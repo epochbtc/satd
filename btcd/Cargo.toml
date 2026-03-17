@@ -17,3 +17,5 @@ rand = { workspace = true }
 [dev-dependencies]
 reqwest = { version = "0.12", features = ["json", "blocking"] }
 serde_json = { workspace = true }
+bitcoin = { workspace = true }
+hex = { workspace = true }

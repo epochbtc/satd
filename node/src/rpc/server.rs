@@ -1,6 +1,7 @@
 use crate::chain::state::ChainState;
+use crate::mempool::pool::Mempool;
 use crate::rpc::auth::{AuthLayer, RpcAuth};
-use crate::rpc::{blockchain, mining, network};
+use crate::rpc::{blockchain, mining, network, rawtx};
 use jsonrpsee::server::{RpcModule, ServerBuilder, ServerHandle};
 use jsonrpsee::types::ErrorObjectOwned;
 use std::net::SocketAddr;
@@ -10,6 +11,7 @@ use tokio::sync::watch;
 /// Shared state for RPC handlers.
 pub struct RpcContext {
     pub chain_state: Arc<ChainState>,
+    pub mempool: Arc<Mempool>,
     pub shutdown_tx: watch::Sender<bool>,
 }
 
@@ -18,36 +20,35 @@ pub async fn start(
     bind_addr: SocketAddr,
     auth: Arc<RpcAuth>,
     chain_state: Arc<ChainState>,
+    mempool: Arc<Mempool>,
     shutdown_tx: watch::Sender<bool>,
 ) -> Result<ServerHandle, Box<dyn std::error::Error + Send + Sync>> {
     let ctx = Arc::new(RpcContext {
         chain_state,
+        mempool,
         shutdown_tx,
     });
 
     let mut module = RpcModule::new(ctx);
 
-    // Register getblockchaininfo
+    // --- Blockchain RPCs ---
+
     module.register_method("getblockchaininfo", |_params, ctx, _extensions| {
         Ok::<_, ErrorObjectOwned>(blockchain::get_blockchain_info(&ctx.chain_state))
     })?;
 
-    // Register getnetworkinfo
     module.register_method("getnetworkinfo", |_params, _ctx, _extensions| {
         Ok::<_, ErrorObjectOwned>(network::get_network_info())
     })?;
 
-    // Register getbestblockhash
     module.register_method("getbestblockhash", |_params, ctx, _extensions| {
         Ok::<_, ErrorObjectOwned>(blockchain::get_best_block_hash(&ctx.chain_state))
     })?;
 
-    // Register getblockcount
     module.register_method("getblockcount", |_params, ctx, _extensions| {
         Ok::<_, ErrorObjectOwned>(blockchain::get_block_count(&ctx.chain_state))
     })?;
 
-    // Register getblockhash
     module.register_method("getblockhash", |params, ctx, _extensions| {
         let height: u32 = params.one().map_err(|e| {
             ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
@@ -57,7 +58,6 @@ pub async fn start(
         })
     })?;
 
-    // Register getblock
     module.register_method("getblock", |params, ctx, _extensions| {
         let mut seq = params.sequence();
         let hash: String = seq.next().map_err(|e| {
@@ -69,7 +69,6 @@ pub async fn start(
         })
     })?;
 
-    // Register getblockheader
     module.register_method("getblockheader", |params, ctx, _extensions| {
         let mut seq = params.sequence();
         let hash: String = seq.next().map_err(|e| {
@@ -81,16 +80,69 @@ pub async fn start(
         })
     })?;
 
-    // Register submitblock
+    // --- Mining RPCs ---
+
     module.register_method("submitblock", |params, ctx, _extensions| {
         let mut seq = params.sequence();
         let hex_block: String = seq.next().map_err(|e| {
             ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
         })?;
-        Ok::<_, ErrorObjectOwned>(mining::submit_block(&ctx.chain_state, &hex_block))
+        Ok::<_, ErrorObjectOwned>(mining::submit_block(
+            &ctx.chain_state,
+            &ctx.mempool,
+            &hex_block,
+        ))
     })?;
 
-    // Register stop
+    // --- Transaction / Mempool RPCs ---
+
+    module.register_method("sendrawtransaction", |params, ctx, _extensions| {
+        let mut seq = params.sequence();
+        let hex_tx: String = seq.next().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        rawtx::send_raw_transaction(&ctx.chain_state, &ctx.mempool, &hex_tx).map_err(
+            |(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>),
+        )
+    })?;
+
+    module.register_method("getmempoolinfo", |_params, ctx, _extensions| {
+        Ok::<_, ErrorObjectOwned>(rawtx::get_mempool_info(&ctx.mempool))
+    })?;
+
+    module.register_method("getrawmempool", |params, ctx, _extensions| {
+        let mut seq = params.sequence();
+        let verbose: bool = seq.optional_next().unwrap_or(Some(false)).unwrap_or(false);
+        Ok::<_, ErrorObjectOwned>(rawtx::get_raw_mempool(&ctx.mempool, verbose))
+    })?;
+
+    module.register_method("getrawtransaction", |params, ctx, _extensions| {
+        let mut seq = params.sequence();
+        let txid: String = seq.next().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        let verbose: bool = seq.optional_next().unwrap_or(Some(false)).unwrap_or(false);
+        let blockhash: Option<String> = seq.optional_next().unwrap_or(None);
+        rawtx::get_raw_transaction(
+            &ctx.chain_state,
+            &ctx.mempool,
+            &txid,
+            verbose,
+            blockhash.as_deref(),
+        )
+        .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
+    })?;
+
+    module.register_method("decoderawtransaction", |params, _ctx, _extensions| {
+        let hex_tx: String = params.one().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        rawtx::decode_raw_transaction(&hex_tx)
+            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
+    })?;
+
+    // --- Control RPCs ---
+
     module.register_async_method("stop", |_params, ctx, _extensions| async move {
         tracing::info!("Received stop RPC, shutting down");
         let _ = ctx.shutdown_tx.send(true);

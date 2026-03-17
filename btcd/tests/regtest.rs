@@ -407,3 +407,68 @@ fn test_submitblock_invalid() {
 
     node.stop();
 }
+
+#[test]
+fn test_getmempoolinfo() {
+    let mut node = TestNode::start(&[]);
+    let response = node.rpc_call("getmempoolinfo").unwrap();
+    let result = &response["result"];
+
+    assert_eq!(result["loaded"], true);
+    assert_eq!(result["size"], 0);
+    assert_eq!(result["bytes"], 0);
+    assert!(result["maxmempool"].as_u64().unwrap() > 0);
+
+    node.stop();
+}
+
+#[test]
+fn test_getrawmempool_empty() {
+    let mut node = TestNode::start(&[]);
+    let response = node.rpc_call("getrawmempool").unwrap();
+    let result = &response["result"];
+    assert!(result.is_array());
+    assert_eq!(result.as_array().unwrap().len(), 0);
+
+    node.stop();
+}
+
+#[test]
+fn test_decoderawtransaction() {
+    let mut node = TestNode::start(&[]);
+
+    // Use the regtest genesis coinbase tx hex
+    let genesis = bitcoin::constants::genesis_block(bitcoin::Network::Regtest);
+    let coinbase_hex = hex::encode(bitcoin::consensus::serialize(&genesis.txdata[0]));
+
+    let response = node
+        .rpc_call_with_params(
+            "decoderawtransaction",
+            vec![serde_json::json!(coinbase_hex)],
+        )
+        .unwrap();
+    let result = &response["result"];
+
+    assert!(result["txid"].is_string());
+    assert!(result["vin"].is_array());
+    assert!(result["vout"].is_array());
+    assert_eq!(result["vin"].as_array().unwrap().len(), 1);
+    assert_eq!(result["vout"].as_array().unwrap().len(), 1);
+    // Coinbase input should have "coinbase" field
+    assert!(result["vin"][0]["coinbase"].is_string());
+
+    node.stop();
+}
+
+#[test]
+fn test_sendrawtransaction_invalid() {
+    let mut node = TestNode::start(&[]);
+
+    // Sending garbage should fail
+    let response = node
+        .rpc_call_with_params("sendrawtransaction", vec![serde_json::json!("deadbeef")])
+        .unwrap();
+    assert!(response["error"].is_object());
+
+    node.stop();
+}

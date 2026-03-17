@@ -1,5 +1,7 @@
 pub mod block;
 pub mod pow;
+pub mod script;
+pub mod tx;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ValidationError {
@@ -19,4 +21,16 @@ pub enum ValidationError {
     BadDifficulty,
     #[error("bad-txns-empty")]
     EmptyBlock,
+    #[error("bad-txns-vin-empty")]
+    BadTxNoInputs,
+    #[error("bad-txns-vout-empty")]
+    BadTxNoOutputs,
+    #[error("bad-txns-vout-negative")]
+    BadTxOutputValue,
+    #[error("bad-txns-inputs-duplicate")]
+    BadTxDuplicateInput,
+    #[error("bad-cb-length")]
+    BadTxCoinbaseSize,
+    #[error("bad-txns-prevout-null")]
+    BadTxNullInput,
 }

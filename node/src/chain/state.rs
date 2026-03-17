@@ -8,6 +8,7 @@ use crate::storage::coinview::Coin;
 use crate::storage::flatfile::{FlatFileManager, FlatFilePos};
 use crate::storage::{Store, StoreError};
 use crate::validation;
+use crate::validation::script::{NoopVerifier, ScriptVerifier};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ChainError {
@@ -38,6 +39,7 @@ pub struct ChainState {
     flat_files: Mutex<FlatFileManager>,
     tip: RwLock<ChainTip>,
     pub network: Network,
+    script_verifier: Box<dyn ScriptVerifier>,
 }
 
 impl ChainState {
@@ -46,6 +48,7 @@ impl ChainState {
         store: Box<dyn Store>,
         mut flat_files: FlatFileManager,
         network: Network,
+        script_verifier: Box<dyn ScriptVerifier>,
     ) -> Result<Self, ChainError> {
         let genesis = bitcoin::constants::genesis_block(network);
         let genesis_hash = genesis.block_hash();
@@ -66,6 +69,7 @@ impl ChainState {
                         height: entry.height,
                     }),
                     network,
+                    script_verifier,
                 });
             }
         }
@@ -79,7 +83,9 @@ impl ChainState {
             .map_err(|e| ChainError::FlatFile(e.to_string()))?;
 
         let parent_work = [0u8; 32];
-        let batch = connect::connect_block(&*store, &genesis, 0, &parent_work, flat_pos)?;
+        let noop = NoopVerifier; // Genesis has no scripts to verify
+        let batch =
+            connect::connect_block(&*store, &genesis, 0, &parent_work, flat_pos, &noop)?;
         store.write_batch(batch)?;
 
         Ok(Self {
@@ -90,6 +96,7 @@ impl ChainState {
                 height: 0,
             }),
             network,
+            script_verifier,
         })
     }
 
@@ -113,6 +120,11 @@ impl ChainState {
         self.store.get_coin(outpoint)
     }
 
+    /// Access the script verifier (for mempool use).
+    pub fn script_verifier(&self) -> &dyn ScriptVerifier {
+        &*self.script_verifier
+    }
+
     /// Read a full block from flat file storage.
     pub fn get_block(&self, hash: &BlockHash) -> Option<Block> {
         let entry = self.store.get_block_index(hash)?;
@@ -128,7 +140,7 @@ impl ChainState {
     }
 
     /// Accept a new block into the chain.
-    pub fn accept_block(&self, block: Block) -> Result<BlockHash, ChainError> {
+    pub fn accept_block(&self, block: &Block) -> Result<BlockHash, ChainError> {
         let block_hash = block.block_hash();
 
         // Check for duplicate
@@ -146,7 +158,7 @@ impl ChainState {
         let new_height = parent.height + 1;
 
         // Context-free block validation
-        validation::block::check_block(&block)?;
+        validation::block::check_block(block)?;
 
         // PoW validation
         validation::pow::check_proof_of_work(&block.header)?;
@@ -162,7 +174,7 @@ impl ChainState {
         })?;
 
         // Write raw block to flat file
-        let block_data = serialize(&block);
+        let block_data = serialize(block);
         let flat_pos = self
             .flat_files
             .lock()
@@ -170,13 +182,14 @@ impl ChainState {
             .write_block(&block_data, network_magic(self.network))
             .map_err(|e| ChainError::FlatFile(e.to_string()))?;
 
-        // Connect block (process transactions, update UTXOs)
+        // Connect block (process transactions, update UTXOs, verify scripts)
         let batch = connect::connect_block(
             &*self.store,
-            &block,
+            block,
             new_height,
             &parent.chainwork,
             flat_pos,
+            &*self.script_verifier,
         )?;
 
         // Atomic commit
@@ -228,7 +241,13 @@ mod tests {
         let blocks_dir = dir.join("blocks");
         let store = Box::new(InMemoryStore::new());
         let flat_files = FlatFileManager::new(&blocks_dir).unwrap();
-        let cs = ChainState::new(store, flat_files, Network::Regtest).unwrap();
+        let cs = ChainState::new(
+            store,
+            flat_files,
+            Network::Regtest,
+            Box::new(NoopVerifier),
+        )
+        .unwrap();
         (cs, dir)
     }
 
@@ -240,12 +259,10 @@ mod tests {
         assert_eq!(cs.tip_height(), 0);
         assert_eq!(cs.tip_hash(), genesis.block_hash());
 
-        // Genesis should be in the index
         let entry = cs.get_block_index(&genesis.block_hash()).unwrap();
         assert_eq!(entry.height, 0);
         assert_eq!(entry.status, BlockStatus::Valid);
 
-        // Should be able to read genesis block back
         let read_back = cs.get_block(&genesis.block_hash()).unwrap();
         assert_eq!(read_back.block_hash(), genesis.block_hash());
 
@@ -257,8 +274,7 @@ mod tests {
         let (cs, dir) = make_chain_state();
         let genesis = bitcoin::constants::genesis_block(Network::Regtest);
 
-        // Trying to accept genesis again should fail with Duplicate
-        let result = cs.accept_block(genesis);
+        let result = cs.accept_block(&genesis);
         assert!(matches!(result, Err(ChainError::Duplicate)));
 
         let _ = std::fs::remove_dir_all(&dir);

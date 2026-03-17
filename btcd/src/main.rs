@@ -2,9 +2,12 @@ mod config;
 
 use config::Config;
 use node::chain::state::ChainState;
+use node::mempool::policy::{DEFAULT_MAX_MEMPOOL_SIZE, DEFAULT_MIN_RELAY_FEE_RATE};
+use node::mempool::pool::Mempool;
 use node::rpc::auth::RpcAuth;
 use node::storage::db::RocksDbStore;
 use node::storage::flatfile::FlatFileManager;
+use node::validation::script::ConsensusVerifier;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -36,7 +39,11 @@ async fn main() {
     // Create network-specific data directory
     let net_datadir = config.network_datadir();
     if let Err(e) = std::fs::create_dir_all(&net_datadir) {
-        eprintln!("Error creating data directory {}: {}", net_datadir.display(), e);
+        eprintln!(
+            "Error creating data directory {}: {}",
+            net_datadir.display(),
+            e
+        );
         std::process::exit(1);
     }
 
@@ -76,8 +83,13 @@ async fn main() {
         }
     };
 
-    // Initialize chain state (loads tip or writes genesis)
-    let chain_state = match ChainState::new(store, flat_files, config.network) {
+    // Initialize chain state with script verification
+    let chain_state = match ChainState::new(
+        store,
+        flat_files,
+        config.network,
+        Box::new(ConsensusVerifier),
+    ) {
         Ok(cs) => Arc::new(cs),
         Err(e) => {
             eprintln!("Error initializing chain state: {}", e);
@@ -92,6 +104,12 @@ async fn main() {
         "Chain state initialized"
     );
 
+    // Initialize mempool
+    let mempool = Arc::new(Mempool::new(
+        DEFAULT_MAX_MEMPOOL_SIZE,
+        DEFAULT_MIN_RELAY_FEE_RATE,
+    ));
+
     // Shutdown channel
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
@@ -104,6 +122,7 @@ async fn main() {
         bind_addr,
         auth.clone(),
         chain_state.clone(),
+        mempool.clone(),
         shutdown_tx,
     )
     .await
