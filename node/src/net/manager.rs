@@ -47,8 +47,14 @@ pub struct PeerManager {
     next_id: AtomicU64,
     event_tx: mpsc::Sender<NetEvent>,
     event_rx: tokio::sync::Mutex<mpsc::Receiver<NetEvent>>,
-    /// Buffer for blocks received out of order (parent not yet connected).
-    block_buffer: RwLock<HashMap<bitcoin::BlockHash, bitcoin::Block>>,
+    /// Track the highest header height we've stored.
+    headers_tip: AtomicU64,
+    /// Track blocks we've already requested to avoid duplicate getdata.
+    requested_blocks: RwLock<std::collections::HashSet<bitcoin::BlockHash>>,
+    /// Configured outbound peer addresses for auto-reconnect.
+    connect_addrs: RwLock<Vec<SocketAddr>>,
+    /// Channel to send received blocks to the processing thread.
+    block_tx: mpsc::UnboundedSender<bitcoin::Block>,
 }
 
 impl PeerManager {
@@ -57,17 +63,36 @@ impl PeerManager {
         mempool: Arc<Mempool>,
         network: Network,
     ) -> Arc<Self> {
-        let (event_tx, event_rx) = mpsc::channel(256);
-        Arc::new(Self {
+        let (event_tx, event_rx) = mpsc::channel(4096);
+        let (block_tx, block_rx) = mpsc::unbounded_channel();
+
+        let mgr = Arc::new(Self {
             peers: RwLock::new(HashMap::new()),
-            chain_state,
-            mempool,
+            chain_state: chain_state.clone(),
+            mempool: mempool.clone(),
             network,
             next_id: AtomicU64::new(1),
             event_tx,
             event_rx: tokio::sync::Mutex::new(event_rx),
-            block_buffer: RwLock::new(HashMap::new()),
-        })
+            headers_tip: AtomicU64::new(0),
+            requested_blocks: RwLock::new(std::collections::HashSet::new()),
+            connect_addrs: RwLock::new(Vec::new()),
+            block_tx,
+        });
+
+        // Spawn block processing thread
+        let cs = chain_state;
+        let mp = mempool;
+        std::thread::spawn(move || {
+            Self::block_processor(block_rx, cs, mp);
+        });
+
+        mgr
+    }
+
+    /// Register addresses for auto-reconnect.
+    pub fn add_connect_addr(&self, addr: SocketAddr) {
+        self.connect_addrs.write().unwrap().push(addr);
     }
 
     /// Connect to an outbound peer.
@@ -112,11 +137,9 @@ impl PeerManager {
     /// Disconnect a peer by address.
     pub fn disconnect(&self, addr: &SocketAddr) -> bool {
         let peers = self.peers.read().unwrap();
-        for (id, handle) in peers.iter() {
+        for (_id, handle) in peers.iter() {
             if handle.info.addr == *addr {
-                // Drop the sender to signal disconnect
                 let _ = handle.msg_tx.try_send(NetworkMessage::Ping(0));
-                tracing::info!(%addr, id, "Disconnecting peer");
                 return true;
             }
         }
@@ -142,29 +165,48 @@ impl PeerManager {
             .count()
     }
 
-    /// Run the main event loop. Call from a spawned task.
+    /// Run the main event loop.
     pub async fn run(self: &Arc<Self>) {
         let mut event_rx = self.event_rx.lock().await;
-        let mut block_request_interval = tokio::time::interval(std::time::Duration::from_secs(2));
+        let mut sync_interval = tokio::time::interval(std::time::Duration::from_millis(500));
+        let mut last_tip: u32 = 0;
+        let mut ticks: u64 = 0;
 
         loop {
-            tokio::select! {
-                event = event_rx.recv() => {
-                    match event {
-                        Some(NetEvent::PeerConnected { id, addr: _, version }) => {
-                            self.handle_peer_connected(id, version);
-                        }
-                        Some(NetEvent::PeerDisconnected { id }) => {
-                            self.handle_peer_disconnected(id);
-                        }
-                        Some(NetEvent::MessageReceived { id, msg }) => {
-                            self.handle_message(id, msg).await;
-                        }
-                        None => break,
-                    }
+            // Process up to 64 events per iteration, then yield for sync
+            let mut processed = 0;
+            loop {
+                if processed >= 64 {
+                    break;
                 }
-                _ = block_request_interval.tick() => {
-                    // Periodically request missing blocks from all connected peers
+                match event_rx.try_recv() {
+                    Ok(NetEvent::PeerConnected { id, addr: _, version }) => {
+                        self.handle_peer_connected(id, version);
+                    }
+                    Ok(NetEvent::PeerDisconnected { id }) => {
+                        self.handle_peer_disconnected(id);
+                    }
+                    Ok(NetEvent::MessageReceived { id, msg }) => {
+                        self.handle_message(id, msg);
+                    }
+                    Err(mpsc::error::TryRecvError::Empty) => break,
+                    Err(mpsc::error::TryRecvError::Disconnected) => return,
+                }
+                processed += 1;
+            }
+
+            // Check sync progress and request more blocks
+            let tip = self.chain_state.tip_height();
+            let htip = self.headers_tip.load(Ordering::Relaxed) as u32;
+
+            if tip != last_tip {
+                last_tip = tip;
+            }
+
+            // Request more blocks if we're behind headers and have capacity
+            if tip < htip {
+                let req_count = self.requested_blocks.read().unwrap().len();
+                if req_count < 256 {
                     let peer_ids: Vec<PeerId> = {
                         let peers = self.peers.read().unwrap();
                         peers.iter()
@@ -177,6 +219,28 @@ impl PeerManager {
                     }
                 }
             }
+
+            ticks += 1;
+            // Every 20 ticks (10 seconds), clear stale requests and check peers
+            if ticks % 20 == 0 {
+                self.requested_blocks.write().unwrap().clear();
+
+                // Auto-reconnect if no peers connected
+                if self.connection_count() == 0 {
+                    let addrs = self.connect_addrs.read().unwrap().clone();
+                    for addr in addrs {
+                        let pm = Arc::clone(&self);
+                        tokio::spawn(async move {
+                            if let Err(e) = pm.connect_outbound(addr).await {
+                                tracing::debug!(%addr, "Reconnect failed: {}", e);
+                            }
+                        });
+                    }
+                }
+            }
+
+            // Yield to tokio runtime
+            sync_interval.tick().await;
         }
     }
 
@@ -202,36 +266,34 @@ impl PeerManager {
         }
     }
 
-    async fn handle_message(&self, id: PeerId, msg: NetworkMessage) {
+    fn handle_message(&self, id: PeerId, msg: NetworkMessage) {
         match msg {
             NetworkMessage::Ping(nonce) => {
                 self.send_to_peer(id, NetworkMessage::Pong(nonce));
             }
             NetworkMessage::Inv(inventory) => {
-                self.handle_inv(id, inventory).await;
+                self.handle_inv(id, inventory);
             }
             NetworkMessage::Headers(headers) => {
-                self.handle_headers(id, headers).await;
+                self.handle_headers(id, headers);
             }
             NetworkMessage::Block(block) => {
-                self.handle_block(id, block).await;
+                self.handle_block(id, block);
             }
             NetworkMessage::Tx(tx) => {
-                self.handle_tx(id, tx).await;
+                self.handle_tx(id, tx);
             }
             NetworkMessage::GetHeaders(msg) => {
-                self.handle_getheaders(id, msg).await;
+                self.handle_getheaders(id, msg);
             }
             NetworkMessage::GetData(inv) => {
-                self.handle_getdata(id, inv).await;
+                self.handle_getdata(id, inv);
             }
-            _ => {
-                // Ignore unhandled messages
-            }
+            _ => {}
         }
     }
 
-    async fn handle_inv(&self, id: PeerId, inventory: Vec<Inventory>) {
+    fn handle_inv(&self, id: PeerId, inventory: Vec<Inventory>) {
         let mut blocks_to_get = Vec::new();
         let mut txs_to_get = Vec::new();
 
@@ -259,15 +321,18 @@ impl PeerManager {
         }
     }
 
-    async fn handle_headers(&self, id: PeerId, headers: Vec<bitcoin::block::Header>) {
+    fn handle_headers(&self, id: PeerId, headers: Vec<bitcoin::block::Header>) {
         if headers.is_empty() {
             return;
         }
 
         let mut accepted = 0;
+        let mut max_height = 0u32;
         for header in &headers {
             match self.chain_state.accept_header(header) {
-                Ok(_) => accepted += 1,
+                Ok(_) => {
+                    accepted += 1;
+                }
                 Err(e) => {
                     tracing::warn!(id, "Header rejected: {}", e);
                     break;
@@ -276,79 +341,76 @@ impl PeerManager {
         }
 
         if accepted > 0 {
-            tracing::debug!(id, accepted, "Headers accepted");
+            // Update headers tip tracking
+            // We don't know exact height here, estimate from accept_header
+            let htip = self.headers_tip.load(Ordering::Relaxed) + accepted as u64;
+            self.headers_tip.store(htip, Ordering::Relaxed);
+
+            tracing::debug!(id, accepted, headers_tip = htip, "Headers accepted");
+
             // Request more headers
             self.send_to_peer(id, sync::make_getheaders(&self.chain_state));
 
-            // Request blocks for headers we don't have data for
-            // Only if we're not already downloading
-            let tip = self.chain_state.tip_height();
-            if tip == 0 || tip % 128 == 0 {
-                self.request_missing_blocks(id);
-            }
+            // Immediately request blocks if we have none in flight
+            self.request_missing_blocks(id);
         }
     }
 
-    async fn handle_block(&self, id: PeerId, block: bitcoin::Block) {
+    fn handle_block(&self, _id: PeerId, block: bitcoin::Block) {
         let hash = block.block_hash();
-        match self.chain_state.accept_block(&block) {
-            Ok(_) => {
-                self.mempool.remove_for_block(&block);
-                let height = self.chain_state.tip_height();
-                if height % 1000 == 0 {
-                    tracing::info!(height, %hash, "IBD progress");
-                }
-                self.broadcast_except(id, sync::make_block_inv(hash));
-                // Try to drain buffered blocks that may now connect
-                self.drain_block_buffer(id).await;
-            }
-            Err(crate::chain::state::ChainError::Duplicate) => {}
-            Err(crate::chain::state::ChainError::BadPrevBlock) => {
-                // Out-of-order: buffer for later
-                let mut buf = self.block_buffer.write().unwrap();
-                if buf.len() < 1024 {
-                    buf.insert(block.header.prev_blockhash, block);
-                }
-            }
-            Err(e) => {
-                tracing::warn!(%hash, "Block rejected: {}", e);
-            }
-        }
+        // Remove from requested tracking and send to processing thread
+        self.requested_blocks.write().unwrap().remove(&hash);
+        let _ = self.block_tx.send(block);
     }
 
-    /// Try to connect buffered blocks whose parents are now available.
-    async fn drain_block_buffer(&self, id: PeerId) {
-        loop {
-            let tip_hash = self.chain_state.tip_hash();
-            let block = {
-                let mut buf = self.block_buffer.write().unwrap();
-                buf.remove(&tip_hash)
-            };
-            match block {
-                Some(b) => {
-                    let hash = b.block_hash();
-                    match self.chain_state.accept_block(&b) {
-                        Ok(_) => {
-                            self.mempool.remove_for_block(&b);
-                            let height = self.chain_state.tip_height();
-                            if height % 1000 == 0 {
-                                tracing::info!(height, %hash, "IBD progress");
+    /// Block processing runs on a dedicated OS thread (not tokio) to avoid
+    /// blocking the async event loop during CPU-intensive validation.
+    fn block_processor(
+        mut rx: mpsc::UnboundedReceiver<bitcoin::Block>,
+        chain_state: Arc<ChainState>,
+        mempool: Arc<Mempool>,
+    ) {
+        let mut block_buffer: HashMap<bitcoin::BlockHash, bitcoin::Block> = HashMap::new();
+        let mut last_log_height: u32 = 0;
+
+        while let Some(block) = rx.blocking_recv() {
+            let hash = block.block_hash();
+            match chain_state.accept_block(&block) {
+                Ok(_) => {
+                    mempool.remove_for_block(&block);
+                    // Drain buffer
+                    loop {
+                        let tip = chain_state.tip_hash();
+                        match block_buffer.remove(&tip) {
+                            Some(b) => {
+                                match chain_state.accept_block(&b) {
+                                    Ok(_) => { mempool.remove_for_block(&b); }
+                                    Err(_) => break,
+                                }
                             }
-                            self.broadcast_except(id, sync::make_block_inv(hash));
-                            // Continue draining
-                        }
-                        Err(e) => {
-                            tracing::debug!(%hash, "Buffered block failed: {}", e);
-                            break;
+                            None => break,
                         }
                     }
+                    let height = chain_state.tip_height();
+                    if height / 1000 > last_log_height / 1000 {
+                        tracing::info!(height, buffered = block_buffer.len(), "IBD progress");
+                        last_log_height = height;
+                    }
                 }
-                None => break,
+                Err(crate::chain::state::ChainError::Duplicate) => {}
+                Err(crate::chain::state::ChainError::BadPrevBlock) => {
+                    if block_buffer.len() < 8192 {
+                        block_buffer.insert(block.header.prev_blockhash, block);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(%hash, "Block rejected: {}", e);
+                }
             }
         }
     }
 
-    async fn handle_tx(&self, _id: PeerId, tx: bitcoin::Transaction) {
+    fn handle_tx(&self, _id: PeerId, tx: bitcoin::Transaction) {
         let txid = tx.compute_txid();
         match self.mempool.accept_transaction(
             tx,
@@ -356,7 +418,6 @@ impl PeerManager {
             self.chain_state.script_verifier(),
         ) {
             Ok(_) => {
-                // Announce to peers
                 self.broadcast(NetworkMessage::Inv(vec![Inventory::WitnessTransaction(
                     txid,
                 )]));
@@ -367,12 +428,11 @@ impl PeerManager {
         }
     }
 
-    async fn handle_getheaders(
+    fn handle_getheaders(
         &self,
         id: PeerId,
         msg: bitcoin::p2p::message_blockdata::GetHeadersMessage,
     ) {
-        // Find the first locator hash we have
         let mut start_height = None;
         for hash in &msg.locator_hashes {
             if let Some(entry) = self.chain_state.get_block_index(hash) {
@@ -399,7 +459,7 @@ impl PeerManager {
         }
     }
 
-    async fn handle_getdata(&self, id: PeerId, inventory: Vec<Inventory>) {
+    fn handle_getdata(&self, id: PeerId, inventory: Vec<Inventory>) {
         for inv in inventory {
             match inv {
                 Inventory::Block(hash) | Inventory::WitnessBlock(hash) => {
@@ -420,11 +480,12 @@ impl PeerManager {
     fn request_missing_blocks(&self, id: PeerId) {
         let tip = self.chain_state.tip_height();
         let mut to_request = Vec::new();
+        let requested = self.requested_blocks.read().unwrap();
 
-        // Scan from current tip upward for blocks with headers but no data
-        for h in (tip + 1)..=(tip + 2000) {
+        // Request blocks from tip+1 upward where we have headers but no data
+        for h in (tip + 1)..=(tip + 512) {
             if let Some(hash) = self.chain_state.get_block_hash_by_height(h) {
-                if !self.chain_state.has_block_data(&hash) {
+                if !self.chain_state.has_block_data(&hash) && !requested.contains(&hash) {
                     to_request.push(hash);
                     if to_request.len() >= 128 {
                         break;
@@ -434,13 +495,17 @@ impl PeerManager {
                 break;
             }
         }
+        drop(requested);
 
         if !to_request.is_empty() {
-            let count = to_request.len();
-            self.send_to_peer(id, sync::make_getdata_blocks(&to_request));
-            if count % 1000 == 0 || count >= 128 {
-                tracing::info!(tip, requesting = count, "Requesting blocks");
+            // Mark as requested
+            let mut req = self.requested_blocks.write().unwrap();
+            for hash in &to_request {
+                req.insert(*hash);
             }
+            drop(req);
+
+            self.send_to_peer(id, sync::make_getdata_blocks(&to_request));
         }
     }
 
@@ -472,7 +537,7 @@ impl PeerManager {
         stream: TcpStream,
         direction: Direction,
     ) {
-        let (msg_tx, msg_rx) = mpsc::channel::<NetworkMessage>(64);
+        let (msg_tx, msg_rx) = mpsc::channel::<NetworkMessage>(256);
 
         let info = PeerInfo::new(id, addr, direction);
         let handle = PeerHandle { info, msg_tx };
@@ -491,7 +556,7 @@ impl PeerManager {
         });
     }
 
-    /// The main task for a single peer (handles handshake + message loop).
+    /// The main task for a single peer.
     async fn peer_task(
         self: &Arc<Self>,
         id: PeerId,
@@ -501,16 +566,16 @@ impl PeerManager {
     ) -> Result<(), String> {
         let mut conn = Connection::new(stream, self.network);
 
-        // Perform handshake
+        // Perform handshake with timeout
         let version = self.perform_handshake(id, &mut conn, direction).await?;
 
-        // Notify manager of successful connection
+        // Notify manager
         let addr = conn.peer_addr().map_err(|e| e.to_string())?;
         self.event_tx
             .send(NetEvent::PeerConnected {
                 id,
                 addr,
-                version: version.clone(),
+                version,
             })
             .await
             .map_err(|e| e.to_string())?;
@@ -524,9 +589,8 @@ impl PeerManager {
         // Main message loop with idle timeout
         loop {
             tokio::select! {
-                // Receive from network (with 5-minute idle timeout)
                 result = tokio::time::timeout(
-                    std::time::Duration::from_secs(300),
+                    std::time::Duration::from_secs(600),
                     conn.recv()
                 ) => {
                     match result {
@@ -544,7 +608,6 @@ impl PeerManager {
                         }
                     }
                 }
-                // Send to network
                 Some(msg) = msg_rx.recv() => {
                     conn.send(msg).await.map_err(|e| e.to_string())?;
                 }
@@ -552,7 +615,7 @@ impl PeerManager {
         }
     }
 
-    /// Receive a message with a timeout.
+    /// Receive a message with timeout.
     async fn recv_with_timeout(conn: &mut Connection, secs: u64) -> Result<NetworkMessage, String> {
         tokio::time::timeout(std::time::Duration::from_secs(secs), conn.recv())
             .await

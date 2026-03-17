@@ -169,9 +169,10 @@ async fn main() {
         tracing::info!(port = config.port, "P2P listening");
     }
 
-    // Connect to configured peers
+    // Connect to configured peers (and register for auto-reconnect)
     for addr_str in &config.connect {
         if let Ok(addr) = addr_str.parse::<SocketAddr>() {
+            peer_manager.add_connect_addr(addr);
             let pm = peer_manager.clone();
             tokio::spawn(async move {
                 if let Err(e) = pm.connect_outbound(addr).await {
