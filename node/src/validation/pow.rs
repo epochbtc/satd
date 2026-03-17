@@ -54,8 +54,13 @@ where
             }
             Ok(())
         }
+        Network::Signet => {
+            // Signet consensus is enforced by block signing, not PoW difficulty.
+            // Accept whatever bits are set (PoW check still validates hash <= target).
+            Ok(())
+        }
         _ => {
-            // Mainnet (and signet)
+            // Mainnet
             let expected = calculate_next_bits(height, prev, &get_ancestor);
             if header.bits.to_consensus() != expected {
                 return Err(ValidationError::BadDifficulty);

@@ -240,9 +240,11 @@ impl ChainState {
     pub fn accept_block(&self, block: &Block) -> Result<BlockHash, ChainError> {
         let block_hash = block.block_hash();
 
-        // Check for duplicate
-        if self.store.get_block_index(&block_hash).is_some() {
-            return Err(ChainError::Duplicate);
+        // Check for duplicate (HeaderOnly entries are OK — we're now providing data)
+        if let Some(existing) = self.store.get_block_index(&block_hash) {
+            if existing.status != BlockStatus::HeaderOnly {
+                return Err(ChainError::Duplicate);
+            }
         }
 
         // Find parent
@@ -419,6 +421,7 @@ fn network_magic(network: Network) -> [u8; 4] {
     match network {
         Network::Bitcoin => [0xf9, 0xbe, 0xb4, 0xd9],
         Network::Testnet => [0x0b, 0x11, 0x09, 0x07],
+        Network::Signet => [0x0a, 0x03, 0xcf, 0x40],
         Network::Regtest => [0xfa, 0xbf, 0xb5, 0xda],
         _ => [0xf9, 0xbe, 0xb4, 0xd9],
     }

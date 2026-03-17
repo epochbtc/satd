@@ -10,6 +10,7 @@ pub fn get_blockchain_info(chain_state: &ChainState) -> Value {
     let chain = match chain_state.network {
         Network::Regtest => "regtest",
         Network::Testnet => "test",
+        Network::Signet => "signet",
         Network::Bitcoin => "main",
         _ => "main",
     };

@@ -33,6 +33,8 @@ impl Config {
             Network::Regtest
         } else if cli.testnet {
             Network::Testnet
+        } else if cli.signet {
+            Network::Signet
         } else {
             Network::Bitcoin
         };
@@ -142,6 +144,7 @@ impl Config {
         match self.network {
             Network::Regtest => self.datadir.join("regtest"),
             Network::Testnet => self.datadir.join("testnet3"),
+            Network::Signet => self.datadir.join("signet"),
             Network::Bitcoin => self.datadir.clone(),
             _ => self.datadir.clone(),
         }
@@ -157,6 +160,9 @@ pub struct CliArgs {
 
     #[arg(long, help = "Use testnet network")]
     pub testnet: bool,
+
+    #[arg(long, help = "Use signet network")]
+    pub signet: bool,
 
     #[arg(long, value_name = "DIR", help = "Data directory")]
     pub datadir: Option<PathBuf>,
@@ -193,6 +199,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
     let known_flags = [
         "regtest",
         "testnet",
+        "signet",
         "datadir",
         "conf",
         "rpcport",
@@ -288,6 +295,7 @@ fn default_rpc_port(network: Network) -> u16 {
     match network {
         Network::Bitcoin => 8332,
         Network::Testnet => 18332,
+        Network::Signet => 38332,
         Network::Regtest => 18443,
         _ => 8332,
     }
@@ -297,6 +305,7 @@ fn default_p2p_port(network: Network) -> u16 {
     match network {
         Network::Bitcoin => 8333,
         Network::Testnet => 18333,
+        Network::Signet => 38333,
         Network::Regtest => 18444,
         _ => 8333,
     }
@@ -375,6 +384,7 @@ rpcport=8332
         let cli = CliArgs {
             regtest: true,
             testnet: false,
+            signet: false,
             datadir: Some(PathBuf::from("/tmp/btcd-test")),
             conf: None,
             rpcport: None,
@@ -396,6 +406,7 @@ rpcport=8332
         let cli = CliArgs {
             regtest: true,
             testnet: false,
+            signet: false,
             datadir: Some(PathBuf::from("/tmp/btcd-test")),
             conf: None,
             rpcport: None,

@@ -47,6 +47,8 @@ pub struct PeerManager {
     next_id: AtomicU64,
     event_tx: mpsc::Sender<NetEvent>,
     event_rx: tokio::sync::Mutex<mpsc::Receiver<NetEvent>>,
+    /// Buffer for blocks received out of order (parent not yet connected).
+    block_buffer: RwLock<HashMap<bitcoin::BlockHash, bitcoin::Block>>,
 }
 
 impl PeerManager {
@@ -64,6 +66,7 @@ impl PeerManager {
             next_id: AtomicU64::new(1),
             event_tx,
             event_rx: tokio::sync::Mutex::new(event_rx),
+            block_buffer: RwLock::new(HashMap::new()),
         })
     }
 
@@ -142,17 +145,36 @@ impl PeerManager {
     /// Run the main event loop. Call from a spawned task.
     pub async fn run(self: &Arc<Self>) {
         let mut event_rx = self.event_rx.lock().await;
+        let mut block_request_interval = tokio::time::interval(std::time::Duration::from_secs(2));
 
-        while let Some(event) = event_rx.recv().await {
-            match event {
-                NetEvent::PeerConnected { id, addr: _, version } => {
-                    self.handle_peer_connected(id, version);
+        loop {
+            tokio::select! {
+                event = event_rx.recv() => {
+                    match event {
+                        Some(NetEvent::PeerConnected { id, addr: _, version }) => {
+                            self.handle_peer_connected(id, version);
+                        }
+                        Some(NetEvent::PeerDisconnected { id }) => {
+                            self.handle_peer_disconnected(id);
+                        }
+                        Some(NetEvent::MessageReceived { id, msg }) => {
+                            self.handle_message(id, msg).await;
+                        }
+                        None => break,
+                    }
                 }
-                NetEvent::PeerDisconnected { id } => {
-                    self.handle_peer_disconnected(id);
-                }
-                NetEvent::MessageReceived { id, msg } => {
-                    self.handle_message(id, msg).await;
+                _ = block_request_interval.tick() => {
+                    // Periodically request missing blocks from all connected peers
+                    let peer_ids: Vec<PeerId> = {
+                        let peers = self.peers.read().unwrap();
+                        peers.iter()
+                            .filter(|(_, h)| h.info.state == PeerState::Connected)
+                            .map(|(id, _)| *id)
+                            .collect()
+                    };
+                    for pid in peer_ids {
+                        self.request_missing_blocks(pid);
+                    }
                 }
             }
         }
@@ -257,10 +279,14 @@ impl PeerManager {
             tracing::debug!(id, accepted, "Headers accepted");
             // Request more headers
             self.send_to_peer(id, sync::make_getheaders(&self.chain_state));
-        }
 
-        // Request blocks for headers we don't have data for
-        self.request_missing_blocks(id);
+            // Request blocks for headers we don't have data for
+            // Only if we're not already downloading
+            let tip = self.chain_state.tip_height();
+            if tip == 0 || tip % 128 == 0 {
+                self.request_missing_blocks(id);
+            }
+        }
     }
 
     async fn handle_block(&self, id: PeerId, block: bitcoin::Block) {
@@ -269,17 +295,55 @@ impl PeerManager {
             Ok(_) => {
                 self.mempool.remove_for_block(&block);
                 let height = self.chain_state.tip_height();
-                if height % 1000 == 0 || height <= 1 {
+                if height % 1000 == 0 {
                     tracing::info!(height, %hash, "IBD progress");
                 }
-                // Announce to other peers
                 self.broadcast_except(id, sync::make_block_inv(hash));
-                // Request more blocks
-                self.request_missing_blocks(id);
+                // Try to drain buffered blocks that may now connect
+                self.drain_block_buffer(id).await;
             }
             Err(crate::chain::state::ChainError::Duplicate) => {}
+            Err(crate::chain::state::ChainError::BadPrevBlock) => {
+                // Out-of-order: buffer for later
+                let mut buf = self.block_buffer.write().unwrap();
+                if buf.len() < 1024 {
+                    buf.insert(block.header.prev_blockhash, block);
+                }
+            }
             Err(e) => {
                 tracing::warn!(%hash, "Block rejected: {}", e);
+            }
+        }
+    }
+
+    /// Try to connect buffered blocks whose parents are now available.
+    async fn drain_block_buffer(&self, id: PeerId) {
+        loop {
+            let tip_hash = self.chain_state.tip_hash();
+            let block = {
+                let mut buf = self.block_buffer.write().unwrap();
+                buf.remove(&tip_hash)
+            };
+            match block {
+                Some(b) => {
+                    let hash = b.block_hash();
+                    match self.chain_state.accept_block(&b) {
+                        Ok(_) => {
+                            self.mempool.remove_for_block(&b);
+                            let height = self.chain_state.tip_height();
+                            if height % 1000 == 0 {
+                                tracing::info!(height, %hash, "IBD progress");
+                            }
+                            self.broadcast_except(id, sync::make_block_inv(hash));
+                            // Continue draining
+                        }
+                        Err(e) => {
+                            tracing::debug!(%hash, "Buffered block failed: {}", e);
+                            break;
+                        }
+                    }
+                }
+                None => break,
             }
         }
     }
