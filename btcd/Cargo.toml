@@ -1,0 +1,19 @@
+[package]
+name = "btcd"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+node = { path = "../node" }
+bitcoin = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rand = { workspace = true }
+
+[dev-dependencies]
+reqwest = { version = "0.12", features = ["json", "blocking"] }
+serde_json = { workspace = true }

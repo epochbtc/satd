@@ -1,0 +1,17 @@
+[package]
+name = "node"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bitcoin = { workspace = true }
+jsonrpsee = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rand = { workspace = true }
+base64 = { workspace = true }
+tower = { workspace = true }
+hyper = { workspace = true }
+thiserror = { workspace = true }
