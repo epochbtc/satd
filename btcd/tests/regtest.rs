@@ -1,7 +1,7 @@
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 struct TestNode {
     process: Child,
@@ -635,4 +635,239 @@ fn test_estimatesmartfee() {
     assert!(result["feerate"].as_f64().unwrap() > 0.0);
     assert_eq!(result["blocks"], 6);
     node.stop();
+}
+
+#[test]
+fn test_mine_many_blocks_bip34() {
+    // Tests that BIP 34 coinbase height encoding works for heights 0-20
+    // (covers OP_0, OP_1..OP_16, and data-push encoding)
+    let mut node = TestNode::start(&[]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+
+    let response = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(20), serde_json::json!(addr)],
+        )
+        .unwrap();
+    let hashes = response["result"].as_array().unwrap();
+    assert_eq!(hashes.len(), 20);
+
+    let response = node.rpc_call("getblockcount").unwrap();
+    assert_eq!(response["result"], 20);
+
+    // Verify each block has the correct height
+    for height in 1..=20u32 {
+        let response = node
+            .rpc_call_with_params("getblockhash", vec![serde_json::json!(height)])
+            .unwrap();
+        let hash = response["result"].as_str().unwrap();
+        let response = node
+            .rpc_call_with_params("getblock", vec![serde_json::json!(hash)])
+            .unwrap();
+        assert_eq!(response["result"]["height"], height);
+    }
+
+    node.stop();
+}
+
+#[test]
+fn test_ibd_detection() {
+    // A fresh regtest node with height 0 should report initialblockdownload=false
+    // because the genesis block timestamp is old but regtest is special
+    let mut node = TestNode::start(&[]);
+    let response = node.rpc_call("getblockchaininfo").unwrap();
+    let result = &response["result"];
+
+    // At height 0 with genesis timestamp far in the past, IBD should be true
+    assert_eq!(result["initialblockdownload"], true);
+
+    // Mine a block — now tip timestamp is current, IBD should be false
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    node.rpc_call_with_params(
+        "generatetoaddress",
+        vec![serde_json::json!(1), serde_json::json!(addr)],
+    )
+    .unwrap();
+
+    let response = node.rpc_call("getblockchaininfo").unwrap();
+    let result = &response["result"];
+    assert_eq!(result["initialblockdownload"], false);
+
+    node.stop();
+}
+
+#[test]
+fn test_getblocktemplate_fields() {
+    // Verify the improved getblocktemplate has all BIP 22/23 fields
+    let mut node = TestNode::start(&[]);
+    let response = node.rpc_call("getblocktemplate").unwrap();
+    let result = &response["result"];
+
+    // BIP 22/23 required fields
+    assert!(result["version"].is_number());
+    assert!(result["previousblockhash"].is_string());
+    assert!(result["transactions"].is_array());
+    assert!(result["coinbasevalue"].is_number());
+    assert!(result["target"].is_string());
+    assert_eq!(result["target"].as_str().unwrap().len(), 64);
+    assert!(result["bits"].is_string());
+    assert!(result["height"].is_number());
+    assert!(result["curtime"].is_number());
+    assert!(result["mintime"].is_number());
+    assert!(result["mutable"].is_array());
+    assert!(result["noncerange"].is_string());
+    assert!(result["sigoplimit"].is_number());
+    assert!(result["sizelimit"].is_number());
+    assert!(result["weightlimit"].is_number());
+    // New BIP 23 fields
+    assert!(result["rules"].is_array());
+    assert!(result["vbavailable"].is_object());
+    assert!(result["vbrequired"].is_number());
+    assert!(result["capabilities"].is_array());
+
+    node.stop();
+}
+
+// --- P2P Integration Tests ---
+
+/// Poll a condition until it returns true, or panic after timeout.
+fn poll_until(check: impl Fn() -> bool, timeout: Duration, msg: &str) {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if check() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    panic!("poll_until timed out after {:?}: {}", timeout, msg);
+}
+
+fn get_rpc_u64(node: &TestNode, method: &str) -> Option<u64> {
+    node.rpc_call(method)
+        .ok()
+        .and_then(|r| r["result"].as_u64())
+}
+
+fn get_rpc_str(node: &TestNode, method: &str) -> Option<String> {
+    node.rpc_call(method)
+        .ok()
+        .and_then(|r| r["result"].as_str().map(|s| s.to_string()))
+}
+
+#[test]
+fn test_two_nodes_connect() {
+    let p2p_port_a = find_available_port();
+    let mut node_a = TestNode::start(&[&format!("--port={}", p2p_port_a)]);
+    let mut node_b = TestNode::start(&[&format!("--connect=127.0.0.1:{}", p2p_port_a)]);
+
+    poll_until(
+        || get_rpc_u64(&node_a, "getconnectioncount").unwrap_or(0) >= 1,
+        Duration::from_secs(15),
+        "node A did not see a connection",
+    );
+
+    let a_count = get_rpc_u64(&node_a, "getconnectioncount").unwrap();
+    assert!(a_count >= 1, "node A connection count: {}", a_count);
+
+    let a_peers = node_a.rpc_call("getpeerinfo").unwrap();
+    let peers = a_peers["result"].as_array().unwrap();
+    assert!(!peers.is_empty(), "node A should have peers");
+    // Node A sees an inbound connection
+    assert_eq!(peers[0]["inbound"], true);
+
+    node_b.stop();
+    node_a.stop();
+}
+
+#[test]
+fn test_block_sync_between_nodes() {
+    let p2p_port_a = find_available_port();
+    let mut node_a = TestNode::start(&[&format!("--port={}", p2p_port_a)]);
+
+    // Mine 5 blocks on node A
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    node_a
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(5), serde_json::json!(addr)],
+        )
+        .unwrap();
+    assert_eq!(get_rpc_u64(&node_a, "getblockcount").unwrap(), 5);
+
+    // Start node B connected to A
+    let mut node_b = TestNode::start(&[&format!("--connect=127.0.0.1:{}", p2p_port_a)]);
+
+    // Wait for B to sync all 5 blocks
+    poll_until(
+        || get_rpc_u64(&node_b, "getblockcount").unwrap_or(0) >= 5,
+        Duration::from_secs(30),
+        "node B did not sync to height 5",
+    );
+
+    // Verify both nodes agree on the best block
+    let a_hash = get_rpc_str(&node_a, "getbestblockhash").unwrap();
+    let b_hash = get_rpc_str(&node_b, "getbestblockhash").unwrap();
+    assert_eq!(a_hash, b_hash, "nodes should agree on best block hash");
+
+    node_b.stop();
+    node_a.stop();
+}
+
+#[test]
+fn test_block_propagation() {
+    let p2p_port_a = find_available_port();
+    let mut node_a = TestNode::start(&[&format!("--port={}", p2p_port_a)]);
+    let mut node_b = TestNode::start(&[&format!("--connect=127.0.0.1:{}", p2p_port_a)]);
+
+    // Wait for connection
+    poll_until(
+        || get_rpc_u64(&node_a, "getconnectioncount").unwrap_or(0) >= 1,
+        Duration::from_secs(15),
+        "nodes did not connect",
+    );
+
+    // Mine a block on A
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    node_a
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(1), serde_json::json!(addr)],
+        )
+        .unwrap();
+
+    // Wait for B to receive the block
+    poll_until(
+        || get_rpc_u64(&node_b, "getblockcount").unwrap_or(0) >= 1,
+        Duration::from_secs(15),
+        "block did not propagate to node B",
+    );
+
+    let a_hash = get_rpc_str(&node_a, "getbestblockhash").unwrap();
+    let b_hash = get_rpc_str(&node_b, "getbestblockhash").unwrap();
+    assert_eq!(a_hash, b_hash);
+
+    node_b.stop();
+    node_a.stop();
+}
+
+#[test]
+fn test_multiple_connections() {
+    let p2p_port_a = find_available_port();
+    let mut node_a = TestNode::start(&[&format!("--port={}", p2p_port_a)]);
+    let mut node_b = TestNode::start(&[&format!("--connect=127.0.0.1:{}", p2p_port_a)]);
+    let mut node_c = TestNode::start(&[&format!("--connect=127.0.0.1:{}", p2p_port_a)]);
+
+    poll_until(
+        || get_rpc_u64(&node_a, "getconnectioncount").unwrap_or(0) >= 2,
+        Duration::from_secs(15),
+        "node A did not reach 2 connections",
+    );
+
+    let count = get_rpc_u64(&node_a, "getconnectioncount").unwrap();
+    assert_eq!(count, 2, "node A should have exactly 2 connections");
+
+    node_c.stop();
+    node_b.stop();
+    node_a.stop();
 }
