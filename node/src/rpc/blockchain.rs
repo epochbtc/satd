@@ -31,6 +31,13 @@ pub fn get_blockchain_info(chain_state: &ChainState) -> Value {
             (0.0, 0u64, 0u64, "0".to_string())
         };
 
+    // IBD heuristic: if tip is more than 24 hours behind wall clock, we're in IBD
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let is_ibd = time + 86400 < now;
+
     json!({
         "chain": chain,
         "blocks": tip_height,
@@ -39,8 +46,8 @@ pub fn get_blockchain_info(chain_state: &ChainState) -> Value {
         "difficulty": difficulty,
         "time": time,
         "mediantime": mediantime,
-        "verificationprogress": 1.0,
-        "initialblockdownload": tip_height == 0,
+        "verificationprogress": if is_ibd { time as f64 / now as f64 } else { 1.0 },
+        "initialblockdownload": is_ibd,
         "chainwork": format!("{:0>64}", chainwork),
         "size_on_disk": 0,
         "pruned": false,
@@ -262,12 +269,15 @@ pub fn get_tx_out_set_info(chain_state: &ChainState) -> Value {
     let tip_height = chain_state.tip_height();
     let coin_count = chain_state.coin_count();
 
+    let total_sats = chain_state.coin_total_amount();
+    let total_btc = total_sats as f64 / 100_000_000.0;
+
     json!({
         "height": tip_height,
         "bestblock": tip_hash.to_string(),
         "txouts": coin_count,
         "bogosize": coin_count * 50,
-        "total_amount": 0.0,
+        "total_amount": total_btc,
         "hash_serialized_3": "",
     })
 }

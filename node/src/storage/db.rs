@@ -148,6 +148,22 @@ impl Store for RocksDbStore {
         let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
         iter.count() as u64
     }
+
+    fn coin_total_amount(&self) -> u64 {
+        let cf = match self.db.cf_handle(CF_COINS) {
+            Some(cf) => cf,
+            None => return 0,
+        };
+        let mut total: u64 = 0;
+        for item in self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start) {
+            if let Ok((_key, value)) = item {
+                if let Ok(coin) = bincode::deserialize::<Coin>(&value) {
+                    total = total.saturating_add(coin.amount);
+                }
+            }
+        }
+        total
+    }
 }
 
 /// In-memory storage backend for testing.
@@ -231,6 +247,15 @@ impl Store for InMemoryStore {
 
     fn coin_count(&self) -> u64 {
         self.coins.read().unwrap().len() as u64
+    }
+
+    fn coin_total_amount(&self) -> u64 {
+        self.coins
+            .read()
+            .unwrap()
+            .values()
+            .map(|c| c.amount)
+            .sum()
     }
 }
 

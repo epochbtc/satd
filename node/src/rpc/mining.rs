@@ -75,21 +75,30 @@ pub fn get_block_template(chain_state: &ChainState, mempool: &Mempool) -> Value 
         })
         .collect();
 
+    // Compute target from compact bits
+    let target = crate::storage::blockindex::target_from_compact(template.bits);
+    let target_hex = hex::encode(target);
+
     json!({
         "version": template.version,
+        "rules": ["csv", "segwit", "taproot"],
+        "vbavailable": {},
+        "vbrequired": 0,
         "previousblockhash": template.prev_hash.to_string(),
         "transactions": txs,
         "coinbaseaux": { "flags": "" },
         "coinbasevalue": template.coinbase_value,
-        "target": format!("{:064x}", 0u128), // simplified
+        "target": format!("{:0>64}", target_hex),
         "mintime": template.cur_time,
         "mutable": ["time", "transactions", "prevblock"],
         "noncerange": "00000000ffffffff",
+        "capabilities": ["proposal"],
         "sigoplimit": 80000,
         "sizelimit": 4000000,
         "weightlimit": 4000000,
         "curtime": template.cur_time,
         "bits": format!("{:08x}", template.bits.to_consensus()),
         "height": template.height,
+        "default_witness_commitment": "",
     })
 }

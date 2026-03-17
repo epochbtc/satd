@@ -57,4 +57,6 @@ pub trait Store: Send + Sync {
     fn write_batch(&self, batch: StoreBatch) -> Result<(), StoreError>;
     fn get_undo(&self, hash: &BlockHash) -> Option<UndoData>;
     fn coin_count(&self) -> u64;
+    /// Sum the total amount (in satoshis) across all UTXOs.
+    fn coin_total_amount(&self) -> u64;
 }
