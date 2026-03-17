@@ -27,7 +27,7 @@ pub enum ConnectError {
 }
 
 /// Block subsidy (coinbase reward) for a given height.
-fn block_subsidy(height: u32) -> u64 {
+pub fn block_subsidy(height: u32) -> u64 {
     let halvings = height / 210_000;
     if halvings >= 64 {
         return 0;

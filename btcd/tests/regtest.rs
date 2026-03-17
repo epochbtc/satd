@@ -493,6 +493,74 @@ fn test_getconnectioncount() {
 }
 
 #[test]
+fn test_generatetoaddress() {
+    let mut node = TestNode::start(&[]);
+
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+
+    // Mine 1 block
+    let response = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(1), serde_json::json!(addr)],
+        )
+        .unwrap();
+    let result = &response["result"];
+    assert!(result.is_array());
+    assert_eq!(result.as_array().unwrap().len(), 1);
+
+    // Verify block count increased
+    let response = node.rpc_call("getblockcount").unwrap();
+    assert_eq!(response["result"], 1);
+
+    // Mine 10 more blocks
+    let response = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(10), serde_json::json!(addr)],
+        )
+        .unwrap();
+    assert_eq!(response["result"].as_array().unwrap().len(), 10);
+
+    let response = node.rpc_call("getblockcount").unwrap();
+    assert_eq!(response["result"], 11);
+
+    node.stop();
+}
+
+#[test]
+fn test_getblocktemplate() {
+    let mut node = TestNode::start(&[]);
+    let response = node.rpc_call("getblocktemplate").unwrap();
+    let result = &response["result"];
+
+    assert_eq!(result["height"], 1);
+    assert!(result["previousblockhash"].is_string());
+    assert!(result["transactions"].is_array());
+    assert!(result["coinbasevalue"].as_u64().unwrap() > 0);
+    assert_eq!(result["bits"], "207fffff");
+
+    node.stop();
+}
+
+#[test]
+fn test_generateblock() {
+    let mut node = TestNode::start(&[]);
+
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let response = node
+        .rpc_call_with_params("generateblock", vec![serde_json::json!(addr)])
+        .unwrap();
+    let result = &response["result"];
+    assert!(result["hash"].is_string());
+
+    let response = node.rpc_call("getblockcount").unwrap();
+    assert_eq!(response["result"], 1);
+
+    node.stop();
+}
+
+#[test]
 fn test_getnetworkinfo_connections() {
     let mut node = TestNode::start(&[]);
     let response = node.rpc_call("getnetworkinfo").unwrap();

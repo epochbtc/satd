@@ -98,6 +98,31 @@ pub async fn start(
         ))
     })?;
 
+    module.register_method("generatetoaddress", |params, ctx, _extensions| {
+        let mut seq = params.sequence();
+        let nblocks: u32 = seq.next().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        let address: String = seq.next().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        mining::generate_to_address(&ctx.chain_state, &ctx.mempool, nblocks, &address)
+            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
+    })?;
+
+    module.register_method("generateblock", |params, ctx, _extensions| {
+        let mut seq = params.sequence();
+        let address: String = seq.next().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        mining::generate_block(&ctx.chain_state, &ctx.mempool, &address)
+            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
+    })?;
+
+    module.register_method("getblocktemplate", |_params, ctx, _extensions| {
+        Ok::<_, ErrorObjectOwned>(mining::get_block_template(&ctx.chain_state, &ctx.mempool))
+    })?;
+
     // --- Transaction / Mempool RPCs ---
 
     module.register_method("sendrawtransaction", |params, ctx, _extensions| {
