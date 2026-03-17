@@ -569,3 +569,70 @@ fn test_getnetworkinfo_connections() {
     assert_eq!(result["subversion"], "/btcd:0.1.0/");
     node.stop();
 }
+
+#[test]
+fn test_gettxoutsetinfo() {
+    let mut node = TestNode::start(&[]);
+
+    // Mine a block so we have some UTXOs
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    node.rpc_call_with_params(
+        "generatetoaddress",
+        vec![serde_json::json!(1), serde_json::json!(addr)],
+    )
+    .unwrap();
+
+    let response = node.rpc_call("gettxoutsetinfo").unwrap();
+    let result = &response["result"];
+    assert_eq!(result["height"], 1);
+    assert!(result["bestblock"].is_string());
+    assert!(result["txouts"].as_u64().unwrap() >= 1);
+
+    node.stop();
+}
+
+#[test]
+fn test_gettxout() {
+    let mut node = TestNode::start(&[]);
+
+    // Mine a block to create a UTXO
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let response = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(1), serde_json::json!(addr)],
+        )
+        .unwrap();
+    let block_hash = &response["result"][0].as_str().unwrap();
+
+    // Get the block to find the coinbase txid
+    let response = node
+        .rpc_call_with_params("getblock", vec![serde_json::json!(block_hash)])
+        .unwrap();
+    let txid = response["result"]["tx"][0].as_str().unwrap();
+
+    // Query the UTXO
+    let response = node
+        .rpc_call_with_params(
+            "gettxout",
+            vec![serde_json::json!(txid), serde_json::json!(0)],
+        )
+        .unwrap();
+    let result = &response["result"];
+    assert!(result["value"].as_f64().unwrap() > 0.0);
+    assert_eq!(result["coinbase"], true);
+
+    node.stop();
+}
+
+#[test]
+fn test_estimatesmartfee() {
+    let mut node = TestNode::start(&[]);
+    let response = node
+        .rpc_call_with_params("estimatesmartfee", vec![serde_json::json!(6)])
+        .unwrap();
+    let result = &response["result"];
+    assert!(result["feerate"].as_f64().unwrap() > 0.0);
+    assert_eq!(result["blocks"], 6);
+    node.stop();
+}

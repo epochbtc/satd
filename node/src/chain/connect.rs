@@ -3,6 +3,7 @@ use bitcoin::{Block, OutPoint, TxOut};
 use crate::storage::blockindex::{BlockIndexEntry, BlockStatus, add_u256, work_for_bits};
 use crate::storage::coinview::Coin;
 use crate::storage::flatfile::FlatFilePos;
+use crate::storage::undo::{OutPointSer, UndoData};
 use crate::storage::{Store, StoreBatch};
 use crate::validation::script::ScriptVerifier;
 use crate::validation::tx::check_transaction;
@@ -56,6 +57,7 @@ pub fn connect_block(
     script_verifier: &dyn ScriptVerifier,
 ) -> Result<StoreBatch, ConnectError> {
     let mut batch = StoreBatch::default();
+    let mut undo = UndoData::default();
     let block_hash = block.block_hash();
     let is_genesis = height == 0;
     let mut total_fees: u64 = 0;
@@ -93,6 +95,9 @@ pub fn connect_block(
                 if coin.coinbase && height - coin.height < COINBASE_MATURITY {
                     return Err(ConnectError::PrematureCoinbaseSpend);
                 }
+
+                // Save for undo
+                undo.spent_coins.push((OutPointSer::from(&outpoint), coin.clone()));
 
                 sum_inputs += coin.amount;
 
@@ -170,6 +175,9 @@ pub fn connect_block(
     batch.block_index_puts.push((block_hash, entry));
     batch.tip = Some(block_hash);
     batch.height_hash_puts.push((height, block_hash));
+    if !is_genesis {
+        batch.undo_puts.push((block_hash, undo));
+    }
 
     Ok(batch)
 }

@@ -2,8 +2,8 @@ use bitcoin::consensus::serialize;
 use bitcoin::{Block, BlockHash, Network, OutPoint};
 use std::sync::{Mutex, RwLock};
 
-use crate::chain::connect;
-use crate::storage::blockindex::{BlockIndexEntry, BlockStatus};
+use crate::chain::{connect, disconnect};
+use crate::storage::blockindex::{BlockIndexEntry, BlockStatus, add_u256, work_for_bits};
 use crate::storage::coinview::Coin;
 use crate::storage::flatfile::{FlatFileManager, FlatFilePos};
 use crate::storage::{Store, StoreError};
@@ -173,6 +173,11 @@ impl ChainState {
         Ok(hash)
     }
 
+    /// Get the total number of UTXOs in the set.
+    pub fn coin_count(&self) -> u64 {
+        self.store.coin_count()
+    }
+
     /// Access the script verifier (for mempool use).
     pub fn script_verifier(&self) -> &dyn ScriptVerifier {
         &*self.script_verifier
@@ -235,6 +240,44 @@ impl ChainState {
             .write_block(&block_data, network_magic(self.network))
             .map_err(|e| ChainError::FlatFile(e.to_string()))?;
 
+        // Check if this extends the current tip or is a side chain
+        let current_tip = self.tip_hash();
+        let new_chainwork = add_u256(&parent.chainwork, &work_for_bits(block.header.bits));
+
+        if prev_hash != current_tip {
+            // Side chain block — check if it has more work
+            let tip_entry = self.store.get_block_index(&current_tip).unwrap();
+            if compare_u256(&new_chainwork, &tip_entry.chainwork) <= 0 {
+                // Less or equal work — store but don't activate
+                let entry = BlockIndexEntry {
+                    header: block.header,
+                    height: new_height,
+                    status: BlockStatus::DataStored,
+                    num_tx: block.txdata.len() as u32,
+                    file_number: flat_pos.file_number,
+                    data_pos: flat_pos.data_pos,
+                    chainwork: new_chainwork,
+                };
+                let mut batch = crate::storage::StoreBatch::default();
+                batch.block_index_puts.push((block_hash, entry));
+                self.store.write_batch(batch)?;
+                tracing::info!(
+                    height = new_height,
+                    hash = %block_hash,
+                    "Side chain block stored (not activated)"
+                );
+                return Ok(block_hash);
+            }
+
+            // More work — perform reorg
+            tracing::info!(
+                old_tip = %current_tip,
+                new_tip = %block_hash,
+                "Reorganizing to longer chain"
+            );
+            self.perform_reorg(&parent, current_tip)?;
+        }
+
         // Connect block (process transactions, update UTXOs, verify scripts)
         let batch = connect::connect_block(
             &*self.store,
@@ -264,6 +307,57 @@ impl ChainState {
 
         Ok(block_hash)
     }
+
+    /// Disconnect blocks from current tip down to the fork point (parent of the new chain).
+    fn perform_reorg(&self, fork_entry: &BlockIndexEntry, old_tip: BlockHash) -> Result<(), ChainError> {
+        let fork_hash = fork_entry.header.block_hash();
+        let mut current = old_tip;
+
+        // Walk back from old tip to fork point, disconnecting blocks
+        loop {
+            if current == fork_hash {
+                break;
+            }
+
+            let entry = self.store.get_block_index(&current)
+                .ok_or(ChainError::BadPrevBlock)?;
+
+            let block = self.get_block(&current)
+                .ok_or(ChainError::FlatFile("block data missing for reorg".to_string()))?;
+
+            let undo = self.store.get_undo(&current)
+                .ok_or(ChainError::FlatFile("undo data missing for reorg".to_string()))?;
+
+            let prev_hash = entry.header.prev_blockhash;
+            let batch = disconnect::disconnect_block(&block, &undo, entry.height, prev_hash);
+            self.store.write_batch(batch)?;
+
+            tracing::info!(height = entry.height, hash = %current, "Block disconnected");
+            current = prev_hash;
+        }
+
+        // Update in-memory tip to fork point
+        {
+            let mut tip = self.tip.write().unwrap();
+            tip.hash = fork_hash;
+            tip.height = fork_entry.height;
+        }
+
+        Ok(())
+    }
+}
+
+/// Compare two big-endian U256 values. Returns -1, 0, or 1.
+fn compare_u256(a: &[u8; 32], b: &[u8; 32]) -> i32 {
+    for i in 0..32 {
+        if a[i] > b[i] {
+            return 1;
+        }
+        if a[i] < b[i] {
+            return -1;
+        }
+    }
+    0
 }
 
 /// Get the network magic bytes for flat file headers.

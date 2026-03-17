@@ -2,11 +2,13 @@ pub mod blockindex;
 pub mod coinview;
 pub mod db;
 pub mod flatfile;
+pub mod undo;
 
 use bitcoin::{BlockHash, OutPoint};
 
 use crate::storage::blockindex::BlockIndexEntry;
 use crate::storage::coinview::Coin;
+use crate::storage::undo::UndoData;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -26,6 +28,7 @@ pub struct StoreBatch {
     pub coin_removes: Vec<OutPoint>,
     pub tip: Option<BlockHash>,
     pub height_hash_puts: Vec<(u32, BlockHash)>,
+    pub undo_puts: Vec<(BlockHash, UndoData)>,
 }
 
 /// Abstract storage backend for block index, UTXO set, and metadata.
@@ -36,4 +39,6 @@ pub trait Store: Send + Sync {
     fn get_tip(&self) -> Option<BlockHash>;
     fn get_block_hash_by_height(&self, height: u32) -> Option<BlockHash>;
     fn write_batch(&self, batch: StoreBatch) -> Result<(), StoreError>;
+    fn get_undo(&self, hash: &BlockHash) -> Option<UndoData>;
+    fn coin_count(&self) -> u64;
 }

@@ -220,3 +220,53 @@ pub fn get_block_header(
 
     Ok(result)
 }
+
+/// `gettxout` — query a single UTXO.
+pub fn get_tx_out(
+    chain_state: &ChainState,
+    txid_str: &str,
+    vout: u32,
+) -> Result<Value, String> {
+    let txid: bitcoin::Txid = txid_str
+        .parse()
+        .map_err(|_| "Invalid txid".to_string())?;
+
+    let outpoint = bitcoin::OutPoint { txid, vout };
+
+    let coin = chain_state
+        .get_coin(&outpoint)
+        .ok_or("UTXO not found".to_string())?;
+
+    let value_btc = coin.amount as f64 / 100_000_000.0;
+    let confirmations = if chain_state.tip_height() >= coin.height {
+        chain_state.tip_height() - coin.height + 1
+    } else {
+        0
+    };
+
+    Ok(json!({
+        "bestblock": chain_state.tip_hash().to_string(),
+        "confirmations": confirmations,
+        "value": value_btc,
+        "scriptPubKey": {
+            "hex": hex::encode(coin.script_pubkey.as_bytes()),
+        },
+        "coinbase": coin.coinbase,
+    }))
+}
+
+/// `gettxoutsetinfo` — return UTXO set statistics.
+pub fn get_tx_out_set_info(chain_state: &ChainState) -> Value {
+    let tip_hash = chain_state.tip_hash();
+    let tip_height = chain_state.tip_height();
+    let coin_count = chain_state.coin_count();
+
+    json!({
+        "height": tip_height,
+        "bestblock": tip_hash.to_string(),
+        "txouts": coin_count,
+        "bogosize": coin_count * 50,
+        "total_amount": 0.0,
+        "hash_serialized_3": "",
+    })
+}

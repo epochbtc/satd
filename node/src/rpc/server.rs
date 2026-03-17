@@ -170,6 +170,38 @@ pub async fn start(
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
+    // --- UTXO / Chain RPCs ---
+
+    module.register_method("gettxout", |params, ctx, _extensions| {
+        let mut seq = params.sequence();
+        let txid: String = seq.next().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        let vout: u32 = seq.next().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        blockchain::get_tx_out(&ctx.chain_state, &txid, vout).map_err(|e| {
+            ErrorObjectOwned::owned(-5, e, None::<()>)
+        })
+    })?;
+
+    module.register_method("gettxoutsetinfo", |_params, ctx, _extensions| {
+        Ok::<_, ErrorObjectOwned>(blockchain::get_tx_out_set_info(&ctx.chain_state))
+    })?;
+
+    module.register_method("estimatesmartfee", |params, ctx, _extensions| {
+        let conf_target: u32 = params.one().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        // Simple stub: return default fee rate
+        let fee_rate = 0.00001000_f64; // 1 sat/vB in BTC/kvB
+        Ok::<_, ErrorObjectOwned>(serde_json::json!({
+            "feerate": fee_rate,
+            "blocks": conf_target,
+            "errors": [],
+        }))
+    })?;
+
     // --- P2P RPCs ---
 
     module.register_method("getpeerinfo", |_params, ctx, _extensions| {

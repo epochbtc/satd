@@ -4,11 +4,13 @@ use std::path::Path;
 
 use crate::storage::blockindex::BlockIndexEntry;
 use crate::storage::coinview::{outpoint_to_key, Coin};
+use crate::storage::undo::UndoData;
 use crate::storage::{Store, StoreBatch, StoreError};
 
 const CF_BLOCK_INDEX: &str = "block_index";
 const CF_COINS: &str = "coins";
 const CF_HEIGHT_INDEX: &str = "height_index";
+const CF_UNDO: &str = "undo";
 
 fn block_hash_to_bytes(hash: &BlockHash) -> &[u8] {
     hash.as_ref()
@@ -40,6 +42,7 @@ impl RocksDbStore {
             rocksdb::ColumnFamilyDescriptor::new(CF_BLOCK_INDEX, rocksdb::Options::default()),
             rocksdb::ColumnFamilyDescriptor::new(CF_COINS, rocksdb::Options::default()),
             rocksdb::ColumnFamilyDescriptor::new(CF_HEIGHT_INDEX, rocksdb::Options::default()),
+            rocksdb::ColumnFamilyDescriptor::new(CF_UNDO, rocksdb::Options::default()),
         ];
 
         let db =
@@ -111,6 +114,14 @@ impl Store for RocksDbStore {
             }
         }
 
+        if let Some(cf) = self.db.cf_handle(CF_UNDO) {
+            for (hash, undo) in &batch.undo_puts {
+                let value = bincode::serialize(undo)
+                    .map_err(|e| StoreError::Serialization(e.to_string()))?;
+                wb.put_cf(&cf, block_hash_to_bytes(hash), &value);
+            }
+        }
+
         if let Some(hash) = &batch.tip {
             wb.put(b"tip", block_hash_to_bytes(hash));
         }
@@ -118,6 +129,21 @@ impl Store for RocksDbStore {
         self.db
             .write(wb)
             .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    fn get_undo(&self, hash: &BlockHash) -> Option<UndoData> {
+        let cf = self.db.cf_handle(CF_UNDO)?;
+        let value = self.db.get_cf(&cf, block_hash_to_bytes(hash)).ok()??;
+        bincode::deserialize(&value).ok()
+    }
+
+    fn coin_count(&self) -> u64 {
+        let cf = match self.db.cf_handle(CF_COINS) {
+            Some(cf) => cf,
+            None => return 0,
+        };
+        let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
+        iter.count() as u64
     }
 }
 
@@ -128,6 +154,7 @@ pub struct InMemoryStore {
     coins: std::sync::RwLock<std::collections::HashMap<OutPoint, Coin>>,
     tip: std::sync::RwLock<Option<BlockHash>>,
     height_index: std::sync::RwLock<std::collections::HashMap<u32, BlockHash>>,
+    undo: std::sync::RwLock<std::collections::HashMap<BlockHash, UndoData>>,
 }
 
 impl InMemoryStore {
@@ -137,6 +164,7 @@ impl InMemoryStore {
             coins: std::sync::RwLock::new(std::collections::HashMap::new()),
             tip: std::sync::RwLock::new(None),
             height_index: std::sync::RwLock::new(std::collections::HashMap::new()),
+            undo: std::sync::RwLock::new(std::collections::HashMap::new()),
         }
     }
 }
@@ -167,6 +195,7 @@ impl Store for InMemoryStore {
         let mut coins = self.coins.write().unwrap();
         let mut tip = self.tip.write().unwrap();
         let mut hi = self.height_index.write().unwrap();
+        let mut undo = self.undo.write().unwrap();
 
         for (hash, entry) in batch.block_index_puts {
             bi.insert(hash, entry);
@@ -183,8 +212,19 @@ impl Store for InMemoryStore {
         for (height, hash) in batch.height_hash_puts {
             hi.insert(height, hash);
         }
+        for (hash, data) in batch.undo_puts {
+            undo.insert(hash, data);
+        }
 
         Ok(())
+    }
+
+    fn get_undo(&self, hash: &BlockHash) -> Option<UndoData> {
+        self.undo.read().unwrap().get(hash).cloned()
+    }
+
+    fn coin_count(&self) -> u64 {
+        self.coins.read().unwrap().len() as u64
     }
 }
 
