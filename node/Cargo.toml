@@ -15,3 +15,6 @@ base64 = { workspace = true }
 tower = { workspace = true }
 hyper = { workspace = true }
 thiserror = { workspace = true }
+rocksdb = { workspace = true }
+hex = { workspace = true }
+bincode = { workspace = true }

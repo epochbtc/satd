@@ -78,12 +78,20 @@ impl TestNode {
     }
 
     fn rpc_call(&self, method: &str) -> Result<serde_json::Value, String> {
+        self.rpc_call_with_params(method, vec![])
+    }
+
+    fn rpc_call_with_params(
+        &self,
+        method: &str,
+        params: Vec<serde_json::Value>,
+    ) -> Result<serde_json::Value, String> {
         let url = format!("http://127.0.0.1:{}/", self.rpcport);
         let body = serde_json::json!({
             "jsonrpc": "2.0",
             "id": "test",
             "method": method,
-            "params": [],
+            "params": params,
         });
 
         let client = reqwest::blocking::Client::new();
@@ -281,6 +289,121 @@ fn test_userpass_auth() {
     // Wrong credentials should be rejected
     let status = node.rpc_call_raw_status("getblockchaininfo", "testuser", "wrongpass");
     assert_eq!(status, 401);
+
+    node.stop();
+}
+
+#[test]
+fn test_getbestblockhash() {
+    let mut node = TestNode::start(&[]);
+    let response = node.rpc_call("getbestblockhash").unwrap();
+    assert_eq!(
+        response["result"],
+        "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206"
+    );
+    node.stop();
+}
+
+#[test]
+fn test_getblockcount() {
+    let mut node = TestNode::start(&[]);
+    let response = node.rpc_call("getblockcount").unwrap();
+    assert_eq!(response["result"], 0);
+    node.stop();
+}
+
+#[test]
+fn test_getblockhash() {
+    let mut node = TestNode::start(&[]);
+    let response = node
+        .rpc_call_with_params("getblockhash", vec![serde_json::json!(0)])
+        .unwrap();
+    assert_eq!(
+        response["result"],
+        "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206"
+    );
+
+    // Out of range should error
+    let response = node
+        .rpc_call_with_params("getblockhash", vec![serde_json::json!(999)])
+        .unwrap();
+    assert!(response["error"].is_object());
+    node.stop();
+}
+
+#[test]
+fn test_getblock() {
+    let mut node = TestNode::start(&[]);
+    let genesis_hash = "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206";
+
+    // Verbose (default)
+    let response = node
+        .rpc_call_with_params("getblock", vec![serde_json::json!(genesis_hash)])
+        .unwrap();
+    let result = &response["result"];
+    assert_eq!(result["hash"], genesis_hash);
+    assert_eq!(result["height"], 0);
+    assert_eq!(result["confirmations"], 1);
+    assert!(result["tx"].is_array());
+
+    // Raw hex (verbosity 0)
+    let response = node
+        .rpc_call_with_params(
+            "getblock",
+            vec![serde_json::json!(genesis_hash), serde_json::json!(0)],
+        )
+        .unwrap();
+    let hex = response["result"].as_str().unwrap();
+    assert!(hex.len() > 160); // at least 80 bytes header
+
+    node.stop();
+}
+
+#[test]
+fn test_getblockheader() {
+    let mut node = TestNode::start(&[]);
+    let genesis_hash = "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206";
+
+    // Verbose
+    let response = node
+        .rpc_call_with_params(
+            "getblockheader",
+            vec![serde_json::json!(genesis_hash), serde_json::json!(true)],
+        )
+        .unwrap();
+    let result = &response["result"];
+    assert_eq!(result["hash"], genesis_hash);
+    assert_eq!(result["height"], 0);
+    assert_eq!(result["bits"], "207fffff");
+
+    // Raw hex (80 bytes = 160 hex chars)
+    let response = node
+        .rpc_call_with_params(
+            "getblockheader",
+            vec![serde_json::json!(genesis_hash), serde_json::json!(false)],
+        )
+        .unwrap();
+    let hex = response["result"].as_str().unwrap();
+    assert_eq!(hex.len(), 160);
+
+    node.stop();
+}
+
+#[test]
+fn test_submitblock_invalid() {
+    let mut node = TestNode::start(&[]);
+
+    // Submit garbage hex
+    let response = node
+        .rpc_call_with_params("submitblock", vec![serde_json::json!("deadbeef")])
+        .unwrap();
+    assert_eq!(response["result"], "Block decode failed");
+
+    // Submit invalid hex
+    let response = node
+        .rpc_call_with_params("submitblock", vec![serde_json::json!("not-hex!")])
+        .unwrap();
+    assert_eq!(response["result"], "Block decode failed");
 
     node.stop();
 }

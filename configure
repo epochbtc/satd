@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# Detect build dependencies and configure .cargo/config.toml.
+# Run once after cloning or when changing toolchains.
+set -e
+
+CARGO_DIR=".cargo"
+CONFIG="$CARGO_DIR/config.toml"
+
+echo "Checking build dependencies..."
+
+# Check for C/C++ compiler
+if ! command -v cc &>/dev/null && ! command -v gcc &>/dev/null; then
+    echo "ERROR: No C compiler found. Install build-essential:"
+    echo "  sudo apt install build-essential"
+    exit 1
+fi
+
+# Check for Rust
+if ! command -v cargo &>/dev/null; then
+    echo "ERROR: cargo not found. Install Rust: https://rustup.rs"
+    exit 1
+fi
+
+# Find GCC include path (needed by bindgen for stddef.h)
+GCC_INCLUDE=""
+for dir in /usr/lib/gcc/x86_64-linux-gnu/*/include /usr/lib/gcc/aarch64-linux-gnu/*/include; do
+    if [ -f "$dir/stddef.h" ]; then
+        GCC_INCLUDE="$dir"
+        break
+    fi
+done
+
+# Check if libclang-common headers are available (makes the workaround unnecessary)
+CLANG_HAS_STDDEF=false
+for dir in /usr/lib/clang/*/include; do
+    if [ -f "$dir/stddef.h" ]; then
+        CLANG_HAS_STDDEF=true
+        break
+    fi
+done
+
+mkdir -p "$CARGO_DIR"
+
+if [ "$CLANG_HAS_STDDEF" = true ]; then
+    echo "  libclang headers found — no workaround needed"
+    cat > "$CONFIG" <<'EOF'
+# No special configuration needed — libclang headers are available.
+EOF
+elif [ -n "$GCC_INCLUDE" ]; then
+    echo "  GCC include path: $GCC_INCLUDE"
+    cat > "$CONFIG" <<EOF
+[env]
+# Points bindgen at GCC's stddef.h (auto-detected by ./configure).
+# Install libclang-common-*-dev to remove this workaround.
+BINDGEN_EXTRA_CLANG_ARGS = "-I${GCC_INCLUDE}"
+EOF
+else
+    echo "WARNING: Could not find stddef.h in GCC or clang paths."
+    echo "  RocksDB build may fail. Try: sudo apt install libclang-common-18-dev"
+    cat > "$CONFIG" <<'EOF'
+# WARNING: stddef.h not found. RocksDB build may fail.
+# Install libclang-common-*-dev or set BINDGEN_EXTRA_CLANG_ARGS manually.
+EOF
+fi
+
+echo "  Rust: $(rustc --version)"
+echo "  Cargo config: $CONFIG"
+echo ""
+
+# Verify the build works
+echo "Running cargo check..."
+if cargo check 2>&1 | tail -3; then
+    echo ""
+    echo "Build OK. Run tests with: cargo test"
+else
+    echo ""
+    echo "Build failed. See errors above."
+    exit 1
+fi

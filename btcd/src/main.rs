@@ -1,7 +1,10 @@
 mod config;
 
 use config::Config;
+use node::chain::state::ChainState;
 use node::rpc::auth::RpcAuth;
+use node::storage::db::RocksDbStore;
+use node::storage::flatfile::FlatFileManager;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -51,8 +54,43 @@ async fn main() {
     };
     let auth = Arc::new(auth);
 
-    // Genesis block for the selected network
-    let genesis = bitcoin::constants::genesis_block(config.network);
+    // Open block storage
+    let blocks_dir = net_datadir.join("blocks");
+    let chainstate_dir = net_datadir.join("chainstate");
+
+    let store = match RocksDbStore::open(&chainstate_dir) {
+        Ok(s) => Box::new(s),
+        Err(e) => {
+            eprintln!("Error opening chain database: {}", e);
+            auth.cleanup();
+            std::process::exit(1);
+        }
+    };
+
+    let flat_files = match FlatFileManager::new(&blocks_dir) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("Error initializing block storage: {}", e);
+            auth.cleanup();
+            std::process::exit(1);
+        }
+    };
+
+    // Initialize chain state (loads tip or writes genesis)
+    let chain_state = match ChainState::new(store, flat_files, config.network) {
+        Ok(cs) => Arc::new(cs),
+        Err(e) => {
+            eprintln!("Error initializing chain state: {}", e);
+            auth.cleanup();
+            std::process::exit(1);
+        }
+    };
+
+    tracing::info!(
+        height = chain_state.tip_height(),
+        tip = %chain_state.tip_hash(),
+        "Chain state initialized"
+    );
 
     // Shutdown channel
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
@@ -65,8 +103,7 @@ async fn main() {
     let server_handle = match node::rpc::server::start(
         bind_addr,
         auth.clone(),
-        config.network,
-        &genesis,
+        chain_state.clone(),
         shutdown_tx,
     )
     .await
