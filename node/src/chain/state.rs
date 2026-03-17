@@ -217,6 +217,11 @@ impl ChainState {
         self.store.coin_count()
     }
 
+    /// Get the total amount (in satoshis) across all UTXOs.
+    pub fn coin_total_amount(&self) -> u64 {
+        self.store.coin_total_amount()
+    }
+
     /// Access the script verifier (for mempool use).
     pub fn script_verifier(&self) -> &dyn ScriptVerifier {
         &*self.script_verifier
@@ -289,9 +294,7 @@ impl ChainState {
         let new_chainwork = add_u256(&parent.chainwork, &work_for_bits(block.header.bits));
 
         if prev_hash != current_tip {
-            // Side chain block — store but don't activate
-            // Reorg is deferred: during IBD, multiple peers send competing chains.
-            // Connecting only tip-extending blocks avoids oscillation.
+            // Side chain block — store it first
             let entry = BlockIndexEntry {
                 header: block.header,
                 height: new_height,
@@ -302,9 +305,84 @@ impl ChainState {
                 chainwork: new_chainwork,
             };
             let mut batch = crate::storage::StoreBatch::default();
-            batch.block_index_puts.push((block_hash, entry));
+            batch.block_index_puts.push((block_hash, entry.clone()));
             self.store.write_batch(batch)?;
-            return Ok(block_hash);
+
+            // Check if this side chain now has more work than the current tip
+            let tip_entry = self.store.get_block_index(&current_tip)
+                .ok_or(ChainError::BadPrevBlock)?;
+            if compare_u256(&new_chainwork, &tip_entry.chainwork) <= 0 {
+                // Side chain has less or equal work — don't reorg
+                return Ok(block_hash);
+            }
+
+            // Side chain has more work — find fork point and reorg
+            tracing::info!(
+                new_height,
+                old_tip_height = tip_entry.height,
+                "Reorg: side chain has more work, activating"
+            );
+
+            // Walk back from the side chain block to find the fork point
+            let fork_entry = {
+                let mut side_hash = prev_hash;
+                loop {
+                    let side_entry = self.store.get_block_index(&side_hash)
+                        .ok_or(ChainError::BadPrevBlock)?;
+                    // Fork point is a block that's on the main chain (Valid status)
+                    if side_entry.status == BlockStatus::Valid {
+                        break side_entry;
+                    }
+                    side_hash = side_entry.header.prev_blockhash;
+                }
+            };
+
+            // Disconnect blocks from current tip down to fork point
+            self.perform_reorg(&fork_entry, current_tip)?;
+
+            // Now connect the side chain blocks from fork point up to (but not including)
+            // the new block. Collect them first since we need to connect in forward order.
+            let mut to_connect = Vec::new();
+            {
+                let mut hash = prev_hash;
+                let fork_hash = fork_entry.header.block_hash();
+                while hash != fork_hash {
+                    to_connect.push(hash);
+                    let e = self.store.get_block_index(&hash)
+                        .ok_or(ChainError::BadPrevBlock)?;
+                    hash = e.header.prev_blockhash;
+                }
+                to_connect.reverse();
+            }
+            for side_hash in &to_connect {
+                let side_block = self.get_block(side_hash)
+                    .ok_or(ChainError::FlatFile("block data missing for reorg connect".to_string()))?;
+                let side_entry = self.store.get_block_index(side_hash)
+                    .ok_or(ChainError::BadPrevBlock)?;
+                let parent_entry = self.store.get_block_index(&side_entry.header.prev_blockhash)
+                    .ok_or(ChainError::BadPrevBlock)?;
+                let use_noop = self.should_skip_scripts(side_entry.height);
+                let noop = NoopVerifier;
+                let verifier: &dyn ScriptVerifier = if use_noop { &noop } else { &*self.script_verifier };
+                let mtp = self.get_median_time_past(side_entry.height);
+                let side_flat_pos = FlatFilePos {
+                    file_number: side_entry.file_number,
+                    data_pos: side_entry.data_pos,
+                };
+                let batch = connect::connect_block(
+                    &*self.store, &side_block, side_entry.height,
+                    &parent_entry.chainwork, side_flat_pos, verifier, mtp,
+                )?;
+                self.store.write_batch(batch)?;
+                {
+                    let mut tip = self.tip.write().unwrap();
+                    tip.hash = *side_hash;
+                    tip.height = side_entry.height;
+                }
+                tracing::info!(height = side_entry.height, hash = %side_hash, "Reorg: block connected");
+            }
+
+            // Fall through to connect the new block as a tip-extending block
         }
 
         // Determine script verifier: skip if below assumevalid height
@@ -466,6 +544,247 @@ mod tests {
 
         let result = cs.accept_block(&genesis);
         assert!(matches!(result, Err(ChainError::Duplicate)));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Build a valid regtest block at the given height with the given parent hash and timestamp.
+    fn build_test_block(parent_hash: BlockHash, height: u32, time: u32) -> Block {
+        use bitcoin::block::Header;
+        use bitcoin::blockdata::locktime::absolute::LockTime;
+        use bitcoin::hashes::Hash;
+        use bitcoin::pow::CompactTarget;
+        use bitcoin::transaction;
+        use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
+
+        let bits = CompactTarget::from_consensus(0x207fffff);
+
+        // BIP 34 coinbase scriptSig: push height, then push the timestamp
+        // as extra nonce to ensure each block's coinbase has a unique txid.
+        let height_script = bitcoin::script::Builder::new()
+            .push_int(height as i64)
+            .push_int(time as i64)
+            .push_opcode(bitcoin::opcodes::OP_FALSE)
+            .into_script();
+
+        let coinbase_input = TxIn {
+            previous_output: OutPoint::null(),
+            script_sig: height_script,
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        };
+
+        let coinbase_output = TxOut {
+            value: Amount::from_sat(5_000_000_000),
+            script_pubkey: ScriptBuf::new(),
+        };
+
+        let coinbase_tx = Transaction {
+            version: transaction::Version(2),
+            lock_time: LockTime::ZERO,
+            input: vec![coinbase_input],
+            output: vec![coinbase_output],
+        };
+
+        let txdata = vec![coinbase_tx];
+
+        // Build block with a dummy merkle root first, then compute the real one
+        let mut block = Block {
+            header: Header {
+                version: bitcoin::block::Version::from_consensus(0x20000000),
+                prev_blockhash: parent_hash,
+                merkle_root: bitcoin::TxMerkleNode::from_raw_hash(
+                    bitcoin::hashes::sha256d::Hash::from_byte_array([0u8; 32]),
+                ),
+                time,
+                bits,
+                nonce: 0,
+            },
+            txdata,
+        };
+
+        // Set the real merkle root
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+
+        // Mine: find a nonce whose hash satisfies PoW for 0x207fffff
+        let target = crate::storage::blockindex::target_from_compact(bits);
+        for nonce in 0u32..1_000_000 {
+            block.header.nonce = nonce;
+            let hash_bytes = *block.block_hash().as_raw_hash().as_byte_array();
+            // Block hash is displayed as little-endian but the byte array from
+            // to_byte_array() is the internal representation. For comparison with
+            // a big-endian target we need to reverse it.
+            let mut hash_be = [0u8; 32];
+            for i in 0..32 {
+                hash_be[i] = hash_bytes[31 - i];
+            }
+            // hash_be <= target means PoW satisfied
+            let mut ok = true;
+            for i in 0..32 {
+                if hash_be[i] < target[i] {
+                    break;
+                }
+                if hash_be[i] > target[i] {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                return block;
+            }
+        }
+        panic!("Failed to mine test block within 1,000,000 nonce iterations");
+    }
+
+    #[test]
+    fn test_reorg_longer_chain_wins() {
+        let (cs, dir) = make_chain_state();
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+        let genesis_hash = genesis.block_hash();
+        assert_eq!(cs.tip_height(), 0);
+
+        // Build chain A: genesis -> A1 -> A2
+        let a1 = build_test_block(genesis_hash, 1, 1_300_000_001);
+        let a1_hash = cs.accept_block(&a1).expect("accept A1");
+
+        let a2 = build_test_block(a1_hash, 2, 1_300_000_002);
+        let a2_hash = cs.accept_block(&a2).expect("accept A2");
+
+        assert_eq!(cs.tip_hash(), a2_hash);
+        assert_eq!(cs.tip_height(), 2);
+
+        // Build chain B: genesis -> B1 -> B2 -> B3 (different timestamps => different hashes)
+        let b1 = build_test_block(genesis_hash, 1, 1_300_000_003);
+        let b1_hash = cs.accept_block(&b1).expect("accept B1");
+        // B1 is a side chain block; tip should still be A2
+        assert_eq!(cs.tip_hash(), a2_hash);
+
+        let b2 = build_test_block(b1_hash, 2, 1_300_000_004);
+        let b2_hash = cs.accept_block(&b2).expect("accept B2");
+        // Equal work (2 blocks each); no reorg
+        assert_eq!(cs.tip_hash(), a2_hash);
+
+        let b3 = build_test_block(b2_hash, 3, 1_300_000_005);
+        let b3_hash = cs.accept_block(&b3).expect("accept B3");
+        // B chain now has more work => reorg
+        assert_eq!(cs.tip_hash(), b3_hash);
+        assert_eq!(cs.tip_height(), 3);
+
+        assert_eq!(cs.get_block_hash_by_height(1), Some(b1_hash));
+        assert_eq!(cs.get_block_hash_by_height(2), Some(b2_hash));
+        assert_eq!(cs.get_block_hash_by_height(3), Some(b3_hash));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_reorg_shorter_chain_no_switch() {
+        let (cs, dir) = make_chain_state();
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+
+        // Build chain A: genesis -> A1 -> A2 -> A3
+        let a1 = build_test_block(genesis_hash, 1, 1_300_000_001);
+        let a1_hash = cs.accept_block(&a1).expect("accept A1");
+        let a2 = build_test_block(a1_hash, 2, 1_300_000_002);
+        let a2_hash = cs.accept_block(&a2).expect("accept A2");
+        let a3 = build_test_block(a2_hash, 3, 1_300_000_003);
+        let a3_hash = cs.accept_block(&a3).expect("accept A3");
+
+        assert_eq!(cs.tip_hash(), a3_hash);
+        assert_eq!(cs.tip_height(), 3);
+
+        // Submit B1 forking from genesis (shorter chain, less work)
+        let b1 = build_test_block(genesis_hash, 1, 1_300_000_010);
+        cs.accept_block(&b1).expect("accept B1");
+
+        // Tip should remain A3
+        assert_eq!(cs.tip_hash(), a3_hash);
+        assert_eq!(cs.tip_height(), 3);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_reorg_equal_work_no_switch() {
+        let (cs, dir) = make_chain_state();
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+
+        // Build chain A: genesis -> A1
+        let a1 = build_test_block(genesis_hash, 1, 1_300_000_001);
+        let a1_hash = cs.accept_block(&a1).expect("accept A1");
+        assert_eq!(cs.tip_hash(), a1_hash);
+
+        // Submit B1 forking from genesis (equal work)
+        let b1 = build_test_block(genesis_hash, 1, 1_300_000_010);
+        cs.accept_block(&b1).expect("accept B1");
+
+        // Tip should remain A1 (equal work => no switch)
+        assert_eq!(cs.tip_hash(), a1_hash);
+        assert_eq!(cs.tip_height(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_reorg_utxo_consistency() {
+        let (cs, dir) = make_chain_state();
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+
+        // Build chain A: genesis -> A1 -> A2
+        let a1 = build_test_block(genesis_hash, 1, 1_300_000_001);
+        let a1_hash = cs.accept_block(&a1).expect("accept A1");
+        let a1_coinbase_txid = a1.txdata[0].compute_txid();
+
+        let a2 = build_test_block(a1_hash, 2, 1_300_000_002);
+        cs.accept_block(&a2).expect("accept A2");
+        let a2_coinbase_txid = a2.txdata[0].compute_txid();
+
+        // Verify A-chain UTXOs exist before reorg
+        let a1_cb_op = OutPoint { txid: a1_coinbase_txid, vout: 0 };
+        let a2_cb_op = OutPoint { txid: a2_coinbase_txid, vout: 0 };
+        assert!(cs.get_coin(&a1_cb_op).is_some());
+        assert!(cs.get_coin(&a2_cb_op).is_some());
+
+        // Build chain B: genesis -> B1 -> B2 -> B3 (more work => triggers reorg)
+        let b1 = build_test_block(genesis_hash, 1, 1_300_000_003);
+        let b1_hash = cs.accept_block(&b1).expect("accept B1");
+        let b1_coinbase_txid = b1.txdata[0].compute_txid();
+
+        let b2 = build_test_block(b1_hash, 2, 1_300_000_004);
+        let b2_hash = cs.accept_block(&b2).expect("accept B2");
+        let b2_coinbase_txid = b2.txdata[0].compute_txid();
+
+        let b3 = build_test_block(b2_hash, 3, 1_300_000_005);
+        cs.accept_block(&b3).expect("accept B3");
+        let b3_coinbase_txid = b3.txdata[0].compute_txid();
+
+        // Reorg should have happened — tip is B3
+        assert_eq!(cs.tip_height(), 3, "tip should be at height 3 after reorg");
+        assert_eq!(cs.tip_hash(), b3.block_hash(), "tip should be B3");
+
+        // After reorg: A-chain coinbase UTXOs must NOT exist
+        assert!(
+            cs.get_coin(&OutPoint { txid: a1_coinbase_txid, vout: 0 }).is_none(),
+            "A1 coinbase UTXO should not exist after reorg"
+        );
+        assert!(
+            cs.get_coin(&OutPoint { txid: a2_coinbase_txid, vout: 0 }).is_none(),
+            "A2 coinbase UTXO should not exist after reorg"
+        );
+
+        // B-chain coinbase UTXOs must exist
+        assert!(
+            cs.get_coin(&OutPoint { txid: b1_coinbase_txid, vout: 0 }).is_some(),
+            "B1 coinbase UTXO should exist after reorg"
+        );
+        assert!(
+            cs.get_coin(&OutPoint { txid: b2_coinbase_txid, vout: 0 }).is_some(),
+            "B2 coinbase UTXO should exist after reorg"
+        );
+        assert!(
+            cs.get_coin(&OutPoint { txid: b3_coinbase_txid, vout: 0 }).is_some(),
+            "B3 coinbase UTXO should exist after reorg"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
