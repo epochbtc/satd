@@ -2,6 +2,7 @@ mod config;
 
 use config::Config;
 use node::chain::state::ChainState;
+use node::mempool::fee::FeeEstimator;
 use node::mempool::policy::{DEFAULT_MAX_MEMPOOL_SIZE, DEFAULT_MIN_RELAY_FEE_RATE};
 use node::mempool::pool::Mempool;
 use node::rpc::auth::RpcAuth;
@@ -114,21 +115,23 @@ async fn main() {
         "Chain state initialized"
     );
 
-    // Initialize mempool
+    // Initialize mempool and fee estimator
     let mempool = Arc::new(Mempool::new(
         DEFAULT_MAX_MEMPOOL_SIZE,
         DEFAULT_MIN_RELAY_FEE_RATE,
     ));
+    let fee_estimator = Arc::new(FeeEstimator::new());
+
+    // Shutdown channel
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
     // Initialize P2P peer manager
     let peer_manager = node::net::manager::PeerManager::new(
         chain_state.clone(),
         mempool.clone(),
         config.network,
+        shutdown_rx.clone(),
     );
-
-    // Shutdown channel
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
     // Start RPC server
     let bind_addr: SocketAddr = format!("{}:{}", config.rpcbind, config.rpcport)
@@ -141,6 +144,7 @@ async fn main() {
         chain_state.clone(),
         mempool.clone(),
         peer_manager.clone(),
+        fee_estimator.clone(),
         shutdown_tx,
     )
     .await
@@ -177,6 +181,23 @@ async fn main() {
             tokio::spawn(async move {
                 if let Err(e) = pm.connect_outbound(addr).await {
                     tracing::warn!(%addr, "Failed to connect to peer: {}", e);
+                }
+            });
+        }
+    }
+
+    // DNS seeding: only if no explicit --connect peers are configured
+    // (matches Bitcoin Core behavior where --connect disables DNS seeding)
+    if config.connect.is_empty() {
+        let dns_addrs =
+            node::net::dns::resolve_dns_seeds(config.network).await;
+        let max_dns_outbound = 8;
+        for addr in dns_addrs.into_iter().take(max_dns_outbound) {
+            peer_manager.add_connect_addr(addr);
+            let pm = peer_manager.clone();
+            tokio::spawn(async move {
+                if let Err(e) = pm.connect_outbound(addr).await {
+                    tracing::warn!(%addr, "DNS seed peer connection failed: {}", e);
                 }
             });
         }

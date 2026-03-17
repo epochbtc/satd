@@ -12,9 +12,14 @@ use tokio::sync::mpsc;
 
 use crate::chain::state::ChainState;
 use crate::mempool::pool::Mempool;
+use crate::net::compact;
 use crate::net::connection::Connection;
 use crate::net::peer::{Direction, PeerId, PeerInfo, PeerState};
 use crate::net::sync;
+
+const MAX_OUTBOUND: usize = 8;
+const MAX_INBOUND: usize = 117;
+const BAN_THRESHOLD: u32 = 100;
 
 /// Event sent from peer tasks to the central manager loop.
 pub enum NetEvent {
@@ -55,6 +60,10 @@ pub struct PeerManager {
     connect_addrs: RwLock<Vec<SocketAddr>>,
     /// Channel to send received blocks to the processing thread.
     block_tx: mpsc::UnboundedSender<bitcoin::Block>,
+    /// Pending compact blocks awaiting missing transactions.
+    pending_compact: RwLock<HashMap<bitcoin::BlockHash, compact::PendingCompact>>,
+    /// Shutdown signal.
+    shutdown: tokio::sync::watch::Receiver<bool>,
 }
 
 impl PeerManager {
@@ -62,6 +71,7 @@ impl PeerManager {
         chain_state: Arc<ChainState>,
         mempool: Arc<Mempool>,
         network: Network,
+        shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Arc<Self> {
         let (event_tx, event_rx) = mpsc::channel(4096);
         let (block_tx, block_rx) = mpsc::unbounded_channel();
@@ -78,6 +88,8 @@ impl PeerManager {
             requested_blocks: RwLock::new(std::collections::HashSet::new()),
             connect_addrs: RwLock::new(Vec::new()),
             block_tx,
+            pending_compact: RwLock::new(HashMap::new()),
+            shutdown,
         });
 
         // Spawn block processing thread
@@ -97,6 +109,20 @@ impl PeerManager {
 
     /// Connect to an outbound peer.
     pub async fn connect_outbound(self: &Arc<Self>, addr: SocketAddr) -> Result<(), String> {
+        {
+            let peers = self.peers.read().unwrap();
+            let outbound_count = peers
+                .values()
+                .filter(|h| {
+                    h.info.direction == Direction::Outbound
+                        && h.info.state == PeerState::Connected
+                })
+                .count();
+            if outbound_count >= MAX_OUTBOUND {
+                return Err("max outbound connections reached".to_string());
+            }
+        }
+
         let stream = TcpStream::connect(addr)
             .await
             .map_err(|e| format!("connect failed: {}", e))?;
@@ -110,6 +136,21 @@ impl PeerManager {
 
     /// Accept an inbound connection.
     pub fn accept_inbound(self: &Arc<Self>, stream: TcpStream, addr: SocketAddr) {
+        {
+            let peers = self.peers.read().unwrap();
+            let inbound_count = peers
+                .values()
+                .filter(|h| {
+                    h.info.direction == Direction::Inbound
+                        && h.info.state == PeerState::Connected
+                })
+                .count();
+            if inbound_count >= MAX_INBOUND {
+                tracing::warn!(%addr, "Max inbound connections reached, dropping connection");
+                return;
+            }
+        }
+
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         tracing::info!(%addr, id, "Accepted inbound peer");
         self.spawn_peer(id, addr, stream, Direction::Inbound);
@@ -165,14 +206,43 @@ impl PeerManager {
             .count()
     }
 
-    /// Run the main event loop.
+    /// Add ban score to a peer. If the score exceeds BAN_THRESHOLD, the peer
+    /// is disconnected and removed.
+    fn add_ban_score(&self, id: PeerId, score: u32, reason: &str) {
+        let mut peers = self.peers.write().unwrap();
+        let should_ban = if let Some(handle) = peers.get_mut(&id) {
+            handle.info.ban_score += score;
+            if handle.info.ban_score >= BAN_THRESHOLD {
+                tracing::warn!(id, addr = %handle.info.addr, score = handle.info.ban_score, reason, "Banning peer");
+                true
+            } else {
+                tracing::debug!(id, score = handle.info.ban_score, reason, "Increased ban score");
+                false
+            }
+        } else {
+            false
+        };
+        if should_ban {
+            peers.remove(&id);
+        }
+    }
+
+    /// Run the main event loop. Returns when shutdown signal is received.
     pub async fn run(self: &Arc<Self>) {
         let mut event_rx = self.event_rx.lock().await;
         let mut sync_interval = tokio::time::interval(std::time::Duration::from_millis(500));
         let mut last_tip: u32 = 0;
         let mut ticks: u64 = 0;
+        let mut shutdown = self.shutdown.clone();
 
         loop {
+            // Check for shutdown
+            if *shutdown.borrow() {
+                tracing::info!("P2P manager shutting down");
+                // Drop all peers to close connections
+                self.peers.write().unwrap().clear();
+                return;
+            }
             // Process up to 64 events per iteration, then yield for sync
             let mut processed = 0;
             loop {
@@ -289,6 +359,22 @@ impl PeerManager {
             NetworkMessage::GetData(inv) => {
                 self.handle_getdata(id, inv);
             }
+            NetworkMessage::SendCmpct(msg) => {
+                let mut peers = self.peers.write().unwrap();
+                if let Some(handle) = peers.get_mut(&id) {
+                    handle.info.compact_blocks = msg.send_compact;
+                    tracing::debug!(id, version = msg.version, "Peer supports compact blocks");
+                }
+            }
+            NetworkMessage::CmpctBlock(msg) => {
+                self.handle_compact_block(id, msg.compact_block);
+            }
+            NetworkMessage::GetBlockTxn(msg) => {
+                self.handle_get_block_txn(id, msg.txs_request);
+            }
+            NetworkMessage::BlockTxn(msg) => {
+                self.handle_block_txn(id, msg.transactions);
+            }
             _ => {}
         }
     }
@@ -334,7 +420,7 @@ impl PeerManager {
                     accepted += 1;
                 }
                 Err(e) => {
-                    tracing::warn!(id, "Header rejected: {}", e);
+                    self.add_ban_score(id, 20, &format!("Header rejected: {}", e));
                     break;
                 }
             }
@@ -407,7 +493,7 @@ impl PeerManager {
         }
     }
 
-    fn handle_tx(&self, _id: PeerId, tx: bitcoin::Transaction) {
+    fn handle_tx(&self, id: PeerId, tx: bitcoin::Transaction) {
         let txid = tx.compute_txid();
         match self.mempool.accept_transaction(
             tx,
@@ -421,6 +507,7 @@ impl PeerManager {
             }
             Err(e) => {
                 tracing::debug!(%txid, "Tx rejected: {}", e);
+                self.add_ban_score(id, 1, &format!("Tx rejected: {}", e));
             }
         }
     }
@@ -470,6 +557,81 @@ impl PeerManager {
                     }
                 }
                 _ => {}
+            }
+        }
+    }
+
+    fn handle_compact_block(&self, id: PeerId, compact: bitcoin::bip152::HeaderAndShortIds) {
+        let block_hash = compact.header.block_hash();
+
+        // Skip if we already have this block
+        if let Some(entry) = self.chain_state.get_block_index(&block_hash) {
+            if entry.status != crate::storage::blockindex::BlockStatus::HeaderOnly {
+                return;
+            }
+        }
+
+        match compact::try_reconstruct(&compact, &self.mempool) {
+            Ok(block) => {
+                tracing::debug!(%block_hash, "Compact block fully reconstructed from mempool");
+                let _ = self.block_tx.send(block);
+            }
+            Err(pending) => {
+                if pending.missing_indices.is_empty() {
+                    return; // Malformed
+                }
+                tracing::debug!(
+                    %block_hash,
+                    missing = pending.missing_indices.len(),
+                    "Compact block incomplete, requesting missing txs"
+                );
+                let request = compact::make_get_block_txn(block_hash, &pending.missing_indices);
+                self.send_to_peer(
+                    id,
+                    NetworkMessage::GetBlockTxn(
+                        bitcoin::p2p::message_compact_blocks::GetBlockTxn {
+                            txs_request: request,
+                        },
+                    ),
+                );
+                self.pending_compact.write().unwrap().insert(block_hash, pending);
+            }
+        }
+    }
+
+    fn handle_get_block_txn(
+        &self,
+        id: PeerId,
+        request: bitcoin::bip152::BlockTransactionsRequest,
+    ) {
+        if let Some(block) = self.chain_state.get_block(&request.block_hash) {
+            match bitcoin::bip152::BlockTransactions::from_request(&request, &block) {
+                Ok(txns) => {
+                    self.send_to_peer(
+                        id,
+                        NetworkMessage::BlockTxn(
+                            bitcoin::p2p::message_compact_blocks::BlockTxn {
+                                transactions: txns,
+                            },
+                        ),
+                    );
+                }
+                Err(e) => {
+                    tracing::debug!(id, "GetBlockTxn request out of range: {}", e);
+                }
+            }
+        }
+    }
+
+    fn handle_block_txn(&self, _id: PeerId, txns: bitcoin::bip152::BlockTransactions) {
+        let block_hash = txns.block_hash;
+        let pending = self.pending_compact.write().unwrap().remove(&block_hash);
+        if let Some(pending) = pending {
+            if let Some(block) = compact::complete_pending(pending, &txns) {
+                tracing::debug!(%block_hash, "Compact block completed with BlockTxn");
+                let _ = self.block_tx.send(block);
+            } else {
+                tracing::debug!(%block_hash, "Failed to complete compact block");
             }
         }
     }
@@ -574,6 +736,16 @@ impl PeerManager {
         conn.send(getheaders)
             .await
             .map_err(|e| e.to_string())?;
+
+        // Negotiate compact block support (BIP 152, version 2 = with witness)
+        conn.send(NetworkMessage::SendCmpct(
+            bitcoin::p2p::message_compact_blocks::SendCmpct {
+                send_compact: true,
+                version: 2,
+            },
+        ))
+        .await
+        .map_err(|e| format!("send sendcmpct: {}", e))?;
 
         // Main message loop with idle timeout
         loop {
