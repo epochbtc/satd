@@ -289,37 +289,22 @@ impl ChainState {
         let new_chainwork = add_u256(&parent.chainwork, &work_for_bits(block.header.bits));
 
         if prev_hash != current_tip {
-            // Side chain block — check if it has more work
-            let tip_entry = self.store.get_block_index(&current_tip).unwrap();
-            if compare_u256(&new_chainwork, &tip_entry.chainwork) <= 0 {
-                // Less or equal work — store but don't activate
-                let entry = BlockIndexEntry {
-                    header: block.header,
-                    height: new_height,
-                    status: BlockStatus::DataStored,
-                    num_tx: block.txdata.len() as u32,
-                    file_number: flat_pos.file_number,
-                    data_pos: flat_pos.data_pos,
-                    chainwork: new_chainwork,
-                };
-                let mut batch = crate::storage::StoreBatch::default();
-                batch.block_index_puts.push((block_hash, entry));
-                self.store.write_batch(batch)?;
-                tracing::info!(
-                    height = new_height,
-                    hash = %block_hash,
-                    "Side chain block stored (not activated)"
-                );
-                return Ok(block_hash);
-            }
-
-            // More work — perform reorg
-            tracing::info!(
-                old_tip = %current_tip,
-                new_tip = %block_hash,
-                "Reorganizing to longer chain"
-            );
-            self.perform_reorg(&parent, current_tip)?;
+            // Side chain block — store but don't activate
+            // Reorg is deferred: during IBD, multiple peers send competing chains.
+            // Connecting only tip-extending blocks avoids oscillation.
+            let entry = BlockIndexEntry {
+                header: block.header,
+                height: new_height,
+                status: BlockStatus::DataStored,
+                num_tx: block.txdata.len() as u32,
+                file_number: flat_pos.file_number,
+                data_pos: flat_pos.data_pos,
+                chainwork: new_chainwork,
+            };
+            let mut batch = crate::storage::StoreBatch::default();
+            batch.block_index_puts.push((block_hash, entry));
+            self.store.write_batch(batch)?;
+            return Ok(block_hash);
         }
 
         // Determine script verifier: skip if below assumevalid height

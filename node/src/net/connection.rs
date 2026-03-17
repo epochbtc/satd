@@ -34,46 +34,54 @@ impl Connection {
         self.stream.write_all(&bytes).await
     }
 
-    /// Receive the next network message.
+    /// Receive the next network message. Skips messages that fail to deserialize.
     pub async fn recv(&mut self) -> io::Result<NetworkMessage> {
-        // Read 24-byte header
-        let mut header = [0u8; HEADER_SIZE];
-        self.stream.read_exact(&mut header).await?;
+        loop {
+            // Read 24-byte header
+            let mut header = [0u8; HEADER_SIZE];
+            self.stream.read_exact(&mut header).await?;
 
-        // Parse payload length from header bytes 16..20 (little-endian u32)
-        let payload_len =
-            u32::from_le_bytes([header[16], header[17], header[18], header[19]]) as usize;
+            // Parse payload length from header bytes 16..20 (little-endian u32)
+            let payload_len =
+                u32::from_le_bytes([header[16], header[17], header[18], header[19]]) as usize;
 
-        if payload_len > MAX_PAYLOAD_SIZE {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("payload too large: {} bytes", payload_len),
-            ));
+            if payload_len > MAX_PAYLOAD_SIZE {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("payload too large: {} bytes", payload_len),
+                ));
+            }
+
+            // Read payload
+            let mut payload = vec![0u8; payload_len];
+            if payload_len > 0 {
+                self.stream.read_exact(&mut payload).await?;
+            }
+
+            // Combine header + payload and deserialize
+            self.buf.clear();
+            self.buf.extend_from_slice(&header);
+            self.buf.extend_from_slice(&payload);
+
+            match deserialize::<RawNetworkMessage>(&self.buf) {
+                Ok(raw) => {
+                    if *raw.magic() != self.magic {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "wrong network magic",
+                        ));
+                    }
+                    return Ok(raw.payload().clone());
+                }
+                Err(_) => {
+                    // Unknown or malformed message — skip it and read the next one.
+                    // Extract command name from header for logging.
+                    let cmd = String::from_utf8_lossy(&header[4..16]);
+                    tracing::debug!(cmd = %cmd.trim_end_matches('\0'), "Skipping unparseable message");
+                    continue;
+                }
+            }
         }
-
-        // Read payload
-        let mut payload = vec![0u8; payload_len];
-        if payload_len > 0 {
-            self.stream.read_exact(&mut payload).await?;
-        }
-
-        // Combine header + payload and deserialize
-        self.buf.clear();
-        self.buf.extend_from_slice(&header);
-        self.buf.extend_from_slice(&payload);
-
-        let raw: RawNetworkMessage =
-            deserialize(&self.buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-        // Validate magic
-        if *raw.magic() != self.magic {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "wrong network magic",
-            ));
-        }
-
-        Ok(raw.payload().clone())
     }
 
     /// Get a reference to the underlying stream (for split operations).

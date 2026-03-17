@@ -203,28 +203,28 @@ impl PeerManager {
                 last_tip = tip;
             }
 
-            // Request more blocks if we're behind headers and have capacity
-            if tip < htip {
-                let req_count = self.requested_blocks.read().unwrap().len();
-                if req_count < 256 {
-                    let peer_ids: Vec<PeerId> = {
-                        let peers = self.peers.read().unwrap();
-                        peers.iter()
-                            .filter(|(_, h)| h.info.state == PeerState::Connected)
-                            .map(|(id, _)| *id)
-                            .collect()
-                    };
-                    for pid in peer_ids {
-                        self.request_missing_blocks(pid);
+            // Request blocks every 10 ticks (5 seconds) and headers every 20 ticks (10 seconds)
+            if ticks % 10 == 0 {
+                let peer_ids: Vec<PeerId> = {
+                    let peers = self.peers.read().unwrap();
+                    peers.iter()
+                        .filter(|(_, h)| h.info.state == PeerState::Connected)
+                        .map(|(id, _)| *id)
+                        .collect()
+                };
+                for pid in &peer_ids {
+                    self.request_missing_blocks(*pid);
+                }
+                if ticks % 20 == 0 {
+                    for pid in &peer_ids {
+                        self.send_to_peer(*pid, sync::make_getheaders(&self.chain_state));
                     }
                 }
             }
 
             ticks += 1;
-            // Every 20 ticks (10 seconds), clear stale requests and check peers
+            // Every 20 ticks (10 seconds), check peers
             if ticks % 20 == 0 {
-                self.requested_blocks.write().unwrap().clear();
-
                 // Auto-reconnect if no peers connected
                 if self.connection_count() == 0 {
                     let addrs = self.connect_addrs.read().unwrap().clone();
@@ -357,9 +357,6 @@ impl PeerManager {
     }
 
     fn handle_block(&self, _id: PeerId, block: bitcoin::Block) {
-        let hash = block.block_hash();
-        // Remove from requested tracking and send to processing thread
-        self.requested_blocks.write().unwrap().remove(&hash);
         let _ = self.block_tx.send(block);
     }
 
@@ -480,12 +477,11 @@ impl PeerManager {
     fn request_missing_blocks(&self, id: PeerId) {
         let tip = self.chain_state.tip_height();
         let mut to_request = Vec::new();
-        let requested = self.requested_blocks.read().unwrap();
 
-        // Request blocks from tip+1 upward where we have headers but no data
+        // Request blocks from tip+1 upward where we have headers but no block data
         for h in (tip + 1)..=(tip + 512) {
             if let Some(hash) = self.chain_state.get_block_hash_by_height(h) {
-                if !self.chain_state.has_block_data(&hash) && !requested.contains(&hash) {
+                if !self.chain_state.has_block_data(&hash) {
                     to_request.push(hash);
                     if to_request.len() >= 128 {
                         break;
@@ -495,16 +491,9 @@ impl PeerManager {
                 break;
             }
         }
-        drop(requested);
 
         if !to_request.is_empty() {
-            // Mark as requested
-            let mut req = self.requested_blocks.write().unwrap();
-            for hash in &to_request {
-                req.insert(*hash);
-            }
-            drop(req);
-
+            tracing::debug!(tip, count = to_request.len(), "Requesting blocks");
             self.send_to_peer(id, sync::make_getdata_blocks(&to_request));
         }
     }
@@ -550,7 +539,7 @@ impl PeerManager {
         let manager = Arc::clone(self);
         tokio::spawn(async move {
             if let Err(e) = manager.peer_task(id, stream, direction, msg_rx).await {
-                tracing::debug!(id, %addr, "Peer task ended: {}", e);
+                tracing::warn!(id, %addr, "Peer task ended: {}", e);
             }
             let _ = manager.event_tx.send(NetEvent::PeerDisconnected { id }).await;
         });
