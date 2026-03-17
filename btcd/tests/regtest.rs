@@ -472,3 +472,32 @@ fn test_sendrawtransaction_invalid() {
 
     node.stop();
 }
+
+#[test]
+fn test_getpeerinfo() {
+    let mut node = TestNode::start(&[]);
+    let response = node.rpc_call("getpeerinfo").unwrap();
+    let result = &response["result"];
+    assert!(result.is_array());
+    // No peers connected yet
+    assert_eq!(result.as_array().unwrap().len(), 0);
+    node.stop();
+}
+
+#[test]
+fn test_getconnectioncount() {
+    let mut node = TestNode::start(&[]);
+    let response = node.rpc_call("getconnectioncount").unwrap();
+    assert_eq!(response["result"], 0);
+    node.stop();
+}
+
+#[test]
+fn test_getnetworkinfo_connections() {
+    let mut node = TestNode::start(&[]);
+    let response = node.rpc_call("getnetworkinfo").unwrap();
+    let result = &response["result"];
+    assert_eq!(result["connections"], 0);
+    assert_eq!(result["subversion"], "/btcd:0.1.0/");
+    node.stop();
+}

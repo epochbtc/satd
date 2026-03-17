@@ -110,6 +110,13 @@ async fn main() {
         DEFAULT_MIN_RELAY_FEE_RATE,
     ));
 
+    // Initialize P2P peer manager
+    let peer_manager = node::net::manager::PeerManager::new(
+        chain_state.clone(),
+        mempool.clone(),
+        config.network,
+    );
+
     // Shutdown channel
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
@@ -123,6 +130,7 @@ async fn main() {
         auth.clone(),
         chain_state.clone(),
         mempool.clone(),
+        peer_manager.clone(),
         shutdown_tx,
     )
     .await
@@ -136,6 +144,38 @@ async fn main() {
     };
 
     tracing::info!(%bind_addr, "RPC server listening");
+
+    // Start P2P networking
+    if config.listen {
+        let p2p_addr: SocketAddr = format!("0.0.0.0:{}", config.port)
+            .parse()
+            .expect("Invalid P2P bind address");
+        let pm = peer_manager.clone();
+        tokio::spawn(async move {
+            if let Err(e) = pm.listen(p2p_addr).await {
+                tracing::error!("P2P listener error: {}", e);
+            }
+        });
+        tracing::info!(port = config.port, "P2P listening");
+    }
+
+    // Connect to configured peers
+    for addr_str in &config.connect {
+        if let Ok(addr) = addr_str.parse::<SocketAddr>() {
+            let pm = peer_manager.clone();
+            tokio::spawn(async move {
+                if let Err(e) = pm.connect_outbound(addr).await {
+                    tracing::warn!(%addr, "Failed to connect to peer: {}", e);
+                }
+            });
+        }
+    }
+
+    // Spawn P2P event loop
+    {
+        let pm = peer_manager.clone();
+        tokio::spawn(async move { pm.run().await });
+    }
 
     // Wait for shutdown signal (stop RPC or Ctrl+C)
     tokio::select! {

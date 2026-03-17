@@ -120,6 +120,59 @@ impl ChainState {
         self.store.get_coin(outpoint)
     }
 
+    /// Check if we have block data (not just a header) for a block.
+    pub fn has_block_data(&self, hash: &BlockHash) -> bool {
+        self.store
+            .get_block_index(hash)
+            .map(|e| e.status == BlockStatus::Valid || e.status == BlockStatus::DataStored)
+            .unwrap_or(false)
+    }
+
+    /// Accept a block header without block data (for headers-first sync).
+    /// Validates PoW and difficulty but does not process transactions.
+    pub fn accept_header(&self, header: &bitcoin::block::Header) -> Result<BlockHash, ChainError> {
+        let hash = header.block_hash();
+
+        // Already known?
+        if self.store.get_block_index(&hash).is_some() {
+            return Ok(hash);
+        }
+
+        // Parent must exist
+        let parent = self
+            .store
+            .get_block_index(&header.prev_blockhash)
+            .ok_or(ChainError::BadPrevBlock)?;
+
+        let new_height = parent.height + 1;
+
+        // PoW validation
+        validation::pow::check_proof_of_work(header)?;
+
+        // Difficulty check
+        validation::pow::check_difficulty(header, &parent, self.network)?;
+
+        // Store as header-only
+        let chainwork =
+            crate::storage::blockindex::add_u256(&parent.chainwork, &crate::storage::blockindex::work_for_bits(header.bits));
+        let entry = BlockIndexEntry {
+            header: *header,
+            height: new_height,
+            status: BlockStatus::HeaderOnly,
+            num_tx: 0,
+            file_number: 0,
+            data_pos: 0,
+            chainwork,
+        };
+
+        let mut batch = crate::storage::StoreBatch::default();
+        batch.block_index_puts.push((hash, entry));
+        batch.height_hash_puts.push((new_height, hash));
+        self.store.write_batch(batch)?;
+
+        Ok(hash)
+    }
+
     /// Access the script verifier (for mempool use).
     pub fn script_verifier(&self) -> &dyn ScriptVerifier {
         &*self.script_verifier

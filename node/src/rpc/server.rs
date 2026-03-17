@@ -1,5 +1,6 @@
 use crate::chain::state::ChainState;
 use crate::mempool::pool::Mempool;
+use crate::net::manager::PeerManager;
 use crate::rpc::auth::{AuthLayer, RpcAuth};
 use crate::rpc::{blockchain, mining, network, rawtx};
 use jsonrpsee::server::{RpcModule, ServerBuilder, ServerHandle};
@@ -12,6 +13,7 @@ use tokio::sync::watch;
 pub struct RpcContext {
     pub chain_state: Arc<ChainState>,
     pub mempool: Arc<Mempool>,
+    pub peer_manager: Arc<PeerManager>,
     pub shutdown_tx: watch::Sender<bool>,
 }
 
@@ -21,11 +23,13 @@ pub async fn start(
     auth: Arc<RpcAuth>,
     chain_state: Arc<ChainState>,
     mempool: Arc<Mempool>,
+    peer_manager: Arc<PeerManager>,
     shutdown_tx: watch::Sender<bool>,
 ) -> Result<ServerHandle, Box<dyn std::error::Error + Send + Sync>> {
     let ctx = Arc::new(RpcContext {
         chain_state,
         mempool,
+        peer_manager,
         shutdown_tx,
     });
 
@@ -37,8 +41,8 @@ pub async fn start(
         Ok::<_, ErrorObjectOwned>(blockchain::get_blockchain_info(&ctx.chain_state))
     })?;
 
-    module.register_method("getnetworkinfo", |_params, _ctx, _extensions| {
-        Ok::<_, ErrorObjectOwned>(network::get_network_info())
+    module.register_method("getnetworkinfo", |_params, ctx, _extensions| {
+        Ok::<_, ErrorObjectOwned>(network::get_network_info(&ctx.peer_manager))
     })?;
 
     module.register_method("getbestblockhash", |_params, ctx, _extensions| {
@@ -139,6 +143,45 @@ pub async fn start(
         })?;
         rawtx::decode_raw_transaction(&hex_tx)
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
+    })?;
+
+    // --- P2P RPCs ---
+
+    module.register_method("getpeerinfo", |_params, ctx, _extensions| {
+        Ok::<_, ErrorObjectOwned>(serde_json::json!(ctx.peer_manager.get_peer_info()))
+    })?;
+
+    module.register_method("getconnectioncount", |_params, ctx, _extensions| {
+        Ok::<_, ErrorObjectOwned>(serde_json::json!(ctx.peer_manager.connection_count()))
+    })?;
+
+    module.register_async_method("addnode", |params, ctx, _extensions| async move {
+        let mut seq = params.sequence();
+        let addr_str: String = seq.next().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        let command: String = seq.optional_next().unwrap_or(Some("onetry".to_string())).unwrap_or("onetry".to_string());
+
+        if command == "onetry" || command == "add" {
+            let addr: std::net::SocketAddr = addr_str.parse().map_err(|e: std::net::AddrParseError| {
+                ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+            })?;
+            ctx.peer_manager.connect_outbound(addr).await.map_err(|e| {
+                ErrorObjectOwned::owned(-1, e, None::<()>)
+            })?;
+        }
+        Ok::<_, ErrorObjectOwned>(serde_json::Value::Null)
+    })?;
+
+    module.register_method("disconnectnode", |params, ctx, _extensions| {
+        let addr_str: String = params.one().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        let addr: std::net::SocketAddr = addr_str.parse().map_err(|e: std::net::AddrParseError| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        ctx.peer_manager.disconnect(&addr);
+        Ok::<_, ErrorObjectOwned>(serde_json::Value::Null)
     })?;
 
     // --- Control RPCs ---

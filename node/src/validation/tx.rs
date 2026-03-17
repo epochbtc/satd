@@ -72,13 +72,9 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_outputs_rejected() {
-        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
-        let mut tx = genesis.txdata[0].clone();
-        // Clear outputs
-        let mut tx_parts = bitcoin::consensus::serialize(&tx);
-        // Easier: just construct a minimal bad tx
-        // Actually let's just verify the genesis passes and trust structure tests
-        let _ = tx;
+    fn test_mainnet_genesis_coinbase_passes() {
+        let genesis = bitcoin::constants::genesis_block(Network::Bitcoin);
+        let coinbase = &genesis.txdata[0];
+        assert!(check_transaction(coinbase).is_ok());
     }
 }

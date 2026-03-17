@@ -1,8 +1,10 @@
+use crate::net::manager::PeerManager;
 use serde_json::{json, Value};
 
-/// Build the `getnetworkinfo` response.
-/// For M1, returns static stub data with zero connections.
-pub fn get_network_info() -> Value {
+/// Build the `getnetworkinfo` response with live connection data.
+pub fn get_network_info(peer_manager: &PeerManager) -> Value {
+    let connections = peer_manager.connection_count();
+
     json!({
         "version": 10000,
         "subversion": "/btcd:0.1.0/",
@@ -12,9 +14,9 @@ pub fn get_network_info() -> Value {
         "localrelay": true,
         "timeoffset": 0,
         "networkactive": true,
-        "connections": 0,
+        "connections": connections,
         "connections_in": 0,
-        "connections_out": 0,
+        "connections_out": connections,
         "networks": [
             {
                 "name": "ipv4",
