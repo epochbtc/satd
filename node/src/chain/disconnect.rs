@@ -1,6 +1,5 @@
 use bitcoin::{Block, OutPoint};
 
-use crate::storage::coinview::Coin;
 use crate::storage::undo::UndoData;
 use crate::storage::StoreBatch;
 
@@ -32,8 +31,9 @@ pub fn disconnect_block(
         batch.coin_puts.push((outpoint, coin.clone()));
     }
 
-    // Update tip to previous block
+    // Update tip to previous block and clean height index
     batch.tip = Some(prev_hash);
+    batch.height_hash_removes.push(block_height);
 
     batch
 }

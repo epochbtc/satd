@@ -1,8 +1,9 @@
 use bitcoin::block::{Header, Version};
+use bitcoin::hashes::Hash;
 use bitcoin::blockdata::script::Builder;
 use bitcoin::blockdata::opcodes;
 use bitcoin::{
-    Address, Amount, Block, Network, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut,
+    Address, Amount, Block, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut,
     Witness,
 };
 
@@ -40,15 +41,42 @@ pub fn mine_block(
     let coinbase_script = addr.script_pubkey();
 
     // Build coinbase transaction
-    let coinbase_tx = build_coinbase(template.height, template.coinbase_value, &coinbase_script);
+    let mut coinbase_tx = build_coinbase(template.height, template.coinbase_value, &coinbase_script);
 
-    // Assemble transactions: coinbase first, then template transactions
-    let mut txdata = vec![coinbase_tx];
-    for ttx in &template.transactions {
-        txdata.push(ttx.tx.clone());
+    // Assemble non-coinbase transactions
+    let other_txs: Vec<Transaction> = template.transactions.iter().map(|t| t.tx.clone()).collect();
+
+    // Check if any transaction has witness data
+    let has_witness = other_txs.iter().any(|tx| {
+        tx.input.iter().any(|i| !i.witness.is_empty())
+    });
+
+    if has_witness {
+        // Compute witness commitment (BIP 141)
+        let witness_root = compute_witness_root(&coinbase_tx, &other_txs);
+        let witness_nonce = [0u8; 32];
+        let mut commitment_preimage = [0u8; 64];
+        commitment_preimage[..32].copy_from_slice(&witness_root);
+        commitment_preimage[32..].copy_from_slice(&witness_nonce);
+        let commitment = bitcoin::hashes::sha256d::Hash::hash(&commitment_preimage);
+
+        // Add witness commitment output to coinbase
+        let mut commitment_script = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+        commitment_script.extend_from_slice(&commitment.to_byte_array());
+        coinbase_tx.output.push(TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::from_bytes(commitment_script),
+        });
+
+        // Set coinbase witness to single 32-byte zero item
+        coinbase_tx.input[0].witness = Witness::from_slice(&[witness_nonce]);
     }
 
-    // Compute merkle root
+    // Assemble final transaction list
+    let mut txdata = vec![coinbase_tx];
+    txdata.extend(other_txs);
+
+    // Compute merkle root (uses txids, not wtxids)
     let merkle_root = compute_merkle_root(&txdata);
 
     // Build header
@@ -166,9 +194,48 @@ fn compute_merkle_root(txdata: &[Transaction]) -> bitcoin::TxMerkleNode {
     ))
 }
 
+/// Compute witness root from transaction list.
+/// Coinbase wtxid is defined as all zeros.
+fn compute_witness_root(_coinbase: &Transaction, others: &[Transaction]) -> [u8; 32] {
+    let mut hashes: Vec<[u8; 32]> = Vec::new();
+
+    // Coinbase wtxid = 0x00...00
+    hashes.push([0u8; 32]);
+
+    // Other transactions use wtxid
+    for tx in others {
+        hashes.push(tx.compute_wtxid().to_raw_hash().to_byte_array());
+    }
+
+    // Compute merkle root from these hashes
+    if hashes.is_empty() {
+        return [0u8; 32];
+    }
+
+    let mut current = hashes;
+    while current.len() > 1 {
+        if current.len() % 2 != 0 {
+            let last = *current.last().unwrap();
+            current.push(last);
+        }
+        let mut next = Vec::new();
+        for i in (0..current.len()).step_by(2) {
+            let mut combined = [0u8; 64];
+            combined[..32].copy_from_slice(&current[i]);
+            combined[32..].copy_from_slice(&current[i + 1]);
+            let hash = bitcoin::hashes::sha256d::Hash::hash(&combined);
+            next.push(hash.to_byte_array());
+        }
+        current = next;
+    }
+
+    current[0]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bitcoin::Network;
     use crate::storage::db::InMemoryStore;
     use crate::storage::flatfile::FlatFileManager;
     use crate::validation::script::NoopVerifier;
@@ -183,6 +250,7 @@ mod tests {
             flat_files,
             Network::Regtest,
             Box::new(NoopVerifier),
+            None,
         )
         .unwrap();
         let mp = Mempool::new(1_000_000, 0);
@@ -211,6 +279,7 @@ mod tests {
             flat_files,
             Network::Regtest,
             Box::new(NoopVerifier),
+            None,
         )
         .unwrap();
         let mp = Mempool::new(1_000_000, 0);

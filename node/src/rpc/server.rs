@@ -189,7 +189,7 @@ pub async fn start(
         Ok::<_, ErrorObjectOwned>(blockchain::get_tx_out_set_info(&ctx.chain_state))
     })?;
 
-    module.register_method("estimatesmartfee", |params, ctx, _extensions| {
+    module.register_method("estimatesmartfee", |params, _ctx, _extensions| {
         let conf_target: u32 = params.one().map_err(|e| {
             ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
         })?;

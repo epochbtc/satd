@@ -112,6 +112,9 @@ impl Store for RocksDbStore {
             for (height, hash) in &batch.height_hash_puts {
                 wb.put_cf(&cf, height.to_le_bytes(), block_hash_to_bytes(hash));
             }
+            for height in &batch.height_hash_removes {
+                wb.delete_cf(&cf, height.to_le_bytes());
+            }
         }
 
         if let Some(cf) = self.db.cf_handle(CF_UNDO) {
@@ -211,6 +214,9 @@ impl Store for InMemoryStore {
         }
         for (height, hash) in batch.height_hash_puts {
             hi.insert(height, hash);
+        }
+        for height in batch.height_hash_removes {
+            hi.remove(&height);
         }
         for (hash, data) in batch.undo_puts {
             undo.insert(hash, data);

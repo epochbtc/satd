@@ -33,4 +33,6 @@ pub enum ValidationError {
     BadTxCoinbaseSize,
     #[error("bad-txns-prevout-null")]
     BadTxNullInput,
+    #[error("bad-witness-commitment")]
+    BadWitnessCommitment,
 }

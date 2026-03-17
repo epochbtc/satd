@@ -166,12 +166,10 @@ impl Mempool {
             return Err(MempoolError::MempoolFull);
         }
 
-        // Script verification
-        for (input_index, _) in tx.input.iter().enumerate() {
-            script_verifier
-                .verify_input(&tx, input_index, &prev_outputs[input_index])
-                .map_err(|e| MempoolError::Script(e.to_string()))?;
-        }
+        // Script verification (all inputs at once for taproot)
+        script_verifier
+            .verify_transaction(&tx, &prev_outputs)
+            .map_err(|e| MempoolError::Script(e.to_string()))?;
 
         // Insert
         let now = std::time::SystemTime::now()
@@ -284,6 +282,7 @@ mod tests {
             flat_files,
             bitcoin::Network::Regtest,
             Box::new(NoopVerifier),
+            None,
         )
         .unwrap();
         let mp = Mempool::new(1_000_000, 0); // 1MB, no min fee for tests

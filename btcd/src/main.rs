@@ -83,12 +83,22 @@ async fn main() {
         }
     };
 
+    // Parse assumevalid hash
+    let assumevalid: Option<bitcoin::BlockHash> = config.assumevalid.as_ref().and_then(|s| {
+        if s.is_empty() { None } else { s.parse().ok() }
+    });
+
+    if let Some(ref av) = assumevalid {
+        tracing::info!(%av, "Assuming blocks valid up to hash");
+    }
+
     // Initialize chain state with script verification
     let chain_state = match ChainState::new(
         store,
         flat_files,
         config.network,
         Box::new(ConsensusVerifier),
+        assumevalid,
     ) {
         Ok(cs) => Arc::new(cs),
         Err(e) => {

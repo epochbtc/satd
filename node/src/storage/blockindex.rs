@@ -54,7 +54,7 @@ pub fn add_u256(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
 }
 
 /// Convert CompactTarget (nBits) to a 256-bit target as big-endian [u8; 32].
-fn target_from_compact(bits: CompactTarget) -> [u8; 32] {
+pub fn target_from_compact(bits: CompactTarget) -> [u8; 32] {
     let bits_u32 = bits.to_consensus();
     let exponent = (bits_u32 >> 24) as usize;
     let mantissa = bits_u32 & 0x007f_ffff;
@@ -292,6 +292,62 @@ pub fn target_to_difficulty(bits: CompactTarget) -> f64 {
     } else {
         diff / (2.0_f64).powi(-shift)
     }
+}
+
+/// Convert a big-endian [u8; 32] target back to CompactTarget (nBits).
+pub fn compact_from_target(target: &[u8; 32]) -> u32 {
+    // Find first non-zero byte
+    let mut first_nonzero = 0;
+    while first_nonzero < 32 && target[first_nonzero] == 0 {
+        first_nonzero += 1;
+    }
+
+    if first_nonzero == 32 {
+        return 0; // Zero target
+    }
+
+    let exponent = (32 - first_nonzero) as u32;
+
+    // Extract 3-byte mantissa
+    let mut mantissa: u32 = (target[first_nonzero] as u32) << 16;
+    if first_nonzero + 1 < 32 {
+        mantissa |= (target[first_nonzero + 1] as u32) << 8;
+    }
+    if first_nonzero + 2 < 32 {
+        mantissa |= target[first_nonzero + 2] as u32;
+    }
+
+    // If high bit of mantissa is set, shift right and increment exponent
+    if mantissa & 0x00800000 != 0 {
+        mantissa >>= 8;
+        return ((exponent + 1) << 24) | mantissa;
+    }
+
+    (exponent << 24) | mantissa
+}
+
+/// Multiply a big-endian U256 by a u32.
+pub fn mul_u256_u32(a: &[u8; 32], b: u32) -> [u8; 32] {
+    let mut result = [0u8; 32];
+    let mut carry: u64 = 0;
+    for i in (0..32).rev() {
+        let prod = a[i] as u64 * b as u64 + carry;
+        result[i] = prod as u8;
+        carry = prod >> 8;
+    }
+    result
+}
+
+/// Divide a big-endian U256 by a u32.
+pub fn div_u256_u32(a: &[u8; 32], b: u32) -> [u8; 32] {
+    let mut result = [0u8; 32];
+    let mut rem: u64 = 0;
+    for i in 0..32 {
+        let cur = (rem << 8) | a[i] as u64;
+        result[i] = (cur / b as u64) as u8;
+        rem = cur % b as u64;
+    }
+    result
 }
 
 /// Custom serde for bitcoin::block::Header via consensus encoding.

@@ -263,17 +263,21 @@ impl PeerManager {
         self.request_missing_blocks(id);
     }
 
-    async fn handle_block(&self, _id: PeerId, block: bitcoin::Block) {
+    async fn handle_block(&self, id: PeerId, block: bitcoin::Block) {
         let hash = block.block_hash();
         match self.chain_state.accept_block(&block) {
             Ok(_) => {
                 self.mempool.remove_for_block(&block);
+                let height = self.chain_state.tip_height();
+                if height % 1000 == 0 || height <= 1 {
+                    tracing::info!(height, %hash, "IBD progress");
+                }
                 // Announce to other peers
-                self.broadcast_except(0, sync::make_block_inv(hash));
+                self.broadcast_except(id, sync::make_block_inv(hash));
+                // Request more blocks
+                self.request_missing_blocks(id);
             }
-            Err(crate::chain::state::ChainError::Duplicate) => {
-                // Already have it, ignore
-            }
+            Err(crate::chain::state::ChainError::Duplicate) => {}
             Err(e) => {
                 tracing::warn!(%hash, "Block rejected: {}", e);
             }
@@ -350,17 +354,15 @@ impl PeerManager {
     }
 
     fn request_missing_blocks(&self, id: PeerId) {
-        // Simple approach: request blocks we have headers for but no data
-        // Walk from genesis to tip looking for HeaderOnly entries
         let tip = self.chain_state.tip_height();
         let mut to_request = Vec::new();
 
-        // Check a window above the current tip (headers may be ahead)
-        for h in 0..=(tip + 2000) {
+        // Scan from current tip upward for blocks with headers but no data
+        for h in (tip + 1)..=(tip + 2000) {
             if let Some(hash) = self.chain_state.get_block_hash_by_height(h) {
                 if !self.chain_state.has_block_data(&hash) {
                     to_request.push(hash);
-                    if to_request.len() >= 16 {
+                    if to_request.len() >= 128 {
                         break;
                     }
                 }
@@ -370,7 +372,11 @@ impl PeerManager {
         }
 
         if !to_request.is_empty() {
+            let count = to_request.len();
             self.send_to_peer(id, sync::make_getdata_blocks(&to_request));
+            if count % 1000 == 0 || count >= 128 {
+                tracing::info!(tip, requesting = count, "Requesting blocks");
+            }
         }
     }
 
@@ -451,20 +457,26 @@ impl PeerManager {
             .await
             .map_err(|e| e.to_string())?;
 
-        // Main message loop
+        // Main message loop with idle timeout
         loop {
             tokio::select! {
-                // Receive from network
-                result = conn.recv() => {
+                // Receive from network (with 5-minute idle timeout)
+                result = tokio::time::timeout(
+                    std::time::Duration::from_secs(300),
+                    conn.recv()
+                ) => {
                     match result {
-                        Ok(msg) => {
+                        Ok(Ok(msg)) => {
                             self.event_tx
                                 .send(NetEvent::MessageReceived { id, msg })
                                 .await
                                 .map_err(|e| e.to_string())?;
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             return Err(format!("recv error: {}", e));
+                        }
+                        Err(_) => {
+                            return Err("peer idle timeout".to_string());
                         }
                     }
                 }
@@ -476,7 +488,15 @@ impl PeerManager {
         }
     }
 
-    /// Perform the version/verack handshake.
+    /// Receive a message with a timeout.
+    async fn recv_with_timeout(conn: &mut Connection, secs: u64) -> Result<NetworkMessage, String> {
+        tokio::time::timeout(std::time::Duration::from_secs(secs), conn.recv())
+            .await
+            .map_err(|_| "handshake timeout".to_string())?
+            .map_err(|e| format!("recv: {}", e))
+    }
+
+    /// Perform the version/verack handshake with timeouts.
     async fn perform_handshake(
         &self,
         _id: PeerId,
@@ -484,36 +504,32 @@ impl PeerManager {
         direction: Direction,
     ) -> Result<VersionMessage, String> {
         let our_version = self.build_version_message(conn.peer_addr().map_err(|e| e.to_string())?);
+        let timeout_secs = 10;
 
         match direction {
             Direction::Outbound => {
-                // Send our version first
                 conn.send(NetworkMessage::Version(our_version))
                     .await
                     .map_err(|e| format!("send version: {}", e))?;
 
-                // Wait for their version
                 let their_version = loop {
-                    let msg = conn.recv().await.map_err(|e| format!("recv: {}", e))?;
+                    let msg = Self::recv_with_timeout(conn, timeout_secs).await?;
                     if let NetworkMessage::Version(v) = msg {
                         break v;
                     }
                 };
 
-                // Send verack
                 conn.send(NetworkMessage::Verack)
                     .await
                     .map_err(|e| format!("send verack: {}", e))?;
 
-                // Wait for their verack
                 loop {
-                    let msg = conn.recv().await.map_err(|e| format!("recv: {}", e))?;
+                    let msg = Self::recv_with_timeout(conn, timeout_secs).await?;
                     if matches!(msg, NetworkMessage::Verack) {
                         break;
                     }
                 }
 
-                // Send SendHeaders to request header announcements
                 conn.send(NetworkMessage::SendHeaders)
                     .await
                     .map_err(|e| format!("send sendheaders: {}", e))?;
@@ -521,27 +537,23 @@ impl PeerManager {
                 Ok(their_version)
             }
             Direction::Inbound => {
-                // Wait for their version
                 let their_version = loop {
-                    let msg = conn.recv().await.map_err(|e| format!("recv: {}", e))?;
+                    let msg = Self::recv_with_timeout(conn, timeout_secs).await?;
                     if let NetworkMessage::Version(v) = msg {
                         break v;
                     }
                 };
 
-                // Send our version
                 conn.send(NetworkMessage::Version(our_version))
                     .await
                     .map_err(|e| format!("send version: {}", e))?;
 
-                // Send verack
                 conn.send(NetworkMessage::Verack)
                     .await
                     .map_err(|e| format!("send verack: {}", e))?;
 
-                // Wait for their verack
                 loop {
-                    let msg = conn.recv().await.map_err(|e| format!("recv: {}", e))?;
+                    let msg = Self::recv_with_timeout(conn, timeout_secs).await?;
                     if matches!(msg, NetworkMessage::Verack) {
                         break;
                     }

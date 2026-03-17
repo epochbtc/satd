@@ -40,6 +40,7 @@ pub struct ChainState {
     tip: RwLock<ChainTip>,
     pub network: Network,
     script_verifier: Box<dyn ScriptVerifier>,
+    assumevalid: Option<BlockHash>,
 }
 
 impl ChainState {
@@ -49,6 +50,7 @@ impl ChainState {
         mut flat_files: FlatFileManager,
         network: Network,
         script_verifier: Box<dyn ScriptVerifier>,
+        assumevalid: Option<BlockHash>,
     ) -> Result<Self, ChainError> {
         let genesis = bitcoin::constants::genesis_block(network);
         let genesis_hash = genesis.block_hash();
@@ -70,6 +72,7 @@ impl ChainState {
                     }),
                     network,
                     script_verifier,
+                    assumevalid,
                 });
             }
         }
@@ -85,7 +88,7 @@ impl ChainState {
         let parent_work = [0u8; 32];
         let noop = NoopVerifier; // Genesis has no scripts to verify
         let batch =
-            connect::connect_block(&*store, &genesis, 0, &parent_work, flat_pos, &noop)?;
+            connect::connect_block(&*store, &genesis, 0, &parent_work, flat_pos, &noop, 0)?;
         store.write_batch(batch)?;
 
         Ok(Self {
@@ -97,6 +100,7 @@ impl ChainState {
             }),
             network,
             script_verifier,
+            assumevalid,
         })
     }
 
@@ -150,7 +154,10 @@ impl ChainState {
         validation::pow::check_proof_of_work(header)?;
 
         // Difficulty check
-        validation::pow::check_difficulty(header, &parent, self.network)?;
+        validation::pow::check_difficulty(header, &parent, self.network, |h| {
+            let hash = self.store.get_block_hash_by_height(h)?;
+            self.store.get_block_index(&hash)
+        })?;
 
         // Store as header-only
         let chainwork =
@@ -171,6 +178,38 @@ impl ChainState {
         self.store.write_batch(batch)?;
 
         Ok(hash)
+    }
+
+    /// Check if script verification should be skipped (assumevalid optimization).
+    fn should_skip_scripts(&self, height: u32) -> bool {
+        if let Some(ref av_hash) = self.assumevalid {
+            // Check if we've seen the assumevalid block in the index
+            if let Some(entry) = self.store.get_block_index(av_hash) {
+                return height <= entry.height;
+            }
+            // Haven't seen it yet — might still be syncing headers
+            // Conservative: don't skip until we've confirmed the hash exists
+        }
+        false
+    }
+
+    /// Compute median time past (MTP) for a given height.
+    /// MTP is the median of the timestamps of the previous 11 blocks.
+    pub fn get_median_time_past(&self, height: u32) -> u32 {
+        let start = if height > 11 { height - 11 } else { 0 };
+        let mut timestamps: Vec<u32> = Vec::new();
+        for h in start..height {
+            if let Some(hash) = self.store.get_block_hash_by_height(h) {
+                if let Some(entry) = self.store.get_block_index(&hash) {
+                    timestamps.push(entry.header.time);
+                }
+            }
+        }
+        if timestamps.is_empty() {
+            return 0;
+        }
+        timestamps.sort();
+        timestamps[timestamps.len() / 2]
     }
 
     /// Get the total number of UTXOs in the set.
@@ -222,10 +261,13 @@ impl ChainState {
         validation::pow::check_proof_of_work(&block.header)?;
 
         // Difficulty check
-        validation::pow::check_difficulty(&block.header, &parent, self.network)?;
+        let store_ref = &*self.store;
+        validation::pow::check_difficulty(&block.header, &parent, self.network, |h| {
+            let hash = store_ref.get_block_hash_by_height(h)?;
+            store_ref.get_block_index(&hash)
+        })?;
 
         // Timestamp check (median time past)
-        let store_ref = &*self.store;
         validation::pow::check_timestamp(&block.header, new_height, |h| {
             let hash = store_ref.get_block_hash_by_height(h)?;
             store_ref.get_block_index(&hash)
@@ -278,14 +320,21 @@ impl ChainState {
             self.perform_reorg(&parent, current_tip)?;
         }
 
+        // Determine script verifier: skip if below assumevalid height
+        let use_noop = self.should_skip_scripts(new_height);
+        let noop = NoopVerifier;
+        let verifier: &dyn ScriptVerifier = if use_noop { &noop } else { &*self.script_verifier };
+
         // Connect block (process transactions, update UTXOs, verify scripts)
+        let mtp = self.get_median_time_past(new_height);
         let batch = connect::connect_block(
             &*self.store,
             block,
             new_height,
             &parent.chainwork,
             flat_pos,
-            &*self.script_verifier,
+            verifier,
+            mtp,
         )?;
 
         // Atomic commit
@@ -309,11 +358,13 @@ impl ChainState {
     }
 
     /// Disconnect blocks from current tip down to the fork point (parent of the new chain).
+    /// All disconnections are batched into a single atomic write.
     fn perform_reorg(&self, fork_entry: &BlockIndexEntry, old_tip: BlockHash) -> Result<(), ChainError> {
         let fork_hash = fork_entry.header.block_hash();
         let mut current = old_tip;
+        let mut combined_batch = crate::storage::StoreBatch::default();
 
-        // Walk back from old tip to fork point, disconnecting blocks
+        // Walk back from old tip to fork point, accumulating disconnect batches
         loop {
             if current == fork_hash {
                 break;
@@ -330,11 +381,14 @@ impl ChainState {
 
             let prev_hash = entry.header.prev_blockhash;
             let batch = disconnect::disconnect_block(&block, &undo, entry.height, prev_hash);
-            self.store.write_batch(batch)?;
+            combined_batch.merge(batch);
 
             tracing::info!(height = entry.height, hash = %current, "Block disconnected");
             current = prev_hash;
         }
+
+        // Atomic commit of all disconnections
+        self.store.write_batch(combined_batch)?;
 
         // Update in-memory tip to fork point
         {
@@ -393,6 +447,7 @@ mod tests {
             flat_files,
             Network::Regtest,
             Box::new(NoopVerifier),
+            None,
         )
         .unwrap();
         (cs, dir)

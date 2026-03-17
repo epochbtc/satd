@@ -20,7 +20,7 @@ pub enum StoreError {
     Io(#[from] std::io::Error),
 }
 
-/// Atomic batch of writes for a single block connection.
+/// Atomic batch of writes for a single block connection/disconnection.
 #[derive(Default)]
 pub struct StoreBatch {
     pub block_index_puts: Vec<(BlockHash, BlockIndexEntry)>,
@@ -28,7 +28,23 @@ pub struct StoreBatch {
     pub coin_removes: Vec<OutPoint>,
     pub tip: Option<BlockHash>,
     pub height_hash_puts: Vec<(u32, BlockHash)>,
+    pub height_hash_removes: Vec<u32>,
     pub undo_puts: Vec<(BlockHash, UndoData)>,
+}
+
+impl StoreBatch {
+    /// Merge another batch into this one (for atomic multi-block operations).
+    pub fn merge(&mut self, other: StoreBatch) {
+        self.block_index_puts.extend(other.block_index_puts);
+        self.coin_puts.extend(other.coin_puts);
+        self.coin_removes.extend(other.coin_removes);
+        if other.tip.is_some() {
+            self.tip = other.tip;
+        }
+        self.height_hash_puts.extend(other.height_hash_puts);
+        self.height_hash_removes.extend(other.height_hash_removes);
+        self.undo_puts.extend(other.undo_puts);
+    }
 }
 
 /// Abstract storage backend for block index, UTXO set, and metadata.

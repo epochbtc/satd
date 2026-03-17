@@ -15,6 +15,7 @@ pub struct Config {
     pub listen: bool,
     pub port: u16,
     pub connect: Vec<String>,
+    pub assumevalid: Option<String>,
 }
 
 impl Config {
@@ -113,6 +114,8 @@ impl Config {
             connect = file_get_all("connect");
         }
 
+        let assumevalid = cli.assumevalid.or_else(|| file_get("assumevalid"));
+
         // Validate auth consistency
         if rpcuser.is_some() != rpcpassword.is_some() {
             return Err(
@@ -130,6 +133,7 @@ impl Config {
             listen,
             port,
             connect,
+            assumevalid,
         })
     }
 
@@ -177,6 +181,9 @@ pub struct CliArgs {
 
     #[arg(long, value_name = "ADDR", help = "Connect to specific peer")]
     pub connect: Vec<String>,
+
+    #[arg(long, value_name = "HASH", help = "Assume blocks up to this hash are valid (skip script verification)")]
+    pub assumevalid: Option<String>,
 }
 
 /// Convert Bitcoin Core-style single-dash long flags to clap-compatible double-dash.
@@ -194,6 +201,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "listen",
         "port",
         "connect",
+        "assumevalid",
     ];
 
     args.into_iter()
@@ -375,6 +383,7 @@ rpcport=8332
             listen: None,
             port: None,
             connect: vec![],
+            assumevalid: None,
         };
         let config = Config::from_cli(cli).unwrap();
         assert_eq!(config.network, Network::Regtest);
@@ -395,6 +404,7 @@ rpcport=8332
             listen: None,
             port: None,
             connect: vec![],
+            assumevalid: None,
         };
         assert!(Config::from_cli(cli).is_err());
     }
