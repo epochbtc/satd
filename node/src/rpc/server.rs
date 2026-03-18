@@ -3,7 +3,7 @@ use crate::mempool::fee::FeeEstimator;
 use crate::mempool::pool::Mempool;
 use crate::net::manager::PeerManager;
 use crate::rpc::auth::{AuthLayer, RpcAuth};
-use crate::rpc::{blockchain, mining, network, psbt, rawtx};
+use crate::rpc::{blockchain, mining, network, psbt, rawtx, util};
 use jsonrpsee::server::{RpcModule, ServerBuilder, ServerHandle};
 use jsonrpsee::types::ErrorObjectOwned;
 use std::net::SocketAddr;
@@ -609,6 +609,113 @@ pub async fn start(
             "validation": true,
             "rpc": true,
         }))
+    })?;
+
+    module.register_method("validateaddress", |params, _ctx, _extensions| {
+        let address: String = params.one().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        Ok::<_, ErrorObjectOwned>(util::validate_address(&address))
+    })?;
+
+    // --- Long-polling RPCs ---
+
+    module.register_async_method("waitforblockheight", |params, ctx, _extensions| async move {
+        let mut seq = params.sequence();
+        let target_height: u32 = seq.next().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        let timeout_ms: u64 = seq.optional_next().unwrap_or(Some(0)).unwrap_or(0);
+        let timeout = if timeout_ms > 0 {
+            std::time::Duration::from_millis(timeout_ms)
+        } else {
+            std::time::Duration::from_secs(300) // default 5 min
+        };
+        let deadline = std::time::Instant::now() + timeout;
+
+        loop {
+            let height = ctx.chain_state.tip_height();
+            if height >= target_height {
+                let hash = ctx.chain_state.tip_hash();
+                return Ok::<_, ErrorObjectOwned>(serde_json::json!({
+                    "hash": hash.to_string(),
+                    "height": height,
+                }));
+            }
+            if std::time::Instant::now() >= deadline {
+                let hash = ctx.chain_state.tip_hash();
+                return Ok(serde_json::json!({
+                    "hash": hash.to_string(),
+                    "height": height,
+                }));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    })?;
+
+    module.register_async_method("waitfornewblock", |params, ctx, _extensions| async move {
+        let mut seq = params.sequence();
+        let timeout_ms: u64 = seq.optional_next().unwrap_or(Some(0)).unwrap_or(0);
+        let timeout = if timeout_ms > 0 {
+            std::time::Duration::from_millis(timeout_ms)
+        } else {
+            std::time::Duration::from_secs(300)
+        };
+        let deadline = std::time::Instant::now() + timeout;
+        let initial_hash = ctx.chain_state.tip_hash();
+
+        loop {
+            let current_hash = ctx.chain_state.tip_hash();
+            if current_hash != initial_hash {
+                let height = ctx.chain_state.tip_height();
+                return Ok::<_, ErrorObjectOwned>(serde_json::json!({
+                    "hash": current_hash.to_string(),
+                    "height": height,
+                }));
+            }
+            if std::time::Instant::now() >= deadline {
+                let height = ctx.chain_state.tip_height();
+                return Ok(serde_json::json!({
+                    "hash": current_hash.to_string(),
+                    "height": height,
+                }));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    })?;
+
+    module.register_async_method("waitforblock", |params, ctx, _extensions| async move {
+        let mut seq = params.sequence();
+        let blockhash: String = seq.next().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        let target_hash: bitcoin::BlockHash = blockhash.parse().map_err(|_| {
+            ErrorObjectOwned::owned(-1, "Invalid block hash", None::<()>)
+        })?;
+        let timeout_ms: u64 = seq.optional_next().unwrap_or(Some(0)).unwrap_or(0);
+        let timeout = if timeout_ms > 0 {
+            std::time::Duration::from_millis(timeout_ms)
+        } else {
+            std::time::Duration::from_secs(300)
+        };
+        let deadline = std::time::Instant::now() + timeout;
+
+        loop {
+            if let Some(entry) = ctx.chain_state.get_block_index(&target_hash) {
+                return Ok::<_, ErrorObjectOwned>(serde_json::json!({
+                    "hash": target_hash.to_string(),
+                    "height": entry.height,
+                }));
+            }
+            if std::time::Instant::now() >= deadline {
+                let height = ctx.chain_state.tip_height();
+                return Ok(serde_json::json!({
+                    "hash": ctx.chain_state.tip_hash().to_string(),
+                    "height": height,
+                }));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
     })?;
 
     module.register_async_method("stop", |_params, ctx, _extensions| async move {
