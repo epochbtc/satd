@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-SATD="/home/bk/devel/epoch/satd/target/release/satd"
+SATD="$HOME/.local/bin/satd"
 DATADIR="/home/bk/.satd"
 RPCPORT=38342
 P2PPORT=38343
