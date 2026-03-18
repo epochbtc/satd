@@ -242,7 +242,7 @@ mod tests {
 
     #[test]
     fn test_mine_single_block() {
-        let dir = std::env::temp_dir().join(format!("btcd-miner-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("satd-miner-test-{}", std::process::id()));
         let store = Box::new(InMemoryStore::new());
         let flat_files = FlatFileManager::new(&dir.join("blocks")).unwrap();
         let cs = ChainState::new(
@@ -269,7 +269,7 @@ mod tests {
     #[test]
     fn test_mine_multiple_blocks() {
         let dir = std::env::temp_dir().join(format!(
-            "btcd-miner-multi-test-{}",
+            "satd-miner-multi-test-{}",
             std::process::id()
         ));
         let store = Box::new(InMemoryStore::new());

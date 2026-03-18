@@ -1,5 +1,5 @@
 [workspace]
-members = ["btcd", "btc-cli", "node"]
+members = ["satd", "sat-cli", "node"]
 resolver = "2"
 
 [workspace.package]

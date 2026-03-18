@@ -498,7 +498,7 @@ mod tests {
 
     fn make_chain_state() -> (ChainState, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!(
-            "btcd-chain-test-{}-{}",
+            "satd-chain-test-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

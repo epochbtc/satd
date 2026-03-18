@@ -112,7 +112,7 @@ mod tests {
 
     #[test]
     fn test_write_and_read_block() {
-        let dir = std::env::temp_dir().join(format!("btcd-flatfile-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("satd-flatfile-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
         let mut mgr = FlatFileManager::new(&dir).unwrap();

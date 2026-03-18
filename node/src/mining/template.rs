@@ -89,7 +89,7 @@ mod tests {
 
     #[test]
     fn test_create_empty_template() {
-        let dir = std::env::temp_dir().join(format!("btcd-template-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("satd-template-test-{}", std::process::id()));
         let store = Box::new(InMemoryStore::new());
         let flat_files = FlatFileManager::new(&dir.join("blocks")).unwrap();
         let cs = ChainState::new(store, flat_files, Network::Regtest, Box::new(NoopVerifier), None).unwrap();

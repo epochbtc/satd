@@ -267,7 +267,7 @@ mod tests {
 
     fn make_test_env() -> (ChainState, Mempool, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!(
-            "btcd-mempool-test-{}-{}",
+            "satd-mempool-test-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

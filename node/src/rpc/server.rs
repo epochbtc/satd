@@ -252,7 +252,7 @@ pub async fn start(
         tracing::info!("Received stop RPC, shutting down");
         let _ = ctx.shutdown_tx.send(true);
         Ok::<_, ErrorObjectOwned>(
-            serde_json::Value::String("btcd stopping".to_string()),
+            serde_json::Value::String("satd stopping".to_string()),
         )
     })?;
 

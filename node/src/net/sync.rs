@@ -75,7 +75,7 @@ mod tests {
 
     #[test]
     fn test_build_locator_genesis_only() {
-        let dir = std::env::temp_dir().join(format!("btcd-sync-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("satd-sync-test-{}", std::process::id()));
         let store = Box::new(InMemoryStore::new());
         let flat_files = FlatFileManager::new(&dir.join("blocks")).unwrap();
         let cs = ChainState::new(store, flat_files, Network::Regtest, Box::new(NoopVerifier), None).unwrap();

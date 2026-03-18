@@ -1,6 +1,6 @@
-# btcd: Gap Analysis vs Bitcoin Core
+# satd: Gap Analysis vs Bitcoin Core
 
-This document catalogs known gaps between btcd and Bitcoin Core, prioritized by
+This document catalogs known gaps between satd and Bitcoin Core, prioritized by
 severity. Wallet functionality is intentionally omitted (out of scope — Epoch
 uses external wallets).
 
@@ -10,7 +10,7 @@ Last updated after M6 completion.
 
 ## P0 — Consensus-Critical
 
-These gaps mean btcd may accept invalid blocks or reject valid ones on mainnet
+These gaps mean satd may accept invalid blocks or reject valid ones on mainnet
 or testnet. Must be fixed before any non-regtest use.
 
 ### 1. No witness commitment in mined blocks
@@ -35,7 +35,7 @@ computed.
 
 `check_block()` validates the merkle root and coinbase structure but never checks
 the witness commitment. BIP 141 mandates that blocks with any witness transaction
-must include a valid commitment in the coinbase. btcd accepts blocks without one.
+must include a valid commitment in the coinbase. satd accepts blocks without one.
 
 **Impact:** Will accept invalid blocks from peers that omit or forge the witness
 commitment.
@@ -59,12 +59,12 @@ locktime comparison — also missing.
 
 BIP 68 redefines the transaction `nSequence` field for non-coinbase inputs. If
 bit 31 is unset, the sequence value encodes a relative locktime (either
-block-height-based or time-based). btcd never interprets sequence values beyond
+block-height-based or time-based). satd never interprets sequence values beyond
 the coinbase scriptSig length check.
 
 BIP 112 (OP_CHECKSEQUENCEVERIFY) is passed to bitcoinconsensus as a flag, so
 the *script opcode* is verified, but the underlying consensus rule that enforces
-the actual locktime constraint is not implemented in btcd's block connection
+the actual locktime constraint is not implemented in satd's block connection
 logic.
 
 **Impact:** Transactions violating relative locktime can be included in blocks.

@@ -1,5 +1,5 @@
 [package]
-name = "btcd"
+name = "satd"
 version.workspace = true
 edition.workspace = true
 

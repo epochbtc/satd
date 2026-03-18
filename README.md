@@ -1,4 +1,4 @@
-# btcd
+# satd
 
 A Bitcoin Core-compatible full node implementation in Rust.
 
@@ -12,8 +12,8 @@ A Bitcoin Core-compatible full node implementation in Rust.
 ## Architecture
 
 ```
-btcd/           Daemon binary — config, lifecycle, entry point
-btc-cli/        CLI client — Bitcoin Core-compatible RPC client
+satd/           Daemon binary — config, lifecycle, entry point
+sat-cli/        CLI client — Bitcoin Core-compatible RPC client
 node/           Core library
 ├── chain/      Chain state management, block connection
 ├── storage/    RocksDB store, flat file block storage, UTXO set
@@ -34,18 +34,18 @@ cargo build
 
 ```sh
 # Start in regtest mode
-cargo run --bin btcd -- --regtest
+cargo run --bin satd -- --regtest
 
 # Query via CLI
-cargo run --bin btc-cli -- --regtest getblockchaininfo
-cargo run --bin btc-cli -- --regtest getblockcount
-cargo run --bin btc-cli -- --regtest getbestblockhash
+cargo run --bin sat-cli -- --regtest getblockchaininfo
+cargo run --bin sat-cli -- --regtest getblockcount
+cargo run --bin sat-cli -- --regtest getbestblockhash
 
 # Submit a block
-cargo run --bin btc-cli -- --regtest submitblock <hex>
+cargo run --bin sat-cli -- --regtest submitblock <hex>
 
 # Stop the node
-cargo run --bin btc-cli -- --regtest stop
+cargo run --bin sat-cli -- --regtest stop
 ```
 
 ## Configuration

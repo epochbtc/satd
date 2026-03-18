@@ -34,7 +34,7 @@ async fn main() {
         network = %config.network,
         datadir = %config.datadir.display(),
         rpcport = config.rpcport,
-        "btcd v0.1.0 starting"
+        "satd v0.1.0 starting"
     );
 
     // Create network-specific data directory
@@ -222,5 +222,5 @@ async fn main() {
     // Graceful shutdown
     server_handle.stop().expect("Failed to stop server");
     auth.cleanup();
-    tracing::info!("btcd stopped");
+    tracing::info!("satd stopped");
 }

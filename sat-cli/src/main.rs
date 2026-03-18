@@ -4,7 +4,7 @@ use clap::Parser;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(name = "btc-cli", version, about = "Bitcoin Core-compatible RPC client")]
+#[command(name = "sat-cli", version, about = "Bitcoin Core-compatible RPC client")]
 struct CliArgs {
     #[arg(long, help = "Use regtest network")]
     regtest: bool,
@@ -147,7 +147,7 @@ async fn main() {
 
     let body = serde_json::json!({
         "jsonrpc": "2.0",
-        "id": "btc-cli",
+        "id": "sat-cli",
         "method": cli.method,
         "params": params,
     });
@@ -206,7 +206,7 @@ async fn main() {
             }
             Err(e) => {
                 if cli.rpcwait && is_connection_error(&e) {
-                    // Retry: re-read cookie file in case btcd just started
+                    // Retry: re-read cookie file in case satd just started
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                     continue;
                 }

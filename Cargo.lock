@@ -238,35 +238,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "btc-cli"
-version = "0.1.0"
-dependencies = [
- "base64",
- "clap",
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "btcd"
-version = "0.1.0"
-dependencies = [
- "bitcoin",
- "clap",
- "hex",
- "node",
- "rand 0.8.5",
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "bumpalo"
 version = "3.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1841,6 +1812,35 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
 dependencies = [
  "winapi-util",
+]
+
+[[package]]
+name = "sat-cli"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "clap",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "satd"
+version = "0.1.0"
+dependencies = [
+ "bitcoin",
+ "clap",
+ "hex",
+ "node",
+ "rand 0.8.5",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

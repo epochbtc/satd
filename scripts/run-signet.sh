@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Launch btcd on signet with local Bitcoin Core + DNS-seeded external peers.
-# Used by the btcd-signet systemd unit.
+# Launch satd on signet with local Bitcoin Core + DNS-seeded external peers.
+# Used by the satd-signet systemd unit.
 
 set -euo pipefail
 
-BTCD="/home/bk/devel/epoch/btcd/target/release/btcd"
-DATADIR="/home/bk/.btcd"
+SATD="/home/bk/devel/epoch/satd/target/release/satd"
+DATADIR="/home/bk/.satd"
 RPCPORT=38342
 P2PPORT=38343
 SIGNET_DNS_SEED="seed.signet.bitcoin.sprovoost.nl"
@@ -28,7 +28,7 @@ if [[ ${#CONNECT_ARGS[@]} -eq 0 ]]; then
     echo "WARNING: no peers found (no local Core, DNS resolution failed)" >&2
 fi
 
-exec "$BTCD" \
+exec "$SATD" \
     --signet \
     --datadir="$DATADIR" \
     --rpcport="$RPCPORT" \

@@ -153,7 +153,7 @@ impl Config {
 
 /// CLI arguments compatible with bitcoind flags.
 #[derive(Parser, Debug)]
-#[command(name = "btcd", version, about = "Bitcoin Core-compatible node in Rust")]
+#[command(name = "satd", version, about = "Bitcoin Core-compatible node in Rust")]
 pub struct CliArgs {
     #[arg(long, help = "Use regtest network")]
     pub regtest: bool,
@@ -326,7 +326,7 @@ mod tests {
     #[test]
     fn test_normalize_args() {
         let args = vec![
-            "btcd".to_string(),
+            "satd".to_string(),
             "-regtest".to_string(),
             "-datadir=/tmp/test".to_string(),
             "-rpcport".to_string(),
@@ -385,7 +385,7 @@ rpcport=8332
             regtest: true,
             testnet: false,
             signet: false,
-            datadir: Some(PathBuf::from("/tmp/btcd-test")),
+            datadir: Some(PathBuf::from("/tmp/satd-test")),
             conf: None,
             rpcport: None,
             rpcuser: None,
@@ -398,7 +398,7 @@ rpcport=8332
         let config = Config::from_cli(cli).unwrap();
         assert_eq!(config.network, Network::Regtest);
         assert_eq!(config.rpcport, 18443);
-        assert_eq!(config.network_datadir(), PathBuf::from("/tmp/btcd-test/regtest"));
+        assert_eq!(config.network_datadir(), PathBuf::from("/tmp/satd-test/regtest"));
     }
 
     #[test]
@@ -407,7 +407,7 @@ rpcport=8332
             regtest: true,
             testnet: false,
             signet: false,
-            datadir: Some(PathBuf::from("/tmp/btcd-test")),
+            datadir: Some(PathBuf::from("/tmp/satd-test")),
             conf: None,
             rpcport: None,
             rpcuser: Some("alice".to_string()),

@@ -13,12 +13,12 @@ struct TestNode {
 impl TestNode {
     fn start(extra_args: &[&str]) -> Self {
         let rpcport = find_available_port();
-        let datadir = std::env::temp_dir().join(format!("btcd-test-{}", rpcport));
+        let datadir = std::env::temp_dir().join(format!("satd-test-{}", rpcport));
         let _ = std::fs::create_dir_all(&datadir);
 
-        let btcd_bin = env!("CARGO_BIN_EXE_btcd");
+        let satd_bin = env!("CARGO_BIN_EXE_satd");
 
-        let mut cmd = Command::new(btcd_bin);
+        let mut cmd = Command::new(satd_bin);
         cmd.arg("--regtest")
             .arg(format!("--datadir={}", datadir.display()))
             .arg(format!("--rpcport={}", rpcport));
@@ -30,7 +30,7 @@ impl TestNode {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
-            .expect("Failed to start btcd");
+            .expect("Failed to start satd");
 
         // Check if using user/pass auth (no cookie file expected)
         let uses_userpass = extra_args.iter().any(|a| a.starts_with("--rpcuser"));
@@ -44,7 +44,7 @@ impl TestNode {
                 }
                 attempts += 1;
                 if attempts > 50 {
-                    panic!("Timed out waiting for btcd to start on port {}", rpcport);
+                    panic!("Timed out waiting for satd to start on port {}", rpcport);
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
@@ -194,7 +194,7 @@ fn test_regtest_getnetworkinfo() {
     let response = node.rpc_call("getnetworkinfo").unwrap();
     let result = &response["result"];
 
-    assert_eq!(result["subversion"], "/btcd:0.1.0/");
+    assert_eq!(result["subversion"], "/satd:0.1.0/");
     assert_eq!(result["connections"], 0);
     assert_eq!(result["protocolversion"], 70016);
     assert_eq!(result["networkactive"], true);
@@ -214,7 +214,7 @@ fn test_auth_rejection() {
 fn test_stop_rpc() {
     let mut node = TestNode::start(&[]);
     let response = node.rpc_call("stop").unwrap();
-    assert_eq!(response["result"], "btcd stopping");
+    assert_eq!(response["result"], "satd stopping");
 
     // Wait for process to exit
     let mut attempts = 0;
@@ -227,11 +227,11 @@ fn test_stop_rpc() {
             Ok(None) => {
                 attempts += 1;
                 if attempts > 30 {
-                    panic!("btcd did not exit after stop RPC");
+                    panic!("satd did not exit after stop RPC");
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
-            Err(e) => panic!("Error waiting for btcd: {}", e),
+            Err(e) => panic!("Error waiting for satd: {}", e),
         }
     }
 
@@ -241,26 +241,26 @@ fn test_stop_rpc() {
 }
 
 #[test]
-fn test_btc_cli_integration() {
+fn test_sat_cli_integration() {
     let mut node = TestNode::start(&[]);
 
-    // btc-cli is in a sibling crate; find it relative to the btcd binary
-    let btcd_bin = env!("CARGO_BIN_EXE_btcd");
-    let btc_cli_bin = std::path::Path::new(btcd_bin)
+    // sat-cli is in a sibling crate; find it relative to the satd binary
+    let satd_bin = env!("CARGO_BIN_EXE_satd");
+    let sat_cli_bin = std::path::Path::new(satd_bin)
         .parent()
         .unwrap()
-        .join("btc-cli");
-    let btc_cli_bin = btc_cli_bin.to_str().unwrap();
+        .join("sat-cli");
+    let sat_cli_bin = sat_cli_bin.to_str().unwrap();
 
-    let output = Command::new(btc_cli_bin)
+    let output = Command::new(sat_cli_bin)
         .arg("--regtest")
         .arg(format!("--datadir={}", node.datadir.display()))
         .arg(format!("--rpcport={}", node.rpcport))
         .arg("getblockchaininfo")
         .output()
-        .expect("Failed to run btc-cli");
+        .expect("Failed to run sat-cli");
 
-    assert!(output.status.success(), "btc-cli should exit successfully");
+    assert!(output.status.success(), "sat-cli should exit successfully");
 
     let stdout = String::from_utf8(output.stdout).unwrap();
     let result: serde_json::Value = serde_json::from_str(&stdout).expect("Output should be valid JSON");
@@ -566,7 +566,7 @@ fn test_getnetworkinfo_connections() {
     let response = node.rpc_call("getnetworkinfo").unwrap();
     let result = &response["result"];
     assert_eq!(result["connections"], 0);
-    assert_eq!(result["subversion"], "/btcd:0.1.0/");
+    assert_eq!(result["subversion"], "/satd:0.1.0/");
     node.stop();
 }
 
