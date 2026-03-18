@@ -33,4 +33,5 @@ exec "$SATD" \
     --datadir="$DATADIR" \
     --rpcport="$RPCPORT" \
     --port="$P2PPORT" \
+    --txindex \
     "${CONNECT_ARGS[@]}"
