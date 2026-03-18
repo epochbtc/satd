@@ -19,3 +19,4 @@ rocksdb = { workspace = true }
 hex = { workspace = true }
 bincode = { workspace = true }
 bitcoinconsensus = { workspace = true }
+rayon = { workspace = true }

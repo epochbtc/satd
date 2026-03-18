@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 use crate::chain::state::ChainState;
 use crate::mempool::pool::Mempool;
 use crate::net::compact;
-use crate::net::connection::Connection;
+use crate::net::connection::{Connection, ConnectionWriter};
 use crate::net::peer::{Direction, PeerId, PeerInfo, PeerState};
 use crate::net::sync;
 
@@ -850,14 +850,20 @@ impl PeerManager {
             .await
             .map_err(|e| e.to_string())?;
 
+        // Split connection into read/write halves to avoid cancel-safety issues.
+        // read_exact is not cancel-safe — if tokio::select! drops a recv() future
+        // mid-read, consumed bytes are lost and the stream becomes misaligned.
+        // By running the reader in a dedicated task, it is never cancelled.
+        let (mut reader, mut writer) = conn.split();
+
         // Request headers to start sync
         let getheaders = sync::make_getheaders(&self.chain_state);
-        conn.send(getheaders)
+        writer.send(getheaders)
             .await
             .map_err(|e| e.to_string())?;
 
         // Negotiate compact block support (BIP 152, version 2 = with witness)
-        conn.send(NetworkMessage::SendCmpct(
+        writer.send(NetworkMessage::SendCmpct(
             bitcoin::p2p::message_compact_blocks::SendCmpct {
                 send_compact: true,
                 version: 2,
@@ -866,30 +872,68 @@ impl PeerManager {
         .await
         .map_err(|e| format!("send sendcmpct: {}", e))?;
 
-        // Main message loop with idle timeout
+        // Spawn a dedicated read task that forwards messages via a channel.
+        // This task is never cancelled, so read_exact always completes.
+        let (read_tx, mut read_rx) = mpsc::channel::<NetworkMessage>(64);
+        let read_task = tokio::spawn(async move {
+            loop {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(600),
+                    reader.recv(),
+                )
+                .await
+                {
+                    Ok(Ok(msg)) => {
+                        if read_tx.send(msg).await.is_err() {
+                            break; // receiver dropped, peer_task ended
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        tracing::debug!("Read error: {}", e);
+                        break;
+                    }
+                    Err(_) => {
+                        tracing::debug!("Peer idle timeout");
+                        break;
+                    }
+                }
+            }
+        });
+
+        // Main loop: receive from reader task OR send outbound messages
+        let result = Self::peer_write_loop(id, &self.event_tx, &mut writer, &mut msg_rx, &mut read_rx).await;
+
+        read_task.abort();
+        result
+    }
+
+    /// Write loop for a peer: forwards received messages to the manager
+    /// and sends outbound messages. Separated for clarity.
+    async fn peer_write_loop(
+        id: PeerId,
+        event_tx: &mpsc::Sender<NetEvent>,
+        writer: &mut ConnectionWriter,
+        msg_rx: &mut mpsc::Receiver<NetworkMessage>,
+        read_rx: &mut mpsc::Receiver<NetworkMessage>,
+    ) -> Result<(), String> {
         loop {
             tokio::select! {
-                result = tokio::time::timeout(
-                    std::time::Duration::from_secs(600),
-                    conn.recv()
-                ) => {
-                    match result {
-                        Ok(Ok(msg)) => {
-                            self.event_tx
+                msg = read_rx.recv() => {
+                    match msg {
+                        Some(msg) => {
+                            event_tx
                                 .send(NetEvent::MessageReceived { id, msg })
                                 .await
                                 .map_err(|e| e.to_string())?;
                         }
-                        Ok(Err(e)) => {
-                            return Err(format!("recv error: {}", e));
-                        }
-                        Err(_) => {
-                            return Err("peer idle timeout".to_string());
+                        None => {
+                            // Reader task ended (error or timeout)
+                            return Err("connection closed".to_string());
                         }
                     }
                 }
                 Some(msg) = msg_rx.recv() => {
-                    conn.send(msg).await.map_err(|e| e.to_string())?;
+                    writer.send(msg).await.map_err(|e| e.to_string())?;
                 }
             }
         }
