@@ -876,3 +876,254 @@ fn test_multiple_connections() {
     node_b.stop();
     node_a.stop();
 }
+
+// ── New RPC tests ────────────────────────────────────────────────
+
+#[test]
+fn test_getdifficulty() {
+    let mut node = TestNode::start(&[]);
+    let response = node.rpc_call("getdifficulty").unwrap();
+    assert!(response["result"].is_number());
+    node.stop();
+}
+
+#[test]
+fn test_getblockstats() {
+    let mut node = TestNode::start(&[]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    node.rpc_call_with_params(
+        "generatetoaddress",
+        vec![serde_json::json!(1), serde_json::json!(addr)],
+    )
+    .unwrap();
+
+    let response = node
+        .rpc_call_with_params("getblockstats", vec![serde_json::json!("1")])
+        .unwrap();
+    let result = &response["result"];
+    assert_eq!(result["height"], 1);
+    assert!(result["txs"].as_u64().unwrap() >= 1);
+    assert!(result["subsidy"].as_u64().unwrap() > 0);
+    node.stop();
+}
+
+#[test]
+fn test_getchaintips() {
+    let mut node = TestNode::start(&[]);
+    let response = node.rpc_call("getchaintips").unwrap();
+    let result = &response["result"];
+    assert!(result.is_array());
+    assert!(!result.as_array().unwrap().is_empty());
+    assert_eq!(result[0]["status"], "active");
+    node.stop();
+}
+
+#[test]
+fn test_getchaintxstats() {
+    let mut node = TestNode::start(&[]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    node.rpc_call_with_params(
+        "generatetoaddress",
+        vec![serde_json::json!(5), serde_json::json!(addr)],
+    )
+    .unwrap();
+
+    let response = node
+        .rpc_call_with_params("getchaintxstats", vec![serde_json::json!(3)])
+        .unwrap();
+    let result = &response["result"];
+    assert_eq!(result["window_block_count"], 3);
+    assert!(result["txcount"].as_u64().unwrap() > 0);
+    node.stop();
+}
+
+#[test]
+fn test_getmempoolentry() {
+    let mut node = TestNode::start(&[]);
+    // Generate blocks + get utxo for crafting a tx is complex,
+    // so just verify the RPC returns an error for nonexistent tx
+    let response = node
+        .rpc_call_with_params(
+            "getmempoolentry",
+            vec![serde_json::json!(
+                "0000000000000000000000000000000000000000000000000000000000000000"
+            )],
+        )
+        .unwrap();
+    assert!(response["error"].is_object());
+    node.stop();
+}
+
+#[test]
+fn test_testmempoolaccept() {
+    let mut node = TestNode::start(&[]);
+    // Test with invalid tx hex
+    let response = node
+        .rpc_call_with_params(
+            "testmempoolaccept",
+            vec![serde_json::json!(["deadbeef"])],
+        )
+        .unwrap();
+    // Should return an error for decode failure
+    assert!(response["error"].is_object());
+    node.stop();
+}
+
+#[test]
+fn test_verifychain() {
+    let mut node = TestNode::start(&[]);
+    let response = node.rpc_call("verifychain").unwrap();
+    assert_eq!(response["result"], true);
+    node.stop();
+}
+
+#[test]
+fn test_preciousblock() {
+    let mut node = TestNode::start(&[]);
+    let hash = node.rpc_call("getbestblockhash").unwrap()["result"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let response = node
+        .rpc_call_with_params("preciousblock", vec![serde_json::json!(hash)])
+        .unwrap();
+    assert!(response["result"].is_null());
+    node.stop();
+}
+
+#[test]
+fn test_getmininginfo() {
+    let mut node = TestNode::start(&[]);
+    let response = node.rpc_call("getmininginfo").unwrap();
+    let result = &response["result"];
+    assert_eq!(result["chain"], "regtest");
+    assert!(result["blocks"].is_number());
+    assert!(result["difficulty"].is_number());
+    node.stop();
+}
+
+#[test]
+fn test_getnetworkhashps() {
+    let mut node = TestNode::start(&[]);
+    let response = node.rpc_call("getnetworkhashps").unwrap();
+    assert!(response["result"].is_number());
+    node.stop();
+}
+
+#[test]
+fn test_submitheader() {
+    let mut node = TestNode::start(&[]);
+    // Submit an invalid header
+    let response = node
+        .rpc_call_with_params("submitheader", vec![serde_json::json!("deadbeef")])
+        .unwrap();
+    assert!(response["error"].is_object());
+    node.stop();
+}
+
+#[test]
+fn test_listbanned() {
+    let mut node = TestNode::start(&[]);
+    let response = node.rpc_call("listbanned").unwrap();
+    assert!(response["result"].is_array());
+    assert!(response["result"].as_array().unwrap().is_empty());
+    node.stop();
+}
+
+#[test]
+fn test_clearbanned() {
+    let mut node = TestNode::start(&[]);
+    let response = node.rpc_call("clearbanned").unwrap();
+    assert!(response["result"].is_null());
+    node.stop();
+}
+
+#[test]
+fn test_ping_rpc() {
+    let mut node = TestNode::start(&[]);
+    let response = node.rpc_call("ping").unwrap();
+    assert!(response["result"].is_null());
+    node.stop();
+}
+
+#[test]
+fn test_help() {
+    let mut node = TestNode::start(&[]);
+    let response = node.rpc_call("help").unwrap();
+    let help_text = response["result"].as_str().unwrap();
+    assert!(help_text.contains("getblockchaininfo"));
+    assert!(help_text.contains("getmininginfo"));
+    assert!(help_text.contains("testmempoolaccept"));
+    node.stop();
+}
+
+#[test]
+fn test_uptime() {
+    let mut node = TestNode::start(&[]);
+    let response = node.rpc_call("uptime").unwrap();
+    let uptime = response["result"].as_u64().unwrap();
+    assert!(uptime < 60); // should be < 60 seconds in test
+    node.stop();
+}
+
+#[test]
+fn test_getmemoryinfo() {
+    let mut node = TestNode::start(&[]);
+    let response = node.rpc_call("getmemoryinfo").unwrap();
+    let result = &response["result"];
+    assert!(result["locked"].is_object());
+    node.stop();
+}
+
+#[test]
+fn test_getrpcinfo() {
+    let mut node = TestNode::start(&[]);
+    let response = node.rpc_call("getrpcinfo").unwrap();
+    let result = &response["result"];
+    assert!(result["active_commands"].is_array());
+    node.stop();
+}
+
+#[test]
+fn test_logging() {
+    let mut node = TestNode::start(&[]);
+    let response = node.rpc_call("logging").unwrap();
+    let result = &response["result"];
+    assert_eq!(result["net"], true);
+    node.stop();
+}
+
+#[test]
+fn test_getaddednodeinfo() {
+    let mut node = TestNode::start(&[]);
+    let response = node.rpc_call("getaddednodeinfo").unwrap();
+    assert!(response["result"].is_array());
+    node.stop();
+}
+
+#[test]
+fn test_getnettotals() {
+    let mut node = TestNode::start(&[]);
+    let response = node.rpc_call("getnettotals").unwrap();
+    let result = &response["result"];
+    assert!(result["timemillis"].is_number());
+    node.stop();
+}
+
+#[test]
+fn test_savemempool() {
+    let mut node = TestNode::start(&[]);
+    let response = node.rpc_call("savemempool").unwrap();
+    assert!(response["result"].is_null());
+    node.stop();
+}
+
+#[test]
+fn test_setnetworkactive() {
+    let mut node = TestNode::start(&[]);
+    let response = node
+        .rpc_call_with_params("setnetworkactive", vec![serde_json::json!(true)])
+        .unwrap();
+    assert_eq!(response["result"], true);
+    node.stop();
+}
