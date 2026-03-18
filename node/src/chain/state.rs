@@ -226,6 +226,11 @@ impl ChainState {
     }
 
     /// Read a full block from flat file storage.
+    /// Look up which block contains a transaction (requires -txindex).
+    pub fn get_tx_location(&self, txid: &bitcoin::Txid) -> Option<BlockHash> {
+        self.store.get_tx_location(txid)
+    }
+
     pub fn get_block(&self, hash: &BlockHash) -> Option<Block> {
         let entry = self.store.get_block_index(hash)?;
         if entry.status == BlockStatus::HeaderOnly || entry.status == BlockStatus::Invalid {

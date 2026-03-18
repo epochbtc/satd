@@ -5,7 +5,7 @@ use node::chain::state::ChainState;
 use node::mempool::fee::FeeEstimator;
 use node::mempool::pool::{Mempool, MempoolConfig};
 use node::rpc::auth::RpcAuth;
-use node::storage::db::RocksDbStore;
+use node::storage::redb_store::RedbStore;
 use node::storage::flatfile::FlatFileManager;
 use node::validation::script::ConsensusVerifier;
 use std::net::SocketAddr;
@@ -63,9 +63,9 @@ async fn main() {
 
     // Open block storage
     let blocks_dir = net_datadir.join("blocks");
-    let chainstate_dir = net_datadir.join("chainstate");
+    let _chainstate_dir = net_datadir.join("chainstate");
 
-    let store = match RocksDbStore::open(&chainstate_dir) {
+    let store = match RedbStore::open(&net_datadir, config.txindex) {
         Ok(s) => Box::new(s),
         Err(e) => {
             eprintln!("Error opening chain database: {}", e);

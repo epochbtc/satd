@@ -27,6 +27,7 @@ pub struct Config {
     pub limitdescendantcount: usize,
     pub mempoolexpiry: u64,
     pub permitbaremultisig: bool,
+    pub txindex: bool,
 }
 
 impl Config {
@@ -179,6 +180,9 @@ impl Config {
             .or_else(|| file_get("permitbaremultisig").and_then(|v| parse_bool(&v)))
             .unwrap_or(true);
 
+        let txindex = cli.txindex
+            || file_get("txindex").and_then(|v| parse_bool(&v)).unwrap_or(false);
+
         // Validate auth consistency
         if rpcuser.is_some() != rpcpassword.is_some() {
             return Err(
@@ -207,6 +211,7 @@ impl Config {
             limitdescendantcount,
             mempoolexpiry,
             permitbaremultisig,
+            txindex,
         })
     }
 
@@ -292,6 +297,9 @@ pub struct CliArgs {
 
     #[arg(long, value_name = "BOOL", help = "Allow bare multisig outputs (default: true)")]
     pub permitbaremultisig: Option<bool>,
+
+    #[arg(long, help = "Maintain a full transaction index")]
+    pub txindex: bool,
 }
 
 /// Convert Bitcoin Core-style single-dash long flags to clap-compatible double-dash.
@@ -321,6 +329,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "limitdescendantcount",
         "mempoolexpiry",
         "permitbaremultisig",
+        "txindex",
     ];
 
     args.into_iter()
@@ -516,6 +525,7 @@ rpcport=8332
             limitdescendantcount: None,
             mempoolexpiry: None,
             permitbaremultisig: None,
+            txindex: false,
         };
         let config = Config::from_cli(cli).unwrap();
         assert_eq!(config.network, Network::Regtest);
@@ -549,6 +559,7 @@ rpcport=8332
             limitdescendantcount: None,
             mempoolexpiry: None,
             permitbaremultisig: None,
+            txindex: false,
         };
         assert!(Config::from_cli(cli).is_err());
     }
