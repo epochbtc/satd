@@ -260,7 +260,12 @@ fn test_sat_cli_integration() {
         .output()
         .expect("Failed to run sat-cli");
 
-    assert!(output.status.success(), "sat-cli should exit successfully");
+    assert!(
+        output.status.success(),
+        "sat-cli should exit successfully.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
 
     let stdout = String::from_utf8(output.stdout).unwrap();
     let result: serde_json::Value = serde_json::from_str(&stdout).expect("Output should be valid JSON");
