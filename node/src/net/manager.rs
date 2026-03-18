@@ -502,6 +502,44 @@ impl PeerManager {
             NetworkMessage::BlockTxn(msg) => {
                 self.handle_block_txn(id, msg.transactions);
             }
+            NetworkMessage::FeeFilter(rate) => {
+                let mut peers = self.peers.write().unwrap();
+                if let Some(handle) = peers.get_mut(&id) {
+                    handle.info.fee_filter = rate as u64;
+                    tracing::debug!(id, rate, "Peer set fee filter");
+                }
+            }
+            NetworkMessage::Addr(addrs) => {
+                tracing::debug!(id, count = addrs.len(), "Received addr");
+                // Log received addresses; actual connection happens via connect_addrs
+                // and the reconnect loop. Store for future peer discovery.
+                for (_, addr) in &addrs {
+                    if let Ok(sock_addr) = addr.socket_addr()
+                        && !self.is_addr_connected(&sock_addr)
+                        && !self.is_addr_banned(&sock_addr)
+                    {
+                        self.add_connect_addr(sock_addr);
+                    }
+                }
+            }
+            NetworkMessage::GetAddr => {
+                // Respond with addresses of our connected peers
+                let peers = self.peers.read().unwrap();
+                let addrs: Vec<(u32, bitcoin::p2p::Address)> = peers
+                    .values()
+                    .filter(|h| h.info.state == PeerState::Connected)
+                    .map(|h| {
+                        let time = h.info.conn_time
+                            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs() as u32;
+                        (time, bitcoin::p2p::Address::new(&h.info.addr, h.info.services))
+                    })
+                    .collect();
+                if !addrs.is_empty() {
+                    self.send_to_peer(id, NetworkMessage::Addr(addrs));
+                }
+            }
             _ => {}
         }
     }
@@ -675,15 +713,36 @@ impl PeerManager {
         }
 
         let txid = tx.compute_txid();
+        let fee_rate = {
+            let weight = tx.weight().to_wu();
+            if weight > 0 {
+                // We'll get the actual fee rate from the mempool entry after acceptance
+                0u64 // placeholder, updated below
+            } else {
+                0
+            }
+        };
         match self.mempool.accept_transaction(
             tx,
             &self.chain_state,
             self.chain_state.script_verifier(),
         ) {
             Ok(_) => {
-                self.broadcast(NetworkMessage::Inv(vec![Inventory::WitnessTransaction(
-                    txid,
-                )]));
+                // Get the actual fee rate from the accepted entry
+                let entry_fee_rate = self.mempool.get(&txid)
+                    .map(|e| e.fee_rate)
+                    .unwrap_or(fee_rate);
+                // Relay to peers whose fee filter allows this tx
+                let inv = NetworkMessage::Inv(vec![Inventory::WitnessTransaction(txid)]);
+                let peers = self.peers.read().unwrap();
+                for (peer_id, handle) in peers.iter() {
+                    if *peer_id != id
+                        && handle.info.state == PeerState::Connected
+                        && entry_fee_rate >= handle.info.fee_filter
+                    {
+                        let _ = handle.msg_tx.try_send(inv.clone());
+                    }
+                }
             }
             Err(e) => {
                 tracing::debug!(%txid, "Tx rejected: {}", e);
@@ -845,10 +904,12 @@ impl PeerManager {
         }
     }
 
+    #[allow(dead_code)]
     fn broadcast(&self, msg: NetworkMessage) {
         self.broadcast_except(0, msg);
     }
 
+    #[allow(dead_code)]
     fn broadcast_except(&self, exclude_id: PeerId, msg: NetworkMessage) {
         let peers = self.peers.read().unwrap();
         for (id, handle) in peers.iter() {
@@ -930,6 +991,11 @@ impl PeerManager {
         ))
         .await
         .map_err(|e| format!("send sendcmpct: {}", e))?;
+
+        // Send our fee filter (BIP 133) so peer doesn't relay low-fee txs to us
+        writer.send(NetworkMessage::FeeFilter(self.mempool.policy().min_fee_rate as i64))
+            .await
+            .map_err(|e| format!("send feefilter: {}", e))?;
 
         // Spawn a dedicated read task that forwards messages via a channel.
         // This task is never cancelled, so read_exact always completes.
