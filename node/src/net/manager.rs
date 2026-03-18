@@ -253,6 +253,75 @@ impl PeerManager {
             .count()
     }
 
+    /// Get the list of currently banned addresses with expiry times.
+    pub fn list_banned(&self) -> Vec<serde_json::Value> {
+        let banned = self.banned_addrs.read().unwrap();
+        let now = Instant::now();
+        banned
+            .iter()
+            .filter(|(_, expiry)| now < **expiry)
+            .map(|(addr, expiry)| {
+                let remaining = expiry.duration_since(now).as_secs();
+                serde_json::json!({
+                    "address": addr.to_string(),
+                    "ban_created": 0,
+                    "banned_until": remaining,
+                    "ban_duration": BAN_DURATION_SECS,
+                    "ban_reason": "node misbehaving",
+                })
+            })
+            .collect()
+    }
+
+    /// Manually ban or unban an address.
+    pub fn set_ban(&self, addr: SocketAddr, ban: bool) {
+        if ban {
+            self.banned_addrs
+                .write()
+                .unwrap()
+                .insert(addr, Instant::now() + Duration::from_secs(BAN_DURATION_SECS));
+        } else {
+            self.banned_addrs.write().unwrap().remove(&addr);
+        }
+    }
+
+    /// Clear all bans.
+    pub fn clear_banned(&self) {
+        self.banned_addrs.write().unwrap().clear();
+    }
+
+    /// Send a ping to all connected peers.
+    pub fn ping_all(&self) {
+        let peers = self.peers.read().unwrap();
+        for (_, handle) in peers.iter() {
+            if handle.info.state == PeerState::Connected {
+                let _ = handle.msg_tx.try_send(NetworkMessage::Ping(rand::random()));
+            }
+        }
+    }
+
+    /// Get the list of configured connect addresses.
+    pub fn get_added_node_info(&self) -> Vec<serde_json::Value> {
+        let addrs = self.connect_addrs.read().unwrap();
+        let peers = self.peers.read().unwrap();
+        addrs
+            .iter()
+            .map(|addr| {
+                let connected = peers
+                    .values()
+                    .any(|h| h.info.addr == *addr && h.info.state == PeerState::Connected);
+                serde_json::json!({
+                    "addednode": addr.to_string(),
+                    "connected": connected,
+                    "addresses": [{
+                        "address": addr.to_string(),
+                        "connected": if connected { "outbound" } else { "false" },
+                    }],
+                })
+            })
+            .collect()
+    }
+
     /// Check if we are in Initial Block Download.
     /// True when our validated tip is more than 24 blocks behind the highest
     /// header height received from peers, or when no headers have been received.

@@ -17,6 +17,7 @@ pub struct RpcContext {
     pub peer_manager: Arc<PeerManager>,
     pub fee_estimator: Arc<FeeEstimator>,
     pub shutdown_tx: watch::Sender<bool>,
+    pub start_time: std::time::Instant,
 }
 
 /// Start the JSON-RPC HTTP server with authentication.
@@ -35,6 +36,7 @@ pub async fn start(
         peer_manager,
         fee_estimator,
         shutdown_tx,
+        start_time: std::time::Instant::now(),
     });
 
     let mut module = RpcModule::new(ctx);
@@ -203,6 +205,30 @@ pub async fn start(
         Ok::<_, ErrorObjectOwned>(mining::get_block_template(&ctx.chain_state, &ctx.mempool))
     })?;
 
+    module.register_method("getmininginfo", |_params, ctx, _extensions| {
+        Ok::<_, ErrorObjectOwned>(mining::get_mining_info(&ctx.chain_state))
+    })?;
+
+    module.register_method("getnetworkhashps", |params, ctx, _extensions| {
+        let mut seq = params.sequence();
+        let nblocks: Option<u32> = seq.optional_next().unwrap_or(None);
+        let height: Option<u32> = seq.optional_next().unwrap_or(None);
+        Ok::<_, ErrorObjectOwned>(serde_json::json!(mining::get_network_hash_ps(
+            &ctx.chain_state,
+            nblocks,
+            height,
+        )))
+    })?;
+
+    module.register_method("submitheader", |params, ctx, _extensions| {
+        let hex_header: String = params.one().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        mining::submit_header(&ctx.chain_state, &hex_header).map_err(|e| {
+            ErrorObjectOwned::owned(-1, e, None::<()>)
+        })
+    })?;
+
     // --- Transaction / Mempool RPCs ---
 
     module.register_method("sendrawtransaction", |params, ctx, _extensions| {
@@ -348,6 +374,62 @@ pub async fn start(
         Ok::<_, ErrorObjectOwned>(serde_json::Value::Null)
     })?;
 
+    module.register_method("getaddednodeinfo", |_params, ctx, _extensions| {
+        Ok::<_, ErrorObjectOwned>(serde_json::json!(ctx.peer_manager.get_added_node_info()))
+    })?;
+
+    module.register_method("getnettotals", |_params, _ctx, _extensions| {
+        Ok::<_, ErrorObjectOwned>(serde_json::json!({
+            "totalbytesrecv": 0,
+            "totalbytessent": 0,
+            "timemillis": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+        }))
+    })?;
+
+    module.register_method("listbanned", |_params, ctx, _extensions| {
+        Ok::<_, ErrorObjectOwned>(serde_json::json!(ctx.peer_manager.list_banned()))
+    })?;
+
+    module.register_method("setban", |params, ctx, _extensions| {
+        let mut seq = params.sequence();
+        let addr_str: String = seq.next().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        let command: String = seq.next().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        let addr: std::net::SocketAddr = addr_str.parse().map_err(|e: std::net::AddrParseError| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        match command.as_str() {
+            "add" => ctx.peer_manager.set_ban(addr, true),
+            "remove" => ctx.peer_manager.set_ban(addr, false),
+            _ => return Err(ErrorObjectOwned::owned(-1, "Invalid command", None::<()>)),
+        }
+        Ok::<_, ErrorObjectOwned>(serde_json::Value::Null)
+    })?;
+
+    module.register_method("clearbanned", |_params, ctx, _extensions| {
+        ctx.peer_manager.clear_banned();
+        Ok::<_, ErrorObjectOwned>(serde_json::Value::Null)
+    })?;
+
+    module.register_method("ping", |_params, ctx, _extensions| {
+        ctx.peer_manager.ping_all();
+        Ok::<_, ErrorObjectOwned>(serde_json::Value::Null)
+    })?;
+
+    module.register_method("setnetworkactive", |params, _ctx, _extensions| {
+        let _active: bool = params.one().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        // Stub: network is always active
+        Ok::<_, ErrorObjectOwned>(serde_json::json!(true))
+    })?;
+
     module.register_method("disconnectnode", |params, ctx, _extensions| {
         let addr_str: String = params.one().map_err(|e| {
             ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
@@ -360,6 +442,71 @@ pub async fn start(
     })?;
 
     // --- Control RPCs ---
+
+    module.register_method("help", |_params, _ctx, _extensions| {
+        let methods = vec![
+            "addnode", "clearbanned", "decoderawtransaction", "decodescript",
+            "disconnectnode", "estimatesmartfee", "generateblock", "generatetoaddress",
+            "getaddednodeinfo", "getbestblockhash", "getblock", "getblockchaininfo",
+            "getblockcount", "getblockhash", "getblockheader", "getblockstats",
+            "getblocktemplate", "getchaintips", "getchaintxstats", "getconnectioncount",
+            "getdifficulty", "getmempoolancestors", "getmempooldescendants",
+            "getmempoolentry", "getmempoolinfo", "getmemoryinfo", "getmininginfo",
+            "getnettotals", "getnetworkhashps", "getnetworkinfo", "getpeerinfo",
+            "getrawmempool", "getrawtransaction", "getrpcinfo", "gettxout",
+            "gettxoutsetinfo", "help", "listbanned", "logging", "ping",
+            "preciousblock", "savemempool", "sendrawtransaction", "setban",
+            "setnetworkactive", "stop", "submitblock", "submitheader",
+            "testmempoolaccept", "uptime", "verifychain",
+        ];
+        Ok::<_, ErrorObjectOwned>(serde_json::json!(methods.join("\n")))
+    })?;
+
+    module.register_method("uptime", |_params, ctx, _extensions| {
+        let uptime = ctx.start_time.elapsed().as_secs();
+        Ok::<_, ErrorObjectOwned>(serde_json::json!(uptime))
+    })?;
+
+    module.register_method("getmemoryinfo", |_params, _ctx, _extensions| {
+        // Read process memory from /proc/self/status on Linux
+        let rss = std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find(|l| l.starts_with("VmRSS:"))
+                    .and_then(|l| {
+                        l.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok())
+                    })
+            })
+            .unwrap_or(0)
+            * 1024; // kB to bytes
+        Ok::<_, ErrorObjectOwned>(serde_json::json!({
+            "locked": {
+                "used": rss,
+                "free": 0,
+                "total": rss,
+                "locked": 0,
+                "chunks_used": 0,
+                "chunks_free": 0,
+            }
+        }))
+    })?;
+
+    module.register_method("getrpcinfo", |_params, _ctx, _extensions| {
+        Ok::<_, ErrorObjectOwned>(serde_json::json!({
+            "active_commands": [],
+            "logpath": "",
+        }))
+    })?;
+
+    module.register_method("logging", |_params, _ctx, _extensions| {
+        Ok::<_, ErrorObjectOwned>(serde_json::json!({
+            "net": true,
+            "mempool": true,
+            "validation": true,
+            "rpc": true,
+        }))
+    })?;
 
     module.register_async_method("stop", |_params, ctx, _extensions| async move {
         tracing::info!("Received stop RPC, shutting down");
