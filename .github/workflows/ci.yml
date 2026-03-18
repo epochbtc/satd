@@ -36,11 +36,11 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - name: Run unit tests
-        run: cargo test --all --locked --all-targets
+      - name: Build all binaries
+        run: cargo build --all --locked
 
-      - name: Run integration tests
-        run: cargo test --test regtest --locked
+      - name: Run tests
+        run: cargo test --all --locked --all-targets
 
       - name: Clean build artifacts
         if: always()
