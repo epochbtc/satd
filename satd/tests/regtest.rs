@@ -876,3 +876,423 @@ fn test_multiple_connections() {
     node_b.stop();
     node_a.stop();
 }
+
+// ── New RPC tests ────────────────────────────────────────────────
+
+#[test]
+fn test_getdifficulty() {
+    let mut node = TestNode::start(&[]);
+    let response = node.rpc_call("getdifficulty").unwrap();
+    assert!(response["result"].is_number());
+    node.stop();
+}
+
+#[test]
+fn test_getblockstats() {
+    let mut node = TestNode::start(&[]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    node.rpc_call_with_params(
+        "generatetoaddress",
+        vec![serde_json::json!(1), serde_json::json!(addr)],
+    )
+    .unwrap();
+
+    let response = node
+        .rpc_call_with_params("getblockstats", vec![serde_json::json!("1")])
+        .unwrap();
+    let result = &response["result"];
+    assert_eq!(result["height"], 1);
+    assert!(result["txs"].as_u64().unwrap() >= 1);
+    assert!(result["subsidy"].as_u64().unwrap() > 0);
+    node.stop();
+}
+
+#[test]
+fn test_getchaintips() {
+    let mut node = TestNode::start(&[]);
+    let response = node.rpc_call("getchaintips").unwrap();
+    let result = &response["result"];
+    assert!(result.is_array());
+    assert!(!result.as_array().unwrap().is_empty());
+    assert_eq!(result[0]["status"], "active");
+    node.stop();
+}
+
+#[test]
+fn test_getchaintxstats() {
+    let mut node = TestNode::start(&[]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    node.rpc_call_with_params(
+        "generatetoaddress",
+        vec![serde_json::json!(5), serde_json::json!(addr)],
+    )
+    .unwrap();
+
+    let response = node
+        .rpc_call_with_params("getchaintxstats", vec![serde_json::json!(3)])
+        .unwrap();
+    let result = &response["result"];
+    assert_eq!(result["window_block_count"], 3);
+    assert!(result["txcount"].as_u64().unwrap() > 0);
+    node.stop();
+}
+
+#[test]
+fn test_getmempoolentry() {
+    let mut node = TestNode::start(&[]);
+    // Generate blocks + get utxo for crafting a tx is complex,
+    // so just verify the RPC returns an error for nonexistent tx
+    let response = node
+        .rpc_call_with_params(
+            "getmempoolentry",
+            vec![serde_json::json!(
+                "0000000000000000000000000000000000000000000000000000000000000000"
+            )],
+        )
+        .unwrap();
+    assert!(response["error"].is_object());
+    node.stop();
+}
+
+#[test]
+fn test_testmempoolaccept() {
+    let mut node = TestNode::start(&[]);
+    // Test with invalid tx hex
+    let response = node
+        .rpc_call_with_params(
+            "testmempoolaccept",
+            vec![serde_json::json!(["deadbeef"])],
+        )
+        .unwrap();
+    // Should return an error for decode failure
+    assert!(response["error"].is_object());
+    node.stop();
+}
+
+#[test]
+fn test_verifychain() {
+    let mut node = TestNode::start(&[]);
+    let response = node.rpc_call("verifychain").unwrap();
+    assert_eq!(response["result"], true);
+    node.stop();
+}
+
+#[test]
+fn test_preciousblock() {
+    let mut node = TestNode::start(&[]);
+    let hash = node.rpc_call("getbestblockhash").unwrap()["result"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let response = node
+        .rpc_call_with_params("preciousblock", vec![serde_json::json!(hash)])
+        .unwrap();
+    assert!(response["result"].is_null());
+    node.stop();
+}
+
+#[test]
+fn test_getmininginfo() {
+    let mut node = TestNode::start(&[]);
+    let response = node.rpc_call("getmininginfo").unwrap();
+    let result = &response["result"];
+    assert_eq!(result["chain"], "regtest");
+    assert!(result["blocks"].is_number());
+    assert!(result["difficulty"].is_number());
+    node.stop();
+}
+
+#[test]
+fn test_getnetworkhashps() {
+    let mut node = TestNode::start(&[]);
+    let response = node.rpc_call("getnetworkhashps").unwrap();
+    assert!(response["result"].is_number());
+    node.stop();
+}
+
+#[test]
+fn test_submitheader() {
+    let mut node = TestNode::start(&[]);
+    // Submit an invalid header
+    let response = node
+        .rpc_call_with_params("submitheader", vec![serde_json::json!("deadbeef")])
+        .unwrap();
+    assert!(response["error"].is_object());
+    node.stop();
+}
+
+#[test]
+fn test_listbanned() {
+    let mut node = TestNode::start(&[]);
+    let response = node.rpc_call("listbanned").unwrap();
+    assert!(response["result"].is_array());
+    assert!(response["result"].as_array().unwrap().is_empty());
+    node.stop();
+}
+
+#[test]
+fn test_clearbanned() {
+    let mut node = TestNode::start(&[]);
+    let response = node.rpc_call("clearbanned").unwrap();
+    assert!(response["result"].is_null());
+    node.stop();
+}
+
+#[test]
+fn test_ping_rpc() {
+    let mut node = TestNode::start(&[]);
+    let response = node.rpc_call("ping").unwrap();
+    assert!(response["result"].is_null());
+    node.stop();
+}
+
+#[test]
+fn test_help() {
+    let mut node = TestNode::start(&[]);
+    let response = node.rpc_call("help").unwrap();
+    let help_text = response["result"].as_str().unwrap();
+    assert!(help_text.contains("getblockchaininfo"));
+    assert!(help_text.contains("getmininginfo"));
+    assert!(help_text.contains("testmempoolaccept"));
+    node.stop();
+}
+
+#[test]
+fn test_uptime() {
+    let mut node = TestNode::start(&[]);
+    let response = node.rpc_call("uptime").unwrap();
+    let uptime = response["result"].as_u64().unwrap();
+    assert!(uptime < 60); // should be < 60 seconds in test
+    node.stop();
+}
+
+#[test]
+fn test_getmemoryinfo() {
+    let mut node = TestNode::start(&[]);
+    let response = node.rpc_call("getmemoryinfo").unwrap();
+    let result = &response["result"];
+    assert!(result["locked"].is_object());
+    node.stop();
+}
+
+#[test]
+fn test_getrpcinfo() {
+    let mut node = TestNode::start(&[]);
+    let response = node.rpc_call("getrpcinfo").unwrap();
+    let result = &response["result"];
+    assert!(result["active_commands"].is_array());
+    node.stop();
+}
+
+#[test]
+fn test_logging() {
+    let mut node = TestNode::start(&[]);
+    let response = node.rpc_call("logging").unwrap();
+    let result = &response["result"];
+    assert_eq!(result["net"], true);
+    node.stop();
+}
+
+#[test]
+fn test_getaddednodeinfo() {
+    let mut node = TestNode::start(&[]);
+    let response = node.rpc_call("getaddednodeinfo").unwrap();
+    assert!(response["result"].is_array());
+    node.stop();
+}
+
+#[test]
+fn test_getnettotals() {
+    let mut node = TestNode::start(&[]);
+    let response = node.rpc_call("getnettotals").unwrap();
+    let result = &response["result"];
+    assert!(result["timemillis"].is_number());
+    node.stop();
+}
+
+#[test]
+fn test_savemempool() {
+    let mut node = TestNode::start(&[]);
+    let response = node.rpc_call("savemempool").unwrap();
+    assert!(response["result"].is_null());
+    node.stop();
+}
+
+#[test]
+fn test_setnetworkactive() {
+    let mut node = TestNode::start(&[]);
+    let response = node
+        .rpc_call_with_params("setnetworkactive", vec![serde_json::json!(true)])
+        .unwrap();
+    assert_eq!(response["result"], true);
+    node.stop();
+}
+
+#[test]
+fn test_createrawtransaction() {
+    let mut node = TestNode::start(&[]);
+    let inputs = serde_json::json!([{
+        "txid": "0000000000000000000000000000000000000000000000000000000000000000",
+        "vout": 0,
+    }]);
+    let outputs = serde_json::json!({
+        "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202": 0.01,
+    });
+    let response = node
+        .rpc_call_with_params("createrawtransaction", vec![inputs, outputs])
+        .unwrap();
+    assert!(response["result"].is_string());
+    let hex = response["result"].as_str().unwrap();
+    assert!(!hex.is_empty());
+    node.stop();
+}
+
+#[test]
+fn test_decodescript() {
+    let mut node = TestNode::start(&[]);
+    // OP_TRUE (0x51) — simplest valid script
+    let response = node
+        .rpc_call_with_params(
+            "decodescript",
+            vec![serde_json::json!("51")],
+        )
+        .unwrap();
+    let result = &response["result"];
+    assert!(result["asm"].is_string());
+    assert!(result["type"].is_string());
+    node.stop();
+}
+
+#[test]
+fn test_createpsbt() {
+    let mut node = TestNode::start(&[]);
+    let inputs = serde_json::json!([{
+        "txid": "0000000000000000000000000000000000000000000000000000000000000000",
+        "vout": 0,
+    }]);
+    let outputs = serde_json::json!({
+        "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202": 0.01,
+    });
+    let response = node
+        .rpc_call_with_params("createpsbt", vec![inputs, outputs])
+        .unwrap();
+    assert!(response["result"].is_string());
+    // Should be valid base64
+    let b64 = response["result"].as_str().unwrap();
+    assert!(b64.starts_with("cHNidP8")); // PSBT magic in base64
+    node.stop();
+}
+
+#[test]
+fn test_decodepsbt() {
+    let mut node = TestNode::start(&[]);
+    // First create a PSBT
+    let inputs = serde_json::json!([{
+        "txid": "0000000000000000000000000000000000000000000000000000000000000000",
+        "vout": 0,
+    }]);
+    let outputs = serde_json::json!({
+        "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202": 0.01,
+    });
+    let create_resp = node
+        .rpc_call_with_params("createpsbt", vec![inputs, outputs])
+        .unwrap();
+    let psbt_b64 = create_resp["result"].as_str().unwrap();
+
+    // Decode it
+    let response = node
+        .rpc_call_with_params("decodepsbt", vec![serde_json::json!(psbt_b64)])
+        .unwrap();
+    let result = &response["result"];
+    assert!(result["tx"].is_object());
+    assert!(result["inputs"].is_array());
+    node.stop();
+}
+
+#[test]
+fn test_analyzepsbt() {
+    let mut node = TestNode::start(&[]);
+    let inputs = serde_json::json!([{
+        "txid": "0000000000000000000000000000000000000000000000000000000000000000",
+        "vout": 0,
+    }]);
+    let outputs = serde_json::json!({
+        "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202": 0.01,
+    });
+    let create_resp = node
+        .rpc_call_with_params("createpsbt", vec![inputs, outputs])
+        .unwrap();
+    let psbt_b64 = create_resp["result"].as_str().unwrap();
+
+    let response = node
+        .rpc_call_with_params("analyzepsbt", vec![serde_json::json!(psbt_b64)])
+        .unwrap();
+    let result = &response["result"];
+    assert!(result["inputs"].is_array());
+    assert_eq!(result["next"], "updater"); // unsigned, no UTXOs
+    node.stop();
+}
+
+#[test]
+fn test_converttopsbt() {
+    let mut node = TestNode::start(&[]);
+    // Create a raw tx first
+    let inputs = serde_json::json!([{
+        "txid": "0000000000000000000000000000000000000000000000000000000000000000",
+        "vout": 0,
+    }]);
+    let outputs = serde_json::json!({
+        "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202": 0.01,
+    });
+    let raw_resp = node
+        .rpc_call_with_params("createrawtransaction", vec![inputs, outputs])
+        .unwrap();
+    let hex_tx = raw_resp["result"].as_str().unwrap();
+
+    let response = node
+        .rpc_call_with_params("converttopsbt", vec![serde_json::json!(hex_tx)])
+        .unwrap();
+    assert!(response["result"].is_string());
+    let b64 = response["result"].as_str().unwrap();
+    assert!(b64.starts_with("cHNidP8"));
+    node.stop();
+}
+
+#[test]
+fn test_validateaddress() {
+    let mut node = TestNode::start(&[]);
+    // Valid regtest bech32 address
+    let response = node
+        .rpc_call_with_params(
+            "validateaddress",
+            vec![serde_json::json!("bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202")],
+        )
+        .unwrap();
+    let result = &response["result"];
+    assert_eq!(result["isvalid"], true);
+    assert_eq!(result["iswitness"], true);
+
+    // Invalid address
+    let response = node
+        .rpc_call_with_params("validateaddress", vec![serde_json::json!("notanaddress")])
+        .unwrap();
+    let result = &response["result"];
+    assert_eq!(result["isvalid"], false);
+    node.stop();
+}
+
+#[test]
+fn test_waitforblockheight() {
+    let mut node = TestNode::start(&[]);
+    // Height 0 is already reached, should return immediately
+    let response = node
+        .rpc_call_with_params(
+            "waitforblockheight",
+            vec![serde_json::json!(0), serde_json::json!(1000)],
+        )
+        .unwrap();
+    let result = &response["result"];
+    assert!(result["height"].is_number());
+    assert!(result["hash"].is_string());
+    node.stop();
+}

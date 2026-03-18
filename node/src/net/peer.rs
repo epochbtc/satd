@@ -36,6 +36,8 @@ pub struct PeerInfo {
     pub user_agent: String,
     pub ban_score: u32,
     pub compact_blocks: bool,
+    /// Peer's minimum fee rate for tx relay (BIP 133 feefilter), in sat/kvB.
+    pub fee_filter: u64,
     pub bytes_sent: u64,
     pub bytes_recv: u64,
     pub conn_time: SystemTime,
@@ -54,6 +56,7 @@ impl PeerInfo {
             user_agent: String::new(),
             ban_score: 0,
             compact_blocks: false,
+            fee_filter: 0,
             bytes_sent: 0,
             bytes_recv: 0,
             conn_time: SystemTime::now(),
@@ -92,6 +95,7 @@ impl PeerInfo {
             "startingheight": self.best_height,
             "synced_headers": -1,
             "synced_blocks": -1,
+            "minfeefilter": self.fee_filter as f64 / 100_000_000.0,
             "connection_type": match self.direction {
                 Direction::Inbound => "inbound-full-relay",
                 Direction::Outbound => "outbound-full-relay",

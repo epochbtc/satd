@@ -3,7 +3,7 @@ use crate::mempool::fee::FeeEstimator;
 use crate::mempool::pool::Mempool;
 use crate::net::manager::PeerManager;
 use crate::rpc::auth::{AuthLayer, RpcAuth};
-use crate::rpc::{blockchain, mining, network, rawtx};
+use crate::rpc::{blockchain, mining, network, psbt, rawtx, util};
 use jsonrpsee::server::{RpcModule, ServerBuilder, ServerHandle};
 use jsonrpsee::types::ErrorObjectOwned;
 use std::net::SocketAddr;
@@ -17,6 +17,7 @@ pub struct RpcContext {
     pub peer_manager: Arc<PeerManager>,
     pub fee_estimator: Arc<FeeEstimator>,
     pub shutdown_tx: watch::Sender<bool>,
+    pub start_time: std::time::Instant,
 }
 
 /// Start the JSON-RPC HTTP server with authentication.
@@ -35,6 +36,7 @@ pub async fn start(
         peer_manager,
         fee_estimator,
         shutdown_tx,
+        start_time: std::time::Instant::now(),
     });
 
     let mut module = RpcModule::new(ctx);
@@ -88,6 +90,82 @@ pub async fn start(
         })
     })?;
 
+    module.register_method("getdifficulty", |_params, ctx, _extensions| {
+        Ok::<_, ErrorObjectOwned>(blockchain::get_difficulty(&ctx.chain_state))
+    })?;
+
+    module.register_method("getblockstats", |params, ctx, _extensions| {
+        let hash_or_height: String = params.one().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        blockchain::get_block_stats(&ctx.chain_state, &hash_or_height).map_err(|e| {
+            ErrorObjectOwned::owned(-5, e, None::<()>)
+        })
+    })?;
+
+    module.register_method("getchaintips", |_params, ctx, _extensions| {
+        Ok::<_, ErrorObjectOwned>(blockchain::get_chain_tips(&ctx.chain_state))
+    })?;
+
+    module.register_method("getchaintxstats", |params, ctx, _extensions| {
+        let mut seq = params.sequence();
+        let nblocks: Option<u32> = seq.optional_next().unwrap_or(None);
+        blockchain::get_chain_tx_stats(&ctx.chain_state, nblocks).map_err(|e| {
+            ErrorObjectOwned::owned(-1, e, None::<()>)
+        })
+    })?;
+
+    module.register_method("getmempoolancestors", |params, ctx, _extensions| {
+        let mut seq = params.sequence();
+        let txid: String = seq.next().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        let verbose: bool = seq.optional_next().unwrap_or(Some(false)).unwrap_or(false);
+        blockchain::get_mempool_ancestors(&ctx.mempool, &txid, verbose).map_err(|e| {
+            ErrorObjectOwned::owned(-5, e, None::<()>)
+        })
+    })?;
+
+    module.register_method("getmempooldescendants", |params, ctx, _extensions| {
+        let mut seq = params.sequence();
+        let txid: String = seq.next().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        let verbose: bool = seq.optional_next().unwrap_or(Some(false)).unwrap_or(false);
+        blockchain::get_mempool_descendants(&ctx.mempool, &txid, verbose).map_err(|e| {
+            ErrorObjectOwned::owned(-5, e, None::<()>)
+        })
+    })?;
+
+    module.register_method("getmempoolentry", |params, ctx, _extensions| {
+        let txid: String = params.one().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        blockchain::get_mempool_entry(&ctx.mempool, &txid).map_err(|e| {
+            ErrorObjectOwned::owned(-5, e, None::<()>)
+        })
+    })?;
+
+    module.register_method("preciousblock", |params, _ctx, _extensions| {
+        let hash: String = params.one().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        blockchain::precious_block(&hash).map_err(|e| {
+            ErrorObjectOwned::owned(-1, e, None::<()>)
+        })
+    })?;
+
+    module.register_method("verifychain", |params, ctx, _extensions| {
+        let mut seq = params.sequence();
+        let check_level: u32 = seq.optional_next().unwrap_or(Some(3)).unwrap_or(3);
+        let nblocks: u32 = seq.optional_next().unwrap_or(Some(6)).unwrap_or(6);
+        Ok::<_, ErrorObjectOwned>(blockchain::verify_chain(&ctx.chain_state, check_level, nblocks))
+    })?;
+
+    module.register_method("savemempool", |_params, _ctx, _extensions| {
+        Ok::<_, ErrorObjectOwned>(blockchain::save_mempool())
+    })?;
+
     // --- Mining RPCs ---
 
     module.register_method("submitblock", |params, ctx, _extensions| {
@@ -125,6 +203,30 @@ pub async fn start(
 
     module.register_method("getblocktemplate", |_params, ctx, _extensions| {
         Ok::<_, ErrorObjectOwned>(mining::get_block_template(&ctx.chain_state, &ctx.mempool))
+    })?;
+
+    module.register_method("getmininginfo", |_params, ctx, _extensions| {
+        Ok::<_, ErrorObjectOwned>(mining::get_mining_info(&ctx.chain_state))
+    })?;
+
+    module.register_method("getnetworkhashps", |params, ctx, _extensions| {
+        let mut seq = params.sequence();
+        let nblocks: Option<u32> = seq.optional_next().unwrap_or(None);
+        let height: Option<u32> = seq.optional_next().unwrap_or(None);
+        Ok::<_, ErrorObjectOwned>(serde_json::json!(mining::get_network_hash_ps(
+            &ctx.chain_state,
+            nblocks,
+            height,
+        )))
+    })?;
+
+    module.register_method("submitheader", |params, ctx, _extensions| {
+        let hex_header: String = params.one().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        mining::submit_header(&ctx.chain_state, &hex_header).map_err(|e| {
+            ErrorObjectOwned::owned(-1, e, None::<()>)
+        })
     })?;
 
     // --- Transaction / Mempool RPCs ---
@@ -171,6 +273,146 @@ pub async fn start(
             ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
         })?;
         rawtx::decode_raw_transaction(&hex_tx)
+            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
+    })?;
+
+    module.register_method("createrawtransaction", |params, _ctx, _extensions| {
+        let mut seq = params.sequence();
+        let inputs: Vec<serde_json::Value> = seq.next().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        let outputs: serde_json::Value = seq.next().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        let locktime: Option<u32> = seq.optional_next().unwrap_or(None);
+        rawtx::create_raw_transaction(&inputs, &outputs, locktime)
+            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
+    })?;
+
+    module.register_method("combinerawtransaction", |params, _ctx, _extensions| {
+        let hex_txs: Vec<String> = params.one().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        rawtx::combine_raw_transaction(&hex_txs)
+            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
+    })?;
+
+    module.register_method("decodescript", |params, _ctx, _extensions| {
+        let hex_script: String = params.one().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        rawtx::decode_script(&hex_script)
+            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
+    })?;
+
+    module.register_method("testmempoolaccept", |params, ctx, _extensions| {
+        let mut seq = params.sequence();
+        let rawtxs: Vec<String> = seq.next().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        let mut results = Vec::new();
+        for hex_tx in &rawtxs {
+            let tx_bytes = hex::decode(hex_tx).map_err(|_| {
+                ErrorObjectOwned::owned(-22, "TX decode failed", None::<()>)
+            })?;
+            let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&tx_bytes).map_err(|_| {
+                ErrorObjectOwned::owned(-22, "TX decode failed", None::<()>)
+            })?;
+            match ctx.mempool.test_accept(&tx, &ctx.chain_state, ctx.chain_state.script_verifier()) {
+                Ok((txid, vsize, fees)) => {
+                    results.push(serde_json::json!({
+                        "txid": txid.to_string(),
+                        "allowed": true,
+                        "vsize": vsize,
+                        "fees": {
+                            "base": fees as f64 / 100_000_000.0,
+                        },
+                    }));
+                }
+                Err(e) => {
+                    let txid = tx.compute_txid();
+                    results.push(serde_json::json!({
+                        "txid": txid.to_string(),
+                        "allowed": false,
+                        "reject-reason": e.to_string(),
+                    }));
+                }
+            }
+        }
+        Ok::<_, ErrorObjectOwned>(serde_json::json!(results))
+    })?;
+
+    // --- PSBT RPCs ---
+
+    module.register_method("createpsbt", |params, _ctx, _extensions| {
+        let mut seq = params.sequence();
+        let inputs: Vec<serde_json::Value> = seq.next().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        let outputs: serde_json::Value = seq.next().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        let locktime: Option<u32> = seq.optional_next().unwrap_or(None);
+        psbt::create_psbt(&inputs, &outputs, locktime)
+            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
+    })?;
+
+    module.register_method("decodepsbt", |params, _ctx, _extensions| {
+        let psbt_b64: String = params.one().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        psbt::decode_psbt(&psbt_b64)
+            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
+    })?;
+
+    module.register_method("analyzepsbt", |params, _ctx, _extensions| {
+        let psbt_b64: String = params.one().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        psbt::analyze_psbt(&psbt_b64)
+            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
+    })?;
+
+    module.register_method("combinepsbt", |params, _ctx, _extensions| {
+        let psbt_b64s: Vec<String> = params.one().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        psbt::combine_psbt(&psbt_b64s)
+            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
+    })?;
+
+    module.register_method("finalizepsbt", |params, ctx, _extensions| {
+        let mut seq = params.sequence();
+        let psbt_b64: String = seq.next().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        let extract: bool = seq.optional_next().unwrap_or(Some(true)).unwrap_or(true);
+        let _ = &ctx; // suppress unused
+        psbt::finalize_psbt(&psbt_b64, extract)
+            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
+    })?;
+
+    module.register_method("converttopsbt", |params, _ctx, _extensions| {
+        let hex_tx: String = params.one().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        psbt::convert_to_psbt(&hex_tx)
+            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
+    })?;
+
+    module.register_method("joinpsbts", |params, _ctx, _extensions| {
+        let psbt_b64s: Vec<String> = params.one().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        psbt::join_psbts(&psbt_b64s)
+            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
+    })?;
+
+    module.register_method("utxoupdatepsbt", |params, ctx, _extensions| {
+        let psbt_b64: String = params.one().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        psbt::utxo_update_psbt(&ctx.chain_state, &psbt_b64)
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
@@ -235,6 +477,62 @@ pub async fn start(
         Ok::<_, ErrorObjectOwned>(serde_json::Value::Null)
     })?;
 
+    module.register_method("getaddednodeinfo", |_params, ctx, _extensions| {
+        Ok::<_, ErrorObjectOwned>(serde_json::json!(ctx.peer_manager.get_added_node_info()))
+    })?;
+
+    module.register_method("getnettotals", |_params, _ctx, _extensions| {
+        Ok::<_, ErrorObjectOwned>(serde_json::json!({
+            "totalbytesrecv": 0,
+            "totalbytessent": 0,
+            "timemillis": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+        }))
+    })?;
+
+    module.register_method("listbanned", |_params, ctx, _extensions| {
+        Ok::<_, ErrorObjectOwned>(serde_json::json!(ctx.peer_manager.list_banned()))
+    })?;
+
+    module.register_method("setban", |params, ctx, _extensions| {
+        let mut seq = params.sequence();
+        let addr_str: String = seq.next().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        let command: String = seq.next().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        let addr: std::net::SocketAddr = addr_str.parse().map_err(|e: std::net::AddrParseError| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        match command.as_str() {
+            "add" => ctx.peer_manager.set_ban(addr, true),
+            "remove" => ctx.peer_manager.set_ban(addr, false),
+            _ => return Err(ErrorObjectOwned::owned(-1, "Invalid command", None::<()>)),
+        }
+        Ok::<_, ErrorObjectOwned>(serde_json::Value::Null)
+    })?;
+
+    module.register_method("clearbanned", |_params, ctx, _extensions| {
+        ctx.peer_manager.clear_banned();
+        Ok::<_, ErrorObjectOwned>(serde_json::Value::Null)
+    })?;
+
+    module.register_method("ping", |_params, ctx, _extensions| {
+        ctx.peer_manager.ping_all();
+        Ok::<_, ErrorObjectOwned>(serde_json::Value::Null)
+    })?;
+
+    module.register_method("setnetworkactive", |params, _ctx, _extensions| {
+        let _active: bool = params.one().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        // Stub: network is always active
+        Ok::<_, ErrorObjectOwned>(serde_json::json!(true))
+    })?;
+
     module.register_method("disconnectnode", |params, ctx, _extensions| {
         let addr_str: String = params.one().map_err(|e| {
             ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
@@ -247,6 +545,178 @@ pub async fn start(
     })?;
 
     // --- Control RPCs ---
+
+    module.register_method("help", |_params, _ctx, _extensions| {
+        let methods = vec![
+            "addnode", "clearbanned", "decoderawtransaction", "decodescript",
+            "disconnectnode", "estimatesmartfee", "generateblock", "generatetoaddress",
+            "getaddednodeinfo", "getbestblockhash", "getblock", "getblockchaininfo",
+            "getblockcount", "getblockhash", "getblockheader", "getblockstats",
+            "getblocktemplate", "getchaintips", "getchaintxstats", "getconnectioncount",
+            "getdifficulty", "getmempoolancestors", "getmempooldescendants",
+            "getmempoolentry", "getmempoolinfo", "getmemoryinfo", "getmininginfo",
+            "getnettotals", "getnetworkhashps", "getnetworkinfo", "getpeerinfo",
+            "getrawmempool", "getrawtransaction", "getrpcinfo", "gettxout",
+            "gettxoutsetinfo", "help", "listbanned", "logging", "ping",
+            "preciousblock", "savemempool", "sendrawtransaction", "setban",
+            "setnetworkactive", "stop", "submitblock", "submitheader",
+            "testmempoolaccept", "uptime", "verifychain",
+        ];
+        Ok::<_, ErrorObjectOwned>(serde_json::json!(methods.join("\n")))
+    })?;
+
+    module.register_method("uptime", |_params, ctx, _extensions| {
+        let uptime = ctx.start_time.elapsed().as_secs();
+        Ok::<_, ErrorObjectOwned>(serde_json::json!(uptime))
+    })?;
+
+    module.register_method("getmemoryinfo", |_params, _ctx, _extensions| {
+        // Read process memory from /proc/self/status on Linux
+        let rss = std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find(|l| l.starts_with("VmRSS:"))
+                    .and_then(|l| {
+                        l.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok())
+                    })
+            })
+            .unwrap_or(0)
+            * 1024; // kB to bytes
+        Ok::<_, ErrorObjectOwned>(serde_json::json!({
+            "locked": {
+                "used": rss,
+                "free": 0,
+                "total": rss,
+                "locked": 0,
+                "chunks_used": 0,
+                "chunks_free": 0,
+            }
+        }))
+    })?;
+
+    module.register_method("getrpcinfo", |_params, _ctx, _extensions| {
+        Ok::<_, ErrorObjectOwned>(serde_json::json!({
+            "active_commands": [],
+            "logpath": "",
+        }))
+    })?;
+
+    module.register_method("logging", |_params, _ctx, _extensions| {
+        Ok::<_, ErrorObjectOwned>(serde_json::json!({
+            "net": true,
+            "mempool": true,
+            "validation": true,
+            "rpc": true,
+        }))
+    })?;
+
+    module.register_method("validateaddress", |params, _ctx, _extensions| {
+        let address: String = params.one().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        Ok::<_, ErrorObjectOwned>(util::validate_address(&address))
+    })?;
+
+    // --- Long-polling RPCs ---
+
+    module.register_async_method("waitforblockheight", |params, ctx, _extensions| async move {
+        let mut seq = params.sequence();
+        let target_height: u32 = seq.next().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        let timeout_ms: u64 = seq.optional_next().unwrap_or(Some(0)).unwrap_or(0);
+        let timeout = if timeout_ms > 0 {
+            std::time::Duration::from_millis(timeout_ms)
+        } else {
+            std::time::Duration::from_secs(300) // default 5 min
+        };
+        let deadline = std::time::Instant::now() + timeout;
+
+        loop {
+            let height = ctx.chain_state.tip_height();
+            if height >= target_height {
+                let hash = ctx.chain_state.tip_hash();
+                return Ok::<_, ErrorObjectOwned>(serde_json::json!({
+                    "hash": hash.to_string(),
+                    "height": height,
+                }));
+            }
+            if std::time::Instant::now() >= deadline {
+                let hash = ctx.chain_state.tip_hash();
+                return Ok(serde_json::json!({
+                    "hash": hash.to_string(),
+                    "height": height,
+                }));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    })?;
+
+    module.register_async_method("waitfornewblock", |params, ctx, _extensions| async move {
+        let mut seq = params.sequence();
+        let timeout_ms: u64 = seq.optional_next().unwrap_or(Some(0)).unwrap_or(0);
+        let timeout = if timeout_ms > 0 {
+            std::time::Duration::from_millis(timeout_ms)
+        } else {
+            std::time::Duration::from_secs(300)
+        };
+        let deadline = std::time::Instant::now() + timeout;
+        let initial_hash = ctx.chain_state.tip_hash();
+
+        loop {
+            let current_hash = ctx.chain_state.tip_hash();
+            if current_hash != initial_hash {
+                let height = ctx.chain_state.tip_height();
+                return Ok::<_, ErrorObjectOwned>(serde_json::json!({
+                    "hash": current_hash.to_string(),
+                    "height": height,
+                }));
+            }
+            if std::time::Instant::now() >= deadline {
+                let height = ctx.chain_state.tip_height();
+                return Ok(serde_json::json!({
+                    "hash": current_hash.to_string(),
+                    "height": height,
+                }));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    })?;
+
+    module.register_async_method("waitforblock", |params, ctx, _extensions| async move {
+        let mut seq = params.sequence();
+        let blockhash: String = seq.next().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        let target_hash: bitcoin::BlockHash = blockhash.parse().map_err(|_| {
+            ErrorObjectOwned::owned(-1, "Invalid block hash", None::<()>)
+        })?;
+        let timeout_ms: u64 = seq.optional_next().unwrap_or(Some(0)).unwrap_or(0);
+        let timeout = if timeout_ms > 0 {
+            std::time::Duration::from_millis(timeout_ms)
+        } else {
+            std::time::Duration::from_secs(300)
+        };
+        let deadline = std::time::Instant::now() + timeout;
+
+        loop {
+            if let Some(entry) = ctx.chain_state.get_block_index(&target_hash) {
+                return Ok::<_, ErrorObjectOwned>(serde_json::json!({
+                    "hash": target_hash.to_string(),
+                    "height": entry.height,
+                }));
+            }
+            if std::time::Instant::now() >= deadline {
+                let height = ctx.chain_state.tip_height();
+                return Ok(serde_json::json!({
+                    "hash": ctx.chain_state.tip_hash().to_string(),
+                    "height": height,
+                }));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    })?;
 
     module.register_async_method("stop", |_params, ctx, _extensions| async move {
         tracing::info!("Received stop RPC, shutting down");

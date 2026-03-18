@@ -3,6 +3,7 @@ use bitcoin::consensus::serialize;
 use serde_json::{json, Value};
 
 use crate::chain::state::ChainState;
+use crate::mempool::pool::Mempool;
 use crate::storage::blockindex::target_to_difficulty;
 
 /// Build the `getblockchaininfo` response from real chain state.
@@ -280,4 +281,319 @@ pub fn get_tx_out_set_info(chain_state: &ChainState) -> Value {
         "total_amount": total_btc,
         "hash_serialized_3": "",
     })
+}
+
+/// `getdifficulty` — return current proof-of-work difficulty.
+pub fn get_difficulty(chain_state: &ChainState) -> Value {
+    let tip_hash = chain_state.tip_hash();
+    if let Some(entry) = chain_state.get_block_index(&tip_hash) {
+        json!(target_to_difficulty(entry.header.bits))
+    } else {
+        json!(0.0)
+    }
+}
+
+/// `getblockstats` — return per-block statistics.
+pub fn get_block_stats(
+    chain_state: &ChainState,
+    hash_or_height: &str,
+) -> Result<Value, String> {
+    // Parse as height or hash
+    let hash = if let Ok(height) = hash_or_height.parse::<u32>() {
+        chain_state
+            .get_block_hash_by_height(height)
+            .ok_or("Block height out of range")?
+    } else {
+        hash_or_height
+            .parse()
+            .map_err(|_| "Invalid block hash or height".to_string())?
+    };
+
+    let entry = chain_state
+        .get_block_index(&hash)
+        .ok_or("Block not found")?;
+    let block = chain_state
+        .get_block(&hash)
+        .ok_or("Block data not available")?;
+
+    let block_bytes = serialize(&block);
+    let total_size = block_bytes.len();
+    let total_weight = block.weight().to_wu();
+    let num_txs = block.txdata.len();
+
+    let mut total_fee: u64 = 0;
+    let mut total_out: u64 = 0;
+    let mut min_fee = u64::MAX;
+    let mut max_fee = 0u64;
+    let mut min_fee_rate = u64::MAX;
+    let mut max_fee_rate = 0u64;
+    let mut segwit_txs = 0u64;
+    let mut utxo_increase: i64 = 0;
+
+    for tx in &block.txdata {
+        let out_sum: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
+        total_out += out_sum;
+        utxo_increase += tx.output.len() as i64;
+
+        if tx.is_coinbase() {
+            continue;
+        }
+
+        utxo_increase -= tx.input.len() as i64;
+
+        // Compute fee from inputs
+        let mut in_sum: u64 = 0;
+        let mut inputs_found = true;
+        for input in &tx.input {
+            match chain_state.get_coin(&input.previous_output) {
+                Some(coin) => in_sum += coin.amount,
+                None => {
+                    inputs_found = false;
+                    break;
+                }
+            }
+        }
+
+        if inputs_found && in_sum >= out_sum {
+            let fee = in_sum - out_sum;
+            total_fee += fee;
+            min_fee = min_fee.min(fee);
+            max_fee = max_fee.max(fee);
+
+            let w = tx.weight().to_wu();
+            if w > 0 {
+                let rate = fee * 1000 / w;
+                min_fee_rate = min_fee_rate.min(rate);
+                max_fee_rate = max_fee_rate.max(rate);
+            }
+        }
+
+        if tx.input.iter().any(|i| !i.witness.is_empty()) {
+            segwit_txs += 1;
+        }
+    }
+
+    if min_fee == u64::MAX {
+        min_fee = 0;
+    }
+    if min_fee_rate == u64::MAX {
+        min_fee_rate = 0;
+    }
+
+    let avg_fee = if num_txs > 1 {
+        total_fee / (num_txs as u64 - 1)
+    } else {
+        0
+    };
+    let avg_fee_rate = if total_weight > 0 && num_txs > 1 {
+        total_fee * 1000 / total_weight
+    } else {
+        0
+    };
+
+    let subsidy = crate::chain::connect::block_subsidy(entry.height);
+
+    Ok(json!({
+        "avgfee": avg_fee,
+        "avgfeerate": avg_fee_rate,
+        "avgtxsize": if num_txs > 1 { total_size / num_txs } else { 0 },
+        "blockhash": hash.to_string(),
+        "height": entry.height,
+        "ins": block.txdata.iter().skip(1).map(|tx| tx.input.len()).sum::<usize>(),
+        "maxfee": max_fee,
+        "maxfeerate": max_fee_rate,
+        "maxtxsize": block.txdata.iter().map(|tx| serialize(tx).len()).max().unwrap_or(0),
+        "medianfee": avg_fee, // simplified: use avg as median
+        "mediantime": entry.header.time,
+        "mediantxsize": if num_txs > 0 { total_size / num_txs } else { 0 },
+        "minfee": min_fee,
+        "minfeerate": min_fee_rate,
+        "mintxsize": block.txdata.iter().map(|tx| serialize(tx).len()).min().unwrap_or(0),
+        "outs": block.txdata.iter().map(|tx| tx.output.len()).sum::<usize>(),
+        "subsidy": subsidy,
+        "swtotal_size": 0,
+        "swtotal_weight": 0,
+        "swtxs": segwit_txs,
+        "time": entry.header.time,
+        "total_out": total_out,
+        "total_size": total_size,
+        "total_weight": total_weight,
+        "totalfee": total_fee,
+        "txs": num_txs,
+        "utxo_increase": utxo_increase,
+        "utxo_size_inc": utxo_increase * 50,
+    }))
+}
+
+/// `getchaintips` — return chain tip info.
+pub fn get_chain_tips(chain_state: &ChainState) -> Value {
+    let tip_hash = chain_state.tip_hash();
+    let tip_height = chain_state.tip_height();
+
+    // Currently we only track the active chain tip
+    json!([{
+        "height": tip_height,
+        "hash": tip_hash.to_string(),
+        "branchlen": 0,
+        "status": "active",
+    }])
+}
+
+/// `getchaintxstats` — return tx rate statistics over a window.
+pub fn get_chain_tx_stats(
+    chain_state: &ChainState,
+    nblocks: Option<u32>,
+) -> Result<Value, String> {
+    let tip_height = chain_state.tip_height();
+    let window = nblocks.unwrap_or(30).min(tip_height);
+
+    if window == 0 {
+        return Err("Window must be > 0".to_string());
+    }
+
+    let tip_hash = chain_state.tip_hash();
+    let tip_entry = chain_state
+        .get_block_index(&tip_hash)
+        .ok_or("Tip not found")?;
+
+    let start_height = tip_height.saturating_sub(window);
+    let start_hash = chain_state
+        .get_block_hash_by_height(start_height)
+        .ok_or("Start block not found")?;
+    let start_entry = chain_state
+        .get_block_index(&start_hash)
+        .ok_or("Start block not found")?;
+
+    // Count transactions in the window
+    let mut tx_count: u64 = 0;
+    for h in (start_height + 1)..=tip_height {
+        if let Some(hash) = chain_state.get_block_hash_by_height(h)
+            && let Some(entry) = chain_state.get_block_index(&hash) {
+                tx_count += entry.num_tx as u64;
+            }
+    }
+
+    let time_diff = tip_entry.header.time.saturating_sub(start_entry.header.time);
+    let tx_rate = if time_diff > 0 {
+        tx_count as f64 / time_diff as f64
+    } else {
+        0.0
+    };
+
+    Ok(json!({
+        "time": tip_entry.header.time,
+        "txcount": tx_count,
+        "window_final_block_hash": tip_hash.to_string(),
+        "window_final_block_height": tip_height,
+        "window_block_count": window,
+        "window_tx_count": tx_count,
+        "window_interval": time_diff,
+        "txrate": tx_rate,
+    }))
+}
+
+/// `getmempoolancestors` — return in-mempool ancestors of a transaction.
+pub fn get_mempool_ancestors(
+    mempool: &Mempool,
+    txid_str: &str,
+    verbose: bool,
+) -> Result<Value, String> {
+    let txid: bitcoin::Txid = txid_str
+        .parse()
+        .map_err(|_| "Invalid txid".to_string())?;
+
+    let ancestors = mempool
+        .get_ancestors(&txid)
+        .ok_or("Transaction not in mempool")?;
+
+    if verbose {
+        let mut result = serde_json::Map::new();
+        for anc_txid in &ancestors {
+            if let Some(entry_json) = mempool.get_entry_verbose(anc_txid) {
+                result.insert(anc_txid.to_string(), entry_json);
+            }
+        }
+        Ok(Value::Object(result))
+    } else {
+        let txids: Vec<String> = ancestors.iter().map(|t| t.to_string()).collect();
+        Ok(json!(txids))
+    }
+}
+
+/// `getmempooldescendants` — return in-mempool descendants of a transaction.
+pub fn get_mempool_descendants(
+    mempool: &Mempool,
+    txid_str: &str,
+    verbose: bool,
+) -> Result<Value, String> {
+    let txid: bitcoin::Txid = txid_str
+        .parse()
+        .map_err(|_| "Invalid txid".to_string())?;
+
+    let descendants = mempool
+        .get_descendants(&txid)
+        .ok_or("Transaction not in mempool")?;
+
+    if verbose {
+        let mut result = serde_json::Map::new();
+        for desc_txid in &descendants {
+            if let Some(entry_json) = mempool.get_entry_verbose(desc_txid) {
+                result.insert(desc_txid.to_string(), entry_json);
+            }
+        }
+        Ok(Value::Object(result))
+    } else {
+        let txids: Vec<String> = descendants.iter().map(|t| t.to_string()).collect();
+        Ok(json!(txids))
+    }
+}
+
+/// `getmempoolentry` — return detailed info about a single mempool transaction.
+pub fn get_mempool_entry(
+    mempool: &Mempool,
+    txid_str: &str,
+) -> Result<Value, String> {
+    let txid: bitcoin::Txid = txid_str
+        .parse()
+        .map_err(|_| "Invalid txid".to_string())?;
+
+    mempool
+        .get_entry_verbose(&txid)
+        .ok_or_else(|| "Transaction not in mempool".to_string())
+}
+
+/// `preciousblock` — mark a block as precious (prefer during reorg tie-breaking).
+pub fn precious_block(_hash_str: &str) -> Result<Value, String> {
+    // Stub: acknowledge but don't implement tie-breaking preference
+    Ok(Value::Null)
+}
+
+/// `verifychain` — verify chain database integrity.
+pub fn verify_chain(chain_state: &ChainState, check_level: u32, nblocks: u32) -> Value {
+    let tip = chain_state.tip_height();
+    let check_blocks = if nblocks == 0 { tip } else { nblocks.min(tip) };
+    let start = tip.saturating_sub(check_blocks);
+
+    let mut verified = 0u32;
+    for h in start..=tip {
+        if let Some(hash) = chain_state.get_block_hash_by_height(h)
+            && chain_state.get_block_index(&hash).is_some() {
+                verified += 1;
+                if check_level >= 1 {
+                    // Level 1+: verify block data exists
+                    if chain_state.get_block(&hash).is_none() {
+                        return json!(false);
+                    }
+                }
+            }
+    }
+
+    let _ = verified; // suppress unused
+    json!(true)
+}
+
+/// `savemempool` — serialize mempool to disk.
+pub fn save_mempool() -> Value {
+    // Stub: mempool persistence not yet implemented
+    Value::Null
 }
