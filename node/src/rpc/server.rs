@@ -88,6 +88,82 @@ pub async fn start(
         })
     })?;
 
+    module.register_method("getdifficulty", |_params, ctx, _extensions| {
+        Ok::<_, ErrorObjectOwned>(blockchain::get_difficulty(&ctx.chain_state))
+    })?;
+
+    module.register_method("getblockstats", |params, ctx, _extensions| {
+        let hash_or_height: String = params.one().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        blockchain::get_block_stats(&ctx.chain_state, &hash_or_height).map_err(|e| {
+            ErrorObjectOwned::owned(-5, e, None::<()>)
+        })
+    })?;
+
+    module.register_method("getchaintips", |_params, ctx, _extensions| {
+        Ok::<_, ErrorObjectOwned>(blockchain::get_chain_tips(&ctx.chain_state))
+    })?;
+
+    module.register_method("getchaintxstats", |params, ctx, _extensions| {
+        let mut seq = params.sequence();
+        let nblocks: Option<u32> = seq.optional_next().unwrap_or(None);
+        blockchain::get_chain_tx_stats(&ctx.chain_state, nblocks).map_err(|e| {
+            ErrorObjectOwned::owned(-1, e, None::<()>)
+        })
+    })?;
+
+    module.register_method("getmempoolancestors", |params, ctx, _extensions| {
+        let mut seq = params.sequence();
+        let txid: String = seq.next().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        let verbose: bool = seq.optional_next().unwrap_or(Some(false)).unwrap_or(false);
+        blockchain::get_mempool_ancestors(&ctx.mempool, &txid, verbose).map_err(|e| {
+            ErrorObjectOwned::owned(-5, e, None::<()>)
+        })
+    })?;
+
+    module.register_method("getmempooldescendants", |params, ctx, _extensions| {
+        let mut seq = params.sequence();
+        let txid: String = seq.next().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        let verbose: bool = seq.optional_next().unwrap_or(Some(false)).unwrap_or(false);
+        blockchain::get_mempool_descendants(&ctx.mempool, &txid, verbose).map_err(|e| {
+            ErrorObjectOwned::owned(-5, e, None::<()>)
+        })
+    })?;
+
+    module.register_method("getmempoolentry", |params, ctx, _extensions| {
+        let txid: String = params.one().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        blockchain::get_mempool_entry(&ctx.mempool, &txid).map_err(|e| {
+            ErrorObjectOwned::owned(-5, e, None::<()>)
+        })
+    })?;
+
+    module.register_method("preciousblock", |params, _ctx, _extensions| {
+        let hash: String = params.one().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        blockchain::precious_block(&hash).map_err(|e| {
+            ErrorObjectOwned::owned(-1, e, None::<()>)
+        })
+    })?;
+
+    module.register_method("verifychain", |params, ctx, _extensions| {
+        let mut seq = params.sequence();
+        let check_level: u32 = seq.optional_next().unwrap_or(Some(3)).unwrap_or(3);
+        let nblocks: u32 = seq.optional_next().unwrap_or(Some(6)).unwrap_or(6);
+        Ok::<_, ErrorObjectOwned>(blockchain::verify_chain(&ctx.chain_state, check_level, nblocks))
+    })?;
+
+    module.register_method("savemempool", |_params, _ctx, _extensions| {
+        Ok::<_, ErrorObjectOwned>(blockchain::save_mempool())
+    })?;
+
     // --- Mining RPCs ---
 
     module.register_method("submitblock", |params, ctx, _extensions| {
@@ -172,6 +248,43 @@ pub async fn start(
         })?;
         rawtx::decode_raw_transaction(&hex_tx)
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
+    })?;
+
+    module.register_method("testmempoolaccept", |params, ctx, _extensions| {
+        let mut seq = params.sequence();
+        let rawtxs: Vec<String> = seq.next().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        let mut results = Vec::new();
+        for hex_tx in &rawtxs {
+            let tx_bytes = hex::decode(hex_tx).map_err(|_| {
+                ErrorObjectOwned::owned(-22, "TX decode failed", None::<()>)
+            })?;
+            let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&tx_bytes).map_err(|_| {
+                ErrorObjectOwned::owned(-22, "TX decode failed", None::<()>)
+            })?;
+            match ctx.mempool.test_accept(&tx, &ctx.chain_state, ctx.chain_state.script_verifier()) {
+                Ok((txid, vsize, fees)) => {
+                    results.push(serde_json::json!({
+                        "txid": txid.to_string(),
+                        "allowed": true,
+                        "vsize": vsize,
+                        "fees": {
+                            "base": fees as f64 / 100_000_000.0,
+                        },
+                    }));
+                }
+                Err(e) => {
+                    let txid = tx.compute_txid();
+                    results.push(serde_json::json!({
+                        "txid": txid.to_string(),
+                        "allowed": false,
+                        "reject-reason": e.to_string(),
+                    }));
+                }
+            }
+        }
+        Ok::<_, ErrorObjectOwned>(serde_json::json!(results))
     })?;
 
     // --- UTXO / Chain RPCs ---

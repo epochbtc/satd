@@ -622,13 +622,12 @@ impl Mempool {
             } else {
                 // Check mempool parents
                 let inner = self.inner.read().unwrap();
-                if let Some(parent) = inner.entries.get(&input.previous_output.txid) {
-                    if let Some(output) = parent.tx.output.get(input.previous_output.vout as usize) {
+                if let Some(parent) = inner.entries.get(&input.previous_output.txid)
+                    && let Some(output) = parent.tx.output.get(input.previous_output.vout as usize) {
                         sum_inputs += output.value.to_sat();
                         prev_outputs.push(output.clone());
                         continue;
                     }
-                }
                 return Err(MempoolError::MissingInputs);
             }
         }
