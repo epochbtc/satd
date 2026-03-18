@@ -1,4 +1,5 @@
-use bitcoin::{Block, OutPoint, TxOut};
+use bitcoin::{Block, OutPoint, Transaction, TxOut};
+use rayon::prelude::*;
 
 use crate::storage::blockindex::{BlockIndexEntry, BlockStatus, add_u256, work_for_bits};
 use crate::storage::coinview::Coin;
@@ -114,7 +115,10 @@ pub fn connect_block(
     let is_genesis = height == 0;
     let mut total_fees: u64 = 0;
 
-    // Process each transaction
+    // Transactions queued for parallel script verification after UTXO resolution
+    let mut verify_queue: Vec<(&Transaction, Vec<TxOut>)> = Vec::new();
+
+    // Process each transaction: resolve UTXOs sequentially, defer script verification
     for tx in &block.txdata {
         let is_coinbase = tx.is_coinbase();
 
@@ -233,10 +237,8 @@ pub fn connect_block(
 
             total_fees += sum_inputs - sum_outputs;
 
-            // Script verification (all inputs at once for taproot)
-            script_verifier
-                .verify_transaction(tx, &prev_outputs)
-                .map_err(|e| ConnectError::ScriptFailed(e.to_string()))?;
+            // Collect for parallel script verification
+            verify_queue.push((tx, prev_outputs));
         }
 
         // Add outputs as new UTXOs (skip genesis coinbase)
@@ -256,6 +258,18 @@ pub fn connect_block(
                 batch.coin_puts.push((outpoint, coin));
             }
         }
+    }
+
+    // Parallel script verification: verify all transactions concurrently
+    if !verify_queue.is_empty() {
+        let result: Result<(), ConnectError> = verify_queue
+            .par_iter()
+            .try_for_each(|(tx, prev_outputs)| {
+                script_verifier
+                    .verify_transaction(tx, prev_outputs)
+                    .map_err(|e| ConnectError::ScriptFailed(e.to_string()))
+            });
+        result?;
     }
 
     // Check coinbase value doesn't exceed subsidy + fees
