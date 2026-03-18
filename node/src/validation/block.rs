@@ -127,7 +127,7 @@ fn compute_merkle_root_from_hashes(hashes: &[[u8; 32]]) -> [u8; 32] {
 
     let mut current = hashes.to_vec();
     while current.len() > 1 {
-        if current.len() % 2 != 0 {
+        if !current.len().is_multiple_of(2) {
             let last = *current.last().unwrap();
             current.push(last);
         }

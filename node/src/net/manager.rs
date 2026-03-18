@@ -88,6 +88,7 @@ pub struct PeerManager {
     /// Track the highest header height we've stored.
     headers_tip: AtomicU64,
     /// Track blocks we've already requested to avoid duplicate getdata.
+    #[allow(dead_code)]
     requested_blocks: RwLock<std::collections::HashSet<bitcoin::BlockHash>>,
     /// Configured outbound peer addresses for auto-reconnect.
     connect_addrs: RwLock<Vec<SocketAddr>>,
@@ -302,7 +303,7 @@ impl PeerManager {
         let mut sync_interval = tokio::time::interval(std::time::Duration::from_millis(500));
         let mut last_tip: u32 = 0;
         let mut ticks: u64 = 0;
-        let mut shutdown = self.shutdown.clone();
+        let shutdown = self.shutdown.clone();
 
         loop {
             // Check for shutdown
@@ -336,7 +337,7 @@ impl PeerManager {
 
             // Check sync progress and request more blocks
             let tip = self.chain_state.tip_height();
-            let htip = self.headers_tip.load(Ordering::Relaxed) as u32;
+            let _htip = self.headers_tip.load(Ordering::Relaxed) as u32;
 
             if tip != last_tip {
                 last_tip = tip;
@@ -348,7 +349,7 @@ impl PeerManager {
             }
 
             // Request blocks every 10 ticks (5 seconds) and headers every 20 ticks (10 seconds)
-            if ticks % 10 == 0 {
+            if ticks.is_multiple_of(10) {
                 let peer_ids: Vec<PeerId> = {
                     let peers = self.peers.read().unwrap();
                     peers.iter()
@@ -359,7 +360,7 @@ impl PeerManager {
                 for pid in &peer_ids {
                     self.request_missing_blocks(*pid);
                 }
-                if ticks % 20 == 0 {
+                if ticks.is_multiple_of(20) {
                     for pid in &peer_ids {
                         self.send_to_peer(*pid, sync::make_getheaders(&self.chain_state));
                     }
@@ -368,7 +369,7 @@ impl PeerManager {
 
             ticks += 1;
             // Every 20 ticks (10 seconds), check peers
-            if ticks % 20 == 0 {
+            if ticks.is_multiple_of(20) {
                 // Auto-reconnect if no peers connected
                 if self.connection_count() == 0 {
                     let addrs = self.connect_addrs.read().unwrap().clone();
@@ -392,14 +393,13 @@ impl PeerManager {
                         // Check backoff timer
                         {
                             let backoff = self.reconnect_backoff.read().unwrap();
-                            if let Some(state) = backoff.get(&addr) {
-                                if now < state.next_attempt {
+                            if let Some(state) = backoff.get(&addr)
+                                && now < state.next_attempt {
                                     continue;
                                 }
-                            }
                         }
 
-                        let pm = Arc::clone(&self);
+                        let pm = Arc::clone(self);
                         tokio::spawn(async move {
                             match pm.connect_outbound(addr).await {
                                 Ok(_) => {
@@ -528,7 +528,7 @@ impl PeerManager {
         }
 
         let mut accepted = 0;
-        let mut max_height = 0u32;
+        let _max_height = 0u32;
         for header in &headers {
             match self.chain_state.accept_header(header) {
                 Ok(_) => {
@@ -652,11 +652,10 @@ impl PeerManager {
 
         let mut headers = Vec::new();
         for h in start..end {
-            if let Some(hash) = self.chain_state.get_block_hash_by_height(h) {
-                if let Some(entry) = self.chain_state.get_block_index(&hash) {
+            if let Some(hash) = self.chain_state.get_block_hash_by_height(h)
+                && let Some(entry) = self.chain_state.get_block_index(&hash) {
                     headers.push(entry.header);
                 }
-            }
         }
 
         if !headers.is_empty() {
@@ -686,11 +685,10 @@ impl PeerManager {
         let block_hash = compact.header.block_hash();
 
         // Skip if we already have this block
-        if let Some(entry) = self.chain_state.get_block_index(&block_hash) {
-            if entry.status != crate::storage::blockindex::BlockStatus::HeaderOnly {
+        if let Some(entry) = self.chain_state.get_block_index(&block_hash)
+            && entry.status != crate::storage::blockindex::BlockStatus::HeaderOnly {
                 return;
             }
-        }
 
         match compact::try_reconstruct(&compact, &self.mempool) {
             Ok(block) => {

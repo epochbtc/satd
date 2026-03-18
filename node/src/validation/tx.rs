@@ -44,7 +44,7 @@ pub fn check_transaction(tx: &Transaction) -> Result<(), ValidationError> {
     if tx.is_coinbase() {
         // Coinbase scriptSig must be between 2 and 100 bytes
         let sig_len = tx.input[0].script_sig.len();
-        if sig_len < 2 || sig_len > 100 {
+        if !(2..=100).contains(&sig_len) {
             return Err(ValidationError::BadTxCoinbaseSize);
         }
     } else {

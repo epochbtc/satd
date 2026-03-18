@@ -24,11 +24,10 @@ pub fn build_locator(chain_state: &ChainState) -> Vec<BlockHash> {
     }
 
     // Always include genesis
-    if let Some(hash) = chain_state.get_block_hash_by_height(0) {
-        if locator.last() != Some(&hash) {
+    if let Some(hash) = chain_state.get_block_hash_by_height(0)
+        && locator.last() != Some(&hash) {
             locator.push(hash);
         }
-    }
 
     locator
 }

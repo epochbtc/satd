@@ -52,7 +52,7 @@ pub fn get_raw_mempool(mempool: &Mempool, verbose: bool) -> Value {
     let mut result = serde_json::Map::new();
     for (txid, entry) in &entries {
         let vsize = if entry.weight > 0 {
-            (entry.weight + 3) / 4
+            entry.weight.div_ceil(4)
         } else {
             0
         };
@@ -87,8 +87,8 @@ pub fn get_raw_transaction(
         .map_err(|_| (-8, "parameter 1 must be of length 64 (not 0, for txid)".to_string()))?;
 
     // Search mempool first (unless blockhash is specified)
-    if blockhash.is_none() {
-        if let Some(entry) = mempool.get(&txid) {
+    if blockhash.is_none()
+        && let Some(entry) = mempool.get(&txid) {
             return if verbose {
                 Ok(decode_transaction_verbose(&entry.tx, None, None))
             } else {
@@ -96,7 +96,6 @@ pub fn get_raw_transaction(
                 Ok(Value::String(hex::encode(raw)))
             };
         }
-    }
 
     // Search in a specific block
     if let Some(hash_str) = blockhash {
@@ -151,7 +150,7 @@ fn decode_transaction_verbose(
     let raw = bitcoin::consensus::serialize(tx);
     let size = raw.len();
     let weight = tx.weight().to_wu() as usize;
-    let vsize = (weight + 3) / 4;
+    let vsize = weight.div_ceil(4);
 
     let vin: Vec<Value> = tx
         .input
@@ -175,7 +174,7 @@ fn decode_transaction_verbose(
                 });
                 if !input.witness.is_empty() {
                     let witness: Vec<String> =
-                        input.witness.iter().map(|w| hex::encode(w)).collect();
+                        input.witness.iter().map(hex::encode).collect();
                     v["txinwitness"] = json!(witness);
                 }
                 v

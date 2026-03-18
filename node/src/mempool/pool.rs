@@ -215,8 +215,8 @@ impl Mempool {
             // Also remove any mempool txs whose inputs are now double-spent by block txs
             if !tx.is_coinbase() {
                 for input in &tx.input {
-                    if let Some(conflict_txid) = inner.spends.remove(&input.previous_output) {
-                        if let Some(conflict_entry) = inner.entries.remove(&conflict_txid) {
+                    if let Some(conflict_txid) = inner.spends.remove(&input.previous_output)
+                        && let Some(conflict_entry) = inner.entries.remove(&conflict_txid) {
                             let sz = bitcoin::consensus::serialize(&conflict_entry.tx).len();
                             inner.total_bytes = inner.total_bytes.saturating_sub(sz);
                             // Clean up remaining spends for the conflicting tx
@@ -224,7 +224,6 @@ impl Mempool {
                                 inner.spends.remove(&ci.previous_output);
                             }
                         }
-                    }
                 }
             }
         }
