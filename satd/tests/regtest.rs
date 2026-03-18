@@ -1292,7 +1292,7 @@ fn test_waitforblockheight() {
         )
         .unwrap();
     let result = &response["result"];
-    assert!(result["height"].as_u64().unwrap() >= 0);
+    assert!(result["height"].is_number());
     assert!(result["hash"].is_string());
     node.stop();
 }
