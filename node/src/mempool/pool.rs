@@ -460,6 +460,194 @@ impl Mempool {
         count
     }
 
+    /// Get the set of in-mempool ancestors for a transaction.
+    pub fn get_ancestors(&self, txid: &Txid) -> Option<HashSet<Txid>> {
+        let inner = self.inner.read().unwrap();
+        let entry = inner.entries.get(txid)?;
+        let mut ancestors = HashSet::new();
+        let mut queue: Vec<Txid> = Vec::new();
+
+        // Find direct parents
+        for input in &entry.tx.input {
+            let parent = input.previous_output.txid;
+            if inner.entries.contains_key(&parent) && ancestors.insert(parent) {
+                queue.push(parent);
+            }
+        }
+
+        // Walk transitively
+        while let Some(anc_txid) = queue.pop() {
+            if let Some(anc) = inner.entries.get(&anc_txid) {
+                for input in &anc.tx.input {
+                    let grandparent = input.previous_output.txid;
+                    if inner.entries.contains_key(&grandparent) && ancestors.insert(grandparent) {
+                        queue.push(grandparent);
+                    }
+                }
+            }
+        }
+
+        Some(ancestors)
+    }
+
+    /// Get the set of in-mempool descendants for a transaction.
+    pub fn get_descendants(&self, txid: &Txid) -> Option<HashSet<Txid>> {
+        let inner = self.inner.read().unwrap();
+        if !inner.entries.contains_key(txid) {
+            return None;
+        }
+
+        let mut descendants = HashSet::new();
+        let mut queue = vec![*txid];
+
+        while let Some(current) = queue.pop() {
+            if let Some(current_entry) = inner.entries.get(&current) {
+                let current_txid = current_entry.tx.compute_txid();
+                // Find children: entries whose inputs reference outputs of current
+                for (child_txid, child_entry) in &inner.entries {
+                    if *child_txid != *txid
+                        && !descendants.contains(child_txid)
+                        && child_entry
+                            .tx
+                            .input
+                            .iter()
+                            .any(|i| i.previous_output.txid == current_txid)
+                    {
+                        descendants.insert(*child_txid);
+                        queue.push(*child_txid);
+                    }
+                }
+            }
+        }
+
+        Some(descendants)
+    }
+
+    /// Get verbose entry data for a single mempool transaction (for RPC).
+    pub fn get_entry_verbose(&self, txid: &Txid) -> Option<serde_json::Value> {
+        let inner = self.inner.read().unwrap();
+        let entry = inner.entries.get(txid)?;
+        let vsize = entry.weight / 4;
+        let ancestors = {
+            drop(inner);
+            self.get_ancestors(txid).unwrap_or_default()
+        };
+        let inner = self.inner.read().unwrap();
+        let entry = inner.entries.get(txid)?;
+
+        let ancestor_count = ancestors.len();
+        let ancestor_size: usize = ancestors
+            .iter()
+            .filter_map(|a| inner.entries.get(a))
+            .map(|e| e.weight / 4)
+            .sum::<usize>()
+            + vsize;
+        let ancestor_fees: u64 = ancestors
+            .iter()
+            .filter_map(|a| inner.entries.get(a))
+            .map(|e| e.fee)
+            .sum::<u64>()
+            + entry.fee;
+
+        let bip125_replaceable = entry
+            .tx
+            .input
+            .iter()
+            .any(|i| i.sequence.0 < 0xffff_fffe);
+
+        Some(serde_json::json!({
+            "fees": {
+                "base": entry.fee as f64 / 100_000_000.0,
+                "modified": entry.fee as f64 / 100_000_000.0,
+                "ancestor": ancestor_fees as f64 / 100_000_000.0,
+                "descendant": entry.fee as f64 / 100_000_000.0,
+            },
+            "vsize": vsize,
+            "weight": entry.weight,
+            "fee": entry.fee as f64 / 100_000_000.0,
+            "time": entry.time,
+            "height": 0, // would need chain height at time of entry
+            "descendantcount": 1,
+            "descendantsize": vsize,
+            "descendantfees": entry.fee,
+            "ancestorcount": ancestor_count + 1,
+            "ancestorsize": ancestor_size,
+            "ancestorfees": ancestor_fees,
+            "depends": ancestors.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+            "spentby": [],
+            "bip125-replaceable": bip125_replaceable,
+            "unbroadcast": false,
+        }))
+    }
+
+    /// Dry-run transaction validation without inserting into the mempool.
+    /// Returns (txid, vsize, fee) on success.
+    pub fn test_accept(
+        &self,
+        tx: &Transaction,
+        chain_state: &ChainState,
+        script_verifier: &dyn ScriptVerifier,
+    ) -> Result<(Txid, usize, u64), MempoolError> {
+        let txid = tx.compute_txid();
+
+        crate::validation::tx::check_transaction(tx)
+            .map_err(|e| MempoolError::Validation(e.to_string()))?;
+
+        if tx.is_coinbase() {
+            return Err(MempoolError::Validation("coinbase not accepted".to_string()));
+        }
+
+        let weight = tx.weight().to_wu() as usize;
+        if weight > MAX_STANDARD_TX_WEIGHT {
+            return Err(MempoolError::Validation("tx-size".to_string()));
+        }
+
+        let inner = self.inner.read().unwrap();
+        if inner.entries.contains_key(&txid) {
+            return Err(MempoolError::AlreadyExists);
+        }
+        drop(inner);
+
+        // Look up inputs
+        let mut sum_inputs: u64 = 0;
+        let mut prev_outputs: Vec<TxOut> = Vec::new();
+
+        for input in &tx.input {
+            if let Some(coin) = chain_state.get_coin(&input.previous_output) {
+                sum_inputs += coin.amount;
+                prev_outputs.push(TxOut {
+                    value: bitcoin::Amount::from_sat(coin.amount),
+                    script_pubkey: coin.script_pubkey.clone(),
+                });
+            } else {
+                // Check mempool parents
+                let inner = self.inner.read().unwrap();
+                if let Some(parent) = inner.entries.get(&input.previous_output.txid) {
+                    if let Some(output) = parent.tx.output.get(input.previous_output.vout as usize) {
+                        sum_inputs += output.value.to_sat();
+                        prev_outputs.push(output.clone());
+                        continue;
+                    }
+                }
+                return Err(MempoolError::MissingInputs);
+            }
+        }
+
+        let sum_outputs: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
+        if sum_inputs < sum_outputs {
+            return Err(MempoolError::BadAmounts);
+        }
+        let fee = sum_inputs - sum_outputs;
+
+        // Script verification
+        script_verifier
+            .verify_transaction(tx, &prev_outputs)
+            .map_err(|e| MempoolError::Script(e.to_string()))?;
+
+        let vsize = weight / 4;
+        Ok((txid, vsize, fee))
+    }
+
     /// Get mempool statistics.
     pub fn info(&self) -> MempoolInfo {
         let inner = self.inner.read().unwrap();
