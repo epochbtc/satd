@@ -129,6 +129,7 @@ async fn main() {
     let peer_manager = node::net::manager::PeerManager::new(
         chain_state.clone(),
         mempool.clone(),
+        fee_estimator.clone(),
         config.network,
         shutdown_rx.clone(),
     );
