@@ -59,6 +59,7 @@ pub struct MempoolInfo {
     pub bytes: usize,
     pub max_size: usize,
     pub min_fee_rate: u64,
+    pub full_rbf: bool,
 }
 
 struct MempoolInner {
@@ -67,24 +68,68 @@ struct MempoolInner {
     total_bytes: usize,
 }
 
+/// Configurable mempool policy. All fields map to Bitcoin Core-compatible
+/// config flags, with the same defaults (or more permissive where noted).
+#[derive(Debug, Clone)]
+pub struct MempoolConfig {
+    pub max_size_bytes: usize,
+    pub min_fee_rate: u64,
+    pub full_rbf: bool,
+    pub dust_relay_fee: u64,
+    pub data_carrier: bool,
+    pub data_carrier_size: usize,
+    pub max_ancestor_count: usize,
+    pub max_descendant_count: usize,
+    pub expiry_secs: u64,
+    pub permit_bare_multisig: bool,
+}
+
+impl Default for MempoolConfig {
+    fn default() -> Self {
+        Self {
+            max_size_bytes: policy::DEFAULT_MAX_MEMPOOL_SIZE,
+            min_fee_rate: policy::DEFAULT_MIN_RELAY_FEE_RATE,
+            full_rbf: true,
+            dust_relay_fee: policy::DUST_RELAY_FEE_RATE,
+            data_carrier: true,
+            data_carrier_size: policy::MAX_OP_RETURN_SIZE,
+            max_ancestor_count: policy::MAX_ANCESTOR_COUNT,
+            max_descendant_count: policy::MAX_DESCENDANT_COUNT,
+            expiry_secs: policy::MEMPOOL_EXPIRY_SECS,
+            permit_bare_multisig: true,
+        }
+    }
+}
+
 /// In-memory transaction pool.
 pub struct Mempool {
     inner: RwLock<MempoolInner>,
-    max_size_bytes: usize,
-    min_fee_rate: u64,
+    config: MempoolConfig,
 }
 
 impl Mempool {
     pub fn new(max_size_bytes: usize, min_fee_rate: u64) -> Self {
+        Self::with_config(MempoolConfig {
+            max_size_bytes,
+            min_fee_rate,
+            ..Default::default()
+        })
+    }
+
+    pub fn with_config(config: MempoolConfig) -> Self {
         Self {
             inner: RwLock::new(MempoolInner {
                 entries: HashMap::new(),
                 spends: HashMap::new(),
                 total_bytes: 0,
             }),
-            max_size_bytes,
-            min_fee_rate,
+            config,
         }
+    }
+
+    /// Get the mempool configuration.
+    pub fn policy(&self) -> &MempoolConfig {
+        &self.config
     }
 
     /// Accept a transaction into the mempool after full validation.
@@ -112,27 +157,39 @@ impl Mempool {
             return Err(MempoolError::Validation("tx-size".to_string()));
         }
 
-        // Policy: dust output check
-        for output in &tx.output {
-            if output.script_pubkey.is_op_return() {
-                continue;
-            }
-            let threshold = policy::dust_threshold(&output.script_pubkey);
-            if output.value.to_sat() < threshold {
-                return Err(MempoolError::Dust);
+        // Policy: dust output check (configurable via -dustrelayfee, 0 = disable)
+        if self.config.dust_relay_fee > 0 {
+            for output in &tx.output {
+                if output.script_pubkey.is_op_return() {
+                    continue;
+                }
+                let threshold =
+                    policy::dust_threshold_with_rate(&output.script_pubkey, self.config.dust_relay_fee);
+                if output.value.to_sat() < threshold {
+                    return Err(MempoolError::Dust);
+                }
             }
         }
 
-        // Policy: OP_RETURN limits — at most one, max size
-        let mut op_return_count = 0;
-        for output in &tx.output {
-            if output.script_pubkey.is_op_return() {
-                op_return_count += 1;
-                if op_return_count > 1 {
+        // Policy: OP_RETURN limits (configurable via -datacarrier and -datacarriersize)
+        if !self.config.data_carrier {
+            // Reject all OP_RETURN outputs
+            for output in &tx.output {
+                if output.script_pubkey.is_op_return() {
                     return Err(MempoolError::NonStandardOpReturn);
                 }
-                if output.script_pubkey.len() > policy::MAX_OP_RETURN_SIZE {
-                    return Err(MempoolError::NonStandardOpReturn);
+            }
+        } else {
+            let mut op_return_count = 0;
+            for output in &tx.output {
+                if output.script_pubkey.is_op_return() {
+                    op_return_count += 1;
+                    if op_return_count > 1 {
+                        return Err(MempoolError::NonStandardOpReturn);
+                    }
+                    if output.script_pubkey.len() > self.config.data_carrier_size {
+                        return Err(MempoolError::NonStandardOpReturn);
+                    }
                 }
             }
         }
@@ -205,7 +262,7 @@ impl Mempool {
                         }
                     }
                 }
-                if ancestors.len() > policy::MAX_ANCESTOR_COUNT {
+                if ancestors.len() > self.config.max_ancestor_count {
                     return Err(MempoolError::TooLongMempoolChain);
                 }
             }
@@ -217,15 +274,17 @@ impl Mempool {
             let mut conflict_fee_total: u64 = 0;
             for conflict_txid in &conflicts {
                 if let Some(conflict_entry) = inner.entries.get(conflict_txid) {
-                    // Opt-in RBF: conflicted tx must signal replaceability
-                    // (any input with sequence < 0xfffffffe)
-                    let signals_rbf = conflict_entry
-                        .tx
-                        .input
-                        .iter()
-                        .any(|i| i.sequence.0 < 0xffff_fffe);
-                    if !signals_rbf {
-                        return Err(MempoolError::ConflictingSpend);
+                    // RBF: in opt-in mode, conflicted tx must signal replaceability
+                    // (any input with sequence < 0xfffffffe). Full RBF skips this check.
+                    if !self.config.full_rbf {
+                        let signals_rbf = conflict_entry
+                            .tx
+                            .input
+                            .iter()
+                            .any(|i| i.sequence.0 < 0xffff_fffe);
+                        if !signals_rbf {
+                            return Err(MempoolError::ConflictingSpend);
+                        }
                     }
                     conflict_fee_total += conflict_entry.fee;
                 }
@@ -263,12 +322,12 @@ impl Mempool {
         } else {
             0
         };
-        if fee_rate < self.min_fee_rate {
-            return Err(MempoolError::InsufficientFee(fee_rate, self.min_fee_rate));
+        if fee_rate < self.config.min_fee_rate {
+            return Err(MempoolError::InsufficientFee(fee_rate, self.config.min_fee_rate));
         }
 
         // Check mempool size
-        if inner.total_bytes + tx_size > self.max_size_bytes {
+        if inner.total_bytes + tx_size > self.config.max_size_bytes {
             return Err(MempoolError::MempoolFull);
         }
 
@@ -379,7 +438,7 @@ impl Mempool {
         let expired: Vec<Txid> = inner
             .entries
             .iter()
-            .filter(|(_, entry)| now.saturating_sub(entry.time) > policy::MEMPOOL_EXPIRY_SECS)
+            .filter(|(_, entry)| now.saturating_sub(entry.time) > self.config.expiry_secs)
             .map(|(txid, _)| *txid)
             .collect();
 
@@ -407,8 +466,9 @@ impl Mempool {
         MempoolInfo {
             size: inner.entries.len(),
             bytes: inner.total_bytes,
-            max_size: self.max_size_bytes,
-            min_fee_rate: self.min_fee_rate,
+            max_size: self.config.max_size_bytes,
+            min_fee_rate: self.config.min_fee_rate,
+            full_rbf: self.config.full_rbf,
         }
     }
 }

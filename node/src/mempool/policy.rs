@@ -38,7 +38,14 @@ pub const INCREMENTAL_RELAY_FEE: u64 = 1_000;
 /// - P2WSH:  43 + 68 = 111 bytes → 330 sats
 /// - P2TR:   43 + 58 = 101 bytes → 330 sats
 /// - Unknown witness: 43 + 68 = 111 bytes → 330 sats
+///
+/// Compute the dust threshold using the default dust relay fee rate.
 pub fn dust_threshold(script_pubkey: &bitcoin::ScriptBuf) -> u64 {
+    dust_threshold_with_rate(script_pubkey, DUST_RELAY_FEE_RATE)
+}
+
+/// Compute the dust threshold for a given output script and fee rate.
+pub fn dust_threshold_with_rate(script_pubkey: &bitcoin::ScriptBuf, fee_rate: u64) -> u64 {
     // Size of the serialized output itself
     let output_size: u64 = 8 + 1 + script_pubkey.len() as u64; // value + varint + script
 
@@ -60,9 +67,9 @@ pub fn dust_threshold(script_pubkey: &bitcoin::ScriptBuf) -> u64 {
         return 0; // OP_RETURN is never dust
     }
 
-    // Total cost at dust relay fee rate
+    // Total cost at the given fee rate
     let total_size = output_size + spend_size;
     // fee = size * rate / 1000 (rate is sat/kvB, 1 vB = 4 WU for legacy, 1 WU for witness)
     // Simplified: use vbytes for consistency with Bitcoin Core
-    total_size * DUST_RELAY_FEE_RATE / 1000
+    total_size * fee_rate / 1000
 }

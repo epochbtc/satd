@@ -3,8 +3,7 @@ mod config;
 use config::Config;
 use node::chain::state::ChainState;
 use node::mempool::fee::FeeEstimator;
-use node::mempool::policy::{DEFAULT_MAX_MEMPOOL_SIZE, DEFAULT_MIN_RELAY_FEE_RATE};
-use node::mempool::pool::Mempool;
+use node::mempool::pool::{Mempool, MempoolConfig};
 use node::rpc::auth::RpcAuth;
 use node::storage::db::RocksDbStore;
 use node::storage::flatfile::FlatFileManager;
@@ -115,11 +114,19 @@ async fn main() {
         "Chain state initialized"
     );
 
-    // Initialize mempool and fee estimator
-    let mempool = Arc::new(Mempool::new(
-        DEFAULT_MAX_MEMPOOL_SIZE,
-        DEFAULT_MIN_RELAY_FEE_RATE,
-    ));
+    // Initialize mempool with policy from config
+    let mempool = Arc::new(Mempool::with_config(MempoolConfig {
+        max_size_bytes: config.maxmempool * 1_000_000,
+        min_fee_rate: config.minrelaytxfee,
+        full_rbf: config.mempoolfullrbf,
+        dust_relay_fee: config.dustrelayfee,
+        data_carrier: config.datacarrier,
+        data_carrier_size: config.datacarriersize,
+        max_ancestor_count: config.limitancestorcount,
+        max_descendant_count: config.limitdescendantcount,
+        expiry_secs: config.mempoolexpiry * 3600,
+        permit_bare_multisig: config.permitbaremultisig,
+    }));
     let fee_estimator = Arc::new(FeeEstimator::new());
 
     // Shutdown channel
