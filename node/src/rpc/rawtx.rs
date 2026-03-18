@@ -1,3 +1,5 @@
+use bitcoin::transaction::Version;
+use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
 use crate::chain::state::ChainState;
 use crate::mempool::pool::Mempool;
 use serde_json::{json, Value};
@@ -220,6 +222,163 @@ fn decode_transaction_verbose(
     }
 
     result
+}
+
+/// `createrawtransaction` — build an unsigned raw transaction from inputs and outputs.
+pub fn create_raw_transaction(
+    inputs: &[Value],
+    outputs: &Value,
+    locktime: Option<u32>,
+) -> Result<Value, (i32, String)> {
+    let mut tx_inputs = Vec::new();
+    for input in inputs {
+        let txid: bitcoin::Txid = input["txid"]
+            .as_str()
+            .ok_or((-8, "Missing txid".to_string()))?
+            .parse()
+            .map_err(|_| (-8, "Invalid txid".to_string()))?;
+        let vout = input["vout"]
+            .as_u64()
+            .ok_or((-8, "Missing vout".to_string()))? as u32;
+        let sequence = input["sequence"]
+            .as_u64()
+            .unwrap_or(0xffff_fffd) as u32; // default: RBF-signaling
+
+        tx_inputs.push(TxIn {
+            previous_output: OutPoint { txid, vout },
+            script_sig: bitcoin::ScriptBuf::new(),
+            sequence: Sequence(sequence),
+            witness: Witness::new(),
+        });
+    }
+
+    let mut tx_outputs = Vec::new();
+    if let Some(obj) = outputs.as_object() {
+        for (addr_or_key, val) in obj {
+            if addr_or_key == "data" {
+                // OP_RETURN output
+                let hex_data = val.as_str().ok_or((-8, "data must be hex string".to_string()))?;
+                let data = hex::decode(hex_data).map_err(|_| (-8, "Invalid hex data".to_string()))?;
+                let push_data = bitcoin::script::PushBytesBuf::try_from(data)
+                    .map_err(|_| (-8, "OP_RETURN data too large".to_string()))?;
+                let script = bitcoin::script::Builder::new()
+                    .push_opcode(bitcoin::opcodes::all::OP_RETURN)
+                    .push_slice(&push_data)
+                    .into_script();
+                tx_outputs.push(TxOut {
+                    value: Amount::ZERO,
+                    script_pubkey: script,
+                });
+            } else {
+                let amount_btc = val
+                    .as_f64()
+                    .ok_or((-8, "Invalid amount".to_string()))?;
+                let amount_sat = (amount_btc * 100_000_000.0) as u64;
+                let address: bitcoin::Address<bitcoin::address::NetworkUnchecked> = addr_or_key
+                    .parse()
+                    .map_err(|_| (-8, format!("Invalid address: {}", addr_or_key)))?;
+                tx_outputs.push(TxOut {
+                    value: Amount::from_sat(amount_sat),
+                    script_pubkey: address.assume_checked().script_pubkey(),
+                });
+            }
+        }
+    } else if let Some(arr) = outputs.as_array() {
+        // Bitcoin Core also accepts array of {addr: amount} objects
+        for obj in arr {
+            if let Some(map) = obj.as_object() {
+                for (addr_or_key, val) in map {
+                    if addr_or_key == "data" {
+                        let hex_data = val.as_str().ok_or((-8, "data must be hex".to_string()))?;
+                        let data = hex::decode(hex_data).map_err(|_| (-8, "Invalid hex".to_string()))?;
+                        let push_data = bitcoin::script::PushBytesBuf::try_from(data)
+                            .map_err(|_| (-8, "OP_RETURN data too large".to_string()))?;
+                        let script = bitcoin::script::Builder::new()
+                            .push_opcode(bitcoin::opcodes::all::OP_RETURN)
+                            .push_slice(&push_data)
+                            .into_script();
+                        tx_outputs.push(TxOut {
+                            value: Amount::ZERO,
+                            script_pubkey: script,
+                        });
+                    } else {
+                        let amount_btc = val.as_f64().ok_or((-8, "Invalid amount".to_string()))?;
+                        let amount_sat = (amount_btc * 100_000_000.0) as u64;
+                        let address: bitcoin::Address<bitcoin::address::NetworkUnchecked> = addr_or_key
+                            .parse()
+                            .map_err(|_| (-8, format!("Invalid address: {}", addr_or_key)))?;
+                        tx_outputs.push(TxOut {
+                            value: Amount::from_sat(amount_sat),
+                            script_pubkey: address.assume_checked().script_pubkey(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    let lt = locktime
+        .map(bitcoin::blockdata::locktime::absolute::LockTime::from_consensus)
+        .unwrap_or(bitcoin::blockdata::locktime::absolute::LockTime::ZERO);
+
+    let tx = Transaction {
+        version: Version(2),
+        lock_time: lt,
+        input: tx_inputs,
+        output: tx_outputs,
+    };
+
+    let raw = bitcoin::consensus::serialize(&tx);
+    Ok(Value::String(hex::encode(raw)))
+}
+
+/// `combinerawtransaction` — merge multiple partially-signed raw transactions.
+pub fn combine_raw_transaction(hex_txs: &[String]) -> Result<Value, (i32, String)> {
+    if hex_txs.is_empty() {
+        return Err((-8, "Missing transactions".to_string()));
+    }
+
+    // Deserialize the first tx as the base
+    let first_bytes = hex::decode(&hex_txs[0]).map_err(|_| (-22, "TX decode failed".to_string()))?;
+    let mut combined: Transaction = bitcoin::consensus::deserialize(&first_bytes)
+        .map_err(|_| (-22, "TX decode failed".to_string()))?;
+
+    // Merge scriptSig and witness from subsequent txs
+    for hex_tx in &hex_txs[1..] {
+        let tx_bytes = hex::decode(hex_tx).map_err(|_| (-22, "TX decode failed".to_string()))?;
+        let tx: Transaction = bitcoin::consensus::deserialize(&tx_bytes)
+            .map_err(|_| (-22, "TX decode failed".to_string()))?;
+
+        if tx.input.len() != combined.input.len() {
+            return Err((-22, "Transaction input count mismatch".to_string()));
+        }
+
+        for (i, input) in tx.input.iter().enumerate() {
+            if combined.input[i].script_sig.is_empty() && !input.script_sig.is_empty() {
+                combined.input[i].script_sig = input.script_sig.clone();
+            }
+            if combined.input[i].witness.is_empty() && !input.witness.is_empty() {
+                combined.input[i].witness = input.witness.clone();
+            }
+        }
+    }
+
+    let raw = bitcoin::consensus::serialize(&combined);
+    Ok(Value::String(hex::encode(raw)))
+}
+
+/// `decodescript` — decode a hex-encoded script.
+pub fn decode_script(hex_script: &str) -> Result<Value, (i32, String)> {
+    let script_bytes = hex::decode(hex_script).map_err(|_| (-22, "Script decode failed".to_string()))?;
+    let script = bitcoin::ScriptBuf::from_bytes(script_bytes);
+
+    let script_type = script_type(&script);
+
+    Ok(json!({
+        "asm": format!("{}", script),
+        "type": script_type,
+        "p2sh": "", // would need hash computation
+    }))
 }
 
 /// Classify a script's type.

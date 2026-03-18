@@ -3,7 +3,7 @@ use crate::mempool::fee::FeeEstimator;
 use crate::mempool::pool::Mempool;
 use crate::net::manager::PeerManager;
 use crate::rpc::auth::{AuthLayer, RpcAuth};
-use crate::rpc::{blockchain, mining, network, rawtx};
+use crate::rpc::{blockchain, mining, network, psbt, rawtx};
 use jsonrpsee::server::{RpcModule, ServerBuilder, ServerHandle};
 use jsonrpsee::types::ErrorObjectOwned;
 use std::net::SocketAddr;
@@ -276,6 +276,35 @@ pub async fn start(
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
+    module.register_method("createrawtransaction", |params, _ctx, _extensions| {
+        let mut seq = params.sequence();
+        let inputs: Vec<serde_json::Value> = seq.next().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        let outputs: serde_json::Value = seq.next().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        let locktime: Option<u32> = seq.optional_next().unwrap_or(None);
+        rawtx::create_raw_transaction(&inputs, &outputs, locktime)
+            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
+    })?;
+
+    module.register_method("combinerawtransaction", |params, _ctx, _extensions| {
+        let hex_txs: Vec<String> = params.one().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        rawtx::combine_raw_transaction(&hex_txs)
+            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
+    })?;
+
+    module.register_method("decodescript", |params, _ctx, _extensions| {
+        let hex_script: String = params.one().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        rawtx::decode_script(&hex_script)
+            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
+    })?;
+
     module.register_method("testmempoolaccept", |params, ctx, _extensions| {
         let mut seq = params.sequence();
         let rawtxs: Vec<String> = seq.next().map_err(|e| {
@@ -311,6 +340,80 @@ pub async fn start(
             }
         }
         Ok::<_, ErrorObjectOwned>(serde_json::json!(results))
+    })?;
+
+    // --- PSBT RPCs ---
+
+    module.register_method("createpsbt", |params, _ctx, _extensions| {
+        let mut seq = params.sequence();
+        let inputs: Vec<serde_json::Value> = seq.next().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        let outputs: serde_json::Value = seq.next().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        let locktime: Option<u32> = seq.optional_next().unwrap_or(None);
+        psbt::create_psbt(&inputs, &outputs, locktime)
+            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
+    })?;
+
+    module.register_method("decodepsbt", |params, _ctx, _extensions| {
+        let psbt_b64: String = params.one().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        psbt::decode_psbt(&psbt_b64)
+            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
+    })?;
+
+    module.register_method("analyzepsbt", |params, _ctx, _extensions| {
+        let psbt_b64: String = params.one().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        psbt::analyze_psbt(&psbt_b64)
+            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
+    })?;
+
+    module.register_method("combinepsbt", |params, _ctx, _extensions| {
+        let psbt_b64s: Vec<String> = params.one().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        psbt::combine_psbt(&psbt_b64s)
+            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
+    })?;
+
+    module.register_method("finalizepsbt", |params, ctx, _extensions| {
+        let mut seq = params.sequence();
+        let psbt_b64: String = seq.next().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        let extract: bool = seq.optional_next().unwrap_or(Some(true)).unwrap_or(true);
+        let _ = &ctx; // suppress unused
+        psbt::finalize_psbt(&psbt_b64, extract)
+            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
+    })?;
+
+    module.register_method("converttopsbt", |params, _ctx, _extensions| {
+        let hex_tx: String = params.one().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        psbt::convert_to_psbt(&hex_tx)
+            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
+    })?;
+
+    module.register_method("joinpsbts", |params, _ctx, _extensions| {
+        let psbt_b64s: Vec<String> = params.one().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        psbt::join_psbts(&psbt_b64s)
+            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
+    })?;
+
+    module.register_method("utxoupdatepsbt", |params, ctx, _extensions| {
+        let psbt_b64: String = params.one().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        psbt::utxo_update_psbt(&ctx.chain_state, &psbt_b64)
+            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
     // --- UTXO / Chain RPCs ---
