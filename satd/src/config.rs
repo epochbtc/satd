@@ -16,6 +16,17 @@ pub struct Config {
     pub port: u16,
     pub connect: Vec<String>,
     pub assumevalid: Option<String>,
+    // Mempool policy
+    pub mempoolfullrbf: bool,
+    pub maxmempool: usize,
+    pub minrelaytxfee: u64,
+    pub dustrelayfee: u64,
+    pub datacarriersize: usize,
+    pub datacarrier: bool,
+    pub limitancestorcount: usize,
+    pub limitdescendantcount: usize,
+    pub mempoolexpiry: u64,
+    pub permitbaremultisig: bool,
 }
 
 impl Config {
@@ -117,6 +128,57 @@ impl Config {
 
         let assumevalid = cli.assumevalid.or_else(|| file_get("assumevalid"));
 
+        // Mempool policy: CLI > config file > defaults
+        let mempoolfullrbf = cli
+            .mempoolfullrbf
+            .or_else(|| file_get("mempoolfullrbf").and_then(|v| parse_bool(&v)))
+            .unwrap_or(true); // full RBF on by default (matches Bitcoin Core v28+)
+
+        let maxmempool = cli
+            .maxmempool
+            .or_else(|| file_get("maxmempool").and_then(|v| v.parse().ok()))
+            .unwrap_or(300); // MB
+
+        let minrelaytxfee = cli
+            .minrelaytxfee
+            .or_else(|| file_get("minrelaytxfee").and_then(|v| v.parse().ok()))
+            .unwrap_or(1_000); // sat/kvB
+
+        let dustrelayfee = cli
+            .dustrelayfee
+            .or_else(|| file_get("dustrelayfee").and_then(|v| v.parse().ok()))
+            .unwrap_or(3_000); // sat/kvB
+
+        let datacarriersize = cli
+            .datacarriersize
+            .or_else(|| file_get("datacarriersize").and_then(|v| v.parse().ok()))
+            .unwrap_or(83);
+
+        let datacarrier = cli
+            .datacarrier
+            .or_else(|| file_get("datacarrier").and_then(|v| parse_bool(&v)))
+            .unwrap_or(true);
+
+        let limitancestorcount = cli
+            .limitancestorcount
+            .or_else(|| file_get("limitancestorcount").and_then(|v| v.parse().ok()))
+            .unwrap_or(25);
+
+        let limitdescendantcount = cli
+            .limitdescendantcount
+            .or_else(|| file_get("limitdescendantcount").and_then(|v| v.parse().ok()))
+            .unwrap_or(25);
+
+        let mempoolexpiry = cli
+            .mempoolexpiry
+            .or_else(|| file_get("mempoolexpiry").and_then(|v| v.parse().ok()))
+            .unwrap_or(336); // hours
+
+        let permitbaremultisig = cli
+            .permitbaremultisig
+            .or_else(|| file_get("permitbaremultisig").and_then(|v| parse_bool(&v)))
+            .unwrap_or(true);
+
         // Validate auth consistency
         if rpcuser.is_some() != rpcpassword.is_some() {
             return Err(
@@ -135,6 +197,16 @@ impl Config {
             port,
             connect,
             assumevalid,
+            mempoolfullrbf,
+            maxmempool,
+            minrelaytxfee,
+            dustrelayfee,
+            datacarriersize,
+            datacarrier,
+            limitancestorcount,
+            limitdescendantcount,
+            mempoolexpiry,
+            permitbaremultisig,
         })
     }
 
@@ -189,6 +261,37 @@ pub struct CliArgs {
 
     #[arg(long, value_name = "HASH", help = "Assume blocks up to this hash are valid (skip script verification)")]
     pub assumevalid: Option<String>,
+
+    // Mempool policy flags (Bitcoin Core compatible + extensions)
+    #[arg(long, value_name = "BOOL", help = "Enable full replace-by-fee (default: true)")]
+    pub mempoolfullrbf: Option<bool>,
+
+    #[arg(long, value_name = "MB", help = "Maximum mempool size in MB (default: 300)")]
+    pub maxmempool: Option<usize>,
+
+    #[arg(long, value_name = "RATE", help = "Minimum relay fee rate in sat/kvB (default: 1000)")]
+    pub minrelaytxfee: Option<u64>,
+
+    #[arg(long, value_name = "RATE", help = "Dust relay fee rate in sat/kvB (default: 3000)")]
+    pub dustrelayfee: Option<u64>,
+
+    #[arg(long, value_name = "BYTES", help = "Maximum OP_RETURN size in bytes (default: 83, 0 = reject all)")]
+    pub datacarriersize: Option<usize>,
+
+    #[arg(long, value_name = "BOOL", help = "Accept OP_RETURN outputs (default: true)")]
+    pub datacarrier: Option<bool>,
+
+    #[arg(long, value_name = "N", help = "Maximum unconfirmed ancestor count (default: 25)")]
+    pub limitancestorcount: Option<usize>,
+
+    #[arg(long, value_name = "N", help = "Maximum unconfirmed descendant count (default: 25)")]
+    pub limitdescendantcount: Option<usize>,
+
+    #[arg(long, value_name = "HOURS", help = "Mempool expiry in hours (default: 336)")]
+    pub mempoolexpiry: Option<u64>,
+
+    #[arg(long, value_name = "BOOL", help = "Allow bare multisig outputs (default: true)")]
+    pub permitbaremultisig: Option<bool>,
 }
 
 /// Convert Bitcoin Core-style single-dash long flags to clap-compatible double-dash.
@@ -208,6 +311,16 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "port",
         "connect",
         "assumevalid",
+        "mempoolfullrbf",
+        "maxmempool",
+        "minrelaytxfee",
+        "dustrelayfee",
+        "datacarriersize",
+        "datacarrier",
+        "limitancestorcount",
+        "limitdescendantcount",
+        "mempoolexpiry",
+        "permitbaremultisig",
     ];
 
     args.into_iter()
@@ -393,11 +506,22 @@ rpcport=8332
             port: None,
             connect: vec![],
             assumevalid: None,
+            mempoolfullrbf: None,
+            maxmempool: None,
+            minrelaytxfee: None,
+            dustrelayfee: None,
+            datacarriersize: None,
+            datacarrier: None,
+            limitancestorcount: None,
+            limitdescendantcount: None,
+            mempoolexpiry: None,
+            permitbaremultisig: None,
         };
         let config = Config::from_cli(cli).unwrap();
         assert_eq!(config.network, Network::Regtest);
         assert_eq!(config.rpcport, 18443);
         assert_eq!(config.network_datadir(), PathBuf::from("/tmp/satd-test/regtest"));
+        assert!(config.mempoolfullrbf); // full RBF on by default
     }
 
     #[test]
@@ -415,6 +539,16 @@ rpcport=8332
             port: None,
             connect: vec![],
             assumevalid: None,
+            mempoolfullrbf: None,
+            maxmempool: None,
+            minrelaytxfee: None,
+            dustrelayfee: None,
+            datacarriersize: None,
+            datacarrier: None,
+            limitancestorcount: None,
+            limitdescendantcount: None,
+            mempoolexpiry: None,
+            permitbaremultisig: None,
         };
         assert!(Config::from_cli(cli).is_err());
     }

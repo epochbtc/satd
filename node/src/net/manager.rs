@@ -12,6 +12,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
 use crate::chain::state::ChainState;
+use crate::mempool::fee::FeeEstimator;
 use crate::mempool::pool::Mempool;
 use crate::net::compact;
 use crate::net::connection::{Connection, ConnectionWriter};
@@ -100,6 +101,9 @@ pub struct PeerManager {
     reconnect_backoff: RwLock<HashMap<SocketAddr, ReconnectState>>,
     /// Banned addresses with ban expiry time.
     banned_addrs: RwLock<HashMap<SocketAddr, Instant>>,
+    /// Fee estimator fed from confirmed blocks (kept alive via Arc, used in block_processor).
+    #[allow(dead_code)]
+    fee_estimator: Arc<FeeEstimator>,
     /// Shutdown signal.
     shutdown: tokio::sync::watch::Receiver<bool>,
 }
@@ -108,6 +112,7 @@ impl PeerManager {
     pub fn new(
         chain_state: Arc<ChainState>,
         mempool: Arc<Mempool>,
+        fee_estimator: Arc<FeeEstimator>,
         network: Network,
         shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Arc<Self> {
@@ -127,6 +132,7 @@ impl PeerManager {
             connect_addrs: RwLock::new(Vec::new()),
             block_tx,
             pending_compact: RwLock::new(HashMap::new()),
+            fee_estimator: fee_estimator.clone(),
             reconnect_backoff: RwLock::new(HashMap::new()),
             banned_addrs: RwLock::new(HashMap::new()),
             shutdown,
@@ -135,8 +141,9 @@ impl PeerManager {
         // Spawn block processing thread
         let cs = chain_state;
         let mp = mempool;
+        let fe = fee_estimator;
         std::thread::spawn(move || {
-            Self::block_processor(block_rx, cs, mp);
+            Self::block_processor(block_rx, cs, mp, fe);
         });
 
         mgr
@@ -368,6 +375,12 @@ impl PeerManager {
             }
 
             ticks += 1;
+
+            // Every 60 ticks (30 seconds), expire old mempool transactions
+            if ticks.is_multiple_of(60) {
+                self.mempool.remove_expired();
+            }
+
             // Every 20 ticks (10 seconds), check peers
             if ticks.is_multiple_of(20) {
                 // Auto-reconnect if no peers connected
@@ -567,6 +580,7 @@ impl PeerManager {
         mut rx: mpsc::UnboundedReceiver<bitcoin::Block>,
         chain_state: Arc<ChainState>,
         mempool: Arc<Mempool>,
+        fee_estimator: Arc<FeeEstimator>,
     ) {
         let mut block_buffer: HashMap<bitcoin::BlockHash, bitcoin::Block> = HashMap::new();
         let mut last_log_height: u32 = 0;
@@ -575,6 +589,7 @@ impl PeerManager {
             let hash = block.block_hash();
             match chain_state.accept_block(&block) {
                 Ok(_) => {
+                    Self::record_block_fees(&block, &chain_state, &fee_estimator);
                     mempool.remove_for_block(&block);
                     // Drain buffer
                     loop {
@@ -582,7 +597,10 @@ impl PeerManager {
                         match block_buffer.remove(&tip) {
                             Some(b) => {
                                 match chain_state.accept_block(&b) {
-                                    Ok(_) => { mempool.remove_for_block(&b); }
+                                    Ok(_) => {
+                                        Self::record_block_fees(&b, &chain_state, &fee_estimator);
+                                        mempool.remove_for_block(&b);
+                                    }
                                     Err(_) => break,
                                 }
                             }
@@ -606,6 +624,47 @@ impl PeerManager {
                 }
             }
         }
+    }
+
+    /// Extract fee rates from a connected block and feed them to the fee estimator.
+    fn record_block_fees(
+        block: &bitcoin::Block,
+        chain_state: &ChainState,
+        fee_estimator: &FeeEstimator,
+    ) {
+        let mut fee_rates = Vec::new();
+        for tx in &block.txdata {
+            if tx.is_coinbase() {
+                continue;
+            }
+            let weight = tx.weight().to_wu();
+            if weight == 0 {
+                continue;
+            }
+            // Compute fee from inputs - outputs
+            let mut sum_inputs: u64 = 0;
+            let mut inputs_found = true;
+            for input in &tx.input {
+                match chain_state.get_coin(&input.previous_output) {
+                    Some(coin) => sum_inputs += coin.amount,
+                    None => {
+                        // Coin already spent (removed during connect_block) — skip this tx
+                        inputs_found = false;
+                        break;
+                    }
+                }
+            }
+            if !inputs_found {
+                continue;
+            }
+            let sum_outputs: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
+            if sum_inputs >= sum_outputs {
+                let fee = sum_inputs - sum_outputs;
+                let fee_rate = fee * 1000 / weight; // sat/kvB
+                fee_rates.push(fee_rate);
+            }
+        }
+        fee_estimator.record_block(&fee_rates);
     }
 
     fn handle_tx(&self, id: PeerId, tx: bitcoin::Transaction) {

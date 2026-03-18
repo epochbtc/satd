@@ -1,9 +1,9 @@
 use bitcoin::{Block, OutPoint, Transaction, TxOut, Txid};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;
 
 use crate::chain::state::ChainState;
-use crate::mempool::policy::MAX_STANDARD_TX_WEIGHT;
+use crate::mempool::policy::{self, MAX_STANDARD_TX_WEIGHT};
 use crate::validation::script::ScriptVerifier;
 use crate::validation::tx::check_transaction;
 
@@ -32,6 +32,14 @@ pub enum MempoolError {
     PrematureCoinbaseSpend,
     #[error("TX decode failed")]
     DecodeFailed,
+    #[error("dust")]
+    Dust,
+    #[error("scriptpubkey")]
+    NonStandardOpReturn,
+    #[error("insufficient fee for RBF. {0} < {1}")]
+    InsufficientReplacementFee(u64, u64),
+    #[error("too-long-mempool-chain")]
+    TooLongMempoolChain,
 }
 
 /// Metadata for a transaction in the mempool.
@@ -51,6 +59,7 @@ pub struct MempoolInfo {
     pub bytes: usize,
     pub max_size: usize,
     pub min_fee_rate: u64,
+    pub full_rbf: bool,
 }
 
 struct MempoolInner {
@@ -59,24 +68,68 @@ struct MempoolInner {
     total_bytes: usize,
 }
 
+/// Configurable mempool policy. All fields map to Bitcoin Core-compatible
+/// config flags, with the same defaults (or more permissive where noted).
+#[derive(Debug, Clone)]
+pub struct MempoolConfig {
+    pub max_size_bytes: usize,
+    pub min_fee_rate: u64,
+    pub full_rbf: bool,
+    pub dust_relay_fee: u64,
+    pub data_carrier: bool,
+    pub data_carrier_size: usize,
+    pub max_ancestor_count: usize,
+    pub max_descendant_count: usize,
+    pub expiry_secs: u64,
+    pub permit_bare_multisig: bool,
+}
+
+impl Default for MempoolConfig {
+    fn default() -> Self {
+        Self {
+            max_size_bytes: policy::DEFAULT_MAX_MEMPOOL_SIZE,
+            min_fee_rate: policy::DEFAULT_MIN_RELAY_FEE_RATE,
+            full_rbf: true,
+            dust_relay_fee: policy::DUST_RELAY_FEE_RATE,
+            data_carrier: true,
+            data_carrier_size: policy::MAX_OP_RETURN_SIZE,
+            max_ancestor_count: policy::MAX_ANCESTOR_COUNT,
+            max_descendant_count: policy::MAX_DESCENDANT_COUNT,
+            expiry_secs: policy::MEMPOOL_EXPIRY_SECS,
+            permit_bare_multisig: true,
+        }
+    }
+}
+
 /// In-memory transaction pool.
 pub struct Mempool {
     inner: RwLock<MempoolInner>,
-    max_size_bytes: usize,
-    min_fee_rate: u64,
+    config: MempoolConfig,
 }
 
 impl Mempool {
     pub fn new(max_size_bytes: usize, min_fee_rate: u64) -> Self {
+        Self::with_config(MempoolConfig {
+            max_size_bytes,
+            min_fee_rate,
+            ..Default::default()
+        })
+    }
+
+    pub fn with_config(config: MempoolConfig) -> Self {
         Self {
             inner: RwLock::new(MempoolInner {
                 entries: HashMap::new(),
                 spends: HashMap::new(),
                 total_bytes: 0,
             }),
-            max_size_bytes,
-            min_fee_rate,
+            config,
         }
+    }
+
+    /// Get the mempool configuration.
+    pub fn policy(&self) -> &MempoolConfig {
+        &self.config
     }
 
     /// Accept a transaction into the mempool after full validation.
@@ -104,6 +157,43 @@ impl Mempool {
             return Err(MempoolError::Validation("tx-size".to_string()));
         }
 
+        // Policy: dust output check (configurable via -dustrelayfee, 0 = disable)
+        if self.config.dust_relay_fee > 0 {
+            for output in &tx.output {
+                if output.script_pubkey.is_op_return() {
+                    continue;
+                }
+                let threshold =
+                    policy::dust_threshold_with_rate(&output.script_pubkey, self.config.dust_relay_fee);
+                if output.value.to_sat() < threshold {
+                    return Err(MempoolError::Dust);
+                }
+            }
+        }
+
+        // Policy: OP_RETURN limits (configurable via -datacarrier and -datacarriersize)
+        if !self.config.data_carrier {
+            // Reject all OP_RETURN outputs
+            for output in &tx.output {
+                if output.script_pubkey.is_op_return() {
+                    return Err(MempoolError::NonStandardOpReturn);
+                }
+            }
+        } else {
+            let mut op_return_count = 0;
+            for output in &tx.output {
+                if output.script_pubkey.is_op_return() {
+                    op_return_count += 1;
+                    if op_return_count > 1 {
+                        return Err(MempoolError::NonStandardOpReturn);
+                    }
+                    if output.script_pubkey.len() > self.config.data_carrier_size {
+                        return Err(MempoolError::NonStandardOpReturn);
+                    }
+                }
+            }
+        }
+
         let tx_size = bitcoin::consensus::serialize(&tx).len();
 
         // Take write lock for the rest (prevents TOCTOU races)
@@ -114,33 +204,108 @@ impl Mempool {
             return Err(MempoolError::AlreadyExists);
         }
 
-        // Check for conflicting spends
+        // Detect conflicting spends (RBF candidates)
+        let mut conflicts: HashSet<Txid> = HashSet::new();
         for input in &tx.input {
-            if inner.spends.contains_key(&input.previous_output) {
-                return Err(MempoolError::ConflictingSpend);
+            if let Some(conflict_txid) = inner.spends.get(&input.previous_output) {
+                conflicts.insert(*conflict_txid);
             }
         }
 
-        // Look up UTXOs and validate inputs
+        // Look up UTXOs and validate inputs (with CPFP support)
         let tip_height = chain_state.tip_height();
         let mut sum_inputs: u64 = 0;
         let mut prev_outputs: Vec<TxOut> = Vec::new();
+        let mut ancestors: HashSet<Txid> = HashSet::new();
 
         for input in &tx.input {
-            let coin = chain_state
-                .get_coin(&input.previous_output)
-                .ok_or(MempoolError::MissingInputs)?;
-
-            // Check coinbase maturity
-            if coin.coinbase && tip_height - coin.height < COINBASE_MATURITY {
-                return Err(MempoolError::PrematureCoinbaseSpend);
+            // First try chain state (confirmed UTXOs)
+            if let Some(coin) = chain_state.get_coin(&input.previous_output) {
+                // Check coinbase maturity
+                if coin.coinbase && tip_height - coin.height < COINBASE_MATURITY {
+                    return Err(MempoolError::PrematureCoinbaseSpend);
+                }
+                sum_inputs += coin.amount;
+                prev_outputs.push(TxOut {
+                    value: bitcoin::Amount::from_sat(coin.amount),
+                    script_pubkey: coin.script_pubkey.clone(),
+                });
+                continue;
             }
 
-            sum_inputs += coin.amount;
-            prev_outputs.push(TxOut {
-                value: bitcoin::Amount::from_sat(coin.amount),
-                script_pubkey: coin.script_pubkey.clone(),
-            });
+            // CPFP: check if the input references an output from a mempool transaction
+            let parent_txid = input.previous_output.txid;
+            let parent_vout = input.previous_output.vout as usize;
+            if let Some(parent) = inner.entries.get(&parent_txid)
+                && let Some(output) = parent.tx.output.get(parent_vout)
+            {
+                ancestors.insert(parent_txid);
+                sum_inputs += output.value.to_sat();
+                prev_outputs.push(output.clone());
+                continue;
+            }
+
+            return Err(MempoolError::MissingInputs);
+        }
+
+        // CPFP: build full ancestor set (transitive) and enforce limits
+        if !ancestors.is_empty() {
+            let mut queue: Vec<Txid> = ancestors.iter().copied().collect();
+            while let Some(ancestor_txid) = queue.pop() {
+                if let Some(ancestor) = inner.entries.get(&ancestor_txid) {
+                    for anc_input in &ancestor.tx.input {
+                        let grandparent = anc_input.previous_output.txid;
+                        if inner.entries.contains_key(&grandparent)
+                            && ancestors.insert(grandparent)
+                        {
+                            queue.push(grandparent);
+                        }
+                    }
+                }
+                if ancestors.len() > self.config.max_ancestor_count {
+                    return Err(MempoolError::TooLongMempoolChain);
+                }
+            }
+        }
+
+        // RBF: if there are conflicts, check replacement rules
+        if !conflicts.is_empty() {
+            // Sum fees of all conflicted transactions
+            let mut conflict_fee_total: u64 = 0;
+            for conflict_txid in &conflicts {
+                if let Some(conflict_entry) = inner.entries.get(conflict_txid) {
+                    // RBF: in opt-in mode, conflicted tx must signal replaceability
+                    // (any input with sequence < 0xfffffffe). Full RBF skips this check.
+                    if !self.config.full_rbf {
+                        let signals_rbf = conflict_entry
+                            .tx
+                            .input
+                            .iter()
+                            .any(|i| i.sequence.0 < 0xffff_fffe);
+                        if !signals_rbf {
+                            return Err(MempoolError::ConflictingSpend);
+                        }
+                    }
+                    conflict_fee_total += conflict_entry.fee;
+                }
+            }
+
+            // Compute new tx fee (we have sum_inputs and sum_outputs from below)
+            let sum_outputs: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
+            if sum_inputs < sum_outputs {
+                return Err(MempoolError::BadAmounts);
+            }
+            let new_fee = sum_inputs - sum_outputs;
+
+            // New fee must exceed old fees + incremental relay fee
+            let min_replacement_fee =
+                conflict_fee_total + policy::INCREMENTAL_RELAY_FEE * weight as u64 / 1000;
+            if new_fee < min_replacement_fee {
+                return Err(MempoolError::InsufficientReplacementFee(
+                    new_fee,
+                    min_replacement_fee,
+                ));
+            }
         }
 
         // Check amounts
@@ -157,12 +322,12 @@ impl Mempool {
         } else {
             0
         };
-        if fee_rate < self.min_fee_rate {
-            return Err(MempoolError::InsufficientFee(fee_rate, self.min_fee_rate));
+        if fee_rate < self.config.min_fee_rate {
+            return Err(MempoolError::InsufficientFee(fee_rate, self.config.min_fee_rate));
         }
 
         // Check mempool size
-        if inner.total_bytes + tx_size > self.max_size_bytes {
+        if inner.total_bytes + tx_size > self.config.max_size_bytes {
             return Err(MempoolError::MempoolFull);
         }
 
@@ -170,6 +335,18 @@ impl Mempool {
         script_verifier
             .verify_transaction(&tx, &prev_outputs)
             .map_err(|e| MempoolError::Script(e.to_string()))?;
+
+        // RBF: remove conflicted transactions before inserting replacement
+        for conflict_txid in &conflicts {
+            if let Some(conflict_entry) = inner.entries.remove(conflict_txid) {
+                let sz = bitcoin::consensus::serialize(&conflict_entry.tx).len();
+                inner.total_bytes = inner.total_bytes.saturating_sub(sz);
+                for ci in &conflict_entry.tx.input {
+                    inner.spends.remove(&ci.previous_output);
+                }
+                tracing::info!(%conflict_txid, "RBF: evicted conflicting transaction");
+            }
+        }
 
         // Insert
         let now = std::time::SystemTime::now()
@@ -193,7 +370,11 @@ impl Mempool {
         );
         inner.total_bytes += tx_size;
 
-        tracing::info!(%txid, fee, fee_rate, "Transaction accepted to mempool");
+        if !conflicts.is_empty() {
+            tracing::info!(%txid, fee, fee_rate, replaced = conflicts.len(), "RBF replacement accepted to mempool");
+        } else {
+            tracing::info!(%txid, fee, fee_rate, ancestors = ancestors.len(), "Transaction accepted to mempool");
+        }
 
         Ok(txid)
     }
@@ -245,14 +426,49 @@ impl Mempool {
             .collect()
     }
 
+    /// Remove transactions that have been in the mempool longer than the expiry time.
+    /// Returns the number of transactions removed.
+    pub fn remove_expired(&self) -> usize {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let mut inner = self.inner.write().unwrap();
+        let expired: Vec<Txid> = inner
+            .entries
+            .iter()
+            .filter(|(_, entry)| now.saturating_sub(entry.time) > self.config.expiry_secs)
+            .map(|(txid, _)| *txid)
+            .collect();
+
+        let count = expired.len();
+        for txid in expired {
+            if let Some(entry) = inner.entries.remove(&txid) {
+                let tx_size = bitcoin::consensus::serialize(&entry.tx).len();
+                inner.total_bytes = inner.total_bytes.saturating_sub(tx_size);
+                for input in &entry.tx.input {
+                    inner.spends.remove(&input.previous_output);
+                }
+            }
+        }
+
+        if count > 0 {
+            tracing::info!(count, "Expired transactions removed from mempool");
+        }
+
+        count
+    }
+
     /// Get mempool statistics.
     pub fn info(&self) -> MempoolInfo {
         let inner = self.inner.read().unwrap();
         MempoolInfo {
             size: inner.entries.len(),
             bytes: inner.total_bytes,
-            max_size: self.max_size_bytes,
-            min_fee_rate: self.min_fee_rate,
+            max_size: self.config.max_size_bytes,
+            min_fee_rate: self.config.min_fee_rate,
+            full_rbf: self.config.full_rbf,
         }
     }
 }

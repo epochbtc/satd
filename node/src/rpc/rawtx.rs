@@ -36,7 +36,7 @@ pub fn get_mempool_info(mempool: &Mempool) -> Value {
         "minrelaytxfee": min_fee_btc,
         "incrementalrelayfee": 0.00001000,
         "unbroadcastcount": 0,
-        "fullrbf": false,
+        "fullrbf": info.full_rbf,
     })
 }
 
