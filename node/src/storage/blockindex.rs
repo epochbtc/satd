@@ -145,17 +145,17 @@ fn div_2_256_by(divisor: &[u8; 32]) -> [u8; 32] {
     // Add 1
     let mut carry = 1u64;
     let mut result_le = [0u64; 4];
-    for i in 0..4 {
-        let (v, c1) = q_le[i].overflowing_add(carry);
+    for (i, limb) in q_le.iter().enumerate() {
+        let (v, c1) = limb.overflowing_add(carry);
         result_le[i] = v;
-        carry = if c1 { 1 } else { 0 };
+        carry = u64::from(c1);
     }
 
     // Convert back to big-endian bytes
     let mut result = [0u8; 32];
-    for i in 0..4 {
+    for (i, limb) in result_le.iter().enumerate() {
         let be_idx = 3 - i;
-        let bytes = result_le[i].to_be_bytes();
+        let bytes = limb.to_be_bytes();
         let off = be_idx * 8;
         result[off..off + 8].copy_from_slice(&bytes);
     }

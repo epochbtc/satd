@@ -64,7 +64,7 @@ impl Store for RocksDbStore {
     fn get_coin(&self, outpoint: &OutPoint) -> Option<Coin> {
         let cf = self.db.cf_handle(CF_COINS)?;
         let key = outpoint_to_key(outpoint);
-        let value = self.db.get_cf(&cf, &key).ok()??;
+        let value = self.db.get_cf(&cf, key).ok()??;
         bincode::deserialize(&value).ok()
     }
 
@@ -100,11 +100,11 @@ impl Store for RocksDbStore {
                 let key = outpoint_to_key(outpoint);
                 let value = bincode::serialize(coin)
                     .map_err(|e| StoreError::Serialization(e.to_string()))?;
-                wb.put_cf(&cf, &key, &value);
+                wb.put_cf(&cf, key, &value);
             }
             for outpoint in &batch.coin_removes {
                 let key = outpoint_to_key(outpoint);
-                wb.delete_cf(&cf, &key);
+                wb.delete_cf(&cf, key);
             }
         }
 
@@ -156,11 +156,10 @@ impl Store for RocksDbStore {
         };
         let mut total: u64 = 0;
         for item in self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start) {
-            if let Ok((_key, value)) = item {
-                if let Ok(coin) = bincode::deserialize::<Coin>(&value) {
+            if let Ok((_key, value)) = item
+                && let Ok(coin) = bincode::deserialize::<Coin>(&value) {
                     total = total.saturating_add(coin.amount);
                 }
-            }
         }
         total
     }
@@ -174,6 +173,12 @@ pub struct InMemoryStore {
     tip: std::sync::RwLock<Option<BlockHash>>,
     height_index: std::sync::RwLock<std::collections::HashMap<u32, BlockHash>>,
     undo: std::sync::RwLock<std::collections::HashMap<BlockHash, UndoData>>,
+}
+
+impl Default for InMemoryStore {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl InMemoryStore {

@@ -40,7 +40,7 @@ impl Config {
         };
 
         // Determine datadir
-        let base_datadir = cli.datadir.unwrap_or_else(|| default_datadir());
+        let base_datadir = cli.datadir.unwrap_or_else(default_datadir);
 
         // Determine config file path and parse it
         let conf_path = cli
@@ -80,11 +80,10 @@ impl Config {
                 .as_ref()
                 .map(|cf| {
                     let mut vals = cf.global.get(key).cloned().unwrap_or_default();
-                    if let Some(s) = cf.sections.get(section) {
-                        if let Some(sv) = s.get(key) {
+                    if let Some(s) = cf.sections.get(section)
+                        && let Some(sv) = s.get(key) {
                             vals.extend(sv.iter().cloned());
                         }
-                    }
                     vals
                 })
                 .unwrap_or_default()

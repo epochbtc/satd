@@ -82,7 +82,7 @@ async fn main() {
         }
     };
 
-    let rpcport = cli.rpcport.unwrap_or_else(|| {
+    let rpcport = cli.rpcport.unwrap_or({
         if cli.regtest {
             18443
         } else if cli.testnet {
@@ -102,7 +102,7 @@ async fn main() {
             let base = cli
                 .datadir
                 .clone()
-                .unwrap_or_else(|| default_datadir());
+                .unwrap_or_else(default_datadir);
             let net_subdir = if cli.regtest {
                 "regtest"
             } else if cli.testnet {
@@ -183,8 +183,8 @@ async fn main() {
                     }
                 };
 
-                if let Some(error) = response_body.get("error") {
-                    if !error.is_null() {
+                if let Some(error) = response_body.get("error")
+                    && !error.is_null() {
                         let msg = error
                             .get("message")
                             .and_then(|m| m.as_str())
@@ -193,7 +193,6 @@ async fn main() {
                         eprintln!("error code: {}: {}", code, msg);
                         std::process::exit(1);
                     }
-                }
 
                 if let Some(result) = response_body.get("result") {
                     if let Some(s) = result.as_str() {

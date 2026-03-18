@@ -4,7 +4,6 @@
 //! and requesting/providing missing transactions.
 
 use bitcoin::bip152::{BlockTransactions, BlockTransactionsRequest, HeaderAndShortIds, ShortId};
-use bitcoin::hashes::Hash;
 use bitcoin::{Block, BlockHash, Transaction};
 use std::collections::HashMap;
 
@@ -23,6 +22,7 @@ pub struct PendingCompact {
 ///
 /// Returns Ok(Block) if all transactions were found, or Err(PendingCompact)
 /// with the missing indices if some transactions are not in the mempool.
+#[allow(clippy::result_large_err)]
 pub fn try_reconstruct(
     compact: &HeaderAndShortIds,
     mempool: &Mempool,
@@ -61,13 +61,13 @@ pub fn try_reconstruct(
     // Fill in remaining slots from mempool using short IDs
     let mut short_id_iter = compact.short_ids.iter();
     let mut missing_indices = Vec::new();
-    for i in 0..total_txs {
-        if txs[i].is_some() {
+    for (i, slot) in txs.iter_mut().enumerate() {
+        if slot.is_some() {
             continue; // Already prefilled
         }
         if let Some(short_id) = short_id_iter.next() {
             if let Some(tx) = mempool_by_short_id.get(short_id) {
-                txs[i] = Some(tx.clone());
+                *slot = Some(tx.clone());
             } else {
                 missing_indices.push(i as u64);
             }

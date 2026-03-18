@@ -174,7 +174,7 @@ fn compute_merkle_root(txdata: &[Transaction]) -> bitcoin::TxMerkleNode {
     let mut current: Vec<[u8; 32]> = hashes.iter().map(|h| h.to_raw_hash().to_byte_array()).collect();
 
     while current.len() > 1 {
-        if current.len() % 2 != 0 {
+        if !current.len().is_multiple_of(2) {
             let last = *current.last().unwrap();
             current.push(last);
         }
@@ -214,7 +214,7 @@ fn compute_witness_root(_coinbase: &Transaction, others: &[Transaction]) -> [u8;
 
     let mut current = hashes;
     while current.len() > 1 {
-        if current.len() % 2 != 0 {
+        if !current.len().is_multiple_of(2) {
             let last = *current.last().unwrap();
             current.push(last);
         }

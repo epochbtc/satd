@@ -76,7 +76,7 @@ where
     F: Fn(u32) -> Option<BlockIndexEntry>,
 {
     // If not at a retarget boundary, bits must match parent
-    if height % RETARGET_INTERVAL != 0 {
+    if !height.is_multiple_of(RETARGET_INTERVAL) {
         return prev.header.bits.to_consensus();
     }
 
@@ -90,7 +90,7 @@ where
     let actual_timespan = prev.header.time.saturating_sub(first_entry.header.time);
 
     // Clamp to [TARGET_TIMESPAN/4, TARGET_TIMESPAN*4]
-    let actual_timespan = actual_timespan.max(TARGET_TIMESPAN / 4).min(TARGET_TIMESPAN * 4);
+    let actual_timespan = actual_timespan.clamp(TARGET_TIMESPAN / 4, TARGET_TIMESPAN * 4);
 
     retarget(prev.header.bits, actual_timespan, MAINNET_POWLIMIT_BITS)
 }
@@ -106,7 +106,7 @@ where
     F: Fn(u32) -> Option<BlockIndexEntry>,
 {
     // At retarget boundary: use standard algorithm
-    if height % RETARGET_INTERVAL == 0 {
+    if height.is_multiple_of(RETARGET_INTERVAL) {
         return calculate_next_bits(height, prev, get_ancestor);
     }
 
@@ -118,7 +118,7 @@ where
     // Otherwise, walk back to find the last non-min-difficulty block
     let mut current = prev.clone();
     loop {
-        if current.height % RETARGET_INTERVAL == 0 {
+        if current.height.is_multiple_of(RETARGET_INTERVAL) {
             break;
         }
         if current.header.bits.to_consensus() != TESTNET_POWLIMIT_BITS {
@@ -177,7 +177,7 @@ where
         return Ok(());
     }
 
-    let start = if height > 11 { height - 11 } else { 0 };
+    let start = height.saturating_sub(11);
     let mut timestamps: Vec<u32> = Vec::new();
     for h in start..height {
         if let Some(entry) = get_ancestor(h) {

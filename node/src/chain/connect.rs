@@ -63,14 +63,13 @@ fn decode_coinbase_height(bytes: &[u8]) -> Option<u32> {
 /// Compute median time past (MTP) for a given height using the store directly.
 /// MTP is the median of the timestamps of the previous 11 blocks.
 fn get_median_time_past(store: &dyn Store, height: u32) -> u32 {
-    let start = if height > 11 { height - 11 } else { 0 };
+    let start = height.saturating_sub(11);
     let mut timestamps: Vec<u32> = Vec::new();
     for h in start..height {
-        if let Some(hash) = store.get_block_hash_by_height(h) {
-            if let Some(entry) = store.get_block_index(&hash) {
+        if let Some(hash) = store.get_block_hash_by_height(h)
+            && let Some(entry) = store.get_block_index(&hash) {
                 timestamps.push(entry.header.time);
             }
-        }
     }
     if timestamps.is_empty() {
         return 0;

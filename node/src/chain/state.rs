@@ -56,8 +56,8 @@ impl ChainState {
         let genesis_hash = genesis.block_hash();
 
         // Check if we have an existing tip
-        if let Some(tip_hash) = store.get_tip() {
-            if let Some(entry) = store.get_block_index(&tip_hash) {
+        if let Some(tip_hash) = store.get_tip()
+            && let Some(entry) = store.get_block_index(&tip_hash) {
                 tracing::info!(
                     height = entry.height,
                     hash = %tip_hash,
@@ -75,7 +75,6 @@ impl ChainState {
                     assumevalid,
                 });
             }
-        }
 
         // Fresh node: store genesis block
         tracing::info!("Initializing chain with genesis block");
@@ -196,14 +195,13 @@ impl ChainState {
     /// Compute median time past (MTP) for a given height.
     /// MTP is the median of the timestamps of the previous 11 blocks.
     pub fn get_median_time_past(&self, height: u32) -> u32 {
-        let start = if height > 11 { height - 11 } else { 0 };
+        let start = height.saturating_sub(11);
         let mut timestamps: Vec<u32> = Vec::new();
         for h in start..height {
-            if let Some(hash) = self.store.get_block_hash_by_height(h) {
-                if let Some(entry) = self.store.get_block_index(&hash) {
+            if let Some(hash) = self.store.get_block_hash_by_height(h)
+                && let Some(entry) = self.store.get_block_index(&hash) {
                     timestamps.push(entry.header.time);
                 }
-            }
         }
         if timestamps.is_empty() {
             return 0;
@@ -246,11 +244,10 @@ impl ChainState {
         let block_hash = block.block_hash();
 
         // Check for duplicate (HeaderOnly entries are OK — we're now providing data)
-        if let Some(existing) = self.store.get_block_index(&block_hash) {
-            if existing.status != BlockStatus::HeaderOnly {
+        if let Some(existing) = self.store.get_block_index(&block_hash)
+            && existing.status != BlockStatus::HeaderOnly {
                 return Err(ChainError::Duplicate);
             }
-        }
 
         // Find parent
         let prev_hash = block.header.prev_blockhash;

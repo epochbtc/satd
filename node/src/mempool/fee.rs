@@ -9,6 +9,12 @@ pub struct FeeEstimator {
     max_blocks: usize,
 }
 
+impl Default for FeeEstimator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FeeEstimator {
     pub fn new() -> Self {
         Self {

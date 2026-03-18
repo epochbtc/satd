@@ -56,9 +56,9 @@ impl ScriptVerifier for ConsensusVerifier {
             })
             .collect();
 
-        for input_index in 0..tx.input.len() {
-            let script_pubkey = prev_outputs[input_index].script_pubkey.as_bytes();
-            let amount = prev_outputs[input_index].value.to_sat();
+        for (input_index, prev_out) in prev_outputs.iter().enumerate().take(tx.input.len()) {
+            let script_pubkey = prev_out.script_pubkey.as_bytes();
+            let amount = prev_out.value.to_sat();
 
             bitcoinconsensus::verify_with_flags(
                 script_pubkey,

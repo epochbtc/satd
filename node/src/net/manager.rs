@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
@@ -20,6 +21,38 @@ use crate::net::sync;
 const MAX_OUTBOUND: usize = 8;
 const MAX_INBOUND: usize = 117;
 const BAN_THRESHOLD: u32 = 100;
+const BAN_DURATION_SECS: u64 = 86400; // 24 hours
+
+/// Per-address reconnect backoff state.
+struct ReconnectState {
+    attempts: u32,
+    next_attempt: Instant,
+}
+
+impl ReconnectState {
+    fn new() -> Self {
+        Self {
+            attempts: 0,
+            next_attempt: Instant::now(),
+        }
+    }
+
+    /// Backoff delay: 10s, 20s, 40s, 80s, 160s, capped at 300s.
+    fn backoff_duration(&self) -> Duration {
+        let secs = 10u64.saturating_mul(1u64 << self.attempts.min(5));
+        Duration::from_secs(secs.min(300))
+    }
+
+    fn record_failure(&mut self) {
+        self.attempts = self.attempts.saturating_add(1);
+        self.next_attempt = Instant::now() + self.backoff_duration();
+    }
+
+    fn reset(&mut self) {
+        self.attempts = 0;
+        self.next_attempt = Instant::now();
+    }
+}
 
 /// Event sent from peer tasks to the central manager loop.
 pub enum NetEvent {
@@ -55,6 +88,7 @@ pub struct PeerManager {
     /// Track the highest header height we've stored.
     headers_tip: AtomicU64,
     /// Track blocks we've already requested to avoid duplicate getdata.
+    #[allow(dead_code)]
     requested_blocks: RwLock<std::collections::HashSet<bitcoin::BlockHash>>,
     /// Configured outbound peer addresses for auto-reconnect.
     connect_addrs: RwLock<Vec<SocketAddr>>,
@@ -62,6 +96,10 @@ pub struct PeerManager {
     block_tx: mpsc::UnboundedSender<bitcoin::Block>,
     /// Pending compact blocks awaiting missing transactions.
     pending_compact: RwLock<HashMap<bitcoin::BlockHash, compact::PendingCompact>>,
+    /// Per-address reconnect backoff state.
+    reconnect_backoff: RwLock<HashMap<SocketAddr, ReconnectState>>,
+    /// Banned addresses with ban expiry time.
+    banned_addrs: RwLock<HashMap<SocketAddr, Instant>>,
     /// Shutdown signal.
     shutdown: tokio::sync::watch::Receiver<bool>,
 }
@@ -89,6 +127,8 @@ impl PeerManager {
             connect_addrs: RwLock::new(Vec::new()),
             block_tx,
             pending_compact: RwLock::new(HashMap::new()),
+            reconnect_backoff: RwLock::new(HashMap::new()),
+            banned_addrs: RwLock::new(HashMap::new()),
             shutdown,
         });
 
@@ -206,24 +246,54 @@ impl PeerManager {
             .count()
     }
 
+    /// Check if we are in Initial Block Download.
+    /// True when our validated tip is more than 24 blocks behind the highest
+    /// header height received from peers, or when no headers have been received.
+    fn is_ibd(&self) -> bool {
+        let tip = self.chain_state.tip_height();
+        let htip = self.headers_tip.load(Ordering::Relaxed) as u32;
+        htip == 0 || tip + 24 < htip
+    }
+
+    /// Check if we already have a connection to this address.
+    fn is_addr_connected(&self, addr: &SocketAddr) -> bool {
+        let peers = self.peers.read().unwrap();
+        peers
+            .values()
+            .any(|h| h.info.addr == *addr && h.info.state != PeerState::Disconnected)
+    }
+
+    /// Check if an address is currently banned.
+    fn is_addr_banned(&self, addr: &SocketAddr) -> bool {
+        let banned = self.banned_addrs.read().unwrap();
+        matches!(banned.get(addr), Some(expiry) if Instant::now() < *expiry)
+    }
+
     /// Add ban score to a peer. If the score exceeds BAN_THRESHOLD, the peer
-    /// is disconnected and removed.
+    /// is disconnected, removed, and its address is banned.
     fn add_ban_score(&self, id: PeerId, score: u32, reason: &str) {
         let mut peers = self.peers.write().unwrap();
-        let should_ban = if let Some(handle) = peers.get_mut(&id) {
+        let (should_ban, ban_addr) = if let Some(handle) = peers.get_mut(&id) {
             handle.info.ban_score += score;
             if handle.info.ban_score >= BAN_THRESHOLD {
                 tracing::warn!(id, addr = %handle.info.addr, score = handle.info.ban_score, reason, "Banning peer");
-                true
+                (true, Some(handle.info.addr))
             } else {
                 tracing::debug!(id, score = handle.info.ban_score, reason, "Increased ban score");
-                false
+                (false, None)
             }
         } else {
-            false
+            (false, None)
         };
         if should_ban {
             peers.remove(&id);
+            if let Some(addr) = ban_addr {
+                drop(peers); // release peers lock before acquiring banned_addrs lock
+                self.banned_addrs
+                    .write()
+                    .unwrap()
+                    .insert(addr, Instant::now() + Duration::from_secs(BAN_DURATION_SECS));
+            }
         }
     }
 
@@ -233,7 +303,7 @@ impl PeerManager {
         let mut sync_interval = tokio::time::interval(std::time::Duration::from_millis(500));
         let mut last_tip: u32 = 0;
         let mut ticks: u64 = 0;
-        let mut shutdown = self.shutdown.clone();
+        let shutdown = self.shutdown.clone();
 
         loop {
             // Check for shutdown
@@ -267,14 +337,19 @@ impl PeerManager {
 
             // Check sync progress and request more blocks
             let tip = self.chain_state.tip_height();
-            let htip = self.headers_tip.load(Ordering::Relaxed) as u32;
+            let _htip = self.headers_tip.load(Ordering::Relaxed) as u32;
 
             if tip != last_tip {
                 last_tip = tip;
+                // Reset reconnect backoff on chain progress
+                let mut backoff = self.reconnect_backoff.write().unwrap();
+                for state in backoff.values_mut() {
+                    state.reset();
+                }
             }
 
             // Request blocks every 10 ticks (5 seconds) and headers every 20 ticks (10 seconds)
-            if ticks % 10 == 0 {
+            if ticks.is_multiple_of(10) {
                 let peer_ids: Vec<PeerId> = {
                     let peers = self.peers.read().unwrap();
                     peers.iter()
@@ -285,7 +360,7 @@ impl PeerManager {
                 for pid in &peer_ids {
                     self.request_missing_blocks(*pid);
                 }
-                if ticks % 20 == 0 {
+                if ticks.is_multiple_of(20) {
                     for pid in &peer_ids {
                         self.send_to_peer(*pid, sync::make_getheaders(&self.chain_state));
                     }
@@ -294,15 +369,54 @@ impl PeerManager {
 
             ticks += 1;
             // Every 20 ticks (10 seconds), check peers
-            if ticks % 20 == 0 {
+            if ticks.is_multiple_of(20) {
                 // Auto-reconnect if no peers connected
                 if self.connection_count() == 0 {
                     let addrs = self.connect_addrs.read().unwrap().clone();
+                    let now = Instant::now();
+
+                    // Clean expired bans
+                    {
+                        let mut banned = self.banned_addrs.write().unwrap();
+                        banned.retain(|_, expiry| now < *expiry);
+                    }
+
                     for addr in addrs {
-                        let pm = Arc::clone(&self);
+                        // Skip if already connected
+                        if self.is_addr_connected(&addr) {
+                            continue;
+                        }
+                        // Skip if banned
+                        if self.is_addr_banned(&addr) {
+                            continue;
+                        }
+                        // Check backoff timer
+                        {
+                            let backoff = self.reconnect_backoff.read().unwrap();
+                            if let Some(state) = backoff.get(&addr)
+                                && now < state.next_attempt {
+                                    continue;
+                                }
+                        }
+
+                        let pm = Arc::clone(self);
                         tokio::spawn(async move {
-                            if let Err(e) = pm.connect_outbound(addr).await {
-                                tracing::debug!(%addr, "Reconnect failed: {}", e);
+                            match pm.connect_outbound(addr).await {
+                                Ok(_) => {
+                                    let mut backoff = pm.reconnect_backoff.write().unwrap();
+                                    backoff
+                                        .entry(addr)
+                                        .or_insert_with(ReconnectState::new)
+                                        .reset();
+                                }
+                                Err(e) => {
+                                    tracing::debug!(%addr, "Reconnect failed: {}", e);
+                                    let mut backoff = pm.reconnect_backoff.write().unwrap();
+                                    backoff
+                                        .entry(addr)
+                                        .or_insert_with(ReconnectState::new)
+                                        .record_failure();
+                                }
                             }
                         });
                     }
@@ -391,7 +505,8 @@ impl PeerManager {
                     }
                 }
                 Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
-                    if self.mempool.get(&txid).is_none() {
+                    // Don't request transactions during IBD — we can't validate them
+                    if !self.is_ibd() && self.mempool.get(&txid).is_none() {
                         txs_to_get.push(txid);
                     }
                 }
@@ -413,7 +528,7 @@ impl PeerManager {
         }
 
         let mut accepted = 0;
-        let mut max_height = 0u32;
+        let _max_height = 0u32;
         for header in &headers {
             match self.chain_state.accept_header(header) {
                 Ok(_) => {
@@ -494,6 +609,12 @@ impl PeerManager {
     }
 
     fn handle_tx(&self, id: PeerId, tx: bitcoin::Transaction) {
+        // During IBD, ignore relayed transactions — our UTXO set is incomplete
+        // so validation would produce false MissingInputs rejections.
+        if self.is_ibd() {
+            return;
+        }
+
         let txid = tx.compute_txid();
         match self.mempool.accept_transaction(
             tx,
@@ -531,11 +652,10 @@ impl PeerManager {
 
         let mut headers = Vec::new();
         for h in start..end {
-            if let Some(hash) = self.chain_state.get_block_hash_by_height(h) {
-                if let Some(entry) = self.chain_state.get_block_index(&hash) {
+            if let Some(hash) = self.chain_state.get_block_hash_by_height(h)
+                && let Some(entry) = self.chain_state.get_block_index(&hash) {
                     headers.push(entry.header);
                 }
-            }
         }
 
         if !headers.is_empty() {
@@ -565,11 +685,10 @@ impl PeerManager {
         let block_hash = compact.header.block_hash();
 
         // Skip if we already have this block
-        if let Some(entry) = self.chain_state.get_block_index(&block_hash) {
-            if entry.status != crate::storage::blockindex::BlockStatus::HeaderOnly {
+        if let Some(entry) = self.chain_state.get_block_index(&block_hash)
+            && entry.status != crate::storage::blockindex::BlockStatus::HeaderOnly {
                 return;
             }
-        }
 
         match compact::try_reconstruct(&compact, &self.mempool) {
             Ok(block) => {

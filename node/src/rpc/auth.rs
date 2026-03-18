@@ -67,12 +67,11 @@ impl RpcAuth {
 
     /// Delete the cookie file on shutdown.
     pub fn cleanup(&self) {
-        if let RpcAuth::Cookie { path, .. } = self {
-            if path.exists() {
+        if let RpcAuth::Cookie { path, .. } = self
+            && path.exists() {
                 let _ = std::fs::remove_file(path);
                 tracing::info!("Cookie file removed");
             }
-        }
     }
 }
 
