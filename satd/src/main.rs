@@ -221,10 +221,46 @@ async fn main() {
         config.prune,
         config.maxconnections,
         config.bantime,
+        config.proxy.clone(),
+        config.onion.clone(),
     );
 
     if config.prune > 0 {
         tracing::info!(target_mb = config.prune, "Block pruning enabled");
+    }
+
+    if config.proxy.is_some() {
+        tracing::info!(proxy = config.proxy.as_deref().unwrap(), "SOCKS5 proxy enabled for outbound connections");
+    }
+
+    // Start Tor hidden service if -torcontrol is set
+    let mut _onion_addr: Option<String> = None;
+    if let Some(ref torcontrol) = config.torcontrol {
+        match node::net::tor::TorController::connect(torcontrol).await {
+            Ok(mut controller) => {
+                let password = config.torpassword.as_deref().unwrap_or("");
+                match controller.authenticate(password).await {
+                    Ok(()) => {
+                        let target = format!("127.0.0.1:{}", config.port);
+                        match controller.create_hidden_service(config.port, &target).await {
+                            Ok(onion) => {
+                                tracing::info!(onion_addr = %onion, "Tor hidden service created");
+                                _onion_addr = Some(onion);
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to create Tor hidden service: {}", e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("Tor control authentication failed: {}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!("Failed to connect to Tor control port: {}", e);
+            }
+        }
     }
 
     // Start RPC server
@@ -276,41 +312,54 @@ async fn main() {
 
     // Connect to configured peers (and register for auto-reconnect)
     for addr_str in &config.connect {
-        if let Ok(addr) = addr_str.parse::<SocketAddr>() {
-            peer_manager.add_connect_addr(addr);
-            let pm = peer_manager.clone();
-            tokio::spawn(async move {
-                if let Err(e) = pm.connect_outbound(addr).await {
-                    tracing::warn!(%addr, "Failed to connect to peer: {}", e);
-                }
-            });
+        match node::net::peer::PeerAddr::parse(addr_str) {
+            Ok(addr) => {
+                peer_manager.add_peer_addr(addr.clone());
+                let pm = peer_manager.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = pm.connect_peer_addr(&addr).await {
+                        tracing::warn!(%addr, "Failed to connect to peer: {}", e);
+                    }
+                });
+            }
+            Err(e) => {
+                tracing::warn!(addr = addr_str, "Invalid connect address: {}", e);
+            }
         }
     }
 
     // Connect to -addnode peers (does NOT disable DNS seeding)
     for addr_str in &config.addnode {
-        if let Ok(addr) = addr_str.parse::<SocketAddr>() {
-            peer_manager.add_connect_addr(addr);
-            let pm = peer_manager.clone();
-            tokio::spawn(async move {
-                if let Err(e) = pm.connect_outbound(addr).await {
-                    tracing::warn!(%addr, "Failed to connect to addnode peer: {}", e);
-                }
-            });
+        match node::net::peer::PeerAddr::parse(addr_str) {
+            Ok(addr) => {
+                peer_manager.add_peer_addr(addr.clone());
+                let pm = peer_manager.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = pm.connect_peer_addr(&addr).await {
+                        tracing::warn!(%addr, "Failed to connect to addnode peer: {}", e);
+                    }
+                });
+            }
+            Err(e) => {
+                tracing::warn!(addr = addr_str, "Invalid addnode address: {}", e);
+            }
         }
     }
 
     // DNS seeding: only if no explicit --connect peers and --dns is enabled
     if config.connect.is_empty() && config.dns {
-        let dns_addrs =
-            node::net::dns::resolve_dns_seeds(config.network).await;
+        let seed_addrs = node::net::dns::resolve_seeds(
+            config.network,
+            config.proxy.as_deref(),
+        )
+        .await;
         let max_dns_outbound = 64;
-        for addr in dns_addrs.into_iter().take(max_dns_outbound) {
-            peer_manager.add_connect_addr(addr);
+        for addr in seed_addrs.into_iter().take(max_dns_outbound) {
+            peer_manager.add_peer_addr(addr.clone());
             let pm = peer_manager.clone();
             tokio::spawn(async move {
-                if let Err(e) = pm.connect_outbound(addr).await {
-                    tracing::warn!(%addr, "DNS seed peer connection failed: {}", e);
+                if let Err(e) = pm.connect_peer_addr(&addr).await {
+                    tracing::warn!(%addr, "Seed peer connection failed: {}", e);
                 }
             });
         }
