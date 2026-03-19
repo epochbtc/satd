@@ -1062,7 +1062,24 @@ impl PeerManager {
             let next_height = tip_height + 1;
 
             if next_height > target_height {
-                // IBD complete
+                // Check if more headers have arrived since we started
+                let headers_tip = chain_state.headers_tip_height();
+                if headers_tip > target_height + 24 {
+                    // More headers available — create a new scheduler for the next batch
+                    tracing::info!(
+                        height = tip_height,
+                        blocks = connected_count,
+                        new_target = headers_tip,
+                        elapsed_secs = start_time.elapsed().as_secs(),
+                        "IBD batch complete, starting next batch"
+                    );
+                    let new_sched = IbdScheduler::new(headers_tip, tip_height, chain_state);
+                    *ibd.write().unwrap() = Some(new_sched);
+                    connected_count = 0;
+                    // The run() loop will detect has_ibd=true within 2s and assign peers
+                    continue;
+                }
+                // Truly done
                 tracing::info!(
                     height = tip_height,
                     blocks = connected_count,
