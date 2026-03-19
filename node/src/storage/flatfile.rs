@@ -123,6 +123,41 @@ impl FlatFileManager {
         file.read_exact(&mut data)?;
         Ok(data)
     }
+
+    /// Scan all blk*.dat files and return raw block bytes with their file positions.
+    /// Used by `-reindex` to rebuild the block index from flat files.
+    pub fn scan_all_blocks(&self) -> Vec<(Vec<u8>, FlatFilePos)> {
+        let mut results = Vec::new();
+        for file_num in 0u32.. {
+            let path = self.file_path(file_num);
+            if !path.exists() {
+                break;
+            }
+            let data = match std::fs::read(&path) {
+                Ok(d) => d,
+                Err(_) => break,
+            };
+            let mut offset = 0usize;
+            while offset + 8 <= data.len() {
+                let size =
+                    u32::from_le_bytes([data[offset + 4], data[offset + 5], data[offset + 6], data[offset + 7]])
+                        as usize;
+                if size == 0 || offset + 8 + size > data.len() {
+                    break;
+                }
+                let block_data = data[offset + 8..offset + 8 + size].to_vec();
+                results.push((
+                    block_data,
+                    FlatFilePos {
+                        file_number: file_num,
+                        data_pos: offset as u32,
+                    },
+                ));
+                offset += 8 + size;
+            }
+        }
+        results
+    }
 }
 
 #[cfg(test)]

@@ -63,6 +63,46 @@ impl TestNode {
         }
     }
 
+    /// Start a node reusing an existing datadir (for restart/reindex tests).
+    fn start_with_datadir(datadir: &std::path::Path, rpcport: u16, extra_args: &[&str]) -> Self {
+        let satd_bin = env!("CARGO_BIN_EXE_satd");
+
+        let mut cmd = Command::new(satd_bin);
+        cmd.arg("--regtest")
+            .arg(format!("--datadir={}", datadir.display()))
+            .arg(format!("--rpcport={}", rpcport));
+        for arg in extra_args {
+            cmd.arg(arg);
+        }
+
+        let process = cmd
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("Failed to start satd");
+
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            if std::net::TcpStream::connect(format!("127.0.0.1:{}", rpcport)).is_ok() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!("Timed out waiting for satd to start on port {}", rpcport);
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        let cookie_path = datadir.join("regtest").join(".cookie");
+        let cookie = std::fs::read_to_string(&cookie_path).expect("Failed to read cookie file");
+
+        TestNode {
+            process,
+            datadir: datadir.to_path_buf(),
+            rpcport,
+            cookie,
+        }
+    }
+
     fn rpc_call(&self, method: &str) -> Result<serde_json::Value, String> {
         self.rpc_call_with_params(method, vec![])
     }
@@ -1757,4 +1797,62 @@ fn test_uptime_increases() {
     );
 
     node.stop();
+}
+
+#[test]
+fn test_reindex_chainstate() {
+    // Mine blocks, stop, restart with -reindex-chainstate, verify chain is intact
+    let rpcport = find_available_port();
+    let datadir = std::env::temp_dir().join(format!("satd-reindex-cs-test-{}", rpcport));
+    let _ = std::fs::create_dir_all(&datadir);
+
+    // Start node and mine blocks
+    let mut node = TestNode::start_with_datadir(&datadir, rpcport, &[]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    node.rpc_call_with_params(
+        "generatetoaddress",
+        vec![serde_json::json!(10), serde_json::json!(addr)],
+    )
+    .unwrap();
+    let response = node.rpc_call("getblockcount").unwrap();
+    assert_eq!(response["result"], 10);
+    node.stop();
+
+    // Restart with -reindex-chainstate
+    let mut node = TestNode::start_with_datadir(&datadir, rpcport, &["--reindex-chainstate"]);
+    let response = node.rpc_call("getblockcount").unwrap();
+    assert_eq!(response["result"], 10, "Block count should be preserved after reindex-chainstate");
+
+    // Verify UTXO set is consistent
+    let response = node.rpc_call("gettxoutsetinfo").unwrap();
+    assert!(response["result"]["txouts"].as_u64().unwrap() > 0);
+    node.stop();
+    let _ = std::fs::remove_dir_all(&datadir);
+}
+
+#[test]
+fn test_reindex() {
+    // Mine blocks, stop, restart with -reindex, verify chain is rebuilt from flat files
+    let rpcport = find_available_port();
+    let datadir = std::env::temp_dir().join(format!("satd-reindex-test-{}", rpcport));
+    let _ = std::fs::create_dir_all(&datadir);
+
+    // Start node and mine blocks
+    let mut node = TestNode::start_with_datadir(&datadir, rpcport, &[]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    node.rpc_call_with_params(
+        "generatetoaddress",
+        vec![serde_json::json!(10), serde_json::json!(addr)],
+    )
+    .unwrap();
+    let response = node.rpc_call("getblockcount").unwrap();
+    assert_eq!(response["result"], 10);
+    node.stop();
+
+    // Restart with -reindex
+    let mut node = TestNode::start_with_datadir(&datadir, rpcport, &["--reindex"]);
+    let response = node.rpc_call("getblockcount").unwrap();
+    assert_eq!(response["result"], 10, "Block count should be preserved after reindex");
+    node.stop();
+    let _ = std::fs::remove_dir_all(&datadir);
 }

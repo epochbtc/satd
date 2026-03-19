@@ -5,6 +5,7 @@ use node::chain::state::ChainState;
 use node::mempool::fee::FeeEstimator;
 use node::mempool::pool::{Mempool, MempoolConfig};
 use node::rpc::auth::RpcAuth;
+use node::storage::Store;
 use node::storage::redb_store::RedbStore;
 use node::storage::flatfile::FlatFileManager;
 use node::validation::script::ConsensusVerifier;
@@ -74,6 +75,24 @@ async fn main() {
         }
     };
 
+    // Handle -reindex: clear everything, will rebuild from flat files
+    if config.reindex {
+        tracing::info!("Reindexing: clearing database, will rebuild from block files");
+        if let Err(e) = store.clear_all() {
+            eprintln!("Error clearing database for reindex: {}", e);
+            auth.cleanup();
+            std::process::exit(1);
+        }
+    } else if config.reindex_chainstate {
+        // Handle -reindex-chainstate: clear UTXO/undo, keep block index
+        tracing::info!("Reindexing chainstate: clearing UTXO set, will rebuild from block files");
+        if let Err(e) = store.clear_chainstate() {
+            eprintln!("Error clearing chainstate for reindex: {}", e);
+            auth.cleanup();
+            std::process::exit(1);
+        }
+    }
+
     let flat_files = match FlatFileManager::new(&blocks_dir) {
         Ok(f) => f,
         Err(e) => {
@@ -81,6 +100,15 @@ async fn main() {
             auth.cleanup();
             std::process::exit(1);
         }
+    };
+
+    // For -reindex: scan flat files before FlatFileManager is moved into ChainState
+    let reindex_blocks = if config.reindex {
+        let scanned = flat_files.scan_all_blocks();
+        tracing::info!(blocks = scanned.len(), "Scanned flat files for reindex");
+        Some(scanned)
+    } else {
+        None
     };
 
     // Parse assumevalid: Core-compatible semantics + "all" extension
@@ -149,6 +177,21 @@ async fn main() {
         tip = %chain_state.tip_hash(),
         "Chain state initialized"
     );
+
+    // Run reindex replay if requested
+    if config.reindex {
+        if let Err(e) = chain_state.reindex_from_blocks(reindex_blocks.unwrap()) {
+            eprintln!("Error during reindex: {}", e);
+            auth.cleanup();
+            std::process::exit(1);
+        }
+    } else if config.reindex_chainstate
+        && let Err(e) = chain_state.reindex_chainstate()
+    {
+        eprintln!("Error during chainstate reindex: {}", e);
+        auth.cleanup();
+        std::process::exit(1);
+    }
 
     // Initialize mempool with policy from config
     let mempool = Arc::new(Mempool::with_config(MempoolConfig {

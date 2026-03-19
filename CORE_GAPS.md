@@ -113,10 +113,11 @@ chain tip is deep enough. Pruned blocks return appropriate errors from RPCs.
 `-txindex` flag enables txid→block_hash lookup stored in redb. `getrawtransaction`
 works without a `blockhash` parameter when txindex is enabled.
 
-### 17. No reindex support (-reindex, -reindex-chainstate)
+### 17. ~~No reindex support (-reindex, -reindex-chainstate)~~ — FIXED
 
-If the database becomes corrupted, the node cannot rebuild from flat files. Must
-delete the chainstate directory and resync from peers.
+`-reindex-chainstate` clears UTXO/undo/txindex tables and replays all blocks from
+flat files using the intact block index. `-reindex` clears everything, scans blk*.dat
+files, discovers chain topology via BFS from genesis, and reconnects all blocks.
 
 ### 18. ~~No checkpoint validation~~ — FIXED
 
@@ -193,9 +194,9 @@ mapped to redb tables. No external C++ dependencies for storage.
 |----------|-------|-------|---------|------|-------------|
 | **P0** | 6 | 6 | 0 | 0 | All consensus-critical gaps closed |
 | **P1** | 8 | 8 | 0 | 0 | All reliability gaps closed |
-| **P2** | 11 | 5 | 3 | 3 | Pruning, txindex, checkpoints, policy, P2P, RPCs improved |
-| **Total** | 25 | 19 | 3 | 3 | |
+| **P2** | 11 | 6 | 3 | 2 | Pruning, txindex, checkpoints, reindex, policy, P2P, RPCs improved |
+| **Total** | 25 | 20 | 3 | 2 | |
 
 All P0 and P1 gaps are resolved. satd is safe for signet/testnet/mainnet IBD
-and block validation. The remaining P2 items (reindex, remaining config flags,
+and block validation. The remaining P2 items (remaining config flags,
 remaining RPCs) are operational polish for full Bitcoin Core compatibility.

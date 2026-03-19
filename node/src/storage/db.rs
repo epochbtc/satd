@@ -119,6 +119,24 @@ impl Store for InMemoryStore {
     fn has_txindex(&self) -> bool {
         true // always enabled in tests
     }
+
+    fn clear_chainstate(&self) -> Result<(), StoreError> {
+        self.coins.write().unwrap().clear();
+        self.undo.write().unwrap().clear();
+        self.tx_index.write().unwrap().clear();
+        *self.tip.write().unwrap() = None;
+        Ok(())
+    }
+
+    fn clear_all(&self) -> Result<(), StoreError> {
+        self.block_index.write().unwrap().clear();
+        self.height_index.write().unwrap().clear();
+        self.coins.write().unwrap().clear();
+        self.undo.write().unwrap().clear();
+        self.tx_index.write().unwrap().clear();
+        *self.tip.write().unwrap() = None;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

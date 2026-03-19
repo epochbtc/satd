@@ -30,6 +30,8 @@ pub struct Config {
     pub permitbaremultisig: bool,
     pub txindex: bool,
     pub prune: u64,
+    pub reindex: bool,
+    pub reindex_chainstate: bool,
 }
 
 impl Config {
@@ -231,6 +233,8 @@ impl Config {
             permitbaremultisig,
             txindex,
             prune,
+            reindex: cli.reindex,
+            reindex_chainstate: cli.reindex_chainstate,
         })
     }
 
@@ -325,6 +329,12 @@ pub struct CliArgs {
 
     #[arg(long, value_name = "MB", help = "Prune block data to target size in MB (0 = no pruning, default: 0)")]
     pub prune: Option<u64>,
+
+    #[arg(long, help = "Rebuild block index and chain state from block files on disk")]
+    pub reindex: bool,
+
+    #[arg(long = "reindex-chainstate", help = "Rebuild UTXO set from existing block files")]
+    pub reindex_chainstate: bool,
 }
 
 /// Convert Bitcoin Core-style single-dash long flags to clap-compatible double-dash.
@@ -357,6 +367,8 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "permitbaremultisig",
         "txindex",
         "prune",
+        "reindex",
+        "reindex-chainstate",
     ];
 
     args.into_iter()
@@ -555,6 +567,8 @@ rpcport=8332
             permitbaremultisig: None,
             txindex: false,
             prune: None,
+            reindex: false,
+            reindex_chainstate: false,
         };
         let config = Config::from_cli(cli).unwrap();
         assert_eq!(config.network, Network::Regtest);
@@ -591,6 +605,8 @@ rpcport=8332
             permitbaremultisig: None,
             txindex: false,
             prune: None,
+            reindex: false,
+            reindex_chainstate: false,
         };
         assert!(Config::from_cli(cli).is_err());
     }

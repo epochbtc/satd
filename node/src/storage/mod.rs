@@ -69,4 +69,10 @@ pub trait Store: Send + Sync {
     fn get_tx_location(&self, txid: &Txid) -> Option<BlockHash>;
     /// Whether this store has txindex enabled.
     fn has_txindex(&self) -> bool;
+    /// Clear UTXO set, undo data, tx index, and tip. Keep block index intact.
+    /// Used by `-reindex-chainstate`.
+    fn clear_chainstate(&self) -> Result<(), StoreError>;
+    /// Clear everything: block index, UTXO set, undo data, tx index, height index, tip.
+    /// Used by `-reindex`.
+    fn clear_all(&self) -> Result<(), StoreError>;
 }
