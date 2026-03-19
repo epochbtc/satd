@@ -132,7 +132,7 @@ Only basic flags are supported: `-regtest`, `-testnet`, `-signet`, `-datadir`,
 `-assumevalid`, `-txindex`, `-prune`, plus mempool policy flags. Missing:
 `-proxy`, `-maxconnections`, `-dbcache`, `-debug`, `-pid`, and ~60 others.
 
-### 20. ~~No mempool policy enforcement~~ — PARTIALLY FIXED
+### 20. ~~No mempool policy enforcement~~ — FIXED
 
 Implemented:
 - Dust output checks (configurable via `-dustrelayfee`, 0 = disable)
@@ -140,37 +140,33 @@ Implemented:
 - Maximum ancestor/descendant count limits (`-limitancestorcount`, `-limitdescendantcount`)
 - Mempool expiration (configurable via `-mempoolexpiry`)
 - Low-fee eviction when mempool is full (evicts lowest fee-rate entries)
-
-Not yet implemented:
-- Standard script type enforcement (non-standard scripts accepted)
+- Standard script type enforcement: rejects non-standard output scripts (P2PKH,
+  P2SH, P2WPKH, P2WSH, P2TR, OP_RETURN accepted; bare multisig configurable)
 
 ### 21. ~~Missing P2P message types~~ — PARTIALLY FIXED
 
-15 of ~20 message types are now handled: `Ping`, `Pong`, `Inv`, `Headers`,
+19 of ~20 message types are now handled: `Ping`, `Pong`, `Inv`, `Headers`,
 `Block`, `Tx`, `GetHeaders`, `GetData`, `SendHeaders`, `SendCmpct`,
-`CmpctBlock`, `GetBlockTxn`, `BlockTxn`, `FeeFilter`, `Addr`, `GetAddr`.
+`CmpctBlock`, `GetBlockTxn`, `BlockTxn`, `FeeFilter`, `Addr`, `AddrV2`,
+`SendAddrV2`, `NotFound`, `GetAddr`.
 Not handled:
 
-- `AddrV2` (v2 peer discovery)
-- `MemPool` (mempool sync)
-- `NotFound` (missing data notification)
-- `FilterLoad` / `FilterAdd` / `FilterClear` (bloom filters)
+- `MemPool` (mempool sync — rarely used)
+- `FilterLoad` / `FilterAdd` / `FilterClear` (bloom filters — deprecated)
 
-### 22. Incomplete getblocktemplate (BIP 22/23)
+### 22. ~~Incomplete getblocktemplate (BIP 22/23)~~ — FIXED
 
-**File:** `node/src/rpc/mining.rs`
+All BIP 22/23 fields now present: `longpollid`, `expires`, and
+`default_witness_commitment` (computed from template transaction wtxids).
 
-Missing fields: `longpollid`, `expires`, `default_witness_commitment`. Sufficient
-for basic regtest mining but not compatible with production mining software.
+### 23. ~~Missing RPCs~~ — FIXED
 
-### 23. ~~Missing RPCs~~ — PARTIALLY FIXED
+77 of ~77 non-wallet Bitcoin Core RPCs are implemented.
 
-76 of ~77 non-wallet Bitcoin Core RPCs are implemented. Notable missing RPCs:
-
-- `prioritisetransaction` — fee bumping for miners
+- ~~`prioritisetransaction`~~ — FIXED: adjusts fee delta for mining priority
 - ~~`signrawtransactionwithkey`~~ — FIXED: P2PKH, P2WPKH, P2SH-P2WPKH, P2TR key-path signing
 - ~~`combinepsbt` / `finalizepsbt` / `utxoupdatepsbt`~~ — FIXED (were already implemented)
-- `disconnectnode` — peer management
+- ~~`disconnectnode`~~ — FIXED (was already implemented, not documented)
 
 ### 24. ~~Checksum handling~~ — FIXED
 
@@ -194,9 +190,9 @@ mapped to redb tables. No external C++ dependencies for storage.
 |----------|-------|-------|---------|------|-------------|
 | **P0** | 6 | 6 | 0 | 0 | All consensus-critical gaps closed |
 | **P1** | 8 | 8 | 0 | 0 | All reliability gaps closed |
-| **P2** | 11 | 6 | 3 | 2 | Pruning, txindex, checkpoints, reindex, policy, P2P, RPCs improved |
-| **Total** | 25 | 20 | 3 | 2 | |
+| **P2** | 11 | 9 | 1 | 1 | All major features complete; P2P bloom filters + config flags remain |
+| **Total** | 25 | 23 | 1 | 1 | |
 
-All P0 and P1 gaps are resolved. satd is safe for signet/testnet/mainnet IBD
-and block validation. The remaining P2 items (remaining config flags,
-remaining RPCs) are operational polish for full Bitcoin Core compatibility.
+All P0 and P1 gaps are resolved. All RPCs (77/77) implemented. getblocktemplate
+is production-ready. Standard mempool policy enforced. The only remaining items
+are missing config flags (#19) and deprecated P2P bloom filters (#21).

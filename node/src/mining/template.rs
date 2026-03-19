@@ -1,3 +1,4 @@
+use bitcoin::hashes::Hash;
 use bitcoin::pow::CompactTarget;
 use bitcoin::{BlockHash, Transaction};
 
@@ -40,9 +41,15 @@ pub fn create_template(chain_state: &ChainState, mempool: &Mempool) -> BlockTemp
         _ => tip_entry.header.bits, // Simplified; full retarget in pow.rs
     };
 
-    // Select transactions from mempool by fee rate
+    // Select transactions from mempool by effective fee rate (includes fee_delta)
     let mut entries = mempool.get_all_entries();
-    entries.sort_by(|a, b| b.1.fee_rate.cmp(&a.1.fee_rate));
+    entries.sort_by(|a, b| {
+        let eff_a = (a.1.fee as i64 + a.1.fee_delta).max(0) as u64 * 1000
+            / a.1.weight.max(1) as u64;
+        let eff_b = (b.1.fee as i64 + b.1.fee_delta).max(0) as u64 * 1000
+            / b.1.weight.max(1) as u64;
+        eff_b.cmp(&eff_a)
+    });
 
     let mut transactions = Vec::new();
     let mut total_weight = COINBASE_WEIGHT_RESERVE;
@@ -77,6 +84,60 @@ pub fn create_template(chain_state: &ChainState, mempool: &Mempool) -> BlockTemp
         transactions,
         coinbase_value: subsidy + total_fees,
     }
+}
+
+/// Compute merkle root from a list of 32-byte hashes.
+fn merkle_root(hashes: &[[u8; 32]]) -> [u8; 32] {
+    if hashes.is_empty() {
+        return [0u8; 32];
+    }
+    let mut current = hashes.to_vec();
+    while current.len() > 1 {
+        if !current.len().is_multiple_of(2) {
+            let last = *current.last().unwrap();
+            current.push(last);
+        }
+        let mut next = Vec::new();
+        for i in (0..current.len()).step_by(2) {
+            let mut combined = [0u8; 64];
+            combined[..32].copy_from_slice(&current[i]);
+            combined[32..].copy_from_slice(&current[i + 1]);
+            let hash = bitcoin::hashes::sha256d::Hash::hash(&combined);
+            next.push(hash.to_byte_array());
+        }
+        current = next;
+    }
+    current[0]
+}
+
+/// Compute the default witness commitment hex for a block template.
+/// Returns the full OP_RETURN script hex (6a24aa21a9ed + 32-byte commitment).
+/// Returns empty string if no transactions have witness data.
+pub fn compute_witness_commitment_hex(txs: &[TemplateTx]) -> String {
+    let has_witness = txs
+        .iter()
+        .any(|ttx| ttx.tx.input.iter().any(|i| !i.witness.is_empty()));
+    if !has_witness {
+        return String::new();
+    }
+
+    // Coinbase wtxid = 0x00...00, then wtxids of included transactions
+    let mut hashes: Vec<[u8; 32]> = vec![[0u8; 32]];
+    for ttx in txs {
+        hashes.push(ttx.tx.compute_wtxid().to_raw_hash().to_byte_array());
+    }
+    let witness_root = merkle_root(&hashes);
+
+    // commitment = SHA256d(witness_root || witness_nonce)
+    let witness_nonce = [0u8; 32];
+    let mut preimage = [0u8; 64];
+    preimage[..32].copy_from_slice(&witness_root);
+    preimage[32..].copy_from_slice(&witness_nonce);
+    let commitment = bitcoin::hashes::sha256d::Hash::hash(&preimage);
+
+    let mut script = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+    script.extend_from_slice(&commitment.to_byte_array());
+    hex::encode(script)
 }
 
 #[cfg(test)]

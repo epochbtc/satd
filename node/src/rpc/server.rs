@@ -553,6 +553,22 @@ pub async fn start(
         Ok::<_, ErrorObjectOwned>(serde_json::json!(true))
     })?;
 
+    module.register_method("prioritisetransaction", |params, ctx, _extensions| {
+        let mut seq = params.sequence();
+        let txid_str: String = seq.next().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        let _dummy: Option<f64> = seq.optional_next().unwrap_or(None); // ignored (Core compat)
+        let fee_delta: i64 = seq.next().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        let txid: bitcoin::Txid = txid_str.parse().map_err(|_| {
+            ErrorObjectOwned::owned(-8, "Invalid txid", None::<()>)
+        })?;
+        let found = ctx.mempool.prioritise_transaction(&txid, fee_delta);
+        Ok::<_, ErrorObjectOwned>(serde_json::json!(found))
+    })?;
+
     module.register_method("disconnectnode", |params, ctx, _extensions| {
         let addr_str: String = params.one().map_err(|e| {
             ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
@@ -578,7 +594,8 @@ pub async fn start(
             "getnettotals", "getnetworkhashps", "getnetworkinfo", "getpeerinfo",
             "getrawmempool", "getrawtransaction", "getrpcinfo", "gettxout",
             "gettxoutsetinfo", "help", "listbanned", "logging", "ping",
-            "preciousblock", "savemempool", "sendrawtransaction", "setban",
+            "preciousblock", "prioritisetransaction",
+            "savemempool", "sendrawtransaction", "setban",
             "signrawtransactionwithkey",
             "setnetworkactive", "stop", "submitblock", "submitheader",
             "testmempoolaccept", "uptime", "verifychain",

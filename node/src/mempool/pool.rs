@@ -50,6 +50,8 @@ pub struct MempoolEntry {
     pub weight: usize,
     pub fee_rate: u64,
     pub time: u64,
+    /// Miner-adjustable fee delta (satoshis) from `prioritisetransaction`.
+    pub fee_delta: i64,
 }
 
 /// Statistics about the mempool.
@@ -191,6 +193,16 @@ impl Mempool {
                         return Err(MempoolError::NonStandardOpReturn);
                     }
                 }
+            }
+        }
+
+        // Policy: reject non-standard output scripts
+        for output in &tx.output {
+            if !policy::is_standard_output_script(
+                &output.script_pubkey,
+                self.config.permit_bare_multisig,
+            ) {
+                return Err(MempoolError::Validation("scriptpubkey".to_string()));
             }
         }
 
@@ -381,6 +393,7 @@ impl Mempool {
                 weight,
                 fee_rate,
                 time: now,
+                fee_delta: 0,
             },
         );
         inner.total_bytes += tx_size;
@@ -428,6 +441,17 @@ impl Mempool {
     /// Get a transaction by txid.
     pub fn get(&self, txid: &Txid) -> Option<MempoolEntry> {
         self.inner.read().unwrap().entries.get(txid).cloned()
+    }
+
+    /// Adjust the fee delta for a transaction in the mempool (for mining priority).
+    pub fn prioritise_transaction(&self, txid: &Txid, fee_delta: i64) -> bool {
+        let mut inner = self.inner.write().unwrap();
+        if let Some(entry) = inner.entries.get_mut(txid) {
+            entry.fee_delta += fee_delta;
+            true
+        } else {
+            false
+        }
     }
 
     /// Get all txids in the mempool.
@@ -834,6 +858,7 @@ mod tests {
                 weight: 400,
                 fee_rate: 25, // very low fee rate
                 time: 0,
+                fee_delta: 0,
             },
         );
         inner.total_bytes = low_size;
