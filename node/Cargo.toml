@@ -20,6 +20,7 @@ hex = { workspace = true }
 bincode = { workspace = true }
 bitcoinconsensus = { workspace = true }
 rayon = { workspace = true }
+tokio-socks = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

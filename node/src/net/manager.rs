@@ -17,7 +17,8 @@ use crate::mempool::pool::Mempool;
 use crate::net::compact;
 use crate::net::connection::{Connection, ConnectionWriter};
 use crate::net::ibd::IbdScheduler;
-use crate::net::peer::{Direction, PeerId, PeerInfo, PeerState};
+use crate::net::peer::{Direction, PeerAddr, PeerId, PeerInfo, PeerState};
+use crate::net::proxy;
 use crate::net::sync;
 
 const MAX_OUTBOUND: usize = 8;
@@ -117,6 +118,12 @@ pub struct PeerManager {
     ibd: Arc<std::sync::RwLock<Option<IbdScheduler>>>,
     /// Signal to wake the connect thread when a block is stored.
     connect_signal: Arc<(std::sync::Mutex<bool>, Condvar)>,
+    /// SOCKS5 proxy for all outbound connections (e.g. "127.0.0.1:9050").
+    proxy: Option<String>,
+    /// Separate SOCKS5 proxy for .onion connections (defaults to proxy).
+    onion_proxy: Option<String>,
+    /// Configured outbound .onion and hostname-based peer addresses for auto-reconnect.
+    connect_peer_addrs: RwLock<Vec<PeerAddr>>,
 }
 
 impl PeerManager {
@@ -127,7 +134,7 @@ impl PeerManager {
         network: Network,
         shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Arc<Self> {
-        Self::with_config(chain_state, mempool, fee_estimator, network, shutdown, 0, 125, 86400)
+        Self::with_config(chain_state, mempool, fee_estimator, network, shutdown, 0, 125, 86400, None, None)
     }
 
     pub fn with_prune(
@@ -138,7 +145,7 @@ impl PeerManager {
         shutdown: tokio::sync::watch::Receiver<bool>,
         prune_target_mb: u64,
     ) -> Arc<Self> {
-        Self::with_config(chain_state, mempool, fee_estimator, network, shutdown, prune_target_mb, 125, 86400)
+        Self::with_config(chain_state, mempool, fee_estimator, network, shutdown, prune_target_mb, 125, 86400, None, None)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -151,6 +158,8 @@ impl PeerManager {
         prune_target_mb: u64,
         max_connections: usize,
         ban_duration_secs: u64,
+        proxy: Option<String>,
+        onion_proxy: Option<String>,
     ) -> Arc<Self> {
         let (event_tx, event_rx) = mpsc::channel(4096);
         let (block_tx, block_rx) = mpsc::unbounded_channel();
@@ -204,6 +213,9 @@ impl PeerManager {
             ban_duration_secs,
             ibd: ibd.clone(),
             connect_signal: connect_signal.clone(),
+            proxy,
+            onion_proxy,
+            connect_peer_addrs: RwLock::new(Vec::new()),
         });
 
         // Spawn block processing thread
@@ -223,32 +235,87 @@ impl PeerManager {
         self.connect_addrs.write().unwrap().push(addr);
     }
 
+    /// Register a PeerAddr (socket or .onion) for auto-reconnect.
+    pub fn add_peer_addr(&self, addr: PeerAddr) {
+        match &addr {
+            PeerAddr::Socket(sa) => self.connect_addrs.write().unwrap().push(*sa),
+            PeerAddr::Onion { .. } => self.connect_peer_addrs.write().unwrap().push(addr),
+        }
+    }
+
+    /// Check outbound connection limit.
+    fn check_outbound_limit(&self) -> Result<(), String> {
+        let max_outbound = if self.is_ibd() {
+            MAX_OUTBOUND_IBD
+        } else {
+            self.max_connections.min(MAX_OUTBOUND)
+        };
+        let peers = self.peers.read().unwrap();
+        let outbound_count = peers
+            .values()
+            .filter(|h| {
+                h.info.direction == Direction::Outbound
+                    && h.info.state == PeerState::Connected
+            })
+            .count();
+        if outbound_count >= max_outbound {
+            return Err("max outbound connections reached".to_string());
+        }
+        Ok(())
+    }
+
     /// Connect to an outbound peer.
     pub async fn connect_outbound(self: &Arc<Self>, addr: SocketAddr) -> Result<(), String> {
-        {
-            let max_outbound = if self.is_ibd() { MAX_OUTBOUND_IBD } else { self.max_connections.min(MAX_OUTBOUND) };
-            let peers = self.peers.read().unwrap();
-            let outbound_count = peers
-                .values()
-                .filter(|h| {
-                    h.info.direction == Direction::Outbound
-                        && h.info.state == PeerState::Connected
-                })
-                .count();
-            if outbound_count >= max_outbound {
-                return Err("max outbound connections reached".to_string());
-            }
-        }
+        self.check_outbound_limit()?;
 
-        let stream = TcpStream::connect(addr)
-            .await
-            .map_err(|e| format!("connect failed: {}", e))?;
+        let stream = if let Some(ref proxy_addr) = self.proxy {
+            proxy::connect_socks5(proxy_addr, addr).await?
+        } else {
+            TcpStream::connect(addr)
+                .await
+                .map_err(|e| format!("connect failed: {}", e))?
+        };
 
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         tracing::info!(%addr, id, "Connecting to peer");
 
         self.spawn_peer(id, addr, stream, Direction::Outbound);
         Ok(())
+    }
+
+    /// Connect to a .onion peer address via SOCKS5 proxy.
+    pub async fn connect_outbound_onion(
+        self: &Arc<Self>,
+        host: &str,
+        port: u16,
+    ) -> Result<(), String> {
+        self.check_outbound_limit()?;
+
+        // Use onion-specific proxy, or fall back to general proxy
+        let proxy_addr = self
+            .onion_proxy
+            .as_deref()
+            .or(self.proxy.as_deref())
+            .ok_or("no proxy configured for .onion connections")?;
+
+        let stream = proxy::connect_socks5_onion(proxy_addr, host, port).await?;
+
+        // Use a placeholder SocketAddr for .onion peers (the actual routing is via proxy)
+        let placeholder_addr: SocketAddr = ([0, 0, 0, 0], port).into();
+
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        tracing::info!(onion = host, id, "Connecting to .onion peer via proxy");
+
+        self.spawn_peer(id, placeholder_addr, stream, Direction::Outbound);
+        Ok(())
+    }
+
+    /// Connect to a PeerAddr (either socket or .onion).
+    pub async fn connect_peer_addr(self: &Arc<Self>, addr: &PeerAddr) -> Result<(), String> {
+        match addr {
+            PeerAddr::Socket(sa) => self.connect_outbound(*sa).await,
+            PeerAddr::Onion { host, port } => self.connect_outbound_onion(host, *port).await,
+        }
     }
 
     /// Accept an inbound connection.
@@ -634,6 +701,17 @@ impl PeerManager {
                                         .or_insert_with(ReconnectState::new)
                                         .record_failure();
                                 }
+                            }
+                        });
+                    }
+
+                    // Also reconnect .onion peers
+                    let onion_addrs = self.connect_peer_addrs.read().unwrap().clone();
+                    for peer_addr in onion_addrs {
+                        let pm = Arc::clone(self);
+                        tokio::spawn(async move {
+                            if let Err(e) = pm.connect_peer_addr(&peer_addr).await {
+                                tracing::debug!(%peer_addr, "Onion reconnect failed: {}", e);
                             }
                         });
                     }

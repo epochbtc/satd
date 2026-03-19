@@ -40,6 +40,13 @@ pub struct Config {
     pub addnode: Vec<String>,
     pub dns: bool,
     pub bantime: u64,
+    // Proxy / Tor
+    pub proxy: Option<String>,
+    pub onion: Option<String>,
+    pub torcontrol: Option<String>,
+    pub torpassword: Option<String>,
+    #[allow(dead_code)]
+    pub onlynet: Vec<String>,
     // Mining
     #[allow(dead_code)]
     pub blockmaxweight: usize,
@@ -286,6 +293,17 @@ impl Config {
                 .bantime
                 .or_else(|| file_get("bantime").and_then(|v| v.parse().ok()))
                 .unwrap_or(86400),
+            proxy: cli.proxy.or_else(|| file_get("proxy")),
+            onion: cli.onion.or_else(|| file_get("onion")),
+            torcontrol: cli.torcontrol.or_else(|| file_get("torcontrol")),
+            torpassword: cli.torpassword.or_else(|| file_get("torpassword")),
+            onlynet: {
+                let mut nets = cli.onlynet;
+                if nets.is_empty() {
+                    nets = file_get_all("onlynet");
+                }
+                nets
+            },
             blockmaxweight: cli
                 .blockmaxweight
                 .or_else(|| file_get("blockmaxweight").and_then(|v| v.parse().ok()))
@@ -427,6 +445,22 @@ pub struct CliArgs {
     #[arg(long, value_name = "SECS", help = "Ban duration in seconds (default: 86400)")]
     pub bantime: Option<u64>,
 
+    // Proxy / Tor flags
+    #[arg(long, value_name = "ADDR:PORT", help = "SOCKS5 proxy for all outbound connections (e.g. 127.0.0.1:9050)")]
+    pub proxy: Option<String>,
+
+    #[arg(long, value_name = "ADDR:PORT", help = "SOCKS5 proxy for .onion connections (defaults to -proxy)")]
+    pub onion: Option<String>,
+
+    #[arg(long, value_name = "ADDR:PORT", help = "Tor control port for hidden service (e.g. 127.0.0.1:9051)")]
+    pub torcontrol: Option<String>,
+
+    #[arg(long, value_name = "PASS", help = "Tor control port password")]
+    pub torpassword: Option<String>,
+
+    #[arg(long, value_name = "NET", help = "Restrict to network types: ipv4, ipv6, onion")]
+    pub onlynet: Vec<String>,
+
     // Mining flags
     #[arg(long, value_name = "WU", help = "Maximum block weight for templates (default: 4000000)")]
     pub blockmaxweight: Option<usize>,
@@ -490,6 +524,11 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "addnode",
         "dns",
         "bantime",
+        "proxy",
+        "onion",
+        "torcontrol",
+        "torpassword",
+        "onlynet",
         "blockmaxweight",
         "blockmintxfee",
         "pid",
@@ -710,6 +749,11 @@ rpcport=8332
             daemon: false,
             dbcache: None,
             par: None,
+            proxy: None,
+            onion: None,
+            torcontrol: None,
+            torpassword: None,
+            onlynet: vec![],
         };
         let config = Config::from_cli(cli).unwrap();
         assert_eq!(config.network, Network::Regtest);
@@ -761,6 +805,11 @@ rpcport=8332
             daemon: false,
             dbcache: None,
             par: None,
+            proxy: None,
+            onion: None,
+            torcontrol: None,
+            torpassword: None,
+            onlynet: vec![],
         };
         assert!(Config::from_cli(cli).is_err());
     }

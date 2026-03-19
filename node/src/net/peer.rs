@@ -1,8 +1,63 @@
 use bitcoin::p2p::message_network::VersionMessage;
 use bitcoin::p2p::ServiceFlags;
+use std::fmt;
 use std::net::SocketAddr;
 use std::time::SystemTime;
 
+/// Address that can represent either a regular socket address or a .onion hostname.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum PeerAddr {
+    Socket(SocketAddr),
+    Onion { host: String, port: u16 },
+}
+
+impl PeerAddr {
+    /// Returns true if this is a .onion address.
+    pub fn is_onion(&self) -> bool {
+        matches!(self, PeerAddr::Onion { .. })
+    }
+
+    /// Returns the port number.
+    pub fn port(&self) -> u16 {
+        match self {
+            PeerAddr::Socket(addr) => addr.port(),
+            PeerAddr::Onion { port, .. } => *port,
+        }
+    }
+
+    /// Try to parse a string as a PeerAddr.
+    /// Handles "host:port" where host can be a .onion address or IP.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        // Check if it's a .onion address
+        if let Some((host, port_str)) = s.rsplit_once(':') {
+            if host.ends_with(".onion") {
+                let port: u16 = port_str
+                    .parse()
+                    .map_err(|_| format!("invalid port in onion address: {}", s))?;
+                return Ok(PeerAddr::Onion {
+                    host: host.to_string(),
+                    port,
+                });
+            }
+        } else if s.ends_with(".onion") {
+            return Err(format!("onion address missing port: {}", s));
+        }
+
+        // Try as regular SocketAddr
+        s.parse::<SocketAddr>()
+            .map(PeerAddr::Socket)
+            .map_err(|e| format!("invalid address '{}': {}", s, e))
+    }
+}
+
+impl fmt::Display for PeerAddr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PeerAddr::Socket(addr) => write!(f, "{}", addr),
+            PeerAddr::Onion { host, port } => write!(f, "{}:{}", host, port),
+        }
+    }
+}
 
 /// Unique peer identifier.
 pub type PeerId = u64;
