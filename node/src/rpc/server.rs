@@ -305,6 +305,26 @@ pub async fn start(
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
+    module.register_method("signrawtransactionwithkey", |params, ctx, _extensions| {
+        let mut seq = params.sequence();
+        let hex_tx: String = seq.next().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        let privkeys: Vec<String> = seq.next().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        let prevtxs: Option<Vec<serde_json::Value>> = seq.optional_next().unwrap_or(None);
+        let sighash_type: Option<String> = seq.optional_next().unwrap_or(None);
+        rawtx::sign_raw_transaction_with_key(
+            &ctx.chain_state,
+            &hex_tx,
+            &privkeys,
+            prevtxs.as_deref(),
+            sighash_type.as_deref(),
+        )
+        .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
+    })?;
+
     module.register_method("testmempoolaccept", |params, ctx, _extensions| {
         let mut seq = params.sequence();
         let rawtxs: Vec<String> = seq.next().map_err(|e| {
@@ -559,6 +579,7 @@ pub async fn start(
             "getrawmempool", "getrawtransaction", "getrpcinfo", "gettxout",
             "gettxoutsetinfo", "help", "listbanned", "logging", "ping",
             "preciousblock", "savemempool", "sendrawtransaction", "setban",
+            "signrawtransactionwithkey",
             "setnetworkactive", "stop", "submitblock", "submitheader",
             "testmempoolaccept", "uptime", "verifychain",
         ];

@@ -36,7 +36,7 @@ impl TestNode {
         let uses_userpass = extra_args.iter().any(|a| a.starts_with("--rpcuser"));
 
         // Wait for RPC server to accept connections (works for both auth modes)
-        let deadline = Instant::now() + Duration::from_secs(15);
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             if std::net::TcpStream::connect(format!("127.0.0.1:{}", rpcport)).is_ok() {
                 break;

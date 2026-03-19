@@ -164,11 +164,11 @@ for basic regtest mining but not compatible with production mining software.
 
 ### 23. ~~Missing RPCs~~ — PARTIALLY FIXED
 
-73 of ~77 non-wallet Bitcoin Core RPCs are implemented. Notable missing RPCs:
+76 of ~77 non-wallet Bitcoin Core RPCs are implemented. Notable missing RPCs:
 
 - `prioritisetransaction` — fee bumping for miners
-- `signrawtransactionwithkey` — signing without wallet
-- `combinepsbt` / `finalizepsbt` / `utxoupdatepsbt` — PSBT workflow
+- ~~`signrawtransactionwithkey`~~ — FIXED: P2PKH, P2WPKH, P2SH-P2WPKH, P2TR key-path signing
+- ~~`combinepsbt` / `finalizepsbt` / `utxoupdatepsbt`~~ — FIXED (were already implemented)
 - `disconnectnode` — peer management
 
 ### 24. ~~Checksum handling~~ — FIXED
