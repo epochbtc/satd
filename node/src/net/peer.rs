@@ -36,6 +36,8 @@ pub struct PeerInfo {
     pub user_agent: String,
     pub ban_score: u32,
     pub compact_blocks: bool,
+    /// Peer signaled BIP 155 addrv2 support via SendAddrV2.
+    pub wants_addrv2: bool,
     /// Peer's minimum fee rate for tx relay (BIP 133 feefilter), in sat/kvB.
     pub fee_filter: u64,
     pub bytes_sent: u64,
@@ -56,6 +58,7 @@ impl PeerInfo {
             user_agent: String::new(),
             ban_score: 0,
             compact_blocks: false,
+            wants_addrv2: false,
             fee_filter: 0,
             bytes_sent: 0,
             bytes_recv: 0,
