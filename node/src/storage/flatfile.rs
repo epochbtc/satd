@@ -49,6 +49,11 @@ impl FlatFileManager {
         })
     }
 
+    /// Get the blocks directory path.
+    pub fn blocks_dir(&self) -> &Path {
+        &self.blocks_dir
+    }
+
     fn file_path(&self, file_number: u32) -> PathBuf {
         self.blocks_dir
             .join(format!("blk{:05}.dat", file_number))

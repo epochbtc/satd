@@ -1,5 +1,6 @@
 use bitcoin::consensus::serialize;
 use bitcoin::{Block, BlockHash, Network, OutPoint};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, RwLock};
 
@@ -41,6 +42,8 @@ struct ChainTip {
 pub struct ChainState {
     store: Box<dyn Store>,
     flat_files: Mutex<FlatFileManager>,
+    /// Path to the blocks directory, for mutex-free reads.
+    blocks_dir: PathBuf,
     tip: RwLock<ChainTip>,
     pub network: Network,
     script_verifier: Box<dyn ScriptVerifier>,
@@ -61,6 +64,7 @@ impl ChainState {
     ) -> Result<Self, ChainError> {
         let genesis = bitcoin::constants::genesis_block(network);
         let genesis_hash = genesis.block_hash();
+        let blocks_dir = flat_files.blocks_dir().to_path_buf();
 
         let checkpoints = checkpoints::checkpoints_for_network(network);
 
@@ -75,6 +79,7 @@ impl ChainState {
                 return Ok(Self {
                     store,
                     flat_files: Mutex::new(flat_files),
+                    blocks_dir,
                     tip: RwLock::new(ChainTip {
                         hash: tip_hash,
                         height: entry.height,
@@ -104,6 +109,7 @@ impl ChainState {
         Ok(Self {
             store,
             flat_files: Mutex::new(flat_files),
+            blocks_dir,
             tip: RwLock::new(ChainTip {
                 hash: genesis_hash,
                 height: 0,
@@ -266,6 +272,156 @@ impl ChainState {
         };
         let data = self.flat_files.lock().unwrap().read_block(&pos).ok()?;
         bitcoin::consensus::deserialize(&data).ok()
+    }
+
+    /// Read a block from flat files without acquiring the flat_files mutex.
+    /// Safe because read_block() opens a fresh file handle each time.
+    fn read_block_direct(&self, pos: &FlatFilePos) -> Option<Block> {
+        let path = self.blocks_dir.join(format!("blk{:05}.dat", pos.file_number));
+        let mut file = std::fs::File::open(&path).ok()?;
+        use std::io::{Read, Seek, SeekFrom};
+        file.seek(SeekFrom::Start(pos.data_pos as u64)).ok()?;
+        let mut header = [0u8; 8];
+        file.read_exact(&mut header).ok()?;
+        let size = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
+        let mut data = vec![0u8; size];
+        file.read_exact(&mut data).ok()?;
+        bitcoin::consensus::deserialize(&data).ok()
+    }
+
+    /// Store block data to disk without connecting it to the chain.
+    /// Used during parallel IBD: blocks arrive out of order and are stored
+    /// immediately, then connected sequentially later.
+    ///
+    /// Returns `(block_hash, height)` on success.
+    pub fn store_block(&self, block: &Block) -> Result<(BlockHash, u32), ChainError> {
+        let block_hash = block.block_hash();
+
+        // Check for duplicate — skip if already DataStored or Valid
+        if let Some(existing) = self.store.get_block_index(&block_hash) {
+            if existing.status != BlockStatus::HeaderOnly {
+                return Err(ChainError::Duplicate);
+            }
+        }
+
+        // Parent must exist as at least HeaderOnly
+        let prev_hash = block.header.prev_blockhash;
+        let parent = self
+            .store
+            .get_block_index(&prev_hash)
+            .ok_or(ChainError::BadPrevBlock)?;
+
+        let new_height = parent.height + 1;
+
+        // Context-free block validation
+        validation::block::check_block(block)?;
+
+        // PoW validation
+        validation::pow::check_proof_of_work(&block.header)?;
+
+        // Difficulty check
+        let store_ref = &*self.store;
+        validation::pow::check_difficulty(&block.header, &parent, self.network, |h| {
+            let hash = store_ref.get_block_hash_by_height(h)?;
+            store_ref.get_block_index(&hash)
+        })?;
+
+        // Checkpoint validation
+        if !checkpoints::check_against_checkpoints(new_height, &block_hash, &self.checkpoints) {
+            return Err(ChainError::CheckpointMismatch(new_height));
+        }
+
+        // Write raw block to flat file
+        let block_data = serialize(block);
+        let flat_pos = self
+            .flat_files
+            .lock()
+            .unwrap()
+            .write_block(&block_data, network_magic(self.network))
+            .map_err(|e| ChainError::FlatFile(e.to_string()))?;
+
+        // Store block index entry as DataStored
+        let chainwork = add_u256(&parent.chainwork, &work_for_bits(block.header.bits));
+        let entry = BlockIndexEntry {
+            header: block.header,
+            height: new_height,
+            status: BlockStatus::DataStored,
+            num_tx: block.txdata.len() as u32,
+            file_number: flat_pos.file_number,
+            data_pos: flat_pos.data_pos,
+            chainwork,
+        };
+
+        let mut batch = crate::storage::StoreBatch::default();
+        batch.block_index_puts.push((block_hash, entry));
+        // Don't write height_hash_puts here — accept_header already did that
+        self.store.write_batch(batch)?;
+
+        Ok((block_hash, new_height))
+    }
+
+    /// Connect an already-stored block (DataStored) to the chain tip.
+    /// The block's parent must be the current chain tip.
+    ///
+    /// Returns the block hash on success.
+    pub fn connect_stored_block(&self, hash: &BlockHash) -> Result<BlockHash, ChainError> {
+        let entry = self
+            .store
+            .get_block_index(hash)
+            .ok_or(ChainError::BadPrevBlock)?;
+
+        if entry.status != BlockStatus::DataStored {
+            return Err(ChainError::Duplicate);
+        }
+
+        // Parent must be current tip (sequential connection)
+        let current_tip = self.tip_hash();
+        if entry.header.prev_blockhash != current_tip {
+            return Err(ChainError::BadPrevBlock);
+        }
+
+        // Read block from flat file (mutex-free)
+        let flat_pos = FlatFilePos {
+            file_number: entry.file_number,
+            data_pos: entry.data_pos,
+        };
+        let block = self
+            .read_block_direct(&flat_pos)
+            .ok_or(ChainError::FlatFile("failed to read stored block".to_string()))?;
+
+        let parent = self
+            .store
+            .get_block_index(&entry.header.prev_blockhash)
+            .ok_or(ChainError::BadPrevBlock)?;
+
+        // Determine script verifier
+        let use_noop = self.should_skip_scripts(entry.height);
+        let noop = NoopVerifier;
+        let verifier: &dyn ScriptVerifier = if use_noop { &noop } else { &*self.script_verifier };
+
+        // Connect block
+        let mtp = self.get_median_time_past(entry.height);
+        let batch = connect::connect_block(
+            &*self.store,
+            &block,
+            entry.height,
+            &parent.chainwork,
+            flat_pos,
+            verifier,
+            mtp,
+        )?;
+
+        // Atomic commit
+        self.store.write_batch(batch)?;
+
+        // Update in-memory tip
+        {
+            let mut tip = self.tip.write().unwrap();
+            tip.hash = *hash;
+            tip.height = entry.height;
+        }
+
+        Ok(*hash)
     }
 
     /// Accept a new block into the chain.
