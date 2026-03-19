@@ -531,11 +531,32 @@ impl PeerManager {
                 for pid in &peer_ids {
                     self.request_missing_blocks(*pid);
                 }
-                // Request headers less frequently
-                if ticks.is_multiple_of(20) {
-                    for pid in &peer_ids {
-                        self.send_to_peer(*pid, sync::make_getheaders(&self.chain_state));
-                    }
+            }
+
+            // Request headers: during IBD, request every 4 ticks (2s) from a few peers.
+            // Requesting from ALL peers floods them and triggers rate limits.
+            if self.is_ibd() && ticks.is_multiple_of(4) {
+                let peer_ids: Vec<PeerId> = {
+                    let peers = self.peers.read().unwrap();
+                    peers.iter()
+                        .filter(|(_, h)| h.info.state == PeerState::Connected)
+                        .map(|(id, _)| *id)
+                        .take(3)
+                        .collect()
+                };
+                for pid in &peer_ids {
+                    self.send_to_peer(*pid, sync::make_getheaders(&self.chain_state));
+                }
+            } else if !self.is_ibd() && ticks.is_multiple_of(20) {
+                let peer_ids: Vec<PeerId> = {
+                    let peers = self.peers.read().unwrap();
+                    peers.iter()
+                        .filter(|(_, h)| h.info.state == PeerState::Connected)
+                        .map(|(id, _)| *id)
+                        .collect()
+                };
+                for pid in &peer_ids {
+                    self.send_to_peer(*pid, sync::make_getheaders(&self.chain_state));
                 }
             }
 
@@ -759,6 +780,9 @@ impl PeerManager {
             match self.chain_state.accept_header(header) {
                 Ok(_) => {
                     accepted += 1;
+                }
+                Err(crate::chain::state::ChainError::Duplicate) => {
+                    // Already known — skip silently
                 }
                 Err(e) => {
                     self.add_ban_score(id, 20, &format!("Header rejected: {}", e));
@@ -1038,7 +1062,24 @@ impl PeerManager {
             let next_height = tip_height + 1;
 
             if next_height > target_height {
-                // IBD complete
+                // Check if more headers have arrived since we started
+                let headers_tip = chain_state.headers_tip_height();
+                if headers_tip > target_height + 24 {
+                    // More headers available — create a new scheduler for the next batch
+                    tracing::info!(
+                        height = tip_height,
+                        blocks = connected_count,
+                        new_target = headers_tip,
+                        elapsed_secs = start_time.elapsed().as_secs(),
+                        "IBD batch complete, starting next batch"
+                    );
+                    let new_sched = IbdScheduler::new(headers_tip, tip_height, chain_state);
+                    *ibd.write().unwrap() = Some(new_sched);
+                    connected_count = 0;
+                    // The run() loop will detect has_ibd=true within 2s and assign peers
+                    continue;
+                }
+                // Truly done
                 tracing::info!(
                     height = tip_height,
                     blocks = connected_count,

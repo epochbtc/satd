@@ -42,7 +42,7 @@ pub fn get_blockchain_info(chain_state: &ChainState) -> Value {
     json!({
         "chain": chain,
         "blocks": tip_height,
-        "headers": tip_height,
+        "headers": chain_state.headers_tip_height().max(tip_height),
         "bestblockhash": tip_hash.to_string(),
         "difficulty": difficulty,
         "time": time,

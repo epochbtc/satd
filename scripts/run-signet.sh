@@ -18,8 +18,8 @@ if ss -tln | grep -q ":${SIGNET_P2P_PORT} "; then
     CONNECT_ARGS+=(--connect "127.0.0.1:${SIGNET_P2P_PORT}")
 fi
 
-# Resolve DNS seed and add up to 8 external peers
-mapfile -t PEERS < <(dig +short "$SIGNET_DNS_SEED" 2>/dev/null | head -8)
+# Resolve DNS seed and add external peers (satd connects to up to 64 during IBD)
+mapfile -t PEERS < <(dig +short "$SIGNET_DNS_SEED" 2>/dev/null)
 for ip in "${PEERS[@]}"; do
     [[ -n "$ip" ]] && CONNECT_ARGS+=(--connect "${ip}:${SIGNET_P2P_PORT}")
 done
