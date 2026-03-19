@@ -204,7 +204,7 @@ async fn main() {
     if config.connect.is_empty() {
         let dns_addrs =
             node::net::dns::resolve_dns_seeds(config.network).await;
-        let max_dns_outbound = 8;
+        let max_dns_outbound = 64;
         for addr in dns_addrs.into_iter().take(max_dns_outbound) {
             peer_manager.add_connect_addr(addr);
             let pm = peer_manager.clone();

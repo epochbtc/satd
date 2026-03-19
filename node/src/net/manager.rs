@@ -20,6 +20,7 @@ use crate::net::peer::{Direction, PeerId, PeerInfo, PeerState};
 use crate::net::sync;
 
 const MAX_OUTBOUND: usize = 8;
+const MAX_OUTBOUND_IBD: usize = 64;
 const MAX_INBOUND: usize = 117;
 const BAN_THRESHOLD: u32 = 100;
 const BAN_DURATION_SECS: u64 = 86400; // 24 hours
@@ -173,6 +174,7 @@ impl PeerManager {
     /// Connect to an outbound peer.
     pub async fn connect_outbound(self: &Arc<Self>, addr: SocketAddr) -> Result<(), String> {
         {
+            let max_outbound = if self.is_ibd() { MAX_OUTBOUND_IBD } else { MAX_OUTBOUND };
             let peers = self.peers.read().unwrap();
             let outbound_count = peers
                 .values()
@@ -181,7 +183,7 @@ impl PeerManager {
                         && h.info.state == PeerState::Connected
                 })
                 .count();
-            if outbound_count >= MAX_OUTBOUND {
+            if outbound_count >= max_outbound {
                 return Err("max outbound connections reached".to_string());
             }
         }
@@ -469,10 +471,10 @@ impl PeerManager {
                 self.mempool.remove_expired();
             }
 
-            // Every 20 ticks (10 seconds), check peers
+            // Every 20 ticks (10 seconds), check peers and connect to more during IBD
             if ticks.is_multiple_of(20) {
-                // Auto-reconnect if no peers connected
-                if self.connection_count() == 0 {
+                let need_peers = self.connection_count() == 0 || self.is_ibd();
+                if need_peers {
                     let addrs = self.connect_addrs.read().unwrap().clone();
                     let now = Instant::now();
 
@@ -599,8 +601,6 @@ impl PeerManager {
             }
             NetworkMessage::Addr(addrs) => {
                 tracing::debug!(id, count = addrs.len(), "Received addr");
-                // Log received addresses; actual connection happens via connect_addrs
-                // and the reconnect loop. Store for future peer discovery.
                 for (_, addr) in &addrs {
                     if let Ok(sock_addr) = addr.socket_addr()
                         && !self.is_addr_connected(&sock_addr)
