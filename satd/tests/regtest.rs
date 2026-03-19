@@ -835,6 +835,40 @@ fn test_block_sync_between_nodes() {
 }
 
 #[test]
+fn test_parallel_ibd() {
+    let p2p_port_a = find_available_port();
+    let mut node_a = TestNode::start(&[&format!("--port={}", p2p_port_a)]);
+
+    // Mine 200 blocks on node A — enough to trigger IBD path (tip + 24 < headers_tip)
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    node_a
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(200), serde_json::json!(addr)],
+        )
+        .unwrap();
+    assert_eq!(get_rpc_u64(&node_a, "getblockcount").unwrap(), 200);
+
+    // Start node B connected to A — should use parallel IBD
+    let mut node_b = TestNode::start(&[&format!("--connect=127.0.0.1:{}", p2p_port_a)]);
+
+    // Wait for B to sync all 200 blocks (generous timeout for regtest)
+    poll_until(
+        || get_rpc_u64(&node_b, "getblockcount").unwrap_or(0) >= 200,
+        Duration::from_secs(60),
+        "node B did not sync to height 200 via parallel IBD",
+    );
+
+    // Verify both nodes agree on the best block
+    let a_hash = get_rpc_str(&node_a, "getbestblockhash").unwrap();
+    let b_hash = get_rpc_str(&node_b, "getbestblockhash").unwrap();
+    assert_eq!(a_hash, b_hash, "nodes should agree on best block after parallel IBD");
+
+    node_b.stop();
+    node_a.stop();
+}
+
+#[test]
 fn test_block_propagation() {
     let p2p_port_a = find_available_port();
     let mut node_a = TestNode::start(&[&format!("--port={}", p2p_port_a)]);

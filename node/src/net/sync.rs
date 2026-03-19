@@ -6,9 +6,10 @@ use bitcoin::BlockHash;
 use crate::chain::state::ChainState;
 
 /// Build a block locator for getheaders messages.
+/// Uses the highest header height (not block tip) so headers can run ahead of blocks during IBD.
 /// Returns hashes at heights: tip, tip-1, ..., tip-10, then exponentially spaced.
 pub fn build_locator(chain_state: &ChainState) -> Vec<BlockHash> {
-    let tip_height = chain_state.tip_height();
+    let tip_height = chain_state.headers_tip_height().max(chain_state.tip_height());
     let mut locator = Vec::new();
     let mut step = 1u32;
     let mut height = tip_height as i64;

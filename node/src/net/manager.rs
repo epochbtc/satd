@@ -6,7 +6,7 @@ use bitcoin::Network;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Condvar, RwLock};
 use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -16,10 +16,12 @@ use crate::mempool::fee::FeeEstimator;
 use crate::mempool::pool::Mempool;
 use crate::net::compact;
 use crate::net::connection::{Connection, ConnectionWriter};
+use crate::net::ibd::IbdScheduler;
 use crate::net::peer::{Direction, PeerId, PeerInfo, PeerState};
 use crate::net::sync;
 
 const MAX_OUTBOUND: usize = 8;
+const MAX_OUTBOUND_IBD: usize = 64;
 const MAX_INBOUND: usize = 117;
 const BAN_THRESHOLD: u32 = 100;
 const BAN_DURATION_SECS: u64 = 86400; // 24 hours
@@ -109,6 +111,10 @@ pub struct PeerManager {
     /// Prune target in MB (0 = disabled).
     #[allow(dead_code)]
     prune_target_mb: u64,
+    /// IBD scheduler for parallel block download (shared with connect thread).
+    ibd: Arc<std::sync::RwLock<Option<IbdScheduler>>>,
+    /// Signal to wake the connect thread when a block is stored.
+    connect_signal: Arc<(std::sync::Mutex<bool>, Condvar)>,
 }
 
 impl PeerManager {
@@ -132,6 +138,33 @@ impl PeerManager {
     ) -> Arc<Self> {
         let (event_tx, event_rx) = mpsc::channel(4096);
         let (block_tx, block_rx) = mpsc::unbounded_channel();
+        let connect_signal = Arc::new((std::sync::Mutex::new(false), Condvar::new()));
+
+        // Check for IBD resume: if headers are ahead of tip, create scheduler
+        let tip_height = chain_state.tip_height();
+        let headers_tip_height = chain_state.headers_tip_height();
+        let ibd_scheduler = if headers_tip_height > tip_height + 24 {
+            let mut sched = IbdScheduler::new(headers_tip_height, tip_height, &chain_state);
+            // Scan for already-downloaded blocks (crash-resume)
+            for h in (tip_height + 1)..=headers_tip_height {
+                if let Some(hash) = chain_state.get_block_hash_by_height(h)
+                    && chain_state.has_block_data(&hash)
+                {
+                    sched.mark_downloaded(h);
+                }
+            }
+            let (dl, _inf, pend, _) = sched.progress();
+            tracing::info!(
+                target_height = headers_tip_height,
+                already_downloaded = dl,
+                pending = pend,
+                "Resuming IBD with parallel scheduler"
+            );
+            Some(sched)
+        } else {
+            None
+        };
+        let ibd = Arc::new(std::sync::RwLock::new(ibd_scheduler));
 
         let mgr = Arc::new(Self {
             peers: RwLock::new(HashMap::new()),
@@ -151,6 +184,8 @@ impl PeerManager {
             banned_addrs: RwLock::new(HashMap::new()),
             shutdown,
             prune_target_mb,
+            ibd: ibd.clone(),
+            connect_signal: connect_signal.clone(),
         });
 
         // Spawn block processing thread
@@ -159,7 +194,7 @@ impl PeerManager {
         let fe = fee_estimator;
         let prune_mb = prune_target_mb;
         std::thread::spawn(move || {
-            Self::block_processor(block_rx, cs, mp, fe, prune_mb);
+            Self::block_processor(block_rx, cs, mp, fe, prune_mb, connect_signal, ibd);
         });
 
         mgr
@@ -173,6 +208,7 @@ impl PeerManager {
     /// Connect to an outbound peer.
     pub async fn connect_outbound(self: &Arc<Self>, addr: SocketAddr) -> Result<(), String> {
         {
+            let max_outbound = if self.is_ibd() { MAX_OUTBOUND_IBD } else { MAX_OUTBOUND };
             let peers = self.peers.read().unwrap();
             let outbound_count = peers
                 .values()
@@ -181,7 +217,7 @@ impl PeerManager {
                         && h.info.state == PeerState::Connected
                 })
                 .count();
-            if outbound_count >= MAX_OUTBOUND {
+            if outbound_count >= max_outbound {
                 return Err("max outbound connections reached".to_string());
             }
         }
@@ -442,8 +478,49 @@ impl PeerManager {
                 }
             }
 
+            // IBD scheduler maintenance
+            let has_ibd = self.ibd.read().unwrap().is_some();
+            if has_ibd {
+                // Every 4 ticks (2s): stall detection and reassignment
+                if ticks.is_multiple_of(4) {
+                    let stalled = {
+                        let mut ibd = self.ibd.write().unwrap();
+                        if let Some(scheduler) = ibd.as_mut() {
+                            scheduler.detect_stalls(Duration::from_secs(60))
+                        } else {
+                            Vec::new()
+                        }
+                    };
+                    for peer_id in stalled {
+                        tracing::debug!(peer_id, "IBD: peer stalled, reassigning blocks");
+                    }
+                    // Assign work to any idle peers
+                    self.assign_all_peers();
+                }
+
+                // Every 20 ticks (10s): progress logging
+                if ticks.is_multiple_of(20) {
+                    let (dl, inf, pend, target) = {
+                        let ibd = self.ibd.read().unwrap();
+                        ibd.as_ref()
+                            .map(|s| s.progress())
+                            .unwrap_or((0, 0, 0, 0))
+                    };
+                    let peers_active = self.connection_count();
+                    tracing::info!(
+                        "IBD download: {}/{} stored, {} in-flight, {} pending, {} peers",
+                        dl + (target as usize - dl - inf - pend),
+                        target,
+                        inf,
+                        pend,
+                        peers_active
+                    );
+                }
+            }
+
             // Request blocks: immediately on tip advance, or every 10 ticks as fallback
-            if tip_advanced || ticks.is_multiple_of(10) {
+            // Skip during IBD swarming — the scheduler handles block requests
+            if !has_ibd && (tip_advanced || ticks.is_multiple_of(10)) {
                 let peer_ids: Vec<PeerId> = {
                     let peers = self.peers.read().unwrap();
                     peers.iter()
@@ -469,10 +546,10 @@ impl PeerManager {
                 self.mempool.remove_expired();
             }
 
-            // Every 20 ticks (10 seconds), check peers
+            // Every 20 ticks (10 seconds), check peers and connect to more during IBD
             if ticks.is_multiple_of(20) {
-                // Auto-reconnect if no peers connected
-                if self.connection_count() == 0 {
+                let need_peers = self.connection_count() == 0 || self.is_ibd();
+                if need_peers {
                     let addrs = self.connect_addrs.read().unwrap().clone();
                     let now = Instant::now();
 
@@ -530,17 +607,24 @@ impl PeerManager {
     }
 
     fn handle_peer_connected(&self, id: PeerId, version: VersionMessage) {
-        let mut peers = self.peers.write().unwrap();
-        if let Some(handle) = peers.get_mut(&id) {
-            handle.info.set_version(version);
-            handle.info.state = PeerState::Connected;
-            tracing::info!(
-                id,
-                addr = %handle.info.addr,
-                user_agent = %handle.info.user_agent,
-                height = handle.info.best_height,
-                "Peer connected"
-            );
+        {
+            let mut peers = self.peers.write().unwrap();
+            if let Some(handle) = peers.get_mut(&id) {
+                handle.info.set_version(version);
+                handle.info.state = PeerState::Connected;
+                tracing::info!(
+                    id,
+                    addr = %handle.info.addr,
+                    user_agent = %handle.info.user_agent,
+                    height = handle.info.best_height,
+                    "Peer connected"
+                );
+            }
+        }
+        // Assign IBD work to the new peer
+        let has_ibd = self.ibd.read().unwrap().is_some();
+        if has_ibd {
+            self.assign_peer_work(id);
         }
     }
 
@@ -548,6 +632,12 @@ impl PeerManager {
         let mut peers = self.peers.write().unwrap();
         if let Some(handle) = peers.remove(&id) {
             tracing::info!(id, addr = %handle.info.addr, "Peer disconnected");
+        }
+        drop(peers);
+        // Notify IBD scheduler so in-flight blocks get reassigned
+        let mut ibd = self.ibd.write().unwrap();
+        if let Some(scheduler) = ibd.as_mut() {
+            scheduler.peer_disconnected(id);
         }
     }
 
@@ -599,8 +689,6 @@ impl PeerManager {
             }
             NetworkMessage::Addr(addrs) => {
                 tracing::debug!(id, count = addrs.len(), "Received addr");
-                // Log received addresses; actual connection happens via connect_addrs
-                // and the reconnect loop. Store for future peer discovery.
                 for (_, addr) in &addrs {
                     if let Ok(sock_addr) = addr.socket_addr()
                         && !self.is_addr_connected(&sock_addr)
@@ -667,7 +755,6 @@ impl PeerManager {
         }
 
         let mut accepted = 0;
-        let _max_height = 0u32;
         for header in &headers {
             match self.chain_state.accept_header(header) {
                 Ok(_) => {
@@ -681,22 +768,131 @@ impl PeerManager {
         }
 
         if accepted > 0 {
-            // Update headers tip tracking
-            // We don't know exact height here, estimate from accept_header
-            let htip = self.headers_tip.load(Ordering::Relaxed) + accepted as u64;
+            // Update headers tip tracking from actual chain state
+            let htip = self.chain_state.headers_tip_height() as u64;
             self.headers_tip.store(htip, Ordering::Relaxed);
 
             tracing::debug!(id, accepted, headers_tip = htip, "Headers accepted");
 
-            // Request more headers
-            self.send_to_peer(id, sync::make_getheaders(&self.chain_state));
+            // Request more headers if peer sent a full batch
+            if headers.len() >= 2000 {
+                self.send_to_peer(id, sync::make_getheaders(&self.chain_state));
+                // During header download, request from other peers too for redundancy
+                let peer_ids: Vec<PeerId> = {
+                    let peers = self.peers.read().unwrap();
+                    peers.iter()
+                        .filter(|(pid, h)| **pid != id && h.info.state == PeerState::Connected)
+                        .map(|(pid, _)| *pid)
+                        .take(3)
+                        .collect()
+                };
+                for pid in peer_ids {
+                    self.send_to_peer(pid, sync::make_getheaders(&self.chain_state));
+                }
+            } else {
+                // Headers complete (peer sent < 2000) — check if we should start swarming
+                let tip = self.chain_state.tip_height();
+                let headers_tip = htip as u32;
+                if headers_tip > tip + 24 {
+                    let mut ibd = self.ibd.write().unwrap();
+                    if ibd.is_none() {
+                        let sched = IbdScheduler::new(headers_tip, tip, &self.chain_state);
+                        let (_, _, pending, target) = sched.progress();
+                        tracing::info!(
+                            target_height = target,
+                            blocks_to_download = pending,
+                            "Headers complete, starting swarm download"
+                        );
+                        *ibd = Some(sched);
+                        drop(ibd);
+                        // Wake the block processor thread so it enters IBD mode
+                        let (lock, cvar) = &*self.connect_signal;
+                        *lock.lock().unwrap() = true;
+                        cvar.notify_one();
+                        // Assign work to all connected peers
+                        self.assign_all_peers();
+                    }
+                }
+            }
 
-            // Immediately request blocks if we have none in flight
-            self.request_missing_blocks(id);
+            // Request blocks (legacy path for non-IBD or fallback)
+            let has_ibd = self.ibd.read().unwrap().is_some();
+            if !has_ibd {
+                self.request_missing_blocks(id);
+            }
         }
     }
 
-    fn handle_block(&self, _id: PeerId, block: bitcoin::Block) {
+    /// Assign download work to all connected peers during IBD.
+    fn assign_all_peers(&self) {
+        let peer_ids: Vec<PeerId> = {
+            let peers = self.peers.read().unwrap();
+            peers.iter()
+                .filter(|(_, h)| h.info.state == PeerState::Connected)
+                .map(|(id, _)| *id)
+                .collect()
+        };
+        for pid in peer_ids {
+            self.assign_peer_work(pid);
+        }
+    }
+
+    /// Assign IBD download work to a specific peer.
+    fn assign_peer_work(&self, peer_id: PeerId) {
+        let mut ibd = self.ibd.write().unwrap();
+        if let Some(scheduler) = ibd.as_mut() {
+            scheduler.register_peer(peer_id);
+            let hashes = scheduler.assign_blocks(peer_id);
+            if !hashes.is_empty() {
+                drop(ibd);
+                for chunk in hashes.chunks(128) {
+                    self.send_to_peer(peer_id, sync::make_getdata_blocks(chunk));
+                }
+            }
+        }
+    }
+
+    fn handle_block(&self, id: PeerId, block: bitcoin::Block) {
+        // Check if IBD scheduler is active
+        let has_ibd = self.ibd.read().unwrap().is_some();
+        if has_ibd {
+            let hash = block.block_hash();
+            match self.chain_state.store_block(&block) {
+                Ok((_, height)) => {
+                    let needs_more = {
+                        let mut ibd = self.ibd.write().unwrap();
+                        if let Some(scheduler) = ibd.as_mut() {
+                            scheduler.block_received(id, height)
+                        } else {
+                            false
+                        }
+                    };
+                    // Wake connect thread
+                    let (lock, cvar) = &*self.connect_signal;
+                    *lock.lock().unwrap() = true;
+                    cvar.notify_one();
+                    // Assign more work if peer has capacity
+                    if needs_more {
+                        self.assign_peer_work(id);
+                    }
+                }
+                Err(crate::chain::state::ChainError::Duplicate) => {
+                    // Already have it, mark in scheduler anyway
+                    if let Some(entry) = self.chain_state.get_block_index(&hash) {
+                        let mut ibd = self.ibd.write().unwrap();
+                        if let Some(scheduler) = ibd.as_mut() {
+                            scheduler.block_received(id, entry.height);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(%hash, "IBD block store failed: {}", e);
+                    self.add_ban_score(id, 10, &format!("block rejected: {}", e));
+                }
+            }
+            return;
+        }
+        // Normal mode
         let _ = self.block_tx.send(block);
     }
 
@@ -708,68 +904,233 @@ impl PeerManager {
         mempool: Arc<Mempool>,
         fee_estimator: Arc<FeeEstimator>,
         prune_target_mb: u64,
+        connect_signal: Arc<(std::sync::Mutex<bool>, Condvar)>,
+        ibd: Arc<std::sync::RwLock<Option<IbdScheduler>>>,
     ) {
-        let mut block_buffer: HashMap<bitcoin::BlockHash, bitcoin::Block> = HashMap::new();
         let mut last_log_height: u32 = 0;
         let mut last_prune_height: u32 = 0;
 
         // Compute keep_blocks from prune target.
-        // Average block size ~1.5 MB for mainnet, ~0.01 MB for signet/regtest.
-        // Conservative: assume 2 MB per block.
         let keep_blocks: u32 = if prune_target_mb > 0 {
             ((prune_target_mb * 1_000_000 / (2 * 1_000_000)) as u32).max(288)
         } else {
             0
         };
 
-        while let Some(block) = rx.blocking_recv() {
-            let hash = block.block_hash();
-            match chain_state.accept_block(&block) {
-                Ok(_) => {
-                    Self::record_block_fees(&block, &chain_state, &fee_estimator);
-                    mempool.remove_for_block(&block);
-                    // Drain buffer
-                    loop {
-                        let tip = chain_state.tip_hash();
-                        match block_buffer.remove(&tip) {
-                            Some(b) => {
-                                match chain_state.accept_block(&b) {
-                                    Ok(_) => {
-                                        Self::record_block_fees(&b, &chain_state, &fee_estimator);
-                                        mempool.remove_for_block(&b);
-                                    }
-                                    Err(_) => break,
-                                }
-                            }
-                            None => break,
-                        }
-                    }
-                    let height = chain_state.tip_height();
-                    if height / 1000 > last_log_height / 1000 {
-                        tracing::info!(height, buffered = block_buffer.len(), "IBD progress");
-                        last_log_height = height;
-                    }
+        // IBD connect loop: walk from tip forward, connecting stored blocks
+        if ibd.read().unwrap().is_some() {
+            Self::ibd_connect_loop(
+                &chain_state,
+                &fee_estimator,
+                &connect_signal,
+                &ibd,
+                keep_blocks,
+                &mut last_log_height,
+                &mut last_prune_height,
+            );
+        }
 
-                    // Periodic pruning during IBD
-                    if keep_blocks > 0 && height > keep_blocks
-                        && height / 1000 > last_prune_height / 1000
-                    {
-                        let deleted = chain_state.prune_blocks(keep_blocks);
-                        if deleted > 0 {
-                            tracing::info!(height, deleted, "Pruned old block files");
+        // Normal mode: process blocks from the channel.
+        // Periodically check if the IBD scheduler was activated (header download completed
+        // while we were in normal mode), and switch to the IBD connect loop if so.
+        let mut block_buffer: HashMap<bitcoin::BlockHash, bitcoin::Block> = HashMap::new();
+        loop {
+            // Check if IBD scheduler was activated
+            if ibd.read().unwrap().is_some() {
+                Self::ibd_connect_loop(
+                    &chain_state,
+                    &fee_estimator,
+                    &connect_signal,
+                    &ibd,
+                    keep_blocks,
+                    &mut last_log_height,
+                    &mut last_prune_height,
+                );
+                continue;
+            }
+
+            // Wait for a block from the channel, but wake up periodically
+            // to check for IBD scheduler activation
+            let (lock, cvar) = &*connect_signal;
+            let mut ready = lock.lock().unwrap();
+            *ready = false;
+            // Wait up to 500ms — will be woken immediately if a block is stored
+            let _ = cvar.wait_timeout(ready, Duration::from_millis(500));
+
+            // Drain all available blocks from the channel
+            while let Ok(block) = rx.try_recv() {
+                let hash = block.block_hash();
+                match chain_state.accept_block(&block) {
+                    Ok(_) => {
+                        Self::record_block_fees(&block, &chain_state, &fee_estimator);
+                        mempool.remove_for_block(&block);
+                        // Drain buffer
+                        loop {
+                            let tip = chain_state.tip_hash();
+                            match block_buffer.remove(&tip) {
+                                Some(b) => {
+                                    match chain_state.accept_block(&b) {
+                                        Ok(_) => {
+                                            Self::record_block_fees(&b, &chain_state, &fee_estimator);
+                                            mempool.remove_for_block(&b);
+                                        }
+                                        Err(_) => break,
+                                    }
+                                }
+                                None => break,
+                            }
                         }
-                        last_prune_height = height;
+                        let height = chain_state.tip_height();
+                        if height / 1000 > last_log_height / 1000 {
+                            tracing::info!(height, buffered = block_buffer.len(), "IBD progress");
+                            last_log_height = height;
+                        }
+
+                        // Periodic pruning
+                        if keep_blocks > 0 && height > keep_blocks
+                            && height / 1000 > last_prune_height / 1000
+                        {
+                            let deleted = chain_state.prune_blocks(keep_blocks);
+                            if deleted > 0 {
+                                tracing::info!(height, deleted, "Pruned old block files");
+                            }
+                            last_prune_height = height;
+                        }
+                    }
+                    Err(crate::chain::state::ChainError::Duplicate) => {}
+                    Err(crate::chain::state::ChainError::BadPrevBlock) => {
+                        if block_buffer.len() < 8192 {
+                            block_buffer.insert(block.header.prev_blockhash, block);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(%hash, "Block rejected: {}", e);
                     }
                 }
-                Err(crate::chain::state::ChainError::Duplicate) => {}
-                Err(crate::chain::state::ChainError::BadPrevBlock) => {
-                    if block_buffer.len() < 8192 {
-                        block_buffer.insert(block.header.prev_blockhash, block);
+            }
+        }
+    }
+
+    /// IBD connect loop: sequentially connect stored blocks from tip forward.
+    /// Sleeps (via condvar) when the next block isn't downloaded yet.
+    fn ibd_connect_loop(
+        chain_state: &ChainState,
+        fee_estimator: &FeeEstimator,
+        connect_signal: &Arc<(std::sync::Mutex<bool>, Condvar)>,
+        ibd: &Arc<std::sync::RwLock<Option<IbdScheduler>>>,
+        keep_blocks: u32,
+        last_log_height: &mut u32,
+        last_prune_height: &mut u32,
+    ) {
+        let mut connected_count = 0u64;
+        let start_time = Instant::now();
+
+        loop {
+            let target_height = {
+                let sched = ibd.read().unwrap();
+                match sched.as_ref() {
+                    Some(s) => s.target_height(),
+                    None => break, // Scheduler cleared
+                }
+            };
+
+            let tip_height = chain_state.tip_height();
+            let next_height = tip_height + 1;
+
+            if next_height > target_height {
+                // IBD complete
+                tracing::info!(
+                    height = tip_height,
+                    blocks = connected_count,
+                    elapsed_secs = start_time.elapsed().as_secs(),
+                    "IBD complete"
+                );
+                *ibd.write().unwrap() = None;
+                break;
+            }
+
+            let hash = match chain_state.get_block_hash_by_height(next_height) {
+                Some(h) => h,
+                None => {
+                    // No header for this height yet — wait
+                    let (lock, cvar) = &**connect_signal;
+                    let mut ready = lock.lock().unwrap();
+                    *ready = false;
+                    let _ = cvar.wait_timeout(ready, Duration::from_secs(1));
+                    continue;
+                }
+            };
+
+            if chain_state.has_block_data(&hash) {
+                // Block is stored (DataStored or Valid), try to connect
+                match chain_state.connect_stored_block(&hash) {
+                    Ok(_) => {
+                        connected_count += 1;
+                        // Update scheduler connect cursor
+                        {
+                            let mut sched = ibd.write().unwrap();
+                            if let Some(s) = sched.as_mut() {
+                                s.connect_cursor_advanced(next_height);
+                            }
+                        }
+                        // Record fees
+                        if let Some(block) = chain_state.get_block(&hash) {
+                            Self::record_block_fees(&block, chain_state, fee_estimator);
+                        }
+                        // Log progress
+                        if next_height / 1000 > *last_log_height / 1000 {
+                            let elapsed = start_time.elapsed().as_secs().max(1);
+                            let rate = connected_count / elapsed;
+                            let (dl, inf, pend, _) = {
+                                let sched = ibd.read().unwrap();
+                                sched.as_ref()
+                                    .map(|s| s.progress())
+                                    .unwrap_or((0, 0, 0, 0))
+                            };
+                            tracing::info!(
+                                height = next_height,
+                                "IBD: {}/{} connected, {} downloaded ahead, {} in-flight, {} pending ({} blk/s)",
+                                next_height,
+                                target_height,
+                                dl,
+                                inf,
+                                pend,
+                                rate
+                            );
+                            *last_log_height = next_height;
+                        }
+                        // Periodic pruning
+                        if keep_blocks > 0 && next_height > keep_blocks
+                            && next_height / 1000 > *last_prune_height / 1000
+                        {
+                            let deleted = chain_state.prune_blocks(keep_blocks);
+                            if deleted > 0 {
+                                tracing::info!(height = next_height, deleted, "Pruned old block files");
+                            }
+                            *last_prune_height = next_height;
+                        }
+                        continue; // Immediately try next block
+                    }
+                    Err(crate::chain::state::ChainError::Duplicate) => {
+                        // Already connected (shouldn't happen but harmless)
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(height = next_height, %hash, "Connect stored block failed: {}", e);
+                        // Wait and retry — might be a transient issue
+                        let (lock, cvar) = &**connect_signal;
+                        let mut ready = lock.lock().unwrap();
+                        *ready = false;
+                        let _ = cvar.wait_timeout(ready, Duration::from_secs(1));
+                        continue;
                     }
                 }
-                Err(e) => {
-                    tracing::warn!(%hash, "Block rejected: {}", e);
-                }
+            } else {
+                // Next block not downloaded yet — wait for signal
+                let (lock, cvar) = &**connect_signal;
+                let mut ready = lock.lock().unwrap();
+                *ready = false;
+                let _ = cvar.wait_timeout(ready, Duration::from_secs(1));
             }
         }
     }
