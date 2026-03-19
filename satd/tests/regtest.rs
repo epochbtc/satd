@@ -35,10 +35,13 @@ impl TestNode {
         // Check if using user/pass auth (no cookie file expected)
         let uses_userpass = extra_args.iter().any(|a| a.starts_with("--rpcuser"));
 
-        // Wait for RPC server to accept connections (works for both auth modes)
+        // Wait for RPC server to be fully ready
         let deadline = Instant::now() + Duration::from_secs(30);
+        let cookie_path = datadir.join("regtest").join(".cookie");
         loop {
-            if std::net::TcpStream::connect(format!("127.0.0.1:{}", rpcport)).is_ok() {
+            let port_open = std::net::TcpStream::connect(format!("127.0.0.1:{}", rpcport)).is_ok();
+            let cookie_ready = uses_userpass || cookie_path.exists();
+            if port_open && cookie_ready {
                 break;
             }
             if Instant::now() >= deadline {
@@ -47,11 +50,9 @@ impl TestNode {
             std::thread::sleep(Duration::from_millis(100));
         }
 
-        // Read cookie file if not using user/pass auth
         let cookie = if uses_userpass {
             String::new()
         } else {
-            let cookie_path = datadir.join("regtest").join(".cookie");
             std::fs::read_to_string(&cookie_path).expect("Failed to read cookie file")
         };
 
