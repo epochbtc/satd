@@ -16,6 +16,7 @@ pub struct Config {
     pub port: u16,
     pub connect: Vec<String>,
     pub assumevalid: Option<String>,
+    pub assumevalidage: u64,
     // Mempool policy
     pub mempoolfullrbf: bool,
     pub maxmempool: usize,
@@ -130,6 +131,11 @@ impl Config {
 
         let assumevalid = cli.assumevalid.or_else(|| file_get("assumevalid"));
 
+        let assumevalidage = cli
+            .assumevalidage
+            .or_else(|| file_get("assumevalidage").and_then(|v| v.parse().ok()))
+            .unwrap_or(86400); // default: 24 hours
+
         // Mempool policy: CLI > config file > defaults
         let mempoolfullrbf = cli
             .mempoolfullrbf
@@ -212,6 +218,7 @@ impl Config {
             port,
             connect,
             assumevalid,
+            assumevalidage,
             mempoolfullrbf,
             maxmempool,
             minrelaytxfee,
@@ -276,8 +283,11 @@ pub struct CliArgs {
     #[arg(long, value_name = "ADDR", help = "Connect to specific peer")]
     pub connect: Vec<String>,
 
-    #[arg(long, value_name = "HASH", help = "Assume blocks up to this hash are valid (skip script verification)")]
+    #[arg(long, value_name = "HASH", help = "Skip script verification up to HASH (default: per-network hash, 0=verify all, all=skip old blocks)")]
     pub assumevalid: Option<String>,
+
+    #[arg(long, value_name = "SECS", help = "With --assumevalid=all, verify scripts for blocks newer than SECS (default: 86400)")]
+    pub assumevalidage: Option<u64>,
 
     // Mempool policy flags (Bitcoin Core compatible + extensions)
     #[arg(long, value_name = "BOOL", help = "Enable full replace-by-fee (default: true)")]
@@ -334,6 +344,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "port",
         "connect",
         "assumevalid",
+        "assumevalidage",
         "mempoolfullrbf",
         "maxmempool",
         "minrelaytxfee",
@@ -531,6 +542,7 @@ rpcport=8332
             port: None,
             connect: vec![],
             assumevalid: None,
+            assumevalidage: None,
             mempoolfullrbf: None,
             maxmempool: None,
             minrelaytxfee: None,
@@ -566,6 +578,7 @@ rpcport=8332
             port: None,
             connect: vec![],
             assumevalid: None,
+            assumevalidage: None,
             mempoolfullrbf: None,
             maxmempool: None,
             minrelaytxfee: None,

@@ -13,6 +13,55 @@ use crate::storage::{Store, StoreError};
 use crate::validation;
 use crate::validation::script::{NoopVerifier, ScriptVerifier};
 
+/// Controls script verification skipping during IBD.
+/// Matches Bitcoin Core's `--assumevalid` semantics as a superset.
+#[derive(Debug, Clone)]
+pub enum AssumeValid {
+    /// Verify all scripts (equivalent to `--assumevalid=0`).
+    Disabled,
+    /// Skip script verification for blocks at or below the given hash.
+    /// The hash must appear in the block index before skipping takes effect.
+    Hash(BlockHash),
+    /// Skip script verification for blocks older than a cutoff duration.
+    /// satd extension (`--assumevalid=all`) — trusts the network for the existing
+    /// chain but fully verifies recent and new blocks.
+    /// The cutoff is controlled by `--assumevalidage` (default: 86400 seconds / 24 hours).
+    All { max_age_secs: u64 },
+}
+
+/// Per-network default assumevalid hashes.
+/// These are well-known blocks deep in the chain that the community has validated.
+/// Matches Bitcoin Core's approach of shipping a default per release.
+pub fn default_assumevalid(network: Network) -> AssumeValid {
+    match network {
+        Network::Bitcoin => {
+            // Bitcoin Core v28.0 default (height 840,000)
+            AssumeValid::Hash(
+                "0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5"
+                    .parse()
+                    .unwrap(),
+            )
+        }
+        Network::Signet => {
+            // Signet block at height 218,000 (before the heavy-tx region)
+            AssumeValid::Hash(
+                "000000f085851d46ad302bcc9246d00435ec24f2095fb9cfa9523837bbac1da3"
+                    .parse()
+                    .unwrap(),
+            )
+        }
+        Network::Testnet => {
+            // Testnet4 — no default yet
+            AssumeValid::Disabled
+        }
+        Network::Regtest => {
+            // Regtest has no meaningful default
+            AssumeValid::Disabled
+        }
+        _ => AssumeValid::Disabled,
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ChainError {
     #[error("duplicate")]
@@ -47,7 +96,7 @@ pub struct ChainState {
     tip: RwLock<ChainTip>,
     pub network: Network,
     script_verifier: Box<dyn ScriptVerifier>,
-    assumevalid: Option<BlockHash>,
+    assumevalid: AssumeValid,
     checkpoints: Vec<Checkpoint>,
     /// Highest header height stored (may be ahead of connected block tip during IBD).
     headers_tip_height: AtomicU32,
@@ -60,7 +109,7 @@ impl ChainState {
         mut flat_files: FlatFileManager,
         network: Network,
         script_verifier: Box<dyn ScriptVerifier>,
-        assumevalid: Option<BlockHash>,
+        assumevalid: AssumeValid,
     ) -> Result<Self, ChainError> {
         let genesis = bitcoin::constants::genesis_block(network);
         let genesis_hash = genesis.block_hash();
@@ -71,8 +120,16 @@ impl ChainState {
         // Check if we have an existing tip
         if let Some(tip_hash) = store.get_tip()
             && let Some(entry) = store.get_block_index(&tip_hash) {
+                // Scan forward from the block tip to find the highest stored header.
+                // Headers may be ahead of blocks if we crashed during IBD.
+                let mut htip = entry.height;
+                while store.get_block_hash_by_height(htip + 1).is_some() {
+                    htip += 1;
+                }
+
                 tracing::info!(
                     height = entry.height,
+                    headers_tip = htip,
                     hash = %tip_hash,
                     "Loaded chain tip from storage"
                 );
@@ -88,7 +145,7 @@ impl ChainState {
                     script_verifier,
                     assumevalid,
                     checkpoints,
-                    headers_tip_height: AtomicU32::new(entry.height),
+                    headers_tip_height: AtomicU32::new(htip),
                 });
             }
 
@@ -208,15 +265,33 @@ impl ChainState {
 
     /// Check if script verification should be skipped (assumevalid optimization).
     fn should_skip_scripts(&self, height: u32) -> bool {
-        if let Some(ref av_hash) = self.assumevalid {
-            // Check if we've seen the assumevalid block in the index
-            if let Some(entry) = self.store.get_block_index(av_hash) {
-                return height <= entry.height;
+        match &self.assumevalid {
+            AssumeValid::Disabled => false,
+            AssumeValid::Hash(av_hash) => {
+                // Check if we've seen the assumevalid block in the index
+                if let Some(entry) = self.store.get_block_index(av_hash) {
+                    return height <= entry.height;
+                }
+                // Haven't seen it yet — might still be syncing headers.
+                // Conservative: don't skip until we've confirmed the hash exists.
+                false
             }
-            // Haven't seen it yet — might still be syncing headers
-            // Conservative: don't skip until we've confirmed the hash exists
+            AssumeValid::All { max_age_secs } => {
+                // Skip scripts for blocks whose header timestamp is older than the cutoff.
+                // This naturally transitions to full verification once the node catches up.
+                if let Some(hash) = self.store.get_block_hash_by_height(height)
+                    && let Some(entry) = self.store.get_block_index(&hash)
+                {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let block_time = entry.header.time as u64;
+                    return now.saturating_sub(block_time) > *max_age_secs;
+                }
+                false
+            }
         }
-        false
     }
 
     /// Compute median time past (MTP) for a given height.
@@ -794,7 +869,7 @@ pub(crate) mod tests {
             flat_files,
             Network::Regtest,
             Box::new(NoopVerifier),
-            None,
+            AssumeValid::Disabled,
         )
         .unwrap();
         (cs, dir)
@@ -1091,7 +1166,7 @@ pub(crate) mod tests {
             flat_files,
             Network::Regtest,
             Box::new(NoopVerifier),
-            None,
+            AssumeValid::Disabled,
         )
         .unwrap();
 

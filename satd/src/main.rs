@@ -83,14 +83,50 @@ async fn main() {
         }
     };
 
-    // Parse assumevalid hash
-    let assumevalid: Option<bitcoin::BlockHash> = config.assumevalid.as_ref().and_then(|s| {
-        if s.is_empty() { None } else { s.parse().ok() }
-    });
-
-    if let Some(ref av) = assumevalid {
-        tracing::info!(%av, "Assuming blocks valid up to hash");
-    }
+    // Parse assumevalid: Core-compatible semantics + "all" extension
+    //   (none)       → per-network default hash
+    //   <hash>       → skip scripts at or below that hash
+    //   0            → disable (verify all scripts)
+    //   all          → skip scripts for ALL blocks (trust network)
+    let assumevalid = match config.assumevalid.as_deref() {
+        None | Some("") => {
+            let av = node::chain::state::default_assumevalid(config.network);
+            match &av {
+                node::chain::state::AssumeValid::Hash(h) => {
+                    tracing::info!(%h, "Using default assumevalid hash");
+                }
+                node::chain::state::AssumeValid::Disabled => {
+                    tracing::info!("No default assumevalid for this network");
+                }
+                _ => {}
+            }
+            av
+        }
+        Some("0") => {
+            tracing::info!("assumevalid disabled — verifying all scripts");
+            node::chain::state::AssumeValid::Disabled
+        }
+        Some("all") => {
+            tracing::info!(
+                max_age_secs = config.assumevalidage,
+                "assumevalid=all — skipping script verification for blocks older than {}s",
+                config.assumevalidage,
+            );
+            node::chain::state::AssumeValid::All { max_age_secs: config.assumevalidage }
+        }
+        Some(hash_str) => {
+            match hash_str.parse::<bitcoin::BlockHash>() {
+                Ok(h) => {
+                    tracing::info!(%h, "Assuming blocks valid up to hash");
+                    node::chain::state::AssumeValid::Hash(h)
+                }
+                Err(e) => {
+                    eprintln!("Error: invalid assumevalid hash '{}': {}", hash_str, e);
+                    std::process::exit(1);
+                }
+            }
+        }
+    };
 
     // Initialize chain state with script verification
     let chain_state = match ChainState::new(
