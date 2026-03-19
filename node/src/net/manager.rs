@@ -805,6 +805,10 @@ impl PeerManager {
                         );
                         *ibd = Some(sched);
                         drop(ibd);
+                        // Wake the block processor thread so it enters IBD mode
+                        let (lock, cvar) = &*self.connect_signal;
+                        *lock.lock().unwrap() = true;
+                        cvar.notify_one();
                         // Assign work to all connected peers
                         self.assign_all_peers();
                     }
@@ -926,12 +930,13 @@ impl PeerManager {
             );
         }
 
-        // Normal mode: process blocks from the channel
+        // Normal mode: process blocks from the channel.
+        // Periodically check if the IBD scheduler was activated (header download completed
+        // while we were in normal mode), and switch to the IBD connect loop if so.
         let mut block_buffer: HashMap<bitcoin::BlockHash, bitcoin::Block> = HashMap::new();
-        while let Some(block) = rx.blocking_recv() {
-            // Check if IBD scheduler was activated (e.g., headers arrived while in normal mode)
+        loop {
+            // Check if IBD scheduler was activated
             if ibd.read().unwrap().is_some() {
-                // Switch to IBD connect loop, drop the block (it was stored by handle_block)
                 Self::ibd_connect_loop(
                     &chain_state,
                     &fee_estimator,
@@ -944,52 +949,63 @@ impl PeerManager {
                 continue;
             }
 
-            let hash = block.block_hash();
-            match chain_state.accept_block(&block) {
-                Ok(_) => {
-                    Self::record_block_fees(&block, &chain_state, &fee_estimator);
-                    mempool.remove_for_block(&block);
-                    // Drain buffer
-                    loop {
-                        let tip = chain_state.tip_hash();
-                        match block_buffer.remove(&tip) {
-                            Some(b) => {
-                                match chain_state.accept_block(&b) {
-                                    Ok(_) => {
-                                        Self::record_block_fees(&b, &chain_state, &fee_estimator);
-                                        mempool.remove_for_block(&b);
-                                    }
-                                    Err(_) => break,
-                                }
-                            }
-                            None => break,
-                        }
-                    }
-                    let height = chain_state.tip_height();
-                    if height / 1000 > last_log_height / 1000 {
-                        tracing::info!(height, buffered = block_buffer.len(), "IBD progress");
-                        last_log_height = height;
-                    }
+            // Wait for a block from the channel, but wake up periodically
+            // to check for IBD scheduler activation
+            let (lock, cvar) = &*connect_signal;
+            let mut ready = lock.lock().unwrap();
+            *ready = false;
+            // Wait up to 500ms — will be woken immediately if a block is stored
+            let _ = cvar.wait_timeout(ready, Duration::from_millis(500));
 
-                    // Periodic pruning
-                    if keep_blocks > 0 && height > keep_blocks
-                        && height / 1000 > last_prune_height / 1000
-                    {
-                        let deleted = chain_state.prune_blocks(keep_blocks);
-                        if deleted > 0 {
-                            tracing::info!(height, deleted, "Pruned old block files");
+            // Drain all available blocks from the channel
+            while let Ok(block) = rx.try_recv() {
+                let hash = block.block_hash();
+                match chain_state.accept_block(&block) {
+                    Ok(_) => {
+                        Self::record_block_fees(&block, &chain_state, &fee_estimator);
+                        mempool.remove_for_block(&block);
+                        // Drain buffer
+                        loop {
+                            let tip = chain_state.tip_hash();
+                            match block_buffer.remove(&tip) {
+                                Some(b) => {
+                                    match chain_state.accept_block(&b) {
+                                        Ok(_) => {
+                                            Self::record_block_fees(&b, &chain_state, &fee_estimator);
+                                            mempool.remove_for_block(&b);
+                                        }
+                                        Err(_) => break,
+                                    }
+                                }
+                                None => break,
+                            }
                         }
-                        last_prune_height = height;
+                        let height = chain_state.tip_height();
+                        if height / 1000 > last_log_height / 1000 {
+                            tracing::info!(height, buffered = block_buffer.len(), "IBD progress");
+                            last_log_height = height;
+                        }
+
+                        // Periodic pruning
+                        if keep_blocks > 0 && height > keep_blocks
+                            && height / 1000 > last_prune_height / 1000
+                        {
+                            let deleted = chain_state.prune_blocks(keep_blocks);
+                            if deleted > 0 {
+                                tracing::info!(height, deleted, "Pruned old block files");
+                            }
+                            last_prune_height = height;
+                        }
                     }
-                }
-                Err(crate::chain::state::ChainError::Duplicate) => {}
-                Err(crate::chain::state::ChainError::BadPrevBlock) => {
-                    if block_buffer.len() < 8192 {
-                        block_buffer.insert(block.header.prev_blockhash, block);
+                    Err(crate::chain::state::ChainError::Duplicate) => {}
+                    Err(crate::chain::state::ChainError::BadPrevBlock) => {
+                        if block_buffer.len() < 8192 {
+                            block_buffer.insert(block.header.prev_blockhash, block);
+                        }
                     }
-                }
-                Err(e) => {
-                    tracing::warn!(%hash, "Block rejected: {}", e);
+                    Err(e) => {
+                        tracing::warn!(%hash, "Block rejected: {}", e);
+                    }
                 }
             }
         }

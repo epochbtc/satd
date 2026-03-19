@@ -1165,4 +1165,111 @@ pub(crate) mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn test_store_block_creates_data_stored() {
+        let (cs, dir) = make_chain_state();
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+        let genesis_hash = genesis.block_hash();
+
+        // First, accept the header so the block's parent chain is known
+        let block1 = build_test_block(genesis_hash, 1, 1_300_000_001);
+        cs.accept_header(&block1.header).unwrap();
+
+        // Store the block without connecting
+        let (hash, height) = cs.store_block(&block1).unwrap();
+        assert_eq!(hash, block1.block_hash());
+        assert_eq!(height, 1);
+
+        // Verify it's DataStored, not Valid
+        let entry = cs.get_block_index(&hash).unwrap();
+        assert_eq!(entry.status, BlockStatus::DataStored);
+        assert_eq!(entry.height, 1);
+
+        // Tip should still be genesis (not connected)
+        assert_eq!(cs.tip_height(), 0);
+        assert_eq!(cs.tip_hash(), genesis_hash);
+
+        // Block data should be readable from flat file
+        assert!(cs.has_block_data(&hash));
+        assert!(cs.get_block(&hash).is_some());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_connect_stored_block() {
+        let (cs, dir) = make_chain_state();
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+        let genesis_hash = genesis.block_hash();
+
+        let block1 = build_test_block(genesis_hash, 1, 1_300_000_001);
+        cs.accept_header(&block1.header).unwrap();
+        let (hash, _) = cs.store_block(&block1).unwrap();
+
+        // Connect the stored block
+        let connected_hash = cs.connect_stored_block(&hash).unwrap();
+        assert_eq!(connected_hash, hash);
+
+        // Tip should now be at height 1
+        assert_eq!(cs.tip_height(), 1);
+        assert_eq!(cs.tip_hash(), hash);
+
+        // Entry should be Valid now
+        let entry = cs.get_block_index(&hash).unwrap();
+        assert_eq!(entry.status, BlockStatus::Valid);
+
+        // Coinbase UTXO should exist
+        let coinbase_txid = block1.txdata[0].compute_txid();
+        assert!(cs.get_coin(&OutPoint { txid: coinbase_txid, vout: 0 }).is_some());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_connect_stored_block_wrong_order() {
+        let (cs, dir) = make_chain_state();
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+        let genesis_hash = genesis.block_hash();
+
+        // Create blocks 1 and 2
+        let block1 = build_test_block(genesis_hash, 1, 1_300_000_001);
+        let block1_hash = block1.block_hash();
+        cs.accept_header(&block1.header).unwrap();
+        let (_, _) = cs.store_block(&block1).unwrap();
+
+        let block2 = build_test_block(block1_hash, 2, 1_300_000_002);
+        cs.accept_header(&block2.header).unwrap();
+        let (hash2, _) = cs.store_block(&block2).unwrap();
+
+        // Try to connect block 2 before block 1 — should fail
+        let result = cs.connect_stored_block(&hash2);
+        assert!(
+            matches!(result, Err(ChainError::BadPrevBlock)),
+            "Connecting height 2 before 1 should fail, got {:?}",
+            result
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_store_block_duplicate() {
+        let (cs, dir) = make_chain_state();
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+
+        let block1 = build_test_block(genesis_hash, 1, 1_300_000_001);
+        cs.accept_header(&block1.header).unwrap();
+        cs.store_block(&block1).unwrap();
+
+        // Store same block again — should be Duplicate
+        let result = cs.store_block(&block1);
+        assert!(
+            matches!(result, Err(ChainError::Duplicate)),
+            "Storing same block twice should fail, got {:?}",
+            result
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
