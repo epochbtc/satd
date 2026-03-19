@@ -135,3 +135,168 @@ pub fn make_compact_block(block: &Block) -> Option<HeaderAndShortIds> {
     // Version 2 = with witness data
     HeaderAndShortIds::from_block(block, nonce, 2, &[]).ok()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::bip152::BlockTransactions;
+    use bitcoin::constants::genesis_block;
+    use bitcoin::Network;
+
+    fn regtest_genesis() -> Block {
+        genesis_block(Network::Regtest)
+    }
+
+    /// Helper: create a simple coinbase-like transaction for testing.
+    fn make_test_tx(value: u64) -> Transaction {
+        Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::locktime::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint::null(),
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(value),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        }
+    }
+
+    #[test]
+    fn test_make_compact_block() {
+        let block = regtest_genesis();
+        let compact = make_compact_block(&block);
+        assert!(compact.is_some());
+        let compact = compact.unwrap();
+        // The compact block's header should match the original
+        assert_eq!(compact.header, block.header);
+    }
+
+    #[test]
+    fn test_make_compact_preserves_header() {
+        let block = regtest_genesis();
+        let compact = make_compact_block(&block).unwrap();
+        assert_eq!(compact.header.prev_blockhash, block.header.prev_blockhash);
+        assert_eq!(compact.header.merkle_root, block.header.merkle_root);
+        assert_eq!(compact.header.time, block.header.time);
+        assert_eq!(compact.header.bits, block.header.bits);
+        assert_eq!(compact.header.nonce, block.header.nonce);
+        assert_eq!(compact.header.version, block.header.version);
+    }
+
+    #[test]
+    fn test_make_get_block_txn() {
+        let hash = regtest_genesis().block_hash();
+        let indices = vec![1, 3, 5];
+        let req = make_get_block_txn(hash, &indices);
+        assert_eq!(req.block_hash, hash);
+        assert_eq!(req.indexes, vec![1, 3, 5]);
+    }
+
+    #[test]
+    fn test_complete_pending_wrong_count() {
+        let header = regtest_genesis().header;
+        let tx = make_test_tx(5000);
+        let pending = PendingCompact {
+            header,
+            txs: vec![Some(tx.clone()), None, None],
+            missing_indices: vec![1, 2],
+        };
+        // Provide only 1 transaction but 2 are missing
+        let block_txns = BlockTransactions {
+            block_hash: header.block_hash(),
+            transactions: vec![make_test_tx(100)],
+        };
+        assert!(complete_pending(pending, &block_txns).is_none());
+    }
+
+    #[test]
+    fn test_complete_pending_success() {
+        let header = regtest_genesis().header;
+        let tx0 = make_test_tx(5000);
+        let tx1 = make_test_tx(1000);
+        let tx2 = make_test_tx(2000);
+
+        let pending = PendingCompact {
+            header,
+            txs: vec![Some(tx0.clone()), None, None],
+            missing_indices: vec![1, 2],
+        };
+        let block_txns = BlockTransactions {
+            block_hash: header.block_hash(),
+            transactions: vec![tx1.clone(), tx2.clone()],
+        };
+        let result = complete_pending(pending, &block_txns);
+        assert!(result.is_some());
+        let block = result.unwrap();
+        assert_eq!(block.header, header);
+        assert_eq!(block.txdata.len(), 3);
+        assert_eq!(block.txdata[0], tx0);
+        assert_eq!(block.txdata[1], tx1);
+        assert_eq!(block.txdata[2], tx2);
+    }
+
+    #[test]
+    fn test_complete_pending_index_out_of_bounds() {
+        let header = regtest_genesis().header;
+        let tx0 = make_test_tx(5000);
+
+        let pending = PendingCompact {
+            header,
+            txs: vec![Some(tx0)],
+            // Index 5 is out of bounds (only 1 slot)
+            missing_indices: vec![5],
+        };
+        let block_txns = BlockTransactions {
+            block_hash: header.block_hash(),
+            transactions: vec![make_test_tx(100)],
+        };
+        assert!(complete_pending(pending, &block_txns).is_none());
+    }
+
+    #[test]
+    fn test_reconstruct_coinbase_only_block() {
+        // The regtest genesis block has only a coinbase transaction.
+        // When we make a compact block from it, the coinbase is prefilled.
+        // Reconstruction with an empty mempool should succeed since all
+        // transactions are prefilled.
+        let block = regtest_genesis();
+        let compact = make_compact_block(&block).unwrap();
+
+        let mempool = Mempool::new(300_000_000, 1_000);
+        let result = try_reconstruct(&compact, &mempool);
+        match result {
+            Ok(reconstructed) => {
+                assert_eq!(reconstructed.header, block.header);
+                assert_eq!(reconstructed.txdata.len(), block.txdata.len());
+            }
+            Err(_) => panic!("expected successful reconstruction of coinbase-only block"),
+        }
+    }
+
+    #[test]
+    fn test_reconstruct_empty_mempool_missing_txs() {
+        // Create a block with coinbase + extra transaction.
+        // The compact block will prefill the coinbase but the extra tx
+        // needs to come from the mempool. With an empty mempool, we get
+        // Err(PendingCompact) with the missing index.
+        let mut block = regtest_genesis();
+        let extra_tx = make_test_tx(1234);
+        block.txdata.push(extra_tx);
+
+        let compact = make_compact_block(&block).unwrap();
+        let mempool = Mempool::new(300_000_000, 1_000);
+        let result = try_reconstruct(&compact, &mempool);
+        match result {
+            Ok(_) => panic!("expected Err(PendingCompact) with missing transactions"),
+            Err(pending) => {
+                assert_eq!(pending.header, block.header);
+                // At least one index should be missing
+                assert!(!pending.missing_indices.is_empty());
+            }
+        }
+    }
+}

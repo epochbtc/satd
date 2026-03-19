@@ -292,4 +292,95 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn test_mine_bad_address() {
+        let dir = std::env::temp_dir().join(format!(
+            "satd-miner-bad-addr-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let store = Box::new(InMemoryStore::new());
+        let flat_files = FlatFileManager::new(&dir.join("blocks")).unwrap();
+        let cs = ChainState::new(
+            store,
+            flat_files,
+            Network::Regtest,
+            Box::new(NoopVerifier),
+            AssumeValid::Disabled,
+        )
+        .unwrap();
+        let mp = Mempool::new(1_000_000, 0);
+
+        let result = mine_block(&cs, &mp, "not-a-valid-address");
+        assert!(matches!(result, Err(MineError::BadAddress(_))));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_mine_wrong_network() {
+        let dir = std::env::temp_dir().join(format!(
+            "satd-miner-wrong-net-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let store = Box::new(InMemoryStore::new());
+        let flat_files = FlatFileManager::new(&dir.join("blocks")).unwrap();
+        let cs = ChainState::new(
+            store,
+            flat_files,
+            Network::Regtest,
+            Box::new(NoopVerifier),
+            AssumeValid::Disabled,
+        )
+        .unwrap();
+        let mp = Mempool::new(1_000_000, 0);
+
+        // Use a mainnet address on a regtest chain
+        let mainnet_addr = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+        let result = mine_block(&cs, &mp, mainnet_addr);
+        assert!(matches!(result, Err(MineError::BadAddress(_))));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_mined_block_valid_pow() {
+        use crate::validation::pow::check_proof_of_work;
+
+        let dir = std::env::temp_dir().join(format!(
+            "satd-miner-pow-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let store = Box::new(InMemoryStore::new());
+        let flat_files = FlatFileManager::new(&dir.join("blocks")).unwrap();
+        let cs = ChainState::new(
+            store,
+            flat_files,
+            Network::Regtest,
+            Box::new(NoopVerifier),
+            AssumeValid::Disabled,
+        )
+        .unwrap();
+        let mp = Mempool::new(1_000_000, 0);
+
+        let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+        let block = mine_block(&cs, &mp, addr).unwrap();
+
+        // Verify the mined block passes proof-of-work validation
+        assert!(check_proof_of_work(&block.header).is_ok());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

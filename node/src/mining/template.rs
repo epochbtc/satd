@@ -105,4 +105,77 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    fn make_template_env() -> (ChainState, Mempool, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "satd-template-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let store = Box::new(InMemoryStore::new());
+        let flat_files = FlatFileManager::new(&dir.join("blocks")).unwrap();
+        let cs = ChainState::new(
+            store,
+            flat_files,
+            Network::Regtest,
+            Box::new(NoopVerifier),
+            AssumeValid::Disabled,
+        )
+        .unwrap();
+        let mp = Mempool::new(1_000_000, 0);
+        (cs, mp, dir)
+    }
+
+    #[test]
+    fn test_template_height_increments() {
+        let (cs, mp, dir) = make_template_env();
+
+        let template = create_template(&cs, &mp);
+        // At genesis (height 0), the next block should be height 1
+        assert_eq!(template.height, cs.tip_height() + 1);
+        assert_eq!(template.height, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_template_coinbase_subsidy_only() {
+        let (cs, mp, dir) = make_template_env();
+
+        let template = create_template(&cs, &mp);
+        let expected_subsidy = crate::chain::connect::block_subsidy(template.height);
+        // With empty mempool, coinbase_value should equal the subsidy alone
+        assert_eq!(template.coinbase_value, expected_subsidy);
+        assert_eq!(template.coinbase_value, 50 * 100_000_000);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_template_bits_regtest() {
+        let (cs, mp, dir) = make_template_env();
+
+        let template = create_template(&cs, &mp);
+        assert_eq!(template.bits.to_consensus(), 0x207fffff);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_template_prev_hash() {
+        let (cs, mp, dir) = make_template_env();
+
+        let tip_hash = cs.tip_hash();
+        let template = create_template(&cs, &mp);
+        // Template's prev_hash must be the current tip hash
+        assert_eq!(template.prev_hash, tip_hash);
+        // At genesis, that should be the regtest genesis hash
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+        assert_eq!(template.prev_hash, genesis.block_hash());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

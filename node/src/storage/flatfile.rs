@@ -155,4 +155,128 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn test_multiple_blocks_same_file() {
+        let dir = std::env::temp_dir().join(format!("satd-flatfile-multi-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut mgr = FlatFileManager::new(&dir).unwrap();
+        let magic = [0xfa, 0xbf, 0xb5, 0xda];
+
+        let pos1 = mgr.write_block(b"block one", magic).unwrap();
+        let pos2 = mgr.write_block(b"block two", magic).unwrap();
+        let pos3 = mgr.write_block(b"block three", magic).unwrap();
+
+        // All three should be in file 0
+        assert_eq!(pos1.file_number, 0);
+        assert_eq!(pos2.file_number, 0);
+        assert_eq!(pos3.file_number, 0);
+
+        // Positions should be strictly increasing
+        assert!(pos2.data_pos > pos1.data_pos);
+        assert!(pos3.data_pos > pos2.data_pos);
+
+        // All blocks should be readable
+        assert_eq!(mgr.read_block(&pos1).unwrap(), b"block one");
+        assert_eq!(mgr.read_block(&pos2).unwrap(), b"block two");
+        assert_eq!(mgr.read_block(&pos3).unwrap(), b"block three");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_read_nonexistent() {
+        let dir = std::env::temp_dir().join(format!("satd-flatfile-noexist-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mgr = FlatFileManager::new(&dir).unwrap();
+        let pos = FlatFilePos {
+            file_number: 99,
+            data_pos: 0,
+        };
+        // Reading from a file that doesn't exist should return an error
+        assert!(mgr.read_block(&pos).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_file_exists_and_delete() {
+        let dir = std::env::temp_dir().join(format!("satd-flatfile-del-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut mgr = FlatFileManager::new(&dir).unwrap();
+        let magic = [0xfa, 0xbf, 0xb5, 0xda];
+
+        // Before writing, file 0 doesn't exist
+        assert!(!mgr.file_exists(0));
+
+        mgr.write_block(b"data", magic).unwrap();
+
+        // After writing, file 0 exists
+        assert!(mgr.file_exists(0));
+
+        // Delete it
+        mgr.delete_file(0).unwrap();
+        assert!(!mgr.file_exists(0));
+
+        // Deleting a non-existent file should not error
+        assert!(mgr.delete_file(99).is_ok());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_resume_from_existing() {
+        let dir = std::env::temp_dir().join(format!("satd-flatfile-resume-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let magic = [0xfa, 0xbf, 0xb5, 0xda];
+
+        // First manager: write one block
+        let pos1 = {
+            let mut mgr = FlatFileManager::new(&dir).unwrap();
+            mgr.write_block(b"first block", magic).unwrap()
+        };
+        // mgr is dropped here
+
+        // Second manager: should resume from where the first left off
+        let mut mgr2 = FlatFileManager::new(&dir).unwrap();
+        let pos2 = mgr2.write_block(b"second block", magic).unwrap();
+
+        // Both should be in file 0 and the second should not overwrite the first
+        assert_eq!(pos1.file_number, 0);
+        assert_eq!(pos2.file_number, 0);
+        assert!(pos2.data_pos > pos1.data_pos);
+
+        // Both blocks should be readable
+        assert_eq!(mgr2.read_block(&pos1).unwrap(), b"first block");
+        assert_eq!(mgr2.read_block(&pos2).unwrap(), b"second block");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_multiple_reads_same_file() {
+        let dir = std::env::temp_dir().join(format!("satd-flatfile-mread-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut mgr = FlatFileManager::new(&dir).unwrap();
+        let magic = [0xfa, 0xbf, 0xb5, 0xda];
+
+        let data_a = vec![0xAA; 1024]; // 1 KB block
+        let data_b = vec![0xBB; 2048]; // 2 KB block
+
+        let pos_a = mgr.write_block(&data_a, magic).unwrap();
+        let pos_b = mgr.write_block(&data_b, magic).unwrap();
+
+        // Read both multiple times — should be consistent
+        for _ in 0..3 {
+            assert_eq!(mgr.read_block(&pos_a).unwrap(), data_a);
+            assert_eq!(mgr.read_block(&pos_b).unwrap(), data_b);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

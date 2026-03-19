@@ -168,4 +168,377 @@ mod tests {
         block.txdata.clear();
         assert!(matches!(check_block(&block), Err(ValidationError::EmptyBlock)));
     }
+
+    #[test]
+    fn test_non_coinbase_first_rejected() {
+        use bitcoin::transaction::Version;
+        use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness, Txid};
+        use bitcoin::hashes::Hash as _;
+
+        // Build a tx whose first input is NOT a coinbase (has a real previous_output)
+        let non_coinbase = Transaction {
+            version: Version::ONE,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::from_byte_array([0xab; 32]),
+                    vout: 0,
+                },
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_0000_0000),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+
+        let mut block = bitcoin::constants::genesis_block(Network::Regtest);
+        block.txdata = vec![non_coinbase];
+        // Fix merkle root so we don't fail on that first
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+
+        assert!(matches!(check_block(&block), Err(ValidationError::NoCoinbase)));
+    }
+
+    #[test]
+    fn test_multiple_coinbase_rejected() {
+        use bitcoin::transaction::Version;
+        use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+
+        let coinbase1 = Transaction {
+            version: Version::ONE,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: bitcoin::ScriptBuf::from(vec![0x04, 0xff, 0xff, 0x00]),
+                sequence: Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_0000_0000),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+
+        let coinbase2 = Transaction {
+            version: Version::ONE,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: bitcoin::ScriptBuf::from(vec![0x04, 0xaa, 0xbb, 0xcc]),
+                sequence: Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(25_0000_0000),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+
+        let mut block = bitcoin::constants::genesis_block(Network::Regtest);
+        block.txdata = vec![coinbase1, coinbase2];
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+
+        assert!(matches!(
+            check_block(&block),
+            Err(ValidationError::MultipleCoinbase)
+        ));
+    }
+
+    #[test]
+    fn test_bad_merkle_root_rejected() {
+        let mut block = bitcoin::constants::genesis_block(Network::Regtest);
+        // Tamper the merkle root
+        block.header.merkle_root =
+            bitcoin::TxMerkleNode::from_byte_array([0xde; 32]);
+        assert!(matches!(
+            check_block(&block),
+            Err(ValidationError::BadMerkleRoot)
+        ));
+    }
+
+    #[test]
+    fn test_oversized_block_rejected() {
+        use bitcoin::transaction::Version;
+        use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+
+        // Create a coinbase with many huge outputs to exceed 4M weight.
+        // Each output with a large script_pubkey contributes significantly to weight.
+        // A single output with ~33000 bytes of script_pubkey = ~33000 * 4 = ~132000 WU (non-witness).
+        // We need ~4M / 132000 ≈ 31 outputs, but let's be generous.
+        let mut outputs = Vec::new();
+        for _ in 0..40 {
+            outputs.push(TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: bitcoin::ScriptBuf::from(vec![0x00; 30_000]),
+            });
+        }
+
+        let coinbase = Transaction {
+            version: Version::ONE,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: bitcoin::ScriptBuf::from(vec![0x04, 0xff, 0xff, 0x00]),
+                sequence: Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: outputs,
+        };
+
+        let mut block = bitcoin::constants::genesis_block(Network::Regtest);
+        block.txdata = vec![coinbase];
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+
+        assert!(matches!(
+            check_block(&block),
+            Err(ValidationError::OversizedBlock)
+        ));
+    }
+
+    #[test]
+    fn test_no_witness_no_commitment_ok() {
+        use bitcoin::transaction::Version;
+        use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
+        use bitcoin::hashes::Hash as _;
+
+        let coinbase = Transaction {
+            version: Version::ONE,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: bitcoin::ScriptBuf::from(vec![0x04, 0xff, 0xff, 0x00]),
+                sequence: Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_0000_0000),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+
+        // Non-witness spending tx (no witness data)
+        let spending = Transaction {
+            version: Version::ONE,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::from_byte_array([0xab; 32]),
+                    vout: 0,
+                },
+                script_sig: bitcoin::ScriptBuf::from(vec![0x00; 20]),
+                sequence: Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(49_0000_0000),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+
+        let mut block = bitcoin::constants::genesis_block(Network::Regtest);
+        block.txdata = vec![coinbase, spending];
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+
+        assert!(check_block(&block).is_ok());
+    }
+
+    #[test]
+    fn test_witness_valid_commitment() {
+        use bitcoin::transaction::Version;
+        use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
+        use bitcoin::hashes::Hash as _;
+
+        let witness_nonce = [0u8; 32];
+
+        // Build a spending tx with witness data
+        let mut witness = Witness::new();
+        witness.push([0x01; 72]); // fake signature
+        let spending = Transaction {
+            version: Version::ONE,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::from_byte_array([0xab; 32]),
+                    vout: 0,
+                },
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness,
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(49_0000_0000),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+
+        // Compute witness merkle root: coinbase wtxid = 0x00...00, then spending wtxid
+        let wtxid_hashes: Vec<[u8; 32]> = vec![
+            [0u8; 32], // coinbase
+            spending.compute_wtxid().to_raw_hash().to_byte_array(),
+        ];
+
+        let witness_root = compute_merkle_root_from_hashes(&wtxid_hashes);
+
+        // Compute commitment = SHA256d(witness_root || witness_nonce)
+        let mut preimage = [0u8; 64];
+        preimage[..32].copy_from_slice(&witness_root);
+        preimage[32..].copy_from_slice(&witness_nonce);
+        let commitment = bitcoin::hashes::sha256d::Hash::hash(&preimage).to_byte_array();
+
+        // Build the witness commitment script: OP_RETURN + PUSH_36 + magic + commitment
+        let mut commitment_script = Vec::with_capacity(38);
+        commitment_script.extend_from_slice(&WITNESS_COMMITMENT_HEADER);
+        commitment_script.extend_from_slice(&commitment);
+
+        // Coinbase with witness nonce and commitment output
+        let mut coinbase_witness = Witness::new();
+        coinbase_witness.push(witness_nonce);
+        let coinbase = Transaction {
+            version: Version::ONE,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: bitcoin::ScriptBuf::from(vec![0x04, 0xff, 0xff, 0x00]),
+                sequence: Sequence::MAX,
+                witness: coinbase_witness,
+            }],
+            output: vec![
+                TxOut {
+                    value: Amount::from_sat(50_0000_0000),
+                    script_pubkey: bitcoin::ScriptBuf::new(),
+                },
+                TxOut {
+                    value: Amount::ZERO,
+                    script_pubkey: bitcoin::ScriptBuf::from(commitment_script),
+                },
+            ],
+        };
+
+        let mut block = bitcoin::constants::genesis_block(Network::Regtest);
+        block.txdata = vec![coinbase, spending];
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+
+        assert!(check_block(&block).is_ok());
+    }
+
+    #[test]
+    fn test_witness_missing_commitment() {
+        use bitcoin::transaction::Version;
+        use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
+        use bitcoin::hashes::Hash as _;
+
+        // Spending tx WITH witness data
+        let mut witness = Witness::new();
+        witness.push([0x01; 72]);
+        let spending = Transaction {
+            version: Version::ONE,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::from_byte_array([0xab; 32]),
+                    vout: 0,
+                },
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness,
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(49_0000_0000),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+
+        // Coinbase WITHOUT any witness commitment output
+        let coinbase = Transaction {
+            version: Version::ONE,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: bitcoin::ScriptBuf::from(vec![0x04, 0xff, 0xff, 0x00]),
+                sequence: Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_0000_0000),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+
+        let mut block = bitcoin::constants::genesis_block(Network::Regtest);
+        block.txdata = vec![coinbase, spending];
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+
+        assert!(matches!(
+            check_block(&block),
+            Err(ValidationError::BadWitnessCommitment)
+        ));
+    }
+
+    #[test]
+    fn test_witness_wrong_commitment() {
+        use bitcoin::transaction::Version;
+        use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
+        use bitcoin::hashes::Hash as _;
+
+        // Spending tx WITH witness data
+        let mut witness = Witness::new();
+        witness.push([0x01; 72]);
+        let spending = Transaction {
+            version: Version::ONE,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::from_byte_array([0xab; 32]),
+                    vout: 0,
+                },
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness,
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(49_0000_0000),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+
+        // Build a witness commitment with the WRONG hash (all 0xde bytes)
+        let mut wrong_commitment_script = Vec::with_capacity(38);
+        wrong_commitment_script.extend_from_slice(&WITNESS_COMMITMENT_HEADER);
+        wrong_commitment_script.extend_from_slice(&[0xde; 32]); // wrong hash
+
+        let mut coinbase_witness = Witness::new();
+        coinbase_witness.push([0u8; 32]);
+        let coinbase = Transaction {
+            version: Version::ONE,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: bitcoin::ScriptBuf::from(vec![0x04, 0xff, 0xff, 0x00]),
+                sequence: Sequence::MAX,
+                witness: coinbase_witness,
+            }],
+            output: vec![
+                TxOut {
+                    value: Amount::from_sat(50_0000_0000),
+                    script_pubkey: bitcoin::ScriptBuf::new(),
+                },
+                TxOut {
+                    value: Amount::ZERO,
+                    script_pubkey: bitcoin::ScriptBuf::from(wrong_commitment_script),
+                },
+            ],
+        };
+
+        let mut block = bitcoin::constants::genesis_block(Network::Regtest);
+        block.txdata = vec![coinbase, spending];
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+
+        assert!(matches!(
+            check_block(&block),
+            Err(ValidationError::BadWitnessCommitment)
+        ));
+    }
 }

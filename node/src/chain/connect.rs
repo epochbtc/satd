@@ -703,4 +703,489 @@ mod tests {
         );
         assert!(result.is_ok());
     }
+
+    #[test]
+    fn test_bip68_time_lock_met() {
+        // Coin at height 10, spending at height 20.
+        // Time-based sequence: bit 22 set, 1 unit = 512 seconds required.
+        // MTP at coin height < MTP at block height by >= 512 seconds.
+        let coin_height = 10u32;
+        let block_height = 20u32;
+        let (store, outpoint, _) = make_test_store_with_coin(coin_height, false);
+
+        // Add block index entries so get_median_time_past can compute MTP.
+        // MTP for coin_height uses blocks at heights max(0, 10-11)..10 = 0..10
+        // MTP for block_height uses blocks at heights max(0, 20-11)..20 = 9..20
+        let base_time = 1_700_000_000u32;
+        let mut batch = StoreBatch::default();
+        for h in 0..block_height {
+            let hash = BlockHash::from_raw_hash(
+                bitcoin::hashes::sha256d::Hash::from_byte_array({
+                    let mut arr = [0u8; 32];
+                    arr[0] = h as u8;
+                    arr[1] = (h >> 8) as u8;
+                    arr[3] = 0xAA; // distinguish from coin txid
+                    arr
+                }),
+            );
+            let mut hdr = bitcoin::constants::genesis_block(Network::Regtest).header;
+            hdr.time = base_time + h * 100; // 100s apart
+            let entry = BlockIndexEntry {
+                header: hdr,
+                height: h,
+                status: BlockStatus::Valid,
+                num_tx: 1,
+                file_number: 0,
+                data_pos: 0,
+                chainwork: [0u8; 32],
+            };
+            batch.block_index_puts.push((hash, entry));
+            batch.height_hash_puts.push((h, hash));
+        }
+        store.write_batch(batch).unwrap();
+
+        // MTP at coin_height=10 uses timestamps for heights 0..10 (10 values)
+        // sorted: base, base+100, ..., base+900 -> median = timestamps[5] = base+500
+        // MTP at block_height=20 uses timestamps for heights 9..20 (11 values)
+        // sorted: base+900, base+1000, ..., base+1900 -> median = timestamps[5] = base+1400
+        // Difference = base+1400 - (base+500) = 900 seconds >= 512 seconds
+
+        // Time-based BIP68 sequence: bit 22 set, 1 unit (512 seconds)
+        let seq = (1u32 << 22) | 1; // time-based, 1 unit = 512s
+        let block = make_block_spending(outpoint, block_height, 2, seq, 0);
+
+        // The connect_block receives MTP for the block (median_time_past param).
+        // But BIP68 internally calls get_median_time_past(store, coin.height) for the coin MTP.
+        // We pass median_time_past = MTP at block height.
+        // MTP at block_height=20: timestamps[9..20] = base+900..base+1900
+        // sorted = [base+900, base+1000, ..., base+1900], median = timestamps[5] = base+1400
+        let mtp_block = base_time + 1400;
+
+        let result = connect_block(
+            &store,
+            &block,
+            block_height,
+            &[0u8; 32],
+            default_pos(),
+            &NoopVerifier,
+            mtp_block,
+        );
+        assert!(result.is_ok(), "BIP68 time lock should be met, got {:?}", result.err());
+    }
+
+    #[test]
+    fn test_bip68_time_lock_not_met() {
+        // Same setup but with insufficient MTP difference.
+        let coin_height = 10u32;
+        let block_height = 11u32; // Only 1 block ahead
+        let (store, outpoint, _) = make_test_store_with_coin(coin_height, false);
+
+        let base_time = 1_700_000_000u32;
+        let mut batch = StoreBatch::default();
+        for h in 0..block_height {
+            let hash = BlockHash::from_raw_hash(
+                bitcoin::hashes::sha256d::Hash::from_byte_array({
+                    let mut arr = [0u8; 32];
+                    arr[0] = h as u8;
+                    arr[1] = (h >> 8) as u8;
+                    arr[3] = 0xAA;
+                    arr
+                }),
+            );
+            let mut hdr = bitcoin::constants::genesis_block(Network::Regtest).header;
+            // Only 10 seconds apart — not enough for 512s requirement
+            hdr.time = base_time + h * 10;
+            let entry = BlockIndexEntry {
+                header: hdr,
+                height: h,
+                status: BlockStatus::Valid,
+                num_tx: 1,
+                file_number: 0,
+                data_pos: 0,
+                chainwork: [0u8; 32],
+            };
+            batch.block_index_puts.push((hash, entry));
+            batch.height_hash_puts.push((h, hash));
+        }
+        store.write_batch(batch).unwrap();
+
+        // MTP at coin_height=10: heights 0..10, timestamps base..base+90,
+        // median = timestamps[5] = base+50
+        // MTP at block_height=11: heights 0..11, timestamps base..base+100,
+        // median = timestamps[5] = base+50
+        // Difference = 0 seconds < 512 seconds
+        let mtp_block = base_time + 50;
+
+        let seq = (1u32 << 22) | 1; // time-based, 1 unit = 512s
+        let block = make_block_spending(outpoint, block_height, 2, seq, 0);
+
+        let result = connect_block(
+            &store,
+            &block,
+            block_height,
+            &[0u8; 32],
+            default_pos(),
+            &NoopVerifier,
+            mtp_block,
+        );
+        assert!(
+            matches!(result, Err(ConnectError::SequenceLockNotMet)),
+            "BIP68 time lock should NOT be met, got Ok",
+        );
+    }
+
+    #[test]
+    fn test_coinbase_value_too_high() {
+        // Coinbase output exceeds block_subsidy + fees -> BadCoinbaseValue.
+        let (store, outpoint, _) = make_test_store_with_coin(10, false);
+
+        // Build block manually: coinbase pays too much
+        let coinbase_script = bitcoin::script::Builder::new()
+            .push_int(101)
+            .push_opcode(bitcoin::opcodes::OP_FALSE)
+            .into_script();
+        let coinbase = Transaction {
+            version: Version(2),
+            lock_time: bitcoin::blockdata::locktime::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: coinbase_script,
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                // subsidy at height 101 = 50 BTC, fees = 0, but we pay 60 BTC
+                value: Amount::from_sat(60 * 100_000_000),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+
+        // Spending tx: consumes 50_000_000 sats, produces 50_000_000 sats (zero fee)
+        let spending_tx = Transaction {
+            version: Version(2),
+            lock_time: bitcoin::blockdata::locktime::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: outpoint,
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_000_000),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+
+        let mut block = Block {
+            header: Header {
+                version: bitcoin::block::Version::from_consensus(0x2000_0000),
+                prev_blockhash: BlockHash::all_zeros(),
+                merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+                time: 1_700_000_000,
+                bits: CompactTarget::from_consensus(0x207f_ffff),
+                nonce: 0,
+            },
+            txdata: vec![coinbase, spending_tx],
+        };
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+
+        let result = connect_block(
+            &store,
+            &block,
+            101,
+            &[0u8; 32],
+            default_pos(),
+            &NoopVerifier,
+            0,
+        );
+        assert!(
+            matches!(result, Err(ConnectError::BadCoinbaseValue)),
+            "Expected BadCoinbaseValue",
+        );
+    }
+
+    #[test]
+    fn test_intra_block_spending() {
+        // Second non-coinbase tx spends an output from the first non-coinbase tx.
+        // This should succeed because connect_block checks batch.coin_puts for in-block UTXOs.
+        let (store, outpoint, _) = make_test_store_with_coin(10, false);
+        let height = 101u32;
+
+        // Coinbase
+        let coinbase_script = bitcoin::script::Builder::new()
+            .push_int(height as i64)
+            .push_opcode(bitcoin::opcodes::OP_FALSE)
+            .into_script();
+        let coinbase = Transaction {
+            version: Version(2),
+            lock_time: bitcoin::blockdata::locktime::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: coinbase_script,
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(block_subsidy(height)),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+
+        // First spending tx: consumes the store coin, produces 50M sats
+        let tx1 = Transaction {
+            version: Version(2),
+            lock_time: bitcoin::blockdata::locktime::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: outpoint,
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_000_000),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+        let tx1_txid = tx1.compute_txid();
+
+        // Second spending tx: consumes tx1's output (in-block UTXO)
+        let tx2 = Transaction {
+            version: Version(2),
+            lock_time: bitcoin::blockdata::locktime::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: tx1_txid,
+                    vout: 0,
+                },
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_000_000),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+
+        let mut block = Block {
+            header: Header {
+                version: bitcoin::block::Version::from_consensus(0x2000_0000),
+                prev_blockhash: BlockHash::all_zeros(),
+                merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+                time: 1_700_000_000,
+                bits: CompactTarget::from_consensus(0x207f_ffff),
+                nonce: 0,
+            },
+            txdata: vec![coinbase, tx1, tx2],
+        };
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+
+        let result = connect_block(
+            &store,
+            &block,
+            height,
+            &[0u8; 32],
+            default_pos(),
+            &NoopVerifier,
+            0,
+        );
+        assert!(result.is_ok(), "Intra-block spending should succeed, got {:?}", result.err());
+    }
+
+    #[test]
+    fn test_bip34_correct_height() {
+        // Block at height 101 with correctly encoded BIP 34 height. Should pass.
+        let (store, outpoint, _) = make_test_store_with_coin(10, false);
+        let block = make_block_spending(outpoint, 101, 2, 0xffff_ffff, 0);
+        let result = connect_block(
+            &store,
+            &block,
+            101,
+            &[0u8; 32],
+            default_pos(),
+            &NoopVerifier,
+            0,
+        );
+        assert!(result.is_ok(), "BIP 34 correct height should pass, got {:?}", result.err());
+    }
+
+    #[test]
+    fn test_bip34_wrong_height() {
+        // Block at height 101 but coinbase encodes height 999 -> BadCoinbaseHeight.
+        let (store, outpoint, _) = make_test_store_with_coin(10, false);
+
+        // Build coinbase with wrong height
+        let coinbase_script = bitcoin::script::Builder::new()
+            .push_int(999) // Wrong height!
+            .push_opcode(bitcoin::opcodes::OP_FALSE)
+            .into_script();
+        let coinbase = Transaction {
+            version: Version(2),
+            lock_time: bitcoin::blockdata::locktime::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: coinbase_script,
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(block_subsidy(101)),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+
+        let spending_tx = Transaction {
+            version: Version(2),
+            lock_time: bitcoin::blockdata::locktime::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: outpoint,
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_000_000),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+
+        let mut block = Block {
+            header: Header {
+                version: bitcoin::block::Version::from_consensus(0x2000_0000),
+                prev_blockhash: BlockHash::all_zeros(),
+                merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+                time: 1_700_000_000,
+                bits: CompactTarget::from_consensus(0x207f_ffff),
+                nonce: 0,
+            },
+            txdata: vec![coinbase, spending_tx],
+        };
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+
+        let result = connect_block(
+            &store,
+            &block,
+            101,
+            &[0u8; 32],
+            default_pos(),
+            &NoopVerifier,
+            0,
+        );
+        assert!(
+            matches!(result, Err(ConnectError::BadCoinbaseHeight)),
+            "Expected BadCoinbaseHeight",
+        );
+    }
+
+    #[test]
+    fn test_output_overflow() {
+        // Spending tx outputs exceed inputs -> BadAmounts.
+        let (store, outpoint, _) = make_test_store_with_coin(10, false);
+        // Coin has 50_000_000 sats. Build a tx that outputs more.
+
+        let coinbase_script = bitcoin::script::Builder::new()
+            .push_int(101)
+            .push_opcode(bitcoin::opcodes::OP_FALSE)
+            .into_script();
+        let coinbase = Transaction {
+            version: Version(2),
+            lock_time: bitcoin::blockdata::locktime::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: coinbase_script,
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(block_subsidy(101)),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+
+        // Spending tx: input has 50_000_000, but output has 60_000_000
+        let spending_tx = Transaction {
+            version: Version(2),
+            lock_time: bitcoin::blockdata::locktime::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: outpoint,
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(60_000_000), // More than input!
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+
+        let mut block = Block {
+            header: Header {
+                version: bitcoin::block::Version::from_consensus(0x2000_0000),
+                prev_blockhash: BlockHash::all_zeros(),
+                merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+                time: 1_700_000_000,
+                bits: CompactTarget::from_consensus(0x207f_ffff),
+                nonce: 0,
+            },
+            txdata: vec![coinbase, spending_tx],
+        };
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+
+        let result = connect_block(
+            &store,
+            &block,
+            101,
+            &[0u8; 32],
+            default_pos(),
+            &NoopVerifier,
+            0,
+        );
+        assert!(
+            matches!(result, Err(ConnectError::BadAmounts)),
+            "Expected BadAmounts",
+        );
+    }
+
+    #[test]
+    fn test_txindex_populated() {
+        // After connect_block, verify all txids from the block appear in batch.tx_index_puts.
+        let (store, outpoint, _) = make_test_store_with_coin(10, false);
+        let block = make_block_spending(outpoint, 101, 2, 0xffff_ffff, 0);
+
+        let batch = connect_block(
+            &store,
+            &block,
+            101,
+            &[0u8; 32],
+            default_pos(),
+            &NoopVerifier,
+            0,
+        )
+        .unwrap();
+
+        // Collect all txids from the block
+        let block_txids: Vec<_> = block.txdata.iter().map(|tx| tx.compute_txid()).collect();
+
+        // Collect all txids from tx_index_puts
+        let indexed_txids: Vec<_> = batch.tx_index_puts.iter().map(|(txid, _)| *txid).collect();
+
+        assert_eq!(
+            block_txids.len(),
+            indexed_txids.len(),
+            "tx_index_puts should have one entry per transaction"
+        );
+        for txid in &block_txids {
+            assert!(
+                indexed_txids.contains(txid),
+                "txid {:?} should be in tx_index_puts",
+                txid
+            );
+        }
+
+        // Verify they all point to the correct block hash
+        let block_hash = block.block_hash();
+        for (_, bh) in &batch.tx_index_puts {
+            assert_eq!(*bh, block_hash, "tx_index entry should point to the block hash");
+        }
+    }
 }

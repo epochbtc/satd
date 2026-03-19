@@ -597,3 +597,135 @@ pub fn save_mempool() -> Value {
     // Stub: mempool persistence not yet implemented
     Value::Null
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chain::state::{AssumeValid, ChainState};
+    use crate::storage::db::InMemoryStore;
+    use crate::storage::flatfile::FlatFileManager;
+    use crate::validation::script::NoopVerifier;
+
+    fn make_cs() -> (ChainState, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "satd-rpc-bc-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let store = Box::new(InMemoryStore::new());
+        let flat_files = FlatFileManager::new(&dir.join("blocks")).unwrap();
+        let cs = ChainState::new(
+            store,
+            flat_files,
+            Network::Regtest,
+            Box::new(NoopVerifier),
+            AssumeValid::Disabled,
+        )
+        .unwrap();
+        (cs, dir)
+    }
+
+    #[test]
+    fn test_getblockchaininfo_genesis() {
+        let (cs, dir) = make_cs();
+        let info = get_blockchain_info(&cs);
+
+        assert_eq!(info["chain"], "regtest");
+        assert_eq!(info["blocks"], 0);
+
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+        assert_eq!(info["bestblockhash"], genesis.block_hash().to_string());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_getbestblockhash() {
+        let (cs, dir) = make_cs();
+        let result = get_best_block_hash(&cs);
+
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+        assert_eq!(result, Value::String(genesis.block_hash().to_string()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_getblockcount() {
+        let (cs, dir) = make_cs();
+        let result = get_block_count(&cs);
+        assert_eq!(result, json!(0));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_getblockhash() {
+        let (cs, dir) = make_cs();
+        let result = get_block_hash(&cs, 0).unwrap();
+
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+        assert_eq!(result, Value::String(genesis.block_hash().to_string()));
+
+        // Height 1 should fail (out of range)
+        let err = get_block_hash(&cs, 1);
+        assert!(err.is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_getblock_hex() {
+        let (cs, dir) = make_cs();
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+        let hash_str = genesis.block_hash().to_string();
+
+        let result = get_block(&cs, &hash_str, 0).unwrap();
+        // Verbosity 0 returns a hex string
+        let hex_str = result.as_str().unwrap();
+        // Verify it's valid hex and can be decoded back to the genesis block
+        let raw = hex::decode(hex_str).unwrap();
+        let decoded: bitcoin::Block = bitcoin::consensus::deserialize(&raw).unwrap();
+        assert_eq!(decoded.block_hash(), genesis.block_hash());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_getblock_json() {
+        let (cs, dir) = make_cs();
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+        let hash_str = genesis.block_hash().to_string();
+
+        let result = get_block(&cs, &hash_str, 1).unwrap();
+        // Verbosity 1 returns JSON with height, hash, tx array
+        assert_eq!(result["height"], 0);
+        assert_eq!(result["hash"], hash_str);
+        assert!(result["tx"].is_array());
+        // Genesis block has exactly one transaction (the coinbase)
+        assert_eq!(result["tx"].as_array().unwrap().len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_getblockheader() {
+        let (cs, dir) = make_cs();
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+        let hash_str = genesis.block_hash().to_string();
+
+        let result = get_block_header(&cs, &hash_str, true).unwrap();
+        assert_eq!(result["height"], 0);
+        assert_eq!(result["hash"], hash_str);
+        assert!(result["bits"].is_string());
+        assert!(result["nonce"].is_number());
+        assert!(result["merkleroot"].is_string());
+        assert!(result["version"].is_number());
+        assert!(result["confirmations"].as_u64().unwrap() >= 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

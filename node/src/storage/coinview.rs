@@ -82,4 +82,52 @@ mod tests {
         assert_eq!(decoded.coinbase, coin.coinbase);
         assert_eq!(decoded.script_pubkey, coin.script_pubkey);
     }
+
+    #[test]
+    fn test_outpoint_key_zero_vout() {
+        use bitcoin::hashes::Hash;
+        let outpoint = bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_raw_hash(
+                bitcoin::hashes::sha256d::Hash::from_byte_array([0x42; 32]),
+            ),
+            vout: 0,
+        };
+        let key = outpoint_to_key(&outpoint);
+        let recovered = key_to_outpoint(&key);
+        assert_eq!(outpoint, recovered);
+        // Verify that the last 4 bytes encode vout=0
+        assert_eq!(&key[32..36], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_outpoint_key_max_vout() {
+        use bitcoin::hashes::Hash;
+        let outpoint = bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_raw_hash(
+                bitcoin::hashes::sha256d::Hash::from_byte_array([0xff; 32]),
+            ),
+            vout: u32::MAX,
+        };
+        let key = outpoint_to_key(&outpoint);
+        let recovered = key_to_outpoint(&key);
+        assert_eq!(outpoint, recovered);
+        // Verify that the last 4 bytes encode u32::MAX in little-endian
+        assert_eq!(&key[32..36], &[0xff, 0xff, 0xff, 0xff]);
+    }
+
+    #[test]
+    fn test_coin_empty_script() {
+        let coin = Coin {
+            amount: 0,
+            script_pubkey: bitcoin::ScriptBuf::new(), // empty script
+            height: 0,
+            coinbase: false,
+        };
+        let encoded = bincode::serialize(&coin).unwrap();
+        let decoded: Coin = bincode::deserialize(&encoded).unwrap();
+        assert_eq!(decoded.amount, 0);
+        assert_eq!(decoded.height, 0);
+        assert!(!decoded.coinbase);
+        assert!(decoded.script_pubkey.is_empty());
+    }
 }
