@@ -272,6 +272,49 @@ impl Store for RedbStore {
     fn has_txindex(&self) -> bool {
         self.txindex_enabled
     }
+
+    fn clear_chainstate(&self) -> Result<(), StoreError> {
+        let txn = self.db.begin_write().map_err(|e| StoreError::Database(e.to_string()))?;
+        // Delete and recreate tables to clear all entries
+        let _ = txn.delete_table(COINS);
+        let _ = txn.delete_table(UNDO);
+        let _ = txn.delete_table(METADATA);
+        if self.txindex_enabled {
+            let _ = txn.delete_table(TX_INDEX);
+        }
+        // Recreate empty tables
+        let _ = txn.open_table(COINS);
+        let _ = txn.open_table(UNDO);
+        let _ = txn.open_table(METADATA);
+        if self.txindex_enabled {
+            let _ = txn.open_table(TX_INDEX);
+        }
+        txn.commit().map_err(|e| StoreError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    fn clear_all(&self) -> Result<(), StoreError> {
+        let txn = self.db.begin_write().map_err(|e| StoreError::Database(e.to_string()))?;
+        let _ = txn.delete_table(BLOCK_INDEX);
+        let _ = txn.delete_table(HEIGHT_INDEX);
+        let _ = txn.delete_table(COINS);
+        let _ = txn.delete_table(UNDO);
+        let _ = txn.delete_table(METADATA);
+        if self.txindex_enabled {
+            let _ = txn.delete_table(TX_INDEX);
+        }
+        // Recreate empty tables
+        let _ = txn.open_table(BLOCK_INDEX);
+        let _ = txn.open_table(HEIGHT_INDEX);
+        let _ = txn.open_table(COINS);
+        let _ = txn.open_table(UNDO);
+        let _ = txn.open_table(METADATA);
+        if self.txindex_enabled {
+            let _ = txn.open_table(TX_INDEX);
+        }
+        txn.commit().map_err(|e| StoreError::Database(e.to_string()))?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

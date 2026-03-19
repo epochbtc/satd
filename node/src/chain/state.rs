@@ -499,6 +499,142 @@ impl ChainState {
         Ok(*hash)
     }
 
+    /// Rebuild the UTXO set by replaying all blocks from flat files.
+    /// Block index and flat files must be intact. Used by `-reindex-chainstate`.
+    pub fn reindex_chainstate(&self) -> Result<(), ChainError> {
+        let mut height = 1; // genesis already connected by ChainState::new()
+        while let Some(hash) = self.store.get_block_hash_by_height(height) {
+            let entry = self
+                .store
+                .get_block_index(&hash)
+                .ok_or(ChainError::BadPrevBlock)?;
+
+            let flat_pos = FlatFilePos {
+                file_number: entry.file_number,
+                data_pos: entry.data_pos,
+            };
+            let block = self
+                .read_block_direct(&flat_pos)
+                .ok_or(ChainError::FlatFile("cannot read block during reindex".into()))?;
+
+            let parent = self
+                .store
+                .get_block_index(&entry.header.prev_blockhash)
+                .ok_or(ChainError::BadPrevBlock)?;
+
+            let use_noop = self.should_skip_scripts(height);
+            let noop = NoopVerifier;
+            let verifier: &dyn ScriptVerifier =
+                if use_noop { &noop } else { &*self.script_verifier };
+
+            let mtp = self.get_median_time_past(height);
+            let batch = connect::connect_block(
+                &*self.store, &block, height, &parent.chainwork, flat_pos, verifier, mtp,
+            )?;
+            self.store.write_batch(batch)?;
+
+            {
+                let mut tip = self.tip.write().unwrap();
+                tip.hash = hash;
+                tip.height = height;
+            }
+
+            if height % 10_000 == 0 {
+                tracing::info!(height, "Reindexing chainstate...");
+            }
+            height += 1;
+        }
+        tracing::info!(height = height - 1, "Chainstate reindex complete");
+        Ok(())
+    }
+
+    /// Rebuild block index and UTXO set from raw block data scanned from flat files.
+    /// Used by `-reindex` when the block index is cleared.
+    pub fn reindex_from_blocks(
+        &self,
+        blocks: Vec<(Vec<u8>, FlatFilePos)>,
+    ) -> Result<(), ChainError> {
+        use std::collections::{HashMap, VecDeque};
+
+        // Parse all blocks and index by hash and parent
+        let mut by_hash: HashMap<BlockHash, (Block, FlatFilePos)> = HashMap::new();
+        let mut children: HashMap<BlockHash, Vec<BlockHash>> = HashMap::new();
+        let mut parse_count = 0;
+        for (data, pos) in blocks {
+            if let Ok(block) = bitcoin::consensus::deserialize::<Block>(&data) {
+                let hash = block.block_hash();
+                children
+                    .entry(block.header.prev_blockhash)
+                    .or_default()
+                    .push(hash);
+                by_hash.insert(hash, (block, pos));
+                parse_count += 1;
+            }
+        }
+        tracing::info!(parse_count, "Parsed blocks from flat files");
+
+        // BFS from genesis to connect blocks in topological order
+        let genesis_hash = bitcoin::constants::genesis_block(self.network).block_hash();
+        let mut queue = VecDeque::new();
+        if let Some(child_hashes) = children.get(&genesis_hash) {
+            for h in child_hashes {
+                queue.push_back(*h);
+            }
+        }
+
+        let mut connected = 0u32;
+        while let Some(hash) = queue.pop_front() {
+            let (block, flat_pos) = match by_hash.remove(&hash) {
+                Some(v) => v,
+                None => continue,
+            };
+
+            let height = {
+                let parent = self
+                    .store
+                    .get_block_index(&block.header.prev_blockhash)
+                    .ok_or(ChainError::BadPrevBlock)?;
+                parent.height + 1
+            };
+
+            let parent = self
+                .store
+                .get_block_index(&block.header.prev_blockhash)
+                .ok_or(ChainError::BadPrevBlock)?;
+
+            let use_noop = self.should_skip_scripts(height);
+            let noop = NoopVerifier;
+            let verifier: &dyn ScriptVerifier =
+                if use_noop { &noop } else { &*self.script_verifier };
+
+            let mtp = self.get_median_time_past(height);
+            let batch = connect::connect_block(
+                &*self.store, &block, height, &parent.chainwork, flat_pos, verifier, mtp,
+            )?;
+            self.store.write_batch(batch)?;
+
+            {
+                let mut tip = self.tip.write().unwrap();
+                tip.hash = hash;
+                tip.height = height;
+            }
+
+            connected += 1;
+            if connected.is_multiple_of(10_000) {
+                tracing::info!(connected, height, "Reindexing from flat files...");
+            }
+
+            // Enqueue children
+            if let Some(child_hashes) = children.get(&hash) {
+                for h in child_hashes {
+                    queue.push_back(*h);
+                }
+            }
+        }
+        tracing::info!(connected, "Reindex from flat files complete");
+        Ok(())
+    }
+
     /// Accept a new block into the chain.
     pub fn accept_block(&self, block: &Block) -> Result<BlockHash, ChainError> {
         let block_hash = block.block_hash();
