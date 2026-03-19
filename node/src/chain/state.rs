@@ -1,5 +1,6 @@
 use bitcoin::consensus::serialize;
 use bitcoin::{Block, BlockHash, Network, OutPoint};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, RwLock};
 
 use crate::chain::checkpoints::{self, Checkpoint};
@@ -45,6 +46,8 @@ pub struct ChainState {
     script_verifier: Box<dyn ScriptVerifier>,
     assumevalid: Option<BlockHash>,
     checkpoints: Vec<Checkpoint>,
+    /// Highest header height stored (may be ahead of connected block tip during IBD).
+    headers_tip_height: AtomicU32,
 }
 
 impl ChainState {
@@ -80,6 +83,7 @@ impl ChainState {
                     script_verifier,
                     assumevalid,
                     checkpoints,
+                    headers_tip_height: AtomicU32::new(entry.height),
                 });
             }
 
@@ -108,6 +112,7 @@ impl ChainState {
             script_verifier,
             assumevalid,
             checkpoints,
+            headers_tip_height: AtomicU32::new(0),
         })
     }
 
@@ -184,7 +189,15 @@ impl ChainState {
         batch.height_hash_puts.push((new_height, hash));
         self.store.write_batch(batch)?;
 
+        // Track highest header for locator construction
+        self.headers_tip_height.fetch_max(new_height, Ordering::Relaxed);
+
         Ok(hash)
+    }
+
+    /// Get the highest header height stored (may be ahead of block tip during IBD).
+    pub fn headers_tip_height(&self) -> u32 {
+        self.headers_tip_height.load(Ordering::Relaxed)
     }
 
     /// Check if script verification should be skipped (assumevalid optimization).
