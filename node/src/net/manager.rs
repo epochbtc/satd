@@ -415,7 +415,9 @@ impl PeerManager {
             let tip = self.chain_state.tip_height();
             let _htip = self.headers_tip.load(Ordering::Relaxed) as u32;
 
-            if tip != last_tip {
+            // When chain advances, immediately request more blocks (don't wait for timer)
+            let tip_advanced = tip != last_tip;
+            if tip_advanced {
                 last_tip = tip;
                 // Reset reconnect backoff on chain progress
                 let mut backoff = self.reconnect_backoff.write().unwrap();
@@ -424,8 +426,8 @@ impl PeerManager {
                 }
             }
 
-            // Request blocks every 10 ticks (5 seconds) and headers every 20 ticks (10 seconds)
-            if ticks.is_multiple_of(10) {
+            // Request blocks: immediately on tip advance, or every 10 ticks as fallback
+            if tip_advanced || ticks.is_multiple_of(10) {
                 let peer_ids: Vec<PeerId> = {
                     let peers = self.peers.read().unwrap();
                     peers.iter()
@@ -436,6 +438,7 @@ impl PeerManager {
                 for pid in &peer_ids {
                     self.request_missing_blocks(*pid);
                 }
+                // Request headers less frequently
                 if ticks.is_multiple_of(20) {
                     for pid in &peer_ids {
                         self.send_to_peer(*pid, sync::make_getheaders(&self.chain_state));
