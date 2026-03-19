@@ -304,6 +304,11 @@ pub fn connect_block(
         batch.undo_puts.push((block_hash, undo));
     }
 
+    // Populate txindex: map each txid to its containing block
+    for tx in &block.txdata {
+        batch.tx_index_puts.push((tx.compute_txid(), block_hash));
+    }
+
     Ok(batch)
 }
 

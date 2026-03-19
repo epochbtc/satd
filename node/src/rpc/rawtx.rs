@@ -128,6 +128,28 @@ pub fn get_raw_transaction(
         }
     }
 
+    // Fallback to txindex if available
+    if blockhash.is_none()
+        && let Some(block_hash) = chain_state.get_tx_location(&txid)
+            && let Some(block) = chain_state.get_block(&block_hash) {
+                let entry = chain_state.get_block_index(&block_hash);
+                for tx in &block.txdata {
+                    if tx.compute_txid() == txid {
+                        return if verbose {
+                            let height = entry.as_ref().map(|e| e.height);
+                            Ok(decode_transaction_verbose(
+                                tx,
+                                Some(&block_hash.to_string()),
+                                height,
+                            ))
+                        } else {
+                            let raw = bitcoin::consensus::serialize(tx);
+                            Ok(Value::String(hex::encode(raw)))
+                        };
+                    }
+                }
+            }
+
     Err((-5, "No such mempool or blockchain transaction. Use gettransaction for wallet transactions.".to_string()))
 }
 

@@ -2,9 +2,10 @@ pub mod blockindex;
 pub mod coinview;
 pub mod db;
 pub mod flatfile;
+pub mod redb_store;
 pub mod undo;
 
-use bitcoin::{BlockHash, OutPoint};
+use bitcoin::{BlockHash, OutPoint, Txid};
 
 use crate::storage::blockindex::BlockIndexEntry;
 use crate::storage::coinview::Coin;
@@ -30,6 +31,8 @@ pub struct StoreBatch {
     pub height_hash_puts: Vec<(u32, BlockHash)>,
     pub height_hash_removes: Vec<u32>,
     pub undo_puts: Vec<(BlockHash, UndoData)>,
+    pub tx_index_puts: Vec<(Txid, BlockHash)>,
+    pub tx_index_removes: Vec<Txid>,
 }
 
 impl StoreBatch {
@@ -44,6 +47,8 @@ impl StoreBatch {
         self.height_hash_puts.extend(other.height_hash_puts);
         self.height_hash_removes.extend(other.height_hash_removes);
         self.undo_puts.extend(other.undo_puts);
+        self.tx_index_puts.extend(other.tx_index_puts);
+        self.tx_index_removes.extend(other.tx_index_removes);
     }
 }
 
@@ -59,4 +64,9 @@ pub trait Store: Send + Sync {
     fn coin_count(&self) -> u64;
     /// Sum the total amount (in satoshis) across all UTXOs.
     fn coin_total_amount(&self) -> u64;
+    /// Look up which block contains a transaction (txindex).
+    /// Returns None if txindex is disabled or the txid is not found.
+    fn get_tx_location(&self, txid: &Txid) -> Option<BlockHash>;
+    /// Whether this store has txindex enabled.
+    fn has_txindex(&self) -> bool;
 }

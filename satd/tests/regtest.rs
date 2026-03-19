@@ -165,8 +165,23 @@ impl Drop for TestNode {
 }
 
 fn find_available_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind to port 0");
-    listener.local_addr().unwrap().port()
+    use std::sync::atomic::{AtomicU16, Ordering};
+    // Use a process-unique atomic counter starting from a high port range.
+    // This avoids the TOCTOU race where bind(0) finds a port, releases it,
+    // and another test grabs the same port before satd can bind.
+    static PORT_COUNTER: AtomicU16 = AtomicU16::new(0);
+    let offset = PORT_COUNTER.fetch_add(1, Ordering::Relaxed);
+    // Base port derived from PID to avoid collisions across concurrent test processes
+    let base = 30000 + (std::process::id() as u16 % 10000);
+    let port = base + offset * 2; // *2 because each node may use rpc + p2p
+    // Verify the port is actually free
+    if TcpListener::bind(format!("127.0.0.1:{}", port)).is_ok() {
+        port
+    } else {
+        // Fallback: let OS pick, but this is rare
+        let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind to port 0");
+        listener.local_addr().unwrap().port()
+    }
 }
 
 #[test]

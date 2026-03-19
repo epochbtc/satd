@@ -226,6 +226,11 @@ impl ChainState {
     }
 
     /// Read a full block from flat file storage.
+    /// Look up which block contains a transaction (requires -txindex).
+    pub fn get_tx_location(&self, txid: &bitcoin::Txid) -> Option<BlockHash> {
+        self.store.get_tx_location(txid)
+    }
+
     pub fn get_block(&self, hash: &BlockHash) -> Option<Block> {
         let entry = self.store.get_block_index(hash)?;
         if entry.status == BlockStatus::HeaderOnly || entry.status == BlockStatus::Invalid {
@@ -310,6 +315,14 @@ impl ChainState {
                 .ok_or(ChainError::BadPrevBlock)?;
             if compare_u256(&new_chainwork, &tip_entry.chainwork) <= 0 {
                 // Side chain has less or equal work — don't reorg
+                return Ok(block_hash);
+            }
+
+            // During IBD, if the side chain is far ahead of our tip, don't attempt
+            // reorg — the intermediate blocks will arrive and connect in order.
+            // This avoids expensive failed reorg attempts when blocks arrive
+            // out of order from multiple peers.
+            if new_height > tip_entry.height + 128 {
                 return Ok(block_hash);
             }
 
