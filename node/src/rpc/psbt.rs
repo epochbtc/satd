@@ -251,9 +251,13 @@ pub fn combine_psbt(psbt_b64s: &[String]) -> Result<Value, (i32, String)> {
 
 /// `finalizepsbt` — finalize a fully-signed PSBT into a network transaction.
 pub fn finalize_psbt(psbt_b64: &str, extract: bool) -> Result<Value, (i32, String)> {
-    let psbt = psbt_from_base64(psbt_b64)?;
+    let mut psbt = psbt_from_base64(psbt_b64)?;
 
-    // Check if all inputs are finalized
+    // Attempt to finalize each input from partial_sigs / tap_key_sig
+    for input in &mut psbt.inputs {
+        try_finalize_input(input);
+    }
+
     let complete = psbt.inputs.iter().all(|i| {
         i.final_script_sig.is_some() || i.final_script_witness.is_some()
     });
@@ -270,6 +274,85 @@ pub fn finalize_psbt(psbt_b64: &str, extract: bool) -> Result<Value, (i32, Strin
             "psbt": psbt_to_base64(&psbt),
             "complete": complete,
         }))
+    }
+}
+
+/// Attempt to finalize a PSBT input by constructing final_script_sig or
+/// final_script_witness from partial signatures and UTXO information.
+fn try_finalize_input(input: &mut bitcoin::psbt::Input) {
+    // Already finalized
+    if input.final_script_sig.is_some() || input.final_script_witness.is_some() {
+        return;
+    }
+
+    // Determine the scriptPubKey from witness_utxo or non_witness_utxo
+    let script = if let Some(ref utxo) = input.witness_utxo {
+        utxo.script_pubkey.clone()
+    } else {
+        return; // Can't finalize without UTXO info
+    };
+
+    let mut finalized = false;
+
+    if script.is_p2pkh() {
+        if input.partial_sigs.len() == 1 {
+            let (pubkey, sig) = input.partial_sigs.iter().next().unwrap();
+            input.final_script_sig = Some(
+                bitcoin::script::Builder::new()
+                    .push_slice(sig.serialize())
+                    .push_key(pubkey)
+                    .into_script(),
+            );
+            finalized = true;
+        }
+    } else if script.is_p2wpkh() {
+        if input.partial_sigs.len() == 1 {
+            let (pubkey, sig) = input.partial_sigs.iter().next().unwrap();
+            let mut witness = Witness::new();
+            witness.push(sig.serialize());
+            witness.push(pubkey.to_bytes());
+            input.final_script_witness = Some(witness);
+            finalized = true;
+        }
+    } else if script.is_p2sh()
+        && let Some(ref redeem_script) = input.redeem_script
+        && redeem_script.is_p2wpkh()
+        && input.partial_sigs.len() == 1
+    {
+        let (pubkey, sig) = input.partial_sigs.iter().next().unwrap();
+        let redeem_bytes = bitcoin::script::PushBytesBuf::try_from(redeem_script.to_bytes());
+        if let Ok(push_bytes) = redeem_bytes {
+            input.final_script_sig = Some(
+                bitcoin::script::Builder::new()
+                    .push_slice(&push_bytes)
+                    .into_script(),
+            );
+            let mut witness = Witness::new();
+            witness.push(sig.serialize());
+            witness.push(pubkey.to_bytes());
+            input.final_script_witness = Some(witness);
+            finalized = true;
+        }
+    } else if script.is_p2tr()
+        && let Some(ref sig) = input.tap_key_sig
+    {
+        let mut witness = Witness::new();
+        witness.push(sig.serialize());
+        input.final_script_witness = Some(witness);
+        finalized = true;
+    }
+
+    // Clear interim PSBT fields after successful finalization (BIP 174)
+    if finalized {
+        input.partial_sigs.clear();
+        input.redeem_script = None;
+        input.witness_script = None;
+        input.bip32_derivation.clear();
+        input.tap_key_sig = None;
+        input.tap_script_sigs.clear();
+        input.tap_key_origins.clear();
+        input.tap_internal_key = None;
+        input.tap_merkle_root = None;
     }
 }
 

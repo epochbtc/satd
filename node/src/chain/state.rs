@@ -852,7 +852,7 @@ pub(crate) mod tests {
     use crate::storage::db::InMemoryStore;
     use crate::storage::flatfile::FlatFileManager;
 
-    fn make_chain_state() -> (ChainState, std::path::PathBuf) {
+    pub(crate) fn make_chain_state() -> (ChainState, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!(
             "satd-chain-test-{}-{}",
             std::process::id(),
@@ -1388,16 +1388,20 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_accept_header_duplicate_returns_ok() {
-        // accept_header returns Ok(hash) for already-known headers (not Err)
+    fn test_accept_header_duplicate_returns_duplicate() {
+        // accept_header returns Err(Duplicate) for already-known headers
         let (cs, dir) = make_chain_state();
         let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
 
         let block1 = build_test_block(genesis_hash, 1, 1_300_000_001);
-        let hash1 = cs.accept_header(&block1.header).unwrap();
-        let hash2 = cs.accept_header(&block1.header).unwrap();
+        cs.accept_header(&block1.header).unwrap();
+        let result = cs.accept_header(&block1.header);
 
-        assert_eq!(hash1, hash2, "Duplicate accept_header should return same hash");
+        assert!(
+            matches!(result, Err(ChainError::Duplicate)),
+            "Duplicate accept_header should return Err(Duplicate), got {:?}",
+            result
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

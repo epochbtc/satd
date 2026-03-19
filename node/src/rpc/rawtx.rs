@@ -1,5 +1,8 @@
 use bitcoin::transaction::Version;
 use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+use bitcoin::hashes::Hash;
+use bitcoin::key::TapTweak;
+use bitcoin::secp256k1::Secp256k1;
 use crate::chain::state::ChainState;
 use crate::mempool::pool::Mempool;
 use serde_json::{json, Value};
@@ -403,6 +406,299 @@ pub fn decode_script(hex_script: &str) -> Result<Value, (i32, String)> {
     }))
 }
 
+/// Parse a sighash type string into EcdsaSighashType.
+fn parse_sighash_type(s: Option<&str>) -> Result<bitcoin::sighash::EcdsaSighashType, (i32, String)> {
+    use bitcoin::sighash::EcdsaSighashType;
+    match s.unwrap_or("ALL") {
+        "ALL" => Ok(EcdsaSighashType::All),
+        "NONE" => Ok(EcdsaSighashType::None),
+        "SINGLE" => Ok(EcdsaSighashType::Single),
+        "ALL|ANYONECANPAY" => Ok(EcdsaSighashType::AllPlusAnyoneCanPay),
+        "NONE|ANYONECANPAY" => Ok(EcdsaSighashType::NonePlusAnyoneCanPay),
+        "SINGLE|ANYONECANPAY" => Ok(EcdsaSighashType::SinglePlusAnyoneCanPay),
+        other => Err((-8, format!("Invalid sighash param: {}", other))),
+    }
+}
+
+/// `signrawtransactionwithkey` — sign a raw transaction with provided private keys.
+pub fn sign_raw_transaction_with_key(
+    chain_state: &ChainState,
+    hex_tx: &str,
+    privkeys: &[String],
+    prevtxs: Option<&[Value]>,
+    sighash_type: Option<&str>,
+) -> Result<Value, (i32, String)> {
+    let tx_bytes = hex::decode(hex_tx).map_err(|_| (-22, "TX decode failed".to_string()))?;
+    let mut tx: Transaction = bitcoin::consensus::deserialize(&tx_bytes)
+        .map_err(|_| (-22, "TX decode failed".to_string()))?;
+
+    let secp = Secp256k1::new();
+    let ecdsa_sighash_type = parse_sighash_type(sighash_type)?;
+
+    // Parse private keys and build pubkey -> secret key lookup
+    let mut key_map: std::collections::HashMap<bitcoin::PublicKey, bitcoin::secp256k1::SecretKey> =
+        std::collections::HashMap::new();
+    // Also track x-only pubkeys for taproot
+    let mut xonly_key_map: std::collections::HashMap<bitcoin::key::XOnlyPublicKey, bitcoin::secp256k1::SecretKey> =
+        std::collections::HashMap::new();
+
+    for wif in privkeys {
+        let privkey = bitcoin::PrivateKey::from_wif(wif)
+            .map_err(|e| (-5, format!("Invalid private key: {}", e)))?;
+        let pubkey = privkey.public_key(&secp);
+        let (xonly, _parity) = pubkey.inner.x_only_public_key();
+        key_map.insert(pubkey, privkey.inner);
+        xonly_key_map.insert(xonly, privkey.inner);
+    }
+
+    // Collect prevout information for each input
+    let num_inputs = tx.input.len();
+    let mut prevouts: Vec<Option<TxOut>> = vec![None; num_inputs];
+
+    // First, populate from user-supplied prevtxs
+    if let Some(prev_array) = prevtxs {
+        for prev in prev_array {
+            let txid: bitcoin::Txid = prev["txid"]
+                .as_str()
+                .ok_or((-8, "Missing txid in prevtxs".to_string()))?
+                .parse()
+                .map_err(|_| (-8, "Invalid txid in prevtxs".to_string()))?;
+            let vout = prev["vout"]
+                .as_u64()
+                .ok_or((-8, "Missing vout in prevtxs".to_string()))? as u32;
+            let script_hex = prev["scriptPubKey"]
+                .as_str()
+                .ok_or((-8, "Missing scriptPubKey in prevtxs".to_string()))?;
+            let script_bytes = hex::decode(script_hex)
+                .map_err(|_| (-8, "Invalid scriptPubKey hex".to_string()))?;
+            let script_pubkey = bitcoin::ScriptBuf::from_bytes(script_bytes);
+
+            let amount = if let Some(amt) = prev.get("amount") {
+                let btc = amt.as_f64().ok_or((-8, "Invalid amount".to_string()))?;
+                Amount::from_sat((btc * 100_000_000.0) as u64)
+            } else {
+                Amount::ZERO
+            };
+
+            let outpoint = OutPoint { txid, vout };
+            for (i, input) in tx.input.iter().enumerate() {
+                if input.previous_output == outpoint {
+                    prevouts[i] = Some(TxOut {
+                        value: amount,
+                        script_pubkey: script_pubkey.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    // Fill remaining from chain state UTXO set
+    for (i, input) in tx.input.iter().enumerate() {
+        if prevouts[i].is_none()
+            && let Some(coin) = chain_state.get_coin(&input.previous_output)
+        {
+            prevouts[i] = Some(TxOut {
+                value: Amount::from_sat(coin.amount),
+                script_pubkey: coin.script_pubkey,
+            });
+        }
+    }
+
+    let mut errors: Vec<Value> = Vec::new();
+
+    // Build the list of all prevouts for SighashCache (needed for taproot)
+    let all_prevouts: Vec<TxOut> = prevouts
+        .iter()
+        .map(|p| {
+            p.clone().unwrap_or(TxOut {
+                value: Amount::ZERO,
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            })
+        })
+        .collect();
+
+    // Sign each input (index needed for both prevouts[] and tx.input[] mutation)
+    #[allow(clippy::needless_range_loop)]
+    for i in 0..num_inputs {
+        let prevout = match &prevouts[i] {
+            Some(p) => p.clone(),
+            None => {
+                errors.push(json!({
+                    "txid": tx.input[i].previous_output.txid.to_string(),
+                    "vout": tx.input[i].previous_output.vout,
+                    "error": "Input not found or already spent",
+                }));
+                continue;
+            }
+        };
+
+        let script = &prevout.script_pubkey;
+
+        if script.is_p2pkh() {
+            // P2PKH: legacy signing
+            let cache = bitcoin::sighash::SighashCache::new(&tx);
+            let sighash = cache
+                .legacy_signature_hash(i, script, ecdsa_sighash_type.to_u32())
+                .map_err(|e| (-1, format!("Sighash error: {}", e)))?;
+
+            let msg = bitcoin::secp256k1::Message::from_digest(sighash.to_byte_array());
+            // Find which key matches the P2PKH address
+            let mut signed = false;
+            for (pubkey, secret) in &key_map {
+                let expected = bitcoin::ScriptBuf::new_p2pkh(&pubkey.pubkey_hash());
+                if expected.as_bytes() == script.as_bytes() {
+                    let sig = secp.sign_ecdsa(&msg, secret);
+                    let ecdsa_sig = bitcoin::ecdsa::Signature::sighash_all(sig);
+                    let mut script_sig = bitcoin::script::Builder::new()
+                        .push_slice(ecdsa_sig.serialize())
+                        .push_key(pubkey)
+                        .into_script();
+                    // Override sighash type if not ALL
+                    if ecdsa_sighash_type != bitcoin::sighash::EcdsaSighashType::All {
+                        script_sig = bitcoin::script::Builder::new()
+                            .push_slice(bitcoin::ecdsa::Signature { signature: sig, sighash_type: ecdsa_sighash_type }.serialize())
+                            .push_key(pubkey)
+                            .into_script();
+                    }
+                    tx.input[i].script_sig = script_sig;
+                    signed = true;
+                    break;
+                }
+            }
+            if !signed {
+                errors.push(json!({
+                    "txid": tx.input[i].previous_output.txid.to_string(),
+                    "vout": tx.input[i].previous_output.vout,
+                    "error": "Unable to sign input, no matching key",
+                }));
+            }
+        } else if script.is_p2wpkh() {
+            // P2WPKH: segwit v0 signing
+            let mut cache = bitcoin::sighash::SighashCache::new(&tx);
+            let mut signed = false;
+            for (pubkey, secret) in &key_map {
+                let Ok(wpkh) = pubkey.wpubkey_hash() else { continue };
+                let expected = bitcoin::ScriptBuf::new_p2wpkh(&wpkh);
+                if expected.as_bytes() == script.as_bytes() {
+                    let sighash = cache
+                        .p2wpkh_signature_hash(i, script, prevout.value, ecdsa_sighash_type)
+                        .map_err(|e| (-1, format!("Sighash error: {}", e)))?;
+                    let msg = bitcoin::secp256k1::Message::from_digest(sighash.to_byte_array());
+                    let sig = secp.sign_ecdsa(&msg, secret);
+                    let ecdsa_sig = bitcoin::ecdsa::Signature { signature: sig, sighash_type: ecdsa_sighash_type };
+                    let mut witness = Witness::new();
+                    witness.push(ecdsa_sig.serialize());
+                    witness.push(pubkey.to_bytes());
+                    tx.input[i].witness = witness;
+                    signed = true;
+                    break;
+                }
+            }
+            if !signed {
+                errors.push(json!({
+                    "txid": tx.input[i].previous_output.txid.to_string(),
+                    "vout": tx.input[i].previous_output.vout,
+                    "error": "Unable to sign input, no matching key",
+                }));
+            }
+        } else if script.is_p2sh() {
+            // P2SH-P2WPKH: check if any key matches wrapped segwit
+            let mut signed = false;
+            for (pubkey, secret) in &key_map {
+                if let Ok(wpkh) = pubkey.wpubkey_hash() {
+                    let redeem_script = bitcoin::ScriptBuf::new_p2wpkh(&wpkh);
+                    let expected_p2sh = bitcoin::ScriptBuf::new_p2sh(&redeem_script.script_hash());
+                    if expected_p2sh.as_bytes() == script.as_bytes() {
+                        let mut cache = bitcoin::sighash::SighashCache::new(&tx);
+                        let sighash = cache
+                            .p2wpkh_signature_hash(i, &redeem_script, prevout.value, ecdsa_sighash_type)
+                            .map_err(|e| (-1, format!("Sighash error: {}", e)))?;
+                        let msg = bitcoin::secp256k1::Message::from_digest(sighash.to_byte_array());
+                        let sig = secp.sign_ecdsa(&msg, secret);
+                        let ecdsa_sig = bitcoin::ecdsa::Signature { signature: sig, sighash_type: ecdsa_sighash_type };
+
+                        // P2SH scriptSig pushes the redeem script
+                        let redeem_bytes = bitcoin::script::PushBytesBuf::try_from(redeem_script.to_bytes())
+                            .map_err(|_| (-1, "Redeem script too large".to_string()))?;
+                        tx.input[i].script_sig = bitcoin::script::Builder::new()
+                            .push_slice(&redeem_bytes)
+                            .into_script();
+                        let mut witness = Witness::new();
+                        witness.push(ecdsa_sig.serialize());
+                        witness.push(pubkey.to_bytes());
+                        tx.input[i].witness = witness;
+                        signed = true;
+                        break;
+                    }
+                }
+            }
+            if !signed {
+                errors.push(json!({
+                    "txid": tx.input[i].previous_output.txid.to_string(),
+                    "vout": tx.input[i].previous_output.vout,
+                    "error": "Unable to sign input, no matching key",
+                }));
+            }
+        } else if script.is_p2tr() {
+            // P2TR key-path: taproot signing
+            let mut cache = bitcoin::sighash::SighashCache::new(&tx);
+            let mut signed = false;
+            for (xonly_pub, secret) in &xonly_key_map {
+                let expected = bitcoin::ScriptBuf::new_p2tr(&secp, *xonly_pub, None);
+                if expected.as_bytes() == script.as_bytes() {
+                    let sighash = cache
+                        .taproot_key_spend_signature_hash(
+                            i,
+                            &bitcoin::sighash::Prevouts::All(&all_prevouts),
+                            bitcoin::sighash::TapSighashType::Default,
+                        )
+                        .map_err(|e| (-1, format!("Taproot sighash error: {}", e)))?;
+                    let msg = bitcoin::secp256k1::Message::from_digest(sighash.to_byte_array());
+                    // Taproot key-path requires key tweaking
+                    let keypair = bitcoin::secp256k1::Keypair::from_secret_key(&secp, secret);
+                    let tweaked = keypair.tap_tweak(&secp, None);
+                    let sig = secp.sign_schnorr(&msg, &tweaked.to_keypair());
+                    let tap_sig = bitcoin::taproot::Signature {
+                        signature: sig,
+                        sighash_type: bitcoin::sighash::TapSighashType::Default,
+                    };
+                    let mut witness = Witness::new();
+                    witness.push(tap_sig.serialize());
+                    tx.input[i].witness = witness;
+                    signed = true;
+                    break;
+                }
+            }
+            if !signed {
+                errors.push(json!({
+                    "txid": tx.input[i].previous_output.txid.to_string(),
+                    "vout": tx.input[i].previous_output.vout,
+                    "error": "Unable to sign input, no matching key",
+                }));
+            }
+        } else {
+            errors.push(json!({
+                "txid": tx.input[i].previous_output.txid.to_string(),
+                "vout": tx.input[i].previous_output.vout,
+                "error": "Unsupported script type",
+            }));
+        }
+    }
+
+    let complete = errors.is_empty()
+        && tx.input.iter().all(|inp| !inp.script_sig.is_empty() || !inp.witness.is_empty());
+    let raw = bitcoin::consensus::serialize(&tx);
+
+    let mut result = json!({
+        "hex": hex::encode(raw),
+        "complete": complete,
+    });
+    if !errors.is_empty() {
+        result["errors"] = json!(errors);
+    }
+    Ok(result)
+}
+
 /// Classify a script's type.
 fn script_type(script: &bitcoin::Script) -> &'static str {
     if script.is_p2pkh() {
@@ -426,6 +722,7 @@ fn script_type(script: &bitcoin::Script) -> &'static str {
 mod tests {
     use super::*;
     use crate::mempool::pool::Mempool;
+    use bitcoin::hashes::Hash;
 
     #[test]
     fn test_getmempoolinfo_empty() {
@@ -441,7 +738,6 @@ mod tests {
     #[test]
     fn test_decode_raw_transaction() {
         use bitcoin::blockdata::locktime::absolute::LockTime;
-        use bitcoin::hashes::Hash;
 
         // Build a simple transaction
         let tx = Transaction {
@@ -492,5 +788,250 @@ mod tests {
 
         // Verify version
         assert_eq!(result["version"], 2);
+    }
+
+    /// Helper: create a chain state for tests that use prevtxs (chain state won't be queried).
+    fn make_chain_state() -> (crate::chain::state::ChainState, std::path::PathBuf) {
+        crate::chain::state::tests::make_chain_state()
+    }
+
+    /// Helper: generate a key pair and return (WIF, pubkey, secret_key).
+    fn test_keypair() -> (String, bitcoin::PublicKey, bitcoin::secp256k1::SecretKey) {
+        let secp = Secp256k1::new();
+        // Well-known test key: secret = 1
+        let mut key_bytes = [0u8; 32];
+        key_bytes[31] = 1;
+        let sk = bitcoin::secp256k1::SecretKey::from_slice(&key_bytes).unwrap();
+        let pk = bitcoin::PublicKey::from_private_key(&secp, &bitcoin::PrivateKey {
+            compressed: true,
+            network: bitcoin::NetworkKind::Test,
+            inner: sk,
+        });
+        let wif = bitcoin::PrivateKey {
+            compressed: true,
+            network: bitcoin::NetworkKind::Test,
+            inner: sk,
+        }
+        .to_wif();
+        (wif, pk, sk)
+    }
+
+    /// Build an unsigned tx spending a fake outpoint to a burn output.
+    fn unsigned_tx(outpoint: OutPoint) -> Transaction {
+        Transaction {
+            version: Version(2),
+            lock_time: bitcoin::blockdata::locktime::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: outpoint,
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: Sequence(0xffff_fffd),
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(49_9900_0000),
+                script_pubkey: bitcoin::ScriptBuf::new_p2wpkh(
+                    &bitcoin::WPubkeyHash::all_zeros(),
+                ),
+            }],
+        }
+    }
+
+    #[test]
+    fn test_sign_p2wpkh() {
+        let (cs, _dir) = make_chain_state();
+        let (wif, pk, _sk) = test_keypair();
+
+        let outpoint = OutPoint {
+            txid: bitcoin::Txid::all_zeros(),
+            vout: 0,
+        };
+        let tx = unsigned_tx(outpoint);
+        let hex_tx = hex::encode(bitcoin::consensus::serialize(&tx));
+
+        let script_pubkey = bitcoin::ScriptBuf::new_p2wpkh(&pk.wpubkey_hash().unwrap());
+        let prevtxs = vec![json!({
+            "txid": outpoint.txid.to_string(),
+            "vout": 0,
+            "scriptPubKey": hex::encode(script_pubkey.as_bytes()),
+            "amount": 50.0,
+        })];
+
+        let result = sign_raw_transaction_with_key(
+            &cs,
+            &hex_tx,
+            &[wif],
+            Some(&prevtxs),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(result["complete"], true);
+        // The signed tx should be longer than the unsigned tx
+        assert!(result["hex"].as_str().unwrap().len() > hex_tx.len());
+
+        // Verify the signed tx deserializes and has a witness
+        let signed_bytes = hex::decode(result["hex"].as_str().unwrap()).unwrap();
+        let signed_tx: Transaction = bitcoin::consensus::deserialize(&signed_bytes).unwrap();
+        assert!(!signed_tx.input[0].witness.is_empty());
+        assert_eq!(signed_tx.input[0].witness.len(), 2); // [sig, pubkey]
+    }
+
+    #[test]
+    fn test_sign_p2pkh() {
+        let (cs, _dir) = make_chain_state();
+        let (wif, pk, _sk) = test_keypair();
+
+        let outpoint = OutPoint {
+            txid: bitcoin::Txid::all_zeros(),
+            vout: 0,
+        };
+        let tx = unsigned_tx(outpoint);
+        let hex_tx = hex::encode(bitcoin::consensus::serialize(&tx));
+
+        let script_pubkey = bitcoin::ScriptBuf::new_p2pkh(&pk.pubkey_hash());
+        let prevtxs = vec![json!({
+            "txid": outpoint.txid.to_string(),
+            "vout": 0,
+            "scriptPubKey": hex::encode(script_pubkey.as_bytes()),
+            "amount": 50.0,
+        })];
+
+        let result = sign_raw_transaction_with_key(
+            &cs,
+            &hex_tx,
+            &[wif],
+            Some(&prevtxs),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(result["complete"], true);
+
+        let signed_bytes = hex::decode(result["hex"].as_str().unwrap()).unwrap();
+        let signed_tx: Transaction = bitcoin::consensus::deserialize(&signed_bytes).unwrap();
+        assert!(!signed_tx.input[0].script_sig.is_empty());
+    }
+
+    #[test]
+    fn test_sign_p2tr_keypath() {
+        let (cs, _dir) = make_chain_state();
+        let (wif, pk, _sk) = test_keypair();
+
+        let secp = Secp256k1::new();
+        let (xonly, _parity) = pk.inner.x_only_public_key();
+        let script_pubkey = bitcoin::ScriptBuf::new_p2tr(&secp, xonly, None);
+
+        let outpoint = OutPoint {
+            txid: bitcoin::Txid::all_zeros(),
+            vout: 0,
+        };
+        let tx = unsigned_tx(outpoint);
+        let hex_tx = hex::encode(bitcoin::consensus::serialize(&tx));
+
+        let prevtxs = vec![json!({
+            "txid": outpoint.txid.to_string(),
+            "vout": 0,
+            "scriptPubKey": hex::encode(script_pubkey.as_bytes()),
+            "amount": 50.0,
+        })];
+
+        let result = sign_raw_transaction_with_key(
+            &cs,
+            &hex_tx,
+            &[wif],
+            Some(&prevtxs),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(result["complete"], true);
+
+        let signed_bytes = hex::decode(result["hex"].as_str().unwrap()).unwrap();
+        let signed_tx: Transaction = bitcoin::consensus::deserialize(&signed_bytes).unwrap();
+        assert_eq!(signed_tx.input[0].witness.len(), 1); // [schnorr_sig]
+    }
+
+    #[test]
+    fn test_sign_wrong_key_returns_error() {
+        let (cs, _dir) = make_chain_state();
+
+        // Use key=1 but the scriptPubKey is for key=2
+        let (wif, _pk, _sk) = test_keypair();
+
+        let secp = Secp256k1::new();
+        let mut key2_bytes = [0u8; 32];
+        key2_bytes[31] = 2;
+        let sk2 = bitcoin::secp256k1::SecretKey::from_slice(&key2_bytes).unwrap();
+        let pk2 = bitcoin::PublicKey::from_private_key(&secp, &bitcoin::PrivateKey {
+            compressed: true,
+            network: bitcoin::NetworkKind::Test,
+            inner: sk2,
+        });
+        let script_pubkey = bitcoin::ScriptBuf::new_p2wpkh(&pk2.wpubkey_hash().unwrap());
+
+        let outpoint = OutPoint {
+            txid: bitcoin::Txid::all_zeros(),
+            vout: 0,
+        };
+        let tx = unsigned_tx(outpoint);
+        let hex_tx = hex::encode(bitcoin::consensus::serialize(&tx));
+
+        let prevtxs = vec![json!({
+            "txid": outpoint.txid.to_string(),
+            "vout": 0,
+            "scriptPubKey": hex::encode(script_pubkey.as_bytes()),
+            "amount": 50.0,
+        })];
+
+        let result = sign_raw_transaction_with_key(
+            &cs,
+            &hex_tx,
+            &[wif],
+            Some(&prevtxs),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(result["complete"], false);
+        assert!(!result["errors"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_sign_invalid_wif() {
+        let (cs, _dir) = make_chain_state();
+
+        let outpoint = OutPoint {
+            txid: bitcoin::Txid::all_zeros(),
+            vout: 0,
+        };
+        let tx = unsigned_tx(outpoint);
+        let hex_tx = hex::encode(bitcoin::consensus::serialize(&tx));
+
+        let result = sign_raw_transaction_with_key(
+            &cs,
+            &hex_tx,
+            &["not-a-valid-wif".to_string()],
+            None,
+            None,
+        );
+
+        assert!(result.is_err());
+        let (code, msg) = result.unwrap_err();
+        assert_eq!(code, -5);
+        assert!(msg.contains("Invalid private key"));
+    }
+
+    #[test]
+    fn test_parse_sighash_types() {
+        use bitcoin::sighash::EcdsaSighashType;
+        assert_eq!(parse_sighash_type(None).unwrap(), EcdsaSighashType::All);
+        assert_eq!(parse_sighash_type(Some("ALL")).unwrap(), EcdsaSighashType::All);
+        assert_eq!(parse_sighash_type(Some("NONE")).unwrap(), EcdsaSighashType::None);
+        assert_eq!(parse_sighash_type(Some("SINGLE")).unwrap(), EcdsaSighashType::Single);
+        assert_eq!(
+            parse_sighash_type(Some("ALL|ANYONECANPAY")).unwrap(),
+            EcdsaSighashType::AllPlusAnyoneCanPay
+        );
+        assert!(parse_sighash_type(Some("INVALID")).is_err());
     }
 }
