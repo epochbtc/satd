@@ -143,16 +143,19 @@ Implemented:
 - Standard script type enforcement: rejects non-standard output scripts (P2PKH,
   P2SH, P2WPKH, P2WSH, P2TR, OP_RETURN accepted; bare multisig configurable)
 
-### 21. ~~Missing P2P message types~~ — PARTIALLY FIXED
+### 21. ~~Missing P2P message types~~ — FIXED (intentional exclusions)
 
 19 of ~20 message types are now handled: `Ping`, `Pong`, `Inv`, `Headers`,
 `Block`, `Tx`, `GetHeaders`, `GetData`, `SendHeaders`, `SendCmpct`,
 `CmpctBlock`, `GetBlockTxn`, `BlockTxn`, `FeeFilter`, `Addr`, `AddrV2`,
 `SendAddrV2`, `NotFound`, `GetAddr`.
-Not handled:
 
-- `MemPool` (mempool sync — rarely used)
-- `FilterLoad` / `FilterAdd` / `FilterClear` (bloom filters — deprecated)
+Intentionally excluded (same rationale as legacy wallet exclusion):
+
+- `FilterLoad` / `FilterAdd` / `FilterClear` / `MerkleBlock` — BIP 37 bloom
+  filters. Deprecated in Bitcoin Core (disabled by default since v0.19, 2019).
+  Known privacy leak and DoS vector. No modern wallet uses them.
+- `MemPool` — rarely used, mostly by bloom filter clients.
 
 ### 22. ~~Incomplete getblocktemplate (BIP 22/23)~~ — FIXED
 
@@ -190,9 +193,9 @@ mapped to redb tables. No external C++ dependencies for storage.
 |----------|-------|-------|---------|------|-------------|
 | **P0** | 6 | 6 | 0 | 0 | All consensus-critical gaps closed |
 | **P1** | 8 | 8 | 0 | 0 | All reliability gaps closed |
-| **P2** | 11 | 9 | 1 | 1 | All major features complete; P2P bloom filters + config flags remain |
-| **Total** | 25 | 23 | 1 | 1 | |
+| **P2** | 11 | 10 | 0 | 1 | All features complete; only config flags remain |
+| **Total** | 25 | 24 | 0 | 1 | |
 
 All P0 and P1 gaps are resolved. All RPCs (77/77) implemented. getblocktemplate
-is production-ready. Standard mempool policy enforced. The only remaining items
-are missing config flags (#19) and deprecated P2P bloom filters (#21).
+is production-ready. Standard mempool policy enforced. Bloom filters intentionally
+excluded (deprecated). The only remaining item is missing config flags (#19).
