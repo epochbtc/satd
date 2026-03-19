@@ -212,13 +212,15 @@ async fn main() {
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
     // Initialize P2P peer manager
-    let peer_manager = node::net::manager::PeerManager::with_prune(
+    let peer_manager = node::net::manager::PeerManager::with_config(
         chain_state.clone(),
         mempool.clone(),
         fee_estimator.clone(),
         config.network,
         shutdown_rx.clone(),
         config.prune,
+        config.maxconnections,
+        config.bantime,
     );
 
     if config.prune > 0 {
@@ -251,9 +253,16 @@ async fn main() {
 
     tracing::info!(%bind_addr, "RPC server listening");
 
+    // Write PID file if requested
+    if let Some(ref pid_path) = config.pid
+        && let Err(e) = std::fs::write(pid_path, std::process::id().to_string())
+    {
+        eprintln!("Warning: failed to write PID file {}: {}", pid_path, e);
+    }
+
     // Start P2P networking
     if config.listen {
-        let p2p_addr: SocketAddr = format!("0.0.0.0:{}", config.port)
+        let p2p_addr: SocketAddr = format!("{}:{}", config.bind, config.port)
             .parse()
             .expect("Invalid P2P bind address");
         let pm = peer_manager.clone();
@@ -278,9 +287,21 @@ async fn main() {
         }
     }
 
-    // DNS seeding: only if no explicit --connect peers are configured
-    // (matches Bitcoin Core behavior where --connect disables DNS seeding)
-    if config.connect.is_empty() {
+    // Connect to -addnode peers (does NOT disable DNS seeding)
+    for addr_str in &config.addnode {
+        if let Ok(addr) = addr_str.parse::<SocketAddr>() {
+            peer_manager.add_connect_addr(addr);
+            let pm = peer_manager.clone();
+            tokio::spawn(async move {
+                if let Err(e) = pm.connect_outbound(addr).await {
+                    tracing::warn!(%addr, "Failed to connect to addnode peer: {}", e);
+                }
+            });
+        }
+    }
+
+    // DNS seeding: only if no explicit --connect peers and --dns is enabled
+    if config.connect.is_empty() && config.dns {
         let dns_addrs =
             node::net::dns::resolve_dns_seeds(config.network).await;
         let max_dns_outbound = 64;
@@ -314,5 +335,8 @@ async fn main() {
     // Graceful shutdown
     server_handle.stop().expect("Failed to stop server");
     auth.cleanup();
+    if let Some(ref pid_path) = config.pid {
+        let _ = std::fs::remove_file(pid_path);
+    }
     tracing::info!("satd stopped");
 }
