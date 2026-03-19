@@ -954,7 +954,7 @@ mod tests {
         let mut hashes = vec![genesis_hash];
         for i in 1..=5u32 {
             let block = build_test_block(parent, i, 1_300_000_000 + i);
-            parent = cs.accept_block(&block).expect(&format!("accept block {}", i));
+            parent = cs.accept_block(&block).unwrap_or_else(|_| panic!("accept block {}", i));
             hashes.push(parent);
         }
         assert_eq!(cs.tip_height(), 5);
