@@ -93,6 +93,7 @@ impl IbdScheduler {
 
     /// Assign blocks to a peer for download. Returns hashes to request via GetData.
     /// Respects per-peer limits and the max-ahead window.
+    /// Always prioritizes blocks near the connect cursor to avoid deadlocks.
     pub fn assign_blocks(&mut self, peer_id: PeerId) -> Vec<BlockHash> {
         let slots = self
             .peer_slots
@@ -112,15 +113,34 @@ impl IbdScheduler {
         let mut hashes = Vec::with_capacity(budget);
         let mut assigned_heights = Vec::with_capacity(budget);
 
+        // Priority zone: always try to assign the next few blocks above the connect cursor.
+        // This prevents deadlock where random blocks are downloaded but the connect
+        // thread is blocked waiting for the very next sequential block.
+        // Limited to 16 blocks to leave most budget for random distribution.
+        let priority_end = (self.connect_cursor + 16).min(self.target_height);
+        for h in (self.connect_cursor + 1)..=priority_end {
+            if hashes.len() >= budget {
+                break;
+            }
+            if self.downloaded.contains(&h) || self.in_flight.contains_key(&h) {
+                continue;
+            }
+            if let Some(&hash) = self.height_to_hash.get(&h) {
+                self.in_flight.insert(h, peer_id);
+                assigned_heights.push(h);
+                hashes.push(hash);
+            }
+        }
+
+        // Then fill remaining budget from the shuffled pending pool
         let mut attempts = 0;
         while hashes.len() < budget && !self.pending.is_empty() {
-            // Prevent infinite loop if all remaining blocks exceed max_ahead
             attempts += 1;
             if attempts > self.pending.len() + budget {
                 break;
             }
 
-            // Respect max_ahead window: don't assign if too many blocks ahead of cursor
+            // Respect max_ahead window
             let total_ahead =
                 self.downloaded.len() as u32 + self.in_flight.len() as u32 + hashes.len() as u32;
             if total_ahead >= self.max_ahead {
@@ -132,12 +152,9 @@ impl IbdScheduler {
                 None => break,
             };
 
-            // Skip already downloaded
             if self.downloaded.contains(&height) {
                 continue;
             }
-
-            // Skip if already in-flight
             if self.in_flight.contains_key(&height) {
                 continue;
             }
