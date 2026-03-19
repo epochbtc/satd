@@ -772,7 +772,7 @@ fn network_magic(network: Network) -> [u8; 4] {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::storage::db::InMemoryStore;
     use crate::storage::flatfile::FlatFileManager;
@@ -830,7 +830,7 @@ mod tests {
     }
 
     /// Build a valid regtest block at the given height with the given parent hash and timestamp.
-    fn build_test_block(parent_hash: BlockHash, height: u32, time: u32) -> Block {
+    pub(crate) fn build_test_block(parent_hash: BlockHash, height: u32, time: u32) -> Block {
         use bitcoin::block::Header;
         use bitcoin::blockdata::locktime::absolute::LockTime;
         use bitcoin::hashes::Hash;
