@@ -531,11 +531,32 @@ impl PeerManager {
                 for pid in &peer_ids {
                     self.request_missing_blocks(*pid);
                 }
-                // Request headers less frequently
-                if ticks.is_multiple_of(20) {
-                    for pid in &peer_ids {
-                        self.send_to_peer(*pid, sync::make_getheaders(&self.chain_state));
-                    }
+            }
+
+            // Request headers: aggressively during IBD (every 1s from all peers),
+            // less frequently once caught up (every 10s)
+            if self.is_ibd() && !has_ibd && ticks.is_multiple_of(2) {
+                // Pre-swarm IBD: headers are still downloading, request from all peers
+                let peer_ids: Vec<PeerId> = {
+                    let peers = self.peers.read().unwrap();
+                    peers.iter()
+                        .filter(|(_, h)| h.info.state == PeerState::Connected)
+                        .map(|(id, _)| *id)
+                        .collect()
+                };
+                for pid in &peer_ids {
+                    self.send_to_peer(*pid, sync::make_getheaders(&self.chain_state));
+                }
+            } else if !has_ibd && ticks.is_multiple_of(20) {
+                let peer_ids: Vec<PeerId> = {
+                    let peers = self.peers.read().unwrap();
+                    peers.iter()
+                        .filter(|(_, h)| h.info.state == PeerState::Connected)
+                        .map(|(id, _)| *id)
+                        .collect()
+                };
+                for pid in &peer_ids {
+                    self.send_to_peer(*pid, sync::make_getheaders(&self.chain_state));
                 }
             }
 
