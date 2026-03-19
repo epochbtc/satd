@@ -89,6 +89,20 @@ impl FlatFileManager {
         Ok(pos)
     }
 
+    /// Check whether a given flat file exists on disk.
+    pub fn file_exists(&self, file_number: u32) -> bool {
+        self.file_path(file_number).exists()
+    }
+
+    /// Delete a flat file from disk.
+    pub fn delete_file(&self, file_number: u32) -> std::io::Result<()> {
+        let path = self.file_path(file_number);
+        if path.exists() {
+            std::fs::remove_file(&path)?;
+        }
+        Ok(())
+    }
+
     /// Read a block from the flat files at the given position.
     pub fn read_block(&self, pos: &FlatFilePos) -> std::io::Result<Vec<u8>> {
         let path = self.file_path(pos.file_number);

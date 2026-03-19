@@ -106,6 +106,9 @@ pub struct PeerManager {
     fee_estimator: Arc<FeeEstimator>,
     /// Shutdown signal.
     shutdown: tokio::sync::watch::Receiver<bool>,
+    /// Prune target in MB (0 = disabled).
+    #[allow(dead_code)]
+    prune_target_mb: u64,
 }
 
 impl PeerManager {
@@ -115,6 +118,17 @@ impl PeerManager {
         fee_estimator: Arc<FeeEstimator>,
         network: Network,
         shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> Arc<Self> {
+        Self::with_prune(chain_state, mempool, fee_estimator, network, shutdown, 0)
+    }
+
+    pub fn with_prune(
+        chain_state: Arc<ChainState>,
+        mempool: Arc<Mempool>,
+        fee_estimator: Arc<FeeEstimator>,
+        network: Network,
+        shutdown: tokio::sync::watch::Receiver<bool>,
+        prune_target_mb: u64,
     ) -> Arc<Self> {
         let (event_tx, event_rx) = mpsc::channel(4096);
         let (block_tx, block_rx) = mpsc::unbounded_channel();
@@ -136,14 +150,16 @@ impl PeerManager {
             reconnect_backoff: RwLock::new(HashMap::new()),
             banned_addrs: RwLock::new(HashMap::new()),
             shutdown,
+            prune_target_mb,
         });
 
         // Spawn block processing thread
         let cs = chain_state;
         let mp = mempool;
         let fe = fee_estimator;
+        let prune_mb = prune_target_mb;
         std::thread::spawn(move || {
-            Self::block_processor(block_rx, cs, mp, fe);
+            Self::block_processor(block_rx, cs, mp, fe, prune_mb);
         });
 
         mgr
@@ -691,9 +707,20 @@ impl PeerManager {
         chain_state: Arc<ChainState>,
         mempool: Arc<Mempool>,
         fee_estimator: Arc<FeeEstimator>,
+        prune_target_mb: u64,
     ) {
         let mut block_buffer: HashMap<bitcoin::BlockHash, bitcoin::Block> = HashMap::new();
         let mut last_log_height: u32 = 0;
+        let mut last_prune_height: u32 = 0;
+
+        // Compute keep_blocks from prune target.
+        // Average block size ~1.5 MB for mainnet, ~0.01 MB for signet/regtest.
+        // Conservative: assume 2 MB per block.
+        let keep_blocks: u32 = if prune_target_mb > 0 {
+            ((prune_target_mb * 1_000_000 / (2 * 1_000_000)) as u32).max(288)
+        } else {
+            0
+        };
 
         while let Some(block) = rx.blocking_recv() {
             let hash = block.block_hash();
@@ -721,6 +748,17 @@ impl PeerManager {
                     if height / 1000 > last_log_height / 1000 {
                         tracing::info!(height, buffered = block_buffer.len(), "IBD progress");
                         last_log_height = height;
+                    }
+
+                    // Periodic pruning during IBD
+                    if keep_blocks > 0 && height > keep_blocks
+                        && height / 1000 > last_prune_height / 1000
+                    {
+                        let deleted = chain_state.prune_blocks(keep_blocks);
+                        if deleted > 0 {
+                            tracing::info!(height, deleted, "Pruned old block files");
+                        }
+                        last_prune_height = height;
                     }
                 }
                 Err(crate::chain::state::ChainError::Duplicate) => {}
