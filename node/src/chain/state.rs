@@ -1347,4 +1347,230 @@ pub(crate) mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn test_accept_header_creates_header_only() {
+        let (cs, dir) = make_chain_state();
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+
+        let block1 = build_test_block(genesis_hash, 1, 1_300_000_001);
+        let hash = cs.accept_header(&block1.header).unwrap();
+
+        let entry = cs.get_block_index(&hash).unwrap();
+        assert_eq!(
+            entry.status,
+            BlockStatus::HeaderOnly,
+            "accept_header should create HeaderOnly entry"
+        );
+        assert_eq!(entry.height, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_accept_header_requires_parent() {
+        let (cs, dir) = make_chain_state();
+
+        // Build a header whose prev_blockhash is unknown
+        let fake_parent: BlockHash = "0000000000000000000000000000000000000000000000000000000000abcdef"
+            .parse()
+            .unwrap();
+        let block = build_test_block(fake_parent, 1, 1_300_000_001);
+
+        let result = cs.accept_header(&block.header);
+        assert!(
+            matches!(result, Err(ChainError::BadPrevBlock)),
+            "accept_header with unknown parent should return BadPrevBlock, got {:?}",
+            result
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_accept_header_duplicate_returns_ok() {
+        // accept_header returns Ok(hash) for already-known headers (not Err)
+        let (cs, dir) = make_chain_state();
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+
+        let block1 = build_test_block(genesis_hash, 1, 1_300_000_001);
+        let hash1 = cs.accept_header(&block1.header).unwrap();
+        let hash2 = cs.accept_header(&block1.header).unwrap();
+
+        assert_eq!(hash1, hash2, "Duplicate accept_header should return same hash");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_accept_header_bad_pow() {
+        let (cs, dir) = make_chain_state();
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+
+        // Build a valid test block, then corrupt its nonce so PoW is invalid
+        let mut block = build_test_block(genesis_hash, 1, 1_300_000_001);
+        // Set bits to mainnet difficulty (extremely hard) — the hash won't meet it
+        block.header.bits = bitcoin::pow::CompactTarget::from_consensus(0x1d00ffff);
+
+        let result = cs.accept_header(&block.header);
+        // This should fail either on PoW check or difficulty check (regtest expects 0x207fffff)
+        assert!(
+            result.is_err(),
+            "accept_header with bad PoW/difficulty should fail, got {:?}",
+            result
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_accept_header_updates_headers_tip() {
+        let (cs, dir) = make_chain_state();
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+
+        assert_eq!(cs.headers_tip_height(), 0, "Initial headers_tip should be 0");
+
+        let block1 = build_test_block(genesis_hash, 1, 1_300_000_001);
+        let hash1 = cs.accept_header(&block1.header).unwrap();
+
+        assert_eq!(
+            cs.headers_tip_height(),
+            1,
+            "headers_tip_height should be 1 after accepting header at height 1"
+        );
+
+        let block2 = build_test_block(hash1, 2, 1_300_000_002);
+        cs.accept_header(&block2.header).unwrap();
+
+        assert_eq!(
+            cs.headers_tip_height(),
+            2,
+            "headers_tip_height should be 2 after accepting header at height 2"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_should_skip_scripts_disabled() {
+        let (cs, dir) = make_chain_state();
+        // make_chain_state creates with AssumeValid::Disabled
+        assert!(
+            !cs.should_skip_scripts(0),
+            "should_skip_scripts should be false at height 0 with Disabled"
+        );
+        assert!(
+            !cs.should_skip_scripts(100),
+            "should_skip_scripts should be false at height 100 with Disabled"
+        );
+        assert!(
+            !cs.should_skip_scripts(1_000_000),
+            "should_skip_scripts should be false at height 1M with Disabled"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_should_skip_scripts_hash() {
+        // Create a ChainState with AssumeValid::Hash pointing to a block we'll connect.
+        let dir = std::env::temp_dir().join(format!(
+            "satd-av-hash-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let blocks_dir = dir.join("blocks");
+        let store = Box::new(InMemoryStore::new());
+        let flat_files = FlatFileManager::new(&blocks_dir).unwrap();
+
+        // First build the chain to find the block hash
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+        let block1 = build_test_block(genesis_hash, 1, 1_300_000_001);
+        let block1_hash = block1.block_hash();
+
+        let cs = ChainState::new(
+            store,
+            flat_files,
+            Network::Regtest,
+            Box::new(NoopVerifier),
+            AssumeValid::Hash(block1_hash),
+        )
+        .unwrap();
+
+        // Before accepting the block, should_skip_scripts returns false
+        // (hash not yet in index)
+        assert!(
+            !cs.should_skip_scripts(0),
+            "Before block is known, should not skip scripts"
+        );
+
+        // Accept the block (connects it, adding to index)
+        cs.accept_block(&block1).unwrap();
+
+        // Now the hash is in the index at height 1
+        // Height <= 1 should skip scripts
+        assert!(
+            cs.should_skip_scripts(0),
+            "Height 0 <= 1, should skip scripts"
+        );
+        assert!(
+            cs.should_skip_scripts(1),
+            "Height 1 <= 1, should skip scripts"
+        );
+        // Height > 1 should NOT skip scripts
+        assert!(
+            !cs.should_skip_scripts(2),
+            "Height 2 > 1, should not skip scripts"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_get_median_time_past_short_chain() {
+        // Build a chain shorter than 11 blocks and verify MTP uses available blocks.
+        let (cs, dir) = make_chain_state();
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+        let genesis_hash = genesis.block_hash();
+
+        // Build 3 blocks with known timestamps.
+        // t3 is between t1 and t2 (out of chronological order) to test sorting.
+        // All must be above MTP at their respective heights to pass timestamp validation.
+        let t1 = 1_300_000_100;
+        let t2 = 1_300_000_200;
+        let t3 = 1_300_000_150; // Out of order vs t2 to test sorting
+
+        let b1 = build_test_block(genesis_hash, 1, t1);
+        let h1 = cs.accept_block(&b1).unwrap();
+
+        let b2 = build_test_block(h1, 2, t2);
+        let h2 = cs.accept_block(&b2).unwrap();
+
+        let b3 = build_test_block(h2, 3, t3);
+        cs.accept_block(&b3).unwrap();
+
+        // MTP at height 4 uses blocks at heights max(0, 4-11)..4 = 0..4
+        // Timestamps: genesis.time, t1, t2, t3
+        // genesis.time for regtest = 1296688602
+        // Sorted: [1296688602, 1_300_000_100, 1_300_000_150, 1_300_000_200]
+        // Median of 4 elements = element at index 2 = 1_300_000_150
+        let mtp = cs.get_median_time_past(4);
+        let genesis_time = genesis.header.time;
+        let mut timestamps = [genesis_time, t1, t2, t3];
+        timestamps.sort();
+        let expected_median = timestamps[timestamps.len() / 2];
+        assert_eq!(
+            mtp, expected_median,
+            "MTP should be the median of available block timestamps"
+        );
+
+        // Also verify MTP at height 1 (only genesis block)
+        let mtp_1 = cs.get_median_time_past(1);
+        assert_eq!(mtp_1, genesis_time, "MTP at height 1 should be genesis time");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

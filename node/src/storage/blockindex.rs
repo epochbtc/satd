@@ -422,4 +422,115 @@ mod tests {
         // Regtest min difficulty is approximately 4.6565e-10
         assert!(diff > 4e-10 && diff < 5e-10, "got {}", diff);
     }
+
+    #[test]
+    fn test_add_u256_carry_propagation() {
+        let mut a = [0u8; 32];
+        let mut b = [0u8; 32];
+        a[31] = 0xFF;
+        b[31] = 0x01;
+        let result = add_u256(&a, &b);
+        // 0xFF + 0x01 = 0x100: byte 31 should be 0x00, carry propagates to byte 30
+        assert_eq!(result[31], 0x00);
+        assert_eq!(result[30], 0x01);
+        assert!(result[..30].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn test_add_u256_max_overflow() {
+        let a = [0xFFu8; 32];
+        let mut b = [0u8; 32];
+        b[31] = 0x01;
+        let result = add_u256(&a, &b);
+        // All-0xFF + 1 should wrap to all-0x00 (overflow wraps)
+        assert_eq!(result, [0u8; 32]);
+    }
+
+    #[test]
+    fn test_mul_u256_u32_basic() {
+        let mut a = [0u8; 32];
+        a[31] = 3;
+        let result = mul_u256_u32(&a, 5);
+        assert_eq!(result[31], 15);
+        assert!(result[..31].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn test_mul_u256_u32_large_carry() {
+        let mut a = [0u8; 32];
+        a[31] = 0xFF;
+        let result = mul_u256_u32(&a, 256);
+        // 0xFF * 256 = 0xFF00
+        assert_eq!(result[30], 0xFF);
+        assert_eq!(result[31], 0x00);
+        assert!(result[..30].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn test_div_u256_u32_exact() {
+        let mut a = [0u8; 32];
+        a[31] = 30;
+        let result = div_u256_u32(&a, 5);
+        assert_eq!(result[31], 6);
+        assert!(result[..31].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn test_div_u256_u32_with_remainder() {
+        let mut a = [0u8; 32];
+        a[31] = 7;
+        let result = div_u256_u32(&a, 2);
+        // 7 / 2 = 3 (truncated)
+        assert_eq!(result[31], 3);
+        assert!(result[..31].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn test_compact_from_target_roundtrip() {
+        // Regtest min difficulty: 0x207fffff
+        let bits1 = CompactTarget::from_consensus(0x207fffff);
+        let target1 = target_from_compact(bits1);
+        let recovered1 = compact_from_target(&target1);
+        assert_eq!(recovered1, 0x207fffff);
+
+        // Mainnet genesis difficulty: 0x1d00ffff
+        let bits2 = CompactTarget::from_consensus(0x1d00ffff);
+        let target2 = target_from_compact(bits2);
+        let recovered2 = compact_from_target(&target2);
+        assert_eq!(recovered2, 0x1d00ffff);
+    }
+
+    #[test]
+    fn test_target_from_compact_mainnet() {
+        // 0x1d00ffff: exponent=0x1d=29, mantissa=0x00ffff
+        // byte_offset = 32 - 29 = 3
+        // target[3] = (0x00ffff >> 16) & 0xff = 0x00
+        // target[4] = (0x00ffff >> 8) & 0xff  = 0xFF
+        // target[5] = 0x00ffff & 0xff          = 0xFF
+        let bits = CompactTarget::from_consensus(0x1d00ffff);
+        let target = target_from_compact(bits);
+        assert_eq!(target[3], 0x00);
+        assert_eq!(target[4], 0xFF);
+        assert_eq!(target[5], 0xFF);
+        // All other bytes should be zero
+        assert!(target[..3].iter().all(|&b| b == 0));
+        assert!(target[6..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn test_work_for_mainnet_bits() {
+        // Mainnet genesis: 0x1d00ffff
+        // work = 2^256 / (target + 1)
+        // target = 0xFFFF * 2^208, so work ~ 2^256 / (0xFFFF * 2^208)
+        //        = 2^48 / 0xFFFF ~ 2^32 * (1 + 2^-16 + ...) ~ 0x01_0001_0001
+        // This is a 5-byte value starting at byte index 27.
+        let bits = CompactTarget::from_consensus(0x1d00ffff);
+        let work = work_for_bits(bits);
+        // Work should be non-zero
+        assert_ne!(work, [0u8; 32]);
+        // Bytes 0..27 should all be zero (the value fits in ~5 bytes)
+        assert!(work[..27].iter().all(|&b| b == 0), "upper bytes should be zero");
+        // Byte 27 should be non-zero (it's 0x01 for the leading byte of ~0x100010001)
+        assert!(work[27] > 0, "byte 27 should be nonzero, got 0x{:02x}", work[27]);
+    }
 }

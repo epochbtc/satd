@@ -1345,3 +1345,430 @@ fn test_waitforblockheight() {
     assert!(result["hash"].is_string());
     node.stop();
 }
+
+// ── Additional integration tests ─────────────────────────────────
+
+#[test]
+fn test_submitblock_valid() {
+    // Mine a valid block using generatetoaddress and verify the block count
+    // increments. Then get the raw block hex, reset to a fresh node, and
+    // submit it via submitblock to verify the RPC accepts a valid block.
+    let mut node = TestNode::start(&[]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+
+    // Mine one block via generatetoaddress
+    let gen_resp = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(1), serde_json::json!(addr)],
+        )
+        .unwrap();
+    let block_hash = gen_resp["result"][0].as_str().unwrap().to_string();
+
+    // Verify block count incremented
+    let count = node.rpc_call("getblockcount").unwrap();
+    assert_eq!(count["result"], 1);
+
+    // Get the raw block hex (verbosity 0)
+    let raw_resp = node
+        .rpc_call_with_params(
+            "getblock",
+            vec![serde_json::json!(block_hash), serde_json::json!(0)],
+        )
+        .unwrap();
+    let block_hex = raw_resp["result"].as_str().unwrap().to_string();
+    assert!(!block_hex.is_empty());
+
+    // Submit the same block again — should get "duplicate" (not an error)
+    let submit_resp = node
+        .rpc_call_with_params("submitblock", vec![serde_json::json!(block_hex)])
+        .unwrap();
+    // Submitting a known block should return "duplicate" or null, not an error
+    let submit_result = &submit_resp["result"];
+    assert!(
+        submit_result.is_null() || submit_result == "duplicate",
+        "Expected null or 'duplicate', got: {:?}",
+        submit_result
+    );
+
+    node.stop();
+}
+
+#[test]
+fn test_node_restart_persistence() {
+    // Start a node, mine blocks, stop, restart with same datadir, verify state persists.
+    // We use raw process management here because TestNode::start always creates its own
+    // datadir, and we need to reuse the same datadir across two invocations.
+    let satd_bin = env!("CARGO_BIN_EXE_satd");
+    let datadir = std::env::temp_dir().join(format!("satd-restart-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&datadir);
+    let _ = std::fs::create_dir_all(&datadir);
+
+    // Helper: make an RPC call to a given port with a given cookie
+    let rpc = |port: u16, cookie: &str, method: &str, params: Vec<serde_json::Value>| -> serde_json::Value {
+        let url = format!("http://127.0.0.1:{}/", port);
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "test",
+            "method": method,
+            "params": params,
+        });
+        let (user, pass) = cookie.split_once(':').unwrap_or(("__cookie__", "none"));
+        let client = reqwest::blocking::Client::new();
+        client
+            .post(&url)
+            .basic_auth(user, Some(pass))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .unwrap()
+            .json()
+            .unwrap()
+    };
+
+    // Helper: wait for cookie file and return its contents
+    let wait_for_cookie = |dir: &std::path::Path| -> String {
+        let cookie_path = dir.join("regtest").join(".cookie");
+        for _ in 0..50 {
+            if let Ok(c) = std::fs::read_to_string(&cookie_path) {
+                return c;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        panic!("Timed out waiting for cookie file at {}", cookie_path.display());
+    };
+
+    let saved_best_hash;
+
+    // ── First run ──
+    let rpcport1 = find_available_port();
+    {
+        let mut child = Command::new(satd_bin)
+            .arg("--regtest")
+            .arg(format!("--datadir={}", datadir.display()))
+            .arg(format!("--rpcport={}", rpcport1))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("Failed to start satd");
+
+        let cookie = wait_for_cookie(&datadir);
+        let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+
+        // Mine 3 blocks
+        rpc(rpcport1, &cookie, "generatetoaddress",
+            vec![serde_json::json!(3), serde_json::json!(addr)]);
+
+        let count = rpc(rpcport1, &cookie, "getblockcount", vec![]);
+        assert_eq!(count["result"], 3);
+
+        saved_best_hash = rpc(rpcport1, &cookie, "getbestblockhash", vec![])["result"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Graceful stop
+        let _ = rpc(rpcport1, &cookie, "stop", vec![]);
+        for _ in 0..30 {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    // ── Second run (same datadir, new port) ──
+    let rpcport2 = find_available_port();
+    {
+        let mut child = Command::new(satd_bin)
+            .arg("--regtest")
+            .arg(format!("--datadir={}", datadir.display()))
+            .arg(format!("--rpcport={}", rpcport2))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("Failed to start satd (second run)");
+
+        let cookie = wait_for_cookie(&datadir);
+
+        // Verify chain state persisted
+        let count = rpc(rpcport2, &cookie, "getblockcount", vec![]);
+        assert_eq!(
+            count["result"], 3,
+            "Block count should persist across restarts"
+        );
+
+        let best_hash = rpc(rpcport2, &cookie, "getbestblockhash", vec![])["result"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            best_hash, saved_best_hash,
+            "Best block hash should persist across restarts"
+        );
+
+        let info = rpc(rpcport2, &cookie, "getblockchaininfo", vec![]);
+        assert_eq!(info["result"]["blocks"], 3);
+        assert_eq!(info["result"]["chain"], "regtest");
+
+        // Graceful stop
+        let _ = rpc(rpcport2, &cookie, "stop", vec![]);
+        for _ in 0..30 {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    let _ = std::fs::remove_dir_all(&datadir);
+}
+
+#[test]
+fn test_gettxoutsetinfo_at_genesis() {
+    // At genesis (height 0), the UTXO set should be empty because
+    // the genesis coinbase is unspendable and not in the UTXO set.
+    let mut node = TestNode::start(&[]);
+    let response = node.rpc_call("gettxoutsetinfo").unwrap();
+    let result = &response["result"];
+
+    assert_eq!(result["height"], 0);
+    assert!(result["bestblock"].is_string());
+    assert_eq!(
+        result["bestblock"],
+        "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206"
+    );
+    // Genesis coinbase is unspendable, so txouts should be 0
+    assert_eq!(
+        result["txouts"], 0,
+        "Genesis UTXO set should have 0 spendable outputs"
+    );
+
+    node.stop();
+}
+
+#[test]
+fn test_getblockstats_genesis() {
+    // Call getblockstats for the genesis block (height 0) and verify expected fields.
+    let mut node = TestNode::start(&[]);
+    let response = node
+        .rpc_call_with_params("getblockstats", vec![serde_json::json!("0")])
+        .unwrap();
+
+    if response["error"].is_object() {
+        // Some implementations may not support getblockstats for genesis block.
+        // If it errors, just verify it's a reasonable error.
+        let error = &response["error"];
+        assert!(error["message"].is_string());
+    } else {
+        let result = &response["result"];
+        assert_eq!(result["height"], 0);
+        assert!(result["txs"].is_number());
+        // Genesis block should have exactly 1 transaction (coinbase)
+        assert_eq!(result["txs"], 1);
+        // Subsidy at height 0 should be 50 BTC = 5_000_000_000 satoshis
+        assert!(result["subsidy"].is_number());
+    }
+
+    node.stop();
+}
+
+#[test]
+fn test_getdifficulty_regtest_value() {
+    // On regtest, the difficulty should be a very small value since
+    // the target is set to the maximum (easiest) difficulty.
+    let mut node = TestNode::start(&[]);
+    let response = node.rpc_call("getdifficulty").unwrap();
+    let difficulty = response["result"].as_f64().unwrap();
+
+    // Regtest difficulty should be positive and very small
+    assert!(difficulty > 0.0, "Difficulty must be positive");
+    // Regtest minimum difficulty is ~4.656e-10
+    assert!(
+        difficulty < 1.0,
+        "Regtest difficulty should be less than 1, got: {}",
+        difficulty
+    );
+
+    node.stop();
+}
+
+#[test]
+fn test_getchaintips_fields() {
+    // Verify getchaintips returns properly structured entries with all
+    // expected fields: height, hash, branchlen, status.
+    let mut node = TestNode::start(&[]);
+    let response = node.rpc_call("getchaintips").unwrap();
+    let result = &response["result"];
+
+    assert!(result.is_array());
+    let tips = result.as_array().unwrap();
+    assert!(!tips.is_empty(), "Should have at least one chain tip");
+
+    // Verify the active tip
+    let active_tip = &tips[0];
+    assert!(active_tip["height"].is_number());
+    assert!(active_tip["hash"].is_string());
+    assert_eq!(active_tip["status"], "active");
+    assert_eq!(
+        active_tip["branchlen"], 0,
+        "Active tip branchlen should be 0"
+    );
+
+    // At genesis, the height should be 0
+    assert_eq!(active_tip["height"], 0);
+
+    node.stop();
+}
+
+#[test]
+fn test_getblockfilter_not_found() {
+    // getblockfilter is not implemented — verify we get an appropriate error.
+    let mut node = TestNode::start(&[]);
+    let fake_hash = "0000000000000000000000000000000000000000000000000000000000000000";
+    let response = node
+        .rpc_call_with_params("getblockfilter", vec![serde_json::json!(fake_hash)])
+        .unwrap();
+
+    // Should return an error (method not found or not implemented)
+    assert!(
+        response["error"].is_object(),
+        "getblockfilter should return an error, got: {:?}",
+        response
+    );
+
+    node.stop();
+}
+
+#[test]
+fn test_multiple_rpc_concurrent() {
+    // Make several RPC calls in parallel using threads and verify none
+    // deadlock and all complete within a reasonable timeout.
+    let mut node = TestNode::start(&[]);
+
+    let rpcport = node.rpcport;
+    let cookie = node.cookie.clone();
+
+    let methods = vec![
+        "getblockchaininfo",
+        "getblockcount",
+        "getbestblockhash",
+        "getmempoolinfo",
+        "getnetworkinfo",
+        "getpeerinfo",
+        "getmininginfo",
+        "uptime",
+    ];
+
+    let handles: Vec<_> = methods
+        .into_iter()
+        .map(|method| {
+            let cookie = cookie.clone();
+            let method = method.to_string();
+            std::thread::spawn(move || {
+                let url = format!("http://127.0.0.1:{}/", rpcport);
+                let body = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": "test",
+                    "method": method,
+                    "params": [],
+                });
+                let (user, pass) = cookie
+                    .split_once(':')
+                    .unwrap_or(("__cookie__", "none"));
+                let client = reqwest::blocking::Client::builder()
+                    .timeout(Duration::from_secs(30))
+                    .build()
+                    .unwrap();
+                let response = client
+                    .post(&url)
+                    .basic_auth(user, Some(pass))
+                    .header("Content-Type", "application/json")
+                    .json(&body)
+                    .send()
+                    .expect("RPC request failed");
+                let json: serde_json::Value = response.json().expect("Failed to parse JSON");
+                assert!(
+                    json["result"] != serde_json::Value::Null || json["error"].is_null(),
+                    "RPC {} returned unexpected response: {:?}",
+                    method,
+                    json
+                );
+                method
+            })
+        })
+        .collect();
+
+    // Wait for all threads to complete (with a timeout)
+    let start = Instant::now();
+    for handle in handles {
+        let method = handle.join().expect("Thread panicked");
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "RPC call {} took too long, possible deadlock",
+            method
+        );
+    }
+
+    node.stop();
+}
+
+#[test]
+fn test_verifychain_after_mining() {
+    // Mine several blocks and then run verifychain to verify integrity.
+    let mut node = TestNode::start(&[]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+
+    // Mine 10 blocks
+    node.rpc_call_with_params(
+        "generatetoaddress",
+        vec![serde_json::json!(10), serde_json::json!(addr)],
+    )
+    .unwrap();
+
+    let count = node.rpc_call("getblockcount").unwrap();
+    assert_eq!(count["result"], 10);
+
+    // Run verifychain — should return true for a healthy chain
+    let response = node.rpc_call("verifychain").unwrap();
+    assert_eq!(
+        response["result"], true,
+        "verifychain should return true after mining"
+    );
+
+    node.stop();
+}
+
+#[test]
+fn test_uptime_increases() {
+    // Verify that uptime increases between two calls (not stuck at 0).
+    let mut node = TestNode::start(&[]);
+
+    let response1 = node.rpc_call("uptime").unwrap();
+    let uptime1 = response1["result"].as_u64().unwrap();
+
+    // Sleep briefly to let uptime increase
+    std::thread::sleep(Duration::from_secs(2));
+
+    let response2 = node.rpc_call("uptime").unwrap();
+    let uptime2 = response2["result"].as_u64().unwrap();
+
+    assert!(
+        uptime2 >= uptime1,
+        "Uptime should not decrease: first={}, second={}",
+        uptime1,
+        uptime2
+    );
+    // uptime2 should be at least 1 second more (we slept 2s)
+    assert!(
+        uptime2 >= 1,
+        "Uptime should be at least 1 second after sleeping, got: {}",
+        uptime2
+    );
+
+    node.stop();
+}

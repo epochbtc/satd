@@ -273,3 +273,229 @@ impl Store for RedbStore {
         self.txindex_enabled
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::blockindex::{BlockIndexEntry, BlockStatus, work_for_bits};
+    use crate::storage::coinview::Coin;
+    use crate::storage::undo::{OutPointSer, UndoData};
+    use crate::storage::{Store, StoreBatch};
+    use bitcoin::hashes::Hash;
+    use bitcoin::pow::CompactTarget;
+    use bitcoin::{BlockHash, OutPoint, Txid};
+
+    fn temp_store(txindex: bool) -> (RedbStore, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RedbStore::open(dir.path(), txindex).unwrap();
+        (store, dir)
+    }
+
+    fn regtest_genesis_entry() -> (BlockHash, BlockIndexEntry) {
+        let genesis = bitcoin::constants::genesis_block(bitcoin::Network::Regtest);
+        let hash = genesis.block_hash();
+        let entry = BlockIndexEntry {
+            header: genesis.header,
+            height: 0,
+            status: BlockStatus::Valid,
+            num_tx: 1,
+            file_number: 0,
+            data_pos: 0,
+            chainwork: work_for_bits(CompactTarget::from_consensus(0x207fffff)),
+        };
+        (hash, entry)
+    }
+
+    fn make_outpoint(txid_byte: u8, vout: u32) -> OutPoint {
+        let inner = bitcoin::hashes::sha256d::Hash::from_byte_array([txid_byte; 32]);
+        OutPoint {
+            txid: Txid::from_raw_hash(inner),
+            vout,
+        }
+    }
+
+    fn make_coin(amount: u64, height: u32) -> Coin {
+        Coin {
+            amount,
+            script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x76, 0xa9, 0x14]),
+            height,
+            coinbase: false,
+        }
+    }
+
+    fn make_block_hash(byte: u8) -> BlockHash {
+        BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([byte; 32]))
+    }
+
+    #[test]
+    fn test_redb_block_index_roundtrip() {
+        let (store, _dir) = temp_store(false);
+        let (hash, entry) = regtest_genesis_entry();
+
+        let mut batch = StoreBatch::default();
+        batch.block_index_puts.push((hash, entry.clone()));
+        store.write_batch(batch).unwrap();
+
+        let recovered = store.get_block_index(&hash).unwrap();
+        assert_eq!(recovered.height, entry.height);
+        assert_eq!(recovered.num_tx, entry.num_tx);
+        assert_eq!(recovered.status, entry.status);
+        assert_eq!(recovered.chainwork, entry.chainwork);
+        assert_eq!(recovered.header.prev_blockhash, entry.header.prev_blockhash);
+    }
+
+    #[test]
+    fn test_redb_coin_roundtrip() {
+        let (store, _dir) = temp_store(false);
+        let op = make_outpoint(0xAA, 0);
+        let coin = make_coin(50_000, 1);
+
+        let mut batch = StoreBatch::default();
+        batch.coin_puts.push((op, coin.clone()));
+        store.write_batch(batch).unwrap();
+
+        let recovered = store.get_coin(&op).unwrap();
+        assert_eq!(recovered.amount, coin.amount);
+        assert_eq!(recovered.height, coin.height);
+        assert!(store.has_coin(&op));
+
+        // Remove the coin
+        let mut batch2 = StoreBatch::default();
+        batch2.coin_removes.push(op);
+        store.write_batch(batch2).unwrap();
+
+        assert!(store.get_coin(&op).is_none());
+        assert!(!store.has_coin(&op));
+    }
+
+    #[test]
+    fn test_redb_tip_roundtrip() {
+        let (store, _dir) = temp_store(false);
+        let hash = make_block_hash(0x42);
+
+        let batch = StoreBatch { tip: Some(hash), ..Default::default() };
+        store.write_batch(batch).unwrap();
+
+        let recovered = store.get_tip().unwrap();
+        assert_eq!(recovered, hash);
+    }
+
+    #[test]
+    fn test_redb_height_index_roundtrip() {
+        let (store, _dir) = temp_store(false);
+        let hash = make_block_hash(0x11);
+
+        let mut batch = StoreBatch::default();
+        batch.height_hash_puts.push((100, hash));
+        store.write_batch(batch).unwrap();
+
+        let recovered = store.get_block_hash_by_height(100).unwrap();
+        assert_eq!(recovered, hash);
+
+        // Non-existent height returns None
+        assert!(store.get_block_hash_by_height(999).is_none());
+    }
+
+    #[test]
+    fn test_redb_undo_roundtrip() {
+        let (store, _dir) = temp_store(false);
+        let block_hash = make_block_hash(0x22);
+        let op = make_outpoint(0x01, 0);
+        let coin = make_coin(1_000_000, 50);
+        let undo = UndoData {
+            spent_coins: vec![(OutPointSer::from(&op), coin)],
+        };
+
+        let mut batch = StoreBatch::default();
+        batch.undo_puts.push((block_hash, undo));
+        store.write_batch(batch).unwrap();
+
+        let recovered = store.get_undo(&block_hash).unwrap();
+        assert_eq!(recovered.spent_coins.len(), 1);
+        assert_eq!(recovered.spent_coins[0].1.amount, 1_000_000);
+    }
+
+    #[test]
+    fn test_redb_txindex_enabled() {
+        let (store, _dir) = temp_store(true);
+        assert!(store.has_txindex());
+
+        let txid = Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0xBB; 32]));
+        let block_hash = make_block_hash(0xCC);
+
+        let mut batch = StoreBatch::default();
+        batch.tx_index_puts.push((txid, block_hash));
+        store.write_batch(batch).unwrap();
+
+        let recovered = store.get_tx_location(&txid).unwrap();
+        assert_eq!(recovered, block_hash);
+    }
+
+    #[test]
+    fn test_redb_txindex_disabled() {
+        let (store, _dir) = temp_store(false);
+        assert!(!store.has_txindex());
+
+        let txid = Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0xDD; 32]));
+        assert!(store.get_tx_location(&txid).is_none());
+    }
+
+    #[test]
+    fn test_redb_coin_count() {
+        let (store, _dir) = temp_store(false);
+
+        let mut batch = StoreBatch::default();
+        for i in 0..3u8 {
+            batch.coin_puts.push((make_outpoint(i + 1, 0), make_coin(1000 * (i as u64 + 1), 0)));
+        }
+        store.write_batch(batch).unwrap();
+
+        assert_eq!(store.coin_count(), 3);
+
+        // Remove one coin
+        let mut batch2 = StoreBatch::default();
+        batch2.coin_removes.push(make_outpoint(0x02, 0));
+        store.write_batch(batch2).unwrap();
+
+        assert_eq!(store.coin_count(), 2);
+    }
+
+    #[test]
+    fn test_redb_coin_total_amount() {
+        let (store, _dir) = temp_store(false);
+
+        let mut batch = StoreBatch::default();
+        batch.coin_puts.push((make_outpoint(0x01, 0), make_coin(1_000, 0)));
+        batch.coin_puts.push((make_outpoint(0x02, 0), make_coin(2_000, 0)));
+        batch.coin_puts.push((make_outpoint(0x03, 0), make_coin(3_000, 0)));
+        store.write_batch(batch).unwrap();
+
+        assert_eq!(store.coin_total_amount(), 6_000);
+    }
+
+    #[test]
+    fn test_redb_batch_atomicity() {
+        let (store, _dir) = temp_store(true);
+        let (genesis_hash, genesis_entry) = regtest_genesis_entry();
+        let tip_hash = make_block_hash(0xFF);
+        let op = make_outpoint(0x10, 0);
+        let coin = make_coin(999, 0);
+        let txid = Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0xEE; 32]));
+
+        // Write everything in one batch
+        let mut batch = StoreBatch::default();
+        batch.block_index_puts.push((genesis_hash, genesis_entry.clone()));
+        batch.coin_puts.push((op, coin));
+        batch.tip = Some(tip_hash);
+        batch.height_hash_puts.push((0, genesis_hash));
+        batch.tx_index_puts.push((txid, genesis_hash));
+        store.write_batch(batch).unwrap();
+
+        // Verify all operations applied
+        assert!(store.get_block_index(&genesis_hash).is_some());
+        assert!(store.has_coin(&op));
+        assert_eq!(store.get_tip().unwrap(), tip_hash);
+        assert_eq!(store.get_block_hash_by_height(0).unwrap(), genesis_hash);
+        assert_eq!(store.get_tx_location(&txid).unwrap(), genesis_hash);
+    }
+}

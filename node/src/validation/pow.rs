@@ -257,4 +257,214 @@ mod tests {
         // Expected bits = parent bits (since not at retarget boundary)
         assert!(check_difficulty(&genesis.header, &prev, Network::Bitcoin, |_| None).is_ok());
     }
+
+    #[test]
+    fn test_retarget_clamp_too_fast() {
+        // At retarget boundary (height 4032), with a tiny timespan (1 second),
+        // the new bits should be clamped to TARGET_TIMESPAN / 4.
+        let genesis = bitcoin::constants::genesis_block(Network::Bitcoin);
+        let base_time = genesis.header.time;
+
+        // prev at height 4031
+        let mut prev_header = genesis.header;
+        prev_header.time = base_time + 1; // Only 1 second after the first_entry
+        let prev = BlockIndexEntry {
+            header: prev_header,
+            height: 4031,
+            status: BlockStatus::Valid,
+            num_tx: 1,
+            file_number: 0,
+            data_pos: 0,
+            chainwork: [0u8; 32],
+        };
+
+        // first_entry at height 2016 (the start of this retarget period)
+        let mut first_header = genesis.header;
+        first_header.time = base_time;
+        let first_entry = BlockIndexEntry {
+            header: first_header,
+            height: 2016,
+            status: BlockStatus::Valid,
+            num_tx: 1,
+            file_number: 0,
+            data_pos: 0,
+            chainwork: [0u8; 32],
+        };
+
+        // Compute expected bits: the timespan of 1 second will be clamped to TARGET_TIMESPAN/4
+        let expected_bits = retarget(
+            prev_header.bits,
+            TARGET_TIMESPAN / 4, // clamped minimum
+            MAINNET_POWLIMIT_BITS,
+        );
+
+        let mut new_header = genesis.header;
+        new_header.bits = CompactTarget::from_consensus(expected_bits);
+
+        let get_ancestor = |h: u32| -> Option<BlockIndexEntry> {
+            if h == 2016 {
+                Some(first_entry.clone())
+            } else {
+                None
+            }
+        };
+
+        assert!(check_difficulty(&new_header, &prev, Network::Bitcoin, get_ancestor).is_ok());
+    }
+
+    #[test]
+    fn test_retarget_clamp_too_slow() {
+        // At retarget boundary (height 4032), with a very large timespan,
+        // the new bits should be clamped to TARGET_TIMESPAN * 4.
+        let genesis = bitcoin::constants::genesis_block(Network::Bitcoin);
+        let base_time = genesis.header.time;
+
+        // prev at height 4031 with timestamp far in the future
+        let mut prev_header = genesis.header;
+        prev_header.time = base_time + TARGET_TIMESPAN * 10; // Way too slow
+        let prev = BlockIndexEntry {
+            header: prev_header,
+            height: 4031,
+            status: BlockStatus::Valid,
+            num_tx: 1,
+            file_number: 0,
+            data_pos: 0,
+            chainwork: [0u8; 32],
+        };
+
+        // first_entry at height 2016
+        let mut first_header = genesis.header;
+        first_header.time = base_time;
+        let first_entry = BlockIndexEntry {
+            header: first_header,
+            height: 2016,
+            status: BlockStatus::Valid,
+            num_tx: 1,
+            file_number: 0,
+            data_pos: 0,
+            chainwork: [0u8; 32],
+        };
+
+        // Compute expected bits: timespan clamped to TARGET_TIMESPAN * 4
+        let expected_bits = retarget(
+            prev_header.bits,
+            TARGET_TIMESPAN * 4, // clamped maximum
+            MAINNET_POWLIMIT_BITS,
+        );
+
+        let mut new_header = genesis.header;
+        new_header.bits = CompactTarget::from_consensus(expected_bits);
+
+        let get_ancestor = |h: u32| -> Option<BlockIndexEntry> {
+            if h == 2016 {
+                Some(first_entry.clone())
+            } else {
+                None
+            }
+        };
+
+        assert!(check_difficulty(&new_header, &prev, Network::Bitcoin, get_ancestor).is_ok());
+    }
+
+    #[test]
+    fn test_signet_any_bits_accepted() {
+        // On Signet, any bits value should pass check_difficulty.
+        let genesis = bitcoin::constants::genesis_block(Network::Signet);
+        let prev = BlockIndexEntry {
+            header: genesis.header,
+            height: 100,
+            status: BlockStatus::Valid,
+            num_tx: 1,
+            file_number: 0,
+            data_pos: 0,
+            chainwork: [0u8; 32],
+        };
+
+        // Use an arbitrary bits value that would fail on other networks
+        let mut header = genesis.header;
+        header.bits = CompactTarget::from_consensus(0x1a0fffff);
+
+        assert!(check_difficulty(&header, &prev, Network::Signet, |_| None).is_ok());
+    }
+
+    #[test]
+    fn test_timestamp_above_median_passes() {
+        // Build 11 ancestors with increasing timestamps, header time above median -> pass.
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+        let base_time = 1_000_000u32;
+
+        let entries: Vec<BlockIndexEntry> = (0..11)
+            .map(|i| {
+                let mut hdr = genesis.header;
+                hdr.time = base_time + i * 100;
+                BlockIndexEntry {
+                    header: hdr,
+                    height: i,
+                    status: BlockStatus::Valid,
+                    num_tx: 1,
+                    file_number: 0,
+                    data_pos: 0,
+                    chainwork: [0u8; 32],
+                }
+            })
+            .collect();
+
+        // Median of [base, base+100, ..., base+1000] sorted = base+500
+        let mut header = genesis.header;
+        header.time = base_time + 501; // Above median
+
+        let get_ancestor = |h: u32| -> Option<BlockIndexEntry> {
+            entries.get(h as usize).cloned()
+        };
+
+        assert!(check_timestamp(&header, 11, get_ancestor).is_ok());
+    }
+
+    #[test]
+    fn test_timestamp_at_median_fails() {
+        // Header time equal to median of previous 11 blocks -> TimeTooOld.
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+        let base_time = 1_000_000u32;
+
+        let entries: Vec<BlockIndexEntry> = (0..11)
+            .map(|i| {
+                let mut hdr = genesis.header;
+                hdr.time = base_time + i * 100;
+                BlockIndexEntry {
+                    header: hdr,
+                    height: i,
+                    status: BlockStatus::Valid,
+                    num_tx: 1,
+                    file_number: 0,
+                    data_pos: 0,
+                    chainwork: [0u8; 32],
+                }
+            })
+            .collect();
+
+        // Median of [base, base+100, ..., base+1000] sorted = base+500
+        let mut header = genesis.header;
+        header.time = base_time + 500; // Equal to median
+
+        let get_ancestor = |h: u32| -> Option<BlockIndexEntry> {
+            entries.get(h as usize).cloned()
+        };
+
+        assert!(matches!(
+            check_timestamp(&header, 11, get_ancestor),
+            Err(ValidationError::TimeTooOld)
+        ));
+    }
+
+    #[test]
+    fn test_check_pow_invalid_hash() {
+        // Use mainnet difficulty bits (very hard), any random header will fail.
+        let mut header = bitcoin::constants::genesis_block(Network::Regtest).header;
+        header.bits = CompactTarget::from_consensus(MAINNET_POWLIMIT_BITS);
+        // The regtest genesis header hash won't meet mainnet difficulty
+        assert!(matches!(
+            check_proof_of_work(&header),
+            Err(ValidationError::BadProofOfWork)
+        ));
+    }
 }

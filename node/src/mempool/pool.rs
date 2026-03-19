@@ -913,4 +913,272 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn test_coinbase_rejected() {
+        use bitcoin::blockdata::locktime::absolute::LockTime;
+        use bitcoin::transaction;
+        use bitcoin::{Amount, ScriptBuf, Sequence, TxIn, TxOut, Witness};
+
+        let (cs, mp, dir) = make_test_env();
+
+        // Build a coinbase transaction (input with null outpoint)
+        let coinbase_tx = Transaction {
+            version: transaction::Version(2),
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::from_bytes(vec![0x01, 0x01]),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(5_000_000_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+
+        let result = mp.accept_transaction(coinbase_tx, &cs, &NoopVerifier);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("coinbase"),
+            "Expected coinbase rejection, got: {}",
+            err
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_missing_inputs() {
+        use bitcoin::blockdata::locktime::absolute::LockTime;
+        use bitcoin::hashes::Hash;
+        use bitcoin::transaction;
+        use bitcoin::{Amount, ScriptBuf, Sequence, TxIn, TxOut, Witness};
+
+        let (cs, mp, dir) = make_test_env();
+
+        // Build a tx referencing a non-existent UTXO
+        let tx = Transaction {
+            version: transaction::Version(2),
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: bitcoin::Txid::from_raw_hash(
+                        bitcoin::hashes::sha256d::Hash::from_byte_array([0xaa; 32]),
+                    ),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1_000_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![
+                    0x76, 0xa9, 0x14,
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    0x88, 0xac,
+                ]),
+            }],
+        };
+
+        let result = mp.accept_transaction(tx, &cs, &NoopVerifier);
+        assert!(matches!(result, Err(MempoolError::MissingInputs)));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_dust_output_rejected() {
+        use bitcoin::blockdata::locktime::absolute::LockTime;
+        use bitcoin::hashes::Hash;
+        use bitcoin::transaction;
+        use bitcoin::{Amount, ScriptBuf, Sequence, TxIn, TxOut, Witness};
+
+        // Create mempool with default dust relay fee
+        let (cs, _mp, dir) = make_test_env();
+        let mp = Mempool::with_config(MempoolConfig {
+            max_size_bytes: 1_000_000,
+            min_fee_rate: 0,
+            dust_relay_fee: 3_000, // 3 sat/vB — standard dust relay fee
+            ..Default::default()
+        });
+
+        // Build a tx with a tiny (1 sat) P2PKH output — well below dust threshold
+        let tx = Transaction {
+            version: transaction::Version(2),
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: bitcoin::Txid::from_raw_hash(
+                        bitcoin::hashes::sha256d::Hash::from_byte_array([0xbb; 32]),
+                    ),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1), // 1 sat — definitely dust
+                script_pubkey: ScriptBuf::from_bytes(vec![
+                    0x76, 0xa9, 0x14,
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    0x88, 0xac,
+                ]),
+            }],
+        };
+
+        let result = mp.accept_transaction(tx, &cs, &NoopVerifier);
+        assert!(matches!(result, Err(MempoolError::Dust)));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_op_return_too_large() {
+        use bitcoin::blockdata::locktime::absolute::LockTime;
+        use bitcoin::hashes::Hash;
+        use bitcoin::transaction;
+        use bitcoin::{Amount, ScriptBuf, Sequence, TxIn, TxOut, Witness};
+
+        let (cs, mp, dir) = make_test_env();
+
+        // Build an OP_RETURN output > 83 bytes
+        let mut op_return_script = vec![0x6a]; // OP_RETURN
+        op_return_script.extend_from_slice(&[0x00; 90]); // 91 bytes total > 83
+
+        let tx = Transaction {
+            version: transaction::Version(2),
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: bitcoin::Txid::from_raw_hash(
+                        bitcoin::hashes::sha256d::Hash::from_byte_array([0xcc; 32]),
+                    ),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::ZERO,
+                script_pubkey: ScriptBuf::from_bytes(op_return_script),
+            }],
+        };
+
+        let result = mp.accept_transaction(tx, &cs, &NoopVerifier);
+        assert!(matches!(result, Err(MempoolError::NonStandardOpReturn)));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_multiple_op_return_rejected() {
+        use bitcoin::blockdata::locktime::absolute::LockTime;
+        use bitcoin::hashes::Hash;
+        use bitcoin::transaction;
+        use bitcoin::{Amount, ScriptBuf, Sequence, TxIn, TxOut, Witness};
+
+        let (cs, mp, dir) = make_test_env();
+
+        // Build a tx with two OP_RETURN outputs (each within size limit)
+        let op_return_script = ScriptBuf::from_bytes(vec![0x6a, 0x04, 0xde, 0xad, 0xbe, 0xef]);
+
+        let tx = Transaction {
+            version: transaction::Version(2),
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: bitcoin::Txid::from_raw_hash(
+                        bitcoin::hashes::sha256d::Hash::from_byte_array([0xdd; 32]),
+                    ),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![
+                TxOut {
+                    value: Amount::ZERO,
+                    script_pubkey: op_return_script.clone(),
+                },
+                TxOut {
+                    value: Amount::ZERO,
+                    script_pubkey: op_return_script,
+                },
+            ],
+        };
+
+        let result = mp.accept_transaction(tx, &cs, &NoopVerifier);
+        assert!(matches!(result, Err(MempoolError::NonStandardOpReturn)));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_data_carrier_disabled() {
+        use bitcoin::blockdata::locktime::absolute::LockTime;
+        use bitcoin::hashes::Hash;
+        use bitcoin::transaction;
+        use bitcoin::{Amount, ScriptBuf, Sequence, TxIn, TxOut, Witness};
+
+        // Create mempool with data_carrier disabled
+        let (cs, _mp, dir) = make_test_env();
+        let mp = Mempool::with_config(MempoolConfig {
+            max_size_bytes: 1_000_000,
+            min_fee_rate: 0,
+            data_carrier: false,
+            ..Default::default()
+        });
+
+        // A small, valid OP_RETURN output
+        let op_return_script = ScriptBuf::from_bytes(vec![0x6a, 0x04, 0xde, 0xad, 0xbe, 0xef]);
+
+        let tx = Transaction {
+            version: transaction::Version(2),
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: bitcoin::Txid::from_raw_hash(
+                        bitcoin::hashes::sha256d::Hash::from_byte_array([0xee; 32]),
+                    ),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::ZERO,
+                script_pubkey: op_return_script,
+            }],
+        };
+
+        let result = mp.accept_transaction(tx, &cs, &NoopVerifier);
+        assert!(matches!(result, Err(MempoolError::NonStandardOpReturn)));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_remove_for_block_empty_pool() {
+        let (_cs, mp, dir) = make_test_env();
+
+        // Verify remove_for_block on an empty pool is a no-op and doesn't panic
+        let genesis = bitcoin::constants::genesis_block(bitcoin::Network::Regtest);
+        mp.remove_for_block(&genesis);
+
+        let info = mp.info();
+        assert_eq!(info.size, 0);
+        assert_eq!(info.bytes, 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -421,3 +421,76 @@ fn script_type(script: &bitcoin::Script) -> &'static str {
         "nonstandard"
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mempool::pool::Mempool;
+
+    #[test]
+    fn test_getmempoolinfo_empty() {
+        let mp = Mempool::new(1_000_000, 0);
+        let info = get_mempool_info(&mp);
+
+        assert_eq!(info["size"], 0);
+        assert_eq!(info["bytes"], 0);
+        assert_eq!(info["loaded"], true);
+        assert_eq!(info["maxmempool"], 1_000_000);
+    }
+
+    #[test]
+    fn test_decode_raw_transaction() {
+        use bitcoin::blockdata::locktime::absolute::LockTime;
+        use bitcoin::hashes::Hash;
+
+        // Build a simple transaction
+        let tx = Transaction {
+            version: Version(2),
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: bitcoin::Txid::from_raw_hash(
+                        bitcoin::hashes::sha256d::Hash::from_byte_array([0xab; 32]),
+                    ),
+                    vout: 0,
+                },
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![
+                TxOut {
+                    value: Amount::from_sat(50_000),
+                    script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![
+                        0x76, 0xa9, 0x14,
+                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                        0x88, 0xac,
+                    ]),
+                },
+                TxOut {
+                    value: Amount::from_sat(10_000),
+                    script_pubkey: bitcoin::ScriptBuf::new(),
+                },
+            ],
+        };
+
+        // Encode to hex
+        let raw = bitcoin::consensus::serialize(&tx);
+        let hex_tx = hex::encode(&raw);
+
+        // Decode via the RPC function
+        let result = decode_raw_transaction(&hex_tx).unwrap();
+
+        // Verify txid matches
+        let expected_txid = tx.compute_txid().to_string();
+        assert_eq!(result["txid"], expected_txid);
+
+        // Verify vin and vout counts
+        assert_eq!(result["vin"].as_array().unwrap().len(), 1);
+        assert_eq!(result["vout"].as_array().unwrap().len(), 2);
+
+        // Verify version
+        assert_eq!(result["version"], 2);
+    }
+}

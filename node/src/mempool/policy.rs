@@ -73,3 +73,130 @@ pub fn dust_threshold_with_rate(script_pubkey: &bitcoin::ScriptBuf, fee_rate: u6
     // Simplified: use vbytes for consistency with Bitcoin Core
     total_size * fee_rate / 1000
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::ScriptBuf;
+
+    /// Helper to build a P2PKH script (25 bytes: OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG)
+    fn p2pkh_script() -> ScriptBuf {
+        ScriptBuf::from_bytes(vec![
+            0x76, 0xa9, 0x14, // OP_DUP OP_HASH160 PUSH20
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 20 zero bytes
+            0x88, 0xac, // OP_EQUALVERIFY OP_CHECKSIG
+        ])
+    }
+
+    /// Helper to build a P2SH script (23 bytes: OP_HASH160 <20> OP_EQUAL)
+    fn p2sh_script() -> ScriptBuf {
+        ScriptBuf::from_bytes(vec![
+            0xa9, 0x14, // OP_HASH160 PUSH20
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0x87, // OP_EQUAL
+        ])
+    }
+
+    /// Helper to build a P2WPKH script (22 bytes: OP_0 <20>)
+    fn p2wpkh_script() -> ScriptBuf {
+        ScriptBuf::from_bytes(vec![
+            0x00, 0x14, // OP_0 PUSH20
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ])
+    }
+
+    /// Helper to build a P2TR script (34 bytes: OP_1 <32>)
+    fn p2tr_script() -> ScriptBuf {
+        let mut bytes = vec![0x51, 0x20]; // OP_1 PUSH32
+        bytes.extend_from_slice(&[0u8; 32]);
+        ScriptBuf::from_bytes(bytes)
+    }
+
+    /// Helper to build an OP_RETURN script
+    fn op_return_script() -> ScriptBuf {
+        ScriptBuf::from_bytes(vec![0x6a]) // OP_RETURN
+    }
+
+    #[test]
+    fn test_dust_p2pkh() {
+        let script = p2pkh_script();
+        assert!(script.is_p2pkh());
+        // output_size = 8 + 1 + 25 = 34; spend_size = 148; total = 182
+        // 182 * 3000 / 1000 = 546
+        assert_eq!(dust_threshold(&script), 546);
+    }
+
+    #[test]
+    fn test_dust_p2wpkh() {
+        let script = p2wpkh_script();
+        assert!(script.is_p2wpkh());
+        // output_size = 8 + 1 + 22 = 31; spend_size = 68; total = 99
+        // 99 * 3000 / 1000 = 297
+        assert_eq!(dust_threshold(&script), 297);
+    }
+
+    #[test]
+    fn test_dust_p2tr() {
+        let script = p2tr_script();
+        assert!(script.is_p2tr());
+        // output_size = 8 + 1 + 34 = 43; spend_size = 68; total = 111
+        // 111 * 3000 / 1000 = 333
+        assert_eq!(dust_threshold(&script), 333);
+    }
+
+    #[test]
+    fn test_dust_p2sh() {
+        let script = p2sh_script();
+        assert!(script.is_p2sh());
+        // output_size = 8 + 1 + 23 = 32; spend_size = 107; total = 139
+        // 139 * 3000 / 1000 = 417
+        assert_eq!(dust_threshold(&script), 417);
+    }
+
+    #[test]
+    fn test_dust_op_return() {
+        let script = op_return_script();
+        assert!(script.is_op_return());
+        // OP_RETURN is unspendable — threshold is always 0
+        assert_eq!(dust_threshold(&script), 0);
+    }
+
+    #[test]
+    fn test_dust_custom_rate() {
+        let script = p2pkh_script();
+        // At double the default rate (6000 sat/kvB), threshold doubles
+        // 182 * 6000 / 1000 = 1092
+        assert_eq!(dust_threshold_with_rate(&script, 6_000), 1092);
+        // Verify it's exactly double the default
+        assert_eq!(
+            dust_threshold_with_rate(&script, 6_000),
+            dust_threshold(&script) * 2
+        );
+    }
+
+    #[test]
+    fn test_dust_zero_rate() {
+        // With fee rate 0, all thresholds should be 0
+        assert_eq!(dust_threshold_with_rate(&p2pkh_script(), 0), 0);
+        assert_eq!(dust_threshold_with_rate(&p2wpkh_script(), 0), 0);
+        assert_eq!(dust_threshold_with_rate(&p2tr_script(), 0), 0);
+        assert_eq!(dust_threshold_with_rate(&p2sh_script(), 0), 0);
+        assert_eq!(dust_threshold_with_rate(&op_return_script(), 0), 0);
+    }
+
+    #[test]
+    fn test_dust_unknown_script() {
+        // An unknown script type should use spend_size = 68 (witness estimate)
+        // Script: 10 arbitrary bytes (not matching any known pattern)
+        let script = ScriptBuf::from_bytes(vec![0xff; 10]);
+        assert!(!script.is_p2pkh());
+        assert!(!script.is_p2sh());
+        assert!(!script.is_p2wpkh());
+        assert!(!script.is_p2wsh());
+        assert!(!script.is_p2tr());
+        assert!(!script.is_op_return());
+        // output_size = 8 + 1 + 10 = 19; spend_size = 68; total = 87
+        // 87 * 3000 / 1000 = 261
+        assert_eq!(dust_threshold(&script), 261);
+    }
+}
