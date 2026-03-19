@@ -100,7 +100,9 @@ pub fn get_block_template(chain_state: &ChainState, mempool: &Mempool) -> Value 
         "curtime": template.cur_time,
         "bits": format!("{:08x}", template.bits.to_consensus()),
         "height": template.height,
-        "default_witness_commitment": "",
+        "default_witness_commitment": crate::mining::template::compute_witness_commitment_hex(&template.transactions),
+        "longpollid": format!("{}{:x}", template.prev_hash, template.cur_time),
+        "expires": 120,
     })
 }
 

@@ -74,6 +74,19 @@ pub fn dust_threshold_with_rate(script_pubkey: &bitcoin::ScriptBuf, fee_rate: u6
     total_size * fee_rate / 1000
 }
 
+/// Check if a script is a standard output type.
+/// Standard types: P2PKH, P2SH, P2WPKH, P2WSH, P2TR, OP_RETURN,
+/// and bare multisig (if configured via `-permitbaremultisig`).
+pub fn is_standard_output_script(script: &bitcoin::Script, permit_bare_multisig: bool) -> bool {
+    script.is_p2pkh()
+        || script.is_p2sh()
+        || script.is_p2wpkh()
+        || script.is_p2wsh()
+        || script.is_p2tr()
+        || script.is_op_return()
+        || (permit_bare_multisig && script.is_multisig())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
