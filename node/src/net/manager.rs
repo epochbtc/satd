@@ -701,20 +701,86 @@ impl PeerManager {
             NetworkMessage::GetAddr => {
                 // Respond with addresses of our connected peers
                 let peers = self.peers.read().unwrap();
-                let addrs: Vec<(u32, bitcoin::p2p::Address)> = peers
+                let wants_v2 = peers.get(&id).is_some_and(|h| h.info.wants_addrv2);
+                let addr_entries: Vec<_> = peers
                     .values()
                     .filter(|h| h.info.state == PeerState::Connected)
-                    .map(|h| {
-                        let time = h.info.conn_time
-                            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs() as u32;
-                        (time, bitcoin::p2p::Address::new(&h.info.addr, h.info.services))
-                    })
                     .collect();
-                if !addrs.is_empty() {
-                    self.send_to_peer(id, NetworkMessage::Addr(addrs));
+
+                if wants_v2 {
+                    let addrs: Vec<bitcoin::p2p::address::AddrV2Message> = addr_entries
+                        .iter()
+                        .map(|h| {
+                            let time = h.info.conn_time
+                                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs() as u32;
+                            bitcoin::p2p::address::AddrV2Message {
+                                time,
+                                services: h.info.services,
+                                addr: bitcoin::p2p::address::AddrV2::Ipv4(match h.info.addr.ip() {
+                                    std::net::IpAddr::V4(ip) => ip,
+                                    std::net::IpAddr::V6(ip) => {
+                                        // Try to extract mapped IPv4, otherwise skip
+                                        if let Some(ip4) = ip.to_ipv4_mapped() {
+                                            ip4
+                                        } else {
+                                            // Fall back — use AddrV2::Ipv6 instead
+                                            return bitcoin::p2p::address::AddrV2Message {
+                                                time,
+                                                services: h.info.services,
+                                                addr: bitcoin::p2p::address::AddrV2::Ipv6(ip),
+                                                port: h.info.addr.port(),
+                                            };
+                                        }
+                                    }
+                                }),
+                                port: h.info.addr.port(),
+                            }
+                        })
+                        .collect();
+                    if !addrs.is_empty() {
+                        self.send_to_peer(id, NetworkMessage::AddrV2(addrs));
+                    }
+                } else {
+                    let addrs: Vec<(u32, bitcoin::p2p::Address)> = addr_entries
+                        .iter()
+                        .map(|h| {
+                            let time = h.info.conn_time
+                                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs() as u32;
+                            (time, bitcoin::p2p::Address::new(&h.info.addr, h.info.services))
+                        })
+                        .collect();
+                    if !addrs.is_empty() {
+                        self.send_to_peer(id, NetworkMessage::Addr(addrs));
+                    }
                 }
+            }
+            NetworkMessage::AddrV2(addrs) => {
+                tracing::debug!(id, count = addrs.len(), "Received addrv2");
+                for addr_msg in &addrs {
+                    if let Ok(sock_addr) = addr_msg.socket_addr()
+                        && !self.is_addr_connected(&sock_addr)
+                        && !self.is_addr_banned(&sock_addr)
+                    {
+                        self.add_connect_addr(sock_addr);
+                    }
+                }
+            }
+            NetworkMessage::SendAddrV2 => {
+                let mut peers = self.peers.write().unwrap();
+                if let Some(handle) = peers.get_mut(&id) {
+                    handle.info.wants_addrv2 = true;
+                    tracing::debug!(id, "Peer supports addrv2");
+                }
+            }
+            NetworkMessage::NotFound(inventory) => {
+                tracing::debug!(id, count = inventory.len(), "Peer sent notfound");
+            }
+            NetworkMessage::SendHeaders => {
+                tracing::debug!(id, "Peer prefers headers announcements");
             }
             _ => {}
         }
@@ -1253,20 +1319,28 @@ impl PeerManager {
     }
 
     fn handle_getdata(&self, id: PeerId, inventory: Vec<Inventory>) {
+        let mut not_found = Vec::new();
         for inv in inventory {
             match inv {
                 Inventory::Block(hash) | Inventory::WitnessBlock(hash) => {
                     if let Some(block) = self.chain_state.get_block(&hash) {
                         self.send_to_peer(id, NetworkMessage::Block(block));
+                    } else {
+                        not_found.push(inv);
                     }
                 }
                 Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
                     if let Some(entry) = self.mempool.get(&txid) {
                         self.send_to_peer(id, NetworkMessage::Tx(entry.tx));
+                    } else {
+                        not_found.push(inv);
                     }
                 }
                 _ => {}
             }
+        }
+        if !not_found.is_empty() {
+            self.send_to_peer(id, NetworkMessage::NotFound(not_found));
         }
     }
 
@@ -1559,6 +1633,11 @@ impl PeerManager {
                     .await
                     .map_err(|e| format!("send version: {}", e))?;
 
+                // BIP 155: signal addrv2 support after Version, before Verack
+                conn.send(NetworkMessage::SendAddrV2)
+                    .await
+                    .map_err(|e| format!("send sendaddrv2: {}", e))?;
+
                 let their_version = loop {
                     let msg = Self::recv_with_timeout(conn, timeout_secs).await?;
                     if let NetworkMessage::Version(v) = msg {
@@ -1594,6 +1673,11 @@ impl PeerManager {
                 conn.send(NetworkMessage::Version(our_version))
                     .await
                     .map_err(|e| format!("send version: {}", e))?;
+
+                // BIP 155: signal addrv2 support after Version, before Verack
+                conn.send(NetworkMessage::SendAddrV2)
+                    .await
+                    .map_err(|e| format!("send sendaddrv2: {}", e))?;
 
                 conn.send(NetworkMessage::Verack)
                     .await

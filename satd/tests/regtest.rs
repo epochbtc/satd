@@ -35,37 +35,23 @@ impl TestNode {
         // Check if using user/pass auth (no cookie file expected)
         let uses_userpass = extra_args.iter().any(|a| a.starts_with("--rpcuser"));
 
-        let cookie = if uses_userpass {
-            // Wait for server to be ready by polling the port
-            let mut attempts = 0;
-            loop {
-                if std::net::TcpStream::connect(format!("127.0.0.1:{}", rpcport)).is_ok() {
-                    break;
-                }
-                attempts += 1;
-                if attempts > 50 {
-                    panic!("Timed out waiting for satd to start on port {}", rpcport);
-                }
-                std::thread::sleep(Duration::from_millis(100));
+        // Wait for RPC server to accept connections (works for both auth modes)
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if std::net::TcpStream::connect(format!("127.0.0.1:{}", rpcport)).is_ok() {
+                break;
             }
+            if Instant::now() >= deadline {
+                panic!("Timed out waiting for satd to start on port {}", rpcport);
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        // Read cookie file if not using user/pass auth
+        let cookie = if uses_userpass {
             String::new()
         } else {
-            // Wait for cookie file to appear
             let cookie_path = datadir.join("regtest").join(".cookie");
-            let mut attempts = 0;
-            loop {
-                if cookie_path.exists() {
-                    break;
-                }
-                attempts += 1;
-                if attempts > 50 {
-                    panic!(
-                        "Timed out waiting for cookie file at {}",
-                        cookie_path.display()
-                    );
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
             std::fs::read_to_string(&cookie_path).expect("Failed to read cookie file")
         };
 
