@@ -781,6 +781,9 @@ impl PeerManager {
                 Ok(_) => {
                     accepted += 1;
                 }
+                Err(crate::chain::state::ChainError::Duplicate) => {
+                    // Already known — skip silently
+                }
                 Err(e) => {
                     self.add_ban_score(id, 20, &format!("Header rejected: {}", e));
                     break;

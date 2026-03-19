@@ -157,7 +157,7 @@ impl ChainState {
 
         // Already known?
         if self.store.get_block_index(&hash).is_some() {
-            return Ok(hash);
+            return Err(ChainError::Duplicate);
         }
 
         // Parent must exist
