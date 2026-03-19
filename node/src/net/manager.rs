@@ -22,9 +22,7 @@ use crate::net::sync;
 
 const MAX_OUTBOUND: usize = 8;
 const MAX_OUTBOUND_IBD: usize = 64;
-const MAX_INBOUND: usize = 117;
 const BAN_THRESHOLD: u32 = 100;
-const BAN_DURATION_SECS: u64 = 86400; // 24 hours
 
 /// Per-address reconnect backoff state.
 struct ReconnectState {
@@ -111,6 +109,10 @@ pub struct PeerManager {
     /// Prune target in MB (0 = disabled).
     #[allow(dead_code)]
     prune_target_mb: u64,
+    /// Maximum total connections (default: 125).
+    max_connections: usize,
+    /// Ban duration in seconds (default: 86400).
+    ban_duration_secs: u64,
     /// IBD scheduler for parallel block download (shared with connect thread).
     ibd: Arc<std::sync::RwLock<Option<IbdScheduler>>>,
     /// Signal to wake the connect thread when a block is stored.
@@ -125,7 +127,7 @@ impl PeerManager {
         network: Network,
         shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Arc<Self> {
-        Self::with_prune(chain_state, mempool, fee_estimator, network, shutdown, 0)
+        Self::with_config(chain_state, mempool, fee_estimator, network, shutdown, 0, 125, 86400)
     }
 
     pub fn with_prune(
@@ -135,6 +137,20 @@ impl PeerManager {
         network: Network,
         shutdown: tokio::sync::watch::Receiver<bool>,
         prune_target_mb: u64,
+    ) -> Arc<Self> {
+        Self::with_config(chain_state, mempool, fee_estimator, network, shutdown, prune_target_mb, 125, 86400)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_config(
+        chain_state: Arc<ChainState>,
+        mempool: Arc<Mempool>,
+        fee_estimator: Arc<FeeEstimator>,
+        network: Network,
+        shutdown: tokio::sync::watch::Receiver<bool>,
+        prune_target_mb: u64,
+        max_connections: usize,
+        ban_duration_secs: u64,
     ) -> Arc<Self> {
         let (event_tx, event_rx) = mpsc::channel(4096);
         let (block_tx, block_rx) = mpsc::unbounded_channel();
@@ -184,6 +200,8 @@ impl PeerManager {
             banned_addrs: RwLock::new(HashMap::new()),
             shutdown,
             prune_target_mb,
+            max_connections,
+            ban_duration_secs,
             ibd: ibd.clone(),
             connect_signal: connect_signal.clone(),
         });
@@ -208,7 +226,7 @@ impl PeerManager {
     /// Connect to an outbound peer.
     pub async fn connect_outbound(self: &Arc<Self>, addr: SocketAddr) -> Result<(), String> {
         {
-            let max_outbound = if self.is_ibd() { MAX_OUTBOUND_IBD } else { MAX_OUTBOUND };
+            let max_outbound = if self.is_ibd() { MAX_OUTBOUND_IBD } else { self.max_connections.min(MAX_OUTBOUND) };
             let peers = self.peers.read().unwrap();
             let outbound_count = peers
                 .values()
@@ -244,7 +262,7 @@ impl PeerManager {
                         && h.info.state == PeerState::Connected
                 })
                 .count();
-            if inbound_count >= MAX_INBOUND {
+            if inbound_count >= self.max_connections.saturating_sub(MAX_OUTBOUND) {
                 tracing::warn!(%addr, "Max inbound connections reached, dropping connection");
                 return;
             }
@@ -318,7 +336,7 @@ impl PeerManager {
                     "address": addr.to_string(),
                     "ban_created": 0,
                     "banned_until": remaining,
-                    "ban_duration": BAN_DURATION_SECS,
+                    "ban_duration": self.ban_duration_secs,
                     "ban_reason": "node misbehaving",
                 })
             })
@@ -331,7 +349,7 @@ impl PeerManager {
             self.banned_addrs
                 .write()
                 .unwrap()
-                .insert(addr, Instant::now() + Duration::from_secs(BAN_DURATION_SECS));
+                .insert(addr, Instant::now() + Duration::from_secs(self.ban_duration_secs));
         } else {
             self.banned_addrs.write().unwrap().remove(&addr);
         }
@@ -420,7 +438,7 @@ impl PeerManager {
                 self.banned_addrs
                     .write()
                     .unwrap()
-                    .insert(addr, Instant::now() + Duration::from_secs(BAN_DURATION_SECS));
+                    .insert(addr, Instant::now() + Duration::from_secs(self.ban_duration_secs));
             }
         }
     }

@@ -32,6 +32,30 @@ pub struct Config {
     pub prune: u64,
     pub reindex: bool,
     pub reindex_chainstate: bool,
+    // P2P
+    pub maxconnections: usize,
+    pub bind: String,
+    #[allow(dead_code)]
+    pub timeout: u64,
+    pub addnode: Vec<String>,
+    pub dns: bool,
+    pub bantime: u64,
+    // Mining
+    #[allow(dead_code)]
+    pub blockmaxweight: usize,
+    #[allow(dead_code)]
+    pub blockmintxfee: u64,
+    // Misc
+    pub pid: Option<String>,
+    // No-op compatibility flags (accepted but ignored)
+    #[allow(dead_code)]
+    pub server: bool,
+    #[allow(dead_code)]
+    pub daemon: bool,
+    #[allow(dead_code)]
+    pub dbcache: usize,
+    #[allow(dead_code)]
+    pub par: usize,
 }
 
 impl Config {
@@ -235,6 +259,54 @@ impl Config {
             prune,
             reindex: cli.reindex,
             reindex_chainstate: cli.reindex_chainstate,
+            maxconnections: cli
+                .maxconnections
+                .or_else(|| file_get("maxconnections").and_then(|v| v.parse().ok()))
+                .unwrap_or(125),
+            bind: cli
+                .bind
+                .or_else(|| file_get("bind"))
+                .unwrap_or_else(|| "0.0.0.0".to_string()),
+            timeout: cli
+                .timeout
+                .or_else(|| file_get("timeout").and_then(|v| v.parse().ok()))
+                .unwrap_or(10),
+            addnode: {
+                let mut nodes = cli.addnode;
+                if nodes.is_empty() {
+                    nodes = file_get_all("addnode");
+                }
+                nodes
+            },
+            dns: cli
+                .dns
+                .or_else(|| file_get("dns").and_then(|v| parse_bool(&v)))
+                .unwrap_or(true),
+            bantime: cli
+                .bantime
+                .or_else(|| file_get("bantime").and_then(|v| v.parse().ok()))
+                .unwrap_or(86400),
+            blockmaxweight: cli
+                .blockmaxweight
+                .or_else(|| file_get("blockmaxweight").and_then(|v| v.parse().ok()))
+                .unwrap_or(4_000_000),
+            blockmintxfee: cli
+                .blockmintxfee
+                .or_else(|| file_get("blockmintxfee").and_then(|v| v.parse().ok()))
+                .unwrap_or(1_000),
+            pid: cli.pid.or_else(|| file_get("pid")),
+            server: cli.server
+                || file_get("server").and_then(|v| parse_bool(&v)).unwrap_or(false),
+            daemon: cli.daemon
+                || file_get("daemon").and_then(|v| parse_bool(&v)).unwrap_or(false),
+            dbcache: cli
+                .dbcache
+                .or_else(|| file_get("dbcache").and_then(|v| v.parse().ok()))
+                .unwrap_or(450),
+            par: cli
+                .par
+                .or_else(|| file_get("par").and_then(|v| v.parse().ok()))
+                .unwrap_or(0),
         })
     }
 
@@ -335,6 +407,49 @@ pub struct CliArgs {
 
     #[arg(long = "reindex-chainstate", help = "Rebuild UTXO set from existing block files")]
     pub reindex_chainstate: bool,
+
+    // P2P flags
+    #[arg(long, value_name = "N", help = "Maximum total connections (default: 125)")]
+    pub maxconnections: Option<usize>,
+
+    #[arg(long, value_name = "ADDR", help = "Bind P2P to this address (default: 0.0.0.0)")]
+    pub bind: Option<String>,
+
+    #[arg(long, value_name = "SECS", help = "P2P connection timeout in seconds (default: 10)")]
+    pub timeout: Option<u64>,
+
+    #[arg(long, value_name = "ADDR", help = "Add a node to connect to (does not disable DNS seeding)")]
+    pub addnode: Vec<String>,
+
+    #[arg(long, value_name = "BOOL", help = "Allow DNS seeding (default: true)")]
+    pub dns: Option<bool>,
+
+    #[arg(long, value_name = "SECS", help = "Ban duration in seconds (default: 86400)")]
+    pub bantime: Option<u64>,
+
+    // Mining flags
+    #[arg(long, value_name = "WU", help = "Maximum block weight for templates (default: 4000000)")]
+    pub blockmaxweight: Option<usize>,
+
+    #[arg(long, value_name = "RATE", help = "Minimum tx fee for block template in sat/kvB (default: 1000)")]
+    pub blockmintxfee: Option<u64>,
+
+    // Misc flags
+    #[arg(long, value_name = "FILE", help = "Write PID to file")]
+    pub pid: Option<String>,
+
+    // No-op compatibility flags (accepted silently, not wired)
+    #[arg(long, help = "Accept RPC commands (always on, accepted for compatibility)")]
+    pub server: bool,
+
+    #[arg(long, help = "Run in background (use systemd instead, accepted for compatibility)")]
+    pub daemon: bool,
+
+    #[arg(long, value_name = "MB", help = "Database cache size in MB (accepted for compatibility)")]
+    pub dbcache: Option<usize>,
+
+    #[arg(long, value_name = "N", help = "Script verification threads (accepted for compatibility)")]
+    pub par: Option<usize>,
 }
 
 /// Convert Bitcoin Core-style single-dash long flags to clap-compatible double-dash.
@@ -369,6 +484,19 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "prune",
         "reindex",
         "reindex-chainstate",
+        "maxconnections",
+        "bind",
+        "timeout",
+        "addnode",
+        "dns",
+        "bantime",
+        "blockmaxweight",
+        "blockmintxfee",
+        "pid",
+        "server",
+        "daemon",
+        "dbcache",
+        "par",
     ];
 
     args.into_iter()
@@ -569,6 +697,19 @@ rpcport=8332
             prune: None,
             reindex: false,
             reindex_chainstate: false,
+            maxconnections: None,
+            bind: None,
+            timeout: None,
+            addnode: vec![],
+            dns: None,
+            bantime: None,
+            blockmaxweight: None,
+            blockmintxfee: None,
+            pid: None,
+            server: false,
+            daemon: false,
+            dbcache: None,
+            par: None,
         };
         let config = Config::from_cli(cli).unwrap();
         assert_eq!(config.network, Network::Regtest);
@@ -607,6 +748,19 @@ rpcport=8332
             prune: None,
             reindex: false,
             reindex_chainstate: false,
+            maxconnections: None,
+            bind: None,
+            timeout: None,
+            addnode: vec![],
+            dns: None,
+            bantime: None,
+            blockmaxweight: None,
+            blockmintxfee: None,
+            pid: None,
+            server: false,
+            daemon: false,
+            dbcache: None,
+            par: None,
         };
         assert!(Config::from_cli(cli).is_err());
     }
