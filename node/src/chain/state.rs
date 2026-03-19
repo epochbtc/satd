@@ -2,6 +2,7 @@ use bitcoin::consensus::serialize;
 use bitcoin::{Block, BlockHash, Network, OutPoint};
 use std::sync::{Mutex, RwLock};
 
+use crate::chain::checkpoints::{self, Checkpoint};
 use crate::chain::{connect, disconnect};
 use crate::storage::blockindex::{BlockIndexEntry, BlockStatus, add_u256, work_for_bits};
 use crate::storage::coinview::Coin;
@@ -18,6 +19,8 @@ pub enum ChainError {
     BadPrevBlock,
     #[error("Block decode failed")]
     DecodeFailed,
+    #[error("checkpoint mismatch at height {0}")]
+    CheckpointMismatch(u32),
     #[error("{0}")]
     Validation(#[from] validation::ValidationError),
     #[error("{0}")]
@@ -41,6 +44,7 @@ pub struct ChainState {
     pub network: Network,
     script_verifier: Box<dyn ScriptVerifier>,
     assumevalid: Option<BlockHash>,
+    checkpoints: Vec<Checkpoint>,
 }
 
 impl ChainState {
@@ -54,6 +58,8 @@ impl ChainState {
     ) -> Result<Self, ChainError> {
         let genesis = bitcoin::constants::genesis_block(network);
         let genesis_hash = genesis.block_hash();
+
+        let checkpoints = checkpoints::checkpoints_for_network(network);
 
         // Check if we have an existing tip
         if let Some(tip_hash) = store.get_tip()
@@ -73,6 +79,7 @@ impl ChainState {
                     network,
                     script_verifier,
                     assumevalid,
+                    checkpoints,
                 });
             }
 
@@ -100,6 +107,7 @@ impl ChainState {
             network,
             script_verifier,
             assumevalid,
+            checkpoints,
         })
     }
 
@@ -127,7 +135,7 @@ impl ChainState {
     pub fn has_block_data(&self, hash: &BlockHash) -> bool {
         self.store
             .get_block_index(hash)
-            .map(|e| e.status == BlockStatus::Valid || e.status == BlockStatus::DataStored)
+            .map(|e| matches!(e.status, BlockStatus::Valid | BlockStatus::DataStored))
             .unwrap_or(false)
     }
 
@@ -233,7 +241,10 @@ impl ChainState {
 
     pub fn get_block(&self, hash: &BlockHash) -> Option<Block> {
         let entry = self.store.get_block_index(hash)?;
-        if entry.status == BlockStatus::HeaderOnly || entry.status == BlockStatus::Invalid {
+        if matches!(
+            entry.status,
+            BlockStatus::HeaderOnly | BlockStatus::Invalid | BlockStatus::Pruned
+        ) {
             return None;
         }
         let pos = FlatFilePos {
@@ -281,6 +292,16 @@ impl ChainState {
             let hash = store_ref.get_block_hash_by_height(h)?;
             store_ref.get_block_index(&hash)
         })?;
+
+        // Checkpoint validation
+        if !checkpoints::check_against_checkpoints(new_height, &block_hash, &self.checkpoints) {
+            tracing::warn!(
+                height = new_height,
+                hash = %block_hash,
+                "Block rejected: checkpoint mismatch"
+            );
+            return Err(ChainError::CheckpointMismatch(new_height));
+        }
 
         // Write raw block to flat file
         let block_data = serialize(block);
@@ -473,6 +494,87 @@ impl ChainState {
         }
 
         Ok(())
+    }
+    /// Prune old block data files whose blocks are deep enough in the chain.
+    /// `keep_blocks` is the number of recent blocks to keep data for.
+    /// Returns the number of files deleted.
+    pub fn prune_blocks(&self, keep_blocks: u32) -> u32 {
+        let tip_height = self.tip_height();
+        if tip_height <= keep_blocks {
+            return 0;
+        }
+        let prune_below = tip_height - keep_blocks;
+
+        // Collect file_numbers used by pruneable blocks (height <= prune_below)
+        let mut pruneable_files: std::collections::HashMap<u32, Vec<(BlockHash, u32)>> =
+            std::collections::HashMap::new();
+        for h in 0..=prune_below {
+            if let Some(hash) = self.store.get_block_hash_by_height(h)
+                && let Some(entry) = self.store.get_block_index(&hash)
+                && entry.status == BlockStatus::Valid
+            {
+                pruneable_files
+                    .entry(entry.file_number)
+                    .or_default()
+                    .push((hash, h));
+            }
+        }
+
+        // Collect file_numbers used by recent blocks (must NOT be deleted)
+        let mut keep_files: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        for h in (prune_below + 1)..=tip_height {
+            if let Some(hash) = self.store.get_block_hash_by_height(h)
+                && let Some(entry) = self.store.get_block_index(&hash)
+            {
+                keep_files.insert(entry.file_number);
+            }
+        }
+
+        let mut deleted = 0u32;
+        let flat_files = self.flat_files.lock().unwrap();
+        let mut batch = crate::storage::StoreBatch::default();
+
+        for (file_num, blocks) in &pruneable_files {
+            // Only delete files that have NO recent blocks in them
+            if keep_files.contains(file_num) {
+                continue;
+            }
+            // Only delete if the file actually exists (not already pruned)
+            if !flat_files.file_exists(*file_num) {
+                continue;
+            }
+            if let Err(e) = flat_files.delete_file(*file_num) {
+                tracing::warn!(file = file_num, "Failed to delete block file: {}", e);
+                continue;
+            }
+            // Mark all blocks in this file as Pruned
+            for (hash, height) in blocks {
+                if let Some(mut entry) = self.store.get_block_index(hash) {
+                    entry.status = BlockStatus::Pruned;
+                    batch.block_index_puts.push((*hash, entry));
+                }
+                tracing::debug!(file = file_num, height, "Block data pruned");
+            }
+            deleted += 1;
+            tracing::info!(file = file_num, "Deleted block file");
+        }
+        drop(flat_files);
+
+        if !batch.block_index_puts.is_empty()
+            && let Err(e) = self.store.write_batch(batch)
+        {
+            tracing::error!("Failed to update block index after pruning: {}", e);
+        }
+
+        deleted
+    }
+
+    /// Check if a block has been pruned.
+    pub fn is_pruned(&self, hash: &BlockHash) -> bool {
+        self.store
+            .get_block_index(hash)
+            .map(|e| e.status == BlockStatus::Pruned)
+            .unwrap_or(false)
     }
 }
 
@@ -795,6 +897,102 @@ mod tests {
             cs.get_coin(&OutPoint { txid: b3_coinbase_txid, vout: 0 }).is_some(),
             "B3 coinbase UTXO should exist after reorg"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_checkpoint_mismatch_rejected() {
+        // Build a ChainState with a fake checkpoint at height 1 that won't match
+        use crate::chain::checkpoints::Checkpoint;
+
+        let dir = std::env::temp_dir().join(format!(
+            "satd-checkpoint-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let blocks_dir = dir.join("blocks");
+        let store = Box::new(InMemoryStore::new());
+        let flat_files = FlatFileManager::new(&blocks_dir).unwrap();
+        let mut cs = ChainState::new(
+            store,
+            flat_files,
+            Network::Regtest,
+            Box::new(NoopVerifier),
+            None,
+        )
+        .unwrap();
+
+        // Inject a fake checkpoint at height 1 with an impossible hash
+        let fake_hash: BlockHash = "0000000000000000000000000000000000000000000000000000000000000001"
+            .parse()
+            .unwrap();
+        cs.checkpoints = vec![Checkpoint { height: 1, hash: fake_hash }];
+
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+        let block1 = build_test_block(genesis_hash, 1, 1_300_000_001);
+        let result = cs.accept_block(&block1);
+        assert!(
+            matches!(result, Err(ChainError::CheckpointMismatch(1))),
+            "Block at checkpoint height with wrong hash should be rejected, got {:?}",
+            result
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_prune_blocks() {
+        let (cs, dir) = make_chain_state();
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+
+        // Build a chain of 5 blocks
+        let mut parent = genesis_hash;
+        let mut hashes = vec![genesis_hash];
+        for i in 1..=5u32 {
+            let block = build_test_block(parent, i, 1_300_000_000 + i);
+            parent = cs.accept_block(&block).expect(&format!("accept block {}", i));
+            hashes.push(parent);
+        }
+        assert_eq!(cs.tip_height(), 5);
+
+        // Verify we can read all blocks
+        for h in &hashes {
+            assert!(cs.get_block(h).is_some(), "block should be readable");
+        }
+
+        // Prune keeping only the last 2 blocks (blocks 4 and 5 kept, 0-3 pruned)
+        let deleted = cs.prune_blocks(2);
+        // All blocks are in file 0, and blocks 4,5 are also in file 0,
+        // so the file should NOT be deleted (contains recent blocks too)
+        // This tests the safety check.
+        assert_eq!(deleted, 0, "Should not delete file containing recent blocks");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_pruned_block_returns_none() {
+        let (cs, dir) = make_chain_state();
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+
+        // Build a single block
+        let block1 = build_test_block(genesis_hash, 1, 1_300_000_001);
+        let hash1 = cs.accept_block(&block1).unwrap();
+
+        // Manually mark it as pruned
+        let mut entry = cs.get_block_index(&hash1).unwrap();
+        entry.status = BlockStatus::Pruned;
+        let mut batch = crate::storage::StoreBatch::default();
+        batch.block_index_puts.push((hash1, entry));
+        cs.store.write_batch(batch).unwrap();
+
+        // get_block should return None for pruned blocks
+        assert!(cs.get_block(&hash1).is_none());
+        assert!(cs.is_pruned(&hash1));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
