@@ -9,6 +9,7 @@ pub enum BlockStatus {
     DataStored,
     Valid,
     Invalid,
+    Pruned,
 }
 
 /// Metadata for a block stored in the block index.

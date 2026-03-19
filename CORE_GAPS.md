@@ -78,29 +78,22 @@ Split read/write connection to prevent stream misalignment.
 transaction relay is skipped, preventing false-positive peer bans. Block
 requests use a 512-block lookahead window with 128-block batches.
 
-### 12. Mempool has no RBF (Replace-By-Fee)
+### 12. ~~Mempool has no RBF (Replace-By-Fee)~~ — FIXED
 
-**File:** `node/src/mempool/pool.rs`
+Opt-in RBF (BIP 125) and full RBF are both implemented. Configurable via
+`-mempoolfullrbf` (default: true, matching Bitcoin Core v28+). Replacement
+requires higher absolute fee plus incremental relay fee per weight unit.
 
-When a transaction's input conflicts with an existing mempool entry, it is
-rejected with `ConflictingSpend`. BIP 125 (opt-in RBF) and full RBF are not
-implemented. There is no fee comparison or replacement logic.
+### 13. ~~Mempool has no CPFP (Child-Pays-For-Parent)~~ — FIXED
 
-### 13. Mempool has no CPFP (Child-Pays-For-Parent)
+Mempool inputs can reference unconfirmed parent outputs. Full transitive
+ancestor set tracking with configurable `-limitancestorcount` (default: 25).
 
-**File:** `node/src/mempool/pool.rs`
+### 14. ~~Fee estimation is not wired~~ — FIXED
 
-Inputs referencing unconfirmed transactions (outputs from other mempool entries)
-are rejected with `MissingInputs`. There is no ancestor/descendant tracking or
-package fee rate computation.
-
-### 14. Fee estimation is not wired
-
-**File:** `node/src/mempool/fee.rs`
-
-`FeeEstimator` struct exists with a percentile-based implementation, but
-`record_block()` is never called from the block connection path. The RPC
-`estimatesmartfee` falls back to a hardcoded 1 sat/vB default.
+`record_block_fees()` is called from `block_processor()` after every successful
+block connection. Extracts per-tx fee rates and feeds them to `FeeEstimator`
+via `record_block()`. `estimatesmartfee` returns target-aware percentiles.
 
 ---
 
@@ -109,54 +102,56 @@ package fee rate computation.
 Missing features that affect deployment and administration. Not consensus-
 critical but expected by operators and tooling.
 
-### 15. No pruning (-prune)
+### 15. ~~No pruning (-prune)~~ — FIXED
 
-Full blockchain must be stored. No flat file deletion for old blocks, no
-automatic disk space management.
+`-prune=<MB>` flag enables automatic deletion of old blk*.dat files once the
+chain tip is deep enough. Pruned blocks return appropriate errors from RPCs.
+`BlockStatus::Pruned` tracks entries whose flat file data has been deleted.
 
-### 16. No transaction index (-txindex)
+### 16. ~~No transaction index (-txindex)~~ — FIXED
 
-`getrawtransaction` requires a `blockhash` parameter for confirmed transactions.
-Without `-txindex`, there is no txid→block reverse lookup.
+`-txindex` flag enables txid→block_hash lookup stored in redb. `getrawtransaction`
+works without a `blockhash` parameter when txindex is enabled.
 
 ### 17. No reindex support (-reindex, -reindex-chainstate)
 
-If RocksDB becomes corrupted, the node cannot rebuild from flat files. Must
+If the database becomes corrupted, the node cannot rebuild from flat files. Must
 delete the chainstate directory and resync from peers.
 
-### 18. No checkpoint validation
+### 18. ~~No checkpoint validation~~ — FIXED
 
-No hardcoded checkpoints for known block hashes at specific heights. Speeds up
-IBD and protects against long-range attacks.
+Hardcoded checkpoints for signet at key heights. During IBD, blocks at checkpoint
+heights must match the expected hash or be rejected. Mainnet/testnet checkpoints
+can be added from Bitcoin Core's source.
 
 ### 19. Missing ~80% of Bitcoin Core config flags
 
 Only basic flags are supported: `-regtest`, `-testnet`, `-signet`, `-datadir`,
 `-rpcport`, `-rpcuser`, `-rpcpassword`, `-listen`, `-port`, `-connect`,
-`-assumevalid`. Missing: `-proxy`, `-maxconnections`, `-dbcache`, `-debug`,
-`-pid`, and ~70 others.
+`-assumevalid`, `-txindex`, `-prune`, plus mempool policy flags. Missing:
+`-proxy`, `-maxconnections`, `-dbcache`, `-debug`, `-pid`, and ~60 others.
 
-### 20. No mempool policy enforcement
+### 20. ~~No mempool policy enforcement~~ — PARTIALLY FIXED
 
-**File:** `node/src/mempool/pool.rs`
+Implemented:
+- Dust output checks (configurable via `-dustrelayfee`, 0 = disable)
+- OP_RETURN data size limits (configurable via `-datacarrier`, `-datacarriersize`)
+- Maximum ancestor/descendant count limits (`-limitancestorcount`, `-limitdescendantcount`)
+- Mempool expiration (configurable via `-mempoolexpiry`)
+- Low-fee eviction when mempool is full (evicts lowest fee-rate entries)
 
-Missing:
-- Dust output checks (outputs below relay dust threshold)
+Not yet implemented:
 - Standard script type enforcement (non-standard scripts accepted)
-- OP_RETURN data size limits
-- Maximum ancestor/descendant count limits
-- Mempool expiration (entries persist forever until confirmed or conflicted)
-- Low-fee eviction (when full, new txs are rejected instead of evicting lowest-fee)
 
-### 21. Missing P2P message types
+### 21. ~~Missing P2P message types~~ — PARTIALLY FIXED
 
-13 of ~20 message types are handled: `Ping`, `Pong`, `Inv`, `Headers`,
+15 of ~20 message types are now handled: `Ping`, `Pong`, `Inv`, `Headers`,
 `Block`, `Tx`, `GetHeaders`, `GetData`, `SendHeaders`, `SendCmpct`,
-`CmpctBlock`, `GetBlockTxn`, `BlockTxn`. Not handled:
+`CmpctBlock`, `GetBlockTxn`, `BlockTxn`, `FeeFilter`, `Addr`, `GetAddr`.
+Not handled:
 
-- `Addr` / `AddrV2` (peer discovery)
+- `AddrV2` (v2 peer discovery)
 - `MemPool` (mempool sync)
-- `FeeFilter` (min fee relay)
 - `NotFound` (missing data notification)
 - `FilterLoad` / `FilterAdd` / `FilterClear` (bloom filters)
 
@@ -164,39 +159,43 @@ Missing:
 
 **File:** `node/src/rpc/mining.rs`
 
-Missing fields: `longpollid`, `expires`, `rules`, `vbavailable`, `vbrequired`,
-`capabilities`, `default_witness_commitment`. Sufficient for basic regtest
-mining but not compatible with production mining software.
+Missing fields: `longpollid`, `expires`, `default_witness_commitment`. Sufficient
+for basic regtest mining but not compatible with production mining software.
 
-### 23. Missing RPCs
+### 23. ~~Missing RPCs~~ — PARTIALLY FIXED
 
-~26 of ~150 Bitcoin Core RPCs are implemented. Notable missing RPCs beyond wallet:
+73 of ~77 non-wallet Bitcoin Core RPCs are implemented. Notable missing RPCs:
 
-- `testmempoolaccept` — dry-run tx validation
-- `getmempoolentry` — single mempool tx details
-- `getmempoolancestors` / `getmempooldescendants` — dependency queries
-- `getmininginfo` — mining status
 - `prioritisetransaction` — fee bumping for miners
-- `createrawtransaction` / `combinerawtransaction` — tx construction
 - `signrawtransactionwithkey` — signing without wallet
-- `decodescript` — script analysis
-- `getblockstats` — per-block statistics
-- `getchaintips` — fork information
-- `waitforblock` / `waitforblockheight` — long-polling
-- `verifychain` — check chain database integrity
+- `combinepsbt` / `finalizepsbt` / `utxoupdatepsbt` — PSBT workflow
+- `disconnectnode` — peer management
+
+### 24. ~~Checksum handling~~ — FIXED
+
+Handled by the `bitcoin` crate's `deserialize` — invalid checksums in P2P
+messages are rejected during deserialization.
+
+---
+
+## Additional Completions (not in original gap list)
+
+### A1. ~~redb storage migration~~ — DONE
+
+Storage backend migrated from RocksDB to redb (pure Rust). All column families
+mapped to redb tables. No external C++ dependencies for storage.
 
 ---
 
 ## Summary
 
-| Priority | Total | Fixed | Open | Description |
-|----------|-------|-------|------|-------------|
-| **P0** | 6 | 6 | 0 | All consensus-critical gaps closed |
-| **P1** | 8 | 5 | 3 | RBF, CPFP, fee estimation remain |
-| **P2** | 11 | 0 | 11 | Operational: pruning, txindex, config, policy, RPCs |
-| **Total** | 25 | 11 | 14 | |
+| Priority | Total | Fixed | Partial | Open | Description |
+|----------|-------|-------|---------|------|-------------|
+| **P0** | 6 | 6 | 0 | 0 | All consensus-critical gaps closed |
+| **P1** | 8 | 8 | 0 | 0 | All reliability gaps closed |
+| **P2** | 11 | 5 | 3 | 3 | Pruning, txindex, checkpoints, policy, P2P, RPCs improved |
+| **Total** | 25 | 19 | 3 | 3 | |
 
-All P0 consensus issues are resolved. satd is safe for signet/testnet IBD and
-block validation. The remaining P1 items (mempool improvements) are needed for
-production relay and mining. P2 items are operational polish for drop-in
-Bitcoin Core compatibility.
+All P0 and P1 gaps are resolved. satd is safe for signet/testnet/mainnet IBD
+and block validation. The remaining P2 items (reindex, remaining config flags,
+remaining RPCs) are operational polish for full Bitcoin Core compatibility.

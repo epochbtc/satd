@@ -28,6 +28,7 @@ pub struct Config {
     pub mempoolexpiry: u64,
     pub permitbaremultisig: bool,
     pub txindex: bool,
+    pub prune: u64,
 }
 
 impl Config {
@@ -183,6 +184,16 @@ impl Config {
         let txindex = cli.txindex
             || file_get("txindex").and_then(|v| parse_bool(&v)).unwrap_or(false);
 
+        let prune = cli
+            .prune
+            .or_else(|| file_get("prune").and_then(|v| v.parse().ok()))
+            .unwrap_or(0); // 0 = no pruning
+
+        // Validate prune + txindex conflict
+        if prune > 0 && txindex {
+            return Err("prune mode is incompatible with -txindex".to_string());
+        }
+
         // Validate auth consistency
         if rpcuser.is_some() != rpcpassword.is_some() {
             return Err(
@@ -212,6 +223,7 @@ impl Config {
             mempoolexpiry,
             permitbaremultisig,
             txindex,
+            prune,
         })
     }
 
@@ -300,6 +312,9 @@ pub struct CliArgs {
 
     #[arg(long, help = "Maintain a full transaction index")]
     pub txindex: bool,
+
+    #[arg(long, value_name = "MB", help = "Prune block data to target size in MB (0 = no pruning, default: 0)")]
+    pub prune: Option<u64>,
 }
 
 /// Convert Bitcoin Core-style single-dash long flags to clap-compatible double-dash.
@@ -330,6 +345,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "mempoolexpiry",
         "permitbaremultisig",
         "txindex",
+        "prune",
     ];
 
     args.into_iter()
@@ -526,6 +542,7 @@ rpcport=8332
             mempoolexpiry: None,
             permitbaremultisig: None,
             txindex: false,
+            prune: None,
         };
         let config = Config::from_cli(cli).unwrap();
         assert_eq!(config.network, Network::Regtest);
@@ -560,6 +577,7 @@ rpcport=8332
             mempoolexpiry: None,
             permitbaremultisig: None,
             txindex: false,
+            prune: None,
         };
         assert!(Config::from_cli(cli).is_err());
     }

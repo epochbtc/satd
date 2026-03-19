@@ -133,13 +133,18 @@ async fn main() {
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
     // Initialize P2P peer manager
-    let peer_manager = node::net::manager::PeerManager::new(
+    let peer_manager = node::net::manager::PeerManager::with_prune(
         chain_state.clone(),
         mempool.clone(),
         fee_estimator.clone(),
         config.network,
         shutdown_rx.clone(),
+        config.prune,
     );
+
+    if config.prune > 0 {
+        tracing::info!(target_mb = config.prune, "Block pruning enabled");
+    }
 
     // Start RPC server
     let bind_addr: SocketAddr = format!("{}:{}", config.rpcbind, config.rpcport)
