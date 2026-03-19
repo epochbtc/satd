@@ -1848,7 +1848,7 @@ impl PeerManager {
             receiver: Address::new(&receiver, ServiceFlags::NONE),
             sender: Address::new(&sender, services),
             nonce: rand::random(),
-            user_agent: "/satd:0.1.0/".to_string(),
+            user_agent: crate::USER_AGENT.to_string(),
             start_height: self.chain_state.tip_height() as i32,
             relay: true,
         }

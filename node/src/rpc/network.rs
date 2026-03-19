@@ -7,7 +7,7 @@ pub fn get_network_info(peer_manager: &PeerManager) -> Value {
 
     json!({
         "version": 10000,
-        "subversion": "/satd:0.1.0/",
+        "subversion": crate::USER_AGENT,
         "protocolversion": 70016,
         "localservices": "0000000000000409",
         "localservicesnames": ["NETWORK", "WITNESS", "NETWORK_LIMITED"],
