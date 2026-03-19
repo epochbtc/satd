@@ -298,10 +298,10 @@ impl ChainState {
         let block_hash = block.block_hash();
 
         // Check for duplicate — skip if already DataStored or Valid
-        if let Some(existing) = self.store.get_block_index(&block_hash) {
-            if existing.status != BlockStatus::HeaderOnly {
-                return Err(ChainError::Duplicate);
-            }
+        if let Some(existing) = self.store.get_block_index(&block_hash)
+            && existing.status != BlockStatus::HeaderOnly
+        {
+            return Err(ChainError::Duplicate);
         }
 
         // Parent must exist as at least HeaderOnly

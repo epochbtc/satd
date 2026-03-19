@@ -112,15 +112,18 @@ impl IbdScheduler {
         let mut hashes = Vec::with_capacity(budget);
         let mut assigned_heights = Vec::with_capacity(budget);
 
-        // Track how many total blocks are ahead of the connect cursor
-        let total_ahead =
-            self.downloaded.len() as u32 + self.in_flight.len() as u32;
-
         let mut attempts = 0;
         while hashes.len() < budget && !self.pending.is_empty() {
             // Prevent infinite loop if all remaining blocks exceed max_ahead
             attempts += 1;
             if attempts > self.pending.len() + budget {
+                break;
+            }
+
+            // Respect max_ahead window: don't assign if too many blocks ahead of cursor
+            let total_ahead =
+                self.downloaded.len() as u32 + self.in_flight.len() as u32 + hashes.len() as u32;
+            if total_ahead >= self.max_ahead {
                 break;
             }
 
@@ -137,15 +140,6 @@ impl IbdScheduler {
             // Skip if already in-flight
             if self.in_flight.contains_key(&height) {
                 continue;
-            }
-
-            // Respect max_ahead window
-            if height > self.connect_cursor + self.max_ahead
-                && total_ahead + hashes.len() as u32 >= self.max_ahead
-            {
-                // Put it back and stop
-                self.pending.push_back(height);
-                break;
             }
 
             if let Some(&hash) = self.height_to_hash.get(&height) {
