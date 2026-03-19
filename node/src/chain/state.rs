@@ -318,6 +318,14 @@ impl ChainState {
                 return Ok(block_hash);
             }
 
+            // During IBD, if the side chain is far ahead of our tip, don't attempt
+            // reorg — the intermediate blocks will arrive and connect in order.
+            // This avoids expensive failed reorg attempts when blocks arrive
+            // out of order from multiple peers.
+            if new_height > tip_entry.height + 128 {
+                return Ok(block_hash);
+            }
+
             // Side chain has more work — find fork point and reorg
             tracing::info!(
                 new_height,

@@ -88,9 +88,9 @@ pub struct PeerManager {
     event_rx: tokio::sync::Mutex<mpsc::Receiver<NetEvent>>,
     /// Track the highest header height we've stored.
     headers_tip: AtomicU64,
-    /// Track blocks we've already requested to avoid duplicate getdata.
+    /// Track blocks currently in-flight (requested but not yet received).
     #[allow(dead_code)]
-    requested_blocks: RwLock<std::collections::HashSet<bitcoin::BlockHash>>,
+    in_flight_blocks: RwLock<std::collections::HashSet<bitcoin::BlockHash>>,
     /// Configured outbound peer addresses for auto-reconnect.
     connect_addrs: RwLock<Vec<SocketAddr>>,
     /// Channel to send received blocks to the processing thread.
@@ -128,7 +128,7 @@ impl PeerManager {
             event_tx,
             event_rx: tokio::sync::Mutex::new(event_rx),
             headers_tip: AtomicU64::new(0),
-            requested_blocks: RwLock::new(std::collections::HashSet::new()),
+            in_flight_blocks: RwLock::new(std::collections::HashSet::new()),
             connect_addrs: RwLock::new(Vec::new()),
             block_tx,
             pending_compact: RwLock::new(HashMap::new()),
