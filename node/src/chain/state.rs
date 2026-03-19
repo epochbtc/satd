@@ -71,8 +71,16 @@ impl ChainState {
         // Check if we have an existing tip
         if let Some(tip_hash) = store.get_tip()
             && let Some(entry) = store.get_block_index(&tip_hash) {
+                // Scan forward from the block tip to find the highest stored header.
+                // Headers may be ahead of blocks if we crashed during IBD.
+                let mut htip = entry.height;
+                while store.get_block_hash_by_height(htip + 1).is_some() {
+                    htip += 1;
+                }
+
                 tracing::info!(
                     height = entry.height,
+                    headers_tip = htip,
                     hash = %tip_hash,
                     "Loaded chain tip from storage"
                 );
@@ -88,7 +96,7 @@ impl ChainState {
                     script_verifier,
                     assumevalid,
                     checkpoints,
-                    headers_tip_height: AtomicU32::new(entry.height),
+                    headers_tip_height: AtomicU32::new(htip),
                 });
             }
 
