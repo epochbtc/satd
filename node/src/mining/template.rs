@@ -82,6 +82,7 @@ pub fn create_template(chain_state: &ChainState, mempool: &Mempool) -> BlockTemp
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chain::state::AssumeValid;
     use crate::storage::db::InMemoryStore;
     use crate::storage::flatfile::FlatFileManager;
     use crate::validation::script::NoopVerifier;
@@ -92,7 +93,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("satd-template-test-{}", std::process::id()));
         let store = Box::new(InMemoryStore::new());
         let flat_files = FlatFileManager::new(&dir.join("blocks")).unwrap();
-        let cs = ChainState::new(store, flat_files, Network::Regtest, Box::new(NoopVerifier), None).unwrap();
+        let cs = ChainState::new(store, flat_files, Network::Regtest, Box::new(NoopVerifier), AssumeValid::Disabled).unwrap();
         let mp = Mempool::new(1_000_000, 0);
 
         let template = create_template(&cs, &mp);

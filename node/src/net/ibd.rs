@@ -278,6 +278,7 @@ mod tests {
     use super::*;
     use crate::storage::db::InMemoryStore;
     use crate::storage::flatfile::FlatFileManager;
+    use crate::chain::state::AssumeValid;
     use crate::validation::script::NoopVerifier;
     use bitcoin::Network;
 
@@ -297,7 +298,7 @@ mod tests {
             flat_files,
             Network::Regtest,
             Box::new(NoopVerifier),
-            None,
+            AssumeValid::Disabled,
         )
         .unwrap();
 

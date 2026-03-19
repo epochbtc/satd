@@ -238,6 +238,7 @@ mod tests {
     use bitcoin::Network;
     use crate::storage::db::InMemoryStore;
     use crate::storage::flatfile::FlatFileManager;
+    use crate::chain::state::AssumeValid;
     use crate::validation::script::NoopVerifier;
 
     #[test]
@@ -250,7 +251,7 @@ mod tests {
             flat_files,
             Network::Regtest,
             Box::new(NoopVerifier),
-            None,
+            AssumeValid::Disabled,
         )
         .unwrap();
         let mp = Mempool::new(1_000_000, 0);
@@ -279,7 +280,7 @@ mod tests {
             flat_files,
             Network::Regtest,
             Box::new(NoopVerifier),
-            None,
+            AssumeValid::Disabled,
         )
         .unwrap();
         let mp = Mempool::new(1_000_000, 0);

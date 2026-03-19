@@ -748,6 +748,7 @@ mod tests {
     use super::*;
     use crate::storage::db::InMemoryStore;
     use crate::storage::flatfile::FlatFileManager;
+    use crate::chain::state::AssumeValid;
     use crate::validation::script::NoopVerifier;
 
     fn make_test_env() -> (ChainState, Mempool, std::path::PathBuf) {
@@ -767,7 +768,7 @@ mod tests {
             flat_files,
             bitcoin::Network::Regtest,
             Box::new(NoopVerifier),
-            None,
+            AssumeValid::Disabled,
         )
         .unwrap();
         let mp = Mempool::new(1_000_000, 0); // 1MB, no min fee for tests
@@ -876,7 +877,7 @@ mod tests {
             flat_files,
             bitcoin::Network::Regtest,
             Box::new(NoopVerifier),
-            None,
+            AssumeValid::Disabled,
         )
         .unwrap();
 
