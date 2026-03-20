@@ -975,27 +975,39 @@ impl PeerManager {
                 for pid in peer_ids {
                     self.send_to_peer(pid, sync::make_getheaders(&self.chain_state));
                 }
-            } else {
-                // Headers complete (peer sent < 2000) — check if we should start swarming
-                let tip = self.chain_state.tip_height();
-                let headers_tip = htip as u32;
-                if headers_tip > tip + 24 {
-                    let mut ibd = self.ibd.write().unwrap();
-                    if ibd.is_none() {
-                        let sched = IbdScheduler::new(headers_tip, tip, &self.chain_state);
-                        let (_, _, pending, target) = sched.progress();
-                        tracing::info!(
-                            target_height = target,
-                            blocks_to_download = pending,
-                            "Headers complete, starting swarm download"
-                        );
-                        *ibd = Some(sched);
+            }
+
+            // Start or extend IBD scheduler as soon as headers are far enough
+            // ahead of the block tip. Don't wait for header download to finish —
+            // pipeline block downloads alongside header sync.
+            let tip = self.chain_state.tip_height();
+            let headers_tip = htip as u32;
+            if headers_tip > tip + 24 {
+                let mut ibd = self.ibd.write().unwrap();
+                if ibd.is_none() {
+                    let sched = IbdScheduler::new(headers_tip, tip, &self.chain_state);
+                    let (_, _, pending, target) = sched.progress();
+                    tracing::info!(
+                        target_height = target,
+                        blocks_to_download = pending,
+                        "Starting parallel block download"
+                    );
+                    *ibd = Some(sched);
+                    drop(ibd);
+                    // Wake the block processor thread so it enters IBD mode
+                    let (lock, cvar) = &*self.connect_signal;
+                    *lock.lock().unwrap() = true;
+                    cvar.notify_one();
+                    // Assign work to all connected peers
+                    self.assign_all_peers();
+                } else if let Some(scheduler) = ibd.as_mut() {
+                    // Headers advanced — extend the scheduler target so it
+                    // keeps downloading without waiting for the current batch
+                    // to fully complete first.
+                    if headers_tip > scheduler.target_height() {
+                        scheduler.extend_target(headers_tip, &self.chain_state);
                         drop(ibd);
-                        // Wake the block processor thread so it enters IBD mode
-                        let (lock, cvar) = &*self.connect_signal;
-                        *lock.lock().unwrap() = true;
-                        cvar.notify_one();
-                        // Assign work to all connected peers
+                        // Assign more work now that we have more blocks to fetch
                         self.assign_all_peers();
                     }
                 }

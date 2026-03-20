@@ -34,4 +34,5 @@ exec "$SATD" \
     --rpcport="$RPCPORT" \
     --port="$P2PPORT" \
     --txindex \
+    --assumevalid=all \
     "${CONNECT_ARGS[@]}"
