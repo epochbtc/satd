@@ -288,6 +288,37 @@ impl IbdScheduler {
         self.downloaded.insert(height);
         self.in_flight.remove(&height);
     }
+
+    /// Extend the target height as more headers arrive.
+    /// Adds newly available heights to the pending pool (shuffled).
+    pub fn extend_target(&mut self, new_target: u32, chain_state: &ChainState) {
+        if new_target <= self.target_height {
+            return;
+        }
+        let old_target = self.target_height;
+        self.target_height = new_target;
+
+        // Collect and shuffle new heights
+        let mut new_heights: Vec<u32> = ((old_target + 1)..=new_target).collect();
+        new_heights.shuffle(&mut rand::thread_rng());
+
+        // Build height-to-hash mapping for new heights
+        for &h in &new_heights {
+            if let Some(hash) = chain_state.get_block_hash_by_height(h) {
+                self.height_to_hash.insert(h, hash);
+            }
+        }
+
+        // Add to pending pool
+        self.pending.extend(new_heights);
+
+        tracing::debug!(
+            old_target,
+            new_target,
+            pending = self.pending.len(),
+            "IBD scheduler target extended"
+        );
+    }
 }
 
 #[cfg(test)]
