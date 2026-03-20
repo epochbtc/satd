@@ -479,6 +479,13 @@ pub async fn start(
         Ok::<_, ErrorObjectOwned>(serde_json::json!(ctx.peer_manager.connection_count()))
     })?;
 
+    module.register_method("getibdprogress", |_params, ctx, _extensions| {
+        match ctx.peer_manager.get_ibd_progress() {
+            Some(progress) => Ok::<_, ErrorObjectOwned>(progress),
+            None => Ok::<_, ErrorObjectOwned>(serde_json::json!({"active": false})),
+        }
+    })?;
+
     module.register_async_method("addnode", |params, ctx, _extensions| async move {
         let mut seq = params.sequence();
         let addr_str: String = seq.next().map_err(|e| {
@@ -589,7 +596,7 @@ pub async fn start(
             "getaddednodeinfo", "getbestblockhash", "getblock", "getblockchaininfo",
             "getblockcount", "getblockhash", "getblockheader", "getblockstats",
             "getblocktemplate", "getchaintips", "getchaintxstats", "getconnectioncount",
-            "getdifficulty", "getmempoolancestors", "getmempooldescendants",
+            "getdifficulty", "getibdprogress", "getmempoolancestors", "getmempooldescendants",
             "getmempoolentry", "getmempoolinfo", "getmemoryinfo", "getmininginfo",
             "getnettotals", "getnetworkhashps", "getnetworkinfo", "getpeerinfo",
             "getrawmempool", "getrawtransaction", "getrpcinfo", "gettxout",
