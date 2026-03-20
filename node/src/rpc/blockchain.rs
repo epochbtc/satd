@@ -266,6 +266,8 @@ pub fn get_tx_out(
 
 /// `gettxoutsetinfo` — return UTXO set statistics.
 pub fn get_tx_out_set_info(chain_state: &ChainState) -> Value {
+    // Flush the UTXO cache so coin_count/coin_total_amount are accurate
+    let _ = chain_state.flush_coin_cache();
     let tip_hash = chain_state.tip_hash();
     let tip_height = chain_state.tip_height();
     let coin_count = chain_state.coin_count();

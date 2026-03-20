@@ -381,7 +381,10 @@ async fn main() {
         }
     }
 
-    // Graceful shutdown
+    // Graceful shutdown — flush UTXO cache before stopping
+    if let Err(e) = chain_state.flush_coin_cache() {
+        tracing::error!("Failed to flush UTXO cache on shutdown: {}", e);
+    }
     server_handle.stop().expect("Failed to stop server");
     auth.cleanup();
     if let Some(ref pid_path) = config.pid {

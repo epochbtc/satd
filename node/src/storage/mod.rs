@@ -1,4 +1,5 @@
 pub mod blockindex;
+pub mod coin_cache;
 pub mod coinview;
 pub mod db;
 pub mod flatfile;
