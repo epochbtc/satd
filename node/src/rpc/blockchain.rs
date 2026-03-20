@@ -275,6 +275,12 @@ pub fn get_tx_out_set_info(chain_state: &ChainState) -> Value {
     let total_sats = chain_state.coin_total_amount();
     let total_btc = total_sats as f64 / 100_000_000.0;
 
+    // Compute age distribution from height histogram
+    // Buckets: <1h (6 blk), <1d (144), <1w (1008), <1mo (4320),
+    //          <6mo (25920), <1y (51840), <3y (155520), 3y+
+    let hist = chain_state.utxo_height_hist();
+    let age_buckets = height_hist_to_age_buckets(&hist, tip_height);
+
     json!({
         "height": tip_height,
         "bestblock": tip_hash.to_string(),
@@ -282,7 +288,49 @@ pub fn get_tx_out_set_info(chain_state: &ChainState) -> Value {
         "bogosize": coin_count * 50,
         "total_amount": total_btc,
         "hash_serialized_3": "",
+        "utxo_age_distribution": {
+            "labels": ["<1h", "<1d", "<1w", "<1mo", "<6mo", "<1y", "<3y", "3y+"],
+            "counts": age_buckets,
+        },
     })
+}
+
+/// Convert a height histogram (1000-block buckets) into 8 age-based buckets
+/// relative to the current tip height.
+fn height_hist_to_age_buckets(hist: &[u64], tip_height: u32) -> [u64; 8] {
+    // Age thresholds in blocks (boundaries between buckets)
+    let thresholds = [6u32, 144, 1008, 4320, 25920, 51840, 155520];
+    let mut buckets = [0u64; 8];
+
+    for (i, &count) in hist.iter().enumerate() {
+        if count == 0 {
+            continue;
+        }
+        // This histogram bucket covers heights [i*1000 .. (i+1)*1000)
+        // Use the midpoint to estimate age
+        let mid_height = i as u32 * 1000 + 500;
+        let age = tip_height.saturating_sub(mid_height);
+
+        let bucket = if age < thresholds[0] {
+            0
+        } else if age < thresholds[1] {
+            1
+        } else if age < thresholds[2] {
+            2
+        } else if age < thresholds[3] {
+            3
+        } else if age < thresholds[4] {
+            4
+        } else if age < thresholds[5] {
+            5
+        } else if age < thresholds[6] {
+            6
+        } else {
+            7
+        };
+        buckets[bucket] += count;
+    }
+    buckets
 }
 
 /// `getdifficulty` — return current proof-of-work difficulty.

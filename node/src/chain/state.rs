@@ -468,6 +468,11 @@ impl ChainState {
         self.store.coin_total_amount()
     }
 
+    /// Get UTXO creation height histogram (1000-block buckets).
+    pub fn utxo_height_hist(&self) -> Vec<u64> {
+        self.store.utxo_height_hist()
+    }
+
     /// Access the script verifier (for mempool use).
     pub fn script_verifier(&self) -> &dyn ScriptVerifier {
         &*self.script_verifier

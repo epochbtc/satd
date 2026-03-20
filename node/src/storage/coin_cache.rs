@@ -1,6 +1,6 @@
 use bitcoin::{BlockHash, OutPoint, Txid};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
 use std::sync::{Mutex, RwLock};
 
 use super::blockindex::BlockIndexEntry;
@@ -31,6 +31,8 @@ pub struct CoinCache {
     dirty_count: AtomicU32,
     /// Pending tip — only written to the inner store on flush.
     pending_tip: Mutex<Option<BlockHash>>,
+    count_delta: AtomicI64,
+    amount_delta: AtomicI64,
 }
 
 impl CoinCache {
@@ -40,6 +42,8 @@ impl CoinCache {
             coins: RwLock::new(HashMap::new()),
             dirty_count: AtomicU32::new(0),
             pending_tip: Mutex::new(None),
+            count_delta: AtomicI64::new(0),
+            amount_delta: AtomicI64::new(0),
         }
     }
 
@@ -74,6 +78,8 @@ impl CoinCache {
 
         drop(cache);
         self.dirty_count.store(0, Ordering::Relaxed);
+        self.count_delta.store(0, Ordering::Relaxed);
+        self.amount_delta.store(0, Ordering::Relaxed);
 
         if puts > 0 || removes > 0 || batch.tip.is_some() {
             tracing::info!(puts, removes, "Flushing UTXO cache to disk");
@@ -131,12 +137,29 @@ impl Store for CoinCache {
         let coin_dirty = batch.coin_puts.len() + batch.coin_removes.len();
         if coin_dirty > 0 {
             let mut cache = self.coins.write().unwrap();
+
+            // Track deltas for puts
             for (outpoint, coin) in batch.coin_puts {
+                self.amount_delta.fetch_add(coin.amount as i64, Ordering::Relaxed);
+                self.count_delta.fetch_add(1, Ordering::Relaxed);
                 cache.insert(outpoint, CacheEntry::Present { coin, dirty: true });
             }
+
+            // Track deltas for removes
             for outpoint in batch.coin_removes {
+                // Look up the amount of the coin being spent
+                let spent_amount = match cache.get(&outpoint) {
+                    Some(CacheEntry::Present { coin, .. }) => coin.amount,
+                    _ => {
+                        // Not in cache, look up from inner store
+                        self.inner.get_coin(&outpoint).map(|c| c.amount).unwrap_or(0)
+                    }
+                };
+                self.amount_delta.fetch_sub(spent_amount as i64, Ordering::Relaxed);
+                self.count_delta.fetch_sub(1, Ordering::Relaxed);
                 cache.insert(outpoint, CacheEntry::Spent { dirty: true });
             }
+
             self.dirty_count
                 .fetch_add(coin_dirty as u32, Ordering::Relaxed);
         }
@@ -196,11 +219,21 @@ impl Store for CoinCache {
     }
 
     fn coin_count(&self) -> u64 {
-        self.inner.coin_count()
+        let base = self.inner.coin_count() as i64;
+        let delta = self.count_delta.load(Ordering::Relaxed);
+        (base + delta).max(0) as u64
     }
 
     fn coin_total_amount(&self) -> u64 {
-        self.inner.coin_total_amount()
+        let base = self.inner.coin_total_amount() as i64;
+        let delta = self.amount_delta.load(Ordering::Relaxed);
+        (base + delta).max(0) as u64
+    }
+
+    fn utxo_height_hist(&self) -> Vec<u64> {
+        // Delegate to inner — the histogram is maintained in the inner store's metadata.
+        // Cache-level deltas are small and short-lived, so this is accurate enough.
+        self.inner.utxo_height_hist()
     }
 
     fn get_tx_location(&self, txid: &Txid) -> Option<BlockHash> {
@@ -214,6 +247,8 @@ impl Store for CoinCache {
     fn clear_chainstate(&self) -> Result<(), StoreError> {
         self.coins.write().unwrap().clear();
         self.dirty_count.store(0, Ordering::Relaxed);
+        self.count_delta.store(0, Ordering::Relaxed);
+        self.amount_delta.store(0, Ordering::Relaxed);
         *self.pending_tip.lock().unwrap() = None;
         self.inner.clear_chainstate()
     }
@@ -221,6 +256,8 @@ impl Store for CoinCache {
     fn clear_all(&self) -> Result<(), StoreError> {
         self.coins.write().unwrap().clear();
         self.dirty_count.store(0, Ordering::Relaxed);
+        self.count_delta.store(0, Ordering::Relaxed);
+        self.amount_delta.store(0, Ordering::Relaxed);
         *self.pending_tip.lock().unwrap() = None;
         self.inner.clear_all()
     }
