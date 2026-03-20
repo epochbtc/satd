@@ -7,6 +7,7 @@ use std::sync::{Mutex, RwLock};
 use crate::chain::checkpoints::{self, Checkpoint};
 use crate::chain::{connect, disconnect};
 use crate::storage::blockindex::{BlockIndexEntry, BlockStatus, add_u256, work_for_bits};
+use crate::storage::coin_cache::CoinCache;
 use crate::storage::coinview::Coin;
 use crate::storage::flatfile::{FlatFileManager, FlatFilePos};
 use crate::storage::{Store, StoreError};
@@ -89,7 +90,7 @@ struct ChainTip {
 
 /// Central chain state manager.
 pub struct ChainState {
-    store: Box<dyn Store>,
+    store: std::sync::Arc<CoinCache>,
     flat_files: Mutex<FlatFileManager>,
     /// Path to the blocks directory, for mutex-free reads.
     blocks_dir: PathBuf,
@@ -100,10 +101,14 @@ pub struct ChainState {
     checkpoints: Vec<Checkpoint>,
     /// Highest header height stored (may be ahead of connected block tip during IBD).
     headers_tip_height: AtomicU32,
+    /// Cached block timestamps for MTP computation (avoids 22 redb reads per block).
+    /// Stores (height, timestamp) pairs for the last ~12 blocks.
+    mtp_cache: Mutex<Vec<(u32, u32)>>,
 }
 
 impl ChainState {
     /// Create a new ChainState. If the store is empty, initializes with the genesis block.
+    /// The store is wrapped in a CoinCache for in-memory UTXO batching.
     pub fn new(
         store: Box<dyn Store>,
         mut flat_files: FlatFileManager,
@@ -116,6 +121,9 @@ impl ChainState {
         let blocks_dir = flat_files.blocks_dir().to_path_buf();
 
         let checkpoints = checkpoints::checkpoints_for_network(network);
+
+        // Wrap the store in a CoinCache for batched UTXO writes
+        let store = std::sync::Arc::new(CoinCache::new(store));
 
         // Check if we have an existing tip
         if let Some(tip_hash) = store.get_tip()
@@ -146,6 +154,7 @@ impl ChainState {
                     assumevalid,
                     checkpoints,
                     headers_tip_height: AtomicU32::new(htip),
+                    mtp_cache: Mutex::new(Vec::with_capacity(12)),
                 });
             }
 
@@ -176,6 +185,7 @@ impl ChainState {
             assumevalid,
             checkpoints,
             headers_tip_height: AtomicU32::new(0),
+            mtp_cache: Mutex::new(Vec::with_capacity(12)),
         })
     }
 
@@ -185,6 +195,12 @@ impl ChainState {
 
     pub fn tip_height(&self) -> u32 {
         self.tip.read().unwrap().height
+    }
+
+    /// Flush the UTXO write cache to disk. Call periodically during IBD
+    /// and on graceful shutdown.
+    pub fn flush_coin_cache(&self) -> Result<(), StoreError> {
+        self.store.flush()
     }
 
     pub fn get_block_index(&self, hash: &BlockHash) -> Option<BlockIndexEntry> {
@@ -258,6 +274,101 @@ impl ChainState {
         Ok(hash)
     }
 
+    /// Accept a batch of headers in a single write transaction.
+    /// Returns (accepted_count, last_error). Stops on non-Duplicate errors.
+    pub fn accept_headers(
+        &self,
+        headers: &[bitcoin::block::Header],
+    ) -> (u32, Option<ChainError>) {
+        let mut batch = crate::storage::StoreBatch::default();
+        let mut accepted = 0u32;
+        let mut max_height = 0u32;
+
+        for header in headers {
+            let hash = header.block_hash();
+
+            // Already known?
+            if self.store.get_block_index(&hash).is_some() {
+                continue; // skip duplicates silently
+            }
+
+            // Also check the current batch for parent (handles consecutive headers)
+            let parent = self
+                .store
+                .get_block_index(&header.prev_blockhash)
+                .or_else(|| {
+                    batch
+                        .block_index_puts
+                        .iter()
+                        .find(|(h, _)| *h == header.prev_blockhash)
+                        .map(|(_, e)| e.clone())
+                });
+
+            let parent = match parent {
+                Some(p) => p,
+                None => return (accepted, Some(ChainError::BadPrevBlock)),
+            };
+
+            let new_height = parent.height + 1;
+
+            // PoW validation
+            if let Err(e) = validation::pow::check_proof_of_work(header) {
+                return (accepted, Some(e.into()));
+            }
+
+            // Difficulty check
+            if let Err(e) = validation::pow::check_difficulty(header, &parent, self.network, |h| {
+                // Check batch first for recently accepted headers, then store
+                batch
+                    .height_hash_puts
+                    .iter()
+                    .find(|(bh, _)| *bh == h)
+                    .and_then(|(_, hash)| {
+                        batch
+                            .block_index_puts
+                            .iter()
+                            .find(|(bih, _)| bih == hash)
+                            .map(|(_, e)| e.clone())
+                    })
+                    .or_else(|| {
+                        let hash = self.store.get_block_hash_by_height(h)?;
+                        self.store.get_block_index(&hash)
+                    })
+            }) {
+                return (accepted, Some(e.into()));
+            }
+
+            let chainwork = crate::storage::blockindex::add_u256(
+                &parent.chainwork,
+                &crate::storage::blockindex::work_for_bits(header.bits),
+            );
+            let entry = BlockIndexEntry {
+                header: *header,
+                height: new_height,
+                status: BlockStatus::HeaderOnly,
+                num_tx: 0,
+                file_number: 0,
+                data_pos: 0,
+                chainwork,
+            };
+
+            batch.block_index_puts.push((hash, entry));
+            batch.height_hash_puts.push((new_height, hash));
+            accepted += 1;
+            max_height = max_height.max(new_height);
+        }
+
+        if accepted > 0 {
+            if let Err(e) = self.store.write_batch(batch) {
+                return (0, Some(e.into()));
+            }
+            self.headers_tip_height
+                .fetch_max(max_height, Ordering::Relaxed);
+        }
+
+        (accepted, None)
+    }
+
     /// Get the highest header height stored (may be ahead of block tip during IBD).
     pub fn headers_tip_height(&self) -> u32 {
         self.headers_tip_height.load(Ordering::Relaxed)
@@ -298,7 +409,26 @@ impl ChainState {
     /// MTP is the median of the timestamps of the previous 11 blocks.
     pub fn get_median_time_past(&self, height: u32) -> u32 {
         let start = height.saturating_sub(11);
-        let mut timestamps: Vec<u32> = Vec::new();
+        let range_len = (height - start) as usize;
+
+        // Try to satisfy entirely from cache
+        let cache = self.mtp_cache.lock().unwrap();
+        let mut timestamps: Vec<u32> = Vec::with_capacity(range_len);
+        for h in start..height {
+            if let Some((_, ts)) = cache.iter().find(|(ch, _)| *ch == h) {
+                timestamps.push(*ts);
+            }
+        }
+        drop(cache);
+
+        if timestamps.len() == range_len && !timestamps.is_empty() {
+            // Cache hit — all timestamps found
+            timestamps.sort();
+            return timestamps[timestamps.len() / 2];
+        }
+
+        // Cache miss — fall back to store lookups
+        timestamps.clear();
         for h in start..height {
             if let Some(hash) = self.store.get_block_hash_by_height(h)
                 && let Some(entry) = self.store.get_block_index(&hash) {
@@ -310,6 +440,22 @@ impl ChainState {
         }
         timestamps.sort();
         timestamps[timestamps.len() / 2]
+    }
+
+    /// Push a block's timestamp into the MTP cache after connection.
+    pub fn push_mtp_cache(&self, height: u32, timestamp: u32) {
+        let mut cache = self.mtp_cache.lock().unwrap();
+        cache.push((height, timestamp));
+        // Keep only the last 12 entries
+        if cache.len() > 12 {
+            cache.remove(0);
+        }
+    }
+
+    /// Pop the highest entry from MTP cache (used on disconnect).
+    pub fn pop_mtp_cache(&self, height: u32) {
+        let mut cache = self.mtp_cache.lock().unwrap();
+        cache.retain(|(h, _)| *h != height);
     }
 
     /// Get the total number of UTXOs in the set.
@@ -495,6 +641,9 @@ impl ChainState {
             tip.hash = *hash;
             tip.height = entry.height;
         }
+
+        // Update MTP cache with this block's timestamp
+        self.push_mtp_cache(entry.height, entry.header.time);
 
         Ok(*hash)
     }
@@ -822,6 +971,9 @@ impl ChainState {
             tip.hash = block_hash;
             tip.height = new_height;
         }
+
+        // Update MTP cache with this block's timestamp
+        self.push_mtp_cache(new_height, block.header.time);
 
         tracing::info!(
             height = new_height,

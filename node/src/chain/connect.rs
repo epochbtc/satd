@@ -1,5 +1,6 @@
 use bitcoin::{Block, OutPoint, Transaction, TxOut};
 use rayon::prelude::*;
+use std::collections::HashMap;
 
 use crate::storage::blockindex::{BlockIndexEntry, BlockStatus, add_u256, work_for_bits};
 use crate::storage::coinview::Coin;
@@ -118,9 +119,17 @@ pub fn connect_block(
     // Transactions queued for parallel script verification after UTXO resolution
     let mut verify_queue: Vec<(&Transaction, Vec<TxOut>)> = Vec::new();
 
+    // Collect txids for txindex (computed once per tx, reused)
+    let mut txids: Vec<bitcoin::Txid> = Vec::with_capacity(block.txdata.len());
+
+    // Fast lookup for coins created earlier in this block (intra-block spends).
+    // Avoids O(n*m) linear scan of batch.coin_puts.
+    let mut intra_block_coins: HashMap<OutPoint, Coin> = HashMap::new();
+
     // Process each transaction: resolve UTXOs sequentially, defer script verification
     for tx in &block.txdata {
         let is_coinbase = tx.is_coinbase();
+        let txid = tx.compute_txid();
 
         // Context-free transaction checks
         check_transaction(tx)?;
@@ -168,17 +177,10 @@ pub fn connect_block(
             for input in &tx.input {
                 let outpoint = input.previous_output;
 
-                // Check that the UTXO exists
-                let coin = store.get_coin(&outpoint);
-
-                // Also check coins created earlier in this same block (within batch)
-                let coin = coin.or_else(|| {
-                    batch
-                        .coin_puts
-                        .iter()
-                        .find(|(op, _)| *op == outpoint)
-                        .map(|(_, c)| c.clone())
-                });
+                // Check that the UTXO exists (store first, then intra-block)
+                let coin = store
+                    .get_coin(&outpoint)
+                    .or_else(|| intra_block_coins.remove(&outpoint));
 
                 let coin = coin.ok_or(ConnectError::MissingOrSpentInput)?;
 
@@ -243,7 +245,6 @@ pub fn connect_block(
 
         // Add outputs as new UTXOs (skip genesis coinbase)
         if !is_genesis || !is_coinbase {
-            let txid = tx.compute_txid();
             for (vout, output) in tx.output.iter().enumerate() {
                 let outpoint = OutPoint {
                     txid,
@@ -255,9 +256,12 @@ pub fn connect_block(
                     height,
                     coinbase: is_coinbase,
                 };
+                intra_block_coins.insert(outpoint, coin.clone());
                 batch.coin_puts.push((outpoint, coin));
             }
         }
+
+        txids.push(txid);
     }
 
     // Parallel script verification: verify all transactions concurrently
@@ -305,8 +309,8 @@ pub fn connect_block(
     }
 
     // Populate txindex: map each txid to its containing block
-    for tx in &block.txdata {
-        batch.tx_index_puts.push((tx.compute_txid(), block_hash));
+    for txid in &txids {
+        batch.tx_index_puts.push((*txid, block_hash));
     }
 
     Ok(batch)

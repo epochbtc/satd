@@ -937,20 +937,11 @@ impl PeerManager {
             return;
         }
 
-        let mut accepted = 0;
-        for header in &headers {
-            match self.chain_state.accept_header(header) {
-                Ok(_) => {
-                    accepted += 1;
-                }
-                Err(crate::chain::state::ChainError::Duplicate) => {
-                    // Already known — skip silently
-                }
-                Err(e) => {
-                    self.add_ban_score(id, 20, &format!("Header rejected: {}", e));
-                    break;
-                }
-            }
+        let (accepted, err) = self.chain_state.accept_headers(&headers);
+        if let Some(e) = err
+            && !matches!(e, crate::chain::state::ChainError::Duplicate)
+        {
+            self.add_ban_score(id, 20, &format!("Header rejected: {}", e));
         }
 
         if accepted > 0 {
@@ -1184,6 +1175,10 @@ impl PeerManager {
                             last_log_height = height;
                         }
 
+                        // Flush UTXO cache immediately in normal mode (not IBD).
+                        // This only happens once per ~10 min so has no performance impact.
+                        let _ = chain_state.flush_coin_cache();
+
                         // Periodic pruning
                         if keep_blocks > 0 && height > keep_blocks
                             && height / 1000 > last_prune_height / 1000
@@ -1213,7 +1208,7 @@ impl PeerManager {
     /// Sleeps (via condvar) when the next block isn't downloaded yet.
     fn ibd_connect_loop(
         chain_state: &ChainState,
-        fee_estimator: &FeeEstimator,
+        _fee_estimator: &FeeEstimator,
         connect_signal: &Arc<(std::sync::Mutex<bool>, Condvar)>,
         ibd: &Arc<std::sync::RwLock<Option<IbdScheduler>>>,
         keep_blocks: u32,
@@ -1253,7 +1248,10 @@ impl PeerManager {
                     // The run() loop will detect has_ibd=true within 2s and assign peers
                     continue;
                 }
-                // Truly done
+                // Truly done — flush UTXO cache before exiting IBD
+                if let Err(e) = chain_state.flush_coin_cache() {
+                    tracing::error!("Failed to flush UTXO cache at IBD completion: {}", e);
+                }
                 tracing::info!(
                     height = tip_height,
                     blocks = connected_count,
@@ -1288,10 +1286,9 @@ impl PeerManager {
                                 s.connect_cursor_advanced(next_height);
                             }
                         }
-                        // Record fees
-                        if let Some(block) = chain_state.get_block(&hash) {
-                            Self::record_block_fees(&block, chain_state, fee_estimator);
-                        }
+                        // Skip fee recording during IBD — the coins are already
+                        // spent so get_coin returns None for every input, and fee
+                        // data from old blocks is useless for estimation anyway.
                         // Log progress
                         if next_height / 1000 > *last_log_height / 1000 {
                             let elapsed = start_time.elapsed().as_secs().max(1);
@@ -1313,6 +1310,11 @@ impl PeerManager {
                                 rate
                             );
                             *last_log_height = next_height;
+
+                            // Flush UTXO cache to disk every 1000 blocks
+                            if let Err(e) = chain_state.flush_coin_cache() {
+                                tracing::error!("Failed to flush UTXO cache: {}", e);
+                            }
                         }
                         // Periodic pruning
                         if keep_blocks > 0 && next_height > keep_blocks
