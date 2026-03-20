@@ -112,6 +112,19 @@ impl Store for InMemoryStore {
             .sum()
     }
 
+    fn utxo_height_hist(&self) -> Vec<u64> {
+        let coins = self.coins.read().unwrap();
+        let mut hist: Vec<u64> = Vec::new();
+        for coin in coins.values() {
+            let bucket = (coin.height / 1000) as usize;
+            if bucket >= hist.len() {
+                hist.resize(bucket + 1, 0);
+            }
+            hist[bucket] += 1;
+        }
+        hist
+    }
+
     fn get_tx_location(&self, txid: &Txid) -> Option<BlockHash> {
         self.tx_index.read().unwrap().get(txid).copied()
     }

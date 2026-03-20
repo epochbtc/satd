@@ -16,6 +16,11 @@ const TX_INDEX: TableDefinition<&[u8], &[u8]> = TableDefinition::new("tx_index")
 const METADATA: TableDefinition<&[u8], &[u8]> = TableDefinition::new("metadata");
 
 const TIP_KEY: &[u8] = b"tip";
+const UTXO_COUNT_KEY: &[u8] = b"utxo_count";
+const TOTAL_AMOUNT_KEY: &[u8] = b"total_amount";
+const UTXO_HEIGHT_HIST_KEY: &[u8] = b"utxo_height_hist";
+/// Each histogram bucket covers this many blocks.
+const HEIGHT_HIST_BUCKET: u32 = 1000;
 
 fn hash_bytes(hash: &BlockHash) -> &[u8] {
     hash.as_ref()
@@ -71,10 +76,66 @@ impl RedbStore {
                 .map_err(|e| StoreError::Database(e.to_string()))?;
         }
 
+        Self::init_utxo_counters(&db)?;
+
         Ok(Self {
             db,
             txindex_enabled: txindex,
         })
+    }
+
+    /// Initialize UTXO counters by scanning the COINS table if they don't exist yet.
+    /// This is a one-time migration for existing databases.
+    fn init_utxo_counters(db: &redb::Database) -> Result<(), StoreError> {
+        // Check if counters already exist
+        {
+            let txn = db.begin_read().map_err(|e| StoreError::Database(e.to_string()))?;
+            let table = txn.open_table(METADATA).map_err(|e| StoreError::Database(e.to_string()))?;
+            let has_counters = table.get(UTXO_COUNT_KEY).map_err(|e| StoreError::Database(e.to_string()))?.is_some();
+            let has_hist = table.get(UTXO_HEIGHT_HIST_KEY).map_err(|e| StoreError::Database(e.to_string()))?.is_some();
+            if has_counters && has_hist {
+                return Ok(()); // Already initialized
+            }
+        }
+
+        tracing::info!("Initializing UTXO counters (one-time migration)...");
+        let txn = db.begin_read().map_err(|e| StoreError::Database(e.to_string()))?;
+        let table = txn.open_table(COINS).map_err(|e| StoreError::Database(e.to_string()))?;
+        let iter = table.iter().map_err(|e| StoreError::Database(e.to_string()))?;
+
+        let mut count: u64 = 0;
+        let mut total_amount: u64 = 0;
+        let mut height_hist: Vec<u64> = Vec::new();
+        for (_key, value) in iter.flatten() {
+            count += 1;
+            if let Ok(coin) = bincode::deserialize::<Coin>(value.value()) {
+                total_amount = total_amount.saturating_add(coin.amount);
+                let bucket = (coin.height / HEIGHT_HIST_BUCKET) as usize;
+                if bucket >= height_hist.len() {
+                    height_hist.resize(bucket + 1, 0);
+                }
+                height_hist[bucket] += 1;
+            }
+        }
+        drop(txn);
+
+        // Write the counters
+        let txn = db.begin_write().map_err(|e| StoreError::Database(e.to_string()))?;
+        {
+            let mut table = txn.open_table(METADATA).map_err(|e| StoreError::Database(e.to_string()))?;
+            table.insert(UTXO_COUNT_KEY, count.to_le_bytes().as_slice())
+                .map_err(|e| StoreError::Database(e.to_string()))?;
+            table.insert(TOTAL_AMOUNT_KEY, total_amount.to_le_bytes().as_slice())
+                .map_err(|e| StoreError::Database(e.to_string()))?;
+            let hist_bytes = bincode::serialize(&height_hist)
+                .map_err(|e| StoreError::Serialization(e.to_string()))?;
+            table.insert(UTXO_HEIGHT_HIST_KEY, hist_bytes.as_slice())
+                .map_err(|e| StoreError::Database(e.to_string()))?;
+        }
+        txn.commit().map_err(|e| StoreError::Database(e.to_string()))?;
+
+        tracing::info!(count, total_amount, buckets = height_hist.len(), "UTXO counters initialized");
+        Ok(())
     }
 }
 
@@ -140,11 +201,28 @@ impl Store for RedbStore {
             }
         }
 
-        // Coins (UTXO set)
-        {
+        // Coins (UTXO set) with counter tracking
+        let mut hist_deltas: std::collections::HashMap<usize, i64> = std::collections::HashMap::new();
+        let (count_delta, amount_delta) = {
             let mut table = txn
                 .open_table(COINS)
                 .map_err(|e| StoreError::Database(e.to_string()))?;
+            let mut count_delta: i64 = 0;
+            let mut amount_delta: i64 = 0;
+
+            // Process removes first (need to look up amounts before deletion)
+            for outpoint in &batch.coin_removes {
+                let key = outpoint_to_key(outpoint);
+                if let Ok(Some(existing)) = table.remove(key.as_slice()) {
+                    count_delta -= 1;
+                    if let Ok(coin) = bincode::deserialize::<Coin>(existing.value()) {
+                        amount_delta -= coin.amount as i64;
+                        let bucket = (coin.height / HEIGHT_HIST_BUCKET) as usize;
+                        *hist_deltas.entry(bucket).or_default() -= 1;
+                    }
+                }
+            }
+
             for (outpoint, coin) in &batch.coin_puts {
                 let key = outpoint_to_key(outpoint);
                 let value = bincode::serialize(coin)
@@ -152,12 +230,14 @@ impl Store for RedbStore {
                 table
                     .insert(key.as_slice(), value.as_slice())
                     .map_err(|e| StoreError::Database(e.to_string()))?;
+                count_delta += 1;
+                amount_delta += coin.amount as i64;
+                let bucket = (coin.height / HEIGHT_HIST_BUCKET) as usize;
+                *hist_deltas.entry(bucket).or_default() += 1;
             }
-            for outpoint in &batch.coin_removes {
-                let key = outpoint_to_key(outpoint);
-                let _ = table.remove(key.as_slice());
-            }
-        }
+
+            (count_delta, amount_delta)
+        };
 
         // Height index
         {
@@ -205,14 +285,67 @@ impl Store for RedbStore {
             }
         }
 
-        // Metadata (tip)
-        if let Some(hash) = &batch.tip {
+        // Metadata (tip + UTXO counters)
+        {
             let mut table = txn
                 .open_table(METADATA)
                 .map_err(|e| StoreError::Database(e.to_string()))?;
-            table
-                .insert(TIP_KEY, hash_bytes(hash))
-                .map_err(|e| StoreError::Database(e.to_string()))?;
+
+            if let Some(hash) = &batch.tip {
+                table
+                    .insert(TIP_KEY, hash_bytes(hash))
+                    .map_err(|e| StoreError::Database(e.to_string()))?;
+            }
+
+            // Update UTXO height histogram
+            if !hist_deltas.is_empty() {
+                let mut hist: Vec<u64> = table
+                    .get(UTXO_HEIGHT_HIST_KEY)
+                    .map_err(|e| StoreError::Database(e.to_string()))?
+                    .and_then(|v| bincode::deserialize(v.value()).ok())
+                    .unwrap_or_default();
+                for (&bucket, &delta) in &hist_deltas {
+                    if bucket >= hist.len() {
+                        hist.resize(bucket + 1, 0);
+                    }
+                    hist[bucket] = (hist[bucket] as i64 + delta).max(0) as u64;
+                }
+                let hist_bytes = bincode::serialize(&hist)
+                    .map_err(|e| StoreError::Serialization(e.to_string()))?;
+                table
+                    .insert(UTXO_HEIGHT_HIST_KEY, hist_bytes.as_slice())
+                    .map_err(|e| StoreError::Database(e.to_string()))?;
+            }
+
+            // Update UTXO counters if any coin operations occurred
+            if count_delta != 0 || amount_delta != 0 {
+                let old_count = table
+                    .get(UTXO_COUNT_KEY)
+                    .map_err(|e| StoreError::Database(e.to_string()))?
+                    .map(|v| {
+                        let bytes: [u8; 8] = v.value().try_into().unwrap_or([0; 8]);
+                        u64::from_le_bytes(bytes)
+                    })
+                    .unwrap_or(0);
+                let old_amount = table
+                    .get(TOTAL_AMOUNT_KEY)
+                    .map_err(|e| StoreError::Database(e.to_string()))?
+                    .map(|v| {
+                        let bytes: [u8; 8] = v.value().try_into().unwrap_or([0; 8]);
+                        u64::from_le_bytes(bytes)
+                    })
+                    .unwrap_or(0);
+
+                let new_count = (old_count as i64 + count_delta) as u64;
+                let new_amount = (old_amount as i64 + amount_delta) as u64;
+
+                table
+                    .insert(UTXO_COUNT_KEY, new_count.to_le_bytes().as_slice())
+                    .map_err(|e| StoreError::Database(e.to_string()))?;
+                table
+                    .insert(TOTAL_AMOUNT_KEY, new_amount.to_le_bytes().as_slice())
+                    .map_err(|e| StoreError::Database(e.to_string()))?;
+            }
         }
 
         txn.commit()
@@ -230,33 +363,51 @@ impl Store for RedbStore {
         let Ok(txn) = self.db.begin_read() else {
             return 0;
         };
-        let Ok(table) = txn.open_table(COINS) else {
+        let Ok(table) = txn.open_table(METADATA) else {
             return 0;
         };
-        let Ok(iter) = table.iter() else {
-            return 0;
-        };
-        iter.count() as u64
+        table
+            .get(UTXO_COUNT_KEY)
+            .ok()
+            .flatten()
+            .map(|v| {
+                let bytes: [u8; 8] = v.value().try_into().unwrap_or([0; 8]);
+                u64::from_le_bytes(bytes)
+            })
+            .unwrap_or(0)
     }
 
     fn coin_total_amount(&self) -> u64 {
         let Ok(txn) = self.db.begin_read() else {
             return 0;
         };
-        let Ok(table) = txn.open_table(COINS) else {
+        let Ok(table) = txn.open_table(METADATA) else {
             return 0;
         };
-        let mut total: u64 = 0;
-        let Ok(iter) = table.iter() else {
-            return 0;
+        table
+            .get(TOTAL_AMOUNT_KEY)
+            .ok()
+            .flatten()
+            .map(|v| {
+                let bytes: [u8; 8] = v.value().try_into().unwrap_or([0; 8]);
+                u64::from_le_bytes(bytes)
+            })
+            .unwrap_or(0)
+    }
+
+    fn utxo_height_hist(&self) -> Vec<u64> {
+        let Ok(txn) = self.db.begin_read() else {
+            return Vec::new();
         };
-        for entry in iter {
-            if let Ok((_key, value)) = entry
-                && let Ok(coin) = bincode::deserialize::<Coin>(value.value()) {
-                    total = total.saturating_add(coin.amount);
-                }
-        }
-        total
+        let Ok(table) = txn.open_table(METADATA) else {
+            return Vec::new();
+        };
+        table
+            .get(UTXO_HEIGHT_HIST_KEY)
+            .ok()
+            .flatten()
+            .and_then(|v| bincode::deserialize(v.value()).ok())
+            .unwrap_or_default()
     }
 
     fn get_tx_location(&self, txid: &Txid) -> Option<BlockHash> {

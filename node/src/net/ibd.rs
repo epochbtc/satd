@@ -319,6 +319,38 @@ impl IbdScheduler {
             "IBD scheduler target extended"
         );
     }
+
+    /// Generate a compact block state bitmap for the TUI.
+    /// Each entry represents one block's state: 0=not-requested, 1=pending,
+    /// 2=in-flight, 3=downloaded/stored.
+    pub fn block_bitmap(&self) -> Vec<u8> {
+        let start = self.connect_cursor + 1;
+        if start > self.target_height {
+            return Vec::new();
+        }
+        let mut bitmap = Vec::with_capacity((self.target_height - start + 1) as usize);
+        for h in start..=self.target_height {
+            let state = if self.downloaded.contains(&h) {
+                3
+            } else if self.in_flight.contains_key(&h) {
+                2
+            } else if self.pending.contains(&h) {
+                1
+            } else {
+                0
+            };
+            bitmap.push(state);
+        }
+        bitmap
+    }
+
+    /// Per-peer download statistics for TUI.
+    pub fn peer_stats(&self) -> Vec<(PeerId, u64, usize)> {
+        self.peer_slots
+            .iter()
+            .map(|(&id, s)| (id, s.blocks_received, s.assigned.len()))
+            .collect()
+    }
 }
 
 #[cfg(test)]

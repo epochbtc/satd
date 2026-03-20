@@ -11,6 +11,8 @@ use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
+use base64::Engine;
+
 use crate::chain::state::ChainState;
 use crate::mempool::fee::FeeEstimator;
 use crate::mempool::pool::Mempool;
@@ -243,6 +245,18 @@ impl PeerManager {
         }
     }
 
+    /// Get the number of connected outbound peers.
+    pub fn outbound_count(&self) -> usize {
+        let peers = self.peers.read().unwrap();
+        peers
+            .values()
+            .filter(|h| {
+                h.info.direction == Direction::Outbound
+                    && h.info.state == PeerState::Connected
+            })
+            .count()
+    }
+
     /// Check outbound connection limit.
     fn check_outbound_limit(&self) -> Result<(), String> {
         let max_outbound = if self.is_ibd() {
@@ -250,15 +264,8 @@ impl PeerManager {
         } else {
             self.max_connections.min(MAX_OUTBOUND)
         };
-        let peers = self.peers.read().unwrap();
-        let outbound_count = peers
-            .values()
-            .filter(|h| {
-                h.info.direction == Direction::Outbound
-                    && h.info.state == PeerState::Connected
-            })
-            .count();
-        if outbound_count >= max_outbound {
+        let outbound = self.outbound_count();
+        if outbound >= max_outbound {
             return Err("max outbound connections reached".to_string());
         }
         Ok(())
@@ -388,6 +395,32 @@ impl PeerManager {
             .values()
             .filter(|h| h.info.state == PeerState::Connected)
             .count()
+    }
+
+    /// Get IBD download progress for the TUI dashboard.
+    pub fn get_ibd_progress(&self) -> Option<serde_json::Value> {
+        let ibd = self.ibd.read().unwrap();
+        let scheduler = ibd.as_ref()?;
+        let (downloaded, in_flight, pending, target) = scheduler.progress();
+        let cursor = scheduler.connect_cursor();
+        let bitmap = scheduler.block_bitmap();
+        let peer_stats = scheduler.peer_stats();
+
+        let bitmap_b64 = base64::engine::general_purpose::STANDARD.encode(&bitmap);
+
+        Some(serde_json::json!({
+            "active": true,
+            "connect_cursor": cursor,
+            "target_height": target,
+            "downloaded": downloaded,
+            "in_flight": in_flight,
+            "pending": pending,
+            "bitmap": bitmap_b64,
+            "bitmap_start": cursor + 1,
+            "peer_download_stats": peer_stats.iter().map(|(id, recv, assigned)| {
+                serde_json::json!({"peer_id": id, "blocks_received": recv, "assigned": assigned})
+            }).collect::<Vec<_>>(),
+        }))
     }
 
     /// Get the list of currently banned addresses with expiry times.
@@ -652,9 +685,11 @@ impl PeerManager {
                 self.mempool.remove_expired();
             }
 
-            // Every 20 ticks (10 seconds), check peers and connect to more during IBD
+            // Every 20 ticks (10 seconds), reconnect if below outbound target
             if ticks.is_multiple_of(20) {
-                let need_peers = self.connection_count() == 0 || self.is_ibd();
+                let outbound = self.outbound_count();
+                let target = if self.is_ibd() { MAX_OUTBOUND_IBD } else { MAX_OUTBOUND };
+                let need_peers = outbound < target;
                 if need_peers {
                     let addrs = self.connect_addrs.read().unwrap().clone();
                     let now = Instant::now();
@@ -681,6 +716,11 @@ impl PeerManager {
                                 && now < state.next_attempt {
                                     continue;
                                 }
+                        }
+
+                        // Don't exceed target
+                        if self.check_outbound_limit().is_err() {
+                            break;
                         }
 
                         let pm = Arc::clone(self);

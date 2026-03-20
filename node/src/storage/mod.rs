@@ -65,6 +65,9 @@ pub trait Store: Send + Sync {
     fn coin_count(&self) -> u64;
     /// Sum the total amount (in satoshis) across all UTXOs.
     fn coin_total_amount(&self) -> u64;
+    /// UTXO creation height histogram. Each element is the count of UTXOs created
+    /// in a 1000-block range: index 0 = heights 0-999, index 1 = 1000-1999, etc.
+    fn utxo_height_hist(&self) -> Vec<u64>;
     /// Look up which block contains a transaction (txindex).
     /// Returns None if txindex is disabled or the txid is not found.
     fn get_tx_location(&self, txid: &Txid) -> Option<BlockHash>;
