@@ -364,16 +364,28 @@ impl ServerHandler for SatdMcpServer {
     }
 }
 
+impl SatdMcpServer {
+    /// Create a new MCP server with the given context.
+    pub fn new(ctx: Arc<Ctx>) -> Self {
+        Self {
+            ctx,
+            tool_router: Self::tool_router(),
+        }
+    }
+
+    /// List all registered tools (for testing / introspection).
+    pub fn list_tools_from_router(&self) -> Vec<rmcp::model::Tool> {
+        self.tool_router.list_all()
+    }
+}
+
 // --- Public API ---
 
 /// Start the MCP server over stdio (stdin/stdout).
 pub async fn serve_stdio(
     ctx: Arc<McpContext>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let server = SatdMcpServer {
-        ctx,
-        tool_router: SatdMcpServer::tool_router(),
-    };
+    let server = SatdMcpServer::new(ctx);
 
     tracing::info!("MCP stdio server starting");
     let service = server.serve(rmcp::transport::io::stdio()).await?;
@@ -405,11 +417,7 @@ pub async fn serve_http(
 
     let mcp_service = StreamableHttpService::new(
         move || {
-            let ctx = ctx.clone();
-            Ok(SatdMcpServer {
-                ctx,
-                tool_router: SatdMcpServer::tool_router(),
-            })
+            Ok(SatdMcpServer::new(ctx.clone()))
         },
         session_manager,
         config,

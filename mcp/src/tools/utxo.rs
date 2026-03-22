@@ -1,10 +1,13 @@
 use crate::context::McpContext;
 use node::rpc::blockchain as rpc;
+use serde_json::json;
 
 /// Look up a single UTXO by txid and output index.
 pub fn get_utxo(ctx: &McpContext, txid: &str, vout: u32) -> String {
-    let result = rpc::get_tx_out(&ctx.chain_state, txid, vout);
-    serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string())
+    match rpc::get_tx_out(&ctx.chain_state, txid, vout) {
+        Ok(result) => serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string()),
+        Err(msg) => json!({"error": msg}).to_string(),
+    }
 }
 
 /// Get UTXO set statistics: total outputs, value, and age distribution.
