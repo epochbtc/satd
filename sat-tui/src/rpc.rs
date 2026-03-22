@@ -16,7 +16,7 @@ impl RpcClient {
             url: format!("http://{}:{}/", host, port),
             auth_header,
             client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .unwrap(),
         }
@@ -68,6 +68,10 @@ impl RpcClient {
 
     // Convenience methods for each RPC we need
 
+    pub async fn get_startup_info(&self) -> Result<serde_json::Value, RpcError> {
+        self.call("getstartupinfo", &[]).await
+    }
+
     pub async fn get_blockchain_info(&self) -> Result<serde_json::Value, RpcError> {
         self.call("getblockchaininfo", &[]).await
     }
@@ -114,6 +118,10 @@ impl RpcClient {
 
     pub async fn get_tx_out_set_info(&self) -> Result<serde_json::Value, RpcError> {
         self.call("gettxoutsetinfo", &[]).await
+    }
+
+    pub async fn get_system_info(&self) -> Result<serde_json::Value, RpcError> {
+        self.call("getsysteminfo", &[]).await
     }
 }
 

@@ -1,3 +1,4 @@
+pub mod help;
 pub mod ibd;
 pub mod steady;
 
@@ -16,17 +17,6 @@ pub fn format_bytes(n: u64) -> String {
         format!("{:.2} MB", n as f64 / 1_048_576.0)
     } else {
         format!("{:.2} GB", n as f64 / 1_073_741_824.0)
-    }
-}
-
-/// Format bytes/sec rate.
-pub fn format_bytes_rate(bps: f64) -> String {
-    if bps < 1_024.0 {
-        format!("{:.0} B/s", bps)
-    } else if bps < 1_048_576.0 {
-        format!("{:.1} KB/s", bps / 1_024.0)
-    } else {
-        format!("{:.1} MB/s", bps / 1_048_576.0)
     }
 }
 
@@ -90,31 +80,30 @@ pub fn format_num(n: u64) -> String {
 /// Build a peer table for either view.
 pub fn peer_table<'a>(
     peers: &'a [serde_json::Value],
-    peer_rates: &'a std::collections::HashMap<String, f64>,
     ibd_stats: Option<&'a [crate::state::PeerDownloadStat]>,
+    peer_dl_rates: &'a std::collections::HashMap<u64, f64>,
     selected: usize,
     title: &'a str,
 ) -> Table<'a> {
     let (header, widths) = if ibd_stats.is_some() {
         (
-            Row::new(vec!["Addr", "Agent", "Blocks", "Assigned", "Rate"])
+            Row::new(vec!["Addr", "Agent", "Recv", "Assigned", "Rate"])
                 .style(Style::default().fg(Color::Cyan)),
             vec![
                 Constraint::Min(22),
                 Constraint::Min(20),
                 Constraint::Min(10),
+                Constraint::Min(8),
                 Constraint::Min(10),
-                Constraint::Min(12),
             ],
         )
     } else {
         (
-            Row::new(vec!["Addr", "Agent", "Height", "Recv", "Rate"])
+            Row::new(vec!["Addr", "Agent", "Height", "Recv"])
                 .style(Style::default().fg(Color::Cyan)),
             vec![
                 Constraint::Min(22),
-                Constraint::Min(20),
-                Constraint::Min(10),
+                Constraint::Min(22),
                 Constraint::Min(12),
                 Constraint::Min(12),
             ],
@@ -132,23 +121,17 @@ pub fn peer_table<'a>(
             let addr = p.get("addr").and_then(|a| a.as_str()).unwrap_or("-");
             let agent = p.get("subver").and_then(|a| a.as_str()).unwrap_or("-");
             let peer_id = p.get("id").and_then(|id| id.as_u64()).unwrap_or(0);
-            let rate = peer_rates.get(addr).copied().unwrap_or(0.0);
-            let rate_color = if rate > 1_048_576.0 {
-                Color::Green
-            } else if rate < 102_400.0 {
-                Color::DarkGray
-            } else {
-                Color::White
-            };
 
             let cells = if ibd_stats.is_some() {
                 let ibd = ibd_map.get(&peer_id);
+                let rate = peer_dl_rates.get(&peer_id).copied().unwrap_or(0.0);
+                let rate_str = if rate > 0.1 { format!("{:.1} blk/s", rate) } else { "-".into() };
                 vec![
                     Cell::from(addr.to_string()),
                     Cell::from(agent.to_string()),
                     Cell::from(ibd.map(|s| format_num(s.blocks_received)).unwrap_or("-".into())),
                     Cell::from(ibd.map(|s| s.assigned.to_string()).unwrap_or("-".into())),
-                    Cell::from(format_bytes_rate(rate)).style(Style::default().fg(rate_color)),
+                    Cell::from(rate_str),
                 ]
             } else {
                 let height = p.get("synced_headers").and_then(|h| h.as_u64())
@@ -160,7 +143,6 @@ pub fn peer_table<'a>(
                     Cell::from(agent.to_string()),
                     Cell::from(format_num(height)),
                     Cell::from(format_bytes(recv)),
-                    Cell::from(format_bytes_rate(rate)).style(Style::default().fg(rate_color)),
                 ]
             };
 
@@ -242,11 +224,13 @@ pub fn render_block_map(
 }
 
 /// Render the connecting screen.
-pub fn connecting_paragraph<'a>(stale: bool) -> Paragraph<'a> {
-    let msg = if stale {
-        "Connection to satd lost. Reconnecting..."
+pub fn connecting_paragraph<'a>(stale: bool, startup_status: Option<&str>) -> Paragraph<'a> {
+    let msg = if let Some(status) = startup_status {
+        format!("satd is starting: {}", status)
+    } else if stale {
+        "Connection to satd lost. Reconnecting...".to_string()
     } else {
-        "Connecting to satd..."
+        "Connecting to satd...".to_string()
     };
     Paragraph::new(Line::from(vec![
         Span::styled(msg, Style::default().fg(Color::Yellow)),

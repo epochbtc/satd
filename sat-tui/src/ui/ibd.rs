@@ -5,7 +5,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Gauge, Paragraph, Sparkline};
 
 use crate::state::AppState;
-use crate::ui::{format_bytes_rate, format_duration, format_num, peer_table, render_block_map};
+use crate::ui::{format_bytes, format_duration, format_num, peer_table, render_block_map};
 
 pub fn draw(f: &mut Frame, state: &AppState) {
     let size = f.area();
@@ -46,13 +46,15 @@ pub fn draw(f: &mut Frame, state: &AppState) {
     // Peers
     let peer_title = format!("Peers ({} connected)", state.connections);
     let ibd_stats = state.ibd_bitmap.as_ref().map(|b| b.peer_stats.as_slice());
-    let table = peer_table(&state.peers, &state.peer_rates, ibd_stats, state.selected_peer, &peer_title);
+    let table = peer_table(&state.peers, ibd_stats, &state.peer_dl_rates, state.selected_peer, &peer_title);
     f.render_widget(table, chunks[4]);
 
     // Footer
     let footer = Line::from(vec![
         Span::styled("q", Style::default().fg(Color::White)),
         Span::styled(": quit  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("h", Style::default().fg(Color::White)),
+        Span::styled(": help  ", Style::default().fg(Color::DarkGray)),
         Span::styled("1/2", Style::default().fg(Color::White)),
         Span::styled(": switch view  ", Style::default().fg(Color::DarkGray)),
         Span::raw("\u{2191}\u{2193}"),
@@ -62,8 +64,9 @@ pub fn draw(f: &mut Frame, state: &AppState) {
 }
 
 fn draw_progress(f: &mut Frame, area: Rect, state: &AppState) {
-    let progress = if state.headers > 0 {
-        state.blocks as f64 / state.headers as f64
+    let target = state.sync_target();
+    let progress = if target > 0 {
+        state.blocks as f64 / target as f64
     } else {
         0.0
     };
@@ -71,7 +74,7 @@ fn draw_progress(f: &mut Frame, area: Rect, state: &AppState) {
     let label = format!(
         "{} / {}  {:.1}%",
         format_num(state.blocks as u64),
-        format_num(state.headers as u64),
+        format_num(target as u64),
         progress * 100.0
     );
 
@@ -80,11 +83,11 @@ fn draw_progress(f: &mut Frame, area: Rect, state: &AppState) {
         .unwrap_or_else(|| "ETA: --".to_string());
 
     let stats_line = format!(
-        "{}   blk/s: {:.0}   hdr/s: {:.0}   dl: {}",
+        "{}   blk/s: {:.0}   hdr/s: {:.0}   peers: {}",
         eta_str,
         state.blocks_per_sec,
         state.headers_per_sec,
-        format_bytes_rate(state.download_rate_bytes),
+        state.connections,
     );
 
     let block = Block::default()
@@ -199,8 +202,9 @@ fn draw_sparklines_and_stats(f: &mut Frame, area: Rect, state: &AppState) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(55),
-            Constraint::Percentage(45),
+            Constraint::Percentage(40),
+            Constraint::Percentage(30),
+            Constraint::Percentage(30),
         ])
         .split(area);
 
@@ -236,8 +240,8 @@ fn draw_sparklines_and_stats(f: &mut Frame, area: Rect, state: &AppState) {
             bps_label,
         );
 
-        // Download rate sparkline
-        let dl_data: Vec<u64> = state.dl_history.iter().map(|v| (*v / 1024.0) as u64).collect();
+        // Download rate sparkline (blocks downloaded / sec)
+        let dl_data: Vec<u64> = state.dl_history.iter().map(|v| *v as u64).collect();
         let dl_spark = Sparkline::default()
             .data(&dl_data)
             .style(Style::default().fg(Color::Cyan));
@@ -249,7 +253,7 @@ fn draw_sparklines_and_stats(f: &mut Frame, area: Rect, state: &AppState) {
         let dl_label = Rect { y: spark2_y + spark2_h, height: 1, ..spark_inner };
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                format!("dl: {}", format_bytes_rate(state.download_rate_bytes)),
+                format!("dl: {:.0} blk/s", state.dl_blocks_per_sec),
                 Style::default().fg(Color::DarkGray),
             ))),
             dl_label,
@@ -267,7 +271,12 @@ fn draw_sparklines_and_stats(f: &mut Frame, area: Rect, state: &AppState) {
     let stats_inner = stats_block.inner(chunks[1]);
     f.render_widget(stats_block, chunks[1]);
 
-    let headers_val = format_num(state.headers as u64);
+    let target = state.sync_target();
+    let headers_val = if target > 0 {
+        format!("{} ({:.0}%)", format_num(state.headers as u64), state.headers as f64 / target as f64 * 100.0)
+    } else {
+        format_num(state.headers as u64)
+    };
     let connected_val = format_num(state.blocks as u64);
     let (stored, inflight, remaining) = if let Some(ref bm) = state.ibd_bitmap {
         (
@@ -308,6 +317,65 @@ fn draw_sparklines_and_stats(f: &mut Frame, area: Rect, state: &AppState) {
                 x: stats_inner.x,
                 y: stats_inner.y + i as u16,
                 width: stats_inner.width,
+                height: 1,
+            };
+            f.render_widget(Paragraph::new(line.clone()), line_area);
+        }
+    }
+
+    // Resources panel
+    draw_resources(f, chunks[2], state);
+}
+
+fn draw_resources(f: &mut Frame, area: Rect, state: &AppState) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(Span::styled(
+            " Resources ",
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let rss_str = state.rss_bytes
+        .map(format_bytes)
+        .unwrap_or_else(|| "-".into());
+    let dirty_str = state.cache_dirty
+        .map(|d| format_num(d as u64))
+        .unwrap_or_else(|| "-".into());
+    let clean_str = state.cache_clean
+        .map(|c| format_num(c as u64))
+        .unwrap_or_else(|| "-".into());
+    let threads_str = state.thread_count
+        .map(|t| t.to_string())
+        .unwrap_or_else(|| "-".into());
+
+    let lines = [
+        Line::from(vec![
+            Span::styled("RSS:     ", Style::default().fg(Color::Gray)),
+            Span::styled(rss_str, Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled("Cache D: ", Style::default().fg(Color::Gray)),
+            Span::styled(dirty_str, Style::default().fg(Color::Yellow)),
+        ]),
+        Line::from(vec![
+            Span::styled("Cache C: ", Style::default().fg(Color::Gray)),
+            Span::styled(clean_str, Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled("Threads: ", Style::default().fg(Color::Gray)),
+            Span::styled(threads_str, Style::default().fg(Color::White)),
+        ]),
+    ];
+
+    for (i, line) in lines.iter().enumerate() {
+        if i < inner.height as usize {
+            let line_area = Rect {
+                x: inner.x,
+                y: inner.y + i as u16,
+                width: inner.width,
                 height: 1,
             };
             f.render_widget(Paragraph::new(line.clone()), line_area);
