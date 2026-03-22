@@ -276,13 +276,12 @@ async fn poller(rpc: Arc<RpcClient>, state: Arc<Mutex<AppState>>) {
         }; // st dropped here, before any .await
 
         // Try getstartupinfo when main RPCs fail — satd may be loading
-        if need_startup_check {
-            if let Ok(v) = rpc.get_startup_info().await {
+        if need_startup_check
+            && let Ok(v) = rpc.get_startup_info().await {
                 let mut st = state.lock().unwrap();
                 st.startup_status = v.get("status")
                     .and_then(|s| s.as_str())
                     .map(|s| s.to_string());
-            }
         }
 
         // Slow polls (every ~5s = 3-4 fast ticks)

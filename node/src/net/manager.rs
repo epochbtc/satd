@@ -1332,10 +1332,9 @@ impl PeerManager {
                         // data from old blocks is useless for estimation anyway.
 
                         // Flush if dirty map is getting large (caps memory usage)
-                        if chain_state.cache_dirty_count() > chain_state.flush_threshold() {
-                            if let Err(e) = chain_state.flush_coin_cache() {
+                        if chain_state.cache_dirty_count() > chain_state.flush_threshold()
+                            && let Err(e) = chain_state.flush_coin_cache() {
                                 tracing::error!("Failed to flush cache: {}", e);
-                            }
                         }
 
                         // Log progress

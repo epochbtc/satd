@@ -89,59 +89,6 @@ impl RedbStore {
         })
     }
 
-    /// Initialize UTXO counters by scanning the COINS table if they don't exist yet.
-    /// This is a one-time migration for existing databases.
-    fn init_utxo_counters(db: &redb::Database) -> Result<(), StoreError> {
-        // Check if counters already exist
-        {
-            let txn = db.begin_read().map_err(|e| StoreError::Database(e.to_string()))?;
-            let table = txn.open_table(METADATA).map_err(|e| StoreError::Database(e.to_string()))?;
-            let has_counters = table.get(UTXO_COUNT_KEY).map_err(|e| StoreError::Database(e.to_string()))?.is_some();
-            let has_hist = table.get(UTXO_HEIGHT_HIST_KEY).map_err(|e| StoreError::Database(e.to_string()))?.is_some();
-            if has_counters && has_hist {
-                return Ok(()); // Already initialized
-            }
-        }
-
-        tracing::info!("Initializing UTXO counters (one-time migration)...");
-        let txn = db.begin_read().map_err(|e| StoreError::Database(e.to_string()))?;
-        let table = txn.open_table(COINS).map_err(|e| StoreError::Database(e.to_string()))?;
-        let iter = table.iter().map_err(|e| StoreError::Database(e.to_string()))?;
-
-        let mut count: u64 = 0;
-        let mut total_amount: u64 = 0;
-        let mut height_hist: Vec<u64> = Vec::new();
-        for (_key, value) in iter.flatten() {
-            count += 1;
-            if let Ok(coin) = bincode::deserialize::<Coin>(value.value()) {
-                total_amount = total_amount.saturating_add(coin.amount);
-                let bucket = (coin.height / HEIGHT_HIST_BUCKET) as usize;
-                if bucket >= height_hist.len() {
-                    height_hist.resize(bucket + 1, 0);
-                }
-                height_hist[bucket] += 1;
-            }
-        }
-        drop(txn);
-
-        // Write the counters
-        let txn = db.begin_write().map_err(|e| StoreError::Database(e.to_string()))?;
-        {
-            let mut table = txn.open_table(METADATA).map_err(|e| StoreError::Database(e.to_string()))?;
-            table.insert(UTXO_COUNT_KEY, count.to_le_bytes().as_slice())
-                .map_err(|e| StoreError::Database(e.to_string()))?;
-            table.insert(TOTAL_AMOUNT_KEY, total_amount.to_le_bytes().as_slice())
-                .map_err(|e| StoreError::Database(e.to_string()))?;
-            let hist_bytes = bincode::serialize(&height_hist)
-                .map_err(|e| StoreError::Serialization(e.to_string()))?;
-            table.insert(UTXO_HEIGHT_HIST_KEY, hist_bytes.as_slice())
-                .map_err(|e| StoreError::Database(e.to_string()))?;
-        }
-        txn.commit().map_err(|e| StoreError::Database(e.to_string()))?;
-
-        tracing::info!(count, total_amount, buckets = height_hist.len(), "UTXO counters initialized");
-        Ok(())
-    }
 }
 
 impl Store for RedbStore {

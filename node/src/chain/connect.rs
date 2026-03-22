@@ -123,6 +123,7 @@ pub fn bip113_activation_height(network: Network) -> u32 {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn connect_block(
     store: &dyn Store,
     block: &Block,
