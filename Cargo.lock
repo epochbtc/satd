@@ -197,16 +197,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "843867be96c8daad0d758b57df9392b6d8d271134fce549de6ce169ff98a92af"
 
 [[package]]
-name = "block-analyzer"
-version = "0.1.0"
-dependencies = [
- "bitcoin",
- "clap",
- "hex",
- "rayon",
-]
-
-[[package]]
 name = "block-buffer"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1900,6 +1890,7 @@ dependencies = [
 name = "satd"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "bitcoin",
  "clap",
  "hex",
