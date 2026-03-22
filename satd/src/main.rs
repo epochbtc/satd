@@ -306,6 +306,41 @@ async fn main() {
 
     tracing::info!(%bind_addr, "RPC server listening");
 
+    // Start MCP server if enabled
+    if config.mcp {
+        let mcp_ctx = std::sync::Arc::new(satd_mcp::McpContext {
+            chain_state: chain_state.clone(),
+            mempool: mempool.clone(),
+            peer_manager: peer_manager.clone(),
+            fee_estimator: fee_estimator.clone(),
+            start_time: std::time::Instant::now(),
+            network: config.network,
+        });
+
+        if config.mcp_stdio {
+            let ctx = mcp_ctx.clone();
+            tokio::spawn(async move {
+                if let Err(e) = satd_mcp::serve_stdio(ctx).await {
+                    tracing::error!("MCP stdio server error: {}", e);
+                }
+            });
+            tracing::info!("MCP stdio server started");
+        }
+
+        if let Some(mcp_port) = config.mcp_port {
+            let mcp_bind: SocketAddr = format!("{}:{}", config.mcp_bind, mcp_port)
+                .parse()
+                .expect("Invalid MCP bind address");
+            let ctx = mcp_ctx.clone();
+            let rx = shutdown_rx.clone();
+            tokio::spawn(async move {
+                if let Err(e) = satd_mcp::serve_http(ctx, mcp_bind, rx).await {
+                    tracing::error!("MCP HTTP server error: {}", e);
+                }
+            });
+        }
+    }
+
     // Write PID file if requested
     if let Some(ref pid_path) = config.pid
         && let Err(e) = std::fs::write(pid_path, std::process::id().to_string())

@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 node = { path = "../node" }
+satd-mcp = { path = "../mcp" }
 bitcoin = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
