@@ -381,3 +381,78 @@ pub async fn serve_stdio(
     tracing::info!("MCP stdio server stopped");
     Ok(())
 }
+
+/// Start the MCP server over Streamable HTTP (also serves legacy SSE clients).
+pub async fn serve_http(
+    ctx: Arc<McpContext>,
+    bind_addr: std::net::SocketAddr,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use rmcp::transport::streamable_http_server::{
+        StreamableHttpServerConfig, StreamableHttpService,
+        session::local::LocalSessionManager,
+    };
+    use tokio_util::sync::CancellationToken;
+
+    let cancel = CancellationToken::new();
+    let config = StreamableHttpServerConfig {
+        stateful_mode: true,
+        cancellation_token: cancel.clone(),
+        ..Default::default()
+    };
+
+    let session_manager = std::sync::Arc::new(LocalSessionManager::default());
+
+    let mcp_service = StreamableHttpService::new(
+        move || {
+            let ctx = ctx.clone();
+            Ok(SatdMcpServer {
+                ctx,
+                tool_router: SatdMcpServer::tool_router(),
+            })
+        },
+        session_manager,
+        config,
+    );
+
+    let listener = tokio::net::TcpListener::bind(bind_addr).await?;
+    tracing::info!(%bind_addr, "MCP HTTP server listening");
+
+    loop {
+        tokio::select! {
+            accept = listener.accept() => {
+                match accept {
+                    Ok((stream, _addr)) => {
+                        let svc = mcp_service.clone();
+                        tokio::spawn(async move {
+                            let io = hyper_util::rt::TokioIo::new(stream);
+                            let svc = hyper::service::service_fn(move |req| {
+                                let svc = svc.clone();
+                                async move {
+                                    Ok::<_, std::convert::Infallible>(svc.handle(req).await)
+                                }
+                            });
+                            if let Err(e) = hyper::server::conn::http1::Builder::new()
+                                .serve_connection(io, svc)
+                                .with_upgrades()
+                                .await
+                            {
+                                tracing::debug!("MCP HTTP connection error: {}", e);
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        tracing::error!("MCP HTTP accept error: {}", e);
+                    }
+                }
+            }
+            _ = shutdown_rx.wait_for(|v| *v) => {
+                tracing::info!("MCP HTTP server shutting down");
+                cancel.cancel();
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}

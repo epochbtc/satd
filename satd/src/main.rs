@@ -328,7 +328,16 @@ async fn main() {
         }
 
         if let Some(mcp_port) = config.mcp_port {
-            tracing::info!(port = mcp_port, bind = %config.mcp_bind, "MCP HTTP transport not yet implemented (Phase 4)");
+            let mcp_bind: SocketAddr = format!("{}:{}", config.mcp_bind, mcp_port)
+                .parse()
+                .expect("Invalid MCP bind address");
+            let ctx = mcp_ctx.clone();
+            let rx = shutdown_rx.clone();
+            tokio::spawn(async move {
+                if let Err(e) = satd_mcp::serve_http(ctx, mcp_bind, rx).await {
+                    tracing::error!("MCP HTTP server error: {}", e);
+                }
+            });
         }
     }
 

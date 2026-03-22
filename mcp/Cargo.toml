@@ -13,3 +13,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 schemars = { workspace = true }
 hex = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { version = "0.1", features = ["tokio"] }
+tokio-util = "0.7"

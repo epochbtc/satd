@@ -31,5 +31,5 @@ tokio-socks = "0.5"
 lru = "0.12"
 ratatui = { version = "0.29", features = ["crossterm"] }
 crossterm = "0.28"
-rmcp = { version = "1", features = ["server", "transport-io"] }
+rmcp = { version = "1", features = ["server", "transport-io", "transport-streamable-http-server"] }
 schemars = { version = "0.8", features = ["derive"] }
