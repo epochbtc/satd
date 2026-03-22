@@ -439,17 +439,6 @@ async fn start_startup_rpc(
         })
         .unwrap();
 
-    // Return warming-up error for all other methods
-    module
-        .register_method("getblockchaininfo", |_params, _ctx, _extensions| {
-            Err::<serde_json::Value, _>(ErrorObjectOwned::owned(
-                -28,
-                "Loading...",
-                None::<()>,
-            ))
-        })
-        .unwrap();
-
     let middleware = tower::ServiceBuilder::new().layer(AuthLayer::new(auth));
     let server = ServerBuilder::new()
         .set_http_middleware(middleware)

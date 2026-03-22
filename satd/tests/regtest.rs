@@ -1,3 +1,4 @@
+use base64::Engine;
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command};
@@ -35,14 +36,36 @@ impl TestNode {
         // Check if using user/pass auth (no cookie file expected)
         let uses_userpass = extra_args.iter().any(|a| a.starts_with("--rpcuser"));
 
-        // Wait for RPC server to be fully ready
+        // Wait for RPC server to be fully ready (not just port open —
+        // the startup RPC server may be listening before the real server).
         let deadline = Instant::now() + Duration::from_secs(30);
         let cookie_path = datadir.join("regtest").join(".cookie");
         loop {
-            let port_open = std::net::TcpStream::connect(format!("127.0.0.1:{}", rpcport)).is_ok();
-            let cookie_ready = uses_userpass || cookie_path.exists();
-            if port_open && cookie_ready {
-                break;
+            if uses_userpass {
+                // With user/pass auth: no cookie file, just wait for port + a short delay
+                // for the real RPC server to replace the startup server.
+                if std::net::TcpStream::connect(format!("127.0.0.1:{}", rpcport)).is_ok() {
+                    std::thread::sleep(Duration::from_millis(500));
+                    break;
+                }
+            } else if let Ok(cookie) = std::fs::read_to_string(&cookie_path) {
+                // With cookie auth: verify the real RPC server responds successfully
+                let auth = base64::engine::general_purpose::STANDARD
+                    .encode(cookie.trim());
+                let client = reqwest::blocking::Client::builder()
+                    .timeout(Duration::from_secs(2))
+                    .build()
+                    .unwrap();
+                let rpc_ready = client
+                    .post(format!("http://127.0.0.1:{}/", rpcport))
+                    .header("Authorization", format!("Basic {}", auth))
+                    .header("Content-Type", "application/json")
+                    .body(r#"{"jsonrpc":"2.0","id":1,"method":"getblockchaininfo"}"#)
+                    .send()
+                    .is_ok_and(|r| r.status().is_success());
+                if rpc_ready {
+                    break;
+                }
             }
             if Instant::now() >= deadline {
                 panic!("Timed out waiting for satd to start on port {}", rpcport);
@@ -82,10 +105,26 @@ impl TestNode {
             .spawn()
             .expect("Failed to start satd");
 
+        let cookie_path = datadir.join("regtest").join(".cookie");
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
-            if std::net::TcpStream::connect(format!("127.0.0.1:{}", rpcport)).is_ok() {
-                break;
+            if let Ok(cookie) = std::fs::read_to_string(&cookie_path) {
+                let auth = base64::engine::general_purpose::STANDARD
+                    .encode(cookie.trim());
+                let client = reqwest::blocking::Client::builder()
+                    .timeout(Duration::from_secs(2))
+                    .build()
+                    .unwrap();
+                let rpc_ready = client
+                    .post(format!("http://127.0.0.1:{}/", rpcport))
+                    .header("Authorization", format!("Basic {}", auth))
+                    .header("Content-Type", "application/json")
+                    .body(r#"{"jsonrpc":"2.0","id":1,"method":"getblockchaininfo"}"#)
+                    .send()
+                    .is_ok_and(|r| r.status().is_success());
+                if rpc_ready {
+                    break;
+                }
             }
             if Instant::now() >= deadline {
                 panic!("Timed out waiting for satd to start on port {}", rpcport);
@@ -93,7 +132,6 @@ impl TestNode {
             std::thread::sleep(Duration::from_millis(100));
         }
 
-        let cookie_path = datadir.join("regtest").join(".cookie");
         let cookie = std::fs::read_to_string(&cookie_path).expect("Failed to read cookie file");
 
         TestNode {
