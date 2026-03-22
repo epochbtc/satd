@@ -252,6 +252,7 @@ mod tests {
             Network::Regtest,
             Box::new(NoopVerifier),
             AssumeValid::Disabled,
+            450,
         )
         .unwrap();
         let mp = Mempool::new(1_000_000, 0);
@@ -281,6 +282,7 @@ mod tests {
             Network::Regtest,
             Box::new(NoopVerifier),
             AssumeValid::Disabled,
+            450,
         )
         .unwrap();
         let mp = Mempool::new(1_000_000, 0);
@@ -311,6 +313,7 @@ mod tests {
             Network::Regtest,
             Box::new(NoopVerifier),
             AssumeValid::Disabled,
+            450,
         )
         .unwrap();
         let mp = Mempool::new(1_000_000, 0);
@@ -339,6 +342,7 @@ mod tests {
             Network::Regtest,
             Box::new(NoopVerifier),
             AssumeValid::Disabled,
+            450,
         )
         .unwrap();
         let mp = Mempool::new(1_000_000, 0);
@@ -371,6 +375,7 @@ mod tests {
             Network::Regtest,
             Box::new(NoopVerifier),
             AssumeValid::Disabled,
+            450,
         )
         .unwrap();
         let mp = Mempool::new(1_000_000, 0);

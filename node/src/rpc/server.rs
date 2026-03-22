@@ -599,7 +599,7 @@ pub async fn start(
             "getdifficulty", "getibdprogress", "getmempoolancestors", "getmempooldescendants",
             "getmempoolentry", "getmempoolinfo", "getmemoryinfo", "getmininginfo",
             "getnettotals", "getnetworkhashps", "getnetworkinfo", "getpeerinfo",
-            "getrawmempool", "getrawtransaction", "getrpcinfo", "gettxout",
+            "getrawmempool", "getrawtransaction", "getrpcinfo", "getsysteminfo", "gettxout",
             "gettxoutsetinfo", "help", "listbanned", "logging", "ping",
             "preciousblock", "prioritisetransaction",
             "savemempool", "sendrawtransaction", "setban",
@@ -613,6 +613,30 @@ pub async fn start(
     module.register_method("uptime", |_params, ctx, _extensions| {
         let uptime = ctx.start_time.elapsed().as_secs();
         Ok::<_, ErrorObjectOwned>(serde_json::json!(uptime))
+    })?;
+
+    module.register_method("getsysteminfo", |_params, ctx, _extensions| {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        let rss_bytes = status.lines()
+            .find(|l| l.starts_with("VmRSS:"))
+            .and_then(|l| l.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok()))
+            .unwrap_or(0) * 1024;
+        let threads = status.lines()
+            .find(|l| l.starts_with("Threads:"))
+            .and_then(|l| l.split_whitespace().nth(1).and_then(|v| v.parse::<u32>().ok()))
+            .unwrap_or(0);
+        let uptime = ctx.start_time.elapsed().as_secs();
+        let cache_dirty = ctx.chain_state.cache_dirty_count();
+        let cache_clean = ctx.chain_state.cache_size().saturating_sub(cache_dirty as usize);
+        let pid = std::process::id();
+        Ok::<_, ErrorObjectOwned>(serde_json::json!({
+            "pid": pid,
+            "rss_bytes": rss_bytes,
+            "threads": threads,
+            "uptime": uptime,
+            "cache_dirty": cache_dirty,
+            "cache_clean": cache_clean,
+        }))
     })?;
 
     module.register_method("getmemoryinfo", |_params, _ctx, _extensions| {

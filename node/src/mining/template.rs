@@ -154,7 +154,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("satd-template-test-{}", std::process::id()));
         let store = Box::new(InMemoryStore::new());
         let flat_files = FlatFileManager::new(&dir.join("blocks")).unwrap();
-        let cs = ChainState::new(store, flat_files, Network::Regtest, Box::new(NoopVerifier), AssumeValid::Disabled).unwrap();
+        let cs = ChainState::new(store, flat_files, Network::Regtest, Box::new(NoopVerifier), AssumeValid::Disabled, 450).unwrap();
         let mp = Mempool::new(1_000_000, 0);
 
         let template = create_template(&cs, &mp);
@@ -184,6 +184,7 @@ mod tests {
             Network::Regtest,
             Box::new(NoopVerifier),
             AssumeValid::Disabled,
+            450,
         )
         .unwrap();
         let mp = Mempool::new(1_000_000, 0);

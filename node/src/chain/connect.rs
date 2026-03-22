@@ -1,4 +1,4 @@
-use bitcoin::{Block, OutPoint, Transaction, TxOut};
+use bitcoin::{Block, Network, OutPoint, Transaction, TxOut};
 use rayon::prelude::*;
 use std::collections::HashMap;
 
@@ -37,23 +37,25 @@ pub enum ConnectError {
 
 /// Decode the block height from a BIP 34 coinbase scriptSig.
 ///
-/// The height is encoded via `Builder::push_int(height)` which produces:
-/// - OP_0 (0x00) for height 0
-/// - OP_1..OP_16 (0x51..0x60) for heights 1-16
-/// - [push_size, LE bytes...] for heights 17+
+/// BIP 34 requires the coinbase scriptSig to start with a CScript push of the
+/// block height. The push opcode specifies how many bytes follow. We interpret
+/// those bytes as a little-endian integer. Early BIP 34 blocks sometimes used
+/// non-minimal pushes (e.g., 4-byte push for a 3-byte height), so we only
+/// compare the decoded value, not the encoding length.
 fn decode_coinbase_height(bytes: &[u8]) -> Option<u32> {
     let first = bytes[0];
     match first {
         0x00 => Some(0), // OP_0
         0x51..=0x60 => Some((first - 0x50) as u32), // OP_1..OP_16
-        0x01..=0x04 => {
-            // Data push: first byte = number of bytes, followed by LE height
+        0x01..=0x08 => {
+            // Data push: first byte = number of bytes to push
             let num_bytes = first as usize;
             if 1 + num_bytes > bytes.len() {
                 return None;
             }
+            // Read as little-endian, but cap to u32 (only use first 4 bytes)
             let mut height: u32 = 0;
-            for i in 0..num_bytes {
+            for i in 0..num_bytes.min(4) {
                 height |= (bytes[1 + i] as u32) << (8 * i);
             }
             Some(height)
@@ -101,6 +103,27 @@ pub fn block_subsidy(height: u32) -> u64 {
 ///
 /// The genesis block (height 0) is special: its coinbase is NOT added to the UTXO set,
 /// matching Bitcoin Core behavior.
+/// BIP 34 activation height per network.
+pub fn bip34_activation_height(network: Network) -> u32 {
+    match network {
+        Network::Bitcoin => 227_931,  // BIP 34 activated at this height per Bitcoin Core
+        Network::Testnet => 21_111,
+        _ => 1, // Signet, Regtest: always active
+    }
+}
+
+/// BIP 113 (MTP for locktime) / BIP 68 (sequence locks) activation height.
+/// Before this height, time-based locktimes compare against block timestamp,
+/// not MTP. BIP 68 sequence locks are not enforced before this height.
+pub fn bip113_activation_height(network: Network) -> u32 {
+    match network {
+        Network::Bitcoin => 419_328,
+        Network::Testnet => 770_112,
+        _ => 1, // Signet, Regtest: always active
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn connect_block(
     store: &dyn Store,
     block: &Block,
@@ -109,6 +132,7 @@ pub fn connect_block(
     flat_pos: FlatFilePos,
     script_verifier: &dyn ScriptVerifier,
     median_time_past: u32,
+    network: Network,
 ) -> Result<StoreBatch, ConnectError> {
     let mut batch = StoreBatch::default();
     let mut undo = UndoData::default();
@@ -134,7 +158,9 @@ pub fn connect_block(
         // Context-free transaction checks
         check_transaction(tx)?;
 
-        // Locktime validation (BIP 113: use MTP for time-based locktimes)
+        // Locktime validation
+        // Before BIP 113 activation: time-based locktimes compare against block timestamp.
+        // After BIP 113: time-based locktimes compare against MTP.
         if !is_coinbase {
             let is_final = tx.input.iter().all(|i| i.sequence == bitcoin::Sequence::MAX);
             if !is_final {
@@ -146,8 +172,13 @@ pub fn connect_block(
                             return Err(ConnectError::LocktimeNotFinal);
                         }
                     } else {
-                        // Time-based locktime (BIP 113: compare against MTP)
-                        if median_time_past < locktime {
+                        // Time-based locktime
+                        let time_threshold = if height >= bip113_activation_height(network) {
+                            median_time_past
+                        } else {
+                            block.header.time
+                        };
+                        if time_threshold < locktime {
                             return Err(ConnectError::LocktimeNotFinal);
                         }
                     }
@@ -156,7 +187,7 @@ pub fn connect_block(
         }
 
         // BIP 34: verify coinbase encodes the correct block height
-        if is_coinbase && height > 0 {
+        if is_coinbase && height >= bip34_activation_height(network) {
             let script = &tx.input[0].script_sig;
             let bytes = script.as_bytes();
             if bytes.is_empty() {
@@ -189,8 +220,9 @@ pub fn connect_block(
                     return Err(ConnectError::PrematureCoinbaseSpend);
                 }
 
-                // BIP 68 sequence lock validation (tx version >= 2)
-                if tx.version.0 >= 2 && input.sequence != bitcoin::Sequence::MAX {
+                // BIP 68 sequence lock validation (tx version >= 2, only after activation)
+                if height >= bip113_activation_height(network)
+                    && tx.version.0 >= 2 && input.sequence != bitcoin::Sequence::MAX {
                     let seq = input.sequence.0;
                     let disable_flag = 1u32 << 31;
                     if seq & disable_flag == 0 {
@@ -226,7 +258,7 @@ pub fn connect_block(
                     script_pubkey: coin.script_pubkey.clone(),
                 });
 
-                batch.coin_removes.push(outpoint);
+                batch.coin_removes.push((outpoint, coin.amount));
             }
 
             // Sum outputs
@@ -341,7 +373,7 @@ mod tests {
         let verifier = NoopVerifier;
 
         let batch =
-            connect_block(&store, &genesis, 0, &parent_work, pos, &verifier, 0).unwrap();
+            connect_block(&store, &genesis, 0, &parent_work, pos, &verifier, 0, Network::Regtest).unwrap();
 
         // Genesis coinbase should NOT be in coin_puts
         assert!(batch.coin_puts.is_empty());
@@ -388,13 +420,18 @@ mod tests {
 
     #[test]
     fn test_decode_coinbase_height_invalid() {
-        // Push size 5 is out of the 0x01..=0x04 range
-        assert_eq!(
-            decode_coinbase_height(&[0x05, 0x00, 0x00, 0x00, 0x00, 0x00]),
-            None
-        );
         // Push 1 byte but no data following
         assert_eq!(decode_coinbase_height(&[0x01]), None);
+        // Push size 0x09+ is out of range
+        assert_eq!(
+            decode_coinbase_height(&[0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),
+            None
+        );
+        // 5-byte push is valid (extra nonce bytes, height in first 4)
+        assert_eq!(
+            decode_coinbase_height(&[0x05, 0x01, 0x00, 0x00, 0x00, 0x00]),
+            Some(1)
+        );
     }
 
     // ── helpers for connect_block tests ───────────────────────────────
@@ -508,6 +545,7 @@ mod tests {
             default_pos(),
             &NoopVerifier,
             0,
+            Network::Regtest,
         );
         assert!(result.is_ok());
     }
@@ -525,6 +563,7 @@ mod tests {
             default_pos(),
             &NoopVerifier,
             0,
+            Network::Regtest,
         );
         assert!(matches!(result, Err(ConnectError::SequenceLockNotMet)));
     }
@@ -542,6 +581,7 @@ mod tests {
             default_pos(),
             &NoopVerifier,
             0,
+            Network::Regtest,
         );
         assert!(result.is_ok());
     }
@@ -559,6 +599,7 @@ mod tests {
             default_pos(),
             &NoopVerifier,
             0,
+            Network::Regtest,
         );
         assert!(result.is_ok());
     }
@@ -576,6 +617,7 @@ mod tests {
             default_pos(),
             &NoopVerifier,
             0,
+            Network::Regtest,
         );
         assert!(result.is_ok());
     }
@@ -595,6 +637,7 @@ mod tests {
             default_pos(),
             &NoopVerifier,
             0,
+            Network::Regtest,
         );
         assert!(result.is_ok());
     }
@@ -612,6 +655,7 @@ mod tests {
             default_pos(),
             &NoopVerifier,
             0,
+            Network::Regtest,
         );
         assert!(matches!(result, Err(ConnectError::LocktimeNotFinal)));
     }
@@ -629,6 +673,7 @@ mod tests {
             default_pos(),
             &NoopVerifier,
             500_000_000,
+            Network::Regtest,
         );
         assert!(matches!(result, Err(ConnectError::LocktimeNotFinal)));
     }
@@ -646,6 +691,7 @@ mod tests {
             default_pos(),
             &NoopVerifier,
             0,
+            Network::Regtest,
         );
         assert!(result.is_ok());
     }
@@ -670,6 +716,7 @@ mod tests {
             default_pos(),
             &NoopVerifier,
             0,
+            Network::Regtest,
         );
         assert!(matches!(result, Err(ConnectError::MissingOrSpentInput)));
     }
@@ -687,6 +734,7 @@ mod tests {
             default_pos(),
             &NoopVerifier,
             0,
+            Network::Regtest,
         );
         assert!(matches!(result, Err(ConnectError::PrematureCoinbaseSpend)));
     }
@@ -704,6 +752,7 @@ mod tests {
             default_pos(),
             &NoopVerifier,
             0,
+            Network::Regtest,
         );
         assert!(result.is_ok());
     }
@@ -773,6 +822,7 @@ mod tests {
             default_pos(),
             &NoopVerifier,
             mtp_block,
+            Network::Regtest,
         );
         assert!(result.is_ok(), "BIP68 time lock should be met, got {:?}", result.err());
     }
@@ -831,6 +881,7 @@ mod tests {
             default_pos(),
             &NoopVerifier,
             mtp_block,
+            Network::Regtest,
         );
         assert!(
             matches!(result, Err(ConnectError::SequenceLockNotMet)),
@@ -901,6 +952,7 @@ mod tests {
             default_pos(),
             &NoopVerifier,
             0,
+            Network::Regtest,
         );
         assert!(
             matches!(result, Err(ConnectError::BadCoinbaseValue)),
@@ -992,6 +1044,7 @@ mod tests {
             default_pos(),
             &NoopVerifier,
             0,
+            Network::Regtest,
         );
         assert!(result.is_ok(), "Intra-block spending should succeed, got {:?}", result.err());
     }
@@ -1009,6 +1062,7 @@ mod tests {
             default_pos(),
             &NoopVerifier,
             0,
+            Network::Regtest,
         );
         assert!(result.is_ok(), "BIP 34 correct height should pass, got {:?}", result.err());
     }
@@ -1074,6 +1128,7 @@ mod tests {
             default_pos(),
             &NoopVerifier,
             0,
+            Network::Regtest,
         );
         assert!(
             matches!(result, Err(ConnectError::BadCoinbaseHeight)),
@@ -1143,6 +1198,7 @@ mod tests {
             default_pos(),
             &NoopVerifier,
             0,
+            Network::Regtest,
         );
         assert!(
             matches!(result, Err(ConnectError::BadAmounts)),
@@ -1164,6 +1220,7 @@ mod tests {
             default_pos(),
             &NoopVerifier,
             0,
+            Network::Regtest,
         )
         .unwrap();
 

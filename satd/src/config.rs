@@ -54,13 +54,13 @@ pub struct Config {
     pub blockmintxfee: u64,
     // Misc
     pub pid: Option<String>,
+    // Cache
+    pub dbcache: usize,
     // No-op compatibility flags (accepted but ignored)
     #[allow(dead_code)]
     pub server: bool,
     #[allow(dead_code)]
     pub daemon: bool,
-    #[allow(dead_code)]
-    pub dbcache: usize,
     #[allow(dead_code)]
     pub par: usize,
 }
@@ -313,14 +313,14 @@ impl Config {
                 .or_else(|| file_get("blockmintxfee").and_then(|v| v.parse().ok()))
                 .unwrap_or(1_000),
             pid: cli.pid.or_else(|| file_get("pid")),
-            server: cli.server
-                || file_get("server").and_then(|v| parse_bool(&v)).unwrap_or(false),
-            daemon: cli.daemon
-                || file_get("daemon").and_then(|v| parse_bool(&v)).unwrap_or(false),
             dbcache: cli
                 .dbcache
                 .or_else(|| file_get("dbcache").and_then(|v| v.parse().ok()))
                 .unwrap_or(450),
+            server: cli.server
+                || file_get("server").and_then(|v| parse_bool(&v)).unwrap_or(false),
+            daemon: cli.daemon
+                || file_get("daemon").and_then(|v| parse_bool(&v)).unwrap_or(false),
             par: cli
                 .par
                 .or_else(|| file_get("par").and_then(|v| v.parse().ok()))
@@ -472,15 +472,16 @@ pub struct CliArgs {
     #[arg(long, value_name = "FILE", help = "Write PID to file")]
     pub pid: Option<String>,
 
+    // Cache
+    #[arg(long, value_name = "MB", help = "Total UTXO write cache size in MB (default: 450)")]
+    pub dbcache: Option<usize>,
+
     // No-op compatibility flags (accepted silently, not wired)
     #[arg(long, help = "Accept RPC commands (always on, accepted for compatibility)")]
     pub server: bool,
 
     #[arg(long, help = "Run in background (use systemd instead, accepted for compatibility)")]
     pub daemon: bool,
-
-    #[arg(long, value_name = "MB", help = "Database cache size in MB (accepted for compatibility)")]
-    pub dbcache: Option<usize>,
 
     #[arg(long, value_name = "N", help = "Script verification threads (accepted for compatibility)")]
     pub par: Option<usize>,

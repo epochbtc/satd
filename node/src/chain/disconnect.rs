@@ -16,12 +16,12 @@ pub fn disconnect_block(
     // Remove outputs created by this block (in reverse order)
     for tx in block.txdata.iter().rev() {
         let txid = tx.compute_txid();
-        for (vout, _) in tx.output.iter().enumerate() {
+        for (vout, output) in tx.output.iter().enumerate() {
             let outpoint = OutPoint {
                 txid,
                 vout: vout as u32,
             };
-            batch.coin_removes.push(outpoint);
+            batch.coin_removes.push((outpoint, output.value.to_sat()));
         }
     }
 
@@ -212,7 +212,7 @@ mod tests {
         let block_hash = block.block_hash();
 
         let connect_batch =
-            connect_block(&store, &block, 1, &[0u8; 32], default_pos(), &NoopVerifier, 0)
+            connect_block(&store, &block, 1, &[0u8; 32], default_pos(), &NoopVerifier, 0, Network::Regtest)
                 .unwrap();
 
         // Extract undo data (for non-genesis coinbase-only blocks, undo has no spent coins)
@@ -233,7 +233,7 @@ mod tests {
             batch
                 .coin_removes
                 .iter()
-                .any(|op| op.txid == coinbase_txid && op.vout == 0),
+                .any(|(op, _)| op.txid == coinbase_txid && op.vout == 0),
             "coin_removes should contain the coinbase output"
         );
 
@@ -256,7 +256,7 @@ mod tests {
         let prev_hash = BlockHash::all_zeros();
 
         let connect_batch =
-            connect_block(&store, &block, 1, &[0u8; 32], default_pos(), &NoopVerifier, 0)
+            connect_block(&store, &block, 1, &[0u8; 32], default_pos(), &NoopVerifier, 0, Network::Regtest)
                 .unwrap();
 
         let undo = connect_batch
@@ -278,11 +278,11 @@ mod tests {
         let spending_txid = block.txdata[1].compute_txid();
         let coinbase_txid = block.txdata[0].compute_txid();
         assert!(
-            batch.coin_removes.iter().any(|op| op.txid == spending_txid),
+            batch.coin_removes.iter().any(|(op, _)| op.txid == spending_txid),
             "spending tx outputs should be in coin_removes"
         );
         assert!(
-            batch.coin_removes.iter().any(|op| op.txid == coinbase_txid),
+            batch.coin_removes.iter().any(|(op, _)| op.txid == coinbase_txid),
             "coinbase outputs should be in coin_removes"
         );
     }
@@ -296,7 +296,7 @@ mod tests {
         let prev_hash = BlockHash::all_zeros();
 
         let connect_batch =
-            connect_block(&store, &block, 1, &[0u8; 32], default_pos(), &NoopVerifier, 0)
+            connect_block(&store, &block, 1, &[0u8; 32], default_pos(), &NoopVerifier, 0, Network::Regtest)
                 .unwrap();
 
         let undo = connect_batch
@@ -427,7 +427,7 @@ mod tests {
 
         let block_hash = block.block_hash();
         let connect_batch =
-            connect_block(&store, &block, height, &[0u8; 32], default_pos(), &NoopVerifier, 0)
+            connect_block(&store, &block, height, &[0u8; 32], default_pos(), &NoopVerifier, 0, Network::Regtest)
                 .unwrap();
 
         let undo = connect_batch
@@ -532,7 +532,7 @@ mod tests {
 
         let block_hash = block.block_hash();
         let connect_batch =
-            connect_block(&store, &block, height, &[0u8; 32], default_pos(), &NoopVerifier, 0)
+            connect_block(&store, &block, height, &[0u8; 32], default_pos(), &NoopVerifier, 0, Network::Regtest)
                 .unwrap();
 
         let undo = connect_batch
@@ -583,7 +583,7 @@ mod tests {
         let block_hash = block.block_hash();
 
         let connect_batch =
-            connect_block(&store, &block, 1, &[0u8; 32], default_pos(), &NoopVerifier, 0)
+            connect_block(&store, &block, 1, &[0u8; 32], default_pos(), &NoopVerifier, 0, Network::Regtest)
                 .unwrap();
 
         let undo = connect_batch
@@ -619,7 +619,7 @@ mod tests {
 
         // Connect
         let connect_batch =
-            connect_block(&store, &block, 1, &[0u8; 32], default_pos(), &NoopVerifier, 0)
+            connect_block(&store, &block, 1, &[0u8; 32], default_pos(), &NoopVerifier, 0, Network::Regtest)
                 .unwrap();
 
         let undo = connect_batch
@@ -660,7 +660,7 @@ mod tests {
 
         // Reconnect
         let reconnect_batch =
-            connect_block(&store, &block, 1, &[0u8; 32], default_pos(), &NoopVerifier, 0)
+            connect_block(&store, &block, 1, &[0u8; 32], default_pos(), &NoopVerifier, 0, Network::Regtest)
                 .unwrap();
         store.write_batch(reconnect_batch).unwrap();
 
@@ -703,7 +703,7 @@ mod tests {
         let block_hash = block.block_hash();
 
         let connect_batch =
-            connect_block(&store, &block, 1, &[0u8; 32], default_pos(), &NoopVerifier, 0)
+            connect_block(&store, &block, 1, &[0u8; 32], default_pos(), &NoopVerifier, 0, Network::Regtest)
                 .unwrap();
 
         let undo = connect_batch
@@ -749,6 +749,7 @@ mod tests {
             Network::Regtest,
             Box::new(NoopVerifier),
             AssumeValid::Disabled,
+            450,
         )
         .unwrap();
 

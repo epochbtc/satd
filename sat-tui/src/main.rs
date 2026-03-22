@@ -160,9 +160,11 @@ fn run_app(
         {
             let st = state.lock().unwrap();
             terminal.draw(|f| {
-                if !st.connected {
+                if st.show_help {
+                    ui::help::draw(f, &st);
+                } else if !st.connected {
                     let area = f.area();
-                    f.render_widget(ui::connecting_paragraph(st.stale), area);
+                    f.render_widget(ui::connecting_paragraph(st.stale, st.startup_status.as_deref()), area);
                 } else {
                     match st.active_mode() {
                         ViewMode::Ibd => ui::ibd::draw(f, &st),
@@ -177,10 +179,14 @@ fn run_app(
             && let Event::Key(key) = event::read()? {
                 let mut st = state.lock().unwrap();
                 match key.code {
-                    KeyCode::Char('q') => return Ok(()),
+                    KeyCode::Char('q') => {
+                        if st.show_help { st.show_help = false; } else { return Ok(()); }
+                    }
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         return Ok(());
                     }
+                    KeyCode::Char('h') | KeyCode::Char('?') => st.show_help = !st.show_help,
+                    KeyCode::Esc => { if st.show_help { st.show_help = false; } }
                     KeyCode::Char('1') => st.toggle_mode(ViewMode::Ibd),
                     KeyCode::Char('2') => st.toggle_mode(ViewMode::Steady),
                     KeyCode::Up => {
@@ -211,21 +217,31 @@ fn run_app(
 async fn poller(rpc: Arc<RpcClient>, state: Arc<Mutex<AppState>>) {
     let mut fast_interval = interval(Duration::from_millis(1500));
     let mut slow_counter: u32 = 0;
+    let mut ibd_counter: u32 = 0;
 
     loop {
         fast_interval.tick().await;
         slow_counter += 1;
+        ibd_counter += 1;
 
-        // Fast polls (every 1.5s)
-        let (chain_res, peers_res, mempool_res, conn_res, ibd_res) = tokio::join!(
+        // Fast polls (every 1.5s) — lightweight RPCs only
+        let (chain_res, peers_res, mempool_res, conn_res, sysinfo_res) = tokio::join!(
             rpc.get_blockchain_info(),
             rpc.get_peer_info(),
             rpc.get_mempool_info(),
             rpc.get_connection_count(),
-            rpc.get_ibd_progress(),
+            rpc.get_system_info(),
         );
 
-        {
+        // IBD progress poll (every 3s = every 2nd fast tick) — heavier bitmap RPC
+        let ibd_res = if ibd_counter >= 2 {
+            ibd_counter = 0;
+            Some(rpc.get_ibd_progress().await)
+        } else {
+            None
+        };
+
+        let need_startup_check = {
             let mut st = state.lock().unwrap();
 
             let any_ok = chain_res.is_ok();
@@ -242,15 +258,30 @@ async fn poller(rpc: Arc<RpcClient>, state: Arc<Mutex<AppState>>) {
             if let Ok(v) = conn_res {
                 st.update_connections(&v);
             }
-            if let Ok(v) = ibd_res {
+            if let Some(Ok(v)) = ibd_res {
                 st.update_ibd_progress(&v);
+            }
+            if let Ok(v) = sysinfo_res {
+                st.update_system_info(&v);
             }
 
             if any_ok {
                 st.mark_poll();
+                st.startup_status = None;
+                false
             } else {
                 st.connected = false;
+                true
             }
+        }; // st dropped here, before any .await
+
+        // Try getstartupinfo when main RPCs fail — satd may be loading
+        if need_startup_check
+            && let Ok(v) = rpc.get_startup_info().await {
+                let mut st = state.lock().unwrap();
+                st.startup_status = v.get("status")
+                    .and_then(|s| s.as_str())
+                    .map(|s| s.to_string());
         }
 
         // Slow polls (every ~5s = 3-4 fast ticks)

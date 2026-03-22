@@ -18,6 +18,7 @@ pub struct Loaded {
     pub uptime: bool,
     pub ibd_progress: bool,
     pub mempool_dist: bool,
+    pub system: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,6 +84,8 @@ pub struct AppState {
     pub chain_name: String,
     pub blocks: u32,
     pub headers: u32,
+    /// Highest block height reported by any connected peer (true chain tip).
+    pub network_height: u32,
     pub best_block_hash: String,
     pub difficulty: f64,
     pub chain_time: u64,
@@ -112,18 +115,24 @@ pub struct AppState {
     pub last_block_secs_ago: Option<u64>,
     pub mempool_size_dist: Option<[u32; 8]>,
 
+    // System resources
+    pub rss_bytes: Option<u64>,
+    pub thread_count: Option<u32>,
+    pub cache_dirty: Option<u32>,
+    pub cache_clean: Option<usize>,
+
     // Computed deltas
     pub blocks_per_sec: f64,
     pub headers_per_sec: f64,
-    pub download_rate_bytes: f64,
+    pub dl_blocks_per_sec: f64,
     pub eta_secs: Option<u64>,
 
     // History (last 60 samples ~ 90 seconds)
     pub bps_history: VecDeque<f64>,
     pub dl_history: VecDeque<f64>,
 
-    // Per-peer download rate
-    pub peer_rates: HashMap<String, f64>,
+    // Per-peer block download rate (peer_id → blk/s)
+    pub peer_dl_rates: HashMap<u64, f64>,
 
     // IBD block map
     pub ibd_bitmap: Option<IbdBitmap>,
@@ -132,16 +141,23 @@ pub struct AppState {
     pub mode: ViewMode,
     pub force_mode: Option<ViewMode>,
     pub selected_peer: usize,
+    pub show_help: bool,
 
     // Internal tracking
     prev_blocks: u32,
     prev_headers: u32,
-    prev_bytes_recv: u64,
-    prev_peer_bytes: HashMap<String, u64>,
+    prev_total_downloaded: u64,
+    prev_peer_blocks: HashMap<u64, u64>,
+    /// For stable ETA: time when we first saw blocks advancing.
+    ibd_start_time: Option<std::time::Instant>,
+    /// Block height when IBD tracking started.
+    ibd_start_blocks: u32,
     pub connected: bool,
     pub last_poll: Option<std::time::Instant>,
     pub stale: bool,
     pub loaded: Loaded,
+    /// Startup status message from satd (shown while node is loading).
+    pub startup_status: Option<String>,
 }
 
 impl AppState {
@@ -150,6 +166,7 @@ impl AppState {
             chain_name: String::new(),
             blocks: 0,
             headers: 0,
+            network_height: 0,
             best_block_hash: String::new(),
             difficulty: 0.0,
             chain_time: 0,
@@ -178,30 +195,39 @@ impl AppState {
             last_block_secs_ago: None,
             mempool_size_dist: None,
 
+            rss_bytes: None,
+            thread_count: None,
+            cache_dirty: None,
+            cache_clean: None,
+
             blocks_per_sec: 0.0,
             headers_per_sec: 0.0,
-            download_rate_bytes: 0.0,
+            dl_blocks_per_sec: 0.0,
             eta_secs: None,
 
             bps_history: VecDeque::with_capacity(HISTORY_CAP),
             dl_history: VecDeque::with_capacity(HISTORY_CAP),
 
-            peer_rates: HashMap::new(),
+            peer_dl_rates: HashMap::new(),
 
             ibd_bitmap: None,
 
             mode: ViewMode::Steady,
             force_mode: None,
             selected_peer: 0,
+            show_help: false,
 
             prev_blocks: 0,
             prev_headers: 0,
-            prev_bytes_recv: 0,
-            prev_peer_bytes: HashMap::new(),
+            prev_total_downloaded: 0,
+            prev_peer_blocks: HashMap::new(),
+            ibd_start_time: None,
+            ibd_start_blocks: 0,
             connected: false,
             last_poll: None,
             stale: false,
             loaded: Loaded::default(),
+            startup_status: None,
         }
     }
 
@@ -234,9 +260,10 @@ impl AppState {
                     self.bps_history.pop_front();
                 }
 
-                // ETA
-                if self.blocks_per_sec > 0.01 && new_headers > new_blocks {
-                    self.eta_secs = Some(((new_headers - new_blocks) as f64 / self.blocks_per_sec) as u64);
+                // ETA — use network height (peer-reported) as target, not just headers
+                let target = self.network_height.max(new_headers);
+                if self.blocks_per_sec > 0.01 && target > new_blocks {
+                    self.eta_secs = Some(((target - new_blocks) as f64 / self.blocks_per_sec) as u64);
                 } else {
                     self.eta_secs = None;
                 }
@@ -267,42 +294,13 @@ impl AppState {
     pub fn update_peers(&mut self, v: &serde_json::Value) {
         self.loaded.peers = true;
         if let Some(arr) = v.as_array() {
-            // Compute download rate from total bytes received
-            let total_recv: u64 = arr.iter()
-                .filter_map(|p| p.get("bytesrecv").and_then(|b| b.as_u64()))
-                .sum();
-            if let Some(last) = self.last_poll {
-                let dt = last.elapsed().as_secs_f64();
-                if dt > 0.1 && self.prev_bytes_recv > 0 {
-                    let raw_rate = total_recv.saturating_sub(self.prev_bytes_recv) as f64 / dt;
-                    self.download_rate_bytes = 0.2 * raw_rate + 0.8 * self.download_rate_bytes;
-                    self.dl_history.push_back(self.download_rate_bytes);
-                    if self.dl_history.len() > HISTORY_CAP {
-                        self.dl_history.pop_front();
-                    }
-                }
-            }
-            self.prev_bytes_recv = total_recv;
-
-            // Per-peer rates
-            for p in arr {
-                if let (Some(addr), Some(recv)) = (
-                    p.get("addr").and_then(|a| a.as_str()),
-                    p.get("bytesrecv").and_then(|b| b.as_u64()),
-                ) {
-                    if let Some(last) = self.last_poll {
-                        let dt = last.elapsed().as_secs_f64();
-                        if dt > 0.1 {
-                            let prev = self.prev_peer_bytes.get(addr).copied().unwrap_or(0);
-                            if prev > 0 {
-                                let rate = recv.saturating_sub(prev) as f64 / dt;
-                                let old = self.peer_rates.get(addr).copied().unwrap_or(0.0);
-                                self.peer_rates.insert(addr.to_string(), 0.2 * rate + 0.8 * old);
-                            }
-                        }
-                    }
-                    self.prev_peer_bytes.insert(addr.to_string(), recv);
-                }
+            // Track max peer height (true network chain tip)
+            let max_height = arr.iter()
+                .filter_map(|p| p.get("startingheight").and_then(|h| h.as_u64()))
+                .max()
+                .unwrap_or(0) as u32;
+            if max_height > self.network_height {
+                self.network_height = max_height;
             }
 
             self.peers = arr.clone();
@@ -326,6 +324,74 @@ impl AppState {
     pub fn update_ibd_progress(&mut self, v: &serde_json::Value) {
         self.loaded.ibd_progress = true;
         self.ibd_bitmap = IbdBitmap::from_json(v);
+
+        if let Some(ref bm) = self.ibd_bitmap {
+            if let Some(last) = self.last_poll {
+                let dt = last.elapsed().as_secs_f64();
+                if dt > 0.1 {
+                    // Connect rate (blocks connected / sec)
+                    let cursor = bm.connect_cursor;
+                    if cursor > self.prev_blocks {
+                        let raw_bps = (cursor - self.prev_blocks) as f64 / dt;
+                        self.blocks_per_sec = 0.2 * raw_bps + 0.8 * self.blocks_per_sec;
+                        self.bps_history.push_back(self.blocks_per_sec);
+                        if self.bps_history.len() > HISTORY_CAP {
+                            self.bps_history.pop_front();
+                        }
+                    }
+
+                    // Download rate (blocks downloaded / sec) from total peer blocks_received
+                    let total_dl: u64 = bm.peer_stats.iter().map(|s| s.blocks_received).sum();
+                    if self.prev_total_downloaded > 0 {
+                        let raw_dl = total_dl.saturating_sub(self.prev_total_downloaded) as f64 / dt;
+                        self.dl_blocks_per_sec = 0.2 * raw_dl + 0.8 * self.dl_blocks_per_sec;
+                        self.dl_history.push_back(self.dl_blocks_per_sec);
+                        if self.dl_history.len() > HISTORY_CAP {
+                            self.dl_history.pop_front();
+                        }
+                    }
+                    self.prev_total_downloaded = total_dl;
+
+                    // Per-peer download rates (blk/s)
+                    for ps in &bm.peer_stats {
+                        let prev = self.prev_peer_blocks.get(&ps.peer_id).copied().unwrap_or(0);
+                        if prev > 0 {
+                            let raw = ps.blocks_received.saturating_sub(prev) as f64 / dt;
+                            let old = self.peer_dl_rates.get(&ps.peer_id).copied().unwrap_or(0.0);
+                            self.peer_dl_rates.insert(ps.peer_id, 0.3 * raw + 0.7 * old);
+                        }
+                        self.prev_peer_blocks.insert(ps.peer_id, ps.blocks_received);
+                    }
+                }
+            }
+
+            // Update block count from cursor (more current than getblockchaininfo)
+            let cursor = bm.connect_cursor;
+            if cursor > self.blocks {
+                self.prev_blocks = cursor;
+                self.blocks = cursor;
+            }
+
+            // ETA from long-window average (total blocks / total time) for stability.
+            // The instantaneous EMA rate (blocks_per_sec) is still shown in sparklines
+            // but the ETA uses the session-wide average to avoid wild oscillation.
+            let target = self.sync_target();
+            if target > self.blocks {
+                if self.ibd_start_time.is_none() && self.blocks > 0 {
+                    self.ibd_start_time = Some(std::time::Instant::now());
+                    self.ibd_start_blocks = self.blocks;
+                }
+                if let Some(start) = self.ibd_start_time {
+                    let elapsed = start.elapsed().as_secs_f64();
+                    let connected = self.blocks.saturating_sub(self.ibd_start_blocks) as f64;
+                    if elapsed > 5.0 && connected > 10.0 {
+                        let avg_bps = connected / elapsed;
+                        let remaining = (target - self.blocks) as f64;
+                        self.eta_secs = Some((remaining / avg_bps) as u64);
+                    }
+                }
+            }
+        }
     }
 
     /// Update from getblockstats response.
@@ -409,6 +475,20 @@ impl AppState {
             }
             self.mempool_size_dist = Some(dist);
         }
+    }
+
+    /// Update from getsysteminfo response.
+    pub fn update_system_info(&mut self, v: &serde_json::Value) {
+        self.loaded.system = true;
+        self.rss_bytes = v.get("rss_bytes").and_then(|r| r.as_u64());
+        self.thread_count = v.get("threads").and_then(|t| t.as_u64()).map(|t| t as u32);
+        self.cache_dirty = v.get("cache_dirty").and_then(|c| c.as_u64()).map(|c| c as u32);
+        self.cache_clean = v.get("cache_clean").and_then(|c| c.as_u64()).map(|c| c as usize);
+    }
+
+    /// Best known target height: max of headers and peer-reported network height.
+    pub fn sync_target(&self) -> u32 {
+        self.network_height.max(self.headers)
     }
 
     /// Mark poll timestamp.

@@ -109,12 +109,14 @@ pub struct ChainState {
 impl ChainState {
     /// Create a new ChainState. If the store is empty, initializes with the genesis block.
     /// The store is wrapped in a CoinCache for in-memory UTXO batching.
+    /// `dbcache_mb` controls the total write cache size in MB (default 450).
     pub fn new(
         store: Box<dyn Store>,
         mut flat_files: FlatFileManager,
         network: Network,
         script_verifier: Box<dyn ScriptVerifier>,
         assumevalid: AssumeValid,
+        dbcache_mb: u64,
     ) -> Result<Self, ChainError> {
         let genesis = bitcoin::constants::genesis_block(network);
         let genesis_hash = genesis.block_hash();
@@ -123,17 +125,32 @@ impl ChainState {
         let checkpoints = checkpoints::checkpoints_for_network(network);
 
         // Wrap the store in a CoinCache for batched UTXO writes
-        let store = std::sync::Arc::new(CoinCache::new(store));
+        let store = std::sync::Arc::new(CoinCache::new(store, dbcache_mb));
 
         // Check if we have an existing tip
         if let Some(tip_hash) = store.get_tip()
             && let Some(entry) = store.get_block_index(&tip_hash) {
-                // Scan forward from the block tip to find the highest stored header.
+                // Find the highest stored header via binary search.
                 // Headers may be ahead of blocks if we crashed during IBD.
                 let mut htip = entry.height;
-                while store.get_block_hash_by_height(htip + 1).is_some() {
-                    htip += 1;
+                // First, probe exponentially to find an upper bound
+                let mut probe = 1u32;
+                while store.get_block_hash_by_height(htip + probe).is_some() {
+                    htip += probe;
+                    probe *= 2;
                 }
+                // Binary search between htip and htip + probe
+                let mut lo = htip;
+                let mut hi = htip + probe;
+                while lo < hi {
+                    let mid = lo + (hi - lo) / 2;
+                    if store.get_block_hash_by_height(mid + 1).is_some() {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                htip = lo;
 
                 tracing::info!(
                     height = entry.height,
@@ -169,7 +186,7 @@ impl ChainState {
         let parent_work = [0u8; 32];
         let noop = NoopVerifier; // Genesis has no scripts to verify
         let batch =
-            connect::connect_block(&*store, &genesis, 0, &parent_work, flat_pos, &noop, 0)?;
+            connect::connect_block(&*store, &genesis, 0, &parent_work, flat_pos, &noop, 0, network)?;
         store.write_batch(batch)?;
 
         Ok(Self {
@@ -201,6 +218,21 @@ impl ChainState {
     /// and on graceful shutdown.
     pub fn flush_coin_cache(&self) -> Result<(), StoreError> {
         self.store.flush()
+    }
+
+    /// Number of dirty entries in the write cache.
+    pub fn cache_dirty_count(&self) -> u32 {
+        self.store.dirty_count()
+    }
+
+    /// Dirty coin flush threshold derived from the dbcache budget.
+    pub fn flush_threshold(&self) -> u32 {
+        self.store.flush_threshold()
+    }
+
+    /// Total coin cache size (dirty + clean entries).
+    pub fn cache_size(&self) -> usize {
+        self.store.cache_size()
     }
 
     pub fn get_block_index(&self, hash: &BlockHash) -> Option<BlockIndexEntry> {
@@ -635,6 +667,7 @@ impl ChainState {
             flat_pos,
             verifier,
             mtp,
+            self.network,
         )?;
 
         // Atomic commit
@@ -683,7 +716,7 @@ impl ChainState {
 
             let mtp = self.get_median_time_past(height);
             let batch = connect::connect_block(
-                &*self.store, &block, height, &parent.chainwork, flat_pos, verifier, mtp,
+                &*self.store, &block, height, &parent.chainwork, flat_pos, verifier, mtp, self.network,
             )?;
             self.store.write_batch(batch)?;
 
@@ -763,7 +796,7 @@ impl ChainState {
 
             let mtp = self.get_median_time_past(height);
             let batch = connect::connect_block(
-                &*self.store, &block, height, &parent.chainwork, flat_pos, verifier, mtp,
+                &*self.store, &block, height, &parent.chainwork, flat_pos, verifier, mtp, self.network,
             )?;
             self.store.write_batch(batch)?;
 
@@ -936,7 +969,7 @@ impl ChainState {
                 };
                 let batch = connect::connect_block(
                     &*self.store, &side_block, side_entry.height,
-                    &parent_entry.chainwork, side_flat_pos, verifier, mtp,
+                    &parent_entry.chainwork, side_flat_pos, verifier, mtp, self.network,
                 )?;
                 self.store.write_batch(batch)?;
                 {
@@ -965,6 +998,7 @@ impl ChainState {
             flat_pos,
             verifier,
             mtp,
+            self.network,
         )?;
 
         // Atomic commit
@@ -1163,6 +1197,7 @@ pub(crate) mod tests {
             Network::Regtest,
             Box::new(NoopVerifier),
             AssumeValid::Disabled,
+            450,
         )
         .unwrap();
         (cs, dir)
@@ -1460,6 +1495,7 @@ pub(crate) mod tests {
             Network::Regtest,
             Box::new(NoopVerifier),
             AssumeValid::Disabled,
+            450,
         )
         .unwrap();
 
@@ -1794,6 +1830,7 @@ pub(crate) mod tests {
             Network::Regtest,
             Box::new(NoopVerifier),
             AssumeValid::Hash(block1_hash),
+            450,
         )
         .unwrap();
 

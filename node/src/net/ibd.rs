@@ -323,25 +323,57 @@ impl IbdScheduler {
     /// Generate a compact block state bitmap for the TUI.
     /// Each entry represents one block's state: 0=not-requested, 1=pending,
     /// 2=in-flight, 3=downloaded/stored.
-    pub fn block_bitmap(&self) -> Vec<u8> {
+    ///
+    /// When the range exceeds `MAX_BITMAP` entries, the bitmap is sampled:
+    /// `MAX_BITMAP` evenly-spaced entries are taken across the full range.
+    /// Returns `(bitmap, sampled)` where `sampled` is true when sampling was used.
+    pub fn block_bitmap(&self) -> (Vec<u8>, bool) {
+        const MAX_BITMAP: usize = 50_000;
+
         let start = self.connect_cursor + 1;
         if start > self.target_height {
-            return Vec::new();
+            return (Vec::new(), false);
         }
-        let mut bitmap = Vec::with_capacity((self.target_height - start + 1) as usize);
-        for h in start..=self.target_height {
-            let state = if self.downloaded.contains(&h) {
-                3
-            } else if self.in_flight.contains_key(&h) {
-                2
-            } else if self.pending.contains(&h) {
-                1
-            } else {
-                0
-            };
-            bitmap.push(state);
+        let total = (self.target_height - start + 1) as usize;
+
+        // Build a HashSet from pending for O(1) lookups (VecDeque::contains is O(n))
+        let pending_set: HashSet<u32> = self.pending.iter().copied().collect();
+
+        if total <= MAX_BITMAP {
+            // Full bitmap — every block in the range
+            let mut bitmap = Vec::with_capacity(total);
+            for h in start..=self.target_height {
+                let state = if self.downloaded.contains(&h) {
+                    3
+                } else if self.in_flight.contains_key(&h) {
+                    2
+                } else if pending_set.contains(&h) {
+                    1
+                } else {
+                    0
+                };
+                bitmap.push(state);
+            }
+            (bitmap, false)
+        } else {
+            // Sampled bitmap — take MAX_BITMAP evenly-spaced samples
+            let step = total as f64 / MAX_BITMAP as f64;
+            let mut bitmap = Vec::with_capacity(MAX_BITMAP);
+            for i in 0..MAX_BITMAP {
+                let h = start + (i as f64 * step) as u32;
+                let state = if self.downloaded.contains(&h) {
+                    3
+                } else if self.in_flight.contains_key(&h) {
+                    2
+                } else if pending_set.contains(&h) {
+                    1
+                } else {
+                    0
+                };
+                bitmap.push(state);
+            }
+            (bitmap, true)
         }
-        bitmap
     }
 
     /// Per-peer download statistics for TUI.
@@ -379,6 +411,7 @@ mod tests {
             Network::Regtest,
             Box::new(NoopVerifier),
             AssumeValid::Disabled,
+            450,
         )
         .unwrap();
 

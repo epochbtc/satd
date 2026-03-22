@@ -51,13 +51,15 @@ pub fn draw(f: &mut Frame, state: &AppState) {
 
     // Peers
     let peer_title = format!("Peers ({} connected)", state.connections);
-    let table = peer_table(&state.peers, &state.peer_rates, None, state.selected_peer, &peer_title);
+    let table = peer_table(&state.peers, None, &state.peer_dl_rates, state.selected_peer, &peer_title);
     f.render_widget(table, chunks[4]);
 
     // Footer
     let footer = Line::from(vec![
         Span::styled("q", Style::default().fg(Color::White)),
         Span::styled(": quit  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("h", Style::default().fg(Color::White)),
+        Span::styled(": help  ", Style::default().fg(Color::DarkGray)),
         Span::styled("1/2", Style::default().fg(Color::White)),
         Span::styled(": switch view  ", Style::default().fg(Color::DarkGray)),
         Span::raw("\u{2191}\u{2193}"),
@@ -363,10 +365,19 @@ fn draw_bottom_row(f: &mut Frame, area: Rect, state: &AppState) {
         .filter_map(|p| p.get("bytessent").and_then(|b| b.as_u64()))
         .sum();
 
+    let rss_str = state.rss_bytes
+        .map(format_bytes)
+        .unwrap_or_else(|| "-".into());
+    let threads_str = state.thread_count
+        .map(|t| t.to_string())
+        .unwrap_or_else(|| "-".into());
+
     let net_lines = vec![
         info_line("Peers:", &format!("{} ({} in / {} out)", state.connections, inbound, outbound)),
         info_line("Recv:", &format_bytes(total_recv)),
         info_line("Sent:", &format_bytes(total_sent)),
+        info_line("RSS:", &rss_str),
+        info_line("Threads:", &threads_str),
     ];
     render_panel(f, cols[1], " Network ", &net_lines);
 }

@@ -1317,6 +1317,7 @@ dependencies = [
  "hex",
  "hyper",
  "jsonrpsee",
+ "lru",
  "rand 0.8.5",
  "rayon",
  "redb",
@@ -1889,15 +1890,18 @@ dependencies = [
 name = "satd"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "bitcoin",
  "clap",
  "hex",
+ "jsonrpsee",
  "node",
  "rand 0.8.5",
  "reqwest",
  "serde",
  "serde_json",
  "tokio",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]

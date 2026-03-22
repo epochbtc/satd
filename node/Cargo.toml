@@ -21,6 +21,7 @@ bincode = { workspace = true }
 bitcoinconsensus = { workspace = true }
 rayon = { workspace = true }
 tokio-socks = { workspace = true }
+lru = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

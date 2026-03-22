@@ -403,7 +403,7 @@ impl PeerManager {
         let scheduler = ibd.as_ref()?;
         let (downloaded, in_flight, pending, target) = scheduler.progress();
         let cursor = scheduler.connect_cursor();
-        let bitmap = scheduler.block_bitmap();
+        let (bitmap, bitmap_sampled) = scheduler.block_bitmap();
         let peer_stats = scheduler.peer_stats();
 
         let bitmap_b64 = base64::engine::general_purpose::STANDARD.encode(&bitmap);
@@ -417,6 +417,7 @@ impl PeerManager {
             "pending": pending,
             "bitmap": bitmap_b64,
             "bitmap_start": cursor + 1,
+            "bitmap_sampled": bitmap_sampled,
             "peer_download_stats": peer_stats.iter().map(|(id, recv, assigned)| {
                 serde_json::json!({"peer_id": id, "blocks_received": recv, "assigned": assigned})
             }).collect::<Vec<_>>(),
@@ -1329,6 +1330,13 @@ impl PeerManager {
                         // Skip fee recording during IBD — the coins are already
                         // spent so get_coin returns None for every input, and fee
                         // data from old blocks is useless for estimation anyway.
+
+                        // Flush if dirty map is getting large (caps memory usage)
+                        if chain_state.cache_dirty_count() > chain_state.flush_threshold()
+                            && let Err(e) = chain_state.flush_coin_cache() {
+                                tracing::error!("Failed to flush cache: {}", e);
+                        }
+
                         // Log progress
                         if next_height / 1000 > *last_log_height / 1000 {
                             let elapsed = start_time.elapsed().as_secs().max(1);
