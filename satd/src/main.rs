@@ -306,6 +306,32 @@ async fn main() {
 
     tracing::info!(%bind_addr, "RPC server listening");
 
+    // Start MCP server if enabled
+    if config.mcp {
+        let mcp_ctx = std::sync::Arc::new(satd_mcp::McpContext {
+            chain_state: chain_state.clone(),
+            mempool: mempool.clone(),
+            peer_manager: peer_manager.clone(),
+            fee_estimator: fee_estimator.clone(),
+            start_time: std::time::Instant::now(),
+            network: config.network,
+        });
+
+        if config.mcp_stdio {
+            let ctx = mcp_ctx.clone();
+            tokio::spawn(async move {
+                if let Err(e) = satd_mcp::serve_stdio(ctx).await {
+                    tracing::error!("MCP stdio server error: {}", e);
+                }
+            });
+            tracing::info!("MCP stdio server started");
+        }
+
+        if let Some(mcp_port) = config.mcp_port {
+            tracing::info!(port = mcp_port, bind = %config.mcp_bind, "MCP HTTP transport not yet implemented (Phase 4)");
+        }
+    }
+
     // Write PID file if requested
     if let Some(ref pid_path) = config.pid
         && let Err(e) = std::fs::write(pid_path, std::process::id().to_string())

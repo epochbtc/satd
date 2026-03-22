@@ -56,6 +56,11 @@ pub struct Config {
     pub pid: Option<String>,
     // Cache
     pub dbcache: usize,
+    // MCP server
+    pub mcp: bool,
+    pub mcp_stdio: bool,
+    pub mcp_port: Option<u16>,
+    pub mcp_bind: String,
     // No-op compatibility flags (accepted but ignored)
     #[allow(dead_code)]
     pub server: bool,
@@ -313,6 +318,19 @@ impl Config {
                 .or_else(|| file_get("blockmintxfee").and_then(|v| v.parse().ok()))
                 .unwrap_or(1_000),
             pid: cli.pid.or_else(|| file_get("pid")),
+            mcp: cli.mcp
+                || file_get("mcp").and_then(|v| parse_bool(&v)).unwrap_or(false),
+            mcp_stdio: cli
+                .mcpstdio
+                .or_else(|| file_get("mcpstdio").and_then(|v| parse_bool(&v)))
+                .unwrap_or(true), // default: enabled when --mcp is set
+            mcp_port: cli
+                .mcpport
+                .or_else(|| file_get("mcpport").and_then(|v| v.parse().ok())),
+            mcp_bind: cli
+                .mcpbind
+                .or_else(|| file_get("mcpbind"))
+                .unwrap_or_else(|| "127.0.0.1".to_string()),
             dbcache: cli
                 .dbcache
                 .or_else(|| file_get("dbcache").and_then(|v| v.parse().ok()))
@@ -476,6 +494,19 @@ pub struct CliArgs {
     #[arg(long, value_name = "MB", help = "Total UTXO write cache size in MB (default: 450)")]
     pub dbcache: Option<usize>,
 
+    // MCP server flags
+    #[arg(long, help = "Enable MCP (Model Context Protocol) server")]
+    pub mcp: bool,
+
+    #[arg(long, value_name = "BOOL", help = "Enable MCP stdio transport (default: true when --mcp)")]
+    pub mcpstdio: Option<bool>,
+
+    #[arg(long, value_name = "PORT", help = "Enable MCP HTTP transport on this port")]
+    pub mcpport: Option<u16>,
+
+    #[arg(long, value_name = "ADDR", help = "MCP HTTP bind address (default: 127.0.0.1)")]
+    pub mcpbind: Option<String>,
+
     // No-op compatibility flags (accepted silently, not wired)
     #[arg(long, help = "Accept RPC commands (always on, accepted for compatibility)")]
     pub server: bool,
@@ -533,6 +564,10 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "blockmaxweight",
         "blockmintxfee",
         "pid",
+        "mcp",
+        "mcpstdio",
+        "mcpport",
+        "mcpbind",
         "server",
         "daemon",
         "dbcache",
@@ -755,6 +790,10 @@ rpcport=8332
             torcontrol: None,
             torpassword: None,
             onlynet: vec![],
+            mcp: false,
+            mcpstdio: None,
+            mcpport: None,
+            mcpbind: None,
         };
         let config = Config::from_cli(cli).unwrap();
         assert_eq!(config.network, Network::Regtest);
@@ -811,6 +850,10 @@ rpcport=8332
             torcontrol: None,
             torpassword: None,
             onlynet: vec![],
+            mcp: false,
+            mcpstdio: None,
+            mcpport: None,
+            mcpbind: None,
         };
         assert!(Config::from_cli(cli).is_err());
     }

@@ -1,0 +1,15 @@
+[package]
+name = "satd-mcp"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+node = { path = "../node" }
+rmcp = { workspace = true }
+bitcoin = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = { workspace = true }
+hex = { workspace = true }
