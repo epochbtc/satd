@@ -1,0 +1,10 @@
+[package]
+name = "block-analyzer"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bitcoin = { workspace = true }
+clap = { workspace = true }
+rayon = { workspace = true }
+hex = { workspace = true }
