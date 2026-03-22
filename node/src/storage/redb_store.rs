@@ -76,7 +76,12 @@ impl RedbStore {
                 .map_err(|e| StoreError::Database(e.to_string()))?;
         }
 
-        Self::init_utxo_counters(&db)?;
+        // Skip the blocking UTXO counter migration on startup.
+        // Counters are maintained incrementally during write_batch(),
+        // so they'll be accurate for any database that has been through
+        // at least one flush. For legacy databases without counters,
+        // coin_count/coin_total_amount will return 0 until a manual
+        // reindex or the values accumulate from connected blocks.
 
         Ok(Self {
             db,
@@ -210,13 +215,14 @@ impl Store for RedbStore {
             let mut count_delta: i64 = 0;
             let mut amount_delta: i64 = 0;
 
-            // Process removes first (need to look up amounts before deletion)
-            for outpoint in &batch.coin_removes {
+            // Process removes
+            for (outpoint, spent_amount) in &batch.coin_removes {
                 let key = outpoint_to_key(outpoint);
                 if let Ok(Some(existing)) = table.remove(key.as_slice()) {
                     count_delta -= 1;
+                    amount_delta -= *spent_amount as i64;
+                    // Need height for histogram — deserialize only for that
                     if let Ok(coin) = bincode::deserialize::<Coin>(existing.value()) {
-                        amount_delta -= coin.amount as i64;
                         let bucket = (coin.height / HEIGHT_HIST_BUCKET) as usize;
                         *hist_deltas.entry(bucket).or_default() -= 1;
                     }
@@ -555,7 +561,7 @@ mod tests {
 
         // Remove the coin
         let mut batch2 = StoreBatch::default();
-        batch2.coin_removes.push(op);
+        batch2.coin_removes.push((op, 5_000_000_000));
         store.write_batch(batch2).unwrap();
 
         assert!(store.get_coin(&op).is_none());
@@ -648,7 +654,7 @@ mod tests {
 
         // Remove one coin
         let mut batch2 = StoreBatch::default();
-        batch2.coin_removes.push(make_outpoint(0x02, 0));
+        batch2.coin_removes.push((make_outpoint(0x02, 0), 200));
         store.write_batch(batch2).unwrap();
 
         assert_eq!(store.coin_count(), 2);

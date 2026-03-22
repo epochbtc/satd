@@ -27,7 +27,8 @@ pub enum StoreError {
 pub struct StoreBatch {
     pub block_index_puts: Vec<(BlockHash, BlockIndexEntry)>,
     pub coin_puts: Vec<(OutPoint, Coin)>,
-    pub coin_removes: Vec<OutPoint>,
+    /// (outpoint, spent_amount) — amount is carried for O(1) counter updates.
+    pub coin_removes: Vec<(OutPoint, u64)>,
     pub tip: Option<BlockHash>,
     pub height_hash_puts: Vec<(u32, BlockHash)>,
     pub height_hash_removes: Vec<u32>,

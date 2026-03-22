@@ -62,6 +62,19 @@ async fn main() {
     };
     let auth = Arc::new(auth);
 
+    // Start a lightweight startup-status RPC server immediately.
+    // This lets the TUI show "Loading database..." instead of "Connecting...".
+    // It will be stopped once the full RPC server is ready.
+    let rpc_bind: SocketAddr = format!("{}:{}", config.rpcbind, config.rpcport)
+        .parse()
+        .expect("Invalid RPC bind address");
+    let startup_status = Arc::new(std::sync::RwLock::new("Opening database...".to_string()));
+    let startup_handle = {
+        let status = startup_status.clone();
+        let auth_clone = auth.clone();
+        start_startup_rpc(rpc_bind, auth_clone, status).await
+    };
+
     // Open block storage
     let blocks_dir = net_datadir.join("blocks");
     let _chainstate_dir = net_datadir.join("chainstate");
@@ -157,12 +170,14 @@ async fn main() {
     };
 
     // Initialize chain state with script verification
+    *startup_status.write().unwrap() = "Initializing chain state...".to_string();
     let chain_state = match ChainState::new(
         store,
         flat_files,
         config.network,
         Box::new(ConsensusVerifier),
         assumevalid,
+        config.dbcache as u64,
     ) {
         Ok(cs) => Arc::new(cs),
         Err(e) => {
@@ -263,10 +278,12 @@ async fn main() {
         }
     }
 
-    // Start RPC server
-    let bind_addr: SocketAddr = format!("{}:{}", config.rpcbind, config.rpcport)
-        .parse()
-        .expect("Invalid RPC bind address");
+    // Stop the startup RPC server and start the real one on the same port
+    startup_handle.stop().expect("Failed to stop startup RPC");
+    // Give the port a moment to be released
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let bind_addr = rpc_bind;
 
     let server_handle = match node::rpc::server::start(
         bind_addr,
@@ -371,13 +388,18 @@ async fn main() {
         tokio::spawn(async move { pm.run().await });
     }
 
-    // Wait for shutdown signal (stop RPC or Ctrl+C)
+    // Wait for shutdown signal (stop RPC, Ctrl+C, or SIGTERM)
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("Failed to register SIGTERM handler");
     tokio::select! {
         _ = shutdown_rx.wait_for(|v| *v) => {
             tracing::info!("Shutdown signal received from RPC");
         }
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("Ctrl+C received, shutting down");
+        }
+        _ = sigterm.recv() => {
+            tracing::info!("SIGTERM received, shutting down");
         }
     }
 
@@ -391,4 +413,49 @@ async fn main() {
         let _ = std::fs::remove_file(pid_path);
     }
     tracing::info!("satd stopped");
+}
+
+/// Start a minimal RPC server that only serves `getstartupinfo`.
+/// This runs on the RPC port before the full node is initialized,
+/// so the TUI can show startup progress instead of "Connecting...".
+async fn start_startup_rpc(
+    bind_addr: SocketAddr,
+    auth: Arc<RpcAuth>,
+    status: Arc<std::sync::RwLock<String>>,
+) -> jsonrpsee::server::ServerHandle {
+    use jsonrpsee::server::{RpcModule, ServerBuilder};
+    use jsonrpsee::types::ErrorObjectOwned;
+    use node::rpc::auth::AuthLayer;
+
+    let mut module = RpcModule::new(status);
+
+    module
+        .register_method("getstartupinfo", |_params, ctx, _extensions| {
+            let status = ctx.read().unwrap().clone();
+            Ok::<_, ErrorObjectOwned>(serde_json::json!({
+                "started": false,
+                "status": status,
+            }))
+        })
+        .unwrap();
+
+    // Return warming-up error for all other methods
+    module
+        .register_method("getblockchaininfo", |_params, _ctx, _extensions| {
+            Err::<serde_json::Value, _>(ErrorObjectOwned::owned(
+                -28,
+                "Loading...",
+                None::<()>,
+            ))
+        })
+        .unwrap();
+
+    let middleware = tower::ServiceBuilder::new().layer(AuthLayer::new(auth));
+    let server = ServerBuilder::new()
+        .set_http_middleware(middleware)
+        .build(bind_addr)
+        .await
+        .expect("Failed to start startup RPC server");
+
+    server.start(module)
 }

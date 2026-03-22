@@ -1,5 +1,5 @@
 [workspace]
-members = ["satd", "sat-cli", "node", "sat-tui"]
+members = ["satd", "sat-cli", "node", "sat-tui", "block-analyzer"]
 resolver = "2"
 
 [workspace.package]
@@ -28,5 +28,6 @@ bincode = "1"
 bitcoinconsensus = "0.106"
 rayon = "1.10"
 tokio-socks = "0.5"
+lru = "0.12"
 ratatui = { version = "0.29", features = ["crossterm"] }
 crossterm = "0.28"
