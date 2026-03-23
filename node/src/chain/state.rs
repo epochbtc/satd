@@ -510,6 +510,71 @@ impl ChainState {
         &*self.script_verifier
     }
 
+    /// Get an Arc reference to the store for read-only access by prefetch workers.
+    pub fn store_ref(&self) -> &std::sync::Arc<CoinCache> {
+        &self.store
+    }
+
+    /// Get the blocks directory path.
+    pub fn blocks_dir(&self) -> &std::path::Path {
+        &self.blocks_dir
+    }
+
+    /// Connect a pre-processed block from the prefetch pipeline.
+    ///
+    /// The block has already been read from flat files, deserialized, and had
+    /// context-free checks run. The main savings is skipping flat file I/O
+    /// on the connect thread.
+    pub fn connect_preprocessed_block(
+        &self,
+        pre: crate::chain::prefetch::PreprocessedBlock,
+    ) -> Result<BlockHash, ChainError> {
+        // Verify parent is current tip (same check as connect_stored_block)
+        let current_tip = self.tip_hash();
+        if pre.entry.header.prev_blockhash != current_tip {
+            return Err(ChainError::BadPrevBlock);
+        }
+
+        // Block must be in DataStored state
+        if pre.entry.status != BlockStatus::DataStored {
+            return Err(ChainError::Duplicate);
+        }
+
+        // Determine script verifier
+        let use_noop = self.should_skip_scripts(pre.height);
+        let noop = NoopVerifier;
+        let verifier: &dyn ScriptVerifier =
+            if use_noop { &noop } else { &*self.script_verifier };
+
+        // Connect block using the pre-fetched data.
+        // The main win is skipping flat file I/O on this thread.
+        let batch = connect::connect_block(
+            &*self.store,
+            &pre.block,
+            pre.height,
+            &pre.parent.chainwork,
+            pre.flat_pos,
+            verifier,
+            pre.mtp,
+            self.network,
+        )?;
+
+        // Atomic commit
+        self.store.write_batch(batch)?;
+
+        // Update in-memory tip
+        {
+            let mut tip = self.tip.write().unwrap();
+            tip.hash = pre.hash;
+            tip.height = pre.height;
+        }
+
+        // Update MTP cache
+        self.push_mtp_cache(pre.height, pre.entry.header.time);
+
+        Ok(pre.hash)
+    }
+
     /// Read a full block from flat file storage.
     /// Look up which block contains a transaction (requires -txindex).
     pub fn get_tx_location(&self, txid: &bitcoin::Txid) -> Option<BlockHash> {
