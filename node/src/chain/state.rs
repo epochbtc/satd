@@ -540,24 +540,41 @@ impl ChainState {
             return Err(ChainError::Duplicate);
         }
 
-        // Determine script verifier
+        // Determine script verifier.
+        // If the prefetcher pre-verified scripts for some transactions,
+        // wrap the verifier to skip those (they've already been checked
+        // against the same coins the connect thread will validate).
         let use_noop = self.should_skip_scripts(pre.height);
         let noop = NoopVerifier;
-        let verifier: &dyn ScriptVerifier =
+        let base_verifier: &dyn ScriptVerifier =
             if use_noop { &noop } else { &*self.script_verifier };
 
         // Connect block using the pre-fetched data.
-        // The main win is skipping flat file I/O on this thread.
-        let batch = connect::connect_block(
-            &*self.store,
-            &pre.block,
-            pre.height,
-            &pre.parent.chainwork,
-            pre.flat_pos,
-            verifier,
-            pre.mtp,
-            self.network,
-        )?;
+        // Wins: flat file I/O eliminated, cache warmed, pre-verified scripts skipped.
+        let batch = if pre.script_verified_txs.is_empty() {
+            connect::connect_block(
+                &*self.store,
+                &pre.block,
+                pre.height,
+                &pre.parent.chainwork,
+                pre.flat_pos,
+                base_verifier,
+                pre.mtp,
+                self.network,
+            )?
+        } else {
+            connect::connect_block_preverified(
+                &*self.store,
+                &pre.block,
+                pre.height,
+                &pre.parent.chainwork,
+                pre.flat_pos,
+                base_verifier,
+                pre.mtp,
+                self.network,
+                &pre.script_verified_txs,
+            )?
+        };
 
         // Atomic commit
         self.store.write_batch(batch)?;

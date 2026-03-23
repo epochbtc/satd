@@ -1,6 +1,7 @@
-use bitcoin::{Block, BlockHash, Txid};
+use bitcoin::{Block, BlockHash, TxOut, Txid};
 use crossbeam_channel::{bounded, Receiver};
-use std::collections::HashMap;
+use rayon::prelude::*;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -12,6 +13,7 @@ use crate::storage::blockindex::{BlockIndexEntry, BlockStatus};
 use crate::storage::coinview::Coin;
 use crate::storage::flatfile::FlatFilePos;
 use crate::storage::Store;
+use crate::validation::script::{ConsensusVerifier, ScriptVerifier};
 use crate::validation::tx::check_transaction;
 
 /// A block that has been pre-read, deserialized, and partially validated
@@ -30,6 +32,10 @@ pub struct PreprocessedBlock {
     pub speculative_coins: HashMap<(usize, usize), Coin>,
     /// Pre-computed txids (one per transaction in the block).
     pub txids: Vec<Txid>,
+    /// Tx indices where all inputs were speculatively resolved AND scripts
+    /// were pre-verified successfully. The connect thread can skip script
+    /// verification for these transactions.
+    pub script_verified_txs: HashSet<usize>,
 }
 
 /// Read a block from a flat file without holding the FlatFileManager mutex.
@@ -122,6 +128,37 @@ pub fn prefetch_block(
         }
     }
 
+    // 7. Pre-verify scripts for transactions where ALL inputs were resolved.
+    // Uses rayon for parallel verification across inputs.
+    let verifier = ConsensusVerifier;
+    let script_verified_txs: HashSet<usize> = block
+        .txdata
+        .par_iter()
+        .enumerate()
+        .filter_map(|(tx_idx, tx)| {
+            if tx.is_coinbase() {
+                return None;
+            }
+            // Check that ALL inputs for this tx have speculative coins
+            let mut prev_outputs = Vec::with_capacity(tx.input.len());
+            for (input_idx, _) in tx.input.iter().enumerate() {
+                if let Some(coin) = speculative_coins.get(&(tx_idx, input_idx)) {
+                    prev_outputs.push(TxOut {
+                        value: bitcoin::Amount::from_sat(coin.amount),
+                        script_pubkey: coin.script_pubkey.clone(),
+                    });
+                } else {
+                    return None; // Missing input — can't verify this tx
+                }
+            }
+            // All inputs resolved — verify scripts
+            match verifier.verify_transaction(tx, &prev_outputs) {
+                Ok(()) => Some(tx_idx),
+                Err(_) => None, // Verification failed — connect thread will re-check
+            }
+        })
+        .collect();
+
     Some(PreprocessedBlock {
         height,
         hash,
@@ -132,6 +169,7 @@ pub fn prefetch_block(
         mtp,
         speculative_coins,
         txids,
+        script_verified_txs,
     })
 }
 
