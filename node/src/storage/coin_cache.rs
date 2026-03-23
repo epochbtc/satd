@@ -388,3 +388,544 @@ impl Store for CoinCache {
         self.inner.clear_all()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::db::InMemoryStore;
+    use super::super::blockindex::{BlockIndexEntry, BlockStatus, work_for_bits};
+    use super::super::undo::{OutPointSer, UndoData};
+    use bitcoin::hashes::Hash;
+    use bitcoin::pow::CompactTarget;
+
+    fn make_cache(dbcache_mb: u64) -> CoinCache {
+        CoinCache::new(Box::new(InMemoryStore::new()), dbcache_mb)
+    }
+
+    fn make_coin(amount: u64, height: u32) -> Coin {
+        Coin {
+            amount,
+            script_pubkey: bitcoin::ScriptBuf::new(),
+            height,
+            coinbase: false,
+        }
+    }
+
+    fn make_outpoint(txid_byte: u8, vout: u32) -> OutPoint {
+        OutPoint {
+            txid: bitcoin::Txid::from_raw_hash(
+                bitcoin::hashes::sha256d::Hash::from_byte_array([txid_byte; 32]),
+            ),
+            vout,
+        }
+    }
+
+    fn make_block_hash(byte: u8) -> BlockHash {
+        BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+            [byte; 32],
+        ))
+    }
+
+    fn make_test_entry(height: u32) -> BlockIndexEntry {
+        let genesis = bitcoin::constants::genesis_block(bitcoin::Network::Regtest);
+        BlockIndexEntry {
+            header: genesis.header,
+            height,
+            status: BlockStatus::Valid,
+            num_tx: 1,
+            file_number: 0,
+            data_pos: 0,
+            chainwork: work_for_bits(CompactTarget::from_consensus(0x207fffff)),
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // 1. get_coin read-through: inner store hit populates clean LRU
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_get_coin_read_through() {
+        let inner = InMemoryStore::new();
+        let op = make_outpoint(0x01, 0);
+        let coin = make_coin(1000, 1);
+
+        // Seed the inner store directly.
+        let mut batch = StoreBatch::default();
+        batch.coin_puts.push((op, coin.clone()));
+        inner.write_batch(batch).unwrap();
+
+        let cache = CoinCache::new(Box::new(inner), 10);
+
+        // First get_coin — cache miss, reads from inner.
+        let c1 = cache.get_coin(&op).unwrap();
+        assert_eq!(c1.amount, 1000);
+
+        // Second get_coin — should hit the clean LRU. dirty_count stays 0
+        // because read-through only populates clean, not dirty.
+        let c2 = cache.get_coin(&op).unwrap();
+        assert_eq!(c2.amount, 1000);
+        assert_eq!(cache.dirty_count(), 0);
+    }
+
+    // ---------------------------------------------------------------
+    // 2. Dirty coin takes priority over inner store
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_get_coin_dirty_takes_priority() {
+        let inner = InMemoryStore::new();
+        let op = make_outpoint(0x02, 0);
+
+        // Seed inner with amount=500.
+        let mut seed = StoreBatch::default();
+        seed.coin_puts.push((op, make_coin(500, 1)));
+        inner.write_batch(seed).unwrap();
+
+        let cache = CoinCache::new(Box::new(inner), 10);
+
+        // Write a dirty coin with amount=999.
+        let mut batch = StoreBatch::default();
+        batch.coin_puts.push((op, make_coin(999, 2)));
+        cache.write_batch(batch).unwrap();
+
+        let c = cache.get_coin(&op).unwrap();
+        assert_eq!(c.amount, 999);
+    }
+
+    // ---------------------------------------------------------------
+    // 3. Spent coin returns None
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_get_coin_spent_returns_none() {
+        let cache = make_cache(10);
+        let op = make_outpoint(0x03, 0);
+
+        // Add then spend.
+        let mut b1 = StoreBatch::default();
+        b1.coin_puts.push((op, make_coin(100, 1)));
+        cache.write_batch(b1).unwrap();
+
+        let mut b2 = StoreBatch::default();
+        b2.coin_removes.push((op, 100));
+        cache.write_batch(b2).unwrap();
+
+        assert!(cache.get_coin(&op).is_none());
+    }
+
+    // ---------------------------------------------------------------
+    // 4. has_coin returns true for dirty Present
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_has_coin_dirty_present() {
+        let cache = make_cache(10);
+        let op = make_outpoint(0x04, 0);
+
+        let mut batch = StoreBatch::default();
+        batch.coin_puts.push((op, make_coin(50, 1)));
+        cache.write_batch(batch).unwrap();
+
+        assert!(cache.has_coin(&op));
+    }
+
+    // ---------------------------------------------------------------
+    // 5. has_coin returns false for dirty Spent
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_has_coin_dirty_spent() {
+        let cache = make_cache(10);
+        let op = make_outpoint(0x05, 0);
+
+        let mut b1 = StoreBatch::default();
+        b1.coin_puts.push((op, make_coin(50, 1)));
+        cache.write_batch(b1).unwrap();
+
+        let mut b2 = StoreBatch::default();
+        b2.coin_removes.push((op, 50));
+        cache.write_batch(b2).unwrap();
+
+        assert!(!cache.has_coin(&op));
+    }
+
+    // ---------------------------------------------------------------
+    // 6. write_batch absorbs coins into dirty map
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_write_batch_absorbs_coins() {
+        let cache = make_cache(10);
+
+        let mut batch = StoreBatch::default();
+        batch.coin_puts.push((make_outpoint(0x10, 0), make_coin(100, 1)));
+        batch.coin_puts.push((make_outpoint(0x11, 0), make_coin(200, 2)));
+        cache.write_batch(batch).unwrap();
+
+        assert_eq!(cache.dirty_count(), 2);
+    }
+
+    // ---------------------------------------------------------------
+    // 7. write_batch tracks count_delta and amount_delta
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_write_batch_tracks_deltas() {
+        let cache = make_cache(10);
+
+        // Add two coins: amounts 1000 and 2000.
+        let mut b1 = StoreBatch::default();
+        b1.coin_puts.push((make_outpoint(0x20, 0), make_coin(1000, 1)));
+        b1.coin_puts.push((make_outpoint(0x21, 0), make_coin(2000, 2)));
+        cache.write_batch(b1).unwrap();
+
+        assert_eq!(cache.count_delta.load(Ordering::Relaxed), 2);
+        assert_eq!(cache.amount_delta.load(Ordering::Relaxed), 3000);
+
+        // Remove one coin (spent amount = 1000).
+        let mut b2 = StoreBatch::default();
+        b2.coin_removes.push((make_outpoint(0x20, 0), 1000));
+        cache.write_batch(b2).unwrap();
+
+        assert_eq!(cache.count_delta.load(Ordering::Relaxed), 1);
+        assert_eq!(cache.amount_delta.load(Ordering::Relaxed), 2000);
+    }
+
+    // ---------------------------------------------------------------
+    // 8. flush writes coins to inner store
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_flush_writes_to_inner() {
+        let inner = InMemoryStore::new();
+        let cache = CoinCache::new(Box::new(inner), 10);
+
+        let op = make_outpoint(0x30, 0);
+        let mut batch = StoreBatch::default();
+        batch.coin_puts.push((op, make_coin(7777, 5)));
+        cache.write_batch(batch).unwrap();
+
+        // Before flush — inner should NOT have the coin (it's only in dirty).
+        // We can't easily access inner through CoinCache, but after flush
+        // we can verify via the cache itself (which will read-through).
+        cache.flush().unwrap();
+
+        // After flush, dirty is empty. get_coin should read-through from inner.
+        assert_eq!(cache.dirty_count(), 0);
+        let c = cache.get_coin(&op).unwrap();
+        assert_eq!(c.amount, 7777);
+    }
+
+    // ---------------------------------------------------------------
+    // 9. flush clears dirty count
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_flush_clears_dirty() {
+        let cache = make_cache(10);
+
+        let mut batch = StoreBatch::default();
+        batch.coin_puts.push((make_outpoint(0x40, 0), make_coin(100, 1)));
+        batch.coin_puts.push((make_outpoint(0x41, 0), make_coin(200, 2)));
+        batch.coin_removes.push((make_outpoint(0x42, 0), 300));
+        cache.write_batch(batch).unwrap();
+
+        assert_eq!(cache.dirty_count(), 3);
+        cache.flush().unwrap();
+        assert_eq!(cache.dirty_count(), 0);
+    }
+
+    // ---------------------------------------------------------------
+    // 10. flush resets deltas to zero
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_flush_resets_deltas() {
+        let cache = make_cache(10);
+
+        let mut batch = StoreBatch::default();
+        batch.coin_puts.push((make_outpoint(0x50, 0), make_coin(500, 1)));
+        cache.write_batch(batch).unwrap();
+
+        assert_ne!(cache.count_delta.load(Ordering::Relaxed), 0);
+        assert_ne!(cache.amount_delta.load(Ordering::Relaxed), 0);
+
+        cache.flush().unwrap();
+
+        assert_eq!(cache.count_delta.load(Ordering::Relaxed), 0);
+        assert_eq!(cache.amount_delta.load(Ordering::Relaxed), 0);
+    }
+
+    // ---------------------------------------------------------------
+    // 11. flush includes pending tip
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_flush_includes_pending_tip() {
+        let cache = make_cache(10);
+        let tip_hash = make_block_hash(0xAA);
+
+        // Set tip via write_batch (needs a coin to trigger buffering path,
+        // but tip is set regardless).
+        let batch = StoreBatch {
+            tip: Some(tip_hash),
+            coin_puts: vec![(make_outpoint(0x60, 0), make_coin(1, 1))],
+            ..Default::default()
+        };
+        cache.write_batch(batch).unwrap();
+
+        // pending_tip is set, but inner store doesn't have it yet.
+        // After flush, inner should have it, and get_tip reads through.
+        cache.flush().unwrap();
+        assert_eq!(cache.get_tip().unwrap(), tip_hash);
+    }
+
+    // ---------------------------------------------------------------
+    // 12. flush includes pending non-coin batch data
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_flush_includes_pending_batch() {
+        let cache = make_cache(10);
+        let bh = make_block_hash(0xBB);
+        let entry = make_test_entry(10);
+
+        // Batch with coins + block_index — non-coins are buffered.
+        let mut batch = StoreBatch::default();
+        batch.coin_puts.push((make_outpoint(0x70, 0), make_coin(1, 1)));
+        batch.block_index_puts.push((bh, entry.clone()));
+        cache.write_batch(batch).unwrap();
+
+        // Before flush: block_index is in overlay cache but check that
+        // after flush it's persisted by clearing the overlay and re-reading.
+        cache.flush().unwrap();
+        cache.block_index_cache.lock().unwrap().clear();
+        let recovered = cache.get_block_index(&bh).unwrap();
+        assert_eq!(recovered.height, 10);
+    }
+
+    // ---------------------------------------------------------------
+    // 13. Non-coin batch passes through immediately
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_no_coin_batch_passes_through() {
+        let cache = make_cache(10);
+        let bh = make_block_hash(0xCC);
+        let entry = make_test_entry(20);
+
+        // Batch with block_index only (no coins).
+        let mut batch = StoreBatch::default();
+        batch.block_index_puts.push((bh, entry.clone()));
+        cache.write_batch(batch).unwrap();
+
+        // Should be in inner immediately — clear overlay and verify.
+        cache.block_index_cache.lock().unwrap().clear();
+        let recovered = cache.get_block_index(&bh).unwrap();
+        assert_eq!(recovered.height, 20);
+    }
+
+    // ---------------------------------------------------------------
+    // 14. Coin batch buffers non-coin data until flush
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_coin_batch_buffers_non_coins() {
+        let cache = make_cache(10);
+        let bh = make_block_hash(0xDD);
+        let entry = make_test_entry(30);
+
+        // Batch with coins + block_index.
+        let mut batch = StoreBatch::default();
+        batch.coin_puts.push((make_outpoint(0x80, 0), make_coin(1, 1)));
+        batch.block_index_puts.push((bh, entry.clone()));
+        cache.write_batch(batch).unwrap();
+
+        // Before flush: clear overlay — inner should NOT have it yet.
+        cache.block_index_cache.lock().unwrap().clear();
+        // The inner doesn't have the block_index entry yet because it was buffered.
+        // get_block_index falls through to inner, which returns None.
+        // But wait — CoinCache::get_block_index checks overlay first, then inner.
+        // We cleared the overlay, so it should go to inner. Since the batch with
+        // coins buffers non-coin ops, inner should not have it.
+        assert!(cache.inner.get_block_index(&bh).is_none());
+
+        cache.flush().unwrap();
+
+        // After flush, inner should have it.
+        let recovered = cache.inner.get_block_index(&bh).unwrap();
+        assert_eq!(recovered.height, 30);
+    }
+
+    // ---------------------------------------------------------------
+    // 15. Overlay block_index cache
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_overlay_block_index() {
+        let cache = make_cache(10);
+        let bh = make_block_hash(0xE0);
+        let entry = make_test_entry(40);
+
+        let mut batch = StoreBatch::default();
+        batch.block_index_puts.push((bh, entry.clone()));
+        cache.write_batch(batch).unwrap();
+
+        let recovered = cache.get_block_index(&bh).unwrap();
+        assert_eq!(recovered.height, 40);
+    }
+
+    // ---------------------------------------------------------------
+    // 16. Overlay height_hash cache
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_overlay_height_hash() {
+        let cache = make_cache(10);
+        let bh = make_block_hash(0xE1);
+
+        let mut batch = StoreBatch::default();
+        batch.height_hash_puts.push((100, bh));
+        cache.write_batch(batch).unwrap();
+
+        assert_eq!(cache.get_block_hash_by_height(100).unwrap(), bh);
+    }
+
+    // ---------------------------------------------------------------
+    // 17. Overlay undo cache
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_overlay_undo() {
+        let cache = make_cache(10);
+        let bh = make_block_hash(0xE2);
+        let undo = UndoData {
+            spent_coins: vec![(
+                OutPointSer {
+                    txid: [0xAB; 32],
+                    vout: 0,
+                },
+                make_coin(42, 1),
+            )],
+        };
+
+        let mut batch = StoreBatch::default();
+        batch.undo_puts.push((bh, undo));
+        cache.write_batch(batch).unwrap();
+
+        let recovered = cache.get_undo(&bh).unwrap();
+        assert_eq!(recovered.spent_coins.len(), 1);
+        assert_eq!(recovered.spent_coins[0].1.amount, 42);
+    }
+
+    // ---------------------------------------------------------------
+    // 18. Empty flush is a no-op (no error)
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_empty_flush_is_noop() {
+        let cache = make_cache(10);
+        // Flush with nothing dirty — should succeed without error.
+        cache.flush().unwrap();
+        assert_eq!(cache.dirty_count(), 0);
+    }
+
+    // ---------------------------------------------------------------
+    // 19. clear_chainstate clears everything
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_clear_chainstate() {
+        let cache = make_cache(10);
+        let op = make_outpoint(0xF0, 0);
+
+        // Add a coin, set tip, add block_index overlay.
+        let mut batch = StoreBatch::default();
+        batch.coin_puts.push((op, make_coin(500, 1)));
+        batch.tip = Some(make_block_hash(0xF1));
+        batch.block_index_puts.push((make_block_hash(0xF2), make_test_entry(50)));
+        batch.height_hash_puts.push((50, make_block_hash(0xF2)));
+        cache.write_batch(batch).unwrap();
+
+        assert!(cache.has_coin(&op));
+        assert_eq!(cache.dirty_count(), 1);
+
+        cache.clear_chainstate().unwrap();
+
+        assert!(!cache.has_coin(&op));
+        assert_eq!(cache.dirty_count(), 0);
+        assert_eq!(cache.count_delta.load(Ordering::Relaxed), 0);
+        assert_eq!(cache.amount_delta.load(Ordering::Relaxed), 0);
+        assert!(cache.get_tip().is_none());
+        // Overlay caches are cleared.
+        assert!(cache.block_index_cache.lock().unwrap().is_empty());
+        assert!(cache.height_hash_cache.lock().unwrap().is_empty());
+        assert!(cache.undo_cache.lock().unwrap().is_empty());
+    }
+
+    // ---------------------------------------------------------------
+    // 20. default() uses 450 MB budget
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_default_uses_450mb() {
+        let cache = CoinCache::default(Box::new(InMemoryStore::new()));
+        // 450 MB budget: clean_cap = (450_000_000 * 80 / 100) / 200 = 1_800_000
+        // flush_threshold = 1_800_000 / 4 = 450_000
+        assert_eq!(cache.flush_threshold(), 450_000);
+    }
+
+    // ---------------------------------------------------------------
+    // 21. Larger dbcache produces larger flush_threshold
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_dbcache_scales_caps() {
+        let small = make_cache(100);
+        let large = make_cache(1000);
+        assert!(
+            large.flush_threshold() > small.flush_threshold(),
+            "large.flush_threshold ({}) should be > small.flush_threshold ({})",
+            large.flush_threshold(),
+            small.flush_threshold()
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // 22. coin_count() = inner count + delta
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_coin_count_with_delta() {
+        let inner = InMemoryStore::new();
+
+        // Seed inner with 3 coins.
+        let mut seed = StoreBatch::default();
+        seed.coin_puts.push((make_outpoint(0xA0, 0), make_coin(100, 1)));
+        seed.coin_puts.push((make_outpoint(0xA1, 0), make_coin(200, 2)));
+        seed.coin_puts.push((make_outpoint(0xA2, 0), make_coin(300, 3)));
+        inner.write_batch(seed).unwrap();
+
+        let cache = CoinCache::new(Box::new(inner), 10);
+        assert_eq!(cache.coin_count(), 3);
+
+        // Add one dirty coin.
+        let mut b1 = StoreBatch::default();
+        b1.coin_puts.push((make_outpoint(0xA3, 0), make_coin(400, 4)));
+        cache.write_batch(b1).unwrap();
+        assert_eq!(cache.coin_count(), 4);
+
+        // Remove one coin.
+        let mut b2 = StoreBatch::default();
+        b2.coin_removes.push((make_outpoint(0xA0, 0), 100));
+        cache.write_batch(b2).unwrap();
+        assert_eq!(cache.coin_count(), 3);
+    }
+
+    // ---------------------------------------------------------------
+    // 23. coin_total_amount() = inner total + delta
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_coin_total_amount_with_delta() {
+        let inner = InMemoryStore::new();
+
+        // Seed inner with total = 100 + 200 = 300.
+        let mut seed = StoreBatch::default();
+        seed.coin_puts.push((make_outpoint(0xB0, 0), make_coin(100, 1)));
+        seed.coin_puts.push((make_outpoint(0xB1, 0), make_coin(200, 2)));
+        inner.write_batch(seed).unwrap();
+
+        let cache = CoinCache::new(Box::new(inner), 10);
+        assert_eq!(cache.coin_total_amount(), 300);
+
+        // Add coin with amount 500.
+        let mut b1 = StoreBatch::default();
+        b1.coin_puts.push((make_outpoint(0xB2, 0), make_coin(500, 3)));
+        cache.write_batch(b1).unwrap();
+        assert_eq!(cache.coin_total_amount(), 800);
+
+        // Remove coin with spent_amount 200.
+        let mut b2 = StoreBatch::default();
+        b2.coin_removes.push((make_outpoint(0xB1, 0), 200));
+        cache.write_batch(b2).unwrap();
+        assert_eq!(cache.coin_total_amount(), 600);
+    }
+}

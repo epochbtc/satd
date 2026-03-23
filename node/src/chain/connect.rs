@@ -1249,4 +1249,198 @@ mod tests {
             assert_eq!(*bh, block_hash, "tx_index entry should point to the block hash");
         }
     }
+
+    // ── BIP 34/113/68 activation-height tests ────────────────────────
+
+    #[test]
+    fn test_bip34_activation_heights() {
+        assert_eq!(bip34_activation_height(Network::Bitcoin), 227_931);
+        assert_eq!(bip34_activation_height(Network::Testnet), 21_111);
+        assert_eq!(bip34_activation_height(Network::Signet), 1);
+        assert_eq!(bip34_activation_height(Network::Regtest), 1);
+    }
+
+    #[test]
+    fn test_bip113_activation_heights() {
+        assert_eq!(bip113_activation_height(Network::Bitcoin), 419_328);
+        assert_eq!(bip113_activation_height(Network::Testnet), 770_112);
+        assert_eq!(bip113_activation_height(Network::Signet), 1);
+        assert_eq!(bip113_activation_height(Network::Regtest), 1);
+    }
+
+    #[test]
+    fn test_bip34_not_enforced_before_activation() {
+        // On Bitcoin mainnet, BIP 34 activates at height 227,931.
+        // Before that, a coinbase with the WRONG height should still succeed.
+        let (store, outpoint, _) = make_test_store_with_coin(10, false);
+        let height = 100u32; // well below 227,931
+
+        // Build a block whose coinbase encodes height 999 (wrong), but at height 100
+        // on Network::Bitcoin this should be fine because BIP 34 is not active yet.
+        let coinbase_script = bitcoin::script::Builder::new()
+            .push_int(999) // Wrong height!
+            .push_opcode(bitcoin::opcodes::OP_FALSE)
+            .into_script();
+        let coinbase = Transaction {
+            version: Version(2),
+            lock_time: bitcoin::blockdata::locktime::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: coinbase_script,
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(block_subsidy(height)),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+
+        let spending_tx = Transaction {
+            version: Version(2),
+            lock_time: bitcoin::blockdata::locktime::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: outpoint,
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_000_000),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+
+        let mut block = Block {
+            header: Header {
+                version: bitcoin::block::Version::from_consensus(0x2000_0000),
+                prev_blockhash: BlockHash::all_zeros(),
+                merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+                time: 1_700_000_000,
+                bits: CompactTarget::from_consensus(0x207f_ffff),
+                nonce: 0,
+            },
+            txdata: vec![coinbase, spending_tx],
+        };
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+
+        let result = connect_block(
+            &store,
+            &block,
+            height,
+            &[0u8; 32],
+            default_pos(),
+            &NoopVerifier,
+            0,
+            Network::Bitcoin,
+        );
+        assert!(
+            result.is_ok(),
+            "BIP 34 should not be enforced before activation height on mainnet, got {:?}",
+            result.err(),
+        );
+    }
+
+    #[test]
+    fn test_locktime_time_uses_block_time_before_bip113() {
+        // On Bitcoin mainnet, BIP 113 activates at height 419,328.
+        // Before activation, time-based locktimes compare against block.header.time,
+        // NOT MTP. Create a scenario where block time > locktime but MTP < locktime:
+        // this should succeed pre-activation (block time is used).
+        let (store, outpoint, _) = make_test_store_with_coin(10, false);
+        let height = 100u32; // well below 419,328
+        let locktime = 500_000_100u32; // time-based (>= 500_000_000)
+
+        let mut block = make_block_spending(outpoint, height, 2, 0, locktime);
+        // Set block time above the locktime so block.header.time >= locktime
+        block.header.time = 500_000_200;
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+
+        // Pass MTP < locktime. Pre-BIP113, this doesn't matter because
+        // block.header.time is used instead of MTP.
+        let mtp = 500_000_000; // below locktime
+
+        let result = connect_block(
+            &store,
+            &block,
+            height,
+            &[0u8; 32],
+            default_pos(),
+            &NoopVerifier,
+            mtp,
+            Network::Bitcoin,
+        );
+        assert!(
+            result.is_ok(),
+            "Pre-BIP113, time-based locktime should compare against block time, got {:?}",
+            result.err(),
+        );
+    }
+
+    #[test]
+    fn test_bip68_not_enforced_before_activation() {
+        // On Bitcoin mainnet, BIP 68 activates at height 419,328 (same as BIP 113).
+        // Before that, sequence locks should NOT be enforced even if the lock is not met.
+        let coin_height = 50u32;
+        let block_height = 100u32; // well below 419,328
+        let (store, outpoint, _) = make_test_store_with_coin(coin_height, false);
+
+        // Sequence requires 200 blocks relative to coin height.
+        // height - coin_height = 100 - 50 = 50 < 200, so the lock is NOT met.
+        // But BIP 68 is not active on mainnet at height 100, so this should succeed.
+        let seq = 200u32; // height-based, requires 200 blocks
+        let block = make_block_spending(outpoint, block_height, 2, seq, 0);
+
+        let result = connect_block(
+            &store,
+            &block,
+            block_height,
+            &[0u8; 32],
+            default_pos(),
+            &NoopVerifier,
+            0,
+            Network::Bitcoin,
+        );
+        assert!(
+            result.is_ok(),
+            "BIP 68 should not be enforced before activation height on mainnet, got {:?}",
+            result.err(),
+        );
+    }
+
+    #[test]
+    fn test_coinbase_height_nonminimal_push() {
+        // Early BIP 34 blocks sometimes used non-minimal pushes: 4-byte push
+        // for a height that fits in 3 bytes. decode_coinbase_height should
+        // decode the value correctly regardless.
+        // Height 100,000 = 0x0186A0, fits in 3 bytes.
+        // Non-minimal: encoded as 4-byte push (0x04) with a trailing zero byte.
+        let bytes = [0x04, 0xA0, 0x86, 0x01, 0x00];
+        assert_eq!(
+            decode_coinbase_height(&bytes),
+            Some(100_000),
+            "Non-minimal 4-byte push for 3-byte height should decode correctly",
+        );
+    }
+
+    #[test]
+    fn test_coinbase_height_5_byte_push() {
+        // 5-byte push: decode_coinbase_height uses only the first 4 bytes for
+        // the height (u32), so the 5th byte is extra nonce / padding.
+        // Height = 1 (0x01), encoded as 5-byte push.
+        let bytes = [0x05, 0x01, 0x00, 0x00, 0x00, 0xFF];
+        assert_eq!(
+            decode_coinbase_height(&bytes),
+            Some(1),
+            "5-byte push should decode height from first 4 bytes",
+        );
+
+        // Height = 0x01020304 = 16,909,060
+        let bytes2 = [0x05, 0x04, 0x03, 0x02, 0x01, 0xAB];
+        assert_eq!(
+            decode_coinbase_height(&bytes2),
+            Some(0x01020304),
+            "5-byte push should decode height from first 4 bytes (larger value)",
+        );
+    }
 }

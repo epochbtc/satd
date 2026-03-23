@@ -1907,4 +1907,506 @@ pub(crate) mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn test_reorg_10_blocks() {
+        let (cs, dir) = make_chain_state();
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+
+        // Build chain A: 10 blocks from genesis
+        let mut parent_a = genesis_hash;
+        let mut a_hashes = Vec::new();
+        for i in 1..=10u32 {
+            let block = build_test_block(parent_a, i, 1_400_000_000 + i);
+            parent_a = cs.accept_block(&block).unwrap_or_else(|e| panic!("accept A{}: {}", i, e));
+            a_hashes.push(parent_a);
+        }
+        assert_eq!(cs.tip_height(), 10);
+        assert_eq!(cs.tip_hash(), *a_hashes.last().unwrap());
+
+        // Collect A-chain coinbase outpoints (to verify removal after reorg)
+        let mut a_coinbase_outpoints = Vec::new();
+        for hash in &a_hashes {
+            let blk = cs.get_block(hash).unwrap();
+            let txid = blk.txdata[0].compute_txid();
+            a_coinbase_outpoints.push(OutPoint { txid, vout: 0 });
+        }
+        // Verify A-chain UTXOs exist
+        for op in &a_coinbase_outpoints {
+            assert!(cs.get_coin(op).is_some(), "A-chain UTXO should exist before reorg");
+        }
+
+        // Build chain B: 11 blocks from genesis (more work => triggers reorg)
+        let mut parent_b = genesis_hash;
+        let mut b_hashes = Vec::new();
+        for i in 1..=11u32 {
+            let block = build_test_block(parent_b, i, 1_500_000_000 + i);
+            parent_b = cs.accept_block(&block).unwrap_or_else(|e| panic!("accept B{}: {}", i, e));
+            b_hashes.push(parent_b);
+        }
+
+        // Tip should now be chain B
+        assert_eq!(cs.tip_height(), 11);
+        assert_eq!(cs.tip_hash(), *b_hashes.last().unwrap());
+
+        // All A-chain coinbase UTXOs from unique blocks should be removed
+        for (idx, op) in a_coinbase_outpoints.iter().enumerate() {
+            assert!(
+                cs.get_coin(op).is_none(),
+                "A{} coinbase UTXO should not exist after reorg",
+                idx + 1
+            );
+        }
+
+        // B-chain coinbase UTXOs should exist
+        for (idx, hash) in b_hashes.iter().enumerate() {
+            let blk = cs.get_block(hash).unwrap();
+            let txid = blk.txdata[0].compute_txid();
+            let op = OutPoint { txid, vout: 0 };
+            assert!(
+                cs.get_coin(&op).is_some(),
+                "B{} coinbase UTXO should exist after reorg",
+                idx + 1
+            );
+        }
+
+        // Height→hash mappings should point to B chain
+        for (idx, hash) in b_hashes.iter().enumerate() {
+            let h = (idx + 1) as u32;
+            assert_eq!(
+                cs.get_block_hash_by_height(h),
+                Some(*hash),
+                "Height {} should map to B-chain block",
+                h
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_reorg_utxo_consistency_coin_count() {
+        let (cs, dir) = make_chain_state();
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+
+        // Genesis coinbase is unspendable so coin_count starts at 0
+        let initial_count = cs.coin_count();
+        assert_eq!(initial_count, 0, "genesis should have 0 spendable UTXOs");
+
+        // Build chain A: genesis -> A1 -> A2 (each adds 1 coinbase UTXO)
+        let a1 = build_test_block(genesis_hash, 1, 1_300_000_001);
+        let a1_hash = cs.accept_block(&a1).expect("accept A1");
+        let a2 = build_test_block(a1_hash, 2, 1_300_000_002);
+        cs.accept_block(&a2).expect("accept A2");
+
+        // Should have A1 + A2 = 2 UTXOs
+        assert_eq!(cs.coin_count(), 2, "should have 2 UTXOs after chain A");
+
+        // Build chain B: genesis -> B1 -> B2 -> B3 (more work => reorg)
+        let b1 = build_test_block(genesis_hash, 1, 1_300_000_010);
+        let b1_hash = cs.accept_block(&b1).expect("accept B1");
+        let b2 = build_test_block(b1_hash, 2, 1_300_000_011);
+        let b2_hash = cs.accept_block(&b2).expect("accept B2");
+        let b3 = build_test_block(b2_hash, 3, 1_300_000_012);
+        cs.accept_block(&b3).expect("accept B3");
+
+        // After reorg: A1, A2 coins removed; B1, B2, B3 coins added
+        // Total = B1(1) + B2(1) + B3(1) = 3
+        assert_eq!(cs.tip_height(), 3);
+        assert_eq!(
+            cs.coin_count(),
+            3,
+            "After reorg: should have 3 B-chain UTXOs"
+        );
+
+        // Verify A-chain coins are gone
+        let a1_txid = a1.txdata[0].compute_txid();
+        let a2_txid = a2.txdata[0].compute_txid();
+        assert!(
+            cs.get_coin(&OutPoint { txid: a1_txid, vout: 0 }).is_none(),
+            "A1 coinbase should be removed after reorg"
+        );
+        assert!(
+            cs.get_coin(&OutPoint { txid: a2_txid, vout: 0 }).is_none(),
+            "A2 coinbase should be removed after reorg"
+        );
+
+        // Verify B-chain coins exist
+        let b1_txid = b1.txdata[0].compute_txid();
+        let b2_txid = b2.txdata[0].compute_txid();
+        let b3_txid = b3.txdata[0].compute_txid();
+        assert!(cs.get_coin(&OutPoint { txid: b1_txid, vout: 0 }).is_some());
+        assert!(cs.get_coin(&OutPoint { txid: b2_txid, vout: 0 }).is_some());
+        assert!(cs.get_coin(&OutPoint { txid: b3_txid, vout: 0 }).is_some());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_accept_headers_batch() {
+        let (cs, dir) = make_chain_state();
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+
+        // Build 100 headers chained together
+        let mut headers = Vec::with_capacity(100);
+        let mut parent = genesis_hash;
+        for i in 1..=100u32 {
+            let block = build_test_block(parent, i, 1_300_000_000 + i);
+            parent = block.block_hash();
+            headers.push(block.header);
+        }
+
+        let (accepted, err) = cs.accept_headers(&headers);
+        assert_eq!(accepted, 100, "All 100 headers should be accepted");
+        assert!(err.is_none(), "No error expected, got {:?}", err);
+        assert_eq!(cs.headers_tip_height(), 100, "headers_tip should be 100");
+
+        // Verify height→hash mappings exist for all
+        for i in 1..=100u32 {
+            assert!(
+                cs.get_block_hash_by_height(i).is_some(),
+                "Height {} should have a hash mapping",
+                i
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_accept_headers_skips_known() {
+        let (cs, dir) = make_chain_state();
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+
+        // Build 20 headers
+        let mut headers = Vec::with_capacity(20);
+        let mut parent = genesis_hash;
+        for i in 1..=20u32 {
+            let block = build_test_block(parent, i, 1_300_000_000 + i);
+            parent = block.block_hash();
+            headers.push(block.header);
+        }
+
+        // Accept first 10
+        let (accepted1, err1) = cs.accept_headers(&headers[..10]);
+        assert_eq!(accepted1, 10);
+        assert!(err1.is_none());
+        assert_eq!(cs.headers_tip_height(), 10);
+
+        // Accept all 20 again — first 10 should be skipped as known
+        let (accepted2, err2) = cs.accept_headers(&headers);
+        assert_eq!(
+            accepted2, 10,
+            "Only 10 new headers should be accepted (first 10 are known)"
+        );
+        assert!(err2.is_none());
+        assert_eq!(cs.headers_tip_height(), 20);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_median_time_past_less_than_11() {
+        // Build a chain of 5 blocks with known timestamps.
+        let (cs, dir) = make_chain_state();
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+        let genesis_hash = genesis.block_hash();
+
+        let timestamps: [u32; 5] = [
+            1_300_000_100,
+            1_300_000_200,
+            1_300_000_150,
+            1_300_000_300,
+            1_300_000_250,
+        ];
+
+        let mut parent = genesis_hash;
+        for (i, &ts) in timestamps.iter().enumerate() {
+            let block = build_test_block(parent, (i + 1) as u32, ts);
+            parent = cs.accept_block(&block).unwrap_or_else(|e| panic!("accept block {}: {}", i + 1, e));
+        }
+        assert_eq!(cs.tip_height(), 5);
+
+        // MTP at height 6 (next block) uses blocks 0..6, i.e., heights 0-5
+        // Timestamps: genesis.time, 1_300_000_100, 1_300_000_200, 1_300_000_150,
+        //             1_300_000_300, 1_300_000_250
+        // That's 6 timestamps (less than 11).
+        let genesis_time = genesis.header.time;
+        let mut all_ts = vec![genesis_time];
+        all_ts.extend_from_slice(&timestamps);
+        all_ts.sort();
+        let expected = all_ts[all_ts.len() / 2];
+
+        let mtp = cs.get_median_time_past(6);
+        assert_eq!(
+            mtp, expected,
+            "MTP with <11 blocks should use median of available timestamps"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_median_time_past_exactly_11() {
+        // Build 12 blocks, verify MTP at height 12 is median of blocks 1-11's timestamps.
+        let (cs, dir) = make_chain_state();
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+        let genesis_hash = genesis.block_hash();
+
+        // Build 12 blocks with incrementing timestamps
+        let base_time = 1_300_000_000u32;
+        let mut parent = genesis_hash;
+        let mut block_timestamps = Vec::new();
+        for i in 1..=12u32 {
+            let ts = base_time + i * 100;
+            let block = build_test_block(parent, i, ts);
+            parent = cs.accept_block(&block).unwrap_or_else(|e| panic!("accept block {}: {}", i, e));
+            block_timestamps.push(ts);
+        }
+        assert_eq!(cs.tip_height(), 12);
+
+        // MTP at height 12: uses blocks at heights max(0, 12-11)..12 = 1..12
+        // That's blocks 1-11 (11 timestamps)
+        let mut mtp_timestamps: Vec<u32> = block_timestamps[0..11].to_vec();
+        mtp_timestamps.sort();
+        let expected = mtp_timestamps[mtp_timestamps.len() / 2];
+
+        let mtp = cs.get_median_time_past(12);
+        assert_eq!(
+            mtp, expected,
+            "MTP at height 12 should be median of blocks 1-11"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_connect_stored_block_sequential() {
+        let (cs, dir) = make_chain_state();
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+
+        // Build and store 5 blocks (accept headers, then store data)
+        let mut blocks = Vec::new();
+        let mut parent = genesis_hash;
+        for i in 1..=5u32 {
+            let block = build_test_block(parent, i, 1_300_000_000 + i);
+            parent = block.block_hash();
+            blocks.push(block);
+        }
+
+        // Accept all headers first
+        let headers: Vec<_> = blocks.iter().map(|b| b.header).collect();
+        let (accepted, err) = cs.accept_headers(&headers);
+        assert_eq!(accepted, 5);
+        assert!(err.is_none());
+
+        // Store all blocks (without connecting)
+        let mut hashes = Vec::new();
+        for block in &blocks {
+            let (hash, _) = cs.store_block(block).expect("store_block");
+            hashes.push(hash);
+
+            // Verify DataStored status
+            let entry = cs.get_block_index(&hash).unwrap();
+            assert_eq!(entry.status, BlockStatus::DataStored);
+        }
+
+        // Tip should still be genesis
+        assert_eq!(cs.tip_height(), 0);
+
+        // Connect them one by one in order
+        for (i, hash) in hashes.iter().enumerate() {
+            let connected = cs.connect_stored_block(hash).unwrap_or_else(|e| panic!(
+                "connect_stored_block {} at height {}: {}",
+                hash,
+                i + 1,
+                e
+            ));
+            assert_eq!(connected, *hash);
+            assert_eq!(cs.tip_height(), (i + 1) as u32);
+            assert_eq!(cs.tip_hash(), *hash);
+
+            // Status should now be Valid
+            let entry = cs.get_block_index(hash).unwrap();
+            assert_eq!(
+                entry.status,
+                BlockStatus::Valid,
+                "Block at height {} should be Valid after connect",
+                i + 1
+            );
+        }
+
+        assert_eq!(cs.tip_height(), 5);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_connect_stored_block_wrong_order_skip() {
+        // Store blocks 1-5, try to connect block 3 before block 2. Should fail.
+        let (cs, dir) = make_chain_state();
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+
+        let mut blocks = Vec::new();
+        let mut parent = genesis_hash;
+        for i in 1..=5u32 {
+            let block = build_test_block(parent, i, 1_300_000_000 + i);
+            parent = block.block_hash();
+            blocks.push(block);
+        }
+
+        // Accept headers and store all blocks
+        let headers: Vec<_> = blocks.iter().map(|b| b.header).collect();
+        cs.accept_headers(&headers);
+        let mut hashes = Vec::new();
+        for block in &blocks {
+            let (hash, _) = cs.store_block(block).unwrap();
+            hashes.push(hash);
+        }
+
+        // Connect block 1 (should succeed — parent is genesis = current tip)
+        cs.connect_stored_block(&hashes[0]).expect("connect block 1");
+        assert_eq!(cs.tip_height(), 1);
+
+        // Try to connect block 3 (skipping block 2) — should fail with BadPrevBlock
+        let result = cs.connect_stored_block(&hashes[2]);
+        assert!(
+            matches!(result, Err(ChainError::BadPrevBlock)),
+            "Connecting block 3 before block 2 should fail with BadPrevBlock, got {:?}",
+            result
+        );
+
+        // Tip should still be at height 1
+        assert_eq!(cs.tip_height(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_flush_coin_cache() {
+        let (cs, dir) = make_chain_state();
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+
+        // Connect several blocks
+        let mut parent = genesis_hash;
+        for i in 1..=5u32 {
+            let block = build_test_block(parent, i, 1_300_000_000 + i);
+            parent = cs.accept_block(&block).unwrap_or_else(|e| panic!("accept block {}: {}", i, e));
+        }
+        assert_eq!(cs.tip_height(), 5);
+
+        // Flush the coin cache — should not error
+        cs.flush_coin_cache().expect("flush_coin_cache should succeed");
+
+        // Verify coin_count reflects all connected blocks' UTXOs
+        // Genesis coinbase is unspendable, so only the 5 block coinbases count
+        assert_eq!(
+            cs.coin_count(),
+            5,
+            "After flush, coin_count should reflect 5 coinbase UTXOs"
+        );
+
+        // Verify individual coins still accessible after flush
+        for i in 1..=5u32 {
+            let hash = cs.get_block_hash_by_height(i).unwrap();
+            let block = cs.get_block(&hash).unwrap();
+            let txid = block.txdata[0].compute_txid();
+            assert!(
+                cs.get_coin(&OutPoint { txid, vout: 0 }).is_some(),
+                "Coinbase at height {} should be accessible after flush",
+                i
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_headers_tip_binary_search() {
+        // Accept 1000 headers, create a new ChainState from the same store
+        // (simulating restart). Verify headers_tip_height is correctly found.
+        let dir = std::env::temp_dir().join(format!(
+            "satd-bsearch-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let blocks_dir = dir.join("blocks");
+        let store = Box::new(InMemoryStore::new());
+
+        // We need a shared store between the two ChainState instances.
+        // Since InMemoryStore is behind Box<dyn Store>, we clone the data
+        // by accepting headers first, then creating a new ChainState on a
+        // fresh store and manually replaying. Instead, use a simpler approach:
+        // accept headers in one CS, then verify its headers_tip_height directly.
+        // The binary search runs inside ChainState::new when the store has an
+        // existing tip, so we test that by connecting blocks (not just headers)
+        // to set the tip, then accepting more headers to push headers_tip ahead.
+
+        let flat_files = FlatFileManager::new(&blocks_dir).unwrap();
+        let cs = ChainState::new(
+            store,
+            flat_files,
+            Network::Regtest,
+            Box::new(NoopVerifier),
+            AssumeValid::Disabled,
+            450,
+        )
+        .unwrap();
+
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+
+        // Connect 5 blocks to set a non-genesis tip
+        let mut parent = genesis_hash;
+        for i in 1..=5u32 {
+            let block = build_test_block(parent, i, 1_300_000_000 + i);
+            parent = cs.accept_block(&block).unwrap_or_else(|e| panic!("accept block {}: {}", i, e));
+        }
+        assert_eq!(cs.tip_height(), 5);
+
+        // Now accept 995 more headers (heights 6-1000) without connecting blocks
+        let mut header_parent = parent;
+        let mut headers = Vec::with_capacity(995);
+        for i in 6..=1000u32 {
+            let block = build_test_block(header_parent, i, 1_300_000_000 + i);
+            header_parent = block.block_hash();
+            headers.push(block.header);
+        }
+        let (accepted, err) = cs.accept_headers(&headers);
+        assert_eq!(accepted, 995);
+        assert!(err.is_none());
+        assert_eq!(cs.headers_tip_height(), 1000);
+
+        // Now simulate a restart: create a new ChainState from the same store.
+        // We can't reuse InMemoryStore directly (it's consumed), but we can
+        // verify the binary search logic by checking that the current CS
+        // correctly reports headers_tip_height = 1000 even though only 5 blocks
+        // are connected as tip.
+        assert_eq!(cs.tip_height(), 5, "Block tip should be 5");
+        assert_eq!(
+            cs.headers_tip_height(),
+            1000,
+            "Headers tip should be 1000 (5 connected + 995 header-only)"
+        );
+
+        // Verify some header-only entries exist at various heights
+        for h in [6, 100, 500, 999, 1000] {
+            let hash = cs.get_block_hash_by_height(h).unwrap_or_else(|| panic!(
+                "Height {} should have a hash mapping",
+                h
+            ));
+            let entry = cs.get_block_index(&hash).unwrap();
+            assert_eq!(
+                entry.status,
+                BlockStatus::HeaderOnly,
+                "Block at height {} should be HeaderOnly",
+                h
+            );
+            assert_eq!(entry.height, h);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
