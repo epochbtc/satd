@@ -136,7 +136,8 @@ impl PeerManager {
         network: Network,
         shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Arc<Self> {
-        Self::with_config(chain_state, mempool, fee_estimator, network, shutdown, 0, 125, 86400, None, None)
+        let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+        Self::with_config(chain_state, mempool, fee_estimator, network, shutdown, 0, 125, 86400, None, None, workers)
     }
 
     pub fn with_prune(
@@ -147,9 +148,11 @@ impl PeerManager {
         shutdown: tokio::sync::watch::Receiver<bool>,
         prune_target_mb: u64,
     ) -> Arc<Self> {
-        Self::with_config(chain_state, mempool, fee_estimator, network, shutdown, prune_target_mb, 125, 86400, None, None)
+        let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+        Self::with_config(chain_state, mempool, fee_estimator, network, shutdown, prune_target_mb, 125, 86400, None, None, workers)
     }
 
+    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     pub fn with_config(
         chain_state: Arc<ChainState>,
@@ -162,6 +165,7 @@ impl PeerManager {
         ban_duration_secs: u64,
         proxy: Option<String>,
         onion_proxy: Option<String>,
+        prefetch_workers: usize,
     ) -> Arc<Self> {
         let (event_tx, event_rx) = mpsc::channel(4096);
         let (block_tx, block_rx) = mpsc::unbounded_channel();
@@ -226,7 +230,7 @@ impl PeerManager {
         let fe = fee_estimator;
         let prune_mb = prune_target_mb;
         std::thread::spawn(move || {
-            Self::block_processor(block_rx, cs, mp, fe, prune_mb, connect_signal, ibd);
+            Self::block_processor(block_rx, cs, mp, fe, prune_mb, connect_signal, ibd, prefetch_workers);
         });
 
         mgr
@@ -1128,6 +1132,7 @@ impl PeerManager {
 
     /// Block processing runs on a dedicated OS thread (not tokio) to avoid
     /// blocking the async event loop during CPU-intensive validation.
+    #[allow(clippy::too_many_arguments)]
     fn block_processor(
         mut rx: mpsc::UnboundedReceiver<bitcoin::Block>,
         chain_state: Arc<ChainState>,
@@ -1136,6 +1141,7 @@ impl PeerManager {
         prune_target_mb: u64,
         connect_signal: Arc<(std::sync::Mutex<bool>, Condvar)>,
         ibd: Arc<std::sync::RwLock<Option<IbdScheduler>>>,
+        prefetch_workers: usize,
     ) {
         let mut last_log_height: u32 = 0;
         let mut last_prune_height: u32 = 0;
@@ -1155,6 +1161,7 @@ impl PeerManager {
                 &connect_signal,
                 &ibd,
                 keep_blocks,
+                prefetch_workers,
                 &mut last_log_height,
                 &mut last_prune_height,
             );
@@ -1173,6 +1180,7 @@ impl PeerManager {
                     &connect_signal,
                     &ibd,
                     keep_blocks,
+                    prefetch_workers,
                     &mut last_log_height,
                     &mut last_prune_height,
                 );
@@ -1249,12 +1257,14 @@ impl PeerManager {
     /// Uses a prefetch pipeline to read and pre-process upcoming blocks in
     /// background threads while the connect thread works on the current block.
     /// Sleeps (via condvar) when the next block isn't downloaded yet.
+    #[allow(clippy::too_many_arguments)]
     fn ibd_connect_loop(
         chain_state: &ChainState,
         _fee_estimator: &FeeEstimator,
         connect_signal: &Arc<(std::sync::Mutex<bool>, Condvar)>,
         ibd: &Arc<std::sync::RwLock<Option<IbdScheduler>>>,
         keep_blocks: u32,
+        prefetch_workers: usize,
         last_log_height: &mut u32,
         last_prune_height: &mut u32,
     ) {
@@ -1268,7 +1278,7 @@ impl PeerManager {
             store,
             chain_state.blocks_dir().to_path_buf(),
             chain_state.tip_height() + 1,
-            4,  // worker threads
+            prefetch_workers,
             32, // lookahead blocks
         );
 

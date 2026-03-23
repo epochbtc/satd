@@ -238,6 +238,7 @@ async fn main() {
         config.bantime,
         config.proxy.clone(),
         config.onion.clone(),
+        config.prefetch_workers,
     );
 
     if config.prune > 0 {
