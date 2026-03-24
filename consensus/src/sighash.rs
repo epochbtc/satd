@@ -3,7 +3,7 @@
 #![allow(clippy::nonminimal_bool)]
 
 use bitcoin::hashes::Hash;
-use bitcoin::sighash::{EcdsaSighashType, Prevouts, SighashCache, TapSighashType};
+use bitcoin::sighash::{self, EcdsaSighashType, Prevouts, SighashCache, TapSighashType};
 use bitcoin::secp256k1::{self, Message, Secp256k1};
 use bitcoin::{Amount, Script, ScriptBuf, Sequence, Transaction, TxOut};
 
@@ -166,24 +166,63 @@ impl SignatureChecker for TxSignatureChecker<'_> {
         let mut cache = SighashCache::new(self.tx);
         let prevouts = Prevouts::All(self.prev_outputs);
 
+        // Build annex from ExecData if present
+        let annex_data: Option<Vec<u8>> = if exec_data.annex_init && exec_data.annex_present {
+            // We need the original annex bytes for sighash computation.
+            // ExecData only stores the hash. We need the raw annex from the witness.
+            // For now, reconstruct from the transaction's witness data.
+            let witness = &self.tx.input[self.input_index].witness;
+            let wit_items: Vec<&[u8]> = witness.iter().collect();
+            if wit_items.len() >= 2 {
+                let last = wit_items[wit_items.len() - 1];
+                if !last.is_empty() && last[0] == 0x50 {
+                    Some(last.to_vec())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let annex = annex_data
+            .as_deref()
+            .and_then(|bytes| sighash::Annex::new(bytes).ok());
+
         let sighash = match sig_version {
             SigVersion::Taproot => {
-                // Key-path spending
+                // Key-path spending: no leaf hash or codeseparator
+                let mut engine = bitcoin::TapSighash::engine();
                 cache
-                    .taproot_key_spend_signature_hash(self.input_index, &prevouts, tap_sighash_type)
-                    .map_err(|_| ScriptError::SchnorrSigHashtype)?
-            }
-            SigVersion::Tapscript => {
-                // Script-path spending
-                let leaf_hash = bitcoin::TapLeafHash::from_byte_array(exec_data.tapleaf_hash);
-                cache
-                    .taproot_script_spend_signature_hash(
+                    .taproot_encode_signing_data_to(
+                        &mut engine,
                         self.input_index,
                         &prevouts,
-                        leaf_hash,
+                        annex,
+                        None, // no leaf hash for key-path
                         tap_sighash_type,
                     )
-                    .map_err(|_| ScriptError::SchnorrSigHashtype)?
+                    .map_err(|_| ScriptError::SchnorrSigHashtype)?;
+                bitcoin::TapSighash::from_engine(engine)
+            }
+            SigVersion::Tapscript => {
+                // Script-path spending: include leaf hash and codeseparator position
+                let leaf_hash = bitcoin::TapLeafHash::from_byte_array(exec_data.tapleaf_hash);
+                let codesep_pos = exec_data.codeseparator_pos;
+                let mut engine = bitcoin::TapSighash::engine();
+                cache
+                    .taproot_encode_signing_data_to(
+                        &mut engine,
+                        self.input_index,
+                        &prevouts,
+                        annex,
+                        Some((leaf_hash, codesep_pos)),
+                        tap_sighash_type,
+                    )
+                    .map_err(|_| ScriptError::SchnorrSigHashtype)?;
+                bitcoin::TapSighash::from_engine(engine)
             }
             _ => unreachable!(),
         };
