@@ -52,8 +52,10 @@ impl SignatureChecker for TxSignatureChecker<'_> {
         script_code: &[u8],
         sig_version: SigVersion,
     ) -> bool {
-        // Parse pubkey
-        let pubkey = match bitcoin::PublicKey::from_slice(pubkey_bytes) {
+        // Parse pubkey using secp256k1 directly (not bitcoin::PublicKey)
+        // because bitcoin::PublicKey rejects hybrid keys (0x06/0x07 prefix)
+        // which are valid for consensus.
+        let pubkey = match secp256k1::PublicKey::from_slice(pubkey_bytes) {
             Ok(pk) => pk,
             Err(_) => return false,
         };
@@ -66,11 +68,17 @@ impl SignatureChecker for TxSignatureChecker<'_> {
         let hash_type_byte = sig[sig.len() - 1];
         let sig_bytes = &sig[..sig.len() - 1];
 
-        // Parse DER signature
-        let ecdsa_sig = match secp256k1::ecdsa::Signature::from_der(sig_bytes) {
+        // Parse DER signature using lax parser (consensus-compatible).
+        // Bitcoin Core uses secp256k1_ecdsa_signature_parse_der_lax for
+        // verification, which accepts slightly non-canonical DER encodings.
+        let mut ecdsa_sig = match secp256k1::ecdsa::Signature::from_der_lax(sig_bytes) {
             Ok(s) => s,
             Err(_) => return false,
         };
+        // Normalize to low-S form before verification. Bitcoin Core's
+        // CPubKey::Verify calls secp256k1_ecdsa_signature_normalize before
+        // secp256k1_ecdsa_verify. Without this, high-S signatures fail.
+        ecdsa_sig.normalize_s();
 
         // Compute sighash
         let sighash_type = match EcdsaSighashType::from_consensus(hash_type_byte as u32) {
@@ -115,7 +123,7 @@ impl SignatureChecker for TxSignatureChecker<'_> {
         };
 
         self.secp
-            .verify_ecdsa(&msg, &ecdsa_sig, &pubkey.inner)
+            .verify_ecdsa(&msg, &ecdsa_sig, &pubkey)
             .is_ok()
     }
 
