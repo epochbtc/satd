@@ -369,6 +369,7 @@ name = "consensus"
 version = "0.1.0"
 dependencies = [
  "bitcoin",
+ "bitcoinconsensus",
  "hex",
  "ripemd",
  "serde",

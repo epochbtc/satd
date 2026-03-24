@@ -14,3 +14,4 @@ ripemd = "0.1"
 serde_json = { workspace = true }
 hex = { workspace = true }
 serde = { workspace = true }
+bitcoinconsensus = { workspace = true }
