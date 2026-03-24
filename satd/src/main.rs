@@ -239,6 +239,7 @@ async fn main() {
         config.proxy.clone(),
         config.onion.clone(),
         config.prefetch_workers,
+        config.max_ahead,
     );
 
     if config.prune > 0 {

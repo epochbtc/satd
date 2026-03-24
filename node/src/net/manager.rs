@@ -126,6 +126,8 @@ pub struct PeerManager {
     onion_proxy: Option<String>,
     /// Configured outbound .onion and hostname-based peer addresses for auto-reconnect.
     connect_peer_addrs: RwLock<Vec<PeerAddr>>,
+    /// Max blocks downloaded ahead of connect cursor during IBD.
+    max_ahead: u32,
 }
 
 impl PeerManager {
@@ -137,7 +139,7 @@ impl PeerManager {
         shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Arc<Self> {
         let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-        Self::with_config(chain_state, mempool, fee_estimator, network, shutdown, 0, 125, 86400, None, None, workers)
+        Self::with_config(chain_state, mempool, fee_estimator, network, shutdown, 0, 125, 86400, None, None, workers, 50_000)
     }
 
     pub fn with_prune(
@@ -149,7 +151,7 @@ impl PeerManager {
         prune_target_mb: u64,
     ) -> Arc<Self> {
         let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-        Self::with_config(chain_state, mempool, fee_estimator, network, shutdown, prune_target_mb, 125, 86400, None, None, workers)
+        Self::with_config(chain_state, mempool, fee_estimator, network, shutdown, prune_target_mb, 125, 86400, None, None, workers, 50_000)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -166,6 +168,7 @@ impl PeerManager {
         proxy: Option<String>,
         onion_proxy: Option<String>,
         prefetch_workers: usize,
+        max_ahead: u32,
     ) -> Arc<Self> {
         let (event_tx, event_rx) = mpsc::channel(4096);
         let (block_tx, block_rx) = mpsc::unbounded_channel();
@@ -175,7 +178,8 @@ impl PeerManager {
         let tip_height = chain_state.tip_height();
         let headers_tip_height = chain_state.headers_tip_height();
         let ibd_scheduler = if headers_tip_height > tip_height + 24 {
-            let mut sched = IbdScheduler::new(headers_tip_height, tip_height, &chain_state);
+            let effective_max_ahead = Self::resolve_max_ahead(max_ahead, headers_tip_height, tip_height);
+            let mut sched = IbdScheduler::new(headers_tip_height, tip_height, &chain_state, effective_max_ahead);
             // Scan for already-downloaded blocks (crash-resume)
             for h in (tip_height + 1)..=headers_tip_height {
                 if let Some(hash) = chain_state.get_block_hash_by_height(h)
@@ -222,6 +226,7 @@ impl PeerManager {
             proxy,
             onion_proxy,
             connect_peer_addrs: RwLock::new(Vec::new()),
+            max_ahead,
         });
 
         // Spawn block processing thread
@@ -230,10 +235,22 @@ impl PeerManager {
         let fe = fee_estimator;
         let prune_mb = prune_target_mb;
         std::thread::spawn(move || {
-            Self::block_processor(block_rx, cs, mp, fe, prune_mb, connect_signal, ibd, prefetch_workers);
+            Self::block_processor(block_rx, cs, mp, fe, prune_mb, connect_signal, ibd, prefetch_workers, max_ahead);
         });
 
         mgr
+    }
+
+    /// Resolve a max_ahead config value to an effective count.
+    /// Values > 1_000_000_000 encode a percentage: 1_000_000_000 + pct.
+    fn resolve_max_ahead(max_ahead: u32, target_height: u32, tip_height: u32) -> u32 {
+        if max_ahead > 1_000_000_000 {
+            let pct = max_ahead - 1_000_000_000;
+            let remaining = target_height.saturating_sub(tip_height);
+            (remaining as u64 * pct as u64 / 100) as u32
+        } else {
+            max_ahead
+        }
     }
 
     /// Register addresses for auto-reconnect.
@@ -1021,7 +1038,8 @@ impl PeerManager {
             if headers_tip > tip + 24 {
                 let mut ibd = self.ibd.write().unwrap();
                 if ibd.is_none() {
-                    let sched = IbdScheduler::new(headers_tip, tip, &self.chain_state);
+                    let effective_max_ahead = Self::resolve_max_ahead(self.max_ahead, headers_tip, tip);
+                    let sched = IbdScheduler::new(headers_tip, tip, &self.chain_state, effective_max_ahead);
                     let (_, _, pending, target) = sched.progress();
                     tracing::info!(
                         target_height = target,
@@ -1142,6 +1160,7 @@ impl PeerManager {
         connect_signal: Arc<(std::sync::Mutex<bool>, Condvar)>,
         ibd: Arc<std::sync::RwLock<Option<IbdScheduler>>>,
         prefetch_workers: usize,
+        max_ahead: u32,
     ) {
         let mut last_log_height: u32 = 0;
         let mut last_prune_height: u32 = 0;
@@ -1164,6 +1183,7 @@ impl PeerManager {
                 prefetch_workers,
                 &mut last_log_height,
                 &mut last_prune_height,
+                max_ahead,
             );
         }
 
@@ -1183,6 +1203,7 @@ impl PeerManager {
                     prefetch_workers,
                     &mut last_log_height,
                     &mut last_prune_height,
+                    max_ahead,
                 );
                 continue;
             }
@@ -1267,6 +1288,7 @@ impl PeerManager {
         prefetch_workers: usize,
         last_log_height: &mut u32,
         last_prune_height: &mut u32,
+        max_ahead: u32,
     ) {
         let mut connected_count = 0u64;
         let start_time = Instant::now();
@@ -1306,7 +1328,8 @@ impl PeerManager {
                         elapsed_secs = start_time.elapsed().as_secs(),
                         "IBD batch complete, starting next batch"
                     );
-                    let new_sched = IbdScheduler::new(headers_tip, tip_height, chain_state);
+                    let effective_max_ahead = Self::resolve_max_ahead(max_ahead, headers_tip, tip_height);
+                    let new_sched = IbdScheduler::new(headers_tip, tip_height, chain_state, effective_max_ahead);
                     *ibd.write().unwrap() = Some(new_sched);
                     connected_count = 0;
                     // Update prefetch cursor for the new batch

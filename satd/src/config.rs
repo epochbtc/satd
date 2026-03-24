@@ -58,6 +58,10 @@ pub struct Config {
     pub dbcache: usize,
     /// Number of IBD prefetch worker threads (default: CPU core count)
     pub prefetch_workers: usize,
+    /// Maximum blocks downloaded ahead of the connect cursor during IBD.
+    /// "all" = unlimited (u32::MAX), "N%" = percentage of remaining (encoded as 1_000_000_000 + pct),
+    /// N = fixed count.
+    pub max_ahead: u32,
     // MCP server
     pub mcp: bool,
     pub mcp_stdio: bool,
@@ -341,6 +345,21 @@ impl Config {
                 .prefetchworkers
                 .or_else(|| file_get("prefetchworkers").and_then(|v| v.parse().ok()))
                 .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)),
+            max_ahead: {
+                let raw = cli.maxahead
+                    .or_else(|| file_get("maxahead"))
+                    .unwrap_or_else(|| "50000".to_string());
+                if raw == "all" {
+                    u32::MAX
+                } else if raw.ends_with('%') {
+                    // Store as a sentinel — will be computed at scheduler creation time
+                    // Values > 1_000_000_000 are percentages encoded as 1_000_000_000 + pct
+                    let pct: u32 = raw.trim_end_matches('%').parse().unwrap_or(100);
+                    1_000_000_000 + pct.min(100)
+                } else {
+                    raw.parse().unwrap_or(50_000)
+                }
+            },
             server: cli.server
                 || file_get("server").and_then(|v| parse_bool(&v)).unwrap_or(false),
             daemon: cli.daemon
@@ -503,6 +522,9 @@ pub struct CliArgs {
     #[arg(long, value_name = "N", help = "Number of IBD prefetch worker threads (default: CPU core count)")]
     pub prefetchworkers: Option<usize>,
 
+    #[arg(long, value_name = "VALUE", help = "Max blocks ahead during IBD: number, 'N%', or 'all' (default: 50000)")]
+    pub maxahead: Option<String>,
+
     // MCP server flags
     #[arg(long, help = "Enable MCP (Model Context Protocol) server")]
     pub mcp: bool,
@@ -581,6 +603,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "daemon",
         "dbcache",
         "par",
+        "maxahead",
     ];
 
     args.into_iter()
@@ -804,6 +827,7 @@ rpcport=8332
             mcpstdio: None,
             mcpport: None,
             mcpbind: None,
+            maxahead: None,
         };
         let config = Config::from_cli(cli).unwrap();
         assert_eq!(config.network, Network::Regtest);
@@ -865,6 +889,7 @@ rpcport=8332
             mcpstdio: None,
             mcpport: None,
             mcpbind: None,
+            maxahead: None,
         };
         assert!(Config::from_cli(cli).is_err());
     }

@@ -37,4 +37,5 @@ exec "$SATD" \
     --port="$P2PPORT" \
     --txindex \
     --assumevalid=all \
+    --maxahead=all \
     "${CONNECT_ARGS[@]}"
