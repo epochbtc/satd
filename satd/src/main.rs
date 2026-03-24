@@ -8,7 +8,7 @@ use node::rpc::auth::RpcAuth;
 use node::storage::Store;
 use node::storage::redb_store::RedbStore;
 use node::storage::flatfile::FlatFileManager;
-use node::validation::script::ConsensusVerifier;
+use node::validation::script::{ConsensusVerifier, ShadowVerifier, ScriptVerifier};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -171,11 +171,17 @@ async fn main() {
 
     // Initialize chain state with script verification
     *startup_status.write().unwrap() = "Initializing chain state...".to_string();
+    let verifier: Box<dyn ScriptVerifier> = if config.shadow_consensus {
+        tracing::info!("Shadow consensus enabled: running Rust engine alongside C++ FFI");
+        Box::new(ShadowVerifier)
+    } else {
+        Box::new(ConsensusVerifier)
+    };
     let chain_state = match ChainState::new(
         store,
         flat_files,
         config.network,
-        Box::new(ConsensusVerifier),
+        verifier,
         assumevalid,
         config.dbcache as u64,
     ) {

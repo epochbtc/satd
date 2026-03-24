@@ -62,6 +62,8 @@ pub struct Config {
     /// "all" = unlimited (u32::MAX), "N%" = percentage of remaining (encoded as 1_000_000_000 + pct),
     /// N = fixed count.
     pub max_ahead: u32,
+    // Shadow consensus
+    pub shadow_consensus: bool,
     // MCP server
     pub mcp: bool,
     pub mcp_stdio: bool,
@@ -360,6 +362,8 @@ impl Config {
                     raw.parse().unwrap_or(50_000).max(1000)
                 }
             },
+            shadow_consensus: cli.shadow_consensus
+                || file_get("shadowconsensus").and_then(|v| parse_bool(&v)).unwrap_or(false),
             server: cli.server
                 || file_get("server").and_then(|v| parse_bool(&v)).unwrap_or(false),
             daemon: cli.daemon
@@ -524,6 +528,9 @@ pub struct CliArgs {
 
     #[arg(long, value_name = "VALUE", help = "Max blocks ahead during IBD: number, 'N%', or 'all' (default: 50000)")]
     pub maxahead: Option<String>,
+
+    #[arg(long, help = "Run Rust consensus engine in shadow mode alongside C++ FFI")]
+    pub shadow_consensus: bool,
 
     // MCP server flags
     #[arg(long, help = "Enable MCP (Model Context Protocol) server")]
