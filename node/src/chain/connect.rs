@@ -1,6 +1,6 @@
 use bitcoin::{Block, Network, OutPoint, Transaction, TxOut};
 use rayon::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::storage::blockindex::{BlockIndexEntry, BlockStatus, add_u256, work_for_bits};
 use crate::storage::coinview::Coin;
@@ -182,6 +182,34 @@ fn connect_block_inner(
     // Avoids O(n*m) linear scan of batch.coin_puts.
     let mut intra_block_coins: HashMap<OutPoint, Coin> = HashMap::new();
 
+    // --- Parallel UTXO pre-resolution for external inputs ---
+    // Identify inputs that spend coins from PREVIOUS blocks (not intra-block).
+    // These can be looked up in parallel since they're independent of this block's
+    // transaction ordering. ~65-85% of inputs are external at typical block heights.
+    let block_txids: HashSet<bitcoin::Txid> = block.txdata.iter()
+        .map(|tx| tx.compute_txid())
+        .collect();
+
+    let external_lookups: Vec<(usize, usize, OutPoint)> = block.txdata.iter()
+        .enumerate()
+        .flat_map(|(tx_idx, tx)| {
+            if tx.is_coinbase() {
+                return Vec::new();
+            }
+            tx.input.iter().enumerate()
+                .filter(|(_, input)| !block_txids.contains(&input.previous_output.txid))
+                .map(|(in_idx, input)| (tx_idx, in_idx, input.previous_output))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    let pre_resolved: HashMap<(usize, usize), Coin> = external_lookups
+        .par_iter()
+        .filter_map(|(tx_idx, in_idx, outpoint)| {
+            store.get_coin(outpoint).map(|coin| ((*tx_idx, *in_idx), coin))
+        })
+        .collect();
+
     // Process each transaction: resolve UTXOs sequentially, defer script verification
     for (tx_idx, tx) in block.txdata.iter().enumerate() {
         let is_coinbase = tx.is_coinbase();
@@ -237,12 +265,13 @@ fn connect_block_inner(
         let mut prev_outputs: Vec<TxOut> = Vec::new();
 
         if !is_coinbase {
-            for input in &tx.input {
+            for (in_idx, input) in tx.input.iter().enumerate() {
                 let outpoint = input.previous_output;
 
-                // Check that the UTXO exists (store first, then intra-block)
-                let coin = store
-                    .get_coin(&outpoint)
+                // Use pre-resolved coin if available (parallel lookup from above),
+                // otherwise fall back to store lookup (intra-block or cache miss).
+                let coin = pre_resolved.get(&(tx_idx, in_idx)).cloned()
+                    .or_else(|| store.get_coin(&outpoint))
                     .or_else(|| intra_block_coins.remove(&outpoint));
 
                 let coin = coin.ok_or(ConnectError::MissingOrSpentInput)?;

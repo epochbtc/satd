@@ -65,6 +65,7 @@ impl IbdScheduler {
         target_height: u32,
         current_tip: u32,
         chain_state: &ChainState,
+        max_ahead: u32,
     ) -> Self {
         let mut heights: Vec<u32> = ((current_tip + 1)..=target_height).collect();
         heights.shuffle(&mut rand::thread_rng());
@@ -85,10 +86,15 @@ impl IbdScheduler {
             downloaded: HashSet::new(),
             peer_slots: HashMap::new(),
             per_peer_limit: 128,
-            max_ahead: 50_000,
+            max_ahead,
             connect_cursor: current_tip,
             height_to_hash,
         }
+    }
+
+    /// Update the max-ahead window at runtime (e.g. for percentage recomputation).
+    pub fn set_max_ahead(&mut self, max_ahead: u32) {
+        self.max_ahead = max_ahead;
     }
 
     /// Assign blocks to a peer for download. Returns hashes to request via GetData.
@@ -437,7 +443,7 @@ mod tests {
         // Reset tip to 0 to simulate IBD (we have headers but no connected blocks)
         // Actually, accept_block connected them. Instead, create scheduler from 0 to 100
         // using the chain_state that has height_to_hash for 1..=100.
-        let mut sched = IbdScheduler::new(100, 0, &cs);
+        let mut sched = IbdScheduler::new(100, 0, &cs, 50_000);
 
         let h1 = sched.assign_blocks(1);
         let h2 = sched.assign_blocks(2);
@@ -457,7 +463,7 @@ mod tests {
     #[test]
     fn test_randomized_distribution() {
         let (cs, dir) = make_chain_state_with_headers(100);
-        let sched = IbdScheduler::new(100, 0, &cs);
+        let sched = IbdScheduler::new(100, 0, &cs, 50_000);
 
         // Check that pending is not in sequential order
         let heights: Vec<u32> = sched.pending.iter().copied().collect();
@@ -472,7 +478,7 @@ mod tests {
     #[test]
     fn test_peer_disconnect_reassigns() {
         let (cs, dir) = make_chain_state_with_headers(50);
-        let mut sched = IbdScheduler::new(50, 0, &cs);
+        let mut sched = IbdScheduler::new(50, 0, &cs, 50_000);
 
         let assigned = sched.assign_blocks(1);
         let assigned_count = assigned.len();
@@ -491,7 +497,7 @@ mod tests {
     #[test]
     fn test_stall_detection() {
         let (cs, dir) = make_chain_state_with_headers(50);
-        let mut sched = IbdScheduler::new(50, 0, &cs);
+        let mut sched = IbdScheduler::new(50, 0, &cs, 50_000);
 
         let _ = sched.assign_blocks(1);
 
@@ -513,8 +519,7 @@ mod tests {
     #[test]
     fn test_max_ahead_window() {
         let (cs, dir) = make_chain_state_with_headers(100);
-        let mut sched = IbdScheduler::new(100, 0, &cs);
-        sched.max_ahead = 20; // Small window for testing
+        let mut sched = IbdScheduler::new(100, 0, &cs, 20); // Small max_ahead for testing
 
         // Assign blocks — should stop at max_ahead
         let h1 = sched.assign_blocks(1);
@@ -531,7 +536,7 @@ mod tests {
     #[test]
     fn test_resume_partial_download() {
         let (cs, dir) = make_chain_state_with_headers(50);
-        let mut sched = IbdScheduler::new(50, 0, &cs);
+        let mut sched = IbdScheduler::new(50, 0, &cs, 50_000);
 
         // Mark some heights as already downloaded
         for h in 1..=20 {
@@ -555,7 +560,7 @@ mod tests {
     #[test]
     fn test_completion() {
         let (cs, dir) = make_chain_state_with_headers(10);
-        let mut sched = IbdScheduler::new(10, 0, &cs);
+        let mut sched = IbdScheduler::new(10, 0, &cs, 50_000);
 
         // Assign all blocks to peer 1
         let _ = sched.assign_blocks(1);
