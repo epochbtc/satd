@@ -228,7 +228,7 @@ pub fn verify_witness_program(
 
             if control.len() < TAPROOT_CONTROL_BASE_SIZE
                 || control.len() > TAPROOT_CONTROL_MAX_SIZE
-                || (control.len() - TAPROOT_CONTROL_BASE_SIZE) % TAPROOT_CONTROL_NODE_SIZE != 0
+                || !(control.len() - TAPROOT_CONTROL_BASE_SIZE).is_multiple_of(TAPROOT_CONTROL_NODE_SIZE)
             {
                 return Err(ScriptError::TaprootWrongControlSize);
             }

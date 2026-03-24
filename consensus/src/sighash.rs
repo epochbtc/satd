@@ -81,9 +81,7 @@ impl SignatureChecker for TxSignatureChecker<'_> {
         ecdsa_sig.normalize_s();
 
         // Compute sighash
-        let sighash_type = match EcdsaSighashType::from_consensus(hash_type_byte as u32) {
-            sht => sht,
-        };
+        let sighash_type = EcdsaSighashType::from_consensus(hash_type_byte as u32);
 
         let script_code_obj = Script::from_bytes(script_code);
 
@@ -118,9 +116,7 @@ impl SignatureChecker for TxSignatureChecker<'_> {
             _ => return false,
         };
 
-        let msg = match Message::from_digest(sighash) {
-            msg => msg,
-        };
+        let msg = Message::from_digest(sighash);
 
         self.secp
             .verify_ecdsa(&msg, &ecdsa_sig, &pubkey)
