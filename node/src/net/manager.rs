@@ -136,7 +136,8 @@ impl PeerManager {
         network: Network,
         shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Arc<Self> {
-        Self::with_config(chain_state, mempool, fee_estimator, network, shutdown, 0, 125, 86400, None, None)
+        let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+        Self::with_config(chain_state, mempool, fee_estimator, network, shutdown, 0, 125, 86400, None, None, workers)
     }
 
     pub fn with_prune(
@@ -147,9 +148,11 @@ impl PeerManager {
         shutdown: tokio::sync::watch::Receiver<bool>,
         prune_target_mb: u64,
     ) -> Arc<Self> {
-        Self::with_config(chain_state, mempool, fee_estimator, network, shutdown, prune_target_mb, 125, 86400, None, None)
+        let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+        Self::with_config(chain_state, mempool, fee_estimator, network, shutdown, prune_target_mb, 125, 86400, None, None, workers)
     }
 
+    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     pub fn with_config(
         chain_state: Arc<ChainState>,
@@ -162,6 +165,7 @@ impl PeerManager {
         ban_duration_secs: u64,
         proxy: Option<String>,
         onion_proxy: Option<String>,
+        prefetch_workers: usize,
     ) -> Arc<Self> {
         let (event_tx, event_rx) = mpsc::channel(4096);
         let (block_tx, block_rx) = mpsc::unbounded_channel();
@@ -226,7 +230,7 @@ impl PeerManager {
         let fe = fee_estimator;
         let prune_mb = prune_target_mb;
         std::thread::spawn(move || {
-            Self::block_processor(block_rx, cs, mp, fe, prune_mb, connect_signal, ibd);
+            Self::block_processor(block_rx, cs, mp, fe, prune_mb, connect_signal, ibd, prefetch_workers);
         });
 
         mgr
@@ -1128,6 +1132,7 @@ impl PeerManager {
 
     /// Block processing runs on a dedicated OS thread (not tokio) to avoid
     /// blocking the async event loop during CPU-intensive validation.
+    #[allow(clippy::too_many_arguments)]
     fn block_processor(
         mut rx: mpsc::UnboundedReceiver<bitcoin::Block>,
         chain_state: Arc<ChainState>,
@@ -1136,6 +1141,7 @@ impl PeerManager {
         prune_target_mb: u64,
         connect_signal: Arc<(std::sync::Mutex<bool>, Condvar)>,
         ibd: Arc<std::sync::RwLock<Option<IbdScheduler>>>,
+        prefetch_workers: usize,
     ) {
         let mut last_log_height: u32 = 0;
         let mut last_prune_height: u32 = 0;
@@ -1155,6 +1161,7 @@ impl PeerManager {
                 &connect_signal,
                 &ibd,
                 keep_blocks,
+                prefetch_workers,
                 &mut last_log_height,
                 &mut last_prune_height,
             );
@@ -1173,6 +1180,7 @@ impl PeerManager {
                     &connect_signal,
                     &ibd,
                     keep_blocks,
+                    prefetch_workers,
                     &mut last_log_height,
                     &mut last_prune_height,
                 );
@@ -1246,18 +1254,33 @@ impl PeerManager {
     }
 
     /// IBD connect loop: sequentially connect stored blocks from tip forward.
+    /// Uses a prefetch pipeline to read and pre-process upcoming blocks in
+    /// background threads while the connect thread works on the current block.
     /// Sleeps (via condvar) when the next block isn't downloaded yet.
+    #[allow(clippy::too_many_arguments)]
     fn ibd_connect_loop(
         chain_state: &ChainState,
         _fee_estimator: &FeeEstimator,
         connect_signal: &Arc<(std::sync::Mutex<bool>, Condvar)>,
         ibd: &Arc<std::sync::RwLock<Option<IbdScheduler>>>,
         keep_blocks: u32,
+        prefetch_workers: usize,
         last_log_height: &mut u32,
         last_prune_height: &mut u32,
     ) {
         let mut connected_count = 0u64;
         let start_time = Instant::now();
+
+        // Start the prefetch pipeline
+        let store: Arc<dyn crate::storage::Store + Send + Sync> =
+            chain_state.store_ref().clone();
+        let (prefetch_rx, prefetch_handle) = crate::chain::prefetch::start_prefetcher(
+            store,
+            chain_state.blocks_dir().to_path_buf(),
+            chain_state.tip_height() + 1,
+            prefetch_workers,
+            32, // lookahead blocks
+        );
 
         loop {
             let target_height = {
@@ -1286,6 +1309,8 @@ impl PeerManager {
                     let new_sched = IbdScheduler::new(headers_tip, tip_height, chain_state);
                     *ibd.write().unwrap() = Some(new_sched);
                     connected_count = 0;
+                    // Update prefetch cursor for the new batch
+                    prefetch_handle.advance_cursor(tip_height + 1);
                     // The run() loop will detect has_ibd=true within 2s and assign peers
                     continue;
                 }
@@ -1316,8 +1341,18 @@ impl PeerManager {
             };
 
             if chain_state.has_block_data(&hash) {
-                // Block is stored (DataStored or Valid), try to connect
-                match chain_state.connect_stored_block(&hash) {
+                // Try to get a pre-processed block from the prefetcher
+                let connect_result = match prefetch_rx.try_recv() {
+                    Ok(pre) if pre.height == next_height && pre.hash == hash => {
+                        chain_state.connect_preprocessed_block(pre)
+                    }
+                    _ => {
+                        // Prefetcher not ready or wrong block — fall back to normal path
+                        chain_state.connect_stored_block(&hash)
+                    }
+                };
+
+                match connect_result {
                     Ok(_) => {
                         connected_count += 1;
                         // Update scheduler connect cursor
@@ -1327,6 +1362,9 @@ impl PeerManager {
                                 s.connect_cursor_advanced(next_height);
                             }
                         }
+                        // Tell the prefetcher we've advanced
+                        prefetch_handle.advance_cursor(next_height + 1);
+
                         // Skip fee recording during IBD — the coins are already
                         // spent so get_coin returns None for every input, and fee
                         // data from old blocks is useless for estimation anyway.
@@ -1398,6 +1436,9 @@ impl PeerManager {
                 let _ = cvar.wait_timeout(ready, Duration::from_secs(1));
             }
         }
+
+        // Stop the prefetch pipeline
+        prefetch_handle.stop();
     }
 
     /// Extract fee rates from a connected block and feed them to the fee estimator.

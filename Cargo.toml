@@ -29,6 +29,7 @@ bitcoinconsensus = "0.106"
 rayon = "1.10"
 tokio-socks = "0.5"
 lru = "0.12"
+crossbeam-channel = "0.5"
 ratatui = { version = "0.29", features = ["crossterm"] }
 crossterm = "0.28"
 rmcp = { version = "1", features = ["server", "transport-io", "transport-streamable-http-server"] }

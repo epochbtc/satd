@@ -134,6 +134,38 @@ pub fn connect_block(
     median_time_past: u32,
     network: Network,
 ) -> Result<StoreBatch, ConnectError> {
+    connect_block_inner(store, block, height, parent_chainwork, flat_pos, script_verifier, median_time_past, network, None)
+}
+
+/// Connect a block with optional set of tx indices whose scripts were
+/// pre-verified by the prefetch pipeline. Those txs skip re-verification.
+#[allow(clippy::too_many_arguments)]
+pub fn connect_block_preverified(
+    store: &dyn Store,
+    block: &Block,
+    height: u32,
+    parent_chainwork: &[u8; 32],
+    flat_pos: FlatFilePos,
+    script_verifier: &dyn ScriptVerifier,
+    median_time_past: u32,
+    network: Network,
+    pre_verified_txs: &std::collections::HashSet<usize>,
+) -> Result<StoreBatch, ConnectError> {
+    connect_block_inner(store, block, height, parent_chainwork, flat_pos, script_verifier, median_time_past, network, Some(pre_verified_txs))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn connect_block_inner(
+    store: &dyn Store,
+    block: &Block,
+    height: u32,
+    parent_chainwork: &[u8; 32],
+    flat_pos: FlatFilePos,
+    script_verifier: &dyn ScriptVerifier,
+    median_time_past: u32,
+    network: Network,
+    pre_verified_txs: Option<&std::collections::HashSet<usize>>,
+) -> Result<StoreBatch, ConnectError> {
     let mut batch = StoreBatch::default();
     let mut undo = UndoData::default();
     let block_hash = block.block_hash();
@@ -151,7 +183,7 @@ pub fn connect_block(
     let mut intra_block_coins: HashMap<OutPoint, Coin> = HashMap::new();
 
     // Process each transaction: resolve UTXOs sequentially, defer script verification
-    for tx in &block.txdata {
+    for (tx_idx, tx) in block.txdata.iter().enumerate() {
         let is_coinbase = tx.is_coinbase();
         let txid = tx.compute_txid();
 
@@ -272,7 +304,13 @@ pub fn connect_block(
             total_fees += sum_inputs - sum_outputs;
 
             // Collect for parallel script verification
-            verify_queue.push((tx, prev_outputs));
+            // Skip if this tx was already pre-verified by the prefetch pipeline
+            let already_verified = pre_verified_txs
+                .map(|set| set.contains(&tx_idx))
+                .unwrap_or(false);
+            if !already_verified {
+                verify_queue.push((tx, prev_outputs));
+            }
         }
 
         // Add outputs as new UTXOs (skip genesis coinbase)

@@ -56,6 +56,8 @@ pub struct Config {
     pub pid: Option<String>,
     // Cache
     pub dbcache: usize,
+    /// Number of IBD prefetch worker threads (default: CPU core count)
+    pub prefetch_workers: usize,
     // MCP server
     pub mcp: bool,
     pub mcp_stdio: bool,
@@ -335,6 +337,10 @@ impl Config {
                 .dbcache
                 .or_else(|| file_get("dbcache").and_then(|v| v.parse().ok()))
                 .unwrap_or(450),
+            prefetch_workers: cli
+                .prefetchworkers
+                .or_else(|| file_get("prefetchworkers").and_then(|v| v.parse().ok()))
+                .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)),
             server: cli.server
                 || file_get("server").and_then(|v| parse_bool(&v)).unwrap_or(false),
             daemon: cli.daemon
@@ -493,6 +499,9 @@ pub struct CliArgs {
     // Cache
     #[arg(long, value_name = "MB", help = "Total UTXO write cache size in MB (default: 450)")]
     pub dbcache: Option<usize>,
+
+    #[arg(long, value_name = "N", help = "Number of IBD prefetch worker threads (default: CPU core count)")]
+    pub prefetchworkers: Option<usize>,
 
     // MCP server flags
     #[arg(long, help = "Enable MCP (Model Context Protocol) server")]
@@ -784,6 +793,7 @@ rpcport=8332
             server: false,
             daemon: false,
             dbcache: None,
+            prefetchworkers: None,
             par: None,
             proxy: None,
             onion: None,
@@ -844,6 +854,7 @@ rpcport=8332
             server: false,
             daemon: false,
             dbcache: None,
+            prefetchworkers: None,
             par: None,
             proxy: None,
             onion: None,
