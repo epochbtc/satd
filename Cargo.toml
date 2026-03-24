@@ -1,5 +1,5 @@
 [workspace]
-members = ["satd", "sat-cli", "node", "sat-tui", "mcp"]
+members = ["satd", "sat-cli", "node", "sat-tui", "mcp", "consensus"]
 resolver = "2"
 
 [workspace.package]
