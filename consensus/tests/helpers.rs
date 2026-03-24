@@ -46,6 +46,7 @@ pub fn parse_flags(flag_str: &str) -> u32 {
 }
 
 /// Parse a Bitcoin Core test vector error name to our ScriptError.
+#[allow(dead_code)]
 pub fn parse_expected_error(name: &str) -> ScriptError {
     ScriptError::from_test_name(name).unwrap_or_else(|| panic!("Unknown error name: {name}"))
 }
@@ -277,11 +278,10 @@ fn opcode_from_name(name: &str) -> Option<u8> {
         _ => {
             // Try SUCCESS opcodes: OP_SUCCESS80..OP_SUCCESS255 etc
             // These are 0x50, 0x62, 0x7e-0x7f, 0x89-0x8a, 0x8d-0x8e, 0x95-0x99, 0xbb-0xfe
-            if let Some(rest) = name.strip_prefix("SUCCESS") {
-                if let Ok(n) = rest.parse::<u16>() {
+            if let Some(rest) = name.strip_prefix("SUCCESS")
+                && let Ok(n) = rest.parse::<u16>() {
                     return Some(n as u8);
                 }
-            }
             None
         }
     }

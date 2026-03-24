@@ -89,7 +89,7 @@ fn spend_tx(credit: &Transaction, script_sig: &[u8], witness: &[Vec<u8>]) -> Tra
 fn hash160(data: &[u8]) -> [u8; 20] {
     let sha = sha2::Sha256::digest(data);
     let mut hasher = ripemd::Ripemd160::new();
-    ripemd::Digest::update(&mut hasher, &sha);
+    ripemd::Digest::update(&mut hasher, sha);
     ripemd::Digest::finalize(hasher).into()
 }
 
@@ -466,10 +466,7 @@ fn test_tapscript_with_annex() {
     let value = 100_000u64;
     let c = credit_tx(spk.as_bytes(), value);
 
-    let mut wit = Vec::new();
-    wit.push(leaf_script.clone()); // stack items: none (OP_1 pushes internally)
-    wit.push(control.clone());
-    wit.push(annex);
+    let wit = vec![leaf_script.clone(), control.clone(), annex];
 
     let tx = spend_tx(&c, &[], &wit);
     let prev = vec![c.output[0].clone()];
@@ -541,7 +538,7 @@ fn test_tapscript_validation_weight_exceeded() {
     leaf_script.extend_from_slice(&unknown_pubkey);
     leaf_script.push(0xac); // OP_CHECKSIG
 
-    let (spk, control) = build_single_leaf_taproot(&internal_key, &leaf_script);
+    let (_spk, _control) = build_single_leaf_taproot(&internal_key, &leaf_script);
 
     // Use CHECKSIGADD to keep consuming sigs without growing/shrinking the
     // stack unpredictably. CHECKSIGADD: (sig num pubkey -- num)

@@ -23,10 +23,11 @@ use helpers::{parse_flags, parse_script};
 use serde_json::Value;
 use std::collections::HashMap;
 
+type ScriptMap = HashMap<(Txid, u32), ScriptBuf>;
+type ValueMap = HashMap<(Txid, u32), i64>;
+
 /// Parse prevouts from a JSON array into maps keyed by OutPoint.
-fn parse_prevouts(
-    inputs: &[Value],
-) -> Option<(HashMap<(Txid, u32), ScriptBuf>, HashMap<(Txid, u32), i64>)> {
+fn parse_prevouts(inputs: &[Value]) -> Option<(ScriptMap, ValueMap)> {
     let mut script_map = HashMap::new();
     let mut value_map = HashMap::new();
 
@@ -271,7 +272,7 @@ fn test_tx_invalid() {
                                 && tx.input[0].previous_output == OutPoint::null();
                             if is_coinbase {
                                 let ss = tx.input[0].script_sig.len();
-                                ss < 2 || ss > 100
+                                !(2..=100).contains(&ss)
                             } else {
                                 false
                             }

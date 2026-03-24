@@ -158,7 +158,7 @@ fn test_p2sh_wrapped_taproot_is_anyone_can_spend() {
         use sha2::Digest;
         let sha = sha2::Sha256::digest(&p2tr);
         let mut hasher = ripemd::Ripemd160::new();
-        ripemd::Digest::update(&mut hasher, &sha);
+        ripemd::Digest::update(&mut hasher, sha);
         let h: [u8; 20] = ripemd::Digest::finalize(hasher).into();
         h
     };
@@ -262,10 +262,7 @@ fn test_nullfail_checkmultisig_nonempty_sig() {
     script_pubkey.push(0xae); // OP_CHECKMULTISIG
 
     // scriptSig: OP_0 (dummy) + non-empty sig (will fail verification)
-    let mut script_sig = Vec::new();
-    script_sig.push(0x00); // dummy element for CHECKMULTISIG bug
-    script_sig.push(0x01); // push 1 byte
-    script_sig.push(0xff); // non-empty invalid sig
+    let script_sig = vec![0x00, 0x01, 0xff]; // dummy, push-1, invalid sig byte
 
     let c = credit_tx(&script_pubkey, 50_000);
     let tx = spend_tx(&c, &script_sig, &[]);

@@ -249,7 +249,7 @@ fn test_verify_p2sh() {
         use sha2::Digest;
         let sha = sha2::Sha256::digest(&redeem);
         let mut hasher = ripemd::Ripemd160::new();
-        ripemd::Digest::update(&mut hasher, &sha);
+        ripemd::Digest::update(&mut hasher, sha);
         let h: [u8; 20] = ripemd::Digest::finalize(hasher).into();
         h
     };

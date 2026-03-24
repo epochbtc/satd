@@ -508,7 +508,7 @@ fn test_tapscript_altstack_hash() {
         use sha2::Digest;
         let sha = sha2::Sha256::digest(data);
         let mut hasher = ripemd::Ripemd160::new();
-        ripemd::Digest::update(&mut hasher, &sha);
+        ripemd::Digest::update(&mut hasher, sha);
         let h: [u8; 20] = ripemd::Digest::finalize(hasher).into();
         h
     };

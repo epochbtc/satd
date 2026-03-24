@@ -15,7 +15,7 @@ mod helpers;
 use bitcoin::absolute::LockTime;
 use bitcoin::consensus::Encodable;
 use bitcoin::hashes::{sha256, Hash, HashEngine};
-use bitcoin::secp256k1::{self, Keypair, Scalar, Secp256k1, SecretKey, XOnlyPublicKey, Parity};
+use bitcoin::secp256k1::{Keypair, Scalar, Secp256k1, SecretKey, XOnlyPublicKey, Parity};
 use bitcoin::transaction::Version;
 use bitcoin::{
     Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness,

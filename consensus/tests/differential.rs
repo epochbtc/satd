@@ -258,7 +258,10 @@ fn differential_script_tests() {
 // Differential test: tx_valid.json
 // =========================================================================
 
-fn parse_prevouts_map(inputs: &[Value]) -> Option<(HashMap<(Txid, u32), Vec<u8>>, HashMap<(Txid, u32), i64>)> {
+type DiffScriptMap = HashMap<(Txid, u32), Vec<u8>>;
+type DiffValueMap = HashMap<(Txid, u32), i64>;
+
+fn parse_prevouts_map(inputs: &[Value]) -> Option<(DiffScriptMap, DiffValueMap)> {
     let mut script_map = HashMap::new();
     let mut value_map = HashMap::new();
     for input in inputs {
