@@ -221,8 +221,9 @@ impl SignatureChecker for TxSignatureChecker<'_> {
     fn check_sequence(&self, sequence: &ScriptNum) -> bool {
         let tx_sequence = self.tx.input[self.input_index].sequence.0;
 
-        // Tx version must be >= 2 for BIP68
-        if self.tx.version.0 < 2 {
+        // Tx version must be >= 2 for BIP68.
+        // Bitcoin Core uses uint32_t for version, so the comparison is unsigned.
+        if (self.tx.version.0 as u32) < 2 {
             return false;
         }
 

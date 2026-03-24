@@ -76,52 +76,50 @@ pub fn execute_witness_script(
 
 /// Scan a tapscript for OP_SUCCESSx opcodes. If found, immediately succeed
 /// (or fail if DISCOURAGE_OP_SUCCESS flag is set).
+///
+/// Matches Bitcoin Core's OP_SUCCESSx pre-scan in ExecuteWitnessScript.
+/// Walks the script using GetOp semantics; if a GetOp fails (truncated push),
+/// returns None (not OP_SUCCESSx — EvalScript will catch the parse error).
 fn scan_for_op_success(script: &[u8], script_flags: u32) -> Option<Result<(), ScriptError>> {
     let mut pc = 0;
     while pc < script.len() {
         let opcode = script[pc];
         pc += 1;
 
-        // Skip push data
+        // Advance past push data
         if opcode <= 75 {
             pc += opcode as usize;
-            continue;
-        }
-        if opcode == 0x4c {
+        } else if opcode == 0x4c {
             // OP_PUSHDATA1
             if pc >= script.len() {
-                return Some(Err(ScriptError::BadOpcode));
+                return None; // truncated — let EvalScript handle it
             }
-            pc += 1 + script[pc - 1 + 1] as usize; // fix: re-read at correct offset
-            // Actually let me just properly advance
-        }
-        // For OP_SUCCESSx detection we don't need perfect parsing; just check opcode values
-        if is_op_success(opcode) {
+            let n = script[pc] as usize;
+            pc += 1 + n;
+        } else if opcode == 0x4d {
+            // OP_PUSHDATA2
+            if pc + 1 >= script.len() {
+                return None;
+            }
+            let n = script[pc] as usize | ((script[pc + 1] as usize) << 8);
+            pc += 2 + n;
+        } else if opcode == 0x4e {
+            // OP_PUSHDATA4
+            if pc + 3 >= script.len() {
+                return None;
+            }
+            let n = script[pc] as usize
+                | ((script[pc + 1] as usize) << 8)
+                | ((script[pc + 2] as usize) << 16)
+                | ((script[pc + 3] as usize) << 24);
+            pc += 4 + n;
+        } else if is_op_success(opcode) {
             if flags::has_flag(script_flags, flags::VERIFY_DISCOURAGE_OP_SUCCESS) {
                 return Some(Err(ScriptError::DiscourageOpSuccess));
             }
             return Some(Ok(()));
         }
-
-        // Skip push data bytes (simple version for OP_SUCCESSx scanning)
-        match opcode {
-            0x4c if pc < script.len() => {
-                let n = script[pc] as usize;
-                pc += 1 + n;
-            }
-            0x4d if pc + 1 < script.len() => {
-                let n = script[pc] as usize | ((script[pc + 1] as usize) << 8);
-                pc += 2 + n;
-            }
-            0x4e if pc + 3 < script.len() => {
-                let n = script[pc] as usize
-                    | ((script[pc + 1] as usize) << 8)
-                    | ((script[pc + 2] as usize) << 16)
-                    | ((script[pc + 3] as usize) << 24);
-                pc += 4 + n;
-            }
-            _ => {}
-        }
+        // else: non-push, non-SUCCESS opcode — just continue
     }
     None
 }
