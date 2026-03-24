@@ -357,7 +357,7 @@ impl Config {
                     let pct: u32 = raw.trim_end_matches('%').parse().unwrap_or(100);
                     1_000_000_000 + pct.min(100)
                 } else {
-                    raw.parse().unwrap_or(50_000)
+                    raw.parse().unwrap_or(50_000).max(1000)
                 }
             },
             server: cli.server
