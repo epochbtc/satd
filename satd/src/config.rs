@@ -3,6 +3,48 @@ use clap::Parser;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+/// Consensus engine selection.
+///
+/// Controls which script verification engine is used:
+/// - `cpp`: C++ libbitcoinconsensus FFI only (current default)
+/// - `rust`: Pure Rust consensus engine only (not yet production-ready)
+/// - `rust-shadow`: Both engines, cpp authoritative, log mismatches
+/// - `cpp-shadow`: Both engines, rust authoritative, log mismatches
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsensusEngine {
+    /// C++ libbitcoinconsensus FFI (default, eventually deprecated).
+    Cpp,
+    /// Pure Rust consensus engine (not yet validated for production).
+    Rust,
+    /// Both engines: cpp is authoritative, rust runs in shadow, mismatches logged.
+    RustShadow,
+    /// Both engines: rust is authoritative, cpp runs in shadow, mismatches logged.
+    CppShadow,
+}
+
+impl ConsensusEngine {
+    fn from_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "cpp" => Some(Self::Cpp),
+            "rust" => Some(Self::Rust),
+            "rust-shadow" => Some(Self::RustShadow),
+            "cpp-shadow" => Some(Self::CppShadow),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for ConsensusEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cpp => write!(f, "cpp"),
+            Self::Rust => write!(f, "rust"),
+            Self::RustShadow => write!(f, "rust-shadow"),
+            Self::CppShadow => write!(f, "cpp-shadow"),
+        }
+    }
+}
+
 /// Resolved node configuration after merging CLI args, config file, and defaults.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -62,8 +104,8 @@ pub struct Config {
     /// "all" = unlimited (u32::MAX), "N%" = percentage of remaining (encoded as 1_000_000_000 + pct),
     /// N = fixed count.
     pub max_ahead: u32,
-    // Shadow consensus
-    pub shadow_consensus: bool,
+    /// Consensus engine selection.
+    pub consensus: ConsensusEngine,
     // MCP server
     pub mcp: bool,
     pub mcp_stdio: bool,
@@ -362,8 +404,15 @@ impl Config {
                     raw.parse().unwrap_or(50_000).max(1000)
                 }
             },
-            shadow_consensus: cli.shadow_consensus
-                || file_get("shadowconsensus").and_then(|v| parse_bool(&v)).unwrap_or(false),
+            consensus: {
+                let raw = cli.consensus
+                    .or_else(|| file_get("consensus"))
+                    .unwrap_or_else(|| "rust-shadow".to_string());
+                ConsensusEngine::from_str(&raw).unwrap_or_else(|| {
+                    eprintln!("Warning: unknown consensus engine '{}', using 'cpp'", raw);
+                    ConsensusEngine::Cpp
+                })
+            },
             server: cli.server
                 || file_get("server").and_then(|v| parse_bool(&v)).unwrap_or(false),
             daemon: cli.daemon
@@ -529,8 +578,8 @@ pub struct CliArgs {
     #[arg(long, value_name = "VALUE", help = "Max blocks ahead during IBD: number, 'N%', or 'all' (default: 50000)")]
     pub maxahead: Option<String>,
 
-    #[arg(long, help = "Run Rust consensus engine in shadow mode alongside C++ FFI")]
-    pub shadow_consensus: bool,
+    #[arg(long, value_name = "ENGINE", help = "Consensus engine: cpp, rust, rust-shadow, cpp-shadow (default: rust-shadow)")]
+    pub consensus: Option<String>,
 
     // MCP server flags
     #[arg(long, help = "Enable MCP (Model Context Protocol) server")]
@@ -835,7 +884,7 @@ rpcport=8332
             mcpport: None,
             mcpbind: None,
             maxahead: None,
-            shadow_consensus: false,
+            consensus: None,
         };
         let config = Config::from_cli(cli).unwrap();
         assert_eq!(config.network, Network::Regtest);
@@ -898,7 +947,7 @@ rpcport=8332
             mcpport: None,
             mcpbind: None,
             maxahead: None,
-            shadow_consensus: false,
+            consensus: None,
         };
         assert!(Config::from_cli(cli).is_err());
     }

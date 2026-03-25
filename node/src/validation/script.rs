@@ -147,12 +147,21 @@ impl ScriptVerifier for RustVerifier {
     }
 }
 
-/// Shadow verifier: runs both C++ FFI and Rust engines, compares results,
-/// always returns the C++ result for consensus safety.
+/// Shadow verifier: runs two engines, compares results, returns the
+/// primary engine's result. Mismatches are logged at ERROR level.
 ///
-/// Any mismatch is logged at ERROR level with full transaction details
-/// for offline debugging.
-pub struct ShadowVerifier;
+/// Use `ShadowVerifier::new(primary, shadow)` to configure which engine
+/// is authoritative and which runs in shadow mode.
+pub struct ShadowVerifier {
+    primary: Box<dyn ScriptVerifier>,
+    shadow: Box<dyn ScriptVerifier>,
+}
+
+impl ShadowVerifier {
+    pub fn new(primary: Box<dyn ScriptVerifier>, shadow: Box<dyn ScriptVerifier>) -> Self {
+        Self { primary, shadow }
+    }
+}
 
 impl ScriptVerifier for ShadowVerifier {
     fn verify_transaction(
@@ -160,35 +169,27 @@ impl ScriptVerifier for ShadowVerifier {
         tx: &Transaction,
         prev_outputs: &[TxOut],
     ) -> Result<(), ScriptError> {
-        // Run C++ FFI (authoritative)
-        let cpp_result = ConsensusVerifier.verify_transaction(tx, prev_outputs);
+        let primary_result = self.primary.verify_transaction(tx, prev_outputs);
+        let shadow_result = self.shadow.verify_transaction(tx, prev_outputs);
 
-        // Run Rust engine (shadow)
-        let rust_result = RustVerifier.verify_transaction(tx, prev_outputs);
-
-        // Compare results
-        match (&cpp_result, &rust_result) {
-            (Ok(()), Ok(())) => {} // Both agree: valid
-            (Err(_), Err(_)) => {} // Both agree: invalid
+        match (&primary_result, &shadow_result) {
+            (Ok(()), Ok(())) | (Err(_), Err(_)) => {} // agree
             (Ok(()), Err(e)) => {
-                // CRITICAL: Rust engine rejected something C++ accepted
                 tracing::error!(
-                    "SHADOW MISMATCH: C++ accepted but Rust REJECTED: {} (txid={})",
+                    "SHADOW MISMATCH: primary accepted but shadow REJECTED: {} (txid={})",
                     e,
                     tx.compute_txid(),
                 );
             }
             (Err(e), Ok(())) => {
-                // Rust engine accepted something C++ rejected
                 tracing::error!(
-                    "SHADOW MISMATCH: C++ REJECTED but Rust accepted: {} (txid={})",
+                    "SHADOW MISMATCH: primary REJECTED but shadow accepted: {} (txid={})",
                     e,
                     tx.compute_txid(),
                 );
             }
         }
 
-        // Always return C++ result for consensus safety
-        cpp_result
+        primary_result
     }
 }
