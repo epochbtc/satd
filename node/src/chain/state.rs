@@ -185,8 +185,18 @@ impl ChainState {
 
         let parent_work = [0u8; 32];
         let noop = NoopVerifier; // Genesis has no scripts to verify
-        let batch =
-            connect::connect_block(&*store, &genesis, 0, &parent_work, flat_pos, &noop, 0, network)?;
+        let batch = connect::connect_block(&connect::ConnectParams {
+            store: &*store,
+            block: &genesis,
+            height: 0,
+            parent_chainwork: &parent_work,
+            flat_pos,
+            script_verifier: &noop,
+            median_time_past: 0,
+            network,
+            pre_verified_txs: None,
+            num_threads: 1,
+        })?;
         store.write_batch(batch)?;
 
         Ok(Self {
@@ -551,30 +561,28 @@ impl ChainState {
 
         // Connect block using the pre-fetched data.
         // Wins: flat file I/O eliminated, cache warmed, pre-verified scripts skipped.
-        let batch = if pre.script_verified_txs.is_empty() {
-            connect::connect_block(
-                &*self.store,
-                &pre.block,
-                pre.height,
-                &pre.parent.chainwork,
-                pre.flat_pos,
-                base_verifier,
-                pre.mtp,
-                self.network,
-            )?
+        //
+        // Only use pre-verified scripts when we're skipping scripts entirely
+        // (assumevalid mode). When the authoritative verifier runs, we must
+        // not bypass it — especially in shadow modes where both engines need
+        // to see every tx.
+        let pre_verified = if use_noop && !pre.script_verified_txs.is_empty() {
+            Some(&pre.script_verified_txs)
         } else {
-            connect::connect_block_preverified(
-                &*self.store,
-                &pre.block,
-                pre.height,
-                &pre.parent.chainwork,
-                pre.flat_pos,
-                base_verifier,
-                pre.mtp,
-                self.network,
-                &pre.script_verified_txs,
-            )?
+            None
         };
+        let batch = connect::connect_block(&connect::ConnectParams {
+            store: &*self.store,
+            block: &pre.block,
+            height: pre.height,
+            parent_chainwork: &pre.parent.chainwork,
+            flat_pos: pre.flat_pos,
+            script_verifier: base_verifier,
+            median_time_past: pre.mtp,
+            network: self.network,
+            pre_verified_txs: pre_verified,
+            num_threads: std::thread::available_parallelism().map(|n| n.get().min(8)).unwrap_or(4),
+        })?;
 
         // Atomic commit
         self.store.write_batch(batch)?;
@@ -741,16 +749,18 @@ impl ChainState {
 
         // Connect block
         let mtp = self.get_median_time_past(entry.height);
-        let batch = connect::connect_block(
-            &*self.store,
-            &block,
-            entry.height,
-            &parent.chainwork,
+        let batch = connect::connect_block(&connect::ConnectParams {
+            store: &*self.store,
+            block: &block,
+            height: entry.height,
+            parent_chainwork: &parent.chainwork,
             flat_pos,
-            verifier,
-            mtp,
-            self.network,
-        )?;
+            script_verifier: verifier,
+            median_time_past: mtp,
+            network: self.network,
+            pre_verified_txs: None,
+            num_threads: std::thread::available_parallelism().map(|n| n.get().min(8)).unwrap_or(4),
+        })?;
 
         // Atomic commit
         self.store.write_batch(batch)?;
@@ -797,9 +807,18 @@ impl ChainState {
                 if use_noop { &noop } else { &*self.script_verifier };
 
             let mtp = self.get_median_time_past(height);
-            let batch = connect::connect_block(
-                &*self.store, &block, height, &parent.chainwork, flat_pos, verifier, mtp, self.network,
-            )?;
+            let batch = connect::connect_block(&connect::ConnectParams {
+                store: &*self.store,
+                block: &block,
+                height,
+                parent_chainwork: &parent.chainwork,
+                flat_pos,
+                script_verifier: verifier,
+                median_time_past: mtp,
+                network: self.network,
+                pre_verified_txs: None,
+                num_threads: std::thread::available_parallelism().map(|n| n.get().min(8)).unwrap_or(4),
+            })?;
             self.store.write_batch(batch)?;
 
             {
@@ -877,9 +896,18 @@ impl ChainState {
                 if use_noop { &noop } else { &*self.script_verifier };
 
             let mtp = self.get_median_time_past(height);
-            let batch = connect::connect_block(
-                &*self.store, &block, height, &parent.chainwork, flat_pos, verifier, mtp, self.network,
-            )?;
+            let batch = connect::connect_block(&connect::ConnectParams {
+                store: &*self.store,
+                block: &block,
+                height,
+                parent_chainwork: &parent.chainwork,
+                flat_pos,
+                script_verifier: verifier,
+                median_time_past: mtp,
+                network: self.network,
+                pre_verified_txs: None,
+                num_threads: std::thread::available_parallelism().map(|n| n.get().min(8)).unwrap_or(4),
+            })?;
             self.store.write_batch(batch)?;
 
             {
@@ -1049,10 +1077,18 @@ impl ChainState {
                     file_number: side_entry.file_number,
                     data_pos: side_entry.data_pos,
                 };
-                let batch = connect::connect_block(
-                    &*self.store, &side_block, side_entry.height,
-                    &parent_entry.chainwork, side_flat_pos, verifier, mtp, self.network,
-                )?;
+                let batch = connect::connect_block(&connect::ConnectParams {
+                    store: &*self.store,
+                    block: &side_block,
+                    height: side_entry.height,
+                    parent_chainwork: &parent_entry.chainwork,
+                    flat_pos: side_flat_pos,
+                    script_verifier: verifier,
+                    median_time_past: mtp,
+                    network: self.network,
+                    pre_verified_txs: None,
+                    num_threads: 1,
+                })?;
                 self.store.write_batch(batch)?;
                 {
                     let mut tip = self.tip.write().unwrap();
@@ -1072,16 +1108,18 @@ impl ChainState {
 
         // Connect block (process transactions, update UTXOs, verify scripts)
         let mtp = self.get_median_time_past(new_height);
-        let batch = connect::connect_block(
-            &*self.store,
+        let batch = connect::connect_block(&connect::ConnectParams {
+            store: &*self.store,
             block,
-            new_height,
-            &parent.chainwork,
+            height: new_height,
+            parent_chainwork: &parent.chainwork,
             flat_pos,
-            verifier,
-            mtp,
-            self.network,
-        )?;
+            script_verifier: verifier,
+            median_time_past: mtp,
+            network: self.network,
+            pre_verified_txs: None,
+            num_threads: 1,
+        })?;
 
         // Atomic commit
         self.store.write_batch(batch)?;

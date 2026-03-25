@@ -38,6 +38,13 @@ async fn main() {
         "satd v0.1.0 starting"
     );
 
+    if config.max_ahead < 1000 && config.max_ahead != u32::MAX {
+        tracing::warn!(
+            max_ahead = config.max_ahead,
+            "Low --maxahead value may cause slow IBD block assignment. Consider >= 1000."
+        );
+    }
+
     // Create network-specific data directory
     let net_datadir = config.network_datadir();
     if let Err(e) = std::fs::create_dir_all(&net_datadir) {
@@ -80,7 +87,7 @@ async fn main() {
     let blocks_dir = net_datadir.join("blocks");
     let _chainstate_dir = net_datadir.join("chainstate");
 
-    let store = match RedbStore::open(&net_datadir, config.txindex) {
+    let store = match RedbStore::open(&net_datadir, config.txindex, config.dbcache / 10) {
         Ok(s) => Box::new(s),
         Err(e) => {
             eprintln!("Error opening chain database: {}", e);
@@ -474,14 +481,12 @@ async fn main() {
         let _ = std::fs::remove_file(pid_path);
     }
 
-    // Drop server and peer references to allow chain_state cleanup
-    tracing::info!("Waiting for clean database shutdown...");
-    // Drop remaining references so Database::drop() runs before exit
+    // Drop local references to help cleanup, but spawned tasks may still hold Arcs
     drop(peer_manager);
     drop(mempool);
     drop(fee_estimator);
     drop(chain_state);
-    tracing::info!("Database closed cleanly");
+    tracing::info!("Shutdown complete — local references released");
 
     tracing::info!("satd stopped");
 }

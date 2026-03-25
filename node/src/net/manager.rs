@@ -247,9 +247,9 @@ impl PeerManager {
         if max_ahead > 1_000_000_000 {
             let pct = max_ahead - 1_000_000_000;
             let remaining = target_height.saturating_sub(tip_height);
-            ((remaining as u64 * pct as u64 / 100) as u32).max(1000)
+            (remaining as u64 * pct as u64 / 100) as u32
         } else {
-            max_ahead.max(1000)
+            max_ahead
         }
     }
 

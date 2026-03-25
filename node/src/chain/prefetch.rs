@@ -128,6 +128,12 @@ pub fn prefetch_block(
     }
 
     // 7. Pre-verify scripts for transactions where ALL inputs were resolved.
+    //
+    // NOTE: This pre-verification is only useful during assumevalid IBD, where
+    // the connect thread skips scripts entirely. When the authoritative verifier
+    // runs (normal mode, shadow modes, etc.), pre_verified_txs is ignored so the
+    // real engine sees every transaction. We still run it here unconditionally to
+    // warm caches and detect obviously-invalid blocks early.
     let verifier = ConsensusVerifier;
     let script_verified_txs: HashSet<usize> = {
         // Collect txs where all inputs are resolved

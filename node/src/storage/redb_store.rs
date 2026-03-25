@@ -48,13 +48,11 @@ pub struct RedbStore {
 }
 
 impl RedbStore {
-    pub fn open(path: &Path, txindex: bool) -> Result<Self, StoreError> {
+    pub fn open(path: &Path, txindex: bool, cache_mb: usize) -> Result<Self, StoreError> {
         let db_path = path.join("chainstate.redb");
-        // Use Builder with a large read cache to speed up startup repair/verification.
-        // redb scans the entire B-tree on open to verify checksums; a 1 GB cache
-        // reduces repeated disk reads from ~3 full passes to ~1.
+        let cache_bytes = (cache_mb * 1_000_000).min(1024 * 1024 * 1024); // cap at 1 GB
         let db = Database::builder()
-            .set_cache_size(1024 * 1024 * 1024) // 1 GB read cache
+            .set_cache_size(cache_bytes)
             .create(&db_path)
             .map_err(|e| {
                 StoreError::Database(format!(
@@ -440,7 +438,7 @@ mod tests {
 
     fn temp_store(txindex: bool) -> (RedbStore, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let store = RedbStore::open(dir.path(), txindex).unwrap();
+        let store = RedbStore::open(dir.path(), txindex, 50).unwrap();
         (store, dir)
     }
 
