@@ -122,49 +122,37 @@ pub fn bip113_activation_height(network: Network) -> u32 {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn connect_block(
-    store: &dyn Store,
-    block: &Block,
-    height: u32,
-    parent_chainwork: &[u8; 32],
-    flat_pos: FlatFilePos,
-    script_verifier: &dyn ScriptVerifier,
-    median_time_past: u32,
-    network: Network,
-) -> Result<StoreBatch, ConnectError> {
-    connect_block_inner(store, block, height, parent_chainwork, flat_pos, script_verifier, median_time_past, network, None)
+/// Parameters for block connection. Groups the many inputs needed by connect_block
+/// into a single struct for readability.
+pub struct ConnectParams<'a> {
+    pub store: &'a dyn Store,
+    pub block: &'a Block,
+    pub height: u32,
+    pub parent_chainwork: &'a [u8; 32],
+    pub flat_pos: FlatFilePos,
+    pub script_verifier: &'a dyn ScriptVerifier,
+    pub median_time_past: u32,
+    pub network: Network,
+    /// Tx indices whose scripts were pre-verified by the prefetch pipeline.
+    /// Those txs skip re-verification.
+    pub pre_verified_txs: Option<&'a std::collections::HashSet<usize>>,
+    /// Number of threads for parallel UTXO resolution and script verification.
+    pub num_threads: usize,
 }
 
-/// Connect a block with optional set of tx indices whose scripts were
-/// pre-verified by the prefetch pipeline. Those txs skip re-verification.
-#[allow(clippy::too_many_arguments)]
-pub fn connect_block_preverified(
-    store: &dyn Store,
-    block: &Block,
-    height: u32,
-    parent_chainwork: &[u8; 32],
-    flat_pos: FlatFilePos,
-    script_verifier: &dyn ScriptVerifier,
-    median_time_past: u32,
-    network: Network,
-    pre_verified_txs: &std::collections::HashSet<usize>,
-) -> Result<StoreBatch, ConnectError> {
-    connect_block_inner(store, block, height, parent_chainwork, flat_pos, script_verifier, median_time_past, network, Some(pre_verified_txs))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn connect_block_inner(
-    store: &dyn Store,
-    block: &Block,
-    height: u32,
-    parent_chainwork: &[u8; 32],
-    flat_pos: FlatFilePos,
-    script_verifier: &dyn ScriptVerifier,
-    median_time_past: u32,
-    network: Network,
-    pre_verified_txs: Option<&std::collections::HashSet<usize>>,
-) -> Result<StoreBatch, ConnectError> {
+pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError> {
+    let ConnectParams {
+        store, block, height, parent_chainwork, flat_pos,
+        script_verifier, median_time_past, network,
+        pre_verified_txs, num_threads,
+    } = params;
+    let store: &dyn Store = *store;
+    let script_verifier: &dyn ScriptVerifier = *script_verifier;
+    let height = *height;
+    let median_time_past = *median_time_past;
+    let network = *network;
+    let num_threads = *num_threads;
+    let flat_pos = *flat_pos;
     let mut batch = StoreBatch::default();
     let mut undo = UndoData::default();
     let block_hash = block.block_hash();
@@ -203,9 +191,7 @@ fn connect_block_inner(
         .collect();
 
     let pre_resolved: HashMap<(usize, usize), Coin> = {
-        let num_threads = std::thread::available_parallelism()
-            .map(|n| n.get().min(8))
-            .unwrap_or(4);
+
         if external_lookups.len() < 100 || num_threads <= 1 {
             // Small block — sequential is faster than thread overhead
             external_lookups.iter()
@@ -394,9 +380,7 @@ fn connect_block_inner(
 
     // Parallel script verification: verify all transactions concurrently
     if !verify_queue.is_empty() {
-        let num_threads = std::thread::available_parallelism()
-            .map(|n| n.get().min(8))
-            .unwrap_or(4);
+
         if verify_queue.len() <= 1 || num_threads <= 1 {
             for (tx, prev_outputs) in &verify_queue {
                 script_verifier
@@ -498,8 +482,18 @@ mod tests {
         let parent_work = [0u8; 32];
         let verifier = NoopVerifier;
 
-        let batch =
-            connect_block(&store, &genesis, 0, &parent_work, pos, &verifier, 0, Network::Regtest).unwrap();
+        let batch = connect_block(&ConnectParams {
+            store: &store,
+            block: &genesis,
+            height: 0,
+            parent_chainwork: &parent_work,
+            flat_pos: pos,
+            script_verifier: &verifier,
+            median_time_past: 0,
+            network: Network::Regtest,
+            pre_verified_txs: None,
+            num_threads: 1,
+        }).unwrap();
 
         // Genesis coinbase should NOT be in coin_puts
         assert!(batch.coin_puts.is_empty());
@@ -663,16 +657,18 @@ mod tests {
         // Coin at height 50, sequence requires 10 blocks, block at height 60 -> pass
         let (store, outpoint, _) = make_test_store_with_coin(50, false);
         let block = make_block_spending(outpoint, 60, 2, 10, 0);
-        let result = connect_block(
-            &store,
-            &block,
-            60,
-            &[0u8; 32],
-            default_pos(),
-            &NoopVerifier,
-            0,
-            Network::Regtest,
-        );
+        let result = connect_block(&ConnectParams {
+            store: &store,
+            block: &block,
+            height: 60,
+            parent_chainwork: &[0u8; 32],
+            flat_pos: default_pos(),
+            script_verifier: &NoopVerifier,
+            median_time_past: 0,
+            network: Network::Regtest,
+            pre_verified_txs: None,
+            num_threads: 1,
+        });
         assert!(result.is_ok());
     }
 
@@ -681,16 +677,18 @@ mod tests {
         // Coin at height 50, sequence requires 10 blocks, block at height 55 -> fail
         let (store, outpoint, _) = make_test_store_with_coin(50, false);
         let block = make_block_spending(outpoint, 55, 2, 10, 0);
-        let result = connect_block(
-            &store,
-            &block,
-            55,
-            &[0u8; 32],
-            default_pos(),
-            &NoopVerifier,
-            0,
-            Network::Regtest,
-        );
+        let result = connect_block(&ConnectParams {
+            store: &store,
+            block: &block,
+            height: 55,
+            parent_chainwork: &[0u8; 32],
+            flat_pos: default_pos(),
+            script_verifier: &NoopVerifier,
+            median_time_past: 0,
+            network: Network::Regtest,
+            pre_verified_txs: None,
+            num_threads: 1,
+        });
         assert!(matches!(result, Err(ConnectError::SequenceLockNotMet)));
     }
 
@@ -699,16 +697,18 @@ mod tests {
         // Bit 31 set disables the sequence lock
         let (store, outpoint, _) = make_test_store_with_coin(50, false);
         let block = make_block_spending(outpoint, 51, 2, 0x8000_0000 | 100, 0);
-        let result = connect_block(
-            &store,
-            &block,
-            51,
-            &[0u8; 32],
-            default_pos(),
-            &NoopVerifier,
-            0,
-            Network::Regtest,
-        );
+        let result = connect_block(&ConnectParams {
+            store: &store,
+            block: &block,
+            height: 51,
+            parent_chainwork: &[0u8; 32],
+            flat_pos: default_pos(),
+            script_verifier: &NoopVerifier,
+            median_time_past: 0,
+            network: Network::Regtest,
+            pre_verified_txs: None,
+            num_threads: 1,
+        });
         assert!(result.is_ok());
     }
 
@@ -717,16 +717,18 @@ mod tests {
         // tx version 1: BIP 68 not enforced even though sequence < required blocks
         let (store, outpoint, _) = make_test_store_with_coin(50, false);
         let block = make_block_spending(outpoint, 51, 1, 10, 0);
-        let result = connect_block(
-            &store,
-            &block,
-            51,
-            &[0u8; 32],
-            default_pos(),
-            &NoopVerifier,
-            0,
-            Network::Regtest,
-        );
+        let result = connect_block(&ConnectParams {
+            store: &store,
+            block: &block,
+            height: 51,
+            parent_chainwork: &[0u8; 32],
+            flat_pos: default_pos(),
+            script_verifier: &NoopVerifier,
+            median_time_past: 0,
+            network: Network::Regtest,
+            pre_verified_txs: None,
+            num_threads: 1,
+        });
         assert!(result.is_ok());
     }
 
@@ -735,16 +737,18 @@ mod tests {
         // Sequence::MAX bypasses BIP 68 entirely
         let (store, outpoint, _) = make_test_store_with_coin(50, false);
         let block = make_block_spending(outpoint, 51, 2, 0xffff_ffff, 0);
-        let result = connect_block(
-            &store,
-            &block,
-            51,
-            &[0u8; 32],
-            default_pos(),
-            &NoopVerifier,
-            0,
-            Network::Regtest,
-        );
+        let result = connect_block(&ConnectParams {
+            store: &store,
+            block: &block,
+            height: 51,
+            parent_chainwork: &[0u8; 32],
+            flat_pos: default_pos(),
+            script_verifier: &NoopVerifier,
+            median_time_past: 0,
+            network: Network::Regtest,
+            pre_verified_txs: None,
+            num_threads: 1,
+        });
         assert!(result.is_ok());
     }
 
@@ -755,16 +759,18 @@ mod tests {
         // locktime=50, height=60 -> pass
         let (store, outpoint, _) = make_test_store_with_coin(10, false);
         let block = make_block_spending(outpoint, 60, 2, 0, 50);
-        let result = connect_block(
-            &store,
-            &block,
-            60,
-            &[0u8; 32],
-            default_pos(),
-            &NoopVerifier,
-            0,
-            Network::Regtest,
-        );
+        let result = connect_block(&ConnectParams {
+            store: &store,
+            block: &block,
+            height: 60,
+            parent_chainwork: &[0u8; 32],
+            flat_pos: default_pos(),
+            script_verifier: &NoopVerifier,
+            median_time_past: 0,
+            network: Network::Regtest,
+            pre_verified_txs: None,
+            num_threads: 1,
+        });
         assert!(result.is_ok());
     }
 
@@ -773,16 +779,18 @@ mod tests {
         // locktime=50, height=49 -> fail
         let (store, outpoint, _) = make_test_store_with_coin(10, false);
         let block = make_block_spending(outpoint, 49, 2, 0, 50);
-        let result = connect_block(
-            &store,
-            &block,
-            49,
-            &[0u8; 32],
-            default_pos(),
-            &NoopVerifier,
-            0,
-            Network::Regtest,
-        );
+        let result = connect_block(&ConnectParams {
+            store: &store,
+            block: &block,
+            height: 49,
+            parent_chainwork: &[0u8; 32],
+            flat_pos: default_pos(),
+            script_verifier: &NoopVerifier,
+            median_time_past: 0,
+            network: Network::Regtest,
+            pre_verified_txs: None,
+            num_threads: 1,
+        });
         assert!(matches!(result, Err(ConnectError::LocktimeNotFinal)));
     }
 
@@ -791,16 +799,18 @@ mod tests {
         // locktime=500_000_001 (time-based), MTP=500_000_000 (too early)
         let (store, outpoint, _) = make_test_store_with_coin(10, false);
         let block = make_block_spending(outpoint, 60, 2, 0, 500_000_001);
-        let result = connect_block(
-            &store,
-            &block,
-            60,
-            &[0u8; 32],
-            default_pos(),
-            &NoopVerifier,
-            500_000_000,
-            Network::Regtest,
-        );
+        let result = connect_block(&ConnectParams {
+            store: &store,
+            block: &block,
+            height: 60,
+            parent_chainwork: &[0u8; 32],
+            flat_pos: default_pos(),
+            script_verifier: &NoopVerifier,
+            median_time_past: 500_000_000,
+            network: Network::Regtest,
+            pre_verified_txs: None,
+            num_threads: 1,
+        });
         assert!(matches!(result, Err(ConnectError::LocktimeNotFinal)));
     }
 
@@ -809,16 +819,18 @@ mod tests {
         // All inputs have Sequence::MAX -> locktime skipped even if not met
         let (store, outpoint, _) = make_test_store_with_coin(10, false);
         let block = make_block_spending(outpoint, 49, 2, 0xffff_ffff, 50);
-        let result = connect_block(
-            &store,
-            &block,
-            49,
-            &[0u8; 32],
-            default_pos(),
-            &NoopVerifier,
-            0,
-            Network::Regtest,
-        );
+        let result = connect_block(&ConnectParams {
+            store: &store,
+            block: &block,
+            height: 49,
+            parent_chainwork: &[0u8; 32],
+            flat_pos: default_pos(),
+            script_verifier: &NoopVerifier,
+            median_time_past: 0,
+            network: Network::Regtest,
+            pre_verified_txs: None,
+            num_threads: 1,
+        });
         assert!(result.is_ok());
     }
 
@@ -834,16 +846,18 @@ mod tests {
             vout: 0,
         };
         let block = make_block_spending(fake_outpoint, 1, 2, 0xffff_ffff, 0);
-        let result = connect_block(
-            &store,
-            &block,
-            1,
-            &[0u8; 32],
-            default_pos(),
-            &NoopVerifier,
-            0,
-            Network::Regtest,
-        );
+        let result = connect_block(&ConnectParams {
+            store: &store,
+            block: &block,
+            height: 1,
+            parent_chainwork: &[0u8; 32],
+            flat_pos: default_pos(),
+            script_verifier: &NoopVerifier,
+            median_time_past: 0,
+            network: Network::Regtest,
+            pre_verified_txs: None,
+            num_threads: 1,
+        });
         assert!(matches!(result, Err(ConnectError::MissingOrSpentInput)));
     }
 
@@ -852,16 +866,18 @@ mod tests {
         // Coinbase at height 50, spending at height 149 (99 confirmations, need 100)
         let (store, outpoint, _) = make_test_store_with_coin(50, true);
         let block = make_block_spending(outpoint, 149, 2, 0xffff_ffff, 0);
-        let result = connect_block(
-            &store,
-            &block,
-            149,
-            &[0u8; 32],
-            default_pos(),
-            &NoopVerifier,
-            0,
-            Network::Regtest,
-        );
+        let result = connect_block(&ConnectParams {
+            store: &store,
+            block: &block,
+            height: 149,
+            parent_chainwork: &[0u8; 32],
+            flat_pos: default_pos(),
+            script_verifier: &NoopVerifier,
+            median_time_past: 0,
+            network: Network::Regtest,
+            pre_verified_txs: None,
+            num_threads: 1,
+        });
         assert!(matches!(result, Err(ConnectError::PrematureCoinbaseSpend)));
     }
 
@@ -870,16 +886,18 @@ mod tests {
         // Coinbase at height 50, spending at height 150 (exactly 100 confirmations)
         let (store, outpoint, _) = make_test_store_with_coin(50, true);
         let block = make_block_spending(outpoint, 150, 2, 0xffff_ffff, 0);
-        let result = connect_block(
-            &store,
-            &block,
-            150,
-            &[0u8; 32],
-            default_pos(),
-            &NoopVerifier,
-            0,
-            Network::Regtest,
-        );
+        let result = connect_block(&ConnectParams {
+            store: &store,
+            block: &block,
+            height: 150,
+            parent_chainwork: &[0u8; 32],
+            flat_pos: default_pos(),
+            script_verifier: &NoopVerifier,
+            median_time_past: 0,
+            network: Network::Regtest,
+            pre_verified_txs: None,
+            num_threads: 1,
+        });
         assert!(result.is_ok());
     }
 
@@ -940,16 +958,18 @@ mod tests {
         // sorted = [base+900, base+1000, ..., base+1900], median = timestamps[5] = base+1400
         let mtp_block = base_time + 1400;
 
-        let result = connect_block(
-            &store,
-            &block,
-            block_height,
-            &[0u8; 32],
-            default_pos(),
-            &NoopVerifier,
-            mtp_block,
-            Network::Regtest,
-        );
+        let result = connect_block(&ConnectParams {
+            store: &store,
+            block: &block,
+            height: block_height,
+            parent_chainwork: &[0u8; 32],
+            flat_pos: default_pos(),
+            script_verifier: &NoopVerifier,
+            median_time_past: mtp_block,
+            network: Network::Regtest,
+            pre_verified_txs: None,
+            num_threads: 1,
+        });
         assert!(result.is_ok(), "BIP68 time lock should be met, got {:?}", result.err());
     }
 
@@ -999,16 +1019,18 @@ mod tests {
         let seq = (1u32 << 22) | 1; // time-based, 1 unit = 512s
         let block = make_block_spending(outpoint, block_height, 2, seq, 0);
 
-        let result = connect_block(
-            &store,
-            &block,
-            block_height,
-            &[0u8; 32],
-            default_pos(),
-            &NoopVerifier,
-            mtp_block,
-            Network::Regtest,
-        );
+        let result = connect_block(&ConnectParams {
+            store: &store,
+            block: &block,
+            height: block_height,
+            parent_chainwork: &[0u8; 32],
+            flat_pos: default_pos(),
+            script_verifier: &NoopVerifier,
+            median_time_past: mtp_block,
+            network: Network::Regtest,
+            pre_verified_txs: None,
+            num_threads: 1,
+        });
         assert!(
             matches!(result, Err(ConnectError::SequenceLockNotMet)),
             "BIP68 time lock should NOT be met, got Ok",
@@ -1070,16 +1092,18 @@ mod tests {
         };
         block.header.merkle_root = block.compute_merkle_root().unwrap();
 
-        let result = connect_block(
-            &store,
-            &block,
-            101,
-            &[0u8; 32],
-            default_pos(),
-            &NoopVerifier,
-            0,
-            Network::Regtest,
-        );
+        let result = connect_block(&ConnectParams {
+            store: &store,
+            block: &block,
+            height: 101,
+            parent_chainwork: &[0u8; 32],
+            flat_pos: default_pos(),
+            script_verifier: &NoopVerifier,
+            median_time_past: 0,
+            network: Network::Regtest,
+            pre_verified_txs: None,
+            num_threads: 1,
+        });
         assert!(
             matches!(result, Err(ConnectError::BadCoinbaseValue)),
             "Expected BadCoinbaseValue",
@@ -1162,16 +1186,18 @@ mod tests {
         };
         block.header.merkle_root = block.compute_merkle_root().unwrap();
 
-        let result = connect_block(
-            &store,
-            &block,
+        let result = connect_block(&ConnectParams {
+            store: &store,
+            block: &block,
             height,
-            &[0u8; 32],
-            default_pos(),
-            &NoopVerifier,
-            0,
-            Network::Regtest,
-        );
+            parent_chainwork: &[0u8; 32],
+            flat_pos: default_pos(),
+            script_verifier: &NoopVerifier,
+            median_time_past: 0,
+            network: Network::Regtest,
+            pre_verified_txs: None,
+            num_threads: 1,
+        });
         assert!(result.is_ok(), "Intra-block spending should succeed, got {:?}", result.err());
     }
 
@@ -1180,16 +1206,18 @@ mod tests {
         // Block at height 101 with correctly encoded BIP 34 height. Should pass.
         let (store, outpoint, _) = make_test_store_with_coin(10, false);
         let block = make_block_spending(outpoint, 101, 2, 0xffff_ffff, 0);
-        let result = connect_block(
-            &store,
-            &block,
-            101,
-            &[0u8; 32],
-            default_pos(),
-            &NoopVerifier,
-            0,
-            Network::Regtest,
-        );
+        let result = connect_block(&ConnectParams {
+            store: &store,
+            block: &block,
+            height: 101,
+            parent_chainwork: &[0u8; 32],
+            flat_pos: default_pos(),
+            script_verifier: &NoopVerifier,
+            median_time_past: 0,
+            network: Network::Regtest,
+            pre_verified_txs: None,
+            num_threads: 1,
+        });
         assert!(result.is_ok(), "BIP 34 correct height should pass, got {:?}", result.err());
     }
 
@@ -1246,16 +1274,18 @@ mod tests {
         };
         block.header.merkle_root = block.compute_merkle_root().unwrap();
 
-        let result = connect_block(
-            &store,
-            &block,
-            101,
-            &[0u8; 32],
-            default_pos(),
-            &NoopVerifier,
-            0,
-            Network::Regtest,
-        );
+        let result = connect_block(&ConnectParams {
+            store: &store,
+            block: &block,
+            height: 101,
+            parent_chainwork: &[0u8; 32],
+            flat_pos: default_pos(),
+            script_verifier: &NoopVerifier,
+            median_time_past: 0,
+            network: Network::Regtest,
+            pre_verified_txs: None,
+            num_threads: 1,
+        });
         assert!(
             matches!(result, Err(ConnectError::BadCoinbaseHeight)),
             "Expected BadCoinbaseHeight",
@@ -1316,16 +1346,18 @@ mod tests {
         };
         block.header.merkle_root = block.compute_merkle_root().unwrap();
 
-        let result = connect_block(
-            &store,
-            &block,
-            101,
-            &[0u8; 32],
-            default_pos(),
-            &NoopVerifier,
-            0,
-            Network::Regtest,
-        );
+        let result = connect_block(&ConnectParams {
+            store: &store,
+            block: &block,
+            height: 101,
+            parent_chainwork: &[0u8; 32],
+            flat_pos: default_pos(),
+            script_verifier: &NoopVerifier,
+            median_time_past: 0,
+            network: Network::Regtest,
+            pre_verified_txs: None,
+            num_threads: 1,
+        });
         assert!(
             matches!(result, Err(ConnectError::BadAmounts)),
             "Expected BadAmounts",
@@ -1338,16 +1370,18 @@ mod tests {
         let (store, outpoint, _) = make_test_store_with_coin(10, false);
         let block = make_block_spending(outpoint, 101, 2, 0xffff_ffff, 0);
 
-        let batch = connect_block(
-            &store,
-            &block,
-            101,
-            &[0u8; 32],
-            default_pos(),
-            &NoopVerifier,
-            0,
-            Network::Regtest,
-        )
+        let batch = connect_block(&ConnectParams {
+            store: &store,
+            block: &block,
+            height: 101,
+            parent_chainwork: &[0u8; 32],
+            flat_pos: default_pos(),
+            script_verifier: &NoopVerifier,
+            median_time_past: 0,
+            network: Network::Regtest,
+            pre_verified_txs: None,
+            num_threads: 1,
+        })
         .unwrap();
 
         // Collect all txids from the block
@@ -1450,16 +1484,18 @@ mod tests {
         };
         block.header.merkle_root = block.compute_merkle_root().unwrap();
 
-        let result = connect_block(
-            &store,
-            &block,
+        let result = connect_block(&ConnectParams {
+            store: &store,
+            block: &block,
             height,
-            &[0u8; 32],
-            default_pos(),
-            &NoopVerifier,
-            0,
-            Network::Bitcoin,
-        );
+            parent_chainwork: &[0u8; 32],
+            flat_pos: default_pos(),
+            script_verifier: &NoopVerifier,
+            median_time_past: 0,
+            network: Network::Bitcoin,
+            pre_verified_txs: None,
+            num_threads: 1,
+        });
         assert!(
             result.is_ok(),
             "BIP 34 should not be enforced before activation height on mainnet, got {:?}",
@@ -1486,16 +1522,18 @@ mod tests {
         // block.header.time is used instead of MTP.
         let mtp = 500_000_000; // below locktime
 
-        let result = connect_block(
-            &store,
-            &block,
+        let result = connect_block(&ConnectParams {
+            store: &store,
+            block: &block,
             height,
-            &[0u8; 32],
-            default_pos(),
-            &NoopVerifier,
-            mtp,
-            Network::Bitcoin,
-        );
+            parent_chainwork: &[0u8; 32],
+            flat_pos: default_pos(),
+            script_verifier: &NoopVerifier,
+            median_time_past: mtp,
+            network: Network::Bitcoin,
+            pre_verified_txs: None,
+            num_threads: 1,
+        });
         assert!(
             result.is_ok(),
             "Pre-BIP113, time-based locktime should compare against block time, got {:?}",
@@ -1517,16 +1555,18 @@ mod tests {
         let seq = 200u32; // height-based, requires 200 blocks
         let block = make_block_spending(outpoint, block_height, 2, seq, 0);
 
-        let result = connect_block(
-            &store,
-            &block,
-            block_height,
-            &[0u8; 32],
-            default_pos(),
-            &NoopVerifier,
-            0,
-            Network::Bitcoin,
-        );
+        let result = connect_block(&ConnectParams {
+            store: &store,
+            block: &block,
+            height: block_height,
+            parent_chainwork: &[0u8; 32],
+            flat_pos: default_pos(),
+            script_verifier: &NoopVerifier,
+            median_time_past: 0,
+            network: Network::Bitcoin,
+            pre_verified_txs: None,
+            num_threads: 1,
+        });
         assert!(
             result.is_ok(),
             "BIP 68 should not be enforced before activation height on mainnet, got {:?}",
