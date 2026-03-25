@@ -1,5 +1,4 @@
 use bitcoin::{Block, Network, OutPoint, Transaction, TxOut};
-use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 
 use crate::storage::blockindex::{BlockIndexEntry, BlockStatus, add_u256, work_for_bits};
@@ -203,12 +202,42 @@ fn connect_block_inner(
         })
         .collect();
 
-    let pre_resolved: HashMap<(usize, usize), Coin> = external_lookups
-        .par_iter()
-        .filter_map(|(tx_idx, in_idx, outpoint)| {
-            store.get_coin(outpoint).map(|coin| ((*tx_idx, *in_idx), coin))
-        })
-        .collect();
+    let pre_resolved: HashMap<(usize, usize), Coin> = {
+        let num_threads = std::thread::available_parallelism()
+            .map(|n| n.get().min(8))
+            .unwrap_or(4);
+        if external_lookups.len() < 100 || num_threads <= 1 {
+            // Small block — sequential is faster than thread overhead
+            external_lookups.iter()
+                .filter_map(|(tx_idx, in_idx, outpoint)| {
+                    store.get_coin(outpoint).map(|coin| ((*tx_idx, *in_idx), coin))
+                })
+                .collect()
+        } else {
+            let chunk_size = external_lookups.len().div_ceil(num_threads);
+            let mut results = HashMap::new();
+            std::thread::scope(|s| {
+                let handles: Vec<_> = external_lookups
+                    .chunks(chunk_size)
+                    .map(|chunk| {
+                        s.spawn(move || {
+                            chunk.iter()
+                                .filter_map(|(tx_idx, in_idx, outpoint)| {
+                                    store.get_coin(outpoint).map(|coin| ((*tx_idx, *in_idx), coin))
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .collect();
+                for handle in handles {
+                    for (key, coin) in handle.join().unwrap() {
+                        results.insert(key, coin);
+                    }
+                }
+            });
+            results
+        }
+    };
 
     // Process each transaction: resolve UTXOs sequentially, defer script verification
     for (tx_idx, tx) in block.txdata.iter().enumerate() {
@@ -365,14 +394,44 @@ fn connect_block_inner(
 
     // Parallel script verification: verify all transactions concurrently
     if !verify_queue.is_empty() {
-        let result: Result<(), ConnectError> = verify_queue
-            .par_iter()
-            .try_for_each(|(tx, prev_outputs)| {
+        let num_threads = std::thread::available_parallelism()
+            .map(|n| n.get().min(8))
+            .unwrap_or(4);
+        if verify_queue.len() <= 1 || num_threads <= 1 {
+            for (tx, prev_outputs) in &verify_queue {
                 script_verifier
                     .verify_transaction(tx, prev_outputs)
-                    .map_err(|e| ConnectError::ScriptFailed(e.to_string()))
+                    .map_err(|e| ConnectError::ScriptFailed(e.to_string()))?;
+            }
+        } else {
+            let chunk_size = verify_queue.len().div_ceil(num_threads);
+            let errors: Vec<ConnectError> = std::thread::scope(|s| {
+                let handles: Vec<_> = verify_queue
+                    .chunks(chunk_size)
+                    .map(|chunk| {
+                        s.spawn(move || {
+                            let mut errs = Vec::new();
+                            for (tx, prev_outputs) in chunk {
+                                if let Err(e) = script_verifier
+                                    .verify_transaction(tx, prev_outputs)
+                                {
+                                    errs.push(ConnectError::ScriptFailed(e.to_string()));
+                                }
+                            }
+                            errs
+                        })
+                    })
+                    .collect();
+                let mut all_errors = Vec::new();
+                for handle in handles {
+                    all_errors.extend(handle.join().unwrap());
+                }
+                all_errors
             });
-        result?;
+            if let Some(err) = errors.into_iter().next() {
+                return Err(err);
+            }
+        }
     }
 
     // Check coinbase value doesn't exceed subsidy + fees

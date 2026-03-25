@@ -1,6 +1,5 @@
-use bitcoin::{Block, BlockHash, TxOut, Txid};
+use bitcoin::{Block, BlockHash, Transaction, TxOut, Txid};
 use crossbeam_channel::{bounded, Receiver};
-use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -129,35 +128,56 @@ pub fn prefetch_block(
     }
 
     // 7. Pre-verify scripts for transactions where ALL inputs were resolved.
-    // Uses rayon for parallel verification across inputs.
     let verifier = ConsensusVerifier;
-    let script_verified_txs: HashSet<usize> = block
-        .txdata
-        .par_iter()
-        .enumerate()
-        .filter_map(|(tx_idx, tx)| {
-            if tx.is_coinbase() {
-                return None;
-            }
-            // Check that ALL inputs for this tx have speculative coins
-            let mut prev_outputs = Vec::with_capacity(tx.input.len());
-            for (input_idx, _) in tx.input.iter().enumerate() {
-                if let Some(coin) = speculative_coins.get(&(tx_idx, input_idx)) {
+    let script_verified_txs: HashSet<usize> = {
+        // Collect txs where all inputs are resolved
+        let verifiable: Vec<(usize, &Transaction, Vec<TxOut>)> = block.txdata.iter()
+            .enumerate()
+            .filter_map(|(tx_idx, tx)| {
+                if tx.is_coinbase() { return None; }
+                let mut prev_outputs = Vec::with_capacity(tx.input.len());
+                for (input_idx, _) in tx.input.iter().enumerate() {
+                    let coin = speculative_coins.get(&(tx_idx, input_idx))?;
                     prev_outputs.push(TxOut {
                         value: bitcoin::Amount::from_sat(coin.amount),
                         script_pubkey: coin.script_pubkey.clone(),
                     });
-                } else {
-                    return None; // Missing input — can't verify this tx
                 }
-            }
-            // All inputs resolved — verify scripts
-            match verifier.verify_transaction(tx, &prev_outputs) {
-                Ok(()) => Some(tx_idx),
-                Err(_) => None, // Verification failed — connect thread will re-check
-            }
-        })
-        .collect();
+                Some((tx_idx, tx, prev_outputs))
+            })
+            .collect();
+
+        let num_threads = std::thread::available_parallelism()
+            .map(|n| n.get().min(8))
+            .unwrap_or(4);
+
+        if verifiable.is_empty() || num_threads <= 1 {
+            verifiable.iter()
+                .filter(|(_, tx, prev_outputs)| verifier.verify_transaction(tx, prev_outputs).is_ok())
+                .map(|(tx_idx, _, _)| *tx_idx)
+                .collect()
+        } else {
+            let chunk_size = verifiable.len().div_ceil(num_threads);
+            let mut verified = HashSet::new();
+            let verifier_ref = &verifier;
+            std::thread::scope(|s| {
+                let handles: Vec<_> = verifiable.chunks(chunk_size)
+                    .map(|chunk| {
+                        s.spawn(move || {
+                            chunk.iter()
+                                .filter(|(_, tx, prev_outputs)| verifier_ref.verify_transaction(tx, prev_outputs).is_ok())
+                                .map(|(tx_idx, _, _)| *tx_idx)
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .collect();
+                for handle in handles {
+                    verified.extend(handle.join().unwrap());
+                }
+            });
+            verified
+        }
+    };
 
     Some(PreprocessedBlock {
         height,
@@ -218,7 +238,7 @@ pub fn start_prefetcher(
 
     // Work dispatch and result collection channels
     let (work_tx, work_rx) = bounded::<u32>(lookahead * 2);
-    let (result_tx, result_rx) = bounded::<PreprocessedBlock>(lookahead * 2);
+    let (result_tx, result_rx) = crossbeam_channel::unbounded::<PreprocessedBlock>();
 
     // Spawn worker threads
     let mut workers = Vec::with_capacity(num_workers + 1);
@@ -288,10 +308,18 @@ pub fn start_prefetcher(
 
             // Send in-order results to connect thread
             while let Some(pre) = buffer.remove(&next_to_send) {
-                if coord_tx.send(pre).is_err() {
-                    return; // Connect thread dropped receiver
+                match coord_tx.send_timeout(pre, std::time::Duration::from_secs(5)) {
+                    Ok(()) => {
+                        next_to_send += 1;
+                    }
+                    Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => {
+                        return; // Connect thread dropped receiver
+                    }
+                    Err(crossbeam_channel::SendTimeoutError::Timeout(_)) => {
+                        // Connect thread is slow — drop this block, it will fall back
+                        next_to_send += 1;
+                    }
                 }
-                next_to_send += 1;
             }
 
             // Brief sleep if nothing ready to avoid busy-spinning

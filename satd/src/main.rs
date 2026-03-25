@@ -473,6 +473,16 @@ async fn main() {
     if let Some(ref pid_path) = config.pid {
         let _ = std::fs::remove_file(pid_path);
     }
+
+    // Drop server and peer references to allow chain_state cleanup
+    tracing::info!("Waiting for clean database shutdown...");
+    // Drop remaining references so Database::drop() runs before exit
+    drop(peer_manager);
+    drop(mempool);
+    drop(fee_estimator);
+    drop(chain_state);
+    tracing::info!("Database closed cleanly");
+
     tracing::info!("satd stopped");
 }
 
