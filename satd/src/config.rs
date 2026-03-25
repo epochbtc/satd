@@ -835,6 +835,7 @@ rpcport=8332
             mcpport: None,
             mcpbind: None,
             maxahead: None,
+            shadow_consensus: false,
         };
         let config = Config::from_cli(cli).unwrap();
         assert_eq!(config.network, Network::Regtest);
@@ -897,6 +898,7 @@ rpcport=8332
             mcpport: None,
             mcpbind: None,
             maxahead: None,
+            shadow_consensus: false,
         };
         assert!(Config::from_cli(cli).is_err());
     }
