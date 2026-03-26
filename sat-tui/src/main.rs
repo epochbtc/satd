@@ -86,9 +86,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         8332
     });
 
-    // Resolve auth
-    let (user, pass) = if let (Some(u), Some(p)) = (&cli.rpcuser, &cli.rpcpassword) {
-        (u.clone(), p.clone())
+    // Resolve auth — use cookie path for automatic re-auth on satd restart
+    let rpc_client = if let (Some(u), Some(p)) = (&cli.rpcuser, &cli.rpcpassword) {
+        Arc::new(RpcClient::new(&cli.rpcconnect, rpcport, u, p))
     } else {
         let cookie_path = cli.rpccookiefile.unwrap_or_else(|| {
             let base = cli.datadir.clone().unwrap_or_else(rpc::default_datadir);
@@ -107,13 +107,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 base.join(net_subdir).join(".cookie")
             }
         });
-        rpc::read_cookie_file(&cookie_path).unwrap_or_else(|_| {
-            // Will retry on connection
-            (String::new(), String::new())
-        })
+        Arc::new(RpcClient::with_cookie(&cli.rpcconnect, rpcport, cookie_path))
     };
-
-    let rpc_client = Arc::new(RpcClient::new(&cli.rpcconnect, rpcport, &user, &pass));
     let state = Arc::new(Mutex::new(AppState::new()));
 
     // Setup terminal
