@@ -247,9 +247,9 @@ impl PeerManager {
         if max_ahead > 1_000_000_000 {
             let pct = max_ahead - 1_000_000_000;
             let remaining = target_height.saturating_sub(tip_height);
-            ((remaining as u64 * pct as u64 / 100) as u32).max(1000)
+            (remaining as u64 * pct as u64 / 100) as u32
         } else {
-            max_ahead.max(1000)
+            max_ahead
         }
     }
 
@@ -424,8 +424,33 @@ impl PeerManager {
         let scheduler = ibd.as_ref()?;
         let (downloaded, in_flight, pending, target) = scheduler.progress();
         let cursor = scheduler.connect_cursor();
-        let (bitmap, bitmap_sampled) = scheduler.block_bitmap();
+        let (mut bitmap, bitmap_sampled) = scheduler.block_bitmap();
         let peer_stats = scheduler.peer_stats();
+        drop(ibd); // Release scheduler lock before checking chain state
+
+        // Fix display: blocks stored on disk but no longer tracked by the scheduler
+        // (downloaded, connected, and removed from scheduler sets) show as state 0.
+        // Upgrade them to state 3 (downloaded) if the block data exists.
+        let bitmap_start = cursor + 1;
+        let total = bitmap.len();
+        if total > 0 {
+            let step = if bitmap_sampled {
+                let range = target.saturating_sub(bitmap_start) + 1;
+                range as f64 / total as f64
+            } else {
+                1.0
+            };
+            for (i, state) in bitmap.iter_mut().enumerate() {
+                if *state == 0 {
+                    let h = bitmap_start + (i as f64 * step) as u32;
+                    if let Some(hash) = self.chain_state.get_block_hash_by_height(h)
+                        && self.chain_state.has_block_data(&hash)
+                    {
+                        *state = 3; // stored on disk
+                    }
+                }
+            }
+        }
 
         let bitmap_b64 = base64::engine::general_purpose::STANDARD.encode(&bitmap);
 

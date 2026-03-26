@@ -41,7 +41,7 @@ pub fn disconnect_block(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chain::connect::{block_subsidy, connect_block};
+    use crate::chain::connect::{block_subsidy, connect_block, ConnectParams};
     use crate::storage::coinview::Coin;
     use crate::storage::db::InMemoryStore;
     use crate::storage::flatfile::FlatFilePos;
@@ -212,7 +212,18 @@ mod tests {
         let block_hash = block.block_hash();
 
         let connect_batch =
-            connect_block(&store, &block, 1, &[0u8; 32], default_pos(), &NoopVerifier, 0, Network::Regtest)
+            connect_block(&ConnectParams {
+                store: &store,
+                block: &block,
+                height: 1,
+                parent_chainwork: &[0u8; 32],
+                flat_pos: default_pos(),
+                script_verifier: &NoopVerifier,
+                median_time_past: 0,
+                network: Network::Regtest,
+                pre_verified_txs: None,
+                num_threads: 1,
+            })
                 .unwrap();
 
         // Extract undo data (for non-genesis coinbase-only blocks, undo has no spent coins)
@@ -256,7 +267,18 @@ mod tests {
         let prev_hash = BlockHash::all_zeros();
 
         let connect_batch =
-            connect_block(&store, &block, 1, &[0u8; 32], default_pos(), &NoopVerifier, 0, Network::Regtest)
+            connect_block(&ConnectParams {
+                store: &store,
+                block: &block,
+                height: 1,
+                parent_chainwork: &[0u8; 32],
+                flat_pos: default_pos(),
+                script_verifier: &NoopVerifier,
+                median_time_past: 0,
+                network: Network::Regtest,
+                pre_verified_txs: None,
+                num_threads: 1,
+            })
                 .unwrap();
 
         let undo = connect_batch
@@ -296,7 +318,18 @@ mod tests {
         let prev_hash = BlockHash::all_zeros();
 
         let connect_batch =
-            connect_block(&store, &block, 1, &[0u8; 32], default_pos(), &NoopVerifier, 0, Network::Regtest)
+            connect_block(&ConnectParams {
+                store: &store,
+                block: &block,
+                height: 1,
+                parent_chainwork: &[0u8; 32],
+                flat_pos: default_pos(),
+                script_verifier: &NoopVerifier,
+                median_time_past: 0,
+                network: Network::Regtest,
+                pre_verified_txs: None,
+                num_threads: 1,
+            })
                 .unwrap();
 
         let undo = connect_batch
@@ -427,7 +460,18 @@ mod tests {
 
         let block_hash = block.block_hash();
         let connect_batch =
-            connect_block(&store, &block, height, &[0u8; 32], default_pos(), &NoopVerifier, 0, Network::Regtest)
+            connect_block(&ConnectParams {
+                store: &store,
+                block: &block,
+                height,
+                parent_chainwork: &[0u8; 32],
+                flat_pos: default_pos(),
+                script_verifier: &NoopVerifier,
+                median_time_past: 0,
+                network: Network::Regtest,
+                pre_verified_txs: None,
+                num_threads: 1,
+            })
                 .unwrap();
 
         let undo = connect_batch
@@ -532,7 +576,18 @@ mod tests {
 
         let block_hash = block.block_hash();
         let connect_batch =
-            connect_block(&store, &block, height, &[0u8; 32], default_pos(), &NoopVerifier, 0, Network::Regtest)
+            connect_block(&ConnectParams {
+                store: &store,
+                block: &block,
+                height,
+                parent_chainwork: &[0u8; 32],
+                flat_pos: default_pos(),
+                script_verifier: &NoopVerifier,
+                median_time_past: 0,
+                network: Network::Regtest,
+                pre_verified_txs: None,
+                num_threads: 1,
+            })
                 .unwrap();
 
         let undo = connect_batch
@@ -583,7 +638,18 @@ mod tests {
         let block_hash = block.block_hash();
 
         let connect_batch =
-            connect_block(&store, &block, 1, &[0u8; 32], default_pos(), &NoopVerifier, 0, Network::Regtest)
+            connect_block(&ConnectParams {
+                store: &store,
+                block: &block,
+                height: 1,
+                parent_chainwork: &[0u8; 32],
+                flat_pos: default_pos(),
+                script_verifier: &NoopVerifier,
+                median_time_past: 0,
+                network: Network::Regtest,
+                pre_verified_txs: None,
+                num_threads: 1,
+            })
                 .unwrap();
 
         let undo = connect_batch
@@ -619,7 +685,18 @@ mod tests {
 
         // Connect
         let connect_batch =
-            connect_block(&store, &block, 1, &[0u8; 32], default_pos(), &NoopVerifier, 0, Network::Regtest)
+            connect_block(&ConnectParams {
+                store: &store,
+                block: &block,
+                height: 1,
+                parent_chainwork: &[0u8; 32],
+                flat_pos: default_pos(),
+                script_verifier: &NoopVerifier,
+                median_time_past: 0,
+                network: Network::Regtest,
+                pre_verified_txs: None,
+                num_threads: 1,
+            })
                 .unwrap();
 
         let undo = connect_batch
@@ -660,7 +737,18 @@ mod tests {
 
         // Reconnect
         let reconnect_batch =
-            connect_block(&store, &block, 1, &[0u8; 32], default_pos(), &NoopVerifier, 0, Network::Regtest)
+            connect_block(&ConnectParams {
+                store: &store,
+                block: &block,
+                height: 1,
+                parent_chainwork: &[0u8; 32],
+                flat_pos: default_pos(),
+                script_verifier: &NoopVerifier,
+                median_time_past: 0,
+                network: Network::Regtest,
+                pre_verified_txs: None,
+                num_threads: 1,
+            })
                 .unwrap();
         store.write_batch(reconnect_batch).unwrap();
 
@@ -703,7 +791,18 @@ mod tests {
         let block_hash = block.block_hash();
 
         let connect_batch =
-            connect_block(&store, &block, 1, &[0u8; 32], default_pos(), &NoopVerifier, 0, Network::Regtest)
+            connect_block(&ConnectParams {
+                store: &store,
+                block: &block,
+                height: 1,
+                parent_chainwork: &[0u8; 32],
+                flat_pos: default_pos(),
+                script_verifier: &NoopVerifier,
+                median_time_past: 0,
+                network: Network::Regtest,
+                pre_verified_txs: None,
+                num_threads: 1,
+            })
                 .unwrap();
 
         let undo = connect_batch
