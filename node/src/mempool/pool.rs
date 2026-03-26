@@ -359,8 +359,9 @@ impl Mempool {
         }
 
         // Script verification (all inputs at once for taproot)
+        // Use tip_height + 1 since the tx will be mined in the next block
         script_verifier
-            .verify_transaction(&tx, &prev_outputs)
+            .verify_transaction(&tx, &prev_outputs, tip_height + 1)
             .map_err(|e| MempoolError::Script(e.to_string()))?;
 
         // RBF: remove conflicted transactions before inserting replacement
@@ -677,9 +678,10 @@ impl Mempool {
         }
         let fee = sum_inputs - sum_outputs;
 
-        // Script verification
+        // Script verification (tip + 1 = next block height)
+        let tip_height = chain_state.tip_height();
         script_verifier
-            .verify_transaction(tx, &prev_outputs)
+            .verify_transaction(tx, &prev_outputs, tip_height + 1)
             .map_err(|e| MempoolError::Script(e.to_string()))?;
 
         let vsize = weight / 4;

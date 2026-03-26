@@ -384,7 +384,7 @@ pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError>
         if verify_queue.len() <= 1 || num_threads <= 1 {
             for (tx, prev_outputs) in &verify_queue {
                 script_verifier
-                    .verify_transaction(tx, prev_outputs)
+                    .verify_transaction(tx, prev_outputs, height)
                     .map_err(|e| ConnectError::ScriptFailed(e.to_string()))?;
             }
         } else {
@@ -397,7 +397,7 @@ pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError>
                             let mut errs = Vec::new();
                             for (tx, prev_outputs) in chunk {
                                 if let Err(e) = script_verifier
-                                    .verify_transaction(tx, prev_outputs)
+                                    .verify_transaction(tx, prev_outputs, height)
                                 {
                                     errs.push(ConnectError::ScriptFailed(e.to_string()));
                                 }
