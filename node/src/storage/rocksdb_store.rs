@@ -2,7 +2,7 @@ use bitcoin::hashes::Hash;
 use bitcoin::{BlockHash, OutPoint, Txid};
 use rocksdb::{
     BlockBasedOptions, BoundColumnFamily, Cache, ColumnFamilyDescriptor, DBCompressionType,
-    DBWithThreadMode, IteratorMode, MultiThreaded, Options, WriteBatch,
+    DBWithThreadMode, MultiThreaded, Options, WriteBatch,
 };
 use std::path::Path;
 use std::sync::Arc;
@@ -50,6 +50,7 @@ type DB = DBWithThreadMode<MultiThreaded>;
 pub struct RocksDbStore {
     db: DB,
     txindex_enabled: bool,
+    block_cache: Cache,
 }
 
 impl RocksDbStore {
@@ -133,6 +134,7 @@ impl RocksDbStore {
         Ok(Self {
             db,
             txindex_enabled: txindex,
+            block_cache,
         })
     }
 
@@ -140,6 +142,60 @@ impl RocksDbStore {
         self.db
             .cf_handle(name)
             .unwrap_or_else(|| panic!("column family '{}' not found", name))
+    }
+
+    /// Build column family options for (re)creation.
+    fn cf_options(&self, name: &str) -> Options {
+        let is_coins = name == CF_COINS;
+        let write_buf_mb = match name {
+            CF_COINS => 64,
+            CF_UNDO | CF_TX_INDEX => 16,
+            CF_BLOCK_INDEX | CF_HEIGHT_INDEX => 8,
+            _ => 2,
+        };
+
+        let compression_per_level = [
+            DBCompressionType::None,
+            DBCompressionType::None,
+            DBCompressionType::Lz4,
+            DBCompressionType::Lz4,
+            DBCompressionType::Lz4,
+            DBCompressionType::Lz4,
+            DBCompressionType::Zstd,
+        ];
+
+        let mut cf_opts = Options::default();
+        let mut table_opts = BlockBasedOptions::default();
+        table_opts.set_block_cache(&self.block_cache);
+        table_opts.set_block_size(16 * 1024);
+        table_opts.set_cache_index_and_filter_blocks(true);
+        table_opts.set_pin_l0_filter_and_index_blocks_in_cache(true);
+        table_opts.set_format_version(5);
+        if is_coins {
+            table_opts.set_bloom_filter(10.0, false);
+            table_opts.set_whole_key_filtering(true);
+        }
+        cf_opts.set_block_based_table_factory(&table_opts);
+        cf_opts.set_write_buffer_size(write_buf_mb * 1024 * 1024);
+        cf_opts.set_max_write_buffer_number(3);
+        cf_opts.set_level_compaction_dynamic_level_bytes(true);
+        cf_opts.set_max_bytes_for_level_base(512 * 1024 * 1024);
+        cf_opts.set_target_file_size_base(64 * 1024 * 1024);
+        cf_opts.set_compression_per_level(&compression_per_level);
+        cf_opts.set_bottommost_compression_type(DBCompressionType::Zstd);
+        cf_opts
+    }
+
+    /// O(1) column family clear: drop and recreate with original options.
+    fn drop_and_recreate_cf(&self, name: &str) -> Result<(), StoreError> {
+        let opts = self.cf_options(name);
+        self.db
+            .drop_cf(name)
+            .map_err(|e| StoreError::Database(format!("drop_cf({}): {}", name, e)))?;
+        self.db
+            .create_cf(name, &opts)
+            .map_err(|e| StoreError::Database(format!("create_cf({}): {}", name, e)))?;
+        Ok(())
     }
 
     fn read_u64_meta(&self, key: &[u8]) -> u64 {
@@ -351,18 +407,7 @@ impl Store for RocksDbStore {
             vec![CF_COINS, CF_UNDO, CF_METADATA]
         };
         for cf_name in cfs {
-            let cf = self.cf(cf_name);
-            let mut wb = WriteBatch::default();
-            let iter = self.db.iterator_cf(&cf, IteratorMode::Start);
-            for item in iter {
-                let (key, _) = item.map_err(|e| StoreError::Database(e.to_string()))?;
-                wb.delete_cf(&cf, &key);
-            }
-            if !wb.is_empty() {
-                self.db
-                    .write(wb)
-                    .map_err(|e| StoreError::Database(e.to_string()))?;
-            }
+            self.drop_and_recreate_cf(cf_name)?;
         }
         Ok(())
     }
@@ -376,20 +421,8 @@ impl Store for RocksDbStore {
             CF_METADATA,
             CF_TX_INDEX,
         ];
-        for cf_name in &all_cfs {
-            if let Some(cf) = self.db.cf_handle(cf_name) {
-                let mut wb = WriteBatch::default();
-                let iter = self.db.iterator_cf(&cf, IteratorMode::Start);
-                for item in iter {
-                    let (key, _) = item.map_err(|e| StoreError::Database(e.to_string()))?;
-                    wb.delete_cf(&cf, &key);
-                }
-                if !wb.is_empty() {
-                    self.db
-                        .write(wb)
-                        .map_err(|e| StoreError::Database(e.to_string()))?;
-                }
-            }
+        for cf_name in all_cfs {
+            self.drop_and_recreate_cf(cf_name)?;
         }
         Ok(())
     }
