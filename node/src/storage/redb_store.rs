@@ -50,13 +50,19 @@ pub struct RedbStore {
 impl RedbStore {
     pub fn open(path: &Path, txindex: bool) -> Result<Self, StoreError> {
         let db_path = path.join("chainstate.redb");
-        let db = Database::create(&db_path).map_err(|e| {
-            StoreError::Database(format!(
-                "Failed to open redb at {}: {}",
-                db_path.display(),
-                e
-            ))
-        })?;
+        // Use Builder with a large read cache to speed up startup repair/verification.
+        // redb scans the entire B-tree on open to verify checksums; a 1 GB cache
+        // reduces repeated disk reads from ~3 full passes to ~1.
+        let db = Database::builder()
+            .set_cache_size(1024 * 1024 * 1024) // 1 GB read cache
+            .create(&db_path)
+            .map_err(|e| {
+                StoreError::Database(format!(
+                    "Failed to open redb at {}: {}",
+                    db_path.display(),
+                    e
+                ))
+            })?;
 
         // Create all tables on first open
         {
