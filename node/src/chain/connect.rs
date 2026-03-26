@@ -334,7 +334,7 @@ pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError>
                     script_pubkey: coin.script_pubkey.clone(),
                 });
 
-                batch.coin_removes.push((outpoint, coin.amount));
+                batch.coin_removes.push((outpoint, coin.amount, coin.height));
             }
 
             // Sum outputs

@@ -267,17 +267,12 @@ impl Store for RocksDbStore {
         let mut count_delta: i64 = 0;
         let mut amount_delta: i64 = 0;
 
-        for (outpoint, spent_amount) in &batch.coin_removes {
+        for (outpoint, spent_amount, spent_height) in &batch.coin_removes {
             let key = outpoint_to_key(outpoint);
-            // Read existing coin for histogram tracking before deleting
-            if let Ok(Some(existing)) = self.db.get_cf(&cf_coins, key) {
-                count_delta -= 1;
-                amount_delta -= *spent_amount as i64;
-                if let Ok(coin) = bincode::deserialize::<Coin>(&existing) {
-                    let bucket = (coin.height / HEIGHT_HIST_BUCKET) as usize;
-                    *hist_deltas.entry(bucket).or_default() -= 1;
-                }
-            }
+            count_delta -= 1;
+            amount_delta -= *spent_amount as i64;
+            let bucket = (*spent_height / HEIGHT_HIST_BUCKET) as usize;
+            *hist_deltas.entry(bucket).or_default() -= 1;
             wb.delete_cf(&cf_coins, key);
         }
 
@@ -515,7 +510,7 @@ mod tests {
 
         // Remove the coin
         let mut batch2 = StoreBatch::default();
-        batch2.coin_removes.push((op, 5_000_000_000));
+        batch2.coin_removes.push((op, 5_000_000_000, 1));
         store.write_batch(batch2).unwrap();
 
         assert!(store.get_coin(&op).is_none());
@@ -613,7 +608,7 @@ mod tests {
         assert_eq!(store.coin_count(), 3);
 
         let mut batch2 = StoreBatch::default();
-        batch2.coin_removes.push((make_outpoint(0x02, 0), 200));
+        batch2.coin_removes.push((make_outpoint(0x02, 0), 200, 0));
         store.write_batch(batch2).unwrap();
 
         assert_eq!(store.coin_count(), 2);

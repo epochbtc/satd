@@ -1118,7 +1118,7 @@ impl ChainState {
             median_time_past: mtp,
             network: self.network,
             pre_verified_txs: None,
-            num_threads: 1,
+            num_threads: std::thread::available_parallelism().map(|n| n.get().min(8)).unwrap_or(4),
         })?;
 
         // Atomic commit

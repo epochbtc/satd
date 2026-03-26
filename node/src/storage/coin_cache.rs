@@ -15,8 +15,13 @@ const DEFAULT_DBCACHE_MB: u64 = 450;
 
 /// Dirty coin entry — must be flushed to backing store before eviction.
 enum DirtyEntry {
-    Present(Coin),
-    Spent(u64),
+    /// Coin exists in backing store and was modified/added. `fresh` = true means
+    /// the coin was created in this flush window (never written to backing store).
+    Present { coin: Coin, fresh: bool },
+    /// Coin was spent. Carries (amount, height) for counter/histogram updates.
+    /// If `fresh` = true, the coin was created and spent in the same flush window
+    /// and can be discarded without touching the backing store.
+    Spent { amount: u64, height: u32, fresh: bool },
 }
 
 /// In-memory write cache wrapping a persistent Store.
@@ -90,7 +95,13 @@ impl CoinCache {
         Self::new(inner, DEFAULT_DBCACHE_MB)
     }
 
-    /// Flush all dirty coins and buffered non-coin writes to the inner store.
+    /// Flush dirty coins to the backing store.
+    ///
+    /// Optimizations vs. naive drain:
+    /// - **FRESH elision**: coins created and spent in the same flush window never
+    ///   touch the backing store (Core PR #17487 insight).
+    /// - **Sync semantics**: flushed coins are moved to the clean LRU instead of
+    ///   discarded, keeping the cache warm (Core PR #17487 / #28280).
     pub fn flush(&self) -> Result<(), StoreError> {
         let mut dirty = self.dirty.write().unwrap();
         let mut batch = {
@@ -98,13 +109,24 @@ impl CoinCache {
             std::mem::take(&mut *pending)
         };
 
+        // Collect coins to move to clean LRU after flush (sync semantics)
+        let mut promote_to_clean: Vec<(OutPoint, Coin)> = Vec::new();
+        let mut fresh_elided = 0u64;
+
         for (outpoint, entry) in dirty.drain() {
             match entry {
-                DirtyEntry::Present(coin) => {
+                DirtyEntry::Present { coin, .. } => {
+                    // Move to clean LRU after write (sync semantics: keep cache warm)
+                    promote_to_clean.push((outpoint, coin.clone()));
                     batch.coin_puts.push((outpoint, coin));
                 }
-                DirtyEntry::Spent(amount) => {
-                    batch.coin_removes.push((outpoint, amount));
+                DirtyEntry::Spent { fresh: true, .. } => {
+                    // FRESH elision: coin was created and spent in the same flush
+                    // window — it never existed in the backing store, skip entirely.
+                    fresh_elided += 1;
+                }
+                DirtyEntry::Spent { amount, height, .. } => {
+                    batch.coin_removes.push((outpoint, amount, height));
                 }
             }
         }
@@ -133,11 +155,20 @@ impl CoinCache {
             tracing::info!(
                 coin_puts = puts,
                 coin_removes = removes,
+                fresh_elided = fresh_elided,
                 block_index = index_puts,
                 undo = undo_puts,
                 "Flushing write cache to disk"
             );
             self.inner.write_batch(batch)?;
+        }
+
+        // Sync semantics: move flushed coins into clean LRU (keeps cache warm)
+        if !promote_to_clean.is_empty() {
+            let mut clean = self.clean.lock().unwrap();
+            for (outpoint, coin) in promote_to_clean {
+                clean.put(outpoint, coin);
+            }
         }
 
         Ok(())
@@ -168,8 +199,8 @@ impl Store for CoinCache {
             let dirty = self.dirty.read().unwrap();
             if let Some(entry) = dirty.get(outpoint) {
                 return match entry {
-                    DirtyEntry::Present(coin) => Some(coin.clone()),
-                    DirtyEntry::Spent(_) => None,
+                    DirtyEntry::Present { coin, .. } => Some(coin.clone()),
+                    DirtyEntry::Spent { .. } => None,
                 };
             }
         }
@@ -192,7 +223,7 @@ impl Store for CoinCache {
         {
             let dirty = self.dirty.read().unwrap();
             if let Some(entry) = dirty.get(outpoint) {
-                return matches!(entry, DirtyEntry::Present(_));
+                return matches!(entry, DirtyEntry::Present { .. });
             }
         }
         {
@@ -215,14 +246,26 @@ impl Store for CoinCache {
                 self.amount_delta.fetch_add(coin.amount as i64, Ordering::Relaxed);
                 self.count_delta.fetch_add(1, Ordering::Relaxed);
                 clean.pop(&outpoint);
-                dirty.insert(outpoint, DirtyEntry::Present(coin));
+                // Mark as fresh if this coin doesn't exist in the backing store
+                // (not already in dirty map as a non-fresh entry)
+                let fresh = !dirty.contains_key(&outpoint);
+                dirty.insert(outpoint, DirtyEntry::Present { coin, fresh });
             }
 
-            for (outpoint, spent_amount) in batch.coin_removes {
+            for (outpoint, spent_amount, spent_height) in batch.coin_removes {
                 self.amount_delta.fetch_sub(spent_amount as i64, Ordering::Relaxed);
                 self.count_delta.fetch_sub(1, Ordering::Relaxed);
                 clean.pop(&outpoint);
-                dirty.insert(outpoint, DirtyEntry::Spent(spent_amount));
+                // If the coin was fresh (created in this flush window), mark the
+                // spend as fresh too — it can be elided entirely during flush.
+                let was_fresh = dirty
+                    .get(&outpoint)
+                    .is_some_and(|e| matches!(e, DirtyEntry::Present { fresh: true, .. }));
+                dirty.insert(outpoint, DirtyEntry::Spent {
+                    amount: spent_amount,
+                    height: spent_height,
+                    fresh: was_fresh,
+                });
             }
 
             self.dirty_count
@@ -504,7 +547,7 @@ mod tests {
         cache.write_batch(b1).unwrap();
 
         let mut b2 = StoreBatch::default();
-        b2.coin_removes.push((op, 100));
+        b2.coin_removes.push((op, 100, 0));
         cache.write_batch(b2).unwrap();
 
         assert!(cache.get_coin(&op).is_none());
@@ -538,7 +581,7 @@ mod tests {
         cache.write_batch(b1).unwrap();
 
         let mut b2 = StoreBatch::default();
-        b2.coin_removes.push((op, 50));
+        b2.coin_removes.push((op, 50, 0));
         cache.write_batch(b2).unwrap();
 
         assert!(!cache.has_coin(&op));
@@ -577,7 +620,7 @@ mod tests {
 
         // Remove one coin (spent amount = 1000).
         let mut b2 = StoreBatch::default();
-        b2.coin_removes.push((make_outpoint(0x20, 0), 1000));
+        b2.coin_removes.push((make_outpoint(0x20, 0), 1000, 0));
         cache.write_batch(b2).unwrap();
 
         assert_eq!(cache.count_delta.load(Ordering::Relaxed), 1);
@@ -618,7 +661,7 @@ mod tests {
         let mut batch = StoreBatch::default();
         batch.coin_puts.push((make_outpoint(0x40, 0), make_coin(100, 1)));
         batch.coin_puts.push((make_outpoint(0x41, 0), make_coin(200, 2)));
-        batch.coin_removes.push((make_outpoint(0x42, 0), 300));
+        batch.coin_removes.push((make_outpoint(0x42, 0), 300, 0));
         cache.write_batch(batch).unwrap();
 
         assert_eq!(cache.dirty_count(), 3);
@@ -895,7 +938,7 @@ mod tests {
 
         // Remove one coin.
         let mut b2 = StoreBatch::default();
-        b2.coin_removes.push((make_outpoint(0xA0, 0), 100));
+        b2.coin_removes.push((make_outpoint(0xA0, 0), 100, 0));
         cache.write_batch(b2).unwrap();
         assert_eq!(cache.coin_count(), 3);
     }
@@ -924,7 +967,7 @@ mod tests {
 
         // Remove coin with spent_amount 200.
         let mut b2 = StoreBatch::default();
-        b2.coin_removes.push((make_outpoint(0xB1, 0), 200));
+        b2.coin_removes.push((make_outpoint(0xB1, 0), 200, 0));
         cache.write_batch(b2).unwrap();
         assert_eq!(cache.coin_total_amount(), 600);
     }
