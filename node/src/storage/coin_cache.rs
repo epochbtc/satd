@@ -13,7 +13,7 @@ use super::{Store, StoreBatch, StoreError};
 /// Default dbcache size in MB (matches Bitcoin Core).
 const DEFAULT_DBCACHE_MB: u64 = 450;
 
-/// Dirty coin entry — must be flushed to redb before eviction.
+/// Dirty coin entry — must be flushed to backing store before eviction.
 enum DirtyEntry {
     Present(Coin),
     Spent(u64),
@@ -22,7 +22,7 @@ enum DirtyEntry {
 /// In-memory write cache wrapping a persistent Store.
 ///
 /// Two-tier coin cache:
-/// - **Dirty map**: unbounded HashMap, flushed periodically to redb.
+/// - **Dirty map**: unbounded HashMap, flushed periodically to backing store.
 /// - **Clean LRU**: bounded LruCache, auto-evicts coldest entries.
 ///
 /// All overlay caches (block_index, height_hash, undo, tx_index) are
@@ -182,7 +182,7 @@ impl Store for CoinCache {
             }
         }
 
-        // 3. Cache miss — read from redb, populate LRU (auto-evicts if full)
+        // 3. Cache miss — read from backing store, populate LRU (auto-evicts if full)
         let coin = self.inner.get_coin(outpoint)?;
         self.clean.lock().unwrap().put(*outpoint, coin.clone());
         Some(coin)
@@ -266,7 +266,7 @@ impl Store for CoinCache {
         }
 
         // Non-coin operations:
-        // - Without coins (store_block, accept_headers): write to redb immediately
+        // - Without coins (store_block, accept_headers): write to backing store immediately
         // - With coins (connect_block): buffer for flush
         let has_non_coin = !batch.block_index_puts.is_empty()
             || !batch.height_hash_puts.is_empty()

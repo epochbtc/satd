@@ -3,7 +3,7 @@ pub mod coin_cache;
 pub mod coinview;
 pub mod db;
 pub mod flatfile;
-pub mod redb_store;
+pub mod rocksdb_store;
 pub mod undo;
 
 use bitcoin::{BlockHash, OutPoint, Txid};

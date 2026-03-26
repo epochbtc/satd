@@ -6,7 +6,7 @@ use node::mempool::fee::FeeEstimator;
 use node::mempool::pool::{Mempool, MempoolConfig};
 use node::rpc::auth::RpcAuth;
 use node::storage::Store;
-use node::storage::redb_store::RedbStore;
+use node::storage::rocksdb_store::RocksDbStore;
 use node::storage::flatfile::FlatFileManager;
 use config::ConsensusEngine;
 use node::validation::script::{ConsensusVerifier, RustVerifier, ShadowVerifier, ScriptVerifier};
@@ -85,9 +85,28 @@ async fn main() {
 
     // Open block storage
     let blocks_dir = net_datadir.join("blocks");
-    let _chainstate_dir = net_datadir.join("chainstate");
 
-    let store = match RedbStore::open(&net_datadir, config.txindex, config.dbcache / 10) {
+    // Detect legacy redb database and fail fast
+    let legacy_redb = net_datadir.join("chainstate.redb");
+    if legacy_redb.exists() {
+        eprintln!(
+            "Error: found legacy redb database at {}.\n\
+             The storage engine has changed to RocksDB. To continue:\n\
+             1. Delete the old chainstate: rm {}\n\
+             2. Restart with --reindex to rebuild from block files, or\n\
+             3. Start fresh with a new datadir.",
+            legacy_redb.display(),
+            legacy_redb.display(),
+        );
+        auth.cleanup();
+        std::process::exit(1);
+    }
+
+    // Partition dbcache budget: 1/3 to RocksDB block cache, 2/3 to CoinCache overlays
+    let rocksdb_cache_mb = config.dbcache / 3;
+    let coincache_mb = config.dbcache - rocksdb_cache_mb;
+
+    let store = match RocksDbStore::open(&net_datadir, config.txindex, rocksdb_cache_mb) {
         Ok(s) => Box::new(s),
         Err(e) => {
             eprintln!("Error opening chain database: {}", e);
@@ -208,7 +227,7 @@ async fn main() {
         config.network,
         verifier,
         assumevalid,
-        config.dbcache as u64,
+        coincache_mb as u64,
     ) {
         Ok(cs) => Arc::new(cs),
         Err(e) => {
