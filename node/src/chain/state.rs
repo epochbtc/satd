@@ -101,7 +101,7 @@ pub struct ChainState {
     checkpoints: Vec<Checkpoint>,
     /// Highest header height stored (may be ahead of connected block tip during IBD).
     headers_tip_height: AtomicU32,
-    /// Cached block timestamps for MTP computation (avoids 22 redb reads per block).
+    /// Cached block timestamps for MTP computation (avoids 22 DB reads per block).
     /// Stores (height, timestamp) pairs for the last ~12 blocks.
     mtp_cache: Mutex<Vec<(u32, u32)>>,
 }
