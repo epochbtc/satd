@@ -114,8 +114,9 @@ impl FlatFileManager {
         self.file_path(file_number).exists()
     }
 
-    /// Delete a flat file from disk.
-    pub fn delete_file(&self, file_number: u32) -> std::io::Result<()> {
+    /// Delete a flat file from disk. Invalidates any cached read handle.
+    pub fn delete_file(&mut self, file_number: u32) -> std::io::Result<()> {
+        self.read_cache.remove(&file_number);
         let path = self.file_path(file_number);
         if path.exists() {
             std::fs::remove_file(&path)?;

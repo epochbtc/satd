@@ -140,15 +140,13 @@ pub struct ConnectParams<'a> {
     pub num_threads: usize,
     /// Pre-computed txids from prefetch. Avoids rehashing all transactions.
     pub precomputed_txids: Option<&'a [bitcoin::Txid]>,
-    /// Speculatively resolved coins from prefetch. Avoids redundant UTXO lookups.
-    pub speculative_coins: Option<&'a HashMap<(usize, usize), crate::storage::coinview::Coin>>,
 }
 
 pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError> {
     let ConnectParams {
         store, block, height, parent_chainwork, flat_pos,
         script_verifier, median_time_past, network,
-        pre_verified_txs, num_threads, precomputed_txids, speculative_coins,
+        pre_verified_txs, num_threads, precomputed_txids,
     } = params;
     let store: &dyn Store = *store;
     let script_verifier: &dyn ScriptVerifier = *script_verifier;
@@ -190,41 +188,42 @@ pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError>
     let mut intra_block_coins: HashMap<OutPoint, Coin> = HashMap::new();
 
     // --- UTXO pre-resolution for external inputs ---
-    // If prefetch provided speculative_coins, use them directly (already resolved).
-    // Otherwise, batch-lookup via MultiGet.
+    // Batch-lookup from authoritative store. Prefetch warmed the CoinCache,
+    // so most external lookups hit the cache.
     let block_txids: HashSet<bitcoin::Txid> = txid_slice.iter().copied().collect();
 
-    let pre_resolved: HashMap<(usize, usize), Coin> = if let Some(spec) = speculative_coins {
-        // Prefetch already resolved these — clone the map
-        (*spec).clone()
-    } else {
-        let external_lookups: Vec<(usize, usize, OutPoint)> = block.txdata.iter()
-            .enumerate()
-            .flat_map(|(tx_idx, tx)| {
-                if tx.is_coinbase() {
-                    return Vec::new();
-                }
-                tx.input.iter().enumerate()
-                    .filter(|(_, input)| !block_txids.contains(&input.previous_output.txid))
-                    .map(|(in_idx, input)| (tx_idx, in_idx, input.previous_output))
-                    .collect::<Vec<_>>()
-            })
-            .collect();
+    // Collect external inputs (not intra-block spends)
+    let external_lookups: Vec<(usize, usize, OutPoint)> = block.txdata.iter()
+        .enumerate()
+        .flat_map(|(tx_idx, tx)| {
+            if tx.is_coinbase() {
+                return Vec::new();
+            }
+            tx.input.iter().enumerate()
+                .filter(|(_, input)| !block_txids.contains(&input.previous_output.txid))
+                .map(|(in_idx, input)| (tx_idx, in_idx, input.previous_output))
+                .collect::<Vec<_>>()
+        })
+        .collect();
 
-        if external_lookups.is_empty() {
-            HashMap::new()
-        } else {
-            let outpoints: Vec<OutPoint> = external_lookups.iter()
-                .map(|(_, _, op)| *op)
-                .collect();
-            let coins = store.get_coins_batch(&outpoints);
-            external_lookups.iter()
-                .zip(coins)
-                .filter_map(|((tx_idx, in_idx, _), coin_opt)| {
-                    coin_opt.map(|coin| ((*tx_idx, *in_idx), coin))
-                })
-                .collect()
-        }
+    // Resolve external inputs. Speculative coins from prefetch are used as hints:
+    // they warm the cache but each coin is still verified against the authoritative
+    // store to prevent stale reads (e.g., if an earlier block spent the coin after
+    // prefetch resolved it).
+    let pre_resolved: HashMap<(usize, usize), Coin> = if external_lookups.is_empty() {
+        HashMap::new()
+    } else {
+        // Batch lookup from authoritative store (hits CoinCache which was warmed by prefetch)
+        let outpoints: Vec<OutPoint> = external_lookups.iter()
+            .map(|(_, _, op)| *op)
+            .collect();
+        let coins = store.get_coins_batch(&outpoints);
+        external_lookups.iter()
+            .zip(coins)
+            .filter_map(|((tx_idx, in_idx, _), coin_opt)| {
+                coin_opt.map(|coin| ((*tx_idx, *in_idx), coin))
+            })
+            .collect()
     };
 
     // Process each transaction: resolve UTXOs sequentially, defer script verification
@@ -552,7 +551,6 @@ mod tests {
             pre_verified_txs: None,
             num_threads: 1,
             precomputed_txids: None,
-            speculative_coins: None,
         }).unwrap();
 
         // Genesis coinbase should NOT be in coin_puts
@@ -729,7 +727,6 @@ mod tests {
             pre_verified_txs: None,
             num_threads: 1,
             precomputed_txids: None,
-            speculative_coins: None,
         });
         assert!(result.is_ok());
     }
@@ -751,7 +748,6 @@ mod tests {
             pre_verified_txs: None,
             num_threads: 1,
             precomputed_txids: None,
-            speculative_coins: None,
         });
         assert!(matches!(result, Err(ConnectError::SequenceLockNotMet)));
     }
@@ -773,7 +769,6 @@ mod tests {
             pre_verified_txs: None,
             num_threads: 1,
             precomputed_txids: None,
-            speculative_coins: None,
         });
         assert!(result.is_ok());
     }
@@ -795,7 +790,6 @@ mod tests {
             pre_verified_txs: None,
             num_threads: 1,
             precomputed_txids: None,
-            speculative_coins: None,
         });
         assert!(result.is_ok());
     }
@@ -817,7 +811,6 @@ mod tests {
             pre_verified_txs: None,
             num_threads: 1,
             precomputed_txids: None,
-            speculative_coins: None,
         });
         assert!(result.is_ok());
     }
@@ -841,7 +834,6 @@ mod tests {
             pre_verified_txs: None,
             num_threads: 1,
             precomputed_txids: None,
-            speculative_coins: None,
         });
         assert!(result.is_ok());
     }
@@ -863,7 +855,6 @@ mod tests {
             pre_verified_txs: None,
             num_threads: 1,
             precomputed_txids: None,
-            speculative_coins: None,
         });
         assert!(matches!(result, Err(ConnectError::LocktimeNotFinal)));
     }
@@ -885,7 +876,6 @@ mod tests {
             pre_verified_txs: None,
             num_threads: 1,
             precomputed_txids: None,
-            speculative_coins: None,
         });
         assert!(matches!(result, Err(ConnectError::LocktimeNotFinal)));
     }
@@ -907,7 +897,6 @@ mod tests {
             pre_verified_txs: None,
             num_threads: 1,
             precomputed_txids: None,
-            speculative_coins: None,
         });
         assert!(result.is_ok());
     }
@@ -936,7 +925,6 @@ mod tests {
             pre_verified_txs: None,
             num_threads: 1,
             precomputed_txids: None,
-            speculative_coins: None,
         });
         assert!(matches!(result, Err(ConnectError::MissingOrSpentInput)));
     }
@@ -958,7 +946,6 @@ mod tests {
             pre_verified_txs: None,
             num_threads: 1,
             precomputed_txids: None,
-            speculative_coins: None,
         });
         assert!(matches!(result, Err(ConnectError::PrematureCoinbaseSpend)));
     }
@@ -980,7 +967,6 @@ mod tests {
             pre_verified_txs: None,
             num_threads: 1,
             precomputed_txids: None,
-            speculative_coins: None,
         });
         assert!(result.is_ok());
     }
@@ -1054,7 +1040,6 @@ mod tests {
             pre_verified_txs: None,
             num_threads: 1,
             precomputed_txids: None,
-            speculative_coins: None,
         });
         assert!(result.is_ok(), "BIP68 time lock should be met, got {:?}", result.err());
     }
@@ -1117,7 +1102,6 @@ mod tests {
             pre_verified_txs: None,
             num_threads: 1,
             precomputed_txids: None,
-            speculative_coins: None,
         });
         assert!(
             matches!(result, Err(ConnectError::SequenceLockNotMet)),
@@ -1192,7 +1176,6 @@ mod tests {
             pre_verified_txs: None,
             num_threads: 1,
             precomputed_txids: None,
-            speculative_coins: None,
         });
         assert!(
             matches!(result, Err(ConnectError::BadCoinbaseValue)),
@@ -1288,7 +1271,6 @@ mod tests {
             pre_verified_txs: None,
             num_threads: 1,
             precomputed_txids: None,
-            speculative_coins: None,
         });
         assert!(result.is_ok(), "Intra-block spending should succeed, got {:?}", result.err());
     }
@@ -1310,7 +1292,6 @@ mod tests {
             pre_verified_txs: None,
             num_threads: 1,
             precomputed_txids: None,
-            speculative_coins: None,
         });
         assert!(result.is_ok(), "BIP 34 correct height should pass, got {:?}", result.err());
     }
@@ -1380,7 +1361,6 @@ mod tests {
             pre_verified_txs: None,
             num_threads: 1,
             precomputed_txids: None,
-            speculative_coins: None,
         });
         assert!(
             matches!(result, Err(ConnectError::BadCoinbaseHeight)),
@@ -1454,7 +1434,6 @@ mod tests {
             pre_verified_txs: None,
             num_threads: 1,
             precomputed_txids: None,
-            speculative_coins: None,
         });
         assert!(
             matches!(result, Err(ConnectError::BadAmounts)),
@@ -1480,7 +1459,6 @@ mod tests {
             pre_verified_txs: None,
             num_threads: 1,
             precomputed_txids: None,
-            speculative_coins: None,
         })
         .unwrap();
 
@@ -1596,7 +1574,6 @@ mod tests {
             pre_verified_txs: None,
             num_threads: 1,
             precomputed_txids: None,
-            speculative_coins: None,
         });
         assert!(
             result.is_ok(),
@@ -1636,7 +1613,6 @@ mod tests {
             pre_verified_txs: None,
             num_threads: 1,
             precomputed_txids: None,
-            speculative_coins: None,
         });
         assert!(
             result.is_ok(),
@@ -1671,7 +1647,6 @@ mod tests {
             pre_verified_txs: None,
             num_threads: 1,
             precomputed_txids: None,
-            speculative_coins: None,
         });
         assert!(
             result.is_ok(),
