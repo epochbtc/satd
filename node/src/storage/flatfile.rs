@@ -16,6 +16,10 @@ pub struct FlatFileManager {
     blocks_dir: PathBuf,
     current_file: u32,
     current_pos: u64,
+    /// Cached write handle for the current append file.
+    write_handle: Option<File>,
+    /// Cached read handles keyed by file number (small LRU).
+    read_cache: std::collections::HashMap<u32, File>,
 }
 
 impl FlatFileManager {
@@ -46,6 +50,8 @@ impl FlatFileManager {
             blocks_dir: blocks_dir.to_path_buf(),
             current_file: file_num,
             current_pos,
+            write_handle: None,
+            read_cache: std::collections::HashMap::new(),
         })
     }
 
@@ -72,6 +78,7 @@ impl FlatFileManager {
         if self.current_pos > 0 && self.current_pos + record_size > MAX_FILE_SIZE {
             self.current_file += 1;
             self.current_pos = 0;
+            self.write_handle = None; // Close old handle, open new file below
         }
 
         let pos = FlatFilePos {
@@ -79,11 +86,19 @@ impl FlatFileManager {
             data_pos: self.current_pos as u32,
         };
 
-        let path = self.file_path(self.current_file);
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        // Reuse cached write handle or open new one
+        let file = match &mut self.write_handle {
+            Some(f) => f,
+            None => {
+                let path = self.file_path(self.current_file);
+                let f = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)?;
+                self.write_handle = Some(f);
+                self.write_handle.as_mut().unwrap()
+            }
+        };
 
         file.write_all(&network_magic)?;
         file.write_all(&(block_data.len() as u32).to_le_bytes())?;
@@ -109,9 +124,21 @@ impl FlatFileManager {
     }
 
     /// Read a block from the flat files at the given position.
-    pub fn read_block(&self, pos: &FlatFilePos) -> std::io::Result<Vec<u8>> {
-        let path = self.file_path(pos.file_number);
-        let mut file = File::open(&path)?;
+    /// Uses cached file handles to avoid repeated open() syscalls.
+    pub fn read_block(&mut self, pos: &FlatFilePos) -> std::io::Result<Vec<u8>> {
+        let file = if let Some(f) = self.read_cache.get_mut(&pos.file_number) {
+            f
+        } else {
+            // Evict oldest if cache is large (keep at most 8 open readers)
+            if self.read_cache.len() >= 8 {
+                let oldest = *self.read_cache.keys().next().unwrap();
+                self.read_cache.remove(&oldest);
+            }
+            let path = self.file_path(pos.file_number);
+            let f = File::open(&path)?;
+            self.read_cache.entry(pos.file_number).or_insert(f)
+        };
+
         file.seek(SeekFrom::Start(pos.data_pos as u64))?;
 
         // Read magic (4 bytes) + size (4 bytes)
@@ -225,7 +252,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("satd-flatfile-noexist-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
-        let mgr = FlatFileManager::new(&dir).unwrap();
+        let mut mgr = FlatFileManager::new(&dir).unwrap();
         let pos = FlatFilePos {
             file_number: 99,
             data_pos: 0,

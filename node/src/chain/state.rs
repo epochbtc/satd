@@ -200,6 +200,8 @@ impl ChainState {
             network,
             pre_verified_txs: None,
             num_threads: 1,
+            precomputed_txids: None,
+            speculative_coins: None,
         })?;
         store.write_batch(batch)?;
 
@@ -587,6 +589,8 @@ impl ChainState {
             network: self.network,
             pre_verified_txs: pre_verified,
             num_threads: self.num_threads,
+            precomputed_txids: Some(&pre.txids),
+            speculative_coins: Some(&pre.speculative_coins),
         })?;
 
         // Atomic commit
@@ -765,6 +769,8 @@ impl ChainState {
             network: self.network,
             pre_verified_txs: None,
             num_threads: self.num_threads,
+            precomputed_txids: None,
+            speculative_coins: None,
         })?;
 
         // Atomic commit
@@ -823,6 +829,8 @@ impl ChainState {
                 network: self.network,
                 pre_verified_txs: None,
                 num_threads: self.num_threads,
+            precomputed_txids: None,
+            speculative_coins: None,
             })?;
             self.store.write_batch(batch)?;
 
@@ -912,6 +920,8 @@ impl ChainState {
                 network: self.network,
                 pre_verified_txs: None,
                 num_threads: self.num_threads,
+            precomputed_txids: None,
+            speculative_coins: None,
             })?;
             self.store.write_batch(batch)?;
 
@@ -1093,6 +1103,8 @@ impl ChainState {
                     network: self.network,
                     pre_verified_txs: None,
                     num_threads: 1,
+                    precomputed_txids: None,
+                    speculative_coins: None,
                 })?;
                 self.store.write_batch(batch)?;
                 {
@@ -1124,6 +1136,8 @@ impl ChainState {
             network: self.network,
             pre_verified_txs: None,
             num_threads: self.num_threads,
+            precomputed_txids: None,
+            speculative_coins: None,
         })?;
 
         // Atomic commit

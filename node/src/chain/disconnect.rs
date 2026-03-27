@@ -223,6 +223,8 @@ mod tests {
                 network: Network::Regtest,
                 pre_verified_txs: None,
                 num_threads: 1,
+            precomputed_txids: None,
+            speculative_coins: None,
             })
                 .unwrap();
 
@@ -278,6 +280,8 @@ mod tests {
                 network: Network::Regtest,
                 pre_verified_txs: None,
                 num_threads: 1,
+            precomputed_txids: None,
+            speculative_coins: None,
             })
                 .unwrap();
 
@@ -329,6 +333,8 @@ mod tests {
                 network: Network::Regtest,
                 pre_verified_txs: None,
                 num_threads: 1,
+            precomputed_txids: None,
+            speculative_coins: None,
             })
                 .unwrap();
 
@@ -471,6 +477,8 @@ mod tests {
                 network: Network::Regtest,
                 pre_verified_txs: None,
                 num_threads: 1,
+            precomputed_txids: None,
+            speculative_coins: None,
             })
                 .unwrap();
 
@@ -587,6 +595,8 @@ mod tests {
                 network: Network::Regtest,
                 pre_verified_txs: None,
                 num_threads: 1,
+            precomputed_txids: None,
+            speculative_coins: None,
             })
                 .unwrap();
 
@@ -649,6 +659,8 @@ mod tests {
                 network: Network::Regtest,
                 pre_verified_txs: None,
                 num_threads: 1,
+            precomputed_txids: None,
+            speculative_coins: None,
             })
                 .unwrap();
 
@@ -696,6 +708,8 @@ mod tests {
                 network: Network::Regtest,
                 pre_verified_txs: None,
                 num_threads: 1,
+            precomputed_txids: None,
+            speculative_coins: None,
             })
                 .unwrap();
 
@@ -748,6 +762,8 @@ mod tests {
                 network: Network::Regtest,
                 pre_verified_txs: None,
                 num_threads: 1,
+            precomputed_txids: None,
+            speculative_coins: None,
             })
                 .unwrap();
         store.write_batch(reconnect_batch).unwrap();
@@ -802,6 +818,8 @@ mod tests {
                 network: Network::Regtest,
                 pre_verified_txs: None,
                 num_threads: 1,
+            precomputed_txids: None,
+            speculative_coins: None,
             })
                 .unwrap();
 
