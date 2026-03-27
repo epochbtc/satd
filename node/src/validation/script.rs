@@ -19,6 +19,13 @@ pub trait ScriptVerifier: Send + Sync {
         prev_outputs: &[TxOut],
         height: u32,
     ) -> Result<(), ScriptError>;
+
+    /// If this verifier runs in shadow mode, return the shadow engine.
+    /// `connect_block` uses this to run primary and shadow in parallel at
+    /// the block level instead of sequentially per transaction.
+    fn shadow_verifier(&self) -> Option<&dyn ScriptVerifier> {
+        None
+    }
 }
 
 /// Softfork activation heights (mainnet). Verification flags are cumulative.
@@ -185,11 +192,11 @@ impl ScriptVerifier for RustVerifier {
     }
 }
 
-/// Shadow verifier: runs two engines, compares results, returns the
-/// primary engine's result. Mismatches are logged at ERROR level.
+/// Shadow verifier: exposes primary and shadow engines so `connect_block`
+/// can run them in parallel at the block level (not per-transaction).
 ///
-/// Use `ShadowVerifier::new(primary, shadow)` to configure which engine
-/// is authoritative and which runs in shadow mode.
+/// `verify_transaction()` only runs the primary engine. The shadow engine
+/// is returned by `shadow_verifier()` for parallel execution in connect_block.
 pub struct ShadowVerifier {
     primary: Box<dyn ScriptVerifier>,
     shadow: Box<dyn ScriptVerifier>,
@@ -208,27 +215,11 @@ impl ScriptVerifier for ShadowVerifier {
         prev_outputs: &[TxOut],
         height: u32,
     ) -> Result<(), ScriptError> {
-        let primary_result = self.primary.verify_transaction(tx, prev_outputs, height);
-        let shadow_result = self.shadow.verify_transaction(tx, prev_outputs, height);
+        // Only run primary — shadow runs in parallel at the block level
+        self.primary.verify_transaction(tx, prev_outputs, height)
+    }
 
-        match (&primary_result, &shadow_result) {
-            (Ok(()), Ok(())) | (Err(_), Err(_)) => {} // agree
-            (Ok(()), Err(e)) => {
-                tracing::error!(
-                    "SHADOW MISMATCH: primary accepted but shadow REJECTED: {} (txid={})",
-                    e,
-                    tx.compute_txid(),
-                );
-            }
-            (Err(e), Ok(())) => {
-                tracing::error!(
-                    "SHADOW MISMATCH: primary REJECTED but shadow accepted: {} (txid={})",
-                    e,
-                    tx.compute_txid(),
-                );
-            }
-        }
-
-        primary_result
+    fn shadow_verifier(&self) -> Option<&dyn ScriptVerifier> {
+        Some(&*self.shadow)
     }
 }
