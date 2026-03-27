@@ -24,6 +24,8 @@ const UTXO_COUNT_KEY: &[u8] = b"utxo_count";
 const TOTAL_AMOUNT_KEY: &[u8] = b"total_amount";
 const UTXO_HEIGHT_HIST_KEY: &[u8] = b"utxo_height_hist";
 const HEIGHT_HIST_BUCKET: u32 = 1000;
+const SCHEMA_KEY: &[u8] = b"schema_version";
+const CURRENT_SCHEMA_VERSION: u32 = 2; // v2 = compact varint coins
 
 fn hash_bytes(hash: &BlockHash) -> &[u8] {
     hash.as_ref()
@@ -54,7 +56,7 @@ pub struct RocksDbStore {
 }
 
 impl RocksDbStore {
-    pub fn open(path: &Path, txindex: bool, cache_mb: usize) -> Result<Self, StoreError> {
+    pub fn open(path: &Path, txindex: bool, cache_mb: usize, reindex: bool) -> Result<Self, StoreError> {
         let db_path = path.join("chainstate");
 
         let cpus = std::thread::available_parallelism()
@@ -131,29 +133,23 @@ impl RocksDbStore {
             ))
         })?;
 
-        // Schema version check: ensure coin format matches this binary
-        const SCHEMA_VERSION: u32 = 2; // v2 = compact varint coins
-        const SCHEMA_KEY: &[u8] = b"schema_version";
-        {
-            let cf_meta = db
-                .cf_handle(CF_METADATA)
-                .expect("metadata CF missing");
+        // Schema version check: ensure coin format matches this binary.
+        // Skip when reindexing — the DB is about to be cleared.
+        if !reindex {
+            let cf_meta = db.cf_handle(CF_METADATA).expect("metadata CF missing");
             match db.get_cf(&cf_meta, SCHEMA_KEY) {
                 Ok(Some(v)) => {
                     let stored = u32::from_le_bytes(v[..].try_into().unwrap_or([0; 4]));
-                    if stored != SCHEMA_VERSION {
+                    if stored != CURRENT_SCHEMA_VERSION {
                         return Err(StoreError::Database(format!(
                             "Chainstate schema version mismatch: DB has v{}, binary expects v{}. \
                              Run with --reindex to rebuild.",
-                            stored, SCHEMA_VERSION
+                            stored, CURRENT_SCHEMA_VERSION
                         )));
                     }
                 }
                 Ok(None) => {
-                    // Fresh DB or pre-versioning DB — check if coins exist
-                    let cf_coins = db
-                        .cf_handle(CF_COINS)
-                        .expect("coins CF missing");
+                    let cf_coins = db.cf_handle(CF_COINS).expect("coins CF missing");
                     let has_coins = db
                         .iterator_cf(&cf_coins, IteratorMode::Start)
                         .next()
@@ -165,11 +161,7 @@ impl RocksDbStore {
                                 .to_string(),
                         ));
                     }
-                    // Empty DB — stamp with current version
-                    let mut wb = WriteBatch::default();
-                    wb.put_cf(&cf_meta, SCHEMA_KEY, SCHEMA_VERSION.to_le_bytes());
-                    db.write(wb)
-                        .map_err(|e| StoreError::Database(e.to_string()))?;
+                    Self::stamp_schema(&db, CURRENT_SCHEMA_VERSION)?;
                 }
                 Err(e) => {
                     return Err(StoreError::Database(format!(
@@ -178,6 +170,9 @@ impl RocksDbStore {
                     )));
                 }
             }
+        } else {
+            // Reindexing — stamp version (clear_all will erase it, but
+            // write_schema_version below handles the re-stamp after clear).
         }
 
         Ok(Self {
@@ -233,6 +228,14 @@ impl RocksDbStore {
         cf_opts.set_compression_per_level(&compression_per_level);
         cf_opts.set_bottommost_compression_type(DBCompressionType::Zstd);
         cf_opts
+    }
+
+    /// Write schema version to the metadata CF.
+    fn stamp_schema(db: &DB, version: u32) -> Result<(), StoreError> {
+        let cf_meta = db.cf_handle(CF_METADATA).expect("metadata CF missing");
+        let mut wb = WriteBatch::default();
+        wb.put_cf(&cf_meta, SCHEMA_KEY, version.to_le_bytes());
+        db.write(wb).map_err(|e| StoreError::Database(e.to_string()))
     }
 
     /// O(1) column family clear: drop and recreate with original options.
@@ -461,7 +464,8 @@ impl Store for RocksDbStore {
         for cf_name in cfs {
             self.drop_and_recreate_cf(cf_name)?;
         }
-        Ok(())
+        // Re-stamp schema version after metadata CF was recreated
+        Self::stamp_schema(&self.db, CURRENT_SCHEMA_VERSION)
     }
 
     fn clear_all(&self) -> Result<(), StoreError> {
@@ -476,7 +480,8 @@ impl Store for RocksDbStore {
         for cf_name in all_cfs {
             self.drop_and_recreate_cf(cf_name)?;
         }
-        Ok(())
+        // Re-stamp schema version after metadata CF was recreated
+        Self::stamp_schema(&self.db, CURRENT_SCHEMA_VERSION)
     }
 
     fn get_coins_batch(&self, outpoints: &[OutPoint]) -> Vec<Option<Coin>> {
@@ -522,7 +527,7 @@ mod tests {
 
     fn temp_store(txindex: bool) -> (RocksDbStore, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let store = RocksDbStore::open(dir.path(), txindex, 16).unwrap();
+        let store = RocksDbStore::open(dir.path(), txindex, 16, false).unwrap();
         (store, dir)
     }
 
