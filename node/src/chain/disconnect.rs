@@ -849,6 +849,7 @@ mod tests {
             Box::new(NoopVerifier),
             AssumeValid::Disabled,
             450,
+        4,
         )
         .unwrap();
 

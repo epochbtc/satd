@@ -30,6 +30,7 @@ fn make_test_ctx() -> (McpContext, tempfile::TempDir) {
             Box::new(NoopVerifier),
             AssumeValid::Disabled,
             450,
+        4,
         )
         .unwrap(),
     );
@@ -559,6 +560,7 @@ mod mining {
                 Box::new(NoopVerifier),
                 AssumeValid::Disabled,
                 450,
+            4,
             )
             .unwrap(),
         );
