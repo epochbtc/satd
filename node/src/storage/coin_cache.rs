@@ -430,6 +430,48 @@ impl Store for CoinCache {
         self.tx_index_cache.lock().unwrap().clear();
         self.inner.clear_all()
     }
+
+    fn get_coins_batch(&self, outpoints: &[OutPoint]) -> Vec<Option<Coin>> {
+        if outpoints.is_empty() {
+            return Vec::new();
+        }
+
+        let mut results: Vec<Option<Coin>> = vec![None; outpoints.len()];
+        let mut misses: Vec<(usize, OutPoint)> = Vec::new();
+
+        // 1. Check dirty map (single lock acquisition for all keys)
+        {
+            let dirty = self.dirty.read().unwrap();
+            let mut clean = self.clean.lock().unwrap();
+            for (i, outpoint) in outpoints.iter().enumerate() {
+                if let Some(entry) = dirty.get(outpoint) {
+                    results[i] = match entry {
+                        DirtyEntry::Present { coin, .. } => Some(coin.clone()),
+                        DirtyEntry::Spent { .. } => None,
+                    };
+                } else if let Some(coin) = clean.get(outpoint) {
+                    results[i] = Some(coin.clone());
+                } else {
+                    misses.push((i, *outpoint));
+                }
+            }
+        }
+
+        // 2. Batch fetch misses from backing store
+        if !misses.is_empty() {
+            let miss_outpoints: Vec<OutPoint> = misses.iter().map(|(_, op)| *op).collect();
+            let fetched = self.inner.get_coins_batch(&miss_outpoints);
+            let mut clean = self.clean.lock().unwrap();
+            for ((idx, outpoint), coin_opt) in misses.into_iter().zip(fetched) {
+                if let Some(coin) = &coin_opt {
+                    clean.put(outpoint, coin.clone());
+                }
+                results[idx] = coin_opt;
+            }
+        }
+
+        results
+    }
 }
 
 #[cfg(test)]

@@ -153,14 +153,24 @@ pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError>
     let network = *network;
     let num_threads = *num_threads;
     let flat_pos = *flat_pos;
-    let mut batch = StoreBatch::default();
-    let mut undo = UndoData::default();
     let block_hash = block.block_hash();
     let is_genesis = height == 0;
     let mut total_fees: u64 = 0;
 
+    // Pre-allocate based on block size
+    let total_inputs: usize = block.txdata.iter().map(|tx| tx.input.len()).sum();
+    let total_outputs: usize = block.txdata.iter().map(|tx| tx.output.len()).sum();
+    let mut batch = StoreBatch {
+        coin_puts: Vec::with_capacity(total_outputs),
+        coin_removes: Vec::with_capacity(total_inputs),
+        ..Default::default()
+    };
+    let mut undo = UndoData {
+        spent_coins: Vec::with_capacity(total_inputs),
+    };
+
     // Transactions queued for parallel script verification after UTXO resolution
-    let mut verify_queue: Vec<(&Transaction, Vec<TxOut>)> = Vec::new();
+    let mut verify_queue: Vec<(&Transaction, Vec<TxOut>)> = Vec::with_capacity(block.txdata.len());
 
     // Collect txids for txindex (computed once per tx, reused)
     let mut txids: Vec<bitcoin::Txid> = Vec::with_capacity(block.txdata.len());
@@ -191,37 +201,20 @@ pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError>
         .collect();
 
     let pre_resolved: HashMap<(usize, usize), Coin> = {
-
-        if external_lookups.len() < 100 || num_threads <= 1 {
-            // Small block — sequential is faster than thread overhead
+        if external_lookups.is_empty() {
+            HashMap::new()
+        } else {
+            // Batch UTXO lookup: single multi_get_cf call for all external inputs
+            let outpoints: Vec<OutPoint> = external_lookups.iter()
+                .map(|(_, _, op)| *op)
+                .collect();
+            let coins = store.get_coins_batch(&outpoints);
             external_lookups.iter()
-                .filter_map(|(tx_idx, in_idx, outpoint)| {
-                    store.get_coin(outpoint).map(|coin| ((*tx_idx, *in_idx), coin))
+                .zip(coins)
+                .filter_map(|((tx_idx, in_idx, _), coin_opt)| {
+                    coin_opt.map(|coin| ((*tx_idx, *in_idx), coin))
                 })
                 .collect()
-        } else {
-            let chunk_size = external_lookups.len().div_ceil(num_threads);
-            let mut results = HashMap::new();
-            std::thread::scope(|s| {
-                let handles: Vec<_> = external_lookups
-                    .chunks(chunk_size)
-                    .map(|chunk| {
-                        s.spawn(move || {
-                            chunk.iter()
-                                .filter_map(|(tx_idx, in_idx, outpoint)| {
-                                    store.get_coin(outpoint).map(|coin| ((*tx_idx, *in_idx), coin))
-                                })
-                                .collect::<Vec<_>>()
-                        })
-                    })
-                    .collect();
-                for handle in handles {
-                    for (key, coin) in handle.join().unwrap() {
-                        results.insert(key, coin);
-                    }
-                }
-            });
-            results
         }
     };
 

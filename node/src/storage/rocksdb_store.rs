@@ -223,7 +223,7 @@ impl Store for RocksDbStore {
         let cf = self.cf(CF_COINS);
         let key = outpoint_to_key(outpoint);
         let value = self.db.get_cf(&cf, key).ok()??;
-        bincode::deserialize(&value).ok()
+        Coin::deserialize_compact(&value)
     }
 
     fn has_coin(&self, outpoint: &OutPoint) -> bool {
@@ -278,8 +278,7 @@ impl Store for RocksDbStore {
 
         for (outpoint, coin) in &batch.coin_puts {
             let key = outpoint_to_key(outpoint);
-            let value =
-                bincode::serialize(coin).map_err(|e| StoreError::Serialization(e.to_string()))?;
+            let value = coin.serialize_compact();
             wb.put_cf(&cf_coins, key, &value);
             count_delta += 1;
             amount_delta += coin.amount as i64;
@@ -420,6 +419,26 @@ impl Store for RocksDbStore {
             self.drop_and_recreate_cf(cf_name)?;
         }
         Ok(())
+    }
+
+    fn get_coins_batch(&self, outpoints: &[OutPoint]) -> Vec<Option<Coin>> {
+        if outpoints.is_empty() {
+            return Vec::new();
+        }
+        let cf = self.cf(CF_COINS);
+        let keys: Vec<[u8; 36]> = outpoints.iter().map(outpoint_to_key).collect();
+        // multi_get_cf expects (&impl AsColumnFamilyRef, key) — Arc<BoundCF> impls it
+        let cf_keys: Vec<_> = keys.iter().map(|k| (&cf, k.as_slice())).collect();
+        self.db
+            .multi_get_cf(cf_keys)
+            .into_iter()
+            .map(|result| {
+                result
+                    .ok()
+                    .flatten()
+                    .and_then(|v| Coin::deserialize_compact(&v))
+            })
+            .collect()
     }
 }
 

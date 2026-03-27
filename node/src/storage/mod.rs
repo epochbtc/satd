@@ -80,4 +80,10 @@ pub trait Store: Send + Sync {
     /// Clear everything: block index, UTXO set, undo data, tx index, height index, tip.
     /// Used by `-reindex`.
     fn clear_all(&self) -> Result<(), StoreError>;
+
+    /// Batch lookup of multiple coins. Default implementation calls get_coin() in a loop.
+    /// RocksDB overrides with multi_get_cf() for significantly better I/O scheduling.
+    fn get_coins_batch(&self, outpoints: &[OutPoint]) -> Vec<Option<Coin>> {
+        outpoints.iter().map(|op| self.get_coin(op)).collect()
+    }
 }

@@ -49,6 +49,77 @@ mod script_serde {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Compact serialization for RocksDB coins CF.
+// Format: [varint(height<<1 | coinbase)] [varint(amount)] [varint(script_len)] [script]
+// ~28 bytes for P2WPKH vs ~43 with bincode (35% smaller).
+// ---------------------------------------------------------------------------
+
+/// Encode a u64 as a variable-length integer (7 bits per byte, MSB = more).
+fn encode_varint(mut val: u64, buf: &mut Vec<u8>) {
+    loop {
+        if val < 0x80 {
+            buf.push(val as u8);
+            return;
+        }
+        buf.push((val as u8 & 0x7F) | 0x80);
+        val >>= 7;
+    }
+}
+
+/// Decode a varint from a byte slice, returning (value, bytes_consumed).
+fn decode_varint(buf: &[u8]) -> Option<(u64, usize)> {
+    let mut val: u64 = 0;
+    let mut shift = 0u32;
+    for (i, &byte) in buf.iter().enumerate() {
+        val |= ((byte & 0x7F) as u64) << shift;
+        if byte & 0x80 == 0 {
+            return Some((val, i + 1));
+        }
+        shift += 7;
+        if shift >= 64 {
+            return None;
+        }
+    }
+    None
+}
+
+impl Coin {
+    /// Compact binary serialization: ~28 bytes for typical P2WPKH coin.
+    pub fn serialize_compact(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(32);
+        // Pack height and coinbase into a single varint
+        let height_cb = ((self.height as u64) << 1) | (self.coinbase as u64);
+        encode_varint(height_cb, &mut buf);
+        encode_varint(self.amount, &mut buf);
+        let script = self.script_pubkey.as_bytes();
+        encode_varint(script.len() as u64, &mut buf);
+        buf.extend_from_slice(script);
+        buf
+    }
+
+    /// Deserialize from compact binary format.
+    pub fn deserialize_compact(data: &[u8]) -> Option<Self> {
+        let (height_cb, n1) = decode_varint(data)?;
+        let height = (height_cb >> 1) as u32;
+        let coinbase = (height_cb & 1) != 0;
+        let (amount, n2) = decode_varint(&data[n1..])?;
+        let (script_len, n3) = decode_varint(&data[n1 + n2..])?;
+        let script_start = n1 + n2 + n3;
+        let script_end = script_start + script_len as usize;
+        if script_end > data.len() {
+            return None;
+        }
+        let script_pubkey = bitcoin::ScriptBuf::from_bytes(data[script_start..script_end].to_vec());
+        Some(Coin {
+            amount,
+            script_pubkey,
+            height,
+            coinbase,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,5 +200,68 @@ mod tests {
         assert_eq!(decoded.height, 0);
         assert!(!decoded.coinbase);
         assert!(decoded.script_pubkey.is_empty());
+    }
+
+    #[test]
+    fn test_compact_roundtrip_p2wpkh() {
+        let coin = Coin {
+            amount: 5_000_000_000,
+            script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x00, 0x14, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab]),
+            height: 800_000,
+            coinbase: false,
+        };
+        let encoded = coin.serialize_compact();
+        assert!(encoded.len() < 35, "compact should be <35 bytes, got {}", encoded.len());
+        let decoded = Coin::deserialize_compact(&encoded).unwrap();
+        assert_eq!(decoded.amount, coin.amount);
+        assert_eq!(decoded.height, coin.height);
+        assert_eq!(decoded.coinbase, coin.coinbase);
+        assert_eq!(decoded.script_pubkey, coin.script_pubkey);
+    }
+
+    #[test]
+    fn test_compact_roundtrip_coinbase() {
+        let coin = Coin {
+            amount: 625_000_000,
+            script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x76, 0xa9, 0x14]),
+            height: 100,
+            coinbase: true,
+        };
+        let encoded = coin.serialize_compact();
+        let decoded = Coin::deserialize_compact(&encoded).unwrap();
+        assert_eq!(decoded.amount, coin.amount);
+        assert_eq!(decoded.height, coin.height);
+        assert!(decoded.coinbase);
+        assert_eq!(decoded.script_pubkey, coin.script_pubkey);
+    }
+
+    #[test]
+    fn test_compact_roundtrip_zero() {
+        let coin = Coin {
+            amount: 0,
+            script_pubkey: bitcoin::ScriptBuf::new(),
+            height: 0,
+            coinbase: false,
+        };
+        let encoded = coin.serialize_compact();
+        assert_eq!(encoded.len(), 3); // 1 byte each for height_cb, amount, script_len
+        let decoded = Coin::deserialize_compact(&encoded).unwrap();
+        assert_eq!(decoded.amount, 0);
+        assert_eq!(decoded.height, 0);
+        assert!(!decoded.coinbase);
+    }
+
+    #[test]
+    fn test_compact_smaller_than_bincode() {
+        let coin = Coin {
+            amount: 100_000_000, // 1 BTC
+            script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x00, 0x14, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab]),
+            height: 500_000,
+            coinbase: false,
+        };
+        let compact = coin.serialize_compact();
+        let bincode_encoded = bincode::serialize(&coin).unwrap();
+        assert!(compact.len() < bincode_encoded.len(),
+            "compact {} should be smaller than bincode {}", compact.len(), bincode_encoded.len());
     }
 }

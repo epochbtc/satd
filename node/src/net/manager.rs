@@ -1326,7 +1326,7 @@ impl PeerManager {
             chain_state.blocks_dir().to_path_buf(),
             chain_state.tip_height() + 1,
             prefetch_workers,
-            32, // lookahead blocks
+            128, // lookahead blocks
         );
 
         loop {
