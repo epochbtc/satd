@@ -228,6 +228,7 @@ async fn main() {
         verifier,
         assumevalid,
         coincache_mb as u64,
+        config.prefetch_workers,
     ) {
         Ok(cs) => Arc::new(cs),
         Err(e) => {

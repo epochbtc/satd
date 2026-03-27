@@ -253,6 +253,7 @@ mod tests {
             Box::new(NoopVerifier),
             AssumeValid::Disabled,
             450,
+        4,
         )
         .unwrap();
         let mp = Mempool::new(1_000_000, 0);
@@ -283,6 +284,7 @@ mod tests {
             Box::new(NoopVerifier),
             AssumeValid::Disabled,
             450,
+        4,
         )
         .unwrap();
         let mp = Mempool::new(1_000_000, 0);
@@ -314,6 +316,7 @@ mod tests {
             Box::new(NoopVerifier),
             AssumeValid::Disabled,
             450,
+        4,
         )
         .unwrap();
         let mp = Mempool::new(1_000_000, 0);
@@ -343,6 +346,7 @@ mod tests {
             Box::new(NoopVerifier),
             AssumeValid::Disabled,
             450,
+        4,
         )
         .unwrap();
         let mp = Mempool::new(1_000_000, 0);
@@ -376,6 +380,7 @@ mod tests {
             Box::new(NoopVerifier),
             AssumeValid::Disabled,
             450,
+        4,
         )
         .unwrap();
         let mp = Mempool::new(1_000_000, 0);

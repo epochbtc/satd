@@ -12,12 +12,29 @@ pub enum ScriptError {
 pub trait ScriptVerifier: Send + Sync {
     /// Verify all inputs of a transaction against their previous outputs.
     /// `prev_outputs` must have one entry per input, in the same order.
+    /// `height` is used to determine which softfork rules are active.
     fn verify_transaction(
         &self,
         tx: &Transaction,
         prev_outputs: &[TxOut],
+        height: u32,
     ) -> Result<(), ScriptError>;
+
+    /// If this verifier runs in shadow mode, return the shadow engine.
+    /// `connect_block` uses this to run primary and shadow in parallel at
+    /// the block level instead of sequentially per transaction.
+    fn shadow_verifier(&self) -> Option<&dyn ScriptVerifier> {
+        None
+    }
 }
+
+/// Softfork activation heights (mainnet). Verification flags are cumulative.
+const BIP16_HEIGHT: u32 = 173_805;  // P2SH
+const BIP66_HEIGHT: u32 = 363_725;  // Strict DER signatures
+const BIP65_HEIGHT: u32 = 388_381;  // CHECKLOCKTIMEVERIFY
+const BIP112_HEIGHT: u32 = 419_328; // CHECKSEQUENCEVERIFY
+const SEGWIT_HEIGHT: u32 = 481_824; // Segregated Witness + NULLDUMMY
+const TAPROOT_HEIGHT: u32 = 709_632; // Taproot
 
 /// Script verifier backed by Bitcoin Core's libconsensus via FFI.
 /// Supports all consensus rules including taproot.
@@ -28,17 +45,31 @@ impl ScriptVerifier for ConsensusVerifier {
         &self,
         tx: &Transaction,
         prev_outputs: &[TxOut],
+        height: u32,
     ) -> Result<(), ScriptError> {
         let tx_bytes = bitcoin::consensus::serialize(tx);
 
-        // Full verification flags including taproot
-        let flags = bitcoinconsensus::VERIFY_P2SH
-            | bitcoinconsensus::VERIFY_DERSIG
-            | bitcoinconsensus::VERIFY_CHECKLOCKTIMEVERIFY
-            | bitcoinconsensus::VERIFY_CHECKSEQUENCEVERIFY
-            | bitcoinconsensus::VERIFY_WITNESS
-            | bitcoinconsensus::VERIFY_NULLDUMMY
-            | bitcoinconsensus::VERIFY_TAPROOT;
+        // Compute verification flags based on softfork activation heights
+        let mut flags = 0u32;
+        if height >= BIP16_HEIGHT {
+            flags |= bitcoinconsensus::VERIFY_P2SH;
+        }
+        if height >= BIP66_HEIGHT {
+            flags |= bitcoinconsensus::VERIFY_DERSIG;
+        }
+        if height >= BIP65_HEIGHT {
+            flags |= bitcoinconsensus::VERIFY_CHECKLOCKTIMEVERIFY;
+        }
+        if height >= BIP112_HEIGHT {
+            flags |= bitcoinconsensus::VERIFY_CHECKSEQUENCEVERIFY;
+        }
+        if height >= SEGWIT_HEIGHT {
+            flags |= bitcoinconsensus::VERIFY_WITNESS
+                | bitcoinconsensus::VERIFY_NULLDUMMY;
+        }
+        if height >= TAPROOT_HEIGHT {
+            flags |= bitcoinconsensus::VERIFY_TAPROOT;
+        }
 
         // Build spent outputs array for taproot (needed for signature hash)
         let script_bytes: Vec<Vec<u8>> = prev_outputs
@@ -83,6 +114,7 @@ impl ScriptVerifier for NoopVerifier {
         &self,
         _tx: &Transaction,
         _prev_outputs: &[TxOut],
+        _height: u32,
     ) -> Result<(), ScriptError> {
         Ok(())
     }
@@ -100,16 +132,29 @@ impl ScriptVerifier for RustVerifier {
         &self,
         tx: &Transaction,
         prev_outputs: &[TxOut],
+        height: u32,
     ) -> Result<(), ScriptError> {
         let tx_bytes = bitcoin::consensus::serialize(tx);
 
-        let flags = consensus::VERIFY_P2SH
-            | consensus::VERIFY_DERSIG
-            | consensus::VERIFY_CHECKLOCKTIMEVERIFY
-            | consensus::VERIFY_CHECKSEQUENCEVERIFY
-            | consensus::VERIFY_WITNESS
-            | consensus::VERIFY_NULLDUMMY
-            | consensus::VERIFY_TAPROOT;
+        let mut flags = 0u32;
+        if height >= BIP16_HEIGHT {
+            flags |= consensus::VERIFY_P2SH;
+        }
+        if height >= BIP66_HEIGHT {
+            flags |= consensus::VERIFY_DERSIG;
+        }
+        if height >= BIP65_HEIGHT {
+            flags |= consensus::VERIFY_CHECKLOCKTIMEVERIFY;
+        }
+        if height >= BIP112_HEIGHT {
+            flags |= consensus::VERIFY_CHECKSEQUENCEVERIFY;
+        }
+        if height >= SEGWIT_HEIGHT {
+            flags |= consensus::VERIFY_WITNESS | consensus::VERIFY_NULLDUMMY;
+        }
+        if height >= TAPROOT_HEIGHT {
+            flags |= consensus::VERIFY_TAPROOT;
+        }
 
         let script_bytes: Vec<Vec<u8>> = prev_outputs
             .iter()
@@ -147,11 +192,11 @@ impl ScriptVerifier for RustVerifier {
     }
 }
 
-/// Shadow verifier: runs two engines, compares results, returns the
-/// primary engine's result. Mismatches are logged at ERROR level.
+/// Shadow verifier: exposes primary and shadow engines so `connect_block`
+/// can run them in parallel at the block level (not per-transaction).
 ///
-/// Use `ShadowVerifier::new(primary, shadow)` to configure which engine
-/// is authoritative and which runs in shadow mode.
+/// `verify_transaction()` only runs the primary engine. The shadow engine
+/// is returned by `shadow_verifier()` for parallel execution in connect_block.
 pub struct ShadowVerifier {
     primary: Box<dyn ScriptVerifier>,
     shadow: Box<dyn ScriptVerifier>,
@@ -168,28 +213,13 @@ impl ScriptVerifier for ShadowVerifier {
         &self,
         tx: &Transaction,
         prev_outputs: &[TxOut],
+        height: u32,
     ) -> Result<(), ScriptError> {
-        let primary_result = self.primary.verify_transaction(tx, prev_outputs);
-        let shadow_result = self.shadow.verify_transaction(tx, prev_outputs);
+        // Only run primary — shadow runs in parallel at the block level
+        self.primary.verify_transaction(tx, prev_outputs, height)
+    }
 
-        match (&primary_result, &shadow_result) {
-            (Ok(()), Ok(())) | (Err(_), Err(_)) => {} // agree
-            (Ok(()), Err(e)) => {
-                tracing::error!(
-                    "SHADOW MISMATCH: primary accepted but shadow REJECTED: {} (txid={})",
-                    e,
-                    tx.compute_txid(),
-                );
-            }
-            (Err(e), Ok(())) => {
-                tracing::error!(
-                    "SHADOW MISMATCH: primary REJECTED but shadow accepted: {} (txid={})",
-                    e,
-                    tx.compute_txid(),
-                );
-            }
-        }
-
-        primary_result
+    fn shadow_verifier(&self) -> Option<&dyn ScriptVerifier> {
+        Some(&*self.shadow)
     }
 }

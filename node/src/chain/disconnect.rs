@@ -21,7 +21,7 @@ pub fn disconnect_block(
                 txid,
                 vout: vout as u32,
             };
-            batch.coin_removes.push((outpoint, output.value.to_sat()));
+            batch.coin_removes.push((outpoint, output.value.to_sat(), block_height));
         }
     }
 
@@ -244,7 +244,7 @@ mod tests {
             batch
                 .coin_removes
                 .iter()
-                .any(|(op, _)| op.txid == coinbase_txid && op.vout == 0),
+                .any(|(op, _, _)| op.txid == coinbase_txid && op.vout == 0),
             "coin_removes should contain the coinbase output"
         );
 
@@ -300,11 +300,11 @@ mod tests {
         let spending_txid = block.txdata[1].compute_txid();
         let coinbase_txid = block.txdata[0].compute_txid();
         assert!(
-            batch.coin_removes.iter().any(|(op, _)| op.txid == spending_txid),
+            batch.coin_removes.iter().any(|(op, _, _)| op.txid == spending_txid),
             "spending tx outputs should be in coin_removes"
         );
         assert!(
-            batch.coin_removes.iter().any(|(op, _)| op.txid == coinbase_txid),
+            batch.coin_removes.iter().any(|(op, _, _)| op.txid == coinbase_txid),
             "coinbase outputs should be in coin_removes"
         );
     }
@@ -849,6 +849,7 @@ mod tests {
             Box::new(NoopVerifier),
             AssumeValid::Disabled,
             450,
+        4,
         )
         .unwrap();
 

@@ -70,7 +70,7 @@ impl Store for InMemoryStore {
         for (outpoint, coin) in batch.coin_puts {
             coins.insert(outpoint, coin);
         }
-        for (outpoint, _amount) in batch.coin_removes {
+        for (outpoint, _amount, _height) in batch.coin_removes {
             coins.remove(&outpoint);
         }
         if let Some(hash) = batch.tip {
@@ -216,7 +216,7 @@ mod tests {
 
         // Remove
         let mut batch2 = StoreBatch::default();
-        batch2.coin_removes.push((outpoint, 42));
+        batch2.coin_removes.push((outpoint, 42, 0));
         store.write_batch(batch2).unwrap();
         assert!(!store.has_coin(&outpoint));
     }

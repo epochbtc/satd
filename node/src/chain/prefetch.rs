@@ -159,7 +159,7 @@ pub fn prefetch_block(
 
         if verifiable.is_empty() || num_threads <= 1 {
             verifiable.iter()
-                .filter(|(_, tx, prev_outputs)| verifier.verify_transaction(tx, prev_outputs).is_ok())
+                .filter(|(_, tx, prev_outputs)| verifier.verify_transaction(tx, prev_outputs, height).is_ok())
                 .map(|(tx_idx, _, _)| *tx_idx)
                 .collect()
         } else {
@@ -171,7 +171,7 @@ pub fn prefetch_block(
                     .map(|chunk| {
                         s.spawn(move || {
                             chunk.iter()
-                                .filter(|(_, tx, prev_outputs)| verifier_ref.verify_transaction(tx, prev_outputs).is_ok())
+                                .filter(|(_, tx, prev_outputs)| verifier_ref.verify_transaction(tx, prev_outputs, height).is_ok())
                                 .map(|(tx_idx, _, _)| *tx_idx)
                                 .collect::<Vec<_>>()
                         })

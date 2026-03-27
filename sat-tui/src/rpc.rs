@@ -3,9 +3,11 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use std::path::{Path, PathBuf};
 
 /// RPC client for communicating with satd.
+/// Automatically re-reads the cookie file on auth failure (handles satd restarts).
 pub struct RpcClient {
     url: String,
-    auth_header: String,
+    auth_header: std::sync::RwLock<String>,
+    cookie_path: Option<PathBuf>,
     client: reqwest::Client,
 }
 
@@ -14,7 +16,8 @@ impl RpcClient {
         let auth_header = format!("Basic {}", BASE64.encode(format!("{}:{}", user, pass)));
         Self {
             url: format!("http://{}:{}/", host, port),
-            auth_header,
+            auth_header: std::sync::RwLock::new(auth_header),
+            cookie_path: None,
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
@@ -22,11 +25,44 @@ impl RpcClient {
         }
     }
 
-    pub async fn call(&self, method: &str, params: &[serde_json::Value]) -> Result<serde_json::Value, RpcError> {
-        self.call_with(&self.client, method, params).await
+    /// Create with cookie file path for automatic re-auth on satd restart.
+    pub fn with_cookie(host: &str, port: u16, cookie_path: PathBuf) -> Self {
+        let auth_header = read_cookie_file(&cookie_path)
+            .map(|(u, p)| format!("Basic {}", BASE64.encode(format!("{}:{}", u, p))))
+            .unwrap_or_default();
+        Self {
+            url: format!("http://{}:{}/", host, port),
+            auth_header: std::sync::RwLock::new(auth_header),
+            cookie_path: Some(cookie_path),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap(),
+        }
     }
 
-    async fn call_with(&self, client: &reqwest::Client, method: &str, params: &[serde_json::Value]) -> Result<serde_json::Value, RpcError> {
+    /// Re-read the cookie file and update the auth header.
+    fn refresh_auth(&self) -> bool {
+        if let Some(path) = &self.cookie_path
+            && let Ok((u, p)) = read_cookie_file(path)
+        {
+            let new_auth = format!("Basic {}", BASE64.encode(format!("{}:{}", u, p)));
+            *self.auth_header.write().unwrap() = new_auth;
+            return true;
+        }
+        false
+    }
+
+    pub async fn call(&self, method: &str, params: &[serde_json::Value]) -> Result<serde_json::Value, RpcError> {
+        let result = self.call_inner(method, params).await;
+        // On auth failure, try refreshing the cookie and retrying once
+        if matches!(result, Err(RpcError::AuthFailed)) && self.refresh_auth() {
+            return self.call_inner(method, params).await;
+        }
+        result
+    }
+
+    async fn call_inner(&self, method: &str, params: &[serde_json::Value]) -> Result<serde_json::Value, RpcError> {
         let body = serde_json::json!({
             "jsonrpc": "2.0",
             "id": "sat-tui",
@@ -34,10 +70,11 @@ impl RpcClient {
             "params": params,
         });
 
-        let response = client
+        let auth = self.auth_header.read().unwrap().clone();
+        let response = self.client
             .post(&self.url)
             .header("Content-Type", "application/json")
-            .header("Authorization", &self.auth_header)
+            .header("Authorization", &auth)
             .json(&body)
             .send()
             .await

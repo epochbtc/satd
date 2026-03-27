@@ -104,6 +104,8 @@ pub struct ChainState {
     /// Cached block timestamps for MTP computation (avoids 22 DB reads per block).
     /// Stores (height, timestamp) pairs for the last ~12 blocks.
     mtp_cache: Mutex<Vec<(u32, u32)>>,
+    /// Number of threads for parallel script verification.
+    num_threads: usize,
 }
 
 impl ChainState {
@@ -117,6 +119,7 @@ impl ChainState {
         script_verifier: Box<dyn ScriptVerifier>,
         assumevalid: AssumeValid,
         dbcache_mb: u64,
+        num_threads: usize,
     ) -> Result<Self, ChainError> {
         let genesis = bitcoin::constants::genesis_block(network);
         let genesis_hash = genesis.block_hash();
@@ -172,6 +175,7 @@ impl ChainState {
                     checkpoints,
                     headers_tip_height: AtomicU32::new(htip),
                     mtp_cache: Mutex::new(Vec::with_capacity(12)),
+                    num_threads,
                 });
             }
 
@@ -213,6 +217,7 @@ impl ChainState {
             checkpoints,
             headers_tip_height: AtomicU32::new(0),
             mtp_cache: Mutex::new(Vec::with_capacity(12)),
+            num_threads,
         })
     }
 
@@ -581,7 +586,7 @@ impl ChainState {
             median_time_past: pre.mtp,
             network: self.network,
             pre_verified_txs: pre_verified,
-            num_threads: std::thread::available_parallelism().map(|n| n.get().min(8)).unwrap_or(4),
+            num_threads: self.num_threads,
         })?;
 
         // Atomic commit
@@ -759,7 +764,7 @@ impl ChainState {
             median_time_past: mtp,
             network: self.network,
             pre_verified_txs: None,
-            num_threads: std::thread::available_parallelism().map(|n| n.get().min(8)).unwrap_or(4),
+            num_threads: self.num_threads,
         })?;
 
         // Atomic commit
@@ -817,7 +822,7 @@ impl ChainState {
                 median_time_past: mtp,
                 network: self.network,
                 pre_verified_txs: None,
-                num_threads: std::thread::available_parallelism().map(|n| n.get().min(8)).unwrap_or(4),
+                num_threads: self.num_threads,
             })?;
             self.store.write_batch(batch)?;
 
@@ -906,7 +911,7 @@ impl ChainState {
                 median_time_past: mtp,
                 network: self.network,
                 pre_verified_txs: None,
-                num_threads: std::thread::available_parallelism().map(|n| n.get().min(8)).unwrap_or(4),
+                num_threads: self.num_threads,
             })?;
             self.store.write_batch(batch)?;
 
@@ -1118,7 +1123,7 @@ impl ChainState {
             median_time_past: mtp,
             network: self.network,
             pre_verified_txs: None,
-            num_threads: 1,
+            num_threads: self.num_threads,
         })?;
 
         // Atomic commit
@@ -1318,6 +1323,7 @@ pub(crate) mod tests {
             Box::new(NoopVerifier),
             AssumeValid::Disabled,
             450,
+        4,
         )
         .unwrap();
         (cs, dir)
@@ -1616,6 +1622,7 @@ pub(crate) mod tests {
             Box::new(NoopVerifier),
             AssumeValid::Disabled,
             450,
+        4,
         )
         .unwrap();
 
@@ -1951,6 +1958,7 @@ pub(crate) mod tests {
             Box::new(NoopVerifier),
             AssumeValid::Hash(block1_hash),
             450,
+        4,
         )
         .unwrap();
 
@@ -2473,6 +2481,7 @@ pub(crate) mod tests {
             Box::new(NoopVerifier),
             AssumeValid::Disabled,
             450,
+        4,
         )
         .unwrap();
 
