@@ -106,7 +106,8 @@ async fn main() {
     let rocksdb_cache_mb = config.dbcache / 3;
     let coincache_mb = config.dbcache - rocksdb_cache_mb;
 
-    let store = match RocksDbStore::open(&net_datadir, config.txindex, rocksdb_cache_mb) {
+    let reindex = config.reindex || config.reindex_chainstate;
+    let store = match RocksDbStore::open(&net_datadir, config.txindex, rocksdb_cache_mb, reindex) {
         Ok(s) => Box::new(s),
         Err(e) => {
             eprintln!("Error opening chain database: {}", e);

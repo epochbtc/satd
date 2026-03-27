@@ -114,16 +114,28 @@ pub fn prefetch_block(
         let _ = check_transaction(tx);
     }
 
-    // 6. Speculative UTXO resolution (cache warming)
-    let mut speculative_coins = HashMap::new();
-    for (tx_idx, tx) in block.txdata.iter().enumerate() {
-        if tx.is_coinbase() {
-            continue;
-        }
-        for (input_idx, input) in tx.input.iter().enumerate() {
-            if let Some(coin) = store.get_coin(&input.previous_output) {
-                speculative_coins.insert((tx_idx, input_idx), coin);
+    // 6. Speculative UTXO resolution (cache warming) — batch lookup
+    let input_keys: Vec<(usize, usize, bitcoin::OutPoint)> = block
+        .txdata
+        .iter()
+        .enumerate()
+        .flat_map(|(tx_idx, tx)| {
+            if tx.is_coinbase() {
+                return Vec::new();
             }
+            tx.input
+                .iter()
+                .enumerate()
+                .map(|(input_idx, input)| (tx_idx, input_idx, input.previous_output))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let outpoints: Vec<bitcoin::OutPoint> = input_keys.iter().map(|(_, _, op)| *op).collect();
+    let coins = store.get_coins_batch(&outpoints);
+    let mut speculative_coins = HashMap::new();
+    for ((tx_idx, input_idx, _), coin_opt) in input_keys.into_iter().zip(coins) {
+        if let Some(coin) = coin_opt {
+            speculative_coins.insert((tx_idx, input_idx), coin);
         }
     }
 
@@ -297,14 +309,23 @@ pub fn start_prefetcher(
 
             // Assign work up to lookahead ahead of next_to_send
             while next_to_assign < next_to_send + lookahead as u32 {
-                // Check if block data is available before dispatching
-                if coord_store
+                // Only dispatch if block DATA is stored (not just header)
+                let has_data = coord_store
                     .get_block_hash_by_height(next_to_assign)
-                    .is_some()
-                {
+                    .and_then(|hash| coord_store.get_block_index(&hash))
+                    .is_some_and(|entry| {
+                        matches!(
+                            entry.status,
+                            BlockStatus::DataStored | BlockStatus::Valid
+                        )
+                    });
+                if has_data {
                     let _ = work_tx.try_send(next_to_assign);
+                    next_to_assign += 1;
+                } else {
+                    // Block data not yet stored — stop dispatching, retry next loop
+                    break;
                 }
-                next_to_assign += 1;
             }
 
             // Collect results from workers

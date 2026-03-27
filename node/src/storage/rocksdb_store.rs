@@ -2,7 +2,7 @@ use bitcoin::hashes::Hash;
 use bitcoin::{BlockHash, OutPoint, Txid};
 use rocksdb::{
     BlockBasedOptions, BoundColumnFamily, Cache, ColumnFamilyDescriptor, DBCompressionType,
-    DBWithThreadMode, MultiThreaded, Options, WriteBatch,
+    DBWithThreadMode, IteratorMode, MultiThreaded, Options, WriteBatch,
 };
 use std::path::Path;
 use std::sync::Arc;
@@ -24,6 +24,8 @@ const UTXO_COUNT_KEY: &[u8] = b"utxo_count";
 const TOTAL_AMOUNT_KEY: &[u8] = b"total_amount";
 const UTXO_HEIGHT_HIST_KEY: &[u8] = b"utxo_height_hist";
 const HEIGHT_HIST_BUCKET: u32 = 1000;
+const SCHEMA_KEY: &[u8] = b"schema_version";
+const CURRENT_SCHEMA_VERSION: u32 = 2; // v2 = compact varint coins
 
 fn hash_bytes(hash: &BlockHash) -> &[u8] {
     hash.as_ref()
@@ -54,7 +56,7 @@ pub struct RocksDbStore {
 }
 
 impl RocksDbStore {
-    pub fn open(path: &Path, txindex: bool, cache_mb: usize) -> Result<Self, StoreError> {
+    pub fn open(path: &Path, txindex: bool, cache_mb: usize, reindex: bool) -> Result<Self, StoreError> {
         let db_path = path.join("chainstate");
 
         let cpus = std::thread::available_parallelism()
@@ -131,6 +133,48 @@ impl RocksDbStore {
             ))
         })?;
 
+        // Schema version check: ensure coin format matches this binary.
+        // Skip when reindexing — the DB is about to be cleared.
+        if !reindex {
+            let cf_meta = db.cf_handle(CF_METADATA).expect("metadata CF missing");
+            match db.get_cf(&cf_meta, SCHEMA_KEY) {
+                Ok(Some(v)) => {
+                    let stored = u32::from_le_bytes(v[..].try_into().unwrap_or([0; 4]));
+                    if stored != CURRENT_SCHEMA_VERSION {
+                        return Err(StoreError::Database(format!(
+                            "Chainstate schema version mismatch: DB has v{}, binary expects v{}. \
+                             Run with --reindex to rebuild.",
+                            stored, CURRENT_SCHEMA_VERSION
+                        )));
+                    }
+                }
+                Ok(None) => {
+                    let cf_coins = db.cf_handle(CF_COINS).expect("coins CF missing");
+                    let has_coins = db
+                        .iterator_cf(&cf_coins, IteratorMode::Start)
+                        .next()
+                        .is_some();
+                    if has_coins {
+                        return Err(StoreError::Database(
+                            "Existing chainstate has no schema version (pre-compact format). \
+                             Run with --reindex to rebuild."
+                                .to_string(),
+                        ));
+                    }
+                    Self::stamp_schema(&db, CURRENT_SCHEMA_VERSION)?;
+                }
+                Err(e) => {
+                    return Err(StoreError::Database(format!(
+                        "Failed to read schema version: {}",
+                        e
+                    )));
+                }
+            }
+        } else {
+            // Reindexing — stamp version (clear_all will erase it, but
+            // write_schema_version below handles the re-stamp after clear).
+        }
+
         Ok(Self {
             db,
             txindex_enabled: txindex,
@@ -186,6 +230,14 @@ impl RocksDbStore {
         cf_opts
     }
 
+    /// Write schema version to the metadata CF.
+    fn stamp_schema(db: &DB, version: u32) -> Result<(), StoreError> {
+        let cf_meta = db.cf_handle(CF_METADATA).expect("metadata CF missing");
+        let mut wb = WriteBatch::default();
+        wb.put_cf(&cf_meta, SCHEMA_KEY, version.to_le_bytes());
+        db.write(wb).map_err(|e| StoreError::Database(e.to_string()))
+    }
+
     /// O(1) column family clear: drop and recreate with original options.
     fn drop_and_recreate_cf(&self, name: &str) -> Result<(), StoreError> {
         let opts = self.cf_options(name);
@@ -223,7 +275,16 @@ impl Store for RocksDbStore {
         let cf = self.cf(CF_COINS);
         let key = outpoint_to_key(outpoint);
         let value = self.db.get_cf(&cf, key).ok()??;
-        bincode::deserialize(&value).ok()
+        let coin = Coin::deserialize_compact(&value);
+        if coin.is_none() {
+            tracing::error!(
+                "corrupt coin: failed to deserialize {} bytes for {}:{}",
+                value.len(),
+                outpoint.txid,
+                outpoint.vout
+            );
+        }
+        coin
     }
 
     fn has_coin(&self, outpoint: &OutPoint) -> bool {
@@ -278,8 +339,7 @@ impl Store for RocksDbStore {
 
         for (outpoint, coin) in &batch.coin_puts {
             let key = outpoint_to_key(outpoint);
-            let value =
-                bincode::serialize(coin).map_err(|e| StoreError::Serialization(e.to_string()))?;
+            let value = coin.serialize_compact();
             wb.put_cf(&cf_coins, key, &value);
             count_delta += 1;
             amount_delta += coin.amount as i64;
@@ -404,7 +464,8 @@ impl Store for RocksDbStore {
         for cf_name in cfs {
             self.drop_and_recreate_cf(cf_name)?;
         }
-        Ok(())
+        // Re-stamp schema version after metadata CF was recreated
+        Self::stamp_schema(&self.db, CURRENT_SCHEMA_VERSION)
     }
 
     fn clear_all(&self) -> Result<(), StoreError> {
@@ -419,7 +480,37 @@ impl Store for RocksDbStore {
         for cf_name in all_cfs {
             self.drop_and_recreate_cf(cf_name)?;
         }
-        Ok(())
+        // Re-stamp schema version after metadata CF was recreated
+        Self::stamp_schema(&self.db, CURRENT_SCHEMA_VERSION)
+    }
+
+    fn get_coins_batch(&self, outpoints: &[OutPoint]) -> Vec<Option<Coin>> {
+        if outpoints.is_empty() {
+            return Vec::new();
+        }
+        let cf = self.cf(CF_COINS);
+        let keys: Vec<[u8; 36]> = outpoints.iter().map(outpoint_to_key).collect();
+        // multi_get_cf expects (&impl AsColumnFamilyRef, key) — Arc<BoundCF> impls it
+        let cf_keys: Vec<_> = keys.iter().map(|k| (&cf, k.as_slice())).collect();
+        self.db
+            .multi_get_cf(cf_keys)
+            .into_iter()
+            .enumerate()
+            .map(|(i, result)| {
+                result.ok().flatten().and_then(|v| {
+                    let coin = Coin::deserialize_compact(&v);
+                    if coin.is_none() {
+                        tracing::error!(
+                            "corrupt coin: failed to deserialize {} bytes for {}:{}",
+                            v.len(),
+                            outpoints[i].txid,
+                            outpoints[i].vout
+                        );
+                    }
+                    coin
+                })
+            })
+            .collect()
     }
 }
 
@@ -436,7 +527,7 @@ mod tests {
 
     fn temp_store(txindex: bool) -> (RocksDbStore, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let store = RocksDbStore::open(dir.path(), txindex, 16).unwrap();
+        let store = RocksDbStore::open(dir.path(), txindex, 16, false).unwrap();
         (store, dir)
     }
 
