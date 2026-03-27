@@ -98,7 +98,7 @@ impl Coin {
         buf
     }
 
-    /// Deserialize from compact binary format.
+    /// Deserialize from compact binary format. Rejects trailing bytes.
     pub fn deserialize_compact(data: &[u8]) -> Option<Self> {
         let (height_cb, n1) = decode_varint(data)?;
         let height = (height_cb >> 1) as u32;
@@ -107,7 +107,8 @@ impl Coin {
         let (script_len, n3) = decode_varint(&data[n1 + n2..])?;
         let script_start = n1 + n2 + n3;
         let script_end = script_start + script_len as usize;
-        if script_end > data.len() {
+        // Strict: exact length match, reject trailing garbage
+        if script_end != data.len() {
             return None;
         }
         let script_pubkey = bitcoin::ScriptBuf::from_bytes(data[script_start..script_end].to_vec());

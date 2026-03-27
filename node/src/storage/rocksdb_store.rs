@@ -2,7 +2,7 @@ use bitcoin::hashes::Hash;
 use bitcoin::{BlockHash, OutPoint, Txid};
 use rocksdb::{
     BlockBasedOptions, BoundColumnFamily, Cache, ColumnFamilyDescriptor, DBCompressionType,
-    DBWithThreadMode, MultiThreaded, Options, WriteBatch,
+    DBWithThreadMode, IteratorMode, MultiThreaded, Options, WriteBatch,
 };
 use std::path::Path;
 use std::sync::Arc;
@@ -131,6 +131,55 @@ impl RocksDbStore {
             ))
         })?;
 
+        // Schema version check: ensure coin format matches this binary
+        const SCHEMA_VERSION: u32 = 2; // v2 = compact varint coins
+        const SCHEMA_KEY: &[u8] = b"schema_version";
+        {
+            let cf_meta = db
+                .cf_handle(CF_METADATA)
+                .expect("metadata CF missing");
+            match db.get_cf(&cf_meta, SCHEMA_KEY) {
+                Ok(Some(v)) => {
+                    let stored = u32::from_le_bytes(v[..].try_into().unwrap_or([0; 4]));
+                    if stored != SCHEMA_VERSION {
+                        return Err(StoreError::Database(format!(
+                            "Chainstate schema version mismatch: DB has v{}, binary expects v{}. \
+                             Run with --reindex to rebuild.",
+                            stored, SCHEMA_VERSION
+                        )));
+                    }
+                }
+                Ok(None) => {
+                    // Fresh DB or pre-versioning DB — check if coins exist
+                    let cf_coins = db
+                        .cf_handle(CF_COINS)
+                        .expect("coins CF missing");
+                    let has_coins = db
+                        .iterator_cf(&cf_coins, IteratorMode::Start)
+                        .next()
+                        .is_some();
+                    if has_coins {
+                        return Err(StoreError::Database(
+                            "Existing chainstate has no schema version (pre-compact format). \
+                             Run with --reindex to rebuild."
+                                .to_string(),
+                        ));
+                    }
+                    // Empty DB — stamp with current version
+                    let mut wb = WriteBatch::default();
+                    wb.put_cf(&cf_meta, SCHEMA_KEY, SCHEMA_VERSION.to_le_bytes());
+                    db.write(wb)
+                        .map_err(|e| StoreError::Database(e.to_string()))?;
+                }
+                Err(e) => {
+                    return Err(StoreError::Database(format!(
+                        "Failed to read schema version: {}",
+                        e
+                    )));
+                }
+            }
+        }
+
         Ok(Self {
             db,
             txindex_enabled: txindex,
@@ -223,7 +272,16 @@ impl Store for RocksDbStore {
         let cf = self.cf(CF_COINS);
         let key = outpoint_to_key(outpoint);
         let value = self.db.get_cf(&cf, key).ok()??;
-        Coin::deserialize_compact(&value)
+        let coin = Coin::deserialize_compact(&value);
+        if coin.is_none() {
+            tracing::error!(
+                "corrupt coin: failed to deserialize {} bytes for {}:{}",
+                value.len(),
+                outpoint.txid,
+                outpoint.vout
+            );
+        }
+        coin
     }
 
     fn has_coin(&self, outpoint: &OutPoint) -> bool {
@@ -432,11 +490,20 @@ impl Store for RocksDbStore {
         self.db
             .multi_get_cf(cf_keys)
             .into_iter()
-            .map(|result| {
-                result
-                    .ok()
-                    .flatten()
-                    .and_then(|v| Coin::deserialize_compact(&v))
+            .enumerate()
+            .map(|(i, result)| {
+                result.ok().flatten().and_then(|v| {
+                    let coin = Coin::deserialize_compact(&v);
+                    if coin.is_none() {
+                        tracing::error!(
+                            "corrupt coin: failed to deserialize {} bytes for {}:{}",
+                            v.len(),
+                            outpoints[i].txid,
+                            outpoints[i].vout
+                        );
+                    }
+                    coin
+                })
             })
             .collect()
     }
