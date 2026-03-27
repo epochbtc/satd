@@ -208,8 +208,15 @@ impl ScriptVerifier for ShadowVerifier {
         prev_outputs: &[TxOut],
         height: u32,
     ) -> Result<(), ScriptError> {
-        let primary_result = self.primary.verify_transaction(tx, prev_outputs, height);
-        let shadow_result = self.shadow.verify_transaction(tx, prev_outputs, height);
+        // Run both engines in parallel — wall-clock = max(primary, shadow) instead of sum
+        let (primary_result, shadow_result) = std::thread::scope(|s| {
+            let shadow_handle = s.spawn(|| {
+                self.shadow.verify_transaction(tx, prev_outputs, height)
+            });
+            let primary_result = self.primary.verify_transaction(tx, prev_outputs, height);
+            let shadow_result = shadow_handle.join().unwrap();
+            (primary_result, shadow_result)
+        });
 
         match (&primary_result, &shadow_result) {
             (Ok(()), Ok(())) | (Err(_), Err(_)) => {} // agree
