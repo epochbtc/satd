@@ -97,11 +97,11 @@ impl CoinCache {
 
     /// Flush dirty coins to the backing store.
     ///
-    /// Optimizations vs. naive drain:
+    /// Optimizations:
     /// - **FRESH elision**: coins created and spent in the same flush window never
     ///   touch the backing store (Core PR #17487 insight).
-    /// - **Sync semantics**: flushed coins are moved to the clean LRU instead of
-    ///   discarded, keeping the cache warm (Core PR #17487 / #28280).
+    /// - **Move semantics**: flushed coins are moved (not cloned) to the clean LRU,
+    ///   avoiding the allocation burst that caused glibc malloc fragmentation.
     pub fn flush(&self) -> Result<(), StoreError> {
         let mut dirty = self.dirty.write().unwrap();
         let mut batch = {
@@ -109,20 +109,22 @@ impl CoinCache {
             std::mem::take(&mut *pending)
         };
 
-        // Collect coins to move to clean LRU after flush (sync semantics)
-        let mut promote_to_clean: Vec<(OutPoint, Coin)> = Vec::new();
+        // Pre-allocate batch vectors based on dirty map size
+        batch.coin_puts.reserve(dirty.len());
+
         let mut fresh_elided = 0u64;
+        // Drain dirty map: build batch and collect surviving coins for LRU promotion
+        let mut promote: Vec<(OutPoint, Coin)> = Vec::with_capacity(dirty.len());
 
         for (outpoint, entry) in dirty.drain() {
             match entry {
                 DirtyEntry::Present { coin, .. } => {
-                    // Move to clean LRU after write (sync semantics: keep cache warm)
-                    promote_to_clean.push((outpoint, coin.clone()));
-                    batch.coin_puts.push((outpoint, coin));
+                    // Serialize for RocksDB batch (needs owned Coin)
+                    batch.coin_puts.push((outpoint, coin.clone()));
+                    // Move (not clone) into promote list for LRU insertion
+                    promote.push((outpoint, coin));
                 }
                 DirtyEntry::Spent { fresh: true, .. } => {
-                    // FRESH elision: coin was created and spent in the same flush
-                    // window — it never existed in the backing store, skip entirely.
                     fresh_elided += 1;
                 }
                 DirtyEntry::Spent { amount, height, .. } => {
@@ -163,12 +165,20 @@ impl CoinCache {
             self.inner.write_batch(batch)?;
         }
 
-        // Sync semantics: move flushed coins into clean LRU (keeps cache warm)
-        if !promote_to_clean.is_empty() {
+        // Move flushed coins to clean LRU (cache warming)
+        if !promote.is_empty() {
             let mut clean = self.clean.lock().unwrap();
-            for (outpoint, coin) in promote_to_clean {
+            for (outpoint, coin) in promote {
                 clean.put(outpoint, coin);
             }
+        }
+
+        // Shrink the drained dirty map to return memory to the allocator.
+        // Without this, HashMap retains its allocation for reuse, which
+        // under glibc malloc causes arena fragmentation over many flushes.
+        {
+            let mut dirty = self.dirty.write().unwrap();
+            dirty.shrink_to_fit();
         }
 
         Ok(())
