@@ -321,11 +321,10 @@ pub fn start_prefetcher(
                     });
                 if has_data {
                     let _ = work_tx.try_send(next_to_assign);
-                    next_to_assign += 1;
-                } else {
-                    // Block data not yet stored — stop dispatching, retry next loop
-                    break;
                 }
+                // Always advance — skip heights without data, they'll be retried
+                // when the connect thread falls back to connect_stored_block
+                next_to_assign += 1;
             }
 
             // Collect results from workers
