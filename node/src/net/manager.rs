@@ -651,7 +651,7 @@ impl PeerManager {
                     let stalled = {
                         let mut ibd = self.ibd.write().unwrap();
                         if let Some(scheduler) = ibd.as_mut() {
-                            scheduler.detect_stalls(Duration::from_secs(60))
+                            scheduler.detect_stalls(Duration::from_secs(15))
                         } else {
                             Vec::new()
                         }
@@ -1316,6 +1316,7 @@ impl PeerManager {
         max_ahead: u32,
     ) {
         let mut connected_count = 0u64;
+        let mut retry_count = 0u32;
         let start_time = Instant::now();
 
         // Start the prefetch pipeline
@@ -1403,6 +1404,7 @@ impl PeerManager {
                 match connect_result {
                     Ok(_) => {
                         connected_count += 1;
+                        retry_count = 0;
                         // Update scheduler connect cursor
                         {
                             let mut sched = ibd.write().unwrap();
@@ -1467,8 +1469,21 @@ impl PeerManager {
                         continue;
                     }
                     Err(e) => {
-                        tracing::warn!(height = next_height, %hash, "Connect stored block failed: {}", e);
-                        // Wait and retry — might be a transient issue
+                        retry_count += 1;
+                        if retry_count >= 30 {
+                            tracing::error!(
+                                height = next_height, %hash, retries = retry_count,
+                                "Persistent connect failure, giving up: {}", e
+                            );
+                            // Force a restart by breaking the loop — systemd will restart us
+                            break;
+                        }
+                        if retry_count.is_multiple_of(10) {
+                            tracing::warn!(
+                                height = next_height, %hash, retries = retry_count,
+                                "Connect stored block failed (retrying): {}", e
+                            );
+                        }
                         let (lock, cvar) = &**connect_signal;
                         let mut ready = lock.lock().unwrap();
                         *ready = false;

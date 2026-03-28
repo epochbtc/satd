@@ -633,15 +633,40 @@ impl ChainState {
     /// Safe because read_block() opens a fresh file handle each time.
     fn read_block_direct(&self, pos: &FlatFilePos) -> Option<Block> {
         let path = self.blocks_dir.join(format!("blk{:05}.dat", pos.file_number));
-        let mut file = std::fs::File::open(&path).ok()?;
+        let mut file = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!(file = %path.display(), "read_block_direct: open failed: {}", e);
+                return None;
+            }
+        };
         use std::io::{Read, Seek, SeekFrom};
-        file.seek(SeekFrom::Start(pos.data_pos as u64)).ok()?;
+        if let Err(e) = file.seek(SeekFrom::Start(pos.data_pos as u64)) {
+            tracing::warn!(file = %path.display(), pos = pos.data_pos, "read_block_direct: seek failed: {}", e);
+            return None;
+        }
         let mut header = [0u8; 8];
-        file.read_exact(&mut header).ok()?;
+        if let Err(e) = file.read_exact(&mut header) {
+            tracing::warn!(file = %path.display(), pos = pos.data_pos, "read_block_direct: header read failed: {}", e);
+            return None;
+        }
         let size = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
+        if size == 0 || size > 4_000_000 {
+            tracing::warn!(file = %path.display(), pos = pos.data_pos, size, "read_block_direct: invalid block size");
+            return None;
+        }
         let mut data = vec![0u8; size];
-        file.read_exact(&mut data).ok()?;
-        bitcoin::consensus::deserialize(&data).ok()
+        if let Err(e) = file.read_exact(&mut data) {
+            tracing::warn!(file = %path.display(), pos = pos.data_pos, size, "read_block_direct: data read failed: {}", e);
+            return None;
+        }
+        match bitcoin::consensus::deserialize(&data) {
+            Ok(block) => Some(block),
+            Err(e) => {
+                tracing::warn!(file = %path.display(), pos = pos.data_pos, size, "read_block_direct: deserialize failed: {}", e);
+                None
+            }
+        }
     }
 
     /// Store block data to disk without connecting it to the chain.

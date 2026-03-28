@@ -119,13 +119,18 @@ impl IbdScheduler {
         let mut hashes = Vec::with_capacity(budget);
         let mut assigned_heights = Vec::with_capacity(budget);
 
-        // Priority zone: always try to assign the next few blocks above the connect cursor.
-        // This prevents deadlock where random blocks are downloaded but the connect
-        // thread is blocked waiting for the very next sequential block.
-        // Limited to 16 blocks to leave most budget for random distribution.
-        let priority_end = (self.connect_cursor + 16).min(self.target_height);
+        // Priority zone: always try to assign blocks near the connect cursor.
+        // This prevents stalls where random blocks are downloaded far ahead but the
+        // connect thread is blocked waiting for the next sequential block.
+        // 256 blocks ensures the near-cursor region is well-covered across multiple peers.
+        let priority_end = (self.connect_cursor + 256).min(self.target_height);
         for h in (self.connect_cursor + 1)..=priority_end {
             if hashes.len() >= budget {
+                break;
+            }
+            let total_ahead =
+                self.downloaded.len() as u32 + self.in_flight.len() as u32 + hashes.len() as u32;
+            if total_ahead >= self.max_ahead {
                 break;
             }
             if self.downloaded.contains(&h) || self.in_flight.contains_key(&h) {
