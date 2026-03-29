@@ -110,42 +110,30 @@ pub fn prefetch_block(
         let _ = check_transaction(tx);
     }
 
-    // 6. Speculative UTXO resolution (cache warming) — batch lookup
-    // Always run: the batch lookup warms the CoinCache for the connect thread.
-    // Results are not stored in PreprocessedBlock (connect uses authoritative store).
-    {
-        let outpoints: Vec<bitcoin::OutPoint> = block
-            .txdata
-            .iter()
-            .flat_map(|tx| {
-                if tx.is_coinbase() {
-                    return Vec::new();
-                }
-                tx.input.iter().map(|input| input.previous_output).collect::<Vec<_>>()
-            })
-            .collect();
-        let _ = store.get_coins_batch(&outpoints); // warm cache, discard results
-    }
+    // 6. Speculative UTXO resolution (cache warming) + optional script pre-verification.
+    //
+    // The batch lookup always warms the CoinCache for the connect thread.
+    // In assumevalid mode, the results are also used for script pre-verification.
+    // Single batch lookup — no redundant DB queries.
+    let input_keys: Vec<(usize, usize, bitcoin::OutPoint)> = block
+        .txdata
+        .iter()
+        .enumerate()
+        .flat_map(|(tx_idx, tx)| {
+            if tx.is_coinbase() { return Vec::new(); }
+            tx.input.iter().enumerate()
+                .map(|(input_idx, input)| (tx_idx, input_idx, input.previous_output))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let outpoints: Vec<bitcoin::OutPoint> = input_keys.iter().map(|(_, _, op)| *op).collect();
+    let coins = store.get_coins_batch(&outpoints); // single batch lookup — warms cache
 
     // 7. Script pre-verification — only in assumevalid mode.
     // Outside assumevalid, the connect thread runs the authoritative verifier on
     // every transaction anyway, so pre-verification is wasted CPU.
     let script_verified_txs: HashSet<usize> = if assumevalid {
         let verifier = ConsensusVerifier;
-        // Build speculative coins for script verification
-        let input_keys: Vec<(usize, usize, bitcoin::OutPoint)> = block
-            .txdata
-            .iter()
-            .enumerate()
-            .flat_map(|(tx_idx, tx)| {
-                if tx.is_coinbase() { return Vec::new(); }
-                tx.input.iter().enumerate()
-                    .map(|(input_idx, input)| (tx_idx, input_idx, input.previous_output))
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        let outpoints: Vec<bitcoin::OutPoint> = input_keys.iter().map(|(_, _, op)| *op).collect();
-        let coins = store.get_coins_batch(&outpoints);
         let mut spec_coins: HashMap<(usize, usize), Coin> = HashMap::new();
         for ((tx_idx, input_idx, _), coin_opt) in input_keys.into_iter().zip(coins) {
             if let Some(coin) = coin_opt {
@@ -200,6 +188,7 @@ pub fn prefetch_block(
             verified
         }
     } else {
+        drop(coins); // results only needed for cache warming, already done
         HashSet::new()
     };
 
