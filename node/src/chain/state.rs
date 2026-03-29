@@ -422,6 +422,12 @@ impl ChainState {
         self.headers_tip_height.load(Ordering::Relaxed)
     }
 
+    /// Whether assumevalid is configured (not Disabled).
+    /// Used to decide whether prefetch should run script pre-verification.
+    pub fn is_assumevalid_active(&self) -> bool {
+        !matches!(self.assumevalid, AssumeValid::Disabled)
+    }
+
     /// Check if script verification should be skipped (assumevalid optimization).
     fn should_skip_scripts(&self, height: u32) -> bool {
         match &self.assumevalid {
