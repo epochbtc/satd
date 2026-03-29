@@ -1162,6 +1162,11 @@ impl PeerManager {
                         }
                     }
                 }
+                Err(crate::chain::state::ChainError::BadPrevBlock) => {
+                    // Parent header not yet accepted — normal during swarm IBD.
+                    // Don't penalize the peer; the block may become valid later.
+                    tracing::debug!(%hash, "IBD block store: parent unknown, skipping");
+                }
                 Err(e) => {
                     tracing::debug!(%hash, "IBD block store failed: {}", e);
                     self.add_ban_score(id, 10, &format!("block rejected: {}", e));
