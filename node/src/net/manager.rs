@@ -1323,6 +1323,7 @@ impl PeerManager {
         let mut connected_count = 0u64;
         let mut retry_count = 0u32;
         let start_time = Instant::now();
+        let perf = std::sync::Arc::new(crate::perf::IbdPerf::new());
 
         // Start the prefetch pipeline
         let store: Arc<dyn crate::storage::Store + Send + Sync> =
@@ -1396,15 +1397,19 @@ impl PeerManager {
 
             if chain_state.has_block_data(&hash) {
                 // Try to get a pre-processed block from the prefetcher
+                let connect_start = Instant::now();
                 let connect_result = match prefetch_rx.try_recv() {
                     Ok(pre) if pre.height == next_height && pre.hash == hash => {
+                        perf.prefetch_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         chain_state.connect_preprocessed_block(pre)
                     }
                     _ => {
-                        // Prefetcher not ready or wrong block — fall back to normal path
+                        perf.prefetch_misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         chain_state.connect_stored_block(&hash)
                     }
                 };
+                perf.connect_ns.fetch_add(connect_start.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+                perf.connect_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
                 match connect_result {
                     Ok(_) => {
@@ -1451,6 +1456,24 @@ impl PeerManager {
                                 rate
                             );
                             *last_log_height = next_height;
+
+                            // Transfer cache perf counters and report
+                            {
+                                let store = chain_state.store_ref();
+                                perf.cache_dirty_hits.fetch_add(
+                                    store.perf_dirty_hits.swap(0, std::sync::atomic::Ordering::Relaxed),
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                                perf.cache_clean_hits.fetch_add(
+                                    store.perf_clean_hits.swap(0, std::sync::atomic::Ordering::Relaxed),
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                                perf.cache_store_misses.fetch_add(
+                                    store.perf_store_misses.swap(0, std::sync::atomic::Ordering::Relaxed),
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                            }
+                            perf.report(next_height);
 
                             // Flush UTXO cache to disk every 1000 blocks
                             if let Err(e) = chain_state.flush_coin_cache() {
