@@ -2,6 +2,7 @@ pub mod chain;
 pub mod mempool;
 pub mod mining;
 pub mod net;
+pub mod perf;
 pub mod rpc;
 pub mod storage;
 pub mod validation;

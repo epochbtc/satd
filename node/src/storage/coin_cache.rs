@@ -2,7 +2,7 @@ use bitcoin::{BlockHash, OutPoint, Txid};
 use lru::LruCache;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 
 use super::blockindex::BlockIndexEntry;
@@ -42,6 +42,10 @@ pub struct CoinCache {
     amount_delta: AtomicI64,
     pending_batch: Mutex<StoreBatch>,
     block_index_cache: Mutex<LruCache<BlockHash, BlockIndexEntry>>,
+    // Perf counters (atomic, zero overhead)
+    pub perf_dirty_hits: AtomicU64,
+    pub perf_clean_hits: AtomicU64,
+    pub perf_store_misses: AtomicU64,
     height_hash_cache: Mutex<LruCache<u32, BlockHash>>,
     undo_cache: Mutex<LruCache<BlockHash, UndoData>>,
     tx_index_cache: Mutex<LruCache<Txid, BlockHash>>,
@@ -87,6 +91,9 @@ impl CoinCache {
             undo_cache: Mutex::new(lru(undo_cap)),
             tx_index_cache: Mutex::new(lru(tx_index_cap.max(1))),
             flush_threshold,
+            perf_dirty_hits: AtomicU64::new(0),
+            perf_clean_hits: AtomicU64::new(0),
+            perf_store_misses: AtomicU64::new(0),
         }
     }
 
@@ -455,11 +462,13 @@ impl Store for CoinCache {
             let mut clean = self.clean.lock().unwrap();
             for (i, outpoint) in outpoints.iter().enumerate() {
                 if let Some(entry) = dirty.get(outpoint) {
+                    self.perf_dirty_hits.fetch_add(1, Ordering::Relaxed);
                     results[i] = match entry {
                         DirtyEntry::Present { coin, .. } => Some(coin.clone()),
                         DirtyEntry::Spent { .. } => None,
                     };
                 } else if let Some(coin) = clean.get(outpoint) {
+                    self.perf_clean_hits.fetch_add(1, Ordering::Relaxed);
                     results[i] = Some(coin.clone());
                 } else {
                     misses.push((i, *outpoint));
@@ -469,6 +478,7 @@ impl Store for CoinCache {
 
         // 2. Batch fetch misses from backing store
         if !misses.is_empty() {
+            self.perf_store_misses.fetch_add(misses.len() as u64, Ordering::Relaxed);
             let miss_outpoints: Vec<OutPoint> = misses.iter().map(|(_, op)| *op).collect();
             let fetched = self.inner.get_coins_batch(&miss_outpoints);
             let mut clean = self.clean.lock().unwrap();
