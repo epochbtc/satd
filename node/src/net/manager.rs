@@ -1328,12 +1328,14 @@ impl PeerManager {
         // Start the prefetch pipeline
         let store: Arc<dyn crate::storage::Store + Send + Sync> =
             chain_state.store_ref().clone();
+        let assumevalid_active = chain_state.is_assumevalid_active();
         let (prefetch_rx, prefetch_handle) = crate::chain::prefetch::start_prefetcher(
             store,
             chain_state.blocks_dir().to_path_buf(),
             chain_state.tip_height() + 1,
             prefetch_workers,
             128, // lookahead blocks
+            assumevalid_active,
         );
 
         loop {

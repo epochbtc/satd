@@ -25,15 +25,10 @@ pub struct PreprocessedBlock {
     pub parent: BlockIndexEntry,
     pub flat_pos: FlatFilePos,
     pub mtp: u32,
-    /// Speculatively resolved coins: (tx_index, input_index) -> Coin.
-    /// These are best-effort; the connect thread re-validates against the
-    /// authoritative UTXO set.
-    pub speculative_coins: HashMap<(usize, usize), Coin>,
     /// Pre-computed txids (one per transaction in the block).
     pub txids: Vec<Txid>,
     /// Tx indices where all inputs were speculatively resolved AND scripts
-    /// were pre-verified successfully. The connect thread can skip script
-    /// verification for these transactions.
+    /// were pre-verified successfully. Only populated in assumevalid mode.
     pub script_verified_txs: HashSet<usize>,
 }
 
@@ -84,6 +79,7 @@ pub fn prefetch_block(
     store: &dyn Store,
     blocks_dir: &Path,
     height: u32,
+    assumevalid: bool,
 ) -> Option<PreprocessedBlock> {
     // 1. Get block hash and entry
     let hash = store.get_block_hash_by_height(height)?;
@@ -114,48 +110,44 @@ pub fn prefetch_block(
         let _ = check_transaction(tx);
     }
 
-    // 6. Speculative UTXO resolution (cache warming) — batch lookup
+    // 6. Speculative UTXO resolution (cache warming) + optional script pre-verification.
+    //
+    // The batch lookup always warms the CoinCache for the connect thread.
+    // In assumevalid mode, the results are also used for script pre-verification.
+    // Single batch lookup — no redundant DB queries.
     let input_keys: Vec<(usize, usize, bitcoin::OutPoint)> = block
         .txdata
         .iter()
         .enumerate()
         .flat_map(|(tx_idx, tx)| {
-            if tx.is_coinbase() {
-                return Vec::new();
-            }
-            tx.input
-                .iter()
-                .enumerate()
+            if tx.is_coinbase() { return Vec::new(); }
+            tx.input.iter().enumerate()
                 .map(|(input_idx, input)| (tx_idx, input_idx, input.previous_output))
                 .collect::<Vec<_>>()
         })
         .collect();
     let outpoints: Vec<bitcoin::OutPoint> = input_keys.iter().map(|(_, _, op)| *op).collect();
-    let coins = store.get_coins_batch(&outpoints);
-    let mut speculative_coins = HashMap::new();
-    for ((tx_idx, input_idx, _), coin_opt) in input_keys.into_iter().zip(coins) {
-        if let Some(coin) = coin_opt {
-            speculative_coins.insert((tx_idx, input_idx), coin);
-        }
-    }
+    let coins = store.get_coins_batch(&outpoints); // single batch lookup — warms cache
 
-    // 7. Pre-verify scripts for transactions where ALL inputs were resolved.
-    //
-    // NOTE: This pre-verification is only useful during assumevalid IBD, where
-    // the connect thread skips scripts entirely. When the authoritative verifier
-    // runs (normal mode, shadow modes, etc.), pre_verified_txs is ignored so the
-    // real engine sees every transaction. We still run it here unconditionally to
-    // warm caches and detect obviously-invalid blocks early.
-    let verifier = ConsensusVerifier;
-    let script_verified_txs: HashSet<usize> = {
-        // Collect txs where all inputs are resolved
+    // 7. Script pre-verification — only in assumevalid mode.
+    // Outside assumevalid, the connect thread runs the authoritative verifier on
+    // every transaction anyway, so pre-verification is wasted CPU.
+    let script_verified_txs: HashSet<usize> = if assumevalid {
+        let verifier = ConsensusVerifier;
+        let mut spec_coins: HashMap<(usize, usize), Coin> = HashMap::new();
+        for ((tx_idx, input_idx, _), coin_opt) in input_keys.into_iter().zip(coins) {
+            if let Some(coin) = coin_opt {
+                spec_coins.insert((tx_idx, input_idx), coin);
+            }
+        }
+
         let verifiable: Vec<(usize, &Transaction, Vec<TxOut>)> = block.txdata.iter()
             .enumerate()
             .filter_map(|(tx_idx, tx)| {
                 if tx.is_coinbase() { return None; }
                 let mut prev_outputs = Vec::with_capacity(tx.input.len());
                 for (input_idx, _) in tx.input.iter().enumerate() {
-                    let coin = speculative_coins.get(&(tx_idx, input_idx))?;
+                    let coin = spec_coins.get(&(tx_idx, input_idx))?;
                     prev_outputs.push(TxOut {
                         value: bitcoin::Amount::from_sat(coin.amount),
                         script_pubkey: coin.script_pubkey.clone(),
@@ -195,6 +187,9 @@ pub fn prefetch_block(
             });
             verified
         }
+    } else {
+        drop(coins); // results only needed for cache warming, already done
+        HashSet::new()
     };
 
     Some(PreprocessedBlock {
@@ -205,7 +200,6 @@ pub fn prefetch_block(
         parent,
         flat_pos,
         mtp,
-        speculative_coins,
         txids,
         script_verified_txs,
     })
@@ -249,6 +243,7 @@ pub fn start_prefetcher(
     start_height: u32,
     num_workers: usize,
     lookahead: usize,
+    assumevalid: bool,
 ) -> (Receiver<PreprocessedBlock>, PrefetchHandle) {
     let (tx, rx) = bounded::<PreprocessedBlock>(lookahead);
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -272,7 +267,7 @@ pub fn start_prefetcher(
             while !w_shutdown.load(Ordering::Relaxed) {
                 match w_rx.recv_timeout(std::time::Duration::from_millis(500)) {
                     Ok(height) => {
-                        if let Some(pre) = prefetch_block(&*w_store, &w_dir, height) {
+                        if let Some(pre) = prefetch_block(&*w_store, &w_dir, height, assumevalid) {
                             let _ = w_tx.send(pre);
                         }
                     }
