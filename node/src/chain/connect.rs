@@ -138,13 +138,15 @@ pub struct ConnectParams<'a> {
     pub pre_verified_txs: Option<&'a std::collections::HashSet<usize>>,
     /// Number of threads for parallel UTXO resolution and script verification.
     pub num_threads: usize,
+    /// Pre-computed txids from prefetch. Avoids rehashing all transactions.
+    pub precomputed_txids: Option<&'a [bitcoin::Txid]>,
 }
 
 pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError> {
     let ConnectParams {
         store, block, height, parent_chainwork, flat_pos,
         script_verifier, median_time_past, network,
-        pre_verified_txs, num_threads,
+        pre_verified_txs, num_threads, precomputed_txids,
     } = params;
     let store: &dyn Store = *store;
     let script_verifier: &dyn ScriptVerifier = *script_verifier;
@@ -172,21 +174,25 @@ pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError>
     // Transactions queued for parallel script verification after UTXO resolution
     let mut verify_queue: Vec<(&Transaction, Vec<TxOut>)> = Vec::with_capacity(block.txdata.len());
 
-    // Collect txids for txindex (computed once per tx, reused)
+    // Reuse precomputed txids from prefetch if available, otherwise compute once
+    let computed_txids: Vec<bitcoin::Txid>;
+    let txid_slice: &[bitcoin::Txid] = if let Some(pre) = precomputed_txids {
+        pre
+    } else {
+        computed_txids = block.txdata.iter().map(|tx| tx.compute_txid()).collect();
+        &computed_txids
+    };
     let mut txids: Vec<bitcoin::Txid> = Vec::with_capacity(block.txdata.len());
 
     // Fast lookup for coins created earlier in this block (intra-block spends).
-    // Avoids O(n*m) linear scan of batch.coin_puts.
     let mut intra_block_coins: HashMap<OutPoint, Coin> = HashMap::new();
 
-    // --- Parallel UTXO pre-resolution for external inputs ---
-    // Identify inputs that spend coins from PREVIOUS blocks (not intra-block).
-    // These can be looked up in parallel since they're independent of this block's
-    // transaction ordering. ~65-85% of inputs are external at typical block heights.
-    let block_txids: HashSet<bitcoin::Txid> = block.txdata.iter()
-        .map(|tx| tx.compute_txid())
-        .collect();
+    // --- UTXO pre-resolution for external inputs ---
+    // Batch-lookup from authoritative store. Prefetch warmed the CoinCache,
+    // so most external lookups hit the cache.
+    let block_txids: HashSet<bitcoin::Txid> = txid_slice.iter().copied().collect();
 
+    // Collect external inputs (not intra-block spends)
     let external_lookups: Vec<(usize, usize, OutPoint)> = block.txdata.iter()
         .enumerate()
         .flat_map(|(tx_idx, tx)| {
@@ -200,28 +206,30 @@ pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError>
         })
         .collect();
 
-    let pre_resolved: HashMap<(usize, usize), Coin> = {
-        if external_lookups.is_empty() {
-            HashMap::new()
-        } else {
-            // Batch UTXO lookup: single multi_get_cf call for all external inputs
-            let outpoints: Vec<OutPoint> = external_lookups.iter()
-                .map(|(_, _, op)| *op)
-                .collect();
-            let coins = store.get_coins_batch(&outpoints);
-            external_lookups.iter()
-                .zip(coins)
-                .filter_map(|((tx_idx, in_idx, _), coin_opt)| {
-                    coin_opt.map(|coin| ((*tx_idx, *in_idx), coin))
-                })
-                .collect()
-        }
+    // Resolve external inputs. Speculative coins from prefetch are used as hints:
+    // they warm the cache but each coin is still verified against the authoritative
+    // store to prevent stale reads (e.g., if an earlier block spent the coin after
+    // prefetch resolved it).
+    let pre_resolved: HashMap<(usize, usize), Coin> = if external_lookups.is_empty() {
+        HashMap::new()
+    } else {
+        // Batch lookup from authoritative store (hits CoinCache which was warmed by prefetch)
+        let outpoints: Vec<OutPoint> = external_lookups.iter()
+            .map(|(_, _, op)| *op)
+            .collect();
+        let coins = store.get_coins_batch(&outpoints);
+        external_lookups.iter()
+            .zip(coins)
+            .filter_map(|((tx_idx, in_idx, _), coin_opt)| {
+                coin_opt.map(|coin| ((*tx_idx, *in_idx), coin))
+            })
+            .collect()
     };
 
     // Process each transaction: resolve UTXOs sequentially, defer script verification
     for (tx_idx, tx) in block.txdata.iter().enumerate() {
         let is_coinbase = tx.is_coinbase();
-        let txid = tx.compute_txid();
+        let txid = txid_slice[tx_idx];
 
         // Context-free transaction checks
         check_transaction(tx)?;
@@ -276,11 +284,10 @@ pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError>
             for (in_idx, input) in tx.input.iter().enumerate() {
                 let outpoint = input.previous_output;
 
-                // Use pre-resolved coin if available (parallel lookup from above),
-                // otherwise fall back to store lookup (intra-block or cache miss).
+                // Lookup order: pre-resolved → intra-block → store (avoids DB hit for intra-block spends)
                 let coin = pre_resolved.get(&(tx_idx, in_idx)).cloned()
-                    .or_else(|| store.get_coin(&outpoint))
-                    .or_else(|| intra_block_coins.remove(&outpoint));
+                    .or_else(|| intra_block_coins.remove(&outpoint))
+                    .or_else(|| store.get_coin(&outpoint));
 
                 let coin = coin.ok_or(ConnectError::MissingOrSpentInput)?;
 
@@ -543,6 +550,7 @@ mod tests {
             network: Network::Regtest,
             pre_verified_txs: None,
             num_threads: 1,
+            precomputed_txids: None,
         }).unwrap();
 
         // Genesis coinbase should NOT be in coin_puts
@@ -718,6 +726,7 @@ mod tests {
             network: Network::Regtest,
             pre_verified_txs: None,
             num_threads: 1,
+            precomputed_txids: None,
         });
         assert!(result.is_ok());
     }
@@ -738,6 +747,7 @@ mod tests {
             network: Network::Regtest,
             pre_verified_txs: None,
             num_threads: 1,
+            precomputed_txids: None,
         });
         assert!(matches!(result, Err(ConnectError::SequenceLockNotMet)));
     }
@@ -758,6 +768,7 @@ mod tests {
             network: Network::Regtest,
             pre_verified_txs: None,
             num_threads: 1,
+            precomputed_txids: None,
         });
         assert!(result.is_ok());
     }
@@ -778,6 +789,7 @@ mod tests {
             network: Network::Regtest,
             pre_verified_txs: None,
             num_threads: 1,
+            precomputed_txids: None,
         });
         assert!(result.is_ok());
     }
@@ -798,6 +810,7 @@ mod tests {
             network: Network::Regtest,
             pre_verified_txs: None,
             num_threads: 1,
+            precomputed_txids: None,
         });
         assert!(result.is_ok());
     }
@@ -820,6 +833,7 @@ mod tests {
             network: Network::Regtest,
             pre_verified_txs: None,
             num_threads: 1,
+            precomputed_txids: None,
         });
         assert!(result.is_ok());
     }
@@ -840,6 +854,7 @@ mod tests {
             network: Network::Regtest,
             pre_verified_txs: None,
             num_threads: 1,
+            precomputed_txids: None,
         });
         assert!(matches!(result, Err(ConnectError::LocktimeNotFinal)));
     }
@@ -860,6 +875,7 @@ mod tests {
             network: Network::Regtest,
             pre_verified_txs: None,
             num_threads: 1,
+            precomputed_txids: None,
         });
         assert!(matches!(result, Err(ConnectError::LocktimeNotFinal)));
     }
@@ -880,6 +896,7 @@ mod tests {
             network: Network::Regtest,
             pre_verified_txs: None,
             num_threads: 1,
+            precomputed_txids: None,
         });
         assert!(result.is_ok());
     }
@@ -907,6 +924,7 @@ mod tests {
             network: Network::Regtest,
             pre_verified_txs: None,
             num_threads: 1,
+            precomputed_txids: None,
         });
         assert!(matches!(result, Err(ConnectError::MissingOrSpentInput)));
     }
@@ -927,6 +945,7 @@ mod tests {
             network: Network::Regtest,
             pre_verified_txs: None,
             num_threads: 1,
+            precomputed_txids: None,
         });
         assert!(matches!(result, Err(ConnectError::PrematureCoinbaseSpend)));
     }
@@ -947,6 +966,7 @@ mod tests {
             network: Network::Regtest,
             pre_verified_txs: None,
             num_threads: 1,
+            precomputed_txids: None,
         });
         assert!(result.is_ok());
     }
@@ -1019,6 +1039,7 @@ mod tests {
             network: Network::Regtest,
             pre_verified_txs: None,
             num_threads: 1,
+            precomputed_txids: None,
         });
         assert!(result.is_ok(), "BIP68 time lock should be met, got {:?}", result.err());
     }
@@ -1080,6 +1101,7 @@ mod tests {
             network: Network::Regtest,
             pre_verified_txs: None,
             num_threads: 1,
+            precomputed_txids: None,
         });
         assert!(
             matches!(result, Err(ConnectError::SequenceLockNotMet)),
@@ -1153,6 +1175,7 @@ mod tests {
             network: Network::Regtest,
             pre_verified_txs: None,
             num_threads: 1,
+            precomputed_txids: None,
         });
         assert!(
             matches!(result, Err(ConnectError::BadCoinbaseValue)),
@@ -1247,6 +1270,7 @@ mod tests {
             network: Network::Regtest,
             pre_verified_txs: None,
             num_threads: 1,
+            precomputed_txids: None,
         });
         assert!(result.is_ok(), "Intra-block spending should succeed, got {:?}", result.err());
     }
@@ -1267,6 +1291,7 @@ mod tests {
             network: Network::Regtest,
             pre_verified_txs: None,
             num_threads: 1,
+            precomputed_txids: None,
         });
         assert!(result.is_ok(), "BIP 34 correct height should pass, got {:?}", result.err());
     }
@@ -1335,6 +1360,7 @@ mod tests {
             network: Network::Regtest,
             pre_verified_txs: None,
             num_threads: 1,
+            precomputed_txids: None,
         });
         assert!(
             matches!(result, Err(ConnectError::BadCoinbaseHeight)),
@@ -1407,6 +1433,7 @@ mod tests {
             network: Network::Regtest,
             pre_verified_txs: None,
             num_threads: 1,
+            precomputed_txids: None,
         });
         assert!(
             matches!(result, Err(ConnectError::BadAmounts)),
@@ -1431,6 +1458,7 @@ mod tests {
             network: Network::Regtest,
             pre_verified_txs: None,
             num_threads: 1,
+            precomputed_txids: None,
         })
         .unwrap();
 
@@ -1545,6 +1573,7 @@ mod tests {
             network: Network::Bitcoin,
             pre_verified_txs: None,
             num_threads: 1,
+            precomputed_txids: None,
         });
         assert!(
             result.is_ok(),
@@ -1583,6 +1612,7 @@ mod tests {
             network: Network::Bitcoin,
             pre_verified_txs: None,
             num_threads: 1,
+            precomputed_txids: None,
         });
         assert!(
             result.is_ok(),
@@ -1616,6 +1646,7 @@ mod tests {
             network: Network::Bitcoin,
             pre_verified_txs: None,
             num_threads: 1,
+            precomputed_txids: None,
         });
         assert!(
             result.is_ok(),
