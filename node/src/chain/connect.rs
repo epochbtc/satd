@@ -379,64 +379,23 @@ pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError>
     }
 
     // Parallel script verification: verify all transactions concurrently.
-    // If a shadow verifier is present, run it in parallel at the block level
-    // (one thread pool for primary, one for shadow) — wall-clock = max(primary, shadow).
+    // Shadow verification (if configured) is handled asynchronously inside the
+    // ShadowVerifier — it dispatches to background workers and never blocks here.
+    // All N threads run the primary (authoritative) engine.
     if !verify_queue.is_empty() {
-        let shadow = script_verifier.shadow_verifier();
-
         if verify_queue.len() <= 1 || num_threads <= 1 {
             for (tx, prev_outputs) in &verify_queue {
                 script_verifier
                     .verify_transaction(tx, prev_outputs, height)
                     .map_err(|e| ConnectError::ScriptFailed(e.to_string()))?;
             }
-            // Run shadow sequentially for small blocks (no threading overhead)
-            if let Some(shadow_v) = shadow {
-                for (tx, prev_outputs) in &verify_queue {
-                    let shadow_result = shadow_v.verify_transaction(tx, prev_outputs, height);
-                    if let Err(e) = &shadow_result {
-                        let primary_ok = script_verifier.verify_transaction(tx, prev_outputs, height).is_ok();
-                        if primary_ok {
-                            tracing::error!("SHADOW MISMATCH: primary accepted but shadow REJECTED: {} (txid={})", e, tx.compute_txid());
-                        }
-                    }
-                }
-            }
         } else {
             let queue_ref = &verify_queue;
+            let chunk_size = verify_queue.len().div_ceil(num_threads);
 
             let errors: Vec<ConnectError> = std::thread::scope(|s| {
-                // With shadow: split threads evenly — half primary, half shadow
-                // Without shadow: all threads for primary
-                let primary_threads = if shadow.is_some() { num_threads / 2 } else { num_threads };
-                let shadow_threads = if shadow.is_some() { num_threads - primary_threads } else { 0 };
-
-                let primary_chunk_size = verify_queue.len().div_ceil(primary_threads.max(1));
-                let shadow_chunk_size = verify_queue.len().div_ceil(shadow_threads.max(1));
-
-                // Spawn shadow thread pool concurrently
-                let shadow_handles: Vec<_> = if let Some(shadow_v) = shadow {
-                    queue_ref
-                        .chunks(shadow_chunk_size)
-                        .map(|chunk| {
-                            s.spawn(move || {
-                                let mut mismatches = Vec::new();
-                                for (tx, prev_outputs) in chunk {
-                                    if let Err(e) = shadow_v.verify_transaction(tx, prev_outputs, height) {
-                                        mismatches.push((tx.compute_txid(), e));
-                                    }
-                                }
-                                mismatches
-                            })
-                        })
-                        .collect()
-                } else {
-                    Vec::new()
-                };
-
-                // Primary thread pool
                 let handles: Vec<_> = queue_ref
-                    .chunks(primary_chunk_size)
+                    .chunks(chunk_size)
                     .map(|chunk| {
                         s.spawn(move || {
                             let mut errs = Vec::new();
@@ -456,17 +415,6 @@ pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError>
                 for handle in handles {
                     all_errors.extend(handle.join().unwrap());
                 }
-
-                // Collect shadow results and log mismatches
-                for sh in shadow_handles {
-                    let mismatches = sh.join().unwrap();
-                    for (txid, err) in mismatches {
-                        if all_errors.is_empty() {
-                            tracing::error!("SHADOW MISMATCH: primary accepted but shadow REJECTED: {} (txid={})", err, txid);
-                        }
-                    }
-                }
-
                 all_errors
             });
             if let Some(err) = errors.into_iter().next() {
