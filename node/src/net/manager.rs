@@ -1329,7 +1329,7 @@ impl PeerManager {
         let store: Arc<dyn crate::storage::Store + Send + Sync> =
             chain_state.store_ref().clone();
         let assumevalid_active = chain_state.is_assumevalid_active();
-        let (prefetch_rx, prefetch_handle) = crate::chain::prefetch::start_prefetcher(
+        let prefetch_handle = crate::chain::prefetch::start_prefetcher(
             store,
             chain_state.blocks_dir().to_path_buf(),
             chain_state.tip_height() + 1,
@@ -1400,8 +1400,8 @@ impl PeerManager {
             if chain_state.has_block_data(&hash) {
                 // Try to get a pre-processed block from the prefetcher
                 let connect_start = Instant::now();
-                let connect_result = match prefetch_rx.try_recv() {
-                    Ok(pre) if pre.height == next_height && pre.hash == hash => {
+                let connect_result = match prefetch_handle.take_block(next_height) {
+                    Some(pre) if pre.hash == hash => {
                         perf.prefetch_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         chain_state.connect_preprocessed_block(pre)
                     }
