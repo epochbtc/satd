@@ -5,7 +5,7 @@ use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 
-use super::blockindex::BlockIndexEntry;
+use super::blockindex::{BlockIndexEntry, BlockStatus};
 use super::coinview::Coin;
 use super::undo::UndoData;
 use super::{Store, StoreBatch, StoreError};
@@ -297,7 +297,19 @@ impl Store for CoinCache {
         {
             let mut bi = self.block_index_cache.lock().unwrap();
             for (hash, entry) in &batch.block_index_puts {
-                bi.put(*hash, entry.clone());
+                // Don't downgrade: if cache has DataStored/Valid, don't overwrite with HeaderOnly.
+                // This prevents a race where accept_headers' batch write clobbers a concurrent
+                // store_block's DataStored update, causing has_block_data() to return false
+                // and permanently stalling the connect loop.
+                let dominated = if let Some(existing) = bi.peek(hash) {
+                    entry.status == BlockStatus::HeaderOnly
+                        && matches!(existing.status, BlockStatus::DataStored | BlockStatus::Valid)
+                } else {
+                    false
+                };
+                if !dominated {
+                    bi.put(*hash, entry.clone());
+                }
             }
         }
         {

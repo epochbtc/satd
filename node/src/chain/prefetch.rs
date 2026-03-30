@@ -1,5 +1,5 @@
 use bitcoin::{Block, BlockHash, Transaction, TxOut, Txid};
-use crossbeam_channel::{bounded, Receiver};
+use crossbeam_channel::bounded;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -211,6 +211,8 @@ pub struct PrefetchHandle {
     workers: Vec<thread::JoinHandle<()>>,
     /// Update this to tell the prefetcher the connect cursor has advanced.
     pub cursor: Arc<AtomicU32>,
+    /// Shared buffer: workers insert, connect thread removes by height.
+    buffer: PrefetchBuffer,
 }
 
 impl PrefetchHandle {
@@ -226,17 +228,27 @@ impl PrefetchHandle {
     pub fn advance_cursor(&self, height: u32) {
         self.cursor.store(height, Ordering::Relaxed);
     }
+
+    /// Try to take a preprocessed block for the given height.
+    /// Returns None if the block hasn't been prefetched yet.
+    pub fn take_block(&self, height: u32) -> Option<PreprocessedBlock> {
+        self.buffer.lock().unwrap().remove(&height)
+    }
 }
+
+/// Shared prefetch buffer: workers insert by height, connect thread removes by height.
+/// No coordinator needed — direct lookup eliminates the ordering bottleneck that
+/// caused 0% prefetch hit rates.
+pub type PrefetchBuffer = Arc<std::sync::Mutex<HashMap<u32, PreprocessedBlock>>>;
 
 /// Start the prefetch pipeline.
 ///
 /// Spawns `num_workers` background threads that read, deserialize, and
-/// pre-process upcoming blocks. A coordinator thread reorders the results
-/// and feeds them to the connect thread in height order via the returned
-/// `Receiver<PreprocessedBlock>`.
+/// pre-process upcoming blocks. Results go into a shared buffer keyed by
+/// height. The connect thread calls `take_block(height)` to retrieve them.
 ///
-/// The connect thread should call `prefetch_handle.advance_cursor(height)`
-/// after each successful connection so the coordinator can dispatch new work.
+/// Call `prefetch_handle.advance_cursor(height)` after each successful
+/// connection so the dispatcher assigns new work ahead of the cursor.
 pub fn start_prefetcher(
     store: Arc<dyn Store + Send + Sync>,
     blocks_dir: PathBuf,
@@ -244,31 +256,30 @@ pub fn start_prefetcher(
     num_workers: usize,
     lookahead: usize,
     assumevalid: bool,
-) -> (Receiver<PreprocessedBlock>, PrefetchHandle) {
-    let (tx, rx) = bounded::<PreprocessedBlock>(lookahead);
+) -> PrefetchHandle {
     let shutdown = Arc::new(AtomicBool::new(false));
     let cursor = Arc::new(AtomicU32::new(start_height));
+    let buffer: PrefetchBuffer = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
-    // Work dispatch and result collection channels
+    // Work dispatch channel
     let (work_tx, work_rx) = bounded::<u32>(lookahead * 2);
-    let (result_tx, result_rx) = crossbeam_channel::unbounded::<PreprocessedBlock>();
 
-    // Spawn worker threads
     let mut workers = Vec::with_capacity(num_workers + 1);
 
+    // Spawn worker threads — process heights, insert into shared buffer
     for _ in 0..num_workers {
         let w_rx = work_rx.clone();
-        let w_tx = result_tx.clone();
         let w_store = store.clone();
         let w_dir = blocks_dir.clone();
         let w_shutdown = shutdown.clone();
+        let w_buffer = buffer.clone();
 
         workers.push(thread::spawn(move || {
             while !w_shutdown.load(Ordering::Relaxed) {
                 match w_rx.recv_timeout(std::time::Duration::from_millis(500)) {
                     Ok(height) => {
                         if let Some(pre) = prefetch_block(&*w_store, &w_dir, height, assumevalid) {
-                            let _ = w_tx.send(pre);
+                            w_buffer.lock().unwrap().insert(height, pre);
                         }
                     }
                     Err(_) => continue,
@@ -276,38 +287,33 @@ pub fn start_prefetcher(
             }
         }));
     }
-    drop(result_tx); // Workers hold the only senders
 
-    // Coordinator thread: assigns work and reorders results for in-order delivery
-    let coord_shutdown = shutdown.clone();
-    let coord_cursor = cursor.clone();
-    let coord_store = store.clone();
-    let coord_tx = tx;
+    // Dispatcher thread: assigns work ahead of the connect cursor
+    let disp_shutdown = shutdown.clone();
+    let disp_cursor = cursor.clone();
+    let disp_store = store.clone();
+    let disp_buffer = buffer.clone();
 
     workers.push(thread::spawn(move || {
-        let mut next_to_send = coord_cursor.load(Ordering::Relaxed);
-        let mut next_to_assign = next_to_send;
-        let mut buffer: HashMap<u32, PreprocessedBlock> = HashMap::new();
+        let mut next_to_assign = disp_cursor.load(Ordering::Relaxed);
 
-        while !coord_shutdown.load(Ordering::Relaxed) {
-            // Update cursor from connect thread
-            let current_cursor = coord_cursor.load(Ordering::Relaxed);
-            if current_cursor > next_to_send {
-                // Connect thread advanced past us, catch up
-                next_to_send = current_cursor;
-                // Discard buffered blocks below cursor
-                buffer.retain(|h, _| *h >= next_to_send);
-                if next_to_assign < next_to_send {
-                    next_to_assign = next_to_send;
-                }
+        while !disp_shutdown.load(Ordering::Relaxed) {
+            let current_cursor = disp_cursor.load(Ordering::Relaxed);
+            if current_cursor > next_to_assign {
+                next_to_assign = current_cursor;
             }
 
-            // Assign work up to lookahead ahead of next_to_send
-            while next_to_assign < next_to_send + lookahead as u32 {
-                // Only dispatch if block DATA is stored (not just header)
-                let has_data = coord_store
+            // Evict stale entries below cursor
+            {
+                let mut buf = disp_buffer.lock().unwrap();
+                buf.retain(|h, _| *h >= current_cursor);
+            }
+
+            // Assign work up to lookahead ahead of cursor
+            while next_to_assign < current_cursor + lookahead as u32 {
+                let has_data = disp_store
                     .get_block_hash_by_height(next_to_assign)
-                    .and_then(|hash| coord_store.get_block_index(&hash))
+                    .and_then(|hash| disp_store.get_block_index(&hash))
                     .is_some_and(|entry| {
                         matches!(
                             entry.status,
@@ -317,46 +323,19 @@ pub fn start_prefetcher(
                 if has_data {
                     let _ = work_tx.try_send(next_to_assign);
                 }
-                // Always advance — skip heights without data, they'll be retried
-                // when the connect thread falls back to connect_stored_block
                 next_to_assign += 1;
             }
 
-            // Collect results from workers
-            while let Ok(pre) = result_rx.try_recv() {
-                buffer.insert(pre.height, pre);
-            }
-
-            // Send in-order results to connect thread
-            while let Some(pre) = buffer.remove(&next_to_send) {
-                match coord_tx.send_timeout(pre, std::time::Duration::from_secs(5)) {
-                    Ok(()) => {
-                        next_to_send += 1;
-                    }
-                    Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => {
-                        return; // Connect thread dropped receiver
-                    }
-                    Err(crossbeam_channel::SendTimeoutError::Timeout(_)) => {
-                        // Connect thread is slow — drop this block, it will fall back
-                        next_to_send += 1;
-                    }
-                }
-            }
-
-            // Brief sleep if nothing ready to avoid busy-spinning
-            if buffer.is_empty() {
-                thread::sleep(std::time::Duration::from_millis(10));
-            }
+            thread::sleep(std::time::Duration::from_millis(10));
         }
     }));
 
-    let handle = PrefetchHandle {
+    PrefetchHandle {
         shutdown,
         workers,
         cursor,
-    };
-
-    (rx, handle)
+        buffer,
+    }
 }
 
 #[cfg(test)]
