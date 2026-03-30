@@ -213,7 +213,9 @@ struct ShadowWork {
 
 impl ShadowVerifier {
     pub fn new(primary: Box<dyn ScriptVerifier>, shadow: Box<dyn ScriptVerifier>) -> Self {
-        let (tx, rx) = crossbeam_channel::bounded::<ShadowWork>(4096);
+        // Large buffer (64K items) — should never fill under normal operation.
+        // A typical block has ~2000 txs; this holds ~32 blocks of backlog.
+        let (tx, rx) = crossbeam_channel::bounded::<ShadowWork>(65536);
         let shadow = std::sync::Arc::new(shadow);
 
         // Spawn background workers (2 threads — enough to keep up without
@@ -258,14 +260,20 @@ impl ScriptVerifier for ShadowVerifier {
         let result = self.primary.verify_transaction(tx, prev_outputs, height);
 
         // On primary success, dispatch shadow verification asynchronously.
-        // If the channel is full, drop the work — throughput over coverage.
         if result.is_ok() {
-            let _ = self.shadow_tx.try_send(ShadowWork {
+            let work = ShadowWork {
                 tx_bytes: bitcoin::consensus::serialize(tx),
                 prev_outputs: prev_outputs.to_vec(),
                 height,
                 txid: tx.compute_txid(),
-            });
+            };
+            if let Err(crossbeam_channel::TrySendError::Full(_)) = self.shadow_tx.try_send(work) {
+                tracing::warn!(
+                    height,
+                    "Shadow verification queue full (64K items) — dropping tx. \
+                     Shadow workers may be falling behind."
+                );
+            }
         }
 
         result
