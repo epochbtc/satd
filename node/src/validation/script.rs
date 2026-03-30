@@ -21,8 +21,7 @@ pub trait ScriptVerifier: Send + Sync {
     ) -> Result<(), ScriptError>;
 
     /// If this verifier runs in shadow mode, return the shadow engine.
-    /// `connect_block` uses this to run primary and shadow in parallel at
-    /// the block level instead of sequentially per transaction.
+    /// Currently unused — ShadowVerifier handles async dispatch internally.
     fn shadow_verifier(&self) -> Option<&dyn ScriptVerifier> {
         None
     }
@@ -192,19 +191,59 @@ impl ScriptVerifier for RustVerifier {
     }
 }
 
-/// Shadow verifier: exposes primary and shadow engines so `connect_block`
-/// can run them in parallel at the block level (not per-transaction).
+/// Shadow verifier: runs the primary engine synchronously in the hot path,
+/// dispatches shadow verification to a background thread pool asynchronously.
 ///
-/// `verify_transaction()` only runs the primary engine. The shadow engine
-/// is returned by `shadow_verifier()` for parallel execution in connect_block.
+/// The connect thread never blocks on shadow results. Mismatches are logged
+/// by the background workers. This makes shadow mode essentially free in
+/// wall-clock terms — shadow uses spare CPU but doesn't slow block connection.
 pub struct ShadowVerifier {
     primary: Box<dyn ScriptVerifier>,
-    shadow: Box<dyn ScriptVerifier>,
+    shadow_tx: crossbeam_channel::Sender<ShadowWork>,
+    _workers: Vec<std::thread::JoinHandle<()>>,
+}
+
+/// Work item for the shadow verification background pool.
+struct ShadowWork {
+    tx_bytes: Vec<u8>,
+    prev_outputs: Vec<TxOut>,
+    height: u32,
+    txid: bitcoin::Txid,
 }
 
 impl ShadowVerifier {
     pub fn new(primary: Box<dyn ScriptVerifier>, shadow: Box<dyn ScriptVerifier>) -> Self {
-        Self { primary, shadow }
+        let (tx, rx) = crossbeam_channel::bounded::<ShadowWork>(4096);
+        let shadow = std::sync::Arc::new(shadow);
+
+        // Spawn background workers (2 threads — enough to keep up without
+        // starving the primary verification threads)
+        let num_workers = 2;
+        let mut workers = Vec::with_capacity(num_workers);
+        for _ in 0..num_workers {
+            let w_rx = rx.clone();
+            let w_shadow = shadow.clone();
+            workers.push(std::thread::spawn(move || {
+                while let Ok(work) = w_rx.recv() {
+                    let tx: Transaction = match bitcoin::consensus::deserialize(&work.tx_bytes) {
+                        Ok(t) => t,
+                        Err(_) => continue,
+                    };
+                    if let Err(e) = w_shadow.verify_transaction(&tx, &work.prev_outputs, work.height) {
+                        tracing::error!(
+                            "SHADOW MISMATCH: primary accepted but shadow REJECTED: {} (txid={})",
+                            e, work.txid
+                        );
+                    }
+                }
+            }));
+        }
+
+        Self {
+            primary,
+            shadow_tx: tx,
+            _workers: workers,
+        }
     }
 }
 
@@ -215,11 +254,27 @@ impl ScriptVerifier for ShadowVerifier {
         prev_outputs: &[TxOut],
         height: u32,
     ) -> Result<(), ScriptError> {
-        // Only run primary — shadow runs in parallel at the block level
-        self.primary.verify_transaction(tx, prev_outputs, height)
-    }
+        // Run primary synchronously — this is the hot path
+        let result = self.primary.verify_transaction(tx, prev_outputs, height);
 
-    fn shadow_verifier(&self) -> Option<&dyn ScriptVerifier> {
-        Some(&*self.shadow)
+        // On primary success, dispatch shadow verification asynchronously.
+        // If the channel is full, drop the work — throughput over coverage.
+        if result.is_ok() {
+            let _ = self.shadow_tx.try_send(ShadowWork {
+                tx_bytes: bitcoin::consensus::serialize(tx),
+                prev_outputs: prev_outputs.to_vec(),
+                height,
+                txid: tx.compute_txid(),
+            });
+        }
+
+        result
+    }
+}
+
+impl Drop for ShadowVerifier {
+    fn drop(&mut self) {
+        // Drop the sender to signal workers to exit
+        // Workers will drain remaining items and stop on recv error
     }
 }
