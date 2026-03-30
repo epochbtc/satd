@@ -212,11 +212,21 @@ struct ShadowWork {
 }
 
 impl ShadowVerifier {
-    pub fn new(primary: Box<dyn ScriptVerifier>, shadow: Box<dyn ScriptVerifier>) -> Self {
+    /// Create a new shadow verifier.
+    /// `primary_name` / `shadow_name` are used in mismatch log messages
+    /// (e.g. "cpp", "rust").
+    pub fn new(
+        primary: Box<dyn ScriptVerifier>,
+        shadow: Box<dyn ScriptVerifier>,
+        primary_name: &str,
+        shadow_name: &str,
+    ) -> Self {
         // Large buffer (64K items) — should never fill under normal operation.
         // A typical block has ~2000 txs; this holds ~32 blocks of backlog.
         let (tx, rx) = crossbeam_channel::bounded::<ShadowWork>(65536);
         let shadow = std::sync::Arc::new(shadow);
+        let primary_label = primary_name.to_string();
+        let shadow_label = shadow_name.to_string();
 
         // Spawn background workers (2 threads — enough to keep up without
         // starving the primary verification threads)
@@ -225,6 +235,8 @@ impl ShadowVerifier {
         for _ in 0..num_workers {
             let w_rx = rx.clone();
             let w_shadow = shadow.clone();
+            let w_primary_label = primary_label.clone();
+            let w_shadow_label = shadow_label.clone();
             workers.push(std::thread::spawn(move || {
                 while let Ok(work) = w_rx.recv() {
                     let tx: Transaction = match bitcoin::consensus::deserialize(&work.tx_bytes) {
@@ -233,8 +245,8 @@ impl ShadowVerifier {
                     };
                     if let Err(e) = w_shadow.verify_transaction(&tx, &work.prev_outputs, work.height) {
                         tracing::error!(
-                            "SHADOW MISMATCH: primary accepted but shadow REJECTED: {} (txid={})",
-                            e, work.txid
+                            "SHADOW MISMATCH at height {}: {} (authoritative) accepted but {} (shadow) REJECTED: {} (txid={})",
+                            work.height, w_primary_label, w_shadow_label, e, work.txid
                         );
                     }
                 }

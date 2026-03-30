@@ -215,6 +215,8 @@ async fn main() {
             Box::new(ShadowVerifier::new(
                 Box::new(ConsensusVerifier),
                 Box::new(RustVerifier),
+                "cpp",
+                "rust",
             ))
         }
         ConsensusEngine::CppShadow => {
@@ -222,6 +224,8 @@ async fn main() {
             Box::new(ShadowVerifier::new(
                 Box::new(RustVerifier),
                 Box::new(ConsensusVerifier),
+                "rust",
+                "cpp",
             ))
         }
     };
