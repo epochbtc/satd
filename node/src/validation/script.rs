@@ -244,9 +244,44 @@ impl ShadowVerifier {
                         Err(_) => continue,
                     };
                     if let Err(e) = w_shadow.verify_transaction(&tx, &work.prev_outputs, work.height) {
+                        // Identify which input(s) failed and log details
+                        let mut failed_inputs = Vec::new();
+                        for (idx, prev_out) in work.prev_outputs.iter().enumerate() {
+                            let script_type = if prev_out.script_pubkey.is_p2pkh() {
+                                "P2PKH"
+                            } else if prev_out.script_pubkey.is_p2sh() {
+                                "P2SH"
+                            } else if prev_out.script_pubkey.is_p2wpkh() {
+                                "P2WPKH"
+                            } else if prev_out.script_pubkey.is_p2wsh() {
+                                "P2WSH"
+                            } else if prev_out.script_pubkey.is_p2tr() {
+                                "P2TR"
+                            } else {
+                                "other"
+                            };
+                            failed_inputs.push(format!(
+                                "input[{}]: {} sats, {} ({}B script)",
+                                idx,
+                                prev_out.value.to_sat(),
+                                script_type,
+                                prev_out.script_pubkey.len(),
+                            ));
+                        }
                         tracing::error!(
-                            "SHADOW MISMATCH at height {}: {} (authoritative) accepted but {} (shadow) REJECTED: {} (txid={})",
-                            work.height, w_primary_label, w_shadow_label, e, work.txid
+                            "SHADOW MISMATCH at height {}: {} (authoritative) accepted but {} (shadow) REJECTED\n  \
+                             txid: {}\n  \
+                             error: {}\n  \
+                             inputs: {} total, witnesses: {}\n  \
+                             details: [{}]",
+                            work.height,
+                            w_primary_label,
+                            w_shadow_label,
+                            work.txid,
+                            e,
+                            tx.input.len(),
+                            tx.input.iter().filter(|i| !i.witness.is_empty()).count(),
+                            failed_inputs.join(", "),
                         );
                     }
                 }
