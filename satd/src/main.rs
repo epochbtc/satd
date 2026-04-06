@@ -217,6 +217,8 @@ async fn main() {
                 Box::new(RustVerifier),
                 "cpp",
                 "rust",
+                config.shadow_queue_size,
+                config.shadow_workers,
             ))
         }
         ConsensusEngine::CppShadow => {
@@ -226,6 +228,8 @@ async fn main() {
                 Box::new(ConsensusVerifier),
                 "rust",
                 "cpp",
+                config.shadow_queue_size,
+                config.shadow_workers,
             ))
         }
     };

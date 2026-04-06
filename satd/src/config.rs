@@ -106,6 +106,10 @@ pub struct Config {
     pub max_ahead: u32,
     /// Consensus engine selection.
     pub consensus: ConsensusEngine,
+    /// Shadow verification queue capacity (default: 4_194_304).
+    pub shadow_queue_size: usize,
+    /// Shadow verification worker threads (default: 4).
+    pub shadow_workers: usize,
     // MCP server
     pub mcp: bool,
     pub mcp_stdio: bool,
@@ -116,8 +120,6 @@ pub struct Config {
     pub server: bool,
     #[allow(dead_code)]
     pub daemon: bool,
-    #[allow(dead_code)]
-    pub par: usize,
 }
 
 impl Config {
@@ -413,14 +415,20 @@ impl Config {
                     ConsensusEngine::Cpp
                 })
             },
+            shadow_queue_size: cli
+                .shadowqueuesize
+                .or_else(|| file_get("shadowqueuesize").and_then(|v| v.parse().ok()))
+                .unwrap_or(4_194_304),
+            shadow_workers: cli
+                .shadowworkers
+                .or_else(|| file_get("shadowworkers").and_then(|v| v.parse().ok()))
+                // --par as fallback for shadow workers (was previously a no-op)
+                .or_else(|| cli.par.or_else(|| file_get("par").and_then(|v| v.parse().ok())).filter(|&n| n > 0))
+                .unwrap_or(4),
             server: cli.server
                 || file_get("server").and_then(|v| parse_bool(&v)).unwrap_or(false),
             daemon: cli.daemon
                 || file_get("daemon").and_then(|v| parse_bool(&v)).unwrap_or(false),
-            par: cli
-                .par
-                .or_else(|| file_get("par").and_then(|v| v.parse().ok()))
-                .unwrap_or(0),
         })
     }
 
@@ -580,6 +588,12 @@ pub struct CliArgs {
 
     #[arg(long, value_name = "ENGINE", help = "Consensus engine: cpp, rust, rust-shadow, cpp-shadow (default: rust-shadow)")]
     pub consensus: Option<String>,
+
+    #[arg(long, value_name = "N", help = "Shadow verification queue capacity (default: 4194304)")]
+    pub shadowqueuesize: Option<usize>,
+
+    #[arg(long, value_name = "N", help = "Shadow verification worker threads (default: 4)")]
+    pub shadowworkers: Option<usize>,
 
     // MCP server flags
     #[arg(long, help = "Enable MCP (Model Context Protocol) server")]
@@ -885,6 +899,8 @@ rpcport=8332
             mcpbind: None,
             maxahead: None,
             consensus: None,
+            shadowqueuesize: None,
+            shadowworkers: None,
         };
         let config = Config::from_cli(cli).unwrap();
         assert_eq!(config.network, Network::Regtest);
@@ -948,6 +964,8 @@ rpcport=8332
             mcpbind: None,
             maxahead: None,
             consensus: None,
+            shadowqueuesize: None,
+            shadowworkers: None,
         };
         assert!(Config::from_cli(cli).is_err());
     }

@@ -200,6 +200,7 @@ impl ScriptVerifier for RustVerifier {
 pub struct ShadowVerifier {
     primary: Box<dyn ScriptVerifier>,
     shadow_tx: crossbeam_channel::Sender<ShadowWork>,
+    queue_size: usize,
     _workers: Vec<std::thread::JoinHandle<()>>,
 }
 
@@ -220,17 +221,19 @@ impl ShadowVerifier {
         shadow: Box<dyn ScriptVerifier>,
         primary_name: &str,
         shadow_name: &str,
+        queue_size: usize,
+        num_workers: usize,
     ) -> Self {
-        // Large buffer (64K items) — should never fill under normal operation.
-        // A typical block has ~2000 txs; this holds ~32 blocks of backlog.
-        let (tx, rx) = crossbeam_channel::bounded::<ShadowWork>(65536);
+        let (tx, rx) = crossbeam_channel::bounded::<ShadowWork>(queue_size);
         let shadow = std::sync::Arc::new(shadow);
         let primary_label = primary_name.to_string();
         let shadow_label = shadow_name.to_string();
 
-        // Spawn background workers (2 threads — enough to keep up without
-        // starving the primary verification threads)
-        let num_workers = 2;
+        tracing::info!(
+            queue_size,
+            num_workers,
+            "Shadow verification pool started"
+        );
         let mut workers = Vec::with_capacity(num_workers);
         for _ in 0..num_workers {
             let w_rx = rx.clone();
@@ -291,6 +294,7 @@ impl ShadowVerifier {
         Self {
             primary,
             shadow_tx: tx,
+            queue_size,
             _workers: workers,
         }
     }
@@ -317,7 +321,8 @@ impl ScriptVerifier for ShadowVerifier {
             if let Err(crossbeam_channel::TrySendError::Full(_)) = self.shadow_tx.try_send(work) {
                 tracing::warn!(
                     height,
-                    "Shadow verification queue full (64K items) — dropping tx. \
+                    queue_size = self.queue_size,
+                    "Shadow verification queue full — dropping tx. \
                      Shadow workers may be falling behind."
                 );
             }

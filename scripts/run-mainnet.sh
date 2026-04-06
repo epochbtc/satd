@@ -3,7 +3,7 @@
 set -euo pipefail
 
 SATD="$HOME/.local/bin/satd"
-DATADIR="/opt/satd-mainnet"
+DATADIR="/satd"
 RPCPORT=18880
 P2PPORT=18881
 MAINNET_P2P_PORT=8333
@@ -38,4 +38,6 @@ exec "$SATD" \
     --txindex \
     --dbcache=8000 \
     --maxahead=all \
+    --consensus=rust-shadow \
+    --assumevalid=0 \
     "${CONNECT_ARGS[@]}"
