@@ -128,6 +128,9 @@ pub struct PeerManager {
     connect_peer_addrs: RwLock<Vec<PeerAddr>>,
     /// Max blocks downloaded ahead of connect cursor during IBD.
     max_ahead: u32,
+    /// Latest ETA (seconds) from the weight-aware IBD estimator.
+    /// Written by the connect loop, read by the RPC handler.
+    ibd_eta_secs: Arc<AtomicU64>,
 }
 
 impl PeerManager {
@@ -227,6 +230,7 @@ impl PeerManager {
             onion_proxy,
             connect_peer_addrs: RwLock::new(Vec::new()),
             max_ahead,
+            ibd_eta_secs: Arc::new(AtomicU64::new(0)),
         });
 
         // Spawn block processing thread
@@ -234,8 +238,9 @@ impl PeerManager {
         let mp = mempool;
         let fe = fee_estimator;
         let prune_mb = prune_target_mb;
+        let eta_secs = mgr.ibd_eta_secs.clone();
         std::thread::spawn(move || {
-            Self::block_processor(block_rx, cs, mp, fe, prune_mb, connect_signal, ibd, prefetch_workers, max_ahead);
+            Self::block_processor(block_rx, cs, mp, fe, prune_mb, connect_signal, ibd, prefetch_workers, max_ahead, network, eta_secs);
         });
 
         mgr
@@ -454,6 +459,8 @@ impl PeerManager {
 
         let bitmap_b64 = base64::engine::general_purpose::STANDARD.encode(&bitmap);
 
+        let eta = self.ibd_eta_secs.load(std::sync::atomic::Ordering::Relaxed);
+
         Some(serde_json::json!({
             "active": true,
             "connect_cursor": cursor,
@@ -464,6 +471,7 @@ impl PeerManager {
             "bitmap": bitmap_b64,
             "bitmap_start": cursor + 1,
             "bitmap_sampled": bitmap_sampled,
+            "eta_secs": eta,
             "peer_download_stats": peer_stats.iter().map(|(id, recv, assigned)| {
                 serde_json::json!({"peer_id": id, "blocks_received": recv, "assigned": assigned})
             }).collect::<Vec<_>>(),
@@ -1191,6 +1199,8 @@ impl PeerManager {
         ibd: Arc<std::sync::RwLock<Option<IbdScheduler>>>,
         prefetch_workers: usize,
         max_ahead: u32,
+        network: Network,
+        ibd_eta_secs: Arc<AtomicU64>,
     ) {
         let mut last_log_height: u32 = 0;
         let mut last_prune_height: u32 = 0;
@@ -1214,6 +1224,8 @@ impl PeerManager {
                 &mut last_log_height,
                 &mut last_prune_height,
                 max_ahead,
+                network,
+                &ibd_eta_secs,
             );
         }
 
@@ -1234,6 +1246,8 @@ impl PeerManager {
                     &mut last_log_height,
                     &mut last_prune_height,
                     max_ahead,
+                    network,
+                    &ibd_eta_secs,
                 );
                 continue;
             }
@@ -1319,11 +1333,20 @@ impl PeerManager {
         last_log_height: &mut u32,
         last_prune_height: &mut u32,
         max_ahead: u32,
+        network: Network,
+        ibd_eta_secs: &Arc<AtomicU64>,
     ) {
         let mut connected_count = 0u64;
         let mut retry_count = 0u32;
         let start_time = Instant::now();
         let perf = std::sync::Arc::new(crate::perf::IbdPerf::new());
+
+        // Weight-aware ETA estimator
+        let target = ibd.read().unwrap().as_ref().map(|s| s.target_height()).unwrap_or(0);
+        let is_mainnet = network == Network::Bitcoin;
+        let mut eta_estimator = crate::ibd_eta::IbdEtaEstimator::new(
+            chain_state.tip_height(), target, is_mainnet,
+        );
 
         // Start the prefetch pipeline
         let store: Arc<dyn crate::storage::Store + Send + Sync> =
@@ -1447,18 +1470,6 @@ impl PeerManager {
                                     .map(|s| s.progress())
                                     .unwrap_or((0, 0, 0, 0))
                             };
-                            tracing::info!(
-                                height = next_height,
-                                "IBD: {}/{} connected, {} downloaded ahead, {} in-flight, {} pending ({} blk/s)",
-                                next_height,
-                                target_height,
-                                dl,
-                                inf,
-                                pend,
-                                rate
-                            );
-                            *last_log_height = next_height;
-
                             // Transfer cache perf counters and report
                             {
                                 let store = chain_state.store_ref();
@@ -1476,6 +1487,33 @@ impl PeerManager {
                                 );
                             }
                             perf.report(next_height);
+
+                            // Feed the ETA estimator with this interval's wall-clock time
+                            let interval_ms = perf.last_interval_ms.load(std::sync::atomic::Ordering::Relaxed);
+                            eta_estimator.record_interval(next_height, interval_ms as f64 / 1000.0);
+                            let eta_str = match eta_estimator.estimate_eta(next_height, target_height) {
+                                Some(secs) => {
+                                    ibd_eta_secs.store(secs, std::sync::atomic::Ordering::Relaxed);
+                                    format!("ETA: {}", crate::ibd_eta::format_eta(secs))
+                                }
+                                None => {
+                                    ibd_eta_secs.store(0, std::sync::atomic::Ordering::Relaxed);
+                                    "ETA: --".to_string()
+                                }
+                            };
+
+                            tracing::info!(
+                                height = next_height,
+                                "IBD: {}/{} connected, {} downloaded ahead, {} in-flight, {} pending ({} blk/s, {})",
+                                next_height,
+                                target_height,
+                                dl,
+                                inf,
+                                pend,
+                                rate,
+                                eta_str,
+                            );
+                            *last_log_height = next_height;
 
                             // Flush UTXO cache to disk every 1000 blocks
                             if let Err(e) = chain_state.flush_coin_cache() {

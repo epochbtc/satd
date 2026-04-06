@@ -148,10 +148,6 @@ pub struct AppState {
     prev_headers: u32,
     prev_total_downloaded: u64,
     prev_peer_blocks: HashMap<u64, u64>,
-    /// For stable ETA: time when we first saw blocks advancing.
-    ibd_start_time: Option<std::time::Instant>,
-    /// Block height when IBD tracking started.
-    ibd_start_blocks: u32,
     pub connected: bool,
     pub last_poll: Option<std::time::Instant>,
     pub stale: bool,
@@ -221,8 +217,6 @@ impl AppState {
             prev_headers: 0,
             prev_total_downloaded: 0,
             prev_peer_blocks: HashMap::new(),
-            ibd_start_time: None,
-            ibd_start_blocks: 0,
             connected: false,
             last_poll: None,
             stale: false,
@@ -260,12 +254,17 @@ impl AppState {
                     self.bps_history.pop_front();
                 }
 
-                // ETA — use network height (peer-reported) as target, not just headers
-                let target = self.network_height.max(new_headers);
-                if self.blocks_per_sec > 0.01 && target > new_blocks {
-                    self.eta_secs = Some(((target - new_blocks) as f64 / self.blocks_per_sec) as u64);
-                } else {
-                    self.eta_secs = None;
+                // ETA — only set here as a fallback when server-side ETA is
+                // not available (non-IBD path or stale IBD progress data).
+                // During active IBD, update_ibd_progress() provides a
+                // weight-aware ETA from the daemon.
+                if self.ibd_bitmap.is_none() {
+                    let target = self.network_height.max(new_headers);
+                    if self.blocks_per_sec > 0.01 && target > new_blocks {
+                        self.eta_secs = Some(((target - new_blocks) as f64 / self.blocks_per_sec) as u64);
+                    } else {
+                        self.eta_secs = None;
+                    }
                 }
             }
         }
@@ -372,24 +371,12 @@ impl AppState {
                 self.blocks = cursor;
             }
 
-            // ETA from long-window average (total blocks / total time) for stability.
-            // The instantaneous EMA rate (blocks_per_sec) is still shown in sparklines
-            // but the ETA uses the session-wide average to avoid wild oscillation.
-            let target = self.sync_target();
-            if target > self.blocks {
-                if self.ibd_start_time.is_none() && self.blocks > 0 {
-                    self.ibd_start_time = Some(std::time::Instant::now());
-                    self.ibd_start_blocks = self.blocks;
-                }
-                if let Some(start) = self.ibd_start_time {
-                    let elapsed = start.elapsed().as_secs_f64();
-                    let connected = self.blocks.saturating_sub(self.ibd_start_blocks) as f64;
-                    if elapsed > 5.0 && connected > 10.0 {
-                        let avg_bps = connected / elapsed;
-                        let remaining = (target - self.blocks) as f64;
-                        self.eta_secs = Some((remaining / avg_bps) as u64);
-                    }
-                }
+            // ETA from server-side weight-aware estimator (computed in the
+            // daemon's connect loop, exposed via getibdprogress RPC).
+            // This accounts for the ~50x cost variation across Bitcoin's
+            // history, producing a stable, converging ETA.
+            if let Some(eta) = v.get("eta_secs").and_then(|e| e.as_u64()) {
+                self.eta_secs = if eta > 0 { Some(eta) } else { None };
             }
         }
     }
