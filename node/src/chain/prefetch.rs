@@ -157,35 +157,14 @@ pub fn prefetch_block(
             })
             .collect();
 
-        let num_threads = std::thread::available_parallelism()
-            .map(|n| n.get().min(8))
-            .unwrap_or(4);
-
-        if verifiable.is_empty() || num_threads <= 1 {
-            verifiable.iter()
+        if verifiable.is_empty() {
+            HashSet::new()
+        } else {
+            use rayon::prelude::*;
+            verifiable.par_iter()
                 .filter(|(_, tx, prev_outputs)| verifier.verify_transaction(tx, prev_outputs, height).is_ok())
                 .map(|(tx_idx, _, _)| *tx_idx)
                 .collect()
-        } else {
-            let chunk_size = verifiable.len().div_ceil(num_threads);
-            let mut verified = HashSet::new();
-            let verifier_ref = &verifier;
-            std::thread::scope(|s| {
-                let handles: Vec<_> = verifiable.chunks(chunk_size)
-                    .map(|chunk| {
-                        s.spawn(move || {
-                            chunk.iter()
-                                .filter(|(_, tx, prev_outputs)| verifier_ref.verify_transaction(tx, prev_outputs, height).is_ok())
-                                .map(|(tx_idx, _, _)| *tx_idx)
-                                .collect::<Vec<_>>()
-                        })
-                    })
-                    .collect();
-                for handle in handles {
-                    verified.extend(handle.join().unwrap());
-                }
-            });
-            verified
         }
     } else {
         drop(coins); // results only needed for cache warming, already done

@@ -42,6 +42,10 @@ pub struct IbdPerf {
 
     // Last report time
     last_report: std::sync::Mutex<Instant>,
+
+    // Wall-clock milliseconds of the most recent reporting interval.
+    // Set by report(), read by the connect loop for ETA calibration.
+    pub last_interval_ms: AtomicU64,
 }
 
 impl Default for IbdPerf {
@@ -71,6 +75,7 @@ impl IbdPerf {
             utxo_batch_ns: AtomicU64::new(0),
             utxo_batch_keys: AtomicU64::new(0),
             last_report: std::sync::Mutex::new(Instant::now()),
+            last_interval_ms: AtomicU64::new(0),
         }
     }
 
@@ -83,6 +88,7 @@ impl IbdPerf {
             e
         };
         let elapsed_ms = elapsed.as_millis().max(1) as u64;
+        self.last_interval_ms.store(elapsed_ms, Ordering::Relaxed);
 
         let connect_count = self.connect_count.swap(0, Ordering::Relaxed);
         let connect_ms = self.connect_ns.swap(0, Ordering::Relaxed) / 1_000_000;

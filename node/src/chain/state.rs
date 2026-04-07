@@ -583,7 +583,7 @@ impl ChainState {
         } else {
             None
         };
-        let batch = connect::connect_block(&connect::ConnectParams {
+        let mut batch = connect::connect_block(&connect::ConnectParams {
             store: &*self.store,
             block: &pre.block,
             height: pre.height,
@@ -597,7 +597,11 @@ impl ChainState {
             precomputed_txids: Some(&pre.txids),
         })?;
 
-        // Atomic commit
+        // Fast path: apply coin mutations directly to dirty map, then
+        // write non-coin metadata through the normal batch path.
+        let coin_puts = std::mem::take(&mut batch.coin_puts);
+        let coin_removes = std::mem::take(&mut batch.coin_removes);
+        self.store.apply_coin_mutations(coin_puts, coin_removes);
         self.store.write_batch(batch)?;
 
         // Update in-memory tip
@@ -787,7 +791,7 @@ impl ChainState {
 
         // Connect block
         let mtp = self.get_median_time_past(entry.height);
-        let batch = connect::connect_block(&connect::ConnectParams {
+        let mut batch = connect::connect_block(&connect::ConnectParams {
             store: &*self.store,
             block: &block,
             height: entry.height,
@@ -801,7 +805,10 @@ impl ChainState {
             precomputed_txids: None,
         })?;
 
-        // Atomic commit
+        // Fast path: apply coin mutations directly, then non-coin metadata.
+        let coin_puts = std::mem::take(&mut batch.coin_puts);
+        let coin_removes = std::mem::take(&mut batch.coin_removes);
+        self.store.apply_coin_mutations(coin_puts, coin_removes);
         self.store.write_batch(batch)?;
 
         // Update in-memory tip
@@ -846,7 +853,7 @@ impl ChainState {
                 if use_noop { &noop } else { &*self.script_verifier };
 
             let mtp = self.get_median_time_past(height);
-            let batch = connect::connect_block(&connect::ConnectParams {
+            let mut batch = connect::connect_block(&connect::ConnectParams {
                 store: &*self.store,
                 block: &block,
                 height,
@@ -857,8 +864,11 @@ impl ChainState {
                 network: self.network,
                 pre_verified_txs: None,
                 num_threads: self.num_threads,
-            precomputed_txids: None,
+                precomputed_txids: None,
             })?;
+            let coin_puts = std::mem::take(&mut batch.coin_puts);
+            let coin_removes = std::mem::take(&mut batch.coin_removes);
+            self.store.apply_coin_mutations(coin_puts, coin_removes);
             self.store.write_batch(batch)?;
 
             {
@@ -936,7 +946,7 @@ impl ChainState {
                 if use_noop { &noop } else { &*self.script_verifier };
 
             let mtp = self.get_median_time_past(height);
-            let batch = connect::connect_block(&connect::ConnectParams {
+            let mut batch = connect::connect_block(&connect::ConnectParams {
                 store: &*self.store,
                 block: &block,
                 height,
@@ -947,8 +957,11 @@ impl ChainState {
                 network: self.network,
                 pre_verified_txs: None,
                 num_threads: self.num_threads,
-            precomputed_txids: None,
+                precomputed_txids: None,
             })?;
+            let coin_puts = std::mem::take(&mut batch.coin_puts);
+            let coin_removes = std::mem::take(&mut batch.coin_removes);
+            self.store.apply_coin_mutations(coin_puts, coin_removes);
             self.store.write_batch(batch)?;
 
             {
@@ -1118,7 +1131,7 @@ impl ChainState {
                     file_number: side_entry.file_number,
                     data_pos: side_entry.data_pos,
                 };
-                let batch = connect::connect_block(&connect::ConnectParams {
+                let mut batch = connect::connect_block(&connect::ConnectParams {
                     store: &*self.store,
                     block: &side_block,
                     height: side_entry.height,
@@ -1131,6 +1144,9 @@ impl ChainState {
                     num_threads: 1,
                     precomputed_txids: None,
                 })?;
+                let coin_puts = std::mem::take(&mut batch.coin_puts);
+                let coin_removes = std::mem::take(&mut batch.coin_removes);
+                self.store.apply_coin_mutations(coin_puts, coin_removes);
                 self.store.write_batch(batch)?;
                 {
                     let mut tip = self.tip.write().unwrap();
@@ -1150,7 +1166,7 @@ impl ChainState {
 
         // Connect block (process transactions, update UTXOs, verify scripts)
         let mtp = self.get_median_time_past(new_height);
-        let batch = connect::connect_block(&connect::ConnectParams {
+        let mut batch = connect::connect_block(&connect::ConnectParams {
             store: &*self.store,
             block,
             height: new_height,
@@ -1164,7 +1180,10 @@ impl ChainState {
             precomputed_txids: None,
         })?;
 
-        // Atomic commit
+        // Fast path: coins direct to dirty map, then non-coin metadata
+        let coin_puts = std::mem::take(&mut batch.coin_puts);
+        let coin_removes = std::mem::take(&mut batch.coin_removes);
+        self.store.apply_coin_mutations(coin_puts, coin_removes);
         self.store.write_batch(batch)?;
 
         // Update in-memory tip
