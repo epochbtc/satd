@@ -465,3 +465,103 @@ fn differential_bip341_key_path() {
     eprintln!("Differential BIP341: {matched} matched, {mismatched} mismatched");
     assert_eq!(mismatched, 0);
 }
+
+// =========================================================================
+// Differential test: P2SH-P2WPKH with non-standard sighash type (0x65)
+//
+// These are real mainnet transactions that were accepted by Bitcoin Core
+// (libbitcoinconsensus) but rejected by the Rust verifier due to the
+// sighash byte 0x65 being normalised to SIGHASH_ALL (0x01) in the BIP143
+// preimage.  Bitcoin Core hashes the raw byte.
+// =========================================================================
+
+#[test]
+fn differential_p2sh_p2wpkh_nonstandard_sighash() {
+    // Flags matching block height 508k+ (post-segwit, pre-taproot)
+    let flags = bitcoinconsensus::VERIFY_P2SH
+        | bitcoinconsensus::VERIFY_DERSIG
+        | bitcoinconsensus::VERIFY_CHECKLOCKTIMEVERIFY
+        | bitcoinconsensus::VERIFY_CHECKSEQUENCEVERIFY
+        | bitcoinconsensus::VERIFY_WITNESS
+        | bitcoinconsensus::VERIFY_NULLDUMMY;
+
+    // (spend_tx_hex, prev_scriptpubkey_hex, prev_value_sats)
+    let cases: &[(&str, &str, u64)] = &[
+        // Height 508011: txid 969c4f116f0a68406d30dc80bf17991fb8fe7fa1b240382baefa2c324b79d50d
+        // P2SH-P2WPKH, sighash byte 0x65
+        (
+            "01000000000101447e208868dbc8e930fc6eba4fe0d0abfe0d9dc2db4ba70542e02467f00205c9\
+             0100000017160014e20c60563894174c253ae937ba59ace46ab9ffb1ffffffff010845f3050000\
+             00001976a91414ac7fc2a782bde1555b753d75ff4ed146683cae88ac024730440220120003c32c\
+             ca7eabf07bad5c31125accc09d13c39546fa93833b8b69a2c72ed7022057083dc2ed348156874b\
+             8af859ac7a9c16e5ce39353f3f1ac2226b49c2b319af652103f73386ac6e567581f8d0611ad7a8\
+             536c3cd0253e535f6fc4707514b2ab54198700000000",
+            "a914e93f9e95f6d5cb1736a94de992d0d18819072fa587",
+            99830000,
+        ),
+        // Height 508417: txid 76e43164383ea18ce4246beb08911b5650e174d2474cd9447f17418789ca4fbc
+        // P2SH-P2WPKH, sighash byte 0x65
+        (
+            "01000000000101bb00b6b6a8f3a8160fb225dab4d81333fdc7b4af0bd41c1038369abfcc0aeecb\
+             01000000171600145f15287308b7ed72571b7714ee9373ef5e0eab09ffffffff0158090300000000\
+             001976a914b118683467b55901940767755d75a399e9c06c3488ac0247304402200f5bb587f6f01d\
+             e296ef38a2cb2a78f5b6644dc3b5981a92169dac6b24c9682a02207b498fef6b4490086b25a9d65f\
+             67ff35cfe2a3df8434486827905f930de812d965210320a3feab5802c0437c30380c03e9bb88a288\
+             fa6f8492c1e0554448ccd657fa2e00000000",
+            "a9147b4ee983fcded1f39e10456b25c24d372302c4e787",
+            200000,
+        ),
+        // Height 509676: txid 702c51fb615d167de25f6e6efe706a3bd41ad3dd3151805a896ccb1f2462b66b
+        // P2SH-P2WPKH, sighash byte 0x65
+        (
+            "0100000000010174a12ba10cb582a325c00bbcaf62b3138aab20d970cb359d07afef3c3bfaea9a\
+             00000000171600144d581ecd16580411e1597f69c649a286540d4c36ffffffff0168bf00000000\
+             00001976a914b138fe0cd7753ea419771e1a5c29af2111ea502488ac0247304402207e6a3da1c3\
+             1156fe89fbd957061ef1af9382c36a0db11bdd06b850a62decd65a02206668c198c74594914b0a\
+             f2e12493cd2d65c01d64df16e1d3934599cdde372d28652103225c519aafb783537e3c6b9cdd78\
+             505bac11dc20dccb886311a32436e3d03eca00000000",
+            "a914d8e00ebe7d7a8eb6859e6bc54715ddf318e5a81187",
+            50000,
+        ),
+        // Height 509793: txid 3b2c470760c48c14036084acad104e8e4e7c224d8267e01d65e21175dfe3a5bb
+        // P2SH-P2WPKH, sighash byte 0x65 (72-byte sig)
+        (
+            "01000000000101af9be42538e888f901528c9172f3024f630ae555873492167a77a4e2fdfe50a8\
+             0000000017160014abb2fe16026f9030fb9a32c25be43430dbf20d75ffffffff01f88f04000000\
+             00001976a91460e494ac538f27143186a518cd2c6443ab14bea388ac02483045022100f47becda\
+             4d3f0bb483b377c17e650aad5678668d4a2f055bcde89d70aa5dc0fe022020cf2fe3ff345e10fd\
+             89a4d8549d006b6be661a09b16451cd55f3add1724736d652103f558c5a39d140bf550a62e79e5\
+             4db80edc6f18112f5f0270ea5b406b2b60111f00000000",
+            "a914a32dad06254107467726feb5c59cbb5d5f28529587",
+            300000,
+        ),
+    ];
+
+    let mut matched = 0;
+    let mut mismatched = 0;
+
+    for (i, &(tx_hex, spk_hex, value)) in cases.iter().enumerate() {
+        let tx_bytes = hex::decode(tx_hex).unwrap();
+        let spk = hex::decode(spk_hex).unwrap();
+
+        let prevs = vec![(spk.clone(), value)];
+        let (rust_ok, cpp_ok, ok) = verify_both(
+            &spk, value, &tx_bytes, 0, flags, Some(&prevs),
+        );
+
+        if ok {
+            matched += 1;
+        } else {
+            mismatched += 1;
+            eprintln!(
+                "DIFF nonstandard_sighash case {i}: rust={rust_ok} cpp={cpp_ok} flags=0x{flags:x}"
+            );
+        }
+    }
+
+    eprintln!(
+        "Differential nonstandard_sighash: {matched} matched, {mismatched} mismatched out of {}",
+        cases.len()
+    );
+    assert_eq!(mismatched, 0, "{mismatched} mismatches in nonstandard sighash test");
+}
