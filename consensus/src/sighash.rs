@@ -2,7 +2,7 @@
 //! use with our SignatureChecker trait.
 #![allow(clippy::nonminimal_bool)]
 
-use bitcoin::hashes::Hash;
+use bitcoin::hashes::{sha256d, Hash};
 use bitcoin::sighash::{self, EcdsaSighashType, Prevouts, SighashCache, TapSighashType};
 use bitcoin::secp256k1::{self, Message, Secp256k1};
 use bitcoin::{Amount, Script, ScriptBuf, Sequence, Transaction, TxOut};
@@ -87,17 +87,32 @@ impl SignatureChecker for TxSignatureChecker<'_> {
 
         let sighash = match sig_version {
             SigVersion::WitnessV0 => {
-                // BIP143 segwit v0 sighash
+                // BIP143 segwit v0 sighash.
+                //
+                // Write the signing data to a buffer so we can replace the
+                // trailing 4-byte hash-type field with the RAW hash-type
+                // byte from the signature.  The bitcoin crate normalises
+                // non-standard bytes (e.g. 0x65 → All → 0x01) via
+                // EcdsaSighashType, but Bitcoin Core hashes the original
+                // byte.  Intermediate fields (hashPrevouts, hashSequence,
+                // hashOutputs) are unaffected because the ACP / SINGLE /
+                // NONE routing is identical after normalisation.
                 let mut cache = SighashCache::new(self.tx);
-                match cache.p2wsh_signature_hash(
+                let mut buf = Vec::with_capacity(256);
+                match cache.segwit_v0_encode_signing_data_to(
+                    &mut buf,
                     self.input_index,
                     script_code_obj,
                     self.amount,
                     sighash_type,
                 ) {
-                    Ok(h) => h.to_byte_array(),
+                    Ok(()) => {}
                     Err(_) => return false,
                 }
+                // Overwrite the last 4 bytes with the raw hash type.
+                let len = buf.len();
+                buf[len - 4..].copy_from_slice(&(hash_type_byte as u32).to_le_bytes());
+                sha256d::Hash::hash(&buf).to_byte_array()
             }
             SigVersion::Base => {
                 // Legacy sighash
