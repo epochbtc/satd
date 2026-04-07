@@ -19,10 +19,17 @@ impl TestNode {
 
         let satd_bin = env!("CARGO_BIN_EXE_satd");
 
+        // Allocate a unique P2P port unless the caller already specified --port.
+        let has_port = extra_args.iter().any(|a| a.starts_with("--port"));
+        let p2p_port = if has_port { 0 } else { find_available_port() };
+
         let mut cmd = Command::new(satd_bin);
         cmd.arg("--regtest")
             .arg(format!("--datadir={}", datadir.display()))
             .arg(format!("--rpcport={}", rpcport));
+        if !has_port {
+            cmd.arg(format!("--port={}", p2p_port));
+        }
         for arg in extra_args {
             cmd.arg(arg);
         }
@@ -36,20 +43,18 @@ impl TestNode {
         // Check if using user/pass auth (no cookie file expected)
         let uses_userpass = extra_args.iter().any(|a| a.starts_with("--rpcuser"));
 
-        // Wait for RPC server to be fully ready (not just port open —
-        // the startup RPC server may be listening before the real server).
+        // Wait for RPC server to be fully ready.  We verify that
+        // getblockchaininfo returns a non-null "chain" field to ensure the
+        // chain state is initialized (not just the HTTP listener).
         let deadline = Instant::now() + Duration::from_secs(30);
         let cookie_path = datadir.join("regtest").join(".cookie");
         loop {
             if uses_userpass {
-                // With user/pass auth: no cookie file, just wait for port + a short delay
-                // for the real RPC server to replace the startup server.
                 if std::net::TcpStream::connect(format!("127.0.0.1:{}", rpcport)).is_ok() {
                     std::thread::sleep(Duration::from_millis(500));
                     break;
                 }
             } else if let Ok(cookie) = std::fs::read_to_string(&cookie_path) {
-                // With cookie auth: verify the real RPC server responds successfully
                 let auth = base64::engine::general_purpose::STANDARD
                     .encode(cookie.trim());
                 let client = reqwest::blocking::Client::builder()
@@ -62,7 +67,9 @@ impl TestNode {
                     .header("Content-Type", "application/json")
                     .body(r#"{"jsonrpc":"2.0","id":1,"method":"getblockchaininfo"}"#)
                     .send()
-                    .is_ok_and(|r| r.status().is_success());
+                    .ok()
+                    .and_then(|r| r.json::<serde_json::Value>().ok())
+                    .is_some_and(|j| !j["result"]["chain"].is_null());
                 if rpc_ready {
                     break;
                 }
@@ -91,10 +98,16 @@ impl TestNode {
     fn start_with_datadir(datadir: &std::path::Path, rpcport: u16, extra_args: &[&str]) -> Self {
         let satd_bin = env!("CARGO_BIN_EXE_satd");
 
+        let has_port = extra_args.iter().any(|a| a.starts_with("--port"));
+        let p2p_port = if has_port { 0 } else { find_available_port() };
+
         let mut cmd = Command::new(satd_bin);
         cmd.arg("--regtest")
             .arg(format!("--datadir={}", datadir.display()))
             .arg(format!("--rpcport={}", rpcport));
+        if !has_port {
+            cmd.arg(format!("--port={}", p2p_port));
+        }
         for arg in extra_args {
             cmd.arg(arg);
         }
@@ -121,7 +134,9 @@ impl TestNode {
                     .header("Content-Type", "application/json")
                     .body(r#"{"jsonrpc":"2.0","id":1,"method":"getblockchaininfo"}"#)
                     .send()
-                    .is_ok_and(|r| r.status().is_success());
+                    .ok()
+                    .and_then(|r| r.json::<serde_json::Value>().ok())
+                    .is_some_and(|j| !j["result"]["chain"].is_null());
                 if rpc_ready {
                     break;
                 }
@@ -159,7 +174,10 @@ impl TestNode {
             "params": params,
         });
 
-        let client = reqwest::blocking::Client::new();
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
         let (user, pass) = self
             .cookie
             .split_once(':')
