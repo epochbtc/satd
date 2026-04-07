@@ -40,6 +40,10 @@ pub struct IbdPerf {
     pub utxo_batch_ns: AtomicU64,
     pub utxo_batch_keys: AtomicU64,
 
+    // Speculative verification (pipelined prefetch)
+    pub spec_verify_skipped: AtomicU64,
+    pub spec_verify_rerun: AtomicU64,
+
     // Last report time
     last_report: std::sync::Mutex<Instant>,
 
@@ -74,6 +78,8 @@ impl IbdPerf {
             script_verify_count: AtomicU64::new(0),
             utxo_batch_ns: AtomicU64::new(0),
             utxo_batch_keys: AtomicU64::new(0),
+            spec_verify_skipped: AtomicU64::new(0),
+            spec_verify_rerun: AtomicU64::new(0),
             last_report: std::sync::Mutex::new(Instant::now()),
             last_interval_ms: AtomicU64::new(0),
         }
@@ -107,6 +113,8 @@ impl IbdPerf {
         let verify_ms = self.script_verify_ns.swap(0, Ordering::Relaxed) / 1_000_000;
         let batch_keys = self.utxo_batch_keys.swap(0, Ordering::Relaxed);
         let batch_ms = self.utxo_batch_ns.swap(0, Ordering::Relaxed) / 1_000_000;
+        let spec_skipped = self.spec_verify_skipped.swap(0, Ordering::Relaxed);
+        let spec_rerun = self.spec_verify_rerun.swap(0, Ordering::Relaxed);
 
         let total_lookups = dirty_hits + clean_hits + store_misses;
         let cache_hit_pct = if total_lookups > 0 {
@@ -133,6 +141,7 @@ impl IbdPerf {
              cache: {cache_hit_pct}% hit (dirty={dirty_hits} clean={clean_hits} miss={store_misses}) | \
              utxo_batch: {batch_keys} keys in {batch_ms}ms | \
              verify: {verify_count} txs in {verify_ms}ms | \
+             spec: {spec_skipped} skipped, {spec_rerun} rerun | \
              flush: {flush_count}x in {flush_ms}ms ({flush_coins} coins, {flush_elided} elided)"
         );
     }

@@ -173,6 +173,8 @@ pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError>
 
     // Transactions queued for parallel script verification after UTXO resolution
     let mut verify_queue: Vec<(&Transaction, Vec<TxOut>)> = Vec::with_capacity(block.txdata.len());
+    // Pre-verified txs that skip primary verification but still need shadow dispatch
+    let mut shadow_queue: Vec<(&Transaction, Vec<TxOut>)> = Vec::new();
 
     // Reuse precomputed txids from prefetch if available, otherwise compute once
     let computed_txids: Vec<bitcoin::Txid>;
@@ -350,13 +352,16 @@ pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError>
 
             total_fees += sum_inputs - sum_outputs;
 
-            // Collect for parallel script verification
-            // Skip if this tx was already pre-verified by the prefetch pipeline
+            // Collect for parallel script verification.
+            // If this tx was speculatively pre-verified by the prefetch pipeline,
+            // skip primary verification but still queue for shadow dispatch.
             let already_verified = pre_verified_txs
                 .map(|set| set.contains(&tx_idx))
                 .unwrap_or(false);
             if !already_verified {
                 verify_queue.push((tx, prev_outputs));
+            } else {
+                shadow_queue.push((tx, prev_outputs));
             }
         }
 
@@ -411,6 +416,13 @@ pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError>
                 return Err(err);
             }
         }
+    }
+
+    // Dispatch speculatively pre-verified txs to the shadow engine.
+    // Primary verification was already done on the prefetch worker; the shadow
+    // engine still needs to see every tx for mismatch detection.
+    for (tx, prev_outputs) in &shadow_queue {
+        script_verifier.dispatch_shadow(tx, prev_outputs, height);
     }
 
     // Check coinbase value doesn't exceed subsidy + fees

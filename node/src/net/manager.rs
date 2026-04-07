@@ -1426,6 +1426,10 @@ impl PeerManager {
                 let connect_result = match prefetch_handle.take_block(next_height) {
                     Some(pre) if pre.hash == hash => {
                         perf.prefetch_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let spec_count = pre.script_verified_txs.len() as u64;
+                        if spec_count > 0 {
+                            perf.spec_verify_skipped.fetch_add(spec_count, std::sync::atomic::Ordering::Relaxed);
+                        }
                         chain_state.connect_preprocessed_block(pre)
                     }
                     _ => {

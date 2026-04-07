@@ -25,6 +25,13 @@ pub trait ScriptVerifier: Send + Sync {
     fn shadow_verifier(&self) -> Option<&dyn ScriptVerifier> {
         None
     }
+
+    /// Dispatch a transaction for shadow-only verification (no primary).
+    /// Called for speculatively pre-verified transactions that were already
+    /// verified by the primary engine on a prefetch worker. The shadow
+    /// engine still needs to see them for mismatch detection.
+    /// Default: no-op (non-shadow verifiers have nothing to dispatch).
+    fn dispatch_shadow(&self, _tx: &Transaction, _prev_outputs: &[TxOut], _height: u32) {}
 }
 
 /// Softfork activation heights (mainnet). Verification flags are cumulative.
@@ -329,6 +336,22 @@ impl ScriptVerifier for ShadowVerifier {
         }
 
         result
+    }
+
+    fn dispatch_shadow(&self, tx: &Transaction, prev_outputs: &[TxOut], height: u32) {
+        let work = ShadowWork {
+            tx_bytes: bitcoin::consensus::serialize(tx),
+            prev_outputs: prev_outputs.to_vec(),
+            height,
+            txid: tx.compute_txid(),
+        };
+        if let Err(crossbeam_channel::TrySendError::Full(_)) = self.shadow_tx.try_send(work) {
+            tracing::warn!(
+                height,
+                queue_size = self.queue_size,
+                "Shadow verification queue full on dispatch_shadow — dropping tx."
+            );
+        }
     }
 }
 
