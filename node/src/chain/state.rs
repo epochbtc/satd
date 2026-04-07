@@ -574,11 +574,12 @@ impl ChainState {
         // Connect block using the pre-fetched data.
         // Wins: flat file I/O eliminated, cache warmed, pre-verified scripts skipped.
         //
-        // Only use pre-verified scripts when we're skipping scripts entirely
-        // (assumevalid mode). When the authoritative verifier runs, we must
-        // not bypass it — especially in shadow modes where both engines need
-        // to see every tx.
-        let pre_verified = if use_noop && !pre.script_verified_txs.is_empty() {
+        // Speculative pre-verification: prefetch workers verify scripts using
+        // the same ConsensusVerifier (cpp FFI). If all inputs still exist when
+        // the connect thread resolves them, the verification result is valid
+        // (coins are immutable). Shadow dispatch for pre-verified txs is
+        // handled by dispatch_shadow() in connect_block.
+        let pre_verified = if !pre.script_verified_txs.is_empty() {
             Some(&pre.script_verified_txs)
         } else {
             None

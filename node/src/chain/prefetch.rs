@@ -79,7 +79,7 @@ pub fn prefetch_block(
     store: &dyn Store,
     blocks_dir: &Path,
     height: u32,
-    assumevalid: bool,
+    _assumevalid: bool,
 ) -> Option<PreprocessedBlock> {
     // 1. Get block hash and entry
     let hash = store.get_block_hash_by_height(height)?;
@@ -129,11 +129,17 @@ pub fn prefetch_block(
     let outpoints: Vec<bitcoin::OutPoint> = input_keys.iter().map(|(_, _, op)| *op).collect();
     let coins = store.get_coins_batch(&outpoints); // single batch lookup — warms cache
 
-    // 7. Script pre-verification — only in assumevalid mode.
-    // Outside assumevalid, the connect thread runs the authoritative verifier on
-    // every transaction anyway, so pre-verification is wasted CPU.
-    let script_verified_txs: HashSet<usize> = if assumevalid {
-        let verifier = ConsensusVerifier;
+    // 7. Speculative script verification — always attempted, not just assumevalid.
+    //
+    // Pre-verifies scripts using the coins resolved above. The connect thread
+    // will skip primary verification for txs where all inputs still exist
+    // (coins are immutable — if the connect thread finds the coin, it is
+    // necessarily the same data the prefetch worker used). Shadow dispatch
+    // is handled separately by the connect thread via dispatch_shadow().
+    //
+    // Uses std::thread::scope (not rayon) to avoid deadlock risk with the
+    // connect thread's rayon pool.
+    let script_verified_txs: HashSet<usize> = {
         let mut spec_coins: HashMap<(usize, usize), Coin> = HashMap::new();
         for ((tx_idx, input_idx, _), coin_opt) in input_keys.into_iter().zip(coins) {
             if let Some(coin) = coin_opt {
@@ -160,15 +166,29 @@ pub fn prefetch_block(
         if verifiable.is_empty() {
             HashSet::new()
         } else {
-            use rayon::prelude::*;
-            verifiable.par_iter()
-                .filter(|(_, tx, prev_outputs)| verifier.verify_transaction(tx, prev_outputs, height).is_ok())
-                .map(|(tx_idx, _, _)| *tx_idx)
-                .collect()
+            let num_threads = std::thread::available_parallelism()
+                .map(|n| n.get().min(8))
+                .unwrap_or(4);
+            let chunk_size = verifiable.len().div_ceil(num_threads);
+            let mut verified = HashSet::new();
+            std::thread::scope(|s| {
+                let handles: Vec<_> = verifiable.chunks(chunk_size)
+                    .map(|chunk| {
+                        s.spawn(|| {
+                            let verifier = ConsensusVerifier;
+                            chunk.iter()
+                                .filter(|(_, tx, prev_outputs)| verifier.verify_transaction(tx, prev_outputs, height).is_ok())
+                                .map(|(tx_idx, _, _)| *tx_idx)
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .collect();
+                for h in handles {
+                    verified.extend(h.join().unwrap());
+                }
+            });
+            verified
         }
-    } else {
-        drop(coins); // results only needed for cache warming, already done
-        HashSet::new()
     };
 
     Some(PreprocessedBlock {
