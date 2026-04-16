@@ -1269,18 +1269,21 @@ impl PeerManager {
             // Drain all available blocks from the channel
             while let Ok(block) = rx.try_recv() {
                 let hash = block.block_hash();
+                // Compute fees BEFORE accept_block — connect_block removes spent coins.
+                let fees = Self::compute_block_fee_rates(&block, &chain_state);
                 match chain_state.accept_block(&block) {
                     Ok(_) => {
-                        Self::record_block_fees(&block, &chain_state, &fee_estimator);
+                        fee_estimator.record_block(&fees);
                         mempool.remove_for_block(&block);
                         // Drain buffer
                         loop {
                             let tip = chain_state.tip_hash();
                             match block_buffer.remove(&tip) {
                                 Some(b) => {
+                                    let b_fees = Self::compute_block_fee_rates(&b, &chain_state);
                                     match chain_state.accept_block(&b) {
                                         Ok(_) => {
-                                            Self::record_block_fees(&b, &chain_state, &fee_estimator);
+                                            fee_estimator.record_block(&b_fees);
                                             mempool.remove_for_block(&b);
                                         }
                                         Err(_) => break,
@@ -1583,11 +1586,11 @@ impl PeerManager {
     }
 
     /// Extract fee rates from a connected block and feed them to the fee estimator.
-    fn record_block_fees(
-        block: &bitcoin::Block,
-        chain_state: &ChainState,
-        fee_estimator: &FeeEstimator,
-    ) {
+    /// Compute per-tx fee rates (sat/kvB) for a block. Must be called BEFORE
+    /// `accept_block`, since connect_block removes spent coins from the UTXO set.
+    /// Intra-block spends are skipped (the prior tx's outputs are not yet in
+    /// the UTXO set at this point).
+    fn compute_block_fee_rates(block: &bitcoin::Block, chain_state: &ChainState) -> Vec<u64> {
         let mut fee_rates = Vec::new();
         for tx in &block.txdata {
             if tx.is_coinbase() {
@@ -1597,14 +1600,12 @@ impl PeerManager {
             if weight == 0 {
                 continue;
             }
-            // Compute fee from inputs - outputs
             let mut sum_inputs: u64 = 0;
             let mut inputs_found = true;
             for input in &tx.input {
                 match chain_state.get_coin(&input.previous_output) {
                     Some(coin) => sum_inputs += coin.amount,
                     None => {
-                        // Coin already spent (removed during connect_block) — skip this tx
                         inputs_found = false;
                         break;
                     }
@@ -1620,7 +1621,7 @@ impl PeerManager {
                 fee_rates.push(fee_rate);
             }
         }
-        fee_estimator.record_block(&fee_rates);
+        fee_rates
     }
 
     fn handle_tx(&self, id: PeerId, tx: bitcoin::Transaction) {
