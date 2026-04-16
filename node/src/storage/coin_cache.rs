@@ -79,7 +79,7 @@ impl CoinCache {
 
         Self {
             inner,
-            dirty: RwLock::new(HashMap::with_capacity(flush_threshold as usize)),
+            dirty: RwLock::new(HashMap::new()),
             clean: Mutex::new(lru(clean_cap.max(1))),
             dirty_count: AtomicU32::new(0),
             pending_tip: Mutex::new(None),
@@ -180,74 +180,7 @@ impl CoinCache {
             }
         }
 
-        // Pre-allocate for the next fill cycle.  We avoid shrink_to_fit()
-        // because it forces reallocation on the next insert; instead, reserve
-        // capacity so the HashMap can absorb the next batch without growing.
-        // Memory from drained Coin heap objects is already returned above.
-        {
-            let mut dirty = self.dirty.write().unwrap();
-            if dirty.capacity() < self.flush_threshold as usize / 2 {
-                dirty.reserve(self.flush_threshold as usize / 2);
-            }
-        }
-
         Ok(())
-    }
-
-    /// Apply coin mutations directly to the dirty map, bypassing StoreBatch.
-    ///
-    /// This is the fast path for block connection: coins go straight into the
-    /// dirty map with a single write-lock acquisition, no clean LRU involvement,
-    /// and single-probe HashMap operations via entry().
-    pub fn apply_coin_mutations(
-        &self,
-        coin_puts: Vec<(OutPoint, Coin)>,
-        coin_removes: Vec<(OutPoint, u64, u32)>,
-    ) {
-        if coin_puts.is_empty() && coin_removes.is_empty() {
-            return;
-        }
-        let total = coin_puts.len() + coin_removes.len();
-
-        let mut dirty = self.dirty.write().unwrap();
-
-        for (outpoint, coin) in coin_puts {
-            self.amount_delta.fetch_add(coin.amount as i64, Ordering::Relaxed);
-            self.count_delta.fetch_add(1, Ordering::Relaxed);
-            match dirty.entry(outpoint) {
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    e.insert(DirtyEntry::Present { coin, fresh: true });
-                }
-                std::collections::hash_map::Entry::Occupied(mut e) => {
-                    e.insert(DirtyEntry::Present { coin, fresh: false });
-                }
-            }
-        }
-
-        for (outpoint, spent_amount, spent_height) in coin_removes {
-            self.amount_delta.fetch_sub(spent_amount as i64, Ordering::Relaxed);
-            self.count_delta.fetch_sub(1, Ordering::Relaxed);
-            match dirty.entry(outpoint) {
-                std::collections::hash_map::Entry::Occupied(mut e) => {
-                    let was_fresh = matches!(e.get(), DirtyEntry::Present { fresh: true, .. });
-                    e.insert(DirtyEntry::Spent {
-                        amount: spent_amount,
-                        height: spent_height,
-                        fresh: was_fresh,
-                    });
-                }
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    e.insert(DirtyEntry::Spent {
-                        amount: spent_amount,
-                        height: spent_height,
-                        fresh: false,
-                    });
-                }
-            }
-        }
-
-        drop(dirty);
-        self.dirty_count.fetch_add(total as u32, Ordering::Relaxed);
     }
 
     /// Number of dirty entries pending flush.
@@ -316,44 +249,32 @@ impl Store for CoinCache {
         let coin_dirty = batch.coin_puts.len() + batch.coin_removes.len();
         if coin_dirty > 0 {
             let mut dirty = self.dirty.write().unwrap();
-            // Note: we skip clean.pop() here — stale clean entries are harmless
-            // because get_coin() always checks the dirty map first.  The LRU
-            // naturally evicts cold entries, so memory overhead is bounded.
+            let mut clean = self.clean.lock().unwrap();
 
             for (outpoint, coin) in batch.coin_puts {
                 self.amount_delta.fetch_add(coin.amount as i64, Ordering::Relaxed);
                 self.count_delta.fetch_add(1, Ordering::Relaxed);
-                // Single-probe via entry() instead of contains_key() + insert()
-                match dirty.entry(outpoint) {
-                    std::collections::hash_map::Entry::Vacant(e) => {
-                        e.insert(DirtyEntry::Present { coin, fresh: true });
-                    }
-                    std::collections::hash_map::Entry::Occupied(mut e) => {
-                        e.insert(DirtyEntry::Present { coin, fresh: false });
-                    }
-                }
+                clean.pop(&outpoint);
+                // Mark as fresh if this coin doesn't exist in the backing store
+                // (not already in dirty map as a non-fresh entry)
+                let fresh = !dirty.contains_key(&outpoint);
+                dirty.insert(outpoint, DirtyEntry::Present { coin, fresh });
             }
 
             for (outpoint, spent_amount, spent_height) in batch.coin_removes {
                 self.amount_delta.fetch_sub(spent_amount as i64, Ordering::Relaxed);
                 self.count_delta.fetch_sub(1, Ordering::Relaxed);
-                match dirty.entry(outpoint) {
-                    std::collections::hash_map::Entry::Occupied(mut e) => {
-                        let was_fresh = matches!(e.get(), DirtyEntry::Present { fresh: true, .. });
-                        e.insert(DirtyEntry::Spent {
-                            amount: spent_amount,
-                            height: spent_height,
-                            fresh: was_fresh,
-                        });
-                    }
-                    std::collections::hash_map::Entry::Vacant(e) => {
-                        e.insert(DirtyEntry::Spent {
-                            amount: spent_amount,
-                            height: spent_height,
-                            fresh: false,
-                        });
-                    }
-                }
+                clean.pop(&outpoint);
+                // If the coin was fresh (created in this flush window), mark the
+                // spend as fresh too — it can be elided entirely during flush.
+                let was_fresh = dirty
+                    .get(&outpoint)
+                    .is_some_and(|e| matches!(e, DirtyEntry::Present { fresh: true, .. }));
+                dirty.insert(outpoint, DirtyEntry::Spent {
+                    amount: spent_amount,
+                    height: spent_height,
+                    fresh: was_fresh,
+                });
             }
 
             self.dirty_count

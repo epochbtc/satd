@@ -153,7 +153,7 @@ pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError>
     let height = *height;
     let median_time_past = *median_time_past;
     let network = *network;
-    let _num_threads = *num_threads;
+    let num_threads = *num_threads;
     let flat_pos = *flat_pos;
     let block_hash = block.block_hash();
     let is_genesis = height == 0;
@@ -187,9 +187,7 @@ pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError>
     let mut txids: Vec<bitcoin::Txid> = Vec::with_capacity(block.txdata.len());
 
     // Fast lookup for coins created earlier in this block (intra-block spends).
-    // Maps outpoint → index into batch.coin_puts to avoid cloning every output.
-    // Only intra-block-spent coins (~5% of outputs) are cloned on lookup.
-    let mut intra_block_index: HashMap<OutPoint, usize> = HashMap::new();
+    let mut intra_block_coins: HashMap<OutPoint, Coin> = HashMap::new();
 
     // --- UTXO pre-resolution for external inputs ---
     // Batch-lookup from authoritative store. Prefetch warmed the CoinCache,
@@ -290,8 +288,7 @@ pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError>
 
                 // Lookup order: pre-resolved → intra-block → store (avoids DB hit for intra-block spends)
                 let coin = pre_resolved.get(&(tx_idx, in_idx)).cloned()
-                    .or_else(|| intra_block_index.remove(&outpoint)
-                        .map(|idx| batch.coin_puts[idx].1.clone()))
+                    .or_else(|| intra_block_coins.remove(&outpoint))
                     .or_else(|| store.get_coin(&outpoint));
 
                 let coin = coin.ok_or(ConnectError::MissingOrSpentInput)?;
@@ -328,18 +325,18 @@ pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError>
                     }
                 }
 
-                // Extract fields before moving coin into undo data.
-                // One script_pubkey clone for TxOut; the coin itself is moved (not cloned).
-                let amount = coin.amount;
-                let coin_height = coin.height;
-                sum_inputs += amount;
+                // Save for undo
+                undo.spent_coins.push((OutPointSer::from(&outpoint), coin.clone()));
 
+                sum_inputs += coin.amount;
+
+                // Build TxOut for script verification
                 prev_outputs.push(TxOut {
-                    value: bitcoin::Amount::from_sat(amount),
+                    value: bitcoin::Amount::from_sat(coin.amount),
                     script_pubkey: coin.script_pubkey.clone(),
                 });
-                batch.coin_removes.push((outpoint, amount, coin_height));
-                undo.spent_coins.push((OutPointSer::from(&outpoint), coin));
+
+                batch.coin_removes.push((outpoint, coin.amount, coin.height));
             }
 
             // Sum outputs
@@ -378,41 +375,54 @@ pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError>
                     height,
                     coinbase: is_coinbase,
                 };
-                let idx = batch.coin_puts.len();
+                intra_block_coins.insert(outpoint, coin.clone());
                 batch.coin_puts.push((outpoint, coin));
-                intra_block_index.insert(outpoint, idx);
             }
         }
 
         txids.push(txid);
     }
 
-    // Parallel script verification: verify all transactions concurrently
-    // using rayon's work-stealing thread pool (reused across blocks, unlike
-    // std::thread::scope which spawns new OS threads each time).
-    //
-    // Deadlock safety: verify_transaction() must not block on rayon or acquire
-    // locks held by the caller. ConsensusVerifier is pure FFI (safe).
-    // ShadowVerifier uses try_send (non-blocking) for shadow dispatch.
+    // Parallel script verification: verify all transactions concurrently.
+    // Shadow verification (if configured) is handled asynchronously inside the
+    // ShadowVerifier — it dispatches to background workers and never blocks here.
+    // All N threads run the primary (authoritative) engine.
     if !verify_queue.is_empty() {
-        if verify_queue.len() <= 1 {
-            // Single tx — skip rayon overhead
+        if verify_queue.len() <= 1 || num_threads <= 1 {
             for (tx, prev_outputs) in &verify_queue {
                 script_verifier
                     .verify_transaction(tx, prev_outputs, height)
                     .map_err(|e| ConnectError::ScriptFailed(e.to_string()))?;
             }
         } else {
-            use rayon::prelude::*;
-            let error: Option<ConnectError> = verify_queue
-                .par_iter()
-                .find_map_any(|(tx, prev_outputs)| {
-                    script_verifier
-                        .verify_transaction(tx, prev_outputs, height)
-                        .err()
-                        .map(|e| ConnectError::ScriptFailed(e.to_string()))
-                });
-            if let Some(err) = error {
+            let queue_ref = &verify_queue;
+            let chunk_size = verify_queue.len().div_ceil(num_threads);
+
+            let errors: Vec<ConnectError> = std::thread::scope(|s| {
+                let handles: Vec<_> = queue_ref
+                    .chunks(chunk_size)
+                    .map(|chunk| {
+                        s.spawn(move || {
+                            let mut errs = Vec::new();
+                            for (tx, prev_outputs) in chunk {
+                                if let Err(e) = script_verifier
+                                    .verify_transaction(tx, prev_outputs, height)
+                                {
+                                    errs.push(ConnectError::ScriptFailed(e.to_string()));
+                                }
+                            }
+                            errs
+                        })
+                    })
+                    .collect();
+
+                let mut all_errors = Vec::new();
+                for handle in handles {
+                    all_errors.extend(handle.join().unwrap());
+                }
+                all_errors
+            });
+            if let Some(err) = errors.into_iter().next() {
                 return Err(err);
             }
         }

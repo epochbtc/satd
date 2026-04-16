@@ -22,7 +22,6 @@ bitcoinconsensus = { workspace = true }
 tokio-socks = { workspace = true }
 lru = { workspace = true }
 crossbeam-channel = { workspace = true }
-rayon = { workspace = true }
 
 consensus = { path = "../consensus" }
 
