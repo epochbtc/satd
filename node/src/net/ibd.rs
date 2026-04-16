@@ -39,6 +39,9 @@ pub struct IbdScheduler {
     /// Heights currently assigned to a peer (in-flight).
     in_flight: HashMap<u32, PeerId>,
 
+    /// When each height was first assigned, for per-height stale detection.
+    in_flight_at: HashMap<u32, Instant>,
+
     /// Heights that have been downloaded (DataStored).
     downloaded: HashSet<u32>,
 
@@ -83,6 +86,7 @@ impl IbdScheduler {
             target_height,
             pending: VecDeque::from(heights),
             in_flight: HashMap::new(),
+            in_flight_at: HashMap::new(),
             downloaded: HashSet::new(),
             peer_slots: HashMap::new(),
             per_peer_limit: 128,
@@ -138,6 +142,7 @@ impl IbdScheduler {
             }
             if let Some(&hash) = self.height_to_hash.get(&h) {
                 self.in_flight.insert(h, peer_id);
+                self.in_flight_at.entry(h).or_insert_with(Instant::now);
                 assigned_heights.push(h);
                 hashes.push(hash);
             }
@@ -172,6 +177,7 @@ impl IbdScheduler {
 
             if let Some(&hash) = self.height_to_hash.get(&height) {
                 self.in_flight.insert(height, peer_id);
+                self.in_flight_at.entry(height).or_insert_with(Instant::now);
                 assigned_heights.push(height);
                 hashes.push(hash);
             }
@@ -189,6 +195,7 @@ impl IbdScheduler {
     /// Returns `true` if the peer has capacity for more work.
     pub fn block_received(&mut self, peer_id: PeerId, height: u32) -> bool {
         self.in_flight.remove(&height);
+        self.in_flight_at.remove(&height);
         self.downloaded.insert(height);
 
         if let Some(slots) = self.peer_slots.get_mut(&peer_id) {
@@ -205,6 +212,7 @@ impl IbdScheduler {
         if let Some(slots) = self.peer_slots.remove(&peer_id) {
             for height in slots.assigned {
                 self.in_flight.remove(&height);
+                self.in_flight_at.remove(&height);
                 // Push to front for immediate reassignment
                 self.pending.push_front(height);
             }
@@ -230,6 +238,36 @@ impl IbdScheduler {
         }
 
         stalled
+    }
+
+    /// Return individual in-flight heights that have exceeded the per-height
+    /// timeout back to pending, regardless of per-peer activity.
+    ///
+    /// This fixes the case where a peer stays active (delivering other blocks)
+    /// but silently ignores specific heights (e.g., height 945208). `detect_stalls`
+    /// cannot catch this because `last_activity` is refreshed by other deliveries.
+    ///
+    /// Returns the number of heights returned to pending.
+    pub fn release_stale_inflight(&mut self, timeout: Duration) -> usize {
+        let now = Instant::now();
+        let stale: Vec<(u32, PeerId)> = self
+            .in_flight_at
+            .iter()
+            .filter(|&(_, at)| now.duration_since(*at) > timeout)
+            .filter_map(|(&h, _)| self.in_flight.get(&h).map(|&p| (h, p)))
+            .collect();
+
+        let count = stale.len();
+        for (h, peer_id) in stale {
+            self.in_flight.remove(&h);
+            self.in_flight_at.remove(&h);
+            // Push to front — the connect loop is likely waiting for this height
+            self.pending.push_front(h);
+            if let Some(slots) = self.peer_slots.get_mut(&peer_id) {
+                slots.assigned.retain(|&x| x != h);
+            }
+        }
+        count
     }
 
     /// Notify the scheduler that the connect cursor has advanced.

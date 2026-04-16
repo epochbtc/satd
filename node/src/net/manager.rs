@@ -656,16 +656,22 @@ impl PeerManager {
             if has_ibd {
                 // Every 4 ticks (2s): stall detection and reassignment
                 if ticks.is_multiple_of(4) {
-                    let stalled = {
+                    let (stalled, stale_heights) = {
                         let mut ibd = self.ibd.write().unwrap();
                         if let Some(scheduler) = ibd.as_mut() {
-                            scheduler.detect_stalls(Duration::from_secs(15))
+                            let stalled = scheduler.detect_stalls(Duration::from_secs(15));
+                            // Per-height timeout: catch heights stuck with an active peer
+                            let stale = scheduler.release_stale_inflight(Duration::from_secs(60));
+                            (stalled, stale)
                         } else {
-                            Vec::new()
+                            (Vec::new(), 0)
                         }
                     };
                     for peer_id in stalled {
                         tracing::debug!(peer_id, "IBD: peer stalled, reassigning blocks");
+                    }
+                    if stale_heights > 0 {
+                        tracing::info!(stale_heights, "IBD: stale in-flight heights returned to pending");
                     }
                     // Assign work to any idle peers
                     self.assign_all_peers();
