@@ -9,12 +9,16 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 
 mod common;
-use common::{filter_category, load_script_tests, run_suite, Category};
+use common::{filter_category, load_script_tests, make_criterion, run_suite, Category};
 
 fn segwit_v0_suite(c: &mut Criterion) {
     let workload = filter_category(load_script_tests(), Category::SegwitV0);
     run_suite(c, "segwit_v0_suite", &workload);
 }
 
-criterion_group!(benches, segwit_v0_suite);
+criterion_group! {
+    name = benches;
+    config = make_criterion();
+    targets = segwit_v0_suite
+}
 criterion_main!(benches);

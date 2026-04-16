@@ -201,10 +201,31 @@ pub fn categorize(flags: u32) -> Category {
     }
 }
 
+/// Construct a `Criterion` configured with pprof flamegraph profiling.
+///
+/// The pprof profiler is inert unless the bench is invoked with
+/// `--profile-time <secs>`; normal `cargo bench` runs pay zero overhead.
+///
+/// When enabled, profiles are written to
+/// `target/criterion/<group>/<function>/profile/flamegraph.svg`.
+///
+/// Sampling rate: 500 Hz — finer than criterion's default 100 Hz, which
+/// leaves gaps in short-iteration flamegraphs.
+pub fn make_criterion() -> criterion::Criterion {
+    criterion::Criterion::default().with_profiler(pprof::criterion::PProfProfiler::new(
+        500,
+        pprof::criterion::Output::Flamegraph(None),
+    ))
+}
+
 /// Run a Rust-vs-C++ comparison bench over a workload, reporting throughput
 /// in elements/sec. Both functions iterate over the full workload per sample
 /// so the number maps directly to verify-rate on the IBD hot path.
-pub fn run_suite(c: &mut criterion::Criterion, group_name: &str, workload: &[WorkloadCase]) {
+pub fn run_suite(
+    c: &mut criterion::Criterion,
+    group_name: &str,
+    workload: &[WorkloadCase],
+) {
     eprintln!("{group_name}: {} cases", workload.len());
     let mut group = c.benchmark_group(group_name);
     group.throughput(criterion::Throughput::Elements(workload.len() as u64));

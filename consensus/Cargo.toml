@@ -16,6 +16,7 @@ hex = { workspace = true }
 serde = { workspace = true }
 bitcoinconsensus = { workspace = true }
 criterion = { version = "0.5", features = ["html_reports"] }
+pprof = { version = "0.13", features = ["criterion", "flamegraph"] }
 
 [[bench]]
 name = "legacy"

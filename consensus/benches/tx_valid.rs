@@ -9,12 +9,16 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 
 mod common;
-use common::{load_tx_valid_cases, run_suite};
+use common::{load_tx_valid_cases, make_criterion, run_suite};
 
 fn tx_valid_suite(c: &mut Criterion) {
     let workload = load_tx_valid_cases();
     run_suite(c, "tx_valid_suite", &workload);
 }
 
-criterion_group!(benches, tx_valid_suite);
+criterion_group! {
+    name = benches;
+    config = make_criterion();
+    targets = tx_valid_suite
+}
 criterion_main!(benches);

@@ -10,12 +10,16 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 
 mod common;
-use common::{load_bip341_keypath_cases, run_suite};
+use common::{load_bip341_keypath_cases, make_criterion, run_suite};
 
 fn taproot_suite(c: &mut Criterion) {
     let workload = load_bip341_keypath_cases();
     run_suite(c, "taproot_suite", &workload);
 }
 
-criterion_group!(benches, taproot_suite);
+criterion_group! {
+    name = benches;
+    config = make_criterion();
+    targets = taproot_suite
+}
 criterion_main!(benches);

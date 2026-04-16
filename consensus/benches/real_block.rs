@@ -11,7 +11,7 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 
 mod common;
-use common::{load_real_block, run_suite};
+use common::{load_real_block, make_criterion, run_suite};
 
 fn real_block_suite(c: &mut Criterion) {
     const FIXTURE: &str = include_str!("../bench-data/block_300000.json");
@@ -20,5 +20,9 @@ fn real_block_suite(c: &mut Criterion) {
     run_suite(c, &name, &workload);
 }
 
-criterion_group!(benches, real_block_suite);
+criterion_group! {
+    name = benches;
+    config = make_criterion();
+    targets = real_block_suite
+}
 criterion_main!(benches);

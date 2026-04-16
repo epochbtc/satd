@@ -8,12 +8,16 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 
 mod common;
-use common::{filter_category, load_script_tests, run_suite, Category};
+use common::{filter_category, load_script_tests, make_criterion, run_suite, Category};
 
 fn legacy_suite(c: &mut Criterion) {
     let workload = filter_category(load_script_tests(), Category::Legacy);
     run_suite(c, "legacy_suite", &workload);
 }
 
-criterion_group!(benches, legacy_suite);
+criterion_group! {
+    name = benches;
+    config = make_criterion();
+    targets = legacy_suite
+}
 criterion_main!(benches);
