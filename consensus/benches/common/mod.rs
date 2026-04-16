@@ -177,9 +177,12 @@ fn serialize_tx(tx: &Transaction) -> Vec<u8> {
 }
 
 /// Which script-complexity category a case belongs to, based on its flags.
+#[derive(Copy, Clone, PartialEq, Eq)]
 pub enum Category {
-    /// Legacy pre-SegWit: no WITNESS, no TAPROOT.
+    /// Bare pre-SegWit scripts: no P2SH, no WITNESS, no TAPROOT.
     Legacy,
+    /// P2SH-wrapped legacy scripts (no WITNESS).
+    P2sh,
     /// SegWit v0 or native witness program.
     SegwitV0,
     /// Taproot (v1 witness).
@@ -191,9 +194,46 @@ pub fn categorize(flags: u32) -> Category {
         Category::Taproot
     } else if flags & consensus::flags::VERIFY_WITNESS != 0 {
         Category::SegwitV0
+    } else if flags & consensus::flags::VERIFY_P2SH != 0 {
+        Category::P2sh
     } else {
         Category::Legacy
     }
+}
+
+/// Run a Rust-vs-C++ comparison bench over a workload, reporting throughput
+/// in elements/sec. Both functions iterate over the full workload per sample
+/// so the number maps directly to verify-rate on the IBD hot path.
+pub fn run_suite(c: &mut criterion::Criterion, group_name: &str, workload: &[WorkloadCase]) {
+    eprintln!("{group_name}: {} cases", workload.len());
+    let mut group = c.benchmark_group(group_name);
+    group.throughput(criterion::Throughput::Elements(workload.len() as u64));
+
+    group.bench_function("rust", |b| {
+        b.iter(|| {
+            for case in workload {
+                let _ = std::hint::black_box(verify_rust(case));
+            }
+        })
+    });
+
+    group.bench_function("cpp", |b| {
+        b.iter(|| {
+            for case in workload {
+                let _ = std::hint::black_box(verify_cpp(case));
+            }
+        })
+    });
+
+    group.finish();
+}
+
+/// Filter a workload by category.
+pub fn filter_category(cases: Vec<WorkloadCase>, target: Category) -> Vec<WorkloadCase> {
+    cases
+        .into_iter()
+        .filter(|c| categorize(c.flags) == target)
+        .collect()
 }
 
 /// Parse script_tests.json into WorkloadCase values that BOTH engines accept
@@ -318,4 +358,196 @@ fn shorten(s: &str, n: usize) -> String {
     } else {
         format!("{}…", &s[..n])
     }
+}
+
+// ---------------------------------------------------------------------------
+// bip341_wallet_vectors.json — BIP341 key-path spending test vector. One
+// fully-signed tx with 9 taproot key-path inputs. Small sample but the only
+// taproot workload we have in-tree.
+// ---------------------------------------------------------------------------
+
+pub fn load_bip341_keypath_cases() -> Vec<WorkloadCase> {
+    let data = include_str!("../../test-data/bip341_wallet_vectors.json");
+    let vectors: Value = serde_json::from_str(data).unwrap();
+    let kps = &vectors["keyPathSpending"][0];
+
+    let tx_hex = kps["auxiliary"]["fullySignedTx"].as_str().unwrap();
+    let tx_bytes = hex::decode(tx_hex).unwrap();
+    let utxos_json = kps["given"]["utxosSpent"].as_array().unwrap();
+    let prevs: Vec<(Vec<u8>, u64)> = utxos_json
+        .iter()
+        .map(|u| {
+            let spk = hex::decode(u["scriptPubKey"].as_str().unwrap()).unwrap();
+            let amount = u["amountSats"].as_u64().unwrap();
+            (spk, amount)
+        })
+        .collect();
+
+    let flags = bitcoinconsensus::VERIFY_P2SH
+        | bitcoinconsensus::VERIFY_WITNESS
+        | bitcoinconsensus::VERIFY_TAPROOT;
+
+    let mut cases = Vec::new();
+    for (i, prev) in prevs.iter().enumerate() {
+        let case = WorkloadCase {
+            name: format!("bip341_keypath#{i}"),
+            script_pubkey: prev.0.clone(),
+            amount: prev.1,
+            tx_bytes: tx_bytes.clone(),
+            input_index: i,
+            flags,
+            prev_outputs: prevs.clone(),
+        };
+        if verify_rust(&case) && verify_cpp(&case) {
+            cases.push(case);
+        }
+    }
+    cases
+}
+
+// ---------------------------------------------------------------------------
+// tx_valid.json — real Bitcoin transactions with multiple inputs. Each test
+// entry becomes N WorkloadCases (one per input). This is the closest thing
+// to "real IBD workload" we have in-tree.
+// ---------------------------------------------------------------------------
+
+fn fill_flags(mut f: u32) -> u32 {
+    if f & consensus::flags::VERIFY_CLEANSTACK != 0 {
+        f |= consensus::flags::VERIFY_WITNESS;
+    }
+    if f & consensus::flags::VERIFY_WITNESS != 0 {
+        f |= consensus::flags::VERIFY_P2SH;
+    }
+    f
+}
+
+pub fn load_tx_valid_cases() -> Vec<WorkloadCase> {
+    use bitcoin::consensus::Decodable;
+    use std::collections::HashMap;
+
+    let data = include_str!("../../test-data/tx_valid.json");
+    let tests: Vec<Value> = serde_json::from_str(data).unwrap();
+    let mut cases = Vec::new();
+
+    for test in &tests {
+        let arr = match test.as_array() {
+            Some(a) if a.len() == 3 && a[0].is_array() => a,
+            _ => continue,
+        };
+        let inputs = arr[0].as_array().unwrap();
+        let tx_hex = match arr[1].as_str() {
+            Some(s) => s,
+            None => continue,
+        };
+        let flags_str = match arr[2].as_str() {
+            Some(s) => s,
+            None => continue,
+        };
+
+        // Build prevout maps keyed by (txid, vout).
+        let mut script_map: HashMap<(Txid, u32), Vec<u8>> = HashMap::new();
+        let mut value_map: HashMap<(Txid, u32), u64> = HashMap::new();
+        let mut ok = true;
+        for input in inputs {
+            let a = match input.as_array() {
+                Some(a) if a.len() >= 3 && a.len() <= 4 => a,
+                _ => {
+                    ok = false;
+                    break;
+                }
+            };
+            let txid_hex = match a[0].as_str() {
+                Some(s) => s,
+                None => {
+                    ok = false;
+                    break;
+                }
+            };
+            let txid_bytes = match hex::decode(txid_hex) {
+                Ok(b) if b.len() == 32 => b,
+                _ => {
+                    ok = false;
+                    break;
+                }
+            };
+            // tx_valid.json uses big-endian txid display — reverse for internal form.
+            let mut txid_arr = [0u8; 32];
+            for (i, b) in txid_bytes.iter().enumerate() {
+                txid_arr[31 - i] = *b;
+            }
+            let txid = Txid::from_byte_array(txid_arr);
+            let vout = match a[1].as_u64() {
+                Some(v) => v as u32,
+                None => {
+                    ok = false;
+                    break;
+                }
+            };
+            let spk = parse_script(a[2].as_str().unwrap_or(""));
+            script_map.insert((txid, vout), spk);
+            if a.len() >= 4 {
+                value_map.insert((txid, vout), a[3].as_i64().unwrap_or(0) as u64);
+            }
+        }
+        if !ok {
+            continue;
+        }
+
+        let tx_bytes = match hex::decode(tx_hex) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let tx: Transaction = match Transaction::consensus_decode(&mut tx_bytes.as_slice()) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+
+        let excluded = parse_flags(flags_str);
+        let verify_flags = fill_flags(!excluded & consensus::flags::ALL_FLAGS);
+        let safe_flags = cpp_safe_flags(verify_flags);
+        let has_taproot = safe_flags & bitcoinconsensus::VERIFY_TAPROOT != 0;
+
+        // Build prev_outputs for the whole tx (required for taproot sighash).
+        let prev_outputs: Vec<(Vec<u8>, u64)> = tx
+            .input
+            .iter()
+            .map(|inp| {
+                let key = (inp.previous_output.txid, inp.previous_output.vout);
+                (
+                    script_map.get(&key).cloned().unwrap_or_default(),
+                    value_map.get(&key).copied().unwrap_or(0),
+                )
+            })
+            .collect();
+
+        let tx_label = format!("tx_{}", shorten(tx_hex, 16));
+
+        for (i, inp) in tx.input.iter().enumerate() {
+            let key = (inp.previous_output.txid, inp.previous_output.vout);
+            let spk = match script_map.get(&key) {
+                Some(s) => s.clone(),
+                None => continue,
+            };
+            let amount = value_map.get(&key).copied().unwrap_or(0);
+
+            let case = WorkloadCase {
+                name: format!("{tx_label}#{i}"),
+                script_pubkey: spk,
+                amount,
+                tx_bytes: tx_bytes.clone(),
+                input_index: i,
+                flags: safe_flags,
+                prev_outputs: if has_taproot {
+                    prev_outputs.clone()
+                } else {
+                    Vec::new()
+                },
+            };
+            if verify_rust(&case) && verify_cpp(&case) {
+                cases.push(case);
+            }
+        }
+    }
+
+    cases
 }

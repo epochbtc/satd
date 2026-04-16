@@ -1,48 +1,18 @@
-//! Legacy (pre-SegWit) script verification: Rust consensus vs bitcoinconsensus.
+//! Legacy (pre-SegWit, no P2SH) script verification: Rust vs C++.
 //!
-//! Workload: script_tests.json entries that do not set VERIFY_WITNESS or
-//! VERIFY_TAPROOT, and that both engines accept. This is P2PK / P2PKH /
-//! OP_CHECKMULTISIG / P2SH territory — the script interpreter loop and
-//! legacy sighash, no BIP143 or BIP341 machinery.
+//! Workload: script_tests.json entries with no P2SH/WITNESS/TAPROOT flags.
+//! Isolates the bare script interpreter + legacy sighash.
 //!
-//! Run with: `cargo bench --bench legacy`
+//! Run: `cargo bench --bench legacy`
 
-use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, Criterion};
 
 mod common;
-use common::{load_script_tests, verify_cpp, verify_rust, Category, WorkloadCase};
-
-fn load_legacy_workload() -> Vec<WorkloadCase> {
-    load_script_tests()
-        .into_iter()
-        .filter(|c| matches!(common::categorize(c.flags), Category::Legacy))
-        .collect()
-}
+use common::{filter_category, load_script_tests, run_suite, Category};
 
 fn legacy_suite(c: &mut Criterion) {
-    let workload = load_legacy_workload();
-    eprintln!("legacy workload: {} cases", workload.len());
-
-    let mut group = c.benchmark_group("legacy_suite");
-    group.throughput(Throughput::Elements(workload.len() as u64));
-
-    group.bench_function("rust", |b| {
-        b.iter(|| {
-            for case in &workload {
-                let _ = std::hint::black_box(verify_rust(case));
-            }
-        })
-    });
-
-    group.bench_function("cpp", |b| {
-        b.iter(|| {
-            for case in &workload {
-                let _ = std::hint::black_box(verify_cpp(case));
-            }
-        })
-    });
-
-    group.finish();
+    let workload = filter_category(load_script_tests(), Category::Legacy);
+    run_suite(c, "legacy_suite", &workload);
 }
 
 criterion_group!(benches, legacy_suite);
