@@ -1037,4 +1037,107 @@ mod tests {
         cache.write_batch(b2).unwrap();
         assert_eq!(cache.coin_total_amount(), 600);
     }
+
+    // ---------------------------------------------------------------
+    // Regression: flush must complete under concurrent read pressure
+    // ---------------------------------------------------------------
+    //
+    // Before the fix, flush() reacquired dirty.write() for shrink_to_fit()
+    // after dropping the initial write lock. With multiple threads
+    // continuously holding dirty.read() via get_coins_batch(), the
+    // writer was starved indefinitely on reader-preferring RwLock
+    // implementations (Linux pthreads default).
+    //
+    // This test spawns reader threads that hammer get_coin() and
+    // get_coins_batch() while the main thread flushes. The flush must
+    // complete within a reasonable timeout — if it deadlocks/starves,
+    // the test fails.
+    #[test]
+    fn test_flush_completes_under_concurrent_read_pressure() {
+        use std::sync::{Arc, atomic::{AtomicBool, Ordering as AOrdering}};
+        use std::time::{Duration, Instant};
+
+        let cache = Arc::new(make_cache(450));
+
+        // Populate dirty map with enough coins to make flush non-trivial
+        let num_coins = 10_000;
+        let mut batch = StoreBatch::default();
+        for i in 0..num_coins {
+            let op = make_outpoint((i % 256) as u8, i as u32);
+            batch.coin_puts.push((op, make_coin(1000 + i as u64, 1)));
+        }
+        cache.write_batch(batch).unwrap();
+
+        // Also populate some coins in the backing store so get_coin has
+        // work to do (read-through path)
+        {
+            let inner_batch = StoreBatch {
+                coin_puts: (0..1000u32)
+                    .map(|i| (make_outpoint(0xFF, i), make_coin(500, 0)))
+                    .collect(),
+                ..StoreBatch::default()
+            };
+            cache.inner.write_batch(inner_batch).unwrap();
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+
+        // Spawn reader threads that continuously take dirty.read() via
+        // get_coin() and get_coins_batch() — this is the exact access
+        // pattern that caused write starvation in the old code.
+        let num_readers = 8;
+        let readers: Vec<_> = (0..num_readers)
+            .map(|t| {
+                let cache = Arc::clone(&cache);
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    let mut i = 0u32;
+                    while !stop.load(AOrdering::Relaxed) {
+                        // Alternate between single get_coin and batch lookups
+                        if i % 3 == 0 {
+                            let ops: Vec<_> = (0..100)
+                                .map(|j| make_outpoint((t * 31 + j) as u8, j as u32))
+                                .collect();
+                            let _ = cache.get_coins_batch(&ops);
+                        } else {
+                            let op = make_outpoint((t * 31 + i % 256) as u8, i);
+                            let _ = cache.get_coin(&op);
+                        }
+                        i = i.wrapping_add(1);
+                    }
+                })
+            })
+            .collect();
+
+        // Give readers time to saturate the read lock
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Flush must complete promptly despite continuous read pressure.
+        // The old code would deadlock here trying to reacquire dirty.write()
+        // for shrink_to_fit() while readers hold dirty.read().
+        let start = Instant::now();
+        cache.flush().expect("flush should succeed");
+        let flush_duration = start.elapsed();
+
+        // Signal readers to stop
+        stop.store(true, AOrdering::Relaxed);
+        for handle in readers {
+            handle.join().unwrap();
+        }
+
+        // Flush should complete in well under 5 seconds.
+        // In practice it takes <100ms. A deadlock would hang forever.
+        assert!(
+            flush_duration < Duration::from_secs(5),
+            "flush took {:?} — possible write starvation",
+            flush_duration,
+        );
+
+        // Verify flush actually worked: dirty map should be empty
+        assert_eq!(cache.dirty_count(), 0);
+
+        // Coins should be accessible via clean LRU after flush
+        let op = make_outpoint(0, 0);
+        assert!(cache.get_coin(&op).is_some());
+    }
 }
