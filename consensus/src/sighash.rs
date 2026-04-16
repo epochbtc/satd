@@ -4,8 +4,9 @@
 
 use bitcoin::hashes::{sha256d, Hash};
 use bitcoin::sighash::{self, EcdsaSighashType, Prevouts, SighashCache, TapSighashType};
-use bitcoin::secp256k1::{self, Message, Secp256k1};
+use bitcoin::secp256k1::{self, Message, Secp256k1, VerifyOnly};
 use bitcoin::{Amount, Script, ScriptBuf, Sequence, Transaction, TxOut};
+use std::sync::OnceLock;
 
 use crate::checker::{ExecData, SignatureChecker, SigVersion};
 use crate::error::ScriptError;
@@ -16,6 +17,21 @@ const SEQUENCE_LOCKTIME_DISABLE_FLAG: u32 = 1 << 31;
 const SEQUENCE_LOCKTIME_TYPE_FLAG: u32 = 1 << 22;
 const SEQUENCE_LOCKTIME_MASK: u32 = 0x0000ffff;
 
+/// Process-global verification-only secp256k1 context.
+///
+/// Creating a `Secp256k1` context is expensive — it allocates the ecmult_gen
+/// precomputation table and runs `context_randomize` for side-channel
+/// protection. Previously we did this on every `TxSignatureChecker::new()`,
+/// which cost ~40% of total verify time on signature-heavy workloads
+/// (profiled via consensus/benches/p2sh.rs). Bitcoin Core allocates its
+/// context once at process startup and reuses it; we now do the same.
+///
+/// `VerifyOnly` omits the ecmult_gen tables (which are only needed for
+/// signing and ECDH), making the one-time allocation cheaper than `All`.
+fn secp_ctx() -> &'static Secp256k1<VerifyOnly> {
+    static CTX: OnceLock<Secp256k1<VerifyOnly>> = OnceLock::new();
+    CTX.get_or_init(Secp256k1::verification_only)
+}
 
 /// A signature checker backed by an actual transaction, delegating sighash
 /// computation to `bitcoin::sighash::SighashCache`.
@@ -24,7 +40,6 @@ pub struct TxSignatureChecker<'a> {
     input_index: usize,
     amount: Amount,
     prev_outputs: &'a [TxOut],
-    secp: Secp256k1<secp256k1::All>,
 }
 
 impl<'a> TxSignatureChecker<'a> {
@@ -39,7 +54,6 @@ impl<'a> TxSignatureChecker<'a> {
             input_index,
             amount,
             prev_outputs,
-            secp: Secp256k1::new(),
         }
     }
 }
@@ -133,7 +147,7 @@ impl SignatureChecker for TxSignatureChecker<'_> {
 
         let msg = Message::from_digest(sighash);
 
-        self.secp
+        secp_ctx()
             .verify_ecdsa(&msg, &ecdsa_sig, &pubkey)
             .is_ok()
     }
@@ -239,7 +253,7 @@ impl SignatureChecker for TxSignatureChecker<'_> {
         };
 
         let msg = Message::from_digest(sighash.to_byte_array());
-        match self.secp.verify_schnorr(&schnorr_sig, &msg, &xonly) {
+        match secp_ctx().verify_schnorr(&schnorr_sig, &msg, &xonly) {
             Ok(()) => Ok(true),
             Err(_) => Err(ScriptError::SchnorrSig),
         }
