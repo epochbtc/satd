@@ -212,7 +212,7 @@ impl PeerManager {
             next_id: AtomicU64::new(1),
             event_tx,
             event_rx: tokio::sync::Mutex::new(event_rx),
-            headers_tip: AtomicU64::new(0),
+            headers_tip: AtomicU64::new(headers_tip_height as u64),
             in_flight_blocks: RwLock::new(std::collections::HashSet::new()),
             connect_addrs: RwLock::new(Vec::new()),
             block_tx,
