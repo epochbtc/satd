@@ -3,6 +3,13 @@ mod config;
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+// Tune jemalloc: return freed pages to the OS faster to reduce RSS bloat.
+// Default decay is 10s; under heavy alloc/free churn (LRU eviction, HashMap
+// resize) dirty pages accumulate faster than they decay, inflating RSS by 2-3x.
+#[allow(non_upper_case_globals)]
+#[unsafe(export_name = "_rjem_malloc_conf")]
+pub static malloc_conf: &[u8] = b"dirty_decay_ms:1000,muzzy_decay_ms:2000\0";
+
 use config::Config;
 use node::chain::state::ChainState;
 use node::mempool::fee::FeeEstimator;
