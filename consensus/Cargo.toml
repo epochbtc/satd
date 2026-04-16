@@ -36,3 +36,7 @@ harness = false
 [[bench]]
 name = "tx_valid"
 harness = false
+
+[[bench]]
+name = "real_block"
+harness = false

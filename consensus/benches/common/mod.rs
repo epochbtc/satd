@@ -361,6 +361,123 @@ fn shorten(s: &str, n: usize) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Real mainnet block — JSON fixture extracted from the synced node via
+// bench-data/extract_block.py. One WorkloadCase per (tx, input) pair across
+// every non-coinbase tx in the block. This is the most honest approximation
+// of IBD hot-path workload: real tx graphs, real scripts, real sizes.
+// ---------------------------------------------------------------------------
+
+/// Load a real-block fixture. Returns (height, cases).
+pub fn load_real_block(fixture_json: &str) -> (u32, Vec<WorkloadCase>) {
+    use bitcoin::consensus::Decodable;
+
+    let fixture: Value = serde_json::from_str(fixture_json).unwrap();
+    let height = fixture["height"].as_u64().unwrap() as u32;
+    let block_hex = fixture["block_hex"].as_str().unwrap();
+    let prevouts_map = fixture["prevouts"].as_object().unwrap();
+
+    let block_bytes = hex::decode(block_hex).unwrap();
+    let block: bitcoin::Block =
+        bitcoin::Block::consensus_decode(&mut block_bytes.as_slice()).unwrap();
+
+    // Flag sets to try: pick the widest set both engines accept for each
+    // input. In practice bitcoinconsensus applies a consistent mainnet flag
+    // vector, but older blocks may fail modern flags like NULLDUMMY.
+    // Start permissive; fall back if the engines disagree.
+    let candidate_flags = [
+        CPP_RECOGNIZED_FLAGS, // everything the C++ engine knows
+        bitcoinconsensus::VERIFY_P2SH
+            | bitcoinconsensus::VERIFY_WITNESS
+            | bitcoinconsensus::VERIFY_TAPROOT,
+        bitcoinconsensus::VERIFY_P2SH | bitcoinconsensus::VERIFY_WITNESS,
+        bitcoinconsensus::VERIFY_P2SH,
+        0,
+    ];
+
+    let mut cases = Vec::new();
+    for (tx_idx, tx) in block.txdata.iter().enumerate() {
+        if tx.is_coinbase() {
+            continue;
+        }
+        let mut tx_bytes = Vec::new();
+        tx.consensus_encode(&mut tx_bytes).unwrap();
+
+        // Assemble prev_outputs aligned to input order — needed for taproot.
+        let prev_outputs: Vec<(Vec<u8>, u64)> = tx
+            .input
+            .iter()
+            .map(|inp| {
+                let key = format!(
+                    "{}:{}",
+                    inp.previous_output.txid, inp.previous_output.vout
+                );
+                let entry = &prevouts_map[&key];
+                let spk = hex::decode(entry["spk"].as_str().unwrap()).unwrap();
+                let value = entry["value"].as_u64().unwrap();
+                (spk, value)
+            })
+            .collect();
+
+        for (i, inp) in tx.input.iter().enumerate() {
+            let key = format!(
+                "{}:{}",
+                inp.previous_output.txid, inp.previous_output.vout
+            );
+            let entry = match prevouts_map.get(&key) {
+                Some(e) => e,
+                None => continue,
+            };
+            let spk = hex::decode(entry["spk"].as_str().unwrap()).unwrap();
+            let amount = entry["value"].as_u64().unwrap();
+
+            // Probe for the widest flag set that both engines accept.
+            let mut chosen_flags: Option<u32> = None;
+            for &flags in &candidate_flags {
+                let has_taproot = flags & bitcoinconsensus::VERIFY_TAPROOT != 0;
+                let test = WorkloadCase {
+                    name: String::new(),
+                    script_pubkey: spk.clone(),
+                    amount,
+                    tx_bytes: tx_bytes.clone(),
+                    input_index: i,
+                    flags,
+                    prev_outputs: if has_taproot {
+                        prev_outputs.clone()
+                    } else {
+                        Vec::new()
+                    },
+                };
+                if verify_rust(&test) && verify_cpp(&test) {
+                    chosen_flags = Some(flags);
+                    break;
+                }
+            }
+            let flags = match chosen_flags {
+                Some(f) => f,
+                None => continue, // neither engine accepts this input — skip
+            };
+
+            let has_taproot = flags & bitcoinconsensus::VERIFY_TAPROOT != 0;
+            cases.push(WorkloadCase {
+                name: format!("h{height}_tx{tx_idx}_in{i}"),
+                script_pubkey: spk,
+                amount,
+                tx_bytes: tx_bytes.clone(),
+                input_index: i,
+                flags,
+                prev_outputs: if has_taproot {
+                    prev_outputs.clone()
+                } else {
+                    Vec::new()
+                },
+            });
+        }
+    }
+
+    (height, cases)
+}
+
+// ---------------------------------------------------------------------------
 // bip341_wallet_vectors.json — BIP341 key-path spending test vector. One
 // fully-signed tx with 9 taproot key-path inputs. Small sample but the only
 // taproot workload we have in-tree.
