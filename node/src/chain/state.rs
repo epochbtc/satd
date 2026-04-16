@@ -336,8 +336,18 @@ impl ChainState {
             let hash = header.block_hash();
 
             // Already known?
-            if self.store.get_block_index(&hash).is_some() {
-                continue; // skip duplicates silently
+            if let Some(existing) = self.store.get_block_index(&hash) {
+                // Crash-resume repair: if the block is stored (DataStored/Valid) but its
+                // height→hash mapping was never written (e.g. accept_headers was never
+                // called for it, or it was lost in a pending_batch that was never flushed),
+                // restore it now so the connect loop can find this block.
+                if matches!(existing.status, BlockStatus::DataStored | BlockStatus::Valid)
+                    && self.store.get_block_hash_by_height(existing.height).is_none()
+                {
+                    batch.height_hash_puts.push((existing.height, hash));
+                    max_height = max_height.max(existing.height);
+                }
+                continue; // skip block_index write — entry already exists
             }
 
             // Also check the current batch for parent (handles consecutive headers)
@@ -406,7 +416,7 @@ impl ChainState {
             max_height = max_height.max(new_height);
         }
 
-        if accepted > 0 {
+        if accepted > 0 || !batch.height_hash_puts.is_empty() {
             if let Err(e) = self.store.write_batch(batch) {
                 return (0, Some(e.into()));
             }
@@ -741,7 +751,9 @@ impl ChainState {
 
         let mut batch = crate::storage::StoreBatch::default();
         batch.block_index_puts.push((block_hash, entry));
-        // Don't write height_hash_puts here — accept_header already did that
+        // Write height_hash so the connect loop can find this block even if
+        // accept_headers was never called (e.g. crash-resume or out-of-order sync).
+        batch.height_hash_puts.push((new_height, block_hash));
         self.store.write_batch(batch)?;
 
         Ok((block_hash, new_height))

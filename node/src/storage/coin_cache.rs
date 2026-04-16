@@ -1094,9 +1094,9 @@ mod tests {
                     let mut i = 0u32;
                     while !stop.load(AOrdering::Relaxed) {
                         // Alternate between single get_coin and batch lookups
-                        if i % 3 == 0 {
+                        if i.is_multiple_of(3) {
                             let ops: Vec<_> = (0..100)
-                                .map(|j| make_outpoint((t * 31 + j) as u8, j as u32))
+                                .map(|j| make_outpoint((t * 31 + j) as u8, j))
                                 .collect();
                             let _ = cache.get_coins_batch(&ops);
                         } else {
