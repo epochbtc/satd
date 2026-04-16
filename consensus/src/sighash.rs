@@ -6,6 +6,8 @@ use bitcoin::hashes::{sha256d, Hash};
 use bitcoin::sighash::{self, EcdsaSighashType, Prevouts, SighashCache, TapSighashType};
 use bitcoin::secp256k1::{self, Message, Secp256k1, VerifyOnly};
 use bitcoin::{Amount, Script, ScriptBuf, Sequence, Transaction, TxOut};
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::OnceLock;
 
 use crate::checker::{ExecData, SignatureChecker, SigVersion};
@@ -33,6 +35,15 @@ fn secp_ctx() -> &'static Secp256k1<VerifyOnly> {
     CTX.get_or_init(Secp256k1::verification_only)
 }
 
+/// Shared `SighashCache` container. `SighashCache` lazily populates per-tx
+/// hashes (`hashPrevouts`, `hashSequence`, `hashOutputs`) which are identical
+/// across all inputs of a transaction — so one cache per tx is correct and
+/// optimal.  `RefCell` gives us interior mutability so `check_*` methods can
+/// keep their `&self` trait signature while the cache's encode helpers
+/// require `&mut self`.  `Rc` lets a higher-level batch verify share a single
+/// cache across per-input `TxSignatureChecker`s.
+pub type SharedSighashCache<'a> = Rc<RefCell<SighashCache<&'a Transaction>>>;
+
 /// A signature checker backed by an actual transaction, delegating sighash
 /// computation to `bitcoin::sighash::SighashCache`.
 pub struct TxSignatureChecker<'a> {
@@ -40,20 +51,44 @@ pub struct TxSignatureChecker<'a> {
     input_index: usize,
     amount: Amount,
     prev_outputs: &'a [TxOut],
+    cache: SharedSighashCache<'a>,
 }
 
 impl<'a> TxSignatureChecker<'a> {
+    /// Single-input constructor: builds its own sighash cache.  Use this when
+    /// verifying a single input in isolation (e.g. via `verify_with_flags`).
     pub fn new(
         tx: &'a Transaction,
         input_index: usize,
         amount: Amount,
         prev_outputs: &'a [TxOut],
     ) -> Self {
+        Self::with_cache(
+            tx,
+            input_index,
+            amount,
+            prev_outputs,
+            Rc::new(RefCell::new(SighashCache::new(tx))),
+        )
+    }
+
+    /// Shared-cache constructor: reuses an existing sighash cache across
+    /// multiple per-input checkers.  Use this inside `verify_transaction`
+    /// so the expensive `hashPrevouts` / `hashSequence` / `hashOutputs`
+    /// computations happen once per tx, not once per input.
+    pub fn with_cache(
+        tx: &'a Transaction,
+        input_index: usize,
+        amount: Amount,
+        prev_outputs: &'a [TxOut],
+        cache: SharedSighashCache<'a>,
+    ) -> Self {
         Self {
             tx,
             input_index,
             amount,
             prev_outputs,
+            cache,
         }
     }
 }
@@ -111,7 +146,7 @@ impl SignatureChecker for TxSignatureChecker<'_> {
                 // byte.  Intermediate fields (hashPrevouts, hashSequence,
                 // hashOutputs) are unaffected because the ACP / SINGLE /
                 // NONE routing is identical after normalisation.
-                let mut cache = SighashCache::new(self.tx);
+                let mut cache = self.cache.borrow_mut();
                 let mut buf = Vec::with_capacity(256);
                 match cache.segwit_v0_encode_signing_data_to(
                     &mut buf,
@@ -130,7 +165,7 @@ impl SignatureChecker for TxSignatureChecker<'_> {
             }
             SigVersion::Base => {
                 // Legacy sighash
-                let cache = SighashCache::new(self.tx);
+                let cache = self.cache.borrow();
                 // Remove OP_CODESEPARATOR from script_code for legacy
                 let script_code_buf = remove_codeseparators(script_code);
                 match cache.legacy_signature_hash(
@@ -188,7 +223,7 @@ impl SignatureChecker for TxSignatureChecker<'_> {
         let tap_sighash_type =
             TapSighashType::from_consensus_u8(hash_type_byte).map_err(|_| ScriptError::SchnorrSigHashtype)?;
 
-        let mut cache = SighashCache::new(self.tx);
+        let mut cache = self.cache.borrow_mut();
         let prevouts = Prevouts::All(self.prev_outputs);
 
         // Build annex from ExecData if present
