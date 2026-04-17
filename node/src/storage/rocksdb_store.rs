@@ -2,7 +2,7 @@ use bitcoin::hashes::Hash;
 use bitcoin::{BlockHash, OutPoint, Txid};
 use rocksdb::{
     BlockBasedOptions, BoundColumnFamily, Cache, ColumnFamilyDescriptor, DBCompressionType,
-    DBWithThreadMode, IteratorMode, MultiThreaded, Options, WriteBatch,
+    DBWithThreadMode, FlushOptions, IteratorMode, MultiThreaded, Options, WriteBatch, WriteOptions,
 };
 use std::path::Path;
 use std::sync::Arc;
@@ -10,7 +10,7 @@ use std::sync::Arc;
 use crate::storage::blockindex::BlockIndexEntry;
 use crate::storage::coinview::{outpoint_to_key, Coin};
 use crate::storage::undo::UndoData;
-use crate::storage::{Store, StoreBatch, StoreError};
+use crate::storage::{Store, StoreBatch, StoreError, WriteMode};
 
 const CF_BLOCK_INDEX: &str = "block_index";
 const CF_COINS: &str = "coins";
@@ -307,6 +307,10 @@ impl Store for RocksDbStore {
     }
 
     fn write_batch(&self, batch: StoreBatch) -> Result<(), StoreError> {
+        self.write_batch_mode(batch, WriteMode::Normal)
+    }
+
+    fn write_batch_mode(&self, batch: StoreBatch, mode: WriteMode) -> Result<(), StoreError> {
         let mut wb = WriteBatch::default();
 
         let cf_bi = self.cf(CF_BLOCK_INDEX);
@@ -412,9 +416,32 @@ impl Store for RocksDbStore {
             wb.put_cf(&cf_meta, TOTAL_AMOUNT_KEY, new_amount.to_le_bytes());
         }
 
-        // Atomic commit across all column families
+        // Atomic commit across all column families.
+        // In BulkLoad mode we skip the WAL — the writer (connect loop during
+        // IBD) is responsible for calling `flush_durable` periodically so the
+        // amount of work lost on crash is bounded. `atomic_flush(true)` +
+        // `DataStored`-vs-`Valid` block-index markers ensure recovery is
+        // consistent: on restart any `DataStored` block not reflected in the
+        // tip pointer simply gets re-connected.
+        let mut wopts = WriteOptions::default();
+        if mode == WriteMode::BulkLoad {
+            wopts.disable_wal(true);
+        }
         self.db
-            .write(wb)
+            .write_opt(wb, &wopts)
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    fn flush_durable(&self) -> Result<(), StoreError> {
+        // Synchronous flush of every column family's memtable to SST files.
+        // With `atomic_flush(true)` set at DB open time, all CFs are flushed
+        // atomically — either the post-flush state is fully persisted or
+        // nothing is. `wait(true)` ensures the call returns only once the
+        // flush is durable on disk.
+        let mut fopts = FlushOptions::default();
+        fopts.set_wait(true);
+        self.db
+            .flush_opt(&fopts)
             .map_err(|e| StoreError::Database(e.to_string()))
     }
 

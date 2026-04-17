@@ -2,13 +2,13 @@ use bitcoin::{BlockHash, OutPoint, Txid};
 use lru::LruCache;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 
 use super::blockindex::{BlockIndexEntry, BlockStatus};
 use super::coinview::Coin;
 use super::undo::UndoData;
-use super::{Store, StoreBatch, StoreError};
+use super::{Store, StoreBatch, StoreError, WriteMode};
 
 /// Default dbcache size in MB (matches Bitcoin Core).
 const DEFAULT_DBCACHE_MB: u64 = 450;
@@ -51,6 +51,18 @@ pub struct CoinCache {
     tx_index_cache: Mutex<LruCache<Txid, BlockHash>>,
     /// Dirty coin flush threshold (~25% of clean coin cap).
     flush_threshold: u32,
+    /// Current write-durability mode. 0 = Normal (WAL enabled), 1 = BulkLoad
+    /// (WAL disabled — only safe during IBD where loss on crash can be
+    /// replayed from the flat-file block store). Set via `set_write_mode`.
+    write_mode: AtomicU8,
+}
+
+fn decode_write_mode(v: u8) -> WriteMode {
+    if v == 1 {
+        WriteMode::BulkLoad
+    } else {
+        WriteMode::Normal
+    }
 }
 
 fn lru<K: std::hash::Hash + Eq, V>(cap: usize) -> LruCache<K, V> {
@@ -94,7 +106,23 @@ impl CoinCache {
             perf_dirty_hits: AtomicU64::new(0),
             perf_clean_hits: AtomicU64::new(0),
             perf_store_misses: AtomicU64::new(0),
+            write_mode: AtomicU8::new(0),
         }
+    }
+
+    /// Switch the underlying-store write mode for subsequent writes and
+    /// flushes. Use `BulkLoad` during IBD (when crash-recovery replay is
+    /// cheap relative to WAL overhead); `Normal` otherwise.
+    pub fn set_write_mode(&self, mode: WriteMode) {
+        let v = match mode {
+            WriteMode::Normal => 0,
+            WriteMode::BulkLoad => 1,
+        };
+        self.write_mode.store(v, Ordering::Relaxed);
+    }
+
+    fn current_write_mode(&self) -> WriteMode {
+        decode_write_mode(self.write_mode.load(Ordering::Relaxed))
     }
 
     /// Create a CoinCache with the default 450 MB budget (for tests).
@@ -161,15 +189,17 @@ impl CoinCache {
             || !batch.tx_index_puts.is_empty();
 
         if has_data {
+            let mode = self.current_write_mode();
             tracing::info!(
                 coin_puts = puts,
                 coin_removes = removes,
                 fresh_elided = fresh_elided,
                 block_index = index_puts,
                 undo = undo_puts,
+                ?mode,
                 "Flushing write cache to disk"
             );
-            self.inner.write_batch(batch)?;
+            self.inner.write_batch_mode(batch, mode)?;
         }
 
         // Move flushed coins to clean LRU (cache warming)
@@ -352,7 +382,7 @@ impl Store for CoinCache {
                     tx_index_puts: batch.tx_index_puts,
                     tx_index_removes: batch.tx_index_removes,
                 };
-                self.inner.write_batch(pass_through)?;
+                self.inner.write_batch_mode(pass_through, self.current_write_mode())?;
             } else {
                 let mut pending = self.pending_batch.lock().unwrap();
                 pending.block_index_puts.extend(batch.block_index_puts);
@@ -365,6 +395,15 @@ impl Store for CoinCache {
         }
 
         Ok(())
+    }
+
+    fn flush_durable(&self) -> Result<(), StoreError> {
+        // First drain the cache's dirty map to the inner store, then ask the
+        // inner store to flush its memtables to SST files. After this returns,
+        // the on-disk state includes every write observed so far even with
+        // the WAL disabled (BulkLoad mode).
+        self.flush()?;
+        self.inner.flush_durable()
     }
 
     fn get_block_index(&self, hash: &BlockHash) -> Option<BlockIndexEntry> {

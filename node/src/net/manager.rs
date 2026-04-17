@@ -1361,6 +1361,8 @@ impl PeerManager {
         let store: Arc<dyn crate::storage::Store + Send + Sync> =
             chain_state.store_ref().clone();
         let assumevalid_active = chain_state.is_assumevalid_active();
+        let primary_engine = chain_state.primary_engine();
+        tracing::info!(?primary_engine, "Prefetch speculative verifier engine");
         let prefetch_handle = crate::chain::prefetch::start_prefetcher(
             store,
             chain_state.blocks_dir().to_path_buf(),
@@ -1368,7 +1370,15 @@ impl PeerManager {
             prefetch_workers,
             128, // lookahead blocks
             assumevalid_active,
+            primary_engine,
         );
+
+        // Enter BulkLoad mode: subsequent RocksDB writes skip the WAL for
+        // the duration of IBD. We call `flush_durable` every 1000 blocks
+        // below so a crash replays at most ~1000 blocks of work (cheap
+        // against the millisecond-per-block connect cost).
+        chain_state.set_write_mode(crate::storage::WriteMode::BulkLoad);
+        tracing::info!("IBD write mode: BulkLoad (WAL disabled, flush every 1000 blocks)");
 
         loop {
             let target_height = {
@@ -1403,15 +1413,20 @@ impl PeerManager {
                     // The run() loop will detect has_ibd=true within 2s and assign peers
                     continue;
                 }
-                // Truly done — flush UTXO cache before exiting IBD
+                // Truly done — flush UTXO cache and force a durable checkpoint
+                // before exiting IBD, then restore Normal write mode.
                 if let Err(e) = chain_state.flush_coin_cache() {
                     tracing::error!("Failed to flush UTXO cache at IBD completion: {}", e);
                 }
+                if let Err(e) = chain_state.flush_durable() {
+                    tracing::error!("Failed to durably flush chainstate at IBD completion: {}", e);
+                }
+                chain_state.set_write_mode(crate::storage::WriteMode::Normal);
                 tracing::info!(
                     height = tip_height,
                     blocks = connected_count,
                     elapsed_secs = start_time.elapsed().as_secs(),
-                    "IBD complete"
+                    "IBD complete (write mode restored to Normal)"
                 );
                 *ibd.write().unwrap() = None;
                 break;
@@ -1528,9 +1543,15 @@ impl PeerManager {
                             );
                             *last_log_height = next_height;
 
-                            // Flush UTXO cache to disk every 1000 blocks
+                            // Flush UTXO cache to disk every 1000 blocks, then
+                            // force a durable checkpoint. With BulkLoad mode
+                            // (WAL disabled) this bounds crash-recovery replay
+                            // work to the last ~1000 blocks.
                             if let Err(e) = chain_state.flush_coin_cache() {
                                 tracing::error!("Failed to flush UTXO cache: {}", e);
+                            }
+                            if let Err(e) = chain_state.flush_durable() {
+                                tracing::error!("Failed durable checkpoint: {}", e);
                             }
                         }
                         // Periodic pruning

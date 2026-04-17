@@ -54,6 +54,21 @@ impl StoreBatch {
     }
 }
 
+/// Write-durability mode for `Store::write_batch`.
+///
+/// `Normal` is the safe default: writes go through the WAL so a crash
+/// recovers to the last committed write. `BulkLoad` disables the WAL
+/// for IBD, trading some crash-recovery latency for ~20-50% less write
+/// I/O during the sync. A `Store::flush()` must be called periodically
+/// in this mode (and before switching back to `Normal`) to bound the
+/// amount of work replayed after a crash.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum WriteMode {
+    #[default]
+    Normal,
+    BulkLoad,
+}
+
 /// Abstract storage backend for block index, UTXO set, and metadata.
 pub trait Store: Send + Sync {
     fn get_block_index(&self, hash: &BlockHash) -> Option<BlockIndexEntry>;
@@ -62,6 +77,18 @@ pub trait Store: Send + Sync {
     fn get_tip(&self) -> Option<BlockHash>;
     fn get_block_hash_by_height(&self, height: u32) -> Option<BlockHash>;
     fn write_batch(&self, batch: StoreBatch) -> Result<(), StoreError>;
+    /// Write with the given durability mode. Default delegates to
+    /// `write_batch` (ignoring the mode) — concrete backends that can honor
+    /// `BulkLoad` should override.
+    fn write_batch_mode(&self, batch: StoreBatch, _mode: WriteMode) -> Result<(), StoreError> {
+        self.write_batch(batch)
+    }
+    /// Force any in-memory state to durable storage. Used after a run of
+    /// `BulkLoad` writes to ensure crash recovery is bounded.
+    /// Default: no-op (in-memory or always-synchronous backends).
+    fn flush_durable(&self) -> Result<(), StoreError> {
+        Ok(())
+    }
     fn get_undo(&self, hash: &BlockHash) -> Option<UndoData>;
     fn coin_count(&self) -> u64;
     /// Sum the total amount (in satoshis) across all UTXOs.

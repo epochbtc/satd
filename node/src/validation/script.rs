@@ -6,6 +6,19 @@ pub enum ScriptError {
     VerifyFailed(String),
 }
 
+/// Identifies which concrete verifier backs the authoritative (primary)
+/// decision path. Used so components like the prefetch pipeline can match
+/// whichever engine the user's config selected as primary — otherwise a
+/// prefetch worker's "script OK" say-so (which lets the connect thread
+/// skip primary verify) would override the user's chosen authority.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PrimaryEngine {
+    /// Bitcoin Core's libbitcoinconsensus (C++ FFI).
+    Cpp,
+    /// Pure Rust consensus engine.
+    Rust,
+}
+
 /// Trait abstracting script/transaction verification.
 /// Phase 1: implemented by ConsensusVerifier (bitcoinconsensus FFI).
 /// Phase 2: will be replaced by SimplicityVerifier.
@@ -32,6 +45,13 @@ pub trait ScriptVerifier: Send + Sync {
     /// engine still needs to see them for mismatch detection.
     /// Default: no-op (non-shadow verifiers have nothing to dispatch).
     fn dispatch_shadow(&self, _tx: &Transaction, _prev_outputs: &[TxOut], _height: u32) {}
+
+    /// Which concrete engine performs authoritative verification.
+    /// Default: `Cpp`. `RustVerifier` overrides; `ShadowVerifier` delegates
+    /// to its inner primary.
+    fn primary_engine(&self) -> PrimaryEngine {
+        PrimaryEngine::Cpp
+    }
 }
 
 /// Softfork activation heights (mainnet). Verification flags are cumulative.
@@ -166,6 +186,10 @@ impl ScriptVerifier for RustVerifier {
         consensus::verify_transaction(tx, prev_outputs, flags).map_err(|(idx, e)| {
             ScriptError::VerifyFailed(format!("rust input {idx}: {e}"))
         })
+    }
+
+    fn primary_engine(&self) -> PrimaryEngine {
+        PrimaryEngine::Rust
     }
 }
 
@@ -323,6 +347,12 @@ impl ScriptVerifier for ShadowVerifier {
                 "Shadow verification queue full on dispatch_shadow — dropping tx."
             );
         }
+    }
+
+    fn primary_engine(&self) -> PrimaryEngine {
+        // Delegate to the inner primary so callers see the real authoritative
+        // engine, not "Cpp" just because ShadowVerifier is the outer type.
+        self.primary.primary_engine()
     }
 }
 
