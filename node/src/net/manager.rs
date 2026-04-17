@@ -1331,6 +1331,12 @@ impl PeerManager {
     /// Uses a prefetch pipeline to read and pre-process upcoming blocks in
     /// background threads while the connect thread works on the current block.
     /// Sleeps (via condvar) when the next block isn't downloaded yet.
+    ///
+    /// Write-mode lifecycle: enters BulkLoad via `BulkLoadGuard::new`;
+    /// restores Normal (and runs a best-effort durable flush) from the
+    /// guard's `Drop` impl. That covers every exit path — clean success,
+    /// persistent-failure break, scheduler-cleared break, and panic unwind
+    /// — so BulkLoad semantics cannot leak into steady-state operation.
     #[allow(clippy::too_many_arguments)]
     fn ibd_connect_loop(
         chain_state: &ChainState,
@@ -1373,11 +1379,14 @@ impl PeerManager {
             primary_engine,
         );
 
-        // Enter BulkLoad mode: subsequent RocksDB writes skip the WAL for
-        // the duration of IBD. We call `flush_durable` every 1000 blocks
-        // below so a crash replays at most ~1000 blocks of work (cheap
-        // against the millisecond-per-block connect cost).
-        chain_state.set_write_mode(crate::storage::WriteMode::BulkLoad);
+        // Enter BulkLoad mode via an RAII guard: subsequent RocksDB writes
+        // skip the WAL for the duration of IBD. The guard's Drop impl runs
+        // on *every* exit path from this function — normal break, panic,
+        // early return — ensuring we never leak WAL-disabled semantics
+        // into steady-state operation. We still call `flush_durable` every
+        // 1000 blocks below so a crash during IBD replays at most ~1000
+        // blocks of work.
+        let _bulk_guard = BulkLoadGuard::new(chain_state);
         tracing::info!("IBD write mode: BulkLoad (WAL disabled, flush every 1000 blocks)");
 
         loop {
@@ -1413,20 +1422,34 @@ impl PeerManager {
                     // The run() loop will detect has_ibd=true within 2s and assign peers
                     continue;
                 }
-                // Truly done — flush UTXO cache and force a durable checkpoint
-                // before exiting IBD, then restore Normal write mode.
+                // Truly done — flush UTXO cache and force a durable
+                // checkpoint before marking IBD complete. Fail-closed: if
+                // either step errors, we loop back instead of claiming
+                // completion, so subsequent retries can attempt to
+                // checkpoint again. The BulkLoadGuard restores Normal
+                // write mode on any actual exit path.
                 if let Err(e) = chain_state.flush_coin_cache() {
-                    tracing::error!("Failed to flush UTXO cache at IBD completion: {}", e);
+                    tracing::error!(
+                        error = %e,
+                        "IBD completion: flush_coin_cache failed; deferring completion"
+                    );
+                    std::thread::sleep(Duration::from_secs(2));
+                    continue;
                 }
                 if let Err(e) = chain_state.flush_durable() {
-                    tracing::error!("Failed to durably flush chainstate at IBD completion: {}", e);
+                    tracing::error!(
+                        error = %e,
+                        "IBD completion: flush_durable failed; deferring completion \
+                         (will retry on next loop iteration)"
+                    );
+                    std::thread::sleep(Duration::from_secs(2));
+                    continue;
                 }
-                chain_state.set_write_mode(crate::storage::WriteMode::Normal);
                 tracing::info!(
                     height = tip_height,
                     blocks = connected_count,
                     elapsed_secs = start_time.elapsed().as_secs(),
-                    "IBD complete (write mode restored to Normal)"
+                    "IBD complete"
                 );
                 *ibd.write().unwrap() = None;
                 break;
@@ -2118,5 +2141,43 @@ impl PeerManager {
             start_height: self.chain_state.tip_height() as i32,
             relay: true,
         }
+    }
+}
+
+/// RAII guard that scopes `WriteMode::BulkLoad` to a lexical region.
+///
+/// Constructor sets BulkLoad. `Drop` attempts a best-effort
+/// `flush_durable` and then unconditionally restores `Normal`, so WAL-
+/// disabled write behavior cannot leak past IBD even if the IBD loop
+/// exits via a non-success path or panics.
+///
+/// Callers on the clean-success IBD-complete path should still invoke
+/// `flush_durable` explicitly and fail-closed if it errors — a silent
+/// "IBD complete" with a failed checkpoint must not be allowed. The
+/// guard's `Drop` is a backstop, not the primary durability contract.
+struct BulkLoadGuard<'a> {
+    chain_state: &'a ChainState,
+}
+
+impl<'a> BulkLoadGuard<'a> {
+    fn new(chain_state: &'a ChainState) -> Self {
+        chain_state.set_write_mode(crate::storage::WriteMode::BulkLoad);
+        Self { chain_state }
+    }
+}
+
+impl Drop for BulkLoadGuard<'_> {
+    fn drop(&mut self) {
+        if let Err(e) = self.chain_state.flush_durable() {
+            tracing::error!(
+                error = %e,
+                "BulkLoadGuard: durable flush failed on IBD exit. \
+                 Restoring Normal write mode anyway; next startup will \
+                 replay any lost BulkLoad writes from the flat-file block \
+                 store (DataStored -> Valid replay path)."
+            );
+        }
+        self.chain_state.set_write_mode(crate::storage::WriteMode::Normal);
+        tracing::info!("BulkLoadGuard: restored Normal write mode");
     }
 }

@@ -1179,4 +1179,48 @@ mod tests {
         let op = make_outpoint(0, 0);
         assert!(cache.get_coin(&op).is_some());
     }
+
+    // ---------------------------------------------------------------
+    // Write-mode toggle propagates to inner store and is round-trippable.
+    // Regression: IBD uses BulkLoad (WAL disabled) during sync and must
+    // restore Normal on exit. Since CoinCache mediates the mode via an
+    // AtomicU8, this test pins that round-trip.
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_write_mode_round_trip() {
+        let cache = make_cache(16);
+
+        // Default is Normal
+        assert_eq!(cache.current_write_mode(), WriteMode::Normal);
+
+        // Flip to BulkLoad, confirm visible
+        cache.set_write_mode(WriteMode::BulkLoad);
+        assert_eq!(cache.current_write_mode(), WriteMode::BulkLoad);
+
+        // Writes succeed in BulkLoad mode (InMemoryStore ignores mode,
+        // but this exercises the write_batch_mode path without error)
+        let op = make_outpoint(9, 0);
+        let coin = make_coin(1_000, 1);
+        let batch = StoreBatch {
+            coin_puts: vec![(op, coin)],
+            ..Default::default()
+        };
+        cache.write_batch(batch).unwrap();
+
+        // Restore Normal, confirm visible
+        cache.set_write_mode(WriteMode::Normal);
+        assert_eq!(cache.current_write_mode(), WriteMode::Normal);
+    }
+
+    // ---------------------------------------------------------------
+    // flush_durable is idempotent and safe to call with no dirty data.
+    // Regression: IBD calls flush_durable on completion and every 1000
+    // blocks. Must not error on an empty cache.
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_flush_durable_empty_is_ok() {
+        let cache = make_cache(16);
+        cache.flush_durable().expect("empty flush_durable must succeed");
+        cache.flush_durable().expect("repeated flush_durable must succeed");
+    }
 }
