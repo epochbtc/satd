@@ -134,13 +134,19 @@ pub fn verify_with_flags(
         }
     }
 
-    // Build prev_outputs for sighash computation
-    let prev_outputs: Vec<bitcoin::TxOut> = if let Some(utxos) = spent_outputs {
+    // Build prev_outputs only when taproot is active — BIP341 sighash is the
+    // only code path that reads `self.prev_outputs` in `TxSignatureChecker`.
+    // For legacy / segwit-v0 verifies, we can pass an empty slice and skip
+    // the N× allocation that was building one TxOut per input.
+    let prev_outputs: Vec<bitcoin::TxOut> = if flags::has_flag(flag_set, flags::VERIFY_TAPROOT) {
+        // Taproot requires a matching prev_output per input.
+        let utxos = spent_outputs.expect("VERIFY_TAPROOT requires spent_outputs (enforced above)");
         utxos
             .iter()
             .map(|u| {
-                let script_bytes =
-                    unsafe { std::slice::from_raw_parts(u.script_pubkey, u.script_pubkey_len as usize) };
+                let script_bytes = unsafe {
+                    std::slice::from_raw_parts(u.script_pubkey, u.script_pubkey_len as usize)
+                };
                 bitcoin::TxOut {
                     value: bitcoin::Amount::from_sat(u.value as u64),
                     script_pubkey: bitcoin::ScriptBuf::from_bytes(script_bytes.to_vec()),
@@ -148,26 +154,7 @@ pub fn verify_with_flags(
             })
             .collect()
     } else {
-        // Build a single prev output for the input being verified
-        tx.input
-            .iter()
-            .enumerate()
-            .map(|(i, _)| {
-                if i == input_index {
-                    bitcoin::TxOut {
-                        value: bitcoin::Amount::from_sat(amount),
-                        script_pubkey: bitcoin::ScriptBuf::from_bytes(
-                            spent_output_script.to_vec(),
-                        ),
-                    }
-                } else {
-                    bitcoin::TxOut {
-                        value: bitcoin::Amount::ZERO,
-                        script_pubkey: bitcoin::ScriptBuf::new(),
-                    }
-                }
-            })
-            .collect()
+        Vec::new()
     };
 
     // Build checker
@@ -233,13 +220,22 @@ pub fn verify_transaction(
     // One SighashCache for the whole tx — the key optimisation of this API.
     let cache = Rc::new(RefCell::new(bitcoin::sighash::SighashCache::new(tx)));
 
+    // TxSignatureChecker only reads prev_outputs in the BIP341 taproot path.
+    // For non-taproot verifies we can pass an empty slice to skip the
+    // unnecessary indirection.
+    let checker_prevs: &[bitcoin::TxOut] = if flags::has_flag(flag_set, flags::VERIFY_TAPROOT) {
+        prev_outputs
+    } else {
+        &[]
+    };
+
     for (i, input) in tx.input.iter().enumerate() {
         let prev = &prev_outputs[i];
         let tx_checker = sighash::TxSignatureChecker::with_cache(
             tx,
             i,
             prev.value,
-            prev_outputs,
+            checker_prevs,
             Rc::clone(&cache),
         );
 
