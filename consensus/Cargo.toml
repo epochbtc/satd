@@ -15,3 +15,29 @@ serde_json = { workspace = true }
 hex = { workspace = true }
 serde = { workspace = true }
 bitcoinconsensus = { workspace = true }
+criterion = { version = "0.5", features = ["html_reports"] }
+pprof = { version = "0.13", features = ["criterion", "flamegraph"] }
+
+[[bench]]
+name = "legacy"
+harness = false
+
+[[bench]]
+name = "p2sh"
+harness = false
+
+[[bench]]
+name = "segwit_v0"
+harness = false
+
+[[bench]]
+name = "taproot"
+harness = false
+
+[[bench]]
+name = "tx_valid"
+harness = false
+
+[[bench]]
+name = "real_block"
+harness = false
