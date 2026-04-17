@@ -204,7 +204,17 @@ pub struct ShadowVerifier {
     shadow_tx: crossbeam_channel::Sender<ShadowWork>,
     queue_size: usize,
     _workers: Vec<std::thread::JoinHandle<()>>,
+    /// Counts shadow txs dropped because the queue was full. Rate-limited
+    /// reporter (see `report_drop`) consumes this and logs an aggregated
+    /// WARN at most once per 5s — a per-drop WARN at IBD verify rates can
+    /// burn tens of percent of wall-clock on tracing+stdout alone.
+    dropped: std::sync::atomic::AtomicU64,
+    /// Unix-epoch seconds of the last aggregated drop-report WARN emitted.
+    last_drop_log_epoch: std::sync::atomic::AtomicU64,
 }
+
+/// Minimum seconds between aggregated drop-report WARN emissions.
+const SHADOW_DROP_LOG_INTERVAL_SECS: u64 = 5;
 
 /// Work item for the shadow verification background pool.
 struct ShadowWork {
@@ -298,6 +308,51 @@ impl ShadowVerifier {
             shadow_tx: tx,
             queue_size,
             _workers: workers,
+            dropped: std::sync::atomic::AtomicU64::new(0),
+            last_drop_log_epoch: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Rate-limited drop reporter. Counts every drop, and emits a single
+    /// aggregated WARN at most once per SHADOW_DROP_LOG_INTERVAL_SECS with
+    /// the accumulated count since the last log. The per-call path is
+    /// just two atomic ops on the hot path — no formatting, no string
+    /// allocation, no stdout contention — which matters when primary is
+    /// much faster than shadow (e.g. Rust-authoritative + C++-shadow)
+    /// and drops happen at ten-million-per-minute rates.
+    fn report_drop(&self, height: u32) {
+        use std::sync::atomic::Ordering;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        self.dropped.fetch_add(1, Ordering::Relaxed);
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let last = self.last_drop_log_epoch.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < SHADOW_DROP_LOG_INTERVAL_SECS {
+            return;
+        }
+        // CAS so only one thread wins the logging race per interval.
+        if self
+            .last_drop_log_epoch
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        let total = self.dropped.swap(0, Ordering::Relaxed);
+        if total > 0 {
+            tracing::warn!(
+                height,
+                queue_size = self.queue_size,
+                dropped = total,
+                interval_secs = SHADOW_DROP_LOG_INTERVAL_SECS,
+                "Shadow verification queue full — dropping tx (aggregated). \
+                 Consider increasing --shadowworkers or --shadowqueuesize, \
+                 or using --consensus=rust if the shadow engine isn't needed."
+            );
         }
     }
 }
@@ -321,12 +376,7 @@ impl ScriptVerifier for ShadowVerifier {
                 txid: tx.compute_txid(),
             };
             if let Err(crossbeam_channel::TrySendError::Full(_)) = self.shadow_tx.try_send(work) {
-                tracing::warn!(
-                    height,
-                    queue_size = self.queue_size,
-                    "Shadow verification queue full — dropping tx. \
-                     Shadow workers may be falling behind."
-                );
+                self.report_drop(height);
             }
         }
 
@@ -341,11 +391,7 @@ impl ScriptVerifier for ShadowVerifier {
             txid: tx.compute_txid(),
         };
         if let Err(crossbeam_channel::TrySendError::Full(_)) = self.shadow_tx.try_send(work) {
-            tracing::warn!(
-                height,
-                queue_size = self.queue_size,
-                "Shadow verification queue full on dispatch_shadow — dropping tx."
-            );
+            self.report_drop(height);
         }
     }
 
