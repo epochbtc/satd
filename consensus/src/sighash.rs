@@ -4,8 +4,11 @@
 
 use bitcoin::hashes::{sha256d, Hash};
 use bitcoin::sighash::{self, EcdsaSighashType, Prevouts, SighashCache, TapSighashType};
-use bitcoin::secp256k1::{self, Message, Secp256k1};
+use bitcoin::secp256k1::{self, Message, Secp256k1, VerifyOnly};
 use bitcoin::{Amount, Script, ScriptBuf, Sequence, Transaction, TxOut};
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::sync::OnceLock;
 
 use crate::checker::{ExecData, SignatureChecker, SigVersion};
 use crate::error::ScriptError;
@@ -16,6 +19,30 @@ const SEQUENCE_LOCKTIME_DISABLE_FLAG: u32 = 1 << 31;
 const SEQUENCE_LOCKTIME_TYPE_FLAG: u32 = 1 << 22;
 const SEQUENCE_LOCKTIME_MASK: u32 = 0x0000ffff;
 
+/// Process-global verification-only secp256k1 context.
+///
+/// Creating a `Secp256k1` context is expensive — it allocates the ecmult_gen
+/// precomputation table and runs `context_randomize` for side-channel
+/// protection. Previously we did this on every `TxSignatureChecker::new()`,
+/// which cost ~40% of total verify time on signature-heavy workloads
+/// (profiled via consensus/benches/p2sh.rs). Bitcoin Core allocates its
+/// context once at process startup and reuses it; we now do the same.
+///
+/// `VerifyOnly` omits the ecmult_gen tables (which are only needed for
+/// signing and ECDH), making the one-time allocation cheaper than `All`.
+fn secp_ctx() -> &'static Secp256k1<VerifyOnly> {
+    static CTX: OnceLock<Secp256k1<VerifyOnly>> = OnceLock::new();
+    CTX.get_or_init(Secp256k1::verification_only)
+}
+
+/// Shared `SighashCache` container. `SighashCache` lazily populates per-tx
+/// hashes (`hashPrevouts`, `hashSequence`, `hashOutputs`) which are identical
+/// across all inputs of a transaction — so one cache per tx is correct and
+/// optimal.  `RefCell` gives us interior mutability so `check_*` methods can
+/// keep their `&self` trait signature while the cache's encode helpers
+/// require `&mut self`.  `Rc` lets a higher-level batch verify share a single
+/// cache across per-input `TxSignatureChecker`s.
+pub type SharedSighashCache<'a> = Rc<RefCell<SighashCache<&'a Transaction>>>;
 
 /// A signature checker backed by an actual transaction, delegating sighash
 /// computation to `bitcoin::sighash::SighashCache`.
@@ -24,22 +51,44 @@ pub struct TxSignatureChecker<'a> {
     input_index: usize,
     amount: Amount,
     prev_outputs: &'a [TxOut],
-    secp: Secp256k1<secp256k1::All>,
+    cache: SharedSighashCache<'a>,
 }
 
 impl<'a> TxSignatureChecker<'a> {
+    /// Single-input constructor: builds its own sighash cache.  Use this when
+    /// verifying a single input in isolation (e.g. via `verify_with_flags`).
     pub fn new(
         tx: &'a Transaction,
         input_index: usize,
         amount: Amount,
         prev_outputs: &'a [TxOut],
     ) -> Self {
+        Self::with_cache(
+            tx,
+            input_index,
+            amount,
+            prev_outputs,
+            Rc::new(RefCell::new(SighashCache::new(tx))),
+        )
+    }
+
+    /// Shared-cache constructor: reuses an existing sighash cache across
+    /// multiple per-input checkers.  Use this inside `verify_transaction`
+    /// so the expensive `hashPrevouts` / `hashSequence` / `hashOutputs`
+    /// computations happen once per tx, not once per input.
+    pub fn with_cache(
+        tx: &'a Transaction,
+        input_index: usize,
+        amount: Amount,
+        prev_outputs: &'a [TxOut],
+        cache: SharedSighashCache<'a>,
+    ) -> Self {
         Self {
             tx,
             input_index,
             amount,
             prev_outputs,
-            secp: Secp256k1::new(),
+            cache,
         }
     }
 }
@@ -97,7 +146,7 @@ impl SignatureChecker for TxSignatureChecker<'_> {
                 // byte.  Intermediate fields (hashPrevouts, hashSequence,
                 // hashOutputs) are unaffected because the ACP / SINGLE /
                 // NONE routing is identical after normalisation.
-                let mut cache = SighashCache::new(self.tx);
+                let mut cache = self.cache.borrow_mut();
                 let mut buf = Vec::with_capacity(256);
                 match cache.segwit_v0_encode_signing_data_to(
                     &mut buf,
@@ -116,7 +165,7 @@ impl SignatureChecker for TxSignatureChecker<'_> {
             }
             SigVersion::Base => {
                 // Legacy sighash
-                let cache = SighashCache::new(self.tx);
+                let cache = self.cache.borrow();
                 // Remove OP_CODESEPARATOR from script_code for legacy
                 let script_code_buf = remove_codeseparators(script_code);
                 match cache.legacy_signature_hash(
@@ -133,7 +182,7 @@ impl SignatureChecker for TxSignatureChecker<'_> {
 
         let msg = Message::from_digest(sighash);
 
-        self.secp
+        secp_ctx()
             .verify_ecdsa(&msg, &ecdsa_sig, &pubkey)
             .is_ok()
     }
@@ -174,7 +223,7 @@ impl SignatureChecker for TxSignatureChecker<'_> {
         let tap_sighash_type =
             TapSighashType::from_consensus_u8(hash_type_byte).map_err(|_| ScriptError::SchnorrSigHashtype)?;
 
-        let mut cache = SighashCache::new(self.tx);
+        let mut cache = self.cache.borrow_mut();
         let prevouts = Prevouts::All(self.prev_outputs);
 
         // Build annex from ExecData if present
@@ -239,7 +288,7 @@ impl SignatureChecker for TxSignatureChecker<'_> {
         };
 
         let msg = Message::from_digest(sighash.to_byte_array());
-        match self.secp.verify_schnorr(&schnorr_sig, &msg, &xonly) {
+        match secp_ctx().verify_schnorr(&schnorr_sig, &msg, &xonly) {
             Ok(()) => Ok(true),
             Err(_) => Err(ScriptError::SchnorrSig),
         }

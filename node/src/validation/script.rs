@@ -140,8 +140,6 @@ impl ScriptVerifier for RustVerifier {
         prev_outputs: &[TxOut],
         height: u32,
     ) -> Result<(), ScriptError> {
-        let tx_bytes = bitcoin::consensus::serialize(tx);
-
         let mut flags = 0u32;
         if height >= BIP16_HEIGHT {
             flags |= consensus::VERIFY_P2SH;
@@ -162,39 +160,12 @@ impl ScriptVerifier for RustVerifier {
             flags |= consensus::VERIFY_TAPROOT;
         }
 
-        let script_bytes: Vec<Vec<u8>> = prev_outputs
-            .iter()
-            .map(|o| o.script_pubkey.as_bytes().to_vec())
-            .collect();
-
-        let utxos: Vec<consensus::Utxo> = prev_outputs
-            .iter()
-            .enumerate()
-            .map(|(i, o)| consensus::Utxo {
-                script_pubkey: script_bytes[i].as_ptr(),
-                script_pubkey_len: script_bytes[i].len() as u32,
-                value: o.value.to_sat() as i64,
-            })
-            .collect();
-
-        for (input_index, prev_out) in prev_outputs.iter().enumerate().take(tx.input.len()) {
-            let script_pubkey = prev_out.script_pubkey.as_bytes();
-            let amount = prev_out.value.to_sat();
-
-            consensus::verify_with_flags(
-                script_pubkey,
-                amount,
-                &tx_bytes,
-                Some(&utxos),
-                input_index,
-                flags,
-            )
-            .map_err(|e| {
-                ScriptError::VerifyFailed(format!("rust input {}: {}", input_index, e))
-            })?;
-        }
-
-        Ok(())
+        // Batch API: passes &Transaction so we don't re-deserialize per
+        // input, and shares a single SighashCache across inputs (BIP143
+        // hashPrevouts / hashSequence / hashOutputs are tx-wide).
+        consensus::verify_transaction(tx, prev_outputs, flags).map_err(|(idx, e)| {
+            ScriptError::VerifyFailed(format!("rust input {idx}: {e}"))
+        })
     }
 }
 
