@@ -12,7 +12,7 @@ use crate::storage::blockindex::{BlockIndexEntry, BlockStatus};
 use crate::storage::coinview::Coin;
 use crate::storage::flatfile::FlatFilePos;
 use crate::storage::Store;
-use crate::validation::script::{ConsensusVerifier, ScriptVerifier};
+use crate::validation::script::{ConsensusVerifier, PrimaryEngine, RustVerifier, ScriptVerifier};
 use crate::validation::tx::check_transaction;
 
 /// A block that has been pre-read, deserialized, and partially validated
@@ -80,6 +80,7 @@ pub fn prefetch_block(
     blocks_dir: &Path,
     height: u32,
     _assumevalid: bool,
+    primary_engine: PrimaryEngine,
 ) -> Option<PreprocessedBlock> {
     // 1. Get block hash and entry
     let hash = store.get_block_hash_by_height(height)?;
@@ -171,13 +172,24 @@ pub fn prefetch_block(
                 .unwrap_or(4);
             let chunk_size = verifiable.len().div_ceil(num_threads);
             let mut verified = HashSet::new();
+            // Use whichever concrete engine the user configured as primary.
+            // Prefetch's "OK" result causes the connect thread to skip its
+            // own primary verify, so this engine must match the user's
+            // authoritative choice — otherwise we'd covertly promote the
+            // other engine to authoritative for pre-verified txs.
             std::thread::scope(|s| {
                 let handles: Vec<_> = verifiable.chunks(chunk_size)
                     .map(|chunk| {
-                        s.spawn(|| {
-                            let verifier = ConsensusVerifier;
+                        s.spawn(move || {
                             chunk.iter()
-                                .filter(|(_, tx, prev_outputs)| verifier.verify_transaction(tx, prev_outputs, height).is_ok())
+                                .filter(|(_, tx, prev_outputs)| match primary_engine {
+                                    PrimaryEngine::Cpp => ConsensusVerifier
+                                        .verify_transaction(tx, prev_outputs, height)
+                                        .is_ok(),
+                                    PrimaryEngine::Rust => RustVerifier
+                                        .verify_transaction(tx, prev_outputs, height)
+                                        .is_ok(),
+                                })
                                 .map(|(tx_idx, _, _)| *tx_idx)
                                 .collect::<Vec<_>>()
                         })
@@ -255,6 +267,7 @@ pub fn start_prefetcher(
     num_workers: usize,
     lookahead: usize,
     assumevalid: bool,
+    primary_engine: PrimaryEngine,
 ) -> PrefetchHandle {
     let shutdown = Arc::new(AtomicBool::new(false));
     let cursor = Arc::new(AtomicU32::new(start_height));
@@ -277,7 +290,7 @@ pub fn start_prefetcher(
             while !w_shutdown.load(Ordering::Relaxed) {
                 match w_rx.recv_timeout(std::time::Duration::from_millis(500)) {
                     Ok(height) => {
-                        if let Some(pre) = prefetch_block(&*w_store, &w_dir, height, assumevalid) {
+                        if let Some(pre) = prefetch_block(&*w_store, &w_dir, height, assumevalid, primary_engine) {
                             w_buffer.lock().unwrap().insert(height, pre);
                         }
                     }

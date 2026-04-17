@@ -542,9 +542,33 @@ impl ChainState {
         &*self.script_verifier
     }
 
+    /// Identify which concrete engine is on the authoritative verification
+    /// path. Used by the prefetch pipeline so its speculative-verify matches
+    /// whichever engine the user configured as primary.
+    pub fn primary_engine(&self) -> crate::validation::script::PrimaryEngine {
+        self.script_verifier.primary_engine()
+    }
+
     /// Get an Arc reference to the store for read-only access by prefetch workers.
     pub fn store_ref(&self) -> &std::sync::Arc<CoinCache> {
         &self.store
+    }
+
+    /// Switch the coin-cache / backing-store write mode. Use `BulkLoad`
+    /// during IBD to disable the WAL on RocksDB writes (major I/O win);
+    /// the caller must invoke `flush_durable` periodically so crash-
+    /// recovery replay stays bounded. `Normal` restores per-write
+    /// durability for steady-state operation.
+    pub fn set_write_mode(&self, mode: crate::storage::WriteMode) {
+        self.store.set_write_mode(mode);
+    }
+
+    /// Force all cached writes to durable storage. Intended to be called
+    /// periodically during `BulkLoad` IBD, and unconditionally before
+    /// switching back to `Normal` mode or shutting down.
+    pub fn flush_durable(&self) -> Result<(), crate::storage::StoreError> {
+        use crate::storage::Store;
+        self.store.flush_durable()
     }
 
     /// Get the blocks directory path.
