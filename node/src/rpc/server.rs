@@ -2,6 +2,7 @@ use crate::chain::state::ChainState;
 use crate::mempool::fee::FeeEstimator;
 use crate::mempool::pool::Mempool;
 use crate::net::manager::PeerManager;
+use crate::rpc::amounts::{default_unit, format_amount, format_feerate_sat_per_kvb};
 use crate::rpc::auth::{AuthLayer, RpcAuth};
 use crate::rpc::{blockchain, mining, network, psbt, rawtx, util};
 use crate::storage::Store;
@@ -383,7 +384,7 @@ pub async fn start(
                         "allowed": true,
                         "vsize": vsize,
                         "fees": {
-                            "base": fees as f64 / 100_000_000.0,
+                            "base": format_amount(fees, default_unit()),
                         },
                     }));
                 }
@@ -497,13 +498,13 @@ pub async fn start(
         let conf_target: u32 = params.one().map_err(|e| {
             ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
         })?;
-        let fee_rate = ctx.fee_estimator.estimate_fee(conf_target)
-            .map(|r| r as f64 / 100_000_000.0) // sat/kvB to BTC/kvB
-            .unwrap_or(0.00001000_f64); // fallback: 1 sat/vB
+        let unit = default_unit();
+        let sat_per_kvb = ctx.fee_estimator.estimate_fee(conf_target).unwrap_or(1_000); // fallback 1 sat/vB
         Ok::<_, ErrorObjectOwned>(serde_json::json!({
-            "feerate": fee_rate,
+            "feerate": format_feerate_sat_per_kvb(sat_per_kvb, unit),
             "blocks": conf_target,
             "errors": [],
+            "_units": unit.as_str(),
         }))
     })?;
 

@@ -2057,6 +2057,47 @@ fn test_dbcache_fixed_numeric_still_works() {
 }
 
 #[test]
+fn test_rpc_default_units_btc_preserves_core_format() {
+    // Default is --rpcdefaultunits=btc. `getmempoolinfo.mempoolminfee` must
+    // be a float (BTC/kvB), as Bitcoin Core emits it.
+    let mut node = TestNode::start(&[]);
+    let info = node.rpc_call("getmempoolinfo").unwrap();
+    let fee = &info["result"]["mempoolminfee"];
+    assert!(
+        fee.as_f64().is_some(),
+        "default mempoolminfee should be a float (BTC/kvB), got: {}",
+        fee
+    );
+    node.stop();
+}
+
+#[test]
+fn test_rpc_default_units_sats_emits_integers() {
+    // --rpcdefaultunits=sats flips mempoolminfee to an integer sat/kvB
+    // value, and estimatesmartfee.feerate also becomes integer.
+    let mut node = TestNode::start(&["--rpcdefaultunits=sats"]);
+    let info = node.rpc_call("getmempoolinfo").unwrap();
+    let fee = &info["result"]["mempoolminfee"];
+    assert!(
+        fee.as_u64().is_some(),
+        "with rpcdefaultunits=sats, mempoolminfee should be integer sat/kvB, got: {}",
+        fee
+    );
+    let est = node
+        .rpc_call_with_params("estimatesmartfee", vec![serde_json::json!(6)])
+        .unwrap();
+    let feerate = &est["result"]["feerate"];
+    assert!(
+        feerate.as_u64().is_some(),
+        "estimatesmartfee.feerate should be integer sat/kvB, got: {}",
+        feerate
+    );
+    // Response should advertise the unit.
+    assert_eq!(est["result"]["_units"], "sats");
+    node.stop();
+}
+
+#[test]
 fn test_reindex() {
     // Mine blocks, stop, restart with -reindex, verify chain is rebuilt from flat files
     let rpcport = find_available_port();

@@ -6,6 +6,7 @@ use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
 use serde_json::{json, Value};
 
 use crate::chain::state::ChainState;
+use crate::rpc::amounts::{default_unit, format_amount};
 
 fn psbt_to_base64(psbt: &Psbt) -> String {
     let mut buf = Vec::new();
@@ -108,7 +109,7 @@ pub fn decode_psbt(psbt_b64: &str) -> Result<Value, (i32, String)> {
             let mut v = json!({});
             if let Some(ref utxo) = input.witness_utxo {
                 v["witness_utxo"] = json!({
-                    "amount": utxo.value.to_sat() as f64 / 100_000_000.0,
+                    "amount": format_amount(utxo.value.to_sat(), default_unit()),
                     "scriptPubKey": {
                         "hex": hex::encode(utxo.script_pubkey.as_bytes()),
                     },

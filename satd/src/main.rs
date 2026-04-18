@@ -56,6 +56,15 @@ async fn main() {
         );
     }
 
+    // Configure server-wide default RPC amount unit before any RPC starts.
+    node::rpc::amounts::set_default(config.rpc_default_units);
+    if config.rpc_default_units != node::rpc::amounts::AmountUnit::Btc {
+        tracing::info!(
+            units = config.rpc_default_units.as_str(),
+            "RPC default units: integer satoshis (non-Core-compat; clients expecting BTC will see numeric differences)"
+        );
+    }
+
     if config.max_ahead < 1000 && config.max_ahead != u32::MAX {
         tracing::warn!(
             max_ahead = config.max_ahead,
