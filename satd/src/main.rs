@@ -74,6 +74,23 @@ async fn main() {
         std::process::exit(1);
     }
 
+    // Consume the clean-shutdown marker from the previous run (if any), BEFORE
+    // opening the chain database. Unlinking happens first so a crash during
+    // startup always results in "dirty" on the next run.
+    let prior_shutdown = node::shutdown::consume_marker(&net_datadir);
+    let last_shutdown_clean = prior_shutdown.is_some();
+    match &prior_shutdown {
+        Some(rec) => tracing::info!(
+            tip_height = rec.tip_height,
+            tip_hash = %rec.tip_hash,
+            "Clean shutdown marker observed — previous exit flushed cleanly"
+        ),
+        None => tracing::warn!(
+            "No clean-shutdown marker — previous exit was dirty or this is a fresh datadir. \
+             Block-index replay will run lazily as needed via DataStored→Valid path."
+        ),
+    }
+
     // Set up authentication
     let auth = if let (Some(user), Some(pass)) = (&config.rpcuser, &config.rpcpassword) {
         RpcAuth::from_user_pass(user.clone(), pass.clone())
@@ -373,6 +390,7 @@ async fn main() {
         peer_manager.clone(),
         fee_estimator.clone(),
         shutdown_tx,
+        last_shutdown_clean,
     )
     .await
     {
@@ -540,10 +558,55 @@ async fn main() {
         }
     }
 
-    // Graceful shutdown — flush UTXO cache before stopping
-    if let Err(e) = chain_state.flush_coin_cache() {
-        tracing::error!("Failed to flush UTXO cache on shutdown: {}", e);
+    // Graceful shutdown — flush UTXO cache before stopping, bounded by
+    // --max-shutdown-secs so we never hang forever on a huge dbcache flush.
+    // On timeout we still exit: the next startup will replay DataStored
+    // blocks from flat files, so we never lose data — we just lose the
+    // clean-shutdown marker (which advertises "we flushed cleanly").
+    let shutdown_deadline = std::time::Duration::from_secs(config.max_shutdown_secs);
+    let tip_hash = chain_state.tip_hash().to_string();
+    let tip_height = chain_state.tip_height();
+    let flush_cs = chain_state.clone();
+    let flush_result = tokio::time::timeout(
+        shutdown_deadline,
+        tokio::task::spawn_blocking(move || flush_cs.flush_coin_cache()),
+    )
+    .await;
+    let flushed_ok = match flush_result {
+        Ok(Ok(Ok(()))) => {
+            tracing::info!("UTXO cache flushed cleanly within {}s deadline",
+                config.max_shutdown_secs);
+            true
+        }
+        Ok(Ok(Err(e))) => {
+            tracing::error!("UTXO cache flush reported error on shutdown: {}", e);
+            false
+        }
+        Ok(Err(e)) => {
+            tracing::error!("UTXO cache flush task panicked on shutdown: {}", e);
+            false
+        }
+        Err(_) => {
+            tracing::error!(
+                deadline_secs = config.max_shutdown_secs,
+                "UTXO cache flush exceeded --max-shutdown-secs; exiting anyway. \
+                 Next startup will replay DataStored blocks from flat files."
+            );
+            false
+        }
+    };
+
+    // Write the clean-shutdown marker only if the flush actually succeeded.
+    // If we timed out or errored, leaving the marker absent is correct — it
+    // tells the next startup (and the operator) that this exit was dirty.
+    if flushed_ok {
+        if let Err(e) = node::shutdown::write_marker(&net_datadir, &tip_hash, tip_height) {
+            tracing::warn!(error = %e, "Failed to write clean-shutdown marker");
+        } else {
+            tracing::info!(tip_height, "Wrote clean-shutdown marker");
+        }
     }
+
     server_handle.stop().expect("Failed to stop server");
     auth.cleanup();
     if let Some(ref pid_path) = config.pid {

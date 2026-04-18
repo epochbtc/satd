@@ -18,9 +18,14 @@ pub struct RpcContext {
     pub fee_estimator: Arc<FeeEstimator>,
     pub shutdown_tx: watch::Sender<bool>,
     pub start_time: std::time::Instant,
+    /// Observed at startup from the clean-shutdown marker. `true` if the
+    /// previous process wrote the marker during a successful flush; `false`
+    /// on first boot or after a crash / timed-out shutdown.
+    pub last_shutdown_clean: bool,
 }
 
 /// Start the JSON-RPC HTTP server with authentication.
+#[allow(clippy::too_many_arguments)]
 pub async fn start(
     bind_addr: SocketAddr,
     auth: Arc<RpcAuth>,
@@ -29,6 +34,7 @@ pub async fn start(
     peer_manager: Arc<PeerManager>,
     fee_estimator: Arc<FeeEstimator>,
     shutdown_tx: watch::Sender<bool>,
+    last_shutdown_clean: bool,
 ) -> Result<ServerHandle, Box<dyn std::error::Error + Send + Sync>> {
     let ctx = Arc::new(RpcContext {
         chain_state,
@@ -37,6 +43,7 @@ pub async fn start(
         fee_estimator,
         shutdown_tx,
         start_time: std::time::Instant::now(),
+        last_shutdown_clean,
     });
 
     let mut module = RpcModule::new(ctx);
@@ -666,6 +673,7 @@ pub async fn start(
             "uptime": uptime,
             "cache_dirty": cache_dirty,
             "cache_clean": cache_clean,
+            "last_shutdown": if ctx.last_shutdown_clean { "clean" } else { "dirty" },
         }))
     })?;
 

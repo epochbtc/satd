@@ -1941,6 +1941,91 @@ fn test_rpc_extended_errors_on_emits_structured_payload() {
 }
 
 #[test]
+fn test_clean_shutdown_marker_graceful_stop() {
+    // Graceful RPC stop should write the marker and next startup should see it.
+    let rpcport = find_available_port();
+    let datadir = std::env::temp_dir().join(format!("satd-clean-shutdown-{}", rpcport));
+    let _ = std::fs::remove_dir_all(&datadir);
+    let _ = std::fs::create_dir_all(&datadir);
+
+    // First run: start, stop gracefully.
+    let mut node = TestNode::start_with_datadir(&datadir, rpcport, &[]);
+    let info1 = node.rpc_call("getsysteminfo").unwrap();
+    // First boot has no prior marker — expect dirty.
+    assert_eq!(
+        info1["result"]["last_shutdown"], "dirty",
+        "first boot should report dirty, got: {}",
+        info1
+    );
+    node.stop();
+
+    // Marker should now exist on disk.
+    let marker = datadir.join("regtest").join(".clean_shutdown");
+    assert!(
+        marker.exists(),
+        "clean-shutdown marker should be written after graceful stop"
+    );
+    let contents = std::fs::read_to_string(&marker).unwrap();
+    assert!(
+        contents.contains("tip_hash"),
+        "marker contents: {}",
+        contents
+    );
+
+    // Second run: marker present → getsysteminfo should say clean. Marker
+    // is consumed at startup so checking getsysteminfo proves the startup
+    // observed it before unlinking.
+    let mut node = TestNode::start_with_datadir(&datadir, rpcport, &[]);
+    let info2 = node.rpc_call("getsysteminfo").unwrap();
+    assert_eq!(
+        info2["result"]["last_shutdown"], "clean",
+        "second boot after clean stop should report clean, got: {}",
+        info2
+    );
+    // And the marker should have been unlinked at startup.
+    assert!(
+        !marker.exists(),
+        "marker should be consumed (unlinked) at startup"
+    );
+    node.stop();
+    let _ = std::fs::remove_dir_all(&datadir);
+}
+
+#[test]
+fn test_clean_shutdown_marker_after_kill() {
+    // SIGKILL bypasses the graceful shutdown path — no marker should be written.
+    let rpcport = find_available_port();
+    let datadir = std::env::temp_dir().join(format!("satd-dirty-shutdown-{}", rpcport));
+    let _ = std::fs::remove_dir_all(&datadir);
+    let _ = std::fs::create_dir_all(&datadir);
+
+    {
+        let mut node = TestNode::start_with_datadir(&datadir, rpcport, &[]);
+        // Kill hard — skip the RPC stop path entirely.
+        let _ = node.process.kill();
+        let _ = node.process.wait();
+        // Don't call node.stop(); Drop will just try kill again (no-op).
+    }
+
+    let marker = datadir.join("regtest").join(".clean_shutdown");
+    assert!(
+        !marker.exists(),
+        "SIGKILL must not leave a clean-shutdown marker behind"
+    );
+
+    // Restart — should report dirty.
+    let mut node = TestNode::start_with_datadir(&datadir, rpcport, &[]);
+    let info = node.rpc_call("getsysteminfo").unwrap();
+    assert_eq!(
+        info["result"]["last_shutdown"], "dirty",
+        "after SIGKILL, last_shutdown should be dirty, got: {}",
+        info
+    );
+    node.stop();
+    let _ = std::fs::remove_dir_all(&datadir);
+}
+
+#[test]
 fn test_reindex() {
     // Mine blocks, stop, restart with -reindex, verify chain is rebuilt from flat files
     let rpcport = find_available_port();
