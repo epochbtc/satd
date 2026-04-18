@@ -39,5 +39,6 @@ exec "$SATD" \
     --dbcache=8000 \
     --maxahead=all \
     --consensus=rust-shadow \
+    --shadowworkers=8 \
     --assumevalid=0 \
     "${CONNECT_ARGS[@]}"
