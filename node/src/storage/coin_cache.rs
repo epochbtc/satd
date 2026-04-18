@@ -229,6 +229,25 @@ impl CoinCache {
     pub fn flush_threshold(&self) -> u32 {
         self.flush_threshold
     }
+
+    /// Resize the clean-coins LRU capacity. Used by adaptive cache sizing.
+    ///
+    /// `new_cap` is clamped to a minimum of 1 (NonZeroUsize constraint of the
+    /// underlying LRU). Shrinking evicts the coldest entries to fit; growing
+    /// is O(1) rehash. Dirty coins are unaffected — those live in a separate
+    /// HashMap until flushed.
+    pub fn resize_clean(&self, new_cap: usize) {
+        let cap = std::num::NonZeroUsize::new(new_cap.max(1)).unwrap();
+        let mut clean = self.clean.lock().unwrap();
+        if clean.cap() != cap {
+            clean.resize(cap);
+        }
+    }
+
+    /// Current clean-LRU capacity (entry count).
+    pub fn clean_cap(&self) -> usize {
+        self.clean.lock().unwrap().cap().get()
+    }
 }
 
 impl Store for CoinCache {
@@ -534,6 +553,14 @@ impl Store for CoinCache {
         }
 
         results
+    }
+
+    fn resize_block_cache(&self, bytes: usize) {
+        self.inner.resize_block_cache(bytes);
+    }
+
+    fn block_cache_capacity_bytes(&self) -> usize {
+        self.inner.block_cache_capacity_bytes()
     }
 }
 

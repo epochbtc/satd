@@ -2026,6 +2026,37 @@ fn test_clean_shutdown_marker_after_kill() {
 }
 
 #[test]
+fn test_dbcache_auto_starts_cleanly() {
+    // --dbcache=auto should start the node without error and expose a
+    // non-zero RocksDB block-cache budget in getsysteminfo. Specific budget
+    // values depend on the host's MemAvailable so we only assert the
+    // plumbing is intact.
+    let mut node = TestNode::start(&["--dbcache=auto"]);
+    let info = node.rpc_call("getsysteminfo").unwrap();
+    let bytes = info["result"]["dbcache_rocksdb_bytes"]
+        .as_u64()
+        .expect("dbcache_rocksdb_bytes should be a number");
+    assert!(
+        bytes > 0,
+        "expected non-zero RocksDB cache budget, got: {}",
+        info
+    );
+    node.stop();
+}
+
+#[test]
+fn test_dbcache_fixed_numeric_still_works() {
+    // Preserve Bitcoin-Core-compatible numeric form: --dbcache=200 must
+    // keep working as a static 200 MB budget after the auto/Fixed refactor.
+    let mut node = TestNode::start(&["--dbcache=200"]);
+    let info = node.rpc_call("getsysteminfo").unwrap();
+    let bytes = info["result"]["dbcache_rocksdb_bytes"].as_u64().unwrap();
+    assert!(bytes >= 16 * 1_000_000, "too small: {}", bytes);
+    assert!(bytes <= 200 * 1_000_000, "too large: {}", bytes);
+    node.stop();
+}
+
+#[test]
 fn test_reindex() {
     // Mine blocks, stop, restart with -reindex, verify chain is rebuilt from flat files
     let rpcport = find_available_port();

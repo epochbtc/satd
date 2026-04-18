@@ -1,5 +1,7 @@
+pub mod adaptive_cache;
 pub mod chain;
 pub mod ibd_eta;
+pub mod memstat;
 pub mod mempool;
 pub mod metrics;
 pub mod mining;

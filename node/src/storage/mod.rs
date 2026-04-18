@@ -113,4 +113,14 @@ pub trait Store: Send + Sync {
     fn get_coins_batch(&self, outpoints: &[OutPoint]) -> Vec<Option<Coin>> {
         outpoints.iter().map(|op| self.get_coin(op)).collect()
     }
+
+    /// Live-resize the block cache (e.g. RocksDB's shared LRU). Called by
+    /// the adaptive-dbcache controller. Default: no-op for backends without
+    /// a resizable cache.
+    fn resize_block_cache(&self, _bytes: usize) {}
+
+    /// Current block-cache capacity in bytes if observable. Default: 0.
+    fn block_cache_capacity_bytes(&self) -> usize {
+        0
+    }
 }
