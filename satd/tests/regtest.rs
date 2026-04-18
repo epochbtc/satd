@@ -2187,6 +2187,55 @@ fn test_rpc_default_units_sats_emits_integers() {
 }
 
 #[test]
+fn test_sat_cli_subcommands_chain() {
+    // Structured subcommand `sat-cli chain info` should translate to
+    // getblockchaininfo. `sat-cli chain height` should emit the raw height.
+    let mut node = TestNode::start(&[]);
+
+    let satd_bin = env!("CARGO_BIN_EXE_satd");
+    let sat_cli_bin = std::path::Path::new(satd_bin)
+        .parent()
+        .unwrap()
+        .join("sat-cli");
+
+    let info = Command::new(&sat_cli_bin)
+        .arg("--regtest")
+        .arg(format!("--datadir={}", node.datadir.display()))
+        .arg(format!("--rpcport={}", node.rpcport))
+        .arg("--output=json")
+        .args(["chain", "info"])
+        .output()
+        .expect("Failed to run sat-cli");
+
+    assert!(
+        info.status.success(),
+        "sat-cli chain info should succeed. stderr: {}",
+        String::from_utf8_lossy(&info.stderr),
+    );
+    let stdout = String::from_utf8(info.stdout).unwrap();
+    let result: serde_json::Value = serde_json::from_str(stdout.trim()).expect("JSON output");
+    assert_eq!(result["chain"], "regtest");
+
+    let height = Command::new(&sat_cli_bin)
+        .arg("--regtest")
+        .arg(format!("--datadir={}", node.datadir.display()))
+        .arg(format!("--rpcport={}", node.rpcport))
+        .args(["chain", "height"])
+        .output()
+        .expect("Failed to run sat-cli");
+    assert!(height.status.success());
+    let out = String::from_utf8(height.stdout).unwrap();
+    assert_eq!(
+        out.trim(),
+        "0",
+        "fresh regtest should have height 0, got: {}",
+        out
+    );
+
+    node.stop();
+}
+
+#[test]
 fn test_reindex() {
     // Mine blocks, stop, restart with -reindex, verify chain is rebuilt from flat files
     let rpcport = find_available_port();
