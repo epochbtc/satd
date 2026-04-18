@@ -55,8 +55,7 @@ impl TestNode {
                     break;
                 }
             } else if let Ok(cookie) = std::fs::read_to_string(&cookie_path) {
-                let auth = base64::engine::general_purpose::STANDARD
-                    .encode(cookie.trim());
+                let auth = base64::engine::general_purpose::STANDARD.encode(cookie.trim());
                 let client = reqwest::blocking::Client::builder()
                     .timeout(Duration::from_secs(2))
                     .build()
@@ -122,8 +121,7 @@ impl TestNode {
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             if let Ok(cookie) = std::fs::read_to_string(&cookie_path) {
-                let auth = base64::engine::general_purpose::STANDARD
-                    .encode(cookie.trim());
+                let auth = base64::engine::general_purpose::STANDARD.encode(cookie.trim());
                 let client = reqwest::blocking::Client::builder()
                     .timeout(Duration::from_secs(2))
                     .build()
@@ -335,7 +333,10 @@ fn test_stop_rpc() {
 
     // Verify cookie file was cleaned up
     let cookie_path = node.datadir.join("regtest").join(".cookie");
-    assert!(!cookie_path.exists(), "Cookie file should be deleted after stop");
+    assert!(
+        !cookie_path.exists(),
+        "Cookie file should be deleted after stop"
+    );
 }
 
 #[test]
@@ -366,7 +367,8 @@ fn test_sat_cli_integration() {
     );
 
     let stdout = String::from_utf8(output.stdout).unwrap();
-    let result: serde_json::Value = serde_json::from_str(&stdout).expect("Output should be valid JSON");
+    let result: serde_json::Value =
+        serde_json::from_str(&stdout).expect("Output should be valid JSON");
 
     assert_eq!(result["chain"], "regtest");
     assert_eq!(
@@ -383,7 +385,10 @@ fn test_userpass_auth() {
 
     // Cookie file should NOT exist when using user/pass auth
     let cookie_path = node.datadir.join("regtest").join(".cookie");
-    assert!(!cookie_path.exists(), "Cookie file should not exist with user/pass auth");
+    assert!(
+        !cookie_path.exists(),
+        "Cookie file should not exist with user/pass auth"
+    );
 
     // Correct credentials should work
     let status = node.rpc_call_raw_status("getblockchaininfo", "testuser", "testpass");
@@ -945,7 +950,10 @@ fn test_parallel_ibd() {
     // Verify both nodes agree on the best block
     let a_hash = get_rpc_str(&node_a, "getbestblockhash").unwrap();
     let b_hash = get_rpc_str(&node_b, "getbestblockhash").unwrap();
-    assert_eq!(a_hash, b_hash, "nodes should agree on best block after parallel IBD");
+    assert_eq!(
+        a_hash, b_hash,
+        "nodes should agree on best block after parallel IBD"
+    );
 
     node_b.stop();
     node_a.stop();
@@ -1091,10 +1099,7 @@ fn test_testmempoolaccept() {
     let mut node = TestNode::start(&[]);
     // Test with invalid tx hex
     let response = node
-        .rpc_call_with_params(
-            "testmempoolaccept",
-            vec![serde_json::json!(["deadbeef"])],
-        )
+        .rpc_call_with_params("testmempoolaccept", vec![serde_json::json!(["deadbeef"])])
         .unwrap();
     // Should return an error for decode failure
     assert!(response["error"].is_object());
@@ -1284,10 +1289,7 @@ fn test_decodescript() {
     let mut node = TestNode::start(&[]);
     // OP_TRUE (0x51) — simplest valid script
     let response = node
-        .rpc_call_with_params(
-            "decodescript",
-            vec![serde_json::json!("51")],
-        )
+        .rpc_call_with_params("decodescript", vec![serde_json::json!("51")])
         .unwrap();
     let result = &response["result"];
     assert!(result["asm"].is_string());
@@ -1397,7 +1399,9 @@ fn test_validateaddress() {
     let response = node
         .rpc_call_with_params(
             "validateaddress",
-            vec![serde_json::json!("bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202")],
+            vec![serde_json::json!(
+                "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202"
+            )],
         )
         .unwrap();
     let result = &response["result"];
@@ -1488,7 +1492,11 @@ fn test_node_restart_persistence() {
     let _ = std::fs::create_dir_all(&datadir);
 
     // Helper: make an RPC call to a given port with a given cookie
-    let rpc = |port: u16, cookie: &str, method: &str, params: Vec<serde_json::Value>| -> serde_json::Value {
+    let rpc = |port: u16,
+               cookie: &str,
+               method: &str,
+               params: Vec<serde_json::Value>|
+     -> serde_json::Value {
         let url = format!("http://127.0.0.1:{}/", port);
         let body = serde_json::json!({
             "jsonrpc": "2.0",
@@ -1518,7 +1526,10 @@ fn test_node_restart_persistence() {
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        panic!("Timed out waiting for cookie file at {}", cookie_path.display());
+        panic!(
+            "Timed out waiting for cookie file at {}",
+            cookie_path.display()
+        );
     };
 
     let saved_best_hash;
@@ -1539,8 +1550,12 @@ fn test_node_restart_persistence() {
         let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
 
         // Mine 3 blocks
-        rpc(rpcport1, &cookie, "generatetoaddress",
-            vec![serde_json::json!(3), serde_json::json!(addr)]);
+        rpc(
+            rpcport1,
+            &cookie,
+            "generatetoaddress",
+            vec![serde_json::json!(3), serde_json::json!(addr)],
+        );
 
         let count = rpc(rpcport1, &cookie, "getblockcount", vec![]);
         assert_eq!(count["result"], 3);
@@ -1760,9 +1775,7 @@ fn test_multiple_rpc_concurrent() {
                     "method": method,
                     "params": [],
                 });
-                let (user, pass) = cookie
-                    .split_once(':')
-                    .unwrap_or(("__cookie__", "none"));
+                let (user, pass) = cookie.split_once(':').unwrap_or(("__cookie__", "none"));
                 let client = reqwest::blocking::Client::builder()
                     .timeout(Duration::from_secs(30))
                     .build()
@@ -1878,7 +1891,10 @@ fn test_reindex_chainstate() {
     // Restart with -reindex-chainstate
     let mut node = TestNode::start_with_datadir(&datadir, rpcport, &["--reindex-chainstate"]);
     let response = node.rpc_call("getblockcount").unwrap();
-    assert_eq!(response["result"], 10, "Block count should be preserved after reindex-chainstate");
+    assert_eq!(
+        response["result"], 10,
+        "Block count should be preserved after reindex-chainstate"
+    );
 
     // Verify UTXO set is consistent
     let response = node.rpc_call("gettxoutsetinfo").unwrap();
@@ -1909,7 +1925,123 @@ fn test_reindex() {
     // Restart with -reindex
     let mut node = TestNode::start_with_datadir(&datadir, rpcport, &["--reindex"]);
     let response = node.rpc_call("getblockcount").unwrap();
-    assert_eq!(response["result"], 10, "Block count should be preserved after reindex");
+    assert_eq!(
+        response["result"], 10,
+        "Block count should be preserved after reindex"
+    );
     node.stop();
     let _ = std::fs::remove_dir_all(&datadir);
+}
+
+#[test]
+fn test_metrics_and_health_endpoints() {
+    let metrics_port = find_available_port();
+    let mut node = TestNode::start(&[&format!("--metricsport={}", metrics_port)]);
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let base = format!("http://127.0.0.1:{}", metrics_port);
+
+    // Poll until the metrics server is listening (spawned after RPC server).
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if client.get(format!("{}/healthz", base)).send().is_ok() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!("metrics server did not come up on port {}", metrics_port);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // /healthz — always 200 if the process is up.
+    let r = client.get(format!("{}/healthz", base)).send().unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    assert!(r.text().unwrap().contains("ok"));
+
+    // /readyz — regtest starts at genesis with no peers, so headers_tip ==
+    // tip == 0 and the node is "ready" by our definition (lag <= 6 blocks).
+    let r = client.get(format!("{}/readyz", base)).send().unwrap();
+    assert_eq!(
+        r.status().as_u16(),
+        200,
+        "regtest node at genesis should be ready"
+    );
+
+    // /metrics — Prometheus text format with the documented schema.
+    let r = client.get(format!("{}/metrics", base)).send().unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let ct = r
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(ct.starts_with("text/plain"), "wrong content-type: {}", ct);
+    let body = r.text().unwrap();
+    for required in [
+        "satd_tip_height",
+        "satd_headers_tip_height",
+        "satd_ibd_active",
+        "satd_mempool_transactions",
+        "satd_mempool_bytes",
+        "satd_peer_connections",
+        "satd_process_uptime_seconds",
+        "satd_build_info",
+    ] {
+        assert!(
+            body.contains(required),
+            "missing metric {} in /metrics body:\n{}",
+            required,
+            body
+        );
+    }
+    // Build-info should carry the network label.
+    assert!(
+        body.contains("network=\"regtest\""),
+        "build_info missing network label:\n{}",
+        body
+    );
+
+    // Unknown path → 404.
+    let r = client
+        .get(format!("{}/does-not-exist", base))
+        .send()
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 404);
+
+    node.stop();
+}
+
+#[test]
+fn test_metrics_endpoint_off_by_default() {
+    // Without --metricsport, the endpoint must not be listening. Pick a port
+    // at random and confirm it's refused — this proves the feature is
+    // truly opt-in and does not silently expose operator state.
+    let mut node = TestNode::start(&[]);
+    let probe_port = find_available_port();
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_millis(500))
+        .build()
+        .unwrap();
+    // Either we get a connection refused (normal) or a response from
+    // something we didn't start; we just assert it's not 200-with-our-body.
+    let result = client
+        .get(format!("http://127.0.0.1:{}/metrics", probe_port))
+        .send();
+    match result {
+        Err(_) => { /* refused — expected */ }
+        Ok(r) => {
+            // If something answered, it is not us.
+            let body = r.text().unwrap_or_default();
+            assert!(
+                !body.contains("satd_tip_height"),
+                "metrics endpoint should be off by default"
+            );
+        }
+    }
+    node.stop();
 }

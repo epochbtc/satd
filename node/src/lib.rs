@@ -1,6 +1,7 @@
 pub mod chain;
 pub mod ibd_eta;
 pub mod mempool;
+pub mod metrics;
 pub mod mining;
 pub mod net;
 pub mod perf;

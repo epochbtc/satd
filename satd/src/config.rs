@@ -115,6 +115,9 @@ pub struct Config {
     pub mcp_stdio: bool,
     pub mcp_port: Option<u16>,
     pub mcp_bind: String,
+    // Metrics / health HTTP server (unauthenticated — bind to loopback or firewall)
+    pub metricsport: Option<u16>,
+    pub metricsbind: String,
     // No-op compatibility flags (accepted but ignored)
     #[allow(dead_code)]
     pub server: bool,
@@ -429,6 +432,13 @@ impl Config {
                 || file_get("server").and_then(|v| parse_bool(&v)).unwrap_or(false),
             daemon: cli.daemon
                 || file_get("daemon").and_then(|v| parse_bool(&v)).unwrap_or(false),
+            metricsport: cli
+                .metricsport
+                .or_else(|| file_get("metricsport").and_then(|v| v.parse().ok())),
+            metricsbind: cli
+                .metricsbind
+                .or_else(|| file_get("metricsbind"))
+                .unwrap_or_else(|| "127.0.0.1".to_string()),
         })
     }
 
@@ -608,6 +618,13 @@ pub struct CliArgs {
     #[arg(long, value_name = "ADDR", help = "MCP HTTP bind address (default: 127.0.0.1)")]
     pub mcpbind: Option<String>,
 
+    // Metrics / health HTTP server (unauthenticated — bind to loopback or firewall)
+    #[arg(long, value_name = "PORT", help = "Enable Prometheus /metrics + /healthz + /readyz on this port (unauthenticated)")]
+    pub metricsport: Option<u16>,
+
+    #[arg(long, value_name = "ADDR", help = "Metrics/health HTTP bind address (default: 127.0.0.1)")]
+    pub metricsbind: Option<String>,
+
     // No-op compatibility flags (accepted silently, not wired)
     #[arg(long, help = "Accept RPC commands (always on, accepted for compatibility)")]
     pub server: bool,
@@ -669,6 +686,8 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "mcpstdio",
         "mcpport",
         "mcpbind",
+        "metricsport",
+        "metricsbind",
         "server",
         "daemon",
         "dbcache",
@@ -897,6 +916,8 @@ rpcport=8332
             mcpstdio: None,
             mcpport: None,
             mcpbind: None,
+            metricsport: None,
+            metricsbind: None,
             maxahead: None,
             consensus: None,
             shadowqueuesize: None,
@@ -962,6 +983,8 @@ rpcport=8332
             mcpstdio: None,
             mcpport: None,
             mcpbind: None,
+            metricsport: None,
+            metricsbind: None,
             maxahead: None,
             consensus: None,
             shadowqueuesize: None,
