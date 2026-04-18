@@ -118,6 +118,9 @@ pub struct Config {
     // Metrics / health HTTP server (unauthenticated — bind to loopback or firewall)
     pub metricsport: Option<u16>,
     pub metricsbind: String,
+    /// Emit structured `data` payloads (category, suggestion, debug) on
+    /// RPC errors. Default off to preserve Bitcoin-Core wire format.
+    pub rpc_extended_errors: bool,
     // No-op compatibility flags (accepted but ignored)
     #[allow(dead_code)]
     pub server: bool,
@@ -439,6 +442,10 @@ impl Config {
                 .metricsbind
                 .or_else(|| file_get("metricsbind"))
                 .unwrap_or_else(|| "127.0.0.1".to_string()),
+            rpc_extended_errors: cli.rpcextendederrors
+                || file_get("rpcextendederrors")
+                    .and_then(|v| parse_bool(&v))
+                    .unwrap_or(false),
         })
     }
 
@@ -634,6 +641,9 @@ pub struct CliArgs {
 
     #[arg(long, value_name = "N", help = "Script verification threads (accepted for compatibility)")]
     pub par: Option<usize>,
+
+    #[arg(long, help = "Emit structured error payloads (category, suggestion, debug) on RPC errors. Default: off (Core-compat)")]
+    pub rpcextendederrors: bool,
 }
 
 /// Convert Bitcoin Core-style single-dash long flags to clap-compatible double-dash.
@@ -693,6 +703,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "dbcache",
         "par",
         "maxahead",
+        "rpcextendederrors",
     ];
 
     args.into_iter()
@@ -922,6 +933,7 @@ rpcport=8332
             consensus: None,
             shadowqueuesize: None,
             shadowworkers: None,
+            rpcextendederrors: false,
         };
         let config = Config::from_cli(cli).unwrap();
         assert_eq!(config.network, Network::Regtest);
@@ -989,6 +1001,7 @@ rpcport=8332
             consensus: None,
             shadowqueuesize: None,
             shadowworkers: None,
+            rpcextendederrors: false,
         };
         assert!(Config::from_cli(cli).is_err());
     }

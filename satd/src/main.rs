@@ -48,6 +48,14 @@ async fn main() {
         "satd v0.1.0 starting"
     );
 
+    // Configure server-wide structured-error switch before any RPC handlers run.
+    node::rpc::error::set_extended_enabled(config.rpc_extended_errors);
+    if config.rpc_extended_errors {
+        tracing::info!(
+            "RPC extended errors enabled — responses include data.category/suggestion/debug (non-Core-compat wire format)"
+        );
+    }
+
     if config.max_ahead < 1000 && config.max_ahead != u32::MAX {
         tracing::warn!(
             max_ahead = config.max_ahead,
