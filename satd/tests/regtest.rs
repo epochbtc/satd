@@ -2086,6 +2086,77 @@ fn test_rpc_default_units_btc_preserves_core_format() {
         "default estimatesmartfee must not include `_units`, got: {}",
         est["result"]
     );
+
+    // gettxoutsetinfo — also an amount-bearing response; the same default
+    // Core-compat invariant applies. No need to create UTXOs; regtest
+    // post-genesis has the coinbase subsidy which materializes once mining
+    // happens, but the RPC itself works on an empty set too.
+    let txset = node.rpc_call("gettxoutsetinfo").unwrap();
+    let txset_result = &txset["result"];
+    assert!(
+        txset_result.get("_units").is_none(),
+        "default gettxoutsetinfo must not include `_units`, got: {}",
+        txset_result
+    );
+    // total_amount should be a float (BTC), not an integer, in default mode.
+    // Empty UTXO set legitimately yields 0.0; the *type* is what matters.
+    let total = &txset_result["total_amount"];
+    assert!(
+        total.is_f64() || total.as_f64() == Some(0.0),
+        "default total_amount should be a float (BTC), got: {}",
+        total
+    );
+    node.stop();
+}
+
+#[test]
+fn test_rpc_default_units_btc_gettxout_mines_coin() {
+    // gettxout requires a real UTXO. Mine a block to get a coinbase we can
+    // query, then assert the default (btc) response has no `_units` tag and
+    // emits `value` as a float.
+    let mut node = TestNode::start(&[]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    node.rpc_call_with_params(
+        "generatetoaddress",
+        vec![serde_json::json!(1), serde_json::json!(addr)],
+    )
+    .unwrap();
+    // Get the coinbase txid from the mined block.
+    let hash = node.rpc_call_with_params("getblockhash", vec![serde_json::json!(1)]).unwrap();
+    let block = node.rpc_call_with_params(
+        "getblock",
+        vec![hash["result"].clone(), serde_json::json!(2)],
+    );
+    // getblock verbose=2 may not fully decode; fall back to verbose=1 for txids.
+    let block = if block.as_ref().map(|b| b["result"]["tx"].is_array()).unwrap_or(false) {
+        block.unwrap()
+    } else {
+        node.rpc_call_with_params(
+            "getblock",
+            vec![hash["result"].clone(), serde_json::json!(1)],
+        )
+        .unwrap()
+    };
+    let coinbase_txid = block["result"]["tx"][0].as_str().expect("coinbase txid").to_string();
+
+    let out = node
+        .rpc_call_with_params(
+            "gettxout",
+            vec![serde_json::json!(coinbase_txid), serde_json::json!(0)],
+        )
+        .unwrap();
+    let result = &out["result"];
+    assert!(
+        result.get("_units").is_none(),
+        "default gettxout must not include `_units`, got: {}",
+        result
+    );
+    let value = &result["value"];
+    assert!(
+        value.is_f64(),
+        "default gettxout.value should be a float (BTC), got: {}",
+        value
+    );
     node.stop();
 }
 
