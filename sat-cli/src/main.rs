@@ -221,7 +221,10 @@ fn resolve_cmd(cmd: &Cmd) -> (String, Vec<serde_json::Value>) {
         Cmd::Node { sub } => match sub {
             NodeCmd::Status => ("getsysteminfo".into(), vec![]),
             NodeCmd::Network => ("getnetworkinfo".into(), vec![]),
-            NodeCmd::Version => ("uptime".into(), vec![]), // uptime is the cheapest probe
+            // `getnetworkinfo` carries the version/subversion/protocolversion
+            // triple that operators actually mean when they ask "what version?"
+            // — the renderer extracts just those fields in pretty mode below.
+            NodeCmd::Version => ("getnetworkinfo".into(), vec![]),
             NodeCmd::Stop => ("stop".into(), vec![]),
         },
         Cmd::Raw(args) => {
@@ -264,21 +267,57 @@ fn render_result(cmd: &Cmd, result: &serde_json::Value, output: &OutputFormat) {
     } = cmd
         && let Some(obj) = result.as_object()
     {
+        // Detect whether the server is emitting sats-integer or btc-float
+        // amounts (PR #62 --rpcdefaultunits=sats) by sniffing the type of
+        // the first entry's fees.base. Label and sort accordingly so the
+        // table matches the wire values exactly.
+        let sats_mode = obj
+            .values()
+            .next()
+            .and_then(|v| v.get("fees")?.get("base"))
+            .is_some_and(|v| v.is_u64() || v.is_i64());
+
         let mut entries: Vec<(&String, &serde_json::Value)> = obj.iter().collect();
         entries.sort_by(|a, b| {
+            // Sort by feerate descending. Read as f64 so both integer-sats and
+            // float-btc responses sort correctly with one code path.
             let fee_a = a.1["fees"]["base"].as_f64().unwrap_or(0.0);
             let fee_b = b.1["fees"]["base"].as_f64().unwrap_or(0.0);
             fee_b
                 .partial_cmp(&fee_a)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        println!("{:<64}  {:>8}  {:>14}", "txid", "vsize", "fee_btc");
+        let fee_header = if sats_mode { "fee_sats" } else { "fee_btc" };
+        println!("{:<64}  {:>8}  {:>14}", "txid", "vsize", fee_header);
         for (txid, entry) in entries.iter().take(*limit) {
             let vsize = entry["vsize"].as_u64().unwrap_or(0);
-            let fee = entry["fees"]["base"].as_f64().unwrap_or(0.0);
-            println!("{:<64}  {:>8}  {:>14.8}", txid, vsize, fee);
+            if sats_mode {
+                let fee = entry["fees"]["base"].as_u64().unwrap_or(0);
+                println!("{:<64}  {:>8}  {:>14}", txid, vsize, fee);
+            } else {
+                let fee = entry["fees"]["base"].as_f64().unwrap_or(0.0);
+                println!("{:<64}  {:>8}  {:>14.8}", txid, vsize, fee);
+            }
         }
         return;
+    }
+
+    // `node version` — extract just the version fields from getnetworkinfo.
+    if let Cmd::Node { sub: NodeCmd::Version } = cmd {
+        let version = result["version"].as_i64();
+        let subversion = result["subversion"].as_str();
+        let protocol = result["protocolversion"].as_i64();
+        match (version, subversion, protocol) {
+            (Some(v), Some(s), Some(p)) => {
+                println!("version:         {}", v);
+                println!("subversion:      {}", s);
+                println!("protocolversion: {}", p);
+                return;
+            }
+            _ => {
+                // Fall through to JSON if the response shape isn't what we expect.
+            }
+        }
     }
 
     if let Some(s) = result.as_str() {

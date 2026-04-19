@@ -2236,6 +2236,48 @@ fn test_sat_cli_subcommands_chain() {
 }
 
 #[test]
+fn test_sat_cli_node_version_returns_version_not_uptime() {
+    // `sat-cli node version` should emit version/subversion/protocolversion
+    // (pretty mode). Regression test for a review finding where the
+    // subcommand was accidentally mapped to `uptime`.
+    let mut node = TestNode::start(&[]);
+
+    let satd_bin = env!("CARGO_BIN_EXE_satd");
+    let sat_cli_bin = std::path::Path::new(satd_bin)
+        .parent()
+        .unwrap()
+        .join("sat-cli");
+
+    let output = Command::new(&sat_cli_bin)
+        .arg("--regtest")
+        .arg(format!("--datadir={}", node.datadir.display()))
+        .arg(format!("--rpcport={}", node.rpcport))
+        .args(["node", "version"])
+        .output()
+        .expect("Failed to run sat-cli");
+
+    assert!(
+        output.status.success(),
+        "sat-cli node version should succeed. stderr: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("version:") && stdout.contains("subversion:"),
+        "expected version fields, got:\n{}",
+        stdout
+    );
+    // Make sure we're not returning a bare integer (which is what `uptime` emits).
+    assert!(
+        stdout.trim().parse::<u64>().is_err(),
+        "sat-cli node version must not return a bare uptime integer; got: {:?}",
+        stdout
+    );
+
+    node.stop();
+}
+
+#[test]
 fn test_reindex() {
     // Mine blocks, stop, restart with -reindex, verify chain is rebuilt from flat files
     let rpcport = find_available_port();
