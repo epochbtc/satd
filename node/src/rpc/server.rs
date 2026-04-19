@@ -61,10 +61,19 @@ pub async fn start(
 
     module.register_method("getblockhash", |params, ctx, _extensions| {
         let height: u32 = params.one().map_err(|e| {
-            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+            crate::rpc::error::RpcError::new(-1, "rpc.input.parse", e.to_string())
+                .with_suggestion("Pass a single integer block height argument.")
+                .into_error_object()
         })?;
+        let tip = ctx.chain_state.tip_height();
         blockchain::get_block_hash(&ctx.chain_state, height).map_err(|e| {
-            ErrorObjectOwned::owned(-1, e, None::<()>)
+            crate::rpc::error::RpcError::new(-8, "rpc.input.range", e)
+                .with_suggestion(format!(
+                    "Chain tip is at height {}. Request a height in [0, {}].",
+                    tip, tip
+                ))
+                .with_debug(serde_json::json!({"requested_height": height, "tip_height": tip}))
+                .into_error_object()
         })
     })?;
 
@@ -234,10 +243,31 @@ pub async fn start(
     module.register_method("sendrawtransaction", |params, ctx, _extensions| {
         let mut seq = params.sequence();
         let hex_tx: String = seq.next().map_err(|e| {
-            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+            crate::rpc::error::RpcError::new(-1, "rpc.input.parse", e.to_string())
+                .with_suggestion("Pass the raw transaction as a hex string in the first argument.")
+                .into_error_object()
         })?;
         rawtx::send_raw_transaction(&ctx.chain_state, &ctx.mempool, &hex_tx).map_err(
-            |(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>),
+            |(code, msg)| {
+                // Classify the mempool error by its code (Core taxonomy):
+                // -22 = decode failed, -25 = mempool acceptance failure.
+                let (category, suggestion) = match code {
+                    -22 => (
+                        "rpc.input.parse",
+                        "Transaction hex failed to decode. Ensure it's a valid raw tx (no 0x prefix, no whitespace).",
+                    ),
+                    -25 => (
+                        "mempool.rejected",
+                        "Mempool rejected the tx. Check feerate (--minrelaytxfee), dust thresholds, and conflicts with existing mempool contents.",
+                    ),
+                    _ => ("rpc.unknown", ""),
+                };
+                let mut err = crate::rpc::error::RpcError::new(code, category, msg);
+                if !suggestion.is_empty() {
+                    err = err.with_suggestion(suggestion);
+                }
+                err.into_error_object()
+            },
         )
     })?;
 

@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod blockchain;
+pub mod error;
 pub mod mining;
 pub mod network;
 pub mod psbt;

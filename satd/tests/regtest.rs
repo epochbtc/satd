@@ -1904,6 +1904,43 @@ fn test_reindex_chainstate() {
 }
 
 #[test]
+fn test_rpc_extended_errors_off_by_default() {
+    // Default: error responses must be byte-identical to Bitcoin Core —
+    // just {code, message}, no `data` payload.
+    let mut node = TestNode::start(&[]);
+    let resp = node
+        .rpc_call_with_params("getblockhash", vec![serde_json::json!(9999)])
+        .unwrap();
+    let err = &resp["error"];
+    assert!(err.is_object(), "expected error object, got: {}", resp);
+    assert!(err["code"].is_number());
+    assert!(err["message"].is_string());
+    // Core emits no `data` field; we mirror that.
+    assert!(
+        err.get("data").is_none() || err["data"].is_null(),
+        "with --rpcextendederrors off, response should omit `data`; got: {}",
+        err
+    );
+    node.stop();
+}
+
+#[test]
+fn test_rpc_extended_errors_on_emits_structured_payload() {
+    // --rpcextendederrors flips the error responses to include data.
+    let mut node = TestNode::start(&["--rpcextendederrors"]);
+    let resp = node
+        .rpc_call_with_params("getblockhash", vec![serde_json::json!(9999)])
+        .unwrap();
+    let err = &resp["error"];
+    let data = &err["data"];
+    assert!(data.is_object(), "expected data object, got: {}", err);
+    assert_eq!(data["category"], "rpc.input.range");
+    assert!(data["suggestion"].is_string());
+    assert!(data["debug"]["requested_height"].as_u64().is_some());
+    node.stop();
+}
+
+#[test]
 fn test_reindex() {
     // Mine blocks, stop, restart with -reindex, verify chain is rebuilt from flat files
     let rpcport = find_available_port();
