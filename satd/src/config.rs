@@ -3,6 +3,58 @@ use clap::Parser;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+/// DB cache sizing mode. `Fixed(n)` is the Core-compatible static N-MB budget;
+/// `Auto { max_mb }` lets the adaptive controller grow/shrink the cache based
+/// on system memory pressure, capped at max_mb.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DbCacheSize {
+    Fixed(usize),
+    Auto { max_mb: usize },
+}
+
+impl DbCacheSize {
+    /// Effective budget to start with, in MB. For Auto, this is the max cap —
+    /// the controller will shrink from here based on runtime MemAvailable.
+    pub fn initial_mb(&self) -> usize {
+        match self {
+            Self::Fixed(n) => *n,
+            Self::Auto { max_mb } => *max_mb,
+        }
+    }
+
+    pub fn is_auto(&self) -> bool {
+        matches!(self, Self::Auto { .. })
+    }
+
+    /// Parse Bitcoin-Core-compatible string: either a number (MB) or "auto".
+    /// When "auto" is given without an explicit max, the cap is chosen based
+    /// on total system memory: 50% of MemTotal, min 450 MB, max 8192 MB.
+    fn parse(s: &str) -> Option<Self> {
+        let trimmed = s.trim();
+        if trimmed.eq_ignore_ascii_case("auto") {
+            let default_max_mb = default_auto_max_mb();
+            Some(Self::Auto { max_mb: default_max_mb })
+        } else {
+            trimmed.parse::<usize>().ok().map(Self::Fixed)
+        }
+    }
+}
+
+fn default_auto_max_mb() -> usize {
+    // Read MemTotal once at config-load time. When unavailable (non-Linux:
+    // /proc/meminfo doesn't exist), fall back to Core's default static
+    // budget — NOT a larger value. The adaptive controller will separately
+    // detect the missing meminfo and stay inactive. Together this keeps
+    // `--dbcache=auto` on non-Linux equivalent to the default `--dbcache=450`,
+    // matching the documented "no-op on platforms without /proc/meminfo".
+    if let Some(info) = node::memstat::meminfo() {
+        let half_gb = (info.total_bytes / 2 / 1_000_000) as usize;
+        half_gb.clamp(450, 8192)
+    } else {
+        450
+    }
+}
+
 /// Consensus engine selection.
 ///
 /// Controls which script verification engine is used:
@@ -96,8 +148,10 @@ pub struct Config {
     pub blockmintxfee: u64,
     // Misc
     pub pid: Option<String>,
-    // Cache
+    // Cache — raw budget for the static partition; see `dbcache_mode` for
+    // whether the adaptive controller should further adjust it at runtime.
     pub dbcache: usize,
+    pub dbcache_mode: DbCacheSize,
     /// Number of IBD prefetch worker threads (default: CPU core count)
     pub prefetch_workers: usize,
     /// Maximum blocks downloaded ahead of the connect cursor during IBD.
@@ -392,10 +446,26 @@ impl Config {
                 .mcpbind
                 .or_else(|| file_get("mcpbind"))
                 .unwrap_or_else(|| "127.0.0.1".to_string()),
-            dbcache: cli
-                .dbcache
-                .or_else(|| file_get("dbcache").and_then(|v| v.parse().ok()))
-                .unwrap_or(450),
+            dbcache: {
+                // Pre-compute static-partition size: the initial budget that
+                // the coin/rocksdb partition is built from. For Auto we use
+                // the max cap, and the adaptive controller shrinks from there.
+                let raw = cli
+                    .dbcache
+                    .clone()
+                    .or_else(|| file_get("dbcache"))
+                    .unwrap_or_else(|| "450".to_string());
+                DbCacheSize::parse(&raw)
+                    .unwrap_or(DbCacheSize::Fixed(450))
+                    .initial_mb()
+            },
+            dbcache_mode: {
+                let raw = cli
+                    .dbcache
+                    .or_else(|| file_get("dbcache"))
+                    .unwrap_or_else(|| "450".to_string());
+                DbCacheSize::parse(&raw).unwrap_or(DbCacheSize::Fixed(450))
+            },
             prefetch_workers: cli
                 .prefetchworkers
                 .or_else(|| file_get("prefetchworkers").and_then(|v| v.parse().ok()))
@@ -601,8 +671,8 @@ pub struct CliArgs {
     pub pid: Option<String>,
 
     // Cache
-    #[arg(long, value_name = "MB", help = "Total UTXO write cache size in MB (default: 450)")]
-    pub dbcache: Option<usize>,
+    #[arg(long, value_name = "MB|auto", help = "Total write cache size: integer MB, or 'auto' for adaptive sizing (default: 450)")]
+    pub dbcache: Option<String>,
 
     #[arg(long, value_name = "N", help = "Number of IBD prefetch worker threads (default: CPU core count)")]
     pub prefetchworkers: Option<usize>,

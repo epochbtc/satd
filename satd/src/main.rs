@@ -543,6 +543,20 @@ async fn main() {
         tokio::spawn(async move { pm.run().await });
     }
 
+    // Spawn adaptive-dbcache controller if --dbcache=auto was requested.
+    // It resizes the RocksDB block cache and the CoinCache clean LRU every
+    // 30 seconds based on /proc/meminfo MemAvailable.
+    if config.dbcache_mode.is_auto() {
+        let max_bytes = config.dbcache as u64 * 1_000_000;
+        let cs = chain_state.clone();
+        let rx = shutdown_rx.clone();
+        node::adaptive_cache::spawn_adaptive_cache(cs, max_bytes, rx);
+        tracing::info!(
+            max_mb = config.dbcache,
+            "Adaptive dbcache enabled — cap set to max budget, adjusted from /proc/meminfo"
+        );
+    }
+
     // Wait for shutdown signal (stop RPC, Ctrl+C, or SIGTERM)
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .expect("Failed to register SIGTERM handler");

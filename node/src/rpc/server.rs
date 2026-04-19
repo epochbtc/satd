@@ -4,6 +4,7 @@ use crate::mempool::pool::Mempool;
 use crate::net::manager::PeerManager;
 use crate::rpc::auth::{AuthLayer, RpcAuth};
 use crate::rpc::{blockchain, mining, network, psbt, rawtx, util};
+use crate::storage::Store;
 use jsonrpsee::server::{RpcModule, ServerBuilder, ServerHandle};
 use jsonrpsee::types::ErrorObjectOwned;
 use std::net::SocketAddr;
@@ -666,6 +667,7 @@ pub async fn start(
         let cache_dirty = ctx.chain_state.cache_dirty_count();
         let cache_clean = ctx.chain_state.cache_size().saturating_sub(cache_dirty as usize);
         let pid = std::process::id();
+        let dbcache_bytes = ctx.chain_state.store_ref().block_cache_capacity_bytes();
         Ok::<_, ErrorObjectOwned>(serde_json::json!({
             "pid": pid,
             "rss_bytes": rss_bytes,
@@ -674,6 +676,7 @@ pub async fn start(
             "cache_dirty": cache_dirty,
             "cache_clean": cache_clean,
             "last_shutdown": if ctx.last_shutdown_clean { "clean" } else { "dirty" },
+            "dbcache_rocksdb_bytes": dbcache_bytes,
         }))
     })?;
 
