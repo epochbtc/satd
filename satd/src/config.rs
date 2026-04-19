@@ -121,6 +121,9 @@ pub struct Config {
     /// Emit structured `data` payloads (category, suggestion, debug) on
     /// RPC errors. Default off to preserve Bitcoin-Core wire format.
     pub rpc_extended_errors: bool,
+    /// Maximum seconds the graceful shutdown flush may take before we
+    /// exit anyway. Bounds worst-case hangs on large dbcache flushes.
+    pub max_shutdown_secs: u64,
     // No-op compatibility flags (accepted but ignored)
     #[allow(dead_code)]
     pub server: bool,
@@ -446,6 +449,10 @@ impl Config {
                 || file_get("rpcextendederrors")
                     .and_then(|v| parse_bool(&v))
                     .unwrap_or(false),
+            max_shutdown_secs: cli
+                .maxshutdownsecs
+                .or_else(|| file_get("maxshutdownsecs").and_then(|v| v.parse().ok()))
+                .unwrap_or(30),
         })
     }
 
@@ -644,6 +651,9 @@ pub struct CliArgs {
 
     #[arg(long, help = "Emit structured error payloads (category, suggestion, debug) on RPC errors. Default: off (Core-compat)")]
     pub rpcextendederrors: bool,
+
+    #[arg(long, value_name = "SECS", help = "Maximum graceful-shutdown flush duration before force exit (default: 30)")]
+    pub maxshutdownsecs: Option<u64>,
 }
 
 /// Convert Bitcoin Core-style single-dash long flags to clap-compatible double-dash.
@@ -704,6 +714,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "par",
         "maxahead",
         "rpcextendederrors",
+        "maxshutdownsecs",
     ];
 
     args.into_iter()
@@ -934,6 +945,7 @@ rpcport=8332
             shadowqueuesize: None,
             shadowworkers: None,
             rpcextendederrors: false,
+            maxshutdownsecs: None,
         };
         let config = Config::from_cli(cli).unwrap();
         assert_eq!(config.network, Network::Regtest);
@@ -1002,6 +1014,7 @@ rpcport=8332
             shadowqueuesize: None,
             shadowworkers: None,
             rpcextendederrors: false,
+            maxshutdownsecs: None,
         };
         assert!(Config::from_cli(cli).is_err());
     }

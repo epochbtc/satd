@@ -6,6 +6,7 @@ pub mod mining;
 pub mod net;
 pub mod perf;
 pub mod rpc;
+pub mod shutdown;
 pub mod storage;
 pub mod validation;
 
