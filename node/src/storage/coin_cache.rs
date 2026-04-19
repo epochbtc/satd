@@ -49,8 +49,11 @@ pub struct CoinCache {
     height_hash_cache: Mutex<LruCache<u32, BlockHash>>,
     undo_cache: Mutex<LruCache<BlockHash, UndoData>>,
     tx_index_cache: Mutex<LruCache<Txid, BlockHash>>,
-    /// Dirty coin flush threshold (~25% of clean coin cap).
-    flush_threshold: u32,
+    /// Dirty coin flush threshold (~25% of clean coin cap). Atomic so that
+    /// `resize_clean()` can update it live — otherwise the node would keep
+    /// accumulating dirty entries up to the original high-water mark after
+    /// an adaptive-cache shrink, defeating the point of the shrink.
+    flush_threshold: AtomicU32,
     /// Current write-durability mode. 0 = Normal (WAL enabled), 1 = BulkLoad
     /// (WAL disabled — only safe during IBD where loss on crash can be
     /// replayed from the flat-file block store). Set via `set_write_mode`.
@@ -102,7 +105,7 @@ impl CoinCache {
             height_hash_cache: Mutex::new(lru(height_hash_cap)),
             undo_cache: Mutex::new(lru(undo_cap)),
             tx_index_cache: Mutex::new(lru(tx_index_cap.max(1))),
-            flush_threshold,
+            flush_threshold: AtomicU32::new(flush_threshold),
             perf_dirty_hits: AtomicU64::new(0),
             perf_clean_hits: AtomicU64::new(0),
             perf_store_misses: AtomicU64::new(0),
@@ -225,9 +228,10 @@ impl CoinCache {
     }
 
     /// Dirty coin count threshold at which the cache should be flushed.
-    /// This is ~25% of the clean coin LRU cap.
+    /// This is ~25% of the clean coin LRU cap — and tracks it live across
+    /// `resize_clean` calls.
     pub fn flush_threshold(&self) -> u32 {
-        self.flush_threshold
+        self.flush_threshold.load(Ordering::Relaxed)
     }
 
     /// Resize the clean-coins LRU capacity. Used by adaptive cache sizing.
@@ -236,12 +240,19 @@ impl CoinCache {
     /// underlying LRU). Shrinking evicts the coldest entries to fit; growing
     /// is O(1) rehash. Dirty coins are unaffected — those live in a separate
     /// HashMap until flushed.
+    ///
+    /// Updates the derived dirty-flush threshold (25% of the new clean cap)
+    /// so subsequent dirty accumulation stays within the new budget.
     pub fn resize_clean(&self, new_cap: usize) {
         let cap = std::num::NonZeroUsize::new(new_cap.max(1)).unwrap();
         let mut clean = self.clean.lock().unwrap();
         if clean.cap() != cap {
             clean.resize(cap);
         }
+        // Track the new threshold on the same shrink so dirty accumulation
+        // honors the new clean cap. Never below 1 to keep `flush` reachable.
+        let new_threshold = ((new_cap / 4) as u32).max(1);
+        self.flush_threshold.store(new_threshold, Ordering::Relaxed);
     }
 
     /// Current clean-LRU capacity (entry count).
@@ -1043,6 +1054,34 @@ mod tests {
             large.flush_threshold(),
             small.flush_threshold()
         );
+    }
+
+    // ---------------------------------------------------------------
+    // 22. resize_clean updates BOTH the LRU cap AND the flush threshold
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_resize_clean_updates_flush_threshold() {
+        let cache = CoinCache::default(Box::new(InMemoryStore::new()));
+        let initial_threshold = cache.flush_threshold();
+        assert!(initial_threshold > 0);
+
+        // Shrink to 100_000 entries: new threshold should be 25_000.
+        cache.resize_clean(100_000);
+        assert_eq!(cache.clean_cap(), 100_000);
+        assert_eq!(
+            cache.flush_threshold(),
+            25_000,
+            "threshold should shrink with clean LRU"
+        );
+
+        // Grow back: threshold tracks the new cap.
+        cache.resize_clean(2_000_000);
+        assert_eq!(cache.flush_threshold(), 500_000);
+
+        // Shrink to 0 clamps to minimum 1 (never lose reachability of flush).
+        cache.resize_clean(0);
+        assert_eq!(cache.flush_threshold(), 1);
+        assert_eq!(cache.clean_cap(), 1);
     }
 
     // ---------------------------------------------------------------

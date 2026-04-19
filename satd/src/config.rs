@@ -41,13 +41,17 @@ impl DbCacheSize {
 }
 
 fn default_auto_max_mb() -> usize {
-    // Read MemTotal once at config-load time. Best-effort — on non-Linux we
-    // fall back to 4096 MB as a safe desktop-class default.
+    // Read MemTotal once at config-load time. When unavailable (non-Linux:
+    // /proc/meminfo doesn't exist), fall back to Core's default static
+    // budget — NOT a larger value. The adaptive controller will separately
+    // detect the missing meminfo and stay inactive. Together this keeps
+    // `--dbcache=auto` on non-Linux equivalent to the default `--dbcache=450`,
+    // matching the documented "no-op on platforms without /proc/meminfo".
     if let Some(info) = node::memstat::meminfo() {
         let half_gb = (info.total_bytes / 2 / 1_000_000) as usize;
         half_gb.clamp(450, 8192)
     } else {
-        4096
+        450
     }
 }
 
