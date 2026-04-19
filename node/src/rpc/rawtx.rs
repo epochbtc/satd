@@ -5,7 +5,7 @@ use bitcoin::key::TapTweak;
 use bitcoin::secp256k1::Secp256k1;
 use crate::chain::state::ChainState;
 use crate::mempool::pool::Mempool;
-use crate::rpc::amounts::{default_unit, format_amount, format_feerate_sat_per_kvb};
+use crate::rpc::amounts::{annotate_units, default_unit, format_amount, format_feerate_sat_per_kvb};
 use serde_json::{json, Value};
 
 /// `sendrawtransaction` — submit a raw transaction to the mempool.
@@ -34,7 +34,7 @@ pub fn get_mempool_info(mempool: &Mempool) -> Value {
     let min_fee = format_feerate_sat_per_kvb(info.min_fee_rate, unit);
     let incremental = format_feerate_sat_per_kvb(1_000, unit); // 1000 sat/kvB
 
-    json!({
+    let mut response = json!({
         "loaded": true,
         "size": info.size,
         "bytes": info.bytes,
@@ -45,8 +45,9 @@ pub fn get_mempool_info(mempool: &Mempool) -> Value {
         "incrementalrelayfee": incremental,
         "unbroadcastcount": 0,
         "fullrbf": info.full_rbf,
-        "_units": unit.as_str(),
-    })
+    });
+    annotate_units(&mut response, unit);
+    response
 }
 
 /// `getrawmempool` — list mempool transaction ids.

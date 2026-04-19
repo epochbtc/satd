@@ -2058,15 +2058,33 @@ fn test_dbcache_fixed_numeric_still_works() {
 
 #[test]
 fn test_rpc_default_units_btc_preserves_core_format() {
-    // Default is --rpcdefaultunits=btc. `getmempoolinfo.mempoolminfee` must
-    // be a float (BTC/kvB), as Bitcoin Core emits it.
+    // Default is --rpcdefaultunits=btc. The response must be byte-identical
+    // to Bitcoin Core: mempoolminfee is a float (BTC/kvB) AND no `_units`
+    // annotation field is added. Adding `_units` in the default mode would
+    // silently break strict-typed Core-compat clients.
     let mut node = TestNode::start(&[]);
     let info = node.rpc_call("getmempoolinfo").unwrap();
-    let fee = &info["result"]["mempoolminfee"];
+    let result = &info["result"];
+    let fee = &result["mempoolminfee"];
     assert!(
         fee.as_f64().is_some(),
         "default mempoolminfee should be a float (BTC/kvB), got: {}",
         fee
+    );
+    assert!(
+        result.get("_units").is_none(),
+        "default mode must not add `_units`; got: {}",
+        result
+    );
+
+    // Same invariant for estimatesmartfee.
+    let est = node
+        .rpc_call_with_params("estimatesmartfee", vec![serde_json::json!(6)])
+        .unwrap();
+    assert!(
+        est["result"].get("_units").is_none(),
+        "default estimatesmartfee must not include `_units`, got: {}",
+        est["result"]
     );
     node.stop();
 }

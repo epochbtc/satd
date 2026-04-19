@@ -88,6 +88,18 @@ pub fn format_amount(sats: u64, unit: AmountUnit) -> Value {
     }
 }
 
+/// Annotate an already-built response object with `_units` **only** when
+/// the active unit differs from the Core-compatible default (`Btc`). That
+/// way default responses remain byte-identical to Bitcoin Core; clients
+/// opting into sats get a machine-readable tag confirming the shape.
+pub fn annotate_units(response: &mut Value, unit: AmountUnit) {
+    if unit == AmountUnit::Sats
+        && let Some(obj) = response.as_object_mut()
+    {
+        obj.insert("_units".to_string(), Value::String(unit.as_str().into()));
+    }
+}
+
 /// Format a fee-rate value in sat/kvB according to the requested unit.
 ///
 /// Fee rates are conventionally expressed in satoshis per virtual kilobyte.
@@ -147,6 +159,23 @@ mod tests {
         assert_eq!(AmountUnit::parse("sat"), Some(AmountUnit::Sats));
         assert_eq!(AmountUnit::parse("SATOSHIS"), Some(AmountUnit::Sats));
         assert_eq!(AmountUnit::parse("xxx"), None);
+    }
+
+    #[test]
+    fn annotate_units_only_tags_sats_mode() {
+        // Btc default must NOT tag — preserves Core wire compatibility.
+        let mut obj = serde_json::json!({"value": 1.23});
+        annotate_units(&mut obj, AmountUnit::Btc);
+        assert!(
+            obj.get("_units").is_none(),
+            "Btc mode must not add _units; got: {}",
+            obj
+        );
+
+        // Sats mode adds the tag.
+        let mut obj = serde_json::json!({"value": 123});
+        annotate_units(&mut obj, AmountUnit::Sats);
+        assert_eq!(obj["_units"], serde_json::Value::String("sats".into()));
     }
 
     #[test]

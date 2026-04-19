@@ -2,7 +2,7 @@ use crate::chain::state::ChainState;
 use crate::mempool::fee::FeeEstimator;
 use crate::mempool::pool::Mempool;
 use crate::net::manager::PeerManager;
-use crate::rpc::amounts::{default_unit, format_amount, format_feerate_sat_per_kvb};
+use crate::rpc::amounts::{annotate_units, default_unit, format_amount, format_feerate_sat_per_kvb};
 use crate::rpc::auth::{AuthLayer, RpcAuth};
 use crate::rpc::{blockchain, mining, network, psbt, rawtx, util};
 use crate::storage::Store;
@@ -500,12 +500,13 @@ pub async fn start(
         })?;
         let unit = default_unit();
         let sat_per_kvb = ctx.fee_estimator.estimate_fee(conf_target).unwrap_or(1_000); // fallback 1 sat/vB
-        Ok::<_, ErrorObjectOwned>(serde_json::json!({
+        let mut response = serde_json::json!({
             "feerate": format_feerate_sat_per_kvb(sat_per_kvb, unit),
             "blocks": conf_target,
             "errors": [],
-            "_units": unit.as_str(),
-        }))
+        });
+        annotate_units(&mut response, unit);
+        Ok::<_, ErrorObjectOwned>(response)
     })?;
 
     // --- P2P RPCs ---
