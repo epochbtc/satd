@@ -413,6 +413,28 @@ async fn main() {
         }
     }
 
+    // Start metrics/health HTTP server if enabled (unauthenticated — bind to
+    // loopback by default, or firewall externally).
+    if let Some(metricsport) = config.metricsport {
+        let metrics_bind: SocketAddr = format!("{}:{}", config.metricsbind, metricsport)
+            .parse()
+            .expect("Invalid metrics bind address");
+        let metrics_ctx = node::metrics::MetricsContext {
+            chain_state: chain_state.clone(),
+            mempool: mempool.clone(),
+            peer_manager: peer_manager.clone(),
+            network: config.network,
+            start_time: std::time::Instant::now(),
+            version: env!("CARGO_PKG_VERSION"),
+        };
+        let rx = shutdown_rx.clone();
+        tokio::spawn(async move {
+            if let Err(e) = node::metrics::serve_metrics_http(metrics_ctx, metrics_bind, rx).await {
+                tracing::error!("Metrics HTTP server error: {}", e);
+            }
+        });
+    }
+
     // Write PID file if requested
     if let Some(ref pid_path) = config.pid
         && let Err(e) = std::fs::write(pid_path, std::process::id().to_string())
