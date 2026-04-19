@@ -243,18 +243,22 @@ fn resolve_cmd(cmd: &Cmd) -> (String, Vec<serde_json::Value>) {
 /// Post-process a subcommand result for nicer default display. Unknown shapes
 /// fall through to pretty-printed JSON.
 fn render_result(cmd: &Cmd, result: &serde_json::Value, output: &OutputFormat) {
+    print!("{}", render_to_string(cmd, result, output));
+}
+
+/// Pure string-returning sibling of `render_result`. Exists so unit tests
+/// can exercise the format logic (especially the sats-vs-btc detection in
+/// `mempool top`) without driving stdout.
+fn render_to_string(cmd: &Cmd, result: &serde_json::Value, output: &OutputFormat) -> String {
     match output {
         OutputFormat::Raw => {
             if let Some(s) = result.as_str() {
-                println!("{}", s);
-            } else {
-                print!("{}", result);
+                return format!("{}\n", s);
             }
-            return;
+            return result.to_string();
         }
         OutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(result).unwrap());
-            return;
+            return format!("{}\n", serde_json::to_string_pretty(result).unwrap());
         }
         OutputFormat::Pretty => {}
     }
@@ -267,64 +271,66 @@ fn render_result(cmd: &Cmd, result: &serde_json::Value, output: &OutputFormat) {
     } = cmd
         && let Some(obj) = result.as_object()
     {
-        // Detect whether the server is emitting sats-integer or btc-float
-        // amounts (PR #62 --rpcdefaultunits=sats) by sniffing the type of
-        // the first entry's fees.base. Label and sort accordingly so the
-        // table matches the wire values exactly.
-        let sats_mode = obj
-            .values()
-            .next()
-            .and_then(|v| v.get("fees")?.get("base"))
-            .is_some_and(|v| v.is_u64() || v.is_i64());
-
-        let mut entries: Vec<(&String, &serde_json::Value)> = obj.iter().collect();
-        entries.sort_by(|a, b| {
-            // Sort by feerate descending. Read as f64 so both integer-sats and
-            // float-btc responses sort correctly with one code path.
-            let fee_a = a.1["fees"]["base"].as_f64().unwrap_or(0.0);
-            let fee_b = b.1["fees"]["base"].as_f64().unwrap_or(0.0);
-            fee_b
-                .partial_cmp(&fee_a)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        let fee_header = if sats_mode { "fee_sats" } else { "fee_btc" };
-        println!("{:<64}  {:>8}  {:>14}", "txid", "vsize", fee_header);
-        for (txid, entry) in entries.iter().take(*limit) {
-            let vsize = entry["vsize"].as_u64().unwrap_or(0);
-            if sats_mode {
-                let fee = entry["fees"]["base"].as_u64().unwrap_or(0);
-                println!("{:<64}  {:>8}  {:>14}", txid, vsize, fee);
-            } else {
-                let fee = entry["fees"]["base"].as_f64().unwrap_or(0.0);
-                println!("{:<64}  {:>8}  {:>14.8}", txid, vsize, fee);
-            }
-        }
-        return;
+        return render_mempool_top(obj, *limit);
     }
 
     // `node version` — extract just the version fields from getnetworkinfo.
-    if let Cmd::Node { sub: NodeCmd::Version } = cmd {
+    if let Cmd::Node {
+        sub: NodeCmd::Version,
+    } = cmd
+    {
         let version = result["version"].as_i64();
         let subversion = result["subversion"].as_str();
         let protocol = result["protocolversion"].as_i64();
-        match (version, subversion, protocol) {
-            (Some(v), Some(s), Some(p)) => {
-                println!("version:         {}", v);
-                println!("subversion:      {}", s);
-                println!("protocolversion: {}", p);
-                return;
-            }
-            _ => {
-                // Fall through to JSON if the response shape isn't what we expect.
-            }
+        if let (Some(v), Some(s), Some(p)) = (version, subversion, protocol) {
+            return format!(
+                "version:         {}\nsubversion:      {}\nprotocolversion: {}\n",
+                v, s, p
+            );
         }
+        // Fall through to JSON if the response shape isn't what we expect.
     }
 
     if let Some(s) = result.as_str() {
-        println!("{}", s);
+        format!("{}\n", s)
     } else {
-        println!("{}", serde_json::to_string_pretty(result).unwrap());
+        format!("{}\n", serde_json::to_string_pretty(result).unwrap())
     }
+}
+
+/// Render the `mempool top` response as a pretty table. Auto-detects the
+/// server's amount unit (integer satoshis vs BTC float) from the first
+/// entry's `fees.base` type and labels the column accordingly, so the
+/// table always reflects the wire values exactly — never the off-by-1e8
+/// confusion that would happen if the CLI always assumed BTC.
+fn render_mempool_top(obj: &serde_json::Map<String, serde_json::Value>, limit: usize) -> String {
+    let sats_mode = obj
+        .values()
+        .next()
+        .and_then(|v| v.get("fees")?.get("base"))
+        .is_some_and(|v| v.is_u64() || v.is_i64());
+
+    let mut entries: Vec<(&String, &serde_json::Value)> = obj.iter().collect();
+    entries.sort_by(|a, b| {
+        let fee_a = a.1["fees"]["base"].as_f64().unwrap_or(0.0);
+        let fee_b = b.1["fees"]["base"].as_f64().unwrap_or(0.0);
+        fee_b
+            .partial_cmp(&fee_a)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let fee_header = if sats_mode { "fee_sats" } else { "fee_btc" };
+    let mut out = format!("{:<64}  {:>8}  {:>14}\n", "txid", "vsize", fee_header);
+    for (txid, entry) in entries.iter().take(limit) {
+        let vsize = entry["vsize"].as_u64().unwrap_or(0);
+        if sats_mode {
+            let fee = entry["fees"]["base"].as_u64().unwrap_or(0);
+            out.push_str(&format!("{:<64}  {:>8}  {:>14}\n", txid, vsize, fee));
+        } else {
+            let fee = entry["fees"]["base"].as_f64().unwrap_or(0.0);
+            out.push_str(&format!("{:<64}  {:>8}  {:>14.8}\n", txid, vsize, fee));
+        }
+    }
+    out
 }
 
 enum OutputFormat {
@@ -492,4 +498,135 @@ fn default_datadir() -> PathBuf {
     std::env::var("HOME")
         .map(|h| PathBuf::from(h).join(".bitcoin"))
         .unwrap_or_else(|_| PathBuf::from("/tmp/.bitcoin"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn mempool_top_cmd(limit: usize) -> Cmd {
+        Cmd::Mempool {
+            sub: MempoolCmd::Top { limit },
+        }
+    }
+
+    #[test]
+    fn mempool_top_btc_mode_uses_float_column() {
+        // When fees.base is a float (server in default btc mode), the CLI
+        // labels the column `fee_btc` and formats with 8 decimal places.
+        let body = json!({
+            "abc": {
+                "vsize": 250u64,
+                "weight": 1000u64,
+                "time": 0u64,
+                "fees": { "base": 0.00012345 },
+            },
+            "def": {
+                "vsize": 100u64,
+                "weight": 400u64,
+                "time": 0u64,
+                "fees": { "base": 0.00100000 },
+            },
+        });
+        let rendered = render_to_string(&mempool_top_cmd(10), &body, &OutputFormat::Pretty);
+        assert!(
+            rendered.contains("fee_btc"),
+            "btc-mode header must say fee_btc, got:\n{}",
+            rendered
+        );
+        // Higher-fee tx sorts first.
+        let def_pos = rendered.find("def").expect("def row missing");
+        let abc_pos = rendered.find("abc").expect("abc row missing");
+        assert!(
+            def_pos < abc_pos,
+            "higher-feerate (def) row should sort above lower (abc):\n{}",
+            rendered
+        );
+        // Float formatting applied.
+        assert!(rendered.contains("0.00100000"));
+        // And crucially, no integer sats leaked out.
+        assert!(!rendered.contains("fee_sats"));
+    }
+
+    #[test]
+    fn mempool_top_sats_mode_uses_integer_column() {
+        // When fees.base is an integer (server in --rpcdefaultunits=sats
+        // mode), the CLI must switch to `fee_sats` and print the raw
+        // integer satoshis — NOT format them as a BTC float, which would
+        // silently multiply the displayed number by 1e8.
+        let body = json!({
+            "abc": {
+                "vsize": 250u64,
+                "weight": 1000u64,
+                "time": 0u64,
+                "fees": { "base": 12345u64 },
+            },
+            "def": {
+                "vsize": 100u64,
+                "weight": 400u64,
+                "time": 0u64,
+                "fees": { "base": 100000u64 },
+            },
+        });
+        let rendered = render_to_string(&mempool_top_cmd(10), &body, &OutputFormat::Pretty);
+        assert!(
+            rendered.contains("fee_sats"),
+            "sats-mode header must say fee_sats, got:\n{}",
+            rendered
+        );
+        assert!(
+            !rendered.contains("fee_btc"),
+            "sats-mode must not label the column fee_btc, got:\n{}",
+            rendered
+        );
+        // Raw integer sats appear verbatim.
+        assert!(
+            rendered.contains("100000") && rendered.contains("12345"),
+            "integer sats should be rendered verbatim, got:\n{}",
+            rendered
+        );
+        // Float formatting must NOT appear (the 1e8-shift bug the review caught).
+        assert!(
+            !rendered.contains("0.00012345"),
+            "sats-mode must not format as BTC float (would be 1e8× wrong): {}",
+            rendered
+        );
+    }
+
+    #[test]
+    fn mempool_top_limit_truncates() {
+        let body = json!({
+            "a": {"vsize": 100, "weight": 400, "time": 0, "fees": {"base": 1.0}},
+            "b": {"vsize": 100, "weight": 400, "time": 0, "fees": {"base": 2.0}},
+            "c": {"vsize": 100, "weight": 400, "time": 0, "fees": {"base": 3.0}},
+        });
+        let rendered = render_to_string(&mempool_top_cmd(1), &body, &OutputFormat::Pretty);
+        // Only the highest-fee row makes it under limit=1.
+        assert!(rendered.contains("c"));
+        assert!(!rendered.contains("\na  "));
+        assert!(!rendered.contains("\nb  "));
+    }
+
+    #[test]
+    fn node_version_extracts_version_fields() {
+        let body = json!({
+            "version": 270000,
+            "subversion": "/satd:0.1.0/",
+            "protocolversion": 70016,
+            "localservices": "0000000000000409",
+        });
+        let cmd = Cmd::Node { sub: NodeCmd::Version };
+        let rendered = render_to_string(&cmd, &body, &OutputFormat::Pretty);
+        assert!(rendered.contains("version:         270000"));
+        assert!(rendered.contains("subversion:      /satd:0.1.0/"));
+        assert!(rendered.contains("protocolversion: 70016"));
+        // Regression against the original bug where this mapped to `uptime`:
+        // that would have produced a bare integer. Make sure we're not doing that.
+        assert!(
+            rendered.trim().parse::<u64>().is_err(),
+            "node version must not render as a bare integer; got: {:?}",
+            rendered
+        );
+    }
 }
