@@ -19,6 +19,45 @@
 use std::fs;
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use crate::storage::StoreError;
+
+/// Outcome of awaiting a bounded shutdown flush. The main binary uses this
+/// to decide whether to write the clean-shutdown marker, log an error, or
+/// force-exit with `std::process::exit(1)` — the only way to actually
+/// honor `--max-shutdown-secs` when the flush is stuck inside a blocking
+/// FFI call that tokio cannot abort.
+#[derive(Debug, PartialEq, Eq)]
+pub enum BoundedFlushOutcome {
+    /// Flush completed successfully within the deadline; marker may be written.
+    Clean,
+    /// Flush ran to completion but returned an error; no marker.
+    FlushError(String),
+    /// The oneshot sender was dropped before signalling (thread panic?).
+    ChannelDropped,
+    /// Flush exceeded the deadline. Caller MUST force the process to exit —
+    /// the underlying `spawn_blocking` or `std::thread` task cannot be
+    /// aborted, so any normal return would let the runtime wait for it.
+    TimedOut,
+}
+
+/// Await a flush completion signal with a hard deadline.
+///
+/// Extracted so unit tests can exercise the timeout arbitration logic
+/// without needing a running satd. The main binary wires the sender side
+/// to a dedicated `std::thread` that calls `flush_coin_cache`.
+pub async fn await_bounded_flush(
+    flush_rx: tokio::sync::oneshot::Receiver<Result<(), StoreError>>,
+    deadline: Duration,
+) -> BoundedFlushOutcome {
+    match tokio::time::timeout(deadline, flush_rx).await {
+        Ok(Ok(Ok(()))) => BoundedFlushOutcome::Clean,
+        Ok(Ok(Err(e))) => BoundedFlushOutcome::FlushError(e.to_string()),
+        Ok(Err(_)) => BoundedFlushOutcome::ChannelDropped,
+        Err(_) => BoundedFlushOutcome::TimedOut,
+    }
+}
 
 /// Filename of the marker inside the network datadir.
 pub const MARKER_FILENAME: &str = ".clean_shutdown";
@@ -197,5 +236,60 @@ mod tests {
         assert_eq!(rec.tip_hash, "x");
         assert_eq!(rec.tip_height, 42);
         assert_eq!(rec.shutdown_unix_secs, 99);
+    }
+
+    // ----------------------------------------------------------------
+    // await_bounded_flush — exercises the timeout arbitration logic so
+    // we can prove the TimedOut branch fires when a flush doesn't
+    // complete in time. The main binary translates TimedOut into
+    // std::process::exit(1), which is what actually bounds shutdown.
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn bounded_flush_clean_on_immediate_ok() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tx.send(Ok(())).unwrap();
+        let outcome = await_bounded_flush(rx, Duration::from_secs(5)).await;
+        assert_eq!(outcome, BoundedFlushOutcome::Clean);
+    }
+
+    #[tokio::test]
+    async fn bounded_flush_surfaces_flush_error() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tx.send(Err(crate::storage::StoreError::Database("boom".into())))
+            .unwrap();
+        let outcome = await_bounded_flush(rx, Duration::from_secs(5)).await;
+        match outcome {
+            BoundedFlushOutcome::FlushError(msg) => assert!(msg.contains("boom")),
+            other => panic!("expected FlushError, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_flush_channel_dropped_when_sender_gone() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), StoreError>>();
+        drop(tx);
+        let outcome = await_bounded_flush(rx, Duration::from_secs(5)).await;
+        assert_eq!(outcome, BoundedFlushOutcome::ChannelDropped);
+    }
+
+    #[tokio::test]
+    async fn bounded_flush_times_out_when_sender_is_slow() {
+        // Keep the sender alive but never signal. The deadline should fire
+        // and the outcome must be TimedOut — which the main binary reacts
+        // to by calling std::process::exit(1), the actual enforcement of
+        // --max-shutdown-secs.
+        let (_tx_kept_alive, rx) = tokio::sync::oneshot::channel::<Result<(), StoreError>>();
+        let t0 = std::time::Instant::now();
+        let outcome = await_bounded_flush(rx, Duration::from_millis(50)).await;
+        let elapsed = t0.elapsed();
+        assert_eq!(outcome, BoundedFlushOutcome::TimedOut);
+        // Deadline must have been honored (within a generous slack for CI
+        // scheduling jitter).
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "timeout should fire quickly; elapsed={:?}",
+            elapsed
+        );
     }
 }

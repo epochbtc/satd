@@ -583,24 +583,23 @@ async fn main() {
         let result = flush_cs.flush_coin_cache();
         let _ = flush_tx.send(result);
     });
-    let flush_result = tokio::time::timeout(shutdown_deadline, flush_rx).await;
-    let flushed_ok = match flush_result {
-        Ok(Ok(Ok(()))) => {
+    let flushed_ok = match node::shutdown::await_bounded_flush(flush_rx, shutdown_deadline).await {
+        node::shutdown::BoundedFlushOutcome::Clean => {
             tracing::info!(
                 "UTXO cache flushed cleanly within {}s deadline",
                 config.max_shutdown_secs
             );
             true
         }
-        Ok(Ok(Err(e))) => {
+        node::shutdown::BoundedFlushOutcome::FlushError(e) => {
             tracing::error!("UTXO cache flush reported error on shutdown: {}", e);
             false
         }
-        Ok(Err(_)) => {
+        node::shutdown::BoundedFlushOutcome::ChannelDropped => {
             tracing::error!("UTXO cache flush sender dropped before completing");
             false
         }
-        Err(_) => {
+        node::shutdown::BoundedFlushOutcome::TimedOut => {
             // Flush exceeded the deadline. The std::thread is still inside
             // the rocksdb FFI and we can't reach in to cancel it. Force exit
             // at the OS level so the deadline is actually honored — this is
