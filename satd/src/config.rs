@@ -178,6 +178,10 @@ pub struct Config {
     /// Maximum seconds the graceful shutdown flush may take before we
     /// exit anyway. Bounds worst-case hangs on large dbcache flushes.
     pub max_shutdown_secs: u64,
+    /// Server-wide default unit for amount serialization in RPC responses.
+    /// `Btc` (default) matches Bitcoin Core byte-for-byte; `Sats` emits
+    /// integer satoshis (no floating-point precision loss).
+    pub rpc_default_units: node::rpc::amounts::AmountUnit,
     // No-op compatibility flags (accepted but ignored)
     #[allow(dead_code)]
     pub server: bool,
@@ -523,6 +527,14 @@ impl Config {
                 .maxshutdownsecs
                 .or_else(|| file_get("maxshutdownsecs").and_then(|v| v.parse().ok()))
                 .unwrap_or(30),
+            rpc_default_units: {
+                let raw = cli
+                    .rpcdefaultunits
+                    .or_else(|| file_get("rpcdefaultunits"))
+                    .unwrap_or_else(|| "btc".to_string());
+                node::rpc::amounts::AmountUnit::parse(&raw)
+                    .unwrap_or(node::rpc::amounts::AmountUnit::Btc)
+            },
         })
     }
 
@@ -724,6 +736,9 @@ pub struct CliArgs {
 
     #[arg(long, value_name = "SECS", help = "Maximum graceful-shutdown flush duration before force exit (default: 30)")]
     pub maxshutdownsecs: Option<u64>,
+
+    #[arg(long, value_name = "UNIT", help = "Default units for RPC amount fields: 'btc' (Core-compatible, default) or 'sats' (integer satoshis)")]
+    pub rpcdefaultunits: Option<String>,
 }
 
 /// Convert Bitcoin Core-style single-dash long flags to clap-compatible double-dash.
@@ -785,6 +800,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "maxahead",
         "rpcextendederrors",
         "maxshutdownsecs",
+        "rpcdefaultunits",
     ];
 
     args.into_iter()
@@ -1016,6 +1032,7 @@ rpcport=8332
             shadowworkers: None,
             rpcextendederrors: false,
             maxshutdownsecs: None,
+            rpcdefaultunits: None,
         };
         let config = Config::from_cli(cli).unwrap();
         assert_eq!(config.network, Network::Regtest);
@@ -1085,6 +1102,7 @@ rpcport=8332
             shadowworkers: None,
             rpcextendederrors: false,
             maxshutdownsecs: None,
+            rpcdefaultunits: None,
         };
         assert!(Config::from_cli(cli).is_err());
     }

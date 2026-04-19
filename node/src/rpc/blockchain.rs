@@ -4,6 +4,7 @@ use serde_json::{json, Value};
 
 use crate::chain::state::ChainState;
 use crate::mempool::pool::Mempool;
+use crate::rpc::amounts::{annotate_units, default_unit, format_amount};
 use crate::storage::blockindex::target_to_difficulty;
 
 /// Build the `getblockchaininfo` response from real chain state.
@@ -246,22 +247,25 @@ pub fn get_tx_out(
         .get_coin(&outpoint)
         .ok_or("UTXO not found".to_string())?;
 
-    let value_btc = coin.amount as f64 / 100_000_000.0;
+    let unit = default_unit();
+    let value = format_amount(coin.amount, unit);
     let confirmations = if chain_state.tip_height() >= coin.height {
         chain_state.tip_height() - coin.height + 1
     } else {
         0
     };
 
-    Ok(json!({
+    let mut response = json!({
         "bestblock": chain_state.tip_hash().to_string(),
         "confirmations": confirmations,
-        "value": value_btc,
+        "value": value,
         "scriptPubKey": {
             "hex": hex::encode(coin.script_pubkey.as_bytes()),
         },
         "coinbase": coin.coinbase,
-    }))
+    });
+    annotate_units(&mut response, unit);
+    Ok(response)
 }
 
 /// `gettxoutsetinfo` — return UTXO set statistics.
@@ -273,7 +277,8 @@ pub fn get_tx_out_set_info(chain_state: &ChainState) -> Value {
     let coin_count = chain_state.coin_count();
 
     let total_sats = chain_state.coin_total_amount();
-    let total_btc = total_sats as f64 / 100_000_000.0;
+    let unit = default_unit();
+    let total = format_amount(total_sats, unit);
 
     // Compute age distribution from height histogram
     // Buckets: <1h (6 blk), <1d (144), <1w (1008), <1mo (4320),
@@ -281,18 +286,20 @@ pub fn get_tx_out_set_info(chain_state: &ChainState) -> Value {
     let hist = chain_state.utxo_height_hist();
     let age_buckets = height_hist_to_age_buckets(&hist, tip_height);
 
-    json!({
+    let mut response = json!({
         "height": tip_height,
         "bestblock": tip_hash.to_string(),
         "txouts": coin_count,
         "bogosize": coin_count * 50,
-        "total_amount": total_btc,
+        "total_amount": total,
         "hash_serialized_3": "",
         "utxo_age_distribution": {
             "labels": ["<1h", "<1d", "<1w", "<1mo", "<6mo", "<1y", "<3y", "3y+"],
             "counts": age_buckets,
         },
-    })
+    });
+    annotate_units(&mut response, unit);
+    response
 }
 
 /// Convert a height histogram (1000-block buckets) into 8 age-based buckets

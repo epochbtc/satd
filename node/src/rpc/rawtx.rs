@@ -5,6 +5,7 @@ use bitcoin::key::TapTweak;
 use bitcoin::secp256k1::Secp256k1;
 use crate::chain::state::ChainState;
 use crate::mempool::pool::Mempool;
+use crate::rpc::amounts::{annotate_units, default_unit, format_amount, format_feerate_sat_per_kvb};
 use serde_json::{json, Value};
 
 /// `sendrawtransaction` — submit a raw transaction to the mempool.
@@ -29,20 +30,24 @@ pub fn send_raw_transaction(
 /// `getmempoolinfo` — return mempool statistics.
 pub fn get_mempool_info(mempool: &Mempool) -> Value {
     let info = mempool.info();
-    let min_fee_btc = info.min_fee_rate as f64 / 100_000_000.0;
+    let unit = default_unit();
+    let min_fee = format_feerate_sat_per_kvb(info.min_fee_rate, unit);
+    let incremental = format_feerate_sat_per_kvb(1_000, unit); // 1000 sat/kvB
 
-    json!({
+    let mut response = json!({
         "loaded": true,
         "size": info.size,
         "bytes": info.bytes,
         "usage": info.bytes,
         "maxmempool": info.max_size,
-        "mempoolminfee": min_fee_btc,
-        "minrelaytxfee": min_fee_btc,
-        "incrementalrelayfee": 0.00001000,
+        "mempoolminfee": min_fee,
+        "minrelaytxfee": min_fee,
+        "incrementalrelayfee": incremental,
         "unbroadcastcount": 0,
         "fullrbf": info.full_rbf,
-    })
+    });
+    annotate_units(&mut response, unit);
+    response
 }
 
 /// `getrawmempool` — list mempool transaction ids.
@@ -55,13 +60,14 @@ pub fn get_raw_mempool(mempool: &Mempool, verbose: bool) -> Value {
     }
 
     let mut result = serde_json::Map::new();
+    let unit = default_unit();
     for (txid, entry) in &entries {
         let vsize = if entry.weight > 0 {
             entry.weight.div_ceil(4)
         } else {
             0
         };
-        let fee_btc = entry.fee as f64 / 100_000_000.0;
+        let fee = format_amount(entry.fee, unit);
 
         result.insert(
             txid.to_string(),
@@ -70,7 +76,7 @@ pub fn get_raw_mempool(mempool: &Mempool, verbose: bool) -> Value {
                 "weight": entry.weight,
                 "time": entry.time,
                 "fees": {
-                    "base": fee_btc,
+                    "base": fee,
                 },
             }),
         );
@@ -209,14 +215,15 @@ fn decode_transaction_verbose(
         })
         .collect();
 
+    let unit = default_unit();
     let vout: Vec<Value> = tx
         .output
         .iter()
         .enumerate()
         .map(|(n, output)| {
-            let value_btc = output.value.to_sat() as f64 / 100_000_000.0;
+            let value = format_amount(output.value.to_sat(), unit);
             json!({
-                "value": value_btc,
+                "value": value,
                 "n": n,
                 "scriptPubKey": {
                     "asm": format!("{}", output.script_pubkey),

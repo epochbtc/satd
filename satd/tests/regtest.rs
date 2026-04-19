@@ -2057,6 +2057,136 @@ fn test_dbcache_fixed_numeric_still_works() {
 }
 
 #[test]
+fn test_rpc_default_units_btc_preserves_core_format() {
+    // Default is --rpcdefaultunits=btc. The response must be byte-identical
+    // to Bitcoin Core: mempoolminfee is a float (BTC/kvB) AND no `_units`
+    // annotation field is added. Adding `_units` in the default mode would
+    // silently break strict-typed Core-compat clients.
+    let mut node = TestNode::start(&[]);
+    let info = node.rpc_call("getmempoolinfo").unwrap();
+    let result = &info["result"];
+    let fee = &result["mempoolminfee"];
+    assert!(
+        fee.as_f64().is_some(),
+        "default mempoolminfee should be a float (BTC/kvB), got: {}",
+        fee
+    );
+    assert!(
+        result.get("_units").is_none(),
+        "default mode must not add `_units`; got: {}",
+        result
+    );
+
+    // Same invariant for estimatesmartfee.
+    let est = node
+        .rpc_call_with_params("estimatesmartfee", vec![serde_json::json!(6)])
+        .unwrap();
+    assert!(
+        est["result"].get("_units").is_none(),
+        "default estimatesmartfee must not include `_units`, got: {}",
+        est["result"]
+    );
+
+    // gettxoutsetinfo — also an amount-bearing response; the same default
+    // Core-compat invariant applies. No need to create UTXOs; regtest
+    // post-genesis has the coinbase subsidy which materializes once mining
+    // happens, but the RPC itself works on an empty set too.
+    let txset = node.rpc_call("gettxoutsetinfo").unwrap();
+    let txset_result = &txset["result"];
+    assert!(
+        txset_result.get("_units").is_none(),
+        "default gettxoutsetinfo must not include `_units`, got: {}",
+        txset_result
+    );
+    // total_amount should be a float (BTC), not an integer, in default mode.
+    // Empty UTXO set legitimately yields 0.0; the *type* is what matters.
+    let total = &txset_result["total_amount"];
+    assert!(
+        total.is_f64() || total.as_f64() == Some(0.0),
+        "default total_amount should be a float (BTC), got: {}",
+        total
+    );
+    node.stop();
+}
+
+#[test]
+fn test_rpc_default_units_btc_gettxout_mines_coin() {
+    // gettxout requires a real UTXO. Mine a block to get a coinbase we can
+    // query, then assert the default (btc) response has no `_units` tag and
+    // emits `value` as a float.
+    let mut node = TestNode::start(&[]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    node.rpc_call_with_params(
+        "generatetoaddress",
+        vec![serde_json::json!(1), serde_json::json!(addr)],
+    )
+    .unwrap();
+    // Get the coinbase txid from the mined block.
+    let hash = node.rpc_call_with_params("getblockhash", vec![serde_json::json!(1)]).unwrap();
+    let block = node.rpc_call_with_params(
+        "getblock",
+        vec![hash["result"].clone(), serde_json::json!(2)],
+    );
+    // getblock verbose=2 may not fully decode; fall back to verbose=1 for txids.
+    let block = if block.as_ref().map(|b| b["result"]["tx"].is_array()).unwrap_or(false) {
+        block.unwrap()
+    } else {
+        node.rpc_call_with_params(
+            "getblock",
+            vec![hash["result"].clone(), serde_json::json!(1)],
+        )
+        .unwrap()
+    };
+    let coinbase_txid = block["result"]["tx"][0].as_str().expect("coinbase txid").to_string();
+
+    let out = node
+        .rpc_call_with_params(
+            "gettxout",
+            vec![serde_json::json!(coinbase_txid), serde_json::json!(0)],
+        )
+        .unwrap();
+    let result = &out["result"];
+    assert!(
+        result.get("_units").is_none(),
+        "default gettxout must not include `_units`, got: {}",
+        result
+    );
+    let value = &result["value"];
+    assert!(
+        value.is_f64(),
+        "default gettxout.value should be a float (BTC), got: {}",
+        value
+    );
+    node.stop();
+}
+
+#[test]
+fn test_rpc_default_units_sats_emits_integers() {
+    // --rpcdefaultunits=sats flips mempoolminfee to an integer sat/kvB
+    // value, and estimatesmartfee.feerate also becomes integer.
+    let mut node = TestNode::start(&["--rpcdefaultunits=sats"]);
+    let info = node.rpc_call("getmempoolinfo").unwrap();
+    let fee = &info["result"]["mempoolminfee"];
+    assert!(
+        fee.as_u64().is_some(),
+        "with rpcdefaultunits=sats, mempoolminfee should be integer sat/kvB, got: {}",
+        fee
+    );
+    let est = node
+        .rpc_call_with_params("estimatesmartfee", vec![serde_json::json!(6)])
+        .unwrap();
+    let feerate = &est["result"]["feerate"];
+    assert!(
+        feerate.as_u64().is_some(),
+        "estimatesmartfee.feerate should be integer sat/kvB, got: {}",
+        feerate
+    );
+    // Response should advertise the unit.
+    assert_eq!(est["result"]["_units"], "sats");
+    node.stop();
+}
+
+#[test]
 fn test_reindex() {
     // Mine blocks, stop, restart with -reindex, verify chain is rebuilt from flat files
     let rpcport = find_available_port();
