@@ -815,7 +815,8 @@ pub async fn start(
     module.register_method("help", |_params, _ctx, _extensions| {
         let methods = vec![
             "addnode", "clearbanned", "decoderawtransaction", "decodescript",
-            "disconnectnode", "estimatesmartfee", "generateblock", "generatetoaddress",
+            "disconnectnode", "estimatefees", "estimatesmartfee", "generateblock",
+            "generatetoaddress",
             "getaddednodeinfo", "getbestblockhash", "getblock", "getblockchaininfo",
             "getblockcount", "getblockhash", "getblockheader", "getblockstats",
             "getblocktemplate", "getchaintips", "getchaintxstats", "getconnectioncount",
