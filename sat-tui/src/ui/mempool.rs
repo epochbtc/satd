@@ -127,7 +127,7 @@ fn draw_histogram(f: &mut Frame, area: Rect, state: &AppState) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray))
         .title(Span::styled(
-            " Feerate histogram ",
+            " Feerate histogram (vbytes per sat/vB band) ",
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(area);
