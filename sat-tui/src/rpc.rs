@@ -153,6 +153,12 @@ impl RpcClient {
         self.call("getreorghistory", &[serde_json::json!(7 * 86_400)]).await
     }
 
+    pub async fn get_mempool_history(&self) -> Result<serde_json::Value, RpcError> {
+        // 40-minute window: at 10s snapshot cadence + 256-cap default ring
+        // that's the full depth. Larger values just waste bytes on the wire.
+        self.call("getmempoolhistory", &[serde_json::json!(2400)]).await
+    }
+
     pub async fn get_block_stats(&self, height: u32) -> Result<serde_json::Value, RpcError> {
         self.call("getblockstats", &[serde_json::json!(height.to_string())]).await
     }

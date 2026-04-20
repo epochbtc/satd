@@ -25,6 +25,36 @@ pub struct Loaded {
 pub enum ViewMode {
     Ibd,
     Steady,
+    Mempool,
+}
+
+/// One snapshot from getmempoolhistory.
+#[derive(Debug, Clone)]
+pub struct MempoolSnapshot {
+    pub ts_unix_secs: u64,
+    pub size: u64,
+    pub bytes: u64,
+    pub min_fee_rate_sat_per_kvb: u64,
+    pub max_fee_rate_sat_per_kvb: u64,
+    pub histogram: Vec<HistogramBucket>,
+}
+
+#[derive(Debug, Clone)]
+pub struct HistogramBucket {
+    pub feerate_sat_per_kvb: u64,
+    pub weight: u64,
+}
+
+/// Top-N mempool entry by ancestor feerate (derived from getrawmempool verbose).
+#[derive(Debug, Clone)]
+pub struct MempoolTopEntry {
+    pub txid: String,
+    pub vsize: u64,
+    /// sat/vB.
+    pub ancestor_feerate: f64,
+    pub ancestor_count: u32,
+    pub descendant_count: u32,
+    pub age_secs: u64,
 }
 
 /// One reorg record from getreorghistory.
@@ -153,6 +183,13 @@ pub struct AppState {
     // Reorg history (from getreorghistory)
     pub reorg_history: Vec<ReorgEntry>,
 
+    // Mempool-pane data
+    pub mempool_history: Vec<MempoolSnapshot>,
+    /// False when the node started without a writable history log.
+    pub mempool_history_available: bool,
+    pub mempool_top: Vec<MempoolTopEntry>,
+    pub selected_mempool_row: usize,
+
     // Computed deltas
     pub blocks_per_sec: f64,
     pub headers_per_sec: f64,
@@ -231,6 +268,11 @@ impl AppState {
             last_shutdown: None,
 
             reorg_history: Vec::new(),
+
+            mempool_history: Vec::new(),
+            mempool_history_available: true,
+            mempool_top: Vec::new(),
+            selected_mempool_row: 0,
 
             blocks_per_sec: 0.0,
             headers_per_sec: 0.0,
@@ -516,27 +558,128 @@ impl AppState {
         self.uptime_secs = v.as_u64();
     }
 
-    /// Update mempool size distribution from getrawmempool true response.
+    /// Update mempool size distribution + top-N from getrawmempool verbose response.
     pub fn update_mempool_dist(&mut self, v: &serde_json::Value) {
         self.loaded.mempool_dist = true;
-        if let Some(obj) = v.as_object() {
-            let mut dist = [0u32; 8];
-            for entry in obj.values() {
-                let vsize = entry.get("vsize").and_then(|s| s.as_u64()).unwrap_or(0);
-                let bucket = match vsize {
-                    0..100 => 0,
-                    100..250 => 1,
-                    250..500 => 2,
-                    500..1_000 => 3,
-                    1_000..5_000 => 4,
-                    5_000..10_000 => 5,
-                    10_000..50_000 => 6,
-                    _ => 7,
-                };
-                dist[bucket] += 1;
-            }
-            self.mempool_size_dist = Some(dist);
+        let Some(obj) = v.as_object() else { return };
+
+        // Size distribution (existing vsize-bucket sparkline for steady view).
+        let mut dist = [0u32; 8];
+        for entry in obj.values() {
+            let vsize = entry.get("vsize").and_then(|s| s.as_u64()).unwrap_or(0);
+            let bucket = match vsize {
+                0..100 => 0,
+                100..250 => 1,
+                250..500 => 2,
+                500..1_000 => 3,
+                1_000..5_000 => 4,
+                5_000..10_000 => 5,
+                10_000..50_000 => 6,
+                _ => 7,
+            };
+            dist[bucket] += 1;
         }
+        self.mempool_size_dist = Some(dist);
+
+        // Top-N by ancestor feerate (ancestorfees is in sats, ancestorsize
+        // in vbytes → feerate in sat/vB directly).
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mut entries: Vec<MempoolTopEntry> = obj
+            .iter()
+            .filter_map(|(txid, e)| {
+                let ancestor_fees = e.get("ancestorfees")?.as_u64()?;
+                let ancestor_size = e.get("ancestorsize")?.as_u64().unwrap_or(0);
+                let vsize = e.get("vsize")?.as_u64().unwrap_or(0);
+                let ancestor_feerate = if ancestor_size > 0 {
+                    ancestor_fees as f64 / ancestor_size as f64
+                } else {
+                    0.0
+                };
+                Some(MempoolTopEntry {
+                    txid: txid.clone(),
+                    vsize,
+                    ancestor_feerate,
+                    ancestor_count: e.get("ancestorcount").and_then(|c| c.as_u64()).unwrap_or(1) as u32,
+                    descendant_count: e.get("descendantcount").and_then(|c| c.as_u64()).unwrap_or(1) as u32,
+                    age_secs: e.get("time")
+                        .and_then(|t| t.as_u64())
+                        .map(|t| now.saturating_sub(t))
+                        .unwrap_or(0),
+                })
+            })
+            .collect();
+        // Sort by ancestor feerate descending, tiebreak by smaller vsize.
+        entries.sort_by(|a, b| {
+            b.ancestor_feerate
+                .partial_cmp(&a.ancestor_feerate)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.vsize.cmp(&b.vsize))
+        });
+        entries.truncate(50);
+        self.mempool_top = entries;
+        if self.selected_mempool_row >= self.mempool_top.len() {
+            self.selected_mempool_row = self.mempool_top.len().saturating_sub(1);
+        }
+    }
+
+    /// Update from getmempoolhistory: { since_secs, available, snapshots: [...] }.
+    pub fn update_mempool_history(&mut self, v: &serde_json::Value) {
+        self.mempool_history_available = v
+            .get("available")
+            .and_then(|b| b.as_bool())
+            .unwrap_or(false);
+        let Some(snaps) = v.get("snapshots").and_then(|a| a.as_array()) else {
+            return;
+        };
+        let mut out: Vec<MempoolSnapshot> = snaps
+            .iter()
+            .filter_map(|s| {
+                let histogram: Vec<HistogramBucket> = s
+                    .get("histogram")
+                    .and_then(|h| h.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|b| {
+                                Some(HistogramBucket {
+                                    feerate_sat_per_kvb: b.get("feerate_sat_per_kvb")?.as_u64()?,
+                                    weight: b.get("weight")?.as_u64()?,
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                Some(MempoolSnapshot {
+                    ts_unix_secs: s.get("ts_unix_secs")?.as_u64()?,
+                    size: s.get("size")?.as_u64()?,
+                    bytes: s.get("bytes")?.as_u64()?,
+                    min_fee_rate_sat_per_kvb: s.get("min_fee_rate_sat_per_kvb")?.as_u64()?,
+                    max_fee_rate_sat_per_kvb: s.get("max_fee_rate_sat_per_kvb")?.as_u64()?,
+                    histogram,
+                })
+            })
+            .collect();
+        // Oldest-first for sparkline left-to-right.
+        out.sort_by_key(|s| s.ts_unix_secs);
+        self.mempool_history = out;
+    }
+
+    /// Most recent snapshot delta (net tx and byte flow since previous snapshot).
+    /// Returns (delta_tx, delta_bytes, interval_secs).
+    pub fn latest_mempool_delta(&self) -> Option<(i64, i64, u64)> {
+        let n = self.mempool_history.len();
+        if n < 2 {
+            return None;
+        }
+        let cur = &self.mempool_history[n - 1];
+        let prev = &self.mempool_history[n - 2];
+        Some((
+            cur.size as i64 - prev.size as i64,
+            cur.bytes as i64 - prev.bytes as i64,
+            cur.ts_unix_secs.saturating_sub(prev.ts_unix_secs),
+        ))
     }
 
     /// Update from getsysteminfo response.
@@ -737,6 +880,101 @@ mod tests {
         let mut st = AppState::new();
         st.update_system_info(&v);
         assert_eq!(st.last_shutdown.as_deref(), Some("dirty"));
+    }
+
+    #[test]
+    fn update_mempool_history_parses_and_orders() {
+        let v = json!({
+            "since_secs": 2400,
+            "available": true,
+            "snapshots": [
+                {
+                    "ts_unix_secs": 1_700_000_020,
+                    "size": 120,
+                    "bytes": 50_000,
+                    "min_fee_rate_sat_per_kvb": 1_000,
+                    "max_fee_rate_sat_per_kvb": 50_000,
+                    "histogram": [
+                        {"feerate_sat_per_kvb": 2_000, "weight": 4_000},
+                        {"feerate_sat_per_kvb": 10_000, "weight": 2_000},
+                    ],
+                },
+                {
+                    "ts_unix_secs": 1_700_000_010,
+                    "size": 100,
+                    "bytes": 40_000,
+                    "min_fee_rate_sat_per_kvb": 1_000,
+                    "max_fee_rate_sat_per_kvb": 40_000,
+                    "histogram": [],
+                },
+            ],
+        });
+        let mut st = AppState::new();
+        st.update_mempool_history(&v);
+        assert!(st.mempool_history_available);
+        assert_eq!(st.mempool_history.len(), 2);
+        // Oldest-first after sort so sparkline reads left→right chronologically.
+        assert_eq!(st.mempool_history[0].ts_unix_secs, 1_700_000_010);
+        assert_eq!(st.mempool_history[1].ts_unix_secs, 1_700_000_020);
+        assert_eq!(st.mempool_history[1].histogram.len(), 2);
+    }
+
+    #[test]
+    fn update_mempool_history_available_false() {
+        let v = json!({
+            "since_secs": 2400,
+            "available": false,
+            "snapshots": [],
+        });
+        let mut st = AppState::new();
+        st.update_mempool_history(&v);
+        assert!(!st.mempool_history_available);
+        assert!(st.mempool_history.is_empty());
+    }
+
+    #[test]
+    fn latest_mempool_delta_tracks_consecutive_snapshots() {
+        let mut st = AppState::new();
+        assert!(st.latest_mempool_delta().is_none());
+        let v = json!({
+            "since_secs": 20,
+            "available": true,
+            "snapshots": [
+                {"ts_unix_secs": 100, "size": 10, "bytes": 5_000,
+                 "min_fee_rate_sat_per_kvb": 1_000, "max_fee_rate_sat_per_kvb": 5_000,
+                 "histogram": []},
+                {"ts_unix_secs": 110, "size": 15, "bytes": 7_500,
+                 "min_fee_rate_sat_per_kvb": 1_000, "max_fee_rate_sat_per_kvb": 5_000,
+                 "histogram": []},
+            ],
+        });
+        st.update_mempool_history(&v);
+        let (dtx, dbytes, secs) = st.latest_mempool_delta().expect("delta");
+        assert_eq!(dtx, 5);
+        assert_eq!(dbytes, 2_500);
+        assert_eq!(secs, 10);
+    }
+
+    #[test]
+    fn update_mempool_dist_computes_top_n_sorted_by_ancestor_feerate() {
+        let v = json!({
+            "lowest": {"fees": {"base": 0.00001}, "vsize": 200, "ancestorfees": 2000, "ancestorsize": 200,
+                       "ancestorcount": 1, "descendantcount": 1, "time": 1_700_000_000},
+            "highest": {"fees": {"base": 0.001}, "vsize": 250, "ancestorfees": 100_000, "ancestorsize": 250,
+                        "ancestorcount": 1, "descendantcount": 1, "time": 1_700_000_000},
+            "cpfp_child": {"fees": {"base": 0.0001}, "vsize": 300, "ancestorfees": 50_000, "ancestorsize": 500,
+                           "ancestorcount": 2, "descendantcount": 1, "time": 1_700_000_000},
+        });
+        let mut st = AppState::new();
+        st.update_mempool_dist(&v);
+        assert_eq!(st.mempool_top.len(), 3);
+        // 100_000/250 = 400 sat/vB (highest)
+        // 50_000/500 = 100 sat/vB
+        // 2_000/200 = 10 sat/vB
+        assert_eq!(st.mempool_top[0].txid, "highest");
+        assert_eq!(st.mempool_top[1].txid, "cpfp_child");
+        assert_eq!(st.mempool_top[2].txid, "lowest");
+        assert!(st.mempool_top[0].ancestor_feerate > st.mempool_top[1].ancestor_feerate);
     }
 
     #[test]

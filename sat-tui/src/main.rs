@@ -166,6 +166,7 @@ fn run_app(
                     match st.active_mode() {
                         ViewMode::Ibd => ui::ibd::draw(f, &st),
                         ViewMode::Steady => ui::steady::draw(f, &st),
+                        ViewMode::Mempool => ui::mempool::draw(f, &st),
                     }
                 }
             })?;
@@ -198,16 +199,31 @@ fn run_app(
                     }
                     KeyCode::Char('1') => st.toggle_mode(ViewMode::Ibd),
                     KeyCode::Char('2') => st.toggle_mode(ViewMode::Steady),
-                    KeyCode::Up => {
-                        if st.selected_peer > 0 {
-                            st.selected_peer -= 1;
+                    KeyCode::Char('3') => st.toggle_mode(ViewMode::Mempool),
+                    KeyCode::Up => match st.active_mode() {
+                        ViewMode::Mempool => {
+                            if st.selected_mempool_row > 0 {
+                                st.selected_mempool_row -= 1;
+                            }
                         }
-                    }
-                    KeyCode::Down => {
-                        if st.selected_peer + 1 < st.peers.len() {
-                            st.selected_peer += 1;
+                        _ => {
+                            if st.selected_peer > 0 {
+                                st.selected_peer -= 1;
+                            }
                         }
-                    }
+                    },
+                    KeyCode::Down => match st.active_mode() {
+                        ViewMode::Mempool => {
+                            if st.selected_mempool_row + 1 < st.mempool_top.len() {
+                                st.selected_mempool_row += 1;
+                            }
+                        }
+                        _ => {
+                            if st.selected_peer + 1 < st.peers.len() {
+                                st.selected_peer += 1;
+                            }
+                        }
+                    },
                     _ => {}
                 }
         }
@@ -302,7 +318,7 @@ async fn poller(rpc: Arc<RpcClient>, state: Arc<Mutex<AppState>>) {
         if slow_counter >= 3 && is_steady {
             slow_counter = 0;
 
-            let (fees_res, mining_res, txstats_res, uptime_res, blockstats_res, rawmempool_res, utxo_res, reorgs_res) = tokio::join!(
+            let (fees_res, mining_res, txstats_res, uptime_res, blockstats_res, rawmempool_res, utxo_res, reorgs_res, mhist_res) = tokio::join!(
                 rpc.estimate_fees(),
                 rpc.get_mining_info(),
                 rpc.get_chain_tx_stats(),
@@ -314,6 +330,7 @@ async fn poller(rpc: Arc<RpcClient>, state: Arc<Mutex<AppState>>) {
                 rpc.get_raw_mempool_verbose(),
                 rpc.get_tx_out_set_info(),
                 rpc.get_reorg_history(),
+                rpc.get_mempool_history(),
             );
 
             let mut st = state.lock().unwrap();
@@ -325,6 +342,7 @@ async fn poller(rpc: Arc<RpcClient>, state: Arc<Mutex<AppState>>) {
             if let Ok(v) = rawmempool_res { st.update_mempool_dist(&v); }
             if let Ok(v) = utxo_res { st.update_utxo_info(&v); }
             if let Ok(v) = reorgs_res { st.update_reorg_history(&v); }
+            if let Ok(v) = mhist_res { st.update_mempool_history(&v); }
         }
     }
 }
