@@ -12,15 +12,17 @@ pub fn get_mempool_entries_bulk(ctx: &McpContext, txids: &[String]) -> String {
 }
 
 /// Time-windowed mempool history — returns an array of snapshots
-/// captured by the snapshotter task. Returns an empty array if the
-/// history ring isn't wired (e.g., in tests).
+/// captured by the snapshotter task. `available: false` when the
+/// history log failed to open at startup (so callers can tell a
+/// disabled feature apart from an empty ring).
 pub fn get_mempool_history(ctx: &McpContext, since_secs: u64) -> String {
-    let snapshots = match &ctx.mempool_history {
-        Some(h) => h.history(since_secs),
-        None => Vec::new(),
+    let (snapshots, available) = match &ctx.mempool_history {
+        Some(h) => (h.history(since_secs), true),
+        None => (Vec::new(), false),
     };
     let result = json!({
         "since_secs": since_secs,
+        "available": available,
         "snapshots": snapshots,
     });
     serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string())

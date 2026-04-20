@@ -20,6 +20,11 @@ pub enum EvictReason {
     FullPool,
     /// Evicted by `remove_expired` because it aged past `expiry_secs`.
     Expiry,
+    /// A block connected that spends inputs this tx also spends — the
+    /// chain, not policy, retired the tx. Distinct from `FullPool` so
+    /// operators aren't misled into thinking the mempool is under
+    /// pressure.
+    BlockConflict,
 }
 
 /// Event emitted on a mempool state transition. Serialized to the WS
@@ -108,13 +113,16 @@ mod tests {
 
     #[test]
     fn leave_evicted_reason_snake_case() {
-        let ev = MempoolEvent::LeaveEvicted {
-            txid: tx(3),
-            reason: EvictReason::FullPool,
-        };
-        let j = serde_json::to_value(&ev).unwrap();
-        assert_eq!(j["kind"], "leave_evicted");
-        assert_eq!(j["reason"], "full_pool");
+        for (reason, expected) in [
+            (EvictReason::FullPool, "full_pool"),
+            (EvictReason::Expiry, "expiry"),
+            (EvictReason::BlockConflict, "block_conflict"),
+        ] {
+            let ev = MempoolEvent::LeaveEvicted { txid: tx(3), reason };
+            let j = serde_json::to_value(&ev).unwrap();
+            assert_eq!(j["kind"], "leave_evicted");
+            assert_eq!(j["reason"], expected);
+        }
     }
 
     #[test]

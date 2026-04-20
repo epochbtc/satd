@@ -532,9 +532,10 @@ impl Mempool {
                 }
 
                 // Also remove any mempool txs whose inputs are now
-                // double-spent by the block. Those are full evictions
-                // (not a confirmation, not an RBF — the chain itself
-                // replaced them), surfaced as `LeaveEvicted { FullPool }`.
+                // double-spent by the block. The chain — not policy —
+                // retired these, surfaced as
+                // `LeaveEvicted { BlockConflict }` so operators don't
+                // read them as mempool pressure.
                 if !tx.is_coinbase() {
                     for input in &tx.input {
                         if let Some(conflict_txid) =
@@ -563,7 +564,7 @@ impl Mempool {
         for txid in &evicted_conflicts {
             self.emit(MempoolEvent::LeaveEvicted {
                 txid: *txid,
-                reason: EvictReason::FullPool,
+                reason: EvictReason::BlockConflict,
             });
         }
     }
@@ -1390,6 +1391,111 @@ mod tests {
         let info = mp.info();
         assert_eq!(info.size, 0);
         assert_eq!(info.bytes, 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_for_block_conflict_emits_block_conflict_not_full_pool() {
+        use bitcoin::blockdata::locktime::absolute::LockTime;
+        use bitcoin::hashes::Hash;
+        use bitcoin::{Amount, ScriptBuf, Sequence, TxIn, TxOut, Witness, transaction};
+
+        let (_cs, mp, dir) = make_test_env();
+        let (event_tx, mut event_rx) =
+            tokio::sync::broadcast::channel::<MempoolEvent>(64);
+        mp.set_event_sender(event_tx);
+
+        // A mempool tx spending UTXO X. We bypass accept_transaction
+        // validation and wire the state by hand — the scenario we need
+        // is "tx is in the mempool, a conflicting block arrives" and
+        // that state is awkward to reach through the public API.
+        let contested = OutPoint {
+            txid: bitcoin::Txid::from_raw_hash(
+                bitcoin::hashes::sha256d::Hash::from_byte_array([7u8; 32]),
+            ),
+            vout: 0,
+        };
+        let mempool_tx = Transaction {
+            version: transaction::Version(2),
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: contested,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let mempool_txid = mempool_tx.compute_txid();
+        {
+            let mut inner = mp.inner.write().unwrap();
+            inner.spends.insert(contested, mempool_txid);
+            inner.entries.insert(
+                mempool_txid,
+                MempoolEntry {
+                    tx: mempool_tx,
+                    fee: 500,
+                    weight: 400,
+                    fee_rate: 1_250,
+                    time: 0,
+                    fee_delta: 0,
+                    sigop_cost: 0,
+                },
+            );
+        }
+
+        // Build a block containing a different tx that spends the same
+        // UTXO X — chain-induced conflict.
+        let block_tx = Transaction {
+            version: transaction::Version(2),
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: contested,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(900),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        // Minimum-viable block: take regtest genesis and append our tx.
+        let mut block = bitcoin::constants::genesis_block(bitcoin::Network::Regtest);
+        block.txdata.push(block_tx);
+
+        mp.remove_for_block(&block, 123);
+
+        // Consume events until we see the LeaveEvicted for mempool_txid.
+        // The broadcast is synchronous in-process; a handful of recv
+        // iterations is enough.
+        let mut saw_block_conflict = false;
+        for _ in 0..8 {
+            match event_rx.try_recv() {
+                Ok(MempoolEvent::LeaveEvicted { txid, reason })
+                    if txid == mempool_txid =>
+                {
+                    assert_eq!(
+                        reason,
+                        EvictReason::BlockConflict,
+                        "chain-induced removal must be BlockConflict, not {:?}",
+                        reason
+                    );
+                    saw_block_conflict = true;
+                    break;
+                }
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
+        assert!(
+            saw_block_conflict,
+            "expected a LeaveEvicted{{BlockConflict}} event for the conflicting mempool tx"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

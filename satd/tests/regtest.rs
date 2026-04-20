@@ -3177,8 +3177,11 @@ fn test_getmempoolhistory_returns_snapshots_shape() {
     let result = response["result"].as_object().unwrap();
     assert!(result.contains_key("since_secs"));
     assert!(result.contains_key("snapshots"));
+    assert!(result.contains_key("available"));
     assert!(result["snapshots"].is_array());
     assert_eq!(result["since_secs"].as_u64(), Some(3_600));
+    // History log opens successfully on a fresh node so available=true.
+    assert_eq!(result["available"].as_bool(), Some(true));
 
     // Custom window.
     let response2 = node

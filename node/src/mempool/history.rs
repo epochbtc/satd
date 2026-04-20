@@ -40,14 +40,46 @@ pub struct MempoolSnapshot {
     pub histogram: Vec<HistogramBucket>,
 }
 
+/// Dedupe signature for `record_if_changed`. Captures everything
+/// semantically meaningful about a snapshot *except* the timestamp,
+/// so a snapshot where the histogram shifted but size/bytes/extremes
+/// stayed the same still gets recorded.
+#[derive(Clone, PartialEq, Eq)]
+struct SnapshotSig {
+    size: usize,
+    bytes: usize,
+    min_fee_rate_sat_per_kvb: u64,
+    max_fee_rate_sat_per_kvb: u64,
+    /// Flattened histogram buckets: (feerate_sat_per_kvb, weight). A
+    /// Vec of tuples is Eq without needing to derive traits on the
+    /// public `HistogramBucket` type.
+    histogram: Vec<(u64, u64)>,
+}
+
+impl SnapshotSig {
+    fn from(snapshot: &MempoolSnapshot) -> Self {
+        Self {
+            size: snapshot.size,
+            bytes: snapshot.bytes,
+            min_fee_rate_sat_per_kvb: snapshot.min_fee_rate_sat_per_kvb,
+            max_fee_rate_sat_per_kvb: snapshot.max_fee_rate_sat_per_kvb,
+            histogram: snapshot
+                .histogram
+                .iter()
+                .map(|b| (b.feerate_sat_per_kvb, b.weight))
+                .collect(),
+        }
+    }
+}
+
 /// In-process mempool history ring + append-only JSONL log.
 pub struct MempoolHistory {
     path: PathBuf,
     ring: Mutex<VecDeque<MempoolSnapshot>>,
     capacity: usize,
-    /// Last entry's (size, bytes, min, max) tuple — used to skip
-    /// writing an identical snapshot when nothing changed.
-    last_sig: Mutex<Option<(usize, usize, u64, u64)>>,
+    /// Full-content signature of the last-written snapshot (minus the
+    /// timestamp) — used to skip writing an identical snapshot.
+    last_sig: Mutex<Option<SnapshotSig>>,
 }
 
 impl MempoolHistory {
@@ -56,9 +88,7 @@ impl MempoolHistory {
     pub fn open(net_datadir: &std::path::Path, capacity: usize) -> std::io::Result<Self> {
         let path = net_datadir.join("mempool_history.log");
         let ring = seed_ring_from_file(&path, capacity);
-        let last_sig = ring
-            .back()
-            .map(|s| (s.size, s.bytes, s.min_fee_rate_sat_per_kvb, s.max_fee_rate_sat_per_kvb));
+        let last_sig = ring.back().map(SnapshotSig::from);
         Ok(Self {
             path,
             ring: Mutex::new(ring),
@@ -68,17 +98,14 @@ impl MempoolHistory {
     }
 
     /// Record a snapshot if it differs from the previous one. Returns
-    /// `true` if a new record was persisted.
+    /// `true` if a new record was persisted. Dedupe compares the full
+    /// snapshot content (minus timestamp), so histogram-only shifts
+    /// still get recorded even if size/bytes/extremes are unchanged.
     pub fn record_if_changed(&self, snapshot: MempoolSnapshot) -> bool {
-        let sig = (
-            snapshot.size,
-            snapshot.bytes,
-            snapshot.min_fee_rate_sat_per_kvb,
-            snapshot.max_fee_rate_sat_per_kvb,
-        );
+        let sig = SnapshotSig::from(&snapshot);
         {
             let mut last = self.last_sig.lock().unwrap();
-            if *last == Some(sig) {
+            if last.as_ref() == Some(&sig) {
                 return false;
             }
             *last = Some(sig);
@@ -243,6 +270,47 @@ mod tests {
         assert!(log.record_if_changed(snap(1, 5)));
         assert!(!log.record_if_changed(snap(2, 5)), "identical sig must dedupe");
         assert!(log.record_if_changed(snap(3, 6)), "different size must record");
+    }
+
+    #[test]
+    fn record_if_changed_sees_histogram_only_shifts() {
+        // Regression: size/bytes/min/max can stay constant while the
+        // histogram reshuffles (e.g., one 10-sat/vB tx replaced by one
+        // 8-sat/vB tx — same count, same bytes, same extremes if those
+        // happened to coincide). The dedupe signature must include the
+        // histogram so these snapshots still record.
+        let dir = tempdir().unwrap();
+        let log = MempoolHistory::open(dir.path(), 10).unwrap();
+        let a = MempoolSnapshot {
+            ts_unix_secs: 1,
+            size: 2,
+            bytes: 500,
+            min_fee_rate_sat_per_kvb: 5_000,
+            max_fee_rate_sat_per_kvb: 10_000,
+            histogram: vec![
+                HistogramBucket { feerate_sat_per_kvb: 5_000, weight: 400 },
+                HistogramBucket { feerate_sat_per_kvb: 10_000, weight: 400 },
+            ],
+        };
+        let b = MempoolSnapshot {
+            ts_unix_secs: 2,
+            size: 2,
+            bytes: 500,
+            min_fee_rate_sat_per_kvb: 5_000,
+            max_fee_rate_sat_per_kvb: 10_000,
+            // Same size/bytes/extremes, but weight moved between buckets.
+            histogram: vec![
+                HistogramBucket { feerate_sat_per_kvb: 5_000, weight: 700 },
+                HistogramBucket { feerate_sat_per_kvb: 10_000, weight: 100 },
+            ],
+        };
+        assert!(log.record_if_changed(a));
+        assert!(
+            log.record_if_changed(b),
+            "histogram-only change must be recorded, not deduped"
+        );
+        let h = log.history(u64::MAX);
+        assert_eq!(h.len(), 2, "both snapshots must land in the ring");
     }
 
     #[test]

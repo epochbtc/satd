@@ -30,7 +30,10 @@ pub struct RpcContext {
     /// Secret fields (passwords) are already redacted by the producer.
     pub effective_config: serde_json::Value,
     /// Ring of periodic mempool snapshots for `getmempoolhistory`.
-    pub mempool_history: Arc<MempoolHistory>,
+    /// `None` when the history log failed to open at startup — in that
+    /// case the RPC returns an empty snapshot list rather than lying
+    /// with a synthetic fallback store.
+    pub mempool_history: Option<Arc<MempoolHistory>>,
 }
 
 /// Which data source `estimatesmartfee` / `estimatefees` draws from.
@@ -118,7 +121,7 @@ pub async fn start(
     shutdown_tx: watch::Sender<bool>,
     last_shutdown_clean: bool,
     effective_config: serde_json::Value,
-    mempool_history: Arc<MempoolHistory>,
+    mempool_history: Option<Arc<MempoolHistory>>,
 ) -> Result<ServerHandle, Box<dyn std::error::Error + Send + Sync>> {
     let ctx = Arc::new(RpcContext {
         chain_state,
@@ -936,18 +939,25 @@ pub async fn start(
 
     module.register_method("getmempoolhistory", |params, ctx, _extensions| {
         // `getmempoolhistory [since_secs]` — default 3600 (1 h).
+        // Returns `available: false` with an empty list when the history
+        // log failed to open at startup, so operators can tell a
+        // temporarily-empty ring apart from a disabled feature.
         let mut seq = params.sequence();
         let since_secs: u64 = seq
             .optional_next()
             .unwrap_or(Some(3_600))
             .unwrap_or(3_600);
-        let snapshots = ctx.mempool_history.history(since_secs);
+        let (snapshots, available) = match &ctx.mempool_history {
+            Some(h) => (h.history(since_secs), true),
+            None => (Vec::new(), false),
+        };
         let arr: Vec<serde_json::Value> = snapshots
             .into_iter()
             .map(|s| serde_json::to_value(s).unwrap_or(serde_json::Value::Null))
             .collect();
         Ok::<_, ErrorObjectOwned>(serde_json::json!({
             "since_secs": since_secs,
+            "available": available,
             "snapshots": arr,
         }))
     })?;

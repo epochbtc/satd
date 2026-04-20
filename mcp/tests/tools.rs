@@ -695,13 +695,14 @@ mod tool_router {
     }
 
     #[test]
-    fn test_tool_router_lists_27_tools() {
+    fn test_tool_router_lists_expected_tools() {
+        // 27 original + 8 ergonomics-backfill (#68) = 35
         let server = make_server();
         let tools = server.list_tools_from_router();
         assert_eq!(
             tools.len(),
-            27,
-            "Expected 27 tools, got {}. Tools: {:?}",
+            35,
+            "Expected 35 tools, got {}. Tools: {:?}",
             tools.len(),
             tools.iter().map(|t| &*t.name).collect::<Vec<_>>()
         );
@@ -844,13 +845,15 @@ mod ergonomics {
     }
 
     #[test]
-    fn test_get_mempool_history_empty_when_unwired() {
-        // make_test_ctx sets mempool_history = None; the tool should
-        // gracefully return an empty snapshots array.
+    fn test_get_mempool_history_signals_unavailable_when_unwired() {
+        // make_test_ctx sets mempool_history = None; the tool must
+        // return `available: false` so callers can distinguish a
+        // disabled feature from an empty but wired ring.
         let (ctx, _dir) = make_test_ctx();
         let out = mempool::get_mempool_history(&ctx, 3_600);
         let json: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(json["since_secs"], 3_600);
+        assert_eq!(json["available"].as_bool(), Some(false));
         assert!(json["snapshots"].is_array());
         assert_eq!(json["snapshots"].as_array().unwrap().len(), 0);
     }
