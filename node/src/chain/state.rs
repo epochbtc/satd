@@ -88,6 +88,34 @@ struct ChainTip {
     height: u32,
 }
 
+/// Data returned by `perform_reorg` so the caller can build a complete
+/// `ReorgRecord` once side-chain reconnection has finished. Recording
+/// the record at fork-disconnect time (the obvious-but-wrong spot)
+/// would misreport `fork_hash` as the new tip and leave
+/// `reconnected` empty.
+#[derive(Debug, Clone)]
+struct ReorgDisconnectInfo {
+    old_tip: BlockHash,
+    old_height: u32,
+    /// Hashes disconnected, walked old-tip-first toward the fork parent.
+    disconnected: Vec<BlockHash>,
+}
+
+/// Staged reorg record: all the inputs to `ReorgRecord::new` except the
+/// final tip. The tip is appended only after the final triggering
+/// block's `connect_block` + commit + tip update all succeed. Keeping
+/// this in-memory and emitting it last means `getreorghistory` never
+/// shows a record whose claimed new_tip never actually activated.
+struct PendingReorgRecord {
+    fork_height: u32,
+    old_tip: BlockHash,
+    old_height: u32,
+    disconnected: Vec<BlockHash>,
+    /// Side-chain blocks already reconnected + committed, fork-parent-
+    /// first, not yet including the final triggering block.
+    reconnected_so_far: Vec<BlockHash>,
+}
+
 /// Central chain state manager.
 pub struct ChainState {
     store: std::sync::Arc<CoinCache>,
@@ -106,6 +134,10 @@ pub struct ChainState {
     mtp_cache: Mutex<Vec<(u32, u32)>>,
     /// Number of threads for parallel script verification.
     num_threads: usize,
+    /// Persistent reorg history + optional webhook dispatch.
+    /// Lazily initialized by `open_reorg_log` — may be absent in tests
+    /// that don't care about reorg observability.
+    reorg_log: std::sync::OnceLock<std::sync::Arc<crate::chain::reorg_log::ReorgLog>>,
 }
 
 impl ChainState {
@@ -176,6 +208,7 @@ impl ChainState {
                     headers_tip_height: AtomicU32::new(htip),
                     mtp_cache: Mutex::new(Vec::with_capacity(12)),
                     num_threads,
+                    reorg_log: std::sync::OnceLock::new(),
                 });
             }
 
@@ -219,7 +252,20 @@ impl ChainState {
             headers_tip_height: AtomicU32::new(0),
             mtp_cache: Mutex::new(Vec::with_capacity(12)),
             num_threads,
+            reorg_log: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Attach a reorg log. Must be called before the chain state sees
+    /// any reorgs; subsequent calls are no-ops (OnceLock).
+    pub fn attach_reorg_log(&self, log: std::sync::Arc<crate::chain::reorg_log::ReorgLog>) {
+        let _ = self.reorg_log.set(log);
+    }
+
+    /// Access the attached reorg log, if any. None if `attach_reorg_log`
+    /// was never called (the test path).
+    pub fn reorg_log(&self) -> Option<&std::sync::Arc<crate::chain::reorg_log::ReorgLog>> {
+        self.reorg_log.get()
     }
 
     pub fn tip_hash(&self) -> BlockHash {
@@ -585,6 +631,14 @@ impl ChainState {
         &self,
         pre: crate::chain::prefetch::PreprocessedBlock,
     ) -> Result<BlockHash, ChainError> {
+        let trace_id = rand::random::<u32>();
+        let _span = tracing::info_span!(
+            "connect",
+            trace_id = trace_id,
+            height = pre.height,
+            block = %pre.entry.header.block_hash()
+        )
+        .entered();
         // Verify parent is current tip (same check as connect_stored_block)
         let current_tip = self.tip_hash();
         if pre.entry.header.prev_blockhash != current_tip {
@@ -792,6 +846,14 @@ impl ChainState {
             .store
             .get_block_index(hash)
             .ok_or(ChainError::BadPrevBlock)?;
+        let trace_id = rand::random::<u32>();
+        let _span = tracing::info_span!(
+            "connect_stored",
+            trace_id = trace_id,
+            height = entry.height,
+            block = %hash
+        )
+        .entered();
 
         if entry.status != BlockStatus::DataStored {
             return Err(ChainError::Duplicate);
@@ -1013,6 +1075,20 @@ impl ChainState {
     /// Accept a new block into the chain.
     pub fn accept_block(&self, block: &Block) -> Result<BlockHash, ChainError> {
         let block_hash = block.block_hash();
+        let trace_id = rand::random::<u32>();
+        let _span = tracing::info_span!(
+            "accept_block",
+            trace_id = trace_id,
+            block = %block_hash
+        )
+        .entered();
+
+        // Reorg record staged by the side-chain branch below and emitted
+        // only after the final tip-extending connect/commit succeeds. If
+        // that final step fails we never persist the record, which keeps
+        // getreorghistory honest: it always describes reorgs that
+        // actually became the active chain tip.
+        let mut pending_reorg: Option<PendingReorgRecord> = None;
 
         // Check for duplicate (HeaderOnly entries are OK — we're now providing data)
         if let Some(existing) = self.store.get_block_index(&block_hash)
@@ -1123,8 +1199,10 @@ impl ChainState {
                 }
             };
 
-            // Disconnect blocks from current tip down to fork point
-            self.perform_reorg(&fork_entry, current_tip)?;
+            // Disconnect blocks from current tip down to fork point.
+            // The returned info carries the data we need to build an
+            // accurate reorg record once reconnection is complete.
+            let disconnect_info = self.perform_reorg(&fork_entry, current_tip)?;
 
             // Now connect the side chain blocks from fork point up to (but not including)
             // the new block. Collect them first since we need to connect in forward order.
@@ -1140,6 +1218,7 @@ impl ChainState {
                 }
                 to_connect.reverse();
             }
+            let mut reconnected_hashes: Vec<BlockHash> = Vec::with_capacity(to_connect.len() + 1);
             for side_hash in &to_connect {
                 let side_block = self.get_block(side_hash)
                     .ok_or(ChainError::FlatFile("block data missing for reorg connect".to_string()))?;
@@ -1174,8 +1253,21 @@ impl ChainState {
                     tip.hash = *side_hash;
                     tip.height = side_entry.height;
                 }
+                reconnected_hashes.push(*side_hash);
                 tracing::info!(height = side_entry.height, hash = %side_hash, "Reorg: block connected");
             }
+
+            // Stage the reorg record for persistence *after* the final
+            // triggering block's connect+commit succeeds below. Writing it
+            // here would predict a new_tip that might never be reached if
+            // the final `connect_block` fails validation.
+            pending_reorg = Some(PendingReorgRecord {
+                fork_height: fork_entry.height,
+                old_tip: disconnect_info.old_tip,
+                old_height: disconnect_info.old_height,
+                disconnected: disconnect_info.disconnected,
+                reconnected_so_far: reconnected_hashes,
+            });
 
             // Fall through to connect the new block as a tip-extending block
         }
@@ -1211,6 +1303,24 @@ impl ChainState {
             tip.height = new_height;
         }
 
+        // The reorg (if one happened) is now fully complete: disconnect,
+        // all intermediate reconnections, and the final tip-extending
+        // connect have all committed. Persist one complete record with
+        // the real final tip.
+        if let (Some(pending), Some(log)) = (pending_reorg.take(), self.reorg_log.get()) {
+            let mut reconnected = pending.reconnected_so_far;
+            reconnected.push(block_hash);
+            let record = crate::chain::reorg_log::ReorgRecord::new(
+                pending.fork_height,
+                pending.old_tip,
+                block_hash,
+                pending.old_height,
+                pending.disconnected,
+                reconnected,
+            );
+            log.record(record);
+        }
+
         // Update MTP cache with this block's timestamp
         self.push_mtp_cache(new_height, block.header.time);
 
@@ -1226,10 +1336,28 @@ impl ChainState {
 
     /// Disconnect blocks from current tip down to the fork point (parent of the new chain).
     /// All disconnections are batched into a single atomic write.
-    fn perform_reorg(&self, fork_entry: &BlockIndexEntry, old_tip: BlockHash) -> Result<(), ChainError> {
+    fn perform_reorg(
+        &self,
+        fork_entry: &BlockIndexEntry,
+        old_tip: BlockHash,
+    ) -> Result<ReorgDisconnectInfo, ChainError> {
+        let trace_id = rand::random::<u32>();
+        let _span = tracing::info_span!(
+            "reorg",
+            trace_id = trace_id,
+            old_tip = %old_tip,
+            fork_height = fork_entry.height
+        )
+        .entered();
         let fork_hash = fork_entry.header.block_hash();
         let mut current = old_tip;
         let mut combined_batch = crate::storage::StoreBatch::default();
+        let mut disconnected_hashes: Vec<BlockHash> = Vec::new();
+        let old_height = self
+            .store
+            .get_block_index(&old_tip)
+            .map(|e| e.height)
+            .unwrap_or(fork_entry.height);
 
         // Walk back from old tip to fork point, accumulating disconnect batches
         loop {
@@ -1250,6 +1378,7 @@ impl ChainState {
             let batch = disconnect::disconnect_block(&block, &undo, entry.height, prev_hash);
             combined_batch.merge(batch);
 
+            disconnected_hashes.push(current);
             tracing::info!(height = entry.height, hash = %current, "Block disconnected");
             current = prev_hash;
         }
@@ -1264,7 +1393,15 @@ impl ChainState {
             tip.height = fork_entry.height;
         }
 
-        Ok(())
+        // NOTE: We deliberately do NOT persist a reorg record here. The
+        // caller knows the real new-tip and the full reconnected list;
+        // recording at this point would stamp fork_hash as "new tip"
+        // and leave reconnected empty — misleading for operators.
+        Ok(ReorgDisconnectInfo {
+            old_tip,
+            old_height,
+            disconnected: disconnected_hashes,
+        })
     }
     /// Prune old block data files whose blocks are deep enough in the chain.
     /// `keep_blocks` is the number of recent blocks to keep data for.

@@ -24,6 +24,10 @@ pub struct RpcContext {
     /// previous process wrote the marker during a successful flush; `false`
     /// on first boot or after a crash / timed-out shutdown.
     pub last_shutdown_clean: bool,
+    /// Pre-rendered effective-config view for the `getconfig` RPC.
+    /// Computed once at startup (the server does not hot-reload config).
+    /// Secret fields (passwords) are already redacted by the producer.
+    pub effective_config: serde_json::Value,
 }
 
 /// Which data source `estimatesmartfee` / `estimatefees` draws from.
@@ -110,6 +114,7 @@ pub async fn start(
     fee_estimator: Arc<FeeEstimator>,
     shutdown_tx: watch::Sender<bool>,
     last_shutdown_clean: bool,
+    effective_config: serde_json::Value,
 ) -> Result<ServerHandle, Box<dyn std::error::Error + Send + Sync>> {
     let ctx = Arc::new(RpcContext {
         chain_state,
@@ -119,6 +124,7 @@ pub async fn start(
         shutdown_tx,
         start_time: std::time::Instant::now(),
         last_shutdown_clean,
+        effective_config,
     });
 
     let mut module = RpcModule::new(ctx);
@@ -819,11 +825,13 @@ pub async fn start(
             "generatetoaddress",
             "getaddednodeinfo", "getbestblockhash", "getblock", "getblockchaininfo",
             "getblockcount", "getblockhash", "getblockheader", "getblockstats",
-            "getblocktemplate", "getchaintips", "getchaintxstats", "getconnectioncount",
+            "getblocktemplate", "getchaintips", "getchaintxstats", "getconfig",
+            "getconnectioncount",
             "getdifficulty", "getibdprogress", "getmempoolancestors", "getmempooldescendants",
             "getmempoolentry", "getmempoolinfo", "getmemoryinfo", "getmininginfo",
             "getnettotals", "getnetworkhashps", "getnetworkinfo", "getpeerinfo",
-            "getrawmempool", "getrawtransaction", "getrpcinfo", "getsysteminfo", "gettxout",
+            "getrawmempool", "getrawtransaction", "getreorghistory", "getrpcinfo",
+            "getsysteminfo", "gettxout",
             "gettxoutsetinfo", "help", "listbanned", "logging", "ping",
             "preciousblock", "prioritisetransaction",
             "savemempool", "sendrawtransaction", "setban",
@@ -837,6 +845,34 @@ pub async fn start(
     module.register_method("uptime", |_params, ctx, _extensions| {
         let uptime = ctx.start_time.elapsed().as_secs();
         Ok::<_, ErrorObjectOwned>(serde_json::json!(uptime))
+    })?;
+
+    module.register_method("getconfig", |_params, ctx, _extensions| {
+        // Effective node configuration — computed at startup. Passwords
+        // and cookie values are redacted. This is advisory, not a
+        // machine-consumable API: field names track satd internals.
+        Ok::<_, ErrorObjectOwned>(ctx.effective_config.clone())
+    })?;
+
+    module.register_method("getreorghistory", |params, ctx, _extensions| {
+        // `getreorghistory [since_secs]` — default 86400 (24 h).
+        let mut seq = params.sequence();
+        let since_secs: u64 = seq
+            .optional_next()
+            .unwrap_or(Some(86_400))
+            .unwrap_or(86_400);
+        let records = match ctx.chain_state.reorg_log() {
+            Some(log) => log.history(since_secs),
+            None => Vec::new(),
+        };
+        let arr: Vec<serde_json::Value> = records
+            .into_iter()
+            .map(|r| serde_json::to_value(r).unwrap_or(serde_json::Value::Null))
+            .collect();
+        Ok::<_, ErrorObjectOwned>(serde_json::json!({
+            "since_secs": since_secs,
+            "records": arr,
+        }))
     })?;
 
     module.register_method("getsysteminfo", |_params, ctx, _extensions| {

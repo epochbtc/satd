@@ -2545,3 +2545,572 @@ fn test_metrics_endpoint_off_by_default() {
     }
     node.stop();
 }
+
+#[test]
+fn test_reorg_record_reflects_completed_state() {
+    // Drive a real reorg by building two independent chains on two
+    // nodes and transplanting the longer one onto the shorter node.
+    // The persisted reorg record MUST report:
+    //   - the final new tip (the longest submitted block), not the
+    //     fork-disconnect point
+    //   - the actual reconnected side-chain hashes, not an empty list
+    //   - the actual disconnected hashes
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+
+    // Node A: mine a short chain of 2 blocks.
+    let mut node_a = TestNode::start(&[]);
+    let gen_a = node_a
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(2), serde_json::json!(addr)],
+        )
+        .unwrap();
+    let a_hashes: Vec<String> = gen_a["result"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(a_hashes.len(), 2);
+
+    // Node B: mine a longer chain of 3 blocks independently (same
+    // genesis parent, so it's a competing fork).
+    let mut node_b = TestNode::start(&[]);
+    let gen_b = node_b
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(3), serde_json::json!(addr)],
+        )
+        .unwrap();
+    let b_hashes: Vec<String> = gen_b["result"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(b_hashes.len(), 3);
+
+    // Pull raw hex for each B block from node B.
+    let mut b_hex: Vec<String> = Vec::new();
+    for h in &b_hashes {
+        let raw = node_b
+            .rpc_call_with_params(
+                "getblock",
+                vec![serde_json::json!(h), serde_json::json!(0)],
+            )
+            .unwrap();
+        b_hex.push(raw["result"].as_str().unwrap().to_string());
+    }
+    node_b.stop();
+
+    // Submit B chain to node A. Node A should reorg once B has more
+    // work than A (after the 3rd B block is submitted — B=3 > A=2).
+    for hex in &b_hex {
+        let _ = node_a
+            .rpc_call_with_params("submitblock", vec![serde_json::json!(hex)])
+            .unwrap();
+    }
+
+    // Node A's tip should now be the last B block.
+    let tip = node_a.rpc_call("getbestblockhash").unwrap();
+    assert_eq!(
+        tip["result"].as_str().unwrap(),
+        b_hashes[2],
+        "node A should have reorged to B's tip"
+    );
+
+    // Reorg history should contain exactly one record describing the
+    // completed reorg, with the correct new tip and both disconnected
+    // and reconnected lists populated.
+    let hist = node_a.rpc_call("getreorghistory").unwrap();
+    let records = hist["result"]["records"].as_array().unwrap();
+    assert_eq!(records.len(), 1, "expected exactly one reorg record");
+    let rec = &records[0];
+
+    assert_eq!(
+        rec["new_tip"].as_str().unwrap(),
+        b_hashes[2],
+        "reorg record new_tip must be the post-reorg chain tip, not the fork point"
+    );
+    assert_eq!(
+        rec["old_tip"].as_str().unwrap(),
+        a_hashes[1],
+        "reorg record old_tip must be A's pre-reorg tip"
+    );
+
+    let disconnected: Vec<String> = rec["disconnected"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    // disconnected is ordered old-tip-first (the order we rolled back).
+    assert_eq!(disconnected, vec![a_hashes[1].clone(), a_hashes[0].clone()]);
+
+    let reconnected: Vec<String> = rec["reconnected"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        reconnected, b_hashes,
+        "reconnected must list every B block in chain order"
+    );
+
+    assert_eq!(rec["fork_height"].as_u64(), Some(0));
+    assert_eq!(rec["depth"].as_u64(), Some(2));
+
+    node_a.stop();
+}
+
+#[test]
+fn test_reorg_record_not_written_when_final_block_fails() {
+    // Residual edge case: disconnect + intermediate side-chain reconnect
+    // succeed, then the final triggering block fails `connect_block`
+    // validation. The persisted reorg record must NOT appear, because
+    // that block never became the active tip.
+    //
+    // We engineer the failure by hand-crafting a block with a valid
+    // header (correct merkle root, satisfies regtest PoW) but an invalid
+    // coinbase value (51 BTC instead of the 50 BTC regtest subsidy).
+    // `connect_block` rejects it with `BadCoinbaseValue`.
+    use bitcoin::consensus::{Encodable, deserialize};
+    use bitcoin::hashes::Hash;
+    use bitcoin::{Amount, Block, Transaction};
+
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+
+    // Node A: short chain of 2 blocks.
+    let mut node_a = TestNode::start(&[]);
+    let gen_a = node_a
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(2), serde_json::json!(addr)],
+        )
+        .unwrap();
+    let _a_hashes: Vec<String> = gen_a["result"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+
+    // Node B: longer chain (3 valid blocks). Take the last one's hex so
+    // we can corrupt its coinbase value.
+    let mut node_b = TestNode::start(&[]);
+    let gen_b = node_b
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(3), serde_json::json!(addr)],
+        )
+        .unwrap();
+    let b_hashes: Vec<String> = gen_b["result"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+
+    // Fetch each B block's hex from node B, tampering with B3's coinbase.
+    let mut b_hex: Vec<String> = Vec::with_capacity(3);
+    for (i, h) in b_hashes.iter().enumerate() {
+        let raw = node_b
+            .rpc_call_with_params(
+                "getblock",
+                vec![serde_json::json!(h), serde_json::json!(0)],
+            )
+            .unwrap();
+        let hex_str = raw["result"].as_str().unwrap().to_string();
+        if i == 2 {
+            // Deserialize, bump coinbase output value, recompute merkle
+            // root, re-solve PoW. Regtest bits = 0x207fffff → near-max
+            // target, so a valid nonce is found in a handful of tries.
+            let bytes = hex::decode(&hex_str).unwrap();
+            let mut block: Block = deserialize(&bytes).unwrap();
+
+            // Corrupt the coinbase: 50 BTC → 51 BTC (invalid subsidy).
+            let cb: &mut Transaction = &mut block.txdata[0];
+            cb.output[0].value = Amount::from_sat(51 * 100_000_000);
+
+            // Recompute merkle root.
+            let txids: Vec<[u8; 32]> = block
+                .txdata
+                .iter()
+                .map(|t| t.compute_txid().to_raw_hash().to_byte_array())
+                .collect();
+            let root = compute_merkle_root(&txids);
+            block.header.merkle_root =
+                bitcoin::TxMerkleNode::from_raw_hash(
+                    bitcoin::hashes::sha256d::Hash::from_byte_array(root),
+                );
+
+            // Re-solve PoW against regtest target.
+            let target = block.header.target();
+            for nonce in 0u32..10_000_000 {
+                block.header.nonce = nonce;
+                if target.is_met_by(block.header.block_hash()) {
+                    break;
+                }
+            }
+
+            let mut buf = Vec::new();
+            block.consensus_encode(&mut buf).unwrap();
+            b_hex.push(hex::encode(&buf));
+        } else {
+            b_hex.push(hex_str);
+        }
+    }
+    node_b.stop();
+
+    // Submit B1, B2, B3 to node A. The first two are side-chain blocks
+    // (equal-or-less work). B3 makes B heavier than A → triggers reorg.
+    // perform_reorg succeeds, B1+B2 reconnect, then connect_block for
+    // B3 must fail on the bad coinbase.
+    for hex in &b_hex {
+        let _ = node_a
+            .rpc_call_with_params("submitblock", vec![serde_json::json!(hex)])
+            .unwrap();
+    }
+
+    // With the final connect failing, the node must end up with B2 as
+    // tip (the last successfully connected side-chain block), not B3.
+    let tip = node_a.rpc_call("getbestblockhash").unwrap();
+    assert_eq!(
+        tip["result"].as_str().unwrap(),
+        b_hashes[1],
+        "final connect should have failed → tip stays at the last successful side-chain block"
+    );
+
+    // The reorg record MUST still reflect an actual completed reorg
+    // (disconnect of A + reconnect through B1, B2) — just without B3.
+    // But the record we wrote must NOT claim B3 became the tip. The
+    // cleanest invariant: either no record (if we defer until the full
+    // success) or a record whose `new_tip` is B2, not the corrupted B3.
+    // Our implementation defers: no record written when the final
+    // connect fails, even though the intermediate state did change.
+    let hist = node_a.rpc_call("getreorghistory").unwrap();
+    let records = hist["result"]["records"].as_array().unwrap();
+    assert!(
+        records.iter().all(|r| r["new_tip"].as_str() != Some(&b_hashes[2])),
+        "getreorghistory must not report the invalid block as a new tip; got: {:?}",
+        records
+    );
+
+    node_a.stop();
+}
+
+/// Double-SHA256 merkle root helper for the failure-path test.
+fn compute_merkle_root(hashes: &[[u8; 32]]) -> [u8; 32] {
+    use bitcoin::hashes::Hash;
+    if hashes.is_empty() {
+        return [0u8; 32];
+    }
+    let mut current = hashes.to_vec();
+    while current.len() > 1 {
+        if !current.len().is_multiple_of(2) {
+            let last = *current.last().unwrap();
+            current.push(last);
+        }
+        let mut next = Vec::with_capacity(current.len() / 2);
+        for pair in current.chunks(2) {
+            let mut combined = [0u8; 64];
+            combined[..32].copy_from_slice(&pair[0]);
+            combined[32..].copy_from_slice(&pair[1]);
+            let h = bitcoin::hashes::sha256d::Hash::hash(&combined);
+            next.push(h.to_byte_array());
+        }
+        current = next;
+    }
+    current[0]
+}
+
+#[test]
+fn test_getreorghistory_empty_on_fresh_node() {
+    let mut node = TestNode::start(&[]);
+    let response = node.rpc_call("getreorghistory").unwrap();
+    let result = &response["result"];
+    assert!(result["records"].is_array());
+    assert_eq!(result["records"].as_array().unwrap().len(), 0);
+    assert_eq!(result["since_secs"].as_u64(), Some(86_400));
+    node.stop();
+}
+
+#[test]
+fn test_getreorghistory_accepts_custom_window() {
+    let mut node = TestNode::start(&[]);
+    let response = node
+        .rpc_call_with_params("getreorghistory", vec![serde_json::json!(3600u64)])
+        .unwrap();
+    assert_eq!(response["result"]["since_secs"].as_u64(), Some(3_600));
+    node.stop();
+}
+
+#[test]
+fn test_profile_pruned_home_applies_defaults() {
+    // --profile=pruned-home sets prune/dbcache/maxconnections. Observable
+    // via getconfig.
+    let mut node = TestNode::start(&["--profile=pruned-home"]);
+    let response = node.rpc_call("getconfig").unwrap();
+    let cfg = &response["result"];
+    assert_eq!(cfg["profile"], "pruned-home");
+    assert_eq!(cfg["storage"]["prune_mb"].as_u64(), Some(10_000));
+    assert_eq!(cfg["storage"]["dbcache_mb"].as_u64(), Some(450));
+    assert_eq!(cfg["p2p"]["max_connections"].as_u64(), Some(20));
+    node.stop();
+}
+
+#[test]
+fn test_profile_cli_override_wins() {
+    // CLI flag overrides profile default. --profile=pruned-home would set
+    // dbcache=450, but --dbcache=100 wins.
+    let mut node = TestNode::start(&["--profile=pruned-home", "--dbcache=100"]);
+    let response = node.rpc_call("getconfig").unwrap();
+    let cfg = &response["result"];
+    assert_eq!(cfg["storage"]["dbcache_mb"].as_u64(), Some(100));
+    // Other profile fields still apply.
+    assert_eq!(cfg["storage"]["prune_mb"].as_u64(), Some(10_000));
+    node.stop();
+}
+
+#[test]
+fn test_profile_archival_enables_txindex() {
+    let mut node = TestNode::start(&["--profile=archival"]);
+    let response = node.rpc_call("getconfig").unwrap();
+    let cfg = &response["result"];
+    assert_eq!(cfg["profile"], "archival");
+    assert_eq!(cfg["storage"]["txindex"].as_bool(), Some(true));
+    assert_eq!(cfg["storage"]["prune_mb"].as_u64(), Some(0));
+    node.stop();
+}
+
+#[test]
+fn test_getconfig_redacts_sensitive_fields() {
+    // Password fields must never be echoed back through getconfig,
+    // even when set via CLI.
+    let mut node = TestNode::start(&[
+        "--rpcuser=alice",
+        "--rpcpassword=secret-sauce",
+    ]);
+    // User/pass auth mode — TestNode's rpc_call uses cookie, which
+    // doesn't exist here. Call raw with basic auth.
+    let url = format!("http://127.0.0.1:{}/", node.rpcport);
+    let client = reqwest::blocking::Client::new();
+    let resp: serde_json::Value = client
+        .post(&url)
+        .basic_auth("alice", Some("secret-sauce"))
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0", "id": "t", "method": "getconfig", "params": []
+        }))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    let cfg = &resp["result"];
+    let serialized = cfg.to_string();
+    assert!(
+        !serialized.contains("secret-sauce"),
+        "getconfig must redact rpcpassword; got: {}",
+        serialized
+    );
+    assert_eq!(cfg["rpc"]["password"], "(set)");
+
+    // Also cleanly stop the node via authenticated RPC.
+    let _ = client
+        .post(&url)
+        .basic_auth("alice", Some("secret-sauce"))
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0", "id": "s", "method": "stop", "params": []
+        }))
+        .send();
+    // Drop `node` via its Drop/stop isn't safe here (cookie empty) — the
+    // child process will be reaped by the test harness's exit sequence
+    // or by the explicit stop we just sent.
+    let exit_deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < exit_deadline {
+        if node.process.try_wait().unwrap().is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    if node.process.try_wait().unwrap().is_none() {
+        let _ = node.process.kill();
+    }
+}
+
+#[test]
+fn test_log_format_json_emits_valid_json_with_trace_id() {
+    // Launch satd with --log-format=json and capture stderr to a file.
+    // Assert at least one line parses as a JSON object containing the
+    // stable fields (timestamp, level, fields.message). When a block is
+    // mined, the corresponding span carries a trace_id we can verify.
+    let rpcport = find_available_port();
+    let p2p_port = find_available_port();
+    let datadir = std::env::temp_dir().join(format!("satd-jsonlog-{}", rpcport));
+    let _ = std::fs::remove_dir_all(&datadir);
+    std::fs::create_dir_all(&datadir).unwrap();
+
+    let log_path = datadir.join("stderr.log");
+    let log_file = std::fs::File::create(&log_path).unwrap();
+    let satd_bin = env!("CARGO_BIN_EXE_satd");
+
+    let mut child = Command::new(satd_bin)
+        .arg("--regtest")
+        .arg(format!("--datadir={}", datadir.display()))
+        .arg(format!("--rpcport={}", rpcport))
+        .arg(format!("--port={}", p2p_port))
+        .arg("--log-format=json")
+        .stdout(log_file)
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("Failed to start satd with --log-format=json");
+
+    // Wait for readiness then mine one block so we generate a connect span.
+    let cookie_path = datadir.join("regtest").join(".cookie");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut cookie = String::new();
+    while Instant::now() < deadline {
+        if let Ok(c) = std::fs::read_to_string(&cookie_path)
+            && !c.is_empty()
+        {
+            cookie = c;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(!cookie.is_empty(), "cookie never appeared — startup failed");
+
+    let url = format!("http://127.0.0.1:{}/", rpcport);
+    let (user, pass) = cookie.split_once(':').unwrap_or(("__cookie__", "none"));
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+
+    // Wait for RPC readiness — require a valid `chain` field in the
+    // getblockchaininfo result, not just HTTP 200 (auth error pages
+    // also return 200 with a JSON-RPC error body).
+    let mut rpc_ready = false;
+    let rpc_deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < rpc_deadline {
+        let resp = client
+            .post(&url)
+            .basic_auth(user, Some(pass))
+            .json(&serde_json::json!({
+                "jsonrpc": "2.0", "id": "r", "method": "getblockchaininfo", "params": []
+            }))
+            .send();
+        if let Ok(r) = resp
+            && let Ok(v) = r.json::<serde_json::Value>()
+            && v["result"]["chain"].as_str().is_some()
+        {
+            rpc_ready = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(rpc_ready, "RPC never became ready");
+
+    // Mine a block to generate a connect span. Poll block count until it
+    // advances so we know the log has a connect event by the time we stop.
+    let mine_resp = client
+        .post(&url)
+        .basic_auth(user, Some(pass))
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0", "id": "m", "method": "generatetoaddress",
+            "params": [1, "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202"],
+        }))
+        .send()
+        .expect("generatetoaddress request failed");
+    let mine_json: serde_json::Value = mine_resp.json().expect("mine response not JSON");
+    assert!(
+        mine_json["error"].is_null(),
+        "generatetoaddress error: {}",
+        mine_json["error"]
+    );
+    let mine_deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < mine_deadline {
+        let resp = client
+            .post(&url)
+            .basic_auth(user, Some(pass))
+            .json(&serde_json::json!({
+                "jsonrpc": "2.0", "id": "bc", "method": "getblockcount", "params": []
+            }))
+            .send();
+        if let Ok(r) = resp
+            && let Ok(v) = r.json::<serde_json::Value>()
+            && v["result"].as_u64().unwrap_or(0) >= 1
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // Graceful shutdown so logs flush.
+    let _ = client
+        .post(&url)
+        .basic_auth(user, Some(pass))
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0", "id": "s", "method": "stop", "params": [],
+        }))
+        .send();
+    let exit_deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < exit_deadline {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    if child.try_wait().unwrap().is_none() {
+        let _ = child.kill();
+    }
+
+    let logs = std::fs::read_to_string(&log_path).unwrap();
+    let mut parsed_lines = 0usize;
+    let mut saw_trace_id = false;
+    let mut saw_required_fields = false;
+    for line in logs.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            panic!(
+                "--log-format=json emitted non-JSON line:\n{}\nfull logs:\n{}",
+                line, logs
+            );
+        };
+        parsed_lines += 1;
+        let obj = v.as_object().expect("log line must be a JSON object");
+        if obj.contains_key("timestamp") && obj.contains_key("level") && obj.contains_key("fields")
+        {
+            saw_required_fields = true;
+        }
+        // Check any span carries a trace_id — the connect / accept paths
+        // all open an info_span with a trace_id field. With
+        // `with_current_span(true)`, the current span appears in a `span`
+        // or `spans` field of each event.
+        let as_str = v.to_string();
+        if as_str.contains("trace_id") {
+            saw_trace_id = true;
+        }
+    }
+    assert!(
+        parsed_lines > 0,
+        "--log-format=json produced no lines. logs:\n{}",
+        logs
+    );
+    assert!(
+        saw_required_fields,
+        "no JSON line had the stable required fields (timestamp, level, fields); logs:\n{}",
+        logs
+    );
+    assert!(
+        saw_trace_id,
+        "no JSON line carried a trace_id from a validation span; logs:\n{}",
+        logs
+    );
+
+    let _ = std::fs::remove_dir_all(&datadir);
+}

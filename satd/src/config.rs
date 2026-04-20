@@ -97,6 +97,137 @@ impl std::fmt::Display for ConsensusEngine {
     }
 }
 
+/// Log output format selected at startup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LogFormat {
+    /// Human-readable text (default) — matches pre-flag behavior.
+    #[default]
+    Text,
+    /// One JSON object per event. Fields: `timestamp`, `level`,
+    /// `target`, `fields.message`, plus any structured fields attached
+    /// by the emitting span/event. Stable field names; safe for
+    /// log-shipping pipelines.
+    Json,
+}
+
+impl LogFormat {
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "text" | "plain" | "human" => Ok(Self::Text),
+            "json" => Ok(Self::Json),
+            other => Err(format!("unknown log format: {}", other)),
+        }
+    }
+}
+
+/// Named preset that populates several knobs at once. Applied between
+/// config-file merging and CLI overrides, so a user-supplied CLI flag
+/// always wins over a profile value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Profile {
+    /// Full archival node: `txindex=true`, no pruning, large dbcache.
+    Archival,
+    /// Home-node pruned build: modest prune target, small dbcache,
+    /// lower peer count. Target: Pi / Umbrel / entry-level VPS.
+    PrunedHome,
+    /// Mining-pool-oriented: higher peer limits, nudged relay policy.
+    Mining,
+    /// Local regtest development: permissive relay, tight peer limits.
+    RegtestDev,
+    /// Signet watchtower: low resource, relay-friendly, signet network.
+    SignetWatchtower,
+}
+
+impl Profile {
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "archival" | "archive" => Ok(Self::Archival),
+            "pruned-home" | "pruned_home" | "home" => Ok(Self::PrunedHome),
+            "mining" | "miner" => Ok(Self::Mining),
+            "regtest-dev" | "regtest_dev" | "dev" => Ok(Self::RegtestDev),
+            "signet-watchtower" | "signet_watchtower" | "watchtower" => Ok(Self::SignetWatchtower),
+            other => Err(format!("unknown profile: {}", other)),
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Archival => "archival",
+            Self::PrunedHome => "pruned-home",
+            Self::Mining => "mining",
+            Self::RegtestDev => "regtest-dev",
+            Self::SignetWatchtower => "signet-watchtower",
+        }
+    }
+
+    /// Default field values this profile suggests. Each returned value
+    /// has `None` for fields the profile does not care about, so the
+    /// normal precedence chain (`cli → file → profile → hardcoded`)
+    /// falls through to the next source.
+    pub fn defaults(&self) -> ProfileDefaults {
+        match self {
+            Self::Archival => ProfileDefaults {
+                txindex: Some(true),
+                prune: Some(0),
+                dbcache: Some(8192),
+                maxconnections: None,
+                minrelaytxfee: None,
+                network_regtest: false,
+                network_signet: false,
+            },
+            Self::PrunedHome => ProfileDefaults {
+                txindex: Some(false),
+                prune: Some(10_000),
+                dbcache: Some(450),
+                maxconnections: Some(20),
+                minrelaytxfee: None,
+                network_regtest: false,
+                network_signet: false,
+            },
+            Self::Mining => ProfileDefaults {
+                txindex: None,
+                prune: Some(0),
+                dbcache: Some(2048),
+                maxconnections: Some(125),
+                minrelaytxfee: None,
+                network_regtest: false,
+                network_signet: false,
+            },
+            Self::RegtestDev => ProfileDefaults {
+                txindex: None,
+                prune: Some(0),
+                dbcache: Some(450),
+                maxconnections: Some(8),
+                minrelaytxfee: Some(0),
+                network_regtest: true,
+                network_signet: false,
+            },
+            Self::SignetWatchtower => ProfileDefaults {
+                txindex: None,
+                prune: Some(2_000),
+                dbcache: Some(450),
+                maxconnections: Some(50),
+                minrelaytxfee: None,
+                network_regtest: false,
+                network_signet: true,
+            },
+        }
+    }
+}
+
+/// Per-field defaults contributed by a named `Profile`. None means the
+/// profile does not opine on this field.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ProfileDefaults {
+    pub txindex: Option<bool>,
+    pub prune: Option<u64>,
+    pub dbcache: Option<usize>,
+    pub maxconnections: Option<usize>,
+    pub minrelaytxfee: Option<u64>,
+    pub network_regtest: bool,
+    pub network_signet: bool,
+}
+
 /// Resolved node configuration after merging CLI args, config file, and defaults.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -182,6 +313,18 @@ pub struct Config {
     /// `Btc` (default) matches Bitcoin Core byte-for-byte; `Sats` emits
     /// integer satoshis (no floating-point precision loss).
     pub rpc_default_units: node::rpc::amounts::AmountUnit,
+    /// Log output format. `Text` is human-readable (default); `Json`
+    /// emits one JSON object per event for log-shipping pipelines.
+    pub log_format: LogFormat,
+    /// Named profile the operator selected (if any). Informational —
+    /// the profile's effects are already baked into the other fields.
+    pub profile: Option<Profile>,
+    /// Optional HTTP endpoint receiving reorg-event POSTs. None = the
+    /// dispatcher is not started.
+    pub reorg_webhook: Option<String>,
+    /// Optional HMAC-SHA256 secret for `X-Satd-Signature`. If set, the
+    /// dispatcher signs each webhook body. Absent = unsigned POSTs.
+    pub reorg_webhook_secret: Option<String>,
     // No-op compatibility flags (accepted but ignored)
     #[allow(dead_code)]
     pub server: bool,
@@ -199,12 +342,24 @@ impl Config {
     }
 
     pub fn from_cli(cli: CliArgs) -> Result<Self, String> {
+        // Resolve named profile (if any). Fields from the profile flow
+        // through as a lower-priority default: CLI flags always override,
+        // config-file entries override profile, and profile wins only over
+        // the hardcoded defaults.
+        let profile = cli
+            .profile
+            .as_ref()
+            .map(|p| Profile::parse(p))
+            .transpose()?;
+        let profile_defaults: ProfileDefaults =
+            profile.map(|p| p.defaults()).unwrap_or_default();
+
         // Determine network from CLI flags
-        let network = if cli.regtest {
+        let network = if cli.regtest || profile_defaults.network_regtest {
             Network::Regtest
         } else if cli.testnet {
             Network::Testnet
-        } else if cli.signet {
+        } else if cli.signet || profile_defaults.network_signet {
             Network::Signet
         } else {
             Network::Bitcoin
@@ -307,6 +462,7 @@ impl Config {
         let minrelaytxfee = cli
             .minrelaytxfee
             .or_else(|| file_get("minrelaytxfee").and_then(|v| v.parse().ok()))
+            .or(profile_defaults.minrelaytxfee)
             .unwrap_or(1_000); // sat/kvB
 
         let dustrelayfee = cli
@@ -345,11 +501,13 @@ impl Config {
             .unwrap_or(true);
 
         let txindex = cli.txindex
-            || file_get("txindex").and_then(|v| parse_bool(&v)).unwrap_or(false);
+            || file_get("txindex").and_then(|v| parse_bool(&v)).unwrap_or(false)
+            || profile_defaults.txindex.unwrap_or(false);
 
         let prune = cli
             .prune
             .or_else(|| file_get("prune").and_then(|v| v.parse().ok()))
+            .or(profile_defaults.prune)
             .unwrap_or(0); // 0 = no pruning
 
         // Validate prune + txindex conflict
@@ -393,6 +551,7 @@ impl Config {
             maxconnections: cli
                 .maxconnections
                 .or_else(|| file_get("maxconnections").and_then(|v| v.parse().ok()))
+                .or(profile_defaults.maxconnections)
                 .unwrap_or(125),
             bind: cli
                 .bind
@@ -458,6 +617,7 @@ impl Config {
                     .dbcache
                     .clone()
                     .or_else(|| file_get("dbcache"))
+                    .or_else(|| profile_defaults.dbcache.map(|v| v.to_string()))
                     .unwrap_or_else(|| "450".to_string());
                 DbCacheSize::parse(&raw)
                     .unwrap_or(DbCacheSize::Fixed(450))
@@ -467,6 +627,7 @@ impl Config {
                 let raw = cli
                     .dbcache
                     .or_else(|| file_get("dbcache"))
+                    .or_else(|| profile_defaults.dbcache.map(|v| v.to_string()))
                     .unwrap_or_else(|| "450".to_string());
                 DbCacheSize::parse(&raw).unwrap_or(DbCacheSize::Fixed(450))
             },
@@ -534,6 +695,74 @@ impl Config {
                     .unwrap_or_else(|| "btc".to_string());
                 node::rpc::amounts::AmountUnit::parse(&raw)
                     .unwrap_or(node::rpc::amounts::AmountUnit::Btc)
+            },
+            log_format: {
+                let raw = cli
+                    .log_format
+                    .or_else(|| file_get("logformat"))
+                    .unwrap_or_else(|| "text".to_string());
+                LogFormat::parse(&raw).unwrap_or_default()
+            },
+            profile,
+            reorg_webhook: cli.reorg_webhook.or_else(|| file_get("reorgwebhook")),
+            reorg_webhook_secret: cli
+                .reorg_webhook_secret
+                .or_else(|| file_get("reorgwebhooksecret")),
+        })
+    }
+
+    /// Serialize a privacy-safe view of the current config for `getconfig`.
+    /// Secret fields (rpcpassword, tor password) are replaced with a
+    /// placeholder so the output can be safely logged or shared.
+    pub fn effective_view(&self) -> serde_json::Value {
+        serde_json::json!({
+            "network": self.network.to_string(),
+            "datadir": self.datadir.display().to_string(),
+            "profile": self.profile.map(|p| p.as_str()).unwrap_or("(none)"),
+            "rpc": {
+                "port": self.rpcport,
+                "bind": self.rpcbind,
+                "user": self.rpcuser.as_deref().unwrap_or("(cookie)"),
+                "password": if self.rpcpassword.is_some() { "(set)" } else { "(none)" },
+                "extended_errors": self.rpc_extended_errors,
+                "default_units": self.rpc_default_units.as_str(),
+            },
+            "p2p": {
+                "listen": self.listen,
+                "port": self.port,
+                "max_connections": self.maxconnections,
+                "bind": self.bind,
+                "dns": self.dns,
+                "connect": self.connect,
+                "addnode": self.addnode,
+            },
+            "mempool": {
+                "max_bytes_mb": self.maxmempool,
+                "min_relay_tx_fee_sat_per_kvb": self.minrelaytxfee,
+                "full_rbf": self.mempoolfullrbf,
+                "expiry_hours": self.mempoolexpiry,
+            },
+            "storage": {
+                "txindex": self.txindex,
+                "prune_mb": self.prune,
+                "dbcache_mb": self.dbcache,
+                "dbcache_mode": format!("{:?}", self.dbcache_mode),
+            },
+            "consensus": format!("{:?}", self.consensus),
+            "metrics": {
+                "port": self.metricsport,
+                "bind": self.metricsbind,
+            },
+            "log_format": match self.log_format {
+                LogFormat::Text => "text",
+                LogFormat::Json => "json",
+            },
+            "max_shutdown_secs": self.max_shutdown_secs,
+            "tor": {
+                "proxy": self.proxy,
+                "onion": self.onion,
+                "control": self.torcontrol,
+                "password": if self.torpassword.is_some() { "(set)" } else { "(none)" },
             },
         })
     }
@@ -739,6 +968,18 @@ pub struct CliArgs {
 
     #[arg(long, value_name = "UNIT", help = "Default units for RPC amount fields: 'btc' (Core-compatible, default) or 'sats' (integer satoshis)")]
     pub rpcdefaultunits: Option<String>,
+
+    #[arg(long = "log-format", value_name = "FORMAT", help = "Log output format: 'text' (default, human) or 'json' (one JSON object per event)")]
+    pub log_format: Option<String>,
+
+    #[arg(long, value_name = "NAME", help = "Named preset: archival | pruned-home | mining | regtest-dev | signet-watchtower. CLI flags override profile values.")]
+    pub profile: Option<String>,
+
+    #[arg(long = "reorg-webhook", value_name = "URL", help = "HTTP(S) endpoint receiving POST bodies on reorg detection")]
+    pub reorg_webhook: Option<String>,
+
+    #[arg(long = "reorg-webhook-secret", value_name = "SECRET", help = "HMAC-SHA256 secret used to sign webhook bodies via X-Satd-Signature")]
+    pub reorg_webhook_secret: Option<String>,
 }
 
 /// Convert Bitcoin Core-style single-dash long flags to clap-compatible double-dash.
@@ -801,6 +1042,13 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "rpcextendederrors",
         "maxshutdownsecs",
         "rpcdefaultunits",
+        "log-format",
+        "logformat",
+        "profile",
+        "reorg-webhook",
+        "reorgwebhook",
+        "reorg-webhook-secret",
+        "reorgwebhooksecret",
     ];
 
     args.into_iter()
@@ -1033,6 +1281,10 @@ rpcport=8332
             rpcextendederrors: false,
             maxshutdownsecs: None,
             rpcdefaultunits: None,
+            log_format: None,
+            profile: None,
+            reorg_webhook: None,
+            reorg_webhook_secret: None,
         };
         let config = Config::from_cli(cli).unwrap();
         assert_eq!(config.network, Network::Regtest);
@@ -1103,6 +1355,10 @@ rpcport=8332
             rpcextendederrors: false,
             maxshutdownsecs: None,
             rpcdefaultunits: None,
+            log_format: None,
+            profile: None,
+            reorg_webhook: None,
+            reorg_webhook_secret: None,
         };
         assert!(Config::from_cli(cli).is_err());
     }
