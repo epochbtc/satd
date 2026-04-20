@@ -157,6 +157,8 @@ fn run_app(
             terminal.draw(|f| {
                 if st.show_help {
                     ui::help::draw(f, &st);
+                } else if st.show_reorgs {
+                    ui::reorgs::draw(f, &st);
                 } else if !st.connected {
                     let area = f.area();
                     f.render_widget(ui::connecting_paragraph(st.stale, st.startup_status.as_deref()), area);
@@ -175,13 +177,25 @@ fn run_app(
                 let mut st = state.lock().unwrap();
                 match key.code {
                     KeyCode::Char('q') => {
-                        if st.show_help { st.show_help = false; } else { return Ok(()); }
+                        if st.show_help { st.show_help = false; }
+                        else if st.show_reorgs { st.show_reorgs = false; }
+                        else { return Ok(()); }
                     }
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         return Ok(());
                     }
-                    KeyCode::Char('h') | KeyCode::Char('?') => st.show_help = !st.show_help,
-                    KeyCode::Esc => { if st.show_help { st.show_help = false; } }
+                    KeyCode::Char('h') | KeyCode::Char('?') => {
+                        st.show_reorgs = false;
+                        st.show_help = !st.show_help;
+                    }
+                    KeyCode::Char('r') => {
+                        st.show_help = false;
+                        st.show_reorgs = !st.show_reorgs;
+                    }
+                    KeyCode::Esc => {
+                        if st.show_help { st.show_help = false; }
+                        if st.show_reorgs { st.show_reorgs = false; }
+                    }
                     KeyCode::Char('1') => st.toggle_mode(ViewMode::Ibd),
                     KeyCode::Char('2') => st.toggle_mode(ViewMode::Steady),
                     KeyCode::Up => {
@@ -288,12 +302,8 @@ async fn poller(rpc: Arc<RpcClient>, state: Arc<Mutex<AppState>>) {
         if slow_counter >= 3 && is_steady {
             slow_counter = 0;
 
-            let (fee1, fee3, fee6, fee12, fee25, mining_res, txstats_res, uptime_res, blockstats_res, rawmempool_res, utxo_res) = tokio::join!(
-                rpc.estimate_smart_fee(1),
-                rpc.estimate_smart_fee(3),
-                rpc.estimate_smart_fee(6),
-                rpc.estimate_smart_fee(12),
-                rpc.estimate_smart_fee(25),
+            let (fees_res, mining_res, txstats_res, uptime_res, blockstats_res, rawmempool_res, utxo_res, reorgs_res) = tokio::join!(
+                rpc.estimate_fees(),
                 rpc.get_mining_info(),
                 rpc.get_chain_tx_stats(),
                 rpc.get_uptime(),
@@ -303,20 +313,18 @@ async fn poller(rpc: Arc<RpcClient>, state: Arc<Mutex<AppState>>) {
                 },
                 rpc.get_raw_mempool_verbose(),
                 rpc.get_tx_out_set_info(),
+                rpc.get_reorg_history(),
             );
 
             let mut st = state.lock().unwrap();
-            if let Ok(v) = fee1 { st.update_fee_estimates(0, &v); }
-            if let Ok(v) = fee3 { st.update_fee_estimates(1, &v); }
-            if let Ok(v) = fee6 { st.update_fee_estimates(2, &v); }
-            if let Ok(v) = fee12 { st.update_fee_estimates(3, &v); }
-            if let Ok(v) = fee25 { st.update_fee_estimates(4, &v); }
+            if let Ok(v) = fees_res { st.update_fee_estimates(&v); }
             if let Ok(v) = mining_res { st.update_mining_info(&v); }
             if let Ok(v) = txstats_res { st.update_chain_tx_stats(&v); }
             if let Ok(v) = uptime_res { st.update_uptime(&v); }
             if let Ok(v) = blockstats_res { st.update_block_stats(&v); }
             if let Ok(v) = rawmempool_res { st.update_mempool_dist(&v); }
             if let Ok(v) = utxo_res { st.update_utxo_info(&v); }
+            if let Ok(v) = reorgs_res { st.update_reorg_history(&v); }
         }
     }
 }

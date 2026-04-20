@@ -27,6 +27,33 @@ pub enum ViewMode {
     Steady,
 }
 
+/// One reorg record from getreorghistory.
+#[derive(Debug, Clone)]
+pub struct ReorgEntry {
+    pub ts_unix_secs: u64,
+    pub depth: u32,
+    pub fork_height: u32,
+    pub old_tip: String,
+    pub new_tip: String,
+    pub disconnected_len: usize,
+    pub reconnected_len: usize,
+}
+
+/// 4-tier fee summary derived from estimatefees (mempool.space convention).
+#[derive(Debug, Clone, Default)]
+pub struct FeeSummary {
+    /// sat/vB for the 1-block target.
+    pub high: Option<f64>,
+    /// sat/vB for the 3-block target.
+    pub medium: Option<f64>,
+    /// sat/vB for the 6-block target.
+    pub low: Option<f64>,
+    /// sat/vB for economy (min-relay-floor clamp).
+    pub none: Option<f64>,
+    pub confidence: Option<String>,
+    pub mode: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct PeerDownloadStat {
     pub peer_id: u64,
@@ -105,7 +132,7 @@ pub struct AppState {
     pub block_stats_size: Option<u64>,
     pub block_stats_weight: Option<u64>,
 
-    pub fee_estimates: [Option<f64>; 5],
+    pub fees: FeeSummary,
     pub utxo_count: Option<u64>,
     pub utxo_total_amount: Option<f64>,
     pub utxo_age_dist: Option<[u64; 8]>,
@@ -120,6 +147,11 @@ pub struct AppState {
     pub thread_count: Option<u32>,
     pub cache_dirty: Option<u32>,
     pub cache_clean: Option<usize>,
+    /// "clean" | "dirty" — from getsysteminfo.last_shutdown (PR #60).
+    pub last_shutdown: Option<String>,
+
+    // Reorg history (from getreorghistory)
+    pub reorg_history: Vec<ReorgEntry>,
 
     // Computed deltas
     pub blocks_per_sec: f64,
@@ -142,6 +174,7 @@ pub struct AppState {
     pub force_mode: Option<ViewMode>,
     pub selected_peer: usize,
     pub show_help: bool,
+    pub show_reorgs: bool,
 
     // Internal tracking
     prev_blocks: u32,
@@ -181,7 +214,7 @@ impl AppState {
             block_stats_size: None,
             block_stats_weight: None,
 
-            fee_estimates: [None; 5],
+            fees: FeeSummary::default(),
             utxo_count: None,
             utxo_total_amount: None,
             utxo_age_dist: None,
@@ -195,6 +228,9 @@ impl AppState {
             thread_count: None,
             cache_dirty: None,
             cache_clean: None,
+            last_shutdown: None,
+
+            reorg_history: Vec::new(),
 
             blocks_per_sec: 0.0,
             headers_per_sec: 0.0,
@@ -212,6 +248,7 @@ impl AppState {
             force_mode: None,
             selected_peer: 0,
             show_help: false,
+            show_reorgs: false,
 
             prev_blocks: 0,
             prev_headers: 0,
@@ -391,15 +428,53 @@ impl AppState {
         self.block_stats_weight = v.get("total_weight").and_then(|w| w.as_u64());
     }
 
-    /// Update from estimatesmartfee responses (5 targets).
-    pub fn update_fee_estimates(&mut self, idx: usize, v: &serde_json::Value) {
+    /// Update from estimatefees response (PR #65/#67).
+    /// Response shape: { targets: { "1": {feerate, confidence}, "3": ..., "6": ... },
+    ///                   economy_feerate, mode, ... }
+    /// `feerate` is already in sat/vB when `sat_per_vb: true` or BTC/kvB otherwise.
+    /// Map targets onto 4-tier mempool.space labels:
+    ///   High = target 1, Medium = target 3, Low = target 6, None = economy.
+    pub fn update_fee_estimates(&mut self, v: &serde_json::Value) {
         self.loaded.fee_estimates = true;
-        if idx < 5 {
-            // feerate is in BTC/kvB, convert to sat/vB: * 100_000_000 / 1000 = * 100_000
-            self.fee_estimates[idx] = v.get("feerate")
-                .and_then(|f| f.as_f64())
-                .map(|f| f * 100_000.0);
-        }
+        let sat_per_vb = v.get("sat_per_vb").and_then(|b| b.as_bool()).unwrap_or(false);
+
+        let parse_rate = |raw: &serde_json::Value| -> Option<f64> {
+            // Values may be strings (new default units=btc path annotates them)
+            // or numbers. Accept either.
+            let n = raw.as_f64()
+                .or_else(|| raw.as_str().and_then(|s| s.parse().ok()))?;
+            if sat_per_vb {
+                Some(n)
+            } else {
+                // BTC/kvB → sat/vB
+                Some(n * 100_000.0)
+            }
+        };
+
+        let targets = v.get("targets").and_then(|t| t.as_object());
+        let tier = |key: &str| -> (Option<f64>, Option<String>) {
+            let obj = targets.and_then(|m| m.get(key)).and_then(|o| o.as_object());
+            let feerate = obj.and_then(|o| o.get("feerate")).and_then(parse_rate);
+            let conf = obj
+                .and_then(|o| o.get("confidence"))
+                .and_then(|c| c.as_str())
+                .map(|s| s.to_string());
+            (feerate, conf)
+        };
+
+        let (high, high_conf) = tier("1");
+        let (medium, _) = tier("3");
+        let (low, _) = tier("6");
+        let none = v.get("economy_feerate").and_then(parse_rate);
+
+        self.fees = FeeSummary {
+            high,
+            medium,
+            low,
+            none,
+            confidence: high_conf,
+            mode: v.get("mode").and_then(|m| m.as_str()).map(|s| s.to_string()),
+        };
     }
 
     /// Update from gettxoutsetinfo response.
@@ -471,6 +546,43 @@ impl AppState {
         self.thread_count = v.get("threads").and_then(|t| t.as_u64()).map(|t| t as u32);
         self.cache_dirty = v.get("cache_dirty").and_then(|c| c.as_u64()).map(|c| c as u32);
         self.cache_clean = v.get("cache_clean").and_then(|c| c.as_u64()).map(|c| c as usize);
+        self.last_shutdown = v.get("last_shutdown")
+            .and_then(|s| s.as_str())
+            .map(|s| s.to_string());
+    }
+
+    /// Update from getreorghistory response: { since_secs, records: [ReorgRecord, ...] }.
+    pub fn update_reorg_history(&mut self, v: &serde_json::Value) {
+        let Some(records) = v.get("records").and_then(|r| r.as_array()) else {
+            return;
+        };
+        self.reorg_history = records
+            .iter()
+            .filter_map(|r| {
+                Some(ReorgEntry {
+                    ts_unix_secs: r.get("ts_unix_secs")?.as_u64()?,
+                    depth: r.get("depth")?.as_u64()? as u32,
+                    fork_height: r.get("fork_height")?.as_u64()? as u32,
+                    old_tip: r.get("old_tip")?.as_str()?.to_string(),
+                    new_tip: r.get("new_tip")?.as_str()?.to_string(),
+                    disconnected_len: r.get("disconnected")
+                        .and_then(|a| a.as_array())
+                        .map(|a| a.len())
+                        .unwrap_or(0),
+                    reconnected_len: r.get("reconnected")
+                        .and_then(|a| a.as_array())
+                        .map(|a| a.len())
+                        .unwrap_or(0),
+                })
+            })
+            .collect();
+        // Most-recent first for display.
+        self.reorg_history.sort_by(|a, b| b.ts_unix_secs.cmp(&a.ts_unix_secs));
+    }
+
+    /// True if we have a healthy, live, steady-state connection.
+    pub fn is_healthy(&self) -> bool {
+        self.connected && !self.stale && !self.is_ibd
     }
 
     /// Best known target height: max of headers and peer-reported network height.
@@ -506,5 +618,138 @@ impl AppState {
         if let Some(last) = self.last_poll {
             self.stale = last.elapsed().as_secs() > 5;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn update_fee_estimates_btc_units() {
+        // Default-unit (btc) response: feerate is BTC/kvB as a float.
+        let v = json!({
+            "targets": {
+                "1": {"feerate": 0.00025, "confidence": "high"},
+                "3": {"feerate": 0.00018, "confidence": "medium"},
+                "6": {"feerate": 0.00010, "confidence": "low"},
+            },
+            "economy_feerate": 0.00001,
+            "mode": "blend",
+            "fallback": false,
+        });
+        let mut st = AppState::new();
+        st.update_fee_estimates(&v);
+        // BTC/kvB → sat/vB = value * 100_000
+        assert_eq!(st.fees.high, Some(25.0));
+        assert_eq!(st.fees.medium, Some(18.0));
+        assert_eq!(st.fees.low, Some(10.0));
+        assert_eq!(st.fees.none, Some(1.0));
+        assert_eq!(st.fees.confidence.as_deref(), Some("high"));
+        assert_eq!(st.fees.mode.as_deref(), Some("blend"));
+        assert!(st.loaded.fee_estimates);
+    }
+
+    #[test]
+    fn update_fee_estimates_sat_per_vb_units() {
+        // --rpcdefaultunits=sats path: feerate is a string integer and
+        // sat_per_vb: true is present.
+        let v = json!({
+            "targets": {
+                "1": {"feerate": "25", "confidence": "high"},
+                "3": {"feerate": "18", "confidence": "medium"},
+                "6": {"feerate": "10", "confidence": "low"},
+            },
+            "economy_feerate": "1",
+            "mode": "mempool",
+            "fallback": false,
+            "sat_per_vb": true,
+        });
+        let mut st = AppState::new();
+        st.update_fee_estimates(&v);
+        assert_eq!(st.fees.high, Some(25.0));
+        assert_eq!(st.fees.none, Some(1.0));
+        assert_eq!(st.fees.mode.as_deref(), Some("mempool"));
+    }
+
+    #[test]
+    fn update_fee_estimates_missing_targets_leave_tier_none() {
+        // Node returns only a subset of targets (e.g., historical mode miss).
+        let v = json!({
+            "targets": { "1": {"feerate": 0.00025, "confidence": "medium"} },
+            "economy_feerate": 0.00001,
+            "mode": "historical",
+        });
+        let mut st = AppState::new();
+        st.update_fee_estimates(&v);
+        assert_eq!(st.fees.high, Some(25.0));
+        assert_eq!(st.fees.medium, None);
+        assert_eq!(st.fees.low, None);
+        assert_eq!(st.fees.none, Some(1.0));
+    }
+
+    #[test]
+    fn update_reorg_history_shape_and_sort() {
+        let v = json!({
+            "since_secs": 86400,
+            "records": [
+                {
+                    "ts_unix_secs": 1_700_000_000,
+                    "depth": 1,
+                    "fork_height": 100,
+                    "old_tip": "aa",
+                    "new_tip": "bb",
+                    "disconnected": ["aa"],
+                    "reconnected": ["bb"],
+                },
+                {
+                    "ts_unix_secs": 1_700_001_000,
+                    "depth": 3,
+                    "fork_height": 200,
+                    "old_tip": "cc",
+                    "new_tip": "dd",
+                    "disconnected": ["cc","c2","c3"],
+                    "reconnected": ["dd","d2"],
+                },
+            ],
+        });
+        let mut st = AppState::new();
+        st.update_reorg_history(&v);
+        // Most-recent first.
+        assert_eq!(st.reorg_history.len(), 2);
+        assert_eq!(st.reorg_history[0].depth, 3);
+        assert_eq!(st.reorg_history[0].disconnected_len, 3);
+        assert_eq!(st.reorg_history[0].reconnected_len, 2);
+        assert_eq!(st.reorg_history[1].depth, 1);
+    }
+
+    #[test]
+    fn update_system_info_last_shutdown() {
+        let v = json!({
+            "pid": 1,
+            "rss_bytes": 1_000,
+            "threads": 4,
+            "cache_dirty": 0,
+            "cache_clean": 0,
+            "last_shutdown": "dirty",
+        });
+        let mut st = AppState::new();
+        st.update_system_info(&v);
+        assert_eq!(st.last_shutdown.as_deref(), Some("dirty"));
+    }
+
+    #[test]
+    fn health_dot_transitions() {
+        let mut st = AppState::new();
+        assert!(!st.is_healthy()); // fresh: not connected
+        st.connected = true;
+        st.is_ibd = true;
+        assert!(!st.is_healthy()); // ibd
+        st.is_ibd = false;
+        st.stale = true;
+        assert!(!st.is_healthy()); // stale
+        st.stale = false;
+        assert!(st.is_healthy());
     }
 }
