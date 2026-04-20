@@ -88,6 +88,19 @@ struct ChainTip {
     height: u32,
 }
 
+/// Data returned by `perform_reorg` so the caller can build a complete
+/// `ReorgRecord` once side-chain reconnection has finished. Recording
+/// the record at fork-disconnect time (the obvious-but-wrong spot)
+/// would misreport `fork_hash` as the new tip and leave
+/// `reconnected` empty.
+#[derive(Debug, Clone)]
+struct ReorgDisconnectInfo {
+    old_tip: BlockHash,
+    old_height: u32,
+    /// Hashes disconnected, walked old-tip-first toward the fork parent.
+    disconnected: Vec<BlockHash>,
+}
+
 /// Central chain state manager.
 pub struct ChainState {
     store: std::sync::Arc<CoinCache>,
@@ -1164,8 +1177,10 @@ impl ChainState {
                 }
             };
 
-            // Disconnect blocks from current tip down to fork point
-            self.perform_reorg(&fork_entry, current_tip)?;
+            // Disconnect blocks from current tip down to fork point.
+            // The returned info carries the data we need to build an
+            // accurate reorg record once reconnection is complete.
+            let disconnect_info = self.perform_reorg(&fork_entry, current_tip)?;
 
             // Now connect the side chain blocks from fork point up to (but not including)
             // the new block. Collect them first since we need to connect in forward order.
@@ -1181,6 +1196,7 @@ impl ChainState {
                 }
                 to_connect.reverse();
             }
+            let mut reconnected_hashes: Vec<BlockHash> = Vec::with_capacity(to_connect.len() + 1);
             for side_hash in &to_connect {
                 let side_block = self.get_block(side_hash)
                     .ok_or(ChainError::FlatFile("block data missing for reorg connect".to_string()))?;
@@ -1215,7 +1231,29 @@ impl ChainState {
                     tip.hash = *side_hash;
                     tip.height = side_entry.height;
                 }
+                reconnected_hashes.push(*side_hash);
                 tracing::info!(height = side_entry.height, hash = %side_hash, "Reorg: block connected");
+            }
+
+            // The final new-tip block (the one that triggered this
+            // `accept_block` call) will be connected immediately below.
+            // Persist the reorg record here — we already know `block_hash`
+            // will be the new tip and all the intermediate side-chain
+            // hashes. If connect of `block` fails after this point, the
+            // record still accurately describes what was on disk at
+            // commit time (the chain *was* rolled back + reconnected
+            // through the side chain; only the final extension fails).
+            if let Some(log) = self.reorg_log.get() {
+                reconnected_hashes.push(block_hash);
+                let record = crate::chain::reorg_log::ReorgRecord::new(
+                    fork_entry.height,
+                    disconnect_info.old_tip,
+                    block_hash,
+                    disconnect_info.old_height,
+                    disconnect_info.disconnected.clone(),
+                    reconnected_hashes.clone(),
+                );
+                log.record(record);
             }
 
             // Fall through to connect the new block as a tip-extending block
@@ -1267,7 +1305,11 @@ impl ChainState {
 
     /// Disconnect blocks from current tip down to the fork point (parent of the new chain).
     /// All disconnections are batched into a single atomic write.
-    fn perform_reorg(&self, fork_entry: &BlockIndexEntry, old_tip: BlockHash) -> Result<(), ChainError> {
+    fn perform_reorg(
+        &self,
+        fork_entry: &BlockIndexEntry,
+        old_tip: BlockHash,
+    ) -> Result<ReorgDisconnectInfo, ChainError> {
         let trace_id = rand::random::<u32>();
         let _span = tracing::info_span!(
             "reorg",
@@ -1320,23 +1362,15 @@ impl ChainState {
             tip.height = fork_entry.height;
         }
 
-        // Persist a reorg record. The new-tip is the fork-point here;
-        // the caller (activate_best_chain) then connects the side-chain
-        // blocks. Reconnected hashes are recorded in that follow-up
-        // pass (we return them so the caller can append).
-        if let Some(log) = self.reorg_log.get() {
-            let record = crate::chain::reorg_log::ReorgRecord::new(
-                fork_entry.height,
-                old_tip,
-                fork_hash,
-                old_height,
-                disconnected_hashes,
-                Vec::new(),
-            );
-            log.record(record);
-        }
-
-        Ok(())
+        // NOTE: We deliberately do NOT persist a reorg record here. The
+        // caller knows the real new-tip and the full reconnected list;
+        // recording at this point would stamp fork_hash as "new tip"
+        // and leave reconnected empty — misleading for operators.
+        Ok(ReorgDisconnectInfo {
+            old_tip,
+            old_height,
+            disconnected: disconnected_hashes,
+        })
     }
     /// Prune old block data files whose blocks are deep enough in the chain.
     /// `keep_blocks` is the number of recent blocks to keep data for.

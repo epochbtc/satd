@@ -2547,6 +2547,124 @@ fn test_metrics_endpoint_off_by_default() {
 }
 
 #[test]
+fn test_reorg_record_reflects_completed_state() {
+    // Drive a real reorg by building two independent chains on two
+    // nodes and transplanting the longer one onto the shorter node.
+    // The persisted reorg record MUST report:
+    //   - the final new tip (the longest submitted block), not the
+    //     fork-disconnect point
+    //   - the actual reconnected side-chain hashes, not an empty list
+    //   - the actual disconnected hashes
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+
+    // Node A: mine a short chain of 2 blocks.
+    let mut node_a = TestNode::start(&[]);
+    let gen_a = node_a
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(2), serde_json::json!(addr)],
+        )
+        .unwrap();
+    let a_hashes: Vec<String> = gen_a["result"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(a_hashes.len(), 2);
+
+    // Node B: mine a longer chain of 3 blocks independently (same
+    // genesis parent, so it's a competing fork).
+    let mut node_b = TestNode::start(&[]);
+    let gen_b = node_b
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(3), serde_json::json!(addr)],
+        )
+        .unwrap();
+    let b_hashes: Vec<String> = gen_b["result"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(b_hashes.len(), 3);
+
+    // Pull raw hex for each B block from node B.
+    let mut b_hex: Vec<String> = Vec::new();
+    for h in &b_hashes {
+        let raw = node_b
+            .rpc_call_with_params(
+                "getblock",
+                vec![serde_json::json!(h), serde_json::json!(0)],
+            )
+            .unwrap();
+        b_hex.push(raw["result"].as_str().unwrap().to_string());
+    }
+    node_b.stop();
+
+    // Submit B chain to node A. Node A should reorg once B has more
+    // work than A (after the 3rd B block is submitted — B=3 > A=2).
+    for hex in &b_hex {
+        let _ = node_a
+            .rpc_call_with_params("submitblock", vec![serde_json::json!(hex)])
+            .unwrap();
+    }
+
+    // Node A's tip should now be the last B block.
+    let tip = node_a.rpc_call("getbestblockhash").unwrap();
+    assert_eq!(
+        tip["result"].as_str().unwrap(),
+        b_hashes[2],
+        "node A should have reorged to B's tip"
+    );
+
+    // Reorg history should contain exactly one record describing the
+    // completed reorg, with the correct new tip and both disconnected
+    // and reconnected lists populated.
+    let hist = node_a.rpc_call("getreorghistory").unwrap();
+    let records = hist["result"]["records"].as_array().unwrap();
+    assert_eq!(records.len(), 1, "expected exactly one reorg record");
+    let rec = &records[0];
+
+    assert_eq!(
+        rec["new_tip"].as_str().unwrap(),
+        b_hashes[2],
+        "reorg record new_tip must be the post-reorg chain tip, not the fork point"
+    );
+    assert_eq!(
+        rec["old_tip"].as_str().unwrap(),
+        a_hashes[1],
+        "reorg record old_tip must be A's pre-reorg tip"
+    );
+
+    let disconnected: Vec<String> = rec["disconnected"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    // disconnected is ordered old-tip-first (the order we rolled back).
+    assert_eq!(disconnected, vec![a_hashes[1].clone(), a_hashes[0].clone()]);
+
+    let reconnected: Vec<String> = rec["reconnected"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        reconnected, b_hashes,
+        "reconnected must list every B block in chain order"
+    );
+
+    assert_eq!(rec["fork_height"].as_u64(), Some(0));
+    assert_eq!(rec["depth"].as_u64(), Some(2));
+
+    node_a.stop();
+}
+
+#[test]
 fn test_getreorghistory_empty_on_fresh_node() {
     let mut node = TestNode::start(&[]);
     let response = node.rpc_call("getreorghistory").unwrap();
