@@ -160,6 +160,14 @@ enum NodeCmd {
     Network,
     /// Version string.
     Version,
+    /// Effective configuration (post-merge of CLI + conf file + profile).
+    Config,
+    /// Recent reorg history from the persistent reorg log.
+    Reorgs {
+        /// Window in seconds (default: 86400 = 24h).
+        #[arg(long, default_value = "86400")]
+        since: u64,
+    },
     /// Shutdown the satd daemon.
     Stop,
 }
@@ -225,6 +233,8 @@ fn resolve_cmd(cmd: &Cmd) -> (String, Vec<serde_json::Value>) {
             // triple that operators actually mean when they ask "what version?"
             // — the renderer extracts just those fields in pretty mode below.
             NodeCmd::Version => ("getnetworkinfo".into(), vec![]),
+            NodeCmd::Config => ("getconfig".into(), vec![]),
+            NodeCmd::Reorgs { since } => ("getreorghistory".into(), vec![json!(since)]),
             NodeCmd::Stop => ("stop".into(), vec![]),
         },
         Cmd::Raw(args) => {

@@ -194,7 +194,13 @@ signing-without-key-storage is the modern flow Sparrow/Specter/Nunchuk use.
 **Effort:** M-L. The crypto is `bitcoin` crate code we already depend on. The
 UX design for the external-signer protocol is the main work.
 
-### 7. Structured JSON logging
+### 7. Structured JSON logging ✅ SHIPPED
+
+**Status:** Landed — `--log-format=json|text` flag, default `text`.
+tracing-subscriber JSON formatter. Trace-id spans on
+`connect_preprocessed_block`, `connect_stored_block`, `accept_block`, and
+`perform_reorg`. Stable field shape: `timestamp`, `level`, `target`,
+`fields.message`, with `span.trace_id` for validation events.
 
 **Pain:** Core's `debug.log` is a text firehose with category prefixes but no
 machine-parseable structure. Every operator who wants log-based alerting
@@ -224,7 +230,12 @@ win for wallet/explorer devs).
 **Effort:** L. Not a quick win but a significant moat once done. Consider
 doing it after Tier 1 to avoid premature schema lock-in.
 
-### 9. `--profile` presets
+### 9. `--profile` presets ✅ SHIPPED
+
+**Status:** Landed — `--profile=<name>` flag with presets `archival`,
+`pruned-home`, `mining`, `regtest-dev`, `signet-watchtower`. CLI flags
+override profile values. New `getconfig` RPC + `sat-cli node config`
+show the effective post-merge configuration with secrets redacted.
 
 **Pain:** Core has a large flag space and no profile concept.
 `jlopp/bitcoin-core-config-generator` exists because operators can't navigate
@@ -271,7 +282,14 @@ state from ZMQ per-tx events.
 
 **Effort:** M. The streaming endpoint is the bulk of the work.
 
-### 12. Persistent reorg log + webhook
+### 12. Persistent reorg log + webhook ✅ SHIPPED
+
+**Status:** Landed — JSONL append-only reorg log at
+`$datadir/reorg.log` with an in-memory 256-record ring. New
+`getreorghistory [since_secs]` RPC + `sat-cli node reorgs` subcommand.
+Optional `--reorg-webhook=<url>` dispatches each record via HTTP POST;
+optional `--reorg-webhook-secret=<secret>` adds HMAC-SHA256
+`X-Satd-Signature: sha256=...` for integrity.
 
 **Pain:** `getchaintips` shows current known tips only. Reorgs that happened
 yesterday are gone. Exchanges and custodians all log reorgs externally.

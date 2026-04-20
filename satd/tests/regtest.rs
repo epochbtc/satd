@@ -2545,3 +2545,293 @@ fn test_metrics_endpoint_off_by_default() {
     }
     node.stop();
 }
+
+#[test]
+fn test_getreorghistory_empty_on_fresh_node() {
+    let mut node = TestNode::start(&[]);
+    let response = node.rpc_call("getreorghistory").unwrap();
+    let result = &response["result"];
+    assert!(result["records"].is_array());
+    assert_eq!(result["records"].as_array().unwrap().len(), 0);
+    assert_eq!(result["since_secs"].as_u64(), Some(86_400));
+    node.stop();
+}
+
+#[test]
+fn test_getreorghistory_accepts_custom_window() {
+    let mut node = TestNode::start(&[]);
+    let response = node
+        .rpc_call_with_params("getreorghistory", vec![serde_json::json!(3600u64)])
+        .unwrap();
+    assert_eq!(response["result"]["since_secs"].as_u64(), Some(3_600));
+    node.stop();
+}
+
+#[test]
+fn test_profile_pruned_home_applies_defaults() {
+    // --profile=pruned-home sets prune/dbcache/maxconnections. Observable
+    // via getconfig.
+    let mut node = TestNode::start(&["--profile=pruned-home"]);
+    let response = node.rpc_call("getconfig").unwrap();
+    let cfg = &response["result"];
+    assert_eq!(cfg["profile"], "pruned-home");
+    assert_eq!(cfg["storage"]["prune_mb"].as_u64(), Some(10_000));
+    assert_eq!(cfg["storage"]["dbcache_mb"].as_u64(), Some(450));
+    assert_eq!(cfg["p2p"]["max_connections"].as_u64(), Some(20));
+    node.stop();
+}
+
+#[test]
+fn test_profile_cli_override_wins() {
+    // CLI flag overrides profile default. --profile=pruned-home would set
+    // dbcache=450, but --dbcache=100 wins.
+    let mut node = TestNode::start(&["--profile=pruned-home", "--dbcache=100"]);
+    let response = node.rpc_call("getconfig").unwrap();
+    let cfg = &response["result"];
+    assert_eq!(cfg["storage"]["dbcache_mb"].as_u64(), Some(100));
+    // Other profile fields still apply.
+    assert_eq!(cfg["storage"]["prune_mb"].as_u64(), Some(10_000));
+    node.stop();
+}
+
+#[test]
+fn test_profile_archival_enables_txindex() {
+    let mut node = TestNode::start(&["--profile=archival"]);
+    let response = node.rpc_call("getconfig").unwrap();
+    let cfg = &response["result"];
+    assert_eq!(cfg["profile"], "archival");
+    assert_eq!(cfg["storage"]["txindex"].as_bool(), Some(true));
+    assert_eq!(cfg["storage"]["prune_mb"].as_u64(), Some(0));
+    node.stop();
+}
+
+#[test]
+fn test_getconfig_redacts_sensitive_fields() {
+    // Password fields must never be echoed back through getconfig,
+    // even when set via CLI.
+    let mut node = TestNode::start(&[
+        "--rpcuser=alice",
+        "--rpcpassword=secret-sauce",
+    ]);
+    // User/pass auth mode — TestNode's rpc_call uses cookie, which
+    // doesn't exist here. Call raw with basic auth.
+    let url = format!("http://127.0.0.1:{}/", node.rpcport);
+    let client = reqwest::blocking::Client::new();
+    let resp: serde_json::Value = client
+        .post(&url)
+        .basic_auth("alice", Some("secret-sauce"))
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0", "id": "t", "method": "getconfig", "params": []
+        }))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    let cfg = &resp["result"];
+    let serialized = cfg.to_string();
+    assert!(
+        !serialized.contains("secret-sauce"),
+        "getconfig must redact rpcpassword; got: {}",
+        serialized
+    );
+    assert_eq!(cfg["rpc"]["password"], "(set)");
+
+    // Also cleanly stop the node via authenticated RPC.
+    let _ = client
+        .post(&url)
+        .basic_auth("alice", Some("secret-sauce"))
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0", "id": "s", "method": "stop", "params": []
+        }))
+        .send();
+    // Drop `node` via its Drop/stop isn't safe here (cookie empty) — the
+    // child process will be reaped by the test harness's exit sequence
+    // or by the explicit stop we just sent.
+    let exit_deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < exit_deadline {
+        if node.process.try_wait().unwrap().is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    if node.process.try_wait().unwrap().is_none() {
+        let _ = node.process.kill();
+    }
+}
+
+#[test]
+fn test_log_format_json_emits_valid_json_with_trace_id() {
+    // Launch satd with --log-format=json and capture stderr to a file.
+    // Assert at least one line parses as a JSON object containing the
+    // stable fields (timestamp, level, fields.message). When a block is
+    // mined, the corresponding span carries a trace_id we can verify.
+    let rpcport = find_available_port();
+    let p2p_port = find_available_port();
+    let datadir = std::env::temp_dir().join(format!("satd-jsonlog-{}", rpcport));
+    let _ = std::fs::remove_dir_all(&datadir);
+    std::fs::create_dir_all(&datadir).unwrap();
+
+    let log_path = datadir.join("stderr.log");
+    let log_file = std::fs::File::create(&log_path).unwrap();
+    let satd_bin = env!("CARGO_BIN_EXE_satd");
+
+    let mut child = Command::new(satd_bin)
+        .arg("--regtest")
+        .arg(format!("--datadir={}", datadir.display()))
+        .arg(format!("--rpcport={}", rpcport))
+        .arg(format!("--port={}", p2p_port))
+        .arg("--log-format=json")
+        .stdout(log_file)
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("Failed to start satd with --log-format=json");
+
+    // Wait for readiness then mine one block so we generate a connect span.
+    let cookie_path = datadir.join("regtest").join(".cookie");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut cookie = String::new();
+    while Instant::now() < deadline {
+        if let Ok(c) = std::fs::read_to_string(&cookie_path)
+            && !c.is_empty()
+        {
+            cookie = c;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(!cookie.is_empty(), "cookie never appeared — startup failed");
+
+    let url = format!("http://127.0.0.1:{}/", rpcport);
+    let (user, pass) = cookie.split_once(':').unwrap_or(("__cookie__", "none"));
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+
+    // Wait for RPC readiness — require a valid `chain` field in the
+    // getblockchaininfo result, not just HTTP 200 (auth error pages
+    // also return 200 with a JSON-RPC error body).
+    let mut rpc_ready = false;
+    let rpc_deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < rpc_deadline {
+        let resp = client
+            .post(&url)
+            .basic_auth(user, Some(pass))
+            .json(&serde_json::json!({
+                "jsonrpc": "2.0", "id": "r", "method": "getblockchaininfo", "params": []
+            }))
+            .send();
+        if let Ok(r) = resp
+            && let Ok(v) = r.json::<serde_json::Value>()
+            && v["result"]["chain"].as_str().is_some()
+        {
+            rpc_ready = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(rpc_ready, "RPC never became ready");
+
+    // Mine a block to generate a connect span. Poll block count until it
+    // advances so we know the log has a connect event by the time we stop.
+    let mine_resp = client
+        .post(&url)
+        .basic_auth(user, Some(pass))
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0", "id": "m", "method": "generatetoaddress",
+            "params": [1, "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202"],
+        }))
+        .send()
+        .expect("generatetoaddress request failed");
+    let mine_json: serde_json::Value = mine_resp.json().expect("mine response not JSON");
+    assert!(
+        mine_json["error"].is_null(),
+        "generatetoaddress error: {}",
+        mine_json["error"]
+    );
+    let mine_deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < mine_deadline {
+        let resp = client
+            .post(&url)
+            .basic_auth(user, Some(pass))
+            .json(&serde_json::json!({
+                "jsonrpc": "2.0", "id": "bc", "method": "getblockcount", "params": []
+            }))
+            .send();
+        if let Ok(r) = resp
+            && let Ok(v) = r.json::<serde_json::Value>()
+            && v["result"].as_u64().unwrap_or(0) >= 1
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // Graceful shutdown so logs flush.
+    let _ = client
+        .post(&url)
+        .basic_auth(user, Some(pass))
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0", "id": "s", "method": "stop", "params": [],
+        }))
+        .send();
+    let exit_deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < exit_deadline {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    if child.try_wait().unwrap().is_none() {
+        let _ = child.kill();
+    }
+
+    let logs = std::fs::read_to_string(&log_path).unwrap();
+    let mut parsed_lines = 0usize;
+    let mut saw_trace_id = false;
+    let mut saw_required_fields = false;
+    for line in logs.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            panic!(
+                "--log-format=json emitted non-JSON line:\n{}\nfull logs:\n{}",
+                line, logs
+            );
+        };
+        parsed_lines += 1;
+        let obj = v.as_object().expect("log line must be a JSON object");
+        if obj.contains_key("timestamp") && obj.contains_key("level") && obj.contains_key("fields")
+        {
+            saw_required_fields = true;
+        }
+        // Check any span carries a trace_id — the connect / accept paths
+        // all open an info_span with a trace_id field. With
+        // `with_current_span(true)`, the current span appears in a `span`
+        // or `spans` field of each event.
+        let as_str = v.to_string();
+        if as_str.contains("trace_id") {
+            saw_trace_id = true;
+        }
+    }
+    assert!(
+        parsed_lines > 0,
+        "--log-format=json produced no lines. logs:\n{}",
+        logs
+    );
+    assert!(
+        saw_required_fields,
+        "no JSON line had the stable required fields (timestamp, level, fields); logs:\n{}",
+        logs
+    );
+    assert!(
+        saw_trace_id,
+        "no JSON line carried a trace_id from a validation span; logs:\n{}",
+        logs
+    );
+
+    let _ = std::fs::remove_dir_all(&datadir);
+}

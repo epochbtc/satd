@@ -25,14 +25,8 @@ use std::sync::Arc;
 
 #[tokio::main]
 async fn main() {
-    // Initialize logging
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-
+    // Config must be parsed before tracing init so --log-format can select
+    // the formatter. Config parse errors go to stderr as plain text.
     let config = match Config::load() {
         Ok(c) => c,
         Err(e) => {
@@ -40,6 +34,24 @@ async fn main() {
             std::process::exit(1);
         }
     };
+
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    match config.log_format {
+        config::LogFormat::Json => {
+            // Stable JSON shape: `timestamp`, `level`, `target`,
+            // `fields.message`, plus any per-event structured fields.
+            tracing_subscriber::fmt()
+                .json()
+                .with_current_span(true)
+                .with_span_list(false)
+                .with_env_filter(env_filter)
+                .init();
+        }
+        config::LogFormat::Text => {
+            tracing_subscriber::fmt().with_env_filter(env_filter).init();
+        }
+    }
 
     tracing::info!(
         network = %config.network,
@@ -297,6 +309,27 @@ async fn main() {
         "Chain state initialized"
     );
 
+    // Open reorg log + optional webhook dispatcher. Failure is non-fatal
+    // — the node still runs, just without persistent reorg history.
+    match node::chain::reorg_log::ReorgLog::open(
+        &net_datadir,
+        node::chain::reorg_log::DEFAULT_RING_CAPACITY,
+    ) {
+        Ok(log) => {
+            let reorg_log = Arc::new(log);
+            if let Some(url) = config.reorg_webhook.clone() {
+                let (tx, rx) = tokio::sync::mpsc::channel::<node::chain::reorg_log::ReorgRecord>(64);
+                reorg_log.set_webhook_sender(tx);
+                let secret = config.reorg_webhook_secret.clone();
+                tokio::spawn(reorg_webhook_dispatcher(url, secret, rx));
+            }
+            chain_state.attach_reorg_log(reorg_log);
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to open reorg log; running without persistent reorg history");
+        }
+    }
+
     // Run reindex replay if requested
     if config.reindex {
         if let Err(e) = chain_state.reindex_from_blocks(reindex_blocks.unwrap()) {
@@ -391,6 +424,7 @@ async fn main() {
 
     let bind_addr = rpc_bind;
 
+    let effective_config_view = config.effective_view();
     let server_handle = match node::rpc::server::start(
         bind_addr,
         auth.clone(),
@@ -400,6 +434,7 @@ async fn main() {
         fee_estimator.clone(),
         shutdown_tx,
         last_shutdown_clean,
+        effective_config_view,
     )
     .await
     {
@@ -701,4 +736,88 @@ async fn start_startup_rpc(
         .expect("Failed to start startup RPC server");
 
     server.start(module)
+}
+
+/// Forwards reorg records to the configured HTTP webhook. Best effort —
+/// failures are logged and dropped. Never blocks the consensus path:
+/// the only backpressure is the channel itself, which `ReorgLog::record`
+/// `try_send`s into (full queue = silent drop, counted).
+async fn reorg_webhook_dispatcher(
+    url: String,
+    secret: Option<String>,
+    mut rx: tokio::sync::mpsc::Receiver<node::chain::reorg_log::ReorgRecord>,
+) {
+    use reqwest::header::{HeaderMap, HeaderValue};
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to build reorg webhook HTTP client");
+            return;
+        }
+    };
+    tracing::info!(url = %url, signed = secret.is_some(), "Reorg webhook dispatcher started");
+    while let Some(record) = rx.recv().await {
+        let body = match serde_json::to_vec(&record) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to serialize reorg record for webhook");
+                continue;
+            }
+        };
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            reqwest::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        if let Some(ref key) = secret {
+            let sig = hmac_sha256_hex(key.as_bytes(), &body);
+            if let Ok(h) = HeaderValue::from_str(&format!("sha256={}", sig)) {
+                headers.insert("X-Satd-Signature", h);
+            }
+        }
+
+        // Simple retry loop: 3 attempts with jittered backoff. A failing
+        // webhook must not back up consensus, so we stop after 3 and move
+        // on to the next record.
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            match client
+                .post(&url)
+                .headers(headers.clone())
+                .body(body.clone())
+                .send()
+                .await
+            {
+                Ok(r) if r.status().is_success() => break,
+                Ok(r) => {
+                    tracing::warn!(status = %r.status(), attempt, "Reorg webhook returned non-2xx");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, attempt, "Reorg webhook request failed");
+                }
+            }
+            if attempt >= 3 {
+                break;
+            }
+            let backoff_ms = 200u64 * (1 << (attempt - 1));
+            tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+        }
+    }
+    tracing::info!("Reorg webhook dispatcher stopped");
+}
+
+/// HMAC-SHA256 over `msg` keyed by `key`, hex-encoded. Pure Rust so we
+/// don't pull in yet another dep; reorg rate is low so the tiny-fast-
+/// crypto path is unnecessary.
+fn hmac_sha256_hex(key: &[u8], msg: &[u8]) -> String {
+    use bitcoin::hashes::{Hash, HashEngine, Hmac, HmacEngine, sha256};
+    let mut hmac: HmacEngine<sha256::Hash> = HmacEngine::new(key);
+    hmac.input(msg);
+    let out = Hmac::<sha256::Hash>::from_engine(hmac);
+    hex::encode(out.to_byte_array())
 }

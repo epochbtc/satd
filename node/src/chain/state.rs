@@ -106,6 +106,10 @@ pub struct ChainState {
     mtp_cache: Mutex<Vec<(u32, u32)>>,
     /// Number of threads for parallel script verification.
     num_threads: usize,
+    /// Persistent reorg history + optional webhook dispatch.
+    /// Lazily initialized by `open_reorg_log` — may be absent in tests
+    /// that don't care about reorg observability.
+    reorg_log: std::sync::OnceLock<std::sync::Arc<crate::chain::reorg_log::ReorgLog>>,
 }
 
 impl ChainState {
@@ -176,6 +180,7 @@ impl ChainState {
                     headers_tip_height: AtomicU32::new(htip),
                     mtp_cache: Mutex::new(Vec::with_capacity(12)),
                     num_threads,
+                    reorg_log: std::sync::OnceLock::new(),
                 });
             }
 
@@ -219,7 +224,20 @@ impl ChainState {
             headers_tip_height: AtomicU32::new(0),
             mtp_cache: Mutex::new(Vec::with_capacity(12)),
             num_threads,
+            reorg_log: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Attach a reorg log. Must be called before the chain state sees
+    /// any reorgs; subsequent calls are no-ops (OnceLock).
+    pub fn attach_reorg_log(&self, log: std::sync::Arc<crate::chain::reorg_log::ReorgLog>) {
+        let _ = self.reorg_log.set(log);
+    }
+
+    /// Access the attached reorg log, if any. None if `attach_reorg_log`
+    /// was never called (the test path).
+    pub fn reorg_log(&self) -> Option<&std::sync::Arc<crate::chain::reorg_log::ReorgLog>> {
+        self.reorg_log.get()
     }
 
     pub fn tip_hash(&self) -> BlockHash {
@@ -585,6 +603,14 @@ impl ChainState {
         &self,
         pre: crate::chain::prefetch::PreprocessedBlock,
     ) -> Result<BlockHash, ChainError> {
+        let trace_id = rand::random::<u32>();
+        let _span = tracing::info_span!(
+            "connect",
+            trace_id = trace_id,
+            height = pre.height,
+            block = %pre.entry.header.block_hash()
+        )
+        .entered();
         // Verify parent is current tip (same check as connect_stored_block)
         let current_tip = self.tip_hash();
         if pre.entry.header.prev_blockhash != current_tip {
@@ -792,6 +818,14 @@ impl ChainState {
             .store
             .get_block_index(hash)
             .ok_or(ChainError::BadPrevBlock)?;
+        let trace_id = rand::random::<u32>();
+        let _span = tracing::info_span!(
+            "connect_stored",
+            trace_id = trace_id,
+            height = entry.height,
+            block = %hash
+        )
+        .entered();
 
         if entry.status != BlockStatus::DataStored {
             return Err(ChainError::Duplicate);
@@ -1013,6 +1047,13 @@ impl ChainState {
     /// Accept a new block into the chain.
     pub fn accept_block(&self, block: &Block) -> Result<BlockHash, ChainError> {
         let block_hash = block.block_hash();
+        let trace_id = rand::random::<u32>();
+        let _span = tracing::info_span!(
+            "accept_block",
+            trace_id = trace_id,
+            block = %block_hash
+        )
+        .entered();
 
         // Check for duplicate (HeaderOnly entries are OK — we're now providing data)
         if let Some(existing) = self.store.get_block_index(&block_hash)
@@ -1227,9 +1268,23 @@ impl ChainState {
     /// Disconnect blocks from current tip down to the fork point (parent of the new chain).
     /// All disconnections are batched into a single atomic write.
     fn perform_reorg(&self, fork_entry: &BlockIndexEntry, old_tip: BlockHash) -> Result<(), ChainError> {
+        let trace_id = rand::random::<u32>();
+        let _span = tracing::info_span!(
+            "reorg",
+            trace_id = trace_id,
+            old_tip = %old_tip,
+            fork_height = fork_entry.height
+        )
+        .entered();
         let fork_hash = fork_entry.header.block_hash();
         let mut current = old_tip;
         let mut combined_batch = crate::storage::StoreBatch::default();
+        let mut disconnected_hashes: Vec<BlockHash> = Vec::new();
+        let old_height = self
+            .store
+            .get_block_index(&old_tip)
+            .map(|e| e.height)
+            .unwrap_or(fork_entry.height);
 
         // Walk back from old tip to fork point, accumulating disconnect batches
         loop {
@@ -1250,6 +1305,7 @@ impl ChainState {
             let batch = disconnect::disconnect_block(&block, &undo, entry.height, prev_hash);
             combined_batch.merge(batch);
 
+            disconnected_hashes.push(current);
             tracing::info!(height = entry.height, hash = %current, "Block disconnected");
             current = prev_hash;
         }
@@ -1262,6 +1318,22 @@ impl ChainState {
             let mut tip = self.tip.write().unwrap();
             tip.hash = fork_hash;
             tip.height = fork_entry.height;
+        }
+
+        // Persist a reorg record. The new-tip is the fork-point here;
+        // the caller (activate_best_chain) then connects the side-chain
+        // blocks. Reconnected hashes are recorded in that follow-up
+        // pass (we return them so the caller can append).
+        if let Some(log) = self.reorg_log.get() {
+            let record = crate::chain::reorg_log::ReorgRecord::new(
+                fork_entry.height,
+                old_tip,
+                fork_hash,
+                old_height,
+                disconnected_hashes,
+                Vec::new(),
+            );
+            log.record(record);
         }
 
         Ok(())
