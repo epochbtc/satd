@@ -25,16 +25,25 @@ pub fn draw(f: &mut Frame, state: &AppState) {
         ])
         .split(size);
 
-    // Title bar
+    // Title bar with health dot.
     let uptime_str = state.uptime_secs
         .map(|s| format!(" up {} ", format_duration(s)))
         .unwrap_or_default();
+    let (dot_glyph, dot_color, health_label) = if state.is_healthy() {
+        ("● ", Color::Green, "ready")
+    } else if state.stale || !state.connected {
+        ("✕ ", Color::Red, "stale")
+    } else {
+        ("○ ", Color::Yellow, "syncing")
+    };
     let title = Line::from(vec![
         Span::styled(" satd ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
         Span::styled(
             format!(" {} ", state.chain_name),
             Style::default().fg(Color::White),
         ),
+        Span::styled(dot_glyph, Style::default().fg(dot_color).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("{} ", health_label), Style::default().fg(dot_color)),
         Span::styled(" v0.1.0 ", Style::default().fg(Color::DarkGray)),
         Span::styled(uptime_str, Style::default().fg(Color::DarkGray)),
     ]);
@@ -54,18 +63,26 @@ pub fn draw(f: &mut Frame, state: &AppState) {
     let table = peer_table(&state.peers, None, &state.peer_dl_rates, state.selected_peer, &peer_title);
     f.render_widget(table, chunks[4]);
 
-    // Footer
-    let footer = Line::from(vec![
+    // Footer — keybindings plus an unclean-shutdown hint if applicable.
+    let mut spans = vec![
         Span::styled("q", Style::default().fg(Color::White)),
         Span::styled(": quit  ", Style::default().fg(Color::DarkGray)),
         Span::styled("h", Style::default().fg(Color::White)),
         Span::styled(": help  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("r", Style::default().fg(Color::White)),
+        Span::styled(": reorgs  ", Style::default().fg(Color::DarkGray)),
         Span::styled("1/2", Style::default().fg(Color::White)),
-        Span::styled(": switch view  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(": view  ", Style::default().fg(Color::DarkGray)),
         Span::raw("\u{2191}\u{2193}"),
-        Span::styled(": scroll peers", Style::default().fg(Color::DarkGray)),
-    ]);
-    f.render_widget(Paragraph::new(footer), chunks[5]);
+        Span::styled(": peers", Style::default().fg(Color::DarkGray)),
+    ];
+    if state.last_shutdown.as_deref() == Some("dirty") {
+        spans.push(Span::styled(
+            "   ⚠ previous shutdown was unclean",
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), chunks[5]);
 }
 
 fn draw_top_row(f: &mut Frame, area: Rect, state: &AppState) {
@@ -211,45 +228,52 @@ fn draw_middle_row(f: &mut Frame, area: Rect, state: &AppState) {
         }
     }
 
-    // Fee estimates
+    // Fees — 4-tier mempool.space-style summary
     if !state.loaded.fee_estimates {
-        render_loading_panel(f, cols[1], " Fee Estimates (sat/vB) ");
+        render_loading_panel(f, cols[1], " Fees (sat/vB) ");
     } else {
         let fee_block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::DarkGray))
             .title(Span::styled(
-                " Fee Estimates (sat/vB) ",
+                " Fees (sat/vB) ",
                 Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
             ));
         let fee_inner = fee_block.inner(cols[1]);
         f.render_widget(fee_block, cols[1]);
 
-        let targets = [1u32, 3, 6, 12, 25];
-        let colors = [Color::Red, Color::LightRed, Color::Yellow, Color::LightGreen, Color::Green];
-        let max_fee = state.fee_estimates.iter()
-            .filter_map(|f| *f)
+        let tiers: [(&str, Option<f64>, Color); 4] = [
+            ("High    (next block)", state.fees.high, Color::Red),
+            ("Medium  (~30 min)   ", state.fees.medium, Color::LightRed),
+            ("Low     (~1 hour)   ", state.fees.low, Color::Yellow),
+            ("None    (economy)   ", state.fees.none, Color::Green),
+        ];
+        let max_fee = tiers
+            .iter()
+            .filter_map(|(_, f, _)| *f)
             .fold(0.0f64, f64::max)
             .max(1.0);
 
-        for (i, (&target, &color)) in targets.iter().zip(colors.iter()).enumerate() {
+        for (i, (label, fee_opt, color)) in tiers.iter().enumerate() {
             if i >= fee_inner.height as usize {
                 break;
             }
-            let fee = state.fee_estimates[i].unwrap_or(0.0);
+            let fee = fee_opt.unwrap_or(0.0);
+            let bar_budget = (fee_inner.width as isize - 32).max(0) as f64;
             let bar_width = if max_fee > 0.0 {
-                ((fee / max_fee) * (fee_inner.width as f64 - 16.0).max(0.0)) as usize
+                ((fee / max_fee) * bar_budget).round() as usize
             } else {
                 0
             };
-
-            let label = format!("{:>3} blk  ", target);
             let bar: String = "\u{2588}".repeat(bar_width);
-            let fee_label = format!("  {:.1}", fee);
+            let fee_label = match fee_opt {
+                Some(_) => format!("  {:.1}", fee),
+                None => "  -".into(),
+            };
 
             let line = Line::from(vec![
-                Span::styled(label, Style::default().fg(Color::Gray)),
-                Span::styled(bar, Style::default().fg(color)),
+                Span::styled(format!("  {:<21}", label), Style::default().fg(Color::Gray)),
+                Span::styled(bar, Style::default().fg(*color)),
                 Span::styled(fee_label, Style::default().fg(Color::White)),
             ]);
 
@@ -260,6 +284,31 @@ fn draw_middle_row(f: &mut Frame, area: Rect, state: &AppState) {
                 height: 1,
             };
             f.render_widget(Paragraph::new(line), line_area);
+        }
+
+        // Mode + confidence footer inside the fee panel.
+        if fee_inner.height >= 6 {
+            let mode = state.fees.mode.as_deref().unwrap_or("?");
+            let conf = state.fees.confidence.as_deref().unwrap_or("?");
+            let conf_color = match conf {
+                "high" => Color::Green,
+                "medium" => Color::Yellow,
+                "low" => Color::LightRed,
+                _ => Color::DarkGray,
+            };
+            let footer_line = Line::from(vec![
+                Span::styled("  mode: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(mode.to_string(), Style::default().fg(Color::Cyan)),
+                Span::styled("  confidence: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(conf.to_string(), Style::default().fg(conf_color)),
+            ]);
+            let footer_area = Rect {
+                x: fee_inner.x,
+                y: fee_inner.y + 5,
+                width: fee_inner.width,
+                height: 1,
+            };
+            f.render_widget(Paragraph::new(footer_line), footer_area);
         }
     }
 }

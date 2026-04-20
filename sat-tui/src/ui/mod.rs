@@ -1,5 +1,6 @@
 pub mod help;
 pub mod ibd;
+pub mod reorgs;
 pub mod steady;
 
 use ratatui::style::{Color, Style};
