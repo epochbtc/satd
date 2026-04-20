@@ -809,7 +809,13 @@ fn test_estimatefees_default_shape() {
     assert!(result.contains_key("mode"));
     assert!(result.contains_key("fallback"));
     assert!(result.contains_key("mempool_weight"));
+    assert!(result.contains_key("economy_feerate"));
+    assert!(result.contains_key("thin_block"));
     assert_eq!(result["mode"], "blend");
+    // Fresh node → block 0 is empty → thin.
+    assert_eq!(result["thin_block"].as_bool(), Some(true));
+    // Economy feerate is present and > 0.
+    assert!(result["economy_feerate"].as_f64().unwrap() > 0.0);
 
     let targets = result["targets"].as_object().unwrap();
     for key in ["1", "3", "6", "12", "24"] {
