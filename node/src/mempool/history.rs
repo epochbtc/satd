@@ -85,7 +85,15 @@ pub struct MempoolHistory {
 impl MempoolHistory {
     /// Open (or create) the log at `$net_datadir/mempool_history.log`
     /// and seed the ring from its tail.
+    ///
+    /// Actively probes writability of `net_datadir` by creating,
+    /// fsyncing, and unlinking a small `.mempool_history.probe` file.
+    /// If that probe fails we return the underlying io::Error so the
+    /// caller can fall back cleanly — this is what makes
+    /// `getmempoolhistory`'s `available: true` a real persistence
+    /// guarantee rather than just "we constructed a struct."
     pub fn open(net_datadir: &std::path::Path, capacity: usize) -> std::io::Result<Self> {
+        probe_writability(net_datadir)?;
         let path = net_datadir.join("mempool_history.log");
         let ring = seed_ring_from_file(&path, capacity);
         let last_sig = ring.back().map(SnapshotSig::from);
@@ -211,6 +219,33 @@ fn seed_ring_from_file(path: &std::path::Path, capacity: usize) -> VecDeque<Memp
     ring
 }
 
+/// Prove that `dir` exists and accepts create + fsync + unlink. The
+/// probe file is named so it sorts next to the log and is obviously
+/// internal — if a probe ever leaks onto disk after a crash, an
+/// operator can identify and remove it.
+fn probe_writability(dir: &std::path::Path) -> std::io::Result<()> {
+    // `create_dir_all` is idempotent — if the datadir was pre-made by
+    // the caller this is a no-op, otherwise it ensures the parent
+    // exists before we try to write into it.
+    std::fs::create_dir_all(dir)?;
+    let probe_path = dir.join(".mempool_history.probe");
+    {
+        let mut f = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&probe_path)?;
+        f.write_all(b"probe\n")?;
+        f.sync_all()?;
+    }
+    // Best-effort cleanup. If unlink fails (e.g. read-only filesystem
+    // that somehow accepted the write — unlikely but possible on
+    // misconfigured NFS), surface the error so the caller doesn't
+    // advertise persistence that won't survive restart.
+    std::fs::remove_file(&probe_path)?;
+    Ok(())
+}
+
 fn append_jsonl(path: &std::path::Path, line: &str) -> std::io::Result<()> {
     let mut f = OpenOptions::new().create(true).append(true).open(path)?;
     f.write_all(line.as_bytes())?;
@@ -311,6 +346,32 @@ mod tests {
         );
         let h = log.history(u64::MAX);
         assert_eq!(h.len(), 2, "both snapshots must land in the ring");
+    }
+
+    #[test]
+    fn open_fails_when_datadir_is_unwritable() {
+        // Point `open` at a path whose parent can't be created — a
+        // regular file masquerading as a directory. The probe must
+        // fail, and we must bubble the error so `main.rs` records
+        // `available: false` instead of claiming persistence.
+        let dir = tempdir().unwrap();
+        let blocker = dir.path().join("not_a_dir");
+        std::fs::write(&blocker, b"file-shaped").unwrap();
+        let bad_datadir = blocker.join("history_subdir");
+        assert!(
+            MempoolHistory::open(&bad_datadir, 10).is_err(),
+            "open should refuse unwritable datadirs so `available` is honest"
+        );
+    }
+
+    #[test]
+    fn open_leaves_no_probe_file_behind_on_success() {
+        let dir = tempdir().unwrap();
+        let _log = MempoolHistory::open(dir.path(), 10).unwrap();
+        // Internal detail but worth pinning: a healthy open cleans up
+        // its probe so operators don't see a stray dotfile.
+        let probe = dir.path().join(".mempool_history.probe");
+        assert!(!probe.exists(), "probe file must not linger after open");
     }
 
     #[test]
