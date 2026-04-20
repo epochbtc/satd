@@ -1,5 +1,6 @@
 pub mod help;
 pub mod ibd;
+pub mod mempool;
 pub mod reorgs;
 pub mod steady;
 
