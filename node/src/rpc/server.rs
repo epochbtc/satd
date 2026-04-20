@@ -1,5 +1,6 @@
 use crate::chain::state::ChainState;
 use crate::mempool::fee::FeeEstimator;
+use crate::mempool::history::MempoolHistory;
 use crate::mempool::pool::Mempool;
 use crate::net::manager::PeerManager;
 use crate::rpc::amounts::{annotate_units, default_unit, format_amount, format_feerate_sat_per_kvb};
@@ -28,6 +29,8 @@ pub struct RpcContext {
     /// Computed once at startup (the server does not hot-reload config).
     /// Secret fields (passwords) are already redacted by the producer.
     pub effective_config: serde_json::Value,
+    /// Ring of periodic mempool snapshots for `getmempoolhistory`.
+    pub mempool_history: Arc<MempoolHistory>,
 }
 
 /// Which data source `estimatesmartfee` / `estimatefees` draws from.
@@ -115,6 +118,7 @@ pub async fn start(
     shutdown_tx: watch::Sender<bool>,
     last_shutdown_clean: bool,
     effective_config: serde_json::Value,
+    mempool_history: Arc<MempoolHistory>,
 ) -> Result<ServerHandle, Box<dyn std::error::Error + Send + Sync>> {
     let ctx = Arc::new(RpcContext {
         chain_state,
@@ -125,6 +129,7 @@ pub async fn start(
         start_time: std::time::Instant::now(),
         last_shutdown_clean,
         effective_config,
+        mempool_history,
     });
 
     let mut module = RpcModule::new(ctx);
@@ -235,12 +240,40 @@ pub async fn start(
     })?;
 
     module.register_method("getmempoolentry", |params, ctx, _extensions| {
-        let txid: String = params.one().map_err(|e| {
+        // Accepts either a single txid string (Core-compat) or an array
+        // of txids (bulk). On bulk, returns a map of txid → entry | null.
+        let mut seq = params.sequence();
+        let first: serde_json::Value = seq.next().map_err(|e| {
             ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
         })?;
-        blockchain::get_mempool_entry(&ctx.mempool, &txid).map_err(|e| {
-            ErrorObjectOwned::owned(-5, e, None::<()>)
-        })
+        match first {
+            serde_json::Value::Array(arr) => {
+                let mut txids: Vec<String> = Vec::with_capacity(arr.len());
+                for v in arr {
+                    match v {
+                        serde_json::Value::String(s) => txids.push(s),
+                        other => {
+                            return Err(ErrorObjectOwned::owned(
+                                -1,
+                                format!("expected string txid, got {}", other),
+                                None::<()>,
+                            ));
+                        }
+                    }
+                }
+                Ok::<_, ErrorObjectOwned>(blockchain::get_mempool_entries_bulk(
+                    &ctx.mempool,
+                    &txids,
+                ))
+            }
+            serde_json::Value::String(s) => blockchain::get_mempool_entry(&ctx.mempool, &s)
+                .map_err(|e| ErrorObjectOwned::owned(-5, e, None::<()>)),
+            other => Err(ErrorObjectOwned::owned(
+                -1,
+                format!("expected string txid or array of txids, got {}", other),
+                None::<()>,
+            )),
+        }
     })?;
 
     module.register_method("preciousblock", |params, _ctx, _extensions| {
@@ -854,7 +887,7 @@ pub async fn start(
             "getblocktemplate", "getchaintips", "getchaintxstats", "getconfig",
             "getconnectioncount",
             "getdifficulty", "getibdprogress", "getmempoolancestors", "getmempooldescendants",
-            "getmempoolentry", "getmempoolinfo", "getmemoryinfo", "getmininginfo",
+            "getmempoolentry", "getmempoolhistory", "getmempoolinfo", "getmemoryinfo", "getmininginfo",
             "getnettotals", "getnetworkhashps", "getnetworkinfo", "getpeerinfo",
             "getrawmempool", "getrawtransaction", "getreorghistory", "getrpcinfo",
             "getsysteminfo", "gettxout",
@@ -863,7 +896,7 @@ pub async fn start(
             "savemempool", "sendrawtransaction", "setban",
             "signrawtransactionwithkey",
             "setnetworkactive", "stop", "submitblock", "submitheader",
-            "testmempoolaccept", "uptime", "verifychain",
+            "subscribemempool", "testmempoolaccept", "unsubscribemempool", "uptime", "verifychain",
         ];
         Ok::<_, ErrorObjectOwned>(serde_json::json!(methods.join("\n")))
     })?;
@@ -900,6 +933,64 @@ pub async fn start(
             "records": arr,
         }))
     })?;
+
+    module.register_method("getmempoolhistory", |params, ctx, _extensions| {
+        // `getmempoolhistory [since_secs]` — default 3600 (1 h).
+        let mut seq = params.sequence();
+        let since_secs: u64 = seq
+            .optional_next()
+            .unwrap_or(Some(3_600))
+            .unwrap_or(3_600);
+        let snapshots = ctx.mempool_history.history(since_secs);
+        let arr: Vec<serde_json::Value> = snapshots
+            .into_iter()
+            .map(|s| serde_json::to_value(s).unwrap_or(serde_json::Value::Null))
+            .collect();
+        Ok::<_, ErrorObjectOwned>(serde_json::json!({
+            "since_secs": since_secs,
+            "snapshots": arr,
+        }))
+    })?;
+
+    module.register_subscription(
+        "subscribemempool",
+        "mempoolevent",
+        "unsubscribemempool",
+        |_params, pending, ctx, _ext| async move {
+            use jsonrpsee::core::SubscriptionError;
+            // Reject the subscription cleanly if the mempool wasn't
+            // wired with an event sender (tests / startup race).
+            let Some(mut rx) = ctx.mempool.subscribe_events() else {
+                pending
+                    .reject(ErrorObjectOwned::owned(
+                        -32603,
+                        "mempool event channel not wired",
+                        None::<()>,
+                    ))
+                    .await;
+                return Ok::<(), SubscriptionError>(());
+            };
+            let sink = pending.accept().await.map_err(SubscriptionError::from)?;
+            loop {
+                match rx.recv().await {
+                    Ok(event) => {
+                        let raw = jsonrpsee::core::to_json_raw_value(&event)
+                            .map_err(SubscriptionError::from)?;
+                        if sink.send(raw).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        // Subscriber fell behind; skip ahead — the
+                        // docs advertise best-effort semantics.
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            Ok(())
+        },
+    )?;
 
     module.register_method("getsysteminfo", |_params, ctx, _extensions| {
         let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();

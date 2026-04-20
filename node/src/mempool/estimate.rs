@@ -68,7 +68,7 @@ pub struct SimBlock {
 }
 
 /// One bucket in the mempool feerate histogram.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct HistogramBucket {
     /// Inclusive lower bound of this bucket in sat/kvB.
     pub feerate_sat_per_kvb: u64,
@@ -256,7 +256,10 @@ fn simulate_one_block(remaining: &HashMap<Txid, MempoolEntry>) -> (SimBlock, Has
 }
 
 /// Bucket entries by their own (not ancestor) feerate.
-fn build_histogram(entries: &HashMap<Txid, MempoolEntry>) -> Vec<HistogramBucket> {
+/// Bucket mempool entries by their own (not ancestor) feerate. Public
+/// so `mempool::history` can reuse the same boundaries as the live
+/// estimator without copying the bin math.
+pub fn build_histogram(entries: &HashMap<Txid, MempoolEntry>) -> Vec<HistogramBucket> {
     let bounds_kvb: Vec<u64> = HISTOGRAM_BOUNDARIES_SAT_PER_VB
         .iter()
         .map(|v| v * 1000)

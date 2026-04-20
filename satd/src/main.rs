@@ -345,6 +345,10 @@ async fn main() {
         std::process::exit(1);
     }
 
+    // Shutdown channel — created before the mempool so the snapshotter
+    // task can subscribe to it.
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+
     // Initialize mempool with policy from config
     let mempool = Arc::new(Mempool::with_config(MempoolConfig {
         max_size_bytes: config.maxmempool * 1_000_000,
@@ -360,8 +364,53 @@ async fn main() {
     }));
     let fee_estimator = Arc::new(FeeEstimator::new());
 
-    // Shutdown channel
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    // Wire the mempool event broadcaster used by `subscribemempool`.
+    let (mempool_event_tx, _) = tokio::sync::broadcast::channel::<
+        node::mempool::events::MempoolEvent,
+    >(node::mempool::pool::EVENT_BROADCAST_CAPACITY);
+    mempool.set_event_sender(mempool_event_tx);
+
+    // Open the mempool history ring + spawn the snapshotter task.
+    // Failure is non-fatal — the node still runs without persistent
+    // history. 10 s cadence × 256-entry ring ≈ 40 min of coverage.
+    let mempool_history = match node::mempool::history::MempoolHistory::open(
+        &net_datadir,
+        node::mempool::history::DEFAULT_RING_CAPACITY,
+    ) {
+        Ok(h) => {
+            let arc = Arc::new(h);
+            let snap_arc = arc.clone();
+            let snap_mempool = mempool.clone();
+            let mut snap_shutdown = shutdown_rx.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+                loop {
+                    tokio::select! {
+                        _ = snap_shutdown.changed() => break,
+                        _ = interval.tick() => {
+                            let snap = node::mempool::history::snapshot_from_mempool(&snap_mempool);
+                            snap_arc.record_if_changed(snap);
+                        }
+                    }
+                }
+            });
+            arc
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to open mempool history; running without it");
+            // Ephemeral fallback so RpcContext still has an Arc to hold.
+            // All history() calls return empty. Use a temp dir under /tmp
+            // so writes fail fast and don't pollute the datadir.
+            let tmp = std::env::temp_dir().join("satd-mempool-history-fallback");
+            Arc::new(
+                node::mempool::history::MempoolHistory::open(
+                    &tmp,
+                    node::mempool::history::DEFAULT_RING_CAPACITY,
+                )
+                .expect("fallback history open should succeed"),
+            )
+        }
+    };
 
     // Initialize P2P peer manager
     let peer_manager = node::net::manager::PeerManager::with_config(
@@ -435,6 +484,7 @@ async fn main() {
         shutdown_tx,
         last_shutdown_clean,
         effective_config_view,
+        mempool_history.clone(),
     )
     .await
     {
@@ -457,6 +507,8 @@ async fn main() {
             fee_estimator: fee_estimator.clone(),
             start_time: std::time::Instant::now(),
             network: config.network,
+            effective_config: config.effective_view(),
+            mempool_history: Some(mempool_history.clone()),
         });
 
         if config.mcp_stdio {

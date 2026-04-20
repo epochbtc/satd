@@ -173,6 +173,30 @@ struct ValidateAddressParams {
     address: String,
 }
 
+#[derive(Deserialize, schemars::JsonSchema)]
+struct GetMempoolEntriesBulkParams {
+    #[schemars(description = "Array of transaction IDs (hex). Missing entries return as `null`.")]
+    txids: Vec<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct GetMempoolHistoryParams {
+    #[schemars(description = "Return snapshots from the last N seconds (default: 3600)")]
+    since_secs: Option<u64>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct SubscribeMempoolSnapshotParams {
+    #[schemars(description = "Maximum events to return (default: 50, max: 50)")]
+    limit: Option<u32>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct GetReorgHistoryParams {
+    #[schemars(description = "Return records from the last N seconds (default: 86400)")]
+    since_secs: Option<u64>,
+}
+
 // --- Tool router: register all 27 tools ---
 
 #[tool_router]
@@ -346,6 +370,57 @@ impl SatdMcpServer {
     #[tool(description = "Validate a Bitcoin address and return its type (P2PKH, P2SH, P2WPKH, P2WSH, P2TR), script hex, and witness info.")]
     fn validate_address(&self, Parameters(p): Parameters<ValidateAddressParams>) -> String {
         tools::address::validate_address(&p.address)
+    }
+
+    // === Operator Ergonomics (PRs #59-#67) ===
+
+    #[tool(description = "Return detailed info for multiple mempool transactions at once. Missing entries are returned as null in the response map.")]
+    fn get_mempool_entries_bulk(
+        &self,
+        Parameters(p): Parameters<GetMempoolEntriesBulkParams>,
+    ) -> String {
+        tools::mempool::get_mempool_entries_bulk(&self.ctx, &p.txids)
+    }
+
+    #[tool(description = "Return time-windowed mempool snapshots (size, bytes, fee-rate histogram). Useful for tracking mempool state over ~40 minutes of history.")]
+    fn get_mempool_history(&self, Parameters(p): Parameters<GetMempoolHistoryParams>) -> String {
+        tools::mempool::get_mempool_history(&self.ctx, p.since_secs.unwrap_or(3_600))
+    }
+
+    #[tool(description = "Return the most recent mempool events (enter, leave_confirmed, leave_evicted, leave_replaced). Snapshot-style; for live streaming use the subscribemempool JSON-RPC subscription.")]
+    fn subscribe_mempool_snapshot(
+        &self,
+        Parameters(p): Parameters<SubscribeMempoolSnapshotParams>,
+    ) -> String {
+        tools::mempool::subscribe_mempool_snapshot(
+            &self.ctx,
+            p.limit.unwrap_or(50) as usize,
+        )
+    }
+
+    #[tool(description = "Return the effective node configuration post-merge of CLI flags, profile, and config file. Passwords and cookies are redacted.")]
+    fn get_config(&self) -> String {
+        tools::ergonomics::get_config(&self.ctx)
+    }
+
+    #[tool(description = "Return persisted reorg events — depth, fork height, disconnected/reconnected block hashes. Default window: 24 hours.")]
+    fn get_reorg_history(&self, Parameters(p): Parameters<GetReorgHistoryParams>) -> String {
+        tools::ergonomics::get_reorg_history(&self.ctx, p.since_secs.unwrap_or(86_400))
+    }
+
+    #[tool(description = "Render the current Prometheus metrics snapshot as text — useful for ad-hoc inspection without scraping the /metrics HTTP endpoint.")]
+    fn get_metrics_snapshot(&self) -> String {
+        tools::ergonomics::get_metrics_snapshot(&self.ctx)
+    }
+
+    #[tool(description = "Liveness check: returns 'ok' plus uptime if the process is running. Mirrors the /healthz HTTP endpoint.")]
+    fn get_health(&self) -> String {
+        tools::ergonomics::get_health(&self.ctx)
+    }
+
+    #[tool(description = "Readiness check: returns true once the node is within a few blocks of the header tip. Mirrors the /readyz HTTP endpoint.")]
+    fn get_readiness(&self) -> String {
+        tools::ergonomics::get_readiness(&self.ctx)
     }
 }
 

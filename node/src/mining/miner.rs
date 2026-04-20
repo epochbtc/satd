@@ -112,7 +112,7 @@ pub fn mine_block(
         .accept_block(&block)
         .map_err(|e| MineError::Rejected(e.to_string()))?;
 
-    mempool.remove_for_block(&block);
+    mempool.remove_for_block(&block, chain_state.tip_height());
 
     Ok(block)
 }

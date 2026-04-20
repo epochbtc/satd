@@ -2,6 +2,53 @@ use crate::context::McpContext;
 use node::rpc::{blockchain as rpc_bc, rawtx};
 use serde_json::json;
 
+/// Bulk mempool entry lookup — returns a JSON map of txid to verbose
+/// entry or `null` for txids that aren't in the pool. Mirrors the
+/// new bulk form of the `getmempoolentry` RPC.
+pub fn get_mempool_entries_bulk(ctx: &McpContext, txids: &[String]) -> String {
+    let owned: Vec<String> = txids.to_vec();
+    let map = rpc_bc::get_mempool_entries_bulk(&ctx.mempool, &owned);
+    serde_json::to_string_pretty(&map).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// Time-windowed mempool history — returns an array of snapshots
+/// captured by the snapshotter task. Returns an empty array if the
+/// history ring isn't wired (e.g., in tests).
+pub fn get_mempool_history(ctx: &McpContext, since_secs: u64) -> String {
+    let snapshots = match &ctx.mempool_history {
+        Some(h) => h.history(since_secs),
+        None => Vec::new(),
+    };
+    let result = json!({
+        "since_secs": since_secs,
+        "snapshots": snapshots,
+    });
+    serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// MCP-friendly snapshot of the most recent mempool events. MCP is
+/// request/response so this is *not* a live stream — it's the last N
+/// events tapped off the broadcast (bounded ring). Pairs with the WS
+/// `subscribemempool` subscription for clients that need live updates.
+pub fn subscribe_mempool_snapshot(ctx: &McpContext, limit: usize) -> String {
+    let events = ctx.mempool.recent_events();
+    let cap = limit.min(events.len());
+    // Take the most recent `cap` events (tail of the ring).
+    let tail: Vec<_> = events
+        .into_iter()
+        .rev()
+        .take(cap)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let result = json!({
+        "count": tail.len(),
+        "events": tail,
+    });
+    serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string())
+}
+
 /// Get mempool overview: size, bytes, fee rate histogram, and policy.
 pub fn get_mempool_overview(ctx: &McpContext) -> String {
     let info = rawtx::get_mempool_info(&ctx.mempool);

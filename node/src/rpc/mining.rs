@@ -18,7 +18,7 @@ pub fn submit_block(chain_state: &ChainState, mempool: &Mempool, hex_block: &str
 
     match chain_state.accept_block(&block) {
         Ok(_) => {
-            mempool.remove_for_block(&block);
+            mempool.remove_for_block(&block, chain_state.tip_height());
             Value::Null
         }
         Err(e) => Value::String(e.to_string()),
