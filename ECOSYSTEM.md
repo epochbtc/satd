@@ -69,7 +69,10 @@ satd is as drop-in as Bitcoin Core for Umbrel, Start9 / StartOS, RaspiBlitz, MyN
 - **Multi-arch Docker images** (`linux/amd64`, `linux/arm64`) published to GHCR with stable tags + immutable digests. Table stakes for any container-based packaging.
 - **Static / minimally-linked binaries** for `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-musl`, `x86_64-unknown-linux-gnu`, `x86_64-apple-darwin`, `aarch64-apple-darwin`, attached to GitHub Releases.
 - **Reproducible builds** (Guix or Nix). Reference: Bitcoin Core's Guix pipeline. Packagers will not commit to an upstream whose binaries they can't verify.
-- **Signed artifacts** (minisign or detached GPG), keys published in `SECURITY.md`, at least two maintainers cross-signing.
+- **Signing (modern stack, no GPG):**
+  - **Tarballs + static binaries** — `minisign` (Ed25519) detached signatures. Public key published in `SECURITY.md` + README; at least two maintainers cross-sign.
+  - **Docker images** — `cosign` keyless signing via GitHub Actions OIDC, attested to the Rekor transparency log. Gives SLSA-level provenance automatically; packagers verify against the workflow identity rather than a personal key.
+  - **Git tags + maintainer commits** — SSH signatures (`ssh-keygen -Y sign`), verified against maintainers' GitHub-published pubkeys (`github.com/<user>.keys`) via an allowed-signers file. Zero new key infrastructure, matches GitHub's "Verified" badge.
 - **Stable semver + public changelog**, explicit RPC-wire deprecation policy.
 - **SBOM + `cargo deny`** in CI. Start9 in particular cares about dependency audit.
 
