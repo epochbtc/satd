@@ -1,0 +1,499 @@
+//! Mempool-based smart fee estimation.
+//!
+//! Simulates the next N block templates from the current mempool snapshot.
+//! For each simulated block we record the lowest admitted *ancestor
+//! feerate* — that is the fee level a new tx needs to land in block k.
+//! Ancestor feerate aggregation handles CPFP correctly: a low-fee parent
+//! + high-fee child are admitted together at the child's pull rate.
+//!
+//! This complements the historical-block `FeeEstimator` in `fee.rs`:
+//! historical data reacts to what miners *did* (slow to respond to sudden
+//! congestion), while mempool simulation reacts to what's queued *now*.
+//!
+//! The simulator is intentionally a pure function over an owned snapshot
+//! of `MempoolEntry`s — it does not hold any mempool locks while running.
+//! Callers should `get_all_entries()` once and pass the Vec in.
+//!
+//! Output: per-block min feerate + confidence + a feerate histogram
+//! suitable for callers that want to roll their own strategy.
+
+use std::collections::{HashMap, HashSet};
+
+use bitcoin::Txid;
+use serde::Serialize;
+
+use crate::mempool::pool::MempoolEntry;
+
+/// Maximum block weight (4,000,000 WU per BIP 141).
+pub const BLOCK_WEIGHT_LIMIT: u64 = 4_000_000;
+/// Weight reserved for the coinbase — mirrors `mining/template.rs`.
+pub const COINBASE_WEIGHT_RESERVE: u64 = 4_000;
+/// Usable weight per simulated block (block limit − coinbase reserve).
+pub const USABLE_WEIGHT_PER_BLOCK: u64 = BLOCK_WEIGHT_LIMIT - COINBASE_WEIGHT_RESERVE;
+
+/// Confidence of an estimated target feerate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Confidence {
+    /// Target block fully packed in simulation; ancestor queue exceeds it.
+    High,
+    /// Target block partially packed; mempool too thin to fully fill it.
+    Medium,
+    /// Mempool had no usable data at this target; floor used.
+    Low,
+}
+
+/// A single simulated block's summary.
+#[derive(Debug, Clone, Serialize)]
+pub struct SimBlock {
+    /// Lowest ancestor-feerate admitted in this block (sat/kvB). Zero if
+    /// the block is empty.
+    pub min_feerate_sat_per_kvb: u64,
+    /// Number of distinct transactions packed (ancestors + roots).
+    pub tx_count: usize,
+    /// Total weight used in this block (excludes coinbase reserve).
+    pub weight: u64,
+    /// Whether the block hit the weight ceiling (no more room to pack).
+    pub filled: bool,
+}
+
+/// One bucket in the mempool feerate histogram.
+#[derive(Debug, Clone, Serialize)]
+pub struct HistogramBucket {
+    /// Inclusive lower bound of this bucket in sat/kvB.
+    pub feerate_sat_per_kvb: u64,
+    /// Sum of weights of entries whose *own* feerate falls in this bucket.
+    pub weight: u64,
+}
+
+/// Result of a mempool simulation pass.
+#[derive(Debug, Clone, Serialize)]
+pub struct MempoolEstimate {
+    pub sim_blocks: Vec<SimBlock>,
+    pub histogram: Vec<HistogramBucket>,
+    /// Total weight queued in the mempool at snapshot time.
+    pub mempool_weight: u64,
+}
+
+/// Default histogram boundaries in sat/vB, converted to sat/kvB on use.
+/// Chosen to span realistic mainnet fee regimes (1 → 1000 sat/vB).
+const HISTOGRAM_BOUNDARIES_SAT_PER_VB: &[u64] = &[
+    1, 2, 3, 5, 8, 10, 15, 20, 30, 50, 75, 100, 150, 200, 300, 500, 1000,
+];
+
+/// Effective (post-prioritisation) fee of an entry, clamped at zero.
+fn effective_fee(entry: &MempoolEntry) -> u64 {
+    (entry.fee as i64 + entry.fee_delta).max(0) as u64
+}
+
+/// Compute the set of in-mempool ancestor txids for `txid`, memoized.
+///
+/// Walks the input graph transitively. Only parents that are themselves
+/// in the snapshot count — confirmed-parent inputs are ignored, matching
+/// Core's ancestor-set semantics for fee estimation.
+fn ancestor_set(
+    txid: &Txid,
+    entries: &HashMap<Txid, MempoolEntry>,
+    memo: &mut HashMap<Txid, HashSet<Txid>>,
+) -> HashSet<Txid> {
+    if let Some(cached) = memo.get(txid) {
+        return cached.clone();
+    }
+    let mut ancestors: HashSet<Txid> = HashSet::new();
+    let Some(root) = entries.get(txid) else {
+        memo.insert(*txid, ancestors.clone());
+        return ancestors;
+    };
+    let mut queue: Vec<Txid> = root
+        .tx
+        .input
+        .iter()
+        .map(|i| i.previous_output.txid)
+        .filter(|p| entries.contains_key(p))
+        .collect();
+    while let Some(parent) = queue.pop() {
+        if !ancestors.insert(parent) {
+            continue;
+        }
+        if let Some(parent_entry) = entries.get(&parent) {
+            for input in &parent_entry.tx.input {
+                let gp = input.previous_output.txid;
+                if entries.contains_key(&gp) && !ancestors.contains(&gp) {
+                    queue.push(gp);
+                }
+            }
+        }
+    }
+    memo.insert(*txid, ancestors.clone());
+    ancestors
+}
+
+/// Ancestor-aggregate (fee, weight) for `txid` — inclusive of self.
+fn ancestor_aggregate(
+    txid: &Txid,
+    entries: &HashMap<Txid, MempoolEntry>,
+    anc_memo: &mut HashMap<Txid, HashSet<Txid>>,
+) -> (u64, u64) {
+    let Some(root) = entries.get(txid) else {
+        return (0, 0);
+    };
+    let mut fee = effective_fee(root);
+    let mut weight = root.weight as u64;
+    let anc = ancestor_set(txid, entries, anc_memo);
+    for a in &anc {
+        if let Some(e) = entries.get(a) {
+            fee = fee.saturating_add(effective_fee(e));
+            weight = weight.saturating_add(e.weight as u64);
+        }
+    }
+    (fee, weight)
+}
+
+/// Simulate a single block from the remaining mempool.
+///
+/// Returns the block summary and the set of txids consumed (to remove
+/// from `remaining` before simulating the next block).
+fn simulate_one_block(remaining: &HashMap<Txid, MempoolEntry>) -> (SimBlock, HashSet<Txid>) {
+    let mut anc_memo: HashMap<Txid, HashSet<Txid>> = HashMap::with_capacity(remaining.len());
+    let mut sorted: Vec<(Txid, u64)> = Vec::with_capacity(remaining.len());
+    for txid in remaining.keys() {
+        let (fee, weight) = ancestor_aggregate(txid, remaining, &mut anc_memo);
+        if weight == 0 {
+            continue;
+        }
+        let rate = fee.saturating_mul(1000) / weight;
+        sorted.push((*txid, rate));
+    }
+    // Highest ancestor-feerate first.
+    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+
+    let mut included: HashSet<Txid> = HashSet::new();
+    let mut used_weight: u64 = 0;
+    let mut min_admitted_rate: u64 = 0;
+    let mut filled = false;
+
+    for (txid, rate) in sorted {
+        if included.contains(&txid) {
+            continue;
+        }
+        let mut group: Vec<Txid> = ancestor_set(&txid, remaining, &mut anc_memo)
+            .into_iter()
+            .filter(|t| !included.contains(t))
+            .collect();
+        group.push(txid);
+        let group_weight: u64 = group
+            .iter()
+            .filter_map(|t| remaining.get(t).map(|e| e.weight as u64))
+            .sum();
+        if used_weight.saturating_add(group_weight) > USABLE_WEIGHT_PER_BLOCK {
+            filled = true;
+            continue;
+        }
+        used_weight += group_weight;
+        min_admitted_rate = rate;
+        for t in group {
+            included.insert(t);
+        }
+        if used_weight >= USABLE_WEIGHT_PER_BLOCK {
+            filled = true;
+            break;
+        }
+    }
+
+    let block = SimBlock {
+        min_feerate_sat_per_kvb: min_admitted_rate,
+        tx_count: included.len(),
+        weight: used_weight,
+        filled,
+    };
+    (block, included)
+}
+
+/// Bucket entries by their own (not ancestor) feerate.
+fn build_histogram(entries: &HashMap<Txid, MempoolEntry>) -> Vec<HistogramBucket> {
+    let bounds_kvb: Vec<u64> = HISTOGRAM_BOUNDARIES_SAT_PER_VB
+        .iter()
+        .map(|v| v * 1000)
+        .collect();
+    let mut weights: Vec<u64> = vec![0; bounds_kvb.len()];
+    for entry in entries.values() {
+        let rate = if entry.weight == 0 {
+            0
+        } else {
+            effective_fee(entry).saturating_mul(1000) / entry.weight as u64
+        };
+        // Drop into the highest bucket whose boundary is ≤ rate.
+        let mut idx: Option<usize> = None;
+        for (i, b) in bounds_kvb.iter().enumerate() {
+            if rate >= *b {
+                idx = Some(i);
+            } else {
+                break;
+            }
+        }
+        if let Some(i) = idx {
+            weights[i] = weights[i].saturating_add(entry.weight as u64);
+        }
+    }
+    bounds_kvb
+        .into_iter()
+        .zip(weights)
+        .filter(|(_, w)| *w > 0)
+        .map(|(feerate_sat_per_kvb, weight)| HistogramBucket {
+            feerate_sat_per_kvb,
+            weight,
+        })
+        .collect()
+}
+
+/// Run the full simulation: build histogram, simulate `n_blocks` blocks.
+///
+/// `snapshot` is taken by value so the caller releases the mempool lock
+/// before we start work. `n_blocks` should be ≥ the largest target the
+/// caller cares about (typically 25 is plenty).
+pub fn estimate_from_mempool(
+    snapshot: Vec<(Txid, MempoolEntry)>,
+    n_blocks: usize,
+) -> MempoolEstimate {
+    let entries: HashMap<Txid, MempoolEntry> = snapshot.into_iter().collect();
+    let mempool_weight: u64 = entries.values().map(|e| e.weight as u64).sum();
+    let histogram = build_histogram(&entries);
+
+    let mut remaining = entries;
+    let mut sim_blocks: Vec<SimBlock> = Vec::with_capacity(n_blocks);
+    for _ in 0..n_blocks {
+        if remaining.is_empty() {
+            sim_blocks.push(SimBlock {
+                min_feerate_sat_per_kvb: 0,
+                tx_count: 0,
+                weight: 0,
+                filled: false,
+            });
+            continue;
+        }
+        let (block, consumed) = simulate_one_block(&remaining);
+        for txid in &consumed {
+            remaining.remove(txid);
+        }
+        let was_filled = block.filled;
+        let was_empty = block.tx_count == 0;
+        sim_blocks.push(block);
+        // If the block wasn't filled and produced nothing, further blocks
+        // will also be empty — fill out with zeros for caller simplicity.
+        if !was_filled && was_empty {
+            while sim_blocks.len() < n_blocks {
+                sim_blocks.push(SimBlock {
+                    min_feerate_sat_per_kvb: 0,
+                    tx_count: 0,
+                    weight: 0,
+                    filled: false,
+                });
+            }
+            break;
+        }
+    }
+
+    MempoolEstimate {
+        sim_blocks,
+        histogram,
+        mempool_weight,
+    }
+}
+
+/// Extract per-target estimated feerate with confidence.
+///
+/// `target` is a 1-indexed block number: target=1 means "land in next
+/// block". For each target we look at `sim_blocks[target - 1]`.
+///
+/// - Fully-filled block → `High` confidence, min admitted rate.
+/// - Partially-filled block → `Medium`, either the min admitted or the
+///   caller's min-relay floor (whichever is higher).
+/// - Empty simulated block → `Low`, floor to `floor_sat_per_kvb`.
+pub fn target_estimate(
+    estimate: &MempoolEstimate,
+    target: u32,
+    floor_sat_per_kvb: u64,
+) -> (u64, Confidence) {
+    let idx = target.saturating_sub(1) as usize;
+    let Some(block) = estimate.sim_blocks.get(idx) else {
+        return (floor_sat_per_kvb, Confidence::Low);
+    };
+    if block.tx_count == 0 {
+        return (floor_sat_per_kvb, Confidence::Low);
+    }
+    if block.filled {
+        return (
+            block.min_feerate_sat_per_kvb.max(floor_sat_per_kvb),
+            Confidence::High,
+        );
+    }
+    (
+        block.min_feerate_sat_per_kvb.max(floor_sat_per_kvb),
+        Confidence::Medium,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::{OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
+
+    fn mk_tx(prevs: &[(Txid, u32)], n_out: u32) -> Transaction {
+        Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: prevs
+                .iter()
+                .map(|(txid, vout)| TxIn {
+                    previous_output: OutPoint {
+                        txid: *txid,
+                        vout: *vout,
+                    },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                })
+                .collect(),
+            output: (0..n_out)
+                .map(|_| TxOut {
+                    value: bitcoin::Amount::from_sat(1_000),
+                    script_pubkey: ScriptBuf::new(),
+                })
+                .collect(),
+        }
+    }
+
+    fn mk_entry(tx: Transaction, fee: u64, weight: usize) -> MempoolEntry {
+        let fee_rate = if weight > 0 {
+            fee * 1000 / weight as u64
+        } else {
+            0
+        };
+        MempoolEntry {
+            tx,
+            fee,
+            weight,
+            fee_rate,
+            time: 0,
+            fee_delta: 0,
+        }
+    }
+
+    fn random_txid(byte: u8) -> Txid {
+        use bitcoin::hashes::Hash;
+        let mut bytes = [0u8; 32];
+        bytes[0] = byte;
+        Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(bytes))
+    }
+
+    #[test]
+    fn empty_mempool_yields_empty_blocks() {
+        let est = estimate_from_mempool(Vec::new(), 3);
+        assert_eq!(est.sim_blocks.len(), 3);
+        for b in &est.sim_blocks {
+            assert_eq!(b.tx_count, 0);
+            assert_eq!(b.weight, 0);
+            assert!(!b.filled);
+        }
+        assert!(est.histogram.is_empty());
+        assert_eq!(est.mempool_weight, 0);
+
+        let (rate, conf) = target_estimate(&est, 1, 1000);
+        assert_eq!(rate, 1000);
+        assert_eq!(conf, Confidence::Low);
+    }
+
+    #[test]
+    fn single_tx_fills_nothing_medium_confidence() {
+        // One small tx, feerate 10_000 sat/kvB.
+        let tx = mk_tx(&[], 1);
+        let txid = tx.compute_txid();
+        let entry = mk_entry(tx, 1_000, 100); // 10_000 sat/kvB
+        let snap = vec![(txid, entry)];
+        let est = estimate_from_mempool(snap, 3);
+        let (rate, conf) = target_estimate(&est, 1, 1000);
+        assert_eq!(rate, 10_000);
+        assert_eq!(conf, Confidence::Medium);
+        // Subsequent blocks are empty → Low.
+        let (_, conf2) = target_estimate(&est, 2, 1000);
+        assert_eq!(conf2, Confidence::Low);
+    }
+
+    #[test]
+    fn histogram_buckets_by_own_feerate() {
+        let tx_a = mk_tx(&[], 1);
+        let tx_b = mk_tx(&[], 2);
+        let ta = tx_a.compute_txid();
+        let tb = tx_b.compute_txid();
+        // 2 sat/vB (2000 sat/kvB) and 20 sat/vB (20000 sat/kvB)
+        let ea = mk_entry(tx_a, 200, 100); // 2000 sat/kvB
+        let eb = mk_entry(tx_b, 2000, 100); // 20000 sat/kvB
+        let est = estimate_from_mempool(vec![(ta, ea), (tb, eb)], 1);
+        let rates: Vec<u64> = est
+            .histogram
+            .iter()
+            .map(|h| h.feerate_sat_per_kvb)
+            .collect();
+        // Expect buckets for 2 sat/vB (=2000) and 20 sat/vB (=20000).
+        assert!(rates.contains(&2000));
+        assert!(rates.contains(&20_000));
+    }
+
+    #[test]
+    fn cpfp_lifts_parent_into_same_block() {
+        // Parent: zero-fee. Child spends parent with high fee.
+        // Without CPFP-aware ancestor feerate, parent would have feerate 0
+        // and be sorted last. With ancestor-feerate sorting, the child's
+        // high rate pulls the parent into the block alongside it.
+        let parent = mk_tx(&[], 1);
+        let parent_txid = parent.compute_txid();
+        let child = mk_tx(&[(parent_txid, 0)], 1);
+        let child_txid = child.compute_txid();
+
+        let parent_entry = mk_entry(parent, 0, 400); // 0 sat/kvB on its own
+        let child_entry = mk_entry(child, 2_000, 400); // 5000 sat/kvB on its own
+        let snap = vec![(parent_txid, parent_entry), (child_txid, child_entry)];
+        let est = estimate_from_mempool(snap, 1);
+        assert_eq!(est.sim_blocks[0].tx_count, 2, "CPFP must pull parent in");
+        // Combined package: 2000 sat / 800 wu = 2500 sat/kvB.
+        assert_eq!(est.sim_blocks[0].min_feerate_sat_per_kvb, 2500);
+    }
+
+    #[test]
+    fn weight_overflow_rolls_into_next_block() {
+        // Two chunks each near half-block. First two fit; third spills.
+        let w = (USABLE_WEIGHT_PER_BLOCK / 2) as usize;
+        // Different prev-txids so the txs are independent (no ancestor
+        // relationships) and sortable purely by own feerate.
+        let t1 = mk_tx(&[(random_txid(1), 0)], 1);
+        let t2 = mk_tx(&[(random_txid(2), 0)], 1);
+        let t3 = mk_tx(&[(random_txid(3), 0)], 1);
+        let id1 = t1.compute_txid();
+        let id2 = t2.compute_txid();
+        let id3 = t3.compute_txid();
+        let e1 = mk_entry(t1, 10_000, w);
+        let e2 = mk_entry(t2, 8_000, w);
+        let e3 = mk_entry(t3, 5_000, w);
+        let est = estimate_from_mempool(vec![(id1, e1), (id2, e2), (id3, e3)], 2);
+        assert!(
+            est.sim_blocks[0].filled,
+            "block 1 should fill with 2 half-blocks"
+        );
+        assert_eq!(est.sim_blocks[0].tx_count, 2);
+        // Block 2 has the leftover tx.
+        assert_eq!(est.sim_blocks[1].tx_count, 1);
+    }
+
+    #[test]
+    fn target_estimate_respects_floor() {
+        // Thin mempool with a very low-feerate tx. Floor should kick in.
+        let tx = mk_tx(&[], 1);
+        let txid = tx.compute_txid();
+        let entry = mk_entry(tx, 10, 100); // 100 sat/kvB
+        let est = estimate_from_mempool(vec![(txid, entry)], 3);
+        let (rate, conf) = target_estimate(&est, 1, 1000);
+        // Floor (1000) above single tx's 100 → returned.
+        assert_eq!(rate, 1000);
+        assert_eq!(conf, Confidence::Medium);
+    }
+}
