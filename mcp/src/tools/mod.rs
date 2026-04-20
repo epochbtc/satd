@@ -8,3 +8,4 @@ pub mod construction;
 pub mod mining;
 pub mod utxo;
 pub mod address;
+pub mod ergonomics;

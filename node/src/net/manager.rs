@@ -1274,7 +1274,7 @@ impl PeerManager {
                 match chain_state.accept_block(&block) {
                     Ok(_) => {
                         fee_estimator.record_block(&fees);
-                        mempool.remove_for_block(&block);
+                        mempool.remove_for_block(&block, chain_state.tip_height());
                         // Drain buffer
                         loop {
                             let tip = chain_state.tip_hash();
@@ -1284,7 +1284,7 @@ impl PeerManager {
                                     match chain_state.accept_block(&b) {
                                         Ok(_) => {
                                             fee_estimator.record_block(&b_fees);
-                                            mempool.remove_for_block(&b);
+                                            mempool.remove_for_block(&b, chain_state.tip_height());
                                         }
                                         Err(_) => break,
                                     }

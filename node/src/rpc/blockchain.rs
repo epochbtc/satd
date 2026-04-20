@@ -619,6 +619,22 @@ pub fn get_mempool_entry(
         .ok_or_else(|| "Transaction not in mempool".to_string())
 }
 
+/// `getmempoolentry` bulk variant — return a `{ "<txid>": entry_or_null }`
+/// map for each requested txid. Missing entries surface as JSON `null`
+/// instead of erroring so callers can batch-query and check per-tx.
+/// Invalid txid strings produce a `null` entry keyed by the raw input.
+pub fn get_mempool_entries_bulk(mempool: &Mempool, txid_strs: &[String]) -> Value {
+    let mut out = serde_json::Map::with_capacity(txid_strs.len());
+    for s in txid_strs {
+        let entry = match s.parse::<bitcoin::Txid>() {
+            Ok(txid) => mempool.get_entry_verbose(&txid).unwrap_or(Value::Null),
+            Err(_) => Value::Null,
+        };
+        out.insert(s.clone(), entry);
+    }
+    Value::Object(out)
+}
+
 /// `preciousblock` — mark a block as precious (prefer during reorg tie-breaking).
 pub fn precious_block(_hash_str: &str) -> Result<Value, String> {
     // Stub: acknowledge but don't implement tie-breaking preference

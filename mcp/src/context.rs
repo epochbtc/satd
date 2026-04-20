@@ -1,5 +1,6 @@
 use node::chain::state::ChainState;
 use node::mempool::fee::FeeEstimator;
+use node::mempool::history::MempoolHistory;
 use node::mempool::pool::Mempool;
 use node::net::manager::PeerManager;
 use std::sync::Arc;
@@ -12,4 +13,9 @@ pub struct McpContext {
     pub fee_estimator: Arc<FeeEstimator>,
     pub start_time: std::time::Instant,
     pub network: bitcoin::Network,
+    /// Post-merge effective config snapshot (secrets already redacted).
+    /// Rendered at startup; reads are cheap clones of the cached JSON.
+    pub effective_config: serde_json::Value,
+    /// Mempool history ring — may be `None` in tests that bypass main.rs.
+    pub mempool_history: Option<Arc<MempoolHistory>>,
 }

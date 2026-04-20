@@ -3120,3 +3120,97 @@ fn test_log_format_json_emits_valid_json_with_trace_id() {
 
     let _ = std::fs::remove_dir_all(&datadir);
 }
+
+// ---------------------------------------------------------------------------
+// Tier-2 #11 — Operator mempool APIs
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_getmempoolentry_bulk_missing_entries_are_null() {
+    // `getmempoolentry` with an array argument returns a map. Non-existent
+    // txids surface as JSON null rather than an error — callers batch and
+    // filter per entry.
+    let mut node = TestNode::start(&[]);
+
+    let fake_txid = "0000000000000000000000000000000000000000000000000000000000000001";
+    let response = node
+        .rpc_call_with_params(
+            "getmempoolentry",
+            vec![serde_json::json!([fake_txid])],
+        )
+        .unwrap();
+    let result = response["result"].as_object().unwrap();
+    assert!(result.contains_key(fake_txid));
+    assert!(result[fake_txid].is_null());
+    node.stop();
+}
+
+#[test]
+fn test_getmempoolentry_single_string_still_core_compat() {
+    // Regression: the original single-string form must still error for a
+    // missing txid (Core-compat behavior). We don't silently turn errors
+    // into nulls for the single-argument path.
+    let mut node = TestNode::start(&[]);
+    let fake_txid = "0000000000000000000000000000000000000000000000000000000000000002";
+    let response = node
+        .rpc_call_with_params(
+            "getmempoolentry",
+            vec![serde_json::json!(fake_txid)],
+        )
+        .unwrap();
+    assert!(
+        response.get("error").is_some(),
+        "single-string missing txid must still error: {}",
+        response
+    );
+    node.stop();
+}
+
+#[test]
+fn test_getmempoolhistory_returns_snapshots_shape() {
+    // On a fresh node the history ring is open but no snapshots have
+    // landed yet — we just verify the response shape here. The
+    // snapshotter cadence is 10 s so waiting for a filled snapshot
+    // would make the test flaky under CI load.
+    let mut node = TestNode::start(&[]);
+    let response = node.rpc_call("getmempoolhistory").unwrap();
+    let result = response["result"].as_object().unwrap();
+    assert!(result.contains_key("since_secs"));
+    assert!(result.contains_key("snapshots"));
+    assert!(result.contains_key("available"));
+    assert!(result["snapshots"].is_array());
+    assert_eq!(result["since_secs"].as_u64(), Some(3_600));
+    // History log opens successfully on a fresh node so available=true.
+    assert_eq!(result["available"].as_bool(), Some(true));
+
+    // Custom window.
+    let response2 = node
+        .rpc_call_with_params("getmempoolhistory", vec![serde_json::json!(120u64)])
+        .unwrap();
+    assert_eq!(response2["result"]["since_secs"].as_u64(), Some(120));
+    node.stop();
+}
+
+#[test]
+fn test_subscribemempool_registered_in_help() {
+    // End-to-end WS subscription exercise is hard to make reliable in
+    // regtest (auth, timing, tokio runtime interop). The broadcast
+    // emission path is unit-tested in node/src/mempool/events.rs + the
+    // Mempool::emit tests; here we verify the RPC is actually
+    // registered — i.e. the WS wire-up compiled in — by inspecting
+    // `help`.
+    let mut node = TestNode::start(&[]);
+    let response = node.rpc_call("help").unwrap();
+    let body = response["result"].as_str().unwrap_or("");
+    assert!(
+        body.contains("subscribemempool"),
+        "`help` output should advertise subscribemempool; got: {}",
+        body
+    );
+    assert!(
+        body.contains("unsubscribemempool"),
+        "`help` output should advertise unsubscribemempool"
+    );
+    node.stop();
+}
+

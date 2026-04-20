@@ -267,7 +267,20 @@ in TUI. New operators reach near-tip in minutes, not days.
 
 **Effort:** M. Snapshot generation + verification pipeline + mirror infra.
 
-### 11. Operator-focused mempool APIs
+### 11. Operator-focused mempool APIs ✅ SHIPPED
+
+**Status:** Landed — bulk `getmempoolentry` (array of txids → map of
+verbose entries or null), `getmempoolhistory [since_secs]` ring of
+periodic snapshots with feerate histogram, and `subscribemempool` WS
+subscription emitting `enter` / `leave_confirmed` / `leave_evicted`
+(reason: `full_pool` | `expiry`) / `leave_replaced` (with
+`replacing_txid`). `getmempoolentry` also now populates
+`spentby` (direct children) and `descendantcount` /
+`descendantsize` / `descendantfees` — Core-compat schema. The same
+PR backfilled MCP tools for every shipped ergonomics endpoint
+(`get_config`, `get_reorg_history`, `get_metrics_snapshot`,
+`get_health`, `get_readiness`, `get_mempool_entries_bulk`,
+`get_mempool_history`, `subscribe_mempool_snapshot`).
 
 **Pain:** `getmempoolentry` is per-tx only (no bulk). `getrawmempool` is
 point-in-time (no history). No streaming diff API — you poll or rebuild

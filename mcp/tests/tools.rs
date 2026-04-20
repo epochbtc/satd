@@ -52,6 +52,8 @@ fn make_test_ctx() -> (McpContext, tempfile::TempDir) {
         fee_estimator,
         start_time: std::time::Instant::now(),
         network: Network::Regtest,
+        effective_config: serde_json::json!({"network": "regtest"}),
+        mempool_history: None,
     };
     (ctx, dir)
 }
@@ -577,6 +579,8 @@ mod mining {
             fee_estimator,
             start_time: std::time::Instant::now(),
             network: Network::Bitcoin,
+            effective_config: serde_json::json!({"network": "bitcoin"}),
+            mempool_history: None,
         };
 
         let result = mine::generate_blocks(&ctx, 1, REGTEST_ADDR);
@@ -691,13 +695,14 @@ mod tool_router {
     }
 
     #[test]
-    fn test_tool_router_lists_27_tools() {
+    fn test_tool_router_lists_expected_tools() {
+        // 27 original + 8 ergonomics-backfill (#68) = 35
         let server = make_server();
         let tools = server.list_tools_from_router();
         assert_eq!(
             tools.len(),
-            27,
-            "Expected 27 tools, got {}. Tools: {:?}",
+            35,
+            "Expected 35 tools, got {}. Tools: {:?}",
             tools.len(),
             tools.iter().map(|t| &*t.name).collect::<Vec<_>>()
         );
@@ -761,5 +766,104 @@ mod tool_router {
                 tool.name
             );
         }
+    }
+}
+
+// ============================================================
+// Operator Ergonomics (PRs #59-#67) — MCP wrappers
+// ============================================================
+
+mod ergonomics {
+    use super::*;
+    use satd_mcp::tools::{ergonomics, mempool};
+
+    #[test]
+    fn test_get_config_returns_redacted_view() {
+        let (ctx, _dir) = make_test_ctx();
+        let out = ergonomics::get_config(&ctx);
+        let json: serde_json::Value = serde_json::from_str(&out).unwrap();
+        // Test ctx uses the "network": "regtest" placeholder set in
+        // make_test_ctx — the real RPC pipes the full effective config.
+        assert_eq!(json["network"], "regtest");
+    }
+
+    #[test]
+    fn test_get_reorg_history_empty_on_fresh_node() {
+        let (ctx, _dir) = make_test_ctx();
+        let out = ergonomics::get_reorg_history(&ctx, 86_400);
+        let json: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(json["since_secs"], 86_400);
+        assert!(json["records"].is_array());
+        assert_eq!(json["records"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_get_metrics_snapshot_includes_mempool_count() {
+        let (ctx, _dir) = make_test_ctx();
+        let out = ergonomics::get_metrics_snapshot(&ctx);
+        let json: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(json["format"], "prometheus-text");
+        let body = json["body"].as_str().unwrap();
+        // Prometheus output always emits our standard counter —
+        // that's the proof the render pipeline ran.
+        assert!(
+            body.contains("satd_mempool_transactions"),
+            "metrics body should include satd_mempool_transactions; got: {}",
+            body
+        );
+    }
+
+    #[test]
+    fn test_get_health_reports_ok() {
+        let (ctx, _dir) = make_test_ctx();
+        let out = ergonomics::get_health(&ctx);
+        let json: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(json["status"], "ok");
+        assert!(json["uptime_seconds"].is_number());
+    }
+
+    #[test]
+    fn test_get_readiness_reports_tip_heights() {
+        let (ctx, _dir) = make_test_ctx_with_blocks(3);
+        let out = ergonomics::get_readiness(&ctx);
+        let json: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(json["tip_height"], 3);
+        assert!(json["ready"].is_boolean());
+    }
+
+    #[test]
+    fn test_get_mempool_entries_bulk_missing_is_null() {
+        let (ctx, _dir) = make_test_ctx();
+        let fake = vec![
+            "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
+        ];
+        let out = mempool::get_mempool_entries_bulk(&ctx, &fake);
+        let json: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let obj = json.as_object().unwrap();
+        assert_eq!(obj.len(), 1);
+        assert!(obj[&fake[0]].is_null());
+    }
+
+    #[test]
+    fn test_get_mempool_history_signals_unavailable_when_unwired() {
+        // make_test_ctx sets mempool_history = None; the tool must
+        // return `available: false` so callers can distinguish a
+        // disabled feature from an empty but wired ring.
+        let (ctx, _dir) = make_test_ctx();
+        let out = mempool::get_mempool_history(&ctx, 3_600);
+        let json: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(json["since_secs"], 3_600);
+        assert_eq!(json["available"].as_bool(), Some(false));
+        assert!(json["snapshots"].is_array());
+        assert_eq!(json["snapshots"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_subscribe_mempool_snapshot_shape() {
+        let (ctx, _dir) = make_test_ctx();
+        let out = mempool::subscribe_mempool_snapshot(&ctx, 10);
+        let json: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(json["count"].is_number());
+        assert!(json["events"].is_array());
     }
 }

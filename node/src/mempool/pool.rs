@@ -1,11 +1,24 @@
 use bitcoin::{Block, OutPoint, Transaction, TxOut, Txid};
-use std::collections::{HashMap, HashSet};
-use std::sync::RwLock;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Mutex, RwLock};
+use tokio::sync::broadcast;
 
 use crate::chain::state::ChainState;
+use crate::mempool::events::{EvictReason, MempoolEvent};
 use crate::mempool::policy::{self, MAX_STANDARD_TX_WEIGHT};
 use crate::validation::script::ScriptVerifier;
 use crate::validation::tx::check_transaction;
+
+/// Capacity of the broadcast channel for `subscribemempool`. Large
+/// enough to absorb short bursts; a subscriber that lags past this
+/// will see `RecvError::Lagged` and skip to the latest events —
+/// correct behavior for a best-effort stream.
+pub const EVENT_BROADCAST_CAPACITY: usize = 1024;
+
+/// Capacity of the in-memory event ring tapped by MCP
+/// `subscribe_mempool_snapshot`. Kept small — MCP is request/response,
+/// clients pull the last N events, not a long history.
+pub const EVENT_RING_CAPACITY: usize = 50;
 
 /// Coinbase maturity: outputs cannot be spent until this many confirmations.
 const COINBASE_MATURITY: u32 = 100;
@@ -111,6 +124,14 @@ impl Default for MempoolConfig {
 pub struct Mempool {
     inner: RwLock<MempoolInner>,
     config: MempoolConfig,
+    /// Broadcast channel fanout for `subscribemempool`. Populated via
+    /// `set_event_sender`; remains `None` in tests that don't need
+    /// event emission.
+    event_tx: Mutex<Option<broadcast::Sender<MempoolEvent>>>,
+    /// Bounded ring of recent events for MCP snapshot consumption.
+    /// Always maintained (cheap) so MCP tools work whether or not
+    /// the broadcast sender is wired.
+    event_ring: Mutex<VecDeque<MempoolEvent>>,
 }
 
 impl Mempool {
@@ -130,6 +151,42 @@ impl Mempool {
                 total_bytes: 0,
             }),
             config,
+            event_tx: Mutex::new(None),
+            event_ring: Mutex::new(VecDeque::with_capacity(EVENT_RING_CAPACITY)),
+        }
+    }
+
+    /// Wire a broadcast sender for mempool events. Must be called
+    /// once at startup before any mempool mutations that should be
+    /// observed by subscribers.
+    pub fn set_event_sender(&self, tx: broadcast::Sender<MempoolEvent>) {
+        *self.event_tx.lock().unwrap() = Some(tx);
+    }
+
+    /// Subscribe to live mempool events. Returns `None` if no sender
+    /// has been wired (typical in tests that bypass `main.rs`).
+    pub fn subscribe_events(&self) -> Option<broadcast::Receiver<MempoolEvent>> {
+        self.event_tx.lock().unwrap().as_ref().map(|tx| tx.subscribe())
+    }
+
+    /// Return the most recent `EVENT_RING_CAPACITY` events tapped
+    /// off the broadcast. Used by MCP `subscribe_mempool_snapshot`.
+    pub fn recent_events(&self) -> Vec<MempoolEvent> {
+        self.event_ring.lock().unwrap().iter().cloned().collect()
+    }
+
+    /// Emit an event: push into the ring, then best-effort broadcast.
+    /// Never blocks; broadcast backpressure is the subscriber's problem.
+    fn emit(&self, event: MempoolEvent) {
+        {
+            let mut ring = self.event_ring.lock().unwrap();
+            ring.push_back(event.clone());
+            while ring.len() > EVENT_RING_CAPACITY {
+                ring.pop_front();
+            }
+        }
+        if let Some(tx) = self.event_tx.lock().unwrap().as_ref() {
+            let _ = tx.send(event);
         }
     }
 
@@ -343,6 +400,7 @@ impl Mempool {
         }
 
         // Check mempool size — evict lowest-fee entries if needed
+        let mut evicted_full_pool: Vec<Txid> = Vec::new();
         if inner.total_bytes + tx_size > self.config.max_size_bytes {
             // Only evict if the new tx has a higher fee rate than the minimum in the pool
             let min_pool_fee_rate = inner
@@ -355,7 +413,7 @@ impl Mempool {
                 return Err(MempoolError::MempoolFull);
             }
             // Evict enough lowest-fee-rate entries to make room
-            Self::evict_lowest_fee_entries(&mut inner, tx_size);
+            evicted_full_pool = Self::evict_lowest_fee_entries(&mut inner, tx_size);
             // If still not enough room after eviction, reject
             if inner.total_bytes + tx_size > self.config.max_size_bytes {
                 return Err(MempoolError::MempoolFull);
@@ -368,7 +426,11 @@ impl Mempool {
             .verify_transaction(&tx, &prev_outputs, tip_height + 1)
             .map_err(|e| MempoolError::Script(e.to_string()))?;
 
-        // RBF: remove conflicted transactions before inserting replacement
+        // RBF: remove conflicted transactions before inserting replacement.
+        // Collect replaced txids so we can emit LeaveReplaced events
+        // after the write lock is dropped (broadcast is best-effort but
+        // still prefer not to hold a lock while sending).
+        let mut replaced: Vec<Txid> = Vec::new();
         for conflict_txid in &conflicts {
             if let Some(conflict_entry) = inner.entries.remove(conflict_txid) {
                 let sz = bitcoin::consensus::serialize(&conflict_entry.tx).len();
@@ -376,6 +438,7 @@ impl Mempool {
                 for ci in &conflict_entry.tx.input {
                     inner.spends.remove(&ci.previous_output);
                 }
+                replaced.push(*conflict_txid);
                 tracing::info!(%conflict_txid, "RBF: evicted conflicting transaction");
             }
         }
@@ -398,6 +461,8 @@ impl Mempool {
             .collect();
         let sigop_cost = tx.total_sigop_cost(|op| prev_outputs_map.get(op).cloned()) as u64;
 
+        let entry_weight_u64 = weight as u64;
+        let vsize_u64 = entry_weight_u64 / 4;
         inner.entries.insert(
             txid,
             MempoolEntry {
@@ -418,37 +483,89 @@ impl Mempool {
             tracing::info!(%txid, fee, fee_rate, ancestors = ancestors.len(), "Transaction accepted to mempool");
         }
 
+        // Drop the write lock before emitting events — broadcast sends
+        // are best-effort but keeping the lock duration tight is the rule.
+        drop(inner);
+
+        for evicted_txid in &evicted_full_pool {
+            self.emit(MempoolEvent::LeaveEvicted {
+                txid: *evicted_txid,
+                reason: EvictReason::FullPool,
+            });
+        }
+        for conflict_txid in &replaced {
+            self.emit(MempoolEvent::LeaveReplaced {
+                txid: *conflict_txid,
+                replacing_txid: txid,
+            });
+        }
+        self.emit(MempoolEvent::Enter {
+            txid,
+            fee,
+            vsize: vsize_u64,
+            fee_rate_sat_per_kvb: fee_rate,
+            time: now,
+        });
+
         Ok(txid)
     }
 
-    /// Remove all transactions confirmed in the given block.
-    pub fn remove_for_block(&self, block: &Block) {
-        let mut inner = self.inner.write().unwrap();
-
-        for tx in &block.txdata {
-            let txid = tx.compute_txid();
-            if let Some(entry) = inner.entries.remove(&txid) {
-                let tx_size = bitcoin::consensus::serialize(&entry.tx).len();
-                inner.total_bytes = inner.total_bytes.saturating_sub(tx_size);
-                for input in &entry.tx.input {
-                    inner.spends.remove(&input.previous_output);
+    /// Remove all transactions confirmed in the given block. Emits
+    /// `LeaveConfirmed` events for txids that were in the mempool.
+    /// `height` is the connected block's height and is threaded into
+    /// the event so subscribers can filter / correlate.
+    pub fn remove_for_block(&self, block: &Block, height: u32) {
+        let block_hash = block.block_hash();
+        let mut confirmed: Vec<Txid> = Vec::new();
+        let mut evicted_conflicts: Vec<Txid> = Vec::new();
+        {
+            let mut inner = self.inner.write().unwrap();
+            for tx in &block.txdata {
+                let txid = tx.compute_txid();
+                if let Some(entry) = inner.entries.remove(&txid) {
+                    let tx_size = bitcoin::consensus::serialize(&entry.tx).len();
+                    inner.total_bytes = inner.total_bytes.saturating_sub(tx_size);
+                    for input in &entry.tx.input {
+                        inner.spends.remove(&input.previous_output);
+                    }
+                    confirmed.push(txid);
                 }
-            }
 
-            // Also remove any mempool txs whose inputs are now double-spent by block txs
-            if !tx.is_coinbase() {
-                for input in &tx.input {
-                    if let Some(conflict_txid) = inner.spends.remove(&input.previous_output)
-                        && let Some(conflict_entry) = inner.entries.remove(&conflict_txid) {
+                // Also remove any mempool txs whose inputs are now
+                // double-spent by the block. The chain — not policy —
+                // retired these, surfaced as
+                // `LeaveEvicted { BlockConflict }` so operators don't
+                // read them as mempool pressure.
+                if !tx.is_coinbase() {
+                    for input in &tx.input {
+                        if let Some(conflict_txid) =
+                            inner.spends.remove(&input.previous_output)
+                            && let Some(conflict_entry) = inner.entries.remove(&conflict_txid)
+                        {
                             let sz = bitcoin::consensus::serialize(&conflict_entry.tx).len();
                             inner.total_bytes = inner.total_bytes.saturating_sub(sz);
-                            // Clean up remaining spends for the conflicting tx
                             for ci in &conflict_entry.tx.input {
                                 inner.spends.remove(&ci.previous_output);
                             }
+                            evicted_conflicts.push(conflict_txid);
                         }
+                    }
                 }
             }
+        }
+
+        for txid in &confirmed {
+            self.emit(MempoolEvent::LeaveConfirmed {
+                txid: *txid,
+                block_hash,
+                height,
+            });
+        }
+        for txid in &evicted_conflicts {
+            self.emit(MempoolEvent::LeaveEvicted {
+                txid: *txid,
+                reason: EvictReason::BlockConflict,
+            });
         }
     }
 
@@ -487,23 +604,34 @@ impl Mempool {
             .unwrap_or_default()
             .as_secs();
 
-        let mut inner = self.inner.write().unwrap();
-        let expired: Vec<Txid> = inner
-            .entries
-            .iter()
-            .filter(|(_, entry)| now.saturating_sub(entry.time) > self.config.expiry_secs)
-            .map(|(txid, _)| *txid)
-            .collect();
+        let mut expired_txids: Vec<Txid> = Vec::new();
+        {
+            let mut inner = self.inner.write().unwrap();
+            let expired: Vec<Txid> = inner
+                .entries
+                .iter()
+                .filter(|(_, entry)| now.saturating_sub(entry.time) > self.config.expiry_secs)
+                .map(|(txid, _)| *txid)
+                .collect();
 
-        let count = expired.len();
-        for txid in expired {
-            if let Some(entry) = inner.entries.remove(&txid) {
-                let tx_size = bitcoin::consensus::serialize(&entry.tx).len();
-                inner.total_bytes = inner.total_bytes.saturating_sub(tx_size);
-                for input in &entry.tx.input {
-                    inner.spends.remove(&input.previous_output);
+            for txid in &expired {
+                if let Some(entry) = inner.entries.remove(txid) {
+                    let tx_size = bitcoin::consensus::serialize(&entry.tx).len();
+                    inner.total_bytes = inner.total_bytes.saturating_sub(tx_size);
+                    for input in &entry.tx.input {
+                        inner.spends.remove(&input.previous_output);
+                    }
+                    expired_txids.push(*txid);
                 }
             }
+        }
+
+        let count = expired_txids.len();
+        for txid in &expired_txids {
+            self.emit(MempoolEvent::LeaveEvicted {
+                txid: *txid,
+                reason: EvictReason::Expiry,
+            });
         }
 
         if count > 0 {
@@ -576,17 +704,42 @@ impl Mempool {
         Some(descendants)
     }
 
+    /// Get the direct in-mempool children of `txid` — transactions
+    /// that spend any output of `txid`. Uses the `spends` reverse
+    /// index for O(outputs) lookup. Does *not* recurse.
+    pub fn get_children(&self, txid: &Txid) -> Option<Vec<Txid>> {
+        let inner = self.inner.read().unwrap();
+        let entry = inner.entries.get(txid)?;
+        let n_outs = entry.tx.output.len() as u32;
+        let mut children: Vec<Txid> = Vec::new();
+        let mut seen: HashSet<Txid> = HashSet::new();
+        for vout in 0..n_outs {
+            let op = OutPoint { txid: *txid, vout };
+            if let Some(child) = inner.spends.get(&op)
+                && seen.insert(*child)
+            {
+                children.push(*child);
+            }
+        }
+        Some(children)
+    }
+
     /// Get verbose entry data for a single mempool transaction (for RPC).
     pub fn get_entry_verbose(&self, txid: &Txid) -> Option<serde_json::Value> {
         let inner = self.inner.read().unwrap();
         let entry = inner.entries.get(txid)?;
         let vsize = entry.weight / 4;
-        let ancestors = {
-            drop(inner);
-            self.get_ancestors(txid).unwrap_or_default()
-        };
+        let entry_fee = entry.fee;
+        let entry_weight = entry.weight;
+        let entry_time = entry.time;
+        let entry_tx_inputs: Vec<_> = entry.tx.input.clone();
+        drop(inner);
+
+        let ancestors = self.get_ancestors(txid).unwrap_or_default();
+        let descendants = self.get_descendants(txid).unwrap_or_default();
+        let children = self.get_children(txid).unwrap_or_default();
+
         let inner = self.inner.read().unwrap();
-        let entry = inner.entries.get(txid)?;
 
         let ancestor_count = ancestors.len();
         let ancestor_size: usize = ancestors
@@ -600,34 +753,46 @@ impl Mempool {
             .filter_map(|a| inner.entries.get(a))
             .map(|e| e.fee)
             .sum::<u64>()
-            + entry.fee;
+            + entry_fee;
 
-        let bip125_replaceable = entry
-            .tx
-            .input
+        let descendant_count = descendants.len() + 1; // includes self
+        let descendant_size: usize = descendants
+            .iter()
+            .filter_map(|d| inner.entries.get(d))
+            .map(|e| e.weight / 4)
+            .sum::<usize>()
+            + vsize;
+        let descendant_fees: u64 = descendants
+            .iter()
+            .filter_map(|d| inner.entries.get(d))
+            .map(|e| e.fee)
+            .sum::<u64>()
+            + entry_fee;
+
+        let bip125_replaceable = entry_tx_inputs
             .iter()
             .any(|i| i.sequence.0 < 0xffff_fffe);
 
         Some(serde_json::json!({
             "fees": {
-                "base": entry.fee as f64 / 100_000_000.0,
-                "modified": entry.fee as f64 / 100_000_000.0,
+                "base": entry_fee as f64 / 100_000_000.0,
+                "modified": entry_fee as f64 / 100_000_000.0,
                 "ancestor": ancestor_fees as f64 / 100_000_000.0,
-                "descendant": entry.fee as f64 / 100_000_000.0,
+                "descendant": descendant_fees as f64 / 100_000_000.0,
             },
             "vsize": vsize,
-            "weight": entry.weight,
-            "fee": entry.fee as f64 / 100_000_000.0,
-            "time": entry.time,
+            "weight": entry_weight,
+            "fee": entry_fee as f64 / 100_000_000.0,
+            "time": entry_time,
             "height": 0, // would need chain height at time of entry
-            "descendantcount": 1,
-            "descendantsize": vsize,
-            "descendantfees": entry.fee,
+            "descendantcount": descendant_count,
+            "descendantsize": descendant_size,
+            "descendantfees": descendant_fees,
             "ancestorcount": ancestor_count + 1,
             "ancestorsize": ancestor_size,
             "ancestorfees": ancestor_fees,
             "depends": ancestors.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
-            "spentby": [],
+            "spentby": children.iter().map(|c| c.to_string()).collect::<Vec<_>>(),
             "bip125-replaceable": bip125_replaceable,
             "unbroadcast": false,
         }))
@@ -702,8 +867,10 @@ impl Mempool {
     }
 
     /// Evict lowest-fee-rate entries to free at least `bytes_needed` bytes.
-    /// Also removes descendants of evicted entries.
-    fn evict_lowest_fee_entries(inner: &mut MempoolInner, bytes_needed: usize) {
+    /// Also removes descendants of evicted entries. Returns the list of
+    /// evicted txids so the caller can emit `LeaveEvicted { FullPool }`
+    /// events after dropping the write lock.
+    fn evict_lowest_fee_entries(inner: &mut MempoolInner, bytes_needed: usize) -> Vec<Txid> {
         // Sort entries by fee_rate ascending
         let mut by_fee_rate: Vec<(Txid, u64)> = inner
             .entries
@@ -767,6 +934,7 @@ impl Mempool {
         if !to_remove.is_empty() {
             tracing::info!(evicted = to_remove.len(), "Mempool eviction complete");
         }
+        to_remove
     }
 
     /// Get mempool statistics.
@@ -1218,11 +1386,116 @@ mod tests {
 
         // Verify remove_for_block on an empty pool is a no-op and doesn't panic
         let genesis = bitcoin::constants::genesis_block(bitcoin::Network::Regtest);
-        mp.remove_for_block(&genesis);
+        mp.remove_for_block(&genesis, 0);
 
         let info = mp.info();
         assert_eq!(info.size, 0);
         assert_eq!(info.bytes, 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_for_block_conflict_emits_block_conflict_not_full_pool() {
+        use bitcoin::blockdata::locktime::absolute::LockTime;
+        use bitcoin::hashes::Hash;
+        use bitcoin::{Amount, ScriptBuf, Sequence, TxIn, TxOut, Witness, transaction};
+
+        let (_cs, mp, dir) = make_test_env();
+        let (event_tx, mut event_rx) =
+            tokio::sync::broadcast::channel::<MempoolEvent>(64);
+        mp.set_event_sender(event_tx);
+
+        // A mempool tx spending UTXO X. We bypass accept_transaction
+        // validation and wire the state by hand — the scenario we need
+        // is "tx is in the mempool, a conflicting block arrives" and
+        // that state is awkward to reach through the public API.
+        let contested = OutPoint {
+            txid: bitcoin::Txid::from_raw_hash(
+                bitcoin::hashes::sha256d::Hash::from_byte_array([7u8; 32]),
+            ),
+            vout: 0,
+        };
+        let mempool_tx = Transaction {
+            version: transaction::Version(2),
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: contested,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let mempool_txid = mempool_tx.compute_txid();
+        {
+            let mut inner = mp.inner.write().unwrap();
+            inner.spends.insert(contested, mempool_txid);
+            inner.entries.insert(
+                mempool_txid,
+                MempoolEntry {
+                    tx: mempool_tx,
+                    fee: 500,
+                    weight: 400,
+                    fee_rate: 1_250,
+                    time: 0,
+                    fee_delta: 0,
+                    sigop_cost: 0,
+                },
+            );
+        }
+
+        // Build a block containing a different tx that spends the same
+        // UTXO X — chain-induced conflict.
+        let block_tx = Transaction {
+            version: transaction::Version(2),
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: contested,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(900),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        // Minimum-viable block: take regtest genesis and append our tx.
+        let mut block = bitcoin::constants::genesis_block(bitcoin::Network::Regtest);
+        block.txdata.push(block_tx);
+
+        mp.remove_for_block(&block, 123);
+
+        // Consume events until we see the LeaveEvicted for mempool_txid.
+        // The broadcast is synchronous in-process; a handful of recv
+        // iterations is enough.
+        let mut saw_block_conflict = false;
+        for _ in 0..8 {
+            match event_rx.try_recv() {
+                Ok(MempoolEvent::LeaveEvicted { txid, reason })
+                    if txid == mempool_txid =>
+                {
+                    assert_eq!(
+                        reason,
+                        EvictReason::BlockConflict,
+                        "chain-induced removal must be BlockConflict, not {:?}",
+                        reason
+                    );
+                    saw_block_conflict = true;
+                    break;
+                }
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
+        assert!(
+            saw_block_conflict,
+            "expected a LeaveEvicted{{BlockConflict}} event for the conflicting mempool tx"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
