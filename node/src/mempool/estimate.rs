@@ -30,6 +30,16 @@ pub const BLOCK_WEIGHT_LIMIT: u64 = 4_000_000;
 pub const COINBASE_WEIGHT_RESERVE: u64 = 4_000;
 /// Usable weight per simulated block (block limit − coinbase reserve).
 pub const USABLE_WEIGHT_PER_BLOCK: u64 = BLOCK_WEIGHT_LIMIT - COINBASE_WEIGHT_RESERVE;
+/// BIP 141 sigop-cost cap per block.
+pub const MAX_BLOCK_SIGOPS_COST: u64 = 80_000;
+/// Bitcoin Core's per-ancestor sigop-cost cap (`MAX_PACKAGE_SIGOPS_COST`).
+/// A package whose aggregate sigop cost exceeds this is skipped.
+pub const MAX_PACKAGE_SIGOPS_COST: u64 = 80_000;
+/// Below this block-0 weight we treat the mempool as "thin": short-term
+/// targets collapse to the min-relay floor because there simply isn't
+/// enough queue depth to draw an estimate from. 2 Mwu ≈ 500 kvB, matching
+/// mempool.space's `blocks` gating.
+pub const THIN_BLOCK_WEIGHT_THRESHOLD: u64 = 2_000_000;
 
 /// Confidence of an estimated target feerate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -153,6 +163,20 @@ fn ancestor_aggregate(
 ///
 /// Returns the block summary and the set of txids consumed (to remove
 /// from `remaining` before simulating the next block).
+///
+/// Admission rules:
+/// - Sort candidates by their *initial* ancestor feerate (descending).
+/// - For each candidate, admit together with its in-mempool ancestors
+///   that are not already in the block.
+/// - Reject the package if its aggregate sigop cost exceeds
+///   `MAX_PACKAGE_SIGOPS_COST`; if it would push the block past
+///   `MAX_BLOCK_SIGOPS_COST`, skip and continue (later packages may fit).
+/// - Record `min_feerate_sat_per_kvb` as the **marginal** feerate at
+///   admission — (fee of not-yet-admitted ancestors + self) /
+///   (weight of not-yet-admitted ancestors + self). This is the
+///   dependencyRate clamp: a descendant whose ancestor was already
+///   pulled in by a sibling only contributes its own weight and fees
+///   to the block's floor, never claiming credit for the sibling's bump.
 fn simulate_one_block(remaining: &HashMap<Txid, MempoolEntry>) -> (SimBlock, HashSet<Txid>) {
     let mut anc_memo: HashMap<Txid, HashSet<Txid>> = HashMap::with_capacity(remaining.len());
     let mut sorted: Vec<(Txid, u64)> = Vec::with_capacity(remaining.len());
@@ -169,10 +193,11 @@ fn simulate_one_block(remaining: &HashMap<Txid, MempoolEntry>) -> (SimBlock, Has
 
     let mut included: HashSet<Txid> = HashSet::new();
     let mut used_weight: u64 = 0;
+    let mut used_sigops: u64 = 0;
     let mut min_admitted_rate: u64 = 0;
     let mut filled = false;
 
-    for (txid, rate) in sorted {
+    for (txid, _initial_rate) in sorted {
         if included.contains(&txid) {
             continue;
         }
@@ -181,20 +206,41 @@ fn simulate_one_block(remaining: &HashMap<Txid, MempoolEntry>) -> (SimBlock, Has
             .filter(|t| !included.contains(t))
             .collect();
         group.push(txid);
-        let group_weight: u64 = group
-            .iter()
-            .filter_map(|t| remaining.get(t).map(|e| e.weight as u64))
-            .sum();
+
+        let mut group_fee: u64 = 0;
+        let mut group_weight: u64 = 0;
+        let mut group_sigops: u64 = 0;
+        for t in &group {
+            if let Some(e) = remaining.get(t) {
+                group_fee = group_fee.saturating_add(effective_fee(e));
+                group_weight = group_weight.saturating_add(e.weight as u64);
+                group_sigops = group_sigops.saturating_add(e.sigop_cost);
+            }
+        }
+        if group_weight == 0 {
+            continue;
+        }
+        if group_sigops > MAX_PACKAGE_SIGOPS_COST {
+            // Policy-invalid as a package — would be dropped by a miner.
+            continue;
+        }
         if used_weight.saturating_add(group_weight) > USABLE_WEIGHT_PER_BLOCK {
             filled = true;
             continue;
         }
+        if used_sigops.saturating_add(group_sigops) > MAX_BLOCK_SIGOPS_COST {
+            // Block-wide sigop cap reached for this package; skip and try
+            // the next candidate (may be smaller in sigops).
+            continue;
+        }
+        let marginal_rate = group_fee.saturating_mul(1000) / group_weight;
         used_weight += group_weight;
-        min_admitted_rate = rate;
+        used_sigops += group_sigops;
+        min_admitted_rate = marginal_rate;
         for t in group {
             included.insert(t);
         }
-        if used_weight >= USABLE_WEIGHT_PER_BLOCK {
+        if used_weight >= USABLE_WEIGHT_PER_BLOCK || used_sigops >= MAX_BLOCK_SIGOPS_COST {
             filled = true;
             break;
         }
@@ -309,11 +355,20 @@ pub fn estimate_from_mempool(
 /// - Partially-filled block → `Medium`, either the min admitted or the
 ///   caller's min-relay floor (whichever is higher).
 /// - Empty simulated block → `Low`, floor to `floor_sat_per_kvb`.
+///
+/// If the first simulated block is "thin" (below
+/// `THIN_BLOCK_WEIGHT_THRESHOLD`), short targets (1..=3) collapse to
+/// the floor with `Low` confidence: in that regime the queue depth
+/// doesn't carry enough signal to price above min-relay, so offering
+/// anything else would mislead callers into overpaying.
 pub fn target_estimate(
     estimate: &MempoolEstimate,
     target: u32,
     floor_sat_per_kvb: u64,
 ) -> (u64, Confidence) {
+    if target <= 3 && is_thin_block(estimate) {
+        return (floor_sat_per_kvb, Confidence::Low);
+    }
     let idx = target.saturating_sub(1) as usize;
     let Some(block) = estimate.sim_blocks.get(idx) else {
         return (floor_sat_per_kvb, Confidence::Low);
@@ -331,6 +386,29 @@ pub fn target_estimate(
         block.min_feerate_sat_per_kvb.max(floor_sat_per_kvb),
         Confidence::Medium,
     )
+}
+
+/// True when the simulated next block is thinly filled — i.e., below
+/// `THIN_BLOCK_WEIGHT_THRESHOLD` in weight. Indicates there is not
+/// enough queue to derive a meaningful short-term premium over the
+/// min-relay floor.
+pub fn is_thin_block(estimate: &MempoolEstimate) -> bool {
+    estimate
+        .sim_blocks
+        .first()
+        .map(|b| b.weight < THIN_BLOCK_WEIGHT_THRESHOLD)
+        .unwrap_or(true)
+}
+
+/// Economy feerate = min(2 × floor, hour_rate). Bounds a "cheapest
+/// reasonable" suggestion so operators never undershoot by pulling
+/// the hour rate down further than twice min-relay, and never
+/// overshoot the hour rate on quiet days.
+pub fn economy_feerate_sat_per_kvb(floor_sat_per_kvb: u64, hour_rate_sat_per_kvb: u64) -> u64 {
+    let twice_floor = floor_sat_per_kvb.saturating_mul(2);
+    hour_rate_sat_per_kvb
+        .min(twice_floor)
+        .max(floor_sat_per_kvb)
 }
 
 #[cfg(test)]
@@ -364,6 +442,15 @@ mod tests {
     }
 
     fn mk_entry(tx: Transaction, fee: u64, weight: usize) -> MempoolEntry {
+        mk_entry_with_sigops(tx, fee, weight, 0)
+    }
+
+    fn mk_entry_with_sigops(
+        tx: Transaction,
+        fee: u64,
+        weight: usize,
+        sigop_cost: u64,
+    ) -> MempoolEntry {
         let fee_rate = if weight > 0 {
             fee * 1000 / weight as u64
         } else {
@@ -376,6 +463,7 @@ mod tests {
             fee_rate,
             time: 0,
             fee_delta: 0,
+            sigop_cost,
         }
     }
 
@@ -405,10 +493,13 @@ mod tests {
 
     #[test]
     fn single_tx_fills_nothing_medium_confidence() {
-        // One small tx, feerate 10_000 sat/kvB.
+        // One fat tx whose weight is above the thin-block threshold so
+        // short-target collapse does not kick in. Feerate 10_000 sat/kvB.
         let tx = mk_tx(&[], 1);
         let txid = tx.compute_txid();
-        let entry = mk_entry(tx, 1_000, 100); // 10_000 sat/kvB
+        let weight = (THIN_BLOCK_WEIGHT_THRESHOLD as usize) + 1;
+        let fee = (weight as u64) * 10_000 / 1_000; // 10_000 sat/kvB
+        let entry = mk_entry(tx, fee, weight);
         let snap = vec![(txid, entry)];
         let est = estimate_from_mempool(snap, 3);
         let (rate, conf) = target_estimate(&est, 1, 1000);
@@ -486,14 +577,139 @@ mod tests {
 
     #[test]
     fn target_estimate_respects_floor() {
-        // Thin mempool with a very low-feerate tx. Floor should kick in.
+        // Non-thin mempool (weight above threshold) at 100 sat/kvB,
+        // floor at 1000 → floor wins even though block is confident.
         let tx = mk_tx(&[], 1);
         let txid = tx.compute_txid();
-        let entry = mk_entry(tx, 10, 100); // 100 sat/kvB
+        let weight = (THIN_BLOCK_WEIGHT_THRESHOLD as usize) + 1;
+        let fee = (weight as u64) * 100 / 1_000; // 100 sat/kvB
+        let entry = mk_entry(tx, fee, weight);
         let est = estimate_from_mempool(vec![(txid, entry)], 3);
         let (rate, conf) = target_estimate(&est, 1, 1000);
-        // Floor (1000) above single tx's 100 → returned.
         assert_eq!(rate, 1000);
         assert_eq!(conf, Confidence::Medium);
+    }
+
+    // --- New: dependencyRate clamping, sigops budget, thin-block, economy ---
+
+    #[test]
+    fn dependency_rate_clamps_sibling_rate() {
+        // Parent P (low), Child X (pays big fee), Child Y (modest).
+        // Pre-fix: Y's ancestor rate = (P+Y)/(Pw+Yw) is medium because P
+        // drags Y down — but after X admits P, Y's marginal rate is
+        // just Y's own rate. We verify that min_admitted_rate reflects
+        // the marginal rate at admission, not the stale ancestor-rate.
+        let parent = mk_tx(&[], 2); // 2 outputs: one for X, one for Y
+        let parent_id = parent.compute_txid();
+        let child_x = mk_tx(&[(parent_id, 0)], 1);
+        let x_id = child_x.compute_txid();
+        let child_y = mk_tx(&[(parent_id, 1)], 1);
+        let y_id = child_y.compute_txid();
+
+        // P: 0 fee, 400 wu → 0 sat/kvB on its own.
+        // X: 100_000 fee, 400 wu → 250_000 sat/kvB on its own.
+        //    X's ancestor (P+X): 100k/800 = 125_000 sat/kvB.
+        // Y: 1_000 fee, 400 wu → 2_500 sat/kvB on its own.
+        //    Y's ancestor (P+Y): 1k/800 = 1_250 sat/kvB (drags low).
+        // Sort: X first (125k), then Y (1.25k). X admits P+X.
+        // Y's marginal at admission (P already in) = 1000/400 = 2500.
+        // Therefore min_admitted_rate must be 2500, not 1250.
+        let p = mk_entry(parent, 0, 400);
+        let ex = mk_entry(child_x, 100_000, 400);
+        let ey = mk_entry(child_y, 1_000, 400);
+        let snap = vec![(parent_id, p), (x_id, ex), (y_id, ey)];
+        let est = estimate_from_mempool(snap, 1);
+        assert_eq!(
+            est.sim_blocks[0].tx_count, 3,
+            "all three should be admitted"
+        );
+        assert_eq!(
+            est.sim_blocks[0].min_feerate_sat_per_kvb, 2_500,
+            "Y's marginal rate at admission — P already paid for"
+        );
+    }
+
+    #[test]
+    fn sigop_heavy_package_excluded() {
+        // A tx with sigop_cost > MAX_PACKAGE_SIGOPS_COST is dropped as a
+        // package candidate — even if its fee rate would otherwise admit.
+        let fat_sigop_tx = mk_tx(&[(random_txid(9), 0)], 1);
+        let fat_id = fat_sigop_tx.compute_txid();
+        let fat_entry =
+            mk_entry_with_sigops(fat_sigop_tx, 1_000_000, 400, MAX_PACKAGE_SIGOPS_COST + 1);
+
+        // A normal high-rate tx that should still be admitted.
+        let ok_tx = mk_tx(&[(random_txid(10), 0)], 1);
+        let ok_id = ok_tx.compute_txid();
+        let ok_entry = mk_entry(ok_tx, 2_000, 400);
+
+        let snap = vec![(fat_id, fat_entry), (ok_id, ok_entry)];
+        let est = estimate_from_mempool(snap, 1);
+        assert_eq!(est.sim_blocks[0].tx_count, 1);
+        // The admitted tx must be the ok one, not the sigop-heavy one.
+        let expected_rate = 2_000u64 * 1_000 / 400;
+        assert_eq!(
+            est.sim_blocks[0].min_feerate_sat_per_kvb, expected_rate,
+            "sigop-heavy tx should not have set the floor"
+        );
+    }
+
+    #[test]
+    fn block_sigop_cap_skips_but_continues() {
+        // Two txs each carry half the block sigop cap + a sliver over,
+        // so two of them cannot coexist. The simulator should admit the
+        // higher-rate one and skip (not stop at) the second — proving
+        // the block-cap path is `continue`, not break.
+        //
+        // We put a third, smaller tx with 0 sigops behind the cap —
+        // it must still be admitted after the block-cap skip.
+        let half = MAX_BLOCK_SIGOPS_COST / 2 + 100;
+
+        let t1 = mk_tx(&[(random_txid(21), 0)], 1);
+        let id1 = t1.compute_txid();
+        let e1 = mk_entry_with_sigops(t1, 100_000, 400, half);
+
+        let t2 = mk_tx(&[(random_txid(22), 0)], 1);
+        let id2 = t2.compute_txid();
+        let e2 = mk_entry_with_sigops(t2, 90_000, 400, half);
+
+        let t3 = mk_tx(&[(random_txid(23), 0)], 1);
+        let id3 = t3.compute_txid();
+        let e3 = mk_entry_with_sigops(t3, 1_000, 400, 0);
+
+        let snap = vec![(id1, e1), (id2, e2), (id3, e3)];
+        let est = estimate_from_mempool(snap, 1);
+        // Admit t1 (sigops fit) + t3 (0 sigops). t2 skipped on block cap.
+        assert_eq!(est.sim_blocks[0].tx_count, 2);
+    }
+
+    #[test]
+    fn thin_block_collapses_short_targets_to_floor() {
+        // A lone tx at 10_000 sat/kvB with weight just below the thin
+        // threshold → block 0 is thin → short targets return (floor, Low).
+        let tx = mk_tx(&[], 1);
+        let txid = tx.compute_txid();
+        let weight = (THIN_BLOCK_WEIGHT_THRESHOLD - 1) as usize;
+        let fee = (weight as u64) * 10_000 / 1_000;
+        let entry = mk_entry(tx, fee, weight);
+        let est = estimate_from_mempool(vec![(txid, entry)], 6);
+        assert!(is_thin_block(&est));
+        let (rate1, conf1) = target_estimate(&est, 1, 1000);
+        assert_eq!(rate1, 1000);
+        assert_eq!(conf1, Confidence::Low);
+        let (rate3, conf3) = target_estimate(&est, 3, 1000);
+        assert_eq!(rate3, 1000);
+        assert_eq!(conf3, Confidence::Low);
+    }
+
+    #[test]
+    fn economy_feerate_clamps_between_floor_and_twice_floor() {
+        let floor = 2_000u64;
+        // Hour rate below floor → at least floor.
+        assert_eq!(economy_feerate_sat_per_kvb(floor, 500), floor);
+        // Hour rate between floor and 2× floor → equals hour rate.
+        assert_eq!(economy_feerate_sat_per_kvb(floor, 3_000), 3_000);
+        // Hour rate above 2× floor → clamped at 2× floor.
+        assert_eq!(economy_feerate_sat_per_kvb(floor, 100_000), 2 * floor);
     }
 }

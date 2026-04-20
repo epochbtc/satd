@@ -687,12 +687,38 @@ pub async fn start(
             })
             .collect();
 
+        // economyFee: "cheap but reasonable" — clamp hour rate between
+        // min-relay floor and 2× floor. Hour rate = the deepest target
+        // the caller asked for.
+        let hour_target = targets.iter().copied().max().unwrap_or(24);
+        let hour_rate = match mode {
+            EstimateMode::Historical => ctx
+                .fee_estimator
+                .estimate_fee(hour_target)
+                .unwrap_or(floor_sat_per_kvb),
+            _ => {
+                let (r, _) = crate::mempool::estimate::target_estimate(
+                    &mempool_est,
+                    hour_target,
+                    floor_sat_per_kvb,
+                );
+                r
+            }
+        };
+        let economy_rate = crate::mempool::estimate::economy_feerate_sat_per_kvb(
+            floor_sat_per_kvb,
+            hour_rate,
+        );
+        let thin_block = crate::mempool::estimate::is_thin_block(&mempool_est);
+
         let mut response = serde_json::json!({
             "targets": targets_obj,
             "histogram": histogram,
             "mode": mode.as_str(),
             "fallback": any_fallback,
             "mempool_weight": mempool_est.mempool_weight,
+            "economy_feerate": format_feerate_sat_per_kvb(economy_rate, unit),
+            "thin_block": thin_block,
         });
         annotate_units(&mut response, unit);
         Ok::<_, ErrorObjectOwned>(response)

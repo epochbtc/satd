@@ -52,6 +52,10 @@ pub struct MempoolEntry {
     pub time: u64,
     /// Miner-adjustable fee delta (satoshis) from `prioritisetransaction`.
     pub fee_delta: i64,
+    /// BIP 141 witness-aware sigop cost of this tx. Computed at admission
+    /// using the resolved `prev_outputs` so P2SH / P2WSH redeem scripts are
+    /// accounted for accurately.
+    pub sigop_cost: u64,
 }
 
 /// Statistics about the mempool.
@@ -386,6 +390,14 @@ impl Mempool {
             inner.spends.insert(input.previous_output, txid);
         }
 
+        let prev_outputs_map: HashMap<OutPoint, TxOut> = tx
+            .input
+            .iter()
+            .zip(prev_outputs.iter())
+            .map(|(i, o)| (i.previous_output, o.clone()))
+            .collect();
+        let sigop_cost = tx.total_sigop_cost(|op| prev_outputs_map.get(op).cloned()) as u64;
+
         inner.entries.insert(
             txid,
             MempoolEntry {
@@ -395,6 +407,7 @@ impl Mempool {
                 fee_rate,
                 time: now,
                 fee_delta: 0,
+                sigop_cost,
             },
         );
         inner.total_bytes += tx_size;
@@ -863,6 +876,7 @@ mod tests {
                 fee_rate: 25, // very low fee rate
                 time: 0,
                 fee_delta: 0,
+                sigop_cost: 0,
             },
         );
         inner.total_bytes = low_size;
