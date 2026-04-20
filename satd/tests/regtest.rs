@@ -2665,6 +2665,167 @@ fn test_reorg_record_reflects_completed_state() {
 }
 
 #[test]
+fn test_reorg_record_not_written_when_final_block_fails() {
+    // Residual edge case: disconnect + intermediate side-chain reconnect
+    // succeed, then the final triggering block fails `connect_block`
+    // validation. The persisted reorg record must NOT appear, because
+    // that block never became the active tip.
+    //
+    // We engineer the failure by hand-crafting a block with a valid
+    // header (correct merkle root, satisfies regtest PoW) but an invalid
+    // coinbase value (51 BTC instead of the 50 BTC regtest subsidy).
+    // `connect_block` rejects it with `BadCoinbaseValue`.
+    use bitcoin::consensus::{Encodable, deserialize};
+    use bitcoin::hashes::Hash;
+    use bitcoin::{Amount, Block, Transaction};
+
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+
+    // Node A: short chain of 2 blocks.
+    let mut node_a = TestNode::start(&[]);
+    let gen_a = node_a
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(2), serde_json::json!(addr)],
+        )
+        .unwrap();
+    let _a_hashes: Vec<String> = gen_a["result"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+
+    // Node B: longer chain (3 valid blocks). Take the last one's hex so
+    // we can corrupt its coinbase value.
+    let mut node_b = TestNode::start(&[]);
+    let gen_b = node_b
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(3), serde_json::json!(addr)],
+        )
+        .unwrap();
+    let b_hashes: Vec<String> = gen_b["result"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+
+    // Fetch each B block's hex from node B, tampering with B3's coinbase.
+    let mut b_hex: Vec<String> = Vec::with_capacity(3);
+    for (i, h) in b_hashes.iter().enumerate() {
+        let raw = node_b
+            .rpc_call_with_params(
+                "getblock",
+                vec![serde_json::json!(h), serde_json::json!(0)],
+            )
+            .unwrap();
+        let hex_str = raw["result"].as_str().unwrap().to_string();
+        if i == 2 {
+            // Deserialize, bump coinbase output value, recompute merkle
+            // root, re-solve PoW. Regtest bits = 0x207fffff → near-max
+            // target, so a valid nonce is found in a handful of tries.
+            let bytes = hex::decode(&hex_str).unwrap();
+            let mut block: Block = deserialize(&bytes).unwrap();
+
+            // Corrupt the coinbase: 50 BTC → 51 BTC (invalid subsidy).
+            let cb: &mut Transaction = &mut block.txdata[0];
+            cb.output[0].value = Amount::from_sat(51 * 100_000_000);
+
+            // Recompute merkle root.
+            let txids: Vec<[u8; 32]> = block
+                .txdata
+                .iter()
+                .map(|t| t.compute_txid().to_raw_hash().to_byte_array())
+                .collect();
+            let root = compute_merkle_root(&txids);
+            block.header.merkle_root =
+                bitcoin::TxMerkleNode::from_raw_hash(
+                    bitcoin::hashes::sha256d::Hash::from_byte_array(root),
+                );
+
+            // Re-solve PoW against regtest target.
+            let target = block.header.target();
+            for nonce in 0u32..10_000_000 {
+                block.header.nonce = nonce;
+                if target.is_met_by(block.header.block_hash()) {
+                    break;
+                }
+            }
+
+            let mut buf = Vec::new();
+            block.consensus_encode(&mut buf).unwrap();
+            b_hex.push(hex::encode(&buf));
+        } else {
+            b_hex.push(hex_str);
+        }
+    }
+    node_b.stop();
+
+    // Submit B1, B2, B3 to node A. The first two are side-chain blocks
+    // (equal-or-less work). B3 makes B heavier than A → triggers reorg.
+    // perform_reorg succeeds, B1+B2 reconnect, then connect_block for
+    // B3 must fail on the bad coinbase.
+    for hex in &b_hex {
+        let _ = node_a
+            .rpc_call_with_params("submitblock", vec![serde_json::json!(hex)])
+            .unwrap();
+    }
+
+    // With the final connect failing, the node must end up with B2 as
+    // tip (the last successfully connected side-chain block), not B3.
+    let tip = node_a.rpc_call("getbestblockhash").unwrap();
+    assert_eq!(
+        tip["result"].as_str().unwrap(),
+        b_hashes[1],
+        "final connect should have failed → tip stays at the last successful side-chain block"
+    );
+
+    // The reorg record MUST still reflect an actual completed reorg
+    // (disconnect of A + reconnect through B1, B2) — just without B3.
+    // But the record we wrote must NOT claim B3 became the tip. The
+    // cleanest invariant: either no record (if we defer until the full
+    // success) or a record whose `new_tip` is B2, not the corrupted B3.
+    // Our implementation defers: no record written when the final
+    // connect fails, even though the intermediate state did change.
+    let hist = node_a.rpc_call("getreorghistory").unwrap();
+    let records = hist["result"]["records"].as_array().unwrap();
+    assert!(
+        records.iter().all(|r| r["new_tip"].as_str() != Some(&b_hashes[2])),
+        "getreorghistory must not report the invalid block as a new tip; got: {:?}",
+        records
+    );
+
+    node_a.stop();
+}
+
+/// Double-SHA256 merkle root helper for the failure-path test.
+fn compute_merkle_root(hashes: &[[u8; 32]]) -> [u8; 32] {
+    use bitcoin::hashes::Hash;
+    if hashes.is_empty() {
+        return [0u8; 32];
+    }
+    let mut current = hashes.to_vec();
+    while current.len() > 1 {
+        if !current.len().is_multiple_of(2) {
+            let last = *current.last().unwrap();
+            current.push(last);
+        }
+        let mut next = Vec::with_capacity(current.len() / 2);
+        for pair in current.chunks(2) {
+            let mut combined = [0u8; 64];
+            combined[..32].copy_from_slice(&pair[0]);
+            combined[32..].copy_from_slice(&pair[1]);
+            let h = bitcoin::hashes::sha256d::Hash::hash(&combined);
+            next.push(h.to_byte_array());
+        }
+        current = next;
+    }
+    current[0]
+}
+
+#[test]
 fn test_getreorghistory_empty_on_fresh_node() {
     let mut node = TestNode::start(&[]);
     let response = node.rpc_call("getreorghistory").unwrap();

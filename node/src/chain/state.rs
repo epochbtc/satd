@@ -101,6 +101,21 @@ struct ReorgDisconnectInfo {
     disconnected: Vec<BlockHash>,
 }
 
+/// Staged reorg record: all the inputs to `ReorgRecord::new` except the
+/// final tip. The tip is appended only after the final triggering
+/// block's `connect_block` + commit + tip update all succeed. Keeping
+/// this in-memory and emitting it last means `getreorghistory` never
+/// shows a record whose claimed new_tip never actually activated.
+struct PendingReorgRecord {
+    fork_height: u32,
+    old_tip: BlockHash,
+    old_height: u32,
+    disconnected: Vec<BlockHash>,
+    /// Side-chain blocks already reconnected + committed, fork-parent-
+    /// first, not yet including the final triggering block.
+    reconnected_so_far: Vec<BlockHash>,
+}
+
 /// Central chain state manager.
 pub struct ChainState {
     store: std::sync::Arc<CoinCache>,
@@ -1068,6 +1083,13 @@ impl ChainState {
         )
         .entered();
 
+        // Reorg record staged by the side-chain branch below and emitted
+        // only after the final tip-extending connect/commit succeeds. If
+        // that final step fails we never persist the record, which keeps
+        // getreorghistory honest: it always describes reorgs that
+        // actually became the active chain tip.
+        let mut pending_reorg: Option<PendingReorgRecord> = None;
+
         // Check for duplicate (HeaderOnly entries are OK — we're now providing data)
         if let Some(existing) = self.store.get_block_index(&block_hash)
             && existing.status != BlockStatus::HeaderOnly {
@@ -1235,26 +1257,17 @@ impl ChainState {
                 tracing::info!(height = side_entry.height, hash = %side_hash, "Reorg: block connected");
             }
 
-            // The final new-tip block (the one that triggered this
-            // `accept_block` call) will be connected immediately below.
-            // Persist the reorg record here — we already know `block_hash`
-            // will be the new tip and all the intermediate side-chain
-            // hashes. If connect of `block` fails after this point, the
-            // record still accurately describes what was on disk at
-            // commit time (the chain *was* rolled back + reconnected
-            // through the side chain; only the final extension fails).
-            if let Some(log) = self.reorg_log.get() {
-                reconnected_hashes.push(block_hash);
-                let record = crate::chain::reorg_log::ReorgRecord::new(
-                    fork_entry.height,
-                    disconnect_info.old_tip,
-                    block_hash,
-                    disconnect_info.old_height,
-                    disconnect_info.disconnected.clone(),
-                    reconnected_hashes.clone(),
-                );
-                log.record(record);
-            }
+            // Stage the reorg record for persistence *after* the final
+            // triggering block's connect+commit succeeds below. Writing it
+            // here would predict a new_tip that might never be reached if
+            // the final `connect_block` fails validation.
+            pending_reorg = Some(PendingReorgRecord {
+                fork_height: fork_entry.height,
+                old_tip: disconnect_info.old_tip,
+                old_height: disconnect_info.old_height,
+                disconnected: disconnect_info.disconnected,
+                reconnected_so_far: reconnected_hashes,
+            });
 
             // Fall through to connect the new block as a tip-extending block
         }
@@ -1288,6 +1301,24 @@ impl ChainState {
             let mut tip = self.tip.write().unwrap();
             tip.hash = block_hash;
             tip.height = new_height;
+        }
+
+        // The reorg (if one happened) is now fully complete: disconnect,
+        // all intermediate reconnections, and the final tip-extending
+        // connect have all committed. Persist one complete record with
+        // the real final tip.
+        if let (Some(pending), Some(log)) = (pending_reorg.take(), self.reorg_log.get()) {
+            let mut reconnected = pending.reconnected_so_far;
+            reconnected.push(block_hash);
+            let record = crate::chain::reorg_log::ReorgRecord::new(
+                pending.fork_height,
+                pending.old_tip,
+                block_hash,
+                pending.old_height,
+                pending.disconnected,
+                reconnected,
+            );
+            log.record(record);
         }
 
         // Update MTP cache with this block's timestamp
