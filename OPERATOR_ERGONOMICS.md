@@ -117,7 +117,12 @@ exact.
 **Effort:** S-M. Touches every amount-returning RPC. Default flag negotiation
 preserves backward compat for Bitcoin-Core-clients.
 
-### 4. Mempool-based smart fee estimation
+### 4. Mempool-based smart fee estimation ✅ SHIPPED
+
+**Status:** Landed — new `estimatefees` RPC plus `estimatesmartfee` with
+optional `mode` param (`historical` default, `mempool`, `blend`). Never
+errors; falls back to min-relay floor with `confidence: low`. Core-compat
+response shape preserved on `estimatesmartfee`.
 
 **Pain:** Core's `estimatesmartfee` is history-based — it cannot react to
 sudden congestion until blocks confirm at the new rate. BTCPay switched to

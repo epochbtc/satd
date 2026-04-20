@@ -746,6 +746,132 @@ fn test_estimatesmartfee() {
 }
 
 #[test]
+fn test_estimatesmartfee_core_compat_shape_unchanged() {
+    // The default (no mode param) response must contain exactly the Core-
+    // compatible keys: `feerate`, `blocks`, `errors`. Nothing else.
+    // Regression guard: adding mempool-based estimation must not break
+    // Bitcoin Core clients.
+    let mut node = TestNode::start(&[]);
+    let response = node
+        .rpc_call_with_params("estimatesmartfee", vec![serde_json::json!(6)])
+        .unwrap();
+    let result = response["result"].as_object().unwrap();
+    let keys: std::collections::BTreeSet<&str> =
+        result.keys().map(|k| k.as_str()).collect();
+    let expected: std::collections::BTreeSet<&str> =
+        ["feerate", "blocks", "errors"].into_iter().collect();
+    assert_eq!(keys, expected, "estimatesmartfee default shape drifted");
+    assert!(result["feerate"].as_f64().unwrap() > 0.0);
+    assert_eq!(result["blocks"], 6);
+    // `errors` is always an empty list.
+    assert!(result["errors"].as_array().unwrap().is_empty());
+    node.stop();
+}
+
+#[test]
+fn test_estimatesmartfee_accepts_mode_param() {
+    // mode=mempool is accepted and returns the same shape. With an empty
+    // mempool the feerate falls back to the min-relay floor.
+    let mut node = TestNode::start(&[]);
+    let response = node
+        .rpc_call_with_params(
+            "estimatesmartfee",
+            vec![serde_json::json!(6), serde_json::json!("mempool")],
+        )
+        .unwrap();
+    let result = &response["result"];
+    assert!(result["feerate"].as_f64().unwrap() > 0.0);
+    assert_eq!(result["blocks"], 6);
+    // Same keys as Core-compat default — only the source differs.
+    let keys: std::collections::BTreeSet<&str> = result
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(|k| k.as_str())
+        .collect();
+    assert_eq!(
+        keys,
+        ["feerate", "blocks", "errors"].into_iter().collect()
+    );
+    node.stop();
+}
+
+#[test]
+fn test_estimatefees_default_shape() {
+    // estimatefees with no args returns a blend over default targets with
+    // a histogram and a `mode` tag. Empty mempool → Low confidence.
+    let mut node = TestNode::start(&[]);
+    let response = node.rpc_call("estimatefees").unwrap();
+    let result = response["result"].as_object().unwrap();
+
+    assert!(result.contains_key("targets"));
+    assert!(result.contains_key("histogram"));
+    assert!(result.contains_key("mode"));
+    assert!(result.contains_key("fallback"));
+    assert!(result.contains_key("mempool_weight"));
+    assert_eq!(result["mode"], "blend");
+
+    let targets = result["targets"].as_object().unwrap();
+    for key in ["1", "3", "6", "12", "24"] {
+        let t = &targets[key];
+        assert!(t["feerate"].as_f64().unwrap() > 0.0);
+        let conf = t["confidence"].as_str().unwrap();
+        assert!(
+            matches!(conf, "high" | "medium" | "low"),
+            "confidence must be one of high|medium|low; got {}",
+            conf
+        );
+    }
+
+    // Histogram is a JSON array (may be empty when mempool is empty).
+    assert!(result["histogram"].is_array());
+    // Fresh node with empty mempool: no tx queued.
+    assert_eq!(result["mempool_weight"].as_u64(), Some(0));
+    node.stop();
+}
+
+#[test]
+fn test_estimatefees_respects_sats_units() {
+    // With --rpcdefaultunits=sats, feerate fields inside `targets` are
+    // JSON integers (sat/kvB), and the response carries `_units: sats`.
+    let mut node = TestNode::start(&["--rpcdefaultunits=sats"]);
+    let response = node.rpc_call("estimatefees").unwrap();
+    let result = &response["result"];
+    assert_eq!(result["_units"].as_str(), Some("sats"));
+    let targets = result["targets"].as_object().unwrap();
+    for (_, t) in targets {
+        assert!(
+            t["feerate"].as_u64().is_some(),
+            "feerate must be integer sat/kvB in sats mode, got: {}",
+            t["feerate"]
+        );
+    }
+    node.stop();
+}
+
+#[test]
+fn test_estimatefees_custom_targets_and_mode() {
+    let mut node = TestNode::start(&[]);
+    let response = node
+        .rpc_call_with_params(
+            "estimatefees",
+            vec![
+                serde_json::json!([1, 2, 5]),
+                serde_json::json!("mempool"),
+            ],
+        )
+        .unwrap();
+    let result = &response["result"];
+    assert_eq!(result["mode"], "mempool");
+    let targets = result["targets"].as_object().unwrap();
+    assert_eq!(
+        targets.keys().map(|k| k.as_str()).collect::<Vec<_>>(),
+        vec!["1", "2", "5"]
+    );
+    node.stop();
+}
+
+#[test]
 fn test_mine_many_blocks_bip34() {
     // Tests that BIP 34 coinbase height encoding works for heights 0-20
     // (covers OP_0, OP_1..OP_16, and data-push encoding)

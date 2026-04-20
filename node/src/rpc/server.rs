@@ -26,6 +26,79 @@ pub struct RpcContext {
     pub last_shutdown_clean: bool,
 }
 
+/// Which data source `estimatesmartfee` / `estimatefees` draws from.
+///
+/// - `Historical` (default for `estimatesmartfee`): percentile of recent
+///   confirmed-block feerates. Exactly matches pre-mempool-sim behavior
+///   and Bitcoin Core's `estimatesmartfee` semantics.
+/// - `Mempool`: simulate the next N block templates from the live
+///   mempool and use the ancestor-feerate of the lowest admitted tx.
+///   Responds faster to sudden congestion than historical.
+/// - `Blend` (default for `estimatefees`): mempool estimate when
+///   confidence >= medium; fall back to historical otherwise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EstimateMode {
+    Historical,
+    Mempool,
+    Blend,
+}
+
+impl EstimateMode {
+    pub fn parse(s: Option<&str>) -> Option<Self> {
+        match s?.trim().to_ascii_lowercase().as_str() {
+            "historical" | "conservative" | "economical" | "unset" => Some(Self::Historical),
+            "mempool" => Some(Self::Mempool),
+            "blend" => Some(Self::Blend),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Historical => "historical",
+            Self::Mempool => "mempool",
+            Self::Blend => "blend",
+        }
+    }
+}
+
+/// Resolve a single `estimatesmartfee` target into a feerate (sat/kvB).
+///
+/// Isolated so `estimatesmartfee` can stay Core-compatible: the response
+/// shape never changes; only the source of the number does.
+fn resolve_feerate_sat_per_kvb<F>(
+    mode: EstimateMode,
+    target: u32,
+    historical: Option<u64>,
+    floor_sat_per_kvb: u64,
+    snapshot_fn: F,
+) -> u64
+where
+    F: FnOnce() -> Vec<(bitcoin::Txid, crate::mempool::pool::MempoolEntry)>,
+{
+    match mode {
+        EstimateMode::Historical => historical.unwrap_or(floor_sat_per_kvb),
+        EstimateMode::Mempool => {
+            let est = crate::mempool::estimate::estimate_from_mempool(snapshot_fn(), target as usize);
+            let (rate, _) = crate::mempool::estimate::target_estimate(&est, target, floor_sat_per_kvb);
+            rate
+        }
+        EstimateMode::Blend => {
+            let est = crate::mempool::estimate::estimate_from_mempool(snapshot_fn(), target as usize);
+            let (mp_rate, mp_conf) = crate::mempool::estimate::target_estimate(&est, target, floor_sat_per_kvb);
+            if matches!(
+                mp_conf,
+                crate::mempool::estimate::Confidence::High
+                    | crate::mempool::estimate::Confidence::Medium
+            ) {
+                mp_rate
+            } else {
+                historical.unwrap_or(floor_sat_per_kvb)
+            }
+        }
+    }
+}
+
 /// Start the JSON-RPC HTTP server with authentication.
 #[allow(clippy::too_many_arguments)]
 pub async fn start(
@@ -495,15 +568,125 @@ pub async fn start(
     })?;
 
     module.register_method("estimatesmartfee", |params, ctx, _extensions| {
-        let conf_target: u32 = params.one().map_err(|e| {
+        let mut seq = params.sequence();
+        let conf_target: u32 = seq.next().map_err(|e| {
             ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
         })?;
+        // Optional trailing `mode` string. Core-compat vocabulary
+        // (ECONOMICAL/CONSERVATIVE/UNSET) is accepted and treated as
+        // Historical; our own vocabulary is historical/mempool/blend.
+        let mode_str: Option<String> = seq.optional_next().unwrap_or(None);
+        let mode = EstimateMode::parse(mode_str.as_deref()).unwrap_or(EstimateMode::Historical);
+
         let unit = default_unit();
-        let sat_per_kvb = ctx.fee_estimator.estimate_fee(conf_target).unwrap_or(1_000); // fallback 1 sat/vB
+        let floor_sat_per_kvb = ctx.mempool.info().min_fee_rate.max(1_000);
+        let historical = ctx.fee_estimator.estimate_fee(conf_target);
+        let sat_per_kvb = resolve_feerate_sat_per_kvb(
+            mode,
+            conf_target,
+            historical,
+            floor_sat_per_kvb,
+            || ctx.mempool.get_all_entries(),
+        );
         let mut response = serde_json::json!({
             "feerate": format_feerate_sat_per_kvb(sat_per_kvb, unit),
             "blocks": conf_target,
             "errors": [],
+        });
+        annotate_units(&mut response, unit);
+        Ok::<_, ErrorObjectOwned>(response)
+    })?;
+
+    module.register_method("estimatefees", |params, ctx, _extensions| {
+        // `estimatefees [targets] [mode]` — both optional.
+        // `targets`: array of confirmation targets in blocks. Default
+        // `[1, 3, 6, 12, 24]`. `mode` (default "blend") selects the data
+        // source.
+        let mut seq = params.sequence();
+        let targets: Vec<u32> = seq
+            .optional_next()
+            .unwrap_or(None)
+            .unwrap_or_else(|| vec![1u32, 3, 6, 12, 24]);
+        let mode_str: Option<String> = seq.optional_next().unwrap_or(None);
+        let mode = EstimateMode::parse(mode_str.as_deref()).unwrap_or(EstimateMode::Blend);
+
+        let unit = default_unit();
+        let floor_sat_per_kvb = ctx.mempool.info().min_fee_rate.max(1_000);
+        let max_target = targets.iter().copied().max().unwrap_or(24).max(1);
+        let snapshot = ctx.mempool.get_all_entries();
+        let mempool_est =
+            crate::mempool::estimate::estimate_from_mempool(snapshot, max_target as usize);
+
+        let mut targets_obj = serde_json::Map::new();
+        let mut any_fallback = false;
+        for t in &targets {
+            let (rate_kvb, conf) = match mode {
+                EstimateMode::Historical => {
+                    let h = ctx.fee_estimator.estimate_fee(*t);
+                    let r = h.unwrap_or(floor_sat_per_kvb);
+                    let c = if h.is_some() {
+                        crate::mempool::estimate::Confidence::Medium
+                    } else {
+                        any_fallback = true;
+                        crate::mempool::estimate::Confidence::Low
+                    };
+                    (r, c)
+                }
+                EstimateMode::Mempool => {
+                    crate::mempool::estimate::target_estimate(&mempool_est, *t, floor_sat_per_kvb)
+                }
+                EstimateMode::Blend => {
+                    let (mp_rate, mp_conf) = crate::mempool::estimate::target_estimate(
+                        &mempool_est,
+                        *t,
+                        floor_sat_per_kvb,
+                    );
+                    if matches!(
+                        mp_conf,
+                        crate::mempool::estimate::Confidence::High
+                            | crate::mempool::estimate::Confidence::Medium
+                    ) {
+                        (mp_rate, mp_conf)
+                    } else if let Some(h) = ctx.fee_estimator.estimate_fee(*t) {
+                        any_fallback = true;
+                        (h, crate::mempool::estimate::Confidence::Medium)
+                    } else {
+                        any_fallback = true;
+                        (floor_sat_per_kvb, crate::mempool::estimate::Confidence::Low)
+                    }
+                }
+            };
+            let conf_str = match conf {
+                crate::mempool::estimate::Confidence::High => "high",
+                crate::mempool::estimate::Confidence::Medium => "medium",
+                crate::mempool::estimate::Confidence::Low => "low",
+            };
+            targets_obj.insert(
+                t.to_string(),
+                serde_json::json!({
+                    "feerate": format_feerate_sat_per_kvb(rate_kvb, unit),
+                    "confidence": conf_str,
+                }),
+            );
+        }
+
+        let histogram: Vec<serde_json::Value> = mempool_est
+            .histogram
+            .iter()
+            .map(|b| {
+                serde_json::json!({
+                    "feerate": format_feerate_sat_per_kvb(b.feerate_sat_per_kvb, unit),
+                    "weight": b.weight,
+                })
+            })
+            .collect();
+
+        let mut response = serde_json::json!({
+            "targets": targets_obj,
+            "histogram": histogram,
+            "mode": mode.as_str(),
+            "fallback": any_fallback,
+            "mempool_weight": mempool_est.mempool_weight,
         });
         annotate_units(&mut response, unit);
         Ok::<_, ErrorObjectOwned>(response)
