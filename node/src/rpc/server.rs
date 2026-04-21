@@ -893,7 +893,7 @@ pub async fn start(
             "getmempoolentry", "getmempoolhistory", "getmempoolinfo", "getmemoryinfo", "getmininginfo",
             "getnettotals", "getnetworkhashps", "getnetworkinfo", "getpeerinfo",
             "getrawmempool", "getrawtransaction", "getreorghistory", "getrpcinfo",
-            "getsysteminfo", "gettxout",
+            "getsysteminfo", "gettxout", "getwarnings",
             "gettxoutsetinfo", "help", "listbanned", "logging", "ping",
             "preciousblock", "prioritisetransaction",
             "savemempool", "sendrawtransaction", "setban",
@@ -914,6 +914,24 @@ pub async fn start(
         // and cookie values are redacted. This is advisory, not a
         // machine-consumable API: field names track satd internals.
         Ok::<_, ErrorObjectOwned>(ctx.effective_config.clone())
+    })?;
+
+    module.register_method("getwarnings", |_params, ctx, _extensions| {
+        // Active operational warnings: connect failures, storage issues,
+        // shadow-verifier mismatches, etc. Each entry is an active
+        // condition keyed by a stable `id`; same-id repeats increment
+        // `count`. Warnings clear when the emitting site detects the
+        // condition resolved.
+        let warnings: Vec<serde_json::Value> = ctx
+            .chain_state
+            .warnings()
+            .list()
+            .into_iter()
+            .map(|w| serde_json::to_value(w).unwrap_or(serde_json::Value::Null))
+            .collect();
+        Ok::<_, ErrorObjectOwned>(serde_json::json!({
+            "warnings": warnings,
+        }))
     })?;
 
     module.register_method("getreorghistory", |params, ctx, _extensions| {

@@ -169,6 +169,10 @@ fn run_app(
                         ViewMode::Mempool => ui::mempool::draw(f, &st),
                     }
                 }
+                // Draw warnings modal LAST so it overlays every other view.
+                // Respects per-id dismissal so acknowledged warnings don't
+                // block the view until they re-trigger.
+                ui::warnings::draw(f, &st);
             })?;
         }
 
@@ -192,6 +196,18 @@ fn run_app(
                     KeyCode::Char('r') => {
                         st.show_help = false;
                         st.show_reorgs = !st.show_reorgs;
+                    }
+                    KeyCode::Char('a') => {
+                        // Acknowledge & dismiss currently-visible warnings
+                        // for this session. They'll reappear if the
+                        // node clears and re-records them, or a new
+                        // id surfaces.
+                        st.dismiss_visible_warnings();
+                    }
+                    KeyCode::Char('w') => {
+                        // Re-show dismissed warnings (operator wants to
+                        // look at them again).
+                        st.dismissed_warnings.clear();
                     }
                     KeyCode::Esc => {
                         if st.show_help { st.show_help = false; }
@@ -250,12 +266,13 @@ async fn poller(rpc: Arc<RpcClient>, state: Arc<Mutex<AppState>>) {
         ibd_counter += 1;
 
         // Fast polls (every 1.5s) — lightweight RPCs only
-        let (chain_res, peers_res, mempool_res, conn_res, sysinfo_res) = tokio::join!(
+        let (chain_res, peers_res, mempool_res, conn_res, sysinfo_res, warnings_res) = tokio::join!(
             rpc.get_blockchain_info(),
             rpc.get_peer_info(),
             rpc.get_mempool_info(),
             rpc.get_connection_count(),
             rpc.get_system_info(),
+            rpc.get_warnings(),
         );
 
         // IBD progress poll (every 3s = every 2nd fast tick) — heavier bitmap RPC
@@ -288,6 +305,9 @@ async fn poller(rpc: Arc<RpcClient>, state: Arc<Mutex<AppState>>) {
             }
             if let Ok(v) = sysinfo_res {
                 st.update_system_info(&v);
+            }
+            if let Ok(v) = warnings_res {
+                st.update_warnings(&v);
             }
 
             if any_ok {
