@@ -686,7 +686,17 @@ async fn main() {
     let flush_cs = chain_state.clone();
     let (flush_tx, flush_rx) = tokio::sync::oneshot::channel();
     std::thread::spawn(move || {
-        let result = flush_cs.flush_coin_cache();
+        // Drain dirty cache to RocksDB memtable, THEN fsync the memtable to
+        // SST. With BulkLoad mode (WAL disabled) a bare `flush_coin_cache`
+        // leaves every post-last-atomic-flush mutation volatile — recovery
+        // on restart replays from DataStored blocks, but only if those
+        // blocks' chainstate effects were truly durable. Relying on the
+        // RocksDB Drop-time flush is not safe: force-exit, SIGKILL or
+        // panic skip destructors and memtable contents are lost. An
+        // explicit `flush_durable` after `flush_coin_cache` guarantees the
+        // tip pointer and its coin mutations are on disk together before
+        // we signal shutdown-complete.
+        let result = flush_cs.flush_coin_cache().and_then(|()| flush_cs.flush_durable());
         let _ = flush_tx.send(result);
     });
     let flushed_ok = match node::shutdown::await_bounded_flush(flush_rx, shutdown_deadline).await {
