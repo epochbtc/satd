@@ -58,6 +58,12 @@ pub struct CoinCache {
     /// (WAL disabled — only safe during IBD where loss on crash can be
     /// replayed from the flat-file block store). Set via `set_write_mode`.
     write_mode: AtomicU8,
+    /// Number of times `flush()` has successfully drained the dirty set.
+    /// Used by tests to assert the periodic-flush policy in reindex and
+    /// the normal connect loop actually fires — without this counter a
+    /// regression that stops flushing would be silent until memory
+    /// exhaustion.
+    pub flush_count: AtomicU64,
 }
 
 fn decode_write_mode(v: u8) -> WriteMode {
@@ -110,6 +116,7 @@ impl CoinCache {
             perf_clean_hits: AtomicU64::new(0),
             perf_store_misses: AtomicU64::new(0),
             write_mode: AtomicU8::new(0),
+            flush_count: AtomicU64::new(0),
         }
     }
 
@@ -213,6 +220,7 @@ impl CoinCache {
             }
         }
 
+        self.flush_count.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 

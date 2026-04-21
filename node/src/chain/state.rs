@@ -919,6 +919,15 @@ impl ChainState {
     /// Rebuild the UTXO set by replaying all blocks from flat files.
     /// Block index and flat files must be intact. Used by `-reindex-chainstate`.
     pub fn reindex_chainstate(&self) -> Result<(), ChainError> {
+        // Periodic flush cadence for the durable checkpoint. The
+        // dirty-cache threshold (see `flush_threshold`) already triggers
+        // in-cache flushes when memory pressure requires — but reindex
+        // runs without the normal connect-loop's periodic `flush_durable`
+        // call, so large reindexes would still hold weeks of writes in
+        // the in-memory dirty set until the whole reindex completed.
+        // 1000 blocks mirrors the production IBD connect loop's cadence.
+        const DURABLE_FLUSH_EVERY: u32 = 1000;
+
         let mut height = 1; // genesis already connected by ChainState::new()
         while let Some(hash) = self.store.get_block_hash_by_height(height) {
             let entry = self
@@ -966,11 +975,29 @@ impl ChainState {
                 tip.height = height;
             }
 
-            if height % 10_000 == 0 {
+            // Bound memory: drain the in-memory dirty set to RocksDB
+            // whenever it crosses the configured threshold. Without
+            // this a full-chain reindex accumulated 122 GiB RSS at
+            // ~block 430k on mainnet before the OOM killer fired.
+            if self.store.dirty_count() > self.store.flush_threshold() {
+                self.store.flush()?;
+            }
+
+            // Periodic durable checkpoint: bounds the replay window on
+            // a crash/OOM during a long reindex so progress sticks.
+            if height.is_multiple_of(DURABLE_FLUSH_EVERY) {
+                self.store.flush()?;
+                self.store.flush_durable()?;
+            }
+
+            if height.is_multiple_of(10_000) {
                 tracing::info!(height, "Reindexing chainstate...");
             }
             height += 1;
         }
+        // Final flush so the reindexed tip is durable before we return.
+        self.store.flush()?;
+        self.store.flush_durable()?;
         tracing::info!(height = height - 1, "Chainstate reindex complete");
         Ok(())
     }
@@ -2747,6 +2774,71 @@ pub(crate) mod tests {
             );
             assert_eq!(entry.height, h);
         }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression: `reindex_chainstate` used to never flush the in-memory
+    /// dirty-cache, so a full-chain reindex accumulated every UTXO mutation
+    /// unbounded. On mainnet this hit 122 GiB RSS at block ~430k before
+    /// OOM-killed the process. With the fix, the periodic durable-flush
+    /// at 1000-block boundaries fires and the final flush drains the
+    /// dirty set before return.
+    #[test]
+    fn reindex_chainstate_flushes_periodically_and_at_end() {
+        let (cs, dir) = make_chain_state();
+        // Build 1200 blocks — past the 1000-block durable-flush cadence
+        // so the periodic-flush path fires at least once mid-reindex
+        // (in addition to the final flush on completion).
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+        let mut parent = genesis.block_hash();
+        for h in 1..=1200u32 {
+            let block = build_test_block(parent, h, 1_300_000_000 + h);
+            parent = cs.accept_block(&block).unwrap();
+        }
+
+        // Clear chainstate + reset in-memory tip so reindex starts fresh.
+        // `accept_block` above already flushed many times; baseline from
+        // here so we're only counting reindex-triggered flushes.
+        cs.store.flush().unwrap(); // drain anything outstanding
+        cs.store.clear_chainstate().unwrap();
+        {
+            let mut tip = cs.tip.write().unwrap();
+            tip.hash = genesis.block_hash();
+            tip.height = 0;
+        }
+        let flushes_before = cs
+            .store
+            .flush_count
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        cs.reindex_chainstate().unwrap();
+
+        let flushes_after = cs
+            .store
+            .flush_count
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let reindex_flushes = flushes_after - flushes_before;
+
+        // Without the fix: zero flushes fire during reindex (dirty set
+        // grows unbounded and the function never calls flush()). With
+        // the fix: at least one mid-reindex flush at height 1000 plus a
+        // final flush at completion = ≥ 2.
+        assert!(
+            reindex_flushes >= 2,
+            "reindex must flush at least periodic + final; got {reindex_flushes}"
+        );
+
+        // And the final flush must drain the dirty set, otherwise the
+        // in-memory state survives past return.
+        assert_eq!(
+            cs.store.dirty_count(),
+            0,
+            "dirty cache not drained by final flush after reindex"
+        );
+
+        // Verify correctness: tip is back at the last block.
+        assert_eq!(cs.tip_height(), 1200);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
