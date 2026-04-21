@@ -87,7 +87,12 @@ fn draw_summary(f: &mut Frame, area: Rect, state: &AppState) {
     let (max_rate, delta_str) = if let Some(last) = state.mempool_history.last() {
         let mx = last.max_fee_rate_sat_per_kvb as f64 / 1_000.0;
         let mx_str = if mx > 0.0 { format!("{:.1}", mx) } else { "-".into() };
-        let delta = if let Some((dtx, dbytes, secs)) = state.latest_mempool_delta() {
+        let delta = if state.mempool_size == 0 {
+            // Distinguish "we have data, mempool is genuinely empty" from
+            // "we're still waiting for our second history snapshot". Both
+            // produce the same on-screen result without this branch.
+            "mempool empty — node receiving no relayed txs (still catching up?)".into()
+        } else if let Some((dtx, dbytes, secs)) = state.latest_mempool_delta() {
             let tx_sign = if dtx >= 0 { "+" } else { "" };
             let bytes_str = if dbytes >= 0 {
                 format!("+{}", format_bytes(dbytes as u64))
@@ -134,6 +139,32 @@ fn draw_histogram(f: &mut Frame, area: Rect, state: &AppState) {
     f.render_widget(block, area);
 
     let aggregated = aggregate_histogram(state.mempool_history.last());
+    let total_weight: u64 = aggregated.iter().map(|(_, w)| *w).sum();
+
+    // Empty mempool — paint a centered "no data" message and skip the bars
+    // entirely (zero-width bars just look like a misrendered panel).
+    if total_weight == 0 && inner.height >= 3 {
+        let msg_y = inner.y + (inner.height.saturating_sub(3)) / 2;
+        let msg_area = Rect { x: inner.x, y: msg_y, width: inner.width, height: 1 };
+        let msg = if state.mempool_size == 0 {
+            "Mempool is empty — no fee distribution to display."
+        } else {
+            "Awaiting first feerate snapshot..."
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                msg.to_string(),
+                Style::default().fg(Color::DarkGray),
+            )))
+            .alignment(ratatui::layout::Alignment::Center),
+            msg_area,
+        );
+        // Still render the tier overlay below — even with empty mempool the
+        // estimator returns floor values that are useful to see.
+        draw_histogram_footer(f, inner, state);
+        return;
+    }
+
     let max_weight = aggregated.iter().map(|(_, w)| *w).max().unwrap_or(1).max(1);
     let bar_budget = (inner.width as isize - 30).max(0) as u64;
 
@@ -180,39 +211,43 @@ fn draw_histogram(f: &mut Frame, area: Rect, state: &AppState) {
         f.render_widget(Paragraph::new(line), row);
     }
 
-    // Tier + mode/confidence footer inside the histogram panel.
-    if inner.height >= 3 {
-        let tier_line = Line::from(tier_spans(&state.fees));
-        let tier_row = Rect {
-            x: inner.x,
-            y: inner.y + inner.height - 2,
-            width: inner.width,
-            height: 1,
-        };
-        f.render_widget(Paragraph::new(tier_line), tier_row);
+    draw_histogram_footer(f, inner, state);
+}
 
-        let mode = state.fees.mode.as_deref().unwrap_or("?");
-        let conf = state.fees.confidence.as_deref().unwrap_or("?");
-        let conf_color = match conf {
-            "high" => Color::Green,
-            "medium" => Color::Yellow,
-            "low" => Color::LightRed,
-            _ => Color::DarkGray,
-        };
-        let mode_line = Line::from(vec![
-            Span::styled("  mode ", Style::default().fg(Color::DarkGray)),
-            Span::styled(mode.to_string(), Style::default().fg(Color::Cyan)),
-            Span::styled("   confidence ", Style::default().fg(Color::DarkGray)),
-            Span::styled(conf.to_string(), Style::default().fg(conf_color)),
-        ]);
-        let mode_row = Rect {
-            x: inner.x,
-            y: inner.y + inner.height - 1,
-            width: inner.width,
-            height: 1,
-        };
-        f.render_widget(Paragraph::new(mode_line), mode_row);
+fn draw_histogram_footer(f: &mut Frame, inner: Rect, state: &AppState) {
+    if inner.height < 3 {
+        return;
     }
+    let tier_line = Line::from(tier_spans(&state.fees));
+    let tier_row = Rect {
+        x: inner.x,
+        y: inner.y + inner.height - 2,
+        width: inner.width,
+        height: 1,
+    };
+    f.render_widget(Paragraph::new(tier_line), tier_row);
+
+    let mode = state.fees.mode.as_deref().unwrap_or("?");
+    let conf = state.fees.confidence.as_deref().unwrap_or("?");
+    let conf_color = match conf {
+        "high" => Color::Green,
+        "medium" => Color::Yellow,
+        "low" => Color::LightRed,
+        _ => Color::DarkGray,
+    };
+    let mode_line = Line::from(vec![
+        Span::styled("  mode ", Style::default().fg(Color::DarkGray)),
+        Span::styled(mode.to_string(), Style::default().fg(Color::Cyan)),
+        Span::styled("   confidence ", Style::default().fg(Color::DarkGray)),
+        Span::styled(conf.to_string(), Style::default().fg(conf_color)),
+    ]);
+    let mode_row = Rect {
+        x: inner.x,
+        y: inner.y + inner.height - 1,
+        width: inner.width,
+        height: 1,
+    };
+    f.render_widget(Paragraph::new(mode_line), mode_row);
 }
 
 fn tier_spans(fees: &FeeSummary) -> Vec<Span<'static>> {
@@ -301,6 +336,22 @@ fn draw_trend(f: &mut Frame, area: Rect, state: &AppState) {
     let txs: Vec<u64> = state.mempool_history.iter().map(|s| s.size).collect();
     let min_fees: Vec<u64> = state.mempool_history.iter().map(|s| s.min_fee_rate_sat_per_kvb).collect();
 
+    // All-zero history (e.g. mempool stayed empty during catch-up) makes
+    // sparklines render as a flat invisible line — paint a hint instead.
+    if bytes.iter().all(|b| *b == 0) && txs.iter().all(|t| *t == 0) {
+        let msg_y = inner.y + inner.height / 2;
+        let msg_area = Rect { x: inner.x, y: msg_y, width: inner.width, height: 1 };
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "no mempool activity yet",
+                Style::default().fg(Color::DarkGray),
+            )))
+            .alignment(ratatui::layout::Alignment::Center),
+            msg_area,
+        );
+        return;
+    }
+
     // 2-row blocks: one label row + one sparkline row each.
     let rows = [
         ("Bytes  ", &bytes, Color::Cyan),
@@ -355,6 +406,37 @@ fn draw_top_n(f: &mut Frame, area: Rect, state: &AppState) {
         " Top by ancestor feerate ({} in mempool) ",
         format_num(state.mempool_size),
     );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(Span::styled(
+            title,
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ));
+
+    if state.mempool_top.is_empty() {
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        if inner.height >= 1 {
+            let msg_y = inner.y + inner.height / 2;
+            let msg_area = Rect { x: inner.x, y: msg_y, width: inner.width, height: 1 };
+            let msg = if state.mempool_size == 0 {
+                "Mempool is empty — no transactions to rank."
+            } else {
+                "Awaiting verbose mempool snapshot..."
+            };
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    msg.to_string(),
+                    Style::default().fg(Color::DarkGray),
+                )))
+                .alignment(ratatui::layout::Alignment::Center),
+                msg_area,
+            );
+        }
+        return;
+    }
+
     let header = Row::new(vec!["#", "txid", "vsize", "anc sat/vB", "A/D", "age"])
         .style(Style::default().fg(Color::Cyan));
     let widths = vec![
@@ -373,17 +455,7 @@ fn draw_top_n(f: &mut Frame, area: Rect, state: &AppState) {
         .map(|(i, e)| top_row(i, e, i == state.selected_mempool_row))
         .collect();
 
-    let table = Table::new(rows, widths)
-        .header(header)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray))
-                .title(Span::styled(
-                    title,
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                )),
-        );
+    let table = Table::new(rows, widths).header(header).block(block);
     f.render_widget(table, area);
 }
 
