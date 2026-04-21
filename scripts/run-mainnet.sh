@@ -38,7 +38,7 @@ exec "$SATD" \
     --txindex \
     --dbcache=8000 \
     --maxahead=all \
-    --consensus=rust-shadow \
+    --consensus=cpp-shadow \
     --shadowworkers=8 \
     --assumevalid=0 \
     "${CONNECT_ARGS[@]}"
