@@ -138,6 +138,9 @@ pub struct ChainState {
     /// Lazily initialized by `open_reorg_log` — may be absent in tests
     /// that don't care about reorg observability.
     reorg_log: std::sync::OnceLock<std::sync::Arc<crate::chain::reorg_log::ReorgLog>>,
+    /// Active node warnings (connect failures, storage issues, etc.).
+    /// Always present — warnings are a core operational surface.
+    warnings: std::sync::Arc<crate::warnings::NodeWarnings>,
 }
 
 impl ChainState {
@@ -209,6 +212,7 @@ impl ChainState {
                     mtp_cache: Mutex::new(Vec::with_capacity(12)),
                     num_threads,
                     reorg_log: std::sync::OnceLock::new(),
+                    warnings: std::sync::Arc::new(crate::warnings::NodeWarnings::new()),
                 });
             }
 
@@ -253,7 +257,14 @@ impl ChainState {
             mtp_cache: Mutex::new(Vec::with_capacity(12)),
             num_threads,
             reorg_log: std::sync::OnceLock::new(),
+            warnings: std::sync::Arc::new(crate::warnings::NodeWarnings::new()),
         })
+    }
+
+    /// Access the shared warnings surface. Always present; use to
+    /// record or clear operational issues from anywhere in the node.
+    pub fn warnings(&self) -> &std::sync::Arc<crate::warnings::NodeWarnings> {
+        &self.warnings
     }
 
     /// Attach a reorg log. Must be called before the chain state sees

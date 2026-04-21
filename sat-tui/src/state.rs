@@ -69,6 +69,25 @@ pub struct ReorgEntry {
     pub reconnected_len: usize,
 }
 
+/// Active warning surfaced from the node's `getwarnings` RPC.
+#[derive(Debug, Clone)]
+pub struct NodeWarning {
+    pub id: String,
+    pub severity: WarningSeverity,
+    pub message: String,
+    pub first_seen_unix_secs: u64,
+    /// Kept for future enrichment; modal currently shows first_seen + count.
+    #[allow(dead_code)]
+    pub last_seen_unix_secs: u64,
+    pub count: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WarningSeverity {
+    Error,
+    Warn,
+}
+
 /// 4-tier fee summary derived from estimatefees (mempool.space convention).
 #[derive(Debug, Clone, Default)]
 pub struct FeeSummary {
@@ -183,6 +202,12 @@ pub struct AppState {
     // Reorg history (from getreorghistory)
     pub reorg_history: Vec<ReorgEntry>,
 
+    // Active node warnings (from getwarnings)
+    pub warnings: Vec<NodeWarning>,
+    /// Per-id dismissal — keys that the operator has acknowledged for
+    /// the current session. Cleared when the id clears server-side.
+    pub dismissed_warnings: std::collections::HashSet<String>,
+
     // Mempool-pane data
     pub mempool_history: Vec<MempoolSnapshot>,
     /// False when the node started without a writable history log.
@@ -268,6 +293,9 @@ impl AppState {
             last_shutdown: None,
 
             reorg_history: Vec::new(),
+
+            warnings: Vec::new(),
+            dismissed_warnings: std::collections::HashSet::new(),
 
             mempool_history: Vec::new(),
             mempool_history_available: true,
@@ -728,6 +756,53 @@ impl AppState {
         self.connected && !self.stale && !self.is_ibd
     }
 
+    /// Update from getwarnings: { warnings: [{id,severity,message,...}, ...] }.
+    pub fn update_warnings(&mut self, v: &serde_json::Value) {
+        let Some(arr) = v.get("warnings").and_then(|a| a.as_array()) else {
+            return;
+        };
+        let parsed: Vec<NodeWarning> = arr
+            .iter()
+            .filter_map(|w| {
+                let severity = match w.get("severity")?.as_str()? {
+                    "error" => WarningSeverity::Error,
+                    "warn" => WarningSeverity::Warn,
+                    _ => return None,
+                };
+                Some(NodeWarning {
+                    id: w.get("id")?.as_str()?.to_string(),
+                    severity,
+                    message: w.get("message")?.as_str()?.to_string(),
+                    first_seen_unix_secs: w.get("first_seen_unix_secs")?.as_u64()?,
+                    last_seen_unix_secs: w.get("last_seen_unix_secs")?.as_u64()?,
+                    count: w.get("count")?.as_u64()?,
+                })
+            })
+            .collect();
+        // Drop dismissals for IDs that no longer appear — once the node
+        // clears a warning and it reappears, the operator should see it
+        // again.
+        let active_ids: std::collections::HashSet<String> =
+            parsed.iter().map(|w| w.id.clone()).collect();
+        self.dismissed_warnings.retain(|id| active_ids.contains(id));
+        self.warnings = parsed;
+    }
+
+    /// Warnings the operator hasn't dismissed yet.
+    pub fn visible_warnings(&self) -> Vec<&NodeWarning> {
+        self.warnings
+            .iter()
+            .filter(|w| !self.dismissed_warnings.contains(&w.id))
+            .collect()
+    }
+
+    /// Dismiss all currently-visible warnings for this session.
+    pub fn dismiss_visible_warnings(&mut self) {
+        for w in &self.warnings {
+            self.dismissed_warnings.insert(w.id.clone());
+        }
+    }
+
     /// Best known target height: max of headers and peer-reported network height.
     pub fn sync_target(&self) -> u32 {
         self.network_height.max(self.headers)
@@ -975,6 +1050,66 @@ mod tests {
         assert_eq!(st.mempool_top[1].txid, "cpfp_child");
         assert_eq!(st.mempool_top[2].txid, "lowest");
         assert!(st.mempool_top[0].ancestor_feerate > st.mempool_top[1].ancestor_feerate);
+    }
+
+    #[test]
+    fn update_warnings_parses_severity_and_fields() {
+        let v = json!({
+            "warnings": [
+                {
+                    "id": "connect.persistent_failure",
+                    "severity": "error",
+                    "message": "block 945989 won't connect",
+                    "first_seen_unix_secs": 100,
+                    "last_seen_unix_secs": 200,
+                    "count": 5,
+                    "context": {"height": 945989},
+                },
+                {
+                    "id": "storage.flush_slow",
+                    "severity": "warn",
+                    "message": "flush took 8s",
+                    "first_seen_unix_secs": 150,
+                    "last_seen_unix_secs": 150,
+                    "count": 1,
+                    "context": {},
+                },
+            ],
+        });
+        let mut st = AppState::new();
+        st.update_warnings(&v);
+        assert_eq!(st.warnings.len(), 2);
+        assert_eq!(st.warnings[0].id, "connect.persistent_failure");
+        assert_eq!(st.warnings[0].severity, WarningSeverity::Error);
+        assert_eq!(st.warnings[0].count, 5);
+        assert_eq!(st.warnings[1].severity, WarningSeverity::Warn);
+    }
+
+    #[test]
+    fn dismissed_warnings_hidden_until_cleared_or_new() {
+        let v = json!({
+            "warnings": [{
+                "id": "a", "severity": "error", "message": "m",
+                "first_seen_unix_secs": 1, "last_seen_unix_secs": 1, "count": 1,
+            }],
+        });
+        let mut st = AppState::new();
+        st.update_warnings(&v);
+        assert_eq!(st.visible_warnings().len(), 1);
+
+        // Operator acknowledges.
+        st.dismiss_visible_warnings();
+        assert_eq!(st.visible_warnings().len(), 0);
+        assert!(st.dismissed_warnings.contains("a"));
+
+        // Server clears the warning — dismissal also clears so next
+        // occurrence of `a` is visible again.
+        st.update_warnings(&json!({"warnings": []}));
+        assert!(!st.dismissed_warnings.contains("a"));
+
+        // `a` reappears.
+        st.update_warnings(&v);
+        assert_eq!(st.visible_warnings().len(), 1);
     }
 
     #[test]

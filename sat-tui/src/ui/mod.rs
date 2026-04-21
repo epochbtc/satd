@@ -3,6 +3,7 @@ pub mod ibd;
 pub mod mempool;
 pub mod reorgs;
 pub mod steady;
+pub mod warnings;
 
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
