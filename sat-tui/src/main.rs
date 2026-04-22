@@ -157,6 +157,8 @@ fn run_app(
             terminal.draw(|f| {
                 if st.show_help {
                     ui::help::draw(f, &st);
+                } else if st.show_reorgs {
+                    ui::reorgs::draw(f, &st);
                 } else if !st.connected {
                     let area = f.area();
                     f.render_widget(ui::connecting_paragraph(st.stale, st.startup_status.as_deref()), area);
@@ -164,8 +166,13 @@ fn run_app(
                     match st.active_mode() {
                         ViewMode::Ibd => ui::ibd::draw(f, &st),
                         ViewMode::Steady => ui::steady::draw(f, &st),
+                        ViewMode::Mempool => ui::mempool::draw(f, &st),
                     }
                 }
+                // Draw warnings modal LAST so it overlays every other view.
+                // Respects per-id dismissal so acknowledged warnings don't
+                // block the view until they re-trigger.
+                ui::warnings::draw(f, &st);
             })?;
         }
 
@@ -175,25 +182,64 @@ fn run_app(
                 let mut st = state.lock().unwrap();
                 match key.code {
                     KeyCode::Char('q') => {
-                        if st.show_help { st.show_help = false; } else { return Ok(()); }
+                        if st.show_help { st.show_help = false; }
+                        else if st.show_reorgs { st.show_reorgs = false; }
+                        else { return Ok(()); }
                     }
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         return Ok(());
                     }
-                    KeyCode::Char('h') | KeyCode::Char('?') => st.show_help = !st.show_help,
-                    KeyCode::Esc => { if st.show_help { st.show_help = false; } }
+                    KeyCode::Char('h') | KeyCode::Char('?') => {
+                        st.show_reorgs = false;
+                        st.show_help = !st.show_help;
+                    }
+                    KeyCode::Char('r') => {
+                        st.show_help = false;
+                        st.show_reorgs = !st.show_reorgs;
+                    }
+                    KeyCode::Char('a') => {
+                        // Acknowledge & dismiss currently-visible warnings
+                        // for this session. They'll reappear if the
+                        // node clears and re-records them, or a new
+                        // id surfaces.
+                        st.dismiss_visible_warnings();
+                    }
+                    KeyCode::Char('w') => {
+                        // Re-show dismissed warnings (operator wants to
+                        // look at them again).
+                        st.dismissed_warnings.clear();
+                    }
+                    KeyCode::Esc => {
+                        if st.show_help { st.show_help = false; }
+                        if st.show_reorgs { st.show_reorgs = false; }
+                    }
                     KeyCode::Char('1') => st.toggle_mode(ViewMode::Ibd),
                     KeyCode::Char('2') => st.toggle_mode(ViewMode::Steady),
-                    KeyCode::Up => {
-                        if st.selected_peer > 0 {
-                            st.selected_peer -= 1;
+                    KeyCode::Char('3') => st.toggle_mode(ViewMode::Mempool),
+                    KeyCode::Up => match st.active_mode() {
+                        ViewMode::Mempool => {
+                            if st.selected_mempool_row > 0 {
+                                st.selected_mempool_row -= 1;
+                            }
                         }
-                    }
-                    KeyCode::Down => {
-                        if st.selected_peer + 1 < st.peers.len() {
-                            st.selected_peer += 1;
+                        _ => {
+                            if st.selected_peer > 0 {
+                                st.selected_peer -= 1;
+                            }
                         }
-                    }
+                    },
+                    KeyCode::Down => match st.active_mode() {
+                        ViewMode::Mempool => {
+                            if st.selected_mempool_row + 1 < st.mempool_top.len() {
+                                st.selected_mempool_row += 1;
+                            }
+                        }
+                        _ => {
+                            if st.selected_peer + 1 < st.peers.len() {
+                                st.selected_peer += 1;
+                            }
+                        }
+                    },
                     _ => {}
                 }
         }
@@ -220,12 +266,13 @@ async fn poller(rpc: Arc<RpcClient>, state: Arc<Mutex<AppState>>) {
         ibd_counter += 1;
 
         // Fast polls (every 1.5s) — lightweight RPCs only
-        let (chain_res, peers_res, mempool_res, conn_res, sysinfo_res) = tokio::join!(
+        let (chain_res, peers_res, mempool_res, conn_res, sysinfo_res, warnings_res) = tokio::join!(
             rpc.get_blockchain_info(),
             rpc.get_peer_info(),
             rpc.get_mempool_info(),
             rpc.get_connection_count(),
             rpc.get_system_info(),
+            rpc.get_warnings(),
         );
 
         // IBD progress poll (every 3s = every 2nd fast tick) — heavier bitmap RPC
@@ -259,6 +306,9 @@ async fn poller(rpc: Arc<RpcClient>, state: Arc<Mutex<AppState>>) {
             if let Ok(v) = sysinfo_res {
                 st.update_system_info(&v);
             }
+            if let Ok(v) = warnings_res {
+                st.update_warnings(&v);
+            }
 
             if any_ok {
                 st.mark_poll();
@@ -288,12 +338,8 @@ async fn poller(rpc: Arc<RpcClient>, state: Arc<Mutex<AppState>>) {
         if slow_counter >= 3 && is_steady {
             slow_counter = 0;
 
-            let (fee1, fee3, fee6, fee12, fee25, mining_res, txstats_res, uptime_res, blockstats_res, rawmempool_res, utxo_res) = tokio::join!(
-                rpc.estimate_smart_fee(1),
-                rpc.estimate_smart_fee(3),
-                rpc.estimate_smart_fee(6),
-                rpc.estimate_smart_fee(12),
-                rpc.estimate_smart_fee(25),
+            let (fees_res, mining_res, txstats_res, uptime_res, blockstats_res, rawmempool_res, utxo_res, reorgs_res, mhist_res) = tokio::join!(
+                rpc.estimate_fees(),
                 rpc.get_mining_info(),
                 rpc.get_chain_tx_stats(),
                 rpc.get_uptime(),
@@ -303,20 +349,20 @@ async fn poller(rpc: Arc<RpcClient>, state: Arc<Mutex<AppState>>) {
                 },
                 rpc.get_raw_mempool_verbose(),
                 rpc.get_tx_out_set_info(),
+                rpc.get_reorg_history(),
+                rpc.get_mempool_history(),
             );
 
             let mut st = state.lock().unwrap();
-            if let Ok(v) = fee1 { st.update_fee_estimates(0, &v); }
-            if let Ok(v) = fee3 { st.update_fee_estimates(1, &v); }
-            if let Ok(v) = fee6 { st.update_fee_estimates(2, &v); }
-            if let Ok(v) = fee12 { st.update_fee_estimates(3, &v); }
-            if let Ok(v) = fee25 { st.update_fee_estimates(4, &v); }
+            if let Ok(v) = fees_res { st.update_fee_estimates(&v); }
             if let Ok(v) = mining_res { st.update_mining_info(&v); }
             if let Ok(v) = txstats_res { st.update_chain_tx_stats(&v); }
             if let Ok(v) = uptime_res { st.update_uptime(&v); }
             if let Ok(v) = blockstats_res { st.update_block_stats(&v); }
             if let Ok(v) = rawmempool_res { st.update_mempool_dist(&v); }
             if let Ok(v) = utxo_res { st.update_utxo_info(&v); }
+            if let Ok(v) = reorgs_res { st.update_reorg_history(&v); }
+            if let Ok(v) = mhist_res { st.update_mempool_history(&v); }
         }
     }
 }

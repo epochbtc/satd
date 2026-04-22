@@ -141,8 +141,26 @@ impl RpcClient {
         self.call("uptime", &[]).await
     }
 
-    pub async fn estimate_smart_fee(&self, target: u32) -> Result<serde_json::Value, RpcError> {
-        self.call("estimatesmartfee", &[serde_json::json!(target)]).await
+    pub async fn estimate_fees(&self) -> Result<serde_json::Value, RpcError> {
+        // Positional: [targets_array, mode]. Targets map mempool.space tiers:
+        // 1=High, 3=Medium, 6=Low. `none` tier is the economy_feerate that
+        // estimatefees always returns alongside targets.
+        self.call("estimatefees", &[serde_json::json!([1, 3, 6])]).await
+    }
+
+    pub async fn get_reorg_history(&self) -> Result<serde_json::Value, RpcError> {
+        // 7-day window is plenty for the TUI display.
+        self.call("getreorghistory", &[serde_json::json!(7 * 86_400)]).await
+    }
+
+    pub async fn get_warnings(&self) -> Result<serde_json::Value, RpcError> {
+        self.call("getwarnings", &[]).await
+    }
+
+    pub async fn get_mempool_history(&self) -> Result<serde_json::Value, RpcError> {
+        // 40-minute window: at 10s snapshot cadence + 256-cap default ring
+        // that's the full depth. Larger values just waste bytes on the wire.
+        self.call("getmempoolhistory", &[serde_json::json!(2400)]).await
     }
 
     pub async fn get_block_stats(&self, height: u32) -> Result<serde_json::Value, RpcError> {

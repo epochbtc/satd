@@ -6,6 +6,55 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::state::{AppState, ViewMode};
 
+fn mempool_help() -> Vec<Line<'static>> {
+    vec![
+        heading("Mempool View  --  Unconfirmed-transaction detail"),
+        blank(),
+        heading("Summary Strip"),
+        label("Txs", "Unconfirmed transactions currently in the mempool."),
+        label("Bytes", "Total mempool size in bytes."),
+        label("Min / Max", "Cheapest / most expensive fee rate admitted (sat/vB)."),
+        label("Δ last Ns", "Net change in tx count and bytes since the previous 10-second snapshot."),
+        blank(),
+        heading("Feerate Histogram"),
+        Line::from(vec![
+            Span::styled("  Distribution of mempool weight across fee-rate bands.", Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Bar color tracks fee-tier thresholds (High/Medium/Low/None).", Style::default().fg(Color::Gray)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Trailing number = vbyte total in the bucket.", Style::default().fg(Color::Gray)),
+        ]),
+        blank(),
+        heading("Fee Tiers (mempool.space convention)"),
+        label("High", "Next-block target (1 block)."),
+        label("Medium", "~30-minute target (3 blocks)."),
+        label("Low", "~1-hour target (6 blocks)."),
+        label("None", "Economy: cheap but reasonable, clamped to min-relay floor."),
+        label("mode / confidence", "Estimator data source + headline quality."),
+        blank(),
+        heading("Trend Sparklines (~40 min)"),
+        label("Bytes", "Total mempool bytes over time (from getmempoolhistory)."),
+        label("Txs", "Mempool entry count over time."),
+        label("MinFee", "Minimum-accepted fee rate over time (sat/kvB)."),
+        blank(),
+        heading("Top by Ancestor Feerate"),
+        label("#", "Ranking from highest to lowest effective feerate."),
+        label("vsize", "Transaction virtual size (vbytes)."),
+        label("anc sat/vB", "Ancestor-adjusted effective feerate (CPFP-aware)."),
+        label("A/D", "Ancestor count / Descendant count — chain depth in either direction."),
+        label("age", "Time since the tx entered the mempool."),
+        blank(),
+        heading("Keyboard"),
+        label("q", "Quit (or close help / reorgs)"),
+        label("h / ?", "Toggle this help screen"),
+        label("r", "Toggle reorg history (last 7 days)"),
+        label("1 / 2 / 3", "Force IBD / Steady / Mempool view (press again for auto)"),
+        label("Up / Down", "Scroll the top-N table"),
+    ]
+}
+
 pub fn draw(f: &mut Frame, state: &AppState) {
     let size = f.area();
 
@@ -28,6 +77,7 @@ pub fn draw(f: &mut Frame, state: &AppState) {
     let lines = match state.active_mode() {
         ViewMode::Ibd => ibd_help(),
         ViewMode::Steady => steady_help(),
+        ViewMode::Mempool => mempool_help(),
     };
 
     let help = Paragraph::new(lines).wrap(Wrap { trim: false });
@@ -116,9 +166,10 @@ fn ibd_help() -> Vec<Line<'static>> {
         label("Rate", "Per-peer download rate in blocks/second."),
         blank(),
         heading("Keyboard"),
-        label("q", "Quit (or close help)"),
+        label("q", "Quit (or close help / reorgs)"),
         label("h / ?", "Toggle this help screen"),
-        label("1 / 2", "Force IBD / Steady view (press again for auto)"),
+        label("r", "Toggle reorg history (last 7 days)"),
+        label("1 / 2 / 3", "Force IBD / Steady / Mempool view (press again for auto)"),
         label("Up / Down", "Scroll the peer table"),
     ]
 }
@@ -146,17 +197,16 @@ fn steady_help() -> Vec<Line<'static>> {
         label("Tx Rate", "Transactions entering the mempool per second."),
         label("Distribution", "Sparkline showing transaction count by vByte size bucket."),
         blank(),
-        heading("Fee Estimates Panel"),
+        heading("Fees Panel"),
         Line::from(vec![
-            Span::styled("  Estimated fee rates (sat/vB) for confirmation within N blocks.", Style::default().fg(Color::White)),
+            Span::styled("  Fee rate tiers derived from `estimatefees` (mempool-based).", Style::default().fg(Color::White)),
         ]),
-        Line::from(vec![
-            Span::styled("  Bar length is proportional to fee. Color: ", Style::default().fg(Color::Gray)),
-            Span::styled("red", Style::default().fg(Color::Red)),
-            Span::styled("=urgent, ", Style::default().fg(Color::Gray)),
-            Span::styled("green", Style::default().fg(Color::Green)),
-            Span::styled("=economy.", Style::default().fg(Color::Gray)),
-        ]),
+        label("High", "Next-block inclusion target (1 block)."),
+        label("Medium", "Within ~30 minutes (3 blocks)."),
+        label("Low", "Within ~1 hour (6 blocks)."),
+        label("None", "Economy tier — cheap but reasonable, derived from min-relay floor."),
+        label("mode", "`historical` | `mempool` | `blend` — data source used by the estimator."),
+        label("confidence", "`high` | `medium` | `low` — quality indicator for the top-tier estimate."),
         blank(),
         heading("UTXO Set Panel"),
         label("UTXOs", "Total unspent transaction outputs in the chain."),
@@ -169,9 +219,10 @@ fn steady_help() -> Vec<Line<'static>> {
         label("Recv / Sent", "Total bytes transferred with all peers."),
         blank(),
         heading("Keyboard"),
-        label("q", "Quit (or close help)"),
+        label("q", "Quit (or close help / reorgs)"),
         label("h / ?", "Toggle this help screen"),
-        label("1 / 2", "Force IBD / Steady view (press again for auto)"),
+        label("r", "Toggle reorg history (last 7 days)"),
+        label("1 / 2 / 3", "Force IBD / Steady / Mempool view (press again for auto)"),
         label("Up / Down", "Scroll the peer table"),
     ]
 }

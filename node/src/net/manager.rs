@@ -1491,6 +1491,10 @@ impl PeerManager {
                     Ok(_) => {
                         connected_count += 1;
                         retry_count = 0;
+                        // Clear any prior connect-failure warnings now that
+                        // we've made forward progress.
+                        chain_state.warnings().clear("connect.persistent_failure");
+                        chain_state.warnings().clear("connect.retry");
                         // Update scheduler connect cursor
                         {
                             let mut sched = ibd.write().unwrap();
@@ -1506,9 +1510,18 @@ impl PeerManager {
                         // data from old blocks is useless for estimation anyway.
 
                         // Flush if dirty map is getting large (caps memory usage)
-                        if chain_state.cache_dirty_count() > chain_state.flush_threshold()
-                            && let Err(e) = chain_state.flush_coin_cache() {
+                        if chain_state.cache_dirty_count() > chain_state.flush_threshold() {
+                            if let Err(e) = chain_state.flush_coin_cache() {
                                 tracing::error!("Failed to flush cache: {}", e);
+                                chain_state.warnings().record(
+                                    "storage.flush_coin_cache_failed",
+                                    crate::warnings::Severity::Error,
+                                    format!("UTXO cache flush failed: {}", e),
+                                    serde_json::json!({ "height": next_height, "error": e.to_string() }),
+                                );
+                            } else {
+                                chain_state.warnings().clear("storage.flush_coin_cache_failed");
+                            }
                         }
 
                         // Log progress
@@ -1572,9 +1585,25 @@ impl PeerManager {
                             // work to the last ~1000 blocks.
                             if let Err(e) = chain_state.flush_coin_cache() {
                                 tracing::error!("Failed to flush UTXO cache: {}", e);
+                                chain_state.warnings().record(
+                                    "storage.flush_coin_cache_failed",
+                                    crate::warnings::Severity::Error,
+                                    format!("UTXO cache flush failed: {}", e),
+                                    serde_json::json!({ "height": next_height, "error": e.to_string() }),
+                                );
+                            } else {
+                                chain_state.warnings().clear("storage.flush_coin_cache_failed");
                             }
                             if let Err(e) = chain_state.flush_durable() {
                                 tracing::error!("Failed durable checkpoint: {}", e);
+                                chain_state.warnings().record(
+                                    "storage.flush_durable_failed",
+                                    crate::warnings::Severity::Error,
+                                    format!("durable checkpoint failed: {}", e),
+                                    serde_json::json!({ "height": next_height, "error": e.to_string() }),
+                                );
+                            } else {
+                                chain_state.warnings().clear("storage.flush_durable_failed");
                             }
                         }
                         // Periodic pruning
@@ -1600,6 +1629,20 @@ impl PeerManager {
                                 height = next_height, %hash, retries = retry_count,
                                 "Persistent connect failure, giving up: {}", e
                             );
+                            chain_state.warnings().record(
+                                "connect.persistent_failure",
+                                crate::warnings::Severity::Error,
+                                format!(
+                                    "block {} ({}) failed to connect after {} retries: {}",
+                                    next_height, hash, retry_count, e
+                                ),
+                                serde_json::json!({
+                                    "height": next_height,
+                                    "hash": hash.to_string(),
+                                    "retries": retry_count,
+                                    "error": e.to_string(),
+                                }),
+                            );
                             // Force a restart by breaking the loop — systemd will restart us
                             break;
                         }
@@ -1607,6 +1650,20 @@ impl PeerManager {
                             tracing::warn!(
                                 height = next_height, %hash, retries = retry_count,
                                 "Connect stored block failed (retrying): {}", e
+                            );
+                            chain_state.warnings().record(
+                                "connect.retry",
+                                crate::warnings::Severity::Warn,
+                                format!(
+                                    "block {} ({}) connect retry {}: {}",
+                                    next_height, hash, retry_count, e
+                                ),
+                                serde_json::json!({
+                                    "height": next_height,
+                                    "hash": hash.to_string(),
+                                    "retries": retry_count,
+                                    "error": e.to_string(),
+                                }),
                             );
                         }
                         let (lock, cvar) = &**connect_signal;

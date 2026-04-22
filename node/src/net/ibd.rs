@@ -208,11 +208,19 @@ impl IbdScheduler {
     }
 
     /// Handle peer disconnection: return in-flight heights to the pending pool.
+    ///
+    /// Intentionally does NOT clear `in_flight_at`. Reason: peer-disconnect
+    /// churn can reassign the same height through a series of flaky peers,
+    /// each of whom never delivers. If we reset the timestamp on every hop,
+    /// `release_stale_inflight`'s 60s window never elapses and the height
+    /// stalls silently forever. Preserving the original timestamp across
+    /// peer-hand-offs means `release_stale_inflight` will eventually fire
+    /// and force a fresh retry on whichever peer picks it up next.
     pub fn peer_disconnected(&mut self, peer_id: PeerId) {
         if let Some(slots) = self.peer_slots.remove(&peer_id) {
             for height in slots.assigned {
                 self.in_flight.remove(&height);
-                self.in_flight_at.remove(&height);
+                // in_flight_at is kept — see doc comment above.
                 // Push to front for immediate reassignment
                 self.pending.push_front(height);
             }
@@ -336,6 +344,11 @@ impl IbdScheduler {
     pub fn mark_downloaded(&mut self, height: u32) {
         self.downloaded.insert(height);
         self.in_flight.remove(&height);
+        // Keep in_flight_at in sync with in_flight — otherwise it's a
+        // slow memory leak in crash-resume paths, and a stale
+        // in_flight_at entry with no matching in_flight makes
+        // release_stale_inflight do extra work-for-nothing on every tick.
+        self.in_flight_at.remove(&height);
     }
 
     /// Extend the target height as more headers arrive.
@@ -515,6 +528,101 @@ mod tests {
         sorted.sort();
         // With 100 elements shuffled, it's astronomically unlikely to be sorted
         assert_ne!(heights, sorted, "Blocks should be shuffled, not sequential");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn peer_disconnect_preserves_in_flight_at_timestamp() {
+        // Regression: peer_disconnected used to clear in_flight_at alongside
+        // in_flight. Under peer-disconnect churn near tip, a height would
+        // bounce between flaky peers and the timestamp would reset on every
+        // hop, so release_stale_inflight(60s) never fired and the block
+        // stalled forever. See PR #74 for the observed mainnet incident.
+        let (cs, dir) = make_chain_state_with_headers(10);
+        let mut sched = IbdScheduler::new(10, 0, &cs, 50_000);
+
+        let assigned = sched.assign_blocks(1);
+        assert!(!assigned.is_empty());
+        // Snapshot timestamps so we can verify they're preserved.
+        let original_stamps: HashMap<u32, Instant> = sched.in_flight_at.clone();
+        assert!(!original_stamps.is_empty());
+
+        sched.peer_disconnected(1);
+        // in_flight cleared, pending repopulated.
+        assert_eq!(sched.in_flight.len(), 0);
+        assert!(!sched.pending.is_empty());
+        // Critical: timestamps survived the disconnect.
+        assert_eq!(
+            sched.in_flight_at, original_stamps,
+            "peer_disconnected must preserve in_flight_at timestamps so \
+             release_stale_inflight can fire across reassignment churn"
+        );
+
+        // Reassign to peer 2. Timestamps must remain the original ones
+        // (or_insert_with preserves existing entries).
+        sched.register_peer(2);
+        let _ = sched.assign_blocks(2);
+        for (h, ts) in &original_stamps {
+            assert_eq!(
+                sched.in_flight_at.get(h),
+                Some(ts),
+                "reassignment must not refresh timestamp for height {h}",
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn release_stale_inflight_fires_after_peer_churn() {
+        // End-to-end: a height that bounces peer→peer via disconnect/
+        // reassign cycles still gets released once the original timestamp
+        // exceeds the timeout.
+        let (cs, dir) = make_chain_state_with_headers(10);
+        let mut sched = IbdScheduler::new(10, 0, &cs, 50_000);
+
+        let _ = sched.assign_blocks(1);
+        let heights_in_flight: Vec<u32> = sched.in_flight.keys().copied().collect();
+        assert!(!heights_in_flight.is_empty());
+
+        // Backdate every in_flight_at to 2 minutes ago.
+        let old = Instant::now() - Duration::from_secs(120);
+        for h in &heights_in_flight {
+            sched.in_flight_at.insert(*h, old);
+        }
+
+        // Simulate peer churn: disconnect peer 1, reassign to peer 2.
+        sched.peer_disconnected(1);
+        sched.register_peer(2);
+        let _ = sched.assign_blocks(2);
+
+        // Even though the current assignment is fresh, the underlying
+        // in_flight_at is still 2 minutes old → release must fire.
+        let released = sched.release_stale_inflight(Duration::from_secs(60));
+        assert!(
+            released >= heights_in_flight.len(),
+            "release_stale_inflight should fire for stale heights despite \
+             peer churn; released={released} expected>={}",
+            heights_in_flight.len()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mark_downloaded_clears_both_in_flight_maps() {
+        let (cs, dir) = make_chain_state_with_headers(5);
+        let mut sched = IbdScheduler::new(5, 0, &cs, 50_000);
+
+        let _ = sched.assign_blocks(1);
+        let height = *sched.in_flight.keys().next().expect("one in-flight");
+        sched.mark_downloaded(height);
+        assert!(!sched.in_flight.contains_key(&height));
+        assert!(
+            !sched.in_flight_at.contains_key(&height),
+            "mark_downloaded must keep in_flight and in_flight_at in sync",
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

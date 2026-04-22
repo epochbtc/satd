@@ -25,6 +25,82 @@ pub struct Loaded {
 pub enum ViewMode {
     Ibd,
     Steady,
+    Mempool,
+}
+
+/// One snapshot from getmempoolhistory.
+#[derive(Debug, Clone)]
+pub struct MempoolSnapshot {
+    pub ts_unix_secs: u64,
+    pub size: u64,
+    pub bytes: u64,
+    pub min_fee_rate_sat_per_kvb: u64,
+    pub max_fee_rate_sat_per_kvb: u64,
+    pub histogram: Vec<HistogramBucket>,
+}
+
+#[derive(Debug, Clone)]
+pub struct HistogramBucket {
+    pub feerate_sat_per_kvb: u64,
+    pub weight: u64,
+}
+
+/// Top-N mempool entry by ancestor feerate (derived from getrawmempool verbose).
+#[derive(Debug, Clone)]
+pub struct MempoolTopEntry {
+    pub txid: String,
+    pub vsize: u64,
+    /// sat/vB.
+    pub ancestor_feerate: f64,
+    pub ancestor_count: u32,
+    pub descendant_count: u32,
+    pub age_secs: u64,
+}
+
+/// One reorg record from getreorghistory.
+#[derive(Debug, Clone)]
+pub struct ReorgEntry {
+    pub ts_unix_secs: u64,
+    pub depth: u32,
+    pub fork_height: u32,
+    pub old_tip: String,
+    pub new_tip: String,
+    pub disconnected_len: usize,
+    pub reconnected_len: usize,
+}
+
+/// Active warning surfaced from the node's `getwarnings` RPC.
+#[derive(Debug, Clone)]
+pub struct NodeWarning {
+    pub id: String,
+    pub severity: WarningSeverity,
+    pub message: String,
+    pub first_seen_unix_secs: u64,
+    /// Kept for future enrichment; modal currently shows first_seen + count.
+    #[allow(dead_code)]
+    pub last_seen_unix_secs: u64,
+    pub count: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WarningSeverity {
+    Error,
+    Warn,
+}
+
+/// 4-tier fee summary derived from estimatefees (mempool.space convention).
+#[derive(Debug, Clone, Default)]
+pub struct FeeSummary {
+    /// sat/vB for the 1-block target.
+    pub high: Option<f64>,
+    /// sat/vB for the 3-block target.
+    pub medium: Option<f64>,
+    /// sat/vB for the 6-block target.
+    pub low: Option<f64>,
+    /// sat/vB for economy (min-relay-floor clamp).
+    pub none: Option<f64>,
+    pub confidence: Option<String>,
+    pub mode: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -105,7 +181,7 @@ pub struct AppState {
     pub block_stats_size: Option<u64>,
     pub block_stats_weight: Option<u64>,
 
-    pub fee_estimates: [Option<f64>; 5],
+    pub fees: FeeSummary,
     pub utxo_count: Option<u64>,
     pub utxo_total_amount: Option<f64>,
     pub utxo_age_dist: Option<[u64; 8]>,
@@ -120,6 +196,24 @@ pub struct AppState {
     pub thread_count: Option<u32>,
     pub cache_dirty: Option<u32>,
     pub cache_clean: Option<usize>,
+    /// "clean" | "dirty" — from getsysteminfo.last_shutdown (PR #60).
+    pub last_shutdown: Option<String>,
+
+    // Reorg history (from getreorghistory)
+    pub reorg_history: Vec<ReorgEntry>,
+
+    // Active node warnings (from getwarnings)
+    pub warnings: Vec<NodeWarning>,
+    /// Per-id dismissal — keys that the operator has acknowledged for
+    /// the current session. Cleared when the id clears server-side.
+    pub dismissed_warnings: std::collections::HashSet<String>,
+
+    // Mempool-pane data
+    pub mempool_history: Vec<MempoolSnapshot>,
+    /// False when the node started without a writable history log.
+    pub mempool_history_available: bool,
+    pub mempool_top: Vec<MempoolTopEntry>,
+    pub selected_mempool_row: usize,
 
     // Computed deltas
     pub blocks_per_sec: f64,
@@ -142,6 +236,7 @@ pub struct AppState {
     pub force_mode: Option<ViewMode>,
     pub selected_peer: usize,
     pub show_help: bool,
+    pub show_reorgs: bool,
 
     // Internal tracking
     prev_blocks: u32,
@@ -181,7 +276,7 @@ impl AppState {
             block_stats_size: None,
             block_stats_weight: None,
 
-            fee_estimates: [None; 5],
+            fees: FeeSummary::default(),
             utxo_count: None,
             utxo_total_amount: None,
             utxo_age_dist: None,
@@ -195,6 +290,17 @@ impl AppState {
             thread_count: None,
             cache_dirty: None,
             cache_clean: None,
+            last_shutdown: None,
+
+            reorg_history: Vec::new(),
+
+            warnings: Vec::new(),
+            dismissed_warnings: std::collections::HashSet::new(),
+
+            mempool_history: Vec::new(),
+            mempool_history_available: true,
+            mempool_top: Vec::new(),
+            selected_mempool_row: 0,
 
             blocks_per_sec: 0.0,
             headers_per_sec: 0.0,
@@ -212,6 +318,7 @@ impl AppState {
             force_mode: None,
             selected_peer: 0,
             show_help: false,
+            show_reorgs: false,
 
             prev_blocks: 0,
             prev_headers: 0,
@@ -391,15 +498,53 @@ impl AppState {
         self.block_stats_weight = v.get("total_weight").and_then(|w| w.as_u64());
     }
 
-    /// Update from estimatesmartfee responses (5 targets).
-    pub fn update_fee_estimates(&mut self, idx: usize, v: &serde_json::Value) {
+    /// Update from estimatefees response (PR #65/#67).
+    /// Response shape: { targets: { "1": {feerate, confidence}, "3": ..., "6": ... },
+    ///                   economy_feerate, mode, ... }
+    /// `feerate` is already in sat/vB when `sat_per_vb: true` or BTC/kvB otherwise.
+    /// Map targets onto 4-tier mempool.space labels:
+    ///   High = target 1, Medium = target 3, Low = target 6, None = economy.
+    pub fn update_fee_estimates(&mut self, v: &serde_json::Value) {
         self.loaded.fee_estimates = true;
-        if idx < 5 {
-            // feerate is in BTC/kvB, convert to sat/vB: * 100_000_000 / 1000 = * 100_000
-            self.fee_estimates[idx] = v.get("feerate")
-                .and_then(|f| f.as_f64())
-                .map(|f| f * 100_000.0);
-        }
+        let sat_per_vb = v.get("sat_per_vb").and_then(|b| b.as_bool()).unwrap_or(false);
+
+        let parse_rate = |raw: &serde_json::Value| -> Option<f64> {
+            // Values may be strings (new default units=btc path annotates them)
+            // or numbers. Accept either.
+            let n = raw.as_f64()
+                .or_else(|| raw.as_str().and_then(|s| s.parse().ok()))?;
+            if sat_per_vb {
+                Some(n)
+            } else {
+                // BTC/kvB → sat/vB
+                Some(n * 100_000.0)
+            }
+        };
+
+        let targets = v.get("targets").and_then(|t| t.as_object());
+        let tier = |key: &str| -> (Option<f64>, Option<String>) {
+            let obj = targets.and_then(|m| m.get(key)).and_then(|o| o.as_object());
+            let feerate = obj.and_then(|o| o.get("feerate")).and_then(parse_rate);
+            let conf = obj
+                .and_then(|o| o.get("confidence"))
+                .and_then(|c| c.as_str())
+                .map(|s| s.to_string());
+            (feerate, conf)
+        };
+
+        let (high, high_conf) = tier("1");
+        let (medium, _) = tier("3");
+        let (low, _) = tier("6");
+        let none = v.get("economy_feerate").and_then(parse_rate);
+
+        self.fees = FeeSummary {
+            high,
+            medium,
+            low,
+            none,
+            confidence: high_conf,
+            mode: v.get("mode").and_then(|m| m.as_str()).map(|s| s.to_string()),
+        };
     }
 
     /// Update from gettxoutsetinfo response.
@@ -441,27 +586,128 @@ impl AppState {
         self.uptime_secs = v.as_u64();
     }
 
-    /// Update mempool size distribution from getrawmempool true response.
+    /// Update mempool size distribution + top-N from getrawmempool verbose response.
     pub fn update_mempool_dist(&mut self, v: &serde_json::Value) {
         self.loaded.mempool_dist = true;
-        if let Some(obj) = v.as_object() {
-            let mut dist = [0u32; 8];
-            for entry in obj.values() {
-                let vsize = entry.get("vsize").and_then(|s| s.as_u64()).unwrap_or(0);
-                let bucket = match vsize {
-                    0..100 => 0,
-                    100..250 => 1,
-                    250..500 => 2,
-                    500..1_000 => 3,
-                    1_000..5_000 => 4,
-                    5_000..10_000 => 5,
-                    10_000..50_000 => 6,
-                    _ => 7,
-                };
-                dist[bucket] += 1;
-            }
-            self.mempool_size_dist = Some(dist);
+        let Some(obj) = v.as_object() else { return };
+
+        // Size distribution (existing vsize-bucket sparkline for steady view).
+        let mut dist = [0u32; 8];
+        for entry in obj.values() {
+            let vsize = entry.get("vsize").and_then(|s| s.as_u64()).unwrap_or(0);
+            let bucket = match vsize {
+                0..100 => 0,
+                100..250 => 1,
+                250..500 => 2,
+                500..1_000 => 3,
+                1_000..5_000 => 4,
+                5_000..10_000 => 5,
+                10_000..50_000 => 6,
+                _ => 7,
+            };
+            dist[bucket] += 1;
         }
+        self.mempool_size_dist = Some(dist);
+
+        // Top-N by ancestor feerate (ancestorfees is in sats, ancestorsize
+        // in vbytes → feerate in sat/vB directly).
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mut entries: Vec<MempoolTopEntry> = obj
+            .iter()
+            .filter_map(|(txid, e)| {
+                let ancestor_fees = e.get("ancestorfees")?.as_u64()?;
+                let ancestor_size = e.get("ancestorsize")?.as_u64().unwrap_or(0);
+                let vsize = e.get("vsize")?.as_u64().unwrap_or(0);
+                let ancestor_feerate = if ancestor_size > 0 {
+                    ancestor_fees as f64 / ancestor_size as f64
+                } else {
+                    0.0
+                };
+                Some(MempoolTopEntry {
+                    txid: txid.clone(),
+                    vsize,
+                    ancestor_feerate,
+                    ancestor_count: e.get("ancestorcount").and_then(|c| c.as_u64()).unwrap_or(1) as u32,
+                    descendant_count: e.get("descendantcount").and_then(|c| c.as_u64()).unwrap_or(1) as u32,
+                    age_secs: e.get("time")
+                        .and_then(|t| t.as_u64())
+                        .map(|t| now.saturating_sub(t))
+                        .unwrap_or(0),
+                })
+            })
+            .collect();
+        // Sort by ancestor feerate descending, tiebreak by smaller vsize.
+        entries.sort_by(|a, b| {
+            b.ancestor_feerate
+                .partial_cmp(&a.ancestor_feerate)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.vsize.cmp(&b.vsize))
+        });
+        entries.truncate(50);
+        self.mempool_top = entries;
+        if self.selected_mempool_row >= self.mempool_top.len() {
+            self.selected_mempool_row = self.mempool_top.len().saturating_sub(1);
+        }
+    }
+
+    /// Update from getmempoolhistory: { since_secs, available, snapshots: [...] }.
+    pub fn update_mempool_history(&mut self, v: &serde_json::Value) {
+        self.mempool_history_available = v
+            .get("available")
+            .and_then(|b| b.as_bool())
+            .unwrap_or(false);
+        let Some(snaps) = v.get("snapshots").and_then(|a| a.as_array()) else {
+            return;
+        };
+        let mut out: Vec<MempoolSnapshot> = snaps
+            .iter()
+            .filter_map(|s| {
+                let histogram: Vec<HistogramBucket> = s
+                    .get("histogram")
+                    .and_then(|h| h.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|b| {
+                                Some(HistogramBucket {
+                                    feerate_sat_per_kvb: b.get("feerate_sat_per_kvb")?.as_u64()?,
+                                    weight: b.get("weight")?.as_u64()?,
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                Some(MempoolSnapshot {
+                    ts_unix_secs: s.get("ts_unix_secs")?.as_u64()?,
+                    size: s.get("size")?.as_u64()?,
+                    bytes: s.get("bytes")?.as_u64()?,
+                    min_fee_rate_sat_per_kvb: s.get("min_fee_rate_sat_per_kvb")?.as_u64()?,
+                    max_fee_rate_sat_per_kvb: s.get("max_fee_rate_sat_per_kvb")?.as_u64()?,
+                    histogram,
+                })
+            })
+            .collect();
+        // Oldest-first for sparkline left-to-right.
+        out.sort_by_key(|s| s.ts_unix_secs);
+        self.mempool_history = out;
+    }
+
+    /// Most recent snapshot delta (net tx and byte flow since previous snapshot).
+    /// Returns (delta_tx, delta_bytes, interval_secs).
+    pub fn latest_mempool_delta(&self) -> Option<(i64, i64, u64)> {
+        let n = self.mempool_history.len();
+        if n < 2 {
+            return None;
+        }
+        let cur = &self.mempool_history[n - 1];
+        let prev = &self.mempool_history[n - 2];
+        Some((
+            cur.size as i64 - prev.size as i64,
+            cur.bytes as i64 - prev.bytes as i64,
+            cur.ts_unix_secs.saturating_sub(prev.ts_unix_secs),
+        ))
     }
 
     /// Update from getsysteminfo response.
@@ -471,6 +717,90 @@ impl AppState {
         self.thread_count = v.get("threads").and_then(|t| t.as_u64()).map(|t| t as u32);
         self.cache_dirty = v.get("cache_dirty").and_then(|c| c.as_u64()).map(|c| c as u32);
         self.cache_clean = v.get("cache_clean").and_then(|c| c.as_u64()).map(|c| c as usize);
+        self.last_shutdown = v.get("last_shutdown")
+            .and_then(|s| s.as_str())
+            .map(|s| s.to_string());
+    }
+
+    /// Update from getreorghistory response: { since_secs, records: [ReorgRecord, ...] }.
+    pub fn update_reorg_history(&mut self, v: &serde_json::Value) {
+        let Some(records) = v.get("records").and_then(|r| r.as_array()) else {
+            return;
+        };
+        self.reorg_history = records
+            .iter()
+            .filter_map(|r| {
+                Some(ReorgEntry {
+                    ts_unix_secs: r.get("ts_unix_secs")?.as_u64()?,
+                    depth: r.get("depth")?.as_u64()? as u32,
+                    fork_height: r.get("fork_height")?.as_u64()? as u32,
+                    old_tip: r.get("old_tip")?.as_str()?.to_string(),
+                    new_tip: r.get("new_tip")?.as_str()?.to_string(),
+                    disconnected_len: r.get("disconnected")
+                        .and_then(|a| a.as_array())
+                        .map(|a| a.len())
+                        .unwrap_or(0),
+                    reconnected_len: r.get("reconnected")
+                        .and_then(|a| a.as_array())
+                        .map(|a| a.len())
+                        .unwrap_or(0),
+                })
+            })
+            .collect();
+        // Most-recent first for display.
+        self.reorg_history.sort_by(|a, b| b.ts_unix_secs.cmp(&a.ts_unix_secs));
+    }
+
+    /// True if we have a healthy, live, steady-state connection.
+    pub fn is_healthy(&self) -> bool {
+        self.connected && !self.stale && !self.is_ibd
+    }
+
+    /// Update from getwarnings: { warnings: [{id,severity,message,...}, ...] }.
+    pub fn update_warnings(&mut self, v: &serde_json::Value) {
+        let Some(arr) = v.get("warnings").and_then(|a| a.as_array()) else {
+            return;
+        };
+        let parsed: Vec<NodeWarning> = arr
+            .iter()
+            .filter_map(|w| {
+                let severity = match w.get("severity")?.as_str()? {
+                    "error" => WarningSeverity::Error,
+                    "warn" => WarningSeverity::Warn,
+                    _ => return None,
+                };
+                Some(NodeWarning {
+                    id: w.get("id")?.as_str()?.to_string(),
+                    severity,
+                    message: w.get("message")?.as_str()?.to_string(),
+                    first_seen_unix_secs: w.get("first_seen_unix_secs")?.as_u64()?,
+                    last_seen_unix_secs: w.get("last_seen_unix_secs")?.as_u64()?,
+                    count: w.get("count")?.as_u64()?,
+                })
+            })
+            .collect();
+        // Drop dismissals for IDs that no longer appear — once the node
+        // clears a warning and it reappears, the operator should see it
+        // again.
+        let active_ids: std::collections::HashSet<String> =
+            parsed.iter().map(|w| w.id.clone()).collect();
+        self.dismissed_warnings.retain(|id| active_ids.contains(id));
+        self.warnings = parsed;
+    }
+
+    /// Warnings the operator hasn't dismissed yet.
+    pub fn visible_warnings(&self) -> Vec<&NodeWarning> {
+        self.warnings
+            .iter()
+            .filter(|w| !self.dismissed_warnings.contains(&w.id))
+            .collect()
+    }
+
+    /// Dismiss all currently-visible warnings for this session.
+    pub fn dismiss_visible_warnings(&mut self) {
+        for w in &self.warnings {
+            self.dismissed_warnings.insert(w.id.clone());
+        }
     }
 
     /// Best known target height: max of headers and peer-reported network height.
@@ -506,5 +836,293 @@ impl AppState {
         if let Some(last) = self.last_poll {
             self.stale = last.elapsed().as_secs() > 5;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn update_fee_estimates_btc_units() {
+        // Default-unit (btc) response: feerate is BTC/kvB as a float.
+        let v = json!({
+            "targets": {
+                "1": {"feerate": 0.00025, "confidence": "high"},
+                "3": {"feerate": 0.00018, "confidence": "medium"},
+                "6": {"feerate": 0.00010, "confidence": "low"},
+            },
+            "economy_feerate": 0.00001,
+            "mode": "blend",
+            "fallback": false,
+        });
+        let mut st = AppState::new();
+        st.update_fee_estimates(&v);
+        // BTC/kvB → sat/vB = value * 100_000
+        assert_eq!(st.fees.high, Some(25.0));
+        assert_eq!(st.fees.medium, Some(18.0));
+        assert_eq!(st.fees.low, Some(10.0));
+        assert_eq!(st.fees.none, Some(1.0));
+        assert_eq!(st.fees.confidence.as_deref(), Some("high"));
+        assert_eq!(st.fees.mode.as_deref(), Some("blend"));
+        assert!(st.loaded.fee_estimates);
+    }
+
+    #[test]
+    fn update_fee_estimates_sat_per_vb_units() {
+        // --rpcdefaultunits=sats path: feerate is a string integer and
+        // sat_per_vb: true is present.
+        let v = json!({
+            "targets": {
+                "1": {"feerate": "25", "confidence": "high"},
+                "3": {"feerate": "18", "confidence": "medium"},
+                "6": {"feerate": "10", "confidence": "low"},
+            },
+            "economy_feerate": "1",
+            "mode": "mempool",
+            "fallback": false,
+            "sat_per_vb": true,
+        });
+        let mut st = AppState::new();
+        st.update_fee_estimates(&v);
+        assert_eq!(st.fees.high, Some(25.0));
+        assert_eq!(st.fees.none, Some(1.0));
+        assert_eq!(st.fees.mode.as_deref(), Some("mempool"));
+    }
+
+    #[test]
+    fn update_fee_estimates_missing_targets_leave_tier_none() {
+        // Node returns only a subset of targets (e.g., historical mode miss).
+        let v = json!({
+            "targets": { "1": {"feerate": 0.00025, "confidence": "medium"} },
+            "economy_feerate": 0.00001,
+            "mode": "historical",
+        });
+        let mut st = AppState::new();
+        st.update_fee_estimates(&v);
+        assert_eq!(st.fees.high, Some(25.0));
+        assert_eq!(st.fees.medium, None);
+        assert_eq!(st.fees.low, None);
+        assert_eq!(st.fees.none, Some(1.0));
+    }
+
+    #[test]
+    fn update_reorg_history_shape_and_sort() {
+        let v = json!({
+            "since_secs": 86400,
+            "records": [
+                {
+                    "ts_unix_secs": 1_700_000_000,
+                    "depth": 1,
+                    "fork_height": 100,
+                    "old_tip": "aa",
+                    "new_tip": "bb",
+                    "disconnected": ["aa"],
+                    "reconnected": ["bb"],
+                },
+                {
+                    "ts_unix_secs": 1_700_001_000,
+                    "depth": 3,
+                    "fork_height": 200,
+                    "old_tip": "cc",
+                    "new_tip": "dd",
+                    "disconnected": ["cc","c2","c3"],
+                    "reconnected": ["dd","d2"],
+                },
+            ],
+        });
+        let mut st = AppState::new();
+        st.update_reorg_history(&v);
+        // Most-recent first.
+        assert_eq!(st.reorg_history.len(), 2);
+        assert_eq!(st.reorg_history[0].depth, 3);
+        assert_eq!(st.reorg_history[0].disconnected_len, 3);
+        assert_eq!(st.reorg_history[0].reconnected_len, 2);
+        assert_eq!(st.reorg_history[1].depth, 1);
+    }
+
+    #[test]
+    fn update_system_info_last_shutdown() {
+        let v = json!({
+            "pid": 1,
+            "rss_bytes": 1_000,
+            "threads": 4,
+            "cache_dirty": 0,
+            "cache_clean": 0,
+            "last_shutdown": "dirty",
+        });
+        let mut st = AppState::new();
+        st.update_system_info(&v);
+        assert_eq!(st.last_shutdown.as_deref(), Some("dirty"));
+    }
+
+    #[test]
+    fn update_mempool_history_parses_and_orders() {
+        let v = json!({
+            "since_secs": 2400,
+            "available": true,
+            "snapshots": [
+                {
+                    "ts_unix_secs": 1_700_000_020,
+                    "size": 120,
+                    "bytes": 50_000,
+                    "min_fee_rate_sat_per_kvb": 1_000,
+                    "max_fee_rate_sat_per_kvb": 50_000,
+                    "histogram": [
+                        {"feerate_sat_per_kvb": 2_000, "weight": 4_000},
+                        {"feerate_sat_per_kvb": 10_000, "weight": 2_000},
+                    ],
+                },
+                {
+                    "ts_unix_secs": 1_700_000_010,
+                    "size": 100,
+                    "bytes": 40_000,
+                    "min_fee_rate_sat_per_kvb": 1_000,
+                    "max_fee_rate_sat_per_kvb": 40_000,
+                    "histogram": [],
+                },
+            ],
+        });
+        let mut st = AppState::new();
+        st.update_mempool_history(&v);
+        assert!(st.mempool_history_available);
+        assert_eq!(st.mempool_history.len(), 2);
+        // Oldest-first after sort so sparkline reads left→right chronologically.
+        assert_eq!(st.mempool_history[0].ts_unix_secs, 1_700_000_010);
+        assert_eq!(st.mempool_history[1].ts_unix_secs, 1_700_000_020);
+        assert_eq!(st.mempool_history[1].histogram.len(), 2);
+    }
+
+    #[test]
+    fn update_mempool_history_available_false() {
+        let v = json!({
+            "since_secs": 2400,
+            "available": false,
+            "snapshots": [],
+        });
+        let mut st = AppState::new();
+        st.update_mempool_history(&v);
+        assert!(!st.mempool_history_available);
+        assert!(st.mempool_history.is_empty());
+    }
+
+    #[test]
+    fn latest_mempool_delta_tracks_consecutive_snapshots() {
+        let mut st = AppState::new();
+        assert!(st.latest_mempool_delta().is_none());
+        let v = json!({
+            "since_secs": 20,
+            "available": true,
+            "snapshots": [
+                {"ts_unix_secs": 100, "size": 10, "bytes": 5_000,
+                 "min_fee_rate_sat_per_kvb": 1_000, "max_fee_rate_sat_per_kvb": 5_000,
+                 "histogram": []},
+                {"ts_unix_secs": 110, "size": 15, "bytes": 7_500,
+                 "min_fee_rate_sat_per_kvb": 1_000, "max_fee_rate_sat_per_kvb": 5_000,
+                 "histogram": []},
+            ],
+        });
+        st.update_mempool_history(&v);
+        let (dtx, dbytes, secs) = st.latest_mempool_delta().expect("delta");
+        assert_eq!(dtx, 5);
+        assert_eq!(dbytes, 2_500);
+        assert_eq!(secs, 10);
+    }
+
+    #[test]
+    fn update_mempool_dist_computes_top_n_sorted_by_ancestor_feerate() {
+        let v = json!({
+            "lowest": {"fees": {"base": 0.00001}, "vsize": 200, "ancestorfees": 2000, "ancestorsize": 200,
+                       "ancestorcount": 1, "descendantcount": 1, "time": 1_700_000_000},
+            "highest": {"fees": {"base": 0.001}, "vsize": 250, "ancestorfees": 100_000, "ancestorsize": 250,
+                        "ancestorcount": 1, "descendantcount": 1, "time": 1_700_000_000},
+            "cpfp_child": {"fees": {"base": 0.0001}, "vsize": 300, "ancestorfees": 50_000, "ancestorsize": 500,
+                           "ancestorcount": 2, "descendantcount": 1, "time": 1_700_000_000},
+        });
+        let mut st = AppState::new();
+        st.update_mempool_dist(&v);
+        assert_eq!(st.mempool_top.len(), 3);
+        // 100_000/250 = 400 sat/vB (highest)
+        // 50_000/500 = 100 sat/vB
+        // 2_000/200 = 10 sat/vB
+        assert_eq!(st.mempool_top[0].txid, "highest");
+        assert_eq!(st.mempool_top[1].txid, "cpfp_child");
+        assert_eq!(st.mempool_top[2].txid, "lowest");
+        assert!(st.mempool_top[0].ancestor_feerate > st.mempool_top[1].ancestor_feerate);
+    }
+
+    #[test]
+    fn update_warnings_parses_severity_and_fields() {
+        let v = json!({
+            "warnings": [
+                {
+                    "id": "connect.persistent_failure",
+                    "severity": "error",
+                    "message": "block 945989 won't connect",
+                    "first_seen_unix_secs": 100,
+                    "last_seen_unix_secs": 200,
+                    "count": 5,
+                    "context": {"height": 945989},
+                },
+                {
+                    "id": "storage.flush_slow",
+                    "severity": "warn",
+                    "message": "flush took 8s",
+                    "first_seen_unix_secs": 150,
+                    "last_seen_unix_secs": 150,
+                    "count": 1,
+                    "context": {},
+                },
+            ],
+        });
+        let mut st = AppState::new();
+        st.update_warnings(&v);
+        assert_eq!(st.warnings.len(), 2);
+        assert_eq!(st.warnings[0].id, "connect.persistent_failure");
+        assert_eq!(st.warnings[0].severity, WarningSeverity::Error);
+        assert_eq!(st.warnings[0].count, 5);
+        assert_eq!(st.warnings[1].severity, WarningSeverity::Warn);
+    }
+
+    #[test]
+    fn dismissed_warnings_hidden_until_cleared_or_new() {
+        let v = json!({
+            "warnings": [{
+                "id": "a", "severity": "error", "message": "m",
+                "first_seen_unix_secs": 1, "last_seen_unix_secs": 1, "count": 1,
+            }],
+        });
+        let mut st = AppState::new();
+        st.update_warnings(&v);
+        assert_eq!(st.visible_warnings().len(), 1);
+
+        // Operator acknowledges.
+        st.dismiss_visible_warnings();
+        assert_eq!(st.visible_warnings().len(), 0);
+        assert!(st.dismissed_warnings.contains("a"));
+
+        // Server clears the warning — dismissal also clears so next
+        // occurrence of `a` is visible again.
+        st.update_warnings(&json!({"warnings": []}));
+        assert!(!st.dismissed_warnings.contains("a"));
+
+        // `a` reappears.
+        st.update_warnings(&v);
+        assert_eq!(st.visible_warnings().len(), 1);
+    }
+
+    #[test]
+    fn health_dot_transitions() {
+        let mut st = AppState::new();
+        assert!(!st.is_healthy()); // fresh: not connected
+        st.connected = true;
+        st.is_ibd = true;
+        assert!(!st.is_healthy()); // ibd
+        st.is_ibd = false;
+        st.stale = true;
+        assert!(!st.is_healthy()); // stale
+        st.stale = false;
+        assert!(st.is_healthy());
     }
 }

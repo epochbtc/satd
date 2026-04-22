@@ -1499,4 +1499,119 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn getrawmempool_verbose_includes_ancestor_descendant_fields() {
+        // Regression guard: the sat-tui mempool pane reads
+        // `ancestorfees` / `ancestorsize` / `descendantcount` from
+        // getrawmempool verbose to build its top-N table. If those
+        // fields are ever dropped from the response, the TUI silently
+        // displays an empty table on real nodes.
+        use bitcoin::blockdata::locktime::absolute::LockTime;
+        use bitcoin::hashes::Hash;
+        use bitcoin::transaction;
+        use bitcoin::{Amount, ScriptBuf, Sequence, TxIn, TxOut, Witness};
+
+        let mp = Mempool::new(1_000_000, 0);
+
+        // Build a parent tx spending some synthetic prevout.
+        let parent_tx = Transaction {
+            version: transaction::Version(2),
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: bitcoin::Txid::from_raw_hash(
+                        bitcoin::hashes::sha256d::Hash::from_byte_array([0x11; 32]),
+                    ),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(9_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let parent_txid = parent_tx.compute_txid();
+
+        // Build a child spending parent:0 — establishes an ancestor link
+        // inside the mempool so the rollup stats exceed the self values.
+        let child_tx = Transaction {
+            version: transaction::Version(2),
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint { txid: parent_txid, vout: 0 },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(8_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let child_txid = child_tx.compute_txid();
+
+        {
+            let mut inner = mp.inner.write().unwrap();
+            for input in &parent_tx.input {
+                inner.spends.insert(input.previous_output, parent_txid);
+            }
+            inner.entries.insert(
+                parent_txid,
+                MempoolEntry {
+                    tx: parent_tx,
+                    fee: 1_000,
+                    weight: 400,
+                    fee_rate: 10_000,
+                    time: 0,
+                    fee_delta: 0,
+                    sigop_cost: 0,
+                },
+            );
+            for input in &child_tx.input {
+                inner.spends.insert(input.previous_output, child_txid);
+            }
+            inner.entries.insert(
+                child_txid,
+                MempoolEntry {
+                    tx: child_tx,
+                    fee: 2_000,
+                    weight: 400,
+                    fee_rate: 20_000,
+                    time: 0,
+                    fee_delta: 0,
+                    sigop_cost: 0,
+                },
+            );
+        }
+
+        let resp = crate::rpc::rawtx::get_raw_mempool(&mp, true);
+        let map = resp.as_object().expect("verbose response is a map");
+        let parent_v = &map[&parent_txid.to_string()];
+        let child_v = &map[&child_txid.to_string()];
+
+        // Self-only: parent has no ancestors, child has parent as ancestor.
+        assert_eq!(parent_v["ancestorcount"].as_u64(), Some(1));
+        assert_eq!(child_v["ancestorcount"].as_u64(), Some(2));
+
+        // Descendants: parent has the child, child has none.
+        assert_eq!(parent_v["descendantcount"].as_u64(), Some(2));
+        assert_eq!(child_v["descendantcount"].as_u64(), Some(1));
+
+        // Fee rollups include the entry itself.
+        assert_eq!(child_v["ancestorfees"].as_u64(), Some(1_000 + 2_000));
+        assert_eq!(parent_v["descendantfees"].as_u64(), Some(1_000 + 2_000));
+
+        // Sizes in vbytes (weight/4 ceil).
+        assert_eq!(parent_v["ancestorsize"].as_u64(), Some(100));
+        assert_eq!(child_v["ancestorsize"].as_u64(), Some(200));
+
+        // Confirm the tui-critical shape: fields are u64 integers, not strings.
+        assert!(parent_v["ancestorfees"].is_u64());
+        assert!(parent_v["ancestorsize"].is_u64());
+        assert!(parent_v["descendantcount"].is_u64());
+    }
 }

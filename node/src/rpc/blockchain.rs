@@ -53,7 +53,13 @@ pub fn get_blockchain_info(chain_state: &ChainState) -> Value {
         "chainwork": format!("{:0>64}", chainwork),
         "size_on_disk": 0,
         "pruned": false,
-        "warnings": ""
+        // Core ≥ v27 warnings is an array of strings. Preserves older
+        // behavior: if no active warnings, emit the empty-string form
+        // Core used historically; otherwise emit the Core-v27 array.
+        "warnings": match chain_state.warnings().as_strings() {
+            v if v.is_empty() => Value::String(String::new()),
+            v => Value::Array(v.into_iter().map(Value::String).collect()),
+        },
     })
 }
 
