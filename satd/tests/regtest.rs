@@ -43,35 +43,62 @@ impl TestNode {
         // Check if using user/pass auth (no cookie file expected)
         let uses_userpass = extra_args.iter().any(|a| a.starts_with("--rpcuser"));
 
-        // Wait for RPC server to be fully ready.  We verify that
+        // Wait for RPC server to be fully ready. We verify that
         // getblockchaininfo returns a non-null "chain" field to ensure the
-        // chain state is initialized (not just the HTTP listener).
+        // chain state is initialized (not just the HTTP listener). The
+        // port is bound early by a lightweight startup-status RPC stub
+        // that only serves `getstartupinfo`; probing getblockchaininfo
+        // confirms the real RPC server has taken over.
+        let (userpass_user, userpass_pass) = if uses_userpass {
+            let user = extra_args
+                .iter()
+                .find_map(|a| a.strip_prefix("--rpcuser="))
+                .unwrap_or("");
+            let pass = extra_args
+                .iter()
+                .find_map(|a| a.strip_prefix("--rpcpassword="))
+                .unwrap_or("");
+            (user.to_string(), pass.to_string())
+        } else {
+            (String::new(), String::new())
+        };
         let deadline = Instant::now() + Duration::from_secs(30);
         let cookie_path = datadir.join("regtest").join(".cookie");
         loop {
-            if uses_userpass {
-                if std::net::TcpStream::connect(format!("127.0.0.1:{}", rpcport)).is_ok() {
-                    std::thread::sleep(Duration::from_millis(500));
-                    break;
-                }
+            let rpc_ready = if uses_userpass {
+                let client = reqwest::blocking::Client::builder()
+                    .timeout(Duration::from_secs(2))
+                    .build()
+                    .unwrap();
+                client
+                    .post(format!("http://127.0.0.1:{}/", rpcport))
+                    .basic_auth(&userpass_user, Some(&userpass_pass))
+                    .header("Content-Type", "application/json")
+                    .body(r#"{"jsonrpc":"2.0","id":1,"method":"getblockchaininfo","params":[]}"#)
+                    .send()
+                    .ok()
+                    .and_then(|r| r.json::<serde_json::Value>().ok())
+                    .is_some_and(|j| !j["result"]["chain"].is_null())
             } else if let Ok(cookie) = std::fs::read_to_string(&cookie_path) {
                 let auth = base64::engine::general_purpose::STANDARD.encode(cookie.trim());
                 let client = reqwest::blocking::Client::builder()
                     .timeout(Duration::from_secs(2))
                     .build()
                     .unwrap();
-                let rpc_ready = client
+                client
                     .post(format!("http://127.0.0.1:{}/", rpcport))
                     .header("Authorization", format!("Basic {}", auth))
                     .header("Content-Type", "application/json")
-                    .body(r#"{"jsonrpc":"2.0","id":1,"method":"getblockchaininfo"}"#)
+                    .body(r#"{"jsonrpc":"2.0","id":1,"method":"getblockchaininfo","params":[]}"#)
                     .send()
                     .ok()
                     .and_then(|r| r.json::<serde_json::Value>().ok())
-                    .is_some_and(|j| !j["result"]["chain"].is_null());
-                if rpc_ready {
-                    break;
-                }
+                    .is_some_and(|j| !j["result"]["chain"].is_null())
+            } else {
+                false
+            };
+            if rpc_ready {
+                break;
             }
             if Instant::now() >= deadline {
                 panic!("Timed out waiting for satd to start on port {}", rpcport);
