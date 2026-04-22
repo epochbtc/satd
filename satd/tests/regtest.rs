@@ -1623,6 +1623,29 @@ fn test_node_restart_persistence() {
     let _ = std::fs::remove_dir_all(&datadir);
     let _ = std::fs::create_dir_all(&datadir);
 
+    // Guard that kills the child on drop. Needed because an assertion
+    // failure between spawn and the explicit cleanup below would
+    // otherwise leak the satd process, which then holds its ports and
+    // cascades into startup-timeout failures in unrelated tests.
+    struct ChildGuard(Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    impl std::ops::Deref for ChildGuard {
+        type Target = Child;
+        fn deref(&self) -> &Child {
+            &self.0
+        }
+    }
+    impl std::ops::DerefMut for ChildGuard {
+        fn deref_mut(&mut self) -> &mut Child {
+            &mut self.0
+        }
+    }
+
     // Helper: make an RPC call to a given port with a given cookie
     let rpc = |port: u16,
                cookie: &str,
@@ -1649,19 +1672,45 @@ fn test_node_restart_persistence() {
             .unwrap()
     };
 
-    // Helper: wait for cookie file and return its contents
-    let wait_for_cookie = |dir: &std::path::Path| -> String {
+    // Wait for the cookie file AND for the real RPC server to be
+    // serving. satd binds a lightweight startup-status RPC to the
+    // port as soon as the cookie is written — but that stub only
+    // responds to `getstartupinfo`. Probe `getblockchaininfo` until
+    // the real RPC server replaces the stub and the chain is
+    // initialized (matches the pattern used by `TestNode::start`).
+    let wait_for_cookie = |dir: &std::path::Path, port: u16| -> String {
         let cookie_path = dir.join("regtest").join(".cookie");
-        for _ in 0..50 {
-            if let Ok(c) = std::fs::read_to_string(&cookie_path) {
-                return c;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Ok(cookie) = std::fs::read_to_string(&cookie_path) {
+                let (user, pass) = cookie
+                    .split_once(':')
+                    .unwrap_or(("__cookie__", "none"));
+                let client = reqwest::blocking::Client::builder()
+                    .timeout(Duration::from_secs(2))
+                    .build()
+                    .unwrap();
+                let ready = client
+                    .post(format!("http://127.0.0.1:{}/", port))
+                    .basic_auth(user, Some(pass))
+                    .header("Content-Type", "application/json")
+                    .body(r#"{"jsonrpc":"2.0","id":1,"method":"getblockchaininfo","params":[]}"#)
+                    .send()
+                    .ok()
+                    .and_then(|r| r.json::<serde_json::Value>().ok())
+                    .is_some_and(|j| !j["result"]["chain"].is_null());
+                if ready {
+                    return cookie;
+                }
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "Timed out waiting for satd RPC to be ready on port {}",
+                    port
+                );
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        panic!(
-            "Timed out waiting for cookie file at {}",
-            cookie_path.display()
-        );
     };
 
     let saved_best_hash;
@@ -1669,16 +1718,18 @@ fn test_node_restart_persistence() {
     // ── First run ──
     let rpcport1 = find_available_port();
     {
-        let mut child = Command::new(satd_bin)
-            .arg("--regtest")
-            .arg(format!("--datadir={}", datadir.display()))
-            .arg(format!("--rpcport={}", rpcport1))
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("Failed to start satd");
+        let mut child = ChildGuard(
+            Command::new(satd_bin)
+                .arg("--regtest")
+                .arg(format!("--datadir={}", datadir.display()))
+                .arg(format!("--rpcport={}", rpcport1))
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("Failed to start satd"),
+        );
 
-        let cookie = wait_for_cookie(&datadir);
+        let cookie = wait_for_cookie(&datadir, rpcport1);
         let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
 
         // Mine 3 blocks
@@ -1712,16 +1763,18 @@ fn test_node_restart_persistence() {
     // ── Second run (same datadir, new port) ──
     let rpcport2 = find_available_port();
     {
-        let mut child = Command::new(satd_bin)
-            .arg("--regtest")
-            .arg(format!("--datadir={}", datadir.display()))
-            .arg(format!("--rpcport={}", rpcport2))
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("Failed to start satd (second run)");
+        let mut child = ChildGuard(
+            Command::new(satd_bin)
+                .arg("--regtest")
+                .arg(format!("--datadir={}", datadir.display()))
+                .arg(format!("--rpcport={}", rpcport2))
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("Failed to start satd (second run)"),
+        );
 
-        let cookie = wait_for_cookie(&datadir);
+        let cookie = wait_for_cookie(&datadir, rpcport2);
 
         // Verify chain state persisted
         let count = rpc(rpcport2, &cookie, "getblockcount", vec![]);
