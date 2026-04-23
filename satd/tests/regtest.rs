@@ -3272,6 +3272,80 @@ fn test_getmempoolhistory_returns_snapshots_shape() {
 }
 
 #[test]
+fn test_getorphaninfo_empty_shape() {
+    // A fresh regtest node has an empty orphan pool. Assert the RPC
+    // returns the Core-compat-ish shape we commit to: size, bytes,
+    // max_size.
+    let mut node = TestNode::start(&[]);
+    let response = node.rpc_call("getorphaninfo").unwrap();
+    let result = &response["result"];
+    assert!(result.is_object(), "getorphaninfo result should be an object");
+    assert_eq!(result["size"].as_u64(), Some(0));
+    assert_eq!(result["bytes"].as_u64(), Some(0));
+    assert!(
+        result["max_size"].as_u64().unwrap_or(0) > 0,
+        "max_size should be a positive cap; got: {:?}",
+        result["max_size"]
+    );
+    node.stop();
+}
+
+#[test]
+fn test_getorphaninfo_registered_in_help() {
+    // Help text must advertise getorphaninfo so operators can discover it.
+    let mut node = TestNode::start(&[]);
+    let response = node.rpc_call("help").unwrap();
+    let body = response["result"].as_str().unwrap_or("");
+    assert!(
+        body.contains("getorphaninfo"),
+        "`help` output should advertise getorphaninfo; got: {}",
+        body
+    );
+    node.stop();
+}
+
+#[test]
+fn test_sendrawtransaction_orphan_rejected_not_orphaned() {
+    // RPC path must NOT route orphans to the orphanage — only P2P relay
+    // should. sendrawtransaction of a tx with a missing parent returns
+    // an error, and getorphaninfo stays at size 0.
+    let mut node = TestNode::start(&[]);
+
+    // Build a raw tx referencing a non-existent parent output. Uses the
+    // createrawtransaction helper so we don't hand-roll the hex.
+    let inputs = serde_json::json!([{
+        "txid": "1111111111111111111111111111111111111111111111111111111111111111",
+        "vout": 0,
+    }]);
+    let outputs = serde_json::json!({
+        "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202": 0.01,
+    });
+    let create_resp = node
+        .rpc_call_with_params("createrawtransaction", vec![inputs, outputs])
+        .unwrap();
+    let hex = create_resp["result"].as_str().unwrap().to_string();
+
+    // Submit via RPC; expect an error (MissingInputs / similar).
+    let submit = node
+        .rpc_call_with_params("sendrawtransaction", vec![serde_json::json!(hex)])
+        .unwrap();
+    assert!(
+        submit["error"].is_object(),
+        "sendrawtransaction of an orphan should error; got: {:?}",
+        submit
+    );
+
+    // Orphanage must still be empty — RPC path does not orphan.
+    let info = node.rpc_call("getorphaninfo").unwrap();
+    assert_eq!(
+        info["result"]["size"].as_u64(),
+        Some(0),
+        "getorphaninfo.size should stay 0 after RPC-rejected orphan"
+    );
+    node.stop();
+}
+
+#[test]
 fn test_subscribemempool_registered_in_help() {
     // End-to-end WS subscription exercise is hard to make reliable in
     // regtest (auth, timing, tokio runtime interop). The broadcast

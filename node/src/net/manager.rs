@@ -15,7 +15,8 @@ use base64::Engine;
 
 use crate::chain::state::ChainState;
 use crate::mempool::fee::FeeEstimator;
-use crate::mempool::pool::Mempool;
+use crate::mempool::orphanage::{OrphanReject, TxOrphanage};
+use crate::mempool::pool::{Mempool, MempoolError};
 use crate::net::compact;
 use crate::net::connection::{Connection, ConnectionWriter};
 use crate::net::ibd::IbdScheduler;
@@ -131,6 +132,10 @@ pub struct PeerManager {
     /// Latest ETA (seconds) from the weight-aware IBD estimator.
     /// Written by the connect loop, read by the RPC handler.
     ibd_eta_secs: Arc<AtomicU64>,
+    /// Orphan transaction pool. Txs with missing parents (from P2P relay)
+    /// are deferred here instead of triggering peer bans; reconsidered on
+    /// new mempool admission and on block connect.
+    orphanage: Arc<TxOrphanage>,
 }
 
 impl PeerManager {
@@ -231,6 +236,7 @@ impl PeerManager {
             connect_peer_addrs: RwLock::new(Vec::new()),
             max_ahead,
             ibd_eta_secs: Arc::new(AtomicU64::new(0)),
+            orphanage: Arc::new(TxOrphanage::with_defaults()),
         });
 
         // Spawn block processing thread
@@ -239,8 +245,9 @@ impl PeerManager {
         let fe = fee_estimator;
         let prune_mb = prune_target_mb;
         let eta_secs = mgr.ibd_eta_secs.clone();
+        let orph = mgr.orphanage.clone();
         std::thread::spawn(move || {
-            Self::block_processor(block_rx, cs, mp, fe, prune_mb, connect_signal, ibd, prefetch_workers, max_ahead, network, eta_secs);
+            Self::block_processor(block_rx, cs, mp, fe, prune_mb, connect_signal, ibd, prefetch_workers, max_ahead, network, eta_secs, orph);
         });
 
         mgr
@@ -256,6 +263,11 @@ impl PeerManager {
         } else {
             max_ahead
         }
+    }
+
+    /// Expose the orphanage so the RPC layer can report diagnostics.
+    pub fn orphanage(&self) -> Arc<TxOrphanage> {
+        self.orphanage.clone()
     }
 
     /// Register addresses for auto-reconnect.
@@ -742,8 +754,13 @@ impl PeerManager {
             ticks += 1;
 
             // Every 60 ticks (30 seconds), expire old mempool transactions
+            // and sweep expired orphans.
             if ticks.is_multiple_of(60) {
                 self.mempool.remove_expired();
+                let expired = self.orphanage.expire(Instant::now());
+                if !expired.is_empty() {
+                    tracing::debug!(count = expired.len(), "Expired orphan transactions");
+                }
             }
 
             // Every 20 ticks (10 seconds), reconnect if below outbound target
@@ -1195,6 +1212,7 @@ impl PeerManager {
     /// Block processing runs on a dedicated OS thread (not tokio) to avoid
     /// blocking the async event loop during CPU-intensive validation.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn block_processor(
         mut rx: mpsc::UnboundedReceiver<bitcoin::Block>,
         chain_state: Arc<ChainState>,
@@ -1207,6 +1225,7 @@ impl PeerManager {
         max_ahead: u32,
         network: Network,
         ibd_eta_secs: Arc<AtomicU64>,
+        orphanage: Arc<TxOrphanage>,
     ) {
         let mut last_log_height: u32 = 0;
         let mut last_prune_height: u32 = 0;
@@ -1275,6 +1294,7 @@ impl PeerManager {
                     Ok(_) => {
                         fee_estimator.record_block(&fees);
                         mempool.remove_for_block(&block, chain_state.tip_height());
+                        reconsider_orphans_on_block(&orphanage, &mempool, &chain_state, &block);
                         // Drain buffer
                         loop {
                             let tip = chain_state.tip_hash();
@@ -1285,6 +1305,7 @@ impl PeerManager {
                                         Ok(_) => {
                                             fee_estimator.record_block(&b_fees);
                                             mempool.remove_for_block(&b, chain_state.tip_height());
+                                            reconsider_orphans_on_block(&orphanage, &mempool, &chain_state, &b);
                                         }
                                         Err(_) => break,
                                     }
@@ -1733,34 +1754,31 @@ impl PeerManager {
         }
 
         let txid = tx.compute_txid();
-        let fee_rate = {
-            let weight = tx.weight().to_wu();
-            if weight > 0 {
-                // We'll get the actual fee rate from the mempool entry after acceptance
-                0u64 // placeholder, updated below
-            } else {
-                0
-            }
-        };
         match self.mempool.accept_transaction(
-            tx,
+            tx.clone(),
             &self.chain_state,
             self.chain_state.script_verifier(),
         ) {
             Ok(_) => {
-                // Get the actual fee rate from the accepted entry
-                let entry_fee_rate = self.mempool.get(&txid)
-                    .map(|e| e.fee_rate)
-                    .unwrap_or(fee_rate);
-                // Relay to peers whose fee filter allows this tx
-                let inv = NetworkMessage::Inv(vec![Inventory::WitnessTransaction(txid)]);
-                let peers = self.peers.read().unwrap();
-                for (peer_id, handle) in peers.iter() {
-                    if *peer_id != id
-                        && handle.info.state == PeerState::Connected
-                        && entry_fee_rate >= handle.info.fee_filter
-                    {
-                        let _ = handle.msg_tx.try_send(inv.clone());
+                self.broadcast_inv(id, txid);
+                // A new parent just entered the mempool — walk orphans
+                // that were waiting on it and try to admit them.
+                self.drain_orphans_for_parent(txid);
+            }
+            Err(MempoolError::MissingInputs) => {
+                // Don't ban — peer may just be ahead of us. Defer to
+                // orphanage and ask the same peer for the parents.
+                let missing = self.collect_missing_parents(&tx);
+                match self.orphanage.add(tx, id, missing.clone()) {
+                    Ok(()) => {
+                        if !missing.is_empty() {
+                            let want: Vec<bitcoin::Txid> = missing.into_iter().collect();
+                            self.send_to_peer(id, sync::make_getdata_txs(&want));
+                        }
+                        tracing::debug!(%txid, peer = id, "Tx deferred to orphanage");
+                    }
+                    Err(OrphanReject::TooLarge) => {
+                        self.add_ban_score(id, 1, "orphan too large");
                     }
                 }
             }
@@ -1769,6 +1787,92 @@ impl PeerManager {
                 self.add_ban_score(id, 1, &format!("Tx rejected: {}", e));
             }
         }
+    }
+
+    /// Inspect `tx`'s inputs and return the set of parent txids whose
+    /// outputs we can't resolve in either the confirmed UTXO set or the
+    /// current mempool. Used to decide which parents to ask for after
+    /// orphaning a tx.
+    fn collect_missing_parents(
+        &self,
+        tx: &bitcoin::Transaction,
+    ) -> std::collections::HashSet<bitcoin::Txid> {
+        let mut missing = std::collections::HashSet::new();
+        for input in &tx.input {
+            let parent = input.previous_output.txid;
+            if self.chain_state.get_coin(&input.previous_output).is_some() {
+                continue;
+            }
+            if self.mempool.get(&parent).is_some() {
+                continue;
+            }
+            missing.insert(parent);
+        }
+        missing
+    }
+
+    /// Relay a newly-admitted tx to other peers whose fee filter allows it.
+    fn broadcast_inv(&self, from: PeerId, txid: bitcoin::Txid) {
+        let entry_fee_rate = self.mempool.get(&txid).map(|e| e.fee_rate).unwrap_or(0);
+        let inv = NetworkMessage::Inv(vec![Inventory::WitnessTransaction(txid)]);
+        let peers = self.peers.read().unwrap();
+        for (peer_id, handle) in peers.iter() {
+            if *peer_id != from
+                && handle.info.state == PeerState::Connected
+                && entry_fee_rate >= handle.info.fee_filter
+            {
+                let _ = handle.msg_tx.try_send(inv.clone());
+            }
+        }
+    }
+
+    /// BFS-drain orphans that listed `parent` as a missing parent. Newly
+    /// admitted children recursively trigger further drains. Orphans that
+    /// still don't validate (other missing parents, or genuinely invalid)
+    /// are re-orphaned or silently dropped.
+    fn drain_orphans_for_parent(&self, parent: bitcoin::Txid) {
+        use std::collections::VecDeque;
+        let mut queue: VecDeque<bitcoin::Txid> =
+            self.orphanage.children_of(&parent).into_iter().collect();
+        while let Some(child_txid) = queue.pop_front() {
+            let Some(child) = self.orphanage.remove(&child_txid) else {
+                continue;
+            };
+            let result = self.mempool.accept_transaction(
+                child.tx.clone(),
+                &self.chain_state,
+                self.chain_state.script_verifier(),
+            );
+            match result {
+                Ok(_) => {
+                    self.broadcast_inv(child.from_peer, child_txid);
+                    for grandchild in self.orphanage.children_of(&child_txid) {
+                        queue.push_back(grandchild);
+                    }
+                }
+                Err(MempoolError::MissingInputs) => {
+                    let missing = self.collect_missing_parents(&child.tx);
+                    let _ = self.orphanage.add(child.tx, child.from_peer, missing);
+                }
+                Err(e) => {
+                    tracing::debug!(%child_txid, "Orphan re-evaluation failed: {}", e);
+                }
+            }
+        }
+    }
+
+    /// Called after a block connects: reconsider orphans whose missing
+    /// parent is now confirmed. Used from the block-processor thread via
+    /// the free-standing [`reconsider_orphans_on_block`] helper below.
+    /// Orphans admitted here are not relayed — peers will naturally
+    /// re-announce, and the block-connect path has no peer context.
+    pub fn reconsider_orphans_for_block(&self, block: &bitcoin::Block) {
+        reconsider_orphans_on_block(
+            &self.orphanage,
+            &self.mempool,
+            &self.chain_state,
+            block,
+        );
     }
 
     fn handle_getheaders(
@@ -2197,6 +2301,65 @@ impl PeerManager {
             user_agent: crate::USER_AGENT.to_string(),
             start_height: self.chain_state.tip_height() as i32,
             relay: true,
+        }
+    }
+}
+
+/// Reconsider orphans whose missing parent was just confirmed in `block`.
+///
+/// Standalone so the `block_processor` thread — which doesn't have a
+/// `PeerManager` handle — can invoke it after `remove_for_block`.
+/// No peer relay: orphans admitted here are in our local mempool; peers
+/// will re-announce on their own schedule.
+pub fn reconsider_orphans_on_block(
+    orphanage: &Arc<TxOrphanage>,
+    mempool: &Arc<Mempool>,
+    chain_state: &Arc<ChainState>,
+    block: &bitcoin::Block,
+) {
+    use std::collections::VecDeque;
+    let mut queue: VecDeque<bitcoin::Txid> = VecDeque::new();
+    for tx in &block.txdata {
+        let confirmed_txid = tx.compute_txid();
+        // Drop any orphan that is itself the confirmed tx.
+        let _ = orphanage.remove(&confirmed_txid);
+        for child in orphanage.children_of(&confirmed_txid) {
+            queue.push_back(child);
+        }
+    }
+    while let Some(child_txid) = queue.pop_front() {
+        let Some(child) = orphanage.remove(&child_txid) else {
+            continue;
+        };
+        let result = mempool.accept_transaction(
+            child.tx.clone(),
+            chain_state,
+            chain_state.script_verifier(),
+        );
+        match result {
+            Ok(_) => {
+                for grandchild in orphanage.children_of(&child_txid) {
+                    queue.push_back(grandchild);
+                }
+            }
+            Err(MempoolError::MissingInputs) => {
+                // Other parents still unresolved — re-orphan with updated set.
+                let mut missing = std::collections::HashSet::new();
+                for input in &child.tx.input {
+                    let parent = input.previous_output.txid;
+                    if chain_state.get_coin(&input.previous_output).is_some() {
+                        continue;
+                    }
+                    if mempool.get(&parent).is_some() {
+                        continue;
+                    }
+                    missing.insert(parent);
+                }
+                let _ = orphanage.add(child.tx, child.from_peer, missing);
+            }
+            Err(e) => {
+                tracing::debug!(%child_txid, "Orphan dropped on block-connect re-eval: {}", e);
+            }
         }
     }
 }

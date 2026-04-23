@@ -399,6 +399,15 @@ pub async fn start(
         Ok::<_, ErrorObjectOwned>(rawtx::get_mempool_info(&ctx.mempool))
     })?;
 
+    module.register_method("getorphaninfo", |_params, ctx, _extensions| {
+        let orphanage = ctx.peer_manager.orphanage();
+        Ok::<_, ErrorObjectOwned>(serde_json::json!({
+            "size": orphanage.len(),
+            "bytes": orphanage.bytes(),
+            "max_size": orphanage.config().max_count,
+        }))
+    })?;
+
     module.register_method("getrawmempool", |params, ctx, _extensions| {
         let mut seq = params.sequence();
         let verbose: bool = seq.optional_next().unwrap_or(Some(false)).unwrap_or(false);
@@ -891,7 +900,7 @@ pub async fn start(
             "getconnectioncount",
             "getdifficulty", "getibdprogress", "getmempoolancestors", "getmempooldescendants",
             "getmempoolentry", "getmempoolhistory", "getmempoolinfo", "getmemoryinfo", "getmininginfo",
-            "getnettotals", "getnetworkhashps", "getnetworkinfo", "getpeerinfo",
+            "getnettotals", "getnetworkhashps", "getnetworkinfo", "getorphaninfo", "getpeerinfo",
             "getrawmempool", "getrawtransaction", "getreorghistory", "getrpcinfo",
             "getsysteminfo", "gettxout", "getwarnings",
             "gettxoutsetinfo", "help", "listbanned", "logging", "ping",
