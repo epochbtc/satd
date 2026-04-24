@@ -15,7 +15,7 @@ use base64::Engine;
 
 use crate::chain::state::ChainState;
 use crate::mempool::fee::FeeEstimator;
-use crate::mempool::orphanage::{OrphanReject, TxOrphanage};
+use crate::mempool::orphanage::{AddOutcome, OrphanReject, TxOrphanage};
 use crate::mempool::pool::{Mempool, MempoolError};
 use crate::net::compact;
 use crate::net::connection::{Connection, ConnectionWriter};
@@ -1770,12 +1770,32 @@ impl PeerManager {
                 // orphanage and ask the same peer for the parents.
                 let missing = self.collect_missing_parents(&tx);
                 match self.orphanage.add(tx, id, missing.clone()) {
-                    Ok(()) => {
-                        if !missing.is_empty() {
-                            let want: Vec<bitcoin::Txid> = missing.into_iter().collect();
-                            self.send_to_peer(id, sync::make_getdata_txs(&want));
-                        }
+                    Ok(AddOutcome::Added) => {
+                        let want: Vec<bitcoin::Txid> = missing.into_iter().collect();
+                        self.send_to_peer(id, sync::make_getdata_txs(&want));
                         tracing::debug!(%txid, peer = id, "Tx deferred to orphanage");
+                    }
+                    Ok(AddOutcome::Duplicate) => {
+                        // Peer resent an orphan we already hold. Don't
+                        // amplify their traffic by re-requesting the same
+                        // parents; parents are already being awaited from
+                        // the original sender (and natural propagation).
+                        tracing::trace!(
+                            %txid,
+                            peer = id,
+                            "Duplicate orphan, skipping parent re-request"
+                        );
+                    }
+                    Err(OrphanReject::NoMissingParents) => {
+                        // Race: parent entered mempool between accept and
+                        // collect. Drop silently — the peer will re-relay
+                        // the child via normal INV once we announce the
+                        // parent, or another peer will redeliver.
+                        tracing::debug!(
+                            %txid,
+                            peer = id,
+                            "Orphan with no resolvable missing parents, dropping"
+                        );
                     }
                     Err(OrphanReject::TooLarge) => {
                         self.add_ban_score(id, 1, "orphan too large");
@@ -1851,6 +1871,9 @@ impl PeerManager {
                     }
                 }
                 Err(MempoolError::MissingInputs) => {
+                    // Other parents still missing — re-orphan. If
+                    // `collect_missing_parents` now returns empty (race),
+                    // `add` returns NoMissingParents and we drop silently.
                     let missing = self.collect_missing_parents(&child.tx);
                     let _ = self.orphanage.add(child.tx, child.from_peer, missing);
                 }
@@ -2343,7 +2366,10 @@ pub fn reconsider_orphans_on_block(
                 }
             }
             Err(MempoolError::MissingInputs) => {
-                // Other parents still unresolved — re-orphan with updated set.
+                // Other parents still unresolved — re-orphan with updated
+                // set. If the set is empty (race), `add` returns
+                // NoMissingParents and we drop silently rather than
+                // stranding an unreachable orphan.
                 let mut missing = std::collections::HashSet::new();
                 for input in &child.tx.input {
                     let parent = input.previous_output.txid;

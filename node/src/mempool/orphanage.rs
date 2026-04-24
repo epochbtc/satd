@@ -54,6 +54,24 @@ impl Default for OrphanageConfig {
 pub enum OrphanReject {
     #[error("orphan tx exceeds MAX_STANDARD_TX_WEIGHT")]
     TooLarge,
+    /// Caller collected zero missing parents — orphaning would strand the tx
+    /// (the `by_parent` index keys off `missing_parents`, so an empty set is
+    /// unreachable from `children_of()`). Reachable under the parent-arrives-
+    /// between-accept-and-collect race; callers drop silently.
+    #[error("orphan has no missing parents — would be unreachable from reconsideration")]
+    NoMissingParents,
+}
+
+/// Outcome of a successful [`TxOrphanage::add`] call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddOutcome {
+    /// Fresh insertion.
+    Added,
+    /// An orphan with the same `txid` was already present; pool state
+    /// unchanged. Callers should NOT re-request missing parents on a
+    /// duplicate — doing so lets a peer amplify outbound `getdata` traffic
+    /// by resending the same orphan.
+    Duplicate,
 }
 
 #[derive(Debug, Clone)]
@@ -103,26 +121,34 @@ impl TxOrphanage {
         &self.config
     }
 
-    /// Insert `tx` as an orphan. `missing_parents` is the set of parent
-    /// txids whose outputs the caller was unable to resolve (not in the
-    /// confirmed UTXO set or the current mempool). `missing_parents` may
-    /// be empty — callers shouldn't normally route non-orphans here, but
-    /// we accept it for simplicity (e.g. a race where the parent arrived
-    /// between the caller's check and our insert).
+    /// Insert `tx` as an orphan. `missing_parents` MUST be non-empty — an
+    /// orphan with an empty set is indexed only under `by_txid`/`by_peer`
+    /// and would be unreachable from the reconsideration paths
+    /// ([`children_of`](Self::children_of) walks `by_parent`), so it could
+    /// only exit via expiry or FIFO eviction. Returns
+    /// [`OrphanReject::NoMissingParents`] in that case; the caller's
+    /// correct response is to drop the tx (the peer will re-relay via
+    /// normal propagation if the condition was a race).
+    ///
+    /// On duplicate `txid`, returns [`AddOutcome::Duplicate`] without
+    /// mutating the pool — callers MUST NOT re-send `getdata` for the
+    /// parents in that case.
     pub fn add(
         &self,
         tx: Transaction,
         from_peer: PeerId,
         missing_parents: HashSet<Txid>,
-    ) -> Result<(), OrphanReject> {
+    ) -> Result<AddOutcome, OrphanReject> {
+        if missing_parents.is_empty() {
+            return Err(OrphanReject::NoMissingParents);
+        }
         let weight = tx.weight().to_wu() as usize;
         if weight > MAX_STANDARD_TX_WEIGHT {
             return Err(OrphanReject::TooLarge);
         }
         let bytes = bitcoin::consensus::serialize(&tx).len();
         let txid = tx.compute_txid();
-        self.add_at(tx, txid, from_peer, missing_parents, bytes, Instant::now());
-        Ok(())
+        Ok(self.add_at(tx, txid, from_peer, missing_parents, bytes, Instant::now()))
     }
 
     fn add_at(
@@ -133,12 +159,13 @@ impl TxOrphanage {
         missing_parents: HashSet<Txid>,
         bytes: usize,
         added_at: Instant,
-    ) {
+    ) -> AddOutcome {
         let mut inner = self.inner.lock().unwrap();
 
-        // Idempotent: already have this orphan.
+        // Idempotent on duplicate txid — report so the caller can skip
+        // re-requesting parents.
         if inner.by_txid.contains_key(&txid) {
-            return;
+            return AddOutcome::Duplicate;
         }
 
         // Per-peer quota: evict this peer's oldest before inserting.
@@ -172,6 +199,7 @@ impl TxOrphanage {
             inner.by_parent.entry(*parent).or_default().insert(txid);
         }
         inner.by_peer.entry(from_peer).or_default().insert(txid);
+        AddOutcome::Added
     }
 
     /// Return child-orphan txids that list `parent_txid` as a missing
@@ -513,13 +541,41 @@ mod tests {
     }
 
     #[test]
-    fn test_idempotent_add() {
+    fn test_add_duplicate_returns_duplicate_outcome() {
         let pool = TxOrphanage::with_defaults();
         let parent = rand_txid(1);
         let tx = make_tx(parent, 0, 100);
+        let txid = tx.compute_txid();
         let missing: HashSet<Txid> = [parent].into_iter().collect();
-        pool.add(tx.clone(), 1, missing.clone()).unwrap();
-        pool.add(tx, 2, missing).unwrap(); // Different peer, same tx
+
+        let first = pool.add(tx.clone(), 1, missing.clone()).unwrap();
+        assert_eq!(first, AddOutcome::Added);
+
+        // Same tx, different peer — must report Duplicate and leave the
+        // pool unchanged (including the original peer's index entry).
+        let second = pool.add(tx, 2, missing).unwrap();
+        assert_eq!(second, AddOutcome::Duplicate);
         assert_eq!(pool.len(), 1);
+        assert!(pool.contains(&txid));
+
+        let inner = pool.inner.lock().unwrap();
+        assert!(inner.by_peer.get(&1).is_some_and(|s| s.contains(&txid)));
+        assert!(
+            !inner.by_peer.contains_key(&2),
+            "duplicate add must not touch peer-2 index"
+        );
+    }
+
+    #[test]
+    fn test_add_empty_missing_parents_rejected() {
+        // Empty `missing_parents` would strand the orphan: `by_parent`
+        // stays empty for it, so `children_of()` never returns it and it
+        // can only exit via FIFO eviction or expiry. `add` must reject.
+        let pool = TxOrphanage::with_defaults();
+        let tx = make_tx(rand_txid(1), 0, 100);
+        let err = pool.add(tx, 1, HashSet::new()).unwrap_err();
+        assert!(matches!(err, OrphanReject::NoMissingParents));
+        assert_eq!(pool.len(), 0);
+        assert_eq!(pool.bytes(), 0);
     }
 }
