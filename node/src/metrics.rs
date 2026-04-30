@@ -39,6 +39,14 @@ pub struct MetricsContext {
     pub network: Network,
     pub start_time: Instant,
     pub version: &'static str,
+    /// Subscription registry handle for active-subscribers gauge.
+    /// Optional so test backends without a registry still render.
+    pub addr_subs:
+        Option<Arc<crate::index::address::SubscriptionRegistry>>,
+    /// Address-index runtime config — exposed as an `enabled` gauge
+    /// so operators can confirm at a glance which DB-backed indexes
+    /// are live.
+    pub addr_enabled: bool,
 }
 
 impl MetricsContext {
@@ -202,6 +210,59 @@ impl MetricsContext {
             &[("version", self.version), ("network", network_str)],
             1,
         );
+
+        // Address-history index metrics (M6).
+        let addr_stats = crate::index::address::stats::snapshot();
+        metric(
+            &mut out,
+            "satd_addrindex_enabled",
+            "1 if the address-history index is enabled at runtime, 0 otherwise.",
+            "gauge",
+            &[],
+            u64::from(self.addr_enabled),
+        );
+        metric(
+            &mut out,
+            "satd_addrindex_funding_rows_total",
+            "Cumulative count of address-history funding rows emitted by connect_block since process start.",
+            "counter",
+            &[],
+            addr_stats.funding_rows,
+        );
+        metric(
+            &mut out,
+            "satd_addrindex_spending_rows_total",
+            "Cumulative count of address-history spending rows emitted by connect_block since process start.",
+            "counter",
+            &[],
+            addr_stats.spending_rows,
+        );
+        metric(
+            &mut out,
+            "satd_addrindex_funding_removes_total",
+            "Cumulative count of address-history funding-row removals emitted by disconnect_block.",
+            "counter",
+            &[],
+            addr_stats.funding_removes,
+        );
+        metric(
+            &mut out,
+            "satd_addrindex_spending_removes_total",
+            "Cumulative count of address-history spending-row removals emitted by disconnect_block.",
+            "counter",
+            &[],
+            addr_stats.spending_removes,
+        );
+        if let Some(subs) = &self.addr_subs {
+            metric(
+                &mut out,
+                "satd_addrindex_subscriptions_active",
+                "Currently registered per-scripthash status subscriptions.",
+                "gauge",
+                &[],
+                subs.active_count() as u64,
+            );
+        }
 
         out
     }

@@ -41,6 +41,7 @@ pub fn emit_funding(
         vout,
         amount_sat: txout.value.to_sat(),
     });
+    crate::index::address::stats::add_funding_rows(1);
 }
 
 /// Emit a spending row for input `vin` of `txid` at `height` consuming
@@ -68,6 +69,7 @@ pub fn emit_spending(
         vin,
         prev_outpoint,
     });
+    crate::index::address::stats::add_spending_rows(1);
 }
 
 /// Build a funding-removal key for `(scripthash, height, txid, vout)`.

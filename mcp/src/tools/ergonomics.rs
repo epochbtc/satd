@@ -42,6 +42,8 @@ pub fn get_metrics_snapshot(ctx: &McpContext) -> String {
         network: ctx.network,
         start_time: ctx.start_time,
         version: env!("CARGO_PKG_VERSION"),
+        addr_subs: None,
+        addr_enabled: false,
     };
     let body = metrics_ctx.render_prometheus();
     let result = json!({
@@ -72,6 +74,8 @@ pub fn get_readiness(ctx: &McpContext) -> String {
         network: ctx.network,
         start_time: ctx.start_time,
         version: env!("CARGO_PKG_VERSION"),
+        addr_subs: None,
+        addr_enabled: false,
     };
     let (ready, reason) = match metrics_ctx.is_ready() {
         Ok(()) => (true, None),

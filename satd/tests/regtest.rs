@@ -2588,6 +2588,11 @@ fn test_metrics_and_health_endpoints() {
         "satd_peer_connections",
         "satd_process_uptime_seconds",
         "satd_build_info",
+        // Address-history index metrics (M6).
+        "satd_addrindex_enabled",
+        "satd_addrindex_funding_rows_total",
+        "satd_addrindex_spending_rows_total",
+        "satd_addrindex_subscriptions_active",
     ] {
         assert!(
             body.contains(required),
