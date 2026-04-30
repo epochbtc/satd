@@ -37,8 +37,8 @@ On-chain wallets are dominated by **Electrum protocol**. LN-focused wallets spli
 
 ### Surfaces satd should expose, ranked by leverage
 
-1. **Electrum protocol server.** Largest wallet install base by far. Either implemented in-tree (`sat-electrum`) or first-class integration / bundling of `electrs` or `Fulcrum`. Unlocks BlueWallet, Nunchuk, Sparrow, Electrum, and most hardware-wallet coordinators in one move.
-2. **Esplora REST API.** Compatible with `blockstream.info` / `mempool.space` endpoints. Unlocks BDK-based wallets and Mutiny-alikes. Smaller ecosystem than Electrum but growing, and it is the BDK-native path.
+1. **Electrum protocol server.** Largest wallet install base by far. Native implementation in-tree, sharing satd's chainstate (see Part 2 §4 for architecture and §4a for implementation strategy). Unlocks BlueWallet, Nunchuk, Sparrow, Electrum, and most hardware-wallet coordinators in one move.
+2. **Esplora REST API.** Compatible with `blockstream.info` / `mempool.space` endpoints. Native implementation, shares the same address-history index as the Electrum server. Unlocks BDK-based wallets and Mutiny-alikes.
 3. **BIP 157/158 P2P service.** Near-free as part of being a well-behaved Bitcoin node — `getcfilters` / `getcfheaders` / `getcfcheckpt` over standard P2P. Zeus-embedded / Blixt users can `addpeer` our .onion. Low incremental cost; covers the LN-focused on-device validation niche.
 4. **Bitcoin Core-compatible JSON-RPC** (already implemented). Protect wire-format compatibility going forward so Sparrow desktop, BTCPay, legacy scripts, and integrations "just work."
 5. **LND-compatible gRPC/REST** *(deferred)*. Would let Zeus / other LND-aware wallets treat satd as "my remote LND." Large surface; only worth it if we decide to go LN-first.
@@ -93,15 +93,85 @@ satd is as drop-in as Bitcoin Core for Umbrel, Start9 / StartOS, RaspiBlitz, MyN
 - **First-class pruning + AssumeUTXO UX** — `-prune=N` + `-assumeutxo=<height>` as the documented recommended profile for Pi / resource-constrained deployments.
 - **Tor-first defaults available** — `-listenonion`, `-onlynet=onion`, ControlPort auto-discovery. Both platforms run Tor by default.
 
-### 4. Companion binaries
+### 4. Wallet-server protocols (Electrum + Esplora) — architecture
 
-Ship Electrum / Esplora servers as **separate binaries in the workspace**:
+Both protocols ship in v1 as **native subsystems inside the satd binary**, gated by feature flags. The architectural story — and the headline differentiator over the bitcoind + electrs status quo — is that **Electrum and Esplora are query layers over satd's chainstate, not a separate process maintaining a parallel index**.
 
-- `sat-electrum` — Electrum protocol server (or first-class integration with `electrs` / `Fulcrum`).
-- `sat-esplora` — Esplora REST server.
-- `sat-index` *(optional)* — native index service if it provides capabilities neither covers.
+#### Why native + shared chainstate, not bundled electrs
 
-Rationale: one process per container maps cleanly to Umbrel / Start9's container model. Keeps satd core lean. Optional `satd --with-electrum` bundle mode covers Pi users who prefer a single process.
+A bundled-electrs companion solves install-friction but inherits the architectural costs of the two-process world: a duplicate RocksDB address-history index (~30-80 GB on a Pi at mainnet tip), parallel block re-scanning, and a reorg-window race where the Electrum view lags the chainstate. None of those go away by vendoring `electrs` alongside `satd`.
+
+Native + shared chainstate gives:
+
+- **One RocksDB instance.** Same WAL, same crash recovery, same backup target.
+- **No duplicate scriptPubKey scanning.** The address-history index is updated inside the existing `connect_block` / `disconnect_block` loop.
+- **Atomic reorg consistency.** The index update lives in the same `WriteBatch` as the chainstate update, so protocol handlers can never observe an index out of sync with the tip.
+- **Sub-millisecond index lookups.** Function calls, not RPC.
+
+That's the architectural claim worth making in the announcement. A bundled-electrs approach can't earn it.
+
+#### Why a single binary, not separate companion binaries (for v1)
+
+Originally this section proposed separate `sat-electrum` and `sat-esplora` companion binaries. Revisited: a single `satd` binary with feature flags is simpler to ship, package, document, and operate, and the failure-isolation arguments for separation are weaker than they look in modern Rust + tokio code with bounded subscription queues, request timeouts, and per-connection limits.
+
+Concretely:
+
+- **One systemd unit, one Docker image, one log stream, one PID.**
+- **One dbcache budget**, one memory allocator, no double-counting RAM.
+- **No RocksDB-secondary-mode coordination problem** — RocksDB doesn't allow concurrent writers; secondary-mode read-only access works but adds lag and schema-coordination headaches.
+- **Feature flags address the "don't pay for what you don't use" concern.** `cargo build --no-default-features` produces a lean consensus-only binary; default build includes both protocols.
+
+The case for separation gets stronger if Electrum subscriptions turn out to be the dominant memory pressure point in production (mobile wallets subscribing to thousands of scripthashes). Mitigation in v1: bounded subscription cap, per-connection memory accounting, easily-flippable feature flag. If pressure becomes real, a v1.x companion-binary split is cheap because the workspace is already structured as library crates (see §4a).
+
+#### Future split into companion binaries (v2)
+
+If operational data demands process isolation in v2 — e.g. Electrum subscription RAM pressure competing with UTXO cache, or a desire for tighter security boundaries on Tor-exposed protocol surfaces — the workspace structure supports adding `sat-electrum` and `sat-esplora` companion binaries that open the RocksDB datadir in **secondary mode** (read-only with WAL replay). Same library code, different deployment shape. v1.x release, not a rewrite.
+
+This is explicitly deferred. Single-binary v1 is the simpler thing.
+
+### 4a. Implementation strategy for Electrum + Esplora
+
+#### Vendor electrs's protocol code, write the index ourselves
+
+Neither romanz/electrs nor Blockstream/electrs is published as a usable library: romanz's internal modules are private (`mod`, not `pub mod`), Blockstream's is `pub mod` but git-only and never API-stable. In both, RocksDB access is hardcoded — there is no `Store` trait we could implement against satd's chainstate. The literal "import as crates" approach doesn't exist.
+
+The realistic path is to **vendor specific source files** from romanz/electrs (MIT licensed, with attribution and license headers preserved) for the well-tested wire protocol layer, and write the index ourselves against satd's RocksDB. Vendor-worthy files (~1500 LOC total):
+
+- `electrum.rs` — Electrum wire-protocol parsing + JSON-RPC method dispatch.
+- `status.rs` — subscription state machine (`ScriptHashStatus`).
+- `merkle.rs` — Electrum merkle-proof construction.
+- `types.rs` — wire types.
+
+Refactor their `Index` dependency from a concrete type to a small trait we own (~4-5 methods: `funding_for(scripthash)`, `spending_for(scripthash)`, `txids_at(height)`, `header_at(height)`, plus mempool variants).
+
+Esplora REST handlers are a smaller protocol — no upstream borrow needed. Direct handler implementation against the same `Index` trait.
+
+#### Workspace structure
+
+Build the code as library crates so binary count is a packaging decision, not an architectural one:
+
+- `node-index` — address-history index over RocksDB. The load-bearing crate; both protocols depend on it.
+- `electrum-proto` — vendored Electrum protocol layer, depends on the `Index` trait from `node-index`.
+- `esplora-handlers` — Esplora REST handlers, depends on the same `Index` trait.
+- `satd` (binary) — pulls in all three behind feature flags (`electrum`, `esplora`).
+
+Future companion binaries (`sat-electrum`, `sat-esplora` per §4 above) reuse the same library crates with thin `main.rs` shells.
+
+#### Effort estimate
+
+Roughly comparable to a milestone, parallelizable across the two protocols once the index lands:
+
+- **Address-history index** (`node-index` crate): ~3-5 weeks. Column-family layout, IBD-time backfill, online maintenance on connect / disconnect, reorg correctness, mempool tracking. Real consensus-adjacent infrastructure that needs the same shadow-validation rigor as block storage.
+- **Esplora REST** (native, `esplora-handlers` crate): ~4-8 weeks on top of the index.
+- **Electrum** (vendored protocol code, `electrum-proto` crate): ~3-5 weeks of vendoring + adaptation, parallelizable with Esplora.
+
+Total: ~10-15 weeks for both protocols, much of it parallelizable. Compares favorably to ~12-16 weeks for full Electrum reimplementation alone.
+
+#### Alternatives considered and rejected
+
+- **Bundle electrs as a `sat-electrum` companion binary.** Marginal user-visible UX delta over separately-installed electrs (one install vs. two; auto-wired defaults). Does *not* fix the duplicate-index, parallel-block-rescan, or reorg-race problems — those are architectural, not packaging. Doesn't earn the headline.
+- **Fork Blockstream/electrs and swap the storage layer.** ~4-6 weeks Electrum-only, ~8-10 with Esplora REST kept working. Inherits Blockstream's three-DB layout, bincode rows, and Liquid feature flags. Larger surface to maintain forever; less clean conceptually than vendoring just the protocol layer.
+- **Full reimplementation of Electrum protocol.** ~12-16 weeks. Defensible but pays the cost of re-deriving well-tested wire-protocol parsing for no gain over vendoring.
 
 ### 5. Raspberry Pi ergonomics
 
@@ -137,19 +207,22 @@ Six items to gate the first packager-friendly tag on:
 Rough dependency order (not a milestone plan — only what blocks what):
 
 1. **AssumeUTXO** (already planned) — unlocks realistic Pi deployment.
-2. **Packager-ready gate items** — infrastructure every integration rides on.
-3. **BIP 157/158 P2P service** — cheapest mobile integration surface, also a general Bitcoin-network good citizen.
-4. **Electrum protocol integration** (bundled `electrs` / `Fulcrum`, or native `sat-electrum`) — largest mobile-wallet unlock.
-5. **Esplora REST** — BDK ecosystem.
-6. **Silent Payments index + push notifications** — advanced mobile-specific capabilities that require server-side state.
-7. *(Deferred)* **LND-compatible gRPC** if LN focus becomes a priority.
+2. **Address-history index** (`node-index` crate) — load-bearing prerequisite for both Electrum and Esplora. Updated inside `connect_block` / `disconnect_block` for atomic reorg consistency.
+3. **Esplora REST** (native handlers over the index) — BDK + Mutiny ecosystem. Smaller protocol surface than Electrum; suitable to own end-to-end.
+4. **Electrum protocol** (vendored protocol code over the same index) — BlueWallet, Nunchuk, Sparrow, hardware-wallet coordinator ecosystem. Parallelizable with Esplora.
+5. **Packager-ready gate items** — infrastructure every integration rides on.
+6. **BIP 157/158 P2P service** — general Bitcoin-network good citizen, alternate path for embedded-Neutrino mobile wallets (Zeus-embedded, Blixt).
+7. **Silent Payments index + push notifications** — advanced mobile-specific capabilities. The SP index rides on the same scan-every-output infrastructure as the address-history index.
+8. *(Deferred)* **LND-compatible gRPC** if LN focus becomes a priority.
 
 ---
 
 ## Open questions
 
-- Native `sat-electrum` vs. bundling `electrs` / `Fulcrum` — long-term maintenance vs. short-term leverage.
+- Address-history index column-family layout — single CF keyed by `(scripthash, height, txid_prefix)` vs. romanz's three-CF (`funding`, `spending`, `txid`) split vs. Blockstream's bincode-row layout. Tradeoffs: lookup latency, write amplification, reorg-undo simplicity.
+- Address index opt-in vs. on-by-default — disk overhead is non-trivial on Pi deployments. Behind `-index=address` flag, or always-on when the relevant feature flag is compiled in?
+- AssumeUTXO interaction with the address-history index — does AssumeUTXO bootstrap the index too, or do users accept a post-AssumeUTXO backfill before Electrum / Esplora become useful?
 - Signed AssumeUTXO snapshot distribution — signing key policy, CDN choice, update cadence.
 - Do we sponsor or upstream satd-specific presets to an existing mobile wallet (Nunchuk, BlueWallet) vs. being a pure server?
 - Non-Tor cloud-accessible deployment path (HTTPS reverse proxy, Tailscale, mutual-TLS) — do we support it or intentionally de-emphasize in favor of Tor-first?
-- Silent Payments index: do we design it as part of satd core, as a separate `sat-index` companion, or rely on an upstream like `sp-electrs`?
+- Silent Payments index: built on top of the address-history index infrastructure, or as a parallel index? (Likely the former, given they share the same scan-every-output shape.)
