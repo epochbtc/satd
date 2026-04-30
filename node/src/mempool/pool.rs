@@ -978,6 +978,7 @@ mod tests {
             AssumeValid::Disabled,
             450,
         4,
+        Default::default(),
         )
         .unwrap();
         let mp = Mempool::new(1_000_000, 0); // 1MB, no min fee for tests
@@ -1091,6 +1092,7 @@ mod tests {
             AssumeValid::Disabled,
             450,
         4,
+        Default::default(),
         )
         .unwrap();
 

@@ -79,7 +79,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("satd-sync-test-{}", std::process::id()));
         let store = Box::new(InMemoryStore::new());
         let flat_files = FlatFileManager::new(&dir.join("blocks")).unwrap();
-        let cs = ChainState::new(store, flat_files, Network::Regtest, Box::new(NoopVerifier), AssumeValid::Disabled, 450, 4).unwrap();
+        let cs = ChainState::new(store, flat_files, Network::Regtest, Box::new(NoopVerifier), AssumeValid::Disabled, 450, 4, Default::default()).unwrap();
 
         let locator = build_locator(&cs);
         assert!(!locator.is_empty());
@@ -111,6 +111,7 @@ mod tests {
             AssumeValid::Disabled,
             450,
         4,
+        Default::default(),
         )
         .unwrap();
 
@@ -206,6 +207,7 @@ mod tests {
             AssumeValid::Disabled,
             450,
         4,
+        Default::default(),
         )
         .unwrap();
 

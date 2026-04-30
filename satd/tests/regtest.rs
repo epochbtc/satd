@@ -3770,3 +3770,35 @@ fn get_rpc_u64_from_json(node: &TestNode, method: &str, key: &str) -> Option<u64
     r["result"][key].as_u64()
 }
 
+// ── Address-history index (M2 integration smoke tests) ────────────────
+
+/// satd must accept `--addressindex=0` and continue to function normally.
+/// Lightweight smoke for the M2 runtime opt-out flag.
+#[test]
+fn test_address_index_disabled_flag_accepted() {
+    let mut node = TestNode::start(&["--addressindex=0"]);
+    let r = node.rpc_call("getblockchaininfo").expect("rpc");
+    assert!(r["result"]["chain"].as_str().is_some());
+    node.stop();
+}
+
+/// `-noindex=address` is the Bitcoin-Core-compatible alias for
+/// `--addressindex=0`. Verifies `translate_index_aliases` runs in the
+/// startup pipeline and the node accepts the spelling.
+#[test]
+fn test_address_index_noindex_alias_accepted() {
+    let mut node = TestNode::start(&["-noindex=address"]);
+    let r = node.rpc_call("getblockchaininfo").expect("rpc");
+    assert!(r["result"]["chain"].as_str().is_some());
+    node.stop();
+}
+
+/// satd must accept `--addressindex=1` (explicit on, the default).
+#[test]
+fn test_address_index_enabled_flag_accepted() {
+    let mut node = TestNode::start(&["--addressindex=1"]);
+    let r = node.rpc_call("getblockchaininfo").expect("rpc");
+    assert!(r["result"]["chain"].as_str().is_some());
+    node.stop();
+}
+

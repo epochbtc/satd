@@ -140,6 +140,9 @@ pub struct ConnectParams<'a> {
     pub num_threads: usize,
     /// Pre-computed txids from prefetch. Avoids rehashing all transactions.
     pub precomputed_txids: Option<&'a [bitcoin::Txid]>,
+    /// Address-history index runtime config. When `enabled`, the per-output
+    /// and per-input loops emit rows into the StoreBatch's `addr_*` vectors.
+    pub address_index: &'a crate::index::address::AddressIndexConfig,
 }
 
 pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError> {
@@ -147,12 +150,14 @@ pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError>
         store, block, height, parent_chainwork, flat_pos,
         script_verifier, median_time_past, network,
         pre_verified_txs, num_threads, precomputed_txids,
+        address_index,
     } = params;
     let store: &dyn Store = *store;
     let script_verifier: &dyn ScriptVerifier = *script_verifier;
     let height = *height;
     let median_time_past = *median_time_past;
     let network = *network;
+    let address_index: &crate::index::address::AddressIndexConfig = address_index;
     let num_threads = *num_threads;
     let flat_pos = *flat_pos;
     let block_hash = block.block_hash();
@@ -337,6 +342,20 @@ pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError>
                 });
 
                 batch.coin_removes.push((outpoint, coin.amount, coin.height));
+
+                // Address-history index: spending row, atomic with the
+                // chainstate update via the same StoreBatch (see
+                // ADDRESS_INDEX.md §"Integration with connect_block /
+                // disconnect_block"). No-op when the index is disabled.
+                crate::index::address::emit_spending(
+                    &mut batch,
+                    address_index,
+                    height,
+                    txid,
+                    in_idx as u32,
+                    &coin,
+                    outpoint,
+                );
             }
 
             // Sum outputs
@@ -377,6 +396,16 @@ pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError>
                 };
                 intra_block_coins.insert(outpoint, coin.clone());
                 batch.coin_puts.push((outpoint, coin));
+
+                // Address-history index: funding row.
+                crate::index::address::emit_funding(
+                    &mut batch,
+                    address_index,
+                    height,
+                    txid,
+                    vout as u32,
+                    output,
+                );
             }
         }
 
@@ -511,6 +540,7 @@ mod tests {
             pre_verified_txs: None,
             num_threads: 1,
             precomputed_txids: None,
+            address_index: &Default::default(),
         }).unwrap();
 
         // Genesis coinbase should NOT be in coin_puts
@@ -687,6 +717,7 @@ mod tests {
             pre_verified_txs: None,
             num_threads: 1,
             precomputed_txids: None,
+            address_index: &Default::default(),
         });
         assert!(result.is_ok());
     }
@@ -708,6 +739,7 @@ mod tests {
             pre_verified_txs: None,
             num_threads: 1,
             precomputed_txids: None,
+            address_index: &Default::default(),
         });
         assert!(matches!(result, Err(ConnectError::SequenceLockNotMet)));
     }
@@ -729,6 +761,7 @@ mod tests {
             pre_verified_txs: None,
             num_threads: 1,
             precomputed_txids: None,
+            address_index: &Default::default(),
         });
         assert!(result.is_ok());
     }
@@ -750,6 +783,7 @@ mod tests {
             pre_verified_txs: None,
             num_threads: 1,
             precomputed_txids: None,
+            address_index: &Default::default(),
         });
         assert!(result.is_ok());
     }
@@ -771,6 +805,7 @@ mod tests {
             pre_verified_txs: None,
             num_threads: 1,
             precomputed_txids: None,
+            address_index: &Default::default(),
         });
         assert!(result.is_ok());
     }
@@ -794,6 +829,7 @@ mod tests {
             pre_verified_txs: None,
             num_threads: 1,
             precomputed_txids: None,
+            address_index: &Default::default(),
         });
         assert!(result.is_ok());
     }
@@ -815,6 +851,7 @@ mod tests {
             pre_verified_txs: None,
             num_threads: 1,
             precomputed_txids: None,
+            address_index: &Default::default(),
         });
         assert!(matches!(result, Err(ConnectError::LocktimeNotFinal)));
     }
@@ -836,6 +873,7 @@ mod tests {
             pre_verified_txs: None,
             num_threads: 1,
             precomputed_txids: None,
+            address_index: &Default::default(),
         });
         assert!(matches!(result, Err(ConnectError::LocktimeNotFinal)));
     }
@@ -857,6 +895,7 @@ mod tests {
             pre_verified_txs: None,
             num_threads: 1,
             precomputed_txids: None,
+            address_index: &Default::default(),
         });
         assert!(result.is_ok());
     }
@@ -885,6 +924,7 @@ mod tests {
             pre_verified_txs: None,
             num_threads: 1,
             precomputed_txids: None,
+            address_index: &Default::default(),
         });
         assert!(matches!(result, Err(ConnectError::MissingOrSpentInput)));
     }
@@ -906,6 +946,7 @@ mod tests {
             pre_verified_txs: None,
             num_threads: 1,
             precomputed_txids: None,
+            address_index: &Default::default(),
         });
         assert!(matches!(result, Err(ConnectError::PrematureCoinbaseSpend)));
     }
@@ -927,6 +968,7 @@ mod tests {
             pre_verified_txs: None,
             num_threads: 1,
             precomputed_txids: None,
+            address_index: &Default::default(),
         });
         assert!(result.is_ok());
     }
@@ -1000,6 +1042,7 @@ mod tests {
             pre_verified_txs: None,
             num_threads: 1,
             precomputed_txids: None,
+            address_index: &Default::default(),
         });
         assert!(result.is_ok(), "BIP68 time lock should be met, got {:?}", result.err());
     }
@@ -1062,6 +1105,7 @@ mod tests {
             pre_verified_txs: None,
             num_threads: 1,
             precomputed_txids: None,
+            address_index: &Default::default(),
         });
         assert!(
             matches!(result, Err(ConnectError::SequenceLockNotMet)),
@@ -1136,6 +1180,7 @@ mod tests {
             pre_verified_txs: None,
             num_threads: 1,
             precomputed_txids: None,
+            address_index: &Default::default(),
         });
         assert!(
             matches!(result, Err(ConnectError::BadCoinbaseValue)),
@@ -1231,6 +1276,7 @@ mod tests {
             pre_verified_txs: None,
             num_threads: 1,
             precomputed_txids: None,
+            address_index: &Default::default(),
         });
         assert!(result.is_ok(), "Intra-block spending should succeed, got {:?}", result.err());
     }
@@ -1252,6 +1298,7 @@ mod tests {
             pre_verified_txs: None,
             num_threads: 1,
             precomputed_txids: None,
+            address_index: &Default::default(),
         });
         assert!(result.is_ok(), "BIP 34 correct height should pass, got {:?}", result.err());
     }
@@ -1321,6 +1368,7 @@ mod tests {
             pre_verified_txs: None,
             num_threads: 1,
             precomputed_txids: None,
+            address_index: &Default::default(),
         });
         assert!(
             matches!(result, Err(ConnectError::BadCoinbaseHeight)),
@@ -1394,6 +1442,7 @@ mod tests {
             pre_verified_txs: None,
             num_threads: 1,
             precomputed_txids: None,
+            address_index: &Default::default(),
         });
         assert!(
             matches!(result, Err(ConnectError::BadAmounts)),
@@ -1419,6 +1468,7 @@ mod tests {
             pre_verified_txs: None,
             num_threads: 1,
             precomputed_txids: None,
+            address_index: &Default::default(),
         })
         .unwrap();
 
@@ -1534,6 +1584,7 @@ mod tests {
             pre_verified_txs: None,
             num_threads: 1,
             precomputed_txids: None,
+            address_index: &Default::default(),
         });
         assert!(
             result.is_ok(),
@@ -1573,6 +1624,7 @@ mod tests {
             pre_verified_txs: None,
             num_threads: 1,
             precomputed_txids: None,
+            address_index: &Default::default(),
         });
         assert!(
             result.is_ok(),
@@ -1607,6 +1659,7 @@ mod tests {
             pre_verified_txs: None,
             num_threads: 1,
             precomputed_txids: None,
+            address_index: &Default::default(),
         });
         assert!(
             result.is_ok(),
@@ -1649,5 +1702,134 @@ mod tests {
             Some(0x01020304),
             "5-byte push should decode height from first 4 bytes (larger value)",
         );
+    }
+
+    // ── Address-history index integration (M2) ────────────────────────
+
+    #[test]
+    fn test_address_index_connect_emits_funding_for_each_output() {
+        // Every non-genesis output flows through emit_funding. Spending
+        // tx with one output + coinbase with one output = 2 funding rows.
+        let (store, outpoint, _) = make_test_store_with_coin(0, false);
+        let block = make_block_spending(outpoint, 1, 2, 0xffff_ffff, 0);
+        let cfg = crate::index::address::AddressIndexConfig::default();
+
+        let batch = connect_block(&ConnectParams {
+            store: &store,
+            block: &block,
+            height: 1,
+            parent_chainwork: &[0u8; 32],
+            flat_pos: default_pos(),
+            script_verifier: &NoopVerifier,
+            median_time_past: 0,
+            network: Network::Regtest,
+            pre_verified_txs: None,
+            num_threads: 1,
+            precomputed_txids: None,
+            address_index: &cfg,
+        })
+        .unwrap();
+
+        assert_eq!(
+            batch.addr_funding_puts.len(),
+            2,
+            "expected 2 funding rows (coinbase output + spending tx output)"
+        );
+        // Every funding row's height must be the block height.
+        for row in &batch.addr_funding_puts {
+            assert_eq!(row.height, 1);
+        }
+    }
+
+    #[test]
+    fn test_address_index_connect_emits_spending_for_each_input() {
+        // Spending tx has one input -> one spending row. Coinbase
+        // doesn't count.
+        let (store, outpoint, _) = make_test_store_with_coin(0, false);
+        let block = make_block_spending(outpoint, 1, 2, 0xffff_ffff, 0);
+        let cfg = crate::index::address::AddressIndexConfig::default();
+
+        let batch = connect_block(&ConnectParams {
+            store: &store,
+            block: &block,
+            height: 1,
+            parent_chainwork: &[0u8; 32],
+            flat_pos: default_pos(),
+            script_verifier: &NoopVerifier,
+            median_time_past: 0,
+            network: Network::Regtest,
+            pre_verified_txs: None,
+            num_threads: 1,
+            precomputed_txids: None,
+            address_index: &cfg,
+        })
+        .unwrap();
+
+        assert_eq!(batch.addr_spending_puts.len(), 1);
+        let row = &batch.addr_spending_puts[0];
+        assert_eq!(row.height, 1);
+        assert_eq!(row.prev_outpoint, outpoint);
+    }
+
+    #[test]
+    fn test_address_index_connect_disabled_emits_no_rows() {
+        let (store, outpoint, _) = make_test_store_with_coin(0, false);
+        let block = make_block_spending(outpoint, 1, 2, 0xffff_ffff, 0);
+        let disabled = crate::index::address::AddressIndexConfig {
+            enabled: false,
+            ..Default::default()
+        };
+
+        let batch = connect_block(&ConnectParams {
+            store: &store,
+            block: &block,
+            height: 1,
+            parent_chainwork: &[0u8; 32],
+            flat_pos: default_pos(),
+            script_verifier: &NoopVerifier,
+            median_time_past: 0,
+            network: Network::Regtest,
+            pre_verified_txs: None,
+            num_threads: 1,
+            precomputed_txids: None,
+            address_index: &disabled,
+        })
+        .unwrap();
+
+        assert!(batch.addr_funding_puts.is_empty());
+        assert!(batch.addr_spending_puts.is_empty());
+    }
+
+    #[test]
+    fn test_address_index_connect_genesis_emits_no_funding() {
+        // Genesis coinbase output is intentionally not added to the UTXO
+        // set (line 366 in connect_block: `if !is_genesis || !is_coinbase`).
+        // The address-index emission lives inside that gate, so genesis
+        // must not produce a funding row either.
+        let store = InMemoryStore::new();
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+        let cfg = crate::index::address::AddressIndexConfig::default();
+
+        let batch = connect_block(&ConnectParams {
+            store: &store,
+            block: &genesis,
+            height: 0,
+            parent_chainwork: &[0u8; 32],
+            flat_pos: default_pos(),
+            script_verifier: &NoopVerifier,
+            median_time_past: 0,
+            network: Network::Regtest,
+            pre_verified_txs: None,
+            num_threads: 1,
+            precomputed_txids: None,
+            address_index: &cfg,
+        })
+        .unwrap();
+
+        assert!(
+            batch.addr_funding_puts.is_empty(),
+            "genesis coinbase must not emit a funding row (matches UTXO-set exclusion)"
+        );
+        assert!(batch.addr_spending_puts.is_empty());
     }
 }
