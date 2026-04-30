@@ -57,6 +57,14 @@ impl MempoolAddrIndex {
             .unwrap_or_default()
     }
 
+    /// Scripthashes that `txid` touches (funding outputs + spending
+    /// resolved inputs). Empty if the txid isn't known to the index.
+    /// Used by the notifier (M5) to narrow status-hash recomputation
+    /// to only the scripthashes the touched tx affected.
+    pub fn scripthashes_for(&self, txid: &Txid) -> Vec<Scripthash> {
+        self.by_txid.get(txid).cloned().unwrap_or_default()
+    }
+
     /// Signed unconfirmed delta in satoshis for `sh`. 0 if the
     /// scripthash has no mempool entries.
     pub fn delta(&self, sh: &Scripthash) -> i64 {

@@ -14,6 +14,8 @@ pub mod emit;
 pub mod keys;
 pub mod lookups;
 pub mod mempool;
+pub mod notifier;
+pub mod subscribe;
 pub mod trait_def;
 pub mod types;
 
@@ -27,5 +29,7 @@ pub use keys::{
 };
 pub use lookups::RocksAddressIndex;
 pub use mempool::{MempoolAddrIndex, mempool_index_task};
+pub use notifier::notifier_task;
+pub use subscribe::{SubscribeError, SubscriptionRegistry, status_hash};
 pub use trait_def::AddressIndex;
 pub use types::{HistoryEntry, IndexError, MempoolHistoryEntry, StatusUpdate, Utxo};

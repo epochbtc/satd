@@ -5,12 +5,16 @@
 use std::sync::{Arc, RwLock};
 
 use bitcoin::OutPoint;
+use tokio::sync::broadcast;
 
 use crate::index::address::config::AddressIndexConfig;
 use crate::index::address::keys::Scripthash;
 use crate::index::address::mempool::MempoolAddrIndex;
+use crate::index::address::subscribe::{SubscribeError, SubscriptionRegistry};
 use crate::index::address::trait_def::AddressIndex;
-use crate::index::address::types::{HistoryEntry, IndexError, MempoolHistoryEntry, Utxo};
+use crate::index::address::types::{
+    HistoryEntry, IndexError, MempoolHistoryEntry, StatusUpdate, Utxo,
+};
 use crate::storage::Store;
 
 /// `AddressIndex` over a chainstate `Store`. The store iterator returns
@@ -28,14 +32,22 @@ pub struct RocksAddressIndex {
     /// (M4); reads merge into `mempool_history` and the unconfirmed
     /// component of `balance`.
     mempool: Arc<RwLock<MempoolAddrIndex>>,
+    /// Subscription registry. Populated lazily so test harnesses
+    /// without a tokio runtime can construct a working trait impl.
+    subs: Arc<SubscriptionRegistry>,
 }
 
 impl RocksAddressIndex {
     pub fn new(store: Arc<dyn Store>, cfg: AddressIndexConfig) -> Self {
+        let subs = Arc::new(SubscriptionRegistry::new(
+            cfg.max_subscriptions,
+            cfg.per_channel_capacity,
+        ));
         Self {
             store,
             cfg,
             mempool: Arc::new(RwLock::new(MempoolAddrIndex::new())),
+            subs,
         }
     }
 
@@ -47,13 +59,29 @@ impl RocksAddressIndex {
         cfg: AddressIndexConfig,
         mempool: Arc<RwLock<MempoolAddrIndex>>,
     ) -> Self {
-        Self { store, cfg, mempool }
+        let subs = Arc::new(SubscriptionRegistry::new(
+            cfg.max_subscriptions,
+            cfg.per_channel_capacity,
+        ));
+        Self {
+            store,
+            cfg,
+            mempool,
+            subs,
+        }
     }
 
     /// Get the shared mempool-index handle so the background task can
     /// share writes with read-side queries.
     pub fn mempool_index_handle(&self) -> Arc<RwLock<MempoolAddrIndex>> {
         self.mempool.clone()
+    }
+
+    /// Get the shared subscription registry so the M5 notifier task
+    /// can fire status updates on the same channels that subscribers
+    /// hold receivers for.
+    pub fn subscription_registry(&self) -> Arc<SubscriptionRegistry> {
+        self.subs.clone()
     }
 
     fn check_enabled(&self) -> Result<(), IndexError> {
@@ -171,6 +199,13 @@ impl AddressIndex for RocksAddressIndex {
             }
         }
         Ok(out)
+    }
+
+    fn subscribe(
+        &self,
+        sh: Scripthash,
+    ) -> Result<broadcast::Receiver<StatusUpdate>, SubscribeError> {
+        self.subs.subscribe(sh)
     }
 }
 

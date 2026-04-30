@@ -3970,6 +3970,18 @@ fn test_address_index_scripthash_param_form() {
     node.stop();
 }
 
+// ── Address-history index — subscriptions flag (M5) ───────────────────
+
+/// satd must accept `--addrindexsubscriptions=N` and continue to
+/// function normally. Smoke for the M5 subscription-cap flag.
+#[test]
+fn test_address_index_subscriptions_flag_accepted() {
+    let mut node = TestNode::start(&["--addrindexsubscriptions=2500"]);
+    let r = node.rpc_call("getblockchaininfo").expect("rpc");
+    assert!(r["result"]["chain"].as_str().is_some());
+    node.stop();
+}
+
 // ── Address-history index — mempool variant (M4) ──────────────────────
 
 /// With no mempool txs, `getaddressbalance.unconfirmed` is 0 even

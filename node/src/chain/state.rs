@@ -176,6 +176,13 @@ pub struct ChainState {
     /// chain_state for UTXO lookups). When unset (test backends),
     /// the reorg re-add path is a no-op.
     mempool: std::sync::OnceLock<std::sync::Arc<crate::mempool::pool::Mempool>>,
+    /// Chain-event broadcaster. Populated via `set_chain_event_sender`;
+    /// consumed by the address-index notifier task (M5) and any
+    /// future observability subscribers. Test backends that don't
+    /// need chain notifications skip the wiring; emit is a no-op.
+    chain_event_tx: std::sync::Mutex<
+        Option<tokio::sync::broadcast::Sender<crate::chain::events::ChainEvent>>,
+    >,
 }
 
 impl ChainState {
@@ -252,6 +259,7 @@ impl ChainState {
                     reorg_log: std::sync::OnceLock::new(),
                     warnings: std::sync::Arc::new(crate::warnings::NodeWarnings::new()),
                     mempool: std::sync::OnceLock::new(),
+                    chain_event_tx: std::sync::Mutex::new(None),
                 });
             }
 
@@ -300,6 +308,7 @@ impl ChainState {
             reorg_log: std::sync::OnceLock::new(),
             warnings: std::sync::Arc::new(crate::warnings::NodeWarnings::new()),
             mempool: std::sync::OnceLock::new(),
+            chain_event_tx: std::sync::Mutex::new(None),
         })
     }
 
@@ -312,6 +321,38 @@ impl ChainState {
         mempool: std::sync::Arc<crate::mempool::pool::Mempool>,
     ) {
         let _ = self.mempool.set(mempool);
+    }
+
+    /// Wire a chain-event broadcaster. Called once at startup so the
+    /// address-index notifier (and any future observers) can subscribe
+    /// to BlockConnected / BlockDisconnected notifications. Mirrors
+    /// `Mempool::set_event_sender` to keep the wiring shape uniform.
+    pub fn set_chain_event_sender(
+        &self,
+        tx: tokio::sync::broadcast::Sender<crate::chain::events::ChainEvent>,
+    ) {
+        *self.chain_event_tx.lock().unwrap() = Some(tx);
+    }
+
+    /// Subscribe to live chain events. Returns `None` if no sender
+    /// has been wired (typical in tests).
+    pub fn subscribe_chain_events(
+        &self,
+    ) -> Option<tokio::sync::broadcast::Receiver<crate::chain::events::ChainEvent>> {
+        self.chain_event_tx
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|tx| tx.subscribe())
+    }
+
+    /// Emit a chain event. Best-effort: a slow consumer that misses
+    /// events sees `RecvError::Lagged`; emission never blocks the
+    /// connect/disconnect path.
+    fn emit_chain_event(&self, event: crate::chain::events::ChainEvent) {
+        if let Some(tx) = self.chain_event_tx.lock().unwrap().as_ref() {
+            let _ = tx.send(event);
+        }
     }
 
     /// Access the shared warnings surface. Always present; use to
@@ -1410,6 +1451,10 @@ impl ChainState {
                     }
                     reconnected_hashes.push(*side_hash);
                     reconnected_blocks.push((side_block, side_entry.height));
+                    self.emit_chain_event(crate::chain::events::ChainEvent::BlockConnected {
+                        hash: *side_hash,
+                        height: side_entry.height,
+                    });
                     tracing::info!(
                         height = side_entry.height,
                         hash = %side_hash,
@@ -1587,6 +1632,14 @@ impl ChainState {
         // Update MTP cache with this block's timestamp
         self.push_mtp_cache(new_height, block.header.time);
 
+        // Notify the address-index notifier (and any future
+        // observability subscribers) that a new tip is in place. Best-
+        // effort: emission never blocks the connect path.
+        self.emit_chain_event(crate::chain::events::ChainEvent::BlockConnected {
+            hash: block_hash,
+            height: new_height,
+        });
+
         tracing::info!(
             height = new_height,
             hash = %block_hash,
@@ -1711,6 +1764,11 @@ impl ChainState {
         // order without scrambling intra-block tx order — chained tx
         // graphs within a block need parents-before-children preserved.
         let mut disconnected_txs_by_block: Vec<Vec<bitcoin::Transaction>> = Vec::new();
+        // (hash, height) pairs for the disconnect chain-event emission.
+        // Captured during walk-back so we can emit in walk-back order
+        // after commit (matching the canonical "disconnect old → connect
+        // new" ordering Electrum/Esplora consumers expect).
+        let mut disconnected_with_height: Vec<(BlockHash, u32)> = Vec::new();
         let old_height = self
             .store
             .get_block_index(&old_tip)
@@ -1750,6 +1808,7 @@ impl ChainState {
             disconnected_txs_by_block.push(block_txs);
 
             disconnected_hashes.push(current);
+            disconnected_with_height.push((current, entry.height));
             tracing::info!(height = entry.height, hash = %current, "Block disconnected");
             current = prev_hash;
         }
@@ -1762,6 +1821,18 @@ impl ChainState {
             let mut tip = self.tip.write().unwrap();
             tip.hash = fork_hash;
             tip.height = fork_entry.height;
+        }
+
+        // Emit one BlockDisconnected per rolled-back block, in the
+        // walk-back order (newest disconnected first → fork-parent
+        // last). This matches the order in which the chain was
+        // actually rolled back — subscribers can iterate the diff
+        // top-down before seeing the reconnect events.
+        for (hash, height) in &disconnected_with_height {
+            self.emit_chain_event(crate::chain::events::ChainEvent::BlockDisconnected {
+                hash: *hash,
+                height: *height,
+            });
         }
 
         // Block order: walk reversed so oldest disconnected block comes
