@@ -1,3 +1,4 @@
+pub mod chain;
 pub mod help;
 pub mod ibd;
 pub mod mempool;
