@@ -169,15 +169,15 @@ Per-block work added: ~`(num_outputs + num_inputs) × sha256` plus the batch ent
 
 The disk-write overhead is the dominant cost — roughly +30-60% bytes-per-block written. Expected IBD wall-time impact on Pi 5: 10-25%. Will benchmark before declaring victory.
 
-### No separate backfill phase
+### No separate backfill phase as default
 
-Rejected: Bitcoin Core's `-reindex-chainstate` pattern where index becomes available only after a long post-IBD walk. Reasons:
+Rejected as the default path: Bitcoin Core's `-reindex-chainstate` pattern where index becomes available only after a long post-IBD walk. Reasons:
 - Doubles wall-clock time before protocols become useful.
 - Requires re-reading every block from flat files — IO-heavy on Pi.
 - Adds a "backfill in progress" state to operate / monitor.
 - Index-during-IBD pays the cost once, in the same pass as block validation.
 
-The one place backfill **does** matter: AssumeUTXO. See [Future / open questions](#future--open-questions).
+The one place backfill **does** matter is AssumeUTXO bootstrap, where pre-snapshot history is missing by construction. That case is handled by an opt-in deferred backfill — see [Deferred backfill (AssumeUTXO mitigation)](#deferred-backfill-assumeutxo-mitigation) below.
 
 ---
 
@@ -205,6 +205,108 @@ struct MempoolAddrIndex {
 ### Memory cost
 
 Bounded by `maxmempool` (default 300 MB). Index overhead ≈ scripthash count × (32 + small set). Empirically ~10-15% of mempool size in RAM. For default settings, ~30-45 MB. Acceptable.
+
+---
+
+## Deferred backfill (AssumeUTXO mitigation)
+
+AssumeUTXO bootstrap (`-assumeutxo=<height>`) skips IBD validation up to the snapshot height. The index-during-IBD strategy populates rows only for blocks the node validates — so a node that bootstrapped via AssumeUTXO has an index that covers heights `> snapshot_height` and a hole below it. Wallets scanning from a pre-snapshot birthday see incomplete history.
+
+The v1 mitigation: an **opt-in deferred backfill** that the operator triggers when convenient. The node remains usable with partial history during the backfill, which runs in background as a tokio task. This is the standard pattern (Bitcoin Core uses it for `tx_index` and `blockfilter_index`).
+
+### Trigger model
+
+- **Startup flag**: `-backfillindex=address` — starts the backfill on next launch. Compatible with Bitcoin Core's `-reindex` / `-reindex-chainstate` style.
+- **Runtime RPC**: `backfillindex "address"` — starts the backfill in background; returns immediately.
+- **Idempotent**: triggering while a backfill is already running is a no-op.
+
+### The technical challenge: resolving spent prev_outputs
+
+`addr_funding` rows are easy — every output's scriptPubKey is in its own block. `addr_spending` rows are hard: each input's spent scriptPubKey lives in an *earlier* block, and AssumeUTXO didn't leave us a historical UTXO state to consult.
+
+**Approach: two-pass walk with a temporary CF.**
+
+```
+Pass 1 (genesis → snapshot_height):
+  for each block:
+    for each tx, for each output:
+      write addr_funding row
+      write to temp CF: outpoint(txid, vout) → scripthash
+
+Pass 2 (genesis → snapshot_height):
+  for each block:
+    for each tx, for each non-coinbase input:
+      lookup scripthash in temp CF using input.previous_output
+      write addr_spending row
+  drop temp CF
+```
+
+Sequential reads + sequential writes per pass. RocksDB-friendly, no random IO into flat files.
+
+### Cost estimate
+
+- **Disk**: temp CF holds ~1.4B entries × ~40 B ≈ 56 GB during backfill, freed at end. Combined peak on a Pi 5: chain (~700 GB) + index (~150 GB) + temp (~56 GB) ≈ 906 GB. 1 TB SSD is workable; 512 GB requires the operator to wait until they've expanded storage.
+- **Time**: ~2× a normal IBD walk (two passes). Pi 5 from cold disk cache: 1.5-3 days. With existing prefetch + parallel hashing infrastructure, likely closer to 1.5.
+- **CPU / IO during backfill**: bounded — runs at lower priority than live block processing. Operators can `pauseindex address` if they need bandwidth.
+
+### Concurrency with live chain
+
+Disjoint write ranges, no conflict:
+- Backfill writes only to `addr_funding` / `addr_spending` rows at heights ≤ snapshot.
+- Live `connect_block` writes to those CFs at heights > current_tip (always > snapshot since we're past it).
+- RocksDB MVCC handles concurrent readers; protocol handlers querying during backfill see whatever rows exist and learn from `getindexinfo` that the index is incomplete.
+
+### Resumability + crash safety
+
+- Per-pass cursor in `metadata` CF: `addrindex.backfill.pass`, `addrindex.backfill.cursor_height`.
+- Each batch of K blocks (e.g. K=1000) writes its rows + advances the cursor in a single `WriteBatch`. WAL ensures atomicity.
+- On restart: read cursor, resume. If pass=1 was complete and pass=2 hadn't started, advance to pass=2.
+- On crash mid-batch: WAL replay rewinds to the last committed cursor; worst-case re-do K blocks of work.
+
+### Status reporting
+
+Mirror Bitcoin Core's `getindexinfo` shape:
+
+```json
+{
+  "address": {
+    "synced": false,
+    "best_block_height": 945123,
+    "backfill": {
+      "active": true,
+      "pass": 1,
+      "cursor_height": 412567,
+      "snapshot_height": 945000,
+      "estimated_remaining_seconds": 86400
+    }
+  }
+}
+```
+
+Estimate from blocks-per-minute over a sliding window. Logged hourly to journal so operators can see progress in `journalctl`.
+
+### Pause / resume / cancel
+
+- `pauseindex "address"` — sets a flag the backfill polls between batches; flushes cursor; exits cleanly.
+- `resumeindex "address"` — re-launches from cursor.
+- `cancelindex "address"` — pauses + drops temp CF + clears cursor. Backfill state gone; user re-triggers from scratch later.
+
+Useful ops scenarios: "I need IO bandwidth, pause" / "I'm low on disk, cancel and reschedule when I've added storage."
+
+### Operator user story
+
+For the AssumeUTXO operator path:
+
+1. Run satd with `-assumeutxo=N`. IBD completes in hours instead of days.
+2. Address index covers heights `> N` only. Electrum / Esplora endpoints work for recent activity. Wallets with post-N birthdays sync fully; wallets with earlier birthdays get a clear "history incomplete below height N" signal from `getindexinfo`.
+3. When ready, run `backfillindex address`. Takes ~1.5-3 days on a Pi 5. During that time the node serves correctly with partial history.
+4. On completion, `getindexinfo` reports `synced: true` and full pre-N history is available.
+
+This is honest, opt-in, and doesn't gate node usability behind a multi-day operation.
+
+### Future: targeted backfill
+
+A separate flavor — `backfillindex "address" --scripthashes=<file>` — that walks blocks once but only writes rows for scripts in a watch set. ~10-100× faster for users who know their addresses upfront (most wallets do, via xpub derivation). Deferred to v1.x: makes "point my new wallet at this node, scan from birthday" a one-shot operation rather than a multi-day rebuild.
 
 ---
 
@@ -297,7 +399,18 @@ Suggested ordering, ~3-5 weeks total. Each step is its own PR.
 - Compaction tuning (which CF should merge-on-write vs. point-lookup-tuned).
 - Documentation: tuning recommendations land in `OPERATOR_ERGONOMICS.md`.
 
-Total elapsed: ~3-5 weeks of focused work. M1-M3 are sequential; M4 can run partially in parallel with M3; M5-M6 are after the index is correct.
+### M7 — Deferred backfill (~1-1.5 weeks)
+
+- Backfill task: two-pass walk with temporary CF (`backfill_outpoint_to_scripthash`).
+- Per-pass cursor in metadata CF; resumable across restarts.
+- `-backfillindex=address` startup flag; `backfillindex "address"` RPC.
+- `pauseindex` / `resumeindex` / `cancelindex` RPCs.
+- `getindexinfo` RPC reporting backfill progress.
+- Concurrency with live chain (disjoint height ranges; smoke test under regtest).
+- Crash-safety test: kill -9 mid-backfill, restart, verify resume completes correctly.
+- AssumeUTXO interaction smoke test: bootstrap via AssumeUTXO at height N, run backfill, verify final index state matches a from-genesis-validated reference.
+
+Total elapsed: ~3-5 weeks for M1-M6 (the live index), plus ~1-1.5 weeks for M7 (the backfill). M7 can ship as a follow-up release if v1 launches before AssumeUTXO is heavily used.
 
 ---
 
@@ -327,17 +440,9 @@ Instead:
 
 ## Future / open questions
 
-### AssumeUTXO interaction
+### Signed index snapshots (v2 / v3)
 
-Snapshot bootstrap (`-assumeutxo=<height>`) skips IBD validation up to the snapshot height. The address index has no equivalent "trust this snapshot" path — pre-snapshot history is missing.
-
-Three options, none free:
-
-1. **Backfill on AssumeUTXO load**: walk every block from genesis to snapshot-height, build the index. Defeats the AssumeUTXO time saving; adds hours-to-days on Pi.
-2. **Truncated index**: index only covers post-snapshot blocks. Document clearly: "address index reflects blocks since snapshot height N." Acceptable for many wallets (they have a birthday); breaks others (legacy address recovery).
-3. **Signed index snapshot**: ship a signed `addr_funding.sst` + `addr_spending.sst` alongside the AssumeUTXO snapshot. Largest engineering effort; smallest user-visible cost.
-
-Initial v1 ships with option 2. Option 3 is the right long-term answer.
+The deferred backfill (above) covers the AssumeUTXO mitigation in v1, but pays the full ~1.5-3 day Pi cost when triggered. The long-term answer is to ship signed `addr_funding.sst` + `addr_spending.sst` files alongside the AssumeUTXO snapshot itself, so an operator who trusts the snapshot signature can `unzip` themselves directly to a complete index. Largest engineering effort (signing infrastructure, key policy, distribution CDN, snapshot update cadence, schema-version compatibility) for the smallest user-visible cost. Defer to v2 / v3 once the v1 backfill path proves out and operator demand justifies it.
 
 ### Silent Payments index
 
@@ -360,4 +465,7 @@ If we also ship BIP 157/158 (per `ECOSYSTEM.md` §3 ranked-leverage list), the s
 - **Per-scripthash precomputed balance accumulator** (above).
 - **Async write path** (index writes happen out-of-band of `connect_block`). Defeats the atomic-reorg-consistency promise and reintroduces the "index lags chainstate" race that we're explicitly avoiding by going native in the first place.
 - **Separate index process with RocksDB secondary mode.** Defers to v2 per `ECOSYSTEM.md` §4 — single binary first, split later if operational data demands it.
+- **Forced backfill on AssumeUTXO load.** Defeats the AssumeUTXO time saving by adding hours-to-days at the worst possible moment (first-launch, before the operator has any useful index either way). Replaced by opt-in deferred backfill — see [Deferred backfill (AssumeUTXO mitigation)](#deferred-backfill-assumeutxo-mitigation).
+- **Single-pass backfill via flat-file random reads.** Resolves spent prev_outputs by reading funding txs from flat files on demand. Simpler conceptually; catastrophic IO profile on Pi (random reads dominate). Two-pass with temp CF wins.
+- **Backfill that also populates `tx_index` as a side effect.** Persistent tx_index has its own value but should be its own opt-in feature, not coupled to the address index. Keep concerns separable.
 - **Bundled electrs as the index.** Architecturally rejected in `ECOSYSTEM.md` §4 — doesn't share chainstate, parallel block scanning, reorg race window. Doesn't earn the headline.
