@@ -8,6 +8,9 @@ pub mod undo;
 
 use bitcoin::{BlockHash, OutPoint, Txid};
 
+use crate::index::address::{
+    AddrFundingKey, AddrFundingRow, AddrSpendingKey, AddrSpendingRow,
+};
 use crate::storage::blockindex::BlockIndexEntry;
 use crate::storage::coinview::Coin;
 use crate::storage::undo::UndoData;
@@ -35,6 +38,14 @@ pub struct StoreBatch {
     pub undo_puts: Vec<(BlockHash, UndoData)>,
     pub tx_index_puts: Vec<(Txid, BlockHash)>,
     pub tx_index_removes: Vec<Txid>,
+    /// Address-history index funding rows. Populated in M2.
+    pub addr_funding_puts: Vec<AddrFundingRow>,
+    /// Address-history index spending rows. Populated in M2.
+    pub addr_spending_puts: Vec<AddrSpendingRow>,
+    /// Address-history funding keys to remove (used by `disconnect_block`).
+    pub addr_funding_removes: Vec<AddrFundingKey>,
+    /// Address-history spending keys to remove (used by `disconnect_block`).
+    pub addr_spending_removes: Vec<AddrSpendingKey>,
 }
 
 impl StoreBatch {
@@ -51,6 +62,10 @@ impl StoreBatch {
         self.undo_puts.extend(other.undo_puts);
         self.tx_index_puts.extend(other.tx_index_puts);
         self.tx_index_removes.extend(other.tx_index_removes);
+        self.addr_funding_puts.extend(other.addr_funding_puts);
+        self.addr_spending_puts.extend(other.addr_spending_puts);
+        self.addr_funding_removes.extend(other.addr_funding_removes);
+        self.addr_spending_removes.extend(other.addr_spending_removes);
     }
 }
 

@@ -18,6 +18,8 @@ const CF_HEIGHT_INDEX: &str = "height_index";
 const CF_UNDO: &str = "undo";
 const CF_TX_INDEX: &str = "tx_index";
 const CF_METADATA: &str = "metadata";
+const CF_ADDR_FUNDING: &str = "addr_funding";
+const CF_ADDR_SPENDING: &str = "addr_spending";
 
 const TIP_KEY: &[u8] = b"tip";
 const UTXO_COUNT_KEY: &[u8] = b"utxo_count";
@@ -129,6 +131,12 @@ impl RocksDbStore {
             ColumnFamilyDescriptor::new(CF_UNDO, make_cf_opts(false, 16)),
             ColumnFamilyDescriptor::new(CF_TX_INDEX, make_cf_opts(false, 16)),
             ColumnFamilyDescriptor::new(CF_METADATA, make_cf_opts(false, 2)),
+            // Address-history index. Bloom on so point lookups for
+            // "is this scripthash known" are fast; 32 MB write-buffer
+            // because the per-block emission is write-heavy during IBD.
+            // Prefix-extractor and tuning will be applied in M3 / M6.
+            ColumnFamilyDescriptor::new(CF_ADDR_FUNDING, make_cf_opts(true, 32)),
+            ColumnFamilyDescriptor::new(CF_ADDR_SPENDING, make_cf_opts(true, 32)),
         ];
 
         let db = DB::open_cf_descriptors(&db_opts, &db_path, cf_descriptors).map_err(|e| {
@@ -197,9 +205,12 @@ impl RocksDbStore {
 
     /// Build column family options for (re)creation.
     fn cf_options(&self, name: &str) -> Options {
-        let is_coins = name == CF_COINS;
+        // Bloom-filtered CFs are those that see point-lookups in
+        // hot paths (UTXO + address-index reads).
+        let bloom = matches!(name, CF_COINS | CF_ADDR_FUNDING | CF_ADDR_SPENDING);
         let write_buf_mb = match name {
             CF_COINS => 64,
+            CF_ADDR_FUNDING | CF_ADDR_SPENDING => 32,
             CF_UNDO | CF_TX_INDEX => 16,
             CF_BLOCK_INDEX | CF_HEIGHT_INDEX => 8,
             _ => 2,
@@ -222,7 +233,7 @@ impl RocksDbStore {
         table_opts.set_cache_index_and_filter_blocks(true);
         table_opts.set_pin_l0_filter_and_index_blocks_in_cache(true);
         table_opts.set_format_version(5);
-        if is_coins {
+        if bloom {
             table_opts.set_bloom_filter(10.0, false);
             table_opts.set_whole_key_filtering(true);
         }
@@ -383,6 +394,35 @@ impl Store for RocksDbStore {
             }
             for txid in &batch.tx_index_removes {
                 wb.delete_cf(&cf_txi, txid_bytes(txid));
+            }
+        }
+
+        // Address-history index. CFs are present unconditionally —
+        // gating on emit-side (M2) keeps the write_batch path simple.
+        // Empty-batch fast-path avoids touching the CF handles when
+        // the index is disabled or the block had no relevant rows.
+        if !batch.addr_funding_puts.is_empty() || !batch.addr_funding_removes.is_empty() {
+            let cf_af = self.cf(CF_ADDR_FUNDING);
+            for row in &batch.addr_funding_puts {
+                let key = crate::index::address::encode_funding_key(&row.key());
+                let value = crate::index::address::encode_funding_value(row.amount_sat);
+                wb.put_cf(&cf_af, key, value);
+            }
+            for key in &batch.addr_funding_removes {
+                let encoded = crate::index::address::encode_funding_key(key);
+                wb.delete_cf(&cf_af, encoded);
+            }
+        }
+        if !batch.addr_spending_puts.is_empty() || !batch.addr_spending_removes.is_empty() {
+            let cf_as = self.cf(CF_ADDR_SPENDING);
+            for row in &batch.addr_spending_puts {
+                let key = crate::index::address::encode_spending_key(&row.key());
+                let value = crate::index::address::encode_spending_value(&row.prev_outpoint);
+                wb.put_cf(&cf_as, key, value);
+            }
+            for key in &batch.addr_spending_removes {
+                let encoded = crate::index::address::encode_spending_key(key);
+                wb.delete_cf(&cf_as, encoded);
             }
         }
 
@@ -870,5 +910,107 @@ mod tests {
         let hist = store.utxo_height_hist();
         assert_eq!(hist[0], 2); // two coins in bucket 0
         assert_eq!(hist[1], 1); // one coin in bucket 1
+    }
+
+    #[test]
+    fn test_address_index_cfs_created_on_open() {
+        let (store, _dir) = temp_store(false);
+        // CF handles must resolve. cf() panics on missing CF, so this
+        // exercises the descriptor registration path end-to-end.
+        let _af = store.cf(CF_ADDR_FUNDING);
+        let _as_ = store.cf(CF_ADDR_SPENDING);
+    }
+
+    #[test]
+    fn test_address_index_cfs_persist_across_reopen() {
+        // Auto-creation should also be idempotent: reopening an
+        // existing datadir must not error and must keep the CFs.
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = RocksDbStore::open(dir.path(), false, 16, false).unwrap();
+            let _af = store.cf(CF_ADDR_FUNDING);
+        }
+        let store = RocksDbStore::open(dir.path(), false, 16, false).unwrap();
+        let _af = store.cf(CF_ADDR_FUNDING);
+        let _as_ = store.cf(CF_ADDR_SPENDING);
+    }
+
+    #[test]
+    fn test_address_index_write_batch_funding_put_then_read() {
+        use crate::index::address::{AddrFundingRow, encode_funding_key, encode_funding_value};
+
+        let (store, _dir) = temp_store(false);
+        let row = AddrFundingRow {
+            scripthash: [0xAB; 32],
+            height: 42,
+            txid: make_outpoint(0xCD, 0).txid,
+            vout: 7,
+            amount_sat: 123_456_789,
+        };
+
+        let mut batch = StoreBatch::default();
+        batch.addr_funding_puts.push(row.clone());
+        store.write_batch(batch).unwrap();
+
+        // Read directly via the encoded key — verifies the writer
+        // serialized exactly what the codec specifies.
+        let cf = store.cf(CF_ADDR_FUNDING);
+        let encoded = encode_funding_key(&row.key());
+        let raw = store.db.get_cf(&cf, encoded).unwrap().expect("row present");
+        assert_eq!(raw.as_slice(), encode_funding_value(row.amount_sat).as_slice());
+    }
+
+    #[test]
+    fn test_address_index_write_batch_spending_put_then_remove() {
+        use crate::index::address::{
+            AddrSpendingRow, encode_spending_key, encode_spending_value,
+        };
+
+        let (store, _dir) = temp_store(false);
+        let prev = make_outpoint(0xEE, 3);
+        let row = AddrSpendingRow {
+            scripthash: [0x10; 32],
+            height: 99,
+            txid: make_outpoint(0x55, 0).txid,
+            vin: 2,
+            prev_outpoint: prev,
+        };
+
+        // Put.
+        let mut batch = StoreBatch::default();
+        batch.addr_spending_puts.push(row.clone());
+        store.write_batch(batch).unwrap();
+
+        let cf = store.cf(CF_ADDR_SPENDING);
+        let encoded_key = encode_spending_key(&row.key());
+        let raw = store
+            .db
+            .get_cf(&cf, encoded_key)
+            .unwrap()
+            .expect("row present");
+        assert_eq!(
+            raw.as_slice(),
+            encode_spending_value(&row.prev_outpoint).as_slice()
+        );
+
+        // Remove via the same key. Round-trips the deletion path used
+        // by `disconnect_block` in M2.
+        let mut rm = StoreBatch::default();
+        rm.addr_spending_removes.push(row.key());
+        store.write_batch(rm).unwrap();
+        assert!(store.db.get_cf(&cf, encoded_key).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_address_index_empty_batch_does_not_touch_cfs() {
+        // Sanity: the empty-batch fast-path in write_batch_mode must
+        // not panic or write spurious rows.
+        let (store, _dir) = temp_store(false);
+        store.write_batch(StoreBatch::default()).unwrap();
+        // Both CFs must still be empty.
+        let af = store.cf(CF_ADDR_FUNDING);
+        let as_ = store.cf(CF_ADDR_SPENDING);
+        assert!(store.db.iterator_cf(&af, IteratorMode::Start).next().is_none());
+        assert!(store.db.iterator_cf(&as_, IteratorMode::Start).next().is_none());
     }
 }
