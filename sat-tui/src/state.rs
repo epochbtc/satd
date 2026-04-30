@@ -26,6 +26,7 @@ pub enum ViewMode {
     Ibd,
     Steady,
     Mempool,
+    Chain,
 }
 
 /// One snapshot from getmempoolhistory.
@@ -167,6 +168,13 @@ pub struct AppState {
     pub chain_time: u64,
     pub is_ibd: bool,
     pub verification_progress: f64,
+    /// Hex-encoded cumulative chain work (256-bit big-endian).
+    pub chainwork_hex: String,
+
+    // Difficulty-epoch anchor — cached header.time at floor(blocks/2016)*2016.
+    // Refreshed only when the floor advances (≈ once per fortnight).
+    pub epoch_start_height: Option<u32>,
+    pub epoch_start_time: Option<u64>,
 
     pub peers: Vec<serde_json::Value>,
     pub mempool_size: u64,
@@ -251,6 +259,32 @@ pub struct AppState {
     pub startup_status: Option<String>,
 }
 
+/// Compute log2 of a hex-encoded big-endian integer without materializing it.
+/// Returns None for empty/all-zero input.
+///
+/// Strategy: locate the most-significant non-zero hex digit, take it plus the
+/// next ~13 hex digits as a u64 mantissa, then add log2(mantissa) to the bit
+/// offset of the consumed prefix. Accuracy is well within 0.001 bits.
+pub fn chain_work_bits_from_hex(hex_str: &str) -> Option<f64> {
+    let s = hex_str.trim_start_matches('0');
+    if s.is_empty() {
+        return None;
+    }
+    // Take up to 14 hex digits (56 bits) for the mantissa — fits in a u64
+    // with headroom for the f64 conversion to keep all bits significant.
+    let take = s.len().min(14);
+    let mantissa_hex = &s[..take];
+    let mantissa = u64::from_str_radix(mantissa_hex, 16).ok()?;
+    if mantissa == 0 {
+        return None;
+    }
+    // Total bits represented by `s` = (s.len() - 1) full nibbles after the
+    // leading nibble + the bit-width of the leading nibble itself.
+    // log2(value) = log2(mantissa) + 4 * (s.len() - take)
+    let tail_nibbles = (s.len() - take) as f64;
+    Some((mantissa as f64).log2() + 4.0 * tail_nibbles)
+}
+
 impl AppState {
     pub fn new() -> Self {
         Self {
@@ -263,6 +297,9 @@ impl AppState {
             chain_time: 0,
             is_ibd: false,
             verification_progress: 0.0,
+            chainwork_hex: String::new(),
+            epoch_start_height: None,
+            epoch_start_time: None,
 
             peers: Vec::new(),
             mempool_size: 0,
@@ -343,6 +380,9 @@ impl AppState {
         self.chain_time = v.get("time").and_then(|t| t.as_u64()).unwrap_or(0);
         self.is_ibd = v.get("initialblockdownload").and_then(|b| b.as_bool()).unwrap_or(false);
         self.verification_progress = v.get("verificationprogress").and_then(|p| p.as_f64()).unwrap_or(0.0);
+        if let Some(s) = v.get("chainwork").and_then(|c| c.as_str()) {
+            self.chainwork_hex = s.to_string();
+        }
 
         // Compute deltas
         if let Some(last) = self.last_poll {
@@ -751,6 +791,168 @@ impl AppState {
         self.reorg_history.sort_by(|a, b| b.ts_unix_secs.cmp(&a.ts_unix_secs));
     }
 
+    /// Cache the difficulty-epoch start anchor (height + header.time).
+    /// Caller must have already verified `epoch_height % 2016 == 0`.
+    pub fn update_epoch_anchor(&mut self, epoch_height: u32, header: &serde_json::Value) {
+        if let Some(t) = header.get("time").and_then(|t| t.as_u64()) {
+            self.epoch_start_height = Some(epoch_height);
+            self.epoch_start_time = Some(t);
+        }
+    }
+
+    // ---- Chain & Issuance derivations (pure math) ----
+
+    /// Block subsidy in sats at the current tip (50 BTC halved every 210k).
+    /// Saturates to 0 after the 33rd halving.
+    pub fn subsidy_sats(&self) -> u64 {
+        let halvings = self.blocks / 210_000;
+        if halvings >= 64 {
+            return 0;
+        }
+        50_0000_0000u64 >> halvings
+    }
+
+    /// Subsidy expected at `tip + 1` — same table, accounting for the case
+    /// where the next block is the first of a new halving epoch.
+    pub fn next_subsidy_sats(&self) -> u64 {
+        let halvings = (self.blocks + 1) / 210_000;
+        if halvings >= 64 {
+            return 0;
+        }
+        50_0000_0000u64 >> halvings
+    }
+
+    /// Halving epoch index for the current tip (0 = pre-first-halving).
+    pub fn subsidy_epoch(&self) -> u32 {
+        self.blocks / 210_000
+    }
+
+    /// Blocks until the next halving (≥ 1 except in the last epoch).
+    pub fn blocks_to_halving(&self) -> u32 {
+        210_000 - (self.blocks % 210_000)
+    }
+
+    /// Blocks until the next difficulty retarget.
+    pub fn blocks_to_retarget(&self) -> u32 {
+        2016 - (self.blocks % 2016)
+    }
+
+    /// Blocks elapsed in the current difficulty epoch (0..2016).
+    pub fn blocks_in_epoch(&self) -> u32 {
+        self.blocks % 2016
+    }
+
+    /// Average seconds per block within the current difficulty epoch.
+    /// Returns None if we don't yet have an anchor or have only just rolled
+    /// into a new epoch.
+    pub fn epoch_avg_block_secs(&self) -> Option<f64> {
+        let start = self.epoch_start_time?;
+        let elapsed_blocks = self.blocks_in_epoch();
+        if elapsed_blocks == 0 || self.chain_time <= start {
+            return None;
+        }
+        Some((self.chain_time - start) as f64 / elapsed_blocks as f64)
+    }
+
+    /// Estimated %-change at next retarget, clamped to ±300%.
+    /// Negative = difficulty drops (blocks slower than 10m), positive = up.
+    pub fn retarget_change_pct(&self) -> Option<f64> {
+        let avg = self.epoch_avg_block_secs()?;
+        if avg <= 0.0 {
+            return None;
+        }
+        // Bitcoin Core retargets so the *next* epoch averages 600s/block.
+        // %change = 600/avg - 1 (positive when blocks were fast).
+        let raw = (600.0 / avg - 1.0) * 100.0;
+        Some(raw.clamp(-300.0, 300.0))
+    }
+
+    /// Cumulative chain work expressed as bits (≈ log2 of the integer).
+    /// Computed in log domain so the 256-bit value never materializes.
+    pub fn chain_work_bits(&self) -> Option<f64> {
+        chain_work_bits_from_hex(&self.chainwork_hex)
+    }
+
+    /// Seconds an attacker at the current network hashrate would need to
+    /// reproduce the entire chain work. `chainwork / hashrate`.
+    pub fn chain_rewrite_secs(&self) -> Option<f64> {
+        let bits = self.chain_work_bits()?;
+        let hps = self.network_hash_ps?;
+        if hps <= 0.0 {
+            return None;
+        }
+        // 2^bits / hps  =  2^(bits - log2(hps))
+        let log_hps = hps.log2();
+        Some(2.0_f64.powf(bits - log_hps))
+    }
+
+    /// Total issued supply as fraction of 21M (0.0..1.0). Requires UTXO snapshot.
+    pub fn supply_pct_issued(&self) -> Option<f64> {
+        Some(self.utxo_total_amount? / 21_000_000.0)
+    }
+
+    /// Realized annual inflation: subsidy_at_tip × blocks_per_year / supply.
+    /// `blocks_per_year` ≈ 144 × 365.25 = 52596.
+    pub fn realized_annual_inflation(&self) -> Option<f64> {
+        let supply_btc = self.utxo_total_amount?;
+        if supply_btc <= 0.0 {
+            return None;
+        }
+        let annual_btc = (self.subsidy_sats() as f64 / 1e8) * 52596.0;
+        Some(annual_btc / supply_btc)
+    }
+
+    /// Forward annual inflation: subsidy *after* the next halving, applied
+    /// against the supply that will exist at that point. Useful as a
+    /// "post-halving" preview.
+    pub fn forward_annual_inflation(&self) -> Option<f64> {
+        let supply_btc = self.utxo_total_amount?;
+        if supply_btc <= 0.0 {
+            return None;
+        }
+        let next_halvings = self.subsidy_epoch() + 1;
+        if next_halvings >= 64 {
+            return Some(0.0);
+        }
+        let next_subsidy_btc = (50_0000_0000u64 >> next_halvings) as f64 / 1e8;
+        // Supply at next halving = current + remaining_subsidy_in_this_epoch.
+        let blocks_left = self.blocks_to_halving() as f64;
+        let remaining_btc = (self.subsidy_sats() as f64 / 1e8) * blocks_left;
+        let supply_at_next = supply_btc + remaining_btc;
+        if supply_at_next <= 0.0 {
+            return None;
+        }
+        Some(next_subsidy_btc * 52596.0 / supply_at_next)
+    }
+
+    /// Top-N peer subver strings with counts. The `(N+1)`th bucket aggregates
+    /// the long tail under "other". Empty subvers are dropped.
+    pub fn subver_distribution(&self, top_n: usize) -> Vec<(String, usize)> {
+        if self.peers.is_empty() || top_n == 0 {
+            return vec![];
+        }
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for p in &self.peers {
+            if let Some(s) = p.get("subver").and_then(|s| s.as_str())
+                && !s.is_empty()
+            {
+                *counts.entry(s.to_string()).or_default() += 1;
+            }
+        }
+        let mut sorted: Vec<(String, usize)> = counts.into_iter().collect();
+        sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        if sorted.len() <= top_n {
+            return sorted;
+        }
+        let (head, tail) = sorted.split_at(top_n);
+        let other_total: usize = tail.iter().map(|(_, c)| *c).sum();
+        let mut out = head.to_vec();
+        if other_total > 0 {
+            out.push(("other".to_string(), other_total));
+        }
+        out
+    }
+
     /// True if we have a healthy, live, steady-state connection.
     pub fn is_healthy(&self) -> bool {
         self.connected && !self.stale && !self.is_ibd
@@ -1110,6 +1312,226 @@ mod tests {
         // `a` reappears.
         st.update_warnings(&v);
         assert_eq!(st.visible_warnings().len(), 1);
+    }
+
+    // ---- Chain & Issuance derivations ----
+
+    #[test]
+    fn subsidy_at_known_heights() {
+        let mut st = AppState::new();
+        st.blocks = 0;
+        assert_eq!(st.subsidy_sats(), 50_0000_0000);
+        st.blocks = 209_999;
+        assert_eq!(st.subsidy_sats(), 50_0000_0000);
+        st.blocks = 210_000;
+        assert_eq!(st.subsidy_sats(), 25_0000_0000);
+        st.blocks = 419_999;
+        assert_eq!(st.subsidy_sats(), 25_0000_0000);
+        st.blocks = 840_000;
+        assert_eq!(st.subsidy_sats(), 3_1250_0000); // 3.125 BTC
+        st.blocks = 945_000;
+        assert_eq!(st.subsidy_sats(), 3_1250_0000);
+    }
+
+    #[test]
+    fn next_subsidy_handles_halving_boundary() {
+        let mut st = AppState::new();
+        st.blocks = 209_999;
+        // Tip at 209_999 is still 50; the *next* block (210_000) is the first of epoch 1.
+        assert_eq!(st.subsidy_sats(), 50_0000_0000);
+        assert_eq!(st.next_subsidy_sats(), 25_0000_0000);
+    }
+
+    #[test]
+    fn blocks_to_halving_and_retarget() {
+        let mut st = AppState::new();
+        st.blocks = 0;
+        assert_eq!(st.blocks_to_halving(), 210_000);
+        assert_eq!(st.blocks_to_retarget(), 2016);
+
+        st.blocks = 209_999;
+        assert_eq!(st.blocks_to_halving(), 1);
+        st.blocks = 210_000;
+        assert_eq!(st.blocks_to_halving(), 210_000);
+
+        st.blocks = 2015;
+        assert_eq!(st.blocks_to_retarget(), 1);
+        st.blocks = 2016;
+        assert_eq!(st.blocks_to_retarget(), 2016);
+    }
+
+    #[test]
+    fn epoch_avg_block_secs_requires_anchor() {
+        let mut st = AppState::new();
+        st.blocks = 1_500;
+        st.chain_time = 1_700_006_000;
+        // No anchor yet.
+        assert_eq!(st.epoch_avg_block_secs(), None);
+        st.epoch_start_height = Some(0);
+        st.epoch_start_time = Some(1_700_000_000);
+        // 6000s over 1500 blocks → 4.0s/blk avg.
+        let avg = st.epoch_avg_block_secs().expect("avg");
+        assert!((avg - 4.0).abs() < 1e-6, "avg = {}", avg);
+    }
+
+    #[test]
+    fn epoch_avg_returns_none_at_boundary() {
+        let mut st = AppState::new();
+        st.blocks = 4032; // exact 2016 boundary → blocks_in_epoch == 0
+        st.chain_time = 1_700_006_000;
+        st.epoch_start_height = Some(4032);
+        st.epoch_start_time = Some(1_700_006_000);
+        assert_eq!(st.epoch_avg_block_secs(), None);
+    }
+
+    #[test]
+    fn retarget_change_pct_clamps_extremes() {
+        let mut st = AppState::new();
+        st.blocks = 1; // fresh epoch, 1 block in
+        st.chain_time = 1_700_000_001;
+        st.epoch_start_height = Some(0);
+        st.epoch_start_time = Some(1_700_000_000);
+        // 1s avg → would be huge speedup; clamped to +300%.
+        let pct = st.retarget_change_pct().expect("pct");
+        assert!((pct - 300.0).abs() < 1e-6, "got {}", pct);
+
+        // 60_000s/blk → very slow → 600/60000 - 1 = -0.99 = -99%.
+        // The slow side naturally bounds at -100%, so the clamp never fires
+        // in that direction; verify the analytical value rather than the clamp.
+        st.chain_time = 1_700_000_000 + 60_000;
+        let pct2 = st.retarget_change_pct().expect("pct2");
+        assert!((pct2 - (-99.0)).abs() < 0.001, "got {}", pct2);
+    }
+
+    #[test]
+    fn retarget_change_pct_normal_range() {
+        let mut st = AppState::new();
+        st.blocks = 1008; // mid-epoch
+        st.chain_time = 1_700_000_000 + 1008 * 540; // 9m blocks → faster
+        st.epoch_start_height = Some(0);
+        st.epoch_start_time = Some(1_700_000_000);
+        // avg = 540s → 600/540 - 1 ≈ +11.11%
+        let pct = st.retarget_change_pct().expect("pct");
+        assert!((pct - 11.111111).abs() < 0.01, "got {}", pct);
+    }
+
+    #[test]
+    fn chain_work_bits_from_known_hex() {
+        // 2^20 = 0x100000 → 20 bits exactly.
+        let v = chain_work_bits_from_hex("0000000000000000000000000000000000000000000000000000000000100000")
+            .expect("bits");
+        assert!((v - 20.0).abs() < 1e-6, "got {}", v);
+
+        // 2^256 - 1 max chainwork ≈ 256 bits.
+        let max = chain_work_bits_from_hex(&"f".repeat(64)).expect("bits");
+        assert!((max - 256.0).abs() < 0.01, "got {}", max);
+
+        // Empty / all-zero hex → None.
+        assert_eq!(chain_work_bits_from_hex(""), None);
+        assert_eq!(chain_work_bits_from_hex(&"0".repeat(64)), None);
+    }
+
+    #[test]
+    fn chain_rewrite_secs_known_inputs() {
+        let mut st = AppState::new();
+        // chainwork = 2^60, hashrate = 2^30 H/s → rewrite = 2^30 sec.
+        st.chainwork_hex = format!("{:0>64}", "1000000000000000"); // 2^60
+        st.network_hash_ps = Some((1u64 << 30) as f64);
+        let secs = st.chain_rewrite_secs().expect("secs");
+        let expected = (1u64 << 30) as f64;
+        assert!(
+            (secs / expected - 1.0).abs() < 1e-3,
+            "got {} expected {}",
+            secs,
+            expected
+        );
+    }
+
+    #[test]
+    fn supply_pct_and_inflation() {
+        let mut st = AppState::new();
+        st.blocks = 945_000;
+        st.utxo_total_amount = Some(19_712_500.0);
+        let pct = st.supply_pct_issued().expect("pct");
+        assert!((pct - 0.93869).abs() < 0.001, "got {}", pct);
+
+        // Subsidy at 945k = 3.125 BTC; annual = 3.125 * 52596 ≈ 164_362.5 BTC.
+        // realized ≈ 164_362.5 / 19_712_500 ≈ 0.00834 (0.834%).
+        let realized = st.realized_annual_inflation().expect("realized");
+        assert!((realized - 0.00834).abs() < 0.001, "got {}", realized);
+
+        // Forward: next-epoch subsidy = 1.5625, supply at next ≈ supply + 3.125 * (210000 - 945000%210000).
+        let forward = st.forward_annual_inflation().expect("forward");
+        assert!(forward < realized, "forward {} should be < realized {}", forward, realized);
+        assert!(forward > 0.0);
+    }
+
+    #[test]
+    fn subver_distribution_top_n_with_other_bucket() {
+        let mut st = AppState::new();
+        st.peers = vec![
+            json!({"subver": "/Satoshi:25.0.0/"}),
+            json!({"subver": "/Satoshi:25.0.0/"}),
+            json!({"subver": "/Satoshi:25.0.0/"}),
+            json!({"subver": "/Satoshi:24.0.1/"}),
+            json!({"subver": "/Satoshi:24.0.1/"}),
+            json!({"subver": "/knots:24.1.0/"}),
+            json!({"subver": "/btcd:0.23.0/"}),
+            json!({"subver": "/SuchPeer:1.0/"}),
+        ];
+        let dist = st.subver_distribution(2);
+        // Top-2 keeps Satoshi:25 (3) and Satoshi:24 (2); other bucket folds knots+btcd+SuchPeer (3).
+        assert_eq!(dist.len(), 3);
+        assert_eq!(dist[0].0, "/Satoshi:25.0.0/");
+        assert_eq!(dist[0].1, 3);
+        assert_eq!(dist[1].0, "/Satoshi:24.0.1/");
+        assert_eq!(dist[1].1, 2);
+        assert_eq!(dist[2].0, "other");
+        assert_eq!(dist[2].1, 3);
+
+        // Empty subver dropped.
+        st.peers.push(json!({"subver": ""}));
+        let dist2 = st.subver_distribution(10);
+        let total: usize = dist2.iter().map(|(_, c)| c).sum();
+        assert_eq!(total, 8); // unchanged — empty was filtered out
+    }
+
+    #[test]
+    fn subver_distribution_no_peers() {
+        let st = AppState::new();
+        assert!(st.subver_distribution(5).is_empty());
+    }
+
+    #[test]
+    fn update_epoch_anchor_caches_height_and_time() {
+        let mut st = AppState::new();
+        st.blocks = 945_312;
+        let header = json!({"time": 1_714_389_222});
+        st.update_epoch_anchor(944_352, &header);
+        assert_eq!(st.epoch_start_height, Some(944_352));
+        assert_eq!(st.epoch_start_time, Some(1_714_389_222));
+    }
+
+    #[test]
+    fn update_chain_info_captures_chainwork() {
+        let v = json!({
+            "chain": "main",
+            "blocks": 1,
+            "headers": 1,
+            "bestblockhash": "aa",
+            "difficulty": 1.0,
+            "time": 0,
+            "initialblockdownload": false,
+            "verificationprogress": 1.0,
+            "chainwork": "0000000000000000000000000000000000000000000000000000000000100000",
+        });
+        let mut st = AppState::new();
+        st.update_chain_info(&v);
+        assert_eq!(
+            st.chainwork_hex,
+            "0000000000000000000000000000000000000000000000000000000000100000"
+        );
+        assert!((st.chain_work_bits().unwrap() - 20.0).abs() < 1e-6);
     }
 
     #[test]

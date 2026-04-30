@@ -55,7 +55,7 @@ pub fn draw(f: &mut Frame, state: &AppState) {
         Span::styled(": quit  ", Style::default().fg(Color::DarkGray)),
         Span::styled("h", Style::default().fg(Color::White)),
         Span::styled(": help  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("1/2", Style::default().fg(Color::White)),
+        Span::styled("1/2/3/4", Style::default().fg(Color::White)),
         Span::styled(": switch view  ", Style::default().fg(Color::DarkGray)),
         Span::raw("\u{2191}\u{2193}"),
         Span::styled(": scroll peers", Style::default().fg(Color::DarkGray)),

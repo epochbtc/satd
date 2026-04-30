@@ -50,7 +50,7 @@ fn mempool_help() -> Vec<Line<'static>> {
         label("q", "Quit (or close help / reorgs)"),
         label("h / ?", "Toggle this help screen"),
         label("r", "Toggle reorg history (last 7 days)"),
-        label("1 / 2 / 3", "Force IBD / Steady / Mempool view (press again for auto)"),
+        label("1 / 2 / 3 / 4", "Force IBD / Steady / Mempool / Chain view (press again for auto)"),
         label("Up / Down", "Scroll the top-N table"),
     ]
 }
@@ -78,6 +78,7 @@ pub fn draw(f: &mut Frame, state: &AppState) {
         ViewMode::Ibd => ibd_help(),
         ViewMode::Steady => steady_help(),
         ViewMode::Mempool => mempool_help(),
+        ViewMode::Chain => chain_help(),
     };
 
     let help = Paragraph::new(lines).wrap(Wrap { trim: false });
@@ -169,8 +170,57 @@ fn ibd_help() -> Vec<Line<'static>> {
         label("q", "Quit (or close help / reorgs)"),
         label("h / ?", "Toggle this help screen"),
         label("r", "Toggle reorg history (last 7 days)"),
-        label("1 / 2 / 3", "Force IBD / Steady / Mempool view (press again for auto)"),
+        label("1 / 2 / 3 / 4", "Force IBD / Steady / Mempool / Chain view (press again for auto)"),
         label("Up / Down", "Scroll the peer table"),
+    ]
+}
+
+fn chain_help() -> Vec<Line<'static>> {
+    vec![
+        heading("Chain & Issuance View  --  Long-horizon chain stats"),
+        blank(),
+        heading("Halvings Panel"),
+        label("Subsidy Epoch", "Halving epoch index (0 = pre-first-halving)."),
+        label("Subsidy", "Block reward at the current tip, in BTC."),
+        label("Halving In", "Blocks remaining until the next halving."),
+        label("Halving ETA", "Wall-clock estimate at 10 min/block."),
+        blank(),
+        heading("Difficulty Retarget Panel"),
+        label("Blocks to Retarget", "Distance to the next 2016-block boundary."),
+        label("Retarget ETA", "Wall-clock estimate at 10 min/block."),
+        label("Block Time (epoch)", "Average seconds/block within the current epoch."),
+        label("Δ Est", "Predicted % change at next retarget (clamped to ±300%)."),
+        blank(),
+        heading("Supply / Issuance Panel"),
+        label("Issued", "Total BTC currently in the UTXO set."),
+        label("% Issued", "Fraction of the 21M cap that has been mined."),
+        label("Remaining", "BTC still to be issued before the supply cap."),
+        label("Realized", "Annual inflation rate at the current subsidy."),
+        label("Forward", "Annual inflation projected for the next halving epoch."),
+        blank(),
+        heading("Chain Security Panel"),
+        label("Chain Work", "Cumulative work as bits (≈ log2 of chainwork)."),
+        label("Rewrite", "Seconds an attacker at network hashrate would need to redo all work."),
+        label("Hashrate", "Network hashrate from getmininginfo."),
+        blank(),
+        heading("Peer Clients Panel"),
+        Line::from(vec![
+            Span::styled("  Top user-agent strings among connected peers, with %.", Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Long tail collapses into 'other'.", Style::default().fg(Color::Gray)),
+        ]),
+        blank(),
+        heading("Trivia Panel"),
+        label("Era index", "Halving epoch (alias for Subsidy Epoch)."),
+        label("Next halving", "Approximate calendar date at 10 min/block."),
+        label("Block at retarget", "Height of the upcoming retarget block."),
+        blank(),
+        heading("Keyboard"),
+        label("q", "Quit (or close help / reorgs)"),
+        label("h / ?", "Toggle this help screen"),
+        label("r", "Toggle reorg history (last 7 days)"),
+        label("1 / 2 / 3 / 4", "Force IBD / Steady / Mempool / Chain view (press again for auto)"),
     ]
 }
 
@@ -222,7 +272,7 @@ fn steady_help() -> Vec<Line<'static>> {
         label("q", "Quit (or close help / reorgs)"),
         label("h / ?", "Toggle this help screen"),
         label("r", "Toggle reorg history (last 7 days)"),
-        label("1 / 2 / 3", "Force IBD / Steady / Mempool view (press again for auto)"),
+        label("1 / 2 / 3 / 4", "Force IBD / Steady / Mempool / Chain view (press again for auto)"),
         label("Up / Down", "Scroll the peer table"),
     ]
 }

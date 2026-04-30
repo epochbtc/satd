@@ -167,6 +167,7 @@ fn run_app(
                         ViewMode::Ibd => ui::ibd::draw(f, &st),
                         ViewMode::Steady => ui::steady::draw(f, &st),
                         ViewMode::Mempool => ui::mempool::draw(f, &st),
+                        ViewMode::Chain => ui::chain::draw(f, &st),
                     }
                 }
                 // Draw warnings modal LAST so it overlays every other view.
@@ -216,6 +217,7 @@ fn run_app(
                     KeyCode::Char('1') => st.toggle_mode(ViewMode::Ibd),
                     KeyCode::Char('2') => st.toggle_mode(ViewMode::Steady),
                     KeyCode::Char('3') => st.toggle_mode(ViewMode::Mempool),
+                    KeyCode::Char('4') => st.toggle_mode(ViewMode::Chain),
                     KeyCode::Up => match st.active_mode() {
                         ViewMode::Mempool => {
                             if st.selected_mempool_row > 0 {
@@ -353,16 +355,37 @@ async fn poller(rpc: Arc<RpcClient>, state: Arc<Mutex<AppState>>) {
                 rpc.get_mempool_history(),
             );
 
-            let mut st = state.lock().unwrap();
-            if let Ok(v) = fees_res { st.update_fee_estimates(&v); }
-            if let Ok(v) = mining_res { st.update_mining_info(&v); }
-            if let Ok(v) = txstats_res { st.update_chain_tx_stats(&v); }
-            if let Ok(v) = uptime_res { st.update_uptime(&v); }
-            if let Ok(v) = blockstats_res { st.update_block_stats(&v); }
-            if let Ok(v) = rawmempool_res { st.update_mempool_dist(&v); }
-            if let Ok(v) = utxo_res { st.update_utxo_info(&v); }
-            if let Ok(v) = reorgs_res { st.update_reorg_history(&v); }
-            if let Ok(v) = mhist_res { st.update_mempool_history(&v); }
+            {
+                let mut st = state.lock().unwrap();
+                if let Ok(v) = fees_res { st.update_fee_estimates(&v); }
+                if let Ok(v) = mining_res { st.update_mining_info(&v); }
+                if let Ok(v) = txstats_res { st.update_chain_tx_stats(&v); }
+                if let Ok(v) = uptime_res { st.update_uptime(&v); }
+                if let Ok(v) = blockstats_res { st.update_block_stats(&v); }
+                if let Ok(v) = rawmempool_res { st.update_mempool_dist(&v); }
+                if let Ok(v) = utxo_res { st.update_utxo_info(&v); }
+                if let Ok(v) = reorgs_res { st.update_reorg_history(&v); }
+                if let Ok(v) = mhist_res { st.update_mempool_history(&v); }
+            }
+
+            // Refresh the difficulty-epoch anchor when the floor advances —
+            // ≈ once per fortnight in steady state. Two cheap RPCs.
+            let anchor_target = {
+                let st = state.lock().unwrap();
+                let cur = st.blocks - (st.blocks % 2016);
+                if st.blocks > 0 && st.epoch_start_height != Some(cur) {
+                    Some(cur)
+                } else {
+                    None
+                }
+            };
+            if let Some(epoch_h) = anchor_target
+                && let Ok(hash_v) = rpc.get_block_hash(epoch_h).await
+                && let Some(hash_str) = hash_v.as_str()
+                && let Ok(hdr_v) = rpc.get_block_header(hash_str).await
+            {
+                state.lock().unwrap().update_epoch_anchor(epoch_h, &hdr_v);
+            }
         }
     }
 }

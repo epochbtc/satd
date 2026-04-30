@@ -178,6 +178,15 @@ impl RpcClient {
     pub async fn get_system_info(&self) -> Result<serde_json::Value, RpcError> {
         self.call("getsysteminfo", &[]).await
     }
+
+    pub async fn get_block_hash(&self, height: u32) -> Result<serde_json::Value, RpcError> {
+        self.call("getblockhash", &[serde_json::json!(height)]).await
+    }
+
+    /// Verbose=true: returns the JSON header (with `time`, `chainwork`, etc.).
+    pub async fn get_block_header(&self, hash: &str) -> Result<serde_json::Value, RpcError> {
+        self.call("getblockheader", &[serde_json::json!(hash), serde_json::json!(true)]).await
+    }
 }
 
 #[derive(Debug)]
