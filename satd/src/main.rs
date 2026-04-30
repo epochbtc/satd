@@ -569,6 +569,15 @@ async fn main() {
         });
     }
 
+    // Backfill handle (M7). Always created so `getindexinfo` /
+    // pause/resume/cancel report a stable shape — for non-AssumeUTXO
+    // datadirs the cursor stays Idle and the RPCs are no-ops.
+    let backfill_handle = std::sync::Arc::new(
+        node::index::address::BackfillHandle::new(
+            node::index::address::BackfillCursor::idle(),
+        ),
+    );
+
     let server_handle = match node::rpc::server::start(
         bind_addr,
         auth.clone(),
@@ -581,6 +590,8 @@ async fn main() {
         effective_config_view,
         mempool_history.clone(),
         address_index,
+        config.addressindex,
+        Some(backfill_handle.clone()),
     )
     .await
     {
