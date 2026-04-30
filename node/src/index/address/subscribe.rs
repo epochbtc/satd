@@ -72,14 +72,24 @@ impl SubscriptionRegistry {
     /// scripthash share the same broadcast channel. Returns
     /// `CapReached` when adding a brand-new scripthash would exceed
     /// the configured limit.
+    ///
+    /// Channels with zero remaining receivers (e.g. after the
+    /// subscriber dropped its `Receiver`) are pruned in-line before
+    /// the cap check, so abandoned subscriptions cannot permanently
+    /// exhaust the cap.
     pub fn subscribe(
         &self,
         sh: Scripthash,
     ) -> Result<broadcast::Receiver<StatusUpdate>, SubscribeError> {
         let mut channels = self.channels.lock().unwrap();
-        if let Some(tx) = channels.get(&sh) {
+        if let Some(tx) = channels.get(&sh)
+            && tx.receiver_count() > 0
+        {
             return Ok(tx.subscribe());
         }
+        // Sweep abandoned channels under the same lock so the cap
+        // check below sees the live count, not the high-water mark.
+        channels.retain(|_, tx| tx.receiver_count() > 0);
         if channels.len() >= self.max_subs {
             return Err(SubscribeError::CapReached(self.max_subs));
         }
@@ -239,6 +249,28 @@ mod tests {
         let _rx_a = reg.subscribe([0xaa; 32]).unwrap();
         let _rx_b = reg.subscribe([0xbb; 32]).unwrap();
         let third = reg.subscribe([0xcc; 32]);
+        assert!(matches!(third, Err(SubscribeError::CapReached(2))));
+    }
+
+    #[test]
+    fn test_address_index_subscribe_cap_recovers_after_drop() {
+        // Drop receivers and confirm new scripthashes can subscribe
+        // again — the prior implementation never pruned, so a client
+        // that subscribed-then-disconnected could permanently exhaust
+        // the cap.
+        let reg = SubscriptionRegistry::new(2, 32);
+        {
+            let _rx_a = reg.subscribe([0xa1; 32]).unwrap();
+            let _rx_b = reg.subscribe([0xb1; 32]).unwrap();
+        }
+        // Receivers dropped → subscribe must reclaim slots.
+        let _rx_c = reg
+            .subscribe([0xc1; 32])
+            .expect("cap should be reclaimable after receivers drop");
+        let _rx_d = reg
+            .subscribe([0xd1; 32])
+            .expect("second reclaimed slot must work too");
+        let third = reg.subscribe([0xe1; 32]);
         assert!(matches!(third, Err(SubscribeError::CapReached(2))));
     }
 

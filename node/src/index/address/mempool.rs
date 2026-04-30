@@ -62,7 +62,10 @@ impl MempoolAddrIndex {
     /// Used by the notifier (M5) to narrow status-hash recomputation
     /// to only the scripthashes the touched tx affected.
     pub fn scripthashes_for(&self, txid: &Txid) -> Vec<Scripthash> {
-        self.by_txid.get(txid).cloned().unwrap_or_default()
+        self.by_txid
+            .get(txid)
+            .map(|entries| entries.iter().map(|(sh, _)| *sh).collect())
+            .unwrap_or_default()
     }
 
     /// Signed unconfirmed delta in satoshis for `sh`. 0 if the
@@ -215,14 +218,32 @@ pub fn resolve_scripthashes(
     (funding, spending)
 }
 
+/// Notification side-effects fired in lock-step with each mempool
+/// event after the index mutation has applied. Bundling them into the
+/// same task that maintains the index removes the previous race
+/// between the mempool index and the M5 notifier task — both used to
+/// consume the broadcast independently with no ordering guarantee, so
+/// a notify could see a stale `MempoolAddrIndex` and dedupe-skip.
+pub struct NotifyBundle {
+    pub index: Arc<crate::index::address::lookups::RocksAddressIndex>,
+    pub registry: Arc<crate::index::address::subscribe::SubscriptionRegistry>,
+}
+
 /// Background task: subscribe to mempool events and keep the index in
 /// sync. Runs until shutdown is signalled.
+///
+/// If `notify` is provided, after each `Enter` / `Leave*` mutation the
+/// task recomputes status hashes for the touched scripthashes (filtered
+/// to those with active subscribers) and fires the corresponding
+/// `StatusUpdate` notifications. The mutate-then-notify ordering is
+/// guaranteed by running both inside the single `tokio::select!` arm.
 pub async fn mempool_index_task(
     index: Arc<RwLock<MempoolAddrIndex>>,
     mempool: Arc<Mempool>,
     chain_state: Arc<ChainState>,
     mut rx: tokio::sync::broadcast::Receiver<MempoolEvent>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
+    notify: Option<NotifyBundle>,
 ) {
     loop {
         tokio::select! {
@@ -246,12 +267,37 @@ pub async fn mempool_index_task(
                         let (funding, spending) = resolve_scripthashes(
                             &entry.tx, &chain_state, &mempool,
                         );
-                        index.write().unwrap().add_tx(txid, &funding, &spending);
+                        let touched: Vec<Scripthash> = {
+                            let mut idx = index.write().unwrap();
+                            idx.add_tx(txid, &funding, &spending);
+                            idx.scripthashes_for(&txid)
+                        };
+                        if let Some(bundle) = &notify {
+                            crate::index::address::notifier::recompute_for(
+                                &bundle.index,
+                                &bundle.registry,
+                                &touched,
+                            );
+                        }
                     }
                     Ok(MempoolEvent::LeaveConfirmed { txid, .. })
                     | Ok(MempoolEvent::LeaveEvicted { txid, .. })
                     | Ok(MempoolEvent::LeaveReplaced { txid, .. }) => {
-                        index.write().unwrap().remove_tx(&txid);
+                        // Capture touched scripthashes BEFORE the remove
+                        // since `remove_tx` clears `by_txid[txid]`.
+                        let touched: Vec<Scripthash> = {
+                            let mut idx = index.write().unwrap();
+                            let touched = idx.scripthashes_for(&txid);
+                            idx.remove_tx(&txid);
+                            touched
+                        };
+                        if let Some(bundle) = &notify {
+                            crate::index::address::notifier::recompute_for(
+                                &bundle.index,
+                                &bundle.registry,
+                                &touched,
+                            );
+                        }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         // Subscriber fell behind — drain stale events
@@ -264,6 +310,15 @@ pub async fn mempool_index_task(
                         index.write().unwrap().resync_from(
                             &snapshot, &chain_state, &mempool,
                         );
+                        // After resync, recompute every active subscriber
+                        // so anyone who was waiting on a missed event
+                        // converges on the truth.
+                        if let Some(bundle) = &notify {
+                            crate::index::address::notifier::recompute_all_active(
+                                &bundle.index,
+                                &bundle.registry,
+                            );
+                        }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                 }
