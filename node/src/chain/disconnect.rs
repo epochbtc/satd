@@ -106,7 +106,6 @@ pub fn disconnect_block(
                 coin,
             ) {
                 batch.addr_spending_removes.push(key);
-                crate::index::address::stats::add_spending_removes(1);
             }
             undo_cursor += 1;
         }
@@ -134,7 +133,6 @@ pub fn disconnect_block(
                 output,
             ) {
                 batch.addr_funding_removes.push(key);
-                crate::index::address::stats::add_funding_removes(1);
             }
         }
 

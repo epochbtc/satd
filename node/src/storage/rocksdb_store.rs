@@ -490,9 +490,31 @@ impl Store for RocksDbStore {
         if mode == WriteMode::BulkLoad {
             wopts.disable_wal(true);
         }
+        // Snapshot row counts before the write so we only bump
+        // committed-row counters after the write succeeds. Pre-commit
+        // emission (the previous behavior) leaked counts from blocks
+        // that produced a batch but failed validation later in the
+        // pipeline.
+        let funding_put_count = batch.addr_funding_puts.len() as u64;
+        let funding_remove_count = batch.addr_funding_removes.len() as u64;
+        let spending_put_count = batch.addr_spending_puts.len() as u64;
+        let spending_remove_count = batch.addr_spending_removes.len() as u64;
         self.db
             .write_opt(wb, &wopts)
-            .map_err(|e| StoreError::Database(e.to_string()))
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        if funding_put_count > 0 {
+            crate::index::address::stats::add_funding_rows(funding_put_count);
+        }
+        if funding_remove_count > 0 {
+            crate::index::address::stats::add_funding_removes(funding_remove_count);
+        }
+        if spending_put_count > 0 {
+            crate::index::address::stats::add_spending_rows(spending_put_count);
+        }
+        if spending_remove_count > 0 {
+            crate::index::address::stats::add_spending_removes(spending_remove_count);
+        }
+        Ok(())
     }
 
     fn flush_durable(&self) -> Result<(), StoreError> {
@@ -1099,5 +1121,54 @@ mod tests {
         let as_ = store.cf(CF_ADDR_SPENDING);
         assert!(store.db.iterator_cf(&af, IteratorMode::Start).next().is_none());
         assert!(store.db.iterator_cf(&as_, IteratorMode::Start).next().is_none());
+    }
+
+    #[test]
+    fn test_address_index_metrics_reflect_committed_rows_only() {
+        use crate::index::address::{AddrFundingRow, AddrSpendingRow, scripthash_of, stats};
+
+        // Use a fresh process snapshot to compute deltas — the static
+        // counters accumulate across tests in the same binary.
+        let before = stats::snapshot();
+
+        let (store, _dir) = temp_store(false);
+        let sh = scripthash_of(&bitcoin::ScriptBuf::new());
+        let txid = bitcoin::Txid::from_raw_hash(
+            bitcoin::hashes::sha256d::Hash::from_byte_array([0xab; 32]),
+        );
+
+        let mut batch = StoreBatch::default();
+        batch.addr_funding_puts.push(AddrFundingRow {
+            scripthash: sh,
+            height: 1,
+            txid,
+            vout: 0,
+            amount_sat: 1000,
+        });
+        batch.addr_spending_puts.push(AddrSpendingRow {
+            scripthash: sh,
+            height: 1,
+            txid,
+            vin: 0,
+            prev_outpoint: bitcoin::OutPoint::null(),
+        });
+        store.write_batch(batch).unwrap();
+
+        let after = stats::snapshot();
+        // Counters are process-wide and other parallel tests can bump
+        // them between snapshots, so assert >= our own contribution
+        // rather than equality.
+        assert!(
+            after.funding_rows >= before.funding_rows + 1,
+            "committed-rows counter must reflect successful write (before {}, after {})",
+            before.funding_rows,
+            after.funding_rows
+        );
+        assert!(
+            after.spending_rows >= before.spending_rows + 1,
+            "committed-rows counter must reflect successful write (before {}, after {})",
+            before.spending_rows,
+            after.spending_rows
+        );
     }
 }

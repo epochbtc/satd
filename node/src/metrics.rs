@@ -224,7 +224,7 @@ impl MetricsContext {
         metric(
             &mut out,
             "satd_addrindex_funding_rows_total",
-            "Cumulative count of address-history funding rows emitted by connect_block since process start.",
+            "Cumulative count of address-history funding rows committed to RocksDB since process start.",
             "counter",
             &[],
             addr_stats.funding_rows,
@@ -232,7 +232,7 @@ impl MetricsContext {
         metric(
             &mut out,
             "satd_addrindex_spending_rows_total",
-            "Cumulative count of address-history spending rows emitted by connect_block since process start.",
+            "Cumulative count of address-history spending rows committed to RocksDB since process start.",
             "counter",
             &[],
             addr_stats.spending_rows,
@@ -240,7 +240,7 @@ impl MetricsContext {
         metric(
             &mut out,
             "satd_addrindex_funding_removes_total",
-            "Cumulative count of address-history funding-row removals emitted by disconnect_block.",
+            "Cumulative count of address-history funding-row removals committed to RocksDB.",
             "counter",
             &[],
             addr_stats.funding_removes,
@@ -248,7 +248,7 @@ impl MetricsContext {
         metric(
             &mut out,
             "satd_addrindex_spending_removes_total",
-            "Cumulative count of address-history spending-row removals emitted by disconnect_block.",
+            "Cumulative count of address-history spending-row removals committed to RocksDB.",
             "counter",
             &[],
             addr_stats.spending_removes,

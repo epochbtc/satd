@@ -1,9 +1,15 @@
 //! Process-wide counters for address-index metrics.
 //!
-//! Counters are bumped during emission (M2) and snapshotted by the
-//! Prometheus `/metrics` endpoint (M6). Held as atomics in a `static`
-//! so emission paths don't need to thread a stats handle through
-//! `connect_block` / `disconnect_block` / `StoreBatch`.
+//! Counters are bumped at the commit boundary in
+//! `RocksDbStore::write_batch_mode` after the underlying RocksDB
+//! `write_opt` succeeds, and snapshotted by the Prometheus `/metrics`
+//! endpoint (M6). Counting at commit (rather than at emission inside
+//! `connect_block`) means a block whose batch fails validation or
+//! whose commit fails does not move the counters — the values
+//! correspond to rows actually persisted.
+//!
+//! Held as atomics in a `static` so the storage path doesn't need to
+//! thread a stats handle through.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -12,26 +18,22 @@ static SPENDING_ROWS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static FUNDING_REMOVES_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SPENDING_REMOVES_TOTAL: AtomicU64 = AtomicU64::new(0);
 
-/// Increment the funding-rows counter by `n`. Called from emission
-/// in `connect_block` (one per output that produced a funding row).
+/// Increment the committed funding-rows counter by `n`.
 pub fn add_funding_rows(n: u64) {
     FUNDING_ROWS_TOTAL.fetch_add(n, Ordering::Relaxed);
 }
 
-/// Increment the spending-rows counter by `n`. Called from emission
-/// in `connect_block` (one per non-coinbase input).
+/// Increment the committed spending-rows counter by `n`.
 pub fn add_spending_rows(n: u64) {
     SPENDING_ROWS_TOTAL.fetch_add(n, Ordering::Relaxed);
 }
 
-/// Increment the funding-removes counter by `n`. Called during
-/// `disconnect_block` (rows removed for a rolled-back block).
+/// Increment the committed funding-removes counter by `n`.
 pub fn add_funding_removes(n: u64) {
     FUNDING_REMOVES_TOTAL.fetch_add(n, Ordering::Relaxed);
 }
 
-/// Increment the spending-removes counter by `n`. Called during
-/// `disconnect_block`.
+/// Increment the committed spending-removes counter by `n`.
 pub fn add_spending_removes(n: u64) {
     SPENDING_REMOVES_TOTAL.fetch_add(n, Ordering::Relaxed);
 }

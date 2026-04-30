@@ -41,7 +41,10 @@ pub fn emit_funding(
         vout,
         amount_sat: txout.value.to_sat(),
     });
-    crate::index::address::stats::add_funding_rows(1);
+    // Counters are bumped at the commit boundary in
+    // `RocksDbStore::write_batch_mode`, not here — a block can fail
+    // validation after `connect_block` produces a batch, in which
+    // case the rows never reach disk.
 }
 
 /// Emit a spending row for input `vin` of `txid` at `height` consuming
@@ -69,7 +72,7 @@ pub fn emit_spending(
         vin,
         prev_outpoint,
     });
-    crate::index::address::stats::add_spending_rows(1);
+    // Counters are bumped at the commit boundary — see emit_funding.
 }
 
 /// Build a funding-removal key for `(scripthash, height, txid, vout)`.
