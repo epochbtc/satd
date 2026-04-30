@@ -8,6 +8,10 @@ struct TestNode {
     process: Child,
     datadir: PathBuf,
     rpcport: u16,
+    /// P2P listen port — tracked so tests can connect raw P2P clients
+    /// without re-parsing the command line. `None` when the caller passes
+    /// an unusual --port format we can't extract.
+    p2p_port: Option<u16>,
     cookie: String,
 }
 
@@ -20,8 +24,13 @@ impl TestNode {
         let satd_bin = env!("CARGO_BIN_EXE_satd");
 
         // Allocate a unique P2P port unless the caller already specified --port.
-        let has_port = extra_args.iter().any(|a| a.starts_with("--port"));
+        let caller_port: Option<u16> = extra_args
+            .iter()
+            .find_map(|a| a.strip_prefix("--port="))
+            .and_then(|s| s.parse().ok());
+        let has_port = caller_port.is_some();
         let p2p_port = if has_port { 0 } else { find_available_port() };
+        let tracked_p2p_port = caller_port.or(if has_port { None } else { Some(p2p_port) });
 
         let mut cmd = Command::new(satd_bin);
         cmd.arg("--regtest")
@@ -116,6 +125,7 @@ impl TestNode {
             process,
             datadir,
             rpcport,
+            p2p_port: tracked_p2p_port,
             cookie,
         }
     }
@@ -178,6 +188,7 @@ impl TestNode {
             process,
             datadir: datadir.to_path_buf(),
             rpcport,
+            p2p_port: None,
             cookie,
         }
     }
@@ -3272,6 +3283,80 @@ fn test_getmempoolhistory_returns_snapshots_shape() {
 }
 
 #[test]
+fn test_getorphaninfo_empty_shape() {
+    // A fresh regtest node has an empty orphan pool. Assert the RPC
+    // returns the Core-compat-ish shape we commit to: size, bytes,
+    // max_size.
+    let mut node = TestNode::start(&[]);
+    let response = node.rpc_call("getorphaninfo").unwrap();
+    let result = &response["result"];
+    assert!(result.is_object(), "getorphaninfo result should be an object");
+    assert_eq!(result["size"].as_u64(), Some(0));
+    assert_eq!(result["bytes"].as_u64(), Some(0));
+    assert!(
+        result["max_size"].as_u64().unwrap_or(0) > 0,
+        "max_size should be a positive cap; got: {:?}",
+        result["max_size"]
+    );
+    node.stop();
+}
+
+#[test]
+fn test_getorphaninfo_registered_in_help() {
+    // Help text must advertise getorphaninfo so operators can discover it.
+    let mut node = TestNode::start(&[]);
+    let response = node.rpc_call("help").unwrap();
+    let body = response["result"].as_str().unwrap_or("");
+    assert!(
+        body.contains("getorphaninfo"),
+        "`help` output should advertise getorphaninfo; got: {}",
+        body
+    );
+    node.stop();
+}
+
+#[test]
+fn test_sendrawtransaction_orphan_rejected_not_orphaned() {
+    // RPC path must NOT route orphans to the orphanage — only P2P relay
+    // should. sendrawtransaction of a tx with a missing parent returns
+    // an error, and getorphaninfo stays at size 0.
+    let mut node = TestNode::start(&[]);
+
+    // Build a raw tx referencing a non-existent parent output. Uses the
+    // createrawtransaction helper so we don't hand-roll the hex.
+    let inputs = serde_json::json!([{
+        "txid": "1111111111111111111111111111111111111111111111111111111111111111",
+        "vout": 0,
+    }]);
+    let outputs = serde_json::json!({
+        "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202": 0.01,
+    });
+    let create_resp = node
+        .rpc_call_with_params("createrawtransaction", vec![inputs, outputs])
+        .unwrap();
+    let hex = create_resp["result"].as_str().unwrap().to_string();
+
+    // Submit via RPC; expect an error (MissingInputs / similar).
+    let submit = node
+        .rpc_call_with_params("sendrawtransaction", vec![serde_json::json!(hex)])
+        .unwrap();
+    assert!(
+        submit["error"].is_object(),
+        "sendrawtransaction of an orphan should error; got: {:?}",
+        submit
+    );
+
+    // Orphanage must still be empty — RPC path does not orphan.
+    let info = node.rpc_call("getorphaninfo").unwrap();
+    assert_eq!(
+        info["result"]["size"].as_u64(),
+        Some(0),
+        "getorphaninfo.size should stay 0 after RPC-rejected orphan"
+    );
+    node.stop();
+}
+
+#[test]
 fn test_subscribemempool_registered_in_help() {
     // End-to-end WS subscription exercise is hard to make reliable in
     // regtest (auth, timing, tokio runtime interop). The broadcast
@@ -3292,5 +3377,396 @@ fn test_subscribemempool_registered_in_help() {
         "`help` output should advertise unsubscribemempool"
     );
     node.stop();
+}
+
+// ---------------------------------------------------------------------------
+// Raw P2P test client — used by the orphan-pool tests below to exercise the
+// live `handle_tx` path. Does the version/verack handshake, then exposes
+// `send_tx` for injecting transactions. A background thread drains incoming
+// frames so the node's send queue doesn't back up while we hold the socket.
+// ---------------------------------------------------------------------------
+
+mod raw_p2p {
+    use bitcoin::consensus::{deserialize, serialize};
+    use bitcoin::p2p::Magic;
+    use bitcoin::p2p::message::{NetworkMessage, RawNetworkMessage};
+    use bitcoin::p2p::message_network::VersionMessage;
+    use bitcoin::p2p::{Address, ServiceFlags};
+    use bitcoin::Transaction;
+    use std::io::{self, Read, Write};
+    use std::net::{SocketAddr, TcpStream};
+    use std::time::{Duration, Instant, SystemTime};
+
+    const HEADER_SIZE: usize = 24;
+    const MAX_PAYLOAD_SIZE: usize = 32 * 1024 * 1024;
+
+    pub struct RawP2pClient {
+        stream: TcpStream,
+    }
+
+    impl RawP2pClient {
+        /// Connect to a regtest satd node on 127.0.0.1:`p2p_port` and
+        /// complete the version/verack handshake. Panics on failure —
+        /// only intended for tests.
+        pub fn connect(p2p_port: u16) -> Self {
+            let addr = format!("127.0.0.1:{}", p2p_port);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let stream = loop {
+                match TcpStream::connect_timeout(
+                    &addr.parse().unwrap(),
+                    Duration::from_secs(2),
+                ) {
+                    Ok(s) => break s,
+                    Err(_) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                    Err(e) => panic!("P2P connect to {} failed: {}", addr, e),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream.set_nodelay(true).unwrap();
+
+            let mut client = RawP2pClient { stream };
+            client.handshake();
+
+            // Spawn a drain thread so the node's writes to us (getheaders,
+            // ping, getdata, etc.) never block the node's send queue.
+            let drain_stream = client.stream.try_clone().unwrap();
+            std::thread::spawn(move || drain_loop(drain_stream));
+
+            client
+        }
+
+        fn handshake(&mut self) {
+            // 1. Send our Version.
+            let our_ver = build_version();
+            self.send_msg(NetworkMessage::Version(our_ver));
+
+            // 2. Read messages until we see both a Version and a Verack
+            //    from the node. Order observed: Version → SendAddrV2 →
+            //    Verack, but don't hard-code.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut saw_version = false;
+            let mut saw_verack = false;
+            while !(saw_version && saw_verack) {
+                if Instant::now() >= deadline {
+                    panic!("handshake timeout waiting for peer version+verack");
+                }
+                match recv_msg(&mut self.stream) {
+                    Ok(NetworkMessage::Version(_)) => saw_version = true,
+                    Ok(NetworkMessage::Verack) => saw_verack = true,
+                    Ok(_) => continue,
+                    Err(e) => panic!("handshake recv failed: {}", e),
+                }
+            }
+
+            // 3. Send our Verack.
+            self.send_msg(NetworkMessage::Verack);
+        }
+
+        pub fn send_tx(&mut self, tx: &Transaction) {
+            self.send_msg(NetworkMessage::Tx(tx.clone()));
+        }
+
+        fn send_msg(&mut self, msg: NetworkMessage) {
+            let raw = RawNetworkMessage::new(Magic::REGTEST, msg);
+            let bytes = serialize(&raw);
+            self.stream.write_all(&bytes).expect("p2p write");
+            self.stream.flush().ok();
+        }
+    }
+
+    fn build_version() -> VersionMessage {
+        let services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+        let timestamp = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let zero: SocketAddr = "0.0.0.0:0".parse().unwrap();
+        VersionMessage {
+            version: 70016,
+            services,
+            timestamp,
+            receiver: Address::new(&zero, ServiceFlags::NONE),
+            sender: Address::new(&zero, services),
+            nonce: 0xDEAD_BEEF_CAFE_F00D,
+            user_agent: "/satd-regtest-p2p:0.1/".into(),
+            start_height: 0,
+            relay: true,
+        }
+    }
+
+    fn recv_msg(stream: &mut TcpStream) -> io::Result<NetworkMessage> {
+        let mut header = [0u8; HEADER_SIZE];
+        stream.read_exact(&mut header)?;
+        let payload_len =
+            u32::from_le_bytes([header[16], header[17], header[18], header[19]]) as usize;
+        if payload_len > MAX_PAYLOAD_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "payload too large",
+            ));
+        }
+        let mut payload = vec![0u8; payload_len];
+        if payload_len > 0 {
+            stream.read_exact(&mut payload)?;
+        }
+        let mut buf = Vec::with_capacity(HEADER_SIZE + payload_len);
+        buf.extend_from_slice(&header);
+        buf.extend_from_slice(&payload);
+        deserialize::<RawNetworkMessage>(&buf)
+            .map(|raw| raw.payload().clone())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+    }
+
+    /// Drain and discard all frames on `stream` until EOF or error. Keeps
+    /// the node's write queue unblocked while tests hold the connection.
+    fn drain_loop(mut stream: TcpStream) {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .ok();
+        while recv_msg(&mut stream).is_ok() {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Orphan-pool P2P regtests. These exercise the live handle_tx path: they
+// send a tx with unresolvable parents via raw P2P and assert the node
+// defers it to the orphanage without banning the peer.
+// ---------------------------------------------------------------------------
+
+fn orphan_tx_with_fake_parent(parent_seed: u8, out_value: u64) -> bitcoin::Transaction {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::hashes::Hash;
+    use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, TxIn, TxOut, Txid, Witness};
+
+    let mut parent_bytes = [0u8; 32];
+    parent_bytes[0] = parent_seed;
+    parent_bytes[1] = 0xAB;
+    parent_bytes[2] = 0xCD;
+    let parent = Txid::from_slice(&parent_bytes).unwrap();
+
+    // Minimal P2WPKH-shaped output: OP_0 <20 bytes>. Any standard-looking
+    // script is fine — we just need to reach the UTXO-lookup step of
+    // mempool acceptance (which will reject with MissingInputs because
+    // the parent txid is fake).
+    let mut p2wpkh = vec![0x00, 0x14];
+    p2wpkh.extend_from_slice(&[parent_seed; 20]);
+    let script_pubkey = ScriptBuf::from_bytes(p2wpkh);
+
+    bitcoin::Transaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint { txid: parent, vout: 0 },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            // Minimal witness so the tx has a witness marker — the SegWit
+            // path is what matters on P2WPKH spends.
+            witness: Witness::from_slice(&[&[0u8; 1][..]]),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(out_value),
+            script_pubkey,
+        }],
+    }
+}
+
+// Spin up two nodes: `miner` produces blocks, `relay` connects to miner,
+// syncs via real P2P (so PeerManager::headers_tip advances and its
+// `is_ibd()` returns false), and is the node we connect our raw client to.
+// `handle_tx` early-returns during IBD, so a single-node setup doesn't
+// exercise the relay path — the miner's real P2P headers are the only
+// mechanism that advances the relay node's headers_tip counter.
+fn spawn_two_node_relay_pair() -> (TestNode, TestNode) {
+    let miner_p2p_port = find_available_port();
+    let miner = TestNode::start(&[&format!("--port={}", miner_p2p_port)]);
+
+    // Mine a handful of blocks. Need enough for the relay node's
+    // PeerManager::is_ibd() check (`htip == 0 || tip + 24 < htip`) to
+    // flip to false — i.e. headers_tip must be non-zero and within 24
+    // of tip. Mining 1 is enough if the relay syncs before we send txs.
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    miner
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(3), serde_json::json!(addr)],
+        )
+        .unwrap();
+
+    let relay_p2p_port = find_available_port();
+    let relay = TestNode::start(&[
+        &format!("--port={}", relay_p2p_port),
+        &format!("--connect=127.0.0.1:{}", miner_p2p_port),
+    ]);
+
+    // Wait for relay to sync + exit IBD.
+    poll_until(
+        || get_rpc_u64(&relay, "getblockcount").unwrap_or(0) >= 3,
+        Duration::from_secs(30),
+        "relay node did not sync miner's blocks",
+    );
+    poll_until(
+        || {
+            relay
+                .rpc_call("getblockchaininfo")
+                .ok()
+                .and_then(|r| r["result"]["initialblockdownload"].as_bool())
+                == Some(false)
+        },
+        Duration::from_secs(15),
+        "relay node stuck in IBD",
+    );
+
+    (miner, relay)
+}
+
+#[test]
+fn test_p2p_orphan_no_ban_and_deferred() {
+    let (mut miner, mut relay) = spawn_two_node_relay_pair();
+    let relay_p2p_port = relay.p2p_port.expect("relay p2p port tracked");
+
+    let mut client = raw_p2p::RawP2pClient::connect(relay_p2p_port);
+    poll_until(
+        || get_rpc_u64(&relay, "getconnectioncount").unwrap_or(0) >= 2,
+        Duration::from_secs(10),
+        "raw client did not register as a peer",
+    );
+
+    // Relay a single orphan tx — parent txid is unknown.
+    let tx = orphan_tx_with_fake_parent(0x11, 1_000);
+    client.send_tx(&tx);
+
+    // Orphanage should pick it up.
+    poll_until(
+        || {
+            get_rpc_u64_from_json(&relay, "getorphaninfo", "size")
+                .is_some_and(|n| n >= 1)
+        },
+        Duration::from_secs(10),
+        "orphan never appeared in orphanage",
+    );
+
+    // Peer must not have been banned, and we're still connected.
+    let banned = relay.rpc_call("listbanned").unwrap();
+    assert_eq!(
+        banned["result"].as_array().map(|a| a.len()).unwrap_or(0),
+        0,
+        "listbanned should be empty after P2P orphan relay"
+    );
+
+    relay.stop();
+    miner.stop();
+}
+
+#[test]
+fn test_p2p_many_orphans_do_not_ban() {
+    // Under the pre-fix code, each MissingInputs relay added +1 ban score;
+    // 100 orphans = ban + disconnect. After the fix, no ban and the peer
+    // stays connected. Strongest regression check we can do without
+    // exposing ban_score in getpeerinfo.
+    let (mut miner, mut relay) = spawn_two_node_relay_pair();
+    let relay_p2p_port = relay.p2p_port.expect("relay p2p port tracked");
+
+    let mut client = raw_p2p::RawP2pClient::connect(relay_p2p_port);
+    poll_until(
+        || get_rpc_u64(&relay, "getconnectioncount").unwrap_or(0) >= 2,
+        Duration::from_secs(10),
+        "raw client not registered",
+    );
+
+    // 120 distinct orphans (each with a distinct fake parent).
+    for i in 0..120u8 {
+        let tx = orphan_tx_with_fake_parent(i.wrapping_add(1), 1_000 + i as u64);
+        client.send_tx(&tx);
+    }
+
+    // Wait long enough for the node to process the backlog.
+    std::thread::sleep(Duration::from_secs(1));
+
+    let banned = relay.rpc_call("listbanned").unwrap();
+    assert_eq!(
+        banned["result"].as_array().map(|a| a.len()).unwrap_or(0),
+        0,
+        "listbanned must stay empty after 120 orphan relays"
+    );
+    // Still connected — miner + our raw client = 2.
+    let conn_count = get_rpc_u64(&relay, "getconnectioncount").unwrap_or(0);
+    assert!(
+        conn_count >= 2,
+        "raw peer must not be disconnected after 120 orphans; got conn_count={}",
+        conn_count
+    );
+
+    // Pool is bounded at max_count (default 100).
+    let info = relay.rpc_call("getorphaninfo").unwrap();
+    let size = info["result"]["size"].as_u64().unwrap_or(0);
+    let max = info["result"]["max_size"].as_u64().unwrap_or(u64::MAX);
+    assert!(size <= max, "orphanage size {} exceeds max_size {}", size, max);
+    assert!(size > 0, "some orphans should be retained");
+
+    relay.stop();
+    miner.stop();
+}
+
+#[test]
+fn test_p2p_duplicate_orphan_no_pool_growth() {
+    // Sending the same orphan repeatedly must not grow the pool beyond 1
+    // and must not ban. The add()→AddOutcome::Duplicate signal is what
+    // makes handle_tx skip re-requesting parents; here we observe the
+    // pool-size invariant, which suffices for the regression.
+    let (mut miner, mut relay) = spawn_two_node_relay_pair();
+    let relay_p2p_port = relay.p2p_port.expect("relay p2p port tracked");
+
+    let mut client = raw_p2p::RawP2pClient::connect(relay_p2p_port);
+    poll_until(
+        || get_rpc_u64(&relay, "getconnectioncount").unwrap_or(0) >= 2,
+        Duration::from_secs(10),
+        "raw client not registered",
+    );
+
+    let tx = orphan_tx_with_fake_parent(0x55, 1_234);
+    for _ in 0..5 {
+        client.send_tx(&tx);
+    }
+
+    // Wait for at least one to land.
+    poll_until(
+        || {
+            get_rpc_u64_from_json(&relay, "getorphaninfo", "size")
+                .is_some_and(|n| n >= 1)
+        },
+        Duration::from_secs(10),
+        "orphan never landed",
+    );
+
+    // Size must stay at exactly 1 — idempotent insert.
+    std::thread::sleep(Duration::from_millis(500));
+    let size = get_rpc_u64_from_json(&relay, "getorphaninfo", "size").unwrap_or(0);
+    assert_eq!(
+        size, 1,
+        "duplicate orphan relay must not grow pool; got size={}",
+        size
+    );
+
+    let banned = relay.rpc_call("listbanned").unwrap();
+    assert_eq!(
+        banned["result"].as_array().map(|a| a.len()).unwrap_or(0),
+        0,
+        "duplicate orphan relay must not ban"
+    );
+
+    relay.stop();
+    miner.stop();
+}
+
+fn get_rpc_u64_from_json(node: &TestNode, method: &str, key: &str) -> Option<u64> {
+    let r = node.rpc_call(method).ok()?;
+    r["result"][key].as_u64()
 }
 

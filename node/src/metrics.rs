@@ -131,6 +131,23 @@ impl MetricsContext {
             &[],
             mempool_info.max_size as u64,
         );
+        let orphanage = self.peer_manager.orphanage();
+        metric(
+            &mut out,
+            "satd_orphan_count",
+            "Current number of transactions in the orphan pool (missing parents, awaiting reconsideration).",
+            "gauge",
+            &[],
+            orphanage.len() as u64,
+        );
+        metric(
+            &mut out,
+            "satd_orphan_bytes",
+            "Total serialized size of orphan transactions in bytes.",
+            "gauge",
+            &[],
+            orphanage.bytes() as u64,
+        );
         metric(
             &mut out,
             "satd_mempool_min_fee_rate_sat_per_kvb",
