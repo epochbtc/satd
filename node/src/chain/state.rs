@@ -81,6 +81,8 @@ pub enum ChainError {
     Storage(#[from] StoreError),
     #[error("block file write failed: {0}")]
     FlatFile(String),
+    #[error("{0}")]
+    Disconnect(#[from] disconnect::DisconnectError),
 }
 
 struct ChainTip {
@@ -1434,7 +1436,7 @@ impl ChainState {
                 entry.height,
                 prev_hash,
                 &self.address_index,
-            );
+            )?;
             combined_batch.merge(batch);
 
             disconnected_hashes.push(current);

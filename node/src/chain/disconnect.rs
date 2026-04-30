@@ -4,6 +4,28 @@ use crate::index::address::AddressIndexConfig;
 use crate::storage::StoreBatch;
 use crate::storage::undo::UndoData;
 
+/// Errors returned by `disconnect_block` when the on-disk undo data
+/// is inconsistent with the block being disconnected. Surfaced as a
+/// real error so corrupt local state lands the operator on
+/// `-reindex-chainstate` instead of an abort.
+#[derive(Debug, thiserror::Error)]
+pub enum DisconnectError {
+    #[error("undo.spent_coins length {actual} does not match expected non-coinbase input count {expected} for block at height {height}")]
+    UndoLengthMismatch {
+        height: u32,
+        expected: usize,
+        actual: usize,
+    },
+    #[error("undo.spent_coins exhausted at height {height} while reconstructing spending tx {tx_idx} input {vin} (cursor {cursor}, len {len})")]
+    UndoExhausted {
+        height: u32,
+        tx_idx: usize,
+        vin: usize,
+        cursor: usize,
+        len: usize,
+    },
+}
+
 /// Disconnect a block: reverse its effects on the UTXO set, the
 /// tx_index, and the address-history index.
 ///
@@ -21,13 +43,18 @@ use crate::storage::undo::UndoData;
 /// recover the `(spending_txid, vin)` for each entry — required
 /// because `addr_spending` rows are keyed by the spending tx, not
 /// the funding outpoint.
+///
+/// Returns an error rather than panicking when undo data is
+/// truncated or oversized: a corrupt local store should surface as a
+/// recoverable error so the operator can recover via
+/// `-reindex-chainstate`, not abort the process.
 pub fn disconnect_block(
     block: &Block,
     undo: &UndoData,
     block_height: u32,
     prev_hash: bitcoin::BlockHash,
     address_index: &AddressIndexConfig,
-) -> StoreBatch {
+) -> Result<StoreBatch, DisconnectError> {
     let mut batch = StoreBatch::default();
 
     // Walk forward to compute txids once and emit the address-index
@@ -37,20 +64,23 @@ pub fn disconnect_block(
     let txids: Vec<bitcoin::Txid> = block.txdata.iter().map(|tx| tx.compute_txid()).collect();
 
     // Address-spending removes: the canonical correspondence between
-    // undo entries and (spending tx, vin) pairs. Asserted in debug
-    // builds so a future change to undo's storage order would fail
-    // loudly rather than silently corrupt the index.
+    // undo entries and (spending tx, vin) pairs. Validated as a real
+    // error so a corrupt undo file (truncated, oversized, or with
+    // mismatched ordering after a future undo-format change) doesn't
+    // panic the node mid-reorg.
     let expected_undo_count: usize = block
         .txdata
         .iter()
         .filter(|tx| !tx.is_coinbase())
         .map(|tx| tx.input.len())
         .sum();
-    debug_assert_eq!(
-        undo.spent_coins.len(),
-        expected_undo_count,
-        "undo.spent_coins should have one entry per non-coinbase input, in connect order"
-    );
+    if undo.spent_coins.len() != expected_undo_count {
+        return Err(DisconnectError::UndoLengthMismatch {
+            height: block_height,
+            expected: expected_undo_count,
+            actual: undo.spent_coins.len(),
+        });
+    }
 
     let mut undo_cursor = 0usize;
     for (tx_idx, tx) in block.txdata.iter().enumerate() {
@@ -59,7 +89,15 @@ pub fn disconnect_block(
         }
         let txid = txids[tx_idx];
         for (vin, _input) in tx.input.iter().enumerate() {
-            let (_op_ser, coin) = &undo.spent_coins[undo_cursor];
+            let (_op_ser, coin) = undo.spent_coins.get(undo_cursor).ok_or(
+                DisconnectError::UndoExhausted {
+                    height: block_height,
+                    tx_idx,
+                    vin,
+                    cursor: undo_cursor,
+                    len: undo.spent_coins.len(),
+                },
+            )?;
             if let Some(key) = crate::index::address::spending_remove_key(
                 address_index,
                 block_height,
@@ -119,7 +157,7 @@ pub fn disconnect_block(
     batch.tip = Some(prev_hash);
     batch.height_hash_removes.push(block_height);
 
-    batch
+    Ok(batch)
 }
 
 #[cfg(test)]
@@ -322,7 +360,7 @@ mod tests {
 
         store.write_batch(connect_batch).unwrap();
 
-        let batch = disconnect_block(&block, &undo, 1, prev_hash, &Default::default());
+        let batch = disconnect_block(&block, &undo, 1, prev_hash, &Default::default()).unwrap();
 
         // coin_removes should contain the coinbase output(s)
         let coinbase_txid = block.txdata[0].compute_txid();
@@ -378,7 +416,7 @@ mod tests {
 
         store.write_batch(connect_batch).unwrap();
 
-        let batch = disconnect_block(&block, &undo, 1, prev_hash, &Default::default());
+        let batch = disconnect_block(&block, &undo, 1, prev_hash, &Default::default()).unwrap();
 
         // The spent coin should be restored
         assert_eq!(batch.coin_puts.len(), 1, "should restore exactly one spent coin");
@@ -431,7 +469,7 @@ mod tests {
 
         store.write_batch(connect_batch).unwrap();
 
-        let batch = disconnect_block(&block, &undo, 1, prev_hash, &Default::default());
+        let batch = disconnect_block(&block, &undo, 1, prev_hash, &Default::default()).unwrap();
 
         let (restored_op, restored_coin) = &batch.coin_puts[0];
         assert_eq!(*restored_op, outpoint);
@@ -446,7 +484,7 @@ mod tests {
         let block = make_coinbase_only_block(5, BlockHash::all_zeros());
         let undo = UndoData::default();
 
-        let batch = disconnect_block(&block, &undo, 5, BlockHash::all_zeros(), &Default::default());
+        let batch = disconnect_block(&block, &undo, 5, BlockHash::all_zeros(), &Default::default()).unwrap();
 
         assert_eq!(batch.height_hash_removes, vec![5]);
     }
@@ -459,7 +497,7 @@ mod tests {
         let block = make_coinbase_only_block(3, prev_hash);
         let undo = UndoData::default();
 
-        let batch = disconnect_block(&block, &undo, 3, prev_hash, &Default::default());
+        let batch = disconnect_block(&block, &undo, 3, prev_hash, &Default::default()).unwrap();
 
         assert_eq!(batch.tip, Some(prev_hash));
     }
@@ -575,7 +613,7 @@ mod tests {
 
         store.write_batch(connect_batch).unwrap();
 
-        let batch = disconnect_block(&block, &undo, height, BlockHash::all_zeros(), &Default::default());
+        let batch = disconnect_block(&block, &undo, height, BlockHash::all_zeros(), &Default::default()).unwrap();
 
         // All 3 txs' outputs should be in coin_removes
         // coinbase has 1 output, tx1 has 1, tx2 has 1 = 3 total
@@ -693,7 +731,7 @@ mod tests {
 
         store.write_batch(connect_batch).unwrap();
 
-        let batch = disconnect_block(&block, &undo, height, BlockHash::all_zeros(), &Default::default());
+        let batch = disconnect_block(&block, &undo, height, BlockHash::all_zeros(), &Default::default()).unwrap();
 
         // All 3 spent inputs should be restored
         assert_eq!(batch.coin_puts.len(), 3);
@@ -761,7 +799,7 @@ mod tests {
         assert!(store.get_coin(&other_op).is_some());
 
         // Disconnect
-        let batch = disconnect_block(&block, &undo, 1, BlockHash::all_zeros(), &Default::default());
+        let batch = disconnect_block(&block, &undo, 1, BlockHash::all_zeros(), &Default::default()).unwrap();
         store.write_batch(batch).unwrap();
 
         // The other coin should still be present
@@ -827,7 +865,7 @@ mod tests {
         assert!(store.get_coin(&outpoint).is_none());
 
         // Disconnect
-        let disconnect_batch = disconnect_block(&block, &undo, 1, prev_hash, &Default::default());
+        let disconnect_batch = disconnect_block(&block, &undo, 1, prev_hash, &Default::default()).unwrap();
         store.write_batch(disconnect_batch).unwrap();
 
         // After disconnect, the original coin should be back
@@ -870,7 +908,7 @@ mod tests {
         let block = make_coinbase_only_block(10, prev_hash);
         let undo = UndoData::default();
 
-        let batch = disconnect_block(&block, &undo, 10, prev_hash, &Default::default());
+        let batch = disconnect_block(&block, &undo, 10, prev_hash, &Default::default()).unwrap();
 
         // Should still remove coinbase outputs
         assert!(!batch.coin_removes.is_empty());
@@ -931,7 +969,7 @@ mod tests {
 
         store.write_batch(connect_batch).unwrap();
 
-        let batch = disconnect_block(&block, &undo, 1, BlockHash::all_zeros(), &Default::default());
+        let batch = disconnect_block(&block, &undo, 1, BlockHash::all_zeros(), &Default::default()).unwrap();
 
         // Every txid that was added by connect_block must be removed by
         // disconnect_block.
@@ -992,7 +1030,7 @@ mod tests {
 
         store.write_batch(connect_batch).unwrap();
 
-        let batch = disconnect_block(&block, &undo, 1, BlockHash::all_zeros(), &cfg);
+        let batch = disconnect_block(&block, &undo, 1, BlockHash::all_zeros(), &cfg).unwrap();
 
         assert_eq!(
             batch.addr_funding_removes.len(),
@@ -1046,9 +1084,67 @@ mod tests {
             .unwrap();
         store.write_batch(connect_batch).unwrap();
 
-        let disc = disconnect_block(&block, &undo, 1, BlockHash::all_zeros(), &disabled);
+        let disc = disconnect_block(&block, &undo, 1, BlockHash::all_zeros(), &disabled).unwrap();
         assert!(disc.addr_funding_removes.is_empty());
         assert!(disc.addr_spending_removes.is_empty());
+    }
+
+    #[test]
+    fn test_disconnect_returns_error_on_corrupt_undo_length() {
+        // Corrupt-undo: a real block expects N undo entries, but the
+        // store hands us a truncated UndoData. disconnect_block must
+        // surface this as DisconnectError, not panic the node.
+        let (store, outpoint, _coin) = make_test_store_with_coin(0, false);
+        let block = make_block_spending(outpoint, 1, 2, 0xffff_ffff, 0);
+        let block_hash = block.block_hash();
+
+        let connect_batch = connect_block(&ConnectParams {
+            store: &store,
+            block: &block,
+            height: 1,
+            parent_chainwork: &[0u8; 32],
+            flat_pos: default_pos(),
+            script_verifier: &NoopVerifier,
+            median_time_past: 0,
+            network: Network::Regtest,
+            pre_verified_txs: None,
+            num_threads: 1,
+            precomputed_txids: None,
+            address_index: &Default::default(),
+        })
+        .unwrap();
+        let mut undo = connect_batch
+            .undo_puts
+            .iter()
+            .find(|(h, _)| *h == block_hash)
+            .map(|(_, u)| u.clone())
+            .unwrap();
+        // Truncate the undo to simulate on-disk corruption.
+        undo.spent_coins.clear();
+
+        let result = disconnect_block(
+            &block,
+            &undo,
+            1,
+            BlockHash::all_zeros(),
+            &Default::default(),
+        );
+        let err = match result {
+            Ok(_) => panic!("truncated undo must surface as DisconnectError"),
+            Err(e) => e,
+        };
+        match err {
+            DisconnectError::UndoLengthMismatch {
+                height,
+                expected,
+                actual,
+            } => {
+                assert_eq!(height, 1);
+                assert_eq!(actual, 0);
+                assert!(expected > 0);
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
     }
 
     #[test]
