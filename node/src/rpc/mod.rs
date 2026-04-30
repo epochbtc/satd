@@ -1,3 +1,4 @@
+pub mod address;
 pub mod amounts;
 pub mod auth;
 pub mod blockchain;

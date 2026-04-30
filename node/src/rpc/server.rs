@@ -1,11 +1,12 @@
 use crate::chain::state::ChainState;
+use crate::index::address::AddressIndex;
 use crate::mempool::fee::FeeEstimator;
 use crate::mempool::history::MempoolHistory;
 use crate::mempool::pool::Mempool;
 use crate::net::manager::PeerManager;
 use crate::rpc::amounts::{annotate_units, default_unit, format_amount, format_feerate_sat_per_kvb};
 use crate::rpc::auth::{AuthLayer, RpcAuth};
-use crate::rpc::{blockchain, mining, network, psbt, rawtx, util};
+use crate::rpc::{address, blockchain, mining, network, psbt, rawtx, util};
 use crate::storage::Store;
 use jsonrpsee::server::{RpcModule, ServerBuilder, ServerHandle};
 use jsonrpsee::types::ErrorObjectOwned;
@@ -34,6 +35,9 @@ pub struct RpcContext {
     /// case the RPC returns an empty snapshot list rather than lying
     /// with a synthetic fallback store.
     pub mempool_history: Option<Arc<MempoolHistory>>,
+    /// Address-history index. Read surface for the `getaddress*` RPCs
+    /// and (in M+1 milestones) the Electrum / Esplora handlers.
+    pub address_index: Arc<dyn AddressIndex>,
 }
 
 /// Which data source `estimatesmartfee` / `estimatefees` draws from.
@@ -122,6 +126,7 @@ pub async fn start(
     last_shutdown_clean: bool,
     effective_config: serde_json::Value,
     mempool_history: Option<Arc<MempoolHistory>>,
+    address_index: Arc<dyn AddressIndex>,
 ) -> Result<ServerHandle, Box<dyn std::error::Error + Send + Sync>> {
     let ctx = Arc::new(RpcContext {
         chain_state,
@@ -133,6 +138,7 @@ pub async fn start(
         last_shutdown_clean,
         effective_config,
         mempool_history,
+        address_index,
     });
 
     let mut module = RpcModule::new(ctx);
@@ -297,6 +303,32 @@ pub async fn start(
 
     module.register_method("savemempool", |_params, _ctx, _extensions| {
         Ok::<_, ErrorObjectOwned>(blockchain::save_mempool())
+    })?;
+
+    // --- Address-history index RPCs (M3) ---
+
+    module.register_method("getaddressbalance", |params, ctx, _extensions| {
+        let v: serde_json::Value = params.one().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        address::get_address_balance(&ctx.address_index, &v, ctx.chain_state.network)
+            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
+    })?;
+
+    module.register_method("getaddresshistory", |params, ctx, _extensions| {
+        let v: serde_json::Value = params.one().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        address::get_address_history(&ctx.address_index, &v, ctx.chain_state.network)
+            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
+    })?;
+
+    module.register_method("getaddressutxos", |params, ctx, _extensions| {
+        let v: serde_json::Value = params.one().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        address::get_address_utxos(&ctx.address_index, &v, ctx.chain_state.network)
+            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
     // --- Mining RPCs ---

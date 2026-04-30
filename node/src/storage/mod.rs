@@ -9,7 +9,7 @@ pub mod undo;
 use bitcoin::{BlockHash, OutPoint, Txid};
 
 use crate::index::address::{
-    AddrFundingKey, AddrFundingRow, AddrSpendingKey, AddrSpendingRow,
+    AddrFundingKey, AddrFundingRow, AddrSpendingKey, AddrSpendingRow, Scripthash,
 };
 use crate::storage::blockindex::BlockIndexEntry;
 use crate::storage::coinview::Coin;
@@ -137,5 +137,23 @@ pub trait Store: Send + Sync {
     /// Current block-cache capacity in bytes if observable. Default: 0.
     fn block_cache_capacity_bytes(&self) -> usize {
         0
+    }
+
+    /// All committed `addr_funding` rows for `sh`, ordered ascending by
+    /// `(height, txid, vout)` (i.e. ascending by encoded key — the BE
+    /// layout in `keys::encode_funding_key`). Returns the value
+    /// `amount_sat` alongside the decoded key. Default: empty (backends
+    /// that don't carry the address index produce no rows).
+    fn iter_addr_funding(&self, _sh: &Scripthash) -> Vec<(AddrFundingKey, u64)> {
+        Vec::new()
+    }
+
+    /// All committed `addr_spending` rows for `sh`, ordered ascending by
+    /// `(height, txid, vin)`. Default: empty.
+    fn iter_addr_spending(
+        &self,
+        _sh: &Scripthash,
+    ) -> Vec<(AddrSpendingKey, bitcoin::OutPoint)> {
+        Vec::new()
     }
 }

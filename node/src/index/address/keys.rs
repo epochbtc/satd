@@ -36,7 +36,7 @@ const SCRIPTHASH_LEN: usize = 32;
 const HEIGHT_LEN: usize = 4;
 const TXID_LEN: usize = 32;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct AddrFundingKey {
     pub scripthash: Scripthash,
     pub height: u32,
@@ -64,7 +64,7 @@ impl AddrFundingRow {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct AddrSpendingKey {
     pub scripthash: Scripthash,
     pub height: u32,

@@ -593,6 +593,77 @@ impl Store for CoinCache {
     fn block_cache_capacity_bytes(&self) -> usize {
         self.inner.block_cache_capacity_bytes()
     }
+
+    fn iter_addr_funding(
+        &self,
+        sh: &crate::index::address::Scripthash,
+    ) -> Vec<(crate::index::address::AddrFundingKey, u64)> {
+        // Reads see committed-to-inner-store rows merged with the
+        // pending (not-yet-flushed) write batch. Without this merge,
+        // queries between a connect_block and the next flush would
+        // miss the latest blocks' rows — the address index is
+        // chainstate-bound, not flush-bound.
+        let pending = self.pending_batch.lock().unwrap();
+        let pending_puts: Vec<(crate::index::address::AddrFundingKey, u64)> = pending
+            .addr_funding_puts
+            .iter()
+            .filter(|r| &r.scripthash == sh)
+            .map(|r| (r.key(), r.amount_sat))
+            .collect();
+        let pending_removes: std::collections::HashSet<crate::index::address::AddrFundingKey> =
+            pending
+                .addr_funding_removes
+                .iter()
+                .filter(|k| &k.scripthash == sh)
+                .cloned()
+                .collect();
+        drop(pending);
+
+        let inner_rows = self.inner.iter_addr_funding(sh);
+        let mut all: Vec<(crate::index::address::AddrFundingKey, u64)> = inner_rows
+            .into_iter()
+            .filter(|(k, _)| !pending_removes.contains(k))
+            .chain(pending_puts)
+            .collect();
+        all.sort_by(|(a, _), (b, _)| {
+            crate::index::address::encode_funding_key(a)
+                .cmp(&crate::index::address::encode_funding_key(b))
+        });
+        all
+    }
+
+    fn iter_addr_spending(
+        &self,
+        sh: &crate::index::address::Scripthash,
+    ) -> Vec<(crate::index::address::AddrSpendingKey, OutPoint)> {
+        let pending = self.pending_batch.lock().unwrap();
+        let pending_puts: Vec<(crate::index::address::AddrSpendingKey, OutPoint)> = pending
+            .addr_spending_puts
+            .iter()
+            .filter(|r| &r.scripthash == sh)
+            .map(|r| (r.key(), r.prev_outpoint))
+            .collect();
+        let pending_removes: std::collections::HashSet<crate::index::address::AddrSpendingKey> =
+            pending
+                .addr_spending_removes
+                .iter()
+                .filter(|k| &k.scripthash == sh)
+                .cloned()
+                .collect();
+        drop(pending);
+
+        let inner_rows = self.inner.iter_addr_spending(sh);
+        let mut all: Vec<(crate::index::address::AddrSpendingKey, OutPoint)> = inner_rows
+            .into_iter()
+            .filter(|(k, _)| !pending_removes.contains(k))
+            .chain(pending_puts)
+            .collect();
+        all.sort_by(|(a, _), (b, _)| {
+            crate::index::address::encode_spending_key(a)
+                .cmp(&crate::index::address::encode_spending_key(b))
+        });
+        all
+    }
 }
 
 #[cfg(test)]
