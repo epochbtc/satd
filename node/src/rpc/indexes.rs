@@ -62,6 +62,28 @@ pub fn backfill_index(
     }
 }
 
+/// Per ADDRESS_INDEX.md, `pause`/`resume`/`cancel` only make sense
+/// while a backfill is in progress (state `running` or `paused`).
+/// In M7 scaffolding mode, no backfill task ever runs, so flipping
+/// the atomic flags would silently mismatch the persisted state and
+/// confuse operators ("paused: true, state: idle"). Treat any
+/// invocation while idle as an explicit no-op with a -8 error so the
+/// command surface is honest.
+fn require_active_backfill(handle: &Arc<BackfillHandle>) -> Result<(), (i32, String)> {
+    use crate::index::address::cursor::BackfillState;
+    let state = handle.cursor().state;
+    match state {
+        BackfillState::Running | BackfillState::Paused => Ok(()),
+        _ => Err((
+            -8,
+            format!(
+                "no backfill is in progress (state: {}); pause/resume/cancel apply only to running or paused backfills",
+                state.label()
+            ),
+        )),
+    }
+}
+
 pub fn pause_index(
     backfill: Option<&Arc<BackfillHandle>>,
     target: &str,
@@ -69,12 +91,10 @@ pub fn pause_index(
     if target != "address" {
         return Err((-8, format!("unknown index target '{}'", target)));
     }
-    if let Some(h) = backfill {
-        h.pause();
-        Ok(json!({"paused": true, "state": h.cursor().state.label()}))
-    } else {
-        Err((-32603, "backfill handle not initialized".to_string()))
-    }
+    let h = backfill.ok_or((-32603, "backfill handle not initialized".to_string()))?;
+    require_active_backfill(h)?;
+    h.pause();
+    Ok(json!({"paused": true, "state": h.cursor().state.label()}))
 }
 
 pub fn resume_index(
@@ -84,12 +104,10 @@ pub fn resume_index(
     if target != "address" {
         return Err((-8, format!("unknown index target '{}'", target)));
     }
-    if let Some(h) = backfill {
-        h.resume();
-        Ok(json!({"resumed": true, "state": h.cursor().state.label()}))
-    } else {
-        Err((-32603, "backfill handle not initialized".to_string()))
-    }
+    let h = backfill.ok_or((-32603, "backfill handle not initialized".to_string()))?;
+    require_active_backfill(h)?;
+    h.resume();
+    Ok(json!({"resumed": true, "state": h.cursor().state.label()}))
 }
 
 pub fn cancel_index(
@@ -99,10 +117,8 @@ pub fn cancel_index(
     if target != "address" {
         return Err((-8, format!("unknown index target '{}'", target)));
     }
-    if let Some(h) = backfill {
-        h.cancel();
-        Ok(json!({"cancelled": true, "state": h.cursor().state.label()}))
-    } else {
-        Err((-32603, "backfill handle not initialized".to_string()))
-    }
+    let h = backfill.ok_or((-32603, "backfill handle not initialized".to_string()))?;
+    require_active_backfill(h)?;
+    h.cancel();
+    Ok(json!({"cancelled": true, "state": h.cursor().state.label()}))
 }

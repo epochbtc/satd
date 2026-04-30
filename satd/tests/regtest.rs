@@ -4045,25 +4045,34 @@ fn test_address_index_getindexinfo_shape() {
 /// label. Wrong targets reject with a -8 error.
 #[test]
 fn test_address_index_backfill_control_rpcs() {
+    // M7 ships scaffolding: no backfill task is spawned (AssumeUTXO
+    // isn't in the tree). pause/resume/cancel must reject as -8 with
+    // a clear "no backfill running" message rather than returning
+    // success+state:idle, which would mislead operators into thinking
+    // the index is paused when it isn't.
     let mut node = TestNode::start(&[]);
 
-    let r = node
-        .rpc_call_with_params(
-            "pauseindex",
-            vec![serde_json::json!("address")],
-        )
-        .expect("rpc");
-    assert_eq!(r["result"]["paused"].as_bool(), Some(true));
+    for method in ["pauseindex", "resumeindex", "cancelindex"] {
+        let r = node
+            .rpc_call_with_params(method, vec![serde_json::json!("address")])
+            .expect("rpc");
+        assert_eq!(
+            r["error"]["code"].as_i64(),
+            Some(-8),
+            "{} on idle backfill must return -8: {}",
+            method,
+            r
+        );
+        let msg = r["error"]["message"].as_str().unwrap_or("");
+        assert!(
+            msg.contains("no backfill is in progress"),
+            "{} error message should explain idle state: {:?}",
+            method,
+            msg
+        );
+    }
 
-    let r = node
-        .rpc_call_with_params(
-            "resumeindex",
-            vec![serde_json::json!("address")],
-        )
-        .expect("rpc");
-    assert_eq!(r["result"]["resumed"].as_bool(), Some(true));
-
-    // Wrong target rejected.
+    // Wrong target still rejected.
     let r = node
         .rpc_call_with_params(
             "pauseindex",
