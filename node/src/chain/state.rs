@@ -95,12 +95,22 @@ struct ChainTip {
 /// the record at fork-disconnect time (the obvious-but-wrong spot)
 /// would misreport `fork_hash` as the new tip and leave
 /// `reconnected` empty.
+///
+/// `disconnected_txs` carries the non-coinbase transactions from the
+/// disconnected blocks so the caller can re-offer them to the mempool
+/// *after* the side chain has fully reconnected. Re-adding inside
+/// `perform_reorg` would validate against the fork-point UTXO set, not
+/// the final post-reorg active chain.
 #[derive(Debug, Clone)]
 struct ReorgDisconnectInfo {
     old_tip: BlockHash,
     old_height: u32,
     /// Hashes disconnected, walked old-tip-first toward the fork parent.
     disconnected: Vec<BlockHash>,
+    /// Non-coinbase transactions from disconnected blocks, in
+    /// fork-parent-first order so the caller can re-add parents before
+    /// children (chained mempool acceptance).
+    disconnected_txs: Vec<bitcoin::Transaction>,
 }
 
 /// Staged reorg record: all the inputs to `ReorgRecord::new` except the
@@ -116,6 +126,14 @@ struct PendingReorgRecord {
     /// Side-chain blocks already reconnected + committed, fork-parent-
     /// first, not yet including the final triggering block.
     reconnected_so_far: Vec<BlockHash>,
+    /// Reconnected side-chain blocks (excluding the triggering block,
+    /// which the caller of `accept_block` cleans up). Held here so the
+    /// post-reconnect mempool cleanup can run against the final chain.
+    reconnected_blocks: Vec<bitcoin::Block>,
+    /// Non-coinbase txs from the disconnected blocks, fork-parent-first.
+    /// Re-offered to the mempool after the full reorg has activated so
+    /// validation runs against the new chain, not the fork point.
+    disconnected_txs: Vec<bitcoin::Transaction>,
 }
 
 /// Central chain state manager.
@@ -1290,6 +1308,7 @@ impl ChainState {
                 to_connect.reverse();
             }
             let mut reconnected_hashes: Vec<BlockHash> = Vec::with_capacity(to_connect.len() + 1);
+            let mut reconnected_blocks: Vec<bitcoin::Block> = Vec::with_capacity(to_connect.len());
             for side_hash in &to_connect {
                 let side_block = self.get_block(side_hash)
                     .ok_or(ChainError::FlatFile("block data missing for reorg connect".to_string()))?;
@@ -1326,6 +1345,7 @@ impl ChainState {
                     tip.height = side_entry.height;
                 }
                 reconnected_hashes.push(*side_hash);
+                reconnected_blocks.push(side_block);
                 tracing::info!(height = side_entry.height, hash = %side_hash, "Reorg: block connected");
             }
 
@@ -1339,6 +1359,8 @@ impl ChainState {
                 old_height: disconnect_info.old_height,
                 disconnected: disconnect_info.disconnected,
                 reconnected_so_far: reconnected_hashes,
+                reconnected_blocks,
+                disconnected_txs: disconnect_info.disconnected_txs,
             });
 
             // Fall through to connect the new block as a tip-extending block
@@ -1378,20 +1400,58 @@ impl ChainState {
 
         // The reorg (if one happened) is now fully complete: disconnect,
         // all intermediate reconnections, and the final tip-extending
-        // connect have all committed. Persist one complete record with
-        // the real final tip.
-        if let (Some(pending), Some(log)) = (pending_reorg.take(), self.reorg_log.get()) {
-            let mut reconnected = pending.reconnected_so_far;
-            reconnected.push(block_hash);
-            let record = crate::chain::reorg_log::ReorgRecord::new(
-                pending.fork_height,
-                pending.old_tip,
-                block_hash,
-                pending.old_height,
-                pending.disconnected,
-                reconnected,
-            );
-            log.record(record);
+        // connect have all committed. Now reconcile mempool against the
+        // new chain *before* persisting the reorg record:
+        //
+        // 1. For each intermediate side-chain block that reconnected,
+        //    evict mempool txs whose inputs are now spent by it. The
+        //    final triggering block's `remove_for_block` is the
+        //    caller's responsibility (`accept_block` returns Ok).
+        //
+        // 2. Re-offer disconnected-block transactions to the mempool.
+        //    Validation runs against the live chain — at this point
+        //    the tip is the final new chain tip — so a tx that
+        //    conflicts with any reconnected side-chain block is
+        //    rejected by `accept_transaction` rather than admitted.
+        //
+        // The reorg record is persisted after the mempool reconcile so
+        // operators see a fully-consistent state when the record
+        // appears in `getreorghistory`.
+        if let Some(pending) = pending_reorg.take() {
+            if let Some(mempool) = self.mempool.get() {
+                let new_tip_height = self.tip_height();
+                for side_block in &pending.reconnected_blocks {
+                    mempool.remove_for_block(side_block, new_tip_height);
+                }
+                for tx in &pending.disconnected_txs {
+                    let txid = tx.compute_txid();
+                    if let Err(e) = mempool.accept_transaction(
+                        tx.clone(),
+                        self,
+                        &*self.script_verifier,
+                    ) {
+                        tracing::debug!(
+                            %txid,
+                            err = ?e,
+                            "Reorg: re-add to mempool failed (likely conflict with new chain)"
+                        );
+                    }
+                }
+            }
+
+            if let Some(log) = self.reorg_log.get() {
+                let mut reconnected = pending.reconnected_so_far;
+                reconnected.push(block_hash);
+                let record = crate::chain::reorg_log::ReorgRecord::new(
+                    pending.fork_height,
+                    pending.old_tip,
+                    block_hash,
+                    pending.old_height,
+                    pending.disconnected,
+                    reconnected,
+                );
+                log.record(record);
+            }
         }
 
         // Update MTP cache with this block's timestamp
@@ -1426,10 +1486,11 @@ impl ChainState {
         let mut current = old_tip;
         let mut combined_batch = crate::storage::StoreBatch::default();
         let mut disconnected_hashes: Vec<BlockHash> = Vec::new();
-        // Disconnected non-coinbase txs, collected fork-parent-first so
-        // the post-commit re-add submits older parents before children
-        // (chained mempool acceptance requires parents already present).
-        let mut disconnected_txs: Vec<bitcoin::Transaction> = Vec::new();
+        // Per-block non-coinbase txs collected newest-disconnect-first.
+        // We hold them in nested vecs so we can reverse the *block*
+        // order without scrambling intra-block tx order — chained tx
+        // graphs within a block need parents-before-children preserved.
+        let mut disconnected_txs_by_block: Vec<Vec<bitcoin::Transaction>> = Vec::new();
         let old_height = self
             .store
             .get_block_index(&old_tip)
@@ -1461,12 +1522,12 @@ impl ChainState {
             )?;
             combined_batch.merge(batch);
 
-            // Capture non-coinbase txs for mempool re-add. Walking
-            // newest-disconnect-first means we'll later need to reverse
-            // when handing to the mempool — see below.
-            for tx in block.txdata.iter().skip(1) {
-                disconnected_txs.push(tx.clone());
-            }
+            // Capture non-coinbase txs for mempool re-add, in block
+            // order. Block order is preserved so a child tx in the same
+            // block doesn't get re-offered before its parent.
+            let block_txs: Vec<bitcoin::Transaction> =
+                block.txdata.iter().skip(1).cloned().collect();
+            disconnected_txs_by_block.push(block_txs);
 
             disconnected_hashes.push(current);
             tracing::info!(height = entry.height, hash = %current, "Block disconnected");
@@ -1483,30 +1544,19 @@ impl ChainState {
             tip.height = fork_entry.height;
         }
 
-        // Mempool re-add. Bitcoin Core semantics: every tx that was in a
-        // disconnected block is re-offered to the mempool so users see
-        // their unconfirmed-but-still-valid txs come back. Order: oldest
-        // disconnected block first, then within block as listed (parents
-        // before children for chained tx graphs in the same block).
-        // Failures (RBF conflicts after the new chain reconnects, dust,
-        // etc.) are logged at debug, not propagated — they're expected.
-        if let Some(mempool) = self.mempool.get() {
-            // disconnected_txs were pushed newest-first; reverse to walk
-            // oldest-disconnected-block first.
-            disconnected_txs.reverse();
-            for tx in disconnected_txs {
-                let txid = tx.compute_txid();
-                if let Err(e) =
-                    mempool.accept_transaction(tx, self, &*self.script_verifier)
-                {
-                    tracing::debug!(
-                        %txid,
-                        err = ?e,
-                        "Reorg: re-add to mempool failed (likely conflict with new chain)"
-                    );
-                }
-            }
-        }
+        // Block order: walk reversed so oldest disconnected block comes
+        // first (parents-before-children across blocks). Tx order
+        // within each block is preserved.
+        //
+        // We deliberately do NOT re-add inside perform_reorg: re-adding
+        // here would validate against the fork-point UTXO set, not the
+        // final post-reorg active chain. A side-chain block reconnected
+        // after this call could spend the same input as a re-added tx,
+        // leaving an invalid tx in the mempool. The caller in
+        // `connect_tip` performs the re-add after all reconnects.
+        disconnected_txs_by_block.reverse();
+        let disconnected_txs: Vec<bitcoin::Transaction> =
+            disconnected_txs_by_block.into_iter().flatten().collect();
 
         // NOTE: We deliberately do NOT persist a reorg record here. The
         // caller knows the real new-tip and the full reconnected list;
@@ -1516,6 +1566,7 @@ impl ChainState {
             old_tip,
             old_height,
             disconnected: disconnected_hashes,
+            disconnected_txs,
         })
     }
     /// Prune old block data files whose blocks are deep enough in the chain.

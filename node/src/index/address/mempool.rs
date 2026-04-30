@@ -32,12 +32,15 @@ use crate::mempool::pool::Mempool;
 pub struct MempoolAddrIndex {
     /// Scripthash → set of txids whose funding/spending touches it.
     by_scripthash: HashMap<Scripthash, HashSet<Txid>>,
-    /// Txid → list of scripthashes the tx touches. Inverse of
-    /// `by_scripthash` so removals are O(scripthashes_per_tx).
-    by_txid: HashMap<Txid, Vec<Scripthash>>,
-    /// Per-scripthash unconfirmed delta in satoshis. Sum of funding
-    /// outputs minus sum of input values (resolved at admission).
-    /// A tx that net-spends more than it funds shows negative.
+    /// Txid → per-scripthash signed deltas the tx contributes. Stores
+    /// deltas (not raw amounts) so removal subtracts exactly what the
+    /// tx added, even if multiple txs touch the same scripthash. The
+    /// keys also serve as the inverse-of-by_scripthash so removal is
+    /// O(scripthashes_per_tx).
+    by_txid: HashMap<Txid, Vec<(Scripthash, i64)>>,
+    /// Per-scripthash unconfirmed delta in satoshis. Sum of per-tx
+    /// contributions in `by_txid` for that scripthash. Removed on
+    /// admission/removal in lock-step so it stays exact.
     delta_sat: HashMap<Scripthash, i64>,
 }
 
@@ -82,50 +85,48 @@ impl MempoolAddrIndex {
             return;
         }
 
-        let mut touched = Vec::new();
+        // Coalesce funding + spending into per-scripthash signed
+        // deltas. A tx that funds and spends the same scripthash
+        // contributes a single net entry, so removal cleanly inverts.
+        let mut deltas: HashMap<Scripthash, i64> = HashMap::new();
         for (sh, amount) in funding {
-            self.by_scripthash.entry(*sh).or_default().insert(txid);
-            *self.delta_sat.entry(*sh).or_insert(0) += *amount as i64;
-            touched.push(*sh);
+            *deltas.entry(*sh).or_insert(0) += *amount as i64;
         }
         for (sh, amount) in spending {
-            self.by_scripthash.entry(*sh).or_default().insert(txid);
-            *self.delta_sat.entry(*sh).or_insert(0) -= *amount as i64;
-            touched.push(*sh);
+            *deltas.entry(*sh).or_insert(0) -= *amount as i64;
         }
-        // De-dup so we don't traverse the same scripthash twice on
-        // remove. A tx can fund and spend the same scripthash.
-        touched.sort_unstable();
-        touched.dedup();
+
+        let mut touched: Vec<(Scripthash, i64)> = deltas.into_iter().collect();
+        touched.sort_unstable_by_key(|(sh, _)| *sh);
+        for (sh, delta) in &touched {
+            self.by_scripthash.entry(*sh).or_default().insert(txid);
+            *self.delta_sat.entry(*sh).or_insert(0) += *delta;
+        }
         self.by_txid.insert(txid, touched);
     }
 
-    /// Forget everything we know about `txid`. Inverse of `add_tx`.
+    /// Forget everything we know about `txid`. Inverse of `add_tx`:
+    /// subtracts exactly the per-scripthash deltas the tx contributed
+    /// so any other mempool tx touching the same scripthash retains
+    /// its accurate delta.
     fn remove_tx(&mut self, txid: &Txid) {
         let touched = match self.by_txid.remove(txid) {
             Some(t) => t,
             None => return,
         };
-        for sh in &touched {
+        for (sh, delta) in &touched {
             if let Some(set) = self.by_scripthash.get_mut(sh) {
                 set.remove(txid);
                 if set.is_empty() {
                     self.by_scripthash.remove(sh);
                 }
             }
-        }
-        // Recompute delta — exact accounting requires re-walking the
-        // remaining txs that touch each scripthash. For correctness we
-        // recompute lazily by clearing and letting subsequent adds
-        // restore the sum; but that's wrong if any remaining tx
-        // touched the same scripthash. So instead, drop the entry and
-        // accept that delta becomes momentarily 0 until the next
-        // resync. M5+ may add per-tx delta tracking if accuracy here
-        // becomes load-bearing — for now the only consumer is the
-        // operator-RPC unconfirmed field, where 0 during a transient
-        // is acceptable.
-        for sh in &touched {
-            self.delta_sat.remove(sh);
+            if let Some(entry) = self.delta_sat.get_mut(sh) {
+                *entry -= *delta;
+                if *entry == 0 {
+                    self.delta_sat.remove(sh);
+                }
+            }
         }
     }
 
@@ -304,8 +305,49 @@ mod tests {
         idx.remove_tx(&txid);
 
         assert!(idx.entries_for(&sh).is_empty());
-        // Per the implementation note in `remove_tx`, the delta entry
-        // is dropped on removal (not recomputed). Verify the absence.
+        // Per-tx delta tracking: the delta drops back to zero exactly,
+        // and the now-empty entry is removed.
+        assert_eq!(idx.delta(&sh), 0);
+        let (n_sh, n_tx) = idx.debug_state();
+        assert_eq!(n_sh, 0);
+        assert_eq!(n_tx, 0);
+    }
+
+    #[test]
+    fn test_address_index_mempool_remove_one_of_two_preserves_other_delta() {
+        // Two mempool txs both fund the same scripthash. Removing one
+        // must leave the other's delta intact — a fix for the prior
+        // wholesale `delta_sat.remove` behavior.
+        let mut idx = MempoolAddrIndex::new();
+        let sh = [0xee; 32];
+        let txid_a = fixture_txid(10);
+        let txid_b = fixture_txid(11);
+
+        idx.add_tx(txid_a, &[(sh, 1000)], &[]);
+        idx.add_tx(txid_b, &[(sh, 2500)], &[]);
+        assert_eq!(idx.delta(&sh), 3500);
+
+        idx.remove_tx(&txid_a);
+        assert_eq!(idx.delta(&sh), 2500, "removing one tx must subtract only its delta");
+        assert_eq!(idx.entries_for(&sh), vec![txid_b]);
+
+        idx.remove_tx(&txid_b);
+        assert_eq!(idx.delta(&sh), 0);
+        let (n_sh, _) = idx.debug_state();
+        assert_eq!(n_sh, 0);
+    }
+
+    #[test]
+    fn test_address_index_mempool_self_funding_and_spending_net_delta() {
+        // A single tx that funds and spends the same scripthash should
+        // contribute exactly its net delta on add and remove cleanly.
+        let mut idx = MempoolAddrIndex::new();
+        let sh = [0xff; 32];
+        let txid = fixture_txid(12);
+        idx.add_tx(txid, &[(sh, 800)], &[(sh, 300)]);
+        assert_eq!(idx.delta(&sh), 500);
+
+        idx.remove_tx(&txid);
         assert_eq!(idx.delta(&sh), 0);
         let (n_sh, n_tx) = idx.debug_state();
         assert_eq!(n_sh, 0);
