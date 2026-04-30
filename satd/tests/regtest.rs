@@ -3972,3 +3972,35 @@ fn test_address_index_scripthash_param_form() {
     node.stop();
 }
 
+// ── Address-history index — mempool variant (M4) ──────────────────────
+
+/// With no mempool txs, `getaddressbalance.unconfirmed` is 0 even
+/// after mining several blocks. Verifies the mempool task doesn't
+/// spuriously credit confirmed coinbases as unconfirmed.
+#[test]
+fn test_address_index_mempool_quiet_when_empty() {
+    let mut node = TestNode::start(&[]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+
+    let _ = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(5), serde_json::json!(addr)],
+        )
+        .unwrap();
+
+    let resp = node
+        .rpc_call_with_params("getaddressbalance", vec![serde_json::json!(addr)])
+        .expect("rpc");
+    let confirmed = resp["result"]["confirmed"].as_u64().unwrap_or(0);
+    let unconfirmed = resp["result"]["unconfirmed"].as_i64().unwrap_or(0);
+    assert!(confirmed > 0, "confirmed must be non-zero after 5 blocks");
+    assert_eq!(
+        unconfirmed, 0,
+        "unconfirmed delta must be 0 when mempool is empty; got {}",
+        unconfirmed
+    );
+
+    node.stop();
+}
+

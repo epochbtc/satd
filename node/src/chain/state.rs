@@ -147,6 +147,11 @@ pub struct ChainState {
     /// Active node warnings (connect failures, storage issues, etc.).
     /// Always present — warnings are a core operational surface.
     warnings: std::sync::Arc<crate::warnings::NodeWarnings>,
+    /// Mempool handle for reorg re-add. Set by `set_mempool` after
+    /// construction to avoid a circular Arc cycle (mempool needs
+    /// chain_state for UTXO lookups). When unset (test backends),
+    /// the reorg re-add path is a no-op.
+    mempool: std::sync::OnceLock<std::sync::Arc<crate::mempool::pool::Mempool>>,
 }
 
 impl ChainState {
@@ -222,6 +227,7 @@ impl ChainState {
                     address_index,
                     reorg_log: std::sync::OnceLock::new(),
                     warnings: std::sync::Arc::new(crate::warnings::NodeWarnings::new()),
+                    mempool: std::sync::OnceLock::new(),
                 });
             }
 
@@ -269,7 +275,19 @@ impl ChainState {
             address_index,
             reorg_log: std::sync::OnceLock::new(),
             warnings: std::sync::Arc::new(crate::warnings::NodeWarnings::new()),
+            mempool: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Wire the mempool handle for reorg re-add. Called once at
+    /// startup after both ChainState and Mempool are constructed.
+    /// Test backends that don't exercise the reorg re-add path skip
+    /// this; the per-perform_reorg branch tolerates absence.
+    pub fn set_mempool(
+        &self,
+        mempool: std::sync::Arc<crate::mempool::pool::Mempool>,
+    ) {
+        let _ = self.mempool.set(mempool);
     }
 
     /// Access the shared warnings surface. Always present; use to
@@ -1408,6 +1426,10 @@ impl ChainState {
         let mut current = old_tip;
         let mut combined_batch = crate::storage::StoreBatch::default();
         let mut disconnected_hashes: Vec<BlockHash> = Vec::new();
+        // Disconnected non-coinbase txs, collected fork-parent-first so
+        // the post-commit re-add submits older parents before children
+        // (chained mempool acceptance requires parents already present).
+        let mut disconnected_txs: Vec<bitcoin::Transaction> = Vec::new();
         let old_height = self
             .store
             .get_block_index(&old_tip)
@@ -1439,6 +1461,13 @@ impl ChainState {
             )?;
             combined_batch.merge(batch);
 
+            // Capture non-coinbase txs for mempool re-add. Walking
+            // newest-disconnect-first means we'll later need to reverse
+            // when handing to the mempool — see below.
+            for tx in block.txdata.iter().skip(1) {
+                disconnected_txs.push(tx.clone());
+            }
+
             disconnected_hashes.push(current);
             tracing::info!(height = entry.height, hash = %current, "Block disconnected");
             current = prev_hash;
@@ -1452,6 +1481,31 @@ impl ChainState {
             let mut tip = self.tip.write().unwrap();
             tip.hash = fork_hash;
             tip.height = fork_entry.height;
+        }
+
+        // Mempool re-add. Bitcoin Core semantics: every tx that was in a
+        // disconnected block is re-offered to the mempool so users see
+        // their unconfirmed-but-still-valid txs come back. Order: oldest
+        // disconnected block first, then within block as listed (parents
+        // before children for chained tx graphs in the same block).
+        // Failures (RBF conflicts after the new chain reconnects, dust,
+        // etc.) are logged at debug, not propagated — they're expected.
+        if let Some(mempool) = self.mempool.get() {
+            // disconnected_txs were pushed newest-first; reverse to walk
+            // oldest-disconnected-block first.
+            disconnected_txs.reverse();
+            for tx in disconnected_txs {
+                let txid = tx.compute_txid();
+                if let Err(e) =
+                    mempool.accept_transaction(tx, self, &*self.script_verifier)
+                {
+                    tracing::debug!(
+                        %txid,
+                        err = ?e,
+                        "Reorg: re-add to mempool failed (likely conflict with new chain)"
+                    );
+                }
+            }
         }
 
         // NOTE: We deliberately do NOT persist a reorg record here. The

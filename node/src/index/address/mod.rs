@@ -13,6 +13,7 @@ pub mod config;
 pub mod emit;
 pub mod keys;
 pub mod lookups;
+pub mod mempool;
 pub mod trait_def;
 pub mod types;
 
@@ -25,5 +26,6 @@ pub use keys::{
     scripthash_of,
 };
 pub use lookups::RocksAddressIndex;
+pub use mempool::{MempoolAddrIndex, mempool_index_task};
 pub use trait_def::AddressIndex;
 pub use types::{HistoryEntry, IndexError, MempoolHistoryEntry, StatusUpdate, Utxo};
