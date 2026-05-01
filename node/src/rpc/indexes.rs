@@ -187,8 +187,9 @@ fn start_fresh(
 ) -> Result<Value, (i32, String)> {
     preflight_disk(chain).map_err(map_backfill_err)?;
 
-    let tip_height = chain.tip_height();
-    let tip_hash = chain.tip_hash();
+    // Atomic snapshot of (hash, height) so the persisted anchor and
+    // its height match exactly — see review-3 finding #1.
+    let (tip_hash, tip_height) = chain.tip_snapshot();
     let store = chain.store_ref();
 
     // Empty chain (genesis only): no walk needed. Mark Completed

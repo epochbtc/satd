@@ -5119,7 +5119,7 @@ fn test_address_index_backfill_reorg_invalidates_to_failed() {
     // Verify no stale rows remain. After Failed-cleanup:
     //  - addr_a should be empty (its blocks were disconnected by
     //    reorg AND backfill's stale rows for A were cleaned up).
-    //  - addr_b should have B's 5 live-indexed rows.
+    //  - addr_b should have B's 3 live-indexed rows.
     let history_a = node_a
         .rpc_call_with_params("getaddresshistory", vec![serde_json::json!(addr_a)])
         .expect("rpc");

@@ -231,8 +231,11 @@ impl BackfillRunner {
         snapshot_height: u32,
         anchor_hash: BlockHash,
     ) -> Result<(), BackfillError> {
-        let tip_hash = self.chain.tip_hash();
-        let tip_height = self.chain.tip_height();
+        // Atomic read of (tip_hash, tip_height). Two separate
+        // `tip_hash()`/`tip_height()` calls would race against live
+        // chain extension and produce false reorg diagnostics
+        // (review-3 finding #1).
+        let (tip_hash, tip_height) = self.chain.tip_snapshot();
         if tip_height < snapshot_height {
             return Err(BackfillError::ReorgInvalidated {
                 height: snapshot_height,
@@ -315,6 +318,33 @@ impl BackfillRunner {
             }
         }
         let old_snapshot = ActiveChainSnapshot { hashes: old_hashes };
+
+        // Build the LIVE active-chain hash vector by walking back from
+        // the current tip. We must not use get_block_hash_by_height
+        // here — that's not an active-chain oracle (header/store
+        // paths can pollute it with side-chain entries). Review-3 #2.
+        let (live_tip_hash, live_tip_height) = chain.tip_snapshot();
+        let live_hashes_len = (live_tip_height as usize + 1).max(1);
+        let mut live_hashes = vec![BlockHash::all_zeros(); live_hashes_len];
+        {
+            let mut h = live_tip_height;
+            let mut current = live_tip_hash;
+            loop {
+                live_hashes[h as usize] = current;
+                if h == 0 {
+                    break;
+                }
+                let entry = chain.store_ref().get_block_index(&current).ok_or_else(|| {
+                    BackfillError::Chain(format!(
+                        "reorg cleanup: missing block index walking live tip back at height {}",
+                        h
+                    ))
+                })?;
+                current = entry.header.prev_blockhash;
+                h -= 1;
+            }
+        }
+
         // Determine which heights backfill has already written to:
         //   pass 1: funding rows for 1..=cursor_height
         //   pass 2: ALL funding rows (1..=snapshot_height) plus
@@ -333,7 +363,10 @@ impl BackfillRunner {
         // amplification is fine because cleanup is bounded.
         for h in 1..=funding_high {
             let old_hash = old_snapshot.hashes[h as usize];
-            let live_hash = chain.store_ref().get_block_hash_by_height(h);
+            // Active-chain hash at h: from the live walk-back vector,
+            // not the height index. Heights past the live tip are
+            // implicitly non-active.
+            let live_hash = live_hashes.get(h as usize).copied();
             if live_hash == Some(old_hash) {
                 // OLD block at this height is still active — its rows
                 // are valid for the new chain too. Skip.
@@ -483,6 +516,14 @@ impl BackfillRunner {
             cur.snapshot_height = snapshot_height;
             self.handle.set_cursor(cur);
 
+            // Post-write anchor check. Catches a reorg that landed
+            // AFTER the pre-write check but BEFORE this write — those
+            // rows are now stale. Returning ReorgInvalidated lets the
+            // supervisor's cleanup walk remove them. This is what
+            // makes the final batch in each pass reorg-safe (there's
+            // no next iteration to catch it). Review-3 finding #3.
+            self.verify_anchor_active(snapshot_height, anchor)?;
+
             if h.is_multiple_of(DURABLE_FLUSH_EVERY_N_BLOCKS) {
                 tracing::info!(
                     pass = 1,
@@ -556,6 +597,12 @@ impl BackfillRunner {
             cur.cursor_height = h;
             cur.pass = 2;
             self.handle.set_cursor(cur);
+
+            // Post-write anchor check. Critical for the FINAL pass-2
+            // batch — without it, a reorg landing between pre-check
+            // and write would commit stale spending rows and the
+            // cursor would still go to Completed. See review-3 #3.
+            self.verify_anchor_active(snapshot_height, anchor)?;
 
             if h.is_multiple_of(DURABLE_FLUSH_EVERY_N_BLOCKS) {
                 tracing::info!(

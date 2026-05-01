@@ -30,7 +30,7 @@ use std::sync::{
 };
 
 use crate::index::address::cursor::{BackfillCursor, BackfillState};
-use crate::storage::{BackfillCursorWrite, Store, StoreBatch, StoreError};
+use crate::storage::{BackfillCursorWrite, Store, StoreBatch, StoreError, WriteMode};
 
 #[derive(Debug, thiserror::Error)]
 pub enum BackfillError {
@@ -157,7 +157,11 @@ impl BackfillHandle {
             }),
             ..Default::default()
         };
-        store.write_batch(batch)?;
+        // Force WriteMode::Normal for cursor transitions so a
+        // BulkLoad-mode chain (mid-IBD) can't lose Completed/Failed/
+        // Cancelled writes on a kill -9. Pairs with the runner's
+        // per-batch Normal writes (review-2 #4 / review-3 #4).
+        store.write_batch_mode(batch, WriteMode::Normal)?;
         // Best-effort clear; non-fatal if the underlying store doesn't
         // support it (in-memory test stores).
         let _ = store.write_backfill_last_error("");
