@@ -15,6 +15,7 @@ pub mod keys;
 pub mod lookups;
 pub mod mempool;
 pub mod notifier;
+pub mod stats;
 pub mod subscribe;
 pub mod trait_def;
 pub mod types;

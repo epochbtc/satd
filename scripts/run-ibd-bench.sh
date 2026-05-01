@@ -66,6 +66,14 @@ echo "  log:            $LOG_FILE"
 START_EPOCH=$(date +%s)
 echo "$START_EPOCH" > "$DATADIR/start_epoch"
 
+# Optional extra args injected by wrapper scripts (e.g.
+# `run-ibd-bench-with-addrindex.sh` adds `--addressindex=0|1`).
+EXTRA_ARGS=()
+if [[ -n "${IBD_BENCH_EXTRA_ARGS:-}" ]]; then
+    # shellcheck disable=SC2206  # intentional word-splitting
+    EXTRA_ARGS=( ${IBD_BENCH_EXTRA_ARGS} )
+fi
+
 exec "$SATD" \
     --datadir="$DATADIR" \
     --rpcport="$RPCPORT" \
@@ -76,4 +84,5 @@ exec "$SATD" \
     --consensus="$CONSENSUS" \
     --shadowworkers="$SHADOW_WORKERS" \
     --assumevalid="$ASSUMEVALID" \
+    "${EXTRA_ARGS[@]}" \
     "${CONNECT_ARGS[@]}" 2>&1 | tee "$LOG_FILE"

@@ -644,6 +644,8 @@ async fn main() {
             network: config.network,
             start_time: std::time::Instant::now(),
             version: env!("CARGO_PKG_VERSION"),
+            addr_subs: Some(address_index_concrete.subscription_registry()),
+            addr_enabled: config.addressindex,
         };
         let rx = shutdown_rx.clone();
         tokio::spawn(async move {
