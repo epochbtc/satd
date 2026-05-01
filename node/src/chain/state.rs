@@ -101,12 +101,22 @@ struct ChainTip {
 /// *after* the side chain has fully reconnected. Re-adding inside
 /// `perform_reorg` would validate against the fork-point UTXO set, not
 /// the final post-reorg active chain.
+///
+/// `disconnected_with_height` lets the caller emit
+/// `BlockDisconnected` chain events at the *end* of a successful
+/// reorg, not inline during the disconnect loop. Inline emission
+/// would notify subscribers about a tentative state that might be
+/// rolled back if a later reconnect fails.
 #[derive(Debug, Clone)]
 struct ReorgDisconnectInfo {
     old_tip: BlockHash,
     old_height: u32,
     /// Hashes disconnected, walked old-tip-first toward the fork parent.
     disconnected: Vec<BlockHash>,
+    /// (hash, height) pairs in walk-back order (newest disconnected
+    /// first → fork-parent last). Used by the deferred chain-event
+    /// emission in `connect_tip`.
+    disconnected_with_height: Vec<(BlockHash, u32)>,
     /// Non-coinbase transactions from disconnected blocks, in
     /// fork-parent-first order so the caller can re-add parents before
     /// children (chained mempool acceptance).
@@ -136,10 +146,11 @@ struct PendingReorgRecord {
     /// Re-offered to the mempool after the full reorg has activated so
     /// validation runs against the new chain, not the fork point.
     disconnected_txs: Vec<bitcoin::Transaction>,
-    /// Hashes of the original-chain blocks the reorg disconnected,
-    /// newest-first. Held so a triggering-block failure can roll the
-    /// chain back to the pre-reorg state.
-    original_disconnected: Vec<BlockHash>,
+    /// (hash, height) of the original-chain blocks the reorg
+    /// disconnected, newest-first. Used both for the triggering-block-
+    /// failure rollback and for the deferred `BlockDisconnected` chain
+    /// event emission at the end of a successful reorg.
+    original_disconnected: Vec<(BlockHash, u32)>,
 }
 
 /// Central chain state manager.
@@ -1451,10 +1462,11 @@ impl ChainState {
                     }
                     reconnected_hashes.push(*side_hash);
                     reconnected_blocks.push((side_block, side_entry.height));
-                    self.emit_chain_event(crate::chain::events::ChainEvent::BlockConnected {
-                        hash: *side_hash,
-                        height: side_entry.height,
-                    });
+                    // Chain event for this side block is staged and
+                    // emitted at the end of `connect_tip` only after
+                    // the entire reorg + mempool reconcile commits.
+                    // Emitting inline would notify subscribers about a
+                    // state that rollback could still revert.
                     tracing::info!(
                         height = side_entry.height,
                         hash = %side_hash,
@@ -1468,7 +1480,7 @@ impl ChainState {
                 tracing::warn!(error = %e, "Reorg side-chain reconnect failed; rolling back to old tip");
                 if let Err(re) = self.rollback_partial_reorg(
                     &reconnected_blocks,
-                    &disconnect_info.disconnected,
+                    &disconnect_info.disconnected_with_height,
                 ) {
                     tracing::error!(
                         original_error = %e,
@@ -1487,14 +1499,15 @@ impl ChainState {
                 fork_height: fork_entry.height,
                 old_tip: disconnect_info.old_tip,
                 old_height: disconnect_info.old_height,
-                disconnected: disconnect_info.disconnected.clone(),
+                disconnected: disconnect_info.disconnected,
                 reconnected_so_far: reconnected_hashes,
                 reconnected_blocks,
                 disconnected_txs: disconnect_info.disconnected_txs,
-                // Carry the original-chain hashes through to the
-                // triggering-block connect path so a failure there can
-                // still roll back to the pre-reorg chain.
-                original_disconnected: disconnect_info.disconnected,
+                // Carry the original-chain (hash, height) pairs
+                // through both for the triggering-block failure
+                // rollback and for the deferred BlockDisconnected
+                // event emission once the reorg fully commits.
+                original_disconnected: disconnect_info.disconnected_with_height,
             });
 
             // Fall through to connect the new block as a tip-extending block
@@ -1631,29 +1644,56 @@ impl ChainState {
             }
         }
 
-        if let Some(pending) = pending_reorg.take()
-            && let Some(log) = self.reorg_log.get()
-        {
-            let mut reconnected = pending.reconnected_so_far;
-            reconnected.push(block_hash);
-            let record = crate::chain::reorg_log::ReorgRecord::new(
-                pending.fork_height,
-                pending.old_tip,
-                block_hash,
-                pending.old_height,
-                pending.disconnected,
-                reconnected,
-            );
-            log.record(record);
+        // Reorg chain-event emission is deferred until here — past
+        // the rollback decision points and past the mempool reconcile
+        // — so subscribers see events only for a reorg that actually
+        // committed. If side-chain reconnect or the triggering block
+        // had failed, control returned with `Err` from the matching
+        // rollback branch above and these events never fire.
+        //
+        // Order: BlockDisconnected (newest disconnected first → fork-
+        // parent last), then side-chain BlockConnected (oldest first),
+        // then the triggering block's BlockConnected. Subscribers can
+        // walk the diff top-down and see a fully-consistent chainstate
+        // + mempool by the time each event lands.
+        if let Some(pending) = pending_reorg.take() {
+            for (hash, height) in &pending.original_disconnected {
+                self.emit_chain_event(
+                    crate::chain::events::ChainEvent::BlockDisconnected {
+                        hash: *hash,
+                        height: *height,
+                    },
+                );
+            }
+            for (side_block, side_height) in &pending.reconnected_blocks {
+                self.emit_chain_event(crate::chain::events::ChainEvent::BlockConnected {
+                    hash: side_block.block_hash(),
+                    height: *side_height,
+                });
+            }
+
+            if let Some(log) = self.reorg_log.get() {
+                let mut reconnected = pending.reconnected_so_far;
+                reconnected.push(block_hash);
+                let record = crate::chain::reorg_log::ReorgRecord::new(
+                    pending.fork_height,
+                    pending.old_tip,
+                    block_hash,
+                    pending.old_height,
+                    pending.disconnected,
+                    reconnected,
+                );
+                log.record(record);
+            }
         }
 
         // Update MTP cache with this block's timestamp
         self.push_mtp_cache(new_height, block.header.time);
 
         // Notify the address-index notifier (and any future
-        // observability subscribers) that a new tip is in place. Best-
-        // effort: emission never blocks the connect path. Mempool
-        // reconcile above ensures subscribers don't see the
+        // observability subscribers) that the triggering block is in
+        // place. Best-effort: emission never blocks the connect path.
+        // Mempool reconcile above ensures subscribers don't see the
         // pre-cleanup mempool.
         self.emit_chain_event(crate::chain::events::ChainEvent::BlockConnected {
             hash: block_hash,
@@ -1684,7 +1724,7 @@ impl ChainState {
     fn rollback_partial_reorg(
         &self,
         side_blocks_committed: &[(bitcoin::Block, u32)],
-        original_disconnected: &[BlockHash],
+        original_disconnected: &[(BlockHash, u32)],
     ) -> Result<(), ChainError> {
         // Disconnect side chain in reverse order (newest first).
         for (side_block, side_height) in side_blocks_committed.iter().rev() {
@@ -1720,7 +1760,7 @@ impl ChainState {
         // Reconnect the original chain in oldest-first order. The
         // original disconnect captured them newest-first (walk from
         // old_tip toward fork), so we reverse to play them forward.
-        for hash in original_disconnected.iter().rev() {
+        for (hash, _height) in original_disconnected.iter().rev() {
             let block = self.get_block(hash).ok_or(ChainError::FlatFile(
                 "block data missing during rollback reconnect".to_string(),
             ))?;
@@ -1843,18 +1883,6 @@ impl ChainState {
             tip.height = fork_entry.height;
         }
 
-        // Emit one BlockDisconnected per rolled-back block, in the
-        // walk-back order (newest disconnected first → fork-parent
-        // last). This matches the order in which the chain was
-        // actually rolled back — subscribers can iterate the diff
-        // top-down before seeing the reconnect events.
-        for (hash, height) in &disconnected_with_height {
-            self.emit_chain_event(crate::chain::events::ChainEvent::BlockDisconnected {
-                hash: *hash,
-                height: *height,
-            });
-        }
-
         // Block order: walk reversed so oldest disconnected block comes
         // first (parents-before-children across blocks). Tx order
         // within each block is preserved.
@@ -1873,10 +1901,17 @@ impl ChainState {
         // caller knows the real new-tip and the full reconnected list;
         // recording at this point would stamp fork_hash as "new tip"
         // and leave reconnected empty — misleading for operators.
+        //
+        // We also deliberately do NOT emit `BlockDisconnected` chain
+        // events here. Emitting inline would notify subscribers about
+        // a tentative state that the reorg may still roll back if a
+        // later reconnect fails. `connect_tip` emits the staged
+        // events at the end of a successful reorg.
         Ok(ReorgDisconnectInfo {
             old_tip,
             old_height,
             disconnected: disconnected_hashes,
+            disconnected_with_height,
             disconnected_txs,
         })
     }
@@ -2234,6 +2269,77 @@ pub(crate) mod tests {
         assert_eq!(cs.get_block_hash_by_height(1), Some(b1_hash));
         assert_eq!(cs.get_block_hash_by_height(2), Some(b2_hash));
         assert_eq!(cs.get_block_hash_by_height(3), Some(b3_hash));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_reorg_chain_events_emitted_after_full_commit() {
+        // Reorg-event ordering: subscribers must see BlockDisconnected
+        // events for the old chain followed by BlockConnected events
+        // for the new chain, all delivered after the reorg has fully
+        // committed (chain + mempool reconcile). No events should
+        // appear ahead of the final triggering block's connect.
+        use crate::chain::events::ChainEvent;
+        let (cs, dir) = make_chain_state();
+        let (chain_tx, mut chain_rx) =
+            tokio::sync::broadcast::channel::<ChainEvent>(64);
+        cs.set_chain_event_sender(chain_tx);
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+
+        // Active chain A: genesis -> A1 -> A2.
+        let a1 = build_test_block(genesis_hash, 1, 1_300_000_001);
+        let a1_hash = cs.accept_block(&a1).expect("accept A1");
+        let a2 = build_test_block(a1_hash, 2, 1_300_000_002);
+        let a2_hash = cs.accept_block(&a2).expect("accept A2");
+
+        // Drain pre-reorg connect events.
+        let mut pre_events = Vec::new();
+        while let Ok(ev) = chain_rx.try_recv() {
+            pre_events.push(ev);
+        }
+        assert_eq!(pre_events.len(), 2, "two BlockConnected before reorg");
+
+        // Heavier B: genesis -> B1 -> B2 -> B3 — triggers reorg on B3.
+        let b1 = build_test_block(genesis_hash, 1, 1_300_000_010);
+        let b1_hash = cs.accept_block(&b1).expect("accept B1");
+        let b2 = build_test_block(b1_hash, 2, 1_300_000_011);
+        let b2_hash = cs.accept_block(&b2).expect("accept B2");
+        let b3 = build_test_block(b2_hash, 3, 1_300_000_012);
+        let b3_hash = cs.accept_block(&b3).expect("accept B3");
+
+        // Collect the events emitted during accept_block(B3). Side
+        // chain blocks B1/B2 are stored as side-chain (no reorg),
+        // so only their accept calls drained nothing — they don't
+        // emit BlockConnected at storage time. The reorg fires when
+        // B3 is accepted.
+        let mut events = Vec::new();
+        while let Ok(ev) = chain_rx.try_recv() {
+            events.push(ev);
+        }
+        // Expected: BlockDisconnected(A2), BlockDisconnected(A1),
+        // BlockConnected(B1), BlockConnected(B2), BlockConnected(B3).
+        assert_eq!(events.len(), 5, "events emitted: {:?}", events);
+        assert!(matches!(
+            events[0],
+            ChainEvent::BlockDisconnected { hash, height: 2 } if hash == a2_hash
+        ), "first event: {:?}", events[0]);
+        assert!(matches!(
+            events[1],
+            ChainEvent::BlockDisconnected { hash, height: 1 } if hash == a1_hash
+        ), "second event: {:?}", events[1]);
+        assert!(matches!(
+            events[2],
+            ChainEvent::BlockConnected { hash, height: 1 } if hash == b1_hash
+        ), "third event: {:?}", events[2]);
+        assert!(matches!(
+            events[3],
+            ChainEvent::BlockConnected { hash, height: 2 } if hash == b2_hash
+        ), "fourth event: {:?}", events[3]);
+        assert!(matches!(
+            events[4],
+            ChainEvent::BlockConnected { hash, height: 3 } if hash == b3_hash
+        ), "fifth event: {:?}", events[4]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
