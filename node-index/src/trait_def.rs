@@ -9,9 +9,9 @@
 
 use tokio::sync::broadcast;
 
-use crate::index::address::keys::Scripthash;
-use crate::index::address::subscribe::SubscribeError;
-use crate::index::address::types::{
+use crate::keys::Scripthash;
+use crate::subscribe::SubscribeError;
+use crate::types::{
     HistoryEntry, IndexError, MempoolHistoryEntry, StatusUpdate, Utxo,
 };
 

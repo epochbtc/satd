@@ -1803,6 +1803,7 @@ dependencies = [
  "jsonrpsee",
  "libc",
  "lru",
+ "node-index",
  "rand 0.8.5",
  "rocksdb",
  "serde",
@@ -1813,6 +1814,16 @@ dependencies = [
  "tokio-socks",
  "tower",
  "tracing",
+]
+
+[[package]]
+name = "node-index"
+version = "0.1.0"
+dependencies = [
+ "bitcoin",
+ "serde",
+ "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]
