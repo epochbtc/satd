@@ -1280,14 +1280,22 @@ impl ChainState {
                 "Reorg: side chain has more work, activating"
             );
 
-            // Walk back from the side chain block to find the fork point
+            // Walk back from the side chain block to find the fork
+            // point — i.e. the deepest ancestor of the side chain that
+            // is currently on the active chain. Active-chain
+            // membership is determined by the height index
+            // (`get_block_hash_by_height(h) == Some(hash)`); blocks
+            // disconnected by past reorgs keep their `BlockStatus::
+            // Valid` marker, so checking status alone could stop the
+            // search at a stale ancestor and cause `perform_reorg` to
+            // try disconnecting toward a hash that isn't on the
+            // active chain.
             let fork_entry = {
                 let mut side_hash = prev_hash;
                 loop {
                     let side_entry = self.store.get_block_index(&side_hash)
                         .ok_or(ChainError::BadPrevBlock)?;
-                    // Fork point is a block that's on the main chain (Valid status)
-                    if side_entry.status == BlockStatus::Valid {
+                    if self.store.get_block_hash_by_height(side_entry.height) == Some(side_hash) {
                         break side_entry;
                     }
                     side_hash = side_entry.header.prev_blockhash;
@@ -2040,6 +2048,60 @@ pub(crate) mod tests {
         assert_eq!(cs.get_block_hash_by_height(1), Some(b1_hash));
         assert_eq!(cs.get_block_hash_by_height(2), Some(b2_hash));
         assert_eq!(cs.get_block_hash_by_height(3), Some(b3_hash));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_reorg_back_to_previously_disconnected_branch() {
+        // Stale-Valid fork-point regression: a previously disconnected
+        // ancestor still carries BlockStatus::Valid, so the old
+        // status-only fork-point search would stop at that stale
+        // ancestor and try to disconnect the live chain toward a hash
+        // that isn't on it. The new search uses the height index and
+        // walks past the stale block to the real active fork point.
+        let (cs, dir) = make_chain_state();
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+
+        // Active chain A: genesis -> A1 -> A2.
+        let a1 = build_test_block(genesis_hash, 1, 1_300_000_001);
+        let a1_hash = cs.accept_block(&a1).expect("accept A1");
+        let a2 = build_test_block(a1_hash, 2, 1_300_000_002);
+        let a2_hash = cs.accept_block(&a2).expect("accept A2");
+        assert_eq!(cs.tip_hash(), a2_hash);
+
+        // Heavier B: genesis -> B1 -> B2 -> B3. Reorgs over A.
+        let b1 = build_test_block(genesis_hash, 1, 1_300_000_010);
+        let b1_hash = cs.accept_block(&b1).expect("accept B1");
+        let b2 = build_test_block(b1_hash, 2, 1_300_000_011);
+        let b2_hash = cs.accept_block(&b2).expect("accept B2");
+        let b3 = build_test_block(b2_hash, 3, 1_300_000_012);
+        let b3_hash = cs.accept_block(&b3).expect("accept B3");
+        assert_eq!(cs.tip_hash(), b3_hash);
+        // Sanity: A2 was disconnected but its block-index status is
+        // still Valid — exactly the condition the old fork-point
+        // search would trip on.
+        let a2_entry = cs.get_block_index(&a2_hash).unwrap();
+        assert_eq!(a2_entry.status, BlockStatus::Valid);
+        assert_eq!(cs.get_block_hash_by_height(2), Some(b2_hash));
+
+        // Now extend the previously-disconnected A branch with new
+        // blocks A3 -> A4 -> A5, beating B's work.
+        let a3 = build_test_block(a2_hash, 3, 1_300_000_020);
+        let a3_hash = cs.accept_block(&a3).expect("accept A3");
+        let a4 = build_test_block(a3_hash, 4, 1_300_000_021);
+        let a4_hash = cs.accept_block(&a4).expect("accept A4");
+        let a5 = build_test_block(a4_hash, 5, 1_300_000_022);
+        let a5_hash = cs.accept_block(&a5).expect("accept A5");
+
+        // Reorg should activate to A5 (the heavier chain).
+        assert_eq!(cs.tip_hash(), a5_hash);
+        assert_eq!(cs.tip_height(), 5);
+        assert_eq!(cs.get_block_hash_by_height(1), Some(a1_hash));
+        assert_eq!(cs.get_block_hash_by_height(2), Some(a2_hash));
+        assert_eq!(cs.get_block_hash_by_height(3), Some(a3_hash));
+        assert_eq!(cs.get_block_hash_by_height(4), Some(a4_hash));
+        assert_eq!(cs.get_block_hash_by_height(5), Some(a5_hash));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
