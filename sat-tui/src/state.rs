@@ -155,6 +155,59 @@ impl IbdBitmap {
     }
 }
 
+/// Snapshot of the address-index backfill from `getindexinfo`. Only
+/// surfaced in the UI when state is one of `running`, `paused`, or
+/// `failed` — `idle`, `completed`, `cancelled`, `rejected` are quiet.
+#[derive(Debug, Clone)]
+pub struct BackfillProgress {
+    /// State label as reported by the daemon: `running` | `paused` |
+    /// `completed` | `failed` | `cancelled` | `rejected` | `idle`.
+    pub state: String,
+    pub pass: u8,
+    pub cursor_height: u32,
+    pub snapshot_height: u32,
+    pub estimated_remaining_seconds: u64,
+    /// Populated when state == "failed".
+    pub last_error: Option<String>,
+}
+
+impl BackfillProgress {
+    pub fn from_json(v: &serde_json::Value) -> Option<Self> {
+        let bf = v.get("address")?.get("backfill")?;
+        let state = bf.get("state")?.as_str()?.to_string();
+        Some(BackfillProgress {
+            state,
+            pass: bf.get("pass").and_then(|p| p.as_u64()).unwrap_or(0) as u8,
+            cursor_height: bf.get("cursor_height").and_then(|h| h.as_u64()).unwrap_or(0) as u32,
+            snapshot_height: bf.get("snapshot_height").and_then(|h| h.as_u64()).unwrap_or(0) as u32,
+            estimated_remaining_seconds: bf
+                .get("estimated_remaining_seconds")
+                .and_then(|s| s.as_u64())
+                .unwrap_or(0),
+            last_error: bf.get("last_error").and_then(|s| s.as_str()).map(str::to_string),
+        })
+    }
+
+    /// True only for states that warrant rendering a status row.
+    pub fn is_visible(&self) -> bool {
+        matches!(self.state.as_str(), "running" | "paused" | "failed")
+    }
+
+    /// Progress ratio across both passes (0.0..=1.0).
+    pub fn progress_ratio(&self) -> f64 {
+        if self.snapshot_height == 0 {
+            return 0.0;
+        }
+        let total = 2u64 * self.snapshot_height as u64;
+        let done = match self.pass {
+            1 => self.cursor_height as u64,
+            2 => self.snapshot_height as u64 + self.cursor_height as u64,
+            _ => 0,
+        };
+        (done as f64 / total as f64).clamp(0.0, 1.0)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AppState {
     // From RPCs
@@ -238,6 +291,10 @@ pub struct AppState {
 
     // IBD block map
     pub ibd_bitmap: Option<IbdBitmap>,
+
+    // Address-index backfill — None when no backfill cursor exists or
+    // when the response shape couldn't be parsed.
+    pub backfill: Option<BackfillProgress>,
 
     // UI state
     pub mode: ViewMode,
@@ -350,6 +407,7 @@ impl AppState {
             peer_dl_rates: HashMap::new(),
 
             ibd_bitmap: None,
+            backfill: None,
 
             mode: ViewMode::Steady,
             force_mode: None,
@@ -624,6 +682,11 @@ impl AppState {
     pub fn update_uptime(&mut self, v: &serde_json::Value) {
         self.loaded.uptime = true;
         self.uptime_secs = v.as_u64();
+    }
+
+    /// Update from `getindexinfo` response.
+    pub fn update_index_info(&mut self, v: &serde_json::Value) {
+        self.backfill = BackfillProgress::from_json(v);
     }
 
     /// Update mempool size distribution + top-N from getrawmempool verbose response.
@@ -1546,5 +1609,88 @@ mod tests {
         assert!(!st.is_healthy()); // stale
         st.stale = false;
         assert!(st.is_healthy());
+    }
+
+    #[test]
+    fn backfill_progress_parses_running_shape() {
+        let v = json!({
+            "address": {
+                "synced": false,
+                "best_block_height": 947_498,
+                "backfill": {
+                    "active": true,
+                    "state": "running",
+                    "pass": 1,
+                    "cursor_height": 100_000,
+                    "snapshot_height": 947_498,
+                    "estimated_remaining_seconds": 360,
+                }
+            }
+        });
+        let bf = BackfillProgress::from_json(&v).expect("backfill subobject present");
+        assert_eq!(bf.state, "running");
+        assert_eq!(bf.pass, 1);
+        assert_eq!(bf.cursor_height, 100_000);
+        assert_eq!(bf.snapshot_height, 947_498);
+        assert_eq!(bf.estimated_remaining_seconds, 360);
+        assert!(bf.last_error.is_none());
+        assert!(bf.is_visible());
+        // Pass 1 contributes cursor / (2 * snapshot) ≈ 5.28%
+        assert!((bf.progress_ratio() - 100_000.0 / (2.0 * 947_498.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn backfill_progress_visibility_filters_quiet_states() {
+        for state in ["idle", "completed", "cancelled", "rejected"] {
+            let v = json!({
+                "address": { "backfill": { "state": state } }
+            });
+            let bf = BackfillProgress::from_json(&v).unwrap();
+            assert!(!bf.is_visible(), "{state} should not be visible");
+        }
+        for state in ["running", "paused", "failed"] {
+            let v = json!({
+                "address": { "backfill": { "state": state } }
+            });
+            let bf = BackfillProgress::from_json(&v).unwrap();
+            assert!(bf.is_visible(), "{state} should be visible");
+        }
+    }
+
+    #[test]
+    fn backfill_progress_pass_two_advances_past_halfway() {
+        let v = json!({
+            "address": { "backfill": {
+                "state": "running",
+                "pass": 2,
+                "cursor_height": 947_498,
+                "snapshot_height": 947_498,
+            }}
+        });
+        let bf = BackfillProgress::from_json(&v).unwrap();
+        // End of pass 2 == 100% across both passes.
+        assert!((bf.progress_ratio() - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn backfill_progress_failed_carries_last_error() {
+        let v = json!({
+            "address": { "backfill": {
+                "state": "failed",
+                "pass": 1,
+                "cursor_height": 50_000,
+                "snapshot_height": 947_498,
+                "last_error": "snapshot tip no longer on active chain",
+            }}
+        });
+        let bf = BackfillProgress::from_json(&v).unwrap();
+        assert_eq!(bf.last_error.as_deref(), Some("snapshot tip no longer on active chain"));
+        assert!(bf.is_visible());
+    }
+
+    #[test]
+    fn backfill_progress_returns_none_when_no_backfill_subobject() {
+        let v = json!({ "address": { "synced": true } });
+        assert!(BackfillProgress::from_json(&v).is_none());
     }
 }

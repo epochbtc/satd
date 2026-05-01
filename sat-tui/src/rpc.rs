@@ -187,6 +187,10 @@ impl RpcClient {
     pub async fn get_block_header(&self, hash: &str) -> Result<serde_json::Value, RpcError> {
         self.call("getblockheader", &[serde_json::json!(hash), serde_json::json!(true)]).await
     }
+
+    pub async fn get_index_info(&self) -> Result<serde_json::Value, RpcError> {
+        self.call("getindexinfo", &[]).await
+    }
 }
 
 #[derive(Debug)]

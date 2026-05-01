@@ -4,7 +4,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Sparkline};
 
-use crate::state::AppState;
+use crate::state::{AppState, BackfillProgress};
 use crate::ui::{
     format_bytes, format_btc, format_duration, format_hash, format_hashrate, format_num,
     peer_table, render_loading_panel,
@@ -13,16 +13,26 @@ use crate::ui::{
 pub fn draw(f: &mut Frame, state: &AppState) {
     let size = f.area();
 
+    // Reserve a 1-row backfill status line just above the keybinding
+    // footer when a backfill is running / paused / failed. Quiet states
+    // (idle, completed, cancelled, rejected) get no row at all.
+    let show_backfill = state.backfill.as_ref().is_some_and(BackfillProgress::is_visible);
+
+    let mut constraints = vec![
+        Constraint::Length(1),  // title
+        Constraint::Length(9),  // chain + latest block
+        Constraint::Length(11), // mempool + fee estimates
+        Constraint::Length(9),  // utxo + network
+        Constraint::Min(5),     // peers
+    ];
+    if show_backfill {
+        constraints.push(Constraint::Length(1)); // backfill status
+    }
+    constraints.push(Constraint::Length(1)); // footer
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),  // title
-            Constraint::Length(9),  // chain + latest block
-            Constraint::Length(11), // mempool + fee estimates
-            Constraint::Length(9),  // utxo + network
-            Constraint::Min(5),    // peers
-            Constraint::Length(1), // footer
-        ])
+        .constraints(constraints)
         .split(size);
 
     // Title bar with health dot.
@@ -63,6 +73,15 @@ pub fn draw(f: &mut Frame, state: &AppState) {
     let table = peer_table(&state.peers, None, &state.peer_dl_rates, state.selected_peer, &peer_title);
     f.render_widget(table, chunks[4]);
 
+    // Backfill status row, when visible.
+    let footer_idx = if show_backfill {
+        let bf = state.backfill.as_ref().expect("show_backfill implies Some");
+        f.render_widget(Paragraph::new(backfill_line(bf)), chunks[5]);
+        6
+    } else {
+        5
+    };
+
     // Footer — keybindings plus an unclean-shutdown hint if applicable.
     let mut spans = vec![
         Span::styled("q", Style::default().fg(Color::White)),
@@ -82,7 +101,67 @@ pub fn draw(f: &mut Frame, state: &AppState) {
             Style::default().fg(Color::Yellow),
         ));
     }
-    f.render_widget(Paragraph::new(Line::from(spans)), chunks[5]);
+    f.render_widget(Paragraph::new(Line::from(spans)), chunks[footer_idx]);
+}
+
+/// One-line summary of a running / paused / failed backfill. Color
+/// follows the state: green for running, yellow for paused, red for
+/// failed.
+fn backfill_line(bf: &BackfillProgress) -> Line<'static> {
+    let pct = bf.progress_ratio() * 100.0;
+    let cursor = format_num(bf.cursor_height as u64);
+    let snapshot = format_num(bf.snapshot_height as u64);
+
+    match bf.state.as_str() {
+        "running" => {
+            let eta = if bf.estimated_remaining_seconds > 0 {
+                format!("  ETA {}", format_duration(bf.estimated_remaining_seconds))
+            } else {
+                String::new()
+            };
+            Line::from(vec![
+                Span::styled(" addr-index backfill ", Style::default().fg(Color::Black).bg(Color::Green).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    format!(
+                        " pass {}/2  {:.1}%  ({}/{}){}",
+                        bf.pass.clamp(1, 2),
+                        pct,
+                        cursor,
+                        snapshot,
+                        eta,
+                    ),
+                    Style::default().fg(Color::White),
+                ),
+            ])
+        }
+        "paused" => Line::from(vec![
+            Span::styled(" addr-index backfill ", Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!(
+                    " paused at pass {}/2  {:.1}%  ({}/{}) — resumeindex address",
+                    bf.pass.clamp(1, 2),
+                    pct,
+                    cursor,
+                    snapshot,
+                ),
+                Style::default().fg(Color::Yellow),
+            ),
+        ]),
+        "failed" => {
+            // Truncate the persisted error to keep the row to one line.
+            // The full message is available via `getindexinfo`.
+            let err = bf.last_error.as_deref().unwrap_or("(no error message)");
+            let err_short: String = err.chars().take(80).collect();
+            Line::from(vec![
+                Span::styled(" addr-index backfill ", Style::default().fg(Color::White).bg(Color::Red).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    format!(" FAILED — {}", err_short),
+                    Style::default().fg(Color::LightRed),
+                ),
+            ])
+        }
+        _ => Line::from(""),
+    }
 }
 
 fn draw_top_row(f: &mut Frame, area: Rect, state: &AppState) {
