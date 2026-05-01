@@ -4988,9 +4988,14 @@ fn test_address_index_backfill_reorg_invalidates_to_failed() {
     // A first then B; reversing the order trips the BIP113 MTP
     // check on subsequent B blocks because B's earlier timestamps
     // become "time-too-old" against A's chain.
+    //
+    // 1000 ms per batch gives a wide enough pause-observation window
+    // to absorb RPC-roundtrip variance on the self-hosted CI runner.
+    // 4 batches × 1 s = ~4 s of runtime; pauseindex from the test
+    // reliably lands during the first batch's sleep.
     let mut node_a = TestNode::start_with_env(
         &[],
-        &[("SATD_BACKFILL_DEBUG_DELAY_MS", "200")],
+        &[("SATD_BACKFILL_DEBUG_DELAY_MS", "1000")],
     );
     let _ = node_a
         .rpc_call_with_params(
@@ -5050,7 +5055,9 @@ fn test_address_index_backfill_reorg_invalidates_to_failed() {
         )
         .expect("rpc");
     // Wait for the runner to observe paused so cursor reflects Paused.
-    poll_backfill_state(&node_a, &["paused", "running"], Duration::from_secs(5));
+    // 15s timeout covers RPC-roundtrip variance + the 1 s/batch debug
+    // delay on the slowest self-hosted CI runners.
+    poll_backfill_state(&node_a, &["paused"], Duration::from_secs(15));
 
     // Submit B's blocks while the runner is paused. The reorg lands
     // immediately; the runner is sleeping in check_pause_loop. When
