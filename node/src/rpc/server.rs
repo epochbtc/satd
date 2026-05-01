@@ -1,12 +1,12 @@
 use crate::chain::state::ChainState;
-use crate::index::address::AddressIndex;
+use crate::index::address::{AddressIndex, BackfillHandle};
 use crate::mempool::fee::FeeEstimator;
 use crate::mempool::history::MempoolHistory;
 use crate::mempool::pool::Mempool;
 use crate::net::manager::PeerManager;
 use crate::rpc::amounts::{annotate_units, default_unit, format_amount, format_feerate_sat_per_kvb};
 use crate::rpc::auth::{AuthLayer, RpcAuth};
-use crate::rpc::{address, blockchain, mining, network, psbt, rawtx, util};
+use crate::rpc::{address, blockchain, indexes, mining, network, psbt, rawtx, util};
 use crate::storage::Store;
 use jsonrpsee::server::{RpcModule, ServerBuilder, ServerHandle};
 use jsonrpsee::types::ErrorObjectOwned;
@@ -38,6 +38,14 @@ pub struct RpcContext {
     /// Address-history index. Read surface for the `getaddress*` RPCs
     /// and (in M+1 milestones) the Electrum / Esplora handlers.
     pub address_index: Arc<dyn AddressIndex>,
+    /// Whether the address-history index is enabled at runtime —
+    /// used by `getindexinfo` to populate the `enabled` field.
+    pub address_index_enabled: bool,
+    /// Optional handle to the deferred-backfill task (M7). Drives
+    /// `getindexinfo`, `backfillindex`, `pause/resume/cancel`. Tests
+    /// without a backfill thread skip wiring; the RPCs return
+    /// "not initialized" errors in that case.
+    pub backfill: Option<Arc<BackfillHandle>>,
 }
 
 /// Which data source `estimatesmartfee` / `estimatefees` draws from.
@@ -127,6 +135,8 @@ pub async fn start(
     effective_config: serde_json::Value,
     mempool_history: Option<Arc<MempoolHistory>>,
     address_index: Arc<dyn AddressIndex>,
+    address_index_enabled: bool,
+    backfill: Option<Arc<BackfillHandle>>,
 ) -> Result<ServerHandle, Box<dyn std::error::Error + Send + Sync>> {
     let ctx = Arc::new(RpcContext {
         chain_state,
@@ -139,6 +149,8 @@ pub async fn start(
         effective_config,
         mempool_history,
         address_index,
+        address_index_enabled,
+        backfill,
     });
 
     let mut module = RpcModule::new(ctx);
@@ -328,6 +340,48 @@ pub async fn start(
             ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
         })?;
         address::get_address_utxos(&ctx.address_index, &v, ctx.chain_state.network)
+            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
+    })?;
+
+    // --- Index control RPCs (M7) ---
+
+    module.register_method("getindexinfo", |_params, ctx, _extensions| {
+        Ok::<_, ErrorObjectOwned>(indexes::get_index_info(
+            ctx.backfill.as_ref(),
+            ctx.address_index_enabled,
+            ctx.chain_state.tip_height(),
+        ))
+    })?;
+
+    module.register_method("backfillindex", |params, ctx, _extensions| {
+        let target: String = params.one().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        indexes::backfill_index(ctx.backfill.as_ref(), &target)
+            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
+    })?;
+
+    module.register_method("pauseindex", |params, ctx, _extensions| {
+        let target: String = params.one().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        indexes::pause_index(ctx.backfill.as_ref(), &target)
+            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
+    })?;
+
+    module.register_method("resumeindex", |params, ctx, _extensions| {
+        let target: String = params.one().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        indexes::resume_index(ctx.backfill.as_ref(), &target)
+            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
+    })?;
+
+    module.register_method("cancelindex", |params, ctx, _extensions| {
+        let target: String = params.one().map_err(|e| {
+            ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+        })?;
+        indexes::cancel_index(ctx.backfill.as_ref(), &target)
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 

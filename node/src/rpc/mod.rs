@@ -3,6 +3,7 @@ pub mod amounts;
 pub mod auth;
 pub mod blockchain;
 pub mod error;
+pub mod indexes;
 pub mod mining;
 pub mod network;
 pub mod psbt;

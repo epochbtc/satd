@@ -4015,7 +4015,108 @@ fn test_address_index_mempool_quiet_when_empty() {
         "unconfirmed delta must be 0 when mempool is empty; got {}",
         unconfirmed
     );
+    node.stop();
+}
+
+// ── Address-history index — backfill RPCs (M7) ────────────────────────
+
+/// `getindexinfo` returns the wrapping `{"address": {...}}` envelope
+/// expected by the spec (ADDRESS_INDEX.md §"Status reporting"):
+/// nested `{address: {synced, best_block_height, backfill: {...}}}`.
+#[test]
+fn test_address_index_getindexinfo_shape() {
+    let mut node = TestNode::start(&[]);
+    let resp = node.rpc_call("getindexinfo").expect("rpc");
+    let addr = &resp["result"]["address"];
+    assert!(addr.is_object(), "address key missing: {}", resp);
+    // synced=true is correct for a non-AssumeUTXO datadir: every
+    // block already had its rows written from connect_block.
+    assert_eq!(addr["synced"].as_bool(), Some(true));
+    assert!(
+        addr["best_block_height"].as_u64().is_some(),
+        "best_block_height must be present: {}",
+        resp
+    );
+
+    let bf = &addr["backfill"];
+    assert!(bf.is_object(), "backfill substructure missing: {}", resp);
+    assert_eq!(bf["active"].as_bool(), Some(false));
+    assert_eq!(bf["pass"].as_u64(), Some(0));
+    assert_eq!(bf["cursor_height"].as_u64(), Some(0));
+    assert_eq!(bf["snapshot_height"].as_u64(), Some(0));
+    assert_eq!(bf["estimated_remaining_seconds"].as_u64(), Some(0));
+    node.stop();
+}
+
+/// `pauseindex address` / `resumeindex address` / `cancelindex address`
+/// must accept the `address` target and surface the cursor's state
+/// label. Wrong targets reject with a -8 error.
+#[test]
+fn test_address_index_backfill_control_rpcs() {
+    // M7 ships scaffolding: no backfill task is spawned (AssumeUTXO
+    // isn't in the tree). pause/resume/cancel must reject as -8 with
+    // a clear "no backfill running" message rather than returning
+    // success+state:idle, which would mislead operators into thinking
+    // the index is paused when it isn't.
+    let mut node = TestNode::start(&[]);
+
+    for method in ["pauseindex", "resumeindex", "cancelindex"] {
+        let r = node
+            .rpc_call_with_params(method, vec![serde_json::json!("address")])
+            .expect("rpc");
+        assert_eq!(
+            r["error"]["code"].as_i64(),
+            Some(-8),
+            "{} on idle backfill must return -8: {}",
+            method,
+            r
+        );
+        let msg = r["error"]["message"].as_str().unwrap_or("");
+        assert!(
+            msg.contains("no backfill is in progress"),
+            "{} error message should explain idle state: {:?}",
+            method,
+            msg
+        );
+    }
+
+    // Wrong target still rejected.
+    let r = node
+        .rpc_call_with_params(
+            "pauseindex",
+            vec![serde_json::json!("not-a-real-index")],
+        )
+        .expect("rpc");
+    assert!(
+        r["error"]["code"].as_i64().is_some(),
+        "expected error for unknown target: {}",
+        r
+    );
+    assert_eq!(r["error"]["code"].as_i64().unwrap(), -8);
 
     node.stop();
 }
 
+/// `backfillindex address` returns the no-op explanation when there's
+/// no AssumeUTXO snapshot — the index was already populated at
+/// connect_block time on this datadir.
+#[test]
+fn test_address_index_backfillindex_noop_without_assumeutxo() {
+    let mut node = TestNode::start(&[]);
+    let r = node
+        .rpc_call_with_params(
+            "backfillindex",
+            vec![serde_json::json!("address")],
+        )
+        .expect("rpc");
+    assert_eq!(r["result"]["started"].as_bool(), Some(false));
+    assert!(
+        r["result"]["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("AssumeUTXO"),
+        "expected AssumeUTXO mention in reason: {}",
+        r
+    );
+    node.stop();
+}
