@@ -1801,6 +1801,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "jsonrpsee",
+ "libc",
  "lru",
  "rand 0.8.5",
  "rocksdb",

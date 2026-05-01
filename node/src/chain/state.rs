@@ -392,6 +392,18 @@ impl ChainState {
         self.tip.read().unwrap().height
     }
 
+    /// Read the active-chain tip's hash and height under a single
+    /// `tip.read()` guard. Callers that need both fields together —
+    /// e.g. the address-index backfill's `verify_anchor_active` — must
+    /// use this method instead of two separate `tip_hash()` /
+    /// `tip_height()` calls; otherwise a chain extension between the
+    /// two reads can pair an old hash with a new height (or vice
+    /// versa) and produce false reorg-invalidated diagnostics.
+    pub fn tip_snapshot(&self) -> (BlockHash, u32) {
+        let tip = self.tip.read().unwrap();
+        (tip.hash, tip.height)
+    }
+
     /// Flush the UTXO write cache to disk. Call periodically during IBD
     /// and on graceful shutdown.
     pub fn flush_coin_cache(&self) -> Result<(), StoreError> {
@@ -839,6 +851,14 @@ impl ChainState {
         };
         let data = self.flat_files.lock().unwrap().read_block(&pos).ok()?;
         bitcoin::consensus::deserialize(&data).ok()
+    }
+
+    /// Read the block at a given active-chain height. Returns `None` for
+    /// heights past the tip, missing block index entries, or pruned/invalid
+    /// blocks. Used by the address-index backfill runner.
+    pub fn read_block_at_height(&self, height: u32) -> Option<Block> {
+        let hash = self.store.get_block_hash_by_height(height)?;
+        self.get_block(&hash)
     }
 
     /// Read a block from flat files without acquiring the flat_files mutex.

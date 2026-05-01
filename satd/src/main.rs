@@ -569,15 +569,105 @@ async fn main() {
         });
     }
 
-    // Backfill handle (M7). Always created so `getindexinfo` /
-    // pause/resume/cancel report a stable shape — for non-AssumeUTXO
-    // datadirs the cursor stays Idle and the RPCs are no-ops.
+    // Backfill handle (M7). Initial cursor is loaded from persisted
+    // metadata so a restart resumes from the last batch boundary
+    // (state == Running) or stays idle (state == Idle/Completed/etc).
+    let initial_cursor = chain_state.store_ref().read_backfill_cursor();
+    if !matches!(
+        initial_cursor.state,
+        node::index::address::BackfillState::Idle
+    ) {
+        tracing::info!(
+            state = %initial_cursor.state.label(),
+            pass = initial_cursor.pass,
+            cursor_height = initial_cursor.cursor_height,
+            snapshot_height = initial_cursor.snapshot_height,
+            "addr-index backfill cursor restored from metadata"
+        );
+    }
     let backfill_handle = std::sync::Arc::new(
-        node::index::address::BackfillHandle::new(
-            node::index::address::BackfillCursor::idle(),
-        ),
+        node::index::address::BackfillHandle::new(initial_cursor),
     );
 
+    // Orphan-temp-CF cleanup: if the persisted cursor isn't actively
+    // mid-backfill (Running/Paused) but the temp CF still exists,
+    // drop it. This handles the "crashed between mark_completed and
+    // drop_cf" window — without this, the temp CF would survive
+    // forever after a clean Completed run that was interrupted at
+    // exactly the wrong moment.
+    if !matches!(
+        initial_cursor.state,
+        node::index::address::BackfillState::Running
+            | node::index::address::BackfillState::Paused
+    ) && chain_state.store_ref().backfill_temp_cf_exists()
+        && let Err(e) = chain_state.store_ref().drop_backfill_temp_cf()
+    {
+        tracing::warn!(error = %e, "failed to drop orphan addr-index backfill temp CF at startup");
+    }
+
+    // Backfill supervisor: receives RPC commands, spawns at most one
+    // runner at a time. Crash recovery: if persisted cursor.state ==
+    // Running on startup AND the address index is enabled, immediately
+    // spawn a runner so backfill resumes after a kill -9. `Paused` is
+    // sticky — operator must `resumeindex` to continue. `Failed` and
+    // other terminal states require a fresh `backfillindex` call.
+    let (backfill_cmd_tx, backfill_cmd_rx) =
+        tokio::sync::mpsc::channel::<node::index::address::BackfillCommand>(1);
+    {
+        let handle = backfill_handle.clone();
+        let chain = chain_state.clone();
+        let addr_cfg = node::index::address::AddressIndexConfig {
+            enabled: config.addressindex,
+            max_subscriptions: config.addrindexsubscriptions,
+            ..Default::default()
+        };
+        let shutdown = shutdown_rx.clone();
+        // Auto-resume on Running OR Paused with the index actually
+        // enabled. Skipping the auto-resume when --addressindex=0
+        // prevents the supervisor from advancing the cursor through a
+        // runner that would refuse to write rows (silently leaving
+        // history gaps — see review-1 finding #4).
+        //
+        // Paused is included so a sticky-paused cursor across restart
+        // has a live runner to observe `resumeindex`/`cancelindex`. The
+        // runner enters check_pause_loop immediately (paused atomic is
+        // initialized from the cursor in BackfillHandle::new) and waits
+        // there until the operator hits resume/cancel — see review-2
+        // finding #3.
+        let auto_resume_state = matches!(
+            handle.cursor().state,
+            node::index::address::BackfillState::Running
+                | node::index::address::BackfillState::Paused
+        );
+        let resume_on_start = config.addressindex && auto_resume_state;
+        if !resume_on_start && auto_resume_state && !config.addressindex {
+            tracing::warn!(
+                state = %handle.cursor().state.label(),
+                "addr-index backfill cursor is active but --addressindex=0; \
+                 supervisor will NOT auto-resume — re-enable the index and restart"
+            );
+        }
+        tokio::spawn(async move {
+            backfill_supervisor(
+                handle,
+                chain,
+                addr_cfg,
+                backfill_cmd_rx,
+                shutdown,
+                resume_on_start,
+            )
+            .await;
+        });
+    }
+
+    // Keep a clone of the shutdown sender in main so Ctrl-C / SIGTERM
+    // can broadcast shutdown to all watch receivers (including the
+    // backfill supervisor + runner). The RPC server takes its own
+    // clone for the `stop` RPC path. Without this, signal-driven
+    // shutdown would proceed to the flush phase without notifying
+    // long-running blocking tasks like the backfill runner, which
+    // would keep the Tokio runtime alive past the deadline.
+    let shutdown_signal_tx = shutdown_tx.clone();
     let server_handle = match node::rpc::server::start(
         bind_addr,
         auth.clone(),
@@ -592,6 +682,7 @@ async fn main() {
         address_index,
         config.addressindex,
         Some(backfill_handle.clone()),
+        Some(backfill_cmd_tx.clone()),
     )
     .await
     {
@@ -771,9 +862,15 @@ async fn main() {
         }
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("Ctrl+C received, shutting down");
+            // Broadcast shutdown so the backfill runner + supervisor
+            // and any other watch subscribers exit promptly. Without
+            // this, a paused or running blocking task could keep the
+            // Tokio runtime alive past the flush deadline.
+            let _ = shutdown_signal_tx.send(true);
         }
         _ = sigterm.recv() => {
             tracing::info!("SIGTERM received, shutting down");
+            let _ = shutdown_signal_tx.send(true);
         }
     }
 
@@ -980,6 +1077,150 @@ async fn reorg_webhook_dispatcher(
         }
     }
     tracing::info!("Reorg webhook dispatcher stopped");
+}
+
+/// Address-index backfill supervisor. Owns serialization (one runner
+/// at a time) and crash recovery (auto-respawns on startup if the
+/// persisted cursor state is Running and the index is enabled).
+///
+/// The runner itself is synchronous (RocksDB calls are blocking), so
+/// it executes inside `spawn_blocking`. The supervisor stays in tokio
+/// to react to shutdown and incoming commands.
+async fn backfill_supervisor(
+    handle: std::sync::Arc<node::index::address::BackfillHandle>,
+    chain: std::sync::Arc<node::chain::state::ChainState>,
+    cfg: node::index::address::AddressIndexConfig,
+    mut cmd_rx: tokio::sync::mpsc::Receiver<node::index::address::BackfillCommand>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    resume_on_start: bool,
+) {
+    if resume_on_start {
+        tracing::info!("addr-index backfill: auto-resuming from persisted cursor");
+        spawn_runner(handle.clone(), chain.clone(), cfg.clone(), shutdown.clone()).await;
+    }
+
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    tracing::info!("addr-index backfill supervisor: shutdown");
+                    return;
+                }
+            }
+            cmd = cmd_rx.recv() => {
+                let Some(cmd) = cmd else {
+                    // All senders dropped; nothing else can request a backfill.
+                    return;
+                };
+                match cmd {
+                    node::index::address::BackfillCommand::Start => {
+                        spawn_runner(
+                            handle.clone(),
+                            chain.clone(),
+                            cfg.clone(),
+                            shutdown.clone(),
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Spawn a runner on the blocking pool and log its result. On a
+/// non-shutdown error, persist `Failed` with the error message so
+/// `getindexinfo` surfaces it to the operator and `cancelindex` can
+/// clear stale active state without requiring a live runner. The
+/// supervisor awaits the join handle so subsequent commands queue up
+/// behind it (channel size 1; further sends backpressure or fail).
+async fn spawn_runner(
+    handle: std::sync::Arc<node::index::address::BackfillHandle>,
+    chain: std::sync::Arc<node::chain::state::ChainState>,
+    cfg: node::index::address::AddressIndexConfig,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    let handle_for_failure = handle.clone();
+    let chain_for_failure = chain.clone();
+    let join = tokio::task::spawn_blocking(move || {
+        let runner = node::index::address::BackfillRunner {
+            handle,
+            chain,
+            cfg,
+            shutdown,
+        };
+        runner.run()
+    });
+    let result = join.await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(node::index::address::BackfillError::Shutdown)) => {
+            tracing::info!("addr-index backfill: stopped for shutdown (resume on next start)");
+        }
+        Ok(Err(node::index::address::BackfillError::Cancelled)) => {
+            tracing::info!("addr-index backfill: cancelled by operator");
+        }
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "addr-index backfill runner exited with error");
+            persist_failed_with_cleanup(&handle_for_failure, &chain_for_failure, &e).await;
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "addr-index backfill runner task panicked");
+            let msg = format!("runner panicked: {}", e);
+            if let Err(p) = handle_for_failure
+                .mark_failed(chain_for_failure.store_ref().as_ref(), &msg)
+            {
+                tracing::warn!(error = %p, "failed to persist Failed state after runner panic");
+            }
+            // Best-effort: drop temp CF on panic so a fresh start
+            // doesn't reuse partial pass-1 state.
+            let _ = chain_for_failure.store_ref().drop_backfill_temp_cf();
+        }
+    }
+}
+
+/// Persist Failed and clean up. For ReorgInvalidated specifically,
+/// run the OLD-snapshot stale-row cleanup before transitioning so a
+/// subsequent fresh backfill doesn't see stale rows from the
+/// abandoned chain. Other errors don't need the cleanup walk because
+/// they don't imply chain divergence (insufficient disk, missing
+/// block, temp CF miss, etc.).
+async fn persist_failed_with_cleanup(
+    handle: &std::sync::Arc<node::index::address::BackfillHandle>,
+    chain: &std::sync::Arc<node::chain::state::ChainState>,
+    err: &node::index::address::BackfillError,
+) {
+    use node::index::address::BackfillError;
+    let cleanup_needed = matches!(err, BackfillError::ReorgInvalidated { .. });
+    if cleanup_needed {
+        let chain_clone = chain.clone();
+        let handle_clone = handle.clone();
+        let cleanup_join = tokio::task::spawn_blocking(move || {
+            node::index::address::BackfillRunner::cleanup_stale_rows_after_reorg(
+                chain_clone.as_ref(),
+                handle_clone.as_ref(),
+            )
+        })
+        .await;
+        match cleanup_join {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "addr-index reorg cleanup failed; proceeding to mark Failed");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "addr-index reorg cleanup task panicked");
+            }
+        }
+    }
+    let msg = format!("{}", err);
+    if let Err(p) = handle.mark_failed(chain.store_ref().as_ref(), &msg) {
+        tracing::warn!(error = %p, "failed to persist Failed state");
+    }
+    // Drop temp CF so a fresh backfill starts from a clean slate
+    // rather than reusing pass-1 mappings from the failed run.
+    if let Err(e) = chain.store_ref().drop_backfill_temp_cf() {
+        tracing::warn!(error = %e, "failed to drop temp CF after Failed");
+    }
 }
 
 /// HMAC-SHA256 over `msg` keyed by `key`, hex-encoded. Pure Rust so we

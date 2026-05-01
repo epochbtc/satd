@@ -17,12 +17,14 @@ pub mod keys;
 pub mod lookups;
 pub mod mempool;
 pub mod notifier;
+pub mod runner;
 pub mod stats;
 pub mod subscribe;
 pub mod trait_def;
 pub mod types;
 
-pub use backfill::{BackfillHandle, StatusReport, render_status};
+pub use backfill::{BackfillError, BackfillHandle, StatusReport, render_status};
+pub use runner::{BackfillCommand, BackfillRunner, PREFLIGHT_REQUIRED_FREE_BYTES, preflight_disk};
 pub use config::AddressIndexConfig;
 pub use cursor::{BackfillCursor, BackfillState};
 pub use emit::{emit_funding, emit_spending, funding_remove_key, spending_remove_key};

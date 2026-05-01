@@ -9,9 +9,15 @@
 
 use std::sync::Arc;
 
+use bitcoin::hashes::Hash;
 use serde_json::{Value, json};
 
-use crate::index::address::{BackfillHandle, cursor::BackfillState, render_status};
+use crate::chain::state::ChainState;
+use crate::index::address::{
+    BackfillCommand, BackfillError, BackfillHandle, cursor::BackfillState, preflight_disk,
+    render_status,
+};
+use crate::storage::Store;
 
 /// `getindexinfo` → `{"address": {...}, ...}` per
 /// `ADDRESS_INDEX.md` §"Status reporting":
@@ -37,6 +43,7 @@ use crate::index::address::{BackfillHandle, cursor::BackfillState, render_status
 /// response slim for the common "no backfill needed" case.
 pub fn get_index_info(
     backfill: Option<&Arc<BackfillHandle>>,
+    chain: &Arc<ChainState>,
     address_enabled: bool,
     best_block_height: u32,
 ) -> Value {
@@ -59,6 +66,7 @@ pub fn get_index_info(
     let estimated_remaining_seconds = estimate_remaining_seconds(&report);
     let mut bf = serde_json::Map::new();
     bf.insert("active".into(), json!(active));
+    bf.insert("state".into(), json!(cursor_state.label()));
     bf.insert("pass".into(), json!(report.pass));
     bf.insert("cursor_height".into(), json!(report.cursor_height));
     bf.insert("snapshot_height".into(), json!(report.snapshot_height));
@@ -66,6 +74,15 @@ pub fn get_index_info(
         "estimated_remaining_seconds".into(),
         json!(estimated_remaining_seconds),
     );
+    // Surface the persisted last-error message when the cursor is in
+    // Failed state so operators can see *why* the backfill stopped
+    // without grepping the log. Cleared automatically on the next
+    // state transition (see `BackfillHandle::persist`).
+    if cursor_state == BackfillState::Failed
+        && let Some(msg) = chain.store_ref().read_backfill_last_error()
+    {
+        bf.insert("last_error".into(), json!(msg));
+    }
     address.insert("backfill".into(), Value::Object(bf));
 
     json!({ "address": Value::Object(address) })
@@ -94,29 +111,184 @@ fn estimate_remaining_seconds(report: &crate::index::address::backfill::StatusRe
 }
 
 /// `backfillindex address` → trigger a deferred backfill for the
-/// address-history index. M7 scaffolding: returns the current state
-/// so operators can confirm the index is wired; actual two-pass
-/// execution lights up when AssumeUTXO lands and the snapshot
-/// height is known.
+/// address-history index. Two-pass walk over every block from genesis
+/// to the chain tip, populating the address-index CFs that pre-date
+/// the operator turning the index on.
+///
+/// All synchronous setup — disk pre-flight, temp-CF creation, anchor
+/// persistence — happens inside this handler before returning
+/// `started: true`. That closes the duplicate-RPC race: a second
+/// caller arriving between the first's `try_send` and the supervisor
+/// spawning the runner now sees the persisted `Running` state and
+/// gets the standard "already in progress" response.
+///
+/// `Failed` is treated as a non-terminal recovery state (lenient
+/// contract): a fresh `backfillindex` after a failed run starts over.
 pub fn backfill_index(
     backfill: Option<&Arc<BackfillHandle>>,
+    cmd_tx: Option<&tokio::sync::mpsc::Sender<BackfillCommand>>,
+    chain: &Arc<ChainState>,
+    address_index_enabled: bool,
     target: &str,
 ) -> Result<Value, (i32, String)> {
     if target != "address" {
         return Err((-8, format!("unknown index target '{}'", target)));
     }
-    match backfill {
-        Some(h) => {
-            // No-op for now: with AssumeUTXO not in the tree, every
-            // block already populated the index from `connect_block`.
-            // We expose the intent so the wire surface is stable.
-            Ok(json!({
+    if !address_index_enabled {
+        return Err((
+            -8,
+            "address index is disabled (--addressindex=0); enable it before requesting a backfill"
+                .into(),
+        ));
+    }
+    let h = backfill.ok_or((-32603, "backfill handle not initialized".to_string()))?;
+    let tx = cmd_tx.ok_or((
+        -32603,
+        "backfill supervisor not running — restart the daemon to wire it".to_string(),
+    ))?;
+
+    let cur = h.cursor();
+    match cur.state {
+        BackfillState::Running | BackfillState::Paused => Ok(in_progress_response(&cur)),
+        BackfillState::Completed => Ok(json!({
+            "started": false,
+            "reason": "backfill already completed for this datadir",
+            "state": cur.state.label(),
+            "snapshot_height": cur.snapshot_height,
+        })),
+        BackfillState::Idle
+        | BackfillState::Cancelled
+        | BackfillState::Rejected
+        | BackfillState::Failed => start_fresh(h, tx, chain, &cur),
+    }
+}
+
+fn in_progress_response(cur: &crate::index::address::cursor::BackfillCursor) -> Value {
+    json!({
+        "started": false,
+        "reason": "backfill already in progress",
+        "state": cur.state.label(),
+        "pass": cur.pass,
+        "cursor_height": cur.cursor_height,
+        "snapshot_height": cur.snapshot_height,
+    })
+}
+
+/// Synchronous fresh-start path. Runs pre-flight, snapshots the chain
+/// tip, creates the temp CF, and atomically persists `Running` via
+/// `handle.start()` — so a duplicate RPC arriving between this and
+/// the supervisor spawn sees `Running` and falls into the "already
+/// running" branch.
+fn start_fresh(
+    h: &Arc<BackfillHandle>,
+    tx: &tokio::sync::mpsc::Sender<BackfillCommand>,
+    chain: &Arc<ChainState>,
+    prev: &crate::index::address::cursor::BackfillCursor,
+) -> Result<Value, (i32, String)> {
+    preflight_disk(chain).map_err(map_backfill_err)?;
+
+    // Atomic snapshot of (hash, height) so the persisted anchor and
+    // its height match exactly — see review-3 finding #1.
+    let (tip_hash, tip_height) = chain.tip_snapshot();
+    let store = chain.store_ref();
+
+    // Empty chain (genesis only): no walk needed. Mark Completed
+    // synchronously without spawning a runner. This still creates +
+    // drops the temp CF so the durable state matches the "just ran a
+    // backfill" path (operators can rely on `getindexinfo.synced`).
+    if tip_height == 0 {
+        store
+            .create_backfill_temp_cf()
+            .map_err(|e| (-32603, format!("create temp CF: {}", e)))?;
+        h.reset_flags();
+        h.start(store.as_ref(), 0, tip_hash.to_byte_array())
+            .map_err(map_backfill_err)?;
+        h.mark_completed(store.as_ref()).map_err(map_backfill_err)?;
+        store
+            .drop_backfill_temp_cf()
+            .map_err(|e| (-32603, format!("drop temp CF: {}", e)))?;
+        return Ok(json!({
+            "started": true,
+            "completed": true,
+            "reason": "empty chain — nothing to walk",
+            "previous_state": prev.state.label(),
+        }));
+    }
+
+    // Reserve a permit on the supervisor channel BEFORE persisting
+    // Running. Otherwise a `try_send` failure (channel full or
+    // receiver dropped) would leave the cursor stuck Running with no
+    // runner alive to advance it — review-2 finding #5.
+    let permit = match tx.try_reserve() {
+        Ok(p) => p,
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+            // Channel size 1 + the supervisor processes one Start at
+            // a time. A full channel means a Start is already queued
+            // — treat as an in-progress duplicate rather than failing
+            // the operator.
+            return Ok(json!({
                 "started": false,
-                "reason": "AssumeUTXO is not in the tree; every block was already indexed at connect_block time. Backfill is a no-op for this datadir.",
-                "state": h.cursor().state.label(),
-            }))
+                "reason": "another backfill start is already queued",
+                "state": prev.state.label(),
+            }));
         }
-        None => Err((-32603, "backfill handle not initialized".to_string())),
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+            return Err((
+                -32603,
+                "backfill supervisor channel closed; restart the daemon".to_string(),
+            ));
+        }
+    };
+
+    store
+        .create_backfill_temp_cf()
+        .map_err(|e| (-32603, format!("create temp CF: {}", e)))?;
+    h.reset_flags();
+
+    // start() atomically transitions Idle/Cancelled/Rejected/Failed/
+    // Completed → Running. If a concurrent caller raced ahead and
+    // already set Running, we get AlreadyRunning back — surface that
+    // as the standard "already in progress" wire shape rather than a
+    // generic -32603. The reserved permit is dropped (no command sent)
+    // — that's fine because the winning caller already enqueued one.
+    match h.start(store.as_ref(), tip_height, tip_hash.to_byte_array()) {
+        Ok(()) => {}
+        Err(BackfillError::AlreadyRunning(_)) => {
+            // Lost the race; current cursor reflects the winner.
+            drop(permit);
+            return Ok(in_progress_response(&h.cursor()));
+        }
+        Err(e) => {
+            drop(permit);
+            return Err(map_backfill_err(e));
+        }
+    }
+
+    // Send via the reserved permit — infallible; closes the dispatch
+    // gap that `try_send` had between persisting Running and the
+    // supervisor receiving the command.
+    permit.send(BackfillCommand::Start);
+    Ok(json!({
+        "started": true,
+        "previous_state": prev.state.label(),
+        "snapshot_height": tip_height,
+    }))
+}
+
+fn map_backfill_err(e: BackfillError) -> (i32, String) {
+    match e {
+        BackfillError::InsufficientDisk { have, need } => (
+            -8,
+            format!(
+                "insufficient free disk for backfill: have {} bytes, need {} bytes (~80 GB)",
+                have, need
+            ),
+        ),
+        BackfillError::AddressIndexDisabled => (
+            -8,
+            "address index is disabled; enable --addressindex=1 first".into(),
+        ),
+        other => (-32603, format!("backfill setup failed: {}", other)),
     }
 }
 

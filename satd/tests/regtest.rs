@@ -17,6 +17,15 @@ struct TestNode {
 
 impl TestNode {
     fn start(extra_args: &[&str]) -> Self {
+        Self::start_with_env(extra_args, &[])
+    }
+
+    /// Like `start` but also sets environment variables on the spawned
+    /// satd process. Used by backfill tests to inject the per-block
+    /// debug delay knob (`SATD_BACKFILL_DEBUG_DELAY_MS`) without
+    /// polluting the parent process's environment, which would race
+    /// across parallel tests.
+    fn start_with_env(extra_args: &[&str], env: &[(&str, &str)]) -> Self {
         let rpcport = find_available_port();
         let datadir = std::env::temp_dir().join(format!("satd-test-{}", rpcport));
         let _ = std::fs::create_dir_all(&datadir);
@@ -41,6 +50,9 @@ impl TestNode {
         }
         for arg in extra_args {
             cmd.arg(arg);
+        }
+        for (k, v) in env {
+            cmd.env(k, v);
         }
 
         let process = cmd
@@ -132,6 +144,15 @@ impl TestNode {
 
     /// Start a node reusing an existing datadir (for restart/reindex tests).
     fn start_with_datadir(datadir: &std::path::Path, rpcport: u16, extra_args: &[&str]) -> Self {
+        Self::start_with_datadir_env(datadir, rpcport, extra_args, &[])
+    }
+
+    fn start_with_datadir_env(
+        datadir: &std::path::Path,
+        rpcport: u16,
+        extra_args: &[&str],
+        env: &[(&str, &str)],
+    ) -> Self {
         let satd_bin = env!("CARGO_BIN_EXE_satd");
 
         let has_port = extra_args.iter().any(|a| a.starts_with("--port"));
@@ -147,10 +168,32 @@ impl TestNode {
         for arg in extra_args {
             cmd.arg(arg);
         }
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+
+        // Optional stderr capture for tests that need to diagnose
+        // startup failures. If `SATD_TEST_STDERR_DIR` is set, satd's
+        // stderr is redirected to a file under that directory keyed by
+        // (rpcport, timestamp). Default: silent (parity with `start`).
+        let stderr_target = match std::env::var("SATD_TEST_STDERR_DIR") {
+            Ok(dir) => {
+                let _ = std::fs::create_dir_all(&dir);
+                let stamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0);
+                let path = std::path::PathBuf::from(&dir)
+                    .join(format!("satd-{}-{}.stderr.log", rpcport, stamp));
+                let f = std::fs::File::create(&path).expect("create stderr log");
+                std::process::Stdio::from(f)
+            }
+            Err(_) => std::process::Stdio::null(),
+        };
 
         let process = cmd
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(stderr_target)
             .spawn()
             .expect("Failed to start satd");
 
@@ -4097,12 +4140,128 @@ fn test_address_index_backfill_control_rpcs() {
     node.stop();
 }
 
-/// `backfillindex address` returns the no-op explanation when there's
-/// no AssumeUTXO snapshot — the index was already populated at
-/// connect_block time on this datadir.
+/// Helper: poll `getindexinfo` until the address-index backfill state
+/// matches one of `expected`. Returns the final response, or panics on
+/// timeout. Default 30 s deadline tracks the runner's per-batch
+/// cadence; tests that inject a long debug delay should size up.
+fn poll_backfill_state(
+    node: &TestNode,
+    expected: &[&str],
+    deadline: std::time::Duration,
+) -> serde_json::Value {
+    let start = Instant::now();
+    let mut last = serde_json::Value::Null;
+    while start.elapsed() < deadline {
+        let r = node.rpc_call("getindexinfo").expect("rpc");
+        let bf = &r["result"]["address"]["backfill"];
+        // Prefer the explicit state field (added in the round-1 fix);
+        // fall back to active/synced inference for backwards compat
+        // if the field is missing.
+        let state_str = bf["state"].as_str().unwrap_or("");
+        if !state_str.is_empty() {
+            for label in expected {
+                if &state_str == label {
+                    return r;
+                }
+                if *label == "synced"
+                    && (state_str == "completed" || state_str == "idle")
+                {
+                    return r;
+                }
+            }
+        } else {
+            let active = bf["active"].as_bool().unwrap_or(false);
+            let synced = r["result"]["address"]["synced"].as_bool().unwrap_or(false);
+            for label in expected {
+                let matches = match *label {
+                    "running" | "paused" => active,
+                    "completed" | "idle" => synced && !active,
+                    "synced" => synced,
+                    _ => false,
+                };
+                if matches {
+                    return r;
+                }
+            }
+        }
+        last = r;
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!(
+        "timeout waiting for backfill state {:?}; last response: {}",
+        expected, last
+    );
+}
+
+/// `backfillindex address` starts a real two-pass backfill on a
+/// non-AssumeUTXO datadir. Replaces the M7-era "no-op" test once the
+/// genesis→tip walk landed.
 #[test]
-fn test_address_index_backfillindex_noop_without_assumeutxo() {
+fn test_address_index_backfillindex_starts_and_completes() {
     let mut node = TestNode::start(&[]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    // Mine a small chain so there's something to walk over.
+    let _ = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(20), serde_json::json!(addr)],
+        )
+        .expect("rpc");
+
+    let r = node
+        .rpc_call_with_params(
+            "backfillindex",
+            vec![serde_json::json!("address")],
+        )
+        .expect("rpc");
+    assert_eq!(
+        r["result"]["started"].as_bool(),
+        Some(true),
+        "expected started=true on fresh datadir: {}",
+        r
+    );
+
+    let final_resp = poll_backfill_state(
+        &node,
+        &["completed"],
+        Duration::from_secs(30),
+    );
+    let bf = &final_resp["result"]["address"]["backfill"];
+    assert_eq!(bf["active"].as_bool(), Some(false));
+    assert!(
+        final_resp["result"]["address"]["synced"]
+            .as_bool()
+            .unwrap_or(false),
+        "synced must be true after completion: {}",
+        final_resp
+    );
+    // Snapshot height should reflect the chain tip at the time of start.
+    assert!(bf["snapshot_height"].as_u64().unwrap_or(0) >= 20);
+
+    node.stop();
+}
+
+/// A second `backfillindex` after completion is idempotent: returns
+/// `started: false` with the "already completed" reason.
+#[test]
+fn test_address_index_backfill_idempotent_after_completion() {
+    let mut node = TestNode::start(&[]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let _ = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(15), serde_json::json!(addr)],
+        )
+        .expect("rpc");
+
+    let _ = node
+        .rpc_call_with_params(
+            "backfillindex",
+            vec![serde_json::json!("address")],
+        )
+        .expect("rpc");
+    poll_backfill_state(&node, &["completed"], Duration::from_secs(30));
+
     let r = node
         .rpc_call_with_params(
             "backfillindex",
@@ -4110,13 +4269,965 @@ fn test_address_index_backfillindex_noop_without_assumeutxo() {
         )
         .expect("rpc");
     assert_eq!(r["result"]["started"].as_bool(), Some(false));
+    let reason = r["result"]["reason"].as_str().unwrap_or("");
     assert!(
-        r["result"]["reason"]
-            .as_str()
-            .unwrap_or("")
-            .contains("AssumeUTXO"),
-        "expected AssumeUTXO mention in reason: {}",
+        reason.contains("already completed"),
+        "expected 'already completed' reason; got: {}",
+        reason
+    );
+
+    node.stop();
+}
+
+/// `--addressindex=0` makes `backfillindex address` reject with an
+/// operator-friendly -8 error. Otherwise the runner would write rows
+/// to a CF nobody reads.
+#[test]
+fn test_address_index_backfill_disabled_returns_error() {
+    let mut node = TestNode::start(&["--addressindex=0"]);
+    let r = node
+        .rpc_call_with_params(
+            "backfillindex",
+            vec![serde_json::json!("address")],
+        )
+        .expect("rpc");
+    assert_eq!(r["error"]["code"].as_i64(), Some(-8));
+    let msg = r["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("disabled") || msg.contains("--addressindex=0"),
+        "error should explain index is disabled; got: {}",
+        msg
+    );
+    node.stop();
+}
+
+/// Pause mid-run, observe paused state, resume, observe completion.
+/// Uses `SATD_BACKFILL_DEBUG_DELAY_MS` to slow the runner so the test
+/// can race the pause flag in.
+#[test]
+fn test_address_index_backfill_pause_resume() {
+    // Inject 30 ms per-block delay so 30 blocks ≈ 1 s pass 1 and we
+    // have time to pause cleanly. Env var is set on the spawned
+    // process only — parent's env stays clean across parallel tests.
+    let mut node = TestNode::start_with_env(
+        &[],
+        &[("SATD_BACKFILL_DEBUG_DELAY_MS", "30")],
+    );
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let _ = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(30), serde_json::json!(addr)],
+        )
+        .expect("rpc");
+
+    let _ = node
+        .rpc_call_with_params(
+            "backfillindex",
+            vec![serde_json::json!("address")],
+        )
+        .expect("rpc");
+
+    // Pause within 100 ms — runner is almost certainly between batches.
+    std::thread::sleep(Duration::from_millis(100));
+    let pause_resp = node
+        .rpc_call_with_params(
+            "pauseindex",
+            vec![serde_json::json!("address")],
+        )
+        .expect("rpc");
+    assert_eq!(
+        pause_resp["result"]["paused"].as_bool(),
+        Some(true),
+        "pauseindex should accept while running: {}",
+        pause_resp
+    );
+
+    // Observe `active=true` (paused state still shows as active in the
+    // RPC envelope — `synced` would be false because the cursor isn't
+    // at snapshot_height yet).
+    let mid = node.rpc_call("getindexinfo").expect("rpc");
+    let bf_mid = &mid["result"]["address"]["backfill"];
+    assert_eq!(bf_mid["active"].as_bool(), Some(true), "{}", mid);
+
+    // Resume and wait for completion.
+    let resume_resp = node
+        .rpc_call_with_params(
+            "resumeindex",
+            vec![serde_json::json!("address")],
+        )
+        .expect("rpc");
+    assert_eq!(resume_resp["result"]["resumed"].as_bool(), Some(true));
+
+    poll_backfill_state(&node, &["completed"], Duration::from_secs(60));
+
+    node.stop();
+}
+
+/// Cancel mid-run, observe cancelled state, then a fresh start
+/// succeeds (proving the temp CF was dropped and persisted state
+/// was reset).
+#[test]
+fn test_address_index_backfill_cancel_then_restart_succeeds() {
+    let mut node = TestNode::start_with_env(
+        &[],
+        &[("SATD_BACKFILL_DEBUG_DELAY_MS", "30")],
+    );
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let _ = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(30), serde_json::json!(addr)],
+        )
+        .expect("rpc");
+
+    let _ = node
+        .rpc_call_with_params(
+            "backfillindex",
+            vec![serde_json::json!("address")],
+        )
+        .expect("rpc");
+
+    std::thread::sleep(Duration::from_millis(100));
+    let cancel_resp = node
+        .rpc_call_with_params(
+            "cancelindex",
+            vec![serde_json::json!("address")],
+        )
+        .expect("rpc");
+    assert_eq!(
+        cancel_resp["result"]["cancelled"].as_bool(),
+        Some(true),
+        "cancelindex should accept while running: {}",
+        cancel_resp
+    );
+
+    // Wait briefly for the runner to observe the cancel flag, persist
+    // state=Cancelled, and drop the temp CF before exiting.
+    std::thread::sleep(Duration::from_millis(500));
+
+    // A fresh start must succeed (started=true) — the previous
+    // Cancelled state isn't terminal.
+    let r = node
+        .rpc_call_with_params(
+            "backfillindex",
+            vec![serde_json::json!("address")],
+        )
+        .expect("rpc");
+    assert_eq!(
+        r["result"]["started"].as_bool(),
+        Some(true),
+        "start after cancel should succeed: {}",
         r
     );
+    let prev = r["result"]["previous_state"].as_str().unwrap_or("");
+    assert_eq!(prev, "cancelled", "previous_state should be cancelled");
+
+    poll_backfill_state(&node, &["completed"], Duration::from_secs(60));
+
+    node.stop();
+}
+
+/// Crash recovery: kill the process mid-backfill, restart with the
+/// same datadir, observe the supervisor auto-resumes and completes.
+/// Uses the debug delay so the kill lands in the middle of pass 1.
+///
+/// Test setup mines + graceful-stops *before* the kill phase so the
+/// chain tip is durable on disk. Without that step, regtest's
+/// CoinCache buffers tip writes in memory until the next flush
+/// threshold (which 40 small blocks won't trigger), so a kill -9
+/// would lose the chain tip and the resumed run would have nothing
+/// to walk.
+#[test]
+fn test_address_index_backfill_resumable_after_kill() {
+    let datadir = std::env::temp_dir().join(format!(
+        "satd-backfill-resume-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&datadir);
+
+    let rpcport = find_available_port();
+    let p2p_port = find_available_port();
+    let port_arg = format!("--port={}", p2p_port);
+
+    // Phase 1: mine 40 blocks, graceful-stop to flush tip durably.
+    let mut node = TestNode::start_with_datadir(&datadir, rpcport, &[&port_arg]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let _ = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(40), serde_json::json!(addr)],
+        )
+        .expect("rpc");
+    node.stop();
+
+    // Phase 2: restart with the debug delay, kick off backfill,
+    // kill -9 mid-pass-1.
+    let env: &[(&str, &str)] = &[("SATD_BACKFILL_DEBUG_DELAY_MS", "30")];
+    let mut node = TestNode::start_with_datadir_env(
+        &datadir,
+        rpcport,
+        &[],
+        env,
+    );
+    // Sanity: chain should still be at 40 after the restart.
+    let info = node.rpc_call("getblockchaininfo").expect("rpc");
+    assert_eq!(
+        info["result"]["blocks"].as_u64(),
+        Some(40),
+        "chain tip should survive graceful stop+restart: {}",
+        info
+    );
+    let _ = node
+        .rpc_call_with_params(
+            "backfillindex",
+            vec![serde_json::json!("address")],
+        )
+        .expect("rpc");
+    std::thread::sleep(Duration::from_millis(300));
+    let _ = node.process.kill();
+    let _ = node.process.wait();
+    std::mem::forget(node); // skip Drop's datadir cleanup
+
+    // Phase 3: restart cleanly (no debug delay) and observe the
+    // supervisor's auto-resume reaching Completed.
+    let mut node = TestNode::start_with_datadir(&datadir, rpcport, &[]);
+    poll_backfill_state(&node, &["completed"], Duration::from_secs(60));
+
+    node.stop();
+    let _ = std::fs::remove_dir_all(&datadir);
+}
+
+/// After a successful backfill, restarting the node leaves the
+/// persisted state at Completed (not Idle). The `address.synced`
+/// field reads true and a fresh `backfillindex` call is the
+/// "already completed" no-op.
+#[test]
+fn test_address_index_backfill_persists_completed_across_restart() {
+    let datadir = std::env::temp_dir().join(format!(
+        "satd-backfill-persist-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&datadir);
+    let rpcport = find_available_port();
+    let p2p_port = find_available_port();
+    let port_arg = format!("--port={}", p2p_port);
+
+    let mut node = TestNode::start_with_datadir(
+        &datadir,
+        rpcport,
+        &[&port_arg],
+    );
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let _ = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(15), serde_json::json!(addr)],
+        )
+        .expect("rpc");
+    let _ = node
+        .rpc_call_with_params(
+            "backfillindex",
+            vec![serde_json::json!("address")],
+        )
+        .expect("rpc");
+    poll_backfill_state(&node, &["completed"], Duration::from_secs(30));
+    node.stop();
+
+    // Restart against the same datadir.
+    let node = TestNode::start_with_datadir(&datadir, rpcport, &[]);
+    let info = node.rpc_call("getindexinfo").expect("rpc");
+    assert!(
+        info["result"]["address"]["synced"]
+            .as_bool()
+            .unwrap_or(false),
+        "synced should still be true after restart: {}",
+        info
+    );
+    let r = node
+        .rpc_call_with_params(
+            "backfillindex",
+            vec![serde_json::json!("address")],
+        )
+        .expect("rpc");
+    assert_eq!(r["result"]["started"].as_bool(), Some(false));
+    let reason = r["result"]["reason"].as_str().unwrap_or("");
+    assert!(
+        reason.contains("already completed"),
+        "expected 'already completed' after restart: {}",
+        reason
+    );
+    let mut node = node;
+    node.stop();
+    let _ = std::fs::remove_dir_all(&datadir);
+}
+
+/// Data-correctness test: mine with `--addressindex=0`, restart with
+/// `=1`, run backfill, and verify `getaddressbalance`/
+/// `getaddresshistory`/`getaddressutxos` produce the same results as
+/// a control node that ran with `=1` from genesis.
+///
+/// This is THE test that exercises the row-writing code path on data
+/// that doesn't already have rows. The earlier completion-state tests
+/// pass even on a broken row writer because live `connect_block`
+/// already wrote the rows during mining.
+#[test]
+fn test_address_index_backfill_data_parity_after_disabled_mining() {
+    // The address used as both coinbase recipient and lookup key.
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let blocks = 25;
+
+    // ── Control: run with --addressindex=1 from the start ──
+    let mut control = TestNode::start(&[]);
+    let _ = control
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(blocks), serde_json::json!(addr)],
+        )
+        .expect("rpc");
+    let control_balance = control
+        .rpc_call_with_params("getaddressbalance", vec![serde_json::json!(addr)])
+        .expect("rpc");
+    let control_history = control
+        .rpc_call_with_params("getaddresshistory", vec![serde_json::json!(addr)])
+        .expect("rpc");
+    let control_utxos = control
+        .rpc_call_with_params("getaddressutxos", vec![serde_json::json!(addr)])
+        .expect("rpc");
+    control.stop();
+
+    // ── Subject: mine with --addressindex=0 (no rows written), then
+    // restart with =1 (live indexer covers heights from restart-tip
+    // onward, but pre-restart rows are missing), then run backfill. ──
+    let datadir = std::env::temp_dir().join(format!(
+        "satd-backfill-parity-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&datadir);
+    let rpcport = find_available_port();
+    let p2p_port = find_available_port();
+    let port_arg = format!("--port={}", p2p_port);
+
+    let mut subject = TestNode::start_with_datadir(
+        &datadir,
+        rpcport,
+        &["--addressindex=0", &port_arg],
+    );
+    let _ = subject
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(blocks), serde_json::json!(addr)],
+        )
+        .expect("rpc");
+    // Sanity: with the index disabled, lookups return an explicit
+    // error (not zero/empty silently) so operators can tell the
+    // difference between "no activity" and "index off".
+    let pre_balance = subject
+        .rpc_call_with_params("getaddressbalance", vec![serde_json::json!(addr)])
+        .expect("rpc");
+    assert!(
+        pre_balance["error"].is_object(),
+        "getaddressbalance should error when --addressindex=0; got {}",
+        pre_balance
+    );
+    subject.stop();
+
+    // Restart with index enabled. Mine no further blocks. Run backfill.
+    let subject = TestNode::start_with_datadir(&datadir, rpcport, &[]);
+    let r = subject
+        .rpc_call_with_params(
+            "backfillindex",
+            vec![serde_json::json!("address")],
+        )
+        .expect("rpc");
+    assert_eq!(
+        r["result"]["started"].as_bool(),
+        Some(true),
+        "expected backfill to start: {}",
+        r
+    );
+    poll_backfill_state(&subject, &["completed"], Duration::from_secs(60));
+
+    let subj_balance = subject
+        .rpc_call_with_params("getaddressbalance", vec![serde_json::json!(addr)])
+        .expect("rpc");
+    let subj_history = subject
+        .rpc_call_with_params("getaddresshistory", vec![serde_json::json!(addr)])
+        .expect("rpc");
+    let subj_utxos = subject
+        .rpc_call_with_params("getaddressutxos", vec![serde_json::json!(addr)])
+        .expect("rpc");
+
+    assert_eq!(
+        control_balance["result"]["confirmed"].as_u64(),
+        subj_balance["result"]["confirmed"].as_u64(),
+        "confirmed balance must match control: control={} subject={}",
+        control_balance,
+        subj_balance,
+    );
+    // Compare full row content (txid, vout, height, amount, type),
+    // not just counts. A count-equal-but-content-divergent backfill
+    // would silently pass a count-only check (review-2 #10).
+    let mut ctrl_hist: Vec<String> = control_history["result"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|v| serde_json::to_string(&v).unwrap_or_default())
+        .collect();
+    let mut subj_hist: Vec<String> = subj_history["result"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|v| serde_json::to_string(&v).unwrap_or_default())
+        .collect();
+    ctrl_hist.sort();
+    subj_hist.sort();
+    assert_eq!(
+        ctrl_hist, subj_hist,
+        "address history rows must match control content-for-content"
+    );
+
+    let mut ctrl_utxos: Vec<String> = control_utxos["result"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|v| serde_json::to_string(&v).unwrap_or_default())
+        .collect();
+    let mut subj_utxos: Vec<String> = subj_utxos["result"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|v| serde_json::to_string(&v).unwrap_or_default())
+        .collect();
+    ctrl_utxos.sort();
+    subj_utxos.sort();
+    assert_eq!(
+        ctrl_utxos, subj_utxos,
+        "address UTXO rows must match control content-for-content"
+    );
+
+    let mut subject = subject;
+    subject.stop();
+    let _ = std::fs::remove_dir_all(&datadir);
+}
+
+/// Spending-row test: mine to a known-key address, spend that
+/// coinbase to a second address, and verify the backfill emits a
+/// `getaddresshistory` entry on the *destination* (a spending row
+/// referenced through pass 2's temp-CF lookup) plus the coinbase
+/// funding rows.
+#[test]
+fn test_address_index_backfill_spending_row_with_real_spend() {
+    use bitcoin::hashes::Hash as _;
+    use bitcoin::key::CompressedPublicKey;
+    use bitcoin::secp256k1::{Message, Secp256k1, SecretKey};
+    use bitcoin::sighash::{EcdsaSighashType, SighashCache};
+    use bitcoin::{
+        absolute::LockTime, Address, Amount, Network, OutPoint, PublicKey, ScriptBuf, Sequence,
+        Transaction, TxIn, TxOut, Witness,
+    };
+    use std::str::FromStr;
+
+    // ── Build a known-key P2WPKH source address ──
+    let secp = Secp256k1::new();
+    let sk = SecretKey::from_slice(&[0x42u8; 32]).unwrap();
+    let pk = PublicKey::new(sk.public_key(&secp));
+    let cpk = CompressedPublicKey::from_slice(&pk.to_bytes()).unwrap();
+    let src_addr = Address::p2wpkh(&cpk, Network::Regtest);
+    let src_str = src_addr.to_string();
+
+    // Destination: the canonical zero-hash address (no key needed —
+    // we never spend from it, just observe rows).
+    let dest_addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+
+    // Run the whole mine-and-spend sequence with `--addressindex=0`
+    // so live indexing writes NOTHING. Then restart with `=1` and
+    // run backfill — this is the only way to actually exercise
+    // pass-2 row writing on a non-coinbase input. With the index
+    // enabled from the start, live `connect_block` already writes
+    // the spending row and a broken backfill would still be silent
+    // (review-2 #8).
+    let datadir = std::env::temp_dir().join(format!(
+        "satd-spending-row-test-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&datadir);
+    let rpcport = find_available_port();
+    let p2p_port = find_available_port();
+    let port_arg = format!("--port={}", p2p_port);
+
+    let mut node = TestNode::start_with_datadir(
+        &datadir,
+        rpcport,
+        &["--addressindex=0", &port_arg],
+    );
+
+    // Mine 101 blocks so the first coinbase is matured (subsidy spendable).
+    let _ = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(101), serde_json::json!(src_str)],
+        )
+        .expect("rpc");
+
+    // Pull block 1's coinbase txid. satd's `getblock` verbosity 1
+    // returns the tx-id list; verbosity 2 (full tx detail) is not
+    // supported, so we infer the coinbase value from the regtest
+    // block-1 subsidy (50 BTC).
+    let block1_hash_resp = node
+        .rpc_call_with_params("getblockhash", vec![serde_json::json!(1)])
+        .expect("rpc");
+    let block1_hash = block1_hash_resp["result"].as_str().unwrap().to_string();
+    let block1_resp = node
+        .rpc_call_with_params(
+            "getblock",
+            vec![serde_json::json!(block1_hash), serde_json::json!(1)],
+        )
+        .expect("rpc");
+    let cb_txid_str = block1_resp["result"]["tx"][0].as_str().unwrap();
+    let cb_txid = bitcoin::Txid::from_str(cb_txid_str).unwrap();
+    // Regtest block-1 coinbase subsidy: 50 BTC (no halvings before 150).
+    let cb_value_sat: u64 = 50 * 100_000_000;
+
+    // ── Build the spending tx: src coinbase → dest, minus 1000 sat fee ──
+    let dest_script = Address::from_str(dest_addr)
+        .unwrap()
+        .require_network(Network::Regtest)
+        .unwrap()
+        .script_pubkey();
+    let send_value = cb_value_sat - 1000;
+    let mut spend = Transaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint { txid: cb_txid, vout: 0 },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(send_value),
+            script_pubkey: dest_script,
+        }],
+    };
+
+    // Sign the P2WPKH input. BIP143 sighash → ECDSA over the digest.
+    let src_script = src_addr.script_pubkey();
+    let mut cache = SighashCache::new(&spend);
+    let sighash = cache
+        .p2wpkh_signature_hash(
+            0,
+            &src_script,
+            Amount::from_sat(cb_value_sat),
+            EcdsaSighashType::All,
+        )
+        .unwrap();
+    let msg = Message::from_digest(sighash.to_byte_array());
+    let sig = secp.sign_ecdsa(&msg, &sk);
+    let mut sig_bytes = sig.serialize_der().to_vec();
+    sig_bytes.push(EcdsaSighashType::All as u8);
+    let mut witness = Witness::new();
+    witness.push(sig_bytes);
+    witness.push(pk.to_bytes());
+    spend.input[0].witness = witness;
+
+    let raw_hex = hex::encode(bitcoin::consensus::serialize(&spend));
+    let submit = node
+        .rpc_call_with_params(
+            "sendrawtransaction",
+            vec![serde_json::json!(raw_hex)],
+        )
+        .expect("rpc");
+    assert!(
+        submit["result"].is_string(),
+        "sendrawtransaction should accept signed P2WPKH spend; got {}",
+        submit
+    );
+
+    // Mine one more block to confirm the spend.
+    let _ = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(1), serde_json::json!(src_str)],
+        )
+        .expect("rpc");
+
+    let spend_txid = spend.compute_txid().to_string();
+
+    // Stop with --addressindex=0 (no rows written); restart with =1
+    // so backfill is the ONLY writer of address rows.
+    node.stop();
+
+    let node = TestNode::start_with_datadir(&datadir, rpcport, &[]);
+
+    // Sanity: lookups should work but return empty pre-backfill
+    // (chain is fully synced; just no rows in the addr CFs yet).
+    let pre_dest_history = node
+        .rpc_call_with_params("getaddresshistory", vec![serde_json::json!(dest_addr)])
+        .expect("rpc");
+    assert_eq!(
+        pre_dest_history["result"]
+            .as_array()
+            .map(|a| a.len())
+            .unwrap_or(0),
+        0,
+        "pre-backfill: dest history must be empty (no rows yet)"
+    );
+
+    // ── Run backfill (the ONLY writer of rows here) ──
+    let r = node
+        .rpc_call_with_params(
+            "backfillindex",
+            vec![serde_json::json!("address")],
+        )
+        .expect("rpc");
+    assert_eq!(
+        r["result"]["started"].as_bool(),
+        Some(true),
+        "expected backfill to start: {}",
+        r
+    );
+    poll_backfill_state(&node, &["completed"], Duration::from_secs(60));
+
+    // Destination must have exactly one funding row (the spend
+    // delivered cb_value_sat - 1000 to it).
+    let post_dest_history = node
+        .rpc_call_with_params("getaddresshistory", vec![serde_json::json!(dest_addr)])
+        .expect("rpc");
+    let dest_entries = post_dest_history["result"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        dest_entries.len(),
+        1,
+        "destination should have exactly 1 funding row: {:?}",
+        dest_entries
+    );
+    let dest_row = &dest_entries[0];
+    assert_eq!(dest_row["type"].as_str(), Some("funding"));
+    assert_eq!(dest_row["txid"].as_str(), Some(spend_txid.as_str()));
+    assert_eq!(dest_row["vout"].as_u64(), Some(0));
+    assert_eq!(
+        dest_row["amount_sat"].as_u64(),
+        Some(cb_value_sat - 1000),
+        "destination amount must equal send_value: {}",
+        dest_row
+    );
+
+    // Source must have a spending row referencing the spend's txid
+    // and the coinbase outpoint we spent. Pass-2 specifically wrote
+    // this — without backfill working, the row wouldn't exist (we
+    // ran the entire mine+spend sequence with --addressindex=0).
+    let post_src_history = node
+        .rpc_call_with_params("getaddresshistory", vec![serde_json::json!(src_str)])
+        .expect("rpc");
+    let src_entries = post_src_history["result"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let spending_row = src_entries.iter().find(|e| {
+        e["type"].as_str() == Some("spending")
+            && e["txid"].as_str() == Some(spend_txid.as_str())
+    });
+    assert!(
+        spending_row.is_some(),
+        "source must have a spending row from backfill pass 2; entries: {:?}",
+        src_entries
+    );
+    let row = spending_row.unwrap();
+    assert_eq!(
+        row["prev_txid"].as_str(),
+        Some(cb_txid.to_string().as_str()),
+        "spending row prev_txid must match the coinbase we spent: {}",
+        row
+    );
+    assert_eq!(row["prev_vout"].as_u64(), Some(0));
+
+    let mut node = node;
+    node.stop();
+    let _ = std::fs::remove_dir_all(&datadir);
+}
+
+/// Reorg invalidates the backfill snapshot mid-run → state=Failed.
+/// Mid-run we submit a longer competing chain that triggers a reorg
+/// at depths > 0 below snapshot_height. The runner's per-batch
+/// verify_anchor_active sees the new active hash and aborts with
+/// ReorgInvalidated; the supervisor persists Failed with the error
+/// surfaced via getindexinfo.last_error.
+#[test]
+fn test_address_index_backfill_reorg_invalidates_to_failed() {
+    use bitcoin::WitnessProgram;
+    use bitcoin::WitnessVersion;
+    use bitcoin::secp256k1::{Secp256k1, SecretKey};
+    use bitcoin::{Address, Network, PublicKey};
+
+    // Distinct A/B addresses so the two chains have different block
+    // hashes from height 1 (otherwise regtest's deterministic mining
+    // of the same address from the same genesis produces identical
+    // headers and submitblock returns "duplicate" — no reorg).
+    let addr_a = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    // Derive a second valid P2WPKH from a fixed key so we don't have
+    // to hand-roll a bech32 checksum.
+    let secp = Secp256k1::new();
+    let sk_b = SecretKey::from_slice(&[0x33u8; 32]).unwrap();
+    let pk_b = PublicKey::new(sk_b.public_key(&secp));
+    use bitcoin::hashes::Hash as _;
+    let pkh_b = bitcoin::hashes::hash160::Hash::hash(&pk_b.to_bytes());
+    let prog_b = WitnessProgram::new(WitnessVersion::V0, pkh_b.as_byte_array()).unwrap();
+    let addr_b_str = Address::from_witness_program(prog_b, Network::Regtest).to_string();
+    let addr_b = addr_b_str.as_str();
+
+    // Node A first: shorter chain + slow backfill knob so the reorg
+    // lands mid-run. Mining order matters here — the existing
+    // reorg test (test_reorg_record_reflects_completed_state) mines
+    // A first then B; reversing the order trips the BIP113 MTP
+    // check on subsequent B blocks because B's earlier timestamps
+    // become "time-too-old" against A's chain.
+    //
+    // 1000 ms per batch gives a wide enough pause-observation window
+    // to absorb RPC-roundtrip variance on the self-hosted CI runner.
+    // 4 batches × 1 s = ~4 s of runtime; pauseindex from the test
+    // reliably lands during the first batch's sleep.
+    let mut node_a = TestNode::start_with_env(
+        &[],
+        &[("SATD_BACKFILL_DEBUG_DELAY_MS", "1000")],
+    );
+    let _ = node_a
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(2), serde_json::json!(addr_a)],
+        )
+        .expect("rpc");
+    let a_tip_height = node_a
+        .rpc_call("getblockcount")
+        .expect("rpc")["result"]
+        .as_u64()
+        .unwrap_or(0) as u32;
+    assert_eq!(a_tip_height, 2);
+
+    // Node B: build a longer competing fork (3 blocks) and capture
+    // hex so we can later submit it to A.
+    let mut node_b = TestNode::start(&[]);
+    let gen_b = node_b
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(3), serde_json::json!(addr_b)],
+        )
+        .unwrap();
+    let b_hashes: Vec<String> = gen_b["result"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    let mut b_hex: Vec<String> = Vec::new();
+    for h in &b_hashes {
+        let raw = node_b
+            .rpc_call_with_params(
+                "getblock",
+                vec![serde_json::json!(h), serde_json::json!(0)],
+            )
+            .unwrap();
+        b_hex.push(raw["result"].as_str().unwrap().to_string());
+    }
+    node_b.stop();
+
+    // Pause the runner immediately so we control timing precisely.
+    // pauseindex flips an atomic flag the runner observes between
+    // batches. Without pausing first, the 20-block backfill at 100ms
+    // per batch (2s) might finish before the reorg lands under load.
+    let r = node_a
+        .rpc_call_with_params(
+            "backfillindex",
+            vec![serde_json::json!("address")],
+        )
+        .expect("rpc");
+    assert_eq!(r["result"]["started"].as_bool(), Some(true));
+    let _ = node_a
+        .rpc_call_with_params(
+            "pauseindex",
+            vec![serde_json::json!("address")],
+        )
+        .expect("rpc");
+    // Wait for the runner to observe paused so cursor reflects Paused.
+    // 15s timeout covers RPC-roundtrip variance + the 1 s/batch debug
+    // delay on the slowest self-hosted CI runners.
+    poll_backfill_state(&node_a, &["paused"], Duration::from_secs(15));
+
+    // Submit B's blocks while the runner is paused. The reorg lands
+    // immediately; the runner is sleeping in check_pause_loop. When
+    // we resume, the next verify_anchor_active is the first thing it
+    // does and trips ReorgInvalidated deterministically.
+    for (i, hex) in b_hex.iter().enumerate() {
+        let res = node_a
+            .rpc_call_with_params("submitblock", vec![serde_json::json!(hex)])
+            .unwrap();
+        if let Some(err) = res.get("error")
+            && !err.is_null()
+        {
+            panic!("submitblock B[{}] errored: {}", i, res);
+        }
+    }
+    // Sanity: A reorged to B (or at least past A's old tip).
+    let bestblock = node_a
+        .rpc_call("getbestblockhash")
+        .expect("rpc")["result"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        bestblock, b_hashes[2],
+        "A should have reorged to B's tip; current tip = {}",
+        bestblock
+    );
+
+    // Resume — next runner wake → verify_anchor_active fails → Failed.
+    let _ = node_a
+        .rpc_call_with_params(
+            "resumeindex",
+            vec![serde_json::json!("address")],
+        )
+        .expect("rpc");
+
+    // Poll for Failed deterministically (no `completed` fallback now).
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut final_state = String::new();
+    let mut last_err = String::new();
+    while Instant::now() < deadline {
+        let info = node_a.rpc_call("getindexinfo").expect("rpc");
+        if let Some(s) = info["result"]["address"]["backfill"]["state"].as_str()
+            && s == "failed"
+        {
+            final_state = s.to_string();
+            last_err = info["result"]["address"]["backfill"]["last_error"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        final_state, "failed",
+        "backfill must reach Failed after reorg; got state {:?}",
+        final_state
+    );
+    assert!(
+        last_err.contains("reorg") || last_err.contains("Reorg") || last_err.contains("anchor"),
+        "expected reorg-invalidated last_error; got {:?}",
+        last_err
+    );
+
+    // Verify no stale rows remain. After Failed-cleanup:
+    //  - addr_a should be empty (its blocks were disconnected by
+    //    reorg AND backfill's stale rows for A were cleaned up).
+    //  - addr_b should have B's 3 live-indexed rows.
+    let history_a = node_a
+        .rpc_call_with_params("getaddresshistory", vec![serde_json::json!(addr_a)])
+        .expect("rpc");
+    let entries_a = history_a["result"].as_array().cloned().unwrap_or_default();
+    assert!(
+        entries_a.is_empty(),
+        "addr_a history should be empty after reorg cleanup; got {} stale entries: {:?}",
+        entries_a.len(),
+        entries_a
+    );
+    let history_b = node_a
+        .rpc_call_with_params("getaddresshistory", vec![serde_json::json!(addr_b)])
+        .expect("rpc");
+    let entries_b = history_b["result"].as_array().cloned().unwrap_or_default();
+    assert_eq!(
+        entries_b.len(),
+        3,
+        "addr_b should have B's 3 live-indexed rows; got {}: {:?}",
+        entries_b.len(),
+        entries_b
+    );
+    for entry in &entries_b {
+        let h = entry["height"].as_u64().unwrap_or(0);
+        assert!(
+            (1..=3).contains(&h),
+            "addr_b row at unexpected height {}: {}",
+            h,
+            entry
+        );
+    }
+
+    // After Failed: a fresh backfillindex starts a new run (lenient).
+    let r2 = node_a
+        .rpc_call_with_params(
+            "backfillindex",
+            vec![serde_json::json!("address")],
+        )
+        .expect("rpc");
+    assert_eq!(
+        r2["result"]["started"].as_bool(),
+        Some(true),
+        "fresh backfill after Failed should start (lenient): {}",
+        r2
+    );
+    poll_backfill_state(&node_a, &["completed"], Duration::from_secs(60));
+
+    node_a.stop();
+}
+
+/// Two backfillindex calls in quick succession: first transitions
+/// Idle→Running synchronously, second sees Running and returns
+/// started:false. Verifies the synchronous-Starting fix for the
+/// duplicate-RPC race (review finding #5).
+#[test]
+fn test_address_index_backfill_duplicate_rpc_race_rejected() {
+    let mut node = TestNode::start_with_env(
+        &[],
+        &[("SATD_BACKFILL_DEBUG_DELAY_MS", "50")],
+    );
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let _ = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(20), serde_json::json!(addr)],
+        )
+        .expect("rpc");
+
+    let r1 = node
+        .rpc_call_with_params(
+            "backfillindex",
+            vec![serde_json::json!("address")],
+        )
+        .expect("rpc");
+    assert_eq!(
+        r1["result"]["started"].as_bool(),
+        Some(true),
+        "first call must start: {}",
+        r1
+    );
+
+    // Second call: state was persisted to Running synchronously by
+    // the first call's start(), so this must see in-progress.
+    let r2 = node
+        .rpc_call_with_params(
+            "backfillindex",
+            vec![serde_json::json!("address")],
+        )
+        .expect("rpc");
+    assert_eq!(
+        r2["result"]["started"].as_bool(),
+        Some(false),
+        "second call must reject as already-in-progress: {}",
+        r2
+    );
+    let reason = r2["result"]["reason"].as_str().unwrap_or("");
+    assert!(
+        reason.contains("already in progress"),
+        "expected 'already in progress' reason; got: {}",
+        reason
+    );
+
+    poll_backfill_state(&node, &["completed"], Duration::from_secs(60));
     node.stop();
 }

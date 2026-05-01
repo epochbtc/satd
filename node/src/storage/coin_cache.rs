@@ -267,6 +267,7 @@ impl CoinCache {
     pub fn clean_cap(&self) -> usize {
         self.clean.lock().unwrap().cap().get()
     }
+
 }
 
 impl Store for CoinCache {
@@ -313,6 +314,17 @@ impl Store for CoinCache {
     }
 
     fn write_batch(&self, batch: StoreBatch) -> Result<(), StoreError> {
+        // Use the cache's currently-configured mode; the explicit-mode
+        // path runs through `write_batch_mode` instead.
+        self.write_batch_mode(batch, self.current_write_mode())
+    }
+
+    fn write_batch_mode(&self, batch: StoreBatch, mode: WriteMode) -> Result<(), StoreError> {
+        // Honor the caller's explicit mode for the inner-store call.
+        // The default trait impl ignores `mode` and delegates to
+        // `write_batch`, which would then use `current_write_mode()`
+        // — defeating the backfill runner's intent of forcing
+        // WriteMode::Normal mid-IBD. See PR #93 review finding #4.
         // Absorb coin operations into dirty map
         let coin_dirty = batch.coin_puts.len() + batch.coin_removes.len();
         if coin_dirty > 0 {
@@ -409,7 +421,9 @@ impl Store for CoinCache {
             || !batch.addr_funding_puts.is_empty()
             || !batch.addr_spending_puts.is_empty()
             || !batch.addr_funding_removes.is_empty()
-            || !batch.addr_spending_removes.is_empty();
+            || !batch.addr_spending_removes.is_empty()
+            || !batch.addr_backfill_temp_puts.is_empty()
+            || batch.backfill_cursor_advance.is_some();
 
         if has_non_coin {
             if coin_dirty == 0 {
@@ -427,8 +441,10 @@ impl Store for CoinCache {
                     addr_spending_puts: batch.addr_spending_puts,
                     addr_funding_removes: batch.addr_funding_removes,
                     addr_spending_removes: batch.addr_spending_removes,
+                    addr_backfill_temp_puts: batch.addr_backfill_temp_puts,
+                    backfill_cursor_advance: batch.backfill_cursor_advance,
                 };
-                self.inner.write_batch_mode(pass_through, self.current_write_mode())?;
+                self.inner.write_batch_mode(pass_through, mode)?;
             } else {
                 let mut pending = self.pending_batch.lock().unwrap();
                 pending.block_index_puts.extend(batch.block_index_puts);
@@ -448,6 +464,8 @@ impl Store for CoinCache {
                     addr_spending_puts: batch.addr_spending_puts,
                     addr_funding_removes: batch.addr_funding_removes,
                     addr_spending_removes: batch.addr_spending_removes,
+                    addr_backfill_temp_puts: batch.addr_backfill_temp_puts,
+                    backfill_cursor_advance: batch.backfill_cursor_advance,
                     ..Default::default()
                 };
                 pending.merge(addr_only);
@@ -643,9 +661,18 @@ impl Store for CoinCache {
         drop(pending);
 
         let inner_rows = self.inner.iter_addr_funding(sh);
+        // Dedupe by key with pending taking precedence over inner.
+        // Without this, an inner row that also has a matching pending
+        // put (e.g. a write that bypassed the pending-batch path via
+        // the no-coin pass-through, while a coincident pending entry
+        // is still buffered) would surface twice in the merged result.
+        // Backfill is the first writer that goes through the no-coin
+        // pass-through alongside a non-empty pending_batch.
+        let pending_keys: std::collections::HashSet<crate::index::address::AddrFundingKey> =
+            pending_puts.iter().map(|(k, _)| k.clone()).collect();
         let mut all: Vec<(crate::index::address::AddrFundingKey, u64)> = inner_rows
             .into_iter()
-            .filter(|(k, _)| !pending_removes.contains(k))
+            .filter(|(k, _)| !pending_removes.contains(k) && !pending_keys.contains(k))
             .chain(pending_puts)
             .collect();
         all.sort_by(|(a, _), (b, _)| {
@@ -684,9 +711,13 @@ impl Store for CoinCache {
         drop(pending);
 
         let inner_rows = self.inner.iter_addr_spending(sh);
+        // Dedupe by key with pending taking precedence over inner.
+        // See `iter_addr_funding` for the rationale.
+        let pending_keys: std::collections::HashSet<crate::index::address::AddrSpendingKey> =
+            pending_puts.iter().map(|(k, _)| k.clone()).collect();
         let mut all: Vec<(crate::index::address::AddrSpendingKey, OutPoint)> = inner_rows
             .into_iter()
-            .filter(|(k, _)| !pending_removes.contains(k))
+            .filter(|(k, _)| !pending_removes.contains(k) && !pending_keys.contains(k))
             .chain(pending_puts)
             .collect();
         all.sort_by(|(a, _), (b, _)| {
@@ -694,6 +725,37 @@ impl Store for CoinCache {
                 .cmp(&crate::index::address::encode_spending_key(b))
         });
         all
+    }
+
+    fn create_backfill_temp_cf(&self) -> Result<(), StoreError> {
+        self.inner.create_backfill_temp_cf()
+    }
+
+    fn drop_backfill_temp_cf(&self) -> Result<(), StoreError> {
+        self.inner.drop_backfill_temp_cf()
+    }
+
+    fn backfill_temp_cf_exists(&self) -> bool {
+        self.inner.backfill_temp_cf_exists()
+    }
+
+    fn lookup_backfill_temp(
+        &self,
+        outpoint: &OutPoint,
+    ) -> Result<Option<crate::index::address::Scripthash>, StoreError> {
+        self.inner.lookup_backfill_temp(outpoint)
+    }
+
+    fn read_backfill_cursor(&self) -> crate::index::address::cursor::BackfillCursor {
+        self.inner.read_backfill_cursor()
+    }
+
+    fn read_backfill_last_error(&self) -> Option<String> {
+        self.inner.read_backfill_last_error()
+    }
+
+    fn write_backfill_last_error(&self, msg: &str) -> Result<(), StoreError> {
+        self.inner.write_backfill_last_error(msg)
     }
 }
 

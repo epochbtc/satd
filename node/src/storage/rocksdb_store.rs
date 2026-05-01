@@ -21,6 +21,11 @@ const CF_TX_INDEX: &str = "tx_index";
 const CF_METADATA: &str = "metadata";
 const CF_ADDR_FUNDING: &str = "addr_funding";
 const CF_ADDR_SPENDING: &str = "addr_spending";
+/// Temp CF created lazily when a deferred backfill starts. Holds
+/// `(outpoint -> scripthash)` rows used by pass 2 to resolve input
+/// scripthashes without reading flat-file undo data. Dropped wholesale
+/// on Completed or Cancelled.
+const CF_ADDR_BACKFILL_TEMP: &str = "addr_backfill_outpoint_to_scripthash";
 
 const TIP_KEY: &[u8] = b"tip";
 const UTXO_COUNT_KEY: &[u8] = b"utxo_count";
@@ -47,6 +52,16 @@ fn hash_from_bytes(bytes: &[u8]) -> Option<BlockHash> {
 
 fn txid_bytes(txid: &Txid) -> &[u8] {
     txid.as_ref()
+}
+
+/// Encode `(txid || vout BE)` as the temp-CF key. 36 bytes; same shape
+/// as `outpoint_to_key` (varint-style) is avoided here so the key is
+/// trivially decodable in tests and panics-on-truncation diagnostics.
+fn backfill_temp_key(op: &OutPoint) -> [u8; 36] {
+    let mut key = [0u8; 36];
+    key[..32].copy_from_slice(op.txid.as_ref());
+    key[32..].copy_from_slice(&op.vout.to_be_bytes());
+    key
 }
 
 type DB = DBWithThreadMode<MultiThreaded>;
@@ -133,7 +148,7 @@ impl RocksDbStore {
             cf_opts
         };
 
-        let cf_descriptors = vec![
+        let mut cf_descriptors = vec![
             ColumnFamilyDescriptor::new(CF_COINS, make_cf_opts(true, 64, None)),
             ColumnFamilyDescriptor::new(CF_BLOCK_INDEX, make_cf_opts(false, 8, None)),
             ColumnFamilyDescriptor::new(CF_HEIGHT_INDEX, make_cf_opts(false, 8, None)),
@@ -148,6 +163,23 @@ impl RocksDbStore {
             ColumnFamilyDescriptor::new(CF_ADDR_FUNDING, make_cf_opts(true, 32, Some(32))),
             ColumnFamilyDescriptor::new(CF_ADDR_SPENDING, make_cf_opts(true, 32, Some(32))),
         ];
+
+        // The deferred-backfill temp CF is created lazily when an
+        // operator triggers `backfillindex address`. RocksDB demands
+        // every existing CF be declared at open time, so probe the DB
+        // dir once and include the temp CF descriptor if it's present.
+        // Skipped on first-open (path doesn't exist yet) — list_cf
+        // requires the DB directory to exist.
+        if db_path.exists()
+            && let Ok(existing_cfs) =
+                DB::list_cf(&Options::default(), &db_path)
+            && existing_cfs.iter().any(|n| n == CF_ADDR_BACKFILL_TEMP)
+        {
+            cf_descriptors.push(ColumnFamilyDescriptor::new(
+                CF_ADDR_BACKFILL_TEMP,
+                make_cf_opts(true, 32, None),
+            ));
+        }
 
         let db = DB::open_cf_descriptors(&db_opts, &db_path, cf_descriptors).map_err(|e| {
             StoreError::Database(format!(
@@ -442,6 +474,48 @@ impl Store for RocksDbStore {
             }
         }
 
+        // Backfill temp CF: only present while a backfill is in flight.
+        // We refuse to commit a batch that produced temp puts but
+        // arrived at the store after the CF was already dropped — that
+        // would commit funding rows + cursor advance without the
+        // matching `(outpoint -> scripthash)` rows pass 2 needs, and
+        // pass 2 would later fail with TempCfMiss. Returning an error
+        // before the WriteBatch is applied preserves the all-or-nothing
+        // contract and forces the runner to stop cleanly.
+        if !batch.addr_backfill_temp_puts.is_empty() {
+            let cf_temp = self.db.cf_handle(CF_ADDR_BACKFILL_TEMP).ok_or_else(|| {
+                StoreError::Database(format!(
+                    "backfill temp CF '{}' is not open; refusing to commit a batch with {} \
+                     pass-1 mappings (the runner should stop and let the operator restart)",
+                    CF_ADDR_BACKFILL_TEMP,
+                    batch.addr_backfill_temp_puts.len(),
+                ))
+            })?;
+            for (outpoint, sh) in &batch.addr_backfill_temp_puts {
+                let key = backfill_temp_key(outpoint);
+                wb.put_cf(&cf_temp, key, sh);
+            }
+        }
+
+        // Metadata: backfill cursor advance. Atomic with the addr-CF and
+        // (when present) temp-CF writes above, so resume is consistent.
+        if let Some(adv) = &batch.backfill_cursor_advance {
+            use crate::index::address::cursor as cur;
+            wb.put_cf(&cf_meta, cur::META_KEY_STATE, [adv.state.as_byte()]);
+            wb.put_cf(&cf_meta, cur::META_KEY_PASS, [adv.pass]);
+            wb.put_cf(&cf_meta, cur::META_KEY_CURSOR_HEIGHT, adv.cursor_height.to_be_bytes());
+            wb.put_cf(&cf_meta, cur::META_KEY_SNAPSHOT_HEIGHT, adv.snapshot_height.to_be_bytes());
+            wb.put_cf(&cf_meta, cur::META_KEY_STARTED_AT, adv.started_at_unix.to_be_bytes());
+            // Snapshot-tip hash. All-zero hash is the "don't care" sentinel
+            // (set by per-block batches that aren't the start
+            // transition); skip the write so we don't clobber the
+            // anchor recorded by start(). Only `start()` and friends
+            // emit a non-zero hash here.
+            if adv.snapshot_tip_hash != [0u8; 32] {
+                wb.put_cf(&cf_meta, cur::META_KEY_SNAPSHOT_HASH, adv.snapshot_tip_hash);
+            }
+        }
+
         // Metadata: tip
         if let Some(hash) = &batch.tip {
             wb.put_cf(&cf_meta, TIP_KEY, hash_bytes(hash));
@@ -597,6 +671,11 @@ impl Store for RocksDbStore {
         for cf_name in cfs {
             self.drop_and_recreate_cf(cf_name)?;
         }
+        // Backfill temp CF: drop wholesale (don't recreate — it's
+        // lazily created when a backfill starts). After clear_chainstate
+        // any in-flight backfill cursor in metadata is also gone, so
+        // leaving the temp CF would orphan its data.
+        self.drop_backfill_temp_cf()?;
         // Re-stamp schema version after metadata CF was recreated
         Self::stamp_schema(&self.db, CURRENT_SCHEMA_VERSION)
     }
@@ -615,6 +694,9 @@ impl Store for RocksDbStore {
         for cf_name in all_cfs {
             self.drop_and_recreate_cf(cf_name)?;
         }
+        // Backfill temp CF: drop without recreate (lazy create on first
+        // backfill start). See clear_chainstate.
+        self.drop_backfill_temp_cf()?;
         // Re-stamp schema version after metadata CF was recreated
         Self::stamp_schema(&self.db, CURRENT_SCHEMA_VERSION)
     }
@@ -710,6 +792,171 @@ impl Store for RocksDbStore {
             out.push((key, prev));
         }
         out
+    }
+
+    fn create_backfill_temp_cf(&self) -> Result<(), StoreError> {
+        if self.db.cf_handle(CF_ADDR_BACKFILL_TEMP).is_some() {
+            return Ok(());
+        }
+        // Bloom + 16-byte prefix-extractor (txid prefix). We lookup by
+        // exact 36-byte key, but a prefix of the txid is enough to bucket
+        // bloom checks usefully. Write buffer 32 MB matches the addr CFs.
+        let mut cf_opts = Options::default();
+        let mut table_opts = BlockBasedOptions::default();
+        table_opts.set_block_cache(&self.block_cache.lock().unwrap());
+        table_opts.set_block_size(16 * 1024);
+        table_opts.set_cache_index_and_filter_blocks(true);
+        table_opts.set_pin_l0_filter_and_index_blocks_in_cache(true);
+        table_opts.set_format_version(5);
+        table_opts.set_bloom_filter(10.0, false);
+        table_opts.set_whole_key_filtering(true);
+        cf_opts.set_block_based_table_factory(&table_opts);
+        cf_opts.set_write_buffer_size(32 * 1024 * 1024);
+        cf_opts.set_max_write_buffer_number(3);
+        cf_opts.set_level_compaction_dynamic_level_bytes(true);
+        cf_opts.set_max_bytes_for_level_base(512 * 1024 * 1024);
+        cf_opts.set_target_file_size_base(64 * 1024 * 1024);
+        // Compress aggressively — temp CF is write-heavy then drop;
+        // bottommost compression doesn't matter because compaction
+        // rarely catches up before drop.
+        cf_opts.set_compression_type(DBCompressionType::Lz4);
+        self.db
+            .create_cf(CF_ADDR_BACKFILL_TEMP, &cf_opts)
+            .map_err(|e| {
+                StoreError::Database(format!(
+                    "create_cf({}): {}",
+                    CF_ADDR_BACKFILL_TEMP, e
+                ))
+            })
+    }
+
+    fn drop_backfill_temp_cf(&self) -> Result<(), StoreError> {
+        if self.db.cf_handle(CF_ADDR_BACKFILL_TEMP).is_none() {
+            return Ok(());
+        }
+        self.db.drop_cf(CF_ADDR_BACKFILL_TEMP).map_err(|e| {
+            StoreError::Database(format!("drop_cf({}): {}", CF_ADDR_BACKFILL_TEMP, e))
+        })
+    }
+
+    fn backfill_temp_cf_exists(&self) -> bool {
+        self.db.cf_handle(CF_ADDR_BACKFILL_TEMP).is_some()
+    }
+
+    fn lookup_backfill_temp(
+        &self,
+        outpoint: &OutPoint,
+    ) -> Result<Option<crate::index::address::Scripthash>, StoreError> {
+        let cf = match self.db.cf_handle(CF_ADDR_BACKFILL_TEMP) {
+            Some(c) => c,
+            None => return Ok(None),
+        };
+        let key = backfill_temp_key(outpoint);
+        match self.db.get_cf(&cf, key) {
+            Ok(Some(v)) => {
+                if v.len() != 32 {
+                    return Err(StoreError::Database(format!(
+                        "corrupt backfill temp value: {} bytes (expected 32)",
+                        v.len()
+                    )));
+                }
+                let mut sh = [0u8; 32];
+                sh.copy_from_slice(&v);
+                Ok(Some(sh))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => Err(StoreError::Database(e.to_string())),
+        }
+    }
+
+    fn read_backfill_cursor(&self) -> crate::index::address::cursor::BackfillCursor {
+        use crate::index::address::cursor as cur;
+        let cf = self.cf(CF_METADATA);
+        let read_u8 = |k: &[u8]| -> Option<u8> {
+            self.db.get_cf(&cf, k).ok().flatten().and_then(|v| v.first().copied())
+        };
+        let read_u32_be = |k: &[u8]| -> Option<u32> {
+            self.db.get_cf(&cf, k).ok().flatten().and_then(|v| {
+                if v.len() == 4 {
+                    Some(u32::from_be_bytes([v[0], v[1], v[2], v[3]]))
+                } else {
+                    None
+                }
+            })
+        };
+        let read_u64_be = |k: &[u8]| -> Option<u64> {
+            self.db.get_cf(&cf, k).ok().flatten().and_then(|v| {
+                if v.len() == 8 {
+                    Some(u64::from_be_bytes([
+                        v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7],
+                    ]))
+                } else {
+                    None
+                }
+            })
+        };
+        let snapshot_tip_hash: [u8; 32] = self
+            .db
+            .get_cf(&cf, cur::META_KEY_SNAPSHOT_HASH)
+            .ok()
+            .flatten()
+            .and_then(|v| {
+                if v.len() == 32 {
+                    let mut h = [0u8; 32];
+                    h.copy_from_slice(&v);
+                    Some(h)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or([0u8; 32]);
+        cur::BackfillCursor {
+            state: read_u8(cur::META_KEY_STATE)
+                .map(cur::BackfillState::from_byte)
+                .unwrap_or(cur::BackfillState::Idle),
+            pass: read_u8(cur::META_KEY_PASS).unwrap_or(0),
+            cursor_height: read_u32_be(cur::META_KEY_CURSOR_HEIGHT).unwrap_or(0),
+            snapshot_height: read_u32_be(cur::META_KEY_SNAPSHOT_HEIGHT).unwrap_or(0),
+            started_at_unix: read_u64_be(cur::META_KEY_STARTED_AT).unwrap_or(0),
+            snapshot_tip_hash,
+        }
+    }
+
+    fn read_backfill_last_error(&self) -> Option<String> {
+        use crate::index::address::cursor as cur;
+        let cf = self.cf(CF_METADATA);
+        self.db
+            .get_cf(&cf, cur::META_KEY_LAST_ERROR)
+            .ok()
+            .flatten()
+            .and_then(|v| String::from_utf8(v.to_vec()).ok())
+            .filter(|s| !s.is_empty())
+    }
+
+    fn write_backfill_last_error(&self, msg: &str) -> Result<(), StoreError> {
+        use crate::index::address::cursor as cur;
+        let cf = self.cf(CF_METADATA);
+        // Truncate to LAST_ERROR_MAX_BYTES at a UTF-8 char boundary so
+        // we never persist invalid UTF-8.
+        let bytes = if msg.len() <= cur::LAST_ERROR_MAX_BYTES {
+            msg.as_bytes().to_vec()
+        } else {
+            let mut idx = cur::LAST_ERROR_MAX_BYTES;
+            while idx > 0 && !msg.is_char_boundary(idx) {
+                idx -= 1;
+            }
+            msg.as_bytes()[..idx].to_vec()
+        };
+        if bytes.is_empty() {
+            // Empty string clears the slot.
+            self.db
+                .delete_cf(&cf, cur::META_KEY_LAST_ERROR)
+                .map_err(|e| StoreError::Database(e.to_string()))
+        } else {
+            self.db
+                .put_cf(&cf, cur::META_KEY_LAST_ERROR, &bytes)
+                .map_err(|e| StoreError::Database(e.to_string()))
+        }
     }
 }
 
