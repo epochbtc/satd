@@ -1159,13 +1159,13 @@ mod tests {
         // them between snapshots, so assert >= our own contribution
         // rather than equality.
         assert!(
-            after.funding_rows >= before.funding_rows + 1,
+            after.funding_rows > before.funding_rows,
             "committed-rows counter must reflect successful write (before {}, after {})",
             before.funding_rows,
             after.funding_rows
         );
         assert!(
-            after.spending_rows >= before.spending_rows + 1,
+            after.spending_rows > before.spending_rows,
             "committed-rows counter must reflect successful write (before {}, after {})",
             before.spending_rows,
             after.spending_rows
