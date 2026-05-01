@@ -368,11 +368,44 @@ async fn main() {
     }));
     let fee_estimator = Arc::new(FeeEstimator::new());
 
-    // Wire the mempool event broadcaster used by `subscribemempool`.
+    // Wire the mempool event broadcaster used by `subscribemempool`
+    // AND by the address-index mempool variant (M4). The address index
+    // task subscribes before any tx admission so it observes every
+    // Enter/Leave event from startup onward.
     let (mempool_event_tx, _) = tokio::sync::broadcast::channel::<
         node::mempool::events::MempoolEvent,
     >(node::mempool::pool::EVENT_BROADCAST_CAPACITY);
+    let addr_index_event_rx = mempool_event_tx.subscribe();
     mempool.set_event_sender(mempool_event_tx);
+
+    // Hook the mempool back into ChainState so `perform_reorg` can
+    // re-add disconnected non-coinbase txs after a reorg (Bitcoin Core
+    // semantics). Without this, every reorg would silently drop
+    // unconfirmed-but-still-valid user txs.
+    chain_state.set_mempool(mempool.clone());
+
+    // Shared MempoolAddrIndex handle. Both the read-side
+    // RocksAddressIndex (for RPC queries) and the background
+    // event-loop task hold the same Arc<RwLock<...>>.
+    let mempool_addr_index = std::sync::Arc::new(std::sync::RwLock::new(
+        node::index::address::MempoolAddrIndex::new(),
+    ));
+    {
+        let task_index = mempool_addr_index.clone();
+        let task_mempool = mempool.clone();
+        let task_chain = chain_state.clone();
+        let task_shutdown = shutdown_rx.clone();
+        tokio::spawn(async move {
+            node::index::address::mempool_index_task(
+                task_index,
+                task_mempool,
+                task_chain,
+                addr_index_event_rx,
+                task_shutdown,
+            )
+            .await;
+        });
+    }
 
     // Open the mempool history ring + spawn the snapshotter task.
     // Failure is non-fatal — the node still runs, but the
@@ -478,16 +511,19 @@ async fn main() {
     // Build the read-side address index from the chainstate store. The
     // CoinCache wrapper transparently merges the pending (not-yet-flushed)
     // write batch into iter_addr_*, so reads stay consistent even between
-    // a connect_block and the next flush.
+    // a connect_block and the next flush. The mempool variant (M4) is
+    // shared with the background event-loop task so RPC queries see the
+    // unconfirmed delta + per-scripthash mempool entries.
     let address_index_store: std::sync::Arc<dyn node::storage::Store> =
         chain_state.store_ref().clone();
     let address_index: std::sync::Arc<dyn node::index::address::AddressIndex> =
-        std::sync::Arc::new(node::index::address::RocksAddressIndex::new(
+        std::sync::Arc::new(node::index::address::RocksAddressIndex::with_mempool_index(
             address_index_store,
             node::index::address::AddressIndexConfig {
                 enabled: config.addressindex,
                 ..Default::default()
             },
+            mempool_addr_index.clone(),
         ));
 
     let server_handle = match node::rpc::server::start(

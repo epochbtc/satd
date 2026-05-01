@@ -2,12 +2,13 @@
 //! `Store`. Mempool history (M4) and the subscription registry (M5)
 //! attach in later milestones.
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use bitcoin::OutPoint;
 
 use crate::index::address::config::AddressIndexConfig;
 use crate::index::address::keys::Scripthash;
+use crate::index::address::mempool::MempoolAddrIndex;
 use crate::index::address::trait_def::AddressIndex;
 use crate::index::address::types::{HistoryEntry, IndexError, MempoolHistoryEntry, Utxo};
 use crate::storage::Store;
@@ -23,11 +24,36 @@ use crate::storage::Store;
 pub struct RocksAddressIndex {
     store: Arc<dyn Store>,
     cfg: AddressIndexConfig,
+    /// Mempool variant of the index. Populated by `mempool_index_task`
+    /// (M4); reads merge into `mempool_history` and the unconfirmed
+    /// component of `balance`.
+    mempool: Arc<RwLock<MempoolAddrIndex>>,
 }
 
 impl RocksAddressIndex {
     pub fn new(store: Arc<dyn Store>, cfg: AddressIndexConfig) -> Self {
-        Self { store, cfg }
+        Self {
+            store,
+            cfg,
+            mempool: Arc::new(RwLock::new(MempoolAddrIndex::new())),
+        }
+    }
+
+    /// Construct with a shared `MempoolAddrIndex` handle so the same
+    /// index instance is observed by the background task (in
+    /// `main.rs`) and the read surface here.
+    pub fn with_mempool_index(
+        store: Arc<dyn Store>,
+        cfg: AddressIndexConfig,
+        mempool: Arc<RwLock<MempoolAddrIndex>>,
+    ) -> Self {
+        Self { store, cfg, mempool }
+    }
+
+    /// Get the shared mempool-index handle so the background task can
+    /// share writes with read-side queries.
+    pub fn mempool_index_handle(&self) -> Arc<RwLock<MempoolAddrIndex>> {
+        self.mempool.clone()
     }
 
     fn check_enabled(&self) -> Result<(), IndexError> {
@@ -84,11 +110,17 @@ impl AddressIndex for RocksAddressIndex {
         Ok(out)
     }
 
-    fn mempool_history(&self, _sh: &Scripthash) -> Vec<MempoolHistoryEntry> {
-        // M4 fills the mempool variant. Returning an empty vec rather
-        // than panicking keeps the trait surface honest and lets M3-era
-        // RPC callers ship without conditional logic.
-        Vec::new()
+    fn mempool_history(&self, sh: &Scripthash) -> Vec<MempoolHistoryEntry> {
+        if !self.cfg.enabled {
+            return Vec::new();
+        }
+        self.mempool
+            .read()
+            .unwrap()
+            .entries_for(sh)
+            .into_iter()
+            .map(|txid| MempoolHistoryEntry { txid })
+            .collect()
     }
 
     fn balance(&self, sh: &Scripthash) -> Result<(u64, i64), IndexError> {
@@ -112,9 +144,8 @@ impl AddressIndex for RocksAddressIndex {
             }
         }
 
-        // M4 will populate the unconfirmed delta from the mempool
-        // variant; for now it is always zero.
-        Ok((confirmed, 0))
+        let unconfirmed = self.mempool.read().unwrap().delta(sh);
+        Ok((confirmed, unconfirmed))
     }
 
     fn utxos(&self, sh: &Scripthash) -> Result<Vec<Utxo>, IndexError> {

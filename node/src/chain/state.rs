@@ -95,12 +95,22 @@ struct ChainTip {
 /// the record at fork-disconnect time (the obvious-but-wrong spot)
 /// would misreport `fork_hash` as the new tip and leave
 /// `reconnected` empty.
+///
+/// `disconnected_txs` carries the non-coinbase transactions from the
+/// disconnected blocks so the caller can re-offer them to the mempool
+/// *after* the side chain has fully reconnected. Re-adding inside
+/// `perform_reorg` would validate against the fork-point UTXO set, not
+/// the final post-reorg active chain.
 #[derive(Debug, Clone)]
 struct ReorgDisconnectInfo {
     old_tip: BlockHash,
     old_height: u32,
     /// Hashes disconnected, walked old-tip-first toward the fork parent.
     disconnected: Vec<BlockHash>,
+    /// Non-coinbase transactions from disconnected blocks, in
+    /// fork-parent-first order so the caller can re-add parents before
+    /// children (chained mempool acceptance).
+    disconnected_txs: Vec<bitcoin::Transaction>,
 }
 
 /// Staged reorg record: all the inputs to `ReorgRecord::new` except the
@@ -116,6 +126,20 @@ struct PendingReorgRecord {
     /// Side-chain blocks already reconnected + committed, fork-parent-
     /// first, not yet including the final triggering block.
     reconnected_so_far: Vec<BlockHash>,
+    /// Reconnected side-chain blocks paired with their heights. The
+    /// height belongs to that block on the new chain — used both for
+    /// the post-reorg mempool cleanup (so `remove_for_block` reports
+    /// the actual confirmation height per block, not the final tip
+    /// height) and for the triggering-block-failure rollback.
+    reconnected_blocks: Vec<(bitcoin::Block, u32)>,
+    /// Non-coinbase txs from the disconnected blocks, fork-parent-first.
+    /// Re-offered to the mempool after the full reorg has activated so
+    /// validation runs against the new chain, not the fork point.
+    disconnected_txs: Vec<bitcoin::Transaction>,
+    /// Hashes of the original-chain blocks the reorg disconnected,
+    /// newest-first. Held so a triggering-block failure can roll the
+    /// chain back to the pre-reorg state.
+    original_disconnected: Vec<BlockHash>,
 }
 
 /// Central chain state manager.
@@ -147,6 +171,11 @@ pub struct ChainState {
     /// Active node warnings (connect failures, storage issues, etc.).
     /// Always present — warnings are a core operational surface.
     warnings: std::sync::Arc<crate::warnings::NodeWarnings>,
+    /// Mempool handle for reorg re-add. Set by `set_mempool` after
+    /// construction to avoid a circular Arc cycle (mempool needs
+    /// chain_state for UTXO lookups). When unset (test backends),
+    /// the reorg re-add path is a no-op.
+    mempool: std::sync::OnceLock<std::sync::Arc<crate::mempool::pool::Mempool>>,
 }
 
 impl ChainState {
@@ -222,6 +251,7 @@ impl ChainState {
                     address_index,
                     reorg_log: std::sync::OnceLock::new(),
                     warnings: std::sync::Arc::new(crate::warnings::NodeWarnings::new()),
+                    mempool: std::sync::OnceLock::new(),
                 });
             }
 
@@ -269,7 +299,19 @@ impl ChainState {
             address_index,
             reorg_log: std::sync::OnceLock::new(),
             warnings: std::sync::Arc::new(crate::warnings::NodeWarnings::new()),
+            mempool: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Wire the mempool handle for reorg re-add. Called once at
+    /// startup after both ChainState and Mempool are constructed.
+    /// Test backends that don't exercise the reorg re-add path skip
+    /// this; the per-perform_reorg branch tolerates absence.
+    pub fn set_mempool(
+        &self,
+        mempool: std::sync::Arc<crate::mempool::pool::Mempool>,
+    ) {
+        let _ = self.mempool.set(mempool);
     }
 
     /// Access the shared warnings surface. Always present; use to
@@ -1238,18 +1280,60 @@ impl ChainState {
                 "Reorg: side chain has more work, activating"
             );
 
-            // Walk back from the side chain block to find the fork point
+            // Walk back from both the active tip and the side-chain
+            // tip in parallel until they meet at a common ancestor
+            // — that is the fork point.
+            //
+            // We deliberately do NOT use `BlockStatus::Valid` (stale
+            // disconnected blocks keep that marker) nor
+            // `get_block_hash_by_height` (the height index is a
+            // "best-known-at-height" lookup populated by
+            // accept_header / accept_headers / store_block too, not
+            // an active-chain-only oracle). Walking ancestor pointers
+            // is bounded by reorg depth (<= 128 by the IBD guard at
+            // line ~1265) and only consults `prev_blockhash` /
+            // `height`, both of which are immutable per block.
             let fork_entry = {
+                let mut active_hash = current_tip;
+                let mut active_height = tip_entry.height;
                 let mut side_hash = prev_hash;
-                loop {
-                    let side_entry = self.store.get_block_index(&side_hash)
+                let mut side_height = new_height.saturating_sub(1);
+
+                // Equalize heights: walk the deeper walker back.
+                while active_height > side_height {
+                    let entry = self
+                        .store
+                        .get_block_index(&active_hash)
                         .ok_or(ChainError::BadPrevBlock)?;
-                    // Fork point is a block that's on the main chain (Valid status)
-                    if side_entry.status == BlockStatus::Valid {
-                        break side_entry;
-                    }
-                    side_hash = side_entry.header.prev_blockhash;
+                    active_hash = entry.header.prev_blockhash;
+                    active_height -= 1;
                 }
+                while side_height > active_height {
+                    let entry = self
+                        .store
+                        .get_block_index(&side_hash)
+                        .ok_or(ChainError::BadPrevBlock)?;
+                    side_hash = entry.header.prev_blockhash;
+                    side_height -= 1;
+                }
+
+                // Walk both back together until they meet.
+                while active_hash != side_hash {
+                    let a_entry = self
+                        .store
+                        .get_block_index(&active_hash)
+                        .ok_or(ChainError::BadPrevBlock)?;
+                    let s_entry = self
+                        .store
+                        .get_block_index(&side_hash)
+                        .ok_or(ChainError::BadPrevBlock)?;
+                    active_hash = a_entry.header.prev_blockhash;
+                    side_hash = s_entry.header.prev_blockhash;
+                }
+
+                self.store
+                    .get_block_index(&active_hash)
+                    .ok_or(ChainError::BadPrevBlock)?
             };
 
             // Disconnect blocks from current tip down to fork point.
@@ -1272,43 +1356,82 @@ impl ChainState {
                 to_connect.reverse();
             }
             let mut reconnected_hashes: Vec<BlockHash> = Vec::with_capacity(to_connect.len() + 1);
-            for side_hash in &to_connect {
-                let side_block = self.get_block(side_hash)
-                    .ok_or(ChainError::FlatFile("block data missing for reorg connect".to_string()))?;
-                let side_entry = self.store.get_block_index(side_hash)
-                    .ok_or(ChainError::BadPrevBlock)?;
-                let parent_entry = self.store.get_block_index(&side_entry.header.prev_blockhash)
-                    .ok_or(ChainError::BadPrevBlock)?;
-                let use_noop = self.should_skip_scripts(side_entry.height);
-                let noop = NoopVerifier;
-                let verifier: &dyn ScriptVerifier = if use_noop { &noop } else { &*self.script_verifier };
-                let mtp = self.get_median_time_past(side_entry.height);
-                let side_flat_pos = FlatFilePos {
-                    file_number: side_entry.file_number,
-                    data_pos: side_entry.data_pos,
-                };
-                let batch = connect::connect_block(&connect::ConnectParams {
-                    store: &*self.store,
-                    block: &side_block,
-                    height: side_entry.height,
-                    parent_chainwork: &parent_entry.chainwork,
-                    flat_pos: side_flat_pos,
-                    script_verifier: verifier,
-                    median_time_past: mtp,
-                    network: self.network,
-                    pre_verified_txs: None,
-                    num_threads: 1,
-                    precomputed_txids: None,
-                    address_index: &self.address_index,
-                })?;
-                self.store.write_batch(batch)?;
-                {
-                    let mut tip = self.tip.write().unwrap();
-                    tip.hash = *side_hash;
-                    tip.height = side_entry.height;
+            let mut reconnected_blocks: Vec<(bitcoin::Block, u32)> =
+                Vec::with_capacity(to_connect.len());
+
+            // Side-chain reconnect — wrapped so a per-block failure
+            // unwinds the partial activation back to the original
+            // chain. Without this, a high-work side chain whose
+            // intermediate or final block fails validation would leave
+            // the node partially reorged.
+            let side_result: Result<(), ChainError> = (|| {
+                for side_hash in &to_connect {
+                    let side_block = self
+                        .get_block(side_hash)
+                        .ok_or(ChainError::FlatFile(
+                            "block data missing for reorg connect".to_string(),
+                        ))?;
+                    let side_entry = self
+                        .store
+                        .get_block_index(side_hash)
+                        .ok_or(ChainError::BadPrevBlock)?;
+                    let parent_entry = self
+                        .store
+                        .get_block_index(&side_entry.header.prev_blockhash)
+                        .ok_or(ChainError::BadPrevBlock)?;
+                    let use_noop = self.should_skip_scripts(side_entry.height);
+                    let noop = NoopVerifier;
+                    let verifier: &dyn ScriptVerifier =
+                        if use_noop { &noop } else { &*self.script_verifier };
+                    let mtp = self.get_median_time_past(side_entry.height);
+                    let side_flat_pos = FlatFilePos {
+                        file_number: side_entry.file_number,
+                        data_pos: side_entry.data_pos,
+                    };
+                    let batch = connect::connect_block(&connect::ConnectParams {
+                        store: &*self.store,
+                        block: &side_block,
+                        height: side_entry.height,
+                        parent_chainwork: &parent_entry.chainwork,
+                        flat_pos: side_flat_pos,
+                        script_verifier: verifier,
+                        median_time_past: mtp,
+                        network: self.network,
+                        pre_verified_txs: None,
+                        num_threads: 1,
+                        precomputed_txids: None,
+                        address_index: &self.address_index,
+                    })?;
+                    self.store.write_batch(batch)?;
+                    {
+                        let mut tip = self.tip.write().unwrap();
+                        tip.hash = *side_hash;
+                        tip.height = side_entry.height;
+                    }
+                    reconnected_hashes.push(*side_hash);
+                    reconnected_blocks.push((side_block, side_entry.height));
+                    tracing::info!(
+                        height = side_entry.height,
+                        hash = %side_hash,
+                        "Reorg: block connected"
+                    );
                 }
-                reconnected_hashes.push(*side_hash);
-                tracing::info!(height = side_entry.height, hash = %side_hash, "Reorg: block connected");
+                Ok(())
+            })();
+
+            if let Err(e) = side_result {
+                tracing::warn!(error = %e, "Reorg side-chain reconnect failed; rolling back to old tip");
+                if let Err(re) = self.rollback_partial_reorg(
+                    &reconnected_blocks,
+                    &disconnect_info.disconnected,
+                ) {
+                    tracing::error!(
+                        original_error = %e,
+                        rollback_error = %re,
+                        "Reorg rollback FAILED — chainstate is inconsistent; operator must reindex"
+                    );
+                }
+                return Err(e);
             }
 
             // Stage the reorg record for persistence *after* the final
@@ -1319,8 +1442,14 @@ impl ChainState {
                 fork_height: fork_entry.height,
                 old_tip: disconnect_info.old_tip,
                 old_height: disconnect_info.old_height,
-                disconnected: disconnect_info.disconnected,
+                disconnected: disconnect_info.disconnected.clone(),
                 reconnected_so_far: reconnected_hashes,
+                reconnected_blocks,
+                disconnected_txs: disconnect_info.disconnected_txs,
+                // Carry the original-chain hashes through to the
+                // triggering-block connect path so a failure there can
+                // still roll back to the pre-reorg chain.
+                original_disconnected: disconnect_info.disconnected,
             });
 
             // Fall through to connect the new block as a tip-extending block
@@ -1331,9 +1460,13 @@ impl ChainState {
         let noop = NoopVerifier;
         let verifier: &dyn ScriptVerifier = if use_noop { &noop } else { &*self.script_verifier };
 
-        // Connect block (process transactions, update UTXOs, verify scripts)
+        // Connect block (process transactions, update UTXOs, verify scripts).
+        // If the triggering block fails inside an in-progress reorg, roll
+        // the chain back to the pre-reorg active chain before returning
+        // the error — otherwise the failed candidate would leave the
+        // node permanently advanced onto a partial side-chain prefix.
         let mtp = self.get_median_time_past(new_height);
-        let batch = connect::connect_block(&connect::ConnectParams {
+        let connect_attempt = connect::connect_block(&connect::ConnectParams {
             store: &*self.store,
             block,
             height: new_height,
@@ -1346,10 +1479,43 @@ impl ChainState {
             num_threads: self.num_threads,
             precomputed_txids: None,
             address_index: &self.address_index,
-        })?;
+        });
+        let batch = match connect_attempt {
+            Ok(b) => b,
+            Err(e) => {
+                if let Some(pending) = pending_reorg.as_ref() {
+                    tracing::warn!(error = %e, "Reorg triggering block validation failed; rolling back to old tip");
+                    if let Err(re) = self.rollback_partial_reorg(
+                        &pending.reconnected_blocks,
+                        &pending.original_disconnected,
+                    ) {
+                        tracing::error!(
+                            original_error = %e,
+                            rollback_error = %re,
+                            "Reorg rollback FAILED — chainstate is inconsistent; operator must reindex"
+                        );
+                    }
+                }
+                return Err(e.into());
+            }
+        };
 
-        // Atomic commit
-        self.store.write_batch(batch)?;
+        if let Err(e) = self.store.write_batch(batch) {
+            if let Some(pending) = pending_reorg.as_ref() {
+                tracing::warn!(error = %e, "Reorg triggering block commit failed; rolling back to old tip");
+                if let Err(re) = self.rollback_partial_reorg(
+                    &pending.reconnected_blocks,
+                    &pending.original_disconnected,
+                ) {
+                    tracing::error!(
+                        original_error = %e,
+                        rollback_error = %re,
+                        "Reorg rollback FAILED — chainstate is inconsistent; operator must reindex"
+                    );
+                }
+            }
+            return Err(e.into());
+        }
 
         // Update in-memory tip
         {
@@ -1360,20 +1526,62 @@ impl ChainState {
 
         // The reorg (if one happened) is now fully complete: disconnect,
         // all intermediate reconnections, and the final tip-extending
-        // connect have all committed. Persist one complete record with
-        // the real final tip.
-        if let (Some(pending), Some(log)) = (pending_reorg.take(), self.reorg_log.get()) {
-            let mut reconnected = pending.reconnected_so_far;
-            reconnected.push(block_hash);
-            let record = crate::chain::reorg_log::ReorgRecord::new(
-                pending.fork_height,
-                pending.old_tip,
-                block_hash,
-                pending.old_height,
-                pending.disconnected,
-                reconnected,
-            );
-            log.record(record);
+        // connect have all committed. Now reconcile mempool against the
+        // new chain *before* persisting the reorg record:
+        //
+        // 1. For each intermediate side-chain block that reconnected,
+        //    evict mempool txs whose inputs are now spent by it. The
+        //    final triggering block's `remove_for_block` is the
+        //    caller's responsibility (`accept_block` returns Ok).
+        //
+        // 2. Re-offer disconnected-block transactions to the mempool.
+        //    Validation runs against the live chain — at this point
+        //    the tip is the final new chain tip — so a tx that
+        //    conflicts with any reconnected side-chain block is
+        //    rejected by `accept_transaction` rather than admitted.
+        //
+        // The reorg record is persisted after the mempool reconcile so
+        // operators see a fully-consistent state when the record
+        // appears in `getreorghistory`.
+        if let Some(pending) = pending_reorg.take() {
+            if let Some(mempool) = self.mempool.get() {
+                // Pass each side block's actual height — passing
+                // new_tip_height here would mis-report confirmation
+                // heights to mempool-event subscribers, who would see
+                // every intermediate-block confirmation labelled with
+                // the final tip height.
+                for (side_block, side_height) in &pending.reconnected_blocks {
+                    mempool.remove_for_block(side_block, *side_height);
+                }
+                for tx in &pending.disconnected_txs {
+                    let txid = tx.compute_txid();
+                    if let Err(e) = mempool.accept_transaction(
+                        tx.clone(),
+                        self,
+                        &*self.script_verifier,
+                    ) {
+                        tracing::debug!(
+                            %txid,
+                            err = ?e,
+                            "Reorg: re-add to mempool failed (likely conflict with new chain)"
+                        );
+                    }
+                }
+            }
+
+            if let Some(log) = self.reorg_log.get() {
+                let mut reconnected = pending.reconnected_so_far;
+                reconnected.push(block_hash);
+                let record = crate::chain::reorg_log::ReorgRecord::new(
+                    pending.fork_height,
+                    pending.old_tip,
+                    block_hash,
+                    pending.old_height,
+                    pending.disconnected,
+                    reconnected,
+                );
+                log.record(record);
+            }
         }
 
         // Update MTP cache with this block's timestamp
@@ -1387,6 +1595,96 @@ impl ChainState {
         );
 
         Ok(block_hash)
+    }
+
+    /// Best-effort rollback of an in-progress reorg: disconnects any
+    /// side-chain blocks that were reconnected, then re-connects the
+    /// original-chain blocks the reorg disconnected. After this
+    /// returns Ok, the active tip is restored to the pre-reorg state
+    /// and the chainstate is consistent with that tip.
+    ///
+    /// Failure here is logged loudly by the caller; we continue to
+    /// propagate the original reorg error rather than masking it.
+    /// Original-chain blocks were already validated when they first
+    /// connected, so we re-connect them with `NoopVerifier` to avoid a
+    /// transient script-verifier failure during rollback.
+    fn rollback_partial_reorg(
+        &self,
+        side_blocks_committed: &[(bitcoin::Block, u32)],
+        original_disconnected: &[BlockHash],
+    ) -> Result<(), ChainError> {
+        // Disconnect side chain in reverse order (newest first).
+        for (side_block, side_height) in side_blocks_committed.iter().rev() {
+            let side_hash = side_block.block_hash();
+            let entry = self
+                .store
+                .get_block_index(&side_hash)
+                .ok_or(ChainError::BadPrevBlock)?;
+            let undo = self
+                .store
+                .get_undo(&side_hash)
+                .ok_or(ChainError::FlatFile(
+                    "undo data missing during rollback".to_string(),
+                ))?;
+            let prev_hash = entry.header.prev_blockhash;
+            let batch = disconnect::disconnect_block(
+                side_block,
+                &undo,
+                *side_height,
+                prev_hash,
+                &self.address_index,
+            )?;
+            self.store.write_batch(batch)?;
+            let prev_entry = self
+                .store
+                .get_block_index(&prev_hash)
+                .ok_or(ChainError::BadPrevBlock)?;
+            let mut tip = self.tip.write().unwrap();
+            tip.hash = prev_hash;
+            tip.height = prev_entry.height;
+        }
+
+        // Reconnect the original chain in oldest-first order. The
+        // original disconnect captured them newest-first (walk from
+        // old_tip toward fork), so we reverse to play them forward.
+        for hash in original_disconnected.iter().rev() {
+            let block = self.get_block(hash).ok_or(ChainError::FlatFile(
+                "block data missing during rollback reconnect".to_string(),
+            ))?;
+            let entry = self
+                .store
+                .get_block_index(hash)
+                .ok_or(ChainError::BadPrevBlock)?;
+            let parent_entry = self
+                .store
+                .get_block_index(&entry.header.prev_blockhash)
+                .ok_or(ChainError::BadPrevBlock)?;
+            let mtp = self.get_median_time_past(entry.height);
+            let flat_pos = FlatFilePos {
+                file_number: entry.file_number,
+                data_pos: entry.data_pos,
+            };
+            let noop = NoopVerifier;
+            let batch = connect::connect_block(&connect::ConnectParams {
+                store: &*self.store,
+                block: &block,
+                height: entry.height,
+                parent_chainwork: &parent_entry.chainwork,
+                flat_pos,
+                script_verifier: &noop,
+                median_time_past: mtp,
+                network: self.network,
+                pre_verified_txs: None,
+                num_threads: 1,
+                precomputed_txids: None,
+                address_index: &self.address_index,
+            })?;
+            self.store.write_batch(batch)?;
+            let mut tip = self.tip.write().unwrap();
+            tip.hash = *hash;
+            tip.height = entry.height;
+        }
+        Ok(())
     }
 
     /// Disconnect blocks from current tip down to the fork point (parent of the new chain).
@@ -1408,6 +1706,11 @@ impl ChainState {
         let mut current = old_tip;
         let mut combined_batch = crate::storage::StoreBatch::default();
         let mut disconnected_hashes: Vec<BlockHash> = Vec::new();
+        // Per-block non-coinbase txs collected newest-disconnect-first.
+        // We hold them in nested vecs so we can reverse the *block*
+        // order without scrambling intra-block tx order — chained tx
+        // graphs within a block need parents-before-children preserved.
+        let mut disconnected_txs_by_block: Vec<Vec<bitcoin::Transaction>> = Vec::new();
         let old_height = self
             .store
             .get_block_index(&old_tip)
@@ -1439,6 +1742,13 @@ impl ChainState {
             )?;
             combined_batch.merge(batch);
 
+            // Capture non-coinbase txs for mempool re-add, in block
+            // order. Block order is preserved so a child tx in the same
+            // block doesn't get re-offered before its parent.
+            let block_txs: Vec<bitcoin::Transaction> =
+                block.txdata.iter().skip(1).cloned().collect();
+            disconnected_txs_by_block.push(block_txs);
+
             disconnected_hashes.push(current);
             tracing::info!(height = entry.height, hash = %current, "Block disconnected");
             current = prev_hash;
@@ -1454,6 +1764,20 @@ impl ChainState {
             tip.height = fork_entry.height;
         }
 
+        // Block order: walk reversed so oldest disconnected block comes
+        // first (parents-before-children across blocks). Tx order
+        // within each block is preserved.
+        //
+        // We deliberately do NOT re-add inside perform_reorg: re-adding
+        // here would validate against the fork-point UTXO set, not the
+        // final post-reorg active chain. A side-chain block reconnected
+        // after this call could spend the same input as a re-added tx,
+        // leaving an invalid tx in the mempool. The caller in
+        // `connect_tip` performs the re-add after all reconnects.
+        disconnected_txs_by_block.reverse();
+        let disconnected_txs: Vec<bitcoin::Transaction> =
+            disconnected_txs_by_block.into_iter().flatten().collect();
+
         // NOTE: We deliberately do NOT persist a reorg record here. The
         // caller knows the real new-tip and the full reconnected list;
         // recording at this point would stamp fork_hash as "new tip"
@@ -1462,6 +1786,7 @@ impl ChainState {
             old_tip,
             old_height,
             disconnected: disconnected_hashes,
+            disconnected_txs,
         })
     }
     /// Prune old block data files whose blocks are deep enough in the chain.
@@ -1757,6 +2082,121 @@ pub(crate) mod tests {
         assert_eq!(cs.get_block_hash_by_height(1), Some(b1_hash));
         assert_eq!(cs.get_block_hash_by_height(2), Some(b2_hash));
         assert_eq!(cs.get_block_hash_by_height(3), Some(b3_hash));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_reorg_fork_point_immune_to_polluted_height_hash() {
+        // The height_hash index is "best known at height" — populated
+        // by accept_header / accept_headers / store_block as well as
+        // by connect_block — so it is NOT an active-chain oracle. A
+        // side-chain block at the same height as an active block, if
+        // stored via `store_block`, will overwrite that height's
+        // entry with the side block's hash, even though the active
+        // chain is unchanged. Fork-point discovery must not depend
+        // on this index.
+        //
+        // Scenario:
+        //   1. Active chain: genesis -> A1 -> A2.
+        //   2. store_block(B1) — side at height 1, overwrites
+        //      height_hash[1] from A1 to B1 even though A1 is active.
+        //   3. Build B2, B3 via accept_block (side chain, more work).
+        //   4. accept_block(B3) triggers reorg.
+        //   5. Fork point must resolve to genesis (the real common
+        //      ancestor), not B1 (the polluted height_hash entry).
+        let (cs, dir) = make_chain_state();
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+
+        let a1 = build_test_block(genesis_hash, 1, 1_300_000_001);
+        let a1_hash = cs.accept_block(&a1).expect("accept A1");
+        let a2 = build_test_block(a1_hash, 2, 1_300_000_002);
+        let _a2_hash = cs.accept_block(&a2).expect("accept A2");
+        // After connect_block: height_hash[1] = A1.
+        assert_eq!(cs.get_block_hash_by_height(1), Some(a1_hash));
+
+        // Build a side block at height 1 and store it. store_block
+        // writes height_hash[1] = B1 (overwriting A1) even though
+        // A1 is the active block at height 1.
+        let b1 = build_test_block(genesis_hash, 1, 1_300_000_010);
+        let b1_hash = b1.block_hash();
+        let _ = cs.store_block(&b1).expect("store B1");
+        assert_eq!(
+            cs.get_block_hash_by_height(1),
+            Some(b1_hash),
+            "store_block must clobber height_hash[1] for the test premise to hold"
+        );
+
+        // Extend B with two more blocks via accept_block — heavier
+        // chain than A.
+        let b2 = build_test_block(b1_hash, 2, 1_300_000_011);
+        let b2_hash = cs.accept_block(&b2).expect("accept B2");
+        let b3 = build_test_block(b2_hash, 3, 1_300_000_012);
+        let b3_hash = cs.accept_block(&b3).expect("accept B3");
+
+        // Reorg must succeed: fork point is genesis, B3 is the new tip.
+        // The previous height-index-based fork-point logic would have
+        // matched at B1 (because height_hash[1] = B1) and tried to
+        // disconnect the active chain toward B1, which isn't on it.
+        assert_eq!(cs.tip_hash(), b3_hash);
+        assert_eq!(cs.tip_height(), 3);
+        assert_eq!(cs.get_block_hash_by_height(1), Some(b1_hash));
+        assert_eq!(cs.get_block_hash_by_height(2), Some(b2_hash));
+        assert_eq!(cs.get_block_hash_by_height(3), Some(b3_hash));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_reorg_back_to_previously_disconnected_branch() {
+        // Stale-Valid fork-point regression: a previously disconnected
+        // ancestor still carries BlockStatus::Valid, so the old
+        // status-only fork-point search would stop at that stale
+        // ancestor and try to disconnect the live chain toward a hash
+        // that isn't on it. The new search uses the height index and
+        // walks past the stale block to the real active fork point.
+        let (cs, dir) = make_chain_state();
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+
+        // Active chain A: genesis -> A1 -> A2.
+        let a1 = build_test_block(genesis_hash, 1, 1_300_000_001);
+        let a1_hash = cs.accept_block(&a1).expect("accept A1");
+        let a2 = build_test_block(a1_hash, 2, 1_300_000_002);
+        let a2_hash = cs.accept_block(&a2).expect("accept A2");
+        assert_eq!(cs.tip_hash(), a2_hash);
+
+        // Heavier B: genesis -> B1 -> B2 -> B3. Reorgs over A.
+        let b1 = build_test_block(genesis_hash, 1, 1_300_000_010);
+        let b1_hash = cs.accept_block(&b1).expect("accept B1");
+        let b2 = build_test_block(b1_hash, 2, 1_300_000_011);
+        let b2_hash = cs.accept_block(&b2).expect("accept B2");
+        let b3 = build_test_block(b2_hash, 3, 1_300_000_012);
+        let b3_hash = cs.accept_block(&b3).expect("accept B3");
+        assert_eq!(cs.tip_hash(), b3_hash);
+        // Sanity: A2 was disconnected but its block-index status is
+        // still Valid — exactly the condition the old fork-point
+        // search would trip on.
+        let a2_entry = cs.get_block_index(&a2_hash).unwrap();
+        assert_eq!(a2_entry.status, BlockStatus::Valid);
+        assert_eq!(cs.get_block_hash_by_height(2), Some(b2_hash));
+
+        // Now extend the previously-disconnected A branch with new
+        // blocks A3 -> A4 -> A5, beating B's work.
+        let a3 = build_test_block(a2_hash, 3, 1_300_000_020);
+        let a3_hash = cs.accept_block(&a3).expect("accept A3");
+        let a4 = build_test_block(a3_hash, 4, 1_300_000_021);
+        let a4_hash = cs.accept_block(&a4).expect("accept A4");
+        let a5 = build_test_block(a4_hash, 5, 1_300_000_022);
+        let a5_hash = cs.accept_block(&a5).expect("accept A5");
+
+        // Reorg should activate to A5 (the heavier chain).
+        assert_eq!(cs.tip_hash(), a5_hash);
+        assert_eq!(cs.tip_height(), 5);
+        assert_eq!(cs.get_block_hash_by_height(1), Some(a1_hash));
+        assert_eq!(cs.get_block_hash_by_height(2), Some(a2_hash));
+        assert_eq!(cs.get_block_hash_by_height(3), Some(a3_hash));
+        assert_eq!(cs.get_block_hash_by_height(4), Some(a4_hash));
+        assert_eq!(cs.get_block_hash_by_height(5), Some(a5_hash));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

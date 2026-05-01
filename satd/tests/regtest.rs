@@ -2786,7 +2786,7 @@ fn test_reorg_record_not_written_when_final_block_fails() {
             vec![serde_json::json!(2), serde_json::json!(addr)],
         )
         .unwrap();
-    let _a_hashes: Vec<String> = gen_a["result"]
+    let a_hashes: Vec<String> = gen_a["result"]
         .as_array()
         .unwrap()
         .iter()
@@ -2870,22 +2870,20 @@ fn test_reorg_record_not_written_when_final_block_fails() {
             .unwrap();
     }
 
-    // With the final connect failing, the node must end up with B2 as
-    // tip (the last successfully connected side-chain block), not B3.
+    // With the final connect failing, atomic rollback (M4 round 2)
+    // disconnects B2 and B1 and reconnects A1, A2 — restoring the
+    // original tip. The node must end up with A2 as tip, not B2 or B3.
     let tip = node_a.rpc_call("getbestblockhash").unwrap();
     assert_eq!(
         tip["result"].as_str().unwrap(),
-        b_hashes[1],
-        "final connect should have failed → tip stays at the last successful side-chain block"
+        a_hashes[1],
+        "final connect failure must roll back the partial reorg → tip restored to original A2"
     );
 
-    // The reorg record MUST still reflect an actual completed reorg
-    // (disconnect of A + reconnect through B1, B2) — just without B3.
-    // But the record we wrote must NOT claim B3 became the tip. The
-    // cleanest invariant: either no record (if we defer until the full
-    // success) or a record whose `new_tip` is B2, not the corrupted B3.
-    // Our implementation defers: no record written when the final
-    // connect fails, even though the intermediate state did change.
+    // No reorg record may claim the invalid block as a new tip. With
+    // atomic rollback the reorg never committed end-to-end, so the
+    // pending reorg record is never persisted; getreorghistory stays
+    // honest about completed reorgs only.
     let hist = node_a.rpc_call("getreorghistory").unwrap();
     let records = hist["result"]["records"].as_array().unwrap();
     assert!(
@@ -3968,6 +3966,38 @@ fn test_address_index_scripthash_param_form() {
         .as_u64()
         .expect("confirmed is u64");
     assert!(confirmed > 0);
+
+    node.stop();
+}
+
+// ── Address-history index — mempool variant (M4) ──────────────────────
+
+/// With no mempool txs, `getaddressbalance.unconfirmed` is 0 even
+/// after mining several blocks. Verifies the mempool task doesn't
+/// spuriously credit confirmed coinbases as unconfirmed.
+#[test]
+fn test_address_index_mempool_quiet_when_empty() {
+    let mut node = TestNode::start(&[]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+
+    let _ = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(5), serde_json::json!(addr)],
+        )
+        .unwrap();
+
+    let resp = node
+        .rpc_call_with_params("getaddressbalance", vec![serde_json::json!(addr)])
+        .expect("rpc");
+    let confirmed = resp["result"]["confirmed"].as_u64().unwrap_or(0);
+    let unconfirmed = resp["result"]["unconfirmed"].as_i64().unwrap_or(0);
+    assert!(confirmed > 0, "confirmed must be non-zero after 5 blocks");
+    assert_eq!(
+        unconfirmed, 0,
+        "unconfirmed delta must be 0 when mempool is empty; got {}",
+        unconfirmed
+    );
 
     node.stop();
 }
