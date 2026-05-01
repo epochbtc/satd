@@ -1280,26 +1280,60 @@ impl ChainState {
                 "Reorg: side chain has more work, activating"
             );
 
-            // Walk back from the side chain block to find the fork
-            // point — i.e. the deepest ancestor of the side chain that
-            // is currently on the active chain. Active-chain
-            // membership is determined by the height index
-            // (`get_block_hash_by_height(h) == Some(hash)`); blocks
-            // disconnected by past reorgs keep their `BlockStatus::
-            // Valid` marker, so checking status alone could stop the
-            // search at a stale ancestor and cause `perform_reorg` to
-            // try disconnecting toward a hash that isn't on the
-            // active chain.
+            // Walk back from both the active tip and the side-chain
+            // tip in parallel until they meet at a common ancestor
+            // — that is the fork point.
+            //
+            // We deliberately do NOT use `BlockStatus::Valid` (stale
+            // disconnected blocks keep that marker) nor
+            // `get_block_hash_by_height` (the height index is a
+            // "best-known-at-height" lookup populated by
+            // accept_header / accept_headers / store_block too, not
+            // an active-chain-only oracle). Walking ancestor pointers
+            // is bounded by reorg depth (<= 128 by the IBD guard at
+            // line ~1265) and only consults `prev_blockhash` /
+            // `height`, both of which are immutable per block.
             let fork_entry = {
+                let mut active_hash = current_tip;
+                let mut active_height = tip_entry.height;
                 let mut side_hash = prev_hash;
-                loop {
-                    let side_entry = self.store.get_block_index(&side_hash)
+                let mut side_height = new_height.saturating_sub(1);
+
+                // Equalize heights: walk the deeper walker back.
+                while active_height > side_height {
+                    let entry = self
+                        .store
+                        .get_block_index(&active_hash)
                         .ok_or(ChainError::BadPrevBlock)?;
-                    if self.store.get_block_hash_by_height(side_entry.height) == Some(side_hash) {
-                        break side_entry;
-                    }
-                    side_hash = side_entry.header.prev_blockhash;
+                    active_hash = entry.header.prev_blockhash;
+                    active_height -= 1;
                 }
+                while side_height > active_height {
+                    let entry = self
+                        .store
+                        .get_block_index(&side_hash)
+                        .ok_or(ChainError::BadPrevBlock)?;
+                    side_hash = entry.header.prev_blockhash;
+                    side_height -= 1;
+                }
+
+                // Walk both back together until they meet.
+                while active_hash != side_hash {
+                    let a_entry = self
+                        .store
+                        .get_block_index(&active_hash)
+                        .ok_or(ChainError::BadPrevBlock)?;
+                    let s_entry = self
+                        .store
+                        .get_block_index(&side_hash)
+                        .ok_or(ChainError::BadPrevBlock)?;
+                    active_hash = a_entry.header.prev_blockhash;
+                    side_hash = s_entry.header.prev_blockhash;
+                }
+
+                self.store
+                    .get_block_index(&active_hash)
+                    .ok_or(ChainError::BadPrevBlock)?
             };
 
             // Disconnect blocks from current tip down to fork point.
@@ -2045,6 +2079,67 @@ pub(crate) mod tests {
         assert_eq!(cs.tip_hash(), b3_hash);
         assert_eq!(cs.tip_height(), 3);
 
+        assert_eq!(cs.get_block_hash_by_height(1), Some(b1_hash));
+        assert_eq!(cs.get_block_hash_by_height(2), Some(b2_hash));
+        assert_eq!(cs.get_block_hash_by_height(3), Some(b3_hash));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_reorg_fork_point_immune_to_polluted_height_hash() {
+        // The height_hash index is "best known at height" — populated
+        // by accept_header / accept_headers / store_block as well as
+        // by connect_block — so it is NOT an active-chain oracle. A
+        // side-chain block at the same height as an active block, if
+        // stored via `store_block`, will overwrite that height's
+        // entry with the side block's hash, even though the active
+        // chain is unchanged. Fork-point discovery must not depend
+        // on this index.
+        //
+        // Scenario:
+        //   1. Active chain: genesis -> A1 -> A2.
+        //   2. store_block(B1) — side at height 1, overwrites
+        //      height_hash[1] from A1 to B1 even though A1 is active.
+        //   3. Build B2, B3 via accept_block (side chain, more work).
+        //   4. accept_block(B3) triggers reorg.
+        //   5. Fork point must resolve to genesis (the real common
+        //      ancestor), not B1 (the polluted height_hash entry).
+        let (cs, dir) = make_chain_state();
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+
+        let a1 = build_test_block(genesis_hash, 1, 1_300_000_001);
+        let a1_hash = cs.accept_block(&a1).expect("accept A1");
+        let a2 = build_test_block(a1_hash, 2, 1_300_000_002);
+        let _a2_hash = cs.accept_block(&a2).expect("accept A2");
+        // After connect_block: height_hash[1] = A1.
+        assert_eq!(cs.get_block_hash_by_height(1), Some(a1_hash));
+
+        // Build a side block at height 1 and store it. store_block
+        // writes height_hash[1] = B1 (overwriting A1) even though
+        // A1 is the active block at height 1.
+        let b1 = build_test_block(genesis_hash, 1, 1_300_000_010);
+        let b1_hash = b1.block_hash();
+        let _ = cs.store_block(&b1).expect("store B1");
+        assert_eq!(
+            cs.get_block_hash_by_height(1),
+            Some(b1_hash),
+            "store_block must clobber height_hash[1] for the test premise to hold"
+        );
+
+        // Extend B with two more blocks via accept_block — heavier
+        // chain than A.
+        let b2 = build_test_block(b1_hash, 2, 1_300_000_011);
+        let b2_hash = cs.accept_block(&b2).expect("accept B2");
+        let b3 = build_test_block(b2_hash, 3, 1_300_000_012);
+        let b3_hash = cs.accept_block(&b3).expect("accept B3");
+
+        // Reorg must succeed: fork point is genesis, B3 is the new tip.
+        // The previous height-index-based fork-point logic would have
+        // matched at B1 (because height_hash[1] = B1) and tried to
+        // disconnect the active chain toward B1, which isn't on it.
+        assert_eq!(cs.tip_hash(), b3_hash);
+        assert_eq!(cs.tip_height(), 3);
         assert_eq!(cs.get_block_hash_by_height(1), Some(b1_hash));
         assert_eq!(cs.get_block_hash_by_height(2), Some(b2_hash));
         assert_eq!(cs.get_block_hash_by_height(3), Some(b3_hash));
