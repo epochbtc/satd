@@ -3,36 +3,94 @@
 //! (`backfillindex`, `pauseindex`, `resumeindex`, `cancelindex`).
 //!
 //! `getindexinfo` returns a wrapping shape (`{"address": {...},
-//! ...}`) so future indexes (txindex, blockfilter) can join under
-//! sibling keys without breaking consumers — see
-//! `ADDRESS_INDEX.md` §"Operator RPCs / `getindexinfo`".
+//! ...}`) matching `ADDRESS_INDEX.md` §"Status reporting" so future
+//! indexes (txindex, blockfilter) can join under sibling keys without
+//! breaking consumers.
 
 use std::sync::Arc;
 
 use serde_json::{Value, json};
 
-use crate::index::address::{BackfillHandle, render_status};
+use crate::index::address::{BackfillHandle, cursor::BackfillState, render_status};
 
-/// `getindexinfo` → `{"address": {...}, ...}`. Builds the per-index
-/// `synced` / `state` / `progress_ratio` fields from the live
-/// backfill cursor (or the idle defaults if no cursor exists yet).
+/// `getindexinfo` → `{"address": {...}, ...}` per
+/// `ADDRESS_INDEX.md` §"Status reporting":
+///
+/// ```text
+/// {
+///   "address": {
+///     "synced": <bool>,
+///     "best_block_height": <chain tip height>,
+///     "backfill": {
+///       "active": <bool>,
+///       "pass": <1 or 2>,
+///       "cursor_height": <u32>,
+///       "snapshot_height": <u32>,
+///       "estimated_remaining_seconds": <u64>
+///     }
+///   }
+/// }
+/// ```
+///
+/// `backfill` is omitted when no backfill state has ever been
+/// recorded for this datadir (cursor is fully idle), keeping the
+/// response slim for the common "no backfill needed" case.
 pub fn get_index_info(
     backfill: Option<&Arc<BackfillHandle>>,
     address_enabled: bool,
+    best_block_height: u32,
 ) -> Value {
     let report = render_status(backfill.map(|h| h.as_ref()), address_enabled);
-    json!({
-        "address": {
-            "synced": report.synced,
-            "enabled": report.enabled,
-            "state": report.state,
-            "pass": report.pass,
-            "cursor_height": report.cursor_height,
-            "snapshot_height": report.snapshot_height,
-            "started_at_unix": report.started_at_unix,
-            "progress_ratio": report.progress_ratio,
-        },
-    })
+    let mut address = serde_json::Map::new();
+    address.insert("synced".into(), json!(report.synced));
+    address.insert("best_block_height".into(), json!(best_block_height));
+
+    // Emit backfill substructure when there's anything to report.
+    // For a brand-new datadir with no backfill ever started, we still
+    // emit it (with `active: false`) so clients can probe a stable
+    // shape without conditional handling.
+    let cursor_state = backfill
+        .map(|h| h.cursor().state)
+        .unwrap_or(BackfillState::Idle);
+    let active = matches!(
+        cursor_state,
+        BackfillState::Running | BackfillState::Paused
+    );
+    let estimated_remaining_seconds = estimate_remaining_seconds(&report);
+    let mut bf = serde_json::Map::new();
+    bf.insert("active".into(), json!(active));
+    bf.insert("pass".into(), json!(report.pass));
+    bf.insert("cursor_height".into(), json!(report.cursor_height));
+    bf.insert("snapshot_height".into(), json!(report.snapshot_height));
+    bf.insert(
+        "estimated_remaining_seconds".into(),
+        json!(estimated_remaining_seconds),
+    );
+    address.insert("backfill".into(), Value::Object(bf));
+
+    json!({ "address": Value::Object(address) })
+}
+
+/// Estimate seconds-to-completion from elapsed time and progress
+/// ratio. Returns 0 when no estimate is available (idle, just
+/// started, or no snapshot height yet).
+fn estimate_remaining_seconds(report: &crate::index::address::backfill::StatusReport) -> u64 {
+    if report.progress_ratio <= 0.0 || report.progress_ratio >= 1.0 {
+        return 0;
+    }
+    if report.started_at_unix == 0 {
+        return 0;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if now <= report.started_at_unix {
+        return 0;
+    }
+    let elapsed = now - report.started_at_unix;
+    let remaining_ratio = 1.0 - report.progress_ratio;
+    ((elapsed as f64) * (remaining_ratio / report.progress_ratio)) as u64
 }
 
 /// `backfillindex address` → trigger a deferred backfill for the

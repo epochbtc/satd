@@ -349,6 +349,7 @@ pub async fn start(
         Ok::<_, ErrorObjectOwned>(indexes::get_index_info(
             ctx.backfill.as_ref(),
             ctx.address_index_enabled,
+            ctx.chain_state.tip_height(),
         ))
     })?;
 

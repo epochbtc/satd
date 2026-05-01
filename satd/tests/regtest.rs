@@ -4021,22 +4021,30 @@ fn test_address_index_mempool_quiet_when_empty() {
 // ── Address-history index — backfill RPCs (M7) ────────────────────────
 
 /// `getindexinfo` returns the wrapping `{"address": {...}}` envelope
-/// expected by the spec, with `enabled` reflecting the runtime flag
-/// and `state` defaulting to "idle" when no backfill has run.
+/// expected by the spec (ADDRESS_INDEX.md §"Status reporting"):
+/// nested `{address: {synced, best_block_height, backfill: {...}}}`.
 #[test]
 fn test_address_index_getindexinfo_shape() {
     let mut node = TestNode::start(&[]);
     let resp = node.rpc_call("getindexinfo").expect("rpc");
     let addr = &resp["result"]["address"];
     assert!(addr.is_object(), "address key missing: {}", resp);
-    assert_eq!(addr["enabled"].as_bool(), Some(true));
-    assert_eq!(addr["state"].as_str(), Some("idle"));
-    assert_eq!(addr["pass"].as_u64(), Some(0));
-    assert_eq!(addr["cursor_height"].as_u64(), Some(0));
-    assert_eq!(addr["snapshot_height"].as_u64(), Some(0));
     // synced=true is correct for a non-AssumeUTXO datadir: every
     // block already had its rows written from connect_block.
     assert_eq!(addr["synced"].as_bool(), Some(true));
+    assert!(
+        addr["best_block_height"].as_u64().is_some(),
+        "best_block_height must be present: {}",
+        resp
+    );
+
+    let bf = &addr["backfill"];
+    assert!(bf.is_object(), "backfill substructure missing: {}", resp);
+    assert_eq!(bf["active"].as_bool(), Some(false));
+    assert_eq!(bf["pass"].as_u64(), Some(0));
+    assert_eq!(bf["cursor_height"].as_u64(), Some(0));
+    assert_eq!(bf["snapshot_height"].as_u64(), Some(0));
+    assert_eq!(bf["estimated_remaining_seconds"].as_u64(), Some(0));
     node.stop();
 }
 
