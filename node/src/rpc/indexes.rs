@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use serde_json::{Value, json};
 
-use crate::index::address::{BackfillHandle, cursor::BackfillState, render_status};
+use crate::index::address::{BackfillCommand, BackfillHandle, cursor::BackfillState, render_status};
 
 /// `getindexinfo` → `{"address": {...}, ...}` per
 /// `ADDRESS_INDEX.md` §"Status reporting":
@@ -94,29 +94,65 @@ fn estimate_remaining_seconds(report: &crate::index::address::backfill::StatusRe
 }
 
 /// `backfillindex address` → trigger a deferred backfill for the
-/// address-history index. M7 scaffolding: returns the current state
-/// so operators can confirm the index is wired; actual two-pass
-/// execution lights up when AssumeUTXO lands and the snapshot
-/// height is known.
+/// address-history index. Two-pass walk over every block from genesis
+/// to the chain tip, populating the address-index CFs that pre-date
+/// the operator turning the index on. Idempotent on the wire: a call
+/// while a backfill is already running returns the live state, not an
+/// error. A call after Completed reports the cached completion.
 pub fn backfill_index(
     backfill: Option<&Arc<BackfillHandle>>,
+    cmd_tx: Option<&tokio::sync::mpsc::Sender<BackfillCommand>>,
+    address_index_enabled: bool,
     target: &str,
 ) -> Result<Value, (i32, String)> {
     if target != "address" {
         return Err((-8, format!("unknown index target '{}'", target)));
     }
-    match backfill {
-        Some(h) => {
-            // No-op for now: with AssumeUTXO not in the tree, every
-            // block already populated the index from `connect_block`.
-            // We expose the intent so the wire surface is stable.
+    if !address_index_enabled {
+        return Err((
+            -8,
+            "address index is disabled (--addressindex=0); enable it before requesting a backfill"
+                .into(),
+        ));
+    }
+    let h = backfill.ok_or((-32603, "backfill handle not initialized".to_string()))?;
+    let tx = cmd_tx.ok_or((
+        -32603,
+        "backfill supervisor not running — restart the daemon to wire it".to_string(),
+    ))?;
+
+    let cur = h.cursor();
+    match cur.state {
+        BackfillState::Running | BackfillState::Paused => Ok(json!({
+            "started": false,
+            "reason": "backfill already in progress",
+            "state": cur.state.label(),
+            "pass": cur.pass,
+            "cursor_height": cur.cursor_height,
+            "snapshot_height": cur.snapshot_height,
+        })),
+        BackfillState::Completed => Ok(json!({
+            "started": false,
+            "reason": "backfill already completed for this datadir",
+            "state": cur.state.label(),
+            "snapshot_height": cur.snapshot_height,
+        })),
+        BackfillState::Idle | BackfillState::Cancelled | BackfillState::Rejected => {
+            // Reset pause/cancel flags so a prior cancel doesn't leak
+            // into the new run. The supervisor will spawn a fresh
+            // runner that calls `start()` to persist Running state.
+            h.reset_flags();
+            tx.try_send(BackfillCommand::Start).map_err(|e| {
+                (
+                    -32603,
+                    format!("failed to dispatch backfill start: {}", e),
+                )
+            })?;
             Ok(json!({
-                "started": false,
-                "reason": "AssumeUTXO is not in the tree; every block was already indexed at connect_block time. Backfill is a no-op for this datadir.",
-                "state": h.cursor().state.label(),
+                "started": true,
+                "previous_state": cur.state.label(),
             }))
         }
-        None => Err((-32603, "backfill handle not initialized".to_string())),
     }
 }
 

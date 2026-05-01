@@ -1,5 +1,5 @@
 use crate::chain::state::ChainState;
-use crate::index::address::{AddressIndex, BackfillHandle};
+use crate::index::address::{AddressIndex, BackfillCommand, BackfillHandle};
 use crate::mempool::fee::FeeEstimator;
 use crate::mempool::history::MempoolHistory;
 use crate::mempool::pool::Mempool;
@@ -46,6 +46,10 @@ pub struct RpcContext {
     /// without a backfill thread skip wiring; the RPCs return
     /// "not initialized" errors in that case.
     pub backfill: Option<Arc<BackfillHandle>>,
+    /// Channel to the backfill supervisor task. `Some` when the
+    /// supervisor is running; `None` when the binary was built without
+    /// the supervisor wired (tests, embedded uses).
+    pub backfill_cmd_tx: Option<tokio::sync::mpsc::Sender<BackfillCommand>>,
 }
 
 /// Which data source `estimatesmartfee` / `estimatefees` draws from.
@@ -137,6 +141,7 @@ pub async fn start(
     address_index: Arc<dyn AddressIndex>,
     address_index_enabled: bool,
     backfill: Option<Arc<BackfillHandle>>,
+    backfill_cmd_tx: Option<tokio::sync::mpsc::Sender<BackfillCommand>>,
 ) -> Result<ServerHandle, Box<dyn std::error::Error + Send + Sync>> {
     let ctx = Arc::new(RpcContext {
         chain_state,
@@ -151,6 +156,7 @@ pub async fn start(
         address_index,
         address_index_enabled,
         backfill,
+        backfill_cmd_tx,
     });
 
     let mut module = RpcModule::new(ctx);
@@ -357,8 +363,13 @@ pub async fn start(
         let target: String = params.one().map_err(|e| {
             ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
         })?;
-        indexes::backfill_index(ctx.backfill.as_ref(), &target)
-            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
+        indexes::backfill_index(
+            ctx.backfill.as_ref(),
+            ctx.backfill_cmd_tx.as_ref(),
+            ctx.address_index_enabled,
+            &target,
+        )
+        .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
     module.register_method("pauseindex", |params, ctx, _extensions| {

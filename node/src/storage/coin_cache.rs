@@ -409,7 +409,9 @@ impl Store for CoinCache {
             || !batch.addr_funding_puts.is_empty()
             || !batch.addr_spending_puts.is_empty()
             || !batch.addr_funding_removes.is_empty()
-            || !batch.addr_spending_removes.is_empty();
+            || !batch.addr_spending_removes.is_empty()
+            || !batch.addr_backfill_temp_puts.is_empty()
+            || batch.backfill_cursor_advance.is_some();
 
         if has_non_coin {
             if coin_dirty == 0 {
@@ -427,6 +429,8 @@ impl Store for CoinCache {
                     addr_spending_puts: batch.addr_spending_puts,
                     addr_funding_removes: batch.addr_funding_removes,
                     addr_spending_removes: batch.addr_spending_removes,
+                    addr_backfill_temp_puts: batch.addr_backfill_temp_puts,
+                    backfill_cursor_advance: batch.backfill_cursor_advance,
                 };
                 self.inner.write_batch_mode(pass_through, self.current_write_mode())?;
             } else {
@@ -448,6 +452,8 @@ impl Store for CoinCache {
                     addr_spending_puts: batch.addr_spending_puts,
                     addr_funding_removes: batch.addr_funding_removes,
                     addr_spending_removes: batch.addr_spending_removes,
+                    addr_backfill_temp_puts: batch.addr_backfill_temp_puts,
+                    backfill_cursor_advance: batch.backfill_cursor_advance,
                     ..Default::default()
                 };
                 pending.merge(addr_only);
@@ -694,6 +700,29 @@ impl Store for CoinCache {
                 .cmp(&crate::index::address::encode_spending_key(b))
         });
         all
+    }
+
+    fn create_backfill_temp_cf(&self) -> Result<(), StoreError> {
+        self.inner.create_backfill_temp_cf()
+    }
+
+    fn drop_backfill_temp_cf(&self) -> Result<(), StoreError> {
+        self.inner.drop_backfill_temp_cf()
+    }
+
+    fn backfill_temp_cf_exists(&self) -> bool {
+        self.inner.backfill_temp_cf_exists()
+    }
+
+    fn lookup_backfill_temp(
+        &self,
+        outpoint: &OutPoint,
+    ) -> Result<Option<crate::index::address::Scripthash>, StoreError> {
+        self.inner.lookup_backfill_temp(outpoint)
+    }
+
+    fn read_backfill_cursor(&self) -> crate::index::address::cursor::BackfillCursor {
+        self.inner.read_backfill_cursor()
     }
 }
 

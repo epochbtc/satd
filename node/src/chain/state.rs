@@ -841,6 +841,14 @@ impl ChainState {
         bitcoin::consensus::deserialize(&data).ok()
     }
 
+    /// Read the block at a given active-chain height. Returns `None` for
+    /// heights past the tip, missing block index entries, or pruned/invalid
+    /// blocks. Used by the address-index backfill runner.
+    pub fn read_block_at_height(&self, height: u32) -> Option<Block> {
+        let hash = self.store.get_block_hash_by_height(height)?;
+        self.get_block(&hash)
+    }
+
     /// Read a block from flat files without acquiring the flat_files mutex.
     /// Safe because read_block() opens a fresh file handle each time.
     fn read_block_direct(&self, pos: &FlatFilePos) -> Option<Block> {

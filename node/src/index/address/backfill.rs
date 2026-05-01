@@ -30,6 +30,29 @@ use std::sync::{
 };
 
 use crate::index::address::cursor::{BackfillCursor, BackfillState};
+use crate::storage::{BackfillCursorWrite, Store, StoreBatch, StoreError};
+
+#[derive(Debug, thiserror::Error)]
+pub enum BackfillError {
+    #[error("backfill already in progress (state: {0})")]
+    AlreadyRunning(&'static str),
+    #[error("backfill already completed for this datadir")]
+    AlreadyCompleted,
+    #[error("invalid state transition: {from} -> {to}")]
+    InvalidTransition { from: &'static str, to: &'static str },
+    #[error("pre-flight: insufficient free disk ({have} bytes < {need} bytes required)")]
+    InsufficientDisk { have: u64, need: u64 },
+    #[error("storage error: {0}")]
+    Storage(#[from] StoreError),
+    #[error("chain state: {0}")]
+    Chain(String),
+    #[error("cancelled by operator")]
+    Cancelled,
+    #[error("shutdown requested")]
+    Shutdown,
+    #[error("temp CF lookup miss for outpoint {0}: backfill data may be corrupt")]
+    TempCfMiss(bitcoin::OutPoint),
+}
 
 /// Shared handle so RPCs can drive the task without a tokio
 /// `oneshot` per command. Each control RPC sets a flag; the task
@@ -63,7 +86,7 @@ impl BackfillHandle {
     /// Snapshot the in-memory cursor for `getindexinfo`. Cheap;
     /// holds the mutex only long enough to clone.
     pub fn cursor(&self) -> BackfillCursor {
-        self.inner.cursor.lock().unwrap().clone()
+        *self.inner.cursor.lock().unwrap()
     }
 
     /// Update the in-memory cursor. Called by the running task on
@@ -96,6 +119,179 @@ impl BackfillHandle {
 
     pub fn is_cancelled(&self) -> bool {
         self.inner.cancelled.load(Ordering::SeqCst)
+    }
+
+    /// Reset the pause/cancel flags. Called by the supervisor before
+    /// spawning a fresh runner so an earlier `cancel`/`pause` doesn't
+    /// leak across runs.
+    pub fn reset_flags(&self) {
+        self.inner.paused.store(false, Ordering::SeqCst);
+        self.inner.cancelled.store(false, Ordering::SeqCst);
+    }
+
+    /// Persist a metadata-only cursor advance via a no-row StoreBatch.
+    /// Used for state transitions (start, advance_to_pass_2, mark_*)
+    /// where the cursor changes without a corresponding addr-CF write.
+    fn persist(&self, store: &dyn Store, new: BackfillCursor) -> Result<(), BackfillError> {
+        let batch = StoreBatch {
+            backfill_cursor_advance: Some(BackfillCursorWrite {
+                state: new.state,
+                pass: new.pass,
+                cursor_height: new.cursor_height,
+                snapshot_height: new.snapshot_height,
+                started_at_unix: new.started_at_unix,
+            }),
+            ..Default::default()
+        };
+        store.write_batch(batch)?;
+        self.set_cursor(new);
+        Ok(())
+    }
+
+    /// Begin a fresh backfill. Cursor transitions Idle/Cancelled/Rejected/
+    /// Completed → Running(pass=1, h=0, snapshot_height). Errors if a
+    /// backfill is already Running or Paused. The caller is expected to
+    /// have created the temp CF first.
+    pub fn start(
+        &self,
+        store: &dyn Store,
+        snapshot_height: u32,
+    ) -> Result<(), BackfillError> {
+        let cur = self.cursor();
+        match cur.state {
+            BackfillState::Running => {
+                return Err(BackfillError::AlreadyRunning("running"));
+            }
+            BackfillState::Paused => {
+                return Err(BackfillError::AlreadyRunning("paused"));
+            }
+            BackfillState::Idle
+            | BackfillState::Cancelled
+            | BackfillState::Rejected
+            | BackfillState::Completed => {}
+        }
+        let started_at_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.persist(
+            store,
+            BackfillCursor {
+                state: BackfillState::Running,
+                pass: 1,
+                cursor_height: 0,
+                snapshot_height,
+                started_at_unix,
+            },
+        )
+    }
+
+    /// Atomic pass-1 → pass-2 transition. Caller must have just persisted
+    /// the final pass-1 row batch (cursor_height = snapshot_height).
+    pub fn advance_to_pass_2(&self, store: &dyn Store) -> Result<(), BackfillError> {
+        let cur = self.cursor();
+        if cur.state != BackfillState::Running || cur.pass != 1 {
+            return Err(BackfillError::InvalidTransition {
+                from: cur.state.label(),
+                to: "running pass=2",
+            });
+        }
+        self.persist(
+            store,
+            BackfillCursor {
+                state: BackfillState::Running,
+                pass: 2,
+                cursor_height: 0,
+                snapshot_height: cur.snapshot_height,
+                started_at_unix: cur.started_at_unix,
+            },
+        )
+    }
+
+    /// Mark Completed. Caller drops the temp CF after this returns Ok.
+    pub fn mark_completed(&self, store: &dyn Store) -> Result<(), BackfillError> {
+        let cur = self.cursor();
+        if cur.state != BackfillState::Running {
+            return Err(BackfillError::InvalidTransition {
+                from: cur.state.label(),
+                to: "completed",
+            });
+        }
+        self.persist(
+            store,
+            BackfillCursor {
+                state: BackfillState::Completed,
+                pass: cur.pass,
+                cursor_height: cur.cursor_height,
+                snapshot_height: cur.snapshot_height,
+                started_at_unix: cur.started_at_unix,
+            },
+        )
+    }
+
+    /// Mark Cancelled. Caller drops the temp CF after this returns Ok.
+    pub fn mark_cancelled(&self, store: &dyn Store) -> Result<(), BackfillError> {
+        let cur = self.cursor();
+        if !matches!(
+            cur.state,
+            BackfillState::Running | BackfillState::Paused
+        ) {
+            return Err(BackfillError::InvalidTransition {
+                from: cur.state.label(),
+                to: "cancelled",
+            });
+        }
+        self.persist(
+            store,
+            BackfillCursor {
+                state: BackfillState::Cancelled,
+                pass: cur.pass,
+                cursor_height: cur.cursor_height,
+                snapshot_height: cur.snapshot_height,
+                started_at_unix: cur.started_at_unix,
+            },
+        )
+    }
+
+    /// Move Running→Paused for `getindexinfo` reporting consistency.
+    /// The runner observes `is_paused()` between batches; this method
+    /// also persists the state byte so a restart while paused stays
+    /// paused. Idempotent if already Paused.
+    pub fn mark_paused(&self, store: &dyn Store) -> Result<(), BackfillError> {
+        let cur = self.cursor();
+        match cur.state {
+            BackfillState::Paused => Ok(()),
+            BackfillState::Running => self.persist(
+                store,
+                BackfillCursor {
+                    state: BackfillState::Paused,
+                    ..cur
+                },
+            ),
+            _ => Err(BackfillError::InvalidTransition {
+                from: cur.state.label(),
+                to: "paused",
+            }),
+        }
+    }
+
+    /// Paused→Running on resume. Idempotent if already Running.
+    pub fn mark_running(&self, store: &dyn Store) -> Result<(), BackfillError> {
+        let cur = self.cursor();
+        match cur.state {
+            BackfillState::Running => Ok(()),
+            BackfillState::Paused => self.persist(
+                store,
+                BackfillCursor {
+                    state: BackfillState::Running,
+                    ..cur
+                },
+            ),
+            _ => Err(BackfillError::InvalidTransition {
+                from: cur.state.label(),
+                to: "running",
+            }),
+        }
     }
 }
 

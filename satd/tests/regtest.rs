@@ -17,6 +17,15 @@ struct TestNode {
 
 impl TestNode {
     fn start(extra_args: &[&str]) -> Self {
+        Self::start_with_env(extra_args, &[])
+    }
+
+    /// Like `start` but also sets environment variables on the spawned
+    /// satd process. Used by backfill tests to inject the per-block
+    /// debug delay knob (`SATD_BACKFILL_DEBUG_DELAY_MS`) without
+    /// polluting the parent process's environment, which would race
+    /// across parallel tests.
+    fn start_with_env(extra_args: &[&str], env: &[(&str, &str)]) -> Self {
         let rpcport = find_available_port();
         let datadir = std::env::temp_dir().join(format!("satd-test-{}", rpcport));
         let _ = std::fs::create_dir_all(&datadir);
@@ -41,6 +50,9 @@ impl TestNode {
         }
         for arg in extra_args {
             cmd.arg(arg);
+        }
+        for (k, v) in env {
+            cmd.env(k, v);
         }
 
         let process = cmd
@@ -132,6 +144,15 @@ impl TestNode {
 
     /// Start a node reusing an existing datadir (for restart/reindex tests).
     fn start_with_datadir(datadir: &std::path::Path, rpcport: u16, extra_args: &[&str]) -> Self {
+        Self::start_with_datadir_env(datadir, rpcport, extra_args, &[])
+    }
+
+    fn start_with_datadir_env(
+        datadir: &std::path::Path,
+        rpcport: u16,
+        extra_args: &[&str],
+        env: &[(&str, &str)],
+    ) -> Self {
         let satd_bin = env!("CARGO_BIN_EXE_satd");
 
         let has_port = extra_args.iter().any(|a| a.starts_with("--port"));
@@ -147,10 +168,32 @@ impl TestNode {
         for arg in extra_args {
             cmd.arg(arg);
         }
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+
+        // Optional stderr capture for tests that need to diagnose
+        // startup failures. If `SATD_TEST_STDERR_DIR` is set, satd's
+        // stderr is redirected to a file under that directory keyed by
+        // (rpcport, timestamp). Default: silent (parity with `start`).
+        let stderr_target = match std::env::var("SATD_TEST_STDERR_DIR") {
+            Ok(dir) => {
+                let _ = std::fs::create_dir_all(&dir);
+                let stamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0);
+                let path = std::path::PathBuf::from(&dir)
+                    .join(format!("satd-{}-{}.stderr.log", rpcport, stamp));
+                let f = std::fs::File::create(&path).expect("create stderr log");
+                std::process::Stdio::from(f)
+            }
+            Err(_) => std::process::Stdio::null(),
+        };
 
         let process = cmd
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(stderr_target)
             .spawn()
             .expect("Failed to start satd");
 
@@ -4097,12 +4140,115 @@ fn test_address_index_backfill_control_rpcs() {
     node.stop();
 }
 
-/// `backfillindex address` returns the no-op explanation when there's
-/// no AssumeUTXO snapshot — the index was already populated at
-/// connect_block time on this datadir.
+/// Helper: poll `getindexinfo` until the address-index backfill state
+/// matches one of `expected`. Returns the final response, or panics on
+/// timeout. Default 30 s deadline tracks the runner's per-batch
+/// cadence; tests that inject a long debug delay should size up.
+fn poll_backfill_state(
+    node: &TestNode,
+    expected: &[&str],
+    deadline: std::time::Duration,
+) -> serde_json::Value {
+    let start = Instant::now();
+    let mut last = serde_json::Value::Null;
+    while start.elapsed() < deadline {
+        let r = node.rpc_call("getindexinfo").expect("rpc");
+        let bf = &r["result"]["address"]["backfill"];
+        let active = bf["active"].as_bool().unwrap_or(false);
+        let synced = r["result"]["address"]["synced"].as_bool().unwrap_or(false);
+        // Map `(active, synced)` to a human label that mirrors the
+        // cursor.state values surfaced by the runner. The RPC doesn't
+        // expose state directly to operators, so we infer from the
+        // shape: synced+!active=Completed/Idle, active=Running/Paused.
+        for label in expected {
+            let matches = match *label {
+                "running" | "paused" => active,
+                "completed" | "idle" => synced && !active,
+                "synced" => synced,
+                _ => false,
+            };
+            if matches {
+                return r;
+            }
+        }
+        last = r;
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!(
+        "timeout waiting for backfill state {:?}; last response: {}",
+        expected, last
+    );
+}
+
+/// `backfillindex address` starts a real two-pass backfill on a
+/// non-AssumeUTXO datadir. Replaces the M7-era "no-op" test once the
+/// genesis→tip walk landed.
 #[test]
-fn test_address_index_backfillindex_noop_without_assumeutxo() {
+fn test_address_index_backfillindex_starts_and_completes() {
     let mut node = TestNode::start(&[]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    // Mine a small chain so there's something to walk over.
+    let _ = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(20), serde_json::json!(addr)],
+        )
+        .expect("rpc");
+
+    let r = node
+        .rpc_call_with_params(
+            "backfillindex",
+            vec![serde_json::json!("address")],
+        )
+        .expect("rpc");
+    assert_eq!(
+        r["result"]["started"].as_bool(),
+        Some(true),
+        "expected started=true on fresh datadir: {}",
+        r
+    );
+
+    let final_resp = poll_backfill_state(
+        &node,
+        &["completed"],
+        Duration::from_secs(30),
+    );
+    let bf = &final_resp["result"]["address"]["backfill"];
+    assert_eq!(bf["active"].as_bool(), Some(false));
+    assert!(
+        final_resp["result"]["address"]["synced"]
+            .as_bool()
+            .unwrap_or(false),
+        "synced must be true after completion: {}",
+        final_resp
+    );
+    // Snapshot height should reflect the chain tip at the time of start.
+    assert!(bf["snapshot_height"].as_u64().unwrap_or(0) >= 20);
+
+    node.stop();
+}
+
+/// A second `backfillindex` after completion is idempotent: returns
+/// `started: false` with the "already completed" reason.
+#[test]
+fn test_address_index_backfill_idempotent_after_completion() {
+    let mut node = TestNode::start(&[]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let _ = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(15), serde_json::json!(addr)],
+        )
+        .expect("rpc");
+
+    let _ = node
+        .rpc_call_with_params(
+            "backfillindex",
+            vec![serde_json::json!("address")],
+        )
+        .expect("rpc");
+    poll_backfill_state(&node, &["completed"], Duration::from_secs(30));
+
     let r = node
         .rpc_call_with_params(
             "backfillindex",
@@ -4110,13 +4256,295 @@ fn test_address_index_backfillindex_noop_without_assumeutxo() {
         )
         .expect("rpc");
     assert_eq!(r["result"]["started"].as_bool(), Some(false));
+    let reason = r["result"]["reason"].as_str().unwrap_or("");
     assert!(
-        r["result"]["reason"]
-            .as_str()
-            .unwrap_or("")
-            .contains("AssumeUTXO"),
-        "expected AssumeUTXO mention in reason: {}",
-        r
+        reason.contains("already completed"),
+        "expected 'already completed' reason; got: {}",
+        reason
+    );
+
+    node.stop();
+}
+
+/// `--addressindex=0` makes `backfillindex address` reject with an
+/// operator-friendly -8 error. Otherwise the runner would write rows
+/// to a CF nobody reads.
+#[test]
+fn test_address_index_backfill_disabled_returns_error() {
+    let mut node = TestNode::start(&["--addressindex=0"]);
+    let r = node
+        .rpc_call_with_params(
+            "backfillindex",
+            vec![serde_json::json!("address")],
+        )
+        .expect("rpc");
+    assert_eq!(r["error"]["code"].as_i64(), Some(-8));
+    let msg = r["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("disabled") || msg.contains("--addressindex=0"),
+        "error should explain index is disabled; got: {}",
+        msg
     );
     node.stop();
+}
+
+/// Pause mid-run, observe paused state, resume, observe completion.
+/// Uses `SATD_BACKFILL_DEBUG_DELAY_MS` to slow the runner so the test
+/// can race the pause flag in.
+#[test]
+fn test_address_index_backfill_pause_resume() {
+    // Inject 30 ms per-block delay so 30 blocks ≈ 1 s pass 1 and we
+    // have time to pause cleanly. Env var is set on the spawned
+    // process only — parent's env stays clean across parallel tests.
+    let mut node = TestNode::start_with_env(
+        &[],
+        &[("SATD_BACKFILL_DEBUG_DELAY_MS", "30")],
+    );
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let _ = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(30), serde_json::json!(addr)],
+        )
+        .expect("rpc");
+
+    let _ = node
+        .rpc_call_with_params(
+            "backfillindex",
+            vec![serde_json::json!("address")],
+        )
+        .expect("rpc");
+
+    // Pause within 100 ms — runner is almost certainly between batches.
+    std::thread::sleep(Duration::from_millis(100));
+    let pause_resp = node
+        .rpc_call_with_params(
+            "pauseindex",
+            vec![serde_json::json!("address")],
+        )
+        .expect("rpc");
+    assert_eq!(
+        pause_resp["result"]["paused"].as_bool(),
+        Some(true),
+        "pauseindex should accept while running: {}",
+        pause_resp
+    );
+
+    // Observe `active=true` (paused state still shows as active in the
+    // RPC envelope — `synced` would be false because the cursor isn't
+    // at snapshot_height yet).
+    let mid = node.rpc_call("getindexinfo").expect("rpc");
+    let bf_mid = &mid["result"]["address"]["backfill"];
+    assert_eq!(bf_mid["active"].as_bool(), Some(true), "{}", mid);
+
+    // Resume and wait for completion.
+    let resume_resp = node
+        .rpc_call_with_params(
+            "resumeindex",
+            vec![serde_json::json!("address")],
+        )
+        .expect("rpc");
+    assert_eq!(resume_resp["result"]["resumed"].as_bool(), Some(true));
+
+    poll_backfill_state(&node, &["completed"], Duration::from_secs(60));
+
+    node.stop();
+}
+
+/// Cancel mid-run, observe cancelled state, then a fresh start
+/// succeeds (proving the temp CF was dropped and persisted state
+/// was reset).
+#[test]
+fn test_address_index_backfill_cancel_then_restart_succeeds() {
+    let mut node = TestNode::start_with_env(
+        &[],
+        &[("SATD_BACKFILL_DEBUG_DELAY_MS", "30")],
+    );
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let _ = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(30), serde_json::json!(addr)],
+        )
+        .expect("rpc");
+
+    let _ = node
+        .rpc_call_with_params(
+            "backfillindex",
+            vec![serde_json::json!("address")],
+        )
+        .expect("rpc");
+
+    std::thread::sleep(Duration::from_millis(100));
+    let cancel_resp = node
+        .rpc_call_with_params(
+            "cancelindex",
+            vec![serde_json::json!("address")],
+        )
+        .expect("rpc");
+    assert_eq!(
+        cancel_resp["result"]["cancelled"].as_bool(),
+        Some(true),
+        "cancelindex should accept while running: {}",
+        cancel_resp
+    );
+
+    // Wait briefly for the runner to observe the cancel flag, persist
+    // state=Cancelled, and drop the temp CF before exiting.
+    std::thread::sleep(Duration::from_millis(500));
+
+    // A fresh start must succeed (started=true) — the previous
+    // Cancelled state isn't terminal.
+    let r = node
+        .rpc_call_with_params(
+            "backfillindex",
+            vec![serde_json::json!("address")],
+        )
+        .expect("rpc");
+    assert_eq!(
+        r["result"]["started"].as_bool(),
+        Some(true),
+        "start after cancel should succeed: {}",
+        r
+    );
+    let prev = r["result"]["previous_state"].as_str().unwrap_or("");
+    assert_eq!(prev, "cancelled", "previous_state should be cancelled");
+
+    poll_backfill_state(&node, &["completed"], Duration::from_secs(60));
+
+    node.stop();
+}
+
+/// Crash recovery: kill the process mid-backfill, restart with the
+/// same datadir, observe the supervisor auto-resumes and completes.
+/// Uses the debug delay so the kill lands in the middle of pass 1.
+///
+/// Test setup mines + graceful-stops *before* the kill phase so the
+/// chain tip is durable on disk. Without that step, regtest's
+/// CoinCache buffers tip writes in memory until the next flush
+/// threshold (which 40 small blocks won't trigger), so a kill -9
+/// would lose the chain tip and the resumed run would have nothing
+/// to walk.
+#[test]
+fn test_address_index_backfill_resumable_after_kill() {
+    let datadir = std::env::temp_dir().join(format!(
+        "satd-backfill-resume-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&datadir);
+
+    let rpcport = find_available_port();
+    let p2p_port = find_available_port();
+    let port_arg = format!("--port={}", p2p_port);
+
+    // Phase 1: mine 40 blocks, graceful-stop to flush tip durably.
+    let mut node = TestNode::start_with_datadir(&datadir, rpcport, &[&port_arg]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let _ = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(40), serde_json::json!(addr)],
+        )
+        .expect("rpc");
+    node.stop();
+
+    // Phase 2: restart with the debug delay, kick off backfill,
+    // kill -9 mid-pass-1.
+    let env: &[(&str, &str)] = &[("SATD_BACKFILL_DEBUG_DELAY_MS", "30")];
+    let mut node = TestNode::start_with_datadir_env(
+        &datadir,
+        rpcport,
+        &[],
+        env,
+    );
+    // Sanity: chain should still be at 40 after the restart.
+    let info = node.rpc_call("getblockchaininfo").expect("rpc");
+    assert_eq!(
+        info["result"]["blocks"].as_u64(),
+        Some(40),
+        "chain tip should survive graceful stop+restart: {}",
+        info
+    );
+    let _ = node
+        .rpc_call_with_params(
+            "backfillindex",
+            vec![serde_json::json!("address")],
+        )
+        .expect("rpc");
+    std::thread::sleep(Duration::from_millis(300));
+    let _ = node.process.kill();
+    let _ = node.process.wait();
+    std::mem::forget(node); // skip Drop's datadir cleanup
+
+    // Phase 3: restart cleanly (no debug delay) and observe the
+    // supervisor's auto-resume reaching Completed.
+    let mut node = TestNode::start_with_datadir(&datadir, rpcport, &[]);
+    poll_backfill_state(&node, &["completed"], Duration::from_secs(60));
+
+    node.stop();
+    let _ = std::fs::remove_dir_all(&datadir);
+}
+
+/// After a successful backfill, restarting the node leaves the
+/// persisted state at Completed (not Idle). The `address.synced`
+/// field reads true and a fresh `backfillindex` call is the
+/// "already completed" no-op.
+#[test]
+fn test_address_index_backfill_persists_completed_across_restart() {
+    let datadir = std::env::temp_dir().join(format!(
+        "satd-backfill-persist-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&datadir);
+    let rpcport = find_available_port();
+    let p2p_port = find_available_port();
+    let port_arg = format!("--port={}", p2p_port);
+
+    let mut node = TestNode::start_with_datadir(
+        &datadir,
+        rpcport,
+        &[&port_arg],
+    );
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let _ = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(15), serde_json::json!(addr)],
+        )
+        .expect("rpc");
+    let _ = node
+        .rpc_call_with_params(
+            "backfillindex",
+            vec![serde_json::json!("address")],
+        )
+        .expect("rpc");
+    poll_backfill_state(&node, &["completed"], Duration::from_secs(30));
+    node.stop();
+
+    // Restart against the same datadir.
+    let node = TestNode::start_with_datadir(&datadir, rpcport, &[]);
+    let info = node.rpc_call("getindexinfo").expect("rpc");
+    assert!(
+        info["result"]["address"]["synced"]
+            .as_bool()
+            .unwrap_or(false),
+        "synced should still be true after restart: {}",
+        info
+    );
+    let r = node
+        .rpc_call_with_params(
+            "backfillindex",
+            vec![serde_json::json!("address")],
+        )
+        .expect("rpc");
+    assert_eq!(r["result"]["started"].as_bool(), Some(false));
+    let reason = r["result"]["reason"].as_str().unwrap_or("");
+    assert!(
+        reason.contains("already completed"),
+        "expected 'already completed' after restart: {}",
+        reason
+    );
+    let mut node = node;
+    node.stop();
+    let _ = std::fs::remove_dir_all(&datadir);
 }

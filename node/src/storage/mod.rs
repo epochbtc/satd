@@ -11,6 +11,7 @@ use bitcoin::{BlockHash, OutPoint, Txid};
 use crate::index::address::{
     AddrFundingKey, AddrFundingRow, AddrSpendingKey, AddrSpendingRow, Scripthash,
 };
+use crate::index::address::cursor::BackfillState;
 use crate::storage::blockindex::BlockIndexEntry;
 use crate::storage::coinview::Coin;
 use crate::storage::undo::UndoData;
@@ -46,6 +47,26 @@ pub struct StoreBatch {
     pub addr_funding_removes: Vec<AddrFundingKey>,
     /// Address-history spending keys to remove (used by `disconnect_block`).
     pub addr_spending_removes: Vec<AddrSpendingKey>,
+    /// `(outpoint -> scripthash)` rows for the deferred backfill's pass-1
+    /// temp CF. Empty for live `connect_block` writes.
+    pub addr_backfill_temp_puts: Vec<(OutPoint, Scripthash)>,
+    /// Persist a backfill cursor advance atomically with the rows it
+    /// describes. `None` for non-backfill writes.
+    pub backfill_cursor_advance: Option<BackfillCursorWrite>,
+}
+
+/// Atomic cursor update emitted by the backfill task at each batch boundary.
+/// Persisted in the metadata CF using the keys declared in
+/// `crate::index::address::cursor`. Bundling the advance into the same
+/// `StoreBatch` as the rows it describes guarantees we never observe a
+/// half-advanced cursor on resume.
+#[derive(Debug, Clone, Copy)]
+pub struct BackfillCursorWrite {
+    pub state: BackfillState,
+    pub pass: u8,
+    pub cursor_height: u32,
+    pub snapshot_height: u32,
+    pub started_at_unix: u64,
 }
 
 impl StoreBatch {
@@ -101,6 +122,22 @@ impl StoreBatch {
         }
         self.addr_spending_puts.extend(other.addr_spending_puts);
         self.addr_spending_removes.extend(other.addr_spending_removes);
+
+        // Backfill temp-CF rows. Last-writer-wins semantics by outpoint
+        // would matter only if a single coalesced batch covered both
+        // pass-1 emission and a hypothetical pass-1-rerun for the same
+        // height, which the runner never does. Plain extend is correct.
+        self.addr_backfill_temp_puts
+            .extend(other.addr_backfill_temp_puts);
+
+        // Cursor advance: incoming wins. The runner emits at most one
+        // advance per WriteBatch; merging is exercised only by the
+        // CoinCache's pending-batch coalescing path, which the backfill
+        // never feeds into (it writes through `Store::write_batch`
+        // directly).
+        if other.backfill_cursor_advance.is_some() {
+            self.backfill_cursor_advance = other.backfill_cursor_advance;
+        }
     }
 }
 
@@ -190,5 +227,43 @@ pub trait Store: Send + Sync {
         _sh: &Scripthash,
     ) -> Vec<(AddrSpendingKey, bitcoin::OutPoint)> {
         Vec::new()
+    }
+
+    /// Lazily create the deferred-backfill temp CF
+    /// (`addr_backfill_outpoint_to_scripthash`). Idempotent: succeeds if
+    /// the CF already exists. Default: error so non-Rocks backends fail
+    /// loud rather than silently no-op.
+    fn create_backfill_temp_cf(&self) -> Result<(), StoreError> {
+        Err(StoreError::Database(
+            "create_backfill_temp_cf not supported on this backend".into(),
+        ))
+    }
+
+    /// Drop the deferred-backfill temp CF. Idempotent: succeeds if the
+    /// CF doesn't exist. Default: error.
+    fn drop_backfill_temp_cf(&self) -> Result<(), StoreError> {
+        Err(StoreError::Database(
+            "drop_backfill_temp_cf not supported on this backend".into(),
+        ))
+    }
+
+    /// Whether the deferred-backfill temp CF currently exists. Default: false.
+    fn backfill_temp_cf_exists(&self) -> bool {
+        false
+    }
+
+    /// Look up `(outpoint -> scripthash)` from the temp CF. Returns
+    /// `Ok(None)` when the CF doesn't exist or the key isn't present;
+    /// `Err` only on backend I/O failure. Default: `Ok(None)`.
+    fn lookup_backfill_temp(
+        &self,
+        _outpoint: &OutPoint,
+    ) -> Result<Option<Scripthash>, StoreError> {
+        Ok(None)
+    }
+
+    /// Read the persisted backfill cursor from metadata. Default: idle.
+    fn read_backfill_cursor(&self) -> crate::index::address::cursor::BackfillCursor {
+        crate::index::address::cursor::BackfillCursor::idle()
     }
 }

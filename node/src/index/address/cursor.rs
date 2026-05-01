@@ -69,7 +69,7 @@ impl BackfillState {
 }
 
 /// Snapshot of the persisted backfill cursor for `getindexinfo`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct BackfillCursor {
     pub state: BackfillState,
     pub pass: u8,

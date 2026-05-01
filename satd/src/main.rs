@@ -569,14 +569,58 @@ async fn main() {
         });
     }
 
-    // Backfill handle (M7). Always created so `getindexinfo` /
-    // pause/resume/cancel report a stable shape — for non-AssumeUTXO
-    // datadirs the cursor stays Idle and the RPCs are no-ops.
+    // Backfill handle (M7). Initial cursor is loaded from persisted
+    // metadata so a restart resumes from the last batch boundary
+    // (state == Running) or stays idle (state == Idle/Completed/etc).
+    let initial_cursor = chain_state.store_ref().read_backfill_cursor();
+    if !matches!(
+        initial_cursor.state,
+        node::index::address::BackfillState::Idle
+    ) {
+        tracing::info!(
+            state = %initial_cursor.state.label(),
+            pass = initial_cursor.pass,
+            cursor_height = initial_cursor.cursor_height,
+            snapshot_height = initial_cursor.snapshot_height,
+            "addr-index backfill cursor restored from metadata"
+        );
+    }
     let backfill_handle = std::sync::Arc::new(
-        node::index::address::BackfillHandle::new(
-            node::index::address::BackfillCursor::idle(),
-        ),
+        node::index::address::BackfillHandle::new(initial_cursor),
     );
+
+    // Backfill supervisor: receives RPC commands, spawns at most one
+    // runner at a time. Crash recovery: if persisted cursor.state ==
+    // Running on startup, immediately spawn a runner (without waiting
+    // for an RPC) so backfill resumes after a kill -9.
+    let (backfill_cmd_tx, backfill_cmd_rx) =
+        tokio::sync::mpsc::channel::<node::index::address::BackfillCommand>(1);
+    {
+        let handle = backfill_handle.clone();
+        let chain = chain_state.clone();
+        let addr_cfg = node::index::address::AddressIndexConfig {
+            enabled: config.addressindex,
+            max_subscriptions: config.addrindexsubscriptions,
+            ..Default::default()
+        };
+        let shutdown = shutdown_rx.clone();
+        let resume_on_start = matches!(
+            handle.cursor().state,
+            node::index::address::BackfillState::Running
+                | node::index::address::BackfillState::Paused
+        );
+        tokio::spawn(async move {
+            backfill_supervisor(
+                handle,
+                chain,
+                addr_cfg,
+                backfill_cmd_rx,
+                shutdown,
+                resume_on_start,
+            )
+            .await;
+        });
+    }
 
     let server_handle = match node::rpc::server::start(
         bind_addr,
@@ -592,6 +636,7 @@ async fn main() {
         address_index,
         config.addressindex,
         Some(backfill_handle.clone()),
+        Some(backfill_cmd_tx.clone()),
     )
     .await
     {
@@ -980,6 +1025,80 @@ async fn reorg_webhook_dispatcher(
         }
     }
     tracing::info!("Reorg webhook dispatcher stopped");
+}
+
+/// Address-index backfill supervisor. Owns serialization (one runner
+/// at a time) and crash recovery (auto-respawns on startup if the
+/// persisted cursor state is Running or Paused).
+///
+/// The runner itself is synchronous (RocksDB calls are blocking), so
+/// it executes inside `spawn_blocking`. The supervisor stays in tokio
+/// to react to shutdown and incoming commands.
+async fn backfill_supervisor(
+    handle: std::sync::Arc<node::index::address::BackfillHandle>,
+    chain: std::sync::Arc<node::chain::state::ChainState>,
+    cfg: node::index::address::AddressIndexConfig,
+    mut cmd_rx: tokio::sync::mpsc::Receiver<node::index::address::BackfillCommand>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    resume_on_start: bool,
+) {
+    if resume_on_start {
+        tracing::info!("addr-index backfill: auto-resuming from persisted cursor");
+        spawn_runner(handle.clone(), chain.clone(), cfg.clone(), shutdown.clone()).await;
+    }
+
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    tracing::info!("addr-index backfill supervisor: shutdown");
+                    return;
+                }
+            }
+            cmd = cmd_rx.recv() => {
+                let Some(cmd) = cmd else {
+                    // All senders dropped; nothing else can request a backfill.
+                    return;
+                };
+                match cmd {
+                    node::index::address::BackfillCommand::Start => {
+                        spawn_runner(
+                            handle.clone(),
+                            chain.clone(),
+                            cfg.clone(),
+                            shutdown.clone(),
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Spawn a runner on the blocking pool and log its result. The
+/// supervisor awaits the join handle so subsequent commands queue up
+/// behind it (channel size 1; further sends backpressure or fail).
+async fn spawn_runner(
+    handle: std::sync::Arc<node::index::address::BackfillHandle>,
+    chain: std::sync::Arc<node::chain::state::ChainState>,
+    cfg: node::index::address::AddressIndexConfig,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    let join = tokio::task::spawn_blocking(move || {
+        let runner = node::index::address::BackfillRunner {
+            handle,
+            chain,
+            cfg,
+            shutdown,
+        };
+        runner.run()
+    });
+    match join.await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::error!(error = %e, "addr-index backfill runner exited with error"),
+        Err(e) => tracing::error!(error = %e, "addr-index backfill runner task panicked"),
+    }
 }
 
 /// HMAC-SHA256 over `msg` keyed by `key`, hex-encoded. Pure Rust so we
