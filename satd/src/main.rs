@@ -622,19 +622,28 @@ async fn main() {
             ..Default::default()
         };
         let shutdown = shutdown_rx.clone();
-        // Auto-resume only on Running with the index actually enabled.
-        // Skipping the auto-resume when --addressindex=0 prevents the
-        // supervisor from advancing the cursor through a runner that
-        // would refuse to write rows (and silently leave history gaps
-        // — see review finding #4).
-        let resume_on_start = config.addressindex
-            && handle.cursor().state == node::index::address::BackfillState::Running;
-        if !resume_on_start
-            && handle.cursor().state == node::index::address::BackfillState::Running
-            && !config.addressindex
-        {
+        // Auto-resume on Running OR Paused with the index actually
+        // enabled. Skipping the auto-resume when --addressindex=0
+        // prevents the supervisor from advancing the cursor through a
+        // runner that would refuse to write rows (silently leaving
+        // history gaps — see review-1 finding #4).
+        //
+        // Paused is included so a sticky-paused cursor across restart
+        // has a live runner to observe `resumeindex`/`cancelindex`. The
+        // runner enters check_pause_loop immediately (paused atomic is
+        // initialized from the cursor in BackfillHandle::new) and waits
+        // there until the operator hits resume/cancel — see review-2
+        // finding #3.
+        let auto_resume_state = matches!(
+            handle.cursor().state,
+            node::index::address::BackfillState::Running
+                | node::index::address::BackfillState::Paused
+        );
+        let resume_on_start = config.addressindex && auto_resume_state;
+        if !resume_on_start && auto_resume_state && !config.addressindex {
             tracing::warn!(
-                "addr-index backfill cursor is Running but --addressindex=0; \
+                state = %handle.cursor().state.label(),
+                "addr-index backfill cursor is active but --addressindex=0; \
                  supervisor will NOT auto-resume — re-enable the index and restart"
             );
         }
@@ -1153,25 +1162,64 @@ async fn spawn_runner(
         }
         Ok(Err(e)) => {
             tracing::error!(error = %e, "addr-index backfill runner exited with error");
-            // Persist Failed so the operator sees it via getindexinfo
-            // and can recover via cancelindex/backfillindex. Best
-            // effort: if the persistence itself fails, log and move on.
-            let msg = format!("{}", e);
-            if let Err(p) =
-                handle_for_failure.mark_failed(chain_for_failure.store_ref().as_ref(), &msg)
-            {
-                tracing::warn!(error = %p, "failed to persist Failed state for addr-index backfill");
-            }
+            persist_failed_with_cleanup(&handle_for_failure, &chain_for_failure, &e).await;
         }
         Err(e) => {
             tracing::error!(error = %e, "addr-index backfill runner task panicked");
             let msg = format!("runner panicked: {}", e);
-            if let Err(p) =
-                handle_for_failure.mark_failed(chain_for_failure.store_ref().as_ref(), &msg)
+            if let Err(p) = handle_for_failure
+                .mark_failed(chain_for_failure.store_ref().as_ref(), &msg)
             {
                 tracing::warn!(error = %p, "failed to persist Failed state after runner panic");
             }
+            // Best-effort: drop temp CF on panic so a fresh start
+            // doesn't reuse partial pass-1 state.
+            let _ = chain_for_failure.store_ref().drop_backfill_temp_cf();
         }
+    }
+}
+
+/// Persist Failed and clean up. For ReorgInvalidated specifically,
+/// run the OLD-snapshot stale-row cleanup before transitioning so a
+/// subsequent fresh backfill doesn't see stale rows from the
+/// abandoned chain. Other errors don't need the cleanup walk because
+/// they don't imply chain divergence (insufficient disk, missing
+/// block, temp CF miss, etc.).
+async fn persist_failed_with_cleanup(
+    handle: &std::sync::Arc<node::index::address::BackfillHandle>,
+    chain: &std::sync::Arc<node::chain::state::ChainState>,
+    err: &node::index::address::BackfillError,
+) {
+    use node::index::address::BackfillError;
+    let cleanup_needed = matches!(err, BackfillError::ReorgInvalidated { .. });
+    if cleanup_needed {
+        let chain_clone = chain.clone();
+        let handle_clone = handle.clone();
+        let cleanup_join = tokio::task::spawn_blocking(move || {
+            node::index::address::BackfillRunner::cleanup_stale_rows_after_reorg(
+                chain_clone.as_ref(),
+                handle_clone.as_ref(),
+            )
+        })
+        .await;
+        match cleanup_join {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "addr-index reorg cleanup failed; proceeding to mark Failed");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "addr-index reorg cleanup task panicked");
+            }
+        }
+    }
+    let msg = format!("{}", err);
+    if let Err(p) = handle.mark_failed(chain.store_ref().as_ref(), &msg) {
+        tracing::warn!(error = %p, "failed to persist Failed state");
+    }
+    // Drop temp CF so a fresh backfill starts from a clean slate
+    // rather than reusing pass-1 mappings from the failed run.
+    if let Err(e) = chain.store_ref().drop_backfill_temp_cf() {
+        tracing::warn!(error = %e, "failed to drop temp CF after Failed");
     }
 }
 

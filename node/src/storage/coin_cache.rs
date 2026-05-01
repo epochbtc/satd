@@ -267,6 +267,7 @@ impl CoinCache {
     pub fn clean_cap(&self) -> usize {
         self.clean.lock().unwrap().cap().get()
     }
+
 }
 
 impl Store for CoinCache {
@@ -313,6 +314,17 @@ impl Store for CoinCache {
     }
 
     fn write_batch(&self, batch: StoreBatch) -> Result<(), StoreError> {
+        // Use the cache's currently-configured mode; the explicit-mode
+        // path runs through `write_batch_mode` instead.
+        self.write_batch_mode(batch, self.current_write_mode())
+    }
+
+    fn write_batch_mode(&self, batch: StoreBatch, mode: WriteMode) -> Result<(), StoreError> {
+        // Honor the caller's explicit mode for the inner-store call.
+        // The default trait impl ignores `mode` and delegates to
+        // `write_batch`, which would then use `current_write_mode()`
+        // — defeating the backfill runner's intent of forcing
+        // WriteMode::Normal mid-IBD. See PR #93 review finding #4.
         // Absorb coin operations into dirty map
         let coin_dirty = batch.coin_puts.len() + batch.coin_removes.len();
         if coin_dirty > 0 {
@@ -432,7 +444,7 @@ impl Store for CoinCache {
                     addr_backfill_temp_puts: batch.addr_backfill_temp_puts,
                     backfill_cursor_advance: batch.backfill_cursor_advance,
                 };
-                self.inner.write_batch_mode(pass_through, self.current_write_mode())?;
+                self.inner.write_batch_mode(pass_through, mode)?;
             } else {
                 let mut pending = self.pending_batch.lock().unwrap();
                 pending.block_index_puts.extend(batch.block_index_puts);

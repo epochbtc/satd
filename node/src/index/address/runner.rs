@@ -53,7 +53,9 @@ use crate::chain::state::ChainState;
 use crate::index::address::backfill::{BackfillError, BackfillHandle};
 use crate::index::address::config::AddressIndexConfig;
 use crate::index::address::cursor::BackfillState;
-use crate::index::address::keys::{AddrFundingRow, AddrSpendingRow, scripthash_of};
+use crate::index::address::keys::{
+    AddrFundingKey, AddrFundingRow, AddrSpendingKey, AddrSpendingRow, scripthash_of,
+};
 use crate::storage::{BackfillCursorWrite, Store, StoreBatch, WriteMode};
 
 /// Inter-task command from RPC handlers to the supervisor.
@@ -122,13 +124,20 @@ impl BackfillRunner {
             return Err(BackfillError::AddressIndexDisabled);
         }
 
-        // Defensive: the supervisor should only spawn us for state ==
-        // Running (fresh start went through RPC; auto-resume only
-        // fires on Running). Anything else is a bug.
+        // Defensive: the supervisor should only spawn us for active
+        // backfill states (Running or Paused). Fresh starts go through
+        // RPC and persist Running; auto-resume on startup fires for
+        // Running or Paused. Paused is allowed so a sticky-paused
+        // cursor across restart has a live runner to observe
+        // `resumeindex`/`cancelindex` — the check_pause_loop below
+        // will wait at the entry point until the operator hits resume.
         let cur = self.handle.cursor();
-        if cur.state != BackfillState::Running {
+        if !matches!(
+            cur.state,
+            BackfillState::Running | BackfillState::Paused
+        ) {
             return Err(BackfillError::Chain(format!(
-                "runner spawned with unexpected state {} (expected Running)",
+                "runner spawned with unexpected state {} (expected Running or Paused)",
                 cur.state.label()
             )));
         }
@@ -211,23 +220,182 @@ impl BackfillRunner {
         Ok(ActiveChainSnapshot { hashes })
     }
 
-    /// Cheap reorg check: confirm the live height index still has our
-    /// anchor hash at `snapshot_height`. Called between batches so the
-    /// runner aborts before committing stale rows.
+    /// Cheap reorg check: confirm the live active-chain block at
+    /// `snapshot_height` is still our anchor hash. The verification
+    /// walks back from the current chain tip via `prev_blockhash` so
+    /// it consults only active-chain ancestry, not the height-index
+    /// (which can transiently point at header-only or stored
+    /// side-chain blocks). See review-2 finding #2.
     fn verify_anchor_active(
         &self,
         snapshot_height: u32,
         anchor_hash: BlockHash,
     ) -> Result<(), BackfillError> {
-        let live = self.chain.store_ref().get_block_hash_by_height(snapshot_height);
-        if live != Some(anchor_hash) {
+        let tip_hash = self.chain.tip_hash();
+        let tip_height = self.chain.tip_height();
+        if tip_height < snapshot_height {
             return Err(BackfillError::ReorgInvalidated {
                 height: snapshot_height,
                 detail: format!(
-                    "anchor {} no longer matches active chain (live: {:?})",
-                    anchor_hash, live
+                    "tip dropped below snapshot height (tip {} < snapshot {})",
+                    tip_height, snapshot_height
                 ),
             });
+        }
+        // Walk back tip_height -> snapshot_height via prev_blockhash.
+        // For mainnet at steady state this is 0 hops; during normal
+        // tip-extension it's a small constant.
+        let mut current = tip_hash;
+        let mut h = tip_height;
+        while h > snapshot_height {
+            let entry = self
+                .chain
+                .store_ref()
+                .get_block_index(&current)
+                .ok_or_else(|| {
+                    BackfillError::ReorgInvalidated {
+                        height: snapshot_height,
+                        detail: format!(
+                            "missing block-index entry walking back from tip {}",
+                            current
+                        ),
+                    }
+                })?;
+            current = entry.header.prev_blockhash;
+            h -= 1;
+        }
+        if current != anchor_hash {
+            return Err(BackfillError::ReorgInvalidated {
+                height: snapshot_height,
+                detail: format!(
+                    "anchor {} no longer on active chain at height {} (live: {})",
+                    anchor_hash, snapshot_height, current
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Walk the OLD snapshot (rebuilt from `cursor.snapshot_tip_hash`)
+    /// for the heights backfill has already touched, find divergences
+    /// against the live active chain, and emit row removes for any
+    /// OLD blocks that are no longer active. Called by the supervisor
+    /// before persisting `Failed` after a `ReorgInvalidated` error.
+    /// Bounded work: reads only divergent blocks (typically <10 for a
+    /// normal reorg).
+    pub fn cleanup_stale_rows_after_reorg(
+        chain: &ChainState,
+        handle: &BackfillHandle,
+    ) -> Result<(), BackfillError> {
+        let cur = handle.cursor();
+        if cur.snapshot_height == 0 {
+            return Ok(());
+        }
+        let old_anchor = BlockHash::from_byte_array(cur.snapshot_tip_hash);
+        // Rebuild OLD snapshot. Parent walks via the persisted block
+        // index, which retains side-chain entries — they aren't
+        // unlinked when the active chain reorgs.
+        let mut old_hashes = vec![BlockHash::all_zeros(); (cur.snapshot_height + 1) as usize];
+        {
+            let mut h = cur.snapshot_height;
+            let mut current = old_anchor;
+            loop {
+                old_hashes[h as usize] = current;
+                if h == 0 {
+                    break;
+                }
+                let entry = chain.store_ref().get_block_index(&current).ok_or_else(|| {
+                    BackfillError::Chain(format!(
+                        "reorg cleanup: missing block index for {} at height {}",
+                        current, h
+                    ))
+                })?;
+                current = entry.header.prev_blockhash;
+                h -= 1;
+            }
+        }
+        let old_snapshot = ActiveChainSnapshot { hashes: old_hashes };
+        // Determine which heights backfill has already written to:
+        //   pass 1: funding rows for 1..=cursor_height
+        //   pass 2: ALL funding rows (1..=snapshot_height) plus
+        //           spending rows for 1..=cursor_height
+        let funding_high = if cur.pass >= 2 {
+            cur.snapshot_height
+        } else {
+            cur.cursor_height
+        };
+        let spending_high = if cur.pass >= 2 { cur.cursor_height } else { 0 };
+
+        let mut total_funding_removes = 0u64;
+        let mut total_spending_removes = 0u64;
+
+        // We commit removes in per-block batches. RocksDB write
+        // amplification is fine because cleanup is bounded.
+        for h in 1..=funding_high {
+            let old_hash = old_snapshot.hashes[h as usize];
+            let live_hash = chain.store_ref().get_block_hash_by_height(h);
+            if live_hash == Some(old_hash) {
+                // OLD block at this height is still active — its rows
+                // are valid for the new chain too. Skip.
+                continue;
+            }
+            // OLD block is no longer active. Emit removes.
+            let old_block = match chain.get_block(&old_hash) {
+                Some(b) => b,
+                None => {
+                    // Pruned or missing; we wrote rows but can't read
+                    // the block to derive scripthashes. Best effort:
+                    // log and continue; operators can re-run backfill
+                    // post-cleanup which will overwrite/re-add as
+                    // needed for the new active chain.
+                    tracing::warn!(
+                        height = h,
+                        old_hash = %old_hash,
+                        "addr-index reorg cleanup: missing block data; skipping height"
+                    );
+                    continue;
+                }
+            };
+            let mut batch = StoreBatch::default();
+            for tx in &old_block.txdata {
+                let txid = tx.compute_txid();
+                for (vout, output) in tx.output.iter().enumerate() {
+                    batch.addr_funding_removes.push(AddrFundingKey {
+                        scripthash: scripthash_of(&output.script_pubkey),
+                        height: h,
+                        txid,
+                        vout: vout as u32,
+                    });
+                    total_funding_removes += 1;
+                }
+                if h <= spending_high && !tx.is_coinbase() {
+                    for (vin, input) in tx.input.iter().enumerate() {
+                        let prev = input.previous_output;
+                        let sh = match chain.store_ref().lookup_backfill_temp(&prev) {
+                            Ok(Some(sh)) => sh,
+                            Ok(None) | Err(_) => continue,
+                        };
+                        batch.addr_spending_removes.push(AddrSpendingKey {
+                            scripthash: sh,
+                            height: h,
+                            txid,
+                            vin: vin as u32,
+                        });
+                        total_spending_removes += 1;
+                    }
+                }
+            }
+            chain
+                .store_ref()
+                .write_batch_mode(batch, WriteMode::Normal)?;
+        }
+        if total_funding_removes > 0 || total_spending_removes > 0 {
+            tracing::info!(
+                funding = total_funding_removes,
+                spending = total_spending_removes,
+                "addr-index reorg cleanup: removed stale rows for divergent OLD blocks"
+            );
+            chain.store_ref().flush_durable()?;
         }
         Ok(())
     }
@@ -262,6 +430,10 @@ impl BackfillRunner {
         let started_at_unix = self.handle.cursor().started_at_unix;
         let debug_delay = debug_delay_ms();
 
+        // Loop starts at height 1 (resume_from is 0 on a fresh start),
+        // matching connect.rs's "skip genesis coinbase" semantics:
+        // height 0 only contains the genesis coinbase, which live
+        // indexing skips. See review-2 finding #7.
         for h in (resume_from + 1)..=snapshot_height {
             self.check_pause_loop()?;
             // Reorg detection (cheap O(1) point lookup). Catches

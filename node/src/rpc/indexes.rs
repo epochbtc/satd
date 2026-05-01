@@ -214,6 +214,31 @@ fn start_fresh(
         }));
     }
 
+    // Reserve a permit on the supervisor channel BEFORE persisting
+    // Running. Otherwise a `try_send` failure (channel full or
+    // receiver dropped) would leave the cursor stuck Running with no
+    // runner alive to advance it — review-2 finding #5.
+    let permit = match tx.try_reserve() {
+        Ok(p) => p,
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+            // Channel size 1 + the supervisor processes one Start at
+            // a time. A full channel means a Start is already queued
+            // — treat as an in-progress duplicate rather than failing
+            // the operator.
+            return Ok(json!({
+                "started": false,
+                "reason": "another backfill start is already queued",
+                "state": prev.state.label(),
+            }));
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+            return Err((
+                -32603,
+                "backfill supervisor channel closed; restart the daemon".to_string(),
+            ));
+        }
+    };
+
     store
         .create_backfill_temp_cf()
         .map_err(|e| (-32603, format!("create temp CF: {}", e)))?;
@@ -223,22 +248,25 @@ fn start_fresh(
     // Completed → Running. If a concurrent caller raced ahead and
     // already set Running, we get AlreadyRunning back — surface that
     // as the standard "already in progress" wire shape rather than a
-    // generic -32603.
+    // generic -32603. The reserved permit is dropped (no command sent)
+    // — that's fine because the winning caller already enqueued one.
     match h.start(store.as_ref(), tip_height, tip_hash.to_byte_array()) {
         Ok(()) => {}
         Err(BackfillError::AlreadyRunning(_)) => {
             // Lost the race; current cursor reflects the winner.
+            drop(permit);
             return Ok(in_progress_response(&h.cursor()));
         }
-        Err(e) => return Err(map_backfill_err(e)),
+        Err(e) => {
+            drop(permit);
+            return Err(map_backfill_err(e));
+        }
     }
 
-    tx.try_send(BackfillCommand::Start).map_err(|e| {
-        (
-            -32603,
-            format!("failed to dispatch backfill start: {}", e),
-        )
-    })?;
+    // Send via the reserved permit — infallible; closes the dispatch
+    // gap that `try_send` had between persisting Running and the
+    // supervisor receiving the command.
+    permit.send(BackfillCommand::Start);
     Ok(json!({
         "started": true,
         "previous_state": prev.state.label(),

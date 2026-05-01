@@ -4154,21 +4154,34 @@ fn poll_backfill_state(
     while start.elapsed() < deadline {
         let r = node.rpc_call("getindexinfo").expect("rpc");
         let bf = &r["result"]["address"]["backfill"];
-        let active = bf["active"].as_bool().unwrap_or(false);
-        let synced = r["result"]["address"]["synced"].as_bool().unwrap_or(false);
-        // Map `(active, synced)` to a human label that mirrors the
-        // cursor.state values surfaced by the runner. The RPC doesn't
-        // expose state directly to operators, so we infer from the
-        // shape: synced+!active=Completed/Idle, active=Running/Paused.
-        for label in expected {
-            let matches = match *label {
-                "running" | "paused" => active,
-                "completed" | "idle" => synced && !active,
-                "synced" => synced,
-                _ => false,
-            };
-            if matches {
-                return r;
+        // Prefer the explicit state field (added in the round-1 fix);
+        // fall back to active/synced inference for backwards compat
+        // if the field is missing.
+        let state_str = bf["state"].as_str().unwrap_or("");
+        if !state_str.is_empty() {
+            for label in expected {
+                if &state_str == label {
+                    return r;
+                }
+                if *label == "synced"
+                    && (state_str == "completed" || state_str == "idle")
+                {
+                    return r;
+                }
+            }
+        } else {
+            let active = bf["active"].as_bool().unwrap_or(false);
+            let synced = r["result"]["address"]["synced"].as_bool().unwrap_or(false);
+            for label in expected {
+                let matches = match *label {
+                    "running" | "paused" => active,
+                    "completed" | "idle" => synced && !active,
+                    "synced" => synced,
+                    _ => false,
+                };
+                if matches {
+                    return r;
+                }
             }
         }
         last = r;
@@ -4652,34 +4665,49 @@ fn test_address_index_backfill_data_parity_after_disabled_mining() {
         control_balance,
         subj_balance,
     );
-    // History and utxos: count should match. Inner ordering depends
-    // on how the index sorts; a count match is sufficient evidence
-    // that backfill wrote the same rows as live indexing.
-    let ctrl_hist_len = control_history["result"]
+    // Compare full row content (txid, vout, height, amount, type),
+    // not just counts. A count-equal-but-content-divergent backfill
+    // would silently pass a count-only check (review-2 #10).
+    let mut ctrl_hist: Vec<String> = control_history["result"]
         .as_array()
-        .map(|a| a.len())
-        .unwrap_or(0);
-    let subj_hist_len = subj_history["result"]
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|v| serde_json::to_string(&v).unwrap_or_default())
+        .collect();
+    let mut subj_hist: Vec<String> = subj_history["result"]
         .as_array()
-        .map(|a| a.len())
-        .unwrap_or(0);
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|v| serde_json::to_string(&v).unwrap_or_default())
+        .collect();
+    ctrl_hist.sort();
+    subj_hist.sort();
     assert_eq!(
-        ctrl_hist_len, subj_hist_len,
-        "history length must match: control={} subject={}",
-        ctrl_hist_len, subj_hist_len
+        ctrl_hist, subj_hist,
+        "address history rows must match control content-for-content"
     );
-    let ctrl_utxos_len = control_utxos["result"]
+
+    let mut ctrl_utxos: Vec<String> = control_utxos["result"]
         .as_array()
-        .map(|a| a.len())
-        .unwrap_or(0);
-    let subj_utxos_len = subj_utxos["result"]
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|v| serde_json::to_string(&v).unwrap_or_default())
+        .collect();
+    let mut subj_utxos: Vec<String> = subj_utxos["result"]
         .as_array()
-        .map(|a| a.len())
-        .unwrap_or(0);
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|v| serde_json::to_string(&v).unwrap_or_default())
+        .collect();
+    ctrl_utxos.sort();
+    subj_utxos.sort();
     assert_eq!(
-        ctrl_utxos_len, subj_utxos_len,
-        "utxo count must match: control={} subject={}",
-        ctrl_utxos_len, subj_utxos_len
+        ctrl_utxos, subj_utxos,
+        "address UTXO rows must match control content-for-content"
     );
 
     let mut subject = subject;
@@ -4716,7 +4744,27 @@ fn test_address_index_backfill_spending_row_with_real_spend() {
     // we never spend from it, just observe rows).
     let dest_addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
 
-    let mut node = TestNode::start(&[]);
+    // Run the whole mine-and-spend sequence with `--addressindex=0`
+    // so live indexing writes NOTHING. Then restart with `=1` and
+    // run backfill — this is the only way to actually exercise
+    // pass-2 row writing on a non-coinbase input. With the index
+    // enabled from the start, live `connect_block` already writes
+    // the spending row and a broken backfill would still be silent
+    // (review-2 #8).
+    let datadir = std::env::temp_dir().join(format!(
+        "satd-spending-row-test-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&datadir);
+    let rpcport = find_available_port();
+    let p2p_port = find_available_port();
+    let port_arg = format!("--port={}", p2p_port);
+
+    let mut node = TestNode::start_with_datadir(
+        &datadir,
+        rpcport,
+        &["--addressindex=0", &port_arg],
+    );
 
     // Mine 101 blocks so the first coinbase is matured (subsidy spendable).
     let _ = node
@@ -4808,16 +4856,29 @@ fn test_address_index_backfill_spending_row_with_real_spend() {
         )
         .expect("rpc");
 
-    // Capture the live-indexed history shape for the destination,
-    // then run backfill and verify identical results.
-    let live_dest_history = node
+    let spend_txid = spend.compute_txid().to_string();
+
+    // Stop with --addressindex=0 (no rows written); restart with =1
+    // so backfill is the ONLY writer of address rows.
+    node.stop();
+
+    let node = TestNode::start_with_datadir(&datadir, rpcport, &[]);
+
+    // Sanity: lookups should work but return empty pre-backfill
+    // (chain is fully synced; just no rows in the addr CFs yet).
+    let pre_dest_history = node
         .rpc_call_with_params("getaddresshistory", vec![serde_json::json!(dest_addr)])
         .expect("rpc");
-    let live_dest_balance = node
-        .rpc_call_with_params("getaddressbalance", vec![serde_json::json!(dest_addr)])
-        .expect("rpc");
+    assert_eq!(
+        pre_dest_history["result"]
+            .as_array()
+            .map(|a| a.len())
+            .unwrap_or(0),
+        0,
+        "pre-backfill: dest history must be empty (no rows yet)"
+    );
 
-    // ── Run backfill (rewrites everything; rows must match) ──
+    // ── Run backfill (the ONLY writer of rows here) ──
     let r = node
         .rpc_call_with_params(
             "backfillindex",
@@ -4832,71 +4893,64 @@ fn test_address_index_backfill_spending_row_with_real_spend() {
     );
     poll_backfill_state(&node, &["completed"], Duration::from_secs(60));
 
-    // After backfill: pre-existing live rows + backfilled rows are
-    // idempotent (same key, same value), so the totals must match
-    // pre-backfill.
+    // Destination must have exactly one funding row (the spend
+    // delivered cb_value_sat - 1000 to it).
     let post_dest_history = node
         .rpc_call_with_params("getaddresshistory", vec![serde_json::json!(dest_addr)])
         .expect("rpc");
-    let post_dest_balance = node
-        .rpc_call_with_params("getaddressbalance", vec![serde_json::json!(dest_addr)])
-        .expect("rpc");
-    assert_eq!(
-        live_dest_history["result"]
-            .as_array()
-            .map(|a| a.len())
-            .unwrap_or(0),
-        post_dest_history["result"]
-            .as_array()
-            .map(|a| a.len())
-            .unwrap_or(0),
-        "destination history len must be stable across backfill: pre={} post={}",
-        live_dest_history,
-        post_dest_history,
-    );
-    assert_eq!(
-        live_dest_balance["result"]["confirmed"].as_u64(),
-        post_dest_balance["result"]["confirmed"].as_u64(),
-        "destination confirmed balance must be stable: pre={} post={}",
-        live_dest_balance,
-        post_dest_balance,
-    );
-
-    // The destination should have at least 1 funding entry (received
-    // the spend) — verifies pass-1 row writing on a real spend's output.
-    let dest_funding = post_dest_history["result"]
-        .as_array()
-        .map(|a| a.len())
-        .unwrap_or(0);
-    assert!(
-        dest_funding >= 1,
-        "destination should have ≥1 history entry from the spend, got {}",
-        dest_funding
-    );
-
-    // The source's history must include both funding (101 coinbases)
-    // and at least 1 spending row (the tx we built spent block 1's
-    // coinbase). This is the pass-2 spending-row coverage.
-    let src_history = node
-        .rpc_call_with_params("getaddresshistory", vec![serde_json::json!(src_str)])
-        .expect("rpc");
-    let src_entries = src_history["result"]
+    let dest_entries = post_dest_history["result"]
         .as_array()
         .cloned()
         .unwrap_or_default();
-    let has_spend_marker = src_entries.iter().any(|e| {
-        // Source's history rows for the spend include the spending
-        // txid (or the "spent" flag in some shapes).
-        e["txid"].as_str() == Some(&spend.compute_txid().to_string())
-            || e["spending_txid"].is_string()
-    });
-    assert!(
-        has_spend_marker,
-        "source history should include the spending tx: {:?}",
-        src_entries
+    assert_eq!(
+        dest_entries.len(),
+        1,
+        "destination should have exactly 1 funding row: {:?}",
+        dest_entries
+    );
+    let dest_row = &dest_entries[0];
+    assert_eq!(dest_row["type"].as_str(), Some("funding"));
+    assert_eq!(dest_row["txid"].as_str(), Some(spend_txid.as_str()));
+    assert_eq!(dest_row["vout"].as_u64(), Some(0));
+    assert_eq!(
+        dest_row["amount_sat"].as_u64(),
+        Some(cb_value_sat - 1000),
+        "destination amount must equal send_value: {}",
+        dest_row
     );
 
+    // Source must have a spending row referencing the spend's txid
+    // and the coinbase outpoint we spent. Pass-2 specifically wrote
+    // this — without backfill working, the row wouldn't exist (we
+    // ran the entire mine+spend sequence with --addressindex=0).
+    let post_src_history = node
+        .rpc_call_with_params("getaddresshistory", vec![serde_json::json!(src_str)])
+        .expect("rpc");
+    let src_entries = post_src_history["result"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let spending_row = src_entries.iter().find(|e| {
+        e["type"].as_str() == Some("spending")
+            && e["txid"].as_str() == Some(spend_txid.as_str())
+    });
+    assert!(
+        spending_row.is_some(),
+        "source must have a spending row from backfill pass 2; entries: {:?}",
+        src_entries
+    );
+    let row = spending_row.unwrap();
+    assert_eq!(
+        row["prev_txid"].as_str(),
+        Some(cb_txid.to_string().as_str()),
+        "spending row prev_txid must match the coinbase we spent: {}",
+        row
+    );
+    assert_eq!(row["prev_vout"].as_u64(), Some(0));
+
+    let mut node = node;
     node.stop();
+    let _ = std::fs::remove_dir_all(&datadir);
 }
 
 /// Reorg invalidates the backfill snapshot mid-run → state=Failed.
@@ -4907,15 +4961,57 @@ fn test_address_index_backfill_spending_row_with_real_spend() {
 /// surfaced via getindexinfo.last_error.
 #[test]
 fn test_address_index_backfill_reorg_invalidates_to_failed() {
-    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    use bitcoin::WitnessProgram;
+    use bitcoin::WitnessVersion;
+    use bitcoin::secp256k1::{Secp256k1, SecretKey};
+    use bitcoin::{Address, Network, PublicKey};
 
-    // Node B: build a longer competing fork (5 blocks) and capture
+    // Distinct A/B addresses so the two chains have different block
+    // hashes from height 1 (otherwise regtest's deterministic mining
+    // of the same address from the same genesis produces identical
+    // headers and submitblock returns "duplicate" — no reorg).
+    let addr_a = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    // Derive a second valid P2WPKH from a fixed key so we don't have
+    // to hand-roll a bech32 checksum.
+    let secp = Secp256k1::new();
+    let sk_b = SecretKey::from_slice(&[0x33u8; 32]).unwrap();
+    let pk_b = PublicKey::new(sk_b.public_key(&secp));
+    use bitcoin::hashes::Hash as _;
+    let pkh_b = bitcoin::hashes::hash160::Hash::hash(&pk_b.to_bytes());
+    let prog_b = WitnessProgram::new(WitnessVersion::V0, pkh_b.as_byte_array()).unwrap();
+    let addr_b_str = Address::from_witness_program(prog_b, Network::Regtest).to_string();
+    let addr_b = addr_b_str.as_str();
+
+    // Node A first: shorter chain + slow backfill knob so the reorg
+    // lands mid-run. Mining order matters here — the existing
+    // reorg test (test_reorg_record_reflects_completed_state) mines
+    // A first then B; reversing the order trips the BIP113 MTP
+    // check on subsequent B blocks because B's earlier timestamps
+    // become "time-too-old" against A's chain.
+    let mut node_a = TestNode::start_with_env(
+        &[],
+        &[("SATD_BACKFILL_DEBUG_DELAY_MS", "200")],
+    );
+    let _ = node_a
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(2), serde_json::json!(addr_a)],
+        )
+        .expect("rpc");
+    let a_tip_height = node_a
+        .rpc_call("getblockcount")
+        .expect("rpc")["result"]
+        .as_u64()
+        .unwrap_or(0) as u32;
+    assert_eq!(a_tip_height, 2);
+
+    // Node B: build a longer competing fork (3 blocks) and capture
     // hex so we can later submit it to A.
     let mut node_b = TestNode::start(&[]);
     let gen_b = node_b
         .rpc_call_with_params(
             "generatetoaddress",
-            vec![serde_json::json!(5), serde_json::json!(addr)],
+            vec![serde_json::json!(3), serde_json::json!(addr_b)],
         )
         .unwrap();
     let b_hashes: Vec<String> = gen_b["result"]
@@ -4936,20 +5032,10 @@ fn test_address_index_backfill_reorg_invalidates_to_failed() {
     }
     node_b.stop();
 
-    // Node A: shorter chain + slow backfill knob so the reorg lands
-    // mid-run.
-    let mut node_a = TestNode::start_with_env(
-        &[],
-        &[("SATD_BACKFILL_DEBUG_DELAY_MS", "50")],
-    );
-    let _ = node_a
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(3), serde_json::json!(addr)],
-        )
-        .expect("rpc");
-
-    // Kick off backfill (state -> Running with snapshot anchor at A's tip).
+    // Pause the runner immediately so we control timing precisely.
+    // pauseindex flips an atomic flag the runner observes between
+    // batches. Without pausing first, the 20-block backfill at 100ms
+    // per batch (2s) might finish before the reorg lands under load.
     let r = node_a
         .rpc_call_with_params(
             "backfillindex",
@@ -4957,68 +5043,128 @@ fn test_address_index_backfill_reorg_invalidates_to_failed() {
         )
         .expect("rpc");
     assert_eq!(r["result"]["started"].as_bool(), Some(true));
+    let _ = node_a
+        .rpc_call_with_params(
+            "pauseindex",
+            vec![serde_json::json!("address")],
+        )
+        .expect("rpc");
+    // Wait for the runner to observe paused so cursor reflects Paused.
+    poll_backfill_state(&node_a, &["paused", "running"], Duration::from_secs(5));
 
-    // Submit B's blocks. Once the cumulative work exceeds A, A reorgs
-    // and the active hash at A's snapshot_height (3) is replaced by
-    // B's hash for that height. The runner's next verify_anchor_active
-    // catches it.
-    for hex in &b_hex {
-        let _ = node_a
+    // Submit B's blocks while the runner is paused. The reorg lands
+    // immediately; the runner is sleeping in check_pause_loop. When
+    // we resume, the next verify_anchor_active is the first thing it
+    // does and trips ReorgInvalidated deterministically.
+    for (i, hex) in b_hex.iter().enumerate() {
+        let res = node_a
             .rpc_call_with_params("submitblock", vec![serde_json::json!(hex)])
             .unwrap();
-    }
-
-    // Poll for state transition to Failed.
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let mut final_state = String::new();
-    while Instant::now() < deadline {
-        let info = node_a.rpc_call("getindexinfo").expect("rpc");
-        if let Some(s) = info["result"]["address"]["backfill"]["state"].as_str() {
-            if s == "failed" {
-                final_state = s.to_string();
-                let last_err = info["result"]["address"]["backfill"]["last_error"]
-                    .as_str()
-                    .unwrap_or("");
-                assert!(
-                    last_err.contains("reorg") || last_err.contains("Reorg"),
-                    "expected reorg-invalidated last_error; got {:?}",
-                    last_err
-                );
-                break;
-            }
-            if s == "completed" {
-                // Race: backfill finished before reorg landed. That's
-                // a flake — the test depends on the reorg arriving
-                // mid-run. Treat as inconclusive but pass (we don't
-                // want to fail CI on a timing-only race).
-                tracing::warn!("reorg-during-backfill test: backfill completed before reorg landed");
-                final_state = s.to_string();
-                break;
-            }
+        if let Some(err) = res.get("error")
+            && !err.is_null()
+        {
+            panic!("submitblock B[{}] errored: {}", i, res);
         }
-        std::thread::sleep(Duration::from_millis(100));
     }
-    assert!(
-        final_state == "failed" || final_state == "completed",
-        "backfill should have reached Failed or Completed; final_state={}",
-        final_state
+    // Sanity: A reorged to B (or at least past A's old tip).
+    let bestblock = node_a
+        .rpc_call("getbestblockhash")
+        .expect("rpc")["result"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        bestblock, b_hashes[2],
+        "A should have reorged to B's tip; current tip = {}",
+        bestblock
     );
 
-    // After Failed: a fresh backfillindex starts a new run (lenient-failed).
-    if final_state == "failed" {
-        let r2 = node_a
-            .rpc_call_with_params(
-                "backfillindex",
-                vec![serde_json::json!("address")],
-            )
-            .expect("rpc");
-        assert_eq!(
-            r2["result"]["started"].as_bool(),
-            Some(true),
-            "fresh backfill after Failed should start (lenient): {}",
-            r2
+    // Resume — next runner wake → verify_anchor_active fails → Failed.
+    let _ = node_a
+        .rpc_call_with_params(
+            "resumeindex",
+            vec![serde_json::json!("address")],
+        )
+        .expect("rpc");
+
+    // Poll for Failed deterministically (no `completed` fallback now).
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut final_state = String::new();
+    let mut last_err = String::new();
+    while Instant::now() < deadline {
+        let info = node_a.rpc_call("getindexinfo").expect("rpc");
+        if let Some(s) = info["result"]["address"]["backfill"]["state"].as_str()
+            && s == "failed"
+        {
+            final_state = s.to_string();
+            last_err = info["result"]["address"]["backfill"]["last_error"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        final_state, "failed",
+        "backfill must reach Failed after reorg; got state {:?}",
+        final_state
+    );
+    assert!(
+        last_err.contains("reorg") || last_err.contains("Reorg") || last_err.contains("anchor"),
+        "expected reorg-invalidated last_error; got {:?}",
+        last_err
+    );
+
+    // Verify no stale rows remain. After Failed-cleanup:
+    //  - addr_a should be empty (its blocks were disconnected by
+    //    reorg AND backfill's stale rows for A were cleaned up).
+    //  - addr_b should have B's 5 live-indexed rows.
+    let history_a = node_a
+        .rpc_call_with_params("getaddresshistory", vec![serde_json::json!(addr_a)])
+        .expect("rpc");
+    let entries_a = history_a["result"].as_array().cloned().unwrap_or_default();
+    assert!(
+        entries_a.is_empty(),
+        "addr_a history should be empty after reorg cleanup; got {} stale entries: {:?}",
+        entries_a.len(),
+        entries_a
+    );
+    let history_b = node_a
+        .rpc_call_with_params("getaddresshistory", vec![serde_json::json!(addr_b)])
+        .expect("rpc");
+    let entries_b = history_b["result"].as_array().cloned().unwrap_or_default();
+    assert_eq!(
+        entries_b.len(),
+        3,
+        "addr_b should have B's 3 live-indexed rows; got {}: {:?}",
+        entries_b.len(),
+        entries_b
+    );
+    for entry in &entries_b {
+        let h = entry["height"].as_u64().unwrap_or(0);
+        assert!(
+            (1..=3).contains(&h),
+            "addr_b row at unexpected height {}: {}",
+            h,
+            entry
         );
     }
+
+    // After Failed: a fresh backfillindex starts a new run (lenient).
+    let r2 = node_a
+        .rpc_call_with_params(
+            "backfillindex",
+            vec![serde_json::json!("address")],
+        )
+        .expect("rpc");
+    assert_eq!(
+        r2["result"]["started"].as_bool(),
+        Some(true),
+        "fresh backfill after Failed should start (lenient): {}",
+        r2
+    );
+    poll_backfill_state(&node_a, &["completed"], Duration::from_secs(60));
 
     node_a.stop();
 }
