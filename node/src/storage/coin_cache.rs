@@ -437,10 +437,20 @@ impl Store for CoinCache {
                 pending.undo_puts.extend(batch.undo_puts);
                 pending.tx_index_puts.extend(batch.tx_index_puts);
                 pending.tx_index_removes.extend(batch.tx_index_removes);
-                pending.addr_funding_puts.extend(batch.addr_funding_puts);
-                pending.addr_spending_puts.extend(batch.addr_spending_puts);
-                pending.addr_funding_removes.extend(batch.addr_funding_removes);
-                pending.addr_spending_removes.extend(batch.addr_spending_removes);
+                // Address-index puts and removes need last-writer-wins
+                // dedup by key (so connect→disconnect→connect or
+                // disconnect→connect sequences before flush land on the
+                // correct final state). Build a small StoreBatch carrying
+                // only the addr-* fields and route it through `merge`
+                // — the rest of `batch` was already extended above.
+                let addr_only = StoreBatch {
+                    addr_funding_puts: batch.addr_funding_puts,
+                    addr_spending_puts: batch.addr_spending_puts,
+                    addr_funding_removes: batch.addr_funding_removes,
+                    addr_spending_removes: batch.addr_spending_removes,
+                    ..Default::default()
+                };
+                pending.merge(addr_only);
             }
         }
 
@@ -592,6 +602,98 @@ impl Store for CoinCache {
 
     fn block_cache_capacity_bytes(&self) -> usize {
         self.inner.block_cache_capacity_bytes()
+    }
+
+    fn iter_addr_funding(
+        &self,
+        sh: &crate::index::address::Scripthash,
+    ) -> Vec<(crate::index::address::AddrFundingKey, u64)> {
+        // Reads see committed-to-inner-store rows merged with the
+        // pending (not-yet-flushed) write batch. Without this merge,
+        // queries between a connect_block and the next flush would
+        // miss the latest blocks' rows — the address index is
+        // chainstate-bound, not flush-bound.
+        //
+        // RocksDB applies puts-then-removes per CF in
+        // `write_batch_mode`, so if a key has both a pending put and a
+        // pending remove (e.g. connect-then-disconnect before flush),
+        // the on-disk outcome is "removed". We mirror that here so the
+        // pre-flush read view matches the post-flush state.
+        let pending = self.pending_batch.lock().unwrap();
+        let pending_removes: std::collections::HashSet<crate::index::address::AddrFundingKey> =
+            pending
+                .addr_funding_removes
+                .iter()
+                .filter(|k| &k.scripthash == sh)
+                .cloned()
+                .collect();
+        let pending_puts: Vec<(crate::index::address::AddrFundingKey, u64)> = pending
+            .addr_funding_puts
+            .iter()
+            .filter(|r| &r.scripthash == sh)
+            .filter_map(|r| {
+                let k = r.key();
+                if pending_removes.contains(&k) {
+                    None
+                } else {
+                    Some((k, r.amount_sat))
+                }
+            })
+            .collect();
+        drop(pending);
+
+        let inner_rows = self.inner.iter_addr_funding(sh);
+        let mut all: Vec<(crate::index::address::AddrFundingKey, u64)> = inner_rows
+            .into_iter()
+            .filter(|(k, _)| !pending_removes.contains(k))
+            .chain(pending_puts)
+            .collect();
+        all.sort_by(|(a, _), (b, _)| {
+            crate::index::address::encode_funding_key(a)
+                .cmp(&crate::index::address::encode_funding_key(b))
+        });
+        all
+    }
+
+    fn iter_addr_spending(
+        &self,
+        sh: &crate::index::address::Scripthash,
+    ) -> Vec<(crate::index::address::AddrSpendingKey, OutPoint)> {
+        // See iter_addr_funding for the put/remove netting rationale.
+        let pending = self.pending_batch.lock().unwrap();
+        let pending_removes: std::collections::HashSet<crate::index::address::AddrSpendingKey> =
+            pending
+                .addr_spending_removes
+                .iter()
+                .filter(|k| &k.scripthash == sh)
+                .cloned()
+                .collect();
+        let pending_puts: Vec<(crate::index::address::AddrSpendingKey, OutPoint)> = pending
+            .addr_spending_puts
+            .iter()
+            .filter(|r| &r.scripthash == sh)
+            .filter_map(|r| {
+                let k = r.key();
+                if pending_removes.contains(&k) {
+                    None
+                } else {
+                    Some((k, r.prev_outpoint))
+                }
+            })
+            .collect();
+        drop(pending);
+
+        let inner_rows = self.inner.iter_addr_spending(sh);
+        let mut all: Vec<(crate::index::address::AddrSpendingKey, OutPoint)> = inner_rows
+            .into_iter()
+            .filter(|(k, _)| !pending_removes.contains(k))
+            .chain(pending_puts)
+            .collect();
+        all.sort_by(|(a, _), (b, _)| {
+            crate::index::address::encode_spending_key(a)
+                .cmp(&crate::index::address::encode_spending_key(b))
+        });
+        all
     }
 }
 
@@ -1308,5 +1410,187 @@ mod tests {
         let cache = make_cache(16);
         cache.flush_durable().expect("empty flush_durable must succeed");
         cache.flush_durable().expect("repeated flush_durable must succeed");
+    }
+
+    // ---------------------------------------------------------------
+    // Pending put + remove for the same address row must net to
+    // "removed" on read, matching the puts-then-removes order used
+    // when the batch eventually flushes to RocksDB. Otherwise
+    // connect+disconnect of an address-touching block before flush
+    // would leak stale rows to confirmed_history / status hashes.
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_pending_addr_funding_put_then_remove_nets_to_empty() {
+        use crate::index::address::{AddrFundingRow, scripthash_of};
+
+        let cache = make_cache(16);
+        let sh = scripthash_of(&bitcoin::ScriptBuf::new());
+        let txid = bitcoin::Txid::from_raw_hash(
+            bitcoin::hashes::sha256d::Hash::from_byte_array([0x99; 32]),
+        );
+
+        // Connect-side: stage a funding row in the pending batch.
+        let mut connect = StoreBatch::default();
+        connect.addr_funding_puts.push(AddrFundingRow {
+            scripthash: sh,
+            height: 1,
+            txid,
+            vout: 0,
+            amount_sat: 1_000,
+        });
+        cache.write_batch(connect).unwrap();
+
+        assert_eq!(
+            cache.iter_addr_funding(&sh).len(),
+            1,
+            "pending put must be visible before disconnect"
+        );
+
+        // Disconnect-side: stage the matching remove in the same
+        // pending batch (no flush in between).
+        let mut disconnect = StoreBatch::default();
+        disconnect.addr_funding_removes.push(
+            crate::index::address::AddrFundingKey { scripthash: sh, height: 1, txid, vout: 0 },
+        );
+        cache.write_batch(disconnect).unwrap();
+
+        assert!(
+            cache.iter_addr_funding(&sh).is_empty(),
+            "pending put + pending remove for same key must net to empty"
+        );
+
+        // After flush the on-disk state must agree.
+        cache.flush_durable().unwrap();
+        assert!(
+            cache.iter_addr_funding(&sh).is_empty(),
+            "post-flush funding rows must remain empty"
+        );
+    }
+
+    #[test]
+    fn test_pending_addr_funding_remove_then_put_keeps_row() {
+        // Disconnect-then-reconnect of a block (e.g. an A→B→A reorg
+        // before flush) should leave the row present. The previous
+        // implementation's per-key netting only handled the
+        // put-then-remove direction; remove-then-put would have
+        // dropped the new put.
+        use crate::index::address::{AddrFundingRow, scripthash_of};
+
+        let cache = make_cache(16);
+        let sh = scripthash_of(&bitcoin::ScriptBuf::new());
+        let txid = bitcoin::Txid::from_raw_hash(
+            bitcoin::hashes::sha256d::Hash::from_byte_array([0x55; 32]),
+        );
+
+        // Stage a remove for the row first (e.g. disconnecting block A).
+        let mut disconnect = StoreBatch::default();
+        disconnect.addr_funding_removes.push(
+            crate::index::address::AddrFundingKey { scripthash: sh, height: 1, txid, vout: 0 },
+        );
+        cache.write_batch(disconnect).unwrap();
+
+        // Now stage a put for the same key (reconnecting the same block
+        // or an alternate block at the same height that reuses the row).
+        let mut reconnect = StoreBatch::default();
+        reconnect.addr_funding_puts.push(AddrFundingRow {
+            scripthash: sh,
+            height: 1,
+            txid,
+            vout: 0,
+            amount_sat: 7_777,
+        });
+        cache.write_batch(reconnect).unwrap();
+
+        let rows = cache.iter_addr_funding(&sh);
+        assert_eq!(rows.len(), 1, "remove-then-put must leave the row present");
+        assert_eq!(rows[0].1, 7_777);
+
+        // Survives the flush.
+        cache.flush_durable().unwrap();
+        let after = cache.iter_addr_funding(&sh);
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].1, 7_777);
+    }
+
+    #[test]
+    fn test_pending_addr_spending_remove_then_put_keeps_row() {
+        use crate::index::address::{AddrSpendingRow, scripthash_of};
+
+        let cache = make_cache(16);
+        let sh = scripthash_of(&bitcoin::ScriptBuf::new());
+        let txid = bitcoin::Txid::from_raw_hash(
+            bitcoin::hashes::sha256d::Hash::from_byte_array([0x66; 32]),
+        );
+        let prev = make_outpoint(0xdd, 1);
+
+        let mut disconnect = StoreBatch::default();
+        disconnect.addr_spending_removes.push(
+            crate::index::address::AddrSpendingKey {
+                scripthash: sh,
+                height: 1,
+                txid,
+                vin: 0,
+            },
+        );
+        cache.write_batch(disconnect).unwrap();
+
+        let mut reconnect = StoreBatch::default();
+        reconnect.addr_spending_puts.push(AddrSpendingRow {
+            scripthash: sh,
+            height: 1,
+            txid,
+            vin: 0,
+            prev_outpoint: prev,
+        });
+        cache.write_batch(reconnect).unwrap();
+
+        let rows = cache.iter_addr_spending(&sh);
+        assert_eq!(rows.len(), 1, "remove-then-put must leave the row present");
+
+        cache.flush_durable().unwrap();
+        let after = cache.iter_addr_spending(&sh);
+        assert_eq!(after.len(), 1);
+    }
+
+    #[test]
+    fn test_pending_addr_spending_put_then_remove_nets_to_empty() {
+        use crate::index::address::{AddrSpendingRow, scripthash_of};
+
+        let cache = make_cache(16);
+        let sh = scripthash_of(&bitcoin::ScriptBuf::new());
+        let spending_txid = bitcoin::Txid::from_raw_hash(
+            bitcoin::hashes::sha256d::Hash::from_byte_array([0x77; 32]),
+        );
+        let prev = make_outpoint(0xaa, 0);
+
+        let mut connect = StoreBatch::default();
+        connect.addr_spending_puts.push(AddrSpendingRow {
+            scripthash: sh,
+            height: 1,
+            txid: spending_txid,
+            vin: 0,
+            prev_outpoint: prev,
+        });
+        cache.write_batch(connect).unwrap();
+        assert_eq!(cache.iter_addr_spending(&sh).len(), 1);
+
+        let mut disconnect = StoreBatch::default();
+        disconnect.addr_spending_removes.push(
+            crate::index::address::AddrSpendingKey {
+                scripthash: sh,
+                height: 1,
+                txid: spending_txid,
+                vin: 0,
+            },
+        );
+        cache.write_batch(disconnect).unwrap();
+
+        assert!(
+            cache.iter_addr_spending(&sh).is_empty(),
+            "pending spending put + remove for same key must net to empty"
+        );
+
+        cache.flush_durable().unwrap();
+        assert!(cache.iter_addr_spending(&sh).is_empty());
     }
 }

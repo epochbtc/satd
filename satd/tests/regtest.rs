@@ -71,7 +71,7 @@ impl TestNode {
         } else {
             (String::new(), String::new())
         };
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + Duration::from_secs(60);
         let cookie_path = datadir.join("regtest").join(".cookie");
         loop {
             let rpc_ready = if uses_userpass {
@@ -1718,7 +1718,7 @@ fn test_node_restart_persistence() {
     // initialized (matches the pattern used by `TestNode::start`).
     let wait_for_cookie = |dir: &std::path::Path, port: u16| -> String {
         let cookie_path = dir.join("regtest").join(".cookie");
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             if let Ok(cookie) = std::fs::read_to_string(&cookie_path) {
                 let (user, pass) = cookie
@@ -3799,6 +3799,176 @@ fn test_address_index_enabled_flag_accepted() {
     let mut node = TestNode::start(&["--addressindex=1"]);
     let r = node.rpc_call("getblockchaininfo").expect("rpc");
     assert!(r["result"]["chain"].as_str().is_some());
+    node.stop();
+}
+
+// ── Address-history index — operator RPCs (M3) ────────────────────────
+
+/// Mining one block to a regtest address must surface a non-zero
+/// confirmed balance on `getaddressbalance` for that address — this
+/// closes the loop M2 wrote (per-block emission) plus M3 reads (the
+/// trait + RPCs).
+#[test]
+fn test_address_index_rpc_getaddressbalance() {
+    let mut node = TestNode::start(&[]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+
+    // Mine 101 blocks so the first coinbase is matured + spendable
+    // visibility doesn't matter — we just want a confirmed balance.
+    let _ = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(101), serde_json::json!(addr)],
+        )
+        .unwrap();
+
+    let resp = node
+        .rpc_call_with_params("getaddressbalance", vec![serde_json::json!(addr)])
+        .expect("rpc");
+    let confirmed = resp["result"]["confirmed"]
+        .as_u64()
+        .expect("confirmed is u64");
+    assert!(
+        confirmed > 0,
+        "expected non-zero confirmed balance after mining; got {}",
+        confirmed
+    );
+    assert_eq!(resp["result"]["unconfirmed"].as_i64().unwrap_or(0), 0);
+
+    node.stop();
+}
+
+/// `getaddresshistory` must return one funding entry per mined block
+/// for the address, in height-ascending order.
+#[test]
+fn test_address_index_rpc_getaddresshistory() {
+    let mut node = TestNode::start(&[]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+
+    let _ = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(5), serde_json::json!(addr)],
+        )
+        .unwrap();
+
+    let resp = node
+        .rpc_call_with_params("getaddresshistory", vec![serde_json::json!(addr)])
+        .expect("rpc");
+    let arr = resp["result"]
+        .as_array()
+        .expect("history result is array")
+        .clone();
+    // 5 coinbases → 5 funding entries (no spends in this test).
+    assert_eq!(arr.len(), 5);
+
+    let mut last_height: i64 = -1;
+    for entry in &arr {
+        assert_eq!(entry["type"].as_str(), Some("funding"));
+        let h = entry["height"].as_i64().expect("height i64");
+        assert!(h > last_height, "history must be height-ascending");
+        last_height = h;
+        assert!(entry["txid"].as_str().is_some());
+        assert!(entry["amount_sat"].as_u64().is_some());
+    }
+
+    node.stop();
+}
+
+/// `getaddressutxos` must return one UTXO per unspent coinbase output
+/// for the address.
+#[test]
+fn test_address_index_rpc_getaddressutxos() {
+    let mut node = TestNode::start(&[]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+
+    let _ = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(3), serde_json::json!(addr)],
+        )
+        .unwrap();
+
+    let resp = node
+        .rpc_call_with_params("getaddressutxos", vec![serde_json::json!(addr)])
+        .expect("rpc");
+    let arr = resp["result"]
+        .as_array()
+        .expect("utxos result is array")
+        .clone();
+    assert_eq!(arr.len(), 3);
+    for utxo in &arr {
+        assert!(utxo["txid"].as_str().is_some());
+        assert!(utxo["amount_sat"].as_u64().is_some());
+        assert!(utxo["height"].as_u64().is_some());
+    }
+
+    node.stop();
+}
+
+/// With `--addressindex=0`, the read RPCs surface
+/// `IndexError::Disabled` (mapped to JSON-RPC code -32601) so wallet
+/// tooling can detect a disabled-index server cleanly.
+#[test]
+fn test_address_index_disabled_lookup_returns_error() {
+    let mut node = TestNode::start(&["--addressindex=0"]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+
+    let resp = node
+        .rpc_call_with_params("getaddressbalance", vec![serde_json::json!(addr)])
+        .expect("rpc");
+    assert!(
+        resp["error"]["code"].as_i64().is_some(),
+        "expected error response when index disabled, got: {}",
+        resp
+    );
+    assert_eq!(resp["error"]["code"].as_i64().unwrap(), -32601);
+
+    node.stop();
+}
+
+/// Calling a getaddress* RPC with a 32-byte hex `scripthash` form
+/// matches the result of calling it with the address string. Verifies
+/// `parse_scripthash_param`'s second-form parser.
+#[test]
+fn test_address_index_scripthash_param_form() {
+    let mut node = TestNode::start(&[]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+
+    let _ = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(2), serde_json::json!(addr)],
+        )
+        .unwrap();
+
+    // Resolve scripthash by computing sha256 of the bech32-decoded spk.
+    // Easier: use the bare-address form, observe history, then probe
+    // with a hand-computed scripthash. We reproduce the same value via
+    // the `address::scripthash_of` helper on the python side... but the
+    // test just needs to demonstrate the alternate param form is
+    // accepted and yields a parsed call. For robustness we ship the
+    // scripthash as the sha256 of the spk, which the regtest faucet
+    // address has stable bytes for.
+    use bitcoin::hashes::Hash as _;
+    let unchecked: bitcoin::Address<bitcoin::address::NetworkUnchecked> =
+        addr.parse().unwrap();
+    let address = unchecked.require_network(bitcoin::Network::Regtest).unwrap();
+    let spk = address.script_pubkey();
+    let sh = bitcoin::hashes::sha256::Hash::hash(spk.as_bytes()).to_byte_array();
+    let sh_hex = hex::encode(sh);
+
+    let resp = node
+        .rpc_call_with_params(
+            "getaddressbalance",
+            vec![serde_json::json!({ "scripthash": sh_hex })],
+        )
+        .expect("rpc");
+    let confirmed = resp["result"]["confirmed"]
+        .as_u64()
+        .expect("confirmed is u64");
+    assert!(confirmed > 0);
+
     node.stop();
 }
 

@@ -2,7 +2,8 @@ use bitcoin::hashes::Hash;
 use bitcoin::{BlockHash, OutPoint, Txid};
 use rocksdb::{
     BlockBasedOptions, BoundColumnFamily, Cache, ColumnFamilyDescriptor, DBCompressionType,
-    DBWithThreadMode, FlushOptions, IteratorMode, MultiThreaded, Options, WriteBatch, WriteOptions,
+    DBWithThreadMode, FlushOptions, IteratorMode, MultiThreaded, Options, SliceTransform,
+    WriteBatch, WriteOptions,
 };
 use std::path::Path;
 use std::sync::Arc;
@@ -97,7 +98,7 @@ impl RocksDbStore {
         ];
 
         // Column family options builder
-        let make_cf_opts = |bloom: bool, write_buf_mb: usize| -> Options {
+        let make_cf_opts = |bloom: bool, write_buf_mb: usize, prefix_len: Option<usize>| -> Options {
             let mut cf_opts = Options::default();
 
             let mut table_opts = BlockBasedOptions::default();
@@ -121,22 +122,31 @@ impl RocksDbStore {
             cf_opts.set_compression_per_level(&compression_per_level);
             cf_opts.set_bottommost_compression_type(DBCompressionType::Zstd);
 
+            // Fixed-length key prefix lets `prefix_iterator_cf` short-
+            // circuit to the matching SST block (and engages the bloom
+            // filter for prefix-presence checks). Used by the address-
+            // history CFs whose first 32 bytes are `sha256(spk)`.
+            if let Some(len) = prefix_len {
+                cf_opts.set_prefix_extractor(SliceTransform::create_fixed_prefix(len));
+            }
+
             cf_opts
         };
 
         let cf_descriptors = vec![
-            ColumnFamilyDescriptor::new(CF_COINS, make_cf_opts(true, 64)),
-            ColumnFamilyDescriptor::new(CF_BLOCK_INDEX, make_cf_opts(false, 8)),
-            ColumnFamilyDescriptor::new(CF_HEIGHT_INDEX, make_cf_opts(false, 8)),
-            ColumnFamilyDescriptor::new(CF_UNDO, make_cf_opts(false, 16)),
-            ColumnFamilyDescriptor::new(CF_TX_INDEX, make_cf_opts(false, 16)),
-            ColumnFamilyDescriptor::new(CF_METADATA, make_cf_opts(false, 2)),
-            // Address-history index. Bloom on so point lookups for
-            // "is this scripthash known" are fast; 32 MB write-buffer
-            // because the per-block emission is write-heavy during IBD.
-            // Prefix-extractor and tuning will be applied in M3 / M6.
-            ColumnFamilyDescriptor::new(CF_ADDR_FUNDING, make_cf_opts(true, 32)),
-            ColumnFamilyDescriptor::new(CF_ADDR_SPENDING, make_cf_opts(true, 32)),
+            ColumnFamilyDescriptor::new(CF_COINS, make_cf_opts(true, 64, None)),
+            ColumnFamilyDescriptor::new(CF_BLOCK_INDEX, make_cf_opts(false, 8, None)),
+            ColumnFamilyDescriptor::new(CF_HEIGHT_INDEX, make_cf_opts(false, 8, None)),
+            ColumnFamilyDescriptor::new(CF_UNDO, make_cf_opts(false, 16, None)),
+            ColumnFamilyDescriptor::new(CF_TX_INDEX, make_cf_opts(false, 16, None)),
+            ColumnFamilyDescriptor::new(CF_METADATA, make_cf_opts(false, 2, None)),
+            // Address-history index. Bloom on for fast point lookups,
+            // 32 MB write-buffer because per-block emission is write-
+            // heavy during IBD, and a fixed 32-byte prefix-extractor so
+            // `prefix_iterator_cf` over a single scripthash short-
+            // circuits to the matching SST blocks instead of scanning.
+            ColumnFamilyDescriptor::new(CF_ADDR_FUNDING, make_cf_opts(true, 32, Some(32))),
+            ColumnFamilyDescriptor::new(CF_ADDR_SPENDING, make_cf_opts(true, 32, Some(32))),
         ];
 
         let db = DB::open_cf_descriptors(&db_opts, &db_path, cf_descriptors).map_err(|e| {
@@ -245,6 +255,12 @@ impl RocksDbStore {
         cf_opts.set_target_file_size_base(64 * 1024 * 1024);
         cf_opts.set_compression_per_level(&compression_per_level);
         cf_opts.set_bottommost_compression_type(DBCompressionType::Zstd);
+        // Address-index CFs share a 32-byte fixed prefix (sha256(spk)).
+        // Mirror the prefix-extractor we set on initial CF creation so
+        // `drop_and_recreate_cf` (used by `clear_*` paths) preserves it.
+        if matches!(name, CF_ADDR_FUNDING | CF_ADDR_SPENDING) {
+            cf_opts.set_prefix_extractor(SliceTransform::create_fixed_prefix(32));
+        }
         cf_opts
     }
 
@@ -546,11 +562,16 @@ impl Store for RocksDbStore {
     }
 
     fn clear_chainstate(&self) -> Result<(), StoreError> {
-        let cfs = if self.txindex_enabled {
+        let mut cfs = if self.txindex_enabled {
             vec![CF_COINS, CF_UNDO, CF_METADATA, CF_TX_INDEX]
         } else {
             vec![CF_COINS, CF_UNDO, CF_METADATA]
         };
+        // Address-history index sits in chainstate and must clear too,
+        // otherwise -reindex-chainstate would leave stale rows that
+        // reference UTXOs the new chainstate is about to overwrite.
+        cfs.push(CF_ADDR_FUNDING);
+        cfs.push(CF_ADDR_SPENDING);
         for cf_name in cfs {
             self.drop_and_recreate_cf(cf_name)?;
         }
@@ -566,6 +587,8 @@ impl Store for RocksDbStore {
             CF_UNDO,
             CF_METADATA,
             CF_TX_INDEX,
+            CF_ADDR_FUNDING,
+            CF_ADDR_SPENDING,
         ];
         for cf_name in all_cfs {
             self.drop_and_recreate_cf(cf_name)?;
@@ -601,6 +624,70 @@ impl Store for RocksDbStore {
                 })
             })
             .collect()
+    }
+
+    fn iter_addr_funding(
+        &self,
+        sh: &crate::index::address::Scripthash,
+    ) -> Vec<(crate::index::address::AddrFundingKey, u64)> {
+        let cf = self.cf(CF_ADDR_FUNDING);
+        // The CF carries a 32-byte fixed prefix-extractor, so
+        // `prefix_iterator_cf` short-circuits via the matching SST
+        // index/bloom and terminates at the first row whose first 32
+        // bytes leave the prefix. RocksDB's iterator is a borrowed
+        // ReadOptions snapshot; we collect into Vec for caller
+        // simplicity (bounded per-scripthash row count in practice).
+        let mut out = Vec::new();
+        for item in self.db.prefix_iterator_cf(&cf, sh) {
+            let (k, v) = match item {
+                Ok(kv) => kv,
+                Err(_) => continue,
+            };
+            // Defensive: prefix_iterator may yield trailing rows whose
+            // prefix is past `sh` once the underlying memtable was
+            // compacted across the prefix boundary. Verify before
+            // decoding.
+            if k.len() < 32 || &k[..32] != sh {
+                break;
+            }
+            let key = match crate::index::address::decode_funding_key(&k) {
+                Some(k) => k,
+                None => continue,
+            };
+            let amount = match crate::index::address::decode_funding_value(&v) {
+                Some(a) => a,
+                None => continue,
+            };
+            out.push((key, amount));
+        }
+        out
+    }
+
+    fn iter_addr_spending(
+        &self,
+        sh: &crate::index::address::Scripthash,
+    ) -> Vec<(crate::index::address::AddrSpendingKey, OutPoint)> {
+        let cf = self.cf(CF_ADDR_SPENDING);
+        let mut out = Vec::new();
+        for item in self.db.prefix_iterator_cf(&cf, sh) {
+            let (k, v) = match item {
+                Ok(kv) => kv,
+                Err(_) => continue,
+            };
+            if k.len() < 32 || &k[..32] != sh {
+                break;
+            }
+            let key = match crate::index::address::decode_spending_key(&k) {
+                Some(k) => k,
+                None => continue,
+            };
+            let prev = match crate::index::address::decode_spending_value(&v) {
+                Some(p) => p,
+                None => continue,
+            };
+            out.push((key, prev));
+        }
+        out
     }
 }
 

@@ -474,6 +474,22 @@ async fn main() {
     let bind_addr = rpc_bind;
 
     let effective_config_view = config.effective_view();
+
+    // Build the read-side address index from the chainstate store. The
+    // CoinCache wrapper transparently merges the pending (not-yet-flushed)
+    // write batch into iter_addr_*, so reads stay consistent even between
+    // a connect_block and the next flush.
+    let address_index_store: std::sync::Arc<dyn node::storage::Store> =
+        chain_state.store_ref().clone();
+    let address_index: std::sync::Arc<dyn node::index::address::AddressIndex> =
+        std::sync::Arc::new(node::index::address::RocksAddressIndex::new(
+            address_index_store,
+            node::index::address::AddressIndexConfig {
+                enabled: config.addressindex,
+                ..Default::default()
+            },
+        ));
+
     let server_handle = match node::rpc::server::start(
         bind_addr,
         auth.clone(),
@@ -485,6 +501,7 @@ async fn main() {
         last_shutdown_clean,
         effective_config_view,
         mempool_history.clone(),
+        address_index,
     )
     .await
     {

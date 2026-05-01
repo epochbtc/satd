@@ -1,5 +1,8 @@
 use bitcoin::{BlockHash, OutPoint, Txid};
 
+use crate::index::address::{
+    AddrFundingKey, AddrFundingRow, AddrSpendingKey, AddrSpendingRow, Scripthash,
+};
 use crate::storage::blockindex::BlockIndexEntry;
 use crate::storage::coinview::Coin;
 use crate::storage::undo::UndoData;
@@ -14,6 +17,8 @@ pub struct InMemoryStore {
     height_index: std::sync::RwLock<std::collections::HashMap<u32, BlockHash>>,
     undo: std::sync::RwLock<std::collections::HashMap<BlockHash, UndoData>>,
     tx_index: std::sync::RwLock<std::collections::HashMap<Txid, BlockHash>>,
+    addr_funding: std::sync::RwLock<Vec<AddrFundingRow>>,
+    addr_spending: std::sync::RwLock<Vec<AddrSpendingRow>>,
 }
 
 impl Default for InMemoryStore {
@@ -31,6 +36,8 @@ impl InMemoryStore {
             height_index: std::sync::RwLock::new(std::collections::HashMap::new()),
             undo: std::sync::RwLock::new(std::collections::HashMap::new()),
             tx_index: std::sync::RwLock::new(std::collections::HashMap::new()),
+            addr_funding: std::sync::RwLock::new(Vec::new()),
+            addr_spending: std::sync::RwLock::new(Vec::new()),
         }
     }
 }
@@ -91,6 +98,24 @@ impl Store for InMemoryStore {
         for txid in batch.tx_index_removes {
             txi.remove(&txid);
         }
+        if !batch.addr_funding_puts.is_empty()
+            || !batch.addr_funding_removes.is_empty()
+        {
+            let mut af = self.addr_funding.write().unwrap();
+            af.extend(batch.addr_funding_puts);
+            for k in batch.addr_funding_removes {
+                af.retain(|r| r.key() != k);
+            }
+        }
+        if !batch.addr_spending_puts.is_empty()
+            || !batch.addr_spending_removes.is_empty()
+        {
+            let mut as_ = self.addr_spending.write().unwrap();
+            as_.extend(batch.addr_spending_puts);
+            for k in batch.addr_spending_removes {
+                as_.retain(|r| r.key() != k);
+            }
+        }
 
         Ok(())
     }
@@ -137,6 +162,8 @@ impl Store for InMemoryStore {
         self.coins.write().unwrap().clear();
         self.undo.write().unwrap().clear();
         self.tx_index.write().unwrap().clear();
+        self.addr_funding.write().unwrap().clear();
+        self.addr_spending.write().unwrap().clear();
         *self.tip.write().unwrap() = None;
         Ok(())
     }
@@ -147,8 +174,45 @@ impl Store for InMemoryStore {
         self.coins.write().unwrap().clear();
         self.undo.write().unwrap().clear();
         self.tx_index.write().unwrap().clear();
+        self.addr_funding.write().unwrap().clear();
+        self.addr_spending.write().unwrap().clear();
         *self.tip.write().unwrap() = None;
         Ok(())
+    }
+
+    fn iter_addr_funding(&self, sh: &Scripthash) -> Vec<(AddrFundingKey, u64)> {
+        let mut rows: Vec<(AddrFundingKey, u64)> = self
+            .addr_funding
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|r| &r.scripthash == sh)
+            .map(|r| (r.key(), r.amount_sat))
+            .collect();
+        rows.sort_by(|(a, _), (b, _)| {
+            crate::index::address::encode_funding_key(a)
+                .cmp(&crate::index::address::encode_funding_key(b))
+        });
+        rows
+    }
+
+    fn iter_addr_spending(
+        &self,
+        sh: &Scripthash,
+    ) -> Vec<(AddrSpendingKey, OutPoint)> {
+        let mut rows: Vec<(AddrSpendingKey, OutPoint)> = self
+            .addr_spending
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|r| &r.scripthash == sh)
+            .map(|r| (r.key(), r.prev_outpoint))
+            .collect();
+        rows.sort_by(|(a, _), (b, _)| {
+            crate::index::address::encode_spending_key(a)
+                .cmp(&crate::index::address::encode_spending_key(b))
+        });
+        rows
     }
 }
 
