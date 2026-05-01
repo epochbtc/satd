@@ -90,6 +90,16 @@ impl SubscriptionRegistry {
         // Sweep abandoned channels under the same lock so the cap
         // check below sees the live count, not the high-water mark.
         channels.retain(|_, tx| tx.receiver_count() > 0);
+        // Drop last_status for any pruned scripthashes. A re-subscribe
+        // is supposed to recompute status_hash from current state; a
+        // stale dedup entry from a prior incarnation could match the
+        // recomputed hash and silently swallow the first notification.
+        let live_keys: std::collections::HashSet<Scripthash> =
+            channels.keys().copied().collect();
+        self.last_status
+            .lock()
+            .unwrap()
+            .retain(|sh, _| live_keys.contains(sh));
         if channels.len() >= self.max_subs {
             return Err(SubscribeError::CapReached(self.max_subs));
         }
@@ -119,19 +129,41 @@ impl SubscriptionRegistry {
             .retain(|sh, _| live_keys.contains(sh));
     }
 
-    /// All scripthashes with at least one active subscriber. Used by
-    /// the notifier to limit status-hash recomputation work to only
-    /// the scripthashes someone is watching.
+    /// All scripthashes with at least one active subscriber. Filters
+    /// channels whose receivers have all dropped — those should not
+    /// drive notifier work or `last_status` updates, both of which
+    /// would be wasted.
     pub fn active_scripthashes(&self) -> Vec<Scripthash> {
-        self.channels.lock().unwrap().keys().copied().collect()
+        self.channels
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(sh, tx)| {
+                if tx.receiver_count() > 0 {
+                    Some(*sh)
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     /// Send a status update to the channel for `sh`, if the
     /// recomputed `status_hash` differs from the last-seen value.
-    /// The receiver_count() check avoids needless `send` work to a
-    /// zero-receiver channel (the channel is kept around for
-    /// future re-subscribers but recomputation is wasted otherwise).
+    ///
+    /// Skips entirely (no `last_status` write) when the channel has
+    /// zero receivers — a stale `last_status` value left behind by a
+    /// dropped receiver could cause a future re-subscriber to miss
+    /// the first notification if the recomputed hash happened to
+    /// match the stale entry.
     pub fn maybe_notify(&self, sh: Scripthash, status_hash: [u8; 32]) {
+        let channels = self.channels.lock().unwrap();
+        let tx = match channels.get(&sh) {
+            Some(tx) if tx.receiver_count() > 0 => tx.clone(),
+            _ => return,
+        };
+        drop(channels);
+
         let mut last = self.last_status.lock().unwrap();
         if last.get(&sh) == Some(&status_hash) {
             return;
@@ -139,13 +171,12 @@ impl SubscriptionRegistry {
         last.insert(sh, status_hash);
         drop(last);
 
-        if let Some(tx) = self.channels.lock().unwrap().get(&sh) {
-            // Best-effort: SendError means no receivers; not an error.
-            let _ = tx.send(StatusUpdate {
-                scripthash: sh,
-                status_hash,
-            });
-        }
+        // Best-effort: SendError means no receivers between our check
+        // and the send (a tiny race window); not an error.
+        let _ = tx.send(StatusUpdate {
+            scripthash: sh,
+            status_hash,
+        });
     }
 }
 
@@ -272,6 +303,59 @@ mod tests {
             .expect("second reclaimed slot must work too");
         let third = reg.subscribe([0xe1; 32]);
         assert!(matches!(third, Err(SubscribeError::CapReached(2))));
+    }
+
+    #[tokio::test]
+    async fn test_address_index_resubscribe_after_drop_sees_first_notify() {
+        // Earlier behavior: last_status was retained after subscribers
+        // dropped, and was even written for zero-receiver channels by
+        // maybe_notify. A re-subscriber whose recomputed status_hash
+        // happened to match the stale entry would silently miss the
+        // first notification. Verify the new prune-on-resubscribe +
+        // skip-when-zero-receivers contract closes that.
+        use tokio::time::{Duration, timeout};
+        let reg = SubscriptionRegistry::new(100, 32);
+        let sh = [0xfe; 32];
+
+        // First subscriber sees a hash, then drops.
+        let h_initial = [0x99; 32];
+        {
+            let mut rx = reg.subscribe(sh).unwrap();
+            reg.maybe_notify(sh, h_initial);
+            let _ = timeout(Duration::from_millis(50), rx.recv()).await;
+        }
+
+        // While no receiver exists, a stale subsystem somehow tries to
+        // notify the same hash — must not write last_status.
+        reg.maybe_notify(sh, h_initial);
+
+        // New subscriber re-subscribes; same hash must arrive on the
+        // first notify (not be dedup'd by stale state).
+        let mut rx2 = reg.subscribe(sh).unwrap();
+        reg.maybe_notify(sh, h_initial);
+        let got = timeout(Duration::from_millis(100), rx2.recv())
+            .await
+            .expect("recv timeout — first post-resubscribe notify was dropped")
+            .expect("recv ok");
+        assert_eq!(got.status_hash, h_initial);
+    }
+
+    #[test]
+    fn test_address_index_active_scripthashes_filters_zero_receivers() {
+        let reg = SubscriptionRegistry::new(100, 32);
+        let sh_live = [0x10; 32];
+        let sh_dead = [0x20; 32];
+        let _live = reg.subscribe(sh_live).unwrap();
+        {
+            let _dead = reg.subscribe(sh_dead).unwrap();
+            // _dead drops at the end of this scope.
+        }
+        let active = reg.active_scripthashes();
+        assert!(active.contains(&sh_live));
+        assert!(
+            !active.contains(&sh_dead),
+            "active_scripthashes must not include zero-receiver channels"
+        );
     }
 
     #[test]

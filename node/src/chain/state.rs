@@ -1588,8 +1588,17 @@ impl ChainState {
         // The reorg record is persisted after the mempool reconcile so
         // operators see a fully-consistent state when the record
         // appears in `getreorghistory`.
-        if let Some(pending) = pending_reorg.take() {
-            if let Some(mempool) = self.mempool.get() {
+        // Mempool reconcile, performed *before* BlockConnected is
+        // emitted so the address-index notifier and any other chain
+        // subscribers see a mempool that already reflects the
+        // confirmations from this block. Without this ordering, a
+        // subscriber reacting to BlockConnected could observe a tx
+        // both as "confirmed at this height" (from the chain) and as
+        // "still mempool" (because the post-accept caller hasn't run
+        // remove_for_block yet) and emit an impossible intermediate
+        // status hash.
+        if let Some(mempool) = self.mempool.get() {
+            if let Some(pending) = pending_reorg.as_ref() {
                 // Pass each side block's actual height — passing
                 // new_tip_height here would mis-report confirmation
                 // heights to mempool-event subscribers, who would see
@@ -1598,6 +1607,13 @@ impl ChainState {
                 for (side_block, side_height) in &pending.reconnected_blocks {
                     mempool.remove_for_block(side_block, *side_height);
                 }
+            }
+            // Triggering block's mempool cleanup. Idempotent with the
+            // caller's post-accept_block remove_for_block, so duplicate
+            // calls are safe.
+            mempool.remove_for_block(block, new_height);
+
+            if let Some(pending) = pending_reorg.as_ref() {
                 for tx in &pending.disconnected_txs {
                     let txid = tx.compute_txid();
                     if let Err(e) = mempool.accept_transaction(
@@ -1613,20 +1629,22 @@ impl ChainState {
                     }
                 }
             }
+        }
 
-            if let Some(log) = self.reorg_log.get() {
-                let mut reconnected = pending.reconnected_so_far;
-                reconnected.push(block_hash);
-                let record = crate::chain::reorg_log::ReorgRecord::new(
-                    pending.fork_height,
-                    pending.old_tip,
-                    block_hash,
-                    pending.old_height,
-                    pending.disconnected,
-                    reconnected,
-                );
-                log.record(record);
-            }
+        if let Some(pending) = pending_reorg.take()
+            && let Some(log) = self.reorg_log.get()
+        {
+            let mut reconnected = pending.reconnected_so_far;
+            reconnected.push(block_hash);
+            let record = crate::chain::reorg_log::ReorgRecord::new(
+                pending.fork_height,
+                pending.old_tip,
+                block_hash,
+                pending.old_height,
+                pending.disconnected,
+                reconnected,
+            );
+            log.record(record);
         }
 
         // Update MTP cache with this block's timestamp
@@ -1634,7 +1652,9 @@ impl ChainState {
 
         // Notify the address-index notifier (and any future
         // observability subscribers) that a new tip is in place. Best-
-        // effort: emission never blocks the connect path.
+        // effort: emission never blocks the connect path. Mempool
+        // reconcile above ensures subscribers don't see the
+        // pre-cleanup mempool.
         self.emit_chain_event(crate::chain::events::ChainEvent::BlockConnected {
             hash: block_hash,
             height: new_height,
