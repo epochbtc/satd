@@ -354,6 +354,7 @@ pub async fn start(
     module.register_method("getindexinfo", |_params, ctx, _extensions| {
         Ok::<_, ErrorObjectOwned>(indexes::get_index_info(
             ctx.backfill.as_ref(),
+            &ctx.chain_state,
             ctx.address_index_enabled,
             ctx.chain_state.tip_height(),
         ))
@@ -366,6 +367,7 @@ pub async fn start(
         indexes::backfill_index(
             ctx.backfill.as_ref(),
             ctx.backfill_cmd_tx.as_ref(),
+            &ctx.chain_state,
             ctx.address_index_enabled,
             &target,
         )

@@ -52,6 +52,10 @@ pub enum BackfillError {
     Shutdown,
     #[error("temp CF lookup miss for outpoint {0}: backfill data may be corrupt")]
     TempCfMiss(bitcoin::OutPoint),
+    #[error("reorg invalidated the backfill snapshot at height {height}: {detail}")]
+    ReorgInvalidated { height: u32, detail: String },
+    #[error("address index is disabled (--addressindex=0); refusing to run backfill")]
+    AddressIndexDisabled,
 }
 
 /// Shared handle so RPCs can drive the task without a tokio
@@ -74,10 +78,16 @@ struct BackfillInner {
 
 impl BackfillHandle {
     pub fn new(initial: BackfillCursor) -> Self {
+        // Initialize the in-memory pause flag from the persisted state
+        // so a `Paused` cursor stays paused across restart. Without
+        // this init, an operator who paused before shutdown would see
+        // the runner auto-resume on next start (see review finding
+        // #10 — sticky-paused contract).
+        let paused_initial = matches!(initial.state, BackfillState::Paused);
         Self {
             inner: Arc::new(BackfillInner {
                 cursor: Mutex::new(initial),
-                paused: AtomicBool::new(false),
+                paused: AtomicBool::new(paused_initial),
                 cancelled: AtomicBool::new(false),
             }),
         }
@@ -132,6 +142,9 @@ impl BackfillHandle {
     /// Persist a metadata-only cursor advance via a no-row StoreBatch.
     /// Used for state transitions (start, advance_to_pass_2, mark_*)
     /// where the cursor changes without a corresponding addr-CF write.
+    /// Clears the persisted `last_error` blob — every transition out
+    /// of `Failed` (or out of any state, for that matter) replaces the
+    /// stale error context with a fresh empty slot.
     fn persist(&self, store: &dyn Store, new: BackfillCursor) -> Result<(), BackfillError> {
         let batch = StoreBatch {
             backfill_cursor_advance: Some(BackfillCursorWrite {
@@ -140,22 +153,30 @@ impl BackfillHandle {
                 cursor_height: new.cursor_height,
                 snapshot_height: new.snapshot_height,
                 started_at_unix: new.started_at_unix,
+                snapshot_tip_hash: new.snapshot_tip_hash,
             }),
             ..Default::default()
         };
         store.write_batch(batch)?;
+        // Best-effort clear; non-fatal if the underlying store doesn't
+        // support it (in-memory test stores).
+        let _ = store.write_backfill_last_error("");
         self.set_cursor(new);
         Ok(())
     }
 
-    /// Begin a fresh backfill. Cursor transitions Idle/Cancelled/Rejected/
-    /// Completed → Running(pass=1, h=0, snapshot_height). Errors if a
-    /// backfill is already Running or Paused. The caller is expected to
-    /// have created the temp CF first.
+    /// Begin a fresh backfill. Cursor transitions
+    /// Idle/Cancelled/Rejected/Failed/Completed → Running(pass=1, h=0,
+    /// snapshot_height). Errors if a backfill is already Running or
+    /// Paused. `Failed` is treated as a non-terminal recovery state:
+    /// a fresh start clears the persisted last-error and runs from
+    /// scratch (the lenient-failed contract). The caller is expected
+    /// to have created the temp CF first.
     pub fn start(
         &self,
         store: &dyn Store,
         snapshot_height: u32,
+        snapshot_tip_hash: [u8; 32],
     ) -> Result<(), BackfillError> {
         let cur = self.cursor();
         match cur.state {
@@ -168,6 +189,7 @@ impl BackfillHandle {
             BackfillState::Idle
             | BackfillState::Cancelled
             | BackfillState::Rejected
+            | BackfillState::Failed
             | BackfillState::Completed => {}
         }
         let started_at_unix = std::time::SystemTime::now()
@@ -182,6 +204,7 @@ impl BackfillHandle {
                 cursor_height: 0,
                 snapshot_height,
                 started_at_unix,
+                snapshot_tip_hash,
             },
         )
     }
@@ -202,8 +225,7 @@ impl BackfillHandle {
                 state: BackfillState::Running,
                 pass: 2,
                 cursor_height: 0,
-                snapshot_height: cur.snapshot_height,
-                started_at_unix: cur.started_at_unix,
+                ..cur
             },
         )
     }
@@ -221,10 +243,7 @@ impl BackfillHandle {
             store,
             BackfillCursor {
                 state: BackfillState::Completed,
-                pass: cur.pass,
-                cursor_height: cur.cursor_height,
-                snapshot_height: cur.snapshot_height,
-                started_at_unix: cur.started_at_unix,
+                ..cur
             },
         )
     }
@@ -245,12 +264,51 @@ impl BackfillHandle {
             store,
             BackfillCursor {
                 state: BackfillState::Cancelled,
-                pass: cur.pass,
-                cursor_height: cur.cursor_height,
-                snapshot_height: cur.snapshot_height,
-                started_at_unix: cur.started_at_unix,
+                ..cur
             },
         )
+    }
+
+    /// Mark Failed with a persisted operator-readable error message.
+    /// Used by the runner when an unrecoverable error occurs (missing
+    /// block, reorg invalidation, temp CF miss, storage error).
+    /// `Failed` is non-terminal at the RPC layer: a fresh
+    /// `backfillindex` clears it and starts over.
+    ///
+    /// Cursor positional fields (pass/cursor_height/snapshot_height)
+    /// are preserved for diagnostics — operators may want to see how
+    /// far the failed run got. The persisted last-error is written
+    /// AFTER the cursor advance so a crash between the two doesn't
+    /// leave a stale error attached to a non-Failed cursor.
+    pub fn mark_failed(
+        &self,
+        store: &dyn Store,
+        err_msg: &str,
+    ) -> Result<(), BackfillError> {
+        let cur = self.cursor();
+        if !matches!(
+            cur.state,
+            BackfillState::Running | BackfillState::Paused
+        ) {
+            return Err(BackfillError::InvalidTransition {
+                from: cur.state.label(),
+                to: "failed",
+            });
+        }
+        // Persist cursor first (this also clears any prior last-error
+        // via `persist`'s blanket clear), then write the new one.
+        self.persist(
+            store,
+            BackfillCursor {
+                state: BackfillState::Failed,
+                ..cur
+            },
+        )?;
+        // Best-effort: if the message can't be persisted (e.g. in-mem
+        // store), the state still reflects Failed — operators just
+        // won't get the error context.
+        let _ = store.write_backfill_last_error(err_msg);
+        Ok(())
     }
 
     /// Move Running→Paused for `getindexinfo` reporting consistency.
@@ -382,6 +440,7 @@ mod tests {
             cursor_height: 100,
             snapshot_height: 1000,
             started_at_unix: 0,
+            snapshot_tip_hash: [0u8; 32],
         };
         // Pass 1 at height 100 of a 1000-block snapshot = 100/2000 = 0.05.
         assert!((cursor.progress_ratio() - 0.05).abs() < 1e-9);
@@ -395,6 +454,7 @@ mod tests {
             cursor_height: 500,
             snapshot_height: 1000,
             started_at_unix: 0,
+            snapshot_tip_hash: [0u8; 32],
         };
         // Pass 2 at height 500 of a 1000-block snapshot = (1000+500)/2000 = 0.75.
         assert!((cursor.progress_ratio() - 0.75).abs() < 1e-9);

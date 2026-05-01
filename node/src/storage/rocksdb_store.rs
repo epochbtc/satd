@@ -475,23 +475,25 @@ impl Store for RocksDbStore {
         }
 
         // Backfill temp CF: only present while a backfill is in flight.
-        // We silently drop the writes if the CF isn't open — that path
-        // is reachable only if a stale runner thread emits a batch after
-        // the CF was dropped on Completed/Cancelled, which the runner
-        // is structured to avoid. Logging at warn keeps it visible if
-        // it does fire.
+        // We refuse to commit a batch that produced temp puts but
+        // arrived at the store after the CF was already dropped — that
+        // would commit funding rows + cursor advance without the
+        // matching `(outpoint -> scripthash)` rows pass 2 needs, and
+        // pass 2 would later fail with TempCfMiss. Returning an error
+        // before the WriteBatch is applied preserves the all-or-nothing
+        // contract and forces the runner to stop cleanly.
         if !batch.addr_backfill_temp_puts.is_empty() {
-            if let Some(cf_temp) = self.db.cf_handle(CF_ADDR_BACKFILL_TEMP) {
-                for (outpoint, sh) in &batch.addr_backfill_temp_puts {
-                    let key = backfill_temp_key(outpoint);
-                    wb.put_cf(&cf_temp, key, sh);
-                }
-            } else {
-                tracing::warn!(
-                    n = batch.addr_backfill_temp_puts.len(),
-                    "backfill temp CF not open; dropping {} pass-1 mappings",
+            let cf_temp = self.db.cf_handle(CF_ADDR_BACKFILL_TEMP).ok_or_else(|| {
+                StoreError::Database(format!(
+                    "backfill temp CF '{}' is not open; refusing to commit a batch with {} \
+                     pass-1 mappings (the runner should stop and let the operator restart)",
+                    CF_ADDR_BACKFILL_TEMP,
                     batch.addr_backfill_temp_puts.len(),
-                );
+                ))
+            })?;
+            for (outpoint, sh) in &batch.addr_backfill_temp_puts {
+                let key = backfill_temp_key(outpoint);
+                wb.put_cf(&cf_temp, key, sh);
             }
         }
 
@@ -504,6 +506,14 @@ impl Store for RocksDbStore {
             wb.put_cf(&cf_meta, cur::META_KEY_CURSOR_HEIGHT, adv.cursor_height.to_be_bytes());
             wb.put_cf(&cf_meta, cur::META_KEY_SNAPSHOT_HEIGHT, adv.snapshot_height.to_be_bytes());
             wb.put_cf(&cf_meta, cur::META_KEY_STARTED_AT, adv.started_at_unix.to_be_bytes());
+            // Snapshot-tip hash. All-zero hash is the "don't care" sentinel
+            // (set by per-block batches that aren't the start
+            // transition); skip the write so we don't clobber the
+            // anchor recorded by start(). Only `start()` and friends
+            // emit a non-zero hash here.
+            if adv.snapshot_tip_hash != [0u8; 32] {
+                wb.put_cf(&cf_meta, cur::META_KEY_SNAPSHOT_HASH, adv.snapshot_tip_hash);
+            }
         }
 
         // Metadata: tip
@@ -661,6 +671,11 @@ impl Store for RocksDbStore {
         for cf_name in cfs {
             self.drop_and_recreate_cf(cf_name)?;
         }
+        // Backfill temp CF: drop wholesale (don't recreate — it's
+        // lazily created when a backfill starts). After clear_chainstate
+        // any in-flight backfill cursor in metadata is also gone, so
+        // leaving the temp CF would orphan its data.
+        self.drop_backfill_temp_cf()?;
         // Re-stamp schema version after metadata CF was recreated
         Self::stamp_schema(&self.db, CURRENT_SCHEMA_VERSION)
     }
@@ -679,6 +694,9 @@ impl Store for RocksDbStore {
         for cf_name in all_cfs {
             self.drop_and_recreate_cf(cf_name)?;
         }
+        // Backfill temp CF: drop without recreate (lazy create on first
+        // backfill start). See clear_chainstate.
+        self.drop_backfill_temp_cf()?;
         // Re-stamp schema version after metadata CF was recreated
         Self::stamp_schema(&self.db, CURRENT_SCHEMA_VERSION)
     }
@@ -877,6 +895,21 @@ impl Store for RocksDbStore {
                 }
             })
         };
+        let snapshot_tip_hash: [u8; 32] = self
+            .db
+            .get_cf(&cf, cur::META_KEY_SNAPSHOT_HASH)
+            .ok()
+            .flatten()
+            .and_then(|v| {
+                if v.len() == 32 {
+                    let mut h = [0u8; 32];
+                    h.copy_from_slice(&v);
+                    Some(h)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or([0u8; 32]);
         cur::BackfillCursor {
             state: read_u8(cur::META_KEY_STATE)
                 .map(cur::BackfillState::from_byte)
@@ -885,6 +918,44 @@ impl Store for RocksDbStore {
             cursor_height: read_u32_be(cur::META_KEY_CURSOR_HEIGHT).unwrap_or(0),
             snapshot_height: read_u32_be(cur::META_KEY_SNAPSHOT_HEIGHT).unwrap_or(0),
             started_at_unix: read_u64_be(cur::META_KEY_STARTED_AT).unwrap_or(0),
+            snapshot_tip_hash,
+        }
+    }
+
+    fn read_backfill_last_error(&self) -> Option<String> {
+        use crate::index::address::cursor as cur;
+        let cf = self.cf(CF_METADATA);
+        self.db
+            .get_cf(&cf, cur::META_KEY_LAST_ERROR)
+            .ok()
+            .flatten()
+            .and_then(|v| String::from_utf8(v.to_vec()).ok())
+            .filter(|s| !s.is_empty())
+    }
+
+    fn write_backfill_last_error(&self, msg: &str) -> Result<(), StoreError> {
+        use crate::index::address::cursor as cur;
+        let cf = self.cf(CF_METADATA);
+        // Truncate to LAST_ERROR_MAX_BYTES at a UTF-8 char boundary so
+        // we never persist invalid UTF-8.
+        let bytes = if msg.len() <= cur::LAST_ERROR_MAX_BYTES {
+            msg.as_bytes().to_vec()
+        } else {
+            let mut idx = cur::LAST_ERROR_MAX_BYTES;
+            while idx > 0 && !msg.is_char_boundary(idx) {
+                idx -= 1;
+            }
+            msg.as_bytes()[..idx].to_vec()
+        };
+        if bytes.is_empty() {
+            // Empty string clears the slot.
+            self.db
+                .delete_cf(&cf, cur::META_KEY_LAST_ERROR)
+                .map_err(|e| StoreError::Database(e.to_string()))
+        } else {
+            self.db
+                .put_cf(&cf, cur::META_KEY_LAST_ERROR, &bytes)
+                .map_err(|e| StoreError::Database(e.to_string()))
         }
     }
 }

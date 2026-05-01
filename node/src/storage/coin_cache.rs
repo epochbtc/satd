@@ -649,9 +649,18 @@ impl Store for CoinCache {
         drop(pending);
 
         let inner_rows = self.inner.iter_addr_funding(sh);
+        // Dedupe by key with pending taking precedence over inner.
+        // Without this, an inner row that also has a matching pending
+        // put (e.g. a write that bypassed the pending-batch path via
+        // the no-coin pass-through, while a coincident pending entry
+        // is still buffered) would surface twice in the merged result.
+        // Backfill is the first writer that goes through the no-coin
+        // pass-through alongside a non-empty pending_batch.
+        let pending_keys: std::collections::HashSet<crate::index::address::AddrFundingKey> =
+            pending_puts.iter().map(|(k, _)| k.clone()).collect();
         let mut all: Vec<(crate::index::address::AddrFundingKey, u64)> = inner_rows
             .into_iter()
-            .filter(|(k, _)| !pending_removes.contains(k))
+            .filter(|(k, _)| !pending_removes.contains(k) && !pending_keys.contains(k))
             .chain(pending_puts)
             .collect();
         all.sort_by(|(a, _), (b, _)| {
@@ -690,9 +699,13 @@ impl Store for CoinCache {
         drop(pending);
 
         let inner_rows = self.inner.iter_addr_spending(sh);
+        // Dedupe by key with pending taking precedence over inner.
+        // See `iter_addr_funding` for the rationale.
+        let pending_keys: std::collections::HashSet<crate::index::address::AddrSpendingKey> =
+            pending_puts.iter().map(|(k, _)| k.clone()).collect();
         let mut all: Vec<(crate::index::address::AddrSpendingKey, OutPoint)> = inner_rows
             .into_iter()
-            .filter(|(k, _)| !pending_removes.contains(k))
+            .filter(|(k, _)| !pending_removes.contains(k) && !pending_keys.contains(k))
             .chain(pending_puts)
             .collect();
         all.sort_by(|(a, _), (b, _)| {
@@ -723,6 +736,14 @@ impl Store for CoinCache {
 
     fn read_backfill_cursor(&self) -> crate::index::address::cursor::BackfillCursor {
         self.inner.read_backfill_cursor()
+    }
+
+    fn read_backfill_last_error(&self) -> Option<String> {
+        self.inner.read_backfill_last_error()
+    }
+
+    fn write_backfill_last_error(&self, msg: &str) -> Result<(), StoreError> {
+        self.inner.write_backfill_last_error(msg)
     }
 }
 

@@ -67,6 +67,12 @@ pub struct BackfillCursorWrite {
     pub cursor_height: u32,
     pub snapshot_height: u32,
     pub started_at_unix: u64,
+    /// Active-chain anchor recorded at `start()` time. Persisted as
+    /// 32 raw bytes under `META_KEY_SNAPSHOT_HASH`. All-zero is
+    /// permitted (e.g. for resume-time updates that don't change the
+    /// anchor) and skips the metadata write when the on-disk value
+    /// already matches.
+    pub snapshot_tip_hash: [u8; 32],
 }
 
 impl StoreBatch {
@@ -265,5 +271,21 @@ pub trait Store: Send + Sync {
     /// Read the persisted backfill cursor from metadata. Default: idle.
     fn read_backfill_cursor(&self) -> crate::index::address::cursor::BackfillCursor {
         crate::index::address::cursor::BackfillCursor::idle()
+    }
+
+    /// Read the persisted last-error message that goes with
+    /// `BackfillState::Failed`. Returns `None` when no error is
+    /// recorded. Default: `None`.
+    fn read_backfill_last_error(&self) -> Option<String> {
+        None
+    }
+
+    /// Write or clear the persisted last-error message. Pass an empty
+    /// string to clear (treated equivalently to a delete). Stored in
+    /// the metadata CF so it survives restart.
+    fn write_backfill_last_error(&self, _msg: &str) -> Result<(), StoreError> {
+        Err(StoreError::Database(
+            "write_backfill_last_error not supported on this backend".into(),
+        ))
     }
 }

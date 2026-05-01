@@ -19,6 +19,17 @@ pub const META_KEY_CURSOR_HEIGHT: &[u8] = b"addrindex.backfill.cursor_height";
 pub const META_KEY_SNAPSHOT_HEIGHT: &[u8] = b"addrindex.backfill.snapshot_height";
 pub const META_KEY_STARTED_AT: &[u8] = b"addrindex.backfill.started_at";
 pub const META_KEY_STATE: &[u8] = b"addrindex.backfill.state";
+/// Active-chain anchor: hash of the block at `snapshot_height` at the
+/// moment `start()` was called. The runner verifies on resume (and
+/// periodically during the run) that this hash is still on the active
+/// chain — if not, a reorg has invalidated the snapshot and the run
+/// must abort with `ReorgInvalidated → Failed` rather than write rows
+/// for blocks the chain no longer includes. 32 bytes raw.
+pub const META_KEY_SNAPSHOT_HASH: &[u8] = b"addrindex.backfill.snapshot_hash";
+/// Operator-readable error message persisted alongside `State::Failed`.
+/// Cleared on the next state transition. UTF-8 string, bounded length
+/// (truncated by the writer if pathological).
+pub const META_KEY_LAST_ERROR: &[u8] = b"addrindex.backfill.last_error";
 
 /// Lifecycle state of the backfill task. Persisted as a single byte
 /// in metadata so a restart can pick up where it left off.
@@ -29,7 +40,8 @@ pub enum BackfillState {
     Idle = 0,
     /// Backfill is running (or was running before a clean shutdown).
     Running = 1,
-    /// Operator paused via `pauseindex`. Resumeable.
+    /// Operator paused via `pauseindex`. Sticky across restart — the
+    /// runner is not auto-respawned; operator must `resumeindex`.
     Paused = 2,
     /// Backfill finished successfully; temp CF dropped.
     Completed = 3,
@@ -38,6 +50,12 @@ pub enum BackfillState {
     /// Pre-flight rejection (e.g. insufficient disk). No persistent
     /// state to clean up.
     Rejected = 5,
+    /// The runner exited with an unrecoverable error (missing block,
+    /// reorg invalidation, temp CF miss, storage error). The last
+    /// error message is persisted in `META_KEY_LAST_ERROR`. Treated
+    /// as a non-terminal recovery state by the RPC: a fresh
+    /// `backfillindex` clears it and starts over.
+    Failed = 6,
 }
 
 impl BackfillState {
@@ -48,6 +66,7 @@ impl BackfillState {
             3 => Self::Completed,
             4 => Self::Cancelled,
             5 => Self::Rejected,
+            6 => Self::Failed,
             _ => Self::Idle,
         }
     }
@@ -64,11 +83,18 @@ impl BackfillState {
             Self::Completed => "completed",
             Self::Cancelled => "cancelled",
             Self::Rejected => "rejected",
+            Self::Failed => "failed",
         }
     }
 }
 
+/// Maximum length (bytes) of the persisted last-error message. Kept
+/// short so a pathological producer can't bloat the metadata CF.
+pub const LAST_ERROR_MAX_BYTES: usize = 1024;
+
 /// Snapshot of the persisted backfill cursor for `getindexinfo`.
+/// `last_error` is loaded out-of-band by the storage layer (since the
+/// cursor is `Copy`); see `Store::read_backfill_last_error`.
 #[derive(Debug, Clone, Copy)]
 pub struct BackfillCursor {
     pub state: BackfillState,
@@ -76,6 +102,10 @@ pub struct BackfillCursor {
     pub cursor_height: u32,
     pub snapshot_height: u32,
     pub started_at_unix: u64,
+    /// Hash of the active-chain block at `snapshot_height` at
+    /// `start()` time. All-zero on `Idle` (no run yet). Used on resume
+    /// to detect reorgs that invalidated the original snapshot.
+    pub snapshot_tip_hash: [u8; 32],
 }
 
 impl BackfillCursor {
@@ -86,6 +116,7 @@ impl BackfillCursor {
             cursor_height: 0,
             snapshot_height: 0,
             started_at_unix: 0,
+            snapshot_tip_hash: [0u8; 32],
         }
     }
 
