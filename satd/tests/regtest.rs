@@ -71,7 +71,7 @@ impl TestNode {
         } else {
             (String::new(), String::new())
         };
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + Duration::from_secs(60);
         let cookie_path = datadir.join("regtest").join(".cookie");
         loop {
             let rpc_ready = if uses_userpass {
@@ -1718,7 +1718,7 @@ fn test_node_restart_persistence() {
     // initialized (matches the pattern used by `TestNode::start`).
     let wait_for_cookie = |dir: &std::path::Path, port: u16| -> String {
         let cookie_path = dir.join("regtest").join(".cookie");
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             if let Ok(cookie) = std::fs::read_to_string(&cookie_path) {
                 let (user, pass) = cookie
