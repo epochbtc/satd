@@ -294,6 +294,10 @@ async fn main() {
         assumevalid,
         coincache_mb as u64,
         config.prefetch_workers,
+        node::index::address::AddressIndexConfig {
+            enabled: config.addressindex,
+            ..Default::default()
+        },
     ) {
         Ok(cs) => Arc::new(cs),
         Err(e) => {

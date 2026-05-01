@@ -31,6 +31,7 @@ fn make_test_ctx() -> (McpContext, tempfile::TempDir) {
             AssumeValid::Disabled,
             450,
         4,
+        Default::default(),
         )
         .unwrap(),
     );
@@ -563,6 +564,7 @@ mod mining {
                 AssumeValid::Disabled,
                 450,
             4,
+            Default::default(),
             )
             .unwrap(),
         );

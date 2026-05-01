@@ -254,6 +254,10 @@ pub struct Config {
     pub mempoolexpiry: u64,
     pub permitbaremultisig: bool,
     pub txindex: bool,
+    /// Address-history index (per `ADDRESS_INDEX.md`). On by default;
+    /// disable via `--addressindex=0` or `-noindex=address`. Backs the
+    /// future native Electrum and Esplora subsystems.
+    pub addressindex: bool,
     pub prune: u64,
     pub reindex: bool,
     pub reindex_chainstate: bool,
@@ -504,6 +508,15 @@ impl Config {
             || file_get("txindex").and_then(|v| parse_bool(&v)).unwrap_or(false)
             || profile_defaults.txindex.unwrap_or(false);
 
+        // Address-history index: on by default. CLI `--addressindex=0`,
+        // config `addressindex=0`, or the Bitcoin-Core-compatible
+        // `-noindex=address` alias (translated to `--addressindex=0`
+        // pre-clap; see normalize_args) all disable it.
+        let addressindex = cli
+            .addressindex
+            .or_else(|| file_get("addressindex").and_then(|v| parse_bool(&v)))
+            .unwrap_or(true);
+
         let prune = cli
             .prune
             .or_else(|| file_get("prune").and_then(|v| v.parse().ok()))
@@ -545,6 +558,7 @@ impl Config {
             mempoolexpiry,
             permitbaremultisig,
             txindex,
+            addressindex,
             prune,
             reindex: cli.reindex,
             reindex_chainstate: cli.reindex_chainstate,
@@ -856,6 +870,9 @@ pub struct CliArgs {
     #[arg(long, help = "Maintain a full transaction index")]
     pub txindex: bool,
 
+    #[arg(long, value_name = "BOOL", value_parser = parse_bool_arg, help = "Maintain an address-history index (default: true). Accepts 0/1/true/false.")]
+    pub addressindex: Option<bool>,
+
     #[arg(long, value_name = "MB", help = "Prune block data to target size in MB (0 = no pruning, default: 0)")]
     pub prune: Option<u64>,
 
@@ -982,9 +999,31 @@ pub struct CliArgs {
     pub reorg_webhook_secret: Option<String>,
 }
 
+/// Translate Bitcoin-Core-compatible index-control aliases that don't
+/// have a direct clap counterpart.
+///
+/// `-noindex=address` / `-index=address` (from Bitcoin Core's
+/// `-noindex` / `-index` family) become `--addressindex=0` /
+/// `--addressindex=1` so the existing clap parsing applies. Unknown
+/// index names are passed through unchanged so the user sees a
+/// "no such argument" error instead of silent dropping.
+fn translate_index_aliases(args: Vec<String>) -> Vec<String> {
+    args.into_iter()
+        .map(|arg| match arg.as_str() {
+            "-noindex=address" | "--noindex=address" => "--addressindex=0".to_string(),
+            "-index=address" | "--index=address" => "--addressindex=1".to_string(),
+            _ => arg,
+        })
+        .collect()
+}
+
 /// Convert Bitcoin Core-style single-dash long flags to clap-compatible double-dash.
 /// e.g. `-regtest` → `--regtest`, `-datadir=/path` → `--datadir=/path`
 pub fn normalize_args(args: Vec<String>) -> Vec<String> {
+    // Translate index-control aliases first so the rest of the
+    // pipeline sees the canonical `--addressindex` form.
+    let args = translate_index_aliases(args);
+
     // Known long flags that Bitcoin Core accepts with a single dash
     let known_flags = [
         "regtest",
@@ -1011,6 +1050,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "mempoolexpiry",
         "permitbaremultisig",
         "txindex",
+        "addressindex",
         "prune",
         "reindex",
         "reindex-chainstate",
@@ -1159,6 +1199,12 @@ fn parse_bool(s: &str) -> Option<bool> {
     }
 }
 
+/// Clap value-parser wrapper for `parse_bool` so CLI flags can accept
+/// the Bitcoin Core convention `=0` / `=1` alongside `true` / `false`.
+fn parse_bool_arg(s: &str) -> Result<bool, String> {
+    parse_bool(s).ok_or_else(|| format!("expected one of 0/1/true/false/yes/no, got '{s}'"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1246,6 +1292,7 @@ rpcport=8332
             mempoolexpiry: None,
             permitbaremultisig: None,
             txindex: false,
+            addressindex: None,
             prune: None,
             reindex: false,
             reindex_chainstate: false,
@@ -1320,6 +1367,7 @@ rpcport=8332
             mempoolexpiry: None,
             permitbaremultisig: None,
             txindex: false,
+            addressindex: None,
             prune: None,
             reindex: false,
             reindex_chainstate: false,

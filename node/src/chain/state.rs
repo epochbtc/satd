@@ -81,6 +81,8 @@ pub enum ChainError {
     Storage(#[from] StoreError),
     #[error("block file write failed: {0}")]
     FlatFile(String),
+    #[error("{0}")]
+    Disconnect(#[from] disconnect::DisconnectError),
 }
 
 struct ChainTip {
@@ -134,6 +136,10 @@ pub struct ChainState {
     mtp_cache: Mutex<Vec<(u32, u32)>>,
     /// Number of threads for parallel script verification.
     num_threads: usize,
+    /// Address-history index runtime config. Threaded into every
+    /// `connect_block` / `disconnect_block` call so emission is gated
+    /// at runtime without cfg ceremony.
+    address_index: crate::index::address::AddressIndexConfig,
     /// Persistent reorg history + optional webhook dispatch.
     /// Lazily initialized by `open_reorg_log` — may be absent in tests
     /// that don't care about reorg observability.
@@ -147,6 +153,7 @@ impl ChainState {
     /// Create a new ChainState. If the store is empty, initializes with the genesis block.
     /// The store is wrapped in a CoinCache for in-memory UTXO batching.
     /// `dbcache_mb` controls the total write cache size in MB (default 450).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         store: Box<dyn Store>,
         mut flat_files: FlatFileManager,
@@ -155,6 +162,7 @@ impl ChainState {
         assumevalid: AssumeValid,
         dbcache_mb: u64,
         num_threads: usize,
+        address_index: crate::index::address::AddressIndexConfig,
     ) -> Result<Self, ChainError> {
         let genesis = bitcoin::constants::genesis_block(network);
         let genesis_hash = genesis.block_hash();
@@ -211,6 +219,7 @@ impl ChainState {
                     headers_tip_height: AtomicU32::new(htip),
                     mtp_cache: Mutex::new(Vec::with_capacity(12)),
                     num_threads,
+                    address_index,
                     reorg_log: std::sync::OnceLock::new(),
                     warnings: std::sync::Arc::new(crate::warnings::NodeWarnings::new()),
                 });
@@ -238,6 +247,7 @@ impl ChainState {
             pre_verified_txs: None,
             num_threads: 1,
             precomputed_txids: None,
+            address_index: &address_index,
         })?;
         store.write_batch(batch)?;
 
@@ -256,6 +266,7 @@ impl ChainState {
             headers_tip_height: AtomicU32::new(0),
             mtp_cache: Mutex::new(Vec::with_capacity(12)),
             num_threads,
+            address_index,
             reorg_log: std::sync::OnceLock::new(),
             warnings: std::sync::Arc::new(crate::warnings::NodeWarnings::new()),
         })
@@ -695,6 +706,7 @@ impl ChainState {
             pre_verified_txs: pre_verified,
             num_threads: self.num_threads,
             precomputed_txids: Some(&pre.txids),
+            address_index: &self.address_index,
         })?;
 
         // Atomic commit
@@ -909,6 +921,7 @@ impl ChainState {
             pre_verified_txs: None,
             num_threads: self.num_threads,
             precomputed_txids: None,
+            address_index: &self.address_index,
         })?;
 
         // Atomic commit
@@ -977,6 +990,7 @@ impl ChainState {
                 pre_verified_txs: None,
                 num_threads: self.num_threads,
             precomputed_txids: None,
+            address_index: &self.address_index,
             })?;
             self.store.write_batch(batch)?;
 
@@ -1085,6 +1099,7 @@ impl ChainState {
                 pre_verified_txs: None,
                 num_threads: self.num_threads,
             precomputed_txids: None,
+            address_index: &self.address_index,
             })?;
             self.store.write_batch(batch)?;
 
@@ -1284,6 +1299,7 @@ impl ChainState {
                     pre_verified_txs: None,
                     num_threads: 1,
                     precomputed_txids: None,
+                    address_index: &self.address_index,
                 })?;
                 self.store.write_batch(batch)?;
                 {
@@ -1329,6 +1345,7 @@ impl ChainState {
             pre_verified_txs: None,
             num_threads: self.num_threads,
             precomputed_txids: None,
+            address_index: &self.address_index,
         })?;
 
         // Atomic commit
@@ -1413,7 +1430,13 @@ impl ChainState {
                 .ok_or(ChainError::FlatFile("undo data missing for reorg".to_string()))?;
 
             let prev_hash = entry.header.prev_blockhash;
-            let batch = disconnect::disconnect_block(&block, &undo, entry.height, prev_hash);
+            let batch = disconnect::disconnect_block(
+                &block,
+                &undo,
+                entry.height,
+                prev_hash,
+                &self.address_index,
+            )?;
             combined_batch.merge(batch);
 
             disconnected_hashes.push(current);
@@ -1574,6 +1597,7 @@ pub(crate) mod tests {
             AssumeValid::Disabled,
             450,
         4,
+        Default::default(),
         )
         .unwrap();
         (cs, dir)
@@ -1873,6 +1897,7 @@ pub(crate) mod tests {
             AssumeValid::Disabled,
             450,
         4,
+        Default::default(),
         )
         .unwrap();
 
@@ -2209,6 +2234,7 @@ pub(crate) mod tests {
             AssumeValid::Hash(block1_hash),
             450,
         4,
+        Default::default(),
         )
         .unwrap();
 
@@ -2732,6 +2758,7 @@ pub(crate) mod tests {
             AssumeValid::Disabled,
             450,
         4,
+        Default::default(),
         )
         .unwrap();
 

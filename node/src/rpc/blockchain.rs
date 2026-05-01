@@ -704,6 +704,7 @@ mod tests {
             AssumeValid::Disabled,
             450,
         4,
+        Default::default(),
         )
         .unwrap();
         (cs, dir)
