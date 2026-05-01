@@ -50,6 +50,16 @@ pub struct StoreBatch {
 
 impl StoreBatch {
     /// Merge another batch into this one (for atomic multi-block operations).
+    ///
+    /// Address-index puts and removes are merged with last-writer-wins
+    /// semantics by key: an incoming remove drops any prior put for
+    /// the same key, and an incoming put drops any prior remove. This
+    /// keeps the merged batch's puts/removes vectors disjoint by key,
+    /// so a CoinCache pending batch correctly reflects the most-recent
+    /// op for each address-index key — important for connect→
+    /// disconnect→connect (e.g. A→B→A reorgs) and disconnect→connect
+    /// (alternate block at the same height containing the same row)
+    /// sequences before flush.
     pub fn merge(&mut self, other: StoreBatch) {
         self.block_index_puts.extend(other.block_index_puts);
         self.coin_puts.extend(other.coin_puts);
@@ -62,9 +72,34 @@ impl StoreBatch {
         self.undo_puts.extend(other.undo_puts);
         self.tx_index_puts.extend(other.tx_index_puts);
         self.tx_index_removes.extend(other.tx_index_removes);
+
+        // addr_funding: incoming removes invalidate any prior put for
+        // the same key, and incoming puts invalidate any prior remove.
+        if !other.addr_funding_removes.is_empty() {
+            let drop: std::collections::HashSet<AddrFundingKey> =
+                other.addr_funding_removes.iter().cloned().collect();
+            self.addr_funding_puts.retain(|p| !drop.contains(&p.key()));
+        }
+        if !other.addr_funding_puts.is_empty() {
+            let drop: std::collections::HashSet<AddrFundingKey> =
+                other.addr_funding_puts.iter().map(|p| p.key()).collect();
+            self.addr_funding_removes.retain(|k| !drop.contains(k));
+        }
         self.addr_funding_puts.extend(other.addr_funding_puts);
-        self.addr_spending_puts.extend(other.addr_spending_puts);
         self.addr_funding_removes.extend(other.addr_funding_removes);
+
+        // addr_spending: same last-writer-wins by key.
+        if !other.addr_spending_removes.is_empty() {
+            let drop: std::collections::HashSet<AddrSpendingKey> =
+                other.addr_spending_removes.iter().cloned().collect();
+            self.addr_spending_puts.retain(|p| !drop.contains(&p.key()));
+        }
+        if !other.addr_spending_puts.is_empty() {
+            let drop: std::collections::HashSet<AddrSpendingKey> =
+                other.addr_spending_puts.iter().map(|p| p.key()).collect();
+            self.addr_spending_removes.retain(|k| !drop.contains(k));
+        }
+        self.addr_spending_puts.extend(other.addr_spending_puts);
         self.addr_spending_removes.extend(other.addr_spending_removes);
     }
 }
