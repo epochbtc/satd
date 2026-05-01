@@ -405,7 +405,11 @@ impl Store for CoinCache {
             || !batch.height_hash_removes.is_empty()
             || !batch.undo_puts.is_empty()
             || !batch.tx_index_puts.is_empty()
-            || !batch.tx_index_removes.is_empty();
+            || !batch.tx_index_removes.is_empty()
+            || !batch.addr_funding_puts.is_empty()
+            || !batch.addr_spending_puts.is_empty()
+            || !batch.addr_funding_removes.is_empty()
+            || !batch.addr_spending_removes.is_empty();
 
         if has_non_coin {
             if coin_dirty == 0 {
@@ -419,6 +423,10 @@ impl Store for CoinCache {
                     undo_puts: batch.undo_puts,
                     tx_index_puts: batch.tx_index_puts,
                     tx_index_removes: batch.tx_index_removes,
+                    addr_funding_puts: batch.addr_funding_puts,
+                    addr_spending_puts: batch.addr_spending_puts,
+                    addr_funding_removes: batch.addr_funding_removes,
+                    addr_spending_removes: batch.addr_spending_removes,
                 };
                 self.inner.write_batch_mode(pass_through, self.current_write_mode())?;
             } else {
@@ -429,6 +437,10 @@ impl Store for CoinCache {
                 pending.undo_puts.extend(batch.undo_puts);
                 pending.tx_index_puts.extend(batch.tx_index_puts);
                 pending.tx_index_removes.extend(batch.tx_index_removes);
+                pending.addr_funding_puts.extend(batch.addr_funding_puts);
+                pending.addr_spending_puts.extend(batch.addr_spending_puts);
+                pending.addr_funding_removes.extend(batch.addr_funding_removes);
+                pending.addr_spending_removes.extend(batch.addr_spending_removes);
             }
         }
 
