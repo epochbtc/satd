@@ -258,6 +258,10 @@ pub struct Config {
     /// disable via `--addressindex=0` or `-noindex=address`. Backs the
     /// future native Electrum and Esplora subsystems.
     pub addressindex: bool,
+    /// Maximum concurrent per-scripthash status subscriptions. Caps
+    /// memory growth from the per-scripthash broadcast registry.
+    /// Default 10000 — generous for typical xpub-derivation patterns.
+    pub addrindexsubscriptions: usize,
     pub prune: u64,
     pub reindex: bool,
     pub reindex_chainstate: bool,
@@ -517,6 +521,16 @@ impl Config {
             .or_else(|| file_get("addressindex").and_then(|v| parse_bool(&v)))
             .unwrap_or(true);
 
+        // Per-scripthash subscription cap. Default 10000 covers
+        // typical xpub-derivation patterns; operators serving public
+        // Electrum/Esplora endpoints may want to raise this.
+        let addrindexsubscriptions = cli
+            .addrindexsubscriptions
+            .or_else(|| {
+                file_get("addrindexsubscriptions").and_then(|v| v.parse().ok())
+            })
+            .unwrap_or(10_000);
+
         let prune = cli
             .prune
             .or_else(|| file_get("prune").and_then(|v| v.parse().ok()))
@@ -559,6 +573,7 @@ impl Config {
             permitbaremultisig,
             txindex,
             addressindex,
+            addrindexsubscriptions,
             prune,
             reindex: cli.reindex,
             reindex_chainstate: cli.reindex_chainstate,
@@ -873,6 +888,13 @@ pub struct CliArgs {
     #[arg(long, value_name = "BOOL", value_parser = parse_bool_arg, help = "Maintain an address-history index (default: true). Accepts 0/1/true/false.")]
     pub addressindex: Option<bool>,
 
+    #[arg(
+        long,
+        value_name = "N",
+        help = "Maximum concurrent per-scripthash subscriptions (default: 10000)"
+    )]
+    pub addrindexsubscriptions: Option<usize>,
+
     #[arg(long, value_name = "MB", help = "Prune block data to target size in MB (0 = no pruning, default: 0)")]
     pub prune: Option<u64>,
 
@@ -1051,6 +1073,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "permitbaremultisig",
         "txindex",
         "addressindex",
+        "addrindexsubscriptions",
         "prune",
         "reindex",
         "reindex-chainstate",
@@ -1293,6 +1316,7 @@ rpcport=8332
             permitbaremultisig: None,
             txindex: false,
             addressindex: None,
+            addrindexsubscriptions: None,
             prune: None,
             reindex: false,
             reindex_chainstate: false,
@@ -1368,6 +1392,7 @@ rpcport=8332
             permitbaremultisig: None,
             txindex: false,
             addressindex: None,
+            addrindexsubscriptions: None,
             prune: None,
             reindex: false,
             reindex_chainstate: false,

@@ -296,6 +296,7 @@ async fn main() {
         config.prefetch_workers,
         node::index::address::AddressIndexConfig {
             enabled: config.addressindex,
+            max_subscriptions: config.addrindexsubscriptions,
             ..Default::default()
         },
     ) {
@@ -372,11 +373,23 @@ async fn main() {
     // AND by the address-index mempool variant (M4). The address index
     // task subscribes before any tx admission so it observes every
     // Enter/Leave event from startup onward.
+    //
+    // Only the index task subscribes to mempool events — the M5
+    // notifier piggybacks on the index task (mutate-then-notify in the
+    // same tokio arm) so chain/mempool ordering is deterministic.
     let (mempool_event_tx, _) = tokio::sync::broadcast::channel::<
         node::mempool::events::MempoolEvent,
     >(node::mempool::pool::EVENT_BROADCAST_CAPACITY);
-    let addr_index_event_rx = mempool_event_tx.subscribe();
+    let addr_index_mempool_event_rx = mempool_event_tx.subscribe();
     mempool.set_event_sender(mempool_event_tx);
+
+    // Wire the chain-event broadcaster used by the address-index
+    // notifier (M5) and any future observability subscribers.
+    let (chain_event_tx, _) = tokio::sync::broadcast::channel::<
+        node::chain::events::ChainEvent,
+    >(node::chain::events::CHAIN_EVENT_BROADCAST_CAPACITY);
+    let addr_notifier_chain_event_rx = chain_event_tx.subscribe();
+    chain_state.set_chain_event_sender(chain_event_tx);
 
     // Hook the mempool back into ChainState so `perform_reorg` can
     // re-add disconnected non-coinbase txs after a reorg (Bitcoin Core
@@ -390,18 +403,44 @@ async fn main() {
     let mempool_addr_index = std::sync::Arc::new(std::sync::RwLock::new(
         node::index::address::MempoolAddrIndex::new(),
     ));
+
+    // Construct the read-side RocksAddressIndex up front so its
+    // `subscription_registry()` handle is available to the mempool
+    // index task (which fires status-update notifications inline with
+    // each event mutation — see `NotifyBundle`).
+    let address_index_store: std::sync::Arc<dyn node::storage::Store> =
+        chain_state.store_ref().clone();
+    let address_index_concrete = std::sync::Arc::new(
+        node::index::address::RocksAddressIndex::with_mempool_index(
+            address_index_store,
+            node::index::address::AddressIndexConfig {
+                enabled: config.addressindex,
+                max_subscriptions: config.addrindexsubscriptions,
+                ..Default::default()
+            },
+            mempool_addr_index.clone(),
+        ),
+    );
+    let address_index: std::sync::Arc<dyn node::index::address::AddressIndex> =
+        address_index_concrete.clone();
+
     {
         let task_index = mempool_addr_index.clone();
         let task_mempool = mempool.clone();
         let task_chain = chain_state.clone();
         let task_shutdown = shutdown_rx.clone();
+        let notify = node::index::address::NotifyBundle {
+            index: address_index_concrete.clone(),
+            registry: address_index_concrete.subscription_registry(),
+        };
         tokio::spawn(async move {
             node::index::address::mempool_index_task(
                 task_index,
                 task_mempool,
                 task_chain,
-                addr_index_event_rx,
+                addr_index_mempool_event_rx,
                 task_shutdown,
+                Some(notify),
             )
             .await;
         });
@@ -508,23 +547,27 @@ async fn main() {
 
     let effective_config_view = config.effective_view();
 
-    // Build the read-side address index from the chainstate store. The
-    // CoinCache wrapper transparently merges the pending (not-yet-flushed)
-    // write batch into iter_addr_*, so reads stay consistent even between
-    // a connect_block and the next flush. The mempool variant (M4) is
-    // shared with the background event-loop task so RPC queries see the
-    // unconfirmed delta + per-scripthash mempool entries.
-    let address_index_store: std::sync::Arc<dyn node::storage::Store> =
-        chain_state.store_ref().clone();
-    let address_index: std::sync::Arc<dyn node::index::address::AddressIndex> =
-        std::sync::Arc::new(node::index::address::RocksAddressIndex::with_mempool_index(
-            address_index_store,
-            node::index::address::AddressIndexConfig {
-                enabled: config.addressindex,
-                ..Default::default()
-            },
-            mempool_addr_index.clone(),
-        ));
+    // Spawn the chain-driven status-update notifier (M5). The mempool-
+    // driven path is folded into `mempool_index_task` above so the
+    // index mutation and notification fire as a single unit; this
+    // task only handles `BlockConnected` / `BlockDisconnected` events
+    // that affect every subscribed scripthash with confirmed history.
+    {
+        let task_index = address_index_concrete.clone();
+        let task_registry = address_index_concrete.subscription_registry();
+        let task_chain = chain_state.clone();
+        let task_shutdown = shutdown_rx.clone();
+        tokio::spawn(async move {
+            node::index::address::notifier_task(
+                task_index,
+                task_registry,
+                task_chain,
+                addr_notifier_chain_event_rx,
+                task_shutdown,
+            )
+            .await;
+        });
+    }
 
     let server_handle = match node::rpc::server::start(
         bind_addr,
