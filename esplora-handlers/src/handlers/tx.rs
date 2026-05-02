@@ -430,5 +430,66 @@ pub fn build_block_tx_json(
     )
 }
 
+/// Build a full Esplora-shape JSON for a confirmed tx given only its
+/// `txid` and `height`. Used by the address-history pagination paths,
+/// which know `(txid, height)` from index rows but not the block.
+///
+/// Resolves the containing block via `txindex`: if txindex is disabled,
+/// returns 503 ServiceUnavailable so the operator sees a clear failure
+/// signal rather than a partial result. The daemon reconciliation in
+/// `satd/src/config.rs` auto-enables txindex when esplora is on, so a
+/// 503 here only fires under operator override (`--txindex=0` with
+/// `--esplora=1`).
+pub fn build_confirmed_tx_json(
+    state: &EsploraState,
+    txid: &Txid,
+    _height: u32,
+) -> EsploraResult<TxJson> {
+    if !state.chain.store_ref().has_txindex() {
+        return Err(EsploraError::ServiceUnavailable);
+    }
+    let block_hash = state
+        .chain
+        .store_ref()
+        .get_tx_location(txid)
+        .ok_or(EsploraError::NotFound)?;
+    let block = state
+        .chain
+        .get_block(&block_hash)
+        .ok_or_else(|| {
+            EsploraError::Internal(format!(
+                "txindex points at {block_hash} but block data is missing"
+            ))
+        })?;
+    let entry = state
+        .chain
+        .get_block_index(&block_hash)
+        .ok_or_else(|| {
+            EsploraError::Internal(format!(
+                "txindex points at {block_hash} but block index entry is missing"
+            ))
+        })?;
+    let tx = block
+        .txdata
+        .iter()
+        .find(|t| t.compute_txid() == *txid)
+        .ok_or_else(|| {
+            EsploraError::Internal(format!(
+                "txindex points at {block_hash} but tx {txid} not present in block"
+            ))
+        })?;
+    build_block_tx_json(state, tx, block_hash, entry.height, entry.header.time)
+}
+
+/// Build a JSON for an unconfirmed mempool tx. `status.confirmed` is
+/// `false` and the block fields are absent. Used by the address-history
+/// mempool-tx page.
+pub fn build_mempool_tx_json(
+    state: &EsploraState,
+    tx: &Transaction,
+) -> EsploraResult<TxJson> {
+    build_tx_json(state, tx, None)
+}
+
 #[allow(dead_code)]
 fn _block_unused(_: Block) {}

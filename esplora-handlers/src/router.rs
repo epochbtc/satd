@@ -18,7 +18,7 @@ use tower_http::trace::TraceLayer;
 
 use crate::auth::AuthExpectation;
 use crate::config::EsploraConfig;
-use crate::handlers::{block, chain, tx};
+use crate::handlers::{address, block, chain, tx};
 use crate::state::EsploraState;
 
 #[derive(Debug, thiserror::Error)]
@@ -69,6 +69,39 @@ pub fn build_router(state: EsploraState) -> Result<Router, RouterBuildError> {
             "/tx",
             post(tx::tx_broadcast).layer(DefaultBodyLimit::max(1024 * 1024)),
         )
+        // Address-string family (Esplora plan PR 5).
+        .route("/address/{addr}", get(address::address_info))
+        .route("/address/{addr}/txs", get(address::address_txs_combined))
+        .route("/address/{addr}/txs/chain", get(address::address_txs_chain))
+        .route(
+            "/address/{addr}/txs/chain/{last_seen_txid}",
+            get(address::address_txs_chain_paged),
+        )
+        .route(
+            "/address/{addr}/txs/mempool",
+            get(address::address_txs_mempool),
+        )
+        .route("/address/{addr}/utxo", get(address::address_utxo))
+        // Scripthash family — parallel set; same handlers branched on
+        // a different parser.
+        .route("/scripthash/{hash}", get(address::scripthash_info))
+        .route(
+            "/scripthash/{hash}/txs",
+            get(address::scripthash_txs_combined),
+        )
+        .route(
+            "/scripthash/{hash}/txs/chain",
+            get(address::scripthash_txs_chain),
+        )
+        .route(
+            "/scripthash/{hash}/txs/chain/{last_seen_txid}",
+            get(address::scripthash_txs_chain_paged),
+        )
+        .route(
+            "/scripthash/{hash}/txs/mempool",
+            get(address::scripthash_txs_mempool),
+        )
+        .route("/scripthash/{hash}/utxo", get(address::scripthash_utxo))
         .with_state(state);
 
     let routes = if cfg.auth.is_enabled() {
