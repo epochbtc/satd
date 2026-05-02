@@ -5837,3 +5837,192 @@ fn test_esplora_auth_cookie_gates_endpoints() {
 
     node.stop();
 }
+
+// ── Esplora tx endpoints (PR 4) ──
+
+/// `/tx/:txid` for a confirmed coinbase returns the full Esplora tx
+/// shape with `is_coinbase=true` and a populated `status` block.
+#[test]
+fn test_esplora_tx_detail_confirmed_coinbase() {
+    let esplora_port = find_available_port();
+    let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
+    let mut node = TestNode::start(&["--esplora=1", &bind, "--txindex"]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let _ = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(1), serde_json::json!(addr)],
+        )
+        .unwrap();
+
+    let txids: Vec<String> = {
+        let tip = esplora_get(esplora_port, "/blocks/tip/hash")
+            .text()
+            .unwrap()
+            .trim()
+            .to_string();
+        esplora_get(esplora_port, &format!("/block/{}/txids", tip))
+            .json()
+            .unwrap()
+    };
+    let coinbase = &txids[0];
+    let r = esplora_get(esplora_port, &format!("/tx/{}", coinbase));
+    assert_eq!(r.status(), 200);
+    let body: serde_json::Value = r.json().unwrap();
+    assert_eq!(body["txid"].as_str().unwrap(), coinbase);
+    let vin = body["vin"].as_array().unwrap();
+    assert_eq!(vin.len(), 1);
+    assert!(vin[0]["is_coinbase"].as_bool().unwrap());
+    assert!(vin[0]["txid"].is_null(), "coinbase vin omits prev txid");
+    let vout = body["vout"].as_array().unwrap();
+    assert!(!vout.is_empty(), "coinbase has at least one output");
+    assert_eq!(vout[0]["scriptpubkey_type"].as_str().unwrap(), "v0_p2wpkh");
+    assert!(vout[0]["scriptpubkey_address"].as_str().is_some());
+    let status = &body["status"];
+    assert!(status["confirmed"].as_bool().unwrap());
+    assert_eq!(status["block_height"].as_u64().unwrap(), 1);
+    assert!(status["block_hash"].as_str().is_some());
+    assert!(body["fee"].as_u64().unwrap() == 0, "coinbase has fee=0");
+    node.stop();
+}
+
+/// `/tx/:txid/status` confirms-then-mempool fallback.
+#[test]
+fn test_esplora_tx_status_confirmed() {
+    let esplora_port = find_available_port();
+    let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
+    let mut node = TestNode::start(&["--esplora=1", &bind, "--txindex"]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let _ = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(1), serde_json::json!(addr)],
+        )
+        .unwrap();
+    let tip = esplora_get(esplora_port, "/blocks/tip/hash")
+        .text()
+        .unwrap()
+        .trim()
+        .to_string();
+    let txids: Vec<String> = esplora_get(esplora_port, &format!("/block/{}/txids", tip))
+        .json()
+        .unwrap();
+    let r = esplora_get(esplora_port, &format!("/tx/{}/status", txids[0]));
+    assert_eq!(r.status(), 200);
+    let body: serde_json::Value = r.json().unwrap();
+    assert!(body["confirmed"].as_bool().unwrap());
+    assert_eq!(body["block_height"].as_u64().unwrap(), 1);
+    assert_eq!(body["block_hash"].as_str().unwrap(), tip);
+    node.stop();
+}
+
+/// `/tx/:txid/hex` returns the consensus-serialized tx as hex; deser
+/// must round-trip to the same txid.
+#[test]
+fn test_esplora_tx_hex_roundtrip() {
+    let esplora_port = find_available_port();
+    let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
+    let mut node = TestNode::start(&["--esplora=1", &bind, "--txindex"]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let _ = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(1), serde_json::json!(addr)],
+        )
+        .unwrap();
+    let tip = esplora_get(esplora_port, "/blocks/tip/hash")
+        .text()
+        .unwrap()
+        .trim()
+        .to_string();
+    let txids: Vec<String> = esplora_get(esplora_port, &format!("/block/{}/txids", tip))
+        .json()
+        .unwrap();
+    let txid = &txids[0];
+
+    let hex_resp = esplora_get(esplora_port, &format!("/tx/{}/hex", txid));
+    assert_eq!(hex_resp.status(), 200);
+    let hex_body = hex_resp.text().unwrap();
+    let bytes = hex::decode(hex_body.trim()).expect("hex decode");
+    let tx: bitcoin::Transaction =
+        bitcoin::consensus::encode::deserialize(&bytes).expect("tx deserialize");
+    assert_eq!(tx.compute_txid().to_string(), *txid);
+
+    // /raw must agree byte-for-byte.
+    let raw_resp = esplora_get(esplora_port, &format!("/tx/{}/raw", txid));
+    let raw_bytes = raw_resp.bytes().unwrap();
+    assert_eq!(raw_bytes.as_ref(), bytes.as_slice());
+
+    node.stop();
+}
+
+/// Unknown txid → 404 across all `/tx/:txid` shapes.
+#[test]
+fn test_esplora_tx_unknown_returns_404() {
+    let esplora_port = find_available_port();
+    let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
+    let mut node = TestNode::start(&["--esplora=1", &bind, "--txindex"]);
+    let zero = "0".repeat(64);
+    for path in [
+        format!("/tx/{}", zero),
+        format!("/tx/{}/status", zero),
+        format!("/tx/{}/hex", zero),
+        format!("/tx/{}/raw", zero),
+    ] {
+        let r = esplora_get(esplora_port, &path);
+        assert_eq!(
+            r.status(),
+            404,
+            "expected 404 for {} but got {}",
+            path,
+            r.status()
+        );
+    }
+    node.stop();
+}
+
+/// Bad txid hex → 400.
+#[test]
+fn test_esplora_tx_bad_txid_returns_400() {
+    let esplora_port = find_available_port();
+    let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
+    let mut node = TestNode::start(&["--esplora=1", &bind, "--txindex"]);
+    let r = esplora_get(esplora_port, "/tx/not-a-txid");
+    assert_eq!(r.status(), 400);
+    node.stop();
+}
+
+/// `/block/:hash/txs` now returns the full Esplora tx shape (replaces
+/// PR 3's `{txid}` stub).
+#[test]
+fn test_esplora_block_txs_returns_full_tx_shape() {
+    let esplora_port = find_available_port();
+    let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
+    let mut node = TestNode::start(&["--esplora=1", &bind, "--txindex"]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let _ = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(1), serde_json::json!(addr)],
+        )
+        .unwrap();
+    let tip = esplora_get(esplora_port, "/blocks/tip/hash")
+        .text()
+        .unwrap()
+        .trim()
+        .to_string();
+    let r = esplora_get(esplora_port, &format!("/block/{}/txs", tip));
+    assert_eq!(r.status(), 200);
+    let arr: Vec<serde_json::Value> = r.json().unwrap();
+    assert_eq!(arr.len(), 1);
+    let entry = &arr[0];
+    // Full TxJson shape must be present, not the PR-3 stub.
+    assert!(entry["vin"].is_array());
+    assert!(entry["vout"].is_array());
+    assert!(entry["status"].is_object());
+    // fee is Option<u64>: u64 (typically 0 for coinbase) or null when
+    // prevouts couldn't resolve.
+    assert!(entry["fee"].is_u64() || entry["fee"].is_null());
+    assert!(entry["weight"].is_u64());
+    node.stop();
+}

@@ -24,6 +24,7 @@ use bitcoin::consensus::{Encodable, encode::serialize};
 
 use crate::encode::{BlockHeaderJson, block_header_json};
 use crate::error::{EsploraError, EsploraResult};
+use crate::handlers::tx::{TxJson, build_block_tx_json};
 use crate::state::EsploraState;
 
 const BLOCK_TXS_PAGE: usize = 25;
@@ -176,29 +177,27 @@ pub async fn block_txid_at_index(
     Ok(tx.compute_txid().to_string())
 }
 
-/// `/block/:hash/txs[/:start_index]` → page of 25 txs, JSON-shaped.
-/// PR 3 ships a minimal `{txid}` summary; PR 4 fills in the full
-/// `vin/vout/status` Esplora shape and replaces this body.
-#[derive(serde::Serialize)]
-pub struct TxStubJson {
-    pub txid: String,
-}
-
+/// `/block/:hash/txs[/:start_index]` → page of 25 full Esplora-shape
+/// txs (vin/vout/status/fee). PR 4 replaced PR 3's `{txid}` stub.
 pub async fn block_txs(
     State(state): State<EsploraState>,
     Path(hash): Path<String>,
-) -> EsploraResult<Json<Vec<TxStubJson>>> {
+) -> EsploraResult<Json<Vec<TxJson>>> {
     block_txs_page(State(state), Path((hash, 0))).await
 }
 
 pub async fn block_txs_page(
     State(state): State<EsploraState>,
     Path((hash, start_index)): Path<(String, usize)>,
-) -> EsploraResult<Json<Vec<TxStubJson>>> {
+) -> EsploraResult<Json<Vec<TxJson>>> {
     let hash = parse_hash(&hash)?;
     let block = state
         .chain
         .get_block(&hash)
+        .ok_or(EsploraError::NotFound)?;
+    let entry = state
+        .chain
+        .get_block_index(&hash)
         .ok_or(EsploraError::NotFound)?;
     // Empty page on out-of-range matches upstream Esplora's
     // pagination contract — clients distinguish "block missing" (404)
@@ -211,15 +210,19 @@ pub async fn block_txs_page(
     let end = start_index
         .saturating_add(BLOCK_TXS_PAGE)
         .min(block.txdata.len());
-    Ok(Json(
-        block.txdata[start_index..end]
-            .iter()
-            .map(|tx| TxStubJson {
-                txid: tx.compute_txid().to_string(),
-            })
-            .collect(),
-    ))
+    let mut out = Vec::with_capacity(end - start_index);
+    for tx in &block.txdata[start_index..end] {
+        out.push(build_block_tx_json(
+            &state,
+            tx,
+            hash,
+            entry.height,
+            entry.header.time,
+        )?);
+    }
+    Ok(Json(out))
 }
+
 
 /// Reusable helper exposed for the `/blocks` page summary in
 /// `chain::collect_blocks_descending`. Returns
