@@ -312,25 +312,30 @@ impl RocksDbStore {
             );
         }
 
-        // tx_index.complete marker — round-3 H1.
+        // tx_index.complete marker — round-3 H1, refined in round-4
+        // H1 to a one-way invalidation flag.
         //
-        // Recomputed on every open from actual on-disk state rather
-        // than trusting a previously-stamped value. The marker is
-        // diagnostic only (driven by the open-time check below); a
-        // stamped-true value would fool the Esplora startup gate
-        // when the operator runs `--esplora=0 --txindex=0` for a
-        // few sessions and then re-enables Esplora.
+        // Trust the persisted value once stamped. The previous
+        // round's "recompute on every open" logic interpreted
+        // "tx_index CF has any rows" as complete, which silently
+        // re-flipped the marker to true after a partial-txindex run
+        // (e.g. legacy empty + one txindex-on block + Esplora restart
+        // would let stale historical 404s through). The corrected
+        // contract:
         //
-        //   complete = (no blocks yet) || (tx_index CF has any rows)
-        //
-        // The "no blocks" branch covers fresh datadirs. The "any
-        // rows" branch covers from-genesis-with-txindex syncs (and
-        // post-`--reindex-chainstate` re-population, where
-        // connect_block restores rows alongside block_index).
-        // The complementary case — block_index populated but
-        // tx_index empty — is the upgrade-from-`--txindex=0`
-        // gap, which Esplora must refuse to start over.
-        {
+        //   - Fresh datadir (no `block_index` rows yet) → stamp true.
+        //     No history to be missing.
+        //   - Legacy datadir without the marker (block_index has
+        //     rows but the flag was never written) → stamp false.
+        //     Esplora must refuse until `--reindex-chainstate`.
+        //     This is conservative — even legitimate
+        //     full-txindex-from-genesis datadirs see a one-time
+        //     reindex prompt — but the alternative was to silently
+        //     accept partial histories.
+        //   - Marker already present → don't touch it. `clear_*`
+        //     paths re-stamp true; `connect_block` paths stamp
+        //     false in `write_batch_mode` when txindex is disabled.
+        if store.read_tx_index_complete().is_none() {
             let block_index_has_rows = store
                 .db
                 .cf_handle(CF_BLOCK_INDEX)
@@ -342,19 +347,7 @@ impl RocksDbStore {
                         .map(|item| item.is_ok())
                 })
                 .unwrap_or(false);
-            let tx_index_has_rows = store
-                .db
-                .cf_handle(CF_TX_INDEX)
-                .and_then(|cf| {
-                    store
-                        .db
-                        .iterator_cf(&cf, IteratorMode::Start)
-                        .next()
-                        .map(|item| item.is_ok())
-                })
-                .unwrap_or(false);
-            let complete = !block_index_has_rows || tx_index_has_rows;
-            store.write_tx_index_complete(complete)?;
+            store.write_tx_index_complete(!block_index_has_rows)?;
         }
         if txindex && !store.tx_index_complete() {
             tracing::warn!(
@@ -560,6 +553,25 @@ impl Store for RocksDbStore {
         let cf_hi = self.cf(CF_HEIGHT_INDEX);
         let cf_undo = self.cf(CF_UNDO);
         let cf_meta = self.cf(CF_METADATA);
+
+        // tx_index.complete one-way invalidation (round-4 H1).
+        //
+        // If the runtime has txindex disabled but this batch is
+        // connecting/reorging blocks (any coin movement), the
+        // tx_index CF will not get the rows for those blocks. Stamp
+        // the completeness marker false IN THE SAME `WriteBatch` as
+        // the chainstate update so the invalidation is atomic with
+        // the connect — a crash mid-write either rolls everything
+        // back or commits both. `coin_puts` is the connect signal
+        // (every connected non-empty block creates outputs);
+        // `coin_removes` covers the disconnect-with-txindex-off case
+        // where existing tx_index rows for the now-undone block
+        // become stale.
+        if !self.txindex_enabled
+            && (!batch.coin_puts.is_empty() || !batch.coin_removes.is_empty())
+        {
+            wb.put_cf(&cf_meta, TX_INDEX_COMPLETE_KEY, [0u8]);
+        }
 
         // Block index
         for (hash, entry) in &batch.block_index_puts {

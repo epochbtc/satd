@@ -6117,6 +6117,164 @@ fn test_esplora_refuses_legacy_txindex_incomplete_datadir() {
     );
 }
 
+/// Round-4 H1: a partial-history datadir (legacy empty
+/// `tx_index` plus a single later block mined with `--txindex=1`)
+/// must still be refused by the Esplora startup gate. The earlier
+/// "any rows means complete" heuristic incorrectly accepted this
+/// case.
+#[test]
+fn test_esplora_refuses_partial_txindex_history() {
+    use std::process::Command;
+    let satd_bin = env!("CARGO_BIN_EXE_satd");
+    let datadir =
+        std::env::temp_dir().join(format!("satd-partial-txi-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&datadir);
+    let _ = std::fs::create_dir_all(&datadir);
+
+    // Phase 1: legacy sync with --esplora=0 --txindex=0. tx_index
+    // stays empty; the marker is invalidated to false on first
+    // block-connect under txindex=off.
+    let rpcport1 = find_available_port();
+    let p2p_port1 = find_available_port();
+    let mut node1 = TestNode::start_with_datadir(
+        &datadir,
+        rpcport1,
+        &["--esplora=0", &format!("--port={}", p2p_port1)],
+    );
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let _ = node1
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(2), serde_json::json!(addr)],
+        )
+        .expect("rpc");
+    node1.stop();
+
+    // Phase 2: enable --txindex=1 (still --esplora=0). This writes
+    // ONE block's tx_index rows on top of the empty CF, but doesn't
+    // change the marker (it's stamped false from phase 1).
+    let rpcport2 = find_available_port();
+    let p2p_port2 = find_available_port();
+    let mut node2 = TestNode::start_with_datadir(
+        &datadir,
+        rpcport2,
+        &[
+            "--esplora=0",
+            "--txindex",
+            &format!("--port={}", p2p_port2),
+        ],
+    );
+    let _ = node2
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(1), serde_json::json!(addr)],
+        )
+        .expect("rpc");
+    node2.stop();
+
+    // Phase 3: default startup (esplora on). Marker is still false
+    // — the "any rows" heuristic would have accepted this, but the
+    // round-4 fix keeps the marker one-way.
+    let rpcport3 = find_available_port();
+    let p2p_port3 = find_available_port();
+    let esplora_port = find_available_port();
+    let out = Command::new(satd_bin)
+        .arg("--regtest")
+        .arg(format!("--datadir={}", datadir.display()))
+        .arg(format!("--rpcport={}", rpcport3))
+        .arg(format!("--port={}", p2p_port3))
+        .arg(format!("--esplorabind=127.0.0.1:{}", esplora_port))
+        .output()
+        .expect("spawn satd");
+    assert!(
+        !out.status.success(),
+        "expected non-zero exit; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("tx_index") && stderr.contains("incomplete"),
+        "expected incomplete diag in stderr; got: {stderr}"
+    );
+}
+
+/// Round-4 H1: a fully-indexed datadir, then one block connected
+/// with `--txindex=0`, must invalidate the marker so Esplora
+/// refuses to start without a reindex. (Inverse direction of
+/// `test_esplora_refuses_partial_txindex_history`.)
+#[test]
+fn test_esplora_refuses_after_txindex_disabled_gap() {
+    use std::process::Command;
+    let satd_bin = env!("CARGO_BIN_EXE_satd");
+    let datadir =
+        std::env::temp_dir().join(format!("satd-disabled-gap-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&datadir);
+    let _ = std::fs::create_dir_all(&datadir);
+
+    // Phase 1: full sync with --esplora=0 --txindex=1. Marker stays
+    // true after open (fresh datadir); blocks land with their
+    // tx_index rows. No invalidation fires (txindex enabled).
+    let rpcport1 = find_available_port();
+    let p2p_port1 = find_available_port();
+    let mut node1 = TestNode::start_with_datadir(
+        &datadir,
+        rpcport1,
+        &[
+            "--esplora=0",
+            "--txindex",
+            &format!("--port={}", p2p_port1),
+        ],
+    );
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let _ = node1
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(2), serde_json::json!(addr)],
+        )
+        .expect("rpc");
+    node1.stop();
+
+    // Phase 2: connect ONE more block with --txindex=0. This MUST
+    // flip the marker to false via the connect-time invalidation.
+    let rpcport2 = find_available_port();
+    let p2p_port2 = find_available_port();
+    let mut node2 = TestNode::start_with_datadir(
+        &datadir,
+        rpcport2,
+        &["--esplora=0", &format!("--port={}", p2p_port2)],
+    );
+    let _ = node2
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(1), serde_json::json!(addr)],
+        )
+        .expect("rpc");
+    node2.stop();
+
+    // Phase 3: default startup must hard-fail now.
+    let rpcport3 = find_available_port();
+    let p2p_port3 = find_available_port();
+    let esplora_port = find_available_port();
+    let out = Command::new(satd_bin)
+        .arg("--regtest")
+        .arg(format!("--datadir={}", datadir.display()))
+        .arg(format!("--rpcport={}", rpcport3))
+        .arg(format!("--port={}", p2p_port3))
+        .arg(format!("--esplorabind=127.0.0.1:{}", esplora_port))
+        .output()
+        .expect("spawn satd");
+    assert!(
+        !out.status.success(),
+        "expected non-zero exit; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("tx_index") && stderr.contains("incomplete"),
+        "expected incomplete diag in stderr; got: {stderr}"
+    );
+}
+
 /// Round-3 M1: `--txindex` on the CLI overrides `txindex=0` in the
 /// config file. (Without this fix, the operator's CLI override is
 /// silently ignored and the daemon hard-fails.)
