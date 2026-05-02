@@ -2707,14 +2707,32 @@ fn test_reorg_record_reflects_completed_state() {
     //     fork-disconnect point
     //   - the actual reconnected side-chain hashes, not an empty list
     //   - the actual disconnected hashes
-    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    //
+    // Distinct A/B coinbase addresses so the two chains have different
+    // block hashes from height 1 — same address + same template time +
+    // nonce 0 produces identical blocks deterministically, in which
+    // case submitblock returns "duplicate" and no reorg occurs. Same
+    // pattern documented on test_address_index_backfill_reorg_invalidates_to_failed.
+    use bitcoin::WitnessProgram;
+    use bitcoin::WitnessVersion;
+    use bitcoin::secp256k1::{Secp256k1, SecretKey};
+    use bitcoin::{Address, Network, PublicKey};
+    let addr_a = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let secp = Secp256k1::new();
+    let sk_b = SecretKey::from_slice(&[0x33u8; 32]).unwrap();
+    let pk_b = PublicKey::new(sk_b.public_key(&secp));
+    use bitcoin::hashes::Hash as _;
+    let pkh_b = bitcoin::hashes::hash160::Hash::hash(&pk_b.to_bytes());
+    let prog_b = WitnessProgram::new(WitnessVersion::V0, pkh_b.as_byte_array()).unwrap();
+    let addr_b_str = Address::from_witness_program(prog_b, Network::Regtest).to_string();
+    let addr_b = addr_b_str.as_str();
 
     // Node A: mine a short chain of 2 blocks.
     let mut node_a = TestNode::start(&[]);
     let gen_a = node_a
         .rpc_call_with_params(
             "generatetoaddress",
-            vec![serde_json::json!(2), serde_json::json!(addr)],
+            vec![serde_json::json!(2), serde_json::json!(addr_a)],
         )
         .unwrap();
     let a_hashes: Vec<String> = gen_a["result"]
@@ -2731,7 +2749,7 @@ fn test_reorg_record_reflects_completed_state() {
     let gen_b = node_b
         .rpc_call_with_params(
             "generatetoaddress",
-            vec![serde_json::json!(3), serde_json::json!(addr)],
+            vec![serde_json::json!(3), serde_json::json!(addr_b)],
         )
         .unwrap();
     let b_hashes: Vec<String> = gen_b["result"]
@@ -2831,14 +2849,31 @@ fn test_reorg_record_not_written_when_final_block_fails() {
     use bitcoin::hashes::Hash;
     use bitcoin::{Amount, Block, Transaction};
 
-    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    // Distinct A/B coinbase addresses so the two chains have different
+    // block hashes from height 1. Without this, regtest's deterministic
+    // mining (same address + same template time + nonce 0) makes the
+    // first two B blocks duplicates of A's, which silently bypasses the
+    // side-chain reorg path entirely — turning this test into a false
+    // positive (no record IS written, but for the wrong reason).
+    use bitcoin::WitnessProgram;
+    use bitcoin::WitnessVersion;
+    use bitcoin::secp256k1::{Secp256k1, SecretKey};
+    use bitcoin::{Address, Network, PublicKey};
+    let addr_a = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let secp = Secp256k1::new();
+    let sk_b = SecretKey::from_slice(&[0x33u8; 32]).unwrap();
+    let pk_b = PublicKey::new(sk_b.public_key(&secp));
+    let pkh_b = bitcoin::hashes::hash160::Hash::hash(&pk_b.to_bytes());
+    let prog_b = WitnessProgram::new(WitnessVersion::V0, pkh_b.as_byte_array()).unwrap();
+    let addr_b_str = Address::from_witness_program(prog_b, Network::Regtest).to_string();
+    let addr_b = addr_b_str.as_str();
 
     // Node A: short chain of 2 blocks.
     let mut node_a = TestNode::start(&[]);
     let gen_a = node_a
         .rpc_call_with_params(
             "generatetoaddress",
-            vec![serde_json::json!(2), serde_json::json!(addr)],
+            vec![serde_json::json!(2), serde_json::json!(addr_a)],
         )
         .unwrap();
     let a_hashes: Vec<String> = gen_a["result"]
@@ -2854,7 +2889,7 @@ fn test_reorg_record_not_written_when_final_block_fails() {
     let gen_b = node_b
         .rpc_call_with_params(
             "generatetoaddress",
-            vec![serde_json::json!(3), serde_json::json!(addr)],
+            vec![serde_json::json!(3), serde_json::json!(addr_b)],
         )
         .unwrap();
     let b_hashes: Vec<String> = gen_b["result"]
