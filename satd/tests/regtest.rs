@@ -6057,6 +6057,119 @@ fn test_esplora_default_startup_auto_enables_txindex() {
     assert!(ready, "esplora listener didn't come up under default startup");
 }
 
+/// Round-3 H1: an upgraded datadir (synced previously with
+/// `--txindex=0`) that now starts with default Esplora settings
+/// must NOT silently come up — it would false-404 historical txs.
+/// This test simulates the upgrade by:
+/// 1. Mining blocks with `--esplora=0` (so txindex stays at default off).
+/// 2. Restarting with default settings (esplora auto-enables txindex).
+/// 3. Asserting startup fails with a clear "incomplete" message.
+#[test]
+fn test_esplora_refuses_legacy_txindex_incomplete_datadir() {
+    use std::process::Command;
+    let satd_bin = env!("CARGO_BIN_EXE_satd");
+    let datadir = std::env::temp_dir().join(format!("satd-legacy-txi-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&datadir);
+    let _ = std::fs::create_dir_all(&datadir);
+
+    // Phase 1: sync with --esplora=0 (no txindex implication, no
+    // tx_index rows written).
+    let rpcport1 = find_available_port();
+    let p2p_port1 = find_available_port();
+    let mut node1 = TestNode::start_with_datadir(
+        &datadir,
+        rpcport1,
+        &["--esplora=0", &format!("--port={}", p2p_port1)],
+    );
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let _ = node1
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(2), serde_json::json!(addr)],
+        )
+        .expect("rpc");
+    node1.stop();
+
+    // Phase 2: restart with default settings — esplora auto-enables
+    // txindex, but the CF is empty for historical rows. Startup
+    // must hard-fail.
+    let rpcport2 = find_available_port();
+    let p2p_port2 = find_available_port();
+    let esplora_port = find_available_port();
+    let out = Command::new(satd_bin)
+        .arg("--regtest")
+        .arg(format!("--datadir={}", datadir.display()))
+        .arg(format!("--rpcport={}", rpcport2))
+        .arg(format!("--port={}", p2p_port2))
+        .arg(format!("--esplorabind=127.0.0.1:{}", esplora_port))
+        .output()
+        .expect("spawn satd");
+    assert!(!out.status.success(), "expected non-zero exit; stderr: {}",
+            String::from_utf8_lossy(&out.stderr));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("tx_index") && stderr.contains("incomplete"),
+        "expected tx_index incomplete diag in stderr; got: {stderr}"
+    );
+    assert!(
+        stderr.contains("--reindex-chainstate"),
+        "expected reindex hint in stderr; got: {stderr}"
+    );
+}
+
+/// Round-3 M1: `--txindex` on the CLI overrides `txindex=0` in the
+/// config file. (Without this fix, the operator's CLI override is
+/// silently ignored and the daemon hard-fails.)
+#[test]
+fn test_esplora_cli_txindex_overrides_config_disable() {
+    use std::process::Command;
+    use std::time::Instant;
+    let satd_bin = env!("CARGO_BIN_EXE_satd");
+    let rpcport = find_available_port();
+    let p2p_port = find_available_port();
+    let esplora_port = find_available_port();
+    let datadir = std::env::temp_dir().join(format!("satd-cli-override-{}", rpcport));
+    let _ = std::fs::create_dir_all(&datadir);
+    // Plant txindex=0 in the config file.
+    std::fs::write(datadir.join("bitcoin.conf"), "txindex=0\n").unwrap();
+
+    // CLI --txindex must win over the config-file disable.
+    let mut child = Command::new(satd_bin)
+        .arg("--regtest")
+        .arg(format!("--datadir={}", datadir.display()))
+        .arg(format!("--rpcport={}", rpcport))
+        .arg(format!("--port={}", p2p_port))
+        .arg("--esplora=1")
+        .arg("--txindex")
+        .arg(format!("--esplorabind=127.0.0.1:{}", esplora_port))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn satd");
+
+    // Wait briefly for the listener — proves startup succeeded.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut ready = false;
+    while Instant::now() < deadline {
+        if reqwest::blocking::Client::new()
+            .get(format!("http://127.0.0.1:{}/blocks/tip/height", esplora_port))
+            .timeout(Duration::from_millis(500))
+            .send()
+            .is_ok_and(|r| r.status().is_success())
+        {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(
+        ready,
+        "esplora listener didn't come up; CLI --txindex must override config txindex=0"
+    );
+}
+
 /// Explicit `txindex=0` in the config file with `--esplora=1`
 /// remains a hard-fail — the operator made an irreconcilable
 /// choice. (Review-2 H3, contrast.)

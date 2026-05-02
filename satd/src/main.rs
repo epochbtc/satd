@@ -27,7 +27,7 @@ use std::sync::Arc;
 async fn main() {
     // Config must be parsed before tracing init so --log-format can select
     // the formatter. Config parse errors go to stderr as plain text.
-    let config = match Config::load() {
+    let mut config = match Config::load() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Error: {}", e);
@@ -50,6 +50,17 @@ async fn main() {
         }
         config::LogFormat::Text => {
             tracing_subscriber::fmt().with_env_filter(env_filter).init();
+        }
+    }
+
+    // Drain config-load notes (Esplora ↔ txindex reconciliation,
+    // prune auto-disable). These were collected before tracing was
+    // initialized; emit them now so the operator can see them
+    // (round-3 M2).
+    for note in config.take_pending_notes() {
+        match note.level {
+            config::NoteLevel::Info => tracing::info!("{}", note.message),
+            config::NoteLevel::Warn => tracing::warn!("{}", note.message),
         }
     }
 
@@ -779,6 +790,25 @@ async fn main() {
                 config.txindex,
                 "config invariant: esplora=true must imply txindex=true after Config::load"
             );
+            // Round-3 H1: txindex completeness check.
+            //
+            // The runtime flag tells us txindex is enabled, but the
+            // CF could be partially populated from a previous
+            // `--txindex=0` run. With Esplora on, that produces
+            // false 404s for historical confirmed txs — exactly the
+            // failure mode round-1's H3 hard-fail was designed to
+            // prevent. Refuse to start the listener and tell the
+            // operator how to fix.
+            if !chain_state.store_ref().tx_index_complete() {
+                eprintln!(
+                    "Error: esplora is enabled and --txindex=1, but the on-disk tx_index \n\
+                     CF is incomplete (this datadir was previously synced with \n\
+                     --txindex=0). Restart with --reindex-chainstate to populate \n\
+                     historical rows, or set --esplora=0 to skip the tx-endpoint surface."
+                );
+                auth.cleanup();
+                std::process::exit(1);
+            }
             let bind: SocketAddr = config
                 .esplora_bind
                 .parse()

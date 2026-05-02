@@ -285,6 +285,15 @@ pub trait Store: Send + Sync {
         Ok(())
     }
 
+    /// True when the `tx_index` CF is fully populated for every tx
+    /// on the active chain. Round-3 H1: required for Esplora's tx
+    /// endpoints to give correct answers. False on upgraded
+    /// datadirs that previously ran with `--txindex=0`. Default:
+    /// `true` for non-Rocks backends.
+    fn tx_index_complete(&self) -> bool {
+        true
+    }
+
     /// Lazily create the deferred-backfill temp CF
     /// (`addr_backfill_outpoint_to_scripthash`). Idempotent: succeeds if
     /// the CF already exists. Default: error so non-Rocks backends fail
