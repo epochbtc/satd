@@ -5404,6 +5404,110 @@ fn test_esplora_disabled_does_not_listen() {
     node.stop();
 }
 
+/// `--esploraprefix=/api` mounts every route under that prefix. The
+/// unprefixed paths must 404, and the prefixed paths must serve.
+/// (Review H2.)
+#[test]
+fn test_esplora_prefix_mounts_under_path() {
+    let esplora_port = find_available_port();
+    let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
+    let mut node = TestNode::start(&[
+        "--esplora=1",
+        &bind,
+        "--esploraprefix=/api",
+    ]);
+
+    let with_prefix = esplora_get(esplora_port, "/api/blocks/tip/height");
+    assert_eq!(with_prefix.status(), 200);
+    assert!(
+        with_prefix
+            .text()
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .is_ok()
+    );
+
+    let without_prefix = esplora_get(esplora_port, "/blocks/tip/height");
+    assert_eq!(
+        without_prefix.status(),
+        404,
+        "unprefixed path must 404 when --esploraprefix=/api"
+    );
+    node.stop();
+}
+
+/// `--esploraauth=cookie --esploracookiefile=<missing>` must fail
+/// daemon startup, NOT silently start an unauthenticated listener.
+/// (Review H1.)
+#[test]
+fn test_esplora_missing_cookie_file_fails_startup() {
+    use std::process::Command;
+    let satd_bin = env!("CARGO_BIN_EXE_satd");
+    let rpcport = find_available_port();
+    let p2p_port = find_available_port();
+    let esplora_port = find_available_port();
+    let datadir = std::env::temp_dir().join(format!("satd-esplora-bad-cookie-{}", rpcport));
+    let _ = std::fs::create_dir_all(&datadir);
+    let missing = datadir.join("definitely-not-a-cookie");
+
+    let out = Command::new(satd_bin)
+        .arg("--regtest")
+        .arg(format!("--datadir={}", datadir.display()))
+        .arg(format!("--rpcport={}", rpcport))
+        .arg(format!("--port={}", p2p_port))
+        .arg("--esplora=1")
+        // PR #102 adds H3 (esplora requires --txindex=1); pass it so
+        // this PR's check (auth init) is the failure that fires.
+        .arg("--txindex")
+        .arg(format!("--esplorabind=127.0.0.1:{}", esplora_port))
+        .arg("--esploraauth=cookie")
+        .arg(format!("--esploracookiefile={}", missing.display()))
+        .output()
+        .expect("spawn satd");
+    assert!(!out.status.success(), "expected non-zero exit");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("esplora startup failed") || stderr.contains("auth init failed"),
+        "expected esplora auth failure in stderr; got: {stderr}"
+    );
+}
+
+/// Esplora bind to an already-taken port must fail daemon startup,
+/// not silently log a warning. (Review H4.)
+#[test]
+fn test_esplora_port_conflict_fails_startup() {
+    use std::net::TcpListener;
+    use std::process::Command;
+    let satd_bin = env!("CARGO_BIN_EXE_satd");
+    // Squat the port so satd can't bind it. Hold the listener for the
+    // lifetime of the satd process.
+    let squatter = TcpListener::bind("127.0.0.1:0").expect("squatter bind");
+    let occupied = squatter.local_addr().unwrap().port();
+    let rpcport = find_available_port();
+    let p2p_port = find_available_port();
+    let datadir = std::env::temp_dir().join(format!("satd-esplora-port-{}", rpcport));
+    let _ = std::fs::create_dir_all(&datadir);
+
+    let out = Command::new(satd_bin)
+        .arg("--regtest")
+        .arg(format!("--datadir={}", datadir.display()))
+        .arg(format!("--rpcport={}", rpcport))
+        .arg(format!("--port={}", p2p_port))
+        .arg("--esplora=1")
+        .arg("--txindex") // see note in test_esplora_missing_cookie_file_fails_startup
+        .arg(format!("--esplorabind=127.0.0.1:{}", occupied))
+        .output()
+        .expect("spawn satd");
+    drop(squatter);
+    assert!(!out.status.success(), "expected non-zero exit");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("could not bind"),
+        "expected bind failure in stderr; got: {stderr}"
+    );
+}
+
 /// Cookie auth: when `--esploraauth=cookie`, requests without the
 /// Authorization header get 401, and cookie-authenticated requests
 /// succeed.

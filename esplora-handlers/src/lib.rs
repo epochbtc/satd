@@ -23,5 +23,5 @@ pub mod state;
 
 pub use config::{EsploraAuth, EsploraConfig};
 pub use error::EsploraError;
-pub use router::build_router;
+pub use router::{RouterBuildError, build_router};
 pub use state::EsploraState;

@@ -759,7 +759,10 @@ async fn main() {
 
     // Start the Esplora REST server if enabled. Refuses to bind when
     // `--addressindex=0` so operators don't end up with an HTTP
-    // surface that 503's every read-side endpoint.
+    // surface that 503's every read-side endpoint. Auth init failure,
+    // CORS validation failure, and bind failure are ALL fatal here —
+    // an operator who explicitly enabled Esplora must not see the
+    // daemon come up "successfully" without the listener (review H1, H4).
     if config.esplora {
         if !config.addressindex {
             tracing::warn!(
@@ -817,17 +820,33 @@ async fn main() {
                 network: config.network,
                 config: Arc::new(esplora_cfg),
             };
-            let router = esplora_handlers::build_router(state);
+            // Auth/CORS/prefix validation surfaces here. A misconfigured
+            // auth scheme is a user-visible exit, not a silent fall-back
+            // to no-auth (review H1, L2).
+            let router = match esplora_handlers::build_router(state) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("Error: esplora startup failed: {e}");
+                    auth.cleanup();
+                    std::process::exit(1);
+                }
+            };
+            // Bind synchronously so a port conflict / permissions error
+            // becomes a daemon startup failure rather than a logged
+            // warning in a detached task (review H4).
+            let listener = match tokio::net::TcpListener::bind(bind).await {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!(
+                        "Error: esplora listener could not bind to {bind}: {e}"
+                    );
+                    auth.cleanup();
+                    std::process::exit(1);
+                }
+            };
+            tracing::info!(%bind, "Esplora REST listening");
             let mut esplora_shutdown = shutdown_rx.clone();
             tokio::spawn(async move {
-                let listener = match tokio::net::TcpListener::bind(bind).await {
-                    Ok(l) => l,
-                    Err(e) => {
-                        tracing::error!(%bind, error = %e, "esplora listener bind failed");
-                        return;
-                    }
-                };
-                tracing::info!(%bind, "Esplora REST listening");
                 let serve = axum::serve(listener, router).with_graceful_shutdown(async move {
                     let _ = esplora_shutdown.changed().await;
                 });

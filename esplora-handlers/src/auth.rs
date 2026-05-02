@@ -56,9 +56,16 @@ impl AuthExpectation {
         let Some(hdr) = header else {
             return false;
         };
-        let Some(encoded) = hdr.strip_prefix("Basic ") else {
+        // RFC 7235: scheme tokens are case-insensitive (review L1).
+        let trimmed = hdr.trim_start();
+        let scheme_end = trimmed
+            .find(char::is_whitespace)
+            .unwrap_or(trimmed.len());
+        let (scheme, rest) = trimmed.split_at(scheme_end);
+        if !scheme.eq_ignore_ascii_case("Basic") {
             return false;
-        };
+        }
+        let encoded = rest.trim_start();
         let Ok(decoded) = BASE64.decode(encoded) else {
             return false;
         };
@@ -68,8 +75,29 @@ impl AuthExpectation {
         let Some((user, pass)) = decoded_str.split_once(':') else {
             return false;
         };
-        user == expected.0 && pass == expected.1
+        // Constant-time compare so an attacker probing credentials over
+        // a slow link can't reliably learn prefix-match length from
+        // server timing (review L1).
+        constant_time_eq(user.as_bytes(), expected.0.as_bytes())
+            & constant_time_eq(pass.as_bytes(), expected.1.as_bytes())
     }
+}
+
+/// Length-then-byte-XOR equality check. Returns false on length
+/// mismatch (so length leakage is preserved — that's a design
+/// trade-off; an attacker who already knows the length learns nothing
+/// more from this code path). Returns the AND of XORs across all
+/// bytes so the loop runs to completion regardless of the first
+/// mismatch.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// Axum middleware function. Wired only when auth is enabled.
@@ -143,5 +171,26 @@ mod tests {
             password: "secret".into(),
         };
         assert!(!exp.check(Some("Bearer xyz")));
+    }
+
+    #[test]
+    fn test_check_userpass_basic_scheme_case_insensitive() {
+        let exp = AuthExpectation::UserPass {
+            username: "alice".into(),
+            password: "secret".into(),
+        };
+        let header = format!("basic {}", BASE64.encode("alice:secret"));
+        assert!(exp.check(Some(&header)));
+        let header2 = format!("BASIC {}", BASE64.encode("alice:secret"));
+        assert!(exp.check(Some(&header2)));
+    }
+
+    #[test]
+    fn test_constant_time_eq_correctness() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"ab"));
+        assert!(!constant_time_eq(b"", b"a"));
+        assert!(constant_time_eq(b"", b""));
     }
 }
