@@ -387,6 +387,26 @@ pub struct Config {
     pub server: bool,
     #[allow(dead_code)]
     pub daemon: bool,
+    /// Operator-facing notes produced during config reconciliation.
+    /// Emitted by `main.rs` AFTER the tracing subscriber is
+    /// initialized — `Config::from_cli` runs before `tracing` is set
+    /// up, so logging from inside the resolver would silently disappear
+    /// (round-3 M2). Consumed once by `take_pending_notes`.
+    pub pending_notes: Vec<ConfigNote>,
+}
+
+/// A deferred operator-facing note emitted during config load. Its
+/// `level` selects the tracing macro in `main.rs`.
+#[derive(Debug, Clone)]
+pub struct ConfigNote {
+    pub level: NoteLevel,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum NoteLevel {
+    Info,
+    Warn,
 }
 
 impl Config {
@@ -557,8 +577,21 @@ impl Config {
             .or_else(|| file_get("permitbaremultisig").and_then(|v| parse_bool(&v)))
             .unwrap_or(true);
 
-        let txindex = cli.txindex
-            || file_get("txindex").and_then(|v| parse_bool(&v)).unwrap_or(false)
+        // Track whether txindex was explicitly disabled via the
+        // config file (CLI can't express that; it's a `bool` flag).
+        // The Esplora auto-implication below honors an explicit
+        // disable and refuses to silently override the operator.
+        //
+        // CLI > config-file precedence (round-3 M1): if the operator
+        // passes `--txindex` on the command line, that wins even when
+        // an old `txindex=0` line is sitting in the config file.
+        // Without this, the Esplora hard-fail below would refuse to
+        // start despite the operator's clear intent.
+        let txindex_file = file_get("txindex").and_then(|v| parse_bool(&v));
+        let txindex_explicitly_disabled =
+            !cli.txindex && matches!(txindex_file, Some(false));
+        let mut txindex = cli.txindex
+            || matches!(txindex_file, Some(true))
             || profile_defaults.txindex.unwrap_or(false);
 
         // Address-history index: on by default. CLI `--addressindex=0`,
@@ -646,7 +679,56 @@ impl Config {
             .or(profile_defaults.prune)
             .unwrap_or(0); // 0 = no pruning
 
-        // Validate prune + txindex conflict
+        // Esplora ↔ txindex coupling (review-2 H3, round-3 M2).
+        //
+        // Esplora's tx + outspend endpoints depend on txindex. Rather
+        // than failing default startup (which the round-1 H3 hard-fail
+        // did), reconcile the two flags here:
+        //
+        //   - prune > 0 + esplora: txindex can't run alongside prune,
+        //     so auto-disable Esplora with a warning.
+        //   - esplora && !txindex && config didn't explicitly disable
+        //     txindex: auto-enable txindex.
+        //   - esplora && txindex_explicitly_disabled: hard-fail; the
+        //     two flags conflict and the operator made the call.
+        //
+        // Notes collected here are emitted by `main.rs` after the
+        // tracing subscriber is initialized — Config::from_cli runs
+        // before `tracing_subscriber::fmt()...init()` (because
+        // --log-format selects the formatter), so direct
+        // `tracing::warn!` calls would silently drop on the floor.
+        let mut pending_notes: Vec<ConfigNote> = Vec::new();
+        let mut esplora_resolved = esplora;
+        if esplora_resolved && prune > 0 {
+            pending_notes.push(ConfigNote {
+                level: NoteLevel::Warn,
+                message: format!(
+                    "esplora requires --txindex, which is incompatible with --prune={prune}; \
+                     disabling esplora. Set --esplora=0 explicitly to silence this warning."
+                ),
+            });
+            esplora_resolved = false;
+        } else if esplora_resolved && !txindex && !txindex_explicitly_disabled {
+            pending_notes.push(ConfigNote {
+                level: NoteLevel::Info,
+                message:
+                    "esplora is enabled; auto-enabling --txindex (required for tx endpoints)"
+                        .to_string(),
+            });
+            txindex = true;
+        } else if esplora_resolved && txindex_explicitly_disabled {
+            return Err(
+                "esplora=1 with txindex=0 in config: refusing to start. \
+                 Either remove the txindex=0 line or set esplora=0, \
+                 or pass --txindex on the CLI to override the config."
+                    .into(),
+            );
+        }
+        let esplora = esplora_resolved;
+
+        // Validate prune + txindex conflict (now redundant with the
+        // esplora reconciliation above for the esplora=1 path, but
+        // still catches the operator who explicitly enables both).
         if prune > 0 && txindex {
             return Err("prune mode is incompatible with -txindex".to_string());
         }
@@ -855,7 +937,17 @@ impl Config {
             reorg_webhook_secret: cli
                 .reorg_webhook_secret
                 .or_else(|| file_get("reorgwebhooksecret")),
+            pending_notes,
         })
+    }
+
+    /// Drain operator-facing notes that the resolver collected before
+    /// tracing was initialized. Called by `main.rs` immediately after
+    /// the subscriber starts so the messages reach the same log stream
+    /// as the rest of the daemon. Idempotent — second call returns an
+    /// empty vec.
+    pub fn take_pending_notes(&mut self) -> Vec<ConfigNote> {
+        std::mem::take(&mut self.pending_notes)
     }
 
     /// Serialize a privacy-safe view of the current config for `getconfig`.

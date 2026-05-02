@@ -54,6 +54,14 @@ const SCHEMA_KEY: &[u8] = b"schema_version";
 /// false so subsequent restarts continue to surface the gap even
 /// after live `connect_block` has appended new rows. (Review H6.)
 const OUTPOINT_SPEND_COMPLETE_KEY: &[u8] = b"outpoint_spend.complete";
+/// `tx_index.complete` metadata flag — symmetric to
+/// `outpoint_spend.complete` but for the `tx_index` CF that backs
+/// `getrawtransaction` / `gettxlocation` and Esplora's `/tx/:txid`
+/// confirmed-side lookup. Stamped true on fresh datadir, on
+/// `clear_chainstate` / `clear_all`. False when an upgraded datadir
+/// has historical block-index entries but the tx_index CF is empty
+/// (the operator previously ran with `txindex=0`). (Round-3 H1.)
+const TX_INDEX_COMPLETE_KEY: &[u8] = b"tx_index.complete";
 const CURRENT_SCHEMA_VERSION: u32 = 2; // v2 = compact varint coins
 
 fn hash_bytes(hash: &BlockHash) -> &[u8] {
@@ -303,6 +311,53 @@ impl RocksDbStore {
                  after upgrade from a satd version that predates this index)"
             );
         }
+
+        // tx_index.complete marker — round-3 H1, refined in round-4
+        // H1 to a one-way invalidation flag.
+        //
+        // Trust the persisted value once stamped. The previous
+        // round's "recompute on every open" logic interpreted
+        // "tx_index CF has any rows" as complete, which silently
+        // re-flipped the marker to true after a partial-txindex run
+        // (e.g. legacy empty + one txindex-on block + Esplora restart
+        // would let stale historical 404s through). The corrected
+        // contract:
+        //
+        //   - Fresh datadir (no `block_index` rows yet) → stamp true.
+        //     No history to be missing.
+        //   - Legacy datadir without the marker (block_index has
+        //     rows but the flag was never written) → stamp false.
+        //     Esplora must refuse until `--reindex-chainstate`.
+        //     This is conservative — even legitimate
+        //     full-txindex-from-genesis datadirs see a one-time
+        //     reindex prompt — but the alternative was to silently
+        //     accept partial histories.
+        //   - Marker already present → don't touch it. `clear_*`
+        //     paths re-stamp true; `connect_block` paths stamp
+        //     false in `write_batch_mode` when txindex is disabled.
+        if store.read_tx_index_complete().is_none() {
+            let block_index_has_rows = store
+                .db
+                .cf_handle(CF_BLOCK_INDEX)
+                .and_then(|cf| {
+                    store
+                        .db
+                        .iterator_cf(&cf, IteratorMode::Start)
+                        .next()
+                        .map(|item| item.is_ok())
+                })
+                .unwrap_or(false);
+            store.write_tx_index_complete(!block_index_has_rows)?;
+        }
+        if txindex && !store.tx_index_complete() {
+            tracing::warn!(
+                target: "storage",
+                "tx_index CF is enabled but on-disk data is incomplete (this datadir was \
+                 previously synced with --txindex=0). Confirmed /tx/:txid lookups will \
+                 false-404 historical transactions until you restart with \
+                 --reindex-chainstate."
+            );
+        }
         Ok(store)
     }
 
@@ -324,6 +379,24 @@ impl RocksDbStore {
             .ok_or_else(|| StoreError::Database("metadata CF missing".into()))?;
         self.db
             .put_cf(&cf, OUTPOINT_SPEND_COMPLETE_KEY, [u8::from(value)])
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    fn read_tx_index_complete(&self) -> Option<bool> {
+        let cf = self.db.cf_handle(CF_METADATA)?;
+        match self.db.get_cf(&cf, TX_INDEX_COMPLETE_KEY) {
+            Ok(Some(v)) => v.first().map(|b| *b != 0),
+            _ => None,
+        }
+    }
+
+    fn write_tx_index_complete(&self, value: bool) -> Result<(), StoreError> {
+        let cf = self
+            .db
+            .cf_handle(CF_METADATA)
+            .ok_or_else(|| StoreError::Database("metadata CF missing".into()))?;
+        self.db
+            .put_cf(&cf, TX_INDEX_COMPLETE_KEY, [u8::from(value)])
             .map_err(|e| StoreError::Database(e.to_string()))
     }
 
@@ -480,6 +553,25 @@ impl Store for RocksDbStore {
         let cf_hi = self.cf(CF_HEIGHT_INDEX);
         let cf_undo = self.cf(CF_UNDO);
         let cf_meta = self.cf(CF_METADATA);
+
+        // tx_index.complete one-way invalidation (round-4 H1).
+        //
+        // If the runtime has txindex disabled but this batch is
+        // connecting/reorging blocks (any coin movement), the
+        // tx_index CF will not get the rows for those blocks. Stamp
+        // the completeness marker false IN THE SAME `WriteBatch` as
+        // the chainstate update so the invalidation is atomic with
+        // the connect — a crash mid-write either rolls everything
+        // back or commits both. `coin_puts` is the connect signal
+        // (every connected non-empty block creates outputs);
+        // `coin_removes` covers the disconnect-with-txindex-off case
+        // where existing tx_index rows for the now-undone block
+        // become stale.
+        if !self.txindex_enabled
+            && (!batch.coin_puts.is_empty() || !batch.coin_removes.is_empty())
+        {
+            wb.put_cf(&cf_meta, TX_INDEX_COMPLETE_KEY, [0u8]);
+        }
 
         // Block index
         for (hash, entry) in &batch.block_index_puts {
@@ -790,10 +882,12 @@ impl Store for RocksDbStore {
         self.drop_backfill_temp_cf()?;
         // Re-stamp schema version after metadata CF was recreated
         Self::stamp_schema(&self.db, CURRENT_SCHEMA_VERSION)?;
-        // Re-stamp outpoint_spend.complete: -reindex-chainstate
-        // produces a from-empty re-population which connect_block
-        // will fill atomically across both addr-CF and outpoint_spend.
-        self.write_outpoint_spend_complete(true)
+        // Re-stamp outpoint_spend.complete + tx_index.complete:
+        // -reindex-chainstate produces a from-empty re-population
+        // which connect_block will fill atomically across all three
+        // index CFs (round-3 H1).
+        self.write_outpoint_spend_complete(true)?;
+        self.write_tx_index_complete(true)
     }
 
     fn clear_all(&self) -> Result<(), StoreError> {
@@ -816,7 +910,8 @@ impl Store for RocksDbStore {
         self.drop_backfill_temp_cf()?;
         // Re-stamp schema version after metadata CF was recreated
         Self::stamp_schema(&self.db, CURRENT_SCHEMA_VERSION)?;
-        self.write_outpoint_spend_complete(true)
+        self.write_outpoint_spend_complete(true)?;
+        self.write_tx_index_complete(true)
     }
 
     fn get_coins_batch(&self, outpoints: &[OutPoint]) -> Vec<Option<Coin>> {
@@ -921,6 +1016,10 @@ impl Store for RocksDbStore {
 
     fn mark_outpoint_spend_complete(&self) -> Result<(), StoreError> {
         self.write_outpoint_spend_complete(true)
+    }
+
+    fn tx_index_complete(&self) -> bool {
+        self.read_tx_index_complete().unwrap_or(false)
     }
 
     fn lookup_spend(

@@ -52,8 +52,18 @@ impl TestNode {
         // — it binds a fixed port (default :3000) and would conflict
         // across parallel TestNode instances.
         let caller_sets_esplora = extra_args.iter().any(|a| a.starts_with("--esplora"));
+        let esplora_explicitly_on = extra_args
+            .iter()
+            .any(|a| *a == "--esplora=1" || *a == "--esplora=true");
         if !caller_sets_esplora {
             cmd.arg("--esplora=0");
+        }
+        // Esplora's tx + outspend endpoints require txindex; satd now
+        // refuses to start `--esplora=1 --txindex=0`. Auto-add the flag
+        // for tests that turn Esplora on but don't otherwise care.
+        let caller_sets_txindex = extra_args.iter().any(|a| a.starts_with("--txindex"));
+        if esplora_explicitly_on && !caller_sets_txindex {
+            cmd.arg("--txindex");
         }
         for arg in extra_args {
             cmd.arg(arg);
@@ -1822,6 +1832,9 @@ fn test_node_restart_persistence() {
                 .arg("--regtest")
                 .arg(format!("--datadir={}", datadir.display()))
                 .arg(format!("--rpcport={}", rpcport1))
+                // Esplora defaults on but requires txindex; tests
+                // spawning satd directly opt out unless they want it.
+                .arg("--esplora=0")
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .spawn()
@@ -1867,6 +1880,7 @@ fn test_node_restart_persistence() {
                 .arg("--regtest")
                 .arg(format!("--datadir={}", datadir.display()))
                 .arg(format!("--rpcport={}", rpcport2))
+                .arg("--esplora=0")
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .spawn()
@@ -3157,6 +3171,7 @@ fn test_log_format_json_emits_valid_json_with_trace_id() {
         .arg(format!("--rpcport={}", rpcport))
         .arg(format!("--port={}", p2p_port))
         .arg("--log-format=json")
+        .arg("--esplora=0")
         .stdout(log_file)
         .stderr(std::process::Stdio::null())
         .spawn()
@@ -5835,5 +5850,549 @@ fn test_esplora_auth_cookie_gates_endpoints() {
         .expect("esplora GET with cookie");
     assert_eq!(r.status(), 200, "expected 200 with cookie auth");
 
+    node.stop();
+}
+
+// ── Esplora tx endpoints (PR 4) ──
+
+/// `/tx/:txid` for a confirmed coinbase returns the full Esplora tx
+/// shape with `is_coinbase=true` and a populated `status` block.
+#[test]
+fn test_esplora_tx_detail_confirmed_coinbase() {
+    let esplora_port = find_available_port();
+    let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
+    let mut node = TestNode::start(&["--esplora=1", &bind, "--txindex"]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let _ = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(1), serde_json::json!(addr)],
+        )
+        .unwrap();
+
+    let txids: Vec<String> = {
+        let tip = esplora_get(esplora_port, "/blocks/tip/hash")
+            .text()
+            .unwrap()
+            .trim()
+            .to_string();
+        esplora_get(esplora_port, &format!("/block/{}/txids", tip))
+            .json()
+            .unwrap()
+    };
+    let coinbase = &txids[0];
+    let r = esplora_get(esplora_port, &format!("/tx/{}", coinbase));
+    assert_eq!(r.status(), 200);
+    let body: serde_json::Value = r.json().unwrap();
+    assert_eq!(body["txid"].as_str().unwrap(), coinbase);
+    let vin = body["vin"].as_array().unwrap();
+    assert_eq!(vin.len(), 1);
+    assert!(vin[0]["is_coinbase"].as_bool().unwrap());
+    assert!(vin[0]["txid"].is_null(), "coinbase vin omits prev txid");
+    let vout = body["vout"].as_array().unwrap();
+    assert!(!vout.is_empty(), "coinbase has at least one output");
+    assert_eq!(vout[0]["scriptpubkey_type"].as_str().unwrap(), "v0_p2wpkh");
+    assert!(vout[0]["scriptpubkey_address"].as_str().is_some());
+    let status = &body["status"];
+    assert!(status["confirmed"].as_bool().unwrap());
+    assert_eq!(status["block_height"].as_u64().unwrap(), 1);
+    assert!(status["block_hash"].as_str().is_some());
+    assert!(body["fee"].as_u64().unwrap() == 0, "coinbase has fee=0");
+    node.stop();
+}
+
+/// `/tx/:txid/status` confirms-then-mempool fallback.
+#[test]
+fn test_esplora_tx_status_confirmed() {
+    let esplora_port = find_available_port();
+    let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
+    let mut node = TestNode::start(&["--esplora=1", &bind, "--txindex"]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let _ = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(1), serde_json::json!(addr)],
+        )
+        .unwrap();
+    let tip = esplora_get(esplora_port, "/blocks/tip/hash")
+        .text()
+        .unwrap()
+        .trim()
+        .to_string();
+    let txids: Vec<String> = esplora_get(esplora_port, &format!("/block/{}/txids", tip))
+        .json()
+        .unwrap();
+    let r = esplora_get(esplora_port, &format!("/tx/{}/status", txids[0]));
+    assert_eq!(r.status(), 200);
+    let body: serde_json::Value = r.json().unwrap();
+    assert!(body["confirmed"].as_bool().unwrap());
+    assert_eq!(body["block_height"].as_u64().unwrap(), 1);
+    assert_eq!(body["block_hash"].as_str().unwrap(), tip);
+    node.stop();
+}
+
+/// `/tx/:txid/hex` returns the consensus-serialized tx as hex; deser
+/// must round-trip to the same txid.
+#[test]
+fn test_esplora_tx_hex_roundtrip() {
+    let esplora_port = find_available_port();
+    let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
+    let mut node = TestNode::start(&["--esplora=1", &bind, "--txindex"]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let _ = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(1), serde_json::json!(addr)],
+        )
+        .unwrap();
+    let tip = esplora_get(esplora_port, "/blocks/tip/hash")
+        .text()
+        .unwrap()
+        .trim()
+        .to_string();
+    let txids: Vec<String> = esplora_get(esplora_port, &format!("/block/{}/txids", tip))
+        .json()
+        .unwrap();
+    let txid = &txids[0];
+
+    let hex_resp = esplora_get(esplora_port, &format!("/tx/{}/hex", txid));
+    assert_eq!(hex_resp.status(), 200);
+    let hex_body = hex_resp.text().unwrap();
+    let bytes = hex::decode(hex_body.trim()).expect("hex decode");
+    let tx: bitcoin::Transaction =
+        bitcoin::consensus::encode::deserialize(&bytes).expect("tx deserialize");
+    assert_eq!(tx.compute_txid().to_string(), *txid);
+
+    // /raw must agree byte-for-byte.
+    let raw_resp = esplora_get(esplora_port, &format!("/tx/{}/raw", txid));
+    let raw_bytes = raw_resp.bytes().unwrap();
+    assert_eq!(raw_bytes.as_ref(), bytes.as_slice());
+
+    node.stop();
+}
+
+/// Unknown txid → 404 across all `/tx/:txid` shapes.
+#[test]
+fn test_esplora_tx_unknown_returns_404() {
+    let esplora_port = find_available_port();
+    let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
+    let mut node = TestNode::start(&["--esplora=1", &bind, "--txindex"]);
+    let zero = "0".repeat(64);
+    for path in [
+        format!("/tx/{}", zero),
+        format!("/tx/{}/status", zero),
+        format!("/tx/{}/hex", zero),
+        format!("/tx/{}/raw", zero),
+    ] {
+        let r = esplora_get(esplora_port, &path);
+        assert_eq!(
+            r.status(),
+            404,
+            "expected 404 for {} but got {}",
+            path,
+            r.status()
+        );
+    }
+    node.stop();
+}
+
+/// Bad txid hex → 400.
+#[test]
+fn test_esplora_tx_bad_txid_returns_400() {
+    let esplora_port = find_available_port();
+    let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
+    let mut node = TestNode::start(&["--esplora=1", &bind, "--txindex"]);
+    let r = esplora_get(esplora_port, "/tx/not-a-txid");
+    assert_eq!(r.status(), 400);
+    node.stop();
+}
+
+/// `--esplora=1 --txindex=0` must fail daemon startup with a clear
+/// Default `satd --regtest --datadir=...` (no `--esplora=0`, no
+/// `--txindex`) starts cleanly. Earlier round-1 H3 made this combo
+/// hard-fail on startup; round-2 reconciles by auto-enabling txindex
+/// when esplora is on. (Review-2 H3.)
+#[test]
+fn test_esplora_default_startup_auto_enables_txindex() {
+    use std::process::Command;
+    use std::time::Instant;
+    let satd_bin = env!("CARGO_BIN_EXE_satd");
+    let rpcport = find_available_port();
+    let p2p_port = find_available_port();
+    let esplora_port = find_available_port();
+    let datadir = std::env::temp_dir().join(format!("satd-default-{}", rpcport));
+    let _ = std::fs::create_dir_all(&datadir);
+
+    let mut child = Command::new(satd_bin)
+        .arg("--regtest")
+        .arg(format!("--datadir={}", datadir.display()))
+        .arg(format!("--rpcport={}", rpcport))
+        .arg(format!("--port={}", p2p_port))
+        // No --esplora flag (default true), no --txindex flag (default
+        // false). The reconciliation should kick in.
+        .arg(format!("--esplorabind=127.0.0.1:{}", esplora_port))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn satd");
+
+    // Wait for the Esplora listener to come up (proves the daemon
+    // didn't exit at startup).
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut ready = false;
+    while Instant::now() < deadline {
+        if reqwest::blocking::Client::new()
+            .get(format!("http://127.0.0.1:{}/blocks/tip/height", esplora_port))
+            .timeout(Duration::from_millis(500))
+            .send()
+            .is_ok_and(|r| r.status().is_success())
+        {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(ready, "esplora listener didn't come up under default startup");
+}
+
+/// Round-3 H1: an upgraded datadir (synced previously with
+/// `--txindex=0`) that now starts with default Esplora settings
+/// must NOT silently come up — it would false-404 historical txs.
+/// This test simulates the upgrade by:
+/// 1. Mining blocks with `--esplora=0` (so txindex stays at default off).
+/// 2. Restarting with default settings (esplora auto-enables txindex).
+/// 3. Asserting startup fails with a clear "incomplete" message.
+#[test]
+fn test_esplora_refuses_legacy_txindex_incomplete_datadir() {
+    use std::process::Command;
+    let satd_bin = env!("CARGO_BIN_EXE_satd");
+    let datadir = std::env::temp_dir().join(format!("satd-legacy-txi-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&datadir);
+    let _ = std::fs::create_dir_all(&datadir);
+
+    // Phase 1: sync with --esplora=0 (no txindex implication, no
+    // tx_index rows written).
+    let rpcport1 = find_available_port();
+    let p2p_port1 = find_available_port();
+    let mut node1 = TestNode::start_with_datadir(
+        &datadir,
+        rpcport1,
+        &["--esplora=0", &format!("--port={}", p2p_port1)],
+    );
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let _ = node1
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(2), serde_json::json!(addr)],
+        )
+        .expect("rpc");
+    node1.stop();
+
+    // Phase 2: restart with default settings — esplora auto-enables
+    // txindex, but the CF is empty for historical rows. Startup
+    // must hard-fail.
+    let rpcport2 = find_available_port();
+    let p2p_port2 = find_available_port();
+    let esplora_port = find_available_port();
+    let out = Command::new(satd_bin)
+        .arg("--regtest")
+        .arg(format!("--datadir={}", datadir.display()))
+        .arg(format!("--rpcport={}", rpcport2))
+        .arg(format!("--port={}", p2p_port2))
+        .arg(format!("--esplorabind=127.0.0.1:{}", esplora_port))
+        .output()
+        .expect("spawn satd");
+    assert!(!out.status.success(), "expected non-zero exit; stderr: {}",
+            String::from_utf8_lossy(&out.stderr));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("tx_index") && stderr.contains("incomplete"),
+        "expected tx_index incomplete diag in stderr; got: {stderr}"
+    );
+    assert!(
+        stderr.contains("--reindex-chainstate"),
+        "expected reindex hint in stderr; got: {stderr}"
+    );
+}
+
+/// Round-4 H1: a partial-history datadir (legacy empty
+/// `tx_index` plus a single later block mined with `--txindex=1`)
+/// must still be refused by the Esplora startup gate. The earlier
+/// "any rows means complete" heuristic incorrectly accepted this
+/// case.
+#[test]
+fn test_esplora_refuses_partial_txindex_history() {
+    use std::process::Command;
+    let satd_bin = env!("CARGO_BIN_EXE_satd");
+    let datadir =
+        std::env::temp_dir().join(format!("satd-partial-txi-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&datadir);
+    let _ = std::fs::create_dir_all(&datadir);
+
+    // Phase 1: legacy sync with --esplora=0 --txindex=0. tx_index
+    // stays empty; the marker is invalidated to false on first
+    // block-connect under txindex=off.
+    let rpcport1 = find_available_port();
+    let p2p_port1 = find_available_port();
+    let mut node1 = TestNode::start_with_datadir(
+        &datadir,
+        rpcport1,
+        &["--esplora=0", &format!("--port={}", p2p_port1)],
+    );
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let _ = node1
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(2), serde_json::json!(addr)],
+        )
+        .expect("rpc");
+    node1.stop();
+
+    // Phase 2: enable --txindex=1 (still --esplora=0). This writes
+    // ONE block's tx_index rows on top of the empty CF, but doesn't
+    // change the marker (it's stamped false from phase 1).
+    let rpcport2 = find_available_port();
+    let p2p_port2 = find_available_port();
+    let mut node2 = TestNode::start_with_datadir(
+        &datadir,
+        rpcport2,
+        &[
+            "--esplora=0",
+            "--txindex",
+            &format!("--port={}", p2p_port2),
+        ],
+    );
+    let _ = node2
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(1), serde_json::json!(addr)],
+        )
+        .expect("rpc");
+    node2.stop();
+
+    // Phase 3: default startup (esplora on). Marker is still false
+    // — the "any rows" heuristic would have accepted this, but the
+    // round-4 fix keeps the marker one-way.
+    let rpcport3 = find_available_port();
+    let p2p_port3 = find_available_port();
+    let esplora_port = find_available_port();
+    let out = Command::new(satd_bin)
+        .arg("--regtest")
+        .arg(format!("--datadir={}", datadir.display()))
+        .arg(format!("--rpcport={}", rpcport3))
+        .arg(format!("--port={}", p2p_port3))
+        .arg(format!("--esplorabind=127.0.0.1:{}", esplora_port))
+        .output()
+        .expect("spawn satd");
+    assert!(
+        !out.status.success(),
+        "expected non-zero exit; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("tx_index") && stderr.contains("incomplete"),
+        "expected incomplete diag in stderr; got: {stderr}"
+    );
+}
+
+/// Round-4 H1: a fully-indexed datadir, then one block connected
+/// with `--txindex=0`, must invalidate the marker so Esplora
+/// refuses to start without a reindex. (Inverse direction of
+/// `test_esplora_refuses_partial_txindex_history`.)
+#[test]
+fn test_esplora_refuses_after_txindex_disabled_gap() {
+    use std::process::Command;
+    let satd_bin = env!("CARGO_BIN_EXE_satd");
+    let datadir =
+        std::env::temp_dir().join(format!("satd-disabled-gap-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&datadir);
+    let _ = std::fs::create_dir_all(&datadir);
+
+    // Phase 1: full sync with --esplora=0 --txindex=1. Marker stays
+    // true after open (fresh datadir); blocks land with their
+    // tx_index rows. No invalidation fires (txindex enabled).
+    let rpcport1 = find_available_port();
+    let p2p_port1 = find_available_port();
+    let mut node1 = TestNode::start_with_datadir(
+        &datadir,
+        rpcport1,
+        &[
+            "--esplora=0",
+            "--txindex",
+            &format!("--port={}", p2p_port1),
+        ],
+    );
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let _ = node1
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(2), serde_json::json!(addr)],
+        )
+        .expect("rpc");
+    node1.stop();
+
+    // Phase 2: connect ONE more block with --txindex=0. This MUST
+    // flip the marker to false via the connect-time invalidation.
+    let rpcport2 = find_available_port();
+    let p2p_port2 = find_available_port();
+    let mut node2 = TestNode::start_with_datadir(
+        &datadir,
+        rpcport2,
+        &["--esplora=0", &format!("--port={}", p2p_port2)],
+    );
+    let _ = node2
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(1), serde_json::json!(addr)],
+        )
+        .expect("rpc");
+    node2.stop();
+
+    // Phase 3: default startup must hard-fail now.
+    let rpcport3 = find_available_port();
+    let p2p_port3 = find_available_port();
+    let esplora_port = find_available_port();
+    let out = Command::new(satd_bin)
+        .arg("--regtest")
+        .arg(format!("--datadir={}", datadir.display()))
+        .arg(format!("--rpcport={}", rpcport3))
+        .arg(format!("--port={}", p2p_port3))
+        .arg(format!("--esplorabind=127.0.0.1:{}", esplora_port))
+        .output()
+        .expect("spawn satd");
+    assert!(
+        !out.status.success(),
+        "expected non-zero exit; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("tx_index") && stderr.contains("incomplete"),
+        "expected incomplete diag in stderr; got: {stderr}"
+    );
+}
+
+/// Round-3 M1: `--txindex` on the CLI overrides `txindex=0` in the
+/// config file. (Without this fix, the operator's CLI override is
+/// silently ignored and the daemon hard-fails.)
+#[test]
+fn test_esplora_cli_txindex_overrides_config_disable() {
+    use std::process::Command;
+    use std::time::Instant;
+    let satd_bin = env!("CARGO_BIN_EXE_satd");
+    let rpcport = find_available_port();
+    let p2p_port = find_available_port();
+    let esplora_port = find_available_port();
+    let datadir = std::env::temp_dir().join(format!("satd-cli-override-{}", rpcport));
+    let _ = std::fs::create_dir_all(&datadir);
+    // Plant txindex=0 in the config file.
+    std::fs::write(datadir.join("bitcoin.conf"), "txindex=0\n").unwrap();
+
+    // CLI --txindex must win over the config-file disable.
+    let mut child = Command::new(satd_bin)
+        .arg("--regtest")
+        .arg(format!("--datadir={}", datadir.display()))
+        .arg(format!("--rpcport={}", rpcport))
+        .arg(format!("--port={}", p2p_port))
+        .arg("--esplora=1")
+        .arg("--txindex")
+        .arg(format!("--esplorabind=127.0.0.1:{}", esplora_port))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn satd");
+
+    // Wait briefly for the listener — proves startup succeeded.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut ready = false;
+    while Instant::now() < deadline {
+        if reqwest::blocking::Client::new()
+            .get(format!("http://127.0.0.1:{}/blocks/tip/height", esplora_port))
+            .timeout(Duration::from_millis(500))
+            .send()
+            .is_ok_and(|r| r.status().is_success())
+        {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(
+        ready,
+        "esplora listener didn't come up; CLI --txindex must override config txindex=0"
+    );
+}
+
+/// Explicit `txindex=0` in the config file with `--esplora=1`
+/// remains a hard-fail — the operator made an irreconcilable
+/// choice. (Review-2 H3, contrast.)
+#[test]
+fn test_esplora_with_explicit_txindex_disabled_fails_startup() {
+    use std::process::Command;
+    let satd_bin = env!("CARGO_BIN_EXE_satd");
+    let rpcport = find_available_port();
+    let p2p_port = find_available_port();
+    let datadir = std::env::temp_dir().join(format!("satd-conflict-{}", rpcport));
+    let _ = std::fs::create_dir_all(&datadir);
+    let net_dir = datadir.join("regtest");
+    let _ = std::fs::create_dir_all(&net_dir);
+    std::fs::write(net_dir.join("bitcoin.conf"), "txindex=0\n").unwrap();
+    // Also write a top-level .conf that satd reads first; safest to
+    // cover both possible search paths.
+    std::fs::write(datadir.join("bitcoin.conf"), "txindex=0\n").unwrap();
+
+    let out = Command::new(satd_bin)
+        .arg("--regtest")
+        .arg(format!("--datadir={}", datadir.display()))
+        .arg(format!("--rpcport={}", rpcport))
+        .arg(format!("--port={}", p2p_port))
+        .arg("--esplora=1")
+        .output()
+        .expect("spawn satd");
+    assert!(!out.status.success(), "expected non-zero exit");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("txindex=0"),
+        "expected explicit-disable diag in stderr; got: {stderr}"
+    );
+}
+
+/// `/block/:hash/txs` now returns the full Esplora tx shape (replaces
+/// PR 3's `{txid}` stub).
+#[test]
+fn test_esplora_block_txs_returns_full_tx_shape() {
+    let esplora_port = find_available_port();
+    let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
+    let mut node = TestNode::start(&["--esplora=1", &bind, "--txindex"]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let _ = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(1), serde_json::json!(addr)],
+        )
+        .unwrap();
+    let tip = esplora_get(esplora_port, "/blocks/tip/hash")
+        .text()
+        .unwrap()
+        .trim()
+        .to_string();
+    let r = esplora_get(esplora_port, &format!("/block/{}/txs", tip));
+    assert_eq!(r.status(), 200);
+    let arr: Vec<serde_json::Value> = r.json().unwrap();
+    assert_eq!(arr.len(), 1);
+    let entry = &arr[0];
+    // Full TxJson shape must be present, not the PR-3 stub.
+    assert!(entry["vin"].is_array());
+    assert!(entry["vout"].is_array());
+    assert!(entry["status"].is_object());
+    // fee is `Option<u64>`: `Some(0)` for coinbase, otherwise number;
+    // null only when prevouts couldn't be resolved.
+    assert!(entry["fee"].is_u64() || entry["fee"].is_null());
+    assert!(entry["weight"].is_u64());
     node.stop();
 }

@@ -9,7 +9,8 @@
 use std::sync::Arc;
 
 use axum::Router;
-use axum::routing::get;
+use axum::extract::DefaultBodyLimit;
+use axum::routing::{get, post};
 use tower::limit::ConcurrencyLimitLayer;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::timeout::TimeoutLayer;
@@ -17,7 +18,7 @@ use tower_http::trace::TraceLayer;
 
 use crate::auth::AuthExpectation;
 use crate::config::EsploraConfig;
-use crate::handlers::{block, chain};
+use crate::handlers::{block, chain, tx};
 use crate::state::EsploraState;
 
 #[derive(Debug, thiserror::Error)]
@@ -53,6 +54,21 @@ pub fn build_router(state: EsploraState) -> Result<Router, RouterBuildError> {
         .route("/block/{hash}/txs/{start_index}", get(block::block_txs_page))
         .route("/block/{hash}/txid/{index}", get(block::block_txid_at_index))
         .route("/block/{hash}/txids", get(block::block_txids))
+        .route("/tx/{txid}", get(tx::tx_detail))
+        .route("/tx/{txid}/status", get(tx::tx_status))
+        .route("/tx/{txid}/hex", get(tx::tx_hex))
+        .route("/tx/{txid}/raw", get(tx::tx_raw))
+        // Body cap for broadcast. `MAX_STANDARD_TX_WEIGHT` is 400_000
+        // weight units; a witness-heavy standard tx can serialize to
+        // around 400 KB, so hex-encoded the body can approach 800 KB.
+        // 1 MB covers that with margin and stays well under the 4 MB
+        // consensus block limit. Per-route layer so the cap doesn't
+        // apply to GET endpoints that don't accept bodies. (Review M4
+        // round 1 + round 2.)
+        .route(
+            "/tx",
+            post(tx::tx_broadcast).layer(DefaultBodyLimit::max(1024 * 1024)),
+        )
         .with_state(state);
 
     let routes = if cfg.auth.is_enabled() {
