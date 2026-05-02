@@ -7,6 +7,7 @@ use crate::storage::blockindex::BlockIndexEntry;
 use crate::storage::coinview::Coin;
 use crate::storage::undo::UndoData;
 use crate::storage::{Store, StoreBatch, StoreError};
+use node_index::SpendingRef;
 
 /// In-memory storage backend for testing.
 pub struct InMemoryStore {
@@ -19,6 +20,8 @@ pub struct InMemoryStore {
     tx_index: std::sync::RwLock<std::collections::HashMap<Txid, BlockHash>>,
     addr_funding: std::sync::RwLock<Vec<AddrFundingRow>>,
     addr_spending: std::sync::RwLock<Vec<AddrSpendingRow>>,
+    outpoint_spend:
+        std::sync::RwLock<std::collections::HashMap<OutPoint, SpendingRef>>,
 }
 
 impl Default for InMemoryStore {
@@ -38,6 +41,7 @@ impl InMemoryStore {
             tx_index: std::sync::RwLock::new(std::collections::HashMap::new()),
             addr_funding: std::sync::RwLock::new(Vec::new()),
             addr_spending: std::sync::RwLock::new(Vec::new()),
+            outpoint_spend: std::sync::RwLock::new(std::collections::HashMap::new()),
         }
     }
 }
@@ -116,6 +120,17 @@ impl Store for InMemoryStore {
                 as_.retain(|r| r.key() != k);
             }
         }
+        if !batch.outpoint_spend_puts.is_empty()
+            || !batch.outpoint_spend_removes.is_empty()
+        {
+            let mut os = self.outpoint_spend.write().unwrap();
+            for (op, sref) in batch.outpoint_spend_puts {
+                os.insert(op, sref);
+            }
+            for op in batch.outpoint_spend_removes {
+                os.remove(&op);
+            }
+        }
 
         Ok(())
     }
@@ -164,6 +179,7 @@ impl Store for InMemoryStore {
         self.tx_index.write().unwrap().clear();
         self.addr_funding.write().unwrap().clear();
         self.addr_spending.write().unwrap().clear();
+        self.outpoint_spend.write().unwrap().clear();
         *self.tip.write().unwrap() = None;
         Ok(())
     }
@@ -176,6 +192,7 @@ impl Store for InMemoryStore {
         self.tx_index.write().unwrap().clear();
         self.addr_funding.write().unwrap().clear();
         self.addr_spending.write().unwrap().clear();
+        self.outpoint_spend.write().unwrap().clear();
         *self.tip.write().unwrap() = None;
         Ok(())
     }
@@ -213,6 +230,10 @@ impl Store for InMemoryStore {
                 .cmp(&crate::index::address::encode_spending_key(b))
         });
         rows
+    }
+
+    fn lookup_spend(&self, outpoint: &OutPoint) -> Result<Option<SpendingRef>, StoreError> {
+        Ok(self.outpoint_spend.read().unwrap().get(outpoint).copied())
     }
 }
 

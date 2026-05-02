@@ -422,6 +422,8 @@ impl Store for CoinCache {
             || !batch.addr_spending_puts.is_empty()
             || !batch.addr_funding_removes.is_empty()
             || !batch.addr_spending_removes.is_empty()
+            || !batch.outpoint_spend_puts.is_empty()
+            || !batch.outpoint_spend_removes.is_empty()
             || !batch.addr_backfill_temp_puts.is_empty()
             || batch.backfill_cursor_advance.is_some();
 
@@ -441,6 +443,8 @@ impl Store for CoinCache {
                     addr_spending_puts: batch.addr_spending_puts,
                     addr_funding_removes: batch.addr_funding_removes,
                     addr_spending_removes: batch.addr_spending_removes,
+                    outpoint_spend_puts: batch.outpoint_spend_puts,
+                    outpoint_spend_removes: batch.outpoint_spend_removes,
                     addr_backfill_temp_puts: batch.addr_backfill_temp_puts,
                     backfill_cursor_advance: batch.backfill_cursor_advance,
                 };
@@ -453,17 +457,20 @@ impl Store for CoinCache {
                 pending.undo_puts.extend(batch.undo_puts);
                 pending.tx_index_puts.extend(batch.tx_index_puts);
                 pending.tx_index_removes.extend(batch.tx_index_removes);
-                // Address-index puts and removes need last-writer-wins
-                // dedup by key (so connect→disconnect→connect or
-                // disconnect→connect sequences before flush land on the
-                // correct final state). Build a small StoreBatch carrying
-                // only the addr-* fields and route it through `merge`
-                // — the rest of `batch` was already extended above.
+                // Address-index, outpoint-spend, and backfill-temp puts
+                // and removes need last-writer-wins dedup by key (so
+                // connect→disconnect→connect or disconnect→connect
+                // sequences before flush land on the correct final
+                // state). Build a small StoreBatch carrying only those
+                // fields and route it through `merge` — the rest of
+                // `batch` was already extended above.
                 let addr_only = StoreBatch {
                     addr_funding_puts: batch.addr_funding_puts,
                     addr_spending_puts: batch.addr_spending_puts,
                     addr_funding_removes: batch.addr_funding_removes,
                     addr_spending_removes: batch.addr_spending_removes,
+                    outpoint_spend_puts: batch.outpoint_spend_puts,
+                    outpoint_spend_removes: batch.outpoint_spend_removes,
                     addr_backfill_temp_puts: batch.addr_backfill_temp_puts,
                     backfill_cursor_advance: batch.backfill_cursor_advance,
                     ..Default::default()

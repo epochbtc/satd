@@ -414,6 +414,9 @@ impl BackfillRunner {
                             txid,
                             vin: vin as u32,
                         });
+                        // outpoint_spend was written for the same input
+                        // in pass 2; remove it as well.
+                        batch.outpoint_spend_removes.push(prev);
                         total_spending_removes += 1;
                     }
                 }
@@ -579,6 +582,17 @@ impl BackfillRunner {
                         vin: vin as u32,
                         prev_outpoint: prev,
                     });
+                    // outpoint_spend rides the same pass-2 walk: one row
+                    // per consumed UTXO, written atomically with the
+                    // address-index spending row.
+                    batch.outpoint_spend_puts.push((
+                        prev,
+                        node_index::SpendingRef {
+                            spending_txid: txid,
+                            spending_vin: vin as u32,
+                            height: h,
+                        },
+                    ));
                 }
             }
             batch.backfill_cursor_advance = Some(BackfillCursorWrite {

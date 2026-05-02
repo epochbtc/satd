@@ -21,6 +21,10 @@ const CF_TX_INDEX: &str = "tx_index";
 const CF_METADATA: &str = "metadata";
 const CF_ADDR_FUNDING: &str = "addr_funding";
 const CF_ADDR_SPENDING: &str = "addr_spending";
+/// Confirmed-side spend index: `prev_outpoint -> SpendingRef`. Written
+/// alongside the address-index spending rows; the two CFs answer
+/// different shapes of the same question.
+const CF_OUTPOINT_SPEND: &str = "outpoint_spend";
 /// Temp CF created lazily when a deferred backfill starts. Holds
 /// `(outpoint -> scripthash)` rows used by pass 2 to resolve input
 /// scripthashes without reading flat-file undo data. Dropped wholesale
@@ -162,6 +166,12 @@ impl RocksDbStore {
             // circuits to the matching SST blocks instead of scanning.
             ColumnFamilyDescriptor::new(CF_ADDR_FUNDING, make_cf_opts(true, 32, Some(32))),
             ColumnFamilyDescriptor::new(CF_ADDR_SPENDING, make_cf_opts(true, 32, Some(32))),
+            // outpoint_spend: bloom on (point lookups dominate), 16 MB
+            // write-buf because the row is small (40-byte value, 36-byte
+            // key) and one row per non-coinbase input — heavier than
+            // tx_index but lighter than addr_spending. 32-byte prefix
+            // (txid) lets `outspends` for a tx fan out cheaply.
+            ColumnFamilyDescriptor::new(CF_OUTPOINT_SPEND, make_cf_opts(true, 16, Some(32))),
         ];
 
         // The deferred-backfill temp CF is created lazily when an
@@ -249,10 +259,14 @@ impl RocksDbStore {
     fn cf_options(&self, name: &str) -> Options {
         // Bloom-filtered CFs are those that see point-lookups in
         // hot paths (UTXO + address-index reads).
-        let bloom = matches!(name, CF_COINS | CF_ADDR_FUNDING | CF_ADDR_SPENDING);
+        let bloom = matches!(
+            name,
+            CF_COINS | CF_ADDR_FUNDING | CF_ADDR_SPENDING | CF_OUTPOINT_SPEND
+        );
         let write_buf_mb = match name {
             CF_COINS => 64,
             CF_ADDR_FUNDING | CF_ADDR_SPENDING => 32,
+            CF_OUTPOINT_SPEND => 16,
             CF_UNDO | CF_TX_INDEX => 16,
             CF_BLOCK_INDEX | CF_HEIGHT_INDEX => 8,
             _ => 2,
@@ -287,10 +301,14 @@ impl RocksDbStore {
         cf_opts.set_target_file_size_base(64 * 1024 * 1024);
         cf_opts.set_compression_per_level(&compression_per_level);
         cf_opts.set_bottommost_compression_type(DBCompressionType::Zstd);
-        // Address-index CFs share a 32-byte fixed prefix (sha256(spk)).
-        // Mirror the prefix-extractor we set on initial CF creation so
-        // `drop_and_recreate_cf` (used by `clear_*` paths) preserves it.
-        if matches!(name, CF_ADDR_FUNDING | CF_ADDR_SPENDING) {
+        // Address-index + outpoint-spend CFs share a 32-byte fixed
+        // prefix. Mirror the prefix-extractor we set on initial CF
+        // creation so `drop_and_recreate_cf` (used by `clear_*` paths)
+        // preserves it.
+        if matches!(
+            name,
+            CF_ADDR_FUNDING | CF_ADDR_SPENDING | CF_OUTPOINT_SPEND
+        ) {
             cf_opts.set_prefix_extractor(SliceTransform::create_fixed_prefix(32));
         }
         cf_opts
@@ -471,6 +489,21 @@ impl Store for RocksDbStore {
             for key in &batch.addr_spending_removes {
                 let encoded = crate::index::address::encode_spending_key(key);
                 wb.delete_cf(&cf_as, encoded);
+            }
+        }
+
+        // outpoint_spend index: same atomic-with-chainstate contract as
+        // the addr-CFs. Empty-batch fast-path skips the CF handle.
+        if !batch.outpoint_spend_puts.is_empty() || !batch.outpoint_spend_removes.is_empty() {
+            let cf_os = self.cf(CF_OUTPOINT_SPEND);
+            for (op, sref) in &batch.outpoint_spend_puts {
+                let key = node_index::encode_outpoint_key(op);
+                let value = node_index::encode_spend_value(sref);
+                wb.put_cf(&cf_os, key, value);
+            }
+            for op in &batch.outpoint_spend_removes {
+                let key = node_index::encode_outpoint_key(op);
+                wb.delete_cf(&cf_os, key);
             }
         }
 
@@ -668,6 +701,7 @@ impl Store for RocksDbStore {
         // reference UTXOs the new chainstate is about to overwrite.
         cfs.push(CF_ADDR_FUNDING);
         cfs.push(CF_ADDR_SPENDING);
+        cfs.push(CF_OUTPOINT_SPEND);
         for cf_name in cfs {
             self.drop_and_recreate_cf(cf_name)?;
         }
@@ -690,6 +724,7 @@ impl Store for RocksDbStore {
             CF_TX_INDEX,
             CF_ADDR_FUNDING,
             CF_ADDR_SPENDING,
+            CF_OUTPOINT_SPEND,
         ];
         for cf_name in all_cfs {
             self.drop_and_recreate_cf(cf_name)?;
@@ -792,6 +827,19 @@ impl Store for RocksDbStore {
             out.push((key, prev));
         }
         out
+    }
+
+    fn lookup_spend(
+        &self,
+        outpoint: &OutPoint,
+    ) -> Result<Option<node_index::SpendingRef>, StoreError> {
+        let cf = self.cf(CF_OUTPOINT_SPEND);
+        let key = node_index::encode_outpoint_key(outpoint);
+        match self.db.get_cf(&cf, key) {
+            Ok(Some(v)) => Ok(node_index::decode_spend_value(&v)),
+            Ok(None) => Ok(None),
+            Err(e) => Err(StoreError::Database(e.to_string())),
+        }
     }
 
     fn create_backfill_temp_cf(&self) -> Result<(), StoreError> {
@@ -1355,6 +1403,73 @@ mod tests {
         rm.addr_spending_removes.push(row.key());
         store.write_batch(rm).unwrap();
         assert!(store.db.get_cf(&cf, encoded_key).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_outpoint_spend_write_batch_put_then_lookup() {
+        let (store, _dir) = temp_store(false);
+        let prev = make_outpoint(0x77, 2);
+        let sref = node_index::SpendingRef {
+            spending_txid: make_outpoint(0xab, 0).txid,
+            spending_vin: 4,
+            height: 100,
+        };
+
+        let mut batch = StoreBatch::default();
+        batch.outpoint_spend_puts.push((prev, sref));
+        store.write_batch(batch).unwrap();
+
+        let got = store.lookup_spend(&prev).unwrap();
+        assert_eq!(got, Some(sref));
+    }
+
+    #[test]
+    fn test_outpoint_spend_write_batch_remove_clears_row() {
+        let (store, _dir) = temp_store(false);
+        let prev = make_outpoint(0x66, 0);
+        let sref = node_index::SpendingRef {
+            spending_txid: make_outpoint(0x99, 0).txid,
+            spending_vin: 0,
+            height: 7,
+        };
+
+        let mut put = StoreBatch::default();
+        put.outpoint_spend_puts.push((prev, sref));
+        store.write_batch(put).unwrap();
+        assert!(store.lookup_spend(&prev).unwrap().is_some());
+
+        let mut rm = StoreBatch::default();
+        rm.outpoint_spend_removes.push(prev);
+        store.write_batch(rm).unwrap();
+        assert_eq!(store.lookup_spend(&prev).unwrap(), None);
+    }
+
+    #[test]
+    fn test_outpoint_spend_lookup_unknown_returns_none() {
+        let (store, _dir) = temp_store(false);
+        let unknown = make_outpoint(0xff, 9);
+        assert_eq!(store.lookup_spend(&unknown).unwrap(), None);
+    }
+
+    #[test]
+    fn test_outpoint_spend_persists_across_reopen() {
+        // Verifies the CF descriptor is registered on subsequent opens
+        // (so an existing chainstate-on-disk doesn't fail to mount).
+        let dir = tempfile::tempdir().unwrap();
+        let prev = make_outpoint(0x33, 1);
+        let sref = node_index::SpendingRef {
+            spending_txid: make_outpoint(0x44, 0).txid,
+            spending_vin: 2,
+            height: 50,
+        };
+        {
+            let store = RocksDbStore::open(dir.path(), false, 16, false).unwrap();
+            let mut batch = StoreBatch::default();
+            batch.outpoint_spend_puts.push((prev, sref));
+            store.write_batch(batch).unwrap();
+        }
+        let store2 = RocksDbStore::open(dir.path(), false, 16, false).unwrap();
+        assert_eq!(store2.lookup_spend(&prev).unwrap(), Some(sref));
     }
 
     #[test]

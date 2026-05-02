@@ -4,3 +4,4 @@
 //! RocksDB instance and ride atomic-with-chainstate writes via `StoreBatch`.
 
 pub mod address;
+pub mod outpoint_spend;

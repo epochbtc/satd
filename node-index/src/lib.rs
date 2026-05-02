@@ -12,6 +12,8 @@
 pub mod config;
 pub mod cursor;
 pub mod keys;
+pub mod spend_keys;
+pub mod spend_trait;
 pub mod subscribe;
 pub mod trait_def;
 pub mod types;
@@ -24,6 +26,11 @@ pub use keys::{
     encode_funding_key, encode_funding_value, encode_spending_key, encode_spending_value,
     scripthash_of,
 };
+pub use spend_keys::{
+    OUTPOINT_KEY_LEN, SPEND_VALUE_LEN, SpendingRef, decode_outpoint_key, decode_spend_value,
+    encode_outpoint_key, encode_spend_value,
+};
+pub use spend_trait::SpendIndex;
 pub use subscribe::{SubscribeError, SubscriptionRegistry, status_hash};
 pub use trait_def::AddressIndex;
 pub use types::{HistoryEntry, IndexError, MempoolHistoryEntry, StatusUpdate, Utxo};
