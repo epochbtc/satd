@@ -771,15 +771,14 @@ async fn main() {
             tracing::warn!(
                 "esplora server requested but --addressindex=0; refusing to start (Esplora reads through the address index)"
             );
-        } else if !config.txindex {
-            eprintln!(
-                "Error: esplora requires --txindex=1 (confirmed tx lookups, prevout resolution, \
-                 and fee calculation depend on it). Restart with --txindex=1, or disable the \
-                 Esplora server with --esplora=0."
-            );
-            auth.cleanup();
-            std::process::exit(1);
         } else {
+            // The esplora ↔ txindex coupling is reconciled in
+            // config::from_cli (review-2 H3): by the time we get
+            // here, config.esplora=true implies config.txindex=true.
+            debug_assert!(
+                config.txindex,
+                "config invariant: esplora=true must imply txindex=true after Config::load"
+            );
             let bind: SocketAddr = config
                 .esplora_bind
                 .parse()

@@ -557,8 +557,14 @@ impl Config {
             .or_else(|| file_get("permitbaremultisig").and_then(|v| parse_bool(&v)))
             .unwrap_or(true);
 
-        let txindex = cli.txindex
-            || file_get("txindex").and_then(|v| parse_bool(&v)).unwrap_or(false)
+        // Track whether txindex was explicitly disabled via the
+        // config file (CLI can't express that; it's a `bool` flag).
+        // The Esplora auto-implication below honors an explicit
+        // disable and refuses to silently override the operator.
+        let txindex_file = file_get("txindex").and_then(|v| parse_bool(&v));
+        let txindex_explicitly_disabled = matches!(txindex_file, Some(false));
+        let mut txindex = cli.txindex
+            || matches!(txindex_file, Some(true))
             || profile_defaults.txindex.unwrap_or(false);
 
         // Address-history index: on by default. CLI `--addressindex=0`,
@@ -646,7 +652,43 @@ impl Config {
             .or(profile_defaults.prune)
             .unwrap_or(0); // 0 = no pruning
 
-        // Validate prune + txindex conflict
+        // Esplora ↔ txindex coupling (review-2 H3).
+        //
+        // Esplora's tx + outspend endpoints depend on txindex. Rather
+        // than failing default startup (which the round-1 H3 hard-fail
+        // did), reconcile the two flags here:
+        //
+        //   - prune > 0 + esplora: txindex can't run alongside prune,
+        //     so auto-disable Esplora with a warning.
+        //   - esplora && !txindex && config didn't explicitly disable
+        //     txindex: auto-enable txindex.
+        //   - esplora && txindex_explicitly_disabled: hard-fail; the
+        //     two flags conflict and the operator made the call.
+        let mut esplora_resolved = esplora;
+        if esplora_resolved && prune > 0 {
+            tracing::warn!(
+                prune,
+                "esplora requires --txindex, which is incompatible with --prune; \
+                 disabling esplora. Set --esplora=0 explicitly to silence this warning."
+            );
+            esplora_resolved = false;
+        } else if esplora_resolved && !txindex && !txindex_explicitly_disabled {
+            tracing::info!(
+                "esplora is enabled; auto-enabling --txindex (required for tx endpoints)"
+            );
+            txindex = true;
+        } else if esplora_resolved && txindex_explicitly_disabled {
+            return Err(
+                "esplora=1 with txindex=0 in config: refusing to start. \
+                 Either remove the txindex=0 line or set esplora=0."
+                    .into(),
+            );
+        }
+        let esplora = esplora_resolved;
+
+        // Validate prune + txindex conflict (now redundant with the
+        // esplora reconciliation above for the esplora=1 path, but
+        // still catches the operator who explicitly enables both).
         if prune > 0 && txindex {
             return Err("prune mode is incompatible with -txindex".to_string());
         }

@@ -58,14 +58,16 @@ pub fn build_router(state: EsploraState) -> Result<Router, RouterBuildError> {
         .route("/tx/{txid}/status", get(tx::tx_status))
         .route("/tx/{txid}/hex", get(tx::tx_hex))
         .route("/tx/{txid}/raw", get(tx::tx_raw))
-        // Body cap for broadcast: 256 KB covers any standard tx
-        // (consensus MAX_BLOCK_SIZE is 4 MB but standard policy
-        // weight maxes ~100 KB serialized; hex doubles that). Per-
-        // route layer so the cap doesn't apply to GET endpoints
-        // that don't accept bodies. (Review M4.)
+        // Body cap for broadcast. `MAX_STANDARD_TX_WEIGHT` is 400_000
+        // weight units; a witness-heavy standard tx can serialize to
+        // around 400 KB, so hex-encoded the body can approach 800 KB.
+        // 1 MB covers that with margin and stays well under the 4 MB
+        // consensus block limit. Per-route layer so the cap doesn't
+        // apply to GET endpoints that don't accept bodies. (Review M4
+        // round 1 + round 2.)
         .route(
             "/tx",
-            post(tx::tx_broadcast).layer(DefaultBodyLimit::max(256 * 1024)),
+            post(tx::tx_broadcast).layer(DefaultBodyLimit::max(1024 * 1024)),
         )
         .with_state(state);
 

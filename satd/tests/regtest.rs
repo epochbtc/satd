@@ -6008,17 +6008,72 @@ fn test_esplora_tx_bad_txid_returns_400() {
 }
 
 /// `--esplora=1 --txindex=0` must fail daemon startup with a clear
-/// message — not silently start a server whose tx endpoints will
-/// 404 every confirmed lookup. (Review H3.)
+/// Default `satd --regtest --datadir=...` (no `--esplora=0`, no
+/// `--txindex`) starts cleanly. Earlier round-1 H3 made this combo
+/// hard-fail on startup; round-2 reconciles by auto-enabling txindex
+/// when esplora is on. (Review-2 H3.)
 #[test]
-fn test_esplora_without_txindex_fails_startup() {
+fn test_esplora_default_startup_auto_enables_txindex() {
     use std::process::Command;
+    use std::time::Instant;
     let satd_bin = env!("CARGO_BIN_EXE_satd");
     let rpcport = find_available_port();
     let p2p_port = find_available_port();
     let esplora_port = find_available_port();
-    let datadir = std::env::temp_dir().join(format!("satd-esplora-no-txi-{}", rpcport));
+    let datadir = std::env::temp_dir().join(format!("satd-default-{}", rpcport));
     let _ = std::fs::create_dir_all(&datadir);
+
+    let mut child = Command::new(satd_bin)
+        .arg("--regtest")
+        .arg(format!("--datadir={}", datadir.display()))
+        .arg(format!("--rpcport={}", rpcport))
+        .arg(format!("--port={}", p2p_port))
+        // No --esplora flag (default true), no --txindex flag (default
+        // false). The reconciliation should kick in.
+        .arg(format!("--esplorabind=127.0.0.1:{}", esplora_port))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn satd");
+
+    // Wait for the Esplora listener to come up (proves the daemon
+    // didn't exit at startup).
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut ready = false;
+    while Instant::now() < deadline {
+        if reqwest::blocking::Client::new()
+            .get(format!("http://127.0.0.1:{}/blocks/tip/height", esplora_port))
+            .timeout(Duration::from_millis(500))
+            .send()
+            .is_ok_and(|r| r.status().is_success())
+        {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(ready, "esplora listener didn't come up under default startup");
+}
+
+/// Explicit `txindex=0` in the config file with `--esplora=1`
+/// remains a hard-fail — the operator made an irreconcilable
+/// choice. (Review-2 H3, contrast.)
+#[test]
+fn test_esplora_with_explicit_txindex_disabled_fails_startup() {
+    use std::process::Command;
+    let satd_bin = env!("CARGO_BIN_EXE_satd");
+    let rpcport = find_available_port();
+    let p2p_port = find_available_port();
+    let datadir = std::env::temp_dir().join(format!("satd-conflict-{}", rpcport));
+    let _ = std::fs::create_dir_all(&datadir);
+    let net_dir = datadir.join("regtest");
+    let _ = std::fs::create_dir_all(&net_dir);
+    std::fs::write(net_dir.join("bitcoin.conf"), "txindex=0\n").unwrap();
+    // Also write a top-level .conf that satd reads first; safest to
+    // cover both possible search paths.
+    std::fs::write(datadir.join("bitcoin.conf"), "txindex=0\n").unwrap();
 
     let out = Command::new(satd_bin)
         .arg("--regtest")
@@ -6026,15 +6081,13 @@ fn test_esplora_without_txindex_fails_startup() {
         .arg(format!("--rpcport={}", rpcport))
         .arg(format!("--port={}", p2p_port))
         .arg("--esplora=1")
-        .arg(format!("--esplorabind=127.0.0.1:{}", esplora_port))
-        // Note: deliberately NOT passing --txindex.
         .output()
         .expect("spawn satd");
     assert!(!out.status.success(), "expected non-zero exit");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("requires --txindex"),
-        "expected txindex-requirement message in stderr; got: {stderr}"
+        stderr.contains("txindex=0"),
+        "expected explicit-disable diag in stderr; got: {stderr}"
     );
 }
 
