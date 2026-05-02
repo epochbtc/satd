@@ -90,7 +90,11 @@ fn collect_blocks_descending(
         // (cached size/weight on the block index entry) can come in a
         // follow-up if profiling shows a hotspot.
         let (size, weight) = try_compute_block_size_weight(state, &hash).unwrap_or((0, 0));
-        let mediantime = state.chain.get_median_time_past(entry.height);
+        // height+1 so the target block is included in the median set
+        // (Bitcoin Core / Esplora explorer convention; see review-2 M2).
+        let mediantime = state
+            .chain
+            .get_median_time_past(entry.height.saturating_add(1));
         out.push(block_header_json(
             &hash,
             &entry,

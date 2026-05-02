@@ -49,10 +49,15 @@ pub async fn block_detail(
         .ok_or(EsploraError::NotFound)?;
     let size = serialize(&block).len() as u32;
     let weight = block.weight().to_wu() as u32;
-    // Median Time Past is the median of the timestamps for the prior
-    // 11 blocks (BIP113). Header time is the wall-clock the miner
-    // chose; consensus and most explorer UIs reference MTP. (Review M2.)
-    let mediantime = state.chain.get_median_time_past(entry.height);
+    // Median Time Past for the API field is the median of the
+    // target block + up to 10 ancestors (Bitcoin Core / Esplora
+    // explorer convention). The consensus helper
+    // `get_median_time_past(h)` returns the MTP "as of just before"
+    // height `h` (median of `h-11..h`); call with `h+1` so the target
+    // block is included in the median set. (Review-2 M2.)
+    let mediantime = state
+        .chain
+        .get_median_time_past(entry.height.saturating_add(1));
     Ok(Json(block_header_json(
         &hash,
         &entry,

@@ -5707,6 +5707,45 @@ fn test_esplora_block_txs_pagination_past_end_returns_empty() {
     node.stop();
 }
 
+/// `mediantime` for the tip includes the tip's own header time in
+/// the median set, not just its 11 ancestors. (Round-2 M2.) Mining
+/// a single block past genesis yields a tip whose `mediantime`
+/// should equal the tip's own header time (not genesis time, which
+/// is what the off-by-one helper would return).
+#[test]
+fn test_esplora_block_mediantime_includes_target_block() {
+    let esplora_port = find_available_port();
+    let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
+    let mut node = TestNode::start(&["--esplora=1", &bind]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let _ = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(1), serde_json::json!(addr)],
+        )
+        .unwrap();
+    let tip = esplora_get(esplora_port, "/blocks/tip/hash")
+        .text()
+        .unwrap()
+        .trim()
+        .to_string();
+    let body: serde_json::Value = esplora_get(esplora_port, &format!("/block/{}", tip))
+        .json()
+        .unwrap();
+    let header_time = body["timestamp"].as_u64().unwrap();
+    let mediantime = body["mediantime"].as_u64().unwrap();
+    // With 2 blocks total (genesis + the one mined), the median of
+    // {genesis_time, tip_time} is the larger of the two (since
+    // even-length medians return the upper-middle). For monotonic
+    // regtest timestamps that's the tip's own time. The off-by-one
+    // helper would have returned genesis time.
+    assert_eq!(
+        mediantime, header_time,
+        "tip mediantime must include the tip itself; off-by-one would return genesis"
+    );
+    node.stop();
+}
+
 /// `/blocks` returns real `size`/`weight` from flat-file data (no
 /// longer the PR-2 placeholder zeros). (Review M1.)
 #[test]
