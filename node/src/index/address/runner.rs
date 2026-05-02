@@ -404,6 +404,18 @@ impl BackfillRunner {
                 if h <= spending_high && !tx.is_coinbase() {
                     for (vin, input) in tx.input.iter().enumerate() {
                         let prev = input.previous_output;
+                        // outpoint_spend remove is keyed by prev_outpoint
+                        // alone, so it can be emitted unconditionally —
+                        // a temp-CF miss only affects the addr_spending
+                        // remove (which needs the scripthash). Pushing
+                        // these together used to gate the outpoint_spend
+                        // remove on the same lookup; that allowed stale
+                        // outpoint-spend rows to survive reorg cleanup
+                        // when the temp CF was partial/corrupt
+                        // (review M7).
+                        batch.outpoint_spend_removes.push(prev);
+                        total_spending_removes += 1;
+
                         let sh = match chain.store_ref().lookup_backfill_temp(&prev) {
                             Ok(Some(sh)) => sh,
                             Ok(None) | Err(_) => continue,
@@ -414,10 +426,6 @@ impl BackfillRunner {
                             txid,
                             vin: vin as u32,
                         });
-                        // outpoint_spend was written for the same input
-                        // in pass 2; remove it as well.
-                        batch.outpoint_spend_removes.push(prev);
-                        total_spending_removes += 1;
                     }
                 }
             }

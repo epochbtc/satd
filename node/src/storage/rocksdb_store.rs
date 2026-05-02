@@ -241,12 +241,57 @@ impl RocksDbStore {
             // write_schema_version below handles the re-stamp after clear).
         }
 
-        Ok(Self {
+        let store = Self {
             db,
             txindex_enabled: txindex,
             block_cache: std::sync::Mutex::new(block_cache),
             block_cache_capacity: std::sync::atomic::AtomicUsize::new(cache_bytes),
-        })
+        };
+        // Detect upgrade-path gap: an existing chainstate may have a
+        // populated addr_spending index from earlier code and an empty
+        // outpoint_spend CF (introduced by this schema bump). New
+        // blocks land in both CFs from connect_block onward, but
+        // historical outspend lookups remain wrong until a re-index.
+        // Warn the operator at open time so the gap isn't silent.
+        // (Review H6.)
+        if store.outpoint_spend_unfilled_for_existing_addr_index() {
+            tracing::warn!(
+                target: "storage",
+                "outpoint_spend index is empty but addr_spending has historical rows: \
+                 historical /tx/:txid/outspend lookups will be incomplete until you \
+                 restart with --reindex-chainstate (recommended after upgrade)"
+            );
+        }
+        Ok(store)
+    }
+
+    /// True when the addr_spending CF has rows but outpoint_spend is
+    /// empty — the migration footgun introduced by adding
+    /// outpoint_spend in a follow-up release. Cheap: each side reads
+    /// at most one iterator entry.
+    fn outpoint_spend_unfilled_for_existing_addr_index(&self) -> bool {
+        let addr_spending_has_rows = self
+            .db
+            .cf_handle(CF_ADDR_SPENDING)
+            .and_then(|cf| {
+                self.db
+                    .iterator_cf(&cf, IteratorMode::Start)
+                    .next()
+                    .map(|item| item.is_ok())
+            })
+            .unwrap_or(false);
+        if !addr_spending_has_rows {
+            return false;
+        }
+        self.db
+            .cf_handle(CF_OUTPOINT_SPEND)
+            .map(|cf| {
+                self.db
+                    .iterator_cf(&cf, IteratorMode::Start)
+                    .next()
+                    .is_none()
+            })
+            .unwrap_or(true)
     }
 
     fn cf(&self, name: &str) -> Arc<BoundColumnFamily<'_>> {
@@ -836,7 +881,24 @@ impl Store for RocksDbStore {
         let cf = self.cf(CF_OUTPOINT_SPEND);
         let key = node_index::encode_outpoint_key(outpoint);
         match self.db.get_cf(&cf, key) {
-            Ok(Some(v)) => Ok(node_index::decode_spend_value(&v)),
+            Ok(Some(v)) => match node_index::decode_spend_value(&v) {
+                Some(sref) => Ok(Some(sref)),
+                None => {
+                    // A row exists but its value is malformed. Fail
+                    // loud so corruption is visible — silently
+                    // returning None would mask a real spend as
+                    // unspent in the answers `SpendIndex` callers
+                    // rely on (Esplora outspend, gettxspendingprevout).
+                    let msg = format!(
+                        "outpoint_spend: corrupt value for {}:{} (got {} bytes)",
+                        outpoint.txid,
+                        outpoint.vout,
+                        v.len()
+                    );
+                    tracing::error!(target: "storage", "{}", msg);
+                    Err(StoreError::Database(msg))
+                }
+            },
             Ok(None) => Ok(None),
             Err(e) => Err(StoreError::Database(e.to_string())),
         }
@@ -1449,6 +1511,29 @@ mod tests {
         let (store, _dir) = temp_store(false);
         let unknown = make_outpoint(0xff, 9);
         assert_eq!(store.lookup_spend(&unknown).unwrap(), None);
+    }
+
+    #[test]
+    fn test_outpoint_spend_lookup_on_corrupt_value_returns_error() {
+        let (store, _dir) = temp_store(false);
+        let prev = make_outpoint(0xaa, 0);
+        // Inject a malformed value (wrong length) directly via the CF
+        // handle, bypassing the codec. This simulates an on-disk
+        // corruption or a future codec mismatch.
+        let cf = store.cf(CF_OUTPOINT_SPEND);
+        let key = node_index::encode_outpoint_key(&prev);
+        store
+            .db
+            .put_cf(&cf, key, b"too-short")
+            .expect("inject corrupt row");
+
+        match store.lookup_spend(&prev) {
+            Err(StoreError::Database(msg)) => {
+                assert!(msg.contains("corrupt value"), "expected corrupt diag, got {msg}");
+            }
+            Err(other) => panic!("expected Database error, got {other:?}"),
+            Ok(v) => panic!("expected Err on corrupt value, got Ok({v:?})"),
+        }
     }
 
     #[test]
