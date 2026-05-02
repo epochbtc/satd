@@ -17,7 +17,7 @@ use tower_http::trace::TraceLayer;
 
 use crate::auth::AuthExpectation;
 use crate::config::EsploraConfig;
-use crate::handlers::chain;
+use crate::handlers::{block, chain};
 use crate::state::EsploraState;
 
 #[derive(Debug, thiserror::Error)]
@@ -45,6 +45,14 @@ pub fn build_router(state: EsploraState) -> Result<Router, RouterBuildError> {
         .route("/blocks", get(chain::blocks_recent))
         .route("/blocks/{start_height}", get(chain::blocks_at_or_below))
         .route("/block-height/{height}", get(chain::block_height))
+        .route("/block/{hash}", get(block::block_detail))
+        .route("/block/{hash}/header", get(block::block_header))
+        .route("/block/{hash}/raw", get(block::block_raw))
+        .route("/block/{hash}/status", get(block::block_status))
+        .route("/block/{hash}/txs", get(block::block_txs))
+        .route("/block/{hash}/txs/{start_index}", get(block::block_txs_page))
+        .route("/block/{hash}/txid/{index}", get(block::block_txid_at_index))
+        .route("/block/{hash}/txids", get(block::block_txids))
         .with_state(state);
 
     let routes = if cfg.auth.is_enabled() {

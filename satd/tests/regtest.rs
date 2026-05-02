@@ -5508,6 +5508,187 @@ fn test_esplora_port_conflict_fails_startup() {
     );
 }
 
+// ── Esplora block detail endpoints (PR 3) ──
+
+#[test]
+fn test_esplora_block_detail_populated() {
+    let esplora_port = find_available_port();
+    let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
+    let mut node = TestNode::start(&["--esplora=1", &bind]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let _ = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(2), serde_json::json!(addr)],
+        )
+        .unwrap();
+
+    let tip = esplora_get(esplora_port, "/blocks/tip/hash")
+        .text()
+        .unwrap()
+        .trim()
+        .to_string();
+    let r = esplora_get(esplora_port, &format!("/block/{}", tip));
+    assert_eq!(r.status(), 200);
+    let body: serde_json::Value = r.json().unwrap();
+    assert_eq!(body["id"].as_str().unwrap(), tip);
+    assert_eq!(body["height"].as_u64().unwrap(), 2);
+    assert_eq!(body["tx_count"].as_u64().unwrap(), 1, "regtest coinbase only");
+    assert!(body["size"].as_u64().unwrap() > 0);
+    assert!(body["weight"].as_u64().unwrap() > 0);
+
+    node.stop();
+}
+
+#[test]
+fn test_esplora_block_header_hex() {
+    let esplora_port = find_available_port();
+    let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
+    let mut node = TestNode::start(&["--esplora=1", &bind]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let _ = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(1), serde_json::json!(addr)],
+        )
+        .unwrap();
+    let tip = esplora_get(esplora_port, "/blocks/tip/hash")
+        .text()
+        .unwrap()
+        .trim()
+        .to_string();
+    let r = esplora_get(esplora_port, &format!("/block/{}/header", tip));
+    assert_eq!(r.status(), 200);
+    let hex_body = r.text().unwrap();
+    assert_eq!(hex_body.trim().len(), 160, "80-byte header = 160 hex chars");
+    node.stop();
+}
+
+#[test]
+fn test_esplora_block_raw_bytes() {
+    let esplora_port = find_available_port();
+    let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
+    let mut node = TestNode::start(&["--esplora=1", &bind]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let _ = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(1), serde_json::json!(addr)],
+        )
+        .unwrap();
+    let tip = esplora_get(esplora_port, "/blocks/tip/hash")
+        .text()
+        .unwrap()
+        .trim()
+        .to_string();
+    let r = esplora_get(esplora_port, &format!("/block/{}/raw", tip));
+    assert_eq!(r.status(), 200);
+    assert_eq!(
+        r.headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("application/octet-stream")
+    );
+    let bytes = r.bytes().unwrap();
+    assert!(bytes.len() > 80, "raw block must be > header size");
+    node.stop();
+}
+
+#[test]
+fn test_esplora_block_status_in_best_chain() {
+    let esplora_port = find_available_port();
+    let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
+    let mut node = TestNode::start(&["--esplora=1", &bind]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let _ = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(2), serde_json::json!(addr)],
+        )
+        .unwrap();
+
+    let h1 = esplora_get(esplora_port, "/block-height/1")
+        .text()
+        .unwrap()
+        .trim()
+        .to_string();
+    let r = esplora_get(esplora_port, &format!("/block/{}/status", h1));
+    assert_eq!(r.status(), 200);
+    let body: serde_json::Value = r.json().unwrap();
+    assert!(body["in_best_chain"].as_bool().unwrap());
+    assert_eq!(body["height"].as_u64().unwrap(), 1);
+    assert!(body["next_best"].as_str().is_some());
+
+    let tip = esplora_get(esplora_port, "/blocks/tip/hash")
+        .text()
+        .unwrap()
+        .trim()
+        .to_string();
+    let r2 = esplora_get(esplora_port, &format!("/block/{}/status", tip));
+    let body2: serde_json::Value = r2.json().unwrap();
+    assert!(body2["in_best_chain"].as_bool().unwrap());
+    assert!(body2.get("next_best").is_none());
+
+    node.stop();
+}
+
+#[test]
+fn test_esplora_block_txids_and_paging() {
+    let esplora_port = find_available_port();
+    let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
+    let mut node = TestNode::start(&["--esplora=1", &bind]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let _ = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(1), serde_json::json!(addr)],
+        )
+        .unwrap();
+    let tip = esplora_get(esplora_port, "/blocks/tip/hash")
+        .text()
+        .unwrap()
+        .trim()
+        .to_string();
+
+    let r = esplora_get(esplora_port, &format!("/block/{}/txids", tip));
+    assert_eq!(r.status(), 200);
+    let txids: Vec<String> = r.json().unwrap();
+    assert_eq!(txids.len(), 1);
+
+    let r2 = esplora_get(esplora_port, &format!("/block/{}/txid/0", tip));
+    assert_eq!(r2.status(), 200);
+    assert_eq!(r2.text().unwrap().trim(), txids[0]);
+
+    let r3 = esplora_get(esplora_port, &format!("/block/{}/txs", tip));
+    assert_eq!(r3.status(), 200);
+    let stubs: Vec<serde_json::Value> = r3.json().unwrap();
+    assert_eq!(stubs.len(), 1);
+    assert_eq!(stubs[0]["txid"].as_str().unwrap(), txids[0]);
+
+    node.stop();
+}
+
+#[test]
+fn test_esplora_block_bad_hash_returns_400() {
+    let esplora_port = find_available_port();
+    let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
+    let mut node = TestNode::start(&["--esplora=1", &bind]);
+    let r = esplora_get(esplora_port, "/block/not-a-hash");
+    assert_eq!(r.status(), 400);
+    node.stop();
+}
+
+#[test]
+fn test_esplora_block_unknown_hash_returns_404() {
+    let esplora_port = find_available_port();
+    let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
+    let mut node = TestNode::start(&["--esplora=1", &bind]);
+    let zero = "0".repeat(64);
+    let r = esplora_get(esplora_port, &format!("/block/{}", zero));
+    assert_eq!(r.status(), 404);
+    node.stop();
+}
+
 /// Cookie auth: when `--esploraauth=cookie`, requests without the
 /// Authorization header get 401, and cookie-authenticated requests
 /// succeed.
