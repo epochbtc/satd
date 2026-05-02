@@ -48,6 +48,13 @@ impl TestNode {
         if !has_port {
             cmd.arg(format!("--port={}", p2p_port));
         }
+        // Disable the Esplora server unless the test explicitly opts in
+        // — it binds a fixed port (default :3000) and would conflict
+        // across parallel TestNode instances.
+        let caller_sets_esplora = extra_args.iter().any(|a| a.starts_with("--esplora"));
+        if !caller_sets_esplora {
+            cmd.arg("--esplora=0");
+        }
         for arg in extra_args {
             cmd.arg(arg);
         }
@@ -168,6 +175,10 @@ impl TestNode {
             .arg(format!("--rpcport={}", rpcport));
         if !has_port {
             cmd.arg(format!("--port={}", p2p_port));
+        }
+        let caller_sets_esplora = extra_args.iter().any(|a| a.starts_with("--esplora"));
+        if !caller_sets_esplora {
+            cmd.arg("--esplora=0");
         }
         for arg in extra_args {
             cmd.arg(arg);
@@ -5280,5 +5291,256 @@ fn test_address_index_backfill_duplicate_rpc_race_rejected() {
     );
 
     poll_backfill_state(&node, &["completed"], Duration::from_secs(60));
+    node.stop();
+}
+
+// ── Esplora REST scaffolding (PR 2) ──
+
+/// Helper: GET a path from the Esplora server and return body as String.
+fn esplora_get(port: u16, path: &str) -> reqwest::blocking::Response {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    client
+        .get(format!("http://127.0.0.1:{}{}", port, path))
+        .send()
+        .expect("esplora GET")
+}
+
+/// Tip endpoints: `/blocks/tip/hash` and `/blocks/tip/height` must
+/// return plain-text responses matching upstream Esplora's shape.
+#[test]
+fn test_esplora_tip_hash_and_height_match_chain_state() {
+    let esplora_port = find_available_port();
+    let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
+    let mut node = TestNode::start(&["--esplora=1", &bind]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let _ = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(3), serde_json::json!(addr)],
+        )
+        .unwrap();
+
+    let h_resp = esplora_get(esplora_port, "/blocks/tip/height");
+    assert_eq!(h_resp.status(), 200);
+    let h: u32 = h_resp.text().unwrap().trim().parse().unwrap();
+    assert_eq!(h, 3);
+
+    let hash_resp = esplora_get(esplora_port, "/blocks/tip/hash");
+    assert_eq!(hash_resp.status(), 200);
+    let tip_hex = hash_resp.text().unwrap().trim().to_string();
+    assert_eq!(tip_hex.len(), 64, "tip hash is 32 raw bytes hex-encoded");
+
+    // /block-height/:h should agree with /blocks/tip/hash.
+    let by_height = esplora_get(esplora_port, &format!("/block-height/{}", h));
+    assert_eq!(by_height.status(), 200);
+    assert_eq!(by_height.text().unwrap().trim(), tip_hex);
+
+    node.stop();
+}
+
+/// `/blocks` returns up to 10 most recent block summaries, descending.
+#[test]
+fn test_esplora_blocks_recent_returns_descending_summaries() {
+    let esplora_port = find_available_port();
+    let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
+    let mut node = TestNode::start(&["--esplora=1", &bind]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let _ = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(5), serde_json::json!(addr)],
+        )
+        .unwrap();
+
+    let r = esplora_get(esplora_port, "/blocks");
+    assert_eq!(r.status(), 200);
+    let arr: Vec<serde_json::Value> = r.json().unwrap();
+    // 5 mined + genesis = 6, /blocks returns at most 10 → all 6.
+    assert_eq!(arr.len(), 6, "expected 6 block summaries; got {:?}", arr);
+
+    let mut last_height: i64 = i64::MAX;
+    for entry in &arr {
+        let h = entry["height"].as_i64().expect("height i64");
+        assert!(h < last_height, "/blocks must be height-descending");
+        last_height = h;
+        // Required upstream-Esplora fields.
+        assert!(entry["id"].as_str().is_some());
+        assert!(entry["timestamp"].as_u64().is_some());
+        assert!(entry["tx_count"].as_u64().is_some());
+        assert!(entry["nonce"].as_u64().is_some());
+    }
+
+    node.stop();
+}
+
+/// `/block-height/:h` for a height past tip returns 404.
+#[test]
+fn test_esplora_block_height_past_tip_404() {
+    let esplora_port = find_available_port();
+    let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
+    let mut node = TestNode::start(&["--esplora=1", &bind]);
+    let r = esplora_get(esplora_port, "/block-height/9999999");
+    assert_eq!(r.status(), 404);
+    node.stop();
+}
+
+/// `--esplora=0` keeps the listener silent — connections refuse.
+#[test]
+fn test_esplora_disabled_does_not_listen() {
+    let esplora_port = find_available_port();
+    let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
+    let mut node = TestNode::start(&["--esplora=0", &bind]);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap();
+    let r = client
+        .get(format!("http://127.0.0.1:{}/blocks/tip/height", esplora_port))
+        .send();
+    assert!(r.is_err(), "expected connection refused; got: {:?}", r);
+    node.stop();
+}
+
+/// `--esploraprefix=/api` mounts every route under that prefix. The
+/// unprefixed paths must 404, and the prefixed paths must serve.
+/// (Review H2.)
+#[test]
+fn test_esplora_prefix_mounts_under_path() {
+    let esplora_port = find_available_port();
+    let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
+    let mut node = TestNode::start(&[
+        "--esplora=1",
+        &bind,
+        "--esploraprefix=/api",
+    ]);
+
+    let with_prefix = esplora_get(esplora_port, "/api/blocks/tip/height");
+    assert_eq!(with_prefix.status(), 200);
+    assert!(
+        with_prefix
+            .text()
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .is_ok()
+    );
+
+    let without_prefix = esplora_get(esplora_port, "/blocks/tip/height");
+    assert_eq!(
+        without_prefix.status(),
+        404,
+        "unprefixed path must 404 when --esploraprefix=/api"
+    );
+    node.stop();
+}
+
+/// `--esploraauth=cookie --esploracookiefile=<missing>` must fail
+/// daemon startup, NOT silently start an unauthenticated listener.
+/// (Review H1.)
+#[test]
+fn test_esplora_missing_cookie_file_fails_startup() {
+    use std::process::Command;
+    let satd_bin = env!("CARGO_BIN_EXE_satd");
+    let rpcport = find_available_port();
+    let p2p_port = find_available_port();
+    let esplora_port = find_available_port();
+    let datadir = std::env::temp_dir().join(format!("satd-esplora-bad-cookie-{}", rpcport));
+    let _ = std::fs::create_dir_all(&datadir);
+    let missing = datadir.join("definitely-not-a-cookie");
+
+    let out = Command::new(satd_bin)
+        .arg("--regtest")
+        .arg(format!("--datadir={}", datadir.display()))
+        .arg(format!("--rpcport={}", rpcport))
+        .arg(format!("--port={}", p2p_port))
+        .arg("--esplora=1")
+        // PR #102 adds H3 (esplora requires --txindex=1); pass it so
+        // this PR's check (auth init) is the failure that fires.
+        .arg("--txindex")
+        .arg(format!("--esplorabind=127.0.0.1:{}", esplora_port))
+        .arg("--esploraauth=cookie")
+        .arg(format!("--esploracookiefile={}", missing.display()))
+        .output()
+        .expect("spawn satd");
+    assert!(!out.status.success(), "expected non-zero exit");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("esplora startup failed") || stderr.contains("auth init failed"),
+        "expected esplora auth failure in stderr; got: {stderr}"
+    );
+}
+
+/// Esplora bind to an already-taken port must fail daemon startup,
+/// not silently log a warning. (Review H4.)
+#[test]
+fn test_esplora_port_conflict_fails_startup() {
+    use std::net::TcpListener;
+    use std::process::Command;
+    let satd_bin = env!("CARGO_BIN_EXE_satd");
+    // Squat the port so satd can't bind it. Hold the listener for the
+    // lifetime of the satd process.
+    let squatter = TcpListener::bind("127.0.0.1:0").expect("squatter bind");
+    let occupied = squatter.local_addr().unwrap().port();
+    let rpcport = find_available_port();
+    let p2p_port = find_available_port();
+    let datadir = std::env::temp_dir().join(format!("satd-esplora-port-{}", rpcport));
+    let _ = std::fs::create_dir_all(&datadir);
+
+    let out = Command::new(satd_bin)
+        .arg("--regtest")
+        .arg(format!("--datadir={}", datadir.display()))
+        .arg(format!("--rpcport={}", rpcport))
+        .arg(format!("--port={}", p2p_port))
+        .arg("--esplora=1")
+        .arg("--txindex") // see note in test_esplora_missing_cookie_file_fails_startup
+        .arg(format!("--esplorabind=127.0.0.1:{}", occupied))
+        .output()
+        .expect("spawn satd");
+    drop(squatter);
+    assert!(!out.status.success(), "expected non-zero exit");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("could not bind"),
+        "expected bind failure in stderr; got: {stderr}"
+    );
+}
+
+/// Cookie auth: when `--esploraauth=cookie`, requests without the
+/// Authorization header get 401, and cookie-authenticated requests
+/// succeed.
+#[test]
+fn test_esplora_auth_cookie_gates_endpoints() {
+    let esplora_port = find_available_port();
+    let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
+    let mut node = TestNode::start(&[
+        "--esplora=1",
+        &bind,
+        "--esploraauth=cookie",
+    ]);
+
+    // No auth → 401.
+    let unauth = esplora_get(esplora_port, "/blocks/tip/height");
+    assert_eq!(unauth.status(), 401);
+
+    // With cookie → 200. The cookie path defaults to the JSON-RPC
+    // shared `.cookie`, which TestNode already read into `node.cookie`.
+    let auth = base64::engine::general_purpose::STANDARD.encode(node.cookie.trim());
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let r = client
+        .get(format!(
+            "http://127.0.0.1:{}/blocks/tip/height",
+            esplora_port
+        ))
+        .header("Authorization", format!("Basic {}", auth))
+        .send()
+        .expect("esplora GET with cookie");
+    assert_eq!(r.status(), 200, "expected 200 with cookie auth");
+
     node.stop();
 }

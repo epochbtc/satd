@@ -1,0 +1,23 @@
+[package]
+name = "esplora-handlers"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json", "matched-path", "query", "tracing"] }
+tower = { workspace = true, features = ["limit"] }
+tower-http = { workspace = true, features = ["cors", "timeout", "limit", "trace"] }
+hyper = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+bitcoin = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+base64 = { workspace = true }
+tokio = { workspace = true }
+node-index = { path = "../node-index" }
+node = { path = "../node" }
+
+[dev-dependencies]
+axum-test = "17"

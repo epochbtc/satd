@@ -215,6 +215,32 @@ impl Profile {
     }
 }
 
+/// Esplora authentication scheme. Mirrors `esplora_handlers::EsploraAuth`'s
+/// shape but lives here so resolution from CLI/config doesn't require a
+/// build-time dependency on the handlers crate (the daemon constructs
+/// the runtime `EsploraAuth` from this enum at startup).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum EsploraAuthMode {
+    #[default]
+    None,
+    Cookie,
+    UserPass,
+}
+
+impl std::str::FromStr for EsploraAuthMode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "none" => Ok(Self::None),
+            "cookie" => Ok(Self::Cookie),
+            "userpass" => Ok(Self::UserPass),
+            other => Err(format!(
+                "esplora_auth: expected one of none/cookie/userpass, got {other:?}"
+            )),
+        }
+    }
+}
+
 /// Per-field defaults contributed by a named `Profile`. None means the
 /// profile does not opine on this field.
 #[derive(Debug, Default, Clone, Copy)]
@@ -262,6 +288,29 @@ pub struct Config {
     /// memory growth from the per-scripthash broadcast registry.
     /// Default 10000 — generous for typical xpub-derivation patterns.
     pub addrindexsubscriptions: usize,
+    /// Native Esplora REST server (per `ECOSYSTEM.md` §4). On by
+    /// default; `--esplora=0` disables. Requires `--addressindex=1`.
+    pub esplora: bool,
+    /// `host:port` for the Esplora HTTP listener.
+    pub esplora_bind: String,
+    /// URL prefix to mount the API under (default `/`; `/api` for
+    /// `blockstream.info`-style deployments).
+    pub esplora_prefix: String,
+    /// Allowed CORS origins. Empty = no CORS.
+    pub esplora_cors: Vec<String>,
+    /// Per-request handler timeout (seconds).
+    pub esplora_request_timeout: u64,
+    /// Hard cap on concurrent in-flight Esplora requests.
+    pub esplora_max_conns: usize,
+    /// Authentication scheme: `none` (default), `cookie`, or
+    /// `userpass`. `none` matches public-Esplora deployments.
+    pub esplora_auth: EsploraAuthMode,
+    /// Path to the cookie file used when `esplora_auth = cookie`.
+    /// Defaults to the same `.cookie` file as JSON-RPC so a single
+    /// credential covers both surfaces.
+    pub esplora_cookie_file: Option<std::path::PathBuf>,
+    /// `user:pass` for `esplora_auth = userpass`.
+    pub esplora_userpass: Option<(String, String)>,
     pub prune: u64,
     pub reindex: bool,
     pub reindex_chainstate: bool,
@@ -531,6 +580,66 @@ impl Config {
             })
             .unwrap_or(10_000);
 
+        // Esplora REST server: on by default. Disabling requires
+        // turning off --addressindex too (Esplora reads through it),
+        // but we don't enforce that here — the daemon refuses to
+        // start the listener when addressindex=0 and logs the reason.
+        let esplora = cli
+            .esplora
+            .or_else(|| file_get("esplora").and_then(|v| parse_bool(&v)))
+            .unwrap_or(true);
+        let esplora_bind = cli
+            .esplorabind
+            .or_else(|| file_get("esplorabind"))
+            .unwrap_or_else(|| "127.0.0.1:3000".to_string());
+        let esplora_prefix = cli
+            .esploraprefix
+            .or_else(|| file_get("esploraprefix"))
+            .unwrap_or_else(|| "/".to_string());
+        let esplora_cors = {
+            let mut origins = cli.esploracors.clone();
+            if origins.is_empty() {
+                origins = file_get_all("esploracors");
+            }
+            origins
+        };
+        let esplora_request_timeout = cli
+            .esplorarequesttimeout
+            .or_else(|| {
+                file_get("esplorarequesttimeout").and_then(|v| v.parse().ok())
+            })
+            .unwrap_or(30);
+        let esplora_max_conns = cli
+            .esploramaxconns
+            .or_else(|| file_get("esploramaxconns").and_then(|v| v.parse().ok()))
+            .unwrap_or(256);
+        let esplora_auth = cli
+            .esploraauth
+            .or_else(|| file_get("esploraauth"))
+            .map(|s| s.parse::<EsploraAuthMode>())
+            .transpose()?
+            .unwrap_or_default();
+        let esplora_cookie_file = cli
+            .esploracookiefile
+            .or_else(|| file_get("esploracookiefile").map(std::path::PathBuf::from));
+        let esplora_userpass = cli
+            .esplorauserpass
+            .or_else(|| file_get("esplorauserpass"))
+            .map(|s| {
+                s.split_once(':')
+                    .map(|(u, p)| (u.to_string(), p.to_string()))
+                    .ok_or_else(|| {
+                        "esplorauserpass: expected user:pass form".to_string()
+                    })
+            })
+            .transpose()?;
+        if matches!(esplora_auth, EsploraAuthMode::UserPass) && esplora_userpass.is_none()
+        {
+            return Err(
+                "--esploraauth=userpass requires --esplorauserpass=user:pass".to_string(),
+            );
+        }
+
         let prune = cli
             .prune
             .or_else(|| file_get("prune").and_then(|v| v.parse().ok()))
@@ -574,6 +683,15 @@ impl Config {
             txindex,
             addressindex,
             addrindexsubscriptions,
+            esplora,
+            esplora_bind,
+            esplora_prefix,
+            esplora_cors,
+            esplora_request_timeout,
+            esplora_max_conns,
+            esplora_auth,
+            esplora_cookie_file,
+            esplora_userpass,
             prune,
             reindex: cli.reindex,
             reindex_chainstate: cli.reindex_chainstate,
@@ -895,6 +1013,33 @@ pub struct CliArgs {
     )]
     pub addrindexsubscriptions: Option<usize>,
 
+    #[arg(long, value_name = "BOOL", value_parser = parse_bool_arg, help = "Run the native Esplora REST server (default: true). Requires --addressindex=1.")]
+    pub esplora: Option<bool>,
+
+    #[arg(long, value_name = "ADDR:PORT", help = "Bind the Esplora REST listener (default: 127.0.0.1:3000)")]
+    pub esplorabind: Option<String>,
+
+    #[arg(long, value_name = "PATH", help = "URL prefix to mount the Esplora API under (default: /)")]
+    pub esploraprefix: Option<String>,
+
+    #[arg(long, value_name = "ORIGIN", help = "Allowed CORS origin for the Esplora server (repeat for multiple)")]
+    pub esploracors: Vec<String>,
+
+    #[arg(long, value_name = "SECS", help = "Per-request handler timeout for Esplora (default: 30)")]
+    pub esplorarequesttimeout: Option<u64>,
+
+    #[arg(long, value_name = "N", help = "Hard cap on concurrent in-flight Esplora requests (default: 256)")]
+    pub esploramaxconns: Option<usize>,
+
+    #[arg(long, value_name = "MODE", help = "Esplora authentication: none|cookie|userpass (default: none)")]
+    pub esploraauth: Option<String>,
+
+    #[arg(long, value_name = "PATH", help = "Path to cookie file when --esploraauth=cookie (default: shared with JSON-RPC)")]
+    pub esploracookiefile: Option<std::path::PathBuf>,
+
+    #[arg(long, value_name = "USER:PASS", help = "Static credentials when --esploraauth=userpass")]
+    pub esplorauserpass: Option<String>,
+
     #[arg(long, value_name = "MB", help = "Prune block data to target size in MB (0 = no pruning, default: 0)")]
     pub prune: Option<u64>,
 
@@ -1074,6 +1219,15 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "txindex",
         "addressindex",
         "addrindexsubscriptions",
+        "esplora",
+        "esplorabind",
+        "esploraprefix",
+        "esploracors",
+        "esplorarequesttimeout",
+        "esploramaxconns",
+        "esploraauth",
+        "esploracookiefile",
+        "esplorauserpass",
         "prune",
         "reindex",
         "reindex-chainstate",
@@ -1317,6 +1471,15 @@ rpcport=8332
             txindex: false,
             addressindex: None,
             addrindexsubscriptions: None,
+            esplora: None,
+            esplorabind: None,
+            esploraprefix: None,
+            esploracors: vec![],
+            esplorarequesttimeout: None,
+            esploramaxconns: None,
+            esploraauth: None,
+            esploracookiefile: None,
+            esplorauserpass: None,
             prune: None,
             reindex: false,
             reindex_chainstate: false,
@@ -1393,6 +1556,15 @@ rpcport=8332
             txindex: false,
             addressindex: None,
             addrindexsubscriptions: None,
+            esplora: None,
+            esplorabind: None,
+            esploraprefix: None,
+            esploracors: vec![],
+            esplorarequesttimeout: None,
+            esploramaxconns: None,
+            esploraauth: None,
+            esploracookiefile: None,
+            esplorauserpass: None,
             prune: None,
             reindex: false,
             reindex_chainstate: false,
