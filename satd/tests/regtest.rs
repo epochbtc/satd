@@ -52,8 +52,18 @@ impl TestNode {
         // — it binds a fixed port (default :3000) and would conflict
         // across parallel TestNode instances.
         let caller_sets_esplora = extra_args.iter().any(|a| a.starts_with("--esplora"));
+        let esplora_explicitly_on = extra_args
+            .iter()
+            .any(|a| *a == "--esplora=1" || *a == "--esplora=true");
         if !caller_sets_esplora {
             cmd.arg("--esplora=0");
+        }
+        // Esplora's tx + outspend endpoints require txindex; satd now
+        // refuses to start `--esplora=1 --txindex=0`. Auto-add the flag
+        // for tests that turn Esplora on but don't otherwise care.
+        let caller_sets_txindex = extra_args.iter().any(|a| a.starts_with("--txindex"));
+        if esplora_explicitly_on && !caller_sets_txindex {
+            cmd.arg("--txindex");
         }
         for arg in extra_args {
             cmd.arg(arg);
@@ -1822,6 +1832,9 @@ fn test_node_restart_persistence() {
                 .arg("--regtest")
                 .arg(format!("--datadir={}", datadir.display()))
                 .arg(format!("--rpcport={}", rpcport1))
+                // Esplora defaults on but requires txindex; tests
+                // spawning satd directly opt out unless they want it.
+                .arg("--esplora=0")
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .spawn()
@@ -1867,6 +1880,7 @@ fn test_node_restart_persistence() {
                 .arg("--regtest")
                 .arg(format!("--datadir={}", datadir.display()))
                 .arg(format!("--rpcport={}", rpcport2))
+                .arg("--esplora=0")
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .spawn()
@@ -3157,6 +3171,7 @@ fn test_log_format_json_emits_valid_json_with_trace_id() {
         .arg(format!("--rpcport={}", rpcport))
         .arg(format!("--port={}", p2p_port))
         .arg("--log-format=json")
+        .arg("--esplora=0")
         .stdout(log_file)
         .stderr(std::process::Stdio::null())
         .spawn()
@@ -5992,6 +6007,37 @@ fn test_esplora_tx_bad_txid_returns_400() {
     node.stop();
 }
 
+/// `--esplora=1 --txindex=0` must fail daemon startup with a clear
+/// message — not silently start a server whose tx endpoints will
+/// 404 every confirmed lookup. (Review H3.)
+#[test]
+fn test_esplora_without_txindex_fails_startup() {
+    use std::process::Command;
+    let satd_bin = env!("CARGO_BIN_EXE_satd");
+    let rpcport = find_available_port();
+    let p2p_port = find_available_port();
+    let esplora_port = find_available_port();
+    let datadir = std::env::temp_dir().join(format!("satd-esplora-no-txi-{}", rpcport));
+    let _ = std::fs::create_dir_all(&datadir);
+
+    let out = Command::new(satd_bin)
+        .arg("--regtest")
+        .arg(format!("--datadir={}", datadir.display()))
+        .arg(format!("--rpcport={}", rpcport))
+        .arg(format!("--port={}", p2p_port))
+        .arg("--esplora=1")
+        .arg(format!("--esplorabind=127.0.0.1:{}", esplora_port))
+        // Note: deliberately NOT passing --txindex.
+        .output()
+        .expect("spawn satd");
+    assert!(!out.status.success(), "expected non-zero exit");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("requires --txindex"),
+        "expected txindex-requirement message in stderr; got: {stderr}"
+    );
+}
+
 /// `/block/:hash/txs` now returns the full Esplora tx shape (replaces
 /// PR 3's `{txid}` stub).
 #[test]
@@ -6020,8 +6066,8 @@ fn test_esplora_block_txs_returns_full_tx_shape() {
     assert!(entry["vin"].is_array());
     assert!(entry["vout"].is_array());
     assert!(entry["status"].is_object());
-    // fee is Option<u64>: u64 (typically 0 for coinbase) or null when
-    // prevouts couldn't resolve.
+    // fee is `Option<u64>`: `Some(0)` for coinbase, otherwise number;
+    // null only when prevouts couldn't be resolved.
     assert!(entry["fee"].is_u64() || entry["fee"].is_null());
     assert!(entry["weight"].is_u64());
     node.stop();

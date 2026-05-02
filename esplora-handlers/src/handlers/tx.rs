@@ -126,7 +126,8 @@ pub struct PrevOutJson {
     pub scriptpubkey: String,
     pub scriptpubkey_asm: String,
     pub scriptpubkey_type: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Serialized as `null` for non-standard scripts to match upstream
+    /// Esplora's wire shape exactly (review L3).
     pub scriptpubkey_address: Option<String>,
     pub value: u64,
 }
@@ -151,7 +152,7 @@ pub struct VoutJson {
     pub scriptpubkey: String,
     pub scriptpubkey_asm: String,
     pub scriptpubkey_type: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// `null` for non-standard scripts (review L3).
     pub scriptpubkey_address: Option<String>,
     pub value: u64,
 }
@@ -165,7 +166,11 @@ pub struct TxJson {
     pub vout: Vec<VoutJson>,
     pub size: u32,
     pub weight: u32,
-    pub fee: u64,
+    /// Total input value − total output value. `null` when at least
+    /// one prevout could not be resolved (e.g. txindex disabled, the
+    /// previous tx is missing) — distinguishes "actually zero fee"
+    /// from "we can't tell" (review L4). `Some(0)` for coinbase txs.
+    pub fee: Option<u64>,
     pub status: TxStatusJson,
 }
 
@@ -330,10 +335,12 @@ fn build_tx_json(
         .collect();
 
     let sum_outputs: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
-    let fee = if tx.is_coinbase() || !have_all_prevouts {
-        0
+    let fee = if tx.is_coinbase() {
+        Some(0)
+    } else if !have_all_prevouts {
+        None
     } else {
-        sum_inputs.saturating_sub(sum_outputs)
+        Some(sum_inputs.saturating_sub(sum_outputs))
     };
 
     let status = match location {

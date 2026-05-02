@@ -9,6 +9,7 @@
 use std::sync::Arc;
 
 use axum::Router;
+use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
 use tower::limit::ConcurrencyLimitLayer;
 use tower_http::cors::{AllowOrigin, CorsLayer};
@@ -57,7 +58,15 @@ pub fn build_router(state: EsploraState) -> Result<Router, RouterBuildError> {
         .route("/tx/{txid}/status", get(tx::tx_status))
         .route("/tx/{txid}/hex", get(tx::tx_hex))
         .route("/tx/{txid}/raw", get(tx::tx_raw))
-        .route("/tx", post(tx::tx_broadcast))
+        // Body cap for broadcast: 256 KB covers any standard tx
+        // (consensus MAX_BLOCK_SIZE is 4 MB but standard policy
+        // weight maxes ~100 KB serialized; hex doubles that). Per-
+        // route layer so the cap doesn't apply to GET endpoints
+        // that don't accept bodies. (Review M4.)
+        .route(
+            "/tx",
+            post(tx::tx_broadcast).layer(DefaultBodyLimit::max(256 * 1024)),
+        )
         .with_state(state);
 
     let routes = if cfg.auth.is_enabled() {

@@ -759,15 +759,26 @@ async fn main() {
 
     // Start the Esplora REST server if enabled. Refuses to bind when
     // `--addressindex=0` so operators don't end up with an HTTP
-    // surface that 503's every read-side endpoint. Auth init failure,
-    // CORS validation failure, and bind failure are ALL fatal here —
-    // an operator who explicitly enabled Esplora must not see the
-    // daemon come up "successfully" without the listener (review H1, H4).
+    // surface that 503's every read-side endpoint. Also requires
+    // `--txindex=1` (review H3) — without it, confirmed tx lookups
+    // would 404 silently and fees would report as null. Auth init
+    // failure, CORS validation, and the listener bind itself are ALL
+    // fatal at startup (review H1, H4); an operator who explicitly
+    // enabled Esplora must not see the daemon come up "successfully"
+    // without the listener.
     if config.esplora {
         if !config.addressindex {
             tracing::warn!(
                 "esplora server requested but --addressindex=0; refusing to start (Esplora reads through the address index)"
             );
+        } else if !config.txindex {
+            eprintln!(
+                "Error: esplora requires --txindex=1 (confirmed tx lookups, prevout resolution, \
+                 and fee calculation depend on it). Restart with --txindex=1, or disable the \
+                 Esplora server with --esplora=0."
+            );
+            auth.cleanup();
+            std::process::exit(1);
         } else {
             let bind: SocketAddr = config
                 .esplora_bind
