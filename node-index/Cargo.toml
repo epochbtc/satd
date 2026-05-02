@@ -1,0 +1,10 @@
+[package]
+name = "node-index"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bitcoin = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }

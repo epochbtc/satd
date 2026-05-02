@@ -30,8 +30,8 @@ use bitcoin::Txid;
 use bitcoin::hashes::{Hash, sha256};
 use tokio::sync::broadcast;
 
-use crate::index::address::keys::Scripthash;
-use crate::index::address::types::StatusUpdate;
+use crate::keys::Scripthash;
+use crate::types::StatusUpdate;
 
 /// Per-scripthash status-update broadcaster. The notifier holds the
 /// `Mutex<HashMap<...>>`; subscribers hold a `Receiver` they got from

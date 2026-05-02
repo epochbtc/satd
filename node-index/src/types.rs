@@ -8,7 +8,7 @@
 
 use bitcoin::{OutPoint, Txid};
 
-use crate::index::address::keys::Scripthash;
+use crate::keys::Scripthash;
 
 /// Disabled / "not enabled" surface error. Returned by the trait when
 /// `--addressindex=0` is in effect so callers can distinguish "no rows
