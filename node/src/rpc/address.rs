@@ -155,6 +155,11 @@ fn index_error_to_rpc(e: IndexError) -> (i32, String) {
         // Use Core's "method not found / not enabled" error code so
         // tooling can detect a disabled-index server cleanly.
         IndexError::Disabled => (-32601, e.to_string()),
+        // Distinct application error code for "the index is enabled
+        // but its on-disk data is incomplete". -32605 is unused by
+        // Core; clients can detect and prompt the operator to
+        // reindex (round-3 H2).
+        IndexError::Incomplete => (-32605, e.to_string()),
         IndexError::Storage(_) => (-32603, e.to_string()),
     }
 }

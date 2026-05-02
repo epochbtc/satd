@@ -88,7 +88,7 @@ pub fn disconnect_block(
             continue;
         }
         let txid = txids[tx_idx];
-        for (vin, _input) in tx.input.iter().enumerate() {
+        for (vin, input) in tx.input.iter().enumerate() {
             let (_op_ser, coin) = undo.spent_coins.get(undo_cursor).ok_or(
                 DisconnectError::UndoExhausted {
                     height: block_height,
@@ -106,6 +106,14 @@ pub fn disconnect_block(
                 coin,
             ) {
                 batch.addr_spending_removes.push(key);
+            }
+            // outpoint_spend remove: keyed by the prev_outpoint, which
+            // lives on the input itself — no undo needed.
+            if let Some(op) = crate::index::outpoint_spend::emit::remove_key(
+                address_index,
+                input.previous_output,
+            ) {
+                batch.outpoint_spend_removes.push(op);
             }
             undo_cursor += 1;
         }
@@ -433,6 +441,10 @@ mod tests {
             batch.coin_removes.iter().any(|(op, _, _)| op.txid == coinbase_txid),
             "coinbase outputs should be in coin_removes"
         );
+
+        // outpoint_spend remove for the consumed UTXO must be present so
+        // the row written by connect_block doesn't survive a reorg.
+        assert_eq!(batch.outpoint_spend_removes, vec![outpoint]);
     }
 
     #[test]

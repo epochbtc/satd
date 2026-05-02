@@ -12,6 +12,7 @@ use crate::index::address::{
     AddrFundingKey, AddrFundingRow, AddrSpendingKey, AddrSpendingRow, Scripthash,
 };
 use crate::index::address::cursor::BackfillState;
+use crate::index::outpoint_spend::SpendingRef;
 use crate::storage::blockindex::BlockIndexEntry;
 use crate::storage::coinview::Coin;
 use crate::storage::undo::UndoData;
@@ -47,6 +48,13 @@ pub struct StoreBatch {
     pub addr_funding_removes: Vec<AddrFundingKey>,
     /// Address-history spending keys to remove (used by `disconnect_block`).
     pub addr_spending_removes: Vec<AddrSpendingKey>,
+    /// `outpoint_spend` rows: `(spent_outpoint, SpendingRef)`. Written by
+    /// `connect_block` for every input on the active chain so Esplora's
+    /// `outspend` and `gettxspendingprevout` (confirmed-side) can answer
+    /// in O(1).
+    pub outpoint_spend_puts: Vec<(OutPoint, SpendingRef)>,
+    /// Outpoints to remove from `outpoint_spend` (used by `disconnect_block`).
+    pub outpoint_spend_removes: Vec<OutPoint>,
     /// `(outpoint -> scripthash)` rows for the deferred backfill's pass-1
     /// temp CF. Empty for live `connect_block` writes.
     pub addr_backfill_temp_puts: Vec<(OutPoint, Scripthash)>,
@@ -128,6 +136,21 @@ impl StoreBatch {
         }
         self.addr_spending_puts.extend(other.addr_spending_puts);
         self.addr_spending_removes.extend(other.addr_spending_removes);
+
+        // outpoint_spend: same last-writer-wins by outpoint.
+        if !other.outpoint_spend_removes.is_empty() {
+            let drop: std::collections::HashSet<OutPoint> =
+                other.outpoint_spend_removes.iter().copied().collect();
+            self.outpoint_spend_puts.retain(|(op, _)| !drop.contains(op));
+        }
+        if !other.outpoint_spend_puts.is_empty() {
+            let drop: std::collections::HashSet<OutPoint> =
+                other.outpoint_spend_puts.iter().map(|(op, _)| *op).collect();
+            self.outpoint_spend_removes.retain(|op| !drop.contains(op));
+        }
+        self.outpoint_spend_puts.extend(other.outpoint_spend_puts);
+        self.outpoint_spend_removes
+            .extend(other.outpoint_spend_removes);
 
         // Backfill temp-CF rows. Last-writer-wins semantics by outpoint
         // would matter only if a single coalesced batch covered both
@@ -233,6 +256,33 @@ pub trait Store: Send + Sync {
         _sh: &Scripthash,
     ) -> Vec<(AddrSpendingKey, bitcoin::OutPoint)> {
         Vec::new()
+    }
+
+    /// Look up the input that spent `outpoint` on the active chain.
+    /// Returns `Ok(None)` when the outpoint is unspent (still in
+    /// `coins`) or has never existed; `Err` only on backend I/O
+    /// failure. Default: `Ok(None)` so non-Rocks backends don't claim
+    /// they have a spend index.
+    fn lookup_spend(&self, _outpoint: &OutPoint) -> Result<Option<SpendingRef>, StoreError> {
+        Ok(None)
+    }
+
+    /// True when the `outpoint_spend` index is fully populated for
+    /// every input on the active chain. Set on fresh datadir
+    /// creation, after `clear_chainstate`/`clear_all`, and after
+    /// address-backfill `mark_completed`. False when an upgraded
+    /// datadir still has historical `addr_spending` rows that
+    /// pre-date this index. Default: `true` for non-Rocks backends.
+    fn outpoint_spend_complete(&self) -> bool {
+        true
+    }
+
+    /// Stamp `outpoint_spend.complete` true. Called by the runner
+    /// when address backfill finishes pass 2 (which writes
+    /// outpoint_spend rows alongside addr_spending rows). Default:
+    /// no-op for backends that don't track the marker.
+    fn mark_outpoint_spend_complete(&self) -> Result<(), StoreError> {
+        Ok(())
     }
 
     /// Lazily create the deferred-backfill temp CF

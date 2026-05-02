@@ -356,6 +356,18 @@ pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError>
                     &coin,
                     outpoint,
                 );
+
+                // outpoint_spend index: keyed by the consumed outpoint
+                // so Esplora outspend / gettxspendingprevout can answer
+                // in O(1). Same flag, same atomic batch.
+                crate::index::outpoint_spend::emit::emit_spend(
+                    &mut batch,
+                    address_index,
+                    height,
+                    txid,
+                    in_idx as u32,
+                    outpoint,
+                );
             }
 
             // Sum outputs
@@ -1769,6 +1781,14 @@ mod tests {
         let row = &batch.addr_spending_puts[0];
         assert_eq!(row.height, 1);
         assert_eq!(row.prev_outpoint, outpoint);
+
+        // outpoint_spend rides the same hook: one row per consumed UTXO,
+        // keyed by the spent outpoint.
+        assert_eq!(batch.outpoint_spend_puts.len(), 1);
+        let (op, sref) = &batch.outpoint_spend_puts[0];
+        assert_eq!(*op, outpoint);
+        assert_eq!(sref.height, 1);
+        assert_eq!(sref.spending_vin, 0);
     }
 
     #[test]
@@ -1798,6 +1818,7 @@ mod tests {
 
         assert!(batch.addr_funding_puts.is_empty());
         assert!(batch.addr_spending_puts.is_empty());
+        assert!(batch.outpoint_spend_puts.is_empty());
     }
 
     #[test]
