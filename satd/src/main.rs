@@ -679,7 +679,7 @@ async fn main() {
         last_shutdown_clean,
         effective_config_view,
         mempool_history.clone(),
-        address_index,
+        address_index.clone(),
         config.addressindex,
         Some(backfill_handle.clone()),
         Some(backfill_cmd_tx.clone()),
@@ -755,6 +755,87 @@ async fn main() {
                 tracing::error!("Metrics HTTP server error: {}", e);
             }
         });
+    }
+
+    // Start the Esplora REST server if enabled. Refuses to bind when
+    // `--addressindex=0` so operators don't end up with an HTTP
+    // surface that 503's every read-side endpoint.
+    if config.esplora {
+        if !config.addressindex {
+            tracing::warn!(
+                "esplora server requested but --addressindex=0; refusing to start (Esplora reads through the address index)"
+            );
+        } else {
+            let bind: SocketAddr = config
+                .esplora_bind
+                .parse()
+                .expect("Invalid esplora bind address");
+            let auth_cfg = match &config.esplora_auth {
+                crate::config::EsploraAuthMode::None => esplora_handlers::EsploraAuth::None,
+                crate::config::EsploraAuthMode::Cookie => {
+                    let path = config
+                        .esplora_cookie_file
+                        .clone()
+                        .unwrap_or_else(|| net_datadir.join(".cookie"));
+                    esplora_handlers::EsploraAuth::Cookie { path }
+                }
+                crate::config::EsploraAuthMode::UserPass => {
+                    let (u, p) = config
+                        .esplora_userpass
+                        .clone()
+                        .expect("esplora userpass validated at config-load");
+                    esplora_handlers::EsploraAuth::UserPass {
+                        username: u,
+                        password: p,
+                    }
+                }
+            };
+            let esplora_cfg = esplora_handlers::EsploraConfig {
+                enabled: true,
+                bind: config.esplora_bind.clone(),
+                prefix: config.esplora_prefix.clone(),
+                cors_origins: config.esplora_cors.clone(),
+                request_timeout: std::time::Duration::from_secs(
+                    config.esplora_request_timeout,
+                ),
+                max_concurrency: config.esplora_max_conns,
+                auth: auth_cfg,
+            };
+            let state = esplora_handlers::EsploraState {
+                chain: chain_state.clone(),
+                mempool: mempool.clone(),
+                address_index: address_index.clone(),
+                spend_index: Arc::new(node::index::outpoint_spend::lookups::RocksSpendIndex::new(
+                    chain_state.store_ref().clone(),
+                    Arc::new(node::index::address::AddressIndexConfig {
+                        enabled: config.addressindex,
+                        max_subscriptions: config.addrindexsubscriptions,
+                        ..Default::default()
+                    }),
+                )),
+                fee_estimator: fee_estimator.clone(),
+                network: config.network,
+                config: Arc::new(esplora_cfg),
+            };
+            let router = esplora_handlers::build_router(state);
+            let mut esplora_shutdown = shutdown_rx.clone();
+            tokio::spawn(async move {
+                let listener = match tokio::net::TcpListener::bind(bind).await {
+                    Ok(l) => l,
+                    Err(e) => {
+                        tracing::error!(%bind, error = %e, "esplora listener bind failed");
+                        return;
+                    }
+                };
+                tracing::info!(%bind, "Esplora REST listening");
+                let serve = axum::serve(listener, router).with_graceful_shutdown(async move {
+                    let _ = esplora_shutdown.changed().await;
+                });
+                if let Err(e) = serve.await {
+                    tracing::error!(error = %e, "Esplora server error");
+                }
+            });
+        }
     }
 
     // Write PID file if requested

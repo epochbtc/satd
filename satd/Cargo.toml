@@ -5,7 +5,9 @@ edition.workspace = true
 
 [dependencies]
 node = { path = "../node" }
+esplora-handlers = { path = "../esplora-handlers" }
 satd-mcp = { path = "../mcp" }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 bitcoin = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
