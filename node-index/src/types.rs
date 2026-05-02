@@ -18,6 +18,14 @@ use crate::keys::Scripthash;
 pub enum IndexError {
     #[error("address index is disabled — restart with --addressindex=1 to enable")]
     Disabled,
+    /// The index is enabled but its on-disk data is known incomplete
+    /// (e.g. an upgrade-time gap detected by the
+    /// `outpoint_spend.complete` marker). Lookups can't safely return
+    /// `Ok(None)` for this state because callers would interpret it as
+    /// "definitively unspent / never seen" — surface explicitly so
+    /// they can either error out or fall through to a slower path.
+    #[error("index is incomplete — restart with --reindex-chainstate to populate historical rows")]
+    Incomplete,
     #[error("storage error: {0}")]
     Storage(String),
 }

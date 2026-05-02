@@ -4133,6 +4133,12 @@ fn test_address_index_getindexinfo_shape() {
     assert_eq!(bf["cursor_height"].as_u64(), Some(0));
     assert_eq!(bf["snapshot_height"].as_u64(), Some(0));
     assert_eq!(bf["estimated_remaining_seconds"].as_u64(), Some(0));
+    // outpoint_spend completeness — true on a fresh datadir
+    // (round-3 H2 fix surfaces this so operators / tooling can
+    // detect upgrade-time gaps).
+    let os = &addr["outpoint_spend"];
+    assert!(os.is_object(), "outpoint_spend key missing: {}", resp);
+    assert_eq!(os["complete"].as_bool(), Some(true));
     node.stop();
 }
 

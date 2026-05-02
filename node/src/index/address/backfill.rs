@@ -250,12 +250,14 @@ impl BackfillHandle {
                 ..cur
             },
         )?;
-        // Pass 2 wrote outpoint_spend rows alongside addr_spending rows
-        // for the entire snapshot range. The pre-snapshot range is
-        // empty by construction (genesis 0..=snapshot_height covers
-        // every block). With both halves populated, stamp the
-        // completeness marker so the open-time warning stops firing.
-        let _ = store.mark_outpoint_spend_complete();
+        // Pass 2 wrote outpoint_spend rows alongside addr_spending
+        // rows for the entire snapshot range. With both halves
+        // populated, stamp the completeness marker so the open-time
+        // warning stops firing. Propagate the error rather than
+        // dropping it (round-3 M3): a "completed" status with a
+        // failed marker write would defeat the marker's purpose as
+        // a reliable completion signal.
+        store.mark_outpoint_spend_complete()?;
         Ok(())
     }
 

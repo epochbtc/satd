@@ -85,6 +85,20 @@ pub fn get_index_info(
     }
     address.insert("backfill".into(), Value::Object(bf));
 
+    // outpoint_spend completeness — exposed under the address-index
+    // sibling because outpoint_spend rides the same on-disk lifecycle
+    // (populated by connect_block / cleared by clear_chainstate /
+    // stamped complete by backfill mark_completed). Operators reading
+    // this field see whether `/tx/:txid/outspend/...` and
+    // `gettxspendingprevout` (confirmed-side) can be trusted to
+    // distinguish "unspent" from "we don't know" (round-3 H2).
+    let mut outpoint_spend = serde_json::Map::new();
+    outpoint_spend.insert(
+        "complete".into(),
+        json!(chain.store_ref().outpoint_spend_complete()),
+    );
+    address.insert("outpoint_spend".into(), Value::Object(outpoint_spend));
+
     json!({ "address": Value::Object(address) })
 }
 

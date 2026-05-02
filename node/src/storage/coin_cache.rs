@@ -764,6 +764,24 @@ impl Store for CoinCache {
     fn write_backfill_last_error(&self, msg: &str) -> Result<(), StoreError> {
         self.inner.write_backfill_last_error(msg)
     }
+
+    // Outpoint-spend completeness marker forwarders. Without these,
+    // the trait defaults (return `true` / no-op) leak through and
+    // mask the upgrade-gap detection done at store-open time.
+    fn outpoint_spend_complete(&self) -> bool {
+        self.inner.outpoint_spend_complete()
+    }
+
+    fn mark_outpoint_spend_complete(&self) -> Result<(), StoreError> {
+        self.inner.mark_outpoint_spend_complete()
+    }
+
+    fn lookup_spend(
+        &self,
+        outpoint: &OutPoint,
+    ) -> Result<Option<node_index::SpendingRef>, StoreError> {
+        self.inner.lookup_spend(outpoint)
+    }
 }
 
 #[cfg(test)]
