@@ -49,7 +49,10 @@ pub async fn block_detail(
         .ok_or(EsploraError::NotFound)?;
     let size = serialize(&block).len() as u32;
     let weight = block.weight().to_wu() as u32;
-    let mediantime = entry.header.time;
+    // Median Time Past is the median of the timestamps for the prior
+    // 11 blocks (BIP113). Header time is the wall-clock the miner
+    // chose; consensus and most explorer UIs reference MTP. (Review M2.)
+    let mediantime = state.chain.get_median_time_past(entry.height);
     Ok(Json(block_header_json(
         &hash,
         &entry,
@@ -192,10 +195,17 @@ pub async fn block_txs_page(
         .chain
         .get_block(&hash)
         .ok_or(EsploraError::NotFound)?;
-    if start_index >= block.txdata.len() && !block.txdata.is_empty() {
-        return Err(EsploraError::NotFound);
+    // Empty page on out-of-range matches upstream Esplora's
+    // pagination contract — clients distinguish "block missing" (404)
+    // from "no more txs at this offset" (empty array). Saturating
+    // arithmetic prevents a `usize::MAX` request from panicking on
+    // overflow (review H5).
+    if start_index >= block.txdata.len() {
+        return Ok(Json(Vec::new()));
     }
-    let end = (start_index + BLOCK_TXS_PAGE).min(block.txdata.len());
+    let end = start_index
+        .saturating_add(BLOCK_TXS_PAGE)
+        .min(block.txdata.len());
     Ok(Json(
         block.txdata[start_index..end]
             .iter()

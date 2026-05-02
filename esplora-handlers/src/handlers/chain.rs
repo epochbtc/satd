@@ -15,6 +15,7 @@ use axum::extract::{Path, State};
 
 use crate::encode::{BlockHeaderJson, block_header_json};
 use crate::error::{EsploraError, EsploraResult};
+use crate::handlers::block::try_compute_block_size_weight;
 use crate::state::EsploraState;
 
 /// `/blocks/tip/hash`. Plain-text big-endian hex (matches upstream).
@@ -81,19 +82,21 @@ fn collect_blocks_descending(
         let Some(entry) = state.chain.get_block_index(&hash) else {
             break;
         };
-        // PR 2 ships the bare-bones header summary. PR 3 fills in
-        // `size` / `weight` / `mediantime` from block data on the
-        // block-detail handler; here we report 0 for the size/weight
-        // fields and the header timestamp for `mediantime`. Upstream
-        // BDK consumers tolerate this for the tip-list shape — they
-        // call /block/:hash for full detail.
-        let mediantime = entry.header.time;
+        // Pull real size/weight from the block data on flat files
+        // (review M1) and real Median Time Past from the chain (M2).
+        // The flat-file read costs ~one open per block on this 10-block
+        // page; for /blocks endpoints called from public Esplora
+        // consumers this is acceptable — bigger optimization options
+        // (cached size/weight on the block index entry) can come in a
+        // follow-up if profiling shows a hotspot.
+        let (size, weight) = try_compute_block_size_weight(state, &hash).unwrap_or((0, 0));
+        let mediantime = state.chain.get_median_time_past(entry.height);
         out.push(block_header_json(
             &hash,
             &entry,
             state.network,
-            0,
-            0,
+            size,
+            weight,
             mediantime,
         ));
     }

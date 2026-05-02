@@ -5668,6 +5668,79 @@ fn test_esplora_block_txids_and_paging() {
     node.stop();
 }
 
+/// `/block/:hash/txs/:start_index` returns an empty array for an
+/// in-range-but-past-end offset, and tolerates `usize::MAX` without
+/// panicking. (Review H5.)
+#[test]
+fn test_esplora_block_txs_pagination_past_end_returns_empty() {
+    let esplora_port = find_available_port();
+    let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
+    let mut node = TestNode::start(&["--esplora=1", &bind]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let _ = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(1), serde_json::json!(addr)],
+        )
+        .unwrap();
+    let tip = esplora_get(esplora_port, "/blocks/tip/hash")
+        .text()
+        .unwrap()
+        .trim()
+        .to_string();
+
+    // Offset == len → empty array, not 404 / panic.
+    let r = esplora_get(esplora_port, &format!("/block/{}/txs/1", tip));
+    assert_eq!(r.status(), 200);
+    let arr: Vec<serde_json::Value> = r.json().unwrap();
+    assert!(arr.is_empty());
+
+    // usize::MAX must be saturated, not overflow-panic.
+    let r2 = esplora_get(
+        esplora_port,
+        &format!("/block/{}/txs/{}", tip, usize::MAX),
+    );
+    assert_eq!(r2.status(), 200);
+    let arr2: Vec<serde_json::Value> = r2.json().unwrap();
+    assert!(arr2.is_empty());
+
+    node.stop();
+}
+
+/// `/blocks` returns real `size`/`weight` from flat-file data (no
+/// longer the PR-2 placeholder zeros). (Review M1.)
+#[test]
+fn test_esplora_blocks_recent_reports_real_size_weight() {
+    let esplora_port = find_available_port();
+    let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
+    let mut node = TestNode::start(&["--esplora=1", &bind]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let _ = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(2), serde_json::json!(addr)],
+        )
+        .unwrap();
+    let r = esplora_get(esplora_port, "/blocks");
+    let arr: Vec<serde_json::Value> = r.json().unwrap();
+    // Inspect the most recent (non-genesis) entries — genesis is
+    // small but the regtest coinbase blocks must report >0.
+    let non_genesis: Vec<&serde_json::Value> =
+        arr.iter().filter(|e| e["height"].as_u64() != Some(0)).collect();
+    assert!(!non_genesis.is_empty());
+    for entry in non_genesis {
+        assert!(
+            entry["size"].as_u64().unwrap() > 0,
+            "non-genesis block size must be > 0; entry: {entry}"
+        );
+        assert!(
+            entry["weight"].as_u64().unwrap() > 0,
+            "non-genesis block weight must be > 0; entry: {entry}"
+        );
+    }
+    node.stop();
+}
+
 #[test]
 fn test_esplora_block_bad_hash_returns_400() {
     let esplora_port = find_available_port();
