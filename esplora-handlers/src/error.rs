@@ -22,6 +22,14 @@ impl From<node_index::IndexError> for EsploraError {
     fn from(value: node_index::IndexError) -> Self {
         match value {
             node_index::IndexError::Disabled => EsploraError::IndexDisabled,
+            // The address/spend index lookup couldn't return a
+            // definitive answer because on-disk data is incomplete
+            // (e.g. an upgrade gap). 503 mirrors the disabled path
+            // so clients treat both as transient. Round-3 H2 added
+            // the variant in node-index; the mapping arm needs to
+            // exist in this PR for the intermediate stack heads to
+            // compile (round-4 B1).
+            node_index::IndexError::Incomplete => EsploraError::ServiceUnavailable,
             node_index::IndexError::Storage(s) => EsploraError::Internal(s),
         }
     }
