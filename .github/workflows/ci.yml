@@ -43,6 +43,14 @@ jobs:
         run: cargo build --all --locked
 
       - name: Run tests
+        # Cap test parallelism. The default (one thread per CPU) lets the
+        # regtest harness spin up 8+ satd processes simultaneously, each
+        # opening RocksDB; on the self-hosted runner that contention has
+        # repeatedly tripped the per-test startup watchdog under load.
+        # Four parallel workers keeps wall-clock reasonable while leaving
+        # the runner enough headroom to bind RPC/P2P listeners promptly.
+        env:
+          RUST_TEST_THREADS: "4"
         run: cargo test --all --locked --all-targets
 
       - name: Clean build artifacts
