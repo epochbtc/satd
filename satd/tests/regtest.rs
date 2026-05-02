@@ -5508,6 +5508,299 @@ fn test_esplora_port_conflict_fails_startup() {
     );
 }
 
+// ── Esplora block detail endpoints (PR 3) ──
+
+#[test]
+fn test_esplora_block_detail_populated() {
+    let esplora_port = find_available_port();
+    let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
+    let mut node = TestNode::start(&["--esplora=1", &bind]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let _ = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(2), serde_json::json!(addr)],
+        )
+        .unwrap();
+
+    let tip = esplora_get(esplora_port, "/blocks/tip/hash")
+        .text()
+        .unwrap()
+        .trim()
+        .to_string();
+    let r = esplora_get(esplora_port, &format!("/block/{}", tip));
+    assert_eq!(r.status(), 200);
+    let body: serde_json::Value = r.json().unwrap();
+    assert_eq!(body["id"].as_str().unwrap(), tip);
+    assert_eq!(body["height"].as_u64().unwrap(), 2);
+    assert_eq!(body["tx_count"].as_u64().unwrap(), 1, "regtest coinbase only");
+    assert!(body["size"].as_u64().unwrap() > 0);
+    assert!(body["weight"].as_u64().unwrap() > 0);
+
+    node.stop();
+}
+
+#[test]
+fn test_esplora_block_header_hex() {
+    let esplora_port = find_available_port();
+    let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
+    let mut node = TestNode::start(&["--esplora=1", &bind]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let _ = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(1), serde_json::json!(addr)],
+        )
+        .unwrap();
+    let tip = esplora_get(esplora_port, "/blocks/tip/hash")
+        .text()
+        .unwrap()
+        .trim()
+        .to_string();
+    let r = esplora_get(esplora_port, &format!("/block/{}/header", tip));
+    assert_eq!(r.status(), 200);
+    let hex_body = r.text().unwrap();
+    assert_eq!(hex_body.trim().len(), 160, "80-byte header = 160 hex chars");
+    node.stop();
+}
+
+#[test]
+fn test_esplora_block_raw_bytes() {
+    let esplora_port = find_available_port();
+    let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
+    let mut node = TestNode::start(&["--esplora=1", &bind]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let _ = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(1), serde_json::json!(addr)],
+        )
+        .unwrap();
+    let tip = esplora_get(esplora_port, "/blocks/tip/hash")
+        .text()
+        .unwrap()
+        .trim()
+        .to_string();
+    let r = esplora_get(esplora_port, &format!("/block/{}/raw", tip));
+    assert_eq!(r.status(), 200);
+    assert_eq!(
+        r.headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("application/octet-stream")
+    );
+    let bytes = r.bytes().unwrap();
+    assert!(bytes.len() > 80, "raw block must be > header size");
+    node.stop();
+}
+
+#[test]
+fn test_esplora_block_status_in_best_chain() {
+    let esplora_port = find_available_port();
+    let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
+    let mut node = TestNode::start(&["--esplora=1", &bind]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let _ = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(2), serde_json::json!(addr)],
+        )
+        .unwrap();
+
+    let h1 = esplora_get(esplora_port, "/block-height/1")
+        .text()
+        .unwrap()
+        .trim()
+        .to_string();
+    let r = esplora_get(esplora_port, &format!("/block/{}/status", h1));
+    assert_eq!(r.status(), 200);
+    let body: serde_json::Value = r.json().unwrap();
+    assert!(body["in_best_chain"].as_bool().unwrap());
+    assert_eq!(body["height"].as_u64().unwrap(), 1);
+    assert!(body["next_best"].as_str().is_some());
+
+    let tip = esplora_get(esplora_port, "/blocks/tip/hash")
+        .text()
+        .unwrap()
+        .trim()
+        .to_string();
+    let r2 = esplora_get(esplora_port, &format!("/block/{}/status", tip));
+    let body2: serde_json::Value = r2.json().unwrap();
+    assert!(body2["in_best_chain"].as_bool().unwrap());
+    assert!(body2.get("next_best").is_none());
+
+    node.stop();
+}
+
+#[test]
+fn test_esplora_block_txids_and_paging() {
+    let esplora_port = find_available_port();
+    let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
+    let mut node = TestNode::start(&["--esplora=1", &bind]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let _ = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(1), serde_json::json!(addr)],
+        )
+        .unwrap();
+    let tip = esplora_get(esplora_port, "/blocks/tip/hash")
+        .text()
+        .unwrap()
+        .trim()
+        .to_string();
+
+    let r = esplora_get(esplora_port, &format!("/block/{}/txids", tip));
+    assert_eq!(r.status(), 200);
+    let txids: Vec<String> = r.json().unwrap();
+    assert_eq!(txids.len(), 1);
+
+    let r2 = esplora_get(esplora_port, &format!("/block/{}/txid/0", tip));
+    assert_eq!(r2.status(), 200);
+    assert_eq!(r2.text().unwrap().trim(), txids[0]);
+
+    let r3 = esplora_get(esplora_port, &format!("/block/{}/txs", tip));
+    assert_eq!(r3.status(), 200);
+    let stubs: Vec<serde_json::Value> = r3.json().unwrap();
+    assert_eq!(stubs.len(), 1);
+    assert_eq!(stubs[0]["txid"].as_str().unwrap(), txids[0]);
+
+    node.stop();
+}
+
+/// `/block/:hash/txs/:start_index` returns an empty array for an
+/// in-range-but-past-end offset, and tolerates `usize::MAX` without
+/// panicking. (Review H5.)
+#[test]
+fn test_esplora_block_txs_pagination_past_end_returns_empty() {
+    let esplora_port = find_available_port();
+    let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
+    let mut node = TestNode::start(&["--esplora=1", &bind]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let _ = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(1), serde_json::json!(addr)],
+        )
+        .unwrap();
+    let tip = esplora_get(esplora_port, "/blocks/tip/hash")
+        .text()
+        .unwrap()
+        .trim()
+        .to_string();
+
+    // Offset == len → empty array, not 404 / panic.
+    let r = esplora_get(esplora_port, &format!("/block/{}/txs/1", tip));
+    assert_eq!(r.status(), 200);
+    let arr: Vec<serde_json::Value> = r.json().unwrap();
+    assert!(arr.is_empty());
+
+    // usize::MAX must be saturated, not overflow-panic.
+    let r2 = esplora_get(
+        esplora_port,
+        &format!("/block/{}/txs/{}", tip, usize::MAX),
+    );
+    assert_eq!(r2.status(), 200);
+    let arr2: Vec<serde_json::Value> = r2.json().unwrap();
+    assert!(arr2.is_empty());
+
+    node.stop();
+}
+
+/// `mediantime` for the tip includes the tip's own header time in
+/// the median set, not just its 11 ancestors. (Round-2 M2.) Mining
+/// a single block past genesis yields a tip whose `mediantime`
+/// should equal the tip's own header time (not genesis time, which
+/// is what the off-by-one helper would return).
+#[test]
+fn test_esplora_block_mediantime_includes_target_block() {
+    let esplora_port = find_available_port();
+    let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
+    let mut node = TestNode::start(&["--esplora=1", &bind]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let _ = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(1), serde_json::json!(addr)],
+        )
+        .unwrap();
+    let tip = esplora_get(esplora_port, "/blocks/tip/hash")
+        .text()
+        .unwrap()
+        .trim()
+        .to_string();
+    let body: serde_json::Value = esplora_get(esplora_port, &format!("/block/{}", tip))
+        .json()
+        .unwrap();
+    let header_time = body["timestamp"].as_u64().unwrap();
+    let mediantime = body["mediantime"].as_u64().unwrap();
+    // With 2 blocks total (genesis + the one mined), the median of
+    // {genesis_time, tip_time} is the larger of the two (since
+    // even-length medians return the upper-middle). For monotonic
+    // regtest timestamps that's the tip's own time. The off-by-one
+    // helper would have returned genesis time.
+    assert_eq!(
+        mediantime, header_time,
+        "tip mediantime must include the tip itself; off-by-one would return genesis"
+    );
+    node.stop();
+}
+
+/// `/blocks` returns real `size`/`weight` from flat-file data (no
+/// longer the PR-2 placeholder zeros). (Review M1.)
+#[test]
+fn test_esplora_blocks_recent_reports_real_size_weight() {
+    let esplora_port = find_available_port();
+    let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
+    let mut node = TestNode::start(&["--esplora=1", &bind]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let _ = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(2), serde_json::json!(addr)],
+        )
+        .unwrap();
+    let r = esplora_get(esplora_port, "/blocks");
+    let arr: Vec<serde_json::Value> = r.json().unwrap();
+    // Inspect the most recent (non-genesis) entries — genesis is
+    // small but the regtest coinbase blocks must report >0.
+    let non_genesis: Vec<&serde_json::Value> =
+        arr.iter().filter(|e| e["height"].as_u64() != Some(0)).collect();
+    assert!(!non_genesis.is_empty());
+    for entry in non_genesis {
+        assert!(
+            entry["size"].as_u64().unwrap() > 0,
+            "non-genesis block size must be > 0; entry: {entry}"
+        );
+        assert!(
+            entry["weight"].as_u64().unwrap() > 0,
+            "non-genesis block weight must be > 0; entry: {entry}"
+        );
+    }
+    node.stop();
+}
+
+#[test]
+fn test_esplora_block_bad_hash_returns_400() {
+    let esplora_port = find_available_port();
+    let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
+    let mut node = TestNode::start(&["--esplora=1", &bind]);
+    let r = esplora_get(esplora_port, "/block/not-a-hash");
+    assert_eq!(r.status(), 400);
+    node.stop();
+}
+
+#[test]
+fn test_esplora_block_unknown_hash_returns_404() {
+    let esplora_port = find_available_port();
+    let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
+    let mut node = TestNode::start(&["--esplora=1", &bind]);
+    let zero = "0".repeat(64);
+    let r = esplora_get(esplora_port, &format!("/block/{}", zero));
+    assert_eq!(r.status(), 404);
+    node.stop();
+}
+
 /// Cookie auth: when `--esploraauth=cookie`, requests without the
 /// Authorization header get 401, and cookie-authenticated requests
 /// succeed.
