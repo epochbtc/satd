@@ -267,6 +267,24 @@ pub trait Store: Send + Sync {
         Ok(None)
     }
 
+    /// True when the `outpoint_spend` index is fully populated for
+    /// every input on the active chain. Set on fresh datadir
+    /// creation, after `clear_chainstate`/`clear_all`, and after
+    /// address-backfill `mark_completed`. False when an upgraded
+    /// datadir still has historical `addr_spending` rows that
+    /// pre-date this index. Default: `true` for non-Rocks backends.
+    fn outpoint_spend_complete(&self) -> bool {
+        true
+    }
+
+    /// Stamp `outpoint_spend.complete` true. Called by the runner
+    /// when address backfill finishes pass 2 (which writes
+    /// outpoint_spend rows alongside addr_spending rows). Default:
+    /// no-op for backends that don't track the marker.
+    fn mark_outpoint_spend_complete(&self) -> Result<(), StoreError> {
+        Ok(())
+    }
+
     /// Lazily create the deferred-backfill temp CF
     /// (`addr_backfill_outpoint_to_scripthash`). Idempotent: succeeds if
     /// the CF already exists. Default: error so non-Rocks backends fail

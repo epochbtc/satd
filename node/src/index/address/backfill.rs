@@ -249,7 +249,14 @@ impl BackfillHandle {
                 state: BackfillState::Completed,
                 ..cur
             },
-        )
+        )?;
+        // Pass 2 wrote outpoint_spend rows alongside addr_spending rows
+        // for the entire snapshot range. The pre-snapshot range is
+        // empty by construction (genesis 0..=snapshot_height covers
+        // every block). With both halves populated, stamp the
+        // completeness marker so the open-time warning stops firing.
+        let _ = store.mark_outpoint_spend_complete();
+        Ok(())
     }
 
     /// Mark Cancelled. Caller drops the temp CF after this returns Ok.
