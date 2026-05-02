@@ -243,6 +243,27 @@ impl BackfillHandle {
                 to: "completed",
             });
         }
+        // Stamp the marker BEFORE the cursor transitions to
+        // Completed. The two writes can't trivially be combined into
+        // one atomic operation; ordering them this way makes a
+        // mid-call crash recover correctly:
+        //
+        //   - crash AFTER marker, BEFORE cursor: cursor stays
+        //     Running/Paused → supervisor resumes pass 2 next start
+        //     → idempotent re-writes (rows are byte-identical) →
+        //     mark_completed runs again, marker already true, cursor
+        //     advances to Completed.
+        //   - crash AFTER marker, AFTER cursor: terminal state, no
+        //     recovery needed.
+        //
+        // The opposite order would leave cursor=Completed with
+        // marker=false on crash, after which `SpendIndex` (round-3 H2)
+        // would refuse outspend lookups forever — a completed
+        // backfill with a permanently-incomplete marker. (Round-4 M2.)
+        //
+        // At this point, pass 2 has finished writing every row for
+        // the snapshot range, so the marker reflects truth.
+        store.mark_outpoint_spend_complete()?;
         self.persist(
             store,
             BackfillCursor {
@@ -250,14 +271,6 @@ impl BackfillHandle {
                 ..cur
             },
         )?;
-        // Pass 2 wrote outpoint_spend rows alongside addr_spending
-        // rows for the entire snapshot range. With both halves
-        // populated, stamp the completeness marker so the open-time
-        // warning stops firing. Propagate the error rather than
-        // dropping it (round-3 M3): a "completed" status with a
-        // failed marker write would defeat the marker's purpose as
-        // a reliable completion signal.
-        store.mark_outpoint_spend_complete()?;
         Ok(())
     }
 
