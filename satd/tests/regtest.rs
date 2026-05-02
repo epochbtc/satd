@@ -83,7 +83,11 @@ impl TestNode {
         } else {
             (String::new(), String::new())
         };
-        let deadline = Instant::now() + Duration::from_secs(60);
+        // Bumped from 60s after observing CI-load startup races where
+        // a satd process needed >60s to bind its RPC listener while
+        // many parallel test workers were contending for the runner.
+        // 120s is generous; locally satd is ready in <2s.
+        let deadline = Instant::now() + Duration::from_secs(120);
         let cookie_path = datadir.join("regtest").join(".cookie");
         loop {
             let rpc_ready = if uses_userpass {
@@ -198,7 +202,9 @@ impl TestNode {
             .expect("Failed to start satd");
 
         let cookie_path = datadir.join("regtest").join(".cookie");
-        let deadline = Instant::now() + Duration::from_secs(60);
+        // See note on the matching deadline in `start_with_env`: 60s is
+        // not enough under CI runner load; bumped to 120s.
+        let deadline = Instant::now() + Duration::from_secs(120);
         loop {
             if let Ok(cookie) = std::fs::read_to_string(&cookie_path) {
                 let auth = base64::engine::general_purpose::STANDARD.encode(cookie.trim());
@@ -1761,7 +1767,8 @@ fn test_node_restart_persistence() {
     // initialized (matches the pattern used by `TestNode::start`).
     let wait_for_cookie = |dir: &std::path::Path, port: u16| -> String {
         let cookie_path = dir.join("regtest").join(".cookie");
-        let deadline = Instant::now() + Duration::from_secs(60);
+        // 120s for the same CI-load reasons documented in TestNode::start.
+        let deadline = Instant::now() + Duration::from_secs(120);
         loop {
             if let Ok(cookie) = std::fs::read_to_string(&cookie_path) {
                 let (user, pass) = cookie
@@ -3456,7 +3463,9 @@ mod raw_p2p {
         /// only intended for tests.
         pub fn connect(p2p_port: u16) -> Self {
             let addr = format!("127.0.0.1:{}", p2p_port);
-            let deadline = Instant::now() + Duration::from_secs(10);
+            // Bumped from 10s after observing CI-load races where the
+            // P2P listener came up fractionally after RPC ready.
+            let deadline = Instant::now() + Duration::from_secs(30);
             let stream = loop {
                 match TcpStream::connect_timeout(
                     &addr.parse().unwrap(),
@@ -3495,8 +3504,9 @@ mod raw_p2p {
 
             // 2. Read messages until we see both a Version and a Verack
             //    from the node. Order observed: Version → SendAddrV2 →
-            //    Verack, but don't hard-code.
-            let deadline = Instant::now() + Duration::from_secs(10);
+            //    Verack, but don't hard-code. 30s for the same CI-load
+            //    margin documented on the connect deadline above.
+            let deadline = Instant::now() + Duration::from_secs(30);
             let mut saw_version = false;
             let mut saw_verack = false;
             while !(saw_version && saw_verack) {
