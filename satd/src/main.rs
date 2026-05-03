@@ -446,6 +446,28 @@ async fn main() {
         shutdown_rx.clone(),
     );
 
+    // Build configured external sinks. Each sink is feature-gated in
+    // the `satd-events` crate; this match enables what the operator
+    // asked for via CLI / `bitcoin.conf`.
+    let mut event_sinks: Vec<Box<dyn node::events::EventSink>> = Vec::new();
+    if let Some(bind) = config.events_grpc_bind.as_deref() {
+        match satd_events::GrpcEventSink::new(bind, event_publisher.clone()) {
+            Ok(sink) => {
+                tracing::info!(target: "events", bind, "events gRPC sink configured");
+                event_sinks.push(Box::new(sink));
+            }
+            Err(e) => {
+                tracing::error!("events gRPC sink: {e}");
+                auth.cleanup();
+                std::process::exit(1);
+            }
+        }
+    }
+    if !event_sinks.is_empty() {
+        let count = event_publisher.attach_sinks(event_sinks, shutdown_rx.clone());
+        tracing::info!(target: "events", sinks = count, "events bus external sinks attached");
+    }
+
     // Hook the mempool back into ChainState so `perform_reorg` can
     // re-add disconnected non-coinbase txs after a reorg (Bitcoin Core
     // semantics). Without this, every reorg would silently drop

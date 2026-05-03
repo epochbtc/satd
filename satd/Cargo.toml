@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 node = { path = "../node" }
 esplora-handlers = { path = "../esplora-handlers" }
+satd-events = { path = "../events", features = ["grpc"] }
 satd-mcp = { path = "../mcp" }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 bitcoin = { workspace = true }

@@ -395,6 +395,11 @@ pub struct Config {
     /// printable ASCII bytes). Used for geo-correlation across
     /// multi-watcher deployments.
     pub events_region: Option<String>,
+    /// `host:port` to bind the events gRPC streaming server. `None`
+    /// (default) leaves the gRPC sink disabled. The server speaks the
+    /// `satd.events.v1.NodeEventStream` schema; clients open a single
+    /// `Subscribe` RPC and consume the stream.
+    pub events_grpc_bind: Option<String>,
     // No-op compatibility flags (accepted but ignored)
     #[allow(dead_code)]
     pub server: bool,
@@ -957,6 +962,9 @@ impl Config {
                 .or_else(|| file_get("reorgwebhooksecret")),
             events_node_id: cli.events_node_id.or_else(|| file_get("eventsnodeid")),
             events_region: cli.events_region.or_else(|| file_get("eventsregion")),
+            events_grpc_bind: cli
+                .events_grpc_bind
+                .or_else(|| file_get("eventsgrpcbind")),
             pending_notes,
         })
     }
@@ -1285,6 +1293,9 @@ pub struct CliArgs {
 
     #[arg(long = "events-region", value_name = "TAG", help = "Optional region tag stamped on every events envelope (\u{2264}8 printable ASCII bytes, e.g. 'us-east1')")]
     pub events_region: Option<String>,
+
+    #[arg(long = "events-grpc-bind", value_name = "ADDR", help = "host:port to bind the events gRPC streaming server (e.g. '0.0.0.0:28430'). Default: disabled")]
+    pub events_grpc_bind: Option<String>,
 }
 
 /// Translate Bitcoin-Core-compatible index-control aliases that don't
@@ -1644,6 +1655,7 @@ rpcport=8332
             reorg_webhook_secret: None,
             events_node_id: None,
             events_region: None,
+            events_grpc_bind: None,
         };
         let config = Config::from_cli(cli).unwrap();
         assert_eq!(config.network, Network::Regtest);
@@ -1732,6 +1744,7 @@ rpcport=8332
             reorg_webhook_secret: None,
             events_node_id: None,
             events_region: None,
+            events_grpc_bind: None,
         };
         assert!(Config::from_cli(cli).is_err());
     }

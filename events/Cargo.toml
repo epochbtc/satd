@@ -1,0 +1,33 @@
+[package]
+name = "satd-events"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = []
+grpc = ["dep:tonic", "dep:prost", "dep:tokio-stream"]
+zmq = []
+
+[dependencies]
+node = { path = "../node" }
+bitcoin = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }
+
+# grpc feature
+tonic = { workspace = true, optional = true }
+prost = { workspace = true, optional = true }
+tokio-stream = { workspace = true, optional = true }
+
+[build-dependencies]
+tonic-build = { workspace = true }
+protoc-bin-vendored = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["test-util"] }
