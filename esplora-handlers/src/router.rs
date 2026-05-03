@@ -18,7 +18,7 @@ use tower_http::trace::TraceLayer;
 
 use crate::auth::AuthExpectation;
 use crate::config::EsploraConfig;
-use crate::handlers::{address, block, chain, outspend, tx};
+use crate::handlers::{address, block, chain, mempool, outspend, tx};
 use crate::state::EsploraState;
 
 #[derive(Debug, thiserror::Error)]
@@ -110,6 +110,12 @@ pub fn build_router(state: EsploraState) -> Result<Router, RouterBuildError> {
             get(address::scripthash_txs_mempool),
         )
         .route("/scripthash/{hash}/utxo", get(address::scripthash_utxo))
+        // Mempool / fee / root (Esplora plan PR 7).
+        .route("/", get(mempool::root))
+        .route("/mempool", get(mempool::mempool_summary))
+        .route("/mempool/txids", get(mempool::mempool_txids))
+        .route("/mempool/recent", get(mempool::mempool_recent))
+        .route("/fee-estimates", get(mempool::fee_estimates))
         .with_state(state);
 
     let routes = if cfg.auth.is_enabled() {
