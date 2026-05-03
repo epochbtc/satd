@@ -3,11 +3,11 @@
 //! Designed for two complementary use cases:
 //!
 //! 1. **Bitcoin Core compatibility.** The `hashtx` and `hashblock`
-//!    topics emit raw 32-byte hashes followed by a little-endian u32
-//!    sequence — the same wire format Bitcoin Core's
-//!    `-zmqpubhashtx` / `-zmqpubhashblock` produce. Existing Core
-//!    tooling (block-explorer indexers, watchtower scripts) connects
-//!    unchanged.
+//!    topics emit the **reversed** 32-byte hash (RPC display order)
+//!    followed by a little-endian u32 sequence — the same wire format
+//!    Bitcoin Core's `-zmqpubhashtx` / `-zmqpubhashblock` produce.
+//!    Existing Core tooling (block-explorer indexers, watchtower
+//!    scripts) connects unchanged.
 //!
 //! 2. **Native consumers.** New topics (`mpevict`, `mpreplace`,
 //!    `mpconfirm`, `nodeevent`) emit JSON payloads that include the
@@ -16,10 +16,23 @@
 //! All topics are multiplexed onto a single PUB socket. Subscribers
 //! filter via standard ZMQ topic prefixes.
 //!
-//! Sequence semantics: Bitcoin Core assigns a per-topic LE u32 counter
-//! that wraps modulo 2^32. We do the same so the wire is byte-identical
-//! to Core for the compat topics. Lag handling matches the in-process
-//! sink contract — `RecvError::Lagged` is logged and the loop continues.
+//! Wire format (matches Bitcoin Core's `zmqpub*` exactly for the compat
+//! topics):
+//! - Frame 0: ASCII topic name (e.g. `b"hashtx"`).
+//! - Frame 1: payload bytes — for `hashtx` / `hashblock`, the 32-byte
+//!   hash in **RPC display order** (reverse of internal byte order).
+//!   For new topics, JSON.
+//! - Frame 2: per-topic monotonic sequence as little-endian `u32`. The
+//!   first message on each topic carries seq `0`; the counter wraps
+//!   modulo 2^32. (Core publishes the *current* counter value and
+//!   increments after send, so seq starts at 0; we replicate that.)
+//!
+//! Backpressure: the underlying `zeromq` PUB socket discards messages
+//! to subscribers whose receive queue is full (standard PUB/SUB
+//! behavior). The current adapter does NOT expose a high-water-mark
+//! knob; satd cannot observe per-subscriber drops. Local lag from the
+//! in-process broadcast (`RecvError::Lagged`) is logged. Future work:
+//! HWM configuration plus per-topic sent/dropped counters.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -29,7 +42,7 @@ use node::events::{EventSink, NodeEvent, NodeEventBody};
 use node::mempool::events::MempoolEvent;
 use node::chain::events::ChainEvent;
 use tokio::sync::{broadcast, watch};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 use zeromq::{Socket, SocketSend, ZmqMessage};
 
 /// Topic prefixes. Stable wire identifiers — operators configure
@@ -61,6 +74,16 @@ pub enum ZmqEventSinkError {
     Bind(String, String),
 }
 
+/// Reverse a 32-byte hash from internal byte order to Bitcoin Core's
+/// RPC/display order. Used for the Core-compatible `hashtx` and
+/// `hashblock` topics so existing Core ZMQ tooling sees identical
+/// frames.
+fn reverse_32(bytes: [u8; 32]) -> [u8; 32] {
+    let mut out = bytes;
+    out.reverse();
+    out
+}
+
 /// Per-topic enable flags. `None` = sink defaults (all enabled).
 #[derive(Debug, Clone, Default)]
 pub struct ZmqTopicConfig {
@@ -78,23 +101,39 @@ impl ZmqTopicConfig {
     }
 }
 
-/// PUB-socket events sink. Built once and handed to
+/// PUB-socket events sink. Built and **bound** via
+/// [`ZmqEventSink::bind`], then handed to
 /// [`node::events::EventPublisher::attach_sinks`].
 pub struct ZmqEventSink {
-    bind: String,
+    endpoint: String,
+    socket: zeromq::PubSocket,
     topics: ZmqTopicConfig,
 }
 
 impl ZmqEventSink {
-    /// Construct a new sink. `bind` is a ZMQ endpoint string
-    /// (e.g. `tcp://0.0.0.0:28332`). The socket is not bound yet —
-    /// binding happens inside [`EventSink::run`] so any failure is
-    /// reported once the daemon's tokio runtime is up.
-    pub fn new(bind: impl Into<String>, topics: ZmqTopicConfig) -> Self {
-        Self {
-            bind: bind.into(),
+    /// Build a new sink and bind the PUB socket immediately. Any bind
+    /// failure surfaces here at startup, before the daemon declares
+    /// readiness — operators get a clear error rather than a silently
+    /// dead sink.
+    ///
+    /// `endpoint` is a ZMQ transport string (`tcp://host:port`,
+    /// `ipc:///path`, etc.). `topics` controls which per-topic frames
+    /// the sink emits.
+    pub async fn bind(
+        endpoint: impl Into<String>,
+        topics: ZmqTopicConfig,
+    ) -> Result<Self, ZmqEventSinkError> {
+        let endpoint = endpoint.into();
+        let mut socket = zeromq::PubSocket::new();
+        socket
+            .bind(&endpoint)
+            .await
+            .map_err(|e| ZmqEventSinkError::Bind(endpoint.clone(), e.to_string()))?;
+        Ok(Self {
+            endpoint,
+            socket,
             topics,
-        }
+        })
     }
 }
 
@@ -109,17 +148,12 @@ impl EventSink for ZmqEventSink {
         mut events: broadcast::Receiver<NodeEvent>,
         mut shutdown: watch::Receiver<bool>,
     ) {
-        let mut socket = zeromq::PubSocket::new();
-        if let Err(e) = socket.bind(&self.bind).await {
-            error!(
-                target: "events::zmq",
-                bind = %self.bind,
-                error = %e,
-                "events ZMQ sink failed to bind",
-            );
-            return;
-        }
-        info!(target: "events::zmq", bind = %self.bind, "events ZMQ sink bound");
+        let Self {
+            endpoint,
+            mut socket,
+            topics,
+        } = *self;
+        info!(target: "events::zmq", bind = %endpoint, "events ZMQ sink running");
 
         let counters = TopicCounters::default();
 
@@ -129,7 +163,7 @@ impl EventSink for ZmqEventSink {
                 _ = shutdown.changed() => break,
                 res = events.recv() => match res {
                     Ok(env) => {
-                        if let Err(e) = publish(&mut socket, &env, &self.topics, &counters).await {
+                        if let Err(e) = publish(&mut socket, &env, &topics, &counters).await {
                             warn!(target: "events::zmq", error = %e, "events ZMQ publish failed");
                         }
                     }
@@ -155,11 +189,13 @@ struct TopicCounters {
 }
 
 impl TopicCounters {
+    /// Match Bitcoin Core: publish the *current* counter value, then
+    /// increment for next time. First message on each topic carries
+    /// `seq = 0`; counter wraps modulo 2^32. `fetch_add(1)` returns the
+    /// pre-increment value, which is exactly what Core writes on the
+    /// wire.
     fn next(&self, counter: &AtomicU32) -> u32 {
-        // Match Bitcoin Core: the published seq is the value AFTER
-        // increment-modulo-2^32, starting at 1 for the first message.
-        // `fetch_add` returns the previous value; we publish that+1.
-        counter.fetch_add(1, Ordering::Relaxed).wrapping_add(1)
+        counter.fetch_add(1, Ordering::Relaxed)
     }
 }
 
@@ -171,44 +207,67 @@ async fn publish(
 ) -> Result<(), zeromq::ZmqError> {
     // Catch-all envelope topic (always emitted unless disabled).
     if ZmqTopicConfig::enabled(topics.nodeevent) {
-        let payload = serde_json::to_vec(env).unwrap_or_default();
-        let seq = counters.next(&counters.nodeevent);
-        send(socket, topics::NODEEVENT, payload, seq).await?;
+        match serde_json::to_vec(env) {
+            Ok(payload) => {
+                let seq = counters.next(&counters.nodeevent);
+                send(socket, topics::NODEEVENT, payload, seq).await?;
+            }
+            Err(e) => {
+                warn!(
+                    target: "events::zmq",
+                    topic = topics::NODEEVENT,
+                    error = %e,
+                    "skipping nodeevent frame: serialization failed",
+                );
+            }
+        }
     }
 
     // Per-event-type topics.
     match &env.body {
         NodeEventBody::Mempool(MempoolEvent::Enter { txid, .. }) => {
             if ZmqTopicConfig::enabled(topics.hashtx) {
-                let payload = txid.as_raw_hash().to_byte_array().to_vec();
+                // Core wire format: 32-byte hash in RPC display order
+                // (reverse of internal byte order).
+                let payload = reverse_32(txid.as_raw_hash().to_byte_array()).to_vec();
                 let seq = counters.next(&counters.hashtx);
                 send(socket, topics::HASHTX, payload, seq).await?;
             }
         }
         NodeEventBody::Mempool(ev @ MempoolEvent::LeaveEvicted { .. }) => {
             if ZmqTopicConfig::enabled(topics.mpevict) {
-                let payload = serde_json::to_vec(ev).unwrap_or_default();
-                let seq = counters.next(&counters.mpevict);
-                send(socket, topics::MPEVICT, payload, seq).await?;
+                publish_json(socket, topics::MPEVICT, ev, &counters.mpevict, counters)
+                    .await?;
             }
         }
         NodeEventBody::Mempool(ev @ MempoolEvent::LeaveReplaced { .. }) => {
             if ZmqTopicConfig::enabled(topics.mpreplace) {
-                let payload = serde_json::to_vec(ev).unwrap_or_default();
-                let seq = counters.next(&counters.mpreplace);
-                send(socket, topics::MPREPLACE, payload, seq).await?;
+                publish_json(
+                    socket,
+                    topics::MPREPLACE,
+                    ev,
+                    &counters.mpreplace,
+                    counters,
+                )
+                .await?;
             }
         }
         NodeEventBody::Mempool(ev @ MempoolEvent::LeaveConfirmed { .. }) => {
             if ZmqTopicConfig::enabled(topics.mpconfirm) {
-                let payload = serde_json::to_vec(ev).unwrap_or_default();
-                let seq = counters.next(&counters.mpconfirm);
-                send(socket, topics::MPCONFIRM, payload, seq).await?;
+                publish_json(
+                    socket,
+                    topics::MPCONFIRM,
+                    ev,
+                    &counters.mpconfirm,
+                    counters,
+                )
+                .await?;
             }
         }
         NodeEventBody::Chain(ChainEvent::BlockConnected { hash, .. }) => {
             if ZmqTopicConfig::enabled(topics.hashblock) {
-                let payload = hash.as_raw_hash().to_byte_array().to_vec();
+                // Core wire format: 32-byte hash in RPC display order.
+                let payload = reverse_32(hash.as_raw_hash().to_byte_array()).to_vec();
                 let seq = counters.next(&counters.hashblock);
                 send(socket, topics::HASHBLOCK, payload, seq).await?;
             }
@@ -226,6 +285,30 @@ async fn publish(
         }
     }
     Ok(())
+}
+
+async fn publish_json<T: serde::Serialize>(
+    socket: &mut zeromq::PubSocket,
+    topic: &'static str,
+    payload: &T,
+    counter: &AtomicU32,
+    counters: &TopicCounters,
+) -> Result<(), zeromq::ZmqError> {
+    match serde_json::to_vec(payload) {
+        Ok(bytes) => {
+            let seq = counters.next(counter);
+            send(socket, topic, bytes, seq).await
+        }
+        Err(e) => {
+            warn!(
+                target: "events::zmq",
+                topic,
+                error = %e,
+                "skipping frame: serialization failed",
+            );
+            Ok(())
+        }
+    }
 }
 
 async fn send(
@@ -269,6 +352,30 @@ mod tests {
         }
     }
 
+    /// 32-byte non-palindromic pattern: each byte is its 1-based index.
+    /// `[0x01, 0x02, ..., 0x20]`. Reversing yields `[0x20, 0x1f, ..., 0x01]`
+    /// — so a wire-format check that asserts `frames[1][0] == 0x20`
+    /// catches both "no reversal" and "wrong reversal" mistakes.
+    fn ramped_bytes() -> [u8; 32] {
+        let mut b = [0u8; 32];
+        for (i, slot) in b.iter_mut().enumerate() {
+            *slot = (i as u8) + 1;
+        }
+        b
+    }
+
+    fn enter_event_with_hash(bytes: [u8; 32]) -> MempoolEvent {
+        MempoolEvent::Enter {
+            txid: Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+                bytes,
+            )),
+            fee: 100,
+            vsize: 250,
+            fee_rate_sat_per_kvb: 400,
+            time: 1_700_000_000,
+        }
+    }
+
     /// Pick an ephemeral TCP port via a throwaway bind, then drop it.
     /// Tiny TOCTOU window before the ZMQ bind, but reliable on
     /// loopback for tests.
@@ -277,6 +384,21 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         drop(listener);
         (format!("tcp://127.0.0.1:{port}"), port)
+    }
+
+    /// Build, bind, and attach a sink with the given topic config.
+    /// Returns the publisher senders for direct event injection.
+    async fn spin_up_sink(
+        endpoint: String,
+        topics: ZmqTopicConfig,
+        publisher: std::sync::Arc<EventPublisher>,
+        shutdown_rx: watch::Receiver<bool>,
+    ) {
+        let sink = ZmqEventSink::bind(endpoint, topics).await.expect("bind");
+        publisher.attach_sinks(
+            vec![Box::new(sink) as Box<dyn EventSink>],
+            shutdown_rx,
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -292,22 +414,25 @@ mod tests {
         );
 
         let (endpoint, _port) = ephemeral_endpoint().await;
-        let sink = ZmqEventSink::new(endpoint.clone(), ZmqTopicConfig::default());
-        let sinks: Vec<Box<dyn EventSink>> = vec![Box::new(sink)];
-        publisher.attach_sinks(sinks, shutdown_rx.clone());
+        spin_up_sink(
+            endpoint.clone(),
+            ZmqTopicConfig::default(),
+            publisher.clone(),
+            shutdown_rx.clone(),
+        )
+        .await;
 
-        // Wait for sink to bind, then connect a SUB.
-        tokio::time::sleep(Duration::from_millis(150)).await;
         let mut sub = SubSocket::new();
         sub.connect(&endpoint).await.expect("sub connect");
         sub.subscribe(topics::HASHTX).await.expect("subscribe");
         // SUB joins are racy; give the cluster a moment to propagate.
         tokio::time::sleep(Duration::from_millis(150)).await;
 
-        // Inject an Enter event.
-        mp_tx.send(enter_event(0xcd)).unwrap();
+        // Inject an Enter event with a non-palindromic 32-byte hash so
+        // the test catches "no reversal" and "wrong reversal" mistakes.
+        let raw = ramped_bytes();
+        mp_tx.send(enter_event_with_hash(raw)).unwrap();
 
-        // Receive (with timeout).
         let msg = tokio::time::timeout(Duration::from_secs(3), sub.recv())
             .await
             .expect("timed out waiting for hashtx")
@@ -316,17 +441,25 @@ mod tests {
         assert_eq!(frames.len(), 3);
         assert_eq!(frames[0], topics::HASHTX.as_bytes());
         assert_eq!(frames[1].len(), 32);
-        assert_eq!(frames[1][0], 0xcd);
+        // Core wire = reversed (RPC display) order. raw is [01..20];
+        // reversed is [20..01], so the first byte must be 0x20.
+        let mut expected = raw;
+        expected.reverse();
+        assert_eq!(
+            frames[1].as_slice(),
+            &expected[..],
+            "hashtx payload must be reversed (Bitcoin Core RPC display order)",
+        );
         assert_eq!(frames[2].len(), 4);
-        // First seq is 1 (Core convention).
+        // First seq on a topic is 0 (Core publishes pre-increment).
         let seq = u32::from_le_bytes(frames[2].as_slice().try_into().unwrap());
-        assert_eq!(seq, 1);
+        assert_eq!(seq, 0, "first hashtx seq must be 0 (Core convention)");
 
         let _ = shutdown_tx.send(true);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn hashblock_frame_emits_on_block_connect() {
+    async fn hashtx_seq_increments_per_message() {
         let publisher = EventPublisher::new(edge(), 64);
         let (mp_tx, _) = broadcast::channel::<MempoolEvent>(16);
         let (ch_tx, _) = broadcast::channel::<ChainEvent>(16);
@@ -338,22 +471,71 @@ mod tests {
         );
 
         let (endpoint, _) = ephemeral_endpoint().await;
-        let sink = ZmqEventSink::new(endpoint.clone(), ZmqTopicConfig::default());
-        publisher.attach_sinks(
-            vec![Box::new(sink) as Box<dyn EventSink>],
+        spin_up_sink(
+            endpoint.clone(),
+            ZmqTopicConfig::default(),
+            publisher.clone(),
+            shutdown_rx.clone(),
+        )
+        .await;
+
+        let mut sub = SubSocket::new();
+        sub.connect(&endpoint).await.expect("sub connect");
+        sub.subscribe(topics::HASHTX).await.expect("subscribe");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        for i in 1..=3u8 {
+            mp_tx.send(enter_event(i)).unwrap();
+        }
+
+        let mut seqs = Vec::new();
+        for _ in 0..3 {
+            let msg = tokio::time::timeout(Duration::from_secs(3), sub.recv())
+                .await
+                .expect("recv timeout")
+                .expect("recv");
+            let frames: Vec<_> = msg.into_vec().into_iter().map(|b| b.to_vec()).collect();
+            seqs.push(u32::from_le_bytes(
+                frames[2].as_slice().try_into().unwrap(),
+            ));
+        }
+        assert_eq!(seqs, vec![0u32, 1, 2]);
+
+        let _ = shutdown_tx.send(true);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hashblock_frame_emits_reversed_hash_on_block_connect() {
+        let publisher = EventPublisher::new(edge(), 64);
+        let (mp_tx, _) = broadcast::channel::<MempoolEvent>(16);
+        let (ch_tx, _) = broadcast::channel::<ChainEvent>(16);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        publisher.spawn_bridges(
+            mp_tx.subscribe(),
+            ch_tx.subscribe(),
             shutdown_rx.clone(),
         );
-        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let (endpoint, _) = ephemeral_endpoint().await;
+        spin_up_sink(
+            endpoint.clone(),
+            ZmqTopicConfig::default(),
+            publisher.clone(),
+            shutdown_rx.clone(),
+        )
+        .await;
 
         let mut sub = SubSocket::new();
         sub.connect(&endpoint).await.expect("sub connect");
         sub.subscribe(topics::HASHBLOCK).await.expect("subscribe");
         tokio::time::sleep(Duration::from_millis(150)).await;
 
+        // Non-palindromic ramp so byte-order regressions are visible.
+        let raw = ramped_bytes();
         ch_tx
             .send(ChainEvent::BlockConnected {
                 hash: BlockHash::from_raw_hash(
-                    bitcoin::hashes::sha256d::Hash::from_byte_array([0xee; 32]),
+                    bitcoin::hashes::sha256d::Hash::from_byte_array(raw),
                 ),
                 height: 42,
             })
@@ -365,8 +547,16 @@ mod tests {
             .expect("recv");
         let frames: Vec<_> = msg.into_vec().into_iter().map(|b| b.to_vec()).collect();
         assert_eq!(frames[0], topics::HASHBLOCK.as_bytes());
-        assert_eq!(frames[1][0], 0xee);
+        let mut expected = raw;
+        expected.reverse();
+        assert_eq!(
+            frames[1].as_slice(),
+            &expected[..],
+            "hashblock payload must be reversed (Bitcoin Core RPC display order)",
+        );
         assert_eq!(frames[1].len(), 32);
+        let seq = u32::from_le_bytes(frames[2].as_slice().try_into().unwrap());
+        assert_eq!(seq, 0, "first hashblock seq must be 0 (Core convention)");
 
         let _ = shutdown_tx.send(true);
     }
@@ -384,12 +574,13 @@ mod tests {
         );
 
         let (endpoint, _) = ephemeral_endpoint().await;
-        let sink = ZmqEventSink::new(endpoint.clone(), ZmqTopicConfig::default());
-        publisher.attach_sinks(
-            vec![Box::new(sink) as Box<dyn EventSink>],
+        spin_up_sink(
+            endpoint.clone(),
+            ZmqTopicConfig::default(),
+            publisher.clone(),
             shutdown_rx.clone(),
-        );
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        )
+        .await;
 
         let mut sub = SubSocket::new();
         sub.connect(&endpoint).await.expect("sub connect");
@@ -431,12 +622,13 @@ mod tests {
         );
 
         let (endpoint, _) = ephemeral_endpoint().await;
-        let sink = ZmqEventSink::new(endpoint.clone(), ZmqTopicConfig::default());
-        publisher.attach_sinks(
-            vec![Box::new(sink) as Box<dyn EventSink>],
+        spin_up_sink(
+            endpoint.clone(),
+            ZmqTopicConfig::default(),
+            publisher.clone(),
             shutdown_rx.clone(),
-        );
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        )
+        .await;
 
         let mut sub = SubSocket::new();
         sub.connect(&endpoint).await.expect("sub connect");
@@ -455,6 +647,15 @@ mod tests {
         assert_eq!(parsed["schema_version"], node::events::SCHEMA_VERSION);
         assert_eq!(parsed["body"]["category"], "mempool");
         assert_eq!(parsed["body"]["kind"], "enter");
+        // EdgeStamp serializes node_id as 32-char hex, region as
+        // trimmed string. (Custom Serialize impl, fixed in PR-1
+        // review fixes.)
+        let stamp = &parsed["stamp"];
+        let node_hex = stamp["node_id"].as_str().expect("node_id is a string");
+        assert_eq!(node_hex.len(), 32);
+        assert!(node_hex.chars().all(|c| c.is_ascii_hexdigit()));
+        // edge() in this test sets region=None.
+        assert!(stamp["region"].is_null());
 
         let _ = shutdown_tx.send(true);
     }
@@ -473,18 +674,16 @@ mod tests {
 
         let (endpoint, _) = ephemeral_endpoint().await;
         // Disable hashtx; nodeevent stays on.
-        let sink = ZmqEventSink::new(
+        spin_up_sink(
             endpoint.clone(),
             ZmqTopicConfig {
                 hashtx: Some(false),
                 ..ZmqTopicConfig::default()
             },
-        );
-        publisher.attach_sinks(
-            vec![Box::new(sink) as Box<dyn EventSink>],
+            publisher.clone(),
             shutdown_rx.clone(),
-        );
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        )
+        .await;
 
         let mut sub = SubSocket::new();
         sub.connect(&endpoint).await.expect("sub connect");

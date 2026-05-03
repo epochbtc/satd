@@ -483,9 +483,17 @@ async fn main() {
             mpconfirm: config.events_zmq_mpconfirm,
             nodeevent: config.events_zmq_nodeevent,
         };
-        let sink = satd_events::ZmqEventSink::new(bind, topics);
-        tracing::info!(target: "events", bind, "events ZMQ sink configured");
-        event_sinks.push(Box::new(sink));
+        match satd_events::ZmqEventSink::bind(bind, topics).await {
+            Ok(sink) => {
+                tracing::info!(target: "events", bind, "events ZMQ sink configured");
+                event_sinks.push(Box::new(sink));
+            }
+            Err(e) => {
+                tracing::error!("events ZMQ sink: {e}");
+                auth.cleanup();
+                std::process::exit(1);
+            }
+        }
     }
     if !event_sinks.is_empty() {
         let count = event_publisher.attach_sinks(event_sinks, shutdown_rx.clone());
