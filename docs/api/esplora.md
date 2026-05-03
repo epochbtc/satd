@@ -22,6 +22,7 @@ here are not yet available; see the Esplora 9-PR plan for the roadmap.
 | `--esploracors=<origin>` | (none) | Repeat for multiple. Use `*` for any origin. |
 | `--esplorarequesttimeout=<seconds>` | `30` | Per-request timeout. |
 | `--esploramaxconns=<n>` | `256` | Concurrent in-flight requests cap. `0` disables. (Does not bound the lifetime of long-lived SSE streams; see **Live updates**.) |
+| `--esplorasseconns=<n>` | same as `--esploramaxconns` | Hard cap on simultaneously-open SSE streams (`/blocks/sse`, `/address/:addr/sse`, `/scripthash/:hash/sse`). Each open stream holds a permit until client disconnect; over-cap connections receive 503. `0` disables the cap. |
 
 `POST /tx` carries a hard-wired 1 MiB body limit at the route layer —
 witness-heavy 400 KB raw txs hex-encode to ~800 KB, so 1 MiB is enough
@@ -120,6 +121,13 @@ default 60s).
 Per-scripthash subscriptions consume from the registry capped by
 `--addrindexsubscriptions=N` (default 10000); over-cap subscribe
 attempts return 503.
+
+Total open SSE streams across all three routes are capped by
+`--esplorasseconns=N` (default same as `--esploramaxconns`). Each
+stream holds a permit until client disconnect — distinct from the
+request-handling cap, which doesn't bound long-lived streaming
+bodies. Over-cap connections receive 503 immediately at the SSE
+entry point.
 
 A subscriber that lags the broadcast channel skips ahead — the
 broadcast guarantees no panic but may drop intermediate events.
