@@ -6896,3 +6896,138 @@ fn test_esplora_address_bad_input_400() {
     assert_eq!(r.status(), 400);
     node.stop();
 }
+
+/// Review H2: a confirmed UTXO that is consumed by an unconfirmed
+/// mempool transaction must NOT appear in the source address's
+/// `/utxo` listing. Listing it would let wallets attempt to
+/// double-spend the same outpoint.
+#[test]
+fn test_esplora_address_utxo_excludes_mempool_spent() {
+    use bitcoin::hashes::Hash as _;
+    use bitcoin::key::CompressedPublicKey;
+    use bitcoin::secp256k1::{Message, Secp256k1, SecretKey};
+    use bitcoin::sighash::{EcdsaSighashType, SighashCache};
+    use bitcoin::{
+        absolute::LockTime, Address, Amount, Network, OutPoint, PublicKey, ScriptBuf, Sequence,
+        Transaction, TxIn, TxOut, Witness,
+    };
+    use std::str::FromStr;
+
+    let secp = Secp256k1::new();
+    let sk = SecretKey::from_slice(&[0x91u8; 32]).unwrap();
+    let pk = PublicKey::new(sk.public_key(&secp));
+    let cpk = CompressedPublicKey::from_slice(&pk.to_bytes()).unwrap();
+    let src_addr = Address::p2wpkh(&cpk, Network::Regtest);
+    let src_str = src_addr.to_string();
+    let dest_addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+
+    let esplora_port = find_available_port();
+    let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
+    let mut node = TestNode::start(&["--esplora=1", &bind]);
+    let _ = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(101), serde_json::json!(src_str.clone())],
+        )
+        .unwrap();
+
+    // Pull block 1's coinbase (the matured one we'll spend).
+    let block1_hash = node
+        .rpc_call_with_params("getblockhash", vec![serde_json::json!(1)])
+        .unwrap()["result"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let block1 = node
+        .rpc_call_with_params(
+            "getblock",
+            vec![serde_json::json!(block1_hash), serde_json::json!(1)],
+        )
+        .unwrap();
+    let cb_txid_str = block1["result"]["tx"][0].as_str().unwrap();
+    let cb_txid = bitcoin::Txid::from_str(cb_txid_str).unwrap();
+    let cb_value = 50u64 * 100_000_000;
+
+    // Pre-broadcast: src has 101 confirmed coinbase UTXOs; the one at
+    // block 1 is in /utxo. Verify presence.
+    let pre: Vec<serde_json::Value> = esplora_get(esplora_port, &format!("/address/{}/utxo", src_str))
+        .json()
+        .unwrap();
+    assert!(
+        pre.iter()
+            .any(|u| u["txid"] == serde_json::json!(cb_txid_str) && u["vout"] == 0),
+        "pre-broadcast: block-1 coinbase outpoint must appear in /utxo"
+    );
+
+    // Build + broadcast a P2WPKH spend: src(block-1 cb) → dest, fee 1000.
+    let dest_script = Address::from_str(dest_addr)
+        .unwrap()
+        .require_network(Network::Regtest)
+        .unwrap()
+        .script_pubkey();
+    let send = cb_value - 1000;
+    let mut spend = Transaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: cb_txid,
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(send),
+            script_pubkey: dest_script,
+        }],
+    };
+    let src_script = src_addr.script_pubkey();
+    let mut cache = SighashCache::new(&spend);
+    let sighash = cache
+        .p2wpkh_signature_hash(0, &src_script, Amount::from_sat(cb_value), EcdsaSighashType::All)
+        .unwrap();
+    let msg = Message::from_digest(sighash.to_byte_array());
+    let sig = secp.sign_ecdsa(&msg, &sk);
+    let mut sig_bytes = sig.serialize_der().to_vec();
+    sig_bytes.push(EcdsaSighashType::All as u8);
+    let mut witness = Witness::new();
+    witness.push(sig_bytes);
+    witness.push(pk.to_bytes());
+    spend.input[0].witness = witness;
+
+    let raw_hex = hex::encode(bitcoin::consensus::serialize(&spend));
+    let _ = node
+        .rpc_call_with_params(
+            "sendrawtransaction",
+            vec![serde_json::json!(raw_hex)],
+        )
+        .unwrap();
+
+    // Post-broadcast: src's `/utxo` MUST NOT list the spent outpoint
+    // even though the spending tx is still in the mempool.
+    let post: Vec<serde_json::Value> = esplora_get(esplora_port, &format!("/address/{}/utxo", src_str))
+        .json()
+        .unwrap();
+    assert!(
+        !post.iter().any(|u| u["txid"] == serde_json::json!(cb_txid_str) && u["vout"] == 0),
+        "/utxo must NOT list a confirmed outpoint with a mempool spend; got: {:?}",
+        post
+    );
+
+    // dest's `/utxo` does list the unconfirmed funding output.
+    let dest_utxos: Vec<serde_json::Value> = esplora_get(
+        esplora_port,
+        &format!("/address/{}/utxo", dest_addr),
+    )
+    .json()
+    .unwrap();
+    let spend_txid = spend.compute_txid().to_string();
+    let dest_entry = dest_utxos
+        .iter()
+        .find(|u| u["txid"] == serde_json::json!(spend_txid))
+        .expect("dest /utxo should list the mempool funding output");
+    assert_eq!(dest_entry["status"]["confirmed"], false);
+    node.stop();
+}

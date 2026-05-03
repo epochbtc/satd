@@ -224,19 +224,26 @@ fn build_address_info(
 }
 
 /// Chain stats — derived purely from confirmed-history rows.
-///
-/// `funded_*` counts/sums come from funding rows. `spent_*` counts come
-/// from spending rows. `spent_txo_sum` is reconstructed by joining each
-/// spending row against the funding row that introduced its prev_outpoint
-/// — same scripthash means the matching funding row is in our history
-/// stream by construction. `tx_count` is the number of distinct txids
-/// touching the scripthash.
 fn build_chain_stats(
     state: &EsploraState,
     sh: &Scripthash,
 ) -> EsploraResult<AddressStatsJson> {
     let history = state.address_index.confirmed_history(sh)?;
+    Ok(compute_chain_stats_from_history(&history))
+}
 
+/// Pure history-reduction helper, exposed so unit tests can hit it
+/// with synthetic rows. Two-pass:
+///
+/// 1. Collect every funding row's amount + counts.
+/// 2. Resolve spending rows against the complete funding map.
+///
+/// The two-pass form is order-independent. A single pass would
+/// undercount `spent_txo_sum` for same-block parent/child spends
+/// where the child's txid sorts before the parent's — `confirmed_history`
+/// orders by `(height, txid_string, is_spending)`, not by topological
+/// order within a block (review M1).
+fn compute_chain_stats_from_history(history: &[HistoryEntry]) -> AddressStatsJson {
     let mut tx_set: BTreeSet<Txid> = BTreeSet::new();
     let mut funded_txo_count: u64 = 0;
     let mut funded_txo_sum: u64 = 0;
@@ -244,42 +251,133 @@ fn build_chain_stats(
     let mut spent_txo_sum: u64 = 0;
     let mut funding_amount: HashMap<(Txid, u32), u64> = HashMap::new();
 
-    for entry in &history {
-        match entry {
-            HistoryEntry::Funding {
-                txid,
-                vout,
-                amount_sat,
-                ..
-            } => {
-                funded_txo_count = funded_txo_count.saturating_add(1);
-                funded_txo_sum = funded_txo_sum.saturating_add(*amount_sat);
-                funding_amount.insert((*txid, *vout), *amount_sat);
-                tx_set.insert(*txid);
-            }
-            HistoryEntry::Spending {
-                txid,
-                prev_outpoint,
-                ..
-            } => {
-                spent_txo_count = spent_txo_count.saturating_add(1);
-                if let Some(&amt) =
-                    funding_amount.get(&(prev_outpoint.txid, prev_outpoint.vout))
-                {
-                    spent_txo_sum = spent_txo_sum.saturating_add(amt);
-                }
-                tx_set.insert(*txid);
-            }
+    // Pass 1: every funding row contributes to funded_* and to the
+    // (txid, vout) → amount lookup map.
+    for entry in history {
+        if let HistoryEntry::Funding {
+            txid,
+            vout,
+            amount_sat,
+            ..
+        } = entry
+        {
+            funded_txo_count = funded_txo_count.saturating_add(1);
+            funded_txo_sum = funded_txo_sum.saturating_add(*amount_sat);
+            funding_amount.insert((*txid, *vout), *amount_sat);
+            tx_set.insert(*txid);
         }
     }
 
-    Ok(AddressStatsJson {
+    // Pass 2: spending rows count + look up the prev_outpoint's amount.
+    // Now safe regardless of intra-block parent/child txid ordering.
+    for entry in history {
+        if let HistoryEntry::Spending {
+            txid,
+            prev_outpoint,
+            ..
+        } = entry
+        {
+            spent_txo_count = spent_txo_count.saturating_add(1);
+            if let Some(&amt) =
+                funding_amount.get(&(prev_outpoint.txid, prev_outpoint.vout))
+            {
+                spent_txo_sum = spent_txo_sum.saturating_add(amt);
+            }
+            tx_set.insert(*txid);
+        }
+    }
+
+    AddressStatsJson {
         tx_count: tx_set.len() as u64,
         funded_txo_count,
         funded_txo_sum,
         spent_txo_count,
         spent_txo_sum,
-    })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::OutPoint;
+
+    fn fixture_txid(byte: u8) -> Txid {
+        use bitcoin::hashes::Hash as _;
+        Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+            [byte; 32],
+        ))
+    }
+
+    /// Review M1: same-block parent funds + child spends. The child's
+    /// txid sorts BEFORE the parent's (lower byte). With a naive
+    /// single-pass implementation, the spending row would be processed
+    /// first and `spent_txo_sum` would miss the funding lookup.
+    #[test]
+    fn chain_stats_handles_child_spend_before_parent_funding_in_history() {
+        let parent = fixture_txid(0x99);
+        let child = fixture_txid(0x11);
+        // Parent funds the address with 5000 sat. Child spends parent's
+        // vout 0 (immediately, same block, height 100). Both rows touch
+        // the same scripthash — the parent via funding, the child via
+        // spending the outpoint that the parent created.
+        let history = vec![
+            // Spending row appears first because child txid (0x11) <
+            // parent txid (0x99) in lexicographic byte-order.
+            HistoryEntry::Spending {
+                height: 100,
+                txid: child,
+                vin: 0,
+                prev_outpoint: OutPoint {
+                    txid: parent,
+                    vout: 0,
+                },
+            },
+            HistoryEntry::Funding {
+                height: 100,
+                txid: parent,
+                vout: 0,
+                amount_sat: 5000,
+            },
+        ];
+
+        let stats = compute_chain_stats_from_history(&history);
+        assert_eq!(stats.funded_txo_count, 1);
+        assert_eq!(stats.funded_txo_sum, 5000);
+        assert_eq!(stats.spent_txo_count, 1);
+        assert_eq!(
+            stats.spent_txo_sum, 5000,
+            "spent_txo_sum must be order-independent (review M1)"
+        );
+        // tx_count: parent + child = 2 distinct txids.
+        assert_eq!(stats.tx_count, 2);
+    }
+
+    #[test]
+    fn chain_stats_unspent_funding_only() {
+        let txid = fixture_txid(0xaa);
+        let history = vec![HistoryEntry::Funding {
+            height: 1,
+            txid,
+            vout: 0,
+            amount_sat: 1000,
+        }];
+        let stats = compute_chain_stats_from_history(&history);
+        assert_eq!(stats.funded_txo_count, 1);
+        assert_eq!(stats.funded_txo_sum, 1000);
+        assert_eq!(stats.spent_txo_count, 0);
+        assert_eq!(stats.spent_txo_sum, 0);
+        assert_eq!(stats.tx_count, 1);
+    }
+
+    #[test]
+    fn chain_stats_empty_history() {
+        let stats = compute_chain_stats_from_history(&[]);
+        assert_eq!(stats.funded_txo_count, 0);
+        assert_eq!(stats.funded_txo_sum, 0);
+        assert_eq!(stats.spent_txo_count, 0);
+        assert_eq!(stats.spent_txo_sum, 0);
+        assert_eq!(stats.tx_count, 0);
+    }
 }
 
 /// Mempool stats — derived on demand from the mempool index's tx-set
@@ -446,25 +544,41 @@ fn build_mempool_txs(
 
 // ── UTXO list ──────────────────────────────────────────────────────
 
-/// `/address/:addr/utxo` — live confirmed UTXOs. Esplora's contract
-/// includes the per-output `status` block; for confirmed UTXOs we
-/// populate it from the funding tx's containing block (height +
-/// block_hash + block_time). Mempool UTXOs (i.e. outputs created by a
-/// tx still in the mempool) would have `confirmed: false` — including
-/// them requires a pass over the mempool index, which we skip here so
-/// the endpoint stays a pure index walk. Upstream Esplora includes
-/// mempool UTXOs; we'll add them in a follow-up if a consumer needs it.
+/// `/address/:addr/utxo` — live UTXOs spendable by this address.
+///
+/// Three components:
+///
+/// 1. Confirmed UTXOs from the address index (`AddressIndex::utxos`)
+///    that are not also spent by an unconfirmed mempool tx.
+/// 2. Mempool funding outputs (this address received a deposit in an
+///    unconfirmed tx) that are not themselves spent in the mempool.
+///
+/// Wallet-correctness: a confirmed UTXO with a mempool spend is NOT
+/// listed (review H2). Listing it would let clients double-spend the
+/// outpoint by signing a fresh tx against the same input.
 fn build_utxos(
     state: &EsploraState,
     sh: &Scripthash,
 ) -> EsploraResult<Vec<UtxoJson>> {
+    // Build the mempool-spent-outpoint set up front so we can filter
+    // both confirmed and mempool-created UTXOs against it. The set
+    // covers every prev_output of every mempool tx touching `sh`.
+    let mempool_entries = state.address_index.mempool_history(sh);
+    let mempool_spends: std::collections::HashSet<OutPoint> =
+        collect_mempool_spent_outpoints(state, &mempool_entries);
+
     let utxos = state.address_index.utxos(sh)?;
-    // Augment with mempool funding-only UTXOs so consumers see the same
-    // shape as upstream (mempool deposits show up as
-    // `status: { confirmed: false }`).
     let mut out = Vec::with_capacity(utxos.len());
     for u in utxos {
-        // Look up the block at u.height to fill in block_hash + block_time.
+        let outpoint = OutPoint {
+            txid: u.txid,
+            vout: u.vout,
+        };
+        // Skip confirmed UTXOs already consumed by an unconfirmed
+        // mempool tx (review H2).
+        if mempool_spends.contains(&outpoint) {
+            continue;
+        }
         let block_hash = state.chain.get_block_hash_by_height(u.height);
         let block_time = block_hash
             .and_then(|h| state.chain.get_block_index(&h))
@@ -484,12 +598,7 @@ fn build_utxos(
 
     // Mempool funding outputs: walk the mempool history for sh, scan
     // each tx's outputs for ones whose script hashes to sh and whose
-    // prev_outpoint isn't yet spent (within the mempool itself). We
-    // approximate "unspent" by checking that the OutPoint isn't a
-    // prev_output of any other mempool tx — bounded by mempool size.
-    let mempool_entries = state.address_index.mempool_history(sh);
-    let mempool_spends: std::collections::HashSet<OutPoint> =
-        collect_mempool_spent_outpoints(state, &mempool_entries);
+    // resulting OutPoint isn't already spent (within the mempool).
     for e in mempool_entries {
         let Some(entry) = state.mempool.get(&e.txid) else {
             continue;
