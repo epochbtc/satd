@@ -226,10 +226,13 @@ CORS, request-timeout, and concurrency-limit knobs are available;
 [blockstream.info](https://github.com/Blockstream/esplora) /
 [mempool.space](https://github.com/mempool/mempool) for the implemented
 endpoint set: chain, block, tx, address/scripthash (info, txs paginated,
-mempool txs, utxo), outspends + merkle proofs, mempool + fee + root.
-See [docs/api/esplora.md](docs/api/esplora.md) for the full endpoint
-list, configuration table, gotchas, and bench harness
-(`scripts/run-esplora-bench.sh`). Live updates (SSE) land in PR 9.
+mempool txs, utxo), outspends + merkle proofs, mempool + fee + root,
+and Server-Sent Events live updates for new blocks + per-address /
+per-scripthash status changes. See
+[docs/api/esplora.md](docs/api/esplora.md) for the full endpoint list,
+configuration table, gotchas, and bench harness
+(`scripts/run-esplora-bench.sh`). WebSocket transport is not
+implemented; SSE covers all known consumers (BDK, mempool.space SDK).
 
 **Pain (historical):** Core's REST interface is "experimental",
 unauthenticated, loopback-only, and covers a subset of blockchain

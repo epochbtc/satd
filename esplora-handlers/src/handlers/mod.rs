@@ -5,4 +5,5 @@ pub mod block;
 pub mod chain;
 pub mod mempool;
 pub mod outspend;
+pub mod sse;
 pub mod tx;

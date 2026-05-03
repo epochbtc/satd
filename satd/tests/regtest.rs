@@ -7697,3 +7697,237 @@ fn test_esplora_mempool_recent_caps_at_ten() {
     node.stop();
 }
 
+// ── Esplora live updates / SSE (PR 9) ──
+
+/// Minimal SSE client over raw TCP. Holds a `BufReader<TcpStream>` so
+/// callers can read events one at a time after the initial handshake.
+/// Each call to `next_event` returns the (event_type, data) pair from
+/// the next non-empty event, or panics if no event arrives within the
+/// configured deadline.
+struct SseClient {
+    reader: std::io::BufReader<std::net::TcpStream>,
+}
+
+impl SseClient {
+    fn connect(port: u16, path: &str) -> Self {
+        use std::io::{BufRead as _, BufReader, Write as _};
+        use std::net::TcpStream;
+        let mut stream =
+            TcpStream::connect(format!("127.0.0.1:{}", port)).expect("sse connect");
+        let req = format!(
+            "GET {} HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept: text/event-stream\r\nConnection: close\r\n\r\n",
+            path
+        );
+        stream.write_all(req.as_bytes()).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(15)))
+            .unwrap();
+        let mut reader = BufReader::new(stream);
+        // Skip HTTP response headers (until blank line). Verify status
+        // is 200 along the way.
+        let mut status_line = String::new();
+        reader.read_line(&mut status_line).expect("status line");
+        assert!(
+            status_line.contains(" 200 "),
+            "sse expected 200 OK; got: {}",
+            status_line.trim()
+        );
+        loop {
+            let mut header = String::new();
+            reader.read_line(&mut header).expect("header line");
+            if header.trim().is_empty() {
+                break;
+            }
+        }
+        Self { reader }
+    }
+
+    /// Block until a complete SSE event is read. Returns
+    /// `(event_type, data)`. SSE comments (`:keepalive`) are skipped.
+    fn next_event(&mut self) -> (String, String) {
+        use std::io::BufRead as _;
+        let mut event_type = String::new();
+        let mut data = String::new();
+        loop {
+            let mut line = String::new();
+            self.reader
+                .read_line(&mut line)
+                .expect("sse read");
+            let trimmed = line.trim_end_matches(['\r', '\n']);
+            if trimmed.is_empty() {
+                if !event_type.is_empty() || !data.is_empty() {
+                    return (event_type, data);
+                }
+                continue;
+            }
+            if let Some(rest) = trimmed.strip_prefix("event: ") {
+                event_type = rest.to_string();
+            } else if let Some(rest) = trimmed.strip_prefix("data: ") {
+                if !data.is_empty() {
+                    data.push('\n');
+                }
+                data.push_str(rest);
+            }
+            // `:` comment lines (heartbeats) and unknown directives ignored.
+        }
+    }
+}
+
+/// `/blocks/sse` emits a `block` event for each new BlockConnected.
+/// Mine one block; expect exactly one event with the right hash + height.
+#[test]
+fn test_esplora_blocks_sse_emits_on_new_block() {
+    let esplora_port = find_available_port();
+    let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
+    let mut node = TestNode::start(&["--esplora=1", &bind]);
+
+    let mut client = SseClient::connect(esplora_port, "/blocks/sse");
+
+    // Mine in a separate thread so we don't deadlock on the SSE read.
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let _ = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(1), serde_json::json!(addr)],
+        )
+        .unwrap();
+
+    let (event_type, data) = client.next_event();
+    assert_eq!(event_type, "block");
+    let payload: serde_json::Value = serde_json::from_str(&data).unwrap();
+    assert!(payload["hash"].is_string());
+    assert_eq!(payload["height"], 1);
+    node.stop();
+}
+
+/// `/address/:addr/sse` emits a `status` event when the address is
+/// touched by a confirmed tx. Mine one block to the address; expect
+/// the status_hash to update.
+#[test]
+fn test_esplora_address_sse_emits_status_on_touch() {
+    let esplora_port = find_available_port();
+    let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
+    let mut node = TestNode::start(&["--esplora=1", &bind]);
+
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let mut client = SseClient::connect(esplora_port, &format!("/address/{}/sse", addr));
+
+    // Mine to the address so the status_hash updates.
+    let _ = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(1), serde_json::json!(addr)],
+        )
+        .unwrap();
+
+    let (event_type, data) = client.next_event();
+    assert_eq!(event_type, "status");
+    let payload: serde_json::Value = serde_json::from_str(&data).unwrap();
+    assert_eq!(payload["address"], serde_json::json!(addr));
+    let sh = payload["status_hash"].as_str().unwrap();
+    assert_eq!(sh.len(), 64, "status_hash hex is 32 bytes");
+    // Cannot be all-zero — that's the empty-history sentinel and we
+    // just funded the address.
+    assert_ne!(sh, "0".repeat(64));
+    node.stop();
+}
+
+/// `/scripthash/:hash/sse` is the parallel scripthash variant.
+#[test]
+fn test_esplora_scripthash_sse_emits_status_on_touch() {
+    let esplora_port = find_available_port();
+    let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
+    let mut node = TestNode::start(&["--esplora=1", &bind]);
+
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let sh = esplora_scripthash_of(addr);
+    let mut client = SseClient::connect(esplora_port, &format!("/scripthash/{}/sse", sh));
+
+    let _ = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(1), serde_json::json!(addr)],
+        )
+        .unwrap();
+
+    let (event_type, data) = client.next_event();
+    assert_eq!(event_type, "status");
+    let payload: serde_json::Value = serde_json::from_str(&data).unwrap();
+    // Under /scripthash the label is the scripthash hex.
+    assert_eq!(payload["address"], serde_json::json!(sh));
+    node.stop();
+}
+
+/// Bad address / scripthash to SSE endpoints → 400, like their
+/// non-SSE siblings.
+#[test]
+fn test_esplora_sse_bad_input_400() {
+    use std::io::{BufRead as _, BufReader, Write as _};
+    use std::net::TcpStream;
+    let esplora_port = find_available_port();
+    let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
+    let mut node = TestNode::start(&["--esplora=1", &bind]);
+
+    for path in [
+        "/address/not-an-address/sse",
+        "/scripthash/not-hex/sse",
+        "/scripthash/0011/sse",
+    ] {
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{}", esplora_port)).unwrap();
+        let req = format!(
+            "GET {} HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept: text/event-stream\r\nConnection: close\r\n\r\n",
+            path
+        );
+        stream.write_all(req.as_bytes()).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut status_line = String::new();
+        reader.read_line(&mut status_line).unwrap();
+        assert!(
+            status_line.contains(" 400 "),
+            "expected 400 for {}; got: {}",
+            path,
+            status_line.trim()
+        );
+    }
+    node.stop();
+}
+
+/// Review M2: open SSE streams must be bounded by `--esplorasseconns`.
+/// Set the cap to 1, open one stream, then verify the next attempt
+/// returns 503 (not a hung socket / accepted connection).
+#[test]
+fn test_esplora_sse_connection_cap_saturates_with_503() {
+    use std::io::{BufRead as _, BufReader, Write as _};
+    use std::net::TcpStream;
+
+    let esplora_port = find_available_port();
+    let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
+    let mut node = TestNode::start(&[
+        "--esplora=1",
+        &bind,
+        "--esplorasseconns=1",
+    ]);
+
+    // First connection: claims the only permit. Hold it open by NOT
+    // dropping the SseClient until after the second connection's
+    // status line has been read.
+    let _holder = SseClient::connect(esplora_port, "/blocks/sse");
+
+    // Second connection should see 503 immediately on the status line.
+    let mut sock = TcpStream::connect(format!("127.0.0.1:{}", esplora_port)).unwrap();
+    let req = "GET /blocks/sse HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept: text/event-stream\r\nConnection: close\r\n\r\n";
+    sock.write_all(req.as_bytes()).unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut reader = BufReader::new(sock);
+    let mut status = String::new();
+    reader.read_line(&mut status).unwrap();
+    assert!(
+        status.contains(" 503 "),
+        "second SSE connection past cap=1 should 503; got: {}",
+        status.trim()
+    );
+
+    drop(_holder); // release the permit so the node can shut down cleanly
+    node.stop();
+}

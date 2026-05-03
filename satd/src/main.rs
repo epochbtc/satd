@@ -842,7 +842,20 @@ async fn main() {
                     config.esplora_request_timeout,
                 ),
                 max_concurrency: config.esplora_max_conns,
+                max_sse_conns: config.esplora_sse_max_conns,
                 auth: auth_cfg,
+            };
+            // Semaphore sized for SSE only — distinct from the request
+            // concurrency layer which doesn't bound long-lived streams
+            // (review M2). `0` means "no cap"; we still use a sized-1
+            // semaphore + add_permits so try_acquire never fails in
+            // that mode.
+            let sse_cap = if config.esplora_sse_max_conns == 0 {
+                let s = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+                s.add_permits(usize::MAX >> 8);
+                s
+            } else {
+                std::sync::Arc::new(tokio::sync::Semaphore::new(config.esplora_sse_max_conns))
             };
             let state = esplora_handlers::EsploraState {
                 chain: chain_state.clone(),
@@ -859,6 +872,7 @@ async fn main() {
                 fee_estimator: fee_estimator.clone(),
                 network: config.network,
                 config: Arc::new(esplora_cfg),
+                sse_semaphore: sse_cap,
             };
             // Auth/CORS/prefix validation surfaces here. A misconfigured
             // auth scheme is a user-visible exit, not a silent fall-back

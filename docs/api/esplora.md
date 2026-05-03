@@ -105,6 +105,27 @@ scripthash hex (non-hex or wrong length) → 400.
 |---|---|---|
 | GET | `/` | JSON: `{chain_tip: {hash, height}, mempool_count}`. Small summary for status pings. |
 
+### Live updates (Server-Sent Events)
+
+| Method | URL | Stream |
+|---|---|---|
+| GET | `/blocks/sse` | One `block` event per `BlockConnected`. Body: `{hash, height}`. |
+| GET | `/address/:addr/sse` | One `status` event per status-hash change for the address. Body: `{address, status_hash}`. |
+| GET | `/scripthash/:hash/sse` | Parallel scripthash variant. The `address` field carries the scripthash hex. |
+
+Connections receive a `:keep-alive` heartbeat every 25 seconds so idle
+streams survive intermediate proxy timeouts (Caddy default 30s, nginx
+default 60s).
+
+Per-scripthash subscriptions consume from the registry capped by
+`--addrindexsubscriptions=N` (default 10000); over-cap subscribe
+attempts return 503.
+
+A subscriber that lags the broadcast channel skips ahead — the
+broadcast guarantees no panic but may drop intermediate events.
+Clients are expected to refresh state via the standard endpoints
+(`/address/:addr` or `/blocks/tip/{hash,height}`) on reconnect.
+
 ## Wire-shape gotchas
 
 - **Hex byte order.** Block hashes, txids, and merkle siblings are
@@ -189,8 +210,9 @@ upstream blockstream.info / mempool.space within these constraints:
   "up to 50", not a specific order.
 - **Fee histogram bucketing** uses electrs's published boundaries
   (1, 2, 3, 4, 5, 6, 8, 10, 12, 15, 20, …, 4000 sat/vB).
-- **Live updates** (SSE / WebSocket subscriptions) are not yet
-  implemented — see PR 9 in the Esplora REST stack.
+- **WebSocket** subscriptions are not implemented; SSE is the
+  supported live-updates transport. Most consumers (BDK, mempool.space
+  SDK) accept SSE as a drop-in replacement.
 - **High-history scripts.** Address-history endpoints
   (`/address/:addr`, `/address/:addr/txs/chain[/:cursor]`,
   `/address/:addr/utxo`, scripthash variants) load the full
