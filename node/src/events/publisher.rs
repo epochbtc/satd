@@ -43,7 +43,6 @@ pub struct EventPublisher {
     edge: EdgeIdentity,
     seq: AtomicU64,
     started_monotonic: Instant,
-    started_wall_ns: u64,
 }
 
 impl EventPublisher {
@@ -51,16 +50,11 @@ impl EventPublisher {
     /// pass [`ENVELOPE_BROADCAST_CAPACITY`] for the default.
     pub fn new(edge: EdgeIdentity, capacity: usize) -> Arc<Self> {
         let (out, _rx) = broadcast::channel(capacity);
-        let started_wall_ns = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
         Arc::new(Self {
             out,
             edge,
             seq: AtomicU64::new(0),
             started_monotonic: Instant::now(),
-            started_wall_ns,
         })
     }
 
@@ -82,12 +76,22 @@ impl EventPublisher {
     }
 
     /// Build a stamp for a new envelope. Increments the per-publisher
-    /// monotonic sequence and captures both monotonic and wall-clock
-    /// times at the same instant.
+    /// monotonic sequence and samples both clocks at the bridge instant.
+    /// `edge_seen_at_ns` is monotonic since publisher start;
+    /// `edge_wall_ns` is `SystemTime::now()` so it tracks NTP /
+    /// administrator-driven adjustments — accept that it may step
+    /// backwards or forwards under those, and use it for cross-node
+    /// correlation rather than ordering on a single node.
     fn stamp(&self) -> EdgeStamp {
         let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
         let monotonic_elapsed = self.started_monotonic.elapsed().as_nanos() as u64;
-        let edge_wall_ns = self.started_wall_ns.saturating_add(monotonic_elapsed);
+        // SystemTime is a VDSO call on Linux x86_64 (~50ns) — fine to
+        // resample per event. Pre-1970 clocks fall back to 0; that is
+        // pathological in practice but keeps the type total.
+        let edge_wall_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
         EdgeStamp {
             node_id: self.edge.node_id,
             region: self.edge.region,
@@ -423,6 +427,39 @@ mod tests {
         // depends on scheduler timing; the contract is "non-zero, no
         // panic, sink keeps running".
         assert!(lag.load(Ordering::Relaxed) > 0);
+        let _ = shutdown_tx.send(true);
+    }
+
+    #[tokio::test]
+    async fn edge_wall_ns_advances_with_real_time() {
+        // Two events separated by a real sleep should have edge_wall_ns
+        // values whose delta is at least ~10ms — confirming we resample
+        // SystemTime per event rather than computing from a frozen
+        // start anchor.
+        let publisher = EventPublisher::new(edge(), 16);
+        let (mp_tx, _) = broadcast::channel::<MempoolEvent>(16);
+        let (ch_tx, _) = broadcast::channel::<ChainEvent>(16);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let sink = CaptureSink::new();
+        let received = sink.received.clone();
+        publisher.attach_sinks(vec![Box::new(sink)], shutdown_rx.clone());
+        publisher.spawn_bridges(mp_tx.subscribe(), ch_tx.subscribe(), shutdown_rx);
+        tokio::task::yield_now().await;
+
+        mp_tx.send(enter_event(1)).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        mp_tx.send(enter_event(2)).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let envs = received.lock().unwrap().clone();
+        assert_eq!(envs.len(), 2);
+        let delta = envs[1].stamp.edge_wall_ns.saturating_sub(envs[0].stamp.edge_wall_ns);
+        assert!(
+            delta > 10_000_000,
+            "edge_wall_ns delta should reflect real elapsed time (got {} ns)",
+            delta,
+        );
         let _ = shutdown_tx.send(true);
     }
 

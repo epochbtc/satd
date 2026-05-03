@@ -404,13 +404,16 @@ async fn main() {
     let events_bus_chain_rx = chain_event_tx.subscribe();
     chain_state.set_chain_event_sender(chain_event_tx);
 
-    // Stand up the pluggable transport bus. Constructed unconditionally
-    // so future external sinks (gRPC, ZMQ, ...) can attach without
-    // re-plumbing the daemon. With zero sinks attached, the bridges
-    // and heartbeat run as no-ops (broadcast::send drops silently when
-    // there are no receivers) — cheap, and lets operators add a sink
-    // by SIGHUP-equivalent (restart with new flags) rather than a code
-    // change.
+    // Stand up the pluggable transport bus.
+    //
+    // Always-on, even when no external sink is configured: the daemon
+    // resolves (and on first start, persists) a UUIDv4 to
+    // `<datadir>/node_id`, spawns the mempool / chain bridges, and runs
+    // a 1 Hz heartbeat task. With zero external sinks, the resulting
+    // envelope `broadcast::send` calls return `Err(SendError)` (no
+    // receivers) and are silently dropped — work per event is small
+    // but not strictly zero. The trade-off is that operators can enable
+    // a sink with a single restart flag, no code path changes.
     let edge_identity = match node::events::EdgeIdentity::resolve(
         &net_datadir,
         config.events_node_id.as_deref(),

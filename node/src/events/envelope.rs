@@ -8,7 +8,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
+use serde::ser::SerializeStruct;
+use serde::{Serialize, Serializer};
 
 use crate::chain::events::ChainEvent;
 use crate::mempool::events::MempoolEvent;
@@ -138,6 +139,65 @@ impl EdgeIdentity {
     }
 }
 
+#[cfg(test)]
+mod stamp_serde_tests {
+    use super::*;
+
+    fn stamp() -> EdgeStamp {
+        EdgeStamp {
+            node_id: [
+                0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67,
+                0x89, 0xab, 0xcd, 0xef,
+            ],
+            region: Some(*b"us-east1"),
+            edge_seen_at_ns: 12_345_678,
+            edge_wall_ns: 1_700_000_000_000_000_000,
+            seq: 42,
+        }
+    }
+
+    #[test]
+    fn stamp_json_renders_node_id_as_hex() {
+        let v = serde_json::to_value(stamp()).unwrap();
+        assert_eq!(v["node_id"], "0123456789abcdef0123456789abcdef");
+        assert_eq!(v["node_id"].as_str().unwrap().len(), 32);
+    }
+
+    #[test]
+    fn stamp_json_renders_region_as_trimmed_string() {
+        let v = serde_json::to_value(stamp()).unwrap();
+        assert_eq!(v["region"], "us-east1");
+    }
+
+    #[test]
+    fn stamp_json_region_padded_short_value_is_trimmed() {
+        let s = EdgeStamp {
+            region: Some(*b"eu-w\0\0\0\0"),
+            ..stamp()
+        };
+        let v = serde_json::to_value(s).unwrap();
+        assert_eq!(v["region"], "eu-w");
+    }
+
+    #[test]
+    fn stamp_json_region_none_serializes_as_null() {
+        let s = EdgeStamp {
+            region: None,
+            ..stamp()
+        };
+        let v = serde_json::to_value(s).unwrap();
+        assert!(v["region"].is_null());
+    }
+
+    #[test]
+    fn stamp_json_preserves_numeric_fields() {
+        let v = serde_json::to_value(stamp()).unwrap();
+        assert_eq!(v["edge_seen_at_ns"], 12_345_678);
+        assert_eq!(v["edge_wall_ns"], 1_700_000_000_000_000_000_u64);
+        assert_eq!(v["seq"], 42);
+    }
+}
+
 fn parse_node_id(s: &str) -> Result<[u8; 16], EdgeIdentityError> {
     let s = s.trim();
     if s.len() != 32 {
@@ -184,9 +244,24 @@ fn load_or_generate_node_id(datadir: &Path) -> Result<[u8; 16], EdgeIdentityErro
 /// [`super::EventPublisher`]. All sinks see identical stamps for the
 /// same source event, so downstream pipelines can correlate observations
 /// across transports.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+///
+/// JSON shape (custom serialization via [`Serialize`]):
+/// ```json
+/// {
+///   "node_id": "0123456789abcdef0123456789abcdef",
+///   "region": "us-east1",
+///   "edge_seen_at_ns": 12345678,
+///   "edge_wall_ns": 1700000000000000000,
+///   "seq": 42
+/// }
+/// ```
+/// `node_id` is the 32-character lowercase hex render of the 16-byte
+/// identifier; `region` is the trimmed ASCII tag (or `null` if unset).
+/// Sinks that need raw bytes (e.g. the gRPC adapter mapping into a
+/// `bytes` field) read the public fields directly.
+#[derive(Debug, Clone, Copy)]
 pub struct EdgeStamp {
-    /// Stable per-node identifier. Hex-encoded UUIDv4 by default.
+    /// Stable per-node identifier. UUIDv4 by default.
     pub node_id: [u8; 16],
     /// Operator-provided geo / topology tag, packed ASCII.
     pub region: Option<[u8; REGION_BYTES]>,
@@ -194,14 +269,42 @@ pub struct EdgeStamp {
     /// internal event to a [`NodeEvent`]. Nanoseconds since publisher
     /// construction (so the value is monotonic and cheap to capture).
     pub edge_seen_at_ns: u64,
-    /// Wall-clock realtime nanoseconds since the Unix epoch, captured at
-    /// the same instant as `edge_seen_at_ns`. Usable for downstream
-    /// correlation across nodes; not monotonic across clock adjustments.
+    /// Wall-clock realtime nanoseconds since the Unix epoch, captured
+    /// at the same instant as `edge_seen_at_ns`. Subject to clock
+    /// adjustments (NTP, manual `date -s`) and therefore not monotonic.
+    /// Use [`Self::edge_seen_at_ns`] for ordering on a single node and
+    /// `edge_wall_ns` for cross-node correlation (with awareness of
+    /// inter-node clock skew).
     pub edge_wall_ns: u64,
     /// Per-`EventPublisher` monotonic sequence number, starting at 1.
     /// Restarts at 1 on daemon restart — pair with `node_id` for global
     /// uniqueness or with `edge_wall_ns` for ordering across restarts.
     pub seq: u64,
+}
+
+impl EdgeStamp {
+    /// Render the trimmed region tag as a borrowed `&str`, or `None` if
+    /// no region was configured.
+    pub fn region_str(&self) -> Option<&str> {
+        self.region.as_ref().map(|raw| {
+            let end = raw.iter().position(|b| *b == 0).unwrap_or(REGION_BYTES);
+            std::str::from_utf8(&raw[..end]).unwrap_or("")
+        })
+    }
+}
+
+impl Serialize for EdgeStamp {
+    fn serialize<S: Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        let node_id_hex = hex::encode(self.node_id);
+        let region = self.region_str();
+        let mut s = ser.serialize_struct("EdgeStamp", 5)?;
+        s.serialize_field("node_id", &node_id_hex)?;
+        s.serialize_field("region", &region)?;
+        s.serialize_field("edge_seen_at_ns", &self.edge_seen_at_ns)?;
+        s.serialize_field("edge_wall_ns", &self.edge_wall_ns)?;
+        s.serialize_field("seq", &self.seq)?;
+        s.end()
+    }
 }
 
 /// Body variants carried by [`NodeEvent`]. The discriminator field is
