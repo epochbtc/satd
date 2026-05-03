@@ -596,6 +596,28 @@ impl Mempool {
             .collect()
     }
 
+    /// Cheap O(1) lookup: which mempool tx (and which input vin) consumes
+    /// `outpoint`? Returns `None` if the outpoint is not consumed by any
+    /// mempool tx. Used by Esplora's `/tx/:txid/outspend/:vout` so the
+    /// single-output path doesn't have to clone the whole mempool to
+    /// answer one question (review M4).
+    ///
+    /// The outer lookup hits the existing `spends` index in O(1); the
+    /// inner walk over the spending tx's inputs is bounded by that
+    /// tx's own input count, not by mempool size.
+    pub fn spending_tx(&self, outpoint: &OutPoint) -> Option<(Txid, u32)> {
+        let inner = self.inner.read().unwrap();
+        let spending_txid = *inner.spends.get(outpoint)?;
+        let entry = inner.entries.get(&spending_txid)?;
+        let vin = entry
+            .tx
+            .input
+            .iter()
+            .position(|i| i.previous_output == *outpoint)?
+            as u32;
+        Some((spending_txid, vin))
+    }
+
     /// Remove transactions that have been in the mempool longer than the expiry time.
     /// Returns the number of transactions removed.
     pub fn remove_expired(&self) -> usize {
