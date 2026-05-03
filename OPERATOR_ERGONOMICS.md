@@ -215,20 +215,43 @@ through prefetch → connect → flush.
 **Effort:** S. `tracing-subscriber` has a JSON formatter. The work is picking
 field names we'll commit to.
 
-### 8. First-class REST/gRPC with OpenAPI
+### 8. First-class REST/gRPC with OpenAPI ✅ PARTIALLY SHIPPED (Esplora)
 
-**Pain:** Core's REST interface is "experimental", unauthenticated, loopback-only,
-and covers a subset of blockchain RPCs. No wallet, no network. Every third-party
-explorer (btc-rpc-explorer, mempool.space) exists partially because Core REST
+**Status:** Native Esplora-compatible REST server landed. On by default
+on `127.0.0.1:3000`; **auth defaults to `none`** (loopback-only
+deployments are fine; non-loopback exposure must explicitly set
+`--esploraauth=cookie` or `--esploraauth=userpass --esplorauserpass=...`).
+CORS, request-timeout, and concurrency-limit knobs are available;
+`POST /tx` carries a hard-wired 1 MiB body cap. Wire-shape parity with
+[blockstream.info](https://github.com/Blockstream/esplora) /
+[mempool.space](https://github.com/mempool/mempool) for the implemented
+endpoint set: chain, block, tx, address/scripthash (info, txs paginated,
+mempool txs, utxo), outspends + merkle proofs, mempool + fee + root.
+See [docs/api/esplora.md](docs/api/esplora.md) for the full endpoint
+list, configuration table, gotchas, and bench harness
+(`scripts/run-esplora-bench.sh`). Live updates (SSE) land in PR 9.
+
+**Pain (historical):** Core's REST interface is "experimental",
+unauthenticated, loopback-only, and covers a subset of blockchain
+RPCs. No wallet, no network. Every third-party explorer
+(btc-rpc-explorer, mempool.space) exists partially because Core REST
 isn't fit for purpose.
 
-**Proposal:** Documented REST layer at `/v1/*` with parity to RPC for read ops,
-auth via bearer token, pagination cursors from day one, OpenAPI spec generated
-from the handler types. gRPC as a stretch goal (proto-defined schema is a real
-win for wallet/explorer devs).
+**Deployment notes:**
+- Always behind a TLS terminator for public exposure (TLS handled by
+  `caddy` / `nginx`; satd does not terminate TLS itself).
+- **Public exposure requires explicitly enabling auth.** Default is
+  `--esploraauth=none`. For non-loopback binds, run with
+  `--esploraauth=cookie` (reuses the daemon `.cookie` file) or
+  `--esploraauth=userpass --esplorauserpass=<user>:<pass>`.
+- For mempool.space-style mounts, set `--esploraprefix=/api`.
+- For browser consumers, set `--esploracors=<origin>` (or `*`).
 
-**Effort:** L. Not a quick win but a significant moat once done. Consider
-doing it after Tier 1 to avoid premature schema lock-in.
+**Future:** OpenAPI spec generation from the handler types, optional
+gRPC surface, PSBT-aware tx submission.
+
+**Effort:** Esplora layer is now L+ shipped over PRs 1–9; PRs 1–7
+landed, 8 (this PR) and 9 (live updates) follow.
 
 ### 9. `--profile` presets ✅ SHIPPED
 
