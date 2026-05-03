@@ -302,6 +302,11 @@ pub struct Config {
     pub esplora_request_timeout: u64,
     /// Hard cap on concurrent in-flight Esplora requests.
     pub esplora_max_conns: usize,
+    /// Hard cap on simultaneously-open SSE streams. Separate from
+    /// `esplora_max_conns` because the request concurrency layer
+    /// does not bound long-lived streaming bodies (review M2). `0`
+    /// disables the cap.
+    pub esplora_sse_max_conns: usize,
     /// Authentication scheme: `none` (default), `cookie`, or
     /// `userpass`. `none` matches public-Esplora deployments.
     pub esplora_auth: EsploraAuthMode,
@@ -646,6 +651,10 @@ impl Config {
             .esploramaxconns
             .or_else(|| file_get("esploramaxconns").and_then(|v| v.parse().ok()))
             .unwrap_or(256);
+        let esplora_sse_max_conns = cli
+            .esplorasseconns
+            .or_else(|| file_get("esplorasseconns").and_then(|v| v.parse().ok()))
+            .unwrap_or(esplora_max_conns);
         let esplora_auth = cli
             .esploraauth
             .or_else(|| file_get("esploraauth"))
@@ -771,6 +780,7 @@ impl Config {
             esplora_cors,
             esplora_request_timeout,
             esplora_max_conns,
+            esplora_sse_max_conns,
             esplora_auth,
             esplora_cookie_file,
             esplora_userpass,
@@ -1123,6 +1133,9 @@ pub struct CliArgs {
     #[arg(long, value_name = "N", help = "Hard cap on concurrent in-flight Esplora requests (default: 256)")]
     pub esploramaxconns: Option<usize>,
 
+    #[arg(long, value_name = "N", help = "Hard cap on simultaneously-open Esplora SSE streams (default: same as --esploramaxconns; 0 disables)")]
+    pub esplorasseconns: Option<usize>,
+
     #[arg(long, value_name = "MODE", help = "Esplora authentication: none|cookie|userpass (default: none)")]
     pub esploraauth: Option<String>,
 
@@ -1317,6 +1330,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "esploracors",
         "esplorarequesttimeout",
         "esploramaxconns",
+        "esplorasseconns",
         "esploraauth",
         "esploracookiefile",
         "esplorauserpass",
@@ -1569,6 +1583,7 @@ rpcport=8332
             esploracors: vec![],
             esplorarequesttimeout: None,
             esploramaxconns: None,
+            esplorasseconns: None,
             esploraauth: None,
             esploracookiefile: None,
             esplorauserpass: None,
@@ -1654,6 +1669,7 @@ rpcport=8332
             esploracors: vec![],
             esplorarequesttimeout: None,
             esploramaxconns: None,
+            esplorasseconns: None,
             esploraauth: None,
             esploracookiefile: None,
             esplorauserpass: None,

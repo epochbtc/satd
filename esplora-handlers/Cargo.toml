@@ -16,6 +16,12 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 base64 = { workspace = true }
 tokio = { workspace = true }
+# SSE handlers convert tokio::sync::broadcast::Receiver into a Stream
+# via `tokio_stream::wrappers::BroadcastStream`. The `sync` feature
+# pulls in only the broadcast-stream wrapper, no extra runtime.
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures-util = "0.3"
+pin-project = "1"
 node-index = { path = "../node-index" }
 node = { path = "../node" }
 

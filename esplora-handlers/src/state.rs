@@ -9,6 +9,7 @@ use node::chain::state::ChainState;
 use node::mempool::fee::FeeEstimator;
 use node::mempool::pool::Mempool;
 use node_index::{AddressIndex, SpendIndex};
+use tokio::sync::Semaphore;
 
 use crate::config::EsploraConfig;
 
@@ -21,4 +22,12 @@ pub struct EsploraState {
     pub fee_estimator: Arc<FeeEstimator>,
     pub network: Network,
     pub config: Arc<EsploraConfig>,
+    /// Hard cap on concurrent SSE streams. Each handler acquires an
+    /// `OwnedSemaphorePermit` and holds it inside the response stream;
+    /// the permit drops when the stream is dropped (client disconnect
+    /// or shutdown). Sized from `EsploraConfig::max_sse_conns` at
+    /// startup. Separate from tower's `ConcurrencyLimitLayer` because
+    /// that layer only bounds request *handling*, not the lifetime of
+    /// long-lived streaming bodies (review M2).
+    pub sse_semaphore: Arc<Semaphore>,
 }

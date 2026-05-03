@@ -28,6 +28,14 @@ pub struct EsploraConfig {
     /// briefly then 503'd. 0 disables the limit (not recommended in
     /// production).
     pub max_concurrency: usize,
+    /// Hard cap on simultaneously-open SSE streams. Each open stream
+    /// holds a permit for the lifetime of the socket; the next
+    /// connection past the cap is rejected with 503. `0` disables.
+    /// Separate from `max_concurrency` because tower's
+    /// `ConcurrencyLimitLayer` only bounds request handling until the
+    /// `Sse` response is constructed — long-lived streaming bodies
+    /// outlive that permit (review M2).
+    pub max_sse_conns: usize,
     /// Authentication scheme. Default `None` matches public-Esplora
     /// deployments; operators on a flat LAN flip to `Cookie`.
     pub auth: EsploraAuth,
@@ -42,6 +50,12 @@ impl Default for EsploraConfig {
             cors_origins: Vec::new(),
             request_timeout: Duration::from_secs(30),
             max_concurrency: 256,
+            // SSE streams are inherently long-lived. The default cap
+            // (256) matches `max_concurrency` so a default-config
+            // operator can't accidentally accumulate more open SSE
+            // sockets than they sized their non-streaming endpoints
+            // for. Bump explicitly via --esplorasseconns.
+            max_sse_conns: 256,
             auth: EsploraAuth::None,
         }
     }
