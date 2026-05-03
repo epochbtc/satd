@@ -18,7 +18,7 @@ use tower_http::trace::TraceLayer;
 
 use crate::auth::AuthExpectation;
 use crate::config::EsploraConfig;
-use crate::handlers::{address, block, chain, tx};
+use crate::handlers::{address, block, chain, outspend, tx};
 use crate::state::EsploraState;
 
 #[derive(Debug, thiserror::Error)]
@@ -58,6 +58,14 @@ pub fn build_router(state: EsploraState) -> Result<Router, RouterBuildError> {
         .route("/tx/{txid}/status", get(tx::tx_status))
         .route("/tx/{txid}/hex", get(tx::tx_hex))
         .route("/tx/{txid}/raw", get(tx::tx_raw))
+        // Outspend + merkle-proof endpoints (Esplora plan PR 6).
+        .route("/tx/{txid}/outspend/{vout}", get(outspend::tx_outspend))
+        .route("/tx/{txid}/outspends", get(outspend::tx_outspends))
+        .route("/tx/{txid}/merkle-proof", get(outspend::tx_merkle_proof))
+        .route(
+            "/tx/{txid}/merkleblock-proof",
+            get(outspend::tx_merkleblock_proof),
+        )
         // Body cap for broadcast. `MAX_STANDARD_TX_WEIGHT` is 400_000
         // weight units; a witness-heavy standard tx can serialize to
         // around 400 KB, so hex-encoded the body can approach 800 KB.

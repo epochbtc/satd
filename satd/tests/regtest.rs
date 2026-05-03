@@ -7031,3 +7031,447 @@ fn test_esplora_address_utxo_excludes_mempool_spent() {
     assert_eq!(dest_entry["status"]["confirmed"], false);
     node.stop();
 }
+// ── Esplora outspends + merkle proofs (PR 6) ──
+
+/// Helper: build a confirmed P2WPKH spend for tests below. Returns
+/// `(spend_tx_hex, spend_txid_str, src_str, dest_str, cb_value_sat)`
+/// after mining 101 blocks to the src and submitting the spend (pre-
+/// mining; caller decides whether to mine the next block to confirm).
+fn esplora_pr6_make_spend(
+    node: &mut TestNode,
+) -> (String, String, String, &'static str, u64) {
+    use bitcoin::hashes::Hash as _;
+    use bitcoin::key::CompressedPublicKey;
+    use bitcoin::secp256k1::{Message, Secp256k1, SecretKey};
+    use bitcoin::sighash::{EcdsaSighashType, SighashCache};
+    use bitcoin::{
+        absolute::LockTime, Address, Amount, Network, OutPoint, PublicKey, ScriptBuf, Sequence,
+        Transaction, TxIn, TxOut, Witness,
+    };
+    use std::str::FromStr;
+
+    let secp = Secp256k1::new();
+    let sk = SecretKey::from_slice(&[0x73u8; 32]).unwrap();
+    let pk = PublicKey::new(sk.public_key(&secp));
+    let cpk = CompressedPublicKey::from_slice(&pk.to_bytes()).unwrap();
+    let src_addr = Address::p2wpkh(&cpk, Network::Regtest);
+    let src_str = src_addr.to_string();
+    let dest_addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+
+    let _ = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(101), serde_json::json!(src_str.clone())],
+        )
+        .unwrap();
+
+    let block1_hash = node
+        .rpc_call_with_params("getblockhash", vec![serde_json::json!(1)])
+        .unwrap()["result"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let block1 = node
+        .rpc_call_with_params(
+            "getblock",
+            vec![serde_json::json!(block1_hash), serde_json::json!(1)],
+        )
+        .unwrap();
+    let cb_txid = bitcoin::Txid::from_str(block1["result"]["tx"][0].as_str().unwrap()).unwrap();
+    let cb_value = 50u64 * 100_000_000;
+
+    let dest_script = Address::from_str(dest_addr)
+        .unwrap()
+        .require_network(Network::Regtest)
+        .unwrap()
+        .script_pubkey();
+    let send = cb_value - 1000;
+    let mut spend = Transaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: cb_txid,
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(send),
+            script_pubkey: dest_script,
+        }],
+    };
+    let src_script = src_addr.script_pubkey();
+    let mut cache = SighashCache::new(&spend);
+    let sighash = cache
+        .p2wpkh_signature_hash(0, &src_script, Amount::from_sat(cb_value), EcdsaSighashType::All)
+        .unwrap();
+    let msg = Message::from_digest(sighash.to_byte_array());
+    let sig = secp.sign_ecdsa(&msg, &sk);
+    let mut sig_bytes = sig.serialize_der().to_vec();
+    sig_bytes.push(EcdsaSighashType::All as u8);
+    let mut witness = Witness::new();
+    witness.push(sig_bytes);
+    witness.push(pk.to_bytes());
+    spend.input[0].witness = witness;
+
+    let raw_hex = hex::encode(bitcoin::consensus::serialize(&spend));
+    let spend_txid = spend.compute_txid().to_string();
+    let _ = node
+        .rpc_call_with_params(
+            "sendrawtransaction",
+            vec![serde_json::json!(raw_hex.clone())],
+        )
+        .unwrap();
+    (raw_hex, spend_txid, src_str, dest_addr, cb_value)
+}
+
+/// `/tx/:txid/outspend/:vout` returns `{spent: false}` for an unspent
+/// coinbase output.
+#[test]
+fn test_esplora_outspend_unspent_returns_spent_false() {
+    let esplora_port = find_available_port();
+    let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
+    let mut node = TestNode::start(&["--esplora=1", &bind]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let _ = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(1), serde_json::json!(addr)],
+        )
+        .unwrap();
+    let tip = esplora_get(esplora_port, "/blocks/tip/hash")
+        .text()
+        .unwrap()
+        .trim()
+        .to_string();
+    let txids: Vec<String> = esplora_get(esplora_port, &format!("/block/{}/txids", tip))
+        .json()
+        .unwrap();
+    let cb = &txids[0];
+    let r = esplora_get(esplora_port, &format!("/tx/{}/outspend/0", cb));
+    assert_eq!(r.status(), 200);
+    let body: serde_json::Value = r.json().unwrap();
+    assert_eq!(body["spent"], false);
+    assert!(body["txid"].is_null() || !body.as_object().unwrap().contains_key("txid"));
+    node.stop();
+}
+
+/// After confirming a real spend, `/outspend/:vout` reports the
+/// spending tx with `confirmed: true` and the spending tx's block.
+#[test]
+fn test_esplora_outspend_confirmed_spend_reports_spender() {
+    let esplora_port = find_available_port();
+    let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
+    let mut node = TestNode::start(&["--esplora=1", &bind]);
+    let (_raw_hex, spend_txid, src_str, _dest, cb_value) = esplora_pr6_make_spend(&mut node);
+
+    // Mine 1 to confirm the spend.
+    let _ = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(1), serde_json::json!(src_str)],
+        )
+        .unwrap();
+
+    // Find the cb txid for block 1 (the one being spent).
+    let block1_hash = node
+        .rpc_call_with_params("getblockhash", vec![serde_json::json!(1)])
+        .unwrap()["result"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let cb_txid: Vec<String> = esplora_get(esplora_port, &format!("/block/{}/txids", block1_hash))
+        .json()
+        .unwrap();
+    let cb = &cb_txid[0];
+
+    let r = esplora_get(esplora_port, &format!("/tx/{}/outspend/0", cb));
+    let body: serde_json::Value = r.json().unwrap();
+    assert_eq!(body["spent"], true);
+    assert_eq!(body["txid"], serde_json::json!(spend_txid));
+    assert_eq!(body["vin"], 0);
+    assert_eq!(body["status"]["confirmed"], true);
+    // The confirming block height for the spend = 102.
+    assert_eq!(body["status"]["block_height"], 102);
+    let _ = cb_value;
+    node.stop();
+}
+
+/// A mempool-only spend appears in /outspend with `confirmed: false`.
+#[test]
+fn test_esplora_outspend_mempool_spend_reports_unconfirmed() {
+    let esplora_port = find_available_port();
+    let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
+    let mut node = TestNode::start(&["--esplora=1", &bind]);
+    let (_raw_hex, spend_txid, _src, _dest, _) = esplora_pr6_make_spend(&mut node);
+    // DO NOT mine — spend remains in mempool.
+
+    let block1_hash = node
+        .rpc_call_with_params("getblockhash", vec![serde_json::json!(1)])
+        .unwrap()["result"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let cb_txid: Vec<String> = esplora_get(esplora_port, &format!("/block/{}/txids", block1_hash))
+        .json()
+        .unwrap();
+    let cb = &cb_txid[0];
+
+    let r = esplora_get(esplora_port, &format!("/tx/{}/outspend/0", cb));
+    let body: serde_json::Value = r.json().unwrap();
+    assert_eq!(body["spent"], true);
+    assert_eq!(body["txid"], serde_json::json!(spend_txid));
+    assert_eq!(body["status"]["confirmed"], false);
+    assert!(body["status"]["block_height"].is_null());
+    node.stop();
+}
+
+/// `/outspends` returns one entry per output, in vout order. For a
+/// confirmed coinbase that's been spent at vout 0, the array is `[spent, ...rest]`.
+#[test]
+fn test_esplora_outspends_array_matches_output_count() {
+    let esplora_port = find_available_port();
+    let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
+    let mut node = TestNode::start(&["--esplora=1", &bind]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let _ = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(2), serde_json::json!(addr)],
+        )
+        .unwrap();
+
+    // Pull tip's coinbase.
+    let tip = esplora_get(esplora_port, "/blocks/tip/hash")
+        .text()
+        .unwrap()
+        .trim()
+        .to_string();
+    let txids: Vec<String> = esplora_get(esplora_port, &format!("/block/{}/txids", tip))
+        .json()
+        .unwrap();
+    let cb = &txids[0];
+
+    let r = esplora_get(esplora_port, &format!("/tx/{}/outspends", cb));
+    let arr: Vec<serde_json::Value> = r.json().unwrap();
+    // Coinbase to a single P2WPKH/P2WSH address: one output.
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["spent"], false);
+    node.stop();
+}
+
+/// Single-tx block: merkle-proof returns empty `merkle` array, pos=0.
+#[test]
+fn test_esplora_merkle_proof_single_tx_block_is_empty() {
+    let esplora_port = find_available_port();
+    let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
+    let mut node = TestNode::start(&["--esplora=1", &bind]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let _ = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(1), serde_json::json!(addr)],
+        )
+        .unwrap();
+
+    let tip = esplora_get(esplora_port, "/blocks/tip/hash")
+        .text()
+        .unwrap()
+        .trim()
+        .to_string();
+    let txids: Vec<String> = esplora_get(esplora_port, &format!("/block/{}/txids", tip))
+        .json()
+        .unwrap();
+    let cb = &txids[0];
+
+    let r = esplora_get(esplora_port, &format!("/tx/{}/merkle-proof", cb));
+    let body: serde_json::Value = r.json().unwrap();
+    assert_eq!(body["block_height"], 1);
+    assert_eq!(body["pos"], 0);
+    let merkle: Vec<serde_json::Value> = body["merkle"].as_array().unwrap().clone();
+    assert!(
+        merkle.is_empty(),
+        "single-tx block has empty merkle path; got {:?}",
+        merkle
+    );
+    node.stop();
+}
+
+/// Multi-tx block: merkle-proof returns a non-empty path that proves
+/// the tx is in the block. Verify length matches ceil(log2(n)) and that
+/// the reconstructed root matches the block header's merkle_root.
+#[test]
+fn test_esplora_merkle_proof_two_tx_block_proves_inclusion() {
+    use bitcoin::hashes::Hash as _;
+    let esplora_port = find_available_port();
+    let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
+    let mut node = TestNode::start(&["--esplora=1", &bind]);
+    let (_raw, spend_txid, src_str, _dest, _) = esplora_pr6_make_spend(&mut node);
+    // Mine to confirm spend → block 102 has 2 txs (coinbase + spend).
+    let _ = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(1), serde_json::json!(src_str)],
+        )
+        .unwrap();
+
+    let tip = esplora_get(esplora_port, "/blocks/tip/hash")
+        .text()
+        .unwrap()
+        .trim()
+        .to_string();
+    let txids: Vec<String> = esplora_get(esplora_port, &format!("/block/{}/txids", tip))
+        .json()
+        .unwrap();
+    assert_eq!(txids.len(), 2);
+
+    let r = esplora_get(esplora_port, &format!("/tx/{}/merkle-proof", spend_txid));
+    let body: serde_json::Value = r.json().unwrap();
+    assert_eq!(body["block_height"], 102);
+    let pos = body["pos"].as_u64().unwrap();
+    assert_eq!(pos, 1, "spend tx is the 2nd tx in the block");
+    let merkle: Vec<String> = body["merkle"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(merkle.len(), 1, "2-tx block has a single-step merkle path");
+
+    // Reconstruct the merkle root from the proof and compare against
+    // the block header's merkle_root.
+    let block_detail: serde_json::Value = esplora_get(esplora_port, &format!("/block/{}", tip))
+        .json()
+        .unwrap();
+    let header_merkle_root = block_detail["merkle_root"].as_str().unwrap().to_string();
+
+    // Walk the proof: start with our txid (display→raw byte order),
+    // pair with each sibling (display order; reverse for raw), apply
+    // sha256d, reverse for display.
+    fn reverse_hex(s: &str) -> Vec<u8> {
+        let mut bytes = hex::decode(s).unwrap();
+        bytes.reverse();
+        bytes
+    }
+    let mut acc: [u8; 32] = reverse_hex(&spend_txid).try_into().unwrap();
+    let mut idx = pos as usize;
+    for sib_hex in &merkle {
+        let sib: [u8; 32] = reverse_hex(sib_hex).try_into().unwrap();
+        let mut combined = [0u8; 64];
+        if idx & 1 == 0 {
+            combined[..32].copy_from_slice(&acc);
+            combined[32..].copy_from_slice(&sib);
+        } else {
+            combined[..32].copy_from_slice(&sib);
+            combined[32..].copy_from_slice(&acc);
+        }
+        acc = bitcoin::hashes::sha256d::Hash::hash(&combined).to_byte_array();
+        idx /= 2;
+    }
+    // Reverse for display.
+    let mut display = acc.to_vec();
+    display.reverse();
+    let computed = hex::encode(display);
+    assert_eq!(computed, header_merkle_root);
+    node.stop();
+}
+
+/// `/merkleblock-proof` returns valid hex that decodes to a MerkleBlock
+/// containing the requested txid.
+#[test]
+fn test_esplora_merkleblock_proof_decodes_with_target_txid() {
+    use bitcoin::consensus::encode::deserialize;
+    use bitcoin::merkle_tree::MerkleBlock;
+    use std::str::FromStr;
+    let esplora_port = find_available_port();
+    let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
+    let mut node = TestNode::start(&["--esplora=1", &bind]);
+    let (_raw, spend_txid, src_str, _dest, _) = esplora_pr6_make_spend(&mut node);
+    let _ = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(1), serde_json::json!(src_str)],
+        )
+        .unwrap();
+
+    let r = esplora_get(esplora_port, &format!("/tx/{}/merkleblock-proof", spend_txid));
+    assert_eq!(r.status(), 200);
+    let hex_body = r.text().unwrap();
+    let bytes = hex::decode(hex_body.trim()).unwrap();
+    let mb: MerkleBlock = deserialize(&bytes).expect("must decode as MerkleBlock");
+
+    let mut matches: Vec<bitcoin::Txid> = Vec::new();
+    let mut indexes: Vec<u32> = Vec::new();
+    mb.extract_matches(&mut matches, &mut indexes).unwrap();
+    let want = bitcoin::Txid::from_str(&spend_txid).unwrap();
+    assert!(matches.contains(&want));
+    node.stop();
+}
+
+/// `/outspend` for an unknown txid → 404 (not 500).
+#[test]
+fn test_esplora_outspend_unknown_txid_returns_404() {
+    let esplora_port = find_available_port();
+    let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
+    let mut node = TestNode::start(&["--esplora=1", &bind]);
+
+    // /outspends — list endpoint must 404 for an unknown txid.
+    let r = esplora_get(
+        esplora_port,
+        "/tx/0000000000000000000000000000000000000000000000000000000000000000/outspends",
+    );
+    assert_eq!(r.status(), 404);
+
+    // /outspend/:vout — single-output endpoint must also 404 for an
+    // unknown txid (review H1). Previously returned `200 {spent:false}`.
+    let r = esplora_get(
+        esplora_port,
+        "/tx/0000000000000000000000000000000000000000000000000000000000000000/outspend/0",
+    );
+    assert_eq!(r.status(), 404);
+    node.stop();
+}
+
+/// Review H1: `/tx/:txid/outspend/:vout` must return 404 when `vout`
+/// is past the tx's output count, even for a real txid. Previously
+/// returned `200 {spent:false}` for any out-of-range vout.
+#[test]
+fn test_esplora_outspend_out_of_range_vout_returns_404() {
+    let esplora_port = find_available_port();
+    let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
+    let mut node = TestNode::start(&["--esplora=1", &bind]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let _ = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(1), serde_json::json!(addr)],
+        )
+        .unwrap();
+    let tip = esplora_get(esplora_port, "/blocks/tip/hash")
+        .text()
+        .unwrap()
+        .trim()
+        .to_string();
+    let txids: Vec<String> = esplora_get(esplora_port, &format!("/block/{}/txids", tip))
+        .json()
+        .unwrap();
+    let cb = &txids[0];
+
+    // vout 0 (in range) → 200 spent:false.
+    let r = esplora_get(esplora_port, &format!("/tx/{}/outspend/0", cb));
+    assert_eq!(r.status(), 200);
+    let body: serde_json::Value = r.json().unwrap();
+    assert_eq!(body["spent"], false);
+
+    // vout 1 (past coinbase output count) → 404.
+    let r = esplora_get(esplora_port, &format!("/tx/{}/outspend/1", cb));
+    assert_eq!(r.status(), 404);
+
+    // vout 999 (way out of range) → 404.
+    let r = esplora_get(esplora_port, &format!("/tx/{}/outspend/999", cb));
+    assert_eq!(r.status(), 404);
+    node.stop();
+}
