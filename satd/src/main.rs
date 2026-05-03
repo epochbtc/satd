@@ -392,6 +392,7 @@ async fn main() {
         node::mempool::events::MempoolEvent,
     >(node::mempool::pool::EVENT_BROADCAST_CAPACITY);
     let addr_index_mempool_event_rx = mempool_event_tx.subscribe();
+    let events_bus_mempool_rx = mempool_event_tx.subscribe();
     mempool.set_event_sender(mempool_event_tx);
 
     // Wire the chain-event broadcaster used by the address-index
@@ -400,7 +401,47 @@ async fn main() {
         node::chain::events::ChainEvent,
     >(node::chain::events::CHAIN_EVENT_BROADCAST_CAPACITY);
     let addr_notifier_chain_event_rx = chain_event_tx.subscribe();
+    let events_bus_chain_rx = chain_event_tx.subscribe();
     chain_state.set_chain_event_sender(chain_event_tx);
+
+    // Stand up the pluggable transport bus. Constructed unconditionally
+    // so future external sinks (gRPC, ZMQ, ...) can attach without
+    // re-plumbing the daemon. With zero sinks attached, the bridges
+    // and heartbeat run as no-ops (broadcast::send drops silently when
+    // there are no receivers) — cheap, and lets operators add a sink
+    // by SIGHUP-equivalent (restart with new flags) rather than a code
+    // change.
+    let edge_identity = match node::events::EdgeIdentity::resolve(
+        &net_datadir,
+        config.events_node_id.as_deref(),
+        config.events_region.as_deref(),
+    ) {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::error!("events bus: failed to resolve edge identity: {e}");
+            auth.cleanup();
+            std::process::exit(1);
+        }
+    };
+    tracing::info!(
+        target: "events",
+        node_id = %edge_identity.node_id_hex(),
+        region = edge_identity.region_str().unwrap_or(""),
+        "events bus edge identity resolved",
+    );
+    let event_publisher = node::events::EventPublisher::new(
+        edge_identity,
+        node::events::ENVELOPE_BROADCAST_CAPACITY,
+    );
+    event_publisher.spawn_bridges(
+        events_bus_mempool_rx,
+        events_bus_chain_rx,
+        shutdown_rx.clone(),
+    );
+    event_publisher.spawn_heartbeat(
+        node::events::publisher::HEARTBEAT_INTERVAL,
+        shutdown_rx.clone(),
+    );
 
     // Hook the mempool back into ChainState so `perform_reorg` can
     // re-add disconnected non-coinbase txs after a reorg (Bitcoin Core
