@@ -10,14 +10,15 @@
 //! Lag handling matches the Esplora SSE pattern — `Lagged` increments a
 //! per-client gauge and the stream continues. Sinks must never panic.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 
 use async_trait::async_trait;
 use node::events::{EventSink, NodeEvent, NodeEventBody};
+use tokio::net::TcpListener;
 use tokio::sync::{broadcast, watch};
 use tokio_stream::Stream;
-use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::wrappers::{BroadcastStream, TcpListenerStream};
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, info, warn};
@@ -32,33 +33,81 @@ use crate::proto::v1::node_event_stream_server::{
 pub enum GrpcEventSinkError {
     #[error("invalid bind address '{0}': {1}")]
     InvalidBind(String, std::net::AddrParseError),
+    #[error(
+        "refusing to bind events gRPC server on non-loopback address {0}: \
+         the server is unauthenticated and unencrypted; pass \
+         --events-grpc-allow-remote to override after putting it behind a \
+         firewall or auth proxy"
+    )]
+    RemoteBindRejected(SocketAddr),
+    #[error("failed to bind {0}: {1}")]
+    BindFailed(SocketAddr, std::io::Error),
 }
 
-/// gRPC streaming sink. Construct via [`GrpcEventSink::new`], then hand
-/// it to [`node::events::EventPublisher::attach_sinks`] which spawns the
+/// gRPC streaming sink. Construct via [`GrpcEventSink::bind`] (async,
+/// pre-binds the TCP listener so failure is reported synchronously at
+/// startup), then hand it to
+/// [`node::events::EventPublisher::attach_sinks`] which spawns the
 /// `run` future as a tokio task.
 pub struct GrpcEventSink {
-    bind: SocketAddr,
+    addr: SocketAddr,
+    listener: TcpListener,
     publisher: std::sync::Arc<node::events::EventPublisher>,
 }
 
 impl GrpcEventSink {
-    /// Build a new sink that will listen on `bind`. The `publisher`
-    /// handle is needed so each incoming subscriber can register its
-    /// own broadcast receiver — sharing the [`EventSink::run`] receiver
-    /// across N clients would force each client to serialize through a
-    /// single channel.
-    pub fn new(
+    /// Build a new sink and **bind** the TCP listener immediately, so
+    /// any bind failure is reported at startup before the daemon
+    /// declares readiness.
+    ///
+    /// The server is unauthenticated and unencrypted. By default, only
+    /// loopback bindings are accepted; pass `allow_remote = true` to
+    /// bind a routable address (which the operator should put behind
+    /// a firewall, mTLS terminator, or auth proxy).
+    ///
+    /// The `publisher` handle is needed so each incoming subscriber can
+    /// register its own broadcast receiver — sharing the
+    /// [`EventSink::run`] receiver across N clients would force each
+    /// client to serialize through a single channel.
+    pub async fn bind(
         bind: &str,
+        allow_remote: bool,
         publisher: std::sync::Arc<node::events::EventPublisher>,
     ) -> Result<Self, GrpcEventSinkError> {
         let addr: SocketAddr = bind
             .parse()
             .map_err(|e| GrpcEventSinkError::InvalidBind(bind.to_string(), e))?;
+        if !allow_remote && !is_loopback(&addr.ip()) {
+            return Err(GrpcEventSinkError::RemoteBindRejected(addr));
+        }
+        let listener = TcpListener::bind(addr)
+            .await
+            .map_err(|e| GrpcEventSinkError::BindFailed(addr, e))?;
+        let bound = listener.local_addr().unwrap_or(addr);
+        info!(
+            target: "events::grpc",
+            addr = %bound,
+            allow_remote,
+            "events gRPC server bound",
+        );
         Ok(Self {
-            bind: addr,
+            addr: bound,
+            listener,
             publisher,
         })
+    }
+
+    /// Address the listener is bound on. Test helper / observability
+    /// hook — production callers don't need this.
+    pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.listener.local_addr()
+    }
+}
+
+fn is_loopback(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback(),
+        IpAddr::V6(v6) => v6.is_loopback(),
     }
 }
 
@@ -81,13 +130,17 @@ impl EventSink for GrpcEventSink {
         let svc = NodeEventStreamServer::new(NodeEventStreamSvc {
             publisher: self.publisher.clone(),
         });
-        info!(target: "events::grpc", addr = %self.bind, "events gRPC server starting");
+        info!(target: "events::grpc", addr = %self.addr, "events gRPC server starting");
         let shutdown_signal = async move {
             let _ = shutdown.changed().await;
         };
+        // The TCP listener was already bound in `bind()` (so any
+        // operator-visible bind failure happens at startup, not here).
+        // Hand it to tonic via `serve_with_incoming_shutdown`.
+        let incoming = TcpListenerStream::new(self.listener);
         if let Err(e) = Server::builder()
             .add_service(svc)
-            .serve_with_shutdown(self.bind, shutdown_signal)
+            .serve_with_incoming_shutdown(incoming, shutdown_signal)
             .await
         {
             warn!(target: "events::grpc", error = %e, "events gRPC server exited with error");
@@ -110,8 +163,14 @@ impl NodeEventStream for NodeEventStreamSvc {
     ) -> Result<Response<Self::SubscribeStream>, Status> {
         let req = request.into_inner();
         // 0 means "all categories" — same convention as the in-process
-        // `EventSink`. Otherwise it's a bitfield: mempool=1, chain=2,
-        // heartbeat=4.
+        // `EventSink`. Otherwise it's a bitfield (mempool=1, chain=2,
+        // heartbeat=4). Unknown bits are silently ignored: a future
+        // server may add new categories without forcing older clients
+        // to upgrade. We could `return Err(invalid_argument)` if the
+        // mask covers no known bit, but that would also reject the
+        // legitimate "subscribe to a category my server doesn't know
+        // about yet" case during a rolling upgrade — easier to log
+        // and let the stream be empty.
         let category_mask = if req.categories == 0 {
             u32::MAX
         } else {
@@ -119,12 +178,22 @@ impl NodeEventStream for NodeEventStreamSvc {
         };
         let since_seq = req.since_seq.unwrap_or(0);
 
+        // `since_seq` is a forward-only filter, NOT a replay hint. We
+        // create a fresh broadcast::Receiver here, which only sees
+        // events emitted strictly after this point — there is no
+        // history rewind. We then drop everything with seq <= since_seq
+        // before sending, so a client that briefly disconnects can
+        // suppress already-seen duplicates if its old `seq` is still
+        // close to the current one. Anything older has already passed
+        // the publisher's broadcast window and cannot be recovered
+        // through this RPC; clients needing durable replay should
+        // consume from a broker upstream of this sink.
         let rx = self.publisher.subscribe();
         debug!(
             target: "events::grpc",
             categories = req.categories,
             since_seq,
-            "events gRPC subscriber attached",
+            "events gRPC subscriber attached (forward-only; no replay)",
         );
 
         let stream = BroadcastStream::new(rx).filter_map(move |item| match item {
@@ -345,6 +414,39 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn bind_rejects_remote_address_by_default() {
+        let publisher = EventPublisher::new(edge(), 16);
+        match GrpcEventSink::bind("0.0.0.0:0", false, publisher).await {
+            Err(GrpcEventSinkError::RemoteBindRejected(_)) => {}
+            Ok(_) => panic!("non-loopback bind without allow_remote should fail"),
+            Err(e) => panic!("expected RemoteBindRejected, got {e}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn bind_allows_loopback_without_override() {
+        let publisher = EventPublisher::new(edge(), 16);
+        let sink = GrpcEventSink::bind("127.0.0.1:0", false, publisher)
+            .await
+            .expect("loopback bind should succeed");
+        let addr = sink.local_addr().expect("local_addr");
+        assert!(addr.ip().is_loopback());
+    }
+
+    #[tokio::test]
+    async fn bind_allows_remote_with_allow_flag() {
+        let publisher = EventPublisher::new(edge(), 16);
+        // 0.0.0.0:0 with allow_remote = true: must succeed (the actual
+        // port the OS picks is irrelevant; the test asserts only that
+        // the loopback gate is bypassed when the caller opts in).
+        let sink = GrpcEventSink::bind("0.0.0.0:0", true, publisher)
+            .await
+            .expect("explicit remote bind should be allowed");
+        let addr = sink.local_addr().unwrap();
+        assert!(!addr.ip().is_loopback());
+    }
+
     #[test]
     fn region_serialization_trims_padding() {
         let stamp = node::events::EdgeStamp {
@@ -370,14 +472,12 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         publisher.spawn_bridges(mp_tx.subscribe(), ch_tx.subscribe(), shutdown_rx.clone());
 
-        // 2. Pick an ephemeral port via TcpListener (tonic itself doesn't
-        // expose its bound port), drop the listener, then build the sink
-        // against the now-known address. There's a tiny TOCTOU window
-        // before tonic re-binds; in practice it's reliable on loopback.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let actual = listener.local_addr().unwrap();
-        drop(listener);
-        let sink = GrpcEventSink::new(&actual.to_string(), publisher.clone()).unwrap();
+        // 2. Bind directly (the new API picks the actual ephemeral port
+        // from the OS, no TOCTOU window).
+        let sink = GrpcEventSink::bind("127.0.0.1:0", false, publisher.clone())
+            .await
+            .expect("bind");
+        let actual = sink.local_addr().unwrap();
         let sinks: Vec<Box<dyn EventSink>> = vec![Box::new(sink)];
         publisher.attach_sinks(sinks, shutdown_rx.clone());
 

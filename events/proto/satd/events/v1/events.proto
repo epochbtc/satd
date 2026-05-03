@@ -13,13 +13,20 @@ service NodeEventStream {
 // "no filter" (the server applies its own defaults).
 message SubscribeRequest {
   // Bitfield: mempool=1, chain=2, heartbeat=4. Zero means "all".
+  // Unknown bits are silently ignored — the server treats the request
+  // as "any of the known categories I recognize that you set"; it does
+  // not error on unrecognized bits so a newer client can address an
+  // older server without a hard incompatibility during a rolling
+  // upgrade.
   uint32 categories = 1;
 
-  // Best-effort resume hint. The server has no durable replay log, so
-  // this is treated as "deliver events with seq > since_seq if they
-  // are still in the live broadcast buffer; otherwise begin from
-  // current". Clients that need durable replay should consume from a
-  // durable broker upstream of the gRPC sink.
+  // Forward-only filter. The server begins each subscription from the
+  // moment the RPC is opened (no replay buffer) and applies this as a
+  // ">since_seq" filter on events observed thereafter. Use it to
+  // suppress duplicates after a brief reconnect within the broadcast
+  // window — NOT to replay history. Events whose seq <= since_seq are
+  // dropped before reaching the wire. Clients that need durable
+  // replay should consume from a durable broker upstream of this sink.
   optional uint64 since_seq = 2;
 }
 

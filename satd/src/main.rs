@@ -451,9 +451,20 @@ async fn main() {
     // asked for via CLI / `bitcoin.conf`.
     let mut event_sinks: Vec<Box<dyn node::events::EventSink>> = Vec::new();
     if let Some(bind) = config.events_grpc_bind.as_deref() {
-        match satd_events::GrpcEventSink::new(bind, event_publisher.clone()) {
+        match satd_events::GrpcEventSink::bind(
+            bind,
+            config.events_grpc_allow_remote,
+            event_publisher.clone(),
+        )
+        .await
+        {
             Ok(sink) => {
-                tracing::info!(target: "events", bind, "events gRPC sink configured");
+                tracing::info!(
+                    target: "events",
+                    bind,
+                    allow_remote = config.events_grpc_allow_remote,
+                    "events gRPC sink configured",
+                );
                 event_sinks.push(Box::new(sink));
             }
             Err(e) => {

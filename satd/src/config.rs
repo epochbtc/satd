@@ -398,8 +398,15 @@ pub struct Config {
     /// `host:port` to bind the events gRPC streaming server. `None`
     /// (default) leaves the gRPC sink disabled. The server speaks the
     /// `satd.events.v1.NodeEventStream` schema; clients open a single
-    /// `Subscribe` RPC and consume the stream.
+    /// `Subscribe` RPC and consume the stream. The server is
+    /// **unauthenticated and unencrypted**; non-loopback bindings are
+    /// rejected unless `events_grpc_allow_remote` is also set.
     pub events_grpc_bind: Option<String>,
+    /// Permit `events_grpc_bind` to point at a non-loopback address.
+    /// Default `false`. Operators must enable this explicitly *and*
+    /// place the server behind a firewall, mTLS terminator, or auth
+    /// proxy — the gRPC sink itself has no auth or rate limits.
+    pub events_grpc_allow_remote: bool,
     // No-op compatibility flags (accepted but ignored)
     #[allow(dead_code)]
     pub server: bool,
@@ -965,6 +972,10 @@ impl Config {
             events_grpc_bind: cli
                 .events_grpc_bind
                 .or_else(|| file_get("eventsgrpcbind")),
+            events_grpc_allow_remote: cli.events_grpc_allow_remote
+                || file_get("eventsgrpcallowremote")
+                    .and_then(|v| parse_bool(&v))
+                    .unwrap_or(false),
             pending_notes,
         })
     }
@@ -1294,8 +1305,11 @@ pub struct CliArgs {
     #[arg(long = "events-region", value_name = "TAG", help = "Optional region tag stamped on every events envelope (\u{2264}8 printable ASCII bytes, e.g. 'us-east1')")]
     pub events_region: Option<String>,
 
-    #[arg(long = "events-grpc-bind", value_name = "ADDR", help = "host:port to bind the events gRPC streaming server (e.g. '0.0.0.0:28430'). Default: disabled")]
+    #[arg(long = "events-grpc-bind", value_name = "ADDR", help = "host:port to bind the events gRPC streaming server. UNAUTHENTICATED — bind to loopback or use --events-grpc-allow-remote for explicit remote exposure. Default: disabled")]
     pub events_grpc_bind: Option<String>,
+
+    #[arg(long = "events-grpc-allow-remote", help = "Permit --events-grpc-bind to point at a non-loopback address. Operator must firewall or auth-proxy the endpoint — the sink has no auth")]
+    pub events_grpc_allow_remote: bool,
 }
 
 /// Translate Bitcoin-Core-compatible index-control aliases that don't
@@ -1656,6 +1670,7 @@ rpcport=8332
             events_node_id: None,
             events_region: None,
             events_grpc_bind: None,
+            events_grpc_allow_remote: false,
         };
         let config = Config::from_cli(cli).unwrap();
         assert_eq!(config.network, Network::Regtest);
@@ -1745,6 +1760,7 @@ rpcport=8332
             events_node_id: None,
             events_region: None,
             events_grpc_bind: None,
+            events_grpc_allow_remote: false,
         };
         assert!(Config::from_cli(cli).is_err());
     }
