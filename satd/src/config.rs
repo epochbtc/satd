@@ -407,6 +407,22 @@ pub struct Config {
     /// place the server behind a firewall, mTLS terminator, or auth
     /// proxy — the gRPC sink itself has no auth or rate limits.
     pub events_grpc_allow_remote: bool,
+    /// ZMQ endpoint string (e.g. `tcp://0.0.0.0:28332`) for the events
+    /// PUB-socket sink. `None` = disabled. Topics emitted: `hashtx`,
+    /// `hashblock` (Bitcoin Core wire-format compatible), plus
+    /// `mpevict`, `mpreplace`, `mpconfirm`, `nodeevent` (JSON
+    /// payloads). Per-topic enable/disable lives in the matching
+    /// `events_zmq_*` fields.
+    pub events_zmq_bind: Option<String>,
+    /// Per-topic ZMQ enable flags. `None` = topic enabled by default
+    /// (matching Core's behavior — if you bind ZMQ, you get every
+    /// topic). Set explicitly to disable.
+    pub events_zmq_hashtx: Option<bool>,
+    pub events_zmq_hashblock: Option<bool>,
+    pub events_zmq_mpevict: Option<bool>,
+    pub events_zmq_mpreplace: Option<bool>,
+    pub events_zmq_mpconfirm: Option<bool>,
+    pub events_zmq_nodeevent: Option<bool>,
     // No-op compatibility flags (accepted but ignored)
     #[allow(dead_code)]
     pub server: bool,
@@ -976,6 +992,27 @@ impl Config {
                 || file_get("eventsgrpcallowremote")
                     .and_then(|v| parse_bool(&v))
                     .unwrap_or(false),
+            events_zmq_bind: cli
+                .events_zmq_bind
+                .or_else(|| file_get("eventszmqbind")),
+            events_zmq_hashtx: cli
+                .events_zmq_hashtx
+                .or_else(|| file_get("eventszmqhashtx").and_then(|v| parse_bool(&v))),
+            events_zmq_hashblock: cli.events_zmq_hashblock.or_else(|| {
+                file_get("eventszmqhashblock").and_then(|v| parse_bool(&v))
+            }),
+            events_zmq_mpevict: cli
+                .events_zmq_mpevict
+                .or_else(|| file_get("eventszmqmpevict").and_then(|v| parse_bool(&v))),
+            events_zmq_mpreplace: cli.events_zmq_mpreplace.or_else(|| {
+                file_get("eventszmqmpreplace").and_then(|v| parse_bool(&v))
+            }),
+            events_zmq_mpconfirm: cli.events_zmq_mpconfirm.or_else(|| {
+                file_get("eventszmqmpconfirm").and_then(|v| parse_bool(&v))
+            }),
+            events_zmq_nodeevent: cli.events_zmq_nodeevent.or_else(|| {
+                file_get("eventszmqnodeevent").and_then(|v| parse_bool(&v))
+            }),
             pending_notes,
         })
     }
@@ -1310,6 +1347,27 @@ pub struct CliArgs {
 
     #[arg(long = "events-grpc-allow-remote", help = "Permit --events-grpc-bind to point at a non-loopback address. Operator must firewall or auth-proxy the endpoint — the sink has no auth")]
     pub events_grpc_allow_remote: bool,
+
+    #[arg(long = "events-zmq-bind", value_name = "ENDPOINT", help = "ZMQ endpoint for the events PUB sink (e.g. 'tcp://0.0.0.0:28332'). Default: disabled")]
+    pub events_zmq_bind: Option<String>,
+
+    #[arg(long = "events-zmq-hashtx", value_name = "BOOL", help = "Enable Bitcoin Core-compatible 'hashtx' topic on the events ZMQ sink (default: enabled when --events-zmq-bind is set)")]
+    pub events_zmq_hashtx: Option<bool>,
+
+    #[arg(long = "events-zmq-hashblock", value_name = "BOOL", help = "Enable Bitcoin Core-compatible 'hashblock' topic on the events ZMQ sink (default: enabled)")]
+    pub events_zmq_hashblock: Option<bool>,
+
+    #[arg(long = "events-zmq-mpevict", value_name = "BOOL", help = "Enable 'mpevict' topic (mempool eviction with reason) on the events ZMQ sink (default: enabled)")]
+    pub events_zmq_mpevict: Option<bool>,
+
+    #[arg(long = "events-zmq-mpreplace", value_name = "BOOL", help = "Enable 'mpreplace' topic (RBF replacement) on the events ZMQ sink (default: enabled)")]
+    pub events_zmq_mpreplace: Option<bool>,
+
+    #[arg(long = "events-zmq-mpconfirm", value_name = "BOOL", help = "Enable 'mpconfirm' topic (mempool tx confirmed in block) on the events ZMQ sink (default: enabled)")]
+    pub events_zmq_mpconfirm: Option<bool>,
+
+    #[arg(long = "events-zmq-nodeevent", value_name = "BOOL", help = "Enable 'nodeevent' topic (full envelope JSON) on the events ZMQ sink (default: enabled)")]
+    pub events_zmq_nodeevent: Option<bool>,
 }
 
 /// Translate Bitcoin-Core-compatible index-control aliases that don't
@@ -1671,6 +1729,13 @@ rpcport=8332
             events_region: None,
             events_grpc_bind: None,
             events_grpc_allow_remote: false,
+            events_zmq_bind: None,
+            events_zmq_hashtx: None,
+            events_zmq_hashblock: None,
+            events_zmq_mpevict: None,
+            events_zmq_mpreplace: None,
+            events_zmq_mpconfirm: None,
+            events_zmq_nodeevent: None,
         };
         let config = Config::from_cli(cli).unwrap();
         assert_eq!(config.network, Network::Regtest);
@@ -1761,6 +1826,13 @@ rpcport=8332
             events_region: None,
             events_grpc_bind: None,
             events_grpc_allow_remote: false,
+            events_zmq_bind: None,
+            events_zmq_hashtx: None,
+            events_zmq_hashblock: None,
+            events_zmq_mpevict: None,
+            events_zmq_mpreplace: None,
+            events_zmq_mpconfirm: None,
+            events_zmq_nodeevent: None,
         };
         assert!(Config::from_cli(cli).is_err());
     }

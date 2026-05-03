@@ -32,3 +32,9 @@ pub mod proto {
 
 #[cfg(feature = "grpc")]
 pub use grpc::{GrpcEventSink, GrpcEventSinkError};
+
+#[cfg(feature = "zmq")]
+pub mod zmq;
+
+#[cfg(feature = "zmq")]
+pub use zmq::{ZmqEventSink, ZmqEventSinkError, ZmqTopicConfig};

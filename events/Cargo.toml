@@ -6,7 +6,7 @@ edition.workspace = true
 [features]
 default = []
 grpc = ["dep:tonic", "dep:prost", "dep:tokio-stream"]
-zmq = []
+zmq = ["dep:zeromq"]
 
 [dependencies]
 node = { path = "../node" }
@@ -23,6 +23,9 @@ thiserror = { workspace = true }
 tonic = { workspace = true, optional = true }
 prost = { workspace = true, optional = true }
 tokio-stream = { workspace = true, optional = true }
+
+# zmq feature
+zeromq = { workspace = true, optional = true }
 
 [build-dependencies]
 tonic-build = { workspace = true }
