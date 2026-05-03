@@ -11,7 +11,10 @@
 //!   `/blocks[/:start_height]`, `/block-height/:h`. Auth, CORS, timeout,
 //!   concurrency-limit middleware.
 //! - PR 3-7: block / tx / address / outspend / mempool / fee endpoints.
-//! - PR 9: WebSocket + SSE.
+//! - PR 9: SSE live updates (`/blocks/sse`, `/address/:addr/sse`,
+//!   `/scripthash/:hash/sse`). WebSocket transport is intentionally
+//!   not implemented — known consumers (BDK, mempool.space SDK)
+//!   accept SSE.
 
 pub mod auth;
 pub mod config;

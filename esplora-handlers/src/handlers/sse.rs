@@ -6,8 +6,11 @@
 //!   `BlockConnected`. Body: JSON `{hash, height}`.
 //! - `GET /address/:addr/sse`  → one `status` event per status-hash
 //!   change for the address. Body: JSON `{address, status_hash}`.
-//! - `GET /scripthash/:hash/sse` → parallel scripthash variant. Body:
-//!   JSON `{scripthash, status_hash}` (no `address` field).
+//! - `GET /scripthash/:hash/sse` → parallel scripthash variant. Body
+//!   shape is identical to `/address/:addr/sse` —
+//!   `{address, status_hash}`, where the `address` field carries the
+//!   scripthash hex. The field name is stable across both routes so
+//!   client tooling can dispatch on a single key.
 //!
 //! Each stream emits a heartbeat comment every 25 seconds so idle
 //! connections survive intermediate proxy timeouts (Caddy's default
