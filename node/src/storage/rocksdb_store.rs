@@ -974,12 +974,16 @@ impl Store for RocksDbStore {
         self.drop_backfill_temp_cf()?;
         // Re-stamp schema version after metadata CF was recreated
         Self::stamp_schema(&self.db, CURRENT_SCHEMA_VERSION)?;
-        // Re-stamp outpoint_spend.complete + tx_index.complete:
-        // -reindex-chainstate produces a from-empty re-population
-        // which connect_block will fill atomically across all three
-        // index CFs (round-3 H1).
+        // Re-stamp outpoint_spend.complete + tx_index.complete +
+        // address_index.complete: -reindex-chainstate produces a
+        // from-empty re-population which connect_block will fill
+        // atomically across all index CFs (round-3 H1, round-2-review
+        // H2). Without the address re-stamp the operator's documented
+        // remediation (`--reindex-chainstate`) would silently leave
+        // Electrum / Esplora address surfaces refusing to bind.
         self.write_outpoint_spend_complete(true)?;
-        self.write_tx_index_complete(true)
+        self.write_tx_index_complete(true)?;
+        self.write_address_index_complete(true)
     }
 
     fn clear_all(&self) -> Result<(), StoreError> {
@@ -1002,8 +1006,11 @@ impl Store for RocksDbStore {
         self.drop_backfill_temp_cf()?;
         // Re-stamp schema version after metadata CF was recreated
         Self::stamp_schema(&self.db, CURRENT_SCHEMA_VERSION)?;
+        // Same three completeness markers as `clear_chainstate` —
+        // see comment there for the round-2-review H2 rationale.
         self.write_outpoint_spend_complete(true)?;
-        self.write_tx_index_complete(true)
+        self.write_tx_index_complete(true)?;
+        self.write_address_index_complete(true)
     }
 
     fn get_coins_batch(&self, outpoints: &[OutPoint]) -> Vec<Option<Coin>> {
@@ -1957,6 +1964,39 @@ mod tests {
         // The backfill-completion path stamps true.
         store.mark_address_index_complete().unwrap();
         assert!(store.address_index_complete());
+    }
+
+    #[test]
+    fn test_address_index_complete_after_clear_chainstate() {
+        // Round-2-review H2: -reindex-chainstate must re-stamp the
+        // address marker alongside tx_index and outpoint_spend, or
+        // the documented remediation leaves Electrum / Esplora
+        // permanently refusing to bind.
+        let (store, _dir) = temp_store(false);
+        store.write_address_index_complete(false).unwrap();
+        assert!(!store.address_index_complete());
+        store.clear_chainstate().unwrap();
+        assert!(
+            store.address_index_complete(),
+            "clear_chainstate must re-stamp address_index.complete"
+        );
+        // Sister markers should also be true (sanity check the
+        // existing contract).
+        assert!(store.tx_index_complete());
+        assert!(store.outpoint_spend_complete());
+    }
+
+    #[test]
+    fn test_address_index_complete_after_clear_all() {
+        // Same contract for full --reindex via clear_all.
+        let (store, _dir) = temp_store(false);
+        store.write_address_index_complete(false).unwrap();
+        assert!(!store.address_index_complete());
+        store.clear_all().unwrap();
+        assert!(
+            store.address_index_complete(),
+            "clear_all must re-stamp address_index.complete"
+        );
     }
 
     // ── iter_addr_funding/spending_limited (round-1 review M4) ────

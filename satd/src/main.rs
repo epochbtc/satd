@@ -910,6 +910,24 @@ async fn main() {
                 auth.cleanup();
                 std::process::exit(1);
             }
+            // Round-2 review H1: same address-index completeness gate
+            // as the Electrum startup path. Esplora's `/address/*`
+            // endpoints read through `address_index.confirmed_history`
+            // and `address_index.utxos`; without this check they would
+            // return well-formed but partial historical results on a
+            // datadir that was previously synced with --addressindex=0.
+            if !chain_state.store_ref().address_index_complete() {
+                eprintln!(
+                    "Error: esplora is enabled and --addressindex=1, but the on-disk \n\
+                     address-history CFs are incomplete (this datadir was previously \n\
+                     synced with --addressindex=0, or the backfill has not finished). \n\
+                     Run the address-index backfill to completion before enabling \n\
+                     Esplora, or restart with --reindex-chainstate. Set --esplora=0 \n\
+                     to skip the Esplora listener."
+                );
+                auth.cleanup();
+                std::process::exit(1);
+            }
             let bind: SocketAddr = config
                 .esplora_bind
                 .parse()
