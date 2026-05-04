@@ -249,6 +249,23 @@ pub trait Store: Send + Sync {
         Vec::new()
     }
 
+    /// Like [`iter_addr_funding`](Self::iter_addr_funding), but stops
+    /// after collecting `limit` rows. Used by streaming-cap callers
+    /// (Electrum / Esplora `get_history`, `listunspent`) so a
+    /// pathologically large scripthash can't force a full RocksDB
+    /// scan + Vec allocation just to fail the per-request cap check.
+    /// Round-1 review M4. Default: forwards to the unlimited
+    /// variant + truncates (correct but unoptimized).
+    fn iter_addr_funding_limited(
+        &self,
+        sh: &Scripthash,
+        limit: usize,
+    ) -> Vec<(AddrFundingKey, u64)> {
+        let mut v = self.iter_addr_funding(sh);
+        v.truncate(limit);
+        v
+    }
+
     /// All committed `addr_spending` rows for `sh`, ordered ascending by
     /// `(height, txid, vin)`. Default: empty.
     fn iter_addr_spending(
@@ -256,6 +273,18 @@ pub trait Store: Send + Sync {
         _sh: &Scripthash,
     ) -> Vec<(AddrSpendingKey, bitcoin::OutPoint)> {
         Vec::new()
+    }
+
+    /// Like [`iter_addr_spending`](Self::iter_addr_spending), but
+    /// stops after collecting `limit` rows. Round-1 review M4.
+    fn iter_addr_spending_limited(
+        &self,
+        sh: &Scripthash,
+        limit: usize,
+    ) -> Vec<(AddrSpendingKey, bitcoin::OutPoint)> {
+        let mut v = self.iter_addr_spending(sh);
+        v.truncate(limit);
+        v
     }
 
     /// Look up the input that spent `outpoint` on the active chain.

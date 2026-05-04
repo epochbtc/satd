@@ -122,15 +122,17 @@ pub fn block_headers(state: &ElectrumState, params: Value) -> Result<Value, Json
 
 pub fn scripthash_get_history(state: &ElectrumState, params: Value) -> Result<Value, JsonRpcError> {
     let sh = parse_scripthash(&params, "blockchain.scripthash.get_history")?;
+    // Round-1 review M4: ask the index for at most `cap + 1` rows so
+    // we abort the RocksDB scan early on pathological scripthashes.
+    // If we got more than `cap` rows back, the cap was exceeded.
+    let cap = state.config.max_history_entries;
     let confirmed = state
         .address_index
-        .confirmed_history(&sh.0)
+        .confirmed_history_limited(&sh.0, cap.saturating_add(1))
         .map_err(JsonRpcError::from_index)?;
 
-    if confirmed.len() > state.config.max_history_entries {
-        return Err(JsonRpcError::history_too_large(
-            state.config.max_history_entries,
-        ));
+    if confirmed.len() > cap {
+        return Err(JsonRpcError::history_too_large(cap));
     }
 
     // Dedup confirmed rows by `(height, txid)` — Electrum reports one
@@ -198,19 +200,19 @@ pub fn scripthash_get_balance(state: &ElectrumState, params: Value) -> Result<Va
 
 pub fn scripthash_listunspent(state: &ElectrumState, params: Value) -> Result<Value, JsonRpcError> {
     let sh = parse_scripthash(&params, "blockchain.scripthash.listunspent")?;
+    // Round-1 review M4: bound the index walk at cap + 1 UTXOs.
+    let cap = state.config.max_history_entries;
     let utxos = state
         .address_index
-        .utxos(&sh.0)
+        .utxos_limited(&sh.0, cap.saturating_add(1))
         .map_err(JsonRpcError::from_index)?;
 
     // Walk funding rows in `(height, txid, vout)` order — already the
-    // natural order of `utxos()` per the trait contract. Listunspent
-    // is bounded by max_history_entries since it can't exceed it
-    // (each UTXO descends from a funding row).
-    if utxos.len() > state.config.max_history_entries {
-        return Err(JsonRpcError::history_too_large(
-            state.config.max_history_entries,
-        ));
+    // natural order of `utxos_limited()` per the trait contract.
+    // Listunspent is bounded by max_history_entries since it can't
+    // exceed it (each UTXO descends from a funding row).
+    if utxos.len() > cap {
+        return Err(JsonRpcError::history_too_large(cap));
     }
 
     // Mempool merge — mirrors `romanz/electrs`'s `Unspent::build`:

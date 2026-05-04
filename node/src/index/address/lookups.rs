@@ -95,10 +95,25 @@ impl RocksAddressIndex {
 
 impl AddressIndex for RocksAddressIndex {
     fn confirmed_history(&self, sh: &Scripthash) -> Result<Vec<HistoryEntry>, IndexError> {
+        self.confirmed_history_limited(sh, usize::MAX)
+    }
+
+    fn confirmed_history_limited(
+        &self,
+        sh: &Scripthash,
+        limit: usize,
+    ) -> Result<Vec<HistoryEntry>, IndexError> {
         self.check_enabled()?;
 
-        let funding = self.store.iter_addr_funding(sh);
-        let spending = self.store.iter_addr_spending(sh);
+        // Round-1 review M4: bound the RocksDB scan. Asking each side
+        // for `limit` rows guarantees that the merged total has at
+        // least `limit` if either side hits its cap; the handler then
+        // checks `len > cap` to decide. We don't need `limit + 1` per
+        // side because the merge across funding + spending of the
+        // same `(height, txid)` is row-oriented (each row is its own
+        // entry), not tx-oriented — the handler dedupes if it cares.
+        let funding = self.store.iter_addr_funding_limited(sh, limit);
+        let spending = self.store.iter_addr_spending_limited(sh, limit);
 
         // Two pre-sorted streams (by encoded key, both prefixed with
         // the same scripthash → height-ascending). Merge by height
@@ -177,14 +192,32 @@ impl AddressIndex for RocksAddressIndex {
     }
 
     fn utxos(&self, sh: &Scripthash) -> Result<Vec<Utxo>, IndexError> {
+        self.utxos_limited(sh, usize::MAX)
+    }
+
+    fn utxos_limited(&self, sh: &Scripthash, limit: usize) -> Result<Vec<Utxo>, IndexError> {
         self.check_enabled()?;
 
         // Same iteration shape as `balance`: walk funding rows, keep
         // those whose outpoint is still in the coins CF. Returns in
         // funding-key order (height ascending, txid then vout).
+        //
+        // Round-1 review M4: stop once we have `limit` UTXOs. We
+        // can't bound the funding scan by `limit` directly because
+        // each funding row needs a `has_coin` filter — most rows
+        // may have already been spent — so we keep iterating
+        // funding until `out.len() == limit`. Worst case is when
+        // the live UTXO set is a small tail of a long history; then
+        // we still scan most of the funding rows. That's an
+        // acceptable trade — the cap is the wire-size guard, not a
+        // pathological-scripthash CPU guard. (CPU bounding belongs
+        // with rate limiting / per-peer caps.)
         let funding = self.store.iter_addr_funding(sh);
         let mut out = Vec::new();
         for (k, amount) in funding {
+            if out.len() >= limit {
+                break;
+            }
             let outpoint = OutPoint {
                 txid: k.txid,
                 vout: k.vout,

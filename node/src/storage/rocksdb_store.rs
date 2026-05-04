@@ -1039,15 +1039,27 @@ impl Store for RocksDbStore {
         &self,
         sh: &crate::index::address::Scripthash,
     ) -> Vec<(crate::index::address::AddrFundingKey, u64)> {
+        self.iter_addr_funding_limited(sh, usize::MAX)
+    }
+
+    fn iter_addr_funding_limited(
+        &self,
+        sh: &crate::index::address::Scripthash,
+        limit: usize,
+    ) -> Vec<(crate::index::address::AddrFundingKey, u64)> {
         let cf = self.cf(CF_ADDR_FUNDING);
         // The CF carries a 32-byte fixed prefix-extractor, so
         // `prefix_iterator_cf` short-circuits via the matching SST
         // index/bloom and terminates at the first row whose first 32
-        // bytes leave the prefix. RocksDB's iterator is a borrowed
-        // ReadOptions snapshot; we collect into Vec for caller
-        // simplicity (bounded per-scripthash row count in practice).
-        let mut out = Vec::new();
+        // bytes leave the prefix. With a `limit`, we stop iterating
+        // once we've collected that many rows — `usize::MAX` is the
+        // unlimited sentinel used by the unbounded `iter_addr_funding`
+        // wrapper above.
+        let mut out: Vec<(crate::index::address::AddrFundingKey, u64)> = Vec::new();
         for item in self.db.prefix_iterator_cf(&cf, sh) {
+            if out.len() >= limit {
+                break;
+            }
             let (k, v) = match item {
                 Ok(kv) => kv,
                 Err(_) => continue,
@@ -1076,9 +1088,20 @@ impl Store for RocksDbStore {
         &self,
         sh: &crate::index::address::Scripthash,
     ) -> Vec<(crate::index::address::AddrSpendingKey, OutPoint)> {
+        self.iter_addr_spending_limited(sh, usize::MAX)
+    }
+
+    fn iter_addr_spending_limited(
+        &self,
+        sh: &crate::index::address::Scripthash,
+        limit: usize,
+    ) -> Vec<(crate::index::address::AddrSpendingKey, OutPoint)> {
         let cf = self.cf(CF_ADDR_SPENDING);
-        let mut out = Vec::new();
+        let mut out: Vec<(crate::index::address::AddrSpendingKey, OutPoint)> = Vec::new();
         for item in self.db.prefix_iterator_cf(&cf, sh) {
+            if out.len() >= limit {
+                break;
+            }
             let (k, v) = match item {
                 Ok(kv) => kv,
                 Err(_) => continue,
@@ -1934,6 +1957,58 @@ mod tests {
         // The backfill-completion path stamps true.
         store.mark_address_index_complete().unwrap();
         assert!(store.address_index_complete());
+    }
+
+    // ── iter_addr_funding/spending_limited (round-1 review M4) ────
+
+    #[test]
+    fn test_iter_addr_funding_limited_aborts_at_cap() {
+        use crate::index::address::AddrFundingRow;
+        let (store, _dir) = temp_store(false);
+
+        let sh = [0xab; 32];
+        let mut batch = StoreBatch::default();
+        for i in 0..50u32 {
+            batch.addr_funding_puts.push(AddrFundingRow {
+                scripthash: sh,
+                height: i,
+                txid: make_outpoint(0x10 + (i as u8 % 8), 0).txid,
+                vout: i,
+                amount_sat: 1000 + (i as u64),
+            });
+        }
+        store.write_batch(batch).unwrap();
+
+        // Unbounded read returns all 50 rows.
+        assert_eq!(store.iter_addr_funding(&sh).len(), 50);
+
+        // Limited read stops at the cap.
+        assert_eq!(store.iter_addr_funding_limited(&sh, 10).len(), 10);
+        assert_eq!(store.iter_addr_funding_limited(&sh, 0).len(), 0);
+        // limit > total: returns total.
+        assert_eq!(store.iter_addr_funding_limited(&sh, 100).len(), 50);
+    }
+
+    #[test]
+    fn test_iter_addr_spending_limited_aborts_at_cap() {
+        use crate::index::address::AddrSpendingRow;
+        let (store, _dir) = temp_store(false);
+
+        let sh = [0xcd; 32];
+        let mut batch = StoreBatch::default();
+        for i in 0..30u32 {
+            batch.addr_spending_puts.push(AddrSpendingRow {
+                scripthash: sh,
+                height: i,
+                txid: make_outpoint(0x20 + (i as u8 % 8), 0).txid,
+                vin: 0,
+                prev_outpoint: make_outpoint(0xff, i),
+            });
+        }
+        store.write_batch(batch).unwrap();
+
+        assert_eq!(store.iter_addr_spending(&sh).len(), 30);
+        assert_eq!(store.iter_addr_spending_limited(&sh, 5).len(), 5);
     }
 
     #[test]
