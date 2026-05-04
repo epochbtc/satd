@@ -12,8 +12,10 @@
 //! response. The push-notification side lives in PR-4
 //! ([`crate::subscribe`]).
 
+use bitcoin::OutPoint;
 use bitcoin::Transaction;
 use bitcoin::consensus::encode::{deserialize, serialize};
+use node_index::scripthash_of;
 use serde_json::{Value, json};
 
 use crate::dispatch::{require_array, require_array_range};
@@ -23,7 +25,7 @@ use crate::state::ElectrumState;
 use crate::status::{compute_status_hash, status_hash_to_json};
 use crate::types::{
     BalanceResponse, FeeHistogramEntry, GetMerkleResponse, HeadersResponse, HistoryEntry,
-    ListUnspentEntry, ScripthashHex, TxidHex, merkle_node_to_hex,
+    ListUnspentEntry, ScripthashHex, TxidHex, merkle_node_to_hex, parse_wire_scripthash,
 };
 
 // ── blockchain.headers.* ──────────────────────────────────────────
@@ -45,7 +47,7 @@ pub fn headers_get(state: &ElectrumState, params: Value) -> Result<Value, JsonRp
     let header = state
         .electrum_extras
         .header_at(height)
-        .ok_or_else(|| JsonRpcError::invalid_params(format!("no header at height {height}")))?;
+        .ok_or_else(|| JsonRpcError::bad_request(format!("no header at height {height}")))?;
     Ok(json!({
         "height": height,
         "hex": hex::encode(serialize(&header)),
@@ -55,23 +57,41 @@ pub fn headers_get(state: &ElectrumState, params: Value) -> Result<Value, JsonRp
 // ── blockchain.block.* ────────────────────────────────────────────
 
 pub fn block_header(state: &ElectrumState, params: Value) -> Result<Value, JsonRpcError> {
-    // `(height, [cp_height])` — we accept the cp_height arg for
-    // protocol compatibility but ignore it (no checkpoint-proof
-    // support in v1; the caller gets the raw header alone).
+    // `(height, [cp_height])` — `cp_height=0` (or omitted) returns
+    // the raw 80-byte header. Nonzero `cp_height` requests a
+    // checkpoint proof against block `cp_height`'s merkle root over
+    // headers, which v1 doesn't implement. Per M3 (review round 1),
+    // silently returning the proof-less response was a compatibility
+    // hazard — clients that pass `cp_height` get a structured error
+    // they can surface, instead of a half-shaped lie.
     let arr = require_array_range(&params, 1, 2, "blockchain.block.header")?;
     let height = parse_height(&arr[0])?;
+    let cp_height = arr.get(1).map(|v| parse_u32(v, "cp_height")).transpose()?;
+    if cp_height.unwrap_or(0) != 0 {
+        return Err(JsonRpcError::bad_request(
+            "checkpoint proof (nonzero cp_height) is not supported by this server",
+        ));
+    }
     let header = state
         .electrum_extras
         .header_at(height)
-        .ok_or_else(|| JsonRpcError::invalid_params(format!("no header at height {height}")))?;
+        .ok_or_else(|| JsonRpcError::bad_request(format!("no header at height {height}")))?;
     Ok(Value::String(hex::encode(serialize(&header))))
 }
 
 pub fn block_headers(state: &ElectrumState, params: Value) -> Result<Value, JsonRpcError> {
-    // `(start_height, count, [cp_height])`
+    // `(start_height, count, [cp_height])` — same `cp_height`
+    // semantics as `block_header`. Reject nonzero values until
+    // checkpoint proofs are implemented (M3, review round 1).
     let arr = require_array_range(&params, 2, 3, "blockchain.block.headers")?;
     let start = parse_height(&arr[0])?;
     let count_req = parse_u32(&arr[1], "count")?;
+    let cp_height = arr.get(2).map(|v| parse_u32(v, "cp_height")).transpose()?;
+    if cp_height.unwrap_or(0) != 0 {
+        return Err(JsonRpcError::bad_request(
+            "checkpoint proof (nonzero cp_height) is not supported by this server",
+        ));
+    }
     let max = state.config.max_headers_per_request;
     let want = count_req.min(max);
 
@@ -102,25 +122,25 @@ pub fn block_headers(state: &ElectrumState, params: Value) -> Result<Value, Json
 
 pub fn scripthash_get_history(state: &ElectrumState, params: Value) -> Result<Value, JsonRpcError> {
     let sh = parse_scripthash(&params, "blockchain.scripthash.get_history")?;
-    let confirmed = state
+    let cap = state.config.max_history_entries;
+
+    // Round-3 review H1: ask the index for at most `cap + 1` DISTINCT
+    // (height, txid) entries — the only wire-relevant dimension.
+    // The address-index schema emits one row per matching output AND
+    // per matching input, so a fixed raw-row duplicate factor is
+    // unsound; a scripthash with many outputs per tx could see a raw
+    // scan truncate before reaching `cap + 1` distinct entries and
+    // silently return a partial history. The new helper streams
+    // funding+spending in lockstep and dedupes inline so it stops
+    // only at storage exhaustion or `cap + 1` distinct pairs.
+    let pairs = state
         .address_index
-        .confirmed_history(&sh.0)
+        .confirmed_distinct_history_limited(&sh.0, cap.saturating_add(1))
         .map_err(JsonRpcError::from_index)?;
 
-    if confirmed.len() > state.config.max_history_entries {
-        return Err(JsonRpcError::history_too_large(
-            state.config.max_history_entries,
-        ));
+    if pairs.len() > cap {
+        return Err(JsonRpcError::history_too_large(cap));
     }
-
-    // Dedup confirmed rows by `(height, txid)` — Electrum reports one
-    // history entry per distinct tx touching the scripthash, regardless
-    // of whether the tx funded + spent it in the same block. Order:
-    // ascending by `(height, txid)`.
-    let mut pairs: Vec<(u32, bitcoin::Txid)> =
-        confirmed.iter().map(|e| (e.height(), e.txid())).collect();
-    pairs.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-    pairs.dedup();
 
     let mut out: Vec<HistoryEntry> = pairs
         .into_iter()
@@ -133,19 +153,37 @@ pub fn scripthash_get_history(state: &ElectrumState, params: Value) -> Result<Va
 
     // Mempool entries come last, in protocol-canonical "txid order"
     // (which matches the ascending-txid order our mempool index
-    // produces today).
+    // produces today). Each carries a signed `height` per electrs's
+    // `Height::as_i64`: `-1` if it spends an unconfirmed parent, `0`
+    // otherwise. `fee` (sats) comes from the live mempool entry which
+    // already pre-computes it at admission.
+    //
+    // Round-2 review M1: enforce the cap as we push — a scripthash
+    // with `cap` confirmed entries plus any mempool entries previously
+    // pushed past the cap silently.
+    let mempool_pool = state.mempool.as_ref();
     let mempool = state.address_index.mempool_history(&sh.0);
     let mut mp_txids: Vec<bitcoin::Txid> = mempool.into_iter().map(|m| m.txid).collect();
     mp_txids.sort();
     for t in mp_txids {
-        // We don't compute the unconfirmed fee in v1; Electrum allows
-        // omitting `fee` on unconfirmed entries (the field is documented
-        // as optional). PR-2 ships without it; PR-4 may add it once the
-        // mempool delta path is wired through SpendIndex.
+        if out.len() >= cap {
+            return Err(JsonRpcError::history_too_large(cap));
+        }
+        let (height, fee) = match mempool_pool.get(&t) {
+            Some(entry) => {
+                let h = if mempool_tx_has_unconfirmed_inputs(&entry.tx, mempool_pool) {
+                    -1
+                } else {
+                    0
+                };
+                (h, Some(entry.fee))
+            }
+            None => (0, None), // raced with eviction; best-effort
+        };
         out.push(HistoryEntry {
-            height: 0,
+            height,
             tx_hash: TxidHex(t),
-            fee: None,
+            fee,
         });
     }
 
@@ -167,44 +205,111 @@ pub fn scripthash_get_balance(state: &ElectrumState, params: Value) -> Result<Va
 
 pub fn scripthash_listunspent(state: &ElectrumState, params: Value) -> Result<Value, JsonRpcError> {
     let sh = parse_scripthash(&params, "blockchain.scripthash.listunspent")?;
+    // Round-1 review M4: bound the index walk at cap + 1 UTXOs.
+    let cap = state.config.max_history_entries;
     let utxos = state
         .address_index
-        .utxos(&sh.0)
+        .utxos_limited(&sh.0, cap.saturating_add(1))
         .map_err(JsonRpcError::from_index)?;
 
     // Walk funding rows in `(height, txid, vout)` order — already the
-    // natural order of `utxos()` per the trait contract. Listunspent
-    // is bounded by max_history_entries since it can't exceed it
-    // (each UTXO descends from a funding row).
-    if utxos.len() > state.config.max_history_entries {
-        return Err(JsonRpcError::history_too_large(
-            state.config.max_history_entries,
-        ));
+    // natural order of `utxos_limited()` per the trait contract.
+    // Listunspent is bounded by max_history_entries since it can't
+    // exceed it (each UTXO descends from a funding row).
+    if utxos.len() > cap {
+        return Err(JsonRpcError::history_too_large(cap));
     }
 
-    let out: Vec<ListUnspentEntry> = utxos
+    // Mempool merge — mirrors `romanz/electrs`'s `Unspent::build`:
+    // start with confirmed UTXOs, drop any that are spent by a mempool
+    // tx, then add mempool tx outputs that fund this scripthash and
+    // aren't themselves yet spent in the mempool.
+    let mempool = state.mempool.as_ref();
+    let mut out: Vec<ListUnspentEntry> = utxos
         .into_iter()
+        .filter(|u| {
+            // Drop confirmed UTXOs whose outpoint is consumed by a
+            // mempool spend — wallets shouldn't see them as spendable.
+            mempool
+                .spending_tx(&OutPoint {
+                    txid: u.txid,
+                    vout: u.vout,
+                })
+                .is_none()
+        })
         .map(|u| ListUnspentEntry {
-            height: u.height,
+            height: u.height as i64,
             tx_hash: TxidHex(u.txid),
             tx_pos: u.vout,
             value: u.amount_sat,
         })
         .collect();
+
+    // Mempool funding additions. Round-2 review M2: cap-check on
+    // every push so a single unconfirmed tx with many outputs to
+    // `sh`, or a flood of mempool funding txs, can't push the
+    // response past `cap` entries.
+    for mp in state.address_index.mempool_history(&sh.0) {
+        let entry = match mempool.get(&mp.txid) {
+            Some(e) => e,
+            None => continue, // raced with eviction
+        };
+        let height: i64 = if mempool_tx_has_unconfirmed_inputs(&entry.tx, mempool) {
+            -1
+        } else {
+            0
+        };
+        for (vout, txout) in entry.tx.output.iter().enumerate() {
+            if scripthash_of(txout.script_pubkey.as_script()) != sh.0 {
+                continue;
+            }
+            let outpoint = OutPoint {
+                txid: mp.txid,
+                vout: vout as u32,
+            };
+            if mempool.spending_tx(&outpoint).is_some() {
+                continue; // already spent by a child mempool tx
+            }
+            if out.len() >= cap {
+                return Err(JsonRpcError::history_too_large(cap));
+            }
+            out.push(ListUnspentEntry {
+                height,
+                tx_hash: TxidHex(mp.txid),
+                tx_pos: vout as u32,
+                value: txout.value.to_sat(),
+            });
+        }
+    }
+
     Ok(serde_json::to_value(&out).unwrap())
 }
 
 pub fn scripthash_get_mempool(state: &ElectrumState, params: Value) -> Result<Value, JsonRpcError> {
     let sh = parse_scripthash(&params, "blockchain.scripthash.get_mempool")?;
+    let mempool_pool = state.mempool.as_ref();
     let mempool = state.address_index.mempool_history(&sh.0);
     let mut txids: Vec<bitcoin::Txid> = mempool.into_iter().map(|m| m.txid).collect();
     txids.sort();
     let out: Vec<HistoryEntry> = txids
         .into_iter()
-        .map(|t| HistoryEntry {
-            height: 0,
-            tx_hash: TxidHex(t),
-            fee: None,
+        .map(|t| {
+            let (height, fee) = match mempool_pool.get(&t) {
+                Some(entry) => {
+                    let h = if mempool_tx_has_unconfirmed_inputs(&entry.tx, mempool_pool) {
+                        -1
+                    } else {
+                        0
+                    };
+                    (h, Some(entry.fee))
+                }
+                None => (0, None),
+            };
+            HistoryEntry {
+                height,
+                tx_hash: TxidHex(t),
+                fee,
+            }
         })
         .collect();
     Ok(serde_json::to_value(&out).unwrap())
@@ -242,8 +347,8 @@ pub fn scripthash_get_first_use(
 
 pub fn scripthash_subscribe(state: &ElectrumState, params: Value) -> Result<Value, JsonRpcError> {
     let sh = parse_scripthash(&params, "blockchain.scripthash.subscribe")?;
-    let h =
-        compute_status_hash(state.address_index.as_ref(), sh).map_err(JsonRpcError::from_index)?;
+    let h = compute_status_hash(state.address_index.as_ref(), state.mempool.as_ref(), sh)
+        .map_err(JsonRpcError::from_index)?;
     Ok(match status_hash_to_json(h) {
         Some(s) => Value::String(s),
         None => Value::Null,
@@ -264,26 +369,193 @@ pub fn scripthash_unsubscribe(
 // ── blockchain.transaction.* ──────────────────────────────────────
 
 pub fn transaction_get(state: &ElectrumState, params: Value) -> Result<Value, JsonRpcError> {
-    // `(txid, [verbose])` — verbose=true returns full json; we
-    // return the hex-encoded raw tx in v1 (the bare-string variant).
-    // verbose=true is rejected because the json shape we'd produce
-    // would not match Bitcoin Core's `getrawtransaction verbose=1`
-    // wire shape exactly, and a half-shaped lie is worse than a
-    // protocol error the client can fall back from.
+    // `(txid, [verbose])` — `verbose=false` (default) returns the hex
+    // string. `verbose=true` returns the full JSON shape Bitcoin Core
+    // produces for `getrawtransaction <txid> 1`, which is what
+    // `romanz/electrs` proxies through to bitcoind.
     let arr = require_array_range(&params, 1, 2, "blockchain.transaction.get")?;
     let txid = parse_txid_hex(&arr[0])?;
     let verbose = arr.get(1).and_then(|v| v.as_bool()).unwrap_or(false);
+
+    // Resolve the tx — mempool first, then txindex fallback. Same
+    // priority order satd's own `getrawtransaction` uses.
+    let (tx, location): (Transaction, Option<TxLocation>) =
+        if let Some(entry) = state.mempool.get(&txid) {
+            (entry.tx, None)
+        } else if let Some(raw) = state.electrum_extras.raw_tx(&txid) {
+            let parsed: Transaction = deserialize(&raw)
+                .map_err(|e| JsonRpcError::internal(format!("stored tx decode failed: {e}")))?;
+            let confirmation = state.electrum_extras.confirmation(&txid);
+            let tip = state.chain.tip_height();
+            let location = confirmation.map(|c| TxLocation {
+                block_hash: c.block_hash,
+                height: c.height,
+                block_time: c.block_time,
+                confirmations: tip.saturating_sub(c.height).saturating_add(1),
+            });
+            (parsed, location)
+        } else {
+            return Err(JsonRpcError::bad_request(format!("tx not found: {txid}")));
+        };
+
     if verbose {
-        return Err(JsonRpcError::invalid_params(
-            "verbose mode is not supported by this server; use blockchain.transaction.get(txid)",
-        ));
+        Ok(verbose_transaction_json(&tx, location.as_ref(), state.network))
+    } else {
+        Ok(Value::String(hex::encode(serialize(&tx))))
     }
-    let raw = state
-        .electrum_extras
-        .raw_tx(&txid)
-        .or_else(|| state.mempool.get(&txid).map(|entry| serialize(&entry.tx)))
-        .ok_or_else(|| JsonRpcError::invalid_params(format!("tx not found: {txid}")))?;
-    Ok(Value::String(hex::encode(raw)))
+}
+
+/// Confirmation envelope used by [`verbose_transaction_json`].
+/// `height` is captured for symmetry with Core's verbose tx response
+/// even though we currently fold it into `confirmations`; keeping it
+/// here so future callers (RPC `getblockheader` cross-reference,
+/// reorg-aware shaping) don't have to plumb it again.
+#[allow(dead_code)]
+struct TxLocation {
+    block_hash: bitcoin::BlockHash,
+    height: u32,
+    block_time: u32,
+    confirmations: u32,
+}
+
+/// Build Bitcoin Core's `getrawtransaction <txid> 1` JSON shape.
+///
+/// Mirrors Core's verbose output exactly (txid, hash, version, size,
+/// vsize, weight, locktime, vin, vout, hex; plus blockhash,
+/// confirmations, time, blocktime when `location` is `Some`).
+///
+/// `network` is the active chain network (mainnet / testnet / signet
+/// / regtest). It controls the address prefix in
+/// `vout[].scriptPubKey.address` so verbose responses are
+/// network-correct on every chain. Hardcoding mainnet would emit
+/// `1...`/`bc1...` strings on regtest, which wallets reject.
+///
+/// Notes on wire fidelity:
+/// - `vout[].value` is BTC as a JSON number. Core emits 8-decimal
+///   strings (e.g. `0.00050000`); serde_json renders f64 without
+///   trailing zeros (`0.0005`). Both parse to the same numeric value;
+///   wallets that consume `value` numerically are unaffected.
+/// - `scriptSig.asm` / `scriptPubKey.asm` use rust-bitcoin's `Display`
+///   impl on `Script`, which matches Bitcoin Core's `ScriptToAsmStr`
+///   for all standard opcodes.
+/// - `coinbase` variant of `vin[]` omits txid/vout/scriptSig per Core.
+/// - `txinwitness` is omitted (not present in JSON) for non-segwit
+///   inputs, matching Core.
+fn verbose_transaction_json(
+    tx: &Transaction,
+    location: Option<&TxLocation>,
+    network: bitcoin::Network,
+) -> Value {
+    let raw = serialize(tx);
+    let txid = tx.compute_txid();
+    let wtxid = tx.compute_wtxid();
+    let weight = tx.weight().to_wu();
+    let vsize = weight.div_ceil(4);
+
+    let vin: Vec<Value> = tx
+        .input
+        .iter()
+        .enumerate()
+        .map(|(i, input)| {
+            if tx.is_coinbase() && i == 0 {
+                let mut v = json!({
+                    "coinbase": hex::encode(input.script_sig.as_bytes()),
+                    "sequence": input.sequence.0,
+                });
+                if !input.witness.is_empty() {
+                    let witness: Vec<String> = input.witness.iter().map(hex::encode).collect();
+                    v["txinwitness"] = json!(witness);
+                }
+                v
+            } else {
+                let mut v = json!({
+                    "txid": input.previous_output.txid.to_string(),
+                    "vout": input.previous_output.vout,
+                    "scriptSig": {
+                        "asm": format!("{}", input.script_sig),
+                        "hex": hex::encode(input.script_sig.as_bytes()),
+                    },
+                    "sequence": input.sequence.0,
+                });
+                if !input.witness.is_empty() {
+                    let witness: Vec<String> = input.witness.iter().map(hex::encode).collect();
+                    v["txinwitness"] = json!(witness);
+                }
+                v
+            }
+        })
+        .collect();
+
+    let vout: Vec<Value> = tx
+        .output
+        .iter()
+        .enumerate()
+        .map(|(n, output)| {
+            let mut spk = json!({
+                "asm": format!("{}", output.script_pubkey),
+                "hex": hex::encode(output.script_pubkey.as_bytes()),
+                "type": script_type_label(&output.script_pubkey),
+            });
+            // Core only emits `address` for outputs that resolve to a
+            // single canonical address (P2PKH, P2SH, P2WPKH, P2WSH,
+            // P2TR). `Address::from_script` returns Err for
+            // multisig / OP_RETURN / nonstandard so we omit gracefully.
+            if let Ok(addr) = bitcoin::Address::from_script(&output.script_pubkey, network) {
+                spk["address"] = Value::String(addr.to_string());
+            }
+            json!({
+                "value": output.value.to_sat() as f64 / 100_000_000.0,
+                "n": n,
+                "scriptPubKey": spk,
+            })
+        })
+        .collect();
+
+    let mut result = json!({
+        "txid": txid.to_string(),
+        "hash": wtxid.to_string(),
+        "version": tx.version.0,
+        "size": raw.len(),
+        "vsize": vsize,
+        "weight": weight,
+        "locktime": tx.lock_time.to_consensus_u32(),
+        "vin": vin,
+        "vout": vout,
+        "hex": hex::encode(&raw),
+    });
+
+    if let Some(loc) = location {
+        result["blockhash"] = Value::String(loc.block_hash.to_string());
+        result["confirmations"] = json!(loc.confirmations);
+        result["time"] = json!(loc.block_time);
+        result["blocktime"] = json!(loc.block_time);
+    }
+
+    result
+}
+
+/// Classify a script for Bitcoin Core's `scriptPubKey.type` field.
+/// Returns the same labels Core's `GetTxOutputType` produces.
+fn script_type_label(script: &bitcoin::Script) -> &'static str {
+    if script.is_p2pk() {
+        "pubkey"
+    } else if script.is_p2pkh() {
+        "pubkeyhash"
+    } else if script.is_p2sh() {
+        "scripthash"
+    } else if script.is_p2wpkh() {
+        "witness_v0_keyhash"
+    } else if script.is_p2wsh() {
+        "witness_v0_scripthash"
+    } else if script.is_p2tr() {
+        "witness_v1_taproot"
+    } else if script.is_op_return() {
+        "nulldata"
+    } else if script.is_multisig() {
+        "multisig"
+    } else {
+        "nonstandard"
+    }
 }
 
 pub fn transaction_get_merkle(state: &ElectrumState, params: Value) -> Result<Value, JsonRpcError> {
@@ -292,7 +564,7 @@ pub fn transaction_get_merkle(state: &ElectrumState, params: Value) -> Result<Va
     let arr = require_array_range(&params, 1, 2, "blockchain.transaction.get_merkle")?;
     let txid = parse_txid_hex(&arr[0])?;
     let proof = state.electrum_extras.tx_merkle(&txid).ok_or_else(|| {
-        JsonRpcError::invalid_params(format!("tx {txid} is not confirmed or not indexed"))
+        JsonRpcError::bad_request(format!("tx {txid} is not confirmed or not indexed"))
     })?;
     let resp = GetMerkleResponse {
         merkle: proof
@@ -325,8 +597,77 @@ pub fn transaction_broadcast(state: &ElectrumState, params: Value) -> Result<Val
     let txid = state
         .mempool
         .accept_transaction(tx, &state.chain, state.chain.script_verifier())
-        .map_err(|e| JsonRpcError::new(1, format!("mempool reject: {e}")))?;
+        .map_err(|e| JsonRpcError::bad_request(format!("mempool reject: {e}")))?;
     Ok(Value::String(txid.to_string()))
+}
+
+/// `blockchain.transaction.broadcast_package(txs[, verbose])` — accept
+/// an array of hex-encoded transactions and submit each to the local
+/// mempool. The return shape mirrors `romanz/electrs`'s non-verbose
+/// path: `{"success": <bool>}` when every tx accepted, plus an
+/// `"errors": [{"txid": ..., "error": ...}, ...]` array for any
+/// rejections. `success` is true only when no rejections occurred.
+///
+/// `verbose=true` is accepted but treated as identical to `false` —
+/// electrs forwards bitcoind's full `submitpackage` JSON in verbose
+/// mode; satd doesn't have a package-level submission API yet (the
+/// Mempool admits per-tx). Documenting this divergence as a known
+/// v1 limitation; clients that pass `verbose=true` get the same
+/// summary shape and can cross-check against per-tx broadcast.
+pub fn transaction_broadcast_package(
+    state: &ElectrumState,
+    params: Value,
+) -> Result<Value, JsonRpcError> {
+    let arr = require_array_range(&params, 1, 2, "blockchain.transaction.broadcast_package")?;
+    let txs_array = arr[0].as_array().ok_or_else(|| {
+        JsonRpcError::invalid_params("first arg must be an array of tx hex strings")
+    })?;
+    let _verbose = arr.get(1).and_then(|v| v.as_bool()).unwrap_or(false);
+
+    let max_pkg = state.config.max_broadcast_package_txs;
+    if txs_array.len() > max_pkg {
+        return Err(JsonRpcError::bad_request(format!(
+            "broadcast package too large: {} txs (cap = {max_pkg})",
+            txs_array.len()
+        )));
+    }
+
+    // Decode every tx up front so a single bad hex doesn't leave us
+    // with a half-broadcast package. Decode failures are JSON-RPC
+    // -32602 (invalid params) — same as `transaction_broadcast`.
+    let mut decoded = Vec::with_capacity(txs_array.len());
+    for v in txs_array {
+        let s = v
+            .as_str()
+            .ok_or_else(|| JsonRpcError::invalid_params("tx must be a hex string"))?;
+        let bytes = hex::decode(s.trim())
+            .map_err(|e| JsonRpcError::invalid_params(format!("bad hex: {e}")))?;
+        let tx: Transaction = deserialize(&bytes)
+            .map_err(|e| JsonRpcError::invalid_params(format!("decode: {e}")))?;
+        decoded.push(tx);
+    }
+
+    let mut errors: Vec<Value> = Vec::new();
+    for tx in &decoded {
+        let txid = tx.compute_txid();
+        if let Err(e) = state.mempool.accept_transaction(
+            tx.clone(),
+            &state.chain,
+            state.chain.script_verifier(),
+        ) {
+            errors.push(json!({
+                "txid": txid.to_string(),
+                "error": e.to_string(),
+            }));
+        }
+    }
+
+    let success = errors.is_empty();
+    Ok(if errors.is_empty() {
+        json!({ "success": success })
+    } else {
+        json!({ "success": success, "errors": errors })
+    })
 }
 
 pub fn transaction_id_from_pos(
@@ -342,7 +683,7 @@ pub fn transaction_id_from_pos(
         .electrum_extras
         .txid_at_pos(height, tx_pos)
         .ok_or_else(|| {
-            JsonRpcError::invalid_params(format!("no tx at height={height} pos={tx_pos}"))
+            JsonRpcError::bad_request(format!("no tx at height={height} pos={tx_pos}"))
         })?;
     if !merkle {
         return Ok(Value::String(txid.to_string()));
@@ -371,18 +712,31 @@ pub fn estimatefee(state: &ElectrumState, params: Value) -> Result<Value, JsonRp
     let arr = require_array(&params, 1, "blockchain.estimatefee")?;
     let target = parse_u32(&arr[0], "num_blocks")?;
     let est = state.fee_estimator.estimate_fee(target);
-    // Electrum returns BTC/kB or -1 if unknown. `estimate_fee` is
-    // sat/kvB.
+    // M1 (review round 1): satd's internal fee_rate unit is
+    // **sat per 1000 weight units** (`fee * 1000 / weight`), NOT
+    // sat/kvB. The Electrum wire returns BTC per kB. Conversion:
+    //   1 vB = 4 WU, so 1000 vB = 4000 WU = 4 × 1000 WU
+    //   sat/(1000 WU) × 4 = sat/(1000 vB) = sat/kvB
+    //   BTC/kB = sat/kvB / 1e8 = (sat/(1000 WU) × 4) / 1e8
+    // Prior code skipped the ×4, underreporting fees by ~4x.
     Ok(match est {
-        Some(sats_per_kvb) => json!((sats_per_kvb as f64) / 1.0e8),
+        Some(sat_per_1000_wu) => json!(sat_per_1000_wu_to_btc_per_kb(sat_per_1000_wu)),
         None => json!(-1.0),
     })
 }
 
 pub fn relayfee(state: &ElectrumState) -> Result<Value, JsonRpcError> {
-    // Same conversion: sat/kvB → BTC/kB.
-    let sats_per_kvb = state.mempool.policy().min_fee_rate;
-    Ok(json!((sats_per_kvb as f64) / 1.0e8))
+    // Same conversion as `estimatefee` — sat/(1000 WU) → BTC/kB.
+    // `min_fee_rate` is the mempool's admission policy in sat per
+    // 1000 weight units, mirroring `Mempool::accept_transaction`.
+    let sat_per_1000_wu = state.mempool.policy().min_fee_rate;
+    Ok(json!(sat_per_1000_wu_to_btc_per_kb(sat_per_1000_wu)))
+}
+
+/// Convert satd's internal `sat per 1000 weight units` fee rate to
+/// the BTC/kB unit Electrum clients expect on the wire. See M1 above.
+pub(crate) fn sat_per_1000_wu_to_btc_per_kb(sat_per_1000_wu: u64) -> f64 {
+    (sat_per_1000_wu * 4) as f64 / 100_000_000.0
 }
 
 // ── helpers ───────────────────────────────────────────────────────
@@ -392,16 +746,10 @@ fn parse_scripthash(params: &Value, method: &str) -> Result<ScripthashHex, JsonR
     let s = arr[0].as_str().ok_or_else(|| {
         JsonRpcError::invalid_params(format!("{method}: scripthash must be a string"))
     })?;
-    let bytes =
-        hex::decode(s).map_err(|e| JsonRpcError::invalid_params(format!("bad scripthash: {e}")))?;
-    if bytes.len() != 32 {
-        return Err(JsonRpcError::invalid_params(
-            "scripthash must be 64 hex chars (32 bytes)",
-        ));
-    }
-    let mut arr = [0u8; 32];
-    arr.copy_from_slice(&bytes);
-    Ok(ScripthashHex(arr))
+    // Wire scripthash is display-order (reversed) hex per Electrum
+    // spec; `parse_wire_scripthash` returns natural sha256 byte order
+    // for index lookup.
+    parse_wire_scripthash(s).map(ScripthashHex)
 }
 
 fn parse_txid_hex(v: &Value) -> Result<bitcoin::Txid, JsonRpcError> {
@@ -422,6 +770,20 @@ fn parse_u32(v: &Value, name: &str) -> Result<u32, JsonRpcError> {
         .ok_or_else(|| {
             JsonRpcError::invalid_params(format!("{name} must be a non-negative integer (≤ u32)"))
         })
+}
+
+/// Returns `true` if `tx` spends at least one output that belongs to
+/// another tx currently in the mempool. Per the Electrum spec
+/// (`romanz/electrs::Height`), this distinguishes the wire `height`
+/// for an unconfirmed entry: `0` for unconfirmed-no-deps, `-1` for
+/// unconfirmed-with-unconfirmed-parents.
+pub(crate) fn mempool_tx_has_unconfirmed_inputs(
+    tx: &Transaction,
+    mempool: &node::mempool::pool::Mempool,
+) -> bool {
+    tx.input
+        .iter()
+        .any(|inp| mempool.get(&inp.previous_output.txid).is_some())
 }
 
 // ── fee_histogram bucketer (used by mempool::get_fee_histogram) ───
@@ -488,5 +850,23 @@ mod tests {
     fn fee_histogram_empty_input_yields_empty_output() {
         let buckets = fee_histogram_buckets(&[]);
         assert!(buckets.is_empty());
+    }
+
+    #[test]
+    fn fee_unit_conversion_matches_known_fixture() {
+        // M1 (review round 1): a 1 sat/vB transaction has internal
+        // `fee * 1000 / weight = 250` (since vB = WU/4). The Electrum
+        // wire expects 0.00001000 BTC/kB = 1 sat/vB × 1000 / 1e8.
+        // Pre-fix, satd returned 0.00000250 — 4x too low.
+        let one_sat_per_vb = 250u64;
+        let btc_per_kb = sat_per_1000_wu_to_btc_per_kb(one_sat_per_vb);
+        // Allow tiny float epsilon.
+        assert!((btc_per_kb - 0.00001000).abs() < 1e-12, "{btc_per_kb}");
+
+        // 10 sat/vB → internal 2500 → 0.0001 BTC/kB.
+        assert!((sat_per_1000_wu_to_btc_per_kb(2500) - 0.0001).abs() < 1e-12);
+
+        // 0 / unknown stays 0.
+        assert_eq!(sat_per_1000_wu_to_btc_per_kb(0), 0.0);
     }
 }

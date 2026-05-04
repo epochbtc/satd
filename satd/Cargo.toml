@@ -5,7 +5,9 @@ edition.workspace = true
 
 [dependencies]
 node = { path = "../node" }
+node-index = { path = "../node-index" }
 esplora-handlers = { path = "../esplora-handlers" }
+electrum-proto = { path = "../electrum-proto" }
 satd-events = { path = "../events", features = ["grpc", "zmq"] }
 satd-mcp = { path = "../mcp" }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }

@@ -425,7 +425,98 @@ over P2P for light clients. Pairs naturally with the address index work.
 > (electrs, Fulcrum, ElectrumX). Not to be confused with the Electrum wallet
 > itself.*
 
-This is the single highest-leverage Tier-3 item and deserves dedicated
+**Status (2026-05): Phase A and Phase B have landed.** satd's
+`--addressindex=1` (default on; see `ADDRESS_INDEX.md`) provides Phase A;
+the native Electrum protocol server in the `electrum-proto` crate
+provides Phase B. Operators enable it via `--electrum=1`, optional TLS
+via `--electrumtlsbind` + `--electrumtlscert`/`--electrumtlskey`.
+
+### Operator quick-start
+
+```sh
+# Plain TCP, loopback only (recommended; expose via Tor)
+satd --electrum=1 --electrumbind=127.0.0.1:50001
+
+# Plain TCP + TLS
+satd --electrum=1 \
+     --electrumbind=127.0.0.1:50001 \
+     --electrumtlsbind=127.0.0.1:50002 \
+     --electrumtlscert=/etc/satd/electrum.crt \
+     --electrumtlskey=/etc/satd/electrum.key
+```
+
+`--electrum=1` requires `--addressindex=1` (auto-enforced) and a
+complete `--txindex` (auto-enabled when not explicitly disabled).
+A datadir previously synced with `--txindex=0` requires
+`--reindex-chainstate` before Electrum can serve confirmed-tx and
+merkle-proof endpoints.
+
+Defaults:
+- `--electrumbind` = `127.0.0.1:50001` (loopback). Expose via a
+  Tor hidden service rather than directly on the LAN/internet —
+  same deployment story as `bitcoind` for self-custody distros.
+- `--electrummaxconns` = 64 (total simultaneous connections).
+- `--electrummaxsubsperconn` = 100 (per-connection scripthash
+  subscription cap).
+- `--electrumrequesttimeout` = 30 seconds. Wraps the dispatch path
+  (read → handler → write) and the TLS handshake; a slow client
+  can't pin a connection slot past this deadline.
+- `--electrummaxbatchrequests` = 16 (max requests per JSON-RPC
+  batch line; mirrors `romanz/electrs`).
+- `--electrummaxbroadcastpackagetxs` = 25 (max txs per
+  `blockchain.transaction.broadcast_package`; mirrors Bitcoin
+  Core's `MAX_PACKAGE_COUNT`).
+- `--electrumfeehistogramttl` = 10 seconds. TTL for the
+  `mempool.get_fee_histogram` cache. The first call after expiry
+  rebuilds from the live mempool snapshot; subsequent calls within
+  the window return the cached JSON. Lower for fresher data at
+  higher CPU cost.
+
+Bitcoin-conf aliases mirror the CLI flags: `electrum`,
+`electrumbind`, `electrumtlsbind`, `electrumtlscert`,
+`electrumtlskey`, `electrummaxconns`, `electrummaxsubsperconn`,
+`electrumrequesttimeout`, `electrummaxbatchrequests`,
+`electrummaxbroadcastpackagetxs`, `electrumfeehistogramttl`,
+`electrumbanner`.
+
+### What's implemented
+
+The v1 method set (per `ECOSYSTEM.md` §4a):
+
+- `server.{version, banner, ping, donation_address, features, peers.subscribe}`
+  — `peers.subscribe` returns `[]` (we are not part of the Electrum
+  server peer mesh).
+- `blockchain.headers.{subscribe, get}`, `blockchain.block.{header, headers}`.
+- `blockchain.scripthash.{get_history, get_balance, listunspent,
+  get_mempool, get_first_use, subscribe, unsubscribe}`.
+- `blockchain.transaction.{get, get_merkle, broadcast,
+  broadcast_package, id_from_pos}`.
+  `transaction.get` returns the raw hex by default; `verbose=true`
+  returns Bitcoin Core's `getrawtransaction <txid> 1` JSON shape
+  (txid/hash/version/size/vsize/weight/locktime, vin with coinbase
+  variant + scriptSig + txinwitness, vout with value/n/scriptPubKey,
+  hex, and blockhash/confirmations/time/blocktime when confirmed).
+- `blockchain.estimatefee`, `blockchain.relayfee` (BTC/kB on the
+  wire, converted from satd's internal sat-per-1000-WU unit).
+- `mempool.get_fee_histogram` (50,000-vbyte buckets, descending sat/vbyte).
+- JSON-RPC batch requests (`[req, req, ...]`) are accepted up to
+  `--electrummaxbatchrequests`. Notifications inside a batch have
+  their responses suppressed per JSON-RPC §6.
+
+`blockchain.block.header` and `blockchain.block.headers` accept the
+`cp_height` argument for protocol compatibility but reject any
+nonzero value with a `bad_request` error — checkpoint proofs are
+not yet implemented, and silently returning the proof-less response
+would be a wallet-compat hazard.
+
+Server-pushed notifications (`blockchain.scripthash.subscribe` and
+`blockchain.headers.subscribe`) are delivered on the same connection
+as the response, with the per-connection mpsc fan-in providing
+backpressure when a client is slow.
+
+### Original analysis (kept for reference)
+
+This was the single highest-leverage Tier-3 item and deserves dedicated
 analysis. Short answer: **yes, and I think it's a major differentiator** —
 but it should be opt-in and carefully scoped.
 

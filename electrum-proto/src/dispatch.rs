@@ -5,17 +5,32 @@
 //! a [`Response`] by routing on `method` and invoking the appropriate
 //! handler from [`crate::handlers`].
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::JsonRpcError;
+use crate::extras::ElectrumExtras;
 use crate::handlers;
 use crate::state::ElectrumState;
+use crate::status::compute_status_hash;
+use crate::subscribe::{HeadersSource, Subscriptions};
+use crate::types::{ScripthashHex, parse_wire_scripthash};
 
 /// Inbound JSON-RPC 2.0 request.
+///
+/// `jsonrpc` is `Option<String>` (not required) because real-world
+/// Electrum clients — Sparrow, BlueWallet, the Electrum desktop
+/// reference client — routinely omit the field. JSON-RPC 2.0 §4
+/// nominally requires `"jsonrpc":"2.0"`, but in the Electrum wire
+/// dialect the field is optional and `romanz/electrs` accepts
+/// requests without it. Rejecting them would block standard wallet
+/// traffic, which is the whole point of the server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Request {
-    pub jsonrpc: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jsonrpc: Option<String>,
     /// Notifications (no `id`) are valid JSON-RPC; for Electrum we don't
     /// receive any in normal flow but accept them gracefully (the
     /// response is suppressed).
@@ -26,12 +41,54 @@ pub struct Request {
     pub params: Option<Value>,
 }
 
+/// One inbound line — either a single JSON-RPC request or a JSON
+/// array of them. Mirrors `romanz/electrs::Requests::{Single, Batch}`.
+#[derive(Debug, Clone)]
+pub enum Requests {
+    Single(Request),
+    Batch(Vec<Request>),
+}
+
 impl Request {
     /// Parse a single JSON-RPC request from a UTF-8 string. Wraps the
     /// underlying serde error as a JSON-RPC parse error so the
     /// transport can shape a consistent error response.
     pub fn parse(s: &str) -> Result<Self, JsonRpcError> {
         serde_json::from_str(s).map_err(|e| JsonRpcError::parse_error(format!("bad json: {e}")))
+    }
+}
+
+impl Requests {
+    /// Parse either a single request `{...}` or a batch `[{...}, ...]`
+    /// from one wire line. JSON-RPC 2.0 §6 (Batch).
+    pub fn parse(s: &str) -> Result<Self, JsonRpcError> {
+        let v: Value = serde_json::from_str(s)
+            .map_err(|e| JsonRpcError::parse_error(format!("bad json: {e}")))?;
+        match v {
+            Value::Array(arr) => {
+                if arr.is_empty() {
+                    // Per JSON-RPC §6, an empty batch is itself an
+                    // invalid request; electrs rejects with -32600.
+                    return Err(JsonRpcError::invalid_request("empty batch"));
+                }
+                let mut reqs = Vec::with_capacity(arr.len());
+                for item in arr {
+                    let req: Request = serde_json::from_value(item).map_err(|e| {
+                        JsonRpcError::invalid_request(format!("batch item shape: {e}"))
+                    })?;
+                    reqs.push(req);
+                }
+                Ok(Requests::Batch(reqs))
+            }
+            Value::Object(_) => {
+                let req: Request = serde_json::from_value(v)
+                    .map_err(|e| JsonRpcError::invalid_request(format!("request shape: {e}")))?;
+                Ok(Requests::Single(req))
+            }
+            _ => Err(JsonRpcError::invalid_request(
+                "request must be an object or batch array",
+            )),
+        }
     }
 }
 
@@ -156,6 +213,9 @@ pub fn dispatch(state: &ElectrumState, req: Request) -> Response {
         "blockchain.transaction.broadcast" => {
             handlers::blockchain::transaction_broadcast(state, params)
         }
+        "blockchain.transaction.broadcast_package" => {
+            handlers::blockchain::transaction_broadcast_package(state, params)
+        }
         "blockchain.transaction.id_from_pos" => {
             handlers::blockchain::transaction_id_from_pos(state, params)
         }
@@ -174,6 +234,104 @@ pub fn dispatch(state: &ElectrumState, req: Request) -> Response {
         Ok(result) => Response::success(id, result),
         Err(err) => Response::error(id, err),
     }
+}
+
+/// Subscription-aware dispatch. Handles
+/// `blockchain.scripthash.subscribe` / `unsubscribe` and
+/// `blockchain.headers.subscribe` by registering / cancelling against
+/// the per-connection [`Subscriptions`] AND computing the synchronous
+/// initial response. All other methods fall through to
+/// [`dispatch`].
+///
+/// `headers_source` is the `ChainState` (or test fake) the headers
+/// subscription will read `ChainEvent`s from. It's plumbed in as a
+/// trait object so the connection layer can swap the concrete source
+/// without coupling this module to `ChainState`.
+pub fn dispatch_with_subscriptions(
+    state: &ElectrumState,
+    subs: &mut Subscriptions,
+    headers_source: &dyn HeadersSource,
+    extras: Arc<dyn ElectrumExtras>,
+    req: Request,
+) -> Response {
+    let id = req.id.clone().unwrap_or(Value::Null);
+    let outcome: Result<Value, JsonRpcError> = match req.method.as_str() {
+        "blockchain.scripthash.subscribe" => handle_scripthash_subscribe(state, subs, &req),
+        "blockchain.scripthash.unsubscribe" => handle_scripthash_unsubscribe(subs, &req),
+        "blockchain.headers.subscribe" => {
+            handle_headers_subscribe(state, subs, headers_source, extras, &req)
+        }
+        _ => return dispatch(state, req),
+    };
+    match outcome {
+        Ok(result) => Response::success(id, result),
+        Err(err) => Response::error(id, err),
+    }
+}
+
+fn handle_scripthash_subscribe(
+    state: &ElectrumState,
+    subs: &mut Subscriptions,
+    req: &Request,
+) -> Result<Value, JsonRpcError> {
+    let params = req.params.clone().unwrap_or(Value::Array(Vec::new()));
+    let arr = require_array_range(&params, 1, 1, "blockchain.scripthash.subscribe")?;
+    let s = arr[0]
+        .as_str()
+        .ok_or_else(|| JsonRpcError::invalid_params("scripthash must be a string"))?;
+    // Wire is display-order; convert to natural sha256 order for the
+    // index. parse_wire_scripthash also enforces the 64-hex-char shape.
+    let sh = parse_wire_scripthash(s)?;
+
+    // Register first so the connection captures any update that happens
+    // between this point and the synchronous status read below. The
+    // initial status read MAY be slightly stale relative to the next
+    // notification — that's fine: clients dedup on status hash, and an
+    // extra notification with an unchanged hash is suppressed by
+    // `SubscriptionRegistry::maybe_notify`.
+    subs.add_scripthash(sh, state.address_index.as_ref())?;
+
+    let h = compute_status_hash(
+        state.address_index.as_ref(),
+        state.mempool.as_ref(),
+        ScripthashHex(sh),
+    )
+    .map_err(JsonRpcError::from_index)?;
+    Ok(match crate::status::status_hash_to_json(h) {
+        Some(s) => Value::String(s),
+        None => Value::Null,
+    })
+}
+
+fn handle_scripthash_unsubscribe(
+    subs: &mut Subscriptions,
+    req: &Request,
+) -> Result<Value, JsonRpcError> {
+    let params = req.params.clone().unwrap_or(Value::Array(Vec::new()));
+    let arr = require_array_range(&params, 1, 1, "blockchain.scripthash.unsubscribe")?;
+    let s = arr[0]
+        .as_str()
+        .ok_or_else(|| JsonRpcError::invalid_params("scripthash must be a string"))?;
+    let sh = parse_wire_scripthash(s)?;
+    let _ = subs.remove_scripthash(&sh);
+    // Per Electrum spec, return true regardless of whether a
+    // subscription existed.
+    Ok(Value::Bool(true))
+}
+
+fn handle_headers_subscribe(
+    state: &ElectrumState,
+    subs: &mut Subscriptions,
+    headers_source: &dyn HeadersSource,
+    extras: Arc<dyn ElectrumExtras>,
+    _req: &Request,
+) -> Result<Value, JsonRpcError> {
+    subs.add_headers(headers_source, extras.clone())?;
+    let (height, header) = state.electrum_extras.tip();
+    Ok(serde_json::json!({
+        "height": height,
+        "hex": hex::encode(bitcoin::consensus::encode::serialize(&header)),
+    }))
 }
 
 // ── Param parsing helpers ──────────────────────────────────────────
@@ -225,6 +383,36 @@ mod tests {
         let req = Request::parse(s).unwrap();
         assert_eq!(req.method, "server.ping");
         assert_eq!(req.id, Some(Value::from(1)));
+        assert_eq!(req.jsonrpc.as_deref(), Some("2.0"));
+    }
+
+    #[test]
+    fn parse_request_without_jsonrpc_field() {
+        // H1 (review round 1): real-world Electrum clients (Sparrow,
+        // Electrum desktop) routinely omit `jsonrpc`. Server MUST
+        // accept the request; rejecting it would block standard
+        // wallet traffic.
+        let s = r#"{"id":1,"method":"server.version","params":["Electrum","1.4"]}"#;
+        let req = Request::parse(s).unwrap();
+        assert_eq!(req.method, "server.version");
+        assert_eq!(req.id, Some(Value::from(1)));
+        assert!(req.jsonrpc.is_none());
+    }
+
+    #[test]
+    fn parse_batch_with_mixed_jsonrpc_fields() {
+        // Batch with one item having jsonrpc and one without — both
+        // must parse and dispatch.
+        let s = r#"[{"id":1,"method":"server.ping"},{"jsonrpc":"2.0","id":2,"method":"server.ping"}]"#;
+        let parsed = Requests::parse(s).unwrap();
+        match parsed {
+            Requests::Batch(reqs) => {
+                assert_eq!(reqs.len(), 2);
+                assert!(reqs[0].jsonrpc.is_none());
+                assert_eq!(reqs[1].jsonrpc.as_deref(), Some("2.0"));
+            }
+            Requests::Single(_) => panic!("expected Batch"),
+        }
     }
 
     #[test]

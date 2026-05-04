@@ -62,6 +62,12 @@ const OUTPOINT_SPEND_COMPLETE_KEY: &[u8] = b"outpoint_spend.complete";
 /// has historical block-index entries but the tx_index CF is empty
 /// (the operator previously ran with `txindex=0`). (Round-3 H1.)
 const TX_INDEX_COMPLETE_KEY: &[u8] = b"tx_index.complete";
+/// Persisted "address-history index is complete for the active chain"
+/// marker. Mirrors `TX_INDEX_COMPLETE_KEY` — set true after a clean
+/// backfill (or on fresh datadirs that started with addressindex=1
+/// from genesis); cleared atomically when a block connects while
+/// addressindex is disabled. Round-1 review H2.
+const ADDRESS_INDEX_COMPLETE_KEY: &[u8] = b"address_index.complete";
 const CURRENT_SCHEMA_VERSION: u32 = 2; // v2 = compact varint coins
 
 fn hash_bytes(hash: &BlockHash) -> &[u8] {
@@ -99,6 +105,12 @@ type DB = DBWithThreadMode<MultiThreaded>;
 pub struct RocksDbStore {
     db: DB,
     txindex_enabled: bool,
+    /// Whether per-block address-index emission is active. When
+    /// `false` and a block connects, the persisted
+    /// `address_index.complete` marker is cleared atomically so a
+    /// future Electrum / Esplora address-surface bind refuses until
+    /// the operator runs a backfill / reindex (Round-1 review H2).
+    addressindex_enabled: bool,
     /// Shared LRU across all column families. Cloneable Arc; the FFI layer
     /// is thread-safe for `set_capacity`, so a clone plus an interior mutex
     /// is enough to allow live resize from a separate task.
@@ -269,6 +281,11 @@ impl RocksDbStore {
         let store = Self {
             db,
             txindex_enabled: txindex,
+            // Default true; main.rs flips this to `config.addressindex`
+            // via `with_addressindex_enabled` before wrapping the store
+            // in CoinCache. Tests / lower-level callers that don't
+            // exercise the address-index path keep the default.
+            addressindex_enabled: true,
             block_cache: std::sync::Mutex::new(block_cache),
             block_cache_capacity: std::sync::atomic::AtomicUsize::new(cache_bytes),
         };
@@ -358,7 +375,53 @@ impl RocksDbStore {
                  --reindex-chainstate."
             );
         }
+
+        // address_index.complete marker — round-1 review H2.
+        //
+        // Mirrors the tx_index path. Three reachable open-time states:
+        //
+        //   - Fresh datadir (no `block_index` rows yet) → stamp true.
+        //     No history to be missing.
+        //   - Legacy datadir without the marker (block_index has rows
+        //     but the flag was never written) → stamp false. Electrum
+        //     / Esplora address-surface bind refuses until backfill
+        //     completes.
+        //   - Marker already present → don't touch it. Backfill
+        //     `mark_completed` re-stamps true; `connect_block` paths
+        //     stamp false in `write_batch_mode` when addressindex is
+        //     disabled (set after `with_addressindex_enabled`).
+        if store.read_address_index_complete().is_none() {
+            let block_index_has_rows = store
+                .db
+                .cf_handle(CF_BLOCK_INDEX)
+                .and_then(|cf| {
+                    store
+                        .db
+                        .iterator_cf(&cf, IteratorMode::Start)
+                        .next()
+                        .map(|item| item.is_ok())
+                })
+                .unwrap_or(false);
+            store.write_address_index_complete(!block_index_has_rows)?;
+        }
         Ok(store)
+    }
+
+    /// Set whether per-block address-index emission is active. Call
+    /// before any `write_batch_mode` runs so the persisted
+    /// `address_index.complete` marker stays consistent with the
+    /// configured behaviour. Default is `true`.
+    pub fn with_addressindex_enabled(mut self, enabled: bool) -> Self {
+        self.addressindex_enabled = enabled;
+        if !enabled {
+            tracing::info!(
+                target: "storage",
+                "address index emission disabled; future block connects will clear \
+                 the address_index.complete marker — Electrum / Esplora address \
+                 surfaces will refuse to bind until a backfill completes."
+            );
+        }
+        self
     }
 
     /// Read the `outpoint_spend.complete` marker from the metadata CF.
@@ -397,6 +460,24 @@ impl RocksDbStore {
             .ok_or_else(|| StoreError::Database("metadata CF missing".into()))?;
         self.db
             .put_cf(&cf, TX_INDEX_COMPLETE_KEY, [u8::from(value)])
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    fn read_address_index_complete(&self) -> Option<bool> {
+        let cf = self.db.cf_handle(CF_METADATA)?;
+        match self.db.get_cf(&cf, ADDRESS_INDEX_COMPLETE_KEY) {
+            Ok(Some(v)) => v.first().map(|b| *b != 0),
+            _ => None,
+        }
+    }
+
+    fn write_address_index_complete(&self, value: bool) -> Result<(), StoreError> {
+        let cf = self
+            .db
+            .cf_handle(CF_METADATA)
+            .ok_or_else(|| StoreError::Database("metadata CF missing".into()))?;
+        self.db
+            .put_cf(&cf, ADDRESS_INDEX_COMPLETE_KEY, [u8::from(value)])
             .map_err(|e| StoreError::Database(e.to_string()))
     }
 
@@ -571,6 +652,17 @@ impl Store for RocksDbStore {
             && (!batch.coin_puts.is_empty() || !batch.coin_removes.is_empty())
         {
             wb.put_cf(&cf_meta, TX_INDEX_COMPLETE_KEY, [0u8]);
+        }
+
+        // Same invalidation contract for the address-index marker
+        // (round-1 review H2). When `addressindex` is disabled and a
+        // block connects/disconnects, the address-history CFs diverge
+        // from the chain — atomic-with-the-batch clearing makes the
+        // diagnostic survive any crash window.
+        if !self.addressindex_enabled
+            && (!batch.coin_puts.is_empty() || !batch.coin_removes.is_empty())
+        {
+            wb.put_cf(&cf_meta, ADDRESS_INDEX_COMPLETE_KEY, [0u8]);
         }
 
         // Block index
@@ -882,12 +974,16 @@ impl Store for RocksDbStore {
         self.drop_backfill_temp_cf()?;
         // Re-stamp schema version after metadata CF was recreated
         Self::stamp_schema(&self.db, CURRENT_SCHEMA_VERSION)?;
-        // Re-stamp outpoint_spend.complete + tx_index.complete:
-        // -reindex-chainstate produces a from-empty re-population
-        // which connect_block will fill atomically across all three
-        // index CFs (round-3 H1).
+        // Re-stamp outpoint_spend.complete + tx_index.complete +
+        // address_index.complete: -reindex-chainstate produces a
+        // from-empty re-population which connect_block will fill
+        // atomically across all index CFs (round-3 H1, round-2-review
+        // H2). Without the address re-stamp the operator's documented
+        // remediation (`--reindex-chainstate`) would silently leave
+        // Electrum / Esplora address surfaces refusing to bind.
         self.write_outpoint_spend_complete(true)?;
-        self.write_tx_index_complete(true)
+        self.write_tx_index_complete(true)?;
+        self.write_address_index_complete(true)
     }
 
     fn clear_all(&self) -> Result<(), StoreError> {
@@ -910,8 +1006,11 @@ impl Store for RocksDbStore {
         self.drop_backfill_temp_cf()?;
         // Re-stamp schema version after metadata CF was recreated
         Self::stamp_schema(&self.db, CURRENT_SCHEMA_VERSION)?;
+        // Same three completeness markers as `clear_chainstate` —
+        // see comment there for the round-2-review H2 rationale.
         self.write_outpoint_spend_complete(true)?;
-        self.write_tx_index_complete(true)
+        self.write_tx_index_complete(true)?;
+        self.write_address_index_complete(true)
     }
 
     fn get_coins_batch(&self, outpoints: &[OutPoint]) -> Vec<Option<Coin>> {
@@ -947,15 +1046,27 @@ impl Store for RocksDbStore {
         &self,
         sh: &crate::index::address::Scripthash,
     ) -> Vec<(crate::index::address::AddrFundingKey, u64)> {
+        self.iter_addr_funding_limited(sh, usize::MAX)
+    }
+
+    fn iter_addr_funding_limited(
+        &self,
+        sh: &crate::index::address::Scripthash,
+        limit: usize,
+    ) -> Vec<(crate::index::address::AddrFundingKey, u64)> {
         let cf = self.cf(CF_ADDR_FUNDING);
         // The CF carries a 32-byte fixed prefix-extractor, so
         // `prefix_iterator_cf` short-circuits via the matching SST
         // index/bloom and terminates at the first row whose first 32
-        // bytes leave the prefix. RocksDB's iterator is a borrowed
-        // ReadOptions snapshot; we collect into Vec for caller
-        // simplicity (bounded per-scripthash row count in practice).
-        let mut out = Vec::new();
+        // bytes leave the prefix. With a `limit`, we stop iterating
+        // once we've collected that many rows — `usize::MAX` is the
+        // unlimited sentinel used by the unbounded `iter_addr_funding`
+        // wrapper above.
+        let mut out: Vec<(crate::index::address::AddrFundingKey, u64)> = Vec::new();
         for item in self.db.prefix_iterator_cf(&cf, sh) {
+            if out.len() >= limit {
+                break;
+            }
             let (k, v) = match item {
                 Ok(kv) => kv,
                 Err(_) => continue,
@@ -984,9 +1095,20 @@ impl Store for RocksDbStore {
         &self,
         sh: &crate::index::address::Scripthash,
     ) -> Vec<(crate::index::address::AddrSpendingKey, OutPoint)> {
+        self.iter_addr_spending_limited(sh, usize::MAX)
+    }
+
+    fn iter_addr_spending_limited(
+        &self,
+        sh: &crate::index::address::Scripthash,
+        limit: usize,
+    ) -> Vec<(crate::index::address::AddrSpendingKey, OutPoint)> {
         let cf = self.cf(CF_ADDR_SPENDING);
-        let mut out = Vec::new();
+        let mut out: Vec<(crate::index::address::AddrSpendingKey, OutPoint)> = Vec::new();
         for item in self.db.prefix_iterator_cf(&cf, sh) {
+            if out.len() >= limit {
+                break;
+            }
             let (k, v) = match item {
                 Ok(kv) => kv,
                 Err(_) => continue,
@@ -1020,6 +1142,16 @@ impl Store for RocksDbStore {
 
     fn tx_index_complete(&self) -> bool {
         self.read_tx_index_complete().unwrap_or(false)
+    }
+
+    fn address_index_complete(&self) -> bool {
+        // Default false when the marker is missing — under-claim
+        // rather than over-claim. Round-1 review H2.
+        self.read_address_index_complete().unwrap_or(false)
+    }
+
+    fn mark_address_index_complete(&self) -> Result<(), StoreError> {
+        self.write_address_index_complete(true)
     }
 
     fn lookup_spend(
@@ -1744,6 +1876,179 @@ mod tests {
         // -reindex-chainstate stamps complete because every block
         // will be re-applied via connect_block.
         assert!(store.outpoint_spend_complete());
+    }
+
+    // ── address_index.complete marker (round-1 review H2) ────────
+
+    #[test]
+    fn test_address_index_complete_true_on_fresh_datadir() {
+        let (store, _dir) = temp_store(false);
+        // Fresh datadir → marker stamped true on first open. Mirrors
+        // the outpoint_spend / tx_index pattern.
+        assert!(store.address_index_complete());
+    }
+
+    #[test]
+    fn test_address_index_complete_legacy_upgrade_stamps_false() {
+        // Simulate an upgraded datadir: block_index has rows but the
+        // address_index.complete marker was never stamped.
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = RocksDbStore::open(dir.path(), false, 16, false).unwrap();
+            // Synthesize a block_index row by writing a synthetic
+            // value directly into the CF. The legacy-detection path
+            // only checks "any row in CF_BLOCK_INDEX", not the row
+            // shape, so we can sidestep the full BlockIndexEntry
+            // serialization here.
+            let cf_bi = store.cf(CF_BLOCK_INDEX);
+            store.db.put_cf(&cf_bi, [0u8; 32], [0u8; 4]).unwrap();
+            // Erase the marker so the next open sees a legacy state.
+            let cf = store.cf(CF_METADATA);
+            store
+                .db
+                .delete_cf(&cf, ADDRESS_INDEX_COMPLETE_KEY)
+                .unwrap();
+        }
+        let store = RocksDbStore::open(dir.path(), false, 16, false).unwrap();
+        assert!(
+            !store.address_index_complete(),
+            "legacy datadir without marker must stamp false on open"
+        );
+    }
+
+    #[test]
+    fn test_address_index_complete_cleared_on_connect_with_addressindex_off() {
+        // The bug round-1 H2 catches: with addressindex disabled,
+        // a connecting block must clear the marker so future
+        // electrum binds refuse.
+        let (store, _dir) = temp_store(false);
+        let store = store.with_addressindex_enabled(false);
+        // Marker starts true on fresh datadir.
+        assert!(store.address_index_complete());
+
+        // Synthesize a connecting batch with a coin put. The marker
+        // is cleared atomically with the write.
+        let mut batch = StoreBatch::default();
+        let outpoint = make_outpoint(0xaa, 0);
+        let coin = crate::storage::Coin {
+            amount: 1000,
+            script_pubkey: bitcoin::ScriptBuf::new(),
+            height: 100,
+            coinbase: false,
+        };
+        batch.coin_puts.push((outpoint, coin));
+        store.write_batch(batch).unwrap();
+
+        assert!(
+            !store.address_index_complete(),
+            "connect-with-addressindex-off must clear the marker"
+        );
+    }
+
+    #[test]
+    fn test_address_index_complete_marker_persists_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = RocksDbStore::open(dir.path(), false, 16, false).unwrap();
+            store.write_address_index_complete(false).unwrap();
+        }
+        let store = RocksDbStore::open(dir.path(), false, 16, false).unwrap();
+        assert!(!store.address_index_complete());
+    }
+
+    #[test]
+    fn test_mark_address_index_complete_stamps_true() {
+        let (store, _dir) = temp_store(false);
+        store.write_address_index_complete(false).unwrap();
+        assert!(!store.address_index_complete());
+        // The backfill-completion path stamps true.
+        store.mark_address_index_complete().unwrap();
+        assert!(store.address_index_complete());
+    }
+
+    #[test]
+    fn test_address_index_complete_after_clear_chainstate() {
+        // Round-2-review H2: -reindex-chainstate must re-stamp the
+        // address marker alongside tx_index and outpoint_spend, or
+        // the documented remediation leaves Electrum / Esplora
+        // permanently refusing to bind.
+        let (store, _dir) = temp_store(false);
+        store.write_address_index_complete(false).unwrap();
+        assert!(!store.address_index_complete());
+        store.clear_chainstate().unwrap();
+        assert!(
+            store.address_index_complete(),
+            "clear_chainstate must re-stamp address_index.complete"
+        );
+        // Sister markers should also be true (sanity check the
+        // existing contract).
+        assert!(store.tx_index_complete());
+        assert!(store.outpoint_spend_complete());
+    }
+
+    #[test]
+    fn test_address_index_complete_after_clear_all() {
+        // Same contract for full --reindex via clear_all.
+        let (store, _dir) = temp_store(false);
+        store.write_address_index_complete(false).unwrap();
+        assert!(!store.address_index_complete());
+        store.clear_all().unwrap();
+        assert!(
+            store.address_index_complete(),
+            "clear_all must re-stamp address_index.complete"
+        );
+    }
+
+    // ── iter_addr_funding/spending_limited (round-1 review M4) ────
+
+    #[test]
+    fn test_iter_addr_funding_limited_aborts_at_cap() {
+        use crate::index::address::AddrFundingRow;
+        let (store, _dir) = temp_store(false);
+
+        let sh = [0xab; 32];
+        let mut batch = StoreBatch::default();
+        for i in 0..50u32 {
+            batch.addr_funding_puts.push(AddrFundingRow {
+                scripthash: sh,
+                height: i,
+                txid: make_outpoint(0x10 + (i as u8 % 8), 0).txid,
+                vout: i,
+                amount_sat: 1000 + (i as u64),
+            });
+        }
+        store.write_batch(batch).unwrap();
+
+        // Unbounded read returns all 50 rows.
+        assert_eq!(store.iter_addr_funding(&sh).len(), 50);
+
+        // Limited read stops at the cap.
+        assert_eq!(store.iter_addr_funding_limited(&sh, 10).len(), 10);
+        assert_eq!(store.iter_addr_funding_limited(&sh, 0).len(), 0);
+        // limit > total: returns total.
+        assert_eq!(store.iter_addr_funding_limited(&sh, 100).len(), 50);
+    }
+
+    #[test]
+    fn test_iter_addr_spending_limited_aborts_at_cap() {
+        use crate::index::address::AddrSpendingRow;
+        let (store, _dir) = temp_store(false);
+
+        let sh = [0xcd; 32];
+        let mut batch = StoreBatch::default();
+        for i in 0..30u32 {
+            batch.addr_spending_puts.push(AddrSpendingRow {
+                scripthash: sh,
+                height: i,
+                txid: make_outpoint(0x20 + (i as u8 % 8), 0).txid,
+                vin: 0,
+                prev_outpoint: make_outpoint(0xff, i),
+            });
+        }
+        store.write_batch(batch).unwrap();
+
+        assert_eq!(store.iter_addr_spending(&sh).len(), 30);
+        assert_eq!(store.iter_addr_spending_limited(&sh, 5).len(), 5);
     }
 
     #[test]

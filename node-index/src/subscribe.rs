@@ -94,8 +94,7 @@ impl SubscriptionRegistry {
         // is supposed to recompute status_hash from current state; a
         // stale dedup entry from a prior incarnation could match the
         // recomputed hash and silently swallow the first notification.
-        let live_keys: std::collections::HashSet<Scripthash> =
-            channels.keys().copied().collect();
+        let live_keys: std::collections::HashSet<Scripthash> = channels.keys().copied().collect();
         self.last_status
             .lock()
             .unwrap()
@@ -180,35 +179,38 @@ impl SubscriptionRegistry {
     }
 }
 
-/// Compute the Electrum status hash for a scripthash given:
+/// Compute the Electrum status hash for a scripthash given the
+/// already-height-tagged history.
 ///
-/// - `confirmed`: list of `(height, txid)` for confirmed history,
-///   in `(height, txid)` ascending order.
-/// - `mempool`: list of mempool txids — assigned `height=0` per
-///   Electrum convention.
+/// `entries` is `(height, txid)` per row, where `height` is signed:
+/// - positive: confirmed block height
+/// - `0`: unconfirmed mempool tx with no unconfirmed inputs
+/// - `-1`: unconfirmed tx that spends an unconfirmed parent
+///
+/// Mirrors the `Height` enum in `romanz/electrs` v0.11.1 src/status.rs:
+/// ```text
+/// Height::Confirmed { height: usize }     -> i64::try_from(height)
+/// Height::Unconfirmed { has_unconfirmed_inputs: false } -> 0
+/// Height::Unconfirmed { has_unconfirmed_inputs: true }  -> -1
+/// ```
+///
+/// Sorting is by `(height, txid)` ascending — negative heights for
+/// chained mempool txs sort first, then `0` for plain mempool, then
+/// positive heights in block order.
 ///
 /// Returns the all-zero hash for an empty history (canonical
 /// "no data" sentinel). Otherwise sha256 of
 /// `"<txid>:<height>:<txid>:<height>:..."`.
-pub fn status_hash(confirmed: &[(u32, Txid)], mempool: &[Txid]) -> [u8; 32] {
-    if confirmed.is_empty() && mempool.is_empty() {
+pub fn status_hash(entries: &[(i64, Txid)]) -> [u8; 32] {
+    if entries.is_empty() {
         return [0u8; 32];
     }
 
-    // Build sorted (height, txid) pairs. Mempool entries get height=0
-    // so they sort first when interleaved with low-height confirmations.
-    // Within a height, sort by txid.
-    let mut entries: Vec<(u32, Txid)> = Vec::with_capacity(confirmed.len() + mempool.len());
-    for &(h, t) in confirmed {
-        entries.push((h, t));
-    }
-    for t in mempool {
-        entries.push((0, *t));
-    }
-    entries.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    let mut sorted: Vec<(i64, Txid)> = entries.to_vec();
+    sorted.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
 
     let mut concat = String::new();
-    for (h, t) in &entries {
+    for (h, t) in &sorted {
         // Electrum hex encoding of txid: hex of byte-reversed (display)
         // form, which is what `Txid::to_string()` produces in rust-
         // bitcoin.
@@ -230,7 +232,7 @@ mod tests {
 
     #[test]
     fn test_address_index_status_hash_empty_is_zero() {
-        let h = status_hash(&[], &[]);
+        let h = status_hash(&[]);
         assert_eq!(h, [0u8; 32]);
     }
 
@@ -238,8 +240,8 @@ mod tests {
     fn test_address_index_status_hash_changes_on_new_entry() {
         let txid_a = fixture_txid(0x01);
         let txid_b = fixture_txid(0x02);
-        let h1 = status_hash(&[(100, txid_a)], &[]);
-        let h2 = status_hash(&[(100, txid_a), (101, txid_b)], &[]);
+        let h1 = status_hash(&[(100, txid_a)]);
+        let h2 = status_hash(&[(100, txid_a), (101, txid_b)]);
         assert_ne!(h1, h2);
     }
 
@@ -247,8 +249,8 @@ mod tests {
     fn test_address_index_status_hash_stable_under_input_reordering() {
         let txid_a = fixture_txid(0x10);
         let txid_b = fixture_txid(0x20);
-        let h1 = status_hash(&[(50, txid_a), (60, txid_b)], &[]);
-        let h2 = status_hash(&[(60, txid_b), (50, txid_a)], &[]);
+        let h1 = status_hash(&[(50, txid_a), (60, txid_b)]);
+        let h2 = status_hash(&[(60, txid_b), (50, txid_a)]);
         assert_eq!(h1, h2);
     }
 
@@ -256,12 +258,25 @@ mod tests {
     fn test_address_index_status_hash_mempool_height_zero() {
         let txid_mp = fixture_txid(0x30);
         let txid_conf = fixture_txid(0x31);
-        let h_with_mp = status_hash(&[(100, txid_conf)], &[txid_mp]);
-        let h_no_mp = status_hash(&[(100, txid_conf)], &[]);
+        let h_with_mp = status_hash(&[(100, txid_conf), (0, txid_mp)]);
+        let h_no_mp = status_hash(&[(100, txid_conf)]);
         assert_ne!(
             h_with_mp, h_no_mp,
             "adding a mempool entry must change status hash"
         );
+    }
+
+    #[test]
+    fn test_address_index_status_hash_distinguishes_unconfirmed_with_deps() {
+        // electrs `Height::Unconfirmed { has_unconfirmed_inputs }`
+        // distinguishes plain unconfirmed (height=0) from
+        // chained-mempool (height=-1). The two MUST hash differently
+        // so wallet clients see a status change when a mempool tx
+        // gains/loses an unconfirmed parent.
+        let txid_mp = fixture_txid(0x30);
+        let h_no_deps = status_hash(&[(0, txid_mp)]);
+        let h_with_deps = status_hash(&[(-1, txid_mp)]);
+        assert_ne!(h_no_deps, h_with_deps);
     }
 
     #[test]

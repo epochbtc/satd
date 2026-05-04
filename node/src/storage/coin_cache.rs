@@ -633,6 +633,14 @@ impl Store for CoinCache {
         &self,
         sh: &crate::index::address::Scripthash,
     ) -> Vec<(crate::index::address::AddrFundingKey, u64)> {
+        self.iter_addr_funding_limited(sh, usize::MAX)
+    }
+
+    fn iter_addr_funding_limited(
+        &self,
+        sh: &crate::index::address::Scripthash,
+        limit: usize,
+    ) -> Vec<(crate::index::address::AddrFundingKey, u64)> {
         // Reads see committed-to-inner-store rows merged with the
         // pending (not-yet-flushed) write batch. Without this merge,
         // queries between a connect_block and the next flush would
@@ -667,7 +675,16 @@ impl Store for CoinCache {
             .collect();
         drop(pending);
 
-        let inner_rows = self.inner.iter_addr_funding(sh);
+        // Round-1 review M4: bound the inner scan. The handler only
+        // needs to know "is there more than `cap`?", so asking inner
+        // for `limit + 1` rows is enough — pending puts may displace
+        // some, but the merged total is still <= limit + 1 + |pending
+        // puts|, which the handler then checks against its cap.
+        // `limit = usize::MAX` (the unbounded wrapper above) preserves
+        // the original "scan everything" behaviour for callers that
+        // need a complete view (Esplora's address-balance summing path).
+        let inner_limit = limit.saturating_add(1);
+        let inner_rows = self.inner.iter_addr_funding_limited(sh, inner_limit);
         // Dedupe by key with pending taking precedence over inner.
         // Without this, an inner row that also has a matching pending
         // put (e.g. a write that bypassed the pending-batch path via
@@ -686,6 +703,13 @@ impl Store for CoinCache {
             crate::index::address::encode_funding_key(a)
                 .cmp(&crate::index::address::encode_funding_key(b))
         });
+        // Round-2 review M3: honor the trait contract — return at
+        // most `limit` rows. Without this truncate a large in-flight
+        // pending batch could push the merged result past `limit + 1`,
+        // weakening the `cap + 1` sentinel handlers rely on.
+        // `limit = usize::MAX` (the unbounded wrapper above) is a
+        // no-op truncate.
+        all.truncate(limit);
         all
     }
 
@@ -693,7 +717,16 @@ impl Store for CoinCache {
         &self,
         sh: &crate::index::address::Scripthash,
     ) -> Vec<(crate::index::address::AddrSpendingKey, OutPoint)> {
-        // See iter_addr_funding for the put/remove netting rationale.
+        self.iter_addr_spending_limited(sh, usize::MAX)
+    }
+
+    fn iter_addr_spending_limited(
+        &self,
+        sh: &crate::index::address::Scripthash,
+        limit: usize,
+    ) -> Vec<(crate::index::address::AddrSpendingKey, OutPoint)> {
+        // See iter_addr_funding_limited for the limit + 1 + |pending|
+        // bounding rationale.
         let pending = self.pending_batch.lock().unwrap();
         let pending_removes: std::collections::HashSet<crate::index::address::AddrSpendingKey> =
             pending
@@ -717,9 +750,10 @@ impl Store for CoinCache {
             .collect();
         drop(pending);
 
-        let inner_rows = self.inner.iter_addr_spending(sh);
+        let inner_limit = limit.saturating_add(1);
+        let inner_rows = self.inner.iter_addr_spending_limited(sh, inner_limit);
         // Dedupe by key with pending taking precedence over inner.
-        // See `iter_addr_funding` for the rationale.
+        // See `iter_addr_funding_limited` for the rationale.
         let pending_keys: std::collections::HashSet<crate::index::address::AddrSpendingKey> =
             pending_puts.iter().map(|(k, _)| k.clone()).collect();
         let mut all: Vec<(crate::index::address::AddrSpendingKey, OutPoint)> = inner_rows
@@ -731,6 +765,9 @@ impl Store for CoinCache {
             crate::index::address::encode_spending_key(a)
                 .cmp(&crate::index::address::encode_spending_key(b))
         });
+        // Round-2 review M3: honor the trait contract — see
+        // iter_addr_funding_limited for the rationale.
+        all.truncate(limit);
         all
     }
 
@@ -778,6 +815,14 @@ impl Store for CoinCache {
 
     fn tx_index_complete(&self) -> bool {
         self.inner.tx_index_complete()
+    }
+
+    fn address_index_complete(&self) -> bool {
+        self.inner.address_index_complete()
+    }
+
+    fn mark_address_index_complete(&self) -> Result<(), StoreError> {
+        self.inner.mark_address_index_complete()
     }
 
     fn lookup_spend(

@@ -1,26 +1,22 @@
 //! Electrum scripthash status helper.
 //!
 //! [`compute_status_hash`] returns the current Electrum-canonical
-//! status hash for a scripthash given an [`AddressIndex`] read surface.
+//! status hash for a scripthash given an [`AddressIndex`] read surface
+//! and a [`Mempool`] reference (needed to distinguish
+//! unconfirmed-no-deps from unconfirmed-with-unconfirmed-parents per
+//! electrs's `Height` enum).
+//!
 //! It's the value `blockchain.scripthash.subscribe` returns
 //! synchronously on first call; future updates ride the broadcast
 //! channel from
 //! [`AddressIndex::subscribe`](node_index::AddressIndex::subscribe)
 //! and carry an already-computed hash, so this helper is only needed
 //! for the initial response.
-//!
-//! Intentionally thin compared to `romanz/electrs`'s
-//! `ScriptHashStatus` state machine: our
-//! [`SubscriptionRegistry`](node_index::SubscriptionRegistry) already
-//! handles per-scripthash dedup, the
-//! [`status_hash`](node_index::status_hash) function we delegate to is
-//! byte-identical to electrs's by spec, and the notifier task already
-//! computes and pushes hashes on every chain / mempool change. There's
-//! no per-connection state for us to maintain; the connection holds a
-//! `Receiver<StatusUpdate>` and forwards as-is.
 
+use node::mempool::pool::Mempool;
 use node_index::{AddressIndex, IndexError, status_hash};
 
+use crate::handlers::blockchain::mempool_tx_has_unconfirmed_inputs;
 use crate::types::ScripthashHex;
 
 /// Compute the current status hash for `sh` from the live index.
@@ -30,26 +26,50 @@ use crate::types::ScripthashHex;
 /// `Err(IndexError::Disabled)` when `--addressindex=0` so the caller
 /// can surface a JSON-RPC error rather than silently returning the
 /// empty-history sentinel.
+///
+/// `mempool` is required for height-tagging unconfirmed entries:
+/// `0` for unconfirmed-no-deps, `-1` for unconfirmed-with-deps.
+/// Mirrors `romanz/electrs`'s `Height::as_i64`.
 pub fn compute_status_hash(
     idx: &dyn AddressIndex,
+    mempool: &Mempool,
     sh: ScripthashHex,
 ) -> Result<[u8; 32], IndexError> {
     let confirmed = idx.confirmed_history(&sh.0)?;
-    let mempool = idx.mempool_history(&sh.0);
 
     // Adapt to the (height, txid) shape `node_index::status_hash`
     // expects. Funding and spending entries that share `(height, txid)`
     // collapse to a single entry per the Electrum spec — the status
     // hash sees one row per `(height, txid)` regardless of how many
     // funding / spending rows exist within it.
-    let mut pairs: Vec<(u32, bitcoin::Txid)> =
-        confirmed.iter().map(|e| (e.height(), e.txid())).collect();
+    let mut pairs: Vec<(i64, bitcoin::Txid)> = confirmed
+        .iter()
+        .map(|e| (e.height() as i64, e.txid()))
+        .collect();
     pairs.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
     pairs.dedup();
 
-    let mempool_txids: Vec<bitcoin::Txid> = mempool.into_iter().map(|m| m.txid).collect();
+    // Mempool entries — tag with -1 if they spend an unconfirmed
+    // parent, 0 otherwise (electrs `Height::Unconfirmed`).
+    for mp in idx.mempool_history(&sh.0) {
+        let height = match mempool.get(&mp.txid) {
+            Some(entry) => {
+                if mempool_tx_has_unconfirmed_inputs(&entry.tx, mempool) {
+                    -1
+                } else {
+                    0
+                }
+            }
+            // Tx left mempool between mempool_history and our get;
+            // best-effort fallback to unconfirmed-no-deps. The next
+            // `LeaveConfirmed` / `LeaveEvicted` event will trigger a
+            // recompute so this value is short-lived.
+            None => 0,
+        };
+        pairs.push((height, mp.txid));
+    }
 
-    Ok(status_hash(&pairs, &mempool_txids))
+    Ok(status_hash(&pairs))
 }
 
 /// Render a 32-byte status hash as the protocol-canonical JSON value.
@@ -86,6 +106,7 @@ mod tests {
     use super::*;
     use bitcoin::hashes::Hash as _;
     use bitcoin::{OutPoint, Txid};
+    use node::mempool::pool::Mempool;
     use node_index::{
         AddressIndex, HistoryEntry, IndexError, MempoolHistoryEntry, Scripthash, StatusUpdate,
         SubscribeError, Utxo,
@@ -95,6 +116,10 @@ mod tests {
 
     fn fixture_txid(byte: u8) -> Txid {
         Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([byte; 32]))
+    }
+
+    fn empty_mempool() -> Mempool {
+        Mempool::new(8 * 1024 * 1024, 1)
     }
 
     /// Tiny in-memory `AddressIndex` for unit-testing the helper without
@@ -145,7 +170,8 @@ mod tests {
     #[test]
     fn empty_history_returns_zero_sentinel() {
         let idx = FakeIndex::default();
-        let h = compute_status_hash(&idx, ScripthashHex([0xab; 32])).unwrap();
+        let mp = empty_mempool();
+        let h = compute_status_hash(&idx, &mp, ScripthashHex([0xab; 32])).unwrap();
         assert_eq!(h, [0u8; 32]);
         assert!(status_hash_to_json(h).is_none());
     }
@@ -153,6 +179,7 @@ mod tests {
     #[test]
     fn confirmed_only_status_matches_status_hash_helper() {
         let idx = FakeIndex::default();
+        let mp = empty_mempool();
         let txid = fixture_txid(0x42);
         idx.confirmed.lock().unwrap().push(HistoryEntry::Funding {
             height: 100,
@@ -161,23 +188,25 @@ mod tests {
             amount_sat: 1000,
         });
 
-        let got = compute_status_hash(&idx, ScripthashHex([0xab; 32])).unwrap();
-        let expected = node_index::status_hash(&[(100, txid)], &[]);
+        let got = compute_status_hash(&idx, &mp, ScripthashHex([0xab; 32])).unwrap();
+        let expected = node_index::status_hash(&[(100, txid)]);
         assert_eq!(got, expected);
         assert!(status_hash_to_json(got).is_some());
     }
 
     #[test]
-    fn mempool_entries_get_height_zero() {
+    fn mempool_entry_without_deps_uses_height_zero() {
         let idx = FakeIndex::default();
+        let mp = empty_mempool();
         let txid_mp = fixture_txid(0x30);
         idx.mempool
             .lock()
             .unwrap()
             .push(MempoolHistoryEntry { txid: txid_mp });
 
-        let got = compute_status_hash(&idx, ScripthashHex([0xcc; 32])).unwrap();
-        let expected = node_index::status_hash(&[], &[txid_mp]);
+        let got = compute_status_hash(&idx, &mp, ScripthashHex([0xcc; 32])).unwrap();
+        // mempool tx not in `mp.get(...)` — fallback path tags it as 0.
+        let expected = node_index::status_hash(&[(0, txid_mp)]);
         assert_eq!(got, expected);
     }
 
@@ -187,6 +216,7 @@ mod tests {
         // input within the SAME tx (e.g., a CoinJoin participant) must
         // contribute exactly one row to the status hash, not two.
         let idx = FakeIndex::default();
+        let mp = empty_mempool();
         let txid = fixture_txid(0x55);
         idx.confirmed.lock().unwrap().extend([
             HistoryEntry::Funding {
@@ -206,9 +236,9 @@ mod tests {
             },
         ]);
 
-        let got = compute_status_hash(&idx, ScripthashHex([0xee; 32])).unwrap();
-        let single = node_index::status_hash(&[(200, txid)], &[]);
-        let double = node_index::status_hash(&[(200, txid), (200, txid)], &[]);
+        let got = compute_status_hash(&idx, &mp, ScripthashHex([0xee; 32])).unwrap();
+        let single = node_index::status_hash(&[(200, txid)]);
+        let double = node_index::status_hash(&[(200, txid), (200, txid)]);
         assert_eq!(got, single, "(height, txid) should dedupe to one row");
         assert_ne!(got, double, "no dedupe would produce a different hash");
     }
@@ -219,7 +249,8 @@ mod tests {
             disabled: true,
             ..Default::default()
         };
-        let result = compute_status_hash(&idx, ScripthashHex([0; 32]));
+        let mp = empty_mempool();
+        let result = compute_status_hash(&idx, &mp, ScripthashHex([0; 32]));
         assert!(matches!(result, Err(IndexError::Disabled)));
     }
 

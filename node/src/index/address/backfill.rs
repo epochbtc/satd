@@ -264,6 +264,11 @@ impl BackfillHandle {
         // At this point, pass 2 has finished writing every row for
         // the snapshot range, so the marker reflects truth.
         store.mark_outpoint_spend_complete()?;
+        // Round-1 review H2: stamp the address-index completeness
+        // marker in the same write window. After this point the
+        // address-history CFs are fully populated for the snapshot
+        // range; Electrum / Esplora address surfaces can bind safely.
+        store.mark_address_index_complete()?;
         self.persist(
             store,
             BackfillCursor {

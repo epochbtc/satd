@@ -16,6 +16,7 @@ use node_index::{AddressIndex, SpendIndex};
 
 use crate::config::ElectrumConfig;
 use crate::extras::ElectrumExtras;
+use crate::handlers::mempool::FeeHistogramCache;
 
 #[derive(Clone)]
 pub struct ElectrumState {
@@ -27,4 +28,8 @@ pub struct ElectrumState {
     pub electrum_extras: Arc<dyn ElectrumExtras>,
     pub network: Network,
     pub config: Arc<ElectrumConfig>,
+    /// Short-TTL cache for `mempool.get_fee_histogram` (round-1
+    /// review M5). Shared across connections so back-to-back wallet
+    /// polls don't each clone the entire mempool.
+    pub fee_histogram_cache: Arc<FeeHistogramCache>,
 }

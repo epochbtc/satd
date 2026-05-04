@@ -276,6 +276,7 @@ pub async fn mempool_index_task(
                             crate::index::address::notifier::recompute_for(
                                 &bundle.index,
                                 &bundle.registry,
+                                &mempool,
                                 &touched,
                             );
                         }
@@ -295,6 +296,7 @@ pub async fn mempool_index_task(
                             crate::index::address::notifier::recompute_for(
                                 &bundle.index,
                                 &bundle.registry,
+                                &mempool,
                                 &touched,
                             );
                         }
@@ -317,6 +319,7 @@ pub async fn mempool_index_task(
                             crate::index::address::notifier::recompute_all_active(
                                 &bundle.index,
                                 &bundle.registry,
+                                &mempool,
                             );
                         }
                     }
@@ -391,7 +394,11 @@ mod tests {
         assert_eq!(idx.delta(&sh), 3500);
 
         idx.remove_tx(&txid_a);
-        assert_eq!(idx.delta(&sh), 2500, "removing one tx must subtract only its delta");
+        assert_eq!(
+            idx.delta(&sh),
+            2500,
+            "removing one tx must subtract only its delta"
+        );
         assert_eq!(idx.entries_for(&sh), vec![txid_b]);
 
         idx.remove_tx(&txid_b);

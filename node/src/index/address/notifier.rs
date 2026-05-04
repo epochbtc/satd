@@ -27,6 +27,7 @@ use crate::index::address::keys::Scripthash;
 use crate::index::address::lookups::RocksAddressIndex;
 use crate::index::address::subscribe::{SubscriptionRegistry, status_hash};
 use crate::index::address::trait_def::AddressIndex;
+use crate::mempool::pool::Mempool;
 
 /// How often the notifier prunes empty channels from the registry as a
 /// belt-and-suspenders measure on top of the per-subscribe prune.
@@ -36,10 +37,15 @@ const PRUNE_INTERVAL: Duration = Duration::from_secs(60);
 /// Spawn the chain-driven status-update notifier. Listens on
 /// `ChainEvent::BlockConnected` / `BlockDisconnected` and recomputes
 /// status hashes only for scripthashes with active subscribers.
+///
+/// `mempool` is required so the recompute path can tag mempool tx
+/// status entries with `-1` for unconfirmed-with-unconfirmed-parents
+/// vs `0` for unconfirmed-no-deps (Electrum spec / electrs `Height`).
 pub async fn notifier_task(
     index: Arc<RocksAddressIndex>,
     registry: Arc<SubscriptionRegistry>,
     _chain_state: Arc<ChainState>,
+    mempool: Arc<Mempool>,
     mut chain_rx: broadcast::Receiver<ChainEvent>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
@@ -66,10 +72,10 @@ pub async fn notifier_task(
                         // (Per the design, this is the simple/correct
                         // path; M6 may add per-block scripthash sets to
                         // narrow the recompute fan-out.)
-                        recompute_all_active(&index, &registry);
+                        recompute_all_active(&index, &registry, &mempool);
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
-                        recompute_all_active(&index, &registry);
+                        recompute_all_active(&index, &registry, &mempool);
                     }
                     Err(broadcast::error::RecvError::Closed) => return,
                 }
@@ -84,9 +90,10 @@ pub async fn notifier_task(
 pub fn recompute_all_active(
     index: &RocksAddressIndex,
     registry: &SubscriptionRegistry,
+    mempool: &Mempool,
 ) {
     for sh in registry.active_scripthashes() {
-        recompute_one(index, registry, &sh);
+        recompute_one(index, registry, mempool, &sh);
     }
 }
 
@@ -97,6 +104,7 @@ pub fn recompute_all_active(
 pub fn recompute_for(
     index: &RocksAddressIndex,
     registry: &SubscriptionRegistry,
+    mempool: &Mempool,
     touched: &[Scripthash],
 ) {
     if touched.is_empty() {
@@ -109,7 +117,7 @@ pub fn recompute_for(
     }
     for sh in touched {
         if active.contains(sh) {
-            recompute_one(index, registry, sh);
+            recompute_one(index, registry, mempool, sh);
         }
     }
 }
@@ -117,24 +125,52 @@ pub fn recompute_for(
 fn recompute_one(
     index: &RocksAddressIndex,
     registry: &SubscriptionRegistry,
+    mempool: &Mempool,
     sh: &Scripthash,
 ) {
-    let confirmed: Vec<(u32, bitcoin::Txid)> = match index.confirmed_history(sh) {
-        Ok(entries) => distinct_confirmed_txs(&entries),
+    let mut entries: Vec<(i64, bitcoin::Txid)> = match index.confirmed_history(sh) {
+        Ok(history) => distinct_confirmed_txs(&history)
+            .into_iter()
+            .map(|(h, t)| (h as i64, t))
+            .collect(),
         Err(_) => return,
     };
     // Mempool entries are already tx-oriented (one entry per txid),
     // but defensively dedupe in case future changes batch mempool rows.
-    let mempool: Vec<bitcoin::Txid> = {
-        let dedup: std::collections::BTreeSet<bitcoin::Txid> = index
-            .mempool_history(sh)
-            .into_iter()
-            .map(|e| e.txid)
-            .collect();
-        dedup.into_iter().collect()
-    };
-    let h = status_hash(&confirmed, &mempool);
+    // For each, tag with -1 if it spends an unconfirmed parent (electrs
+    // `Height::Unconfirmed { has_unconfirmed_inputs: true }`), else 0.
+    let mempool_txids: std::collections::BTreeSet<bitcoin::Txid> = index
+        .mempool_history(sh)
+        .into_iter()
+        .map(|e| e.txid)
+        .collect();
+    for txid in mempool_txids {
+        let h: i64 = match mempool.get(&txid) {
+            Some(entry) => {
+                if has_unconfirmed_inputs(&entry.tx, mempool) {
+                    -1
+                } else {
+                    0
+                }
+            }
+            // Tx left mempool between mempool_history and our get;
+            // best-effort fallback to 0. The follow-up Leave* event
+            // will trigger a recompute and converge.
+            None => 0,
+        };
+        entries.push((h, txid));
+    }
+    let h = status_hash(&entries);
     registry.maybe_notify(*sh, h);
+}
+
+/// Returns `true` if `tx` spends at least one output that belongs to
+/// another tx currently in `mempool`. Mirrors electrs's
+/// `has_unconfirmed_inputs` check inside `Height::compute`.
+fn has_unconfirmed_inputs(tx: &bitcoin::Transaction, mempool: &Mempool) -> bool {
+    tx.input
+        .iter()
+        .any(|inp| mempool.get(&inp.previous_output.txid).is_some())
 }
 
 /// Reduce row-oriented confirmed history to the distinct
@@ -163,9 +199,7 @@ mod tests {
 
     fn fixture_txid(byte: u8) -> bitcoin::Txid {
         use bitcoin::hashes::Hash as _;
-        bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
-            [byte; 32],
-        ))
+        bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([byte; 32]))
     }
 
     /// Review M5: a single tx with multiple history rows touching the
@@ -219,9 +253,11 @@ mod tests {
         // Status hash must therefore equal the hash of the distinct
         // pairs only — confirms downstream `status_hash` invariance
         // is preserved by upstream dedupe.
-        let dup_hash = status_hash(&pairs, &[]);
-        let canon = vec![(50, other_txid), (100, same_txid)];
-        let canon_hash = status_hash(&canon, &[]);
+        let signed_pairs: Vec<(i64, bitcoin::Txid)> =
+            pairs.iter().map(|&(h, t)| (h as i64, t)).collect();
+        let dup_hash = status_hash(&signed_pairs);
+        let canon: Vec<(i64, bitcoin::Txid)> = vec![(50, other_txid), (100, same_txid)];
+        let canon_hash = status_hash(&canon);
         assert_eq!(dup_hash, canon_hash);
     }
 

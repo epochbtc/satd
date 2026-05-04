@@ -1,19 +1,48 @@
-Design lineage: this crate's wire-protocol structure (method names, JSON
-shapes, status-hash construction, merkle-proof encoding, ScriptHashStatus
-state machine) follows romanz/electrs (https://github.com/romanz/electrs),
-which is the reference implementation of an Electrum protocol server in
-Rust. The Electrum protocol itself is open and documented at
-https://electrumx.readthedocs.io/en/latest/protocol.html.
+Vendored from `romanz/electrs` (https://github.com/romanz/electrs):
+  Version: v0.11.1
+  Pinned commit: 35216c6d30148be8e6763d913d437330f431fc03
+  License: MIT
 
-Code in this crate is original implementation written from spec, not a
-literal vendoring of electrs sources. We track electrs's choices closely
-where wire compatibility requires it (status hash construction; merkle
-encoding; method dispatch shape) and diverge where our own subscription
-infrastructure (`node_index::SubscriptionRegistry`) renders electrs's
-internal state machine unnecessary.
+Files literally vendored (top-of-file attribution headers in each):
+  src/merkle.rs
+    → electrum-proto/src/merkle.rs (Proof + Proof::create + Proof::to_hex
+      block; satd-local helpers `compute_merkle_branch`, `merkle_root`,
+      `root_from_branch` are wrappers, not vendored)
 
-The romanz/electrs project is MIT-licensed; the upstream LICENSE text
-follows for reference and for compliance with its attribution norms.
+Files that follow electrs's wire shape but are reimplemented from
+spec rather than literally vendored (we cross-checked against the
+upstream source so the wire bytes match for every method we ship):
+  src/electrum.rs    → electrum-proto/src/dispatch.rs + handlers/*
+  src/status.rs      → electrum-proto/src/status.rs
+                       (we reuse `node_index::status_hash`, which is
+                       byte-identical to electrs's hash by spec)
+  src/types.rs       → electrum-proto/src/types.rs
+                       (only the wire-format types — `Height`,
+                       `HistoryEntry`, `Balance`, `UnspentEntry` — are
+                       relevant; electrs's DB-row types are not.)
+
+Wire-format compatibility points cross-checked against electrs v0.11.1:
+  - scripthash hex on the wire is byte-reversed (electrs uses
+    `#[hash_newtype(backward)]`; we reverse at serde boundaries).
+  - Electrum `Height` enum: confirmed → block height (positive),
+    unconfirmed-no-deps → 0, unconfirmed-with-deps → -1. Affects
+    `HistoryEntry.height` and the input to `status_hash`.
+  - Mempool `HistoryEntry` always carries `fee` (sat).
+  - `listunspent` merges confirmed and mempool funding/spending
+    rows, matching electrs's `Unspent::build`.
+  - `transaction.get verbose=true` mirrors Bitcoin Core's
+    `getrawtransaction <txid> 1` JSON shape. Electrs proxies to
+    bitcoind; we build the same JSON from satd's chainstate directly.
+  - `transaction.broadcast_package` accepts an array of hex-encoded
+    txs and reports per-tx accept/reject.
+  - JSON-RPC batch requests (`[req, req, …]`) are accepted alongside
+    single requests.
+  - Error codes: BadRequest = 1, DaemonError = 2, internal = -32603.
+    Error message strings match electrs's fixed wording where the
+    code is fully spec-defined.
+
+The upstream LICENSE text follows for reference and for compliance with
+its attribution norms.
 
 ────────────────────────────────────────────────────────────────────────
 
