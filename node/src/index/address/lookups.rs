@@ -105,13 +105,18 @@ impl AddressIndex for RocksAddressIndex {
     ) -> Result<Vec<HistoryEntry>, IndexError> {
         self.check_enabled()?;
 
-        // Round-1 review M4: bound the RocksDB scan. Asking each side
-        // for `limit` rows guarantees that the merged total has at
-        // least `limit` if either side hits its cap; the handler then
-        // checks `len > cap` to decide. We don't need `limit + 1` per
-        // side because the merge across funding + spending of the
-        // same `(height, txid)` is row-oriented (each row is its own
-        // entry), not tx-oriented — the handler dedupes if it cares.
+        // Round-2 review M3: honor the trait contract — return at
+        // most `limit` rows.
+        //
+        // The two underlying iterators (funding + spending) each
+        // return up to `limit` rows in scripthash-ascending key
+        // order. Concatenating them and sorting can produce up to
+        // `2 * limit` rows, so the previous implementation was
+        // leakier than the doc-comment claimed. We now scan each
+        // side at `limit`, merge, sort, and truncate to `limit`
+        // total rows. The `usize::MAX` sentinel propagates through
+        // saturating_add so unbounded callers (`confirmed_history`)
+        // still see all rows.
         let funding = self.store.iter_addr_funding_limited(sh, limit);
         let spending = self.store.iter_addr_spending_limited(sh, limit);
 
@@ -150,6 +155,9 @@ impl AddressIndex for RocksAddressIndex {
             );
             key_a.cmp(&key_b)
         });
+        // M3 truncate-after-merge so the public contract is exact.
+        // Saturating math guards `limit = usize::MAX` (unbounded).
+        out.truncate(limit);
         Ok(out)
     }
 
@@ -245,7 +253,7 @@ impl AddressIndex for RocksAddressIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::address::keys::AddrFundingRow;
+    use crate::index::address::keys::{AddrFundingRow, AddrSpendingRow};
     use crate::storage::StoreBatch;
     use crate::storage::db::InMemoryStore;
 
@@ -448,5 +456,55 @@ mod tests {
         assert_eq!(utxos.len(), 1);
         assert_eq!(utxos[0].txid, txid_b);
         assert_eq!(utxos[0].amount_sat, 2000);
+    }
+
+    /// Round-2 review M3: `confirmed_history_limited` honors its
+    /// trait contract — at most `limit` rows after merge + sort.
+    /// Before this fix, a scripthash with N funding + N spending
+    /// rows could return up to `2 * limit` rows when the caller
+    /// asked for `limit`, weakening the `cap + 1` sentinel pattern.
+    #[test]
+    fn test_address_index_confirmed_history_limited_truncates_to_limit() {
+        let store_inner = Arc::new(InMemoryStore::new());
+        let store: Arc<dyn Store> = store_inner.clone();
+        let idx = RocksAddressIndex::new(store, AddressIndexConfig::default());
+        let sh = [0xab; 32];
+
+        // 10 funding + 10 spending rows for the same scripthash.
+        // With limit=12, the unfixed code would have returned ~20
+        // (10 + 10 from each side); the fixed code truncates to 12.
+        let mut batch = StoreBatch::default();
+        for i in 0..10u32 {
+            batch.addr_funding_puts.push(AddrFundingRow {
+                scripthash: sh,
+                height: i,
+                txid: fixture_txid(i as u8),
+                vout: 0,
+                amount_sat: 100,
+            });
+            batch.addr_spending_puts.push(AddrSpendingRow {
+                scripthash: sh,
+                height: i + 100,
+                txid: fixture_txid(0x80 + i as u8),
+                vin: 0,
+                prev_outpoint: OutPoint {
+                    txid: fixture_txid(0xff),
+                    vout: i,
+                },
+            });
+        }
+        store_inner.write_batch(batch).unwrap();
+
+        for limit in [3, 5, 12, 19] {
+            let history = idx.confirmed_history_limited(&sh, limit).unwrap();
+            assert!(
+                history.len() <= limit,
+                "limit={limit} returned {} rows (must be <= limit)",
+                history.len()
+            );
+        }
+        // Unbounded path returns the full 20 rows.
+        let full = idx.confirmed_history_limited(&sh, usize::MAX).unwrap();
+        assert_eq!(full.len(), 20);
     }
 }

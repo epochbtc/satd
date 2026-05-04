@@ -122,18 +122,25 @@ pub fn block_headers(state: &ElectrumState, params: Value) -> Result<Value, Json
 
 pub fn scripthash_get_history(state: &ElectrumState, params: Value) -> Result<Value, JsonRpcError> {
     let sh = parse_scripthash(&params, "blockchain.scripthash.get_history")?;
-    // Round-1 review M4: ask the index for at most `cap + 1` rows so
-    // we abort the RocksDB scan early on pathological scripthashes.
-    // If we got more than `cap` rows back, the cap was exceeded.
     let cap = state.config.max_history_entries;
+
+    // Round-2 review M1: cap on the FINAL Electrum entry count
+    // (distinct tx + mempool entries), not on raw confirmed rows.
+    // A tx that both funds and spends `sh` in the same block
+    // contributes 2 raw rows but only 1 Electrum entry; capping
+    // pre-dedupe could falsely reject within-cap requests.
+    //
+    // To bound the raw-row scan we ask for `2 * (cap + 1)` rows
+    // — worst-case duplicate factor 2 (one funding + one spending
+    // row per (height, txid) pair). If a scripthash has more
+    // duplicate-row factor than 2 in practice (highly unusual), the
+    // distinct count is still bounded by `cap + 1` at the dedupe
+    // step below. `saturating_mul` guards `cap = usize::MAX`.
+    let raw_limit = cap.saturating_add(1).saturating_mul(2);
     let confirmed = state
         .address_index
-        .confirmed_history_limited(&sh.0, cap.saturating_add(1))
+        .confirmed_history_limited(&sh.0, raw_limit)
         .map_err(JsonRpcError::from_index)?;
-
-    if confirmed.len() > cap {
-        return Err(JsonRpcError::history_too_large(cap));
-    }
 
     // Dedup confirmed rows by `(height, txid)` — Electrum reports one
     // history entry per distinct tx touching the scripthash, regardless
@@ -143,6 +150,11 @@ pub fn scripthash_get_history(state: &ElectrumState, params: Value) -> Result<Va
         confirmed.iter().map(|e| (e.height(), e.txid())).collect();
     pairs.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
     pairs.dedup();
+
+    // Cap on distinct confirmed entries.
+    if pairs.len() > cap {
+        return Err(JsonRpcError::history_too_large(cap));
+    }
 
     let mut out: Vec<HistoryEntry> = pairs
         .into_iter()
@@ -159,11 +171,18 @@ pub fn scripthash_get_history(state: &ElectrumState, params: Value) -> Result<Va
     // `Height::as_i64`: `-1` if it spends an unconfirmed parent, `0`
     // otherwise. `fee` (sats) comes from the live mempool entry which
     // already pre-computes it at admission.
+    //
+    // Round-2 review M1: enforce the cap as we push — a scripthash
+    // with `cap` confirmed entries plus any mempool entries previously
+    // pushed past the cap silently.
     let mempool_pool = state.mempool.as_ref();
     let mempool = state.address_index.mempool_history(&sh.0);
     let mut mp_txids: Vec<bitcoin::Txid> = mempool.into_iter().map(|m| m.txid).collect();
     mp_txids.sort();
     for t in mp_txids {
+        if out.len() >= cap {
+            return Err(JsonRpcError::history_too_large(cap));
+        }
         let (height, fee) = match mempool_pool.get(&t) {
             Some(entry) => {
                 let h = if mempool_tx_has_unconfirmed_inputs(&entry.tx, mempool_pool) {
@@ -240,7 +259,10 @@ pub fn scripthash_listunspent(state: &ElectrumState, params: Value) -> Result<Va
         })
         .collect();
 
-    // Mempool funding additions.
+    // Mempool funding additions. Round-2 review M2: cap-check on
+    // every push so a single unconfirmed tx with many outputs to
+    // `sh`, or a flood of mempool funding txs, can't push the
+    // response past `cap` entries.
     for mp in state.address_index.mempool_history(&sh.0) {
         let entry = match mempool.get(&mp.txid) {
             Some(e) => e,
@@ -261,6 +283,9 @@ pub fn scripthash_listunspent(state: &ElectrumState, params: Value) -> Result<Va
             };
             if mempool.spending_tx(&outpoint).is_some() {
                 continue; // already spent by a child mempool tx
+            }
+            if out.len() >= cap {
+                return Err(JsonRpcError::history_too_large(cap));
             }
             out.push(ListUnspentEntry {
                 height,

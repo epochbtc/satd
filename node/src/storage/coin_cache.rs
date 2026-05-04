@@ -703,6 +703,13 @@ impl Store for CoinCache {
             crate::index::address::encode_funding_key(a)
                 .cmp(&crate::index::address::encode_funding_key(b))
         });
+        // Round-2 review M3: honor the trait contract — return at
+        // most `limit` rows. Without this truncate a large in-flight
+        // pending batch could push the merged result past `limit + 1`,
+        // weakening the `cap + 1` sentinel handlers rely on.
+        // `limit = usize::MAX` (the unbounded wrapper above) is a
+        // no-op truncate.
+        all.truncate(limit);
         all
     }
 
@@ -758,6 +765,9 @@ impl Store for CoinCache {
             crate::index::address::encode_spending_key(a)
                 .cmp(&crate::index::address::encode_spending_key(b))
         });
+        // Round-2 review M3: honor the trait contract — see
+        // iter_addr_funding_limited for the rationale.
+        all.truncate(limit);
         all
     }
 
