@@ -5329,6 +5329,11 @@ fn test_esplora_missing_cookie_file_fails_startup() {
     let p2p_port = find_available_port();
     let esplora_port = find_available_port();
     let datadir = std::env::temp_dir().join(format!("satd-esplora-bad-cookie-{}", rpcport));
+    // Self-hosted CI runner persists /tmp between runs; a prior run
+    // with the same rpcport hashing leaves chainstate rows that flip
+    // the address_index.complete marker to false on reopen and break
+    // this test's expected error path. Wipe before recreating.
+    let _ = std::fs::remove_dir_all(&datadir);
     let _ = std::fs::create_dir_all(&datadir);
     let missing = datadir.join("definitely-not-a-cookie");
 
@@ -5368,6 +5373,7 @@ fn test_esplora_port_conflict_fails_startup() {
     let rpcport = find_available_port();
     let p2p_port = find_available_port();
     let datadir = std::env::temp_dir().join(format!("satd-esplora-port-{}", rpcport));
+    let _ = std::fs::remove_dir_all(&datadir);
     let _ = std::fs::create_dir_all(&datadir);
 
     let out = Command::new(satd_bin)
@@ -5886,6 +5892,7 @@ fn test_esplora_default_startup_auto_enables_txindex() {
     let p2p_port = find_available_port();
     let esplora_port = find_available_port();
     let datadir = std::env::temp_dir().join(format!("satd-default-{}", rpcport));
+    let _ = std::fs::remove_dir_all(&datadir);
     let _ = std::fs::create_dir_all(&datadir);
 
     let mut child = Command::new(satd_bin)
@@ -6151,6 +6158,7 @@ fn test_esplora_cli_txindex_overrides_config_disable() {
     let p2p_port = find_available_port();
     let esplora_port = find_available_port();
     let datadir = std::env::temp_dir().join(format!("satd-cli-override-{}", rpcport));
+    let _ = std::fs::remove_dir_all(&datadir);
     let _ = std::fs::create_dir_all(&datadir);
     // Plant txindex=0 in the config file.
     std::fs::write(datadir.join("bitcoin.conf"), "txindex=0\n").unwrap();
