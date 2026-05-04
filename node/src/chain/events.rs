@@ -4,6 +4,7 @@
 //! observability tools subscribe to the same channel.
 
 use bitcoin::BlockHash;
+use serde::Serialize;
 
 /// Capacity of the chain-event broadcast channel. Sized so a slow
 /// consumer can pause for a few seconds at typical block cadence
@@ -15,7 +16,8 @@ pub const CHAIN_EVENT_BROADCAST_CAPACITY: usize = 64;
 /// Chain-tip transition. A reorg emits one `BlockDisconnected` per
 /// disconnected block followed by one `BlockConnected` per
 /// reconnected block (in chain order).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ChainEvent {
     BlockConnected {
         hash: BlockHash,

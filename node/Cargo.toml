@@ -23,6 +23,8 @@ bitcoinconsensus = { workspace = true }
 tokio-socks = { workspace = true }
 lru = { workspace = true }
 crossbeam-channel = { workspace = true }
+async-trait = { workspace = true }
+uuid = { workspace = true }
 
 consensus = { path = "../consensus" }
 node-index = { path = "../node-index" }
@@ -32,3 +34,4 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+tokio = { workspace = true, features = ["test-util"] }

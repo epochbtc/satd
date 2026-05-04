@@ -387,6 +387,14 @@ pub struct Config {
     /// Optional HMAC-SHA256 secret for `X-Satd-Signature`. If set, the
     /// dispatcher signs each webhook body. Absent = unsigned POSTs.
     pub reorg_webhook_secret: Option<String>,
+    /// Operator-pinned per-node identifier for the events bus. 32-char
+    /// lowercase hex (UUIDv4). `None` = auto-generate and persist to
+    /// `<datadir>/node_id` on first start.
+    pub events_node_id: Option<String>,
+    /// Optional region tag stamped on every events envelope (≤ 8
+    /// printable ASCII bytes). Used for geo-correlation across
+    /// multi-watcher deployments.
+    pub events_region: Option<String>,
     // No-op compatibility flags (accepted but ignored)
     #[allow(dead_code)]
     pub server: bool,
@@ -947,6 +955,8 @@ impl Config {
             reorg_webhook_secret: cli
                 .reorg_webhook_secret
                 .or_else(|| file_get("reorgwebhooksecret")),
+            events_node_id: cli.events_node_id.or_else(|| file_get("eventsnodeid")),
+            events_region: cli.events_region.or_else(|| file_get("eventsregion")),
             pending_notes,
         })
     }
@@ -1269,6 +1279,12 @@ pub struct CliArgs {
 
     #[arg(long = "reorg-webhook-secret", value_name = "SECRET", help = "HMAC-SHA256 secret used to sign webhook bodies via X-Satd-Signature")]
     pub reorg_webhook_secret: Option<String>,
+
+    #[arg(long = "events-node-id", value_name = "HEX32", help = "Stable per-node identifier stamped on every events envelope (32-char hex). Default: auto-generated and persisted to <datadir>/node_id")]
+    pub events_node_id: Option<String>,
+
+    #[arg(long = "events-region", value_name = "TAG", help = "Optional region tag stamped on every events envelope (\u{2264}8 printable ASCII bytes, e.g. 'us-east1')")]
+    pub events_region: Option<String>,
 }
 
 /// Translate Bitcoin-Core-compatible index-control aliases that don't
@@ -1626,6 +1642,8 @@ rpcport=8332
             profile: None,
             reorg_webhook: None,
             reorg_webhook_secret: None,
+            events_node_id: None,
+            events_region: None,
         };
         let config = Config::from_cli(cli).unwrap();
         assert_eq!(config.network, Network::Regtest);
@@ -1712,6 +1730,8 @@ rpcport=8332
             profile: None,
             reorg_webhook: None,
             reorg_webhook_secret: None,
+            events_node_id: None,
+            events_region: None,
         };
         assert!(Config::from_cli(cli).is_err());
     }
