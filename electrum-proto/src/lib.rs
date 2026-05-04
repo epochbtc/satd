@@ -1,0 +1,49 @@
+//! Electrum protocol server for satd.
+//!
+//! Architecturally this crate is the Electrum analogue of
+//! [`esplora-handlers`]: a thin protocol layer that calls into satd's
+//! shared chainstate via the `node-index` trait surface
+//! ([`AddressIndex`](node_index::AddressIndex),
+//! [`SpendIndex`](node_index::SpendIndex)) plus the
+//! [`extras::ElectrumExtras`] shim defined here for the surface that
+//! lives outside the index proper (raw tx bytes, block headers by
+//! height, merkle proofs, txid-by-position).
+//!
+//! See `ECOSYSTEM.md` §4 / §4a for the architectural rationale (single
+//! binary, native, shared chainstate) and `ADDRESS_INDEX.md` for the
+//! index design.
+//!
+//! Design lineage: the wire protocol shape (method names, JSON
+//! payloads, status-hash construction, merkle-proof encoding) follows
+//! `romanz/electrs`. See `vendor/electrs.MIT` for attribution and the
+//! upstream MIT LICENSE.
+//!
+//! Scope by milestone (per the Electrum plan):
+//! - **PR-1 (this PR)**: crate scaffold, leaf modules
+//!   ([`types`], [`status`], [`merkle`]), and the
+//!   [`extras::ElectrumExtras`] trait. No transport, no method
+//!   dispatch yet.
+//! - PR-2: method handlers + dispatch.
+//! - PR-3: TCP transport + JSON-RPC line protocol.
+//! - PR-4: per-connection subscriptions.
+//! - PR-5: TLS support (`tokio-rustls`).
+//! - PR-6: wiring in `satd/main.rs` + ops docs.
+
+pub mod extras;
+pub mod merkle;
+pub mod status;
+pub mod types;
+
+pub use extras::{ElectrumExtras, RocksElectrumExtras, TxConfirmation, TxMerkleProof};
+pub use merkle::{compute_merkle_branch, merkle_root};
+pub use status::compute_status_hash;
+pub use types::{
+    BalanceResponse, FeeHistogramEntry, GetMerkleResponse, HeadersResponse, HistoryEntry,
+    ListUnspentEntry, ScripthashHex, TxidHex,
+};
+
+/// Electrum protocol version this server reports via `server.version`.
+/// Matches `romanz/electrs` at the pinned reference; safer than `1.4`
+/// because some clients gate `blockchain.scripthash.subscribe`
+/// semantics on `>= 1.4.2`.
+pub const PROTOCOL_VERSION: &str = "1.4.5";
