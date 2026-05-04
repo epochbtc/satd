@@ -294,6 +294,29 @@ pub trait Store: Send + Sync {
         true
     }
 
+    /// True when the address-history CFs are fully populated for the
+    /// active chain. Required before binding any address-surface
+    /// service (Electrum's `blockchain.scripthash.*`, Esplora's
+    /// `/address/*`). False on upgraded datadirs that previously ran
+    /// with `--addressindex=0`, or when a backfill is incomplete.
+    /// Cleared atomically when a block connects with addressindex
+    /// disabled. Default: `true` for non-Rocks backends. Round-1
+    /// review H2.
+    fn address_index_complete(&self) -> bool {
+        true
+    }
+
+    /// Set the persisted `address_index.complete` marker to `true`.
+    /// Called by the address-index backfill when it finishes pass 2
+    /// (every row written, snapshot covered). Default: error so
+    /// non-Rocks backends fail loud rather than silently no-op.
+    /// Round-1 review H2.
+    fn mark_address_index_complete(&self) -> Result<(), StoreError> {
+        Err(StoreError::Database(
+            "mark_address_index_complete not supported on this backend".into(),
+        ))
+    }
+
     /// Lazily create the deferred-backfill temp CF
     /// (`addr_backfill_outpoint_to_scripthash`). Idempotent: succeeds if
     /// the CF already exists. Default: error so non-Rocks backends fail

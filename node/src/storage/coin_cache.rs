@@ -780,6 +780,14 @@ impl Store for CoinCache {
         self.inner.tx_index_complete()
     }
 
+    fn address_index_complete(&self) -> bool {
+        self.inner.address_index_complete()
+    }
+
+    fn mark_address_index_complete(&self) -> Result<(), StoreError> {
+        self.inner.mark_address_index_complete()
+    }
+
     fn lookup_spend(
         &self,
         outpoint: &OutPoint,

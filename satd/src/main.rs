@@ -175,7 +175,11 @@ async fn main() {
 
     let reindex = config.reindex || config.reindex_chainstate;
     let store = match RocksDbStore::open(&net_datadir, config.txindex, rocksdb_cache_mb, reindex) {
-        Ok(s) => Box::new(s),
+        // Round-1 review H2: tell the Store whether the address
+        // index is active so `write_batch_mode` can clear the
+        // `address_index.complete` marker atomically with any
+        // connect-with-addressindex-disabled batch.
+        Ok(s) => Box::new(s.with_addressindex_enabled(config.addressindex)),
         Err(e) => {
             eprintln!("Error opening chain database: {}", e);
             auth.cleanup();
@@ -1016,6 +1020,27 @@ async fn main() {
                  CF is incomplete (this datadir was previously synced with \n\
                  --txindex=0). Restart with --reindex-chainstate to populate \n\
                  historical rows, or set --electrum=0 to skip the Electrum server."
+            );
+            auth.cleanup();
+            std::process::exit(1);
+        }
+        // Round-1 review H2: refuse to bind Electrum when the
+        // address-history CFs are known to be partial. Without this
+        // check, a datadir previously synced with --addressindex=0
+        // (then flipped on alongside --electrum=1) would serve
+        // well-formed but partial scripthash histories indistinguishable
+        // from real "no history" answers — a silent correctness bug.
+        // The marker is set true on a fresh sync from genesis with
+        // addressindex on, or after the address-index backfill
+        // completes pass 2.
+        if !chain_state.store_ref().address_index_complete() {
+            eprintln!(
+                "Error: electrum is enabled and --addressindex=1, but the on-disk \n\
+                 address-history CFs are incomplete (this datadir was previously \n\
+                 synced with --addressindex=0, or the backfill has not finished). \n\
+                 Run the address-index backfill to completion before enabling \n\
+                 Electrum, or restart with --reindex-chainstate. Set --electrum=0 \n\
+                 to skip the Electrum server."
             );
             auth.cleanup();
             std::process::exit(1);
