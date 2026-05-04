@@ -199,6 +199,79 @@ impl AddressIndex for RocksAddressIndex {
         Ok((confirmed, unconfirmed))
     }
 
+    fn confirmed_distinct_history_limited(
+        &self,
+        sh: &Scripthash,
+        limit: usize,
+    ) -> Result<Vec<(u32, bitcoin::Txid)>, IndexError> {
+        // Round-3 review H1: stream/merge funding + spending CFs into
+        // distinct (height, txid) pairs, stopping ONLY at storage
+        // exhaustion or `limit` distinct pairs. The previous
+        // `confirmed_history_limited` + post-hoc dedupe relied on a
+        // fixed duplicate factor of 2 (one funding + one spending row
+        // per tx), which the schema doesn't enforce — a single tx can
+        // contribute multiple funding rows (one per matching output)
+        // and multiple spending rows (one per matching input). A
+        // pathological scripthash could therefore see the raw scan
+        // truncate before reaching `limit` distinct entries, returning
+        // a silent partial history.
+        //
+        // Implementation: both `iter_addr_funding` and
+        // `iter_addr_spending` return their rows in
+        // `(scripthash, height, txid, vout/vin)` ascending order. A
+        // lockstep merge by `(height, txid)` plus a "last seen"
+        // dedupe is enough.
+        //
+        // Memory: the underlying `iter_addr_*` methods materialize
+        // the full per-scripthash history into Vec; the M4 raw-row
+        // bound is intentionally NOT applied here because shrinking
+        // the scan window would re-introduce the silent-truncation
+        // bug. Tighter bounding would need a streaming Store API,
+        // which is queued as a separate cleanup.
+        self.check_enabled()?;
+
+        let funding = self.store.iter_addr_funding(sh);
+        let spending = self.store.iter_addr_spending(sh);
+        let mut funding_iter = funding.into_iter().peekable();
+        let mut spending_iter = spending.into_iter().peekable();
+
+        let mut out: Vec<(u32, bitcoin::Txid)> = Vec::new();
+        let mut last: Option<(u32, bitcoin::Txid)> = None;
+
+        while out.len() < limit {
+            let f_key = funding_iter.peek().map(|(k, _)| (k.height, k.txid));
+            let s_key = spending_iter.peek().map(|(k, _)| (k.height, k.txid));
+
+            let next = match (f_key, s_key) {
+                (None, None) => break,
+                (Some(fk), None) => {
+                    funding_iter.next();
+                    fk
+                }
+                (None, Some(sk)) => {
+                    spending_iter.next();
+                    sk
+                }
+                (Some(fk), Some(sk)) => {
+                    if fk <= sk {
+                        funding_iter.next();
+                        fk
+                    } else {
+                        spending_iter.next();
+                        sk
+                    }
+                }
+            };
+
+            if last.as_ref() != Some(&next) {
+                out.push(next);
+                last = Some(next);
+            }
+        }
+
+        Ok(out)
+    }
+
     fn utxos(&self, sh: &Scripthash) -> Result<Vec<Utxo>, IndexError> {
         self.utxos_limited(sh, usize::MAX)
     }
@@ -456,6 +529,99 @@ mod tests {
         assert_eq!(utxos.len(), 1);
         assert_eq!(utxos[0].txid, txid_b);
         assert_eq!(utxos[0].amount_sat, 2000);
+    }
+
+    /// Round-3 review H1: `confirmed_distinct_history_limited` must
+    /// stop ONLY at storage exhaustion or `limit` distinct pairs —
+    /// never silently truncate due to a raw-row duplicate factor.
+    /// Before this fix, the handler computed `raw_limit = 2*(cap+1)`
+    /// and trusted the duplicate factor to be at most 2. The schema
+    /// emits one row per matching output + one per matching input, so
+    /// a tx with 3+ outputs to the same scripthash could push the raw
+    /// scan past the cap before reaching `cap + 1` distinct (height,
+    /// txid) pairs.
+    #[test]
+    fn test_address_index_confirmed_distinct_history_handles_high_duplicate_factor() {
+        let store_inner = Arc::new(InMemoryStore::new());
+        let store: Arc<dyn Store> = store_inner.clone();
+        let idx = RocksAddressIndex::new(store, AddressIndexConfig::default());
+        let sh = [0xab; 32];
+
+        // 4 distinct txs, each with 5 funding outputs to `sh`. That
+        // yields 20 raw funding rows for 4 distinct (height, txid)
+        // pairs — duplicate factor 5, above the previous fixed-2
+        // assumption.
+        let mut batch = StoreBatch::default();
+        for i in 0..4u32 {
+            let txid = fixture_txid(0x10 + i as u8);
+            for vout in 0..5u32 {
+                batch.addr_funding_puts.push(AddrFundingRow {
+                    scripthash: sh,
+                    height: i,
+                    txid,
+                    vout,
+                    amount_sat: 100,
+                });
+            }
+        }
+        store_inner.write_batch(batch).unwrap();
+
+        // Asking for 3 distinct entries should return exactly 3 (not
+        // truncated mid-tx). And the 3 should be the first 3 in
+        // (height, txid) order.
+        let limited = idx.confirmed_distinct_history_limited(&sh, 3).unwrap();
+        assert_eq!(limited.len(), 3);
+        // Heights 0, 1, 2 (the first three blocks).
+        assert_eq!(
+            limited.iter().map(|(h, _)| *h).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+
+        // Asking for 100 (more than exists) returns 4 — storage
+        // exhausted before limit reached.
+        let full = idx.confirmed_distinct_history_limited(&sh, 100).unwrap();
+        assert_eq!(full.len(), 4);
+    }
+
+    /// Round-3 review H1, regression case: with cap=3 and a
+    /// scripthash containing 4 distinct txs each with 5 funding
+    /// outputs, asking for cap+1=4 distinct entries must return 4
+    /// (so the handler errors with `history_too_large`), not silently
+    /// truncate to 3 because the raw scan window was exhausted.
+    #[test]
+    fn test_address_index_confirmed_distinct_history_no_silent_truncation() {
+        let store_inner = Arc::new(InMemoryStore::new());
+        let store: Arc<dyn Store> = store_inner.clone();
+        let idx = RocksAddressIndex::new(store, AddressIndexConfig::default());
+        let sh = [0xfe; 32];
+
+        // 4 txs × 5 outputs each = 20 raw funding rows.
+        let mut batch = StoreBatch::default();
+        for i in 0..4u32 {
+            let txid = fixture_txid(0x80 + i as u8);
+            for vout in 0..5u32 {
+                batch.addr_funding_puts.push(AddrFundingRow {
+                    scripthash: sh,
+                    height: i,
+                    txid,
+                    vout,
+                    amount_sat: 100,
+                });
+            }
+        }
+        store_inner.write_batch(batch).unwrap();
+
+        // Cap = 3, ask for cap + 1 = 4 distinct entries. The
+        // handler-side check is `len > cap` → 4 > 3 → error.
+        // Pre-fix this returned at most 3 because raw_limit = 8 was
+        // exhausted before reaching 4 distinct pairs (duplicate
+        // factor 5 > 2).
+        let pairs = idx.confirmed_distinct_history_limited(&sh, 4).unwrap();
+        assert_eq!(
+            pairs.len(),
+            4,
+            "must return cap+1 distinct pairs so handler can detect over-cap"
+        );
     }
 
     /// Round-2 review M3: `confirmed_history_limited` honors its

@@ -124,34 +124,20 @@ pub fn scripthash_get_history(state: &ElectrumState, params: Value) -> Result<Va
     let sh = parse_scripthash(&params, "blockchain.scripthash.get_history")?;
     let cap = state.config.max_history_entries;
 
-    // Round-2 review M1: cap on the FINAL Electrum entry count
-    // (distinct tx + mempool entries), not on raw confirmed rows.
-    // A tx that both funds and spends `sh` in the same block
-    // contributes 2 raw rows but only 1 Electrum entry; capping
-    // pre-dedupe could falsely reject within-cap requests.
-    //
-    // To bound the raw-row scan we ask for `2 * (cap + 1)` rows
-    // — worst-case duplicate factor 2 (one funding + one spending
-    // row per (height, txid) pair). If a scripthash has more
-    // duplicate-row factor than 2 in practice (highly unusual), the
-    // distinct count is still bounded by `cap + 1` at the dedupe
-    // step below. `saturating_mul` guards `cap = usize::MAX`.
-    let raw_limit = cap.saturating_add(1).saturating_mul(2);
-    let confirmed = state
+    // Round-3 review H1: ask the index for at most `cap + 1` DISTINCT
+    // (height, txid) entries — the only wire-relevant dimension.
+    // The address-index schema emits one row per matching output AND
+    // per matching input, so a fixed raw-row duplicate factor is
+    // unsound; a scripthash with many outputs per tx could see a raw
+    // scan truncate before reaching `cap + 1` distinct entries and
+    // silently return a partial history. The new helper streams
+    // funding+spending in lockstep and dedupes inline so it stops
+    // only at storage exhaustion or `cap + 1` distinct pairs.
+    let pairs = state
         .address_index
-        .confirmed_history_limited(&sh.0, raw_limit)
+        .confirmed_distinct_history_limited(&sh.0, cap.saturating_add(1))
         .map_err(JsonRpcError::from_index)?;
 
-    // Dedup confirmed rows by `(height, txid)` — Electrum reports one
-    // history entry per distinct tx touching the scripthash, regardless
-    // of whether the tx funded + spent it in the same block. Order:
-    // ascending by `(height, txid)`.
-    let mut pairs: Vec<(u32, bitcoin::Txid)> =
-        confirmed.iter().map(|e| (e.height(), e.txid())).collect();
-    pairs.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-    pairs.dedup();
-
-    // Cap on distinct confirmed entries.
     if pairs.len() > cap {
         return Err(JsonRpcError::history_too_large(cap));
     }
