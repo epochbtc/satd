@@ -171,6 +171,76 @@ pub struct BackfillProgress {
     pub last_error: Option<String>,
 }
 
+/// Snapshot of the server-listener configuration from
+/// `getserverstatus`. Used by the steady-view services row to render
+/// a single-line indicator for the address-index, Esplora REST, and
+/// Electrum protocol surfaces.
+///
+/// Fields stay `None` when the RPC call hasn't returned yet, when the
+/// satd build is too old to know about `getserverstatus`, or when the
+/// listener isn't enabled in the running config. The renderer treats
+/// `None` as "unknown" and omits the column rather than guessing.
+#[derive(Debug, Clone, Default)]
+pub struct ServerStatus {
+    pub addressindex: Option<AddressIndexStatus>,
+    pub esplora: Option<ListenerStatus>,
+    pub electrum: Option<ListenerStatus>,
+    pub electrum_tls: Option<ListenerStatus>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AddressIndexStatus {
+    pub enabled: bool,
+    /// Reflects the on-disk `address_index.complete` marker, which the
+    /// Electrum / Esplora servers use as a hard gate. False means a
+    /// backfill (or fresh sync) is still required before those servers
+    /// can answer history queries safely.
+    pub complete: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ListenerStatus {
+    pub bind: String,
+}
+
+impl ServerStatus {
+    pub fn from_json(v: &serde_json::Value) -> Self {
+        let addressindex = v.get("addressindex").and_then(|a| {
+            Some(AddressIndexStatus {
+                enabled: a.get("enabled")?.as_bool()?,
+                complete: a.get("complete")?.as_bool()?,
+            })
+        });
+        let esplora = v.get("esplora").and_then(parse_listener);
+        let electrum_root = v.get("electrum");
+        let electrum = electrum_root.and_then(parse_listener);
+        let electrum_tls = electrum_root.and_then(|e| {
+            // `tls_bind` is populated independently of the plain bind
+            // (operators can run TLS-only or both).
+            let enabled = e.get("enabled").and_then(|x| x.as_bool()).unwrap_or(false);
+            if !enabled {
+                return None;
+            }
+            let bind = e.get("tls_bind").and_then(|x| x.as_str())?;
+            Some(ListenerStatus { bind: bind.to_string() })
+        });
+        Self {
+            addressindex,
+            esplora,
+            electrum,
+            electrum_tls,
+        }
+    }
+}
+
+fn parse_listener(v: &serde_json::Value) -> Option<ListenerStatus> {
+    if !v.get("enabled")?.as_bool()? {
+        return None;
+    }
+    let bind = v.get("bind")?.as_str()?;
+    Some(ListenerStatus { bind: bind.to_string() })
+}
+
 impl BackfillProgress {
     pub fn from_json(v: &serde_json::Value) -> Option<Self> {
         let bf = v.get("address")?.get("backfill")?;
@@ -296,6 +366,10 @@ pub struct AppState {
     // when the response shape couldn't be parsed.
     pub backfill: Option<BackfillProgress>,
 
+    /// Listener and address-index status from `getserverstatus`. Drives
+    /// the always-visible services row in the steady view.
+    pub server_status: ServerStatus,
+
     // UI state
     pub mode: ViewMode,
     pub force_mode: Option<ViewMode>,
@@ -408,6 +482,7 @@ impl AppState {
 
             ibd_bitmap: None,
             backfill: None,
+            server_status: ServerStatus::default(),
 
             mode: ViewMode::Steady,
             force_mode: None,
@@ -687,6 +762,11 @@ impl AppState {
     /// Update from `getindexinfo` response.
     pub fn update_index_info(&mut self, v: &serde_json::Value) {
         self.backfill = BackfillProgress::from_json(v);
+    }
+
+    /// Update from `getserverstatus` response.
+    pub fn update_server_status(&mut self, v: &serde_json::Value) {
+        self.server_status = ServerStatus::from_json(v);
     }
 
     /// Update mempool size distribution + top-N from getrawmempool verbose response.
@@ -1692,5 +1772,60 @@ mod tests {
     fn backfill_progress_returns_none_when_no_backfill_subobject() {
         let v = json!({ "address": { "synced": true } });
         assert!(BackfillProgress::from_json(&v).is_none());
+    }
+
+    #[test]
+    fn server_status_parses_full_shape() {
+        let v = json!({
+            "addressindex": { "enabled": true, "complete": true },
+            "esplora": { "enabled": true, "bind": "127.0.0.1:3000" },
+            "electrum": {
+                "enabled": true,
+                "bind": "127.0.0.1:50001",
+                "tls_bind": "127.0.0.1:50002",
+            },
+        });
+        let s = ServerStatus::from_json(&v);
+        assert!(s.addressindex.as_ref().unwrap().enabled);
+        assert!(s.addressindex.as_ref().unwrap().complete);
+        assert_eq!(s.esplora.as_ref().unwrap().bind, "127.0.0.1:3000");
+        assert_eq!(s.electrum.as_ref().unwrap().bind, "127.0.0.1:50001");
+        assert_eq!(s.electrum_tls.as_ref().unwrap().bind, "127.0.0.1:50002");
+    }
+
+    #[test]
+    fn server_status_listeners_disabled_become_none() {
+        let v = json!({
+            "addressindex": { "enabled": false, "complete": false },
+            "esplora": { "enabled": false, "bind": null },
+            "electrum": { "enabled": false, "bind": null, "tls_bind": null },
+        });
+        let s = ServerStatus::from_json(&v);
+        assert!(!s.addressindex.as_ref().unwrap().enabled);
+        assert!(s.esplora.is_none());
+        assert!(s.electrum.is_none());
+        assert!(s.electrum_tls.is_none());
+    }
+
+    #[test]
+    fn server_status_electrum_plain_off_tls_on() {
+        // TLS-only operator: plain bind absent, tls bind present.
+        // Currently `electrum.enabled` covers both, so a TLS-only
+        // deployment still reports `bind` as the plain one in our
+        // server impl; this test pins the parser's tolerance for a
+        // null plain bind plus a populated tls_bind.
+        let v = json!({
+            "addressindex": { "enabled": true, "complete": false },
+            "esplora": { "enabled": false, "bind": null },
+            "electrum": {
+                "enabled": true,
+                "bind": null,
+                "tls_bind": "127.0.0.1:50002",
+            },
+        });
+        let s = ServerStatus::from_json(&v);
+        assert!(s.electrum.is_none(), "plain bind null → electrum None");
+        assert_eq!(s.electrum_tls.as_ref().unwrap().bind, "127.0.0.1:50002");
+        assert!(!s.addressindex.as_ref().unwrap().complete);
     }
 }

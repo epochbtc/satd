@@ -340,7 +340,7 @@ async fn poller(rpc: Arc<RpcClient>, state: Arc<Mutex<AppState>>) {
         if slow_counter >= 3 && is_steady {
             slow_counter = 0;
 
-            let (fees_res, mining_res, txstats_res, uptime_res, blockstats_res, rawmempool_res, utxo_res, reorgs_res, mhist_res, index_res) = tokio::join!(
+            let (fees_res, mining_res, txstats_res, uptime_res, blockstats_res, rawmempool_res, utxo_res, reorgs_res, mhist_res, index_res, srv_res) = tokio::join!(
                 rpc.estimate_fees(),
                 rpc.get_mining_info(),
                 rpc.get_chain_tx_stats(),
@@ -354,6 +354,7 @@ async fn poller(rpc: Arc<RpcClient>, state: Arc<Mutex<AppState>>) {
                 rpc.get_reorg_history(),
                 rpc.get_mempool_history(),
                 rpc.get_index_info(),
+                rpc.get_server_status(),
             );
 
             {
@@ -368,6 +369,7 @@ async fn poller(rpc: Arc<RpcClient>, state: Arc<Mutex<AppState>>) {
                 if let Ok(v) = reorgs_res { st.update_reorg_history(&v); }
                 if let Ok(v) = mhist_res { st.update_mempool_history(&v); }
                 if let Ok(v) = index_res { st.update_index_info(&v); }
+                if let Ok(v) = srv_res { st.update_server_status(&v); }
             }
 
             // Refresh the difficulty-epoch anchor when the floor advances —
