@@ -11,8 +11,50 @@ use crate::storage::Store;
 use jsonrpsee::server::{RpcModule, ServerBuilder, ServerHandle};
 use jsonrpsee::types::ErrorObjectOwned;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tokio::sync::watch;
+
+/// Shared, mutable record of which optional listeners actually bound
+/// at startup. Updated by the listener wiring after each successful
+/// bind; read by `getserverstatus` to report runtime — not config —
+/// status.
+///
+/// Why this exists: config intent and runtime reality diverge in two
+/// cases the operator cares about. (1) The Esplora startup gate
+/// silently skips binding when `--addressindex=0` is set with the
+/// default `--esplora=1`; the daemon keeps running with no Esplora
+/// listener. (2) The Electrum / Esplora completeness-marker gates can
+/// fail in production datadirs even after the daemon comes up. A
+/// status RPC that reads from `effective_config` would lie about both.
+#[derive(Default)]
+pub struct ServerListenerStatus {
+    inner: RwLock<ServerListenerStatusInner>,
+}
+
+#[derive(Default, Clone)]
+struct ServerListenerStatusInner {
+    esplora: Option<String>,
+    electrum: Option<String>,
+    electrum_tls: Option<String>,
+}
+
+impl ServerListenerStatus {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+    pub fn set_esplora(&self, bind: String) {
+        self.inner.write().unwrap().esplora = Some(bind);
+    }
+    pub fn set_electrum(&self, bind: String) {
+        self.inner.write().unwrap().electrum = Some(bind);
+    }
+    pub fn set_electrum_tls(&self, bind: String) {
+        self.inner.write().unwrap().electrum_tls = Some(bind);
+    }
+    fn snapshot(&self) -> ServerListenerStatusInner {
+        self.inner.read().unwrap().clone()
+    }
+}
 
 /// Shared state for RPC handlers.
 pub struct RpcContext {
@@ -50,6 +92,10 @@ pub struct RpcContext {
     /// supervisor is running; `None` when the binary was built without
     /// the supervisor wired (tests, embedded uses).
     pub backfill_cmd_tx: Option<tokio::sync::mpsc::Sender<BackfillCommand>>,
+    /// Runtime listener status — read by `getserverstatus`. Mutated by
+    /// the satd binary after each optional listener (Esplora,
+    /// Electrum, Electrum TLS) successfully binds.
+    pub listener_status: Arc<ServerListenerStatus>,
 }
 
 /// Which data source `estimatesmartfee` / `estimatefees` draws from.
@@ -142,6 +188,7 @@ pub async fn start(
     address_index_enabled: bool,
     backfill: Option<Arc<BackfillHandle>>,
     backfill_cmd_tx: Option<tokio::sync::mpsc::Sender<BackfillCommand>>,
+    listener_status: Arc<ServerListenerStatus>,
 ) -> Result<ServerHandle, Box<dyn std::error::Error + Send + Sync>> {
     let ctx = Arc::new(RpcContext {
         chain_state,
@@ -157,6 +204,7 @@ pub async fn start(
         address_index_enabled,
         backfill,
         backfill_cmd_tx,
+        listener_status,
     });
 
     let mut module = RpcModule::new(ctx);
@@ -1001,7 +1049,7 @@ pub async fn start(
             "getmempoolentry", "getmempoolhistory", "getmempoolinfo", "getmemoryinfo", "getmininginfo",
             "getnettotals", "getnetworkhashps", "getnetworkinfo", "getorphaninfo", "getpeerinfo",
             "getrawmempool", "getrawtransaction", "getreorghistory", "getrpcinfo",
-            "getsysteminfo", "gettxout", "getwarnings",
+            "getserverstatus", "getsysteminfo", "gettxout", "getwarnings",
             "gettxoutsetinfo", "help", "listbanned", "logging", "ping",
             "preciousblock", "prioritisetransaction",
             "savemempool", "sendrawtransaction", "setban",
@@ -1022,6 +1070,38 @@ pub async fn start(
         // and cookie values are redacted. This is advisory, not a
         // machine-consumable API: field names track satd internals.
         Ok::<_, ErrorObjectOwned>(ctx.effective_config.clone())
+    })?;
+
+    module.register_method("getserverstatus", |_params, ctx, _extensions| {
+        // Compact runtime listener status for monitoring (sat-tui).
+        // Reads the live `ServerListenerStatus` populated as each
+        // optional server binds during startup — not the operator's
+        // configuration — so silent skips (e.g. Esplora skipped when
+        // `--addressindex=0` is paired with the default `--esplora=1`)
+        // surface accurately as `null`.
+        //
+        // Wire shape: each listener is either `null` (not bound) or
+        // `{"bind": "..."}` (bound and serving). `addressindex` rides
+        // its own shape because it is an in-process index, not a
+        // listener: `enabled` reflects the configured runtime, and
+        // `complete` reflects the on-disk completeness marker the
+        // wallet servers gate their bind on.
+        let snap = ctx.listener_status.snapshot();
+        let listener = |bind: Option<String>| -> serde_json::Value {
+            match bind {
+                Some(b) => serde_json::json!({ "bind": b }),
+                None => serde_json::Value::Null,
+            }
+        };
+        Ok::<_, ErrorObjectOwned>(serde_json::json!({
+            "addressindex": {
+                "enabled": ctx.address_index_enabled,
+                "complete": ctx.chain_state.store_ref().address_index_complete(),
+            },
+            "esplora": listener(snap.esplora),
+            "electrum": listener(snap.electrum),
+            "electrum_tls": listener(snap.electrum_tls),
+        }))
     })?;
 
     module.register_method("getwarnings", |_params, ctx, _extensions| {

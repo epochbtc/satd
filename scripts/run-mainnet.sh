@@ -36,6 +36,9 @@ exec "$SATD" \
     --rpcport="$RPCPORT" \
     --port="$P2PPORT" \
     --txindex \
+    --addressindex=1 \
+    --esplora=0 \
+    --electrum=0 \
     --dbcache=8000 \
     --maxahead=all \
     --consensus=cpp-shadow \

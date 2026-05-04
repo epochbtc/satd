@@ -4,7 +4,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Sparkline};
 
-use crate::state::{AppState, BackfillProgress};
+use crate::state::AppState;
 use crate::ui::{
     format_bytes, format_btc, format_duration, format_hash, format_hashrate, format_num,
     peer_table, render_loading_panel,
@@ -13,22 +13,15 @@ use crate::ui::{
 pub fn draw(f: &mut Frame, state: &AppState) {
     let size = f.area();
 
-    // Reserve a 1-row backfill status line just above the keybinding
-    // footer when a backfill is running / paused / failed. Quiet states
-    // (idle, completed, cancelled, rejected) get no row at all.
-    let show_backfill = state.backfill.as_ref().is_some_and(BackfillProgress::is_visible);
-
-    let mut constraints = vec![
+    let constraints = vec![
         Constraint::Length(1),  // title
         Constraint::Length(9),  // chain + latest block
         Constraint::Length(11), // mempool + fee estimates
         Constraint::Length(9),  // utxo + network
         Constraint::Min(5),     // peers
+        Constraint::Length(1),  // services status (addr-index, esplora, electrum)
+        Constraint::Length(1),  // footer
     ];
-    if show_backfill {
-        constraints.push(Constraint::Length(1)); // backfill status
-    }
-    constraints.push(Constraint::Length(1)); // footer
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -73,14 +66,13 @@ pub fn draw(f: &mut Frame, state: &AppState) {
     let table = peer_table(&state.peers, None, &state.peer_dl_rates, state.selected_peer, &peer_title);
     f.render_widget(table, chunks[4]);
 
-    // Backfill status row, when visible.
-    let footer_idx = if show_backfill {
-        let bf = state.backfill.as_ref().expect("show_backfill implies Some");
-        f.render_widget(Paragraph::new(backfill_line(bf)), chunks[5]);
-        6
-    } else {
-        5
-    };
+    // Services row — always visible. Shows addr-index, Esplora, and
+    // Electrum status side-by-side. When a backfill is running /
+    // paused / failed, the addr-index column shows backfill progress
+    // instead of the steady-state synced/syncing label.
+    f.render_widget(Paragraph::new(services_line(state)), chunks[5]);
+
+    let footer_idx = 6;
 
     // Footer — keybindings plus an unclean-shutdown hint if applicable.
     let mut spans = vec![
@@ -104,64 +96,164 @@ pub fn draw(f: &mut Frame, state: &AppState) {
     f.render_widget(Paragraph::new(Line::from(spans)), chunks[footer_idx]);
 }
 
-/// One-line summary of a running / paused / failed backfill. Color
-/// follows the state: green for running, yellow for paused, red for
-/// failed.
-fn backfill_line(bf: &BackfillProgress) -> Line<'static> {
-    let pct = bf.progress_ratio() * 100.0;
-    let cursor = format_num(bf.cursor_height as u64);
-    let snapshot = format_num(bf.snapshot_height as u64);
+/// Single-line services row. Three columns separated by two spaces:
+/// `addr-idx <state>`, `esplora <state>`, `electrum <state>`.
+///
+/// `<state>` for addr-idx is the backfill summary when one is active
+/// (running / paused / failed), the live `synced`/`syncing`/`off`/`-`
+/// label otherwise. For listeners it is the bind address when bound,
+/// `off` when explicitly not bound, `-` (dim) when status is unknown
+/// (RPC not yet returned, older satd build, transient error). The
+/// Electrum TLS bind, when present, follows the plain bind in
+/// parentheses.
+fn services_line(state: &AppState) -> Line<'static> {
+    let mut spans = vec![Span::raw(" ")];
+    addr_index_spans(&mut spans, state);
+    spans.push(Span::raw("  "));
+    listener_spans(&mut spans, "esplora", &state.server_status.esplora, None);
+    spans.push(Span::raw("  "));
+    listener_spans(
+        &mut spans,
+        "electrum",
+        &state.server_status.electrum,
+        Some(&state.server_status.electrum_tls),
+    );
+    Line::from(spans)
+}
 
-    match bf.state.as_str() {
-        "running" => {
-            let eta = if bf.estimated_remaining_seconds > 0 {
-                format!("  ETA {}", format_duration(bf.estimated_remaining_seconds))
-            } else {
-                String::new()
-            };
-            Line::from(vec![
-                Span::styled(" addr-index backfill ", Style::default().fg(Color::Black).bg(Color::Green).add_modifier(Modifier::BOLD)),
-                Span::styled(
+fn addr_index_spans(spans: &mut Vec<Span<'static>>, state: &AppState) {
+    let label = "addr-idx";
+    if let Some(bf) = state.backfill.as_ref().filter(|b| b.is_visible()) {
+        let pct = bf.progress_ratio() * 100.0;
+        let cursor = format_num(bf.cursor_height as u64);
+        let snapshot = format_num(bf.snapshot_height as u64);
+        match bf.state.as_str() {
+            "running" => {
+                let eta = if bf.estimated_remaining_seconds > 0 {
+                    format!("  ETA {}", format_duration(bf.estimated_remaining_seconds))
+                } else {
+                    String::new()
+                };
+                spans.push(dot(Color::Green));
+                spans.push(Span::styled(label, Style::default().fg(Color::White)));
+                spans.push(Span::styled(
                     format!(
-                        " pass {}/2  {:.1}%  ({}/{}){}",
+                        " backfill pass {}/2 {:.1}% ({}/{}){}",
                         bf.pass.clamp(1, 2),
                         pct,
                         cursor,
                         snapshot,
                         eta,
                     ),
-                    Style::default().fg(Color::White),
-                ),
-            ])
-        }
-        "paused" => Line::from(vec![
-            Span::styled(" addr-index backfill ", Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled(
-                format!(
-                    " paused at pass {}/2  {:.1}%  ({}/{}) — resumeindex address",
-                    bf.pass.clamp(1, 2),
-                    pct,
-                    cursor,
-                    snapshot,
-                ),
-                Style::default().fg(Color::Yellow),
-            ),
-        ]),
-        "failed" => {
-            // Truncate the persisted error to keep the row to one line.
-            // The full message is available via `getindexinfo`.
-            let err = bf.last_error.as_deref().unwrap_or("(no error message)");
-            let err_short: String = err.chars().take(80).collect();
-            Line::from(vec![
-                Span::styled(" addr-index backfill ", Style::default().fg(Color::White).bg(Color::Red).add_modifier(Modifier::BOLD)),
-                Span::styled(
-                    format!(" FAILED — {}", err_short),
+                    Style::default().fg(Color::Gray),
+                ));
+            }
+            "paused" => {
+                spans.push(dot(Color::Yellow));
+                spans.push(Span::styled(label, Style::default().fg(Color::White)));
+                spans.push(Span::styled(
+                    format!(
+                        " backfill paused pass {}/2 {:.1}% — resumeindex address",
+                        bf.pass.clamp(1, 2),
+                        pct,
+                    ),
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
+            "failed" => {
+                let err = bf.last_error.as_deref().unwrap_or("(no error)");
+                let err_short: String = err.chars().take(60).collect();
+                spans.push(dot(Color::Red));
+                spans.push(Span::styled(label, Style::default().fg(Color::White)));
+                spans.push(Span::styled(
+                    format!(" backfill FAILED — {}", err_short),
                     Style::default().fg(Color::LightRed),
-                ),
-            ])
+                ));
+            }
+            _ => {}
         }
-        _ => Line::from(""),
+        return;
     }
+    match &state.server_status.addressindex {
+        crate::state::ListenerView::Unknown => {
+            // No status from satd yet (first poll, older satd, transient
+            // RPC error). Stay neutral — don't claim disabled.
+            spans.push(dot(Color::DarkGray));
+            spans.push(Span::styled(label, Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled(" -", Style::default().fg(Color::DarkGray)));
+        }
+        crate::state::ListenerView::NotBound => {
+            // Should not occur for the addressindex variant — it always
+            // emits a `Bound(_)` view since the daemon always reports
+            // both flags. Render as unknown if we ever see it.
+            spans.push(dot(Color::DarkGray));
+            spans.push(Span::styled(label, Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled(" -", Style::default().fg(Color::DarkGray)));
+        }
+        crate::state::ListenerView::Bound(ai) if !ai.enabled => {
+            spans.push(dot(Color::DarkGray));
+            spans.push(Span::styled(label, Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled(" off", Style::default().fg(Color::DarkGray)));
+        }
+        crate::state::ListenerView::Bound(ai) if ai.complete => {
+            spans.push(dot(Color::Green));
+            spans.push(Span::styled(label, Style::default().fg(Color::White)));
+            spans.push(Span::styled(" synced", Style::default().fg(Color::Gray)));
+        }
+        crate::state::ListenerView::Bound(_) => {
+            // Enabled but the on-disk completeness marker isn't set —
+            // fresh sync still in progress, or a backfill is needed
+            // before Electrum / Esplora can bind.
+            spans.push(dot(Color::Yellow));
+            spans.push(Span::styled(label, Style::default().fg(Color::White)));
+            spans.push(Span::styled(
+                " syncing",
+                Style::default().fg(Color::Yellow),
+            ));
+        }
+    }
+}
+
+fn listener_spans(
+    spans: &mut Vec<Span<'static>>,
+    label: &'static str,
+    view: &crate::state::ListenerView<crate::state::ListenerStatus>,
+    tls_view: Option<&crate::state::ListenerView<crate::state::ListenerStatus>>,
+) {
+    use crate::state::ListenerView::*;
+    match view {
+        Unknown => {
+            spans.push(dot(Color::DarkGray));
+            spans.push(Span::styled(label, Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled(" -", Style::default().fg(Color::DarkGray)));
+        }
+        NotBound => {
+            spans.push(dot(Color::DarkGray));
+            spans.push(Span::styled(label, Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled(" off", Style::default().fg(Color::DarkGray)));
+        }
+        Bound(l) => {
+            spans.push(dot(Color::Green));
+            spans.push(Span::styled(label, Style::default().fg(Color::White)));
+            spans.push(Span::styled(
+                format!(" {}", l.bind),
+                Style::default().fg(Color::Gray),
+            ));
+            if let Some(Bound(tls)) = tls_view {
+                spans.push(Span::styled(
+                    format!(" (tls {})", tls.bind),
+                    Style::default().fg(Color::Cyan),
+                ));
+            }
+        }
+    }
+}
+
+fn dot(color: Color) -> Span<'static> {
+    Span::styled(
+        "● ",
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    )
 }
 
 fn draw_top_row(f: &mut Frame, area: Rect, state: &AppState) {

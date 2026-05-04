@@ -1220,6 +1220,15 @@ impl Config {
                 "control": self.torcontrol,
                 "password": if self.torpassword.is_some() { "(set)" } else { "(none)" },
             },
+            "esplora": {
+                "enabled": self.esplora,
+                "bind": if self.esplora { Some(self.esplora_bind.clone()) } else { None },
+            },
+            "electrum": {
+                "enabled": self.electrum,
+                "bind": if self.electrum { Some(self.electrum_bind.clone()) } else { None },
+                "tls_bind": if self.electrum { self.electrum_tls_bind.clone() } else { None },
+            },
         })
     }
 

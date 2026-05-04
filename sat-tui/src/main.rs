@@ -331,62 +331,79 @@ async fn poller(rpc: Arc<RpcClient>, state: Arc<Mutex<AppState>>) {
                     .map(|s| s.to_string());
         }
 
-        // Slow polls (every ~5s = 3-4 fast ticks)
+        // Slow polls (every ~5s = 3-4 fast ticks).
         let is_steady = {
             let st = state.lock().unwrap();
             !st.is_ibd
         };
 
-        if slow_counter >= 3 && is_steady {
+        if slow_counter >= 3 {
             slow_counter = 0;
 
-            let (fees_res, mining_res, txstats_res, uptime_res, blockstats_res, rawmempool_res, utxo_res, reorgs_res, mhist_res, index_res) = tokio::join!(
-                rpc.estimate_fees(),
-                rpc.get_mining_info(),
-                rpc.get_chain_tx_stats(),
-                rpc.get_uptime(),
-                async {
-                    let height = state.lock().unwrap().blocks;
-                    if height > 0 { rpc.get_block_stats(height).await } else { Err(rpc::RpcError::Rpc("no blocks".into())) }
-                },
-                rpc.get_raw_mempool_verbose(),
-                rpc.get_tx_out_set_info(),
-                rpc.get_reorg_history(),
-                rpc.get_mempool_history(),
-                rpc.get_index_info(),
-            );
-
+            // Index + server-status polls always run, regardless of IBD
+            // state — they drive the always-visible services row, which
+            // operators may force-display via key 2 even during IBD.
+            let (index_res, srv_res) =
+                tokio::join!(rpc.get_index_info(), rpc.get_server_status());
             {
                 let mut st = state.lock().unwrap();
-                if let Ok(v) = fees_res { st.update_fee_estimates(&v); }
-                if let Ok(v) = mining_res { st.update_mining_info(&v); }
-                if let Ok(v) = txstats_res { st.update_chain_tx_stats(&v); }
-                if let Ok(v) = uptime_res { st.update_uptime(&v); }
-                if let Ok(v) = blockstats_res { st.update_block_stats(&v); }
-                if let Ok(v) = rawmempool_res { st.update_mempool_dist(&v); }
-                if let Ok(v) = utxo_res { st.update_utxo_info(&v); }
-                if let Ok(v) = reorgs_res { st.update_reorg_history(&v); }
-                if let Ok(v) = mhist_res { st.update_mempool_history(&v); }
-                if let Ok(v) = index_res { st.update_index_info(&v); }
+                if let Ok(v) = index_res {
+                    st.update_index_info(&v);
+                }
+                if let Ok(v) = srv_res {
+                    st.update_server_status(&v);
+                }
             }
 
-            // Refresh the difficulty-epoch anchor when the floor advances —
-            // ≈ once per fortnight in steady state. Two cheap RPCs.
-            let anchor_target = {
-                let st = state.lock().unwrap();
-                let cur = st.blocks - (st.blocks % 2016);
-                if st.blocks > 0 && st.epoch_start_height != Some(cur) {
-                    Some(cur)
-                } else {
-                    None
+            // Heavy steady-state batch — only meaningful at chain tip.
+            // Skipped during IBD because most fields would be nullish.
+            if is_steady {
+                let (fees_res, mining_res, txstats_res, uptime_res, blockstats_res, rawmempool_res, utxo_res, reorgs_res, mhist_res) = tokio::join!(
+                    rpc.estimate_fees(),
+                    rpc.get_mining_info(),
+                    rpc.get_chain_tx_stats(),
+                    rpc.get_uptime(),
+                    async {
+                        let height = state.lock().unwrap().blocks;
+                        if height > 0 { rpc.get_block_stats(height).await } else { Err(rpc::RpcError::Rpc("no blocks".into())) }
+                    },
+                    rpc.get_raw_mempool_verbose(),
+                    rpc.get_tx_out_set_info(),
+                    rpc.get_reorg_history(),
+                    rpc.get_mempool_history(),
+                );
+
+                {
+                    let mut st = state.lock().unwrap();
+                    if let Ok(v) = fees_res { st.update_fee_estimates(&v); }
+                    if let Ok(v) = mining_res { st.update_mining_info(&v); }
+                    if let Ok(v) = txstats_res { st.update_chain_tx_stats(&v); }
+                    if let Ok(v) = uptime_res { st.update_uptime(&v); }
+                    if let Ok(v) = blockstats_res { st.update_block_stats(&v); }
+                    if let Ok(v) = rawmempool_res { st.update_mempool_dist(&v); }
+                    if let Ok(v) = utxo_res { st.update_utxo_info(&v); }
+                    if let Ok(v) = reorgs_res { st.update_reorg_history(&v); }
+                    if let Ok(v) = mhist_res { st.update_mempool_history(&v); }
                 }
-            };
-            if let Some(epoch_h) = anchor_target
-                && let Ok(hash_v) = rpc.get_block_hash(epoch_h).await
-                && let Some(hash_str) = hash_v.as_str()
-                && let Ok(hdr_v) = rpc.get_block_header(hash_str).await
-            {
-                state.lock().unwrap().update_epoch_anchor(epoch_h, &hdr_v);
+
+                // Refresh the difficulty-epoch anchor when the floor advances —
+                // ≈ once per fortnight in steady state. Two cheap RPCs.
+                let anchor_target = {
+                    let st = state.lock().unwrap();
+                    let cur = st.blocks - (st.blocks % 2016);
+                    if st.blocks > 0 && st.epoch_start_height != Some(cur) {
+                        Some(cur)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(epoch_h) = anchor_target
+                    && let Ok(hash_v) = rpc.get_block_hash(epoch_h).await
+                    && let Some(hash_str) = hash_v.as_str()
+                    && let Ok(hdr_v) = rpc.get_block_header(hash_str).await
+                {
+                    state.lock().unwrap().update_epoch_anchor(epoch_h, &hdr_v);
+                }
             }
         }
     }

@@ -5329,6 +5329,11 @@ fn test_esplora_missing_cookie_file_fails_startup() {
     let p2p_port = find_available_port();
     let esplora_port = find_available_port();
     let datadir = std::env::temp_dir().join(format!("satd-esplora-bad-cookie-{}", rpcport));
+    // Self-hosted CI runner persists /tmp between runs; a prior run
+    // with the same rpcport hashing leaves chainstate rows that flip
+    // the address_index.complete marker to false on reopen and break
+    // this test's expected error path. Wipe before recreating.
+    let _ = std::fs::remove_dir_all(&datadir);
     let _ = std::fs::create_dir_all(&datadir);
     let missing = datadir.join("definitely-not-a-cookie");
 
@@ -5368,6 +5373,7 @@ fn test_esplora_port_conflict_fails_startup() {
     let rpcport = find_available_port();
     let p2p_port = find_available_port();
     let datadir = std::env::temp_dir().join(format!("satd-esplora-port-{}", rpcport));
+    let _ = std::fs::remove_dir_all(&datadir);
     let _ = std::fs::create_dir_all(&datadir);
 
     let out = Command::new(satd_bin)
@@ -5886,6 +5892,7 @@ fn test_esplora_default_startup_auto_enables_txindex() {
     let p2p_port = find_available_port();
     let esplora_port = find_available_port();
     let datadir = std::env::temp_dir().join(format!("satd-default-{}", rpcport));
+    let _ = std::fs::remove_dir_all(&datadir);
     let _ = std::fs::create_dir_all(&datadir);
 
     let mut child = Command::new(satd_bin)
@@ -6151,6 +6158,7 @@ fn test_esplora_cli_txindex_overrides_config_disable() {
     let p2p_port = find_available_port();
     let esplora_port = find_available_port();
     let datadir = std::env::temp_dir().join(format!("satd-cli-override-{}", rpcport));
+    let _ = std::fs::remove_dir_all(&datadir);
     let _ = std::fs::create_dir_all(&datadir);
     // Plant txindex=0 in the config file.
     std::fs::write(datadir.join("bitcoin.conf"), "txindex=0\n").unwrap();
@@ -7944,4 +7952,105 @@ fn test_electrum_disabled_does_not_listen() {
     node.stop();
     // (We don't try to connect to 50001; CI environments may have
     // unrelated services there.)
+}
+
+/// Default regtest flags (no Esplora/Electrum) → `getserverstatus`
+/// must report all listeners as `null` (not bound). The
+/// `addressindex` field still reports its enabled/complete flags.
+#[test]
+fn test_getserverstatus_default_no_listeners() {
+    let mut node = TestNode::start(&[]);
+    let v = node.rpc_call("getserverstatus").unwrap();
+    let res = &v["result"];
+    assert!(
+        res["esplora"].is_null(),
+        "esplora should be null with default flags; got {}",
+        res["esplora"]
+    );
+    assert!(
+        res["electrum"].is_null(),
+        "electrum should be null with default flags; got {}",
+        res["electrum"]
+    );
+    assert!(
+        res["electrum_tls"].is_null(),
+        "electrum_tls should be null with default flags; got {}",
+        res["electrum_tls"]
+    );
+    assert!(
+        res["addressindex"]["enabled"].is_boolean(),
+        "addressindex.enabled must be a bool"
+    );
+    assert!(
+        res["addressindex"]["complete"].is_boolean(),
+        "addressindex.complete must be a bool"
+    );
+    node.stop();
+}
+
+/// Regression test for PR #127 H1: `getserverstatus` must reflect
+/// **runtime** listener state, not config intent. With
+/// `--addressindex=0 --esplora=1`, the daemon silently skips binding
+/// Esplora (logs a warning, keeps running). Reading the config-only
+/// shape that PR #127 v1 emitted would have falsely claimed Esplora
+/// was bound.
+#[test]
+fn test_getserverstatus_addressindex_off_skips_esplora() {
+    let esplora_port = find_available_port();
+    let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
+    // Esplora=1 + addressindex=0 → daemon must boot but skip Esplora.
+    let mut node = TestNode::start(&["--esplora=1", "--addressindex=0", &bind]);
+    let v = node.rpc_call("getserverstatus").unwrap();
+    let res = &v["result"];
+    assert!(
+        res["esplora"].is_null(),
+        "esplora must be null when --addressindex=0 silently skipped its bind; got {}",
+        res["esplora"]
+    );
+    node.stop();
+}
+
+/// `--esplora=1` with `--addressindex=1` (the supported combo) →
+/// `getserverstatus.esplora` must carry the bind address.
+#[test]
+fn test_getserverstatus_esplora_bound_carries_bind() {
+    let esplora_port = find_available_port();
+    let bind_arg = format!("--esplorabind=127.0.0.1:{}", esplora_port);
+    let mut node = TestNode::start(&["--esplora=1", &bind_arg]);
+    let v = node.rpc_call("getserverstatus").unwrap();
+    let res = &v["result"];
+    let bind = res["esplora"]["bind"]
+        .as_str()
+        .unwrap_or_else(|| panic!("esplora.bind missing or not a string; got {}", res["esplora"]));
+    assert!(
+        bind.ends_with(&format!(":{}", esplora_port)),
+        "expected esplora bind to end in :{}, got {bind}",
+        esplora_port
+    );
+    node.stop();
+}
+
+/// Regression test for PR #127 L3: `getconfig` must not surface
+/// `electrum.tls_bind` when Electrum itself is disabled. v1 of PR #127
+/// gated `electrum.bind` on `enabled` but left `tls_bind` ungated.
+#[test]
+fn test_getconfig_tls_bind_gated_on_electrum_enabled() {
+    let mut node = TestNode::start(&[]);
+    let v = node.rpc_call("getconfig").unwrap();
+    let electrum = &v["result"]["electrum"];
+    assert_eq!(
+        electrum["enabled"].as_bool(),
+        Some(false),
+        "default Electrum is off"
+    );
+    assert!(
+        electrum["bind"].is_null(),
+        "electrum.bind should be null when disabled"
+    );
+    assert!(
+        electrum["tls_bind"].is_null(),
+        "electrum.tls_bind should be null when disabled; got {}",
+        electrum["tls_bind"]
+    );
+    node.stop();
 }

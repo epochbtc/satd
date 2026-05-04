@@ -171,6 +171,89 @@ pub struct BackfillProgress {
     pub last_error: Option<String>,
 }
 
+/// Snapshot of the runtime listener status from `getserverstatus`.
+/// Drives the steady-view services row.
+///
+/// Each listener field is tri-state so the renderer can distinguish
+/// "not yet polled / older satd / transient RPC error" from
+/// "explicitly not bound." Conflating them silently mislabels a
+/// disconnected TUI as "all servers off."
+#[derive(Debug, Clone, Default)]
+pub struct ServerStatus {
+    pub addressindex: ListenerView<AddressIndexStatus>,
+    pub esplora: ListenerView<ListenerStatus>,
+    pub electrum: ListenerView<ListenerStatus>,
+    pub electrum_tls: ListenerView<ListenerStatus>,
+}
+
+/// Tri-state view of a listener's runtime status.
+///
+/// - `Unknown`: getserverstatus has not returned a usable response
+///   for this field yet (first poll, transient RPC error, satd build
+///   without `getserverstatus`, or a malformed sub-field).
+/// - `NotBound`: getserverstatus returned `null` for this listener.
+///   The server is not currently bound — either disabled in config
+///   or skipped by a runtime gate (e.g. Esplora skipped when
+///   `--addressindex=0` is paired with the default `--esplora=1`).
+/// - `Bound(t)`: listener is actively serving on the carried address.
+#[derive(Debug, Clone, Default)]
+pub enum ListenerView<T> {
+    #[default]
+    Unknown,
+    NotBound,
+    Bound(T),
+}
+
+#[derive(Debug, Clone)]
+pub struct AddressIndexStatus {
+    pub enabled: bool,
+    /// Reflects the on-disk `address_index.complete` marker, which the
+    /// Electrum / Esplora servers use as a hard gate. False means a
+    /// backfill (or fresh sync) is still required before those servers
+    /// can answer history queries safely.
+    pub complete: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ListenerStatus {
+    pub bind: String,
+}
+
+impl ServerStatus {
+    pub fn from_json(v: &serde_json::Value) -> Self {
+        Self {
+            addressindex: parse_addressindex(v.get("addressindex")),
+            esplora: parse_listener_view(v.get("esplora")),
+            electrum: parse_listener_view(v.get("electrum")),
+            electrum_tls: parse_listener_view(v.get("electrum_tls")),
+        }
+    }
+}
+
+fn parse_addressindex(v: Option<&serde_json::Value>) -> ListenerView<AddressIndexStatus> {
+    let v = match v {
+        Some(v) if !v.is_null() => v,
+        _ => return ListenerView::Unknown,
+    };
+    match (v.get("enabled").and_then(|x| x.as_bool()), v.get("complete").and_then(|x| x.as_bool())) {
+        (Some(enabled), Some(complete)) => ListenerView::Bound(AddressIndexStatus { enabled, complete }),
+        _ => ListenerView::Unknown,
+    }
+}
+
+fn parse_listener_view(v: Option<&serde_json::Value>) -> ListenerView<ListenerStatus> {
+    let Some(v) = v else { return ListenerView::Unknown };
+    if v.is_null() {
+        return ListenerView::NotBound;
+    }
+    match v.get("bind").and_then(|b| b.as_str()) {
+        Some(bind) => ListenerView::Bound(ListenerStatus { bind: bind.to_string() }),
+        // Object present but no usable bind — treat as unknown rather
+        // than guessing at "off."
+        None => ListenerView::Unknown,
+    }
+}
+
 impl BackfillProgress {
     pub fn from_json(v: &serde_json::Value) -> Option<Self> {
         let bf = v.get("address")?.get("backfill")?;
@@ -296,6 +379,10 @@ pub struct AppState {
     // when the response shape couldn't be parsed.
     pub backfill: Option<BackfillProgress>,
 
+    /// Listener and address-index status from `getserverstatus`. Drives
+    /// the always-visible services row in the steady view.
+    pub server_status: ServerStatus,
+
     // UI state
     pub mode: ViewMode,
     pub force_mode: Option<ViewMode>,
@@ -408,6 +495,7 @@ impl AppState {
 
             ibd_bitmap: None,
             backfill: None,
+            server_status: ServerStatus::default(),
 
             mode: ViewMode::Steady,
             force_mode: None,
@@ -687,6 +775,11 @@ impl AppState {
     /// Update from `getindexinfo` response.
     pub fn update_index_info(&mut self, v: &serde_json::Value) {
         self.backfill = BackfillProgress::from_json(v);
+    }
+
+    /// Update from `getserverstatus` response.
+    pub fn update_server_status(&mut self, v: &serde_json::Value) {
+        self.server_status = ServerStatus::from_json(v);
     }
 
     /// Update mempool size distribution + top-N from getrawmempool verbose response.
@@ -1692,5 +1785,88 @@ mod tests {
     fn backfill_progress_returns_none_when_no_backfill_subobject() {
         let v = json!({ "address": { "synced": true } });
         assert!(BackfillProgress::from_json(&v).is_none());
+    }
+
+    fn unwrap_bound<T: Clone>(v: &ListenerView<T>) -> T {
+        match v {
+            ListenerView::Bound(t) => t.clone(),
+            other => panic!("expected Bound, got {:?}", std::mem::discriminant(other)),
+        }
+    }
+
+    #[test]
+    fn server_status_parses_all_listeners_bound() {
+        // New wire shape: each listener is `null` (not bound) or
+        // `{bind: "..."}`. addressindex is its own shape.
+        let v = json!({
+            "addressindex": { "enabled": true, "complete": true },
+            "esplora": { "bind": "127.0.0.1:3000" },
+            "electrum": { "bind": "127.0.0.1:50001" },
+            "electrum_tls": { "bind": "127.0.0.1:50002" },
+        });
+        let s = ServerStatus::from_json(&v);
+        let ai = unwrap_bound(&s.addressindex);
+        assert!(ai.enabled);
+        assert!(ai.complete);
+        assert_eq!(unwrap_bound(&s.esplora).bind, "127.0.0.1:3000");
+        assert_eq!(unwrap_bound(&s.electrum).bind, "127.0.0.1:50001");
+        assert_eq!(unwrap_bound(&s.electrum_tls).bind, "127.0.0.1:50002");
+    }
+
+    #[test]
+    fn server_status_listener_null_becomes_not_bound() {
+        let v = json!({
+            "addressindex": { "enabled": false, "complete": false },
+            "esplora": null,
+            "electrum": null,
+            "electrum_tls": null,
+        });
+        let s = ServerStatus::from_json(&v);
+        assert!(matches!(s.esplora, ListenerView::NotBound));
+        assert!(matches!(s.electrum, ListenerView::NotBound));
+        assert!(matches!(s.electrum_tls, ListenerView::NotBound));
+        let ai = unwrap_bound(&s.addressindex);
+        assert!(!ai.enabled);
+    }
+
+    #[test]
+    fn server_status_missing_field_becomes_unknown() {
+        // Round-trip against an older satd that doesn't emit the new
+        // top-level keys. Empty object → all Unknown.
+        let v = json!({});
+        let s = ServerStatus::from_json(&v);
+        assert!(matches!(s.addressindex, ListenerView::Unknown));
+        assert!(matches!(s.esplora, ListenerView::Unknown));
+        assert!(matches!(s.electrum, ListenerView::Unknown));
+        assert!(matches!(s.electrum_tls, ListenerView::Unknown));
+    }
+
+    #[test]
+    fn server_status_default_is_unknown() {
+        // The pre-poll default must render as Unknown (dim "-"), not
+        // NotBound ("off"). This is the regression PR #127's reviewer
+        // flagged.
+        let s = ServerStatus::default();
+        assert!(matches!(s.addressindex, ListenerView::Unknown));
+        assert!(matches!(s.esplora, ListenerView::Unknown));
+        assert!(matches!(s.electrum, ListenerView::Unknown));
+        assert!(matches!(s.electrum_tls, ListenerView::Unknown));
+    }
+
+    #[test]
+    fn server_status_partial_addressindex_is_unknown() {
+        // Object present but flags missing — older satd that emits a
+        // skeleton but not the live fields. Don't guess.
+        let v = json!({
+            "addressindex": { "enabled": true },
+            "esplora": null,
+            "electrum": null,
+            "electrum_tls": null,
+        });
+        let s = ServerStatus::from_json(&v);
+        assert!(
+            matches!(s.addressindex, ListenerView::Unknown),
+            "partial addressindex must render as Unknown"
+        );
     }
 }

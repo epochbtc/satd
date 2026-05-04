@@ -191,6 +191,10 @@ impl RpcClient {
     pub async fn get_index_info(&self) -> Result<serde_json::Value, RpcError> {
         self.call("getindexinfo", &[]).await
     }
+
+    pub async fn get_server_status(&self) -> Result<serde_json::Value, RpcError> {
+        self.call("getserverstatus", &[]).await
+    }
 }
 
 #[derive(Debug)]
