@@ -1,5 +1,5 @@
 [workspace]
-members = ["satd", "sat-cli", "node", "node-index", "esplora-handlers", "sat-tui", "mcp", "consensus"]
+members = ["satd", "sat-cli", "node", "node-index", "esplora-handlers", "sat-tui", "mcp", "consensus", "events"]
 resolver = "2"
 
 [workspace.package]
@@ -32,6 +32,12 @@ lru = "0.12"
 crossbeam-channel = "0.5"
 async-trait = "0.1"
 uuid = { version = "1", features = ["v4"] }
+tonic = "0.12"
+tonic-build = "0.12"
+prost = "0.13"
+prost-types = "0.13"
+protoc-bin-vendored = "3"
+tokio-stream = "0.1"
 ratatui = { version = "0.29", features = ["crossterm"] }
 crossterm = "0.28"
 rmcp = { version = "1", features = ["server", "transport-io", "transport-streamable-http-server"] }
