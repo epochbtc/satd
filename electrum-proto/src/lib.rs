@@ -35,6 +35,8 @@ pub mod error;
 pub mod extras;
 pub mod handlers;
 pub mod merkle;
+pub mod rpc;
+pub mod server;
 pub mod state;
 pub mod status;
 pub mod types;
@@ -44,6 +46,7 @@ pub use dispatch::{Notification, Request, Response, dispatch};
 pub use error::JsonRpcError;
 pub use extras::{ElectrumExtras, RocksElectrumExtras, TxConfirmation, TxMerkleProof};
 pub use merkle::{compute_merkle_branch, merkle_root};
+pub use server::{DispatchFn, ElectrumServer, ElectrumServerError, state_dispatcher};
 pub use state::ElectrumState;
 pub use status::compute_status_hash;
 pub use types::{

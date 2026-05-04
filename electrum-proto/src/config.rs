@@ -7,6 +7,7 @@
 //! listener. Static-data fields used by handlers (banner,
 //! per-method limits) are defined here so PR-2 can wire them through.
 
+use std::net::SocketAddr;
 use std::time::Duration;
 
 /// Defaults align with `romanz/electrs` where possible:
@@ -22,14 +23,16 @@ pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
 pub const DEFAULT_MAX_CONNS: usize = 64;
 pub const DEFAULT_MAX_SUBS_PER_CONN: usize = 100;
 
-/// Configuration available to method handlers.
+/// Configuration available to method handlers + transport.
 ///
-/// PR-3 adds the transport-side fields (`bind`, `max_conns`, etc.);
 /// PR-5 adds the TLS fields. This struct is intentionally
 /// `Clone`-cheap so per-connection state can hold a snapshot without
 /// reaching back through an `Arc`.
 #[derive(Debug, Clone)]
 pub struct ElectrumConfig {
+    /// `host:port` to bind. Defaults to loopback on the standard
+    /// Electrum plain-TCP port (50001).
+    pub bind: SocketAddr,
     /// Banner string returned by `server.banner`. `None` falls back to
     /// a default constructed at server start (`format!("powered by
     /// satd {}", version)`).
@@ -42,19 +45,26 @@ pub struct ElectrumConfig {
     pub max_history_entries: usize,
     /// Max headers per `blockchain.block.headers` response.
     pub max_headers_per_request: u32,
+    /// Hard cap on simultaneously-open connections. Excess
+    /// connections are accepted then immediately closed with a
+    /// `subscription_cap`-style JSON-RPC error so the client knows
+    /// to retry — same shape `romanz/electrs` uses.
+    pub max_conns: usize,
     /// Per-connection scripthash subscription cap (PR-4 enforces).
     pub max_subs_per_conn: usize,
-    /// Wall-clock timeout per inbound request (PR-3 wires).
+    /// Wall-clock timeout per inbound request.
     pub request_timeout: Duration,
 }
 
 impl Default for ElectrumConfig {
     fn default() -> Self {
         Self {
+            bind: "127.0.0.1:50001".parse().unwrap(),
             banner: None,
             donation_address: String::new(),
             max_history_entries: MAX_HISTORY_ENTRIES,
             max_headers_per_request: MAX_HEADERS_PER_REQUEST,
+            max_conns: DEFAULT_MAX_CONNS,
             max_subs_per_conn: DEFAULT_MAX_SUBS_PER_CONN,
             request_timeout: Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS),
         }
