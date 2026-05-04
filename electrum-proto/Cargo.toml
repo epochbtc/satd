@@ -12,5 +12,11 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
 node-index = { path = "../node-index" }
 node = { path = "../node" }
+
+[dev-dependencies]
+rcgen = { workspace = true }
+tempfile = "3"

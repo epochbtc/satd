@@ -8,6 +8,7 @@
 //! per-method limits) are defined here so PR-2 can wire them through.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::Duration;
 
 /// Defaults align with `romanz/electrs` where possible:
@@ -33,6 +34,16 @@ pub struct ElectrumConfig {
     /// `host:port` to bind. Defaults to loopback on the standard
     /// Electrum plain-TCP port (50001).
     pub bind: SocketAddr,
+    /// Optional TLS bind. When `Some`, both `tls_cert_path` and
+    /// `tls_key_path` MUST also be `Some`; the server validates this
+    /// at construction time.
+    pub tls_bind: Option<SocketAddr>,
+    /// Path to the TLS server certificate (PEM). Read once at server
+    /// start and held in memory.
+    pub tls_cert_path: Option<PathBuf>,
+    /// Path to the TLS server private key (PEM). Read once at
+    /// server start and held in memory.
+    pub tls_key_path: Option<PathBuf>,
     /// Banner string returned by `server.banner`. `None` falls back to
     /// a default constructed at server start (`format!("powered by
     /// satd {}", version)`).
@@ -60,6 +71,9 @@ impl Default for ElectrumConfig {
     fn default() -> Self {
         Self {
             bind: "127.0.0.1:50001".parse().unwrap(),
+            tls_bind: None,
+            tls_cert_path: None,
+            tls_key_path: None,
             banner: None,
             donation_address: String::new(),
             max_history_entries: MAX_HISTORY_ENTRIES,

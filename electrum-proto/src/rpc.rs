@@ -8,8 +8,7 @@
 //! subscription state). A batch request sees a JSON-RPC error.
 
 use thiserror::Error;
-use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::net::tcp::OwnedReadHalf;
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
 /// Per-line read cap. A malformed or unbounded write from a client
 /// must not OOM the server. 1 MiB is well above any legitimate
@@ -36,8 +35,8 @@ pub enum FramingError {
 /// pathological client sending an unbounded line would grow `buf`
 /// without limit. We read byte-by-byte until `\n` or `MAX_LINE_BYTES`,
 /// matching electrs's careful framing.
-pub async fn read_line_bounded<'a>(
-    reader: &mut BufReader<OwnedReadHalf>,
+pub async fn read_line_bounded<'a, R: AsyncRead + Unpin>(
+    reader: &mut BufReader<R>,
     buf: &'a mut Vec<u8>,
     cap: usize,
 ) -> Result<&'a str, FramingError> {

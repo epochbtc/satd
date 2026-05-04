@@ -25,9 +25,10 @@ use std::sync::Arc;
 
 use serde_json::Value;
 use thiserror::Error;
-use tokio::io::{AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, mpsc, watch};
+use tokio_rustls::TlsAcceptor;
 
 use crate::config::ElectrumConfig;
 use crate::dispatch::{Notification, Request, Response, dispatch_with_subscriptions};
@@ -35,11 +36,16 @@ use crate::error::JsonRpcError;
 use crate::rpc::{FramingError, MAX_LINE_BYTES, read_line_bounded, write_line};
 use crate::state::ElectrumState;
 use crate::subscribe::{NOTIFY_CHANNEL_CAP, Subscriptions};
+use crate::tls::{TlsConfigError, build_acceptor};
 
 #[derive(Debug, Error)]
 pub enum ElectrumServerError {
     #[error("bind to {addr}: {source}")]
     Bind { addr: SocketAddr, source: io::Error },
+    #[error("tls config: {0}")]
+    Tls(#[from] TlsConfigError),
+    #[error("tls misconfigured: tls_bind set without tls_cert_path / tls_key_path")]
+    TlsMissingPaths,
 }
 
 /// Boxed sync dispatcher owned by a single connection. `FnMut` so the
@@ -71,8 +77,14 @@ pub fn state_connection_factory(state: Arc<ElectrumState>) -> ConnectionFactory 
 
 /// Pre-bound Electrum TCP server. Construct via [`Self::bind`]; run
 /// via [`Self::serve`] until the supplied shutdown watch flips.
+///
+/// Holds two optional listeners — `listener` for plain TCP (always
+/// present unless removed) and `tls` for the rustls-wrapped variant.
+/// Both share the same connection cap, dispatch factory, and
+/// shutdown watch.
 pub struct ElectrumServer {
     listener: TcpListener,
+    tls: Option<(TcpListener, TlsAcceptor)>,
     factory: ConnectionFactory,
     config: Arc<ElectrumConfig>,
     semaphore: Arc<Semaphore>,
@@ -102,31 +114,71 @@ impl ElectrumServer {
                     addr: config.bind,
                     source,
                 })?;
+
+        // If a TLS bind is configured, ALL of (tls_bind, tls_cert_path,
+        // tls_key_path) must be set; partial configuration is a hard
+        // startup error rather than silently ignored.
+        let tls = match (
+            config.tls_bind,
+            config.tls_cert_path.as_ref(),
+            config.tls_key_path.as_ref(),
+        ) {
+            (None, _, _) => None,
+            (Some(_), None, _) | (Some(_), _, None) => {
+                return Err(ElectrumServerError::TlsMissingPaths);
+            }
+            (Some(addr), Some(cert), Some(key)) => {
+                let acceptor = build_acceptor(cert, key)?;
+                let tls_listener = TcpListener::bind(addr)
+                    .await
+                    .map_err(|source| ElectrumServerError::Bind { addr, source })?;
+                Some((tls_listener, acceptor))
+            }
+        };
+
         let semaphore = Arc::new(Semaphore::new(config.max_conns.max(1)));
         Ok(Self {
             listener,
+            tls,
             factory,
             config: Arc::new(config),
             semaphore,
         })
     }
 
-    /// Returns the bound address. Useful in tests where `bind` was
-    /// `127.0.0.1:0` and the OS picked the port.
+    /// Returns the plain-TCP bound address. Useful in tests where
+    /// `bind` was `127.0.0.1:0` and the OS picked the port.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.listener.local_addr()
     }
 
+    /// Returns the TLS bound address if TLS is configured.
+    pub fn local_tls_addr(&self) -> Option<io::Result<SocketAddr>> {
+        self.tls.as_ref().map(|(l, _)| l.local_addr())
+    }
+
     /// Run the accept loop until `shutdown` flips to `true`. Spawns
     /// one task per connection; per-connection tasks observe the
-    /// same shutdown watch and exit cleanly.
+    /// same shutdown watch and exit cleanly. When TLS is configured,
+    /// both listeners run in parallel — connections route to the
+    /// same per-conn handler regardless of transport.
     pub async fn serve(self, mut shutdown: watch::Receiver<bool>) {
         tracing::info!(
             bind = %self.config.bind,
+            tls_bind = ?self.config.tls_bind,
             max_conns = self.config.max_conns,
             "Electrum server listening"
         );
         loop {
+            // Match shape lets us conditionally enable the TLS arm
+            // without blocking on a never-ready future when TLS isn't
+            // configured.
+            let tls_accept = async {
+                match &self.tls {
+                    Some((listener, _)) => listener.accept().await,
+                    None => std::future::pending().await,
+                }
+            };
             tokio::select! {
                 biased;
                 _ = shutdown.changed() => {
@@ -134,40 +186,109 @@ impl ElectrumServer {
                     return;
                 }
                 accept = self.listener.accept() => {
-                    let (stream, peer) = match accept {
-                        Ok(v) => v,
+                    self.handle_plain_accept(accept, &shutdown);
+                }
+                accept = tls_accept => {
+                    self.handle_tls_accept(accept, &shutdown);
+                }
+            }
+        }
+    }
+
+    fn handle_plain_accept(
+        &self,
+        accept: io::Result<(TcpStream, SocketAddr)>,
+        shutdown: &watch::Receiver<bool>,
+    ) {
+        let (stream, peer) = match accept {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "Electrum accept error");
+                return;
+            }
+        };
+        match self.semaphore.clone().try_acquire_owned() {
+            Ok(permit) => {
+                tracing::debug!(peer = %peer, "Electrum connection accepted");
+                let factory = self.factory.clone();
+                let config = self.config.clone();
+                let conn_shutdown = shutdown.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    let (dispatch, notify_rx) = factory(config.max_subs_per_conn);
+                    if let Err(e) =
+                        handle_connection(stream, dispatch, notify_rx, config, conn_shutdown).await
+                    {
+                        tracing::debug!(peer = %peer, error = %e, "Electrum connection ended");
+                    }
+                });
+            }
+            Err(_) => {
+                tracing::warn!(
+                    peer = %peer,
+                    "Electrum at-capacity rejection ({} max)",
+                    self.config.max_conns
+                );
+                tokio::spawn(async move {
+                    let _ = reject_overflow(stream).await;
+                });
+            }
+        }
+    }
+
+    fn handle_tls_accept(
+        &self,
+        accept: io::Result<(TcpStream, SocketAddr)>,
+        shutdown: &watch::Receiver<bool>,
+    ) {
+        let (stream, peer) = match accept {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "Electrum TLS accept error");
+                return;
+            }
+        };
+        let acceptor = match &self.tls {
+            Some((_, a)) => a.clone(),
+            None => return, // unreachable when accept arm is gated
+        };
+        match self.semaphore.clone().try_acquire_owned() {
+            Ok(permit) => {
+                let factory = self.factory.clone();
+                let config = self.config.clone();
+                let conn_shutdown = shutdown.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    let tls_stream = match acceptor.accept(stream).await {
+                        Ok(s) => s,
                         Err(e) => {
-                            tracing::warn!(error = %e, "Electrum accept error");
-                            continue;
+                            tracing::debug!(peer = %peer, error = %e, "TLS handshake failed");
+                            return;
                         }
                     };
-                    let permit = self.semaphore.clone().try_acquire_owned();
-                    match permit {
-                        Ok(permit) => {
-                            tracing::debug!(peer = %peer, "Electrum connection accepted");
-                            let factory = self.factory.clone();
-                            let config = self.config.clone();
-                            let conn_shutdown = shutdown.clone();
-                            tokio::spawn(async move {
-                                let _permit = permit;
-                                let (dispatch, notify_rx) = factory(config.max_subs_per_conn);
-                                if let Err(e) = handle_connection(stream, dispatch, notify_rx, config, conn_shutdown).await {
-                                    tracing::debug!(peer = %peer, error = %e, "Electrum connection ended");
-                                }
-                            });
-                        }
-                        Err(_) => {
-                            tracing::warn!(
-                                peer = %peer,
-                                "Electrum at-capacity rejection ({} max)",
-                                self.config.max_conns
-                            );
-                            tokio::spawn(async move {
-                                let _ = reject_overflow(stream).await;
-                            });
-                        }
+                    let (dispatch, notify_rx) = factory(config.max_subs_per_conn);
+                    if let Err(e) =
+                        handle_connection(tls_stream, dispatch, notify_rx, config, conn_shutdown)
+                            .await
+                    {
+                        tracing::debug!(peer = %peer, error = %e, "Electrum TLS connection ended");
                     }
-                }
+                });
+            }
+            Err(_) => {
+                tracing::warn!(
+                    peer = %peer,
+                    "Electrum TLS at-capacity rejection ({} max)",
+                    self.config.max_conns
+                );
+                tokio::spawn(async move {
+                    // Same plain-text rejection over an unencrypted
+                    // TCP stream — the client hasn't completed the
+                    // TLS handshake yet, so there's no encryption
+                    // context to use. They'll see a plain-JSON line
+                    // before the connection drops.
+                    let _ = reject_overflow(stream).await;
+                });
             }
         }
     }
@@ -186,15 +307,17 @@ impl ElectrumServer {
 ///   lines here; we write them straight to the wire.
 /// - `read_line_bounded` — inbound request from the client; parse,
 ///   dispatch, write response.
-async fn handle_connection(
-    stream: TcpStream,
+async fn handle_connection<S>(
+    stream: S,
     mut dispatch: BoxedDispatch,
     mut notify_rx: mpsc::Receiver<String>,
     _config: Arc<ElectrumConfig>,
     mut shutdown: watch::Receiver<bool>,
-) -> Result<(), FramingError> {
-    let _ = stream.set_nodelay(true);
-    let (read_half, mut write_half) = stream.into_split();
+) -> Result<(), FramingError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (read_half, mut write_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half);
     let mut buf: Vec<u8> = Vec::with_capacity(2048);
 
@@ -248,16 +371,15 @@ pub fn render_notification(n: &Notification) -> Result<String, serde_json::Error
     serde_json::to_string(n)
 }
 
-async fn reject_overflow(stream: TcpStream) -> io::Result<()> {
-    let (_rd, mut wr) = stream.into_split();
+async fn reject_overflow(mut stream: TcpStream) -> io::Result<()> {
     let err = JsonRpcError::new(4, "server is at connection capacity; please retry shortly");
     let resp = Response::error(Value::Null, err);
     if let Ok(s) = serde_json::to_string(&resp) {
-        let _ = wr.write_all(s.as_bytes()).await;
-        let _ = wr.write_all(b"\n").await;
-        let _ = wr.flush().await;
+        let _ = stream.write_all(s.as_bytes()).await;
+        let _ = stream.write_all(b"\n").await;
+        let _ = stream.flush().await;
     }
-    wr.shutdown().await
+    stream.shutdown().await
 }
 
 #[cfg(test)]
@@ -414,6 +536,89 @@ mod tests {
         drop(hold_stream);
         sd_tx.send(true).unwrap();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), join).await;
+    }
+
+    #[tokio::test]
+    async fn tls_round_trips_a_request() {
+        use std::io::Write;
+        use tokio_rustls::TlsConnector;
+        use tokio_rustls::rustls::ClientConfig;
+        use tokio_rustls::rustls::pki_types::ServerName;
+
+        // Generate a self-signed cert with rcgen and write it + the
+        // private key to temp PEM files. ElectrumServer reads from
+        // disk so this exercises the same load_certs / load_private_key
+        // path as production.
+        let san = ["localhost".to_string()];
+        let cert = rcgen::generate_simple_self_signed(san).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        std::fs::File::create(&cert_path)
+            .unwrap()
+            .write_all(cert.cert.pem().as_bytes())
+            .unwrap();
+        std::fs::File::create(&key_path)
+            .unwrap()
+            .write_all(cert.key_pair.serialize_pem().as_bytes())
+            .unwrap();
+
+        let cfg = ElectrumConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            tls_bind: Some("127.0.0.1:0".parse().unwrap()),
+            tls_cert_path: Some(cert_path),
+            tls_key_path: Some(key_path),
+            max_conns: 4,
+            ..Default::default()
+        };
+        let server = ElectrumServer::bind_with_factory(cfg, echo_factory())
+            .await
+            .unwrap();
+        let tls_addr = server.local_tls_addr().unwrap().unwrap();
+        let (sd_tx, sd_rx) = watch::channel(false);
+        let join = tokio::spawn(server.serve(sd_rx));
+
+        // Trust the test's self-signed cert in the client store.
+        let mut roots = tokio_rustls::rustls::RootCertStore::empty();
+        let der = cert.cert.der().clone();
+        roots.add(der).unwrap();
+        let client_cfg = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = TlsConnector::from(Arc::new(client_cfg));
+
+        let tcp = TcpStream::connect(tls_addr).await.unwrap();
+        let dnsname = ServerName::try_from("localhost").unwrap();
+        let mut tls_stream = connector.connect(dnsname, tcp).await.unwrap();
+        let req = json!({"jsonrpc":"2.0","id":42,"method":"server.ping","params":[]});
+        let s = serde_json::to_string(&req).unwrap();
+        tls_stream.write_all(s.as_bytes()).await.unwrap();
+        tls_stream.write_all(b"\n").await.unwrap();
+        tls_stream.flush().await.unwrap();
+        let mut reader = tokio::io::BufReader::new(tls_stream);
+        let mut line = String::new();
+        tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_str(line.trim_end()).unwrap();
+        assert_eq!(v["id"], 42);
+        assert_eq!(v["result"]["method"], "server.ping");
+
+        sd_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), join).await;
+    }
+
+    #[tokio::test]
+    async fn tls_partial_config_is_a_hard_error() {
+        let cfg = ElectrumConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            tls_bind: Some("127.0.0.1:0".parse().unwrap()),
+            tls_cert_path: None, // missing key path too
+            tls_key_path: None,
+            ..Default::default()
+        };
+        let result = ElectrumServer::bind_with_factory(cfg, echo_factory()).await;
+        assert!(matches!(result, Err(ElectrumServerError::TlsMissingPaths)));
     }
 
     #[tokio::test]
