@@ -29,13 +29,22 @@
 //! - PR-5: TLS support (`tokio-rustls`).
 //! - PR-6: wiring in `satd/main.rs` + ops docs.
 
+pub mod config;
+pub mod dispatch;
+pub mod error;
 pub mod extras;
+pub mod handlers;
 pub mod merkle;
+pub mod state;
 pub mod status;
 pub mod types;
 
+pub use config::ElectrumConfig;
+pub use dispatch::{Notification, Request, Response, dispatch};
+pub use error::JsonRpcError;
 pub use extras::{ElectrumExtras, RocksElectrumExtras, TxConfirmation, TxMerkleProof};
 pub use merkle::{compute_merkle_branch, merkle_root};
+pub use state::ElectrumState;
 pub use status::compute_status_hash;
 pub use types::{
     BalanceResponse, FeeHistogramEntry, GetMerkleResponse, HeadersResponse, HistoryEntry,
