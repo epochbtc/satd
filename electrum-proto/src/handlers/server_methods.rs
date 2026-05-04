@@ -28,11 +28,15 @@ pub fn version(_state: &ElectrumState, params: Value) -> Result<Value, JsonRpcEr
     let proto_arg = arr.get(1).cloned().unwrap_or(Value::Null);
 
     let supported = PROTOCOL_VERSION;
+    // Per the Electrum spec, the client's protocol_version arg is
+    // either a single string (the minimum version the client requires)
+    // or an explicit `[min, max]` pair. In the single-string case
+    // there is no upper bound — the server picks its own version
+    // unconditionally as long as it's >= the client's min.
     let intersect_ok = match &proto_arg {
         Value::Null => true,
-        Value::String(s) => version_in_range(s, s, supported),
+        Value::String(min) => !matches!(version_compare(supported, min), std::cmp::Ordering::Less),
         Value::Array(a) => {
-            // [min, max] form
             let min = a.first().and_then(|v| v.as_str()).unwrap_or(supported);
             let max = a.get(1).and_then(|v| v.as_str()).unwrap_or(supported);
             version_in_range(min, max, supported)

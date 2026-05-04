@@ -33,7 +33,9 @@ impl DbCacheSize {
         let trimmed = s.trim();
         if trimmed.eq_ignore_ascii_case("auto") {
             let default_max_mb = default_auto_max_mb();
-            Some(Self::Auto { max_mb: default_max_mb })
+            Some(Self::Auto {
+                max_mb: default_max_mb,
+            })
         } else {
             trimmed.parse::<usize>().ok().map(Self::Fixed)
         }
@@ -316,6 +318,38 @@ pub struct Config {
     pub esplora_cookie_file: Option<std::path::PathBuf>,
     /// `user:pass` for `esplora_auth = userpass`.
     pub esplora_userpass: Option<(String, String)>,
+    /// Native Electrum protocol server (per `ECOSYSTEM.md` §4 / §4a).
+    /// Off by default; `--electrum=1` enables. Requires
+    /// `--addressindex=1` AND a complete `--txindex` for the
+    /// confirmed-tx and merkle-proof endpoints. Both invariants
+    /// are enforced at startup.
+    pub electrum: bool,
+    /// `host:port` for the plain-TCP Electrum listener. Defaults to
+    /// loopback on port 50001 (Electrum's standard plain-TCP port);
+    /// expose via Tor / .onion rather than directly on the LAN per
+    /// the operator advice in `OPERATOR_ERGONOMICS.md`.
+    pub electrum_bind: String,
+    /// Optional TLS bind. When set, `electrum_tls_cert` and
+    /// `electrum_tls_key` MUST also be set. Standard Electrum TLS
+    /// port is 50002.
+    pub electrum_tls_bind: Option<String>,
+    /// Path to PEM-encoded TLS certificate (operator-supplied;
+    /// self-signed-on-first-start is deferred).
+    pub electrum_tls_cert: Option<std::path::PathBuf>,
+    /// Path to PEM-encoded TLS private key.
+    pub electrum_tls_key: Option<std::path::PathBuf>,
+    /// Hard cap on simultaneously-open connections.
+    pub electrum_max_conns: usize,
+    /// Per-connection scripthash subscription cap.
+    pub electrum_max_subs_per_conn: usize,
+    /// Per-request timeout (seconds). Currently advisory in v1 — the
+    /// transport reads each line then dispatches synchronously; we
+    /// rely on bounded I/O caps instead of a strict deadline.
+    pub electrum_request_timeout: u64,
+    /// Override for `server.banner`. `None` falls back to a default
+    /// composed at request time (`format!("powered by satd {}",
+    /// version)`).
+    pub electrum_banner: Option<String>,
     pub prune: u64,
     pub reindex: bool,
     pub reindex_chainstate: bool,
@@ -469,8 +503,7 @@ impl Config {
             .as_ref()
             .map(|p| Profile::parse(p))
             .transpose()?;
-        let profile_defaults: ProfileDefaults =
-            profile.map(|p| p.defaults()).unwrap_or_default();
+        let profile_defaults: ProfileDefaults = profile.map(|p| p.defaults()).unwrap_or_default();
 
         // Determine network from CLI flags
         let network = if cli.regtest || profile_defaults.network_regtest {
@@ -511,11 +544,7 @@ impl Config {
                     .get(section)
                     .and_then(|s| s.get(key))
                     .and_then(|v| v.last().cloned())
-                    .or_else(|| {
-                        cf.global
-                            .get(key)
-                            .and_then(|v| v.last().cloned())
-                    })
+                    .or_else(|| cf.global.get(key).and_then(|v| v.last().cloned()))
             })
         };
 
@@ -525,9 +554,10 @@ impl Config {
                 .map(|cf| {
                     let mut vals = cf.global.get(key).cloned().unwrap_or_default();
                     if let Some(s) = cf.sections.get(section)
-                        && let Some(sv) = s.get(key) {
-                            vals.extend(sv.iter().cloned());
-                        }
+                        && let Some(sv) = s.get(key)
+                    {
+                        vals.extend(sv.iter().cloned());
+                    }
                     vals
                 })
                 .unwrap_or_default()
@@ -629,8 +659,7 @@ impl Config {
         // Without this, the Esplora hard-fail below would refuse to
         // start despite the operator's clear intent.
         let txindex_file = file_get("txindex").and_then(|v| parse_bool(&v));
-        let txindex_explicitly_disabled =
-            !cli.txindex && matches!(txindex_file, Some(false));
+        let txindex_explicitly_disabled = !cli.txindex && matches!(txindex_file, Some(false));
         let mut txindex = cli.txindex
             || matches!(txindex_file, Some(true))
             || profile_defaults.txindex.unwrap_or(false);
@@ -649,9 +678,7 @@ impl Config {
         // Electrum/Esplora endpoints may want to raise this.
         let addrindexsubscriptions = cli
             .addrindexsubscriptions
-            .or_else(|| {
-                file_get("addrindexsubscriptions").and_then(|v| v.parse().ok())
-            })
+            .or_else(|| file_get("addrindexsubscriptions").and_then(|v| v.parse().ok()))
             .unwrap_or(10_000);
 
         // Esplora REST server: on by default. Disabling requires
@@ -679,9 +706,7 @@ impl Config {
         };
         let esplora_request_timeout = cli
             .esplorarequesttimeout
-            .or_else(|| {
-                file_get("esplorarequesttimeout").and_then(|v| v.parse().ok())
-            })
+            .or_else(|| file_get("esplorarequesttimeout").and_then(|v| v.parse().ok()))
             .unwrap_or(30);
         let esplora_max_conns = cli
             .esploramaxconns
@@ -706,15 +731,50 @@ impl Config {
             .map(|s| {
                 s.split_once(':')
                     .map(|(u, p)| (u.to_string(), p.to_string()))
-                    .ok_or_else(|| {
-                        "esplorauserpass: expected user:pass form".to_string()
-                    })
+                    .ok_or_else(|| "esplorauserpass: expected user:pass form".to_string())
             })
             .transpose()?;
-        if matches!(esplora_auth, EsploraAuthMode::UserPass) && esplora_userpass.is_none()
+        if matches!(esplora_auth, EsploraAuthMode::UserPass) && esplora_userpass.is_none() {
+            return Err("--esploraauth=userpass requires --esplorauserpass=user:pass".to_string());
+        }
+
+        // ── Electrum ─────────────────────────────────────────────
+        let electrum = cli
+            .electrum
+            .or_else(|| file_get("electrum").and_then(|v| parse_bool(&v)))
+            .unwrap_or(false);
+        let electrum_bind = cli
+            .electrumbind
+            .or_else(|| file_get("electrumbind"))
+            .unwrap_or_else(|| "127.0.0.1:50001".to_string());
+        let electrum_tls_bind = cli.electrumtlsbind.or_else(|| file_get("electrumtlsbind"));
+        let electrum_tls_cert = cli
+            .electrumtlscert
+            .or_else(|| file_get("electrumtlscert").map(std::path::PathBuf::from));
+        let electrum_tls_key = cli
+            .electrumtlskey
+            .or_else(|| file_get("electrumtlskey").map(std::path::PathBuf::from));
+        let electrum_max_conns = cli
+            .electrummaxconns
+            .or_else(|| file_get("electrummaxconns").and_then(|v| v.parse().ok()))
+            .unwrap_or(64);
+        let electrum_max_subs_per_conn = cli
+            .electrummaxsubsperconn
+            .or_else(|| file_get("electrummaxsubsperconn").and_then(|v| v.parse().ok()))
+            .unwrap_or(100);
+        let electrum_request_timeout = cli
+            .electrumrequesttimeout
+            .or_else(|| file_get("electrumrequesttimeout").and_then(|v| v.parse().ok()))
+            .unwrap_or(30);
+        let electrum_banner = cli.electrumbanner.or_else(|| file_get("electrumbanner"));
+        // TLS partial-config validation. The server-side `bind` also
+        // catches this, but checking here lets us surface a friendlier
+        // CLI message and refuse to start up.
+        if electrum_tls_bind.is_some()
+            && (electrum_tls_cert.is_none() || electrum_tls_key.is_none())
         {
             return Err(
-                "--esploraauth=userpass requires --esplorauserpass=user:pass".to_string(),
+                "--electrumtlsbind requires --electrumtlscert AND --electrumtlskey".to_string(),
             );
         }
 
@@ -756,20 +816,55 @@ impl Config {
         } else if esplora_resolved && !txindex && !txindex_explicitly_disabled {
             pending_notes.push(ConfigNote {
                 level: NoteLevel::Info,
-                message:
-                    "esplora is enabled; auto-enabling --txindex (required for tx endpoints)"
-                        .to_string(),
+                message: "esplora is enabled; auto-enabling --txindex (required for tx endpoints)"
+                    .to_string(),
             });
             txindex = true;
         } else if esplora_resolved && txindex_explicitly_disabled {
-            return Err(
-                "esplora=1 with txindex=0 in config: refusing to start. \
+            return Err("esplora=1 with txindex=0 in config: refusing to start. \
                  Either remove the txindex=0 line or set esplora=0, \
                  or pass --txindex on the CLI to override the config."
+                .into());
+        }
+        let esplora = esplora_resolved;
+
+        // Electrum ↔ txindex / addressindex coupling. Same shape as
+        // the esplora block above. Electrum's transaction.* and
+        // get_merkle endpoints need txindex; scripthash.* needs
+        // addressindex.
+        let mut electrum_resolved = electrum;
+        if electrum_resolved && prune > 0 {
+            pending_notes.push(ConfigNote {
+                level: NoteLevel::Warn,
+                message: format!(
+                    "electrum requires --txindex, which is incompatible with --prune={prune}; \
+                     disabling electrum. Set --electrum=0 explicitly to silence this warning."
+                ),
+            });
+            electrum_resolved = false;
+        } else if electrum_resolved && !txindex && !txindex_explicitly_disabled {
+            pending_notes.push(ConfigNote {
+                level: NoteLevel::Info,
+                message:
+                    "electrum is enabled; auto-enabling --txindex (required for tx + merkle endpoints)"
+                        .to_string(),
+            });
+            txindex = true;
+        } else if electrum_resolved && txindex_explicitly_disabled {
+            return Err("electrum=1 with txindex=0 in config: refusing to start. \
+                 Either remove the txindex=0 line or set electrum=0, \
+                 or pass --txindex on the CLI to override the config."
+                .into());
+        }
+        if electrum_resolved && !addressindex {
+            return Err(
+                "electrum=1 with addressindex=0 in config: refusing to start. \
+                 Electrum reads through the address index — enable it with \
+                 --addressindex=1, or set --electrum=0."
                     .into(),
             );
         }
-        let esplora = esplora_resolved;
+        let electrum = electrum_resolved;
 
         // Validate prune + txindex conflict (now redundant with the
         // esplora reconciliation above for the esplora=1 path, but
@@ -780,9 +875,7 @@ impl Config {
 
         // Validate auth consistency
         if rpcuser.is_some() != rpcpassword.is_some() {
-            return Err(
-                "rpcuser and rpcpassword must both be set or both be unset".to_string(),
-            );
+            return Err("rpcuser and rpcpassword must both be set or both be unset".to_string());
         }
 
         Ok(Config {
@@ -820,6 +913,15 @@ impl Config {
             esplora_auth,
             esplora_cookie_file,
             esplora_userpass,
+            electrum,
+            electrum_bind,
+            electrum_tls_bind,
+            electrum_tls_cert,
+            electrum_tls_key,
+            electrum_max_conns,
+            electrum_max_subs_per_conn,
+            electrum_request_timeout,
+            electrum_banner,
             prune,
             reindex: cli.reindex,
             reindex_chainstate: cli.reindex_chainstate,
@@ -872,7 +974,9 @@ impl Config {
                 .unwrap_or(1_000),
             pid: cli.pid.or_else(|| file_get("pid")),
             mcp: cli.mcp
-                || file_get("mcp").and_then(|v| parse_bool(&v)).unwrap_or(false),
+                || file_get("mcp")
+                    .and_then(|v| parse_bool(&v))
+                    .unwrap_or(false),
             mcp_stdio: cli
                 .mcpstdio
                 .or_else(|| file_get("mcpstdio").and_then(|v| parse_bool(&v)))
@@ -909,9 +1013,14 @@ impl Config {
             prefetch_workers: cli
                 .prefetchworkers
                 .or_else(|| file_get("prefetchworkers").and_then(|v| v.parse().ok()))
-                .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)),
+                .unwrap_or_else(|| {
+                    std::thread::available_parallelism()
+                        .map(|n| n.get())
+                        .unwrap_or(4)
+                }),
             max_ahead: {
-                let raw = cli.maxahead
+                let raw = cli
+                    .maxahead
                     .or_else(|| file_get("maxahead"))
                     .unwrap_or_else(|| "50000".to_string());
                 if raw == "all" {
@@ -926,7 +1035,8 @@ impl Config {
                 }
             },
             consensus: {
-                let raw = cli.consensus
+                let raw = cli
+                    .consensus
                     .or_else(|| file_get("consensus"))
                     .unwrap_or_else(|| "rust-shadow".to_string());
                 ConsensusEngine::from_str(&raw).unwrap_or_else(|| {
@@ -942,12 +1052,20 @@ impl Config {
                 .shadowworkers
                 .or_else(|| file_get("shadowworkers").and_then(|v| v.parse().ok()))
                 // --par as fallback for shadow workers (was previously a no-op)
-                .or_else(|| cli.par.or_else(|| file_get("par").and_then(|v| v.parse().ok())).filter(|&n| n > 0))
+                .or_else(|| {
+                    cli.par
+                        .or_else(|| file_get("par").and_then(|v| v.parse().ok()))
+                        .filter(|&n| n > 0)
+                })
                 .unwrap_or(4),
             server: cli.server
-                || file_get("server").and_then(|v| parse_bool(&v)).unwrap_or(false),
+                || file_get("server")
+                    .and_then(|v| parse_bool(&v))
+                    .unwrap_or(false),
             daemon: cli.daemon
-                || file_get("daemon").and_then(|v| parse_bool(&v)).unwrap_or(false),
+                || file_get("daemon")
+                    .and_then(|v| parse_bool(&v))
+                    .unwrap_or(false),
             metricsport: cli
                 .metricsport
                 .or_else(|| file_get("metricsport").and_then(|v| v.parse().ok())),
@@ -985,34 +1103,30 @@ impl Config {
                 .or_else(|| file_get("reorgwebhooksecret")),
             events_node_id: cli.events_node_id.or_else(|| file_get("eventsnodeid")),
             events_region: cli.events_region.or_else(|| file_get("eventsregion")),
-            events_grpc_bind: cli
-                .events_grpc_bind
-                .or_else(|| file_get("eventsgrpcbind")),
+            events_grpc_bind: cli.events_grpc_bind.or_else(|| file_get("eventsgrpcbind")),
             events_grpc_allow_remote: cli.events_grpc_allow_remote
                 || file_get("eventsgrpcallowremote")
                     .and_then(|v| parse_bool(&v))
                     .unwrap_or(false),
-            events_zmq_bind: cli
-                .events_zmq_bind
-                .or_else(|| file_get("eventszmqbind")),
+            events_zmq_bind: cli.events_zmq_bind.or_else(|| file_get("eventszmqbind")),
             events_zmq_hashtx: cli
                 .events_zmq_hashtx
                 .or_else(|| file_get("eventszmqhashtx").and_then(|v| parse_bool(&v))),
-            events_zmq_hashblock: cli.events_zmq_hashblock.or_else(|| {
-                file_get("eventszmqhashblock").and_then(|v| parse_bool(&v))
-            }),
+            events_zmq_hashblock: cli
+                .events_zmq_hashblock
+                .or_else(|| file_get("eventszmqhashblock").and_then(|v| parse_bool(&v))),
             events_zmq_mpevict: cli
                 .events_zmq_mpevict
                 .or_else(|| file_get("eventszmqmpevict").and_then(|v| parse_bool(&v))),
-            events_zmq_mpreplace: cli.events_zmq_mpreplace.or_else(|| {
-                file_get("eventszmqmpreplace").and_then(|v| parse_bool(&v))
-            }),
-            events_zmq_mpconfirm: cli.events_zmq_mpconfirm.or_else(|| {
-                file_get("eventszmqmpconfirm").and_then(|v| parse_bool(&v))
-            }),
-            events_zmq_nodeevent: cli.events_zmq_nodeevent.or_else(|| {
-                file_get("eventszmqnodeevent").and_then(|v| parse_bool(&v))
-            }),
+            events_zmq_mpreplace: cli
+                .events_zmq_mpreplace
+                .or_else(|| file_get("eventszmqmpreplace").and_then(|v| parse_bool(&v))),
+            events_zmq_mpconfirm: cli
+                .events_zmq_mpconfirm
+                .or_else(|| file_get("eventszmqmpconfirm").and_then(|v| parse_bool(&v))),
+            events_zmq_nodeevent: cli
+                .events_zmq_nodeevent
+                .or_else(|| file_get("eventszmqnodeevent").and_then(|v| parse_bool(&v))),
             pending_notes,
         })
     }
@@ -1131,41 +1245,89 @@ pub struct CliArgs {
     #[arg(long, value_name = "ADDR", help = "Connect to specific peer")]
     pub connect: Vec<String>,
 
-    #[arg(long, value_name = "HASH", help = "Skip script verification up to HASH (default: per-network hash, 0=verify all, all=skip old blocks)")]
+    #[arg(
+        long,
+        value_name = "HASH",
+        help = "Skip script verification up to HASH (default: per-network hash, 0=verify all, all=skip old blocks)"
+    )]
     pub assumevalid: Option<String>,
 
-    #[arg(long, value_name = "SECS", help = "With --assumevalid=all, verify scripts for blocks newer than SECS (default: 86400)")]
+    #[arg(
+        long,
+        value_name = "SECS",
+        help = "With --assumevalid=all, verify scripts for blocks newer than SECS (default: 86400)"
+    )]
     pub assumevalidage: Option<u64>,
 
     // Mempool policy flags (Bitcoin Core compatible + extensions)
-    #[arg(long, value_name = "BOOL", help = "Enable full replace-by-fee (default: true)")]
+    #[arg(
+        long,
+        value_name = "BOOL",
+        help = "Enable full replace-by-fee (default: true)"
+    )]
     pub mempoolfullrbf: Option<bool>,
 
-    #[arg(long, value_name = "MB", help = "Maximum mempool size in MB (default: 300)")]
+    #[arg(
+        long,
+        value_name = "MB",
+        help = "Maximum mempool size in MB (default: 300)"
+    )]
     pub maxmempool: Option<usize>,
 
-    #[arg(long, value_name = "RATE", help = "Minimum relay fee rate in sat/kvB (default: 1000)")]
+    #[arg(
+        long,
+        value_name = "RATE",
+        help = "Minimum relay fee rate in sat/kvB (default: 1000)"
+    )]
     pub minrelaytxfee: Option<u64>,
 
-    #[arg(long, value_name = "RATE", help = "Dust relay fee rate in sat/kvB (default: 3000)")]
+    #[arg(
+        long,
+        value_name = "RATE",
+        help = "Dust relay fee rate in sat/kvB (default: 3000)"
+    )]
     pub dustrelayfee: Option<u64>,
 
-    #[arg(long, value_name = "BYTES", help = "Maximum OP_RETURN size in bytes (default: 83, 0 = reject all)")]
+    #[arg(
+        long,
+        value_name = "BYTES",
+        help = "Maximum OP_RETURN size in bytes (default: 83, 0 = reject all)"
+    )]
     pub datacarriersize: Option<usize>,
 
-    #[arg(long, value_name = "BOOL", help = "Accept OP_RETURN outputs (default: true)")]
+    #[arg(
+        long,
+        value_name = "BOOL",
+        help = "Accept OP_RETURN outputs (default: true)"
+    )]
     pub datacarrier: Option<bool>,
 
-    #[arg(long, value_name = "N", help = "Maximum unconfirmed ancestor count (default: 25)")]
+    #[arg(
+        long,
+        value_name = "N",
+        help = "Maximum unconfirmed ancestor count (default: 25)"
+    )]
     pub limitancestorcount: Option<usize>,
 
-    #[arg(long, value_name = "N", help = "Maximum unconfirmed descendant count (default: 25)")]
+    #[arg(
+        long,
+        value_name = "N",
+        help = "Maximum unconfirmed descendant count (default: 25)"
+    )]
     pub limitdescendantcount: Option<usize>,
 
-    #[arg(long, value_name = "HOURS", help = "Mempool expiry in hours (default: 336)")]
+    #[arg(
+        long,
+        value_name = "HOURS",
+        help = "Mempool expiry in hours (default: 336)"
+    )]
     pub mempoolexpiry: Option<u64>,
 
-    #[arg(long, value_name = "BOOL", help = "Allow bare multisig outputs (default: true)")]
+    #[arg(
+        long,
+        value_name = "BOOL",
+        help = "Allow bare multisig outputs (default: true)"
+    )]
     pub permitbaremultisig: Option<bool>,
 
     #[arg(long, help = "Maintain a full transaction index")]
@@ -1184,82 +1346,231 @@ pub struct CliArgs {
     #[arg(long, value_name = "BOOL", value_parser = parse_bool_arg, help = "Run the native Esplora REST server (default: true). Requires --addressindex=1.")]
     pub esplora: Option<bool>,
 
-    #[arg(long, value_name = "ADDR:PORT", help = "Bind the Esplora REST listener (default: 127.0.0.1:3000)")]
+    #[arg(
+        long,
+        value_name = "ADDR:PORT",
+        help = "Bind the Esplora REST listener (default: 127.0.0.1:3000)"
+    )]
     pub esplorabind: Option<String>,
 
-    #[arg(long, value_name = "PATH", help = "URL prefix to mount the Esplora API under (default: /)")]
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "URL prefix to mount the Esplora API under (default: /)"
+    )]
     pub esploraprefix: Option<String>,
 
-    #[arg(long, value_name = "ORIGIN", help = "Allowed CORS origin for the Esplora server (repeat for multiple)")]
+    #[arg(
+        long,
+        value_name = "ORIGIN",
+        help = "Allowed CORS origin for the Esplora server (repeat for multiple)"
+    )]
     pub esploracors: Vec<String>,
 
-    #[arg(long, value_name = "SECS", help = "Per-request handler timeout for Esplora (default: 30)")]
+    #[arg(
+        long,
+        value_name = "SECS",
+        help = "Per-request handler timeout for Esplora (default: 30)"
+    )]
     pub esplorarequesttimeout: Option<u64>,
 
-    #[arg(long, value_name = "N", help = "Hard cap on concurrent in-flight Esplora requests (default: 256)")]
+    #[arg(
+        long,
+        value_name = "N",
+        help = "Hard cap on concurrent in-flight Esplora requests (default: 256)"
+    )]
     pub esploramaxconns: Option<usize>,
 
-    #[arg(long, value_name = "N", help = "Hard cap on simultaneously-open Esplora SSE streams (default: same as --esploramaxconns; 0 disables)")]
+    #[arg(
+        long,
+        value_name = "N",
+        help = "Hard cap on simultaneously-open Esplora SSE streams (default: same as --esploramaxconns; 0 disables)"
+    )]
     pub esplorasseconns: Option<usize>,
 
-    #[arg(long, value_name = "MODE", help = "Esplora authentication: none|cookie|userpass (default: none)")]
+    #[arg(
+        long,
+        value_name = "MODE",
+        help = "Esplora authentication: none|cookie|userpass (default: none)"
+    )]
     pub esploraauth: Option<String>,
 
-    #[arg(long, value_name = "PATH", help = "Path to cookie file when --esploraauth=cookie (default: shared with JSON-RPC)")]
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Path to cookie file when --esploraauth=cookie (default: shared with JSON-RPC)"
+    )]
     pub esploracookiefile: Option<std::path::PathBuf>,
 
-    #[arg(long, value_name = "USER:PASS", help = "Static credentials when --esploraauth=userpass")]
+    #[arg(
+        long,
+        value_name = "USER:PASS",
+        help = "Static credentials when --esploraauth=userpass"
+    )]
     pub esplorauserpass: Option<String>,
 
-    #[arg(long, value_name = "MB", help = "Prune block data to target size in MB (0 = no pruning, default: 0)")]
+    #[arg(long, value_name = "BOOL", value_parser = parse_bool_arg, help = "Run the native Electrum protocol server (default: false). Requires --addressindex=1 and --txindex=1.")]
+    pub electrum: Option<bool>,
+
+    #[arg(
+        long,
+        value_name = "ADDR:PORT",
+        help = "Bind the Electrum plain-TCP listener (default: 127.0.0.1:50001)"
+    )]
+    pub electrumbind: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "ADDR:PORT",
+        help = "Bind the Electrum TLS listener (requires --electrumtlscert and --electrumtlskey)"
+    )]
+    pub electrumtlsbind: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Path to PEM-encoded TLS certificate for the Electrum server"
+    )]
+    pub electrumtlscert: Option<std::path::PathBuf>,
+
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Path to PEM-encoded TLS private key for the Electrum server"
+    )]
+    pub electrumtlskey: Option<std::path::PathBuf>,
+
+    #[arg(
+        long,
+        value_name = "N",
+        help = "Hard cap on simultaneously-open Electrum connections (default: 64)"
+    )]
+    pub electrummaxconns: Option<usize>,
+
+    #[arg(
+        long,
+        value_name = "N",
+        help = "Per-connection scripthash subscription cap (default: 100)"
+    )]
+    pub electrummaxsubsperconn: Option<usize>,
+
+    #[arg(
+        long,
+        value_name = "SECS",
+        help = "Per-request handler timeout for Electrum (default: 30)"
+    )]
+    pub electrumrequesttimeout: Option<u64>,
+
+    #[arg(
+        long,
+        value_name = "TEXT",
+        help = "Custom banner returned by server.banner"
+    )]
+    pub electrumbanner: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "MB",
+        help = "Prune block data to target size in MB (0 = no pruning, default: 0)"
+    )]
     pub prune: Option<u64>,
 
-    #[arg(long, help = "Rebuild block index and chain state from block files on disk")]
+    #[arg(
+        long,
+        help = "Rebuild block index and chain state from block files on disk"
+    )]
     pub reindex: bool,
 
-    #[arg(long = "reindex-chainstate", help = "Rebuild UTXO set from existing block files")]
+    #[arg(
+        long = "reindex-chainstate",
+        help = "Rebuild UTXO set from existing block files"
+    )]
     pub reindex_chainstate: bool,
 
     // P2P flags
-    #[arg(long, value_name = "N", help = "Maximum total connections (default: 125)")]
+    #[arg(
+        long,
+        value_name = "N",
+        help = "Maximum total connections (default: 125)"
+    )]
     pub maxconnections: Option<usize>,
 
-    #[arg(long, value_name = "ADDR", help = "Bind P2P to this address (default: 0.0.0.0)")]
+    #[arg(
+        long,
+        value_name = "ADDR",
+        help = "Bind P2P to this address (default: 0.0.0.0)"
+    )]
     pub bind: Option<String>,
 
-    #[arg(long, value_name = "SECS", help = "P2P connection timeout in seconds (default: 10)")]
+    #[arg(
+        long,
+        value_name = "SECS",
+        help = "P2P connection timeout in seconds (default: 10)"
+    )]
     pub timeout: Option<u64>,
 
-    #[arg(long, value_name = "ADDR", help = "Add a node to connect to (does not disable DNS seeding)")]
+    #[arg(
+        long,
+        value_name = "ADDR",
+        help = "Add a node to connect to (does not disable DNS seeding)"
+    )]
     pub addnode: Vec<String>,
 
     #[arg(long, value_name = "BOOL", help = "Allow DNS seeding (default: true)")]
     pub dns: Option<bool>,
 
-    #[arg(long, value_name = "SECS", help = "Ban duration in seconds (default: 86400)")]
+    #[arg(
+        long,
+        value_name = "SECS",
+        help = "Ban duration in seconds (default: 86400)"
+    )]
     pub bantime: Option<u64>,
 
     // Proxy / Tor flags
-    #[arg(long, value_name = "ADDR:PORT", help = "SOCKS5 proxy for all outbound connections (e.g. 127.0.0.1:9050)")]
+    #[arg(
+        long,
+        value_name = "ADDR:PORT",
+        help = "SOCKS5 proxy for all outbound connections (e.g. 127.0.0.1:9050)"
+    )]
     pub proxy: Option<String>,
 
-    #[arg(long, value_name = "ADDR:PORT", help = "SOCKS5 proxy for .onion connections (defaults to -proxy)")]
+    #[arg(
+        long,
+        value_name = "ADDR:PORT",
+        help = "SOCKS5 proxy for .onion connections (defaults to -proxy)"
+    )]
     pub onion: Option<String>,
 
-    #[arg(long, value_name = "ADDR:PORT", help = "Tor control port for hidden service (e.g. 127.0.0.1:9051)")]
+    #[arg(
+        long,
+        value_name = "ADDR:PORT",
+        help = "Tor control port for hidden service (e.g. 127.0.0.1:9051)"
+    )]
     pub torcontrol: Option<String>,
 
     #[arg(long, value_name = "PASS", help = "Tor control port password")]
     pub torpassword: Option<String>,
 
-    #[arg(long, value_name = "NET", help = "Restrict to network types: ipv4, ipv6, onion")]
+    #[arg(
+        long,
+        value_name = "NET",
+        help = "Restrict to network types: ipv4, ipv6, onion"
+    )]
     pub onlynet: Vec<String>,
 
     // Mining flags
-    #[arg(long, value_name = "WU", help = "Maximum block weight for templates (default: 4000000)")]
+    #[arg(
+        long,
+        value_name = "WU",
+        help = "Maximum block weight for templates (default: 4000000)"
+    )]
     pub blockmaxweight: Option<usize>,
 
-    #[arg(long, value_name = "RATE", help = "Minimum tx fee for block template in sat/kvB (default: 1000)")]
+    #[arg(
+        long,
+        value_name = "RATE",
+        help = "Minimum tx fee for block template in sat/kvB (default: 1000)"
+    )]
     pub blockmintxfee: Option<u64>,
 
     // Misc flags
@@ -1267,106 +1578,230 @@ pub struct CliArgs {
     pub pid: Option<String>,
 
     // Cache
-    #[arg(long, value_name = "MB|auto", help = "Total write cache size: integer MB, or 'auto' for adaptive sizing (default: 450)")]
+    #[arg(
+        long,
+        value_name = "MB|auto",
+        help = "Total write cache size: integer MB, or 'auto' for adaptive sizing (default: 450)"
+    )]
     pub dbcache: Option<String>,
 
-    #[arg(long, value_name = "N", help = "Number of IBD prefetch worker threads (default: CPU core count)")]
+    #[arg(
+        long,
+        value_name = "N",
+        help = "Number of IBD prefetch worker threads (default: CPU core count)"
+    )]
     pub prefetchworkers: Option<usize>,
 
-    #[arg(long, value_name = "VALUE", help = "Max blocks ahead during IBD: number, 'N%', or 'all' (default: 50000)")]
+    #[arg(
+        long,
+        value_name = "VALUE",
+        help = "Max blocks ahead during IBD: number, 'N%', or 'all' (default: 50000)"
+    )]
     pub maxahead: Option<String>,
 
-    #[arg(long, value_name = "ENGINE", help = "Consensus engine: cpp, rust, rust-shadow, cpp-shadow (default: rust-shadow)")]
+    #[arg(
+        long,
+        value_name = "ENGINE",
+        help = "Consensus engine: cpp, rust, rust-shadow, cpp-shadow (default: rust-shadow)"
+    )]
     pub consensus: Option<String>,
 
-    #[arg(long, value_name = "N", help = "Shadow verification queue capacity (default: 4194304)")]
+    #[arg(
+        long,
+        value_name = "N",
+        help = "Shadow verification queue capacity (default: 4194304)"
+    )]
     pub shadowqueuesize: Option<usize>,
 
-    #[arg(long, value_name = "N", help = "Shadow verification worker threads (default: 4)")]
+    #[arg(
+        long,
+        value_name = "N",
+        help = "Shadow verification worker threads (default: 4)"
+    )]
     pub shadowworkers: Option<usize>,
 
     // MCP server flags
     #[arg(long, help = "Enable MCP (Model Context Protocol) server")]
     pub mcp: bool,
 
-    #[arg(long, value_name = "BOOL", help = "Enable MCP stdio transport (default: true when --mcp)")]
+    #[arg(
+        long,
+        value_name = "BOOL",
+        help = "Enable MCP stdio transport (default: true when --mcp)"
+    )]
     pub mcpstdio: Option<bool>,
 
-    #[arg(long, value_name = "PORT", help = "Enable MCP HTTP transport on this port")]
+    #[arg(
+        long,
+        value_name = "PORT",
+        help = "Enable MCP HTTP transport on this port"
+    )]
     pub mcpport: Option<u16>,
 
-    #[arg(long, value_name = "ADDR", help = "MCP HTTP bind address (default: 127.0.0.1)")]
+    #[arg(
+        long,
+        value_name = "ADDR",
+        help = "MCP HTTP bind address (default: 127.0.0.1)"
+    )]
     pub mcpbind: Option<String>,
 
     // Metrics / health HTTP server (unauthenticated — bind to loopback or firewall)
-    #[arg(long, value_name = "PORT", help = "Enable Prometheus /metrics + /healthz + /readyz on this port (unauthenticated)")]
+    #[arg(
+        long,
+        value_name = "PORT",
+        help = "Enable Prometheus /metrics + /healthz + /readyz on this port (unauthenticated)"
+    )]
     pub metricsport: Option<u16>,
 
-    #[arg(long, value_name = "ADDR", help = "Metrics/health HTTP bind address (default: 127.0.0.1)")]
+    #[arg(
+        long,
+        value_name = "ADDR",
+        help = "Metrics/health HTTP bind address (default: 127.0.0.1)"
+    )]
     pub metricsbind: Option<String>,
 
     // No-op compatibility flags (accepted silently, not wired)
-    #[arg(long, help = "Accept RPC commands (always on, accepted for compatibility)")]
+    #[arg(
+        long,
+        help = "Accept RPC commands (always on, accepted for compatibility)"
+    )]
     pub server: bool,
 
-    #[arg(long, help = "Run in background (use systemd instead, accepted for compatibility)")]
+    #[arg(
+        long,
+        help = "Run in background (use systemd instead, accepted for compatibility)"
+    )]
     pub daemon: bool,
 
-    #[arg(long, value_name = "N", help = "Script verification threads (accepted for compatibility)")]
+    #[arg(
+        long,
+        value_name = "N",
+        help = "Script verification threads (accepted for compatibility)"
+    )]
     pub par: Option<usize>,
 
-    #[arg(long, help = "Emit structured error payloads (category, suggestion, debug) on RPC errors. Default: off (Core-compat)")]
+    #[arg(
+        long,
+        help = "Emit structured error payloads (category, suggestion, debug) on RPC errors. Default: off (Core-compat)"
+    )]
     pub rpcextendederrors: bool,
 
-    #[arg(long, value_name = "SECS", help = "Maximum graceful-shutdown flush duration before force exit (default: 30)")]
+    #[arg(
+        long,
+        value_name = "SECS",
+        help = "Maximum graceful-shutdown flush duration before force exit (default: 30)"
+    )]
     pub maxshutdownsecs: Option<u64>,
 
-    #[arg(long, value_name = "UNIT", help = "Default units for RPC amount fields: 'btc' (Core-compatible, default) or 'sats' (integer satoshis)")]
+    #[arg(
+        long,
+        value_name = "UNIT",
+        help = "Default units for RPC amount fields: 'btc' (Core-compatible, default) or 'sats' (integer satoshis)"
+    )]
     pub rpcdefaultunits: Option<String>,
 
-    #[arg(long = "log-format", value_name = "FORMAT", help = "Log output format: 'text' (default, human) or 'json' (one JSON object per event)")]
+    #[arg(
+        long = "log-format",
+        value_name = "FORMAT",
+        help = "Log output format: 'text' (default, human) or 'json' (one JSON object per event)"
+    )]
     pub log_format: Option<String>,
 
-    #[arg(long, value_name = "NAME", help = "Named preset: archival | pruned-home | mining | regtest-dev | signet-watchtower. CLI flags override profile values.")]
+    #[arg(
+        long,
+        value_name = "NAME",
+        help = "Named preset: archival | pruned-home | mining | regtest-dev | signet-watchtower. CLI flags override profile values."
+    )]
     pub profile: Option<String>,
 
-    #[arg(long = "reorg-webhook", value_name = "URL", help = "HTTP(S) endpoint receiving POST bodies on reorg detection")]
+    #[arg(
+        long = "reorg-webhook",
+        value_name = "URL",
+        help = "HTTP(S) endpoint receiving POST bodies on reorg detection"
+    )]
     pub reorg_webhook: Option<String>,
 
-    #[arg(long = "reorg-webhook-secret", value_name = "SECRET", help = "HMAC-SHA256 secret used to sign webhook bodies via X-Satd-Signature")]
+    #[arg(
+        long = "reorg-webhook-secret",
+        value_name = "SECRET",
+        help = "HMAC-SHA256 secret used to sign webhook bodies via X-Satd-Signature"
+    )]
     pub reorg_webhook_secret: Option<String>,
 
-    #[arg(long = "events-node-id", value_name = "HEX32", help = "Stable per-node identifier stamped on every events envelope (32-char hex). Default: auto-generated and persisted to <datadir>/node_id")]
+    #[arg(
+        long = "events-node-id",
+        value_name = "HEX32",
+        help = "Stable per-node identifier stamped on every events envelope (32-char hex). Default: auto-generated and persisted to <datadir>/node_id"
+    )]
     pub events_node_id: Option<String>,
 
-    #[arg(long = "events-region", value_name = "TAG", help = "Optional region tag stamped on every events envelope (\u{2264}8 printable ASCII bytes, e.g. 'us-east1')")]
+    #[arg(
+        long = "events-region",
+        value_name = "TAG",
+        help = "Optional region tag stamped on every events envelope (\u{2264}8 printable ASCII bytes, e.g. 'us-east1')"
+    )]
     pub events_region: Option<String>,
 
-    #[arg(long = "events-grpc-bind", value_name = "ADDR", help = "host:port to bind the events gRPC streaming server. UNAUTHENTICATED — bind to loopback or use --events-grpc-allow-remote for explicit remote exposure. Default: disabled")]
+    #[arg(
+        long = "events-grpc-bind",
+        value_name = "ADDR",
+        help = "host:port to bind the events gRPC streaming server. UNAUTHENTICATED — bind to loopback or use --events-grpc-allow-remote for explicit remote exposure. Default: disabled"
+    )]
     pub events_grpc_bind: Option<String>,
 
-    #[arg(long = "events-grpc-allow-remote", help = "Permit --events-grpc-bind to point at a non-loopback address. Operator must firewall or auth-proxy the endpoint — the sink has no auth")]
+    #[arg(
+        long = "events-grpc-allow-remote",
+        help = "Permit --events-grpc-bind to point at a non-loopback address. Operator must firewall or auth-proxy the endpoint — the sink has no auth"
+    )]
     pub events_grpc_allow_remote: bool,
 
-    #[arg(long = "events-zmq-bind", value_name = "ENDPOINT", help = "ZMQ endpoint for the events PUB sink (e.g. 'tcp://0.0.0.0:28332'). Default: disabled")]
+    #[arg(
+        long = "events-zmq-bind",
+        value_name = "ENDPOINT",
+        help = "ZMQ endpoint for the events PUB sink (e.g. 'tcp://0.0.0.0:28332'). Default: disabled"
+    )]
     pub events_zmq_bind: Option<String>,
 
-    #[arg(long = "events-zmq-hashtx", value_name = "BOOL", help = "Enable Bitcoin Core-compatible 'hashtx' topic on the events ZMQ sink (default: enabled when --events-zmq-bind is set)")]
+    #[arg(
+        long = "events-zmq-hashtx",
+        value_name = "BOOL",
+        help = "Enable Bitcoin Core-compatible 'hashtx' topic on the events ZMQ sink (default: enabled when --events-zmq-bind is set)"
+    )]
     pub events_zmq_hashtx: Option<bool>,
 
-    #[arg(long = "events-zmq-hashblock", value_name = "BOOL", help = "Enable Bitcoin Core-compatible 'hashblock' topic on the events ZMQ sink (default: enabled)")]
+    #[arg(
+        long = "events-zmq-hashblock",
+        value_name = "BOOL",
+        help = "Enable Bitcoin Core-compatible 'hashblock' topic on the events ZMQ sink (default: enabled)"
+    )]
     pub events_zmq_hashblock: Option<bool>,
 
-    #[arg(long = "events-zmq-mpevict", value_name = "BOOL", help = "Enable 'mpevict' topic (mempool eviction with reason) on the events ZMQ sink (default: enabled)")]
+    #[arg(
+        long = "events-zmq-mpevict",
+        value_name = "BOOL",
+        help = "Enable 'mpevict' topic (mempool eviction with reason) on the events ZMQ sink (default: enabled)"
+    )]
     pub events_zmq_mpevict: Option<bool>,
 
-    #[arg(long = "events-zmq-mpreplace", value_name = "BOOL", help = "Enable 'mpreplace' topic (RBF replacement) on the events ZMQ sink (default: enabled)")]
+    #[arg(
+        long = "events-zmq-mpreplace",
+        value_name = "BOOL",
+        help = "Enable 'mpreplace' topic (RBF replacement) on the events ZMQ sink (default: enabled)"
+    )]
     pub events_zmq_mpreplace: Option<bool>,
 
-    #[arg(long = "events-zmq-mpconfirm", value_name = "BOOL", help = "Enable 'mpconfirm' topic (mempool tx confirmed in block) on the events ZMQ sink (default: enabled)")]
+    #[arg(
+        long = "events-zmq-mpconfirm",
+        value_name = "BOOL",
+        help = "Enable 'mpconfirm' topic (mempool tx confirmed in block) on the events ZMQ sink (default: enabled)"
+    )]
     pub events_zmq_mpconfirm: Option<bool>,
 
-    #[arg(long = "events-zmq-nodeevent", value_name = "BOOL", help = "Enable 'nodeevent' topic (full envelope JSON) on the events ZMQ sink (default: enabled)")]
+    #[arg(
+        long = "events-zmq-nodeevent",
+        value_name = "BOOL",
+        help = "Enable 'nodeevent' topic (full envelope JSON) on the events ZMQ sink (default: enabled)"
+    )]
     pub events_zmq_nodeevent: Option<bool>,
 }
 
@@ -1433,6 +1868,15 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "esploraauth",
         "esploracookiefile",
         "esplorauserpass",
+        "electrum",
+        "electrumbind",
+        "electrumtlsbind",
+        "electrumtlscert",
+        "electrumtlskey",
+        "electrummaxconns",
+        "electrummaxsubsperconn",
+        "electrumrequesttimeout",
+        "electrumbanner",
         "prune",
         "reindex",
         "reindex-chainstate",
@@ -1501,8 +1945,8 @@ pub struct ConfigFile {
 
 impl ConfigFile {
     pub fn parse_file(path: &Path) -> Result<Self, String> {
-        let content =
-            std::fs::read_to_string(path).map_err(|e| format!("Cannot read {}: {}", path.display(), e))?;
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| format!("Cannot read {}: {}", path.display(), e))?;
         Self::parse(&content)
     }
 
@@ -1623,11 +2067,23 @@ rpcport=8332
         let cf = ConfigFile::parse(content).unwrap();
         assert_eq!(cf.global.get("rpcuser").unwrap().last().unwrap(), "alice");
         assert_eq!(
-            cf.sections.get("regtest").unwrap().get("rpcport").unwrap().last().unwrap(),
+            cf.sections
+                .get("regtest")
+                .unwrap()
+                .get("rpcport")
+                .unwrap()
+                .last()
+                .unwrap(),
             "18443"
         );
         assert_eq!(
-            cf.sections.get("main").unwrap().get("rpcport").unwrap().last().unwrap(),
+            cf.sections
+                .get("main")
+                .unwrap()
+                .get("rpcport")
+                .unwrap()
+                .last()
+                .unwrap(),
             "8332"
         );
     }
@@ -1686,6 +2142,15 @@ rpcport=8332
             esploraauth: None,
             esploracookiefile: None,
             esplorauserpass: None,
+            electrum: None,
+            electrumbind: None,
+            electrumtlsbind: None,
+            electrumtlscert: None,
+            electrumtlskey: None,
+            electrummaxconns: None,
+            electrummaxsubsperconn: None,
+            electrumrequesttimeout: None,
+            electrumbanner: None,
             prune: None,
             reindex: false,
             reindex_chainstate: false,
@@ -1740,7 +2205,10 @@ rpcport=8332
         let config = Config::from_cli(cli).unwrap();
         assert_eq!(config.network, Network::Regtest);
         assert_eq!(config.rpcport, 18443);
-        assert_eq!(config.network_datadir(), PathBuf::from("/tmp/satd-test/regtest"));
+        assert_eq!(
+            config.network_datadir(),
+            PathBuf::from("/tmp/satd-test/regtest")
+        );
         assert!(config.mempoolfullrbf); // full RBF on by default
     }
 
@@ -1783,6 +2251,15 @@ rpcport=8332
             esploraauth: None,
             esploracookiefile: None,
             esplorauserpass: None,
+            electrum: None,
+            electrumbind: None,
+            electrumtlsbind: None,
+            electrumtlscert: None,
+            electrumtlskey: None,
+            electrummaxconns: None,
+            electrummaxsubsperconn: None,
+            electrumrequesttimeout: None,
+            electrumbanner: None,
             prune: None,
             reindex: false,
             reindex_chainstate: false,

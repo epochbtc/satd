@@ -11,15 +11,15 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 pub static malloc_conf: &[u8] = b"dirty_decay_ms:1000,muzzy_decay_ms:2000\0";
 
 use config::Config;
+use config::ConsensusEngine;
 use node::chain::state::ChainState;
 use node::mempool::fee::FeeEstimator;
 use node::mempool::pool::{Mempool, MempoolConfig};
 use node::rpc::auth::RpcAuth;
 use node::storage::Store;
-use node::storage::rocksdb_store::RocksDbStore;
 use node::storage::flatfile::FlatFileManager;
-use config::ConsensusEngine;
-use node::validation::script::{ConsensusVerifier, RustVerifier, ShadowVerifier, ScriptVerifier};
+use node::storage::rocksdb_store::RocksDbStore;
+use node::validation::script::{ConsensusVerifier, RustVerifier, ScriptVerifier, ShadowVerifier};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -248,28 +248,26 @@ async fn main() {
                 "assumevalid=all — skipping script verification for blocks older than {}s",
                 config.assumevalidage,
             );
-            node::chain::state::AssumeValid::All { max_age_secs: config.assumevalidage }
-        }
-        Some(hash_str) => {
-            match hash_str.parse::<bitcoin::BlockHash>() {
-                Ok(h) => {
-                    tracing::info!(%h, "Assuming blocks valid up to hash");
-                    node::chain::state::AssumeValid::Hash(h)
-                }
-                Err(e) => {
-                    eprintln!("Error: invalid assumevalid hash '{}': {}", hash_str, e);
-                    std::process::exit(1);
-                }
+            node::chain::state::AssumeValid::All {
+                max_age_secs: config.assumevalidage,
             }
         }
+        Some(hash_str) => match hash_str.parse::<bitcoin::BlockHash>() {
+            Ok(h) => {
+                tracing::info!(%h, "Assuming blocks valid up to hash");
+                node::chain::state::AssumeValid::Hash(h)
+            }
+            Err(e) => {
+                eprintln!("Error: invalid assumevalid hash '{}': {}", hash_str, e);
+                std::process::exit(1);
+            }
+        },
     };
 
     // Initialize chain state with script verification
     *startup_status.write().unwrap() = "Initializing chain state...".to_string();
     let verifier: Box<dyn ScriptVerifier> = match config.consensus {
-        ConsensusEngine::Cpp => {
-            Box::new(ConsensusVerifier)
-        }
+        ConsensusEngine::Cpp => Box::new(ConsensusVerifier),
         ConsensusEngine::Rust => {
             tracing::warn!("Using Rust consensus engine — NOT YET VALIDATED FOR PRODUCTION");
             Box::new(RustVerifier)
@@ -334,7 +332,8 @@ async fn main() {
         Ok(log) => {
             let reorg_log = Arc::new(log);
             if let Some(url) = config.reorg_webhook.clone() {
-                let (tx, rx) = tokio::sync::mpsc::channel::<node::chain::reorg_log::ReorgRecord>(64);
+                let (tx, rx) =
+                    tokio::sync::mpsc::channel::<node::chain::reorg_log::ReorgRecord>(64);
                 reorg_log.set_webhook_sender(tx);
                 let secret = config.reorg_webhook_secret.clone();
                 tokio::spawn(reorg_webhook_dispatcher(url, secret, rx));
@@ -397,9 +396,9 @@ async fn main() {
 
     // Wire the chain-event broadcaster used by the address-index
     // notifier (M5) and any future observability subscribers.
-    let (chain_event_tx, _) = tokio::sync::broadcast::channel::<
-        node::chain::events::ChainEvent,
-    >(node::chain::events::CHAIN_EVENT_BROADCAST_CAPACITY);
+    let (chain_event_tx, _) = tokio::sync::broadcast::channel::<node::chain::events::ChainEvent>(
+        node::chain::events::CHAIN_EVENT_BROADCAST_CAPACITY,
+    );
     let addr_notifier_chain_event_rx = chain_event_tx.subscribe();
     let events_bus_chain_rx = chain_event_tx.subscribe();
     chain_state.set_chain_event_sender(chain_event_tx);
@@ -432,10 +431,8 @@ async fn main() {
         region = edge_identity.region_str().unwrap_or(""),
         "events bus edge identity resolved",
     );
-    let event_publisher = node::events::EventPublisher::new(
-        edge_identity,
-        node::events::ENVELOPE_BROADCAST_CAPACITY,
-    );
+    let event_publisher =
+        node::events::EventPublisher::new(edge_identity, node::events::ENVELOPE_BROADCAST_CAPACITY);
     event_publisher.spawn_bridges(
         events_bus_mempool_rx,
         events_bus_chain_rx,
@@ -519,8 +516,8 @@ async fn main() {
     // each event mutation — see `NotifyBundle`).
     let address_index_store: std::sync::Arc<dyn node::storage::Store> =
         chain_state.store_ref().clone();
-    let address_index_concrete = std::sync::Arc::new(
-        node::index::address::RocksAddressIndex::with_mempool_index(
+    let address_index_concrete =
+        std::sync::Arc::new(node::index::address::RocksAddressIndex::with_mempool_index(
             address_index_store,
             node::index::address::AddressIndexConfig {
                 enabled: config.addressindex,
@@ -528,8 +525,7 @@ async fn main() {
                 ..Default::default()
             },
             mempool_addr_index.clone(),
-        ),
-    );
+        ));
     let address_index: std::sync::Arc<dyn node::index::address::AddressIndex> =
         address_index_concrete.clone();
 
@@ -614,7 +610,10 @@ async fn main() {
     }
 
     if config.proxy.is_some() {
-        tracing::info!(proxy = config.proxy.as_deref().unwrap(), "SOCKS5 proxy enabled for outbound connections");
+        tracing::info!(
+            proxy = config.proxy.as_deref().unwrap(),
+            "SOCKS5 proxy enabled for outbound connections"
+        );
     }
 
     // Start Tor hidden service if -torcontrol is set
@@ -694,9 +693,8 @@ async fn main() {
             "addr-index backfill cursor restored from metadata"
         );
     }
-    let backfill_handle = std::sync::Arc::new(
-        node::index::address::BackfillHandle::new(initial_cursor),
-    );
+    let backfill_handle =
+        std::sync::Arc::new(node::index::address::BackfillHandle::new(initial_cursor));
 
     // Orphan-temp-CF cleanup: if the persisted cursor isn't actively
     // mid-backfill (Running/Paused) but the temp CF still exists,
@@ -706,8 +704,7 @@ async fn main() {
     // exactly the wrong moment.
     if !matches!(
         initial_cursor.state,
-        node::index::address::BackfillState::Running
-            | node::index::address::BackfillState::Paused
+        node::index::address::BackfillState::Running | node::index::address::BackfillState::Paused
     ) && chain_state.store_ref().backfill_temp_cf_exists()
         && let Err(e) = chain_state.store_ref().drop_backfill_temp_cf()
     {
@@ -936,9 +933,7 @@ async fn main() {
                 bind: config.esplora_bind.clone(),
                 prefix: config.esplora_prefix.clone(),
                 cors_origins: config.esplora_cors.clone(),
-                request_timeout: std::time::Duration::from_secs(
-                    config.esplora_request_timeout,
-                ),
+                request_timeout: std::time::Duration::from_secs(config.esplora_request_timeout),
                 max_concurrency: config.esplora_max_conns,
                 max_sse_conns: config.esplora_sse_max_conns,
                 auth: auth_cfg,
@@ -989,9 +984,7 @@ async fn main() {
             let listener = match tokio::net::TcpListener::bind(bind).await {
                 Ok(l) => l,
                 Err(e) => {
-                    eprintln!(
-                        "Error: esplora listener could not bind to {bind}: {e}"
-                    );
+                    eprintln!("Error: esplora listener could not bind to {bind}: {e}");
                     auth.cleanup();
                     std::process::exit(1);
                 }
@@ -1007,6 +1000,86 @@ async fn main() {
                 }
             });
         }
+    }
+
+    // Start the Electrum server if enabled. Refuses to bind when
+    // addressindex=0 (already enforced by Config::load) or when the
+    // tx_index CF is incomplete (a datadir previously synced with
+    // --txindex=0 has historical gaps that would 404 silently). Bind
+    // failure is fatal, mirroring the Esplora pattern above.
+    if config.electrum {
+        if !chain_state.store_ref().tx_index_complete() {
+            eprintln!(
+                "Error: electrum is enabled and --txindex=1, but the on-disk tx_index \n\
+                 CF is incomplete (this datadir was previously synced with \n\
+                 --txindex=0). Restart with --reindex-chainstate to populate \n\
+                 historical rows, or set --electrum=0 to skip the Electrum server."
+            );
+            auth.cleanup();
+            std::process::exit(1);
+        }
+        let electrum_bind: SocketAddr = config
+            .electrum_bind
+            .parse()
+            .expect("Invalid electrum bind address");
+        let electrum_tls_bind = config
+            .electrum_tls_bind
+            .as_ref()
+            .map(|s| s.parse::<SocketAddr>().expect("Invalid electrumtlsbind"));
+        let electrum_cfg = electrum_proto::ElectrumConfig {
+            bind: electrum_bind,
+            tls_bind: electrum_tls_bind,
+            tls_cert_path: config.electrum_tls_cert.clone(),
+            tls_key_path: config.electrum_tls_key.clone(),
+            banner: config.electrum_banner.clone(),
+            donation_address: String::new(),
+            max_history_entries: electrum_proto::config::MAX_HISTORY_ENTRIES,
+            max_headers_per_request: electrum_proto::config::MAX_HEADERS_PER_REQUEST,
+            max_conns: config.electrum_max_conns,
+            max_subs_per_conn: config.electrum_max_subs_per_conn,
+            request_timeout: std::time::Duration::from_secs(config.electrum_request_timeout),
+        };
+        let electrum_extras: std::sync::Arc<dyn electrum_proto::ElectrumExtras> =
+            std::sync::Arc::new(electrum_proto::RocksElectrumExtras::new(
+                chain_state.clone(),
+            ));
+        let spend_index: std::sync::Arc<dyn node_index::SpendIndex> =
+            std::sync::Arc::new(node::index::outpoint_spend::lookups::RocksSpendIndex::new(
+                chain_state.store_ref().clone(),
+                Arc::new(node::index::address::AddressIndexConfig {
+                    enabled: config.addressindex,
+                    max_subscriptions: config.addrindexsubscriptions,
+                    ..Default::default()
+                }),
+            ));
+        let electrum_state = std::sync::Arc::new(electrum_proto::ElectrumState {
+            chain: chain_state.clone(),
+            mempool: mempool.clone(),
+            address_index: address_index.clone(),
+            spend_index,
+            fee_estimator: fee_estimator.clone(),
+            electrum_extras,
+            network: config.network,
+            config: std::sync::Arc::new(electrum_cfg.clone()),
+        });
+        let server = match electrum_proto::ElectrumServer::bind(electrum_cfg, electrum_state).await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Error: electrum server bind failed: {e}");
+                auth.cleanup();
+                std::process::exit(1);
+            }
+        };
+        tracing::info!(
+            bind = %electrum_bind,
+            tls_bind = ?electrum_tls_bind,
+            "Electrum server listening"
+        );
+        let electrum_shutdown = shutdown_rx.clone();
+        tokio::spawn(async move {
+            server.serve(electrum_shutdown).await;
+        });
     }
 
     // Write PID file if requested
@@ -1068,11 +1141,8 @@ async fn main() {
 
     // DNS seeding: only if no explicit --connect peers and --dns is enabled
     if config.connect.is_empty() && config.dns {
-        let seed_addrs = node::net::dns::resolve_seeds(
-            config.network,
-            config.proxy.as_deref(),
-        )
-        .await;
+        let seed_addrs =
+            node::net::dns::resolve_seeds(config.network, config.proxy.as_deref()).await;
         let max_dns_outbound = 64;
         for addr in seed_addrs.into_iter().take(max_dns_outbound) {
             peer_manager.add_peer_addr(addr.clone());
@@ -1158,7 +1228,9 @@ async fn main() {
         // explicit `flush_durable` after `flush_coin_cache` guarantees the
         // tip pointer and its coin mutations are on disk together before
         // we signal shutdown-complete.
-        let result = flush_cs.flush_coin_cache().and_then(|()| flush_cs.flush_durable());
+        let result = flush_cs
+            .flush_coin_cache()
+            .and_then(|()| flush_cs.flush_durable());
         let _ = flush_tx.send(result);
     });
     let flushed_ok = match node::shutdown::await_bounded_flush(flush_rx, shutdown_deadline).await {
@@ -1419,8 +1491,8 @@ async fn spawn_runner(
         Err(e) => {
             tracing::error!(error = %e, "addr-index backfill runner task panicked");
             let msg = format!("runner panicked: {}", e);
-            if let Err(p) = handle_for_failure
-                .mark_failed(chain_for_failure.store_ref().as_ref(), &msg)
+            if let Err(p) =
+                handle_for_failure.mark_failed(chain_for_failure.store_ref().as_ref(), &msg)
             {
                 tracing::warn!(error = %p, "failed to persist Failed state after runner panic");
             }

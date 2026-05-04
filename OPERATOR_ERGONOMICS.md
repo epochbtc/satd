@@ -425,7 +425,69 @@ over P2P for light clients. Pairs naturally with the address index work.
 > (electrs, Fulcrum, ElectrumX). Not to be confused with the Electrum wallet
 > itself.*
 
-This is the single highest-leverage Tier-3 item and deserves dedicated
+**Status (2026-05): Phase A and Phase B have landed.** satd's
+`--addressindex=1` (default on; see `ADDRESS_INDEX.md`) provides Phase A;
+the native Electrum protocol server in the `electrum-proto` crate
+provides Phase B. Operators enable it via `--electrum=1`, optional TLS
+via `--electrumtlsbind` + `--electrumtlscert`/`--electrumtlskey`.
+
+### Operator quick-start
+
+```sh
+# Plain TCP, loopback only (recommended; expose via Tor)
+satd --electrum=1 --electrumbind=127.0.0.1:50001
+
+# Plain TCP + TLS
+satd --electrum=1 \
+     --electrumbind=127.0.0.1:50001 \
+     --electrumtlsbind=127.0.0.1:50002 \
+     --electrumtlscert=/etc/satd/electrum.crt \
+     --electrumtlskey=/etc/satd/electrum.key
+```
+
+`--electrum=1` requires `--addressindex=1` (auto-enforced) and a
+complete `--txindex` (auto-enabled when not explicitly disabled).
+A datadir previously synced with `--txindex=0` requires
+`--reindex-chainstate` before Electrum can serve confirmed-tx and
+merkle-proof endpoints.
+
+Defaults:
+- `--electrumbind` = `127.0.0.1:50001` (loopback). Expose via a
+  Tor hidden service rather than directly on the LAN/internet —
+  same deployment story as `bitcoind` for self-custody distros.
+- `--electrummaxconns` = 64 (total simultaneous connections).
+- `--electrummaxsubsperconn` = 100 (per-connection scripthash
+  subscription cap).
+- `--electrumrequesttimeout` = 30 seconds.
+
+Bitcoin-conf aliases mirror the CLI flags: `electrum`,
+`electrumbind`, `electrumtlsbind`, `electrumtlscert`,
+`electrumtlskey`, `electrummaxconns`, `electrummaxsubsperconn`,
+`electrumrequesttimeout`, `electrumbanner`.
+
+### What's implemented
+
+The v1 method set (per `ECOSYSTEM.md` §4a):
+
+- `server.{version, banner, ping, donation_address, features, peers.subscribe}`
+  — `peers.subscribe` returns `[]` (we are not part of the Electrum
+  server peer mesh).
+- `blockchain.headers.{subscribe, get}`, `blockchain.block.{header, headers}`.
+- `blockchain.scripthash.{get_history, get_balance, listunspent,
+  get_mempool, get_first_use, subscribe, unsubscribe}`.
+- `blockchain.transaction.{get, get_merkle, broadcast, id_from_pos}`.
+  `transaction.get` returns hex; `verbose=true` is rejected.
+- `blockchain.estimatefee`, `blockchain.relayfee`.
+- `mempool.get_fee_histogram` (50,000-vbyte buckets, descending sat/vbyte).
+
+Server-pushed notifications (`blockchain.scripthash.subscribe` and
+`blockchain.headers.subscribe`) are delivered on the same connection
+as the response, with the per-connection mpsc fan-in providing
+backpressure when a client is slow.
+
+### Original analysis (kept for reference)
+
+This was the single highest-leverage Tier-3 item and deserves dedicated
 analysis. Short answer: **yes, and I think it's a major differentiator** —
 but it should be opt-in and carefully scoped.
 
