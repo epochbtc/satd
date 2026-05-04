@@ -49,9 +49,13 @@ use zeromq::{Socket, SocketSend, ZmqMessage};
 /// subscribers via these strings, so don't rename them without bumping
 /// the schema version and documenting the migration.
 pub mod topics {
-    /// Core-compatible. Payload = 32-byte raw txid. Seq tag = u32 LE.
+    /// Core-compatible. Payload = 32-byte txid in **RPC display order**
+    /// (the internal byte order reversed — same on-the-wire shape as
+    /// Bitcoin Core's `-zmqpubhashtx`). Seq tag = u32 LE.
     pub const HASHTX: &str = "hashtx";
-    /// Core-compatible. Payload = 32-byte raw block hash. Seq tag = u32 LE.
+    /// Core-compatible. Payload = 32-byte block hash in **RPC display
+    /// order** (the internal byte order reversed — same on-the-wire
+    /// shape as Bitcoin Core's `-zmqpubhashblock`). Seq tag = u32 LE.
     pub const HASHBLOCK: &str = "hashblock";
     /// New. Payload = JSON-serialized `MempoolEvent::LeaveEvicted` body
     /// (txid + reason). Seq tag = u32 LE.
