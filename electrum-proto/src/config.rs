@@ -23,6 +23,13 @@ pub const MAX_HEADERS_PER_REQUEST: u32 = 2016;
 pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
 pub const DEFAULT_MAX_CONNS: usize = 64;
 pub const DEFAULT_MAX_SUBS_PER_CONN: usize = 100;
+/// Max requests in a single JSON-RPC batch. electrs uses 16; matches
+/// the wallet client mix where Sparrow batches 2–8 reads at startup.
+pub const DEFAULT_MAX_BATCH_REQUESTS: usize = 16;
+/// Max txs in a single `blockchain.transaction.broadcast_package`
+/// call. electrs accepts up to ~25 (matching Bitcoin Core's
+/// `MAX_PACKAGE_COUNT`).
+pub const DEFAULT_MAX_BROADCAST_PACKAGE_TXS: usize = 25;
 
 /// Configuration available to method handlers + transport.
 ///
@@ -63,8 +70,16 @@ pub struct ElectrumConfig {
     pub max_conns: usize,
     /// Per-connection scripthash subscription cap (PR-4 enforces).
     pub max_subs_per_conn: usize,
-    /// Wall-clock timeout per inbound request.
+    /// Wall-clock timeout per inbound request. Enforced around the
+    /// dispatch path so a slow handler can't pin a connection slot
+    /// indefinitely (review-round-1 M2).
     pub request_timeout: Duration,
+    /// Max requests in a single JSON-RPC batch. Excess batches are
+    /// rejected with `bad_request` (review-round-1 M5).
+    pub max_batch_requests: usize,
+    /// Max txs in a single `blockchain.transaction.broadcast_package`
+    /// call. Excess packages are rejected (review-round-1 M5).
+    pub max_broadcast_package_txs: usize,
 }
 
 impl Default for ElectrumConfig {
@@ -81,6 +96,8 @@ impl Default for ElectrumConfig {
             max_conns: DEFAULT_MAX_CONNS,
             max_subs_per_conn: DEFAULT_MAX_SUBS_PER_CONN,
             request_timeout: Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS),
+            max_batch_requests: DEFAULT_MAX_BATCH_REQUESTS,
+            max_broadcast_package_txs: DEFAULT_MAX_BROADCAST_PACKAGE_TXS,
         }
     }
 }

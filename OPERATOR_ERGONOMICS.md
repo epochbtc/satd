@@ -458,12 +458,20 @@ Defaults:
 - `--electrummaxconns` = 64 (total simultaneous connections).
 - `--electrummaxsubsperconn` = 100 (per-connection scripthash
   subscription cap).
-- `--electrumrequesttimeout` = 30 seconds.
+- `--electrumrequesttimeout` = 30 seconds. Wraps the dispatch path
+  (read → handler → write) and the TLS handshake; a slow client
+  can't pin a connection slot past this deadline.
+- `--electrummaxbatchrequests` = 16 (max requests per JSON-RPC
+  batch line; mirrors `romanz/electrs`).
+- `--electrummaxbroadcastpackagetxs` = 25 (max txs per
+  `blockchain.transaction.broadcast_package`; mirrors Bitcoin
+  Core's `MAX_PACKAGE_COUNT`).
 
 Bitcoin-conf aliases mirror the CLI flags: `electrum`,
 `electrumbind`, `electrumtlsbind`, `electrumtlscert`,
 `electrumtlskey`, `electrummaxconns`, `electrummaxsubsperconn`,
-`electrumrequesttimeout`, `electrumbanner`.
+`electrumrequesttimeout`, `electrummaxbatchrequests`,
+`electrummaxbroadcastpackagetxs`, `electrumbanner`.
 
 ### What's implemented
 
@@ -475,10 +483,25 @@ The v1 method set (per `ECOSYSTEM.md` §4a):
 - `blockchain.headers.{subscribe, get}`, `blockchain.block.{header, headers}`.
 - `blockchain.scripthash.{get_history, get_balance, listunspent,
   get_mempool, get_first_use, subscribe, unsubscribe}`.
-- `blockchain.transaction.{get, get_merkle, broadcast, id_from_pos}`.
-  `transaction.get` returns hex; `verbose=true` is rejected.
-- `blockchain.estimatefee`, `blockchain.relayfee`.
+- `blockchain.transaction.{get, get_merkle, broadcast,
+  broadcast_package, id_from_pos}`.
+  `transaction.get` returns the raw hex by default; `verbose=true`
+  returns Bitcoin Core's `getrawtransaction <txid> 1` JSON shape
+  (txid/hash/version/size/vsize/weight/locktime, vin with coinbase
+  variant + scriptSig + txinwitness, vout with value/n/scriptPubKey,
+  hex, and blockhash/confirmations/time/blocktime when confirmed).
+- `blockchain.estimatefee`, `blockchain.relayfee` (BTC/kB on the
+  wire, converted from satd's internal sat-per-1000-WU unit).
 - `mempool.get_fee_histogram` (50,000-vbyte buckets, descending sat/vbyte).
+- JSON-RPC batch requests (`[req, req, ...]`) are accepted up to
+  `--electrummaxbatchrequests`. Notifications inside a batch have
+  their responses suppressed per JSON-RPC §6.
+
+`blockchain.block.header` and `blockchain.block.headers` accept the
+`cp_height` argument for protocol compatibility but reject any
+nonzero value with a `bad_request` error — checkpoint proofs are
+not yet implemented, and silently returning the proof-less response
+would be a wallet-compat hazard.
 
 Server-pushed notifications (`blockchain.scripthash.subscribe` and
 `blockchain.headers.subscribe`) are delivered on the same connection

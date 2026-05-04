@@ -109,8 +109,12 @@ impl ElectrumExtras for RocksElectrumExtras {
     }
 
     fn tip(&self) -> (u32, Header) {
-        let height = self.chain.tip_height();
-        let hash = self.chain.tip_hash();
+        // M6 (review round 1): use `tip_snapshot()` so `(hash, height)`
+        // come from the same `tip.read()` guard. Two separate
+        // `tip_hash()` / `tip_height()` calls could pair an old hash
+        // with a new height if a block connects between them, causing
+        // `headers.subscribe`'s initial response to mismatch.
+        let (hash, height) = self.chain.tip_snapshot();
         let header = self
             .chain
             .get_block_index(&hash)

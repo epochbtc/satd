@@ -259,10 +259,26 @@ impl ElectrumServer {
                 let conn_shutdown = shutdown.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
-                    let tls_stream = match acceptor.accept(stream).await {
-                        Ok(s) => s,
-                        Err(e) => {
+                    // Bound the TLS handshake so a half-open client
+                    // can't sit on a connection permit forever
+                    // (review-round-1 M2).
+                    let handshake_timeout = config.request_timeout;
+                    let tls_stream = match tokio::time::timeout(
+                        handshake_timeout,
+                        acceptor.accept(stream),
+                    ).await {
+                        Ok(Ok(s)) => s,
+                        Ok(Err(e)) => {
                             tracing::debug!(peer = %peer, error = %e, "TLS handshake failed");
+                            return;
+                        }
+                        Err(_elapsed) => {
+                            tracing::warn!(
+                                target = "electrum::server",
+                                peer = %peer,
+                                timeout_secs = handshake_timeout.as_secs(),
+                                "TLS handshake timed out — closing connection",
+                            );
                             return;
                         }
                     };
@@ -311,7 +327,7 @@ async fn handle_connection<S>(
     stream: S,
     mut dispatch: BoxedDispatch,
     mut notify_rx: mpsc::Receiver<String>,
-    _config: Arc<ElectrumConfig>,
+    config: Arc<ElectrumConfig>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), FramingError>
 where
@@ -320,23 +336,71 @@ where
     let (read_half, mut write_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half);
     let mut buf: Vec<u8> = Vec::with_capacity(2048);
+    let request_timeout = config.request_timeout;
+    let max_batch = config.max_batch_requests;
 
     loop {
         tokio::select! {
             biased;
             _ = shutdown.changed() => return Ok(()),
             Some(notif_json) = notify_rx.recv() => {
-                write_line(&mut write_half, &notif_json).await?;
+                // Bound the write so a stuck reader can't pin the
+                // task indefinitely (review-round-1 M2).
+                match tokio::time::timeout(
+                    request_timeout,
+                    write_line(&mut write_half, &notif_json),
+                ).await {
+                    Ok(res) => res?,
+                    Err(_elapsed) => {
+                        tracing::warn!(
+                            target = "electrum::server",
+                            timeout_secs = request_timeout.as_secs(),
+                            "notification write timed out — closing connection",
+                        );
+                        return Ok(());
+                    }
+                }
             }
             line = read_line_bounded(&mut reader, &mut buf, MAX_LINE_BYTES) => {
+                // The read itself isn't deadlined here — slowloris
+                // protection rides on `request_timeout` bounding the
+                // dispatch path below; an idle connection that never
+                // writes a newline is harmless except for occupying
+                // a connection slot, which the total-conn semaphore
+                // already bounds.
                 let line = match line {
                     Ok(s) => s.to_string(),
                     Err(FramingError::Closed) => return Ok(()),
                     Err(e) => return Err(e),
                 };
-                let response = process_request(&mut dispatch, &line);
+                let response = match tokio::time::timeout(
+                    request_timeout,
+                    async { process_request(&mut dispatch, &line, max_batch) },
+                ).await {
+                    Ok(resp) => resp,
+                    Err(_elapsed) => {
+                        let err = JsonRpcError::bad_request(format!(
+                            "request timed out after {}s", request_timeout.as_secs()
+                        ));
+                        let resp = Response::error(Value::Null, err);
+                        Some(serde_json::to_string(&resp).unwrap_or_default())
+                    }
+                };
                 if let Some(resp_json) = response {
-                    write_line(&mut write_half, &resp_json).await?;
+                    match tokio::time::timeout(
+                        request_timeout,
+                        write_line(&mut write_half, &resp_json),
+                    ).await {
+                        Ok(res) => res?,
+                        Err(_elapsed) => {
+                            tracing::warn!(
+                                target = "electrum::server",
+                                timeout_secs = request_timeout.as_secs(),
+                                "response write timed out — closing connection",
+                            );
+                            return Ok(());
+                        }
+                    }
                 }
             }
         }
@@ -347,7 +411,15 @@ where
 /// (requests with no `id`) since the spec says we don't reply, and
 /// also `None` when a batch contained ONLY notifications. Handles
 /// both single requests and batch arrays per JSON-RPC 2.0 §6.
-fn process_request(dispatch: &mut BoxedDispatch, line: &str) -> Option<String> {
+///
+/// `max_batch_requests` rejects oversized batches before dispatching
+/// any element, preventing a single 1 MiB line from forcing the
+/// server through thousands of method calls (review-round-1 M5).
+fn process_request(
+    dispatch: &mut BoxedDispatch,
+    line: &str,
+    max_batch_requests: usize,
+) -> Option<String> {
     match Requests::parse(line) {
         Ok(Requests::Single(req)) => {
             let is_notification = req.id.is_none();
@@ -359,6 +431,14 @@ fn process_request(dispatch: &mut BoxedDispatch, line: &str) -> Option<String> {
             }
         }
         Ok(Requests::Batch(reqs)) => {
+            if reqs.len() > max_batch_requests {
+                let err = JsonRpcError::bad_request(format!(
+                    "batch too large: {} requests (cap = {max_batch_requests})",
+                    reqs.len()
+                ));
+                let resp = Response::error(Value::Null, err);
+                return serde_json::to_string(&resp).ok();
+            }
             // Per spec: dispatch each, suppress responses for
             // notifications. If the batch contained only
             // notifications, return None (no response written).

@@ -342,10 +342,18 @@ pub struct Config {
     pub electrum_max_conns: usize,
     /// Per-connection scripthash subscription cap.
     pub electrum_max_subs_per_conn: usize,
-    /// Per-request timeout (seconds). Currently advisory in v1 — the
-    /// transport reads each line then dispatches synchronously; we
-    /// rely on bounded I/O caps instead of a strict deadline.
+    /// Per-request timeout (seconds). Wraps the dispatch path
+    /// (read → handler → write) and the TLS handshake via
+    /// `tokio::time::timeout`; an idle or slow client cannot pin a
+    /// connection slot indefinitely. A timed-out dispatch returns
+    /// `bad_request("request timed out after Ns")` on the wire.
     pub electrum_request_timeout: u64,
+    /// Max requests in a single JSON-RPC batch line. Excess batches
+    /// are rejected with `bad_request`.
+    pub electrum_max_batch_requests: usize,
+    /// Max txs in a single `blockchain.transaction.broadcast_package`
+    /// call. Excess packages are rejected with `bad_request`.
+    pub electrum_max_broadcast_package_txs: usize,
     /// Override for `server.banner`. `None` falls back to a default
     /// composed at request time (`format!("powered by satd {}",
     /// version)`).
@@ -766,6 +774,14 @@ impl Config {
             .electrumrequesttimeout
             .or_else(|| file_get("electrumrequesttimeout").and_then(|v| v.parse().ok()))
             .unwrap_or(30);
+        let electrum_max_batch_requests = cli
+            .electrummaxbatchrequests
+            .or_else(|| file_get("electrummaxbatchrequests").and_then(|v| v.parse().ok()))
+            .unwrap_or(16);
+        let electrum_max_broadcast_package_txs = cli
+            .electrummaxbroadcastpackagetxs
+            .or_else(|| file_get("electrummaxbroadcastpackagetxs").and_then(|v| v.parse().ok()))
+            .unwrap_or(25);
         let electrum_banner = cli.electrumbanner.or_else(|| file_get("electrumbanner"));
         // TLS partial-config validation. The server-side `bind` also
         // catches this, but checking here lets us surface a friendlier
@@ -921,6 +937,8 @@ impl Config {
             electrum_max_conns,
             electrum_max_subs_per_conn,
             electrum_request_timeout,
+            electrum_max_batch_requests,
+            electrum_max_broadcast_package_txs,
             electrum_banner,
             prune,
             reindex: cli.reindex,
@@ -1463,6 +1481,20 @@ pub struct CliArgs {
 
     #[arg(
         long,
+        value_name = "N",
+        help = "Max requests per JSON-RPC batch line (default: 16)"
+    )]
+    pub electrummaxbatchrequests: Option<usize>,
+
+    #[arg(
+        long,
+        value_name = "N",
+        help = "Max txs per blockchain.transaction.broadcast_package (default: 25)"
+    )]
+    pub electrummaxbroadcastpackagetxs: Option<usize>,
+
+    #[arg(
+        long,
         value_name = "TEXT",
         help = "Custom banner returned by server.banner"
     )]
@@ -1876,6 +1908,8 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "electrummaxconns",
         "electrummaxsubsperconn",
         "electrumrequesttimeout",
+        "electrummaxbatchrequests",
+        "electrummaxbroadcastpackagetxs",
         "electrumbanner",
         "prune",
         "reindex",
@@ -2150,6 +2184,8 @@ rpcport=8332
             electrummaxconns: None,
             electrummaxsubsperconn: None,
             electrumrequesttimeout: None,
+            electrummaxbatchrequests: None,
+            electrummaxbroadcastpackagetxs: None,
             electrumbanner: None,
             prune: None,
             reindex: false,
@@ -2259,6 +2295,8 @@ rpcport=8332
             electrummaxconns: None,
             electrummaxsubsperconn: None,
             electrumrequesttimeout: None,
+            electrummaxbatchrequests: None,
+            electrummaxbroadcastpackagetxs: None,
             electrumbanner: None,
             prune: None,
             reindex: false,

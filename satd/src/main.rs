@@ -1040,6 +1040,8 @@ async fn main() {
             max_conns: config.electrum_max_conns,
             max_subs_per_conn: config.electrum_max_subs_per_conn,
             request_timeout: std::time::Duration::from_secs(config.electrum_request_timeout),
+            max_batch_requests: config.electrum_max_batch_requests,
+            max_broadcast_package_txs: config.electrum_max_broadcast_package_txs,
         };
         let electrum_extras: std::sync::Arc<dyn electrum_proto::ElectrumExtras> =
             std::sync::Arc::new(electrum_proto::RocksElectrumExtras::new(

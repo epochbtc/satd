@@ -19,9 +19,18 @@ use crate::subscribe::{HeadersSource, Subscriptions};
 use crate::types::{ScripthashHex, parse_wire_scripthash};
 
 /// Inbound JSON-RPC 2.0 request.
+///
+/// `jsonrpc` is `Option<String>` (not required) because real-world
+/// Electrum clients — Sparrow, BlueWallet, the Electrum desktop
+/// reference client — routinely omit the field. JSON-RPC 2.0 §4
+/// nominally requires `"jsonrpc":"2.0"`, but in the Electrum wire
+/// dialect the field is optional and `romanz/electrs` accepts
+/// requests without it. Rejecting them would block standard wallet
+/// traffic, which is the whole point of the server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Request {
-    pub jsonrpc: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jsonrpc: Option<String>,
     /// Notifications (no `id`) are valid JSON-RPC; for Electrum we don't
     /// receive any in normal flow but accept them gracefully (the
     /// response is suppressed).
@@ -374,6 +383,36 @@ mod tests {
         let req = Request::parse(s).unwrap();
         assert_eq!(req.method, "server.ping");
         assert_eq!(req.id, Some(Value::from(1)));
+        assert_eq!(req.jsonrpc.as_deref(), Some("2.0"));
+    }
+
+    #[test]
+    fn parse_request_without_jsonrpc_field() {
+        // H1 (review round 1): real-world Electrum clients (Sparrow,
+        // Electrum desktop) routinely omit `jsonrpc`. Server MUST
+        // accept the request; rejecting it would block standard
+        // wallet traffic.
+        let s = r#"{"id":1,"method":"server.version","params":["Electrum","1.4"]}"#;
+        let req = Request::parse(s).unwrap();
+        assert_eq!(req.method, "server.version");
+        assert_eq!(req.id, Some(Value::from(1)));
+        assert!(req.jsonrpc.is_none());
+    }
+
+    #[test]
+    fn parse_batch_with_mixed_jsonrpc_fields() {
+        // Batch with one item having jsonrpc and one without — both
+        // must parse and dispatch.
+        let s = r#"[{"id":1,"method":"server.ping"},{"jsonrpc":"2.0","id":2,"method":"server.ping"}]"#;
+        let parsed = Requests::parse(s).unwrap();
+        match parsed {
+            Requests::Batch(reqs) => {
+                assert_eq!(reqs.len(), 2);
+                assert!(reqs[0].jsonrpc.is_none());
+                assert_eq!(reqs[1].jsonrpc.as_deref(), Some("2.0"));
+            }
+            Requests::Single(_) => panic!("expected Batch"),
+        }
     }
 
     #[test]

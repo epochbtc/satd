@@ -2,10 +2,11 @@
 //!
 //! Electrum uses a line-protocol over TCP: requests are JSON objects
 //! terminated by `\n`, responses too. A single line carries one
-//! request or one response. We deliberately do NOT support batch
-//! requests (the spec allows `[req, req, ...]` as an array; almost no
-//! Electrum client uses it and it complicates per-request timeouts +
-//! subscription state). A batch request sees a JSON-RPC error.
+//! request, one batch (JSON-RPC 2.0 §6 — `[req, req, ...]`), or one
+//! response/notification. Batch dispatch is implemented in
+//! [`crate::server::process_request`] via
+//! [`crate::dispatch::Requests`]; per-batch length is capped by
+//! `ElectrumConfig::max_batch_requests`.
 
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};

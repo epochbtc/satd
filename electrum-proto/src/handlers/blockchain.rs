@@ -57,11 +57,21 @@ pub fn headers_get(state: &ElectrumState, params: Value) -> Result<Value, JsonRp
 // ── blockchain.block.* ────────────────────────────────────────────
 
 pub fn block_header(state: &ElectrumState, params: Value) -> Result<Value, JsonRpcError> {
-    // `(height, [cp_height])` — we accept the cp_height arg for
-    // protocol compatibility but ignore it (no checkpoint-proof
-    // support in v1; the caller gets the raw header alone).
+    // `(height, [cp_height])` — `cp_height=0` (or omitted) returns
+    // the raw 80-byte header. Nonzero `cp_height` requests a
+    // checkpoint proof against block `cp_height`'s merkle root over
+    // headers, which v1 doesn't implement. Per M3 (review round 1),
+    // silently returning the proof-less response was a compatibility
+    // hazard — clients that pass `cp_height` get a structured error
+    // they can surface, instead of a half-shaped lie.
     let arr = require_array_range(&params, 1, 2, "blockchain.block.header")?;
     let height = parse_height(&arr[0])?;
+    let cp_height = arr.get(1).map(|v| parse_u32(v, "cp_height")).transpose()?;
+    if cp_height.unwrap_or(0) != 0 {
+        return Err(JsonRpcError::bad_request(
+            "checkpoint proof (nonzero cp_height) is not supported by this server",
+        ));
+    }
     let header = state
         .electrum_extras
         .header_at(height)
@@ -70,10 +80,18 @@ pub fn block_header(state: &ElectrumState, params: Value) -> Result<Value, JsonR
 }
 
 pub fn block_headers(state: &ElectrumState, params: Value) -> Result<Value, JsonRpcError> {
-    // `(start_height, count, [cp_height])`
+    // `(start_height, count, [cp_height])` — same `cp_height`
+    // semantics as `block_header`. Reject nonzero values until
+    // checkpoint proofs are implemented (M3, review round 1).
     let arr = require_array_range(&params, 2, 3, "blockchain.block.headers")?;
     let start = parse_height(&arr[0])?;
     let count_req = parse_u32(&arr[1], "count")?;
+    let cp_height = arr.get(2).map(|v| parse_u32(v, "cp_height")).transpose()?;
+    if cp_height.unwrap_or(0) != 0 {
+        return Err(JsonRpcError::bad_request(
+            "checkpoint proof (nonzero cp_height) is not supported by this server",
+        ));
+    }
     let max = state.config.max_headers_per_request;
     let want = count_req.min(max);
 
@@ -368,7 +386,7 @@ pub fn transaction_get(state: &ElectrumState, params: Value) -> Result<Value, Js
         };
 
     if verbose {
-        Ok(verbose_transaction_json(&tx, location.as_ref()))
+        Ok(verbose_transaction_json(&tx, location.as_ref(), state.network))
     } else {
         Ok(Value::String(hex::encode(serialize(&tx))))
     }
@@ -393,6 +411,12 @@ struct TxLocation {
 /// vsize, weight, locktime, vin, vout, hex; plus blockhash,
 /// confirmations, time, blocktime when `location` is `Some`).
 ///
+/// `network` is the active chain network (mainnet / testnet / signet
+/// / regtest). It controls the address prefix in
+/// `vout[].scriptPubKey.address` so verbose responses are
+/// network-correct on every chain. Hardcoding mainnet would emit
+/// `1...`/`bc1...` strings on regtest, which wallets reject.
+///
 /// Notes on wire fidelity:
 /// - `vout[].value` is BTC as a JSON number. Core emits 8-decimal
 ///   strings (e.g. `0.00050000`); serde_json renders f64 without
@@ -404,7 +428,11 @@ struct TxLocation {
 /// - `coinbase` variant of `vin[]` omits txid/vout/scriptSig per Core.
 /// - `txinwitness` is omitted (not present in JSON) for non-segwit
 ///   inputs, matching Core.
-fn verbose_transaction_json(tx: &Transaction, location: Option<&TxLocation>) -> Value {
+fn verbose_transaction_json(
+    tx: &Transaction,
+    location: Option<&TxLocation>,
+    network: bitcoin::Network,
+) -> Value {
     let raw = serialize(tx);
     let txid = tx.compute_txid();
     let wtxid = tx.compute_wtxid();
@@ -459,9 +487,7 @@ fn verbose_transaction_json(tx: &Transaction, location: Option<&TxLocation>) -> 
             // single canonical address (P2PKH, P2SH, P2WPKH, P2WSH,
             // P2TR). `Address::from_script` returns Err for
             // multisig / OP_RETURN / nonstandard so we omit gracefully.
-            if let Ok(addr) =
-                bitcoin::Address::from_script(&output.script_pubkey, bitcoin::Network::Bitcoin)
-            {
+            if let Ok(addr) = bitcoin::Address::from_script(&output.script_pubkey, network) {
                 spk["address"] = Value::String(addr.to_string());
             }
             json!({
@@ -585,6 +611,14 @@ pub fn transaction_broadcast_package(
     })?;
     let _verbose = arr.get(1).and_then(|v| v.as_bool()).unwrap_or(false);
 
+    let max_pkg = state.config.max_broadcast_package_txs;
+    if txs_array.len() > max_pkg {
+        return Err(JsonRpcError::bad_request(format!(
+            "broadcast package too large: {} txs (cap = {max_pkg})",
+            txs_array.len()
+        )));
+    }
+
     // Decode every tx up front so a single bad hex doesn't leave us
     // with a half-broadcast package. Decode failures are JSON-RPC
     // -32602 (invalid params) — same as `transaction_broadcast`.
@@ -665,18 +699,31 @@ pub fn estimatefee(state: &ElectrumState, params: Value) -> Result<Value, JsonRp
     let arr = require_array(&params, 1, "blockchain.estimatefee")?;
     let target = parse_u32(&arr[0], "num_blocks")?;
     let est = state.fee_estimator.estimate_fee(target);
-    // Electrum returns BTC/kB or -1 if unknown. `estimate_fee` is
-    // sat/kvB.
+    // M1 (review round 1): satd's internal fee_rate unit is
+    // **sat per 1000 weight units** (`fee * 1000 / weight`), NOT
+    // sat/kvB. The Electrum wire returns BTC per kB. Conversion:
+    //   1 vB = 4 WU, so 1000 vB = 4000 WU = 4 × 1000 WU
+    //   sat/(1000 WU) × 4 = sat/(1000 vB) = sat/kvB
+    //   BTC/kB = sat/kvB / 1e8 = (sat/(1000 WU) × 4) / 1e8
+    // Prior code skipped the ×4, underreporting fees by ~4x.
     Ok(match est {
-        Some(sats_per_kvb) => json!((sats_per_kvb as f64) / 1.0e8),
+        Some(sat_per_1000_wu) => json!(sat_per_1000_wu_to_btc_per_kb(sat_per_1000_wu)),
         None => json!(-1.0),
     })
 }
 
 pub fn relayfee(state: &ElectrumState) -> Result<Value, JsonRpcError> {
-    // Same conversion: sat/kvB → BTC/kB.
-    let sats_per_kvb = state.mempool.policy().min_fee_rate;
-    Ok(json!((sats_per_kvb as f64) / 1.0e8))
+    // Same conversion as `estimatefee` — sat/(1000 WU) → BTC/kB.
+    // `min_fee_rate` is the mempool's admission policy in sat per
+    // 1000 weight units, mirroring `Mempool::accept_transaction`.
+    let sat_per_1000_wu = state.mempool.policy().min_fee_rate;
+    Ok(json!(sat_per_1000_wu_to_btc_per_kb(sat_per_1000_wu)))
+}
+
+/// Convert satd's internal `sat per 1000 weight units` fee rate to
+/// the BTC/kB unit Electrum clients expect on the wire. See M1 above.
+pub(crate) fn sat_per_1000_wu_to_btc_per_kb(sat_per_1000_wu: u64) -> f64 {
+    (sat_per_1000_wu * 4) as f64 / 100_000_000.0
 }
 
 // ── helpers ───────────────────────────────────────────────────────
@@ -790,5 +837,23 @@ mod tests {
     fn fee_histogram_empty_input_yields_empty_output() {
         let buckets = fee_histogram_buckets(&[]);
         assert!(buckets.is_empty());
+    }
+
+    #[test]
+    fn fee_unit_conversion_matches_known_fixture() {
+        // M1 (review round 1): a 1 sat/vB transaction has internal
+        // `fee * 1000 / weight = 250` (since vB = WU/4). The Electrum
+        // wire expects 0.00001000 BTC/kB = 1 sat/vB × 1000 / 1e8.
+        // Pre-fix, satd returned 0.00000250 — 4x too low.
+        let one_sat_per_vb = 250u64;
+        let btc_per_kb = sat_per_1000_wu_to_btc_per_kb(one_sat_per_vb);
+        // Allow tiny float epsilon.
+        assert!((btc_per_kb - 0.00001000).abs() < 1e-12, "{btc_per_kb}");
+
+        // 10 sat/vB → internal 2500 → 0.0001 BTC/kB.
+        assert!((sat_per_1000_wu_to_btc_per_kb(2500) - 0.0001).abs() < 1e-12);
+
+        // 0 / unknown stays 0.
+        assert_eq!(sat_per_1000_wu_to_btc_per_kb(0), 0.0);
     }
 }

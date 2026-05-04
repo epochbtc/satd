@@ -27,6 +27,11 @@ pub enum TlsConfigError {
     },
     #[error("no certificates found in {path}")]
     NoCerts { path: String },
+    #[error("malformed certificate in {path}: {source}")]
+    BadCert {
+        path: String,
+        source: std::io::Error,
+    },
     #[error("no private key found in {path}")]
     NoKey { path: String },
     #[error("rustls config: {0}")]
@@ -54,9 +59,18 @@ fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, TlsConfigErro
         source,
     })?;
     let mut reader = BufReader::new(file);
-    let certs: Vec<_> = rustls_pemfile::certs(&mut reader)
-        .filter_map(Result::ok)
-        .collect();
+    // L1 (review round 1): collect into `Result<Vec<_>, _>` instead
+    // of `filter_map(Result::ok)`. A malformed PEM block mixed with
+    // valid certs would otherwise be silently discarded — startup
+    // succeeds with a partial chain that fails handshakes later.
+    // Fail fast at startup so the operator sees the misconfiguration
+    // immediately.
+    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| TlsConfigError::BadCert {
+            path: path_str.clone(),
+            source,
+        })?;
     if certs.is_empty() {
         return Err(TlsConfigError::NoCerts { path: path_str });
     }
