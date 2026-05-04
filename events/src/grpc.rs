@@ -7,8 +7,10 @@
 //! state (broadcast receiver + filter) lives on the streaming task spawned
 //! by tonic for each incoming RPC.
 //!
-//! Lag handling matches the Esplora SSE pattern — `Lagged` increments a
-//! per-client gauge and the stream continues. Sinks must never panic.
+//! Lag handling matches the Esplora SSE pattern — `Lagged` is logged at
+//! `warn` level (`target = "events::grpc"`) and the stream continues.
+//! Sinks must never panic. Per-client metrics (active subscribers,
+//! cumulative lag, dropped count) are deferred to a follow-up.
 
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
