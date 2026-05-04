@@ -111,7 +111,7 @@ impl Subscriptions {
         // client.
         let receiver = idx
             .subscribe(sh)
-            .map_err(|e| JsonRpcError::new(3, format!("subscribe: {e}")))?;
+            .map_err(|e| JsonRpcError::bad_request(format!("subscribe: {e}")))?;
 
         let tx = self.notify_tx.clone();
         let handle = tokio::spawn(async move {
@@ -197,7 +197,7 @@ async fn forward_scripthash(
                 };
                 let notif = Notification::new(
                     "blockchain.scripthash.subscribe",
-                    json!([hex::encode(sh), status_param]),
+                    json!([crate::types::scripthash_to_wire_hex(&sh), status_param]),
                 );
                 let s = match serde_json::to_string(&notif) {
                     Ok(s) => s,
@@ -214,7 +214,7 @@ async fn forward_scripthash(
             Err(broadcast::error::RecvError::Lagged(n)) => {
                 warn!(
                     target = "electrum::subscribe",
-                    scripthash = %hex::encode(sh),
+                    scripthash = %crate::types::scripthash_to_wire_hex(&sh),
                     dropped = n,
                     "scripthash subscription lagged",
                 );
@@ -485,7 +485,10 @@ mod tests {
         let (tx, _rx) = mpsc::channel(8);
         let mut subs = Subscriptions::new(tx, 100);
         let err = subs.add_scripthash([0xbb; 32], &idx).unwrap_err();
-        assert_eq!(err.code, 3);
+        // Server-wide cap surfaced via electrs-style BadRequest (code 1)
+        // — same code the at-capacity overflow path uses so retrying
+        // wallets can converge on a single backoff behaviour.
+        assert_eq!(err.code, 1);
     }
 
     #[tokio::test]

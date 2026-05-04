@@ -11,11 +11,13 @@ use crate::error::JsonRpcError;
 use crate::state::ElectrumState;
 
 /// `server.version([client_name, protocol_version])` — returns
-/// `[server_name, protocol_version]`. Per the Electrum spec, the
-/// client may pass either a single string for `protocol_version` or a
-/// `[min, max]` pair; we accept both and report a single supported
-/// version. If the requested range excludes ours we error with
-/// `code 1`.
+/// `[server_name, protocol_version]`. Per the Electrum spec (and
+/// `romanz/electrs`'s implementation), the client may pass either a
+/// single string for `protocol_version` (interpreted as a single
+/// **exact** target version) or a `[min, max]` pair. The single-string
+/// form is NOT a min-only — electrs's `check_between(version, single,
+/// single)` rejects clients that don't match exactly. We mirror that
+/// to keep the `server.version` contract identical.
 pub fn version(_state: &ElectrumState, params: Value) -> Result<Value, JsonRpcError> {
     // Client name + protocol-version arg are both optional. We do
     // intersection logic only when we got a useful protocol-version.
@@ -28,14 +30,13 @@ pub fn version(_state: &ElectrumState, params: Value) -> Result<Value, JsonRpcEr
     let proto_arg = arr.get(1).cloned().unwrap_or(Value::Null);
 
     let supported = PROTOCOL_VERSION;
-    // Per the Electrum spec, the client's protocol_version arg is
-    // either a single string (the minimum version the client requires)
-    // or an explicit `[min, max]` pair. In the single-string case
-    // there is no upper bound — the server picks its own version
-    // unconditionally as long as it's >= the client's min.
+    // Spec / electrs:
+    // - missing or null: accept; pick our supported version.
+    // - single string: must match supported EXACTLY.
+    // - [min, max] pair: supported must lie in [min, max].
     let intersect_ok = match &proto_arg {
         Value::Null => true,
-        Value::String(min) => !matches!(version_compare(supported, min), std::cmp::Ordering::Less),
+        Value::String(exact) => version_in_range(exact, exact, supported),
         Value::Array(a) => {
             let min = a.first().and_then(|v| v.as_str()).unwrap_or(supported);
             let max = a.get(1).and_then(|v| v.as_str()).unwrap_or(supported);
@@ -45,10 +46,9 @@ pub fn version(_state: &ElectrumState, params: Value) -> Result<Value, JsonRpcEr
     };
 
     if !intersect_ok {
-        return Err(JsonRpcError::new(
-            1,
-            format!("unsupported protocol version range; server speaks {supported}"),
-        ));
+        return Err(JsonRpcError::bad_request(format!(
+            "unsupported protocol version; server speaks {supported}"
+        )));
     }
 
     let server_name = format!("satd/{}", env!("CARGO_PKG_VERSION"));
@@ -79,18 +79,35 @@ pub fn donation_address(state: &ElectrumState) -> Result<Value, JsonRpcError> {
 }
 
 /// `server.features()` — small descriptor dict consumed by some
-/// clients. We expose the honest minimum: hosts (empty), genesis hash,
-/// supported protocol min/max (both = our PROTOCOL_VERSION since we
-/// don't negotiate), and a server name. No pruning advertisement.
+/// clients. Mirrors `romanz/electrs`'s shape: genesis hash, supported
+/// protocol min/max (both = our PROTOCOL_VERSION since we don't
+/// negotiate), server name, and the `hosts` map populated with
+/// `tcp_port` (and `ssl_port` when TLS is bound) so peer-discovery
+/// clients can distinguish service ports.
 pub fn features(state: &ElectrumState) -> Result<Value, JsonRpcError> {
     let genesis_hash = state
         .chain
         .get_block_hash_by_height(0)
         .map(|h| h.to_string())
         .unwrap_or_default();
+    let mut host_entry = serde_json::Map::new();
+    host_entry.insert("tcp_port".into(), json!(state.config.bind.port()));
+    if let Some(tls) = state.config.tls_bind {
+        host_entry.insert("ssl_port".into(), json!(tls.port()));
+    }
+    let mut hosts = serde_json::Map::new();
+    // Use the bind host as the dictionary key. Real electrs
+    // deployments key on the public hostname; here we only know the
+    // bound socket, which is good enough for clients that round-trip
+    // the structure (Sparrow, Electrum desktop) and don't validate
+    // hostnames.
+    hosts.insert(
+        state.config.bind.ip().to_string(),
+        Value::Object(host_entry),
+    );
     Ok(json!({
         "genesis_hash": genesis_hash,
-        "hosts": serde_json::Map::new(),
+        "hosts": hosts,
         "protocol_max": PROTOCOL_VERSION,
         "protocol_min": PROTOCOL_VERSION,
         "pruning": serde_json::Value::Null,
@@ -136,5 +153,16 @@ mod tests {
         assert!(version_in_range("1.4.5", "1.4.5", "1.4.5"));
         assert!(!version_in_range("1.5", "2.0", "1.4.5"));
         assert!(!version_in_range("1.0", "1.3", "1.4.5"));
+    }
+
+    #[test]
+    fn version_in_range_single_exact_match() {
+        // Per electrs, single-string `protocol_version` is an exact
+        // target — `check_between(ours, single, single)`. Our
+        // PROTOCOL_VERSION is "1.4"; a client sending "1.4" passes,
+        // a client sending "1.4.5" or "1.5" does not.
+        assert!(version_in_range("1.4", "1.4", "1.4"));
+        assert!(!version_in_range("1.4.5", "1.4.5", "1.4"));
+        assert!(!version_in_range("1.5", "1.5", "1.4"));
     }
 }

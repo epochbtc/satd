@@ -44,7 +44,9 @@ pub mod tls;
 pub mod types;
 
 pub use config::ElectrumConfig;
-pub use dispatch::{Notification, Request, Response, dispatch, dispatch_with_subscriptions};
+pub use dispatch::{
+    Notification, Request, Requests, Response, dispatch, dispatch_with_subscriptions,
+};
 pub use error::JsonRpcError;
 pub use extras::{ElectrumExtras, RocksElectrumExtras, TxConfirmation, TxMerkleProof};
 pub use merkle::{compute_merkle_branch, merkle_root};
@@ -60,7 +62,9 @@ pub use types::{
 };
 
 /// Electrum protocol version this server reports via `server.version`.
-/// Matches `romanz/electrs` at the pinned reference; safer than `1.4`
-/// because some clients gate `blockchain.scripthash.subscribe`
-/// semantics on `>= 1.4.2`.
-pub const PROTOCOL_VERSION: &str = "1.4.5";
+/// Matches `romanz/electrs` v0.11.1
+/// (commit `35216c6d30148be8e6763d913d437330f431fc03`,
+/// `src/electrum.rs::PROTOCOL_VERSION`). The single-string form means
+/// `server.version` negotiation expects an exact match — the client's
+/// stated version must be `1.4` to be acceptable, just like electrs.
+pub const PROTOCOL_VERSION: &str = "1.4";

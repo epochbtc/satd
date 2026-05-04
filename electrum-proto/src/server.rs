@@ -31,7 +31,7 @@ use tokio::sync::{Semaphore, mpsc, watch};
 use tokio_rustls::TlsAcceptor;
 
 use crate::config::ElectrumConfig;
-use crate::dispatch::{Notification, Request, Response, dispatch_with_subscriptions};
+use crate::dispatch::{Notification, Request, Requests, Response, dispatch_with_subscriptions};
 use crate::error::JsonRpcError;
 use crate::rpc::{FramingError, MAX_LINE_BYTES, read_line_bounded, write_line};
 use crate::state::ElectrumState;
@@ -344,23 +344,43 @@ where
 }
 
 /// Parse + dispatch + serialize. Returns `None` for notifications
-/// (requests with no `id`) since the spec says we don't reply.
+/// (requests with no `id`) since the spec says we don't reply, and
+/// also `None` when a batch contained ONLY notifications. Handles
+/// both single requests and batch arrays per JSON-RPC 2.0 §6.
 fn process_request(dispatch: &mut BoxedDispatch, line: &str) -> Option<String> {
-    let req = match Request::parse(line) {
-        Ok(r) => r,
+    match Requests::parse(line) {
+        Ok(Requests::Single(req)) => {
+            let is_notification = req.id.is_none();
+            let resp = dispatch(req);
+            if is_notification {
+                None
+            } else {
+                serde_json::to_string(&resp).ok()
+            }
+        }
+        Ok(Requests::Batch(reqs)) => {
+            // Per spec: dispatch each, suppress responses for
+            // notifications. If the batch contained only
+            // notifications, return None (no response written).
+            let mut responses: Vec<Response> = Vec::with_capacity(reqs.len());
+            for req in reqs {
+                let is_notification = req.id.is_none();
+                let resp = dispatch(req);
+                if !is_notification {
+                    responses.push(resp);
+                }
+            }
+            if responses.is_empty() {
+                None
+            } else {
+                serde_json::to_string(&responses).ok()
+            }
+        }
         Err(err) => {
             let resp = Response::error(Value::Null, err);
-            return serde_json::to_string(&resp).ok();
+            serde_json::to_string(&resp).ok()
         }
-    };
-
-    let is_notification = req.id.is_none();
-    let resp = dispatch(req);
-
-    if is_notification {
-        return None;
     }
-    serde_json::to_string(&resp).ok()
 }
 
 /// Render a JSON-RPC notification as a writeable line. Used by
@@ -372,7 +392,10 @@ pub fn render_notification(n: &Notification) -> Result<String, serde_json::Error
 }
 
 async fn reject_overflow(mut stream: TcpStream) -> io::Result<()> {
-    let err = JsonRpcError::new(4, "server is at connection capacity; please retry shortly");
+    // Code 1 (bad_request): mirrors electrs's "client overload" wire
+    // shape — clients see a structured error and can retry with backoff
+    // instead of treating the close as a network failure.
+    let err = JsonRpcError::bad_request("server is at connection capacity; please retry shortly");
     let resp = Response::error(Value::Null, err);
     if let Ok(s) = serde_json::to_string(&resp) {
         let _ = stream.write_all(s.as_bytes()).await;
@@ -531,7 +554,11 @@ mod tests {
         let mut reader2 = tokio::io::BufReader::new(stream2);
         let line = read_response_line(&mut reader2).await;
         let v: Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(v["error"]["code"], 4);
+        // Reject uses electrs-style BadRequest (code 1) for at-capacity
+        // refusal — same code path electrs uses for any handler-level
+        // refusal so client retry/backoff logic doesn't have to special-
+        // case our overflow signal.
+        assert_eq!(v["error"]["code"], 1);
 
         drop(hold_stream);
         sd_tx.send(true).unwrap();

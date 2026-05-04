@@ -7852,7 +7852,9 @@ fn test_electrum_server_version_round_trips() {
         server_name.starts_with("satd/"),
         "server.version should report satd/<ver>; got {server_name}"
     );
-    assert_eq!(result[1], "1.4.5", "protocol version should be 1.4.5");
+    // Protocol version matches romanz/electrs v0.11.1 — `"1.4"`. See
+    // electrum-proto::PROTOCOL_VERSION for the rationale.
+    assert_eq!(result[1], "1.4", "protocol version should be 1.4");
 
     node.stop();
 }

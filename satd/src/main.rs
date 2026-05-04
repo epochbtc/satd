@@ -664,12 +664,14 @@ async fn main() {
         let task_index = address_index_concrete.clone();
         let task_registry = address_index_concrete.subscription_registry();
         let task_chain = chain_state.clone();
+        let task_mempool = mempool.clone();
         let task_shutdown = shutdown_rx.clone();
         tokio::spawn(async move {
             node::index::address::notifier_task(
                 task_index,
                 task_registry,
                 task_chain,
+                task_mempool,
                 addr_notifier_chain_event_rx,
                 task_shutdown,
             )
