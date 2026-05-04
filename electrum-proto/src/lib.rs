@@ -39,16 +39,20 @@ pub mod rpc;
 pub mod server;
 pub mod state;
 pub mod status;
+pub mod subscribe;
 pub mod types;
 
 pub use config::ElectrumConfig;
-pub use dispatch::{Notification, Request, Response, dispatch};
+pub use dispatch::{Notification, Request, Response, dispatch, dispatch_with_subscriptions};
 pub use error::JsonRpcError;
 pub use extras::{ElectrumExtras, RocksElectrumExtras, TxConfirmation, TxMerkleProof};
 pub use merkle::{compute_merkle_branch, merkle_root};
-pub use server::{DispatchFn, ElectrumServer, ElectrumServerError, state_dispatcher};
+pub use server::{
+    BoxedDispatch, ConnectionFactory, ElectrumServer, ElectrumServerError, state_connection_factory,
+};
 pub use state::ElectrumState;
 pub use status::compute_status_hash;
+pub use subscribe::{HeadersSource, NOTIFY_CHANNEL_CAP, Subscriptions};
 pub use types::{
     BalanceResponse, FeeHistogramEntry, GetMerkleResponse, HeadersResponse, HistoryEntry,
     ListUnspentEntry, ScripthashHex, TxidHex,

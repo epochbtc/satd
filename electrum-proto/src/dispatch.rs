@@ -5,12 +5,18 @@
 //! a [`Response`] by routing on `method` and invoking the appropriate
 //! handler from [`crate::handlers`].
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::JsonRpcError;
+use crate::extras::ElectrumExtras;
 use crate::handlers;
 use crate::state::ElectrumState;
+use crate::status::compute_status_hash;
+use crate::subscribe::{HeadersSource, Subscriptions};
+use crate::types::ScripthashHex;
 
 /// Inbound JSON-RPC 2.0 request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -174,6 +180,114 @@ pub fn dispatch(state: &ElectrumState, req: Request) -> Response {
         Ok(result) => Response::success(id, result),
         Err(err) => Response::error(id, err),
     }
+}
+
+/// Subscription-aware dispatch. Handles
+/// `blockchain.scripthash.subscribe` / `unsubscribe` and
+/// `blockchain.headers.subscribe` by registering / cancelling against
+/// the per-connection [`Subscriptions`] AND computing the synchronous
+/// initial response. All other methods fall through to
+/// [`dispatch`].
+///
+/// `headers_source` is the `ChainState` (or test fake) the headers
+/// subscription will read `ChainEvent`s from. It's plumbed in as a
+/// trait object so the connection layer can swap the concrete source
+/// without coupling this module to `ChainState`.
+pub fn dispatch_with_subscriptions(
+    state: &ElectrumState,
+    subs: &mut Subscriptions,
+    headers_source: &dyn HeadersSource,
+    extras: Arc<dyn ElectrumExtras>,
+    req: Request,
+) -> Response {
+    let id = req.id.clone().unwrap_or(Value::Null);
+    let outcome: Result<Value, JsonRpcError> = match req.method.as_str() {
+        "blockchain.scripthash.subscribe" => handle_scripthash_subscribe(state, subs, &req),
+        "blockchain.scripthash.unsubscribe" => handle_scripthash_unsubscribe(subs, &req),
+        "blockchain.headers.subscribe" => {
+            handle_headers_subscribe(state, subs, headers_source, extras, &req)
+        }
+        _ => return dispatch(state, req),
+    };
+    match outcome {
+        Ok(result) => Response::success(id, result),
+        Err(err) => Response::error(id, err),
+    }
+}
+
+fn handle_scripthash_subscribe(
+    state: &ElectrumState,
+    subs: &mut Subscriptions,
+    req: &Request,
+) -> Result<Value, JsonRpcError> {
+    let params = req.params.clone().unwrap_or(Value::Array(Vec::new()));
+    let arr = require_array_range(&params, 1, 1, "blockchain.scripthash.subscribe")?;
+    let s = arr[0]
+        .as_str()
+        .ok_or_else(|| JsonRpcError::invalid_params("scripthash must be a string"))?;
+    let bytes =
+        hex::decode(s).map_err(|e| JsonRpcError::invalid_params(format!("bad scripthash: {e}")))?;
+    if bytes.len() != 32 {
+        return Err(JsonRpcError::invalid_params(
+            "scripthash must be 64 hex chars (32 bytes)",
+        ));
+    }
+    let mut sh = [0u8; 32];
+    sh.copy_from_slice(&bytes);
+
+    // Register first so the connection captures any update that happens
+    // between this point and the synchronous status read below. The
+    // initial status read MAY be slightly stale relative to the next
+    // notification — that's fine: clients dedup on status hash, and an
+    // extra notification with an unchanged hash is suppressed by
+    // `SubscriptionRegistry::maybe_notify`.
+    subs.add_scripthash(sh, state.address_index.as_ref())?;
+
+    let h = compute_status_hash(state.address_index.as_ref(), ScripthashHex(sh))
+        .map_err(JsonRpcError::from_index)?;
+    Ok(match crate::status::status_hash_to_json(h) {
+        Some(s) => Value::String(s),
+        None => Value::Null,
+    })
+}
+
+fn handle_scripthash_unsubscribe(
+    subs: &mut Subscriptions,
+    req: &Request,
+) -> Result<Value, JsonRpcError> {
+    let params = req.params.clone().unwrap_or(Value::Array(Vec::new()));
+    let arr = require_array_range(&params, 1, 1, "blockchain.scripthash.unsubscribe")?;
+    let s = arr[0]
+        .as_str()
+        .ok_or_else(|| JsonRpcError::invalid_params("scripthash must be a string"))?;
+    let bytes =
+        hex::decode(s).map_err(|e| JsonRpcError::invalid_params(format!("bad scripthash: {e}")))?;
+    if bytes.len() != 32 {
+        return Err(JsonRpcError::invalid_params(
+            "scripthash must be 64 hex chars (32 bytes)",
+        ));
+    }
+    let mut sh = [0u8; 32];
+    sh.copy_from_slice(&bytes);
+    let _ = subs.remove_scripthash(&sh);
+    // Per Electrum spec, return true regardless of whether a
+    // subscription existed.
+    Ok(Value::Bool(true))
+}
+
+fn handle_headers_subscribe(
+    state: &ElectrumState,
+    subs: &mut Subscriptions,
+    headers_source: &dyn HeadersSource,
+    extras: Arc<dyn ElectrumExtras>,
+    _req: &Request,
+) -> Result<Value, JsonRpcError> {
+    subs.add_headers(headers_source, extras.clone())?;
+    let (height, header) = state.electrum_extras.tip();
+    Ok(serde_json::json!({
+        "height": height,
+        "hex": hex::encode(bitcoin::consensus::encode::serialize(&header)),
+    }))
 }
 
 // ── Param parsing helpers ──────────────────────────────────────────
