@@ -780,6 +780,11 @@ async fn main() {
     // long-running blocking tasks like the backfill runner, which
     // would keep the Tokio runtime alive past the deadline.
     let shutdown_signal_tx = shutdown_tx.clone();
+    // Live listener status — populated as each optional server (Esplora,
+    // Electrum, Electrum TLS) successfully binds below. Read by the
+    // `getserverstatus` RPC. Created before rpc::start so the RPC
+    // handler holds the same Arc the bind sites mutate.
+    let listener_status = node::rpc::server::ServerListenerStatus::new();
     let server_handle = match node::rpc::server::start(
         bind_addr,
         auth.clone(),
@@ -795,6 +800,7 @@ async fn main() {
         config.addressindex,
         Some(backfill_handle.clone()),
         Some(backfill_cmd_tx.clone()),
+        listener_status.clone(),
     )
     .await
     {
@@ -1014,6 +1020,7 @@ async fn main() {
                 }
             };
             tracing::info!(%bind, "Esplora REST listening");
+            listener_status.set_esplora(bind.to_string());
             let mut esplora_shutdown = shutdown_rx.clone();
             tokio::spawn(async move {
                 let serve = axum::serve(listener, router).with_graceful_shutdown(async move {
@@ -1129,6 +1136,10 @@ async fn main() {
             tls_bind = ?electrum_tls_bind,
             "Electrum server listening"
         );
+        listener_status.set_electrum(electrum_bind.to_string());
+        if let Some(tls_bind) = electrum_tls_bind {
+            listener_status.set_electrum_tls(tls_bind.to_string());
+        }
         let electrum_shutdown = shutdown_rx.clone();
         tokio::spawn(async move {
             server.serve(electrum_shutdown).await;

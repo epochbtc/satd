@@ -1227,7 +1227,7 @@ impl Config {
             "electrum": {
                 "enabled": self.electrum,
                 "bind": if self.electrum { Some(self.electrum_bind.clone()) } else { None },
-                "tls_bind": self.electrum_tls_bind.clone(),
+                "tls_bind": if self.electrum { self.electrum_tls_bind.clone() } else { None },
             },
         })
     }

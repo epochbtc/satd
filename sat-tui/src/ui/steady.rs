@@ -100,31 +100,23 @@ pub fn draw(f: &mut Frame, state: &AppState) {
 /// `addr-idx <state>`, `esplora <state>`, `electrum <state>`.
 ///
 /// `<state>` for addr-idx is the backfill summary when one is active
-/// (running / paused / failed), the live `synced` / `lagging` / `off`
-/// label otherwise. For listeners it is the bind address when
-/// enabled, `off` (dim) otherwise. Listener TLS binds, when present,
-/// follow the plain bind in parentheses.
+/// (running / paused / failed), the live `synced`/`syncing`/`off`/`-`
+/// label otherwise. For listeners it is the bind address when bound,
+/// `off` when explicitly not bound, `-` (dim) when status is unknown
+/// (RPC not yet returned, older satd build, transient error). The
+/// Electrum TLS bind, when present, follows the plain bind in
+/// parentheses.
 fn services_line(state: &AppState) -> Line<'static> {
-    let mut spans = Vec::new();
-    spans.push(Span::raw(" "));
+    let mut spans = vec![Span::raw(" ")];
     addr_index_spans(&mut spans, state);
     spans.push(Span::raw("  "));
-    listener_spans(
-        &mut spans,
-        "esplora",
-        state.server_status.esplora.as_ref().map(|l| l.bind.as_str()),
-        None,
-    );
+    listener_spans(&mut spans, "esplora", &state.server_status.esplora, None);
     spans.push(Span::raw("  "));
     listener_spans(
         &mut spans,
         "electrum",
-        state.server_status.electrum.as_ref().map(|l| l.bind.as_str()),
-        state
-            .server_status
-            .electrum_tls
-            .as_ref()
-            .map(|l| l.bind.as_str()),
+        &state.server_status.electrum,
+        Some(&state.server_status.electrum_tls),
     );
     Line::from(spans)
 }
@@ -182,25 +174,33 @@ fn addr_index_spans(spans: &mut Vec<Span<'static>>, state: &AppState) {
         }
         return;
     }
-    match state.server_status.addressindex.as_ref() {
-        None => {
+    match &state.server_status.addressindex {
+        crate::state::ListenerView::Unknown => {
             // No status from satd yet (first poll, older satd, transient
             // RPC error). Stay neutral — don't claim disabled.
             spans.push(dot(Color::DarkGray));
             spans.push(Span::styled(label, Style::default().fg(Color::DarkGray)));
             spans.push(Span::styled(" -", Style::default().fg(Color::DarkGray)));
         }
-        Some(ai) if !ai.enabled => {
+        crate::state::ListenerView::NotBound => {
+            // Should not occur for the addressindex variant — it always
+            // emits a `Bound(_)` view since the daemon always reports
+            // both flags. Render as unknown if we ever see it.
+            spans.push(dot(Color::DarkGray));
+            spans.push(Span::styled(label, Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled(" -", Style::default().fg(Color::DarkGray)));
+        }
+        crate::state::ListenerView::Bound(ai) if !ai.enabled => {
             spans.push(dot(Color::DarkGray));
             spans.push(Span::styled(label, Style::default().fg(Color::DarkGray)));
             spans.push(Span::styled(" off", Style::default().fg(Color::DarkGray)));
         }
-        Some(ai) if ai.complete => {
+        crate::state::ListenerView::Bound(ai) if ai.complete => {
             spans.push(dot(Color::Green));
             spans.push(Span::styled(label, Style::default().fg(Color::White)));
             spans.push(Span::styled(" synced", Style::default().fg(Color::Gray)));
         }
-        Some(_) => {
+        crate::state::ListenerView::Bound(_) => {
             // Enabled but the on-disk completeness marker isn't set —
             // fresh sync still in progress, or a backfill is needed
             // before Electrum / Esplora can bind.
@@ -217,28 +217,34 @@ fn addr_index_spans(spans: &mut Vec<Span<'static>>, state: &AppState) {
 fn listener_spans(
     spans: &mut Vec<Span<'static>>,
     label: &'static str,
-    bind: Option<&str>,
-    tls_bind: Option<&str>,
+    view: &crate::state::ListenerView<crate::state::ListenerStatus>,
+    tls_view: Option<&crate::state::ListenerView<crate::state::ListenerStatus>>,
 ) {
-    match bind {
-        Some(b) => {
-            spans.push(dot(Color::Green));
-            spans.push(Span::styled(label, Style::default().fg(Color::White)));
-            spans.push(Span::styled(
-                format!(" {}", b),
-                Style::default().fg(Color::Gray),
-            ));
-            if let Some(tls) = tls_bind {
-                spans.push(Span::styled(
-                    format!(" (tls {})", tls),
-                    Style::default().fg(Color::Cyan),
-                ));
-            }
+    use crate::state::ListenerView::*;
+    match view {
+        Unknown => {
+            spans.push(dot(Color::DarkGray));
+            spans.push(Span::styled(label, Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled(" -", Style::default().fg(Color::DarkGray)));
         }
-        None => {
+        NotBound => {
             spans.push(dot(Color::DarkGray));
             spans.push(Span::styled(label, Style::default().fg(Color::DarkGray)));
             spans.push(Span::styled(" off", Style::default().fg(Color::DarkGray)));
+        }
+        Bound(l) => {
+            spans.push(dot(Color::Green));
+            spans.push(Span::styled(label, Style::default().fg(Color::White)));
+            spans.push(Span::styled(
+                format!(" {}", l.bind),
+                Style::default().fg(Color::Gray),
+            ));
+            if let Some(Bound(tls)) = tls_view {
+                spans.push(Span::styled(
+                    format!(" (tls {})", tls.bind),
+                    Style::default().fg(Color::Cyan),
+                ));
+            }
         }
     }
 }
