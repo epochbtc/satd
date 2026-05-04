@@ -1,0 +1,62 @@
+//! Resolved Electrum-server configuration. Mirrors the `--electrum*`
+//! CLI flags from `satd::config`. Populated by the daemon at startup
+//! and frozen for the server's lifetime.
+//!
+//! Transport-related fields (`bind`, `tls_*`, `max_conns`,
+//! `request_timeout`) land in PR-3 / PR-5 along with the actual
+//! listener. Static-data fields used by handlers (banner,
+//! per-method limits) are defined here so PR-2 can wire them through.
+
+use std::time::Duration;
+
+/// Defaults align with `romanz/electrs` where possible:
+/// - `MAX_HISTORY_ENTRIES`: cap on confirmed-history rows returned by
+///   `blockchain.scripthash.get_history` so a pathological scripthash
+///   doesn't OOM the server. electrs uses 200,000.
+/// - `MAX_HEADERS_PER_REQUEST`: max headers `blockchain.block.headers`
+///   will return in a single call. electrs uses 2016 (one retarget
+///   period).
+pub const MAX_HISTORY_ENTRIES: usize = 200_000;
+pub const MAX_HEADERS_PER_REQUEST: u32 = 2016;
+pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
+pub const DEFAULT_MAX_CONNS: usize = 64;
+pub const DEFAULT_MAX_SUBS_PER_CONN: usize = 100;
+
+/// Configuration available to method handlers.
+///
+/// PR-3 adds the transport-side fields (`bind`, `max_conns`, etc.);
+/// PR-5 adds the TLS fields. This struct is intentionally
+/// `Clone`-cheap so per-connection state can hold a snapshot without
+/// reaching back through an `Arc`.
+#[derive(Debug, Clone)]
+pub struct ElectrumConfig {
+    /// Banner string returned by `server.banner`. `None` falls back to
+    /// a default constructed at server start (`format!("powered by
+    /// satd {}", version)`).
+    pub banner: Option<String>,
+    /// Donation address returned by `server.donation_address`. Empty
+    /// string is the documented "no donations" sentinel.
+    pub donation_address: String,
+    /// Max confirmed-history entries any single `get_history` call
+    /// will return before erroring with `history_too_large`.
+    pub max_history_entries: usize,
+    /// Max headers per `blockchain.block.headers` response.
+    pub max_headers_per_request: u32,
+    /// Per-connection scripthash subscription cap (PR-4 enforces).
+    pub max_subs_per_conn: usize,
+    /// Wall-clock timeout per inbound request (PR-3 wires).
+    pub request_timeout: Duration,
+}
+
+impl Default for ElectrumConfig {
+    fn default() -> Self {
+        Self {
+            banner: None,
+            donation_address: String::new(),
+            max_history_entries: MAX_HISTORY_ENTRIES,
+            max_headers_per_request: MAX_HEADERS_PER_REQUEST,
+            max_subs_per_conn: DEFAULT_MAX_SUBS_PER_CONN,
+            request_timeout: Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS),
+        }
+    }
+}
