@@ -1067,6 +1067,7 @@ async fn main() {
             request_timeout: std::time::Duration::from_secs(config.electrum_request_timeout),
             max_batch_requests: config.electrum_max_batch_requests,
             max_broadcast_package_txs: config.electrum_max_broadcast_package_txs,
+            fee_histogram_ttl: std::time::Duration::from_secs(config.electrum_fee_histogram_ttl),
         };
         let electrum_extras: std::sync::Arc<dyn electrum_proto::ElectrumExtras> =
             std::sync::Arc::new(electrum_proto::RocksElectrumExtras::new(
@@ -1090,6 +1091,11 @@ async fn main() {
             electrum_extras,
             network: config.network,
             config: std::sync::Arc::new(electrum_cfg.clone()),
+            fee_histogram_cache: std::sync::Arc::new(
+                electrum_proto::handlers::mempool::FeeHistogramCache::new(
+                    electrum_cfg.fee_histogram_ttl,
+                ),
+            ),
         });
         let server = match electrum_proto::ElectrumServer::bind(electrum_cfg, electrum_state).await
         {

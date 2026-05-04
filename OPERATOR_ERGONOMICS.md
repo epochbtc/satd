@@ -466,12 +466,18 @@ Defaults:
 - `--electrummaxbroadcastpackagetxs` = 25 (max txs per
   `blockchain.transaction.broadcast_package`; mirrors Bitcoin
   Core's `MAX_PACKAGE_COUNT`).
+- `--electrumfeehistogramttl` = 10 seconds. TTL for the
+  `mempool.get_fee_histogram` cache. The first call after expiry
+  rebuilds from the live mempool snapshot; subsequent calls within
+  the window return the cached JSON. Lower for fresher data at
+  higher CPU cost.
 
 Bitcoin-conf aliases mirror the CLI flags: `electrum`,
 `electrumbind`, `electrumtlsbind`, `electrumtlscert`,
 `electrumtlskey`, `electrummaxconns`, `electrummaxsubsperconn`,
 `electrumrequesttimeout`, `electrummaxbatchrequests`,
-`electrummaxbroadcastpackagetxs`, `electrumbanner`.
+`electrummaxbroadcastpackagetxs`, `electrumfeehistogramttl`,
+`electrumbanner`.
 
 ### What's implemented
 

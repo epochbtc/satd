@@ -30,6 +30,10 @@ pub const DEFAULT_MAX_BATCH_REQUESTS: usize = 16;
 /// call. electrs accepts up to ~25 (matching Bitcoin Core's
 /// `MAX_PACKAGE_COUNT`).
 pub const DEFAULT_MAX_BROADCAST_PACKAGE_TXS: usize = 25;
+/// Default TTL for the `mempool.get_fee_histogram` cache. electrs
+/// uses 10 seconds. Wallets that poll this every 10s naturally
+/// see one rebuild per poll cycle.
+pub const DEFAULT_FEE_HISTOGRAM_TTL_SECS: u64 = 10;
 
 /// Configuration available to method handlers + transport.
 ///
@@ -80,6 +84,10 @@ pub struct ElectrumConfig {
     /// Max txs in a single `blockchain.transaction.broadcast_package`
     /// call. Excess packages are rejected (review-round-1 M5).
     pub max_broadcast_package_txs: usize,
+    /// TTL for the `mempool.get_fee_histogram` cache (review-round-1
+    /// M5). The first call after expiry rebuilds; subsequent calls
+    /// within the window return the cached JSON.
+    pub fee_histogram_ttl: Duration,
 }
 
 impl Default for ElectrumConfig {
@@ -98,6 +106,7 @@ impl Default for ElectrumConfig {
             request_timeout: Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS),
             max_batch_requests: DEFAULT_MAX_BATCH_REQUESTS,
             max_broadcast_package_txs: DEFAULT_MAX_BROADCAST_PACKAGE_TXS,
+            fee_histogram_ttl: Duration::from_secs(DEFAULT_FEE_HISTOGRAM_TTL_SECS),
         }
     }
 }

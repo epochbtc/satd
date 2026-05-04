@@ -354,6 +354,10 @@ pub struct Config {
     /// Max txs in a single `blockchain.transaction.broadcast_package`
     /// call. Excess packages are rejected with `bad_request`.
     pub electrum_max_broadcast_package_txs: usize,
+    /// TTL (seconds) for the `mempool.get_fee_histogram` cache.
+    /// Default 10s — matches `romanz/electrs`. Lower = fresher data
+    /// but more CPU per wallet poll cycle.
+    pub electrum_fee_histogram_ttl: u64,
     /// Override for `server.banner`. `None` falls back to a default
     /// composed at request time (`format!("powered by satd {}",
     /// version)`).
@@ -782,6 +786,10 @@ impl Config {
             .electrummaxbroadcastpackagetxs
             .or_else(|| file_get("electrummaxbroadcastpackagetxs").and_then(|v| v.parse().ok()))
             .unwrap_or(25);
+        let electrum_fee_histogram_ttl = cli
+            .electrumfeehistogramttl
+            .or_else(|| file_get("electrumfeehistogramttl").and_then(|v| v.parse().ok()))
+            .unwrap_or(10);
         let electrum_banner = cli.electrumbanner.or_else(|| file_get("electrumbanner"));
         // TLS partial-config validation. The server-side `bind` also
         // catches this, but checking here lets us surface a friendlier
@@ -939,6 +947,7 @@ impl Config {
             electrum_request_timeout,
             electrum_max_batch_requests,
             electrum_max_broadcast_package_txs,
+            electrum_fee_histogram_ttl,
             electrum_banner,
             prune,
             reindex: cli.reindex,
@@ -1495,6 +1504,13 @@ pub struct CliArgs {
 
     #[arg(
         long,
+        value_name = "SECS",
+        help = "TTL (seconds) for mempool.get_fee_histogram cache (default: 10)"
+    )]
+    pub electrumfeehistogramttl: Option<u64>,
+
+    #[arg(
+        long,
         value_name = "TEXT",
         help = "Custom banner returned by server.banner"
     )]
@@ -1910,6 +1926,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "electrumrequesttimeout",
         "electrummaxbatchrequests",
         "electrummaxbroadcastpackagetxs",
+        "electrumfeehistogramttl",
         "electrumbanner",
         "prune",
         "reindex",
@@ -2186,6 +2203,7 @@ rpcport=8332
             electrumrequesttimeout: None,
             electrummaxbatchrequests: None,
             electrummaxbroadcastpackagetxs: None,
+            electrumfeehistogramttl: None,
             electrumbanner: None,
             prune: None,
             reindex: false,
@@ -2297,6 +2315,7 @@ rpcport=8332
             electrumrequesttimeout: None,
             electrummaxbatchrequests: None,
             electrummaxbroadcastpackagetxs: None,
+            electrumfeehistogramttl: None,
             electrumbanner: None,
             prune: None,
             reindex: false,
