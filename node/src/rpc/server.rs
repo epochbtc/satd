@@ -1001,7 +1001,7 @@ pub async fn start(
             "getmempoolentry", "getmempoolhistory", "getmempoolinfo", "getmemoryinfo", "getmininginfo",
             "getnettotals", "getnetworkhashps", "getnetworkinfo", "getorphaninfo", "getpeerinfo",
             "getrawmempool", "getrawtransaction", "getreorghistory", "getrpcinfo",
-            "getsysteminfo", "gettxout", "getwarnings",
+            "getserverstatus", "getsysteminfo", "gettxout", "getwarnings",
             "gettxoutsetinfo", "help", "listbanned", "logging", "ping",
             "preciousblock", "prioritisetransaction",
             "savemempool", "sendrawtransaction", "setban",
@@ -1022,6 +1022,33 @@ pub async fn start(
         // and cookie values are redacted. This is advisory, not a
         // machine-consumable API: field names track satd internals.
         Ok::<_, ErrorObjectOwned>(ctx.effective_config.clone())
+    })?;
+
+    module.register_method("getserverstatus", |_params, ctx, _extensions| {
+        // Compact server-listener status for monitoring (sat-tui).
+        // A bound `esplora` / `electrum` listener implies the server
+        // is running: the bind-time gates fatally exit on failure,
+        // so reaching steady state with `enabled: true` and a
+        // non-null `bind` is equivalent to "actively serving."
+        let esplora = ctx
+            .effective_config
+            .get("esplora")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let electrum = ctx
+            .effective_config
+            .get("electrum")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let addressindex = serde_json::json!({
+            "enabled": ctx.address_index_enabled,
+            "complete": ctx.chain_state.store_ref().address_index_complete(),
+        });
+        Ok::<_, ErrorObjectOwned>(serde_json::json!({
+            "addressindex": addressindex,
+            "esplora": esplora,
+            "electrum": electrum,
+        }))
     })?;
 
     module.register_method("getwarnings", |_params, ctx, _extensions| {
