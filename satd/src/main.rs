@@ -814,6 +814,11 @@ async fn main() {
         Some(backfill_handle.clone()),
         Some(backfill_cmd_tx.clone()),
         listener_status.clone(),
+        // BIP 158 filter index: PR-3 plumbs the runtime knob through
+        // to RPC status surfaces (`getindexinfo`, `getserverstatus`).
+        // PR-5 adds the `--blockfilterindex` CLI flag; until then we
+        // hard-code `false` to match the PR-2 default-off posture.
+        false,
     )
     .await
     {

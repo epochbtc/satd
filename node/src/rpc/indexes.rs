@@ -19,21 +19,19 @@ use crate::index::address::{
 };
 use crate::storage::Store;
 
-/// `getindexinfo` → `{"address": {...}, ...}` per
-/// `ADDRESS_INDEX.md` §"Status reporting":
+/// `getindexinfo` → `{"address": {...}, "basic block filter index": {...}}`
+/// per `ADDRESS_INDEX.md` §"Status reporting":
 ///
 /// ```text
 /// {
 ///   "address": {
 ///     "synced": <bool>,
 ///     "best_block_height": <chain tip height>,
-///     "backfill": {
-///       "active": <bool>,
-///       "pass": <1 or 2>,
-///       "cursor_height": <u32>,
-///       "snapshot_height": <u32>,
-///       "estimated_remaining_seconds": <u64>
-///     }
+///     "backfill": { ... }
+///   },
+///   "basic block filter index": {  // only when block-filter-index feature is on
+///     "synced": <bool>,
+///     "best_block_height": <chain tip height>
 ///   }
 /// }
 /// ```
@@ -41,11 +39,20 @@ use crate::storage::Store;
 /// `backfill` is omitted when no backfill state has ever been
 /// recorded for this datadir (cursor is fully idle), keeping the
 /// response slim for the common "no backfill needed" case.
+///
+/// The Bitcoin Core-shaped key `"basic block filter index"` (with the
+/// spaces and the lowercase wording) keeps existing tooling that polls
+/// `getindexinfo` to wait for filter readiness happy. Backfill
+/// progress for the filter index is deferred to a follow-up PR; the
+/// `synced` field reads the `block_filter_index.complete` marker
+/// directly so a fresh-from-genesis sync with `--blockfilterindex=basic`
+/// reports `synced: true` once it reaches the chain tip.
 pub fn get_index_info(
     backfill: Option<&Arc<BackfillHandle>>,
     chain: &Arc<ChainState>,
     address_enabled: bool,
     best_block_height: u32,
+    #[cfg(feature = "block-filter-index")] block_filter_index_enabled: bool,
 ) -> Value {
     let report = render_status(backfill.map(|h| h.as_ref()), address_enabled);
     let mut address = serde_json::Map::new();
@@ -99,7 +106,24 @@ pub fn get_index_info(
     );
     address.insert("outpoint_spend".into(), Value::Object(outpoint_spend));
 
-    json!({ "address": Value::Object(address) })
+    let mut top = serde_json::Map::new();
+    top.insert("address".into(), Value::Object(address));
+
+    // BIP 158 filter index sibling. `block_filter_index_enabled` is
+    // the runtime config bit (`--blockfilterindex=basic`); `synced`
+    // reads the on-disk completeness marker. Both must be true for
+    // the BIP 157 P2P service and `getblockfilter` RPC to actually
+    // return data.
+    #[cfg(feature = "block-filter-index")]
+    {
+        let synced = block_filter_index_enabled
+            && chain.store_ref().block_filter_index_complete();
+        let mut bfi = serde_json::Map::new();
+        bfi.insert("synced".into(), json!(synced));
+        bfi.insert("best_block_height".into(), json!(best_block_height));
+        top.insert("basic block filter index".into(), Value::Object(bfi));
+    }
+    Value::Object(top)
 }
 
 /// Estimate seconds-to-completion from elapsed time and progress

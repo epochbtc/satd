@@ -96,6 +96,12 @@ pub struct RpcContext {
     /// the satd binary after each optional listener (Esplora,
     /// Electrum, Electrum TLS) successfully binds.
     pub listener_status: Arc<ServerListenerStatus>,
+    /// Whether the BIP 158 filter index is enabled at runtime — used
+    /// by `getindexinfo` and `getserverstatus` to populate the
+    /// `block_filter_index.enabled` field. PR-5 of the BIP 157/158
+    /// stack wires this to `config.blockfilterindex`.
+    #[cfg(feature = "block-filter-index")]
+    pub blockfilterindex_enabled: bool,
 }
 
 /// Which data source `estimatesmartfee` / `estimatefees` draws from.
@@ -189,6 +195,7 @@ pub async fn start(
     backfill: Option<Arc<BackfillHandle>>,
     backfill_cmd_tx: Option<tokio::sync::mpsc::Sender<BackfillCommand>>,
     listener_status: Arc<ServerListenerStatus>,
+    #[cfg(feature = "block-filter-index")] blockfilterindex_enabled: bool,
 ) -> Result<ServerHandle, Box<dyn std::error::Error + Send + Sync>> {
     let ctx = Arc::new(RpcContext {
         chain_state,
@@ -205,6 +212,8 @@ pub async fn start(
         backfill,
         backfill_cmd_tx,
         listener_status,
+        #[cfg(feature = "block-filter-index")]
+        blockfilterindex_enabled,
     });
 
     let mut module = RpcModule::new(ctx);
@@ -405,6 +414,8 @@ pub async fn start(
             &ctx.chain_state,
             ctx.address_index_enabled,
             ctx.chain_state.tip_height(),
+            #[cfg(feature = "block-filter-index")]
+            ctx.blockfilterindex_enabled,
         ))
     })?;
 
@@ -1093,15 +1104,31 @@ pub async fn start(
                 None => serde_json::Value::Null,
             }
         };
-        Ok::<_, ErrorObjectOwned>(serde_json::json!({
-            "addressindex": {
+        // Build the response with optional blockfilterindex sibling.
+        // The BIP 158 filter index rides the same shape as the
+        // address-index (an in-process index, not a listener) so a
+        // future sat-tui `bf-idx` column matches the existing
+        // `addr-idx` rendering.
+        let mut resp = serde_json::Map::new();
+        resp.insert(
+            "addressindex".into(),
+            serde_json::json!({
                 "enabled": ctx.address_index_enabled,
                 "complete": ctx.chain_state.store_ref().address_index_complete(),
-            },
-            "esplora": listener(snap.esplora),
-            "electrum": listener(snap.electrum),
-            "electrum_tls": listener(snap.electrum_tls),
-        }))
+            }),
+        );
+        resp.insert("esplora".into(), listener(snap.esplora));
+        resp.insert("electrum".into(), listener(snap.electrum));
+        resp.insert("electrum_tls".into(), listener(snap.electrum_tls));
+        #[cfg(feature = "block-filter-index")]
+        resp.insert(
+            "blockfilterindex".into(),
+            serde_json::json!({
+                "enabled": ctx.blockfilterindex_enabled,
+                "complete": ctx.chain_state.store_ref().block_filter_index_complete(),
+            }),
+        );
+        Ok::<_, ErrorObjectOwned>(serde_json::Value::Object(resp))
     })?;
 
     module.register_method("getwarnings", |_params, ctx, _extensions| {
