@@ -12,6 +12,8 @@ use crate::index::address::{
     AddrFundingKey, AddrFundingRow, AddrSpendingKey, AddrSpendingRow, Scripthash,
 };
 use crate::index::address::cursor::BackfillState;
+#[cfg(feature = "block-filter-index")]
+use crate::index::filter::{FilterHeaderRow, FilterKey, FilterRow};
 use crate::index::outpoint_spend::SpendingRef;
 use crate::storage::blockindex::BlockIndexEntry;
 use crate::storage::coinview::Coin;
@@ -61,6 +63,20 @@ pub struct StoreBatch {
     /// Persist a backfill cursor advance atomically with the rows it
     /// describes. `None` for non-backfill writes.
     pub backfill_cursor_advance: Option<BackfillCursorWrite>,
+    /// BIP 158 compact-block-filter rows. Populated by
+    /// `connect_block`'s end-of-loop emit when the filter index is
+    /// runtime-enabled.
+    #[cfg(feature = "block-filter-index")]
+    pub filter_puts: Vec<FilterRow>,
+    /// BIP 157 chained filter-header rows. Same emission point as
+    /// `filter_puts`; one row per connected block.
+    #[cfg(feature = "block-filter-index")]
+    pub filter_header_puts: Vec<FilterHeaderRow>,
+    /// `(filter_type, height)` keys to drop from both `cf_filter` and
+    /// `cf_filter_header`. Used by `disconnect_block` when reversing a
+    /// connected block's filter rows.
+    #[cfg(feature = "block-filter-index")]
+    pub filter_removes: Vec<FilterKey>,
 }
 
 /// Atomic cursor update emitted by the backfill task at each batch boundary.
@@ -166,6 +182,29 @@ impl StoreBatch {
         // directly).
         if other.backfill_cursor_advance.is_some() {
             self.backfill_cursor_advance = other.backfill_cursor_advance;
+        }
+
+        // Filter index: same last-writer-wins by `(type, height)`.
+        // Connect → disconnect → connect at the same height (an A→B→A
+        // reorg) must end with the put winning, and connect at a
+        // height whose row is in the prior batch's removes must drop
+        // the remove. Mirrors the addr_funding / addr_spending merge.
+        #[cfg(feature = "block-filter-index")]
+        {
+            if !other.filter_removes.is_empty() {
+                let drop: std::collections::HashSet<FilterKey> =
+                    other.filter_removes.iter().copied().collect();
+                self.filter_puts.retain(|p| !drop.contains(&p.key));
+                self.filter_header_puts.retain(|p| !drop.contains(&p.key));
+            }
+            if !other.filter_puts.is_empty() {
+                let drop: std::collections::HashSet<FilterKey> =
+                    other.filter_puts.iter().map(|p| p.key).collect();
+                self.filter_removes.retain(|k| !drop.contains(k));
+            }
+            self.filter_puts.extend(other.filter_puts);
+            self.filter_header_puts.extend(other.filter_header_puts);
+            self.filter_removes.extend(other.filter_removes);
         }
     }
 }
@@ -377,6 +416,41 @@ pub trait Store: Send + Sync {
         _outpoint: &OutPoint,
     ) -> Result<Option<Scripthash>, StoreError> {
         Ok(None)
+    }
+
+    /// Read a BIP 158 filter blob for `(filter_type, height)`. Returns
+    /// `None` when the row doesn't exist (height not connected, or
+    /// filter index never populated this height). Default: `None` for
+    /// backends without filter-index storage.
+    #[cfg(feature = "block-filter-index")]
+    fn get_filter(&self, _filter_type: u8, _height: u32) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// Read a BIP 157 chained filter header for `(filter_type, height)`.
+    /// Default: `None`.
+    #[cfg(feature = "block-filter-index")]
+    fn get_filter_header(&self, _filter_type: u8, _height: u32) -> Option<[u8; 32]> {
+        None
+    }
+
+    /// True when the BIP 158 filter index is fully populated for the
+    /// active chain. Symmetric to `address_index_complete` /
+    /// `tx_index_complete`. Default: `true` for non-Rocks backends.
+    #[cfg(feature = "block-filter-index")]
+    fn block_filter_index_complete(&self) -> bool {
+        true
+    }
+
+    /// Stamp `block_filter_index.complete` true. Called by the filter
+    /// backfill (PR-3) when it finishes the snapshot range. Default:
+    /// error so non-Rocks backends fail loud rather than silently
+    /// no-op.
+    #[cfg(feature = "block-filter-index")]
+    fn mark_block_filter_index_complete(&self) -> Result<(), StoreError> {
+        Err(StoreError::Database(
+            "mark_block_filter_index_complete not supported on this backend".into(),
+        ))
     }
 
     /// Read the persisted backfill cursor from metadata. Default: idle.

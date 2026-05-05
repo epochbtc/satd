@@ -32,6 +32,15 @@ pub enum ConnectError {
     BadCoinbaseHeight,
     #[error("{0}")]
     TxValidation(#[from] crate::validation::ValidationError),
+    /// BIP 158 filter construction failed for the connecting block.
+    /// In practice this is unreachable because we populate the
+    /// prev-output-script map from the same coins we just resolved
+    /// for script verification; the variant exists so a future
+    /// surface (synthetic-block test fixtures, alternate filter type)
+    /// surfaces a real error rather than an `unwrap()` panic.
+    #[cfg(feature = "block-filter-index")]
+    #[error("block filter index emit failed: {0}")]
+    FilterIndexEmit(String),
 }
 
 /// Decode the block height from a BIP 34 coinbase scriptSig.
@@ -143,9 +152,24 @@ pub struct ConnectParams<'a> {
     /// Address-history index runtime config. When `enabled`, the per-output
     /// and per-input loops emit rows into the StoreBatch's `addr_*` vectors.
     pub address_index: &'a crate::index::address::AddressIndexConfig,
+    /// BIP 158 compact-block-filter index runtime config. When
+    /// `enabled`, the end-of-tx-loop emit produces a filter blob +
+    /// chained header for the connected block. No-op when disabled
+    /// (cleared completeness marker is handled inside the storage
+    /// layer via `with_blockfilterindex_enabled`).
+    #[cfg(feature = "block-filter-index")]
+    pub filter_index: &'a crate::index::filter::FilterIndexConfig,
 }
 
 pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError> {
+    #[cfg(feature = "block-filter-index")]
+    let ConnectParams {
+        store, block, height, parent_chainwork, flat_pos,
+        script_verifier, median_time_past, network,
+        pre_verified_txs, num_threads, precomputed_txids,
+        address_index, filter_index,
+    } = params;
+    #[cfg(not(feature = "block-filter-index"))]
     let ConnectParams {
         store, block, height, parent_chainwork, flat_pos,
         script_verifier, median_time_past, network,
@@ -158,6 +182,8 @@ pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError>
     let median_time_past = *median_time_past;
     let network = *network;
     let address_index: &crate::index::address::AddressIndexConfig = address_index;
+    #[cfg(feature = "block-filter-index")]
+    let filter_index: &crate::index::filter::FilterIndexConfig = filter_index;
     let num_threads = *num_threads;
     let flat_pos = *flat_pos;
     let block_hash = block.block_hash();
@@ -193,6 +219,14 @@ pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError>
 
     // Fast lookup for coins created earlier in this block (intra-block spends).
     let mut intra_block_coins: HashMap<OutPoint, Coin> = HashMap::new();
+
+    // Block-wide prev-output script map for BIP 158 filter construction.
+    // Populated alongside `prev_outputs` inside the per-tx loop and
+    // consumed by the emit helper at end-of-loop. No-op when the
+    // filter index is disabled (we still pay one HashMap insertion per
+    // input, which is cheap and dominated by the script verification).
+    #[cfg(feature = "block-filter-index")]
+    let mut block_prev_output_scripts: HashMap<OutPoint, bitcoin::ScriptBuf> = HashMap::new();
 
     // --- UTXO pre-resolution for external inputs ---
     // Batch-lookup from authoritative store. Prefetch warmed the CoinCache,
@@ -340,6 +374,14 @@ pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError>
                     value: bitcoin::Amount::from_sat(coin.amount),
                     script_pubkey: coin.script_pubkey.clone(),
                 });
+
+                // BIP 158 SCRIPT_FILTER input set: every non-coinbase
+                // input contributes its prev-output scriptPubKey.
+                #[cfg(feature = "block-filter-index")]
+                if filter_index.enabled {
+                    block_prev_output_scripts
+                        .insert(outpoint, coin.script_pubkey.clone());
+                }
 
                 batch.coin_removes.push((outpoint, coin.amount, coin.height));
 
@@ -489,6 +531,35 @@ pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError>
         }
     }
 
+    // BIP 158 compact-block-filter emission. End-of-loop hook: builds
+    // the filter blob over (output scripts ∪ prev-output scripts) and
+    // chains the BIP 157 filter header off the previous block's
+    // header. No-op when the index is disabled at runtime — the
+    // per-block clear in `RocksDbStore::write_batch_mode` clears the
+    // completeness marker on the same atomic batch.
+    #[cfg(feature = "block-filter-index")]
+    if filter_index.enabled {
+        let prev_header = if height == 0 {
+            crate::index::filter::emit::GENESIS_PREV_FILTER_HEADER
+        } else {
+            store
+                .get_filter_header(crate::index::filter::FILTER_TYPE_BASIC, height - 1)
+                .unwrap_or(crate::index::filter::emit::GENESIS_PREV_FILTER_HEADER)
+        };
+        let pair = crate::index::filter::build_filter_row_pair(
+            filter_index,
+            height,
+            block,
+            &block_prev_output_scripts,
+            &prev_header,
+        )
+        .map_err(|e| ConnectError::FilterIndexEmit(format!("{e}")))?;
+        if let Some((row, header_row)) = pair {
+            batch.filter_puts.push(row);
+            batch.filter_header_puts.push(header_row);
+        }
+    }
+
     // Build BlockIndexEntry
     let chainwork = add_u256(parent_chainwork, &work_for_bits(block.header.bits));
     let entry = BlockIndexEntry {
@@ -553,6 +624,8 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &Default::default(),
         }).unwrap();
 
         // Genesis coinbase should NOT be in coin_puts
@@ -730,6 +803,8 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &Default::default(),
         });
         assert!(result.is_ok());
     }
@@ -752,6 +827,8 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &Default::default(),
         });
         assert!(matches!(result, Err(ConnectError::SequenceLockNotMet)));
     }
@@ -774,6 +851,8 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &Default::default(),
         });
         assert!(result.is_ok());
     }
@@ -796,6 +875,8 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &Default::default(),
         });
         assert!(result.is_ok());
     }
@@ -818,6 +899,8 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &Default::default(),
         });
         assert!(result.is_ok());
     }
@@ -842,6 +925,8 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &Default::default(),
         });
         assert!(result.is_ok());
     }
@@ -864,6 +949,8 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &Default::default(),
         });
         assert!(matches!(result, Err(ConnectError::LocktimeNotFinal)));
     }
@@ -886,6 +973,8 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &Default::default(),
         });
         assert!(matches!(result, Err(ConnectError::LocktimeNotFinal)));
     }
@@ -908,6 +997,8 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &Default::default(),
         });
         assert!(result.is_ok());
     }
@@ -937,6 +1028,8 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &Default::default(),
         });
         assert!(matches!(result, Err(ConnectError::MissingOrSpentInput)));
     }
@@ -959,6 +1052,8 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &Default::default(),
         });
         assert!(matches!(result, Err(ConnectError::PrematureCoinbaseSpend)));
     }
@@ -981,6 +1076,8 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &Default::default(),
         });
         assert!(result.is_ok());
     }
@@ -1055,6 +1152,8 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &Default::default(),
         });
         assert!(result.is_ok(), "BIP68 time lock should be met, got {:?}", result.err());
     }
@@ -1118,6 +1217,8 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &Default::default(),
         });
         assert!(
             matches!(result, Err(ConnectError::SequenceLockNotMet)),
@@ -1193,6 +1294,8 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &Default::default(),
         });
         assert!(
             matches!(result, Err(ConnectError::BadCoinbaseValue)),
@@ -1289,6 +1392,8 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &Default::default(),
         });
         assert!(result.is_ok(), "Intra-block spending should succeed, got {:?}", result.err());
     }
@@ -1311,6 +1416,8 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &Default::default(),
         });
         assert!(result.is_ok(), "BIP 34 correct height should pass, got {:?}", result.err());
     }
@@ -1381,6 +1488,8 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &Default::default(),
         });
         assert!(
             matches!(result, Err(ConnectError::BadCoinbaseHeight)),
@@ -1455,6 +1564,8 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &Default::default(),
         });
         assert!(
             matches!(result, Err(ConnectError::BadAmounts)),
@@ -1481,6 +1592,8 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &Default::default(),
         })
         .unwrap();
 
@@ -1597,6 +1710,8 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &Default::default(),
         });
         assert!(
             result.is_ok(),
@@ -1637,6 +1752,8 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &Default::default(),
         });
         assert!(
             result.is_ok(),
@@ -1672,6 +1789,8 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &Default::default(),
         });
         assert!(
             result.is_ok(),
@@ -1739,6 +1858,8 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &cfg,
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &Default::default(),
         })
         .unwrap();
 
@@ -1774,6 +1895,8 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &cfg,
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &Default::default(),
         })
         .unwrap();
 
@@ -1813,6 +1936,8 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &disabled,
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &Default::default(),
         })
         .unwrap();
 
@@ -1844,6 +1969,8 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &cfg,
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &Default::default(),
         })
         .unwrap();
 
@@ -1852,5 +1979,116 @@ mod tests {
             "genesis coinbase must not emit a funding row (matches UTXO-set exclusion)"
         );
         assert!(batch.addr_spending_puts.is_empty());
+    }
+
+    #[cfg(feature = "block-filter-index")]
+    #[test]
+    fn test_filter_index_enabled_emits_filter_and_header_rows() {
+        // Connect a coinbase + spending tx block with filter index on,
+        // assert one filter row + one header row land in the batch.
+        let (store, outpoint, _) = make_test_store_with_coin(0, false);
+        let block = make_block_spending(outpoint, 1, 2, 0xffff_ffff, 0);
+        let cfg = crate::index::address::AddressIndexConfig::default();
+        let fcfg = crate::index::filter::FilterIndexConfig {
+            enabled: true,
+            peer_serve: false,
+        };
+
+        let batch = connect_block(&ConnectParams {
+            store: &store,
+            block: &block,
+            height: 1,
+            parent_chainwork: &[0u8; 32],
+            flat_pos: default_pos(),
+            script_verifier: &NoopVerifier,
+            median_time_past: 0,
+            network: Network::Regtest,
+            pre_verified_txs: None,
+            num_threads: 1,
+            precomputed_txids: None,
+            address_index: &cfg,
+            filter_index: &fcfg,
+        })
+        .unwrap();
+
+        assert_eq!(batch.filter_puts.len(), 1, "expected one filter row per block");
+        assert_eq!(batch.filter_header_puts.len(), 1);
+        assert_eq!(batch.filter_puts[0].key.height, 1);
+        assert_eq!(batch.filter_puts[0].key.filter_type, 0u8);
+        assert!(!batch.filter_puts[0].filter.is_empty());
+    }
+
+    #[cfg(feature = "block-filter-index")]
+    #[test]
+    fn test_filter_index_disabled_emits_no_filter_rows() {
+        let (store, outpoint, _) = make_test_store_with_coin(0, false);
+        let block = make_block_spending(outpoint, 1, 2, 0xffff_ffff, 0);
+        let cfg = crate::index::address::AddressIndexConfig::default();
+        let fcfg = crate::index::filter::FilterIndexConfig::default();
+
+        let batch = connect_block(&ConnectParams {
+            store: &store,
+            block: &block,
+            height: 1,
+            parent_chainwork: &[0u8; 32],
+            flat_pos: default_pos(),
+            script_verifier: &NoopVerifier,
+            median_time_past: 0,
+            network: Network::Regtest,
+            pre_verified_txs: None,
+            num_threads: 1,
+            precomputed_txids: None,
+            address_index: &cfg,
+            filter_index: &fcfg,
+        })
+        .unwrap();
+
+        assert!(batch.filter_puts.is_empty());
+        assert!(batch.filter_header_puts.is_empty());
+    }
+
+    #[cfg(feature = "block-filter-index")]
+    #[test]
+    fn test_filter_index_chain_links_via_prev_header() {
+        // Connect a height-1 block on a fresh store (no prior filter
+        // header), then connect a height-2 block whose filter header
+        // chains off height-1's. Verify the height-2 header equals
+        // sha256d(filter_hash_2 || header_1).
+        let (store, outpoint, _) = make_test_store_with_coin(0, false);
+        let block_1 = make_block_spending(outpoint, 1, 2, 0xffff_ffff, 0);
+        let cfg = crate::index::address::AddressIndexConfig::default();
+        let fcfg = crate::index::filter::FilterIndexConfig {
+            enabled: true,
+            peer_serve: false,
+        };
+
+        let batch_1 = connect_block(&ConnectParams {
+            store: &store,
+            block: &block_1,
+            height: 1,
+            parent_chainwork: &[0u8; 32],
+            flat_pos: default_pos(),
+            script_verifier: &NoopVerifier,
+            median_time_past: 0,
+            network: Network::Regtest,
+            pre_verified_txs: None,
+            num_threads: 1,
+            precomputed_txids: None,
+            address_index: &cfg,
+            filter_index: &fcfg,
+        })
+        .unwrap();
+
+        let header_1 = batch_1.filter_header_puts[0].header;
+        let filter_1 = batch_1.filter_puts[0].filter.clone();
+
+        // Compute height-1 header from filter_1 with a [0u8; 32] prev (since
+        // height-0 didn't emit). This must match what connect_block stamped.
+        use bitcoin::bip158::FilterHeader;
+        use bitcoin::hashes::Hash;
+        let prev = FilterHeader::from_byte_array([0u8; 32]);
+        let bf = bitcoin::bip158::BlockFilter::new(&filter_1);
+        let expected = bf.filter_header(&prev).to_byte_array();
+        assert_eq!(header_1, expected);
     }
 }

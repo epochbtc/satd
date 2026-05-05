@@ -175,6 +175,12 @@ pub struct ChainState {
     /// `connect_block` / `disconnect_block` call so emission is gated
     /// at runtime without cfg ceremony.
     address_index: crate::index::address::AddressIndexConfig,
+    /// BIP 158 compact-block-filter index runtime config. Same
+    /// per-call threading as `address_index` — enables filter
+    /// emission at end-of-tx-loop in `connect_block` and the inverse
+    /// row-removal in `disconnect_block`.
+    #[cfg(feature = "block-filter-index")]
+    filter_index: crate::index::filter::FilterIndexConfig,
     /// Persistent reorg history + optional webhook dispatch.
     /// Lazily initialized by `open_reorg_log` — may be absent in tests
     /// that don't care about reorg observability.
@@ -210,6 +216,7 @@ impl ChainState {
         dbcache_mb: u64,
         num_threads: usize,
         address_index: crate::index::address::AddressIndexConfig,
+        filter_index: crate::index::filter::FilterIndexConfig,
     ) -> Result<Self, ChainError> {
         let genesis = bitcoin::constants::genesis_block(network);
         let genesis_hash = genesis.block_hash();
@@ -267,6 +274,8 @@ impl ChainState {
                     mtp_cache: Mutex::new(Vec::with_capacity(12)),
                     num_threads,
                     address_index,
+                    #[cfg(feature = "block-filter-index")]
+                    filter_index,
                     reorg_log: std::sync::OnceLock::new(),
                     warnings: std::sync::Arc::new(crate::warnings::NodeWarnings::new()),
                     mempool: std::sync::OnceLock::new(),
@@ -297,6 +306,8 @@ impl ChainState {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &address_index,
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &filter_index,
         })?;
         store.write_batch(batch)?;
 
@@ -316,6 +327,8 @@ impl ChainState {
             mtp_cache: Mutex::new(Vec::with_capacity(12)),
             num_threads,
             address_index,
+            #[cfg(feature = "block-filter-index")]
+            filter_index,
             reorg_log: std::sync::OnceLock::new(),
             warnings: std::sync::Arc::new(crate::warnings::NodeWarnings::new()),
             mempool: std::sync::OnceLock::new(),
@@ -813,6 +826,8 @@ impl ChainState {
             num_threads: self.num_threads,
             precomputed_txids: Some(&pre.txids),
             address_index: &self.address_index,
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &self.filter_index,
         })?;
 
         // Atomic commit
@@ -1036,6 +1051,8 @@ impl ChainState {
             num_threads: self.num_threads,
             precomputed_txids: None,
             address_index: &self.address_index,
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &self.filter_index,
         })?;
 
         // Atomic commit
@@ -1105,6 +1122,8 @@ impl ChainState {
                 num_threads: self.num_threads,
             precomputed_txids: None,
             address_index: &self.address_index,
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &self.filter_index,
             })?;
             self.store.write_batch(batch)?;
 
@@ -1214,6 +1233,8 @@ impl ChainState {
                 num_threads: self.num_threads,
             precomputed_txids: None,
             address_index: &self.address_index,
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &self.filter_index,
             })?;
             self.store.write_batch(batch)?;
 
@@ -1473,6 +1494,8 @@ impl ChainState {
                         num_threads: 1,
                         precomputed_txids: None,
                         address_index: &self.address_index,
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &self.filter_index,
                     })?;
                     self.store.write_batch(batch)?;
                     {
@@ -1557,6 +1580,8 @@ impl ChainState {
             num_threads: self.num_threads,
             precomputed_txids: None,
             address_index: &self.address_index,
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &self.filter_index,
         });
         let batch = match connect_attempt {
             Ok(b) => b,
@@ -1766,6 +1791,8 @@ impl ChainState {
                 *side_height,
                 prev_hash,
                 &self.address_index,
+                #[cfg(feature = "block-filter-index")]
+                &self.filter_index,
             )?;
             self.store.write_batch(batch)?;
             let prev_entry = self
@@ -1811,6 +1838,8 @@ impl ChainState {
                 num_threads: 1,
                 precomputed_txids: None,
                 address_index: &self.address_index,
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &self.filter_index,
             })?;
             self.store.write_batch(batch)?;
             let mut tip = self.tip.write().unwrap();
@@ -1877,6 +1906,8 @@ impl ChainState {
                 entry.height,
                 prev_hash,
                 &self.address_index,
+                #[cfg(feature = "block-filter-index")]
+                &self.filter_index,
             )?;
             combined_batch.merge(batch);
 
@@ -2067,8 +2098,9 @@ pub(crate) mod tests {
             Box::new(NoopVerifier),
             AssumeValid::Disabled,
             450,
-        4,
-        Default::default(),
+            4,
+            Default::default(),
+            Default::default(),
         )
         .unwrap();
         (cs, dir)
@@ -2553,8 +2585,9 @@ pub(crate) mod tests {
             Box::new(NoopVerifier),
             AssumeValid::Disabled,
             450,
-        4,
-        Default::default(),
+            4,
+            Default::default(),
+            Default::default(),
         )
         .unwrap();
 
@@ -2890,8 +2923,9 @@ pub(crate) mod tests {
             Box::new(NoopVerifier),
             AssumeValid::Hash(block1_hash),
             450,
-        4,
-        Default::default(),
+            4,
+            Default::default(),
+            Default::default(),
         )
         .unwrap();
 
@@ -3414,8 +3448,9 @@ pub(crate) mod tests {
             Box::new(NoopVerifier),
             AssumeValid::Disabled,
             450,
-        4,
-        Default::default(),
+            4,
+            Default::default(),
+            Default::default(),
         )
         .unwrap();
 

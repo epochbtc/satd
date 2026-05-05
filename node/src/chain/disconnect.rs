@@ -1,6 +1,8 @@
 use bitcoin::{Block, OutPoint};
 
 use crate::index::address::AddressIndexConfig;
+#[cfg(feature = "block-filter-index")]
+use crate::index::filter::FilterIndexConfig;
 use crate::storage::StoreBatch;
 use crate::storage::undo::UndoData;
 
@@ -54,6 +56,7 @@ pub fn disconnect_block(
     block_height: u32,
     prev_hash: bitcoin::BlockHash,
     address_index: &AddressIndexConfig,
+    #[cfg(feature = "block-filter-index")] filter_index: &FilterIndexConfig,
 ) -> Result<StoreBatch, DisconnectError> {
     let mut batch = StoreBatch::default();
 
@@ -164,6 +167,16 @@ pub fn disconnect_block(
     // Update tip to previous block and clean height index
     batch.tip = Some(prev_hash);
     batch.height_hash_removes.push(block_height);
+
+    // BIP 158 filter index: drop the filter blob + chained header for
+    // this height. Both rows live under `(FILTER_TYPE_BASIC, height)`
+    // so a single key drops both. Reorg correctness comes from the
+    // `(type, height)` keying — a subsequent connect of a different
+    // block at the same height overwrites the row deterministically.
+    #[cfg(feature = "block-filter-index")]
+    if let Some(key) = crate::index::filter::filter_remove_key(filter_index, block_height) {
+        batch.filter_removes.push(key);
+    }
 
     Ok(batch)
 }
@@ -355,6 +368,8 @@ mod tests {
                 num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &Default::default(),
             })
                 .unwrap();
 
@@ -368,7 +383,7 @@ mod tests {
 
         store.write_batch(connect_batch).unwrap();
 
-        let batch = disconnect_block(&block, &undo, 1, prev_hash, &Default::default()).unwrap();
+        let batch = disconnect_block(&block, &undo, 1, prev_hash, &Default::default(), #[cfg(feature = "block-filter-index")] &Default::default()).unwrap();
 
         // coin_removes should contain the coinbase output(s)
         let coinbase_txid = block.txdata[0].compute_txid();
@@ -412,6 +427,8 @@ mod tests {
                 num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &Default::default(),
             })
                 .unwrap();
 
@@ -424,7 +441,7 @@ mod tests {
 
         store.write_batch(connect_batch).unwrap();
 
-        let batch = disconnect_block(&block, &undo, 1, prev_hash, &Default::default()).unwrap();
+        let batch = disconnect_block(&block, &undo, 1, prev_hash, &Default::default(), #[cfg(feature = "block-filter-index")] &Default::default()).unwrap();
 
         // The spent coin should be restored
         assert_eq!(batch.coin_puts.len(), 1, "should restore exactly one spent coin");
@@ -469,6 +486,8 @@ mod tests {
                 num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &Default::default(),
             })
                 .unwrap();
 
@@ -481,7 +500,7 @@ mod tests {
 
         store.write_batch(connect_batch).unwrap();
 
-        let batch = disconnect_block(&block, &undo, 1, prev_hash, &Default::default()).unwrap();
+        let batch = disconnect_block(&block, &undo, 1, prev_hash, &Default::default(), #[cfg(feature = "block-filter-index")] &Default::default()).unwrap();
 
         let (restored_op, restored_coin) = &batch.coin_puts[0];
         assert_eq!(*restored_op, outpoint);
@@ -496,7 +515,7 @@ mod tests {
         let block = make_coinbase_only_block(5, BlockHash::all_zeros());
         let undo = UndoData::default();
 
-        let batch = disconnect_block(&block, &undo, 5, BlockHash::all_zeros(), &Default::default()).unwrap();
+        let batch = disconnect_block(&block, &undo, 5, BlockHash::all_zeros(), &Default::default(), #[cfg(feature = "block-filter-index")] &Default::default()).unwrap();
 
         assert_eq!(batch.height_hash_removes, vec![5]);
     }
@@ -509,7 +528,7 @@ mod tests {
         let block = make_coinbase_only_block(3, prev_hash);
         let undo = UndoData::default();
 
-        let batch = disconnect_block(&block, &undo, 3, prev_hash, &Default::default()).unwrap();
+        let batch = disconnect_block(&block, &undo, 3, prev_hash, &Default::default(), #[cfg(feature = "block-filter-index")] &Default::default()).unwrap();
 
         assert_eq!(batch.tip, Some(prev_hash));
     }
@@ -613,6 +632,8 @@ mod tests {
                 num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &Default::default(),
             })
                 .unwrap();
 
@@ -625,7 +646,7 @@ mod tests {
 
         store.write_batch(connect_batch).unwrap();
 
-        let batch = disconnect_block(&block, &undo, height, BlockHash::all_zeros(), &Default::default()).unwrap();
+        let batch = disconnect_block(&block, &undo, height, BlockHash::all_zeros(), &Default::default(), #[cfg(feature = "block-filter-index")] &Default::default()).unwrap();
 
         // All 3 txs' outputs should be in coin_removes
         // coinbase has 1 output, tx1 has 1, tx2 has 1 = 3 total
@@ -731,6 +752,8 @@ mod tests {
                 num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &Default::default(),
             })
                 .unwrap();
 
@@ -743,7 +766,7 @@ mod tests {
 
         store.write_batch(connect_batch).unwrap();
 
-        let batch = disconnect_block(&block, &undo, height, BlockHash::all_zeros(), &Default::default()).unwrap();
+        let batch = disconnect_block(&block, &undo, height, BlockHash::all_zeros(), &Default::default(), #[cfg(feature = "block-filter-index")] &Default::default()).unwrap();
 
         // All 3 spent inputs should be restored
         assert_eq!(batch.coin_puts.len(), 3);
@@ -795,6 +818,8 @@ mod tests {
                 num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &Default::default(),
             })
                 .unwrap();
 
@@ -811,7 +836,7 @@ mod tests {
         assert!(store.get_coin(&other_op).is_some());
 
         // Disconnect
-        let batch = disconnect_block(&block, &undo, 1, BlockHash::all_zeros(), &Default::default()).unwrap();
+        let batch = disconnect_block(&block, &undo, 1, BlockHash::all_zeros(), &Default::default(), #[cfg(feature = "block-filter-index")] &Default::default()).unwrap();
         store.write_batch(batch).unwrap();
 
         // The other coin should still be present
@@ -844,6 +869,8 @@ mod tests {
                 num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &Default::default(),
             })
                 .unwrap();
 
@@ -877,7 +904,7 @@ mod tests {
         assert!(store.get_coin(&outpoint).is_none());
 
         // Disconnect
-        let disconnect_batch = disconnect_block(&block, &undo, 1, prev_hash, &Default::default()).unwrap();
+        let disconnect_batch = disconnect_block(&block, &undo, 1, prev_hash, &Default::default(), #[cfg(feature = "block-filter-index")] &Default::default()).unwrap();
         store.write_batch(disconnect_batch).unwrap();
 
         // After disconnect, the original coin should be back
@@ -898,6 +925,8 @@ mod tests {
                 num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &Default::default(),
             })
                 .unwrap();
         store.write_batch(reconnect_batch).unwrap();
@@ -920,7 +949,7 @@ mod tests {
         let block = make_coinbase_only_block(10, prev_hash);
         let undo = UndoData::default();
 
-        let batch = disconnect_block(&block, &undo, 10, prev_hash, &Default::default()).unwrap();
+        let batch = disconnect_block(&block, &undo, 10, prev_hash, &Default::default(), #[cfg(feature = "block-filter-index")] &Default::default()).unwrap();
 
         // Should still remove coinbase outputs
         assert!(!batch.coin_removes.is_empty());
@@ -956,6 +985,8 @@ mod tests {
                 num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &Default::default(),
             })
                 .unwrap();
 
@@ -981,7 +1012,7 @@ mod tests {
 
         store.write_batch(connect_batch).unwrap();
 
-        let batch = disconnect_block(&block, &undo, 1, BlockHash::all_zeros(), &Default::default()).unwrap();
+        let batch = disconnect_block(&block, &undo, 1, BlockHash::all_zeros(), &Default::default(), #[cfg(feature = "block-filter-index")] &Default::default()).unwrap();
 
         // Every txid that was added by connect_block must be removed by
         // disconnect_block.
@@ -1023,6 +1054,8 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &cfg,
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &Default::default(),
         })
         .unwrap();
 
@@ -1042,7 +1075,16 @@ mod tests {
 
         store.write_batch(connect_batch).unwrap();
 
-        let batch = disconnect_block(&block, &undo, 1, BlockHash::all_zeros(), &cfg).unwrap();
+        let batch = disconnect_block(
+            &block,
+            &undo,
+            1,
+            BlockHash::all_zeros(),
+            &cfg,
+            #[cfg(feature = "block-filter-index")]
+            &Default::default(),
+        )
+        .unwrap();
 
         assert_eq!(
             batch.addr_funding_removes.len(),
@@ -1082,6 +1124,8 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &disabled,
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &Default::default(),
         })
         .unwrap();
 
@@ -1096,9 +1140,74 @@ mod tests {
             .unwrap();
         store.write_batch(connect_batch).unwrap();
 
-        let disc = disconnect_block(&block, &undo, 1, BlockHash::all_zeros(), &disabled).unwrap();
+        let disc = disconnect_block(
+            &block,
+            &undo,
+            1,
+            BlockHash::all_zeros(),
+            &disabled,
+            #[cfg(feature = "block-filter-index")]
+            &Default::default(),
+        )
+        .unwrap();
         assert!(disc.addr_funding_removes.is_empty());
         assert!(disc.addr_spending_removes.is_empty());
+    }
+
+    #[cfg(feature = "block-filter-index")]
+    #[test]
+    fn test_disconnect_with_filter_index_enabled_emits_remove_key() {
+        // Filter index on: disconnect produces one (type, height) remove.
+        use crate::index::filter::FILTER_TYPE_BASIC;
+        let (_store, outpoint, _coin) = make_test_store_with_coin(0, false);
+        let block = make_block_spending(outpoint, 1, 2, 0xffff_ffff, 0);
+        // Synthesize a minimal-but-correct undo for the block (one
+        // spent coin per non-coinbase input).
+        let undo = UndoData {
+            spent_coins: vec![(
+                crate::storage::undo::OutPointSer::from(&outpoint),
+                _coin,
+            )],
+        };
+        let fcfg = crate::index::filter::FilterIndexConfig {
+            enabled: true,
+            peer_serve: false,
+        };
+        let batch = disconnect_block(
+            &block,
+            &undo,
+            42,
+            BlockHash::all_zeros(),
+            &Default::default(),
+            &fcfg,
+        )
+        .unwrap();
+        assert_eq!(batch.filter_removes.len(), 1);
+        assert_eq!(batch.filter_removes[0].height, 42);
+        assert_eq!(batch.filter_removes[0].filter_type, FILTER_TYPE_BASIC);
+    }
+
+    #[cfg(feature = "block-filter-index")]
+    #[test]
+    fn test_disconnect_with_filter_index_disabled_emits_no_remove_key() {
+        let (_store, outpoint, _coin) = make_test_store_with_coin(0, false);
+        let block = make_block_spending(outpoint, 1, 2, 0xffff_ffff, 0);
+        let undo = UndoData {
+            spent_coins: vec![(
+                crate::storage::undo::OutPointSer::from(&outpoint),
+                _coin,
+            )],
+        };
+        let batch = disconnect_block(
+            &block,
+            &undo,
+            42,
+            BlockHash::all_zeros(),
+            &Default::default(),
+            &crate::index::filter::FilterIndexConfig::default(),
+        )
+        .unwrap();
+        assert!(batch.filter_removes.is_empty());
     }
 
     #[test]
@@ -1123,6 +1232,8 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &Default::default(),
         })
         .unwrap();
         let mut undo = connect_batch
@@ -1139,6 +1250,8 @@ mod tests {
             &undo,
             1,
             BlockHash::all_zeros(),
+            &Default::default(),
+            #[cfg(feature = "block-filter-index")]
             &Default::default(),
         );
         let err = match result {
@@ -1187,7 +1300,7 @@ mod tests {
             450,
         4,
         Default::default(),
-        )
+        Default::default(),)
         .unwrap();
 
         let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
