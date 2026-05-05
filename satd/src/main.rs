@@ -179,12 +179,12 @@ async fn main() {
         // index is active so `write_batch_mode` can clear the
         // `address_index.complete` marker atomically with any
         // connect-with-addressindex-disabled batch. The filter-index
-        // builder follows the same shape; PR-5 lands the
-        // `config.blockfilterindex` flag, so we hard-code `false` for
-        // now to match the PR-2 default-off posture.
+        // builder follows the same shape, gated on
+        // `config.blockfilterindex` so a connect with the index
+        // disabled clears the completeness marker.
         Ok(s) => Box::new(
             s.with_addressindex_enabled(config.addressindex)
-                .with_blockfilterindex_enabled(false),
+                .with_blockfilterindex_enabled(config.blockfilterindex),
         ),
         Err(e) => {
             eprintln!("Error opening chain database: {}", e);
@@ -318,13 +318,15 @@ async fn main() {
             max_subscriptions: config.addrindexsubscriptions,
             ..Default::default()
         },
-        // BIP 158 filter index: defaults to disabled. PR-5 of the
-        // BIP 157/158 stack adds the `--blockfilterindex` /
-        // `--peerblockfilters` CLI flags + reconciliation. PR-2 lands
-        // the index storage + connect-block emission with the runtime
-        // knob hard-coded off so existing operators see no behaviour
-        // change until PR-5 ships.
-        node::index::filter::FilterIndexConfig::default(),
+        // BIP 158 filter index: gated on `--blockfilterindex=basic`.
+        // When `enabled = false`, the per-block emit helper is a
+        // no-op and the open-time consistency check stamps the
+        // completeness marker false on the next connect. PR-5 layers
+        // the `peerblockfilters` companion knob on top.
+        node::index::filter::FilterIndexConfig {
+            enabled: config.blockfilterindex,
+            peer_serve: false,
+        },
     ) {
         Ok(cs) => Arc::new(cs),
         Err(e) => {
@@ -785,6 +787,66 @@ async fn main() {
         });
     }
 
+    // Filter-index backfill state machine. Mirrors the address-index
+    // setup above: read persisted cursor, build handle, log on
+    // restored state, conditionally auto-resume. The runtime knob
+    // comes from `config.blockfilterindex` (added in PR-3 via the
+    // `--blockfilterindex=basic|0|1` CLI flag). PR-5 layers the
+    // bitcoin.conf alias and the `peerblockfilters` companion knob.
+    let blockfilterindex_runtime: bool = config.blockfilterindex;
+
+    let filter_initial_cursor = chain_state.store_ref().read_filter_backfill_cursor();
+    if !matches!(
+        filter_initial_cursor.state,
+        node::index::filter::cursor::BackfillState::Idle
+    ) {
+        tracing::info!(
+            state = %filter_initial_cursor.state.label(),
+            cursor_height = filter_initial_cursor.cursor_height,
+            snapshot_height = filter_initial_cursor.snapshot_height,
+            "filter-index backfill cursor restored from metadata"
+        );
+    }
+    let filter_backfill_handle = std::sync::Arc::new(node::index::filter::BackfillHandle::new(
+        filter_initial_cursor,
+    ));
+
+    let (filter_backfill_cmd_tx, filter_backfill_cmd_rx) =
+        tokio::sync::mpsc::channel::<node::index::filter::BackfillCommand>(1);
+    {
+        let handle = filter_backfill_handle.clone();
+        let chain = chain_state.clone();
+        let filter_cfg = node::index::filter::FilterIndexConfig {
+            enabled: blockfilterindex_runtime,
+            peer_serve: false,
+        };
+        let shutdown = shutdown_rx.clone();
+        let auto_resume_state = matches!(
+            handle.cursor().state,
+            node::index::filter::cursor::BackfillState::Running
+                | node::index::filter::cursor::BackfillState::Paused
+        );
+        let resume_on_start = blockfilterindex_runtime && auto_resume_state;
+        if !resume_on_start && auto_resume_state && !blockfilterindex_runtime {
+            tracing::warn!(
+                state = %handle.cursor().state.label(),
+                "filter-index backfill cursor is active but blockfilterindex=0; \
+                 supervisor will NOT auto-resume — re-enable the index and restart"
+            );
+        }
+        tokio::spawn(async move {
+            filter_backfill_supervisor(
+                handle,
+                chain,
+                filter_cfg,
+                filter_backfill_cmd_rx,
+                shutdown,
+                resume_on_start,
+            )
+            .await;
+        });
+    }
+
     // Keep a clone of the shutdown sender in main so Ctrl-C / SIGTERM
     // can broadcast shutdown to all watch receivers (including the
     // backfill supervisor + runner). The RPC server takes its own
@@ -814,6 +876,20 @@ async fn main() {
         Some(backfill_handle.clone()),
         Some(backfill_cmd_tx.clone()),
         listener_status.clone(),
+        // BIP 158 filter index: PR-3 plumbs the runtime knob through
+        // to RPC status surfaces (`getindexinfo`, `getserverstatus`).
+        // The 4 args below are gated by `node`'s `block-filter-index`
+        // feature, which is always on in any workspace build of
+        // `satd` (esplora-handlers / electrum-proto pull node in
+        // without `default-features = false`, so Cargo unifies the
+        // feature on regardless of satd's per-binary feature gate).
+        // We pass them unconditionally — PR-5 wires `RocksFilterIndex`
+        // for the `filter_index` slot; until then it stays `None`
+        // and `getblockfilter` errors with "not initialized".
+        blockfilterindex_runtime,
+        None,
+        Some(filter_backfill_handle.clone()),
+        Some(filter_backfill_cmd_tx.clone()),
     )
     .await
     {
@@ -1621,6 +1697,133 @@ async fn persist_failed_with_cleanup(
     // rather than reusing pass-1 mappings from the failed run.
     if let Err(e) = chain.store_ref().drop_backfill_temp_cf() {
         tracing::warn!(error = %e, "failed to drop temp CF after Failed");
+    }
+}
+
+// ============================================================================
+// Filter-index backfill supervisor (mirrors the address-index pattern above
+// for BIP 158 filter rows). Single-pass walk, no temp CF.
+// ============================================================================
+
+/// Filter-index backfill supervisor. Same lifecycle as
+/// `backfill_supervisor` for the address index but for the filter
+/// backfill — single-pass, no temp CF cleanup.
+async fn filter_backfill_supervisor(
+    handle: std::sync::Arc<node::index::filter::BackfillHandle>,
+    chain: std::sync::Arc<node::chain::state::ChainState>,
+    cfg: node::index::filter::FilterIndexConfig,
+    mut cmd_rx: tokio::sync::mpsc::Receiver<node::index::filter::BackfillCommand>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    resume_on_start: bool,
+) {
+    if resume_on_start {
+        tracing::info!("filter-index backfill: auto-resuming from persisted cursor");
+        spawn_filter_runner(handle.clone(), chain.clone(), cfg.clone(), shutdown.clone()).await;
+    }
+
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    tracing::info!("filter-index backfill supervisor: shutdown");
+                    return;
+                }
+            }
+            cmd = cmd_rx.recv() => {
+                let Some(cmd) = cmd else {
+                    return;
+                };
+                match cmd {
+                    node::index::filter::BackfillCommand::Start => {
+                        spawn_filter_runner(
+                            handle.clone(),
+                            chain.clone(),
+                            cfg.clone(),
+                            shutdown.clone(),
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn spawn_filter_runner(
+    handle: std::sync::Arc<node::index::filter::BackfillHandle>,
+    chain: std::sync::Arc<node::chain::state::ChainState>,
+    cfg: node::index::filter::FilterIndexConfig,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    let handle_for_failure = handle.clone();
+    let chain_for_failure = chain.clone();
+    let join = tokio::task::spawn_blocking(move || {
+        let runner = node::index::filter::BackfillRunner {
+            handle,
+            chain,
+            cfg,
+            shutdown,
+        };
+        runner.run()
+    });
+    let result = join.await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(node::index::filter::BackfillError::Shutdown)) => {
+            tracing::info!("filter-index backfill: stopped for shutdown (resume on next start)");
+        }
+        Ok(Err(node::index::filter::BackfillError::Cancelled)) => {
+            tracing::info!("filter-index backfill: cancelled by operator");
+        }
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "filter-index backfill runner exited with error");
+            persist_filter_failed_with_cleanup(&handle_for_failure, &chain_for_failure, &e).await;
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "filter-index backfill runner task panicked");
+            let msg = format!("runner panicked: {}", e);
+            if let Err(p) =
+                handle_for_failure.mark_failed(chain_for_failure.store_ref().as_ref(), &msg)
+            {
+                tracing::warn!(error = %p, "failed to persist Failed state after filter runner panic");
+            }
+        }
+    }
+}
+
+async fn persist_filter_failed_with_cleanup(
+    handle: &std::sync::Arc<node::index::filter::BackfillHandle>,
+    chain: &std::sync::Arc<node::chain::state::ChainState>,
+    err: &node::index::filter::BackfillError,
+) {
+    use node::index::filter::BackfillError;
+    let cleanup_needed = matches!(err, BackfillError::ReorgInvalidated { .. });
+    if cleanup_needed {
+        let chain_clone = chain.clone();
+        let handle_clone = handle.clone();
+        let cleanup_join = tokio::task::spawn_blocking(move || {
+            node::index::filter::BackfillRunner::cleanup_stale_rows_after_reorg(
+                chain_clone.as_ref(),
+                handle_clone.as_ref(),
+            )
+        })
+        .await;
+        match cleanup_join {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    error = %e,
+                    "filter-index reorg cleanup failed; proceeding to mark Failed"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "filter-index reorg cleanup task panicked");
+            }
+        }
+    }
+    let msg = format!("{}", err);
+    if let Err(p) = handle.mark_failed(chain.store_ref().as_ref(), &msg) {
+        tracing::warn!(error = %p, "failed to persist filter-index Failed state");
     }
 }
 

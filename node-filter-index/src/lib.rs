@@ -12,11 +12,13 @@
 //! alone.
 
 pub mod config;
+pub mod cursor;
 pub mod keys;
 pub mod trait_def;
 pub mod types;
 
 pub use config::FilterIndexConfig;
+pub use cursor::{BackfillCursor, BackfillState};
 pub use keys::{
     decode_filter_key, encode_filter_key, FilterKey, FILTER_KEY_LEN, FILTER_TYPE_BASIC,
 };

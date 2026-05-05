@@ -21,7 +21,11 @@ enum DirtyEntry {
     /// Coin was spent. Carries (amount, height) for counter/histogram updates.
     /// If `fresh` = true, the coin was created and spent in the same flush window
     /// and can be discarded without touching the backing store.
-    Spent { amount: u64, height: u32, fresh: bool },
+    Spent {
+        amount: u64,
+        height: u32,
+        fresh: bool,
+    },
 }
 
 /// In-memory write cache wrapping a persistent Store.
@@ -238,8 +242,7 @@ impl CoinCache {
 
     /// Approximate total cache size (dirty + clean coins).
     pub fn cache_size(&self) -> usize {
-        self.dirty_count.load(Ordering::Relaxed) as usize
-            + self.clean.lock().unwrap().len()
+        self.dirty_count.load(Ordering::Relaxed) as usize + self.clean.lock().unwrap().len()
     }
 
     /// Dirty coin count threshold at which the cache should be flushed.
@@ -274,7 +277,6 @@ impl CoinCache {
     pub fn clean_cap(&self) -> usize {
         self.clean.lock().unwrap().cap().get()
     }
-
 }
 
 impl Store for CoinCache {
@@ -339,7 +341,8 @@ impl Store for CoinCache {
             let mut clean = self.clean.lock().unwrap();
 
             for (outpoint, coin) in batch.coin_puts {
-                self.amount_delta.fetch_add(coin.amount as i64, Ordering::Relaxed);
+                self.amount_delta
+                    .fetch_add(coin.amount as i64, Ordering::Relaxed);
                 self.count_delta.fetch_add(1, Ordering::Relaxed);
                 clean.pop(&outpoint);
                 // Mark as fresh if this coin doesn't exist in the backing store
@@ -349,7 +352,8 @@ impl Store for CoinCache {
             }
 
             for (outpoint, spent_amount, spent_height) in batch.coin_removes {
-                self.amount_delta.fetch_sub(spent_amount as i64, Ordering::Relaxed);
+                self.amount_delta
+                    .fetch_sub(spent_amount as i64, Ordering::Relaxed);
                 self.count_delta.fetch_sub(1, Ordering::Relaxed);
                 clean.pop(&outpoint);
                 // If the coin was fresh (created in this flush window), mark the
@@ -357,11 +361,14 @@ impl Store for CoinCache {
                 let was_fresh = dirty
                     .get(&outpoint)
                     .is_some_and(|e| matches!(e, DirtyEntry::Present { fresh: true, .. }));
-                dirty.insert(outpoint, DirtyEntry::Spent {
-                    amount: spent_amount,
-                    height: spent_height,
-                    fresh: was_fresh,
-                });
+                dirty.insert(
+                    outpoint,
+                    DirtyEntry::Spent {
+                        amount: spent_amount,
+                        height: spent_height,
+                        fresh: was_fresh,
+                    },
+                );
             }
 
             self.dirty_count
@@ -382,7 +389,10 @@ impl Store for CoinCache {
                 // and permanently stalling the connect loop.
                 let dominated = if let Some(existing) = bi.peek(hash) {
                     entry.status == BlockStatus::HeaderOnly
-                        && matches!(existing.status, BlockStatus::DataStored | BlockStatus::Valid)
+                        && matches!(
+                            existing.status,
+                            BlockStatus::DataStored | BlockStatus::Valid
+                        )
                 } else {
                     false
                 };
@@ -439,7 +449,17 @@ impl Store for CoinCache {
             || !batch.outpoint_spend_removes.is_empty()
             || !batch.addr_backfill_temp_puts.is_empty()
             || batch.backfill_cursor_advance.is_some()
-            || has_filter;
+            || has_filter
+            || {
+                #[cfg(feature = "block-filter-index")]
+                {
+                    batch.filter_backfill_cursor_advance.is_some()
+                }
+                #[cfg(not(feature = "block-filter-index"))]
+                {
+                    false
+                }
+            };
 
         if has_non_coin {
             if coin_dirty == 0 {
@@ -467,13 +487,17 @@ impl Store for CoinCache {
                     filter_header_puts: batch.filter_header_puts,
                     #[cfg(feature = "block-filter-index")]
                     filter_removes: batch.filter_removes,
+                    #[cfg(feature = "block-filter-index")]
+                    filter_backfill_cursor_advance: batch.filter_backfill_cursor_advance,
                 };
                 self.inner.write_batch_mode(pass_through, mode)?;
             } else {
                 let mut pending = self.pending_batch.lock().unwrap();
                 pending.block_index_puts.extend(batch.block_index_puts);
                 pending.height_hash_puts.extend(batch.height_hash_puts);
-                pending.height_hash_removes.extend(batch.height_hash_removes);
+                pending
+                    .height_hash_removes
+                    .extend(batch.height_hash_removes);
                 pending.undo_puts.extend(batch.undo_puts);
                 pending.tx_index_puts.extend(batch.tx_index_puts);
                 pending.tx_index_removes.extend(batch.tx_index_removes);
@@ -499,6 +523,8 @@ impl Store for CoinCache {
                     filter_header_puts: batch.filter_header_puts,
                     #[cfg(feature = "block-filter-index")]
                     filter_removes: batch.filter_removes,
+                    #[cfg(feature = "block-filter-index")]
+                    filter_backfill_cursor_advance: batch.filter_backfill_cursor_advance,
                     ..Default::default()
                 };
                 pending.merge(addr_only);
@@ -632,7 +658,8 @@ impl Store for CoinCache {
 
         // 2. Batch fetch misses from backing store
         if !misses.is_empty() {
-            self.perf_store_misses.fetch_add(misses.len() as u64, Ordering::Relaxed);
+            self.perf_store_misses
+                .fetch_add(misses.len() as u64, Ordering::Relaxed);
             let miss_outpoints: Vec<OutPoint> = misses.iter().map(|(_, op)| *op).collect();
             let fetched = self.inner.get_coins_batch(&miss_outpoints);
             let mut clean = self.clean.lock().unwrap();
@@ -894,8 +921,10 @@ impl Store for CoinCache {
         // Pending remove takes precedence: the on-disk net effect of
         // remove-then-put is the put (last-writer-wins), but
         // remove-only flips a previously-set entry off. Mirror that.
-        let pending_remove =
-            pending.outpoint_spend_removes.iter().any(|op| op == outpoint);
+        let pending_remove = pending
+            .outpoint_spend_removes
+            .iter()
+            .any(|op| op == outpoint);
         let pending_put = pending
             .outpoint_spend_puts
             .iter()
@@ -914,10 +943,10 @@ impl Store for CoinCache {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use super::super::db::InMemoryStore;
     use super::super::blockindex::{BlockIndexEntry, BlockStatus, work_for_bits};
+    use super::super::db::InMemoryStore;
     use super::super::undo::{OutPointSer, UndoData};
+    use super::*;
     use bitcoin::hashes::Hash;
     use bitcoin::pow::CompactTarget;
 
@@ -936,17 +965,15 @@ mod tests {
 
     fn make_outpoint(txid_byte: u8, vout: u32) -> OutPoint {
         OutPoint {
-            txid: bitcoin::Txid::from_raw_hash(
-                bitcoin::hashes::sha256d::Hash::from_byte_array([txid_byte; 32]),
-            ),
+            txid: bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+                [txid_byte; 32],
+            )),
             vout,
         }
     }
 
     fn make_block_hash(byte: u8) -> BlockHash {
-        BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
-            [byte; 32],
-        ))
+        BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([byte; 32]))
     }
 
     fn make_test_entry(height: u32) -> BlockIndexEntry {
@@ -1075,8 +1102,12 @@ mod tests {
         let cache = make_cache(10);
 
         let mut batch = StoreBatch::default();
-        batch.coin_puts.push((make_outpoint(0x10, 0), make_coin(100, 1)));
-        batch.coin_puts.push((make_outpoint(0x11, 0), make_coin(200, 2)));
+        batch
+            .coin_puts
+            .push((make_outpoint(0x10, 0), make_coin(100, 1)));
+        batch
+            .coin_puts
+            .push((make_outpoint(0x11, 0), make_coin(200, 2)));
         cache.write_batch(batch).unwrap();
 
         assert_eq!(cache.dirty_count(), 2);
@@ -1091,8 +1122,10 @@ mod tests {
 
         // Add two coins: amounts 1000 and 2000.
         let mut b1 = StoreBatch::default();
-        b1.coin_puts.push((make_outpoint(0x20, 0), make_coin(1000, 1)));
-        b1.coin_puts.push((make_outpoint(0x21, 0), make_coin(2000, 2)));
+        b1.coin_puts
+            .push((make_outpoint(0x20, 0), make_coin(1000, 1)));
+        b1.coin_puts
+            .push((make_outpoint(0x21, 0), make_coin(2000, 2)));
         cache.write_batch(b1).unwrap();
 
         assert_eq!(cache.count_delta.load(Ordering::Relaxed), 2);
@@ -1139,8 +1172,12 @@ mod tests {
         let cache = make_cache(10);
 
         let mut batch = StoreBatch::default();
-        batch.coin_puts.push((make_outpoint(0x40, 0), make_coin(100, 1)));
-        batch.coin_puts.push((make_outpoint(0x41, 0), make_coin(200, 2)));
+        batch
+            .coin_puts
+            .push((make_outpoint(0x40, 0), make_coin(100, 1)));
+        batch
+            .coin_puts
+            .push((make_outpoint(0x41, 0), make_coin(200, 2)));
         batch.coin_removes.push((make_outpoint(0x42, 0), 300, 0));
         cache.write_batch(batch).unwrap();
 
@@ -1157,7 +1194,9 @@ mod tests {
         let cache = make_cache(10);
 
         let mut batch = StoreBatch::default();
-        batch.coin_puts.push((make_outpoint(0x50, 0), make_coin(500, 1)));
+        batch
+            .coin_puts
+            .push((make_outpoint(0x50, 0), make_coin(500, 1)));
         cache.write_batch(batch).unwrap();
 
         assert_ne!(cache.count_delta.load(Ordering::Relaxed), 0);
@@ -1203,7 +1242,9 @@ mod tests {
 
         // Batch with coins + block_index — non-coins are buffered.
         let mut batch = StoreBatch::default();
-        batch.coin_puts.push((make_outpoint(0x70, 0), make_coin(1, 1)));
+        batch
+            .coin_puts
+            .push((make_outpoint(0x70, 0), make_coin(1, 1)));
         batch.block_index_puts.push((bh, entry.clone()));
         cache.write_batch(batch).unwrap();
 
@@ -1246,7 +1287,9 @@ mod tests {
 
         // Batch with coins + block_index.
         let mut batch = StoreBatch::default();
-        batch.coin_puts.push((make_outpoint(0x80, 0), make_coin(1, 1)));
+        batch
+            .coin_puts
+            .push((make_outpoint(0x80, 0), make_coin(1, 1)));
         batch.block_index_puts.push((bh, entry.clone()));
         cache.write_batch(batch).unwrap();
 
@@ -1347,7 +1390,9 @@ mod tests {
         let mut batch = StoreBatch::default();
         batch.coin_puts.push((op, make_coin(500, 1)));
         batch.tip = Some(make_block_hash(0xF1));
-        batch.block_index_puts.push((make_block_hash(0xF2), make_test_entry(50)));
+        batch
+            .block_index_puts
+            .push((make_block_hash(0xF2), make_test_entry(50)));
         batch.height_hash_puts.push((50, make_block_hash(0xF2)));
         cache.write_batch(batch).unwrap();
 
@@ -1430,9 +1475,12 @@ mod tests {
 
         // Seed inner with 3 coins.
         let mut seed = StoreBatch::default();
-        seed.coin_puts.push((make_outpoint(0xA0, 0), make_coin(100, 1)));
-        seed.coin_puts.push((make_outpoint(0xA1, 0), make_coin(200, 2)));
-        seed.coin_puts.push((make_outpoint(0xA2, 0), make_coin(300, 3)));
+        seed.coin_puts
+            .push((make_outpoint(0xA0, 0), make_coin(100, 1)));
+        seed.coin_puts
+            .push((make_outpoint(0xA1, 0), make_coin(200, 2)));
+        seed.coin_puts
+            .push((make_outpoint(0xA2, 0), make_coin(300, 3)));
         inner.write_batch(seed).unwrap();
 
         let cache = CoinCache::new(Box::new(inner), 10);
@@ -1440,7 +1488,8 @@ mod tests {
 
         // Add one dirty coin.
         let mut b1 = StoreBatch::default();
-        b1.coin_puts.push((make_outpoint(0xA3, 0), make_coin(400, 4)));
+        b1.coin_puts
+            .push((make_outpoint(0xA3, 0), make_coin(400, 4)));
         cache.write_batch(b1).unwrap();
         assert_eq!(cache.coin_count(), 4);
 
@@ -1460,8 +1509,10 @@ mod tests {
 
         // Seed inner with total = 100 + 200 = 300.
         let mut seed = StoreBatch::default();
-        seed.coin_puts.push((make_outpoint(0xB0, 0), make_coin(100, 1)));
-        seed.coin_puts.push((make_outpoint(0xB1, 0), make_coin(200, 2)));
+        seed.coin_puts
+            .push((make_outpoint(0xB0, 0), make_coin(100, 1)));
+        seed.coin_puts
+            .push((make_outpoint(0xB1, 0), make_coin(200, 2)));
         inner.write_batch(seed).unwrap();
 
         let cache = CoinCache::new(Box::new(inner), 10);
@@ -1469,7 +1520,8 @@ mod tests {
 
         // Add coin with amount 500.
         let mut b1 = StoreBatch::default();
-        b1.coin_puts.push((make_outpoint(0xB2, 0), make_coin(500, 3)));
+        b1.coin_puts
+            .push((make_outpoint(0xB2, 0), make_coin(500, 3)));
         cache.write_batch(b1).unwrap();
         assert_eq!(cache.coin_total_amount(), 800);
 
@@ -1496,7 +1548,10 @@ mod tests {
     // the test fails.
     #[test]
     fn test_flush_completes_under_concurrent_read_pressure() {
-        use std::sync::{Arc, atomic::{AtomicBool, Ordering as AOrdering}};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering as AOrdering},
+        };
         use std::time::{Duration, Instant};
 
         let cache = Arc::new(make_cache(450));
@@ -1623,8 +1678,12 @@ mod tests {
     #[test]
     fn test_flush_durable_empty_is_ok() {
         let cache = make_cache(16);
-        cache.flush_durable().expect("empty flush_durable must succeed");
-        cache.flush_durable().expect("repeated flush_durable must succeed");
+        cache
+            .flush_durable()
+            .expect("empty flush_durable must succeed");
+        cache
+            .flush_durable()
+            .expect("repeated flush_durable must succeed");
     }
 
     // ---------------------------------------------------------------
@@ -1640,9 +1699,9 @@ mod tests {
 
         let cache = make_cache(16);
         let sh = scripthash_of(&bitcoin::ScriptBuf::new());
-        let txid = bitcoin::Txid::from_raw_hash(
-            bitcoin::hashes::sha256d::Hash::from_byte_array([0x99; 32]),
-        );
+        let txid = bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+            [0x99; 32],
+        ));
 
         // Connect-side: stage a funding row in the pending batch.
         let mut connect = StoreBatch::default();
@@ -1664,9 +1723,14 @@ mod tests {
         // Disconnect-side: stage the matching remove in the same
         // pending batch (no flush in between).
         let mut disconnect = StoreBatch::default();
-        disconnect.addr_funding_removes.push(
-            crate::index::address::AddrFundingKey { scripthash: sh, height: 1, txid, vout: 0 },
-        );
+        disconnect
+            .addr_funding_removes
+            .push(crate::index::address::AddrFundingKey {
+                scripthash: sh,
+                height: 1,
+                txid,
+                vout: 0,
+            });
         cache.write_batch(disconnect).unwrap();
 
         assert!(
@@ -1693,15 +1757,20 @@ mod tests {
 
         let cache = make_cache(16);
         let sh = scripthash_of(&bitcoin::ScriptBuf::new());
-        let txid = bitcoin::Txid::from_raw_hash(
-            bitcoin::hashes::sha256d::Hash::from_byte_array([0x55; 32]),
-        );
+        let txid = bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+            [0x55; 32],
+        ));
 
         // Stage a remove for the row first (e.g. disconnecting block A).
         let mut disconnect = StoreBatch::default();
-        disconnect.addr_funding_removes.push(
-            crate::index::address::AddrFundingKey { scripthash: sh, height: 1, txid, vout: 0 },
-        );
+        disconnect
+            .addr_funding_removes
+            .push(crate::index::address::AddrFundingKey {
+                scripthash: sh,
+                height: 1,
+                txid,
+                vout: 0,
+            });
         cache.write_batch(disconnect).unwrap();
 
         // Now stage a put for the same key (reconnecting the same block
@@ -1733,20 +1802,20 @@ mod tests {
 
         let cache = make_cache(16);
         let sh = scripthash_of(&bitcoin::ScriptBuf::new());
-        let txid = bitcoin::Txid::from_raw_hash(
-            bitcoin::hashes::sha256d::Hash::from_byte_array([0x66; 32]),
-        );
+        let txid = bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+            [0x66; 32],
+        ));
         let prev = make_outpoint(0xdd, 1);
 
         let mut disconnect = StoreBatch::default();
-        disconnect.addr_spending_removes.push(
-            crate::index::address::AddrSpendingKey {
+        disconnect
+            .addr_spending_removes
+            .push(crate::index::address::AddrSpendingKey {
                 scripthash: sh,
                 height: 1,
                 txid,
                 vin: 0,
-            },
-        );
+            });
         cache.write_batch(disconnect).unwrap();
 
         let mut reconnect = StoreBatch::default();
@@ -1790,14 +1859,14 @@ mod tests {
         assert_eq!(cache.iter_addr_spending(&sh).len(), 1);
 
         let mut disconnect = StoreBatch::default();
-        disconnect.addr_spending_removes.push(
-            crate::index::address::AddrSpendingKey {
+        disconnect
+            .addr_spending_removes
+            .push(crate::index::address::AddrSpendingKey {
                 scripthash: sh,
                 height: 1,
                 txid: spending_txid,
                 vin: 0,
-            },
-        );
+            });
         cache.write_batch(disconnect).unwrap();
 
         assert!(

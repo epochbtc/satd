@@ -9,7 +9,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::storage::blockindex::BlockIndexEntry;
-use crate::storage::coinview::{outpoint_to_key, Coin};
+use crate::storage::coinview::{Coin, outpoint_to_key};
 use crate::storage::undo::UndoData;
 use crate::storage::{Store, StoreBatch, StoreError, WriteMode};
 
@@ -155,7 +155,12 @@ pub struct RocksDbStore {
 }
 
 impl RocksDbStore {
-    pub fn open(path: &Path, txindex: bool, cache_mb: usize, reindex: bool) -> Result<Self, StoreError> {
+    pub fn open(
+        path: &Path,
+        txindex: bool,
+        cache_mb: usize,
+        reindex: bool,
+    ) -> Result<Self, StoreError> {
         let db_path = path.join("chainstate");
 
         let cpus = std::thread::available_parallelism()
@@ -188,40 +193,41 @@ impl RocksDbStore {
         ];
 
         // Column family options builder
-        let make_cf_opts = |bloom: bool, write_buf_mb: usize, prefix_len: Option<usize>| -> Options {
-            let mut cf_opts = Options::default();
+        let make_cf_opts =
+            |bloom: bool, write_buf_mb: usize, prefix_len: Option<usize>| -> Options {
+                let mut cf_opts = Options::default();
 
-            let mut table_opts = BlockBasedOptions::default();
-            table_opts.set_block_cache(&block_cache);
-            table_opts.set_block_size(16 * 1024); // 16 KB for SSD
-            table_opts.set_cache_index_and_filter_blocks(true);
-            table_opts.set_pin_l0_filter_and_index_blocks_in_cache(true);
-            table_opts.set_format_version(5);
+                let mut table_opts = BlockBasedOptions::default();
+                table_opts.set_block_cache(&block_cache);
+                table_opts.set_block_size(16 * 1024); // 16 KB for SSD
+                table_opts.set_cache_index_and_filter_blocks(true);
+                table_opts.set_pin_l0_filter_and_index_blocks_in_cache(true);
+                table_opts.set_format_version(5);
 
-            if bloom {
-                table_opts.set_bloom_filter(10.0, false);
-                table_opts.set_whole_key_filtering(true);
-            }
+                if bloom {
+                    table_opts.set_bloom_filter(10.0, false);
+                    table_opts.set_whole_key_filtering(true);
+                }
 
-            cf_opts.set_block_based_table_factory(&table_opts);
-            cf_opts.set_write_buffer_size(write_buf_mb * 1024 * 1024);
-            cf_opts.set_max_write_buffer_number(3);
-            cf_opts.set_level_compaction_dynamic_level_bytes(true);
-            cf_opts.set_max_bytes_for_level_base(512 * 1024 * 1024);
-            cf_opts.set_target_file_size_base(64 * 1024 * 1024);
-            cf_opts.set_compression_per_level(&compression_per_level);
-            cf_opts.set_bottommost_compression_type(DBCompressionType::Zstd);
+                cf_opts.set_block_based_table_factory(&table_opts);
+                cf_opts.set_write_buffer_size(write_buf_mb * 1024 * 1024);
+                cf_opts.set_max_write_buffer_number(3);
+                cf_opts.set_level_compaction_dynamic_level_bytes(true);
+                cf_opts.set_max_bytes_for_level_base(512 * 1024 * 1024);
+                cf_opts.set_target_file_size_base(64 * 1024 * 1024);
+                cf_opts.set_compression_per_level(&compression_per_level);
+                cf_opts.set_bottommost_compression_type(DBCompressionType::Zstd);
 
-            // Fixed-length key prefix lets `prefix_iterator_cf` short-
-            // circuit to the matching SST block (and engages the bloom
-            // filter for prefix-presence checks). Used by the address-
-            // history CFs whose first 32 bytes are `sha256(spk)`.
-            if let Some(len) = prefix_len {
-                cf_opts.set_prefix_extractor(SliceTransform::create_fixed_prefix(len));
-            }
+                // Fixed-length key prefix lets `prefix_iterator_cf` short-
+                // circuit to the matching SST block (and engages the bloom
+                // filter for prefix-presence checks). Used by the address-
+                // history CFs whose first 32 bytes are `sha256(spk)`.
+                if let Some(len) = prefix_len {
+                    cf_opts.set_prefix_extractor(SliceTransform::create_fixed_prefix(len));
+                }
 
-            cf_opts
-        };
+                cf_opts
+            };
 
         let mut cf_descriptors = vec![
             ColumnFamilyDescriptor::new(CF_COINS, make_cf_opts(true, 64, None)),
@@ -271,8 +277,7 @@ impl RocksDbStore {
         // Skipped on first-open (path doesn't exist yet) — list_cf
         // requires the DB directory to exist.
         if db_path.exists()
-            && let Ok(existing_cfs) =
-                DB::list_cf(&Options::default(), &db_path)
+            && let Ok(existing_cfs) = DB::list_cf(&Options::default(), &db_path)
             && existing_cfs.iter().any(|n| n == CF_ADDR_BACKFILL_TEMP)
         {
             cf_descriptors.push(ColumnFamilyDescriptor::new(
@@ -681,10 +686,7 @@ impl RocksDbStore {
         // prefix. Mirror the prefix-extractor we set on initial CF
         // creation so `drop_and_recreate_cf` (used by `clear_*` paths)
         // preserves it.
-        if matches!(
-            name,
-            CF_ADDR_FUNDING | CF_ADDR_SPENDING | CF_OUTPOINT_SPEND
-        ) {
+        if matches!(name, CF_ADDR_FUNDING | CF_ADDR_SPENDING | CF_OUTPOINT_SPEND) {
             cf_opts.set_prefix_extractor(SliceTransform::create_fixed_prefix(32));
         }
         cf_opts
@@ -695,7 +697,8 @@ impl RocksDbStore {
         let cf_meta = db.cf_handle(CF_METADATA).expect("metadata CF missing");
         let mut wb = WriteBatch::default();
         wb.put_cf(&cf_meta, SCHEMA_KEY, version.to_le_bytes());
-        db.write(wb).map_err(|e| StoreError::Database(e.to_string()))
+        db.write(wb)
+            .map_err(|e| StoreError::Database(e.to_string()))
     }
 
     /// O(1) column family clear: drop and recreate with original options.
@@ -792,8 +795,7 @@ impl Store for RocksDbStore {
         // `coin_removes` covers the disconnect-with-txindex-off case
         // where existing tx_index rows for the now-undone block
         // become stale.
-        if !self.txindex_enabled
-            && (!batch.coin_puts.is_empty() || !batch.coin_removes.is_empty())
+        if !self.txindex_enabled && (!batch.coin_puts.is_empty() || !batch.coin_removes.is_empty())
         {
             wb.put_cf(&cf_meta, TX_INDEX_COMPLETE_KEY, [0u8]);
         }
@@ -961,11 +963,7 @@ impl Store for RocksDbStore {
                 // bound, with this value as the "ever-stamped" upper
                 // bound for diagnostics.
                 if let Some(h) = max_height {
-                    wb.put_cf(
-                        &cf_meta,
-                        BLOCK_FILTER_INDEX_TIP_HEIGHT_KEY,
-                        h.to_be_bytes(),
-                    );
+                    wb.put_cf(&cf_meta, BLOCK_FILTER_INDEX_TIP_HEIGHT_KEY, h.to_be_bytes());
                 }
             }
         }
@@ -999,9 +997,21 @@ impl Store for RocksDbStore {
             use crate::index::address::cursor as cur;
             wb.put_cf(&cf_meta, cur::META_KEY_STATE, [adv.state.as_byte()]);
             wb.put_cf(&cf_meta, cur::META_KEY_PASS, [adv.pass]);
-            wb.put_cf(&cf_meta, cur::META_KEY_CURSOR_HEIGHT, adv.cursor_height.to_be_bytes());
-            wb.put_cf(&cf_meta, cur::META_KEY_SNAPSHOT_HEIGHT, adv.snapshot_height.to_be_bytes());
-            wb.put_cf(&cf_meta, cur::META_KEY_STARTED_AT, adv.started_at_unix.to_be_bytes());
+            wb.put_cf(
+                &cf_meta,
+                cur::META_KEY_CURSOR_HEIGHT,
+                adv.cursor_height.to_be_bytes(),
+            );
+            wb.put_cf(
+                &cf_meta,
+                cur::META_KEY_SNAPSHOT_HEIGHT,
+                adv.snapshot_height.to_be_bytes(),
+            );
+            wb.put_cf(
+                &cf_meta,
+                cur::META_KEY_STARTED_AT,
+                adv.started_at_unix.to_be_bytes(),
+            );
             // Snapshot-tip hash. All-zero hash is the "don't care" sentinel
             // (set by per-block batches that aren't the start
             // transition); skip the write so we don't clobber the
@@ -1009,6 +1019,37 @@ impl Store for RocksDbStore {
             // emit a non-zero hash here.
             if adv.snapshot_tip_hash != [0u8; 32] {
                 wb.put_cf(&cf_meta, cur::META_KEY_SNAPSHOT_HASH, adv.snapshot_tip_hash);
+            }
+        }
+
+        // Metadata: filter-index backfill cursor advance. Atomic with
+        // the cf_filter / cf_filter_header writes above so a kill -9
+        // mid-batch leaves cursor and rows in lockstep.
+        #[cfg(feature = "block-filter-index")]
+        if let Some(adv) = &batch.filter_backfill_cursor_advance {
+            use node_filter_index::cursor as fcur;
+            wb.put_cf(&cf_meta, fcur::META_KEY_STATE, [adv.state.as_byte()]);
+            wb.put_cf(
+                &cf_meta,
+                fcur::META_KEY_CURSOR_HEIGHT,
+                adv.cursor_height.to_be_bytes(),
+            );
+            wb.put_cf(
+                &cf_meta,
+                fcur::META_KEY_SNAPSHOT_HEIGHT,
+                adv.snapshot_height.to_be_bytes(),
+            );
+            wb.put_cf(
+                &cf_meta,
+                fcur::META_KEY_STARTED_AT,
+                adv.started_at_unix.to_be_bytes(),
+            );
+            if adv.snapshot_tip_hash != [0u8; 32] {
+                wb.put_cf(
+                    &cf_meta,
+                    fcur::META_KEY_SNAPSHOT_HASH,
+                    adv.snapshot_tip_hash,
+                );
             }
         }
 
@@ -1032,8 +1073,8 @@ impl Store for RocksDbStore {
                 }
                 hist[bucket] = (hist[bucket] as i64 + delta).max(0) as u64;
             }
-            let hist_bytes = bincode::serialize(&hist)
-                .map_err(|e| StoreError::Serialization(e.to_string()))?;
+            let hist_bytes =
+                bincode::serialize(&hist).map_err(|e| StoreError::Serialization(e.to_string()))?;
             wb.put_cf(&cf_meta, UTXO_HEIGHT_HIST_KEY, &hist_bytes);
         }
 
@@ -1478,10 +1519,7 @@ impl Store for RocksDbStore {
         self.db
             .create_cf(CF_ADDR_BACKFILL_TEMP, &cf_opts)
             .map_err(|e| {
-                StoreError::Database(format!(
-                    "create_cf({}): {}",
-                    CF_ADDR_BACKFILL_TEMP, e
-                ))
+                StoreError::Database(format!("create_cf({}): {}", CF_ADDR_BACKFILL_TEMP, e))
             })
     }
 
@@ -1489,9 +1527,9 @@ impl Store for RocksDbStore {
         if self.db.cf_handle(CF_ADDR_BACKFILL_TEMP).is_none() {
             return Ok(());
         }
-        self.db.drop_cf(CF_ADDR_BACKFILL_TEMP).map_err(|e| {
-            StoreError::Database(format!("drop_cf({}): {}", CF_ADDR_BACKFILL_TEMP, e))
-        })
+        self.db
+            .drop_cf(CF_ADDR_BACKFILL_TEMP)
+            .map_err(|e| StoreError::Database(format!("drop_cf({}): {}", CF_ADDR_BACKFILL_TEMP, e)))
     }
 
     fn backfill_temp_cf_exists(&self) -> bool {
@@ -1528,7 +1566,11 @@ impl Store for RocksDbStore {
         use crate::index::address::cursor as cur;
         let cf = self.cf(CF_METADATA);
         let read_u8 = |k: &[u8]| -> Option<u8> {
-            self.db.get_cf(&cf, k).ok().flatten().and_then(|v| v.first().copied())
+            self.db
+                .get_cf(&cf, k)
+                .ok()
+                .flatten()
+                .and_then(|v| v.first().copied())
         };
         let read_u32_be = |k: &[u8]| -> Option<u32> {
             self.db.get_cf(&cf, k).ok().flatten().and_then(|v| {
@@ -1613,12 +1655,105 @@ impl Store for RocksDbStore {
                 .map_err(|e| StoreError::Database(e.to_string()))
         }
     }
+
+    #[cfg(feature = "block-filter-index")]
+    fn read_filter_backfill_cursor(&self) -> node_filter_index::cursor::BackfillCursor {
+        use node_filter_index::cursor as fcur;
+        let cf = self.cf(CF_METADATA);
+        let read_u8 = |k: &[u8]| -> Option<u8> {
+            self.db
+                .get_cf(&cf, k)
+                .ok()
+                .flatten()
+                .and_then(|v| v.first().copied())
+        };
+        let read_u32_be = |k: &[u8]| -> Option<u32> {
+            self.db.get_cf(&cf, k).ok().flatten().and_then(|v| {
+                if v.len() == 4 {
+                    Some(u32::from_be_bytes([v[0], v[1], v[2], v[3]]))
+                } else {
+                    None
+                }
+            })
+        };
+        let read_u64_be = |k: &[u8]| -> Option<u64> {
+            self.db.get_cf(&cf, k).ok().flatten().and_then(|v| {
+                if v.len() == 8 {
+                    Some(u64::from_be_bytes([
+                        v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7],
+                    ]))
+                } else {
+                    None
+                }
+            })
+        };
+        let snapshot_tip_hash: [u8; 32] = self
+            .db
+            .get_cf(&cf, fcur::META_KEY_SNAPSHOT_HASH)
+            .ok()
+            .flatten()
+            .and_then(|v| {
+                if v.len() == 32 {
+                    let mut h = [0u8; 32];
+                    h.copy_from_slice(&v);
+                    Some(h)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or([0u8; 32]);
+        fcur::BackfillCursor {
+            state: read_u8(fcur::META_KEY_STATE)
+                .map(fcur::BackfillState::from_byte)
+                .unwrap_or(fcur::BackfillState::Idle),
+            cursor_height: read_u32_be(fcur::META_KEY_CURSOR_HEIGHT).unwrap_or(0),
+            snapshot_height: read_u32_be(fcur::META_KEY_SNAPSHOT_HEIGHT).unwrap_or(0),
+            started_at_unix: read_u64_be(fcur::META_KEY_STARTED_AT).unwrap_or(0),
+            snapshot_tip_hash,
+        }
+    }
+
+    #[cfg(feature = "block-filter-index")]
+    fn read_filter_backfill_last_error(&self) -> Option<String> {
+        use node_filter_index::cursor as fcur;
+        let cf = self.cf(CF_METADATA);
+        self.db
+            .get_cf(&cf, fcur::META_KEY_LAST_ERROR)
+            .ok()
+            .flatten()
+            .and_then(|v| String::from_utf8(v.to_vec()).ok())
+            .filter(|s| !s.is_empty())
+    }
+
+    #[cfg(feature = "block-filter-index")]
+    fn write_filter_backfill_last_error(&self, msg: &str) -> Result<(), StoreError> {
+        use node_filter_index::cursor as fcur;
+        let cf = self.cf(CF_METADATA);
+        let bytes = if msg.len() <= fcur::LAST_ERROR_MAX_BYTES {
+            msg.as_bytes().to_vec()
+        } else {
+            let mut idx = fcur::LAST_ERROR_MAX_BYTES;
+            while idx > 0 && !msg.is_char_boundary(idx) {
+                idx -= 1;
+            }
+            msg.as_bytes()[..idx].to_vec()
+        };
+        if bytes.is_empty() {
+            self.db
+                .delete_cf(&cf, fcur::META_KEY_LAST_ERROR)
+                .map_err(|e| StoreError::Database(e.to_string()))
+        } else {
+            self.db
+                .put_cf(&cf, fcur::META_KEY_LAST_ERROR, &bytes)
+                .map_err(|e| StoreError::Database(e.to_string()))
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::blockindex::{work_for_bits, BlockIndexEntry, BlockStatus};
+    use crate::storage::blockindex::{BlockIndexEntry, BlockStatus, work_for_bits};
     use crate::storage::coinview::Coin;
     use crate::storage::undo::{OutPointSer, UndoData};
     use crate::storage::{Store, StoreBatch};
@@ -1763,8 +1898,7 @@ mod tests {
         let (store, _dir) = temp_store(true);
         assert!(store.has_txindex());
 
-        let txid =
-            Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0xBB; 32]));
+        let txid = Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0xBB; 32]));
         let block_hash = make_block_hash(0xCC);
 
         let mut batch = StoreBatch::default();
@@ -1780,8 +1914,7 @@ mod tests {
         let (store, _dir) = temp_store(false);
         assert!(!store.has_txindex());
 
-        let txid =
-            Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0xDD; 32]));
+        let txid = Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0xDD; 32]));
         assert!(store.get_tx_location(&txid).is_none());
     }
 
@@ -1832,8 +1965,7 @@ mod tests {
         let tip_hash = make_block_hash(0xFF);
         let op = make_outpoint(0x10, 0);
         let coin = make_coin(999, 0);
-        let txid =
-            Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0xEE; 32]));
+        let txid = Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0xEE; 32]));
 
         let mut batch = StoreBatch::default();
         batch
@@ -1848,10 +1980,7 @@ mod tests {
         assert!(store.get_block_index(&genesis_hash).is_some());
         assert!(store.has_coin(&op));
         assert_eq!(store.get_tip().unwrap(), tip_hash);
-        assert_eq!(
-            store.get_block_hash_by_height(0).unwrap(),
-            genesis_hash
-        );
+        assert_eq!(store.get_block_hash_by_height(0).unwrap(), genesis_hash);
         assert_eq!(store.get_tx_location(&txid).unwrap(), genesis_hash);
     }
 
@@ -1861,8 +1990,7 @@ mod tests {
         let (hash, entry) = regtest_genesis_entry();
         let op = make_outpoint(0x10, 0);
         let coin = make_coin(999, 0);
-        let txid =
-            Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0xEE; 32]));
+        let txid = Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0xEE; 32]));
 
         let mut batch = StoreBatch::default();
         batch.block_index_puts.push((hash, entry));
@@ -1968,14 +2096,15 @@ mod tests {
         let cf = store.cf(CF_ADDR_FUNDING);
         let encoded = encode_funding_key(&row.key());
         let raw = store.db.get_cf(&cf, encoded).unwrap().expect("row present");
-        assert_eq!(raw.as_slice(), encode_funding_value(row.amount_sat).as_slice());
+        assert_eq!(
+            raw.as_slice(),
+            encode_funding_value(row.amount_sat).as_slice()
+        );
     }
 
     #[test]
     fn test_address_index_write_batch_spending_put_then_remove() {
-        use crate::index::address::{
-            AddrSpendingRow, encode_spending_key, encode_spending_value,
-        };
+        use crate::index::address::{AddrSpendingRow, encode_spending_key, encode_spending_value};
 
         let (store, _dir) = temp_store(false);
         let prev = make_outpoint(0xEE, 3);
@@ -2074,7 +2203,10 @@ mod tests {
 
         match store.lookup_spend(&prev) {
             Err(StoreError::Database(msg)) => {
-                assert!(msg.contains("corrupt value"), "expected corrupt diag, got {msg}");
+                assert!(
+                    msg.contains("corrupt value"),
+                    "expected corrupt diag, got {msg}"
+                );
             }
             Err(other) => panic!("expected Database error, got {other:?}"),
             Ok(v) => panic!("expected Err on corrupt value, got Ok({v:?})"),
@@ -2110,7 +2242,10 @@ mod tests {
             // Wipe the marker (simulating a datadir from before this
             // schema bump).
             let cf = store.cf(CF_METADATA);
-            store.db.delete_cf(&cf, OUTPOINT_SPEND_COMPLETE_KEY).unwrap();
+            store
+                .db
+                .delete_cf(&cf, OUTPOINT_SPEND_COMPLETE_KEY)
+                .unwrap();
         }
         let store = RocksDbStore::open(dir.path(), false, 16, false).unwrap();
         assert!(!store.outpoint_spend_complete());
@@ -2169,10 +2304,7 @@ mod tests {
             store.db.put_cf(&cf_bi, [0u8; 32], [0u8; 4]).unwrap();
             // Erase the marker so the next open sees a legacy state.
             let cf = store.cf(CF_METADATA);
-            store
-                .db
-                .delete_cf(&cf, ADDRESS_INDEX_COMPLETE_KEY)
-                .unwrap();
+            store.db.delete_cf(&cf, ADDRESS_INDEX_COMPLETE_KEY).unwrap();
         }
         let store = RocksDbStore::open(dir.path(), false, 16, false).unwrap();
         assert!(
@@ -2346,8 +2478,20 @@ mod tests {
         // Both CFs must still be empty.
         let af = store.cf(CF_ADDR_FUNDING);
         let as_ = store.cf(CF_ADDR_SPENDING);
-        assert!(store.db.iterator_cf(&af, IteratorMode::Start).next().is_none());
-        assert!(store.db.iterator_cf(&as_, IteratorMode::Start).next().is_none());
+        assert!(
+            store
+                .db
+                .iterator_cf(&af, IteratorMode::Start)
+                .next()
+                .is_none()
+        );
+        assert!(
+            store
+                .db
+                .iterator_cf(&as_, IteratorMode::Start)
+                .next()
+                .is_none()
+        );
     }
 
     #[test]
@@ -2360,9 +2504,9 @@ mod tests {
 
         let (store, _dir) = temp_store(false);
         let sh = scripthash_of(&bitcoin::ScriptBuf::new());
-        let txid = bitcoin::Txid::from_raw_hash(
-            bitcoin::hashes::sha256d::Hash::from_byte_array([0xab; 32]),
-        );
+        let txid = bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+            [0xab; 32],
+        ));
 
         let mut batch = StoreBatch::default();
         batch.addr_funding_puts.push(AddrFundingRow {

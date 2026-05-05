@@ -8,10 +8,10 @@ pub mod undo;
 
 use bitcoin::{BlockHash, OutPoint, Txid};
 
+use crate::index::address::cursor::BackfillState;
 use crate::index::address::{
     AddrFundingKey, AddrFundingRow, AddrSpendingKey, AddrSpendingRow, Scripthash,
 };
-use crate::index::address::cursor::BackfillState;
 #[cfg(feature = "block-filter-index")]
 use crate::index::filter::{FilterHeaderRow, FilterKey, FilterRow};
 use crate::index::outpoint_spend::SpendingRef;
@@ -77,6 +77,11 @@ pub struct StoreBatch {
     /// connected block's filter rows.
     #[cfg(feature = "block-filter-index")]
     pub filter_removes: Vec<FilterKey>,
+    /// Persist a filter-index backfill cursor advance atomically with
+    /// the filter rows it describes. `None` for non-backfill writes.
+    /// Mirrors `backfill_cursor_advance` for the address-index family.
+    #[cfg(feature = "block-filter-index")]
+    pub filter_backfill_cursor_advance: Option<FilterBackfillCursorWrite>,
 }
 
 /// Atomic cursor update emitted by the backfill task at each batch boundary.
@@ -96,6 +101,24 @@ pub struct BackfillCursorWrite {
     /// permitted (e.g. for resume-time updates that don't change the
     /// anchor) and skips the metadata write when the on-disk value
     /// already matches.
+    pub snapshot_tip_hash: [u8; 32],
+}
+
+/// Atomic cursor update for the BIP 158 filter-index backfill task.
+/// Persisted in CF_METADATA under the `filterindex.backfill.*`
+/// namespace. Single-pass walk so there is no `pass` field. Bundling
+/// the advance into the same `StoreBatch` as the filter rows it
+/// describes guarantees we never observe a half-advanced cursor on
+/// resume.
+#[cfg(feature = "block-filter-index")]
+#[derive(Debug, Clone, Copy)]
+pub struct FilterBackfillCursorWrite {
+    pub state: node_filter_index::cursor::BackfillState,
+    pub cursor_height: u32,
+    pub snapshot_height: u32,
+    pub started_at_unix: u64,
+    /// Active-chain anchor recorded at `start()` time. Same all-zero
+    /// "don't care" sentinel semantics as the address-index variant.
     pub snapshot_tip_hash: [u8; 32],
 }
 
@@ -151,17 +174,22 @@ impl StoreBatch {
             self.addr_spending_removes.retain(|k| !drop.contains(k));
         }
         self.addr_spending_puts.extend(other.addr_spending_puts);
-        self.addr_spending_removes.extend(other.addr_spending_removes);
+        self.addr_spending_removes
+            .extend(other.addr_spending_removes);
 
         // outpoint_spend: same last-writer-wins by outpoint.
         if !other.outpoint_spend_removes.is_empty() {
             let drop: std::collections::HashSet<OutPoint> =
                 other.outpoint_spend_removes.iter().copied().collect();
-            self.outpoint_spend_puts.retain(|(op, _)| !drop.contains(op));
+            self.outpoint_spend_puts
+                .retain(|(op, _)| !drop.contains(op));
         }
         if !other.outpoint_spend_puts.is_empty() {
-            let drop: std::collections::HashSet<OutPoint> =
-                other.outpoint_spend_puts.iter().map(|(op, _)| *op).collect();
+            let drop: std::collections::HashSet<OutPoint> = other
+                .outpoint_spend_puts
+                .iter()
+                .map(|(op, _)| *op)
+                .collect();
             self.outpoint_spend_removes.retain(|op| !drop.contains(op));
         }
         self.outpoint_spend_puts.extend(other.outpoint_spend_puts);
@@ -205,6 +233,16 @@ impl StoreBatch {
             self.filter_puts.extend(other.filter_puts);
             self.filter_header_puts.extend(other.filter_header_puts);
             self.filter_removes.extend(other.filter_removes);
+
+            // Filter-index backfill cursor advance: incoming wins.
+            // Same shape as the address-index advance — the runner emits
+            // at most one advance per WriteBatch, so we only ever need
+            // last-writer-wins for the CoinCache pending-batch coalesce
+            // path (which the backfill never feeds into; it writes
+            // through `Store::write_batch` directly).
+            if other.filter_backfill_cursor_advance.is_some() {
+                self.filter_backfill_cursor_advance = other.filter_backfill_cursor_advance;
+            }
         }
     }
 }
@@ -307,10 +345,7 @@ pub trait Store: Send + Sync {
 
     /// All committed `addr_spending` rows for `sh`, ordered ascending by
     /// `(height, txid, vin)`. Default: empty.
-    fn iter_addr_spending(
-        &self,
-        _sh: &Scripthash,
-    ) -> Vec<(AddrSpendingKey, bitcoin::OutPoint)> {
+    fn iter_addr_spending(&self, _sh: &Scripthash) -> Vec<(AddrSpendingKey, bitcoin::OutPoint)> {
         Vec::new()
     }
 
@@ -411,10 +446,7 @@ pub trait Store: Send + Sync {
     /// Look up `(outpoint -> scripthash)` from the temp CF. Returns
     /// `Ok(None)` when the CF doesn't exist or the key isn't present;
     /// `Err` only on backend I/O failure. Default: `Ok(None)`.
-    fn lookup_backfill_temp(
-        &self,
-        _outpoint: &OutPoint,
-    ) -> Result<Option<Scripthash>, StoreError> {
+    fn lookup_backfill_temp(&self, _outpoint: &OutPoint) -> Result<Option<Scripthash>, StoreError> {
         Ok(None)
     }
 
@@ -471,6 +503,30 @@ pub trait Store: Send + Sync {
     fn write_backfill_last_error(&self, _msg: &str) -> Result<(), StoreError> {
         Err(StoreError::Database(
             "write_backfill_last_error not supported on this backend".into(),
+        ))
+    }
+
+    /// Read the persisted filter-index backfill cursor from metadata.
+    /// Default: idle. Mirrors `read_backfill_cursor` for the address
+    /// family but reads the `filterindex.backfill.*` keyspace.
+    #[cfg(feature = "block-filter-index")]
+    fn read_filter_backfill_cursor(&self) -> node_filter_index::cursor::BackfillCursor {
+        node_filter_index::cursor::BackfillCursor::idle()
+    }
+
+    /// Read the persisted last-error message that goes with
+    /// `filter_index` `BackfillState::Failed`. Default: `None`.
+    #[cfg(feature = "block-filter-index")]
+    fn read_filter_backfill_last_error(&self) -> Option<String> {
+        None
+    }
+
+    /// Write or clear the persisted filter-backfill last-error
+    /// message. Pass an empty string to clear.
+    #[cfg(feature = "block-filter-index")]
+    fn write_filter_backfill_last_error(&self, _msg: &str) -> Result<(), StoreError> {
+        Err(StoreError::Database(
+            "write_filter_backfill_last_error not supported on this backend".into(),
         ))
     }
 }

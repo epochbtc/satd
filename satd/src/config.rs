@@ -286,6 +286,13 @@ pub struct Config {
     /// disable via `--addressindex=0` or `-noindex=address`. Backs the
     /// future native Electrum and Esplora subsystems.
     pub addressindex: bool,
+    /// BIP 158 compact-block-filter index. Off by default; enable via
+    /// `--blockfilterindex=basic` (or `--blockfilterindex=1`). PR-3 of
+    /// the BIP 157/158 stack adds the runtime knob and its backfill
+    /// supervisor; PR-5 layers the bitcoin.conf alias, the
+    /// `peerblockfilters` companion flag, and `effective_view`
+    /// reconciliation on top.
+    pub blockfilterindex: bool,
     /// Maximum concurrent per-scripthash status subscriptions. Caps
     /// memory growth from the per-scripthash broadcast registry.
     /// Default 10000 — generous for typical xpub-derivation patterns.
@@ -693,6 +700,16 @@ impl Config {
             .or_else(|| file_get("addrindexsubscriptions").and_then(|v| v.parse().ok()))
             .unwrap_or(10_000);
 
+        // BIP 158 compact-block-filter index: off by default. PR-3
+        // reads only the `--blockfilterindex` CLI flag; PR-5 layers
+        // on `bitcoin.conf` aliases (`-noindex=blockfilter`,
+        // `-blockfilterindex=basic`) and the `peerblockfilters`
+        // companion flag.
+        let blockfilterindex = cli
+            .blockfilterindex
+            .or_else(|| file_get("blockfilterindex").and_then(|v| parse_blockfilterindex_value(&v)))
+            .unwrap_or(false);
+
         // Esplora REST server: on by default. Disabling requires
         // turning off --addressindex too (Esplora reads through it),
         // but we don't enforce that here — the daemon refuses to
@@ -926,6 +943,7 @@ impl Config {
             permitbaremultisig,
             txindex,
             addressindex,
+            blockfilterindex,
             addrindexsubscriptions,
             esplora,
             esplora_bind,
@@ -1371,6 +1389,13 @@ pub struct CliArgs {
 
     #[arg(long, value_name = "BOOL", value_parser = parse_bool_arg, help = "Maintain an address-history index (default: true). Accepts 0/1/true/false.")]
     pub addressindex: Option<bool>,
+
+    /// BIP 158 compact-block-filter index. Accepts `0`, `1`, or the
+    /// Bitcoin-Core-compatible literal `basic` (alias for `1`). PR-5
+    /// adds the `bitcoin.conf` alias and `peerblockfilters` companion
+    /// flag; PR-3 ships the runtime knob alone.
+    #[arg(long, value_name = "MODE", value_parser = parse_blockfilterindex_arg, help = "Maintain a BIP 158 compact-block-filter index. Accepts 0/1/basic.")]
+    pub blockfilterindex: Option<bool>,
 
     #[arg(
         long,
@@ -2091,6 +2116,23 @@ fn parse_bool_arg(s: &str) -> Result<bool, String> {
     parse_bool(s).ok_or_else(|| format!("expected one of 0/1/true/false/yes/no, got '{s}'"))
 }
 
+/// Parse the `--blockfilterindex` value. Accepts `0`, `1`, the
+/// Bitcoin-Core-compatible literal `basic` (alias for `1`), and the
+/// usual bool spellings. Returns `Ok(true)` for the on-states and
+/// `Ok(false)` for the off-states. Future filter types will accept
+/// additional literals here without breaking back-compat.
+fn parse_blockfilterindex_value(s: &str) -> Option<bool> {
+    match s.to_ascii_lowercase().as_str() {
+        "basic" => Some(true),
+        other => parse_bool(other),
+    }
+}
+
+fn parse_blockfilterindex_arg(s: &str) -> Result<bool, String> {
+    parse_blockfilterindex_value(s)
+        .ok_or_else(|| format!("expected one of 0/1/basic/true/false, got '{s}'"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2191,6 +2233,7 @@ rpcport=8332
             permitbaremultisig: None,
             txindex: false,
             addressindex: None,
+            blockfilterindex: None,
             addrindexsubscriptions: None,
             esplora: None,
             esplorabind: None,
@@ -2303,6 +2346,7 @@ rpcport=8332
             permitbaremultisig: None,
             txindex: false,
             addressindex: None,
+            blockfilterindex: None,
             addrindexsubscriptions: None,
             esplora: None,
             esplorabind: None,
