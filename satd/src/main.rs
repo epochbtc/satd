@@ -321,11 +321,13 @@ async fn main() {
         // BIP 158 filter index: gated on `--blockfilterindex=basic`.
         // When `enabled = false`, the per-block emit helper is a
         // no-op and the open-time consistency check stamps the
-        // completeness marker false on the next connect. PR-5 layers
-        // the `peerblockfilters` companion knob on top.
+        // completeness marker false on the next connect. The
+        // `peer_serve` knob (`--peerblockfilters=1`) gates the BIP
+        // 157 P2P service handlers; PR-5 layers `bitcoin.conf`
+        // aliases + reconciliation on top.
         node::index::filter::FilterIndexConfig {
             enabled: config.blockfilterindex,
-            peer_serve: false,
+            peer_serve: config.peerblockfilters,
         },
     ) {
         Ok(cs) => Arc::new(cs),
@@ -551,15 +553,20 @@ async fn main() {
     // BIP 158 filter index. Built unconditionally (the runtime knob
     // gates per-block emission); the `Arc<dyn FilterIndex>` is shared
     // by the BIP 157 P2P arms in `PeerManager` and the
-    // `getblockfilter` RPC (PR-5). Until PR-5 wires the
-    // `--blockfilterindex` / `--peerblockfilters` CLI flags, both
-    // default to off and the index is silent on the wire.
+    // `getblockfilter` RPC (PR-5). Reads `config.blockfilterindex` so
+    // `is_complete()` correctly returns true once the on-disk marker
+    // is stamped — without this, the predicate gating the version
+    // handshake's `NODE_COMPACT_FILTERS` advertisement would never
+    // fire even with the operator opting in via `--peerblockfilters=1`.
     let filter_index_store: std::sync::Arc<dyn node::storage::Store> =
         chain_state.store_ref().clone();
     let filter_index: std::sync::Arc<dyn node_filter_index::FilterIndex> = std::sync::Arc::new(
         node::index::filter::RocksFilterIndex::new(
             filter_index_store,
-            node_filter_index::FilterIndexConfig::default(),
+            node_filter_index::FilterIndexConfig {
+                enabled: config.blockfilterindex,
+                peer_serve: config.peerblockfilters,
+            },
         ),
     );
 
@@ -642,9 +649,8 @@ async fn main() {
     // Wire the BIP 158 filter index into the peer manager so the BIP
     // 157 service arms can read filter rows and the version handshake
     // can advertise `NODE_COMPACT_FILTERS` when both runtime knobs say
-    // yes. PR-5 wires `peer_serve` to `config.peerblockfilters`; for
-    // now we hard-code `false` to match the PR-2 default-off posture.
-    peer_manager.set_filter_index(filter_index.clone(), false);
+    // yes (`--blockfilterindex=basic` AND `--peerblockfilters=1`).
+    peer_manager.set_filter_index(filter_index.clone(), config.peerblockfilters);
 
     if config.prune > 0 {
         tracing::info!(target_mb = config.prune, "Block pruning enabled");

@@ -289,10 +289,17 @@ pub struct Config {
     /// BIP 158 compact-block-filter index. Off by default; enable via
     /// `--blockfilterindex=basic` (or `--blockfilterindex=1`). PR-3 of
     /// the BIP 157/158 stack adds the runtime knob and its backfill
-    /// supervisor; PR-5 layers the bitcoin.conf alias, the
-    /// `peerblockfilters` companion flag, and `effective_view`
-    /// reconciliation on top.
+    /// supervisor; PR-5 layers the bitcoin.conf alias and
+    /// `effective_view` reconciliation on top.
     pub blockfilterindex: bool,
+    /// Advertise `NODE_COMPACT_FILTERS` and serve BIP 157 messages
+    /// (`getcfilters` / `getcfheaders` / `getcfcheckpt`). Off by
+    /// default — operators who want to expose filter data over P2P
+    /// must opt in. PR-4 of the BIP 157/158 stack ships the runtime
+    /// knob; PR-5 layers the bitcoin.conf alias and reconciliation
+    /// (forces `blockfilterindex=basic` when this is on; refuses on
+    /// explicit conflict).
+    pub peerblockfilters: bool,
     /// Maximum concurrent per-scripthash status subscriptions. Caps
     /// memory growth from the per-scripthash broadcast registry.
     /// Default 10000 — generous for typical xpub-derivation patterns.
@@ -703,12 +710,27 @@ impl Config {
         // BIP 158 compact-block-filter index: off by default. PR-3
         // reads only the `--blockfilterindex` CLI flag; PR-5 layers
         // on `bitcoin.conf` aliases (`-noindex=blockfilter`,
-        // `-blockfilterindex=basic`) and the `peerblockfilters`
-        // companion flag.
+        // `-blockfilterindex=basic`) and reconciliation.
         let blockfilterindex = cli
             .blockfilterindex
             .or_else(|| file_get("blockfilterindex").and_then(|v| parse_blockfilterindex_value(&v)))
             .unwrap_or(false);
+
+        // Serve BIP 157 messages over P2P. Off by default — operators
+        // who want the daemon to advertise NODE_COMPACT_FILTERS and
+        // answer `getcfilters` / `getcfheaders` / `getcfcheckpt` must
+        // opt in. Refuses if `blockfilterindex` is off.
+        let peerblockfilters = cli
+            .peerblockfilters
+            .or_else(|| file_get("peerblockfilters").and_then(|v| parse_bool(&v)))
+            .unwrap_or(false);
+        if peerblockfilters && !blockfilterindex {
+            return Err(
+                "peerblockfilters=1 requires blockfilterindex=basic. \
+                 Either pass --blockfilterindex=basic or drop --peerblockfilters."
+                    .to_string(),
+            );
+        }
 
         // Esplora REST server: on by default. Disabling requires
         // turning off --addressindex too (Esplora reads through it),
@@ -944,6 +966,7 @@ impl Config {
             txindex,
             addressindex,
             blockfilterindex,
+            peerblockfilters,
             addrindexsubscriptions,
             esplora,
             esplora_bind,
@@ -1392,10 +1415,16 @@ pub struct CliArgs {
 
     /// BIP 158 compact-block-filter index. Accepts `0`, `1`, or the
     /// Bitcoin-Core-compatible literal `basic` (alias for `1`). PR-5
-    /// adds the `bitcoin.conf` alias and `peerblockfilters` companion
-    /// flag; PR-3 ships the runtime knob alone.
+    /// adds the `bitcoin.conf` alias; PR-3 / PR-4 ship the runtime
+    /// knob and the P2P-serve companion knob.
     #[arg(long, value_name = "MODE", value_parser = parse_blockfilterindex_arg, help = "Maintain a BIP 158 compact-block-filter index. Accepts 0/1/basic.")]
     pub blockfilterindex: Option<bool>,
+
+    /// Advertise `NODE_COMPACT_FILTERS` and serve BIP 157 messages.
+    /// Off by default. Requires `--blockfilterindex` to be on; the
+    /// PR-4 wiring silent-drops requests when the index is incomplete.
+    #[arg(long, value_name = "BOOL", value_parser = parse_bool_arg, help = "Serve BIP 157 compact-filter messages over P2P. Default: false.")]
+    pub peerblockfilters: Option<bool>,
 
     #[arg(
         long,
@@ -2234,6 +2263,7 @@ rpcport=8332
             txindex: false,
             addressindex: None,
             blockfilterindex: None,
+            peerblockfilters: None,
             addrindexsubscriptions: None,
             esplora: None,
             esplorabind: None,
@@ -2347,6 +2377,7 @@ rpcport=8332
             txindex: false,
             addressindex: None,
             blockfilterindex: None,
+            peerblockfilters: None,
             addrindexsubscriptions: None,
             esplora: None,
             esplorabind: None,

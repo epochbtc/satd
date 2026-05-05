@@ -880,18 +880,45 @@ impl Store for CoinCache {
 
     #[cfg(feature = "block-filter-index")]
     fn get_filter(&self, filter_type: u8, height: u32) -> Option<Vec<u8>> {
-        // Filter blob is written atomically with the chain batch in
-        // the inner store; no pending-batch override needed because
-        // both `getblockfilter` and the BIP 157 P2P arms read by
-        // height, and our pending batch can hold rows whose height is
-        // above the stable read horizon. If a future caller wants
-        // up-to-the-second freshness, the same pending-batch peek
-        // pattern as `lookup_spend` applies — defer until then.
+        // Pending-batch peek first: the filter row may have been
+        // pushed by `connect_block` but not yet flushed to the inner
+        // store. The BIP 157 P2P arms and `getblockfilter` need
+        // up-to-the-second freshness so the latest mined block
+        // becomes queryable as soon as it's connected — without this
+        // peek, they would silently 404 until the CoinCache hit a
+        // flush threshold. Last-writer-wins by `(filter_type, height)`
+        // mirrors `StoreBatch::merge`'s semantics.
+        use node_filter_index::FilterKey;
+        let key = FilterKey {
+            filter_type,
+            height,
+        };
+        let pending = self.pending_batch.lock().unwrap();
+        if pending.filter_removes.contains(&key) {
+            return None;
+        }
+        if let Some(row) = pending.filter_puts.iter().rev().find(|r| r.key == key) {
+            return Some(row.filter.clone());
+        }
+        drop(pending);
         self.inner.get_filter(filter_type, height)
     }
 
     #[cfg(feature = "block-filter-index")]
     fn get_filter_header(&self, filter_type: u8, height: u32) -> Option<[u8; 32]> {
+        use node_filter_index::FilterKey;
+        let key = FilterKey {
+            filter_type,
+            height,
+        };
+        let pending = self.pending_batch.lock().unwrap();
+        if pending.filter_removes.contains(&key) {
+            return None;
+        }
+        if let Some(row) = pending.filter_header_puts.iter().rev().find(|r| r.key == key) {
+            return Some(row.header);
+        }
+        drop(pending);
         self.inner.get_filter_header(filter_type, height)
     }
 
