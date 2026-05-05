@@ -25,6 +25,16 @@ const CF_ADDR_SPENDING: &str = "addr_spending";
 /// alongside the address-index spending rows; the two CFs answer
 /// different shapes of the same question.
 const CF_OUTPOINT_SPEND: &str = "outpoint_spend";
+/// BIP 158 compact-block-filter blobs, keyed by
+/// `(filter_type:u8 || height_be:u32)`. Value: raw GCS-encoded filter.
+/// Sibling to `cf_filter_header`.
+#[cfg(feature = "block-filter-index")]
+const CF_FILTER: &str = "block_filter";
+/// BIP 157 chained filter headers (32 bytes each). Same key shape as
+/// `cf_filter`. Persisted alongside the filter blob so we never
+/// recompute the header chain at read time.
+#[cfg(feature = "block-filter-index")]
+const CF_FILTER_HEADER: &str = "block_filter_header";
 /// Temp CF created lazily when a deferred backfill starts. Holds
 /// `(outpoint -> scripthash)` rows used by pass 2 to resolve input
 /// scripthashes without reading flat-file undo data. Dropped wholesale
@@ -68,6 +78,22 @@ const TX_INDEX_COMPLETE_KEY: &[u8] = b"tx_index.complete";
 /// from genesis); cleared atomically when a block connects while
 /// addressindex is disabled. Round-1 review H2.
 const ADDRESS_INDEX_COMPLETE_KEY: &[u8] = b"address_index.complete";
+/// Persisted "BIP 158 filter index is complete for the active chain"
+/// marker. Symmetric to `ADDRESS_INDEX_COMPLETE_KEY`: set true on
+/// fresh datadirs that started with `--blockfilterindex=basic` from
+/// genesis, or after a successful filter backfill (PR-3); cleared
+/// atomically when a block connects while `blockfilterindex=0`. Both
+/// the `getblockfilter` RPC and the BIP 157 P2P arms refuse to serve
+/// when this flag is false.
+#[cfg(feature = "block-filter-index")]
+const BLOCK_FILTER_INDEX_COMPLETE_KEY: &[u8] = b"block_filter_index.complete";
+/// Persisted "highest filter-row height we've stamped" marker. Read at
+/// startup to validate the completeness marker against actual coverage.
+/// Updated by `connect_block` only; reorg-disconnect doesn't roll it
+/// back (the active chain's tip is the read-time oracle, the
+/// persisted value is just an upper bound).
+#[cfg(feature = "block-filter-index")]
+const BLOCK_FILTER_INDEX_TIP_HEIGHT_KEY: &[u8] = b"block_filter_index.tip_height";
 const CURRENT_SCHEMA_VERSION: u32 = 2; // v2 = compact varint coins
 
 fn hash_bytes(hash: &BlockHash) -> &[u8] {
@@ -111,6 +137,14 @@ pub struct RocksDbStore {
     /// future Electrum / Esplora address-surface bind refuses until
     /// the operator runs a backfill / reindex (Round-1 review H2).
     addressindex_enabled: bool,
+    /// Whether per-block BIP 158 filter-index emission is active.
+    /// Same invalidation contract as `addressindex_enabled`: when
+    /// `false` and a block connects, the persisted
+    /// `block_filter_index.complete` marker is cleared atomically so
+    /// the BIP 157 P2P service refuses until the operator runs a
+    /// filter backfill / reindex.
+    #[cfg(feature = "block-filter-index")]
+    blockfilterindex_enabled: bool,
     /// Shared LRU across all column families. Cloneable Arc; the FFI layer
     /// is thread-safe for `set_capacity`, so a clone plus an interior mutex
     /// is enough to allow live resize from a separate task.
@@ -211,6 +245,25 @@ impl RocksDbStore {
             ColumnFamilyDescriptor::new(CF_OUTPOINT_SPEND, make_cf_opts(true, 16, Some(32))),
         ];
 
+        // BIP 158 filter index. Bloom on (point lookups dominate
+        // `getcfilters`/`getblockfilter`); 16 MB write-buf because
+        // every connected block produces one ~30 KB filter blob plus
+        // a 32-byte header row. No prefix extractor: keys are 5 bytes
+        // `(filter_type[1] || height_be[4])`, so a fixed-prefix
+        // optimization would only help iterators that span filter
+        // types — we have one filter type for v1.
+        #[cfg(feature = "block-filter-index")]
+        {
+            cf_descriptors.push(ColumnFamilyDescriptor::new(
+                CF_FILTER,
+                make_cf_opts(true, 16, None),
+            ));
+            cf_descriptors.push(ColumnFamilyDescriptor::new(
+                CF_FILTER_HEADER,
+                make_cf_opts(true, 8, None),
+            ));
+        }
+
         // The deferred-backfill temp CF is created lazily when an
         // operator triggers `backfillindex address`. RocksDB demands
         // every existing CF be declared at open time, so probe the DB
@@ -286,6 +339,13 @@ impl RocksDbStore {
             // in CoinCache. Tests / lower-level callers that don't
             // exercise the address-index path keep the default.
             addressindex_enabled: true,
+            // Default false (the runtime opt-in is `--blockfilterindex=basic`);
+            // main.rs flips it via `with_blockfilterindex_enabled`. Default
+            // false matches the addr-side cleared-marker invariant: when
+            // the index is *off*, every connected block clears the
+            // completeness marker atomically.
+            #[cfg(feature = "block-filter-index")]
+            blockfilterindex_enabled: false,
             block_cache: std::sync::Mutex::new(block_cache),
             block_cache_capacity: std::sync::atomic::AtomicUsize::new(cache_bytes),
         };
@@ -404,6 +464,35 @@ impl RocksDbStore {
                 .unwrap_or(false);
             store.write_address_index_complete(!block_index_has_rows)?;
         }
+
+        // block_filter_index.complete marker — same shape as the
+        // address-index marker above. Three reachable open-time states:
+        //
+        //   - Fresh datadir (no `block_index` rows yet) → stamp true.
+        //     No history to be missing.
+        //   - Legacy datadir without the marker (block_index has rows
+        //     but the flag was never written) → stamp false. The BIP
+        //     157 P2P service refuses to advertise/serve until backfill
+        //     completes (PR-3) or the operator runs `--reindex-chainstate`.
+        //   - Marker already present → don't touch it. Backfill
+        //     `mark_block_filter_index_complete` re-stamps true; per-block
+        //     `write_batch_mode` clears it when blockfilterindex is
+        //     disabled at runtime (set after `with_blockfilterindex_enabled`).
+        #[cfg(feature = "block-filter-index")]
+        if store.read_block_filter_index_complete().is_none() {
+            let block_index_has_rows = store
+                .db
+                .cf_handle(CF_BLOCK_INDEX)
+                .and_then(|cf| {
+                    store
+                        .db
+                        .iterator_cf(&cf, IteratorMode::Start)
+                        .next()
+                        .map(|item| item.is_ok())
+                })
+                .unwrap_or(false);
+            store.write_block_filter_index_complete(!block_index_has_rows)?;
+        }
         Ok(store)
     }
 
@@ -419,6 +508,26 @@ impl RocksDbStore {
                 "address index emission disabled; future block connects will clear \
                  the address_index.complete marker — Electrum / Esplora address \
                  surfaces will refuse to bind until a backfill completes."
+            );
+        }
+        self
+    }
+
+    /// Set whether per-block BIP 158 filter-index emission is active.
+    /// Call before any `write_batch_mode` runs so the persisted
+    /// `block_filter_index.complete` marker stays consistent with the
+    /// configured behaviour. Default is `false` (matches the
+    /// `--blockfilterindex=0` Bitcoin-Core default).
+    #[cfg(feature = "block-filter-index")]
+    pub fn with_blockfilterindex_enabled(mut self, enabled: bool) -> Self {
+        self.blockfilterindex_enabled = enabled;
+        if !enabled {
+            tracing::info!(
+                target: "storage",
+                "block filter index emission disabled; future block connects will clear \
+                 the block_filter_index.complete marker — the BIP 157 P2P service and \
+                 getblockfilter RPC will refuse to serve until a backfill / reindex \
+                 completes."
             );
         }
         self
@@ -481,6 +590,26 @@ impl RocksDbStore {
             .map_err(|e| StoreError::Database(e.to_string()))
     }
 
+    #[cfg(feature = "block-filter-index")]
+    fn read_block_filter_index_complete(&self) -> Option<bool> {
+        let cf = self.db.cf_handle(CF_METADATA)?;
+        match self.db.get_cf(&cf, BLOCK_FILTER_INDEX_COMPLETE_KEY) {
+            Ok(Some(v)) => v.first().map(|b| *b != 0),
+            _ => None,
+        }
+    }
+
+    #[cfg(feature = "block-filter-index")]
+    fn write_block_filter_index_complete(&self, value: bool) -> Result<(), StoreError> {
+        let cf = self
+            .db
+            .cf_handle(CF_METADATA)
+            .ok_or_else(|| StoreError::Database("metadata CF missing".into()))?;
+        self.db
+            .put_cf(&cf, BLOCK_FILTER_INDEX_COMPLETE_KEY, [u8::from(value)])
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
     fn cf(&self, name: &str) -> Arc<BoundColumnFamily<'_>> {
         self.db
             .cf_handle(name)
@@ -490,7 +619,18 @@ impl RocksDbStore {
     /// Build column family options for (re)creation.
     fn cf_options(&self, name: &str) -> Options {
         // Bloom-filtered CFs are those that see point-lookups in
-        // hot paths (UTXO + address-index reads).
+        // hot paths (UTXO + address-index reads + filter-index reads).
+        #[cfg(feature = "block-filter-index")]
+        let bloom = matches!(
+            name,
+            CF_COINS
+                | CF_ADDR_FUNDING
+                | CF_ADDR_SPENDING
+                | CF_OUTPOINT_SPEND
+                | CF_FILTER
+                | CF_FILTER_HEADER
+        );
+        #[cfg(not(feature = "block-filter-index"))]
         let bloom = matches!(
             name,
             CF_COINS | CF_ADDR_FUNDING | CF_ADDR_SPENDING | CF_OUTPOINT_SPEND
@@ -501,6 +641,10 @@ impl RocksDbStore {
             CF_OUTPOINT_SPEND => 16,
             CF_UNDO | CF_TX_INDEX => 16,
             CF_BLOCK_INDEX | CF_HEIGHT_INDEX => 8,
+            #[cfg(feature = "block-filter-index")]
+            CF_FILTER => 16,
+            #[cfg(feature = "block-filter-index")]
+            CF_FILTER_HEADER => 8,
             _ => 2,
         };
 
@@ -665,6 +809,17 @@ impl Store for RocksDbStore {
             wb.put_cf(&cf_meta, ADDRESS_INDEX_COMPLETE_KEY, [0u8]);
         }
 
+        // Same invalidation contract for the BIP 158 filter-index marker.
+        // When `blockfilterindex` is disabled at runtime and a block
+        // connects/disconnects, the filter CFs diverge from the chain;
+        // clear the marker atomically.
+        #[cfg(feature = "block-filter-index")]
+        if !self.blockfilterindex_enabled
+            && (!batch.coin_puts.is_empty() || !batch.coin_removes.is_empty())
+        {
+            wb.put_cf(&cf_meta, BLOCK_FILTER_INDEX_COMPLETE_KEY, [0u8]);
+        }
+
         // Block index
         for (hash, entry) in &batch.block_index_puts {
             let value =
@@ -766,6 +921,52 @@ impl Store for RocksDbStore {
             for op in &batch.outpoint_spend_removes {
                 let key = node_index::encode_outpoint_key(op);
                 wb.delete_cf(&cf_os, key);
+            }
+        }
+
+        // BIP 158 filter index. Filter blob and chained filter header
+        // ride the same atomic batch as the chainstate update, so a
+        // crash mid-write rolls everything back together — protocol
+        // handlers can never observe a filter row whose chain segment
+        // is partially committed. Empty-batch fast-path skips both CFs.
+        #[cfg(feature = "block-filter-index")]
+        {
+            if !batch.filter_puts.is_empty()
+                || !batch.filter_header_puts.is_empty()
+                || !batch.filter_removes.is_empty()
+            {
+                use node_filter_index::encode_filter_key;
+                let cf_f = self.cf(CF_FILTER);
+                let cf_fh = self.cf(CF_FILTER_HEADER);
+                let mut max_height: Option<u32> = None;
+                for row in &batch.filter_puts {
+                    let key = encode_filter_key(&row.key);
+                    wb.put_cf(&cf_f, key, &row.filter);
+                    max_height = Some(max_height.map_or(row.key.height, |h| h.max(row.key.height)));
+                }
+                for row in &batch.filter_header_puts {
+                    let key = encode_filter_key(&row.key);
+                    wb.put_cf(&cf_fh, key, row.header);
+                    max_height = Some(max_height.map_or(row.key.height, |h| h.max(row.key.height)));
+                }
+                for k in &batch.filter_removes {
+                    let key = encode_filter_key(k);
+                    wb.delete_cf(&cf_f, key);
+                    wb.delete_cf(&cf_fh, key);
+                }
+                // Persisted high-water tip-height. Connect-only update;
+                // disconnect-time decrement is handled implicitly by
+                // letting the read path use the active-chain tip
+                // (chain_state.tip_height()) as the authoritative
+                // bound, with this value as the "ever-stamped" upper
+                // bound for diagnostics.
+                if let Some(h) = max_height {
+                    wb.put_cf(
+                        &cf_meta,
+                        BLOCK_FILTER_INDEX_TIP_HEIGHT_KEY,
+                        h.to_be_bytes(),
+                    );
+                }
             }
         }
 
@@ -964,6 +1165,14 @@ impl Store for RocksDbStore {
         cfs.push(CF_ADDR_FUNDING);
         cfs.push(CF_ADDR_SPENDING);
         cfs.push(CF_OUTPOINT_SPEND);
+        // Same reasoning for the BIP 158 filter index: -reindex-chainstate
+        // is going to rebuild filters from genesis via the normal
+        // connect_block emit path.
+        #[cfg(feature = "block-filter-index")]
+        {
+            cfs.push(CF_FILTER);
+            cfs.push(CF_FILTER_HEADER);
+        }
         for cf_name in cfs {
             self.drop_and_recreate_cf(cf_name)?;
         }
@@ -983,11 +1192,14 @@ impl Store for RocksDbStore {
         // Electrum / Esplora address surfaces refusing to bind.
         self.write_outpoint_spend_complete(true)?;
         self.write_tx_index_complete(true)?;
-        self.write_address_index_complete(true)
+        self.write_address_index_complete(true)?;
+        #[cfg(feature = "block-filter-index")]
+        self.write_block_filter_index_complete(true)?;
+        Ok(())
     }
 
     fn clear_all(&self) -> Result<(), StoreError> {
-        let all_cfs = [
+        let mut all_cfs: Vec<&str> = vec![
             CF_BLOCK_INDEX,
             CF_COINS,
             CF_HEIGHT_INDEX,
@@ -998,6 +1210,11 @@ impl Store for RocksDbStore {
             CF_ADDR_SPENDING,
             CF_OUTPOINT_SPEND,
         ];
+        #[cfg(feature = "block-filter-index")]
+        {
+            all_cfs.push(CF_FILTER);
+            all_cfs.push(CF_FILTER_HEADER);
+        }
         for cf_name in all_cfs {
             self.drop_and_recreate_cf(cf_name)?;
         }
@@ -1010,7 +1227,10 @@ impl Store for RocksDbStore {
         // see comment there for the round-2-review H2 rationale.
         self.write_outpoint_spend_complete(true)?;
         self.write_tx_index_complete(true)?;
-        self.write_address_index_complete(true)
+        self.write_address_index_complete(true)?;
+        #[cfg(feature = "block-filter-index")]
+        self.write_block_filter_index_complete(true)?;
+        Ok(())
     }
 
     fn get_coins_batch(&self, outpoints: &[OutPoint]) -> Vec<Option<Coin>> {
@@ -1152,6 +1372,51 @@ impl Store for RocksDbStore {
 
     fn mark_address_index_complete(&self) -> Result<(), StoreError> {
         self.write_address_index_complete(true)
+    }
+
+    #[cfg(feature = "block-filter-index")]
+    fn get_filter(&self, filter_type: u8, height: u32) -> Option<Vec<u8>> {
+        let cf = self.cf(CF_FILTER);
+        let key = node_filter_index::encode_filter_key(&node_filter_index::FilterKey {
+            filter_type,
+            height,
+        });
+        self.db.get_cf(&cf, key).ok().flatten()
+    }
+
+    #[cfg(feature = "block-filter-index")]
+    fn get_filter_header(&self, filter_type: u8, height: u32) -> Option<[u8; 32]> {
+        let cf = self.cf(CF_FILTER_HEADER);
+        let key = node_filter_index::encode_filter_key(&node_filter_index::FilterKey {
+            filter_type,
+            height,
+        });
+        let v = self.db.get_cf(&cf, key).ok().flatten()?;
+        if v.len() != 32 {
+            tracing::error!(
+                target: "storage",
+                "filter header at height {} has unexpected length {} (want 32)",
+                height,
+                v.len()
+            );
+            return None;
+        }
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&v);
+        Some(out)
+    }
+
+    #[cfg(feature = "block-filter-index")]
+    fn block_filter_index_complete(&self) -> bool {
+        // Default false when the marker is missing — under-claim
+        // rather than over-claim. Same convention as
+        // `address_index_complete`.
+        self.read_block_filter_index_complete().unwrap_or(false)
+    }
+
+    #[cfg(feature = "block-filter-index")]
+    fn mark_block_filter_index_complete(&self) -> Result<(), StoreError> {
+        self.write_block_filter_index_complete(true)
     }
 
     fn lookup_spend(

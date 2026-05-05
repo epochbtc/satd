@@ -476,7 +476,7 @@ mod tests {
             450,
         4,
         Default::default(),
-        )
+        Default::default(),)
         .unwrap();
 
         // Build a chain of headers using test blocks

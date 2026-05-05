@@ -3,6 +3,8 @@ use bitcoin::{BlockHash, OutPoint, Txid};
 use crate::index::address::{
     AddrFundingKey, AddrFundingRow, AddrSpendingKey, AddrSpendingRow, Scripthash,
 };
+#[cfg(feature = "block-filter-index")]
+use crate::index::filter::FilterKey;
 use crate::storage::blockindex::BlockIndexEntry;
 use crate::storage::coinview::Coin;
 use crate::storage::undo::UndoData;
@@ -22,6 +24,12 @@ pub struct InMemoryStore {
     addr_spending: std::sync::RwLock<Vec<AddrSpendingRow>>,
     outpoint_spend:
         std::sync::RwLock<std::collections::HashMap<OutPoint, SpendingRef>>,
+    #[cfg(feature = "block-filter-index")]
+    filter: std::sync::RwLock<std::collections::HashMap<FilterKey, Vec<u8>>>,
+    #[cfg(feature = "block-filter-index")]
+    filter_header: std::sync::RwLock<std::collections::HashMap<FilterKey, [u8; 32]>>,
+    #[cfg(feature = "block-filter-index")]
+    filter_complete: std::sync::RwLock<bool>,
 }
 
 impl Default for InMemoryStore {
@@ -42,6 +50,15 @@ impl InMemoryStore {
             addr_funding: std::sync::RwLock::new(Vec::new()),
             addr_spending: std::sync::RwLock::new(Vec::new()),
             outpoint_spend: std::sync::RwLock::new(std::collections::HashMap::new()),
+            #[cfg(feature = "block-filter-index")]
+            filter: std::sync::RwLock::new(std::collections::HashMap::new()),
+            #[cfg(feature = "block-filter-index")]
+            filter_header: std::sync::RwLock::new(std::collections::HashMap::new()),
+            // Match the RocksDb default: tests that drive the filter index
+            // and want a complete marker stamp it explicitly via
+            // `mark_block_filter_index_complete`.
+            #[cfg(feature = "block-filter-index")]
+            filter_complete: std::sync::RwLock::new(true),
         }
     }
 }
@@ -132,6 +149,30 @@ impl Store for InMemoryStore {
             }
         }
 
+        #[cfg(feature = "block-filter-index")]
+        {
+            if !batch.filter_puts.is_empty() {
+                let mut f = self.filter.write().unwrap();
+                for row in batch.filter_puts {
+                    f.insert(row.key, row.filter);
+                }
+            }
+            if !batch.filter_header_puts.is_empty() {
+                let mut fh = self.filter_header.write().unwrap();
+                for row in batch.filter_header_puts {
+                    fh.insert(row.key, row.header);
+                }
+            }
+            if !batch.filter_removes.is_empty() {
+                let mut f = self.filter.write().unwrap();
+                let mut fh = self.filter_header.write().unwrap();
+                for k in batch.filter_removes {
+                    f.remove(&k);
+                    fh.remove(&k);
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -180,6 +221,12 @@ impl Store for InMemoryStore {
         self.addr_funding.write().unwrap().clear();
         self.addr_spending.write().unwrap().clear();
         self.outpoint_spend.write().unwrap().clear();
+        #[cfg(feature = "block-filter-index")]
+        {
+            self.filter.write().unwrap().clear();
+            self.filter_header.write().unwrap().clear();
+            *self.filter_complete.write().unwrap() = true;
+        }
         *self.tip.write().unwrap() = None;
         Ok(())
     }
@@ -193,6 +240,12 @@ impl Store for InMemoryStore {
         self.addr_funding.write().unwrap().clear();
         self.addr_spending.write().unwrap().clear();
         self.outpoint_spend.write().unwrap().clear();
+        #[cfg(feature = "block-filter-index")]
+        {
+            self.filter.write().unwrap().clear();
+            self.filter_header.write().unwrap().clear();
+            *self.filter_complete.write().unwrap() = true;
+        }
         *self.tip.write().unwrap() = None;
         Ok(())
     }
@@ -234,6 +287,35 @@ impl Store for InMemoryStore {
 
     fn lookup_spend(&self, outpoint: &OutPoint) -> Result<Option<SpendingRef>, StoreError> {
         Ok(self.outpoint_spend.read().unwrap().get(outpoint).copied())
+    }
+
+    #[cfg(feature = "block-filter-index")]
+    fn get_filter(&self, filter_type: u8, height: u32) -> Option<Vec<u8>> {
+        self.filter
+            .read()
+            .unwrap()
+            .get(&FilterKey { filter_type, height })
+            .cloned()
+    }
+
+    #[cfg(feature = "block-filter-index")]
+    fn get_filter_header(&self, filter_type: u8, height: u32) -> Option<[u8; 32]> {
+        self.filter_header
+            .read()
+            .unwrap()
+            .get(&FilterKey { filter_type, height })
+            .copied()
+    }
+
+    #[cfg(feature = "block-filter-index")]
+    fn block_filter_index_complete(&self) -> bool {
+        *self.filter_complete.read().unwrap()
+    }
+
+    #[cfg(feature = "block-filter-index")]
+    fn mark_block_filter_index_complete(&self) -> Result<(), StoreError> {
+        *self.filter_complete.write().unwrap() = true;
+        Ok(())
     }
 }
 

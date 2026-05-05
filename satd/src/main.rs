@@ -178,8 +178,14 @@ async fn main() {
         // Round-1 review H2: tell the Store whether the address
         // index is active so `write_batch_mode` can clear the
         // `address_index.complete` marker atomically with any
-        // connect-with-addressindex-disabled batch.
-        Ok(s) => Box::new(s.with_addressindex_enabled(config.addressindex)),
+        // connect-with-addressindex-disabled batch. The filter-index
+        // builder follows the same shape; PR-5 lands the
+        // `config.blockfilterindex` flag, so we hard-code `false` for
+        // now to match the PR-2 default-off posture.
+        Ok(s) => Box::new(
+            s.with_addressindex_enabled(config.addressindex)
+                .with_blockfilterindex_enabled(false),
+        ),
         Err(e) => {
             eprintln!("Error opening chain database: {}", e);
             auth.cleanup();
@@ -312,6 +318,13 @@ async fn main() {
             max_subscriptions: config.addrindexsubscriptions,
             ..Default::default()
         },
+        // BIP 158 filter index: defaults to disabled. PR-5 of the
+        // BIP 157/158 stack adds the `--blockfilterindex` /
+        // `--peerblockfilters` CLI flags + reconciliation. PR-2 lands
+        // the index storage + connect-block emission with the runtime
+        // knob hard-coded off so existing operators see no behaviour
+        // change until PR-5 ships.
+        node::index::filter::FilterIndexConfig::default(),
     ) {
         Ok(cs) => Arc::new(cs),
         Err(e) => {

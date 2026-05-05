@@ -999,8 +999,9 @@ mod tests {
             Box::new(NoopVerifier),
             AssumeValid::Disabled,
             450,
-        4,
-        Default::default(),
+            4,
+            Default::default(),
+            Default::default(),
         )
         .unwrap();
         let mp = Mempool::new(1_000_000, 0); // 1MB, no min fee for tests
@@ -1113,8 +1114,9 @@ mod tests {
             Box::new(NoopVerifier),
             AssumeValid::Disabled,
             450,
-        4,
-        Default::default(),
+            4,
+            Default::default(),
+            Default::default(),
         )
         .unwrap();
 

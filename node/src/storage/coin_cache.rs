@@ -190,13 +190,20 @@ impl CoinCache {
         self.count_delta.store(0, Ordering::Relaxed);
         self.amount_delta.store(0, Ordering::Relaxed);
 
+        #[cfg(feature = "block-filter-index")]
+        let has_filter_rows = !batch.filter_puts.is_empty()
+            || !batch.filter_header_puts.is_empty()
+            || !batch.filter_removes.is_empty();
+        #[cfg(not(feature = "block-filter-index"))]
+        let has_filter_rows = false;
         let has_data = puts > 0
             || removes > 0
             || batch.tip.is_some()
             || !batch.block_index_puts.is_empty()
             || !batch.height_hash_puts.is_empty()
             || !batch.undo_puts.is_empty()
-            || !batch.tx_index_puts.is_empty();
+            || !batch.tx_index_puts.is_empty()
+            || has_filter_rows;
 
         if has_data {
             let mode = self.current_write_mode();
@@ -412,6 +419,12 @@ impl Store for CoinCache {
         // Non-coin operations:
         // - Without coins (store_block, accept_headers): write to backing store immediately
         // - With coins (connect_block): buffer for flush
+        #[cfg(feature = "block-filter-index")]
+        let has_filter = !batch.filter_puts.is_empty()
+            || !batch.filter_header_puts.is_empty()
+            || !batch.filter_removes.is_empty();
+        #[cfg(not(feature = "block-filter-index"))]
+        let has_filter = false;
         let has_non_coin = !batch.block_index_puts.is_empty()
             || !batch.height_hash_puts.is_empty()
             || !batch.height_hash_removes.is_empty()
@@ -425,7 +438,8 @@ impl Store for CoinCache {
             || !batch.outpoint_spend_puts.is_empty()
             || !batch.outpoint_spend_removes.is_empty()
             || !batch.addr_backfill_temp_puts.is_empty()
-            || batch.backfill_cursor_advance.is_some();
+            || batch.backfill_cursor_advance.is_some()
+            || has_filter;
 
         if has_non_coin {
             if coin_dirty == 0 {
@@ -447,6 +461,12 @@ impl Store for CoinCache {
                     outpoint_spend_removes: batch.outpoint_spend_removes,
                     addr_backfill_temp_puts: batch.addr_backfill_temp_puts,
                     backfill_cursor_advance: batch.backfill_cursor_advance,
+                    #[cfg(feature = "block-filter-index")]
+                    filter_puts: batch.filter_puts,
+                    #[cfg(feature = "block-filter-index")]
+                    filter_header_puts: batch.filter_header_puts,
+                    #[cfg(feature = "block-filter-index")]
+                    filter_removes: batch.filter_removes,
                 };
                 self.inner.write_batch_mode(pass_through, mode)?;
             } else {
@@ -457,13 +477,13 @@ impl Store for CoinCache {
                 pending.undo_puts.extend(batch.undo_puts);
                 pending.tx_index_puts.extend(batch.tx_index_puts);
                 pending.tx_index_removes.extend(batch.tx_index_removes);
-                // Address-index, outpoint-spend, and backfill-temp puts
-                // and removes need last-writer-wins dedup by key (so
-                // connect→disconnect→connect or disconnect→connect
-                // sequences before flush land on the correct final
-                // state). Build a small StoreBatch carrying only those
-                // fields and route it through `merge` — the rest of
-                // `batch` was already extended above.
+                // Address-index, outpoint-spend, backfill-temp, and
+                // filter-index puts and removes all need last-writer-wins
+                // dedup by key (so connect→disconnect→connect or
+                // disconnect→connect sequences before flush land on the
+                // correct final state). Build a small StoreBatch carrying
+                // only those fields and route it through `merge` — the
+                // rest of `batch` was already extended above.
                 let addr_only = StoreBatch {
                     addr_funding_puts: batch.addr_funding_puts,
                     addr_spending_puts: batch.addr_spending_puts,
@@ -473,6 +493,12 @@ impl Store for CoinCache {
                     outpoint_spend_removes: batch.outpoint_spend_removes,
                     addr_backfill_temp_puts: batch.addr_backfill_temp_puts,
                     backfill_cursor_advance: batch.backfill_cursor_advance,
+                    #[cfg(feature = "block-filter-index")]
+                    filter_puts: batch.filter_puts,
+                    #[cfg(feature = "block-filter-index")]
+                    filter_header_puts: batch.filter_header_puts,
+                    #[cfg(feature = "block-filter-index")]
+                    filter_removes: batch.filter_removes,
                     ..Default::default()
                 };
                 pending.merge(addr_only);
@@ -823,6 +849,33 @@ impl Store for CoinCache {
 
     fn mark_address_index_complete(&self) -> Result<(), StoreError> {
         self.inner.mark_address_index_complete()
+    }
+
+    #[cfg(feature = "block-filter-index")]
+    fn get_filter(&self, filter_type: u8, height: u32) -> Option<Vec<u8>> {
+        // Filter blob is written atomically with the chain batch in
+        // the inner store; no pending-batch override needed because
+        // both `getblockfilter` and the BIP 157 P2P arms read by
+        // height, and our pending batch can hold rows whose height is
+        // above the stable read horizon. If a future caller wants
+        // up-to-the-second freshness, the same pending-batch peek
+        // pattern as `lookup_spend` applies — defer until then.
+        self.inner.get_filter(filter_type, height)
+    }
+
+    #[cfg(feature = "block-filter-index")]
+    fn get_filter_header(&self, filter_type: u8, height: u32) -> Option<[u8; 32]> {
+        self.inner.get_filter_header(filter_type, height)
+    }
+
+    #[cfg(feature = "block-filter-index")]
+    fn block_filter_index_complete(&self) -> bool {
+        self.inner.block_filter_index_complete()
+    }
+
+    #[cfg(feature = "block-filter-index")]
+    fn mark_block_filter_index_complete(&self) -> Result<(), StoreError> {
+        self.inner.mark_block_filter_index_complete()
     }
 
     fn lookup_spend(

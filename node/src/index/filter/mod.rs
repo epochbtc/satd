@@ -10,9 +10,13 @@
 
 #[cfg(feature = "block-filter-index")]
 pub mod emit;
+#[cfg(feature = "block-filter-index")]
+pub mod lookups;
 
 #[cfg(feature = "block-filter-index")]
 pub use emit::{build_filter_row_pair, filter_remove_key};
+#[cfg(feature = "block-filter-index")]
+pub use lookups::{MAX_FILTER_RANGE, RocksFilterIndex, filter_hash};
 
 pub use node_filter_index::{
     decode_filter_key, encode_filter_key, FilterHeaderRow, FilterIndex, FilterIndexConfig,
