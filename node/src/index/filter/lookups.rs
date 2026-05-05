@@ -230,9 +230,12 @@ mod tests {
             idx.headers_range(FILTER_TYPE_BASIC, 100, 50),
             Err(IndexError::InvalidRange { .. })
         ));
-        // range == 1000 (BIP 157 says strictly less than 1000 difference).
+        // headers_range services `getcfheaders` callers, which
+        // Bitcoin Core caps at MAX_GETCFHEADERS_SIZE = 2000 (review
+        // 2026-05-04 M1). The range diff must be strictly less than
+        // 2000 (i.e. inclusive count <= 2000).
         assert!(matches!(
-            idx.headers_range(FILTER_TYPE_BASIC, 0, 1000),
+            idx.headers_range(FILTER_TYPE_BASIC, 0, 2000),
             Err(IndexError::InvalidRange { .. })
         ));
     }
