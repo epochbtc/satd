@@ -136,6 +136,20 @@ pub struct PeerManager {
     /// are deferred here instead of triggering peer bans; reconsidered on
     /// new mempool admission and on block connect.
     orphanage: Arc<TxOrphanage>,
+    /// BIP 158 filter index handle. Wired post-construction via
+    /// `set_filter_index` (mirrors `ChainState::set_mempool` shape) so
+    /// the existing constructor surface stays unchanged. The handler
+    /// arms read it for `getcfilters` / `getcfheaders` / `getcfcheckpt`,
+    /// and the version handshake ORs `COMPACT_FILTERS` into our
+    /// services when both the runtime advertise flag and the index's
+    /// `is_complete()` say yes.
+    #[cfg(feature = "block-filter-index")]
+    filter_index: std::sync::OnceLock<Arc<dyn node_filter_index::FilterIndex>>,
+    /// Whether the operator opted into advertising and serving the BIP
+    /// 157 P2P service (`--peerblockfilters=1`). Defaults to false; set
+    /// alongside `set_filter_index` from the satd binary.
+    #[cfg(feature = "block-filter-index")]
+    peer_serve_filters: std::sync::atomic::AtomicBool,
 }
 
 impl PeerManager {
@@ -237,6 +251,10 @@ impl PeerManager {
             max_ahead,
             ibd_eta_secs: Arc::new(AtomicU64::new(0)),
             orphanage: Arc::new(TxOrphanage::with_defaults()),
+            #[cfg(feature = "block-filter-index")]
+            filter_index: std::sync::OnceLock::new(),
+            #[cfg(feature = "block-filter-index")]
+            peer_serve_filters: std::sync::atomic::AtomicBool::new(false),
         });
 
         // Spawn block processing thread
@@ -268,6 +286,41 @@ impl PeerManager {
     /// Expose the orphanage so the RPC layer can report diagnostics.
     pub fn orphanage(&self) -> Arc<TxOrphanage> {
         self.orphanage.clone()
+    }
+
+    /// Wire the BIP 158 filter index handle. Called once at startup
+    /// after both `PeerManager` and `RocksFilterIndex` are constructed.
+    /// Idempotent on duplicate calls (later sets are silently ignored).
+    /// `peer_serve` is the operator-side advertisement flag
+    /// (`--peerblockfilters=1`).
+    #[cfg(feature = "block-filter-index")]
+    pub fn set_filter_index(
+        &self,
+        index: Arc<dyn node_filter_index::FilterIndex>,
+        peer_serve: bool,
+    ) {
+        let _ = self.filter_index.set(index);
+        self.peer_serve_filters
+            .store(peer_serve, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Predicate consulted by `handle_message` and the version
+    /// handshake: serve filters only when the operator opted in
+    /// (`--peerblockfilters=1`) AND the index is complete. Backfill
+    /// in flight → false (prevents advertising a service we cannot
+    /// faithfully provide).
+    #[cfg(feature = "block-filter-index")]
+    fn peer_serve_filters_ready(&self) -> bool {
+        if !self
+            .peer_serve_filters
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return false;
+        }
+        match self.filter_index.get() {
+            Some(idx) => idx.is_complete(),
+            None => false,
+        }
     }
 
     /// Register addresses for auto-reconnect.
@@ -1016,6 +1069,25 @@ impl PeerManager {
             }
             NetworkMessage::SendHeaders => {
                 tracing::debug!(id, "Peer prefers headers announcements");
+            }
+            #[cfg(feature = "block-filter-index")]
+            NetworkMessage::GetCFilters(req) => {
+                if self.peer_serve_filters_ready() {
+                    self.handle_get_cfilters(id, req);
+                }
+                // Silent drop per BIP 157 when not serving.
+            }
+            #[cfg(feature = "block-filter-index")]
+            NetworkMessage::GetCFHeaders(req) => {
+                if self.peer_serve_filters_ready() {
+                    self.handle_get_cfheaders(id, req);
+                }
+            }
+            #[cfg(feature = "block-filter-index")]
+            NetworkMessage::GetCFCheckpt(req) => {
+                if self.peer_serve_filters_ready() {
+                    self.handle_get_cfcheckpt(id, req);
+                }
             }
             _ => {}
         }
@@ -1898,6 +1970,173 @@ impl PeerManager {
         );
     }
 
+    /// `getcfilters` handler per BIP 157.
+    /// Validates filter type, range bounds, and active-chain stop hash;
+    /// silent-drops any violation. On success, replies with one
+    /// `CFilter` per height in the requested range (BIP 157 specifies
+    /// per-height responses, not a batched form).
+    #[cfg(feature = "block-filter-index")]
+    fn handle_get_cfilters(&self, id: PeerId, req: bitcoin::p2p::message_filter::GetCFilters) {
+        use node_filter_index::FILTER_TYPE_BASIC;
+        let bitcoin::p2p::message_filter::GetCFilters {
+            filter_type,
+            start_height,
+            stop_hash,
+        } = req;
+        // Filter type guard.
+        if filter_type != FILTER_TYPE_BASIC {
+            return;
+        }
+        // Resolve stop_hash → stop_height via block_index.
+        let Some(stop_entry) = self.chain_state.get_block_index(&stop_hash) else {
+            return;
+        };
+        let stop_height = stop_entry.height;
+        // BIP 157: stop_height ≥ start_height, range < 1000.
+        if stop_height < start_height {
+            return;
+        }
+        if stop_height - start_height >= 1000 {
+            return;
+        }
+        // Active-chain check: stop_hash must match the active chain at stop_height.
+        match self.chain_state.get_block_hash_by_height(stop_height) {
+            Some(h) if h == stop_hash => {}
+            _ => return,
+        }
+        let Some(idx) = self.filter_index.get() else {
+            return;
+        };
+        for h in start_height..=stop_height {
+            let Some(block_hash) = self.chain_state.get_block_hash_by_height(h) else {
+                return;
+            };
+            let Ok(filter) = idx.filter_at(filter_type, h) else {
+                return;
+            };
+            self.send_to_peer(
+                id,
+                NetworkMessage::CFilter(bitcoin::p2p::message_filter::CFilter {
+                    filter_type,
+                    block_hash,
+                    filter,
+                }),
+            );
+        }
+    }
+
+    /// `getcfheaders` handler per BIP 157.
+    /// Replies with a single `CFHeaders` carrying
+    /// `previous_filter_header` plus per-height filter hashes (computed
+    /// on the fly from the stored filter blob — see plan §"Filter-hash
+    /// CF for getcfheaders recompute" for why we don't persist a third
+    /// CF).
+    #[cfg(feature = "block-filter-index")]
+    fn handle_get_cfheaders(&self, id: PeerId, req: bitcoin::p2p::message_filter::GetCFHeaders) {
+        use bitcoin::bip158::FilterHash;
+        use bitcoin::hashes::Hash;
+        use node_filter_index::FILTER_TYPE_BASIC;
+        let bitcoin::p2p::message_filter::GetCFHeaders {
+            filter_type,
+            start_height,
+            stop_hash,
+        } = req;
+        if filter_type != FILTER_TYPE_BASIC {
+            return;
+        }
+        let Some(stop_entry) = self.chain_state.get_block_index(&stop_hash) else {
+            return;
+        };
+        let stop_height = stop_entry.height;
+        if stop_height < start_height {
+            return;
+        }
+        if stop_height - start_height >= 1000 {
+            return;
+        }
+        match self.chain_state.get_block_hash_by_height(stop_height) {
+            Some(h) if h == stop_hash => {}
+            _ => return,
+        }
+        let Some(idx) = self.filter_index.get() else {
+            return;
+        };
+        // previous_filter_header: header at start_height - 1, or all-zeros for height 0.
+        let previous_filter_header = if start_height == 0 {
+            bitcoin::bip158::FilterHeader::from_byte_array([0u8; 32])
+        } else {
+            let Ok(prev) = idx.header_at(filter_type, start_height - 1) else {
+                return;
+            };
+            bitcoin::bip158::FilterHeader::from_byte_array(prev)
+        };
+        // filter_hashes: sha256d(filter_blob) per height.
+        let mut filter_hashes = Vec::with_capacity((stop_height - start_height + 1) as usize);
+        for h in start_height..=stop_height {
+            let Ok(blob) = idx.filter_at(filter_type, h) else {
+                return;
+            };
+            let hash = bitcoin::hashes::sha256d::Hash::hash(&blob).to_byte_array();
+            filter_hashes.push(FilterHash::from_byte_array(hash));
+        }
+        self.send_to_peer(
+            id,
+            NetworkMessage::CFHeaders(bitcoin::p2p::message_filter::CFHeaders {
+                filter_type,
+                stop_hash,
+                previous_filter_header,
+                filter_hashes,
+            }),
+        );
+    }
+
+    /// `getcfcheckpt` handler per BIP 157 — filter headers at every
+    /// 1000-block boundary up to (and including) the highest 1000-block
+    /// boundary ≤ `stop_height`.
+    #[cfg(feature = "block-filter-index")]
+    fn handle_get_cfcheckpt(&self, id: PeerId, req: bitcoin::p2p::message_filter::GetCFCheckpt) {
+        use bitcoin::hashes::Hash;
+        use node_filter_index::FILTER_TYPE_BASIC;
+        let bitcoin::p2p::message_filter::GetCFCheckpt {
+            filter_type,
+            stop_hash,
+        } = req;
+        if filter_type != FILTER_TYPE_BASIC {
+            return;
+        }
+        let Some(stop_entry) = self.chain_state.get_block_index(&stop_hash) else {
+            return;
+        };
+        let stop_height = stop_entry.height;
+        match self.chain_state.get_block_hash_by_height(stop_height) {
+            Some(h) if h == stop_hash => {}
+            _ => return,
+        }
+        let Some(idx) = self.filter_index.get() else {
+            return;
+        };
+        let max_idx = stop_height / 1000;
+        let mut filter_headers = Vec::with_capacity(max_idx as usize);
+        for i in 1..=max_idx {
+            let h = i * 1000;
+            if h > stop_height {
+                break;
+            }
+            let Ok(header) = idx.header_at(filter_type, h) else {
+                return;
+            };
+            filter_headers.push(bitcoin::bip158::FilterHeader::from_byte_array(header));
+        }
+        self.send_to_peer(
+            id,
+            NetworkMessage::CFCheckpt(bitcoin::p2p::message_filter::CFCheckpt {
+                filter_type,
+                stop_hash,
+                filter_headers,
+            }),
+        );
+    }
+
     fn handle_getheaders(
         &self,
         id: PeerId,
@@ -2306,7 +2545,16 @@ impl PeerManager {
     }
 
     fn build_version_message(&self, receiver: SocketAddr) -> VersionMessage {
-        let services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+        let mut services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+        // BIP 157 NODE_COMPACT_FILTERS (bit 6) — advertised at version
+        // time when the runtime predicate is true. Re-evaluated per
+        // outgoing handshake so a node that finishes a backfill or
+        // toggles `peerblockfilters` mid-run picks up the change for
+        // new connections without a restart.
+        #[cfg(feature = "block-filter-index")]
+        if self.peer_serve_filters_ready() {
+            services |= ServiceFlags::COMPACT_FILTERS;
+        }
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()

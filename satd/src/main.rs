@@ -548,6 +548,21 @@ async fn main() {
     let address_index: std::sync::Arc<dyn node::index::address::AddressIndex> =
         address_index_concrete.clone();
 
+    // BIP 158 filter index. Built unconditionally (the runtime knob
+    // gates per-block emission); the `Arc<dyn FilterIndex>` is shared
+    // by the BIP 157 P2P arms in `PeerManager` and the
+    // `getblockfilter` RPC (PR-5). Until PR-5 wires the
+    // `--blockfilterindex` / `--peerblockfilters` CLI flags, both
+    // default to off and the index is silent on the wire.
+    let filter_index_store: std::sync::Arc<dyn node::storage::Store> =
+        chain_state.store_ref().clone();
+    let filter_index: std::sync::Arc<dyn node_filter_index::FilterIndex> = std::sync::Arc::new(
+        node::index::filter::RocksFilterIndex::new(
+            filter_index_store,
+            node_filter_index::FilterIndexConfig::default(),
+        ),
+    );
+
     {
         let task_index = mempool_addr_index.clone();
         let task_mempool = mempool.clone();
@@ -623,6 +638,13 @@ async fn main() {
         config.prefetch_workers,
         config.max_ahead,
     );
+
+    // Wire the BIP 158 filter index into the peer manager so the BIP
+    // 157 service arms can read filter rows and the version handshake
+    // can advertise `NODE_COMPACT_FILTERS` when both runtime knobs say
+    // yes. PR-5 wires `peer_serve` to `config.peerblockfilters`; for
+    // now we hard-code `false` to match the PR-2 default-off posture.
+    peer_manager.set_filter_index(filter_index.clone(), false);
 
     if config.prune > 0 {
         tracing::info!(target_mb = config.prune, "Block pruning enabled");
