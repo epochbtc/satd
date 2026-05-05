@@ -334,6 +334,10 @@ jobs:
     permissions:
       contents: read
       packages: write
+      # cosign keyless OIDC needs an id-token to mint a short-lived
+      # signing certificate. Without this permission the sign step
+      # fails with "missing OIDC token".
+      id-token: write
 
     steps:
       - name: Download digests
@@ -372,10 +376,35 @@ jobs:
           docker buildx imagetools create $tags $digests
 
       - name: Inspect manifest
+        id: inspect
         run: |
           set -euo pipefail
           tag=$(jq -cr '.tags[0]' <<< '${{ steps.meta.outputs.json }}')
           docker buildx imagetools inspect "$tag"
+          # Resolve the manifest-list digest so we can sign by digest
+          # rather than by tag — signing the digest is durable across
+          # any future tag re-pointing.
+          digest=$(docker buildx imagetools inspect "$tag" \
+                     --format '{{json .Manifest}}' | jq -r '.digest')
+          echo "manifest_digest=${digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: 'v2.4.1'
+
+      # Keyless OIDC signing. The signing certificate's identity binds
+      # to this exact workflow file at this exact tag ref; verifiers
+      # use the same identity binding (see SECURITY.md). No long-lived
+      # signing key, no key rotation. Attestation lands in Rekor.
+      - name: Sign manifest list (cosign keyless)
+        env:
+          COSIGN_YES: 'true'
+        run: |
+          set -euo pipefail
+          ref="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.inspect.outputs.manifest_digest }}"
+          echo ">> Signing $ref"
+          cosign sign "$ref"
 
 
   release:

@@ -310,6 +310,38 @@ The workflow also runs on PRs that touch the `Dockerfile`,
 build matrix, no publish — so the next tagged release can never be
 the first time a workflow change is exercised end to end.
 
+### Signed releases
+
+Three independent signing surfaces. Verifier commands and key custody
+details live in [`SECURITY.md`](../SECURITY.md).
+
+- **Tarballs — minisign Ed25519.** Each `.tar.zst` ships with a
+  detached `.minisig`. Pubkeys (primary + cold spare) in `SECURITY.md`.
+  Maintainer signs offline with passphrases gated by 1Password +
+  YubiKey 2FA — the signing key is never present in CI. Maintainer
+  runbook: `contrib/release/sign-tarballs.sh <tag>`.
+- **Container image — cosign keyless OIDC.** No signing key in
+  custody. The merge-manifest CI job mints a short-lived cert from
+  GitHub Actions OIDC and the attestation is logged to Rekor.
+  Verify with:
+
+  ```sh
+  cosign verify ghcr.io/epochbtc/satd:<version> \
+    --certificate-identity-regexp \
+      'https://github.com/epochbtc/satd/.github/workflows/release.yml@refs/tags/v.*' \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com
+  ```
+
+- **Git tags — SSH signatures.** Annotated tags are signed by the
+  maintainer's SSH key. Source-of-truth for the trusted pubkey set is
+  `https://github.com/bkeroack.keys` (delegating to GitHub avoids a
+  stale pinned file as machines rotate). Verify with the bundled
+  helper:
+
+  ```sh
+  contrib/release/verify-tag.sh v0.1.0
+  ```
+
 ### Coming in later PRs
 
 - **musl-linux tarballs.** Targets `x86_64-unknown-linux-musl` and
@@ -317,19 +349,9 @@ the first time a workflow change is exercised end to end.
   `rocksdb-sys` + musl wants a dedicated cross toolchain and the
   v0.1.0 priority is gnu-linux + macOS, both of which downstream
   package managers handle natively.
-- **`minisign`-signed tarballs.** PR-3. Detached `*.minisig`
-  signatures cross-signed by at least two maintainers; public keys
-  in `SECURITY.md`.
-- **`cosign`-signed images.** PR-3. Keyless OIDC signing attested to
-  the Rekor transparency log; verify via:
-
-  ```sh
-  cosign verify ghcr.io/epochbtc/satd:<version> \
-    --certificate-identity-regexp 'https://github.com/epochbtc/satd/.*' \
-    --certificate-oidc-issuer https://token.actions.githubusercontent.com
-  ```
-
-- **`cyclonedx`-format SBOM** attached to each release. PR-5.
+- **Reproducible-build verification** — PR-4 (Nix flake) double-builds
+  on two distinct hosts and asserts byte-identical output.
+- **`cyclonedx`-format SBOM** attached to each release — PR-5.
 
 ## Stability contract
 
@@ -356,4 +378,4 @@ release notes for the version that ships them.
 
 | Version | Notable changes |
 |---|---|
-| 0.1.0 (current) | Initial PACKAGING.md. Dockerfile + systemd unit shipped. Tag-triggered release workflow on hosted runners produces tarballs (gnu-linux + macOS, both arches) and a multi-arch GHCR image. Signing, reproducible-build verification, and SBOM generation pending. |
+| 0.1.0 (current) | Initial PACKAGING.md. Dockerfile + systemd unit shipped. Tag-triggered release workflow on hosted runners produces tarballs (gnu-linux + Apple Silicon) and a multi-arch GHCR image. Signing across all three surfaces (minisign tarballs, cosign keyless image, SSH-signed tags) shipped. Reproducible-build verification and SBOM generation pending. |
