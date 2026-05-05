@@ -351,8 +351,10 @@ intended migration is:
 4. Optional: `backfillindex address` and `backfillindex blockfilter` to
    populate the satd-specific indexes from disk.
 
-Total time on a Pi 5 with a warm flat-file cache: ~12-24 hours for the
-chainstate replay; backfills are concurrent with live operation.
+Backfills run concurrently with live block validation, so the node
+serves correctly with partial history while they progress. End-to-end
+migration timings on representative hardware are not yet benchmarked;
+this section will be updated when measurements are available.
 
 ---
 
