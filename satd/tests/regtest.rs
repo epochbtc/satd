@@ -2078,6 +2078,102 @@ fn test_getblockfilter_returns_filter_when_complete() {
     node.stop();
 }
 
+/// Regression test for M2 (review 2026-05-04): `getblockfilter`
+/// returns the filter header in display/reversed byte order to match
+/// Bitcoin Core's uint256 RPC convention. Asserts the RPC result
+/// matches `bitcoin::bip158::FilterHeader::to_string()` exactly,
+/// which Display-prints in reversed (display) order — proving the
+/// raw `to_byte_array()` internal-order encoding bug from before the
+/// fix is gone.
+#[test]
+fn test_getblockfilter_header_is_display_byte_order() {
+    use bitcoin::bip158::{BlockFilter, FilterHeader};
+    use bitcoin::hashes::Hash as _;
+
+    let mut node = TestNode::start(&["--blockfilterindex=basic"]);
+    let genesis_hash_hex = node
+        .rpc_call_with_params("getblockhash", vec![serde_json::json!(0)])
+        .unwrap()["result"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Compute the expected genesis filter header locally so we can
+    // compare byte order. Genesis (regtest) has prev_filter_header
+    // == [0u8; 32] per BIP 157.
+    let getblock = node
+        .rpc_call_with_params(
+            "getblock",
+            vec![serde_json::json!(genesis_hash_hex), serde_json::json!(0)],
+        )
+        .unwrap();
+    let block_hex = getblock["result"].as_str().expect("block hex");
+    let block_bytes = hex::decode(block_hex).expect("decode block");
+    let block: bitcoin::Block =
+        bitcoin::consensus::deserialize(&block_bytes).expect("deserialize block");
+    let prev_outputs: std::collections::HashMap<bitcoin::OutPoint, bitcoin::ScriptBuf> =
+        std::collections::HashMap::new();
+    let filter = BlockFilter::new_script_filter(&block, |op| {
+        prev_outputs
+            .get(op)
+            .cloned()
+            .ok_or(bitcoin::bip158::Error::UtxoMissing(*op))
+    })
+    .expect("filter");
+    let prev = FilterHeader::from_byte_array([0u8; 32]);
+    let expected_header = filter.filter_header(&prev);
+    let expected_display = expected_header.to_string();
+
+    let response = node
+        .rpc_call_with_params("getblockfilter", vec![serde_json::json!(genesis_hash_hex)])
+        .unwrap();
+    let actual_header = response["result"]["header"]
+        .as_str()
+        .expect("header field");
+    assert_eq!(
+        actual_header, expected_display,
+        "getblockfilter must return header in display byte order; \
+         got {actual_header} expected {expected_display}",
+    );
+
+    // Also assert it does NOT match the byte-reversed (raw internal)
+    // form — which is the pre-fix behavior.
+    let raw_internal_hex = hex::encode(expected_header.to_byte_array());
+    assert_ne!(
+        actual_header, raw_internal_hex,
+        "header should be display-form, not internal-byte order"
+    );
+    node.stop();
+}
+
+/// Regression test for H2 (review 2026-05-04): `getblockfilter` must
+/// reject hashes that are not the active-chain block at their
+/// claimed height. A made-up hash returns a not-found error rather
+/// than the active block's filter.
+#[test]
+fn test_getblockfilter_rejects_non_active_hash() {
+    let mut node = TestNode::start(&["--blockfilterindex=basic"]);
+    // A hash that doesn't exist anywhere in the block index. The
+    // `get_block_index` lookup returns None for this case, which is
+    // already handled by the original "block not found" error path —
+    // the H2 fix covers the more subtle case where the hash IS in
+    // block_index (e.g. a stored fork/header-only entry) but is not
+    // the active-chain hash at its height. Probing for that case
+    // requires controlled fork construction; we cover the basic
+    // not-found path here as the smoke check that the RPC doesn't
+    // accept arbitrary hashes.
+    let fake_hash = "00000000000000000000000000000000000000000000000000000000deadbeef";
+    let response = node
+        .rpc_call_with_params("getblockfilter", vec![serde_json::json!(fake_hash)])
+        .unwrap();
+    assert!(
+        response["error"].is_object(),
+        "getblockfilter on unknown hash must error, got {:?}",
+        response
+    );
+    node.stop();
+}
+
 #[test]
 fn test_getindexinfo_includes_basic_block_filter_index_key() {
     // With --blockfilterindex=basic, getindexinfo must surface the

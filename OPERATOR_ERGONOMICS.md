@@ -494,21 +494,51 @@ The mobile wallet `addpeer`s your node's `.onion`; embedded-Neutrino
 clients (Zeus-embedded, Blixt) discover your peer via service-flag
 filtering on connect.
 
+### Backfilling pre-existing datadirs
+
+Datadirs that were synced before the BIP 158 filter index landed (or
+that previously ran with `--blockfilterindex=0`) start with the
+completeness marker `false`. `getblockfilter` errors with "block
+filter index is not synced" and the BIP 157 P2P arms silent-drop.
+
+To retroactively populate the index without a full chain rebuild:
+
+1. Restart with `--blockfilterindex=basic`.
+2. Trigger the deferred backfill:
+
+   ```sh
+   sat-cli backfillindex blockfilter
+   ```
+
+3. Monitor progress:
+
+   ```sh
+   sat-cli getindexinfo
+   # → result["basic block filter index"]["backfill"]["state"] / cursor_height /
+   #   snapshot_height / estimated_remaining_seconds
+   ```
+
+   Operator controls: `pauseindex blockfilter`, `resumeindex
+   blockfilter`, `cancelindex blockfilter`. The cursor is persisted
+   atomically with each filter row so a kill -9 mid-flight resumes
+   cleanly on the next start.
+
+The backfill is a single-pass walk over `(block, undo)` per height,
+which means it requires the on-disk undo data the connect-block path
+already wrote. After completion, a tail catch-up phase rewrites any
+filter headers the live `connect_block` emitted above
+`snapshot_height` so the BIP 157 chain is intact at completion.
+
 ### Caveats
 
-- **Pre-existing datadirs** synced before the index landed cannot
-  retroactively populate the index. The completeness marker stamps
-  `false` at open-time, the `getblockfilter` RPC errors with
-  "block filter index is not synced", and the BIP 157 P2P arms
-  silent-drop. Operator remediation is `--reindex-chainstate` (which
-  rebuilds every index from genesis).
 - **Pruning** is not yet implemented (see `CORE_GAPS.md`). Once it
   lands, the filter index will survive pruning by construction
   (filters are independent of full block bodies) — but a pruned
-  datadir will not be able to retroactively backfill.
-- **Backfill mechanism** (single-pass walk over `(block, undo)` for
-  pre-existing datadirs) is deferred to a follow-up PR. Current shape
-  works fully for fresh-from-genesis sync deployments.
+  datadir cannot retroactively backfill (the runner reads each
+  block's persisted undo data, which `--prune` discards).
+- **`--reindex-chainstate`** is still available as a heavier last-
+  resort remediation if undo data is corrupt or unavailable. Prefer
+  `backfillindex blockfilter` for the common upgrade path.
 
 ---
 
