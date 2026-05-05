@@ -121,6 +121,18 @@ impl BackfillRunner {
         let cur = self.handle.cursor();
         self.run_pass(&snapshot, cur.cursor_height)?;
 
+        // Tail catch-up: while the runner was filling 0..=snapshot_height
+        // the live `connect_block` may have emitted filter rows for
+        // heights > snapshot_height that chain off the all-zero genesis
+        // header (because the prev-header at snapshot_height didn't
+        // exist yet at live-emit time). After the snapshot pass, walk
+        // forward from snapshot+1 to the current tip, recomputing
+        // headers from the just-stamped snapshot tail. Loop until the
+        // tip stops moving so concurrent live extensions converge —
+        // this is what closes the H1 chain-corruption window the
+        // 2026-05-04 review flagged.
+        self.run_tail_catchup(snapshot.snapshot_height())?;
+
         self.handle
             .mark_completed(self.chain.store_ref().as_ref())?;
         tracing::info!(
@@ -128,6 +140,116 @@ impl BackfillRunner {
             "filter-index backfill: completed"
         );
         Ok(())
+    }
+
+    /// Tail catch-up phase: re-emit filter rows + correctly chained
+    /// filter headers for every height from `snapshot_height + 1` to
+    /// the current chain tip. Live `connect_block` may have produced
+    /// header rows above the snapshot that chain off the all-zero
+    /// fallback (the connect-time emit cannot wait for backfill
+    /// without blocking the chain). We overwrite those rows here.
+    ///
+    /// Loops until the tip stops advancing — concurrent live block
+    /// connections during the catch-up would otherwise leave a
+    /// trailing window of stale headers. In steady state this converges
+    /// in one or two iterations.
+    fn run_tail_catchup(&self, snapshot_height: u32) -> Result<(), BackfillError> {
+        let mut cursor = snapshot_height;
+        loop {
+            self.check_pause_loop()?;
+            let (tip_hash, tip_height) = self.chain.tip_snapshot();
+            if tip_height <= cursor {
+                return Ok(());
+            }
+            // Walk back from the live tip to `cursor + 1` and rewrite
+            // every header in that range with a correctly-chained
+            // value. Block-hash-by-walk-back rather than via the
+            // height index to avoid header-only entries.
+            let mut hashes = vec![bitcoin::BlockHash::all_zeros(); (tip_height + 1) as usize];
+            let mut h = tip_height;
+            let mut current = tip_hash;
+            while h > cursor {
+                hashes[h as usize] = current;
+                let entry = self
+                    .chain
+                    .store_ref()
+                    .get_block_index(&current)
+                    .ok_or_else(|| {
+                        BackfillError::Chain(format!(
+                            "tail catch-up: missing block index for {} at height {}",
+                            current, h
+                        ))
+                    })?;
+                current = entry.header.prev_blockhash;
+                h -= 1;
+            }
+            // current is now the hash at `cursor` (the snapshot tail
+            // boundary on the first iteration, or the previous
+            // catch-up boundary on subsequent iterations). Use
+            // `header_at(cursor)` as the chain root.
+            let mut prev_header = self
+                .chain
+                .store_ref()
+                .get_filter_header(node_filter_index::FILTER_TYPE_BASIC, cursor)
+                .ok_or_else(|| {
+                    BackfillError::Chain(format!(
+                        "tail catch-up: missing filter header at boundary height {}",
+                        cursor
+                    ))
+                })?;
+            for h in (cursor + 1)..=tip_height {
+                self.check_pause_loop()?;
+                let hash = hashes[h as usize];
+                let block = self.chain.get_block(&hash).ok_or_else(|| {
+                    BackfillError::Chain(format!(
+                        "tail catch-up: missing block data for {} at height {}",
+                        hash, h
+                    ))
+                })?;
+                let undo = self
+                    .chain
+                    .store_ref()
+                    .get_undo(&hash)
+                    .ok_or(BackfillError::MissingUndo(h))?;
+                let mut prev_map: HashMap<OutPoint, ScriptBuf> = HashMap::new();
+                let mut undo_cursor = 0usize;
+                for tx in &block.txdata {
+                    if tx.is_coinbase() {
+                        continue;
+                    }
+                    for input in &tx.input {
+                        let (op_ser, coin) = undo
+                            .spent_coins
+                            .get(undo_cursor)
+                            .ok_or(BackfillError::MissingUndo(h))?;
+                        debug_assert_eq!(input.previous_output, op_ser.to_outpoint());
+                        prev_map.insert(input.previous_output, coin.script_pubkey.clone());
+                        undo_cursor += 1;
+                    }
+                }
+                let mut batch = StoreBatch::default();
+                if let Some((row, header_row)) =
+                    build_filter_row_pair(&self.cfg, h, &block, &prev_map, &prev_header).map_err(
+                        |e| BackfillError::Chain(format!("tail catch-up emit at {h}: {e}")),
+                    )?
+                {
+                    prev_header = header_row.header;
+                    batch.filter_puts.push(row);
+                    batch.filter_header_puts.push(header_row);
+                }
+                self.chain
+                    .store_ref()
+                    .write_batch_mode(batch, WriteMode::Normal)?;
+            }
+            tracing::info!(
+                from = cursor + 1,
+                to = tip_height,
+                "filter-index backfill: tail catch-up walked"
+            );
+            cursor = tip_height;
+            // Loop: if a fresh live block landed during the walk,
+            // tip_height moved and we need another pass.
+        }
     }
 
     fn acquire_snapshot(&self) -> Result<ActiveChainSnapshot, BackfillError> {

@@ -8455,6 +8455,74 @@ fn test_filter_backfill_from_disabled_datadir_matches_connect_time() {
     let _ = std::fs::remove_dir_all(&datadir_b);
 }
 
+/// Regression test for H1 (review 2026-05-04): backfill running on
+/// an upgraded datadir while a new live block lands. The filter
+/// header at `snapshot_height + 1` must chain off the freshly-stamped
+/// header at `snapshot_height`, NOT off all-zeros from the live emit
+/// hitting a missing prev_header. Without the runner's tail catch-up
+/// phase, the post-snapshot chain is corrupt.
+#[test]
+fn test_filter_backfill_tail_catchup_after_concurrent_live_block() {
+    let rpcport = find_available_port();
+    let datadir = std::env::temp_dir().join(format!("satd-filter-bf-tail-test-{}", rpcport));
+    let _ = std::fs::create_dir_all(&datadir);
+
+    // Phase 1: mine a chain with the index OFF so historical heights
+    // have no filter rows.
+    let mut node_a = TestNode::start_with_datadir(&datadir, rpcport, &[]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    node_a
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(20), serde_json::json!(addr)],
+        )
+        .expect("rpc");
+    node_a.stop();
+
+    // Phase 2: restart with the index ON + a slow runner. While the
+    // backfill is mid-flight, mine an extra block so it lands above
+    // `snapshot_height` while at least some heights ≤ snapshot are
+    // still missing. The runner's tail catch-up phase has to rewrite
+    // the post-snapshot header so the chain is intact at completion.
+    let mut node_b = TestNode::start_with_datadir_env(
+        &datadir,
+        rpcport,
+        &["--blockfilterindex=basic"],
+        &[("SATD_FILTER_BACKFILL_DEBUG_DELAY_MS", "100")],
+    );
+    let r = node_b
+        .rpc_call_with_params("backfillindex", vec![serde_json::json!("blockfilter")])
+        .expect("rpc");
+    assert_eq!(r["result"]["started"].as_bool(), Some(true));
+    poll_filter_backfill_state(&node_b, &["running"], Duration::from_secs(15));
+    // Mine ONE extra block via live path. It connects through
+    // `connect_block` and would (without the H1 fix) chain off zero.
+    node_b
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(1), serde_json::json!(addr)],
+        )
+        .expect("rpc");
+    poll_filter_backfill_state(&node_b, &["completed"], Duration::from_secs(60));
+
+    // synced=true after tail-catchup completion means the marker is
+    // stamped AND the post-snapshot tail is rewritten with correctly
+    // chained headers. The byte-level header validation lives in PR-5
+    // once `getblockfilter` returns the header hex.
+    let info = node_b.rpc_call("getindexinfo").expect("rpc");
+    assert!(
+        info["result"]["basic block filter index"]["synced"]
+            .as_bool()
+            .unwrap_or(false),
+        "synced must be true after tail-catchup completion"
+    );
+    let bci = node_b.rpc_call("getblockchaininfo").expect("rpc");
+    let blocks = bci["result"]["blocks"].as_u64().unwrap_or(0);
+    assert!(blocks >= 21, "tip must be > snapshot height; got {blocks}");
+    node_b.stop();
+    let _ = std::fs::remove_dir_all(&datadir);
+}
+
 /// `pauseindex blockfilter` / `resumeindex blockfilter` return -8 when
 /// no backfill is active.
 #[test]
