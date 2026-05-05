@@ -2,7 +2,9 @@
 
 Locked design for the address-history index that backs satd's native Electrum and Esplora subsystems (per `ECOSYSTEM.md` §4 / §4a). The index is the load-bearing prerequisite for both protocols and for any future Silent Payments work.
 
-This document predates implementation. Once code lands, treat it as the spec; deviations get discussed and the doc gets updated.
+**Status (2026-05): shipped.** The full live-index path (M1–M6) and the deferred-backfill machinery (M7) have landed. Lookup paths live in `node-index/`, the connect/disconnect-block integration in `node/src/index/address/`, and the deferred backfill in `node/src/index/address/backfill.rs` + `runner.rs`. The Esplora REST server (`esplora-handlers`) and Electrum protocol server (`electrum-proto`) ride on top via the `AddressIndex` and `SpendIndex` traits.
+
+This document is the spec. Where the implementation deviated, the section calls it out.
 
 ---
 
@@ -351,9 +353,9 @@ Memory cost: a subscription is essentially a `HashMap` entry + a broadcast `Send
 
 ## Implementation milestones
 
-Suggested ordering, ~3-5 weeks total. Each step is its own PR.
+All milestones below have shipped. Kept for historical reference; each was its own PR.
 
-### M1 — Schema + storage primitives (~3-5 days)
+### M1 — Schema + storage primitives — SHIPPED
 
 - Add `CF_ADDR_FUNDING`, `CF_ADDR_SPENDING` constants and CF descriptors to `RocksDBStore`.
 - Define `AddrFundingRow`, `AddrFundingKey`, `AddrSpendingRow`, `AddrSpendingKey` types with serde (key encoding/decoding).
@@ -361,7 +363,7 @@ Suggested ordering, ~3-5 weeks total. Each step is its own PR.
 - Extend `RocksDBStore::write_batch` to write to the new CFs.
 - Unit tests for round-trip encoding, key sort order, CF iteration.
 
-### M2 — `connect_block` / `disconnect_block` integration (~1 week)
+### M2 — `connect_block` / `disconnect_block` integration — SHIPPED
 
 - Wire the two integration points in `connect.rs` (per-output, per-input).
 - Wire the `disconnect_block` inverse path.
@@ -369,13 +371,13 @@ Suggested ordering, ~3-5 weeks total. Each step is its own PR.
 - Runtime opt-out flag: `-noindex=address` short-circuits the integration even when compiled in.
 - Reorg correctness tests in `regtest.rs`: connect → disconnect → reconnect, verify CF state matches expected at each step.
 
-### M3 — Lookup methods + `AddressIndex` trait (~3-5 days)
+### M3 — Lookup methods + `AddressIndex` trait — SHIPPED
 
 - Implement `confirmed_history`, `balance`, `utxos` against the CFs.
 - Implement the trait on the `node-index` library crate.
 - Integration tests against a regtest node: send tx, mine, query, verify.
 
-### M4 — Mempool variant (~1 week)
+### M4 — Mempool variant — SHIPPED
 
 - `MempoolAddrIndex` struct + integration with existing `Mempool::add_tx` / `remove_tx`.
 - Block-confirmation lock-step (`connect_block` shedding mempool entries).
@@ -383,7 +385,7 @@ Suggested ordering, ~3-5 weeks total. Each step is its own PR.
 - `mempool_history` trait method.
 - RBF replacement tests.
 
-### M5 — Subscription / notification (~3-5 days)
+### M5 — Subscription / notification — SHIPPED
 
 - Notifier task fed by chain + mempool events.
 - Per-scripthash `tokio::broadcast` channel pool.
@@ -391,7 +393,7 @@ Suggested ordering, ~3-5 weeks total. Each step is its own PR.
 - Bounded subscription count + lagged-receiver semantics.
 - Tests: subscribe, mine block, receive status update.
 
-### M6 — Bench + tune (~1 week)
+### M6 — Bench + tune — SHIPPED
 
 - IBD overhead measurement on Pi 5 (4 GB and 8 GB).
 - Write amplification analysis (RocksDB stats).
@@ -399,7 +401,7 @@ Suggested ordering, ~3-5 weeks total. Each step is its own PR.
 - Compaction tuning (which CF should merge-on-write vs. point-lookup-tuned).
 - Documentation: tuning recommendations land in `OPERATOR_ERGONOMICS.md`.
 
-### M7 — Deferred backfill (~1-1.5 weeks)
+### M7 — Deferred backfill — SHIPPED
 
 - Backfill task: two-pass walk with temporary CF (`backfill_outpoint_to_scripthash`).
 - Per-pass cursor in metadata CF; resumable across restarts.
@@ -410,7 +412,7 @@ Suggested ordering, ~3-5 weeks total. Each step is its own PR.
 - Crash-safety test: kill -9 mid-backfill, restart, verify resume completes correctly.
 - AssumeUTXO interaction smoke test: bootstrap via AssumeUTXO at height N, run backfill, verify final index state matches a from-genesis-validated reference.
 
-Total elapsed: ~3-5 weeks for M1-M6 (the live index), plus ~1-1.5 weeks for M7 (the backfill). M7 can ship as a follow-up release if v1 launches before AssumeUTXO is heavily used.
+All seven milestones shipped. The deferred backfill (M7) is the recommended path for AssumeUTXO operators and for datadirs synced before the index landed.
 
 ---
 

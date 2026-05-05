@@ -2,7 +2,7 @@
 
 Strategic direction for how satd integrates with the broader Bitcoin ecosystem: which mobile clients we target, which API surfaces we expose, and how we make satd easy to package for self-custody stacks (Umbrel, Start9, RaspiBlitz, MyNode, BTCPay, home-server distros).
 
-Not a milestone spec. This doc guides future milestones and informs packaging / API decisions as they arise.
+Not a milestone spec. This doc guides future milestones and informs packaging / API decisions as they arise. Implementation status of each surface listed below is tracked in `CORE_GAPS.md` (A1–A10) and the "shipped" markers in `OPERATOR_ERGONOMICS.md`.
 
 ---
 
@@ -37,10 +37,10 @@ On-chain wallets are dominated by **Electrum protocol**. LN-focused wallets spli
 
 ### Surfaces satd should expose, ranked by leverage
 
-1. **Electrum protocol server.** Largest wallet install base by far. Native implementation in-tree, sharing satd's chainstate (see Part 2 §4 for architecture and §4a for implementation strategy). Unlocks BlueWallet, Nunchuk, Sparrow, Electrum, and most hardware-wallet coordinators in one move.
-2. **Esplora REST API.** Compatible with `blockstream.info` / `mempool.space` endpoints. Native implementation, shares the same address-history index as the Electrum server. Unlocks BDK-based wallets and Mutiny-alikes.
-3. **BIP 157/158 P2P service.** Near-free as part of being a well-behaved Bitcoin node — `getcfilters` / `getcfheaders` / `getcfcheckpt` over standard P2P. Zeus-embedded / Blixt users can `addpeer` our .onion. Low incremental cost; covers the LN-focused on-device validation niche.
-4. **Bitcoin Core-compatible JSON-RPC** (already implemented). Protect wire-format compatibility going forward so Sparrow desktop, BTCPay, legacy scripts, and integrations "just work."
+1. **Electrum protocol server.** ✅ Shipped (`electrum-proto` crate; `--electrum=1`). Largest wallet install base by far. Native implementation in-tree, sharing satd's chainstate (see Part 2 §4 for architecture and §4a for implementation strategy). Unlocks BlueWallet, Nunchuk, Sparrow, Electrum, and most hardware-wallet coordinators in one move.
+2. **Esplora REST API.** ✅ Shipped (`esplora-handlers` crate; `--esplora=1`, on by default on loopback). Wire-shape parity with `blockstream.info` / `mempool.space` for the implemented endpoint set. Shares the address-history index with the Electrum server. Unlocks BDK-based wallets and Mutiny-alikes.
+3. **BIP 157/158 P2P service.** ✅ Shipped (`node-filter-index` crate; `--blockfilterindex=basic --peerblockfilters=1`). `getcfilters` / `getcfheaders` / `getcfcheckpt` over standard P2P. Zeus-embedded / Blixt users can `addpeer` our .onion. Covers the LN-focused on-device validation niche.
+4. **Bitcoin Core-compatible JSON-RPC** ✅ Shipped (80 methods). Protected by `STABILITY_POLICY.md` Tier 1 so Sparrow desktop, BTCPay, NBXplorer, and legacy scripts "just work."
 5. **LND-compatible gRPC/REST** *(deferred)*. Would let Zeus / other LND-aware wallets treat satd as "my remote LND." Large surface; only worth it if we decide to go LN-first.
 
 ### Cross-cutting capabilities (enabled across multiple surfaces)
@@ -95,7 +95,7 @@ satd is as drop-in as Bitcoin Core for Umbrel, Start9 / StartOS, RaspiBlitz, MyN
 
 ### 4. Wallet-server protocols (Electrum + Esplora) — architecture
 
-Both protocols ship in v1 as **native subsystems inside the satd binary**, gated by feature flags. The architectural story — and the headline differentiator over the bitcoind + electrs status quo — is that **Electrum and Esplora are query layers over satd's chainstate, not a separate process maintaining a parallel index**.
+Both protocols ship as **native subsystems inside the satd binary**, gated by runtime flags (`--electrum=1`, `--esplora=1`). The `block-filter-index` Cargo feature additionally allows compiling out the BIP 158 codec entirely for a consensus-only build. The architectural story — and the headline differentiator over the bitcoind + electrs status quo — is that **Electrum and Esplora are query layers over satd's chainstate, not a separate process maintaining a parallel index**.
 
 #### Why native + shared chainstate, not bundled electrs
 
@@ -157,15 +157,15 @@ Build the code as library crates so binary count is a packaging decision, not an
 
 Future companion binaries (`sat-electrum`, `sat-esplora` per §4 above) reuse the same library crates with thin `main.rs` shells.
 
-#### Effort estimate
+#### Effort estimate (historical, for reference)
 
-Roughly comparable to a milestone, parallelizable across the two protocols once the index lands:
+The pre-implementation estimate, recorded for posterity:
 
-- **Address-history index** (`node-index` crate): ~3-5 weeks. Column-family layout, IBD-time backfill, online maintenance on connect / disconnect, reorg correctness, mempool tracking. Real consensus-adjacent infrastructure that needs the same shadow-validation rigor as block storage.
+- **Address-history index** (`node-index` crate): ~3-5 weeks. Column-family layout, IBD-time backfill, online maintenance on connect / disconnect, reorg correctness, mempool tracking.
 - **Esplora REST** (native, `esplora-handlers` crate): ~4-8 weeks on top of the index.
 - **Electrum** (vendored protocol code, `electrum-proto` crate): ~3-5 weeks of vendoring + adaptation, parallelizable with Esplora.
 
-Total: ~10-15 weeks for both protocols, much of it parallelizable. Compares favorably to ~12-16 weeks for full Electrum reimplementation alone.
+Both protocols and the index landed in the timeframe estimated. The address-history index design is captured in `ADDRESS_INDEX.md`; both protocol surfaces are documented in `OPERATOR_ERGONOMICS.md` and `docs/api/esplora.md`.
 
 #### Alternatives considered and rejected
 
@@ -204,25 +204,30 @@ Six items to gate the first packager-friendly tag on:
 
 ## Sequencing notes
 
-Rough dependency order (not a milestone plan — only what blocks what):
+Rough dependency order. Items 2-4 and 6 have shipped; 1 and 5 are partial; 7-8 remain.
 
-1. **AssumeUTXO** (already planned) — unlocks realistic Pi deployment.
-2. **Address-history index** (`node-index` crate) — load-bearing prerequisite for both Electrum and Esplora. Updated inside `connect_block` / `disconnect_block` for atomic reorg consistency.
-3. **Esplora REST** (native handlers over the index) — BDK + Mutiny ecosystem. Smaller protocol surface than Electrum; suitable to own end-to-end.
-4. **Electrum protocol** (vendored protocol code over the same index) — BlueWallet, Nunchuk, Sparrow, hardware-wallet coordinator ecosystem. Parallelizable with Esplora.
-5. **Packager-ready gate items** — infrastructure every integration rides on.
-6. **BIP 157/158 P2P service** — general Bitcoin-network good citizen, alternate path for embedded-Neutrino mobile wallets (Zeus-embedded, Blixt).
-7. **Silent Payments index + push notifications** — advanced mobile-specific capabilities. The SP index rides on the same scan-every-output infrastructure as the address-history index.
+1. **AssumeUTXO** *(partial)* — `loadtxoutset` and the snapshot-validation pipeline are wired; `--fast-start` (one-flag UX with embedded snapshot hash) is still future work. Already unlocks realistic Pi deployment for operators willing to fetch a snapshot manually.
+2. **Address-history index** ✅ shipped — `node-index` crate; updated inside `connect_block` / `disconnect_block` for atomic reorg consistency.
+3. **Esplora REST** ✅ shipped — `esplora-handlers` crate; on by default on loopback.
+4. **Electrum protocol** ✅ shipped — `electrum-proto` crate; vendored protocol code from `romanz/electrs` (MIT) over the address-index trait surface.
+5. **Packager-ready gate items** *(partial)* — `/health`, `/readyz`, `/metrics`, structured-JSON logs, profile presets, persistent reorg log + webhook, events bus, MCP server are shipped. Multi-arch Docker images, signed tarballs, reproducible builds, systemd unit, and `docs/PACKAGING.md` are still future work — see `STABILITY_POLICY.md` for the canary-CI commitments that gate the first packager-friendly tag.
+6. **BIP 157/158 P2P service** ✅ shipped — `node-filter-index` crate + `getcfilters` / `getcfheaders` / `getcfcheckpt` arms in `node/src/net/manager.rs`; deferred backfill via `backfillindex blockfilter`.
+7. **Silent Payments index + push notifications** *(deferred)* — advanced mobile-specific capabilities. The SP index rides on the same scan-every-output infrastructure as the address-history index.
 8. *(Deferred)* **LND-compatible gRPC** if LN focus becomes a priority.
 
 ---
 
 ## Open questions
 
-- Address-history index column-family layout — single CF keyed by `(scripthash, height, txid_prefix)` vs. romanz's three-CF (`funding`, `spending`, `txid`) split vs. Blockstream's bincode-row layout. Tradeoffs: lookup latency, write amplification, reorg-undo simplicity.
-- Address index opt-in vs. on-by-default — disk overhead is non-trivial on Pi deployments. Behind `-index=address` flag, or always-on when the relevant feature flag is compiled in?
-- AssumeUTXO interaction with the address-history index — does AssumeUTXO bootstrap the index too, or do users accept a post-AssumeUTXO backfill before Electrum / Esplora become useful?
-- Signed AssumeUTXO snapshot distribution — signing key policy, CDN choice, update cadence.
+Resolved (kept here for traceability; the resolution is captured in code or in `ADDRESS_INDEX.md`):
+
+- ~~Address-history index column-family layout.~~ **Resolved**: two CFs (`addr_funding`, `addr_spending`) keyed by `(scripthash[32], height_be[4], txid[32], vout/vin_be[4])`. See `ADDRESS_INDEX.md` §"Schema".
+- ~~Address index opt-in vs. on-by-default.~~ **Resolved**: on by default (`--addressindex=1`); opt out with `--addressindex=0`. Esplora and Electrum auto-require it.
+- ~~AssumeUTXO interaction with the address-history index.~~ **Resolved**: deferred opt-in backfill via `backfillindex address` (and `backfillindex blockfilter` for the BIP 158 index). Operator triggers when convenient; node remains usable with partial history.
+
+Open:
+
+- Signed AssumeUTXO snapshot distribution — signing key policy, CDN choice, update cadence. Tied to `--fast-start` UX (Tier 2 #10 in `OPERATOR_ERGONOMICS.md`).
 - Do we sponsor or upstream satd-specific presets to an existing mobile wallet (Nunchuk, BlueWallet) vs. being a pure server?
 - Non-Tor cloud-accessible deployment path (HTTPS reverse proxy, Tailscale, mutual-TLS) — do we support it or intentionally de-emphasize in favor of Tor-first?
 - Silent Payments index: built on top of the address-history index infrastructure, or as a parallel index? (Likely the former, given they share the same scan-every-output shape.)

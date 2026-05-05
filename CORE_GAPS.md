@@ -4,7 +4,7 @@ This document catalogs known gaps between satd and Bitcoin Core, prioritized by
 severity. Wallet functionality is intentionally omitted (out of scope — Epoch
 uses external wallets).
 
-Last updated: 2026-03-18
+Last updated: 2026-05-05
 
 ---
 
@@ -110,8 +110,9 @@ chain tip is deep enough. Pruned blocks return appropriate errors from RPCs.
 
 ### 16. ~~No transaction index (-txindex)~~ — FIXED
 
-`-txindex` flag enables txid→block_hash lookup stored in redb. `getrawtransaction`
-works without a `blockhash` parameter when txindex is enabled.
+`-txindex` flag enables txid→block_hash lookup stored in RocksDB (CF
+`tx_index`). `getrawtransaction` works without a `blockhash` parameter when
+txindex is enabled.
 
 ### 17. ~~No reindex support (-reindex, -reindex-chainstate)~~ — FIXED
 
@@ -182,10 +183,82 @@ messages are rejected during deserialization.
 
 ## Additional Completions (not in original gap list)
 
-### A1. ~~redb storage migration~~ — DONE
+### A1. ~~Storage backend migration~~ — DONE
 
-Storage backend migrated from RocksDB to redb (pure Rust). All column families
-mapped to redb tables. No external C++ dependencies for storage.
+The original Phase 1 plan started on a pure-Rust embedded KV store; the
+chainstate is now on **RocksDB** (`rocksdb = 0.24`, zstd + lz4 compression
+enabled). RAII write-mode guard with fail-closed durability transitions
+(PR #56), jemalloc on the daemon, and the BulkLoad / Durable WAL flip
+during IBD live in `node/src/storage/rocksdb_store.rs`. No `redb`
+runtime dependency remains; legacy `chainstate.redb` paths are detected
+on startup and the daemon refuses to start with a migration message
+(`satd/src/main.rs:156`).
+
+### A2. ~~Address-history index~~ — DONE
+
+`node-index` crate provides per-scripthash funding + spending CFs over
+the same RocksDB instance, updated atomically with `connect_block` /
+`disconnect_block`. Powers the native Esplora REST and Electrum protocol
+servers. Mempool variant in-memory; subscription registry per-scripthash;
+deferred AssumeUTXO backfill via `backfillindex address`. See
+`ADDRESS_INDEX.md`.
+
+### A3. ~~Esplora REST server~~ — DONE
+
+`esplora-handlers` crate; on by default on `127.0.0.1:3000`; wire-shape
+parity with blockstream.info / mempool.space within the implemented
+endpoint set. Cookie + userpass auth; CORS; SSE live updates. Esplora
+requires `--addressindex=1` and `--txindex=1` (auto-enforced). See
+`docs/api/esplora.md`.
+
+### A4. ~~Electrum protocol server~~ — DONE
+
+`electrum-proto` crate; vendored protocol code from `romanz/electrs`
+(MIT) over our own `AddressIndex` trait. Plain TCP + optional TLS;
+JSON-RPC batches; full v1.4.5 method set. `--electrum=1` enables;
+loopback default. See `OPERATOR_ERGONOMICS.md`.
+
+### A5. ~~BIP 157/158 compact block filters~~ — DONE
+
+`node-filter-index` crate (BIP 158 codec) + `node/src/index/filter`
+(emission, backfill, P2P service). Atomic `connect_block` /
+`disconnect_block` writes; chained filter headers; deferred backfill
+via `backfillindex blockfilter`. P2P service advertises
+`NODE_COMPACT_FILTERS` (bit 6) via `--peerblockfilters=1` and answers
+`getcfilters` / `getcfheaders` / `getcfcheckpt`.
+
+### A6. ~~Mempool subscription stream~~ — DONE
+
+`subscribemempool` JSON-RPC WS subscription emitting `enter` /
+`leave_confirmed` / `leave_evicted` (with `reason: full_pool | expiry`)
+/ `leave_replaced` (with `replacing_txid`). Bulk `getmempoolentry`,
+`getmempoolhistory` ring buffer.
+
+### A7. ~~Persistent reorg log + webhook~~ — DONE
+
+JSONL append-only log at `$datadir/reorg.log`; in-memory 256-record
+ring; `getreorghistory` RPC; optional `--reorg-webhook=<url>` HTTP POST
+with `--reorg-webhook-secret=<secret>` HMAC-SHA256 signature.
+
+### A8. ~~Ops-surface endpoints~~ — DONE
+
+Prometheus `/metrics`, `/healthz`, `/readyz` on `--metricsbind`. Stable
+metric schema (see `node/src/metrics.rs`). Structured-JSON tracing
+spans (`--log-format=json`). `--profile=<preset>` config presets +
+`getconfig` RPC.
+
+### A9. ~~Events bus (gRPC + ZMQ frames)~~ — DONE
+
+`satd-events` crate with gRPC server and ZMQ publisher sinks for
+chain + mempool envelopes. Edge-identity + heartbeat. Distinct from
+Bitcoin Core's `-zmqpub*` topic-pub model (we ship a structured event
+envelope, not raw block / tx topics).
+
+### A10. ~~MCP server~~ — DONE
+
+`satd-mcp` crate exposes ops-surface RPCs as Model Context Protocol
+tools. stdio transport (`--mcp-stdio`) + streamable-HTTP transport
+(`--mcp-port`).
 
 ---
 
@@ -196,8 +269,14 @@ mapped to redb tables. No external C++ dependencies for storage.
 | **P0** | 6 | 6 | 0 | 0 | All consensus-critical gaps closed |
 | **P1** | 8 | 8 | 0 | 0 | All reliability gaps closed |
 | **P2** | 11 | 11 | 0 | 0 | All gaps closed |
-| **Total** | 25 | 25 | 0 | 0 | |
+| **Beyond Core** | 10 | 10 | 0 | 0 | satd-specific surfaces |
+| **Total** | 35 | 35 | 0 | 0 | |
 
-**All 25 gaps are now resolved.** satd is a fully functional Bitcoin Core-compatible
-node with 77/77 RPCs, complete P2P protocol support, and configurable operation.
-Intentional exclusions: legacy wallet, BIP 37 bloom filters, SOCKS5 proxy, ZMQ.
+All 25 original gaps remain resolved; A1–A10 are surfaces beyond Core
+parity that satd ships natively. satd serves wallets and operator tooling
+out of one binary that Core requires `bitcoind + electrs + esplora +
+prometheus-exporter + nginx` to cover.
+
+Intentional exclusions: legacy (BDB) wallet, BIP 37 bloom filters,
+SOCKS5 proxy, Bitcoin Core-style `-zmqpub*` raw-topic publication
+(satd ships a structured event envelope via `satd-events` instead).

@@ -16,8 +16,8 @@ Minimum 4-release deprecation cycle. Never removed without a resurrection flag.
 
 - Bitcoin Core-compatible JSON-RPC wire shape: method names, response field names + types, error codes, pagination semantics.
 - P2P wire protocol (standard Bitcoin messages — any satd-specific messages are Tier 2 unless explicitly promoted).
-- Electrum protocol server semantics (once `sat-electrum` ships).
-- Esplora REST paths and response shapes (once `sat-esplora` ships).
+- Electrum protocol server semantics (the in-process server gated by `--electrum=1`; `electrum-proto` crate). Includes wire-protocol method shapes, subscription notification shapes, and TLS option semantics.
+- Esplora REST paths and response shapes (the in-process server gated by `--esplora=1`; `esplora-handlers` crate). Includes route paths, JSON shapes, SSE event names + payloads, and auth modes.
 - CLI flag names and default values (`-datadir`, `-prune`, `-txindex`, etc.).
 - `bitcoin.conf` / `satd.conf` key names and defaults.
 - On-disk directory layout names (`blocks/`, `chainstate/`, `indexes/`).
@@ -109,8 +109,8 @@ Mandatory canaries:
 - **BTCPayServer**: boot `btcpayserver/btcpayserver` with satd as the Bitcoin backend; run their `dockerfile-deps` entrypoint; verify `/api/v1/server/info` responds healthy.
 - **NBXplorer**: boot against satd; index recent regtest blocks; verify callback delivery.
 - **Umbrel app**: install the satd Umbrel app on an Umbrel dev image; verify the dashboard reports the node as healthy.
-- **Electrum-personality canary** (once `sat-electrum` exists): run Electrum client test suite against satd's Electrum endpoint.
-- **Esplora canary** (once `sat-esplora` exists): run BDK's Esplora integration tests against satd's Esplora endpoint.
+- **Electrum-personality canary**: boot satd with `--electrum=1`; run an Electrum-client smoke suite (BlueWallet, Sparrow, or Electrum desktop in headless mode) against the endpoint; verify `server.version` handshake, `blockchain.scripthash.subscribe` notifications on a regtest mining tick, and `blockchain.transaction.broadcast` round-trip.
+- **Esplora canary**: boot satd with `--esplora=1`; run BDK's Esplora integration tests against the endpoint; verify wire-shape parity for the implemented endpoint set.
 
 The canary is not advisory. A failing canary blocks the RC until either the downstream is patched with our active support, or the breaking change is reverted. The canary matrix is versioned and its failures are archived with each RC.
 
