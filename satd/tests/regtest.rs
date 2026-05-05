@@ -8523,7 +8523,6 @@ fn test_filter_backfill_tail_catchup_after_concurrent_live_block() {
     let _ = std::fs::remove_dir_all(&datadir);
 }
 
-
 // ============================================================================
 // BIP 157 P2P service integration tests (PR-4 of the BIP 157/158 stack)
 // ============================================================================
