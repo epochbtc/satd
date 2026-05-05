@@ -57,8 +57,11 @@ jobs:
             os: ubuntu-24.04
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
-          - target: x86_64-apple-darwin
-            os: macos-13
+          # Apple Silicon only on macOS. macos-13 (Intel) is being
+          # deprecated by GitHub, the hosted-runner queue has multi-hour
+          # wait times, and Apple Silicon is the targeted macOS surface
+          # for satd. If a downstream packager needs an x86_64 darwin
+          # build, they can cross-build from an arm64 darwin host.
           - target: aarch64-apple-darwin
             os: macos-14
 
@@ -220,9 +223,24 @@ jobs:
           retention-days: 14
 
 
-  build-docker:
-    name: docker / multi-arch
-    runs-on: ubuntu-24.04
+  # Per-platform Docker build on a native runner. QEMU emulation of
+  # arm64 on amd64 (the previous design) takes 2+ hours cold for this
+  # workspace because rocksdb's C++ build is huge. With native runners
+  # each platform compiles in 5-15 min. The merge job below stitches
+  # the per-arch images into a single multi-arch manifest.
+  build-docker-platform:
+    name: docker / ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            os: ubuntu-24.04
+            slug: amd64
+          - platform: linux/arm64
+            os: ubuntu-24.04-arm
+            slug: arm64
 
     permissions:
       contents: read
@@ -232,21 +250,23 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # QEMU lets the amd64 runner cross-build linux/arm64 layers in the
-      # same job. Slow (~25-40 min cold for arm64), but simple. Once we
-      # have native ARM Linux runners wired into a matrix-and-merge job,
-      # this becomes ~10 min. Tracked for a follow-up.
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: arm64
-
       - name: Set up Docker buildx
         uses: docker/setup-buildx-action@v3
 
-      # Authentication for GHCR. On a PR we still want to exercise the
-      # build, just not the push — so the login step itself is gated
-      # on tag-trigger to keep it skippable for forks (no token).
+      - name: Compute image tags + labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # `bake-target=metadata` is irrelevant here; we just want the
+          # OCI labels. The merge job below pulls the actual tags from
+          # its own metadata-action invocation — per-platform images
+          # are referenced only by digest.
+          labels: |
+            org.opencontainers.image.title=satd
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.licenses=TBD
+
       - name: Log in to GHCR
         if: startsWith(github.ref, 'refs/tags/')
         uses: docker/login-action@v3
@@ -255,7 +275,85 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Compute image tags + labels
+      - name: Build (PR / dispatch — no push)
+        if: ${{ ! startsWith(github.ref, 'refs/tags/') }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ matrix.platform }}
+          push: false
+          load: false
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.slug }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.slug }}
+          provenance: false
+
+      - name: Build and push by digest (tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ matrix.platform }}
+          # push-by-digest avoids racing the manifest list with the
+          # other arch — each per-arch build pushes to GHCR by digest
+          # only (no tag), and the merge job creates the tagged
+          # manifest list referencing both digests.
+          outputs: |
+            type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.slug }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.slug }}
+          provenance: false
+
+      - name: Export digest
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          mkdir -p /tmp/digests
+          digest='${{ steps.build.outputs.digest }}'
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.slug }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+
+  merge-docker:
+    name: docker / merge manifest
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build-docker-platform]
+    runs-on: ubuntu-24.04
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Set up Docker buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute manifest tags
         id: meta
         uses: docker/metadata-action@v5
         with:
@@ -263,31 +361,27 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/') }}
-            type=ref,event=pr
-          labels: |
-            org.opencontainers.image.title=satd
-            org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.licenses=TBD
+            type=raw,value=latest
 
-      - name: Build and (conditionally) push
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: ${{ startsWith(github.ref, 'refs/tags/') }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          provenance: false
+      - name: Create + push manifest list
+        working-directory: /tmp/digests
+        run: |
+          set -euo pipefail
+          tags=$(jq -cr '.tags | map("--tag " + .) | join(" ")' <<< '${{ steps.meta.outputs.json }}')
+          digests=$(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
+          docker buildx imagetools create $tags $digests
+
+      - name: Inspect manifest
+        run: |
+          set -euo pipefail
+          tag=$(jq -cr '.tags[0]' <<< '${{ steps.meta.outputs.json }}')
+          docker buildx imagetools inspect "$tag"
 
 
   release:
     name: GitHub Release
     if: startsWith(github.ref, 'refs/tags/')
-    needs: [build-tarball, build-docker]
+    needs: [build-tarball, merge-docker]
     runs-on: ubuntu-24.04
 
     permissions:
