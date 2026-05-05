@@ -9073,6 +9073,171 @@ fn test_p2p_silent_drop_invalid_filter_type() {
     let _ = std::fs::remove_dir_all(&datadir);
 }
 
+/// Regression test for H3 (review 2026-05-04): a max-size
+/// `getcfilters` request that produces 1000 `CFilter` responses must
+/// be delivered fully. Before the H3 fix the per-peer outbound mpsc
+/// channel was 256 slots and the handler used best-effort `try_send`,
+/// which silently dropped the tail of any 257+ message response.
+#[test]
+fn test_p2p_getcfilters_max_size_response_not_truncated() {
+    use bitcoin::hashes::Hash as _;
+    use bitcoin::p2p::message_filter::GetCFilters;
+
+    let p2p_port = find_available_port();
+    let rpcport = find_available_port();
+    let datadir = std::env::temp_dir().join(format!(
+        "satd-p2p-cfilters-1000-test-{}",
+        rpcport
+    ));
+    let _ = std::fs::create_dir_all(&datadir);
+    let mut node = TestNode::start_with_datadir(
+        &datadir,
+        rpcport,
+        &[
+            "--blockfilterindex=basic",
+            "--peerblockfilters=1",
+            &format!("--port={}", p2p_port),
+        ],
+    );
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    node.rpc_call_with_params(
+        "generatetoaddress",
+        vec![serde_json::json!(1000), serde_json::json!(addr)],
+    )
+    .expect("rpc");
+
+    let bci = node.rpc_call("getblockchaininfo").expect("rpc");
+    let stop_hex = bci["result"]["bestblockhash"]
+        .as_str()
+        .expect("bestblockhash")
+        .to_string();
+    let mut consensus =
+        <[u8; 32]>::try_from(hex::decode(&stop_hex).expect("hex").as_slice())
+            .expect("32 bytes");
+    consensus.reverse();
+    let stop_hash = bitcoin::BlockHash::from_raw_hash(
+        bitcoin::hashes::sha256d::Hash::from_byte_array(consensus),
+    );
+
+    let mut client = cf_client::CFilterClient::connect(p2p_port);
+    // Range 1..=1000 = 1000 messages — exactly at the cap (the rule
+    // is `stop - start < 1000`, so `1000 - 1 = 999`).
+    client.send_get_cfilters(GetCFilters {
+        filter_type: 0,
+        start_height: 1,
+        stop_hash,
+    });
+    let cfilters = client.recv_cfilters(1000, Duration::from_secs(60));
+    assert_eq!(
+        cfilters.len(),
+        1000,
+        "expected 1000 CFilter responses delivered without truncation, got {}",
+        cfilters.len()
+    );
+    node.stop();
+    let _ = std::fs::remove_dir_all(&datadir);
+}
+
+/// Regression test for M1 (review 2026-05-04): `getcfheaders` accepts
+/// up to 2000 headers per Bitcoin Core's
+/// `MAX_GETCFHEADERS_SIZE = 2000`. Before the M1 fix satd reused the
+/// `getcfilters` 1000 cap and silently dropped 1001..=2000 ranges.
+#[test]
+fn test_p2p_getcfheaders_accepts_2000_headers() {
+    use bitcoin::hashes::Hash as _;
+    use bitcoin::p2p::message_filter::GetCFHeaders;
+
+    let p2p_port = find_available_port();
+    let rpcport = find_available_port();
+    let datadir = std::env::temp_dir().join(format!(
+        "satd-p2p-cfheaders-2000-test-{}",
+        rpcport
+    ));
+    let _ = std::fs::create_dir_all(&datadir);
+    let mut node = TestNode::start_with_datadir(
+        &datadir,
+        rpcport,
+        &[
+            "--blockfilterindex=basic",
+            "--peerblockfilters=1",
+            &format!("--port={}", p2p_port),
+        ],
+    );
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    node.rpc_call_with_params(
+        "generatetoaddress",
+        vec![serde_json::json!(2010), serde_json::json!(addr)],
+    )
+    .expect("rpc");
+
+    let bci = node.rpc_call("getblockchaininfo").expect("rpc");
+    let tip_hex = bci["result"]["bestblockhash"]
+        .as_str()
+        .expect("bestblockhash")
+        .to_string();
+    let mut consensus =
+        <[u8; 32]>::try_from(hex::decode(&tip_hex).expect("hex").as_slice())
+            .expect("32 bytes");
+    consensus.reverse();
+    let tip_hash = bitcoin::BlockHash::from_raw_hash(
+        bitcoin::hashes::sha256d::Hash::from_byte_array(consensus),
+    );
+    // Use getblockhash for stop at height 2000 specifically — exactly
+    // 2000 headers in the range 1..=2000 (count == 2000, allowed).
+    let stop_hex_2000 = node
+        .rpc_call_with_params("getblockhash", vec![serde_json::json!(2000)])
+        .unwrap()["result"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut consensus2k =
+        <[u8; 32]>::try_from(hex::decode(&stop_hex_2000).expect("hex").as_slice())
+            .expect("32 bytes");
+    consensus2k.reverse();
+    let stop_hash_2000 = bitcoin::BlockHash::from_raw_hash(
+        bitcoin::hashes::sha256d::Hash::from_byte_array(consensus2k),
+    );
+
+    let mut client = cf_client::CFilterClient::connect(p2p_port);
+    // 2000 headers = at the cap. Inclusive count rule: `stop - start <
+    // 2000` means start=1, stop=2000 yields 2000 entries — allowed.
+    client.send_get_cfheaders(GetCFHeaders {
+        filter_type: 0,
+        start_height: 1,
+        stop_hash: stop_hash_2000,
+    });
+    let resp = client
+        .recv_cfheaders(Duration::from_secs(30))
+        .expect("CFHeaders response for 2000-header request");
+    assert_eq!(
+        resp.filter_hashes.len(),
+        2000,
+        "expected 2000 hashes, got {}",
+        resp.filter_hashes.len()
+    );
+
+    // 2001 headers must be silent-dropped (start=0, stop=2000 = 2001).
+    let stop_hex_genesis = node
+        .rpc_call_with_params("getblockhash", vec![serde_json::json!(0)])
+        .unwrap()["result"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut _consensus_g =
+        <[u8; 32]>::try_from(hex::decode(&stop_hex_genesis).expect("hex").as_slice())
+            .expect("32 bytes");
+    let _ = tip_hash; // suppress unused var warnings on the silent-drop path
+    client.send_get_cfheaders(GetCFHeaders {
+        filter_type: 0,
+        start_height: 0,
+        stop_hash: stop_hash_2000,
+    });
+    client.assert_silent(Duration::from_secs(2));
+
+    node.stop();
+    let _ = std::fs::remove_dir_all(&datadir);
+}
+
 #[test]
 fn test_p2p_silent_drop_oversized_range() {
     use bitcoin::hashes::Hash as _;

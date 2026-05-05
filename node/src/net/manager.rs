@@ -1977,6 +1977,7 @@ impl PeerManager {
     /// per-height responses, not a batched form).
     #[cfg(feature = "block-filter-index")]
     fn handle_get_cfilters(&self, id: PeerId, req: bitcoin::p2p::message_filter::GetCFilters) {
+        use crate::index::filter::lookups::MAX_GETCFILTERS_SIZE;
         use node_filter_index::FILTER_TYPE_BASIC;
         let bitcoin::p2p::message_filter::GetCFilters {
             filter_type,
@@ -1996,7 +1997,7 @@ impl PeerManager {
         if stop_height < start_height {
             return;
         }
-        if stop_height - start_height >= 1000 {
+        if stop_height - start_height >= MAX_GETCFILTERS_SIZE {
             return;
         }
         // Active-chain check: stop_hash must match the active chain at stop_height.
@@ -2007,22 +2008,45 @@ impl PeerManager {
         let Some(idx) = self.filter_index.get() else {
             return;
         };
-        for h in start_height..=stop_height {
-            let Some(block_hash) = self.chain_state.get_block_hash_by_height(h) else {
-                return;
-            };
-            let Ok(filter) = idx.filter_at(filter_type, h) else {
-                return;
-            };
-            self.send_to_peer(
-                id,
-                NetworkMessage::CFilter(bitcoin::p2p::message_filter::CFilter {
-                    filter_type,
-                    block_hash,
-                    filter,
-                }),
-            );
-        }
+        // Stream responses via an async task with backpressure. The
+        // 256-slot per-peer mpsc channel cannot fit a full
+        // 1000-message response; `try_send` would silently drop the
+        // tail (review 2026-05-04 H3). Spawn a task that holds the
+        // peer's `Sender` clone and `await`s each send so the slow-
+        // consumer/queue-full case naturally backpressures instead of
+        // truncating the protocol response.
+        let msg_tx = {
+            let peers = self.peers.read().unwrap();
+            peers.get(&id).map(|h| h.msg_tx.clone())
+        };
+        let Some(msg_tx) = msg_tx else {
+            return;
+        };
+        let chain_state = self.chain_state.clone();
+        let idx = idx.clone();
+        tokio::spawn(async move {
+            for h in start_height..=stop_height {
+                let Some(block_hash) = chain_state.get_block_hash_by_height(h) else {
+                    return;
+                };
+                let Ok(filter) = idx.filter_at(filter_type, h) else {
+                    return;
+                };
+                if msg_tx
+                    .send(NetworkMessage::CFilter(
+                        bitcoin::p2p::message_filter::CFilter {
+                            filter_type,
+                            block_hash,
+                            filter,
+                        },
+                    ))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
     }
 
     /// `getcfheaders` handler per BIP 157.
@@ -2033,6 +2057,7 @@ impl PeerManager {
     /// CF).
     #[cfg(feature = "block-filter-index")]
     fn handle_get_cfheaders(&self, id: PeerId, req: bitcoin::p2p::message_filter::GetCFHeaders) {
+        use crate::index::filter::lookups::MAX_GETCFHEADERS_SIZE;
         use bitcoin::bip158::FilterHash;
         use bitcoin::hashes::Hash;
         use node_filter_index::FILTER_TYPE_BASIC;
@@ -2051,7 +2076,9 @@ impl PeerManager {
         if stop_height < start_height {
             return;
         }
-        if stop_height - start_height >= 1000 {
+        // Bitcoin Core / BIP 157 cap getcfheaders at 2000, not the 1000
+        // that applies to getcfilters. Review 2026-05-04 M1.
+        if stop_height - start_height >= MAX_GETCFHEADERS_SIZE {
             return;
         }
         match self.chain_state.get_block_hash_by_height(stop_height) {
