@@ -530,10 +530,10 @@ filter headers the live `connect_block` emitted above
 > itself.*
 
 **Status (2026-05): Phase A and Phase B have landed.** satd's
-`--addressindex=1` (default on; see `ADDRESS_INDEX.md`) provides Phase A;
-the native Electrum protocol server in the `electrum-proto` crate
-provides Phase B. Operators enable it via `--electrum=1`, optional TLS
-via `--electrumtlsbind` + `--electrumtlscert`/`--electrumtlskey`.
+`--addressindex=1` (default on) provides Phase A; the native Electrum
+protocol server in the `electrum-proto` crate provides Phase B.
+Operators enable it via `--electrum=1`, optional TLS via
+`--electrumtlsbind` + `--electrumtlscert`/`--electrumtlskey`.
 
 ### Operator quick-start
 

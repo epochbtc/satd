@@ -136,8 +136,10 @@ Per-scripthash funding + spending history over the shared RocksDB.
 Atomic with `connect_block` / `disconnect_block`. Default-on
 (`--addressindex=1`); auto-required by Esplora and Electrum. Mempool
 variant in-memory; subscription registry per-scripthash; deferred
-AssumeUTXO backfill via `backfillindex address`. Design captured in
-`ADDRESS_INDEX.md`.
+AssumeUTXO backfill via `backfillindex address`. Two RocksDB column
+families (`addr_funding`, `addr_spending`) keyed by
+`(scripthash[32], height_be[4], txid[32], vout/vin_be[4])`. Source
+lives in `node-index/` and `node/src/index/address/`.
 
 Bitcoin Core deliberately stays out of address-indexing for scaling
 reasons. satd accepts the disk cost (~120-180 GB compressed at mainnet
@@ -361,7 +363,6 @@ this section will be updated when measurements are available.
 ## References
 
 - `STABILITY_POLICY.md` — Tier 1 / 2 / 3 stability contract.
-- `ADDRESS_INDEX.md` — design + integration of the address index.
 - `OPERATOR_ERGONOMICS.md` — operator flag matrix and tuning.
 - `ECOSYSTEM.md` — strategic direction for mobile + packaging.
 - `docs/api/esplora.md` — Esplora REST endpoint reference.

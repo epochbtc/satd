@@ -4301,8 +4301,9 @@ fn test_address_index_mempool_quiet_when_empty() {
 // ── Address-history index — backfill RPCs (M7) ────────────────────────
 
 /// `getindexinfo` returns the wrapping `{"address": {...}}` envelope
-/// expected by the spec (ADDRESS_INDEX.md §"Status reporting"):
-/// nested `{address: {synced, best_block_height, backfill: {...}}}`.
+/// with nested `{address: {synced, best_block_height, backfill: {...}}}`.
+/// The shape is constructed in `node/src/rpc/indexes.rs` and locked by
+/// `STABILITY_POLICY.md` Tier 2 so downstream tooling can rely on it.
 #[test]
 fn test_address_index_getindexinfo_shape() {
     let mut node = TestNode::start(&[]);

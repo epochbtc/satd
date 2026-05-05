@@ -1031,11 +1031,11 @@ mod tests {
 
     #[test]
     fn test_disconnect_emits_addr_funding_and_spending_removes() {
-        // M2: disconnect_block populates addr_funding_removes for every
+        // disconnect_block populates addr_funding_removes for every
         // output the block created and addr_spending_removes for every
-        // input it consumed. This is the deletion symmetry that
-        // ADDRESS_INDEX.md demands and which the tx_index path was
-        // missing pre-M2.
+        // input it consumed. The deletion symmetry mirrors the
+        // connect-block emission so the address index stays atomic
+        // with the chainstate across reorgs.
         let (store, outpoint, _coin) = make_test_store_with_coin(0, false);
         let block = make_block_spending(outpoint, 1, 2, 0xffff_ffff, 0);
         let block_hash = block.block_hash();

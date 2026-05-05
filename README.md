@@ -23,7 +23,7 @@ What's implemented today (non-exhaustive):
   v1.4.5 protocol. Plain TCP loopback default; expose via Tor.
 - **Address-history index** (`node-index`) — single RocksDB instance shared
   with chainstate, atomic with `connect_block` / `disconnect_block`. Powers
-  Esplora and Electrum. See `ADDRESS_INDEX.md`.
+  Esplora and Electrum. See `CORE_DIFFERENCES.md` §"Address-history index".
 - **BIP 157/158 compact block filters** (`node-filter-index`) — index +
   P2P service (`getcfilters` / `getcfheaders` / `getcfcheckpt`) for
   embedded-Neutrino mobile wallets (Zeus, Blixt, Mutiny). See
@@ -151,7 +151,6 @@ cargo clippy --all-features --all-targets -- -D warnings
 | `OPERATOR_ERGONOMICS.md` | Operator-facing flag matrix, tuning, every shipped surface. |
 | `STABILITY_POLICY.md` | Tiered stability contract; deprecation policy; canary CI. |
 | `ECOSYSTEM.md` | Mobile / packaging strategy; why native + shared chainstate. |
-| `ADDRESS_INDEX.md` | Address-history index design (column families, reorg, backfill). |
 | `docs/api/esplora.md` | Esplora REST endpoint reference + wire-shape gotchas. |
 
 ## License
