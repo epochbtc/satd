@@ -1,0 +1,28 @@
+.git
+.github
+target
+**/target
+**/*.rs.bk
+**/.DS_Store
+
+# Editor / tooling
+.idea
+.vscode
+.claude
+.cargo/config.local.toml
+
+# Ad-hoc local scratch (review docs, planning notes, etc.)
+*.md.bak
+SATD_*_REVIEW*.md
+satd-pr-*-review*.md
+SATD_ESPLORA_*.md
+SATD_ADDRESS_INDEX_*.md
+reviews/
+
+# Local data
+*.log
+logs/
+data/
+
+# Tests fixtures we don't need at build time
+**/regtest_*.tmp
