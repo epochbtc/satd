@@ -86,17 +86,22 @@ jobs:
             libssl-dev \
             pkg-config
 
-      # macOS: rocksdb-sys's bindgen step dlopen()s libclang.dylib at
-      # build-script time and can't find it without an explicit hint.
-      # The active Xcode's toolchain ships one at a stable path; expose
-      # it via LIBCLANG_PATH for every subsequent step in this job.
-      - name: Configure LIBCLANG_PATH (macOS)
+      # macOS: librocksdb-sys's build-script binary is linked against
+      # libclang.dylib at @rpath. dyld's search list includes
+      # /usr/local/lib, but no libclang ships there. Symlink Xcode's
+      # libclang.dylib into /usr/local/lib so the dyld lookup succeeds.
+      # LIBCLANG_PATH alone (a bindgen-only env var) does not help —
+      # this is a dynamic-loader path issue, not a bindgen one.
+      - name: Stage libclang for rocksdb-sys (macOS)
         if: runner.os == 'macOS'
         run: |
           set -euo pipefail
           xcode_dir="$(xcode-select -p)"
           libclang_dir="${xcode_dir}/Toolchains/XcodeDefault.xctoolchain/usr/lib"
           test -f "${libclang_dir}/libclang.dylib"
+          sudo mkdir -p /usr/local/lib
+          sudo ln -sf "${libclang_dir}/libclang.dylib" /usr/local/lib/libclang.dylib
+          # LIBCLANG_PATH is the bindgen-side hint; harmless to also set.
           echo "LIBCLANG_PATH=${libclang_dir}" >> "$GITHUB_ENV"
 
       - name: Install Rust toolchain
