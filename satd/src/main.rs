@@ -174,7 +174,13 @@ async fn main() {
     let coincache_mb = config.dbcache - rocksdb_cache_mb;
 
     let reindex = config.reindex || config.reindex_chainstate;
-    let store = match RocksDbStore::open(&net_datadir, config.txindex, rocksdb_cache_mb, reindex) {
+    let store = match RocksDbStore::open(
+        &net_datadir,
+        config.txindex,
+        rocksdb_cache_mb,
+        reindex,
+        config.max_open_files,
+    ) {
         // Round-1 review H2: tell the Store whether the address +
         // filter indexes are active so `write_batch_mode` can clear
         // the corresponding `*.complete` markers atomically with any
@@ -640,6 +646,7 @@ async fn main() {
         config.onion.clone(),
         config.prefetch_workers,
         config.max_ahead,
+        config.ibd_l0_pause_at,
     );
 
     // Wire the BIP 158 filter index into the peer manager so the BIP
@@ -1347,6 +1354,30 @@ async fn main() {
             "Adaptive dbcache enabled — cap set to max budget, adjusted from /proc/meminfo"
         );
     }
+
+    // Stall watchdog: dedicated OS thread that detects connector wedges
+    // and dumps thread states (and after a grace period, aborts so systemd
+    // restarts us). Deliberately not a tokio task — the wedge we are
+    // protecting against parks every tokio worker, so a tokio-scheduled
+    // watchdog would freeze with the rest.
+    node::stall_watchdog::spawn_stall_watchdog(
+        chain_state.clone(),
+        std::time::Duration::from_secs(config.stall_watchdog_secs),
+        std::time::Duration::from_secs(config.stall_abort_secs),
+        shutdown_rx.clone(),
+    );
+
+    // Periodic forced-compaction thread: backstop for RocksDB compaction
+    // falling behind. Forces a chainstate compaction when the L0 file count
+    // stays above the configured threshold for a full interval. Synchronous
+    // and long-running, so it gets its own OS thread rather than a tokio
+    // worker.
+    node::stall_watchdog::spawn_periodic_compactor(
+        chain_state.clone(),
+        std::time::Duration::from_secs(config.compaction_interval_secs),
+        config.compaction_l0_at,
+        shutdown_rx.clone(),
+    );
 
     // Wait for shutdown signal (stop RPC, Ctrl+C, or SIGTERM)
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())

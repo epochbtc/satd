@@ -61,7 +61,7 @@ mod tests {
 
     fn fresh_store() -> (RocksSpendIndex, TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(RocksDbStore::open(dir.path(), false, 16, false).unwrap())
+        let store = Arc::new(RocksDbStore::open(dir.path(), false, 16, false, -1).unwrap())
             as Arc<dyn Store>;
         let cfg = Arc::new(AddressIndexConfig {
             enabled: true,

@@ -1,7 +1,7 @@
 use bitcoin::consensus::serialize;
 use bitcoin::{Block, BlockHash, Network, OutPoint};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 
 use crate::chain::checkpoints::{self, Checkpoint};
@@ -200,6 +200,13 @@ pub struct ChainState {
     chain_event_tx: std::sync::Mutex<
         Option<tokio::sync::broadcast::Sender<crate::chain::events::ChainEvent>>,
     >,
+    /// Lock-free monotonic counter bumped on every successful connect.
+    /// Read by the stall watchdog to detect connector wedges without
+    /// taking the `tip` RwLock, which is precisely the lock the wedge
+    /// might be holding. The watchdog observes a stalled value if and
+    /// only if the connect path stopped completing — independent of
+    /// what state the rest of the runtime is in.
+    connect_heartbeat: AtomicU64,
 }
 
 impl ChainState {
@@ -280,6 +287,7 @@ impl ChainState {
                     warnings: std::sync::Arc::new(crate::warnings::NodeWarnings::new()),
                     mempool: std::sync::OnceLock::new(),
                     chain_event_tx: std::sync::Mutex::new(None),
+                    connect_heartbeat: AtomicU64::new(0),
                 });
             }
 
@@ -333,6 +341,7 @@ impl ChainState {
             warnings: std::sync::Arc::new(crate::warnings::NodeWarnings::new()),
             mempool: std::sync::OnceLock::new(),
             chain_event_tx: std::sync::Mutex::new(None),
+            connect_heartbeat: AtomicU64::new(0),
         })
     }
 
@@ -436,6 +445,43 @@ impl ChainState {
     /// Total coin cache size (dirty + clean entries).
     pub fn cache_size(&self) -> usize {
         self.store.cache_size()
+    }
+
+    /// Live count of L0 SST files in the chainstate column family. The IBD
+    /// connector reads this between blocks to decide whether to pause and
+    /// let RocksDB compaction catch up.
+    pub fn chainstate_l0_files(&self) -> u64 {
+        self.store.chainstate_l0_files()
+    }
+
+    /// RocksDB's estimate of pending compaction work, in bytes, for the
+    /// chainstate column family. Used by the periodic compactor and in
+    /// stall-watchdog diagnostics.
+    pub fn chainstate_pending_compaction_bytes(&self) -> u64 {
+        self.store.chainstate_pending_compaction_bytes()
+    }
+
+    /// Force a synchronous full-range compaction of the chainstate column
+    /// family. Drains the dirty overlay first so the compaction includes
+    /// pending writes. Long-running: returns only when RocksDB completes
+    /// the compaction.
+    pub fn compact_chainstate(&self) -> Result<(), StoreError> {
+        self.store.compact_chainstate()
+    }
+
+    /// Read the lock-free connect-heartbeat counter. Bumped on every
+    /// successful connector iteration; read by the stall watchdog as its
+    /// progress signal. Value is monotonic but not interpretable as a
+    /// height — only its delta over time matters.
+    pub fn connect_heartbeat(&self) -> u64 {
+        self.connect_heartbeat.load(Ordering::Relaxed)
+    }
+
+    /// Bump the connect-heartbeat counter. Called by the connector after
+    /// each successful block connect (in both IBD and steady-state paths)
+    /// so the watchdog has a lock-free way to observe forward progress.
+    pub fn bump_connect_heartbeat(&self) {
+        self.connect_heartbeat.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn get_block_index(&self, hash: &BlockHash) -> Option<BlockIndexEntry> {

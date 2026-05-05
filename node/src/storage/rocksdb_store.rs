@@ -160,6 +160,7 @@ impl RocksDbStore {
         txindex: bool,
         cache_mb: usize,
         reindex: bool,
+        max_open_files: i32,
     ) -> Result<Self, StoreError> {
         let db_path = path.join("chainstate");
 
@@ -181,6 +182,16 @@ impl RocksDbStore {
         db_opts.set_max_total_wal_size(256 * 1024 * 1024);
         db_opts.set_bytes_per_sync(1024 * 1024);
         db_opts.set_wal_bytes_per_sync(1024 * 1024);
+        // Bound the table reader cache. Without this, RocksDB defaults to
+        // -1 (keep every SST open for the lifetime of the DB), so a chain-
+        // state that has accumulated tens of thousands of SSTs during a
+        // compaction backlog will hold tens of thousands of fds and load
+        // every per-SST bloom/index block — the failure mode that wedged
+        // a 78-GB process during a mainnet IBD. A small positive cap
+        // forces RocksDB to evict cold SST handles and keeps the per-SST
+        // metadata footprint proportional to working-set size, not on-
+        // disk file count.
+        db_opts.set_max_open_files(max_open_files);
 
         let compression_per_level = [
             DBCompressionType::None, // L0
@@ -1157,6 +1168,42 @@ impl Store for RocksDbStore {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    fn chainstate_l0_files(&self) -> u64 {
+        let cf = self.cf(CF_COINS);
+        self.db
+            .property_int_value_cf(&cf, "rocksdb.num-files-at-level0")
+            .ok()
+            .flatten()
+            .unwrap_or(0)
+    }
+
+    fn chainstate_pending_compaction_bytes(&self) -> u64 {
+        let cf = self.cf(CF_COINS);
+        self.db
+            .property_int_value_cf(&cf, "rocksdb.estimate-pending-compaction-bytes")
+            .ok()
+            .flatten()
+            .unwrap_or(0)
+    }
+
+    fn compact_chainstate(&self) -> Result<(), StoreError> {
+        // Full-range manual compaction of the coins CF. Synchronous: returns
+        // once RocksDB finishes the compaction. With None/None bounds we
+        // sweep every level of the CF, which is what the periodic compactor
+        // wants when L0 has accumulated faster than the background scheduler
+        // can drain it. We deliberately do not pass `CompactOptions` to
+        // change exclusive_manual_compaction; the default (true) blocks
+        // automatic compactions on this CF for the duration, which is fine
+        // because we're forcing the work anyway.
+        let cf = self.cf(CF_COINS);
+        self.db
+            .compact_range_cf::<&[u8], &[u8]>(&cf, None, None);
+        // compact_range_cf is fire-and-wait in the FFI; the call returns
+        // only after compaction completes. There is no error channel from
+        // the C++ side here — failures surface via subsequent operations.
+        Ok(())
+    }
+
     fn get_undo(&self, hash: &BlockHash) -> Option<UndoData> {
         let cf = self.cf(CF_UNDO);
         let value = self.db.get_cf(&cf, hash_bytes(hash)).ok()??;
@@ -1763,7 +1810,7 @@ mod tests {
 
     fn temp_store(txindex: bool) -> (RocksDbStore, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let store = RocksDbStore::open(dir.path(), txindex, 16, false).unwrap();
+        let store = RocksDbStore::open(dir.path(), txindex, 16, false, -1).unwrap();
         (store, dir)
     }
 
@@ -2066,10 +2113,10 @@ mod tests {
         // existing datadir must not error and must keep the CFs.
         let dir = tempfile::tempdir().unwrap();
         {
-            let store = RocksDbStore::open(dir.path(), false, 16, false).unwrap();
+            let store = RocksDbStore::open(dir.path(), false, 16, false, -1).unwrap();
             let _af = store.cf(CF_ADDR_FUNDING);
         }
-        let store = RocksDbStore::open(dir.path(), false, 16, false).unwrap();
+        let store = RocksDbStore::open(dir.path(), false, 16, false, -1).unwrap();
         let _af = store.cf(CF_ADDR_FUNDING);
         let _as_ = store.cf(CF_ADDR_SPENDING);
     }
@@ -2228,7 +2275,7 @@ mod tests {
         {
             // First open: write a synthetic addr_spending row, then
             // delete the marker to simulate a pre-marker state.
-            let store = RocksDbStore::open(dir.path(), false, 16, false).unwrap();
+            let store = RocksDbStore::open(dir.path(), false, 16, false, -1).unwrap();
             let row = crate::index::address::AddrSpendingRow {
                 scripthash: [0x42; 32],
                 height: 1,
@@ -2247,7 +2294,7 @@ mod tests {
                 .delete_cf(&cf, OUTPOINT_SPEND_COMPLETE_KEY)
                 .unwrap();
         }
-        let store = RocksDbStore::open(dir.path(), false, 16, false).unwrap();
+        let store = RocksDbStore::open(dir.path(), false, 16, false, -1).unwrap();
         assert!(!store.outpoint_spend_complete());
     }
 
@@ -2258,12 +2305,12 @@ mod tests {
         // outpoint_spend rows. (Round-2 H6 contract.)
         let dir = tempfile::tempdir().unwrap();
         {
-            let store = RocksDbStore::open(dir.path(), false, 16, false).unwrap();
+            let store = RocksDbStore::open(dir.path(), false, 16, false, -1).unwrap();
             // Force the marker false via the helper; this is what
             // open() does when it detects a legacy datadir.
             store.write_outpoint_spend_complete(false).unwrap();
         }
-        let store = RocksDbStore::open(dir.path(), false, 16, false).unwrap();
+        let store = RocksDbStore::open(dir.path(), false, 16, false, -1).unwrap();
         assert!(!store.outpoint_spend_complete());
     }
 
@@ -2294,7 +2341,7 @@ mod tests {
         // address_index.complete marker was never stamped.
         let dir = tempfile::tempdir().unwrap();
         {
-            let store = RocksDbStore::open(dir.path(), false, 16, false).unwrap();
+            let store = RocksDbStore::open(dir.path(), false, 16, false, -1).unwrap();
             // Synthesize a block_index row by writing a synthetic
             // value directly into the CF. The legacy-detection path
             // only checks "any row in CF_BLOCK_INDEX", not the row
@@ -2306,7 +2353,7 @@ mod tests {
             let cf = store.cf(CF_METADATA);
             store.db.delete_cf(&cf, ADDRESS_INDEX_COMPLETE_KEY).unwrap();
         }
-        let store = RocksDbStore::open(dir.path(), false, 16, false).unwrap();
+        let store = RocksDbStore::open(dir.path(), false, 16, false, -1).unwrap();
         assert!(
             !store.address_index_complete(),
             "legacy datadir without marker must stamp false on open"
@@ -2346,10 +2393,10 @@ mod tests {
     fn test_address_index_complete_marker_persists_across_reopen() {
         let dir = tempfile::tempdir().unwrap();
         {
-            let store = RocksDbStore::open(dir.path(), false, 16, false).unwrap();
+            let store = RocksDbStore::open(dir.path(), false, 16, false, -1).unwrap();
             store.write_address_index_complete(false).unwrap();
         }
-        let store = RocksDbStore::open(dir.path(), false, 16, false).unwrap();
+        let store = RocksDbStore::open(dir.path(), false, 16, false, -1).unwrap();
         assert!(!store.address_index_complete());
     }
 
@@ -2460,12 +2507,12 @@ mod tests {
             height: 50,
         };
         {
-            let store = RocksDbStore::open(dir.path(), false, 16, false).unwrap();
+            let store = RocksDbStore::open(dir.path(), false, 16, false, -1).unwrap();
             let mut batch = StoreBatch::default();
             batch.outpoint_spend_puts.push((prev, sref));
             store.write_batch(batch).unwrap();
         }
-        let store2 = RocksDbStore::open(dir.path(), false, 16, false).unwrap();
+        let store2 = RocksDbStore::open(dir.path(), false, 16, false, -1).unwrap();
         assert_eq!(store2.lookup_spend(&prev).unwrap(), Some(sref));
     }
 

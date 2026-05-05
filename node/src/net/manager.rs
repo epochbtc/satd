@@ -161,7 +161,7 @@ impl PeerManager {
         shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Arc<Self> {
         let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-        Self::with_config(chain_state, mempool, fee_estimator, network, shutdown, 0, 125, 86400, None, None, workers, 50_000)
+        Self::with_config(chain_state, mempool, fee_estimator, network, shutdown, 0, 125, 86400, None, None, workers, 50_000, 0)
     }
 
     pub fn with_prune(
@@ -173,7 +173,7 @@ impl PeerManager {
         prune_target_mb: u64,
     ) -> Arc<Self> {
         let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-        Self::with_config(chain_state, mempool, fee_estimator, network, shutdown, prune_target_mb, 125, 86400, None, None, workers, 50_000)
+        Self::with_config(chain_state, mempool, fee_estimator, network, shutdown, prune_target_mb, 125, 86400, None, None, workers, 50_000, 0)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -191,6 +191,7 @@ impl PeerManager {
         onion_proxy: Option<String>,
         prefetch_workers: usize,
         max_ahead: u32,
+        ibd_l0_pause_at: u32,
     ) -> Arc<Self> {
         let (event_tx, event_rx) = mpsc::channel(4096);
         let (block_tx, block_rx) = mpsc::unbounded_channel();
@@ -265,7 +266,7 @@ impl PeerManager {
         let eta_secs = mgr.ibd_eta_secs.clone();
         let orph = mgr.orphanage.clone();
         std::thread::spawn(move || {
-            Self::block_processor(block_rx, cs, mp, fe, prune_mb, connect_signal, ibd, prefetch_workers, max_ahead, network, eta_secs, orph);
+            Self::block_processor(block_rx, cs, mp, fe, prune_mb, connect_signal, ibd, prefetch_workers, max_ahead, ibd_l0_pause_at, network, eta_secs, orph);
         });
 
         mgr
@@ -1295,6 +1296,7 @@ impl PeerManager {
         ibd: Arc<std::sync::RwLock<Option<IbdScheduler>>>,
         prefetch_workers: usize,
         max_ahead: u32,
+        ibd_l0_pause_at: u32,
         network: Network,
         ibd_eta_secs: Arc<AtomicU64>,
         orphanage: Arc<TxOrphanage>,
@@ -1321,6 +1323,7 @@ impl PeerManager {
                 &mut last_log_height,
                 &mut last_prune_height,
                 max_ahead,
+                ibd_l0_pause_at,
                 network,
                 &ibd_eta_secs,
             );
@@ -1343,6 +1346,7 @@ impl PeerManager {
                     &mut last_log_height,
                     &mut last_prune_height,
                     max_ahead,
+                    ibd_l0_pause_at,
                     network,
                     &ibd_eta_secs,
                 );
@@ -1364,6 +1368,7 @@ impl PeerManager {
                 let fees = Self::compute_block_fee_rates(&block, &chain_state);
                 match chain_state.accept_block(&block) {
                     Ok(_) => {
+                        chain_state.bump_connect_heartbeat();
                         fee_estimator.record_block(&fees);
                         mempool.remove_for_block(&block, chain_state.tip_height());
                         reconsider_orphans_on_block(&orphanage, &mempool, &chain_state, &block);
@@ -1375,6 +1380,7 @@ impl PeerManager {
                                     let b_fees = Self::compute_block_fee_rates(&b, &chain_state);
                                     match chain_state.accept_block(&b) {
                                         Ok(_) => {
+                                            chain_state.bump_connect_heartbeat();
                                             fee_estimator.record_block(&b_fees);
                                             mempool.remove_for_block(&b, chain_state.tip_height());
                                             reconsider_orphans_on_block(&orphanage, &mempool, &chain_state, &b);
@@ -1441,6 +1447,7 @@ impl PeerManager {
         last_log_height: &mut u32,
         last_prune_height: &mut u32,
         max_ahead: u32,
+        ibd_l0_pause_at: u32,
         network: Network,
         ibd_eta_secs: &Arc<AtomicU64>,
     ) {
@@ -1482,7 +1489,68 @@ impl PeerManager {
         let _bulk_guard = BulkLoadGuard::new(chain_state);
         tracing::info!("IBD write mode: BulkLoad (WAL disabled, flush every 1000 blocks)");
 
+        // RocksDB compaction backpressure state. We log a single warn when
+        // we first start pausing in a sustained-pressure window, and a
+        // single info when we resume — without this throttling the
+        // backpressure loop would spam every 500ms it stays paused.
+        let mut backpressure_paused = false;
+        let mut backpressure_pause_started: Option<Instant> = None;
+
         loop {
+            // Backpressure: if RocksDB has accumulated too many L0 SST files,
+            // the chainstate is on the path that wedged a 78-GB process
+            // during a mainnet IBD (10k+ L0 SSTs, 4h cumulative write-stall).
+            // Pause the connector here to give compaction a chance to drain
+            // before we add another batch of writes. We cap the per-iteration
+            // wait so a buggy or stuck compactor cannot deadlock the loop —
+            // the periodic forced-compactor (a separate thread) is the
+            // backstop for that case.
+            if ibd_l0_pause_at > 0 {
+                let mut waited = Duration::ZERO;
+                let max_wait = Duration::from_secs(60);
+                let poll = Duration::from_millis(500);
+                loop {
+                    let l0 = chain_state.chainstate_l0_files();
+                    if l0 < ibd_l0_pause_at as u64 {
+                        if backpressure_paused {
+                            let dur = backpressure_pause_started
+                                .map(|t| t.elapsed())
+                                .unwrap_or_default();
+                            tracing::info!(
+                                l0_files = l0,
+                                paused_secs = dur.as_secs(),
+                                "IBD: L0 below threshold, resuming connector"
+                            );
+                            backpressure_paused = false;
+                            backpressure_pause_started = None;
+                        }
+                        break;
+                    }
+                    if !backpressure_paused {
+                        let pending = chain_state.chainstate_pending_compaction_bytes();
+                        tracing::warn!(
+                            l0_files = l0,
+                            threshold = ibd_l0_pause_at,
+                            pending_compaction_bytes = pending,
+                            "IBD: L0 above pause threshold, pausing connector for compaction"
+                        );
+                        backpressure_paused = true;
+                        backpressure_pause_started = Some(Instant::now());
+                    }
+                    if waited >= max_wait {
+                        tracing::warn!(
+                            l0_files = l0,
+                            threshold = ibd_l0_pause_at,
+                            waited_secs = waited.as_secs(),
+                            "IBD: backpressure max-wait exceeded, proceeding anyway"
+                        );
+                        break;
+                    }
+                    std::thread::sleep(poll);
+                    waited += poll;
+                }
+            }
+
             let target_height = {
                 let sched = ibd.read().unwrap();
                 match sched.as_ref() {
@@ -1584,6 +1652,11 @@ impl PeerManager {
                     Ok(_) => {
                         connected_count += 1;
                         retry_count = 0;
+                        // Lock-free progress signal for the stall watchdog.
+                        // Must run on every successful connect, before any
+                        // subsequent step that takes a lock the watchdog
+                        // would otherwise block on.
+                        chain_state.bump_connect_heartbeat();
                         // Clear any prior connect-failure warnings now that
                         // we've made forward progress.
                         chain_state.warnings().clear("connect.persistent_failure");

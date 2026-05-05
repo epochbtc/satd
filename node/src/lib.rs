@@ -11,6 +11,7 @@ pub mod net;
 pub mod perf;
 pub mod rpc;
 pub mod shutdown;
+pub mod stall_watchdog;
 pub mod storage;
 pub mod validation;
 pub mod warnings;
