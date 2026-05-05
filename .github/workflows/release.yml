@@ -186,13 +186,28 @@ jobs:
           # zstd is the default modern tarball compressor — better
           # ratio than gzip and an order of magnitude faster decompress.
           # PACKAGING.md commits to .tar.zst as the artifact format.
-          tar --owner=0 --group=0 --numeric-owner \
-              --format=ustar \
-              --sort=name \
-              --mtime='2026-01-01 00:00:00 UTC' \
-              -cf "${STAGE}.tar" "${STAGE}"
+          #
+          # macOS ships BSD tar as `tar`; the reproducible-friendly
+          # flags (--owner, --mtime, --sort) are GNU-only. Both
+          # macos-13 + macos-14 hosted runners include gnu-tar via
+          # Homebrew under the name `gtar`. Pick whichever exists.
+          if command -v gtar >/dev/null 2>&1; then
+            TAR=gtar
+          else
+            TAR=tar
+          fi
+          "$TAR" --owner=0 --group=0 --numeric-owner \
+                 --format=ustar \
+                 --sort=name \
+                 --mtime='2026-01-01 00:00:00 UTC' \
+                 -cf "${STAGE}.tar" "${STAGE}"
           zstd -19 --rm "${STAGE}.tar"
-          sha256sum "${STAGE}.tar.zst" > "${STAGE}.tar.zst.sha256"
+          # `sha256sum` is GNU coreutils; macOS ships `shasum -a 256`.
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${STAGE}.tar.zst" > "${STAGE}.tar.zst.sha256"
+          else
+            shasum -a 256 "${STAGE}.tar.zst" > "${STAGE}.tar.zst.sha256"
+          fi
 
       - name: Upload tarball artifact
         uses: actions/upload-artifact@v4
