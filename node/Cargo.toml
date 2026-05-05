@@ -28,6 +28,16 @@ uuid = { workspace = true }
 
 consensus = { path = "../consensus" }
 node-index = { path = "../node-index" }
+node-filter-index = { path = "../node-filter-index" }
+
+[features]
+default = ["block-filter-index"]
+# Compile in the BIP 158 compact-block-filter index. Default-on; turn
+# off with `--no-default-features` for a consensus-only build (no
+# filter codec, no `index::filter::emit`). The runtime knob
+# `--blockfilterindex` decides per-block emission once the feature is
+# compiled in.
+block-filter-index = []
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"

@@ -1,0 +1,9 @@
+[package]
+name = "node-filter-index"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bitcoin = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
