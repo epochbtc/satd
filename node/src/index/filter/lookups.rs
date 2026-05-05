@@ -12,11 +12,28 @@ use node_filter_index::{FilterIndex, IndexError, FILTER_TYPE_BASIC};
 
 use crate::storage::Store;
 
-/// Maximum range a single `getcfheaders` / `getcfilters` request can
-/// span, per BIP 157 ("a value of 1000 or fewer"). Enforced inside
-/// `headers_range`. Public so the P2P handler arms can short-circuit
-/// before calling into the store.
-pub const MAX_FILTER_RANGE: u32 = 1000;
+/// Maximum number of filters in a single `getcfilters` request, per
+/// BIP 157 / Bitcoin Core (`MAX_GETCFILTERS_SIZE = 1000`). Public so
+/// the P2P handler arm can short-circuit before calling into the
+/// store.
+pub const MAX_GETCFILTERS_SIZE: u32 = 1000;
+
+/// Maximum number of filter headers in a single `getcfheaders`
+/// request. Bitcoin Core sets this to 2000
+/// (`MAX_GETCFHEADERS_SIZE`); BIP 157's "1000 or fewer" applies to
+/// `getcfilters` only. The 2026-05-04 review (M1) flagged that
+/// reusing the 1000 cap for `getcfheaders` silently dropped valid
+/// 1001..=2000 requests from Core-compatible Neutrino clients.
+pub const MAX_GETCFHEADERS_SIZE: u32 = 2000;
+
+/// `getcfcheckpt` checkpoint cadence — BIP 157 fixes this at every
+/// 1000 blocks regardless of the `getcfilters` / `getcfheaders`
+/// per-request caps.
+pub const CHECKPOINT_INTERVAL: u32 = 1000;
+
+/// Backwards-compat alias for callers that don't yet distinguish.
+/// New code should use the spec-specific constants above.
+pub const MAX_FILTER_RANGE: u32 = MAX_GETCFILTERS_SIZE;
 
 pub struct RocksFilterIndex {
     store: Arc<dyn Store>,
@@ -75,8 +92,11 @@ impl FilterIndex for RocksFilterIndex {
                 stop_height,
             });
         }
+        // `headers_range` services `getcfheaders` callers, which Core
+        // and BIP 157 cap at 2000 headers — not the 1000 that applies
+        // to `getcfilters`. Review 2026-05-04 M1.
         if stop_height < start_height
-            || stop_height.saturating_sub(start_height) >= MAX_FILTER_RANGE
+            || stop_height.saturating_sub(start_height) >= MAX_GETCFHEADERS_SIZE
         {
             return Err(IndexError::InvalidRange {
                 start_height,
@@ -115,10 +135,10 @@ impl FilterIndex for RocksFilterIndex {
         // (but not including) the stop height. We return heights
         // 1000, 2000, ... ≤ stop_height. Genesis (height 0) is never
         // a checkpoint per the spec.
-        let max_idx = stop_height / MAX_FILTER_RANGE;
+        let max_idx = stop_height / CHECKPOINT_INTERVAL;
         let mut out = Vec::with_capacity(max_idx as usize);
         for i in 1..=max_idx {
-            let h = i * MAX_FILTER_RANGE;
+            let h = i * CHECKPOINT_INTERVAL;
             // A clamp for the strict "< stop_height" rule: the spec
             // says intervals strictly less than the stop. The
             // canonical reading from Bitcoin Core's implementation is
@@ -210,9 +230,12 @@ mod tests {
             idx.headers_range(FILTER_TYPE_BASIC, 100, 50),
             Err(IndexError::InvalidRange { .. })
         ));
-        // range == 1000 (BIP 157 says strictly less than 1000 difference).
+        // headers_range services `getcfheaders` callers, which
+        // Bitcoin Core caps at MAX_GETCFHEADERS_SIZE = 2000 (review
+        // 2026-05-04 M1). The range diff must be strictly less than
+        // 2000 (i.e. inclusive count <= 2000).
         assert!(matches!(
-            idx.headers_range(FILTER_TYPE_BASIC, 0, 1000),
+            idx.headers_range(FILTER_TYPE_BASIC, 0, 2000),
             Err(IndexError::InvalidRange { .. })
         ));
     }

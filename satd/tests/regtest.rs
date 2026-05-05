@@ -8523,6 +8523,818 @@ fn test_filter_backfill_tail_catchup_after_concurrent_live_block() {
     let _ = std::fs::remove_dir_all(&datadir);
 }
 
+
+// ============================================================================
+// BIP 157 P2P service integration tests (PR-4 of the BIP 157/158 stack)
+// ============================================================================
+
+/// Specialised P2P client that lets the test inspect inbound messages
+/// (`CFilter`, `CFHeaders`, `CFCheckpt`, `Version`). Unlike
+/// `raw_p2p::RawP2pClient`, this variant doesn't spawn a drain thread —
+/// the test itself owns the recv loop so it can selectively accept
+/// filter responses.
+mod cf_client {
+    use bitcoin::consensus::{deserialize, serialize};
+    use bitcoin::p2p::message::{NetworkMessage, RawNetworkMessage};
+    use bitcoin::p2p::message_filter::{GetCFCheckpt, GetCFHeaders, GetCFilters};
+    use bitcoin::p2p::message_network::VersionMessage;
+    use bitcoin::p2p::{Address, Magic, ServiceFlags};
+    use std::io::{self, Read, Write};
+    use std::net::{SocketAddr, TcpStream};
+    use std::time::{Duration, Instant, SystemTime};
+
+    const HEADER_SIZE: usize = 24;
+    const MAX_PAYLOAD_SIZE: usize = 32 * 1024 * 1024;
+
+    pub struct CFilterClient {
+        stream: TcpStream,
+        /// Captured peer Version message — the BIP 157 spec requires
+        /// `NODE_COMPACT_FILTERS` (bit 6) to be advertised when a node
+        /// is willing to serve filter messages.
+        pub peer_services: ServiceFlags,
+    }
+
+    impl CFilterClient {
+        pub fn connect(p2p_port: u16) -> Self {
+            let addr = format!("127.0.0.1:{}", p2p_port);
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let stream = loop {
+                match TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_secs(2)) {
+                    Ok(s) => break s,
+                    Err(_) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                    Err(e) => panic!("CFilter P2P connect to {} failed: {}", addr, e),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream.set_nodelay(true).unwrap();
+
+            let mut client = CFilterClient {
+                stream,
+                peer_services: ServiceFlags::NONE,
+            };
+            client.handshake();
+            client
+        }
+
+        fn handshake(&mut self) {
+            let our_ver = build_version();
+            self.send_msg(NetworkMessage::Version(our_ver));
+
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let mut saw_version = false;
+            let mut saw_verack = false;
+            while !(saw_version && saw_verack) {
+                if Instant::now() >= deadline {
+                    panic!("handshake timeout waiting for peer version+verack");
+                }
+                match recv_msg(&mut self.stream) {
+                    Ok(NetworkMessage::Version(v)) => {
+                        self.peer_services = v.services;
+                        saw_version = true;
+                    }
+                    Ok(NetworkMessage::Verack) => saw_verack = true,
+                    Ok(_) => continue,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                    Err(e) => panic!("handshake recv failed: {}", e),
+                }
+            }
+            self.send_msg(NetworkMessage::Verack);
+        }
+
+        pub fn send_get_cfilters(&mut self, req: GetCFilters) {
+            self.send_msg(NetworkMessage::GetCFilters(req));
+        }
+
+        pub fn send_get_cfheaders(&mut self, req: GetCFHeaders) {
+            self.send_msg(NetworkMessage::GetCFHeaders(req));
+        }
+
+        pub fn send_get_cfcheckpt(&mut self, req: GetCFCheckpt) {
+            self.send_msg(NetworkMessage::GetCFCheckpt(req));
+        }
+
+        /// Receive at most `count` `CFilter` messages with the given
+        /// timeout. Returns whatever it collected before the deadline.
+        ///
+        /// Uses a single long read_timeout per message rather than a
+        /// short polling loop because `read_exact` on a partial-read
+        /// timeout consumes some bytes from the stream irrecoverably,
+        /// corrupting subsequent message framing.
+        pub fn recv_cfilters(
+            &mut self,
+            count: usize,
+            timeout: Duration,
+        ) -> Vec<bitcoin::p2p::message_filter::CFilter> {
+            let deadline = Instant::now() + timeout;
+            let mut out = Vec::with_capacity(count);
+            while out.len() < count && Instant::now() < deadline {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                self.stream
+                    .set_read_timeout(Some(remaining.max(Duration::from_millis(100))))
+                    .unwrap();
+                match recv_msg(&mut self.stream) {
+                    Ok(NetworkMessage::CFilter(f)) => out.push(f),
+                    Ok(_) => continue,
+                    Err(_) => break,
+                }
+            }
+            out
+        }
+
+        pub fn recv_cfheaders(
+            &mut self,
+            timeout: Duration,
+        ) -> Option<bitcoin::p2p::message_filter::CFHeaders> {
+            let deadline = Instant::now() + timeout;
+            while Instant::now() < deadline {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                self.stream
+                    .set_read_timeout(Some(remaining.max(Duration::from_millis(100))))
+                    .unwrap();
+                match recv_msg(&mut self.stream) {
+                    Ok(NetworkMessage::CFHeaders(h)) => return Some(h),
+                    Ok(_) => continue,
+                    Err(_) => return None,
+                }
+            }
+            None
+        }
+
+        pub fn recv_cfcheckpt(
+            &mut self,
+            timeout: Duration,
+        ) -> Option<bitcoin::p2p::message_filter::CFCheckpt> {
+            let deadline = Instant::now() + timeout;
+            while Instant::now() < deadline {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                self.stream
+                    .set_read_timeout(Some(remaining.max(Duration::from_millis(100))))
+                    .unwrap();
+                match recv_msg(&mut self.stream) {
+                    Ok(NetworkMessage::CFCheckpt(c)) => return Some(c),
+                    Ok(_) => continue,
+                    Err(_) => return None,
+                }
+            }
+            None
+        }
+
+        /// Assert that no CFilter / CFHeaders / CFCheckpt arrives in the
+        /// window — the silent-drop contract from BIP 157.
+        pub fn assert_silent(&mut self, window: Duration) {
+            let deadline = Instant::now() + window;
+            while Instant::now() < deadline {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                self.stream
+                    .set_read_timeout(Some(remaining.max(Duration::from_millis(100))))
+                    .unwrap();
+                match recv_msg(&mut self.stream) {
+                    Ok(NetworkMessage::CFilter(_))
+                    | Ok(NetworkMessage::CFHeaders(_))
+                    | Ok(NetworkMessage::CFCheckpt(_)) => {
+                        panic!("assert_silent: peer sent a filter response unexpectedly");
+                    }
+                    Ok(_) => continue,
+                    Err(_) => break,
+                }
+            }
+        }
+
+        fn send_msg(&mut self, msg: NetworkMessage) {
+            let raw = RawNetworkMessage::new(Magic::REGTEST, msg);
+            let bytes = serialize(&raw);
+            self.stream.write_all(&bytes).expect("p2p write");
+            self.stream.flush().ok();
+        }
+    }
+
+    fn build_version() -> VersionMessage {
+        let services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+        let timestamp = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let zero: SocketAddr = "0.0.0.0:0".parse().unwrap();
+        VersionMessage {
+            version: 70016,
+            services,
+            timestamp,
+            receiver: Address::new(&zero, ServiceFlags::NONE),
+            sender: Address::new(&zero, services),
+            nonce: 0xCAFE_F00D_DEAD_BEEF,
+            user_agent: "/satd-cf-client:0.1/".into(),
+            start_height: 0,
+            relay: true,
+        }
+    }
+
+    fn recv_msg(stream: &mut TcpStream) -> io::Result<NetworkMessage> {
+        let mut header = [0u8; HEADER_SIZE];
+        stream.read_exact(&mut header)?;
+        let payload_len =
+            u32::from_le_bytes([header[16], header[17], header[18], header[19]]) as usize;
+        if payload_len > MAX_PAYLOAD_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "payload too large",
+            ));
+        }
+        let mut payload = vec![0u8; payload_len];
+        if payload_len > 0 {
+            stream.read_exact(&mut payload)?;
+        }
+        let mut buf = Vec::with_capacity(HEADER_SIZE + payload_len);
+        buf.extend_from_slice(&header);
+        buf.extend_from_slice(&payload);
+        deserialize::<RawNetworkMessage>(&buf)
+            .map(|raw| raw.payload().clone())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+    }
+}
+
+/// Bring up satd with `--blockfilterindex=basic --peerblockfilters=1`,
+/// mine some blocks, request `getcfheaders` over P2P, and assert the
+/// returned `CFHeaders` has the expected per-height filter hashes.
+#[test]
+fn test_p2p_getcfheaders_returns_chain() {
+    use bitcoin::hashes::Hash as _;
+    use bitcoin::p2p::message_filter::GetCFHeaders;
+
+    let p2p_port = find_available_port();
+    let rpcport = find_available_port();
+    let datadir = std::env::temp_dir().join(format!("satd-p2p-cfheaders-test-{}", rpcport));
+    let _ = std::fs::create_dir_all(&datadir);
+    let mut node = TestNode::start_with_datadir(
+        &datadir,
+        rpcport,
+        &[
+            "--blockfilterindex=basic",
+            "--peerblockfilters=1",
+            &format!("--port={}", p2p_port),
+        ],
+    );
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    node.rpc_call_with_params(
+        "generatetoaddress",
+        vec![serde_json::json!(20), serde_json::json!(addr)],
+    )
+    .expect("rpc");
+
+    let info = node.rpc_call("getindexinfo").expect("rpc");
+    assert!(
+        info["result"]["basic block filter index"]["synced"]
+            .as_bool()
+            .unwrap_or(false),
+        "filter index must be synced after mining: {}",
+        info
+    );
+
+    // Resolve tip hash for stop_hash.
+    let bci = node.rpc_call("getblockchaininfo").expect("rpc");
+    let tip_hex = bci["result"]["bestblockhash"]
+        .as_str()
+        .expect("bestblockhash")
+        .to_string();
+    let tip_bytes = <[u8; 32]>::try_from(hex::decode(&tip_hex).expect("hex").as_slice())
+        .expect("32 bytes");
+    // RPC returns display form; reverse for consensus-byte stop_hash.
+    let mut consensus = tip_bytes;
+    consensus.reverse();
+    let stop_hash = bitcoin::BlockHash::from_raw_hash(
+        bitcoin::hashes::sha256d::Hash::from_byte_array(consensus),
+    );
+
+    let mut client = cf_client::CFilterClient::connect(p2p_port);
+    // BIP 157: NODE_COMPACT_FILTERS bit 6 set in advertised services.
+    assert!(
+        client
+            .peer_services
+            .has(bitcoin::p2p::ServiceFlags::COMPACT_FILTERS),
+        "peer must advertise NODE_COMPACT_FILTERS when peerblockfilters=1 + index complete; got {:?}",
+        client.peer_services
+    );
+
+    client.send_get_cfheaders(GetCFHeaders {
+        filter_type: 0,
+        start_height: 0,
+        stop_hash,
+    });
+    let resp = client
+        .recv_cfheaders(Duration::from_secs(5))
+        .expect("CFHeaders response");
+    assert_eq!(resp.filter_type, 0);
+    assert_eq!(resp.stop_hash, stop_hash);
+    // 21 hashes expected: heights 0..=20.
+    assert_eq!(resp.filter_hashes.len(), 21);
+    // start_height=0 → previous_filter_header is all-zeros per BIP 157.
+    assert_eq!(resp.previous_filter_header.to_byte_array(), [0u8; 32]);
+
+    node.stop();
+    let _ = std::fs::remove_dir_all(&datadir);
+}
+
+#[test]
+fn test_p2p_getcfilters_returns_blobs() {
+    use bitcoin::hashes::Hash as _;
+    use bitcoin::p2p::message_filter::GetCFilters;
+
+    let p2p_port = find_available_port();
+    let rpcport = find_available_port();
+    let datadir = std::env::temp_dir().join(format!("satd-p2p-cfilters-test-{}", rpcport));
+    let _ = std::fs::create_dir_all(&datadir);
+    let mut node = TestNode::start_with_datadir(
+        &datadir,
+        rpcport,
+        &[
+            "--blockfilterindex=basic",
+            "--peerblockfilters=1",
+            &format!("--port={}", p2p_port),
+        ],
+    );
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    node.rpc_call_with_params(
+        "generatetoaddress",
+        vec![serde_json::json!(25), serde_json::json!(addr)],
+    )
+    .expect("rpc");
+
+    let bci = node.rpc_call("getblockchaininfo").expect("rpc");
+    let stop_hex = bci["result"]["bestblockhash"]
+        .as_str()
+        .expect("bestblockhash")
+        .to_string();
+    let mut consensus =
+        <[u8; 32]>::try_from(hex::decode(&stop_hex).expect("hex").as_slice()).expect("32 bytes");
+    consensus.reverse();
+    let stop_hash = bitcoin::BlockHash::from_raw_hash(
+        bitcoin::hashes::sha256d::Hash::from_byte_array(consensus),
+    );
+
+    let mut client = cf_client::CFilterClient::connect(p2p_port);
+    client.send_get_cfilters(GetCFilters {
+        filter_type: 0,
+        start_height: 10,
+        stop_hash,
+    });
+    // Heights 10..=25 = 16 messages.
+    let cfilters = client.recv_cfilters(16, Duration::from_secs(10));
+    assert_eq!(
+        cfilters.len(),
+        16,
+        "expected 16 CFilter responses, got {}",
+        cfilters.len()
+    );
+    for f in &cfilters {
+        assert_eq!(f.filter_type, 0);
+        // BIP 158 SCRIPT_FILTER for a coinbase-only block is a small
+        // GCS blob — at minimum the length-prefix bytes — never empty
+        // because every block has at least one output script.
+        assert!(!f.filter.is_empty(), "filter blob must be non-empty");
+    }
+    node.stop();
+    let _ = std::fs::remove_dir_all(&datadir);
+}
+
+#[test]
+fn test_p2p_getcfcheckpt_thousand_block_intervals() {
+    use bitcoin::hashes::Hash as _;
+    use bitcoin::p2p::message_filter::GetCFCheckpt;
+
+    let p2p_port = find_available_port();
+    let rpcport = find_available_port();
+    let datadir = std::env::temp_dir().join(format!("satd-p2p-cfcheckpt-test-{}", rpcport));
+    let _ = std::fs::create_dir_all(&datadir);
+    let mut node = TestNode::start_with_datadir(
+        &datadir,
+        rpcport,
+        &[
+            "--blockfilterindex=basic",
+            "--peerblockfilters=1",
+            &format!("--port={}", p2p_port),
+        ],
+    );
+    // Mine just enough to get a single 1000-boundary checkpoint.
+    // Mining 1500 regtest blocks via generatetoaddress is cheap.
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    node.rpc_call_with_params(
+        "generatetoaddress",
+        vec![serde_json::json!(1500), serde_json::json!(addr)],
+    )
+    .expect("rpc");
+
+    let bci = node.rpc_call("getblockchaininfo").expect("rpc");
+    let stop_hex = bci["result"]["bestblockhash"]
+        .as_str()
+        .expect("bestblockhash")
+        .to_string();
+    let mut consensus =
+        <[u8; 32]>::try_from(hex::decode(&stop_hex).expect("hex").as_slice()).expect("32 bytes");
+    consensus.reverse();
+    let stop_hash = bitcoin::BlockHash::from_raw_hash(
+        bitcoin::hashes::sha256d::Hash::from_byte_array(consensus),
+    );
+
+    let mut client = cf_client::CFilterClient::connect(p2p_port);
+    client.send_get_cfcheckpt(GetCFCheckpt {
+        filter_type: 0,
+        stop_hash,
+    });
+    let resp = client
+        .recv_cfcheckpt(Duration::from_secs(5))
+        .expect("CFCheckpt response");
+    assert_eq!(resp.filter_type, 0);
+    assert_eq!(resp.stop_hash, stop_hash);
+    // 1500 blocks → only one checkpoint at height 1000 (the rule is
+    // strict 1000-block intervals, genesis is excluded).
+    assert_eq!(
+        resp.filter_headers.len(),
+        1,
+        "expected 1 checkpoint at height 1000, got {}",
+        resp.filter_headers.len()
+    );
+    node.stop();
+    let _ = std::fs::remove_dir_all(&datadir);
+}
+
+#[test]
+fn test_p2p_silent_drop_when_peer_serve_disabled() {
+    use bitcoin::hashes::Hash as _;
+    use bitcoin::p2p::message_filter::GetCFHeaders;
+
+    // blockfilterindex=basic but peerblockfilters off: handlers must
+    // silent-drop and the version handshake must NOT advertise
+    // NODE_COMPACT_FILTERS.
+    let p2p_port = find_available_port();
+    let rpcport = find_available_port();
+    let datadir = std::env::temp_dir().join(format!("satd-p2p-silent-test-{}", rpcport));
+    let _ = std::fs::create_dir_all(&datadir);
+    let mut node = TestNode::start_with_datadir(
+        &datadir,
+        rpcport,
+        &[
+            "--blockfilterindex=basic",
+            // No --peerblockfilters
+            &format!("--port={}", p2p_port),
+        ],
+    );
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    node.rpc_call_with_params(
+        "generatetoaddress",
+        vec![serde_json::json!(15), serde_json::json!(addr)],
+    )
+    .expect("rpc");
+
+    let bci = node.rpc_call("getblockchaininfo").expect("rpc");
+    let stop_hex = bci["result"]["bestblockhash"]
+        .as_str()
+        .expect("bestblockhash")
+        .to_string();
+    let mut consensus =
+        <[u8; 32]>::try_from(hex::decode(&stop_hex).expect("hex").as_slice()).expect("32 bytes");
+    consensus.reverse();
+    let stop_hash = bitcoin::BlockHash::from_raw_hash(
+        bitcoin::hashes::sha256d::Hash::from_byte_array(consensus),
+    );
+
+    let mut client = cf_client::CFilterClient::connect(p2p_port);
+    assert!(
+        !client
+            .peer_services
+            .has(bitcoin::p2p::ServiceFlags::COMPACT_FILTERS),
+        "NODE_COMPACT_FILTERS must NOT be set when peerblockfilters is off; got {:?}",
+        client.peer_services
+    );
+
+    client.send_get_cfheaders(GetCFHeaders {
+        filter_type: 0,
+        start_height: 0,
+        stop_hash,
+    });
+    client.assert_silent(Duration::from_secs(2));
+    node.stop();
+    let _ = std::fs::remove_dir_all(&datadir);
+}
+
+#[test]
+fn test_p2p_silent_drop_invalid_filter_type() {
+    use bitcoin::hashes::Hash as _;
+    use bitcoin::p2p::message_filter::GetCFilters;
+
+    let p2p_port = find_available_port();
+    let rpcport = find_available_port();
+    let datadir = std::env::temp_dir().join(format!(
+        "satd-p2p-bad-filter-type-test-{}",
+        rpcport
+    ));
+    let _ = std::fs::create_dir_all(&datadir);
+    let mut node = TestNode::start_with_datadir(
+        &datadir,
+        rpcport,
+        &[
+            "--blockfilterindex=basic",
+            "--peerblockfilters=1",
+            &format!("--port={}", p2p_port),
+        ],
+    );
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    node.rpc_call_with_params(
+        "generatetoaddress",
+        vec![serde_json::json!(10), serde_json::json!(addr)],
+    )
+    .expect("rpc");
+
+    let bci = node.rpc_call("getblockchaininfo").expect("rpc");
+    let stop_hex = bci["result"]["bestblockhash"]
+        .as_str()
+        .expect("bestblockhash")
+        .to_string();
+    let mut consensus =
+        <[u8; 32]>::try_from(hex::decode(&stop_hex).expect("hex").as_slice()).expect("32 bytes");
+    consensus.reverse();
+    let stop_hash = bitcoin::BlockHash::from_raw_hash(
+        bitcoin::hashes::sha256d::Hash::from_byte_array(consensus),
+    );
+
+    let mut client = cf_client::CFilterClient::connect(p2p_port);
+    client.send_get_cfilters(GetCFilters {
+        filter_type: 0x99,
+        start_height: 0,
+        stop_hash,
+    });
+    client.assert_silent(Duration::from_secs(2));
+    node.stop();
+    let _ = std::fs::remove_dir_all(&datadir);
+}
+
+/// Regression test for H3 (review 2026-05-04): a max-size
+/// `getcfilters` request that produces 1000 `CFilter` responses must
+/// be delivered fully. Before the H3 fix the per-peer outbound mpsc
+/// channel was 256 slots and the handler used best-effort `try_send`,
+/// which silently dropped the tail of any 257+ message response.
+#[test]
+fn test_p2p_getcfilters_max_size_response_not_truncated() {
+    use bitcoin::hashes::Hash as _;
+    use bitcoin::p2p::message_filter::GetCFilters;
+
+    let p2p_port = find_available_port();
+    let rpcport = find_available_port();
+    let datadir = std::env::temp_dir().join(format!(
+        "satd-p2p-cfilters-1000-test-{}",
+        rpcport
+    ));
+    let _ = std::fs::create_dir_all(&datadir);
+    let mut node = TestNode::start_with_datadir(
+        &datadir,
+        rpcport,
+        &[
+            "--blockfilterindex=basic",
+            "--peerblockfilters=1",
+            &format!("--port={}", p2p_port),
+        ],
+    );
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    node.rpc_call_with_params(
+        "generatetoaddress",
+        vec![serde_json::json!(1000), serde_json::json!(addr)],
+    )
+    .expect("rpc");
+
+    let bci = node.rpc_call("getblockchaininfo").expect("rpc");
+    let stop_hex = bci["result"]["bestblockhash"]
+        .as_str()
+        .expect("bestblockhash")
+        .to_string();
+    let mut consensus =
+        <[u8; 32]>::try_from(hex::decode(&stop_hex).expect("hex").as_slice())
+            .expect("32 bytes");
+    consensus.reverse();
+    let stop_hash = bitcoin::BlockHash::from_raw_hash(
+        bitcoin::hashes::sha256d::Hash::from_byte_array(consensus),
+    );
+
+    let mut client = cf_client::CFilterClient::connect(p2p_port);
+    // Range 1..=1000 = 1000 messages — exactly at the cap (the rule
+    // is `stop - start < 1000`, so `1000 - 1 = 999`).
+    client.send_get_cfilters(GetCFilters {
+        filter_type: 0,
+        start_height: 1,
+        stop_hash,
+    });
+    let cfilters = client.recv_cfilters(1000, Duration::from_secs(60));
+    assert_eq!(
+        cfilters.len(),
+        1000,
+        "expected 1000 CFilter responses delivered without truncation, got {}",
+        cfilters.len()
+    );
+    node.stop();
+    let _ = std::fs::remove_dir_all(&datadir);
+}
+
+/// Regression test for M1 (review 2026-05-04): `getcfheaders` accepts
+/// up to 2000 headers per Bitcoin Core's
+/// `MAX_GETCFHEADERS_SIZE = 2000`. Before the M1 fix satd reused the
+/// `getcfilters` 1000 cap and silently dropped 1001..=2000 ranges.
+#[test]
+fn test_p2p_getcfheaders_accepts_2000_headers() {
+    use bitcoin::hashes::Hash as _;
+    use bitcoin::p2p::message_filter::GetCFHeaders;
+
+    let p2p_port = find_available_port();
+    let rpcport = find_available_port();
+    let datadir = std::env::temp_dir().join(format!(
+        "satd-p2p-cfheaders-2000-test-{}",
+        rpcport
+    ));
+    let _ = std::fs::create_dir_all(&datadir);
+    let mut node = TestNode::start_with_datadir(
+        &datadir,
+        rpcport,
+        &[
+            "--blockfilterindex=basic",
+            "--peerblockfilters=1",
+            &format!("--port={}", p2p_port),
+        ],
+    );
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    node.rpc_call_with_params(
+        "generatetoaddress",
+        vec![serde_json::json!(2010), serde_json::json!(addr)],
+    )
+    .expect("rpc");
+
+    let bci = node.rpc_call("getblockchaininfo").expect("rpc");
+    let tip_hex = bci["result"]["bestblockhash"]
+        .as_str()
+        .expect("bestblockhash")
+        .to_string();
+    let mut consensus =
+        <[u8; 32]>::try_from(hex::decode(&tip_hex).expect("hex").as_slice())
+            .expect("32 bytes");
+    consensus.reverse();
+    let tip_hash = bitcoin::BlockHash::from_raw_hash(
+        bitcoin::hashes::sha256d::Hash::from_byte_array(consensus),
+    );
+    // Use getblockhash for stop at height 2000 specifically — exactly
+    // 2000 headers in the range 1..=2000 (count == 2000, allowed).
+    let stop_hex_2000 = node
+        .rpc_call_with_params("getblockhash", vec![serde_json::json!(2000)])
+        .unwrap()["result"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut consensus2k =
+        <[u8; 32]>::try_from(hex::decode(&stop_hex_2000).expect("hex").as_slice())
+            .expect("32 bytes");
+    consensus2k.reverse();
+    let stop_hash_2000 = bitcoin::BlockHash::from_raw_hash(
+        bitcoin::hashes::sha256d::Hash::from_byte_array(consensus2k),
+    );
+
+    let mut client = cf_client::CFilterClient::connect(p2p_port);
+    // 2000 headers = at the cap. Inclusive count rule: `stop - start <
+    // 2000` means start=1, stop=2000 yields 2000 entries — allowed.
+    client.send_get_cfheaders(GetCFHeaders {
+        filter_type: 0,
+        start_height: 1,
+        stop_hash: stop_hash_2000,
+    });
+    let resp = client
+        .recv_cfheaders(Duration::from_secs(30))
+        .expect("CFHeaders response for 2000-header request");
+    assert_eq!(
+        resp.filter_hashes.len(),
+        2000,
+        "expected 2000 hashes, got {}",
+        resp.filter_hashes.len()
+    );
+
+    // 2001 headers must be silent-dropped (start=0, stop=2000 = 2001).
+    let stop_hex_genesis = node
+        .rpc_call_with_params("getblockhash", vec![serde_json::json!(0)])
+        .unwrap()["result"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut _consensus_g =
+        <[u8; 32]>::try_from(hex::decode(&stop_hex_genesis).expect("hex").as_slice())
+            .expect("32 bytes");
+    let _ = tip_hash; // suppress unused var warnings on the silent-drop path
+    client.send_get_cfheaders(GetCFHeaders {
+        filter_type: 0,
+        start_height: 0,
+        stop_hash: stop_hash_2000,
+    });
+    client.assert_silent(Duration::from_secs(2));
+
+    node.stop();
+    let _ = std::fs::remove_dir_all(&datadir);
+}
+
+#[test]
+fn test_p2p_silent_drop_oversized_range() {
+    use bitcoin::hashes::Hash as _;
+    use bitcoin::p2p::message_filter::GetCFilters;
+
+    let p2p_port = find_available_port();
+    let rpcport = find_available_port();
+    let datadir = std::env::temp_dir().join(format!(
+        "satd-p2p-oversize-test-{}",
+        rpcport
+    ));
+    let _ = std::fs::create_dir_all(&datadir);
+    let mut node = TestNode::start_with_datadir(
+        &datadir,
+        rpcport,
+        &[
+            "--blockfilterindex=basic",
+            "--peerblockfilters=1",
+            &format!("--port={}", p2p_port),
+        ],
+    );
+    // Need >=1000 blocks so we can form a >1000-range request.
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    node.rpc_call_with_params(
+        "generatetoaddress",
+        vec![serde_json::json!(1100), serde_json::json!(addr)],
+    )
+    .expect("rpc");
+
+    let bci = node.rpc_call("getblockchaininfo").expect("rpc");
+    let stop_hex = bci["result"]["bestblockhash"]
+        .as_str()
+        .expect("bestblockhash")
+        .to_string();
+    let mut consensus =
+        <[u8; 32]>::try_from(hex::decode(&stop_hex).expect("hex").as_slice()).expect("32 bytes");
+    consensus.reverse();
+    let stop_hash = bitcoin::BlockHash::from_raw_hash(
+        bitcoin::hashes::sha256d::Hash::from_byte_array(consensus),
+    );
+
+    let mut client = cf_client::CFilterClient::connect(p2p_port);
+    // Range from 0 to 1100 = 1101 blocks, well over the 1000 cap.
+    client.send_get_cfilters(GetCFilters {
+        filter_type: 0,
+        start_height: 0,
+        stop_hash,
+    });
+    client.assert_silent(Duration::from_secs(2));
+    node.stop();
+    let _ = std::fs::remove_dir_all(&datadir);
+}
+
+#[test]
+fn test_p2p_silent_drop_off_chain_stop_hash() {
+    use bitcoin::hashes::Hash as _;
+    use bitcoin::p2p::message_filter::GetCFHeaders;
+
+    let p2p_port = find_available_port();
+    let rpcport = find_available_port();
+    let datadir = std::env::temp_dir().join(format!(
+        "satd-p2p-offchain-test-{}",
+        rpcport
+    ));
+    let _ = std::fs::create_dir_all(&datadir);
+    let mut node = TestNode::start_with_datadir(
+        &datadir,
+        rpcport,
+        &[
+            "--blockfilterindex=basic",
+            "--peerblockfilters=1",
+            &format!("--port={}", p2p_port),
+        ],
+    );
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    node.rpc_call_with_params(
+        "generatetoaddress",
+        vec![serde_json::json!(10), serde_json::json!(addr)],
+    )
+    .expect("rpc");
+
+    let mut client = cf_client::CFilterClient::connect(p2p_port);
+    // A made-up stop_hash that doesn't exist in the block index.
+    let fake = [0xab; 32];
+    let stop_hash = bitcoin::BlockHash::from_raw_hash(
+        bitcoin::hashes::sha256d::Hash::from_byte_array(fake),
+    );
+    client.send_get_cfheaders(GetCFHeaders {
+        filter_type: 0,
+        start_height: 0,
+        stop_hash,
+    });
+    client.assert_silent(Duration::from_secs(2));
+    node.stop();
+    let _ = std::fs::remove_dir_all(&datadir);
+}
+
 /// `pauseindex blockfilter` / `resumeindex blockfilter` return -8 when
 /// no backfill is active.
 #[test]
