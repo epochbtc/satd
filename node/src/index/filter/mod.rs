@@ -9,16 +9,27 @@
 //! storage layout.
 
 #[cfg(feature = "block-filter-index")]
+pub mod backfill;
+#[cfg(feature = "block-filter-index")]
 pub mod emit;
 #[cfg(feature = "block-filter-index")]
 pub mod lookups;
+#[cfg(feature = "block-filter-index")]
+pub mod runner;
 
+#[cfg(feature = "block-filter-index")]
+pub use backfill::{
+    BackfillError, BackfillHandle, PREFLIGHT_REQUIRED_FREE_BYTES, StatusReport, render_status,
+};
 #[cfg(feature = "block-filter-index")]
 pub use emit::{build_filter_row_pair, filter_remove_key};
 #[cfg(feature = "block-filter-index")]
 pub use lookups::{MAX_FILTER_RANGE, RocksFilterIndex, filter_hash};
+#[cfg(feature = "block-filter-index")]
+pub use runner::{BackfillCommand, BackfillRunner, preflight_disk};
 
+pub use node_filter_index::cursor;
 pub use node_filter_index::{
-    decode_filter_key, encode_filter_key, FilterHeaderRow, FilterIndex, FilterIndexConfig,
-    FilterKey, FilterRow, IndexError, FILTER_KEY_LEN, FILTER_TYPE_BASIC,
+    BackfillCursor, BackfillState, FILTER_KEY_LEN, FILTER_TYPE_BASIC, FilterHeaderRow, FilterIndex,
+    FilterIndexConfig, FilterKey, FilterRow, IndexError, decode_filter_key, encode_filter_key,
 };

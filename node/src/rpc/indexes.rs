@@ -17,6 +17,8 @@ use crate::index::address::{
     BackfillCommand, BackfillError, BackfillHandle, cursor::BackfillState, preflight_disk,
     render_status,
 };
+#[cfg(feature = "block-filter-index")]
+use crate::index::filter;
 use crate::storage::Store;
 
 /// `getindexinfo` → `{"address": {...}, "basic block filter index": {...}}`
@@ -53,6 +55,7 @@ pub fn get_index_info(
     address_enabled: bool,
     best_block_height: u32,
     #[cfg(feature = "block-filter-index")] block_filter_index_enabled: bool,
+    #[cfg(feature = "block-filter-index")] filter_backfill: Option<&Arc<filter::BackfillHandle>>,
 ) -> Value {
     let report = render_status(backfill.map(|h| h.as_ref()), address_enabled);
     let mut address = serde_json::Map::new();
@@ -66,10 +69,7 @@ pub fn get_index_info(
     let cursor_state = backfill
         .map(|h| h.cursor().state)
         .unwrap_or(BackfillState::Idle);
-    let active = matches!(
-        cursor_state,
-        BackfillState::Running | BackfillState::Paused
-    );
+    let active = matches!(cursor_state, BackfillState::Running | BackfillState::Paused);
     let estimated_remaining_seconds = estimate_remaining_seconds(&report);
     let mut bf = serde_json::Map::new();
     bf.insert("active".into(), json!(active));
@@ -111,19 +111,73 @@ pub fn get_index_info(
 
     // BIP 158 filter index sibling. `block_filter_index_enabled` is
     // the runtime config bit (`--blockfilterindex=basic`); `synced`
-    // reads the on-disk completeness marker. Both must be true for
-    // the BIP 157 P2P service and `getblockfilter` RPC to actually
-    // return data.
+    // reads the on-disk completeness marker AND requires no backfill
+    // to be mid-flight. Both must be true for the BIP 157 P2P service
+    // and `getblockfilter` RPC to actually return data.
     #[cfg(feature = "block-filter-index")]
     {
-        let synced = block_filter_index_enabled
-            && chain.store_ref().block_filter_index_complete();
+        let filter_complete = chain.store_ref().block_filter_index_complete();
+        let report = filter::render_status(
+            filter_backfill.map(|h| h.as_ref()),
+            block_filter_index_enabled,
+            filter_complete,
+        );
         let mut bfi = serde_json::Map::new();
-        bfi.insert("synced".into(), json!(synced));
+        bfi.insert("synced".into(), json!(report.synced));
         bfi.insert("best_block_height".into(), json!(best_block_height));
+
+        // Emit the backfill substructure even when no backfill has run
+        // (Idle), matching the address-index shape so clients can probe
+        // the field unconditionally.
+        let cursor_state = filter_backfill
+            .map(|h| h.cursor().state)
+            .unwrap_or(filter::cursor::BackfillState::Idle);
+        let active = matches!(
+            cursor_state,
+            filter::cursor::BackfillState::Running | filter::cursor::BackfillState::Paused
+        );
+        let estimated_remaining_seconds = estimate_filter_remaining_seconds(&report);
+        let mut bf = serde_json::Map::new();
+        bf.insert("active".into(), json!(active));
+        bf.insert("state".into(), json!(cursor_state.label()));
+        bf.insert("cursor_height".into(), json!(report.cursor_height));
+        bf.insert("snapshot_height".into(), json!(report.snapshot_height));
+        bf.insert(
+            "estimated_remaining_seconds".into(),
+            json!(estimated_remaining_seconds),
+        );
+        if cursor_state == filter::cursor::BackfillState::Failed
+            && let Some(msg) = chain.store_ref().read_filter_backfill_last_error()
+        {
+            bf.insert("last_error".into(), json!(msg));
+        }
+        bfi.insert("backfill".into(), Value::Object(bf));
         top.insert("basic block filter index".into(), Value::Object(bfi));
     }
     Value::Object(top)
+}
+
+/// ETA estimator for the single-pass filter backfill. Same shape as
+/// `estimate_remaining_seconds` for the address-index but reads the
+/// linear `progress_ratio` (no two-pass weighting).
+#[cfg(feature = "block-filter-index")]
+fn estimate_filter_remaining_seconds(report: &filter::StatusReport) -> u64 {
+    if report.progress_ratio <= 0.0 || report.progress_ratio >= 1.0 {
+        return 0;
+    }
+    if report.started_at_unix == 0 {
+        return 0;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if now <= report.started_at_unix {
+        return 0;
+    }
+    let elapsed = now - report.started_at_unix;
+    let remaining_ratio = 1.0 - report.progress_ratio;
+    ((elapsed as f64) * (remaining_ratio / report.progress_ratio)) as u64
 }
 
 /// Estimate seconds-to-completion from elapsed time and progress
@@ -162,13 +216,28 @@ fn estimate_remaining_seconds(report: &crate::index::address::backfill::StatusRe
 ///
 /// `Failed` is treated as a non-terminal recovery state (lenient
 /// contract): a fresh `backfillindex` after a failed run starts over.
+#[allow(clippy::too_many_arguments)]
 pub fn backfill_index(
     backfill: Option<&Arc<BackfillHandle>>,
     cmd_tx: Option<&tokio::sync::mpsc::Sender<BackfillCommand>>,
     chain: &Arc<ChainState>,
     address_index_enabled: bool,
     target: &str,
+    #[cfg(feature = "block-filter-index")] filter_backfill: Option<&Arc<filter::BackfillHandle>>,
+    #[cfg(feature = "block-filter-index")] filter_cmd_tx: Option<
+        &tokio::sync::mpsc::Sender<filter::BackfillCommand>,
+    >,
+    #[cfg(feature = "block-filter-index")] block_filter_index_enabled: bool,
 ) -> Result<Value, (i32, String)> {
+    #[cfg(feature = "block-filter-index")]
+    if target == "blockfilter" {
+        return backfill_index_filter(
+            filter_backfill,
+            filter_cmd_tx,
+            chain,
+            block_filter_index_enabled,
+        );
+    }
     if target != "address" {
         return Err((-8, format!("unknown index target '{}'", target)));
     }
@@ -355,7 +424,16 @@ fn require_active_backfill(handle: &Arc<BackfillHandle>) -> Result<(), (i32, Str
 pub fn pause_index(
     backfill: Option<&Arc<BackfillHandle>>,
     target: &str,
+    #[cfg(feature = "block-filter-index")] filter_backfill: Option<&Arc<filter::BackfillHandle>>,
 ) -> Result<Value, (i32, String)> {
+    #[cfg(feature = "block-filter-index")]
+    if target == "blockfilter" {
+        let h = filter_backfill
+            .ok_or((-32603, "filter backfill handle not initialized".to_string()))?;
+        require_active_filter_backfill(h)?;
+        h.pause();
+        return Ok(json!({"paused": true, "state": h.cursor().state.label()}));
+    }
     if target != "address" {
         return Err((-8, format!("unknown index target '{}'", target)));
     }
@@ -368,7 +446,16 @@ pub fn pause_index(
 pub fn resume_index(
     backfill: Option<&Arc<BackfillHandle>>,
     target: &str,
+    #[cfg(feature = "block-filter-index")] filter_backfill: Option<&Arc<filter::BackfillHandle>>,
 ) -> Result<Value, (i32, String)> {
+    #[cfg(feature = "block-filter-index")]
+    if target == "blockfilter" {
+        let h = filter_backfill
+            .ok_or((-32603, "filter backfill handle not initialized".to_string()))?;
+        require_active_filter_backfill(h)?;
+        h.resume();
+        return Ok(json!({"resumed": true, "state": h.cursor().state.label()}));
+    }
     if target != "address" {
         return Err((-8, format!("unknown index target '{}'", target)));
     }
@@ -381,7 +468,16 @@ pub fn resume_index(
 pub fn cancel_index(
     backfill: Option<&Arc<BackfillHandle>>,
     target: &str,
+    #[cfg(feature = "block-filter-index")] filter_backfill: Option<&Arc<filter::BackfillHandle>>,
 ) -> Result<Value, (i32, String)> {
+    #[cfg(feature = "block-filter-index")]
+    if target == "blockfilter" {
+        let h = filter_backfill
+            .ok_or((-32603, "filter backfill handle not initialized".to_string()))?;
+        require_active_filter_backfill(h)?;
+        h.cancel();
+        return Ok(json!({"cancelled": true, "state": h.cursor().state.label()}));
+    }
     if target != "address" {
         return Err((-8, format!("unknown index target '{}'", target)));
     }
@@ -389,4 +485,185 @@ pub fn cancel_index(
     require_active_backfill(h)?;
     h.cancel();
     Ok(json!({"cancelled": true, "state": h.cursor().state.label()}))
+}
+
+/// Mirror of `require_active_backfill` for the filter-index family.
+#[cfg(feature = "block-filter-index")]
+fn require_active_filter_backfill(
+    handle: &Arc<filter::BackfillHandle>,
+) -> Result<(), (i32, String)> {
+    use filter::cursor::BackfillState;
+    let state = handle.cursor().state;
+    match state {
+        BackfillState::Running | BackfillState::Paused => Ok(()),
+        _ => Err((
+            -8,
+            format!(
+                "no filter backfill is in progress (state: {}); pause/resume/cancel apply only to running or paused backfills",
+                state.label()
+            ),
+        )),
+    }
+}
+
+/// Filter-index `backfillindex blockfilter` handler. Single-pass walk
+/// from genesis → tip; the synchronous setup runs `preflight_disk`,
+/// captures the active-chain anchor, and atomically persists `Running`
+/// before signalling the supervisor.
+#[cfg(feature = "block-filter-index")]
+fn backfill_index_filter(
+    backfill: Option<&Arc<filter::BackfillHandle>>,
+    cmd_tx: Option<&tokio::sync::mpsc::Sender<filter::BackfillCommand>>,
+    chain: &Arc<ChainState>,
+    block_filter_index_enabled: bool,
+) -> Result<Value, (i32, String)> {
+    use filter::cursor::BackfillState as FState;
+    if !block_filter_index_enabled {
+        return Err((
+            -8,
+            "block filter index is disabled (--blockfilterindex=0); enable it before requesting a backfill"
+                .into(),
+        ));
+    }
+    let h = backfill.ok_or((-32603, "filter backfill handle not initialized".to_string()))?;
+    let tx = cmd_tx.ok_or((
+        -32603,
+        "filter backfill supervisor not running — restart the daemon to wire it".to_string(),
+    ))?;
+
+    let cur = h.cursor();
+    match cur.state {
+        FState::Running | FState::Paused => Ok(filter_in_progress_response(&cur)),
+        FState::Completed => Ok(json!({
+            "started": false,
+            "reason": "filter backfill already completed for this datadir",
+            "state": cur.state.label(),
+            "snapshot_height": cur.snapshot_height,
+        })),
+        FState::Idle | FState::Cancelled | FState::Rejected | FState::Failed => {
+            filter_start_fresh(h, tx, chain, &cur)
+        }
+    }
+}
+
+#[cfg(feature = "block-filter-index")]
+fn filter_in_progress_response(cur: &filter::cursor::BackfillCursor) -> Value {
+    json!({
+        "started": false,
+        "reason": "filter backfill already in progress",
+        "state": cur.state.label(),
+        "cursor_height": cur.cursor_height,
+        "snapshot_height": cur.snapshot_height,
+    })
+}
+
+#[cfg(feature = "block-filter-index")]
+fn filter_start_fresh(
+    h: &Arc<filter::BackfillHandle>,
+    tx: &tokio::sync::mpsc::Sender<filter::BackfillCommand>,
+    chain: &Arc<ChainState>,
+    prev: &filter::cursor::BackfillCursor,
+) -> Result<Value, (i32, String)> {
+    filter::preflight_disk(chain).map_err(map_filter_backfill_err)?;
+
+    let (tip_hash, tip_height) = chain.tip_snapshot();
+    let store = chain.store_ref();
+
+    // Empty chain (genesis only): walk a one-element snapshot
+    // synchronously rather than spawning a runner. The runner has its
+    // own genesis emit branch so the synchronous shortcut just stamps
+    // the marker and Completes.
+    if tip_height == 0 {
+        h.reset_flags();
+        h.start(store.as_ref(), 0, tip_hash.to_byte_array())
+            .map_err(map_filter_backfill_err)?;
+        // Stamp filter row 0 inline — the runner walks 1..=tip, so an
+        // empty chain (height 0) skips the loop entirely. Emit genesis
+        // here so `getblockfilter <genesis>` works on an empty
+        // backfill chain.
+        let block = chain.get_block(&tip_hash).ok_or_else(|| {
+            (
+                -32603,
+                format!("missing genesis block data for {}", tip_hash),
+            )
+        })?;
+        let cfg = filter::FilterIndexConfig {
+            enabled: true,
+            peer_serve: false,
+        };
+        let prev_map: std::collections::HashMap<bitcoin::OutPoint, bitcoin::ScriptBuf> =
+            std::collections::HashMap::new();
+        let mut batch = crate::storage::StoreBatch::default();
+        if let Some((row, header_row)) = filter::build_filter_row_pair(
+            &cfg,
+            0,
+            &block,
+            &prev_map,
+            &filter::emit::GENESIS_PREV_FILTER_HEADER,
+        )
+        .map_err(|e| (-32603, format!("genesis filter emit: {e}")))?
+        {
+            batch.filter_puts.push(row);
+            batch.filter_header_puts.push(header_row);
+        }
+        store
+            .write_batch_mode(batch, crate::storage::WriteMode::Normal)
+            .map_err(|e| (-32603, format!("write genesis filter row: {e}")))?;
+        h.mark_completed(store.as_ref())
+            .map_err(map_filter_backfill_err)?;
+        return Ok(json!({
+            "started": true,
+            "completed": true,
+            "reason": "empty chain — only genesis filter stamped",
+            "previous_state": prev.state.label(),
+        }));
+    }
+
+    let permit = match tx.try_reserve() {
+        Ok(p) => p,
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+            return Ok(json!({
+                "started": false,
+                "reason": "another filter backfill start is already queued",
+                "state": prev.state.label(),
+            }));
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+            return Err((
+                -32603,
+                "filter backfill supervisor channel closed; restart the daemon".to_string(),
+            ));
+        }
+    };
+
+    h.reset_flags();
+    match h.start(store.as_ref(), tip_height, tip_hash.to_byte_array()) {
+        Ok(()) => {}
+        Err(filter::BackfillError::AlreadyRunning(_)) => {
+            drop(permit);
+            return Ok(filter_in_progress_response(&h.cursor()));
+        }
+        Err(e) => {
+            drop(permit);
+            return Err(map_filter_backfill_err(e));
+        }
+    }
+    permit.send(filter::BackfillCommand::Start);
+    Ok(json!({
+        "started": true,
+        "previous_state": prev.state.label(),
+        "snapshot_height": tip_height,
+    }))
+}
+
+#[cfg(feature = "block-filter-index")]
+fn map_filter_backfill_err(e: filter::BackfillError) -> (i32, String) {
+    use filter::BackfillError as E;
+    match e {
+        E::FilterIndexDisabled => (
+            -8,
+            "block filter index is disabled; enable --blockfilterindex=basic first".into(),
+        ),
+        other => (-32603, format!("filter backfill setup failed: {}", other)),
+    }
 }
