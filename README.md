@@ -8,8 +8,9 @@ One process. One RocksDB. One systemd unit.
 
 Pre-1.0; tracks mainnet from genesis. Consensus parity with Bitcoin Core
 v28+, validated against the C++ verifier as a shadow on every block sync
-through ~945k. See `CORE_GAPS.md` for the gap matrix and `STABILITY_POLICY.md`
-for the integrator-facing stability contract.
+through ~945k. See `CORE_DIFFERENCES.md` for the catalog of intentional deviations
+(extra surfaces, exclusions, default differences) and
+`STABILITY_POLICY.md` for the integrator-facing stability contract.
 
 What's implemented today (non-exhaustive):
 
@@ -146,7 +147,7 @@ cargo clippy --all-features --all-targets -- -D warnings
 | File | Purpose |
 |---|---|
 | `README.md` | This file — overview + quick start. |
-| `CORE_GAPS.md` | Gap matrix vs. Bitcoin Core (consensus / reliability / operational). |
+| `CORE_DIFFERENCES.md` | Catalog of intentional deviations from Bitcoin Core: native protocol surfaces, exclusions, behavioral defaults, and the migration path for Core operators. |
 | `OPERATOR_ERGONOMICS.md` | Operator-facing flag matrix, tuning, every shipped surface. |
 | `STABILITY_POLICY.md` | Tiered stability contract; deprecation policy; canary CI. |
 | `ECOSYSTEM.md` | Mobile / packaging strategy; why native + shared chainstate. |

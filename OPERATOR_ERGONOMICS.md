@@ -508,11 +508,14 @@ filter headers the live `connect_block` emitted above
 
 ### Caveats
 
-- **Pruning** is not yet implemented (see `CORE_GAPS.md`). Once it
-  lands, the filter index will survive pruning by construction
-  (filters are independent of full block bodies) — but a pruned
-  datadir cannot retroactively backfill (the runner reads each
-  block's persisted undo data, which `--prune` discards).
+- **Pruning** (`-prune=<MB>`) is implemented. The filter index
+  survives pruning by construction (filters are independent of full
+  block bodies) — but a pruned datadir cannot retroactively backfill
+  the filter index (the runner reads each block's persisted undo data,
+  which `--prune` discards). Operators who plan to enable
+  `--blockfilterindex=basic` after running pruned should keep the
+  filter index enabled from the start, or temporarily lift the prune
+  to allow the backfill to read undo data.
 - **`--reindex-chainstate`** is still available as a heavier last-
   resort remediation if undo data is corrupt or unavailable. Prefer
   `backfillindex blockfilter` for the common upgrade path.

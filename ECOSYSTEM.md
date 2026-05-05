@@ -2,7 +2,7 @@
 
 Strategic direction for how satd integrates with the broader Bitcoin ecosystem: which mobile clients we target, which API surfaces we expose, and how we make satd easy to package for self-custody stacks (Umbrel, Start9, RaspiBlitz, MyNode, BTCPay, home-server distros).
 
-Not a milestone spec. This doc guides future milestones and informs packaging / API decisions as they arise. Implementation status of each surface listed below is tracked in `CORE_GAPS.md` (A1–A10) and the "shipped" markers in `OPERATOR_ERGONOMICS.md`.
+Not a milestone spec. This doc guides future milestones and informs packaging / API decisions as they arise. Implementation status of each surface listed below is captured in `CORE_DIFFERENCES.md` and the "shipped" markers in `OPERATOR_ERGONOMICS.md`.
 
 ---
 
