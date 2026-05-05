@@ -2140,6 +2140,7 @@ dependencies = [
  "jsonrpsee",
  "libc",
  "lru",
+ "node-filter-index",
  "node-index",
  "rand 0.8.5",
  "rocksdb",
@@ -2152,6 +2153,15 @@ dependencies = [
  "tower 0.5.3",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "node-filter-index"
+version = "0.1.0"
+dependencies = [
+ "bitcoin",
+ "serde",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -3163,6 +3173,7 @@ dependencies = [
  "hex",
  "jsonrpsee",
  "node",
+ "node-filter-index",
  "node-index",
  "rand 0.8.5",
  "reqwest",

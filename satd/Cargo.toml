@@ -3,9 +3,17 @@ name = "satd"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = ["block-filter-index"]
+# Forwards `node`'s `block-filter-index` feature so a `cargo build
+# --no-default-features` on the satd binary produces a consensus-only
+# build with no BIP 158 codec compiled in.
+block-filter-index = ["node/block-filter-index"]
+
 [dependencies]
-node = { path = "../node" }
+node = { path = "../node", default-features = false }
 node-index = { path = "../node-index" }
+node-filter-index = { path = "../node-filter-index" }
 esplora-handlers = { path = "../esplora-handlers" }
 electrum-proto = { path = "../electrum-proto" }
 satd-events = { path = "../events", features = ["grpc", "zmq"] }
