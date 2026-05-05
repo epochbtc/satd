@@ -2017,20 +2017,99 @@ fn test_getchaintips_fields() {
 }
 
 #[test]
-fn test_getblockfilter_not_found() {
-    // getblockfilter is not implemented — verify we get an appropriate error.
+fn test_getblockfilter_errors_when_index_disabled() {
+    // Default-off: --blockfilterindex is not set, so getblockfilter
+    // returns an error citing the disabled index. The genesis hash is
+    // a real, known hash on regtest so the failure path is "index
+    // disabled" rather than "block not found".
     let mut node = TestNode::start(&[]);
-    let fake_hash = "0000000000000000000000000000000000000000000000000000000000000000";
+    let genesis_hash = node
+        .rpc_call_with_params("getblockhash", vec![serde_json::json!(0)])
+        .unwrap()["result"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let response = node
-        .rpc_call_with_params("getblockfilter", vec![serde_json::json!(fake_hash)])
+        .rpc_call_with_params("getblockfilter", vec![serde_json::json!(genesis_hash)])
         .unwrap();
-
-    // Should return an error (method not found or not implemented)
     assert!(
         response["error"].is_object(),
-        "getblockfilter should return an error, got: {:?}",
+        "getblockfilter should error when index is disabled, got: {:?}",
         response
     );
+    let msg = response["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("disabled") || msg.contains("not synced"),
+        "expected disabled/not-synced message, got: {msg}"
+    );
+
+    node.stop();
+}
+
+#[test]
+fn test_getblockfilter_returns_filter_when_complete() {
+    // With --blockfilterindex=basic enabled on a fresh-from-genesis
+    // regtest sync, the completeness marker is true at open and the
+    // genesis filter is emitted by the connect_block hook. Hitting
+    // getblockfilter with the genesis hash must return a hex filter
+    // and a hex header.
+    let mut node = TestNode::start(&["--blockfilterindex=basic"]);
+    let genesis_hash = node
+        .rpc_call_with_params("getblockhash", vec![serde_json::json!(0)])
+        .unwrap()["result"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let response = node
+        .rpc_call_with_params("getblockfilter", vec![serde_json::json!(genesis_hash)])
+        .unwrap();
+    let result = &response["result"];
+    assert!(
+        result.is_object(),
+        "expected getblockfilter to return object, got: {:?}",
+        response
+    );
+    let filter_hex = result["filter"].as_str().expect("filter field");
+    let header_hex = result["header"].as_str().expect("header field");
+    // Hex-encoded; no 0x prefix; lowercase.
+    assert!(filter_hex.chars().all(|c| c.is_ascii_hexdigit()));
+    assert_eq!(header_hex.len(), 64, "header should be 32 bytes hex");
+
+    node.stop();
+}
+
+#[test]
+fn test_getindexinfo_includes_basic_block_filter_index_key() {
+    // With --blockfilterindex=basic, getindexinfo must surface the
+    // Bitcoin-Core-shaped key "basic block filter index" alongside
+    // "address". synced=true on a fresh-sync datadir.
+    let mut node = TestNode::start(&["--blockfilterindex=basic"]);
+    let response = node.rpc_call("getindexinfo").unwrap();
+    let result = &response["result"];
+    assert!(
+        result["basic block filter index"].is_object(),
+        "expected 'basic block filter index' key, got: {:?}",
+        result
+    );
+    assert!(
+        result["basic block filter index"]["synced"]
+            .as_bool()
+            .unwrap_or(false),
+        "expected synced=true on fresh-sync datadir"
+    );
+
+    node.stop();
+}
+
+#[test]
+fn test_config_peerblockfilters_forces_blockfilterindex() {
+    // Setting --peerblockfilters=1 alone auto-enables the index.
+    // getconfig surfaces the resolved values via effective_view.
+    let mut node = TestNode::start(&["--peerblockfilters=1"]);
+    let response = node.rpc_call("getconfig").unwrap();
+    let bfi = &response["result"]["block_filter_index"];
+    assert_eq!(bfi["enabled"].as_bool(), Some(true));
+    assert_eq!(bfi["peer_serve"].as_bool(), Some(true));
 
     node.stop();
 }

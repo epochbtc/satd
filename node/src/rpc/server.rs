@@ -100,11 +100,12 @@ pub struct RpcContext {
     pub listener_status: Arc<ServerListenerStatus>,
     /// Whether the BIP 158 filter index is enabled at runtime — used
     /// by `getindexinfo` and `getserverstatus` to populate the
-    /// `block_filter_index.enabled` field. PR-5 of the BIP 157/158
-    /// stack wires this to `config.blockfilterindex`.
+    /// `block_filter_index.enabled` field.
     #[cfg(feature = "block-filter-index")]
     pub blockfilterindex_enabled: bool,
-    /// BIP 158 filter index — read surface for `getblockfilter`.
+    /// Read-side handle for the BIP 158 compact-block-filter index.
+    /// `getblockfilter` reads through this. `None` when the binary
+    /// was constructed without the filter index wired.
     #[cfg(feature = "block-filter-index")]
     pub filter_index: Option<Arc<dyn node_filter_index::FilterIndex>>,
     /// Filter-index backfill handle. `Some` when the filter-index
@@ -436,6 +437,25 @@ pub async fn start(
     })?;
 
     // --- Index control RPCs (M7) ---
+
+    #[cfg(feature = "block-filter-index")]
+    module.register_method("getblockfilter", |params, ctx, _extensions| {
+        // `getblockfilter <blockhash> [filtertype]`. Bitcoin-Core-compatible.
+        let mut seq = params.sequence();
+        let block_hash: String = seq
+            .next()
+            .map_err(|e| ErrorObjectOwned::owned(-8, e.to_string(), None::<()>))?;
+        let filter_type: Option<String> = seq
+            .optional_next()
+            .map_err(|e| ErrorObjectOwned::owned(-8, e.to_string(), None::<()>))?;
+        indexes::get_block_filter(
+            &ctx.chain_state,
+            ctx.filter_index.as_ref(),
+            &block_hash,
+            filter_type.as_deref(),
+        )
+        .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
+    })?;
 
     module.register_method("getindexinfo", |_params, ctx, _extensions| {
         Ok::<_, ErrorObjectOwned>(indexes::get_index_info(
