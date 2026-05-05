@@ -69,20 +69,22 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Linux runners need clang/libclang for rocksdb-sys bindgen and
-      # cmake for the rocksdb native code. Pre-installed on
-      # ubuntu-24.04 + ubuntu-24.04-arm; this step is a sanity check
-      # that makes the dependency explicit so a future runner image
-      # change can't silently break the build.
-      - name: Verify Linux build deps
+      # rocksdb-sys needs libclang (bindgen headers) and the rocksdb
+      # native build wants cmake. Hosted ubuntu-24.04 ships clang +
+      # cmake binaries but NOT libclang-dev — install explicitly.
+      # libssl-dev is needed by the openssl-sys path in reqwest's
+      # native-tls backend.
+      - name: Install Linux build deps
         if: runner.os == 'Linux'
         run: |
           set -euo pipefail
-          for tool in clang cmake pkg-config; do
-            command -v "$tool" >/dev/null || { echo "missing: $tool"; exit 1; }
-          done
-          dpkg -s libclang-dev >/dev/null
-          dpkg -s libssl-dev >/dev/null
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang \
+            cmake \
+            libclang-dev \
+            libssl-dev \
+            pkg-config
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
