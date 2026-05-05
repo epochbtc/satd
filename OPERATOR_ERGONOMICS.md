@@ -416,6 +416,130 @@ over P2P for light clients. Pairs naturally with the address index work.
 
 **Effort:** L.
 
+**Status (2026-05): BIP 157/158 has landed.** Silent Payments deferred —
+see `bip157-158-compact-filters.md` for the implementation plan.
+
+---
+
+## Compact block filter index (BIP 157 / 158)
+
+> *Note: BIP 158 is the compact-block-filter format (GCS-encoded
+> `(scriptPubKey)` set per block); BIP 157 is the P2P service that
+> serves filters and chained filter headers (`getcfilters` /
+> `getcfheaders` / `getcfcheckpt`). Together they let mobile and
+> embedded wallets like Zeus, Blixt, and Mutiny scan privately
+> without maintaining a per-scripthash subscription on a remote
+> server.*
+
+**Status (2026-05): shipped.** satd builds the BIP 158 SCRIPT_FILTER
+(filter type `0x00`, the only type the spec defines today) atomically
+inside the existing `connect_block` / `disconnect_block` write batch,
+and answers BIP 157 P2P requests when the operator opts in.
+
+### Operator quick-start
+
+```sh
+# Build the filter index (no P2P advertisement)
+satd --blockfilterindex=basic
+
+# Same, plus advertise NODE_COMPACT_FILTERS and answer P2P queries
+satd --blockfilterindex=basic --peerblockfilters=1
+
+# Bitcoin Core spelling also accepted:
+#   --blockfilterindex=basic    # alias for --blockfilterindex=1
+#   -noindex=blockfilter        # alias for --blockfilterindex=0
+```
+
+### Flags
+
+| Flag | Default | Notes |
+|---|---|---|
+| `--blockfilterindex=<0\|1\|basic>` | `0` | Builds the index; one filter blob (~30 KB) + 32-byte chained header per connected block. |
+| `--peerblockfilters=<bool>` | `0` | Advertises `NODE_COMPACT_FILTERS` (bit 6) at the version handshake and serves `getcfilters` / `getcfheaders` / `getcfcheckpt`. Implies `--blockfilterindex=basic`. |
+
+### Verification
+
+```sh
+satd-cli getindexinfo
+# {
+#   "address": { ... },
+#   "basic block filter index": {
+#     "synced": true,
+#     "best_block_height": 947910
+#   }
+# }
+
+satd-cli getserverstatus
+# { "blockfilterindex": { "enabled": true, "complete": true }, ... }
+
+satd-cli getblockfilter <blockhash>
+# { "filter": "<hex>", "header": "<hex>" }
+```
+
+### Tor deployment
+
+The BIP 157 service is the natural pairing for a Tor-only node:
+mobile wallets connect over `.onion`, work through CGNAT, and never
+leak the operator's home IP. Combine with `--listenonion` /
+`--onlynet=onion` and use the standard P2P port:
+
+```sh
+satd \
+    --blockfilterindex=basic --peerblockfilters=1 \
+    --listenonion --onlynet=onion \
+    --torcontrol=127.0.0.1:9051
+```
+
+The mobile wallet `addpeer`s your node's `.onion`; embedded-Neutrino
+clients (Zeus-embedded, Blixt) discover your peer via service-flag
+filtering on connect.
+
+### Backfilling pre-existing datadirs
+
+Datadirs that were synced before the BIP 158 filter index landed (or
+that previously ran with `--blockfilterindex=0`) start with the
+completeness marker `false`. `getblockfilter` errors with "block
+filter index is not synced" and the BIP 157 P2P arms silent-drop.
+
+To retroactively populate the index without a full chain rebuild:
+
+1. Restart with `--blockfilterindex=basic`.
+2. Trigger the deferred backfill:
+
+   ```sh
+   sat-cli backfillindex blockfilter
+   ```
+
+3. Monitor progress:
+
+   ```sh
+   sat-cli getindexinfo
+   # → result["basic block filter index"]["backfill"]["state"] / cursor_height /
+   #   snapshot_height / estimated_remaining_seconds
+   ```
+
+   Operator controls: `pauseindex blockfilter`, `resumeindex
+   blockfilter`, `cancelindex blockfilter`. The cursor is persisted
+   atomically with each filter row so a kill -9 mid-flight resumes
+   cleanly on the next start.
+
+The backfill is a single-pass walk over `(block, undo)` per height,
+which means it requires the on-disk undo data the connect-block path
+already wrote. After completion, a tail catch-up phase rewrites any
+filter headers the live `connect_block` emitted above
+`snapshot_height` so the BIP 157 chain is intact at completion.
+
+### Caveats
+
+- **Pruning** is not yet implemented (see `CORE_GAPS.md`). Once it
+  lands, the filter index will survive pruning by construction
+  (filters are independent of full block bodies) — but a pruned
+  datadir cannot retroactively backfill (the runner reads each
+  block's persisted undo data, which `--prune` discards).
+- **`--reindex-chainstate`** is still available as a heavier last-
+  resort remediation if undo data is corrupt or unavailable. Prefer
+  `backfillindex blockfilter` for the common upgrade path.
+
 ---
 
 ## Electrum/electrs Integration

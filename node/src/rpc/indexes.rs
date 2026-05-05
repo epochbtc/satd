@@ -667,3 +667,115 @@ fn map_filter_backfill_err(e: filter::BackfillError) -> (i32, String) {
         other => (-32603, format!("filter backfill setup failed: {}", other)),
     }
 }
+
+/// `getblockfilter <blockhash> [filtertype]` — Bitcoin-Core-compatible
+/// RPC. Returns `{filter: hex, header: hex}` for the basic filter at
+/// the block.
+///
+/// Errors:
+/// - `RPC_INVALID_ADDRESS_OR_KEY` (-5) when the block hash is unknown.
+/// - `RPC_INVALID_PARAMETER` (-8) when `filtertype` is not `"basic"`.
+/// - `RPC_MISC_ERROR` (-1) when the index is disabled or not synced.
+#[cfg(feature = "block-filter-index")]
+pub fn get_block_filter(
+    chain: &Arc<ChainState>,
+    filter_index: Option<&Arc<dyn node_filter_index::FilterIndex>>,
+    block_hash_hex: &str,
+    filter_type_str: Option<&str>,
+) -> Result<Value, (i32, String)> {
+    use bitcoin::BlockHash;
+    use bitcoin::hashes::{Hash, hex::FromHex};
+    use node_filter_index::FILTER_TYPE_BASIC;
+
+    let filter_type = match filter_type_str {
+        None | Some("basic") => FILTER_TYPE_BASIC,
+        Some(other) => return Err((-8, format!("unknown filter type '{other}'"))),
+    };
+
+    let raw = <[u8; 32]>::from_hex(block_hash_hex)
+        .map_err(|e| (-5, format!("blockhash must be hex of length 64: {e}")))?;
+    // Bitcoin block hashes are display-reversed; the wire-format we
+    // deserialize from the user's hex IS the consensus byte order.
+    // `BlockHash::from_byte_array` takes consensus bytes — but the
+    // user typed the display form. Reverse it.
+    let mut consensus = raw;
+    consensus.reverse();
+    let block_hash =
+        BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(consensus));
+
+    let entry = chain
+        .get_block_index(&block_hash)
+        .ok_or_else(|| (-5, "block not found".to_string()))?;
+    let height = entry.height;
+
+    // Active-chain check (review 2026-05-04 H2): the filter index is
+    // height-keyed, so resolving a stale/fork/header-only block hash
+    // through `get_block_index` and then reading by height would
+    // return the active block's filter under the wrong hash. Reject
+    // any hash that isn't the active chain at its claimed height.
+    match chain.get_block_hash_by_height(height) {
+        Some(active) if active == block_hash => {}
+        _ => {
+            return Err((
+                -5,
+                "filter not found for non-active block".to_string(),
+            ));
+        }
+    }
+
+    let idx = filter_index.ok_or_else(|| {
+        (
+            -1,
+            "block filter index not initialized in this build".to_string(),
+        )
+    })?;
+
+    let filter_bytes = idx
+        .filter_at(filter_type, height)
+        .map_err(map_filter_index_err)?;
+    let header_bytes = idx
+        .header_at(filter_type, height)
+        .map_err(map_filter_index_err)?;
+
+    // Re-check the active-chain mapping after the index reads to
+    // prevent a concurrent reorg from interleaving a filter from one
+    // block with the active-chain hash of another. If the height
+    // mapping changed under us, surface as not-found rather than
+    // returning stale data.
+    match chain.get_block_hash_by_height(height) {
+        Some(active) if active == block_hash => {}
+        _ => {
+            return Err((
+                -5,
+                "filter not found: concurrent reorg displaced the requested block"
+                    .to_string(),
+            ));
+        }
+    }
+
+    // Header byte order (review 2026-05-04 M2): Bitcoin Core's RPC
+    // convention for uint256-shaped fields is the display/reversed
+    // hex encoding, which is what `FilterHeader::to_string()` /
+    // `Display` produces. Returning `hex::encode(header_bytes)`
+    // would emit the internal/wire byte order (reversed relative to
+    // Core).
+    let header_display =
+        bitcoin::bip158::FilterHeader::from_byte_array(header_bytes).to_string();
+
+    Ok(json!({
+        "filter": hex::encode(filter_bytes),
+        "header": header_display,
+    }))
+}
+
+#[cfg(feature = "block-filter-index")]
+fn map_filter_index_err(e: node_filter_index::IndexError) -> (i32, String) {
+    use node_filter_index::IndexError;
+    match e {
+        IndexError::Disabled => (-1, "block filter index is disabled".to_string()),
+        IndexError::Incomplete => (-1, "block filter index is not synced".to_string()),
+        IndexError::NotFound(h) => (-5, format!("filter not found at height {h}")),
+        IndexError::InvalidRange { .. } => (-8, "invalid filter range".to_string()),
+        IndexError::Storage(s) => (-1, format!("filter storage error: {s}")),
+    }
+}

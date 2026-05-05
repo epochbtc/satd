@@ -286,20 +286,6 @@ pub struct Config {
     /// disable via `--addressindex=0` or `-noindex=address`. Backs the
     /// future native Electrum and Esplora subsystems.
     pub addressindex: bool,
-    /// BIP 158 compact-block-filter index. Off by default; enable via
-    /// `--blockfilterindex=basic` (or `--blockfilterindex=1`). PR-3 of
-    /// the BIP 157/158 stack adds the runtime knob and its backfill
-    /// supervisor; PR-5 layers the bitcoin.conf alias and
-    /// `effective_view` reconciliation on top.
-    pub blockfilterindex: bool,
-    /// Advertise `NODE_COMPACT_FILTERS` and serve BIP 157 messages
-    /// (`getcfilters` / `getcfheaders` / `getcfcheckpt`). Off by
-    /// default — operators who want to expose filter data over P2P
-    /// must opt in. PR-4 of the BIP 157/158 stack ships the runtime
-    /// knob; PR-5 layers the bitcoin.conf alias and reconciliation
-    /// (forces `blockfilterindex=basic` when this is on; refuses on
-    /// explicit conflict).
-    pub peerblockfilters: bool,
     /// Maximum concurrent per-scripthash status subscriptions. Caps
     /// memory growth from the per-scripthash broadcast registry.
     /// Default 10000 — generous for typical xpub-derivation patterns.
@@ -376,6 +362,19 @@ pub struct Config {
     /// composed at request time (`format!("powered by satd {}",
     /// version)`).
     pub electrum_banner: Option<String>,
+    /// BIP 158 compact-block-filter index (per `ECOSYSTEM.md` §3,
+    /// `bip157-158-compact-filters.md`). Off by default; enable via
+    /// `--blockfilterindex=basic` (Bitcoin-Core-compatible spelling)
+    /// or `--blockfilterindex=1`. Required for the BIP 157 P2P
+    /// service and the `getblockfilter` RPC. Implies an additional
+    /// per-block disk write of ~30 KB filter blob + 32-byte header.
+    pub blockfilterindex: bool,
+    /// Whether to advertise `NODE_COMPACT_FILTERS` and answer
+    /// `getcfilters` / `getcfheaders` / `getcfcheckpt` over the BIP
+    /// 157 P2P service. Off by default. Enabling requires
+    /// `--blockfilterindex=basic`; the `Config::load` reconciliation
+    /// hard-fails on the conflict.
+    pub peerblockfilters: bool,
     pub prune: u64,
     pub reindex: bool,
     pub reindex_chainstate: bool,
@@ -707,30 +706,10 @@ impl Config {
             .or_else(|| file_get("addrindexsubscriptions").and_then(|v| v.parse().ok()))
             .unwrap_or(10_000);
 
-        // BIP 158 compact-block-filter index: off by default. PR-3
-        // reads only the `--blockfilterindex` CLI flag; PR-5 layers
-        // on `bitcoin.conf` aliases (`-noindex=blockfilter`,
-        // `-blockfilterindex=basic`) and reconciliation.
-        let blockfilterindex = cli
-            .blockfilterindex
-            .or_else(|| file_get("blockfilterindex").and_then(|v| parse_blockfilterindex_value(&v)))
-            .unwrap_or(false);
-
-        // Serve BIP 157 messages over P2P. Off by default — operators
-        // who want the daemon to advertise NODE_COMPACT_FILTERS and
-        // answer `getcfilters` / `getcfheaders` / `getcfcheckpt` must
-        // opt in. Refuses if `blockfilterindex` is off.
-        let peerblockfilters = cli
-            .peerblockfilters
-            .or_else(|| file_get("peerblockfilters").and_then(|v| parse_bool(&v)))
-            .unwrap_or(false);
-        if peerblockfilters && !blockfilterindex {
-            return Err(
-                "peerblockfilters=1 requires blockfilterindex=basic. \
-                 Either pass --blockfilterindex=basic or drop --peerblockfilters."
-                    .to_string(),
-            );
-        }
+        // BIP 158 compact-block-filter index + peerblockfilters: see
+        // the resolution block below near line 833 (it includes the
+        // `-noindex=blockfilter` alias handling and `peerblockfilters`
+        // reconciliation that PR-5 layers on top of PR-3's CLI knob).
 
         // Esplora REST server: on by default. Disabling requires
         // turning off --addressindex too (Esplora reads through it),
@@ -830,6 +809,23 @@ impl Config {
             .or_else(|| file_get("electrumfeehistogramttl").and_then(|v| v.parse().ok()))
             .unwrap_or(10);
         let electrum_banner = cli.electrumbanner.or_else(|| file_get("electrumbanner"));
+
+        // BIP 158 filter index. CLI `--blockfilterindex=<0|1|basic>`,
+        // config `blockfilterindex=<0|1|basic>`, or
+        // `-noindex=blockfilter` (translated to `--blockfilterindex=0`
+        // by the alias normalizer, mirroring `-noindex=address`).
+        // Off by default per Bitcoin Core's documented stance: the
+        // operator pays the disk overhead only when wallets need it.
+        let blockfilterindex = cli
+            .blockfilterindex
+            .or_else(|| file_get("blockfilterindex").and_then(parse_blockfilterindex_value))
+            .unwrap_or(false);
+
+        // BIP 157 P2P advertisement and serving.
+        let peerblockfilters = cli
+            .peerblockfilters
+            .or_else(|| file_get("peerblockfilters").and_then(|v| parse_bool(&v)))
+            .unwrap_or(false);
         // TLS partial-config validation. The server-side `bind` also
         // catches this, but checking here lets us surface a friendlier
         // CLI message and refuse to start up.
@@ -929,6 +925,37 @@ impl Config {
         }
         let electrum = electrum_resolved;
 
+        // BIP 157/158 reconciliation. `--peerblockfilters=1` requires
+        // `--blockfilterindex=basic` because the P2P arms read through
+        // the index. Mirror the Esplora ↔ addressindex coupling: if
+        // the operator only sets `peerblockfilters`, auto-enable the
+        // index with a config-load note. If they explicitly disabled
+        // the index, refuse to start.
+        let mut blockfilterindex_resolved = blockfilterindex;
+        let blockfilterindex_explicitly_disabled = cli.blockfilterindex == Some(false)
+            || file_get("blockfilterindex")
+                .and_then(parse_blockfilterindex_value)
+                .map(|v| !v)
+                .unwrap_or(false);
+        if peerblockfilters && !blockfilterindex_resolved && !blockfilterindex_explicitly_disabled
+        {
+            pending_notes.push(ConfigNote {
+                level: NoteLevel::Info,
+                message: "peerblockfilters is enabled; auto-enabling --blockfilterindex=basic \
+                          (required for the BIP 157 P2P service to read filter rows)"
+                    .to_string(),
+            });
+            blockfilterindex_resolved = true;
+        } else if peerblockfilters && blockfilterindex_explicitly_disabled {
+            return Err(
+                "peerblockfilters=1 with blockfilterindex=0 in config: refusing to start. \
+                 The BIP 157 P2P service reads through the filter index — enable it with \
+                 --blockfilterindex=basic, or set --peerblockfilters=0."
+                    .into(),
+            );
+        }
+        let blockfilterindex = blockfilterindex_resolved;
+
         // Validate prune + txindex conflict (now redundant with the
         // esplora reconciliation above for the esplora=1 path, but
         // still catches the operator who explicitly enables both).
@@ -965,8 +992,6 @@ impl Config {
             permitbaremultisig,
             txindex,
             addressindex,
-            blockfilterindex,
-            peerblockfilters,
             addrindexsubscriptions,
             esplora,
             esplora_bind,
@@ -990,6 +1015,8 @@ impl Config {
             electrum_max_broadcast_package_txs,
             electrum_fee_histogram_ttl,
             electrum_banner,
+            blockfilterindex,
+            peerblockfilters,
             prune,
             reindex: cli.reindex,
             reindex_chainstate: cli.reindex_chainstate,
@@ -1270,6 +1297,10 @@ impl Config {
                 "bind": if self.electrum { Some(self.electrum_bind.clone()) } else { None },
                 "tls_bind": if self.electrum { self.electrum_tls_bind.clone() } else { None },
             },
+            "block_filter_index": {
+                "enabled": self.blockfilterindex,
+                "peer_serve": self.peerblockfilters,
+            },
         })
     }
 
@@ -1412,19 +1443,6 @@ pub struct CliArgs {
 
     #[arg(long, value_name = "BOOL", value_parser = parse_bool_arg, help = "Maintain an address-history index (default: true). Accepts 0/1/true/false.")]
     pub addressindex: Option<bool>,
-
-    /// BIP 158 compact-block-filter index. Accepts `0`, `1`, or the
-    /// Bitcoin-Core-compatible literal `basic` (alias for `1`). PR-5
-    /// adds the `bitcoin.conf` alias; PR-3 / PR-4 ship the runtime
-    /// knob and the P2P-serve companion knob.
-    #[arg(long, value_name = "MODE", value_parser = parse_blockfilterindex_arg, help = "Maintain a BIP 158 compact-block-filter index. Accepts 0/1/basic.")]
-    pub blockfilterindex: Option<bool>,
-
-    /// Advertise `NODE_COMPACT_FILTERS` and serve BIP 157 messages.
-    /// Off by default. Requires `--blockfilterindex` to be on; the
-    /// PR-4 wiring silent-drops requests when the index is incomplete.
-    #[arg(long, value_name = "BOOL", value_parser = parse_bool_arg, help = "Serve BIP 157 compact-filter messages over P2P. Default: false.")]
-    pub peerblockfilters: Option<bool>,
 
     #[arg(
         long,
@@ -1578,6 +1596,21 @@ pub struct CliArgs {
         help = "Custom banner returned by server.banner"
     )]
     pub electrumbanner: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "BOOL_OR_BASIC",
+        value_parser = parse_blockfilterindex_arg,
+        help = "Build a BIP 158 compact-block-filter index (default: false). Accepts 0/1/basic; \"basic\" is the BIP 158 SCRIPT_FILTER (the only filter type defined today). Required by --peerblockfilters=1 and `getblockfilter`."
+    )]
+    pub blockfilterindex: Option<bool>,
+    #[arg(
+        long,
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        help = "Advertise NODE_COMPACT_FILTERS and answer getcfilters / getcfheaders / getcfcheckpt over P2P (default: false). Implies --blockfilterindex=basic."
+    )]
+    pub peerblockfilters: Option<bool>,
 
     #[arg(
         long,
@@ -1929,6 +1962,12 @@ fn translate_index_aliases(args: Vec<String>) -> Vec<String> {
         .map(|arg| match arg.as_str() {
             "-noindex=address" | "--noindex=address" => "--addressindex=0".to_string(),
             "-index=address" | "--index=address" => "--addressindex=1".to_string(),
+            // BIP 158 filter-index aliases. Bitcoin Core treats
+            // `-blockfilterindex=basic` as the canonical form; we
+            // translate both the legacy single-dash and the
+            // `-noindex=blockfilter` shorthand here.
+            "-noindex=blockfilter" | "--noindex=blockfilter" => "--blockfilterindex=0".to_string(),
+            "-index=blockfilter" | "--index=blockfilter" => "--blockfilterindex=basic".to_string(),
             _ => arg,
         })
         .collect()
@@ -2145,21 +2184,22 @@ fn parse_bool_arg(s: &str) -> Result<bool, String> {
     parse_bool(s).ok_or_else(|| format!("expected one of 0/1/true/false/yes/no, got '{s}'"))
 }
 
-/// Parse the `--blockfilterindex` value. Accepts `0`, `1`, the
-/// Bitcoin-Core-compatible literal `basic` (alias for `1`), and the
-/// usual bool spellings. Returns `Ok(true)` for the on-states and
-/// `Ok(false)` for the off-states. Future filter types will accept
-/// additional literals here without breaking back-compat.
-fn parse_blockfilterindex_value(s: &str) -> Option<bool> {
-    match s.to_ascii_lowercase().as_str() {
+/// Parse the `blockfilterindex` config value. Bitcoin Core accepts
+/// `0`, `1`, and the string `basic` (alias for `1`); we mirror that
+/// plus the usual bool spellings. Any other value yields `None` so
+/// the caller can fall back to the default (off).
+fn parse_blockfilterindex_value(s: String) -> Option<bool> {
+    match s.trim().to_ascii_lowercase().as_str() {
         "basic" => Some(true),
         other => parse_bool(other),
     }
 }
 
+/// Clap value-parser wrapper for `parse_blockfilterindex_value` so the
+/// CLI can take `--blockfilterindex=basic` alongside `=0` / `=1`.
 fn parse_blockfilterindex_arg(s: &str) -> Result<bool, String> {
-    parse_blockfilterindex_value(s)
-        .ok_or_else(|| format!("expected one of 0/1/basic/true/false, got '{s}'"))
+    parse_blockfilterindex_value(s.to_string())
+        .ok_or_else(|| format!("expected one of 0/1/basic/true/false/yes/no, got '{s}'"))
 }
 
 #[cfg(test)]
@@ -2262,8 +2302,6 @@ rpcport=8332
             permitbaremultisig: None,
             txindex: false,
             addressindex: None,
-            blockfilterindex: None,
-            peerblockfilters: None,
             addrindexsubscriptions: None,
             esplora: None,
             esplorabind: None,
@@ -2287,6 +2325,8 @@ rpcport=8332
             electrummaxbroadcastpackagetxs: None,
             electrumfeehistogramttl: None,
             electrumbanner: None,
+            blockfilterindex: None,
+            peerblockfilters: None,
             prune: None,
             reindex: false,
             reindex_chainstate: false,
@@ -2376,8 +2416,6 @@ rpcport=8332
             permitbaremultisig: None,
             txindex: false,
             addressindex: None,
-            blockfilterindex: None,
-            peerblockfilters: None,
             addrindexsubscriptions: None,
             esplora: None,
             esplorabind: None,
@@ -2401,6 +2439,8 @@ rpcport=8332
             electrummaxbroadcastpackagetxs: None,
             electrumfeehistogramttl: None,
             electrumbanner: None,
+            blockfilterindex: None,
+            peerblockfilters: None,
             prune: None,
             reindex: false,
             reindex_chainstate: false,

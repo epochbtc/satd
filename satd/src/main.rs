@@ -175,13 +175,10 @@ async fn main() {
 
     let reindex = config.reindex || config.reindex_chainstate;
     let store = match RocksDbStore::open(&net_datadir, config.txindex, rocksdb_cache_mb, reindex) {
-        // Round-1 review H2: tell the Store whether the address
-        // index is active so `write_batch_mode` can clear the
-        // `address_index.complete` marker atomically with any
-        // connect-with-addressindex-disabled batch. The filter-index
-        // builder follows the same shape, gated on
-        // `config.blockfilterindex` so a connect with the index
-        // disabled clears the completeness marker.
+        // Round-1 review H2: tell the Store whether the address +
+        // filter indexes are active so `write_batch_mode` can clear
+        // the corresponding `*.complete` markers atomically with any
+        // connect-with-index-off batch.
         Ok(s) => Box::new(
             s.with_addressindex_enabled(config.addressindex)
                 .with_blockfilterindex_enabled(config.blockfilterindex),
@@ -323,8 +320,7 @@ async fn main() {
         // no-op and the open-time consistency check stamps the
         // completeness marker false on the next connect. The
         // `peer_serve` knob (`--peerblockfilters=1`) gates the BIP
-        // 157 P2P service handlers; PR-5 layers `bitcoin.conf`
-        // aliases + reconciliation on top.
+        // 157 P2P service handlers.
         node::index::filter::FilterIndexConfig {
             enabled: config.blockfilterindex,
             peer_serve: config.peerblockfilters,
@@ -649,7 +645,8 @@ async fn main() {
     // Wire the BIP 158 filter index into the peer manager so the BIP
     // 157 service arms can read filter rows and the version handshake
     // can advertise `NODE_COMPACT_FILTERS` when both runtime knobs say
-    // yes (`--blockfilterindex=basic` AND `--peerblockfilters=1`).
+    // yes (`--blockfilterindex=basic` AND `--peerblockfilters=1`) AND
+    // the on-disk completeness marker is true.
     peer_manager.set_filter_index(filter_index.clone(), config.peerblockfilters);
 
     if config.prune > 0 {
@@ -904,18 +901,13 @@ async fn main() {
         Some(backfill_handle.clone()),
         Some(backfill_cmd_tx.clone()),
         listener_status.clone(),
-        // BIP 158 filter index: PR-3 plumbs the runtime knob through
-        // to RPC status surfaces (`getindexinfo`, `getserverstatus`).
-        // The 4 args below are gated by `node`'s `block-filter-index`
-        // feature, which is always on in any workspace build of
-        // `satd` (esplora-handlers / electrum-proto pull node in
-        // without `default-features = false`, so Cargo unifies the
+        // BIP 158 filter index: passed unconditionally because `node`'s
+        // `block-filter-index` feature is always on in any workspace
+        // build of `satd` (esplora-handlers / electrum-proto pull node
+        // in without `default-features = false`, so Cargo unifies the
         // feature on regardless of satd's per-binary feature gate).
-        // We pass them unconditionally — PR-5 wires `RocksFilterIndex`
-        // for the `filter_index` slot; until then it stays `None`
-        // and `getblockfilter` errors with "not initialized".
-        blockfilterindex_runtime,
-        None,
+        config.blockfilterindex,
+        Some(filter_index.clone()),
         Some(filter_backfill_handle.clone()),
         Some(filter_backfill_cmd_tx.clone()),
     )
