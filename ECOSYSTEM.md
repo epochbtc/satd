@@ -2,7 +2,7 @@
 
 Strategic direction for how satd integrates with the broader Bitcoin ecosystem: which mobile clients we target, which API surfaces we expose, and how we make satd easy to package for self-custody stacks (Umbrel, Start9, RaspiBlitz, MyNode, BTCPay, home-server distros).
 
-Not a milestone spec. This doc guides future milestones and informs packaging / API decisions as they arise. Implementation status of each surface listed below is tracked in `CORE_GAPS.md` (A1–A10) and the "shipped" markers in `OPERATOR_ERGONOMICS.md`.
+Not a milestone spec. This doc guides future milestones and informs packaging / API decisions as they arise. Implementation status of each surface listed below is captured in `CORE_DIFFERENCES.md` and the "shipped" markers in `OPERATOR_ERGONOMICS.md`.
 
 ---
 
@@ -165,7 +165,7 @@ The pre-implementation estimate, recorded for posterity:
 - **Esplora REST** (native, `esplora-handlers` crate): ~4-8 weeks on top of the index.
 - **Electrum** (vendored protocol code, `electrum-proto` crate): ~3-5 weeks of vendoring + adaptation, parallelizable with Esplora.
 
-Both protocols and the index landed in the timeframe estimated. The address-history index design is captured in `ADDRESS_INDEX.md`; both protocol surfaces are documented in `OPERATOR_ERGONOMICS.md` and `docs/api/esplora.md`.
+Both protocols and the index landed in the timeframe estimated. The shipped surfaces are summarized in `CORE_DIFFERENCES.md` §"Native protocol surfaces"; operator flags and tuning live in `OPERATOR_ERGONOMICS.md` and `docs/api/esplora.md`.
 
 #### Alternatives considered and rejected
 
@@ -219,9 +219,9 @@ Rough dependency order. Items 2-4 and 6 have shipped; 1 and 5 are partial; 7-8 r
 
 ## Open questions
 
-Resolved (kept here for traceability; the resolution is captured in code or in `ADDRESS_INDEX.md`):
+Resolved (kept here for traceability; the resolution lives in code and `CORE_DIFFERENCES.md`):
 
-- ~~Address-history index column-family layout.~~ **Resolved**: two CFs (`addr_funding`, `addr_spending`) keyed by `(scripthash[32], height_be[4], txid[32], vout/vin_be[4])`. See `ADDRESS_INDEX.md` §"Schema".
+- ~~Address-history index column-family layout.~~ **Resolved**: two CFs (`addr_funding`, `addr_spending`) keyed by `(scripthash[32], height_be[4], txid[32], vout/vin_be[4])`. See `node-index/src/keys.rs`.
 - ~~Address index opt-in vs. on-by-default.~~ **Resolved**: on by default (`--addressindex=1`); opt out with `--addressindex=0`. Esplora and Electrum auto-require it.
 - ~~AssumeUTXO interaction with the address-history index.~~ **Resolved**: deferred opt-in backfill via `backfillindex address` (and `backfillindex blockfilter` for the BIP 158 index). Operator triggers when convenient; node remains usable with partial history.
 

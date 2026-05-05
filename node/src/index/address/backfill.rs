@@ -1,7 +1,7 @@
-//! Deferred address-history backfill — the AssumeUTXO mitigation
-//! described in `ADDRESS_INDEX.md` §"Backfill". Two-pass walk over
-//! every block from genesis to the snapshot height, populating the
-//! `addr_funding` / `addr_spending` CFs that AssumeUTXO bypassed.
+//! Deferred address-history backfill — the AssumeUTXO mitigation.
+//! Two-pass walk over every block from genesis to the snapshot height,
+//! populating the `addr_funding` / `addr_spending` CFs that AssumeUTXO
+//! bypassed.
 //!
 //! Status: scaffolding (M7). The state machine, persistent cursor,
 //! and operator RPCs are wired so the feature is testable and
@@ -413,7 +413,8 @@ pub fn render_status(handle: Option<&BackfillHandle>, address_enabled: bool) -> 
 
 /// Serializable shape returned by `getindexinfo` under the `address`
 /// key. The wrapping envelope (`{"address": …, "txindex": …}`) is
-/// constructed in `rpc/indexes.rs` per `ADDRESS_INDEX.md` §"RPC".
+/// constructed in `rpc/indexes.rs`; the JSON layout is locked by
+/// `STABILITY_POLICY.md` Tier 2.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct StatusReport {
     pub synced: bool,

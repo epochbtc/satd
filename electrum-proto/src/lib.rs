@@ -10,8 +10,9 @@
 //! height, merkle proofs, txid-by-position).
 //!
 //! See `ECOSYSTEM.md` §4 / §4a for the architectural rationale (single
-//! binary, native, shared chainstate) and `ADDRESS_INDEX.md` for the
-//! index design.
+//! binary, native, shared chainstate). The `node-index` crate's
+//! module-level docs describe the trait surface this protocol crate
+//! consumes.
 //!
 //! Design lineage: the wire protocol shape (method names, JSON
 //! payloads, status-hash construction, merkle-proof encoding) follows

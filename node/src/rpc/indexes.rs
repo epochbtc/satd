@@ -1,11 +1,11 @@
-//! Operator-facing RPCs for the indexes family. M7 ships
-//! `getindexinfo` and the four backfill control RPCs
-//! (`backfillindex`, `pauseindex`, `resumeindex`, `cancelindex`).
+//! Operator-facing RPCs for the indexes family: `getindexinfo` and
+//! the four backfill control RPCs (`backfillindex`, `pauseindex`,
+//! `resumeindex`, `cancelindex`).
 //!
-//! `getindexinfo` returns a wrapping shape (`{"address": {...},
-//! ...}`) matching `ADDRESS_INDEX.md` §"Status reporting" so future
-//! indexes (txindex, blockfilter) can join under sibling keys without
-//! breaking consumers.
+//! `getindexinfo` returns a wrapping shape (`{"address": {...}, ...}`)
+//! so future indexes (txindex, blockfilter) join under sibling keys
+//! without breaking consumers. The exact JSON layout is documented on
+//! `getindexinfo` below and locked by `STABILITY_POLICY.md` Tier 2.
 
 use std::sync::Arc;
 
@@ -21,8 +21,7 @@ use crate::index::address::{
 use crate::index::filter;
 use crate::storage::Store;
 
-/// `getindexinfo` → `{"address": {...}, "basic block filter index": {...}}`
-/// per `ADDRESS_INDEX.md` §"Status reporting":
+/// `getindexinfo` → `{"address": {...}, "basic block filter index": {...}}`:
 ///
 /// ```text
 /// {
@@ -399,13 +398,12 @@ fn map_backfill_err(e: BackfillError) -> (i32, String) {
     }
 }
 
-/// Per ADDRESS_INDEX.md, `pause`/`resume`/`cancel` only make sense
-/// while a backfill is in progress (state `running` or `paused`).
-/// In M7 scaffolding mode, no backfill task ever runs, so flipping
-/// the atomic flags would silently mismatch the persisted state and
-/// confuse operators ("paused: true, state: idle"). Treat any
-/// invocation while idle as an explicit no-op with a -8 error so the
-/// command surface is honest.
+/// `pause`/`resume`/`cancel` only make sense while a backfill is in
+/// progress (state `running` or `paused`). When no backfill task is
+/// running, flipping the atomic flags would silently mismatch the
+/// persisted state and confuse operators ("paused: true, state: idle").
+/// Treat any invocation while idle as an explicit no-op with a -8 error
+/// so the command surface is honest.
 fn require_active_backfill(handle: &Arc<BackfillHandle>) -> Result<(), (i32, String)> {
     use crate::index::address::cursor::BackfillState;
     let state = handle.cursor().state;

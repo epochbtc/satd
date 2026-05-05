@@ -282,9 +282,9 @@ pub struct Config {
     pub mempoolexpiry: u64,
     pub permitbaremultisig: bool,
     pub txindex: bool,
-    /// Address-history index (per `ADDRESS_INDEX.md`). On by default;
-    /// disable via `--addressindex=0` or `-noindex=address`. Backs the
-    /// future native Electrum and Esplora subsystems.
+    /// Address-history index. On by default; disable via
+    /// `--addressindex=0` or `-noindex=address`. Backs the native
+    /// Electrum and Esplora subsystems.
     pub addressindex: bool,
     /// Maximum concurrent per-scripthash status subscriptions. Caps
     /// memory growth from the per-scripthash broadcast registry.

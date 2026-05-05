@@ -508,11 +508,14 @@ filter headers the live `connect_block` emitted above
 
 ### Caveats
 
-- **Pruning** is not yet implemented (see `CORE_GAPS.md`). Once it
-  lands, the filter index will survive pruning by construction
-  (filters are independent of full block bodies) — but a pruned
-  datadir cannot retroactively backfill (the runner reads each
-  block's persisted undo data, which `--prune` discards).
+- **Pruning** (`-prune=<MB>`) is implemented. The filter index
+  survives pruning by construction (filters are independent of full
+  block bodies) — but a pruned datadir cannot retroactively backfill
+  the filter index (the runner reads each block's persisted undo data,
+  which `--prune` discards). Operators who plan to enable
+  `--blockfilterindex=basic` after running pruned should keep the
+  filter index enabled from the start, or temporarily lift the prune
+  to allow the backfill to read undo data.
 - **`--reindex-chainstate`** is still available as a heavier last-
   resort remediation if undo data is corrupt or unavailable. Prefer
   `backfillindex blockfilter` for the common upgrade path.
@@ -527,10 +530,10 @@ filter headers the live `connect_block` emitted above
 > itself.*
 
 **Status (2026-05): Phase A and Phase B have landed.** satd's
-`--addressindex=1` (default on; see `ADDRESS_INDEX.md`) provides Phase A;
-the native Electrum protocol server in the `electrum-proto` crate
-provides Phase B. Operators enable it via `--electrum=1`, optional TLS
-via `--electrumtlsbind` + `--electrumtlscert`/`--electrumtlskey`.
+`--addressindex=1` (default on) provides Phase A; the native Electrum
+protocol server in the `electrum-proto` crate provides Phase B.
+Operators enable it via `--electrum=1`, optional TLS via
+`--electrumtlsbind` + `--electrumtlscert`/`--electrumtlskey`.
 
 ### Operator quick-start
 

@@ -1,14 +1,13 @@
 //! Operator-facing RPC handlers for the address-history index.
 //!
-//! Three minimal RPCs cover the M3 surface: `getaddressbalance`,
-//! `getaddresshistory`, `getaddressutxos`. Inputs accept either an
-//! address string (parsed against the active network) or a
-//! 32-byte hex scripthash (`{"scripthash": "<hex>"}` form). Output
-//! shapes follow the `ADDRESS_INDEX.md` operator-RPC sketch.
+//! Three minimal RPCs: `getaddressbalance`, `getaddresshistory`,
+//! `getaddressutxos`. Inputs accept either an address string (parsed
+//! against the active network) or a 32-byte hex scripthash
+//! (`{"scripthash": "<hex>"}` form).
 //!
-//! These are operator tools, not protocol surfaces — Electrum /
-//! Esplora handlers in later milestones build on the same trait but
-//! with their own request/response shapes.
+//! These are operator tools, not protocol surfaces — the Electrum and
+//! Esplora handlers build on the same `AddressIndex` trait but with
+//! their own request/response shapes.
 
 use std::sync::Arc;
 

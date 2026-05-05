@@ -386,9 +386,8 @@ pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError>
                 batch.coin_removes.push((outpoint, coin.amount, coin.height));
 
                 // Address-history index: spending row, atomic with the
-                // chainstate update via the same StoreBatch (see
-                // ADDRESS_INDEX.md §"Integration with connect_block /
-                // disconnect_block"). No-op when the index is disabled.
+                // chainstate update via the same StoreBatch. No-op when
+                // the index is disabled.
                 crate::index::address::emit_spending(
                     &mut batch,
                     address_index,

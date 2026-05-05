@@ -12,8 +12,7 @@
 //! Concurrency: live `connect_block` writes ranges > current_tip; the
 //! backfill writes ranges ≤ snapshot_height. Disjoint key spaces —
 //! RocksDB MVCC handles concurrent readers, concurrent disjoint-key
-//! writes are safe. Mirrors the same property the address-index
-//! backfill relies on (`ADDRESS_INDEX.md` §"Concurrency").
+//! writes are safe. Same property the address-index backfill relies on.
 
 use std::sync::{
     Arc, Mutex,

@@ -6,7 +6,7 @@
 //! a `prefix_iterator_cf` over a single scripthash produces a sorted
 //! stream of that script's history without an in-memory sort step.
 //!
-//! Schema layout (per `ADDRESS_INDEX.md` §"Schema"):
+//! Schema layout:
 //!
 //! ```text
 //! addr_funding   key: scripthash[32] || height_be[4] || txid[32] || vout_be[4]    (72 bytes)
