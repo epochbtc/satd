@@ -26,8 +26,10 @@ on:
   push:
     tags:
       - 'v*'
+  # No `branches:` filter — stacked PRs target sibling packaging
+  # branches, not master, and we want each PR in the stack to be able
+  # to exercise this workflow on the changed Dockerfile / Cargo set.
   pull_request:
-    branches: [master]
     paths:
       - 'Dockerfile'
       - '.github/workflows/release.yml'
