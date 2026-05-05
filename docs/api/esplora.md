@@ -6,8 +6,12 @@ listening on `127.0.0.1:3000`. Wire shapes match upstream
 [mempool.space](https://github.com/mempool/mempool) byte-for-byte
 within the endpoint set listed below.
 
-This document covers what's implemented today. Endpoints not listed
-here are not yet available; see the Esplora 9-PR plan for the roadmap.
+This document covers what's implemented today. The implementation lives
+in the `esplora-handlers/` workspace crate; routes are registered in
+`esplora-handlers/src/router.rs` and shape parity is locked behind the
+canary CI requirement in `STABILITY_POLICY.md`.
+
+Last verified against routes: 2026-05-05.
 
 ## Configuration
 

@@ -4,7 +4,7 @@ This document catalogs Bitcoin Core ergonomic pain points that satd can address,
 mapped against what satd already has. It is a product-research artifact meant to
 feed milestone planning, not a commitment to any specific scope.
 
-Last updated: 2026-04-18
+Last updated: 2026-05-05
 
 ---
 
@@ -51,71 +51,48 @@ These are small-to-medium efforts that each remove a well-known Core friction
 and are visible in the first 10 minutes of operator use. Each ships cleanly as
 its own PR. This is the recommended starter pack.
 
-### 1. First-class `/metrics` Prometheus endpoint
+### 1. First-class `/metrics` Prometheus endpoint ✅ SHIPPED
+
+**Status:** Landed — `--metricsbind=<addr:port>` enables the HTTP server
+exposing `GET /metrics` (Prometheus text format), `GET /healthz`, and
+`GET /readyz`. Unauthenticated by design; bind to loopback or behind a
+reverse proxy. Stable schema documented in `node/src/metrics.rs`.
+`/readyz` reports green when within `READY_LAG_BLOCKS` of the highest
+seen header.
 
 **Pain:** Monitoring Core requires third-party exporters — `jvstein/bitcoin-prometheus-exporter`
 (Python RPC polling), `0xB10C/bitcoind-observer` (requires USDT+eBPF), and
 homegrown shell scripts. Each has different metric names and coverage gaps.
 
-**Proposal:** Built-in HTTP `/metrics` on a separate port. Stable schema. Useful
-defaults from existing state:
-- `satd_mempool_bytes`, `satd_mempool_count`, `satd_mempool_fee_histogram_bucket`
-- `satd_peer_count{type=inbound|outbound|manual|onion}`, `satd_peer_bandwidth_bytes`
-- `satd_ibd_progress_ratio`, `satd_tip_height`, `satd_tip_lag_seconds`
-- `satd_rpc_request_duration_seconds_bucket{method}`
-- `satd_utxo_cache_hit_ratio`, `satd_coin_cache_bytes`
-- `satd_shadow_verify_drops_total`, `satd_shadow_verify_queue_depth`
-- `satd_block_connect_duration_seconds_bucket`
+### 2. Structured CLI subcommands ✅ SHIPPED
 
-**Effort:** S. We already have most of the counters (`perf.rs`, `getsysteminfo`).
-The new work is the HTTP handler and the histogram buckets.
+**Status:** Landed — `sat-cli` now has structured subcommands
+(`chain`, `mempool`, `peer`, `node`, `fee`, `tx`, `psbt`, etc.) with
+pretty-printed output by default and `-o json|yaml|raw` as escape
+hatch. Legacy raw-method form (`sat-cli getblockchaininfo`) still
+works via clap's `external_subcommand` so existing scripts and
+muscle memory keep working.
 
-### 2. Structured CLI subcommands
+**Pain:** `sat-cli` was originally a raw RPC wrapper.
+`bitcoin-core-config-generator` and similar wrappers exist because the
+raw Bitcoin Core CLI is hostile.
+([jlopp/bitcoin-core-config-generator](https://github.com/jlopp/bitcoin-core-config-generator))
 
-**Pain:** `sat-cli` today is a raw RPC wrapper (`sat-cli getblockchaininfo`).
-No output formatting, no table views, no shell completions, no piping helpers.
-`bitcoin-core-config-generator` and similar wrappers exist because the raw CLI
-is hostile. ([jlopp/bitcoin-core-config-generator](https://github.com/jlopp/bitcoin-core-config-generator))
+### 3. Satoshis-as-integers by default ✅ SHIPPED
 
-**Proposal:** Subcommand structure with human-friendly defaults:
+**Status:** Landed — per-request `amounts=sats|btc` parameter on
+amount-returning RPCs and a server default selectable via
+`AmountUnit::set_default` at startup. Per-request opt-in remains
+backward-compatible: BTC-as-doubles is the wire default to preserve
+parity with Bitcoin Core, callers opt into `"amounts": "sats"` per
+request and can verify via the `"units": "sats"` field in the
+response. `node/src/rpc/amounts.rs` is the canonical surface.
 
-```
-sat-cli chain info                   # pretty-printed getblockchaininfo
-sat-cli chain tips
-sat-cli mempool top [--limit=20]
-sat-cli mempool tx <txid>
-sat-cli peer list
-sat-cli peer ban <addr>
-sat-cli fee estimate [--target=1|6|24]
-sat-cli tx decode <hex>
-sat-cli tx send <hex>
-sat-cli psbt analyze <psbt>
-sat-cli node status
-sat-cli node logs --follow --filter=net
-```
-
-Default to human-formatted output. `-o json|yaml|raw` as escape hatch.
-Ship bash/zsh/fish completions. Built-in filter flags analogous to `jq`
-(`--select .blocks`).
-
-**Effort:** M. Clap's `subcommand` + `derive` machinery makes this clean.
-Backward-compatible with raw-method fallthrough for unrecognized commands.
-
-### 3. Satoshis-as-integers by default
-
-**Pain:** Bitcoin Core issue [#3249](https://github.com/bitcoin/bitcoin/issues/3249)
-("RPC option to report bitcoins in satoshi units") is open since 2013. All
-amount fields are JSON doubles (IEEE 754). Every integrator has been bitten by
-floating-point amount handling. The Bitcoin Wiki has a dedicated page warning
-about it ([Proper Money Handling (JSON-RPC)](https://en.bitcoin.it/wiki/Proper_Money_Handling_(JSON-RPC))).
-
-**Proposal:** Per-request `amounts=sats|btc` flag, default `sats`. Amounts
-emitted as JSON integers. Responses include a `units: "sats"` field so callers
-can verify. CLI presenters still show BTC by default but the wire format is
-exact.
-
-**Effort:** S-M. Touches every amount-returning RPC. Default flag negotiation
-preserves backward compat for Bitcoin-Core-clients.
+**Pain (historical):** Bitcoin Core issue [#3249](https://github.com/bitcoin/bitcoin/issues/3249)
+("RPC option to report bitcoins in satoshi units") has been open
+since 2013. All Core amount fields are JSON doubles (IEEE 754); the
+Bitcoin Wiki has a dedicated warning page
+([Proper Money Handling (JSON-RPC)](https://en.bitcoin.it/wiki/Proper_Money_Handling_(JSON-RPC))).
 
 ### 4. Mempool-based smart fee estimation ✅ SHIPPED
 
@@ -144,32 +121,24 @@ mode as Core.
 **Effort:** M. Block-template simulation is code we already have for mining
 (`getblocktemplate`); wire it into fee estimation as a forward-looking source.
 
-### 5. Structured error responses
+### 5. Structured error responses ✅ SHIPPED
 
-**Pain:** Core error messages are famously cryptic. "Insufficient funds" even
-when balance exceeds the send amount (because fee isn't accounted for,
-[#18](https://github.com/bitcoin/bitcoin/issues/18)). `importdescriptors`
-errors don't point at the parse location ([Sparrow #1575](https://github.com/sparrowwallet/sparrow/issues/1575)).
-"Bitcoin Core is shutting down…" indefinite hangs ([#27848](https://github.com/bitcoin/bitcoin/issues/27848)).
+**Status:** Landed — `node/src/rpc/error.rs` defines a stable
+`category` string per error site, optional `suggestion` for actionable
+fix advice, and an optional `debug` object. Per-request opt-in via the
+existing structured-error escape hatch keeps Core-compat clients on
+the historical Core-shaped error response. The category schema is
+covered by `STABILITY_POLICY.md` Tier 2 ("category names, once
+published, must not change meaning — only new names can be added").
 
-**Proposal:** Structured JSON-RPC error payload:
-
-```json
-{
-  "code": -26,
-  "message": "Transaction rejected: fee too low",
-  "category": "mempool.policy.feerate",
-  "suggestion": "Minimum relay feerate is 1.0 sat/vB; this tx is 0.7 sat/vB. Raise --minrelaytxfee or increase fee.",
-  "debug": { "computed_feerate": 0.7, "min_required": 1.0, "vsize": 250 }
-}
-```
-
-Every error site gets a stable `category` string (for dashboards/filters)
-and a human `suggestion` with actionable fix advice. Small changes, huge
-reputation win.
-
-**Effort:** M. Touches many sites but each change is localized. Create an
-error-enum with `category()` and `suggestion()` methods; migrate incrementally.
+**Pain (historical):** Core error messages are famously cryptic.
+"Insufficient funds" even when balance exceeds the send amount
+(because fee isn't accounted for,
+[#18](https://github.com/bitcoin/bitcoin/issues/18)).
+`importdescriptors` errors don't point at the parse location
+([Sparrow #1575](https://github.com/sparrowwallet/sparrow/issues/1575)).
+"Bitcoin Core is shutting down…" indefinite hangs
+([#27848](https://github.com/bitcoin/bitcoin/issues/27848)).
 
 ---
 
@@ -344,9 +313,17 @@ discussion](https://github.com/bitcoin/bitcoin/blob/master/doc/design/)).
 
 ## Tier 3 — attractive but heavier lifts
 
-### 13. Built-in address/scripthash index + Electrum protocol server
+### 13. Built-in address/scripthash index + Electrum protocol server ✅ SHIPPED
 
-**This is large enough to deserve its own section below.** See [Electrum/electrs Integration](#electrumelectrs-integration).
+**Status:** All three originally-scoped phases have landed. Phase A
+(address/scripthash index) is `node-index` + `node/src/index/address`;
+Phase B (Electrum protocol server) is `electrum-proto`; Phase C (BIP
+157/158 filter server) is `node-filter-index` + `node/src/index/filter`.
+See the [Compact block filter index](#compact-block-filter-index-bip-157--158)
+and [Electrum/electrs Integration](#electrumelectrs-integration) sections
+below for operator quick-starts. Original Tier-3 planning analysis is
+retained in the "Electrum/electrs Integration" section under
+"Original analysis (kept for reference)".
 
 ### 14. Config hot reload on SIGHUP
 
@@ -1001,21 +978,23 @@ Be honest about these — don't spend effort chasing.
 
 ---
 
-## Recommended first moves
+## Recommended first moves — historical, all shipped
 
-A starter pack that would ship cleanly as the next milestone:
+The 2026-04 starter pack landed in full and the address-index follow-on
+shipped on top:
 
-1. **#1 Prometheus `/metrics`** — removes a whole ecosystem of exporters.
-2. **#3 Satoshis-as-integers** — fixes a 13-year-old Core footgun.
-3. **#2 Structured CLI subcommands** — immediate first-impression win.
-4. **#5 Structured error responses** — small sites, huge reputation win.
+1. ~~**#1 Prometheus `/metrics`**~~ — shipped (`--metricsbind`).
+2. ~~**#3 Satoshis-as-integers**~~ — shipped (per-request `amounts=sats`).
+3. ~~**#2 Structured CLI subcommands**~~ — shipped (`sat-cli chain info`, `node status`, etc.).
+4. ~~**#5 Structured error responses**~~ — shipped (`category` / `suggestion` / `debug`).
+5. ~~**#13 address index + Electrum protocol server**~~ — shipped (Phase A in `node-index`, Phase B in `electrum-proto`, plus Phase C BIP 157/158 in `node-filter-index`).
 
-Each is independently shippable, each is visible in the first 10 minutes of
-operator use, and none blocks the others.
+Open Tier 1 / Tier 2 items remaining for the next operator-facing pack:
 
-After that starter pack, **#13 address index (Phase A only)** is the natural
-next big bet — it unlocks wallet connectivity and sets up the Electrum
-protocol server as a follow-up.
+- **#6 PSBT signing** (stdin-keyed, no stored keys) — keyless flow that satd is uniquely positioned to ship cleanly.
+- **#10 AssumeUTXO `--fast-start`** — one-flag UX with embedded snapshot hash; the snapshot-validation pipeline already exists.
+- **#14 Config hot reload on SIGHUP** — small but distinctive vs. Core.
+- **#15 Built-in alerting hooks** — pairs naturally with the persistent reorg-log webhook that already shipped.
 
 ---
 
