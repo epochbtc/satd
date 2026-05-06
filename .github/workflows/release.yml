@@ -362,10 +362,16 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # Pre-release tags (anything with `-`, e.g. v0.1.0-rc1) get
+          # only the full {{version}} tag — they MUST NOT advance the
+          # `latest` or {{major}}.{{minor}} aliases. Otherwise an rc
+          # build would briefly own `latest` and an operator running
+          # `docker pull …:latest` would silently pick up an unstable
+          # release.
           tags: |
             type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest
+            type=semver,pattern={{major}}.{{minor}},enable=${{ !contains(github.ref_name, '-') }}
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
 
       - name: Create + push manifest list
         working-directory: /tmp/digests
