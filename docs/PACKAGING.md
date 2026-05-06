@@ -312,10 +312,13 @@ Tag-triggered (`v*`) releases produce, per tag, via
 - A multi-arch container at `ghcr.io/epochbtc/satd:<version>` covering
   `linux/amd64` + `linux/arm64`.
 
-The workflow also runs on PRs that touch the `Dockerfile`,
-`.github/workflows/release.yml`, `Cargo.lock`, or `Cargo.toml` — same
-build matrix, no publish — so the next tagged release can never be
-the first time a workflow change is exercised end to end.
+The workflow currently runs on tag pushes only. PR-trigger dry-runs
+and `workflow_dispatch` were removed during the private-repo phase
+to conserve hosted-runner minutes; they will be re-enabled when the
+repo flips to public (Actions minutes are free for public repos).
+Until then, release-workflow / Dockerfile / Cargo-lock breakage
+first manifests at tag time rather than on the PR that introduced
+it — fix forward by reverting or patching, then re-tag.
 
 ### Signed releases
 
