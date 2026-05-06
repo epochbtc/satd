@@ -1,0 +1,83 @@
+# satd.service — systemd unit for the satd Bitcoin node.
+#
+# Install:
+#   sudo install -Dm644 contrib/systemd/satd.service /etc/systemd/system/satd.service
+#   sudo install -Dm755 target/release/satd /usr/local/bin/satd
+#   sudo install -Dm755 target/release/sat-cli /usr/local/bin/sat-cli
+#   sudo useradd --system --home /var/lib/satd --shell /usr/sbin/nologin satd
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now satd
+#
+# Optional config: drop a `bitcoin.conf` (or `satd.conf`) into
+#   /var/lib/satd/bitcoin.conf
+# satd reads it via the standard `-conf=` resolution against the datadir.
+#
+# Type=simple is intentional: satd does not yet call sd_notify(READY=1).
+# Once that lands the unit will be upgraded to Type=notify with
+# NotifyAccess=main, so systemd waits for RocksDB to finish opening
+# before declaring the unit started.
+
+[Unit]
+Description=satd — Bitcoin full node
+Documentation=https://github.com/epochbtc/satd
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/satd --datadir=/var/lib/satd
+ExecStop=/bin/kill -SIGTERM $MAINPID
+
+# RocksDB flush + undo-file fsync on shutdown can take a while under load.
+# 10 minutes matches Bitcoin Core's bitcoind.service ceiling and is the
+# practical upper bound observed during mainnet-tip operation.
+TimeoutStopSec=10min
+KillSignal=SIGTERM
+SendSIGKILL=yes
+
+Restart=on-failure
+RestartSec=5s
+
+User=satd
+Group=satd
+
+# StateDirectory creates /var/lib/satd 0750 satd:satd if it doesn't already
+# exist. Survives package reinstalls; preserved across stop/start.
+StateDirectory=satd
+StateDirectoryMode=0750
+
+# Resource limits.
+#  - LimitNOFILE: RocksDB keeps many SST files mmapped; 65536 leaves
+#    headroom over the ~thousands the chainstate uses at mainnet tip.
+#  - TasksMax: no thread bomb, but rayon + tokio + RPC hyper threads
+#    add up. 16k is plenty without being unbounded.
+LimitNOFILE=65536
+TasksMax=16384
+
+# Hardening. These are deliberately conservative — satd needs network
+# (P2P + outbound HTTPS), filesystem write to its datadir, and that's
+# the lot.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/satd
+
+[Install]
+WantedBy=multi-user.target

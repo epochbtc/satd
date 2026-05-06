@@ -151,6 +151,7 @@ cargo clippy --all-features --all-targets -- -D warnings
 | `OPERATOR_ERGONOMICS.md` | Operator-facing flag matrix, tuning, every shipped surface. |
 | `STABILITY_POLICY.md` | Tiered stability contract; deprecation policy; canary CI. |
 | `ECOSYSTEM.md` | Mobile / packaging strategy; why native + shared chainstate. |
+| `docs/PACKAGING.md` | Authoritative reference for downstream packagers (file layout, signals, ports, container, systemd). |
 | `docs/api/esplora.md` | Esplora REST endpoint reference + wire-shape gotchas. |
 
 ## License
