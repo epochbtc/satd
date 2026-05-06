@@ -285,13 +285,20 @@ Tag-triggered (`v*`) releases produce, per tag, via
 - `satd-<version>-<target>.tar.zst` for the targets currently shipped:
   - `x86_64-unknown-linux-gnu`
   - `aarch64-unknown-linux-gnu`
-  - `aarch64-apple-darwin`
 
-  `x86_64-apple-darwin` is intentionally not built. macos-13 is being
-  deprecated by GitHub, the hosted-runner queue runs hours-long, and
-  Apple Silicon is the targeted macOS surface for satd. Operators who
-  need an x86_64 darwin build can cross-compile from an arm64 darwin
-  host (`cargo build --release --target=x86_64-apple-darwin`).
+  **macOS Apple Silicon (`aarch64-apple-darwin`) is temporarily
+  disabled** while the repo is private. Hosted Apple Silicon runners
+  bill at 20× the linux-2-core rate, which is uneconomical on the
+  current Team plan. The matrix entry is commented out (not removed)
+  in `.github/workflows/release.yml`; it will be re-enabled when the
+  repo flips to public, at which point hosted Actions minutes are
+  free. Until then, macOS users can `cargo install --git` or
+  cross-build from any host.
+
+  `x86_64-apple-darwin` is also not built — macos-13 is being
+  deprecated by GitHub and Apple Silicon is the targeted macOS
+  surface. Operators who need x86_64 darwin can cross-compile from
+  an arm64 darwin host (`cargo build --release --target=x86_64-apple-darwin`).
 
   Each tarball contains stripped `satd` + `sat-cli` binaries and the
   authoritative reference docs (`README.md`, `PACKAGING.md`,

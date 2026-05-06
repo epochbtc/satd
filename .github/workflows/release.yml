@@ -57,13 +57,25 @@ jobs:
             os: ubuntu-24.04
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
-          # Apple Silicon only on macOS. macos-13 (Intel) is being
-          # deprecated by GitHub, the hosted-runner queue has multi-hour
-          # wait times, and Apple Silicon is the targeted macOS surface
-          # for satd. If a downstream packager needs an x86_64 darwin
-          # build, they can cross-build from an arm64 darwin host.
-          - target: aarch64-apple-darwin
-            os: macos-14
+          # Apple Silicon (macos-14) is intentionally disabled while
+          # the repo is private. Hosted Apple Silicon runners bill at
+          # 20× the linux-2-core rate; one PR-trigger dry-run run
+          # consumes ~200 minute-equivalents on this matrix entry
+          # alone, which depletes a Team-plan monthly quota in just a
+          # few PRs.
+          #
+          # Re-enable once the repo is public (Actions minutes are
+          # free for public repos) by uncommenting the entry below.
+          # The `Stage libclang for rocksdb-sys (macOS)` step further
+          # down already keys on `runner.os == 'macOS'`, so no other
+          # changes are needed.
+          #
+          # macos-13 (Intel) was previously dropped because Apple
+          # Silicon is the targeted macOS surface for satd; if a
+          # downstream packager needs an x86_64 darwin build they can
+          # cross-build from an arm64 darwin host.
+          # - target: aarch64-apple-darwin
+          #   os: macos-14
 
     permissions:
       contents: read
