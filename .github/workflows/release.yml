@@ -1,24 +1,26 @@
 # Release workflow — runs on hosted runners (NOT the self-hosted runner
-# that ci.yml uses). Hosted runners give us free amd64 + arm64 Linux,
-# Intel + Apple Silicon macOS, and the Docker buildx multi-arch story
-# without having to manage QEMU on our own infra.
+# that ci.yml uses). Hosted runners give us free amd64 + arm64 Linux
+# and the Docker buildx multi-arch story without having to manage
+# QEMU on our own infra.
 #
-# Triggers:
-#   - push of a `v*` tag → full publish (tarballs uploaded to a GitHub
-#     Release; multi-arch image pushed to ghcr.io/epochbtc/satd).
-#   - pull_request touching this workflow, the Dockerfile, or
-#     Cargo.lock/Cargo.toml → dry-run build of every artifact, no
-#     publish. This is what catches workflow / Dockerfile breakage
-#     before a tag goes out.
-#   - workflow_dispatch → manual run, also dry-run by default.
+# Trigger: tag push only (`v*`). PR-trigger dry-runs and
+# workflow_dispatch were both removed during the private-repo phase
+# because hosted-runner minutes are scarce on the Team plan and the
+# PR dry-run was burning the bulk of the quota. The trade is that
+# release-workflow / Dockerfile / Cargo-lock breakage now first
+# manifests at tag time rather than on the PR that introduced it —
+# acceptable while quota matters; re-enable the PR + dispatch
+# triggers once the repo is public (Actions minutes are free for
+# public repos).
 #
-# What's intentionally NOT here yet (other PRs in the packaging stack):
-#   - musl tarball targets (PR-2 follow-on; rocksdb-sys + musl wants a
-#     dedicated cross toolchain and the priority for v0.1.0 is gnu-linux
-#     + macOS, both of which package managers handle natively)
-#   - minisign tarball signing + cosign keyless image signing → PR-3
-#   - Reproducible-build bit-for-bit verification → PR-4 (Nix flake)
-#   - SBOM generation + cargo-deny gate → PR-5
+# What's intentionally NOT here yet (later PRs in the packaging stack):
+#   - musl tarball targets — rocksdb-sys + musl wants a dedicated
+#     cross toolchain
+#   - macOS Apple Silicon tarball — currently commented out in the
+#     matrix below (see comment at the matrix entry); re-enable when
+#     the repo is public
+#   - Reproducible-build bit-for-bit verification (Nix flake)
+#   - SBOM generation + cargo-deny gate
 
 name: Release
 
@@ -26,16 +28,6 @@ on:
   push:
     tags:
       - 'v*'
-  # No `branches:` filter — stacked PRs target sibling packaging
-  # branches, not master, and we want each PR in the stack to be able
-  # to exercise this workflow on the changed Dockerfile / Cargo set.
-  pull_request:
-    paths:
-      - 'Dockerfile'
-      - '.github/workflows/release.yml'
-      - 'Cargo.lock'
-      - 'Cargo.toml'
-  workflow_dispatch:
 
 permissions: {}
 
@@ -57,13 +49,25 @@ jobs:
             os: ubuntu-24.04
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
-          # Apple Silicon only on macOS. macos-13 (Intel) is being
-          # deprecated by GitHub, the hosted-runner queue has multi-hour
-          # wait times, and Apple Silicon is the targeted macOS surface
-          # for satd. If a downstream packager needs an x86_64 darwin
-          # build, they can cross-build from an arm64 darwin host.
-          - target: aarch64-apple-darwin
-            os: macos-14
+          # Apple Silicon (macos-14) is intentionally disabled while
+          # the repo is private. Hosted Apple Silicon runners bill at
+          # 20× the linux-2-core rate; one PR-trigger dry-run run
+          # consumes ~200 minute-equivalents on this matrix entry
+          # alone, which depletes a Team-plan monthly quota in just a
+          # few PRs.
+          #
+          # Re-enable once the repo is public (Actions minutes are
+          # free for public repos) by uncommenting the entry below.
+          # The `Stage libclang for rocksdb-sys (macOS)` step further
+          # down already keys on `runner.os == 'macOS'`, so no other
+          # changes are needed.
+          #
+          # macos-13 (Intel) was previously dropped because Apple
+          # Silicon is the targeted macOS surface for satd; if a
+          # downstream packager needs an x86_64 darwin build they can
+          # cross-build from an arm64 darwin host.
+          # - target: aarch64-apple-darwin
+          #   os: macos-14
 
     permissions:
       contents: read

@@ -285,13 +285,20 @@ Tag-triggered (`v*`) releases produce, per tag, via
 - `satd-<version>-<target>.tar.zst` for the targets currently shipped:
   - `x86_64-unknown-linux-gnu`
   - `aarch64-unknown-linux-gnu`
-  - `aarch64-apple-darwin`
 
-  `x86_64-apple-darwin` is intentionally not built. macos-13 is being
-  deprecated by GitHub, the hosted-runner queue runs hours-long, and
-  Apple Silicon is the targeted macOS surface for satd. Operators who
-  need an x86_64 darwin build can cross-compile from an arm64 darwin
-  host (`cargo build --release --target=x86_64-apple-darwin`).
+  **macOS Apple Silicon (`aarch64-apple-darwin`) is temporarily
+  disabled** while the repo is private. Hosted Apple Silicon runners
+  bill at 20× the linux-2-core rate, which is uneconomical on the
+  current Team plan. The matrix entry is commented out (not removed)
+  in `.github/workflows/release.yml`; it will be re-enabled when the
+  repo flips to public, at which point hosted Actions minutes are
+  free. Until then, macOS users can `cargo install --git` or
+  cross-build from any host.
+
+  `x86_64-apple-darwin` is also not built — macos-13 is being
+  deprecated by GitHub and Apple Silicon is the targeted macOS
+  surface. Operators who need x86_64 darwin can cross-compile from
+  an arm64 darwin host (`cargo build --release --target=x86_64-apple-darwin`).
 
   Each tarball contains stripped `satd` + `sat-cli` binaries and the
   authoritative reference docs (`README.md`, `PACKAGING.md`,
@@ -305,10 +312,13 @@ Tag-triggered (`v*`) releases produce, per tag, via
 - A multi-arch container at `ghcr.io/epochbtc/satd:<version>` covering
   `linux/amd64` + `linux/arm64`.
 
-The workflow also runs on PRs that touch the `Dockerfile`,
-`.github/workflows/release.yml`, `Cargo.lock`, or `Cargo.toml` — same
-build matrix, no publish — so the next tagged release can never be
-the first time a workflow change is exercised end to end.
+The workflow currently runs on tag pushes only. PR-trigger dry-runs
+and `workflow_dispatch` were removed during the private-repo phase
+to conserve hosted-runner minutes; they will be re-enabled when the
+repo flips to public (Actions minutes are free for public repos).
+Until then, release-workflow / Dockerfile / Cargo-lock breakage
+first manifests at tag time rather than on the PR that introduced
+it — fix forward by reverting or patching, then re-tag.
 
 ### Signed releases
 
