@@ -682,6 +682,25 @@ impl Store for CoinCache {
         self.inner.block_cache_capacity_bytes()
     }
 
+    fn chainstate_l0_files(&self) -> u64 {
+        self.inner.chainstate_l0_files()
+    }
+
+    fn chainstate_pending_compaction_bytes(&self) -> u64 {
+        self.inner.chainstate_pending_compaction_bytes()
+    }
+
+    fn compact_chainstate(&self) -> Result<(), StoreError> {
+        // Drain pending writes before forcing a compaction so the dirty
+        // overlay's contents are visible to the compaction range and
+        // included in the resulting SSTs. Without this, a subsequent
+        // flush would re-introduce L0 files immediately after the manual
+        // compaction completed, making the periodic compactor's effort
+        // wasted.
+        self.flush()?;
+        self.inner.compact_chainstate()
+    }
+
     fn iter_addr_funding(
         &self,
         sh: &crate::index::address::Scripthash,

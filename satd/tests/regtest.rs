@@ -2,7 +2,38 @@ use base64::Engine;
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
+
+/// Multiply a test timeout by `SATD_TEST_TIMEOUT_MULT` (default 1.0). CI
+/// runs on a self-hosted runner that shares the host with mainnet `satd`
+/// and other cron jobs, so wall-clock contention can push satd's startup
+/// from <2s locally to >120s under load. Local dev keeps tight timeouts
+/// (so real regressions surface quickly); CI sets the mult to ≥2.0 in
+/// `.github/workflows/ci.yml` to absorb the runner's worst-case load.
+///
+/// Read once on first call and cached. The mult is clamped to (0, 100)
+/// so a typo (`SATD_TEST_TIMEOUT_MULT=foo`) silently falls back to 1.0
+/// rather than disabling all timeouts.
+fn test_timeout_mult() -> f64 {
+    static MULT: OnceLock<f64> = OnceLock::new();
+    *MULT.get_or_init(|| {
+        std::env::var("SATD_TEST_TIMEOUT_MULT")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .filter(|m| *m > 0.0 && *m < 100.0)
+            .unwrap_or(1.0)
+    })
+}
+
+/// Construct a [`Duration`] for a test deadline, scaled by
+/// [`test_timeout_mult`]. Use this for the long startup / sync waits that
+/// have flaked under CI load; do *not* use it for the per-HTTP-request
+/// `reqwest` timeouts, where a long timeout actually masks bugs (a hung
+/// RPC is a real regression we want to catch quickly).
+fn test_timeout(secs: u64) -> Duration {
+    Duration::from_secs_f64(secs as f64 * test_timeout_mult())
+}
 
 struct TestNode {
     process: Child,
@@ -108,7 +139,7 @@ impl TestNode {
         // a satd process needed >60s to bind its RPC listener while
         // many parallel test workers were contending for the runner.
         // 120s is generous; locally satd is ready in <2s.
-        let deadline = Instant::now() + Duration::from_secs(120);
+        let deadline = Instant::now() + test_timeout(120);
         let cookie_path = datadir.join("regtest").join(".cookie");
         loop {
             let rpc_ready = if uses_userpass {
@@ -229,7 +260,7 @@ impl TestNode {
         let cookie_path = datadir.join("regtest").join(".cookie");
         // See note on the matching deadline in `start_with_env`: 60s is
         // not enough under CI runner load; bumped to 120s.
-        let deadline = Instant::now() + Duration::from_secs(120);
+        let deadline = Instant::now() + test_timeout(120);
         loop {
             if let Ok(cookie) = std::fs::read_to_string(&cookie_path) {
                 let auth = base64::engine::general_purpose::STANDARD.encode(cookie.trim());
@@ -1786,7 +1817,7 @@ fn test_node_restart_persistence() {
     let wait_for_cookie = |dir: &std::path::Path, port: u16| -> String {
         let cookie_path = dir.join("regtest").join(".cookie");
         // 120s for the same CI-load reasons documented in TestNode::start.
-        let deadline = Instant::now() + Duration::from_secs(120);
+        let deadline = Instant::now() + test_timeout(120);
         loop {
             if let Ok(cookie) = std::fs::read_to_string(&cookie_path) {
                 let (user, pass) = cookie.split_once(':').unwrap_or(("__cookie__", "none"));
@@ -3888,10 +3919,12 @@ fn spawn_two_node_relay_pair() -> (TestNode, TestNode) {
         &format!("--connect=127.0.0.1:{}", miner_p2p_port),
     ]);
 
-    // Wait for relay to sync + exit IBD.
+    // Wait for relay to sync + exit IBD. Scaled by SATD_TEST_TIMEOUT_MULT
+    // because under CI runner load the inter-node sync (header download +
+    // block fetch) has been observed to exceed the locally-comfortable 30s.
     poll_until(
         || get_rpc_u64(&relay, "getblockcount").unwrap_or(0) >= 3,
-        Duration::from_secs(30),
+        test_timeout(30),
         "relay node did not sync miner's blocks",
     );
     poll_until(
@@ -3902,7 +3935,7 @@ fn spawn_two_node_relay_pair() -> (TestNode, TestNode) {
                 .and_then(|r| r["result"]["initialblockdownload"].as_bool())
                 == Some(false)
         },
-        Duration::from_secs(15),
+        test_timeout(15),
         "relay node stuck in IBD",
     );
 
@@ -6086,7 +6119,7 @@ fn test_esplora_default_startup_auto_enables_txindex() {
 
     // Wait for the Esplora listener to come up (proves the daemon
     // didn't exit at startup).
-    let deadline = Instant::now() + Duration::from_secs(120);
+    let deadline = Instant::now() + test_timeout(120);
     let mut ready = false;
     while Instant::now() < deadline {
         if reqwest::blocking::Client::new()
@@ -6354,7 +6387,7 @@ fn test_esplora_cli_txindex_overrides_config_disable() {
         .expect("spawn satd");
 
     // Wait briefly for the listener — proves startup succeeded.
-    let deadline = Instant::now() + Duration::from_secs(120);
+    let deadline = Instant::now() + test_timeout(120);
     let mut ready = false;
     while Instant::now() < deadline {
         if reqwest::blocking::Client::new()

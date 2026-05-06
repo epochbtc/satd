@@ -410,6 +410,36 @@ pub struct Config {
     /// "all" = unlimited (u32::MAX), "N%" = percentage of remaining (encoded as 1_000_000_000 + pct),
     /// N = fixed count.
     pub max_ahead: u32,
+    /// RocksDB `max_open_files` cap. Bounds the table-reader cache so a
+    /// large compaction backlog doesn't pin tens of thousands of SST file
+    /// descriptors and their per-SST metadata in memory. `-1` = unlimited
+    /// (legacy behavior). Default: 2048.
+    pub max_open_files: i32,
+    /// IBD connector backpressure: pause each loop iteration when the
+    /// chainstate's L0 SST count is at or above this value, so RocksDB
+    /// compaction has a chance to drain. `0` disables. Default: 64.
+    pub ibd_l0_pause_at: u32,
+    /// Periodic forced-compaction interval, in seconds. The dedicated
+    /// compactor thread wakes this often, checks the chainstate's L0 file
+    /// count, and forces a synchronous compaction if it's at or above
+    /// `compaction_l0_at`. `0` disables the thread. Default: 1800 (30 min).
+    pub compaction_interval_secs: u64,
+    /// L0 SST count at or above which the periodic compactor forces a
+    /// chainstate compaction. Distinct from `ibd_l0_pause_at` because the
+    /// connector reacts every block (so a high threshold avoids constant
+    /// micro-pauses) while the compactor runs on a long interval (so a
+    /// lower threshold cleans up moderate backlogs that the connector is
+    /// tolerating). Default: 16.
+    pub compaction_l0_at: u64,
+    /// Seconds without chain-tip advancement before the stall watchdog
+    /// dumps thread states from `/proc/self/task/*` for post-mortem.
+    /// `0` disables the watchdog entirely. Default: 300 (5 min).
+    pub stall_watchdog_secs: u64,
+    /// Additional seconds after a forensics dump before the watchdog
+    /// calls `std::process::abort()` so systemd restarts the unit.
+    /// Default: 300 (so total = `stall_watchdog_secs + stall_abort_secs`
+    /// = 10 min by default).
+    pub stall_abort_secs: u64,
     /// Consensus engine selection.
     pub consensus: ConsensusEngine,
     /// Shadow verification queue capacity (default: 4_194_304).
@@ -1129,6 +1159,30 @@ impl Config {
                     raw.parse().unwrap_or(50_000)
                 }
             },
+            max_open_files: cli
+                .maxopenfiles
+                .or_else(|| file_get("maxopenfiles").and_then(|v| v.parse().ok()))
+                .unwrap_or(2048),
+            ibd_l0_pause_at: cli
+                .ibdl0pauseat
+                .or_else(|| file_get("ibdl0pauseat").and_then(|v| v.parse().ok()))
+                .unwrap_or(64),
+            compaction_interval_secs: cli
+                .compactionintervalsecs
+                .or_else(|| file_get("compactionintervalsecs").and_then(|v| v.parse().ok()))
+                .unwrap_or(1800),
+            compaction_l0_at: cli
+                .compactionl0at
+                .or_else(|| file_get("compactionl0at").and_then(|v| v.parse().ok()))
+                .unwrap_or(16),
+            stall_watchdog_secs: cli
+                .stallwatchdogsecs
+                .or_else(|| file_get("stallwatchdogsecs").and_then(|v| v.parse().ok()))
+                .unwrap_or(300),
+            stall_abort_secs: cli
+                .stallabortsecs
+                .or_else(|| file_get("stallabortsecs").and_then(|v| v.parse().ok()))
+                .unwrap_or(300),
             consensus: {
                 let raw = cli
                     .consensus
@@ -1745,6 +1799,48 @@ pub struct CliArgs {
 
     #[arg(
         long,
+        value_name = "N",
+        help = "RocksDB max_open_files cap; -1 = unlimited (default: 2048)"
+    )]
+    pub maxopenfiles: Option<i32>,
+
+    #[arg(
+        long,
+        value_name = "N",
+        help = "Pause IBD connector when chainstate L0 SST count >= N; 0 disables (default: 64)"
+    )]
+    pub ibdl0pauseat: Option<u32>,
+
+    #[arg(
+        long,
+        value_name = "SECS",
+        help = "Periodic forced-compaction interval in seconds; 0 disables (default: 1800)"
+    )]
+    pub compactionintervalsecs: Option<u64>,
+
+    #[arg(
+        long,
+        value_name = "N",
+        help = "Force chainstate compaction when L0 SST count >= N (default: 16)"
+    )]
+    pub compactionl0at: Option<u64>,
+
+    #[arg(
+        long,
+        value_name = "SECS",
+        help = "Stall watchdog forensic-dump threshold; 0 disables (default: 300)"
+    )]
+    pub stallwatchdogsecs: Option<u64>,
+
+    #[arg(
+        long,
+        value_name = "SECS",
+        help = "Stall watchdog additional grace before abort (default: 300)"
+    )]
+    pub stallabortsecs: Option<u64>,
+
+    #[arg(
+        long,
         value_name = "ENGINE",
         help = "Consensus engine: cpp, rust, rust-shadow, cpp-shadow (default: rust-shadow)"
     )]
@@ -2356,6 +2452,12 @@ rpcport=8332
             metricsport: None,
             metricsbind: None,
             maxahead: None,
+            maxopenfiles: None,
+            ibdl0pauseat: None,
+            compactionintervalsecs: None,
+            compactionl0at: None,
+            stallwatchdogsecs: None,
+            stallabortsecs: None,
             consensus: None,
             shadowqueuesize: None,
             shadowworkers: None,
@@ -2470,6 +2572,12 @@ rpcport=8332
             metricsport: None,
             metricsbind: None,
             maxahead: None,
+            maxopenfiles: None,
+            ibdl0pauseat: None,
+            compactionintervalsecs: None,
+            compactionl0at: None,
+            stallwatchdogsecs: None,
+            stallabortsecs: None,
             consensus: None,
             shadowqueuesize: None,
             shadowworkers: None,

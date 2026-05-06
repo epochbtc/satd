@@ -49,8 +49,15 @@ jobs:
         # repeatedly tripped the per-test startup watchdog under load.
         # Four parallel workers keeps wall-clock reasonable while leaving
         # the runner enough headroom to bind RPC/P2P listeners promptly.
+        #
+        # SATD_TEST_TIMEOUT_MULT=2 doubles the regtest harness's startup
+        # and inter-node-sync deadlines (see `test_timeout` in regtest.rs).
+        # Local dev keeps the 1.0 default; CI absorbs the runner's worst-
+        # case load (mainnet satd + cron jobs sharing the box) without
+        # masking real regressions in per-RPC timeouts.
         env:
           RUST_TEST_THREADS: "4"
+          SATD_TEST_TIMEOUT_MULT: "2"
         run: cargo test --all --locked --all-targets
 
       - name: Clean build artifacts

@@ -317,6 +317,33 @@ pub trait Store: Send + Sync {
         0
     }
 
+    /// Number of L0 SST files in the chainstate (coins) column family. Used
+    /// by the IBD connector for backpressure: when the count exceeds the
+    /// configured pause threshold, the connector pauses to let compaction
+    /// catch up. Default: 0 (backends without leveled storage report no
+    /// pressure, so the connector never pauses).
+    fn chainstate_l0_files(&self) -> u64 {
+        0
+    }
+
+    /// Estimated bytes of pending compaction work for the chainstate (coins)
+    /// column family. Diagnostic signal logged alongside the L0 file count;
+    /// the periodic compactor consults it to decide whether a forced
+    /// compaction is overdue. Default: 0.
+    fn chainstate_pending_compaction_bytes(&self) -> u64 {
+        0
+    }
+
+    /// Force a full compaction of the chainstate (coins) column family.
+    /// Called by the periodic compactor when the L0 file count or pending-
+    /// compaction backlog has stayed above its threshold for too long, and
+    /// by operators via RPC if exposed. Synchronous: returns once RocksDB
+    /// has finished the compaction range. Default: no-op (Ok) for backends
+    /// without compaction.
+    fn compact_chainstate(&self) -> Result<(), StoreError> {
+        Ok(())
+    }
+
     /// All committed `addr_funding` rows for `sh`, ordered ascending by
     /// `(height, txid, vout)` (i.e. ascending by encoded key — the BE
     /// layout in `keys::encode_funding_key`). Returns the value
