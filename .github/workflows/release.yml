@@ -1,0 +1,420 @@
+# Release workflow — runs on hosted runners (NOT the self-hosted runner
+# that ci.yml uses). Hosted runners give us free amd64 + arm64 Linux,
+# Intel + Apple Silicon macOS, and the Docker buildx multi-arch story
+# without having to manage QEMU on our own infra.
+#
+# Triggers:
+#   - push of a `v*` tag → full publish (tarballs uploaded to a GitHub
+#     Release; multi-arch image pushed to ghcr.io/epochbtc/satd).
+#   - pull_request touching this workflow, the Dockerfile, or
+#     Cargo.lock/Cargo.toml → dry-run build of every artifact, no
+#     publish. This is what catches workflow / Dockerfile breakage
+#     before a tag goes out.
+#   - workflow_dispatch → manual run, also dry-run by default.
+#
+# What's intentionally NOT here yet (other PRs in the packaging stack):
+#   - musl tarball targets (PR-2 follow-on; rocksdb-sys + musl wants a
+#     dedicated cross toolchain and the priority for v0.1.0 is gnu-linux
+#     + macOS, both of which package managers handle natively)
+#   - minisign tarball signing + cosign keyless image signing → PR-3
+#   - Reproducible-build bit-for-bit verification → PR-4 (Nix flake)
+#   - SBOM generation + cargo-deny gate → PR-5
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  # No `branches:` filter — stacked PRs target sibling packaging
+  # branches, not master, and we want each PR in the stack to be able
+  # to exercise this workflow on the changed Dockerfile / Cargo set.
+  pull_request:
+    paths:
+      - 'Dockerfile'
+      - '.github/workflows/release.yml'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+  workflow_dispatch:
+
+permissions: {}
+
+env:
+  RUST_TOOLCHAIN: '1.93'
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+
+  build-tarball:
+    name: tarball / ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          # Apple Silicon only on macOS. macos-13 (Intel) is being
+          # deprecated by GitHub, the hosted-runner queue has multi-hour
+          # wait times, and Apple Silicon is the targeted macOS surface
+          # for satd. If a downstream packager needs an x86_64 darwin
+          # build, they can cross-build from an arm64 darwin host.
+          - target: aarch64-apple-darwin
+            os: macos-14
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # rocksdb-sys needs libclang (bindgen headers) and the rocksdb
+      # native build wants cmake. Hosted ubuntu-24.04 ships clang +
+      # cmake binaries but NOT libclang-dev — install explicitly.
+      # libssl-dev is needed by the openssl-sys path in reqwest's
+      # native-tls backend.
+      - name: Install Linux build deps
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang \
+            cmake \
+            libclang-dev \
+            libssl-dev \
+            pkg-config
+
+      # macOS: librocksdb-sys's build-script binary is linked against
+      # libclang.dylib at @rpath. dyld's search list includes
+      # /usr/local/lib, but no libclang ships there. Symlink Xcode's
+      # libclang.dylib into /usr/local/lib so the dyld lookup succeeds.
+      # LIBCLANG_PATH alone (a bindgen-only env var) does not help —
+      # this is a dynamic-loader path issue, not a bindgen one.
+      - name: Stage libclang for rocksdb-sys (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          xcode_dir="$(xcode-select -p)"
+          libclang_dir="${xcode_dir}/Toolchains/XcodeDefault.xctoolchain/usr/lib"
+          test -f "${libclang_dir}/libclang.dylib"
+          sudo mkdir -p /usr/local/lib
+          sudo ln -sf "${libclang_dir}/libclang.dylib" /usr/local/lib/libclang.dylib
+          # LIBCLANG_PATH is the bindgen-side hint; harmless to also set.
+          echo "LIBCLANG_PATH=${libclang_dir}" >> "$GITHUB_ENV"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo registry + git
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ matrix.target }}-cargo-
+
+      - name: Cache target directory
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-${{ matrix.target }}-target-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ matrix.target }}-target-
+
+      - name: Build release binaries
+        run: |
+          cargo build --release --locked \
+            --bin satd --bin sat-cli \
+            --target ${{ matrix.target }}
+
+      - name: Determine version string
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+          else
+            short_sha=$(git rev-parse --short=12 HEAD)
+            echo "version=0.0.0-dev+${short_sha}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Stage tarball contents
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage="satd-${{ steps.version.outputs.version }}-${{ matrix.target }}"
+          mkdir -p "$stage/bin"
+          cp "target/${{ matrix.target }}/release/satd"    "$stage/bin/satd"
+          cp "target/${{ matrix.target }}/release/sat-cli" "$stage/bin/sat-cli"
+          # Strip is best-effort: macOS strip on cross-compiled aarch64
+          # binaries from a macos-13 runner can fail on signature
+          # checks. Don't gate the release on it.
+          strip "$stage/bin/satd"    || true
+          strip "$stage/bin/sat-cli" || true
+          cp README.md           "$stage/README.md"
+          cp docs/PACKAGING.md   "$stage/PACKAGING.md"
+          cp CORE_DIFFERENCES.md "$stage/CORE_DIFFERENCES.md"
+          cp STABILITY_POLICY.md "$stage/STABILITY_POLICY.md"
+          if [[ -f LICENSE ]]; then
+            cp LICENSE "$stage/LICENSE"
+          fi
+          # Manifest pinning the build provenance for offline auditors
+          # who only have the tarball. Augmented by minisig/cosign in PR-3.
+          {
+            echo "name: satd"
+            echo "version: ${{ steps.version.outputs.version }}"
+            echo "target: ${{ matrix.target }}"
+            echo "commit: ${GITHUB_SHA}"
+            echo "ref: ${GITHUB_REF}"
+            echo "rust: ${{ env.RUST_TOOLCHAIN }}"
+            echo "built-at: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "runner: ${{ runner.os }}-${{ runner.arch }}"
+          } > "$stage/MANIFEST"
+          echo "STAGE=$stage" >> "$GITHUB_ENV"
+
+      - name: Pack tarball
+        shell: bash
+        run: |
+          set -euo pipefail
+          # zstd is the default modern tarball compressor — better
+          # ratio than gzip and an order of magnitude faster decompress.
+          # PACKAGING.md commits to .tar.zst as the artifact format.
+          #
+          # macOS ships BSD tar as `tar`; the reproducible-friendly
+          # flags (--owner, --mtime, --sort) are GNU-only. Both
+          # macos-13 + macos-14 hosted runners include gnu-tar via
+          # Homebrew under the name `gtar`. Pick whichever exists.
+          if command -v gtar >/dev/null 2>&1; then
+            TAR=gtar
+          else
+            TAR=tar
+          fi
+          "$TAR" --owner=0 --group=0 --numeric-owner \
+                 --format=ustar \
+                 --sort=name \
+                 --mtime='2026-01-01 00:00:00 UTC' \
+                 -cf "${STAGE}.tar" "${STAGE}"
+          zstd -19 --rm "${STAGE}.tar"
+          # `sha256sum` is GNU coreutils; macOS ships `shasum -a 256`.
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${STAGE}.tar.zst" > "${STAGE}.tar.zst.sha256"
+          else
+            shasum -a 256 "${STAGE}.tar.zst" > "${STAGE}.tar.zst.sha256"
+          fi
+
+      - name: Upload tarball artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.STAGE }}.tar.zst
+          path: |
+            ${{ env.STAGE }}.tar.zst
+            ${{ env.STAGE }}.tar.zst.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+
+  # Per-platform Docker build on a native runner. QEMU emulation of
+  # arm64 on amd64 (the previous design) takes 2+ hours cold for this
+  # workspace because rocksdb's C++ build is huge. With native runners
+  # each platform compiles in 5-15 min. The merge job below stitches
+  # the per-arch images into a single multi-arch manifest.
+  build-docker-platform:
+    name: docker / ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            os: ubuntu-24.04
+            slug: amd64
+          - platform: linux/arm64
+            os: ubuntu-24.04-arm
+            slug: arm64
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Compute image tags + labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # `bake-target=metadata` is irrelevant here; we just want the
+          # OCI labels. The merge job below pulls the actual tags from
+          # its own metadata-action invocation — per-platform images
+          # are referenced only by digest.
+          labels: |
+            org.opencontainers.image.title=satd
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.licenses=TBD
+
+      - name: Log in to GHCR
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build (PR / dispatch — no push)
+        if: ${{ ! startsWith(github.ref, 'refs/tags/') }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ matrix.platform }}
+          push: false
+          load: false
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.slug }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.slug }}
+          provenance: false
+
+      - name: Build and push by digest (tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ matrix.platform }}
+          # push-by-digest avoids racing the manifest list with the
+          # other arch — each per-arch build pushes to GHCR by digest
+          # only (no tag), and the merge job creates the tagged
+          # manifest list referencing both digests.
+          outputs: |
+            type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.slug }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.slug }}
+          provenance: false
+
+      - name: Export digest
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          mkdir -p /tmp/digests
+          digest='${{ steps.build.outputs.digest }}'
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.slug }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+
+  merge-docker:
+    name: docker / merge manifest
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build-docker-platform]
+    runs-on: ubuntu-24.04
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Set up Docker buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute manifest tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+
+      - name: Create + push manifest list
+        working-directory: /tmp/digests
+        run: |
+          set -euo pipefail
+          tags=$(jq -cr '.tags | map("--tag " + .) | join(" ")' <<< '${{ steps.meta.outputs.json }}')
+          digests=$(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
+          docker buildx imagetools create $tags $digests
+
+      - name: Inspect manifest
+        run: |
+          set -euo pipefail
+          tag=$(jq -cr '.tags[0]' <<< '${{ steps.meta.outputs.json }}')
+          docker buildx imagetools inspect "$tag"
+
+
+  release:
+    name: GitHub Release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build-tarball, merge-docker]
+    runs-on: ubuntu-24.04
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout (for changelog reference)
+        uses: actions/checkout@v4
+
+      - name: Download tarball artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Aggregate sha256sums
+        run: |
+          set -euo pipefail
+          cd dist
+          ls -la
+          # Per-tarball .sha256 files were uploaded; concatenate into one.
+          cat *.tar.zst.sha256 | sort > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create or update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          # Auto-generate from PR titles; we'll replace this with a
+          # CHANGELOG.md-driven body once the public-release machinery
+          # for that lands.
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.tar.zst
+            dist/*.tar.zst.sha256
+            dist/SHA256SUMS

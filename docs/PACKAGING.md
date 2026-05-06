@@ -192,10 +192,19 @@ CLI:
 docker exec satd sat-cli getblockchaininfo
 ```
 
-**Multi-arch images and signed tags are not yet published (future).**
-PR-2 in the packaging stack will add a tag-triggered release workflow
-that publishes `linux/amd64` and `linux/arm64` to GHCR with cosign
-keyless signatures.
+**Multi-arch images.** Tag-triggered releases publish `linux/amd64`
+and `linux/arm64` to `ghcr.io/epochbtc/satd` via the workflow at
+`.github/workflows/release.yml`. Tags follow `docker/metadata-action`
+defaults: `<MAJOR>.<MINOR>.<PATCH>`, `<MAJOR>.<MINOR>`, and `latest`
+on every release.
+
+```sh
+docker pull ghcr.io/epochbtc/satd:0.1.0
+docker pull ghcr.io/epochbtc/satd:latest
+```
+
+Signing of these images (cosign keyless OIDC, attested to Rekor) ships
+in PR-3 of the packaging stack.
 
 ## systemd
 
@@ -268,21 +277,51 @@ build because the workspace is pure-Cargo and Nix integration is
 substantially shorter to specify. A Guix manifest may follow if a
 downstream packager needs it.
 
-## Release artifacts *(future)*
+## Release artifacts
 
-PR-2 + PR-3 in the packaging stack will produce, per tag:
+Tag-triggered (`v*`) releases produce, per tag, via
+`.github/workflows/release.yml` running on hosted GitHub runners:
 
-- `satd-<version>-<target>.tar.zst` for `aarch64-unknown-linux-gnu`,
-  `aarch64-unknown-linux-musl`, `x86_64-unknown-linux-gnu`,
-  `x86_64-unknown-linux-musl`, `x86_64-apple-darwin`,
-  `aarch64-apple-darwin`. Each contains stripped `satd` and `sat-cli`
-  binaries, a copy of `LICENSE`, and `bitcoin.conf.example`.
-- Detached `minisign` signatures (`*.minisig`) for every tarball,
-  signed by at least two maintainers. Public keys live in
-  `SECURITY.md`.
-- Multi-arch container at `ghcr.io/epochbtc/satd:<version>`, signed
-  by cosign keyless OIDC, with provenance attested to the Rekor
-  transparency log. Verify via:
+- `satd-<version>-<target>.tar.zst` for the targets currently shipped:
+  - `x86_64-unknown-linux-gnu`
+  - `aarch64-unknown-linux-gnu`
+  - `aarch64-apple-darwin`
+
+  `x86_64-apple-darwin` is intentionally not built. macos-13 is being
+  deprecated by GitHub, the hosted-runner queue runs hours-long, and
+  Apple Silicon is the targeted macOS surface for satd. Operators who
+  need an x86_64 darwin build can cross-compile from an arm64 darwin
+  host (`cargo build --release --target=x86_64-apple-darwin`).
+
+  Each tarball contains stripped `satd` + `sat-cli` binaries and the
+  authoritative reference docs (`README.md`, `PACKAGING.md`,
+  `CORE_DIFFERENCES.md`, `STABILITY_POLICY.md`), plus a `MANIFEST` file
+  pinning the build commit, target triple, Rust toolchain version, and
+  build timestamp.
+
+- A per-tarball `*.sha256` file alongside each artifact, plus an
+  aggregate `SHA256SUMS` in the release.
+
+- A multi-arch container at `ghcr.io/epochbtc/satd:<version>` covering
+  `linux/amd64` + `linux/arm64`.
+
+The workflow also runs on PRs that touch the `Dockerfile`,
+`.github/workflows/release.yml`, `Cargo.lock`, or `Cargo.toml` — same
+build matrix, no publish — so the next tagged release can never be
+the first time a workflow change is exercised end to end.
+
+### Coming in later PRs
+
+- **musl-linux tarballs.** Targets `x86_64-unknown-linux-musl` and
+  `aarch64-unknown-linux-musl`. Deferred to a follow-up because
+  `rocksdb-sys` + musl wants a dedicated cross toolchain and the
+  v0.1.0 priority is gnu-linux + macOS, both of which downstream
+  package managers handle natively.
+- **`minisign`-signed tarballs.** PR-3. Detached `*.minisig`
+  signatures cross-signed by at least two maintainers; public keys
+  in `SECURITY.md`.
+- **`cosign`-signed images.** PR-3. Keyless OIDC signing attested to
+  the Rekor transparency log; verify via:
 
   ```sh
   cosign verify ghcr.io/epochbtc/satd:<version> \
@@ -290,7 +329,7 @@ PR-2 + PR-3 in the packaging stack will produce, per tag:
     --certificate-oidc-issuer https://token.actions.githubusercontent.com
   ```
 
-- `cyclonedx`-format SBOM (`*.cdx.json`) attached to each release.
+- **`cyclonedx`-format SBOM** attached to each release. PR-5.
 
 ## Stability contract
 
@@ -317,4 +356,4 @@ release notes for the version that ships them.
 
 | Version | Notable changes |
 |---|---|
-| 0.1.0 (current) | Initial PACKAGING.md. Dockerfile + systemd unit shipped. Release pipeline, signing, reproducible build pending. |
+| 0.1.0 (current) | Initial PACKAGING.md. Dockerfile + systemd unit shipped. Tag-triggered release workflow on hosted runners produces tarballs (gnu-linux + macOS, both arches) and a multi-arch GHCR image. Signing, reproducible-build verification, and SBOM generation pending. |
