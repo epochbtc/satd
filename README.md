@@ -156,6 +156,7 @@ cargo clippy --all-features --all-targets -- -D warnings
 
 ## License
 
-TBD — pending public release. Vendored code from `romanz/electrs` (MIT) is
-attributed in `electrum-proto/vendor/electrs.MIT` with original LICENSE
-text preserved.
+MIT — see [`LICENSE`](LICENSE) for the full text.
+
+Vendored code from `romanz/electrs` (MIT) is attributed in
+`electrum-proto/vendor/electrs.MIT` with original LICENSE text preserved.

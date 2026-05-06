@@ -74,6 +74,13 @@ RestrictSUIDSGID=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
+# SystemCallFilter is additive: the first line establishes the
+# allowed base set (@system-service, the broad "normal daemon" set
+# from systemd's predefined groups). The second line uses the `~`
+# prefix to subtract groups from that set — here, @privileged
+# (capability-related calls like setuid) and @resources (rlimit /
+# scheduler tweaks). Net result: a daemon-shaped allowlist with the
+# admin/tuning subsets carved back out.
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @resources
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
