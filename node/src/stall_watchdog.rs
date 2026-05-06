@@ -14,10 +14,10 @@
 //!   timestamp. If the tip hasn't advanced for `stall_threshold`, it emits
 //!   per-thread state from `/proc/self/task/*` (TID, comm, kernel state,
 //!   wchan) so the operator has post-mortem evidence of which threads were
-//!   parked on what futex, and after `abort_after` of continued silence it
-//!   calls `std::process::abort()` so systemd restarts the unit. Without
-//!   this, a wedged process can sit in the same broken state indefinitely
-//!   and the operator only finds out when a downstream client times out.
+//!   parked on what futex. It then attempts a graceful shutdown via
+//!   `SIGTERM` (which the main task handles with its own bounded
+//!   `--max-shutdown-secs` flush deadline) and only falls through to
+//!   `std::process::abort()` if the graceful path is itself stuck.
 //!
 //! * **Periodic compactor**: every `interval` it inspects the chainstate's
 //!   L0 SST count and pending-compaction-bytes estimate. If either is over
@@ -39,8 +39,21 @@ use std::time::{Duration, Instant};
 /// Spawn the stall watchdog on a dedicated `std::thread`.
 ///
 /// `stall_threshold` is how long without forward connector progress before
-/// the watchdog dumps thread states. `abort_after` is how much *additional*
-/// silence after the dump before the watchdog calls `std::process::abort()`.
+/// the watchdog dumps thread states. `abort_after` is the additional grace
+/// after the forensic dump before the watchdog forces process exit. During
+/// that grace window the watchdog first attempts a graceful shutdown by
+/// raising `SIGTERM` to itself; only if the process is still alive when
+/// `abort_after` fully elapses does it fall through to `std::process::abort()`.
+///
+/// Why graceful-then-abort: RocksDB is crash-consistent and BulkLoad-mode
+/// writes replay from the flat-file block store on next start, so a direct
+/// abort would not corrupt the DB — but trying graceful first lets the
+/// existing `--max-shutdown-secs`-bounded flush path stamp a clean-shutdown
+/// marker and persist the post-last-checkpoint memtable. If the same lock
+/// the wedge is holding also blocks graceful shutdown, that path runs into
+/// its own bounded timeout and force-exits via `process::exit`, and the
+/// watchdog's outer fence still fires if for some reason neither path
+/// completes.
 ///
 /// Progress is observed via [`ChainState::connect_heartbeat`], a lock-free
 /// counter bumped on every successful connect. The watchdog deliberately
@@ -76,6 +89,7 @@ pub fn spawn_stall_watchdog(
             let mut last_seen_heartbeat = chain_state.connect_heartbeat();
             let mut last_advance = Instant::now();
             let mut dumped_for_this_stall = false;
+            let mut sigterm_sent = false;
             loop {
                 std::thread::sleep(poll);
                 if *shutdown_rx.borrow() {
@@ -93,6 +107,7 @@ pub fn spawn_stall_watchdog(
                              stall; watchdog returning to nominal state"
                         );
                         dumped_for_this_stall = false;
+                        sigterm_sent = false;
                     }
                     continue;
                 }
@@ -101,12 +116,30 @@ pub fn spawn_stall_watchdog(
                     capture_forensics(stalled_for, heartbeat, &chain_state);
                     dumped_for_this_stall = true;
                 }
+                // First escalation: raise SIGTERM so the existing main()
+                // shutdown path runs (which has its own bounded flush
+                // deadline). Sending SIGTERM is idempotent in effect — we
+                // gate it on `sigterm_sent` so a stuck graceful path
+                // doesn't spam signals.
+                if dumped_for_this_stall && !sigterm_sent && stalled_for >= stall_threshold {
+                    tracing::error!(
+                        stalled_secs = stalled_for.as_secs(),
+                        heartbeat,
+                        "Stall watchdog: raising SIGTERM to attempt graceful \
+                         shutdown via the bounded --max-shutdown-secs flush path. \
+                         Will force-abort if the process is still alive after \
+                         the abort_after grace window."
+                    );
+                    raise_sigterm();
+                    sigterm_sent = true;
+                }
                 if dumped_for_this_stall && stalled_for >= stall_threshold + abort_after {
                     tracing::error!(
                         stalled_secs = stalled_for.as_secs(),
                         heartbeat,
                         "Stall persists past abort deadline; calling \
                          std::process::abort() so systemd restarts the unit. \
+                         Graceful shutdown via SIGTERM did not complete in time. \
                          Forensics dumped above."
                     );
                     // abort, not exit: skips destructors (we cannot trust
@@ -119,6 +152,26 @@ pub fn spawn_stall_watchdog(
             }
         })
         .expect("failed to spawn stall-watchdog thread");
+}
+
+/// Raise `SIGTERM` to our own process so the main shutdown path (which
+/// already has a bounded `--max-shutdown-secs` flush+exit machinery) takes
+/// over. We use the `libc` raw signal API rather than `nix::sys::signal`
+/// to avoid a new dependency; `raise(3)` is async-signal-safe and well-
+/// defined for self-signaling. A failure here is non-fatal — the watchdog
+/// will fall through to `abort()` after the grace window — so we only log.
+fn raise_sigterm() {
+    // SAFETY: `libc::raise` is async-signal-safe and takes no pointer
+    // arguments. The only failure mode is `EINVAL` for an unrecognized
+    // signal number, which `SIGTERM` is not.
+    let rc = unsafe { libc::raise(libc::SIGTERM) };
+    if rc != 0 {
+        tracing::error!(
+            errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1),
+            "Stall watchdog: libc::raise(SIGTERM) failed; will rely on \
+             outer abort fence"
+        );
+    }
 }
 
 /// Spawn the periodic forced-compaction thread.
@@ -280,12 +333,18 @@ mod tests {
     use std::path::Path;
 
     /// Sanity-check the `/proc/self/task/*` reader: on any Linux test host
-    /// the current process must have at least one task entry (itself), and
-    /// reading it must produce a non-empty `comm` and a `State:` line. If
-    /// this regresses (e.g. by accidentally moving to `/proc/<pid>/task`
-    /// with a stale pid, or by trimming the state line wrong) the watchdog
-    /// would emit empty diagnostic rows during a real stall — which is the
-    /// failure mode this test exists to catch.
+    /// at least one task entry must produce a readable `comm` and a
+    /// well-formed `State:` line.
+    ///
+    /// We don't assert per-entry invariants because threads in this test
+    /// process can exit between the `read_dir` enumeration and the per-tid
+    /// `comm` / `status` reads — a real race when the broader test suite
+    /// runs concurrently. The watchdog tolerates this in production (it
+    /// just logs an empty row for the dead thread), so the test does the
+    /// same: skip entries whose reads come back empty, and fail only if
+    /// *no* entry was readable at all (which would indicate the reader
+    /// itself regressed — e.g. accidentally pointing at a stale pid or
+    /// trimming the State line wrong).
     #[test]
     fn forensics_reader_returns_self_thread_metadata() {
         let task_dir = Path::new("/proc/self/task");
@@ -297,9 +356,12 @@ mod tests {
         for entry in std::fs::read_dir(task_dir).unwrap().flatten() {
             let comm = super::read_trim(&entry.path().join("comm"));
             let state = super::read_state(&entry.path().join("status"));
-            assert!(!comm.is_empty(), "comm should be non-empty for tid={:?}", entry.file_name());
-            assert!(!state.is_empty(), "state should be non-empty for tid={:?}", entry.file_name());
-            // The first letter of state is the canonical short code (R, S, D, …).
+            if comm.is_empty() || state.is_empty() {
+                // Thread exited between read_dir and our per-tid reads;
+                // the production watchdog tolerates this same race.
+                continue;
+            }
+            // First letter of state is the canonical short code (R, S, D, …).
             let code = state.chars().next().unwrap();
             assert!(
                 matches!(code, 'R' | 'S' | 'D' | 'T' | 't' | 'X' | 'Z' | 'I'),
@@ -309,6 +371,6 @@ mod tests {
             );
             found_any = true;
         }
-        assert!(found_any, "no /proc/self/task entries found — reader is broken");
+        assert!(found_any, "no readable /proc/self/task entries — reader is broken");
     }
 }
