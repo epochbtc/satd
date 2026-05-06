@@ -40,8 +40,13 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # Build deps:
 #   - clang + libclang-dev: rocksdb-sys bindgen
 #   - cmake + make + g++ + pkg-config: rocksdb / zstd / lz4 native code
-#   - libssl-dev: reqwest TLS backend (cargo build links the system openssl
-#     unless every dep has been audited for rustls-only — easier to provide it)
+#   - libssl-dev: reqwest's default TLS backend is `native-tls`, which
+#     pulls openssl-sys on Linux. We deliberately don't switch the
+#     workspace to rustls-only: that requires auditing every transitive
+#     dependency (and any indirect openssl-sys pull-in is silent). The
+#     openssl path is battle-tested and the apt package is a known
+#     quantity, so we accept the larger system dependency rather than
+#     shoulder the rustls audit burden.
 #   - ca-certificates: rustup downloads
 #   - curl: rustup installer
 #   - git: build.rs scripts that read git metadata

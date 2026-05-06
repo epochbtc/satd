@@ -265,7 +265,7 @@ jobs:
           labels: |
             org.opencontainers.image.title=satd
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.licenses=TBD
+            org.opencontainers.image.licenses=MIT
 
       - name: Log in to GHCR
         if: startsWith(github.ref, 'refs/tags/')
@@ -287,6 +287,14 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=${{ matrix.slug }}
           cache-to: type=gha,mode=max,scope=${{ matrix.slug }}
+          # provenance=false skips buildkit's auto-generated SLSA
+          # attestation. We do our own provenance via cosign keyless
+          # in merge-docker (the Sigstore cert ties the image to a
+          # specific workflow run + ref), and a real SBOM ships in
+          # PR-5. The auto-attestation here would produce a partial
+          # provenance record that's neither verifiable end-to-end
+          # nor consistent with the cosign signature, which is worse
+          # than no record. Re-enable once the SBOM step lands.
           provenance: false
 
       - name: Build and push by digest (tag)
@@ -306,6 +314,14 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=${{ matrix.slug }}
           cache-to: type=gha,mode=max,scope=${{ matrix.slug }}
+          # provenance=false skips buildkit's auto-generated SLSA
+          # attestation. We do our own provenance via cosign keyless
+          # in merge-docker (the Sigstore cert ties the image to a
+          # specific workflow run + ref), and a real SBOM ships in
+          # PR-5. The auto-attestation here would produce a partial
+          # provenance record that's neither verifiable end-to-end
+          # nor consistent with the cosign signature, which is worse
+          # than no record. Re-enable once the SBOM step lands.
           provenance: false
 
       - name: Export digest
