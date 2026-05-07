@@ -1,39 +1,43 @@
 # Nix flake CI: build the workspace through the flake (`nix build .#satd`)
 # and prove the build is bit-identical across two independent runners.
 #
-# Status: advisory-only on PRs. Not a required check on master in v1.
-# After ~10 green PRs the maintainer should promote this to required
-# in the branch protection settings; until then a flaky Nix-side issue
-# (cache miss, transient network) shouldn't block unrelated work.
-#
 # Triggers:
-#   - PRs that touch the flake itself, the toolchain pin, or the
-#     workspace's lockfile (the inputs that change the build).
-#   - workflow_dispatch for ad-hoc runs.
+#   - Tag pushes (`v*`) — runs alongside the release workflow at
+#     tag-cut time. A failure here doesn't block the release
+#     directly (the workflows are independent jobs); it does mean
+#     the released tarball cannot claim Nix-rebuilt provenance for
+#     that tag, which the maintainer should fix-forward in a follow-
+#     up tag.
+#   - `workflow_dispatch` for ad-hoc runs (lock generation, debugging
+#     a flake change before tagging).
 #
-# Deliberately NOT wired into release.yml. Adding a Nix repro check
-# to the tag-time release workflow would inflate the cost of every
-# release without earning a guard the advisory CI doesn't already
-# provide. Reconsider once the repo flips to public (Actions minutes
-# free) and the Nix-to-tarball-binary repro story is solved.
+# What's NOT here, and why:
+#   - PR-trigger on flake-/lock-touching PRs. Considered, dropped to
+#     match `release.yml`'s post-PR-#140 cost stance: hosted-runner
+#     minutes are scarce, so the PR check that *might* catch a flake
+#     regression isn't worth the rate at which it fires (every
+#     dependency bump touches Cargo.lock). A flake regression now
+#     first manifests at tag time, alongside any release.yml
+#     regression — same trade `release.yml` already makes for
+#     Dockerfile / Cargo-lock breakage.
+#
+# Deliberately NOT wired into release.yml. The tag push fires both
+# workflows in parallel; they don't gate each other. Reconsider
+# once the repo flips to public (Actions minutes free for public
+# repos) — at that point both PR-trigger and a hard gate on the
+# Nix repro check become reasonable.
 #
 # flake.lock note: this PR ships `flake.nix` without a committed
-# `flake.lock`. The first run of this workflow on a maintainer
-# branch should be a `workflow_dispatch` invocation that generates
-# the lock; the maintainer then commits the resulting `flake.lock`.
-# Subsequent PR-trigger runs will use the committed lock.
+# `flake.lock`. The first `workflow_dispatch` run from a maintainer
+# branch generates the lock; commit the result. Subsequent runs use
+# the committed lock.
 
 name: Nix
 
 on:
-  pull_request:
-    paths:
-      - 'flake.nix'
-      - 'flake.lock'
-      - 'rust-toolchain.toml'
-      - 'Cargo.lock'
-      - 'Cargo.toml'
-      - '.github/workflows/nix.yml'
+  push:
+    tags:
+      - 'v*'
   workflow_dispatch:
 
 permissions:

@@ -317,19 +317,24 @@ single source of truth — both rustup and the flake read it.
 
 ### Gating policy
 
-The `Nix` workflow is **advisory-only** in v1 — not a required check
-on `master`. After ~10 green PRs the maintainer should promote it
-to required. The `Release` workflow does **not** depend on it; tag-
-time releases continue to ship rustup-stable tarballs and the Nix
-build is a separate verification surface.
+The `Nix` workflow runs on **tag pushes (`v*`)** and **`workflow_dispatch`**
+only — same trigger model as `Release`, for the same cost-conservation
+reason (PR-trigger on every Cargo.lock edit is too expensive on the
+current Team plan). The two workflows fire in parallel at tag-cut time
+and don't gate each other; a Nix-side failure means the released
+tarball can't claim Nix-rebuilt provenance for that tag and should be
+fix-forwarded.
+
+Reconsider both the trigger scope and a hard `Release`-gates-on-Nix
+dependency once the repo flips public (Actions minutes free).
 
 ### `flake.lock`
 
 The first PR that lands the flake intentionally **does not commit
 `flake.lock`** because the maintainer who lands it does not have Nix
 on their workstation. The CI workflow is gated to `workflow_dispatch`
-+ relevant-paths PR triggers; the first run by a Nix-capable
-maintainer (or via `workflow_dispatch` from a CI runner) will
++ tag pushes; the first `workflow_dispatch` run by a Nix-capable
+maintainer (or from a CI runner) will
 generate the lock, after which it should be committed and the PR
 description updated. Subsequent PRs run against the committed lock.
 
