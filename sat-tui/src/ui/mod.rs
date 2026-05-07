@@ -3,6 +3,7 @@ pub mod help;
 pub mod ibd;
 pub mod mempool;
 pub mod reorgs;
+pub mod startup;
 pub mod steady;
 pub mod warnings;
 
@@ -227,11 +228,12 @@ pub fn render_block_map(
     lines
 }
 
-/// Render the connecting screen.
-pub fn connecting_paragraph<'a>(stale: bool, startup_status: Option<&str>) -> Paragraph<'a> {
-    let msg = if let Some(status) = startup_status {
-        format!("satd is starting: {}", status)
-    } else if stale {
+/// Render the connecting screen — used when there's no startup status
+/// to show (cold connect, transient drop). When `getstartupinfo` returns
+/// progress data, the renderer should use [`crate::ui::startup::draw`]
+/// instead so operators get the rich panel.
+pub fn connecting_paragraph<'a>(stale: bool) -> Paragraph<'a> {
+    let msg = if stale {
         "Connection to satd lost. Reconnecting...".to_string()
     } else {
         "Connecting to satd...".to_string()

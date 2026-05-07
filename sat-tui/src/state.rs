@@ -399,8 +399,21 @@ pub struct AppState {
     pub last_poll: Option<std::time::Instant>,
     pub stale: bool,
     pub loaded: Loaded,
-    /// Startup status message from satd (shown while node is loading).
-    pub startup_status: Option<String>,
+    /// Structured startup-progress response from `getstartupinfo`.
+    /// `Some` while satd is in pre-RPC startup (opening DB, reindex, etc.);
+    /// `None` once the full RPC server is up and `getblockchaininfo` succeeds.
+    pub startup_status: Option<StartupStatus>,
+    /// Wall-clock time of the first startup-status poll. Used by the
+    /// startup panel to compute elapsed / rate / ETA.
+    pub startup_started_at: Option<std::time::Instant>,
+    /// Per-phase wall-clock anchor — reset on phase transition so rate
+    /// and ETA reflect the *current* phase rather than the whole startup.
+    pub startup_phase_started_at: Option<std::time::Instant>,
+    /// Last-seen phase, used to detect transitions.
+    pub startup_phase: String,
+    /// Rolling samples of `(t, current)` for rate estimation. Capped
+    /// at ~30 entries (~45 s at the 1.5 s poll cadence).
+    pub startup_samples: VecDeque<(std::time::Instant, u64)>,
 }
 
 /// Structured startup-progress response from `getstartupinfo`.
@@ -423,7 +436,9 @@ impl StartupStatus {
     }
 
     /// Human-readable line: "Replaying blocks (phase 2/2) [reindex_connect]:
-    /// 234567/945000 (24.8%)".
+    /// 234567/945000 (24.8%)". Kept for tests / fallback callers; the
+    /// rich panel renders its own layout.
+    #[allow(dead_code)]
     pub fn render(&self) -> String {
         let phase_tag = if self.phase.is_empty() {
             String::new()
@@ -553,7 +568,73 @@ impl AppState {
             stale: false,
             loaded: Loaded::default(),
             startup_status: None,
+            startup_started_at: None,
+            startup_phase_started_at: None,
+            startup_phase: String::new(),
+            startup_samples: VecDeque::with_capacity(32),
         }
+    }
+
+    /// Push a fresh startup-progress sample. Resets the rolling window
+    /// when the phase changes so per-phase rate stays accurate.
+    pub fn update_startup(&mut self, status: StartupStatus) {
+        let now = std::time::Instant::now();
+        if self.startup_started_at.is_none() {
+            self.startup_started_at = Some(now);
+        }
+        if self.startup_phase != status.phase {
+            self.startup_phase = status.phase.clone();
+            self.startup_phase_started_at = Some(now);
+            self.startup_samples.clear();
+        }
+        if self.startup_phase_started_at.is_none() {
+            self.startup_phase_started_at = Some(now);
+        }
+        self.startup_samples.push_back((now, status.current));
+        while self.startup_samples.len() > 30 {
+            self.startup_samples.pop_front();
+        }
+        self.startup_status = Some(status);
+    }
+
+    /// Clear startup tracking — called once the full RPC server replies.
+    pub fn clear_startup(&mut self) {
+        self.startup_status = None;
+        self.startup_started_at = None;
+        self.startup_phase_started_at = None;
+        self.startup_phase.clear();
+        self.startup_samples.clear();
+    }
+
+    /// Items per second over the rolling window. `None` if the window is
+    /// empty or spans less than 1 second.
+    pub fn startup_rate(&self) -> Option<f64> {
+        if self.startup_samples.len() < 2 {
+            return None;
+        }
+        let (t0, c0) = self.startup_samples.front().copied()?;
+        let (t1, c1) = self.startup_samples.back().copied()?;
+        let dt = t1.duration_since(t0).as_secs_f64();
+        if dt < 1.0 || c1 <= c0 {
+            return None;
+        }
+        Some((c1 - c0) as f64 / dt)
+    }
+
+    /// Estimated seconds remaining for the current phase. Only meaningful
+    /// after a few samples — returns `None` until the rolling window has
+    /// enough data and `total` is known.
+    pub fn startup_eta_secs(&self) -> Option<u64> {
+        let status = self.startup_status.as_ref()?;
+        if status.total == 0 || status.current >= status.total {
+            return None;
+        }
+        let rate = self.startup_rate()?;
+        if rate <= 0.0 {
+            return None;
+        }
+        let remaining = (status.total - status.current) as f64 / rate;
+        Some(remaining as u64)
     }
 
     /// Update from getblockchaininfo response.
@@ -1242,6 +1323,88 @@ impl AppState {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn startup_rate_needs_window_and_progress() {
+        let mut st = AppState::new();
+        // No samples yet.
+        assert!(st.startup_rate().is_none());
+
+        let s = StartupStatus {
+            phase: "reindex_connect".into(),
+            message: "x".into(),
+            current: 100,
+            total: 1000,
+        };
+        st.update_startup(s);
+        // Single sample is insufficient.
+        assert!(st.startup_rate().is_none());
+
+        // Two samples but inside the same instant — duration < 1 s.
+        let s2 = StartupStatus {
+            phase: "reindex_connect".into(),
+            message: "x".into(),
+            current: 110,
+            total: 1000,
+        };
+        st.update_startup(s2);
+        // Likely None unless the test scheduler stalled past 1 s; either
+        // way, no panic and the API stays well-defined.
+        let _ = st.startup_rate();
+    }
+
+    #[test]
+    fn startup_phase_transition_resets_window() {
+        let mut st = AppState::new();
+        st.update_startup(StartupStatus {
+            phase: "reindex_scan".into(),
+            message: "scanning".into(),
+            current: 5_000,
+            total: 0,
+        });
+        assert_eq!(st.startup_samples.len(), 1);
+        assert_eq!(st.startup_phase, "reindex_scan");
+
+        st.update_startup(StartupStatus {
+            phase: "reindex_connect".into(),
+            message: "replay".into(),
+            current: 1,
+            total: 945_000,
+        });
+        // Phase change clears the rolling window so rate isn't polluted
+        // by the (much faster) scan-phase samples.
+        assert_eq!(st.startup_samples.len(), 1);
+        assert_eq!(st.startup_phase, "reindex_connect");
+    }
+
+    #[test]
+    fn startup_eta_requires_total_and_rate() {
+        let mut st = AppState::new();
+        st.update_startup(StartupStatus {
+            phase: "reindex_connect".into(),
+            message: "replay".into(),
+            current: 100,
+            total: 0,
+        });
+        // total=0 → no ETA.
+        assert!(st.startup_eta_secs().is_none());
+    }
+
+    #[test]
+    fn clear_startup_drops_all_tracking() {
+        let mut st = AppState::new();
+        st.update_startup(StartupStatus {
+            phase: "reindex_connect".into(),
+            message: "replay".into(),
+            current: 100,
+            total: 1000,
+        });
+        st.clear_startup();
+        assert!(st.startup_status.is_none());
+        assert!(st.startup_started_at.is_none());
+        assert!(st.startup_samples.is_empty());
+        assert!(st.startup_phase.is_empty());
+    }
 
     #[test]
     fn update_fee_estimates_btc_units() {

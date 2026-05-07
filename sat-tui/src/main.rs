@@ -161,8 +161,12 @@ fn run_app(
                 } else if st.show_reorgs {
                     ui::reorgs::draw(f, &st);
                 } else if !st.connected {
-                    let area = f.area();
-                    f.render_widget(ui::connecting_paragraph(st.stale, st.startup_status.as_deref()), area);
+                    if st.startup_status.is_some() {
+                        ui::startup::draw(f, &st);
+                    } else {
+                        let area = f.area();
+                        f.render_widget(ui::connecting_paragraph(st.stale), area);
+                    }
                 } else {
                     match st.active_mode() {
                         ViewMode::Ibd => ui::ibd::draw(f, &st),
@@ -315,7 +319,7 @@ async fn poller(rpc: Arc<RpcClient>, state: Arc<Mutex<AppState>>) {
 
             if any_ok {
                 st.mark_poll();
-                st.startup_status = None;
+                st.clear_startup();
                 false
             } else {
                 st.connected = false;
@@ -327,9 +331,8 @@ async fn poller(rpc: Arc<RpcClient>, state: Arc<Mutex<AppState>>) {
         if need_startup_check
             && let Ok(v) = rpc.get_startup_info().await {
                 let status = state::StartupStatus::from_json(&v);
-                let line = status.render();
                 let mut st = state.lock();
-                st.startup_status = Some(line);
+                st.update_startup(status);
         }
 
         // Slow polls (every ~5s = 3-4 fast ticks).
