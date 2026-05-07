@@ -13,25 +13,25 @@ use node_index::SpendingRef;
 
 /// In-memory storage backend for testing.
 pub struct InMemoryStore {
-    block_index: std::sync::RwLock<std::collections::HashMap<BlockHash, BlockIndexEntry>>,
-    coins: std::sync::RwLock<std::collections::HashMap<OutPoint, Coin>>,
-    tip: std::sync::RwLock<Option<BlockHash>>,
-    height_index: std::sync::RwLock<std::collections::HashMap<u32, BlockHash>>,
-    undo: std::sync::RwLock<std::collections::HashMap<BlockHash, UndoData>>,
-    tx_index: std::sync::RwLock<std::collections::HashMap<Txid, BlockHash>>,
-    addr_funding: std::sync::RwLock<Vec<AddrFundingRow>>,
-    addr_spending: std::sync::RwLock<Vec<AddrSpendingRow>>,
-    outpoint_spend: std::sync::RwLock<std::collections::HashMap<OutPoint, SpendingRef>>,
+    block_index: parking_lot::RwLock<std::collections::HashMap<BlockHash, BlockIndexEntry>>,
+    coins: parking_lot::RwLock<std::collections::HashMap<OutPoint, Coin>>,
+    tip: parking_lot::RwLock<Option<BlockHash>>,
+    height_index: parking_lot::RwLock<std::collections::HashMap<u32, BlockHash>>,
+    undo: parking_lot::RwLock<std::collections::HashMap<BlockHash, UndoData>>,
+    tx_index: parking_lot::RwLock<std::collections::HashMap<Txid, BlockHash>>,
+    addr_funding: parking_lot::RwLock<Vec<AddrFundingRow>>,
+    addr_spending: parking_lot::RwLock<Vec<AddrSpendingRow>>,
+    outpoint_spend: parking_lot::RwLock<std::collections::HashMap<OutPoint, SpendingRef>>,
     #[cfg(feature = "block-filter-index")]
-    filter: std::sync::RwLock<std::collections::HashMap<FilterKey, Vec<u8>>>,
+    filter: parking_lot::RwLock<std::collections::HashMap<FilterKey, Vec<u8>>>,
     #[cfg(feature = "block-filter-index")]
-    filter_header: std::sync::RwLock<std::collections::HashMap<FilterKey, [u8; 32]>>,
+    filter_header: parking_lot::RwLock<std::collections::HashMap<FilterKey, [u8; 32]>>,
     #[cfg(feature = "block-filter-index")]
-    filter_complete: std::sync::RwLock<bool>,
+    filter_complete: parking_lot::RwLock<bool>,
     #[cfg(feature = "block-filter-index")]
-    filter_backfill_cursor: std::sync::RwLock<node_filter_index::cursor::BackfillCursor>,
+    filter_backfill_cursor: parking_lot::RwLock<node_filter_index::cursor::BackfillCursor>,
     #[cfg(feature = "block-filter-index")]
-    filter_backfill_last_error: std::sync::RwLock<Option<String>>,
+    filter_backfill_last_error: parking_lot::RwLock<Option<String>>,
 }
 
 impl Default for InMemoryStore {
@@ -43,62 +43,62 @@ impl Default for InMemoryStore {
 impl InMemoryStore {
     pub fn new() -> Self {
         Self {
-            block_index: std::sync::RwLock::new(std::collections::HashMap::new()),
-            coins: std::sync::RwLock::new(std::collections::HashMap::new()),
-            tip: std::sync::RwLock::new(None),
-            height_index: std::sync::RwLock::new(std::collections::HashMap::new()),
-            undo: std::sync::RwLock::new(std::collections::HashMap::new()),
-            tx_index: std::sync::RwLock::new(std::collections::HashMap::new()),
-            addr_funding: std::sync::RwLock::new(Vec::new()),
-            addr_spending: std::sync::RwLock::new(Vec::new()),
-            outpoint_spend: std::sync::RwLock::new(std::collections::HashMap::new()),
+            block_index: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            coins: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            tip: parking_lot::RwLock::new(None),
+            height_index: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            undo: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            tx_index: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            addr_funding: parking_lot::RwLock::new(Vec::new()),
+            addr_spending: parking_lot::RwLock::new(Vec::new()),
+            outpoint_spend: parking_lot::RwLock::new(std::collections::HashMap::new()),
             #[cfg(feature = "block-filter-index")]
-            filter: std::sync::RwLock::new(std::collections::HashMap::new()),
+            filter: parking_lot::RwLock::new(std::collections::HashMap::new()),
             #[cfg(feature = "block-filter-index")]
-            filter_header: std::sync::RwLock::new(std::collections::HashMap::new()),
+            filter_header: parking_lot::RwLock::new(std::collections::HashMap::new()),
             // Match the RocksDb default: tests that drive the filter index
             // and want a complete marker stamp it explicitly via
             // `mark_block_filter_index_complete`.
             #[cfg(feature = "block-filter-index")]
-            filter_complete: std::sync::RwLock::new(true),
+            filter_complete: parking_lot::RwLock::new(true),
             #[cfg(feature = "block-filter-index")]
-            filter_backfill_cursor: std::sync::RwLock::new(
+            filter_backfill_cursor: parking_lot::RwLock::new(
                 node_filter_index::cursor::BackfillCursor::idle(),
             ),
             #[cfg(feature = "block-filter-index")]
-            filter_backfill_last_error: std::sync::RwLock::new(None),
+            filter_backfill_last_error: parking_lot::RwLock::new(None),
         }
     }
 }
 
 impl Store for InMemoryStore {
     fn get_block_index(&self, hash: &BlockHash) -> Option<BlockIndexEntry> {
-        self.block_index.read().unwrap().get(hash).cloned()
+        self.block_index.read().get(hash).cloned()
     }
 
     fn get_coin(&self, outpoint: &OutPoint) -> Option<Coin> {
-        self.coins.read().unwrap().get(outpoint).cloned()
+        self.coins.read().get(outpoint).cloned()
     }
 
     fn has_coin(&self, outpoint: &OutPoint) -> bool {
-        self.coins.read().unwrap().contains_key(outpoint)
+        self.coins.read().contains_key(outpoint)
     }
 
     fn get_tip(&self) -> Option<BlockHash> {
-        *self.tip.read().unwrap()
+        *self.tip.read()
     }
 
     fn get_block_hash_by_height(&self, height: u32) -> Option<BlockHash> {
-        self.height_index.read().unwrap().get(&height).copied()
+        self.height_index.read().get(&height).copied()
     }
 
     fn write_batch(&self, batch: StoreBatch) -> Result<(), StoreError> {
-        let mut bi = self.block_index.write().unwrap();
-        let mut coins = self.coins.write().unwrap();
-        let mut tip = self.tip.write().unwrap();
-        let mut hi = self.height_index.write().unwrap();
-        let mut undo = self.undo.write().unwrap();
-        let mut txi = self.tx_index.write().unwrap();
+        let mut bi = self.block_index.write();
+        let mut coins = self.coins.write();
+        let mut tip = self.tip.write();
+        let mut hi = self.height_index.write();
+        let mut undo = self.undo.write();
+        let mut txi = self.tx_index.write();
 
         for (hash, entry) in batch.block_index_puts {
             bi.insert(hash, entry);
@@ -128,21 +128,21 @@ impl Store for InMemoryStore {
             txi.remove(&txid);
         }
         if !batch.addr_funding_puts.is_empty() || !batch.addr_funding_removes.is_empty() {
-            let mut af = self.addr_funding.write().unwrap();
+            let mut af = self.addr_funding.write();
             af.extend(batch.addr_funding_puts);
             for k in batch.addr_funding_removes {
                 af.retain(|r| r.key() != k);
             }
         }
         if !batch.addr_spending_puts.is_empty() || !batch.addr_spending_removes.is_empty() {
-            let mut as_ = self.addr_spending.write().unwrap();
+            let mut as_ = self.addr_spending.write();
             as_.extend(batch.addr_spending_puts);
             for k in batch.addr_spending_removes {
                 as_.retain(|r| r.key() != k);
             }
         }
         if !batch.outpoint_spend_puts.is_empty() || !batch.outpoint_spend_removes.is_empty() {
-            let mut os = self.outpoint_spend.write().unwrap();
+            let mut os = self.outpoint_spend.write();
             for (op, sref) in batch.outpoint_spend_puts {
                 os.insert(op, sref);
             }
@@ -154,27 +154,27 @@ impl Store for InMemoryStore {
         #[cfg(feature = "block-filter-index")]
         {
             if !batch.filter_puts.is_empty() {
-                let mut f = self.filter.write().unwrap();
+                let mut f = self.filter.write();
                 for row in batch.filter_puts {
                     f.insert(row.key, row.filter);
                 }
             }
             if !batch.filter_header_puts.is_empty() {
-                let mut fh = self.filter_header.write().unwrap();
+                let mut fh = self.filter_header.write();
                 for row in batch.filter_header_puts {
                     fh.insert(row.key, row.header);
                 }
             }
             if !batch.filter_removes.is_empty() {
-                let mut f = self.filter.write().unwrap();
-                let mut fh = self.filter_header.write().unwrap();
+                let mut f = self.filter.write();
+                let mut fh = self.filter_header.write();
                 for k in batch.filter_removes {
                     f.remove(&k);
                     fh.remove(&k);
                 }
             }
             if let Some(adv) = batch.filter_backfill_cursor_advance {
-                let mut cur = self.filter_backfill_cursor.write().unwrap();
+                let mut cur = self.filter_backfill_cursor.write();
                 cur.state = adv.state;
                 cur.cursor_height = adv.cursor_height;
                 cur.snapshot_height = adv.snapshot_height;
@@ -189,19 +189,19 @@ impl Store for InMemoryStore {
     }
 
     fn get_undo(&self, hash: &BlockHash) -> Option<UndoData> {
-        self.undo.read().unwrap().get(hash).cloned()
+        self.undo.read().get(hash).cloned()
     }
 
     fn coin_count(&self) -> u64 {
-        self.coins.read().unwrap().len() as u64
+        self.coins.read().len() as u64
     }
 
     fn coin_total_amount(&self) -> u64 {
-        self.coins.read().unwrap().values().map(|c| c.amount).sum()
+        self.coins.read().values().map(|c| c.amount).sum()
     }
 
     fn utxo_height_hist(&self) -> Vec<u64> {
-        let coins = self.coins.read().unwrap();
+        let coins = self.coins.read();
         let mut hist: Vec<u64> = Vec::new();
         for coin in coins.values() {
             let bucket = (coin.height / 1000) as usize;
@@ -214,7 +214,7 @@ impl Store for InMemoryStore {
     }
 
     fn get_tx_location(&self, txid: &Txid) -> Option<BlockHash> {
-        self.tx_index.read().unwrap().get(txid).copied()
+        self.tx_index.read().get(txid).copied()
     }
 
     fn has_txindex(&self) -> bool {
@@ -222,38 +222,38 @@ impl Store for InMemoryStore {
     }
 
     fn clear_chainstate(&self) -> Result<(), StoreError> {
-        self.coins.write().unwrap().clear();
-        self.undo.write().unwrap().clear();
-        self.tx_index.write().unwrap().clear();
-        self.addr_funding.write().unwrap().clear();
-        self.addr_spending.write().unwrap().clear();
-        self.outpoint_spend.write().unwrap().clear();
+        self.coins.write().clear();
+        self.undo.write().clear();
+        self.tx_index.write().clear();
+        self.addr_funding.write().clear();
+        self.addr_spending.write().clear();
+        self.outpoint_spend.write().clear();
         #[cfg(feature = "block-filter-index")]
         {
-            self.filter.write().unwrap().clear();
-            self.filter_header.write().unwrap().clear();
-            *self.filter_complete.write().unwrap() = true;
+            self.filter.write().clear();
+            self.filter_header.write().clear();
+            *self.filter_complete.write() = true;
         }
-        *self.tip.write().unwrap() = None;
+        *self.tip.write() = None;
         Ok(())
     }
 
     fn clear_all(&self) -> Result<(), StoreError> {
-        self.block_index.write().unwrap().clear();
-        self.height_index.write().unwrap().clear();
-        self.coins.write().unwrap().clear();
-        self.undo.write().unwrap().clear();
-        self.tx_index.write().unwrap().clear();
-        self.addr_funding.write().unwrap().clear();
-        self.addr_spending.write().unwrap().clear();
-        self.outpoint_spend.write().unwrap().clear();
+        self.block_index.write().clear();
+        self.height_index.write().clear();
+        self.coins.write().clear();
+        self.undo.write().clear();
+        self.tx_index.write().clear();
+        self.addr_funding.write().clear();
+        self.addr_spending.write().clear();
+        self.outpoint_spend.write().clear();
         #[cfg(feature = "block-filter-index")]
         {
-            self.filter.write().unwrap().clear();
-            self.filter_header.write().unwrap().clear();
-            *self.filter_complete.write().unwrap() = true;
+            self.filter.write().clear();
+            self.filter_header.write().clear();
+            *self.filter_complete.write() = true;
         }
-        *self.tip.write().unwrap() = None;
+        *self.tip.write() = None;
         Ok(())
     }
 
@@ -261,7 +261,7 @@ impl Store for InMemoryStore {
         let mut rows: Vec<(AddrFundingKey, u64)> = self
             .addr_funding
             .read()
-            .unwrap()
+            
             .iter()
             .filter(|r| &r.scripthash == sh)
             .map(|r| (r.key(), r.amount_sat))
@@ -277,7 +277,7 @@ impl Store for InMemoryStore {
         let mut rows: Vec<(AddrSpendingKey, OutPoint)> = self
             .addr_spending
             .read()
-            .unwrap()
+            
             .iter()
             .filter(|r| &r.scripthash == sh)
             .map(|r| (r.key(), r.prev_outpoint))
@@ -290,14 +290,14 @@ impl Store for InMemoryStore {
     }
 
     fn lookup_spend(&self, outpoint: &OutPoint) -> Result<Option<SpendingRef>, StoreError> {
-        Ok(self.outpoint_spend.read().unwrap().get(outpoint).copied())
+        Ok(self.outpoint_spend.read().get(outpoint).copied())
     }
 
     #[cfg(feature = "block-filter-index")]
     fn get_filter(&self, filter_type: u8, height: u32) -> Option<Vec<u8>> {
         self.filter
             .read()
-            .unwrap()
+            
             .get(&FilterKey {
                 filter_type,
                 height,
@@ -309,7 +309,7 @@ impl Store for InMemoryStore {
     fn get_filter_header(&self, filter_type: u8, height: u32) -> Option<[u8; 32]> {
         self.filter_header
             .read()
-            .unwrap()
+            
             .get(&FilterKey {
                 filter_type,
                 height,
@@ -319,28 +319,28 @@ impl Store for InMemoryStore {
 
     #[cfg(feature = "block-filter-index")]
     fn block_filter_index_complete(&self) -> bool {
-        *self.filter_complete.read().unwrap()
+        *self.filter_complete.read()
     }
 
     #[cfg(feature = "block-filter-index")]
     fn mark_block_filter_index_complete(&self) -> Result<(), StoreError> {
-        *self.filter_complete.write().unwrap() = true;
+        *self.filter_complete.write() = true;
         Ok(())
     }
 
     #[cfg(feature = "block-filter-index")]
     fn read_filter_backfill_cursor(&self) -> node_filter_index::cursor::BackfillCursor {
-        *self.filter_backfill_cursor.read().unwrap()
+        *self.filter_backfill_cursor.read()
     }
 
     #[cfg(feature = "block-filter-index")]
     fn read_filter_backfill_last_error(&self) -> Option<String> {
-        self.filter_backfill_last_error.read().unwrap().clone()
+        self.filter_backfill_last_error.read().clone()
     }
 
     #[cfg(feature = "block-filter-index")]
     fn write_filter_backfill_last_error(&self, msg: &str) -> Result<(), StoreError> {
-        let mut slot = self.filter_backfill_last_error.write().unwrap();
+        let mut slot = self.filter_backfill_last_error.write();
         if msg.is_empty() {
             *slot = None;
         } else {

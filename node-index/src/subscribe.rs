@@ -24,9 +24,9 @@
 //! the all-zero array; we mirror that).
 
 use std::collections::HashMap;
-use std::sync::Mutex;
 
 use bitcoin::Txid;
+use parking_lot::Mutex;
 use bitcoin::hashes::{Hash, sha256};
 use tokio::sync::broadcast;
 
@@ -81,7 +81,7 @@ impl SubscriptionRegistry {
         &self,
         sh: Scripthash,
     ) -> Result<broadcast::Receiver<StatusUpdate>, SubscribeError> {
-        let mut channels = self.channels.lock().unwrap();
+        let mut channels = self.channels.lock();
         if let Some(tx) = channels.get(&sh)
             && tx.receiver_count() > 0
         {
@@ -97,7 +97,7 @@ impl SubscriptionRegistry {
         let live_keys: std::collections::HashSet<Scripthash> = channels.keys().copied().collect();
         self.last_status
             .lock()
-            .unwrap()
+            
             .retain(|sh, _| live_keys.contains(sh));
         if channels.len() >= self.max_subs {
             return Err(SubscribeError::CapReached(self.max_subs));
@@ -110,21 +110,21 @@ impl SubscriptionRegistry {
     /// Number of distinct scripthashes currently subscribed. Used by
     /// the `satd_addrindex_subscriptions_active` Prometheus gauge.
     pub fn active_count(&self) -> usize {
-        self.channels.lock().unwrap().len()
+        self.channels.lock().len()
     }
 
     /// Forget all per-scripthash channels with zero remaining
     /// subscribers. Called periodically from the notifier so
     /// abandoned channels don't accumulate forever.
     pub fn prune_empty(&self) {
-        let mut channels = self.channels.lock().unwrap();
+        let mut channels = self.channels.lock();
         channels.retain(|_, tx| tx.receiver_count() > 0);
         // Drop matching last_status entries — a future re-subscribe
         // recomputes status_hash from current state, which is correct.
         let live_keys: std::collections::HashSet<Scripthash> = channels.keys().copied().collect();
         self.last_status
             .lock()
-            .unwrap()
+            
             .retain(|sh, _| live_keys.contains(sh));
     }
 
@@ -135,7 +135,7 @@ impl SubscriptionRegistry {
     pub fn active_scripthashes(&self) -> Vec<Scripthash> {
         self.channels
             .lock()
-            .unwrap()
+            
             .iter()
             .filter_map(|(sh, tx)| {
                 if tx.receiver_count() > 0 {
@@ -156,14 +156,14 @@ impl SubscriptionRegistry {
     /// the first notification if the recomputed hash happened to
     /// match the stale entry.
     pub fn maybe_notify(&self, sh: Scripthash, status_hash: [u8; 32]) {
-        let channels = self.channels.lock().unwrap();
+        let channels = self.channels.lock();
         let tx = match channels.get(&sh) {
             Some(tx) if tx.receiver_count() > 0 => tx.clone(),
             _ => return,
         };
         drop(channels);
 
-        let mut last = self.last_status.lock().unwrap();
+        let mut last = self.last_status.lock();
         if last.get(&sh) == Some(&status_hash) {
             return;
         }

@@ -148,7 +148,7 @@ pub struct RocksDbStore {
     /// Shared LRU across all column families. Cloneable Arc; the FFI layer
     /// is thread-safe for `set_capacity`, so a clone plus an interior mutex
     /// is enough to allow live resize from a separate task.
-    block_cache: std::sync::Mutex<Cache>,
+    block_cache: parking_lot::Mutex<Cache>,
     /// Tracked separately because the RocksDB Cache API has no
     /// `get_capacity` getter — only usage.
     block_cache_capacity: std::sync::atomic::AtomicUsize,
@@ -362,7 +362,7 @@ impl RocksDbStore {
             // completeness marker atomically.
             #[cfg(feature = "block-filter-index")]
             blockfilterindex_enabled: false,
-            block_cache: std::sync::Mutex::new(block_cache),
+            block_cache: parking_lot::Mutex::new(block_cache),
             block_cache_capacity: std::sync::atomic::AtomicUsize::new(cache_bytes),
         };
         // outpoint_spend completeness marker (review H6 round 2).
@@ -676,7 +676,7 @@ impl RocksDbStore {
 
         let mut cf_opts = Options::default();
         let mut table_opts = BlockBasedOptions::default();
-        table_opts.set_block_cache(&self.block_cache.lock().unwrap());
+        table_opts.set_block_cache(&self.block_cache.lock());
         table_opts.set_block_size(16 * 1024);
         table_opts.set_cache_index_and_filter_blocks(true);
         table_opts.set_pin_l0_filter_and_index_blocks_in_cache(true);
@@ -1157,7 +1157,7 @@ impl Store for RocksDbStore {
         // LRU. `set_capacity` takes `&mut self` for Rust borrow-checker
         // reasons only; the underlying FFI is safe to call concurrently.
         // We hold a Mutex<Cache> purely to satisfy the signature.
-        let mut cache = self.block_cache.lock().unwrap();
+        let mut cache = self.block_cache.lock();
         cache.set_capacity(bytes);
         self.block_cache_capacity
             .store(bytes, std::sync::atomic::Ordering::Relaxed);
@@ -1546,7 +1546,7 @@ impl Store for RocksDbStore {
         // bloom checks usefully. Write buffer 32 MB matches the addr CFs.
         let mut cf_opts = Options::default();
         let mut table_opts = BlockBasedOptions::default();
-        table_opts.set_block_cache(&self.block_cache.lock().unwrap());
+        table_opts.set_block_cache(&self.block_cache.lock());
         table_opts.set_block_size(16 * 1024);
         table_opts.set_cache_index_and_filter_blocks(true);
         table_opts.set_pin_l0_filter_and_index_blocks_in_cache(true);

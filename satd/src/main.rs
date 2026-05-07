@@ -143,11 +143,11 @@ async fn main() {
     let rpc_bind: SocketAddr = format!("{}:{}", config.rpcbind, config.rpcport)
         .parse()
         .expect("Invalid RPC bind address");
-    let startup_status = Arc::new(std::sync::RwLock::new("Opening database...".to_string()));
+    let startup_progress = node::startup_progress::StartupProgress::new();
     let startup_handle = {
-        let status = startup_status.clone();
+        let progress = startup_progress.clone();
         let auth_clone = auth.clone();
-        start_startup_rpc(rpc_bind, auth_clone, status).await
+        start_startup_rpc(rpc_bind, auth_clone, progress).await
     };
 
     // Open block storage
@@ -198,6 +198,7 @@ async fn main() {
 
     // Handle -reindex: clear everything, will rebuild from flat files
     if config.reindex {
+        startup_progress.set_phase("clearing_db", "Clearing chain database for reindex...");
         tracing::info!("Reindexing: clearing database, will rebuild from block files");
         if let Err(e) = store.clear_all() {
             eprintln!("Error clearing database for reindex: {}", e);
@@ -223,14 +224,11 @@ async fn main() {
         }
     };
 
-    // For -reindex: scan flat files before FlatFileManager is moved into ChainState
-    let reindex_blocks = if config.reindex {
-        let scanned = flat_files.scan_all_blocks();
-        tracing::info!(blocks = scanned.len(), "Scanned flat files for reindex");
-        Some(scanned)
-    } else {
-        None
-    };
+    // -reindex used to eagerly slurp every block into a `Vec` here so the
+    // FlatFileManager could be moved into ChainState; on a fully-synced
+    // mainnet that path needs ~900 GB RSS and OOM-kills the process. The
+    // reindex now streams directly from disk inside ChainState — no upfront
+    // scan needed.
 
     // Parse assumevalid: Core-compatible semantics + "all" extension
     //   (none)       → per-network default hash
@@ -278,7 +276,7 @@ async fn main() {
     };
 
     // Initialize chain state with script verification
-    *startup_status.write().unwrap() = "Initializing chain state...".to_string();
+    startup_progress.set_phase("chain_init", "Initializing chain state...");
     let verifier: Box<dyn ScriptVerifier> = match config.consensus {
         ConsensusEngine::Cpp => Box::new(ConsensusVerifier),
         ConsensusEngine::Rust => {
@@ -370,17 +368,19 @@ async fn main() {
 
     // Run reindex replay if requested
     if config.reindex {
-        if let Err(e) = chain_state.reindex_from_blocks(reindex_blocks.unwrap()) {
+        startup_progress.set_phase("reindex_scan", "Scanning block files (phase 1/2)");
+        if let Err(e) = chain_state.reindex_from_flat_files(Some(startup_progress.clone())) {
             eprintln!("Error during reindex: {}", e);
             auth.cleanup();
             std::process::exit(1);
         }
-    } else if config.reindex_chainstate
-        && let Err(e) = chain_state.reindex_chainstate()
-    {
-        eprintln!("Error during chainstate reindex: {}", e);
-        auth.cleanup();
-        std::process::exit(1);
+    } else if config.reindex_chainstate {
+        startup_progress.set_phase("reindex_chainstate", "Replaying UTXO set");
+        if let Err(e) = chain_state.reindex_chainstate() {
+            eprintln!("Error during chainstate reindex: {}", e);
+            auth.cleanup();
+            std::process::exit(1);
+        }
     }
 
     // Shutdown channel — created before the mempool so the snapshotter
@@ -529,7 +529,7 @@ async fn main() {
     // Shared MempoolAddrIndex handle. Both the read-side
     // RocksAddressIndex (for RPC queries) and the background
     // event-loop task hold the same Arc<RwLock<...>>.
-    let mempool_addr_index = std::sync::Arc::new(std::sync::RwLock::new(
+    let mempool_addr_index = std::sync::Arc::new(parking_lot::RwLock::new(
         node::index::address::MempoolAddrIndex::new(),
     ));
 
@@ -1506,20 +1506,29 @@ async fn main() {
 async fn start_startup_rpc(
     bind_addr: SocketAddr,
     auth: Arc<RpcAuth>,
-    status: Arc<std::sync::RwLock<String>>,
+    progress: Arc<node::startup_progress::StartupProgress>,
 ) -> jsonrpsee::server::ServerHandle {
     use jsonrpsee::server::{RpcModule, ServerBuilder};
     use jsonrpsee::types::ErrorObjectOwned;
     use node::rpc::auth::AuthLayer;
 
-    let mut module = RpcModule::new(status);
+    let mut module = RpcModule::new(progress);
 
     module
         .register_method("getstartupinfo", |_params, ctx, _extensions| {
-            let status = ctx.read().unwrap().clone();
+            let snap = ctx.snapshot();
+            let percent = if snap.total > 0 {
+                Some(((snap.current as f64 / snap.total as f64) * 100.0 * 10.0).round() / 10.0)
+            } else {
+                None
+            };
             Ok::<_, ErrorObjectOwned>(serde_json::json!({
                 "started": false,
-                "status": status,
+                "status": snap.message,
+                "phase": snap.phase,
+                "current": snap.current,
+                "total": snap.total,
+                "percent": percent,
             }))
         })
         .unwrap();

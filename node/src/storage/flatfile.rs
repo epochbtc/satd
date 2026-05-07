@@ -152,10 +152,26 @@ impl FlatFileManager {
         Ok(data)
     }
 
-    /// Scan all blk*.dat files and return raw block bytes with their file positions.
-    /// Used by `-reindex` to rebuild the block index from flat files.
-    pub fn scan_all_blocks(&self) -> Vec<(Vec<u8>, FlatFilePos)> {
-        let mut results = Vec::new();
+    /// Stream every block in `blk*.dat` files, invoking `visit` for each.
+    ///
+    /// Used by `-reindex` to rebuild the block index from flat files without
+    /// holding all blocks in memory at once. The previous `scan_all_blocks`
+    /// API returned `Vec<(Vec<u8>, FlatFilePos)>`, which forced ~900 GB of
+    /// resident memory on a fully-synced mainnet (945k × ~1 MB) and OOM-
+    /// killed the process during reindex.
+    ///
+    /// Files are read into a 128 MB buffer (one whole `blk*.dat` at a time),
+    /// then walked record-by-record. The visitor sees each block's payload
+    /// as a borrowed `&[u8]` plus its `FlatFilePos`. The buffer is reused
+    /// across files, so peak memory is `O(MAX_FILE_SIZE)` regardless of how
+    /// many flat files exist.
+    ///
+    /// Returns the total number of blocks visited.
+    pub fn for_each_block<F>(&self, mut visit: F) -> std::io::Result<u64>
+    where
+        F: FnMut(&[u8], FlatFilePos),
+    {
+        let mut count = 0u64;
         for file_num in 0u32.. {
             let path = self.file_path(file_num);
             if !path.exists() {
@@ -167,24 +183,28 @@ impl FlatFileManager {
             };
             let mut offset = 0usize;
             while offset + 8 <= data.len() {
-                let size =
-                    u32::from_le_bytes([data[offset + 4], data[offset + 5], data[offset + 6], data[offset + 7]])
-                        as usize;
+                let size = u32::from_le_bytes([
+                    data[offset + 4],
+                    data[offset + 5],
+                    data[offset + 6],
+                    data[offset + 7],
+                ]) as usize;
                 if size == 0 || offset + 8 + size > data.len() {
                     break;
                 }
-                let block_data = data[offset + 8..offset + 8 + size].to_vec();
-                results.push((
-                    block_data,
+                let block_slice = &data[offset + 8..offset + 8 + size];
+                visit(
+                    block_slice,
                     FlatFilePos {
                         file_number: file_num,
                         data_pos: offset as u32,
                     },
-                ));
+                );
+                count += 1;
                 offset += 8 + size;
             }
         }
-        results
+        Ok(count)
     }
 }
 
@@ -245,6 +265,46 @@ mod tests {
         assert_eq!(mgr.read_block(&pos2).unwrap(), b"block two");
         assert_eq!(mgr.read_block(&pos3).unwrap(), b"block three");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn for_each_block_streams_all_records_in_order() {
+        let dir = std::env::temp_dir().join(format!("satd-flatfile-stream-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut mgr = FlatFileManager::new(&dir).unwrap();
+        let magic = [0xfa, 0xbf, 0xb5, 0xda];
+        let payloads: Vec<&[u8]> = vec![b"block one", b"second block payload", b"third"];
+        let mut written = Vec::new();
+        for p in &payloads {
+            written.push(mgr.write_block(p, magic).unwrap());
+        }
+
+        let mut visited: Vec<(Vec<u8>, FlatFilePos)> = Vec::new();
+        let count = mgr
+            .for_each_block(|data, pos| visited.push((data.to_vec(), pos)))
+            .unwrap();
+
+        assert_eq!(count, payloads.len() as u64);
+        assert_eq!(visited.len(), payloads.len());
+        for (i, (data, pos)) in visited.iter().enumerate() {
+            assert_eq!(data, payloads[i]);
+            assert_eq!(pos.file_number, written[i].file_number);
+            assert_eq!(pos.data_pos, written[i].data_pos);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn for_each_block_handles_empty_blocks_dir() {
+        let dir = std::env::temp_dir().join(format!("satd-flatfile-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mgr = FlatFileManager::new(&dir).unwrap();
+        let mut count = 0;
+        mgr.for_each_block(|_, _| count += 1).unwrap();
+        assert_eq!(count, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

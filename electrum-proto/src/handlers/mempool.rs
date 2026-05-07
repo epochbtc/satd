@@ -1,6 +1,6 @@
 //! `mempool.*` method handlers.
 
-use std::sync::Mutex;
+use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -40,7 +40,7 @@ impl FeeHistogramCache {
     /// past the TTL queue behind a single build, then read the same
     /// fresh value on the wire.
     pub fn get_or_compute<F: FnOnce() -> Value>(&self, build: F) -> Value {
-        let mut guard = self.last.lock().unwrap();
+        let mut guard = self.last.lock();
         let now = Instant::now();
         if let Some((stamped, cached)) = guard.as_ref()
             && now.duration_since(*stamped) < self.ttl
@@ -56,7 +56,7 @@ impl FeeHistogramCache {
     /// callers rely on natural TTL expiry.
     #[cfg(test)]
     pub fn invalidate(&self) {
-        *self.last.lock().unwrap() = None;
+        *self.last.lock() = None;
     }
 }
 

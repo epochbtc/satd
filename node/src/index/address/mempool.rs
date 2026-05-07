@@ -18,9 +18,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::RwLock;
 
 use bitcoin::{Transaction, Txid};
+use parking_lot::RwLock;
 
 use crate::chain::state::ChainState;
 use crate::index::address::keys::{Scripthash, scripthash_of};
@@ -268,7 +268,7 @@ pub async fn mempool_index_task(
                             &entry.tx, &chain_state, &mempool,
                         );
                         let touched: Vec<Scripthash> = {
-                            let mut idx = index.write().unwrap();
+                            let mut idx = index.write();
                             idx.add_tx(txid, &funding, &spending);
                             idx.scripthashes_for(&txid)
                         };
@@ -287,7 +287,7 @@ pub async fn mempool_index_task(
                         // Capture touched scripthashes BEFORE the remove
                         // since `remove_tx` clears `by_txid[txid]`.
                         let touched: Vec<Scripthash> = {
-                            let mut idx = index.write().unwrap();
+                            let mut idx = index.write();
                             let touched = idx.scripthashes_for(&txid);
                             idx.remove_tx(&txid);
                             touched
@@ -309,7 +309,7 @@ pub async fn mempool_index_task(
                             .into_iter()
                             .map(|(txid, e)| (txid, e.tx))
                             .collect();
-                        index.write().unwrap().resync_from(
+                        index.write().resync_from(
                             &snapshot, &chain_state, &mempool,
                         );
                         // After resync, recompute every active subscriber

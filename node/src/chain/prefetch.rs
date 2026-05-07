@@ -243,14 +243,14 @@ impl PrefetchHandle {
     /// Try to take a preprocessed block for the given height.
     /// Returns None if the block hasn't been prefetched yet.
     pub fn take_block(&self, height: u32) -> Option<PreprocessedBlock> {
-        self.buffer.lock().unwrap().remove(&height)
+        self.buffer.lock().remove(&height)
     }
 }
 
 /// Shared prefetch buffer: workers insert by height, connect thread removes by height.
 /// No coordinator needed — direct lookup eliminates the ordering bottleneck that
 /// caused 0% prefetch hit rates.
-pub type PrefetchBuffer = Arc<std::sync::Mutex<HashMap<u32, PreprocessedBlock>>>;
+pub type PrefetchBuffer = Arc<parking_lot::Mutex<HashMap<u32, PreprocessedBlock>>>;
 
 /// Start the prefetch pipeline.
 ///
@@ -271,7 +271,7 @@ pub fn start_prefetcher(
 ) -> PrefetchHandle {
     let shutdown = Arc::new(AtomicBool::new(false));
     let cursor = Arc::new(AtomicU32::new(start_height));
-    let buffer: PrefetchBuffer = Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let buffer: PrefetchBuffer = Arc::new(parking_lot::Mutex::new(HashMap::new()));
 
     // Work dispatch channel
     let (work_tx, work_rx) = bounded::<u32>(lookahead * 2);
@@ -291,7 +291,7 @@ pub fn start_prefetcher(
                 match w_rx.recv_timeout(std::time::Duration::from_millis(500)) {
                     Ok(height) => {
                         if let Some(pre) = prefetch_block(&*w_store, &w_dir, height, assumevalid, primary_engine) {
-                            w_buffer.lock().unwrap().insert(height, pre);
+                            w_buffer.lock().insert(height, pre);
                         }
                     }
                     Err(_) => continue,
@@ -317,7 +317,7 @@ pub fn start_prefetcher(
 
             // Evict stale entries below cursor
             {
-                let mut buf = disp_buffer.lock().unwrap();
+                let mut buf = disp_buffer.lock();
                 buf.retain(|h, _| *h >= current_cursor);
             }
 

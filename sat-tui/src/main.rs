@@ -11,8 +11,9 @@ use crossterm::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::io;
+use parking_lot::Mutex;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::time::{interval, Duration};
 
 use rpc::RpcClient;
@@ -153,7 +154,7 @@ fn run_app(
     loop {
         // Draw
         {
-            let st = state.lock().unwrap();
+            let st = state.lock();
             terminal.draw(|f| {
                 if st.show_help {
                     ui::help::draw(f, &st);
@@ -180,7 +181,7 @@ fn run_app(
         // Handle input (50ms timeout)
         if event::poll(Duration::from_millis(50))?
             && let Event::Key(key) = event::read()? {
-                let mut st = state.lock().unwrap();
+                let mut st = state.lock();
                 match key.code {
                     KeyCode::Char('q') => {
                         if st.show_help { st.show_help = false; }
@@ -248,7 +249,7 @@ fn run_app(
 
         // Check stale
         {
-            let mut st = state.lock().unwrap();
+            let mut st = state.lock();
             st.check_stale();
         }
 
@@ -286,7 +287,7 @@ async fn poller(rpc: Arc<RpcClient>, state: Arc<Mutex<AppState>>) {
         };
 
         let need_startup_check = {
-            let mut st = state.lock().unwrap();
+            let mut st = state.lock();
 
             let any_ok = chain_res.is_ok();
 
@@ -325,15 +326,15 @@ async fn poller(rpc: Arc<RpcClient>, state: Arc<Mutex<AppState>>) {
         // Try getstartupinfo when main RPCs fail — satd may be loading
         if need_startup_check
             && let Ok(v) = rpc.get_startup_info().await {
-                let mut st = state.lock().unwrap();
-                st.startup_status = v.get("status")
-                    .and_then(|s| s.as_str())
-                    .map(|s| s.to_string());
+                let status = state::StartupStatus::from_json(&v);
+                let line = status.render();
+                let mut st = state.lock();
+                st.startup_status = Some(line);
         }
 
         // Slow polls (every ~5s = 3-4 fast ticks).
         let is_steady = {
-            let st = state.lock().unwrap();
+            let st = state.lock();
             !st.is_ibd
         };
 
@@ -346,7 +347,7 @@ async fn poller(rpc: Arc<RpcClient>, state: Arc<Mutex<AppState>>) {
             let (index_res, srv_res) =
                 tokio::join!(rpc.get_index_info(), rpc.get_server_status());
             {
-                let mut st = state.lock().unwrap();
+                let mut st = state.lock();
                 if let Ok(v) = index_res {
                     st.update_index_info(&v);
                 }
@@ -364,7 +365,7 @@ async fn poller(rpc: Arc<RpcClient>, state: Arc<Mutex<AppState>>) {
                     rpc.get_chain_tx_stats(),
                     rpc.get_uptime(),
                     async {
-                        let height = state.lock().unwrap().blocks;
+                        let height = state.lock().blocks;
                         if height > 0 { rpc.get_block_stats(height).await } else { Err(rpc::RpcError::Rpc("no blocks".into())) }
                     },
                     rpc.get_raw_mempool_verbose(),
@@ -374,7 +375,7 @@ async fn poller(rpc: Arc<RpcClient>, state: Arc<Mutex<AppState>>) {
                 );
 
                 {
-                    let mut st = state.lock().unwrap();
+                    let mut st = state.lock();
                     if let Ok(v) = fees_res { st.update_fee_estimates(&v); }
                     if let Ok(v) = mining_res { st.update_mining_info(&v); }
                     if let Ok(v) = txstats_res { st.update_chain_tx_stats(&v); }
@@ -389,7 +390,7 @@ async fn poller(rpc: Arc<RpcClient>, state: Arc<Mutex<AppState>>) {
                 // Refresh the difficulty-epoch anchor when the floor advances —
                 // ≈ once per fortnight in steady state. Two cheap RPCs.
                 let anchor_target = {
-                    let st = state.lock().unwrap();
+                    let st = state.lock();
                     let cur = st.blocks - (st.blocks % 2016);
                     if st.blocks > 0 && st.epoch_start_height != Some(cur) {
                         Some(cur)
@@ -402,7 +403,7 @@ async fn poller(rpc: Arc<RpcClient>, state: Arc<Mutex<AppState>>) {
                     && let Some(hash_str) = hash_v.as_str()
                     && let Ok(hdr_v) = rpc.get_block_header(hash_str).await
                 {
-                    state.lock().unwrap().update_epoch_anchor(epoch_h, &hdr_v);
+                    state.lock().update_epoch_anchor(epoch_h, &hdr_v);
                 }
             }
         }

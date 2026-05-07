@@ -21,9 +21,9 @@
 //! TUI displays warnings in a blocking modal precisely because they
 //! are not meant to be a normal part of the operator's experience.
 
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Mutex;
 
 /// Severity of a node warning. `Error` is for conditions that block
 /// progress or indicate data inconsistency; `Warn` is for conditions
@@ -88,7 +88,7 @@ impl NodeWarnings {
     ) {
         let now = unix_secs();
         let message: String = message.into();
-        let mut active = self.active.lock().unwrap();
+        let mut active = self.active.lock();
         active
             .entry(id.to_string())
             .and_modify(|w| {
@@ -111,13 +111,13 @@ impl NodeWarnings {
 
     /// Clear a warning by id. No-op if not present.
     pub fn clear(&self, id: &str) {
-        let mut active = self.active.lock().unwrap();
+        let mut active = self.active.lock();
         active.remove(id);
     }
 
     /// Active warnings, sorted `Error` first then by first_seen asc.
     pub fn list(&self) -> Vec<Warning> {
-        let active = self.active.lock().unwrap();
+        let active = self.active.lock();
         let mut out: Vec<Warning> = active.values().cloned().collect();
         out.sort_by(|a, b| {
             // Error < Warn, i.e. Error first.
@@ -134,7 +134,7 @@ impl NodeWarnings {
     pub fn has_errors(&self) -> bool {
         self.active
             .lock()
-            .unwrap()
+            
             .values()
             .any(|w| w.severity == Severity::Error)
     }
@@ -150,7 +150,7 @@ impl NodeWarnings {
 
     #[cfg(test)]
     pub fn count(&self) -> usize {
-        self.active.lock().unwrap().len()
+        self.active.lock().len()
     }
 }
 

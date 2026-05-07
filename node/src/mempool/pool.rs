@@ -1,6 +1,6 @@
 use bitcoin::{Block, OutPoint, Transaction, TxOut, Txid};
+use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Mutex, RwLock};
 use tokio::sync::broadcast;
 
 use crate::chain::state::ChainState;
@@ -160,32 +160,32 @@ impl Mempool {
     /// once at startup before any mempool mutations that should be
     /// observed by subscribers.
     pub fn set_event_sender(&self, tx: broadcast::Sender<MempoolEvent>) {
-        *self.event_tx.lock().unwrap() = Some(tx);
+        *self.event_tx.lock() = Some(tx);
     }
 
     /// Subscribe to live mempool events. Returns `None` if no sender
     /// has been wired (typical in tests that bypass `main.rs`).
     pub fn subscribe_events(&self) -> Option<broadcast::Receiver<MempoolEvent>> {
-        self.event_tx.lock().unwrap().as_ref().map(|tx| tx.subscribe())
+        self.event_tx.lock().as_ref().map(|tx| tx.subscribe())
     }
 
     /// Return the most recent `EVENT_RING_CAPACITY` events tapped
     /// off the broadcast. Used by MCP `subscribe_mempool_snapshot`.
     pub fn recent_events(&self) -> Vec<MempoolEvent> {
-        self.event_ring.lock().unwrap().iter().cloned().collect()
+        self.event_ring.lock().iter().cloned().collect()
     }
 
     /// Emit an event: push into the ring, then best-effort broadcast.
     /// Never blocks; broadcast backpressure is the subscriber's problem.
     fn emit(&self, event: MempoolEvent) {
         {
-            let mut ring = self.event_ring.lock().unwrap();
+            let mut ring = self.event_ring.lock();
             ring.push_back(event.clone());
             while ring.len() > EVENT_RING_CAPACITY {
                 ring.pop_front();
             }
         }
-        if let Some(tx) = self.event_tx.lock().unwrap().as_ref() {
+        if let Some(tx) = self.event_tx.lock().as_ref() {
             let _ = tx.send(event);
         }
     }
@@ -270,7 +270,7 @@ impl Mempool {
         let tx_size = bitcoin::consensus::serialize(&tx).len();
 
         // Take write lock for the rest (prevents TOCTOU races)
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write();
 
         // Check not already in mempool
         if inner.entries.contains_key(&txid) {
@@ -519,7 +519,7 @@ impl Mempool {
         let mut confirmed: Vec<Txid> = Vec::new();
         let mut evicted_conflicts: Vec<Txid> = Vec::new();
         {
-            let mut inner = self.inner.write().unwrap();
+            let mut inner = self.inner.write();
             for tx in &block.txdata {
                 let txid = tx.compute_txid();
                 if let Some(entry) = inner.entries.remove(&txid) {
@@ -571,12 +571,12 @@ impl Mempool {
 
     /// Get a transaction by txid.
     pub fn get(&self, txid: &Txid) -> Option<MempoolEntry> {
-        self.inner.read().unwrap().entries.get(txid).cloned()
+        self.inner.read().entries.get(txid).cloned()
     }
 
     /// Adjust the fee delta for a transaction in the mempool (for mining priority).
     pub fn prioritise_transaction(&self, txid: &Txid, fee_delta: i64) -> bool {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write();
         if let Some(entry) = inner.entries.get_mut(txid) {
             entry.fee_delta += fee_delta;
             true
@@ -589,7 +589,7 @@ impl Mempool {
     pub fn get_all_entries(&self) -> Vec<(Txid, MempoolEntry)> {
         self.inner
             .read()
-            .unwrap()
+            
             .entries
             .iter()
             .map(|(k, v)| (*k, v.clone()))
@@ -606,7 +606,7 @@ impl Mempool {
     /// inner walk over the spending tx's inputs is bounded by that
     /// tx's own input count, not by mempool size.
     pub fn spending_tx(&self, outpoint: &OutPoint) -> Option<(Txid, u32)> {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read();
         let spending_txid = *inner.spends.get(outpoint)?;
         let entry = inner.entries.get(&spending_txid)?;
         let vin = entry
@@ -628,7 +628,7 @@ impl Mempool {
 
         let mut expired_txids: Vec<Txid> = Vec::new();
         {
-            let mut inner = self.inner.write().unwrap();
+            let mut inner = self.inner.write();
             let expired: Vec<Txid> = inner
                 .entries
                 .iter()
@@ -665,7 +665,7 @@ impl Mempool {
 
     /// Get the set of in-mempool ancestors for a transaction.
     pub fn get_ancestors(&self, txid: &Txid) -> Option<HashSet<Txid>> {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read();
         let entry = inner.entries.get(txid)?;
         let mut ancestors = HashSet::new();
         let mut queue: Vec<Txid> = Vec::new();
@@ -695,7 +695,7 @@ impl Mempool {
 
     /// Get the set of in-mempool descendants for a transaction.
     pub fn get_descendants(&self, txid: &Txid) -> Option<HashSet<Txid>> {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read();
         if !inner.entries.contains_key(txid) {
             return None;
         }
@@ -730,7 +730,7 @@ impl Mempool {
     /// that spend any output of `txid`. Uses the `spends` reverse
     /// index for O(outputs) lookup. Does *not* recurse.
     pub fn get_children(&self, txid: &Txid) -> Option<Vec<Txid>> {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read();
         let entry = inner.entries.get(txid)?;
         let n_outs = entry.tx.output.len() as u32;
         let mut children: Vec<Txid> = Vec::new();
@@ -748,7 +748,7 @@ impl Mempool {
 
     /// Get verbose entry data for a single mempool transaction (for RPC).
     pub fn get_entry_verbose(&self, txid: &Txid) -> Option<serde_json::Value> {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read();
         let entry = inner.entries.get(txid)?;
         let vsize = entry.weight / 4;
         let entry_fee = entry.fee;
@@ -761,7 +761,7 @@ impl Mempool {
         let descendants = self.get_descendants(txid).unwrap_or_default();
         let children = self.get_children(txid).unwrap_or_default();
 
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read();
 
         let ancestor_count = ancestors.len();
         let ancestor_size: usize = ancestors
@@ -842,7 +842,7 @@ impl Mempool {
             return Err(MempoolError::Validation("tx-size".to_string()));
         }
 
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read();
         if inner.entries.contains_key(&txid) {
             return Err(MempoolError::AlreadyExists);
         }
@@ -861,7 +861,7 @@ impl Mempool {
                 });
             } else {
                 // Check mempool parents
-                let inner = self.inner.read().unwrap();
+                let inner = self.inner.read();
                 if let Some(parent) = inner.entries.get(&input.previous_output.txid)
                     && let Some(output) = parent.tx.output.get(input.previous_output.vout as usize) {
                         sum_inputs += output.value.to_sat();
@@ -961,7 +961,7 @@ impl Mempool {
 
     /// Get mempool statistics.
     pub fn info(&self) -> MempoolInfo {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read();
         MempoolInfo {
             size: inner.entries.len(),
             bytes: inner.total_bytes,
@@ -1032,7 +1032,7 @@ mod tests {
             ..Default::default()
         });
 
-        let mut inner = mp.inner.write().unwrap();
+        let mut inner = mp.inner.write();
 
         // Insert a low-fee "transaction" directly (bypass validation for unit test)
         let low_fee_tx = Transaction {
@@ -1458,7 +1458,7 @@ mod tests {
         };
         let mempool_txid = mempool_tx.compute_txid();
         {
-            let mut inner = mp.inner.write().unwrap();
+            let mut inner = mp.inner.write();
             inner.spends.insert(contested, mempool_txid);
             inner.entries.insert(
                 mempool_txid,
@@ -1581,7 +1581,7 @@ mod tests {
         let child_txid = child_tx.compute_txid();
 
         {
-            let mut inner = mp.inner.write().unwrap();
+            let mut inner = mp.inner.write();
             for input in &parent_tx.input {
                 inner.spends.insert(input.previous_output, parent_txid);
             }

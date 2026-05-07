@@ -54,7 +54,8 @@ pub trait EventSink: Send + Sync + 'static {
 #[cfg(test)]
 pub mod testing {
     use super::*;
-    use std::sync::{Arc, Mutex};
+    use parking_lot::Mutex;
+    use std::sync::Arc;
 
     /// Records every envelope it receives. Lag is reported via
     /// `lag_total` (cumulative dropped count).
@@ -70,7 +71,7 @@ pub mod testing {
         }
 
         pub fn snapshot(&self) -> Vec<NodeEvent> {
-            self.received.lock().unwrap().clone()
+            self.received.lock().clone()
         }
     }
 
@@ -90,7 +91,7 @@ pub mod testing {
                     biased;
                     _ = shutdown.changed() => return,
                     res = events.recv() => match res {
-                        Ok(env) => self.received.lock().unwrap().push(env),
+                        Ok(env) => self.received.lock().push(env),
                         Err(broadcast::error::RecvError::Lagged(n)) => {
                             self.lag_total
                                 .fetch_add(n, std::sync::atomic::Ordering::Relaxed);

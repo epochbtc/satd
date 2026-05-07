@@ -2,8 +2,8 @@ use bitcoin::{BlockHash, OutPoint, Txid};
 use lru::LruCache;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
+use parking_lot::{Mutex, RwLock};
 use std::sync::atomic::{AtomicI64, AtomicU8, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Mutex, RwLock};
 
 use super::blockindex::{BlockIndexEntry, BlockStatus};
 use super::coinview::Coin;
@@ -152,9 +152,9 @@ impl CoinCache {
     /// - **Move semantics**: flushed coins are moved (not cloned) to the clean LRU,
     ///   avoiding the allocation burst that caused glibc malloc fragmentation.
     pub fn flush(&self) -> Result<(), StoreError> {
-        let mut dirty = self.dirty.write().unwrap();
+        let mut dirty = self.dirty.write();
         let mut batch = {
-            let mut pending = self.pending_batch.lock().unwrap();
+            let mut pending = self.pending_batch.lock();
             std::mem::take(&mut *pending)
         };
 
@@ -182,7 +182,7 @@ impl CoinCache {
             }
         }
 
-        batch.tip = self.pending_tip.lock().unwrap().take();
+        batch.tip = self.pending_tip.lock().take();
 
         let puts = batch.coin_puts.len();
         let removes = batch.coin_removes.len();
@@ -225,7 +225,7 @@ impl CoinCache {
 
         // Move flushed coins to clean LRU (cache warming)
         if !promote.is_empty() {
-            let mut clean = self.clean.lock().unwrap();
+            let mut clean = self.clean.lock();
             for (outpoint, coin) in promote {
                 clean.put(outpoint, coin);
             }
@@ -242,7 +242,7 @@ impl CoinCache {
 
     /// Approximate total cache size (dirty + clean coins).
     pub fn cache_size(&self) -> usize {
-        self.dirty_count.load(Ordering::Relaxed) as usize + self.clean.lock().unwrap().len()
+        self.dirty_count.load(Ordering::Relaxed) as usize + self.clean.lock().len()
     }
 
     /// Dirty coin count threshold at which the cache should be flushed.
@@ -263,7 +263,7 @@ impl CoinCache {
     /// so subsequent dirty accumulation stays within the new budget.
     pub fn resize_clean(&self, new_cap: usize) {
         let cap = std::num::NonZeroUsize::new(new_cap.max(1)).unwrap();
-        let mut clean = self.clean.lock().unwrap();
+        let mut clean = self.clean.lock();
         if clean.cap() != cap {
             clean.resize(cap);
         }
@@ -275,7 +275,7 @@ impl CoinCache {
 
     /// Current clean-LRU capacity (entry count).
     pub fn clean_cap(&self) -> usize {
-        self.clean.lock().unwrap().cap().get()
+        self.clean.lock().cap().get()
     }
 }
 
@@ -283,7 +283,7 @@ impl Store for CoinCache {
     fn get_coin(&self, outpoint: &OutPoint) -> Option<Coin> {
         // 1. Check dirty map
         {
-            let dirty = self.dirty.read().unwrap();
+            let dirty = self.dirty.read();
             if let Some(entry) = dirty.get(outpoint) {
                 return match entry {
                     DirtyEntry::Present { coin, .. } => Some(coin.clone()),
@@ -294,7 +294,7 @@ impl Store for CoinCache {
 
         // 2. Check clean LRU
         {
-            let mut clean = self.clean.lock().unwrap();
+            let mut clean = self.clean.lock();
             if let Some(coin) = clean.get(outpoint) {
                 return Some(coin.clone());
             }
@@ -302,19 +302,19 @@ impl Store for CoinCache {
 
         // 3. Cache miss — read from backing store, populate LRU (auto-evicts if full)
         let coin = self.inner.get_coin(outpoint)?;
-        self.clean.lock().unwrap().put(*outpoint, coin.clone());
+        self.clean.lock().put(*outpoint, coin.clone());
         Some(coin)
     }
 
     fn has_coin(&self, outpoint: &OutPoint) -> bool {
         {
-            let dirty = self.dirty.read().unwrap();
+            let dirty = self.dirty.read();
             if let Some(entry) = dirty.get(outpoint) {
                 return matches!(entry, DirtyEntry::Present { .. });
             }
         }
         {
-            let mut clean = self.clean.lock().unwrap();
+            let mut clean = self.clean.lock();
             if clean.get(outpoint).is_some() {
                 return true;
             }
@@ -337,8 +337,8 @@ impl Store for CoinCache {
         // Absorb coin operations into dirty map
         let coin_dirty = batch.coin_puts.len() + batch.coin_removes.len();
         if coin_dirty > 0 {
-            let mut dirty = self.dirty.write().unwrap();
-            let mut clean = self.clean.lock().unwrap();
+            let mut dirty = self.dirty.write();
+            let mut clean = self.clean.lock();
 
             for (outpoint, coin) in batch.coin_puts {
                 self.amount_delta
@@ -376,12 +376,12 @@ impl Store for CoinCache {
         }
 
         if batch.tip.is_some() {
-            *self.pending_tip.lock().unwrap() = batch.tip;
+            *self.pending_tip.lock() = batch.tip;
         }
 
         // Populate overlay LRU caches
         {
-            let mut bi = self.block_index_cache.lock().unwrap();
+            let mut bi = self.block_index_cache.lock();
             for (hash, entry) in &batch.block_index_puts {
                 // Don't downgrade: if cache has DataStored/Valid, don't overwrite with HeaderOnly.
                 // This prevents a race where accept_headers' batch write clobbers a concurrent
@@ -402,7 +402,7 @@ impl Store for CoinCache {
             }
         }
         {
-            let mut hh = self.height_hash_cache.lock().unwrap();
+            let mut hh = self.height_hash_cache.lock();
             for &(height, hash) in &batch.height_hash_puts {
                 hh.put(height, hash);
             }
@@ -411,13 +411,13 @@ impl Store for CoinCache {
             }
         }
         {
-            let mut uc = self.undo_cache.lock().unwrap();
+            let mut uc = self.undo_cache.lock();
             for (hash, undo) in &batch.undo_puts {
                 uc.put(*hash, undo.clone());
             }
         }
         {
-            let mut ti = self.tx_index_cache.lock().unwrap();
+            let mut ti = self.tx_index_cache.lock();
             for &(txid, hash) in &batch.tx_index_puts {
                 ti.put(txid, hash);
             }
@@ -492,7 +492,7 @@ impl Store for CoinCache {
                 };
                 self.inner.write_batch_mode(pass_through, mode)?;
             } else {
-                let mut pending = self.pending_batch.lock().unwrap();
+                let mut pending = self.pending_batch.lock();
                 pending.block_index_puts.extend(batch.block_index_puts);
                 pending.height_hash_puts.extend(batch.height_hash_puts);
                 pending
@@ -544,28 +544,28 @@ impl Store for CoinCache {
     }
 
     fn get_block_index(&self, hash: &BlockHash) -> Option<BlockIndexEntry> {
-        if let Some(entry) = self.block_index_cache.lock().unwrap().get(hash) {
+        if let Some(entry) = self.block_index_cache.lock().get(hash) {
             return Some(entry.clone());
         }
         self.inner.get_block_index(hash)
     }
 
     fn get_tip(&self) -> Option<BlockHash> {
-        if let Some(tip) = *self.pending_tip.lock().unwrap() {
+        if let Some(tip) = *self.pending_tip.lock() {
             return Some(tip);
         }
         self.inner.get_tip()
     }
 
     fn get_block_hash_by_height(&self, height: u32) -> Option<BlockHash> {
-        if let Some(&hash) = self.height_hash_cache.lock().unwrap().get(&height) {
+        if let Some(&hash) = self.height_hash_cache.lock().get(&height) {
             return Some(hash);
         }
         self.inner.get_block_hash_by_height(height)
     }
 
     fn get_undo(&self, hash: &BlockHash) -> Option<UndoData> {
-        if let Some(undo) = self.undo_cache.lock().unwrap().get(hash) {
+        if let Some(undo) = self.undo_cache.lock().get(hash) {
             return Some(undo.clone());
         }
         self.inner.get_undo(hash)
@@ -588,7 +588,7 @@ impl Store for CoinCache {
     }
 
     fn get_tx_location(&self, txid: &Txid) -> Option<BlockHash> {
-        if let Some(&hash) = self.tx_index_cache.lock().unwrap().get(txid) {
+        if let Some(&hash) = self.tx_index_cache.lock().get(txid) {
             return Some(hash);
         }
         self.inner.get_tx_location(txid)
@@ -599,32 +599,32 @@ impl Store for CoinCache {
     }
 
     fn clear_chainstate(&self) -> Result<(), StoreError> {
-        self.dirty.write().unwrap().clear();
-        self.clean.lock().unwrap().clear();
+        self.dirty.write().clear();
+        self.clean.lock().clear();
         self.dirty_count.store(0, Ordering::Relaxed);
         self.count_delta.store(0, Ordering::Relaxed);
         self.amount_delta.store(0, Ordering::Relaxed);
-        *self.pending_tip.lock().unwrap() = None;
-        *self.pending_batch.lock().unwrap() = StoreBatch::default();
-        self.block_index_cache.lock().unwrap().clear();
-        self.height_hash_cache.lock().unwrap().clear();
-        self.undo_cache.lock().unwrap().clear();
-        self.tx_index_cache.lock().unwrap().clear();
+        *self.pending_tip.lock() = None;
+        *self.pending_batch.lock() = StoreBatch::default();
+        self.block_index_cache.lock().clear();
+        self.height_hash_cache.lock().clear();
+        self.undo_cache.lock().clear();
+        self.tx_index_cache.lock().clear();
         self.inner.clear_chainstate()
     }
 
     fn clear_all(&self) -> Result<(), StoreError> {
-        self.dirty.write().unwrap().clear();
-        self.clean.lock().unwrap().clear();
+        self.dirty.write().clear();
+        self.clean.lock().clear();
         self.dirty_count.store(0, Ordering::Relaxed);
         self.count_delta.store(0, Ordering::Relaxed);
         self.amount_delta.store(0, Ordering::Relaxed);
-        *self.pending_tip.lock().unwrap() = None;
-        *self.pending_batch.lock().unwrap() = StoreBatch::default();
-        self.block_index_cache.lock().unwrap().clear();
-        self.height_hash_cache.lock().unwrap().clear();
-        self.undo_cache.lock().unwrap().clear();
-        self.tx_index_cache.lock().unwrap().clear();
+        *self.pending_tip.lock() = None;
+        *self.pending_batch.lock() = StoreBatch::default();
+        self.block_index_cache.lock().clear();
+        self.height_hash_cache.lock().clear();
+        self.undo_cache.lock().clear();
+        self.tx_index_cache.lock().clear();
         self.inner.clear_all()
     }
 
@@ -638,8 +638,8 @@ impl Store for CoinCache {
 
         // 1. Check dirty map (single lock acquisition for all keys)
         {
-            let dirty = self.dirty.read().unwrap();
-            let mut clean = self.clean.lock().unwrap();
+            let dirty = self.dirty.read();
+            let mut clean = self.clean.lock();
             for (i, outpoint) in outpoints.iter().enumerate() {
                 if let Some(entry) = dirty.get(outpoint) {
                     self.perf_dirty_hits.fetch_add(1, Ordering::Relaxed);
@@ -662,7 +662,7 @@ impl Store for CoinCache {
                 .fetch_add(misses.len() as u64, Ordering::Relaxed);
             let miss_outpoints: Vec<OutPoint> = misses.iter().map(|(_, op)| *op).collect();
             let fetched = self.inner.get_coins_batch(&miss_outpoints);
-            let mut clean = self.clean.lock().unwrap();
+            let mut clean = self.clean.lock();
             for ((idx, outpoint), coin_opt) in misses.into_iter().zip(fetched) {
                 if let Some(coin) = &coin_opt {
                     clean.put(outpoint, coin.clone());
@@ -724,7 +724,7 @@ impl Store for CoinCache {
         // pending remove (e.g. connect-then-disconnect before flush),
         // the on-disk outcome is "removed". We mirror that here so the
         // pre-flush read view matches the post-flush state.
-        let pending = self.pending_batch.lock().unwrap();
+        let pending = self.pending_batch.lock();
         let pending_removes: std::collections::HashSet<crate::index::address::AddrFundingKey> =
             pending
                 .addr_funding_removes
@@ -799,7 +799,7 @@ impl Store for CoinCache {
     ) -> Vec<(crate::index::address::AddrSpendingKey, OutPoint)> {
         // See iter_addr_funding_limited for the limit + 1 + |pending|
         // bounding rationale.
-        let pending = self.pending_batch.lock().unwrap();
+        let pending = self.pending_batch.lock();
         let pending_removes: std::collections::HashSet<crate::index::address::AddrSpendingKey> =
             pending
                 .addr_spending_removes
@@ -912,7 +912,7 @@ impl Store for CoinCache {
             filter_type,
             height,
         };
-        let pending = self.pending_batch.lock().unwrap();
+        let pending = self.pending_batch.lock();
         if pending.filter_removes.contains(&key) {
             return None;
         }
@@ -930,7 +930,7 @@ impl Store for CoinCache {
             filter_type,
             height,
         };
-        let pending = self.pending_batch.lock().unwrap();
+        let pending = self.pending_batch.lock();
         if pending.filter_removes.contains(&key) {
             return None;
         }
@@ -963,7 +963,7 @@ impl Store for CoinCache {
         // outpoint that was just spent — and with `outpoint_spend.complete`
         // true (fresh datadir), the round-3 H2 enforcement would
         // surface that as definitive "unspent". (Round-4 M1.)
-        let pending = self.pending_batch.lock().unwrap();
+        let pending = self.pending_batch.lock();
         // Pending remove takes precedence: the on-disk net effect of
         // remove-then-put is the put (last-writer-wins), but
         // remove-only flips a previously-set entry off. Mirror that.
@@ -1297,7 +1297,7 @@ mod tests {
         // Before flush: block_index is in overlay cache but check that
         // after flush it's persisted by clearing the overlay and re-reading.
         cache.flush().unwrap();
-        cache.block_index_cache.lock().unwrap().clear();
+        cache.block_index_cache.lock().clear();
         let recovered = cache.get_block_index(&bh).unwrap();
         assert_eq!(recovered.height, 10);
     }
@@ -1317,7 +1317,7 @@ mod tests {
         cache.write_batch(batch).unwrap();
 
         // Should be in inner immediately — clear overlay and verify.
-        cache.block_index_cache.lock().unwrap().clear();
+        cache.block_index_cache.lock().clear();
         let recovered = cache.get_block_index(&bh).unwrap();
         assert_eq!(recovered.height, 20);
     }
@@ -1340,7 +1340,7 @@ mod tests {
         cache.write_batch(batch).unwrap();
 
         // Before flush: clear overlay — inner should NOT have it yet.
-        cache.block_index_cache.lock().unwrap().clear();
+        cache.block_index_cache.lock().clear();
         // The inner doesn't have the block_index entry yet because it was buffered.
         // get_block_index falls through to inner, which returns None.
         // But wait — CoinCache::get_block_index checks overlay first, then inner.
@@ -1453,9 +1453,9 @@ mod tests {
         assert_eq!(cache.amount_delta.load(Ordering::Relaxed), 0);
         assert!(cache.get_tip().is_none());
         // Overlay caches are cleared.
-        assert!(cache.block_index_cache.lock().unwrap().is_empty());
-        assert!(cache.height_hash_cache.lock().unwrap().is_empty());
-        assert!(cache.undo_cache.lock().unwrap().is_empty());
+        assert!(cache.block_index_cache.lock().is_empty());
+        assert!(cache.height_hash_cache.lock().is_empty());
+        assert!(cache.undo_cache.lock().is_empty());
     }
 
     // ---------------------------------------------------------------

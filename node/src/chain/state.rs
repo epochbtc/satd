@@ -1,8 +1,9 @@
 use bitcoin::consensus::serialize;
 use bitcoin::{Block, BlockHash, Network, OutPoint};
 use std::path::PathBuf;
+use parking_lot::{Mutex, RwLock};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Mutex, RwLock};
 
 use crate::chain::checkpoints::{self, Checkpoint};
 use crate::chain::{connect, disconnect};
@@ -197,7 +198,7 @@ pub struct ChainState {
     /// consumed by the address-index notifier task (M5) and any
     /// future observability subscribers. Test backends that don't
     /// need chain notifications skip the wiring; emit is a no-op.
-    chain_event_tx: std::sync::Mutex<
+    chain_event_tx: parking_lot::Mutex<
         Option<tokio::sync::broadcast::Sender<crate::chain::events::ChainEvent>>,
     >,
     /// Lock-free monotonic counter bumped on every successful connect.
@@ -286,7 +287,7 @@ impl ChainState {
                     reorg_log: std::sync::OnceLock::new(),
                     warnings: std::sync::Arc::new(crate::warnings::NodeWarnings::new()),
                     mempool: std::sync::OnceLock::new(),
-                    chain_event_tx: std::sync::Mutex::new(None),
+                    chain_event_tx: parking_lot::Mutex::new(None),
                     connect_heartbeat: AtomicU64::new(0),
                 });
             }
@@ -340,7 +341,7 @@ impl ChainState {
             reorg_log: std::sync::OnceLock::new(),
             warnings: std::sync::Arc::new(crate::warnings::NodeWarnings::new()),
             mempool: std::sync::OnceLock::new(),
-            chain_event_tx: std::sync::Mutex::new(None),
+            chain_event_tx: parking_lot::Mutex::new(None),
             connect_heartbeat: AtomicU64::new(0),
         })
     }
@@ -364,7 +365,7 @@ impl ChainState {
         &self,
         tx: tokio::sync::broadcast::Sender<crate::chain::events::ChainEvent>,
     ) {
-        *self.chain_event_tx.lock().unwrap() = Some(tx);
+        *self.chain_event_tx.lock() = Some(tx);
     }
 
     /// Subscribe to live chain events. Returns `None` if no sender
@@ -374,7 +375,7 @@ impl ChainState {
     ) -> Option<tokio::sync::broadcast::Receiver<crate::chain::events::ChainEvent>> {
         self.chain_event_tx
             .lock()
-            .unwrap()
+            
             .as_ref()
             .map(|tx| tx.subscribe())
     }
@@ -383,7 +384,7 @@ impl ChainState {
     /// events sees `RecvError::Lagged`; emission never blocks the
     /// connect/disconnect path.
     fn emit_chain_event(&self, event: crate::chain::events::ChainEvent) {
-        if let Some(tx) = self.chain_event_tx.lock().unwrap().as_ref() {
+        if let Some(tx) = self.chain_event_tx.lock().as_ref() {
             let _ = tx.send(event);
         }
     }
@@ -407,11 +408,11 @@ impl ChainState {
     }
 
     pub fn tip_hash(&self) -> BlockHash {
-        self.tip.read().unwrap().hash
+        self.tip.read().hash
     }
 
     pub fn tip_height(&self) -> u32 {
-        self.tip.read().unwrap().height
+        self.tip.read().height
     }
 
     /// Read the active-chain tip's hash and height under a single
@@ -422,7 +423,7 @@ impl ChainState {
     /// two reads can pair an old hash with a new height (or vice
     /// versa) and produce false reorg-invalidated diagnostics.
     pub fn tip_snapshot(&self) -> (BlockHash, u32) {
-        let tip = self.tip.read().unwrap();
+        let tip = self.tip.read();
         (tip.hash, tip.height)
     }
 
@@ -709,7 +710,7 @@ impl ChainState {
         let range_len = (height - start) as usize;
 
         // Try to satisfy entirely from cache
-        let cache = self.mtp_cache.lock().unwrap();
+        let cache = self.mtp_cache.lock();
         let mut timestamps: Vec<u32> = Vec::with_capacity(range_len);
         for h in start..height {
             if let Some((_, ts)) = cache.iter().find(|(ch, _)| *ch == h) {
@@ -741,7 +742,7 @@ impl ChainState {
 
     /// Push a block's timestamp into the MTP cache after connection.
     pub fn push_mtp_cache(&self, height: u32, timestamp: u32) {
-        let mut cache = self.mtp_cache.lock().unwrap();
+        let mut cache = self.mtp_cache.lock();
         cache.push((height, timestamp));
         // Keep only the last 12 entries
         if cache.len() > 12 {
@@ -751,7 +752,7 @@ impl ChainState {
 
     /// Pop the highest entry from MTP cache (used on disconnect).
     pub fn pop_mtp_cache(&self, height: u32) {
-        let mut cache = self.mtp_cache.lock().unwrap();
+        let mut cache = self.mtp_cache.lock();
         cache.retain(|(h, _)| *h != height);
     }
 
@@ -881,7 +882,7 @@ impl ChainState {
 
         // Update in-memory tip
         {
-            let mut tip = self.tip.write().unwrap();
+            let mut tip = self.tip.write();
             tip.hash = pre.hash;
             tip.height = pre.height;
         }
@@ -910,7 +911,7 @@ impl ChainState {
             file_number: entry.file_number,
             data_pos: entry.data_pos,
         };
-        let data = self.flat_files.lock().unwrap().read_block(&pos).ok()?;
+        let data = self.flat_files.lock().read_block(&pos).ok()?;
         bitcoin::consensus::deserialize(&data).ok()
     }
 
@@ -1009,7 +1010,7 @@ impl ChainState {
         let flat_pos = self
             .flat_files
             .lock()
-            .unwrap()
+            
             .write_block(&block_data, network_magic(self.network))
             .map_err(|e| ChainError::FlatFile(e.to_string()))?;
 
@@ -1106,7 +1107,7 @@ impl ChainState {
 
         // Update in-memory tip
         {
-            let mut tip = self.tip.write().unwrap();
+            let mut tip = self.tip.write();
             tip.hash = *hash;
             tip.height = entry.height;
         }
@@ -1174,7 +1175,7 @@ impl ChainState {
             self.store.write_batch(batch)?;
 
             {
-                let mut tip = self.tip.write().unwrap();
+                let mut tip = self.tip.write();
                 tip.hash = hash;
                 tip.height = height;
             }
@@ -1206,59 +1207,110 @@ impl ChainState {
         Ok(())
     }
 
-    /// Rebuild block index and UTXO set from raw block data scanned from flat files.
-    /// Used by `-reindex` when the block index is cleared.
-    pub fn reindex_from_blocks(
+    /// Rebuild the block index and UTXO set by streaming `blk*.dat` files.
+    /// Used by `-reindex` when the chain database has been cleared.
+    ///
+    /// Two passes:
+    ///   1. Stream every record in the flat files, parsing only the 80-byte
+    ///      header. Build `header_by_hash` and the `parent → children`
+    ///      multimap. Memory: one `BlockHeader` + position per block,
+    ///      ~150 bytes — about 140 MB at the current mainnet height. The
+    ///      previous implementation eagerly held every full block in
+    ///      memory (~900 GB on mainnet), which OOM-killed the node.
+    ///   2. BFS from genesis. For each hash, read the raw block from the
+    ///      flat file, deserialize, run `connect_block`, drop the block.
+    ///      Peak memory is one block payload at a time.
+    ///
+    /// `progress` (if provided) is updated with the per-phase counters so
+    /// the startup RPC can render `current/total` to operators.
+    pub fn reindex_from_flat_files(
         &self,
-        blocks: Vec<(Vec<u8>, FlatFilePos)>,
+        progress: Option<Arc<crate::startup_progress::StartupProgress>>,
     ) -> Result<(), ChainError> {
         use std::collections::{HashMap, VecDeque};
 
-        // Parse all blocks and index by hash and parent
-        let mut by_hash: HashMap<BlockHash, (Block, FlatFilePos)> = HashMap::new();
-        let mut children: HashMap<BlockHash, Vec<BlockHash>> = HashMap::new();
-        let mut parse_count = 0;
-        for (data, pos) in blocks {
-            if let Ok(block) = bitcoin::consensus::deserialize::<Block>(&data) {
-                let hash = block.block_hash();
-                children
-                    .entry(block.header.prev_blockhash)
-                    .or_default()
-                    .push(hash);
-                by_hash.insert(hash, (block, pos));
-                parse_count += 1;
-            }
-        }
-        tracing::info!(parse_count, "Parsed blocks from flat files");
+        // Periodic flush cadence — same reasoning as `reindex_chainstate`:
+        // without it the in-memory dirty set held weeks of writes for a
+        // mainnet reindex and pinned 100+ GiB of RSS.
+        const DURABLE_FLUSH_EVERY: u32 = 1000;
 
-        // BFS from genesis to connect blocks in topological order
+        struct HeaderRef {
+            header: bitcoin::block::Header,
+            pos: FlatFilePos,
+        }
+
+        // Phase 1: scan flat files, parse only headers.
+        if let Some(p) = &progress {
+            p.set_phase("reindex_scan", "Scanning block files (phase 1/2)");
+        }
+        let mut header_by_hash: HashMap<BlockHash, HeaderRef> = HashMap::new();
+        let mut children: HashMap<BlockHash, Vec<BlockHash>> = HashMap::new();
+        let mut scanned: u64 = 0;
+        {
+            let flat_files = self.flat_files.lock();
+            flat_files
+                .for_each_block(|block_bytes, pos| {
+                    if block_bytes.len() < 80 {
+                        return;
+                    }
+                    let header: bitcoin::block::Header =
+                        match bitcoin::consensus::deserialize(&block_bytes[..80]) {
+                            Ok(h) => h,
+                            Err(_) => return,
+                        };
+                    let hash = header.block_hash();
+                    children
+                        .entry(header.prev_blockhash)
+                        .or_default()
+                        .push(hash);
+                    header_by_hash.insert(hash, HeaderRef { header, pos });
+                    scanned += 1;
+                    if let Some(p) = &progress
+                        && scanned.is_multiple_of(1000)
+                    {
+                        p.set_current(scanned);
+                    }
+                })
+                .map_err(|e| ChainError::FlatFile(format!("scan flat files: {}", e)))?;
+        }
+        let total = scanned;
+        if let Some(p) = &progress {
+            p.set_total(total);
+            p.set_current(total);
+        }
+        tracing::info!(scanned, "Phase 1: indexed block headers from flat files");
+
+        // Phase 2: BFS from genesis, fetch each block from disk and connect.
+        if let Some(p) = &progress {
+            p.set_phase("reindex_connect", "Replaying blocks (phase 2/2)");
+            p.set_total(total);
+        }
         let genesis_hash = bitcoin::constants::genesis_block(self.network).block_hash();
-        let mut queue = VecDeque::new();
+        let mut queue: VecDeque<BlockHash> = VecDeque::new();
         if let Some(child_hashes) = children.get(&genesis_hash) {
             for h in child_hashes {
                 queue.push_back(*h);
             }
         }
 
-        let mut connected = 0u32;
+        let mut connected: u32 = 0;
         while let Some(hash) = queue.pop_front() {
-            let (block, flat_pos) = match by_hash.remove(&hash) {
+            let entry = match header_by_hash.remove(&hash) {
                 Some(v) => v,
                 None => continue,
             };
 
-            let height = {
-                let parent = self
-                    .store
-                    .get_block_index(&block.header.prev_blockhash)
-                    .ok_or(ChainError::BadPrevBlock)?;
-                parent.height + 1
-            };
+            // Re-read the raw block from disk; we only kept the header during
+            // phase 1.
+            let block = self
+                .read_block_direct(&entry.pos)
+                .ok_or_else(|| ChainError::FlatFile("read failed during reindex".into()))?;
 
             let parent = self
                 .store
-                .get_block_index(&block.header.prev_blockhash)
+                .get_block_index(&entry.header.prev_blockhash)
                 .ok_or(ChainError::BadPrevBlock)?;
+            let height = parent.height + 1;
 
             let use_noop = self.should_skip_scripts(height);
             let noop = NoopVerifier;
@@ -1271,36 +1323,55 @@ impl ChainState {
                 block: &block,
                 height,
                 parent_chainwork: &parent.chainwork,
-                flat_pos,
+                flat_pos: entry.pos,
                 script_verifier: verifier,
                 median_time_past: mtp,
                 network: self.network,
                 pre_verified_txs: None,
                 num_threads: self.num_threads,
-            precomputed_txids: None,
-            address_index: &self.address_index,
-            #[cfg(feature = "block-filter-index")]
-            filter_index: &self.filter_index,
+                precomputed_txids: None,
+                address_index: &self.address_index,
+                #[cfg(feature = "block-filter-index")]
+                filter_index: &self.filter_index,
             })?;
             self.store.write_batch(batch)?;
 
             {
-                let mut tip = self.tip.write().unwrap();
+                let mut tip = self.tip.write();
                 tip.hash = hash;
                 tip.height = height;
             }
 
+            // Same memory + durability discipline as `reindex_chainstate`.
+            if self.store.dirty_count() > self.store.flush_threshold() {
+                self.store.flush()?;
+            }
+            if height.is_multiple_of(DURABLE_FLUSH_EVERY) {
+                self.store.flush()?;
+                self.store.flush_durable()?;
+            }
+
             connected += 1;
+            if let Some(p) = &progress
+                && connected.is_multiple_of(100)
+            {
+                p.set_current(connected as u64);
+            }
             if connected.is_multiple_of(10_000) {
                 tracing::info!(connected, height, "Reindexing from flat files...");
             }
 
-            // Enqueue children
             if let Some(child_hashes) = children.get(&hash) {
                 for h in child_hashes {
                     queue.push_back(*h);
                 }
             }
+        }
+        // Final durable checkpoint so the reindexed tip survives a crash.
+        self.store.flush()?;
+        self.store.flush_durable()?;
+        if let Some(p) = &progress {
+            p.set_current(connected as u64);
         }
         tracing::info!(connected, "Reindex from flat files complete");
         Ok(())
@@ -1373,7 +1444,7 @@ impl ChainState {
         let flat_pos = self
             .flat_files
             .lock()
-            .unwrap()
+            
             .write_block(&block_data, network_magic(self.network))
             .map_err(|e| ChainError::FlatFile(e.to_string()))?;
 
@@ -1545,7 +1616,7 @@ impl ChainState {
                     })?;
                     self.store.write_batch(batch)?;
                     {
-                        let mut tip = self.tip.write().unwrap();
+                        let mut tip = self.tip.write();
                         tip.hash = *side_hash;
                         tip.height = side_entry.height;
                     }
@@ -1668,7 +1739,7 @@ impl ChainState {
 
         // Update in-memory tip
         {
-            let mut tip = self.tip.write().unwrap();
+            let mut tip = self.tip.write();
             tip.hash = block_hash;
             tip.height = new_height;
         }
@@ -1845,7 +1916,7 @@ impl ChainState {
                 .store
                 .get_block_index(&prev_hash)
                 .ok_or(ChainError::BadPrevBlock)?;
-            let mut tip = self.tip.write().unwrap();
+            let mut tip = self.tip.write();
             tip.hash = prev_hash;
             tip.height = prev_entry.height;
         }
@@ -1888,7 +1959,7 @@ impl ChainState {
             filter_index: &self.filter_index,
             })?;
             self.store.write_batch(batch)?;
-            let mut tip = self.tip.write().unwrap();
+            let mut tip = self.tip.write();
             tip.hash = *hash;
             tip.height = entry.height;
         }
@@ -1975,7 +2046,7 @@ impl ChainState {
 
         // Update in-memory tip to fork point
         {
-            let mut tip = self.tip.write().unwrap();
+            let mut tip = self.tip.write();
             tip.hash = fork_hash;
             tip.height = fork_entry.height;
         }
@@ -2048,7 +2119,7 @@ impl ChainState {
         }
 
         let mut deleted = 0u32;
-        let mut flat_files = self.flat_files.lock().unwrap();
+        let mut flat_files = self.flat_files.lock();
         let mut batch = crate::storage::StoreBatch::default();
 
         for (file_num, blocks) in &pruneable_files {
@@ -3579,7 +3650,7 @@ pub(crate) mod tests {
         cs.store.flush().unwrap(); // drain anything outstanding
         cs.store.clear_chainstate().unwrap();
         {
-            let mut tip = cs.tip.write().unwrap();
+            let mut tip = cs.tip.write();
             tip.hash = genesis.block_hash();
             tip.height = 0;
         }

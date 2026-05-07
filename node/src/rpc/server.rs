@@ -12,8 +12,9 @@ use crate::rpc::{address, blockchain, indexes, mining, network, psbt, rawtx, uti
 use crate::storage::Store;
 use jsonrpsee::server::{RpcModule, ServerBuilder, ServerHandle};
 use jsonrpsee::types::ErrorObjectOwned;
+use parking_lot::RwLock;
 use std::net::SocketAddr;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use tokio::sync::watch;
 
 /// Shared, mutable record of which optional listeners actually bound
@@ -45,16 +46,16 @@ impl ServerListenerStatus {
         Arc::new(Self::default())
     }
     pub fn set_esplora(&self, bind: String) {
-        self.inner.write().unwrap().esplora = Some(bind);
+        self.inner.write().esplora = Some(bind);
     }
     pub fn set_electrum(&self, bind: String) {
-        self.inner.write().unwrap().electrum = Some(bind);
+        self.inner.write().electrum = Some(bind);
     }
     pub fn set_electrum_tls(&self, bind: String) {
-        self.inner.write().unwrap().electrum_tls = Some(bind);
+        self.inner.write().electrum_tls = Some(bind);
     }
     fn snapshot(&self) -> ServerListenerStatusInner {
-        self.inner.read().unwrap().clone()
+        self.inner.read().clone()
     }
 }
 

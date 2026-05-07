@@ -14,8 +14,9 @@
 //! RocksDB MVCC handles concurrent readers, concurrent disjoint-key
 //! writes are safe. Same property the address-index backfill relies on.
 
+use parking_lot::Mutex;
 use std::sync::{
-    Arc, Mutex,
+    Arc,
     atomic::{AtomicBool, Ordering},
 };
 
@@ -87,11 +88,11 @@ impl BackfillHandle {
     }
 
     pub fn cursor(&self) -> BackfillCursor {
-        *self.inner.cursor.lock().unwrap()
+        *self.inner.cursor.lock()
     }
 
     pub fn set_cursor(&self, cursor: BackfillCursor) {
-        *self.inner.cursor.lock().unwrap() = cursor;
+        *self.inner.cursor.lock() = cursor;
     }
 
     pub fn pause(&self) {

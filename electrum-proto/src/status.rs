@@ -111,7 +111,7 @@ mod tests {
         AddressIndex, HistoryEntry, IndexError, MempoolHistoryEntry, Scripthash, StatusUpdate,
         SubscribeError, Utxo,
     };
-    use std::sync::Mutex;
+    use parking_lot::Mutex;
     use tokio::sync::broadcast;
 
     fn fixture_txid(byte: u8) -> Txid {
@@ -136,13 +136,13 @@ mod tests {
             if self.disabled {
                 return Err(IndexError::Disabled);
             }
-            Ok(self.confirmed.lock().unwrap().clone())
+            Ok(self.confirmed.lock().clone())
         }
         fn mempool_history(&self, _sh: &Scripthash) -> Vec<MempoolHistoryEntry> {
             if self.disabled {
                 return Vec::new();
             }
-            self.mempool.lock().unwrap().clone()
+            self.mempool.lock().clone()
         }
         fn balance(&self, _sh: &Scripthash) -> Result<(u64, i64), IndexError> {
             if self.disabled {
@@ -181,7 +181,7 @@ mod tests {
         let idx = FakeIndex::default();
         let mp = empty_mempool();
         let txid = fixture_txid(0x42);
-        idx.confirmed.lock().unwrap().push(HistoryEntry::Funding {
+        idx.confirmed.lock().push(HistoryEntry::Funding {
             height: 100,
             txid,
             vout: 0,
@@ -201,7 +201,7 @@ mod tests {
         let txid_mp = fixture_txid(0x30);
         idx.mempool
             .lock()
-            .unwrap()
+            
             .push(MempoolHistoryEntry { txid: txid_mp });
 
         let got = compute_status_hash(&idx, &mp, ScripthashHex([0xcc; 32])).unwrap();
@@ -218,7 +218,7 @@ mod tests {
         let idx = FakeIndex::default();
         let mp = empty_mempool();
         let txid = fixture_txid(0x55);
-        idx.confirmed.lock().unwrap().extend([
+        idx.confirmed.lock().extend([
             HistoryEntry::Funding {
                 height: 200,
                 txid,
