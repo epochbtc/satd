@@ -3,10 +3,11 @@ use bitcoin::p2p::message_blockdata::Inventory;
 use bitcoin::p2p::message_network::VersionMessage;
 use bitcoin::p2p::{Address, ServiceFlags};
 use bitcoin::Network;
+use parking_lot::{Condvar, RwLock};
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, RwLock};
 use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -118,9 +119,9 @@ pub struct PeerManager {
     /// Ban duration in seconds (default: 86400).
     ban_duration_secs: u64,
     /// IBD scheduler for parallel block download (shared with connect thread).
-    ibd: Arc<std::sync::RwLock<Option<IbdScheduler>>>,
+    ibd: Arc<parking_lot::RwLock<Option<IbdScheduler>>>,
     /// Signal to wake the connect thread when a block is stored.
-    connect_signal: Arc<(std::sync::Mutex<bool>, Condvar)>,
+    connect_signal: Arc<(parking_lot::Mutex<bool>, Condvar)>,
     /// SOCKS5 proxy for all outbound connections (e.g. "127.0.0.1:9050").
     proxy: Option<String>,
     /// Separate SOCKS5 proxy for .onion connections (defaults to proxy).
@@ -195,7 +196,7 @@ impl PeerManager {
     ) -> Arc<Self> {
         let (event_tx, event_rx) = mpsc::channel(4096);
         let (block_tx, block_rx) = mpsc::unbounded_channel();
-        let connect_signal = Arc::new((std::sync::Mutex::new(false), Condvar::new()));
+        let connect_signal = Arc::new((parking_lot::Mutex::new(false), Condvar::new()));
 
         // Check for IBD resume: if headers are ahead of tip, create scheduler
         let tip_height = chain_state.tip_height();
@@ -222,7 +223,7 @@ impl PeerManager {
         } else {
             None
         };
-        let ibd = Arc::new(std::sync::RwLock::new(ibd_scheduler));
+        let ibd = Arc::new(parking_lot::RwLock::new(ibd_scheduler));
 
         let mgr = Arc::new(Self {
             peers: RwLock::new(HashMap::new()),
@@ -326,20 +327,20 @@ impl PeerManager {
 
     /// Register addresses for auto-reconnect.
     pub fn add_connect_addr(&self, addr: SocketAddr) {
-        self.connect_addrs.write().unwrap().push(addr);
+        self.connect_addrs.write().push(addr);
     }
 
     /// Register a PeerAddr (socket or .onion) for auto-reconnect.
     pub fn add_peer_addr(&self, addr: PeerAddr) {
         match &addr {
-            PeerAddr::Socket(sa) => self.connect_addrs.write().unwrap().push(*sa),
-            PeerAddr::Onion { .. } => self.connect_peer_addrs.write().unwrap().push(addr),
+            PeerAddr::Socket(sa) => self.connect_addrs.write().push(*sa),
+            PeerAddr::Onion { .. } => self.connect_peer_addrs.write().push(addr),
         }
     }
 
     /// Get the number of connected outbound peers.
     pub fn outbound_count(&self) -> usize {
-        let peers = self.peers.read().unwrap();
+        let peers = self.peers.read();
         peers
             .values()
             .filter(|h| {
@@ -420,7 +421,7 @@ impl PeerManager {
     /// Accept an inbound connection.
     pub fn accept_inbound(self: &Arc<Self>, stream: TcpStream, addr: SocketAddr) {
         {
-            let peers = self.peers.read().unwrap();
+            let peers = self.peers.read();
             let inbound_count = peers
                 .values()
                 .filter(|h| {
@@ -460,7 +461,7 @@ impl PeerManager {
 
     /// Disconnect a peer by address.
     pub fn disconnect(&self, addr: &SocketAddr) -> bool {
-        let peers = self.peers.read().unwrap();
+        let peers = self.peers.read();
         for (_id, handle) in peers.iter() {
             if handle.info.addr == *addr {
                 let _ = handle.msg_tx.try_send(NetworkMessage::Ping(0));
@@ -472,7 +473,7 @@ impl PeerManager {
 
     /// Get info about all connected peers.
     pub fn get_peer_info(&self) -> Vec<serde_json::Value> {
-        let peers = self.peers.read().unwrap();
+        let peers = self.peers.read();
         peers
             .values()
             .filter(|h| h.info.state == PeerState::Connected)
@@ -482,7 +483,7 @@ impl PeerManager {
 
     /// Get connection count.
     pub fn connection_count(&self) -> usize {
-        let peers = self.peers.read().unwrap();
+        let peers = self.peers.read();
         peers
             .values()
             .filter(|h| h.info.state == PeerState::Connected)
@@ -491,7 +492,7 @@ impl PeerManager {
 
     /// Get IBD download progress for the TUI dashboard.
     pub fn get_ibd_progress(&self) -> Option<serde_json::Value> {
-        let ibd = self.ibd.read().unwrap();
+        let ibd = self.ibd.read();
         let scheduler = ibd.as_ref()?;
         let (downloaded, in_flight, pending, target) = scheduler.progress();
         let cursor = scheduler.connect_cursor();
@@ -546,7 +547,7 @@ impl PeerManager {
 
     /// Get the list of currently banned addresses with expiry times.
     pub fn list_banned(&self) -> Vec<serde_json::Value> {
-        let banned = self.banned_addrs.read().unwrap();
+        let banned = self.banned_addrs.read();
         let now = Instant::now();
         banned
             .iter()
@@ -569,21 +570,21 @@ impl PeerManager {
         if ban {
             self.banned_addrs
                 .write()
-                .unwrap()
+                
                 .insert(addr, Instant::now() + Duration::from_secs(self.ban_duration_secs));
         } else {
-            self.banned_addrs.write().unwrap().remove(&addr);
+            self.banned_addrs.write().remove(&addr);
         }
     }
 
     /// Clear all bans.
     pub fn clear_banned(&self) {
-        self.banned_addrs.write().unwrap().clear();
+        self.banned_addrs.write().clear();
     }
 
     /// Send a ping to all connected peers.
     pub fn ping_all(&self) {
-        let peers = self.peers.read().unwrap();
+        let peers = self.peers.read();
         for (_, handle) in peers.iter() {
             if handle.info.state == PeerState::Connected {
                 let _ = handle.msg_tx.try_send(NetworkMessage::Ping(rand::random()));
@@ -593,8 +594,8 @@ impl PeerManager {
 
     /// Get the list of configured connect addresses.
     pub fn get_added_node_info(&self) -> Vec<serde_json::Value> {
-        let addrs = self.connect_addrs.read().unwrap();
-        let peers = self.peers.read().unwrap();
+        let addrs = self.connect_addrs.read();
+        let peers = self.peers.read();
         addrs
             .iter()
             .map(|addr| {
@@ -624,7 +625,7 @@ impl PeerManager {
 
     /// Check if we already have a connection to this address.
     fn is_addr_connected(&self, addr: &SocketAddr) -> bool {
-        let peers = self.peers.read().unwrap();
+        let peers = self.peers.read();
         peers
             .values()
             .any(|h| h.info.addr == *addr && h.info.state != PeerState::Disconnected)
@@ -632,14 +633,14 @@ impl PeerManager {
 
     /// Check if an address is currently banned.
     fn is_addr_banned(&self, addr: &SocketAddr) -> bool {
-        let banned = self.banned_addrs.read().unwrap();
+        let banned = self.banned_addrs.read();
         matches!(banned.get(addr), Some(expiry) if Instant::now() < *expiry)
     }
 
     /// Add ban score to a peer. If the score exceeds BAN_THRESHOLD, the peer
     /// is disconnected, removed, and its address is banned.
     fn add_ban_score(&self, id: PeerId, score: u32, reason: &str) {
-        let mut peers = self.peers.write().unwrap();
+        let mut peers = self.peers.write();
         let (should_ban, ban_addr) = if let Some(handle) = peers.get_mut(&id) {
             handle.info.ban_score += score;
             if handle.info.ban_score >= BAN_THRESHOLD {
@@ -658,7 +659,7 @@ impl PeerManager {
                 drop(peers); // release peers lock before acquiring banned_addrs lock
                 self.banned_addrs
                     .write()
-                    .unwrap()
+                    
                     .insert(addr, Instant::now() + Duration::from_secs(self.ban_duration_secs));
             }
         }
@@ -677,7 +678,7 @@ impl PeerManager {
             if *shutdown.borrow() {
                 tracing::info!("P2P manager shutting down");
                 // Drop all peers to close connections
-                self.peers.write().unwrap().clear();
+                self.peers.write().clear();
                 return;
             }
             // Process up to 64 events per iteration, then yield for sync
@@ -711,19 +712,19 @@ impl PeerManager {
             if tip_advanced {
                 last_tip = tip;
                 // Reset reconnect backoff on chain progress
-                let mut backoff = self.reconnect_backoff.write().unwrap();
+                let mut backoff = self.reconnect_backoff.write();
                 for state in backoff.values_mut() {
                     state.reset();
                 }
             }
 
             // IBD scheduler maintenance
-            let has_ibd = self.ibd.read().unwrap().is_some();
+            let has_ibd = self.ibd.read().is_some();
             if has_ibd {
                 // Every 4 ticks (2s): stall detection and reassignment
                 if ticks.is_multiple_of(4) {
                     let (stalled, stale_heights) = {
-                        let mut ibd = self.ibd.write().unwrap();
+                        let mut ibd = self.ibd.write();
                         if let Some(scheduler) = ibd.as_mut() {
                             let stalled = scheduler.detect_stalls(Duration::from_secs(15));
                             // Per-height timeout: catch heights stuck with an active peer
@@ -746,7 +747,7 @@ impl PeerManager {
                 // Every 20 ticks (10s): progress logging
                 if ticks.is_multiple_of(20) {
                     let (dl, inf, pend, target) = {
-                        let ibd = self.ibd.read().unwrap();
+                        let ibd = self.ibd.read();
                         ibd.as_ref()
                             .map(|s| s.progress())
                             .unwrap_or((0, 0, 0, 0))
@@ -767,7 +768,7 @@ impl PeerManager {
             // Skip during IBD swarming — the scheduler handles block requests
             if !has_ibd && (tip_advanced || ticks.is_multiple_of(10)) {
                 let peer_ids: Vec<PeerId> = {
-                    let peers = self.peers.read().unwrap();
+                    let peers = self.peers.read();
                     peers.iter()
                         .filter(|(_, h)| h.info.state == PeerState::Connected)
                         .map(|(id, _)| *id)
@@ -782,7 +783,7 @@ impl PeerManager {
             // Requesting from ALL peers floods them and triggers rate limits.
             if self.is_ibd() && ticks.is_multiple_of(4) {
                 let peer_ids: Vec<PeerId> = {
-                    let peers = self.peers.read().unwrap();
+                    let peers = self.peers.read();
                     peers.iter()
                         .filter(|(_, h)| h.info.state == PeerState::Connected)
                         .map(|(id, _)| *id)
@@ -794,7 +795,7 @@ impl PeerManager {
                 }
             } else if !self.is_ibd() && ticks.is_multiple_of(20) {
                 let peer_ids: Vec<PeerId> = {
-                    let peers = self.peers.read().unwrap();
+                    let peers = self.peers.read();
                     peers.iter()
                         .filter(|(_, h)| h.info.state == PeerState::Connected)
                         .map(|(id, _)| *id)
@@ -823,12 +824,12 @@ impl PeerManager {
                 let target = if self.is_ibd() { MAX_OUTBOUND_IBD } else { MAX_OUTBOUND };
                 let need_peers = outbound < target;
                 if need_peers {
-                    let addrs = self.connect_addrs.read().unwrap().clone();
+                    let addrs = self.connect_addrs.read().clone();
                     let now = Instant::now();
 
                     // Clean expired bans
                     {
-                        let mut banned = self.banned_addrs.write().unwrap();
+                        let mut banned = self.banned_addrs.write();
                         banned.retain(|_, expiry| now < *expiry);
                     }
 
@@ -843,7 +844,7 @@ impl PeerManager {
                         }
                         // Check backoff timer
                         {
-                            let backoff = self.reconnect_backoff.read().unwrap();
+                            let backoff = self.reconnect_backoff.read();
                             if let Some(state) = backoff.get(&addr)
                                 && now < state.next_attempt {
                                     continue;
@@ -859,7 +860,7 @@ impl PeerManager {
                         tokio::spawn(async move {
                             match pm.connect_outbound(addr).await {
                                 Ok(_) => {
-                                    let mut backoff = pm.reconnect_backoff.write().unwrap();
+                                    let mut backoff = pm.reconnect_backoff.write();
                                     backoff
                                         .entry(addr)
                                         .or_insert_with(ReconnectState::new)
@@ -867,7 +868,7 @@ impl PeerManager {
                                 }
                                 Err(e) => {
                                     tracing::debug!(%addr, "Reconnect failed: {}", e);
-                                    let mut backoff = pm.reconnect_backoff.write().unwrap();
+                                    let mut backoff = pm.reconnect_backoff.write();
                                     backoff
                                         .entry(addr)
                                         .or_insert_with(ReconnectState::new)
@@ -878,7 +879,7 @@ impl PeerManager {
                     }
 
                     // Also reconnect .onion peers
-                    let onion_addrs = self.connect_peer_addrs.read().unwrap().clone();
+                    let onion_addrs = self.connect_peer_addrs.read().clone();
                     for peer_addr in onion_addrs {
                         let pm = Arc::clone(self);
                         tokio::spawn(async move {
@@ -897,7 +898,7 @@ impl PeerManager {
 
     fn handle_peer_connected(&self, id: PeerId, version: VersionMessage) {
         {
-            let mut peers = self.peers.write().unwrap();
+            let mut peers = self.peers.write();
             if let Some(handle) = peers.get_mut(&id) {
                 handle.info.set_version(version);
                 handle.info.state = PeerState::Connected;
@@ -911,20 +912,20 @@ impl PeerManager {
             }
         }
         // Assign IBD work to the new peer
-        let has_ibd = self.ibd.read().unwrap().is_some();
+        let has_ibd = self.ibd.read().is_some();
         if has_ibd {
             self.assign_peer_work(id);
         }
     }
 
     fn handle_peer_disconnected(&self, id: PeerId) {
-        let mut peers = self.peers.write().unwrap();
+        let mut peers = self.peers.write();
         if let Some(handle) = peers.remove(&id) {
             tracing::info!(id, addr = %handle.info.addr, "Peer disconnected");
         }
         drop(peers);
         // Notify IBD scheduler so in-flight blocks get reassigned
-        let mut ibd = self.ibd.write().unwrap();
+        let mut ibd = self.ibd.write();
         if let Some(scheduler) = ibd.as_mut() {
             scheduler.peer_disconnected(id);
         }
@@ -954,7 +955,7 @@ impl PeerManager {
                 self.handle_getdata(id, inv);
             }
             NetworkMessage::SendCmpct(msg) => {
-                let mut peers = self.peers.write().unwrap();
+                let mut peers = self.peers.write();
                 if let Some(handle) = peers.get_mut(&id) {
                     handle.info.compact_blocks = msg.send_compact;
                     tracing::debug!(id, version = msg.version, "Peer supports compact blocks");
@@ -970,7 +971,7 @@ impl PeerManager {
                 self.handle_block_txn(id, msg.transactions);
             }
             NetworkMessage::FeeFilter(rate) => {
-                let mut peers = self.peers.write().unwrap();
+                let mut peers = self.peers.write();
                 if let Some(handle) = peers.get_mut(&id) {
                     handle.info.fee_filter = rate as u64;
                     tracing::debug!(id, rate, "Peer set fee filter");
@@ -989,7 +990,7 @@ impl PeerManager {
             }
             NetworkMessage::GetAddr => {
                 // Respond with addresses of our connected peers
-                let peers = self.peers.read().unwrap();
+                let peers = self.peers.read();
                 let wants_v2 = peers.get(&id).is_some_and(|h| h.info.wants_addrv2);
                 let addr_entries: Vec<_> = peers
                     .values()
@@ -1059,7 +1060,7 @@ impl PeerManager {
                 }
             }
             NetworkMessage::SendAddrV2 => {
-                let mut peers = self.peers.write().unwrap();
+                let mut peers = self.peers.write();
                 if let Some(handle) = peers.get_mut(&id) {
                     handle.info.wants_addrv2 = true;
                     tracing::debug!(id, "Peer supports addrv2");
@@ -1147,7 +1148,7 @@ impl PeerManager {
                 self.send_to_peer(id, sync::make_getheaders(&self.chain_state));
                 // During header download, request from other peers too for redundancy
                 let peer_ids: Vec<PeerId> = {
-                    let peers = self.peers.read().unwrap();
+                    let peers = self.peers.read();
                     peers.iter()
                         .filter(|(pid, h)| **pid != id && h.info.state == PeerState::Connected)
                         .map(|(pid, _)| *pid)
@@ -1165,7 +1166,7 @@ impl PeerManager {
             let tip = self.chain_state.tip_height();
             let headers_tip = htip as u32;
             if headers_tip > tip + 24 {
-                let mut ibd = self.ibd.write().unwrap();
+                let mut ibd = self.ibd.write();
                 if ibd.is_none() {
                     let effective_max_ahead = Self::resolve_max_ahead(self.max_ahead, headers_tip, tip);
                     let sched = IbdScheduler::new(headers_tip, tip, &self.chain_state, effective_max_ahead);
@@ -1179,7 +1180,7 @@ impl PeerManager {
                     drop(ibd);
                     // Wake the block processor thread so it enters IBD mode
                     let (lock, cvar) = &*self.connect_signal;
-                    *lock.lock().unwrap() = true;
+                    *lock.lock() = true;
                     cvar.notify_one();
                     // Assign work to all connected peers
                     self.assign_all_peers();
@@ -1197,7 +1198,7 @@ impl PeerManager {
             }
 
             // Request blocks (legacy path for non-IBD or fallback)
-            let has_ibd = self.ibd.read().unwrap().is_some();
+            let has_ibd = self.ibd.read().is_some();
             if !has_ibd {
                 self.request_missing_blocks(id);
             }
@@ -1207,7 +1208,7 @@ impl PeerManager {
     /// Assign download work to all connected peers during IBD.
     fn assign_all_peers(&self) {
         let peer_ids: Vec<PeerId> = {
-            let peers = self.peers.read().unwrap();
+            let peers = self.peers.read();
             peers.iter()
                 .filter(|(_, h)| h.info.state == PeerState::Connected)
                 .map(|(id, _)| *id)
@@ -1220,7 +1221,7 @@ impl PeerManager {
 
     /// Assign IBD download work to a specific peer.
     fn assign_peer_work(&self, peer_id: PeerId) {
-        let mut ibd = self.ibd.write().unwrap();
+        let mut ibd = self.ibd.write();
         if let Some(scheduler) = ibd.as_mut() {
             scheduler.register_peer(peer_id);
             let hashes = scheduler.assign_blocks(peer_id);
@@ -1235,13 +1236,13 @@ impl PeerManager {
 
     fn handle_block(&self, id: PeerId, block: bitcoin::Block) {
         // Check if IBD scheduler is active
-        let has_ibd = self.ibd.read().unwrap().is_some();
+        let has_ibd = self.ibd.read().is_some();
         if has_ibd {
             let hash = block.block_hash();
             match self.chain_state.store_block(&block) {
                 Ok((_, height)) => {
                     let needs_more = {
-                        let mut ibd = self.ibd.write().unwrap();
+                        let mut ibd = self.ibd.write();
                         if let Some(scheduler) = ibd.as_mut() {
                             scheduler.block_received(id, height)
                         } else {
@@ -1250,7 +1251,7 @@ impl PeerManager {
                     };
                     // Wake connect thread
                     let (lock, cvar) = &*self.connect_signal;
-                    *lock.lock().unwrap() = true;
+                    *lock.lock() = true;
                     cvar.notify_one();
                     // Assign more work if peer has capacity
                     if needs_more {
@@ -1260,7 +1261,7 @@ impl PeerManager {
                 Err(crate::chain::state::ChainError::Duplicate) => {
                     // Already have it, mark in scheduler anyway
                     if let Some(entry) = self.chain_state.get_block_index(&hash) {
-                        let mut ibd = self.ibd.write().unwrap();
+                        let mut ibd = self.ibd.write();
                         if let Some(scheduler) = ibd.as_mut() {
                             scheduler.block_received(id, entry.height);
                         }
@@ -1292,8 +1293,8 @@ impl PeerManager {
         mempool: Arc<Mempool>,
         fee_estimator: Arc<FeeEstimator>,
         prune_target_mb: u64,
-        connect_signal: Arc<(std::sync::Mutex<bool>, Condvar)>,
-        ibd: Arc<std::sync::RwLock<Option<IbdScheduler>>>,
+        connect_signal: Arc<(parking_lot::Mutex<bool>, Condvar)>,
+        ibd: Arc<parking_lot::RwLock<Option<IbdScheduler>>>,
         prefetch_workers: usize,
         max_ahead: u32,
         ibd_l0_pause_at: u32,
@@ -1312,7 +1313,7 @@ impl PeerManager {
         };
 
         // IBD connect loop: walk from tip forward, connecting stored blocks
-        if ibd.read().unwrap().is_some() {
+        if ibd.read().is_some() {
             Self::ibd_connect_loop(
                 &chain_state,
                 &fee_estimator,
@@ -1335,7 +1336,7 @@ impl PeerManager {
         let mut block_buffer: HashMap<bitcoin::BlockHash, bitcoin::Block> = HashMap::new();
         loop {
             // Check if IBD scheduler was activated
-            if ibd.read().unwrap().is_some() {
+            if ibd.read().is_some() {
                 Self::ibd_connect_loop(
                     &chain_state,
                     &fee_estimator,
@@ -1356,10 +1357,10 @@ impl PeerManager {
             // Wait for a block from the channel, but wake up periodically
             // to check for IBD scheduler activation
             let (lock, cvar) = &*connect_signal;
-            let mut ready = lock.lock().unwrap();
+            let mut ready = lock.lock();
             *ready = false;
             // Wait up to 500ms — will be woken immediately if a block is stored
-            let _ = cvar.wait_timeout(ready, Duration::from_millis(500));
+            let _ = cvar.wait_for(&mut ready, Duration::from_millis(500));
 
             // Drain all available blocks from the channel
             while let Ok(block) = rx.try_recv() {
@@ -1440,8 +1441,8 @@ impl PeerManager {
     fn ibd_connect_loop(
         chain_state: &ChainState,
         _fee_estimator: &FeeEstimator,
-        connect_signal: &Arc<(std::sync::Mutex<bool>, Condvar)>,
-        ibd: &Arc<std::sync::RwLock<Option<IbdScheduler>>>,
+        connect_signal: &Arc<(parking_lot::Mutex<bool>, Condvar)>,
+        ibd: &Arc<parking_lot::RwLock<Option<IbdScheduler>>>,
         keep_blocks: u32,
         prefetch_workers: usize,
         last_log_height: &mut u32,
@@ -1457,7 +1458,7 @@ impl PeerManager {
         let perf = std::sync::Arc::new(crate::perf::IbdPerf::new());
 
         // Weight-aware ETA estimator
-        let target = ibd.read().unwrap().as_ref().map(|s| s.target_height()).unwrap_or(0);
+        let target = ibd.read().as_ref().map(|s| s.target_height()).unwrap_or(0);
         let is_mainnet = network == Network::Bitcoin;
         let mut eta_estimator = crate::ibd_eta::IbdEtaEstimator::new(
             chain_state.tip_height(), target, is_mainnet,
@@ -1552,7 +1553,7 @@ impl PeerManager {
             }
 
             let target_height = {
-                let sched = ibd.read().unwrap();
+                let sched = ibd.read();
                 match sched.as_ref() {
                     Some(s) => s.target_height(),
                     None => break, // Scheduler cleared
@@ -1576,7 +1577,7 @@ impl PeerManager {
                     );
                     let effective_max_ahead = Self::resolve_max_ahead(max_ahead, headers_tip, tip_height);
                     let new_sched = IbdScheduler::new(headers_tip, tip_height, chain_state, effective_max_ahead);
-                    *ibd.write().unwrap() = Some(new_sched);
+                    *ibd.write() = Some(new_sched);
                     connected_count = 0;
                     // Update prefetch cursor for the new batch
                     prefetch_handle.advance_cursor(tip_height + 1);
@@ -1612,7 +1613,7 @@ impl PeerManager {
                     elapsed_secs = start_time.elapsed().as_secs(),
                     "IBD complete"
                 );
-                *ibd.write().unwrap() = None;
+                *ibd.write() = None;
                 break;
             }
 
@@ -1621,9 +1622,9 @@ impl PeerManager {
                 None => {
                     // No header for this height yet — wait
                     let (lock, cvar) = &**connect_signal;
-                    let mut ready = lock.lock().unwrap();
+                    let mut ready = lock.lock();
                     *ready = false;
-                    let _ = cvar.wait_timeout(ready, Duration::from_secs(1));
+                    let _ = cvar.wait_for(&mut ready, Duration::from_secs(1));
                     continue;
                 }
             };
@@ -1663,7 +1664,7 @@ impl PeerManager {
                         chain_state.warnings().clear("connect.retry");
                         // Update scheduler connect cursor
                         {
-                            let mut sched = ibd.write().unwrap();
+                            let mut sched = ibd.write();
                             if let Some(s) = sched.as_mut() {
                                 s.connect_cursor_advanced(next_height);
                             }
@@ -1695,7 +1696,7 @@ impl PeerManager {
                             let elapsed = start_time.elapsed().as_secs().max(1);
                             let rate = connected_count / elapsed;
                             let (dl, inf, pend, _) = {
-                                let sched = ibd.read().unwrap();
+                                let sched = ibd.read();
                                 sched.as_ref()
                                     .map(|s| s.progress())
                                     .unwrap_or((0, 0, 0, 0))
@@ -1833,18 +1834,18 @@ impl PeerManager {
                             );
                         }
                         let (lock, cvar) = &**connect_signal;
-                        let mut ready = lock.lock().unwrap();
+                        let mut ready = lock.lock();
                         *ready = false;
-                        let _ = cvar.wait_timeout(ready, Duration::from_secs(1));
+                        let _ = cvar.wait_for(&mut ready, Duration::from_secs(1));
                         continue;
                     }
                 }
             } else {
                 // Next block not downloaded yet — wait for signal
                 let (lock, cvar) = &**connect_signal;
-                let mut ready = lock.lock().unwrap();
+                let mut ready = lock.lock();
                 *ready = false;
-                let _ = cvar.wait_timeout(ready, Duration::from_secs(1));
+                let _ = cvar.wait_for(&mut ready, Duration::from_secs(1));
             }
         }
 
@@ -1980,7 +1981,7 @@ impl PeerManager {
     fn broadcast_inv(&self, from: PeerId, txid: bitcoin::Txid) {
         let entry_fee_rate = self.mempool.get(&txid).map(|e| e.fee_rate).unwrap_or(0);
         let inv = NetworkMessage::Inv(vec![Inventory::WitnessTransaction(txid)]);
-        let peers = self.peers.read().unwrap();
+        let peers = self.peers.read();
         for (peer_id, handle) in peers.iter() {
             if *peer_id != from
                 && handle.info.state == PeerState::Connected
@@ -2089,7 +2090,7 @@ impl PeerManager {
         // consumer/queue-full case naturally backpressures instead of
         // truncating the protocol response.
         let msg_tx = {
-            let peers = self.peers.read().unwrap();
+            let peers = self.peers.read();
             peers.get(&id).map(|h| h.msg_tx.clone())
         };
         let Some(msg_tx) = msg_tx else {
@@ -2325,7 +2326,7 @@ impl PeerManager {
                         },
                     ),
                 );
-                self.pending_compact.write().unwrap().insert(block_hash, pending);
+                self.pending_compact.write().insert(block_hash, pending);
             }
         }
     }
@@ -2356,7 +2357,7 @@ impl PeerManager {
 
     fn handle_block_txn(&self, _id: PeerId, txns: bitcoin::bip152::BlockTransactions) {
         let block_hash = txns.block_hash;
-        let pending = self.pending_compact.write().unwrap().remove(&block_hash);
+        let pending = self.pending_compact.write().remove(&block_hash);
         if let Some(pending) = pending {
             if let Some(block) = compact::complete_pending(pending, &txns) {
                 tracing::debug!(%block_hash, "Compact block completed with BlockTxn");
@@ -2392,7 +2393,7 @@ impl PeerManager {
     }
 
     fn send_to_peer(&self, id: PeerId, msg: NetworkMessage) {
-        let peers = self.peers.read().unwrap();
+        let peers = self.peers.read();
         if let Some(handle) = peers.get(&id) {
             let _ = handle.msg_tx.try_send(msg);
         }
@@ -2405,7 +2406,7 @@ impl PeerManager {
 
     #[allow(dead_code)]
     fn broadcast_except(&self, exclude_id: PeerId, msg: NetworkMessage) {
-        let peers = self.peers.read().unwrap();
+        let peers = self.peers.read();
         for (id, handle) in peers.iter() {
             if *id != exclude_id && handle.info.state == PeerState::Connected {
                 let _ = handle.msg_tx.try_send(msg.clone());
@@ -2427,7 +2428,7 @@ impl PeerManager {
         let handle = PeerHandle { info, msg_tx };
 
         {
-            let mut peers = self.peers.write().unwrap();
+            let mut peers = self.peers.write();
             peers.insert(id, handle);
         }
 

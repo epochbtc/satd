@@ -20,10 +20,10 @@ use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bitcoin::BlockHash;
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
@@ -106,7 +106,7 @@ impl ReorgLog {
     /// Wire a webhook sender. Subsequent `record()` calls will try to
     /// push events into it. Overwrites any previous sender.
     pub fn set_webhook_sender(&self, tx: mpsc::Sender<ReorgRecord>) {
-        *self.webhook_tx.lock().unwrap() = Some(tx);
+        *self.webhook_tx.lock() = Some(tx);
     }
 
     /// Persist a record: append JSONL to disk, push into the ring,
@@ -128,7 +128,7 @@ impl ReorgLog {
         }
 
         {
-            let mut ring = self.ring.lock().unwrap();
+            let mut ring = self.ring.lock();
             ring.push_back(record.clone());
             while ring.len() > self.capacity {
                 ring.pop_front();
@@ -138,7 +138,7 @@ impl ReorgLog {
         // Best-effort webhook dispatch. `try_send` never blocks; a full
         // queue means the dispatcher is lagging on slow webhooks, in
         // which case dropping is correct (we still have the ring + disk).
-        if let Some(tx) = self.webhook_tx.lock().unwrap().as_ref()
+        if let Some(tx) = self.webhook_tx.lock().as_ref()
             && tx.try_send(record).is_err()
         {
             self.webhook_drops.fetch_add(1, Ordering::Relaxed);
@@ -153,7 +153,7 @@ impl ReorgLog {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let cutoff = now.saturating_sub(since_secs);
-        let ring = self.ring.lock().unwrap();
+        let ring = self.ring.lock();
         ring.iter()
             .filter(|r| r.ts_unix_secs >= cutoff)
             .cloned()
@@ -294,7 +294,7 @@ mod tests {
         // Manually push a stale record bypassing `record()` to simulate
         // a very old event.
         {
-            let mut ring = log.ring.lock().unwrap();
+            let mut ring = log.ring.lock();
             ring.push_back(ReorgRecord {
                 ts_unix_secs: 100, // ancient
                 depth: 1,

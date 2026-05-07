@@ -14,3 +14,4 @@ base64 = { workspace = true }
 reqwest = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
+parking_lot = { workspace = true }

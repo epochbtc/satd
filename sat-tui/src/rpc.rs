@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 /// Automatically re-reads the cookie file on auth failure (handles satd restarts).
 pub struct RpcClient {
     url: String,
-    auth_header: std::sync::RwLock<String>,
+    auth_header: parking_lot::RwLock<String>,
     cookie_path: Option<PathBuf>,
     client: reqwest::Client,
 }
@@ -16,7 +16,7 @@ impl RpcClient {
         let auth_header = format!("Basic {}", BASE64.encode(format!("{}:{}", user, pass)));
         Self {
             url: format!("http://{}:{}/", host, port),
-            auth_header: std::sync::RwLock::new(auth_header),
+            auth_header: parking_lot::RwLock::new(auth_header),
             cookie_path: None,
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
@@ -32,7 +32,7 @@ impl RpcClient {
             .unwrap_or_default();
         Self {
             url: format!("http://{}:{}/", host, port),
-            auth_header: std::sync::RwLock::new(auth_header),
+            auth_header: parking_lot::RwLock::new(auth_header),
             cookie_path: Some(cookie_path),
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
@@ -47,7 +47,7 @@ impl RpcClient {
             && let Ok((u, p)) = read_cookie_file(path)
         {
             let new_auth = format!("Basic {}", BASE64.encode(format!("{}:{}", u, p)));
-            *self.auth_header.write().unwrap() = new_auth;
+            *self.auth_header.write() = new_auth;
             return true;
         }
         false
@@ -70,7 +70,7 @@ impl RpcClient {
             "params": params,
         });
 
-        let auth = self.auth_header.read().unwrap().clone();
+        let auth = self.auth_header.read().clone();
         let response = self.client
             .post(&self.url)
             .header("Content-Type", "application/json")

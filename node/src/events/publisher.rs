@@ -293,7 +293,7 @@ mod tests {
         mp_tx.send(enter_event(1)).unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await;
 
-        let envs = received.lock().unwrap().clone();
+        let envs = received.lock().clone();
         assert_eq!(envs.len(), 1);
         assert!(matches!(
             envs[0].body,
@@ -326,7 +326,7 @@ mod tests {
         // Allow both bridges to drain.
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let envs = received.lock().unwrap().clone();
+        let envs = received.lock().clone();
         assert_eq!(envs.len(), 10);
         let seqs: Vec<u64> = envs.iter().map(|e| e.stamp.seq).collect();
         let mut sorted = seqs.clone();
@@ -356,7 +356,7 @@ mod tests {
         // Wait for ~5 heartbeat intervals to elapse.
         tokio::time::sleep(cadence * 5 + Duration::from_millis(30)).await;
 
-        let envs = received.lock().unwrap().clone();
+        let envs = received.lock().clone();
         let heartbeats: Vec<_> = envs
             .iter()
             .filter(|e| matches!(e.body, NodeEventBody::Heartbeat { .. }))
@@ -452,7 +452,7 @@ mod tests {
         mp_tx.send(enter_event(2)).unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let envs = received.lock().unwrap().clone();
+        let envs = received.lock().clone();
         assert_eq!(envs.len(), 2);
         let delta = envs[1].stamp.edge_wall_ns.saturating_sub(envs[0].stamp.edge_wall_ns);
         assert!(

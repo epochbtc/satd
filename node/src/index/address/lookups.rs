@@ -2,9 +2,10 @@
 //! `Store`. Mempool history (M4) and the subscription registry (M5)
 //! attach in later milestones.
 
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use bitcoin::OutPoint;
+use parking_lot::RwLock;
 use tokio::sync::broadcast;
 
 use crate::index::address::config::AddressIndexConfig;
@@ -167,7 +168,7 @@ impl AddressIndex for RocksAddressIndex {
         }
         self.mempool
             .read()
-            .unwrap()
+            
             .entries_for(sh)
             .into_iter()
             .map(|txid| MempoolHistoryEntry { txid })
@@ -195,7 +196,7 @@ impl AddressIndex for RocksAddressIndex {
             }
         }
 
-        let unconfirmed = self.mempool.read().unwrap().delta(sh);
+        let unconfirmed = self.mempool.read().delta(sh);
         Ok((confirmed, unconfirmed))
     }
 

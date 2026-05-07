@@ -15,8 +15,8 @@
 //! CPU/memory DoS scoring (Core 30+) is out of scope.
 
 use bitcoin::{Transaction, Txid};
+use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::mempool::policy::MAX_STANDARD_TX_WEIGHT;
@@ -160,7 +160,7 @@ impl TxOrphanage {
         bytes: usize,
         added_at: Instant,
     ) -> AddOutcome {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
 
         // Idempotent on duplicate txid — report so the caller can skip
         // re-requesting parents.
@@ -206,7 +206,7 @@ impl TxOrphanage {
     /// parent. Caller typically calls [`remove`](Self::remove) on each
     /// child and retries `accept_transaction`.
     pub fn children_of(&self, parent_txid: &Txid) -> Vec<Txid> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock();
         inner
             .by_parent
             .get(parent_txid)
@@ -217,7 +217,7 @@ impl TxOrphanage {
     /// Remove and return the orphan entry for `txid`, if present. Cleans
     /// all indexes atomically.
     pub fn remove(&self, txid: &Txid) -> Option<OrphanEntry> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         Self::remove_locked(&mut inner, txid)
     }
 
@@ -246,7 +246,7 @@ impl TxOrphanage {
     /// Sweep entries past expiry. `now` is injected so tests can drive
     /// the clock.
     pub fn expire(&self, now: Instant) -> Vec<Txid> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         let expiry = self.config.expiry;
         let victims: Vec<Txid> = inner
             .by_txid
@@ -261,19 +261,19 @@ impl TxOrphanage {
     }
 
     pub fn len(&self) -> usize {
-        self.inner.lock().unwrap().by_txid.len()
+        self.inner.lock().by_txid.len()
     }
 
     pub fn bytes(&self) -> usize {
-        self.inner.lock().unwrap().total_bytes
+        self.inner.lock().total_bytes
     }
 
     pub fn is_empty(&self) -> bool {
-        self.inner.lock().unwrap().by_txid.is_empty()
+        self.inner.lock().by_txid.is_empty()
     }
 
     pub fn contains(&self, txid: &Txid) -> bool {
-        self.inner.lock().unwrap().by_txid.contains_key(txid)
+        self.inner.lock().by_txid.contains_key(txid)
     }
 
     fn pop_oldest(inner: &mut OrphanageInner) -> Option<Txid> {
@@ -502,7 +502,7 @@ mod tests {
         pool.remove(&child_txids[0]).unwrap();
         pool.remove(&child_txids[2]).unwrap();
         assert!(pool.children_of(&parent).is_empty());
-        let inner = pool.inner.lock().unwrap();
+        let inner = pool.inner.lock();
         assert!(
             !inner.by_parent.contains_key(&parent),
             "empty parent bucket should be dropped"
@@ -558,7 +558,7 @@ mod tests {
         assert_eq!(pool.len(), 1);
         assert!(pool.contains(&txid));
 
-        let inner = pool.inner.lock().unwrap();
+        let inner = pool.inner.lock();
         assert!(inner.by_peer.get(&1).is_some_and(|s| s.contains(&txid)));
         assert!(
             !inner.by_peer.contains_key(&2),

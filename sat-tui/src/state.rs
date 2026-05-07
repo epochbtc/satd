@@ -403,6 +403,47 @@ pub struct AppState {
     pub startup_status: Option<String>,
 }
 
+/// Structured startup-progress response from `getstartupinfo`.
+#[derive(Debug, Clone, Default)]
+pub struct StartupStatus {
+    pub phase: String,
+    pub message: String,
+    pub current: u64,
+    pub total: u64,
+}
+
+impl StartupStatus {
+    pub fn from_json(v: &serde_json::Value) -> Self {
+        Self {
+            phase: v.get("phase").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+            message: v.get("status").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+            current: v.get("current").and_then(|n| n.as_u64()).unwrap_or(0),
+            total: v.get("total").and_then(|n| n.as_u64()).unwrap_or(0),
+        }
+    }
+
+    /// Human-readable line: "Replaying blocks (phase 2/2) [reindex_connect]:
+    /// 234567/945000 (24.8%)".
+    pub fn render(&self) -> String {
+        let phase_tag = if self.phase.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", self.phase)
+        };
+        if self.total > 0 {
+            let pct = (self.current as f64 / self.total as f64) * 100.0;
+            format!(
+                "{}{}: {}/{} ({:.1}%)",
+                self.message, phase_tag, self.current, self.total, pct
+            )
+        } else if !self.message.is_empty() {
+            format!("{}{}", self.message, phase_tag)
+        } else {
+            "satd is starting...".to_string()
+        }
+    }
+}
+
 /// Compute log2 of a hex-encoded big-endian integer without materializing it.
 /// Returns None for empty/all-zero input.
 ///

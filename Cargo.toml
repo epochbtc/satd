@@ -33,6 +33,7 @@ tokio-socks = "0.5"
 lru = "0.12"
 crossbeam-channel = "0.5"
 async-trait = "0.1"
+parking_lot = "0.12"
 uuid = { version = "1", features = ["v4"] }
 tonic = "0.12"
 tonic-build = "0.12"

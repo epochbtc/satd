@@ -1,4 +1,4 @@
-use std::sync::RwLock;
+use parking_lot::RwLock;
 
 /// Simple fee rate estimator.
 /// Tracks recent block fee rates and returns percentile-based estimates
@@ -29,7 +29,7 @@ impl FeeEstimator {
         if fee_rates.is_empty() {
             return;
         }
-        let mut rates = self.recent_rates.write().unwrap();
+        let mut rates = self.recent_rates.write();
         rates.extend_from_slice(fee_rates);
         // Keep only recent samples
         if rates.len() > self.max_samples {
@@ -43,7 +43,7 @@ impl FeeEstimator {
     /// Lower targets return higher percentiles (more aggressive fee).
     /// Returns None if insufficient data.
     pub fn estimate_fee(&self, target: u32) -> Option<u64> {
-        let rates = self.recent_rates.read().unwrap();
+        let rates = self.recent_rates.read();
         if rates.len() < 10 {
             return None;
         }

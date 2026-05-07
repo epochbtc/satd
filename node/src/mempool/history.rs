@@ -16,9 +16,9 @@ use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
-use std::sync::Mutex;
 
 use bitcoin::Txid;
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::mempool::estimate::HistogramBucket;
@@ -112,7 +112,7 @@ impl MempoolHistory {
     pub fn record_if_changed(&self, snapshot: MempoolSnapshot) -> bool {
         let sig = SnapshotSig::from(&snapshot);
         {
-            let mut last = self.last_sig.lock().unwrap();
+            let mut last = self.last_sig.lock();
             if last.as_ref() == Some(&sig) {
                 return false;
             }
@@ -139,7 +139,7 @@ impl MempoolHistory {
             Err(e) => tracing::warn!(error = %e, "Failed to serialize mempool snapshot"),
         }
 
-        let mut ring = self.ring.lock().unwrap();
+        let mut ring = self.ring.lock();
         ring.push_back(snapshot);
         while ring.len() > self.capacity {
             ring.pop_front();
@@ -153,7 +153,7 @@ impl MempoolHistory {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let cutoff = now.saturating_sub(since_secs);
-        let ring = self.ring.lock().unwrap();
+        let ring = self.ring.lock();
         ring.iter()
             .filter(|s| s.ts_unix_secs >= cutoff)
             .cloned()

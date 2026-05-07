@@ -24,8 +24,9 @@
 //! spaces — RocksDB MVCC handles concurrent readers, concurrent
 //! disjoint-key writes are safe.
 
+use parking_lot::Mutex;
 use std::sync::{
-    Arc, Mutex,
+    Arc,
     atomic::{AtomicBool, Ordering},
 };
 
@@ -96,14 +97,14 @@ impl BackfillHandle {
     /// Snapshot the in-memory cursor for `getindexinfo`. Cheap;
     /// holds the mutex only long enough to clone.
     pub fn cursor(&self) -> BackfillCursor {
-        *self.inner.cursor.lock().unwrap()
+        *self.inner.cursor.lock()
     }
 
     /// Update the in-memory cursor. Called by the running task on
     /// each batch boundary, and by `main.rs` on startup when
     /// re-reading persisted state.
     pub fn set_cursor(&self, cursor: BackfillCursor) {
-        *self.inner.cursor.lock().unwrap() = cursor;
+        *self.inner.cursor.lock() = cursor;
     }
 
     /// Operator request: pause at the next batch boundary. Idempotent.

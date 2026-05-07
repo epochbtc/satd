@@ -293,7 +293,7 @@ mod tests {
         AddressIndex, HistoryEntry, IndexError, MempoolHistoryEntry, StatusUpdate, SubscribeError,
         Utxo,
     };
-    use std::sync::Mutex;
+    use parking_lot::Mutex;
 
     /// Trivial ElectrumExtras stub that returns a fixed header at
     /// every height. Used by the headers-forwarder test so the task
@@ -358,7 +358,7 @@ mod tests {
         }
 
         fn fire(&self, sh: Scripthash, status: [u8; 32]) {
-            if let Some(tx) = self.senders.lock().unwrap().get(&sh) {
+            if let Some(tx) = self.senders.lock().get(&sh) {
                 let _ = tx.send(StatusUpdate {
                     scripthash: sh,
                     status_hash: status,
@@ -387,7 +387,7 @@ mod tests {
             if self.cap_full {
                 return Err(SubscribeError::CapReached(0));
             }
-            let mut map = self.senders.lock().unwrap();
+            let mut map = self.senders.lock();
             let tx = map.entry(sh).or_insert_with(|| broadcast::channel(16).0);
             Ok(tx.subscribe())
         }

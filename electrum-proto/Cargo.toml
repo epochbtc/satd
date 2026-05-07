@@ -14,6 +14,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
+parking_lot = { workspace = true }
 tokio-rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 node-index = { path = "../node-index" }

@@ -27,6 +27,7 @@ lru = { workspace = true }
 crossbeam-channel = { workspace = true }
 async-trait = { workspace = true }
 uuid = { workspace = true }
+parking_lot = { workspace = true }
 
 consensus = { path = "../consensus" }
 node-index = { path = "../node-index" }

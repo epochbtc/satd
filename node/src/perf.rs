@@ -45,7 +45,7 @@ pub struct IbdPerf {
     pub spec_verify_rerun: AtomicU64,
 
     // Last report time
-    last_report: std::sync::Mutex<Instant>,
+    last_report: parking_lot::Mutex<Instant>,
 
     // Wall-clock milliseconds of the most recent reporting interval.
     // Set by report(), read by the connect loop for ETA calibration.
@@ -80,7 +80,7 @@ impl IbdPerf {
             utxo_batch_keys: AtomicU64::new(0),
             spec_verify_skipped: AtomicU64::new(0),
             spec_verify_rerun: AtomicU64::new(0),
-            last_report: std::sync::Mutex::new(Instant::now()),
+            last_report: parking_lot::Mutex::new(Instant::now()),
             last_interval_ms: AtomicU64::new(0),
         }
     }
@@ -88,7 +88,7 @@ impl IbdPerf {
     /// Log a structured performance summary and reset counters.
     pub fn report(&self, height: u32) {
         let elapsed = {
-            let mut last = self.last_report.lock().unwrap();
+            let mut last = self.last_report.lock();
             let e = last.elapsed();
             *last = Instant::now();
             e
