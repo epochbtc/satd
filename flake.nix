@@ -99,7 +99,7 @@
           nativeBuildInputs = with pkgs; [
             pkg-config
             cmake
-            llvmPackages.clang  # `clang` binary on PATH for clang-sys
+            llvmPackages_19.clang  # `clang` binary on PATH for clang-sys
           ];
 
           # `rocksdb` is here as a system library (with its dev
@@ -130,7 +130,7 @@
             openssl
             zlib
             rocksdb
-            llvmPackages.libclang  # libclang.so for bindgen via clang-sys
+            llvmPackages_19.libclang  # libclang.so for bindgen via clang-sys
           ];
 
           # Env applied to the dev shell only. Sets LIBCLANG_PATH so
@@ -149,7 +149,7 @@
           # "libclang error; possible causes include: Host vs.
           # target architecture mismatch".
           shellEnv = {
-            LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+            LIBCLANG_PATH = "${pkgs.llvmPackages_19.libclang.lib}/lib";
           };
 
           # Env applied only to the build derivation. We deliberately
@@ -180,13 +180,20 @@
           #                     symbols + linker build-id for a
           #                     deterministic ELF.
           buildEnv = {
-            LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+            LIBCLANG_PATH = "${pkgs.llvmPackages_19.libclang.lib}/lib";
             BINDGEN_EXTRA_CLANG_ARGS =
-              "-isystem ${pkgs.llvmPackages.libclang.lib}/lib/clang/${pkgs.lib.versions.major pkgs.llvmPackages.libclang.version}/include "
+              "-isystem ${pkgs.llvmPackages_19.libclang.lib}/lib/clang/${pkgs.lib.versions.major pkgs.llvmPackages_19.libclang.version}/include "
               + "-isystem ${pkgs.glibc.dev}/include";
             ROCKSDB_LIB_DIR = "${pkgs.rocksdb}/lib";
             ROCKSDB_INCLUDE_DIR = "${pkgs.rocksdb}/include";
-            SOURCE_DATE_EPOCH = toString (self.lastModifiedDate or 1);
+            # `self.lastModified` is the integer Unix timestamp.
+            # `self.lastModifiedDate` (which we used initially) is a
+            # YYYYMMDDhhmmss STRING — passing that as
+            # SOURCE_DATE_EPOCH causes the nixpkgs cc-wrapper to
+            # reject it ("must be a non-negative decimal integer <=
+            # 253402300799"), which silently breaks any clang call
+            # in the build (e.g. librocksdb-sys's bindgen step).
+            SOURCE_DATE_EPOCH = toString (self.lastModified or 1);
             CARGO_PROFILE_RELEASE_STRIP = "symbols";
             RUSTFLAGS = "-C link-arg=-Wl,--build-id=none";
           };
@@ -264,7 +271,7 @@
             ];
             shellHook = ''
               echo "satd dev shell — toolchain: $(rustc --version)"
-              echo "  LIBCLANG_PATH=${pkgs.llvmPackages.libclang.lib}/lib"
+              echo "  LIBCLANG_PATH=${pkgs.llvmPackages_19.libclang.lib}/lib"
             '';
           });
 
