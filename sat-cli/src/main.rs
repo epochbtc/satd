@@ -366,6 +366,19 @@ async fn main() {
     let cli = match Cli::try_parse_from(normalized) {
         Ok(c) => c,
         Err(e) => {
+            // `--version` and `--help` come back as `Err` from
+            // `try_parse_from`; clap's `print()` writes the
+            // requested output to the right stream and we exit 0.
+            // Without this branch the help/version output would be
+            // emitted as a parse-error and sat-cli would exit 1.
+            use clap::error::ErrorKind;
+            if matches!(
+                e.kind(),
+                ErrorKind::DisplayVersion | ErrorKind::DisplayHelp
+            ) {
+                e.print().ok();
+                std::process::exit(0);
+            }
             eprintln!("{}", e);
             std::process::exit(1);
         }

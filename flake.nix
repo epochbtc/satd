@@ -1,0 +1,301 @@
+{
+  # satd reproducible build via Nix.
+  #
+  # See `docs/PACKAGING.md` §"Reproducible build via Nix" for the
+  # operator-facing story. This file is the source for two outputs:
+  #
+  #   - `nix build` produces deterministic `satd` and `sat-cli` binaries
+  #     under `result/bin/`. Two builds from the same commit on two
+  #     hosts produce the same SHA256.
+  #
+  #   - `nix develop` drops into a shell with the workspace's full
+  #     native toolchain (clang, libclang, cmake, openssl, plus the
+  #     pinned rust). Useful for contributors who don't want to manage
+  #     rustup themselves.
+  #
+  # Toolchain pin lives in `rust-toolchain.toml` at the repo root and
+  # is the single source of truth (also read by rustup).
+  #
+  # v1 scope (this PR): x86_64-linux + aarch64-linux. Nix-to-Nix
+  # repro only — matching the rustup-stable tarball binary is a
+  # separate exercise (linker / build-id alignment) deferred to v1.x.
+
+  description = "satd — Bitcoin Core-compatible full node in Rust (reproducible build)";
+
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
+
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+
+    crane = {
+      url = "github:ipetkov/crane";
+    };
+
+    flake-utils.url = "github:numtide/flake-utils";
+  };
+
+  outputs =
+    { self
+    , nixpkgs
+    , rust-overlay
+    , crane
+    , flake-utils
+    }:
+    flake-utils.lib.eachSystem
+      [
+        flake-utils.lib.system.x86_64-linux
+        flake-utils.lib.system.aarch64-linux
+      ]
+      (system:
+        let
+          pkgs = import nixpkgs {
+            inherit system;
+            overlays = [ (import rust-overlay) ];
+          };
+
+          # Read the channel + components from rust-toolchain.toml so
+          # the flake and `cargo` agree on what rustc to use.
+          rustToolchain =
+            pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+
+          craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
+
+          # crane's `cleanCargoSource` strips non-Rust files. The
+          # workspace has `events/proto/*.proto` files that
+          # `tonic_build` reads at compile time; keep those.
+          # Also keep license/attribution files referenced by some
+          # downstream build scripts and the `vendor/` directories.
+          src = pkgs.lib.cleanSourceWith {
+            src = ./.;
+            name = "satd-source";
+            filter = path: type:
+              let
+                rel = pkgs.lib.removePrefix (toString ./. + "/") (toString path);
+                isProto = pkgs.lib.hasSuffix ".proto" rel;
+                isVendorAttribution =
+                  pkgs.lib.hasInfix "/vendor/" ("/" + rel);
+                isCargoOrRust = craneLib.filterCargoSources path type;
+              in
+              isProto || isVendorAttribution || isCargoOrRust;
+          };
+
+          # Native deps every cargo build in this workspace needs.
+          # Mirrors the apt list in `Dockerfile` and the
+          # `Install Linux build deps` step in
+          # `.github/workflows/release.yml`. Anything added there must
+          # be added here.
+          #
+          # `rustPlatform.bindgenHook` was tried first (it's the
+          # idiomatic surface) but didn't actually export
+          # BINDGEN_EXTRA_CLANG_ARGS into crane's deps-build phase
+          # — likely because the hook's `addEnvHooks` mechanism
+          # depends on the C compiler stdenv being applied at a
+          # phase crane reorders. Dropping back to explicit
+          # nativeBuildInputs + env vars set on the derivation is
+          # less elegant but actually works.
+          nativeBuildInputs = with pkgs; [
+            pkg-config
+            cmake
+            llvmPackages_19.clang  # `clang` binary on PATH for clang-sys
+          ];
+
+          # `rocksdb` is here as a system library (with its dev
+          # headers) so librocksdb-sys uses nixpkgs's pre-built
+          # RocksDB instead of its vendored C++ tree. Two reasons:
+          #
+          #   1. Earlier attempts using the vendored RocksDB
+          #      consistently panicked librocksdb-sys's bindgen step
+          #      with "libclang error" — the bindgenHook alone
+          #      wasn't enough to feed libclang the right system
+          #      include paths for the vendored RocksDB's particular
+          #      header set. nixpkgs's pre-built rocksdb dev tree
+          #      ships clean headers that bindgen can parse.
+          #
+          #   2. As a bonus, skipping the vendored C++ build cuts
+          #      ~10 min off the cold compile time and removes the
+          #      `PORTABLE=1` / `ROCKSDB_DISABLE_AVX2=1` knobs as a
+          #      determinism concern (nixpkgs's rocksdb is built
+          #      portably by definition).
+          #
+          # Tradeoff: the rocksdb version under nixpkgs may differ
+          # slightly from the librocksdb-sys-pinned version
+          # (currently 10.4.2). librocksdb-sys uses its own
+          # bindgen-generated bindings either way, so a minor-version
+          # mismatch is fine; a major API change would surface as a
+          # compile error in the bindgen output.
+          buildInputs = with pkgs; [
+            openssl
+            zlib
+            rocksdb
+            llvmPackages_19.libclang  # libclang.so for bindgen via clang-sys
+          ];
+
+          # Env applied to the dev shell only. Sets LIBCLANG_PATH so
+          # editor processes / long-lived `cargo` invocations inside
+          # `nix develop` find libclang without re-running the
+          # bindgen setup-hook each time.
+          #
+          # Deliberately NOT spread into the build derivation —
+          # `rustPlatform.bindgenHook` (in nativeBuildInputs) is
+          # responsible for setting both LIBCLANG_PATH and the
+          # critical BINDGEN_EXTRA_CLANG_ARGS (system include paths
+          # for stdint.h, libstdc++, etc.) inside the build sandbox.
+          # Pre-setting LIBCLANG_PATH from outside the hook makes
+          # bindgen invoke libclang without the matching include
+          # paths, and librocksdb-sys's bindgen step panics with
+          # "libclang error; possible causes include: Host vs.
+          # target architecture mismatch".
+          shellEnv = {
+            LIBCLANG_PATH = "${pkgs.llvmPackages_19.libclang.lib}/lib";
+          };
+
+          # Env applied only to the build derivation. We deliberately
+          # don't put determinism knobs in the dev shell because a
+          # developer running local `cargo build --release` shouldn't
+          # lose debug symbols / build-id by accident.
+          #
+          #   - LIBCLANG_PATH / BINDGEN_EXTRA_CLANG_ARGS  bindgen
+          #                     uses clang-sys to load libclang.so
+          #                     and pass `-isystem` paths to libclang
+          #                     for header parsing. Both must be set
+          #                     for librocksdb-sys's bindgen step to
+          #                     succeed.
+          #
+          #   - ROCKSDB_LIB_DIR / ROCKSDB_INCLUDE_DIR  point
+          #                     librocksdb-sys at nixpkgs's
+          #                     pre-built rocksdb (see buildInputs
+          #                     comment). Skips the vendored C++
+          #                     build entirely.
+          #
+          #   - SOURCE_DATE_EPOCH   pinned to the flake's
+          #                     `lastModifiedDate` so any build
+          #                     script that bakes a timestamp gets a
+          #                     stable one. cc-rs and tonic-build
+          #                     respect it.
+          #
+          #   - CARGO_PROFILE_RELEASE_STRIP / RUSTFLAGS  drop debug
+          #                     symbols + linker build-id for a
+          #                     deterministic ELF.
+          buildEnv = {
+            LIBCLANG_PATH = "${pkgs.llvmPackages_19.libclang.lib}/lib";
+            BINDGEN_EXTRA_CLANG_ARGS =
+              "-isystem ${pkgs.llvmPackages_19.libclang.lib}/lib/clang/${pkgs.lib.versions.major pkgs.llvmPackages_19.libclang.version}/include "
+              + "-isystem ${pkgs.glibc.dev}/include";
+            ROCKSDB_LIB_DIR = "${pkgs.rocksdb}/lib";
+            ROCKSDB_INCLUDE_DIR = "${pkgs.rocksdb}/include";
+            # `self.lastModified` is the integer Unix timestamp.
+            # `self.lastModifiedDate` (which we used initially) is a
+            # YYYYMMDDhhmmss STRING — passing that as
+            # SOURCE_DATE_EPOCH causes the nixpkgs cc-wrapper to
+            # reject it ("must be a non-negative decimal integer <=
+            # 253402300799"), which silently breaks any clang call
+            # in the build (e.g. librocksdb-sys's bindgen step).
+            SOURCE_DATE_EPOCH = toString (self.lastModified or 1);
+            CARGO_PROFILE_RELEASE_STRIP = "symbols";
+            RUSTFLAGS = "-C link-arg=-Wl,--build-id=none";
+          };
+
+          commonArgs = buildEnv // {
+            inherit src nativeBuildInputs buildInputs;
+            strictDeps = true;
+            # `--locked` mirrors the release workflow; deps must
+            # match Cargo.lock exactly. No registry fetches at
+            # build time.
+            cargoExtraArgs = "--locked";
+            # The workspace's package version (read from the
+            # workspace.package table) is a placeholder until a real
+            # release. crane wants a name+version anyway; using the
+            # workspace pin keeps the derivation name predictable.
+            pname = "satd-workspace";
+            version = "0.1.0";
+          };
+
+          # First-pass build: produce the dep-only artifacts. Cached
+          # in the nix store keyed by Cargo.lock contents, so source
+          # edits don't re-build the dep graph.
+          cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+
+          # Second-pass: workspace build of the binary crates we ship.
+          satd = craneLib.buildPackage (commonArgs // {
+            inherit cargoArtifacts;
+            pname = "satd";
+            # Build only the two binaries we ship as releases. The
+            # workspace has additional bins (sat-tui) that operators
+            # can opt into; keeping the default flake build small
+            # matches the release tarball.
+            cargoExtraArgs = "--locked --bin satd --bin sat-cli";
+            # The default `doCheck = true` would run `cargo test`
+            # inside the build derivation. We expose tests as a
+            # `checks.cargo-test` derivation instead, so a packager
+            # who just wants binaries doesn't pay the test cost.
+            doCheck = false;
+            meta = with pkgs.lib; {
+              description = "Bitcoin Core-compatible full node in Rust";
+              homepage = "https://github.com/epochbtc/satd";
+              license = licenses.mit;
+              mainProgram = "satd";
+              platforms = [ "x86_64-linux" "aarch64-linux" ];
+            };
+          });
+        in
+        {
+          packages = {
+            inherit satd;
+            default = satd;
+          };
+
+          apps = {
+            satd = flake-utils.lib.mkApp {
+              drv = satd;
+              name = "satd";
+            };
+            sat-cli = flake-utils.lib.mkApp {
+              drv = satd;
+              name = "sat-cli";
+            };
+            default = flake-utils.lib.mkApp {
+              drv = satd;
+              name = "satd";
+            };
+          };
+
+          devShells.default = pkgs.mkShell (shellEnv // {
+            inputsFrom = [ satd ];
+            packages = [
+              rustToolchain
+              pkgs.cargo-watch
+              pkgs.cargo-nextest
+            ];
+            shellHook = ''
+              echo "satd dev shell — toolchain: $(rustc --version)"
+              echo "  LIBCLANG_PATH=${pkgs.llvmPackages_19.libclang.lib}/lib"
+            '';
+          });
+
+          checks = {
+            # Each check is a separate derivation so `nix flake check`
+            # exposes them independently and CI can address them
+            # one-by-one.
+            cargo-clippy = craneLib.cargoClippy (commonArgs // {
+              inherit cargoArtifacts;
+              cargoClippyExtraArgs = "--all-targets --all-features -- -D warnings";
+            });
+
+            cargo-fmt = craneLib.cargoFmt {
+              inherit src;
+              # rustfmt isn't gated on `--all-features` so this is a
+              # cheap parallel check.
+            };
+
+            cargo-test = craneLib.cargoTest (commonArgs // {
+              inherit cargoArtifacts;
+              cargoTestExtraArgs = "--workspace --all-features";
+            });
+          };
+
+          formatter = pkgs.nixpkgs-fmt;
+        });
+}

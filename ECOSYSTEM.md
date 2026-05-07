@@ -193,12 +193,12 @@ Both protocols and the index landed in the timeframe estimated. The shipped surf
 
 Six items to gate the first packager-friendly tag on:
 
-1. Multi-arch Docker + signed tarballs in GitHub Releases
-2. Reproducible build (Guix or Nix)
-3. Systemd unit with `Type=notify` + verified graceful shutdown
-4. `/health` + `/metrics` endpoints
+1. Multi-arch Docker + signed tarballs in GitHub Releases ✅ shipped
+2. Reproducible build (Guix or Nix) ✅ shipped (Nix; see `docs/PACKAGING.md` §"Reproducible build via Nix"). A Guix manifest may follow if a downstream packager needs it.
+3. Systemd unit with `Type=notify` + verified graceful shutdown — `Type=simple` shipped; `Type=notify` upgrade pending
+4. `/health` + `/metrics` endpoints ✅ shipped
 5. Pruning + AssumeUTXO tested on a 4 GB Pi 5
-6. `docs/PACKAGING.md` + a working `umbrel-apps` PR
+6. `docs/PACKAGING.md` ✅ shipped + a working `umbrel-apps` PR
 
 ---
 
@@ -210,7 +210,7 @@ Rough dependency order. Items 2-4 and 6 have shipped; 1 and 5 are partial; 7-8 r
 2. **Address-history index** ✅ shipped — `node-index` crate; updated inside `connect_block` / `disconnect_block` for atomic reorg consistency.
 3. **Esplora REST** ✅ shipped — `esplora-handlers` crate; on by default on loopback.
 4. **Electrum protocol** ✅ shipped — `electrum-proto` crate; vendored protocol code from `romanz/electrs` (MIT) over the address-index trait surface.
-5. **Packager-ready gate items** *(partial)* — `/health`, `/readyz`, `/metrics`, structured-JSON logs, profile presets, persistent reorg log + webhook, events bus, MCP server are shipped. Multi-arch Docker images, signed tarballs, reproducible builds, systemd unit, and `docs/PACKAGING.md` are still future work — see `STABILITY_POLICY.md` for the canary-CI commitments that gate the first packager-friendly tag.
+5. **Packager-ready gate items** *(partial)* — `/health`, `/readyz`, `/metrics`, structured-JSON logs, profile presets, persistent reorg log + webhook, events bus, MCP server, multi-arch Docker images, signed tarballs, Nix flake reproducible build, systemd unit, and `docs/PACKAGING.md` are shipped. `Type=notify` systemd upgrade and the SBOM step remain — see `STABILITY_POLICY.md` for the canary-CI commitments that gate the first packager-friendly tag.
 6. **BIP 157/158 P2P service** ✅ shipped — `node-filter-index` crate + `getcfilters` / `getcfheaders` / `getcfcheckpt` arms in `node/src/net/manager.rs`; deferred backfill via `backfillindex blockfilter`.
 7. **Silent Payments index + push notifications** *(deferred)* — advanced mobile-specific capabilities. The SP index rides on the same scan-every-output infrastructure as the address-history index.
 8. *(Deferred)* **LND-compatible gRPC** if LN focus becomes a priority.

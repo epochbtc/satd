@@ -3,3 +3,8 @@
 .idea/
 .vscode/
 .cargo/config.toml
+
+# Nix build outputs (`nix build` symlinks; flake repl history)
+result
+result-*
+.direnv/

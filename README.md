@@ -95,6 +95,16 @@ protocol code):
 cargo build -p satd --no-default-features
 ```
 
+Reproducible build via Nix (deterministic across hosts; toolchain
+pinned in `rust-toolchain.toml`):
+
+```sh
+nix build .#satd     # produces ./result/bin/{satd, sat-cli}
+```
+
+See [`docs/PACKAGING.md`](docs/PACKAGING.md) §"Reproducible build via Nix"
+for the full story.
+
 ## Running
 
 ```sh

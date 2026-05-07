@@ -183,8 +183,13 @@ via `gpg.ssh.allowedSignersFile`.
   maintainer's GitHub account (SSH).
 
 **They do not prove:**
-- That the build was reproducible — that's PR-4 (Nix flake) of the
-  packaging stack.
+- That the published tarball binary matches a third-party rebuild
+  of the same source. The `Nix` workflow gives independent
+  verification on the `nix build` path (two-runner byte-identical
+  check, see `docs/PACKAGING.md` §"Reproducible build via Nix" and
+  `contrib/repro/diff-build.sh` for offline reproduction). Aligning
+  the rustup-stable tarball binary against the Nix output bit-for-bit
+  is a v1.x follow-up.
 - That the source tree at the tag has been independently reviewed.
 - That the maintainer's machine wasn't compromised at signing time.
   Hardware-token-backed signing (FIDO2-resident SSH for tags;
@@ -193,4 +198,4 @@ via `gpg.ssh.allowedSignersFile`.
 
 For high-assurance deployments, combine the signature checks above
 with the reproducible-build verification described in
-`docs/PACKAGING.md` once that ships.
+[`docs/PACKAGING.md`](docs/PACKAGING.md) §"Reproducible build via Nix".

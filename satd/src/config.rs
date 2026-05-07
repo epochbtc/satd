@@ -544,7 +544,25 @@ impl Config {
     pub fn load() -> Result<Self, String> {
         let raw_args: Vec<String> = std::env::args().collect();
         let normalized = normalize_args(raw_args);
-        let cli = CliArgs::try_parse_from(normalized).map_err(|e| e.to_string())?;
+        let cli = match CliArgs::try_parse_from(normalized) {
+            Ok(c) => c,
+            Err(e) => {
+                // `--version` and `--help` come back as `Err` from
+                // `try_parse_from`; clap's `print()` writes the
+                // requested output to the right stream and we exit
+                // 0. Without this, satd treats `--version` /
+                // `--help` as a parse error and exits 1.
+                use clap::error::ErrorKind;
+                if matches!(
+                    e.kind(),
+                    ErrorKind::DisplayVersion | ErrorKind::DisplayHelp
+                ) {
+                    e.print().ok();
+                    std::process::exit(0);
+                }
+                return Err(e.to_string());
+            }
+        };
         Self::from_cli(cli)
     }
 
