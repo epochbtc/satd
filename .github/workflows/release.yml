@@ -450,6 +450,16 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: dist
+          # Filter out the per-arch digest artifacts (only the
+          # merge-docker job needs them) and the auto-uploaded
+          # `*.dockerbuild` build-record artifact that
+          # docker/build-push-action@v6 attaches by default. Both
+          # were being pulled here previously, which (a) wasted
+          # bandwidth and (b) bit us on v0.1.0-rc1 when an Azure
+          # blob fetch on the dockerbuild artifact transient-failed
+          # 5 retries in a row, killing the entire release step
+          # despite every tarball having downloaded fine.
+          pattern: 'satd-*'
           merge-multiple: true
 
       - name: Aggregate sha256sums

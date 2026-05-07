@@ -72,8 +72,10 @@ gh release download "$TAG" \
 echo ">> Confirming SHA256SUMS"
 sha256sum -c SHA256SUMS
 
+tarball_count=$(ls -1 *.tar.zst | wc -l)
 echo ">> Signing each tarball"
-echo "   passphrase will be requested once; minisign caches in-process"
+echo "   minisign will prompt for the key passphrase once per tarball"
+echo "   ($tarball_count prompts expected; same primary-key passphrase each time)"
 for f in *.tar.zst; do
     if [[ -f "${f}.minisig" ]]; then
         echo "   skip $f (signature already present)"
