@@ -87,11 +87,18 @@
           # `Install Linux build deps` step in
           # `.github/workflows/release.yml`. Anything added there must
           # be added here.
+          #
+          # `rustPlatform.bindgenHook` is the right surface for the
+          # rocksdb-sys + bindgen + libstdc++ headers triangle.
+          # Pure `clang` + `llvmPackages.libclang.lib` is not enough:
+          # bindgen needs `BINDGEN_EXTRA_CLANG_ARGS` set to point at
+          # the stdenv's C/C++ system include paths, and that's what
+          # the hook does. Without it, bindgen panics with
+          # `libclang error` during the librocksdb-sys build script.
           nativeBuildInputs = with pkgs; [
             pkg-config
             cmake
-            clang
-            llvmPackages.libclang.lib
+            rustPlatform.bindgenHook
           ];
 
           buildInputs = with pkgs; [
@@ -102,6 +109,12 @@
           # Env that any cargo invocation in this workspace needs to
           # find the right native deps. Set in both the build
           # derivation and `nix develop`.
+          #
+          # LIBCLANG_PATH is still set explicitly even though the
+          # bindgenHook also exports it; the dev shell may run cargo
+          # outside the setup-hook lifecycle (e.g. a long-lived
+          # editor process), and a stable string is friendlier than
+          # relying on hook execution order.
           shellEnv = {
             LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
           };
