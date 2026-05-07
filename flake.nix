@@ -106,22 +106,28 @@
             zlib
           ];
 
-          # Env that any cargo invocation in this workspace needs to
-          # find the right native deps. Set in both the build
-          # derivation and `nix develop`.
+          # Env applied to the dev shell only. Sets LIBCLANG_PATH so
+          # editor processes / long-lived `cargo` invocations inside
+          # `nix develop` find libclang without re-running the
+          # bindgen setup-hook each time.
           #
-          # LIBCLANG_PATH is still set explicitly even though the
-          # bindgenHook also exports it; the dev shell may run cargo
-          # outside the setup-hook lifecycle (e.g. a long-lived
-          # editor process), and a stable string is friendlier than
-          # relying on hook execution order.
+          # Deliberately NOT spread into the build derivation —
+          # `rustPlatform.bindgenHook` (in nativeBuildInputs) is
+          # responsible for setting both LIBCLANG_PATH and the
+          # critical BINDGEN_EXTRA_CLANG_ARGS (system include paths
+          # for stdint.h, libstdc++, etc.) inside the build sandbox.
+          # Pre-setting LIBCLANG_PATH from outside the hook makes
+          # bindgen invoke libclang without the matching include
+          # paths, and librocksdb-sys's bindgen step panics with
+          # "libclang error; possible causes include: Host vs.
+          # target architecture mismatch".
           shellEnv = {
             LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
           };
 
-          # Additional env applied only to the build derivation. These
-          # are the determinism knobs; we deliberately don't put them
-          # in the dev shell because a developer running local
+          # Env applied only to the build derivation. These are the
+          # determinism knobs; we deliberately don't put them in the
+          # dev shell because a developer running local
           # `cargo build --release` shouldn't lose debug symbols /
           # build-id by accident.
           #
@@ -144,7 +150,7 @@
           #   - CARGO_PROFILE_RELEASE_STRIP / RUSTFLAGS  drop debug
           #                     symbols + linker build-id for a
           #                     deterministic ELF.
-          buildEnv = shellEnv // {
+          buildEnv = {
             ROCKSDB_DISABLE_AVX2 = "1";
             PORTABLE = "1";
             SOURCE_DATE_EPOCH = toString (self.lastModifiedDate or 1);
