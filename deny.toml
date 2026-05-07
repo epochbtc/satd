@@ -1,0 +1,102 @@
+# cargo-deny policy for satd
+#
+# Run locally:
+#   cargo install --locked cargo-deny
+#   cargo deny check
+#
+# CI runs this on every PR that touches Cargo.{toml,lock}, deny.toml, or the
+# deny workflow itself. The release workflow runs it again as a hard gate
+# before any tarball or SBOM job — a known-vulnerable dep cannot ship.
+#
+# Triage policy when an advisory hits CI:
+#   1. If a fixed version exists, bump and merge.
+#   2. Otherwise, add a `[[advisories.ignore]]` entry below citing the
+#      RUSTSEC-XXXX-XXXX id, the rationale (why exposure is acceptable),
+#      and a follow-up issue link. No silent allowlists.
+
+[graph]
+all-features = true
+
+[output]
+feature-depth = 1
+
+# ---------------------------------------------------------------------------
+# Advisories: RustSec database
+# ---------------------------------------------------------------------------
+[advisories]
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+ignore = [
+    # paste 1.0.15 — RUSTSEC-2024-0436 (unmaintained, archived).
+    # Pulled in transitively by ratatui (sat-tui dep). No safe upgrade and
+    # the crate has no security implications — it's a compile-time macro.
+    # Track ratatui upstream for paste removal.
+    { id = "RUSTSEC-2024-0436", reason = "transitive via ratatui; macro-only; awaiting upstream removal" },
+
+    # rustls-pemfile 2.2.0 — RUSTSEC-2025-0134 (unmaintained, archived).
+    # Direct dep in electrum-proto for TLS PEM loading. The replacement
+    # (rustls-pki-types::PemObject) is a straightforward port but is a
+    # code change, not config; tracked as a follow-up rather than bundled
+    # into this PR. The advisory describes no vulnerability — the crate
+    # is a thin wrapper over still-maintained code in rustls-pki-types.
+    { id = "RUSTSEC-2025-0134", reason = "deferred port to rustls-pki-types::PemObject; no vuln" },
+
+    # bincode 1.3.3 — unmaintained.
+    # 2.x is a major rewrite with API breakage; migration is a separate
+    # workstream. Used for internal serialization in node storage where
+    # data is trusted (own-process writes, own-process reads).
+    { id = "RUSTSEC-2025-0141", reason = "bincode development ceased; trusted internal data only; replacement is a separate workstream" },
+]
+
+# ---------------------------------------------------------------------------
+# Licenses
+# ---------------------------------------------------------------------------
+# Allowlist is permissive licenses only. Anything outside this list (notably
+# GPL-*, AGPL-*, SSPL, Commons-Clause) is denied. Add narrow exceptions in
+# the `[[licenses.exceptions]]` table below with a comment naming the crate
+# and the reason.
+[licenses]
+allow = [
+    "MIT",
+    "MITNFA",                  # MIT + no-false-attributions; permissive (hex_lit).
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "Unlicense",
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.93
+exceptions = []
+
+# ---------------------------------------------------------------------------
+# Bans: forbidden crates and version-policy
+# ---------------------------------------------------------------------------
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Workspace-internal `path = "../foo"` deps are technically wildcards. They
+# resolve to the local checkout, never to crates.io, so the "*" version is
+# fine. cargo-deny gates this behind a single switch.
+allow-wildcard-paths = true
+highlight = "all"
+deny = []
+skip = []
+skip-tree = []
+
+# ---------------------------------------------------------------------------
+# Sources: registries and git deps
+# ---------------------------------------------------------------------------
+# Workspace deps must come from crates.io. Git deps require an explicit
+# allowlist entry below pinning the repository, with a comment explaining
+# why the crate isn't on crates.io.
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

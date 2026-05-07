@@ -3,6 +3,7 @@ name = "consensus"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
 repository.workspace = true
 
 [dependencies]
@@ -18,7 +19,7 @@ hex = { workspace = true }
 serde = { workspace = true }
 bitcoinconsensus = { workspace = true }
 criterion = { version = "0.5", features = ["html_reports"] }
-pprof = { version = "0.13", features = ["criterion", "flamegraph"] }
+pprof = { version = "0.14", features = ["criterion", "flamegraph"] }
 
 [[bench]]
 name = "legacy"

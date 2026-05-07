@@ -8,3 +8,8 @@
 result
 result-*
 .direnv/
+
+# CycloneDX SBOMs from local `cargo cyclonedx` runs. CI generates and
+# uploads these as release artifacts; never check them in.
+*.cdx.json
+*.cdx.json.sha256

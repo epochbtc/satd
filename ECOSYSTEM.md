@@ -74,7 +74,7 @@ satd is as drop-in as Bitcoin Core for Umbrel, Start9 / StartOS, RaspiBlitz, MyN
   - **Docker images** — `cosign` keyless signing via GitHub Actions OIDC, attested to the Rekor transparency log. Gives SLSA-level provenance automatically; packagers verify against the workflow identity rather than a personal key.
   - **Git tags + maintainer commits** — SSH signatures (`ssh-keygen -Y sign`), verified against maintainers' GitHub-published pubkeys (`github.com/<user>.keys`) via an allowed-signers file. Zero new key infrastructure, matches GitHub's "Verified" badge.
 - **Stable semver + public changelog**, explicit RPC-wire deprecation policy.
-- **SBOM + `cargo deny`** in CI. Start9 in particular cares about dependency audit.
+- **SBOM + `cargo deny`** in CI — *shipped*. Each release attaches CycloneDX 1.5 JSON SBOMs per binary, signed with the same minisign key as the tarballs. `cargo-deny` runs as a hard gate on every release artifact (and on PR for any dep-graph-touching PR); policy is in `deny.toml`. See `docs/PACKAGING.md` §"Software Bill of Materials" + §"Supply-chain policy".
 
 ### 2. Runtime ergonomics
 
@@ -210,7 +210,7 @@ Rough dependency order. Items 2-4 and 6 have shipped; 1 and 5 are partial; 7-8 r
 2. **Address-history index** ✅ shipped — `node-index` crate; updated inside `connect_block` / `disconnect_block` for atomic reorg consistency.
 3. **Esplora REST** ✅ shipped — `esplora-handlers` crate; on by default on loopback.
 4. **Electrum protocol** ✅ shipped — `electrum-proto` crate; vendored protocol code from `romanz/electrs` (MIT) over the address-index trait surface.
-5. **Packager-ready gate items** *(partial)* — `/health`, `/readyz`, `/metrics`, structured-JSON logs, profile presets, persistent reorg log + webhook, events bus, MCP server, multi-arch Docker images, signed tarballs, Nix flake reproducible build, systemd unit, and `docs/PACKAGING.md` are shipped. `Type=notify` systemd upgrade and the SBOM step remain — see `STABILITY_POLICY.md` for the canary-CI commitments that gate the first packager-friendly tag.
+5. **Packager-ready gate items** *(partial)* — `/health`, `/readyz`, `/metrics`, structured-JSON logs, profile presets, persistent reorg log + webhook, events bus, MCP server, multi-arch Docker images, signed tarballs, Nix flake reproducible build, CycloneDX SBOMs + `cargo-deny` supply-chain gate, systemd unit, and `docs/PACKAGING.md` are shipped. `Type=notify` systemd upgrade remains — see `STABILITY_POLICY.md` for the canary-CI commitments that gate the first packager-friendly tag.
 6. **BIP 157/158 P2P service** ✅ shipped — `node-filter-index` crate + `getcfilters` / `getcfheaders` / `getcfcheckpt` arms in `node/src/net/manager.rs`; deferred backfill via `backfillindex blockfilter`.
 7. **Silent Payments index + push notifications** *(deferred)* — advanced mobile-specific capabilities. The SP index rides on the same scan-every-output infrastructure as the address-history index.
 8. *(Deferred)* **LND-compatible gRPC** if LN focus becomes a priority.

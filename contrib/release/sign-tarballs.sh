@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# sign-tarballs.sh — maintainer-side: download a release's tarballs,
-# sign each with minisign, and upload the .minisig files back.
+# sign-tarballs.sh — maintainer-side: download a release's tarballs +
+# CycloneDX SBOMs, sign each with minisign, and upload the .minisig
+# files back.
 #
 # Prereqs:
 #   - minisign installed locally
@@ -62,21 +63,36 @@ echo ">> Downloading release artifacts for $TAG"
 # --skip-existing would silently keep the bad copy. The SHA256SUMS
 # step below catches that, but only if we actually fetched fresh
 # bytes. Tarballs are small; the re-download cost is trivial.
+#
+# Both tarballs (*.tar.zst) and CycloneDX SBOMs (*.cdx.json) are
+# signed with the same minisign primary key. Operators verify both
+# with the same recipe (`minisign -Vm <file> -P <pubkey>`).
 gh release download "$TAG" \
     --repo epochbtc/satd \
     --pattern '*.tar.zst' \
     --pattern '*.tar.zst.sha256' \
+    --pattern '*.cdx.json' \
+    --pattern '*.cdx.json.sha256' \
     --pattern 'SHA256SUMS' \
     --clobber
 
 echo ">> Confirming SHA256SUMS"
 sha256sum -c SHA256SUMS
 
-tarball_count=$(ls -1 *.tar.zst | wc -l)
-echo ">> Signing each tarball"
-echo "   minisign will prompt for the key passphrase once per tarball"
-echo "   ($tarball_count prompts expected; same primary-key passphrase each time)"
-for f in *.tar.zst; do
+# Collect everything we'll sign: tarballs + SBOMs.
+shopt -s nullglob
+to_sign=( *.tar.zst *.cdx.json )
+shopt -u nullglob
+
+if [[ ${#to_sign[@]} -eq 0 ]]; then
+    echo "no artifacts found to sign for tag $TAG" >&2
+    exit 1
+fi
+
+echo ">> Signing each artifact"
+echo "   minisign will prompt for the key passphrase once per file"
+echo "   (${#to_sign[@]} prompts expected; same primary-key passphrase each time)"
+for f in "${to_sign[@]}"; do
     if [[ -f "${f}.minisig" ]]; then
         echo "   skip $f (signature already present)"
         continue
@@ -85,7 +101,7 @@ for f in *.tar.zst; do
 done
 
 echo ">> Round-trip verifying every signature against the published pubkey"
-for f in *.tar.zst; do
+for f in "${to_sign[@]}"; do
     minisign -Vm "$f" -P "$PUBKEY" >/dev/null
     echo "   ok: ${f}.minisig"
 done

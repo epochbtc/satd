@@ -7,6 +7,10 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/epochbtc/satd"
+# Workspace crates are not published to crates.io. Marking publish = false
+# here also lets cargo-deny's `allow-wildcard-paths` apply to internal
+# `path = "../foo"` deps, which are otherwise treated as wildcards.
+publish = false
 
 [workspace.dependencies]
 bitcoin = { version = "0.32", features = ["serde", "rand-std"] }
@@ -30,7 +34,7 @@ bincode = "1"
 bitcoinconsensus = "0.106"
 rayon = "1.10"
 tokio-socks = "0.5"
-lru = "0.12"
+lru = "0.16"
 crossbeam-channel = "0.5"
 async-trait = "0.1"
 parking_lot = "0.12"
