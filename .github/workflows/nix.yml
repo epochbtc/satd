@@ -1,0 +1,193 @@
+# Nix flake CI: build the workspace through the flake (`nix build .#satd`)
+# and prove the build is bit-identical across two independent runners.
+#
+# Status: advisory-only on PRs. Not a required check on master in v1.
+# After ~10 green PRs the maintainer should promote this to required
+# in the branch protection settings; until then a flaky Nix-side issue
+# (cache miss, transient network) shouldn't block unrelated work.
+#
+# Triggers:
+#   - PRs that touch the flake itself, the toolchain pin, or the
+#     workspace's lockfile (the inputs that change the build).
+#   - workflow_dispatch for ad-hoc runs.
+#
+# Deliberately NOT wired into release.yml. Adding a Nix repro check
+# to the tag-time release workflow would inflate the cost of every
+# release without earning a guard the advisory CI doesn't already
+# provide. Reconsider once the repo flips to public (Actions minutes
+# free) and the Nix-to-tarball-binary repro story is solved.
+#
+# flake.lock note: this PR ships `flake.nix` without a committed
+# `flake.lock`. The first run of this workflow on a maintainer
+# branch should be a `workflow_dispatch` invocation that generates
+# the lock; the maintainer then commits the resulting `flake.lock`.
+# Subsequent PR-trigger runs will use the committed lock.
+
+name: Nix
+
+on:
+  pull_request:
+    paths:
+      - 'flake.nix'
+      - 'flake.lock'
+      - 'rust-toolchain.toml'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - '.github/workflows/nix.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+
+  build-and-check:
+    name: nix build / ${{ matrix.system }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - system: x86_64-linux
+            os: ubuntu-24.04
+          - system: aarch64-linux
+            os: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+        with:
+          # Determinate Systems' installer enables the binary cache
+          # and flakes by default. No additional config needed for v1.
+          extra-conf: |
+            experimental-features = nix-command flakes
+
+      - name: Magic Nix cache
+        uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Confirm flake evaluates
+        run: nix flake show --no-write-lock-file
+
+      - name: Build satd
+        run: |
+          nix build .#satd \
+            --print-build-logs \
+            --no-write-lock-file
+          ls -la result/bin/
+
+      - name: Smoke-test built binaries
+        run: |
+          ./result/bin/satd --version
+          ./result/bin/sat-cli --version
+
+      - name: Hash output binaries
+        id: hash
+        run: |
+          set -euo pipefail
+          satd_hash=$(sha256sum result/bin/satd    | awk '{print $1}')
+          cli_hash=$(sha256sum  result/bin/sat-cli | awk '{print $1}')
+          echo "satd_hash=${satd_hash}"    >> "$GITHUB_OUTPUT"
+          echo "sat-cli_hash=${cli_hash}"  >> "$GITHUB_OUTPUT"
+          echo "## Binary hashes (${{ matrix.system }})" >> "$GITHUB_STEP_SUMMARY"
+          echo ""                                         >> "$GITHUB_STEP_SUMMARY"
+          echo "| Binary | sha256 |"                      >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|"                                >> "$GITHUB_STEP_SUMMARY"
+          echo "| satd    | \`${satd_hash}\` |"           >> "$GITHUB_STEP_SUMMARY"
+          echo "| sat-cli | \`${cli_hash}\` |"            >> "$GITHUB_STEP_SUMMARY"
+
+
+  # Reproducibility check — two independent ubuntu-24.04 runners build
+  # the flake; a third job downloads both hash artifacts and asserts
+  # equality. v1 covers x86_64-linux only; aarch64-linux follows in
+  # v1.x once we've burned in the x86_64 path.
+  reproducibility:
+    name: nix repro / x86_64-linux pair
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        # Two independent VMs of the same OS. Each GH Actions job
+        # spins up a fresh runner image, so this is two cold builds
+        # on different hosts.
+        replica: [a, b]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+
+      - name: Magic Nix cache
+        uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Build satd
+        run: |
+          nix build .#satd \
+            --print-build-logs \
+            --no-write-lock-file
+
+      - name: Hash binary
+        id: hash
+        run: |
+          set -euo pipefail
+          mkdir -p hash-out
+          sha256sum result/bin/satd    > hash-out/satd.sha256
+          sha256sum result/bin/sat-cli > hash-out/sat-cli.sha256
+
+      - name: Upload hash artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nix-repro-hashes-${{ matrix.replica }}
+          path: hash-out/
+          if-no-files-found: error
+          retention-days: 7
+
+  reproducibility-compare:
+    name: nix repro / compare
+    needs: [reproducibility]
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Download replica A
+        uses: actions/download-artifact@v4
+        with:
+          name: nix-repro-hashes-a
+          path: a/
+
+      - name: Download replica B
+        uses: actions/download-artifact@v4
+        with:
+          name: nix-repro-hashes-b
+          path: b/
+
+      - name: Assert byte-identical builds
+        run: |
+          set -euo pipefail
+          {
+            echo "## Reproducibility check"
+            echo ""
+            echo "| Binary | replica A | replica B | match |"
+            echo "|---|---|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          fail=0
+          for bin in satd sat-cli; do
+            ha=$(awk '{print $1}' "a/${bin}.sha256")
+            hb=$(awk '{print $1}' "b/${bin}.sha256")
+            if [[ "$ha" == "$hb" ]]; then
+              echo "| ${bin} | \`${ha}\` | \`${hb}\` | ✅ |" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "| ${bin} | \`${ha}\` | \`${hb}\` | ❌ |" >> "$GITHUB_STEP_SUMMARY"
+              echo "MISMATCH for ${bin}: ${ha} vs ${hb}" >&2
+              fail=1
+            fi
+          done
+
+          exit "$fail"

@@ -13,13 +13,14 @@ direction for packaging is in [`ECOSYSTEM.md`](../ECOSYSTEM.md) §2.
 ## Document status
 
 This is **PACKAGING.md v1**. It covers what shipped today: the
-container, systemd unit, on-disk layout, and operational surface.
-Sections marked **(future)** describe contracts that future PRs will
-fulfil — release pipeline, signing, reproducible build, SBOM. They
-are listed here so packagers can see the full intended shape and
-plan against it.
+container, systemd unit, on-disk layout, operational surface, release
+pipeline, signing across all three surfaces, and reproducible build
+via Nix. Sections marked **(future)** describe contracts that future
+PRs will fulfil — SBOM generation, `Type=notify` systemd, OpenRC /
+runit equivalents. They are listed here so packagers can see the
+full intended shape and plan against it.
 
-Updated: 2026-05-05.
+Updated: 2026-05-07.
 
 ## Binaries
 
@@ -264,13 +265,92 @@ Indexes that scan historical blocks (`--txindex`, `--addressindex`,
 `--blockfilterindex`) require unpruned blocks. satd refuses to start
 with a conflicting combination — same shape as Core.
 
-## Reproducible build *(future)*
+## Reproducible build via Nix
 
-PR-4 in the packaging stack will land a Nix flake (`flake.nix`) that
-produces deterministic binaries and a CI job that double-builds on
-two distinct hosts and asserts byte-identical output. Until that
-lands, packagers should pin Cargo.lock and the Rust toolchain version
-(currently 1.93) to get something close.
+The repo ships a Nix flake at `flake.nix` that produces deterministic
+`satd` and `sat-cli` binaries on `x86_64-linux` and `aarch64-linux`.
+
+Quickstart for a packager who already has Nix with flakes enabled:
+
+```sh
+# Build (produces ./result/bin/{satd, sat-cli})
+nix build .#satd
+
+# Hash the built binaries
+sha256sum result/bin/satd result/bin/sat-cli
+
+# Drop into a dev shell with the full toolchain (clang, libclang,
+# cmake, openssl, rustc, cargo, rustfmt, clippy, cargo-watch,
+# cargo-nextest)
+nix develop
+```
+
+The toolchain pin (`rust-toolchain.toml` at the repo root) is the
+single source of truth — both rustup and the flake read it.
+
+### What "reproducible" means in v1
+
+- **Two `nix build` invocations** of the same commit on two hosts
+  produce byte-identical `result/bin/satd`. CI proves this on every
+  PR that touches `flake.nix` / `flake.lock` / `rust-toolchain.toml` /
+  `Cargo.lock` via `.github/workflows/nix.yml` (a two-runner pair
+  build + a third compare job that asserts SHA256 equality).
+- **Local repro** is one command: `contrib/repro/diff-build.sh
+  /path/to/clone-A /path/to/clone-B`. Runs `nix build` in each, hashes
+  the outputs, and falls back to `diffoscope` when they diverge.
+- **Out of scope for v1**: matching the rustup-stable tarball binary
+  (the one `.github/workflows/release.yml` ships) byte-for-byte. That
+  requires aligning linker / debug-info / build-id behaviour between
+  two different build drivers; tractable but a separate PR.
+
+### Determinism hazards addressed
+
+| Hazard | How the flake handles it |
+|---|---|
+| `rocksdb-sys` bindgen output | `LIBCLANG_PATH` set to the pinned libclang; bindgen output is deterministic for a fixed libclang version. |
+| RocksDB vendored C++ build | `PORTABLE=1` + `ROCKSDB_DISABLE_AVX2=1` so the build doesn't tune for the runner's CPU; matches what the release-tarball workflow already produces (rustup-stable defaults to generic x86_64-v1). |
+| `cc-rs` C/C++ compiles (secp256k1, bitcoinconsensus) | Compiler version pinned via nixpkgs; `SOURCE_DATE_EPOCH` respected by cc-rs for any timestamped output. |
+| `OUT_DIR` paths in generated code | crane builds inside a content-addressed `/build/source`; paths are stable across hosts. |
+| Linker build-id | `RUSTFLAGS=-C link-arg=-Wl,--build-id=none` drops the per-build random ID. |
+| Cargo `--release` profile | `CARGO_PROFILE_RELEASE_STRIP=symbols` strips deterministically inside the derivation. |
+| `tonic_build` / proto generation | `events/proto/*.proto` files included in the source filter; protoc is vendored via `protoc-bin-vendored` so no host protoc dep. |
+
+### Gating policy
+
+The `Nix` workflow is **advisory-only** in v1 — not a required check
+on `master`. After ~10 green PRs the maintainer should promote it
+to required. The `Release` workflow does **not** depend on it; tag-
+time releases continue to ship rustup-stable tarballs and the Nix
+build is a separate verification surface.
+
+### `flake.lock`
+
+The first PR that lands the flake intentionally **does not commit
+`flake.lock`** because the maintainer who lands it does not have Nix
+on their workstation. The CI workflow is gated to `workflow_dispatch`
++ relevant-paths PR triggers; the first run by a Nix-capable
+maintainer (or via `workflow_dispatch` from a CI runner) will
+generate the lock, after which it should be committed and the PR
+description updated. Subsequent PRs run against the committed lock.
+
+Renovate (or a manual cadence) bumps the lock weekly. Bumps that
+change `flake.lock` re-trigger the repro check; if reproducibility
+breaks under a new input revision, the bump is reverted and the
+hazard is investigated.
+
+### What's intentionally not in this flake
+
+- macOS reproducibility (`aarch64-darwin`) — deferred until the
+  repo flips public; macOS builds in the release workflow are
+  also currently disabled for the same reason.
+- musl targets — same `rocksdb-sys + musl` cross-toolchain reason
+  the release workflow defers them.
+- A NixOS module / Home Manager output — packagers should write
+  their own service definitions; the contract this doc describes
+  is the input.
+- A maintainer-owned binary cache (Cachix) — adds a key-custody
+  surface we're not taking on yet. The CI uses the ephemeral
+  `magic-nix-cache` action for speedup only.
 
 Bitcoin Core uses Guix; satd targets Nix as the primary reproducible
 build because the workspace is pure-Cargo and Nix integration is
@@ -359,9 +439,9 @@ details live in [`SECURITY.md`](../SECURITY.md).
   `rocksdb-sys` + musl wants a dedicated cross toolchain and the
   v0.1.0 priority is gnu-linux + macOS, both of which downstream
   package managers handle natively.
-- **Reproducible-build verification** — PR-4 (Nix flake) double-builds
-  on two distinct hosts and asserts byte-identical output.
 - **`cyclonedx`-format SBOM** attached to each release — PR-5.
+- **`Type=notify` systemd unit upgrade** + OpenRC / runit equivalents
+  — PR-6.
 
 ## Stability contract
 
@@ -388,4 +468,4 @@ release notes for the version that ships them.
 
 | Version | Notable changes |
 |---|---|
-| 0.1.0 (current) | Initial PACKAGING.md. Dockerfile + systemd unit shipped. Tag-triggered release workflow on hosted runners produces tarballs (gnu-linux + Apple Silicon) and a multi-arch GHCR image. Signing across all three surfaces (minisign tarballs, cosign keyless image, SSH-signed tags) shipped. Reproducible-build verification and SBOM generation pending. |
+| 0.1.0 (current) | Initial PACKAGING.md. Dockerfile + systemd unit shipped. Tag-triggered release workflow on hosted runners produces tarballs (gnu-linux + Apple Silicon) and a multi-arch GHCR image. Signing across all three surfaces (minisign tarballs, cosign keyless image, SSH-signed tags) shipped. Nix flake (`flake.nix`) shipped for reproducible builds with two-runner CI verification (`x86_64-linux`, `aarch64-linux`); SBOM generation pending. |
