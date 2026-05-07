@@ -88,22 +88,42 @@
           # `.github/workflows/release.yml`. Anything added there must
           # be added here.
           #
-          # `rustPlatform.bindgenHook` is the right surface for the
-          # rocksdb-sys + bindgen + libstdc++ headers triangle.
-          # Pure `clang` + `llvmPackages.libclang.lib` is not enough:
-          # bindgen needs `BINDGEN_EXTRA_CLANG_ARGS` set to point at
-          # the stdenv's C/C++ system include paths, and that's what
-          # the hook does. Without it, bindgen panics with
-          # `libclang error` during the librocksdb-sys build script.
+          # `rustPlatform.bindgenHook` handles libclang + system
+          # include paths for any bindgen-using crate.
           nativeBuildInputs = with pkgs; [
             pkg-config
             cmake
             rustPlatform.bindgenHook
           ];
 
+          # `rocksdb` is here as a system library (with its dev
+          # headers) so librocksdb-sys uses nixpkgs's pre-built
+          # RocksDB instead of its vendored C++ tree. Two reasons:
+          #
+          #   1. Earlier attempts using the vendored RocksDB
+          #      consistently panicked librocksdb-sys's bindgen step
+          #      with "libclang error" — the bindgenHook alone
+          #      wasn't enough to feed libclang the right system
+          #      include paths for the vendored RocksDB's particular
+          #      header set. nixpkgs's pre-built rocksdb dev tree
+          #      ships clean headers that bindgen can parse.
+          #
+          #   2. As a bonus, skipping the vendored C++ build cuts
+          #      ~10 min off the cold compile time and removes the
+          #      `PORTABLE=1` / `ROCKSDB_DISABLE_AVX2=1` knobs as a
+          #      determinism concern (nixpkgs's rocksdb is built
+          #      portably by definition).
+          #
+          # Tradeoff: the rocksdb version under nixpkgs may differ
+          # slightly from the librocksdb-sys-pinned version
+          # (currently 10.4.2). librocksdb-sys uses its own
+          # bindgen-generated bindings either way, so a minor-version
+          # mismatch is fine; a major API change would surface as a
+          # compile error in the bindgen output.
           buildInputs = with pkgs; [
             openssl
             zlib
+            rocksdb
           ];
 
           # Env applied to the dev shell only. Sets LIBCLANG_PATH so
@@ -125,21 +145,16 @@
             LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
           };
 
-          # Env applied only to the build derivation. These are the
-          # determinism knobs; we deliberately don't put them in the
-          # dev shell because a developer running local
-          # `cargo build --release` shouldn't lose debug symbols /
-          # build-id by accident.
+          # Env applied only to the build derivation. We deliberately
+          # don't put determinism knobs in the dev shell because a
+          # developer running local `cargo build --release` shouldn't
+          # lose debug symbols / build-id by accident.
           #
-          #   - ROCKSDB_DISABLE_AVX2 / PORTABLE  RocksDB's vendored
-          #                     build defaults to `-march=native`
-          #                     when PORTABLE is unset; that breaks
-          #                     repro across runners with different
-          #                     ISA caps. The release-workflow
-          #                     tarball already does not use
-          #                     -march=native (default rustup-stable
-          #                     produces generic x86_64-v1), so this
-          #                     matches that behaviour.
+          #   - ROCKSDB_LIB_DIR / ROCKSDB_INCLUDE_DIR  point
+          #                     librocksdb-sys at nixpkgs's
+          #                     pre-built rocksdb (see buildInputs
+          #                     comment). Skips the vendored C++
+          #                     build entirely.
           #
           #   - SOURCE_DATE_EPOCH   pinned to the flake's
           #                     `lastModifiedDate` so any build
@@ -151,8 +166,8 @@
           #                     symbols + linker build-id for a
           #                     deterministic ELF.
           buildEnv = {
-            ROCKSDB_DISABLE_AVX2 = "1";
-            PORTABLE = "1";
+            ROCKSDB_LIB_DIR = "${pkgs.rocksdb}/lib";
+            ROCKSDB_INCLUDE_DIR = "${pkgs.rocksdb}/include";
             SOURCE_DATE_EPOCH = toString (self.lastModifiedDate or 1);
             CARGO_PROFILE_RELEASE_STRIP = "symbols";
             RUSTFLAGS = "-C link-arg=-Wl,--build-id=none";

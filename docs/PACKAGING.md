@@ -307,8 +307,8 @@ single source of truth — both rustup and the flake read it.
 
 | Hazard | How the flake handles it |
 |---|---|
-| `rocksdb-sys` bindgen output | `LIBCLANG_PATH` set to the pinned libclang; bindgen output is deterministic for a fixed libclang version. |
-| RocksDB vendored C++ build | `PORTABLE=1` + `ROCKSDB_DISABLE_AVX2=1` so the build doesn't tune for the runner's CPU; matches what the release-tarball workflow already produces (rustup-stable defaults to generic x86_64-v1). |
+| `rocksdb-sys` bindgen output | `rustPlatform.bindgenHook` sets up libclang + the stdenv's system include paths so bindgen's translation-unit parse is reproducible. Output is deterministic for a fixed libclang version. |
+| RocksDB native code | We use **nixpkgs's pre-built `rocksdb`** (via `ROCKSDB_LIB_DIR` / `ROCKSDB_INCLUDE_DIR`) rather than the librocksdb-sys-vendored C++ tree. nixpkgs builds rocksdb portably (no `-march=native`), so cross-runner CPU variance is a non-issue. The tradeoff is a minor version mismatch between librocksdb-sys's pinned 10.4.2 and whatever nixpkgs ships (regenerated bindings either way; major API drift would surface as a compile error). |
 | `cc-rs` C/C++ compiles (secp256k1, bitcoinconsensus) | Compiler version pinned via nixpkgs; `SOURCE_DATE_EPOCH` respected by cc-rs for any timestamped output. |
 | `OUT_DIR` paths in generated code | crane builds inside a content-addressed `/build/source`; paths are stable across hosts. |
 | Linker build-id | `RUSTFLAGS=-C link-arg=-Wl,--build-id=none` drops the per-build random ID. |
