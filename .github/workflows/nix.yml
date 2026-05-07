@@ -86,14 +86,7 @@ jobs:
 
       - name: Smoke-test built binaries
         run: |
-          set -euo pipefail
-          # Both binaries should exist as valid ELFs. We don't run
-          # `--version` because satd's clap setup treats `--version`
-          # as a missing-subcommand and exits non-zero (sat-cli works
-          # fine; satd doesn't). Build success + a successful ldd
-          # is sufficient sanity for CI.
-          file ./result/bin/satd ./result/bin/sat-cli
-          ldd  ./result/bin/satd | head
+          ./result/bin/satd --version
           ./result/bin/sat-cli --version
 
       - name: Hash output binaries
