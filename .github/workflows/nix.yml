@@ -77,6 +77,23 @@ jobs:
       - name: Confirm flake evaluates
         run: nix flake show --no-write-lock-file
 
+      - name: Print derivation env (debug)
+        run: |
+          # Show what env vars / nativeBuildInputs / buildInputs the
+          # satd derivation actually sees. Useful when the build
+          # fails inside a build-script (e.g. bindgen) and we need
+          # to confirm LIBCLANG_PATH / BINDGEN_EXTRA_CLANG_ARGS are
+          # plumbed correctly.
+          nix derivation show .#satd \
+            --no-write-lock-file \
+          | jq -r '
+              to_entries[]
+              | .value.env
+              | to_entries[]
+              | select(.key | test("^(LIBCLANG_PATH|BINDGEN|ROCKSDB|RUSTFLAGS|SOURCE_DATE_EPOCH|CARGO_PROFILE)"))
+              | "\(.key)=\(.value)"
+            '
+
       - name: Build satd
         run: |
           nix build .#satd \

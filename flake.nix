@@ -88,12 +88,18 @@
           # `.github/workflows/release.yml`. Anything added there must
           # be added here.
           #
-          # `rustPlatform.bindgenHook` handles libclang + system
-          # include paths for any bindgen-using crate.
+          # `rustPlatform.bindgenHook` was tried first (it's the
+          # idiomatic surface) but didn't actually export
+          # BINDGEN_EXTRA_CLANG_ARGS into crane's deps-build phase
+          # — likely because the hook's `addEnvHooks` mechanism
+          # depends on the C compiler stdenv being applied at a
+          # phase crane reorders. Dropping back to explicit
+          # nativeBuildInputs + env vars set on the derivation is
+          # less elegant but actually works.
           nativeBuildInputs = with pkgs; [
             pkg-config
             cmake
-            rustPlatform.bindgenHook
+            llvmPackages.clang  # `clang` binary on PATH for clang-sys
           ];
 
           # `rocksdb` is here as a system library (with its dev
@@ -124,6 +130,7 @@
             openssl
             zlib
             rocksdb
+            llvmPackages.libclang  # libclang.so for bindgen via clang-sys
           ];
 
           # Env applied to the dev shell only. Sets LIBCLANG_PATH so
@@ -150,6 +157,13 @@
           # developer running local `cargo build --release` shouldn't
           # lose debug symbols / build-id by accident.
           #
+          #   - LIBCLANG_PATH / BINDGEN_EXTRA_CLANG_ARGS  bindgen
+          #                     uses clang-sys to load libclang.so
+          #                     and pass `-isystem` paths to libclang
+          #                     for header parsing. Both must be set
+          #                     for librocksdb-sys's bindgen step to
+          #                     succeed.
+          #
           #   - ROCKSDB_LIB_DIR / ROCKSDB_INCLUDE_DIR  point
           #                     librocksdb-sys at nixpkgs's
           #                     pre-built rocksdb (see buildInputs
@@ -166,6 +180,10 @@
           #                     symbols + linker build-id for a
           #                     deterministic ELF.
           buildEnv = {
+            LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+            BINDGEN_EXTRA_CLANG_ARGS =
+              "-isystem ${pkgs.llvmPackages.libclang.lib}/lib/clang/${pkgs.lib.versions.major pkgs.llvmPackages.libclang.version}/include "
+              + "-isystem ${pkgs.glibc.dev}/include";
             ROCKSDB_LIB_DIR = "${pkgs.rocksdb}/lib";
             ROCKSDB_INCLUDE_DIR = "${pkgs.rocksdb}/include";
             SOURCE_DATE_EPOCH = toString (self.lastModifiedDate or 1);
