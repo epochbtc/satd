@@ -317,24 +317,29 @@ single source of truth — both rustup and the flake read it.
 
 ### Gating policy
 
-The `Nix` workflow runs on **tag pushes (`v*`)** and **`workflow_dispatch`**
-only — same trigger model as `Release`, for the same cost-conservation
-reason (PR-trigger on every Cargo.lock edit is too expensive on the
-current Team plan). The two workflows fire in parallel at tag-cut time
-and don't gate each other; a Nix-side failure means the released
-tarball can't claim Nix-rebuilt provenance for that tag and should be
+The `Nix` workflow runs on **tag pushes (`v*`)**, **`workflow_dispatch`**,
+and **PRs that change flake-specific files** (the flake itself,
+`rust-toolchain.toml`, the workflow, the repro helper under
+`contrib/repro/`). It deliberately does **not** trigger on
+`Cargo.lock` / `Cargo.toml` edits — every dependency bump touches
+those and burns hosted-runner minutes for low-signal runs.
+
+The Nix and Release workflows fire in parallel at tag-cut time and
+don't gate each other; a Nix-side failure means the released tarball
+can't claim Nix-rebuilt provenance for that tag and should be
 fix-forwarded.
 
-Reconsider both the trigger scope and a hard `Release`-gates-on-Nix
-dependency once the repo flips public (Actions minutes free).
+Reconsider both the trigger scope (broader PR-trigger) and a hard
+`Release`-gates-on-Nix dependency once the repo flips public (Actions
+minutes free).
 
 ### `flake.lock`
 
 The first PR that lands the flake intentionally **does not commit
 `flake.lock`** because the maintainer who lands it does not have Nix
 on their workstation. The CI workflow is gated to `workflow_dispatch`
-+ tag pushes; the first `workflow_dispatch` run by a Nix-capable
-maintainer (or from a CI runner) will
++ flake-touching PRs + tag pushes; the first `workflow_dispatch` run
+by a Nix-capable maintainer (or from a CI runner) will
 generate the lock, after which it should be committed and the PR
 description updated. Subsequent PRs run against the committed lock.
 

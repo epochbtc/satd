@@ -8,24 +8,19 @@
 #     the released tarball cannot claim Nix-rebuilt provenance for
 #     that tag, which the maintainer should fix-forward in a follow-
 #     up tag.
-#   - `workflow_dispatch` for ad-hoc runs (lock generation, debugging
-#     a flake change before tagging).
-#
-# What's NOT here, and why:
-#   - PR-trigger on flake-/lock-touching PRs. Considered, dropped to
-#     match `release.yml`'s post-PR-#140 cost stance: hosted-runner
-#     minutes are scarce, so the PR check that *might* catch a flake
-#     regression isn't worth the rate at which it fires (every
-#     dependency bump touches Cargo.lock). A flake regression now
-#     first manifests at tag time, alongside any release.yml
-#     regression — same trade `release.yml` already makes for
-#     Dockerfile / Cargo-lock breakage.
+#   - PRs that change flake-specific files (the flake itself, the
+#     toolchain pin, this workflow, the repro helper). Deliberately
+#     NOT triggered on `Cargo.lock` / `Cargo.toml` edits because
+#     every dep bump touches those and burns hosted-runner minutes
+#     for low-signal runs. A regression introduced via a Cargo edit
+#     surfaces at tag time, same as `release.yml`'s post-#140 stance.
+#   - `workflow_dispatch` for ad-hoc runs.
 #
 # Deliberately NOT wired into release.yml. The tag push fires both
 # workflows in parallel; they don't gate each other. Reconsider
 # once the repo flips to public (Actions minutes free for public
-# repos) — at that point both PR-trigger and a hard gate on the
-# Nix repro check become reasonable.
+# repos) — at that point both broader PR-trigger and a hard gate
+# on the Nix repro check become reasonable.
 #
 # flake.lock note: this PR ships `flake.nix` without a committed
 # `flake.lock`. The first `workflow_dispatch` run from a maintainer
@@ -38,6 +33,13 @@ on:
   push:
     tags:
       - 'v*'
+  pull_request:
+    paths:
+      - 'flake.nix'
+      - 'flake.lock'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/nix.yml'
+      - 'contrib/repro/**'
   workflow_dispatch:
 
 permissions:
