@@ -13,13 +13,11 @@ direction for packaging is in [`ECOSYSTEM.md`](../ECOSYSTEM.md) §2.
 ## Document status
 
 This is **PACKAGING.md v1**. It covers what shipped today: the
-container, systemd unit, on-disk layout, operational surface, release
+container, `Type=notify` systemd unit (with EXTEND_TIMEOUT_USEC
+heartbeats so reindex doesn't fight the start timeout), OpenRC and
+runit unit equivalents, on-disk layout, operational surface, release
 pipeline, signing across all three surfaces, reproducible build via
 Nix, CycloneDX SBOMs per binary, and a `cargo-deny` supply-chain gate.
-Sections marked **(future)** describe contracts that future PRs will
-fulfil — `Type=notify` systemd, OpenRC / runit equivalents. They are
-listed here so packagers can see the full intended shape and plan
-against it.
 
 Updated: 2026-05-07.
 
@@ -235,11 +233,121 @@ ReadWritePaths=
 ReadWritePaths=/srv/bitcoin
 ```
 
-The unit is currently `Type=simple`; it will move to `Type=notify`
-once `sd_notify(READY=1)` lands. See
-`contrib/systemd/README.md` for context.
+The unit is `Type=notify`. satd calls `sd_notify(READY=1)` after every
+listener (RPC, P2P, optional Esplora / Electrum / MCP / events
+surfaces) is bound, so dependent units (Tor onion services pointing
+at the RPC port, watchtower processes, monitoring agents) start at
+the right moment instead of racing the bind sequence.
 
-OpenRC and runit equivalents will land in a follow-up PR.
+### Reindex resilience
+
+`--reindex-chainstate` on a fully-synced mainnet node runs for hours.
+satd handles this without help from the operator:
+
+- `TimeoutStartSec=infinity` in the unit removes the static budget
+  that would otherwise SIGKILL the unit at 90s.
+- Every 30s during the pre-bind phase, satd emits
+  `sd_notify(EXTEND_TIMEOUT_USEC=120000000, STATUS=...)`. The
+  `EXTEND_TIMEOUT_USEC` resets systemd's internal kill-deadline; the
+  `STATUS` line shows live phase + progress in `systemctl status satd`.
+- The heartbeat IS the liveness check. If satd goes silent for >120s
+  (genuinely stuck, not just slow), systemd kills the unit and the
+  on-failure restart loop kicks in.
+
+```sh
+$ systemctl status satd
+● satd.service — Bitcoin full node
+     Loaded: loaded (/etc/systemd/system/satd.service; enabled)
+     Active: activating (start) since Wed 2026-05-07 18:44:19 UTC
+     Status: "Replaying blocks (350000/800000, 43%)"
+   Main PID: 12345 (satd)
+```
+
+This is identical behaviour to Bitcoin Core's bitcoind.service since
+v22.
+
+### Running multiple networks side by side
+
+Until a `satd@.service` template unit lands, operators who need
+`signet`, `regtest`, and mainnet on the same host can copy the unit
+under different names with per-instance drop-ins:
+
+```sh
+# Mainnet — the default unit installed above (satd.service).
+
+# Signet on the same host:
+sudo cp contrib/systemd/satd.service \
+        /etc/systemd/system/satd-signet.service
+
+# /etc/systemd/system/satd-signet.service.d/instance.conf
+sudo install -Dm644 /dev/stdin \
+        /etc/systemd/system/satd-signet.service.d/instance.conf <<'EOF'
+[Service]
+ExecStart=
+ExecStart=/usr/local/bin/satd --signet --datadir=/var/lib/satd-signet
+StateDirectory=
+StateDirectory=satd-signet
+ReadWritePaths=
+ReadWritePaths=/var/lib/satd-signet
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now satd-signet
+```
+
+Same pattern for `--regtest`. Each instance gets its own datadir, its
+own `satd-<network>` user (or share the `satd` user — your call), and
+its own RPC port (set via `--rpcport=<n>` in the drop-in).
+
+A native `satd@.service` template unit (`systemctl start satd@signet`)
+is a candidate for v0.1.x once we have signal that the drop-in pattern
+isn't enough.
+
+## OpenRC
+
+Alpine, Gentoo (with the `openrc` profile), Artix, and other distros
+that use OpenRC. The repository ships `contrib/openrc/init.d/satd`.
+
+```sh
+sudo install -Dm755 contrib/openrc/init.d/satd /etc/init.d/satd
+sudo install -Dm755 target/release/satd /usr/local/bin/satd
+sudo install -Dm755 target/release/sat-cli /usr/local/bin/sat-cli
+sudo adduser -S -H -h /var/lib/satd -s /sbin/nologin satd
+sudo install -d -m 0750 -o satd -g satd /var/lib/satd
+sudo rc-update add satd default
+sudo rc-service satd start
+```
+
+OpenRC has no notify protocol — it considers the service "started"
+once the daemon backgrounds via `start-stop-daemon`. That means
+reindex doesn't fight any startup timeout the way it does on systemd;
+the unit is just `running` for the entire reindex.
+
+Per-instance config can be set via `/etc/conf.d/satd`:
+
+```sh
+# /etc/conf.d/satd
+satd_args="--prune=550 --txindex=0"
+```
+
+## runit
+
+Void Linux, Artix-runit, and any s6-rc-compatible setup. The
+repository ships `contrib/runit/satd/run` and a log helper at
+`contrib/runit/satd/log/run`.
+
+```sh
+sudo install -Dm755 contrib/runit/satd/run     /etc/sv/satd/run
+sudo install -Dm755 contrib/runit/satd/log/run /etc/sv/satd/log/run
+sudo install -Dm755 target/release/satd        /usr/local/bin/satd
+sudo install -Dm755 target/release/sat-cli     /usr/local/bin/sat-cli
+sudo useradd --system --home /var/lib/satd --shell /sbin/nologin satd
+sudo install -d -m 0750 -o satd -g satd /var/lib/satd
+sudo ln -s /etc/sv/satd /var/service/satd
+```
+
+runit supervises foreground processes; no daemonization, no readiness
+gate, no timeouts to fight with. Reindex runs as long as it needs to.
 
 ## Resource budget
 
@@ -512,8 +620,10 @@ The policy runs as a hard gate in two places:
   `rocksdb-sys` + musl wants a dedicated cross toolchain and the
   v0.1.0 priority is gnu-linux + macOS, both of which downstream
   package managers handle natively.
-- **`Type=notify` systemd unit upgrade** + OpenRC / runit equivalents
-  — PR-6.
+- **Runtime watchdog** (`WatchdogSec=` in the systemd unit, paired
+  with `sd_notify(WATCHDOG=1)` from satd's main event loop). The
+  PR-6 plumbing covers startup; runtime liveness needs explicit
+  per-subsystem health criteria and is deferred to a v0.1.x follow-up.
 
 ## Stability contract
 
@@ -540,4 +650,4 @@ release notes for the version that ships them.
 
 | Version | Notable changes |
 |---|---|
-| 0.1.0 (current) | Initial PACKAGING.md. Dockerfile + systemd unit shipped. Tag-triggered release workflow on hosted runners produces tarballs (gnu-linux + Apple Silicon) and a multi-arch GHCR image. Signing across all three surfaces (minisign tarballs, cosign keyless image, SSH-signed tags) shipped. Nix flake (`flake.nix`) shipped for reproducible builds with two-runner CI verification (`x86_64-linux`, `aarch64-linux`). CycloneDX 1.5 SBOMs per binary + `cargo-deny` supply-chain gate (PR-time on dep-graph PRs, hard gate at tag time) shipped. |
+| 0.1.0 (current) | Initial PACKAGING.md. Dockerfile + systemd unit shipped. Tag-triggered release workflow on hosted runners produces tarballs (gnu-linux + Apple Silicon) and a multi-arch GHCR image. Signing across all three surfaces (minisign tarballs, cosign keyless image, SSH-signed tags) shipped. Nix flake (`flake.nix`) shipped for reproducible builds with two-runner CI verification (`x86_64-linux`, `aarch64-linux`). CycloneDX 1.5 SBOMs per binary + `cargo-deny` supply-chain gate (PR-time on dep-graph PRs, hard gate at tag time) shipped. systemd unit upgraded to `Type=notify` with sd_notify heartbeats so `--reindex-chainstate` doesn't fight `TimeoutStartSec`; OpenRC and runit unit equivalents shipped. |
