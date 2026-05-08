@@ -83,6 +83,37 @@ are not required to. Verification details are in `SECURITY.md`.
 - Consensus-adjacent changes — extend the shadow-verifier coverage if
   applicable; mismatches must produce a structured `ShadowMismatch`.
 
+## AI-assisted contributions
+
+AI-assisted contributions are welcome. The bar is the same as any other
+contribution: the engineering has to be solid, the diff has to be one
+you've read and understood, and you take responsibility for what you
+submit. We don't require disclosure that an AI tool was used.
+
+What we do expect:
+
+- **Run the local checks on your own machine.** Don't trust an AI tool's
+  claim that `cargo test` passes — run it. AI tools routinely hallucinate
+  clean output, and "it compiled in the AI's head" is not the same as
+  "it compiles."
+- **Read the diff line by line before pushing.** Watch for: invented APIs
+  (functions, methods, or crate features that don't exist), stubs the AI
+  left behind from its own planning, tests that exercise the wrong path
+  or assert against constants the implementation just produced, `unwrap`
+  / `expect` sneaked into non-test code, drive-by reformatting of
+  unrelated lines.
+- **Submit changes you could have written or debugged unaided.** If you
+  can't reason about why the diff is correct, you can't defend it in
+  review and you can't maintain it after merge. Smaller PRs you fully
+  understand beat sprawling PRs you don't.
+- **The PR description states what the change does and how you verified
+  it.** Reviewers will close PRs that read as unreviewed AI output.
+
+Subsystems with sharper edges (consensus / verifier / connect-block,
+RocksDB schema, P2P state machine, sighash and signature-verification
+code) are the wrong place to learn — please get familiar with the
+surrounding code before asking an AI to edit it.
+
 ## What not to send
 
 - PRs that add features without an accompanying integration test.
