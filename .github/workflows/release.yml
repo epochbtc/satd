@@ -103,6 +103,11 @@ jobs:
           # that member's directory. We want the binaries' SBOMs only —
           # collect satd.cdx.json + sat-cli.cdx.json, version-suffix the
           # filenames, drop the rest.
+          #
+          # CycloneDX 1.5 is the current widely-tooled spec version. 1.6
+          # is the latest but adds only minor enrichment (e.g. licensing
+          # disjunctions); pinning 1.5 maximizes consumer compatibility
+          # for downstream packagers (Start9, Umbrel, distro tooling).
           cargo cyclonedx --format json --spec-version 1.5 --all-features
           mkdir sbom
           v="${{ steps.version.outputs.version }}"
@@ -113,6 +118,26 @@ jobs:
             sha256sum "$f" > "${f}.sha256"
           done
           ls -la
+
+      # Defensive sanity gate before upload: confirm the SBOMs are
+      # parseable JSON and carry a non-empty components list. Catches a
+      # cargo-cyclonedx upgrade that silently changes output shape, or a
+      # zero-byte file from an upstream tool failure that didn't trip a
+      # non-zero exit code. Cheap (jq is preinstalled on hosted runners)
+      # and avoids shipping a corrupt artifact in a release.
+      - name: Verify SBOM well-formedness
+        run: |
+          set -euo pipefail
+          v="${{ steps.version.outputs.version }}"
+          for f in sbom/satd-v${v}.cdx.json sbom/sat-cli-v${v}.cdx.json; do
+            jq empty "$f"
+            n=$(jq '.components | length' "$f")
+            if [[ "$n" -lt 10 ]]; then
+              echo "SBOM $f has only $n components — refusing to ship" >&2
+              exit 1
+            fi
+            echo "ok: $f ($n components)"
+          done
 
       - name: Upload SBOM artifact
         uses: actions/upload-artifact@v4

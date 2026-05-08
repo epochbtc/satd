@@ -468,8 +468,16 @@ jq -r '.components[] | "\(.name) \(.version) \(.licenses[0].license.id // .licen
 The SBOM is generated from the same `Cargo.lock` that produced the
 released binary; the `cargo cyclonedx` invocation lives in the `sbom`
 job in `.github/workflows/release.yml`. The dep graph is identical
-across release targets, so a single SBOM per binary covers all
-tarballs.
+across the gnu-linux release targets currently shipped
+(`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`), so a
+single SBOM per binary covers both tarballs.
+
+If a future release adds musl or macOS targets — which can resolve
+different platform-specific deps (e.g. `libc` shim crates,
+`security-framework` on darwin) — the workflow will need to emit a
+per-target SBOM and the artifact filenames will gain a target-triple
+suffix. Track this when re-enabling the deferred targets in the
+release matrix.
 
 ### Supply-chain policy
 
