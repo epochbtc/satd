@@ -135,7 +135,7 @@ docs/                         API + integration docs
 | `STABILITY_POLICY.md` | Tiered stability contract; deprecation policy; canary CI. |
 | `ECOSYSTEM.md` | Mobile / packaging strategy; why native + shared chainstate. |
 | `docs/PACKAGING.md` | Authoritative reference for downstream packagers. |
-| `docs/TUI.md` | `sat-tui` reference: views, panels, fields, keybindings. |
+| `docs/TUI.md` | `sat-tui` reference: views, panels, every field, keybindings. |
 | `docs/api/esplora.md` | Esplora REST endpoint reference + wire-shape gotchas. |
 
 ## License
