@@ -681,6 +681,10 @@ impl BackfillRunner {
 /// `backfillindex` RPC handler so a failure surfaces to the caller
 /// rather than getting buried in a runner log.
 pub fn preflight_disk(chain: &ChainState) -> Result<(), BackfillError> {
+    let required = preflight_required_bytes();
+    if required == 0 {
+        return Ok(());
+    }
     let datadir = chain.blocks_dir();
     let have = match free_disk_bytes(datadir) {
         Some(b) => b,
@@ -691,13 +695,26 @@ pub fn preflight_disk(chain: &ChainState) -> Result<(), BackfillError> {
             return Ok(());
         }
     };
-    if have < PREFLIGHT_REQUIRED_FREE_BYTES {
+    if have < required {
         return Err(BackfillError::InsufficientDisk {
             have,
-            need: PREFLIGHT_REQUIRED_FREE_BYTES,
+            need: required,
         });
     }
     Ok(())
+}
+
+/// Test/CI knob: `SATD_BACKFILL_PREFLIGHT_BYTES` overrides the default
+/// 80 GB headroom. Set to `0` to disable the check entirely. Used by
+/// the regtest suite — regtest chains are tiny (KB to MB) and the
+/// mainnet-class threshold blocks every backfill test on a runner with
+/// less than 80 GB free. Production never sets this; the default is
+/// unchanged.
+fn preflight_required_bytes() -> u64 {
+    std::env::var("SATD_BACKFILL_PREFLIGHT_BYTES")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(PREFLIGHT_REQUIRED_FREE_BYTES)
 }
 
 /// Test/operations debug knob: per-block sleep injected between

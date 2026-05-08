@@ -1,5 +1,10 @@
 name: CI
 
+# PR-triggered build + test + lint. Runs on GitHub-hosted runners so that
+# untrusted fork PRs cannot execute arbitrary code on a maintainer-owned
+# self-hosted machine. Tag-cut release builds live in `release.yml` (also
+# hosted); reproducible-build verification lives in `nix.yml`.
+
 on:
   push:
     branches:
@@ -7,19 +12,59 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
 
-env:
-  LIBCLANG_PATH: /home/bk/.local/lib
+# Cancel superseded runs on the same PR. Avoids burning hosted-runner
+# minutes on stale commits when a contributor pushes rapid fixups.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
 
   test:
     name: "Tests"
-    runs-on: self-hosted
+    runs-on: ubuntu-24.04
     if: github.event_name == 'pull_request'
 
     steps:
       - name: Checkout sources
         uses: actions/checkout@v4
+
+      # Hosted ubuntu-24.04 ships ~30 GB of pre-installed SDKs we don't
+      # use (Android, .NET, Haskell, CodeQL). The workspace target/
+      # directory plus cargo registry routinely exceed the remaining
+      # ~14 GB of free disk and SIGBUS the linker mid-link of debug-mode
+      # test binaries. Reclaim ~20 GB before the build.
+      - name: Free disk space
+        run: |
+          set -euo pipefail
+          df -h /
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /opt/hostedtoolcache/PyPy
+          sudo rm -rf /opt/hostedtoolcache/Ruby
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+
+      # rocksdb-sys needs libclang (bindgen headers) and the rocksdb
+      # native build wants cmake. Hosted ubuntu-24.04 ships clang +
+      # cmake binaries but NOT libclang-dev — install explicitly.
+      # libssl-dev is needed by the openssl-sys path in reqwest's
+      # native-tls backend.
+      - name: Install Linux build deps
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang \
+            cmake \
+            libclang-dev \
+            libssl-dev \
+            pkg-config
 
       - name: Set up Rust toolchain
         uses: actions-rs/toolchain@v1
@@ -45,7 +90,7 @@ jobs:
       - name: Run tests
         # Cap test parallelism. The default (one thread per CPU) lets the
         # regtest harness spin up 8+ satd processes simultaneously, each
-        # opening RocksDB; on the self-hosted runner that contention has
+        # opening RocksDB; on a 4-vCPU hosted runner that contention has
         # repeatedly tripped the per-test startup watchdog under load.
         # Four parallel workers keeps wall-clock reasonable while leaving
         # the runner enough headroom to bind RPC/P2P listeners promptly.
@@ -53,25 +98,45 @@ jobs:
         # SATD_TEST_TIMEOUT_MULT=2 doubles the regtest harness's startup
         # and inter-node-sync deadlines (see `test_timeout` in regtest.rs).
         # Local dev keeps the 1.0 default; CI absorbs the runner's worst-
-        # case load (mainnet satd + cron jobs sharing the box) without
-        # masking real regressions in per-RPC timeouts.
+        # case load without masking real regressions in per-RPC timeouts.
+        #
+        # `--all-targets` is intentionally NOT passed here. It would pull
+        # in the bench targets (criterion + pprof + inferno across the
+        # consensus crate) and example targets, which together more than
+        # double the link surface and SIGBUS the linker on the
+        # 14 GB hosted-runner SSD. Bench / example compilation is
+        # validated by the Lint job's clippy run, which type-checks but
+        # doesn't link.
         env:
           RUST_TEST_THREADS: "4"
           SATD_TEST_TIMEOUT_MULT: "2"
-        run: cargo test --all --locked --all-targets
-
-      - name: Clean build artifacts
-        if: always()
-        run: cargo clean
+          # Disable the 80 GB free-disk pre-flight on the address-index
+          # backfill RPC. The threshold is sized for mainnet (~56 GB
+          # peak temp CF + headroom); regtest chains here are KB to MB
+          # and a hosted runner has ~14 GB free, so the production
+          # default rejects every backfill test.
+          SATD_BACKFILL_PREFLIGHT_BYTES: "0"
+        run: cargo test --all --locked
 
   lint:
     name: "Lint"
-    runs-on: self-hosted
+    runs-on: ubuntu-24.04
     if: github.event_name == 'pull_request'
 
     steps:
       - name: Checkout sources
         uses: actions/checkout@v4
+
+      - name: Install Linux build deps
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang \
+            cmake \
+            libclang-dev \
+            libssl-dev \
+            pkg-config
 
       - name: Set up Rust toolchain
         uses: actions-rs/toolchain@v1
@@ -93,7 +158,3 @@ jobs:
 
       - name: Run clippy (deny warnings)
         run: cargo clippy --all-targets --all-features -- -D warnings
-
-      - name: Clean build artifacts
-        if: always()
-        run: cargo clean
