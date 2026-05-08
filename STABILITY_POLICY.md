@@ -2,7 +2,10 @@
 
 This document defines satd's stability contract with integrators — BTCPayServer, NBXplorer, Umbrel, Start9, Sparrow, Electrum-personality clients, Fulcrum-personality clients, block explorers, any BDK-based wallet pointed at our APIs. It governs when we can change what, how removals are staged, and what invariants we hold across upgrades.
 
-Every rule here is grounded in an observed incident from Bitcoin Core's 2025–2026 release cycle. Each rule is annotated with the specific scar it answers. This is not an aspirational ethics statement; it is a binding policy on satd releases.
+### Pre-1.0 (`0.x`) Application
+While `satd` is in its `0.x` pre-1.0 phase, we strive to follow these rules to the greatest extent possible. However, to maintain development velocity, we reserve the right to accelerate deprecations (e.g., removing a surface in a subsequent `0.x` release rather than waiting 4 full releases). We will, however, always endeavor to provide clean migration paths and adhere to the state-management invariants described below. Once `1.0` is reached, the full deprecation cycles will be strictly enforced.
+
+Every rule here is grounded in real-world observations from Bitcoin ecosystem release cycles. Each rule is annotated with the specific historical context it addresses. This is a binding policy on satd releases.
 
 ---
 
@@ -54,15 +57,15 @@ satd does not implement Bitcoin Core's legacy wallet. Core's v30 removal of `add
 
 **Resurrection flag required.** Every Tier 1 removal ships with a `-deprecatedrpc=<name>` / `-legacy-<flag>` escape hatch that survives at least two major releases past the removal. The flag is announced in release notes and `--help`.
 
-> *Scar:* Core v31 (2026-04-19) removed `settxfee` / `-paytxfee` with no escape hatch, but granted one to `startingheight`. Inconsistent resurrection policy is worse than a uniform one — infra maintainers can't predict what they'll have to rewrite.
+> *Historical Context:* Core v31 (2026-04-19) removed `settxfee` / `-paytxfee` with no escape hatch, but granted one to `startingheight`. Inconsistent resurrection policy is worse than a uniform one — infra maintainers can't predict what they'll have to rewrite.
 
 **Removal budget:** no more than two Tier 1 removals per major release, and never two from the same subsystem in the same release.
 
-> *Scar:* Core v30 (2025-10) removed 11 legacy wallet RPCs in a single release. BTCPay still carries a bash-paste workaround layer in `dockerfile-deps/Bitcoin/*/docker-entrypoint.sh` because the cohort was too large to absorb in one upgrade cycle.
+> *Historical Context:* Core v30 (2025-10) removed 11 legacy wallet RPCs in a single release. BTCPay still carries a bash-paste workaround layer in `dockerfile-deps/Bitcoin/*/docker-entrypoint.sh` because the cohort was too large to absorb in one upgrade cycle.
 
 **Deprecation ≠ scheduled removal.** Marking something deprecated means "discouraged for new code," not "will be deleted in N+2." Deletion requires a separate, deliberate proposal with a demonstrated migration story covering at least BTCPayServer, Umbrel, and Start9 integrations.
 
-> *Scar:* Nicolas Dorier's 2019 argument in [bitcoin/bitcoin#16725](https://github.com/bitcoin/bitcoin/pull/16725) — the automatic-removal-after-deprecation habit silently breaks explorers and downstream signers that were never on anyone's radar when the deprecation was agreed.
+> *Historical Context:* Nicolas Dorier's 2019 argument in [bitcoin/bitcoin#16725](https://github.com/bitcoin/bitcoin/pull/16725) — the automatic-removal-after-deprecation habit silently breaks explorers and downstream signers that were never on anyone's radar when the deprecation was agreed.
 
 ---
 
@@ -78,7 +81,7 @@ If vN+1 requires format X and vN produced format Y, satd reads Y on startup, pro
 
 A new `require()` that rejects previously-valid data counts as a break. It triggers the same deprecation cycle and the same migration obligation as a format change.
 
-> *Scar:* Core v31's `"Wallet name cannot be empty"` change — a pure validation addition that invalidates the empty-named default wallet Core itself had shipped for years. Dorier's 2026-04-21 X thread (3:54 AM, 21.9K views) documents the 200-line bash workaround it cost BTCPay. No bytes on disk changed; the impact was identical to a format change.
+> *Historical Context:* Core v31's `"Wallet name cannot be empty"` change — a pure validation addition that invalidates the empty-named default wallet Core itself had shipped for years. Dorier's 2026-04-21 X thread (3:54 AM, 21.9K views) documents the 200-line bash workaround it cost BTCPay. No bytes on disk changed; the impact was identical to a format change.
 
 ### 3. Do not break your own historical defaults.
 
@@ -96,7 +99,7 @@ Migrations may create new files, rename old ones, or abort. They may **never** c
 - Provide a `--dry-run` mode that prints the exact rename / create plan.
 - Be covered by a fuzzing job over representative directory layouts.
 
-> *Scar:* Core 30.0/30.1's `migratewallet` under `-walletdir` + pruning deleted the entire wallet directory in an error path. Binaries were pulled from bitcoincore.org on [2026-01-05](https://bitcoincore.org/en/2026/01/05/wallet-migration-bug/); fix shipped in 30.2 on 2026-01-10. Root cause: a delete in an error branch, with no move-aside discipline and no pre-migration backup.
+> *Historical Context:* Core 30.0/30.1's `migratewallet` under `-walletdir` + pruning deleted the entire wallet directory in an error path. Binaries were pulled from bitcoincore.org on [2026-01-05](https://bitcoincore.org/en/2026/01/05/wallet-migration-bug/); fix shipped in 30.2 on 2026-01-10. Root cause: a delete in an error branch, with no move-aside discipline and no pre-migration backup.
 
 ---
 
@@ -114,7 +117,7 @@ Mandatory canaries:
 
 The canary is not advisory. A failing canary blocks the RC until either the downstream is patched with our active support, or the breaking change is reverted. The canary matrix is versioned and its failures are archived with each RC.
 
-> *Scar:* Core runs no such job. This is the single largest reason infra maintainers learn about breakages from user bug reports rather than from release notes. It is also the cheapest structural fix any node project can adopt.
+> *Historical Context:* Core runs no such job. This is the single largest reason infra maintainers learn about breakages from user bug reports rather than from release notes. It is also the cheapest structural fix any node project can adopt.
 
 ---
 
@@ -127,7 +130,7 @@ One satd maintainer holds the explicit role of **infra liaison** per release cyc
 - Is named in the release notes for each cycle.
 - Rotates annually among the core maintainers.
 
-> *Scar:* [bitcoin/bitcoin#35055](https://github.com/bitcoin/bitcoin/issues/35055) (Vinnie Falco's governance brief, 2026-04-11) documents Core's merge authority concentrating ~65% on one maintainer in 2025–2026. No one structurally owned infra-maintainer impact. We don't replicate that.
+> *Historical Context:* In large open-source projects, merge authority can sometimes concentrate without a dedicated advocate for downstream infrastructure maintainers. We establish this role to explicitly own infra-maintainer impact.
 
 ---
 
