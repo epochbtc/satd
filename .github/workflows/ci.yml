@@ -81,10 +81,18 @@ jobs:
         # and inter-node-sync deadlines (see `test_timeout` in regtest.rs).
         # Local dev keeps the 1.0 default; CI absorbs the runner's worst-
         # case load without masking real regressions in per-RPC timeouts.
+        #
+        # `--all-targets` is intentionally NOT passed here. It would pull
+        # in the bench targets (criterion + pprof + inferno across the
+        # consensus crate) and example targets, which together more than
+        # double the link surface and SIGBUS the linker on the
+        # 14 GB hosted-runner SSD. Bench / example compilation is
+        # validated by the Lint job's clippy run, which type-checks but
+        # doesn't link.
         env:
           RUST_TEST_THREADS: "4"
           SATD_TEST_TIMEOUT_MULT: "2"
-        run: cargo test --all --locked --all-targets
+        run: cargo test --all --locked
 
   lint:
     name: "Lint"
