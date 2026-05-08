@@ -11,13 +11,14 @@
 ## Why satd?
 
 *   **Node Sovereignty:** Built to give economic node operators a robust, memory-safe alternative to the monoculture, strengthening the network's resilience. Read the [Manifesto](MANIFESTO.md).
-*   **Zero Consensus Divergence:** Achieves consensus parity with Bitcoin Core by shadow-validating every block against the C++ `libbitcoinconsensus` engine. We rewrite the network and storage layers in Rust, but we never gamble on consensus.
+*   **Zero Consensus Divergence (Dual Engine):** Features a full Rust implementation of the consensus rules that passes Bitcoin Core's test suite (and beyond). Operators can choose to run the pure Rust engine, the C++ `libbitcoinconsensus` engine, or both simultaneously with bidirectional shadow-validation to mathematically guarantee zero divergence.
 *   **Built for the Operator:** Eliminates the `bitcoind` + `electrs` + `esplora` multi-process headache. Everything shares a single chainstate and a single RocksDB instance.
 
 ## Features
 
 ### 🛡️ Consensus & Network
-*   **Consensus Parity:** Tracks mainnet from genesis, validated against `libbitcoinconsensus` as a shadow on every block sync through ~945k+.
+*   **Dual Consensus Engine:** A complete, independently written Rust consensus engine that passes the Bitcoin Core test suite, with a C++ `libbitcoinconsensus` conservative fallback.
+*   **Swarm-Style IBD:** BitTorrent-like parallel block downloading and speculative verification pipeline for heavily optimized Initial Block Download.
 *   **Full P2P:** BIP 152 compact blocks, ban scoring, addrv2, BIP 324 v2 transport (in progress), Tor v3 (hardcoded `.onion` seeds).
 *   **Modern Mempool:** Full RBF / opt-in BIP 125, CPFP ancestor tracking, configurable policy (`-dustrelayfee`, `-limitancestorcount`, etc.).
 
@@ -28,7 +29,8 @@
 *   **Shared Indexing:** Address-history index atomic with `connect_block`. One database powers everything.
 
 ### 🛠️ Operator Ergonomics
-*   **Metrics & Observability:** Native Prometheus `/metrics`, `/healthz`, JSON-structured logs, and a TUI for IBD progress (`sat-tui`).
+*   **Native TUI (`sat-tui`):** A beautiful Ratatui-based terminal interface for real-time IBD bitmap visualization, peer stats, and node observability.
+*   **Metrics & Observability:** Native Prometheus `/metrics`, `/healthz`, and JSON-structured logs.
 *   **Core-Compatible:** Accepts standard `bitcoin.conf` and CLI flags (`-prune`, `-txindex`, `-assumeutxo`). Uses standard `.cookie` auth.
 *   **Mempool Stream:** `subscribemempool` JSON-RPC WS subscription with explicit eviction/replacement reasons.
 *   **Events Bus:** gRPC + ZMQ publishers for chain and mempool events (`satd-events`).
