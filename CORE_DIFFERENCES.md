@@ -65,7 +65,7 @@ artifacts, signing stack) but no protocol consequences.
 | **Storage backend** | LevelDB (chainstate, indexes) + flat block files | RocksDB (chainstate + all indexes, single instance, zstd + lz4) + flat block files; jemalloc allocator |
 | **Async runtime** | `boost::asio` + `std::thread` mix | `tokio` for all I/O |
 | **JSON-RPC server** | bespoke HTTP / SSL stack | `jsonrpsee` over `tower` middleware |
-| **Reproducible builds** | Guix | Cargo + (planned) Guix or Nix |
+| **Reproducible builds** | Guix | Nix flake (Guix may follow if a downstream packager needs it) |
 | **Release signing** | GPG (PGP) | minisign (artifacts) + cosign keyless (containers) + SSH sigs (git tags). No GPG. |
 
 **Why one RocksDB instance.** Core uses LevelDB and bundles indexes

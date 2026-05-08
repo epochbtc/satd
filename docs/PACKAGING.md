@@ -131,8 +131,9 @@ unauthenticated HTTP endpoints on that port (default bind 127.0.0.1):
 
 These are the right surfaces to wire to a Docker `HEALTHCHECK`,
 Kubernetes liveness/readiness probes, or a systemd `ExecStartPost=`
-poll. Both `Type=notify` (planned, requires `sd_notify` wiring) and
-poll-based readiness work.
+poll. The shipped `Type=notify` unit (see §"systemd" below) uses
+`sd_notify(READY=1)` for startup signalling; poll-based readiness
+against `/readyz` works equally well for non-systemd supervisors.
 
 ## Configuration
 
