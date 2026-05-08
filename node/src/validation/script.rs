@@ -19,9 +19,9 @@ pub enum PrimaryEngine {
     Rust,
 }
 
-/// Trait abstracting script/transaction verification.
-/// Phase 1: implemented by ConsensusVerifier (bitcoinconsensus FFI).
-/// Phase 2: will be replaced by SimplicityVerifier.
+/// Trait abstracting script/transaction verification. Implemented by
+/// `ConsensusVerifier` (bitcoinconsensus FFI), `RustVerifier` (native), and
+/// `ShadowVerifier` (parity-checked dual-engine).
 pub trait ScriptVerifier: Send + Sync {
     /// Verify all inputs of a transaction against their previous outputs.
     /// `prev_outputs` must have one entry per input, in the same order.
