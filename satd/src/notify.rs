@@ -158,6 +158,16 @@ pub fn notify_stopping() {
 mod tests {
     use super::*;
 
+    /// Serializes the two Linux tests that mutate `NOTIFY_SOCKET`. Cargo
+    /// runs `#[test]`s in parallel by default (`--test-threads=N` where
+    /// N is CPU count), so without this guard test A could `remove_var`
+    /// while test B is mid-`sd_notify::notify`, or both could set
+    /// different sock paths and lose datagrams to the wrong listener.
+    /// Using a hand-rolled mutex avoids pulling in `serial_test` for
+    /// two tests.
+    #[cfg(target_os = "linux")]
+    static NOTIFY_SOCKET_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn format_status_no_total() {
         let snap = node::startup_progress::StartupSnapshot {
@@ -206,6 +216,14 @@ mod tests {
     fn helpers_emit_systemd_wire_protocol() {
         use std::os::unix::net::UnixDatagram;
 
+        // Serialize against the heartbeat test below — both touch
+        // NOTIFY_SOCKET. Hold the guard for the entire test body
+        // (recover from poisoning so a panic in the other test doesn't
+        // wedge this one).
+        let _guard = NOTIFY_SOCKET_GUARD
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+
         let dir = tempfile::tempdir().expect("tempdir");
         let sock_path = dir.path().join("notify.sock");
         let listener = UnixDatagram::bind(&sock_path).expect("bind");
@@ -213,11 +231,8 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(2)))
             .expect("read timeout");
 
-        // SAFETY: tests in this module set NOTIFY_SOCKET for the duration
-        // of the case to stand in for systemd's exec setup. Cargo's
-        // default test threading runs each `#[test]` in its own thread,
-        // but env access is process-wide; mark this test #[serial] if
-        // additional NOTIFY_SOCKET-using tests are added later.
+        // SAFETY: NOTIFY_SOCKET is process-wide. NOTIFY_SOCKET_GUARD
+        // (above) serializes the two tests that touch it.
         unsafe {
             std::env::set_var("NOTIFY_SOCKET", &sock_path);
         }
@@ -252,10 +267,28 @@ mod tests {
     /// right wire bytes hit the socket, then signal stop and confirm it
     /// exits. Multi-threaded runtime so the blocking recv on the listener
     /// can park without starving the spawned heartbeat task.
+    // The mutex guard is intentionally held across awaits to serialize
+    // the entire test body against the sibling NOTIFY_SOCKET test —
+    // exactly the cross-test race the guard exists to prevent. The
+    // underlying lock is uncontended on local runs (different test
+    // threads typically schedule at different points) and the worst
+    // case is one test waiting on the other, not deadlock.
+    #[allow(clippy::await_holding_lock)]
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn heartbeat_emits_status_and_extend_timeout() {
         use std::os::unix::net::UnixDatagram;
+
+        // Serialize against the wire-protocol test above — both touch
+        // NOTIFY_SOCKET. Block on a std mutex inside an async test is
+        // fine here: the lock is uncontended in normal local runs
+        // (different test threads typically schedule at different
+        // points), and contention only happens when both linux tests
+        // run concurrently, which is exactly the case we want to
+        // serialize.
+        let _guard = NOTIFY_SOCKET_GUARD
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
 
         let dir = tempfile::tempdir().expect("tempdir");
         let sock_path = dir.path().join("notify.sock");
@@ -263,6 +296,8 @@ mod tests {
         listener
             .set_read_timeout(Some(Duration::from_secs(2)))
             .expect("read timeout");
+        // SAFETY: NOTIFY_SOCKET is process-wide. NOTIFY_SOCKET_GUARD
+        // (above) serializes the two tests that touch it.
         unsafe {
             std::env::set_var("NOTIFY_SOCKET", &sock_path);
         }

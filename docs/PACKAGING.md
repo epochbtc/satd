@@ -266,6 +266,43 @@ $ systemctl status satd
 This is identical behaviour to Bitcoin Core's bitcoind.service since
 v22.
 
+### Running multiple networks side by side
+
+Until a `satd@.service` template unit lands, operators who need
+`signet`, `regtest`, and mainnet on the same host can copy the unit
+under different names with per-instance drop-ins:
+
+```sh
+# Mainnet — the default unit installed above (satd.service).
+
+# Signet on the same host:
+sudo cp contrib/systemd/satd.service \
+        /etc/systemd/system/satd-signet.service
+
+# /etc/systemd/system/satd-signet.service.d/instance.conf
+sudo install -Dm644 /dev/stdin \
+        /etc/systemd/system/satd-signet.service.d/instance.conf <<'EOF'
+[Service]
+ExecStart=
+ExecStart=/usr/local/bin/satd --signet --datadir=/var/lib/satd-signet
+StateDirectory=
+StateDirectory=satd-signet
+ReadWritePaths=
+ReadWritePaths=/var/lib/satd-signet
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now satd-signet
+```
+
+Same pattern for `--regtest`. Each instance gets its own datadir, its
+own `satd-<network>` user (or share the `satd` user — your call), and
+its own RPC port (set via `--rpcport=<n>` in the drop-in).
+
+A native `satd@.service` template unit (`systemctl start satd@signet`)
+is a candidate for v0.1.x once we have signal that the drop-in pattern
+isn't enough.
+
 ## OpenRC
 
 Alpine, Gentoo (with the `openrc` profile), Artix, and other distros
