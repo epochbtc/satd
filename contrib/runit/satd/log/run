@@ -1,0 +1,6 @@
+#!/bin/sh
+# Log helper for the satd runit service. Pipes stdout+stderr from satd
+# into svlogd, which writes timestamped + auto-rotated logs under
+# /var/log/satd. Aligns with the Void Linux convention.
+
+exec chpst -u satd:satd svlogd -tt /var/log/satd

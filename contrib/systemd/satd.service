@@ -12,21 +12,35 @@
 #   /var/lib/satd/bitcoin.conf
 # satd reads it via the standard `-conf=` resolution against the datadir.
 #
-# Type=simple is intentional: satd does not yet call sd_notify(READY=1).
-# Once that lands the unit will be upgraded to Type=notify with
-# NotifyAccess=main, so systemd waits for RocksDB to finish opening
-# before declaring the unit started.
+# Type=notify: satd calls sd_notify(READY=1) only after every listener
+# is bound (RPC, P2P, optional Esplora/Electrum/MCP/events surfaces),
+# so dependent units (Tor onion services, watchtower processes) start
+# at the right moment instead of racing satd's bind sequence.
+#
+# During reindex (which can run for many hours on a fully-synced
+# mainnet node) satd emits sd_notify(EXTEND_TIMEOUT_USEC=120000000)
+# every 30s plus STATUS=<phase: progress>. TimeoutStartSec is `infinity`
+# because the heartbeat IS the liveness check — silence for >120s and
+# systemd kills the unit (correctly: it's stuck). `systemctl status
+# satd` shows the live STATUS line during reindex.
 
 [Unit]
 Description=satd — Bitcoin full node
-Documentation=https://github.com/epochbtc/satd
+Documentation=https://github.com/epochbtc/satd/blob/master/docs/PACKAGING.md
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
 ExecStart=/usr/local/bin/satd --datadir=/var/lib/satd
 ExecStop=/bin/kill -SIGTERM $MAINPID
+
+# Reindex can take hours. The EXTEND_TIMEOUT_USEC heartbeats inside
+# satd reset this every 30s during the pre-bind phase; `infinity`
+# removes the static budget that would otherwise kill us during
+# `--reindex-chainstate`. See the comment block above.
+TimeoutStartSec=infinity
 
 # RocksDB flush + undo-file fsync on shutdown can take a while under load.
 # 10 minutes matches Bitcoin Core's bitcoind.service ceiling and is the

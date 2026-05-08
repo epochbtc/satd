@@ -1,4 +1,5 @@
 mod config;
+mod notify;
 
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
@@ -149,6 +150,21 @@ async fn main() {
         let auth_clone = auth.clone();
         start_startup_rpc(rpc_bind, auth_clone, progress).await
     };
+
+    // Service-manager heartbeat. On systemd this prevents the unit from
+    // hitting TimeoutStartSec during long-running startup phases like
+    // `--reindex-chainstate` (hours on mainnet). Each tick reads the
+    // shared StartupProgress snapshot and emits both
+    //   STATUS=<phase: progress>
+    //   EXTEND_TIMEOUT_USEC=120000000
+    // The unit file ships TimeoutStartSec=infinity; the heartbeat IS
+    // the liveness check — silence for >120s and systemd kills us.
+    // No-op on non-systemd hosts (NOTIFY_SOCKET unset) so the same
+    // binary works under OpenRC, runit, macOS, plain shell, etc.
+    notify::notify_status("Starting up");
+    let (heartbeat_stop_tx, heartbeat_stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let heartbeat_handle =
+        notify::spawn_startup_heartbeat(startup_progress.clone(), heartbeat_stop_rx);
 
     // Open block storage
     let blocks_dir = net_datadir.join("blocks");
@@ -1379,6 +1395,17 @@ async fn main() {
         shutdown_rx.clone(),
     );
 
+    // All listeners bound, all background tasks spawned. Tell the
+    // service manager we're up. This stops the startup heartbeat and
+    // transitions the systemd unit to `active (running)`; dependent
+    // units (Tor onion services, watchtower processes pointing at our
+    // RPC) start now. IBD continues in the background — operators that
+    // care about chain-tip readiness should poll `getblockchaininfo`,
+    // not the unit state.
+    let _ = heartbeat_stop_tx.send(());
+    let _ = heartbeat_handle.await;
+    notify::notify_ready();
+
     // Wait for shutdown signal (stop RPC, Ctrl+C, or SIGTERM)
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .expect("Failed to register SIGTERM handler");
@@ -1399,6 +1426,13 @@ async fn main() {
             let _ = shutdown_signal_tx.send(true);
         }
     }
+
+    // Tell the service manager we're shutting down BEFORE the blocking
+    // RocksDB flush. Operators running `systemctl stop satd` or watching
+    // `systemctl status satd` see "deactivating" immediately rather than
+    // staring at "active" for the full TimeoutStopSec while the flush
+    // runs.
+    notify::notify_stopping();
 
     // Graceful shutdown — flush UTXO cache before stopping, bounded by
     // --max-shutdown-secs so we actually exit within the deadline no matter

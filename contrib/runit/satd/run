@@ -1,0 +1,24 @@
+#!/bin/sh
+# satd — runit run script.
+#
+# Install (Void / Artix-runit / s6-rc):
+#   sudo install -Dm755 contrib/runit/satd/run     /etc/sv/satd/run
+#   sudo install -Dm755 contrib/runit/satd/log/run /etc/sv/satd/log/run
+#   sudo install -Dm755 target/release/satd        /usr/local/bin/satd
+#   sudo install -Dm755 target/release/sat-cli     /usr/local/bin/sat-cli
+#   sudo useradd --system --home /var/lib/satd --shell /sbin/nologin satd
+#   sudo install -d -m 0750 -o satd -g satd /var/lib/satd
+#   sudo ln -s /etc/sv/satd /var/service/satd
+#
+# runit has no notify protocol and no "ready" concept; it just
+# supervises whatever the run script execs and restarts on exit.
+# Reindex doesn't fight any timeout the way it does on systemd —
+# the script keeps running for as long as satd does.
+#
+# `chpst -u satd:satd` is the runit way to drop privileges; some
+# distros use `s6-setuidgid` instead — adjust if that's the local
+# convention.
+
+exec 2>&1
+ulimit -n 65536
+exec chpst -u satd:satd /usr/local/bin/satd --datadir=/var/lib/satd

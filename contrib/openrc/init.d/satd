@@ -1,0 +1,50 @@
+#!/sbin/openrc-run
+# satd — OpenRC init script.
+#
+# Install (Alpine / Gentoo / Artix):
+#   sudo install -Dm755 contrib/openrc/init.d/satd /etc/init.d/satd
+#   sudo install -Dm755 target/release/satd /usr/local/bin/satd
+#   sudo install -Dm755 target/release/sat-cli /usr/local/bin/sat-cli
+#   sudo adduser -S -H -h /var/lib/satd -s /sbin/nologin satd
+#   sudo install -d -m 0750 -o satd -g satd /var/lib/satd
+#   sudo rc-update add satd default
+#   sudo rc-service satd start
+#
+# OpenRC has no notify protocol — it considers the service "started"
+# once the daemon backgrounds via start-stop-daemon. That means a long
+# `--reindex-chainstate` doesn't fight any startup timeout the way it
+# does on systemd; the unit is just "running" the whole time.
+# Operators wanting reindex-progress visibility can `sat-cli` against
+# the early startup-RPC port.
+
+name="satd"
+description="satd — Bitcoin full node"
+
+command="/usr/local/bin/satd"
+command_args="--datadir=/var/lib/satd ${satd_args:-}"
+command_user="satd:satd"
+command_background="yes"
+
+pidfile="/run/${RC_SVCNAME:-satd}.pid"
+output_log="/var/log/satd.log"
+error_log="/var/log/satd.log"
+
+# Ulimits — RocksDB keeps many SST files mmapped; default soft NOFILE
+# (often 1024) bites at mainnet tip. Match the systemd unit.
+rc_ulimit="-n 65536"
+
+# RocksDB flush + undo-file fsync on shutdown can take a while under
+# load. 10 minutes matches the systemd TimeoutStopSec and is the
+# practical upper bound observed during mainnet-tip operation.
+retry="SIGTERM/600/SIGKILL/30"
+
+depend() {
+    need net
+    use logger dns
+    after firewall
+}
+
+start_pre() {
+    checkpath -d -m 0750 -o "${command_user}" /var/lib/satd
+    checkpath -f -m 0640 -o "${command_user}" "${output_log}"
+}
