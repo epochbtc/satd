@@ -30,6 +30,14 @@
 *   **Shared Indexing:** Address-history index atomic with `connect_block`. One database powers everything.
 
 ### Operator Ergonomics
+
+<details>
+<summary><b>View the satd Terminal UI</b></summary>
+
+![satd Terminal UI showing IBD progress](docs/assets/tui-hero.png)
+*The `sat-tui` interface provides real-time observability, including an IBD bitmap, peer stats, and a JSON-RPC explorer.*
+</details>
+
 *   **Native TUI (`sat-tui`):** A beautiful Ratatui-based terminal interface for real-time IBD bitmap visualization, peer stats, and node observability.
 *   **Metrics & Observability:** Native Prometheus `/metrics`, `/healthz`, and JSON-structured logs.
 *   **Core-Compatible:** Accepts standard `bitcoin.conf` and CLI flags (`-prune`, `-txindex`, `-assumeutxo`). Uses standard `.cookie` auth.
