@@ -173,6 +173,20 @@ via `gpg.ssh.allowedSignersFile`.
 
 - No keys to rotate. The identity binding is intrinsically per-run.
 
+## Software Bill of Materials
+
+Each release ships CycloneDX 1.5 JSON SBOMs for every shipped binary
+(`satd-v<version>.cdx.json`, `sat-cli-v<version>.cdx.json`). The SBOMs
+are signed with the same minisign primary key as the tarballs and
+verify with the same recipe — see
+[`docs/PACKAGING.md`](docs/PACKAGING.md) §"Software Bill of Materials".
+
+Supply-chain enforcement runs as a `cargo-deny` gate against the
+RustSec advisory database. The policy is in `deny.toml` at the repo
+root; it runs on every dep-graph-touching PR and as a hard
+precondition for every release artifact (tag-time enforcement) — see
+`docs/PACKAGING.md` §"Supply-chain policy".
+
 ## Threat model — what these signatures do and don't prove
 
 **They prove:**

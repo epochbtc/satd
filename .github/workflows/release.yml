@@ -19,8 +19,12 @@
 #   - macOS Apple Silicon tarball — currently commented out in the
 #     matrix below (see comment at the matrix entry); re-enable when
 #     the repo is public
-#   - Reproducible-build bit-for-bit verification (Nix flake)
-#   - SBOM generation + cargo-deny gate
+#
+# The supply-chain-gate job below runs cargo-deny against the workspace
+# graph as a hard precondition for every release artifact. If a RustSec
+# advisory landed during a quiet period between merges, this gate is
+# what prevents shipping the affected build (the PR-time deny.yml only
+# catches dep-graph-touching PRs). Triage policy lives in deny.toml.
 
 name: Release
 
@@ -38,8 +42,116 @@ env:
 
 jobs:
 
+  # Hard supply-chain gate: every release job below `needs:` this. A new
+  # RustSec advisory against a dep we ship will fail the gate and abort
+  # the release, even if no PR has run deny.yml since the advisory landed.
+  supply-chain-gate:
+    name: supply-chain gate (cargo-deny)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@0.19.4
+
+      - name: cargo deny check
+        run: cargo deny --all-features check
+
+  # CycloneDX 1.5 SBOM for the two shipped binaries (satd, sat-cli).
+  # Generated once from Cargo.lock — the dep graph is identical across
+  # release targets, so a single SBOM covers all tarballs.
+  sbom:
+    name: SBOM (CycloneDX)
+    needs: [supply-chain-gate]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Determine version string
+        id: version
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+          else
+            short_sha=$(git rev-parse --short=12 HEAD)
+            echo "version=0.0.0-dev+${short_sha}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Install cargo-cyclonedx
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-cyclonedx@0.5.9
+
+      - name: Generate SBOMs
+        run: |
+          set -euo pipefail
+          # cargo-cyclonedx writes one .cdx.json per workspace member into
+          # that member's directory. We want the binaries' SBOMs only —
+          # collect satd.cdx.json + sat-cli.cdx.json, version-suffix the
+          # filenames, drop the rest.
+          #
+          # CycloneDX 1.5 is the current widely-tooled spec version. 1.6
+          # is the latest but adds only minor enrichment (e.g. licensing
+          # disjunctions); pinning 1.5 maximizes consumer compatibility
+          # for downstream packagers (Start9, Umbrel, distro tooling).
+          cargo cyclonedx --format json --spec-version 1.5 --all-features
+          mkdir sbom
+          v="${{ steps.version.outputs.version }}"
+          cp satd/satd.cdx.json       "sbom/satd-v${v}.cdx.json"
+          cp sat-cli/sat-cli.cdx.json "sbom/sat-cli-v${v}.cdx.json"
+          cd sbom
+          for f in *.cdx.json; do
+            sha256sum "$f" > "${f}.sha256"
+          done
+          ls -la
+
+      # Defensive sanity gate before upload: confirm the SBOMs are
+      # parseable JSON and carry a non-empty components list. Catches a
+      # cargo-cyclonedx upgrade that silently changes output shape, or a
+      # zero-byte file from an upstream tool failure that didn't trip a
+      # non-zero exit code. Cheap (jq is preinstalled on hosted runners)
+      # and avoids shipping a corrupt artifact in a release.
+      - name: Verify SBOM well-formedness
+        run: |
+          set -euo pipefail
+          v="${{ steps.version.outputs.version }}"
+          for f in sbom/satd-v${v}.cdx.json sbom/sat-cli-v${v}.cdx.json; do
+            jq empty "$f"
+            n=$(jq '.components | length' "$f")
+            if [[ "$n" -lt 10 ]]; then
+              echo "SBOM $f has only $n components — refusing to ship" >&2
+              exit 1
+            fi
+            echo "ok: $f ($n components)"
+          done
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: satd-sbom
+          path: |
+            sbom/*.cdx.json
+            sbom/*.cdx.json.sha256
+          if-no-files-found: error
+          retention-days: 14
+
   build-tarball:
     name: tarball / ${{ matrix.target }}
+    needs: [supply-chain-gate]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -234,6 +346,7 @@ jobs:
   # the per-arch images into a single multi-arch manifest.
   build-docker-platform:
     name: docker / ${{ matrix.platform }}
+    needs: [supply-chain-gate]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -295,10 +408,10 @@ jobs:
           # attestation. We do our own provenance via cosign keyless
           # in merge-docker (the Sigstore cert ties the image to a
           # specific workflow run + ref), and a real SBOM ships in
-          # PR-5. The auto-attestation here would produce a partial
+          # the SBOM job (above) attaches the dep manifest separately. The auto-attestation here would produce a partial
           # provenance record that's neither verifiable end-to-end
           # nor consistent with the cosign signature, which is worse
-          # than no record. Re-enable once the SBOM step lands.
+          # than no record. Re-enable would require reconciling against the cosign signature path.
           provenance: false
 
       - name: Build and push by digest (tag)
@@ -322,10 +435,10 @@ jobs:
           # attestation. We do our own provenance via cosign keyless
           # in merge-docker (the Sigstore cert ties the image to a
           # specific workflow run + ref), and a real SBOM ships in
-          # PR-5. The auto-attestation here would produce a partial
+          # the SBOM job (above) attaches the dep manifest separately. The auto-attestation here would produce a partial
           # provenance record that's neither verifiable end-to-end
           # nor consistent with the cosign signature, which is worse
-          # than no record. Re-enable once the SBOM step lands.
+          # than no record. Re-enable would require reconciling against the cosign signature path.
           provenance: false
 
       - name: Export digest
@@ -436,7 +549,7 @@ jobs:
   release:
     name: GitHub Release
     if: startsWith(github.ref, 'refs/tags/')
-    needs: [build-tarball, merge-docker]
+    needs: [build-tarball, merge-docker, sbom]
     runs-on: ubuntu-24.04
 
     permissions:
@@ -462,13 +575,20 @@ jobs:
           pattern: 'satd-*'
           merge-multiple: true
 
+      - name: Download SBOM artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: satd-sbom
+          path: dist
+
       - name: Aggregate sha256sums
         run: |
           set -euo pipefail
           cd dist
           ls -la
-          # Per-tarball .sha256 files were uploaded; concatenate into one.
-          cat *.tar.zst.sha256 | sort > SHA256SUMS
+          # Per-tarball + per-SBOM .sha256 files were uploaded; concatenate
+          # into one canonical SHA256SUMS file for the release.
+          cat *.tar.zst.sha256 *.cdx.json.sha256 | sort > SHA256SUMS
           cat SHA256SUMS
 
       - name: Create or update GitHub Release
@@ -482,4 +602,6 @@ jobs:
           files: |
             dist/*.tar.zst
             dist/*.tar.zst.sha256
+            dist/*.cdx.json
+            dist/*.cdx.json.sha256
             dist/SHA256SUMS

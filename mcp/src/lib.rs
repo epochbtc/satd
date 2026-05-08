@@ -482,11 +482,9 @@ pub async fn serve_http(
     use tokio_util::sync::CancellationToken;
 
     let cancel = CancellationToken::new();
-    let config = StreamableHttpServerConfig {
-        stateful_mode: true,
-        cancellation_token: cancel.clone(),
-        ..Default::default()
-    };
+    let mut config = StreamableHttpServerConfig::default();
+    config.stateful_mode = true;
+    config.cancellation_token = cancel.clone();
 
     let session_manager = std::sync::Arc::new(LocalSessionManager::default());
 

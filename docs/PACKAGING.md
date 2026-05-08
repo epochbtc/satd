@@ -14,11 +14,12 @@ direction for packaging is in [`ECOSYSTEM.md`](../ECOSYSTEM.md) §2.
 
 This is **PACKAGING.md v1**. It covers what shipped today: the
 container, systemd unit, on-disk layout, operational surface, release
-pipeline, signing across all three surfaces, and reproducible build
-via Nix. Sections marked **(future)** describe contracts that future
-PRs will fulfil — SBOM generation, `Type=notify` systemd, OpenRC /
-runit equivalents. They are listed here so packagers can see the
-full intended shape and plan against it.
+pipeline, signing across all three surfaces, reproducible build via
+Nix, CycloneDX SBOMs per binary, and a `cargo-deny` supply-chain gate.
+Sections marked **(future)** describe contracts that future PRs will
+fulfil — `Type=notify` systemd, OpenRC / runit equivalents. They are
+listed here so packagers can see the full intended shape and plan
+against it.
 
 Updated: 2026-05-07.
 
@@ -397,10 +398,18 @@ Tag-triggered (`v*`) releases produce, per tag, via
   build timestamp.
 
 - A per-tarball `*.sha256` file alongside each artifact, plus an
-  aggregate `SHA256SUMS` in the release.
+  aggregate `SHA256SUMS` covering tarballs **and** SBOMs in the release.
 
 - A multi-arch container at `ghcr.io/epochbtc/satd:<version>` covering
   `linux/amd64` + `linux/arm64`.
+
+- CycloneDX 1.5 JSON SBOMs for each shipped binary:
+  - `satd-v<version>.cdx.json`
+  - `sat-cli-v<version>.cdx.json`
+
+  Each ships with a `*.sha256` next to it (already in `SHA256SUMS`)
+  and a `*.minisig` produced by the same maintainer-side
+  `contrib/release/sign-tarballs.sh` flow that signs the tarballs.
 
 The workflow currently runs on tag pushes only. PR-trigger dry-runs
 and `workflow_dispatch` were removed during the private-repo phase
@@ -442,6 +451,60 @@ details live in [`SECURITY.md`](../SECURITY.md).
   contrib/release/verify-tag.sh v0.1.0
   ```
 
+### Software Bill of Materials
+
+Each release ships a CycloneDX 1.5 JSON SBOM per binary:
+
+```sh
+# Authenticate the SBOM (same key + recipe as the tarballs)
+minisign -Vm satd-v0.1.0.cdx.json \
+  -P RWQeP6MczCgPh6tU03GEMm4HsnGbXte3VT2Bc52TBSR7Q+X7WnL5vfQ3
+
+# Enumerate dependencies — name, version, license
+jq -r '.components[] | "\(.name) \(.version) \(.licenses[0].license.id // .licenses[0].license.name // "?")"' \
+  satd-v0.1.0.cdx.json | sort
+```
+
+The SBOM is generated from the same `Cargo.lock` that produced the
+released binary; the `cargo cyclonedx` invocation lives in the `sbom`
+job in `.github/workflows/release.yml`. The dep graph is identical
+across the gnu-linux release targets currently shipped
+(`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`), so a
+single SBOM per binary covers both tarballs.
+
+If a future release adds musl or macOS targets — which can resolve
+different platform-specific deps (e.g. `libc` shim crates,
+`security-framework` on darwin) — the workflow will need to emit a
+per-target SBOM and the artifact filenames will gain a target-triple
+suffix. Track this when re-enabling the deferred targets in the
+release matrix.
+
+### Supply-chain policy
+
+`deny.toml` at the repo root encodes the supply-chain policy enforced
+by [`cargo-deny`](https://github.com/EmbarkStudios/cargo-deny):
+
+- **Advisories** — every RustSec advisory against any dep in the
+  workspace fails CI by default. Exceptions are documented in
+  `[advisories.ignore]` with a `reason` field naming the rationale.
+- **Licenses** — permissive only (MIT / Apache-2.0 / BSD / ISC /
+  Unicode / CC0 / Zlib / Unlicense / MPL-2.0 family). GPL-* and
+  AGPL-* are denied implicitly.
+- **Bans** — wildcards on crates.io deps are denied; workspace-internal
+  `path = "../foo"` deps are allowed via `allow-wildcard-paths` because
+  every workspace crate is `publish = false`.
+- **Sources** — only `https://github.com/rust-lang/crates.io-index`.
+  Git deps require an explicit allowlist entry.
+
+The policy runs as a hard gate in two places:
+
+- `.github/workflows/deny.yml` — every PR that touches `Cargo.toml`,
+  `Cargo.lock`, `deny.toml`, or the workflow itself.
+- The `supply-chain-gate` job inside `.github/workflows/release.yml`
+  — every release artifact (tarballs, SBOMs, container) `needs:` it.
+  A new RustSec advisory landed during a quiet period between merges
+  cannot ship a release.
+
 ### Coming in later PRs
 
 - **musl-linux tarballs.** Targets `x86_64-unknown-linux-musl` and
@@ -449,7 +512,6 @@ details live in [`SECURITY.md`](../SECURITY.md).
   `rocksdb-sys` + musl wants a dedicated cross toolchain and the
   v0.1.0 priority is gnu-linux + macOS, both of which downstream
   package managers handle natively.
-- **`cyclonedx`-format SBOM** attached to each release — PR-5.
 - **`Type=notify` systemd unit upgrade** + OpenRC / runit equivalents
   — PR-6.
 
@@ -478,4 +540,4 @@ release notes for the version that ships them.
 
 | Version | Notable changes |
 |---|---|
-| 0.1.0 (current) | Initial PACKAGING.md. Dockerfile + systemd unit shipped. Tag-triggered release workflow on hosted runners produces tarballs (gnu-linux + Apple Silicon) and a multi-arch GHCR image. Signing across all three surfaces (minisign tarballs, cosign keyless image, SSH-signed tags) shipped. Nix flake (`flake.nix`) shipped for reproducible builds with two-runner CI verification (`x86_64-linux`, `aarch64-linux`); SBOM generation pending. |
+| 0.1.0 (current) | Initial PACKAGING.md. Dockerfile + systemd unit shipped. Tag-triggered release workflow on hosted runners produces tarballs (gnu-linux + Apple Silicon) and a multi-arch GHCR image. Signing across all three surfaces (minisign tarballs, cosign keyless image, SSH-signed tags) shipped. Nix flake (`flake.nix`) shipped for reproducible builds with two-runner CI verification (`x86_64-linux`, `aarch64-linux`). CycloneDX 1.5 SBOMs per binary + `cargo-deny` supply-chain gate (PR-time on dep-graph PRs, hard gate at tag time) shipped. |

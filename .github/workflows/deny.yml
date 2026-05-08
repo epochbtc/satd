@@ -1,0 +1,41 @@
+name: cargo deny
+
+# Supply-chain gate. Runs the four cargo-deny checks (advisories, bans,
+# licenses, sources) against the workspace dep graph.
+#
+# Trigger scope: PRs that actually change the dep graph or the policy
+# itself. Other PRs skip this entirely.
+#
+# Tag/release-time enforcement happens inside release.yml (the
+# supply-chain-gate job that all release jobs depend on), so a tag push
+# cannot ship a release with a known-vulnerable dep even if the relevant
+# advisory landed during a quiet period between merges.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "**/Cargo.toml"
+      - "deny.toml"
+      - ".github/workflows/deny.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-deny:
+    name: cargo deny check
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@0.19.4
+
+      - name: cargo deny check
+        run: cargo deny --all-features check
