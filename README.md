@@ -16,20 +16,20 @@
 
 ## Features
 
-### 🛡️ Consensus & Network
+### Consensus & Network
 *   **Dual Consensus Engine:** A complete, independently written Rust consensus engine that passes the Bitcoin Core test suite, with a C++ `libbitcoinconsensus` conservative fallback.
 *   **Swarm-Style IBD:** BitTorrent-like parallel block downloading and speculative verification pipeline for heavily optimized Initial Block Download.
 *   **Full P2P:** BIP 152 compact blocks, ban scoring, addrv2, BIP 324 v2 transport (in progress), Tor v3 (hardcoded `.onion` seeds).
 *   **Modern Mempool:** Full RBF / opt-in BIP 125, CPFP ancestor tracking, configurable policy (`-dustrelayfee`, `-limitancestorcount`, etc.).
 
-### 🔌 Native Integrations (No side-cars required)
+### Native Integrations (No side-cars required)
 *   **AI-Native MCP Server:** An optional Model Context Protocol (`mcp`) binary that exposes node data and operational surfaces directly to AI agents.
 *   **Electrum Protocol:** Native TCP server (v1.4.5) for wallets like BlueWallet, Sparrow, and Nunchuk.
 *   **Esplora REST:** Wire-shape parity with blockstream.info / mempool.space for the implemented endpoint set.
 *   **Compact Block Filters:** Native BIP 157/158 index and P2P service for embedded-Neutrino mobile wallets (Zeus, Blixt, Mutiny).
 *   **Shared Indexing:** Address-history index atomic with `connect_block`. One database powers everything.
 
-### 🛠️ Operator Ergonomics
+### Operator Ergonomics
 *   **Native TUI (`sat-tui`):** A beautiful Ratatui-based terminal interface for real-time IBD bitmap visualization, peer stats, and node observability.
 *   **Metrics & Observability:** Native Prometheus `/metrics`, `/healthz`, and JSON-structured logs.
 *   **Core-Compatible:** Accepts standard `bitcoin.conf` and CLI flags (`-prune`, `-txindex`, `-assumeutxo`). Uses standard `.cookie` auth.
