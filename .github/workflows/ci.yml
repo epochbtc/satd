@@ -110,6 +110,12 @@ jobs:
         env:
           RUST_TEST_THREADS: "4"
           SATD_TEST_TIMEOUT_MULT: "2"
+          # Disable the 80 GB free-disk pre-flight on the address-index
+          # backfill RPC. The threshold is sized for mainnet (~56 GB
+          # peak temp CF + headroom); regtest chains here are KB to MB
+          # and a hosted runner has ~14 GB free, so the production
+          # default rejects every backfill test.
+          SATD_BACKFILL_PREFLIGHT_BYTES: "0"
         run: cargo test --all --locked
 
   lint:
