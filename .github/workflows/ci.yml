@@ -32,6 +32,24 @@ jobs:
       - name: Checkout sources
         uses: actions/checkout@v4
 
+      # Hosted ubuntu-24.04 ships ~30 GB of pre-installed SDKs we don't
+      # use (Android, .NET, Haskell, CodeQL). The workspace target/
+      # directory plus cargo registry routinely exceed the remaining
+      # ~14 GB of free disk and SIGBUS the linker mid-link of debug-mode
+      # test binaries. Reclaim ~20 GB before the build.
+      - name: Free disk space
+        run: |
+          set -euo pipefail
+          df -h /
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /opt/hostedtoolcache/PyPy
+          sudo rm -rf /opt/hostedtoolcache/Ruby
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+
       # rocksdb-sys needs libclang (bindgen headers) and the rocksdb
       # native build wants cmake. Hosted ubuntu-24.04 ships clang +
       # cmake binaries but NOT libclang-dev — install explicitly.
