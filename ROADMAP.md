@@ -9,17 +9,16 @@ These items are organized into tiers based on their impact and feasibility for o
 While `satd` currently matches Core's mempool policy defaults and exposes basic flags (`-datacarrier`, `-dustrelayfee`), our ultimate goal is to give operators programmatic, frictionless control over what their hardware validates.
 
 ### Transaction Validation DSL (Domain Specific Language)
-**Proposal:** A lightweight, strictly bounded rule engine (e.g., via YAML/JSON or a highly constrained scripting environment) that evaluates every transaction before it enters the mempool.
-**Why it matters:** It completely removes `satd` developers from the policy debate. If a new class of spam or controversial transaction format emerges, operators do not have to wait for a software update or run a patched C++ fork (like Bitcoin Knots) to filter it. They simply update their local policy ruleset.
-**Security constraint:** Because this runs on every incoming transaction, the DSL must be strictly bounded in execution time and memory to prevent DoS attacks. No loops, no external network calls, just flat boolean evaluation of transaction metadata (e.g., `tx.witness.size > 400000`, `tx.has_op_return == true`).
+**Proposal:** A lightweight, highly constrained rule engine that evaluates every transaction before it enters the mempool. By folding all filtering strategies into a single DSL, we eliminate the need to hardcode new CLI flags every time a controversial transaction format emerges.
 
-### Granular Script Type Filtering
-**Proposal:** Explicit CLI toggles for *every* standard script type, rather than just bare multisig or OP_RETURN.
-**Why it matters:** Operators can strictly define the shape of their mempool. Knobs would include `--permit-p2pk=0`, `--permit-p2tr=1`, or `--permit-unknown-witness-versions=0` (preventing future upgrade vectors without explicit operator opt-in).
+Operators could define local rulesets using simple boolean logic on transaction metadata. For example:
+- **Granular Script Filtering:** `tx.outputs.any(out => out.script_type == 'p2tr') -> reject`
+- **Economic Discrimination:** `tx.has_op_return && tx.fee_rate < (network.min_relay * 2) -> reject`
+- **Witness Size Caps:** `tx.witness.size > 400000 -> reject`
 
-### Economic Content Discrimination (Fee Multipliers)
-**Proposal:** Instead of flat-out rejecting certain transaction types, allow operators to demand a premium fee rate for them.
-**Why it matters:** An operator might allow large `OP_RETURN` data blobs, but require them to pay 2x the standard minimum relay fee to compensate for the bandwidth/storage bloat.
+**Why it matters:** It completely removes `satd` developers from the policy debate. Operators do not have to wait for a software update or run a patched C++ fork (like Bitcoin Knots) to enforce their preferences. They simply update their local policy.
+
+**Crucial Security Constraint (DoS Protection):** Because this runs on every incoming transaction, the DSL **must not be Turing complete**. It must be strictly bounded in execution time and memory. The engine will support *no loops*, *no recursion*, and *no external network calls*—only flat, O(1) or O(N) boolean evaluations of static transaction metadata. This ensures the DSL cannot be used as an attack vector to exhaust node CPU or memory.
 
 ### Dynamic Dust Thresholds
 **Proposal:** `--dynamic-dust=1` — Automatically scales the dust threshold as a percentage of the trailing 24-hour median block fee.
