@@ -4,6 +4,27 @@ This document outlines upcoming operator-focused features and research areas for
 
 These items are organized into tiers based on their impact and feasibility for operators. This is a living document and priorities may shift.
 
+## Advanced Mempool Sovereignty
+
+While `satd` currently matches Core's mempool policy defaults and exposes basic flags (`-datacarrier`, `-dustrelayfee`), our ultimate goal is to give operators programmatic, frictionless control over what their hardware validates.
+
+### Transaction Validation DSL (Domain Specific Language)
+**Proposal:** A lightweight, strictly bounded rule engine (e.g., via YAML/JSON or a highly constrained scripting environment) that evaluates every transaction before it enters the mempool.
+**Why it matters:** It completely removes `satd` developers from the policy debate. If a new class of spam or controversial transaction format emerges, operators do not have to wait for a software update or run a patched C++ fork (like Bitcoin Knots) to filter it. They simply update their local policy ruleset.
+**Security constraint:** Because this runs on every incoming transaction, the DSL must be strictly bounded in execution time and memory to prevent DoS attacks. No loops, no external network calls, just flat boolean evaluation of transaction metadata (e.g., `tx.witness.size > 400000`, `tx.has_op_return == true`).
+
+### Granular Script Type Filtering
+**Proposal:** Explicit CLI toggles for *every* standard script type, rather than just bare multisig or OP_RETURN.
+**Why it matters:** Operators can strictly define the shape of their mempool. Knobs would include `--permit-p2pk=0`, `--permit-p2tr=1`, or `--permit-unknown-witness-versions=0` (preventing future upgrade vectors without explicit operator opt-in).
+
+### Economic Content Discrimination (Fee Multipliers)
+**Proposal:** Instead of flat-out rejecting certain transaction types, allow operators to demand a premium fee rate for them.
+**Why it matters:** An operator might allow large `OP_RETURN` data blobs, but require them to pay 2x the standard minimum relay fee to compensate for the bandwidth/storage bloat.
+
+### Dynamic Dust Thresholds
+**Proposal:** `--dynamic-dust=1` — Automatically scales the dust threshold as a percentage of the trailing 24-hour median block fee.
+**Why it matters:** A static `3000 sat/kvB` dust limit is insufficient to prevent UTXO set exhaustion during extreme high-fee environments. Dynamic thresholds protect the node when network congestion spikes.
+
 ## Upcoming Operator Features
 
 ### PSBT signing (stdin-keyed, no stored keys)
