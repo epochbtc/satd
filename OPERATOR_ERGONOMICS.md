@@ -43,6 +43,17 @@ Instead of manually tuning `-dbcache`, `-maxmempool`, and connection limits, ope
 | `--blockfilterindex=<0\|1\|basic>` | `0` | Builds the BIP 158 compact block filter index. |
 | `--peerblockfilters=<0\|1>` | `0` | Advertises `NODE_COMPACT_FILTERS` (bit 6) and serves BIP 157 P2P queries. |
 
+### Mempool Policy Sovereignty
+`satd` believes that operators should have strict, ultimate control over what their hardware validates and relays. Instead of requiring a patched C++ fork (like Bitcoin Knots) to filter spam or unwanted data, `satd` exposes these policies as first-class configuration knobs:
+
+| Flag | Default | Notes |
+|---|---|---|
+| `--datacarrier=<0\|1>` | `1` | If set to `0`, strictly rejects **all** transactions containing `OP_RETURN` outputs from entering the mempool or being relayed. |
+| `--datacarriersize=<bytes>` | `83` | The maximum permitted size of an `OP_RETURN` script. Anything larger is rejected as non-standard. |
+| `--dustrelayfee=<sat/kvB>` | `3000` | The threshold used to calculate dust. Raising this forces spam transactions creating tiny, unspendable UTXOs to pay significantly higher fees. |
+| `--permitbaremultisig=<0\|1>` | `1` | If `0`, rejects complex, non-standard bare multisig setups often used for data-storage hacks. |
+| `--limitancestorcount=<N>` | `25` | Maximum unconfirmed ancestor count. |
+
 ## 3. Developer & Integrator APIs
 
 ### Mempool-Based Fee Estimation
