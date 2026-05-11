@@ -1035,11 +1035,11 @@ dependencies = [
  "node-index",
  "parking_lot",
  "rcgen",
- "rustls-pemfile",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
+ "tls-config",
  "tokio",
  "tokio-rustls",
  "tracing",
@@ -1106,11 +1106,11 @@ dependencies = [
  "pin-project",
  "rcgen",
  "reqwest",
- "rustls-pemfile",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
+ "tls-config",
  "tokio",
  "tokio-rustls",
  "tokio-stream",
@@ -2259,13 +2259,12 @@ dependencies = [
  "rcgen",
  "reqwest",
  "rocksdb",
- "rustls-pemfile",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
+ "tls-config",
  "tokio",
- "tokio-rustls",
  "tokio-socks",
  "tower 0.5.3",
  "tracing",
@@ -4020,6 +4019,17 @@ name = "tinyvec_macros"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
+
+[[package]]
+name = "tls-config"
+version = "0.1.0"
+dependencies = [
+ "rcgen",
+ "rustls-pemfile",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio-rustls",
+]
 
 [[package]]
 name = "tokio"

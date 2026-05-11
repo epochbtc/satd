@@ -1,0 +1,16 @@
+[package]
+name = "tls-config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+tokio-rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+rcgen = { workspace = true }
+tempfile = "3"

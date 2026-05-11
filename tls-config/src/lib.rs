@@ -1,14 +1,20 @@
-//! TLS configuration loading.
+//! Shared TLS configuration loading for satd's server-side TLS surfaces.
 //!
 //! Operator supplies PEM-encoded certificate + private-key files via
-//! `--esploratlscert` / `--esploratlskey`. We load them once at
-//! server start and build a [`tokio_rustls::TlsAcceptor`].
+//! per-surface flags (`--electrumtlscert` / `--esploratlscert` /
+//! `--rpctlscert`, and their matching `*tlskey`). Each surface loads
+//! the same PEM shape and builds a [`tokio_rustls::TlsAcceptor`]; this
+//! crate is the single implementation they share. Bitcoin Core's RPC
+//! is HTTP-only by design; the JSON-RPC TLS path here is satd-specific.
 //!
-//! Matches the Electrum-server shape so a single operator mental
-//! model covers both surfaces. v1 ships with operator-supplied PEM
-//! only; self-signed generate-on-first-start is documented as a
-//! deferred feature (raises key-rotation policy questions; defer
-//! until we pick a stance).
+//! v1 ships with operator-supplied PEM only; self-signed
+//! generate-on-first-start is documented as a deferred feature
+//! (raises key-rotation policy questions; defer until we pick a
+//! stance).
+//!
+//! The acceptor type is re-exported so consumers can refer to it
+//! through this crate without adding their own `tokio-rustls`
+//! dependency just to spell the return type.
 
 use std::fs::File;
 use std::io::BufReader;
@@ -16,8 +22,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use thiserror::Error;
-use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+pub use tokio_rustls::TlsAcceptor;
 
 #[derive(Debug, Error)]
 pub enum TlsConfigError {

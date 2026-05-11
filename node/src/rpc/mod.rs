@@ -9,5 +9,4 @@ pub mod network;
 pub mod psbt;
 pub mod rawtx;
 pub mod server;
-pub mod tls;
 pub mod util;

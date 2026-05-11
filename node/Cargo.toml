@@ -29,8 +29,7 @@ crossbeam-channel = { workspace = true }
 async-trait = { workspace = true }
 uuid = { workspace = true }
 parking_lot = { workspace = true }
-tokio-rustls = { workspace = true }
-rustls-pemfile = { workspace = true }
+tls-config = { path = "../tls-config" }
 
 consensus = { path = "../consensus" }
 node-index = { path = "../node-index" }

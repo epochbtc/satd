@@ -41,7 +41,6 @@ pub mod server;
 pub mod state;
 pub mod status;
 pub mod subscribe;
-pub mod tls;
 pub mod types;
 
 pub use config::ElectrumConfig;

@@ -1668,7 +1668,7 @@ async fn spawn_tls_surface(
     listener_status: Arc<ServerListenerStatus>,
     shutdown_rx: &mut watch::Receiver<bool>,
 ) -> Result<ServerHandle, Box<dyn std::error::Error + Send + Sync>> {
-    let acceptor = crate::rpc::tls::build_acceptor(&cfg.cert_path, &cfg.key_path)?;
+    let acceptor = tls_config::build_acceptor(&cfg.cert_path, &cfg.key_path)?;
     // Bind synchronously so a port conflict becomes a startup-fatal
     // error rather than a silently-dropped tokio task that never
     // accepts a connection.
