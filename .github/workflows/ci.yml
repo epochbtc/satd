@@ -118,6 +118,21 @@ jobs:
           SATD_BACKFILL_PREFLIGHT_BYTES: "0"
         run: cargo test --all --locked
 
+      - name: Run E2E suite
+        # The E2E suite (`tests/e2e.rs`) drives `satd` over real sockets
+        # via real clients (sat-cli, reqwest, electrum-client). It owns
+        # the boot-and-poll lifecycle per-test and is serialized so the
+        # tests don't contend over a single hosted-runner's RPC/P2P
+        # ports. SATD_E2E_TIMEOUT_MULT=3 gives more headroom than the
+        # unit-test mult of 2 because E2E chains poll loops on top of
+        # the harness's own startup wait.
+        env:
+          RUST_TEST_THREADS: "1"
+          SATD_TEST_TIMEOUT_MULT: "2"
+          SATD_E2E_TIMEOUT_MULT: "3"
+          SATD_BACKFILL_PREFLIGHT_BYTES: "0"
+        run: cargo test --test e2e --locked
+
   lint:
     name: "Lint"
     runs-on: ubuntu-24.04
