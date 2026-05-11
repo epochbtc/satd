@@ -11,7 +11,8 @@ use crate::rpc::auth::{AuthLayer, RpcAuth};
 use crate::rpc::{address, blockchain, indexes, mining, network, psbt, rawtx, util};
 use crate::storage::Store;
 use jsonrpsee::server::{
-    Methods, RpcModule, ServerBuilder, ServerHandle, serve_with_graceful_shutdown, stop_channel,
+    Methods, RpcModule, ServerBuilder, ServerConfig, ServerHandle, serve_with_graceful_shutdown,
+    stop_channel,
 };
 use jsonrpsee::types::ErrorObjectOwned;
 use parking_lot::RwLock;
@@ -1620,8 +1621,17 @@ pub async fn start(
     // Plain-HTTP server. AuthLayer wraps the RPC stack at the tower
     // layer, so TLS (when enabled) inherits the same auth transparently
     // — the auth middleware runs after HTTP parsing, not at the socket.
+    //
+    // `server_cfg` is built once and shared with the TLS path below so
+    // both surfaces enforce the same jsonrpsee core limits (connection
+    // cap, request/response size, batch config, etc.). Today the value
+    // is the library default — making the source explicit prevents a
+    // future tightening on this builder from silently leaving the TLS
+    // surface on the old (looser) defaults.
+    let server_cfg = ServerConfig::default();
     let plain_middleware = tower::ServiceBuilder::new().layer(AuthLayer::new(auth.clone()));
     let server = ServerBuilder::new()
+        .set_config(server_cfg.clone())
         .set_http_middleware(plain_middleware)
         .build(bind_addr)
         .await?;
@@ -1637,6 +1647,7 @@ pub async fn start(
         Some(
             spawn_tls_surface(
                 tls_cfg,
+                server_cfg,
                 auth,
                 methods,
                 listener_status_outer,
@@ -1663,6 +1674,7 @@ pub async fn start(
 /// process-level shutdown also terminates this surface.
 async fn spawn_tls_surface(
     cfg: RpcTlsConfig,
+    server_cfg: ServerConfig,
     auth: Arc<RpcAuth>,
     methods: Methods,
     listener_status: Arc<ServerListenerStatus>,
@@ -1693,6 +1705,7 @@ async fn spawn_tls_surface(
     // block.
     let tls_middleware = tower::ServiceBuilder::new().layer(AuthLayer::new(auth));
     let rpc_svc = ServerBuilder::new()
+        .set_config(server_cfg)
         .set_http_middleware(tls_middleware)
         .to_service_builder()
         .build(methods, stop_handle.clone());
