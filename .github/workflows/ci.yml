@@ -84,9 +84,6 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - name: Build all binaries
-        run: cargo build --all --locked
-
       - name: Run tests
         # Cap test parallelism. The default (one thread per CPU) lets the
         # regtest harness spin up 8+ satd processes simultaneously, each
