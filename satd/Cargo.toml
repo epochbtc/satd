@@ -12,6 +12,24 @@ default = ["block-filter-index"]
 # --no-default-features` on the satd binary produces a consensus-only
 # build with no BIP 158 codec compiled in.
 block-filter-index = ["node/block-filter-index"]
+# Marker for the E2E integration test target — see the `[[test]]`
+# section below. The general `cargo test --all --locked` step in CI
+# skips the e2e binary because its `required-features = ["e2e"]`
+# isn't satisfied; the dedicated E2E step enables it explicitly via
+# `--features e2e`. Without this gating, `cargo test --all` would
+# run the suite once with `RUST_TEST_THREADS=4` (defeating the
+# serialized contract) before the dedicated step runs it again.
+e2e = []
+
+# Pin the e2e integration test target to its own feature. Combined
+# with the `e2e = []` feature above, this keeps `cargo test --all`
+# from picking up the suite by accident. The Lint job runs
+# `cargo clippy --all-features` so the test code still gets
+# type-checked on every PR.
+[[test]]
+name = "e2e"
+path = "tests/e2e.rs"
+required-features = ["e2e"]
 
 [dependencies]
 node = { path = "../node", default-features = false }

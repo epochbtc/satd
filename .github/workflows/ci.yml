@@ -135,12 +135,19 @@ jobs:
         # ports. SATD_E2E_TIMEOUT_MULT=3 gives more headroom than the
         # unit-test mult of 2 because E2E chains poll loops on top of
         # the harness's own startup wait.
+        #
+        # `--features e2e` is required: the `[[test]] name = "e2e"`
+        # target in `satd/Cargo.toml` declares `required-features =
+        # ["e2e"]`, so the binary isn't built (and the suite isn't
+        # run) by the preceding `cargo test --all` step. The result:
+        # the e2e suite runs exactly once, in this step, with
+        # `RUST_TEST_THREADS=1` honoured.
         env:
           RUST_TEST_THREADS: "1"
           SATD_TEST_TIMEOUT_MULT: "2"
           SATD_E2E_TIMEOUT_MULT: "3"
           SATD_BACKFILL_PREFLIGHT_BYTES: "0"
-        run: cargo test --test e2e --locked
+        run: cargo test --test e2e --locked --features e2e
 
   lint:
     name: "Lint"

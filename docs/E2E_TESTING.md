@@ -26,10 +26,13 @@ Updated: 2026-05-11.
 cargo build -p sat-cli --locked
 
 # Run the full suite. Serialized — each test owns its own satd boot.
-cargo test --test e2e --locked -- --test-threads=1
+# `--features e2e` is mandatory: the e2e [[test]] target declares
+# `required-features = ["e2e"]` so it stays out of `cargo test --all`.
+cargo test --test e2e --locked --features e2e -- --test-threads=1
 
 # Or a single test.
-cargo test --test e2e --locked test_e2e_cross_surface_esplora_broadcast_visible_in_rpc_and_electrum \
+cargo test --test e2e --locked --features e2e \
+  test_e2e_cross_surface_esplora_broadcast_visible_in_rpc_and_electrum \
   -- --test-threads=1 --exact
 ```
 

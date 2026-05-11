@@ -103,27 +103,7 @@ impl TestNode {
         if !has_port {
             cmd.arg(format!("--port={}", p2p_port));
         }
-        // Disable the Esplora server unless the test explicitly opts in
-        // — it binds a fixed port (default :3000) and would conflict
-        // across parallel TestNode instances.
-        let caller_sets_esplora = extra_args.iter().any(|a| a.starts_with("--esplora"));
-        let esplora_explicitly_on = extra_args
-            .iter()
-            .any(|a| *a == "--esplora=1" || *a == "--esplora=true");
-        if !caller_sets_esplora {
-            cmd.arg("--esplora=0");
-        }
-        // Esplora's tx + outspend endpoints require txindex; satd now
-        // refuses to start `--esplora=1 --txindex=0`. Auto-add the flag
-        // for tests that turn Esplora on but don't otherwise care.
-        // Same coupling for Electrum's transaction.* / get_merkle paths.
-        let caller_sets_txindex = extra_args.iter().any(|a| a.starts_with("--txindex"));
-        let electrum_explicitly_on = extra_args
-            .iter()
-            .any(|a| *a == "--electrum=1" || *a == "--electrum=true");
-        if (esplora_explicitly_on || electrum_explicitly_on) && !caller_sets_txindex {
-            cmd.arg("--txindex");
-        }
+        apply_listener_arg_defaults(&mut cmd, extra_args);
         for arg in extra_args {
             cmd.arg(arg);
         }
@@ -242,10 +222,7 @@ impl TestNode {
         if !has_port {
             cmd.arg(format!("--port={}", p2p_port));
         }
-        let caller_sets_esplora = extra_args.iter().any(|a| a.starts_with("--esplora"));
-        if !caller_sets_esplora {
-            cmd.arg("--esplora=0");
-        }
+        apply_listener_arg_defaults(&mut cmd, extra_args);
         for arg in extra_args {
             cmd.arg(arg);
         }
@@ -404,6 +381,38 @@ impl Drop for TestNode {
         let _ = self.process.kill();
         let _ = self.process.wait();
         let _ = std::fs::remove_dir_all(&self.datadir);
+    }
+}
+
+/// Apply the listener-coupling defaults that both startup paths
+/// share. Centralised so the restart-path (`start_with_datadir_env`)
+/// stays consistent with the cold-start path (`start_with_env`) as
+/// new listener flags are added — the kind of drift the L2 review
+/// finding called out.
+///
+/// Rules:
+/// - `--esplora=0` unless the caller passed any `--esplora*` flag.
+///   The Esplora server binds a fixed port (default :3000) and would
+///   conflict across parallel `TestNode` instances.
+/// - `--txindex` when Esplora or Electrum is explicitly enabled and
+///   the caller didn't otherwise set txindex. satd refuses to start
+///   `--esplora=1 --txindex=0` (the tx + outspend / get_merkle
+///   endpoints all require txindex), and an unhelpful refuse-to-start
+///   is the most common footgun for new tests.
+fn apply_listener_arg_defaults(cmd: &mut Command, extra_args: &[&str]) {
+    let caller_sets_esplora = extra_args.iter().any(|a| a.starts_with("--esplora"));
+    let esplora_explicitly_on = extra_args
+        .iter()
+        .any(|a| *a == "--esplora=1" || *a == "--esplora=true");
+    if !caller_sets_esplora {
+        cmd.arg("--esplora=0");
+    }
+    let caller_sets_txindex = extra_args.iter().any(|a| a.starts_with("--txindex"));
+    let electrum_explicitly_on = extra_args
+        .iter()
+        .any(|a| *a == "--electrum=1" || *a == "--electrum=true");
+    if (esplora_explicitly_on || electrum_explicitly_on) && !caller_sets_txindex {
+        cmd.arg("--txindex");
     }
 }
 
