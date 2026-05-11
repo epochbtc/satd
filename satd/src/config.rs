@@ -358,6 +358,21 @@ pub struct Config {
     pub electrum_tls_cert: Option<std::path::PathBuf>,
     /// Path to PEM-encoded TLS private key.
     pub electrum_tls_key: Option<std::path::PathBuf>,
+    /// Require mutual TLS on the Electrum TLS listener. Off by default
+    /// (backwards-compatible with electrs). When `true`, both
+    /// `electrum_tls_bind` and `electrum_mtls_client_ca` MUST be set;
+    /// the server refuses any client without a cert validly signed by
+    /// the configured CA. Electrum has no application auth today, so
+    /// the mTLS handshake is the only gate.
+    pub electrum_mtls: bool,
+    /// PEM CA bundle used to verify client certificates on the
+    /// Electrum TLS surface. Required when `electrum_mtls = true`.
+    pub electrum_mtls_client_ca: Option<std::path::PathBuf>,
+    /// Optional allowlist of accepted client-cert subject identities
+    /// (CN / DNS-SAN, case-insensitive). Empty means "any CA-signed
+    /// cert is accepted"; non-empty narrows further. Repeatable
+    /// `--electrummtlsclientallow` or comma-separated.
+    pub electrum_mtls_client_allow: Vec<String>,
     /// Hard cap on simultaneously-open connections.
     pub electrum_max_conns: usize,
     /// Per-connection scripthash subscription cap.
@@ -886,6 +901,33 @@ impl Config {
         let electrum_tls_key = cli
             .electrumtlskey
             .or_else(|| file_get("electrumtlskey").map(std::path::PathBuf::from));
+        let electrum_mtls = cli
+            .electrummtls
+            .or_else(|| file_get("electrummtls").and_then(|v| parse_bool(&v)))
+            .unwrap_or(false);
+        let electrum_mtls_client_ca = cli
+            .electrummtlsclientca
+            .or_else(|| file_get("electrummtlsclientca").map(std::path::PathBuf::from));
+        let electrum_mtls_client_allow = {
+            // Match the `esploracors` pattern: CLI takes precedence; if
+            // no CLI values were given, fall back to all matching keys
+            // in bitcoin.conf (so `electrummtlsclientallow=alice` lines
+            // accumulate). Comma-separated values inside a single flag
+            // are split here so operators can pick whichever style.
+            let mut values: Vec<String> = cli.electrummtlsclientallow.clone();
+            if values.is_empty() {
+                values = file_get_all("electrummtlsclientallow");
+            }
+            values
+                .into_iter()
+                .flat_map(|v| {
+                    v.split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        };
         let electrum_max_conns = cli
             .electrummaxconns
             .or_else(|| file_get("electrummaxconns").and_then(|v| v.parse().ok()))
@@ -937,6 +979,17 @@ impl Config {
             return Err(
                 "--electrumtlsbind requires --electrumtlscert AND --electrumtlskey".to_string(),
             );
+        }
+        // mTLS validation. Strictly additive: enabling mTLS requires
+        // an existing TLS surface (cert + key + bind) plus the
+        // operator-supplied CA bundle. We catch all three here so the
+        // CLI surfaces a single friendly message; the server-side
+        // `bind` also checks the CA-without-mTLS combination.
+        if electrum_mtls && electrum_tls_bind.is_none() {
+            return Err("--electrummtls=1 requires --electrumtlsbind".to_string());
+        }
+        if electrum_mtls && electrum_mtls_client_ca.is_none() {
+            return Err("--electrummtls=1 requires --electrummtlsclientca".to_string());
         }
 
         let prune = cli
@@ -1116,6 +1169,9 @@ impl Config {
             electrum_tls_bind,
             electrum_tls_cert,
             electrum_tls_key,
+            electrum_mtls,
+            electrum_mtls_client_ca,
+            electrum_mtls_client_allow,
             electrum_max_conns,
             electrum_max_subs_per_conn,
             electrum_request_timeout,
@@ -1430,6 +1486,12 @@ impl Config {
                 "enabled": self.electrum,
                 "bind": if self.electrum { Some(self.electrum_bind.clone()) } else { None },
                 "tls_bind": if self.electrum { self.electrum_tls_bind.clone() } else { None },
+                "mtls": if self.electrum { Some(self.electrum_mtls) } else { None },
+                "mtls_client_allow_count": if self.electrum {
+                    Some(self.electrum_mtls_client_allow.len())
+                } else {
+                    None
+                },
             },
             "block_filter_index": {
                 "enabled": self.blockfilterindex,
@@ -1723,6 +1785,28 @@ pub struct CliArgs {
         help = "Path to PEM-encoded TLS private key for the Electrum server"
     )]
     pub electrumtlskey: Option<std::path::PathBuf>,
+
+    #[arg(
+        long,
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        help = "Require mutual TLS on the Electrum TLS listener (default: false). Requires --electrumtlsbind and --electrummtlsclientca."
+    )]
+    pub electrummtls: Option<bool>,
+
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Path to PEM CA bundle used to verify client certificates when --electrummtls=1"
+    )]
+    pub electrummtlsclientca: Option<std::path::PathBuf>,
+
+    #[arg(
+        long,
+        value_name = "NAME",
+        help = "Allowlist of accepted client-cert CN / DNS-SAN values (repeatable, comma-separated). Empty = any cert validly signed by the CA."
+    )]
+    pub electrummtlsclientallow: Vec<String>,
 
     #[arg(
         long,
@@ -2247,6 +2331,9 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "electrumtlsbind",
         "electrumtlscert",
         "electrumtlskey",
+        "electrummtls",
+        "electrummtlsclientca",
+        "electrummtlsclientallow",
         "electrummaxconns",
         "electrummaxsubsperconn",
         "electrumrequesttimeout",
@@ -2548,6 +2635,9 @@ rpcport=8332
             electrumtlsbind: None,
             electrumtlscert: None,
             electrumtlskey: None,
+            electrummtls: None,
+            electrummtlsclientca: None,
+            electrummtlsclientallow: vec![],
             electrummaxconns: None,
             electrummaxsubsperconn: None,
             electrumrequesttimeout: None,
@@ -2674,6 +2764,9 @@ rpcport=8332
             electrumtlsbind: None,
             electrumtlscert: None,
             electrumtlskey: None,
+            electrummtls: None,
+            electrummtlsclientca: None,
+            electrummtlsclientallow: vec![],
             electrummaxconns: None,
             electrummaxsubsperconn: None,
             electrumrequesttimeout: None,
@@ -2860,5 +2953,95 @@ rpcport=8332
         .unwrap();
         let config = Config::from_cli(cli).expect("complete --rpctls* triple should load");
         assert_eq!(config.rpc_tls_bind.as_deref(), Some("127.0.0.1:8333"));
+    }
+
+    /// Electrum mTLS flag-shape validation. `--electrummtls=1` must
+    /// pair with `--electrumtlsbind` AND `--electrummtlsclientca`;
+    /// either alone is a config-load error. With all three set, the
+    /// load proceeds (cert/CA parsing happens later at bind time).
+    #[test]
+    fn test_electrum_mtls_partial_config_is_rejected() {
+        // No TLS surface at all — `--electrummtls=1` without
+        // `--electrumtlsbind` must error.
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-test",
+            "--electrum=1",
+            "--electrummtls=1",
+        ])
+        .unwrap();
+        let err = Config::from_cli(cli).unwrap_err();
+        assert!(
+            err.contains("electrumtlsbind") || err.contains("electrummtls"),
+            "expected mTLS-without-TLS error, got: {err}"
+        );
+
+        // TLS surface present, but no CA bundle — must error.
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-test",
+            "--electrum=1",
+            "--electrumtlsbind=127.0.0.1:50002",
+            "--electrumtlscert=/tmp/cert.pem",
+            "--electrumtlskey=/tmp/key.pem",
+            "--electrummtls=1",
+            // missing --electrummtlsclientca
+        ])
+        .unwrap();
+        let err = Config::from_cli(cli).unwrap_err();
+        assert!(
+            err.contains("electrummtlsclientca"),
+            "expected missing-CA error, got: {err}"
+        );
+
+        // All four present — config loads.
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-test",
+            "--electrum=1",
+            "--electrumtlsbind=127.0.0.1:50002",
+            "--electrumtlscert=/tmp/cert.pem",
+            "--electrumtlskey=/tmp/key.pem",
+            "--electrummtls=1",
+            "--electrummtlsclientca=/tmp/ca.pem",
+        ])
+        .unwrap();
+        let config = Config::from_cli(cli)
+            .expect("complete --electrummtls* triple plus TLS triple should load");
+        assert!(config.electrum_mtls);
+        assert_eq!(
+            config.electrum_mtls_client_ca.as_deref(),
+            Some(std::path::Path::new("/tmp/ca.pem"))
+        );
+    }
+
+    /// Allowlist parsing: comma-separated single flag, repeated
+    /// flags, and a mix all collapse to the same `Vec<String>` shape.
+    #[test]
+    fn test_electrum_mtls_clientallow_parses() {
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-test",
+            "--electrum=1",
+            "--electrumtlsbind=127.0.0.1:50002",
+            "--electrumtlscert=/tmp/cert.pem",
+            "--electrumtlskey=/tmp/key.pem",
+            "--electrummtls=1",
+            "--electrummtlsclientca=/tmp/ca.pem",
+            "--electrummtlsclientallow=alice,bob",
+            "--electrummtlsclientallow=carol",
+        ])
+        .unwrap();
+        let config = Config::from_cli(cli).unwrap();
+        // Order is not guaranteed (we flatten through iterator), but
+        // contents must be exactly the three names with no commas
+        // hiding inside.
+        let mut names = config.electrum_mtls_client_allow.clone();
+        names.sort();
+        assert_eq!(names, vec!["alice", "bob", "carol"]);
     }
 }

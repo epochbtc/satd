@@ -55,6 +55,22 @@ pub struct ElectrumConfig {
     /// Path to the TLS server private key (PEM). Read once at
     /// server start and held in memory.
     pub tls_key_path: Option<PathBuf>,
+    /// Whether to require mutual TLS on the TLS listener. Only
+    /// meaningful when `tls_bind` is set. When `true`, `mtls_client_ca`
+    /// MUST also be `Some` and the handshake will refuse any client
+    /// that does not present a cert validly signed by the supplied CA.
+    /// mTLS is strictly additive: Electrum has no application auth
+    /// today, so when this is enabled the handshake is the only gate.
+    pub mtls_enabled: bool,
+    /// Path to the PEM CA bundle used to verify client certificates
+    /// when `mtls_enabled` is `true`. Loaded once at server start; the
+    /// trust anchor set is held in memory.
+    pub mtls_client_ca: Option<PathBuf>,
+    /// Optional allowlist of accepted client-cert subject identities
+    /// (CN and DNS-SAN values, case-insensitive). Empty = no further
+    /// filter beyond the CA. Operators who want a narrow set of
+    /// principals supply `--electrummtlsclientallow=alice,bob`.
+    pub mtls_client_allow: Vec<String>,
     /// Banner string returned by `server.banner`. `None` falls back to
     /// a default constructed at server start (`format!("powered by
     /// satd {}", version)`).
@@ -97,6 +113,9 @@ impl Default for ElectrumConfig {
             tls_bind: None,
             tls_cert_path: None,
             tls_key_path: None,
+            mtls_enabled: false,
+            mtls_client_ca: None,
+            mtls_client_allow: Vec::new(),
             banner: None,
             donation_address: String::new(),
             max_history_entries: MAX_HISTORY_ENTRIES,

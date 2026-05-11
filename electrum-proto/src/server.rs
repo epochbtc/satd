@@ -46,6 +46,10 @@ pub enum ElectrumServerError {
     Tls(#[from] TlsConfigError),
     #[error("tls misconfigured: tls_bind set without tls_cert_path / tls_key_path")]
     TlsMissingPaths,
+    #[error("mtls misconfigured: mtls_enabled set without tls_bind")]
+    MtlsWithoutTls,
+    #[error("mtls misconfigured: mtls_enabled set without mtls_client_ca")]
+    MtlsMissingCa,
 }
 
 /// Boxed sync dispatcher owned by a single connection. `FnMut` so the
@@ -85,6 +89,11 @@ pub fn state_connection_factory(state: Arc<ElectrumState>) -> ConnectionFactory 
 pub struct ElectrumServer {
     listener: TcpListener,
     tls: Option<(TcpListener, TlsAcceptor)>,
+    /// Compiled allowlist applied after a successful mTLS handshake.
+    /// `is_empty()` short-circuits to "any CA-signed cert is accepted".
+    /// Held alongside the acceptor so `handle_tls_accept` doesn't have
+    /// to reach back into the config on every connection.
+    allow: tls_config::ClientAllowList,
     factory: ConnectionFactory,
     config: Arc<ElectrumConfig>,
     semaphore: Arc<Semaphore>,
@@ -115,6 +124,18 @@ impl ElectrumServer {
                     source,
                 })?;
 
+        // Validate mTLS configuration up front so a misconfiguration
+        // becomes a startup-fatal error rather than per-handshake
+        // failures later. mTLS is meaningful only on the TLS surface;
+        // requiring it without a TLS bind is operator confusion we
+        // refuse to paper over.
+        if config.mtls_enabled && config.tls_bind.is_none() {
+            return Err(ElectrumServerError::MtlsWithoutTls);
+        }
+        if config.mtls_enabled && config.mtls_client_ca.is_none() {
+            return Err(ElectrumServerError::MtlsMissingCa);
+        }
+
         // If a TLS bind is configured, ALL of (tls_bind, tls_cert_path,
         // tls_key_path) must be set; partial configuration is a hard
         // startup error rather than silently ignored.
@@ -128,11 +149,18 @@ impl ElectrumServer {
                 return Err(ElectrumServerError::TlsMissingPaths);
             }
             (Some(addr), Some(cert), Some(key)) => {
-                // PR 1: pass `ClientAuthPolicy::Disabled` so the call
-                // site is migrated to the new signature without
-                // changing behavior. PR 2 wires the per-surface mTLS
-                // flags through to this `build_acceptor` call.
-                let acceptor = build_acceptor(cert, key, &ClientAuthPolicy::Disabled)?;
+                // mTLS picks the client-auth policy. When disabled,
+                // we keep the historical "any client" handshake; when
+                // enabled, the operator's CA is the trust anchor and
+                // unsigned clients are rejected at the rustls layer.
+                let policy = match (config.mtls_enabled, config.mtls_client_ca.as_ref()) {
+                    (true, Some(ca)) => ClientAuthPolicy::Required {
+                        ca_path: ca.clone(),
+                    },
+                    (true, None) => unreachable!("mTLS validation above guarantees CA path"),
+                    (false, _) => ClientAuthPolicy::Disabled,
+                };
+                let acceptor = build_acceptor(cert, key, &policy)?;
                 let tls_listener = TcpListener::bind(addr)
                     .await
                     .map_err(|source| ElectrumServerError::Bind { addr, source })?;
@@ -140,10 +168,13 @@ impl ElectrumServer {
             }
         };
 
+        let allow = tls_config::ClientAllowList::new(config.mtls_client_allow.iter().cloned());
+
         let semaphore = Arc::new(Semaphore::new(config.max_conns.max(1)));
         Ok(Self {
             listener,
             tls,
+            allow,
             factory,
             config: Arc::new(config),
             semaphore,
@@ -261,6 +292,7 @@ impl ElectrumServer {
                 let factory = self.factory.clone();
                 let config = self.config.clone();
                 let conn_shutdown = shutdown.clone();
+                let allow = self.allow.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
                     // Bound the TLS handshake so a half-open client
@@ -286,6 +318,32 @@ impl ElectrumServer {
                             return;
                         }
                     };
+                    // After a successful (m)TLS handshake, optionally
+                    // narrow to the operator's CN/SAN allowlist. When
+                    // `allow` is empty (no allowlist configured), the
+                    // CA bundle remains the only gate and this check
+                    // is a no-op. When mTLS is disabled entirely, the
+                    // handshake produces no peer cert and the check
+                    // also returns Ok via the empty-allowlist
+                    // short-circuit.
+                    let (_, server_conn) = tls_stream.get_ref();
+                    if config.mtls_enabled
+                        && let Some(subject) = tls_config::peer_subject_label(server_conn)
+                    {
+                        tracing::info!(
+                            peer = %peer,
+                            subject = %subject,
+                            "Electrum mTLS client accepted",
+                        );
+                    }
+                    if let Err(rej) = tls_config::check_peer_allowed(server_conn, &allow) {
+                        tracing::warn!(
+                            peer = %peer,
+                            subject = %rej.subject_label,
+                            "Electrum mTLS client rejected by allowlist",
+                        );
+                        return;
+                    }
                     let (dispatch, notify_rx) = factory(config.max_subs_per_conn);
                     if let Err(e) =
                         handle_connection(tls_stream, dispatch, notify_rx, config, conn_shutdown)
@@ -730,6 +788,466 @@ mod tests {
         };
         let result = ElectrumServer::bind_with_factory(cfg, echo_factory()).await;
         assert!(matches!(result, Err(ElectrumServerError::TlsMissingPaths)));
+    }
+
+    /// Mint a CA + a leaf signed by it. The CA cert is what the
+    /// server's mTLS verifier trusts; the leaf is what the client
+    /// presents during handshake. rcgen 0.13 splits "CA" from "leaf"
+    /// via `KeyUsagePurpose::KeyCertSign` and a callback to
+    /// `signed_by`.
+    fn mint_ca_and_leaf(
+        leaf_dns: &str,
+    ) -> (
+        rcgen::Certificate, // CA root
+        rcgen::KeyPair,     // CA key (needed to sign more leaves)
+        rcgen::Certificate, // leaf signed by CA
+        rcgen::KeyPair,     // leaf private key
+    ) {
+        // CA
+        let mut ca_params = rcgen::CertificateParams::new(vec![]).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
+        ca_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "test-ca");
+        let ca_kp = rcgen::KeyPair::generate().unwrap();
+        let ca_cert = ca_params.self_signed(&ca_kp).unwrap();
+        // Leaf
+        let mut leaf_params = rcgen::CertificateParams::new(vec![leaf_dns.to_string()]).unwrap();
+        leaf_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, leaf_dns);
+        let leaf_kp = rcgen::KeyPair::generate().unwrap();
+        let leaf_cert = leaf_params.signed_by(&leaf_kp, &ca_cert, &ca_kp).unwrap();
+        (ca_cert, ca_kp, leaf_cert, leaf_kp)
+    }
+
+    fn write_file(path: &std::path::Path, body: &str) {
+        use std::io::Write;
+        std::fs::File::create(path)
+            .unwrap()
+            .write_all(body.as_bytes())
+            .unwrap();
+    }
+
+    /// Helper to build a client `TlsConnector` that trusts `ca_cert`
+    /// and (optionally) presents a leaf cert + key during handshake.
+    fn client_connector(
+        ca_cert: &rcgen::Certificate,
+        client_id: Option<(&rcgen::Certificate, &rcgen::KeyPair)>,
+    ) -> tokio_rustls::TlsConnector {
+        use tokio_rustls::TlsConnector;
+        use tokio_rustls::rustls::ClientConfig;
+        use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+        let mut roots = tokio_rustls::rustls::RootCertStore::empty();
+        roots.add(ca_cert.der().clone()).unwrap();
+        let builder = ClientConfig::builder().with_root_certificates(roots);
+        let client_cfg = match client_id {
+            Some((leaf, kp)) => {
+                let leaf_der: CertificateDer<'static> = leaf.der().clone();
+                let key_der: PrivateKeyDer<'static> =
+                    PrivatePkcs8KeyDer::from(kp.serialize_der()).into();
+                builder
+                    .with_client_auth_cert(vec![leaf_der], key_der)
+                    .unwrap()
+            }
+            None => builder.with_no_client_auth(),
+        };
+        TlsConnector::from(Arc::new(client_cfg))
+    }
+
+    /// Helper: run an Electrum request over a `tokio_rustls`-backed
+    /// connection, asserting that the round trip completes. Used by
+    /// the mTLS-happy-path tests below.
+    async fn run_electrum_ping_over_tls(
+        connector: tokio_rustls::TlsConnector,
+        addr: SocketAddr,
+        dns: &str,
+    ) -> Value {
+        use tokio_rustls::rustls::pki_types::ServerName;
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let dnsname = ServerName::try_from(dns.to_string()).unwrap();
+        let mut tls_stream = connector.connect(dnsname, tcp).await.unwrap();
+        let req = json!({"jsonrpc":"2.0","id":7,"method":"server.ping","params":[]});
+        let s = serde_json::to_string(&req).unwrap();
+        tls_stream.write_all(s.as_bytes()).await.unwrap();
+        tls_stream.write_all(b"\n").await.unwrap();
+        tls_stream.flush().await.unwrap();
+        let mut reader = tokio::io::BufReader::new(tls_stream);
+        let mut line = String::new();
+        tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line)
+            .await
+            .unwrap();
+        serde_json::from_str(line.trim_end()).unwrap()
+    }
+
+    /// mTLS happy-path: server requires a client cert signed by the
+    /// configured CA; the client presents a valid leaf; the request
+    /// round-trips end to end.
+    #[tokio::test]
+    async fn mtls_round_trip_with_valid_client_cert() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ca_cert, ca_kp, server_cert, server_kp) = mint_ca_and_leaf("localhost");
+        // Mint a client leaf using the SAME CA root the server is
+        // configured to trust.
+        let mut client_params =
+            rcgen::CertificateParams::new(vec!["alice.test".to_string()]).unwrap();
+        client_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "alice.test");
+        let client_kp = rcgen::KeyPair::generate().unwrap();
+        let client_cert = client_params
+            .signed_by(&client_kp, &ca_cert, &ca_kp)
+            .unwrap();
+        let server_cert_path = dir.path().join("server.pem");
+        let server_key_path = dir.path().join("server.key.pem");
+        let ca_path = dir.path().join("ca.pem");
+        write_file(&server_cert_path, &server_cert.pem());
+        write_file(&server_key_path, &server_kp.serialize_pem());
+        write_file(&ca_path, &ca_cert.pem());
+
+        let cfg = ElectrumConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            tls_bind: Some("127.0.0.1:0".parse().unwrap()),
+            tls_cert_path: Some(server_cert_path),
+            tls_key_path: Some(server_key_path),
+            mtls_enabled: true,
+            mtls_client_ca: Some(ca_path),
+            max_conns: 4,
+            ..Default::default()
+        };
+        let server = ElectrumServer::bind_with_factory(cfg, echo_factory())
+            .await
+            .unwrap();
+        let tls_addr = server.local_tls_addr().unwrap().unwrap();
+        let (sd_tx, sd_rx) = watch::channel(false);
+        let join = tokio::spawn(server.serve(sd_rx));
+
+        let connector = client_connector(&ca_cert, Some((&client_cert, &client_kp)));
+        let v = run_electrum_ping_over_tls(connector, tls_addr, "localhost").await;
+        assert_eq!(v["id"], 7);
+        assert_eq!(v["result"]["method"], "server.ping");
+
+        sd_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), join).await;
+    }
+
+    /// mTLS rejection: server requires a client cert; the client
+    /// presents no cert. In TLS 1.3 the client's `connect()` may
+    /// resolve locally before the server's verifier rejects, so we
+    /// assert that the first application read returns an error /
+    /// EOF rather than a JSON response.
+    #[tokio::test]
+    async fn mtls_rejects_handshake_without_client_cert() {
+        use tokio_rustls::rustls::pki_types::ServerName;
+        let dir = tempfile::tempdir().unwrap();
+        let (ca_cert, _ca_kp, server_cert, server_kp) = mint_ca_and_leaf("localhost");
+        let server_cert_path = dir.path().join("server.pem");
+        let server_key_path = dir.path().join("server.key.pem");
+        let ca_path = dir.path().join("ca.pem");
+        write_file(&server_cert_path, &server_cert.pem());
+        write_file(&server_key_path, &server_kp.serialize_pem());
+        write_file(&ca_path, &ca_cert.pem());
+
+        let cfg = ElectrumConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            tls_bind: Some("127.0.0.1:0".parse().unwrap()),
+            tls_cert_path: Some(server_cert_path),
+            tls_key_path: Some(server_key_path),
+            mtls_enabled: true,
+            mtls_client_ca: Some(ca_path),
+            max_conns: 4,
+            ..Default::default()
+        };
+        let server = ElectrumServer::bind_with_factory(cfg, echo_factory())
+            .await
+            .unwrap();
+        let tls_addr = server.local_tls_addr().unwrap().unwrap();
+        let (sd_tx, sd_rx) = watch::channel(false);
+        let join = tokio::spawn(server.serve(sd_rx));
+
+        // Client trusts the CA but presents no client cert.
+        let connector = client_connector(&ca_cert, None);
+        let tcp = TcpStream::connect(tls_addr).await.unwrap();
+        let dnsname = ServerName::try_from("localhost").unwrap();
+        // Either `connect` itself errors (TLS 1.2 path), or it returns
+        // Ok and the first read fails when the server's verifier
+        // alert reaches the client (TLS 1.3 half-RTT). Both shapes
+        // mean "the server refused this client" — we accept either.
+        let assert_rejected = |outcome: Result<String, String>| {
+            assert!(
+                outcome.is_err(),
+                "expected mTLS rejection, got JSON line: {outcome:?}"
+            );
+        };
+        match connector.connect(dnsname, tcp).await {
+            Err(_) => assert_rejected(Err("connect failed".into())),
+            Ok(mut stream) => {
+                let _ = stream
+                    .write_all(
+                        b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"server.ping\",\"params\":[]}\n",
+                    )
+                    .await;
+                let _ = stream.flush().await;
+                let mut reader = tokio::io::BufReader::new(stream);
+                let mut line = String::new();
+                let read = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line),
+                )
+                .await;
+                let outcome: Result<String, String> = match read {
+                    Ok(Ok(0)) => Err("EOF".into()),
+                    Ok(Ok(_)) => Ok(line),
+                    Ok(Err(e)) => Err(e.to_string()),
+                    Err(_) => panic!("read did not return promptly after server rejection"),
+                };
+                assert_rejected(outcome);
+            }
+        }
+
+        sd_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), join).await;
+    }
+
+    /// mTLS rejection: server requires CA-signed client cert; client
+    /// presents a cert signed by a DIFFERENT CA. Server-side
+    /// verifier rejects; in TLS 1.3 the rejection surfaces on the
+    /// first read.
+    #[tokio::test]
+    async fn mtls_rejects_wrong_ca_client_cert() {
+        use tokio_rustls::rustls::pki_types::ServerName;
+        let dir = tempfile::tempdir().unwrap();
+        let (good_ca, _good_ca_kp, server_cert, server_kp) = mint_ca_and_leaf("localhost");
+        let (_other_ca, _other_ca_kp, other_leaf, other_leaf_kp) = mint_ca_and_leaf("alice.test");
+        let server_cert_path = dir.path().join("server.pem");
+        let server_key_path = dir.path().join("server.key.pem");
+        let ca_path = dir.path().join("good-ca.pem");
+        write_file(&server_cert_path, &server_cert.pem());
+        write_file(&server_key_path, &server_kp.serialize_pem());
+        write_file(&ca_path, &good_ca.pem());
+
+        let cfg = ElectrumConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            tls_bind: Some("127.0.0.1:0".parse().unwrap()),
+            tls_cert_path: Some(server_cert_path),
+            tls_key_path: Some(server_key_path),
+            mtls_enabled: true,
+            mtls_client_ca: Some(ca_path),
+            max_conns: 4,
+            ..Default::default()
+        };
+        let server = ElectrumServer::bind_with_factory(cfg, echo_factory())
+            .await
+            .unwrap();
+        let tls_addr = server.local_tls_addr().unwrap().unwrap();
+        let (sd_tx, sd_rx) = watch::channel(false);
+        let join = tokio::spawn(server.serve(sd_rx));
+
+        // Client presents a leaf signed by a DIFFERENT CA. Trust the
+        // SERVER cert's CA so the *server-auth* half of the handshake
+        // succeeds (so we exercise the client-auth rejection path).
+        let connector = client_connector(&good_ca, Some((&other_leaf, &other_leaf_kp)));
+        let tcp = TcpStream::connect(tls_addr).await.unwrap();
+        let dnsname = ServerName::try_from("localhost").unwrap();
+        // Same accept-both shape as the no-cert case above:
+        // `connect()` may succeed locally in TLS 1.3 with the
+        // rejection arriving on the first read.
+        match connector.connect(dnsname, tcp).await {
+            Err(_) => { /* connect-time rejection — accepted */ }
+            Ok(mut stream) => {
+                let _ = stream
+                    .write_all(
+                        b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"server.ping\",\"params\":[]}\n",
+                    )
+                    .await;
+                let _ = stream.flush().await;
+                let mut reader = tokio::io::BufReader::new(stream);
+                let mut line = String::new();
+                let read = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line),
+                )
+                .await;
+                match read {
+                    Ok(Ok(0)) => { /* EOF — expected */ }
+                    Ok(Ok(_)) => panic!("expected mTLS rejection, got: {line:?}"),
+                    Ok(Err(_)) => { /* IO error — expected */ }
+                    Err(_) => panic!("read did not return promptly after server rejection"),
+                }
+            }
+        }
+
+        sd_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), join).await;
+    }
+
+    /// Allowlist happy-path: server requires mTLS AND restricts
+    /// principals to the named set. Client cert's CN matches one of
+    /// them. The request round-trips end to end.
+    #[tokio::test]
+    async fn mtls_allowlist_accepts_matching_cn() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ca_cert, ca_kp, server_cert, server_kp) = mint_ca_and_leaf("localhost");
+        let mut client_params =
+            rcgen::CertificateParams::new(vec!["alice.test".to_string()]).unwrap();
+        client_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "alice");
+        let client_kp = rcgen::KeyPair::generate().unwrap();
+        let client_cert = client_params
+            .signed_by(&client_kp, &ca_cert, &ca_kp)
+            .unwrap();
+
+        let server_cert_path = dir.path().join("server.pem");
+        let server_key_path = dir.path().join("server.key.pem");
+        let ca_path = dir.path().join("ca.pem");
+        write_file(&server_cert_path, &server_cert.pem());
+        write_file(&server_key_path, &server_kp.serialize_pem());
+        write_file(&ca_path, &ca_cert.pem());
+
+        let cfg = ElectrumConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            tls_bind: Some("127.0.0.1:0".parse().unwrap()),
+            tls_cert_path: Some(server_cert_path),
+            tls_key_path: Some(server_key_path),
+            mtls_enabled: true,
+            mtls_client_ca: Some(ca_path),
+            mtls_client_allow: vec!["alice".to_string(), "bob".to_string()],
+            max_conns: 4,
+            ..Default::default()
+        };
+        let server = ElectrumServer::bind_with_factory(cfg, echo_factory())
+            .await
+            .unwrap();
+        let tls_addr = server.local_tls_addr().unwrap().unwrap();
+        let (sd_tx, sd_rx) = watch::channel(false);
+        let join = tokio::spawn(server.serve(sd_rx));
+
+        let connector = client_connector(&ca_cert, Some((&client_cert, &client_kp)));
+        let v = run_electrum_ping_over_tls(connector, tls_addr, "localhost").await;
+        assert_eq!(v["id"], 7);
+
+        sd_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), join).await;
+    }
+
+    /// Allowlist rejection: handshake succeeds (cert is CA-signed),
+    /// but the leaf's CN / SAN don't match the allowlist. The
+    /// connection is dropped post-handshake. The client sees a clean
+    /// disconnect with no data.
+    #[tokio::test]
+    async fn mtls_allowlist_rejects_unlisted_principal() {
+        use tokio_rustls::rustls::pki_types::ServerName;
+        let dir = tempfile::tempdir().unwrap();
+        let (ca_cert, ca_kp, server_cert, server_kp) = mint_ca_and_leaf("localhost");
+        let mut client_params =
+            rcgen::CertificateParams::new(vec!["mallory.test".to_string()]).unwrap();
+        client_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "mallory");
+        let client_kp = rcgen::KeyPair::generate().unwrap();
+        let client_cert = client_params
+            .signed_by(&client_kp, &ca_cert, &ca_kp)
+            .unwrap();
+
+        let server_cert_path = dir.path().join("server.pem");
+        let server_key_path = dir.path().join("server.key.pem");
+        let ca_path = dir.path().join("ca.pem");
+        write_file(&server_cert_path, &server_cert.pem());
+        write_file(&server_key_path, &server_kp.serialize_pem());
+        write_file(&ca_path, &ca_cert.pem());
+
+        let cfg = ElectrumConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            tls_bind: Some("127.0.0.1:0".parse().unwrap()),
+            tls_cert_path: Some(server_cert_path),
+            tls_key_path: Some(server_key_path),
+            mtls_enabled: true,
+            mtls_client_ca: Some(ca_path),
+            mtls_client_allow: vec!["alice".to_string(), "bob".to_string()],
+            max_conns: 4,
+            ..Default::default()
+        };
+        let server = ElectrumServer::bind_with_factory(cfg, echo_factory())
+            .await
+            .unwrap();
+        let tls_addr = server.local_tls_addr().unwrap().unwrap();
+        let (sd_tx, sd_rx) = watch::channel(false);
+        let join = tokio::spawn(server.serve(sd_rx));
+
+        // Handshake succeeds — mallory has a valid CA-signed cert.
+        // Post-handshake, the allowlist drops the connection before
+        // any request can be dispatched. We assert the read returns
+        // EOF rather than a response line.
+        let connector = client_connector(&ca_cert, Some((&client_cert, &client_kp)));
+        let tcp = TcpStream::connect(tls_addr).await.unwrap();
+        let dnsname = ServerName::try_from("localhost").unwrap();
+        let mut tls_stream = connector.connect(dnsname, tcp).await.unwrap();
+        // Send a request; the server-side allowlist check should have
+        // already dropped the connection, so this write may or may not
+        // succeed (TCP-level race), but the subsequent read must see
+        // EOF — no JSON response is forthcoming.
+        let _ = tls_stream
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"server.ping\",\"params\":[]}\n")
+            .await;
+        let mut reader = tokio::io::BufReader::new(tls_stream);
+        let mut line = String::new();
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line),
+        )
+        .await;
+        match read {
+            Ok(Ok(0)) => { /* clean EOF — expected */ }
+            Ok(Ok(_)) => panic!("expected EOF after allowlist drop, got: {line:?}"),
+            Ok(Err(_)) => { /* IO error — also acceptable (peer reset) */ }
+            Err(_) => panic!("read did not return promptly after allowlist drop"),
+        }
+
+        sd_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), join).await;
+    }
+
+    /// Misconfiguration: `mtls_enabled=true` without a CA path is a
+    /// hard error at server-construction time.
+    #[tokio::test]
+    async fn mtls_without_ca_is_a_hard_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert = rcgen::generate_simple_self_signed(["localhost".to_string()]).unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        write_file(&cert_path, &cert.cert.pem());
+        write_file(&key_path, &cert.key_pair.serialize_pem());
+        let cfg = ElectrumConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            tls_bind: Some("127.0.0.1:0".parse().unwrap()),
+            tls_cert_path: Some(cert_path),
+            tls_key_path: Some(key_path),
+            mtls_enabled: true,
+            mtls_client_ca: None, // <-- the misconfiguration
+            ..Default::default()
+        };
+        let result = ElectrumServer::bind_with_factory(cfg, echo_factory()).await;
+        assert!(matches!(result, Err(ElectrumServerError::MtlsMissingCa)));
+    }
+
+    /// Misconfiguration: `mtls_enabled=true` without a TLS bind is a
+    /// hard error at server-construction time.
+    #[tokio::test]
+    async fn mtls_without_tls_bind_is_a_hard_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca_path = dir.path().join("ca.pem");
+        write_file(&ca_path, "fake");
+        let cfg = ElectrumConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            tls_bind: None,
+            mtls_enabled: true,
+            mtls_client_ca: Some(ca_path),
+            ..Default::default()
+        };
+        let result = ElectrumServer::bind_with_factory(cfg, echo_factory()).await;
+        assert!(matches!(result, Err(ElectrumServerError::MtlsWithoutTls)));
     }
 
     #[tokio::test]
