@@ -1118,3 +1118,165 @@ fn test_e2e_jsonrpc_sat_cli_auth_failure_shape() {
     );
     e2e.node.stop();
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// Cross-surface test (the merge gate)
+// ─────────────────────────────────────────────────────────────────────
+//
+// The single test below is the whole reason this work exists: it
+// asserts the shared-chainstate / one-process / one-RocksDB guarantee
+// that justifies satd's architecture. A tx broadcast through Esplora's
+// `POST /tx` must:
+//
+//   * appear in JSON-RPC `getrawmempool` (proves the broadcast wrote to
+//     the same `Mempool` instance the RPC reads from);
+//   * fire an Electrum `scripthash.subscribe` notification on the dest
+//     scripthash (proves the mempool→index→subscription pipeline
+//     remains correct, with scripthash derivation matching across
+//     Esplora and Electrum);
+//   * then, after mining, flip `status.confirmed` to `true` on Esplora's
+//     `GET /tx/:txid` (proves the confirm path is wired symmetrically).
+//
+// Failure modes this single test catches that nothing else does:
+//   * Esplora's `/tx` handler accepts the body but writes to a
+//     different `Mempool` instance than the index reads from.
+//   * Mempool→index update fires but `maybe_notify` is called with the
+//     wrong scripthash (Esplora/Electrum derivation mismatch).
+//   * Notification fires but the per-conn `scripthash_forwarder` task
+//     is wedged.
+//   * RPC `getrawmempool` reads a stale snapshot.
+
+#[test]
+fn test_e2e_cross_surface_esplora_broadcast_visible_in_rpc_and_electrum() {
+    use electrum_client::ElectrumApi;
+    // Boot with all three surfaces. `--esplora=1` triggers the
+    // harness's txindex auto-coupling; addressindex is on by default;
+    // `--electrum=1` brings up the TCP listener.
+    let mut e2e = E2eNode::boot_with(&[
+        "--esplora=1",
+        "--esplorabind=127.0.0.1:0",
+        "--electrum=1",
+        "--electrumbind=127.0.0.1:0",
+    ]);
+    let esplora = esplora_for(&e2e);
+    let electrum =
+        electrum_client::Client::new(&electrum_url_for(&e2e)).expect("electrum connect");
+
+    // Source wallet + dest burn address.
+    let src_wallet = DeterministicWallet::from_secret([0x11u8; 32]);
+    let dest_addr_str = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let dest_addr = bitcoin::Address::from_str(dest_addr_str)
+        .expect("valid bech32")
+        .require_network(bitcoin::Network::Regtest)
+        .expect("regtest");
+    let dest_script = dest_addr.script_pubkey();
+
+    // Mature block-1 coinbase so the spend can use it.
+    let _ = e2e
+        .node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![
+                serde_json::json!(101),
+                serde_json::json!(src_wallet.address.to_string()),
+            ],
+        )
+        .expect("generatetoaddress 101");
+
+    // Subscribe via Electrum BEFORE broadcasting so the notification
+    // is queued the moment the mempool admit fires.
+    let initial = electrum
+        .script_subscribe(&dest_script)
+        .expect("script_subscribe");
+    assert!(
+        initial.is_none(),
+        "dest should start with empty status, got {:?}",
+        initial
+    );
+
+    // Build the spend (block-1 coinbase → dest, 1000-sat fee).
+    let (raw_hex, txid_hex) =
+        build_signed_p2wpkh_spend_from_block1_coinbase(&e2e.node, &src_wallet, dest_script.clone(), 1000);
+
+    // *** Broadcast via Esplora. *** This is the cross-surface
+    // critical path: a write on Esplora must propagate to both
+    // JSON-RPC (read) and Electrum (subscription).
+    let resp = esplora.post_tx(&raw_hex);
+    assert_eq!(
+        resp.status(),
+        200,
+        "Esplora POST /tx must succeed; got {}",
+        resp.status()
+    );
+    let body = resp.text().expect("body utf8");
+    assert_eq!(body.trim(), txid_hex, "Esplora POST /tx body must match txid");
+
+    // (a) JSON-RPC `getrawmempool` must show the txid within 10s.
+    let rpcport = e2e.node.rpcport;
+    let cookie = e2e.node.cookie.clone();
+    let want_txid = txid_hex.clone();
+    common::poll_until_json(
+        || rpc_post(rpcport, &cookie, "getrawmempool", &[]),
+        |v| {
+            v["result"]
+                .as_array()
+                .is_some_and(|a| a.iter().any(|t| t.as_str() == Some(want_txid.as_str())))
+        },
+        10,
+    );
+
+    // (b) Electrum `scripthash.subscribe` must fire on the dest
+    // scripthash. Same `ping()` interleave as the PR-4 subscribe
+    // test — `electrum-client` has no background reader thread.
+    let deadline = std::time::Instant::now() + e2e_test_timeout(10);
+    loop {
+        electrum.ping().expect("ping");
+        if electrum
+            .script_pop(&dest_script)
+            .expect("script_pop")
+            .is_some()
+        {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "no Electrum scripthash notification within deadline after Esplora broadcast"
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
+    // Mine 1 block to confirm. After this, all three surfaces should
+    // see the spend as confirmed.
+    let _ = e2e
+        .node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![
+                serde_json::json!(1),
+                serde_json::json!(src_wallet.address.to_string()),
+            ],
+        )
+        .expect("confirm block");
+
+    // RPC mempool drains.
+    common::poll_until_json(
+        || rpc_post(rpcport, &cookie, "getrawmempool", &[]),
+        |v| v["result"].as_array().is_some_and(|a| a.is_empty()),
+        10,
+    );
+
+    // Esplora `GET /tx/:txid` flips to confirmed.
+    let want_txid_for_esplora = txid_hex.clone();
+    common::poll_until_json(
+        || {
+            let r = esplora.get(&format!("/tx/{}", want_txid_for_esplora));
+            r.json::<serde_json::Value>()
+                .unwrap_or(serde_json::Value::Null)
+        },
+        |v| v["status"]["confirmed"] == true,
+        10,
+    );
+
+    e2e.node.stop();
+}
