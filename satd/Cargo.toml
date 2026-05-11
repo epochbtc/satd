@@ -45,3 +45,9 @@ bitcoin = { workspace = true }
 hex = { workspace = true }
 base64 = { workspace = true }
 tempfile = "3"
+# Third-party Electrum client for the E2E suite. Independent
+# implementation of the wire protocol (predates `electrum-proto`;
+# ships its own message types). Drives the Electrum test group so
+# wire-format regressions a native-Rust client we wrote ourselves
+# would gloss over still get caught.
+electrum-client = "0.25"
