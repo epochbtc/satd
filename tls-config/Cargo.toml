@@ -10,6 +10,11 @@ repository.workspace = true
 tokio-rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 thiserror = { workspace = true }
+# Leaf-cert parsing for the mTLS allowlist + peer-subject logging
+# path. rustls-webpki (already transitively pulled by tokio-rustls)
+# exposes verification primitives but not subject-DN / SAN extraction;
+# x509-parser is the standard pure-Rust crate for that.
+x509-parser = "0.16"
 
 [dev-dependencies]
 rcgen = { workspace = true }

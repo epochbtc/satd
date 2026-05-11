@@ -36,7 +36,7 @@ use crate::error::JsonRpcError;
 use crate::rpc::{FramingError, MAX_LINE_BYTES, read_line_bounded, write_line};
 use crate::state::ElectrumState;
 use crate::subscribe::{NOTIFY_CHANNEL_CAP, Subscriptions};
-use tls_config::{TlsConfigError, build_acceptor};
+use tls_config::{ClientAuthPolicy, TlsConfigError, build_acceptor};
 
 #[derive(Debug, Error)]
 pub enum ElectrumServerError {
@@ -128,7 +128,11 @@ impl ElectrumServer {
                 return Err(ElectrumServerError::TlsMissingPaths);
             }
             (Some(addr), Some(cert), Some(key)) => {
-                let acceptor = build_acceptor(cert, key)?;
+                // PR 1: pass `ClientAuthPolicy::Disabled` so the call
+                // site is migrated to the new signature without
+                // changing behavior. PR 2 wires the per-surface mTLS
+                // flags through to this `build_acceptor` call.
+                let acceptor = build_acceptor(cert, key, &ClientAuthPolicy::Disabled)?;
                 let tls_listener = TcpListener::bind(addr)
                     .await
                     .map_err(|source| ElectrumServerError::Bind { addr, source })?;

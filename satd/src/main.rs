@@ -1219,7 +1219,11 @@ async fn main() {
                             std::process::exit(1);
                         }
                     };
-                    let acceptor = match esplora_handlers::build_acceptor(cert, key) {
+                    let acceptor = match esplora_handlers::build_acceptor(
+                        cert,
+                        key,
+                        &esplora_handlers::ClientAuthPolicy::Disabled,
+                    ) {
                         Ok(a) => a,
                         Err(e) => {
                             eprintln!("Error: esplora TLS config: {e}");

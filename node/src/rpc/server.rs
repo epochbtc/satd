@@ -1680,7 +1680,14 @@ async fn spawn_tls_surface(
     listener_status: Arc<ServerListenerStatus>,
     shutdown_rx: &mut watch::Receiver<bool>,
 ) -> Result<ServerHandle, Box<dyn std::error::Error + Send + Sync>> {
-    let acceptor = tls_config::build_acceptor(&cfg.cert_path, &cfg.key_path)?;
+    // PR 1: pass `ClientAuthPolicy::Disabled` so the call site is
+    // migrated to the new signature without changing behavior. PR 4
+    // wires the per-surface mTLS flags through to this call.
+    let acceptor = tls_config::build_acceptor(
+        &cfg.cert_path,
+        &cfg.key_path,
+        &tls_config::ClientAuthPolicy::Disabled,
+    )?;
     // Bind synchronously so a port conflict becomes a startup-fatal
     // error rather than a silently-dropped tokio task that never
     // accepts a connection.
