@@ -25,8 +25,14 @@ tokio = { workspace = true }
 tokio-stream = { version = "0.1", features = ["sync"] }
 futures-util = "0.3"
 pin-project = "1"
+tokio-rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
 node-index = { path = "../node-index" }
 node = { path = "../node" }
 
 [dev-dependencies]
 axum-test = "17"
+rcgen = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+tempfile = "3"
+tokio-rustls = { workspace = true }

@@ -295,6 +295,18 @@ pub struct Config {
     pub esplora: bool,
     /// `host:port` for the Esplora HTTP listener.
     pub esplora_bind: String,
+    /// Optional TLS bind. When set, `esplora_tls_cert` and
+    /// `esplora_tls_key` MUST also be set. Mirrors the Electrum-server
+    /// shape so operators learn one TLS configuration pattern. No
+    /// standard Esplora TLS port; `:3001` is a common convention
+    /// (one above the plain `:3000`).
+    pub esplora_tls_bind: Option<String>,
+    /// Path to PEM-encoded TLS certificate for the Esplora server
+    /// (operator-supplied; self-signed-on-first-start is deferred,
+    /// same stance as Electrum).
+    pub esplora_tls_cert: Option<std::path::PathBuf>,
+    /// Path to PEM-encoded TLS private key for the Esplora server.
+    pub esplora_tls_key: Option<std::path::PathBuf>,
     /// URL prefix to mount the API under (default `/`; `/api` for
     /// `blockstream.info`-style deployments).
     pub esplora_prefix: String,
@@ -815,6 +827,24 @@ impl Config {
         if matches!(esplora_auth, EsploraAuthMode::UserPass) && esplora_userpass.is_none() {
             return Err("--esploraauth=userpass requires --esplorauserpass=user:pass".to_string());
         }
+        let esplora_tls_bind = cli.esploratlsbind.or_else(|| file_get("esploratlsbind"));
+        let esplora_tls_cert = cli
+            .esploratlscert
+            .or_else(|| file_get("esploratlscert").map(std::path::PathBuf::from));
+        let esplora_tls_key = cli
+            .esploratlskey
+            .or_else(|| file_get("esploratlskey").map(std::path::PathBuf::from));
+        // TLS partial-config validation: same shape as Electrum below.
+        // Catching here surfaces a friendlier CLI message than the
+        // server-side check; both layers stay so a programmatic caller
+        // that bypasses `Config::load` still hits the hard error.
+        if esplora_tls_bind.is_some()
+            && (esplora_tls_cert.is_none() || esplora_tls_key.is_none())
+        {
+            return Err(
+                "--esploratlsbind requires --esploratlscert AND --esploratlskey".to_string(),
+            );
+        }
 
         // ── Electrum ─────────────────────────────────────────────
         let electrum = cli
@@ -1043,6 +1073,9 @@ impl Config {
             addrindexsubscriptions,
             esplora,
             esplora_bind,
+            esplora_tls_bind,
+            esplora_tls_cert,
+            esplora_tls_key,
             esplora_prefix,
             esplora_cors,
             esplora_request_timeout,
@@ -1363,6 +1396,7 @@ impl Config {
             "esplora": {
                 "enabled": self.esplora,
                 "bind": if self.esplora { Some(self.esplora_bind.clone()) } else { None },
+                "tls_bind": if self.esplora { self.esplora_tls_bind.clone() } else { None },
             },
             "electrum": {
                 "enabled": self.electrum,
@@ -1532,6 +1566,27 @@ pub struct CliArgs {
         help = "Bind the Esplora REST listener (default: 127.0.0.1:3000)"
     )]
     pub esplorabind: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "ADDR:PORT",
+        help = "Bind the Esplora TLS listener (requires --esploratlscert and --esploratlskey)"
+    )]
+    pub esploratlsbind: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Path to PEM-encoded TLS certificate for the Esplora server"
+    )]
+    pub esploratlscert: Option<std::path::PathBuf>,
+
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Path to PEM-encoded TLS private key for the Esplora server"
+    )]
+    pub esploratlskey: Option<std::path::PathBuf>,
 
     #[arg(
         long,
@@ -2124,6 +2179,9 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "addrindexsubscriptions",
         "esplora",
         "esplorabind",
+        "esploratlsbind",
+        "esploratlscert",
+        "esploratlskey",
         "esploraprefix",
         "esploracors",
         "esplorarequesttimeout",
@@ -2419,6 +2477,9 @@ rpcport=8332
             addrindexsubscriptions: None,
             esplora: None,
             esplorabind: None,
+            esploratlsbind: None,
+            esploratlscert: None,
+            esploratlskey: None,
             esploraprefix: None,
             esploracors: vec![],
             esplorarequesttimeout: None,
@@ -2539,6 +2600,9 @@ rpcport=8332
             addrindexsubscriptions: None,
             esplora: None,
             esplorabind: None,
+            esploratlsbind: None,
+            esploratlscert: None,
+            esploratlskey: None,
             esploraprefix: None,
             esploracors: vec![],
             esplorarequesttimeout: None,
@@ -2619,5 +2683,69 @@ rpcport=8332
             events_zmq_nodeevent: None,
         };
         assert!(Config::from_cli(cli).is_err());
+    }
+
+    /// `--esploratlsbind` without the matching cert/key flags must be
+    /// rejected at config-load time. Catching it here surfaces a
+    /// friendlier message than the server-side check; the server still
+    /// validates so a programmatic caller that bypasses `Config::load`
+    /// hits the same hard error. Mirrors the documented Electrum-TLS
+    /// behaviour so an operator who learned the one rule applies it
+    /// uniformly.
+    #[test]
+    fn test_esplora_tls_partial_config_is_rejected() {
+        // Missing both cert and key.
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-test",
+            "--esploratlsbind=127.0.0.1:3001",
+        ])
+        .unwrap();
+        let err = Config::from_cli(cli).unwrap_err();
+        assert!(
+            err.contains("esploratlsbind"),
+            "expected partial-TLS error, got: {err}"
+        );
+
+        // Cert without key.
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-test",
+            "--esploratlsbind=127.0.0.1:3001",
+            "--esploratlscert=/tmp/cert.pem",
+        ])
+        .unwrap();
+        assert!(Config::from_cli(cli).is_err());
+
+        // Key without cert.
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-test",
+            "--esploratlsbind=127.0.0.1:3001",
+            "--esploratlskey=/tmp/key.pem",
+        ])
+        .unwrap();
+        assert!(Config::from_cli(cli).is_err());
+
+        // All three present — config loads cleanly. The actual cert
+        // parsing happens at server bind time; here we only verify the
+        // flag-shape gate is satisfied.
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-test",
+            "--esploratlsbind=127.0.0.1:3001",
+            "--esploratlscert=/tmp/cert.pem",
+            "--esploratlskey=/tmp/key.pem",
+        ])
+        .unwrap();
+        let config = Config::from_cli(cli).expect("complete --esploratls* triple should load");
+        assert_eq!(
+            config.esplora_tls_bind.as_deref(),
+            Some("127.0.0.1:3001")
+        );
     }
 }

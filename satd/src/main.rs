@@ -1093,6 +1093,9 @@ async fn main() {
             let esplora_cfg = esplora_handlers::EsploraConfig {
                 enabled: true,
                 bind: config.esplora_bind.clone(),
+                tls_bind: config.esplora_tls_bind.clone(),
+                tls_cert_path: config.esplora_tls_cert.clone(),
+                tls_key_path: config.esplora_tls_key.clone(),
                 prefix: config.esplora_prefix.clone(),
                 cors_origins: config.esplora_cors.clone(),
                 request_timeout: std::time::Duration::from_secs(config.esplora_request_timeout),
@@ -1151,17 +1154,100 @@ async fn main() {
                     std::process::exit(1);
                 }
             };
-            tracing::info!(%bind, "Esplora REST listening");
+            // TLS listener (optional). Same pattern as Electrum:
+            // load the cert/key + bind the TLS port synchronously so
+            // a misconfigured TLS surface is a startup-fatal error
+            // rather than a logged warning on the first handshake.
+            let tls_handshake_timeout =
+                std::time::Duration::from_secs(config.esplora_request_timeout);
+            let tls_setup = match (
+                config.esplora_tls_bind.as_ref(),
+                config.esplora_tls_cert.as_ref(),
+                config.esplora_tls_key.as_ref(),
+            ) {
+                (None, _, _) => None,
+                (Some(_), None, _) | (Some(_), _, None) => {
+                    eprintln!(
+                        "Error: --esploratlsbind requires --esploratlscert AND --esploratlskey"
+                    );
+                    auth.cleanup();
+                    std::process::exit(1);
+                }
+                (Some(addr_str), Some(cert), Some(key)) => {
+                    let tls_bind: SocketAddr = match addr_str.parse() {
+                        Ok(v) => v,
+                        Err(e) => {
+                            eprintln!(
+                                "Error: invalid --esploratlsbind {addr_str:?}: {e}"
+                            );
+                            auth.cleanup();
+                            std::process::exit(1);
+                        }
+                    };
+                    let acceptor = match esplora_handlers::build_acceptor(cert, key) {
+                        Ok(a) => a,
+                        Err(e) => {
+                            eprintln!("Error: esplora TLS config: {e}");
+                            auth.cleanup();
+                            std::process::exit(1);
+                        }
+                    };
+                    let tls_listener =
+                        match tokio::net::TcpListener::bind(tls_bind).await {
+                            Ok(l) => l,
+                            Err(e) => {
+                                eprintln!(
+                                    "Error: esplora TLS listener could not bind to {tls_bind}: {e}"
+                                );
+                                auth.cleanup();
+                                std::process::exit(1);
+                            }
+                        };
+                    Some((tls_bind, tls_listener, acceptor))
+                }
+            };
+            tracing::info!(
+                %bind,
+                tls_bind = ?tls_setup.as_ref().map(|(a, _, _)| *a),
+                "Esplora REST listening"
+            );
             listener_status.set_esplora(bind.to_string());
             let mut esplora_shutdown = shutdown_rx.clone();
+            // The plain and TLS arms share the same `router` (axum's
+            // Router is Clone-cheap). They observe the same shutdown
+            // watch, so SIGTERM gracefully drains both surfaces.
+            let plain_router = router.clone();
             tokio::spawn(async move {
-                let serve = axum::serve(listener, router).with_graceful_shutdown(async move {
-                    let _ = esplora_shutdown.changed().await;
-                });
+                let serve =
+                    axum::serve(listener, plain_router).with_graceful_shutdown(async move {
+                        let _ = esplora_shutdown.changed().await;
+                    });
                 if let Err(e) = serve.await {
                     tracing::error!(error = %e, "Esplora server error");
                 }
             });
+            if let Some((tls_bind, tls_listener, acceptor)) = tls_setup {
+                let tls_router = router.clone();
+                let mut tls_shutdown = shutdown_rx.clone();
+                let tls_wrap = esplora_handlers::TlsListener::new(
+                    tls_listener,
+                    acceptor,
+                    tls_handshake_timeout,
+                );
+                tokio::spawn(async move {
+                    let serve = axum::serve(tls_wrap, tls_router)
+                        .with_graceful_shutdown(async move {
+                            let _ = tls_shutdown.changed().await;
+                        });
+                    if let Err(e) = serve.await {
+                        tracing::error!(
+                            error = %e,
+                            %tls_bind,
+                            "Esplora TLS server error",
+                        );
+                    }
+                });
+            }
         }
     }
 
