@@ -2060,12 +2060,13 @@ fn test_e2e_jsonrpc_sat_cli_auth_failure_shape() {
 
 #[test]
 fn test_e2e_jsonrpc_getblock_verbose_levels() {
-    // getblock has two implemented verbosity levels in satd today:
+    // getblock has three verbosity levels (Core-compat):
     //   0 → raw block hex (serialized)
     //   1 (default) → JSON object with tx as txid array
-    // (Core supports level 2 — full tx-detail array — which satd does
-    // not yet implement; that's a known Core-compat gap tracked in
-    // CORE_DIFFERENCES.md. This test pins the implemented behavior.)
+    //   2 → JSON object with tx as full tx-detail objects (same per-tx
+    //       shape `getrawtransaction verbose=true` returns)
+    // Wallets and explorers pick a level based on what they need; each
+    // level's wire shape must stay stable.
     let mut e2e = E2eNode::boot_with(&[]);
     let wallet = DeterministicWallet::from_secret([0x11u8; 32]);
     let _ = e2e
@@ -2128,12 +2129,61 @@ fn test_e2e_jsonrpc_getblock_verbose_levels() {
     // Default (no verbosity argument) must equal verbosity=1.
     let v_default = e2e
         .node
-        .rpc_call_with_params("getblock", vec![serde_json::json!(h1)])
+        .rpc_call_with_params("getblock", vec![serde_json::json!(h1.clone())])
         .expect("getblock default");
     assert_eq!(
         v_default["result"], v1["result"],
         "default verbosity must equal explicit verbose=1"
     );
+
+    // Level 2: object with tx as array of full tx detail objects.
+    // Same per-tx shape as `getrawtransaction verbose=true` —
+    // {txid, hash, version, size, vsize, weight, locktime, vin, vout}.
+    // Block-context fields (blockhash, blockheight, confirmations)
+    // are stamped on each tx so explorers can render without a follow-up
+    // call.
+    let v2 = e2e
+        .node
+        .rpc_call_with_params(
+            "getblock",
+            vec![serde_json::json!(h1.clone()), serde_json::json!(2)],
+        )
+        .expect("getblock v2");
+    let tx = v2["result"]["tx"].as_array().expect("v2 tx array");
+    assert_eq!(tx.len(), 1);
+    assert!(
+        tx[0]["txid"].as_str().is_some_and(|s| s.len() == 64),
+        "v2 tx[0].txid is full txid"
+    );
+    assert!(tx[0]["vin"].is_array(), "v2 tx[0].vin is array");
+    assert!(tx[0]["vout"].is_array(), "v2 tx[0].vout is array");
+    assert!(
+        tx[0]["vsize"].as_u64().unwrap_or(0) > 0,
+        "v2 tx[0].vsize > 0"
+    );
+    assert_eq!(
+        tx[0]["blockhash"].as_str(),
+        Some(h1.as_str()),
+        "v2 tx[0].blockhash stamped"
+    );
+    assert_eq!(
+        tx[0]["blockheight"].as_u64(),
+        Some(1),
+        "v2 tx[0].blockheight stamped"
+    );
+    // Level-1 txid array must equal the txids on level-2 tx objects
+    // (consistency invariant between verbosity levels).
+    let v1_txids: Vec<&str> = v1["result"]["tx"]
+        .as_array()
+        .expect("v1 tx")
+        .iter()
+        .map(|t| t.as_str().expect("v1 txid"))
+        .collect();
+    let v2_txids: Vec<&str> = tx
+        .iter()
+        .map(|t| t.get("txid").and_then(|v| v.as_str()).expect("v2 txid"))
+        .collect();
+    assert_eq!(v1_txids, v2_txids, "v1 tx[] and v2 tx[].txid must agree");
 
     e2e.node.stop();
 }

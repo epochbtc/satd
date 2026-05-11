@@ -90,6 +90,8 @@ pub fn get_block_hash(
 /// `getblock` — return block data at given verbosity.
 /// verbosity 0: raw hex
 /// verbosity 1 (default): JSON with header + txids
+/// verbosity 2+: JSON with header + full per-tx detail (same shape as
+///               `getrawtransaction verbose=true`, embedded under `tx`)
 pub fn get_block(
     chain_state: &ChainState,
     hash_str: &str,
@@ -116,21 +118,44 @@ pub fn get_block(
         .get_block(&hash)
         .ok_or("Block data not available")?;
 
-    let txids: Vec<String> = block
-        .txdata
-        .iter()
-        .map(|tx| tx.compute_txid().to_string())
-        .collect();
-
-    let difficulty = target_to_difficulty(entry.header.bits);
-    let chainwork_hex = hex::encode(entry.chainwork);
-    let block_size = serialize(&block).len();
-
     let confirmations = if chain_state.tip_height() >= entry.height {
         chain_state.tip_height() - entry.height + 1
     } else {
         0
     };
+
+    // Bitcoin Core's verbosity contract:
+    //   1 → tx is an array of txid strings
+    //   2+ → tx is an array of full tx-detail objects (Core caps at 3,
+    //        which adds prevout decoding; satd treats anything ≥2 as
+    //        the standard full-detail shape).
+    let block_hash_str = hash.to_string();
+    let tx_field: Value = if verbosity >= 2 {
+        let txs: Vec<Value> = block
+            .txdata
+            .iter()
+            .map(|tx| {
+                crate::rpc::rawtx::decode_transaction_verbose(
+                    tx,
+                    Some(&block_hash_str),
+                    Some(entry.height),
+                    Some(confirmations as u64),
+                )
+            })
+            .collect();
+        Value::Array(txs)
+    } else {
+        let txids: Vec<String> = block
+            .txdata
+            .iter()
+            .map(|tx| tx.compute_txid().to_string())
+            .collect();
+        json!(txids)
+    };
+
+    let difficulty = target_to_difficulty(entry.header.bits);
+    let chainwork_hex = hex::encode(entry.chainwork);
+    let block_size = serialize(&block).len();
 
     let prev_hash = if entry.height > 0 {
         Some(entry.header.prev_blockhash.to_string())
@@ -143,13 +168,13 @@ pub fn get_block(
         .map(|h| h.to_string());
 
     let mut result = json!({
-        "hash": hash.to_string(),
+        "hash": block_hash_str,
         "confirmations": confirmations,
         "height": entry.height,
         "version": entry.header.version.to_consensus(),
         "versionHex": format!("{:08x}", entry.header.version.to_consensus()),
         "merkleroot": entry.header.merkle_root.to_string(),
-        "tx": txids,
+        "tx": tx_field,
         "time": entry.header.time,
         "mediantime": entry.header.time,
         "nonce": entry.header.nonce,
