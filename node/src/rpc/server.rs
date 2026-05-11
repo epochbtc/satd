@@ -90,6 +90,19 @@ pub struct RpcTlsConfig {
     pub mtls_enabled: bool,
     pub mtls_client_ca: Option<PathBuf>,
     pub mtls_client_allow: Vec<String>,
+    /// Per-handshake wall-clock cap. Defaults to 10s (set by satd
+    /// when constructing this struct); shorter than Electrum/Esplora
+    /// (30s) because JSON-RPC clients are typically local or
+    /// short-haul and a slow handshake is more likely a probe than a
+    /// real client. Configurable via `--rpctlshandshaketimeout` so an
+    /// operator behind a high-latency link can raise it.
+    pub handshake_timeout: Duration,
+    /// Hard cap on concurrent TLS connections (held until the
+    /// connection closes). Defaults to 100, matching jsonrpsee's
+    /// `ServerConfig::max_connections` so the TLS surface doesn't
+    /// silently lose the cap the plain-HTTP path enforces via
+    /// jsonrpsee's own Server::start path. (Review C1.)
+    pub max_connections: usize,
 }
 
 /// Composite handle that stops both the plain-HTTP and (optional) TLS
@@ -1759,7 +1772,19 @@ async fn spawn_tls_surface(
         let _ = bridge_handle.stop();
     });
 
-    let handshake_timeout = Duration::from_secs(10);
+    // Per-handshake timeout from the cfg (review H2). Matches the
+    // shape Electrum/Esplora use, just with a tighter default.
+    let handshake_timeout = cfg.handshake_timeout;
+    // Connection cap (review C1). The plain-HTTP RPC path runs
+    // through `Server::start()` which enforces jsonrpsee's
+    // `ServerConfig::max_connections`. The manual accept loop here
+    // bypasses that, so we mirror the cap with a tokio Semaphore.
+    // The permit is held by the per-connection task and released on
+    // drop, so the cap covers handshake + steady-state serving.
+    let conn_cap = std::sync::Arc::new(tokio::sync::Semaphore::new(
+        cfg.max_connections.max(1),
+    ));
+    let max_connections = cfg.max_connections;
     let accept_stop = stop_handle.clone();
     tokio::spawn(async move {
         loop {
@@ -1778,12 +1803,30 @@ async fn spawn_tls_surface(
                 _ = accept_stop.clone().shutdown() => break,
             };
 
+            // try_acquire_owned: if the semaphore is at capacity,
+            // drop the connection here (pre-handshake, so we can't
+            // even send a JSON-RPC error body — TLS hasn't started).
+            // The client will see a TCP-level connection reset.
+            let permit = match conn_cap.clone().try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => {
+                    tracing::warn!(
+                        peer = %peer,
+                        "RPC TLS at-capacity rejection ({} max)",
+                        max_connections,
+                    );
+                    drop(stream);
+                    continue;
+                }
+            };
+
             let acceptor = acceptor.clone();
             let rpc_svc = rpc_svc.clone();
             let conn_stop = accept_stop.clone();
             let allow = allow.clone();
             let mtls_enabled = cfg.mtls_enabled;
             tokio::spawn(async move {
+                let _permit = permit;
                 let tls_stream =
                     match tokio::time::timeout(handshake_timeout, acceptor.accept(stream)).await {
                         Ok(Ok(s)) => s,
@@ -1804,27 +1847,29 @@ async fn spawn_tls_surface(
                             return;
                         }
                     };
-                // mTLS post-handshake checks. Audit-log the leaf
-                // subject when mTLS is enabled (best-effort, never
-                // propagates). The allowlist short-circuits when
-                // empty, so the non-mTLS path stays untouched.
-                let (_, server_conn) = tls_stream.get_ref();
-                if mtls_enabled
-                    && let Some(subject) = tls_config::peer_subject_label(server_conn)
-                {
-                    tracing::info!(
-                        peer = %peer,
-                        subject = %subject,
-                        "RPC mTLS client accepted",
-                    );
-                }
-                if let Err(rej) = tls_config::check_peer_allowed(server_conn, &allow) {
-                    tracing::warn!(
-                        peer = %peer,
-                        subject = %rej.subject_label,
-                        "RPC mTLS client rejected by allowlist",
-                    );
-                    return;
+                // mTLS post-handshake hooks (audit log + allowlist
+                // check) only run when mTLS is enabled (review C2).
+                // Without an mTLS handshake there is no peer cert; a
+                // non-empty allowlist would reject every connection.
+                // Config-load validation (review C3) refuses that
+                // combination, but this gate is also defense-in-depth.
+                if mtls_enabled {
+                    let (_, server_conn) = tls_stream.get_ref();
+                    if let Some(subject) = tls_config::peer_subject_label(server_conn) {
+                        tracing::info!(
+                            peer = %peer,
+                            subject = %subject,
+                            "RPC mTLS client accepted",
+                        );
+                    }
+                    if let Err(rej) = tls_config::check_peer_allowed(server_conn, &allow) {
+                        tracing::warn!(
+                            peer = %peer,
+                            subject = %rej.subject_label,
+                            "RPC mTLS client rejected by allowlist",
+                        );
+                        return;
+                    }
                 }
 
                 // service_fn returns a `Box::pin`-ed future explicitly

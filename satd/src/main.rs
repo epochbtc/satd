@@ -927,6 +927,14 @@ async fn main() {
                 mtls_enabled: config.rpc_mtls,
                 mtls_client_ca: config.rpc_mtls_client_ca.clone(),
                 mtls_client_allow: config.rpc_mtls_client_allow.clone(),
+                handshake_timeout: std::time::Duration::from_secs(
+                    config.rpc_tls_handshake_timeout,
+                ),
+                // Default 100 mirrors jsonrpsee's
+                // `ServerConfig::max_connections`. The plain-HTTP
+                // path's cap; the TLS surface keeps the same default
+                // so operator expectations don't drift between paths.
+                max_connections: 100,
             }),
             Err(e) => {
                 eprintln!("Error: invalid --rpctlsbind {addr_str:?}: {e}");
