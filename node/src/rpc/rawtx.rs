@@ -142,11 +142,14 @@ pub fn get_raw_transaction(
         .parse()
         .map_err(|_| (-8, "parameter 1 must be of length 64 (not 0, for txid)".to_string()))?;
 
-    // Search mempool first (unless blockhash is specified)
+    // Search mempool first (unless blockhash is specified). Bitcoin
+    // Core reports unconfirmed-tx `confirmations` as 0 in the verbose
+    // response; match that so clients that gate on the field don't
+    // have to special-case satd.
     if blockhash.is_none()
         && let Some(entry) = mempool.get(&txid) {
             return if verbose {
-                Ok(decode_transaction_verbose(&entry.tx, None, None))
+                Ok(decode_transaction_verbose(&entry.tx, None, None, Some(0)))
             } else {
                 let raw = bitcoin::consensus::serialize(&entry.tx);
                 Ok(Value::String(hex::encode(raw)))
@@ -169,10 +172,12 @@ pub fn get_raw_transaction(
             if tx.compute_txid() == txid {
                 return if verbose {
                     let height = entry.as_ref().map(|e| e.height);
+                    let confirmations = height.map(|h| confirmations_for(chain_state, h));
                     Ok(decode_transaction_verbose(
                         tx,
                         Some(hash_str),
                         height,
+                        confirmations,
                     ))
                 } else {
                     let raw = bitcoin::consensus::serialize(tx);
@@ -191,10 +196,13 @@ pub fn get_raw_transaction(
                     if tx.compute_txid() == txid {
                         return if verbose {
                             let height = entry.as_ref().map(|e| e.height);
+                            let confirmations =
+                                height.map(|h| confirmations_for(chain_state, h));
                             Ok(decode_transaction_verbose(
                                 tx,
                                 Some(&block_hash.to_string()),
                                 height,
+                                confirmations,
                             ))
                         } else {
                             let raw = bitcoin::consensus::serialize(tx);
@@ -215,14 +223,28 @@ pub fn decode_raw_transaction(hex_tx: &str) -> Result<Value, (i32, String)> {
     let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&tx_bytes)
         .map_err(|_| (-22, "TX decode failed".to_string()))?;
 
-    Ok(decode_transaction_verbose(&tx, None, None))
+    Ok(decode_transaction_verbose(&tx, None, None, None))
 }
 
-/// Build verbose transaction JSON (shared by getrawtransaction and decoderawtransaction).
+/// Confirmation count for a tx mined at `block_height` against the
+/// current active-chain tip. Matches Bitcoin Core's
+/// `(tip - block_height) + 1`, saturating to 0 if the block is
+/// somehow ahead of the tip (only reachable across a reorg race we
+/// don't otherwise protect against here).
+fn confirmations_for(chain_state: &ChainState, block_height: u32) -> u64 {
+    let tip = chain_state.tip_height();
+    tip.saturating_sub(block_height).saturating_add(1) as u64
+}
+
+/// Build verbose transaction JSON (shared by getrawtransaction and
+/// decoderawtransaction). `confirmations` is `Some(0)` for a mempool
+/// hit, `Some(N)` for a confirmed tx, and `None` for offline decode
+/// (`decoderawtransaction`) where there is no chain context.
 fn decode_transaction_verbose(
     tx: &bitcoin::Transaction,
     blockhash: Option<&str>,
     block_height: Option<u32>,
+    confirmations: Option<u64>,
 ) -> Value {
     let txid = tx.compute_txid();
     let raw = bitcoin::consensus::serialize(tx);
@@ -296,6 +318,9 @@ fn decode_transaction_verbose(
     }
     if let Some(h) = block_height {
         result["blockheight"] = json!(h);
+    }
+    if let Some(c) = confirmations {
+        result["confirmations"] = json!(c);
     }
 
     result

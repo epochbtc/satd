@@ -383,12 +383,10 @@ fn test_e2e_jsonrpc_tx_broadcast_and_mempool() {
     );
 
     // Confirm via `getrawtransaction` verbose=true — wallet-free
-    // observation that the tx is now in block 102 (the block we just
-    // mined after the broadcast). satd's verbose response currently
-    // emits `blockheight` but not `confirmations`; that omission is a
-    // Core-compat gap to fix in a follow-up. For this test the
-    // `blockheight` match is sufficient: it proves the spend is mined
-    // at the expected position.
+    // observation. After mining 1 block on top, the spend has exactly
+    // 1 confirmation. This same call also returns `blockheight: 102`
+    // (the spend lands in block 102, mined just above); both fields
+    // are part of the Core-compatible verbose response.
     let raw = rpc_post(
         rpcport,
         &cookie,
@@ -396,10 +394,11 @@ fn test_e2e_jsonrpc_tx_broadcast_and_mempool() {
         &[serde_json::json!(txid_hex), serde_json::json!(true)],
     );
     assert_eq!(
-        raw["result"]["blockheight"], 102,
-        "tx should be mined in block 102; got {}",
+        raw["result"]["confirmations"], 1,
+        "tx should show 1 confirmation; got {}",
         raw
     );
+    assert_eq!(raw["result"]["blockheight"], 102);
 
     e2e.node.stop();
 }
