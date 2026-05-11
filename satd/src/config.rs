@@ -265,6 +265,14 @@ pub struct Config {
     pub rpcbind: String,
     pub rpcuser: Option<String>,
     pub rpcpassword: Option<String>,
+    /// Optional TLS bind. When set, `rpc_tls_cert` and `rpc_tls_key`
+    /// MUST also be set. Bitcoin Core's RPC is HTTP-only; this is a
+    /// satd-specific addition for operators who want native TLS
+    /// without a reverse proxy. Mirrors the Electrum / Esplora TLS
+    /// surfaces.
+    pub rpc_tls_bind: Option<String>,
+    pub rpc_tls_cert: Option<std::path::PathBuf>,
+    pub rpc_tls_key: Option<std::path::PathBuf>,
     pub listen: bool,
     pub port: u16,
     pub connect: Vec<String>,
@@ -658,6 +666,22 @@ impl Config {
 
         let rpcuser = cli.rpcuser.or_else(|| file_get("rpcuser"));
         let rpcpassword = cli.rpcpassword.or_else(|| file_get("rpcpassword"));
+
+        let rpc_tls_bind = cli.rpctlsbind.or_else(|| file_get("rpctlsbind"));
+        let rpc_tls_cert = cli
+            .rpctlscert
+            .or_else(|| file_get("rpctlscert").map(std::path::PathBuf::from));
+        let rpc_tls_key = cli
+            .rpctlskey
+            .or_else(|| file_get("rpctlskey").map(std::path::PathBuf::from));
+        // Partial-config validation: same shape as Electrum/Esplora
+        // TLS. Catching here surfaces a friendlier CLI message than
+        // the server-side check; both layers stay so a programmatic
+        // caller that bypasses `Config::load` still hits the hard
+        // error.
+        if rpc_tls_bind.is_some() && (rpc_tls_cert.is_none() || rpc_tls_key.is_none()) {
+            return Err("--rpctlsbind requires --rpctlscert AND --rpctlskey".to_string());
+        }
 
         let listen = cli
             .listen
@@ -1053,6 +1077,9 @@ impl Config {
             rpcbind,
             rpcuser,
             rpcpassword,
+            rpc_tls_bind,
+            rpc_tls_cert,
+            rpc_tls_key,
             listen,
             port,
             connect,
@@ -1355,6 +1382,7 @@ impl Config {
                 "password": if self.rpcpassword.is_some() { "(set)" } else { "(none)" },
                 "extended_errors": self.rpc_extended_errors,
                 "default_units": self.rpc_default_units.as_str(),
+                "tls_bind": self.rpc_tls_bind.clone(),
             },
             "p2p": {
                 "listen": self.listen,
@@ -1449,6 +1477,27 @@ pub struct CliArgs {
 
     #[arg(long, value_name = "PASS", help = "RPC password")]
     pub rpcpassword: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "ADDR:PORT",
+        help = "Bind the JSON-RPC TLS listener (requires --rpctlscert and --rpctlskey)"
+    )]
+    pub rpctlsbind: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Path to PEM-encoded TLS certificate for the JSON-RPC server"
+    )]
+    pub rpctlscert: Option<std::path::PathBuf>,
+
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Path to PEM-encoded TLS private key for the JSON-RPC server"
+    )]
+    pub rpctlskey: Option<std::path::PathBuf>,
 
     #[arg(long, value_name = "BOOL", help = "Accept P2P connections")]
     pub listen: Option<bool>,
@@ -2159,6 +2208,9 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "rpcport",
         "rpcuser",
         "rpcpassword",
+        "rpctlsbind",
+        "rpctlscert",
+        "rpctlskey",
         "listen",
         "port",
         "connect",
@@ -2457,6 +2509,9 @@ rpcport=8332
             rpcport: None,
             rpcuser: None,
             rpcpassword: None,
+            rpctlsbind: None,
+            rpctlscert: None,
+            rpctlskey: None,
             listen: None,
             port: None,
             connect: vec![],
@@ -2580,6 +2635,9 @@ rpcport=8332
             rpcport: None,
             rpcuser: Some("alice".to_string()),
             rpcpassword: None, // missing password
+            rpctlsbind: None,
+            rpctlscert: None,
+            rpctlskey: None,
             listen: None,
             port: None,
             connect: vec![],
@@ -2747,5 +2805,60 @@ rpcport=8332
             config.esplora_tls_bind.as_deref(),
             Some("127.0.0.1:3001")
         );
+    }
+
+    /// `--rpctlsbind` without the matching cert/key flags must be
+    /// rejected at config-load time. Mirrors the Electrum and Esplora
+    /// TLS shape so an operator who learned the one rule applies it
+    /// uniformly across all three surfaces.
+    #[test]
+    fn test_rpc_tls_partial_config_is_rejected() {
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-test",
+            "--rpctlsbind=127.0.0.1:8333",
+        ])
+        .unwrap();
+        let err = Config::from_cli(cli).unwrap_err();
+        assert!(
+            err.contains("rpctlsbind"),
+            "expected partial-TLS error, got: {err}"
+        );
+
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-test",
+            "--rpctlsbind=127.0.0.1:8333",
+            "--rpctlscert=/tmp/cert.pem",
+        ])
+        .unwrap();
+        assert!(Config::from_cli(cli).is_err());
+
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-test",
+            "--rpctlsbind=127.0.0.1:8333",
+            "--rpctlskey=/tmp/key.pem",
+        ])
+        .unwrap();
+        assert!(Config::from_cli(cli).is_err());
+
+        // All three present — config loads cleanly. Cert parsing
+        // happens at server bind time; here we only verify the
+        // flag-shape gate is satisfied.
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-test",
+            "--rpctlsbind=127.0.0.1:8333",
+            "--rpctlscert=/tmp/cert.pem",
+            "--rpctlskey=/tmp/key.pem",
+        ])
+        .unwrap();
+        let config = Config::from_cli(cli).expect("complete --rpctls* triple should load");
+        assert_eq!(config.rpc_tls_bind.as_deref(), Some("127.0.0.1:8333"));
     }
 }

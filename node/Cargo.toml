@@ -29,6 +29,8 @@ crossbeam-channel = { workspace = true }
 async-trait = { workspace = true }
 uuid = { workspace = true }
 parking_lot = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
 
 consensus = { path = "../consensus" }
 node-index = { path = "../node-index" }
@@ -49,3 +51,5 @@ libc = "0.2"
 [dev-dependencies]
 tempfile = "3"
 tokio = { workspace = true, features = ["test-util"] }
+rcgen = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }

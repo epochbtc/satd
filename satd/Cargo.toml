@@ -57,12 +57,13 @@ sd-notify = { workspace = true }
 tikv-jemallocator = "0.6"
 
 [dev-dependencies]
-reqwest = { version = "0.12", features = ["json", "blocking"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "rustls-tls"] }
 serde_json = { workspace = true }
 bitcoin = { workspace = true }
 hex = { workspace = true }
 base64 = { workspace = true }
 tempfile = "3"
+rcgen = { workspace = true }
 # Third-party Electrum client for the E2E suite. Independent
 # implementation of the wire protocol (predates `electrum-proto`;
 # ships its own message types). Drives the Electrum test group so

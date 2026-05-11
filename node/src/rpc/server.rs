@@ -10,11 +10,15 @@ use crate::rpc::amounts::{
 use crate::rpc::auth::{AuthLayer, RpcAuth};
 use crate::rpc::{address, blockchain, indexes, mining, network, psbt, rawtx, util};
 use crate::storage::Store;
-use jsonrpsee::server::{RpcModule, ServerBuilder, ServerHandle};
+use jsonrpsee::server::{
+    Methods, RpcModule, ServerBuilder, ServerHandle, serve_with_graceful_shutdown, stop_channel,
+};
 use jsonrpsee::types::ErrorObjectOwned;
 use parking_lot::RwLock;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::watch;
 
 /// Shared, mutable record of which optional listeners actually bound
@@ -39,6 +43,7 @@ struct ServerListenerStatusInner {
     esplora: Option<String>,
     electrum: Option<String>,
     electrum_tls: Option<String>,
+    rpc_tls: Option<String>,
 }
 
 impl ServerListenerStatus {
@@ -54,8 +59,47 @@ impl ServerListenerStatus {
     pub fn set_electrum_tls(&self, bind: String) {
         self.inner.write().electrum_tls = Some(bind);
     }
+    pub fn set_rpc_tls(&self, bind: String) {
+        self.inner.write().rpc_tls = Some(bind);
+    }
     fn snapshot(&self) -> ServerListenerStatusInner {
         self.inner.read().clone()
+    }
+}
+
+/// TLS settings for the JSON-RPC server.
+///
+/// Operator-supplied PEM cert + key paths. Bitcoin Core's RPC is
+/// HTTP-only; this is a satd-specific addition for operators who want
+/// native TLS without a reverse proxy. Mirrors the Electrum / Esplora
+/// TLS surfaces for ergonomic consistency.
+#[derive(Debug, Clone)]
+pub struct RpcTlsConfig {
+    pub bind_addr: SocketAddr,
+    pub cert_path: PathBuf,
+    pub key_path: PathBuf,
+}
+
+/// Composite handle that stops both the plain-HTTP and (optional) TLS
+/// JSON-RPC surfaces. Returned by [`start`] so callers see a single
+/// `.stop()` call regardless of whether TLS is enabled. Mirrors the
+/// shutdown semantics of the plain-HTTP [`ServerHandle`] (i.e. an
+/// already-stopped surface is not an error).
+#[derive(Clone)]
+pub struct RpcServerHandle {
+    plain: ServerHandle,
+    tls: Option<ServerHandle>,
+}
+
+impl RpcServerHandle {
+    /// Tell both surfaces to stop. Ignores `AlreadyStopped` on the TLS
+    /// surface so a previously-fired bridge or test teardown does not
+    /// propagate an error to the caller.
+    pub fn stop(&self) -> Result<(), jsonrpsee::server::AlreadyStoppedError> {
+        if let Some(tls) = &self.tls {
+            let _ = tls.stop();
+        }
+        self.plain.stop()
     }
 }
 
@@ -198,9 +242,15 @@ where
 }
 
 /// Start the JSON-RPC HTTP server with authentication.
+///
+/// When `tls` is `Some`, also binds a parallel HTTPS listener using
+/// the supplied PEM cert + key. The plain-HTTP path is unchanged from
+/// the no-TLS configuration; TLS is purely additive. The returned
+/// [`RpcServerHandle`] stops both surfaces on `.stop()`.
 #[allow(clippy::too_many_arguments)]
 pub async fn start(
     bind_addr: SocketAddr,
+    tls: Option<RpcTlsConfig>,
     auth: Arc<RpcAuth>,
     chain_state: Arc<ChainState>,
     mempool: Arc<Mempool>,
@@ -225,7 +275,15 @@ pub async fn start(
     #[cfg(feature = "block-filter-index")] filter_backfill_cmd_tx: Option<
         tokio::sync::mpsc::Sender<crate::index::filter::BackfillCommand>,
     >,
-) -> Result<ServerHandle, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<RpcServerHandle, Box<dyn std::error::Error + Send + Sync>> {
+    // Listener-status + shutdown_tx are needed both inside the RPC
+    // context (so the `stop` RPC + `getserverstatus` can use them) AND
+    // by the TLS surface wiring below. Clone the Arcs / watch::Sender
+    // here so the eventual `RpcModule::new(ctx)` consumption below
+    // doesn't strand us without a handle to those values.
+    let listener_status_outer = listener_status.clone();
+    let shutdown_tx_outer = shutdown_tx.clone();
+
     let ctx = Arc::new(RpcContext {
         chain_state,
         mempool,
@@ -1240,6 +1298,7 @@ pub async fn start(
         resp.insert("esplora".into(), listener(snap.esplora));
         resp.insert("electrum".into(), listener(snap.electrum));
         resp.insert("electrum_tls".into(), listener(snap.electrum_tls));
+        resp.insert("rpc_tls".into(), listener(snap.rpc_tls));
         #[cfg(feature = "block-filter-index")]
         {
             let state_label = ctx
@@ -1558,14 +1617,181 @@ pub async fn start(
         Ok::<_, ErrorObjectOwned>(serde_json::Value::String("satd stopping".to_string()))
     })?;
 
-    // Build server with auth middleware
-    let middleware = tower::ServiceBuilder::new().layer(AuthLayer::new(auth));
-
+    // Plain-HTTP server. AuthLayer wraps the RPC stack at the tower
+    // layer, so TLS (when enabled) inherits the same auth transparently
+    // — the auth middleware runs after HTTP parsing, not at the socket.
+    let plain_middleware = tower::ServiceBuilder::new().layer(AuthLayer::new(auth.clone()));
     let server = ServerBuilder::new()
-        .set_http_middleware(middleware)
+        .set_http_middleware(plain_middleware)
         .build(bind_addr)
         .await?;
 
-    let handle = server.start(module);
-    Ok(handle)
+    // Methods is Arc-backed and cheap to clone; we keep one copy here
+    // to feed the TLS path's per-connection service builder if TLS is
+    // enabled. (`Server::start` consumes its own copy.)
+    let methods: Methods = module.into();
+    let plain_handle = server.start(methods.clone());
+
+    let tls_handle = if let Some(tls_cfg) = tls {
+        let mut shutdown_rx_for_tls = shutdown_tx_outer.subscribe();
+        Some(
+            spawn_tls_surface(
+                tls_cfg,
+                auth,
+                methods,
+                listener_status_outer,
+                &mut shutdown_rx_for_tls,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+
+    Ok(RpcServerHandle {
+        plain: plain_handle,
+        tls: tls_handle,
+    })
+}
+
+/// Bind the TLS listener and spawn the per-connection accept loop.
+///
+/// The accept loop terminates when the returned [`ServerHandle`] is
+/// stopped — either by the composite [`RpcServerHandle::stop`] call
+/// from main shutdown, or by a bridge task wired here that forwards
+/// the global `shutdown_tx` watch into the TLS stop handle so a
+/// process-level shutdown also terminates this surface.
+async fn spawn_tls_surface(
+    cfg: RpcTlsConfig,
+    auth: Arc<RpcAuth>,
+    methods: Methods,
+    listener_status: Arc<ServerListenerStatus>,
+    shutdown_rx: &mut watch::Receiver<bool>,
+) -> Result<ServerHandle, Box<dyn std::error::Error + Send + Sync>> {
+    let acceptor = crate::rpc::tls::build_acceptor(&cfg.cert_path, &cfg.key_path)?;
+    // Bind synchronously so a port conflict becomes a startup-fatal
+    // error rather than a silently-dropped tokio task that never
+    // accepts a connection.
+    let tcp = tokio::net::TcpListener::bind(cfg.bind_addr).await?;
+    let bound = tcp.local_addr()?;
+    listener_status.set_rpc_tls(bound.to_string());
+
+    // jsonrpsee's stop_channel lets us drive the manual accept loop
+    // and per-connection `serve_with_graceful_shutdown` with the same
+    // shutdown future. The returned ServerHandle is what composite
+    // shutdown will use.
+    let (stop_handle, server_handle) = stop_channel();
+
+    // Per-connection tower service. AuthLayer holds Arc<RpcAuth> so
+    // cloning it is cheap; we hand a fresh ServiceBuilder to this
+    // surface so the plain-HTTP path's middleware chain stays isolated.
+    // We build the `TowerService` here (once) and clone it per
+    // connection — this mirrors jsonrpsee's own test helper (see
+    // `jsonrpsee-server/src/tests/helpers.rs::ws_server_with_stats`).
+    // Building once side-steps an HRTB inference quirk that bites if
+    // you defer the `.build()` call into the per-connection `async`
+    // block.
+    let tls_middleware = tower::ServiceBuilder::new().layer(AuthLayer::new(auth));
+    let rpc_svc = ServerBuilder::new()
+        .set_http_middleware(tls_middleware)
+        .to_service_builder()
+        .build(methods, stop_handle.clone());
+
+    // Bridge: when the process-wide `shutdown_tx` fires (Ctrl-C,
+    // SIGTERM, or the `stop` RPC), also stop this surface. main.rs
+    // additionally calls `RpcServerHandle::stop()` after the flush
+    // phase, which idempotently re-fires the same stop — both paths
+    // are safe (AlreadyStopped is ignored).
+    let bridge_handle = server_handle.clone();
+    let mut bridge_rx = shutdown_rx.clone();
+    tokio::spawn(async move {
+        let _ = bridge_rx.changed().await;
+        let _ = bridge_handle.stop();
+    });
+
+    let handshake_timeout = Duration::from_secs(10);
+    let accept_stop = stop_handle.clone();
+    tokio::spawn(async move {
+        loop {
+            let (stream, peer) = tokio::select! {
+                res = tcp.accept() => match res {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "RPC TLS accept error");
+                        // Match esplora/electrum: brief sleep on
+                        // transient accept errors so an EMFILE storm
+                        // doesn't busy-loop.
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        continue;
+                    }
+                },
+                _ = accept_stop.clone().shutdown() => break,
+            };
+
+            let acceptor = acceptor.clone();
+            let rpc_svc = rpc_svc.clone();
+            let conn_stop = accept_stop.clone();
+            tokio::spawn(async move {
+                let tls_stream =
+                    match tokio::time::timeout(handshake_timeout, acceptor.accept(stream)).await {
+                        Ok(Ok(s)) => s,
+                        Ok(Err(e)) => {
+                            tracing::debug!(
+                                peer = %peer,
+                                error = %e,
+                                "RPC TLS handshake failed",
+                            );
+                            return;
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                peer = %peer,
+                                timeout_secs = handshake_timeout.as_secs(),
+                                "RPC TLS handshake timed out — closing connection",
+                            );
+                            return;
+                        }
+                    };
+
+                // service_fn returns a `Box::pin`-ed future explicitly
+                // so the spawn site sees a `Send + 'static` future and
+                // sidesteps the HRTB-inference quirk that bites if you
+                // return `async move { ... }` directly.
+                let svc = tower::service_fn(
+                    move |req: jsonrpsee::server::HttpRequest<hyper::body::Incoming>| {
+                        let mut rpc_svc = rpc_svc.clone();
+                        Box::pin(async move {
+                            tower::Service::<
+                                jsonrpsee::server::HttpRequest<hyper::body::Incoming>,
+                            >::call(&mut rpc_svc, req)
+                            .await
+                        })
+                            as std::pin::Pin<
+                                Box<
+                                    dyn std::future::Future<
+                                            Output = Result<
+                                                jsonrpsee::server::HttpResponse<
+                                                    jsonrpsee::server::HttpBody,
+                                                >,
+                                                tower::BoxError,
+                                            >,
+                                        > + Send,
+                                >,
+                            >
+                    },
+                );
+
+                // Spawn the serve future directly (no wrapping async
+                // block) — this matches the doc example and helper
+                // pattern that types correctly under HRTB inference.
+                tokio::spawn(serve_with_graceful_shutdown(
+                    tls_stream,
+                    svc,
+                    conn_stop.shutdown(),
+                ));
+            });
+        }
+    });
+
+    Ok(server_handle)
 }
