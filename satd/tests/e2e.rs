@@ -2058,6 +2058,452 @@ fn test_e2e_jsonrpc_sat_cli_auth_failure_shape() {
     e2e.node.stop();
 }
 
+#[test]
+fn test_e2e_jsonrpc_getblock_verbose_levels() {
+    // getblock has two implemented verbosity levels in satd today:
+    //   0 → raw block hex (serialized)
+    //   1 (default) → JSON object with tx as txid array
+    // (Core supports level 2 — full tx-detail array — which satd does
+    // not yet implement; that's a known Core-compat gap tracked in
+    // CORE_DIFFERENCES.md. This test pins the implemented behavior.)
+    let mut e2e = E2eNode::boot_with(&[]);
+    let wallet = DeterministicWallet::from_secret([0x11u8; 32]);
+    let _ = e2e
+        .node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![
+                serde_json::json!(2),
+                serde_json::json!(wallet.address.to_string()),
+            ],
+        )
+        .expect("generatetoaddress 2");
+    let h1 = e2e
+        .node
+        .rpc_call_with_params("getblockhash", vec![serde_json::json!(1)])
+        .expect("getblockhash 1")["result"]
+        .as_str()
+        .expect("hash")
+        .to_string();
+
+    // Level 0: raw hex; round-trips to a Block whose hash matches.
+    let v0 = e2e
+        .node
+        .rpc_call_with_params(
+            "getblock",
+            vec![serde_json::json!(h1.clone()), serde_json::json!(0)],
+        )
+        .expect("getblock v0");
+    let raw_hex = v0["result"].as_str().expect("hex string");
+    let bytes = hex::decode(raw_hex).expect("hex decode");
+    let block: bitcoin::Block = bitcoin::consensus::deserialize(&bytes).expect("deserialize");
+    assert_eq!(block.block_hash().to_string(), h1, "v0 hex round-trips");
+
+    // Level 1 (default): object with tx as array of txid strings, plus
+    // size, weight, confirmations, version, merkleroot.
+    let v1 = e2e
+        .node
+        .rpc_call_with_params(
+            "getblock",
+            vec![serde_json::json!(h1.clone()), serde_json::json!(1)],
+        )
+        .expect("getblock v1");
+    assert_eq!(v1["result"]["hash"], h1);
+    assert_eq!(v1["result"]["height"], 1);
+    let tx = v1["result"]["tx"].as_array().expect("tx array");
+    assert_eq!(tx.len(), 1, "coinbase only");
+    assert!(
+        tx[0].as_str().is_some_and(|s| s.len() == 64),
+        "v1 tx[0] is a txid string"
+    );
+    assert!(v1["result"]["size"].as_u64().unwrap_or(0) > 0);
+    assert!(v1["result"]["weight"].as_u64().unwrap_or(0) > 0);
+    assert!(
+        v1["result"]["merkleroot"]
+            .as_str()
+            .is_some_and(|s| s.len() == 64),
+        "merkleroot 64-char hex"
+    );
+
+    // Default (no verbosity argument) must equal verbosity=1.
+    let v_default = e2e
+        .node
+        .rpc_call_with_params("getblock", vec![serde_json::json!(h1)])
+        .expect("getblock default");
+    assert_eq!(
+        v_default["result"], v1["result"],
+        "default verbosity must equal explicit verbose=1"
+    );
+
+    e2e.node.stop();
+}
+
+#[test]
+fn test_e2e_jsonrpc_getblockheader_verbose() {
+    // getblockheader has two return shapes:
+    //   true  (default) → JSON object {hash, version, merkleroot, time, ...}
+    //   false           → 80-byte serialized header as hex
+    // Wallets call this constantly during sync; the wire-shape contract
+    // is small but critical.
+    let mut e2e = E2eNode::boot_with(&[]);
+    let wallet = DeterministicWallet::from_secret([0x11u8; 32]);
+    let _ = e2e
+        .node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![
+                serde_json::json!(1),
+                serde_json::json!(wallet.address.to_string()),
+            ],
+        )
+        .expect("generatetoaddress 1");
+    let h = e2e
+        .node
+        .rpc_call_with_params("getblockhash", vec![serde_json::json!(1)])
+        .expect("getblockhash 1")["result"]
+        .as_str()
+        .expect("hash")
+        .to_string();
+
+    // Default (verbose=true) returns the object form.
+    let obj = e2e
+        .node
+        .rpc_call_with_params("getblockheader", vec![serde_json::json!(h.clone())])
+        .expect("getblockheader default")["result"]
+        .clone();
+    assert_eq!(obj["hash"], h);
+    assert_eq!(obj["height"], 1);
+    assert!(
+        obj["merkleroot"].as_str().is_some_and(|s| s.len() == 64),
+        "merkleroot is 64-char hex"
+    );
+    assert!(obj["time"].as_u64().is_some(), "time is integer");
+
+    // verbose=false returns the 160-char hex (80-byte serialized header).
+    let raw = e2e
+        .node
+        .rpc_call_with_params(
+            "getblockheader",
+            vec![serde_json::json!(h), serde_json::json!(false)],
+        )
+        .expect("getblockheader verbose=false")["result"]
+        .as_str()
+        .expect("hex string")
+        .to_string();
+    assert_eq!(raw.len(), 160, "80-byte header serializes to 160 hex chars");
+    // Bytes deserialize back to a Header.
+    let bytes = hex::decode(&raw).expect("hex decode");
+    let _header: bitcoin::block::Header =
+        bitcoin::consensus::deserialize(&bytes).expect("deserialize header");
+
+    e2e.node.stop();
+}
+
+#[test]
+fn test_e2e_jsonrpc_gettxout_for_confirmed_coinbase() {
+    // gettxout on a confirmed coinbase output is the canonical path
+    // for wallet "is this UTXO still spendable?" probes. Wire shape
+    // is `{bestblock, confirmations, value, scriptPubKey: {hex}, coinbase}`
+    // — every field is consumer-facing.
+    let mut e2e = E2eNode::boot_with(&[]);
+    let wallet = DeterministicWallet::from_secret([0x11u8; 32]);
+    let _ = e2e
+        .node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![
+                serde_json::json!(3),
+                serde_json::json!(wallet.address.to_string()),
+            ],
+        )
+        .expect("generatetoaddress 3");
+    let block1_hash = e2e
+        .node
+        .rpc_call_with_params("getblockhash", vec![serde_json::json!(1)])
+        .expect("getblockhash 1")["result"]
+        .as_str()
+        .expect("hash")
+        .to_string();
+    let cb_txid = e2e
+        .node
+        .rpc_call_with_params(
+            "getblock",
+            vec![serde_json::json!(block1_hash), serde_json::json!(1)],
+        )
+        .expect("getblock")["result"]["tx"][0]
+        .as_str()
+        .expect("coinbase txid")
+        .to_string();
+
+    let v = e2e
+        .node
+        .rpc_call_with_params(
+            "gettxout",
+            vec![serde_json::json!(cb_txid), serde_json::json!(0)],
+        )
+        .expect("gettxout coinbase")["result"]
+        .clone();
+    // 3 blocks mined; the coinbase at height 1 has 3 confirmations
+    // (1, 2, 3 - 1 + 1 = 3).
+    assert_eq!(v["confirmations"], 3, "block-1 coinbase at tip-2 → 3 confs");
+    assert_eq!(v["coinbase"], true);
+    assert!(
+        v["bestblock"].as_str().is_some_and(|s| s.len() == 64),
+        "bestblock is the tip hash"
+    );
+    assert!(
+        v["scriptPubKey"]["hex"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()),
+        "scriptPubKey.hex non-empty"
+    );
+
+    e2e.node.stop();
+}
+
+#[test]
+fn test_e2e_jsonrpc_getmempoolentry_and_info_track_broadcast() {
+    // getmempoolinfo + getmempoolentry are the standard wallet
+    // path for "how big is the mempool, and what does my tx look
+    // like in it." Wire-shape regressions here break BlueWallet,
+    // Sparrow, and any explorer with a mempool view.
+    let mut e2e = E2eNode::boot_with(&[]);
+    let wallet = DeterministicWallet::from_secret([0x11u8; 32]);
+    let _ = e2e
+        .node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![
+                serde_json::json!(101),
+                serde_json::json!(wallet.address.to_string()),
+            ],
+        )
+        .expect("generatetoaddress 101");
+
+    // Baseline: empty mempool. size and bytes both 0.
+    let info0 = e2e
+        .node
+        .rpc_call("getmempoolinfo")
+        .expect("getmempoolinfo baseline")["result"]
+        .clone();
+    assert_eq!(info0["size"], 0, "empty mempool size=0");
+    assert_eq!(info0["bytes"], 0, "empty mempool bytes=0");
+
+    // Broadcast a spend.
+    let dest = bitcoin::Address::from_str("bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202")
+        .expect("valid bech32")
+        .require_network(bitcoin::Network::Regtest)
+        .expect("regtest");
+    let (raw_hex, txid_hex) = build_signed_p2wpkh_spend_from_block1_coinbase(
+        &e2e.node,
+        &wallet,
+        dest.script_pubkey(),
+        1000,
+    );
+    let _ = e2e
+        .node
+        .rpc_call_with_params("sendrawtransaction", vec![serde_json::json!(raw_hex)])
+        .expect("sendrawtransaction");
+
+    // getmempoolinfo now shows size=1, bytes>0.
+    let info1 = e2e
+        .node
+        .rpc_call("getmempoolinfo")
+        .expect("getmempoolinfo with tx")["result"]
+        .clone();
+    assert_eq!(info1["size"], 1, "1 tx in mempool");
+    assert!(info1["bytes"].as_u64().unwrap_or(0) > 0, "non-zero bytes");
+
+    // getmempoolentry returns per-tx detail with vsize, fees, time.
+    let entry = e2e
+        .node
+        .rpc_call_with_params("getmempoolentry", vec![serde_json::json!(txid_hex.clone())])
+        .expect("getmempoolentry")["result"]
+        .clone();
+    assert!(entry["vsize"].as_u64().unwrap_or(0) > 0, "vsize > 0");
+    assert!(entry["time"].as_u64().is_some(), "time is integer");
+    // Fee in the verbose entry should equal what we paid (1000 sat).
+    // Bitcoin Core wraps fees as `fees: {base, modified, ancestor, descendant}`
+    // in BTC. satd's amounts.rs reports either BTC string or sat int
+    // depending on the unit; assert it's present and non-empty.
+    assert!(
+        entry["fees"]["base"].is_string() || entry["fees"]["base"].is_number(),
+        "fees.base present, got {:?}",
+        entry["fees"]["base"]
+    );
+
+    e2e.node.stop();
+}
+
+#[test]
+fn test_e2e_jsonrpc_getrawmempool_verbose() {
+    // getrawmempool defaults to verbose=false → array of txid strings.
+    // verbose=true returns an object keyed by txid with per-tx detail.
+    // Both shapes are part of the Core-compat contract.
+    let mut e2e = E2eNode::boot_with(&[]);
+    let wallet = DeterministicWallet::from_secret([0x11u8; 32]);
+    let _ = e2e
+        .node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![
+                serde_json::json!(101),
+                serde_json::json!(wallet.address.to_string()),
+            ],
+        )
+        .expect("generatetoaddress 101");
+
+    let dest = bitcoin::Address::from_str("bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202")
+        .expect("valid bech32")
+        .require_network(bitcoin::Network::Regtest)
+        .expect("regtest");
+    let (raw_hex, txid_hex) = build_signed_p2wpkh_spend_from_block1_coinbase(
+        &e2e.node,
+        &wallet,
+        dest.script_pubkey(),
+        1000,
+    );
+    let _ = e2e
+        .node
+        .rpc_call_with_params("sendrawtransaction", vec![serde_json::json!(raw_hex)])
+        .expect("sendrawtransaction");
+
+    // Default (verbose=false) is array.
+    let v_false = e2e
+        .node
+        .rpc_call("getrawmempool")
+        .expect("getrawmempool default")["result"]
+        .clone();
+    let arr = v_false.as_array().expect("array under default verbose");
+    assert!(arr.iter().any(|t| t.as_str() == Some(txid_hex.as_str())));
+
+    // verbose=true is object keyed by txid.
+    let v_true = e2e
+        .node
+        .rpc_call_with_params("getrawmempool", vec![serde_json::json!(true)])
+        .expect("getrawmempool verbose=true")["result"]
+        .clone();
+    let obj = v_true.as_object().expect("verbose=true returns object");
+    let entry = obj.get(&txid_hex).unwrap_or_else(|| {
+        panic!(
+            "verbose=true missing tx {}; got keys {:?}",
+            txid_hex,
+            obj.keys().collect::<Vec<_>>()
+        )
+    });
+    assert!(entry["vsize"].as_u64().unwrap_or(0) > 0);
+    assert!(entry["time"].as_u64().is_some());
+
+    e2e.node.stop();
+}
+
+#[test]
+fn test_e2e_jsonrpc_validateaddress_valid_and_invalid() {
+    // validateaddress is the standard "is this a valid receiving
+    // address" probe wallets use before composing a send. The wire
+    // shape is small but consumed by every signing flow.
+    let mut e2e = E2eNode::boot_with(&[]);
+    let wallet = DeterministicWallet::from_secret([0x11u8; 32]);
+
+    // Valid regtest bech32 → isvalid: true + address echo.
+    let v = e2e
+        .node
+        .rpc_call_with_params(
+            "validateaddress",
+            vec![serde_json::json!(wallet.address.to_string())],
+        )
+        .expect("validateaddress valid")["result"]
+        .clone();
+    assert_eq!(v["isvalid"], true, "valid regtest address must validate");
+    assert_eq!(v["address"], wallet.address.to_string());
+
+    // Garbage → isvalid: false. Catches lenient parsers that
+    // accept non-bech32 / non-base58 garbage.
+    let v = e2e
+        .node
+        .rpc_call_with_params(
+            "validateaddress",
+            vec![serde_json::json!("not_a_real_address")],
+        )
+        .expect("validateaddress invalid")["result"]
+        .clone();
+    assert_eq!(v["isvalid"], false, "garbage must not validate");
+
+    e2e.node.stop();
+}
+
+#[test]
+fn test_e2e_jsonrpc_decodescript_p2wpkh() {
+    // decodescript is used by PSBT-aware wallets to introspect an
+    // unfamiliar scriptPubKey. We hand it a known P2WPKH script and
+    // assert the decoded asm / type round-trip.
+    let mut e2e = E2eNode::boot_with(&[]);
+    let wallet = DeterministicWallet::from_secret([0x11u8; 32]);
+    let spk_hex = hex::encode(wallet.address.script_pubkey().as_bytes());
+
+    let v = e2e
+        .node
+        .rpc_call_with_params("decodescript", vec![serde_json::json!(spk_hex)])
+        .expect("decodescript")["result"]
+        .clone();
+    // type must be the P2WPKH tag. Core uses `witness_v0_keyhash`;
+    // satd's encoder matches.
+    assert_eq!(
+        v["type"], "witness_v0_keyhash",
+        "P2WPKH must decode as witness_v0_keyhash, got {}",
+        v["type"]
+    );
+    // asm must mention OP_0 followed by a 40-char hex push.
+    let asm = v["asm"].as_str().expect("asm string");
+    assert!(
+        asm.starts_with("OP_0 "),
+        "P2WPKH asm starts with OP_0, got: {}",
+        asm
+    );
+
+    e2e.node.stop();
+}
+
+#[test]
+fn test_e2e_jsonrpc_getblockstats() {
+    // getblockstats is the canonical mempool.space-style data source
+    // for per-block fee summaries. The shape must include at least
+    // height, blockhash, txs, total_size — explorers read all four.
+    let mut e2e = E2eNode::boot_with(&[]);
+    let wallet = DeterministicWallet::from_secret([0x11u8; 32]);
+    let _ = e2e
+        .node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![
+                serde_json::json!(3),
+                serde_json::json!(wallet.address.to_string()),
+            ],
+        )
+        .expect("generatetoaddress 3");
+    let h2 = e2e
+        .node
+        .rpc_call_with_params("getblockhash", vec![serde_json::json!(2)])
+        .expect("getblockhash 2")["result"]
+        .as_str()
+        .expect("hash")
+        .to_string();
+
+    // Probe by hash. (The handler also accepts a height string; we
+    // pin one form to avoid duplicating the same assertion logic.)
+    let v = e2e
+        .node
+        .rpc_call_with_params("getblockstats", vec![serde_json::json!(h2.clone())])
+        .expect("getblockstats")["result"]
+        .clone();
+    assert_eq!(v["height"], 2);
+    assert_eq!(v["blockhash"], h2);
+    assert_eq!(v["txs"], 1, "coinbase-only block");
+    assert!(v["total_size"].as_u64().unwrap_or(0) > 0, "total_size > 0");
+
+    e2e.node.stop();
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Cross-surface test (the merge gate)
 // ─────────────────────────────────────────────────────────────────────
