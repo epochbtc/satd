@@ -318,31 +318,31 @@ impl ElectrumServer {
                             return;
                         }
                     };
-                    // After a successful (m)TLS handshake, optionally
-                    // narrow to the operator's CN/SAN allowlist. When
-                    // `allow` is empty (no allowlist configured), the
-                    // CA bundle remains the only gate and this check
-                    // is a no-op. When mTLS is disabled entirely, the
-                    // handshake produces no peer cert and the check
-                    // also returns Ok via the empty-allowlist
-                    // short-circuit.
-                    let (_, server_conn) = tls_stream.get_ref();
-                    if config.mtls_enabled
-                        && let Some(subject) = tls_config::peer_subject_label(server_conn)
-                    {
-                        tracing::info!(
-                            peer = %peer,
-                            subject = %subject,
-                            "Electrum mTLS client accepted",
-                        );
-                    }
-                    if let Err(rej) = tls_config::check_peer_allowed(server_conn, &allow) {
-                        tracing::warn!(
-                            peer = %peer,
-                            subject = %rej.subject_label,
-                            "Electrum mTLS client rejected by allowlist",
-                        );
-                        return;
+                    // mTLS post-handshake hooks (audit log + allowlist
+                    // check) only run when mTLS is enabled. On a
+                    // plain-TLS surface there is no peer cert, so
+                    // `check_peer_allowed` against any non-empty
+                    // allowlist would reject every connection — review
+                    // C2. Config-load validation (review C3) already
+                    // refuses a non-empty allowlist without mTLS, so
+                    // this gate is also defense-in-depth.
+                    if config.mtls_enabled {
+                        let (_, server_conn) = tls_stream.get_ref();
+                        if let Some(subject) = tls_config::peer_subject_label(server_conn) {
+                            tracing::info!(
+                                peer = %peer,
+                                subject = %subject,
+                                "Electrum mTLS client accepted",
+                            );
+                        }
+                        if let Err(rej) = tls_config::check_peer_allowed(server_conn, &allow) {
+                            tracing::warn!(
+                                peer = %peer,
+                                subject = %rej.subject_label,
+                                "Electrum mTLS client rejected by allowlist",
+                            );
+                            return;
+                        }
                     }
                     let (dispatch, notify_rx) = factory(config.max_subs_per_conn);
                     if let Err(e) =

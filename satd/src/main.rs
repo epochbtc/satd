@@ -1337,14 +1337,34 @@ async fn main() {
             auth.cleanup();
             std::process::exit(1);
         }
-        let electrum_bind: SocketAddr = config
-            .electrum_bind
-            .parse()
-            .expect("Invalid electrum bind address");
-        let electrum_tls_bind = config
+        // Bind-address parsing exits cleanly on invalid input rather
+        // than panicking (review H3). The plain-bind value comes from
+        // an unvalidated CLI/config string — `.expect()` would surface
+        // an operator typo as a SIGABRT instead of a friendly message.
+        let electrum_bind: SocketAddr = match config.electrum_bind.parse() {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!(
+                    "Error: invalid --electrumbind {:?}: {e}",
+                    config.electrum_bind
+                );
+                auth.cleanup();
+                std::process::exit(1);
+            }
+        };
+        let electrum_tls_bind = match config
             .electrum_tls_bind
             .as_ref()
-            .map(|s| s.parse::<SocketAddr>().expect("Invalid electrumtlsbind"));
+            .map(|s| (s, s.parse::<SocketAddr>()))
+        {
+            None => None,
+            Some((_, Ok(a))) => Some(a),
+            Some((raw, Err(e))) => {
+                eprintln!("Error: invalid --electrumtlsbind {raw:?}: {e}");
+                auth.cleanup();
+                std::process::exit(1);
+            }
+        };
         let electrum_cfg = electrum_proto::ElectrumConfig {
             bind: electrum_bind,
             tls_bind: electrum_tls_bind,

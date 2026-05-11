@@ -908,7 +908,7 @@ impl Config {
         let electrum_mtls_client_ca = cli
             .electrummtlsclientca
             .or_else(|| file_get("electrummtlsclientca").map(std::path::PathBuf::from));
-        let electrum_mtls_client_allow = {
+        let electrum_mtls_client_allow: Vec<String> = {
             // Match the `esploracors` pattern: CLI takes precedence; if
             // no CLI values were given, fall back to all matching keys
             // in bitcoin.conf (so `electrummtlsclientallow=alice` lines
@@ -990,6 +990,15 @@ impl Config {
         }
         if electrum_mtls && electrum_mtls_client_ca.is_none() {
             return Err("--electrummtls=1 requires --electrummtlsclientca".to_string());
+        }
+        // Refuse `--electrummtlsclientallow` without `--electrummtls=1`
+        // (review C3): the allowlist runs after a successful handshake
+        // and matches the leaf cert's CN/SAN; without mTLS there is no
+        // peer cert, and a non-empty allowlist would reject every
+        // connection. Surface the misconfiguration at startup rather
+        // than as silent connection drops at runtime.
+        if !electrum_mtls && !electrum_mtls_client_allow.is_empty() {
+            return Err("--electrummtlsclientallow requires --electrummtls=1".to_string());
         }
 
         let prune = cli
@@ -3043,5 +3052,29 @@ rpcport=8332
         let mut names = config.electrum_mtls_client_allow.clone();
         names.sort();
         assert_eq!(names, vec!["alice", "bob", "carol"]);
+    }
+
+    /// review C3: an allowlist set without `--electrummtls=1` would
+    /// reject every connection at runtime (no peer cert to match).
+    /// Surface that misconfiguration at startup.
+    #[test]
+    fn test_electrum_mtls_clientallow_requires_mtls() {
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-test",
+            "--electrum=1",
+            "--electrumtlsbind=127.0.0.1:50002",
+            "--electrumtlscert=/tmp/cert.pem",
+            "--electrumtlskey=/tmp/key.pem",
+            "--electrummtlsclientallow=alice",
+            // Deliberately omit --electrummtls=1.
+        ])
+        .unwrap();
+        let err = Config::from_cli(cli).unwrap_err();
+        assert!(
+            err.contains("electrummtlsclientallow") && err.contains("electrummtls"),
+            "expected allowlist-without-mtls error, got: {err}"
+        );
     }
 }
