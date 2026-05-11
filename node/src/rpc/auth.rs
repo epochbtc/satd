@@ -4,10 +4,17 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// RPC authentication credentials.
+///
+/// `Disabled` is reserved for the mTLS escape hatch on the TLS
+/// surface (`--rpcdisableauth=1` + `--rpcmtls=1`): clients prove
+/// identity via the mTLS client cert and the AuthLayer becomes a
+/// pass-through. It must NEVER be used on the plain-HTTP surface —
+/// the satd binary refuses that configuration at startup.
 #[derive(Debug, Clone)]
 pub enum RpcAuth {
     Cookie { path: PathBuf, token: String },
     UserPass { username: String, password: String },
+    Disabled,
 }
 
 impl RpcAuth {
@@ -39,6 +46,13 @@ impl RpcAuth {
     /// Validate an HTTP Authorization header value.
     /// Expected format: "Basic <base64(username:password)>"
     pub fn validate(&self, auth_header: &str) -> bool {
+        // Auth-disabled is the pass-through path used on the mTLS-
+        // protected TLS surface when the operator sets
+        // `--rpcdisableauth=1`. The handshake-time client-cert check
+        // is the actual gate; no Basic header is needed or examined.
+        if matches!(self, RpcAuth::Disabled) {
+            return true;
+        }
         let encoded = match auth_header.strip_prefix("Basic ") {
             Some(e) => e,
             None => return false,
@@ -62,7 +76,15 @@ impl RpcAuth {
                 username,
                 password,
             } => user == username && pass == password,
+            RpcAuth::Disabled => unreachable!("handled above"),
         }
+    }
+
+    /// Is auth disabled? Used by call sites that want a header-free
+    /// fast path (the request middleware can skip reading the header
+    /// entirely, including for the `Disabled`-on-mTLS-only path).
+    pub fn is_disabled(&self) -> bool {
+        matches!(self, RpcAuth::Disabled)
     }
 
     /// Delete the cookie file on shutdown.
@@ -144,6 +166,14 @@ where
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
+            // Auth-disabled short-circuit: skip the header read
+            // entirely. Used by the mTLS-only TLS surface when
+            // `--rpcdisableauth=1` — the rustls handshake is the
+            // actual gate, and clients are not expected to send a
+            // Basic header.
+            if auth.is_disabled() {
+                return inner.call(req).await;
+            }
             // Check Authorization header
             let authorized = req
                 .headers()

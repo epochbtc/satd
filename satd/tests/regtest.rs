@@ -9460,3 +9460,382 @@ fn test_rpc_tls_partial_config_aborts_startup() {
 
     let _ = std::fs::remove_dir_all(&datadir);
 }
+
+/// Mint a CA + a server cert + a client cert all chained to the CA.
+/// Returns absolute paths for each PEM file (server cert/key, CA, and
+/// the client cert+key concatenated for reqwest `Identity::from_pem`)
+/// plus the client cert's CN for the allowlist tests.
+fn mint_mtls_pki(dir: &std::path::Path, client_cn: &str) -> RpcMtlsPki {
+    use std::io::Write as _;
+    // CA root.
+    let mut ca_params = rcgen::CertificateParams::new(vec![]).unwrap();
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    ca_params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
+    ca_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "rpc-mtls-test-ca");
+    let ca_kp = rcgen::KeyPair::generate().unwrap();
+    let ca_cert = ca_params.self_signed(&ca_kp).unwrap();
+
+    // Server leaf signed by the CA — what the RPC TLS server presents.
+    let mut server_params =
+        rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+    server_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "localhost");
+    let server_kp = rcgen::KeyPair::generate().unwrap();
+    let server_cert = server_params.signed_by(&server_kp, &ca_cert, &ca_kp).unwrap();
+
+    // Client leaf signed by the CA — what reqwest presents during the
+    // mTLS handshake. Two DNS SANs so allowlist tests can target
+    // either the CN or a SAN value.
+    let mut client_params =
+        rcgen::CertificateParams::new(vec![format!("{client_cn}.client.test")]).unwrap();
+    client_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, client_cn);
+    let client_kp = rcgen::KeyPair::generate().unwrap();
+    let client_cert = client_params.signed_by(&client_kp, &ca_cert, &ca_kp).unwrap();
+
+    let server_cert_path = dir.join("server.pem");
+    let server_key_path = dir.join("server.key.pem");
+    let ca_path = dir.join("ca.pem");
+    let client_id_path = dir.join("client-identity.pem");
+
+    std::fs::write(&server_cert_path, server_cert.pem()).unwrap();
+    std::fs::write(&server_key_path, server_kp.serialize_pem()).unwrap();
+    std::fs::write(&ca_path, ca_cert.pem()).unwrap();
+    let mut id_file = std::fs::File::create(&client_id_path).unwrap();
+    id_file.write_all(client_cert.pem().as_bytes()).unwrap();
+    id_file.write_all(client_kp.serialize_pem().as_bytes()).unwrap();
+
+    RpcMtlsPki {
+        server_cert_path,
+        server_key_path,
+        ca_path,
+        ca_pem: ca_cert.pem(),
+        client_identity_pem: {
+            let mut buf = client_cert.pem();
+            buf.push_str(&client_kp.serialize_pem());
+            buf
+        },
+    }
+}
+
+struct RpcMtlsPki {
+    server_cert_path: PathBuf,
+    server_key_path: PathBuf,
+    ca_path: PathBuf,
+    ca_pem: String,
+    client_identity_pem: String,
+}
+
+/// Build a reqwest blocking client that trusts the supplied CA and
+/// presents the given client identity (cert + key concatenated PEM).
+/// Forces rustls because workspace feature unification can pull in
+/// native-tls as well, and `Identity::from_pem` is rustls-only.
+fn https_mtls_client(ca_pem: &str, client_identity_pem: Option<&str>) -> reqwest::blocking::Client {
+    let root = reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap();
+    let mut builder = reqwest::blocking::Client::builder()
+        .use_rustls_tls()
+        .add_root_certificate(root)
+        .timeout(Duration::from_secs(5));
+    if let Some(pem) = client_identity_pem {
+        let id = reqwest::Identity::from_pem(pem.as_bytes()).unwrap();
+        builder = builder.identity(id);
+    }
+    builder.build().unwrap()
+}
+
+/// mTLS happy path: server requires CA-signed client cert; client
+/// presents one + cookie auth. HTTPS round-trip succeeds; plain HTTP
+/// still works as the backwards-compatible default surface; HTTPS
+/// without Basic auth is still 401 (mTLS is strictly additive when
+/// `--rpcdisableauth` is NOT set).
+#[test]
+fn test_rpc_mtls_round_trip() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pki = mint_mtls_pki(tmp.path(), "alice");
+    let tls_port = find_available_port();
+    let tls_bind = format!("127.0.0.1:{}", tls_port);
+
+    let mut node = TestNode::start(&[
+        &format!("--rpctlsbind={}", tls_bind),
+        &format!("--rpctlscert={}", pki.server_cert_path.display()),
+        &format!("--rpctlskey={}", pki.server_key_path.display()),
+        "--rpcmtls=1",
+        &format!("--rpcmtlsclientca={}", pki.ca_path.display()),
+    ]);
+
+    // Plain HTTP keeps working — mTLS is additive on the TLS surface.
+    let info = node.rpc_call("getblockchaininfo").expect("plain rpc");
+    assert_eq!(info["result"]["chain"].as_str(), Some("regtest"));
+
+    // HTTPS with valid client cert + cookie auth → 200.
+    let auth = base64::engine::general_purpose::STANDARD.encode(node.cookie.trim());
+    let client = https_mtls_client(&pki.ca_pem, Some(&pki.client_identity_pem));
+    let url = format!("https://localhost:{}/", tls_port);
+    let resp: serde_json::Value = client
+        .post(&url)
+        .header("Authorization", format!("Basic {}", auth))
+        .header("Content-Type", "application/json")
+        .body(r#"{"jsonrpc":"2.0","id":1,"method":"getblockchaininfo"}"#)
+        .send()
+        .expect("HTTPS mTLS request")
+        .json()
+        .expect("HTTPS mTLS response JSON");
+    assert_eq!(resp["result"]["chain"].as_str(), Some("regtest"));
+
+    // HTTPS with valid client cert but NO Basic auth → 401. mTLS is
+    // strictly additive: the AuthLayer keeps running on top.
+    let resp = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .body(r#"{"jsonrpc":"2.0","id":1,"method":"getblockchaininfo"}"#)
+        .send()
+        .expect("HTTPS mTLS no-auth request");
+    assert_eq!(resp.status(), 401);
+
+    node.stop();
+}
+
+/// mTLS rejection: server requires client cert; the client connects
+/// without one. The handshake is refused at the TLS layer; reqwest
+/// surfaces a connection-level error.
+#[test]
+fn test_rpc_mtls_rejects_client_without_cert() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pki = mint_mtls_pki(tmp.path(), "alice");
+    let tls_port = find_available_port();
+    let tls_bind = format!("127.0.0.1:{}", tls_port);
+
+    let mut node = TestNode::start(&[
+        &format!("--rpctlsbind={}", tls_bind),
+        &format!("--rpctlscert={}", pki.server_cert_path.display()),
+        &format!("--rpctlskey={}", pki.server_key_path.display()),
+        "--rpcmtls=1",
+        &format!("--rpcmtlsclientca={}", pki.ca_path.display()),
+    ]);
+
+    // Build a client that trusts the CA but offers NO client cert.
+    let client = https_mtls_client(&pki.ca_pem, None);
+    let url = format!("https://localhost:{}/", tls_port);
+    let result = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .body(r#"{"jsonrpc":"2.0","id":1,"method":"getblockchaininfo"}"#)
+        .send();
+    assert!(
+        result.is_err(),
+        "mTLS-required server should refuse no-cert client; got: {result:?}",
+    );
+
+    node.stop();
+}
+
+/// `--rpcdisableauth=1` + `--rpcmtls=1`: mTLS becomes the only auth
+/// on the TLS surface; the AuthLayer is a no-op so a client with a
+/// valid cert and NO Basic header gets a 200. The plain-HTTP surface
+/// must still enforce Basic — that's the safety invariant of
+/// rpcdisableauth: it only weakens the mTLS-protected surface.
+#[test]
+fn test_rpc_mtls_disable_auth_skips_basic_on_tls() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pki = mint_mtls_pki(tmp.path(), "alice");
+    let tls_port = find_available_port();
+    let tls_bind = format!("127.0.0.1:{}", tls_port);
+
+    let mut node = TestNode::start(&[
+        &format!("--rpctlsbind={}", tls_bind),
+        &format!("--rpctlscert={}", pki.server_cert_path.display()),
+        &format!("--rpctlskey={}", pki.server_key_path.display()),
+        "--rpcmtls=1",
+        &format!("--rpcmtlsclientca={}", pki.ca_path.display()),
+        "--rpcdisableauth=1",
+    ]);
+
+    // Plain HTTP still requires Basic — auth-disable is TLS-surface
+    // only. Use a raw reqwest request without auth to assert 401.
+    let plain_url = format!("http://127.0.0.1:{}/", node.rpcport);
+    let plain_client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let resp = plain_client
+        .post(&plain_url)
+        .header("Content-Type", "application/json")
+        .body(r#"{"jsonrpc":"2.0","id":1,"method":"getblockchaininfo"}"#)
+        .send()
+        .expect("plain HTTP no-auth request");
+    assert_eq!(resp.status(), 401, "plain HTTP must keep enforcing auth");
+
+    // HTTPS with valid client cert but NO Basic header → 200, because
+    // --rpcdisableauth=1 turns the AuthLayer into a pass-through on
+    // the TLS surface.
+    let client = https_mtls_client(&pki.ca_pem, Some(&pki.client_identity_pem));
+    let url = format!("https://localhost:{}/", tls_port);
+    let resp: serde_json::Value = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .body(r#"{"jsonrpc":"2.0","id":1,"method":"getblockchaininfo"}"#)
+        .send()
+        .expect("HTTPS mTLS request")
+        .json()
+        .expect("HTTPS mTLS response JSON");
+    assert_eq!(resp["result"]["chain"].as_str(), Some("regtest"));
+
+    node.stop();
+}
+
+/// `--rpcmtlsclientallow=alice` narrows the principal set. The
+/// client cert's CN is `alice`, so the request succeeds.
+#[test]
+fn test_rpc_mtls_allowlist_accepts_matching_cn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pki = mint_mtls_pki(tmp.path(), "alice");
+    let tls_port = find_available_port();
+    let tls_bind = format!("127.0.0.1:{}", tls_port);
+
+    let mut node = TestNode::start(&[
+        &format!("--rpctlsbind={}", tls_bind),
+        &format!("--rpctlscert={}", pki.server_cert_path.display()),
+        &format!("--rpctlskey={}", pki.server_key_path.display()),
+        "--rpcmtls=1",
+        &format!("--rpcmtlsclientca={}", pki.ca_path.display()),
+        "--rpcmtlsclientallow=alice,bob",
+    ]);
+
+    let auth = base64::engine::general_purpose::STANDARD.encode(node.cookie.trim());
+    let client = https_mtls_client(&pki.ca_pem, Some(&pki.client_identity_pem));
+    let url = format!("https://localhost:{}/", tls_port);
+    let resp: serde_json::Value = client
+        .post(&url)
+        .header("Authorization", format!("Basic {}", auth))
+        .header("Content-Type", "application/json")
+        .body(r#"{"jsonrpc":"2.0","id":1,"method":"getblockchaininfo"}"#)
+        .send()
+        .expect("HTTPS request")
+        .json()
+        .expect("HTTPS response JSON");
+    assert_eq!(resp["result"]["chain"].as_str(), Some("regtest"));
+
+    node.stop();
+}
+
+/// Allowlist rejection: the client cert's CN is `mallory`, which is
+/// not in `--rpcmtlsclientallow=alice,bob`. The handshake succeeds
+/// (cert is CA-signed) but the listener drops the connection
+/// post-handshake; reqwest sees a connection-level error.
+#[test]
+fn test_rpc_mtls_allowlist_drops_unlisted_principal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pki = mint_mtls_pki(tmp.path(), "mallory");
+    let tls_port = find_available_port();
+    let tls_bind = format!("127.0.0.1:{}", tls_port);
+
+    let mut node = TestNode::start(&[
+        &format!("--rpctlsbind={}", tls_bind),
+        &format!("--rpctlscert={}", pki.server_cert_path.display()),
+        &format!("--rpctlskey={}", pki.server_key_path.display()),
+        "--rpcmtls=1",
+        &format!("--rpcmtlsclientca={}", pki.ca_path.display()),
+        "--rpcmtlsclientallow=alice,bob",
+    ]);
+
+    let auth = base64::engine::general_purpose::STANDARD.encode(node.cookie.trim());
+    let client = https_mtls_client(&pki.ca_pem, Some(&pki.client_identity_pem));
+    let url = format!("https://localhost:{}/", tls_port);
+    let result = client
+        .post(&url)
+        .header("Authorization", format!("Basic {}", auth))
+        .header("Content-Type", "application/json")
+        .body(r#"{"jsonrpc":"2.0","id":1,"method":"getblockchaininfo"}"#)
+        .send();
+    assert!(
+        result.is_err(),
+        "allowlist should drop unlisted principal; got: {result:?}",
+    );
+
+    node.stop();
+}
+
+/// Misconfiguration: `--rpcmtls=1` without `--rpcmtlsclientca`
+/// aborts startup. The config-load gate refuses; the binary exits
+/// non-zero before the listener binds.
+#[test]
+fn test_rpc_mtls_without_ca_aborts_startup() {
+    let satd_bin = env!("CARGO_BIN_EXE_satd");
+    let datadir = std::env::temp_dir()
+        .join(format!("satd-test-rpcmtls-noca-{}", find_available_port()));
+    let _ = std::fs::create_dir_all(&datadir);
+    let tmp = tempfile::tempdir().unwrap();
+    let (cert_path, key_path) = mint_test_tls_cert(tmp.path());
+    let rpcport = find_available_port();
+    let tls_port = find_available_port();
+
+    let out = Command::new(satd_bin)
+        .arg("--regtest")
+        .arg(format!("--datadir={}", datadir.display()))
+        .arg(format!("--rpcport={}", rpcport))
+        .arg(format!("--port={}", find_available_port()))
+        .arg("--esplora=0")
+        .arg(format!("--rpctlsbind=127.0.0.1:{}", tls_port))
+        .arg(format!("--rpctlscert={}", cert_path.display()))
+        .arg(format!("--rpctlskey={}", key_path.display()))
+        .arg("--rpcmtls=1")
+        // Deliberately omit --rpcmtlsclientca.
+        .output()
+        .expect("spawn satd");
+
+    assert!(!out.status.success(), "should reject mtls without ca");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(
+        combined.contains("rpcmtlsclientca"),
+        "error should mention rpcmtlsclientca; got: {combined}"
+    );
+
+    let _ = std::fs::remove_dir_all(&datadir);
+}
+
+/// Misconfiguration: `--rpcdisableauth=1` without `--rpcmtls=1`
+/// aborts startup. Prevents the operator from accidentally opening
+/// a no-auth HTTP port behind nothing.
+#[test]
+fn test_rpc_disableauth_without_mtls_aborts_startup() {
+    let satd_bin = env!("CARGO_BIN_EXE_satd");
+    let datadir = std::env::temp_dir()
+        .join(format!("satd-test-rpcda-nomtls-{}", find_available_port()));
+    let _ = std::fs::create_dir_all(&datadir);
+    let rpcport = find_available_port();
+
+    let out = Command::new(satd_bin)
+        .arg("--regtest")
+        .arg(format!("--datadir={}", datadir.display()))
+        .arg(format!("--rpcport={}", rpcport))
+        .arg(format!("--port={}", find_available_port()))
+        .arg("--esplora=0")
+        .arg("--rpcdisableauth=1")
+        // Deliberately omit --rpcmtls=1 and the rest of the TLS quad.
+        .output()
+        .expect("spawn satd");
+
+    assert!(
+        !out.status.success(),
+        "should reject --rpcdisableauth=1 without --rpcmtls=1"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(
+        combined.contains("rpcdisableauth") || combined.contains("rpcmtls"),
+        "error should mention rpcdisableauth / rpcmtls; got: {combined}"
+    );
+
+    let _ = std::fs::remove_dir_all(&datadir);
+}

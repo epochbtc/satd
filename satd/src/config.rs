@@ -273,6 +273,24 @@ pub struct Config {
     pub rpc_tls_bind: Option<String>,
     pub rpc_tls_cert: Option<std::path::PathBuf>,
     pub rpc_tls_key: Option<std::path::PathBuf>,
+    /// Require mutual TLS on the JSON-RPC TLS listener. Off by
+    /// default. When `true`, the listener refuses any client without
+    /// a cert validly signed by `rpc_mtls_client_ca`. Strictly
+    /// additive — cookie / userpass auth keeps running on top unless
+    /// the operator also passes `--rpcdisableauth=1`.
+    pub rpc_mtls: bool,
+    /// PEM CA bundle used to verify client certificates on the
+    /// JSON-RPC TLS surface. Required when `rpc_mtls = true`.
+    pub rpc_mtls_client_ca: Option<std::path::PathBuf>,
+    /// Optional allowlist of accepted client-cert subject identities
+    /// (CN / DNS-SAN, case-insensitive). Empty = any CA-signed cert.
+    pub rpc_mtls_client_allow: Vec<String>,
+    /// Disable HTTP Basic auth on the JSON-RPC TLS surface. Only
+    /// accepted when `rpc_mtls = true` (the mTLS handshake becomes
+    /// the only gate on that surface). The plain-HTTP surface is
+    /// UNAFFECTED — it always keeps cookie / userpass enforcement so
+    /// loopback access stays gated against other local processes.
+    pub rpc_disable_auth: bool,
     pub listen: bool,
     pub port: u16,
     pub connect: Vec<String>,
@@ -710,6 +728,49 @@ impl Config {
         // error.
         if rpc_tls_bind.is_some() && (rpc_tls_cert.is_none() || rpc_tls_key.is_none()) {
             return Err("--rpctlsbind requires --rpctlscert AND --rpctlskey".to_string());
+        }
+
+        let rpc_mtls = cli
+            .rpcmtls
+            .or_else(|| file_get("rpcmtls").and_then(|v| parse_bool(&v)))
+            .unwrap_or(false);
+        let rpc_mtls_client_ca = cli
+            .rpcmtlsclientca
+            .or_else(|| file_get("rpcmtlsclientca").map(std::path::PathBuf::from));
+        let rpc_mtls_client_allow = {
+            let mut values: Vec<String> = cli.rpcmtlsclientallow.clone();
+            if values.is_empty() {
+                values = file_get_all("rpcmtlsclientallow");
+            }
+            values
+                .into_iter()
+                .flat_map(|v| {
+                    v.split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        };
+        let rpc_disable_auth = cli
+            .rpcdisableauth
+            .or_else(|| file_get("rpcdisableauth").and_then(|v| parse_bool(&v)))
+            .unwrap_or(false);
+
+        // mTLS validation, mirroring the other surfaces.
+        if rpc_mtls && rpc_tls_bind.is_none() {
+            return Err("--rpcmtls=1 requires --rpctlsbind".to_string());
+        }
+        if rpc_mtls && rpc_mtls_client_ca.is_none() {
+            return Err("--rpcmtls=1 requires --rpcmtlsclientca".to_string());
+        }
+        // --rpcdisableauth only makes sense behind mTLS. The plain-
+        // HTTP surface ALWAYS retains its cookie / userpass auth, so
+        // this flag never opens an unauthenticated HTTP port; the
+        // gate here is "you must have an mTLS surface for this to
+        // affect anything," which avoids configuration confusion.
+        if rpc_disable_auth && !rpc_mtls {
+            return Err("--rpcdisableauth=1 requires --rpcmtls=1".to_string());
         }
 
         let listen = cli
@@ -1190,6 +1251,10 @@ impl Config {
             rpcuser,
             rpcpassword,
             rpc_tls_bind,
+            rpc_mtls,
+            rpc_mtls_client_ca,
+            rpc_mtls_client_allow,
+            rpc_disable_auth,
             rpc_tls_cert,
             rpc_tls_key,
             listen,
@@ -1501,6 +1566,13 @@ impl Config {
                 "extended_errors": self.rpc_extended_errors,
                 "default_units": self.rpc_default_units.as_str(),
                 "tls_bind": self.rpc_tls_bind.clone(),
+                "mtls": self.rpc_mtls,
+                "mtls_client_allow_count": self.rpc_mtls_client_allow.len(),
+                // The plain-HTTP surface always keeps auth; this flag
+                // only affects the TLS-with-mTLS surface. Surfacing
+                // the bool here lets `getconfig` show the operator
+                // exactly which knob is on.
+                "disable_auth_on_tls": self.rpc_disable_auth,
             },
             "p2p": {
                 "listen": self.listen,
@@ -1628,6 +1700,36 @@ pub struct CliArgs {
         help = "Path to PEM-encoded TLS private key for the JSON-RPC server"
     )]
     pub rpctlskey: Option<std::path::PathBuf>,
+
+    #[arg(
+        long,
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        help = "Require mutual TLS on the JSON-RPC TLS listener (default: false). Requires --rpctlsbind and --rpcmtlsclientca."
+    )]
+    pub rpcmtls: Option<bool>,
+
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Path to PEM CA bundle used to verify client certificates when --rpcmtls=1"
+    )]
+    pub rpcmtlsclientca: Option<std::path::PathBuf>,
+
+    #[arg(
+        long,
+        value_name = "NAME",
+        help = "Allowlist of accepted client-cert CN / DNS-SAN values (repeatable, comma-separated). Empty = any cert validly signed by the CA."
+    )]
+    pub rpcmtlsclientallow: Vec<String>,
+
+    #[arg(
+        long,
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        help = "Disable HTTP Basic auth on the JSON-RPC TLS surface (default: false). Only accepted with --rpcmtls=1. Plain HTTP keeps full auth."
+    )]
+    pub rpcdisableauth: Option<bool>,
 
     #[arg(long, value_name = "BOOL", help = "Accept P2P connections")]
     pub listen: Option<bool>,
@@ -2385,6 +2487,10 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "rpctlsbind",
         "rpctlscert",
         "rpctlskey",
+        "rpcmtls",
+        "rpcmtlsclientca",
+        "rpcmtlsclientallow",
+        "rpcdisableauth",
         "listen",
         "port",
         "connect",
@@ -2692,6 +2798,10 @@ rpcport=8332
             rpctlsbind: None,
             rpctlscert: None,
             rpctlskey: None,
+            rpcmtls: None,
+            rpcmtlsclientca: None,
+            rpcmtlsclientallow: vec![],
+            rpcdisableauth: None,
             listen: None,
             port: None,
             connect: vec![],
@@ -2824,6 +2934,10 @@ rpcport=8332
             rpctlsbind: None,
             rpctlscert: None,
             rpctlskey: None,
+            rpcmtls: None,
+            rpcmtlsclientca: None,
+            rpcmtlsclientallow: vec![],
+            rpcdisableauth: None,
             listen: None,
             port: None,
             connect: vec![],
@@ -3194,6 +3308,77 @@ rpcport=8332
         assert!(
             err.contains("esploramtlsclientallow") && err.contains("esploramtls"),
             "expected allowlist-without-mtls error, got: {err}"
+        );
+    }
+
+    /// RPC mTLS flag-shape validation. Mirrors the Electrum / Esplora
+    /// tests so an operator who learned one rule applies it uniformly.
+    #[test]
+    fn test_rpc_mtls_partial_config_is_rejected() {
+        // mTLS without TLS bind — error.
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-test",
+            "--rpcmtls=1",
+        ])
+        .unwrap();
+        let err = Config::from_cli(cli).unwrap_err();
+        assert!(
+            err.contains("rpctlsbind") || err.contains("rpcmtls"),
+            "expected mTLS-without-TLS error, got: {err}"
+        );
+
+        // TLS bind + cert + key, mTLS on, no CA — error.
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-test",
+            "--rpctlsbind=127.0.0.1:8333",
+            "--rpctlscert=/tmp/cert.pem",
+            "--rpctlskey=/tmp/key.pem",
+            "--rpcmtls=1",
+        ])
+        .unwrap();
+        let err = Config::from_cli(cli).unwrap_err();
+        assert!(
+            err.contains("rpcmtlsclientca"),
+            "expected missing-CA error, got: {err}"
+        );
+
+        // Full quad — config loads.
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-test",
+            "--rpctlsbind=127.0.0.1:8333",
+            "--rpctlscert=/tmp/cert.pem",
+            "--rpctlskey=/tmp/key.pem",
+            "--rpcmtls=1",
+            "--rpcmtlsclientca=/tmp/ca.pem",
+        ])
+        .unwrap();
+        let config = Config::from_cli(cli).expect("complete mTLS config should load");
+        assert!(config.rpc_mtls);
+        assert!(!config.rpc_disable_auth);
+    }
+
+    /// `--rpcdisableauth=1` without `--rpcmtls=1` is rejected. Without
+    /// the gate an operator could accidentally open a no-auth HTTP
+    /// port; we refuse to start to surface the misconfiguration.
+    #[test]
+    fn test_rpc_disable_auth_requires_mtls() {
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-test",
+            "--rpcdisableauth=1",
+        ])
+        .unwrap();
+        let err = Config::from_cli(cli).unwrap_err();
+        assert!(
+            err.contains("rpcdisableauth") || err.contains("rpcmtls"),
+            "expected disable-auth-without-mtls error, got: {err}"
         );
     }
 
