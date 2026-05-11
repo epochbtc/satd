@@ -311,6 +311,11 @@ pub(crate) fn decode_transaction_verbose(
         "locktime": tx.lock_time.to_consensus_u32(),
         "vin": vin,
         "vout": vout,
+        // Bitcoin Core always echoes the raw hex in verbose responses
+        // for `getrawtransaction`. `decoderawtransaction` technically
+        // omits it upstream, but echoing the caller's own input back
+        // is harmless and lets us share the same verbose builder.
+        "hex": hex::encode(&raw),
     });
 
     if let Some(bh) = blockhash {

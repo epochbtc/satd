@@ -2716,3 +2716,553 @@ fn test_e2e_cross_surface_esplora_broadcast_visible_in_rpc_and_electrum() {
 
     e2e.node.stop();
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// Typed-client parity suite
+//
+// These tests drive satd via third-party typed clients
+// (`bitcoincore-rpc` for JSON-RPC, `esplora-client` for REST). The
+// clients' own response deserializers act as a parity oracle: if our
+// handler renames a field, drops a required field, or returns a wrong
+// JSON type, the call fails at *deserialization*, not at our
+// `assert_eq!`. That catches a class of upstream-compat drift that
+// shape-blind `serde_json::Value` asserts gloss over.
+//
+// Both clients are independent of our internal `node`,
+// `esplora-handlers`, and `electrum-proto` crates — see the PR
+// description for `cargo tree -e all` output.
+// ─────────────────────────────────────────────────────────────────────
+
+/// Build a `bitcoincore_rpc::Client` pointed at this node's regtest
+/// JSON-RPC endpoint with cookie-derived basic auth. The harness reads
+/// the cookie file into `node.cookie` at startup, so we pass through
+/// as `UserPass` rather than `CookieFile(path)`: equivalent over the
+/// wire, and avoids a second file read.
+fn bitcoincore_rpc_client_for(node: &TestNode) -> bitcoincore_rpc::Client {
+    use bitcoincore_rpc::Auth;
+    let (user, pass) = node
+        .cookie
+        .split_once(':')
+        .expect("cookie file format `user:pass`");
+    bitcoincore_rpc::Client::new(
+        &format!("http://127.0.0.1:{}", node.rpcport),
+        Auth::UserPass(user.to_string(), pass.to_string()),
+    )
+    .expect("bitcoincore_rpc::Client::new")
+}
+
+/// Build an `esplora_client::BlockingClient` pointed at this node's
+/// Esplora REST endpoint. Caller is responsible for booting the node
+/// with `--esplora=1 --esplorabind=127.0.0.1:0`.
+fn esplora_typed_client_for(e2e: &E2eNode) -> esplora_client::BlockingClient {
+    let port = e2e
+        .esplora_port
+        .expect("E2eNode booted with --esplora=1 and --esplorabind=127.0.0.1:0");
+    esplora_client::Builder::new(&format!("http://127.0.0.1:{}", port)).build_blocking()
+}
+
+#[test]
+fn test_e2e_typed_jsonrpc_getblockchaininfo_deserializes() {
+    use bitcoincore_rpc::RpcApi;
+    let mut e2e = E2eNode::boot_with(&[]);
+    let client = bitcoincore_rpc_client_for(&e2e.node);
+
+    // The deserialize itself is the parity oracle: `GetBlockchainInfoResult`
+    // requires every field Core 0.21+ documents (chain, blocks, headers,
+    // bestblockhash, difficulty, mediantime, verificationprogress,
+    // initialblockdownload, chainwork, size_on_disk, pruned). If satd
+    // renames or omits any, this call panics with a serde error before
+    // we get to the asserts.
+    let info = client
+        .get_blockchain_info()
+        .expect("typed getblockchaininfo round-trip");
+    assert_eq!(info.chain, bitcoin::Network::Regtest);
+    assert_eq!(info.blocks, 0);
+    assert_eq!(info.headers, 0);
+    assert!(
+        !info.chain_work.is_empty(),
+        "chainwork hex must decode to bytes"
+    );
+    assert!(!info.initial_block_download || info.blocks == 0);
+
+    e2e.node.stop();
+}
+
+#[test]
+fn test_e2e_typed_jsonrpc_block_lifecycle_typed() {
+    use bitcoincore_rpc::RpcApi;
+    let mut e2e = E2eNode::boot_with(&[]);
+    let client = bitcoincore_rpc_client_for(&e2e.node);
+    let wallet = DeterministicWallet::from_secret([0x21u8; 32]);
+
+    let hashes = client
+        .generate_to_address(101, &wallet.address)
+        .expect("typed generate_to_address");
+    assert_eq!(hashes.len(), 101, "generate_to_address returns 101 hashes");
+
+    assert_eq!(client.get_block_count().expect("typed block_count"), 101);
+
+    let best = client.get_best_block_hash().expect("typed bestblockhash");
+    assert_eq!(
+        best,
+        *hashes.last().expect("non-empty hash list"),
+        "bestblockhash must equal the last generated block"
+    );
+
+    let genesis = client.get_block_hash(0).expect("typed genesis hash");
+    let block0: bitcoin::Block = client.get_block(&genesis).expect("typed genesis block");
+    // Round-tripping the genesis block through the bitcoin crate's
+    // `Block` decoder is an end-to-end check that satd's `getblock
+    // <hash> 0` returns Core-compatible raw hex (the only verbosity
+    // bitcoincore-rpc's `get_block` calls).
+    assert_eq!(block0.block_hash(), genesis);
+    assert_eq!(
+        block0.txdata.len(),
+        1,
+        "genesis has exactly one (coinbase) tx"
+    );
+
+    e2e.node.stop();
+}
+
+#[test]
+fn test_e2e_typed_jsonrpc_raw_transaction_round_trip() {
+    use bitcoincore_rpc::RpcApi;
+    let mut e2e = E2eNode::boot_with(&[]);
+    let client = bitcoincore_rpc_client_for(&e2e.node);
+    let wallet = DeterministicWallet::from_secret([0x22u8; 32]);
+    let _ = client
+        .generate_to_address(1, &wallet.address)
+        .expect("generate 1 block");
+
+    let block1_hash = client.get_block_hash(1).expect("block1 hash");
+    let block1: bitcoin::Block = client.get_block(&block1_hash).expect("block1 typed");
+    let cb_txid = block1.txdata[0].compute_txid();
+
+    // `get_raw_transaction` returns a typed `bitcoin::Transaction`
+    // (verbose=false → hex → decode). `get_raw_transaction_info`
+    // returns the verbose JSON object via `GetRawTransactionResult`
+    // — separate deserialize path with its own required fields
+    // (`txid`, `hash`, `size`, `vsize`, `version`, `locktime`, `vin`,
+    // `vout`, etc.).
+    let raw_tx = client
+        .get_raw_transaction(&cb_txid, Some(&block1_hash))
+        .expect("typed getrawtransaction non-verbose");
+    assert_eq!(raw_tx.compute_txid(), cb_txid);
+
+    let raw_info = client
+        .get_raw_transaction_info(&cb_txid, Some(&block1_hash))
+        .expect("typed getrawtransaction verbose");
+    assert_eq!(raw_info.txid, cb_txid);
+    assert!(
+        !raw_info.vout.is_empty(),
+        "coinbase tx must have at least one vout"
+    );
+    assert_eq!(
+        raw_info.vin.len(),
+        1,
+        "coinbase tx has exactly one (synthetic) input"
+    );
+    assert!(
+        raw_info.vin[0].is_coinbase(),
+        "block-1 input must be flagged as coinbase by Core's verbose shape"
+    );
+
+    e2e.node.stop();
+}
+
+#[test]
+fn test_e2e_typed_jsonrpc_send_raw_transaction_returns_typed_txid() {
+    use bitcoincore_rpc::RpcApi;
+    let mut e2e = E2eNode::boot_with(&[]);
+    let client = bitcoincore_rpc_client_for(&e2e.node);
+    let wallet = DeterministicWallet::from_secret([0x23u8; 32]);
+    let _ = client
+        .generate_to_address(101, &wallet.address)
+        .expect("generate 101 to mature cb1");
+
+    let dest_addr = bitcoin::Address::from_str("bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202")
+        .expect("valid bech32")
+        .require_network(bitcoin::Network::Regtest)
+        .expect("regtest");
+    let (raw_hex, expected_txid_str) = build_signed_p2wpkh_spend_from_block1_coinbase(
+        &e2e.node,
+        &wallet,
+        dest_addr.script_pubkey(),
+        1000,
+    );
+
+    // `send_raw_transaction` deserializes the response as a typed
+    // `bitcoin::Txid`. Core returns a hex string; a wire-format drift
+    // (returning a JSON object, missing the 0x prefix-stripping, etc.)
+    // would deserialize-fail here.
+    let returned: bitcoin::Txid = client
+        .send_raw_transaction(raw_hex.as_str())
+        .expect("typed sendrawtransaction");
+    assert_eq!(returned.to_string(), expected_txid_str);
+
+    e2e.node.stop();
+}
+
+#[test]
+fn test_e2e_typed_jsonrpc_get_tx_out_typed() {
+    use bitcoincore_rpc::RpcApi;
+    let mut e2e = E2eNode::boot_with(&[]);
+    let client = bitcoincore_rpc_client_for(&e2e.node);
+    let wallet = DeterministicWallet::from_secret([0x24u8; 32]);
+    let _ = client
+        .generate_to_address(1, &wallet.address)
+        .expect("generate 1");
+
+    let block1_hash = client.get_block_hash(1).expect("block1 hash");
+    let block1: bitcoin::Block = client.get_block(&block1_hash).expect("block1");
+    let cb_txid = block1.txdata[0].compute_txid();
+
+    // `get_tx_out` is the canonical UTXO-set probe; its typed
+    // `GetTxOutResult` requires `bestblock`, `confirmations`, `value`
+    // (BTC-denominated), `scriptPubKey`, and `coinbase`.
+    let tx_out = client
+        .get_tx_out(&cb_txid, 0, Some(false))
+        .expect("typed gettxout")
+        .expect("cb_txid:0 should be unspent on a fresh node");
+    assert_eq!(tx_out.bestblock, block1_hash);
+    assert!(tx_out.coinbase, "block-1 vout-0 must be coinbase-flagged");
+    assert_eq!(
+        tx_out.value,
+        bitcoin::Amount::from_int_btc(50),
+        "regtest cb subsidy is 50 BTC pre-150"
+    );
+
+    // Spent / non-existent outpoint must come back as `None` after
+    // `opt_result` strips the JSON `null`. Any deviation (e.g.
+    // returning an empty object) would unwrap-fail here.
+    let nope = client
+        .get_tx_out(&cb_txid, 999, Some(false))
+        .expect("typed gettxout for missing vout");
+    assert!(nope.is_none(), "missing vout must serialize as JSON null");
+
+    e2e.node.stop();
+}
+
+#[test]
+fn test_e2e_typed_jsonrpc_get_mempool_info_typed() {
+    use bitcoincore_rpc::RpcApi;
+    let mut e2e = E2eNode::boot_with(&[]);
+    let client = bitcoincore_rpc_client_for(&e2e.node);
+
+    // `GetMempoolInfoResult` requires `size`, `bytes`, `usage`,
+    // `maxmempool`, `mempoolminfee` (BTC-denominated), and
+    // `minrelaytxfee` (BTC-denominated). The two fee fields use
+    // `with = "bitcoin::amount::serde::as_btc"`, so missing the
+    // decimal-BTC encoding (e.g. returning sats) would fail this
+    // call.
+    let info = client.get_mempool_info().expect("typed getmempoolinfo");
+    assert_eq!(info.size, 0, "fresh mempool is empty");
+    assert!(info.max_mempool > 0, "maxmempool must be a positive size");
+    assert!(
+        info.min_relay_tx_fee >= bitcoin::Amount::ZERO,
+        "minrelaytxfee must be a non-negative BTC amount"
+    );
+
+    e2e.node.stop();
+}
+
+#[test]
+fn test_e2e_typed_esplora_height_and_tip_typed() {
+    let mut e2e = E2eNode::boot_with(&esplora_e2e_args());
+    let esplora = esplora_typed_client_for(&e2e);
+
+    // `get_height()` deserializes a plain integer body — drift
+    // (e.g. returning a JSON object) would fail-parse here. Same
+    // for `get_tip_hash()` which expects a 64-char hex string and
+    // decodes it via `BlockHash::from_str`.
+    let h0 = esplora.get_height().expect("typed esplora height (fresh)");
+    assert_eq!(h0, 0, "fresh regtest is at height 0");
+
+    let wallet = DeterministicWallet::from_secret([0x31u8; 32]);
+    let _ = e2e
+        .node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![
+                serde_json::json!(5),
+                serde_json::json!(wallet.address.to_string()),
+            ],
+        )
+        .expect("mine 5 blocks");
+
+    let h5 = esplora.get_height().expect("typed esplora height (mined)");
+    assert_eq!(h5, 5, "after mining 5, tip is 5");
+
+    let tip = esplora.get_tip_hash().expect("typed tip hash");
+    let height_5_hash = esplora
+        .get_block_hash(5)
+        .expect("typed get_block_hash(5)");
+    assert_eq!(tip, height_5_hash, "tip hash must match height-5 hash");
+
+    let genesis = esplora
+        .get_block_hash(0)
+        .expect("typed get_block_hash(0)");
+    assert_eq!(
+        genesis.to_string(),
+        bitcoin::constants::genesis_block(bitcoin::Network::Regtest)
+            .block_hash()
+            .to_string(),
+        "Esplora regtest genesis hash must match the bitcoin crate's constant"
+    );
+
+    e2e.node.stop();
+}
+
+#[test]
+fn test_e2e_typed_esplora_broadcast_and_tx_info() {
+    let mut e2e = E2eNode::boot_with(&esplora_e2e_args());
+    let esplora = esplora_typed_client_for(&e2e);
+    let wallet = DeterministicWallet::from_secret([0x32u8; 32]);
+    let _ = e2e
+        .node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![
+                serde_json::json!(101),
+                serde_json::json!(wallet.address.to_string()),
+            ],
+        )
+        .expect("mine 101");
+
+    let dest_addr = bitcoin::Address::from_str("bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202")
+        .expect("valid bech32")
+        .require_network(bitcoin::Network::Regtest)
+        .expect("regtest");
+    let (raw_hex, txid_hex) = build_signed_p2wpkh_spend_from_block1_coinbase(
+        &e2e.node,
+        &wallet,
+        dest_addr.script_pubkey(),
+        1000,
+    );
+    let txid = bitcoin::Txid::from_str(&txid_hex).expect("valid txid");
+    let signed_tx: bitcoin::Transaction = bitcoin::consensus::deserialize(
+        &hex::decode(&raw_hex).expect("raw_hex is valid hex"),
+    )
+    .expect("decode signed tx");
+
+    // `broadcast(&Transaction)` posts to `/tx` with the lowercase-hex
+    // body the typed client encodes itself — exercises the same wire
+    // shape mempool.space's frontend uses.
+    esplora.broadcast(&signed_tx).expect("typed esplora broadcast");
+
+    // `get_tx_info` deserializes the full `Tx` shape (txid, version,
+    // locktime, vin, vout, size, weight, status, fee). Missing or
+    // mistyped fields fail-parse before the asserts run.
+    let info = esplora
+        .get_tx_info(&txid)
+        .expect("typed get_tx_info")
+        .expect("tx is in mempool");
+    assert_eq!(info.txid, txid);
+    assert!(!info.status.confirmed, "unmined tx must be unconfirmed");
+    assert_eq!(info.fee, 1000, "fee must round-trip the 1000-sat spec");
+    assert_eq!(info.vin.len(), 1);
+    assert_eq!(info.vout.len(), 1);
+
+    // Mine to confirm; `get_tx_info` should flip `status.confirmed`.
+    let _ = e2e
+        .node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![
+                serde_json::json!(1),
+                serde_json::json!(wallet.address.to_string()),
+            ],
+        )
+        .expect("confirm");
+    common::poll_until(
+        || {
+            esplora
+                .get_tx_info(&txid)
+                .ok()
+                .flatten()
+                .is_some_and(|t| t.status.confirmed)
+        },
+        e2e_test_timeout(10),
+        "typed get_tx_info never reported confirmed",
+    );
+
+    e2e.node.stop();
+}
+
+#[test]
+fn test_e2e_typed_esplora_address_utxos_typed() {
+    let mut e2e = E2eNode::boot_with(&esplora_e2e_args());
+    let esplora = esplora_typed_client_for(&e2e);
+    let wallet = DeterministicWallet::from_secret([0x33u8; 32]);
+
+    let _ = e2e
+        .node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![
+                serde_json::json!(1),
+                serde_json::json!(wallet.address.to_string()),
+            ],
+        )
+        .expect("mine 1 to wallet");
+
+    // `get_address_utxos` deserializes a `Vec<Utxo>`; each `Utxo`
+    // requires `txid`, `vout`, `status` (with confirmed +
+    // block_height/hash/time), and `value` as a typed `Amount`.
+    let utxos = esplora
+        .get_address_utxos(&wallet.address)
+        .expect("typed get_address_utxos");
+    assert_eq!(utxos.len(), 1, "exactly one coinbase UTXO at the address");
+    let u = &utxos[0];
+    assert_eq!(u.vout, 0);
+    assert_eq!(u.value, bitcoin::Amount::from_int_btc(50));
+    assert!(u.status.confirmed, "the coinbase is in a mined block");
+    assert_eq!(
+        u.status.block_height,
+        Some(1),
+        "status.block_height must round-trip"
+    );
+
+    e2e.node.stop();
+}
+
+#[test]
+fn test_e2e_typed_esplora_fee_estimates_typed() {
+    let mut e2e = E2eNode::boot_with(&esplora_e2e_args());
+    let esplora = esplora_typed_client_for(&e2e);
+
+    // The deserialize-into-typed-HashMap is the parity check: the
+    // wire shape is `{ "1": 1.0, "2": 1.0, ... }` — keys are integer
+    // strings, values are floats. A drift to integer values or
+    // string keys with non-numeric content would fail-parse here.
+    let estimates = esplora
+        .get_fee_estimates()
+        .expect("typed get_fee_estimates");
+    // On regtest the values are stub-y, so we only assert
+    // shape-survival: every value must be a non-NaN finite f64.
+    for (target, fee) in &estimates {
+        assert!(*target >= 1, "fee-estimate target must be a positive integer");
+        assert!(
+            fee.is_finite(),
+            "fee-estimate value for target {} must be finite, got {}",
+            target,
+            fee
+        );
+    }
+
+    e2e.node.stop();
+}
+
+#[test]
+fn test_e2e_typed_esplora_block_info_typed() {
+    let mut e2e = E2eNode::boot_with(&esplora_e2e_args());
+    let esplora = esplora_typed_client_for(&e2e);
+    let wallet = DeterministicWallet::from_secret([0x34u8; 32]);
+    let _ = e2e
+        .node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![
+                serde_json::json!(1),
+                serde_json::json!(wallet.address.to_string()),
+            ],
+        )
+        .expect("mine 1");
+
+    let hash = esplora.get_tip_hash().expect("typed tip hash");
+    // `BlockInfo` has the deepest required-field surface in the
+    // Esplora API: id, height, version, timestamp, tx_count, size,
+    // weight, merkle_root, previousblockhash, mediantime, nonce,
+    // bits, difficulty. Missing any fails-parse.
+    let info = esplora.get_block_info(&hash).expect("typed block_info");
+    assert_eq!(info.id, hash);
+    assert_eq!(info.height, 1);
+    assert!(info.tx_count >= 1, "block-1 has at least the coinbase tx");
+    assert_eq!(
+        info.previousblockhash.expect("block-1 has parent"),
+        bitcoin::constants::genesis_block(bitcoin::Network::Regtest).block_hash(),
+        "block-1's parent must be regtest genesis"
+    );
+
+    e2e.node.stop();
+}
+
+#[test]
+fn test_e2e_typed_esplora_tx_status_via_typed_client() {
+    let mut e2e = E2eNode::boot_with(&esplora_e2e_args());
+    let esplora = esplora_typed_client_for(&e2e);
+    let wallet = DeterministicWallet::from_secret([0x35u8; 32]);
+    let _ = e2e
+        .node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![
+                serde_json::json!(101),
+                serde_json::json!(wallet.address.to_string()),
+            ],
+        )
+        .expect("mine 101");
+
+    let dest_addr = bitcoin::Address::from_str("bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202")
+        .expect("valid bech32")
+        .require_network(bitcoin::Network::Regtest)
+        .expect("regtest");
+    let (raw_hex, txid_hex) = build_signed_p2wpkh_spend_from_block1_coinbase(
+        &e2e.node,
+        &wallet,
+        dest_addr.script_pubkey(),
+        1000,
+    );
+    let txid = bitcoin::Txid::from_str(&txid_hex).expect("valid txid");
+    let signed_tx: bitcoin::Transaction = bitcoin::consensus::deserialize(
+        &hex::decode(&raw_hex).expect("raw_hex is valid hex"),
+    )
+    .expect("decode signed tx");
+    esplora.broadcast(&signed_tx).expect("typed broadcast");
+
+    // `get_tx_status` returns the lean `TxStatus` shape directly
+    // (no enclosing `Tx`): `confirmed`, `block_height`, `block_hash`,
+    // `block_time`. Mempool → all `Option` fields `None`. After
+    // mining → all `Some`.
+    let mempool_status = esplora.get_tx_status(&txid).expect("typed tx_status");
+    assert!(!mempool_status.confirmed);
+    assert!(mempool_status.block_height.is_none());
+    assert!(mempool_status.block_hash.is_none());
+    assert!(mempool_status.block_time.is_none());
+
+    let _ = e2e
+        .node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![
+                serde_json::json!(1),
+                serde_json::json!(wallet.address.to_string()),
+            ],
+        )
+        .expect("confirm");
+    common::poll_until(
+        || {
+            esplora
+                .get_tx_status(&txid)
+                .ok()
+                .is_some_and(|s| s.confirmed)
+        },
+        e2e_test_timeout(10),
+        "typed tx_status never flipped to confirmed",
+    );
+    let mined_status = esplora
+        .get_tx_status(&txid)
+        .expect("typed tx_status post-mine");
+    assert!(mined_status.confirmed);
+    assert!(
+        mined_status.block_height.is_some(),
+        "confirmed status must carry block_height"
+    );
+    assert!(
+        mined_status.block_hash.is_some(),
+        "confirmed status must carry block_hash"
+    );
+
+    e2e.node.stop();
+}

@@ -274,9 +274,13 @@ pub fn get_tx_out(
 
     let outpoint = bitcoin::OutPoint { txid, vout };
 
-    let coin = chain_state
-        .get_coin(&outpoint)
-        .ok_or("UTXO not found".to_string())?;
+    // Bitcoin Core returns JSON `null` for a missing or spent
+    // outpoint — not an error. Clients (including `bitcoincore-rpc`)
+    // use this as the UTXO-existence probe; returning an error
+    // breaks the `Option<GetTxOutResult>` round-trip.
+    let Some(coin) = chain_state.get_coin(&outpoint) else {
+        return Ok(Value::Null);
+    };
 
     let unit = default_unit();
     let value = format_amount(coin.amount, unit);
@@ -291,6 +295,7 @@ pub fn get_tx_out(
         "confirmations": confirmations,
         "value": value,
         "scriptPubKey": {
+            "asm": format!("{}", coin.script_pubkey),
             "hex": hex::encode(coin.script_pubkey.as_bytes()),
         },
         "coinbase": coin.coinbase,
