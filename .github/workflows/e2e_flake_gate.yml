@@ -89,10 +89,13 @@ jobs:
         # Build the test binary once so the loop only re-runs it,
         # avoiding 10× the cargo-resolve / compile cost. `--no-run`
         # is the canonical way to compile test binaries without
-        # invoking them.
+        # invoking them. `--features e2e` is required because the
+        # `[[test]] name = "e2e"` target declares
+        # `required-features = ["e2e"]` so it stays out of the
+        # general `cargo test --all` test pass.
         env:
           SATD_BACKFILL_PREFLIGHT_BYTES: "0"
-        run: cargo test --test e2e --locked --no-run
+        run: cargo test --test e2e --locked --features e2e --no-run
 
       - name: Run E2E flake gate
         env:
@@ -104,11 +107,29 @@ jobs:
         run: |
           set -euo pipefail
           iters="${ITERATIONS:-10}"
+          # Validate before the loop. A non-numeric `iterations`
+          # input (e.g. `abc`, `0`, `-3`) would otherwise make
+          # `seq` print to stderr, leave the for-list empty, and
+          # exit the script "successfully" with zero iterations
+          # run — exactly the failure mode this gate exists to
+          # prevent.
+          if ! [[ "$iters" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::iterations must be a positive integer, got: '$iters'"
+            exit 1
+          fi
+          # Cap to keep a typo from burning hundreds of hosted-runner
+          # minutes. 100 is well above any sensible
+          # release-confidence run; raise the cap if a real reason
+          # appears.
+          if [[ "$iters" -gt 100 ]]; then
+            echo "::error::iterations=$iters exceeds the 100-iteration cap"
+            exit 1
+          fi
           echo "Running E2E suite $iters times; fail-fast on first non-zero exit."
           pass=0
           for i in $(seq 1 "$iters"); do
             echo "--- Iteration $i / $iters ---"
-            if cargo test --test e2e --locked -- --test-threads=1; then
+            if cargo test --test e2e --locked --features e2e -- --test-threads=1; then
               pass=$((pass + 1))
               echo "Iteration $i: PASS ($pass / $iters)"
             else
