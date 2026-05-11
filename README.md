@@ -20,7 +20,8 @@
 *   **Dual Consensus Engine:** A complete, independently written Rust consensus engine that passes the Bitcoin Core test suite, with a C++ `libbitcoinconsensus` conservative fallback.
 *   **Swarm-Style IBD:** BitTorrent-like parallel block downloading and speculative verification pipeline for heavily optimized Initial Block Download.
 *   **Full P2P:** BIP 152 compact blocks, ban scoring, addrv2, BIP 324 v2 transport (in progress), Tor v3 (hardcoded `.onion` seeds).
-*   **Modern Mempool:** Full RBF / opt-in BIP 125, CPFP ancestor tracking, configurable policy (`-dustrelayfee`, `-limitancestorcount`, etc.).
+*   **Policy Sovereignty (Mempool):** Strict, first-class control over what your node relays. Easily filter spam, block `OP_RETURN` data, or adjust limits via exposed flags (`-datacarrier`, `-datacarriersize`, `-dustrelayfee`, `-limitancestorcount`, `-permitbaremultisig`) without needing a patched fork.
+*   **Modern Mempool:** Full RBF / opt-in BIP 125 and CPFP ancestor tracking.
 
 ### Native Integrations (No side-cars required)
 *   **AI-Native MCP Server:** An optional Model Context Protocol (`mcp`) binary that exposes node data and operational surfaces directly to AI agents.
