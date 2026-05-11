@@ -22,9 +22,13 @@ pub mod encode;
 pub mod error;
 pub mod handlers;
 pub mod router;
+pub mod serve;
 pub mod state;
+pub mod tls;
 
 pub use config::{EsploraAuth, EsploraConfig};
 pub use error::EsploraError;
 pub use router::{RouterBuildError, build_router};
+pub use serve::TlsListener;
 pub use state::EsploraState;
+pub use tls::{TlsConfigError, build_acceptor};

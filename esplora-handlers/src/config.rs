@@ -14,6 +14,17 @@ pub struct EsploraConfig {
     pub enabled: bool,
     /// `host:port` to bind. Defaults to `127.0.0.1:3000`.
     pub bind: String,
+    /// Optional TLS bind. When `Some`, both `tls_cert_path` and
+    /// `tls_key_path` MUST also be `Some`; the server validates this
+    /// at construction time. Mirrors the Electrum-server shape so a
+    /// single operator mental model covers both surfaces.
+    pub tls_bind: Option<String>,
+    /// Path to the TLS server certificate (PEM). Read once at server
+    /// start and held in memory.
+    pub tls_cert_path: Option<PathBuf>,
+    /// Path to the TLS server private key (PEM). Read once at
+    /// server start and held in memory.
+    pub tls_key_path: Option<PathBuf>,
     /// URL prefix to mount the API under. Defaults to `/`. Set to
     /// `/api` for `blockstream.info`-style deployments.
     pub prefix: String,
@@ -46,6 +57,9 @@ impl Default for EsploraConfig {
         Self {
             enabled: true,
             bind: "127.0.0.1:3000".to_string(),
+            tls_bind: None,
+            tls_cert_path: None,
+            tls_key_path: None,
             prefix: "/".to_string(),
             cors_origins: Vec::new(),
             request_timeout: Duration::from_secs(30),
