@@ -894,7 +894,7 @@ impl Config {
         let esplora_mtls_client_ca = cli
             .esploramtlsclientca
             .or_else(|| file_get("esploramtlsclientca").map(std::path::PathBuf::from));
-        let esplora_mtls_client_allow = {
+        let esplora_mtls_client_allow: Vec<String> = {
             let mut values: Vec<String> = cli.esploramtlsclientallow.clone();
             if values.is_empty() {
                 values = file_get_all("esploramtlsclientallow");
@@ -919,6 +919,13 @@ impl Config {
         }
         if esplora_mtls && esplora_mtls_client_ca.is_none() {
             return Err("--esploramtls=1 requires --esploramtlsclientca".to_string());
+        }
+        // Refuse `--esploramtlsclientallow` without `--esploramtls=1`
+        // (review C3). See the electrum equivalent: a non-empty
+        // allowlist without an mTLS handshake has no peer cert to
+        // match and would reject every connection.
+        if !esplora_mtls && !esplora_mtls_client_allow.is_empty() {
+            return Err("--esploramtlsclientallow requires --esploramtls=1".to_string());
         }
         if esplora_tls_bind.is_some()
             && (esplora_tls_cert.is_none() || esplora_tls_key.is_none())
@@ -3164,6 +3171,29 @@ rpcport=8332
         assert_eq!(
             config.esplora_mtls_client_ca.as_deref(),
             Some(std::path::Path::new("/tmp/ca.pem"))
+        );
+    }
+
+    /// review C3: `--esploramtlsclientallow` without `--esploramtls=1`
+    /// would reject every TLS connection (no peer cert to match).
+    /// Reject the misconfiguration at startup.
+    #[test]
+    fn test_esplora_mtls_clientallow_requires_mtls() {
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-test",
+            "--esplora=1",
+            "--esploratlsbind=127.0.0.1:3001",
+            "--esploratlscert=/tmp/cert.pem",
+            "--esploratlskey=/tmp/key.pem",
+            "--esploramtlsclientallow=alice",
+        ])
+        .unwrap();
+        let err = Config::from_cli(cli).unwrap_err();
+        assert!(
+            err.contains("esploramtlsclientallow") && err.contains("esploramtls"),
+            "expected allowlist-without-mtls error, got: {err}"
         );
     }
 

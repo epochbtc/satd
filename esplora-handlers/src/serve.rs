@@ -12,6 +12,17 @@
 //! client can't pin the accept loop indefinitely; on timeout the
 //! socket is dropped and we move on. Mirrors the Electrum-server
 //! handshake-timeout guard.
+//!
+//! Known limitation (review M3): `axum::serve::Listener::accept`
+//! returns exactly one ready connection per call, so this listener
+//! completes the TLS handshake inline before yielding to axum. A
+//! slow handshake therefore stalls the accept loop for the duration
+//! of `handshake_timeout`. The timeout caps the worst case but the
+//! single-threaded handshake pipeline is a DoS vector against a
+//! determined attacker. Future work: spawn each handshake into its
+//! own task and feed `accept()` from a bounded MPSC of completed
+//! `(TlsStream, SocketAddr)` pairs. Tracked as follow-up to the
+//! mTLS series.
 
 use std::io;
 use std::net::SocketAddr;
@@ -113,28 +124,30 @@ impl axum::serve::Listener for TlsListener {
                     continue;
                 }
             };
-            // mTLS post-handshake checks. The audit log fires for any
-            // mTLS-enabled accept; the allowlist check is an additional
-            // narrowing applied even when mTLS is "off" (it's a no-op
-            // with the default empty list, so the plain-TLS path stays
-            // untouched).
-            let (_, server_conn) = tls_stream.get_ref();
-            if self.mtls_enabled
-                && let Some(subject) = tls_config::peer_subject_label(server_conn)
-            {
-                tracing::info!(
-                    peer = %peer,
-                    subject = %subject,
-                    "Esplora mTLS client accepted",
-                );
-            }
-            if let Err(rej) = tls_config::check_peer_allowed(server_conn, &self.allow) {
-                tracing::warn!(
-                    peer = %peer,
-                    subject = %rej.subject_label,
-                    "Esplora mTLS client rejected by allowlist",
-                );
-                continue;
+            // mTLS post-handshake hooks (audit log + allowlist check)
+            // only run when mTLS is enabled. On a plain-TLS surface
+            // there is no peer cert, so `check_peer_allowed` against
+            // any non-empty allowlist would reject every connection —
+            // review C2. Config-load validation (review C3) already
+            // refuses a non-empty allowlist without mTLS, so this
+            // gate is defense-in-depth.
+            if self.mtls_enabled {
+                let (_, server_conn) = tls_stream.get_ref();
+                if let Some(subject) = tls_config::peer_subject_label(server_conn) {
+                    tracing::info!(
+                        peer = %peer,
+                        subject = %subject,
+                        "Esplora mTLS client accepted",
+                    );
+                }
+                if let Err(rej) = tls_config::check_peer_allowed(server_conn, &self.allow) {
+                    tracing::warn!(
+                        peer = %peer,
+                        subject = %rej.subject_label,
+                        "Esplora mTLS client rejected by allowlist",
+                    );
+                    continue;
+                }
             }
             return (tls_stream, peer);
         }
