@@ -36,7 +36,7 @@ use crate::error::JsonRpcError;
 use crate::rpc::{FramingError, MAX_LINE_BYTES, read_line_bounded, write_line};
 use crate::state::ElectrumState;
 use crate::subscribe::{NOTIFY_CHANNEL_CAP, Subscriptions};
-use crate::tls::{TlsConfigError, build_acceptor};
+use tls_config::{TlsConfigError, build_acceptor};
 
 #[derive(Debug, Error)]
 pub enum ElectrumServerError {

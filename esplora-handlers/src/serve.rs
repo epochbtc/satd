@@ -84,7 +84,7 @@ impl axum::serve::Listener for TlsListener {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tls::build_acceptor;
+    use tls_config::build_acceptor;
     use axum::Router;
     use axum::routing::get;
     use std::io::Write;

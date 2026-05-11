@@ -1,5 +1,6 @@
 use base64::Engine;
 use std::net::TcpListener;
+use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
@@ -9147,4 +9148,326 @@ fn test_filter_pause_resume_rejects_when_idle() {
         r
     );
     node.stop();
+}
+
+/// Mint a self-signed `localhost` certificate + key, write them to PEM
+/// files under `dir`, and return the two paths. Used by the RPC-TLS
+/// integration tests so each test runs against a fresh ephemeral cert
+/// — keeps the test independent of any operator-managed keys on the
+/// host.
+fn mint_test_tls_cert(dir: &std::path::Path) -> (PathBuf, PathBuf) {
+    let cert = rcgen::generate_simple_self_signed(["localhost".to_string()]).unwrap();
+    let cert_path = dir.join("rpc-cert.pem");
+    let key_path = dir.join("rpc-key.pem");
+    std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+    std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
+    (cert_path, key_path)
+}
+
+/// End-to-end test that proves `--rpctlsbind` + cert + key boots a
+/// real HTTPS surface that authenticates and answers RPC calls. The
+/// plain-HTTP surface is asserted to keep working in parallel so the
+/// TLS path is purely additive.
+///
+/// Mirrors the Electrum and Esplora TLS round-trip tests so a future
+/// reader sees the same shape on all three surfaces.
+#[test]
+fn test_rpc_tls_round_trip() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (cert_path, key_path) = mint_test_tls_cert(tmp.path());
+    let tls_port = find_available_port();
+    let tls_bind = format!("127.0.0.1:{}", tls_port);
+
+    let mut node = TestNode::start(&[
+        &format!("--rpctlsbind={}", tls_bind),
+        &format!("--rpctlscert={}", cert_path.display()),
+        &format!("--rpctlskey={}", key_path.display()),
+    ]);
+
+    // Plain HTTP still works.
+    let info = node
+        .rpc_call("getblockchaininfo")
+        .expect("plain HTTP rpc");
+    assert_eq!(info["result"]["chain"].as_str(), Some("regtest"));
+
+    // HTTPS round-trip. Trust our self-signed cert via
+    // `add_root_certificate` rather than disabling cert validation —
+    // we want a real cert-chain check so a regression that drops the
+    // server cert surfaces as a test failure, not a silent pass.
+    let cert_pem = std::fs::read(&cert_path).unwrap();
+    let root = reqwest::Certificate::from_pem(&cert_pem).unwrap();
+    let auth = base64::engine::general_purpose::STANDARD.encode(node.cookie.trim());
+    let client = reqwest::blocking::Client::builder()
+        .add_root_certificate(root)
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let url = format!("https://localhost:{}/", tls_port);
+    let resp: serde_json::Value = client
+        .post(&url)
+        .header("Authorization", format!("Basic {}", auth))
+        .header("Content-Type", "application/json")
+        .body(r#"{"jsonrpc":"2.0","id":1,"method":"getblockchaininfo"}"#)
+        .send()
+        .expect("HTTPS request")
+        .json()
+        .expect("HTTPS response JSON");
+    assert_eq!(resp["result"]["chain"].as_str(), Some("regtest"));
+
+    // No-auth HTTPS request must be rejected — the Basic-auth tower
+    // layer wraps the RPC stack and is applied transparently over TLS
+    // (TLS is transport, auth is HTTP layer). A regression that
+    // somehow detached auth on the TLS surface would let this slip
+    // through.
+    let resp = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .body(r#"{"jsonrpc":"2.0","id":1,"method":"getblockchaininfo"}"#)
+        .send()
+        .expect("HTTPS unauth request");
+    assert_eq!(resp.status(), 401);
+
+    node.stop();
+}
+
+/// Build a `reqwest` blocking client that trusts the supplied
+/// self-signed cert and bounds requests with a 5s timeout. Used by
+/// the TLS integration tests so each one doesn't repeat the same six
+/// lines of client setup. `add_root_certificate` is preferred over
+/// disabling validation — we want a real cert-chain check so a
+/// regression that drops the server cert surfaces as a test failure
+/// rather than a silent pass.
+fn https_client(cert_pem_path: &std::path::Path) -> reqwest::blocking::Client {
+    let cert_pem = std::fs::read(cert_pem_path).unwrap();
+    let root = reqwest::Certificate::from_pem(&cert_pem).unwrap();
+    reqwest::blocking::Client::builder()
+        .add_root_certificate(root)
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap()
+}
+
+/// Userpass auth must work over TLS in addition to cookie auth. The
+/// AuthLayer is the same code path on both the plain-HTTP and TLS
+/// surfaces, but the round-trip test only exercised cookie; this one
+/// pins the userpass-mode credential check on the TLS surface so a
+/// future refactor of either side surfaces the regression here.
+#[test]
+fn test_rpc_tls_userpass_auth() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (cert_path, key_path) = mint_test_tls_cert(tmp.path());
+    let tls_port = find_available_port();
+    let tls_bind = format!("127.0.0.1:{}", tls_port);
+
+    let mut node = TestNode::start(&[
+        "--rpcuser=tlsuser",
+        "--rpcpassword=tlssecret",
+        &format!("--rpctlsbind={}", tls_bind),
+        &format!("--rpctlscert={}", cert_path.display()),
+        &format!("--rpctlskey={}", key_path.display()),
+    ]);
+
+    let client = https_client(&cert_path);
+    let url = format!("https://localhost:{}/", tls_port);
+
+    // Correct userpass over HTTPS → 200.
+    let good = base64::engine::general_purpose::STANDARD.encode("tlsuser:tlssecret");
+    let resp: serde_json::Value = client
+        .post(&url)
+        .header("Authorization", format!("Basic {}", good))
+        .header("Content-Type", "application/json")
+        .body(r#"{"jsonrpc":"2.0","id":1,"method":"getblockchaininfo"}"#)
+        .send()
+        .expect("HTTPS userpass request")
+        .json()
+        .expect("HTTPS userpass response JSON");
+    assert_eq!(resp["result"]["chain"].as_str(), Some("regtest"));
+
+    // Wrong password over HTTPS → 401. Distinct code path from
+    // no-auth (which the round-trip test already covers) because the
+    // Basic header is decoded and compared rather than missing.
+    let bad = base64::engine::general_purpose::STANDARD.encode("tlsuser:wrongpw");
+    let status = client
+        .post(&url)
+        .header("Authorization", format!("Basic {}", bad))
+        .header("Content-Type", "application/json")
+        .body(r#"{"jsonrpc":"2.0","id":1,"method":"getblockchaininfo"}"#)
+        .send()
+        .expect("HTTPS wrong-userpass request")
+        .status();
+    assert_eq!(status, 401);
+
+    node.stop();
+}
+
+/// Concurrent HTTPS connections must all succeed. The TLS path
+/// spawns a fresh task per accepted connection and clones the shared
+/// `TowerService` for each; a bug in that cloning (or in shared
+/// `TlsAcceptor` cloning) would surface here as one of the threads
+/// failing or hanging. Eight parallel clients is enough to flush out
+/// the obvious shared-state bugs without making the test load-heavy.
+#[test]
+fn test_rpc_tls_concurrent_requests() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (cert_path, key_path) = mint_test_tls_cert(tmp.path());
+    let tls_port = find_available_port();
+    let tls_bind = format!("127.0.0.1:{}", tls_port);
+
+    let mut node = TestNode::start(&[
+        &format!("--rpctlsbind={}", tls_bind),
+        &format!("--rpctlscert={}", cert_path.display()),
+        &format!("--rpctlskey={}", key_path.display()),
+    ]);
+
+    let auth = base64::engine::general_purpose::STANDARD.encode(node.cookie.trim());
+    let url = format!("https://localhost:{}/", tls_port);
+
+    // std::thread::scope keeps the borrow of `cert_path` / `auth` /
+    // `url` valid for the duration of the spawned threads without
+    // requiring `'static` clones per thread.
+    std::thread::scope(|s| {
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let cert_path = &cert_path;
+            let auth = &auth;
+            let url = &url;
+            handles.push(s.spawn(move || {
+                let client = https_client(cert_path);
+                let resp: serde_json::Value = client
+                    .post(url)
+                    .header("Authorization", format!("Basic {}", auth))
+                    .header("Content-Type", "application/json")
+                    .body(format!(
+                        r#"{{"jsonrpc":"2.0","id":{i},"method":"getblockchaininfo"}}"#
+                    ))
+                    .send()
+                    .unwrap_or_else(|e| panic!("thread {i}: HTTPS request: {e}"))
+                    .json()
+                    .unwrap_or_else(|e| panic!("thread {i}: HTTPS response JSON: {e}"));
+                assert_eq!(
+                    resp["result"]["chain"].as_str(),
+                    Some("regtest"),
+                    "thread {i}: unexpected response: {resp}"
+                );
+                assert_eq!(resp["id"].as_i64(), Some(i as i64));
+            }));
+        }
+        for h in handles {
+            h.join().expect("thread panicked");
+        }
+    });
+
+    node.stop();
+}
+
+/// The `stop` RPC issued over HTTPS must cleanly shut the whole
+/// daemon down. This exercises the composite shutdown end-to-end:
+/// the stop handler sends `shutdown_tx`, the TLS bridge task stops
+/// the TLS surface, main.rs's signal-wait completes and runs the
+/// flush phase, then `RpcServerHandle::stop()` stops the plain
+/// surface. A regression in any link breaks this test.
+#[test]
+fn test_rpc_tls_stop_rpc_shuts_down_cleanly() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (cert_path, key_path) = mint_test_tls_cert(tmp.path());
+    let tls_port = find_available_port();
+    let tls_bind = format!("127.0.0.1:{}", tls_port);
+
+    let mut node = TestNode::start(&[
+        &format!("--rpctlsbind={}", tls_bind),
+        &format!("--rpctlscert={}", cert_path.display()),
+        &format!("--rpctlskey={}", key_path.display()),
+    ]);
+
+    let client = https_client(&cert_path);
+    let auth = base64::engine::general_purpose::STANDARD.encode(node.cookie.trim());
+    let url = format!("https://localhost:{}/", tls_port);
+
+    let resp: serde_json::Value = client
+        .post(&url)
+        .header("Authorization", format!("Basic {}", auth))
+        .header("Content-Type", "application/json")
+        .body(r#"{"jsonrpc":"2.0","id":1,"method":"stop"}"#)
+        .send()
+        .expect("HTTPS stop request")
+        .json()
+        .expect("HTTPS stop response JSON");
+    assert_eq!(resp["result"], "satd stopping");
+
+    // Wait for the process to exit. Same deadline shape as the plain
+    // `test_stop_rpc` for behavioural parity.
+    let mut attempts = 0;
+    loop {
+        match node.process.try_wait() {
+            Ok(Some(status)) => {
+                assert!(
+                    status.success(),
+                    "satd exited unsuccessfully after stop-over-TLS: {status:?}"
+                );
+                break;
+            }
+            Ok(None) => {
+                attempts += 1;
+                if attempts > 30 {
+                    panic!("satd did not exit after stop RPC issued over TLS");
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => panic!("Error waiting for satd: {e}"),
+        }
+    }
+
+    // Cookie cleanup happens after `server_handle.stop()`; if it ran,
+    // the composite shutdown reached the cleanup step.
+    let cookie_path = node.datadir.join("regtest").join(".cookie");
+    assert!(
+        !cookie_path.exists(),
+        "Cookie file should be deleted after stop-over-TLS"
+    );
+}
+
+/// `--rpctlsbind` without the matching cert/key flags must be a hard
+/// startup error. The config-load layer already rejects this; this
+/// test verifies the satd binary actually surfaces a non-zero exit
+/// so an operator who mistyped a flag doesn't end up with a daemon
+/// that silently fell back to plain HTTP.
+#[test]
+fn test_rpc_tls_partial_config_aborts_startup() {
+    let satd_bin = env!("CARGO_BIN_EXE_satd");
+    let datadir = std::env::temp_dir().join(format!(
+        "satd-test-rpctls-partial-{}",
+        find_available_port()
+    ));
+    let _ = std::fs::create_dir_all(&datadir);
+    let rpcport = find_available_port();
+    let tls_port = find_available_port();
+
+    let out = Command::new(satd_bin)
+        .arg("--regtest")
+        .arg(format!("--datadir={}", datadir.display()))
+        .arg(format!("--rpcport={}", rpcport))
+        .arg(format!("--port={}", find_available_port()))
+        .arg("--esplora=0")
+        .arg(format!("--rpctlsbind=127.0.0.1:{}", tls_port))
+        // Deliberately omit --rpctlscert / --rpctlskey.
+        .output()
+        .expect("spawn satd");
+
+    assert!(
+        !out.status.success(),
+        "satd should reject partial --rpctls* config; stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("rpctls"),
+        "error message should mention rpctls; got: {combined}"
+    );
+
+    let _ = std::fs::remove_dir_all(&datadir);
 }

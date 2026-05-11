@@ -908,8 +908,43 @@ async fn main() {
     // `getserverstatus` RPC. Created before rpc::start so the RPC
     // handler holds the same Arc the bind sites mutate.
     let listener_status = node::rpc::server::ServerListenerStatus::new();
+
+    // Optional JSON-RPC TLS surface. Bitcoin Core's RPC is HTTP-only;
+    // this is a satd-specific addition for operators who want native
+    // TLS without a reverse proxy. Partial-config (bind without
+    // cert/key, or vice versa) was already rejected at config-load
+    // time; here we just parse the bind addr.
+    let rpc_tls = match (
+        config.rpc_tls_bind.as_deref(),
+        config.rpc_tls_cert.as_deref(),
+        config.rpc_tls_key.as_deref(),
+    ) {
+        (Some(addr_str), Some(cert), Some(key)) => match addr_str.parse::<SocketAddr>() {
+            Ok(bind_addr) => Some(node::rpc::server::RpcTlsConfig {
+                bind_addr,
+                cert_path: cert.to_path_buf(),
+                key_path: key.to_path_buf(),
+            }),
+            Err(e) => {
+                eprintln!("Error: invalid --rpctlsbind {addr_str:?}: {e}");
+                auth.cleanup();
+                std::process::exit(1);
+            }
+        },
+        (None, None, None) => None,
+        _ => {
+            // Should be unreachable given config-load validation, but
+            // be explicit so a future refactor doesn't silently drop the
+            // partial-config gate.
+            eprintln!("Error: --rpctlsbind requires --rpctlscert AND --rpctlskey");
+            auth.cleanup();
+            std::process::exit(1);
+        }
+    };
+
     let server_handle = match node::rpc::server::start(
         bind_addr,
+        rpc_tls,
         auth.clone(),
         chain_state.clone(),
         mempool.clone(),

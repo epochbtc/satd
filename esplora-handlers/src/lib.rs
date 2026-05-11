@@ -24,11 +24,13 @@ pub mod handlers;
 pub mod router;
 pub mod serve;
 pub mod state;
-pub mod tls;
 
 pub use config::{EsploraAuth, EsploraConfig};
 pub use error::EsploraError;
 pub use router::{RouterBuildError, build_router};
 pub use serve::TlsListener;
 pub use state::EsploraState;
-pub use tls::{TlsConfigError, build_acceptor};
+// Re-export the shared TLS-config surface so callers that already
+// depend on this crate (e.g. `satd/main.rs`) don't also need a direct
+// `tls-config` dep to spell `build_acceptor`.
+pub use tls_config::{TlsConfigError, build_acceptor};
