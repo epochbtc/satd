@@ -1206,12 +1206,22 @@ async fn main() {
                     Some((tls_bind, tls_listener, acceptor))
                 }
             };
+            // Use the listener's actual bound address — when the
+            // operator passes `--esplorabind=127.0.0.1:0`, the
+            // configured `bind` value still reads as `:0`, but the OS
+            // has assigned a real port. `getserverstatus` callers
+            // (sat-tui, ops scripts, integration tests) need the
+            // actual port.
+            let reported_bind = listener
+                .local_addr()
+                .map(|a| a.to_string())
+                .unwrap_or_else(|_| bind.to_string());
             tracing::info!(
-                %bind,
+                bind = %reported_bind,
                 tls_bind = ?tls_setup.as_ref().map(|(a, _, _)| *a),
                 "Esplora REST listening"
             );
-            listener_status.set_esplora(bind.to_string());
+            listener_status.set_esplora(reported_bind);
             let mut esplora_shutdown = shutdown_rx.clone();
             // The plain and TLS arms share the same `router` (axum's
             // Router is Clone-cheap). They observe the same shutdown
@@ -1349,14 +1359,29 @@ async fn main() {
                 std::process::exit(1);
             }
         };
+        // Mirror the Esplora fix: read back actual bound addresses
+        // from the listener so `--electrumbind=127.0.0.1:0` reports
+        // the OS-assigned port via `getserverstatus`. Fall back to
+        // the configured value if `local_addr()` errors (rare; mostly
+        // for parity with the old behaviour if the listener somehow
+        // doesn't know its own address).
+        let reported_electrum_bind = server
+            .local_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|_| electrum_bind.to_string());
+        let reported_electrum_tls_bind = match (server.local_tls_addr(), electrum_tls_bind) {
+            (Some(Ok(a)), _) => Some(a.to_string()),
+            (Some(Err(_)), Some(cfg)) => Some(cfg.to_string()),
+            (None, _) | (Some(Err(_)), None) => None,
+        };
         tracing::info!(
-            bind = %electrum_bind,
-            tls_bind = ?electrum_tls_bind,
+            bind = %reported_electrum_bind,
+            tls_bind = ?reported_electrum_tls_bind,
             "Electrum server listening"
         );
-        listener_status.set_electrum(electrum_bind.to_string());
-        if let Some(tls_bind) = electrum_tls_bind {
-            listener_status.set_electrum_tls(tls_bind.to_string());
+        listener_status.set_electrum(reported_electrum_bind);
+        if let Some(tls_bind) = reported_electrum_tls_bind {
+            listener_status.set_electrum_tls(tls_bind);
         }
         let electrum_shutdown = shutdown_rx.clone();
         tokio::spawn(async move {
