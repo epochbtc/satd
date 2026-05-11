@@ -138,6 +138,7 @@ docs/                         API + integration docs
 | `docs/PACKAGING.md` | Authoritative reference for downstream packagers. |
 | `docs/TUI.md` | `sat-tui` reference: views, panels, every field, keybindings. |
 | `docs/api/esplora.md` | Esplora REST endpoint reference + wire-shape gotchas. |
+| `docs/E2E_TESTING.md` | End-to-end suite: how to run, timeout knobs, flake-gate workflow. |
 
 ## License
 

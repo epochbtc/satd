@@ -1,0 +1,120 @@
+name: E2E Flake Gate
+
+# Manual workflow that runs the E2E suite 10 consecutive times, failing
+# fast on the first non-zero exit. Intended to be triggered before
+# tagging a release or when investigating a suspected flake in the E2E
+# suite — *not* a per-PR check because it costs ~10× the per-PR e2e
+# step (the suite serializes, so wall-clock scales linearly).
+#
+# The 10-loop discipline is the merge gate for PR-5
+# (`test_e2e_cross_surface_esplora_broadcast_visible_in_rpc_and_electrum`)
+# and a release gate for every E2E test thereafter. A single flake
+# means a real bug in the mempool → index → subscription path, not a
+# test problem — see `docs/E2E_TESTING.md`.
+
+on:
+  workflow_dispatch:
+    inputs:
+      iterations:
+        description: "Iteration count (default 10; lower for triage, higher for release confidence)"
+        required: false
+        default: "10"
+
+permissions:
+  contents: read
+
+jobs:
+  flake-gate:
+    name: "E2E Flake Gate"
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      # Same disk-pressure reclamation as the main PR job. Hosted
+      # runners ship ~30 GB of pre-installed SDKs we don't use; without
+      # this the workspace target/ exceeds the remaining ~14 GB and
+      # the linker SIGBUSes mid-link.
+      - name: Free disk space
+        run: |
+          set -euo pipefail
+          df -h /
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /opt/hostedtoolcache/PyPy
+          sudo rm -rf /opt/hostedtoolcache/Ruby
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+
+      - name: Install Linux build deps
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang \
+            cmake \
+            libclang-dev \
+            libssl-dev \
+            pkg-config
+
+      - name: Set up Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: 1.93
+          override: true
+
+      - name: Cache Cargo registry & build artifacts
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Pre-build sat-cli (test fixture)
+        # Same load-bearing pre-build as in the PR-triggered CI: the
+        # satd integration tests reach `sat-cli` by path lookup
+        # (`Path::new(CARGO_BIN_EXE_satd).parent().join("sat-cli")`)
+        # rather than `CARGO_BIN_EXE_<crate>`, so cargo's automatic bin
+        # build doesn't pick it up.
+        run: cargo build -p sat-cli --locked
+
+      - name: Build E2E test binary
+        # Build the test binary once so the loop only re-runs it,
+        # avoiding 10× the cargo-resolve / compile cost. `--no-run`
+        # is the canonical way to compile test binaries without
+        # invoking them.
+        env:
+          SATD_BACKFILL_PREFLIGHT_BYTES: "0"
+        run: cargo test --test e2e --locked --no-run
+
+      - name: Run E2E flake gate
+        env:
+          RUST_TEST_THREADS: "1"
+          SATD_TEST_TIMEOUT_MULT: "2"
+          SATD_E2E_TIMEOUT_MULT: "3"
+          SATD_BACKFILL_PREFLIGHT_BYTES: "0"
+          ITERATIONS: ${{ github.event.inputs.iterations }}
+        run: |
+          set -euo pipefail
+          iters="${ITERATIONS:-10}"
+          echo "Running E2E suite $iters times; fail-fast on first non-zero exit."
+          pass=0
+          for i in $(seq 1 "$iters"); do
+            echo "--- Iteration $i / $iters ---"
+            if cargo test --test e2e --locked -- --test-threads=1; then
+              pass=$((pass + 1))
+              echo "Iteration $i: PASS ($pass / $iters)"
+            else
+              echo "Iteration $i: FAIL — gate failed at $pass / $iters successful runs"
+              echo "::error::E2E flake gate failed on iteration $i"
+              exit 1
+            fi
+          done
+          echo "Flake gate green: $pass / $iters iterations passed."
