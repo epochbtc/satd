@@ -1,4 +1,5 @@
 pub mod chain;
+pub mod failure;
 pub mod help;
 pub mod ibd;
 pub mod mempool;
