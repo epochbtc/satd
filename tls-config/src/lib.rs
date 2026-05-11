@@ -61,6 +61,11 @@ pub enum TlsConfigError {
     },
     #[error("no private key found in {path}")]
     NoKey { path: String },
+    #[error("malformed private key in {path}: {source}")]
+    BadKey {
+        path: String,
+        source: std::io::Error,
+    },
     #[error("no CA certificates found in {path}")]
     NoCaRoots { path: String },
     #[error("malformed CA certificate in {path}: {source}")]
@@ -106,6 +111,17 @@ pub enum ClientAuthPolicy {
 /// that case. Operators who want this stricter mode supply the flag
 /// (e.g. `--rpcmtlsclientallow=alice,bob`); leaving it unset keeps
 /// the broader "CA is the allowlist" model.
+///
+/// Only `Subject CN` and DNS-typed `SubjectAltName` entries are
+/// matched. Other SAN types (email, URI, IP) are ignored. Operators
+/// who need richer matching should use a narrower CA bundle.
+///
+/// **Warning:** the allowlist is meaningful only when mTLS is
+/// enabled — without an mTLS handshake there is no peer cert to
+/// compare against. Callers MUST gate `check_peer_allowed` on
+/// `mtls_enabled` (or the parallel `satd`-level config validation
+/// that refuses `*mtlsclientallow` without `*mtls=1`); a non-empty
+/// allowlist on a plain-TLS surface would reject every connection.
 #[derive(Debug, Clone, Default)]
 pub struct ClientAllowList {
     names: HashSet<String>,
@@ -201,8 +217,14 @@ fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, TlsConfigErro
         source,
     })?;
     let mut reader = BufReader::new(file);
+    // Distinguish "file unreadable" (Io, raised by File::open above)
+    // from "file content is not a valid PEM key" (BadKey). The cert
+    // loader uses the analogous BadCert variant; private-key errors
+    // historically rolled into Io which was misleading — operators
+    // staring at "cannot read TLS file" for a malformed PEM blob were
+    // sent looking for permission issues that didn't exist.
     rustls_pemfile::private_key(&mut reader)
-        .map_err(|source| TlsConfigError::Io {
+        .map_err(|source| TlsConfigError::BadKey {
             path: path_str.clone(),
             source,
         })?
@@ -392,6 +414,50 @@ mod tests {
             &ClientAuthPolicy::Disabled,
         );
         assert!(matches!(result, Err(TlsConfigError::Io { .. })));
+    }
+
+    /// File exists but content isn't a valid PEM private-key blob.
+    /// Distinct from "file missing" (Io) and from "file empty but
+    /// well-formed" (NoKey). Operators staring at a misleading "cannot
+    /// read TLS file" error for malformed PEM was the bug behind the
+    /// dedicated `BadKey` variant.
+    #[test]
+    fn malformed_key_file_is_bad_key_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert = simple_cert();
+        let cert_path = write_pem(dir.path(), "cert.pem", &cert.cert.pem());
+        // A PEM-shaped blob with a recognized header but garbage body.
+        // `rustls_pemfile::private_key` parses the BEGIN/END frame
+        // then fails to decode the base64 inside.
+        let bad_key = "-----BEGIN PRIVATE KEY-----\nnot-base64-garbage\n-----END PRIVATE KEY-----\n";
+        let key_path = write_pem(dir.path(), "key.pem", bad_key);
+        let result = build_acceptor(&cert_path, &key_path, &ClientAuthPolicy::Disabled);
+        assert!(
+            matches!(result, Err(TlsConfigError::BadKey { .. })),
+            "expected BadKey, got err: {:?}",
+            result.err()
+        );
+    }
+
+    /// Both PEM blobs parse, but the key doesn't match the cert.
+    /// rustls's `with_single_cert` validates the pairing and rejects;
+    /// we surface that as `Rustls`. Important because the cert-loader
+    /// and key-loader can each succeed in isolation, so a mismatched
+    /// pair only surfaces at the acceptor-build step.
+    #[test]
+    fn mismatched_cert_and_key_is_rustls_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert_a = simple_cert();
+        let cert_b = simple_cert();
+        let cert_path = write_pem(dir.path(), "cert.pem", &cert_a.cert.pem());
+        // Use cert_b's key — well-formed but doesn't match cert_a.
+        let key_path = write_pem(dir.path(), "key.pem", &cert_b.key_pair.serialize_pem());
+        let result = build_acceptor(&cert_path, &key_path, &ClientAuthPolicy::Disabled);
+        assert!(
+            matches!(result, Err(TlsConfigError::Rustls(_))),
+            "expected Rustls error for cert/key mismatch, got err: {:?}",
+            result.err()
+        );
     }
 
     #[test]
