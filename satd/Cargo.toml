@@ -79,3 +79,18 @@ rcgen = { workspace = true }
 # `CryptoProvider::install_default()` panic. Dropping the TLS
 # feature entirely sidesteps the unification.
 electrum-client = { version = "0.25", default-features = false }
+# Third-party Bitcoin Core JSON-RPC client. Same role as
+# `electrum-client` above for Electrum: an independent client
+# written against Core's documented wire shape, so our handlers'
+# responses must round-trip through *its* deserializers — not just
+# ours. Drift from Core's field names, types, or error codes shows
+# up as a deserialize panic in the test, not a silent
+# shape-divergence in production.
+bitcoincore-rpc = "0.19"
+# Third-party Esplora REST client (BDK). Same parity-oracle role
+# for the Esplora surface. `default-features = false` +
+# `features = ["blocking"]` selects the `minreq` blocking
+# transport — avoids the `reqwest` async path and the
+# `async-https`/`rustls` feature combos, mirroring the rationale
+# for `electrum-client`'s minimal feature set above.
+esplora-client = { version = "0.12", default-features = false, features = ["blocking"] }

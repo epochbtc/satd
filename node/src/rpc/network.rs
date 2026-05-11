@@ -6,7 +6,14 @@ pub fn get_network_info(peer_manager: &PeerManager) -> Value {
     let connections = peer_manager.connection_count();
 
     json!({
-        "version": 10000,
+        // Advertises Bitcoin Core wire-protocol vintage (Core v28).
+        // Distinct from `subversion`, which carries satd's own
+        // implementation version. Clients use `version` to gate
+        // legacy compatibility adapters — `bitcoincore-rpc`
+        // pre-`getblockchaininfo` switches softfork shape on
+        // `version < 190000`, so anything advertising sub-0.19 here
+        // breaks every Core-compat client.
+        "version": 280000,
         "subversion": crate::USER_AGENT,
         "protocolversion": 70016,
         "localservices": "0000000000000409",
