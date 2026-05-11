@@ -1708,6 +1708,328 @@ fn test_e2e_electrum_scripthash_subscribe_fires_on_mempool() {
 }
 
 #[test]
+fn test_e2e_electrum_block_header_and_headers_suite() {
+    // Boot once, mine 5, then assert block.header / block.headers
+    // round-trip cleanly. Wallets like Sparrow / BlueWallet rely on
+    // these for header-chain verification — wire-shape drift here
+    // breaks SPV proofs.
+    use electrum_client::ElectrumApi;
+    let mut e2e = E2eNode::boot_with(&electrum_e2e_args());
+    let url = electrum_url_for(&e2e);
+    let client = electrum_client::Client::new(&url).expect("electrum connect");
+
+    let wallet = DeterministicWallet::from_secret([0x11u8; 32]);
+    let _ = e2e
+        .node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![
+                serde_json::json!(5),
+                serde_json::json!(wallet.address.to_string()),
+            ],
+        )
+        .expect("generatetoaddress 5");
+
+    // block_header(0) returns regtest genesis. The genesis hash is
+    // pinned in `bitcoin::blockdata::constants` — a deserialize-then-
+    // compute-hash round trip ties the wire format to a known value.
+    let h0 = client.block_header(0).expect("block_header 0");
+    let regtest_genesis =
+        bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest).block_hash();
+    assert_eq!(
+        h0.block_hash(),
+        regtest_genesis,
+        "block_header(0) must be regtest genesis"
+    );
+
+    // block_header(3) returns a header whose hash matches the same
+    // hash JSON-RPC returns for getblockhash(3).
+    let h3_via_rpc = e2e
+        .node
+        .rpc_call_with_params("getblockhash", vec![serde_json::json!(3)])
+        .expect("getblockhash 3")["result"]
+        .as_str()
+        .expect("hash string")
+        .to_string();
+    let h3 = client.block_header(3).expect("block_header 3");
+    assert_eq!(
+        h3.block_hash().to_string(),
+        h3_via_rpc,
+        "Electrum block_header(3) must match JSON-RPC getblockhash(3)"
+    );
+
+    // block_headers(0, 6) returns 6 contiguous headers starting at
+    // genesis. The first header's hash must equal regtest genesis;
+    // each consecutive header's prev_blockhash must equal the
+    // previous header's hash (chain linkage invariant).
+    let res = client.block_headers(0, 6).expect("block_headers 0..6");
+    assert_eq!(res.count, 6, "asked for 6, got count={}", res.count);
+    assert_eq!(res.headers.len(), 6, "headers array length");
+    assert_eq!(
+        res.headers[0].block_hash(),
+        regtest_genesis,
+        "first header is regtest genesis"
+    );
+    for (i, w) in res.headers.windows(2).enumerate() {
+        assert_eq!(
+            w[1].prev_blockhash,
+            w[0].block_hash(),
+            "headers[{}].prev_blockhash must equal headers[{}].block_hash()",
+            i + 1,
+            i
+        );
+    }
+
+    e2e.node.stop();
+}
+
+#[test]
+fn test_e2e_electrum_scripthash_balance_and_listunspent() {
+    // Wallets call get_balance + listunspent every time they refresh
+    // a watched address. The shape must stay stable across regressions.
+    use electrum_client::ElectrumApi;
+    let mut e2e = E2eNode::boot_with(&electrum_e2e_args());
+    let url = electrum_url_for(&e2e);
+    let client = electrum_client::Client::new(&url).expect("electrum connect");
+
+    let wallet = DeterministicWallet::from_secret([0x11u8; 32]);
+    let spk = wallet.address.script_pubkey();
+
+    // Mine 5 immediately-spendable coinbases. (101 isn't needed here:
+    // we don't spend, we just observe balance / listunspent.) Each
+    // coinbase yields 50 BTC subsidy on regtest pre-halving.
+    let _ = e2e
+        .node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![
+                serde_json::json!(5),
+                serde_json::json!(wallet.address.to_string()),
+            ],
+        )
+        .expect("generatetoaddress 5");
+
+    // The electrum-client wraps the wire-level reversed-hex scripthash
+    // derivation; pass it the raw scriptPubKey.
+    let bal = client.script_get_balance(&spk).expect("script_get_balance");
+    // 5 coinbases * 50 BTC * 1e8 sat/BTC. Coinbase isn't matured for
+    // spend (101 confs needed), but Electrum's balance just sums
+    // confirmed outputs — so all 5 count here.
+    assert_eq!(
+        bal.confirmed,
+        5 * 50 * 100_000_000,
+        "confirmed balance = 5 × 50 BTC subsidy"
+    );
+
+    let utxos = client
+        .script_list_unspent(&spk)
+        .expect("script_list_unspent");
+    assert_eq!(utxos.len(), 5, "5 mined coinbases → 5 UTXOs");
+    for u in &utxos {
+        assert_eq!(u.value, 50 * 100_000_000, "each coinbase = 50 BTC");
+        assert_eq!(u.tx_pos, 0, "coinbase output is at vout=0");
+        assert!(
+            (1..=5).contains(&u.height),
+            "coinbase height in [1, 5], got {}",
+            u.height
+        );
+    }
+
+    e2e.node.stop();
+}
+
+#[test]
+fn test_e2e_electrum_merkle_and_id_from_pos_round_trip() {
+    // Wallets verify confirmations by:
+    //   1. calling `transaction_get_merkle(txid, height)` to get the
+    //      branch + pos
+    //   2. independently asking for `txid_from_pos(height, pos)` and
+    //      confirming it matches their txid
+    // Both must agree, and the merkle path must reconstruct the
+    // block's merkleroot. Wire-shape drift here breaks every SPV
+    // wallet that talks to satd.
+    use electrum_client::ElectrumApi;
+    let mut e2e = E2eNode::boot_with(&electrum_e2e_args());
+    let url = electrum_url_for(&e2e);
+    let client = electrum_client::Client::new(&url).expect("electrum connect");
+
+    let wallet = DeterministicWallet::from_secret([0x11u8; 32]);
+    let _ = e2e
+        .node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![
+                serde_json::json!(101),
+                serde_json::json!(wallet.address.to_string()),
+            ],
+        )
+        .expect("generatetoaddress 101");
+
+    let dest = bitcoin::Address::from_str("bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202")
+        .expect("valid bech32")
+        .require_network(bitcoin::Network::Regtest)
+        .expect("regtest");
+    let (raw_hex, txid_hex) = build_signed_p2wpkh_spend_from_block1_coinbase(
+        &e2e.node,
+        &wallet,
+        dest.script_pubkey(),
+        1000,
+    );
+    let txid = bitcoin::Txid::from_str(&txid_hex).expect("txid parse");
+
+    // Broadcast + confirm at height 102.
+    let _ = client
+        .transaction_broadcast_raw(&hex::decode(&raw_hex).expect("hex"))
+        .expect("transaction_broadcast_raw");
+    let _ = e2e
+        .node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![
+                serde_json::json!(1),
+                serde_json::json!(wallet.address.to_string()),
+            ],
+        )
+        .expect("generatetoaddress 1");
+
+    // txid_from_pos(102, 1) returns our spend (coinbase at pos=0).
+    let from_pos = client.txid_from_pos(102, 1).expect("txid_from_pos(102, 1)");
+    assert_eq!(
+        from_pos, txid,
+        "txid_from_pos(102, 1) must equal the spend's txid"
+    );
+
+    // transaction_get_merkle returns (block_height=102, pos=1, branch).
+    let merkle = client
+        .transaction_get_merkle(&txid, 102)
+        .expect("transaction_get_merkle");
+    assert_eq!(merkle.block_height, 102);
+    assert_eq!(merkle.pos, 1, "spend at index 1 in block 102");
+
+    // Reconstruct merkle root from branch and compare against the
+    // block's merkleroot via JSON-RPC. Catches any drift in branch
+    // ordering, byte direction, or pair-hash composition.
+    let recomputed = recompute_merkle_root(&txid, &merkle.merkle, merkle.pos);
+    let block_hash = e2e
+        .node
+        .rpc_call_with_params("getblockhash", vec![serde_json::json!(102)])
+        .expect("getblockhash 102")["result"]
+        .as_str()
+        .expect("hash")
+        .to_string();
+    let expected_root = e2e
+        .node
+        .rpc_call_with_params("getblockheader", vec![serde_json::json!(block_hash)])
+        .expect("getblockheader")["result"]["merkleroot"]
+        .as_str()
+        .expect("merkleroot")
+        .to_string();
+    assert_eq!(
+        recomputed.to_string(),
+        expected_root,
+        "reconstructed root from Electrum merkle proof must match block merkleroot"
+    );
+
+    e2e.node.stop();
+}
+
+#[test]
+fn test_e2e_electrum_estimatefee_and_relayfee() {
+    // estimatefee / relayfee are the two fee endpoints every wallet
+    // calls before composing a tx. Both return BTC/kB on the wire;
+    // satd's internal unit is sat per 1000 weight units, so a
+    // conversion regression has historically been a 4x error
+    // (see electrum-proto blockchain.rs sat_per_1000_wu_to_btc_per_kb).
+    use electrum_client::ElectrumApi;
+    let mut e2e = E2eNode::boot_with(&electrum_e2e_args());
+    let url = electrum_url_for(&e2e);
+    let client = electrum_client::Client::new(&url).expect("electrum connect");
+
+    // relay_fee always has a value because it reflects the mempool
+    // admission floor (a static operator config, not estimator data).
+    let relay = client.relay_fee().expect("relay_fee");
+    assert!(
+        relay > 0.0 && relay < 1.0,
+        "relay_fee should be a small positive BTC/kB, got {}",
+        relay
+    );
+
+    // estimate_fee on a fresh chain has no real estimator data;
+    // satd returns -1.0 as a sentinel. Either a positive estimate
+    // OR -1.0 is acceptable wire behavior — both are valid Electrum
+    // responses (-1.0 mirrors what Electrum servers return when they
+    // can't form an estimate).
+    let est = client.estimate_fee(6, None).expect("estimate_fee");
+    assert!(
+        est == -1.0 || est > 0.0,
+        "estimate_fee should be -1.0 (no data) or a positive BTC/kB, got {}",
+        est
+    );
+
+    e2e.node.stop();
+}
+
+#[test]
+fn test_e2e_electrum_ping_and_server_features_genesis() {
+    // ping() is the heartbeat every long-lived wallet uses to keep
+    // the connection alive. server_features.genesis_hash pins the
+    // network — wallets compare it to a hardcoded constant before
+    // syncing. A wire-format regression on either is severe.
+    use electrum_client::ElectrumApi;
+    let mut e2e = E2eNode::boot_with(&electrum_e2e_args());
+    let url = electrum_url_for(&e2e);
+    let client = electrum_client::Client::new(&url).expect("electrum connect");
+
+    client.ping().expect("ping must succeed");
+
+    let features = client.server_features().expect("server_features");
+    // server_features.genesis_hash is reported in display-byte order
+    // as a [u8; 32] array. Compare against the regtest genesis
+    // constant computed from rust-bitcoin's tables.
+    let regtest_genesis =
+        bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest).block_hash();
+    // genesis_hash field on the server_features response is the raw
+    // 32-byte hash in **display** order (Electrum sends reversed-hex).
+    // Compare via string representation to sidestep byte-order
+    // questions: convert both to natural-hex then compare.
+    let from_features = hex::encode(features.genesis_hash);
+    let expected = regtest_genesis.to_string();
+    assert_eq!(
+        from_features, expected,
+        "server_features.genesis_hash must match regtest genesis"
+    );
+
+    e2e.node.stop();
+}
+
+#[test]
+fn test_e2e_electrum_scripthash_unsubscribe_returns_true() {
+    // satd's scripthash.unsubscribe always returns true (the per-
+    // connection subscription state is implicit on disconnect; the
+    // explicit unsubscribe RPC is a wire-shape compatibility shim).
+    // This test pins that behavior so a future refactor that
+    // accidentally returns false / 0 / null gets caught.
+    use electrum_client::ElectrumApi;
+    let mut e2e = E2eNode::boot_with(&electrum_e2e_args());
+    let url = electrum_url_for(&e2e);
+    let client = electrum_client::Client::new(&url).expect("electrum connect");
+
+    let wallet = DeterministicWallet::from_secret([0x11u8; 32]);
+    let spk = wallet.address.script_pubkey();
+
+    // Subscribe, then unsubscribe. Both should succeed on the wire.
+    // electrum-client tracks subscription state on the client side and
+    // refuses to send a second unsubscribe — that path is exercised
+    // by the client's own unit tests; what we're testing here is the
+    // server's wire response, which is what wallets read.
+    let _ = client.script_subscribe(&spk).expect("script_subscribe");
+    let ok = client.script_unsubscribe(&spk).expect("script_unsubscribe");
+    assert!(ok, "scripthash_unsubscribe must return true");
+
+    e2e.node.stop();
+}
+
+#[test]
 fn test_e2e_jsonrpc_sat_cli_auth_failure_shape() {
     // Boot a node so sat-cli has something to connect to, but ignore
     // the real cookie path and pass a deliberately-wrong rpcuser /
