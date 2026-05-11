@@ -74,11 +74,35 @@ impl ServerListenerStatus {
 /// HTTP-only; this is a satd-specific addition for operators who want
 /// native TLS without a reverse proxy. Mirrors the Electrum / Esplora
 /// TLS surfaces for ergonomic consistency.
+///
+/// `mtls_enabled` opts in to mutual TLS on this surface. When `true`,
+/// `mtls_client_ca` MUST be `Some`; the rustls verifier rejects any
+/// client without a CA-signed cert at handshake time. The mTLS path
+/// is strictly additive — the existing HTTP Basic auth keeps running
+/// on top unless the operator separately passes `--rpcdisableauth=1`
+/// (which only takes effect on this TLS surface; the plain-HTTP
+/// surface always keeps full auth).
 #[derive(Debug, Clone)]
 pub struct RpcTlsConfig {
     pub bind_addr: SocketAddr,
     pub cert_path: PathBuf,
     pub key_path: PathBuf,
+    pub mtls_enabled: bool,
+    pub mtls_client_ca: Option<PathBuf>,
+    pub mtls_client_allow: Vec<String>,
+    /// Per-handshake wall-clock cap. Defaults to 10s (set by satd
+    /// when constructing this struct); shorter than Electrum/Esplora
+    /// (30s) because JSON-RPC clients are typically local or
+    /// short-haul and a slow handshake is more likely a probe than a
+    /// real client. Configurable via `--rpctlshandshaketimeout` so an
+    /// operator behind a high-latency link can raise it.
+    pub handshake_timeout: Duration,
+    /// Hard cap on concurrent TLS connections (held until the
+    /// connection closes). Defaults to 100, matching jsonrpsee's
+    /// `ServerConfig::max_connections` so the TLS surface doesn't
+    /// silently lose the cap the plain-HTTP path enforces via
+    /// jsonrpsee's own Server::start path. (Review C1.)
+    pub max_connections: usize,
 }
 
 /// Composite handle that stops both the plain-HTTP and (optional) TLS
@@ -253,6 +277,15 @@ pub async fn start(
     bind_addr: SocketAddr,
     tls: Option<RpcTlsConfig>,
     auth: Arc<RpcAuth>,
+    // `tls_auth` is applied to the TLS surface only. `None` (the
+    // common case) means "same as `auth`". `Some(Arc::new(RpcAuth::
+    // Disabled))` is the mTLS escape hatch: clients prove identity
+    // via the rustls handshake and the AuthLayer becomes a pass-
+    // through. The plain-HTTP surface always uses `auth` unchanged —
+    // disabling on plain HTTP would open a no-auth port. satd's
+    // config-load validation enforces "Disabled requires mTLS"; this
+    // layer accepts whatever the caller passes.
+    tls_auth: Option<Arc<RpcAuth>>,
     chain_state: Arc<ChainState>,
     mempool: Arc<Mempool>,
     peer_manager: Arc<PeerManager>,
@@ -1644,11 +1677,16 @@ pub async fn start(
 
     let tls_handle = if let Some(tls_cfg) = tls {
         let mut shutdown_rx_for_tls = shutdown_tx_outer.subscribe();
+        // Caller-supplied TLS-only auth lets the satd binary opt the
+        // TLS surface into auth-disabled mode behind mTLS without
+        // affecting the plain-HTTP path. Defaults to the same auth
+        // as plain when not specified.
+        let surface_auth = tls_auth.unwrap_or_else(|| auth.clone());
         Some(
             spawn_tls_surface(
                 tls_cfg,
                 server_cfg,
-                auth,
+                surface_auth,
                 methods,
                 listener_status_outer,
                 &mut shutdown_rx_for_tls,
@@ -1680,14 +1718,19 @@ async fn spawn_tls_surface(
     listener_status: Arc<ServerListenerStatus>,
     shutdown_rx: &mut watch::Receiver<bool>,
 ) -> Result<ServerHandle, Box<dyn std::error::Error + Send + Sync>> {
-    // PR 1: pass `ClientAuthPolicy::Disabled` so the call site is
-    // migrated to the new signature without changing behavior. PR 4
-    // wires the per-surface mTLS flags through to this call.
-    let acceptor = tls_config::build_acceptor(
-        &cfg.cert_path,
-        &cfg.key_path,
-        &tls_config::ClientAuthPolicy::Disabled,
-    )?;
+    // mTLS policy: `Required` when the operator opted in via
+    // `--rpcmtls=1`; otherwise `Disabled` (plain server-auth TLS).
+    // The startup validation in satd/main.rs already enforced that a
+    // CA path is set whenever mTLS is on, but be defensive here too.
+    let policy = match (cfg.mtls_enabled, cfg.mtls_client_ca.as_ref()) {
+        (true, Some(ca)) => tls_config::ClientAuthPolicy::Required {
+            ca_path: ca.clone(),
+        },
+        (true, None) => return Err("rpc mtls enabled without CA path".into()),
+        (false, _) => tls_config::ClientAuthPolicy::Disabled,
+    };
+    let acceptor = tls_config::build_acceptor(&cfg.cert_path, &cfg.key_path, &policy)?;
+    let allow = tls_config::ClientAllowList::new(cfg.mtls_client_allow.iter().cloned());
     // Bind synchronously so a port conflict becomes a startup-fatal
     // error rather than a silently-dropped tokio task that never
     // accepts a connection.
@@ -1729,7 +1772,19 @@ async fn spawn_tls_surface(
         let _ = bridge_handle.stop();
     });
 
-    let handshake_timeout = Duration::from_secs(10);
+    // Per-handshake timeout from the cfg (review H2). Matches the
+    // shape Electrum/Esplora use, just with a tighter default.
+    let handshake_timeout = cfg.handshake_timeout;
+    // Connection cap (review C1). The plain-HTTP RPC path runs
+    // through `Server::start()` which enforces jsonrpsee's
+    // `ServerConfig::max_connections`. The manual accept loop here
+    // bypasses that, so we mirror the cap with a tokio Semaphore.
+    // The permit is held by the per-connection task and released on
+    // drop, so the cap covers handshake + steady-state serving.
+    let conn_cap = std::sync::Arc::new(tokio::sync::Semaphore::new(
+        cfg.max_connections.max(1),
+    ));
+    let max_connections = cfg.max_connections;
     let accept_stop = stop_handle.clone();
     tokio::spawn(async move {
         loop {
@@ -1748,10 +1803,30 @@ async fn spawn_tls_surface(
                 _ = accept_stop.clone().shutdown() => break,
             };
 
+            // try_acquire_owned: if the semaphore is at capacity,
+            // drop the connection here (pre-handshake, so we can't
+            // even send a JSON-RPC error body — TLS hasn't started).
+            // The client will see a TCP-level connection reset.
+            let permit = match conn_cap.clone().try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => {
+                    tracing::warn!(
+                        peer = %peer,
+                        "RPC TLS at-capacity rejection ({} max)",
+                        max_connections,
+                    );
+                    drop(stream);
+                    continue;
+                }
+            };
+
             let acceptor = acceptor.clone();
             let rpc_svc = rpc_svc.clone();
             let conn_stop = accept_stop.clone();
+            let allow = allow.clone();
+            let mtls_enabled = cfg.mtls_enabled;
             tokio::spawn(async move {
+                let _permit = permit;
                 let tls_stream =
                     match tokio::time::timeout(handshake_timeout, acceptor.accept(stream)).await {
                         Ok(Ok(s)) => s,
@@ -1772,6 +1847,30 @@ async fn spawn_tls_surface(
                             return;
                         }
                     };
+                // mTLS post-handshake hooks (audit log + allowlist
+                // check) only run when mTLS is enabled (review C2).
+                // Without an mTLS handshake there is no peer cert; a
+                // non-empty allowlist would reject every connection.
+                // Config-load validation (review C3) refuses that
+                // combination, but this gate is also defense-in-depth.
+                if mtls_enabled {
+                    let (_, server_conn) = tls_stream.get_ref();
+                    if let Some(subject) = tls_config::peer_subject_label(server_conn) {
+                        tracing::info!(
+                            peer = %peer,
+                            subject = %subject,
+                            "RPC mTLS client accepted",
+                        );
+                    }
+                    if let Err(rej) = tls_config::check_peer_allowed(server_conn, &allow) {
+                        tracing::warn!(
+                            peer = %peer,
+                            subject = %rej.subject_label,
+                            "RPC mTLS client rejected by allowlist",
+                        );
+                        return;
+                    }
+                }
 
                 // service_fn returns a `Box::pin`-ed future explicitly
                 // so the spawn site sees a `Send + 'static` future and

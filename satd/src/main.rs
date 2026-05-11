@@ -924,6 +924,17 @@ async fn main() {
                 bind_addr,
                 cert_path: cert.to_path_buf(),
                 key_path: key.to_path_buf(),
+                mtls_enabled: config.rpc_mtls,
+                mtls_client_ca: config.rpc_mtls_client_ca.clone(),
+                mtls_client_allow: config.rpc_mtls_client_allow.clone(),
+                handshake_timeout: std::time::Duration::from_secs(
+                    config.rpc_tls_handshake_timeout,
+                ),
+                // Default 100 mirrors jsonrpsee's
+                // `ServerConfig::max_connections`. The plain-HTTP
+                // path's cap; the TLS surface keeps the same default
+                // so operator expectations don't drift between paths.
+                max_connections: 100,
             }),
             Err(e) => {
                 eprintln!("Error: invalid --rpctlsbind {addr_str:?}: {e}");
@@ -942,10 +953,22 @@ async fn main() {
         }
     };
 
+    // When `--rpcdisableauth=1` is combined with `--rpcmtls=1`, the
+    // TLS surface gets a separate "auth disabled" handle so the
+    // rustls handshake is the only gate. The plain-HTTP surface
+    // always retains full auth — config-load validation enforces that
+    // `rpc_disable_auth` requires `rpc_mtls`, so this branch only
+    // fires when both are set.
+    let tls_auth = if config.rpc_disable_auth {
+        Some(std::sync::Arc::new(node::rpc::auth::RpcAuth::Disabled))
+    } else {
+        None
+    };
     let server_handle = match node::rpc::server::start(
         bind_addr,
         rpc_tls,
         auth.clone(),
+        tls_auth,
         chain_state.clone(),
         mempool.clone(),
         peer_manager.clone(),
