@@ -8,6 +8,10 @@ layout) per `STABILITY_POLICY.md`.
 
 ## [Unreleased]
 
+### Native protocol surfaces
+
+- **Native TLS Support:** Direct TLS termination for JSON-RPC, Electrum, and Esplora servers via `--rpctlsbind`, `--electrumtlsbind`, and `--esploratlsbind`. Eliminates the need for a TLS-terminating sidecar.
+
 ## [0.1.0] — 2026-05-08
 
 First public release. Pre-1.0 in semver terms; the Tier 1 surfaces listed

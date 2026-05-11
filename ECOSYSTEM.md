@@ -45,6 +45,7 @@ On-chain wallets are dominated by **Electrum protocol**. LN-focused wallets spli
 
 ### Cross-cutting capabilities (enabled across multiple surfaces)
 
+- **Native TLS Support.** In-process TLS termination for JSON-RPC, Electrum, and Esplora servers, without needing Nginx.
 - **Mempool visibility** — accurate fee estimation, 0-conf incoming UX, RBF / double-spend detection.
 - **Silent Payments (BIP 352) index.** Server-side scanning of every output's ECDH tweak; push only relevant outputs to the phone. Without server-side indexing, SP is impractical on mobile.
 - **Push notifications** to the mobile wallet via APNs / FCM on relevant block / tx events so the app doesn't have to stay awake polling.
@@ -107,6 +108,7 @@ Native + shared chainstate gives:
 - **No duplicate scriptPubKey scanning.** The address-history index is updated inside the existing `connect_block` / `disconnect_block` loop.
 - **Atomic reorg consistency.** The index update lives in the same `WriteBatch` as the chainstate update, so protocol handlers can never observe an index out of sync with the tip.
 - **Sub-millisecond index lookups.** Function calls, not RPC.
+- **Native TLS.** No need to configure or bundle reverse proxy sidecars like nginx just to terminate TLS for these protocol servers.
 
 That's the architectural claim worth making in the announcement. A bundled-electrs approach can't earn it.
 

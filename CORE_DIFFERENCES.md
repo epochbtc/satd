@@ -64,7 +64,7 @@ artifacts, signing stack) but no protocol consequences.
 | **Script verification** | `libbitcoinconsensus` (C++) | `bitcoinconsensus` FFI primary + native Rust verifier as parity-validated shadow |
 | **Storage backend** | LevelDB (chainstate, indexes) + flat block files | RocksDB (chainstate + all indexes, single instance, zstd + lz4) + flat block files; jemalloc allocator |
 | **Async runtime** | `boost::asio` + `std::thread` mix | `tokio` for all I/O |
-| **JSON-RPC server** | bespoke HTTP / SSL stack | `jsonrpsee` over `tower` middleware |
+| **JSON-RPC server** | bespoke HTTP / SSL stack | `jsonrpsee` over `tower` middleware (with native TLS support) |
 | **Reproducible builds** | Guix | Nix flake (Guix may follow if a downstream packager needs it) |
 | **Release signing** | GPG (PGP) | minisign (artifacts) + cosign keyless (containers) + SSH sigs (git tags). No GPG. |
 
@@ -86,14 +86,14 @@ without the duplicate-index, parallel-rescan, reorg-race costs of the
 
 The biggest set of intentional differences. Bitcoin Core operators
 typically run a stack: `bitcoind + electrs/Fulcrum + esplora +
-prometheus-exporter + custom-zmq-consumer + nginx`. satd ships those
-surfaces in-tree, sharing chainstate.
+prometheus-exporter + custom-zmq-consumer + nginx` (for TLS). satd ships those
+surfaces in-tree, sharing chainstate, with **native TLS support** for Electrum, Esplora, and JSON-RPC.
 
 ### Esplora REST server (`esplora-handlers`)
 
 Native handlers for the Esplora wire format consumed by BDK, Mutiny,
 mempool.space SDK, and the blockstream.info / mempool.space public
-APIs. On by default on `127.0.0.1:3000`.
+APIs. On by default on `127.0.0.1:3000`. Optional TLS via `--esploratlsbind`.
 
 - Wire-shape parity with `blockstream.info` / `mempool.space` for the
   implemented endpoint set: chain, block, tx, address/scripthash,
