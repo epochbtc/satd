@@ -37,8 +37,7 @@ impl E2eNode {
         let node = TestNode::start(extra_args);
         let want_esplora = args_request_listener(extra_args, "--esplora");
         let want_electrum = args_request_listener(extra_args, "--electrum");
-        let (esplora_port, electrum_port) =
-            poll_listener_ports(&node, want_esplora, want_electrum);
+        let (esplora_port, electrum_port) = poll_listener_ports(&node, want_esplora, want_electrum);
         E2eNode {
             node,
             esplora_port,
@@ -419,11 +418,7 @@ fn test_e2e_jsonrpc_tx_broadcast_and_mempool() {
     assert!(confirm.status.success());
     common::poll_until_json(
         || rpc_post(rpcport, &cookie, "getrawmempool", &[]),
-        |v| {
-            v["result"]
-                .as_array()
-                .is_some_and(|a| a.is_empty())
-        },
+        |v| v["result"].as_array().is_some_and(|a| a.is_empty()),
         10,
     );
 
@@ -490,10 +485,7 @@ fn rpc_post(
         .text()
         .unwrap_or_else(|e| panic!("rpc_post {method}: body read failed: {e}"));
     if !status.is_success() {
-        panic!(
-            "rpc_post {method}: HTTP {} — body: {}",
-            status, text
-        );
+        panic!("rpc_post {method}: HTTP {} — body: {}", status, text);
     }
     let v: serde_json::Value = serde_json::from_str(&text)
         .unwrap_or_else(|e| panic!("rpc_post {method}: JSON parse failed: {e} — body: {text}"));
@@ -515,10 +507,7 @@ fn esplora_get_json(esplora: &EsploraClient, path: &str) -> serde_json::Value {
         .text()
         .unwrap_or_else(|e| panic!("esplora GET {path}: body read failed: {e}"));
     if !status.is_success() {
-        panic!(
-            "esplora GET {path}: HTTP {} — body: {}",
-            status, text
-        );
+        panic!("esplora GET {path}: HTTP {} — body: {}", status, text);
     }
     serde_json::from_str(&text)
         .unwrap_or_else(|e| panic!("esplora GET {path}: JSON parse failed: {e} — body: {text}"))
@@ -664,11 +653,7 @@ fn test_e2e_esplora_post_tx_round_trip() {
     let r = esplora.post_tx(&raw_hex);
     assert_eq!(r.status(), 200, "POST /tx should return 200");
     let body = r.text().expect("body utf8");
-    assert_eq!(
-        body.trim(),
-        txid_hex,
-        "POST /tx body should be the txid"
-    );
+    assert_eq!(body.trim(), txid_hex, "POST /tx body should be the txid");
 
     // GET /tx/:txid — assert unconfirmed (in mempool, not yet mined).
     let tx_r = esplora.get(&format!("/tx/{}", txid_hex));
@@ -751,8 +736,10 @@ fn test_e2e_esplora_address_history_after_spend() {
     common::poll_until_json(
         || esplora_get_json(&esplora, &src_path),
         |v| {
-            v.as_array()
-                .is_some_and(|a| a.iter().any(|t| t["txid"].as_str() == Some(want_txid.as_str())))
+            v.as_array().is_some_and(|a| {
+                a.iter()
+                    .any(|t| t["txid"].as_str() == Some(want_txid.as_str()))
+            })
         },
         10,
     );
@@ -879,13 +866,465 @@ fn test_e2e_esplora_cookie_auth_required_when_configured() {
         .split_once(':')
         .expect("cookie has user:pass");
     let r = EsploraClient::client()
-        .get(format!("http://127.0.0.1:{}/blocks/tip/height", esplora.port))
+        .get(format!(
+            "http://127.0.0.1:{}/blocks/tip/height",
+            esplora.port
+        ))
         .basic_auth(user, Some(pass))
         .send()
         .expect("authed GET");
     assert_eq!(r.status(), 200, "authed Esplora request must succeed");
     assert_eq!(r.text().expect("body utf8").trim(), "0");
 
+    e2e.node.stop();
+}
+
+/// Esplora-flavored scripthash of a `scriptPubKey`: raw SHA-256, hex
+/// in natural byte order. Mirrors `node_index::scripthash_of` so tests
+/// can derive the same key the handler does without depending on
+/// `node-index` types here.
+fn esplora_scripthash_of_spk(spk: &bitcoin::Script) -> String {
+    use bitcoin::hashes::{Hash as _, sha256};
+    let h = sha256::Hash::hash(spk.as_bytes());
+    hex::encode(h.to_byte_array())
+}
+
+#[test]
+fn test_e2e_esplora_block_family_suite() {
+    // Boot once, mine 5 blocks, assert every block-family endpoint
+    // returns a shape consistent with the same data fetched via JSON-RPC.
+    // This catches regressions in serialization, height→hash mapping,
+    // and pagination in one fixture.
+    let mut e2e = E2eNode::boot_with(&esplora_e2e_args());
+    let esplora = esplora_for(&e2e);
+    let wallet = DeterministicWallet::from_secret([0x11u8; 32]);
+
+    let _ = e2e
+        .node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![
+                serde_json::json!(5),
+                serde_json::json!(wallet.address.to_string()),
+            ],
+        )
+        .expect("generatetoaddress 5");
+
+    // Resolve height-3 hash via RPC so subsequent assertions have a
+    // known-good reference; pick a mid-chain block so height/prev/next
+    // logic is all in scope.
+    let h3_hash = e2e
+        .node
+        .rpc_call_with_params("getblockhash", vec![serde_json::json!(3)])
+        .expect("getblockhash 3")["result"]
+        .as_str()
+        .expect("hash string")
+        .to_string();
+    let tip_hash = e2e
+        .node
+        .rpc_call("getbestblockhash")
+        .expect("getbestblockhash")["result"]
+        .as_str()
+        .expect("hash string")
+        .to_string();
+
+    // /block/:hash — summary shape with size, weight, mediantime,
+    // version, merkle_root, prev/next.
+    let v = esplora_get_json(&esplora, &format!("/block/{}", h3_hash));
+    assert_eq!(v["id"], h3_hash, "id field round-trips block hash");
+    assert_eq!(v["height"], 3);
+    assert_eq!(v["tx_count"], 1, "regtest coinbase-only block");
+    assert!(v["size"].as_u64().unwrap_or(0) > 0, "size > 0");
+    assert!(v["weight"].as_u64().unwrap_or(0) > 0, "weight > 0");
+    assert!(
+        v["merkle_root"].as_str().is_some_and(|s| s.len() == 64),
+        "merkle_root is 64-char hex"
+    );
+    assert!(
+        v["previousblockhash"]
+            .as_str()
+            .is_some_and(|s| s.len() == 64),
+        "previousblockhash present for non-genesis"
+    );
+
+    // /block/:hash/header — 80-byte serialized header as 160-char hex.
+    let r = esplora.get(&format!("/block/{}/header", h3_hash));
+    assert_eq!(r.status(), 200);
+    let header_hex = r.text().expect("body utf8").trim().to_string();
+    assert_eq!(header_hex.len(), 160, "80-byte header → 160 hex chars");
+
+    // /block/:hash/raw — bytes must deserialize back to a Block whose
+    // hash matches the original.
+    let r = esplora.get(&format!("/block/{}/raw", h3_hash));
+    assert_eq!(r.status(), 200);
+    let raw = r.bytes().expect("body bytes");
+    let block: bitcoin::Block = bitcoin::consensus::deserialize(&raw).expect("block deserializes");
+    assert_eq!(
+        block.block_hash().to_string(),
+        h3_hash,
+        "raw bytes round-trip to same block hash"
+    );
+
+    // /block/:hash/status — in_best_chain true, height matches, next_best
+    // points at height 4.
+    let v = esplora_get_json(&esplora, &format!("/block/{}/status", h3_hash));
+    assert_eq!(v["in_best_chain"], true);
+    assert_eq!(v["height"], 3);
+    assert!(
+        v["next_best"].as_str().is_some_and(|s| s.len() == 64),
+        "non-tip block has next_best"
+    );
+
+    // /block/:hash/txids + /block/:hash/txid/:i agree.
+    let txids = esplora_get_json(&esplora, &format!("/block/{}/txids", h3_hash));
+    let arr = txids.as_array().expect("txids array");
+    assert_eq!(arr.len(), 1, "coinbase-only");
+    let cb_txid_from_array = arr[0].as_str().expect("txid string").to_string();
+    let r = esplora.get(&format!("/block/{}/txid/0", h3_hash));
+    assert_eq!(r.status(), 200);
+    let cb_txid_indexed = r.text().expect("body utf8").trim().to_string();
+    assert_eq!(
+        cb_txid_from_array, cb_txid_indexed,
+        "/txids[0] and /txid/0 must agree"
+    );
+
+    // /block-height/3 → same hash as `getblockhash 3` via RPC.
+    let r = esplora.get("/block-height/3");
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.text().expect("body utf8").trim(), h3_hash);
+
+    // /blocks → up to 10 descending; first entry must be tip.
+    let v = esplora_get_json(&esplora, "/blocks");
+    let arr = v.as_array().expect("blocks array");
+    assert_eq!(arr.len(), 6, "5 mined + genesis = 6 entries");
+    assert_eq!(arr[0]["id"], tip_hash, "tip block first in /blocks");
+    assert_eq!(arr[0]["height"], 5);
+    assert_eq!(arr[5]["height"], 0, "genesis last");
+
+    // /blocks/2 → up to 10 descending ending at height 2 inclusive.
+    let v = esplora_get_json(&esplora, "/blocks/2");
+    let arr = v.as_array().expect("blocks/2 array");
+    assert_eq!(arr.len(), 3, "heights 2, 1, 0");
+    assert_eq!(arr[0]["height"], 2);
+
+    // /blocks/9999 past tip → 404.
+    let r = esplora.get("/blocks/9999");
+    assert_eq!(r.status(), 404, "past-tip start_height should 404");
+
+    // Bogus block hash → 4xx (either 400 BadRequest or 404 NotFound).
+    let r = esplora.get("/block/0000000000000000000000000000000000000000000000000000000000000000");
+    assert!(
+        (400..500).contains(&r.status().as_u16()),
+        "unknown block hash should be 4xx, got {}",
+        r.status()
+    );
+
+    e2e.node.stop();
+}
+
+#[test]
+fn test_e2e_esplora_tx_family_suite() {
+    // Boot once, mature cb1, broadcast a spend, mine 1, then assert
+    // every tx-family endpoint against the confirmed spend.
+    let mut e2e = E2eNode::boot_with(&esplora_e2e_args());
+    let esplora = esplora_for(&e2e);
+    let wallet = DeterministicWallet::from_secret([0x11u8; 32]);
+
+    let _ = e2e
+        .node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![
+                serde_json::json!(101),
+                serde_json::json!(wallet.address.to_string()),
+            ],
+        )
+        .expect("generatetoaddress 101");
+
+    let dest_addr = bitcoin::Address::from_str("bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202")
+        .expect("valid bech32")
+        .require_network(bitcoin::Network::Regtest)
+        .expect("regtest");
+    let dest_script = dest_addr.script_pubkey();
+    let (raw_hex, txid_hex) = build_signed_p2wpkh_spend_from_block1_coinbase(
+        &e2e.node,
+        &wallet,
+        dest_script.clone(),
+        1000,
+    );
+
+    let r = esplora.post_tx(&raw_hex);
+    assert_eq!(r.status(), 200, "POST /tx accept");
+    assert_eq!(r.text().expect("body utf8").trim(), txid_hex);
+
+    // Mine 1 to confirm. The spend lands at height 102.
+    let _ = e2e
+        .node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![
+                serde_json::json!(1),
+                serde_json::json!(wallet.address.to_string()),
+            ],
+        )
+        .expect("generatetoaddress 1");
+
+    // Wait for the spend to show as confirmed on /tx/:txid/status. Use
+    // a bounded poll because the address-index + tx-index updates
+    // happen in connect_block, which is synchronous with the miner
+    // RPC's reply — typically converges on the first probe.
+    let status_path = format!("/tx/{}/status", txid_hex);
+    let v = common::poll_until_json(
+        || esplora_get_json(&esplora, &status_path),
+        |v| v["confirmed"] == true,
+        10,
+    );
+    assert_eq!(v["block_height"], 102);
+    assert!(
+        v["block_hash"].as_str().is_some_and(|s| s.len() == 64),
+        "block_hash hex"
+    );
+
+    // /tx/:txid/hex returns the same hex we broadcast.
+    let r = esplora.get(&format!("/tx/{}/hex", txid_hex));
+    assert_eq!(r.status(), 200);
+    assert_eq!(
+        r.text().expect("body utf8").trim(),
+        raw_hex,
+        "/tx/:txid/hex round-trips"
+    );
+
+    // /tx/:txid/raw returns bytes that decode back to the same tx.
+    let r = esplora.get(&format!("/tx/{}/raw", txid_hex));
+    assert_eq!(r.status(), 200);
+    let raw = r.bytes().expect("body bytes");
+    let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&raw).expect("tx deserialize");
+    assert_eq!(
+        tx.compute_txid().to_string(),
+        txid_hex,
+        "/tx/:txid/raw bytes match txid"
+    );
+
+    // /tx/:txid/outspends — the burn destination is unspent; the array
+    // has one entry matching the single vout.
+    let v = esplora_get_json(&esplora, &format!("/tx/{}/outspends", txid_hex));
+    let arr = v.as_array().expect("outspends array");
+    assert_eq!(arr.len(), 1, "spend has 1 output");
+    assert_eq!(arr[0]["spent"], false, "burn output is unspent");
+
+    // /tx/:txid/outspend/0 — same single-shot lookup, same answer.
+    let v = esplora_get_json(&esplora, &format!("/tx/{}/outspend/0", txid_hex));
+    assert_eq!(v["spent"], false);
+
+    // Out-of-range vout → 404 (review-hardened path).
+    let r = esplora.get(&format!("/tx/{}/outspend/9", txid_hex));
+    assert_eq!(r.status(), 404, "out-of-range vout must 404");
+
+    // /tx/:txid/merkle-proof — recompute root from branch+pos and
+    // assert it matches the block's merkle_root field.
+    let v = esplora_get_json(&esplora, &format!("/tx/{}/merkle-proof", txid_hex));
+    assert_eq!(v["block_height"], 102);
+    let pos = v["pos"].as_u64().expect("pos number") as usize;
+    assert_eq!(pos, 1, "coinbase at 0, spend at 1");
+    let branch_bytes: Vec<[u8; 32]> = v["merkle"]
+        .as_array()
+        .expect("merkle branch array")
+        .iter()
+        .map(|n| {
+            let mut buf = [0u8; 32];
+            let bytes = hex::decode(n.as_str().expect("hex node")).expect("hex decode");
+            buf.copy_from_slice(&bytes);
+            buf
+        })
+        .collect();
+    let txid = bitcoin::Txid::from_str(&txid_hex).expect("txid parse");
+    let recomputed = recompute_merkle_root(&txid, &branch_bytes, pos);
+    let block_hash = e2e
+        .node
+        .rpc_call_with_params("getblockhash", vec![serde_json::json!(102)])
+        .expect("getblockhash 102")["result"]
+        .as_str()
+        .expect("hash")
+        .to_string();
+    let header = e2e
+        .node
+        .rpc_call_with_params("getblockheader", vec![serde_json::json!(block_hash)])
+        .expect("getblockheader")["result"]
+        .clone();
+    let expected_root = header["merkleroot"]
+        .as_str()
+        .expect("merkleroot")
+        .to_string();
+    assert_eq!(
+        recomputed.to_string(),
+        expected_root,
+        "reconstructed merkle root must equal block's merkleroot"
+    );
+
+    // Unknown txid on any tx-family endpoint → 404.
+    let bogus = "0000000000000000000000000000000000000000000000000000000000000001";
+    let r = esplora.get(&format!("/tx/{}/status", bogus));
+    assert_eq!(r.status(), 404, "unknown txid status should 404");
+    let r = esplora.get(&format!("/tx/{}/hex", bogus));
+    assert_eq!(r.status(), 404, "unknown txid hex should 404");
+
+    e2e.node.stop();
+}
+
+#[test]
+fn test_e2e_esplora_scripthash_parity_with_address() {
+    // The scripthash endpoint family must return identical stats to
+    // the address endpoint family for the same scriptPubKey. Wallets
+    // like Sparrow query via scripthash; explorers query via address.
+    // Drift here is a wire-level compat break.
+    let mut e2e = E2eNode::boot_with(&esplora_e2e_args());
+    let esplora = esplora_for(&e2e);
+    let wallet = DeterministicWallet::from_secret([0x11u8; 32]);
+    let addr_str = wallet.address.to_string();
+    let sh = esplora_scripthash_of_spk(&wallet.address.script_pubkey());
+
+    let _ = e2e
+        .node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(5), serde_json::json!(addr_str.clone())],
+        )
+        .expect("generatetoaddress 5");
+
+    // /address/:addr vs /scripthash/:hash — stats must agree.
+    let a = esplora_get_json(&esplora, &format!("/address/{}", addr_str));
+    let s = esplora_get_json(&esplora, &format!("/scripthash/{}", sh));
+    assert_eq!(
+        a["chain_stats"], s["chain_stats"],
+        "chain_stats must match between /address and /scripthash"
+    );
+    assert_eq!(
+        a["mempool_stats"], s["mempool_stats"],
+        "mempool_stats must match"
+    );
+
+    // /address/:addr/utxo vs /scripthash/:hash/utxo — same UTXO set.
+    let a_utxo = esplora_get_json(&esplora, &format!("/address/{}/utxo", addr_str));
+    let s_utxo = esplora_get_json(&esplora, &format!("/scripthash/{}/utxo", sh));
+    let a_arr = a_utxo.as_array().expect("address utxo array");
+    let s_arr = s_utxo.as_array().expect("scripthash utxo array");
+    assert_eq!(a_arr.len(), s_arr.len(), "same UTXO count");
+    let collect_keys = |arr: &[serde_json::Value]| -> std::collections::BTreeSet<(String, u64)> {
+        arr.iter()
+            .map(|u| {
+                (
+                    u["txid"].as_str().unwrap_or("").to_string(),
+                    u["vout"].as_u64().unwrap_or(0),
+                )
+            })
+            .collect()
+    };
+    assert_eq!(
+        collect_keys(a_arr),
+        collect_keys(s_arr),
+        "same (txid, vout) set across the two endpoints"
+    );
+
+    e2e.node.stop();
+}
+
+#[test]
+fn test_e2e_esplora_mempool_detail_tracks_broadcast() {
+    // Boot fresh, mine to maturity, broadcast a spend, assert that
+    // /mempool, /mempool/txids, /mempool/recent all reflect the
+    // broadcast tx. Wire shapes for mempool.space / blockstream.info
+    // consumers — drift here breaks downstream tooling.
+    let mut e2e = E2eNode::boot_with(&esplora_e2e_args());
+    let esplora = esplora_for(&e2e);
+    let wallet = DeterministicWallet::from_secret([0x11u8; 32]);
+
+    let _ = e2e
+        .node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![
+                serde_json::json!(101),
+                serde_json::json!(wallet.address.to_string()),
+            ],
+        )
+        .expect("generatetoaddress 101");
+
+    let dest_addr = bitcoin::Address::from_str("bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202")
+        .expect("valid bech32")
+        .require_network(bitcoin::Network::Regtest)
+        .expect("regtest");
+    let (raw_hex, txid_hex) = build_signed_p2wpkh_spend_from_block1_coinbase(
+        &e2e.node,
+        &wallet,
+        dest_addr.script_pubkey(),
+        1000,
+    );
+    let r = esplora.post_tx(&raw_hex);
+    assert_eq!(r.status(), 200);
+
+    // /mempool/txids includes the txid.
+    let want_txid = txid_hex.clone();
+    common::poll_until_json(
+        || esplora_get_json(&esplora, "/mempool/txids"),
+        |v| {
+            v.as_array()
+                .is_some_and(|a| a.iter().any(|t| t.as_str() == Some(want_txid.as_str())))
+        },
+        10,
+    );
+
+    // /mempool summary: count == 1, vsize > 0, total_fee == 1000.
+    let v = esplora_get_json(&esplora, "/mempool");
+    assert_eq!(v["count"], 1);
+    assert!(v["vsize"].as_u64().unwrap_or(0) > 0, "vsize > 0");
+    assert_eq!(v["total_fee"], 1000, "fee_sat we paid");
+    assert!(v["fee_histogram"].is_array(), "fee_histogram must be array");
+
+    // /mempool/recent includes the tx with shape {txid, fee, vsize, value}.
+    let v = esplora_get_json(&esplora, "/mempool/recent");
+    let arr = v.as_array().expect("recent array");
+    let entry = arr
+        .iter()
+        .find(|e| e["txid"].as_str() == Some(txid_hex.as_str()))
+        .unwrap_or_else(|| panic!("broadcast tx not in /mempool/recent; got {:?}", arr));
+    assert_eq!(entry["fee"], 1000);
+    assert!(entry["vsize"].as_u64().unwrap_or(0) > 0);
+    assert!(
+        entry["value"].as_u64().unwrap_or(0) > 0,
+        "value field is sum of output values"
+    );
+
+    e2e.node.stop();
+}
+
+#[test]
+fn test_e2e_esplora_fee_estimates_keys() {
+    // /fee-estimates must always return the full target set so
+    // BDK / mempool-sdk consumers can index into it without
+    // missing-key handling. Confirmation targets are pinned in
+    // `mempool::FEE_TARGETS`.
+    let mut e2e = E2eNode::boot_with(&esplora_e2e_args());
+    let esplora = esplora_for(&e2e);
+    let v = esplora_get_json(&esplora, "/fee-estimates");
+    let obj = v.as_object().expect("fee-estimates object");
+    // Sentinel keys from the FEE_TARGETS array in mempool.rs — must
+    // always be present even on a fresh chain (the handler falls back
+    // to 1.0 sat/vB when the estimator has no data).
+    for target in ["1", "2", "6", "10", "20", "144", "504", "1008"] {
+        let v = obj.get(target).unwrap_or_else(|| {
+            panic!(
+                "fee-estimates missing target '{}'; got keys {:?}",
+                target,
+                obj.keys().collect::<Vec<_>>()
+            )
+        });
+        assert!(
+            v.as_f64().is_some_and(|f| f > 0.0),
+            "fee-estimates['{}'] must be positive float, got {}",
+            target,
+            v
+        );
+    }
     e2e.node.stop();
 }
 
@@ -900,9 +1339,9 @@ fn electrum_e2e_args() -> Vec<&'static str> {
 }
 
 fn electrum_url_for(e2e: &E2eNode) -> String {
-    let port = e2e.electrum_port.expect(
-        "E2eNode booted with --electrum=1 and --electrumbind=127.0.0.1:0",
-    );
+    let port = e2e
+        .electrum_port
+        .expect("E2eNode booted with --electrum=1 and --electrumbind=127.0.0.1:0");
     format!("tcp://127.0.0.1:{}", port)
 }
 
@@ -913,8 +1352,8 @@ fn test_e2e_electrum_server_features_from_third_party_client() {
     // surface-specific tests do.
     use electrum_client::ElectrumApi;
     let mut e2e = E2eNode::boot_with(&electrum_e2e_args());
-    let client = electrum_client::Client::new(&electrum_url_for(&e2e))
-        .expect("electrum client connect");
+    let client =
+        electrum_client::Client::new(&electrum_url_for(&e2e)).expect("electrum client connect");
     let features = client.server_features().expect("server_features");
 
     // The regtest genesis hash, big-endian display order:
@@ -922,8 +1361,7 @@ fn test_e2e_electrum_server_features_from_third_party_client() {
     // Compare against the bitcoin crate's authoritative value rather
     // than a hand-typed constant so a future regtest-params change
     // doesn't silently invalidate the test.
-    let expected =
-        bitcoin::constants::genesis_block(bitcoin::Network::Regtest).block_hash();
+    let expected = bitcoin::constants::genesis_block(bitcoin::Network::Regtest).block_hash();
     let expected_hex = expected.to_string();
     let got_hex = hex::encode(features.genesis_hash);
     assert_eq!(
@@ -1009,11 +1447,21 @@ fn test_e2e_electrum_scripthash_get_history_for_funded_address() {
     let history = client
         .script_get_history(&script)
         .expect("script_get_history");
-    assert_eq!(history.len(), 3, "expected 3 history entries, got {:?}", history);
+    assert_eq!(
+        history.len(),
+        3,
+        "expected 3 history entries, got {:?}",
+        history
+    );
     let heights: Vec<i32> = history.iter().map(|h| h.height).collect();
     let mut sorted = heights.clone();
     sorted.sort();
-    assert_eq!(sorted, vec![1, 2, 3], "expected heights 1, 2, 3; got {:?}", heights);
+    assert_eq!(
+        sorted,
+        vec![1, 2, 3],
+        "expected heights 1, 2, 3; got {:?}",
+        heights
+    );
 
     e2e.node.stop();
 }
@@ -1210,7 +1658,11 @@ fn test_e2e_electrum_scripthash_subscribe_fires_on_mempool() {
     let initial = client
         .script_subscribe(&dest_script)
         .expect("script_subscribe");
-    assert!(initial.is_none(), "dest should start with empty status, got {:?}", initial);
+    assert!(
+        initial.is_none(),
+        "dest should start with empty status, got {:?}",
+        initial
+    );
 
     // Broadcast the funding tx via JSON-RPC (we already tested the
     // Electrum broadcast path above; here the publisher is JSON-RPC,
@@ -1277,9 +1729,7 @@ fn test_e2e_jsonrpc_sat_cli_auth_failure_shape() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
     assert!(
-        stderr.contains("unauthorized")
-            || stderr.contains("401")
-            || stderr.contains("auth"),
+        stderr.contains("unauthorized") || stderr.contains("401") || stderr.contains("auth"),
         "stderr should signal an auth failure; got: {}",
         stderr
     );
@@ -1326,8 +1776,7 @@ fn test_e2e_cross_surface_esplora_broadcast_visible_in_rpc_and_electrum() {
         "--electrumbind=127.0.0.1:0",
     ]);
     let esplora = esplora_for(&e2e);
-    let electrum =
-        electrum_client::Client::new(&electrum_url_for(&e2e)).expect("electrum connect");
+    let electrum = electrum_client::Client::new(&electrum_url_for(&e2e)).expect("electrum connect");
 
     // Source wallet + dest burn address.
     let src_wallet = DeterministicWallet::from_secret([0x11u8; 32]);
@@ -1362,8 +1811,12 @@ fn test_e2e_cross_surface_esplora_broadcast_visible_in_rpc_and_electrum() {
     );
 
     // Build the spend (block-1 coinbase → dest, 1000-sat fee).
-    let (raw_hex, txid_hex) =
-        build_signed_p2wpkh_spend_from_block1_coinbase(&e2e.node, &src_wallet, dest_script.clone(), 1000);
+    let (raw_hex, txid_hex) = build_signed_p2wpkh_spend_from_block1_coinbase(
+        &e2e.node,
+        &src_wallet,
+        dest_script.clone(),
+        1000,
+    );
 
     // *** Broadcast via Esplora. *** This is the cross-surface
     // critical path: a write on Esplora must propagate to both
@@ -1376,7 +1829,11 @@ fn test_e2e_cross_surface_esplora_broadcast_visible_in_rpc_and_electrum() {
         resp.status()
     );
     let body = resp.text().expect("body utf8");
-    assert_eq!(body.trim(), txid_hex, "Esplora POST /tx body must match txid");
+    assert_eq!(
+        body.trim(),
+        txid_hex,
+        "Esplora POST /tx body must match txid"
+    );
 
     // (a) JSON-RPC `getrawmempool` must show the txid within 10s.
     let rpcport = e2e.node.rpcport;
@@ -1406,9 +1863,7 @@ fn test_e2e_cross_surface_esplora_broadcast_visible_in_rpc_and_electrum() {
             break;
         }
         if std::time::Instant::now() >= deadline {
-            panic!(
-                "no Electrum scripthash notification within deadline after Esplora broadcast"
-            );
+            panic!("no Electrum scripthash notification within deadline after Esplora broadcast");
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
