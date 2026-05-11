@@ -33,4 +33,4 @@ pub use state::EsploraState;
 // Re-export the shared TLS-config surface so callers that already
 // depend on this crate (e.g. `satd/main.rs`) don't also need a direct
 // `tls-config` dep to spell `build_acceptor`.
-pub use tls_config::{ClientAuthPolicy, TlsConfigError, build_acceptor};
+pub use tls_config::{ClientAllowList, ClientAuthPolicy, TlsConfigError, build_acceptor};

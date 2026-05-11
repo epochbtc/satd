@@ -315,6 +315,20 @@ pub struct Config {
     pub esplora_tls_cert: Option<std::path::PathBuf>,
     /// Path to PEM-encoded TLS private key for the Esplora server.
     pub esplora_tls_key: Option<std::path::PathBuf>,
+    /// Require mutual TLS on the Esplora TLS listener. Off by default
+    /// (backwards-compatible with public-Esplora deployments). When
+    /// `true`, both `esplora_tls_bind` and `esplora_mtls_client_ca`
+    /// MUST be set; the server refuses any client without a cert
+    /// validly signed by the configured CA. Strictly additive — the
+    /// existing `esplora_auth` layer still runs on top.
+    pub esplora_mtls: bool,
+    /// PEM CA bundle used to verify client certificates on the Esplora
+    /// TLS surface. Required when `esplora_mtls = true`.
+    pub esplora_mtls_client_ca: Option<std::path::PathBuf>,
+    /// Optional allowlist of accepted client-cert subject identities
+    /// (CN / DNS-SAN, case-insensitive). Empty means "any CA-signed
+    /// cert is accepted"; non-empty narrows further.
+    pub esplora_mtls_client_allow: Vec<String>,
     /// URL prefix to mount the API under (default `/`; `/api` for
     /// `blockstream.info`-style deployments).
     pub esplora_prefix: String,
@@ -873,10 +887,46 @@ impl Config {
         let esplora_tls_key = cli
             .esploratlskey
             .or_else(|| file_get("esploratlskey").map(std::path::PathBuf::from));
+        let esplora_mtls = cli
+            .esploramtls
+            .or_else(|| file_get("esploramtls").and_then(|v| parse_bool(&v)))
+            .unwrap_or(false);
+        let esplora_mtls_client_ca = cli
+            .esploramtlsclientca
+            .or_else(|| file_get("esploramtlsclientca").map(std::path::PathBuf::from));
+        let esplora_mtls_client_allow: Vec<String> = {
+            let mut values: Vec<String> = cli.esploramtlsclientallow.clone();
+            if values.is_empty() {
+                values = file_get_all("esploramtlsclientallow");
+            }
+            values
+                .into_iter()
+                .flat_map(|v| {
+                    v.split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        };
         // TLS partial-config validation: same shape as Electrum below.
         // Catching here surfaces a friendlier CLI message than the
         // server-side check; both layers stay so a programmatic caller
         // that bypasses `Config::load` still hits the hard error.
+        // Esplora mTLS validation, mirroring the Electrum / RPC shape.
+        if esplora_mtls && esplora_tls_bind.is_none() {
+            return Err("--esploramtls=1 requires --esploratlsbind".to_string());
+        }
+        if esplora_mtls && esplora_mtls_client_ca.is_none() {
+            return Err("--esploramtls=1 requires --esploramtlsclientca".to_string());
+        }
+        // Refuse `--esploramtlsclientallow` without `--esploramtls=1`
+        // (review C3). See the electrum equivalent: a non-empty
+        // allowlist without an mTLS handshake has no peer cert to
+        // match and would reject every connection.
+        if !esplora_mtls && !esplora_mtls_client_allow.is_empty() {
+            return Err("--esploramtlsclientallow requires --esploramtls=1".to_string());
+        }
         if esplora_tls_bind.is_some()
             && (esplora_tls_cert.is_none() || esplora_tls_key.is_none())
         {
@@ -1165,6 +1215,9 @@ impl Config {
             esplora_tls_bind,
             esplora_tls_cert,
             esplora_tls_key,
+            esplora_mtls,
+            esplora_mtls_client_ca,
+            esplora_mtls_client_allow,
             esplora_prefix,
             esplora_cors,
             esplora_request_timeout,
@@ -1490,6 +1543,12 @@ impl Config {
                 "enabled": self.esplora,
                 "bind": if self.esplora { Some(self.esplora_bind.clone()) } else { None },
                 "tls_bind": if self.esplora { self.esplora_tls_bind.clone() } else { None },
+                "mtls": if self.esplora { Some(self.esplora_mtls) } else { None },
+                "mtls_client_allow_count": if self.esplora {
+                    Some(self.esplora_mtls_client_allow.len())
+                } else {
+                    None
+                },
             },
             "electrum": {
                 "enabled": self.electrum,
@@ -1707,6 +1766,28 @@ pub struct CliArgs {
         help = "Path to PEM-encoded TLS private key for the Esplora server"
     )]
     pub esploratlskey: Option<std::path::PathBuf>,
+
+    #[arg(
+        long,
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        help = "Require mutual TLS on the Esplora TLS listener (default: false). Requires --esploratlsbind and --esploramtlsclientca."
+    )]
+    pub esploramtls: Option<bool>,
+
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Path to PEM CA bundle used to verify client certificates when --esploramtls=1"
+    )]
+    pub esploramtlsclientca: Option<std::path::PathBuf>,
+
+    #[arg(
+        long,
+        value_name = "NAME",
+        help = "Allowlist of accepted client-cert CN / DNS-SAN values (repeatable, comma-separated). Empty = any cert validly signed by the CA."
+    )]
+    pub esploramtlsclientallow: Vec<String>,
 
     #[arg(
         long,
@@ -2327,6 +2408,9 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "esploratlsbind",
         "esploratlscert",
         "esploratlskey",
+        "esploramtls",
+        "esploramtlsclientca",
+        "esploramtlsclientallow",
         "esploraprefix",
         "esploracors",
         "esplorarequesttimeout",
@@ -2631,6 +2715,9 @@ rpcport=8332
             esploratlsbind: None,
             esploratlscert: None,
             esploratlskey: None,
+            esploramtls: None,
+            esploramtlsclientca: None,
+            esploramtlsclientallow: vec![],
             esploraprefix: None,
             esploracors: vec![],
             esplorarequesttimeout: None,
@@ -2760,6 +2847,9 @@ rpcport=8332
             esploratlsbind: None,
             esploratlscert: None,
             esploratlskey: None,
+            esploramtls: None,
+            esploramtlsclientca: None,
+            esploramtlsclientallow: vec![],
             esploraprefix: None,
             esploracors: vec![],
             esplorarequesttimeout: None,
@@ -3024,6 +3114,86 @@ rpcport=8332
         assert_eq!(
             config.electrum_mtls_client_ca.as_deref(),
             Some(std::path::Path::new("/tmp/ca.pem"))
+        );
+    }
+
+    /// Esplora mTLS flag-shape validation. Mirrors the electrum test.
+    #[test]
+    fn test_esplora_mtls_partial_config_is_rejected() {
+        // mTLS=1 without esplora TLS surface — must error.
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-test",
+            "--esplora=1",
+            "--esploramtls=1",
+        ])
+        .unwrap();
+        let err = Config::from_cli(cli).unwrap_err();
+        assert!(
+            err.contains("esploratlsbind") || err.contains("esploramtls"),
+            "expected mTLS-without-TLS error, got: {err}"
+        );
+
+        // TLS surface present, but no CA bundle — must error.
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-test",
+            "--esplora=1",
+            "--esploratlsbind=127.0.0.1:3001",
+            "--esploratlscert=/tmp/cert.pem",
+            "--esploratlskey=/tmp/key.pem",
+            "--esploramtls=1",
+        ])
+        .unwrap();
+        let err = Config::from_cli(cli).unwrap_err();
+        assert!(
+            err.contains("esploramtlsclientca"),
+            "expected missing-CA error, got: {err}"
+        );
+
+        // All four present — config loads.
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-test",
+            "--esplora=1",
+            "--esploratlsbind=127.0.0.1:3001",
+            "--esploratlscert=/tmp/cert.pem",
+            "--esploratlskey=/tmp/key.pem",
+            "--esploramtls=1",
+            "--esploramtlsclientca=/tmp/ca.pem",
+        ])
+        .unwrap();
+        let config = Config::from_cli(cli).expect("complete mTLS quad should load");
+        assert!(config.esplora_mtls);
+        assert_eq!(
+            config.esplora_mtls_client_ca.as_deref(),
+            Some(std::path::Path::new("/tmp/ca.pem"))
+        );
+    }
+
+    /// review C3: `--esploramtlsclientallow` without `--esploramtls=1`
+    /// would reject every TLS connection (no peer cert to match).
+    /// Reject the misconfiguration at startup.
+    #[test]
+    fn test_esplora_mtls_clientallow_requires_mtls() {
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-test",
+            "--esplora=1",
+            "--esploratlsbind=127.0.0.1:3001",
+            "--esploratlscert=/tmp/cert.pem",
+            "--esploratlskey=/tmp/key.pem",
+            "--esploramtlsclientallow=alice",
+        ])
+        .unwrap();
+        let err = Config::from_cli(cli).unwrap_err();
+        assert!(
+            err.contains("esploramtlsclientallow") && err.contains("esploramtls"),
+            "expected allowlist-without-mtls error, got: {err}"
         );
     }
 

@@ -1131,6 +1131,9 @@ async fn main() {
                 tls_bind: config.esplora_tls_bind.clone(),
                 tls_cert_path: config.esplora_tls_cert.clone(),
                 tls_key_path: config.esplora_tls_key.clone(),
+                mtls_enabled: config.esplora_mtls,
+                mtls_client_ca: config.esplora_mtls_client_ca.clone(),
+                mtls_client_allow: config.esplora_mtls_client_allow.clone(),
                 prefix: config.esplora_prefix.clone(),
                 cors_origins: config.esplora_cors.clone(),
                 request_timeout: std::time::Duration::from_secs(config.esplora_request_timeout),
@@ -1219,11 +1222,22 @@ async fn main() {
                             std::process::exit(1);
                         }
                     };
-                    let acceptor = match esplora_handlers::build_acceptor(
-                        cert,
-                        key,
-                        &esplora_handlers::ClientAuthPolicy::Disabled,
-                    ) {
+                    // mTLS policy: when --esploramtls=1, build the
+                    // acceptor with `Required` so rustls refuses any
+                    // client without a CA-signed cert at handshake
+                    // time. Validation above already ensured the CA
+                    // path is set in that branch.
+                    let policy = if config.esplora_mtls {
+                        esplora_handlers::ClientAuthPolicy::Required {
+                            ca_path: config
+                                .esplora_mtls_client_ca
+                                .clone()
+                                .expect("config validation enforces CA when mtls=1"),
+                        }
+                    } else {
+                        esplora_handlers::ClientAuthPolicy::Disabled
+                    };
+                    let acceptor = match esplora_handlers::build_acceptor(cert, key, &policy) {
                         Ok(a) => a,
                         Err(e) => {
                             eprintln!("Error: esplora TLS config: {e}");
@@ -1278,10 +1292,15 @@ async fn main() {
             if let Some((tls_bind, tls_listener, acceptor)) = tls_setup {
                 let tls_router = router.clone();
                 let mut tls_shutdown = shutdown_rx.clone();
-                let tls_wrap = esplora_handlers::TlsListener::new(
+                let allow = esplora_handlers::ClientAllowList::new(
+                    config.esplora_mtls_client_allow.iter().cloned(),
+                );
+                let tls_wrap = esplora_handlers::TlsListener::new_with_mtls(
                     tls_listener,
                     acceptor,
                     tls_handshake_timeout,
+                    config.esplora_mtls,
+                    allow,
                 );
                 tokio::spawn(async move {
                     let serve = axum::serve(tls_wrap, tls_router)

@@ -25,6 +25,22 @@ pub struct EsploraConfig {
     /// Path to the TLS server private key (PEM). Read once at
     /// server start and held in memory.
     pub tls_key_path: Option<PathBuf>,
+    /// Require mutual TLS on the Esplora TLS listener. Off by default
+    /// (backwards-compatible with public-Esplora deployments). When
+    /// `true`, both `tls_bind` and `mtls_client_ca` MUST be set; the
+    /// server refuses any client without a cert validly signed by the
+    /// configured CA. Strictly additive — the existing `auth` layer
+    /// (None / Cookie / UserPass) keeps running on top of the mTLS
+    /// handshake. Operators who want "mTLS is the only auth" set
+    /// `auth = EsploraAuth::None`.
+    pub mtls_enabled: bool,
+    /// PEM CA bundle used to verify client certificates when
+    /// `mtls_enabled` is `true`.
+    pub mtls_client_ca: Option<PathBuf>,
+    /// Optional allowlist of accepted client-cert subject identities
+    /// (CN / DNS-SAN, case-insensitive). Empty means "any CA-signed
+    /// cert is accepted"; non-empty narrows further.
+    pub mtls_client_allow: Vec<String>,
     /// URL prefix to mount the API under. Defaults to `/`. Set to
     /// `/api` for `blockstream.info`-style deployments.
     pub prefix: String,
@@ -60,6 +76,9 @@ impl Default for EsploraConfig {
             tls_bind: None,
             tls_cert_path: None,
             tls_key_path: None,
+            mtls_enabled: false,
+            mtls_client_ca: None,
+            mtls_client_allow: Vec::new(),
             prefix: "/".to_string(),
             cors_origins: Vec::new(),
             request_timeout: Duration::from_secs(30),
