@@ -51,11 +51,12 @@ tempfile = "3"
 # wire-format regressions a native-Rust client we wrote ourselves
 # would gloss over still get caught.
 #
-# `default-features = false` + `rustls-ring`: the default features
-# pull in `aws-lc-rs` as the rustls CryptoProvider, which clashes
-# with the workspace's existing `ring` provider (already brought in
-# by `tokio-rustls`). Two installed providers make rustls's
-# auto-detection panic at runtime. `rustls-ring` pins
-# electrum-client's TLS to ring too, keeping the workspace
-# single-provider.
-electrum-client = { version = "0.25", default-features = false, features = ["proxy", "rustls-ring"] }
+# `default-features = false` + no `rustls*` / `proxy`: our tests
+# connect via plain TCP (`tcp://127.0.0.1:port`), so we don't need
+# the TLS or SOCKS5 paths at all. Pulling either flavour of rustls
+# in unifies with the workspace's existing rustls (via tokio-rustls
+# + hyper-rustls + rustls-platform-verifier), enabling *two* crypto
+# provider features simultaneously and tripping rustls's runtime
+# `CryptoProvider::install_default()` panic. Dropping the TLS
+# feature entirely sidesteps the unification.
+electrum-client = { version = "0.25", default-features = false }
