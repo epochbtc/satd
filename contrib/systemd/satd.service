@@ -8,9 +8,29 @@
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable --now satd
 #
-# Optional config: drop a `bitcoin.conf` (or `satd.conf`) into
-#   /var/lib/satd/bitcoin.conf
+# Cookie-auth access for non-root operators: add yourself to the
+# `satd` group. The unit chmods $DATADIR/.cookie to 0640 on every
+# start, so group members can run `sat-cli` / `sat-tui` without sudo:
+#   sudo usermod -aG satd <your-user>
+# (group changes only take effect in new login sessions)
+#
+# Optional config (recommended): drop a `bitcoin.conf` (or `satd.conf`)
+# into `$SATD_DATADIR/bitcoin.conf` (default `/var/lib/satd/bitcoin.conf`).
 # satd reads it via the standard `-conf=` resolution against the datadir.
+#
+# Runtime overrides — `/etc/default/satd` (optional):
+#   SATD_DATADIR=/var/lib/satd       # override datadir path
+#   SATD_OPTS="--rpcport=18880 ..."  # extra flags appended to ExecStart
+#
+# If you set SATD_DATADIR to anything other than `/var/lib/satd`, you
+# also need a drop-in that updates the hardening directives, since
+# systemd does not expand environment variables in those:
+#   /etc/systemd/system/satd.service.d/datadir.conf:
+#     [Service]
+#     StateDirectory=
+#     ReadWritePaths=
+#     ReadWritePaths=/your/datadir
+# (Empty values reset the inherited list; the second line adds yours.)
 #
 # Type=notify: satd calls sd_notify(READY=1) only after every listener
 # is bound (RPC, P2P, optional Esplora/Electrum/MCP/events surfaces),
@@ -33,8 +53,23 @@ Wants=network-online.target
 [Service]
 Type=notify
 NotifyAccess=main
-ExecStart=/usr/local/bin/satd --datadir=/var/lib/satd
+
+# Operators can override the datadir or append extra flags via
+# /etc/default/satd without forking the unit. ${SATD_DATADIR} stays a
+# single argv token; $SATD_OPTS is word-split, so multi-flag strings
+# like `--rpcport=18880 --txindex` expand to separate arguments.
+Environment=SATD_DATADIR=/var/lib/satd
+Environment=SATD_OPTS=
+EnvironmentFile=-/etc/default/satd
+ExecStart=/usr/local/bin/satd --datadir=${SATD_DATADIR} $SATD_OPTS
 ExecStop=/bin/kill -SIGTERM $MAINPID
+
+# Loosen the cookie file from 0600 → 0640 once it's been written, so
+# users added to the `satd` group can authenticate sat-cli/sat-tui
+# without sudo. `-` prefix: missing cookie (e.g., when --rpcuser is
+# set instead) is non-fatal. Cookie still rotates on every daemon
+# start, so this is no less secure than 0600 for outside-group users.
+ExecStartPost=-/bin/chmod 0640 ${SATD_DATADIR}/.cookie
 
 # Reindex can take hours. The EXTEND_TIMEOUT_USEC heartbeats inside
 # satd reset this every 30s during the pre-bind phase; `infinity`
