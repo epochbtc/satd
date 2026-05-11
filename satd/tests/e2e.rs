@@ -803,6 +803,291 @@ fn test_e2e_esplora_cookie_auth_required_when_configured() {
     e2e.node.stop();
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// Electrum suite (driven by third-party `electrum-client` crate)
+// ─────────────────────────────────────────────────────────────────────
+
+fn electrum_e2e_args() -> Vec<&'static str> {
+    // `--electrum=1` triggers the harness's txindex auto-coupling
+    // (`common/mod.rs::start_with_env`); addressindex is on by default.
+    vec!["--electrum=1", "--electrumbind=127.0.0.1:0"]
+}
+
+fn electrum_url_for(e2e: &E2eNode) -> String {
+    let port = e2e.electrum_port.expect(
+        "E2eNode booted with --electrum=1 and --electrumbind=127.0.0.1:0",
+    );
+    format!("tcp://127.0.0.1:{}", port)
+}
+
+#[test]
+fn test_e2e_electrum_server_features_from_third_party_client() {
+    // The whole point of using a third-party client: if our framer or
+    // serde shapes are wrong, this single call fails before any of the
+    // surface-specific tests do.
+    use electrum_client::ElectrumApi;
+    let mut e2e = E2eNode::boot_with(&electrum_e2e_args());
+    let client = electrum_client::Client::new(&electrum_url_for(&e2e))
+        .expect("electrum client connect");
+    let features = client.server_features().expect("server_features");
+
+    // The regtest genesis hash, big-endian display order:
+    //   0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206
+    // Compare against the bitcoin crate's authoritative value rather
+    // than a hand-typed constant so a future regtest-params change
+    // doesn't silently invalidate the test.
+    let expected =
+        bitcoin::constants::genesis_block(bitcoin::Network::Regtest).block_hash();
+    let expected_hex = expected.to_string();
+    let got_hex = hex::encode(features.genesis_hash);
+    assert_eq!(
+        got_hex.to_lowercase(),
+        expected_hex.to_lowercase(),
+        "genesis_hash mismatch"
+    );
+    e2e.node.stop();
+}
+
+#[test]
+fn test_e2e_electrum_headers_subscribe_notification() {
+    use electrum_client::ElectrumApi;
+    let mut e2e = E2eNode::boot_with(&electrum_e2e_args());
+    let url = electrum_url_for(&e2e);
+    let client = electrum_client::Client::new(&url).expect("electrum client connect");
+
+    // Subscribe to header notifications. The initial reply already
+    // carries the current tip (height 0, regtest genesis header).
+    let initial = client.block_headers_subscribe().expect("subscribe");
+    assert_eq!(initial.height, 0, "fresh regtest tip should be 0");
+
+    // Mine 1 block via the inner JSON-RPC. The server should send a
+    // header notification; poll `block_headers_pop` until it returns
+    // Some(header) at the new height.
+    let wallet = DeterministicWallet::from_secret([0x11u8; 32]);
+    let _ = e2e
+        .node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![
+                serde_json::json!(1),
+                serde_json::json!(wallet.address.to_string()),
+            ],
+        )
+        .expect("generatetoaddress");
+
+    // `electrum-client` only reads from the socket when an RPC method
+    // is called; it has no background reader thread. So a bare
+    // `block_headers_pop` against an idle client always returns None,
+    // even when notifications are waiting on the wire. `ping()` is
+    // the cheapest call we can issue to drain the read buffer into
+    // the notification queue. Same pattern in the scripthash
+    // subscribe test below.
+    let deadline = std::time::Instant::now() + e2e_test_timeout(10);
+    loop {
+        client.ping().expect("ping");
+        if let Some(notif) = client.block_headers_pop().expect("headers pop") {
+            assert_eq!(notif.height, 1, "expected height 1, got {}", notif.height);
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("no header notification received within deadline");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    e2e.node.stop();
+}
+
+#[test]
+fn test_e2e_electrum_scripthash_get_history_for_funded_address() {
+    use electrum_client::ElectrumApi;
+    let mut e2e = E2eNode::boot_with(&electrum_e2e_args());
+    let url = electrum_url_for(&e2e);
+    let client = electrum_client::Client::new(&url).expect("electrum connect");
+
+    // Mine 3 blocks to a known P2WPKH; the address has 3 coinbase
+    // outputs (one per block). Electrum's history returns one entry
+    // per tx that touches the scripthash.
+    let wallet = DeterministicWallet::from_secret([0x11u8; 32]);
+    let _ = e2e
+        .node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![
+                serde_json::json!(3),
+                serde_json::json!(wallet.address.to_string()),
+            ],
+        )
+        .expect("generatetoaddress 3");
+
+    let script = wallet.address.script_pubkey();
+    let history = client
+        .script_get_history(&script)
+        .expect("script_get_history");
+    assert_eq!(history.len(), 3, "expected 3 history entries, got {:?}", history);
+    let heights: Vec<i32> = history.iter().map(|h| h.height).collect();
+    let mut sorted = heights.clone();
+    sorted.sort();
+    assert_eq!(sorted, vec![1, 2, 3], "expected heights 1, 2, 3; got {:?}", heights);
+
+    e2e.node.stop();
+}
+
+#[test]
+fn test_e2e_electrum_transaction_broadcast() {
+    use electrum_client::ElectrumApi;
+    let mut e2e = E2eNode::boot_with(&electrum_e2e_args());
+    let url = electrum_url_for(&e2e);
+    let client = electrum_client::Client::new(&url).expect("electrum connect");
+
+    let wallet = DeterministicWallet::from_secret([0x11u8; 32]);
+    let _ = e2e
+        .node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![
+                serde_json::json!(101),
+                serde_json::json!(wallet.address.to_string()),
+            ],
+        )
+        .expect("generatetoaddress 101");
+
+    let dest_script = bitcoin::Address::from_str("bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202")
+        .expect("valid bech32")
+        .require_network(bitcoin::Network::Regtest)
+        .expect("regtest")
+        .script_pubkey();
+    let (raw_hex, expected_txid_str) =
+        build_signed_p2wpkh_spend_from_block1_coinbase(&e2e.node, &wallet, dest_script, 1000);
+    let raw_bytes = hex::decode(&raw_hex).expect("hex");
+
+    // Broadcast via the third-party Electrum client.
+    let txid = client
+        .transaction_broadcast_raw(&raw_bytes)
+        .expect("transaction_broadcast_raw");
+    assert_eq!(
+        txid.to_string(),
+        expected_txid_str,
+        "broadcast txid round-trip"
+    );
+
+    // Round-trip via `transaction.get`: fetch the raw bytes back. The
+    // server reads from mempool here (tx not yet mined).
+    let fetched = client
+        .transaction_get_raw(&txid)
+        .expect("transaction_get_raw");
+    assert_eq!(
+        hex::encode(&fetched),
+        raw_hex,
+        "transaction_get_raw should return the broadcast bytes verbatim"
+    );
+
+    // Mine and verify the merkle proof.
+    let _ = e2e
+        .node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![
+                serde_json::json!(1),
+                serde_json::json!(wallet.address.to_string()),
+            ],
+        )
+        .expect("confirm block");
+
+    // Allow a beat for indexes / tx-location to flip. The merkle
+    // fetch needs the height (`102`) and the server reads from the
+    // confirmed block.
+    let merkle = common::poll_until_json(
+        || match client.transaction_get_merkle(&txid, 102) {
+            Ok(m) => serde_json::json!({
+                "block_height": m.block_height,
+                "pos": m.pos,
+                "merkle_len": m.merkle.len(),
+            }),
+            Err(_) => serde_json::Value::Null,
+        },
+        |v| v["block_height"] == 102,
+        10,
+    );
+    assert!(merkle["pos"].as_u64().unwrap_or(0) >= 1, "spend should not be at pos 0 (coinbase)");
+
+    e2e.node.stop();
+}
+
+#[test]
+fn test_e2e_electrum_scripthash_subscribe_fires_on_mempool() {
+    use electrum_client::ElectrumApi;
+    let mut e2e = E2eNode::boot_with(&electrum_e2e_args());
+    let url = electrum_url_for(&e2e);
+    let client = electrum_client::Client::new(&url).expect("electrum connect");
+
+    let src_wallet = DeterministicWallet::from_secret([0x11u8; 32]);
+    let _ = e2e
+        .node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![
+                serde_json::json!(101),
+                serde_json::json!(src_wallet.address.to_string()),
+            ],
+        )
+        .expect("generatetoaddress 101");
+
+    let dest_addr = bitcoin::Address::from_str("bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202")
+        .expect("valid bech32")
+        .require_network(bitcoin::Network::Regtest)
+        .expect("regtest");
+    let dest_script = dest_addr.script_pubkey();
+
+    // Subscribe to dest BEFORE broadcasting. Initial status is None
+    // (no history) — that's expected.
+    let initial = client
+        .script_subscribe(&dest_script)
+        .expect("script_subscribe");
+    assert!(initial.is_none(), "dest should start with empty status, got {:?}", initial);
+
+    // Broadcast the funding tx via JSON-RPC (we already tested the
+    // Electrum broadcast path above; here the publisher is JSON-RPC,
+    // so a successful notification proves the mempool→index→
+    // subscription pipeline works regardless of which surface
+    // broadcasts).
+    let (raw_hex, _txid_str) = build_signed_p2wpkh_spend_from_block1_coinbase(
+        &e2e.node,
+        &src_wallet,
+        dest_script.clone(),
+        1000,
+    );
+    let _ = e2e
+        .node
+        .rpc_call_with_params("sendrawtransaction", vec![serde_json::json!(raw_hex)])
+        .expect("sendrawtransaction");
+
+    // Poll for a status update on the dest scripthash. Bound at 20s
+    // (more generous than other tests because the mempool→notify
+    // hop is the highest-latency path in the suite). If this flakes
+    // even once in 10 runs, the bug is in the publisher/forwarder,
+    // not the test.
+    // See note on `electrum-client`'s lack of a background reader in
+    // the headers test above; `ping()` each iteration drains the
+    // socket into the notification queue.
+    let deadline = std::time::Instant::now() + e2e_test_timeout(20);
+    loop {
+        client.ping().expect("ping");
+        if client
+            .script_pop(&dest_script)
+            .expect("script_pop")
+            .is_some()
+        {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("no scripthash notification received within deadline");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
+    e2e.node.stop();
+}
+
 #[test]
 fn test_e2e_jsonrpc_sat_cli_auth_failure_shape() {
     // Boot a node so sat-cli has something to connect to, but ignore

@@ -45,3 +45,18 @@ bitcoin = { workspace = true }
 hex = { workspace = true }
 base64 = { workspace = true }
 tempfile = "3"
+# Third-party Electrum client for the E2E suite. Independent
+# implementation of the wire protocol (predates `electrum-proto`;
+# ships its own message types). Drives the Electrum test group so
+# wire-format regressions a native-Rust client we wrote ourselves
+# would gloss over still get caught.
+#
+# `default-features = false` + no `rustls*` / `proxy`: our tests
+# connect via plain TCP (`tcp://127.0.0.1:port`), so we don't need
+# the TLS or SOCKS5 paths at all. Pulling either flavour of rustls
+# in unifies with the workspace's existing rustls (via tokio-rustls
+# + hyper-rustls + rustls-platform-verifier), enabling *two* crypto
+# provider features simultaneously and tripping rustls's runtime
+# `CryptoProvider::install_default()` panic. Dropping the TLS
+# feature entirely sidesteps the unification.
+electrum-client = { version = "0.25", default-features = false }

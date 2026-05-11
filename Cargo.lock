@@ -1013,6 +1013,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
 
 [[package]]
+name = "electrum-client"
+version = "0.25.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1970c5d7bd9de6d4041cbfc3e46faa3e85fe7efcea2b0eb06750d3ae1ef577b7"
+dependencies = [
+ "bitcoin",
+ "log",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "electrum-proto"
 version = "0.1.0"
 dependencies = [
@@ -3325,6 +3337,7 @@ dependencies = [
  "base64",
  "bitcoin",
  "clap",
+ "electrum-client",
  "electrum-proto",
  "esplora-handlers",
  "hex",
