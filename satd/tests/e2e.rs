@@ -26,13 +26,19 @@ pub struct E2eNode {
 }
 
 impl E2eNode {
-    /// Boot a `satd` regtest node with the given extra args, then read
-    /// back the bound Esplora / Electrum ports (`None` when the listener
-    /// isn't requested or didn't come up). Use `--esplorabind=127.0.0.1:0`
-    /// / `--electrumbind=127.0.0.1:0` to get OS-assigned ports.
+    /// Boot a `satd` regtest node with the given extra args, then poll
+    /// `getserverstatus` until every requested optional listener
+    /// (Esplora / Electrum) reports a non-null bind with a non-zero
+    /// port. `TestNode::start` only waits for the JSON-RPC server, but
+    /// satd starts the RPC server *before* the optional listeners
+    /// bind — so observing `chain == regtest` doesn't imply the
+    /// Esplora/Electrum ports are ready to read back.
     pub fn boot_with(extra_args: &[&str]) -> Self {
         let node = TestNode::start(extra_args);
-        let (esplora_port, electrum_port) = read_listener_ports(&node);
+        let want_esplora = args_request_listener(extra_args, "--esplora");
+        let want_electrum = args_request_listener(extra_args, "--electrum");
+        let (esplora_port, electrum_port) =
+            poll_listener_ports(&node, want_esplora, want_electrum);
         E2eNode {
             node,
             esplora_port,
@@ -41,29 +47,68 @@ impl E2eNode {
     }
 }
 
-/// Probe `getserverstatus` and return `(esplora_port, electrum_port)`.
-/// Each is `None` when the listener field is null or absent. Used by
-/// `boot_with` after startup; the per-listener bind status flips from
-/// null to a `{"bind": "host:port"}` object once that listener
-/// successfully binds, so this read happens after `TestNode::start`'s
-/// own startup poll completes.
-fn read_listener_ports(node: &TestNode) -> (Option<u16>, Option<u16>) {
-    let resp = match node.rpc_call("getserverstatus") {
-        Ok(v) => v,
-        Err(_) => return (None, None),
-    };
-    let result = &resp["result"];
-    let esplora = result["esplora"]["bind"]
-        .as_str()
-        .and_then(parse_port_from_bind);
-    let electrum = result["electrum"]["bind"]
-        .as_str()
-        .and_then(parse_port_from_bind);
-    (esplora, electrum)
+/// Detect whether `extra_args` requests the given listener (e.g.
+/// `--esplora=1` / `--electrum=1` / `--esplora=true`). Returns false
+/// for `=0` / `=false` / absent.
+fn args_request_listener(extra_args: &[&str], flag_prefix: &str) -> bool {
+    let on = format!("{}=1", flag_prefix);
+    let on_true = format!("{}=true", flag_prefix);
+    extra_args.iter().any(|a| *a == on || *a == on_true)
 }
 
+/// Poll `getserverstatus` until every requested optional listener
+/// reports a non-null bind with a non-zero port. Returns the parsed
+/// ports — `None` for any listener not requested by the caller.
+/// Panics on timeout with the last-seen `getserverstatus` body so
+/// the failure points at the actual startup state, not a generic
+/// "no listener" message.
+fn poll_listener_ports(
+    node: &TestNode,
+    want_esplora: bool,
+    want_electrum: bool,
+) -> (Option<u16>, Option<u16>) {
+    let deadline = std::time::Instant::now() + e2e_test_timeout(30);
+    loop {
+        let last_body = node
+            .rpc_call("getserverstatus")
+            .unwrap_or(serde_json::Value::Null);
+        let result = &last_body["result"];
+        let esplora = result["esplora"]["bind"]
+            .as_str()
+            .and_then(parse_port_from_bind);
+        let electrum = result["electrum"]["bind"]
+            .as_str()
+            .and_then(parse_port_from_bind);
+        let esplora_ready = !want_esplora || esplora.is_some();
+        let electrum_ready = !want_electrum || electrum.is_some();
+        if esplora_ready && electrum_ready {
+            // Only surface ports for listeners the caller requested:
+            // an enabled-by-default future listener that the caller
+            // didn't opt into shouldn't leak through `E2eNode`.
+            return (
+                if want_esplora { esplora } else { None },
+                if want_electrum { electrum } else { None },
+            );
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "timed out waiting for listeners (esplora wanted={} got={:?}, electrum wanted={} got={:?}); last getserverstatus: {}",
+                want_esplora, esplora, want_electrum, electrum, last_body
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// Parse the trailing port from a `host:port` bind string. Returns
+/// `None` if the port is 0 — port-0 is the request the operator
+/// sends to ask for an OS-assigned port, so observing it on the
+/// reply path means `local_addr()` lookup hasn't completed yet and
+/// callers should keep polling.
 fn parse_port_from_bind(bind: &str) -> Option<u16> {
-    bind.rsplit_once(':').and_then(|(_, p)| p.parse().ok())
+    bind.rsplit_once(':')
+        .and_then(|(_, p)| p.parse::<u16>().ok())
+        .filter(|&p| p != 0)
 }
 
 #[test]
@@ -403,10 +448,19 @@ fn test_e2e_jsonrpc_tx_broadcast_and_mempool() {
     e2e.node.stop();
 }
 
-/// Thin helper used by tests that need to drive a JSON-RPC method from
-/// inside a `poll_until_json` probe. Mirrors `TestNode::rpc_call_with_params`
-/// but returns `Value::Null` on transport failure (lets the predicate
-/// loop instead of panicking inside the closure).
+/// Thin helper used by tests that need to drive a JSON-RPC method
+/// from inside a `poll_until_json` probe. Mirrors
+/// `TestNode::rpc_call_with_params` but is fail-fast on real errors:
+/// transport failures, non-2xx HTTP, malformed JSON, and JSON-RPC
+/// errors all panic immediately with structured context. Predicates
+/// in `poll_until_json` callers only see *valid* JSON-RPC successes
+/// — the loop is for state-convergence, not error masking.
+///
+/// This is the right policy because the harness's `TestNode::start`
+/// already waits for the RPC server to answer `getblockchaininfo`
+/// before the test body runs. Any post-start RPC error is a real bug
+/// (auth regression, 500, malformed shape) that timing-based polling
+/// would hide behind a generic `poll_until_json timed out` panic.
 fn rpc_post(
     rpcport: u16,
     cookie: &str,
@@ -423,16 +477,51 @@ fn rpc_post(
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
-        .expect("build client");
-    client
+        .expect("build reqwest client");
+    let resp = client
         .post(format!("http://127.0.0.1:{}/", rpcport))
         .basic_auth(user, Some(pass))
         .header("Content-Type", "application/json")
         .json(&body)
         .send()
-        .ok()
-        .and_then(|r| r.json::<serde_json::Value>().ok())
-        .unwrap_or(serde_json::Value::Null)
+        .unwrap_or_else(|e| panic!("rpc_post {method}: transport error: {e}"));
+    let status = resp.status();
+    let text = resp
+        .text()
+        .unwrap_or_else(|e| panic!("rpc_post {method}: body read failed: {e}"));
+    if !status.is_success() {
+        panic!(
+            "rpc_post {method}: HTTP {} — body: {}",
+            status, text
+        );
+    }
+    let v: serde_json::Value = serde_json::from_str(&text)
+        .unwrap_or_else(|e| panic!("rpc_post {method}: JSON parse failed: {e} — body: {text}"));
+    if !v["error"].is_null() {
+        panic!("rpc_post {method}: JSON-RPC error: {}", v["error"]);
+    }
+    v
+}
+
+/// Companion helper for tests that probe an Esplora endpoint inside a
+/// `poll_until_json` predicate. Same fail-fast policy as `rpc_post`:
+/// transport failures and non-2xx HTTP panic with structured context;
+/// only the parsed-JSON-but-not-converged path returns to the
+/// predicate.
+fn esplora_get_json(esplora: &EsploraClient, path: &str) -> serde_json::Value {
+    let resp = esplora.get(path);
+    let status = resp.status();
+    let text = resp
+        .text()
+        .unwrap_or_else(|e| panic!("esplora GET {path}: body read failed: {e}"));
+    if !status.is_success() {
+        panic!(
+            "esplora GET {path}: HTTP {} — body: {}",
+            status, text
+        );
+    }
+    serde_json::from_str(&text)
+        .unwrap_or_else(|e| panic!("esplora GET {path}: JSON parse failed: {e} — body: {text}"))
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -593,15 +682,9 @@ fn test_e2e_esplora_post_tx_round_trip() {
     // mempool snapshot is rebuilt lazily.
     let port = esplora.port;
     let want_txid = txid_hex.clone();
+    let _ = port;
     common::poll_until_json(
-        || {
-            let r = EsploraClient::client()
-                .get(format!("http://127.0.0.1:{}/mempool/txids", port))
-                .send()
-                .expect("GET /mempool/txids");
-            r.json::<serde_json::Value>()
-                .unwrap_or(serde_json::Value::Null)
-        },
+        || esplora_get_json(&esplora, "/mempool/txids"),
         |v| {
             v.as_array()
                 .is_some_and(|a| a.iter().any(|t| t.as_str() == Some(want_txid.as_str())))
@@ -642,6 +725,12 @@ fn test_e2e_esplora_address_history_after_spend() {
 
     let r = esplora.post_tx(&raw_hex);
     assert_eq!(r.status(), 200);
+    let body = r.text().expect("body utf8");
+    assert_eq!(
+        body.trim(),
+        txid_hex,
+        "POST /tx body must echo the broadcast txid"
+    );
 
     // Mine 1 block to confirm.
     let _ = e2e
@@ -658,12 +747,9 @@ fn test_e2e_esplora_address_history_after_spend() {
     // GET /address/:src/txs should now include the spend.
     let src_str = src_wallet.address.to_string();
     let want_txid = txid_hex.clone();
+    let src_path = format!("/address/{}/txs", src_str);
     common::poll_until_json(
-        || {
-            let r = esplora.get(&format!("/address/{}/txs", src_str));
-            r.json::<serde_json::Value>()
-                .unwrap_or(serde_json::Value::Null)
-        },
+        || esplora_get_json(&esplora, &src_path),
         |v| {
             v.as_array()
                 .is_some_and(|a| a.iter().any(|t| t["txid"].as_str() == Some(want_txid.as_str())))
@@ -996,21 +1082,102 @@ fn test_e2e_electrum_transaction_broadcast() {
     // Allow a beat for indexes / tx-location to flip. The merkle
     // fetch needs the height (`102`) and the server reads from the
     // confirmed block.
-    let merkle = common::poll_until_json(
-        || match client.transaction_get_merkle(&txid, 102) {
-            Ok(m) => serde_json::json!({
-                "block_height": m.block_height,
-                "pos": m.pos,
-                "merkle_len": m.merkle.len(),
-            }),
-            Err(_) => serde_json::Value::Null,
-        },
-        |v| v["block_height"] == 102,
-        10,
+    let deadline = std::time::Instant::now() + e2e_test_timeout(10);
+    let merkle = loop {
+        match client.transaction_get_merkle(&txid, 102) {
+            Ok(m) if m.block_height == 102 => break m,
+            Ok(_) | Err(_) => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("transaction_get_merkle didn't reach block 102 within deadline");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    };
+
+    // Block at height 102 has exactly two transactions: the coinbase
+    // (pos 0) plus our spend (pos 1). The merkle proof for pos 1
+    // contains a single sibling — the coinbase txid.
+    assert_eq!(
+        merkle.pos, 1,
+        "spend should be at pos 1 (right of the coinbase); got pos {}",
+        merkle.pos
     );
-    assert!(merkle["pos"].as_u64().unwrap_or(0) >= 1, "spend should not be at pos 0 (coinbase)");
+    assert_eq!(
+        merkle.merkle.len(),
+        1,
+        "2-tx block must yield a 1-element merkle branch; got {} elements",
+        merkle.merkle.len()
+    );
+
+    // Independent verification: recompute the merkle root from the
+    // proof and compare against the on-chain header. This is the
+    // *security surface* the Electrum protocol exposes — without
+    // this check the server could return a syntactically valid but
+    // semantically broken proof and the test would still pass.
+    let block102_hash_str = e2e
+        .node
+        .rpc_call_with_params("getblockhash", vec![serde_json::json!(102)])
+        .expect("getblockhash 102")["result"]
+        .as_str()
+        .expect("block hash")
+        .to_string();
+    let raw_block_hex = e2e
+        .node
+        .rpc_call_with_params(
+            "getblock",
+            vec![serde_json::json!(block102_hash_str), serde_json::json!(0)],
+        )
+        .expect("getblock verbosity 0")["result"]
+        .as_str()
+        .expect("raw block hex")
+        .to_string();
+    let raw_block = hex::decode(&raw_block_hex).expect("decode block hex");
+    let block: bitcoin::Block =
+        bitcoin::consensus::deserialize(&raw_block).expect("deserialize block");
+    let expected_root = block.header.merkle_root;
+    let computed_root = recompute_merkle_root(&txid, &merkle.merkle, merkle.pos);
+    assert_eq!(
+        computed_root, expected_root,
+        "merkle proof failed to recompute the block's merkle root; \
+         computed {}, expected {}",
+        computed_root, expected_root
+    );
 
     e2e.node.stop();
+}
+
+/// Recompute a Bitcoin merkle root from a leaf txid + proof + index.
+/// Electrum's `blockchain.transaction.get_merkle` returns siblings as
+/// hex strings in display (big-endian) byte order; `electrum-client`'s
+/// `from_hex` for `[u8; 32]` produces the bytes in that same display
+/// order. Bitcoin's internal SHA256d operates on the natural
+/// (little-endian) byte order, so each sibling is reversed before
+/// hashing. The starting leaf (`txid.to_byte_array()`) is already in
+/// natural order.
+fn recompute_merkle_root(
+    txid: &bitcoin::Txid,
+    branch: &[[u8; 32]],
+    pos: usize,
+) -> bitcoin::TxMerkleNode {
+    use bitcoin::hashes::Hash;
+    let mut current: [u8; 32] = txid.to_byte_array();
+    let mut p = pos;
+    for sibling_display in branch {
+        let mut sibling_internal = *sibling_display;
+        sibling_internal.reverse();
+        let mut combined = [0u8; 64];
+        if p & 1 == 0 {
+            combined[..32].copy_from_slice(&current);
+            combined[32..].copy_from_slice(&sibling_internal);
+        } else {
+            combined[..32].copy_from_slice(&sibling_internal);
+            combined[32..].copy_from_slice(&current);
+        }
+        current = bitcoin::hashes::sha256d::Hash::hash(&combined).to_byte_array();
+        p >>= 1;
+    }
+    let hash = bitcoin::hashes::sha256d::Hash::from_byte_array(current);
+    bitcoin::TxMerkleNode::from_raw_hash(hash)
 }
 
 #[test]
@@ -1267,13 +1434,9 @@ fn test_e2e_cross_surface_esplora_broadcast_visible_in_rpc_and_electrum() {
     );
 
     // Esplora `GET /tx/:txid` flips to confirmed.
-    let want_txid_for_esplora = txid_hex.clone();
+    let tx_path = format!("/tx/{}", txid_hex);
     common::poll_until_json(
-        || {
-            let r = esplora.get(&format!("/tx/{}", want_txid_for_esplora));
-            r.json::<serde_json::Value>()
-                .unwrap_or(serde_json::Value::Null)
-        },
+        || esplora_get_json(&esplora, &tx_path),
         |v| v["status"]["confirmed"] == true,
         10,
     );
