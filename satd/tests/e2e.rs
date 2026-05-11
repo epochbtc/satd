@@ -435,6 +435,374 @@ fn rpc_post(
         .unwrap_or(serde_json::Value::Null)
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// Esplora REST suite
+// ─────────────────────────────────────────────────────────────────────
+
+/// Build an `EsploraClient` for a booted node. Panics if Esplora isn't
+/// enabled — `boot_with(&["--esplora=1", "--esplorabind=127.0.0.1:0", ...])`
+/// is required.
+fn esplora_for(e2e: &E2eNode) -> EsploraClient {
+    let port = e2e
+        .esplora_port
+        .expect("E2eNode booted with --esplora=1 and --esplorabind=127.0.0.1:0");
+    EsploraClient { port }
+}
+
+/// Thin wrapper around `reqwest::blocking::Client` for the Esplora
+/// endpoint set. All helpers return the raw `Response` so tests can
+/// assert on status + body shape.
+struct EsploraClient {
+    port: u16,
+}
+
+impl EsploraClient {
+    fn url(&self, path: &str) -> String {
+        format!("http://127.0.0.1:{}{}", self.port, path)
+    }
+
+    fn get(&self, path: &str) -> reqwest::blocking::Response {
+        Self::client()
+            .get(self.url(path))
+            .send()
+            .expect("esplora GET")
+    }
+
+    /// Plain-text POST /tx (the canonical Esplora wire shape: raw-hex
+    /// body, `Content-Type: text/plain`). Matches mempool.space and
+    /// blockstream.info.
+    fn post_tx(&self, raw_hex: &str) -> reqwest::blocking::Response {
+        Self::client()
+            .post(self.url("/tx"))
+            .header("Content-Type", "text/plain")
+            .body(raw_hex.to_string())
+            .send()
+            .expect("esplora POST /tx")
+    }
+
+    /// POST /tx with a caller-chosen Content-Type (or no header).
+    /// Used by the content-type-compatibility test to assert that
+    /// satd accepts any Content-Type the way blockstream.io does.
+    fn post_tx_with_content_type(
+        &self,
+        raw_hex: &str,
+        content_type: Option<&str>,
+    ) -> reqwest::blocking::Response {
+        let mut req = Self::client().post(self.url("/tx"));
+        if let Some(ct) = content_type {
+            req = req.header("Content-Type", ct);
+        }
+        req.body(raw_hex.to_string())
+            .send()
+            .expect("esplora POST /tx (custom CT)")
+    }
+
+    fn client() -> reqwest::blocking::Client {
+        reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("build reqwest client")
+    }
+}
+
+fn esplora_e2e_args() -> Vec<&'static str> {
+    // `--esplora=1` triggers the harness's txindex auto-coupling
+    // (`common/mod.rs::start_with_env`); addressindex is on by default
+    // in satd so no explicit flag is needed.
+    vec!["--esplora=1", "--esplorabind=127.0.0.1:0"]
+}
+
+#[test]
+fn test_e2e_esplora_tip_height_after_mining() {
+    let mut e2e = E2eNode::boot_with(&esplora_e2e_args());
+    let esplora = esplora_for(&e2e);
+
+    // Fresh regtest tip should be 0 (genesis).
+    let r = esplora.get("/blocks/tip/height");
+    assert_eq!(r.status(), 200);
+    assert_eq!(
+        r.text().expect("body utf8").trim(),
+        "0",
+        "fresh regtest tip should be 0"
+    );
+
+    // Mine 5 blocks to a deterministic P2WPKH; tip should flip to 5.
+    let wallet = DeterministicWallet::from_secret([0x11u8; 32]);
+    let _ = e2e
+        .node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![
+                serde_json::json!(5),
+                serde_json::json!(wallet.address.to_string()),
+            ],
+        )
+        .expect("generatetoaddress");
+
+    let r = esplora.get("/blocks/tip/height");
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.text().expect("body utf8").trim(), "5");
+
+    e2e.node.stop();
+}
+
+#[test]
+fn test_e2e_esplora_post_tx_round_trip() {
+    let mut e2e = E2eNode::boot_with(&esplora_e2e_args());
+    let esplora = esplora_for(&e2e);
+    let wallet = DeterministicWallet::from_secret([0x11u8; 32]);
+
+    // Mature block-1 coinbase.
+    let _ = e2e
+        .node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![
+                serde_json::json!(101),
+                serde_json::json!(wallet.address.to_string()),
+            ],
+        )
+        .expect("generatetoaddress 101");
+
+    let dest_script = bitcoin::Address::from_str("bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202")
+        .expect("valid bech32")
+        .require_network(bitcoin::Network::Regtest)
+        .expect("regtest")
+        .script_pubkey();
+    let (raw_hex, txid_hex) =
+        build_signed_p2wpkh_spend_from_block1_coinbase(&e2e.node, &wallet, dest_script, 1000);
+
+    let r = esplora.post_tx(&raw_hex);
+    assert_eq!(r.status(), 200, "POST /tx should return 200");
+    let body = r.text().expect("body utf8");
+    assert_eq!(
+        body.trim(),
+        txid_hex,
+        "POST /tx body should be the txid"
+    );
+
+    // GET /tx/:txid — assert unconfirmed (in mempool, not yet mined).
+    let tx_r = esplora.get(&format!("/tx/{}", txid_hex));
+    assert_eq!(tx_r.status(), 200);
+    let tx_json: serde_json::Value = tx_r.json().expect("tx body json");
+    assert_eq!(tx_json["txid"], txid_hex);
+    assert_eq!(tx_json["status"]["confirmed"], false);
+
+    // GET /mempool — the txid should appear in the verbose mempool
+    // snapshot. We poll briefly since admit is synchronous but the
+    // mempool snapshot is rebuilt lazily.
+    let port = esplora.port;
+    let want_txid = txid_hex.clone();
+    common::poll_until_json(
+        || {
+            let r = EsploraClient::client()
+                .get(format!("http://127.0.0.1:{}/mempool/txids", port))
+                .send()
+                .expect("GET /mempool/txids");
+            r.json::<serde_json::Value>()
+                .unwrap_or(serde_json::Value::Null)
+        },
+        |v| {
+            v.as_array()
+                .is_some_and(|a| a.iter().any(|t| t.as_str() == Some(want_txid.as_str())))
+        },
+        10,
+    );
+
+    e2e.node.stop();
+}
+
+#[test]
+fn test_e2e_esplora_address_history_after_spend() {
+    let mut e2e = E2eNode::boot_with(&esplora_e2e_args());
+    let esplora = esplora_for(&e2e);
+    let src_wallet = DeterministicWallet::from_secret([0x11u8; 32]);
+
+    // Mine 101 to src so cb-1 is matured.
+    let _ = e2e
+        .node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![
+                serde_json::json!(101),
+                serde_json::json!(src_wallet.address.to_string()),
+            ],
+        )
+        .expect("generatetoaddress 101");
+
+    // Build + broadcast the spend cb-1 → canonical-burn dest.
+    let dest_addr_str = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let dest_script = bitcoin::Address::from_str(dest_addr_str)
+        .expect("valid bech32")
+        .require_network(bitcoin::Network::Regtest)
+        .expect("regtest")
+        .script_pubkey();
+    let (raw_hex, txid_hex) =
+        build_signed_p2wpkh_spend_from_block1_coinbase(&e2e.node, &src_wallet, dest_script, 1000);
+
+    let r = esplora.post_tx(&raw_hex);
+    assert_eq!(r.status(), 200);
+
+    // Mine 1 block to confirm.
+    let _ = e2e
+        .node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![
+                serde_json::json!(1),
+                serde_json::json!(src_wallet.address.to_string()),
+            ],
+        )
+        .expect("confirm block");
+
+    // GET /address/:src/txs should now include the spend.
+    let src_str = src_wallet.address.to_string();
+    let want_txid = txid_hex.clone();
+    common::poll_until_json(
+        || {
+            let r = esplora.get(&format!("/address/{}/txs", src_str));
+            r.json::<serde_json::Value>()
+                .unwrap_or(serde_json::Value::Null)
+        },
+        |v| {
+            v.as_array()
+                .is_some_and(|a| a.iter().any(|t| t["txid"].as_str() == Some(want_txid.as_str())))
+        },
+        10,
+    );
+
+    // GET /address/:dest/utxo should list the new output (post-mine).
+    let dest_utxos = esplora.get(&format!("/address/{}/utxo", dest_addr_str));
+    assert_eq!(dest_utxos.status(), 200);
+    let utxos: serde_json::Value = dest_utxos.json().expect("utxos json");
+    let arr = utxos.as_array().expect("array");
+    assert!(
+        arr.iter()
+            .any(|u| u["txid"].as_str() == Some(txid_hex.as_str())),
+        "dest /utxo should include the spend output; got {}",
+        utxos
+    );
+
+    e2e.node.stop();
+}
+
+#[test]
+fn test_e2e_esplora_content_type_compatibility() {
+    // blockstream.info / mempool.space accept POST /tx regardless of
+    // the Content-Type sent by the client. Many Esplora clients send
+    // `application/json` (wrong) or omit the header entirely; satd
+    // must hex-parse the body regardless to stay compatible.
+    let mut e2e = E2eNode::boot_with(&esplora_e2e_args());
+    let esplora = esplora_for(&e2e);
+    let wallet = DeterministicWallet::from_secret([0x11u8; 32]);
+
+    let _ = e2e
+        .node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![
+                serde_json::json!(101),
+                serde_json::json!(wallet.address.to_string()),
+            ],
+        )
+        .expect("generatetoaddress 101");
+
+    let dest_script = bitcoin::Address::from_str("bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202")
+        .expect("valid bech32")
+        .require_network(bitcoin::Network::Regtest)
+        .expect("regtest")
+        .script_pubkey();
+    let (raw_hex, txid_hex) =
+        build_signed_p2wpkh_spend_from_block1_coinbase(&e2e.node, &wallet, dest_script, 1000);
+
+    // Wrong Content-Type: application/json. Must still succeed.
+    let r = esplora.post_tx_with_content_type(&raw_hex, Some("application/json"));
+    assert_eq!(
+        r.status(),
+        200,
+        "POST /tx with application/json Content-Type must succeed (blockstream-compat)"
+    );
+    assert_eq!(r.text().expect("body utf8").trim(), txid_hex);
+
+    e2e.node.stop();
+}
+
+#[test]
+fn test_e2e_esplora_content_type_missing_compatibility() {
+    // No Content-Type header at all (some HTTP libraries omit it for
+    // POSTs with a String body). Must succeed for the same reason
+    // application/json must succeed.
+    let mut e2e = E2eNode::boot_with(&esplora_e2e_args());
+    let esplora = esplora_for(&e2e);
+    let wallet = DeterministicWallet::from_secret([0x11u8; 32]);
+
+    let _ = e2e
+        .node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![
+                serde_json::json!(101),
+                serde_json::json!(wallet.address.to_string()),
+            ],
+        )
+        .expect("generatetoaddress 101");
+
+    let dest_script = bitcoin::Address::from_str("bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202")
+        .expect("valid bech32")
+        .require_network(bitcoin::Network::Regtest)
+        .expect("regtest")
+        .script_pubkey();
+    let (raw_hex, txid_hex) =
+        build_signed_p2wpkh_spend_from_block1_coinbase(&e2e.node, &wallet, dest_script, 1000);
+
+    let r = esplora.post_tx_with_content_type(&raw_hex, None);
+    assert_eq!(
+        r.status(),
+        200,
+        "POST /tx with no Content-Type must succeed (blockstream-compat)"
+    );
+    assert_eq!(r.text().expect("body utf8").trim(), txid_hex);
+
+    e2e.node.stop();
+}
+
+#[test]
+fn test_e2e_esplora_cookie_auth_required_when_configured() {
+    let mut e2e = E2eNode::boot_with(&[
+        "--esplora=1",
+        "--esplorabind=127.0.0.1:0",
+        "--esploraauth=cookie",
+    ]);
+    let esplora = esplora_for(&e2e);
+
+    // Unauthenticated request must get 401.
+    let r = esplora.get("/blocks/tip/height");
+    assert_eq!(
+        r.status(),
+        401,
+        "unauthed Esplora request must be rejected with 401 under --esploraauth=cookie"
+    );
+
+    // Authenticated request with the cookie must succeed. The
+    // cookie value in `node.cookie` is the on-disk `user:pass`
+    // string; satd reuses the same cookie file for both JSON-RPC
+    // and Esplora cookie auth.
+    let (user, pass) = e2e
+        .node
+        .cookie
+        .split_once(':')
+        .expect("cookie has user:pass");
+    let r = EsploraClient::client()
+        .get(format!("http://127.0.0.1:{}/blocks/tip/height", esplora.port))
+        .basic_auth(user, Some(pass))
+        .send()
+        .expect("authed GET");
+    assert_eq!(r.status(), 200, "authed Esplora request must succeed");
+    assert_eq!(r.text().expect("body utf8").trim(), "0");
+
+    e2e.node.stop();
+}
+
 #[test]
 fn test_e2e_jsonrpc_sat_cli_auth_failure_shape() {
     // Boot a node so sat-cli has something to connect to, but ignore
