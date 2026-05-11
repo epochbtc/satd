@@ -240,7 +240,7 @@ fn confirmations_for(chain_state: &ChainState, block_height: u32) -> u64 {
 /// decoderawtransaction). `confirmations` is `Some(0)` for a mempool
 /// hit, `Some(N)` for a confirmed tx, and `None` for offline decode
 /// (`decoderawtransaction`) where there is no chain context.
-fn decode_transaction_verbose(
+pub(crate) fn decode_transaction_verbose(
     tx: &bitcoin::Transaction,
     blockhash: Option<&str>,
     block_height: Option<u32>,

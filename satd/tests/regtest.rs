@@ -2197,28 +2197,17 @@ fn test_rpc_default_units_btc_gettxout_mines_coin() {
         vec![serde_json::json!(1), serde_json::json!(addr)],
     )
     .unwrap();
-    // Get the coinbase txid from the mined block.
+    // Get the coinbase txid from the mined block. Use verbose=1 so
+    // `tx[0]` is a txid string (verbose=2 wraps each tx in an object).
     let hash = node
         .rpc_call_with_params("getblockhash", vec![serde_json::json!(1)])
         .unwrap();
-    let block = node.rpc_call_with_params(
-        "getblock",
-        vec![hash["result"].clone(), serde_json::json!(2)],
-    );
-    // getblock verbose=2 may not fully decode; fall back to verbose=1 for txids.
-    let block = if block
-        .as_ref()
-        .map(|b| b["result"]["tx"].is_array())
-        .unwrap_or(false)
-    {
-        block.unwrap()
-    } else {
-        node.rpc_call_with_params(
+    let block = node
+        .rpc_call_with_params(
             "getblock",
             vec![hash["result"].clone(), serde_json::json!(1)],
         )
-        .unwrap()
-    };
+        .unwrap();
     let coinbase_txid = block["result"]["tx"][0]
         .as_str()
         .expect("coinbase txid")
