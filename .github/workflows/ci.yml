@@ -84,8 +84,17 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - name: Build all binaries
-        run: cargo build --all --locked
+      # Pre-build sat-cli. The satd integration tests reach `sat-cli` by
+      # path lookup (`Path::new(CARGO_BIN_EXE_satd).parent().join("sat-cli")`)
+      # rather than via the `CARGO_BIN_EXE_*` mechanism, because the
+      # binary lives in a sibling crate. `cargo test` only auto-builds
+      # bin targets for the same crate as the test, so without this
+      # explicit step the path lookup finds nothing and every sat-cli
+      # test fails with ENOENT. The narrow `-p sat-cli` build (vs. the
+      # old `cargo build --all`) is targeted at the actual dependency
+      # and avoids the ~5-7min cost of building every workspace bin.
+      - name: Pre-build sat-cli (test fixture)
+        run: cargo build -p sat-cli --locked
 
       - name: Run tests
         # Cap test parallelism. The default (one thread per CPU) lets the
