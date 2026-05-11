@@ -24,6 +24,7 @@
 *   **Modern Mempool:** Full RBF / opt-in BIP 125 and CPFP ancestor tracking.
 
 ### Native Integrations (No side-cars required)
+*   **Native TLS Support:** Direct TLS support for JSON-RPC, Electrum, and Esplora servers, eliminating the need for Nginx/reverse-proxy sidecars.
 *   **AI-Native MCP Server:** An optional Model Context Protocol (`mcp`) binary that exposes node data and operational surfaces directly to AI agents.
 *   **Electrum Protocol:** Native TCP server (v1.4.5) for wallets like BlueWallet, Sparrow, and Nunchuk.
 *   **Esplora REST:** Wire-shape parity with blockstream.info / mempool.space for the implemented endpoint set.
