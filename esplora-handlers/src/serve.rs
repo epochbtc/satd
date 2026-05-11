@@ -84,7 +84,7 @@ impl axum::serve::Listener for TlsListener {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tls_config::build_acceptor;
+    use tls_config::{ClientAuthPolicy, build_acceptor};
     use axum::Router;
     use axum::routing::get;
     use std::io::Write;
@@ -110,7 +110,7 @@ mod tests {
         let cert = rcgen::generate_simple_self_signed(["localhost".to_string()]).unwrap();
         let cert_path = write_pem(dir.path(), "cert.pem", &cert.cert.pem());
         let key_path = write_pem(dir.path(), "key.pem", &cert.key_pair.serialize_pem());
-        let acceptor = build_acceptor(&cert_path, &key_path).unwrap();
+        let acceptor = build_acceptor(&cert_path, &key_path, &ClientAuthPolicy::Disabled).unwrap();
         let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let local = tcp.local_addr().unwrap();
         let listener = TlsListener::new(tcp, acceptor, Duration::from_secs(5));
@@ -152,7 +152,7 @@ mod tests {
         let cert = rcgen::generate_simple_self_signed(["localhost".to_string()]).unwrap();
         let cert_path = write_pem(dir.path(), "cert.pem", &cert.cert.pem());
         let key_path = write_pem(dir.path(), "key.pem", &cert.key_pair.serialize_pem());
-        let acceptor = build_acceptor(&cert_path, &key_path).unwrap();
+        let acceptor = build_acceptor(&cert_path, &key_path, &ClientAuthPolicy::Disabled).unwrap();
         let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let local = tcp.local_addr().unwrap();
         // Short timeout — keep the test fast.
