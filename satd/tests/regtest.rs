@@ -1268,15 +1268,18 @@ fn test_dumptxoutset_writes_core_format_snapshot() {
     // Bytes 43..51: coins_count = 10 LE.
     assert_eq!(&raw[43..51], &10u64.to_le_bytes());
 
-    // SHA-256 of the file matches the reported hash. This is the
-    // contract operators use to cross-check against Core's published
-    // `assumeutxo_hash` value.
-    use bitcoin::hashes::{Hash, HashEngine};
-    let mut engine = bitcoin::hashes::sha256::HashEngine::default();
-    engine.input(&raw);
-    let computed =
-        hex::encode(bitcoin::hashes::sha256::Hash::from_engine(engine).to_byte_array());
-    assert_eq!(computed, reported_hash);
+    // The reported `txoutset_hash` is HASH_SERIALIZED_3 — single SHA-256
+    // over Core's `TxOutSer` stream of the UTXO set — NOT the SHA-256
+    // of the snapshot file bytes. To independently verify, parse the
+    // file into (outpoint, coin) pairs and re-hash via TxOutSer; the
+    // result must match `txoutset_hash`. Lib-side `state.rs` has the
+    // detailed roundtrip test; here we just confirm the field is
+    // present, well-formed hex, and a stable 64-char string.
+    assert_eq!(reported_hash.len(), 64, "txoutset_hash must be 32-byte hex");
+    assert!(
+        reported_hash.chars().all(|c| c.is_ascii_hexdigit()),
+        "txoutset_hash must be hex: {reported_hash}"
+    );
 
     // Refuses overwrite on a second call.
     let response = node

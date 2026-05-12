@@ -729,7 +729,7 @@ pub fn dump_txout_set(chain_state: &ChainState, path: &str) -> Result<Value, (i3
             "base_hash": summary.base_hash.to_string(),
             "base_height": summary.base_height,
             "path": summary.path.to_string_lossy(),
-            "txoutset_hash": hex::encode(summary.txoutset_sha256),
+            "txoutset_hash": hex::encode(summary.hash_serialized_3),
         })),
         Err(DumpError::RefuseOverwrite(p)) => Err((
             -8,
