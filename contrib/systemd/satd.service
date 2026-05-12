@@ -84,7 +84,13 @@ TimeoutStopSec=10min
 KillSignal=SIGTERM
 SendSIGKILL=yes
 
-Restart=on-failure
+# `Restart=always` (vs. on-failure) is deliberate: the in-process stall
+# watchdog (node/src/stall_watchdog.rs) escalates via SIGTERM and the
+# graceful `--max-shutdown-secs` flush path, which exits 0. With
+# Restart=on-failure those watchdog-triggered shutdowns would NOT
+# auto-restart (see issue #178). Operator-driven `systemctl stop` still
+# stops the unit; only unsupervised exits get auto-restarted.
+Restart=always
 RestartSec=5s
 
 User=satd
