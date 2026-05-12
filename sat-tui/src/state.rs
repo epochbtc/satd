@@ -414,6 +414,30 @@ pub struct AppState {
     /// Rolling samples of `(t, current)` for rate estimation. Capped
     /// at ~30 entries (~45 s at the 1.5 s poll cadence).
     pub startup_samples: VecDeque<(std::time::Instant, u64)>,
+
+    /// Last RPC failure observed by the poller. `Some` from the first
+    /// failed batch until any RPC in a subsequent batch succeeds. The
+    /// failure modal reads this to surface hard errors (auth, connect)
+    /// prominently — without it the UI silently sits on "Connecting..."
+    /// forever.
+    pub last_failure: Option<RpcFailureRecord>,
+}
+
+/// Categorised RPC failure for modal display. Mirrors `rpc::RpcError`
+/// but lives in state so the UI layer doesn't import rpc types.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RpcFailure {
+    AuthFailed,
+    ConnectionFailed,
+    Timeout,
+    Other,
+}
+
+#[derive(Debug, Clone)]
+pub struct RpcFailureRecord {
+    pub kind: RpcFailure,
+    pub message: String,
+    pub first_seen: std::time::Instant,
 }
 
 /// Structured startup-progress response from `getstartupinfo`.
@@ -572,7 +596,33 @@ impl AppState {
             startup_phase_started_at: None,
             startup_phase: String::new(),
             startup_samples: VecDeque::with_capacity(32),
+            last_failure: None,
         }
+    }
+
+    /// Record an RPC failure observed by the poller. Re-recording the
+    /// same kind keeps the original `first_seen` so the failure modal
+    /// can display "failing for Ns".
+    pub fn record_failure(&mut self, kind: RpcFailure, message: String) {
+        match &mut self.last_failure {
+            Some(rec) if rec.kind == kind => {
+                rec.message = message;
+            }
+            _ => {
+                self.last_failure = Some(RpcFailureRecord {
+                    kind,
+                    message,
+                    first_seen: std::time::Instant::now(),
+                });
+            }
+        }
+    }
+
+    /// Clear any tracked failure — called from `mark_poll` when an RPC
+    /// succeeds, so the modal dismisses automatically the moment the
+    /// connection recovers.
+    pub fn clear_failure(&mut self) {
+        self.last_failure = None;
     }
 
     /// Push a fresh startup-progress sample. Resets the rolling window
@@ -1404,6 +1454,34 @@ mod tests {
         assert!(st.startup_started_at.is_none());
         assert!(st.startup_samples.is_empty());
         assert!(st.startup_phase.is_empty());
+    }
+
+    #[test]
+    fn record_failure_then_clear() {
+        let mut st = AppState::new();
+        assert!(st.last_failure.is_none());
+
+        st.record_failure(RpcFailure::AuthFailed, "401".into());
+        let rec = st.last_failure.as_ref().expect("recorded");
+        assert_eq!(rec.kind, RpcFailure::AuthFailed);
+        assert_eq!(rec.message, "401");
+        let first_seen = rec.first_seen;
+
+        // Re-recording the same kind preserves first_seen so the
+        // modal can show a stable "failing for Ns" duration.
+        st.record_failure(RpcFailure::AuthFailed, "still 401".into());
+        let rec = st.last_failure.as_ref().unwrap();
+        assert_eq!(rec.first_seen, first_seen);
+        assert_eq!(rec.message, "still 401");
+
+        // Recording a different kind resets first_seen.
+        st.record_failure(RpcFailure::ConnectionFailed, "econnrefused".into());
+        let rec = st.last_failure.as_ref().unwrap();
+        assert_eq!(rec.kind, RpcFailure::ConnectionFailed);
+        assert!(rec.first_seen >= first_seen);
+
+        st.clear_failure();
+        assert!(st.last_failure.is_none());
     }
 
     #[test]

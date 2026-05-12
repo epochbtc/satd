@@ -16,8 +16,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::time::{interval, Duration};
 
-use rpc::RpcClient;
-use state::{AppState, ViewMode};
+use rpc::{RpcClient, RpcError};
+use state::{AppState, RpcFailure, ViewMode};
 
 #[derive(Parser, Debug)]
 #[command(name = "sat-tui", version, about = "Terminal dashboard for satd")]
@@ -179,6 +179,10 @@ fn run_app(
                 // Respects per-id dismissal so acknowledged warnings don't
                 // block the view until they re-trigger.
                 ui::warnings::draw(f, &st);
+                // Failure modal sits on top of warnings — if we can't
+                // reach satd at all, surface that before anything from
+                // the (now-stale) node state.
+                ui::failure::draw(f, &st);
             })?;
         }
 
@@ -295,6 +299,19 @@ async fn poller(rpc: Arc<RpcClient>, state: Arc<Mutex<AppState>>) {
 
             let any_ok = chain_res.is_ok();
 
+            // Classify the failure mode BEFORE the per-result Ok-moves
+            // below — once we move the inner Values out, the original
+            // Results can't be borrowed again. Only used when `any_ok`
+            // is false, but computing unconditionally is cheap.
+            let batch_failure = classify_batch_error(&[
+                chain_res.as_ref().err(),
+                peers_res.as_ref().err(),
+                mempool_res.as_ref().err(),
+                conn_res.as_ref().err(),
+                sysinfo_res.as_ref().err(),
+                warnings_res.as_ref().err(),
+            ]);
+
             if let Ok(v) = chain_res {
                 st.update_chain_info(&v);
             }
@@ -320,9 +337,13 @@ async fn poller(rpc: Arc<RpcClient>, state: Arc<Mutex<AppState>>) {
             if any_ok {
                 st.mark_poll();
                 st.clear_startup();
+                st.clear_failure();
                 false
             } else {
                 st.connected = false;
+                if let Some((kind, msg)) = batch_failure {
+                    st.record_failure(kind, msg);
+                }
                 true
             }
         }; // st dropped here, before any .await
@@ -410,5 +431,59 @@ async fn poller(rpc: Arc<RpcClient>, state: Arc<Mutex<AppState>>) {
                 }
             }
         }
+    }
+}
+
+/// Pick the most informative error from a fast-poll batch. Auth/connect
+/// failures take priority — they're the actionable ones that should
+/// trigger the modal immediately. Timeouts and Rpc errors come behind.
+/// Returns `None` if no errors were passed in.
+fn classify_batch_error(errs: &[Option<&RpcError>]) -> Option<(RpcFailure, String)> {
+    let mut best: Option<(u8, RpcFailure, String)> = None;
+    for e in errs.iter().copied().flatten() {
+        let (prio, kind) = match e {
+            RpcError::AuthFailed => (3, RpcFailure::AuthFailed),
+            RpcError::ConnectionFailed => (2, RpcFailure::ConnectionFailed),
+            RpcError::Timeout => (1, RpcFailure::Timeout),
+            RpcError::Request(_) | RpcError::Rpc(_) => (0, RpcFailure::Other),
+        };
+        if best.as_ref().is_none_or(|(p, _, _)| prio > *p) {
+            best = Some((prio, kind, e.to_string()));
+        }
+    }
+    best.map(|(_, k, m)| (k, m))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_prefers_auth_over_connection_over_timeout() {
+        let conn = RpcError::ConnectionFailed;
+        let auth = RpcError::AuthFailed;
+        let timeout = RpcError::Timeout;
+        let other = RpcError::Rpc("boom".into());
+
+        // AuthFailed always wins.
+        let (k, _) = classify_batch_error(&[
+            Some(&conn),
+            Some(&timeout),
+            Some(&auth),
+            Some(&other),
+        ])
+        .unwrap();
+        assert_eq!(k, RpcFailure::AuthFailed);
+
+        // Without auth, ConnectionFailed wins over Timeout / Other.
+        let (k, _) = classify_batch_error(&[Some(&timeout), Some(&conn), Some(&other)]).unwrap();
+        assert_eq!(k, RpcFailure::ConnectionFailed);
+
+        // Without auth/connect, Timeout wins over Other.
+        let (k, _) = classify_batch_error(&[Some(&other), Some(&timeout)]).unwrap();
+        assert_eq!(k, RpcFailure::Timeout);
+
+        // All-None batch yields None.
+        assert!(classify_batch_error(&[None, None]).is_none());
     }
 }
