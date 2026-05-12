@@ -208,6 +208,13 @@ pub struct ChainState {
     /// only if the connect path stopped completing — independent of
     /// what state the rest of the runtime is in.
     connect_heartbeat: AtomicU64,
+    /// Fine-grained per-phase heartbeat for `connect_preprocessed_block`
+    /// and `connect::connect_block`. The single `connect_heartbeat`
+    /// counter tells the watchdog *that* the connector wedged; this
+    /// tracker tells it *where*. See `connect_phase.rs` for the phase
+    /// definitions. Arc'd so the watchdog (a separate `std::thread`)
+    /// can share it with the connector.
+    connect_phases: std::sync::Arc<crate::chain::connect_phase::ConnectPhaseTracker>,
 }
 
 impl ChainState {
@@ -289,6 +296,9 @@ impl ChainState {
                     mempool: std::sync::OnceLock::new(),
                     chain_event_tx: parking_lot::Mutex::new(None),
                     connect_heartbeat: AtomicU64::new(0),
+                    connect_phases: std::sync::Arc::new(
+                        crate::chain::connect_phase::ConnectPhaseTracker::new(),
+                    ),
                 });
             }
 
@@ -317,6 +327,7 @@ impl ChainState {
             address_index: &address_index,
             #[cfg(feature = "block-filter-index")]
             filter_index: &filter_index,
+            phase_tracker: None,
         })?;
         store.write_batch(batch)?;
 
@@ -343,6 +354,9 @@ impl ChainState {
             mempool: std::sync::OnceLock::new(),
             chain_event_tx: parking_lot::Mutex::new(None),
             connect_heartbeat: AtomicU64::new(0),
+            connect_phases: std::sync::Arc::new(
+                crate::chain::connect_phase::ConnectPhaseTracker::new(),
+            ),
         })
     }
 
@@ -483,6 +497,17 @@ impl ChainState {
     /// so the watchdog has a lock-free way to observe forward progress.
     pub fn bump_connect_heartbeat(&self) {
         self.connect_heartbeat.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Per-phase tracker for `connect_preprocessed_block`. The stall
+    /// watchdog reads from this to identify which phase the connector
+    /// wedged in (see `connect_phase.rs`). Returns an `Arc` clone so the
+    /// watchdog can hold a reference without the borrow checker
+    /// extending `ChainState`'s lifetime over the watchdog thread.
+    pub fn connect_phases(
+        &self,
+    ) -> std::sync::Arc<crate::chain::connect_phase::ConnectPhaseTracker> {
+        std::sync::Arc::clone(&self.connect_phases)
     }
 
     pub fn get_block_index(&self, hash: &BlockHash) -> Option<BlockIndexEntry> {
@@ -819,6 +844,10 @@ impl ChainState {
         &self,
         pre: crate::chain::prefetch::PreprocessedBlock,
     ) -> Result<BlockHash, ChainError> {
+        use crate::chain::connect_phase::ConnectPhase;
+        let phases = &*self.connect_phases;
+        phases.enter(ConnectPhase::EnterConnect);
+
         let trace_id = rand::random::<u32>();
         let _span = tracing::info_span!(
             "connect",
@@ -830,11 +859,13 @@ impl ChainState {
         // Verify parent is current tip (same check as connect_stored_block)
         let current_tip = self.tip_hash();
         if pre.entry.header.prev_blockhash != current_tip {
+            phases.enter(ConnectPhase::Idle);
             return Err(ChainError::BadPrevBlock);
         }
 
         // Block must be in DataStored state
         if pre.entry.status != BlockStatus::DataStored {
+            phases.enter(ConnectPhase::Idle);
             return Err(ChainError::Duplicate);
         }
 
@@ -875,12 +906,15 @@ impl ChainState {
             address_index: &self.address_index,
             #[cfg(feature = "block-filter-index")]
             filter_index: &self.filter_index,
+            phase_tracker: Some(phases),
         })?;
 
         // Atomic commit
+        phases.enter(ConnectPhase::WriteBatch);
         self.store.write_batch(batch)?;
 
         // Update in-memory tip
+        phases.enter(ConnectPhase::TipWrite);
         {
             let mut tip = self.tip.write();
             tip.hash = pre.hash;
@@ -890,6 +924,7 @@ impl ChainState {
         // Update MTP cache
         self.push_mtp_cache(pre.height, pre.entry.header.time);
 
+        phases.enter(ConnectPhase::Idle);
         Ok(pre.hash)
     }
 
@@ -1045,6 +1080,9 @@ impl ChainState {
             .store
             .get_block_index(hash)
             .ok_or(ChainError::BadPrevBlock)?;
+        use crate::chain::connect_phase::ConnectPhase;
+        let phases = &*self.connect_phases;
+        phases.enter(ConnectPhase::EnterConnect);
         let trace_id = rand::random::<u32>();
         let _span = tracing::info_span!(
             "connect_stored",
@@ -1055,12 +1093,14 @@ impl ChainState {
         .entered();
 
         if entry.status != BlockStatus::DataStored {
+            phases.enter(ConnectPhase::Idle);
             return Err(ChainError::Duplicate);
         }
 
         // Parent must be current tip (sequential connection)
         let current_tip = self.tip_hash();
         if entry.header.prev_blockhash != current_tip {
+            phases.enter(ConnectPhase::Idle);
             return Err(ChainError::BadPrevBlock);
         }
 
@@ -1100,12 +1140,15 @@ impl ChainState {
             address_index: &self.address_index,
             #[cfg(feature = "block-filter-index")]
             filter_index: &self.filter_index,
+            phase_tracker: Some(phases),
         })?;
 
         // Atomic commit
+        phases.enter(ConnectPhase::WriteBatch);
         self.store.write_batch(batch)?;
 
         // Update in-memory tip
+        phases.enter(ConnectPhase::TipWrite);
         {
             let mut tip = self.tip.write();
             tip.hash = *hash;
@@ -1115,6 +1158,7 @@ impl ChainState {
         // Update MTP cache with this block's timestamp
         self.push_mtp_cache(entry.height, entry.header.time);
 
+        phases.enter(ConnectPhase::Idle);
         Ok(*hash)
     }
 
@@ -1171,6 +1215,7 @@ impl ChainState {
             address_index: &self.address_index,
             #[cfg(feature = "block-filter-index")]
             filter_index: &self.filter_index,
+            phase_tracker: None,
             })?;
             self.store.write_batch(batch)?;
 
@@ -1333,6 +1378,7 @@ impl ChainState {
                 address_index: &self.address_index,
                 #[cfg(feature = "block-filter-index")]
                 filter_index: &self.filter_index,
+                phase_tracker: None,
             })?;
             self.store.write_batch(batch)?;
 
@@ -1613,6 +1659,7 @@ impl ChainState {
                         address_index: &self.address_index,
             #[cfg(feature = "block-filter-index")]
             filter_index: &self.filter_index,
+                        phase_tracker: None,
                     })?;
                     self.store.write_batch(batch)?;
                     {
@@ -1699,6 +1746,7 @@ impl ChainState {
             address_index: &self.address_index,
             #[cfg(feature = "block-filter-index")]
             filter_index: &self.filter_index,
+            phase_tracker: None,
         });
         let batch = match connect_attempt {
             Ok(b) => b,
@@ -1957,6 +2005,7 @@ impl ChainState {
                 address_index: &self.address_index,
             #[cfg(feature = "block-filter-index")]
             filter_index: &self.filter_index,
+            phase_tracker: None,
             })?;
             self.store.write_batch(batch)?;
             let mut tip = self.tip.write();

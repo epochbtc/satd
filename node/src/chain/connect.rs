@@ -159,6 +159,14 @@ pub struct ConnectParams<'a> {
     /// layer via `with_blockfilterindex_enabled`).
     #[cfg(feature = "block-filter-index")]
     pub filter_index: &'a crate::index::filter::FilterIndexConfig,
+    /// Per-phase heartbeat tracker. When `Some`, the connect path
+    /// stamps a new phase + wall-clock timestamp at each major
+    /// transition (pre-resolve, verify-dispatch, verify-join, etc.).
+    /// The stall watchdog reads from this to pinpoint where the
+    /// connector wedged when a stall is detected. `None` for callers
+    /// that don't need observability (tests, disconnect/reorg replay).
+    pub phase_tracker:
+        Option<&'a crate::chain::connect_phase::ConnectPhaseTracker>,
 }
 
 pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError> {
@@ -167,14 +175,14 @@ pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError>
         store, block, height, parent_chainwork, flat_pos,
         script_verifier, median_time_past, network,
         pre_verified_txs, num_threads, precomputed_txids,
-        address_index, filter_index,
+        address_index, filter_index, phase_tracker,
     } = params;
     #[cfg(not(feature = "block-filter-index"))]
     let ConnectParams {
         store, block, height, parent_chainwork, flat_pos,
         script_verifier, median_time_past, network,
         pre_verified_txs, num_threads, precomputed_txids,
-        address_index,
+        address_index, phase_tracker,
     } = params;
     let store: &dyn Store = *store;
     let script_verifier: &dyn ScriptVerifier = *script_verifier;
@@ -186,6 +194,15 @@ pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError>
     let filter_index: &crate::index::filter::FilterIndexConfig = filter_index;
     let num_threads = *num_threads;
     let flat_pos = *flat_pos;
+    let phase_tracker = *phase_tracker;
+    // Small closure to keep phase-entry call sites short. Each phase
+    // boundary is one line; absent-tracker (tests, reorg replay) is a
+    // single null-check, well below verification cost.
+    let mark = |p: crate::chain::connect_phase::ConnectPhase| {
+        if let Some(t) = phase_tracker {
+            t.enter(p);
+        }
+    };
     let block_hash = block.block_hash();
     let is_genesis = height == 0;
     let mut total_fees: u64 = 0;
@@ -251,6 +268,7 @@ pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError>
     // they warm the cache but each coin is still verified against the authoritative
     // store to prevent stale reads (e.g., if an earlier block spent the coin after
     // prefetch resolved it).
+    mark(crate::chain::connect_phase::ConnectPhase::PreResolveCoins);
     let pre_resolved: HashMap<(usize, usize), Coin> = if external_lookups.is_empty() {
         HashMap::new()
     } else {
@@ -268,6 +286,7 @@ pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError>
     };
 
     // Process each transaction: resolve UTXOs sequentially, defer script verification
+    mark(crate::chain::connect_phase::ConnectPhase::PerTxValidate);
     for (tx_idx, tx) in block.txdata.iter().enumerate() {
         let is_coinbase = tx.is_coinbase();
         let txid = txid_slice[tx_idx];
@@ -471,6 +490,7 @@ pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError>
     // All N threads run the primary (authoritative) engine.
     if !verify_queue.is_empty() {
         if verify_queue.len() <= 1 || num_threads <= 1 {
+            mark(crate::chain::connect_phase::ConnectPhase::VerifyJoin);
             for (tx, prev_outputs) in &verify_queue {
                 script_verifier
                     .verify_transaction(tx, prev_outputs, height)
@@ -480,6 +500,7 @@ pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError>
             let queue_ref = &verify_queue;
             let chunk_size = verify_queue.len().div_ceil(num_threads);
 
+            mark(crate::chain::connect_phase::ConnectPhase::VerifyDispatch);
             let errors: Vec<ConnectError> = std::thread::scope(|s| {
                 let handles: Vec<_> = queue_ref
                     .chunks(chunk_size)
@@ -498,6 +519,11 @@ pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError>
                     })
                     .collect();
 
+                // Joining the scope-spawned workers is the most common
+                // wedge site we've seen in practice (issue #178). Mark
+                // the phase transition before .join() so a stalled
+                // dump definitively pins the wedge to this step.
+                mark(crate::chain::connect_phase::ConnectPhase::VerifyJoin);
                 let mut all_errors = Vec::new();
                 for handle in handles {
                     all_errors.extend(handle.join().unwrap());
@@ -513,9 +539,11 @@ pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError>
     // Dispatch speculatively pre-verified txs to the shadow engine.
     // Primary verification was already done on the prefetch worker; the shadow
     // engine still needs to see every tx for mismatch detection.
+    mark(crate::chain::connect_phase::ConnectPhase::ShadowDispatch);
     for (tx, prev_outputs) in &shadow_queue {
         script_verifier.dispatch_shadow(tx, prev_outputs, height);
     }
+    mark(crate::chain::connect_phase::ConnectPhase::PostVerifyChecks);
 
     // Check coinbase value doesn't exceed subsidy + fees
     if !is_genesis && !block.txdata.is_empty() {
@@ -625,6 +653,7 @@ mod tests {
             address_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
+            phase_tracker: None,
         }).unwrap();
 
         // Genesis coinbase should NOT be in coin_puts
@@ -804,6 +833,7 @@ mod tests {
             address_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
+            phase_tracker: None,
         });
         assert!(result.is_ok());
     }
@@ -828,6 +858,7 @@ mod tests {
             address_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
+            phase_tracker: None,
         });
         assert!(matches!(result, Err(ConnectError::SequenceLockNotMet)));
     }
@@ -852,6 +883,7 @@ mod tests {
             address_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
+            phase_tracker: None,
         });
         assert!(result.is_ok());
     }
@@ -876,6 +908,7 @@ mod tests {
             address_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
+            phase_tracker: None,
         });
         assert!(result.is_ok());
     }
@@ -900,6 +933,7 @@ mod tests {
             address_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
+            phase_tracker: None,
         });
         assert!(result.is_ok());
     }
@@ -926,6 +960,7 @@ mod tests {
             address_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
+            phase_tracker: None,
         });
         assert!(result.is_ok());
     }
@@ -950,6 +985,7 @@ mod tests {
             address_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
+            phase_tracker: None,
         });
         assert!(matches!(result, Err(ConnectError::LocktimeNotFinal)));
     }
@@ -974,6 +1010,7 @@ mod tests {
             address_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
+            phase_tracker: None,
         });
         assert!(matches!(result, Err(ConnectError::LocktimeNotFinal)));
     }
@@ -998,6 +1035,7 @@ mod tests {
             address_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
+            phase_tracker: None,
         });
         assert!(result.is_ok());
     }
@@ -1029,6 +1067,7 @@ mod tests {
             address_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
+            phase_tracker: None,
         });
         assert!(matches!(result, Err(ConnectError::MissingOrSpentInput)));
     }
@@ -1053,6 +1092,7 @@ mod tests {
             address_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
+            phase_tracker: None,
         });
         assert!(matches!(result, Err(ConnectError::PrematureCoinbaseSpend)));
     }
@@ -1077,6 +1117,7 @@ mod tests {
             address_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
+            phase_tracker: None,
         });
         assert!(result.is_ok());
     }
@@ -1153,6 +1194,7 @@ mod tests {
             address_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
+            phase_tracker: None,
         });
         assert!(result.is_ok(), "BIP68 time lock should be met, got {:?}", result.err());
     }
@@ -1218,6 +1260,7 @@ mod tests {
             address_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
+            phase_tracker: None,
         });
         assert!(
             matches!(result, Err(ConnectError::SequenceLockNotMet)),
@@ -1295,6 +1338,7 @@ mod tests {
             address_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
+            phase_tracker: None,
         });
         assert!(
             matches!(result, Err(ConnectError::BadCoinbaseValue)),
@@ -1393,6 +1437,7 @@ mod tests {
             address_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
+            phase_tracker: None,
         });
         assert!(result.is_ok(), "Intra-block spending should succeed, got {:?}", result.err());
     }
@@ -1417,6 +1462,7 @@ mod tests {
             address_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
+            phase_tracker: None,
         });
         assert!(result.is_ok(), "BIP 34 correct height should pass, got {:?}", result.err());
     }
@@ -1489,6 +1535,7 @@ mod tests {
             address_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
+            phase_tracker: None,
         });
         assert!(
             matches!(result, Err(ConnectError::BadCoinbaseHeight)),
@@ -1565,6 +1612,7 @@ mod tests {
             address_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
+            phase_tracker: None,
         });
         assert!(
             matches!(result, Err(ConnectError::BadAmounts)),
@@ -1593,6 +1641,7 @@ mod tests {
             address_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
+            phase_tracker: None,
         })
         .unwrap();
 
@@ -1711,6 +1760,7 @@ mod tests {
             address_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
+            phase_tracker: None,
         });
         assert!(
             result.is_ok(),
@@ -1753,6 +1803,7 @@ mod tests {
             address_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
+            phase_tracker: None,
         });
         assert!(
             result.is_ok(),
@@ -1790,6 +1841,7 @@ mod tests {
             address_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
+            phase_tracker: None,
         });
         assert!(
             result.is_ok(),
@@ -1859,6 +1911,7 @@ mod tests {
             address_index: &cfg,
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
+            phase_tracker: None,
         })
         .unwrap();
 
@@ -1896,6 +1949,7 @@ mod tests {
             address_index: &cfg,
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
+            phase_tracker: None,
         })
         .unwrap();
 
@@ -1937,6 +1991,7 @@ mod tests {
             address_index: &disabled,
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
+            phase_tracker: None,
         })
         .unwrap();
 
@@ -1970,6 +2025,7 @@ mod tests {
             address_index: &cfg,
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
+            phase_tracker: None,
         })
         .unwrap();
 
@@ -2007,6 +2063,7 @@ mod tests {
             precomputed_txids: None,
             address_index: &cfg,
             filter_index: &fcfg,
+            phase_tracker: None,
         })
         .unwrap();
 
@@ -2039,6 +2096,7 @@ mod tests {
             precomputed_txids: None,
             address_index: &cfg,
             filter_index: &fcfg,
+            phase_tracker: None,
         })
         .unwrap();
 
@@ -2075,6 +2133,7 @@ mod tests {
             precomputed_txids: None,
             address_index: &cfg,
             filter_index: &fcfg,
+            phase_tracker: None,
         })
         .unwrap();
 
