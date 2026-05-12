@@ -1761,6 +1761,40 @@ impl Store for RocksDbStore {
             .collect()
     }
 
+    fn for_each_coin_snapshot(
+        &self,
+        f: &mut dyn FnMut(&OutPoint, &Coin) -> Result<(), StoreError>,
+    ) -> Result<u64, StoreError> {
+        // Acquire a RocksDB snapshot — point-in-time view that isolates
+        // the iteration from concurrent writes. The snapshot is dropped
+        // at the end of this function; the iterator stays valid for as
+        // long as `snap` lives.
+        let snap = self.db.snapshot();
+        let cf = self.cf(CF_COINS);
+        let mut written = 0u64;
+        for kv in snap.iterator_cf(&cf, IteratorMode::Start) {
+            let (key, value) = kv.map_err(|e| StoreError::Database(e.to_string()))?;
+            if key.len() != 36 {
+                return Err(StoreError::Database(format!(
+                    "unexpected coin key length: {}",
+                    key.len()
+                )));
+            }
+            let mut key_arr = [0u8; 36];
+            key_arr.copy_from_slice(&key);
+            let outpoint = crate::storage::coinview::key_to_outpoint(&key_arr);
+            let coin = Coin::deserialize_compact(&value).ok_or_else(|| {
+                StoreError::Serialization(format!(
+                    "corrupt coin record at {}:{}",
+                    outpoint.txid, outpoint.vout
+                ))
+            })?;
+            f(&outpoint, &coin)?;
+            written += 1;
+        }
+        Ok(written)
+    }
+
     fn iter_addr_funding(
         &self,
         sh: &crate::index::address::Scripthash,

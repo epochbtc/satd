@@ -1,7 +1,10 @@
 use bitcoin::consensus::serialize;
+use bitcoin::hashes::Hash;
 use bitcoin::{Block, BlockHash, Network, OutPoint};
-use std::path::PathBuf;
 use parking_lot::{Mutex, RwLock};
+use std::fs::File;
+use std::io::{self, BufWriter, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -567,6 +570,105 @@ impl ChainState {
     ) -> Result<crate::storage::blockfile_audit::BlockfileAuditReport, crate::storage::blockfile_audit::AuditError>
     {
         crate::storage::blockfile_audit::audit_blockfiles(&*self.store, &self.blocks_dir)
+    }
+
+    /// Emit a Bitcoin Core-format UTXO snapshot file at `path` from the
+    /// current tip. The output is byte-compatible with `bitcoin-cli
+    /// dumptxoutset` and can be loaded into either Core or satd via
+    /// `loadtxoutset` (once that RPC lands in PR 5/5).
+    ///
+    /// Holds the tip read lock for the duration of the dump so the
+    /// snapshot is consistent (no block-connect can occur). Operators
+    /// should expect block processing to pause for the duration —
+    /// matching Core's behavior.
+    ///
+    /// Refuses to overwrite an existing file at `path` (matching Core).
+    pub fn dump_utxo_snapshot(&self, path: &Path) -> Result<DumpSummary, DumpError> {
+        if path.exists() {
+            return Err(DumpError::RefuseOverwrite(path.to_path_buf()));
+        }
+
+        // Hold the tip read lock for the entire dump: writers block on
+        // the corresponding write lock, so the UTXO set is frozen.
+        let tip_guard = self.tip.read();
+        let base_hash = tip_guard.hash;
+        let base_height = tip_guard.height;
+
+        // Land every dirty coin in the cache into the underlying Store
+        // before we iterate. The Store's snapshot only sees committed
+        // writes; without this, the dump would miss in-flight changes.
+        self.flush_coin_cache().map_err(DumpError::Store)?;
+
+        let coins_count = self.store.coin_count();
+        let meta = crate::storage::compressed_coin::SnapshotMetadata {
+            version: crate::storage::compressed_coin::SNAPSHOT_VERSION,
+            network_magic: network_magic(self.network),
+            base_blockhash: base_hash,
+            coins_count,
+        };
+
+        // Tee the byte stream so we hash exactly what hits disk.
+        let file = File::create(path).map_err(DumpError::Io)?;
+        let writer = BufWriter::new(file);
+        let mut hasher = bitcoin::hashes::sha256::HashEngine::default();
+        let mut tee = TeeWriter::new(writer, &mut hasher);
+        meta.serialize(&mut tee).map_err(DumpError::Io)?;
+
+        // Stream coins. The closure can fail with either an I/O error
+        // (writing to disk) or a codec error (none expected from valid
+        // Coin values). Funnel both into a single `out_err` cell so we
+        // can return cleanly without panicking inside the iteration.
+        let mut record_buf: Vec<u8> = Vec::with_capacity(64);
+        let mut out_err: Option<DumpError> = None;
+        let written = self
+            .store
+            .for_each_coin_snapshot(&mut |op, coin| {
+                if out_err.is_some() {
+                    return Ok(());
+                }
+                record_buf.clear();
+                if let Err(e) =
+                    crate::storage::compressed_coin::write_outpoint(&mut record_buf, op)
+                {
+                    out_err = Some(DumpError::Io(e));
+                    return Ok(());
+                }
+                if let Err(e) =
+                    crate::storage::compressed_coin::serialize_coin(&mut record_buf, coin)
+                {
+                    out_err = Some(DumpError::Io(e));
+                    return Ok(());
+                }
+                if let Err(e) = tee.write_all(&record_buf) {
+                    out_err = Some(DumpError::Io(e));
+                    return Ok(());
+                }
+                Ok(())
+            })
+            .map_err(DumpError::Store)?;
+
+        if let Some(e) = out_err {
+            return Err(e);
+        }
+
+        tee.flush().map_err(DumpError::Io)?;
+        let txoutset_sha256 = bitcoin::hashes::sha256::Hash::from_engine(hasher);
+        drop(tip_guard);
+
+        if written != coins_count {
+            return Err(DumpError::CountMismatch {
+                expected: coins_count,
+                actual: written,
+            });
+        }
+
+        Ok(DumpSummary {
+            coins_written: written,
+            base_hash,
+            base_height,
+            path: path.to_path_buf(),
+            txoutset_sha256: txoutset_sha256.to_byte_array(),
+        })
     }
 
     /// Read the lock-free connect-heartbeat counter. Bumped on every
@@ -2666,6 +2768,58 @@ fn compare_u256(a: &[u8; 32], b: &[u8; 32]) -> i32 {
 }
 
 /// Get the network magic bytes for flat file headers.
+/// Summary returned by [`ChainState::dump_utxo_snapshot`].
+#[derive(Debug, Clone)]
+pub struct DumpSummary {
+    pub coins_written: u64,
+    pub base_hash: BlockHash,
+    pub base_height: u32,
+    pub path: PathBuf,
+    /// SHA-256 of the snapshot file contents. Operators compare this
+    /// against Core's published value to confirm format compatibility.
+    pub txoutset_sha256: [u8; 32],
+}
+
+/// Errors raised by [`ChainState::dump_utxo_snapshot`].
+#[derive(Debug, thiserror::Error)]
+pub enum DumpError {
+    #[error("io error: {0}")]
+    Io(#[from] io::Error),
+    #[error("storage error: {0}")]
+    Store(#[from] StoreError),
+    #[error("refusing to overwrite existing file: {0}")]
+    RefuseOverwrite(PathBuf),
+    #[error("coin count mismatch (expected {expected}, wrote {actual})")]
+    CountMismatch { expected: u64, actual: u64 },
+}
+
+/// Adapter that writes to an inner sink and concurrently feeds every byte
+/// into a hash engine. The hash matches the on-disk contents exactly,
+/// which is the property operators rely on for cross-validation against
+/// Bitcoin Core's published snapshot hash.
+struct TeeWriter<'a, W: Write> {
+    inner: W,
+    hasher: &'a mut bitcoin::hashes::sha256::HashEngine,
+}
+
+impl<'a, W: Write> TeeWriter<'a, W> {
+    fn new(inner: W, hasher: &'a mut bitcoin::hashes::sha256::HashEngine) -> Self {
+        Self { inner, hasher }
+    }
+}
+
+impl<W: Write> Write for TeeWriter<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        bitcoin::hashes::HashEngine::input(self.hasher, &buf[..n]);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 fn network_magic(network: Network) -> [u8; 4] {
     match network {
         Network::Bitcoin => [0xf9, 0xbe, 0xb4, 0xd9],
@@ -4122,6 +4276,114 @@ pub(crate) mod tests {
 
         // Tip should still be at height 1
         assert_eq!(cs.tip_height(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dump_utxo_snapshot_roundtrip_via_codec() {
+        use crate::storage::compressed_coin::{
+            deserialize_coin, read_outpoint, SnapshotMetadata, SNAPSHOT_MAGIC_BYTES,
+            SNAPSHOT_VERSION,
+        };
+        use std::io::BufReader;
+
+        let (cs, dir) = make_chain_state();
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+
+        // Five blocks → five coinbase UTXOs.
+        let mut parent = genesis_hash;
+        for i in 1..=5u32 {
+            let block = build_test_block(parent, i, 1_300_000_000 + i);
+            parent = cs.accept_block(&block).expect("accept_block");
+        }
+        assert_eq!(cs.tip_height(), 5);
+
+        let snapshot_path = dir.join("dump.snapshot");
+        let summary = cs
+            .dump_utxo_snapshot(&snapshot_path)
+            .expect("dump_utxo_snapshot");
+        assert_eq!(summary.coins_written, 5);
+        assert_eq!(summary.base_height, 5);
+        assert_eq!(summary.base_hash, cs.tip_hash());
+        assert_eq!(summary.path, snapshot_path);
+
+        // Parse the file back via the PR-1 codec. Header layout, coin
+        // count, and per-record decode must all succeed cleanly to EOF.
+        let file = File::open(&snapshot_path).expect("open snapshot");
+        let on_disk_len = file.metadata().unwrap().len();
+        let mut reader = BufReader::new(file);
+        let meta = SnapshotMetadata::deserialize(&mut reader).expect("parse header");
+        assert_eq!(meta.version, SNAPSHOT_VERSION);
+        assert_eq!(meta.network_magic, [0xfa, 0xbf, 0xb5, 0xda]); // regtest
+        assert_eq!(meta.base_blockhash, cs.tip_hash());
+        assert_eq!(meta.coins_count, 5);
+
+        let mut decoded = 0u64;
+        while decoded < meta.coins_count {
+            let _op = read_outpoint(&mut reader).expect("decode outpoint");
+            let _coin = deserialize_coin(&mut reader).expect("decode coin");
+            decoded += 1;
+        }
+        assert_eq!(decoded, 5);
+
+        // EOF
+        let mut tail = [0u8; 1];
+        assert_eq!(
+            std::io::Read::read(&mut reader, &mut tail).unwrap(),
+            0,
+            "snapshot has trailing bytes"
+        );
+
+        // Verify the reported sha256 matches an independent re-hash of
+        // the on-disk file — this is the operator's cross-validation
+        // contract against Core's published `assumeutxo_hash`.
+        let raw = std::fs::read(&snapshot_path).unwrap();
+        assert_eq!(raw.len() as u64, on_disk_len);
+        let mut engine = bitcoin::hashes::sha256::HashEngine::default();
+        bitcoin::hashes::HashEngine::input(&mut engine, &raw);
+        let expected =
+            bitcoin::hashes::sha256::Hash::from_engine(engine).to_byte_array();
+        assert_eq!(summary.txoutset_sha256, expected);
+
+        // First 5 bytes are the snapshot magic.
+        assert_eq!(&raw[..5], &SNAPSHOT_MAGIC_BYTES);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dump_utxo_snapshot_refuses_overwrite() {
+        let (cs, dir) = make_chain_state();
+        let path = dir.join("preexisting.dat");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, b"do not clobber me").unwrap();
+
+        let err = cs
+            .dump_utxo_snapshot(&path)
+            .expect_err("should refuse overwrite");
+        assert!(matches!(err, DumpError::RefuseOverwrite(_)));
+
+        // File contents must be unchanged.
+        let contents = std::fs::read(&path).unwrap();
+        assert_eq!(contents, b"do not clobber me");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dump_utxo_snapshot_empty_utxo_set() {
+        let (cs, dir) = make_chain_state();
+        // Genesis only — its coinbase is unspendable so coin_count() is 0.
+        assert_eq!(cs.coin_count(), 0);
+
+        let path = dir.join("empty.dat");
+        let summary = cs.dump_utxo_snapshot(&path).expect("dump empty");
+        assert_eq!(summary.coins_written, 0);
+
+        // File should be exactly 51 bytes (just the header).
+        let len = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(len, 51);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
