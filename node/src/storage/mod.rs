@@ -1,6 +1,7 @@
 pub mod blockindex;
 pub mod coin_cache;
 pub mod coinview;
+pub mod compressed_coin;
 pub mod db;
 pub mod flatfile;
 pub mod rocksdb_store;
