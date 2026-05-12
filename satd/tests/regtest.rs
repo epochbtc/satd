@@ -1101,6 +1101,80 @@ fn test_savemempool() {
 }
 
 #[test]
+fn test_dumptxoutset_writes_core_format_snapshot() {
+    let mut node = TestNode::start(&[]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+
+    // Mine 10 blocks → 10 spendable coinbase UTXOs.
+    node.rpc_call_with_params(
+        "generatetoaddress",
+        vec![serde_json::json!(10), serde_json::json!(addr)],
+    )
+    .unwrap();
+
+    let dump_path = std::env::temp_dir().join(format!(
+        "satd-dumptxoutset-{}-{}.dat",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos()
+    ));
+    let _ = std::fs::remove_file(&dump_path);
+
+    let response = node
+        .rpc_call_with_params(
+            "dumptxoutset",
+            vec![serde_json::json!(dump_path.to_string_lossy())],
+        )
+        .unwrap();
+    let result = &response["result"];
+    assert!(result.is_object(), "result should be an object: {response}");
+    assert_eq!(result["coins_written"].as_u64().unwrap(), 10);
+    assert_eq!(result["base_height"].as_u64().unwrap(), 10);
+    assert!(result["base_hash"].as_str().unwrap().len() == 64);
+    assert!(result["path"].as_str().unwrap().contains("satd-dumptxoutset-"));
+    let reported_hash = result["txoutset_hash"].as_str().unwrap().to_string();
+    assert_eq!(reported_hash.len(), 64);
+
+    // File exists on disk.
+    let raw = std::fs::read(&dump_path).expect("read snapshot file");
+    assert!(raw.len() > 51, "snapshot smaller than header: {} bytes", raw.len());
+
+    // First 5 bytes: snapshot magic "utxo\xff".
+    assert_eq!(&raw[..5], &[b'u', b't', b'x', b'o', 0xff]);
+    // Bytes 5..7: version 2 LE.
+    assert_eq!(&raw[5..7], &[0x02, 0x00]);
+    // Bytes 7..11: regtest network magic.
+    assert_eq!(&raw[7..11], &[0xfa, 0xbf, 0xb5, 0xda]);
+    // Bytes 43..51: coins_count = 10 LE.
+    assert_eq!(&raw[43..51], &10u64.to_le_bytes());
+
+    // SHA-256 of the file matches the reported hash. This is the
+    // contract operators use to cross-check against Core's published
+    // `assumeutxo_hash` value.
+    use bitcoin::hashes::{Hash, HashEngine};
+    let mut engine = bitcoin::hashes::sha256::HashEngine::default();
+    engine.input(&raw);
+    let computed =
+        hex::encode(bitcoin::hashes::sha256::Hash::from_engine(engine).to_byte_array());
+    assert_eq!(computed, reported_hash);
+
+    // Refuses overwrite on a second call.
+    let response = node
+        .rpc_call_with_params(
+            "dumptxoutset",
+            vec![serde_json::json!(dump_path.to_string_lossy())],
+        )
+        .unwrap();
+    assert!(response["error"].is_object(), "expected error: {response}");
+    assert_eq!(response["error"]["code"], -8);
+
+    let _ = std::fs::remove_file(&dump_path);
+    node.stop();
+}
+
+#[test]
 fn test_setnetworkactive() {
     let mut node = TestNode::start(&[]);
     let response = node

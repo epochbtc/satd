@@ -577,6 +577,16 @@ impl Store for CoinCache {
         (base + delta).max(0) as u64
     }
 
+    fn for_each_coin_snapshot(
+        &self,
+        f: &mut dyn FnMut(&OutPoint, &Coin) -> Result<(), StoreError>,
+    ) -> Result<u64, StoreError> {
+        // Pure delegation: the caller is required to flush dirty entries
+        // before invoking this (see ChainState::dump_utxo_snapshot), so
+        // the inner Store's snapshot already contains every coin.
+        self.inner.for_each_coin_snapshot(f)
+    }
+
     fn coin_total_amount(&self) -> u64 {
         let base = self.inner.coin_total_amount() as i64;
         let delta = self.amount_delta.load(Ordering::Relaxed);

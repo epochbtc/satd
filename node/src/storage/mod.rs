@@ -308,6 +308,24 @@ pub trait Store: Send + Sync {
         outpoints.iter().map(|op| self.get_coin(op)).collect()
     }
 
+    /// Stream every `(OutPoint, Coin)` pair in the UTXO set, in
+    /// `(txid_bytes, vout_le_bytes)` ascending key order, through the
+    /// callback `f`. Returns the total number of coins iterated.
+    ///
+    /// Backends that can take a point-in-time view (e.g. RocksDB
+    /// `Snapshot`) MUST use one so the iteration is isolated from
+    /// concurrent writes. Callers are responsible for flushing any
+    /// in-memory caches (e.g. `CoinCache::flush`) before calling, so
+    /// that pending writes are visible to the snapshot.
+    ///
+    /// Used by `dumptxoutset` to emit AssumeUTXO snapshot files. The
+    /// closure receives borrowed references so backends don't have to
+    /// heap-allocate per coin.
+    fn for_each_coin_snapshot(
+        &self,
+        f: &mut dyn FnMut(&OutPoint, &Coin) -> Result<(), StoreError>,
+    ) -> Result<u64, StoreError>;
+
     /// Live-resize the block cache (e.g. RocksDB's shared LRU). Called by
     /// the adaptive-dbcache controller. Default: no-op for backends without
     /// a resizable cache.
