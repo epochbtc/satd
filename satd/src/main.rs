@@ -657,6 +657,7 @@ async fn main() {
         shutdown_rx.clone(),
         config.prune,
         config.maxconnections,
+        config.maxinboundperip,
         config.bantime,
         config.proxy.clone(),
         config.onion.clone(),
