@@ -84,6 +84,73 @@ fn test_stop_rpc() {
 }
 
 #[test]
+fn test_stopatheight_exits_after_target_block() {
+    // Start satd with --stopatheight=5. Mining 5 blocks should
+    // trigger a BlockConnected event whose height matches the
+    // target, causing the watcher task to broadcast shutdown.
+    let mut node = TestNode::start(&["--stopatheight=5"]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+
+    // Mine 5 blocks.
+    let response = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(5), serde_json::json!(addr)],
+        )
+        .unwrap();
+    assert_eq!(
+        response["result"].as_array().unwrap().len(),
+        5,
+        "should mine all 5 blocks"
+    );
+
+    // Within ~6s, the watcher should observe the height-5 BlockConnected,
+    // broadcast shutdown, and the daemon should exit cleanly.
+    let mut attempts = 0;
+    let exit_status = loop {
+        match node.process.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                attempts += 1;
+                if attempts > 60 {
+                    let _ = node.process.kill();
+                    panic!("satd did not exit within 6s after reaching stopatheight=5");
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => panic!("Error waiting for satd: {e}"),
+        }
+    };
+    assert!(
+        exit_status.success(),
+        "satd should exit cleanly after stopatheight, got {exit_status:?}"
+    );
+}
+
+#[test]
+fn test_stopatheight_zero_disabled() {
+    // No --stopatheight flag → daemon does not self-shutdown after
+    // mining blocks. Sanity check that the watcher only spawns when
+    // configured.
+    let mut node = TestNode::start(&[]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    node.rpc_call_with_params(
+        "generatetoaddress",
+        vec![serde_json::json!(3), serde_json::json!(addr)],
+    )
+    .unwrap();
+
+    // Briefly poll: process must STILL be running.
+    std::thread::sleep(Duration::from_millis(500));
+    match node.process.try_wait() {
+        Ok(None) => {} // expected: still running
+        Ok(Some(status)) => panic!("satd exited unexpectedly: {status:?}"),
+        Err(e) => panic!("try_wait error: {e}"),
+    }
+    node.stop();
+}
+
+#[test]
 fn test_sat_cli_integration() {
     let mut node = TestNode::start(&[]);
 

@@ -440,6 +440,62 @@ async fn main() {
     );
     let addr_notifier_chain_event_rx = chain_event_tx.subscribe();
     let events_bus_chain_rx = chain_event_tx.subscribe();
+
+    // -stopatheight watcher: subscribe to chain events and broadcast
+    // graceful shutdown when the active-chain tip first reaches the
+    // configured height. Matches Bitcoin Core's `-stopatheight`. Uses
+    // the chain-event channel rather than polling so the latency
+    // between block-connected and shutdown is bounded by the broadcast
+    // delivery (microseconds) rather than a polling interval — without
+    // this guarantee, fast IBD could advance the tip several blocks
+    // past the target before we noticed.
+    if let Some(target_height) = config.stopatheight {
+        let mut rx = chain_event_tx.subscribe();
+        let stop_tx = shutdown_tx.clone();
+        let chain_state_for_stop = std::sync::Arc::clone(&chain_state);
+        tracing::info!(
+            target = target_height,
+            "-stopatheight configured; will shut down when tip reaches this height"
+        );
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(node::chain::events::ChainEvent::BlockConnected {
+                        height,
+                        ..
+                    }) => {
+                        if height >= target_height {
+                            tracing::info!(
+                                target = target_height,
+                                tip = height,
+                                "-stopatheight reached; broadcasting shutdown"
+                            );
+                            let _ = stop_tx.send(true);
+                            return;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        // We don't lose correctness — every chain event
+                        // is also reflected in the tip atomic. On lag,
+                        // re-check the current tip explicitly so we
+                        // don't miss the boundary.
+                        if chain_state_for_stop.tip_height() >= target_height {
+                            tracing::info!(
+                                target = target_height,
+                                tip = chain_state_for_stop.tip_height(),
+                                "-stopatheight reached after lag-recovery; broadcasting shutdown"
+                            );
+                            let _ = stop_tx.send(true);
+                            return;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                }
+            }
+        });
+    }
+
     chain_state.set_chain_event_sender(chain_event_tx);
 
     // Stand up the pluggable transport bus.
