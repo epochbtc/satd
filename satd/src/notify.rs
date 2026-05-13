@@ -175,6 +175,7 @@ mod tests {
             message: "Opening database...".to_string(),
             current: 0,
             total: 0,
+            stop_height: None,
         };
         assert_eq!(format_status(&snap), "Opening database...");
     }
@@ -186,6 +187,7 @@ mod tests {
             message: "Replaying blocks".to_string(),
             current: 250_000,
             total: 800_000,
+            stop_height: None,
         };
         assert_eq!(
             format_status(&snap),
@@ -200,6 +202,7 @@ mod tests {
             message: "Replaying blocks".to_string(),
             current: 100,
             total: 100,
+            stop_height: None,
         };
         assert_eq!(format_status(&snap), "Replaying blocks (100/100, 100%)");
     }

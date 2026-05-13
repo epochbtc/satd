@@ -1120,7 +1120,22 @@ impl ChainState {
 
     /// Rebuild the UTXO set by replaying all blocks from flat files.
     /// Block index and flat files must be intact. Used by `-reindex-chainstate`.
-    pub fn reindex_chainstate(&self) -> Result<(), ChainError> {
+    ///
+    /// `stop_at` matches the `-stopatheight` flag: when set, replay halts
+    /// cleanly after connecting that height (subsequent heights in the
+    /// block index are left for a future run). This is the load-bearing
+    /// `-stopatheight` check for reindex — the chain-event watcher used
+    /// by the normal IBD path is not yet wired at reindex time, so it
+    /// cannot stop reindex on its own.
+    ///
+    /// `progress` (if provided) receives total / current / stop_height
+    /// updates so the startup RPC can render a gauge that distinguishes
+    /// the file tip (total) from the configured stop target.
+    pub fn reindex_chainstate(
+        &self,
+        stop_at: Option<u32>,
+        progress: Option<Arc<crate::startup_progress::StartupProgress>>,
+    ) -> Result<(), ChainError> {
         // Periodic flush cadence for the durable checkpoint. The
         // dirty-cache threshold (see `flush_threshold`) already triggers
         // in-cache flushes when memory pressure requires — but reindex
@@ -1129,6 +1144,12 @@ impl ChainState {
         // the in-memory dirty set until the whole reindex completed.
         // 1000 blocks mirrors the production IBD connect loop's cadence.
         const DURABLE_FLUSH_EVERY: u32 = 1000;
+
+        if let Some(p) = &progress {
+            let total = self.max_indexed_height();
+            p.set_total(total as u64);
+            p.set_stop_height(stop_at.map(|h| h as u64));
+        }
 
         let mut height = 1; // genesis already connected by ChainState::new()
         while let Some(hash) = self.store.get_block_hash_by_height(height) {
@@ -1180,6 +1201,16 @@ impl ChainState {
                 tip.height = height;
             }
 
+            // Emit a chain event so subscribers (events bus, future
+            // observers) see reindex progress just as they would IBD.
+            // No-op when the broadcaster isn't wired yet (the case
+            // during normal `-reindex-chainstate` startup); kept here so
+            // moving the wiring earlier needs no further change.
+            self.emit_chain_event(crate::chain::events::ChainEvent::BlockConnected {
+                hash,
+                height,
+            });
+
             // Bound memory: drain the in-memory dirty set to RocksDB
             // whenever it crosses the configured threshold. Without
             // this a full-chain reindex accumulated 122 GiB RSS at
@@ -1195,16 +1226,77 @@ impl ChainState {
                 self.store.flush_durable()?;
             }
 
+            if let Some(p) = &progress
+                && height.is_multiple_of(100)
+            {
+                p.set_current(height as u64);
+            }
+
             if height.is_multiple_of(10_000) {
                 tracing::info!(height, "Reindexing chainstate...");
             }
+
+            // Honor `-stopatheight`: exit after the targeted height is
+            // durable. Subsequent heights, if present in the block index,
+            // are left for a follow-up run (no chainstate rollback).
+            if let Some(target) = stop_at
+                && height >= target
+            {
+                if let Some(p) = &progress {
+                    p.set_current(height as u64);
+                }
+                tracing::info!(
+                    height,
+                    target,
+                    "Reached -stopatheight during chainstate reindex; exiting"
+                );
+                self.store.flush()?;
+                self.store.flush_durable()?;
+                return Ok(());
+            }
+
             height += 1;
         }
         // Final flush so the reindexed tip is durable before we return.
         self.store.flush()?;
         self.store.flush_durable()?;
+        if let Some(p) = &progress {
+            p.set_current((height - 1) as u64);
+        }
         tracing::info!(height = height - 1, "Chainstate reindex complete");
         Ok(())
+    }
+
+    /// Highest height present in the height→hash index. Used by reindex
+    /// progress reporting to show the on-disk file tip when it differs
+    /// from a configured `-stopatheight` target.
+    ///
+    /// Doubling probe (1, 2, 4, …) to find an absent height, then binary
+    /// search between the last-present and first-absent height. ~40
+    /// `get_block_hash_by_height` lookups at mainnet sizes — negligible
+    /// vs. the reindex itself, and avoids widening the `Store` trait.
+    fn max_indexed_height(&self) -> u32 {
+        if self.store.get_block_hash_by_height(1).is_none() {
+            return 0;
+        }
+        let mut lo: u32 = 1;
+        let mut hi: u32 = 2;
+        while self.store.get_block_hash_by_height(hi).is_some() {
+            lo = hi;
+            hi = match hi.checked_mul(2) {
+                Some(v) => v,
+                None => return u32::MAX,
+            };
+        }
+        while lo + 1 < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.store.get_block_hash_by_height(mid).is_some() {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
     }
 
     /// Rebuild the block index and UTXO set by streaming `blk*.dat` files.
@@ -1223,8 +1315,15 @@ impl ChainState {
     ///
     /// `progress` (if provided) is updated with the per-phase counters so
     /// the startup RPC can render `current/total` to operators.
+    ///
+    /// `stop_at` matches the `-stopatheight` flag: when set, the
+    /// connect phase exits cleanly after the targeted height is
+    /// durable. Headers past the target are still scanned in phase 1
+    /// (the BFS needs the full parent→children map to build chain
+    /// order correctly), but no further blocks are connected.
     pub fn reindex_from_flat_files(
         &self,
+        stop_at: Option<u32>,
         progress: Option<Arc<crate::startup_progress::StartupProgress>>,
     ) -> Result<(), ChainError> {
         use std::collections::{HashMap, VecDeque};
@@ -1284,6 +1383,7 @@ impl ChainState {
         if let Some(p) = &progress {
             p.set_phase("reindex_connect", "Replaying blocks (phase 2/2)");
             p.set_total(total);
+            p.set_stop_height(stop_at.map(|h| h as u64));
         }
         let genesis_hash = bitcoin::constants::genesis_block(self.network).block_hash();
         let mut queue: VecDeque<BlockHash> = VecDeque::new();
@@ -1342,6 +1442,14 @@ impl ChainState {
                 tip.height = height;
             }
 
+            // See note in `reindex_chainstate`: emit even though the
+            // broadcaster is typically unset at reindex time, so that
+            // moving the wiring earlier needs no further change.
+            self.emit_chain_event(crate::chain::events::ChainEvent::BlockConnected {
+                hash,
+                height,
+            });
+
             // Same memory + durability discipline as `reindex_chainstate`.
             if self.store.dirty_count() > self.store.flush_threshold() {
                 self.store.flush()?;
@@ -1359,6 +1467,28 @@ impl ChainState {
             }
             if connected.is_multiple_of(10_000) {
                 tracing::info!(connected, height, "Reindexing from flat files...");
+            }
+
+            // Honor `-stopatheight`: exit the replay phase after the
+            // targeted height is durable. Same semantics as
+            // `reindex_chainstate` — no rollback for already-connected
+            // heights, and remaining headers stay queued for a later
+            // run (the connector just stops draining the BFS queue).
+            if let Some(target) = stop_at
+                && height >= target
+            {
+                if let Some(p) = &progress {
+                    p.set_current(connected as u64);
+                }
+                tracing::info!(
+                    connected,
+                    height,
+                    target,
+                    "Reached -stopatheight during flat-file reindex; exiting"
+                );
+                self.store.flush()?;
+                self.store.flush_durable()?;
+                return Ok(());
             }
 
             if let Some(child_hashes) = children.get(&hash) {
@@ -3659,7 +3789,7 @@ pub(crate) mod tests {
             .flush_count
             .load(std::sync::atomic::Ordering::Relaxed);
 
-        cs.reindex_chainstate().unwrap();
+        cs.reindex_chainstate(None, None).unwrap();
 
         let flushes_after = cs
             .store
@@ -3686,6 +3816,82 @@ pub(crate) mod tests {
 
         // Verify correctness: tip is back at the last block.
         assert_eq!(cs.tip_height(), 1200);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `reindex_chainstate` must honor `-stopatheight`: when a target
+    /// height is given, replay halts cleanly at that height even when
+    /// the block index extends past it. The chain-event watcher that
+    /// implements `-stopatheight` for the normal IBD path is not wired
+    /// at reindex time, so reindex has to enforce the bound itself.
+    #[test]
+    fn reindex_chainstate_honors_stop_at() {
+        let (cs, dir) = make_chain_state();
+        // Build 600 blocks. We'll stop at 400 — well past the first
+        // periodic-flush boundary so we exercise the durable-flush
+        // path too, but with enough remaining to confirm we don't
+        // run past the target.
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+        let mut parent = genesis.block_hash();
+        for h in 1..=600u32 {
+            let block = build_test_block(parent, h, 1_300_000_000 + h);
+            parent = cs.accept_block(&block).unwrap();
+        }
+        cs.store.flush().unwrap();
+        cs.store.clear_chainstate().unwrap();
+        {
+            let mut tip = cs.tip.write();
+            tip.hash = genesis.block_hash();
+            tip.height = 0;
+        }
+
+        let progress = crate::startup_progress::StartupProgress::new();
+        progress.set_phase("reindex_chainstate", "Replaying UTXO set");
+        cs.reindex_chainstate(Some(400), Some(progress.clone())).unwrap();
+
+        assert_eq!(cs.tip_height(), 400, "reindex must stop at the target");
+        let snap = progress.snapshot();
+        assert_eq!(
+            snap.stop_height,
+            Some(400),
+            "progress must surface the stop target so the TUI can render it"
+        );
+        assert_eq!(snap.total, 600, "progress total must reflect file tip");
+        assert_eq!(snap.current, 400, "current must end exactly at stop_at");
+
+        // Final flush must still drain the dirty set so the tip at 400
+        // is durable; the operator restarts and continues from here.
+        assert_eq!(
+            cs.store.dirty_count(),
+            0,
+            "dirty cache not drained by final flush at stop_at"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `max_indexed_height` is the helper that powers reindex progress
+    /// reporting. Validates the doubling+binary-search across a few
+    /// shapes: empty index, small, and a non-power-of-two boundary.
+    #[test]
+    fn max_indexed_height_finds_chain_tip() {
+        let (cs, dir) = make_chain_state();
+
+        // Pristine: only genesis exists at height 0. The helper looks
+        // at heights ≥ 1 because reindex starts from 1, so an empty
+        // index past genesis must return 0.
+        assert_eq!(cs.max_indexed_height(), 0);
+
+        // Build 257 blocks — one past a power-of-two boundary so the
+        // doubling probe (256, 512) bounds the binary search.
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+        let mut parent = genesis.block_hash();
+        for h in 1..=257u32 {
+            let block = build_test_block(parent, h, 1_300_000_000 + h);
+            parent = cs.accept_block(&block).unwrap();
+        }
+        assert_eq!(cs.max_indexed_height(), 257);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

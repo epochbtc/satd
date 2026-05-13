@@ -385,17 +385,46 @@ async fn main() {
     // Run reindex replay if requested
     if config.reindex {
         startup_progress.set_phase("reindex_scan", "Scanning block files (phase 1/2)");
-        if let Err(e) = chain_state.reindex_from_flat_files(Some(startup_progress.clone())) {
+        if let Err(e) = chain_state.reindex_from_flat_files(
+            config.stopatheight,
+            Some(startup_progress.clone()),
+        ) {
             eprintln!("Error during reindex: {}", e);
             auth.cleanup();
             std::process::exit(1);
         }
+        // Mirror PR #185's IBD behavior: when `-stopatheight` is set
+        // and reindex halts at the target, exit cleanly. The operator's
+        // intent is "bring the chainstate to height H and stop"; if we
+        // continued startup we'd stand up RPC + P2P only to have the
+        // chain-event watcher tear them down on the first peer-driven
+        // block. Restart without `-stopatheight` (and typically with
+        // `-connect=0`) to dump or otherwise inspect the result.
+        if config.stopatheight.is_some() {
+            tracing::info!(
+                stop_at = config.stopatheight,
+                "Exiting after reindex reached -stopatheight"
+            );
+            auth.cleanup();
+            return;
+        }
     } else if config.reindex_chainstate {
         startup_progress.set_phase("reindex_chainstate", "Replaying UTXO set");
-        if let Err(e) = chain_state.reindex_chainstate() {
+        if let Err(e) = chain_state.reindex_chainstate(
+            config.stopatheight,
+            Some(startup_progress.clone()),
+        ) {
             eprintln!("Error during chainstate reindex: {}", e);
             auth.cleanup();
             std::process::exit(1);
+        }
+        if config.stopatheight.is_some() {
+            tracing::info!(
+                stop_at = config.stopatheight,
+                "Exiting after chainstate reindex reached -stopatheight"
+            );
+            auth.cleanup();
+            return;
         }
     }
 
@@ -1822,8 +1851,12 @@ async fn start_startup_rpc(
     module
         .register_method("getstartupinfo", |_params, ctx, _extensions| {
             let snap = ctx.snapshot();
-            let percent = if snap.total > 0 {
-                Some(((snap.current as f64 / snap.total as f64) * 100.0 * 10.0).round() / 10.0)
+            // Prefer `stop_height` as the percent denominator when set:
+            // the operator's goal is to reach the stop target, not the
+            // file tip, so the gauge should fill from 0..stop_height.
+            let percent_denom = snap.stop_height.unwrap_or(snap.total);
+            let percent = if percent_denom > 0 {
+                Some(((snap.current as f64 / percent_denom as f64) * 100.0 * 10.0).round() / 10.0)
             } else {
                 None
             };
@@ -1833,6 +1866,7 @@ async fn start_startup_rpc(
                 "phase": snap.phase,
                 "current": snap.current,
                 "total": snap.total,
+                "stop_height": snap.stop_height,
                 "percent": percent,
             }))
         })

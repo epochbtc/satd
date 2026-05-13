@@ -447,6 +447,10 @@ pub struct StartupStatus {
     pub message: String,
     pub current: u64,
     pub total: u64,
+    /// `Some(h)` when the active phase honors `-stopatheight`: reindex
+    /// will halt cleanly at height `h` even if the on-disk block files
+    /// extend past it (`total > stop_height`).
+    pub stop_height: Option<u64>,
 }
 
 impl StartupStatus {
@@ -456,6 +460,7 @@ impl StartupStatus {
             message: v.get("status").and_then(|s| s.as_str()).unwrap_or("").to_string(),
             current: v.get("current").and_then(|n| n.as_u64()).unwrap_or(0),
             total: v.get("total").and_then(|n| n.as_u64()).unwrap_or(0),
+            stop_height: v.get("stop_height").and_then(|n| n.as_u64()),
         }
     }
 
@@ -1385,6 +1390,7 @@ mod tests {
             message: "x".into(),
             current: 100,
             total: 1000,
+            stop_height: None,
         };
         st.update_startup(s);
         // Single sample is insufficient.
@@ -1396,6 +1402,7 @@ mod tests {
             message: "x".into(),
             current: 110,
             total: 1000,
+            stop_height: None,
         };
         st.update_startup(s2);
         // Likely None unless the test scheduler stalled past 1 s; either
@@ -1411,6 +1418,7 @@ mod tests {
             message: "scanning".into(),
             current: 5_000,
             total: 0,
+            stop_height: None,
         });
         assert_eq!(st.startup_samples.len(), 1);
         assert_eq!(st.startup_phase, "reindex_scan");
@@ -1420,6 +1428,7 @@ mod tests {
             message: "replay".into(),
             current: 1,
             total: 945_000,
+            stop_height: None,
         });
         // Phase change clears the rolling window so rate isn't polluted
         // by the (much faster) scan-phase samples.
@@ -1435,6 +1444,7 @@ mod tests {
             message: "replay".into(),
             current: 100,
             total: 0,
+            stop_height: None,
         });
         // total=0 → no ETA.
         assert!(st.startup_eta_secs().is_none());
@@ -1448,12 +1458,47 @@ mod tests {
             message: "replay".into(),
             current: 100,
             total: 1000,
+            stop_height: None,
         });
         st.clear_startup();
         assert!(st.startup_status.is_none());
         assert!(st.startup_started_at.is_none());
         assert!(st.startup_samples.is_empty());
         assert!(st.startup_phase.is_empty());
+    }
+
+    #[test]
+    fn startup_status_parses_stop_height_when_present() {
+        let v = json!({
+            "phase": "reindex_chainstate",
+            "status": "Replaying UTXO set",
+            "current": 12_345,
+            "total": 945_000,
+            "stop_height": 840_000,
+        });
+        let s = StartupStatus::from_json(&v);
+        assert_eq!(s.stop_height, Some(840_000));
+        assert_eq!(s.total, 945_000);
+    }
+
+    #[test]
+    fn startup_status_omits_stop_height_when_absent_or_null() {
+        let v_absent = json!({
+            "phase": "reindex_chainstate",
+            "status": "Replaying UTXO set",
+            "current": 1,
+            "total": 100,
+        });
+        assert_eq!(StartupStatus::from_json(&v_absent).stop_height, None);
+
+        let v_null = json!({
+            "phase": "reindex_chainstate",
+            "status": "Replaying UTXO set",
+            "current": 1,
+            "total": 100,
+            "stop_height": serde_json::Value::Null,
+        });
+        assert_eq!(StartupStatus::from_json(&v_null).stop_height, None);
     }
 
     #[test]

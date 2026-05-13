@@ -2046,6 +2046,82 @@ fn test_reindex_chainstate() {
     let _ = std::fs::remove_dir_all(&datadir);
 }
 
+/// `-reindex-chainstate` honors `-stopatheight` and exits cleanly when
+/// it reaches the target height. Mirrors test_stopatheight_exits_after_target_block
+/// but for the reindex path, which (unlike IBD) runs before RPC stands
+/// up — so we spawn satd directly and `wait()` rather than going
+/// through TestNode (which blocks until RPC is ready).
+#[test]
+fn test_reindex_chainstate_stopatheight_exits() {
+    let rpcport = find_available_port();
+    let datadir = std::env::temp_dir().join(format!("satd-reindex-stop-{}", rpcport));
+    let _ = std::fs::create_dir_all(&datadir);
+
+    // Phase 1: build chainstate up to height 10 the normal way.
+    let mut node = TestNode::start_with_datadir(&datadir, rpcport, &[]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    node.rpc_call_with_params(
+        "generatetoaddress",
+        vec![serde_json::json!(10), serde_json::json!(addr)],
+    )
+    .unwrap();
+    assert_eq!(node.rpc_call("getblockcount").unwrap()["result"], 10);
+    node.stop();
+
+    // Phase 2: spawn satd with --reindex-chainstate --stopatheight=5.
+    // The daemon exits before standing up RPC, so we wait on the
+    // process directly.
+    let satd_bin = env!("CARGO_BIN_EXE_satd");
+    let p2p_port = find_available_port();
+    let mut child = std::process::Command::new(satd_bin)
+        .arg("--regtest")
+        .arg(format!("--datadir={}", datadir.display()))
+        .arg(format!("--rpcport={}", rpcport))
+        .arg(format!("--port={}", p2p_port))
+        .arg("--reindex-chainstate")
+        .arg("--stopatheight=5")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("Failed to start satd for reindex-stopatheight test");
+
+    let deadline = Instant::now() + test_timeout(60);
+    let exit_status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    panic!("satd did not exit within 60s of --reindex-chainstate --stopatheight=5");
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => panic!("Error waiting for satd: {e}"),
+        }
+    };
+    assert!(
+        exit_status.success(),
+        "satd should exit cleanly after reindex hits stopatheight; got {exit_status:?}"
+    );
+
+    // Phase 3: restart normally (regtest has no seed peers, so IBD
+    // won't advance past the stopped tip on its own). Chainstate
+    // should be at height 5, with the block index still carrying
+    // entries 6..10 (reindex only stopped replay; it didn't drop
+    // block-index rows).
+    let mut node = TestNode::start_with_datadir(&datadir, rpcport, &[]);
+    let height = node.rpc_call("getblockcount").unwrap()["result"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(
+        height, 5,
+        "after stopped reindex, chainstate tip must be at the stop target"
+    );
+    node.stop();
+
+    let _ = std::fs::remove_dir_all(&datadir);
+}
+
 #[test]
 fn test_rpc_extended_errors_off_by_default() {
     // Default: error responses must be byte-identical to Bitcoin Core —
