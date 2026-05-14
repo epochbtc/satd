@@ -262,6 +262,75 @@ pub fn spawn_periodic_compactor(
         .expect("failed to spawn rocksdb-compactor thread");
 }
 
+/// Per-column-family pending-compaction diagnostic. Wakes every
+/// `interval` (default 60s in `satd`) and emits one INFO line listing
+/// the largest pending-compaction-bytes counts per CF.
+///
+/// This is the missing observability that turned a known failure mode
+/// (LSM falling behind on the secondary indexes) into a silent
+/// disk-fill: the existing compactor only reads `coins`, which stays
+/// healthy throughout. Watching `addr_spending` / `addr_funding` /
+/// `outpoint_spend` / `undo` is what would have surfaced the
+/// 2026-05-13 incident hours earlier.
+///
+/// Runs on its own OS thread (matching `spawn_periodic_compactor`)
+/// rather than a tokio task, so it survives the same wedge categories
+/// that motivated the stall watchdog.
+pub fn spawn_compaction_diagnostic(
+    chain_state: Arc<ChainState>,
+    interval: Duration,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    if interval.is_zero() {
+        tracing::info!("Compaction diagnostic disabled");
+        return;
+    }
+    std::thread::Builder::new()
+        .name("rocksdb-diag".into())
+        .spawn(move || {
+            tracing::info!(
+                interval_secs = interval.as_secs(),
+                "Compaction diagnostic thread started"
+            );
+            let slice = Duration::from_secs(5);
+            loop {
+                let mut waited = Duration::ZERO;
+                while waited < interval {
+                    std::thread::sleep(slice);
+                    if *shutdown_rx.borrow() {
+                        tracing::info!("Compaction diagnostic shutting down");
+                        return;
+                    }
+                    waited += slice;
+                }
+                let mut breakdown = chain_state.pending_compaction_bytes_by_cf();
+                // Sort by pending bytes desc so the most-loaded CFs
+                // appear first in the log line — even if downstream
+                // tooling truncates, the signal stays visible.
+                breakdown.sort_by(|a, b| b.1.cmp(&a.1));
+                let total: u64 = breakdown.iter().map(|(_, b)| *b).sum();
+                let mb = |b: u64| b / (1024 * 1024);
+                // Render as a single key=value sequence per CF for
+                // easy grep/awk parsing. Skip CFs with zero pending
+                // to keep the line readable on healthy systems.
+                let parts: Vec<String> = breakdown
+                    .iter()
+                    .filter(|(_, b)| *b > 0)
+                    .map(|(name, b)| format!("{}={}M", name, mb(*b)))
+                    .collect();
+                let l0 = chain_state.chainstate_l0_files();
+                tracing::info!(
+                    target: "storage",
+                    pending_total_mb = mb(total),
+                    coins_l0_files = l0,
+                    per_cf = %parts.join(" "),
+                    "RocksDB pending-compaction snapshot"
+                );
+            }
+        })
+        .expect("failed to spawn rocksdb-diag thread");
+}
+
 /// Best-effort post-mortem dump for a detected stall. We can't get full
 /// userspace stacks without `gdb` (which the systemd unit's hardening
 /// usually blocks via cleared `PR_SET_DUMPABLE`), but `/proc/self/task/*`

@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use crate::storage::blockindex::BlockIndexEntry;
 use crate::storage::coinview::{Coin, outpoint_to_key};
+use crate::storage::profile::StorageTuning;
 use crate::storage::undo::UndoData;
 use crate::storage::{Store, StoreBatch, StoreError, WriteMode};
 
@@ -152,15 +153,46 @@ pub struct RocksDbStore {
     /// Tracked separately because the RocksDB Cache API has no
     /// `get_capacity` getter — only usage.
     block_cache_capacity: std::sync::atomic::AtomicUsize,
+    /// Resolved storage tuning, kept so `drop_and_recreate_cf` rebuilds
+    /// dropped CFs with the same profile-specific options the rest of
+    /// the DB was opened with (matters for `clear_chainstate` and
+    /// reindex flows).
+    tuning: StorageTuning,
 }
 
 impl RocksDbStore {
+    /// Open the chainstate with default storage tuning (`ssd` profile).
+    /// Tests and lower-level callers that don't care about the profile
+    /// use this; `satd` wires its CLI-resolved tuning through
+    /// [`open_with_tuning`](Self::open_with_tuning).
     pub fn open(
         path: &Path,
         txindex: bool,
         cache_mb: usize,
         reindex: bool,
         max_open_files: i32,
+    ) -> Result<Self, StoreError> {
+        Self::open_with_tuning(
+            path,
+            txindex,
+            cache_mb,
+            reindex,
+            max_open_files,
+            StorageTuning::default(),
+        )
+    }
+
+    /// Open the chainstate with explicit storage tuning. See
+    /// [`StorageTuning`] for the per-field semantics; the resolved
+    /// values are logged at INFO so an operator can verify what
+    /// RocksDB is actually running with.
+    pub fn open_with_tuning(
+        path: &Path,
+        txindex: bool,
+        cache_mb: usize,
+        reindex: bool,
+        max_open_files: i32,
+        tuning: StorageTuning,
     ) -> Result<Self, StoreError> {
         let db_path = path.join("chainstate");
 
@@ -177,11 +209,23 @@ impl RocksDbStore {
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
         db_opts.increase_parallelism((cpus / 2).max(2) as i32);
-        db_opts.set_max_background_jobs(6);
+        db_opts.set_max_background_jobs(tuning.max_background_jobs);
+        db_opts.set_max_subcompactions(tuning.max_subcompactions);
         db_opts.set_atomic_flush(true);
-        db_opts.set_max_total_wal_size(256 * 1024 * 1024);
-        db_opts.set_bytes_per_sync(1024 * 1024);
-        db_opts.set_wal_bytes_per_sync(1024 * 1024);
+        db_opts.set_max_total_wal_size(tuning.max_total_wal_size);
+        db_opts.set_bytes_per_sync(tuning.bytes_per_sync);
+        db_opts.set_wal_bytes_per_sync(tuning.wal_bytes_per_sync);
+
+        tracing::info!(
+            target: "storage",
+            profile = %tuning.profile,
+            max_background_jobs = tuning.max_background_jobs,
+            max_subcompactions = tuning.max_subcompactions,
+            max_total_wal_mb = tuning.max_total_wal_size / (1024 * 1024),
+            bytes_per_sync_mb = tuning.bytes_per_sync / (1024 * 1024),
+            hot_cf_target_file_size_mb = tuning.hot_cf_target_file_size_base / (1024 * 1024),
+            "RocksDB storage tuning resolved"
+        );
         // Bound the table reader cache. Without this, RocksDB defaults to
         // -1 (keep every SST open for the lifetime of the DB), so a chain-
         // state that has accumulated tens of thousands of SSTs during a
@@ -203,9 +247,12 @@ impl RocksDbStore {
             DBCompressionType::Zstd, // L6
         ];
 
-        // Column family options builder
+        // Column family options builder. `hot=true` opts into the
+        // tuning profile's `hot_cf_target_file_size_base` — used for
+        // the high-write secondary indexes whose bottom-level
+        // compaction throughput dominates total IBD storage growth.
         let make_cf_opts =
-            |bloom: bool, write_buf_mb: usize, prefix_len: Option<usize>| -> Options {
+            |bloom: bool, write_buf_mb: usize, prefix_len: Option<usize>, hot: bool| -> Options {
                 let mut cf_opts = Options::default();
 
                 let mut table_opts = BlockBasedOptions::default();
@@ -225,7 +272,12 @@ impl RocksDbStore {
                 cf_opts.set_max_write_buffer_number(3);
                 cf_opts.set_level_compaction_dynamic_level_bytes(true);
                 cf_opts.set_max_bytes_for_level_base(512 * 1024 * 1024);
-                cf_opts.set_target_file_size_base(64 * 1024 * 1024);
+                let target_file_size = if hot {
+                    tuning.hot_cf_target_file_size_base
+                } else {
+                    64 * 1024 * 1024
+                };
+                cf_opts.set_target_file_size_base(target_file_size);
                 cf_opts.set_compression_per_level(&compression_per_level);
                 cf_opts.set_bottommost_compression_type(DBCompressionType::Zstd);
 
@@ -241,25 +293,31 @@ impl RocksDbStore {
             };
 
         let mut cf_descriptors = vec![
-            ColumnFamilyDescriptor::new(CF_COINS, make_cf_opts(true, 64, None)),
-            ColumnFamilyDescriptor::new(CF_BLOCK_INDEX, make_cf_opts(false, 8, None)),
-            ColumnFamilyDescriptor::new(CF_HEIGHT_INDEX, make_cf_opts(false, 8, None)),
-            ColumnFamilyDescriptor::new(CF_UNDO, make_cf_opts(false, 16, None)),
-            ColumnFamilyDescriptor::new(CF_TX_INDEX, make_cf_opts(false, 16, None)),
-            ColumnFamilyDescriptor::new(CF_METADATA, make_cf_opts(false, 2, None)),
+            ColumnFamilyDescriptor::new(CF_COINS, make_cf_opts(true, 64, None, false)),
+            ColumnFamilyDescriptor::new(CF_BLOCK_INDEX, make_cf_opts(false, 8, None, false)),
+            ColumnFamilyDescriptor::new(CF_HEIGHT_INDEX, make_cf_opts(false, 8, None, false)),
+            // undo: hot — append-only row per input, never compaction-
+            // friendly. Larger SST target reduces the count of files
+            // that pile up at the bottom level during IBD.
+            ColumnFamilyDescriptor::new(CF_UNDO, make_cf_opts(false, 16, None, true)),
+            ColumnFamilyDescriptor::new(CF_TX_INDEX, make_cf_opts(false, 16, None, false)),
+            ColumnFamilyDescriptor::new(CF_METADATA, make_cf_opts(false, 2, None, false)),
             // Address-history index. Bloom on for fast point lookups,
             // 32 MB write-buffer because per-block emission is write-
             // heavy during IBD, and a fixed 32-byte prefix-extractor so
             // `prefix_iterator_cf` over a single scripthash short-
             // circuits to the matching SST blocks instead of scanning.
-            ColumnFamilyDescriptor::new(CF_ADDR_FUNDING, make_cf_opts(true, 32, Some(32))),
-            ColumnFamilyDescriptor::new(CF_ADDR_SPENDING, make_cf_opts(true, 32, Some(32))),
+            // Marked hot — these two CFs accumulated 3,900 + 2,900 SSTs
+            // during the disk-full incident.
+            ColumnFamilyDescriptor::new(CF_ADDR_FUNDING, make_cf_opts(true, 32, Some(32), true)),
+            ColumnFamilyDescriptor::new(CF_ADDR_SPENDING, make_cf_opts(true, 32, Some(32), true)),
             // outpoint_spend: bloom on (point lookups dominate), 16 MB
             // write-buf because the row is small (40-byte value, 36-byte
             // key) and one row per non-coinbase input — heavier than
             // tx_index but lighter than addr_spending. 32-byte prefix
             // (txid) lets `outspends` for a tx fan out cheaply.
-            ColumnFamilyDescriptor::new(CF_OUTPOINT_SPEND, make_cf_opts(true, 16, Some(32))),
+            // Also hot — write rate matches addr_spending.
+            ColumnFamilyDescriptor::new(CF_OUTPOINT_SPEND, make_cf_opts(true, 16, Some(32), true)),
         ];
 
         // BIP 158 filter index. Bloom on (point lookups dominate
@@ -273,11 +331,11 @@ impl RocksDbStore {
         {
             cf_descriptors.push(ColumnFamilyDescriptor::new(
                 CF_FILTER,
-                make_cf_opts(true, 16, None),
+                make_cf_opts(true, 16, None, false),
             ));
             cf_descriptors.push(ColumnFamilyDescriptor::new(
                 CF_FILTER_HEADER,
-                make_cf_opts(true, 8, None),
+                make_cf_opts(true, 8, None, false),
             ));
         }
 
@@ -293,7 +351,7 @@ impl RocksDbStore {
         {
             cf_descriptors.push(ColumnFamilyDescriptor::new(
                 CF_ADDR_BACKFILL_TEMP,
-                make_cf_opts(true, 32, None),
+                make_cf_opts(true, 32, None, false),
             ));
         }
 
@@ -364,6 +422,7 @@ impl RocksDbStore {
             blockfilterindex_enabled: false,
             block_cache: parking_lot::Mutex::new(block_cache),
             block_cache_capacity: std::sync::atomic::AtomicUsize::new(cache_bytes),
+            tuning,
         };
         // outpoint_spend completeness marker (review H6 round 2).
         //
@@ -690,7 +749,20 @@ impl RocksDbStore {
         cf_opts.set_max_write_buffer_number(3);
         cf_opts.set_level_compaction_dynamic_level_bytes(true);
         cf_opts.set_max_bytes_for_level_base(512 * 1024 * 1024);
-        cf_opts.set_target_file_size_base(64 * 1024 * 1024);
+        // Hot CFs (high-write secondary indexes) opt into the profile's
+        // larger `hot_cf_target_file_size_base`. See `make_cf_opts` in
+        // `open_with_tuning` for the same hot/non-hot split applied on
+        // initial open.
+        let hot = matches!(
+            name,
+            CF_ADDR_FUNDING | CF_ADDR_SPENDING | CF_OUTPOINT_SPEND | CF_UNDO
+        );
+        let target_file_size = if hot {
+            self.tuning.hot_cf_target_file_size_base
+        } else {
+            64 * 1024 * 1024
+        };
+        cf_opts.set_target_file_size_base(target_file_size);
         cf_opts.set_compression_per_level(&compression_per_level);
         cf_opts.set_bottommost_compression_type(DBCompressionType::Zstd);
         // Address-index + outpoint-spend CFs share a 32-byte fixed
@@ -1184,6 +1256,44 @@ impl Store for RocksDbStore {
             .ok()
             .flatten()
             .unwrap_or(0)
+    }
+
+    fn pending_compaction_bytes_by_cf(&self) -> Vec<(&'static str, u64)> {
+        // Static list — covers every CF this binary registers. CFs not
+        // present in the live DB (`block-filter-index` feature off, or
+        // older datadir without the temp CF) silently report 0. The
+        // ordering matters for the diagnostic log: largest-pending
+        // CFs first so the most-relevant signal appears even when the
+        // log line is truncated by downstream tooling.
+        let names: &[&'static str] = &[
+            CF_ADDR_SPENDING,
+            CF_ADDR_FUNDING,
+            CF_OUTPOINT_SPEND,
+            CF_UNDO,
+            CF_COINS,
+            CF_TX_INDEX,
+            CF_BLOCK_INDEX,
+            CF_HEIGHT_INDEX,
+            CF_METADATA,
+            #[cfg(feature = "block-filter-index")]
+            CF_FILTER,
+            #[cfg(feature = "block-filter-index")]
+            CF_FILTER_HEADER,
+            CF_ADDR_BACKFILL_TEMP,
+        ];
+        names
+            .iter()
+            .filter_map(|name| {
+                let cf = self.db.cf_handle(name)?;
+                let bytes = self
+                    .db
+                    .property_int_value_cf(&cf, "rocksdb.estimate-pending-compaction-bytes")
+                    .ok()
+                    .flatten()
+                    .unwrap_or(0);
+                Some((*name, bytes))
+            })
+            .collect()
     }
 
     fn compact_chainstate(&self) -> Result<(), StoreError> {

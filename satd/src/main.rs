@@ -190,12 +190,17 @@ async fn main() {
     let coincache_mb = config.dbcache - rocksdb_cache_mb;
 
     let reindex = config.reindex || config.reindex_chainstate;
-    let store = match RocksDbStore::open(
+    let storage_tuning = node::storage::profile::StorageTuning::for_profile(config.storage_profile)
+        .with_background_jobs(config.rocksdb_background_jobs)
+        .with_subcompactions(config.rocksdb_subcompactions)
+        .with_wal_mb(config.rocksdb_wal_mb);
+    let store = match RocksDbStore::open_with_tuning(
         &net_datadir,
         config.txindex,
         rocksdb_cache_mb,
         reindex,
         config.max_open_files,
+        storage_tuning,
     ) {
         // Round-1 review H2: tell the Store whether the address +
         // filter indexes are active so `write_batch_mode` can clear
@@ -1607,6 +1612,19 @@ async fn main() {
         chain_state.clone(),
         std::time::Duration::from_secs(config.compaction_interval_secs),
         config.compaction_l0_at,
+        shutdown_rx.clone(),
+    );
+
+    // Per-CF pending-compaction diagnostic. Logs one INFO snapshot
+    // every `compaction_diag_interval_secs` (default 60) showing the
+    // largest pending-compaction-bytes counts across all CFs.
+    // Missing this observability is what turned the 2026-05-13 LSM
+    // backlog into a silent disk-fill — the existing compactor reads
+    // only the `coins` CF, which stayed healthy throughout while the
+    // four secondary-index CFs accumulated ~370 GB of pending work.
+    node::stall_watchdog::spawn_compaction_diagnostic(
+        chain_state.clone(),
+        std::time::Duration::from_secs(config.compaction_diag_interval_secs),
         shutdown_rx.clone(),
     );
 
