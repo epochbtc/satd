@@ -2373,9 +2373,11 @@ impl PeerManager {
                 }
         }
 
-        if !headers.is_empty() {
-            self.send_to_peer(id, NetworkMessage::Headers(headers));
-        }
+        // Always send a Headers reply, even when empty. Bitcoin Core and
+        // btcd both unconditionally respond to getheaders; some Core
+        // versions track silent-drops as soft misbehavior. Empty reply
+        // signals "I have nothing newer than your locator."
+        self.send_to_peer(id, NetworkMessage::Headers(headers));
     }
 
     fn handle_getdata(&self, id: PeerId, inventory: Vec<Inventory>) {
