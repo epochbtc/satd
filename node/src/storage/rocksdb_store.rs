@@ -1392,7 +1392,41 @@ impl Store for RocksDbStore {
     }
 
     fn sst_bytes_by_cf(&self) -> Vec<(&'static str, u64)> {
-        self.query_cf_property("rocksdb.total-sst-files-size")
+        // `get_column_family_metadata_cf` returns the LSM-level summary
+        // directly (sum of file sizes across all levels, in bytes).
+        // We previously queried the `rocksdb.total-sst-files-size`
+        // integer property here, but on the live mainnet datadir it
+        // came back as `Ok(None)` for every CF and was silently
+        // coerced to 0 by the property helper — see the 2026-05-14
+        // dogfood log where the chainstate is hundreds of GB on disk
+        // yet the diagnostic reported `total_mb=0` with an empty
+        // `per_cf=`. The metadata API is the documented, non-stringly-
+        // typed accessor for the same number and does not depend on
+        // the rocksdb property registry recognising the name.
+        let names: &[&'static str] = &[
+            CF_ADDR_SPENDING,
+            CF_ADDR_FUNDING,
+            CF_OUTPOINT_SPEND,
+            CF_UNDO,
+            CF_COINS,
+            CF_TX_INDEX,
+            CF_BLOCK_INDEX,
+            CF_HEIGHT_INDEX,
+            CF_METADATA,
+            #[cfg(feature = "block-filter-index")]
+            CF_FILTER,
+            #[cfg(feature = "block-filter-index")]
+            CF_FILTER_HEADER,
+            CF_ADDR_BACKFILL_TEMP,
+        ];
+        names
+            .iter()
+            .filter_map(|name| {
+                let cf = self.db.cf_handle(name)?;
+                let meta = self.db.get_column_family_metadata_cf(&cf);
+                Some((*name, meta.size))
+            })
+            .collect()
     }
 
     fn compact_chainstate(&self) -> Result<(), StoreError> {
