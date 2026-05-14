@@ -304,6 +304,14 @@ pub struct Config {
     pub connect: Vec<String>,
     pub assumevalid: Option<String>,
     pub assumevalidage: u64,
+    /// Stop running once the active-chain tip reaches this height
+    /// (matches Bitcoin Core's `-stopatheight`). The node accepts the
+    /// block at the target height, then broadcasts graceful shutdown
+    /// so RocksDB flushes cleanly. Primary use case is deterministic
+    /// testing — e.g. dumping a UTXO snapshot at exactly an AssumeUTXO
+    /// anchor height for cross-validation against Core's published
+    /// `hash_serialized_3` values. `None` (default) = run indefinitely.
+    pub stopatheight: Option<u32>,
     // Mempool policy
     pub mempoolfullrbf: bool,
     pub maxmempool: usize,
@@ -816,6 +824,10 @@ impl Config {
             .or_else(|| file_get("assumevalidage").and_then(|v| v.parse().ok()))
             .unwrap_or(86400); // default: 24 hours
 
+        let stopatheight = cli
+            .stopatheight
+            .or_else(|| file_get("stopatheight").and_then(|v| v.parse().ok()));
+
         // Mempool policy: CLI > config file > defaults
         let mempoolfullrbf = cli
             .mempoolfullrbf
@@ -1284,6 +1296,7 @@ impl Config {
             connect,
             assumevalid,
             assumevalidage,
+            stopatheight,
             mempoolfullrbf,
             maxmempool,
             minrelaytxfee,
@@ -1783,6 +1796,13 @@ pub struct CliArgs {
         help = "With --assumevalid=all, verify scripts for blocks newer than SECS (default: 86400)"
     )]
     pub assumevalidage: Option<u64>,
+
+    #[arg(
+        long,
+        value_name = "HEIGHT",
+        help = "Stop running after the active-chain tip reaches HEIGHT (matches Core's -stopatheight)"
+    )]
+    pub stopatheight: Option<u32>,
 
     // Mempool policy flags (Bitcoin Core compatible + extensions)
     #[arg(
@@ -2527,6 +2547,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "connect",
         "assumevalid",
         "assumevalidage",
+        "stopatheight",
         "mempoolfullrbf",
         "maxmempool",
         "minrelaytxfee",
@@ -2839,6 +2860,7 @@ rpcport=8332
             connect: vec![],
             assumevalid: None,
             assumevalidage: None,
+            stopatheight: None,
             mempoolfullrbf: None,
             maxmempool: None,
             minrelaytxfee: None,
@@ -2976,6 +2998,7 @@ rpcport=8332
             connect: vec![],
             assumevalid: None,
             assumevalidage: None,
+            stopatheight: None,
             mempoolfullrbf: None,
             maxmempool: None,
             minrelaytxfee: None,
