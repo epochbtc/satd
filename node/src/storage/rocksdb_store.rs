@@ -8,7 +8,7 @@ use rocksdb::{
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::storage::blockindex::BlockIndexEntry;
+use crate::storage::blockindex::{BlockIndexEntry, BlockStatus};
 use crate::storage::coinview::{Coin, outpoint_to_key};
 use crate::storage::undo::UndoData;
 use crate::storage::{Store, StoreBatch, StoreError, WriteMode};
@@ -834,7 +834,29 @@ impl Store for RocksDbStore {
         }
 
         // Block index
+        //
+        // Dominance filter mirroring `CachedStore::write_batch`'s rule:
+        // a HeaderOnly write must not clobber an on-disk DataStored or
+        // Valid entry. Most callers hit this through the cache, which
+        // already drops dominated writes before they reach us — but
+        // any path that bypasses the cache (e.g. tests, direct
+        // `Store::write_batch`) would otherwise reintroduce the same
+        // race the cache fix closed: `accept_headers`' HeaderOnly
+        // batch clobbering a concurrent `store_block`'s DataStored
+        // update, leaving `has_block_data()` permanently false and
+        // stalling the connect loop. Silent-keep (no error, no log
+        // spam) matches the cache behavior.
         for (hash, entry) in &batch.block_index_puts {
+            if entry.status == BlockStatus::HeaderOnly
+                && let Some(existing_bytes) = self
+                    .db
+                    .get_cf(&cf_bi, hash_bytes(hash))
+                    .map_err(|e| StoreError::Database(e.to_string()))?
+                && let Ok(existing) = bincode::deserialize::<BlockIndexEntry>(&existing_bytes)
+                && matches!(existing.status, BlockStatus::DataStored | BlockStatus::Valid)
+            {
+                continue;
+            }
             let value =
                 bincode::serialize(entry).map_err(|e| StoreError::Serialization(e.to_string()))?;
             wb.put_cf(&cf_bi, hash_bytes(hash), &value);
@@ -1865,6 +1887,99 @@ mod tests {
         assert_eq!(recovered.status, entry.status);
         assert_eq!(recovered.chainwork, entry.chainwork);
         assert_eq!(recovered.header.prev_blockhash, entry.header.prev_blockhash);
+    }
+
+    #[test]
+    fn block_index_header_only_does_not_clobber_data_stored() {
+        // Reproduces the race the cache layer's dominance check closes,
+        // mirrored at the RocksDB layer: a HeaderOnly write arriving
+        // after a DataStored/Valid write for the same hash must be
+        // dropped, not allowed to downgrade the on-disk entry.
+        let (store, _dir) = temp_store(false);
+        let (hash, mut datastored) = regtest_genesis_entry();
+        datastored.status = BlockStatus::DataStored;
+        datastored.file_number = 7;
+        datastored.data_pos = 1234;
+
+        let mut batch1 = StoreBatch::default();
+        batch1.block_index_puts.push((hash, datastored.clone()));
+        store.write_batch(batch1).unwrap();
+        assert_eq!(
+            store.get_block_index(&hash).unwrap().status,
+            BlockStatus::DataStored
+        );
+
+        // Now attempt a HeaderOnly write (simulating accept_headers
+        // racing a store_block that just landed). Must be a silent
+        // no-op, not a downgrade.
+        let header_only = BlockIndexEntry {
+            status: BlockStatus::HeaderOnly,
+            file_number: 0,
+            data_pos: 0,
+            ..datastored.clone()
+        };
+        let mut batch2 = StoreBatch::default();
+        batch2.block_index_puts.push((hash, header_only));
+        store.write_batch(batch2).unwrap();
+
+        let recovered = store.get_block_index(&hash).unwrap();
+        assert_eq!(
+            recovered.status,
+            BlockStatus::DataStored,
+            "HeaderOnly write must not clobber DataStored"
+        );
+        assert_eq!(recovered.file_number, 7);
+        assert_eq!(recovered.data_pos, 1234);
+    }
+
+    #[test]
+    fn block_index_upgrades_apply_normally() {
+        // The dominance filter is one-directional. A HeaderOnly → Valid
+        // upgrade must still apply (this is the normal flow:
+        // accept_headers writes HeaderOnly, then store_block + connect
+        // upgrade to DataStored/Valid).
+        let (store, _dir) = temp_store(false);
+        let (hash, mut header_only) = regtest_genesis_entry();
+        header_only.status = BlockStatus::HeaderOnly;
+        header_only.file_number = 0;
+        header_only.data_pos = 0;
+
+        let mut batch1 = StoreBatch::default();
+        batch1.block_index_puts.push((hash, header_only.clone()));
+        store.write_batch(batch1).unwrap();
+        assert_eq!(
+            store.get_block_index(&hash).unwrap().status,
+            BlockStatus::HeaderOnly
+        );
+
+        // DataStored upgrade applies.
+        let datastored = BlockIndexEntry {
+            status: BlockStatus::DataStored,
+            file_number: 3,
+            data_pos: 99,
+            ..header_only.clone()
+        };
+        let mut batch2 = StoreBatch::default();
+        batch2.block_index_puts.push((hash, datastored));
+        store.write_batch(batch2).unwrap();
+
+        let recovered = store.get_block_index(&hash).unwrap();
+        assert_eq!(recovered.status, BlockStatus::DataStored);
+        assert_eq!(recovered.file_number, 3);
+        assert_eq!(recovered.data_pos, 99);
+
+        // Valid upgrade applies.
+        let valid = BlockIndexEntry {
+            status: BlockStatus::Valid,
+            ..recovered
+        };
+        let mut batch3 = StoreBatch::default();
+        batch3.block_index_puts.push((hash, valid));
+        store.write_batch(batch3).unwrap();
+        assert_eq!(
+            store.get_block_index(&hash).unwrap().status,
+            BlockStatus::Valid
+        );
     }
 
     #[test]
