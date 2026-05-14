@@ -463,6 +463,9 @@ pub struct Config {
     pub reindex_chainstate: bool,
     // P2P
     pub maxconnections: usize,
+    /// Maximum simultaneous inbound peers from the same source IP
+    /// (Core-style flood guard; default 3).
+    pub maxinboundperip: usize,
     pub bind: String,
     #[allow(dead_code)]
     pub timeout: u64,
@@ -1351,6 +1354,10 @@ impl Config {
                 .or_else(|| file_get("maxconnections").and_then(|v| v.parse().ok()))
                 .or(profile_defaults.maxconnections)
                 .unwrap_or(125),
+            maxinboundperip: cli
+                .maxinboundperip
+                .or_else(|| file_get("maxinboundperip").and_then(|v| v.parse().ok()))
+                .unwrap_or(3),
             bind: cli
                 .bind
                 .or_else(|| file_get("bind"))
@@ -1614,6 +1621,7 @@ impl Config {
                 "listen": self.listen,
                 "port": self.port,
                 "max_connections": self.maxconnections,
+                "max_inbound_per_ip": self.maxinboundperip,
                 "bind": self.bind,
                 "dns": self.dns,
                 "connect": self.connect,
@@ -2143,6 +2151,13 @@ pub struct CliArgs {
 
     #[arg(
         long,
+        value_name = "N",
+        help = "Maximum simultaneous inbound peers from the same source IP (default: 3)"
+    )]
+    pub maxinboundperip: Option<usize>,
+
+    #[arg(
+        long,
         value_name = "ADDR",
         help = "Bind P2P to this address (default: 0.0.0.0)"
     )]
@@ -2596,6 +2611,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "reindex",
         "reindex-chainstate",
         "maxconnections",
+        "maxinboundperip",
         "bind",
         "timeout",
         "addnode",
@@ -2911,6 +2927,7 @@ rpcport=8332
             reindex: false,
             reindex_chainstate: false,
             maxconnections: None,
+            maxinboundperip: None,
             bind: None,
             timeout: None,
             addnode: vec![],
@@ -3049,6 +3066,7 @@ rpcport=8332
             reindex: false,
             reindex_chainstate: false,
             maxconnections: None,
+            maxinboundperip: None,
             bind: None,
             timeout: None,
             addnode: vec![],

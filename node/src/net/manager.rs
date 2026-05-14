@@ -4,8 +4,8 @@ use bitcoin::p2p::message_network::VersionMessage;
 use bitcoin::p2p::{Address, ServiceFlags};
 use bitcoin::Network;
 use parking_lot::{Condvar, RwLock};
-use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -28,6 +28,10 @@ use crate::net::sync;
 const MAX_OUTBOUND: usize = 8;
 const MAX_OUTBOUND_IBD: usize = 64;
 const BAN_THRESHOLD: u32 = 100;
+/// Hardcoded fallback when callers (tests, the no-config `new` constructor)
+/// don't supply a value. Operator-facing path goes through
+/// `Config::maxinboundperip` and the `-maxinboundperip` CLI flag.
+const DEFAULT_MAX_INBOUND_PER_IP: usize = 3;
 
 /// Per-address reconnect backoff state.
 struct ReconnectState {
@@ -116,6 +120,14 @@ pub struct PeerManager {
     prune_target_mb: u64,
     /// Maximum total connections (default: 125).
     max_connections: usize,
+    /// Maximum simultaneous inbound peers from the same source IP
+    /// (Core-style flood guard).
+    max_inbound_per_ip: usize,
+    /// Outbound `connect_outbound` calls that have started but haven't
+    /// yet finished registering a peer. Used to dedup concurrent dial
+    /// attempts against the same addr (e.g. an addr arriving from
+    /// multiple peers' gossip).
+    pending_connections: RwLock<HashSet<SocketAddr>>,
     /// Ban duration in seconds (default: 86400).
     ban_duration_secs: u64,
     /// IBD scheduler for parallel block download (shared with connect thread).
@@ -162,7 +174,7 @@ impl PeerManager {
         shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Arc<Self> {
         let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-        Self::with_config(chain_state, mempool, fee_estimator, network, shutdown, 0, 125, 86400, None, None, workers, 50_000, 0)
+        Self::with_config(chain_state, mempool, fee_estimator, network, shutdown, 0, 125, DEFAULT_MAX_INBOUND_PER_IP, 86400, None, None, workers, 50_000, 0)
     }
 
     pub fn with_prune(
@@ -174,10 +186,9 @@ impl PeerManager {
         prune_target_mb: u64,
     ) -> Arc<Self> {
         let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-        Self::with_config(chain_state, mempool, fee_estimator, network, shutdown, prune_target_mb, 125, 86400, None, None, workers, 50_000, 0)
+        Self::with_config(chain_state, mempool, fee_estimator, network, shutdown, prune_target_mb, 125, DEFAULT_MAX_INBOUND_PER_IP, 86400, None, None, workers, 50_000, 0)
     }
 
-    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     pub fn with_config(
         chain_state: Arc<ChainState>,
@@ -187,6 +198,7 @@ impl PeerManager {
         shutdown: tokio::sync::watch::Receiver<bool>,
         prune_target_mb: u64,
         max_connections: usize,
+        max_inbound_per_ip: usize,
         ban_duration_secs: u64,
         proxy: Option<String>,
         onion_proxy: Option<String>,
@@ -244,6 +256,8 @@ impl PeerManager {
             shutdown,
             prune_target_mb,
             max_connections,
+            max_inbound_per_ip,
+            pending_connections: RwLock::new(HashSet::new()),
             ban_duration_secs,
             ibd: ibd.clone(),
             connect_signal: connect_signal.clone(),
@@ -326,16 +340,64 @@ impl PeerManager {
     }
 
     /// Register addresses for auto-reconnect.
+    ///
+    /// Deduped: addr/addrv2 gossip from multiple peers frequently announces
+    /// the same socket address many times. Without dedup, the reconnect
+    /// loop spawns one `connect_outbound` task per duplicate, and a remote
+    /// peer's per-IP rate limit will FIN all but the first within a few
+    /// hundred ms — surfacing as severe peer churn.
     pub fn add_connect_addr(&self, addr: SocketAddr) {
-        self.connect_addrs.write().push(addr);
+        let mut addrs = self.connect_addrs.write();
+        if !addrs.contains(&addr) {
+            addrs.push(addr);
+        }
     }
 
-    /// Register a PeerAddr (socket or .onion) for auto-reconnect.
+    /// Register a PeerAddr (socket or .onion) for auto-reconnect. Same
+    /// dedup rationale as `add_connect_addr`.
     pub fn add_peer_addr(&self, addr: PeerAddr) {
         match &addr {
-            PeerAddr::Socket(sa) => self.connect_addrs.write().push(*sa),
-            PeerAddr::Onion { .. } => self.connect_peer_addrs.write().push(addr),
+            PeerAddr::Socket(sa) => {
+                let mut addrs = self.connect_addrs.write();
+                if !addrs.contains(sa) {
+                    addrs.push(*sa);
+                }
+            }
+            PeerAddr::Onion { .. } => {
+                let mut addrs = self.connect_peer_addrs.write();
+                if !addrs.contains(&addr) {
+                    addrs.push(addr);
+                }
+            }
         }
+    }
+
+    /// Count inbound peers, returning `(total_inbound, same_ip_inbound)`.
+    /// Pulled out for unit-testing the per-IP cap without a real `TcpStream`.
+    ///
+    /// Includes both `Connecting` and `Connected` inbound peers — review
+    /// F4 (PR #181): counting only `Connected` let concurrent handshake
+    /// bursts from one IP exceed `maxinboundperip` for the duration of
+    /// the handshake. Pending inbound peers consume a slot from the
+    /// moment we accept the TCP stream until the peer task terminates
+    /// (handshake success → `Connected`, or handshake failure → peer
+    /// dropped from `self.peers`). Outbound peers and disconnected
+    /// peers don't count.
+    fn count_inbound(peers: &HashMap<PeerId, PeerHandle>, ip: IpAddr) -> (usize, usize) {
+        let mut total = 0usize;
+        let mut same_ip = 0usize;
+        for h in peers.values() {
+            if h.info.direction != Direction::Inbound
+                || h.info.state == PeerState::Disconnected
+            {
+                continue;
+            }
+            total += 1;
+            if h.info.addr.ip() == ip {
+                same_ip += 1;
+            }
+        }
+        (total, same_ip)
     }
 
     /// Get the number of connected outbound peers.
@@ -367,6 +429,37 @@ impl PeerManager {
     /// Connect to an outbound peer.
     pub async fn connect_outbound(self: &Arc<Self>, addr: SocketAddr) -> Result<(), String> {
         self.check_outbound_limit()?;
+
+        // Claim the dial slot before doing any network I/O. Without this,
+        // the reconnect loop can spawn multiple concurrent `connect_outbound`
+        // tasks for the same addr (the addr is removed from `connect_addrs`
+        // after the dial returns, not before it starts), and a remote
+        // peer's per-IP rate limit will FIN all but the first.
+        {
+            let mut pending = self.pending_connections.write();
+            if pending.contains(&addr) {
+                return Err(format!("connect already in flight to {}", addr));
+            }
+            if self.is_addr_connected(&addr) {
+                return Err(format!("already connected to {}", addr));
+            }
+            pending.insert(addr);
+        }
+        // RAII guard so the slot is released on every exit path, including
+        // panics from the await points below.
+        struct PendingGuard<'a> {
+            set: &'a RwLock<HashSet<SocketAddr>>,
+            addr: SocketAddr,
+        }
+        impl<'a> Drop for PendingGuard<'a> {
+            fn drop(&mut self) {
+                self.set.write().remove(&self.addr);
+            }
+        }
+        let _guard = PendingGuard {
+            set: &self.pending_connections,
+            addr,
+        };
 
         let stream = if let Some(ref proxy_addr) = self.proxy {
             proxy::connect_socks5(proxy_addr, addr).await?
@@ -419,25 +512,42 @@ impl PeerManager {
     }
 
     /// Accept an inbound connection.
+    ///
+    /// Cap-check and slot reservation happen atomically under one
+    /// write lock so concurrent accepts cannot both observe a below-
+    /// limit count and proceed. Without this, the earlier shape
+    /// (read-lock for count, drop lock, write-lock for insert) left
+    /// a TOCTOU window that, combined with counting only `Connected`
+    /// peers, let handshake bursts bypass the per-IP cap. Review F4.
     pub fn accept_inbound(self: &Arc<Self>, stream: TcpStream, addr: SocketAddr) {
-        {
-            let peers = self.peers.read();
-            let inbound_count = peers
-                .values()
-                .filter(|h| {
-                    h.info.direction == Direction::Inbound
-                        && h.info.state == PeerState::Connected
-                })
-                .count();
+        let ip = addr.ip();
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let msg_rx = {
+            let mut peers = self.peers.write();
+            let (inbound_count, same_ip_count) = Self::count_inbound(&peers, ip);
             if inbound_count >= self.max_connections.saturating_sub(MAX_OUTBOUND) {
                 tracing::warn!(%addr, "Max inbound connections reached, dropping connection");
                 return;
             }
-        }
-
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+            if same_ip_count >= self.max_inbound_per_ip {
+                tracing::warn!(
+                    %addr,
+                    same_ip_count,
+                    limit = self.max_inbound_per_ip,
+                    "Per-IP inbound limit reached, dropping connection",
+                );
+                return;
+            }
+            // Reserve the slot under the same write lock so further
+            // accepts on this thread (or another) see this peer in
+            // count_inbound's tally before they themselves cap-check.
+            let (msg_tx, msg_rx) = mpsc::channel::<NetworkMessage>(256);
+            let info = PeerInfo::new(id, addr, Direction::Inbound);
+            peers.insert(id, PeerHandle { info, msg_tx });
+            msg_rx
+        };
         tracing::info!(%addr, id, "Accepted inbound peer");
-        self.spawn_peer(id, addr, stream, Direction::Inbound);
+        self.spawn_peer_task(id, addr, stream, Direction::Inbound, msg_rx);
     }
 
     /// Listen for inbound connections.
@@ -2423,15 +2533,27 @@ impl PeerManager {
         direction: Direction,
     ) {
         let (msg_tx, msg_rx) = mpsc::channel::<NetworkMessage>(256);
-
         let info = PeerInfo::new(id, addr, direction);
         let handle = PeerHandle { info, msg_tx };
-
         {
             let mut peers = self.peers.write();
             peers.insert(id, handle);
         }
+        self.spawn_peer_task(id, addr, stream, direction, msg_rx);
+    }
 
+    /// Inner half of `spawn_peer`: spawns the peer task once the
+    /// `PeerHandle` is already in `self.peers`. Split out so
+    /// `accept_inbound` can do the cap-check + insertion atomically
+    /// under one write lock and then call this without re-inserting.
+    fn spawn_peer_task(
+        self: &Arc<Self>,
+        id: PeerId,
+        addr: SocketAddr,
+        stream: TcpStream,
+        direction: Direction,
+        msg_rx: mpsc::Receiver<NetworkMessage>,
+    ) {
         let manager = Arc::clone(self);
         tokio::spawn(async move {
             if let Err(e) = manager.peer_task(id, stream, direction, msg_rx).await {
@@ -2774,5 +2896,148 @@ impl Drop for BulkLoadGuard<'_> {
         }
         self.chain_state.set_write_mode(crate::storage::WriteMode::Normal);
         tracing::info!("BulkLoadGuard: restored Normal write mode");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::net::peer::{Direction, PeerInfo, PeerState};
+
+    fn mk_handle(id: PeerId, addr: SocketAddr, dir: Direction, state: PeerState) -> PeerHandle {
+        let mut info = PeerInfo::new(id, addr, dir);
+        info.state = state;
+        // 1-slot channel; we never send on the test side.
+        let (tx, _rx) = mpsc::channel::<NetworkMessage>(1);
+        PeerHandle { info, msg_tx: tx }
+    }
+
+    #[test]
+    fn count_inbound_classifies_by_direction_and_state() {
+        let mut peers = HashMap::new();
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+        // Inbound + Connected: counts.
+        peers.insert(
+            1,
+            mk_handle(1, SocketAddr::new(ip, 8333), Direction::Inbound, PeerState::Connected),
+        );
+        // Outbound + Connected: not counted as inbound.
+        peers.insert(
+            2,
+            mk_handle(2, SocketAddr::new(ip, 8333), Direction::Outbound, PeerState::Connected),
+        );
+        // Inbound + Connecting (handshake in progress): F4 fix — must
+        // count toward the cap, otherwise concurrent handshake bursts
+        // from one IP bypass the limit until handshakes complete.
+        peers.insert(
+            3,
+            mk_handle(3, SocketAddr::new(ip, 8333), Direction::Inbound, PeerState::Connecting),
+        );
+        // Inbound + Disconnected: stale entry, no real socket, doesn't
+        // count.
+        peers.insert(
+            4,
+            mk_handle(4, SocketAddr::new(ip, 8333), Direction::Inbound, PeerState::Disconnected),
+        );
+        let (total, same_ip) = PeerManager::count_inbound(&peers, ip);
+        assert_eq!(total, 2);
+        assert_eq!(same_ip, 2);
+    }
+
+    #[test]
+    fn count_inbound_caps_against_handshake_burst() {
+        // Regression for review F4: a burst of inbound TCP accepts from
+        // a single IP must not all squeeze through the per-IP cap
+        // while still in handshake. With the old semantics
+        // (Connected-only), the entire burst could insert as
+        // Connecting and each accept would observe same_ip_count == 0.
+        let mut peers = HashMap::new();
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+        // Simulate four concurrent accepts from the same IP that all
+        // landed in Connecting before any handshake completed.
+        for id in 1..=4u32 {
+            peers.insert(
+                id as PeerId,
+                mk_handle(
+                    id as PeerId,
+                    SocketAddr::new(ip, 8333 + id as u16),
+                    Direction::Inbound,
+                    PeerState::Connecting,
+                ),
+            );
+        }
+        let (total, same_ip) = PeerManager::count_inbound(&peers, ip);
+        assert_eq!(total, 4, "handshake-in-progress peers must consume slots");
+        assert_eq!(same_ip, 4);
+    }
+
+    #[test]
+    fn count_inbound_groups_by_ip() {
+        let mut peers = HashMap::new();
+        let ip_a: IpAddr = "10.0.0.1".parse().unwrap();
+        let ip_b: IpAddr = "10.0.0.2".parse().unwrap();
+        for (id, ip) in [(1, ip_a), (2, ip_a), (3, ip_a), (4, ip_b)] {
+            peers.insert(
+                id,
+                mk_handle(
+                    id,
+                    SocketAddr::new(ip, 8333 + id as u16),
+                    Direction::Inbound,
+                    PeerState::Connected,
+                ),
+            );
+        }
+        let (total_a, same_a) = PeerManager::count_inbound(&peers, ip_a);
+        assert_eq!(total_a, 4);
+        assert_eq!(same_a, 3);
+        let (total_b, same_b) = PeerManager::count_inbound(&peers, ip_b);
+        assert_eq!(total_b, 4);
+        assert_eq!(same_b, 1);
+    }
+
+    #[test]
+    fn pending_connections_guard_releases_on_drop() {
+        // Mirrors the RAII pattern inside `connect_outbound`. The guard
+        // exists to ensure the pending slot is released even when the
+        // dial fails or panics across an await point.
+        let set: RwLock<HashSet<SocketAddr>> = RwLock::new(HashSet::new());
+        let addr: SocketAddr = "127.0.0.1:8333".parse().unwrap();
+
+        struct PendingGuard<'a> {
+            set: &'a RwLock<HashSet<SocketAddr>>,
+            addr: SocketAddr,
+        }
+        impl<'a> Drop for PendingGuard<'a> {
+            fn drop(&mut self) {
+                self.set.write().remove(&self.addr);
+            }
+        }
+
+        {
+            set.write().insert(addr);
+            assert!(set.read().contains(&addr));
+            let _g = PendingGuard { set: &set, addr };
+            // ... pretend a dial happens here ...
+        }
+        assert!(!set.read().contains(&addr), "guard should release slot on drop");
+    }
+
+    #[test]
+    fn add_connect_addr_dedups() {
+        // Pure-Vec test of the dedup idiom used inside add_connect_addr.
+        let mut addrs: Vec<SocketAddr> = Vec::new();
+        let a: SocketAddr = "1.2.3.4:8333".parse().unwrap();
+        let b: SocketAddr = "1.2.3.5:8333".parse().unwrap();
+        for _ in 0..5 {
+            if !addrs.contains(&a) {
+                addrs.push(a);
+            }
+        }
+        for _ in 0..3 {
+            if !addrs.contains(&b) {
+                addrs.push(b);
+            }
+        }
+        assert_eq!(addrs, vec![a, b]);
     }
 }
