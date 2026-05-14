@@ -55,18 +55,34 @@ use std::time::{Duration, Instant};
 /// watchdog's outer fence still fires if for some reason neither path
 /// completes.
 ///
-/// Progress is observed via [`ChainState::connect_heartbeat`], a lock-free
-/// counter bumped on every successful connect. The watchdog deliberately
-/// does **not** read `tip_height()` because that takes a read on the same
-/// `RwLock<ChainTip>` that `connect_block` writes — exactly the lock the
-/// wedge we are protecting against could be holding. Reading an atomic
-/// counter avoids that dependency entirely; whatever else is happening in
-/// the runtime, this thread can always observe the heartbeat.
+/// Progress is observed via two lock-free counters on [`ChainState`]:
 ///
-/// During IBD the heartbeat advances roughly every 100-500ms at 6 blk/s on
-/// mainnet, so 5 minutes is conservative. Outside IBD the cadence is
-/// per-block (≈10 min on mainnet) — operators who want the watchdog active
-/// in steady-state should set a threshold well above one block interval.
+/// * [`ChainState::connect_heartbeat`] — bumped on every successful
+///   block connect. Reliable progress signal during IBD (≈6 blk/s on
+///   mainnet) but silent for many minutes at tip between blocks.
+/// * [`ChainState::manager_heartbeat`] — bumped on every iteration of
+///   the P2P manager's main loop (~500 ms). Tracks "the loop is alive"
+///   independent of whether a block was processed on this tick.
+///
+/// The watchdog resets its stall timer whenever *either* counter
+/// advances, so a stall is only reported when **both** have been silent
+/// for the full threshold. This keeps the 300 s default valid at
+/// mainnet tip (where `connect_heartbeat` is naturally idle between
+/// blocks) while still catching true wedges: a real lockup parks the
+/// manager loop and the connector together, so neither counter moves.
+///
+/// The watchdog deliberately does **not** read `tip_height()` because
+/// that takes a read on the same `RwLock<ChainTip>` that `connect_block`
+/// writes — exactly the lock the wedge we are protecting against could
+/// be holding. Reading atomic counters avoids that dependency entirely;
+/// whatever else is happening in the runtime, this thread can always
+/// observe the heartbeats.
+///
+/// During IBD both counters advance every few hundred milliseconds, so
+/// 5 minutes is very conservative. At mainnet tip the connector
+/// counter can pause for ≥10 min between blocks but the manager
+/// counter keeps advancing, so the threshold remains valid without
+/// per-phase tuning.
 pub fn spawn_stall_watchdog(
     chain_state: Arc<ChainState>,
     stall_threshold: Duration,
@@ -86,7 +102,8 @@ pub fn spawn_stall_watchdog(
                 "Stall watchdog started"
             );
             let poll = Duration::from_secs(15);
-            let mut last_seen_heartbeat = chain_state.connect_heartbeat();
+            let mut last_seen_connect = chain_state.connect_heartbeat();
+            let mut last_seen_manager = chain_state.manager_heartbeat();
             let mut last_advance = Instant::now();
             let mut dumped_for_this_stall = false;
             let mut sigterm_sent = false;
@@ -96,14 +113,24 @@ pub fn spawn_stall_watchdog(
                     tracing::info!("Stall watchdog shutting down");
                     return;
                 }
-                let heartbeat = chain_state.connect_heartbeat();
-                if heartbeat != last_seen_heartbeat {
-                    last_seen_heartbeat = heartbeat;
+                let connect_hb = chain_state.connect_heartbeat();
+                let manager_hb = chain_state.manager_heartbeat();
+                // Reset the stall timer if *either* heartbeat advanced.
+                // At mainnet tip `connect_hb` can stay flat for >10 min
+                // between blocks; `manager_hb` keeps ticking as long as
+                // the P2P loop and tokio runtime are alive. A true
+                // wedge parks both, which is what we want to detect.
+                let advanced =
+                    connect_hb != last_seen_connect || manager_hb != last_seen_manager;
+                if advanced {
+                    last_seen_connect = connect_hb;
+                    last_seen_manager = manager_hb;
                     last_advance = Instant::now();
                     if dumped_for_this_stall {
                         tracing::info!(
-                            heartbeat,
-                            "Connector advanced after a previously-detected \
+                            connect_heartbeat = connect_hb,
+                            manager_heartbeat = manager_hb,
+                            "Heartbeats advanced after a previously-detected \
                              stall; watchdog returning to nominal state"
                         );
                         dumped_for_this_stall = false;
@@ -113,7 +140,7 @@ pub fn spawn_stall_watchdog(
                 }
                 let stalled_for = last_advance.elapsed();
                 if stalled_for >= stall_threshold && !dumped_for_this_stall {
-                    capture_forensics(stalled_for, heartbeat, &chain_state);
+                    capture_forensics(stalled_for, connect_hb, manager_hb, &chain_state);
                     dumped_for_this_stall = true;
                 }
                 // First escalation: raise SIGTERM so the existing main()
@@ -124,7 +151,8 @@ pub fn spawn_stall_watchdog(
                 if dumped_for_this_stall && !sigterm_sent && stalled_for >= stall_threshold {
                     tracing::error!(
                         stalled_secs = stalled_for.as_secs(),
-                        heartbeat,
+                        connect_heartbeat = connect_hb,
+                        manager_heartbeat = manager_hb,
                         "Stall watchdog: raising SIGTERM to attempt graceful \
                          shutdown via the bounded --max-shutdown-secs flush path. \
                          Will force-abort if the process is still alive after \
@@ -136,7 +164,8 @@ pub fn spawn_stall_watchdog(
                 if dumped_for_this_stall && stalled_for >= stall_threshold + abort_after {
                     tracing::error!(
                         stalled_secs = stalled_for.as_secs(),
-                        heartbeat,
+                        connect_heartbeat = connect_hb,
+                        manager_heartbeat = manager_hb,
                         "Stall persists past abort deadline; calling \
                          std::process::abort() so systemd restarts the unit. \
                          Graceful shutdown via SIGTERM did not complete in time. \
@@ -339,19 +368,26 @@ pub fn spawn_compaction_diagnostic(
 /// captured exactly this shape and made the diagnosis possible: 94 threads
 /// all in `futex_do_wait` with zero in `R` or `D` state proved the wedge
 /// was synchronization, not I/O.
-fn capture_forensics(stalled_for: Duration, heartbeat: u64, chain_state: &ChainState) {
+fn capture_forensics(
+    stalled_for: Duration,
+    connect_heartbeat: u64,
+    manager_heartbeat: u64,
+    chain_state: &ChainState,
+) {
     let l0 = chain_state.chainstate_l0_files();
     let pending = chain_state.chainstate_pending_compaction_bytes();
     let dirty = chain_state.cache_dirty_count();
     tracing::error!(
         stalled_secs = stalled_for.as_secs(),
-        heartbeat,
+        connect_heartbeat,
+        manager_heartbeat,
         chainstate_l0_files = l0,
         chainstate_pending_compaction_bytes = pending,
         coin_cache_dirty_count = dirty,
-        "Stall watchdog: connector heartbeat has not advanced; capturing \
-         thread states from /proc/self/task. Look for many threads in \
-         `futex` for a synchronization deadlock; many in `D` for stuck I/O."
+        "Stall watchdog: both connect and manager heartbeats have been \
+         silent past the threshold; capturing thread states from \
+         /proc/self/task. Look for many threads in `futex` for a \
+         synchronization deadlock; many in `D` for stuck I/O."
     );
 
     // Phase-level forensics: the connect path stamps an atomic phase on

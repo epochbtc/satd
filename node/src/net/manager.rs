@@ -785,6 +785,14 @@ impl PeerManager {
         let shutdown = self.shutdown.clone();
 
         loop {
+            // Manager-loop heartbeat: bumped on every iteration so the
+            // stall watchdog has a "loop is alive" signal that is
+            // independent of block arrivals. At mainnet tip the
+            // connector heartbeat can be quiet for >10 min between
+            // blocks, but this counter keeps ticking every ~500 ms as
+            // long as the manager loop and tokio runtime are healthy.
+            self.chain_state.bump_manager_heartbeat();
+
             // Check for shutdown
             if *shutdown.borrow() {
                 tracing::info!("P2P manager shutting down");
