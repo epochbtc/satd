@@ -172,6 +172,59 @@ impl StorageTuning {
         }
         self
     }
+
+    /// Detect resolved values likely to recreate the failure mode that
+    /// motivated this whole module — primarily an operator override
+    /// dropping the WAL trigger or background-thread count below what
+    /// the active profile considers safe. Returns a list of human-
+    /// readable warnings; the caller logs each at WARN. Empty list =
+    /// no concerns.
+    ///
+    /// Warnings are relative to the active profile's defaults rather
+    /// than to absolute thresholds. HDD intentionally runs with a
+    /// smaller WAL than SSD (~512 MB vs 1.5 GB) to bound crash-
+    /// recovery replay on slow writes; an absolute threshold would
+    /// either spam HDD operators or leave SSD operators with a
+    /// degraded WAL silently.
+    ///
+    /// We surface these but do not refuse to start: the override
+    /// surface exists explicitly for emergency operator tuning, and
+    /// the reviewer asked us to preserve the escape hatch.
+    pub fn validate(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        let profile_defaults = Self::for_profile(self.profile);
+        let wal_mb = self.max_total_wal_size / (1024 * 1024);
+        let default_wal_mb = profile_defaults.max_total_wal_size / (1024 * 1024);
+        if wal_mb < default_wal_mb {
+            warnings.push(format!(
+                "max_total_wal_size = {} MB is below the {} profile's default \
+                 of {} MB. A small WAL trigger forces flushes of half-empty \
+                 memtables, producing tiny L0 SSTs and compaction backlog — \
+                 the configuration shape that caused the 2026-05-13 disk-fill \
+                 incident.",
+                wal_mb, self.profile, default_wal_mb
+            ));
+        }
+        if self.max_subcompactions as i32 > self.max_background_jobs {
+            warnings.push(format!(
+                "max_subcompactions = {} exceeds max_background_jobs = {}; \
+                 sub-compaction threads compete for the same background pool, \
+                 so the excess will idle and effective compaction parallelism \
+                 is bounded by background_jobs anyway.",
+                self.max_subcompactions, self.max_background_jobs
+            ));
+        }
+        if self.max_background_jobs < 2 {
+            warnings.push(format!(
+                "max_background_jobs = {} serializes flushes against compactions \
+                 across all 12+ column families. RocksDB needs at least 2 \
+                 background threads (one for flush, one for compaction) to make \
+                 forward progress under any sustained write rate.",
+                self.max_background_jobs
+            ));
+        }
+        warnings
+    }
 }
 
 impl Default for StorageTuning {
@@ -220,5 +273,61 @@ mod tests {
         assert_eq!(t.max_subcompactions, 1);
         assert_eq!(t.max_total_wal_size, 64 * 1024 * 1024);
         assert_eq!(t.profile, StorageProfile::Ssd);
+    }
+
+    #[test]
+    fn default_profiles_produce_no_warnings() {
+        assert!(StorageTuning::for_profile(StorageProfile::Ssd).validate().is_empty());
+        assert!(StorageTuning::for_profile(StorageProfile::Hdd).validate().is_empty());
+    }
+
+    #[test]
+    fn warns_when_wal_override_below_profile_default() {
+        // SSD default WAL is 1.5 GB; an override to 256 MB (the value
+        // that triggered the original incident) must warn.
+        let t = StorageTuning::for_profile(StorageProfile::Ssd).with_wal_mb(Some(256));
+        let warnings = t.validate();
+        assert!(
+            warnings.iter().any(|w| w.contains("max_total_wal_size")),
+            "expected WAL warning, got {:?}",
+            warnings
+        );
+    }
+
+    #[test]
+    fn no_warning_when_hdd_default_wal_used() {
+        // HDD intentionally runs with 512 MB WAL (smaller than SSD's
+        // 1.5 GB) to bound crash-recovery on slow disks. That default
+        // must NOT trigger a warning — otherwise HDD operators see
+        // spurious warnings on every restart.
+        let t = StorageTuning::for_profile(StorageProfile::Hdd);
+        assert!(
+            t.validate().iter().all(|w| !w.contains("max_total_wal_size")),
+            "HDD default must not produce a WAL warning"
+        );
+    }
+
+    #[test]
+    fn warns_when_subcompactions_exceed_background_jobs() {
+        let t = StorageTuning::for_profile(StorageProfile::Ssd)
+            .with_background_jobs(Some(2))
+            .with_subcompactions(Some(8));
+        let warnings = t.validate();
+        assert!(
+            warnings.iter().any(|w| w.contains("max_subcompactions")),
+            "expected subcompactions warning, got {:?}",
+            warnings
+        );
+    }
+
+    #[test]
+    fn warns_when_background_jobs_too_small() {
+        let t = StorageTuning::for_profile(StorageProfile::Ssd).with_background_jobs(Some(1));
+        let warnings = t.validate();
+        assert!(
+            warnings.iter().any(|w| w.contains("max_background_jobs")),
+            "expected background_jobs warning, got {:?}",
+            warnings
+        );
     }
 }

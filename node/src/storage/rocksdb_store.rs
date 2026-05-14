@@ -216,6 +216,13 @@ impl RocksDbStore {
         db_opts.set_bytes_per_sync(tuning.bytes_per_sync);
         db_opts.set_wal_bytes_per_sync(tuning.wal_bytes_per_sync);
 
+        // Loud warnings for override combinations likely to recreate
+        // the failure mode that motivated this module. We log but
+        // don't refuse to start — the override surface exists for
+        // emergency operator tuning. See `StorageTuning::validate`.
+        for warning in tuning.validate() {
+            tracing::warn!(target: "storage", "{}", warning);
+        }
         tracing::info!(
             target: "storage",
             profile = %tuning.profile,
