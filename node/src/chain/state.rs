@@ -225,6 +225,17 @@ pub struct ChainState {
     /// only if the connect path stopped completing — independent of
     /// what state the rest of the runtime is in.
     connect_heartbeat: AtomicU64,
+    /// Lock-free monotonic counter bumped on every iteration of the
+    /// P2P manager's main `select!` loop. Complements
+    /// [`Self::connect_heartbeat`]: that counter only advances when a
+    /// block is connected, which is silent for many minutes at mainnet
+    /// tip; this counter advances on every loop iteration (default
+    /// 500 ms) regardless of block arrivals. The stall watchdog reads
+    /// both and considers the node stalled only when *both* counters
+    /// have been silent for the threshold — so the default threshold
+    /// (300 s) stays valid at tip without false positives, while still
+    /// catching true loop-wedge conditions promptly during IBD.
+    manager_heartbeat: AtomicU64,
     /// Fine-grained per-phase heartbeat for `connect_preprocessed_block`
     /// and `connect::connect_block`. The single `connect_heartbeat`
     /// counter tells the watchdog *that* the connector wedged; this
@@ -313,6 +324,7 @@ impl ChainState {
                     mempool: std::sync::OnceLock::new(),
                     chain_event_tx: parking_lot::Mutex::new(None),
                     connect_heartbeat: AtomicU64::new(0),
+                    manager_heartbeat: AtomicU64::new(0),
                     connect_phases: std::sync::Arc::new(
                         crate::chain::connect_phase::ConnectPhaseTracker::new(),
                     ),
@@ -371,6 +383,7 @@ impl ChainState {
             mempool: std::sync::OnceLock::new(),
             chain_event_tx: parking_lot::Mutex::new(None),
             connect_heartbeat: AtomicU64::new(0),
+            manager_heartbeat: AtomicU64::new(0),
             connect_phases: std::sync::Arc::new(
                 crate::chain::connect_phase::ConnectPhaseTracker::new(),
             ),
@@ -532,6 +545,22 @@ impl ChainState {
     /// so the watchdog has a lock-free way to observe forward progress.
     pub fn bump_connect_heartbeat(&self) {
         self.connect_heartbeat.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Read the lock-free manager-heartbeat counter. Bumped on every
+    /// iteration of the P2P manager's main loop (~every 500 ms);
+    /// stays silent only if the manager loop itself is wedged or the
+    /// tokio runtime is parked. Read by the stall watchdog as a
+    /// "loop is alive" signal independent of block arrivals.
+    pub fn manager_heartbeat(&self) -> u64 {
+        self.manager_heartbeat.load(Ordering::Relaxed)
+    }
+
+    /// Bump the manager-heartbeat counter. Called once per iteration
+    /// of `PeerManager::run`'s main loop, regardless of whether work
+    /// was performed or a block was connected on that tick.
+    pub fn bump_manager_heartbeat(&self) {
+        self.manager_heartbeat.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Per-phase tracker for `connect_preprocessed_block`. The stall
@@ -2668,6 +2697,38 @@ pub(crate) mod tests {
 
         let result = cs.accept_block(&genesis);
         assert!(matches!(result, Err(ChainError::Duplicate)));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Both heartbeat counters start at zero and advance independently
+    /// on bump. The stall watchdog relies on this to distinguish
+    /// "connector idle but loop alive" (steady-state tip) from "loop
+    /// itself is wedged" (true stall).
+    #[test]
+    fn test_heartbeats_independent() {
+        let (cs, dir) = make_chain_state();
+        // Fresh ChainState: connect heartbeat starts at 0, manager
+        // heartbeat starts at 0. (Genesis init does not bump connect.)
+        let connect_start = cs.connect_heartbeat();
+        let manager_start = cs.manager_heartbeat();
+        assert_eq!(manager_start, 0);
+
+        cs.bump_manager_heartbeat();
+        assert_eq!(cs.manager_heartbeat(), manager_start + 1);
+        assert_eq!(
+            cs.connect_heartbeat(),
+            connect_start,
+            "bump_manager_heartbeat must not touch connect_heartbeat"
+        );
+
+        cs.bump_connect_heartbeat();
+        assert_eq!(cs.connect_heartbeat(), connect_start + 1);
+        assert_eq!(
+            cs.manager_heartbeat(),
+            manager_start + 1,
+            "bump_connect_heartbeat must not touch manager_heartbeat"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
