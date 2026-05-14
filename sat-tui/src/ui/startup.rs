@@ -50,11 +50,32 @@ pub fn draw(f: &mut Frame, st: &AppState) {
         .split(inner);
 
     // Header: phase title + raw count.
+    //
+    // When `-stopatheight` is honored by the active phase, the count
+    // shows `current / stop_height` so the operator sees the target
+    // they care about, with `(file tip: total)` appended if the on-disk
+    // block files extend past the stop height. Without a stop target,
+    // fall back to the old `current / total` layout.
     let phase_title = phase_label(&status.phase);
-    let count_line = if status.total > 0 {
-        format!("{} / {}", format_num(status.current), format_num(status.total))
-    } else {
-        format!("{} (total tbd)", format_num(status.current))
+    let count_line = match status.stop_height {
+        Some(stop) if status.total > stop => format!(
+            "{} / {}  (file tip: {})",
+            format_num(status.current),
+            format_num(stop),
+            format_num(status.total),
+        ),
+        Some(stop) => format!(
+            "{} / {}",
+            format_num(status.current),
+            format_num(stop),
+        ),
+        None => {
+            if status.total > 0 {
+                format!("{} / {}", format_num(status.current), format_num(status.total))
+            } else {
+                format!("{} (total tbd)", format_num(status.current))
+            }
+        }
     };
     let header = Paragraph::new(vec![
         Line::from(vec![Span::styled(
@@ -71,13 +92,18 @@ pub fn draw(f: &mut Frame, st: &AppState) {
     ]);
     f.render_widget(header, chunks[0]);
 
-    // Progress gauge.
-    let pct = if status.total > 0 {
-        ((status.current as f64 / status.total as f64) * 100.0).clamp(0.0, 100.0)
+    // Progress gauge. Prefer `stop_height` as the denominator: the
+    // operator's goal is to reach the configured stop target, not the
+    // file tip, so the bar fills from 0..stop_height (a stop_height
+    // smaller than `total` makes the bar reach 100% earlier than a
+    // bar denominated by `total` would).
+    let gauge_denom = status.stop_height.unwrap_or(status.total);
+    let pct = if gauge_denom > 0 {
+        ((status.current as f64 / gauge_denom as f64) * 100.0).clamp(0.0, 100.0)
     } else {
         0.0
     };
-    let gauge_label = if status.total > 0 {
+    let gauge_label = if gauge_denom > 0 {
         format!("{:.1}%", pct)
     } else {
         "—".to_string()
@@ -130,6 +156,18 @@ pub fn draw(f: &mut Frame, st: &AppState) {
         None => "—".to_string(),
     };
     stat_lines.push(stat_line("ETA (phase)", eta_str, Color::Yellow));
+
+    if let Some(stop) = status.stop_height {
+        // Surface the configured `-stopatheight` so the operator sees
+        // that reindex will halt at H even when the on-disk block files
+        // extend past it. Highlighted because it materially changes
+        // what the gauge above represents.
+        stat_lines.push(stat_line(
+            "Stop at",
+            format_num(stop),
+            Color::LightMagenta,
+        ));
+    }
 
     if !st.startup_phase.is_empty() {
         stat_lines.push(stat_line(
