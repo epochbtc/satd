@@ -4,6 +4,7 @@ pub mod coinview;
 pub mod compressed_coin;
 pub mod db;
 pub mod flatfile;
+pub mod profile;
 pub mod rocksdb_store;
 pub mod undo;
 
@@ -333,6 +334,18 @@ pub trait Store: Send + Sync {
     /// compaction is overdue. Default: 0.
     fn chainstate_pending_compaction_bytes(&self) -> u64 {
         0
+    }
+
+    /// Per-column-family pending-compaction-bytes breakdown. Used by the
+    /// diagnostic logger to surface which CF is falling behind — the
+    /// chainstate-wide `coins`-only number missed the actual culprits
+    /// during the mainnet IBD incident (addr_funding, addr_spending,
+    /// outpoint_spend, undo accumulated ~370 GB combined while `coins`
+    /// stayed healthy at 8.6 GB). Returns `(cf_name, bytes)` pairs in
+    /// declaration order. Default: empty (non-RocksDB backends have no
+    /// pending-compaction concept).
+    fn pending_compaction_bytes_by_cf(&self) -> Vec<(&'static str, u64)> {
+        Vec::new()
     }
 
     /// Force a full compaction of the chainstate (coins) column family.

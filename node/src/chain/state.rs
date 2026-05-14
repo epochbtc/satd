@@ -493,6 +493,15 @@ impl ChainState {
         self.store.chainstate_pending_compaction_bytes()
     }
 
+    /// Per-column-family pending-compaction-bytes breakdown. Surfaced
+    /// by the periodic diagnostic logger so operators can see *which*
+    /// CF is falling behind — the chainstate-wide `coins`-only number
+    /// missed the actual culprits during the mainnet IBD disk-fill
+    /// incident.
+    pub fn pending_compaction_bytes_by_cf(&self) -> Vec<(&'static str, u64)> {
+        self.store.pending_compaction_bytes_by_cf()
+    }
+
     /// Force a synchronous full-range compaction of the chainstate column
     /// family. Drains the dirty overlay first so the compaction includes
     /// pending writes. Long-running: returns only when RocksDB completes

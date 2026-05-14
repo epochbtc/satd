@@ -501,6 +501,30 @@ pub struct Config {
     /// descriptors and their per-SST metadata in memory. `-1` = unlimited
     /// (legacy behavior). Default: 2048.
     pub max_open_files: i32,
+    /// Underlying storage class for the chainstate. Selects a set of
+    /// RocksDB tunables sized for the media: `Ssd` (default) maxes
+    /// background parallelism and uses a large WAL trigger; `Hdd`
+    /// reduces concurrency to avoid seek thrash and shortens the WAL
+    /// to bound crash-recovery time on slow writes.
+    pub storage_profile: node::storage::profile::StorageProfile,
+    /// Optional override for `Options::set_max_background_jobs`. When
+    /// `None`, the value from `storage_profile` applies. Advanced
+    /// users only — the three rocksdb-* overrides interact, and
+    /// setting one in isolation can make compaction worse.
+    pub rocksdb_background_jobs: Option<i32>,
+    /// Optional override for `Options::set_max_subcompactions`. See
+    /// `rocksdb_background_jobs` for the cross-knob caveat.
+    pub rocksdb_subcompactions: Option<u32>,
+    /// Optional override for `Options::set_max_total_wal_size`,
+    /// expressed in megabytes for CLI ergonomics. Must be comfortably
+    /// larger than the sum of per-CF write buffers (~680 MB on the
+    /// stock schema), otherwise flushes are driven by WAL pressure
+    /// rather than memtable pressure (the failure mode that caused
+    /// the 2026-05-13 disk-fill incident).
+    pub rocksdb_wal_mb: Option<u64>,
+    /// Interval at which the per-CF pending-compaction diagnostic
+    /// logger emits a snapshot. Default: 60s. `0` disables.
+    pub compaction_diag_interval_secs: u64,
     /// IBD connector backpressure: pause each loop iteration when the
     /// chainstate's L0 SST count is at or above this value, so RocksDB
     /// compaction has a chance to drain. `0` disables. Default: 64.
@@ -1466,6 +1490,30 @@ impl Config {
                 .maxopenfiles
                 .or_else(|| file_get("maxopenfiles").and_then(|v| v.parse().ok()))
                 .unwrap_or(2048),
+            storage_profile: {
+                let raw = cli
+                    .storageprofile
+                    .clone()
+                    .or_else(|| file_get("storageprofile"))
+                    .unwrap_or_else(|| "ssd".to_string());
+                raw.parse().unwrap_or_else(|e| {
+                    eprintln!("warning: {}, falling back to 'ssd'", e);
+                    node::storage::profile::StorageProfile::default()
+                })
+            },
+            rocksdb_background_jobs: cli
+                .rocksdbbackgroundjobs
+                .or_else(|| file_get("rocksdbbackgroundjobs").and_then(|v| v.parse().ok())),
+            rocksdb_subcompactions: cli
+                .rocksdbsubcompactions
+                .or_else(|| file_get("rocksdbsubcompactions").and_then(|v| v.parse().ok())),
+            rocksdb_wal_mb: cli
+                .rocksdbwalmb
+                .or_else(|| file_get("rocksdbwalmb").and_then(|v| v.parse().ok())),
+            compaction_diag_interval_secs: cli
+                .compactiondiagintervalsecs
+                .or_else(|| file_get("compactiondiagintervalsecs").and_then(|v| v.parse().ok()))
+                .unwrap_or(60),
             ibd_l0_pause_at: cli
                 .ibdl0pauseat
                 .or_else(|| file_get("ibdl0pauseat").and_then(|v| v.parse().ok()))
@@ -2269,6 +2317,46 @@ pub struct CliArgs {
 
     #[arg(
         long,
+        value_name = "PROFILE",
+        help = "Storage class for chainstate tuning: ssd (default) or hdd. \
+                ssd maxes background parallelism; hdd avoids seek thrash."
+    )]
+    pub storageprofile: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "N",
+        help = "Override RocksDB max_background_jobs (advanced; default from \
+                --storageprofile). Caps concurrent flush + compaction jobs."
+    )]
+    pub rocksdbbackgroundjobs: Option<i32>,
+
+    #[arg(
+        long,
+        value_name = "N",
+        help = "Override RocksDB max_subcompactions (advanced; default from \
+                --storageprofile). Sub-thread parallelism per compaction job."
+    )]
+    pub rocksdbsubcompactions: Option<u32>,
+
+    #[arg(
+        long,
+        value_name = "MB",
+        help = "Override RocksDB max_total_wal_size in MB (advanced; default \
+                from --storageprofile). Must exceed sum of per-CF write \
+                buffers (~680 MB on stock schema) to avoid WAL-pressure flushes."
+    )]
+    pub rocksdbwalmb: Option<u64>,
+
+    #[arg(
+        long,
+        value_name = "SECS",
+        help = "Per-CF pending-compaction diagnostic log interval; 0 disables (default: 60)"
+    )]
+    pub compactiondiagintervalsecs: Option<u64>,
+
+    #[arg(
+        long,
         value_name = "N",
         help = "Pause IBD connector when chainstate L0 SST count >= N; 0 disables (default: 64)"
     )]
@@ -2954,6 +3042,11 @@ rpcport=8332
             metricsbind: None,
             maxahead: None,
             maxopenfiles: None,
+            storageprofile: None,
+            rocksdbbackgroundjobs: None,
+            rocksdbsubcompactions: None,
+            rocksdbwalmb: None,
+            compactiondiagintervalsecs: None,
             ibdl0pauseat: None,
             compactionintervalsecs: None,
             compactionl0at: None,
@@ -3093,6 +3186,11 @@ rpcport=8332
             metricsbind: None,
             maxahead: None,
             maxopenfiles: None,
+            storageprofile: None,
+            rocksdbbackgroundjobs: None,
+            rocksdbsubcompactions: None,
+            rocksdbwalmb: None,
+            compactiondiagintervalsecs: None,
             ibdl0pauseat: None,
             compactionintervalsecs: None,
             compactionl0at: None,
