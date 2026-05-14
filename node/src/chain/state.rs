@@ -86,6 +86,23 @@ pub enum ChainError {
     Disconnect(#[from] disconnect::DisconnectError),
 }
 
+/// Result of a `repair_block_index_holes` pass.
+#[derive(Debug, Default, Clone)]
+pub struct RepairOutcome {
+    /// HeaderOnly block-index entries above tip at the start of the
+    /// pass.
+    pub holes_found: usize,
+    /// Holes resolved by finding the block data in a flat file.
+    pub repaired: usize,
+    /// Holes where the block data was not present in any flat file —
+    /// the operator will need to re-download these via normal IBD.
+    pub still_missing: usize,
+    /// Total blocks read from flat files during the scan (a measure of
+    /// scan throughput and progress).
+    pub blocks_scanned: u64,
+    pub elapsed_secs: u64,
+}
+
 struct ChainTip {
     hash: BlockHash,
     height: u32,
@@ -208,6 +225,13 @@ pub struct ChainState {
     /// only if the connect path stopped completing — independent of
     /// what state the rest of the runtime is in.
     connect_heartbeat: AtomicU64,
+    /// Fine-grained per-phase heartbeat for `connect_preprocessed_block`
+    /// and `connect::connect_block`. The single `connect_heartbeat`
+    /// counter tells the watchdog *that* the connector wedged; this
+    /// tracker tells it *where*. See `connect_phase.rs` for the phase
+    /// definitions. Arc'd so the watchdog (a separate `std::thread`)
+    /// can share it with the connector.
+    connect_phases: std::sync::Arc<crate::chain::connect_phase::ConnectPhaseTracker>,
 }
 
 impl ChainState {
@@ -289,6 +313,9 @@ impl ChainState {
                     mempool: std::sync::OnceLock::new(),
                     chain_event_tx: parking_lot::Mutex::new(None),
                     connect_heartbeat: AtomicU64::new(0),
+                    connect_phases: std::sync::Arc::new(
+                        crate::chain::connect_phase::ConnectPhaseTracker::new(),
+                    ),
                 });
             }
 
@@ -317,6 +344,7 @@ impl ChainState {
             address_index: &address_index,
             #[cfg(feature = "block-filter-index")]
             filter_index: &filter_index,
+            phase_tracker: None,
         })?;
         store.write_batch(batch)?;
 
@@ -343,6 +371,9 @@ impl ChainState {
             mempool: std::sync::OnceLock::new(),
             chain_event_tx: parking_lot::Mutex::new(None),
             connect_heartbeat: AtomicU64::new(0),
+            connect_phases: std::sync::Arc::new(
+                crate::chain::connect_phase::ConnectPhaseTracker::new(),
+            ),
         })
     }
 
@@ -483,6 +514,17 @@ impl ChainState {
     /// so the watchdog has a lock-free way to observe forward progress.
     pub fn bump_connect_heartbeat(&self) {
         self.connect_heartbeat.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Per-phase tracker for `connect_preprocessed_block`. The stall
+    /// watchdog reads from this to identify which phase the connector
+    /// wedged in (see `connect_phase.rs`). Returns an `Arc` clone so the
+    /// watchdog can hold a reference without the borrow checker
+    /// extending `ChainState`'s lifetime over the watchdog thread.
+    pub fn connect_phases(
+        &self,
+    ) -> std::sync::Arc<crate::chain::connect_phase::ConnectPhaseTracker> {
+        std::sync::Arc::clone(&self.connect_phases)
     }
 
     pub fn get_block_index(&self, hash: &BlockHash) -> Option<BlockIndexEntry> {
@@ -810,6 +852,211 @@ impl ChainState {
         &self.blocks_dir
     }
 
+    /// Scan flat files and repair `block_index` entries above the current
+    /// tip that are stuck in `HeaderOnly` despite the block data being
+    /// present on disk.
+    ///
+    /// Why this exists: a historical race in `CachedStore::write_batch`'s
+    /// dominance filter (see `coin_cache.rs`) — and the lack of an
+    /// equivalent guard at the inner RocksDB layer until recently — let
+    /// `accept_headers`' HeaderOnly batch overwrite a concurrent
+    /// `store_block`'s DataStored update. The flat file writes were
+    /// non-transactional with the index, so the block bytes are still on
+    /// disk; only the index entry was wiped (file=0 pos=0, the
+    /// placeholder accept_headers writes for HeaderOnly).
+    ///
+    /// Without repair, the connect loop wedges permanently at the first
+    /// hole: `has_block_data()` returns false, the IBD scheduler can
+    /// re-request the block, but with peer churn there's no guarantee
+    /// any peer stays connected long enough to redeliver — and even if
+    /// one does, the next hole 100 heights up wedges us again. Mainnet
+    /// instance, 2026-05-12: 435 holes across a 3084-height window.
+    ///
+    /// Scan cost: one sequential pass over every flat file (~134 MB
+    /// each). On the affected mainnet datadir, ~670 GB total → ~20 min
+    /// at typical SSD bandwidth. The pass is skipped entirely when
+    /// there are no holes above the tip, so a healthy node pays only
+    /// the index walk.
+    pub fn repair_block_index_holes(&self) -> Result<RepairOutcome, ChainError> {
+        use crate::storage::flatfile::FlatFilePos;
+        let tip_height = self.tip_height();
+        let headers_tip = self.headers_tip_height();
+        let span_start = std::time::Instant::now();
+
+        // Index walk: pass 1 — find HeaderOnly heights and track the
+        // maximum DataStored/Valid height above tip, plus the
+        // file_number range that those DataStored entries span.
+        //
+        // The heuristic: a HeaderOnly hole only matters if there's a
+        // DataStored entry STRICTLY ABOVE it (height > hole.height).
+        // That's the wedge signature — a hole in an already-downloaded
+        // region the connector will eventually walk through.
+        //
+        // A HeaderOnly entry at, or above, the highest DataStored is
+        // just normal IBD-in-progress (header accepted, block not yet
+        // downloaded) — there is by construction no block data on
+        // disk for it. Pre-filtering these out is what makes startup
+        // fast in normal operation: a 130k-entry IBD frontier doesn't
+        // trigger a flat-file scan.
+        //
+        // The file range (`min_ds_file`..=`max_ds_file`) bounds the
+        // flat-file scan. Blocks at heights between `tip+1` and
+        // `max_ds_height` were written to disk while we held those
+        // heights in flight; arrival order is approximately, but not
+        // exactly, height-ordered, so we widen the file range by the
+        // min/max we actually see. Files outside that range cannot
+        // contain the missing data.
+        let mut all_above: Vec<(u32, BlockHash, BlockIndexEntry)> = Vec::new();
+        let mut max_datastored_height: u32 = tip_height;
+        let mut min_ds_file: Option<u32> = None;
+        let mut max_ds_file: Option<u32> = None;
+        for h in (tip_height + 1)..=headers_tip {
+            let Some(hash) = self.store.get_block_hash_by_height(h) else {
+                continue;
+            };
+            let Some(entry) = self.store.get_block_index(&hash) else {
+                continue;
+            };
+            match entry.status {
+                BlockStatus::DataStored | BlockStatus::Valid => {
+                    if h > max_datastored_height {
+                        max_datastored_height = h;
+                    }
+                    let f = entry.file_number;
+                    min_ds_file = Some(min_ds_file.map_or(f, |m| m.min(f)));
+                    max_ds_file = Some(max_ds_file.map_or(f, |m| m.max(f)));
+                }
+                BlockStatus::HeaderOnly => {
+                    all_above.push((h, hash, entry));
+                }
+                _ => {}
+            }
+        }
+
+        // Pass 2: filter HeaderOnly entries down to corruption
+        // candidates — those strictly below the highest DataStored.
+        let mut holes: std::collections::HashMap<BlockHash, BlockIndexEntry> =
+            std::collections::HashMap::new();
+        let mut ibd_frontier_skipped = 0usize;
+        for (height, hash, entry) in all_above {
+            if height < max_datastored_height {
+                holes.insert(hash, entry);
+            } else {
+                ibd_frontier_skipped += 1;
+            }
+        }
+
+        let mut outcome = RepairOutcome {
+            holes_found: holes.len(),
+            ..Default::default()
+        };
+
+        if holes.is_empty() {
+            tracing::debug!(
+                tip_height,
+                headers_tip,
+                max_datastored_height,
+                ibd_frontier_skipped,
+                elapsed_ms = span_start.elapsed().as_millis() as u64,
+                "Block-index hole repair: no corruption holes above tip"
+            );
+            return Ok(outcome);
+        }
+
+        // File range scan: only walk files that contained DataStored
+        // entries in the affected height range. Anything outside that
+        // range can't be the block we're looking for.
+        let (start_file, end_file) = match (min_ds_file, max_ds_file) {
+            (Some(s), Some(e)) => (s, e),
+            _ => {
+                // No DataStored entries above tip (would have been
+                // caught by the holes.is_empty() check, but defensive).
+                return Ok(outcome);
+            }
+        };
+
+        tracing::info!(
+            holes = holes.len(),
+            ibd_frontier_skipped,
+            tip_height,
+            max_datastored_height,
+            file_range_start = start_file,
+            file_range_end = end_file,
+            "Block-index hole repair: scanning targeted flat-file range"
+        );
+
+        // Targeted flat-file scan with early termination once every
+        // hole is resolved. `for_each_block_in_files` reads each file
+        // sequentially; the visitor returns Break the moment `holes`
+        // is empty.
+        let mut repair_batch = crate::storage::StoreBatch::default();
+        let mut blocks_scanned: u64 = 0;
+        let scan_result = {
+            let flat_files = self.flat_files.lock();
+            flat_files.for_each_block_in_files(
+                start_file..=end_file,
+                |block_bytes, pos: FlatFilePos| {
+                    blocks_scanned += 1;
+                    let Ok(block) =
+                        bitcoin::consensus::deserialize::<Block>(block_bytes)
+                    else {
+                        return std::ops::ControlFlow::Continue(());
+                    };
+                    let hash = block.block_hash();
+                    if let Some(entry) = holes.remove(&hash) {
+                        let repaired = BlockIndexEntry {
+                            status: BlockStatus::DataStored,
+                            file_number: pos.file_number,
+                            data_pos: pos.data_pos,
+                            num_tx: block.txdata.len() as u32,
+                            // header, height, chainwork carry over.
+                            ..entry
+                        };
+                        repair_batch.block_index_puts.push((hash, repaired));
+                    }
+                    if holes.is_empty() {
+                        std::ops::ControlFlow::Break(())
+                    } else {
+                        std::ops::ControlFlow::Continue(())
+                    }
+                },
+            )
+        };
+        if let Err(e) = scan_result {
+            return Err(ChainError::FlatFile(e.to_string()));
+        }
+
+        outcome.blocks_scanned = blocks_scanned;
+        outcome.repaired = repair_batch.block_index_puts.len();
+        outcome.still_missing = holes.len();
+        outcome.elapsed_secs = span_start.elapsed().as_secs();
+
+        if outcome.repaired > 0 {
+            self.store.write_batch(repair_batch)?;
+            // Durable flush so a crash before the next periodic flush
+            // doesn't lose the repair work and leave us re-scanning at
+            // next startup.
+            use crate::storage::Store;
+            if let Err(e) = self.store.flush_durable() {
+                tracing::warn!(
+                    error = %e,
+                    "Block-index hole repair: flush_durable failed after repair write"
+                );
+            }
+        }
+
+        tracing::info!(
+            holes_found = outcome.holes_found,
+            repaired = outcome.repaired,
+            still_missing = outcome.still_missing,
+            blocks_scanned = outcome.blocks_scanned,
+            elapsed_secs = outcome.elapsed_secs,
+            "Block-index hole repair complete"
+        );
+
+        Ok(outcome)
+    }
+
     /// Connect a pre-processed block from the prefetch pipeline.
     ///
     /// The block has already been read from flat files, deserialized, and had
@@ -819,6 +1066,10 @@ impl ChainState {
         &self,
         pre: crate::chain::prefetch::PreprocessedBlock,
     ) -> Result<BlockHash, ChainError> {
+        use crate::chain::connect_phase::ConnectPhase;
+        let phases = &*self.connect_phases;
+        phases.enter(ConnectPhase::EnterConnect);
+
         let trace_id = rand::random::<u32>();
         let _span = tracing::info_span!(
             "connect",
@@ -830,11 +1081,13 @@ impl ChainState {
         // Verify parent is current tip (same check as connect_stored_block)
         let current_tip = self.tip_hash();
         if pre.entry.header.prev_blockhash != current_tip {
+            phases.enter(ConnectPhase::Idle);
             return Err(ChainError::BadPrevBlock);
         }
 
         // Block must be in DataStored state
         if pre.entry.status != BlockStatus::DataStored {
+            phases.enter(ConnectPhase::Idle);
             return Err(ChainError::Duplicate);
         }
 
@@ -875,12 +1128,15 @@ impl ChainState {
             address_index: &self.address_index,
             #[cfg(feature = "block-filter-index")]
             filter_index: &self.filter_index,
+            phase_tracker: Some(phases),
         })?;
 
         // Atomic commit
+        phases.enter(ConnectPhase::WriteBatch);
         self.store.write_batch(batch)?;
 
         // Update in-memory tip
+        phases.enter(ConnectPhase::TipWrite);
         {
             let mut tip = self.tip.write();
             tip.hash = pre.hash;
@@ -890,6 +1146,7 @@ impl ChainState {
         // Update MTP cache
         self.push_mtp_cache(pre.height, pre.entry.header.time);
 
+        phases.enter(ConnectPhase::Idle);
         Ok(pre.hash)
     }
 
@@ -1045,6 +1302,9 @@ impl ChainState {
             .store
             .get_block_index(hash)
             .ok_or(ChainError::BadPrevBlock)?;
+        use crate::chain::connect_phase::ConnectPhase;
+        let phases = &*self.connect_phases;
+        phases.enter(ConnectPhase::EnterConnect);
         let trace_id = rand::random::<u32>();
         let _span = tracing::info_span!(
             "connect_stored",
@@ -1055,12 +1315,14 @@ impl ChainState {
         .entered();
 
         if entry.status != BlockStatus::DataStored {
+            phases.enter(ConnectPhase::Idle);
             return Err(ChainError::Duplicate);
         }
 
         // Parent must be current tip (sequential connection)
         let current_tip = self.tip_hash();
         if entry.header.prev_blockhash != current_tip {
+            phases.enter(ConnectPhase::Idle);
             return Err(ChainError::BadPrevBlock);
         }
 
@@ -1100,12 +1362,15 @@ impl ChainState {
             address_index: &self.address_index,
             #[cfg(feature = "block-filter-index")]
             filter_index: &self.filter_index,
+            phase_tracker: Some(phases),
         })?;
 
         // Atomic commit
+        phases.enter(ConnectPhase::WriteBatch);
         self.store.write_batch(batch)?;
 
         // Update in-memory tip
+        phases.enter(ConnectPhase::TipWrite);
         {
             let mut tip = self.tip.write();
             tip.hash = *hash;
@@ -1115,6 +1380,7 @@ impl ChainState {
         // Update MTP cache with this block's timestamp
         self.push_mtp_cache(entry.height, entry.header.time);
 
+        phases.enter(ConnectPhase::Idle);
         Ok(*hash)
     }
 
@@ -1192,6 +1458,7 @@ impl ChainState {
             address_index: &self.address_index,
             #[cfg(feature = "block-filter-index")]
             filter_index: &self.filter_index,
+            phase_tracker: None,
             })?;
             self.store.write_batch(batch)?;
 
@@ -1350,12 +1617,12 @@ impl ChainState {
             flat_files
                 .for_each_block(|block_bytes, pos| {
                     if block_bytes.len() < 80 {
-                        return;
+                        return std::ops::ControlFlow::Continue(());
                     }
                     let header: bitcoin::block::Header =
                         match bitcoin::consensus::deserialize(&block_bytes[..80]) {
                             Ok(h) => h,
-                            Err(_) => return,
+                            Err(_) => return std::ops::ControlFlow::Continue(()),
                         };
                     let hash = header.block_hash();
                     children
@@ -1369,6 +1636,7 @@ impl ChainState {
                     {
                         p.set_current(scanned);
                     }
+                    std::ops::ControlFlow::Continue(())
                 })
                 .map_err(|e| ChainError::FlatFile(format!("scan flat files: {}", e)))?;
         }
@@ -1433,6 +1701,7 @@ impl ChainState {
                 address_index: &self.address_index,
                 #[cfg(feature = "block-filter-index")]
                 filter_index: &self.filter_index,
+                phase_tracker: None,
             })?;
             self.store.write_batch(batch)?;
 
@@ -1743,6 +2012,7 @@ impl ChainState {
                         address_index: &self.address_index,
             #[cfg(feature = "block-filter-index")]
             filter_index: &self.filter_index,
+                        phase_tracker: None,
                     })?;
                     self.store.write_batch(batch)?;
                     {
@@ -1829,6 +2099,7 @@ impl ChainState {
             address_index: &self.address_index,
             #[cfg(feature = "block-filter-index")]
             filter_index: &self.filter_index,
+            phase_tracker: None,
         });
         let batch = match connect_attempt {
             Ok(b) => b,
@@ -2087,6 +2358,7 @@ impl ChainState {
                 address_index: &self.address_index,
             #[cfg(feature = "block-filter-index")]
             filter_index: &self.filter_index,
+            phase_tracker: None,
             })?;
             self.store.write_batch(batch)?;
             let mut tip = self.tip.write();
@@ -3893,6 +4165,172 @@ pub(crate) mod tests {
         }
         assert_eq!(cs.max_indexed_height(), 257);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// repair_block_index_holes scans flat files and restores DataStored
+    /// entries that were wiped to HeaderOnly. Reproduces the mainnet
+    /// 2026-05-12 corruption shape: block data is still in the flat
+    /// file, but the block_index entry was clobbered to
+    /// `HeaderOnly { file_number: 0, data_pos: 0 }`, AND there is at
+    /// least one DataStored block at a higher height — the heuristic
+    /// that distinguishes corruption from a normal IBD frontier.
+    #[test]
+    fn test_repair_block_index_holes_restores_datastored_from_flat_files() {
+        let (cs, dir) = make_chain_state();
+
+        // Build a 5-block chain on top of genesis. accept_block writes
+        // them as DataStored + Valid and the flat files hold all 5.
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+        let mut parent = genesis.block_hash();
+        let mut blocks: Vec<Block> = Vec::new();
+        let mut height = 1u32;
+        let mut time = genesis.header.time + 1;
+        for _ in 0..5 {
+            let blk = build_test_block(parent, height, time);
+            parent = blk.block_hash();
+            cs.accept_block(&blk).unwrap();
+            blocks.push(blk);
+            height += 1;
+            time += 1;
+        }
+        cs.flush_coin_cache().unwrap();
+        assert_eq!(cs.tip_height(), 5);
+
+        // Corrupt block 4 (middle of the "above tip" range). Leave
+        // block 5 intact as DataStored — this matches the mainnet
+        // shape where height N is HeaderOnly but heights >N stay
+        // DataStored, and is what the repair heuristic keys off of.
+        let inner = cs.store.inner_for_test();
+
+        let target = blocks[3].block_hash(); // height 4
+        let original = cs.get_block_index(&target).unwrap();
+        let corrupt = BlockIndexEntry {
+            status: BlockStatus::HeaderOnly,
+            file_number: 0,
+            data_pos: 0,
+            num_tx: 0,
+            ..original.clone()
+        };
+        let mut batch = crate::storage::StoreBatch::default();
+        batch.block_index_puts.push((target, corrupt));
+        inner.write_batch(batch).unwrap();
+        cs.store.invalidate_block_index_cache(&target);
+
+        // Rewind tip pointer (in-memory + persisted) to height 3 so
+        // block 4 is "above tip" from the repair's POV. headers_tip
+        // isn't bumped by accept_block, so set it directly.
+        {
+            let mut tip = cs.tip.write();
+            tip.hash = blocks[2].block_hash();
+            tip.height = 3;
+        }
+        let tip_batch = crate::storage::StoreBatch {
+            tip: Some(blocks[2].block_hash()),
+            ..Default::default()
+        };
+        cs.store.write_batch(tip_batch).unwrap();
+        cs.flush_coin_cache().unwrap();
+        cs.headers_tip_height.fetch_max(5, Ordering::Relaxed);
+
+        assert!(
+            !cs.has_block_data(&target),
+            "corruption setup must leave has_block_data=false"
+        );
+
+        let outcome = cs.repair_block_index_holes().unwrap();
+        assert_eq!(outcome.holes_found, 1);
+        assert_eq!(outcome.repaired, 1);
+        assert_eq!(outcome.still_missing, 0);
+
+        cs.store.invalidate_block_index_cache(&target);
+        assert!(cs.has_block_data(&target));
+        let repaired = cs.get_block_index(&target).unwrap();
+        assert_eq!(repaired.status, BlockStatus::DataStored);
+        assert_eq!(repaired.num_tx as usize, blocks[3].txdata.len());
+        let read_back = cs.get_block(&target).unwrap();
+        assert_eq!(read_back.block_hash(), target);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Heuristic test: HeaderOnly entries at the IBD frontier (no
+    /// DataStored entry above them) are NOT scanned for. These are
+    /// normal in-progress IBD state, not corruption, and scanning the
+    /// flat files for them would burn ~20 minutes of disk reads on
+    /// every restart for a healthy node mid-IBD.
+    #[test]
+    fn test_repair_block_index_holes_skips_ibd_frontier() {
+        let (cs, _dir) = make_chain_state();
+
+        // Build 3 blocks, then corrupt blocks 4 and 5 to HeaderOnly —
+        // but with NO DataStored above them. This is the IBD-frontier
+        // shape: headers accepted, blocks not yet downloaded.
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+        let mut parent = genesis.block_hash();
+        let mut blocks: Vec<Block> = Vec::new();
+        let mut h_acc = 1u32;
+        let mut t_acc = genesis.header.time + 1;
+        for _ in 0..5 {
+            let blk = build_test_block(parent, h_acc, t_acc);
+            parent = blk.block_hash();
+            cs.accept_block(&blk).unwrap();
+            blocks.push(blk);
+            h_acc += 1;
+            t_acc += 1;
+        }
+        cs.flush_coin_cache().unwrap();
+
+        // Mark heights 4 AND 5 as HeaderOnly (the entire above-tip
+        // range). There is no DataStored above either — both look like
+        // normal IBD frontier.
+        let inner = cs.store.inner_for_test();
+        for i in [3usize, 4] {
+            let hash = blocks[i].block_hash();
+            let original = cs.get_block_index(&hash).unwrap();
+            let corrupt = BlockIndexEntry {
+                status: BlockStatus::HeaderOnly,
+                file_number: 0,
+                data_pos: 0,
+                num_tx: 0,
+                ..original.clone()
+            };
+            let mut batch = crate::storage::StoreBatch::default();
+            batch.block_index_puts.push((hash, corrupt));
+            inner.write_batch(batch).unwrap();
+            cs.store.invalidate_block_index_cache(&hash);
+        }
+
+        // Rewind tip to 3.
+        {
+            let mut tip = cs.tip.write();
+            tip.hash = blocks[2].block_hash();
+            tip.height = 3;
+        }
+        let tip_batch = crate::storage::StoreBatch {
+            tip: Some(blocks[2].block_hash()),
+            ..Default::default()
+        };
+        cs.store.write_batch(tip_batch).unwrap();
+        cs.flush_coin_cache().unwrap();
+        cs.headers_tip_height.fetch_max(5, Ordering::Relaxed);
+
+        let outcome = cs.repair_block_index_holes().unwrap();
+        assert_eq!(
+            outcome.holes_found, 0,
+            "frontier HeaderOnly entries must not count as repair holes"
+        );
+        assert_eq!(outcome.blocks_scanned, 0, "no scan should occur");
+    }
+
+    /// Healthy node: repair is a fast no-op.
+    #[test]
+    fn test_repair_block_index_holes_no_holes_is_fast_noop() {
+        let (cs, dir) = make_chain_state();
+        let outcome = cs.repair_block_index_holes().unwrap();
+        assert_eq!(outcome.holes_found, 0);
+        assert_eq!(outcome.repaired, 0);
+        assert_eq!(outcome.still_missing, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

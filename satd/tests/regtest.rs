@@ -849,15 +849,66 @@ fn test_parallel_ibd() {
         .unwrap();
     assert_eq!(get_rpc_u64(&node_a, "getblockcount").unwrap(), 200);
 
-    // Start node B connected to A — should use parallel IBD
-    let mut node_b = TestNode::start(&[&format!("--connect=127.0.0.1:{}", p2p_port_a)]);
+    // Start node B connected to A — should use parallel IBD. Capture
+    // node B's stderr so the wedge dump below can include satd-side
+    // logs when the test fails (without paying the I/O cost in every
+    // other regtest test).
+    let mut node_b = TestNode::start_capturing_stderr(&[&format!(
+        "--connect=127.0.0.1:{}",
+        p2p_port_a
+    )]);
 
-    // Wait for B to sync all 200 blocks (generous timeout for regtest)
-    poll_until(
-        || get_rpc_u64(&node_b, "getblockcount").unwrap_or(0) >= 200,
-        Duration::from_secs(60),
-        "node B did not sync to height 200 via parallel IBD",
-    );
+    // Wait for B to sync all 200 blocks. The timeout has headroom for slow
+    // CI runners: per-peer in-flight is capped at 16 (Bitcoin Core's
+    // MAX_BLOCKS_IN_TRANSIT_PER_PEER), so a 1-peer regtest run needs ~13
+    // round-trips and can take 60s+ when the runner is under load even
+    // though it completes in ~11s locally.
+    let start = std::time::Instant::now();
+    let mut last_logged = 0u64;
+    while start.elapsed() < Duration::from_secs(180) {
+        let count = get_rpc_u64(&node_b, "getblockcount").unwrap_or(0);
+        if count >= 200 {
+            eprintln!(
+                "test_parallel_ibd: synced 200/200 in {:.1}s",
+                start.elapsed().as_secs_f64()
+            );
+            break;
+        }
+        if count != last_logged && start.elapsed().as_secs() > 5 {
+            eprintln!(
+                "test_parallel_ibd: at {:.1}s, node B getblockcount={}",
+                start.elapsed().as_secs_f64(),
+                count
+            );
+            last_logged = count;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let final_count = get_rpc_u64(&node_b, "getblockcount").unwrap_or(0);
+    if final_count < 200 {
+        // Dump node B state to make the wedge debuggable from CI logs.
+        let chaininfo = node_b
+            .rpc_call("getblockchaininfo")
+            .map(|v| v.to_string())
+            .unwrap_or_else(|e| format!("(rpc err: {e})"));
+        let peerinfo = node_b
+            .rpc_call("getpeerinfo")
+            .map(|v| v.to_string())
+            .unwrap_or_else(|e| format!("(rpc err: {e})"));
+        let a_count = get_rpc_u64(&node_a, "getblockcount").unwrap_or(0);
+        let b_stderr = std::fs::read_to_string(&node_b.stderr_log)
+            .unwrap_or_else(|e| format!("(read err: {e})"));
+        // Last 200 log lines are usually enough to see the wedge state.
+        let tail: String = b_stderr.lines().rev().take(200).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
+        eprintln!(
+            "test_parallel_ibd wedge dump:\n  node_a.getblockcount={a_count}\n  node_b.getblockchaininfo={chaininfo}\n  node_b.getpeerinfo={peerinfo}\n  node_b.stderr (last 200 lines):\n{tail}",
+        );
+        panic!(
+            "node B did not sync to height 200 via parallel IBD; stuck at {} after {:.1}s",
+            final_count,
+            start.elapsed().as_secs_f64()
+        );
+    }
 
     // Verify both nodes agree on the best block
     let a_hash = get_rpc_str(&node_a, "getbestblockhash").unwrap();

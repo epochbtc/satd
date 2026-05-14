@@ -835,31 +835,83 @@ impl Store for RocksDbStore {
 
         // Block index
         //
-        // Dominance filter mirroring `CachedStore::write_batch`'s rule:
-        // a HeaderOnly write must not clobber an on-disk DataStored or
-        // Valid entry. Most callers hit this through the cache, which
-        // already drops dominated writes before they reach us — but
-        // any path that bypasses the cache (e.g. tests, direct
-        // `Store::write_batch`) would otherwise reintroduce the same
-        // race the cache fix closed: `accept_headers`' HeaderOnly
-        // batch clobbering a concurrent `store_block`'s DataStored
-        // update, leaving `has_block_data()` permanently false and
-        // stalling the connect loop. Silent-keep (no error, no log
-        // spam) matches the cache behavior.
+        // Dominance filter: a HeaderOnly write must never clobber an
+        // existing DataStored or Valid entry. The cache layer
+        // (`CachedStore::write_batch_mode`) is supposed to filter
+        // dominated entries before we see them, but we keep this check
+        // for two reasons:
+        //
+        //   1. Any path that bypasses the cache (tests, direct
+        //      `Store::write_batch` calls) would otherwise reintroduce
+        //      the race that produced the 2026-05-12 wedge — ~435
+        //      block-index entries on a single mainnet IBD instance
+        //      flipped from DataStored to HeaderOnly with file=0 pos=0
+        //      (the placeholder values accept_headers writes), leaving
+        //      `has_block_data()` permanently false at every hole.
+        //
+        //   2. The check has to be **batch-aware**, not just disk-aware.
+        //      RocksDB's `WriteBatch` keeps the last `put_cf` per key,
+        //      so if a single batch contains [(X, DataStored), (X,
+        //      HeaderOnly)] (insertion order), the disk ends up with
+        //      HeaderOnly. Tracking `seen_in_batch` catches this; the
+        //      disk-state read alone misses it because the
+        //      not-yet-committed prior put isn't visible to `get_cf`.
+        //
+        // Silent-keep (no error, no log spam) matches the cache behavior.
+        let mut seen_in_batch: std::collections::HashMap<BlockHash, BlockStatus> =
+            std::collections::HashMap::new();
         for (hash, entry) in &batch.block_index_puts {
-            if entry.status == BlockStatus::HeaderOnly
-                && let Some(existing_bytes) = self
-                    .db
-                    .get_cf(&cf_bi, hash_bytes(hash))
-                    .map_err(|e| StoreError::Database(e.to_string()))?
-                && let Ok(existing) = bincode::deserialize::<BlockIndexEntry>(&existing_bytes)
-                && matches!(existing.status, BlockStatus::DataStored | BlockStatus::Valid)
-            {
+            // Dominance guard: a HeaderOnly put must not overwrite an
+            // existing DataStored/Valid value. Check the in-batch
+            // history first (a prior put in this same WriteBatch is
+            // invisible to `get_cf` until commit), then fall back to
+            // disk. Errors propagate — F3 fix (PR #184 re-review): the
+            // previous `.ok().flatten()` / `deserialize(...).ok()`
+            // chain silently disabled the guard if RocksDB returned
+            // an error or an existing entry was unparseable. Failing
+            // closed (refuse the write) preserves dominance even
+            // under storage faults; the operator sees a real error
+            // and can investigate rather than ending up with a
+            // silently downgraded HeaderOnly entry overwriting
+            // forensic evidence.
+            let dominant_status = if entry.status == BlockStatus::HeaderOnly {
+                match seen_in_batch.get(hash).copied() {
+                    Some(s) => Some(s),
+                    None => match self
+                        .db
+                        .get_cf(&cf_bi, hash_bytes(hash))
+                        .map_err(|e| {
+                            StoreError::Database(format!(
+                                "block-index dominance guard get_cf({}): {}",
+                                hash, e
+                            ))
+                        })? {
+                        Some(bytes) => {
+                            let existing: BlockIndexEntry = bincode::deserialize(&bytes)
+                                .map_err(|e| {
+                                    StoreError::Serialization(format!(
+                                        "block-index dominance guard deserialize({}): {}",
+                                        hash, e
+                                    ))
+                                })?;
+                            Some(existing.status)
+                        }
+                        None => None,
+                    },
+                }
+            } else {
+                None
+            };
+            if matches!(
+                dominant_status,
+                Some(BlockStatus::DataStored) | Some(BlockStatus::Valid)
+            ) {
                 continue;
             }
             let value =
                 bincode::serialize(entry).map_err(|e| StoreError::Serialization(e.to_string()))?;
             wb.put_cf(&cf_bi, hash_bytes(hash), &value);
+            seen_in_batch.insert(*hash, entry.status);
         }
 
         // Coins with counter tracking
@@ -1980,6 +2032,107 @@ mod tests {
             store.get_block_index(&hash).unwrap().status,
             BlockStatus::Valid
         );
+    }
+
+    #[test]
+    fn block_index_dominance_guard_fails_closed_on_corrupt_existing_value() {
+        // Regression for review F3 (PR #184 re-review): the dominance
+        // guard previously used `.ok().flatten()` for the RocksDB read
+        // and `.ok()` for deserialization, so a read error or an
+        // unparseable existing entry silently disabled the guard and
+        // allowed a HeaderOnly write to land — overwriting forensic
+        // evidence of the original corruption.
+        //
+        // The fix surfaces deserialize failure as `StoreError::
+        // Serialization`. Verify by: writing junk bytes directly to
+        // the block_index CF under a known hash, then attempting a
+        // HeaderOnly write_batch for that hash. The batch must fail,
+        // and the junk bytes must remain on disk so an operator can
+        // diagnose the underlying corruption rather than seeing it
+        // silently masked.
+        let (store, _dir) = temp_store(false);
+        let (hash, _) = regtest_genesis_entry();
+
+        // Inject corrupt bytes directly via the inner db handle —
+        // bypasses write_batch's normal serialize path.
+        let cf_bi = store.cf(CF_BLOCK_INDEX);
+        store.db.put_cf(&cf_bi, hash_bytes(&hash), b"not-a-block-index-entry")
+            .expect("direct put_cf for corrupt fixture");
+
+        // Now attempt a HeaderOnly write for the same hash. The
+        // dominance guard must reject the whole batch.
+        let header_only = BlockIndexEntry {
+            status: BlockStatus::HeaderOnly,
+            file_number: 0,
+            data_pos: 0,
+            ..regtest_genesis_entry().1
+        };
+        let mut batch = StoreBatch::default();
+        batch.block_index_puts.push((hash, header_only));
+        let res = store.write_batch(batch);
+        assert!(
+            matches!(res, Err(StoreError::Serialization(_))),
+            "expected StoreError::Serialization, got {:?}",
+            res
+        );
+
+        // The corrupt bytes must still be on disk — the failed batch
+        // did not silently overwrite them.
+        let raw = store.db.get_cf(&cf_bi, hash_bytes(&hash))
+            .expect("get_cf")
+            .expect("entry still present");
+        assert_eq!(
+            raw, b"not-a-block-index-entry",
+            "corrupt entry must survive the rejected dominance check"
+        );
+    }
+
+    #[test]
+    fn block_index_in_batch_dominance_keeps_highest_status() {
+        // RocksDB's WriteBatch keeps the last `put_cf` per key, so a
+        // batch carrying both (X, DataStored) and (X, HeaderOnly) for
+        // the same hash would land on disk as HeaderOnly. The inner
+        // store's dominance filter has to be batch-aware to catch this
+        // — checking only the on-disk state is not enough because the
+        // earlier `put_cf` in the same batch isn't visible to `get_cf`.
+        //
+        // Order 1: DataStored first, HeaderOnly second.
+        let (store, _dir) = temp_store(false);
+        let (hash, mut datastored) = regtest_genesis_entry();
+        datastored.status = BlockStatus::DataStored;
+        datastored.file_number = 4;
+        datastored.data_pos = 42;
+        let header_only = BlockIndexEntry {
+            status: BlockStatus::HeaderOnly,
+            file_number: 0,
+            data_pos: 0,
+            ..datastored.clone()
+        };
+
+        let mut batch = StoreBatch::default();
+        batch.block_index_puts.push((hash, datastored.clone()));
+        batch.block_index_puts.push((hash, header_only.clone()));
+        store.write_batch(batch).unwrap();
+
+        let recovered = store.get_block_index(&hash).unwrap();
+        assert_eq!(
+            recovered.status,
+            BlockStatus::DataStored,
+            "in-batch HeaderOnly write must not clobber an earlier DataStored write"
+        );
+        assert_eq!(recovered.file_number, 4);
+        assert_eq!(recovered.data_pos, 42);
+
+        // Order 2: HeaderOnly first, DataStored second — last writer
+        // wins for the upgrade direction.
+        let (store2, _dir2) = temp_store(false);
+        let mut batch2 = StoreBatch::default();
+        batch2.block_index_puts.push((hash, header_only));
+        batch2.block_index_puts.push((hash, datastored.clone()));
+        store2.write_batch(batch2).unwrap();
+        let recovered2 = store2.get_block_index(&hash).unwrap();
+        assert_eq!(recovered2.status, BlockStatus::DataStored);
+        assert_eq!(recovered2.file_number, 4);
     }
 
     #[test]

@@ -14,6 +14,7 @@ use tokio::sync::mpsc;
 
 use base64::Engine;
 
+use crate::chain::connect_phase::ConnectPhase;
 use crate::chain::state::ChainState;
 use crate::mempool::fee::FeeEstimator;
 use crate::mempool::orphanage::{AddOutcome, OrphanReject, TxOrphanage};
@@ -833,15 +834,24 @@ impl PeerManager {
             if has_ibd {
                 // Every 4 ticks (2s): stall detection and reassignment
                 if ticks.is_multiple_of(4) {
-                    let (stalled, stale_heights) = {
+                    let (stalled, stale_heights, silent) = {
                         let mut ibd = self.ibd.write();
                         if let Some(scheduler) = ibd.as_mut() {
                             let stalled = scheduler.detect_stalls(Duration::from_secs(15));
                             // Per-height timeout: catch heights stuck with an active peer
-                            let stale = scheduler.release_stale_inflight(Duration::from_secs(60));
-                            (stalled, stale)
+                            let stale = scheduler.release_stale_inflight(
+                                Duration::from_secs(60),
+                                Duration::from_secs(15),
+                            );
+                            // Silent peers are scanned AFTER releases so a
+                            // peer that hit its third release on this pass
+                            // gets dropped on the same tick.
+                            let silent = scheduler.silent_peers(
+                                crate::net::ibd::SILENT_PEER_FAILURE_THRESHOLD,
+                            );
+                            (stalled, stale, silent)
                         } else {
-                            (Vec::new(), 0)
+                            (Vec::new(), 0, Vec::new())
                         }
                     };
                     for peer_id in stalled {
@@ -850,27 +860,60 @@ impl PeerManager {
                     if stale_heights > 0 {
                         tracing::info!(stale_heights, "IBD: stale in-flight heights returned to pending");
                     }
+                    for peer_id in silent {
+                        let addr = self
+                            .peers
+                            .read()
+                            .get(&peer_id)
+                            .map(|h| h.info.addr.to_string())
+                            .unwrap_or_else(|| "<gone>".to_string());
+                        tracing::warn!(
+                            peer_id,
+                            addr = %addr,
+                            "IBD: dropping silent peer — repeatedly failed to deliver assigned blocks"
+                        );
+                        // Reuse the normal disconnect flow so the scheduler
+                        // gets its in-flight heights back via peer_disconnected.
+                        self.handle_peer_disconnected(peer_id);
+                    }
                     // Assign work to any idle peers
                     self.assign_all_peers();
                 }
 
                 // Every 20 ticks (10s): progress logging
                 if ticks.is_multiple_of(20) {
-                    let (dl, inf, pend, target) = {
+                    let (cursor, target) = {
+                        let ibd = self.ibd.read();
+                        match ibd.as_ref() {
+                            Some(s) => (s.connect_cursor(), s.target_height()),
+                            None => (0, 0),
+                        }
+                    };
+                    let (dl, inf, pend, _) = {
                         let ibd = self.ibd.read();
                         ibd.as_ref()
                             .map(|s| s.progress())
                             .unwrap_or((0, 0, 0, 0))
                     };
                     let peers_active = self.connection_count();
+                    // "stored" is the count of blocks already connected,
+                    // which is exactly `connect_cursor`. The prior formula
+                    // `target - dl - inf - pend` (plus dl) underflowed when
+                    // pending and downloaded overlapped: the priority-zone
+                    // scan does not pop from pending, so an assigned and
+                    // then delivered height can appear in both `downloaded`
+                    // and `pending` simultaneously, making the subtraction
+                    // wrap below zero. That panic crashed the sync loop and
+                    // wedged IBD with the trailing blocks unrequested.
                     tracing::info!(
                         "IBD download: {}/{} stored, {} in-flight, {} pending, {} peers",
-                        dl + (target as usize - dl - inf - pend),
+                        cursor,
                         target,
                         inf,
                         pend,
                         peers_active
                     );
+                    let _ = dl; // retained for future per-tick stats
                 }
             }
 
@@ -1177,7 +1220,56 @@ impl PeerManager {
                 }
             }
             NetworkMessage::NotFound(inventory) => {
-                tracing::debug!(id, count = inventory.len(), "Peer sent notfound");
+                // Authoritative "I don't have this" from the peer. Until
+                // this commit we logged at debug and did nothing, so the
+                // height stayed in_flight for the full 60s
+                // `release_stale_inflight` window before any other peer
+                // could be assigned. When ALL near-cursor peers respond
+                // notfound (e.g. they're pruned or not synced past the
+                // connect cursor's depth), the connector wedges
+                // indefinitely. Release the heights now so the next
+                // `assign_all_peers` tick can try a different peer.
+                let mut block_hashes: Vec<bitcoin::BlockHash> = Vec::new();
+                for inv in &inventory {
+                    if let Inventory::Block(h) | Inventory::WitnessBlock(h) = inv {
+                        block_hashes.push(*h);
+                    }
+                }
+                if block_hashes.is_empty() {
+                    tracing::debug!(id, count = inventory.len(), "Peer sent notfound (non-block)");
+                } else {
+                    let mut released_heights: Vec<u32> = Vec::new();
+                    {
+                        let mut ibd = self.ibd.write();
+                        if let Some(scheduler) = ibd.as_mut() {
+                            for h in &block_hashes {
+                                if let Some(entry) = self.chain_state.get_block_index(h)
+                                    && scheduler.release_height(entry.height, id)
+                                {
+                                    released_heights.push(entry.height);
+                                }
+                            }
+                        }
+                    }
+                    if released_heights.is_empty() {
+                        tracing::debug!(
+                            id,
+                            count = block_hashes.len(),
+                            "Peer sent notfound for blocks not currently in_flight to this peer"
+                        );
+                    } else {
+                        tracing::info!(
+                            peer_id = id,
+                            count = released_heights.len(),
+                            min_height = released_heights.iter().min().copied(),
+                            max_height = released_heights.iter().max().copied(),
+                            "Peer notfound: heights released for reassignment to a different peer"
+                        );
+                        // Trigger immediate reassignment instead of waiting
+                        // for the next 2s scheduler tick.
+                        self.assign_all_peers();
+                    }
+                }
             }
             NetworkMessage::SendHeaders => {
                 tracing::debug!(id, "Peer prefers headers announcements");
@@ -1270,14 +1362,25 @@ impl PeerManager {
                 }
             }
 
-            // Start or extend IBD scheduler as soon as headers are far enough
-            // ahead of the block tip. Don't wait for header download to finish —
-            // pipeline block downloads alongside header sync.
+            // Start or extend IBD scheduler when headers are ahead of blocks.
+            //
+            // The +24 threshold only gates *creation* — once a scheduler
+            // exists, extension must happen unconditionally on any new
+            // headers past its target. Otherwise a late-arriving headers
+            // batch (e.g. the last few blocks of a small chain) lands
+            // while tip is already close to the prior target, the
+            // `>tip+24` gate fails, the scheduler keeps its old target,
+            // and the connector declares IBD complete with the new
+            // headers' blocks unrequested. Observed on regtest
+            // test_parallel_ibd: connector wedges at tip < headers tip
+            // forever because request_missing_blocks (the non-IBD path)
+            // only runs inside handle_headers and never sees another
+            // batch trigger it.
             let tip = self.chain_state.tip_height();
             let headers_tip = htip as u32;
-            if headers_tip > tip + 24 {
+            {
                 let mut ibd = self.ibd.write();
-                if ibd.is_none() {
+                if ibd.is_none() && headers_tip > tip + 24 {
                     let effective_max_ahead = Self::resolve_max_ahead(self.max_ahead, headers_tip, tip);
                     let sched = IbdScheduler::new(headers_tip, tip, &self.chain_state, effective_max_ahead);
                     let (_, _, pending, target) = sched.progress();
@@ -1294,17 +1397,19 @@ impl PeerManager {
                     cvar.notify_one();
                     // Assign work to all connected peers
                     self.assign_all_peers();
-                } else if let Some(scheduler) = ibd.as_mut() {
-                    // Headers advanced — extend the scheduler target so it
-                    // keeps downloading without waiting for the current batch
-                    // to fully complete first.
-                    if headers_tip > scheduler.target_height() {
-                        scheduler.extend_target(headers_tip, &self.chain_state);
-                        drop(ibd);
-                        // Assign more work now that we have more blocks to fetch
-                        self.assign_all_peers();
-                    }
+                } else if let Some(scheduler) = ibd.as_mut()
+                    && headers_tip > scheduler.target_height()
+                {
+                    scheduler.extend_target(headers_tip, &self.chain_state);
+                    drop(ibd);
+                    self.assign_all_peers();
                 }
+                // Scope ends here — write lock dropped before the read
+                // lock below. Without the scope, the no-branch path held
+                // the write lock through `self.ibd.read()`, deadlocking
+                // handle_headers and wedging every test that depends on
+                // block propagation (test_block_propagation,
+                // test_block_sync_between_nodes, the p2p_orphan suite).
             }
 
             // Request blocks (legacy path for non-IBD or fallback)
@@ -1330,7 +1435,27 @@ impl PeerManager {
     }
 
     /// Assign IBD download work to a specific peer.
+    ///
+    /// Skips peers whose advertised best_height in the version message is
+    /// more than 1000 blocks behind our target. The 2026-05-13 mainnet
+    /// wedge showed inbound peers connecting with `height=0` (likely spam
+    /// or pre-sync nodes) consuming priority-zone assignments they cannot
+    /// fulfill, then holding them for the full stale-timeout window
+    /// before any useful peer is tried.
     fn assign_peer_work(&self, peer_id: PeerId) {
+        let target_height = match self.ibd.read().as_ref() {
+            Some(s) => s.target_height(),
+            None => return,
+        };
+        let peer_height = {
+            let peers = self.peers.read();
+            peers.get(&peer_id).map(|h| h.info.best_height).unwrap_or(0)
+        };
+        // i32::saturating_sub avoids underflow for early-IBD targets.
+        if (peer_height as i64) < (target_height as i64).saturating_sub(1000) {
+            // Peer is not synced enough to be a useful IBD source. Skip.
+            return;
+        }
         let mut ibd = self.ibd.write();
         if let Some(scheduler) = ibd.as_mut() {
             scheduler.register_peer(peer_id);
@@ -1607,6 +1732,12 @@ impl PeerManager {
         let mut backpressure_paused = false;
         let mut backpressure_pause_started: Option<Instant> = None;
 
+        // Track which height we've already logged as "stuck waiting for
+        // block data" so we don't flood the log when the connector spins
+        // for 5+ minutes on a missing height. One line per stuck height,
+        // plus one refresh every 60s while still stuck.
+        let mut last_stuck_log: Option<(u32, Instant)> = None;
+
         loop {
             // Backpressure: if RocksDB has accumulated too many L0 SST files,
             // the chainstate is on the path that wedged a 78-GB process
@@ -1700,14 +1831,17 @@ impl PeerManager {
                 // completion, so subsequent retries can attempt to
                 // checkpoint again. The BulkLoadGuard restores Normal
                 // write mode on any actual exit path.
+                chain_state.connect_phases().enter(ConnectPhase::FlushingCoinCache);
                 if let Err(e) = chain_state.flush_coin_cache() {
                     tracing::error!(
                         error = %e,
                         "IBD completion: flush_coin_cache failed; deferring completion"
                     );
+                    chain_state.connect_phases().enter(ConnectPhase::Idle);
                     std::thread::sleep(Duration::from_secs(2));
                     continue;
                 }
+                chain_state.connect_phases().enter(ConnectPhase::FlushDurable);
                 if let Err(e) = chain_state.flush_durable() {
                     tracing::error!(
                         error = %e,
@@ -1731,10 +1865,12 @@ impl PeerManager {
                 Some(h) => h,
                 None => {
                     // No header for this height yet — wait
+                    chain_state.connect_phases().enter(ConnectPhase::WaitingForHeader);
                     let (lock, cvar) = &**connect_signal;
                     let mut ready = lock.lock();
                     *ready = false;
                     let _ = cvar.wait_for(&mut ready, Duration::from_secs(1));
+                    chain_state.connect_phases().enter(ConnectPhase::Idle);
                     continue;
                 }
             };
@@ -1788,6 +1924,7 @@ impl PeerManager {
 
                         // Flush if dirty map is getting large (caps memory usage)
                         if chain_state.cache_dirty_count() > chain_state.flush_threshold() {
+                            chain_state.connect_phases().enter(ConnectPhase::FlushingCoinCache);
                             if let Err(e) = chain_state.flush_coin_cache() {
                                 tracing::error!("Failed to flush cache: {}", e);
                                 chain_state.warnings().record(
@@ -1799,6 +1936,7 @@ impl PeerManager {
                             } else {
                                 chain_state.warnings().clear("storage.flush_coin_cache_failed");
                             }
+                            chain_state.connect_phases().enter(ConnectPhase::Idle);
                         }
 
                         // Log progress
@@ -1860,6 +1998,7 @@ impl PeerManager {
                             // force a durable checkpoint. With BulkLoad mode
                             // (WAL disabled) this bounds crash-recovery replay
                             // work to the last ~1000 blocks.
+                            chain_state.connect_phases().enter(ConnectPhase::FlushingCoinCache);
                             if let Err(e) = chain_state.flush_coin_cache() {
                                 tracing::error!("Failed to flush UTXO cache: {}", e);
                                 chain_state.warnings().record(
@@ -1871,6 +2010,7 @@ impl PeerManager {
                             } else {
                                 chain_state.warnings().clear("storage.flush_coin_cache_failed");
                             }
+                            chain_state.connect_phases().enter(ConnectPhase::FlushDurable);
                             if let Err(e) = chain_state.flush_durable() {
                                 tracing::error!("Failed durable checkpoint: {}", e);
                                 chain_state.warnings().record(
@@ -1882,6 +2022,7 @@ impl PeerManager {
                             } else {
                                 chain_state.warnings().clear("storage.flush_durable_failed");
                             }
+                            chain_state.connect_phases().enter(ConnectPhase::Idle);
                         }
                         // Periodic pruning
                         if keep_blocks > 0 && next_height > keep_blocks
@@ -1943,19 +2084,91 @@ impl PeerManager {
                                 }),
                             );
                         }
+                        chain_state.connect_phases().enter(ConnectPhase::CondvarWait);
                         let (lock, cvar) = &**connect_signal;
                         let mut ready = lock.lock();
                         *ready = false;
                         let _ = cvar.wait_for(&mut ready, Duration::from_secs(1));
+                        chain_state.connect_phases().enter(ConnectPhase::Idle);
                         continue;
                     }
                 }
             } else {
                 // Next block not downloaded yet — wait for signal
+                chain_state.connect_phases().enter(ConnectPhase::WaitingForBlockData);
+                // Diagnostic for the wedge class where the connector spins
+                // forever on a HeaderOnly entry whose data never arrives.
+                // Log once per stuck height, then refresh every 60s with a
+                // scheduler-state snapshot so we can see if the downloader
+                // is even trying. Cheap: the scheduler read is a single
+                // RwLock::read() and three HashMap lookups.
+                let should_log = match last_stuck_log {
+                    None => true,
+                    Some((h, _)) if h != next_height => true,
+                    Some((_, t)) => t.elapsed() >= Duration::from_secs(60),
+                };
+                if should_log {
+                    let (
+                        in_pending,
+                        in_flight,
+                        downloaded,
+                        has_height_to_hash,
+                        inflight_peer,
+                        inflight_age,
+                        peer_load,
+                    ) = {
+                        let sched = ibd.read();
+                        match sched.as_ref() {
+                            Some(s) => {
+                                let p = s.inflight_peer(next_height);
+                                (
+                                    s.pending_contains(next_height),
+                                    s.in_flight_contains(next_height),
+                                    s.is_downloaded(next_height),
+                                    s.height_to_hash_contains(next_height),
+                                    p,
+                                    s.inflight_age_secs(next_height),
+                                    p.map(|pid| s.peer_inflight_count(pid)),
+                                )
+                            }
+                            None => (false, false, false, false, None, None, None),
+                        }
+                    };
+                    let inflight_peer_height = inflight_peer.and_then(|pid| {
+                        // Note: we don't have a back-ref to `self` here
+                        // (this is in block_processor), so look up via the
+                        // ChainState-less PeerManager Arc would require
+                        // passing it in. Leaving as None for now keeps
+                        // this diagnostic single-purpose — the peer ID is
+                        // enough to grep the journal for that peer's
+                        // version log.
+                        let _ = pid;
+                        None::<i32>
+                    });
+                    let entry = chain_state.get_block_index(&hash);
+                    tracing::warn!(
+                        height = next_height,
+                        %hash,
+                        in_pending,
+                        in_flight,
+                        downloaded,
+                        has_height_to_hash,
+                        ?inflight_peer,
+                        ?inflight_age,
+                        ?peer_load,
+                        ?inflight_peer_height,
+                        block_index_status = ?entry.as_ref().map(|e| e.status),
+                        file_number = entry.as_ref().map(|e| e.file_number),
+                        data_pos = entry.as_ref().map(|e| e.data_pos),
+                        "Connector stuck waiting for block data; scheduler state for this height"
+                    );
+                    last_stuck_log = Some((next_height, Instant::now()));
+                }
                 let (lock, cvar) = &**connect_signal;
                 let mut ready = lock.lock();
                 *ready = false;
                 let _ = cvar.wait_for(&mut ready, Duration::from_secs(1));
+                chain_state.connect_phases().enter(ConnectPhase::Idle);
             }
         }
 
@@ -2653,6 +2866,16 @@ impl PeerManager {
 
     /// Write loop for a peer: forwards received messages to the manager
     /// and sends outbound messages. Separated for clarity.
+    ///
+    /// Termination contract:
+    ///   - `read_rx` closing → reader task ended; exit with error so the
+    ///     outer `peer_task` emits `NetEvent::PeerDisconnected`.
+    ///   - `msg_rx` closing → manager dropped our `PeerHandle` (e.g. the
+    ///     silent-peer drop path, or a deliberate `handle_peer_disconnected`
+    ///     call). Exit too, so the TCP socket and reader task actually
+    ///     terminate instead of leaving an untracked peer feeding events.
+    ///     The earlier `Some(msg) = msg_rx.recv()` pattern silently
+    ///     disabled the branch on close — review F2 (PRs #180-#184).
     async fn peer_write_loop(
         id: PeerId,
         event_tx: &mpsc::Sender<NetEvent>,
@@ -2676,8 +2899,21 @@ impl PeerManager {
                         }
                     }
                 }
-                Some(msg) = msg_rx.recv() => {
-                    writer.send(msg).await.map_err(|e| e.to_string())?;
+                msg = msg_rx.recv() => {
+                    match msg {
+                        Some(msg) => {
+                            writer.send(msg).await.map_err(|e| e.to_string())?;
+                        }
+                        None => {
+                            // Manager dropped our handle. Return so the
+                            // outer task aborts the reader and closes
+                            // the TCP socket; without this exit, the
+                            // task would keep running on `read_rx` and
+                            // emit `MessageReceived` events for a peer
+                            // no longer in `self.peers`.
+                            return Err("disconnected by manager".to_string());
+                        }
+                    }
                 }
             }
         }

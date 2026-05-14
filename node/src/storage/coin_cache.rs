@@ -144,6 +144,27 @@ impl CoinCache {
         Self::new(inner, DEFAULT_DBCACHE_MB)
     }
 
+    /// Test-only direct access to the wrapped backing store. Lets tests
+    /// simulate the historical block-index corruption (a HeaderOnly
+    /// write reaching the inner store without going through the cache
+    /// dominance filter) so the repair pass has something to repair.
+    /// Never use outside `#[cfg(test)]` — bypassing the cache means
+    /// none of its invariants hold.
+    #[cfg(test)]
+    pub fn inner_for_test(&self) -> &dyn Store {
+        &*self.inner
+    }
+
+    /// Test-only: drop a single hash from the block-index LRU. After
+    /// corrupting the inner store directly, the cache may still serve a
+    /// stale (correct) entry from the LRU — invalidating it forces the
+    /// next read to fall through to the (now-corrupted) inner store,
+    /// matching what a real post-restart cache would do.
+    #[cfg(test)]
+    pub fn invalidate_block_index_cache(&self, hash: &BlockHash) {
+        self.block_index_cache.lock().pop(hash);
+    }
+
     /// Flush dirty coins to the backing store.
     ///
     /// Optimizations:
@@ -328,7 +349,7 @@ impl Store for CoinCache {
         self.write_batch_mode(batch, self.current_write_mode())
     }
 
-    fn write_batch_mode(&self, batch: StoreBatch, mode: WriteMode) -> Result<(), StoreError> {
+    fn write_batch_mode(&self, mut batch: StoreBatch, mode: WriteMode) -> Result<(), StoreError> {
         // Honor the caller's explicit mode for the inner-store call.
         // The default trait impl ignores `mode` and delegates to
         // `write_batch`, which would then use `current_write_mode()`
@@ -379,27 +400,51 @@ impl Store for CoinCache {
             *self.pending_tip.lock() = batch.tip;
         }
 
-        // Populate overlay LRU caches
+        // Update overlay LRU AND filter dominated entries OUT of the batch.
+        //
+        // Dominance rule: a HeaderOnly write must not clobber an existing
+        // DataStored or Valid entry. Without this filter, accept_headers'
+        // batch (which checks `get_block_index` before deciding to write
+        // but cannot lock across that check + the inner write) can clobber
+        // a concurrent store_block's DataStored update — leaving
+        // `has_block_data()` permanently false and permanently stalling the
+        // connect loop. (Reproduced on mainnet, 2026-05-12; ~435 holes
+        // observed in a single IBD range.)
+        //
+        // The previous incarnation filtered only the cache LRU put, leaving
+        // the dominated entry in the batch we forwarded to the inner store.
+        // The inner-store dominance check (`rocksdb_store::write_batch_mode`)
+        // is the second line of defense but it consults on-disk state, not
+        // the in-flight cache — so cache-only writes still leaked through.
+        // Filtering the batch here keeps the cache and the forwarded batch
+        // in agreement, and the inner-store check stays as defense-in-depth.
+        //
+        // `seen` tracks within-batch dominance so a HeaderOnly entry can't
+        // be saved by appearing earlier in the same batch as a DataStored
+        // entry for the same hash — keep highest-status per hash.
         {
             let mut bi = self.block_index_cache.lock();
-            for (hash, entry) in &batch.block_index_puts {
-                // Don't downgrade: if cache has DataStored/Valid, don't overwrite with HeaderOnly.
-                // This prevents a race where accept_headers' batch write clobbers a concurrent
-                // store_block's DataStored update, causing has_block_data() to return false
-                // and permanently stalling the connect loop.
-                let dominated = if let Some(existing) = bi.peek(hash) {
-                    entry.status == BlockStatus::HeaderOnly
-                        && matches!(
-                            existing.status,
-                            BlockStatus::DataStored | BlockStatus::Valid
-                        )
-                } else {
-                    false
-                };
-                if !dominated {
-                    bi.put(*hash, entry.clone());
+            let mut seen: HashMap<BlockHash, BlockStatus> = HashMap::new();
+            let original = std::mem::take(&mut batch.block_index_puts);
+            let mut filtered = Vec::with_capacity(original.len());
+            for (hash, entry) in original {
+                let dominant_status = seen
+                    .get(&hash)
+                    .copied()
+                    .or_else(|| bi.peek(&hash).map(|e| e.status));
+                let dominated = entry.status == BlockStatus::HeaderOnly
+                    && matches!(
+                        dominant_status,
+                        Some(BlockStatus::DataStored) | Some(BlockStatus::Valid)
+                    );
+                if dominated {
+                    continue;
                 }
+                bi.put(hash, entry.clone());
+                seen.insert(hash, entry.status);
+                filtered.push((hash, entry));
             }
+            batch.block_index_puts = filtered;
         }
         {
             let mut hh = self.height_hash_cache.lock();
@@ -2044,5 +2089,94 @@ mod tests {
         // After remove-then-put, the put must win (it's the latest
         // operation against `prev`).
         assert_eq!(cache.lookup_spend(&prev).unwrap(), Some(sref));
+    }
+
+    // ---------------------------------------------------------------
+    // Block-index dominance filter: cache layer drops dominated entries
+    // OUT of the batch before forwarding to the inner store.
+    // ---------------------------------------------------------------
+    #[test]
+    fn cache_filter_drops_header_only_clobbering_data_stored() {
+        let inner = Box::new(InMemoryStore::new());
+        let cache = CoinCache::new(inner, 10);
+        let hash = make_block_hash(0x77);
+
+        // First batch: write DataStored (e.g. via store_block).
+        let mut batch1 = StoreBatch::default();
+        let mut entry_ds = make_test_entry(100);
+        entry_ds.status = BlockStatus::DataStored;
+        entry_ds.file_number = 9;
+        entry_ds.data_pos = 4242;
+        batch1.block_index_puts.push((hash, entry_ds.clone()));
+        cache.write_batch(batch1).unwrap();
+
+        // Second batch: a HeaderOnly write for the same hash
+        // (simulating a late accept_headers batch). Must be DROPPED —
+        // not just skipped at the LRU but also stripped from what we
+        // forward to the inner store, so the wedge cannot recur on a
+        // cache-evicted hash.
+        let mut batch2 = StoreBatch::default();
+        let entry_ho = BlockIndexEntry {
+            status: BlockStatus::HeaderOnly,
+            file_number: 0,
+            data_pos: 0,
+            ..entry_ds.clone()
+        };
+        batch2.block_index_puts.push((hash, entry_ho));
+        cache.write_batch(batch2).unwrap();
+
+        // Cache lookup: still DataStored.
+        let cached = cache.get_block_index(&hash).unwrap();
+        assert_eq!(cached.status, BlockStatus::DataStored);
+        assert_eq!(cached.file_number, 9);
+
+        // Force a flush and re-check: inner store must also be
+        // DataStored. (The whole point of filtering the batch — not
+        // just the LRU — is that the inner store agrees with the cache.)
+        cache.flush().unwrap();
+        // Drop the cache LRU so the next read falls through to inner.
+        cache.block_index_cache.lock().clear();
+        let from_inner = cache.get_block_index(&hash).unwrap();
+        assert_eq!(
+            from_inner.status,
+            BlockStatus::DataStored,
+            "inner store must reflect the dominance filter — not just the LRU"
+        );
+        assert_eq!(from_inner.file_number, 9);
+    }
+
+    #[test]
+    fn cache_filter_in_batch_keeps_highest_status() {
+        // A single batch carrying both (X, DataStored) and (X, HeaderOnly)
+        // for the same hash. The HeaderOnly entry must be stripped from
+        // the batch the cache forwards to the inner store, regardless
+        // of order. (RocksDB WriteBatch keeps last-put-wins per key, so
+        // an unfiltered batch in HeaderOnly-second order produces a
+        // HeaderOnly disk state — the wedge mechanism.)
+        let inner = Box::new(InMemoryStore::new());
+        let cache = CoinCache::new(inner, 10);
+        let hash = make_block_hash(0x99);
+
+        let mut ds = make_test_entry(200);
+        ds.status = BlockStatus::DataStored;
+        ds.file_number = 3;
+        ds.data_pos = 999;
+        let ho = BlockIndexEntry {
+            status: BlockStatus::HeaderOnly,
+            file_number: 0,
+            data_pos: 0,
+            ..ds.clone()
+        };
+
+        let mut batch = StoreBatch::default();
+        batch.block_index_puts.push((hash, ds.clone()));
+        batch.block_index_puts.push((hash, ho));
+        cache.write_batch(batch).unwrap();
+
+        cache.flush().unwrap();
+        cache.block_index_cache.lock().clear();
+        let from_inner = cache.get_block_index(&hash).unwrap();
+        assert_eq!(from_inner.status, BlockStatus::DataStored);
+        assert_eq!(from_inner.file_number, 3);
     }
 }
