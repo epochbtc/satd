@@ -348,6 +348,18 @@ pub trait Store: Send + Sync {
         Vec::new()
     }
 
+    /// Per-column-family total on-disk SST size in bytes. Companion to
+    /// [`pending_compaction_bytes_by_cf`](Self::pending_compaction_bytes_by_cf):
+    /// the pending number tells you *whether* the LSM is keeping up;
+    /// this tells you *where* the bytes actually live. Surfaced at
+    /// startup and inside the 60s diagnostic snapshot so operators
+    /// can answer "is my chainstate footprint dominated by coins,
+    /// tx_index, or one of the address indexes?" without an offline
+    /// `ldb` dump. Default: empty.
+    fn sst_bytes_by_cf(&self) -> Vec<(&'static str, u64)> {
+        Vec::new()
+    }
+
     /// Force a full compaction of the chainstate (coins) column family.
     /// Called by the periodic compactor when the L0 file count or pending-
     /// compaction backlog has stayed above its threshold for too long, and
