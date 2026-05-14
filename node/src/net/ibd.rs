@@ -22,6 +22,17 @@ struct PeerSlots {
     blocks_received: u64,
     /// Last time we received a block from this peer.
     last_activity: Instant,
+    /// Number of distinct release *events* since the last successful block
+    /// delivery from this peer. Reset to 0 on `block_received`. One event
+    /// covers a burst of per-height releases that happen within
+    /// `FAILURE_DEDUP_WINDOW` of each other — without that dedupe, a peer
+    /// holding 16 near-cursor heights that all time out on the same pass
+    /// would be counted as 16 failures in one go and dropped instantly even
+    /// though it had been silent for only 15s.
+    consecutive_failures: u32,
+    /// Last time `record_failure` actually incremented `consecutive_failures`
+    /// for this peer. Used to dedupe release bursts.
+    last_failure_at: Option<Instant>,
 }
 
 /// BitTorrent-style download coordinator for parallel IBD.
@@ -59,7 +70,34 @@ pub struct IbdScheduler {
 
     /// Height-to-hash mapping (populated from chain_state during creation).
     height_to_hash: HashMap<u32, BlockHash>,
+
+    /// Per-(height, peer) cooldown timestamp. When a height is released from
+    /// a peer (timeout or notfound), that peer is barred from being re-issued
+    /// the same height until `cooldown_until > now`. Prevents the "silent
+    /// peer keeps getting re-assigned the same height" wedge observed at
+    /// height 785197 on the 2026-05-13 mainnet IBD run, where the 15s
+    /// near-cursor timeout released a stuck height back to pending and the
+    /// same peer immediately re-claimed it via its priority-zone scan.
+    height_peer_cooldown: HashMap<u32, HashMap<PeerId, Instant>>,
 }
+
+/// How long a peer is barred from re-claiming a height after it failed to
+/// deliver. Pegged longer than the per-height stale timeout so the release
+/// loop cannot reset it back to the same peer on the next pass.
+const PEER_HEIGHT_COOLDOWN: Duration = Duration::from_secs(60);
+
+/// Per-peer dedupe window for failure counting. A burst of per-height
+/// releases for the same peer within this window counts as one failure
+/// event — otherwise a peer with 16 near-cursor heights that all time out
+/// in a single 15s pass would jump straight past the threshold and get
+/// dropped on the very first stall instead of after sustained silence.
+const FAILURE_DEDUP_WINDOW: Duration = Duration::from_secs(20);
+
+/// Number of distinct release events since the last successful delivery
+/// before a peer is considered silent and eligible for disconnect. With
+/// `FAILURE_DEDUP_WINDOW=20s` this means ~60s of sustained silence before
+/// a peer gets dropped.
+pub const SILENT_PEER_FAILURE_THRESHOLD: u32 = 3;
 
 impl IbdScheduler {
     /// Create a new scheduler for heights `(current_tip+1)..=target_height`.
@@ -89,11 +127,81 @@ impl IbdScheduler {
             in_flight_at: HashMap::new(),
             downloaded: HashSet::new(),
             peer_slots: HashMap::new(),
-            per_peer_limit: 128,
+            // Match Bitcoin Core's MAX_BLOCKS_IN_TRANSIT_PER_PEER (16). The
+            // previous limit (128) packed our getdata to peers with batches
+            // 8x larger than what stock peers expect to process. On the
+            // mainnet 2026-05-13 wedge run, peers consistently disconnected
+            // us after ~60s with most of their assignment unfulfilled — the
+            // smaller batch lets peers cycle through requests faster and
+            // reduces wasted in-flight assignments when a peer drops.
+            per_peer_limit: 16,
             max_ahead,
             connect_cursor: current_tip,
             height_to_hash,
+            height_peer_cooldown: HashMap::new(),
         }
+    }
+
+    /// Record that `peer` failed to deliver `height`. Always sets the
+    /// per-(peer, height) anti-affinity cooldown so the same peer cannot be
+    /// re-issued the same height on the next assign pass. Bumps the peer's
+    /// `consecutive_failures` counter at most once per `FAILURE_DEDUP_WINDOW`
+    /// so a single stall pass that releases many heights from one peer
+    /// counts as one failure event, not N.
+    fn record_failure(&mut self, peer: PeerId, height: u32) {
+        let now = Instant::now();
+        let until = now + PEER_HEIGHT_COOLDOWN;
+        self.height_peer_cooldown
+            .entry(height)
+            .or_default()
+            .insert(peer, until);
+        if let Some(slots) = self.peer_slots.get_mut(&peer) {
+            let should_count = match slots.last_failure_at {
+                Some(prev) => now.duration_since(prev) >= FAILURE_DEDUP_WINDOW,
+                None => true,
+            };
+            if should_count {
+                slots.consecutive_failures = slots.consecutive_failures.saturating_add(1);
+                slots.last_failure_at = Some(now);
+            }
+        }
+    }
+
+    /// True if `peer` is currently barred from being assigned `height`.
+    ///
+    /// Anti-affinity only kicks in when there is more than one peer to
+    /// choose from. With a single peer (regtest, early connect-out) there
+    /// is no alternative — applying the cooldown would make `height`
+    /// permanently unassignable until the cooldown expires, causing a
+    /// connector wedge that's strictly worse than letting the same peer
+    /// retry. Mainnet IBD has 50+ peers so this never trips there.
+    fn is_peer_on_cooldown(&self, height: u32, peer: PeerId, now: Instant) -> bool {
+        if self.peer_slots.len() <= 1 {
+            return false;
+        }
+        self.height_peer_cooldown
+            .get(&height)
+            .and_then(|m| m.get(&peer))
+            .is_some_and(|&until| now < until)
+    }
+
+    /// Peers whose `consecutive_failures` since their last successful delivery
+    /// is at or above `threshold`. Intended for the manager to disconnect
+    /// silent peers that hold slots but never deliver.
+    ///
+    /// Returns empty when the peer pool is at or below the threshold size —
+    /// disconnecting a peer when we have no fallback would halt IBD outright.
+    /// The mainnet wedge this defends against only manifests with many
+    /// peers; regtest / single-peer setups can tolerate slow delivery.
+    pub fn silent_peers(&self, threshold: u32) -> Vec<PeerId> {
+        if self.peer_slots.len() <= 1 {
+            return Vec::new();
+        }
+        self.peer_slots
+            .iter()
+            .filter(|(_, s)| s.consecutive_failures >= threshold)
+            .map(|(&p, _)| p)
+            .collect()
     }
 
     /// Update the max-ahead window at runtime (e.g. for percentage recomputation).
@@ -112,6 +220,8 @@ impl IbdScheduler {
                 assigned: Vec::new(),
                 blocks_received: 0,
                 last_activity: Instant::now(),
+                consecutive_failures: 0,
+                last_failure_at: None,
             });
 
         let current_assigned = slots.assigned.len() as u32;
@@ -122,6 +232,11 @@ impl IbdScheduler {
         let budget = (self.per_peer_limit - current_assigned) as usize;
         let mut hashes = Vec::with_capacity(budget);
         let mut assigned_heights = Vec::with_capacity(budget);
+        let now = Instant::now();
+        // Heights popped from the shared pending pool that this peer is on
+        // cooldown for. We push these back to the tail so the pool isn't
+        // drained from the perspective of other peers' next assign_blocks.
+        let mut deferred: Vec<u32> = Vec::new();
 
         // Priority zone: always try to assign blocks near the connect cursor.
         // This prevents stalls where random blocks are downloaded far ahead but the
@@ -138,6 +253,9 @@ impl IbdScheduler {
                 break;
             }
             if self.downloaded.contains(&h) || self.in_flight.contains_key(&h) {
+                continue;
+            }
+            if self.is_peer_on_cooldown(h, peer_id, now) {
                 continue;
             }
             if let Some(&hash) = self.height_to_hash.get(&h) {
@@ -174,6 +292,12 @@ impl IbdScheduler {
             if self.in_flight.contains_key(&height) {
                 continue;
             }
+            if self.is_peer_on_cooldown(height, peer_id, now) {
+                // Hold this height aside; a different peer's next call can
+                // claim it. Pushed back to the pool after this peer's pass.
+                deferred.push(height);
+                continue;
+            }
 
             if let Some(&hash) = self.height_to_hash.get(&height) {
                 self.in_flight.insert(height, peer_id);
@@ -181,6 +305,13 @@ impl IbdScheduler {
                 assigned_heights.push(height);
                 hashes.push(hash);
             }
+        }
+
+        // Return cooldown-deferred heights to the pending pool so other peers
+        // can pick them up. Pushed to the back to give the shuffled queue a
+        // chance to rotate other candidates forward first.
+        for h in deferred {
+            self.pending.push_back(h);
         }
 
         if !assigned_heights.is_empty() {
@@ -197,11 +328,16 @@ impl IbdScheduler {
         self.in_flight.remove(&height);
         self.in_flight_at.remove(&height);
         self.downloaded.insert(height);
+        // The peer just proved it is alive and delivering. Drop any cooldown
+        // entries for this height and reset its consecutive-failure count.
+        self.height_peer_cooldown.remove(&height);
 
         if let Some(slots) = self.peer_slots.get_mut(&peer_id) {
             slots.assigned.retain(|&h| h != height);
             slots.blocks_received += 1;
             slots.last_activity = Instant::now();
+            slots.consecutive_failures = 0;
+            slots.last_failure_at = None;
             return (slots.assigned.len() as u32) < self.per_peer_limit / 2;
         }
         false
@@ -225,6 +361,14 @@ impl IbdScheduler {
                 self.pending.push_front(height);
             }
         }
+        // Drop the departing peer from every per-height cooldown table.
+        // Without this, a peer that flapped (disconnect/reconnect) would keep
+        // its cooldown across the gap on a freshly-allocated PeerId, which
+        // is harmless, but the entries pile up across hours of churn.
+        self.height_peer_cooldown.retain(|_, m| {
+            m.remove(&peer_id);
+            !m.is_empty()
+        });
     }
 
     /// Detect stalled peers (no activity within timeout).
@@ -255,13 +399,33 @@ impl IbdScheduler {
     /// but silently ignores specific heights (e.g., height 945208). `detect_stalls`
     /// cannot catch this because `last_activity` is refreshed by other deliveries.
     ///
+    /// `near_cursor_timeout` (typically much shorter than `timeout`) applies to
+    /// heights in `connect_cursor+1..=connect_cursor+10` — the immediate-next
+    /// blocks the connector is blocked on. Without this, a single silently-
+    /// dropping peer can stall IBD for the full 60s `timeout` per round even
+    /// though dozens of other peers could deliver the same block instantly.
+    /// The mainnet 2026-05-13 wedge at height 783563 showed peer 52 holding
+    /// it for 2+ minutes with no delivery before any other peer was tried.
+    ///
     /// Returns the number of heights returned to pending.
-    pub fn release_stale_inflight(&mut self, timeout: Duration) -> usize {
+    pub fn release_stale_inflight(
+        &mut self,
+        timeout: Duration,
+        near_cursor_timeout: Duration,
+    ) -> usize {
         let now = Instant::now();
+        let near_cursor_end = self.connect_cursor + 10;
         let stale: Vec<(u32, PeerId)> = self
             .in_flight_at
             .iter()
-            .filter(|&(_, at)| now.duration_since(*at) > timeout)
+            .filter(|&(&h, at)| {
+                let effective = if h > self.connect_cursor && h <= near_cursor_end {
+                    near_cursor_timeout
+                } else {
+                    timeout
+                };
+                now.duration_since(*at) > effective
+            })
             .filter_map(|(&h, _)| self.in_flight.get(&h).map(|&p| (h, p)))
             .collect();
 
@@ -274,6 +438,10 @@ impl IbdScheduler {
             if let Some(slots) = self.peer_slots.get_mut(&peer_id) {
                 slots.assigned.retain(|&x| x != h);
             }
+            // Mark this peer as failed for this height so the very next
+            // assign_peer_work pass doesn't hand the same height right back
+            // to the same silent peer (mainnet 2026-05-13 wedge at 785197).
+            self.record_failure(peer_id, h);
         }
         count
     }
@@ -284,6 +452,8 @@ impl IbdScheduler {
         self.connect_cursor = new_tip;
         // Remove from downloaded set — they've been connected
         self.downloaded.retain(|&h| h > new_tip);
+        // Cooldown entries for heights at or below the cursor are dead state.
+        self.height_peer_cooldown.retain(|&h, _| h > new_tip);
     }
 
     /// Get download progress: (downloaded, in_flight, pending, target).
@@ -326,6 +496,87 @@ impl IbdScheduler {
         self.downloaded.contains(&height)
     }
 
+    /// True if `height` is in the pending pool waiting to be assigned.
+    /// Diagnostic accessor for the connector-stuck-waiting-for-block-data log.
+    pub fn pending_contains(&self, height: u32) -> bool {
+        self.pending.iter().any(|&h| h == height)
+    }
+
+    /// True if `height` is currently assigned to a peer (in-flight).
+    pub fn in_flight_contains(&self, height: u32) -> bool {
+        self.in_flight.contains_key(&height)
+    }
+
+    /// True if the scheduler has a height→hash mapping for `height`.
+    /// Populated at scheduler construction from `chain_state.get_block_hash_by_height`.
+    /// A missing mapping means the priority loop's `height_to_hash.get(&h)`
+    /// returns None and the height is skipped — a way for a height to
+    /// silently never get assigned.
+    pub fn height_to_hash_contains(&self, height: u32) -> bool {
+        self.height_to_hash.contains_key(&height)
+    }
+
+    /// PeerId currently holding the in-flight assignment for `height`,
+    /// if any. Diagnostic accessor used by the "Connector stuck waiting
+    /// for block data" log so we can correlate stuck heights with
+    /// specific peers.
+    pub fn inflight_peer(&self, height: u32) -> Option<PeerId> {
+        self.in_flight.get(&height).copied()
+    }
+
+    /// Age of the in_flight_at timestamp for `height`, in seconds.
+    /// Used to verify that release_stale_inflight is actually firing
+    /// for stuck heights — if this stays small (< stale timeout) across
+    /// repeat diagnostic samples, something is refreshing the timestamp
+    /// inside the 60s window.
+    pub fn inflight_age_secs(&self, height: u32) -> Option<u64> {
+        self.in_flight_at
+            .get(&height)
+            .map(|at| at.elapsed().as_secs())
+    }
+
+    /// Snapshot of how many heights the peer currently holds in
+    /// in_flight. Diagnostic for "is the peer overloaded vs. just
+    /// silently dropping requests".
+    pub fn peer_inflight_count(&self, peer_id: PeerId) -> usize {
+        self.peer_slots
+            .get(&peer_id)
+            .map(|s| s.assigned.len())
+            .unwrap_or(0)
+    }
+
+    /// Release a height that is in-flight to `owner_peer`. Returns
+    /// `true` if the release happened. Returns `false` if the height
+    /// is not in-flight or is held by a different peer (we don't want
+    /// peer X's notfound to release peer Y's pending request).
+    ///
+    /// Unlike `release_stale_inflight`, this does NOT preserve
+    /// `in_flight_at`. The 60s stale timer is a fallback for silently-
+    /// dropping peers; an explicit notfound is authoritative — the
+    /// peer told us it doesn't have the block. We reset the timer so
+    /// the NEXT peer to be assigned gets a fresh 60s window.
+    pub fn release_height(&mut self, height: u32, owner_peer: PeerId) -> bool {
+        let owned_by = match self.in_flight.get(&height) {
+            Some(&p) => p,
+            None => return false,
+        };
+        if owned_by != owner_peer {
+            return false;
+        }
+        self.in_flight.remove(&height);
+        self.in_flight_at.remove(&height);
+        self.pending.push_front(height);
+        if let Some(slots) = self.peer_slots.get_mut(&owner_peer) {
+            slots.assigned.retain(|&x| x != height);
+        }
+        // Anti-affinity: an explicit notfound from this peer is even stronger
+        // evidence than a timeout that we should not re-issue this height to
+        // them. Record the failure so assign_blocks skips this peer for the
+        // cooldown window.
+        self.record_failure(owner_peer, height);
+        true
+    }
+
     /// Get list of all tracked peer IDs.
     pub fn peer_ids(&self) -> Vec<PeerId> {
         self.peer_slots.keys().copied().collect()
@@ -337,6 +588,8 @@ impl IbdScheduler {
             assigned: Vec::new(),
             blocks_received: 0,
             last_activity: Instant::now(),
+            consecutive_failures: 0,
+            last_failure_at: None,
         });
     }
 
@@ -349,6 +602,8 @@ impl IbdScheduler {
         // in_flight_at entry with no matching in_flight makes
         // release_stale_inflight do extra work-for-nothing on every tick.
         self.in_flight_at.remove(&height);
+        // Cooldowns for a downloaded height serve no purpose; drop them.
+        self.height_peer_cooldown.remove(&height);
     }
 
     /// Extend the target height as more headers arrive.
@@ -600,12 +855,248 @@ mod tests {
 
         // Even though the current assignment is fresh, the underlying
         // in_flight_at is still 2 minutes old → release must fire.
-        let released = sched.release_stale_inflight(Duration::from_secs(60));
+        let released = sched.release_stale_inflight(
+            Duration::from_secs(60),
+            Duration::from_secs(15),
+        );
         assert!(
             released >= heights_in_flight.len(),
             "release_stale_inflight should fire for stale heights despite \
              peer churn; released={released} expected>={}",
             heights_in_flight.len()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn release_does_not_re_assign_to_same_peer() {
+        // 2026-05-13 mainnet wedge: peer 1 silently held height 785197 and
+        // the 15s near-cursor timeout released it back to pending. On the
+        // very next assign_peer_work pass, peer 1's priority-zone scan
+        // re-claimed the same height, looping forever. The cooldown must
+        // block self-reassignment for at least the cooldown window.
+        let (cs, dir) = make_chain_state_with_headers(10);
+        let mut sched = IbdScheduler::new(10, 0, &cs, 50_000);
+
+        // Cooldown logic only activates when >1 peer exists (no fallback
+        // with a single peer). Register a second peer up front.
+        sched.register_peer(2);
+
+        // Peer 1 grabs blocks via the priority zone.
+        let assigned_first = sched.assign_blocks(1);
+        assert!(!assigned_first.is_empty());
+        // Pick the first height peer 1 took and release it back.
+        let stuck_height = *sched
+            .peer_slots
+            .get(&1)
+            .and_then(|s| s.assigned.first())
+            .expect("peer 1 has at least one assigned height");
+        assert!(sched.release_height(stuck_height, 1));
+
+        // Peer 1 asks for more work — without anti-affinity it would pop
+        // stuck_height right back off the priority zone.
+        let assigned_second = sched.assign_blocks(1);
+        let took_back: bool = sched
+            .peer_slots
+            .get(&1)
+            .map(|s| s.assigned.contains(&stuck_height))
+            .unwrap_or(false);
+        assert!(
+            !took_back,
+            "peer 1 must not be re-issued a height it just released; \
+             second-pass assigned={assigned_second:?}"
+        );
+        // A different peer can still claim it freely.
+        let _ = sched.assign_blocks(2);
+        let peer2_has_it = sched
+            .peer_slots
+            .get(&2)
+            .map(|s| s.assigned.contains(&stuck_height))
+            .unwrap_or(false);
+        assert!(
+            peer2_has_it,
+            "a fresh peer should be free to pick up the released height"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn silent_peer_flagged_after_repeated_releases() {
+        // After SILENT_PEER_FAILURE_THRESHOLD distinct release events,
+        // dedupe-spaced, the peer must show up in silent_peers() so the
+        // manager can drop it. The dedupe window prevents a single burst
+        // of N height-releases from counting as N events.
+        let (cs, dir) = make_chain_state_with_headers(20);
+        let mut sched = IbdScheduler::new(20, 0, &cs, 50_000);
+
+        // silent_peers only fires with >1 peer so disconnecting one still
+        // leaves a usable peer to take over. Register a second peer.
+        sched.register_peer(2);
+
+        let _ = sched.assign_blocks(1);
+        let heights: Vec<u32> = sched
+            .peer_slots
+            .get(&1)
+            .map(|s| s.assigned.iter().take(3).copied().collect())
+            .unwrap_or_default();
+        assert!(heights.len() >= 3, "need at least 3 assigned heights");
+        for h in heights {
+            assert!(sched.release_height(h, 1));
+            // Backdate last_failure_at to escape the dedupe window so the
+            // next release counts as a distinct event.
+            if let Some(slots) = sched.peer_slots.get_mut(&1) {
+                slots.last_failure_at =
+                    Some(Instant::now() - (FAILURE_DEDUP_WINDOW + Duration::from_secs(1)));
+            }
+        }
+
+        let silent = sched.silent_peers(SILENT_PEER_FAILURE_THRESHOLD);
+        assert!(silent.contains(&1), "peer 1 should be flagged silent");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn release_burst_counts_as_single_failure_event() {
+        // Regression for the 2026-05-13 over-trigger: a peer holding many
+        // near-cursor heights that all time out in one release pass must
+        // count as ONE failure event, not N. Otherwise the threshold is
+        // crossed instantly on the first stall, before the peer has had
+        // any chance to recover.
+        let (cs, dir) = make_chain_state_with_headers(20);
+        let mut sched = IbdScheduler::new(20, 0, &cs, 50_000);
+
+        // silent_peers gating requires >1 peer; register a second.
+        sched.register_peer(2);
+
+        let _ = sched.assign_blocks(1);
+        let heights: Vec<u32> = sched
+            .peer_slots
+            .get(&1)
+            .map(|s| s.assigned.clone())
+            .unwrap_or_default();
+        assert!(heights.len() >= 3, "need at least 3 assigned heights");
+
+        // Release all heights in a tight burst — within the dedupe window.
+        for h in &heights {
+            assert!(sched.release_height(*h, 1));
+        }
+
+        let failures = sched
+            .peer_slots
+            .get(&1)
+            .map(|s| s.consecutive_failures)
+            .unwrap_or(0);
+        assert_eq!(
+            failures, 1,
+            "a burst of {} releases inside the dedupe window must count as one event",
+            heights.len()
+        );
+        let silent = sched.silent_peers(SILENT_PEER_FAILURE_THRESHOLD);
+        assert!(
+            !silent.contains(&1),
+            "single stall pass must not cross the silent-peer threshold"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn block_received_resets_failure_counter() {
+        // A successful delivery proves the peer is alive and absolves it of
+        // its accumulated misses.
+        let (cs, dir) = make_chain_state_with_headers(20);
+        let mut sched = IbdScheduler::new(20, 0, &cs, 50_000);
+
+        // Cooldown/silent-peer logic gated on >1 peer; register a second.
+        sched.register_peer(2);
+
+        let _ = sched.assign_blocks(1);
+        let heights: Vec<u32> = sched
+            .peer_slots
+            .get(&1)
+            .map(|s| s.assigned.iter().take(2).copied().collect())
+            .unwrap_or_default();
+        // Release two heights with the dedupe window backdated between so
+        // both are counted as distinct failure events.
+        for h in &heights {
+            assert!(sched.release_height(*h, 1));
+            if let Some(slots) = sched.peer_slots.get_mut(&1) {
+                slots.last_failure_at =
+                    Some(Instant::now() - (FAILURE_DEDUP_WINDOW + Duration::from_secs(1)));
+            }
+        }
+        assert!(sched.peer_slots[&1].consecutive_failures >= 2);
+
+        // Re-assign and deliver one.
+        let _ = sched.assign_blocks(1);
+        let delivered = sched
+            .peer_slots
+            .get(&1)
+            .and_then(|s| s.assigned.first().copied());
+        if let Some(h) = delivered {
+            sched.block_received(1, h);
+            assert_eq!(sched.peer_slots[&1].consecutive_failures, 0);
+            assert!(sched.peer_slots[&1].last_failure_at.is_none());
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn single_peer_bypasses_cooldown_and_silent_disconnect() {
+        // CI regression 2026-05-13: with one peer, releasing a height
+        // applies a 60s cooldown to that peer, but there's no alternative
+        // peer to take the height, so it becomes unassignable for 60s.
+        // Drives test_parallel_ibd into a 3-minute timeout. Anti-affinity
+        // and silent-peer disconnect must both no-op with a single peer.
+        let (cs, dir) = make_chain_state_with_headers(10);
+        let mut sched = IbdScheduler::new(10, 0, &cs, 50_000);
+
+        let _ = sched.assign_blocks(1);
+        let h = *sched
+            .peer_slots
+            .get(&1)
+            .and_then(|s| s.assigned.first())
+            .expect("peer 1 has assigned height");
+        assert!(sched.release_height(h, 1));
+
+        // Same peer must be free to re-claim the height — no alternative
+        // exists with a single peer.
+        let _ = sched.assign_blocks(1);
+        let reclaimed = sched
+            .peer_slots
+            .get(&1)
+            .map(|s| s.assigned.contains(&h))
+            .unwrap_or(false);
+        assert!(
+            reclaimed,
+            "single-peer scheduler must allow the only peer to re-claim a \
+             released height — cooldown has nowhere else to go"
+        );
+
+        // Even with many releases on a single peer, silent_peers must be
+        // empty — disconnecting the only peer would halt IBD outright.
+        for _ in 0..10 {
+            if let Some(slot_h) = sched
+                .peer_slots
+                .get(&1)
+                .and_then(|s| s.assigned.first().copied())
+            {
+                assert!(sched.release_height(slot_h, 1));
+            }
+            let _ = sched.assign_blocks(1);
+            if let Some(slots) = sched.peer_slots.get_mut(&1) {
+                slots.last_failure_at =
+                    Some(Instant::now() - (FAILURE_DEDUP_WINDOW + Duration::from_secs(1)));
+            }
+        }
+        let silent = sched.silent_peers(SILENT_PEER_FAILURE_THRESHOLD);
+        assert!(
+            silent.is_empty(),
+            "single-peer scheduler must never flag its only peer as silent"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -640,9 +1131,18 @@ mod tests {
         // Disconnect peer 1
         sched.peer_disconnected(1);
 
-        // Their blocks should be back in the pool
+        // Their blocks should be back in the pool. Priority-zone claims do
+        // NOT pop from pending, so a height claimed via the priority zone
+        // and then released on disconnect appears twice in pending (the
+        // duplicate is silently skipped by the contains_key check on the
+        // next pop). Assert via uniqueness of heights covered.
         assert_eq!(sched.in_flight.len(), 0);
-        assert_eq!(sched.pending.len(), 50); // All 50 back in pending
+        let unique_heights: HashSet<u32> = sched.pending.iter().copied().collect();
+        assert_eq!(
+            unique_heights.len(),
+            50,
+            "all 50 distinct heights must be reachable from pending after disconnect"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

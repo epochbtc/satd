@@ -284,6 +284,39 @@ fn capture_forensics(stalled_for: Duration, heartbeat: u64, chain_state: &ChainS
          thread states from /proc/self/task. Look for many threads in \
          `futex` for a synchronization deadlock; many in `D` for stuck I/O."
     );
+
+    // Phase-level forensics: the connect path stamps an atomic phase on
+    // every major transition (`pre_resolve_coins`, `verify_dispatch`,
+    // `verify_join`, `write_batch`, etc.). The phase with the smallest
+    // entered_age_ms relative to *now* is the phase the connector is
+    // currently wedged in. Per-phase entry counts are a built-in profile
+    // of where the connector spends iterations during normal operation,
+    // and on a stalled iteration tell us how far it progressed before
+    // wedging.
+    let phases = chain_state.connect_phases();
+    let current = phases.current();
+    let age_ms = phases.entered_age_ms();
+    let counts = phases.snapshot_counts();
+    tracing::error!(
+        phase = current.as_str(),
+        phase_age_ms = age_ms,
+        "Stall watchdog: connector phase at moment of stall — the connector \
+         is wedged inside this phase, see per-phase counts below for what \
+         was reached during normal operation."
+    );
+    for (i, &count) in counts
+        .iter()
+        .enumerate()
+        .take(crate::chain::connect_phase::ConnectPhase::COUNT)
+    {
+        let phase = crate::chain::connect_phase::ConnectPhase::from_index(i);
+        tracing::error!(
+            target: "stall_watchdog",
+            phase = phase.as_str(),
+            count,
+            "Stall watchdog: phase entry count since startup"
+        );
+    }
     let task_dir = std::path::Path::new("/proc/self/task");
     let entries = match std::fs::read_dir(task_dir) {
         Ok(e) => e,

@@ -278,26 +278,39 @@ pub fn start_prefetcher(
 
     let mut workers = Vec::with_capacity(num_workers + 1);
 
-    // Spawn worker threads — process heights, insert into shared buffer
-    for _ in 0..num_workers {
+    // Spawn worker threads — process heights, insert into shared buffer.
+    // Threads are named so /proc/self/task dumps from the stall watchdog
+    // attribute them as `prefetch-N` rather than the default `satd`.
+    for n in 0..num_workers {
         let w_rx = work_rx.clone();
         let w_store = store.clone();
         let w_dir = blocks_dir.clone();
         let w_shutdown = shutdown.clone();
         let w_buffer = buffer.clone();
 
-        workers.push(thread::spawn(move || {
-            while !w_shutdown.load(Ordering::Relaxed) {
-                match w_rx.recv_timeout(std::time::Duration::from_millis(500)) {
-                    Ok(height) => {
-                        if let Some(pre) = prefetch_block(&*w_store, &w_dir, height, assumevalid, primary_engine) {
-                            w_buffer.lock().insert(height, pre);
+        workers.push(
+            thread::Builder::new()
+                .name(format!("prefetch-{}", n))
+                .spawn(move || {
+                    while !w_shutdown.load(Ordering::Relaxed) {
+                        match w_rx.recv_timeout(std::time::Duration::from_millis(500)) {
+                            Ok(height) => {
+                                if let Some(pre) = prefetch_block(
+                                    &*w_store,
+                                    &w_dir,
+                                    height,
+                                    assumevalid,
+                                    primary_engine,
+                                ) {
+                                    w_buffer.lock().insert(height, pre);
+                                }
+                            }
+                            Err(_) => continue,
                         }
                     }
-                    Err(_) => continue,
-                }
-            }
-        }));
+                })
+                .expect("failed to spawn prefetch worker thread"),
+        );
     }
 
     // Dispatcher thread: assigns work ahead of the connect cursor
@@ -306,7 +319,10 @@ pub fn start_prefetcher(
     let disp_store = store.clone();
     let disp_buffer = buffer.clone();
 
-    workers.push(thread::spawn(move || {
+    workers.push(
+        thread::Builder::new()
+            .name("prefetch-dispatch".into())
+            .spawn(move || {
         let mut next_to_assign = disp_cursor.load(Ordering::Relaxed);
 
         while !disp_shutdown.load(Ordering::Relaxed) {
@@ -340,7 +356,9 @@ pub fn start_prefetcher(
 
             thread::sleep(std::time::Duration::from_millis(10));
         }
-    }));
+            })
+            .expect("failed to spawn prefetch-dispatch thread"),
+    );
 
     PrefetchHandle {
         shutdown,

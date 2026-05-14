@@ -247,12 +247,18 @@ impl ShadowVerifier {
             "Shadow verification pool started"
         );
         let mut workers = Vec::with_capacity(num_workers);
-        for _ in 0..num_workers {
+        for n in 0..num_workers {
             let w_rx = rx.clone();
             let w_shadow = shadow.clone();
             let w_primary_label = primary_label.clone();
             let w_shadow_label = shadow_label.clone();
-            workers.push(std::thread::spawn(move || {
+            // Thread names ensure /proc/self/task dumps attribute these
+            // workers as `shadow-N` rather than the default `satd`. See
+            // node/src/stall_watchdog.rs for the consumer.
+            workers.push(
+                std::thread::Builder::new()
+                    .name(format!("shadow-{}", n))
+                    .spawn(move || {
                 while let Ok(work) = w_rx.recv() {
                     let tx: Transaction = match bitcoin::consensus::deserialize(&work.tx_bytes) {
                         Ok(t) => t,
@@ -300,7 +306,9 @@ impl ShadowVerifier {
                         );
                     }
                 }
-            }));
+                    })
+                    .expect("failed to spawn shadow verification worker"),
+            );
         }
 
         Self {

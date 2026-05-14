@@ -360,6 +360,32 @@ async fn main() {
         "Chain state initialized"
     );
 
+    // Repair any HeaderOnly block-index entries above tip whose data is
+    // actually present in the flat files. Idempotent: when there are no
+    // holes (the healthy case) it's just one cheap index walk over
+    // (tip..headers_tip). When there ARE holes, the scan is bounded by
+    // total flat-file size — ~20 min for ~670 GB at SSD bandwidth.
+    // Without this, a corruption episode caused by the historical
+    // accept_headers→inner-store HeaderOnly clobber leaves the connect
+    // loop wedged forever; peer-driven redelivery isn't reliable enough
+    // under churn to fill ~hundreds of holes one at a time.
+    match chain_state.repair_block_index_holes() {
+        Ok(outcome) => {
+            if outcome.holes_found > 0 {
+                tracing::info!(
+                    holes_found = outcome.holes_found,
+                    repaired = outcome.repaired,
+                    still_missing = outcome.still_missing,
+                    elapsed_secs = outcome.elapsed_secs,
+                    "Block-index hole repair finished"
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Block-index hole repair failed; continuing startup");
+        }
+    }
+
     // Open reorg log + optional webhook dispatcher. Failure is non-fatal
     // — the node still runs, just without persistent reorg history.
     match node::chain::reorg_log::ReorgLog::open(

@@ -68,11 +68,22 @@ pub struct TestNode {
     /// an unusual --port format we can't extract.
     pub p2p_port: Option<u16>,
     pub cookie: String,
+    /// Path where the spawned satd's stderr is captured. Tests can read
+    /// this on failure to surface satd's internal logs in CI output.
+    pub stderr_log: PathBuf,
 }
 
 impl TestNode {
     pub fn start(extra_args: &[&str]) -> Self {
-        Self::start_with_env(extra_args, &[])
+        Self::start_inner(extra_args, &[], false)
+    }
+
+    /// Like `start` but also captures the spawned satd's stderr into a file
+    /// in its datadir. The captured path is exposed as `stderr_log` so the
+    /// caller can dump it on failure. Opt-in because heavy logging adds
+    /// enough I/O on loaded CI runners to slow other tests.
+    pub fn start_capturing_stderr(extra_args: &[&str]) -> Self {
+        Self::start_inner(extra_args, &[], true)
     }
 
     /// Like `start` but also sets environment variables on the spawned
@@ -81,6 +92,10 @@ impl TestNode {
     /// parent process's environment, which would race across parallel
     /// tests.
     pub fn start_with_env(extra_args: &[&str], env: &[(&str, &str)]) -> Self {
+        Self::start_inner(extra_args, env, false)
+    }
+
+    fn start_inner(extra_args: &[&str], env: &[(&str, &str)], capture_stderr: bool) -> Self {
         let rpcport = find_available_port();
         let datadir = std::env::temp_dir().join(format!("satd-test-{}", rpcport));
         let _ = std::fs::create_dir_all(&datadir);
@@ -111,9 +126,21 @@ impl TestNode {
             cmd.env(k, v);
         }
 
+        // Stderr capture is opt-in via the `capture_stderr` flag from
+        // `start_capturing_stderr`. Default null matches the prior behavior
+        // — always-on capture adds enough I/O on loaded CI runners to slow
+        // other tests into their poll-until budgets.
+        let stderr_log = datadir.join("satd.stderr");
+        let stderr_target = if capture_stderr {
+            let f = std::fs::File::create(&stderr_log)
+                .expect("create satd stderr capture file");
+            std::process::Stdio::from(f)
+        } else {
+            std::process::Stdio::null()
+        };
         let process = cmd
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(stderr_target)
             .spawn()
             .expect("Failed to start satd");
 
@@ -192,6 +219,7 @@ impl TestNode {
             rpcport,
             p2p_port: tracked_p2p_port,
             cookie,
+            stderr_log,
         }
     }
 
@@ -230,12 +258,12 @@ impl TestNode {
             cmd.env(k, v);
         }
 
-        // Optional stderr capture for tests that need to diagnose startup
-        // failures. If `SATD_TEST_STDERR_DIR` is set, satd's stderr is
-        // redirected to a file under that directory keyed by (rpcport,
-        // timestamp). Default: silent (parity with `start`).
-        let stderr_target = match std::env::var("SATD_TEST_STDERR_DIR") {
-            Ok(dir) => {
+        // Opt-in stderr capture: `SATD_TEST_STDERR_DIR` directs logs to a
+        // stable path for debugging. Default null matches prior behavior;
+        // see `start` for the I/O-cost rationale on CI.
+        let env_dir = std::env::var("SATD_TEST_STDERR_DIR").ok();
+        let (stderr_target, stderr_log) = match env_dir {
+            Some(dir) => {
                 let _ = std::fs::create_dir_all(&dir);
                 let stamp = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -244,11 +272,10 @@ impl TestNode {
                 let path = std::path::PathBuf::from(&dir)
                     .join(format!("satd-{}-{}.stderr.log", rpcport, stamp));
                 let f = std::fs::File::create(&path).expect("create stderr log");
-                std::process::Stdio::from(f)
+                (std::process::Stdio::from(f), path)
             }
-            Err(_) => std::process::Stdio::null(),
+            None => (std::process::Stdio::null(), PathBuf::new()),
         };
-
         let process = cmd
             .stdout(std::process::Stdio::null())
             .stderr(stderr_target)
@@ -291,6 +318,7 @@ impl TestNode {
             rpcport,
             p2p_port: None,
             cookie,
+            stderr_log,
         }
     }
 

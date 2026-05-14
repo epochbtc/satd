@@ -169,42 +169,100 @@ impl FlatFileManager {
     /// Returns the total number of blocks visited.
     pub fn for_each_block<F>(&self, mut visit: F) -> std::io::Result<u64>
     where
-        F: FnMut(&[u8], FlatFilePos),
+        F: FnMut(&[u8], FlatFilePos) -> std::ops::ControlFlow<()>,
     {
+        // Unbounded scan: iterate file 0, 1, 2, ... and stop at the
+        // first non-existent file. Cannot delegate to
+        // `for_each_block_in_files(0..u32::MAX, ...)` because that
+        // iterator would scan 4 billion `path.exists()` calls past the
+        // real end of the chain.
         let mut count = 0u64;
         for file_num in 0u32.. {
             let path = self.file_path(file_num);
             if !path.exists() {
                 break;
             }
-            let data = match std::fs::read(&path) {
-                Ok(d) => d,
-                Err(_) => break,
-            };
-            let mut offset = 0usize;
-            while offset + 8 <= data.len() {
-                let size = u32::from_le_bytes([
-                    data[offset + 4],
-                    data[offset + 5],
-                    data[offset + 6],
-                    data[offset + 7],
-                ]) as usize;
-                if size == 0 || offset + 8 + size > data.len() {
-                    break;
-                }
-                let block_slice = &data[offset + 8..offset + 8 + size];
-                visit(
-                    block_slice,
-                    FlatFilePos {
-                        file_number: file_num,
-                        data_pos: offset as u32,
-                    },
-                );
-                count += 1;
-                offset += 8 + size;
+            match Self::scan_one_file(&path, file_num, &mut count, &mut visit)? {
+                std::ops::ControlFlow::Break(()) => return Ok(count),
+                std::ops::ControlFlow::Continue(()) => {}
             }
         }
         Ok(count)
+    }
+
+    /// Scan every block in the given file-number range. Stops on the
+    /// first `ControlFlow::Break` returned by the visitor (use this to
+    /// early-exit when you've found everything you're looking for).
+    ///
+    /// Non-existent file numbers are skipped silently (so ranges that
+    /// overshoot the actual file set are fine). Use this when you know
+    /// which file numbers contain the blocks you care about — it
+    /// avoids the full-scan cost of `for_each_block`.
+    pub fn for_each_block_in_files<I, F>(
+        &self,
+        files: I,
+        mut visit: F,
+    ) -> std::io::Result<u64>
+    where
+        I: IntoIterator<Item = u32>,
+        F: FnMut(&[u8], FlatFilePos) -> std::ops::ControlFlow<()>,
+    {
+        let mut count = 0u64;
+        for file_num in files {
+            let path = self.file_path(file_num);
+            if !path.exists() {
+                continue;
+            }
+            match Self::scan_one_file(&path, file_num, &mut count, &mut visit)? {
+                std::ops::ControlFlow::Break(()) => return Ok(count),
+                std::ops::ControlFlow::Continue(()) => {}
+            }
+        }
+        Ok(count)
+    }
+
+    /// Scan a single flat-file path: parse each record and invoke the
+    /// visitor. Updates `count` per block successfully read. Returns
+    /// `Break` if the visitor short-circuits.
+    fn scan_one_file<F>(
+        path: &std::path::Path,
+        file_num: u32,
+        count: &mut u64,
+        visit: &mut F,
+    ) -> std::io::Result<std::ops::ControlFlow<()>>
+    where
+        F: FnMut(&[u8], FlatFilePos) -> std::ops::ControlFlow<()>,
+    {
+        let data = match std::fs::read(path) {
+            Ok(d) => d,
+            Err(_) => return Ok(std::ops::ControlFlow::Continue(())),
+        };
+        let mut offset = 0usize;
+        while offset + 8 <= data.len() {
+            let size = u32::from_le_bytes([
+                data[offset + 4],
+                data[offset + 5],
+                data[offset + 6],
+                data[offset + 7],
+            ]) as usize;
+            if size == 0 || offset + 8 + size > data.len() {
+                break;
+            }
+            let block_slice = &data[offset + 8..offset + 8 + size];
+            if let std::ops::ControlFlow::Break(()) = visit(
+                block_slice,
+                FlatFilePos {
+                    file_number: file_num,
+                    data_pos: offset as u32,
+                },
+            ) {
+                *count += 1;
+                return Ok(std::ops::ControlFlow::Break(()));
+            }
+            *count += 1;
+            offset += 8 + size;
+        }
+        Ok(std::ops::ControlFlow::Continue(()))
     }
 }
 
@@ -283,7 +341,10 @@ mod tests {
 
         let mut visited: Vec<(Vec<u8>, FlatFilePos)> = Vec::new();
         let count = mgr
-            .for_each_block(|data, pos| visited.push((data.to_vec(), pos)))
+            .for_each_block(|data, pos| {
+                visited.push((data.to_vec(), pos));
+                std::ops::ControlFlow::Continue(())
+            })
             .unwrap();
 
         assert_eq!(count, payloads.len() as u64);
@@ -303,7 +364,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let mgr = FlatFileManager::new(&dir).unwrap();
         let mut count = 0;
-        mgr.for_each_block(|_, _| count += 1).unwrap();
+        mgr.for_each_block(|_, _| {
+            count += 1;
+            std::ops::ControlFlow::Continue(())
+        })
+        .unwrap();
         assert_eq!(count, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
