@@ -502,6 +502,15 @@ impl ChainState {
         self.store.pending_compaction_bytes_by_cf()
     }
 
+    /// Per-column-family on-disk SST size in bytes. Pairs with the
+    /// pending-compaction breakdown to answer two related questions:
+    /// pending = "is the LSM keeping up?", sst_bytes = "where do the
+    /// GBs live?". Logged once at startup and inside the 60s
+    /// diagnostic snapshot.
+    pub fn sst_bytes_by_cf(&self) -> Vec<(&'static str, u64)> {
+        self.store.sst_bytes_by_cf()
+    }
+
     /// Force a synchronous full-range compaction of the chainstate column
     /// family. Drains the dirty overlay first so the compaction includes
     /// pending writes. Long-running: returns only when RocksDB completes

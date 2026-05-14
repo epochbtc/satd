@@ -285,6 +285,12 @@ pub fn spawn_compaction_diagnostic(
         tracing::info!("Compaction diagnostic disabled");
         return;
     }
+    // One-shot SST size dump at startup so an operator can answer
+    // "where do my chainstate GBs live?" without waiting a full tick.
+    // The 60s thread re-emits this alongside the pending-compaction
+    // snapshot for the live view.
+    log_sst_size_breakdown(&chain_state);
+
     std::thread::Builder::new()
         .name("rocksdb-diag".into())
         .spawn(move || {
@@ -326,9 +332,37 @@ pub fn spawn_compaction_diagnostic(
                     per_cf = %parts.join(" "),
                     "RocksDB pending-compaction snapshot"
                 );
+
+                // SST size breakdown alongside the pending snapshot.
+                // Same render shape so downstream parsing is uniform.
+                log_sst_size_breakdown(&chain_state);
             }
         })
         .expect("failed to spawn rocksdb-diag thread");
+}
+
+/// Emit one INFO line listing on-disk SST size per CF, sorted desc.
+/// Shared between the startup one-shot and the 60s tick so the
+/// rendering stays consistent. CFs with zero size are omitted (a
+/// healthy fresh datadir on a backend without per-CF storage would
+/// otherwise produce an empty `per_cf=` field — same shape as the
+/// pending snapshot).
+fn log_sst_size_breakdown(chain_state: &ChainState) {
+    let mut breakdown = chain_state.sst_bytes_by_cf();
+    breakdown.sort_by(|a, b| b.1.cmp(&a.1));
+    let total: u64 = breakdown.iter().map(|(_, b)| *b).sum();
+    let mb = |b: u64| b / (1024 * 1024);
+    let parts: Vec<String> = breakdown
+        .iter()
+        .filter(|(_, b)| *b > 0)
+        .map(|(name, b)| format!("{}={}M", name, mb(*b)))
+        .collect();
+    tracing::info!(
+        target: "storage",
+        total_mb = mb(total),
+        per_cf = %parts.join(" "),
+        "RocksDB SST size snapshot"
+    );
 }
 
 /// Best-effort post-mortem dump for a detected stall. We can't get full

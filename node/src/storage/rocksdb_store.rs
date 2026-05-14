@@ -791,6 +791,54 @@ impl RocksDbStore {
             .map_err(|e| StoreError::Database(e.to_string()))
     }
 
+    /// Query a per-CF integer property across every CF this binary
+    /// registers. Returns `(cf_name, value)` pairs in declaration
+    /// order; CFs not present in the live DB (feature-gated, or older
+    /// datadir without the temp CF) are silently skipped. Properties
+    /// that error or are absent on a CF report 0 rather than
+    /// disappearing — the caller's log line stays self-explanatory.
+    ///
+    /// Used by both the pending-compaction diagnostic
+    /// (`rocksdb.estimate-pending-compaction-bytes`) and the SST size
+    /// diagnostic (`rocksdb.total-sst-files-size`). Other RocksDB
+    /// integer properties with the same shape can hook in here.
+    ///
+    /// The ordering mirrors the diagnostic-log priority — largest-by-
+    /// observed-load CFs first — so the most operationally relevant
+    /// entries appear even when the log line is truncated by
+    /// downstream tooling.
+    fn query_cf_property(&self, property: &str) -> Vec<(&'static str, u64)> {
+        let names: &[&'static str] = &[
+            CF_ADDR_SPENDING,
+            CF_ADDR_FUNDING,
+            CF_OUTPOINT_SPEND,
+            CF_UNDO,
+            CF_COINS,
+            CF_TX_INDEX,
+            CF_BLOCK_INDEX,
+            CF_HEIGHT_INDEX,
+            CF_METADATA,
+            #[cfg(feature = "block-filter-index")]
+            CF_FILTER,
+            #[cfg(feature = "block-filter-index")]
+            CF_FILTER_HEADER,
+            CF_ADDR_BACKFILL_TEMP,
+        ];
+        names
+            .iter()
+            .filter_map(|name| {
+                let cf = self.db.cf_handle(name)?;
+                let value = self
+                    .db
+                    .property_int_value_cf(&cf, property)
+                    .ok()
+                    .flatten()
+                    .unwrap_or(0);
+                Some((*name, value))
+            })
+            .collect()
+    }
+
     /// O(1) column family clear: drop and recreate with original options.
     fn drop_and_recreate_cf(&self, name: &str) -> Result<(), StoreError> {
         let opts = self.cf_options(name);
@@ -1340,41 +1388,11 @@ impl Store for RocksDbStore {
     }
 
     fn pending_compaction_bytes_by_cf(&self) -> Vec<(&'static str, u64)> {
-        // Static list — covers every CF this binary registers. CFs not
-        // present in the live DB (`block-filter-index` feature off, or
-        // older datadir without the temp CF) silently report 0. The
-        // ordering matters for the diagnostic log: largest-pending
-        // CFs first so the most-relevant signal appears even when the
-        // log line is truncated by downstream tooling.
-        let names: &[&'static str] = &[
-            CF_ADDR_SPENDING,
-            CF_ADDR_FUNDING,
-            CF_OUTPOINT_SPEND,
-            CF_UNDO,
-            CF_COINS,
-            CF_TX_INDEX,
-            CF_BLOCK_INDEX,
-            CF_HEIGHT_INDEX,
-            CF_METADATA,
-            #[cfg(feature = "block-filter-index")]
-            CF_FILTER,
-            #[cfg(feature = "block-filter-index")]
-            CF_FILTER_HEADER,
-            CF_ADDR_BACKFILL_TEMP,
-        ];
-        names
-            .iter()
-            .filter_map(|name| {
-                let cf = self.db.cf_handle(name)?;
-                let bytes = self
-                    .db
-                    .property_int_value_cf(&cf, "rocksdb.estimate-pending-compaction-bytes")
-                    .ok()
-                    .flatten()
-                    .unwrap_or(0);
-                Some((*name, bytes))
-            })
-            .collect()
+        self.query_cf_property("rocksdb.estimate-pending-compaction-bytes")
+    }
+
+    fn sst_bytes_by_cf(&self) -> Vec<(&'static str, u64)> {
+        self.query_cf_property("rocksdb.total-sst-files-size")
     }
 
     fn compact_chainstate(&self) -> Result<(), StoreError> {
