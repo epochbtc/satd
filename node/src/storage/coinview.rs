@@ -114,7 +114,14 @@ impl Coin {
     /// truncated or the varints overflow.
     pub fn deserialize_compact_stream(data: &[u8]) -> Option<(Self, usize)> {
         let (height_cb, n1) = decode_varint(data)?;
-        let height = (height_cb >> 1) as u32;
+        // Reject corrupt records whose encoded height would not fit in u32.
+        // Without this guard, `height_cb >> 1 as u32` would silently wrap
+        // and we'd restore a coin at the wrong height during disconnect.
+        let height_u64 = height_cb >> 1;
+        if height_u64 > u32::MAX as u64 {
+            return None;
+        }
+        let height = height_u64 as u32;
         let coinbase = (height_cb & 1) != 0;
         let (amount, n2) = decode_varint(data.get(n1..)?)?;
         let (script_len, n3) = decode_varint(data.get(n1 + n2..)?)?;
@@ -265,6 +272,48 @@ mod tests {
         assert_eq!(decoded.amount, 0);
         assert_eq!(decoded.height, 0);
         assert!(!decoded.coinbase);
+    }
+
+    #[test]
+    fn test_compact_height_overflow_rejected() {
+        // Manually craft a record whose encoded height_cb is large enough
+        // that `height_cb >> 1` does not fit in a u32. Pre-fix the code
+        // wrapped silently; the M2 review finding required this rejection.
+        // height_cb = (u64::MAX >> 0) — covers the full top of the range.
+        let mut buf = Vec::new();
+        encode_varint(u64::MAX, &mut buf); // height_cb
+        encode_varint(0, &mut buf); // amount
+        encode_varint(0, &mut buf); // script_len
+        assert!(
+            Coin::deserialize_compact(&buf).is_none(),
+            "deserialize should reject a height that doesn't fit in u32",
+        );
+    }
+
+    #[test]
+    fn test_compact_height_just_above_u32_max_rejected() {
+        // height = (u32::MAX as u64 + 1), encoded as height_cb = height << 1.
+        let height_cb = ((u32::MAX as u64) + 1) << 1;
+        let mut buf = Vec::new();
+        encode_varint(height_cb, &mut buf);
+        encode_varint(0, &mut buf);
+        encode_varint(0, &mut buf);
+        assert!(
+            Coin::deserialize_compact(&buf).is_none(),
+            "deserialize should reject a height that doesn't fit in u32",
+        );
+    }
+
+    #[test]
+    fn test_compact_height_at_u32_max_accepted() {
+        // u32::MAX is the boundary — must still decode.
+        let height_cb = (u32::MAX as u64) << 1;
+        let mut buf = Vec::new();
+        encode_varint(height_cb, &mut buf);
+        encode_varint(1, &mut buf);
+        encode_varint(0, &mut buf);
+        let coin = Coin::deserialize_compact(&buf).expect("u32::MAX height should decode");
+        assert_eq!(coin.height, u32::MAX);
     }
 
     #[test]

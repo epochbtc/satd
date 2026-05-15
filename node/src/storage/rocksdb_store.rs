@@ -1452,7 +1452,9 @@ impl Store for RocksDbStore {
         let cf = self.cf(CF_UNDO);
         let value = self.db.get_cf(&cf, hash_bytes(hash)).ok()??;
         // `UndoData::deserialize` auto-detects v1 vs legacy v0 bincode
-        // by peeking the first two bytes (v1 magic = 0xFE 0x01).
+        // by peeking the 8-byte v1 magic. A 2-byte magic was rejected
+        // in review because it collides with a legacy bincode `Vec`
+        // length prefix of exactly 510.
         UndoData::deserialize(&value).ok()
     }
 
@@ -2399,8 +2401,10 @@ mod tests {
             spent_coins: vec![(OutPointSer::from(&op), coin.clone())],
         };
         let bytes = bincode::serialize(&v0).unwrap();
-        // First byte of a bincode Vec is the length-low-byte, so it
-        // can't accidentally collide with the v1 magic (0xFE 0x01).
+        // The 8-byte v1 magic (`C0DECAFE_C0DECAFE` LE) is impossibly
+        // large as a `Vec` length prefix, so no realistic legacy row
+        // can collide. Single-entry rows in particular have length
+        // prefix `01 00 00 00 00 00 00 00`, nowhere near the magic.
         let cf = store.cf(super::CF_UNDO);
         store
             .db
