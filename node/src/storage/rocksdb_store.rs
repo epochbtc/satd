@@ -22,6 +22,13 @@ const CF_TX_INDEX: &str = "tx_index";
 const CF_METADATA: &str = "metadata";
 const CF_ADDR_FUNDING: &str = "addr_funding";
 const CF_ADDR_SPENDING: &str = "addr_spending";
+/// v2 address-history CFs: same row shape, but the key carries only
+/// a 16-byte scripthash prefix (vs 32 bytes for v1). All writes after
+/// PR D land here; reads consult both v1 and v2 and concatenate (the
+/// lookup layer already sorts post-fetch). Migration of existing v1
+/// data is the next PR.
+const CF_ADDR_FUNDING_V2: &str = "addr_funding_v2";
+const CF_ADDR_SPENDING_V2: &str = "addr_spending_v2";
 /// Confirmed-side spend index: `prev_outpoint -> SpendingRef`. Written
 /// alongside the address-index spending rows; the two CFs answer
 /// different shapes of the same question.
@@ -318,6 +325,19 @@ impl RocksDbStore {
             // during the disk-full incident.
             ColumnFamilyDescriptor::new(CF_ADDR_FUNDING, make_cf_opts(true, 32, Some(32), true)),
             ColumnFamilyDescriptor::new(CF_ADDR_SPENDING, make_cf_opts(true, 32, Some(32), true)),
+            // v2 address-history CFs with a 16-byte fixed prefix
+            // extractor so prefix bloom + index work at the shorter
+            // key shape. Write-buf intentionally matches v1 because
+            // emission rate is identical — every block that writes v1
+            // rows now writes v2 rows.
+            ColumnFamilyDescriptor::new(
+                CF_ADDR_FUNDING_V2,
+                make_cf_opts(true, 32, Some(16), true),
+            ),
+            ColumnFamilyDescriptor::new(
+                CF_ADDR_SPENDING_V2,
+                make_cf_opts(true, 32, Some(16), true),
+            ),
             // outpoint_spend: bloom on (point lookups dominate), 16 MB
             // write-buf because the row is small (40-byte value, 36-byte
             // key) and one row per non-coinbase input — heavier than
@@ -448,17 +468,25 @@ impl RocksDbStore {
         //    `connect_block` starts appending new outpoint_spend rows.
         let marker = store.read_outpoint_spend_complete();
         if marker.is_none() {
-            let addr_has_rows = store
-                .db
-                .cf_handle(CF_ADDR_SPENDING)
-                .and_then(|cf| {
-                    store
-                        .db
-                        .iterator_cf(&cf, IteratorMode::Start)
-                        .next()
-                        .map(|item| item.is_ok())
-                })
-                .unwrap_or(false);
+            // Pre-PR-D datadirs only have addr_spending; post-PR-D
+            // writes go to addr_spending_v2. Either presence means
+            // the historical-rows-without-marker state we want to
+            // detect, so we OR across both CFs.
+            let cf_has_rows = |cf_name: &str| -> bool {
+                store
+                    .db
+                    .cf_handle(cf_name)
+                    .and_then(|cf| {
+                        store
+                            .db
+                            .iterator_cf(&cf, IteratorMode::Start)
+                            .next()
+                            .map(|item| item.is_ok())
+                    })
+                    .unwrap_or(false)
+            };
+            let addr_has_rows =
+                cf_has_rows(CF_ADDR_SPENDING) || cf_has_rows(CF_ADDR_SPENDING_V2);
             store.write_outpoint_spend_complete(!addr_has_rows)?;
         }
         if !store.outpoint_spend_complete() {
@@ -708,6 +736,8 @@ impl RocksDbStore {
             CF_COINS
                 | CF_ADDR_FUNDING
                 | CF_ADDR_SPENDING
+                | CF_ADDR_FUNDING_V2
+                | CF_ADDR_SPENDING_V2
                 | CF_OUTPOINT_SPEND
                 | CF_FILTER
                 | CF_FILTER_HEADER
@@ -715,11 +745,16 @@ impl RocksDbStore {
         #[cfg(not(feature = "block-filter-index"))]
         let bloom = matches!(
             name,
-            CF_COINS | CF_ADDR_FUNDING | CF_ADDR_SPENDING | CF_OUTPOINT_SPEND
+            CF_COINS
+                | CF_ADDR_FUNDING
+                | CF_ADDR_SPENDING
+                | CF_ADDR_FUNDING_V2
+                | CF_ADDR_SPENDING_V2
+                | CF_OUTPOINT_SPEND
         );
         let write_buf_mb = match name {
             CF_COINS => 64,
-            CF_ADDR_FUNDING | CF_ADDR_SPENDING => 32,
+            CF_ADDR_FUNDING | CF_ADDR_SPENDING | CF_ADDR_FUNDING_V2 | CF_ADDR_SPENDING_V2 => 32,
             CF_OUTPOINT_SPEND => 16,
             CF_UNDO | CF_TX_INDEX => 16,
             CF_BLOCK_INDEX | CF_HEIGHT_INDEX => 8,
@@ -762,7 +797,12 @@ impl RocksDbStore {
         // initial open.
         let hot = matches!(
             name,
-            CF_ADDR_FUNDING | CF_ADDR_SPENDING | CF_OUTPOINT_SPEND | CF_UNDO
+            CF_ADDR_FUNDING
+                | CF_ADDR_SPENDING
+                | CF_ADDR_FUNDING_V2
+                | CF_ADDR_SPENDING_V2
+                | CF_OUTPOINT_SPEND
+                | CF_UNDO
         );
         let target_file_size = if hot {
             self.tuning.hot_cf_target_file_size_base
@@ -778,6 +818,8 @@ impl RocksDbStore {
         // preserves it.
         if matches!(name, CF_ADDR_FUNDING | CF_ADDR_SPENDING | CF_OUTPOINT_SPEND) {
             cf_opts.set_prefix_extractor(SliceTransform::create_fixed_prefix(32));
+        } else if matches!(name, CF_ADDR_FUNDING_V2 | CF_ADDR_SPENDING_V2) {
+            cf_opts.set_prefix_extractor(SliceTransform::create_fixed_prefix(16));
         }
         cf_opts
     }
@@ -811,6 +853,8 @@ impl RocksDbStore {
         let names: &[&'static str] = &[
             CF_ADDR_SPENDING,
             CF_ADDR_FUNDING,
+            CF_ADDR_SPENDING_V2,
+            CF_ADDR_FUNDING_V2,
             CF_OUTPOINT_SPEND,
             CF_UNDO,
             CF_COINS,
@@ -1099,28 +1143,40 @@ impl Store for RocksDbStore {
         // gating on emit-side (M2) keeps the write_batch path simple.
         // Empty-batch fast-path avoids touching the CF handles when
         // the index is disabled or the block had no relevant rows.
+        //
+        // All new writes target the v2 CFs (16-byte scripthash prefix
+        // keys). v1 puts are never emitted. Deletes target BOTH v1
+        // and v2 because a remove could refer to a pre-PR-D row that
+        // still lives in v1 — a v1-only or v2-only delete would miss
+        // half the time during the transition.
         if !batch.addr_funding_puts.is_empty() || !batch.addr_funding_removes.is_empty() {
-            let cf_af = self.cf(CF_ADDR_FUNDING);
+            let cf_af_v1 = self.cf(CF_ADDR_FUNDING);
+            let cf_af_v2 = self.cf(CF_ADDR_FUNDING_V2);
             for row in &batch.addr_funding_puts {
-                let key = crate::index::address::encode_funding_key(&row.key());
+                let key = crate::index::address::encode_funding_key_v2(&row.key());
                 let value = crate::index::address::encode_funding_value(row.amount_sat);
-                wb.put_cf(&cf_af, key, value);
+                wb.put_cf(&cf_af_v2, key, value);
             }
             for key in &batch.addr_funding_removes {
-                let encoded = crate::index::address::encode_funding_key(key);
-                wb.delete_cf(&cf_af, encoded);
+                let v1_encoded = crate::index::address::encode_funding_key(key);
+                let v2_encoded = crate::index::address::encode_funding_key_v2(key);
+                wb.delete_cf(&cf_af_v1, v1_encoded);
+                wb.delete_cf(&cf_af_v2, v2_encoded);
             }
         }
         if !batch.addr_spending_puts.is_empty() || !batch.addr_spending_removes.is_empty() {
-            let cf_as = self.cf(CF_ADDR_SPENDING);
+            let cf_as_v1 = self.cf(CF_ADDR_SPENDING);
+            let cf_as_v2 = self.cf(CF_ADDR_SPENDING_V2);
             for row in &batch.addr_spending_puts {
-                let key = crate::index::address::encode_spending_key(&row.key());
+                let key = crate::index::address::encode_spending_key_v2(&row.key());
                 let value = crate::index::address::encode_spending_value(&row.prev_outpoint);
-                wb.put_cf(&cf_as, key, value);
+                wb.put_cf(&cf_as_v2, key, value);
             }
             for key in &batch.addr_spending_removes {
-                let encoded = crate::index::address::encode_spending_key(key);
-                wb.delete_cf(&cf_as, encoded);
+                let v1_encoded = crate::index::address::encode_spending_key(key);
+                let v2_encoded = crate::index::address::encode_spending_key_v2(key);
+                wb.delete_cf(&cf_as_v1, v1_encoded);
+                wb.delete_cf(&cf_as_v2, v2_encoded);
             }
         }
 
@@ -1407,6 +1463,8 @@ impl Store for RocksDbStore {
         let names: &[&'static str] = &[
             CF_ADDR_SPENDING,
             CF_ADDR_FUNDING,
+            CF_ADDR_SPENDING_V2,
+            CF_ADDR_FUNDING_V2,
             CF_OUTPOINT_SPEND,
             CF_UNDO,
             CF_COINS,
@@ -1522,6 +1580,8 @@ impl Store for RocksDbStore {
         // reference UTXOs the new chainstate is about to overwrite.
         cfs.push(CF_ADDR_FUNDING);
         cfs.push(CF_ADDR_SPENDING);
+        cfs.push(CF_ADDR_FUNDING_V2);
+        cfs.push(CF_ADDR_SPENDING_V2);
         cfs.push(CF_OUTPOINT_SPEND);
         // Same reasoning for the BIP 158 filter index: -reindex-chainstate
         // is going to rebuild filters from genesis via the normal
@@ -1566,6 +1626,8 @@ impl Store for RocksDbStore {
             CF_TX_INDEX,
             CF_ADDR_FUNDING,
             CF_ADDR_SPENDING,
+            CF_ADDR_FUNDING_V2,
+            CF_ADDR_SPENDING_V2,
             CF_OUTPOINT_SPEND,
         ];
         #[cfg(feature = "block-filter-index")]
@@ -1632,16 +1694,17 @@ impl Store for RocksDbStore {
         sh: &crate::index::address::Scripthash,
         limit: usize,
     ) -> Vec<(crate::index::address::AddrFundingKey, u64)> {
-        let cf = self.cf(CF_ADDR_FUNDING);
-        // The CF carries a 32-byte fixed prefix-extractor, so
-        // `prefix_iterator_cf` short-circuits via the matching SST
-        // index/bloom and terminates at the first row whose first 32
-        // bytes leave the prefix. With a `limit`, we stop iterating
-        // once we've collected that many rows — `usize::MAX` is the
-        // unlimited sentinel used by the unbounded `iter_addr_funding`
-        // wrapper above.
+        // Dual-read: walk v1 (32-byte scripthash) + v2 (16-byte
+        // prefix) and concatenate. The address-index lookup layer
+        // sorts the merged stream post-fetch, so we don't need to
+        // produce a strictly merged order here. Each iterator
+        // respects its own bloom/prefix extractor and short-circuits
+        // when the prefix is exhausted.
         let mut out: Vec<(crate::index::address::AddrFundingKey, u64)> = Vec::new();
-        for item in self.db.prefix_iterator_cf(&cf, sh) {
+
+        // v1: 32-byte scripthash prefix, full key length 72.
+        let cf_v1 = self.cf(CF_ADDR_FUNDING);
+        for item in self.db.prefix_iterator_cf(&cf_v1, sh) {
             if out.len() >= limit {
                 break;
             }
@@ -1666,6 +1729,41 @@ impl Store for RocksDbStore {
             };
             out.push((key, amount));
         }
+
+        // v2: 16-byte scripthash-prefix.
+        if out.len() < limit {
+            let cf_v2 = self.cf(CF_ADDR_FUNDING_V2);
+            let sh_prefix = &sh[..crate::index::address::SCRIPTHASH_PREFIX_LEN];
+            for item in self.db.prefix_iterator_cf(&cf_v2, sh_prefix) {
+                if out.len() >= limit {
+                    break;
+                }
+                let (k, v) = match item {
+                    Ok(kv) => kv,
+                    Err(_) => continue,
+                };
+                if k.len() != crate::index::address::KEY_LEN_V2 || &k[..sh_prefix.len()] != sh_prefix {
+                    break;
+                }
+                let payload = match crate::index::address::decode_funding_key_v2(&k) {
+                    Some(p) => p,
+                    None => continue,
+                };
+                let amount = match crate::index::address::decode_funding_value(&v) {
+                    Some(a) => a,
+                    None => continue,
+                };
+                // Reconstruct the canonical in-memory key by re-
+                // attaching the caller's full scripthash. Collisions
+                // (different full scripthashes sharing this 16-byte
+                // prefix) are admitted by design — see module
+                // docstring in `node_index::keys`. The lookup layer
+                // exposes results keyed by the caller-supplied
+                // scripthash regardless.
+                let key = crate::index::address::reconstruct_funding_key(sh, payload);
+                out.push((key, amount));
+            }
+        }
         out
     }
 
@@ -1681,9 +1779,13 @@ impl Store for RocksDbStore {
         sh: &crate::index::address::Scripthash,
         limit: usize,
     ) -> Vec<(crate::index::address::AddrSpendingKey, OutPoint)> {
-        let cf = self.cf(CF_ADDR_SPENDING);
+        // Dual-read across v1 + v2 CFs. See iter_addr_funding_limited
+        // for the rationale; mirror its shape here.
         let mut out: Vec<(crate::index::address::AddrSpendingKey, OutPoint)> = Vec::new();
-        for item in self.db.prefix_iterator_cf(&cf, sh) {
+
+        // v1: 32-byte scripthash prefix.
+        let cf_v1 = self.cf(CF_ADDR_SPENDING);
+        for item in self.db.prefix_iterator_cf(&cf_v1, sh) {
             if out.len() >= limit {
                 break;
             }
@@ -1703,6 +1805,34 @@ impl Store for RocksDbStore {
                 None => continue,
             };
             out.push((key, prev));
+        }
+
+        // v2: 16-byte scripthash prefix.
+        if out.len() < limit {
+            let cf_v2 = self.cf(CF_ADDR_SPENDING_V2);
+            let sh_prefix = &sh[..crate::index::address::SCRIPTHASH_PREFIX_LEN];
+            for item in self.db.prefix_iterator_cf(&cf_v2, sh_prefix) {
+                if out.len() >= limit {
+                    break;
+                }
+                let (k, v) = match item {
+                    Ok(kv) => kv,
+                    Err(_) => continue,
+                };
+                if k.len() != crate::index::address::KEY_LEN_V2 || &k[..sh_prefix.len()] != sh_prefix {
+                    break;
+                }
+                let payload = match crate::index::address::decode_spending_key_v2(&k) {
+                    Some(p) => p,
+                    None => continue,
+                };
+                let prev = match crate::index::address::decode_spending_value(&v) {
+                    Some(p) => p,
+                    None => continue,
+                };
+                let key = crate::index::address::reconstruct_spending_key(sh, payload);
+                out.push((key, prev));
+            }
         }
         out
     }
@@ -2732,7 +2862,9 @@ mod tests {
 
     #[test]
     fn test_address_index_write_batch_funding_put_then_read() {
-        use crate::index::address::{AddrFundingRow, encode_funding_key, encode_funding_value};
+        use crate::index::address::{
+            AddrFundingRow, encode_funding_key, encode_funding_key_v2, encode_funding_value,
+        };
 
         let (store, _dir) = temp_store(false);
         let row = AddrFundingRow {
@@ -2747,11 +2879,22 @@ mod tests {
         batch.addr_funding_puts.push(row.clone());
         store.write_batch(batch).unwrap();
 
-        // Read directly via the encoded key — verifies the writer
-        // serialized exactly what the codec specifies.
-        let cf = store.cf(CF_ADDR_FUNDING);
-        let encoded = encode_funding_key(&row.key());
-        let raw = store.db.get_cf(&cf, encoded).unwrap().expect("row present");
+        // Post-PR-D, write_batch emits to v2 only. The legacy v1 CF
+        // must NOT contain the row; the new v2 CF must.
+        let cf_v1 = store.cf(CF_ADDR_FUNDING);
+        let v1_encoded = encode_funding_key(&row.key());
+        assert!(
+            store.db.get_cf(&cf_v1, v1_encoded).unwrap().is_none(),
+            "v1 CF must be empty after a v2 write",
+        );
+
+        let cf_v2 = store.cf(CF_ADDR_FUNDING_V2);
+        let v2_encoded = encode_funding_key_v2(&row.key());
+        let raw = store
+            .db
+            .get_cf(&cf_v2, v2_encoded)
+            .unwrap()
+            .expect("row present in v2");
         assert_eq!(
             raw.as_slice(),
             encode_funding_value(row.amount_sat).as_slice()
@@ -2760,7 +2903,9 @@ mod tests {
 
     #[test]
     fn test_address_index_write_batch_spending_put_then_remove() {
-        use crate::index::address::{AddrSpendingRow, encode_spending_key, encode_spending_value};
+        use crate::index::address::{
+            AddrSpendingRow, encode_spending_key, encode_spending_key_v2, encode_spending_value,
+        };
 
         let (store, _dir) = temp_store(false);
         let prev = make_outpoint(0xEE, 3);
@@ -2772,29 +2917,38 @@ mod tests {
             prev_outpoint: prev,
         };
 
-        // Put.
+        // Put. Post-PR-D, write_batch emits to v2 only.
         let mut batch = StoreBatch::default();
         batch.addr_spending_puts.push(row.clone());
         store.write_batch(batch).unwrap();
 
-        let cf = store.cf(CF_ADDR_SPENDING);
-        let encoded_key = encode_spending_key(&row.key());
+        let cf_v1 = store.cf(CF_ADDR_SPENDING);
+        let v1_encoded = encode_spending_key(&row.key());
+        assert!(
+            store.db.get_cf(&cf_v1, v1_encoded).unwrap().is_none(),
+            "v1 CF must be empty after a v2 write",
+        );
+
+        let cf_v2 = store.cf(CF_ADDR_SPENDING_V2);
+        let v2_encoded = encode_spending_key_v2(&row.key());
         let raw = store
             .db
-            .get_cf(&cf, encoded_key)
+            .get_cf(&cf_v2, v2_encoded)
             .unwrap()
-            .expect("row present");
+            .expect("row present in v2");
         assert_eq!(
             raw.as_slice(),
             encode_spending_value(&row.prev_outpoint).as_slice()
         );
 
         // Remove via the same key. Round-trips the deletion path used
-        // by `disconnect_block` in M2.
+        // by disconnect_block; under PR D's dual-CF delete, the tombstone
+        // lands in BOTH CFs, so we verify v2 (where the row was) goes
+        // away.
         let mut rm = StoreBatch::default();
         rm.addr_spending_removes.push(row.key());
         store.write_batch(rm).unwrap();
-        assert!(store.db.get_cf(&cf, encoded_key).unwrap().is_none());
+        assert!(store.db.get_cf(&cf_v2, v2_encoded).unwrap().is_none());
     }
 
     #[test]
@@ -3102,6 +3256,240 @@ mod tests {
 
         assert_eq!(store.iter_addr_spending(&sh).len(), 30);
         assert_eq!(store.iter_addr_spending_limited(&sh, 5).len(), 5);
+    }
+
+    #[test]
+    fn dual_read_merges_v1_and_v2_funding_rows() {
+        // Mainnet scenario for the duration of the migration window:
+        // some scripthash has pre-PR-D rows in CF_ADDR_FUNDING and
+        // post-PR-D rows in CF_ADDR_FUNDING_V2. The merged read must
+        // surface BOTH sets keyed by the caller's full scripthash.
+        use crate::index::address::{
+            AddrFundingKey, AddrFundingRow, encode_funding_key, encode_funding_key_v2,
+            encode_funding_value,
+        };
+
+        let (store, _dir) = temp_store(false);
+        let sh = [0xCA; 32];
+
+        // 1. Inject a synthetic v1 row directly via the CF (writes
+        // would never produce v1 again post-PR-D).
+        let v1_row = AddrFundingRow {
+            scripthash: sh,
+            height: 100,
+            txid: make_outpoint(0xA1, 0).txid,
+            vout: 0,
+            amount_sat: 1_000,
+        };
+        let cf_v1 = store.cf(CF_ADDR_FUNDING);
+        store
+            .db
+            .put_cf(
+                &cf_v1,
+                encode_funding_key(&v1_row.key()),
+                encode_funding_value(v1_row.amount_sat),
+            )
+            .unwrap();
+
+        // 2. Drive a normal write to populate the v2 CF for the same
+        // scripthash at a different height.
+        let v2_row = AddrFundingRow {
+            scripthash: sh,
+            height: 200,
+            txid: make_outpoint(0xB2, 0).txid,
+            vout: 0,
+            amount_sat: 2_000,
+        };
+        let mut batch = StoreBatch::default();
+        batch.addr_funding_puts.push(v2_row.clone());
+        store.write_batch(batch).unwrap();
+
+        // Sanity: v1 CF carries v1 row only; v2 CF carries v2 row only.
+        let cf_v2 = store.cf(CF_ADDR_FUNDING_V2);
+        assert!(
+            store
+                .db
+                .get_cf(&cf_v2, encode_funding_key_v2(&v1_row.key()))
+                .unwrap()
+                .is_none(),
+            "v2 CF must not auto-populate from the v1 fixture",
+        );
+        assert!(
+            store
+                .db
+                .get_cf(&cf_v1, encode_funding_key(&v2_row.key()))
+                .unwrap()
+                .is_none(),
+            "v1 CF must not receive v2 writes",
+        );
+
+        // 3. Read via the merged iterator. Expect both rows.
+        let mut got = store.iter_addr_funding(&sh);
+        got.sort_by_key(|(k, _)| k.height);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].0.height, 100);
+        assert_eq!(got[0].1, 1_000);
+        assert_eq!(got[1].0.height, 200);
+        assert_eq!(got[1].1, 2_000);
+        // Both rows must carry the caller's full 32-byte scripthash,
+        // even the v2 row whose on-disk key has only the 16-byte prefix.
+        let expected_keys: Vec<AddrFundingKey> = vec![v1_row.key(), v2_row.key()];
+        let got_keys: Vec<AddrFundingKey> = got.iter().map(|(k, _)| k.clone()).collect();
+        for k in &got_keys {
+            assert_eq!(k.scripthash, sh);
+        }
+        assert!(expected_keys.iter().all(|e| got_keys.contains(e)));
+    }
+
+    #[test]
+    fn dual_read_merges_v1_and_v2_spending_rows() {
+        // Same shape as the funding test for spending CFs.
+        use crate::index::address::{
+            AddrSpendingKey, AddrSpendingRow, encode_spending_key, encode_spending_value,
+        };
+
+        let (store, _dir) = temp_store(false);
+        let sh = [0xDE; 32];
+
+        let v1_row = AddrSpendingRow {
+            scripthash: sh,
+            height: 10,
+            txid: make_outpoint(0x11, 0).txid,
+            vin: 0,
+            prev_outpoint: make_outpoint(0xC0, 0),
+        };
+        let cf_v1 = store.cf(CF_ADDR_SPENDING);
+        store
+            .db
+            .put_cf(
+                &cf_v1,
+                encode_spending_key(&v1_row.key()),
+                encode_spending_value(&v1_row.prev_outpoint),
+            )
+            .unwrap();
+
+        let v2_row = AddrSpendingRow {
+            scripthash: sh,
+            height: 20,
+            txid: make_outpoint(0x22, 0).txid,
+            vin: 1,
+            prev_outpoint: make_outpoint(0xC1, 0),
+        };
+        let mut batch = StoreBatch::default();
+        batch.addr_spending_puts.push(v2_row.clone());
+        store.write_batch(batch).unwrap();
+
+        let mut got = store.iter_addr_spending(&sh);
+        got.sort_by_key(|(k, _)| k.height);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].0.height, 10);
+        assert_eq!(got[1].0.height, 20);
+        let expected_keys: Vec<AddrSpendingKey> = vec![v1_row.key(), v2_row.key()];
+        let got_keys: Vec<AddrSpendingKey> = got.iter().map(|(k, _)| k.clone()).collect();
+        for k in &got_keys {
+            assert_eq!(k.scripthash, sh);
+        }
+        assert!(expected_keys.iter().all(|e| got_keys.contains(e)));
+    }
+
+    #[test]
+    fn remove_clears_row_from_v1_cf() {
+        // If a row exists in the v1 CF (pre-PR-D residue) and the
+        // disconnect path queues a remove, the merged delete must
+        // clear it from v1. Otherwise the row would re-appear on the
+        // next merged read.
+        use crate::index::address::{AddrFundingRow, encode_funding_key, encode_funding_value};
+
+        let (store, _dir) = temp_store(false);
+        let sh = [0xAA; 32];
+        let row = AddrFundingRow {
+            scripthash: sh,
+            height: 5,
+            txid: make_outpoint(0xBB, 0).txid,
+            vout: 0,
+            amount_sat: 999,
+        };
+        let cf_v1 = store.cf(CF_ADDR_FUNDING);
+        store
+            .db
+            .put_cf(
+                &cf_v1,
+                encode_funding_key(&row.key()),
+                encode_funding_value(row.amount_sat),
+            )
+            .unwrap();
+
+        assert_eq!(store.iter_addr_funding(&sh).len(), 1);
+
+        let mut batch = StoreBatch::default();
+        batch.addr_funding_removes.push(row.key());
+        store.write_batch(batch).unwrap();
+
+        // Both CFs must end up with no row for this key.
+        assert!(
+            store
+                .db
+                .get_cf(&cf_v1, encode_funding_key(&row.key()))
+                .unwrap()
+                .is_none(),
+            "v1 row must be tombstoned by the merged delete",
+        );
+        assert_eq!(store.iter_addr_funding(&sh).len(), 0);
+    }
+
+    #[test]
+    fn dual_read_admits_16_byte_prefix_collisions() {
+        // Two different full scripthashes that share the first 16
+        // bytes will both surface in a v2 read for either. The
+        // module-level docstring spells out this collision-tolerant
+        // posture; the test pins it so an accidental tightening
+        // (e.g. adding a full-scripthash redundancy check) is loud.
+        use crate::index::address::AddrFundingRow;
+
+        let (store, _dir) = temp_store(false);
+        let sh_alice = {
+            let mut sh = [0u8; 32];
+            sh[..16].copy_from_slice(&[0xAB; 16]);
+            sh[16..].copy_from_slice(&[0x01; 16]);
+            sh
+        };
+        let sh_mallory = {
+            let mut sh = [0u8; 32];
+            sh[..16].copy_from_slice(&[0xAB; 16]); // collides on prefix
+            sh[16..].copy_from_slice(&[0x99; 16]);
+            sh
+        };
+
+        let mut batch = StoreBatch::default();
+        batch.addr_funding_puts.push(AddrFundingRow {
+            scripthash: sh_alice,
+            height: 1,
+            txid: make_outpoint(0xA1, 0).txid,
+            vout: 0,
+            amount_sat: 1,
+        });
+        batch.addr_funding_puts.push(AddrFundingRow {
+            scripthash: sh_mallory,
+            height: 2,
+            txid: make_outpoint(0xA2, 0).txid,
+            vout: 0,
+            amount_sat: 2,
+        });
+        store.write_batch(batch).unwrap();
+
+        // Querying with Alice's full scripthash returns BOTH rows
+        // because they're indistinguishable at the v2 16-byte prefix.
+        // Returned keys carry Alice's scripthash (the caller's
+        // identity) even for Mallory's row — that's the trade-off.
+        let got = store.iter_addr_funding(&sh_alice);
+        assert_eq!(
+            got.len(),
+            2,
+            "v2 prefix collision must yield both rows, not silently filter",
+        );
+        for (k, _) in &got {
+            assert_eq!(k.scripthash, sh_alice);
+        }
     }
 
     #[test]

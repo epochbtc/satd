@@ -28,10 +28,12 @@ pub use node_index::AddressIndexConfig;
 pub use node_index::{BackfillCursor, BackfillState};
 pub use emit::{emit_funding, emit_spending, funding_remove_key, spending_remove_key};
 pub use node_index::{
-    AddrFundingKey, AddrFundingRow, AddrSpendingKey, AddrSpendingRow, Scripthash,
-    decode_funding_key, decode_funding_value, decode_spending_key, decode_spending_value,
-    encode_funding_key, encode_funding_value, encode_spending_key, encode_spending_value,
-    scripthash_of,
+    AddrFundingKey, AddrFundingKeyV2Payload, AddrFundingRow, AddrSpendingKey,
+    AddrSpendingKeyV2Payload, AddrSpendingRow, KEY_LEN_V2, SCRIPTHASH_PREFIX_LEN, Scripthash,
+    decode_funding_key, decode_funding_key_v2, decode_funding_value, decode_spending_key,
+    decode_spending_key_v2, decode_spending_value, encode_funding_key, encode_funding_key_v2,
+    encode_funding_value, encode_spending_key, encode_spending_key_v2, encode_spending_value,
+    reconstruct_funding_key, reconstruct_spending_key, scripthash_of,
 };
 pub use lookups::RocksAddressIndex;
 pub use mempool::{MempoolAddrIndex, NotifyBundle, mempool_index_task};
