@@ -2302,18 +2302,23 @@ fn run_offline_migrate_undo(store: &node::storage::rocksdb_store::RocksDbStore, 
     use node::storage::Store;
     use node::storage::undo_migrate::{UndoMigrateConfig, prune_and_migrate_undo};
 
-    // 1. Determine the chain tip height. Without a tip recorded, there's
-    //    no meaningful prune horizon — refuse rather than guess.
+    // 1. Determine the chain tip height. A missing tip means the
+    //    datadir hasn't synced any blocks yet — the undo CF is
+    //    therefore empty and there's nothing to do. Print a clear
+    //    message and exit 0 so the migrator stays idempotent on
+    //    fresh datadirs (CI smoke tests, post-reindex aborts, etc.).
     let tip_hash = match store.get_tip() {
         Some(h) => h,
         None => {
             eprintln!(
-                "Error: --migrate-undo refused: no chain tip recorded in datadir. \
-                 Run `satd` normally at least once to download/sync some blocks before migrating."
+                "migrate-undo: no chain tip recorded — datadir has no blocks, nothing to migrate"
             );
-            return 1;
+            return 0;
         }
     };
+    // A tip recorded but no matching block_index entry IS a real
+    // corruption case — refuse and exit non-zero so the operator
+    // notices.
     let tip_height = match store.get_block_index(&tip_hash) {
         Some(entry) => entry.height,
         None => {
