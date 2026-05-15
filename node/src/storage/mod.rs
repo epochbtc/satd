@@ -1,3 +1,4 @@
+pub mod blockfile_audit;
 pub mod blockindex;
 pub mod coin_cache;
 pub mod coinview;
@@ -358,6 +359,20 @@ pub trait Store: Send + Sync {
     /// `ldb` dump. Default: empty.
     fn sst_bytes_by_cf(&self) -> Vec<(&'static str, u64)> {
         Vec::new()
+    }
+
+    /// Iterate every `block_index` entry, invoking `visit` once per row.
+    /// Used by the blockfile slack audit (and any other diagnostic that
+    /// needs the full block_index set). Order is unspecified. Returning
+    /// is non-cancellable — visitors must accept all rows.
+    ///
+    /// Default: no-op for backends that don't carry a block_index (in-
+    /// memory test store, etc.).
+    fn for_each_block_index(
+        &self,
+        _visit: &mut dyn FnMut(BlockHash, BlockIndexEntry),
+    ) -> Result<(), StoreError> {
+        Ok(())
     }
 
     /// Force a full compaction of the chainstate (coins) column family.

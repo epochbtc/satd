@@ -1453,6 +1453,25 @@ impl Store for RocksDbStore {
         bincode::deserialize(&value).ok()
     }
 
+    fn for_each_block_index(
+        &self,
+        visit: &mut dyn FnMut(BlockHash, BlockIndexEntry),
+    ) -> Result<(), StoreError> {
+        let cf = self.cf(CF_BLOCK_INDEX);
+        let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
+        for item in iter {
+            let (k, v) = item.map_err(|e| StoreError::Database(e.to_string()))?;
+            let Some(hash) = hash_from_bytes(&k) else {
+                continue;
+            };
+            let Ok(entry) = bincode::deserialize::<BlockIndexEntry>(&v) else {
+                continue;
+            };
+            visit(hash, entry);
+        }
+        Ok(())
+    }
+
     fn coin_count(&self) -> u64 {
         self.read_u64_meta(UTXO_COUNT_KEY)
     }

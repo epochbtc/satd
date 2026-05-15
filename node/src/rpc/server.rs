@@ -1370,6 +1370,25 @@ pub async fn start(
         }))
     })?;
 
+    module.register_method("getblockfileaudit", |_params, ctx, _extensions| {
+        // Slack audit: compares every `block_index` reference against the
+        // actual on-disk size of `blk*.dat` files. Read-only diagnostic;
+        // safe to run on a live node. Cost on mainnet is ~minute for the
+        // 8-byte-header reads per indexed block. Output is JSON; the
+        // sat-cli wrapper renders a per-file table in pretty mode.
+        let report = ctx.chain_state.audit_block_files().map_err(|e| {
+            ErrorObjectOwned::owned(-32000, format!("blockfile audit failed: {}", e), None::<()>)
+        })?;
+        let value = serde_json::to_value(&report).map_err(|e| {
+            ErrorObjectOwned::owned(
+                -32603,
+                format!("blockfile audit serialization failed: {}", e),
+                None::<()>,
+            )
+        })?;
+        Ok::<_, ErrorObjectOwned>(value)
+    })?;
+
     module.register_method("getreorghistory", |params, ctx, _extensions| {
         // `getreorghistory [since_secs]` — default 86400 (24 h).
         let mut seq = params.sequence();

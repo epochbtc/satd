@@ -192,6 +192,17 @@ impl Store for InMemoryStore {
         self.undo.read().get(hash).cloned()
     }
 
+    fn for_each_block_index(
+        &self,
+        visit: &mut dyn FnMut(BlockHash, BlockIndexEntry),
+    ) -> Result<(), StoreError> {
+        let bi = self.block_index.read();
+        for (hash, entry) in bi.iter() {
+            visit(*hash, entry.clone());
+        }
+        Ok(())
+    }
+
     fn coin_count(&self) -> u64 {
         self.coins.read().len() as u64
     }
