@@ -69,6 +69,11 @@ pub struct BlockfileAuditReport {
     /// signal; non-zero counts are reported separately so slack accounting
     /// stays clean.
     pub unresolved_entries: u64,
+    /// `block_index` rows whose key/value failed to decode during the scan
+    /// — not silently skipped because the index is consensus-critical
+    /// local state and non-zero counts mean it likely needs repair.
+    pub block_index_skipped_bad_key: u64,
+    pub block_index_skipped_bad_value: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -97,7 +102,7 @@ pub fn audit_blockfiles(
 
     // 1. Walk block_index, bucket entries by file_number.
     let mut by_file: HashMap<u32, Vec<u32>> = HashMap::new();
-    store
+    let scan_stats = store
         .for_each_block_index(&mut |_hash: BlockHash, entry: BlockIndexEntry| {
             // Pruned blocks have no on-disk data — skip them. They're
             // recorded in block_index for chain bookkeeping but their
@@ -205,6 +210,8 @@ pub fn audit_blockfiles(
         totals,
         duration_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
         unresolved_entries,
+        block_index_skipped_bad_key: scan_stats.skipped_bad_key,
+        block_index_skipped_bad_value: scan_stats.skipped_bad_value,
     })
 }
 
@@ -238,19 +245,11 @@ fn measure_file(
     for pos in positions {
         let pos64 = pos as u64;
         if pos64 + 8 > file_size {
+            // Header doesn't fit in file. Leave prev_end alone so a later
+            // valid record's gap_slack absorbs this position correctly.
             unresolved += 1;
             continue;
         }
-        // Gap from the previous record's end to this record's start is slack
-        // (some superseded write that block_index moved away from).
-        if pos64 > prev_end {
-            gap_slack += pos64 - prev_end;
-        }
-        // (pos64 < prev_end would mean overlapping records — corruption.
-        // We don't double-count: the overlapping bytes count as referenced
-        // by both, which inflates the reference total slightly, which the
-        // operator sees as a negative slack on the totals line. That's the
-        // honest reporting we want.)
         if let Err(e) = file.seek(SeekFrom::Start(pos64)) {
             return Err(AuditError::Io {
                 path: path.display().to_string(),
@@ -258,7 +257,7 @@ fn measure_file(
             });
         }
         if let Err(e) = file.read_exact(&mut header) {
-            // EOF mid-header: unresolved.
+            // EOF mid-header: unresolved. Don't touch gap_slack or prev_end.
             if e.kind() == std::io::ErrorKind::UnexpectedEof {
                 unresolved += 1;
                 continue;
@@ -271,12 +270,26 @@ fn measure_file(
         let size = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as u64;
         let record_size = 8 + size;
         if pos64 + record_size > file_size {
-            // Record claims to extend past EOF: truncated or corrupt entry.
-            // Count what fits and flag it as unresolved so the slack total
-            // doesn't go negative on this file.
+            // Record claims to extend past EOF: truncated or corrupt
+            // entry. Leave prev_end and gap_slack alone — counting this
+            // span as gap_slack right after pos would double-count with
+            // trailing_slack since prev_end never advances past it.
             unresolved += 1;
             continue;
         }
+        // Validation passed — commit all category accounting now. Doing
+        // this BEFORE the size validation (as the pre-fix code did)
+        // could leak gap bytes into `gap_slack` for a record we then
+        // rejected, while trailing_slack at the end picks up the same
+        // span from the old prev_end — a double-count.
+        if pos64 > prev_end {
+            gap_slack += pos64 - prev_end;
+        }
+        // (pos64 < prev_end would mean overlapping records — corruption.
+        // We don't double-count: the overlapping bytes count as
+        // referenced by both, which inflates the reference total
+        // slightly, which the operator sees as a negative slack on the
+        // totals line. That's the honest reporting we want.)
         referenced_bytes += record_size;
         indexed_count += 1;
         prev_end = pos64 + record_size;
@@ -453,6 +466,72 @@ mod tests {
         assert_eq!(report.unresolved_entries, 0);
         assert_eq!(report.totals.indexed_block_count, 1);
         assert_eq!(report.totals.slack_bytes_total, 0);
+    }
+
+    /// L1 regression: a `block_index` entry whose record header reads
+    /// fine but whose claimed `size` extends past EOF must NOT advance
+    /// `gap_slack` or `prev_end`. Before the fix, the gap from the
+    /// previous record's end up to this position was committed before
+    /// validation, and then the same span was double-counted under
+    /// `trailing_slack` at the file tail.
+    #[test]
+    fn audit_truncated_record_past_eof_does_not_double_count_slack() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blocks_dir = tmp.path().join("blocks");
+        let db_dir = tmp.path().join("db");
+        std::fs::create_dir_all(&blocks_dir).unwrap();
+        std::fs::create_dir_all(&db_dir).unwrap();
+
+        // Manually build a blk00000.dat:
+        //   [block_a: header(8) + 1024 bytes]      -> records pos=0
+        //   [poison header: claims size=1_000_000] -> at pos=1032,
+        //                                              file is only 1040 bytes
+        let path = blocks_dir.join("blk00000.dat");
+        let mut bytes = Vec::new();
+        let magic = [0xfa, 0xbf, 0xb5, 0xda];
+        let block_a = vec![0xAAu8; 1024];
+        bytes.extend_from_slice(&magic);
+        bytes.extend_from_slice(&(block_a.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&block_a);
+        let pos_a: u32 = 0;
+        let pos_b: u32 = bytes.len() as u32;
+        // Header claims a 1 MB payload that would extend far past EOF.
+        bytes.extend_from_slice(&magic);
+        bytes.extend_from_slice(&1_000_000u32.to_le_bytes());
+        // No payload — the audit must catch the size-vs-EOF mismatch.
+        std::fs::write(&path, &bytes).unwrap();
+        let file_size = bytes.len() as u64;
+
+        let store = open_store(&db_dir);
+        let mut batch = StoreBatch::default();
+        batch
+            .block_index_puts
+            .push((make_hash(1), dummy_index_entry(0, pos_a)));
+        batch
+            .block_index_puts
+            .push((make_hash(2), dummy_index_entry(0, pos_b)));
+        store.write_batch(batch).unwrap();
+
+        let report = audit_blockfiles(&store, &blocks_dir).unwrap();
+        assert_eq!(report.totals.file_count, 1);
+        // Only block_a counted as indexed; block_b is unresolved.
+        assert_eq!(report.totals.indexed_block_count, 1);
+        assert_eq!(report.unresolved_entries, 1);
+        // Block A occupies 8 + 1024 = 1032 bytes. The poison record
+        // starts immediately after, so there is no gap between A and
+        // the poison record. After A, prev_end = 1032; trailing_slack
+        // = file_size - prev_end = 8 (the poison header bytes). With
+        // the pre-fix code, gap_slack would have been advanced ahead
+        // of validation and the same 8 bytes could end up double-
+        // counted; here both gap_slack and the unresolved span must be
+        // accounted for exactly once.
+        let f = &report.files[0];
+        assert_eq!(f.referenced_bytes, 1032);
+        assert_eq!(f.indexed_block_count, 1);
+        assert_eq!(f.gap_slack_bytes, 0);
+        assert_eq!(f.trailing_slack_bytes, file_size - 1032);
+        // Per-file slack must be self-consistent.
+        assert_eq!(f.slack_bytes, file_size as i64 - 1032);
     }
 
     /// A file referenced by no index entry shows up as 100% trailing slack

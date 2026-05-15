@@ -195,12 +195,13 @@ impl Store for InMemoryStore {
     fn for_each_block_index(
         &self,
         visit: &mut dyn FnMut(BlockHash, BlockIndexEntry),
-    ) -> Result<(), StoreError> {
+    ) -> Result<crate::storage::BlockIndexScanStats, StoreError> {
         let bi = self.block_index.read();
         for (hash, entry) in bi.iter() {
             visit(*hash, entry.clone());
         }
-        Ok(())
+        // In-memory map can't carry corrupt rows; stats are always zero.
+        Ok(crate::storage::BlockIndexScanStats::default())
     }
 
     fn coin_count(&self) -> u64 {

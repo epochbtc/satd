@@ -389,14 +389,32 @@ fn render_blockfile_audit(result: &serde_json::Value) -> String {
         .get("unresolved_entries")
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
+    let bad_keys = result
+        .get("block_index_skipped_bad_key")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let bad_values = result
+        .get("block_index_skipped_bad_value")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
 
     let mut out = String::new();
     out.push_str(&format!(
-        "blocks_dir: {}\nduration:   {:.2}s\nunresolved: {}\n\n",
+        "blocks_dir: {}\nduration:   {:.2}s\nunresolved: {}\n",
         blocks_dir,
         duration_ms as f64 / 1000.0,
         unresolved
     ));
+    if bad_keys != 0 || bad_values != 0 {
+        // Loud surface — non-zero counts here mean block_index itself
+        // failed to decode for some rows, which is consensus-critical
+        // local state. Don't bury it as "info".
+        out.push_str(&format!(
+            "WARNING: block_index decode skips — bad_keys={} bad_values={}\n",
+            bad_keys, bad_values,
+        ));
+    }
+    out.push('\n');
     out.push_str(&format!(
         "{:>8}  {:>12}  {:>12}  {:>12}  {:>6}  {:>10}\n",
         "file_no", "size_MB", "referenced_MB", "slack_MB", "slack%", "blocks"

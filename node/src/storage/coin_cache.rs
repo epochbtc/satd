@@ -623,7 +623,7 @@ impl Store for CoinCache {
     fn for_each_block_index(
         &self,
         visit: &mut dyn FnMut(BlockHash, BlockIndexEntry),
-    ) -> Result<(), StoreError> {
+    ) -> Result<crate::storage::BlockIndexScanStats, StoreError> {
         self.inner.for_each_block_index(visit)
     }
 

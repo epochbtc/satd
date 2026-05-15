@@ -1456,20 +1456,23 @@ impl Store for RocksDbStore {
     fn for_each_block_index(
         &self,
         visit: &mut dyn FnMut(BlockHash, BlockIndexEntry),
-    ) -> Result<(), StoreError> {
+    ) -> Result<crate::storage::BlockIndexScanStats, StoreError> {
         let cf = self.cf(CF_BLOCK_INDEX);
         let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
+        let mut stats = crate::storage::BlockIndexScanStats::default();
         for item in iter {
             let (k, v) = item.map_err(|e| StoreError::Database(e.to_string()))?;
             let Some(hash) = hash_from_bytes(&k) else {
+                stats.skipped_bad_key += 1;
                 continue;
             };
             let Ok(entry) = bincode::deserialize::<BlockIndexEntry>(&v) else {
+                stats.skipped_bad_value += 1;
                 continue;
             };
             visit(hash, entry);
         }
-        Ok(())
+        Ok(stats)
     }
 
     fn coin_count(&self) -> u64 {
@@ -2394,6 +2397,49 @@ mod tests {
         let recovered = store.get_undo(&block_hash).unwrap();
         assert_eq!(recovered.spent_coins.len(), 1);
         assert_eq!(recovered.spent_coins[0].1.amount, 1_000_000);
+    }
+
+    #[test]
+    fn for_each_block_index_surfaces_decode_skip_counts() {
+        // Regression for the M4 review finding: `for_each_block_index`
+        // used to silently skip rows whose key/value failed to decode,
+        // which made the blockfile audit understate references and hide
+        // `block_index` corruption. The trait now returns
+        // `BlockIndexScanStats`; counts must reflect both failure modes.
+        let (store, _dir) = temp_store(false);
+
+        // Insert one legitimate row through the normal write path.
+        let (hash, entry) = regtest_genesis_entry();
+        let mut batch = StoreBatch::default();
+        batch.block_index_puts.push((hash, entry));
+        store.write_batch(batch).unwrap();
+
+        // Inject corrupt rows directly into the CF, bypassing
+        // write_batch. Two distinct shapes:
+        //   - bad key: shorter than 32 bytes, so `hash_from_bytes`
+        //     returns None.
+        //   - bad value: a 32-byte hash key but garbage bytes for the
+        //     entry, so bincode::deserialize fails.
+        let cf = store.cf(CF_BLOCK_INDEX);
+        store
+            .db
+            .put_cf(&cf, b"too-short-key", b"irrelevant")
+            .unwrap();
+        let bad_value_hash = make_block_hash(0xAB);
+        store
+            .db
+            .put_cf(&cf, hash_bytes(&bad_value_hash), b"definitely-not-bincode")
+            .unwrap();
+
+        let mut seen = 0u64;
+        let stats = store
+            .for_each_block_index(&mut |_h, _e| {
+                seen += 1;
+            })
+            .unwrap();
+        assert_eq!(seen, 1, "only the legitimate row should reach the visitor");
+        assert_eq!(stats.skipped_bad_key, 1);
+        assert_eq!(stats.skipped_bad_value, 1);
     }
 
     #[test]
