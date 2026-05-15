@@ -104,6 +104,19 @@ pub struct UndoMigrateStats {
     /// Rows that failed to decode even after dispatching v0/v1.
     /// Left in place; non-zero counts indicate genuine corruption.
     pub rows_decode_failed: u64,
+    /// `block_index` rows skipped during the pre-pass height
+    /// lookup because the key wasn't a 32-byte hash. Distinct from
+    /// `rows_skipped_unknown_height` (which counts undo rows whose
+    /// block hash had no `block_index` entry at all) — review L1
+    /// (2026-05-15) flagged that collapsing both signals into one
+    /// counter made it hard to distinguish orphan undo from
+    /// corrupt block_index.
+    pub block_index_skipped_bad_key: u64,
+    /// `block_index` rows skipped because the value failed to
+    /// bincode-decode as a `BlockIndexEntry`. Non-zero counts mean
+    /// the block_index CF itself has corruption that needs repair
+    /// (run `--reindex` to rebuild).
+    pub block_index_skipped_bad_value: u64,
     /// Sum of value bytes for every row we read off disk.
     pub bytes_before: u64,
     /// Sum of value bytes for every row that remains after the run
@@ -140,11 +153,15 @@ pub fn prune_and_migrate_undo(
 
     // 1. Build hash -> height lookup from block_index. ~1M entries on
     //    mainnet is ~36 MB — cheaper than a get_cf per undo row.
-    let heights = load_block_heights(store)?;
+    let (heights, bi_skip_key, bi_skip_value) = load_block_heights(store)?;
 
     // 2. Walk the undo CF, classify each row, accumulate writes in
     //    batches, flush every `batch_size` rows.
-    let mut stats = UndoMigrateStats::default();
+    let mut stats = UndoMigrateStats {
+        block_index_skipped_bad_key: bi_skip_key,
+        block_index_skipped_bad_value: bi_skip_value,
+        ..Default::default()
+    };
     let mut batch = WriteBatch::default();
     let mut batch_rows = 0usize;
 
@@ -187,17 +204,15 @@ pub fn prune_and_migrate_undo(
             continue;
         }
 
-        // In the keep range. Already v1? Leave it alone.
-        if value.len() >= crate::storage::undo::V1_MAGIC.len()
+        // In the keep range. Determine the on-disk format by peeking
+        // the magic, but ALWAYS deserialize before treating a row as
+        // healthy — review M1 (2026-05-15) flagged that the previous
+        // magic-only fast-path classified a truncated, bad-version,
+        // or otherwise corrupt v1 row as `already_v1` and hid the
+        // corruption from the operator.
+        let starts_with_v1_magic = value.len() >= crate::storage::undo::V1_MAGIC.len()
             && value[..crate::storage::undo::V1_MAGIC.len()]
-                == crate::storage::undo::V1_MAGIC
-        {
-            stats.rows_already_v1 += 1;
-            stats.bytes_after += value.len() as u64;
-            continue;
-        }
-
-        // v0 row in the keep range — decode and rewrite.
+                == crate::storage::undo::V1_MAGIC;
         let decoded = match UndoData::deserialize(&value) {
             Ok(u) => u,
             Err(_) => {
@@ -206,6 +221,14 @@ pub fn prune_and_migrate_undo(
                 continue;
             }
         };
+        if starts_with_v1_magic {
+            // Genuine v1 row — leave it alone. Decoding succeeded, so
+            // the row is healthy.
+            stats.rows_already_v1 += 1;
+            stats.bytes_after += value.len() as u64;
+            continue;
+        }
+        // v0 row in the keep range — rewrite as v1.
         let new_bytes = decoded.serialize_v1();
         stats.bytes_after += new_bytes.len() as u64;
         stats.rows_migrated += 1;
@@ -235,31 +258,37 @@ pub fn prune_and_migrate_undo(
 }
 
 /// One-pass scan of `block_index` building a hash -> height map for
-/// the migrator's per-row height check. Bad rows are surfaced via
-/// `BlockIndexScanStats` from the `Store::for_each_block_index`
-/// trait method (which the migrator currently doesn't propagate —
-/// the migrator's `rows_skipped_unknown_height` already accounts
-/// for them via the lookup miss path).
+/// the migrator's per-row height check. Returns the heights map plus
+/// the count of rows skipped because of a malformed key and the count
+/// skipped because of a value that didn't bincode-decode. These two
+/// counts surface in [`UndoMigrateStats::block_index_skipped_bad_key`]
+/// and `block_index_skipped_bad_value` so the operator can tell
+/// `block_index` corruption (here) from orphan-undo (counted at the
+/// undo-CF walk as `rows_skipped_unknown_height`).
 fn load_block_heights(
     store: &RocksDbStore,
-) -> Result<HashMap<BlockHash, u32>, UndoMigrateError> {
+) -> Result<(HashMap<BlockHash, u32>, u64, u64), UndoMigrateError> {
     let cf = store.cf(CF_BLOCK_INDEX);
     let iter = store
         .raw_db()
         .iterator_cf(&cf, rocksdb::IteratorMode::Start);
     let mut heights: HashMap<BlockHash, u32> = HashMap::new();
+    let mut skipped_bad_key: u64 = 0;
+    let mut skipped_bad_value: u64 = 0;
     for item in iter {
         let (k, v) = item.map_err(|e| UndoMigrateError::RocksDb(e.to_string()))?;
         let Some(hash) = hash_from_bytes(&k) else {
+            skipped_bad_key += 1;
             continue;
         };
         let Ok(entry) = bincode::deserialize::<crate::storage::blockindex::BlockIndexEntry>(&v)
         else {
+            skipped_bad_value += 1;
             continue;
         };
         heights.insert(hash, entry.height);
     }
-    Ok(heights)
+    Ok((heights, skipped_bad_key, skipped_bad_value))
 }
 
 #[cfg(test)]
@@ -577,6 +606,64 @@ mod tests {
         // Row must still be present and readable.
         let recovered = store.get_undo(&orphan_hash).unwrap();
         assert_eq!(recovered.spent_coins.len(), 1);
+    }
+
+    #[test]
+    fn v1_magic_but_corrupt_payload_surfaces_as_decode_failed() {
+        // Regression for review M1 (2026-05-15): the migrator used
+        // to classify any row whose value started with V1_MAGIC as
+        // `already_v1` without decoding, hiding a class of corrupt
+        // rows. Now any row in the keep range goes through
+        // `UndoData::deserialize` and decode failures are routed to
+        // `rows_decode_failed` regardless of the magic prefix.
+        use crate::storage::rocksdb_store::CF_UNDO;
+        use crate::storage::rocksdb_store::hash_bytes;
+        use crate::storage::undo::V1_MAGIC;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_store(tmp.path());
+
+        let hash = make_hash(0xC0);
+        let mut batch = StoreBatch::default();
+        batch.block_index_puts.push((hash, dummy_entry(100)));
+        store.write_batch(batch).unwrap();
+
+        // Magic prefix + truncated body: starts with V1_MAGIC but
+        // has no version byte, no count, no coin data.
+        let cf = store.cf(CF_UNDO);
+        let mut corrupt = V1_MAGIC.to_vec();
+        corrupt.push(0xFF); // garbage byte where a version would be
+        store
+            .raw_db()
+            .put_cf(&cf, hash_bytes(&hash), &corrupt)
+            .unwrap();
+
+        let stats = prune_and_migrate_undo(
+            &store,
+            UndoMigrateConfig {
+                prune_below: 50, // height 100 stays
+                dry_run: false,
+                batch_size: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            stats.rows_decode_failed, 1,
+            "corrupt v1 row must be surfaced as decode_failed, not already_v1",
+        );
+        assert_eq!(stats.rows_already_v1, 0);
+        assert_eq!(stats.rows_migrated, 0);
+
+        // Row must still be in place — corruption diagnostics should
+        // never silently destroy bytes.
+        assert!(
+            store
+                .raw_db()
+                .get_cf(&cf, hash_bytes(&hash))
+                .unwrap()
+                .is_some(),
+            "decode_failed rows must not be deleted",
+        );
     }
 
     #[test]

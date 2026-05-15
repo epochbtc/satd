@@ -124,7 +124,63 @@ async fn main() {
         ),
     }
 
-    // Set up authentication
+    // Detect legacy redb database and fail fast. Done before auth/RPC
+    // setup so the legacy-detect error doesn't write to the cookie file
+    // or bind a port unnecessarily.
+    let blocks_dir = net_datadir.join("blocks");
+    let legacy_redb = net_datadir.join("chainstate.redb");
+    if legacy_redb.exists() {
+        eprintln!(
+            "Error: found legacy redb database at {}.\n\
+             The storage engine has changed to RocksDB. To continue:\n\
+             1. Delete the old chainstate: rm {}\n\
+             2. Restart with --reindex to rebuild from block files, or\n\
+             3. Start fresh with a new datadir.",
+            legacy_redb.display(),
+            legacy_redb.display(),
+        );
+        std::process::exit(1);
+    }
+
+    // Partition dbcache budget: 1/3 to RocksDB block cache, 2/3 to CoinCache overlays
+    let rocksdb_cache_mb = config.dbcache / 3;
+    let coincache_mb = config.dbcache - rocksdb_cache_mb;
+
+    let reindex = config.reindex || config.reindex_chainstate;
+    let storage_tuning = node::storage::profile::StorageTuning::for_profile(config.storage_profile)
+        .with_background_jobs(config.rocksdb_background_jobs)
+        .with_subcompactions(config.rocksdb_subcompactions)
+        .with_wal_mb(config.rocksdb_wal_mb);
+    let raw_store = match RocksDbStore::open_with_tuning(
+        &net_datadir,
+        config.txindex,
+        rocksdb_cache_mb,
+        reindex,
+        config.max_open_files,
+        storage_tuning,
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error opening chain database: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    // Offline maintenance: --migrate-undo. Dispatch BEFORE setting up
+    // auth/RPC/heartbeat — review M2 (2026-05-15) flagged that doing
+    // those first meant the migrator could fail because the configured
+    // RPC port was already in use (e.g. another satd already
+    // listening, even though our LOCK acquire would catch the true
+    // concurrent-writer case). The datadir LOCK held by
+    // `open_with_tuning` is the only mutual-exclusion we need for
+    // offline maintenance.
+    if config.migrate_undo {
+        let exit_code = run_offline_migrate_undo(&raw_store, &config);
+        std::process::exit(exit_code);
+    }
+
+    // Beyond this point we're committing to daemon startup. Set up
+    // authentication, then the lightweight startup-status RPC server.
     let auth = if let (Some(user), Some(pass)) = (&config.rpcuser, &config.rpcpassword) {
         RpcAuth::from_user_pass(user.clone(), pass.clone())
     } else {
@@ -138,7 +194,7 @@ async fn main() {
     };
     let auth = Arc::new(auth);
 
-    // Start a lightweight startup-status RPC server immediately.
+    // Start a lightweight startup-status RPC server.
     // This lets the TUI show "Loading database..." instead of "Connecting...".
     // It will be stopped once the full RPC server is ready.
     let rpc_bind: SocketAddr = format!("{}:{}", config.rpcbind, config.rpcport)
@@ -165,64 +221,6 @@ async fn main() {
     let (heartbeat_stop_tx, heartbeat_stop_rx) = tokio::sync::oneshot::channel::<()>();
     let heartbeat_handle =
         notify::spawn_startup_heartbeat(startup_progress.clone(), heartbeat_stop_rx);
-
-    // Open block storage
-    let blocks_dir = net_datadir.join("blocks");
-
-    // Detect legacy redb database and fail fast
-    let legacy_redb = net_datadir.join("chainstate.redb");
-    if legacy_redb.exists() {
-        eprintln!(
-            "Error: found legacy redb database at {}.\n\
-             The storage engine has changed to RocksDB. To continue:\n\
-             1. Delete the old chainstate: rm {}\n\
-             2. Restart with --reindex to rebuild from block files, or\n\
-             3. Start fresh with a new datadir.",
-            legacy_redb.display(),
-            legacy_redb.display(),
-        );
-        auth.cleanup();
-        std::process::exit(1);
-    }
-
-    // Partition dbcache budget: 1/3 to RocksDB block cache, 2/3 to CoinCache overlays
-    let rocksdb_cache_mb = config.dbcache / 3;
-    let coincache_mb = config.dbcache - rocksdb_cache_mb;
-
-    let reindex = config.reindex || config.reindex_chainstate;
-    let storage_tuning = node::storage::profile::StorageTuning::for_profile(config.storage_profile)
-        .with_background_jobs(config.rocksdb_background_jobs)
-        .with_subcompactions(config.rocksdb_subcompactions)
-        .with_wal_mb(config.rocksdb_wal_mb);
-    let raw_store = match RocksDbStore::open_with_tuning(
-        &net_datadir,
-        config.txindex,
-        rocksdb_cache_mb,
-        reindex,
-        config.max_open_files,
-        storage_tuning,
-    ) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("Error opening chain database: {}", e);
-            auth.cleanup();
-            std::process::exit(1);
-        }
-    };
-
-    // Offline maintenance: --migrate-undo. The store is open r/w and the
-    // datadir LOCK is held; if the daemon is already running this code
-    // path is unreachable (RocksDbStore::open_with_tuning would have
-    // failed). We delegate to the migrator, print a short result line
-    // so it's greppable from CI logs, and exit. No daemon startup, so
-    // we never box the store or wire indexes.
-    if config.migrate_undo {
-        let exit_code = run_offline_migrate_undo(&raw_store, &config);
-        let _ = heartbeat_stop_tx.send(());
-        let _ = heartbeat_handle.await;
-        auth.cleanup();
-        std::process::exit(exit_code);
-    }
 
     // Round-1 review H2: tell the Store whether the address + filter
     // indexes are active so `write_batch_mode` can clear the
@@ -2332,39 +2330,63 @@ fn run_offline_migrate_undo(store: &node::storage::rocksdb_store::RocksDbStore, 
     };
 
     // 2. Determine the filter-index cursor. Compiled out when the feature
-    //    is disabled — in that case we treat the cursor as "above tip"
+    //    is disabled — in that case we treat the bound as "above tip"
     //    (u32::MAX) so it doesn't constrain the prune horizon. When
-    //    enabled, anything below the cursor has already had its filter
-    //    computed and won't need its undo data again.
+    //    the filter index is COMPLETE (whether by backfill finishing
+    //    or by live indexing from genesis), all of `block_index` has
+    //    already had filters computed and the filter index won't
+    //    backfill anything below tip again — so it doesn't constrain
+    //    pruning either. Only an enabled-and-incomplete filter index
+    //    constrains the prune horizon: the backfill cursor is the
+    //    lowest height the filter index might still need its undo
+    //    data for.
+    //
+    // Review M3 (2026-05-15): the prior code used the cursor
+    // unconditionally, which produced `prune_below = 0` (effectively
+    // no pruning) on a completed filter index whose persisted cursor
+    // had decayed to its idle/zero state. The complete-marker check
+    // here is the documented fix.
     #[cfg(feature = "block-filter-index")]
-    let filter_cursor_height: u32 = {
-        if config.blockfilterindex {
+    let filter_bound_kind: (u32, &'static str) = {
+        if !config.blockfilterindex {
+            (u32::MAX, "disabled")
+        } else if store.block_filter_index_complete() {
+            (u32::MAX, "complete")
+        } else {
             let cursor = store.read_filter_backfill_cursor();
             // BackfillCursor tracks the height the runner is currently
             // working on; everything below that height has been
             // committed. We use it as an inclusive upper bound on what
-            // it has consumed, since the underlying writes are
-            // atomic per-block.
-            cursor.cursor_height
-        } else {
-            u32::MAX
+            // it has consumed.
+            (cursor.cursor_height, "in-progress")
         }
     };
     #[cfg(not(feature = "block-filter-index"))]
-    let filter_cursor_height: u32 = u32::MAX;
+    let filter_bound_kind: (u32, &'static str) = (u32::MAX, "feature-disabled");
+    let (filter_bound, filter_state) = filter_bound_kind;
 
-    // 3. Compute the safe prune horizon. We're conservative: prune below
-    //    the MINIMUM of the reorg floor and the filter cursor. If the
-    //    filter index is enabled and still well behind tip, this
-    //    naturally limits how much we can prune until the operator
-    //    completes backfill.
+    // 3. Compute the safe prune horizon: the MINIMUM of the reorg
+    //    floor and the filter-index bound (which is u32::MAX in any
+    //    state that doesn't constrain).
     let reorg_floor = tip_height.saturating_sub(config.migrate_undo_keep_recent);
-    let prune_below = std::cmp::min(reorg_floor, filter_cursor_height);
+    let prune_below = std::cmp::min(reorg_floor, filter_bound);
 
     eprintln!(
-        "migrate-undo: tip_height={} keep_recent={} filter_cursor={} -> prune_below={}",
-        tip_height, config.migrate_undo_keep_recent, filter_cursor_height, prune_below,
+        "migrate-undo: tip_height={} keep_recent={} filter_state={} filter_bound={} -> prune_below={}",
+        tip_height, config.migrate_undo_keep_recent, filter_state, filter_bound, prune_below,
     );
+    // Refuse to silently no-op when the filter index is enabled but
+    // not complete and is far enough behind to disable pruning
+    // entirely. The migrator would otherwise succeed with
+    // rows_pruned=0 and the operator wouldn't know why.
+    if prune_below == 0 && tip_height > 0 {
+        eprintln!(
+            "WARNING: migrate-undo: prune_below=0 (filter_state={} filter_bound={}); \
+             no pruning will occur. Either complete the filter-index backfill first, \
+             or disable the filter index to allow pruning.",
+            filter_state, filter_bound,
+        );
+    }
     if config.migrate_undo_dry_run {
         eprintln!("migrate-undo: DRY RUN — no writes will be made");
     }
@@ -2401,6 +2423,16 @@ fn run_offline_migrate_undo(store: &node::storage::rocksdb_store::RocksDbStore, 
         reclaimed,
         stats.duration_ms,
     );
+    if stats.block_index_skipped_bad_key != 0 || stats.block_index_skipped_bad_value != 0 {
+        // Loud warning — non-zero counts here mean block_index itself
+        // failed to decode for some rows, which is consensus-critical
+        // local state.
+        eprintln!(
+            "WARNING: migrate-undo: block_index decode skips — bad_keys={} bad_values={}. \
+             Recommend running with --reindex to rebuild the index.",
+            stats.block_index_skipped_bad_key, stats.block_index_skipped_bad_value,
+        );
+    }
     if config.migrate_undo_dry_run {
         eprintln!(
             "migrate-undo: dry-run complete; re-run without --migrate-undo-dry-run to apply"
