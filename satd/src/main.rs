@@ -194,7 +194,7 @@ async fn main() {
         .with_background_jobs(config.rocksdb_background_jobs)
         .with_subcompactions(config.rocksdb_subcompactions)
         .with_wal_mb(config.rocksdb_wal_mb);
-    let store = match RocksDbStore::open_with_tuning(
+    let raw_store = match RocksDbStore::open_with_tuning(
         &net_datadir,
         config.txindex,
         rocksdb_cache_mb,
@@ -202,20 +202,37 @@ async fn main() {
         config.max_open_files,
         storage_tuning,
     ) {
-        // Round-1 review H2: tell the Store whether the address +
-        // filter indexes are active so `write_batch_mode` can clear
-        // the corresponding `*.complete` markers atomically with any
-        // connect-with-index-off batch.
-        Ok(s) => Box::new(
-            s.with_addressindex_enabled(config.addressindex)
-                .with_blockfilterindex_enabled(config.blockfilterindex),
-        ),
+        Ok(s) => s,
         Err(e) => {
             eprintln!("Error opening chain database: {}", e);
             auth.cleanup();
             std::process::exit(1);
         }
     };
+
+    // Offline maintenance: --migrate-undo. The store is open r/w and the
+    // datadir LOCK is held; if the daemon is already running this code
+    // path is unreachable (RocksDbStore::open_with_tuning would have
+    // failed). We delegate to the migrator, print a short result line
+    // so it's greppable from CI logs, and exit. No daemon startup, so
+    // we never box the store or wire indexes.
+    if config.migrate_undo {
+        let exit_code = run_offline_migrate_undo(&raw_store, &config);
+        let _ = heartbeat_stop_tx.send(());
+        let _ = heartbeat_handle.await;
+        auth.cleanup();
+        std::process::exit(exit_code);
+    }
+
+    // Round-1 review H2: tell the Store whether the address + filter
+    // indexes are active so `write_batch_mode` can clear the
+    // corresponding `*.complete` markers atomically with any
+    // connect-with-index-off batch.
+    let store = Box::new(
+        raw_store
+            .with_addressindex_enabled(config.addressindex)
+            .with_blockfilterindex_enabled(config.blockfilterindex),
+    );
 
     // Handle -reindex: clear everything, will rebuild from flat files
     if config.reindex {
@@ -2269,6 +2286,127 @@ async fn persist_filter_failed_with_cleanup(
     if let Err(p) = handle.mark_failed(chain.store_ref().as_ref(), &msg) {
         tracing::warn!(error = %p, "failed to persist filter-index Failed state");
     }
+}
+
+/// Run the offline undo prune + migrate pass against an already-open
+/// `RocksDbStore`. Computes a safe prune horizon that respects both
+/// the reorg-protection floor (tip - keep_recent) and the BIP 158
+/// filter-index backfill cursor (anything the filter index might
+/// still need to backfill), then delegates to the migrator and
+/// prints a short result line.
+///
+/// Returns the process exit code: `0` on success, `1` if the
+/// migration errored or the store has no tip recorded yet (which
+/// would make any prune horizon meaningless).
+fn run_offline_migrate_undo(store: &node::storage::rocksdb_store::RocksDbStore, config: &Config) -> i32 {
+    use node::storage::Store;
+    use node::storage::undo_migrate::{UndoMigrateConfig, prune_and_migrate_undo};
+
+    // 1. Determine the chain tip height. Without a tip recorded, there's
+    //    no meaningful prune horizon — refuse rather than guess.
+    let tip_hash = match store.get_tip() {
+        Some(h) => h,
+        None => {
+            eprintln!(
+                "Error: --migrate-undo refused: no chain tip recorded in datadir. \
+                 Run `satd` normally at least once to download/sync some blocks before migrating."
+            );
+            return 1;
+        }
+    };
+    let tip_height = match store.get_block_index(&tip_hash) {
+        Some(entry) => entry.height,
+        None => {
+            eprintln!(
+                "Error: --migrate-undo refused: tip {} has no block_index entry. \
+                 Datadir appears corrupt; run --reindex first.",
+                tip_hash
+            );
+            return 1;
+        }
+    };
+
+    // 2. Determine the filter-index cursor. Compiled out when the feature
+    //    is disabled — in that case we treat the cursor as "above tip"
+    //    (u32::MAX) so it doesn't constrain the prune horizon. When
+    //    enabled, anything below the cursor has already had its filter
+    //    computed and won't need its undo data again.
+    #[cfg(feature = "block-filter-index")]
+    let filter_cursor_height: u32 = {
+        if config.blockfilterindex {
+            let cursor = store.read_filter_backfill_cursor();
+            // BackfillCursor tracks the height the runner is currently
+            // working on; everything below that height has been
+            // committed. We use it as an inclusive upper bound on what
+            // it has consumed, since the underlying writes are
+            // atomic per-block.
+            cursor.cursor_height
+        } else {
+            u32::MAX
+        }
+    };
+    #[cfg(not(feature = "block-filter-index"))]
+    let filter_cursor_height: u32 = u32::MAX;
+
+    // 3. Compute the safe prune horizon. We're conservative: prune below
+    //    the MINIMUM of the reorg floor and the filter cursor. If the
+    //    filter index is enabled and still well behind tip, this
+    //    naturally limits how much we can prune until the operator
+    //    completes backfill.
+    let reorg_floor = tip_height.saturating_sub(config.migrate_undo_keep_recent);
+    let prune_below = std::cmp::min(reorg_floor, filter_cursor_height);
+
+    eprintln!(
+        "migrate-undo: tip_height={} keep_recent={} filter_cursor={} -> prune_below={}",
+        tip_height, config.migrate_undo_keep_recent, filter_cursor_height, prune_below,
+    );
+    if config.migrate_undo_dry_run {
+        eprintln!("migrate-undo: DRY RUN — no writes will be made");
+    }
+
+    // 4. Run the migrator.
+    let migrate_cfg = UndoMigrateConfig {
+        prune_below,
+        dry_run: config.migrate_undo_dry_run,
+        ..Default::default()
+    };
+    let stats = match prune_and_migrate_undo(store, migrate_cfg) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error: migrate-undo failed: {}", e);
+            return 1;
+        }
+    };
+
+    // 5. Surface the outcome. One-line summary so log scrapers / CI can
+    //    grep, followed by the per-category breakdown.
+    let reclaimed = stats.bytes_reclaimed();
+    eprintln!(
+        "migrate-undo: scanned={} pruned={} migrated={} already_v1={} \
+         skipped_unknown_height={} decode_failed={} bytes_before={} bytes_after={} \
+         reclaimed={} duration_ms={}",
+        stats.rows_scanned,
+        stats.rows_pruned,
+        stats.rows_migrated,
+        stats.rows_already_v1,
+        stats.rows_skipped_unknown_height,
+        stats.rows_decode_failed,
+        stats.bytes_before,
+        stats.bytes_after,
+        reclaimed,
+        stats.duration_ms,
+    );
+    if config.migrate_undo_dry_run {
+        eprintln!(
+            "migrate-undo: dry-run complete; re-run without --migrate-undo-dry-run to apply"
+        );
+    } else {
+        eprintln!(
+            "migrate-undo: complete; reclaimed {:.2} GB",
+            reclaimed as f64 / 1_073_741_824.0
+        );
+    }
+    0
 }
 
 /// HMAC-SHA256 over `msg` keyed by `key`, hex-encoded. Pure Rust so we

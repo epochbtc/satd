@@ -14,10 +14,10 @@ use crate::storage::profile::StorageTuning;
 use crate::storage::undo::UndoData;
 use crate::storage::{Store, StoreBatch, StoreError, WriteMode};
 
-const CF_BLOCK_INDEX: &str = "block_index";
+pub(crate) const CF_BLOCK_INDEX: &str = "block_index";
 const CF_COINS: &str = "coins";
 const CF_HEIGHT_INDEX: &str = "height_index";
-const CF_UNDO: &str = "undo";
+pub(crate) const CF_UNDO: &str = "undo";
 const CF_TX_INDEX: &str = "tx_index";
 const CF_METADATA: &str = "metadata";
 const CF_ADDR_FUNDING: &str = "addr_funding";
@@ -97,11 +97,11 @@ const BLOCK_FILTER_INDEX_COMPLETE_KEY: &[u8] = b"block_filter_index.complete";
 const BLOCK_FILTER_INDEX_TIP_HEIGHT_KEY: &[u8] = b"block_filter_index.tip_height";
 const CURRENT_SCHEMA_VERSION: u32 = 2; // v2 = compact varint coins
 
-fn hash_bytes(hash: &BlockHash) -> &[u8] {
+pub(crate) fn hash_bytes(hash: &BlockHash) -> &[u8] {
     hash.as_ref()
 }
 
-fn hash_from_bytes(bytes: &[u8]) -> Option<BlockHash> {
+pub(crate) fn hash_from_bytes(bytes: &[u8]) -> Option<BlockHash> {
     if bytes.len() != 32 {
         return None;
     }
@@ -692,10 +692,18 @@ impl RocksDbStore {
             .map_err(|e| StoreError::Database(e.to_string()))
     }
 
-    fn cf(&self, name: &str) -> Arc<BoundColumnFamily<'_>> {
+    pub(crate) fn cf(&self, name: &str) -> Arc<BoundColumnFamily<'_>> {
         self.db
             .cf_handle(name)
             .unwrap_or_else(|| panic!("column family '{}' not found", name))
+    }
+
+    /// Shared accessor used by maintenance code that lives outside this
+    /// module (e.g. the offline undo migrator). Keeps `self.db` itself
+    /// private so the migrator can't accidentally bypass open-mode
+    /// guards.
+    pub(crate) fn raw_db(&self) -> &rocksdb::DBWithThreadMode<rocksdb::MultiThreaded> {
+        &self.db
     }
 
     /// Build column family options for (re)creation.

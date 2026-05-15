@@ -8,6 +8,7 @@ pub mod flatfile;
 pub mod profile;
 pub mod rocksdb_store;
 pub mod undo;
+pub mod undo_migrate;
 
 use bitcoin::{BlockHash, OutPoint, Txid};
 
