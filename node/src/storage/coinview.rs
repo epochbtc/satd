@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 /// A single unspent transaction output.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Coin {
     pub amount: u64,
     #[serde(with = "script_serde")]
@@ -56,7 +56,7 @@ mod script_serde {
 // ---------------------------------------------------------------------------
 
 /// Encode a u64 as a variable-length integer (7 bits per byte, MSB = more).
-fn encode_varint(mut val: u64, buf: &mut Vec<u8>) {
+pub(crate) fn encode_varint(mut val: u64, buf: &mut Vec<u8>) {
     loop {
         if val < 0x80 {
             buf.push(val as u8);
@@ -68,7 +68,7 @@ fn encode_varint(mut val: u64, buf: &mut Vec<u8>) {
 }
 
 /// Decode a varint from a byte slice, returning (value, bytes_consumed).
-fn decode_varint(buf: &[u8]) -> Option<(u64, usize)> {
+pub(crate) fn decode_varint(buf: &[u8]) -> Option<(u64, usize)> {
     let mut val: u64 = 0;
     let mut shift = 0u32;
     for (i, &byte) in buf.iter().enumerate() {
@@ -100,24 +100,39 @@ impl Coin {
 
     /// Deserialize from compact binary format. Rejects trailing bytes.
     pub fn deserialize_compact(data: &[u8]) -> Option<Self> {
+        let (coin, consumed) = Self::deserialize_compact_stream(data)?;
+        if consumed != data.len() {
+            return None;
+        }
+        Some(coin)
+    }
+
+    /// Streaming variant of [`Coin::deserialize_compact`]: returns the
+    /// decoded coin and the number of bytes consumed, so the caller can
+    /// pack multiple coins back-to-back without an outer length prefix.
+    /// Used by the undo v1 format. Returns `None` if the bytes are
+    /// truncated or the varints overflow.
+    pub fn deserialize_compact_stream(data: &[u8]) -> Option<(Self, usize)> {
         let (height_cb, n1) = decode_varint(data)?;
         let height = (height_cb >> 1) as u32;
         let coinbase = (height_cb & 1) != 0;
-        let (amount, n2) = decode_varint(&data[n1..])?;
-        let (script_len, n3) = decode_varint(&data[n1 + n2..])?;
+        let (amount, n2) = decode_varint(data.get(n1..)?)?;
+        let (script_len, n3) = decode_varint(data.get(n1 + n2..)?)?;
         let script_start = n1 + n2 + n3;
-        let script_end = script_start + script_len as usize;
-        // Strict: exact length match, reject trailing garbage
-        if script_end != data.len() {
+        let script_end = script_start.checked_add(script_len as usize)?;
+        if script_end > data.len() {
             return None;
         }
         let script_pubkey = bitcoin::ScriptBuf::from_bytes(data[script_start..script_end].to_vec());
-        Some(Coin {
-            amount,
-            script_pubkey,
-            height,
-            coinbase,
-        })
+        Some((
+            Coin {
+                amount,
+                script_pubkey,
+                height,
+                coinbase,
+            },
+            script_end,
+        ))
     }
 }
 

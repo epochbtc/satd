@@ -218,11 +218,10 @@ impl BackfillRunner {
                         continue;
                     }
                     for input in &tx.input {
-                        let (op_ser, coin) = undo
+                        let coin = undo
                             .spent_coins
                             .get(undo_cursor)
                             .ok_or(BackfillError::MissingUndo(h))?;
-                        debug_assert_eq!(input.previous_output, op_ser.to_outpoint());
                         prev_map.insert(input.previous_output, coin.script_pubkey.clone());
                         undo_cursor += 1;
                     }
@@ -513,21 +512,13 @@ impl BackfillRunner {
                     continue;
                 }
                 for input in &tx.input {
-                    let (op_ser, coin) = undo
+                    let coin = undo
                         .spent_coins
                         .get(undo_cursor)
                         .ok_or(BackfillError::MissingUndo(h))?;
-                    // Sanity: the undo outpoint should match the
-                    // input's previous_output. We rely on connect-order
-                    // alignment and don't fail loud on mismatch — undo
-                    // bookkeeping is internal — but the assertion
-                    // surfaces an inconsistency early in development.
-                    debug_assert_eq!(
-                        input.previous_output,
-                        op_ser.to_outpoint(),
-                        "undo entry mismatch at height {}",
-                        h
-                    );
+                    // The v1 undo format stores only the spent coin, in
+                    // connect-order — the outpoint is the input's
+                    // `previous_output`. No cross-check possible here.
                     prev_map.insert(input.previous_output, coin.script_pubkey.clone());
                     undo_cursor += 1;
                 }

@@ -1036,7 +1036,7 @@ impl Store for CoinCache {
 mod tests {
     use super::super::blockindex::{BlockIndexEntry, BlockStatus, work_for_bits};
     use super::super::db::InMemoryStore;
-    use super::super::undo::{OutPointSer, UndoData};
+    use super::super::undo::UndoData;
     use super::*;
     use bitcoin::hashes::Hash;
     use bitcoin::pow::CompactTarget;
@@ -1440,13 +1440,7 @@ mod tests {
         let cache = make_cache(10);
         let bh = make_block_hash(0xE2);
         let undo = UndoData {
-            spent_coins: vec![(
-                OutPointSer {
-                    txid: [0xAB; 32],
-                    vout: 0,
-                },
-                make_coin(42, 1),
-            )],
+            spent_coins: vec![make_coin(42, 1)],
         };
 
         let mut batch = StoreBatch::default();
@@ -1455,7 +1449,7 @@ mod tests {
 
         let recovered = cache.get_undo(&bh).unwrap();
         assert_eq!(recovered.spent_coins.len(), 1);
-        assert_eq!(recovered.spent_coins[0].1.amount, 42);
+        assert_eq!(recovered.spent_coins[0].amount, 42);
     }
 
     // ---------------------------------------------------------------
