@@ -1,3 +1,4 @@
+pub mod addr_index_migrate;
 pub mod blockfile_audit;
 pub mod blockindex;
 pub mod coin_cache;

@@ -20,15 +20,16 @@ const CF_HEIGHT_INDEX: &str = "height_index";
 pub(crate) const CF_UNDO: &str = "undo";
 const CF_TX_INDEX: &str = "tx_index";
 const CF_METADATA: &str = "metadata";
-const CF_ADDR_FUNDING: &str = "addr_funding";
-const CF_ADDR_SPENDING: &str = "addr_spending";
+pub(crate) const CF_ADDR_FUNDING: &str = "addr_funding";
+pub(crate) const CF_ADDR_SPENDING: &str = "addr_spending";
 /// v2 address-history CFs: same row shape, but the key carries only
 /// a 16-byte scripthash prefix (vs 32 bytes for v1). All writes after
 /// PR D land here; reads consult both v1 and v2 and concatenate (the
-/// lookup layer already sorts post-fetch). Migration of existing v1
-/// data is the next PR.
-const CF_ADDR_FUNDING_V2: &str = "addr_funding_v2";
-const CF_ADDR_SPENDING_V2: &str = "addr_spending_v2";
+/// lookup layer already sorts post-fetch). The offline addr-index
+/// migrator (`storage::addr_index_migrate`) rewrites v1 rows into
+/// these CFs.
+pub(crate) const CF_ADDR_FUNDING_V2: &str = "addr_funding_v2";
+pub(crate) const CF_ADDR_SPENDING_V2: &str = "addr_spending_v2";
 /// Confirmed-side spend index: `prev_outpoint -> SpendingRef`. Written
 /// alongside the address-index spending rows; the two CFs answer
 /// different shapes of the same question.
@@ -726,10 +727,10 @@ impl RocksDbStore {
             .unwrap_or_else(|| panic!("column family '{}' not found", name))
     }
 
-    /// Shared accessor used by maintenance code that lives outside this
-    /// module (e.g. the offline undo migrator). Keeps `self.db` itself
-    /// private so the migrator can't accidentally bypass open-mode
-    /// guards.
+    /// Shared accessor used by offline maintenance code (the undo
+    /// migrator and the addr-index migrator) that needs the raw
+    /// RocksDB handle. Keeps `self.db` itself private so migrators
+    /// can't accidentally bypass open-mode guards or schema gating.
     pub(crate) fn raw_db(&self) -> &rocksdb::DBWithThreadMode<rocksdb::MultiThreaded> {
         &self.db
     }

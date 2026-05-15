@@ -467,6 +467,8 @@ pub struct Config {
     pub migrate_undo: bool,
     pub migrate_undo_dry_run: bool,
     pub migrate_undo_keep_recent: u32,
+    pub migrate_addr_index: bool,
+    pub migrate_addr_index_dry_run: bool,
     // P2P
     pub maxconnections: usize,
     /// Maximum simultaneous inbound peers from the same source IP
@@ -1382,6 +1384,8 @@ impl Config {
             migrate_undo: cli.migrate_undo,
             migrate_undo_dry_run: cli.migrate_undo_dry_run,
             migrate_undo_keep_recent: cli.migrate_undo_keep_recent,
+            migrate_addr_index: cli.migrate_addr_index,
+            migrate_addr_index_dry_run: cli.migrate_addr_index_dry_run,
             maxconnections: cli
                 .maxconnections
                 .or_else(|| file_get("maxconnections").and_then(|v| v.parse().ok()))
@@ -2223,6 +2227,18 @@ pub struct CliArgs {
     )]
     pub migrate_undo_keep_recent: u32,
 
+    #[arg(
+        long = "migrate-addr-index",
+        help = "Offline: rewrite v1 addr_funding/addr_spending rows into the smaller v2 schema (~16 bytes saved per row, projected ~80 GB total on mainnet). Exits after running."
+    )]
+    pub migrate_addr_index: bool,
+
+    #[arg(
+        long = "migrate-addr-index-dry-run",
+        help = "With --migrate-addr-index: scan and report without writing or deleting anything."
+    )]
+    pub migrate_addr_index_dry_run: bool,
+
     // P2P flags
     #[arg(
         long,
@@ -3051,6 +3067,8 @@ rpcport=8332
             migrate_undo: false,
             migrate_undo_dry_run: false,
             migrate_undo_keep_recent: 2016,
+            migrate_addr_index: false,
+            migrate_addr_index_dry_run: false,
             maxconnections: None,
             maxinboundperip: None,
             bind: None,
@@ -3198,6 +3216,8 @@ rpcport=8332
             migrate_undo: false,
             migrate_undo_dry_run: false,
             migrate_undo_keep_recent: 2016,
+            migrate_addr_index: false,
+            migrate_addr_index_dry_run: false,
             maxconnections: None,
             maxinboundperip: None,
             bind: None,

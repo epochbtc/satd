@@ -179,6 +179,16 @@ async fn main() {
         std::process::exit(exit_code);
     }
 
+    // Offline maintenance: --migrate-addr-index. Same rationale as
+    // --migrate-undo above — the datadir LOCK acquired by
+    // `open_with_tuning` is the only mutual-exclusion needed; running
+    // before auth/RPC/heartbeat avoids the RPC-port-already-in-use
+    // failure mode (review M2, 2026-05-15).
+    if config.migrate_addr_index {
+        let exit_code = run_offline_migrate_addr_index(&raw_store, &config);
+        std::process::exit(exit_code);
+    }
+
     // Beyond this point we're committing to daemon startup. Set up
     // authentication, then the lightweight startup-status RPC server.
     let auth = if let (Some(user), Some(pass)) = (&config.rpcuser, &config.rpcpassword) {
@@ -2449,6 +2459,77 @@ fn run_offline_migrate_undo(store: &node::storage::rocksdb_store::RocksDbStore, 
 /// HMAC-SHA256 over `msg` keyed by `key`, hex-encoded. Pure Rust so we
 /// don't pull in yet another dep; reorg rate is low so the tiny-fast-
 /// crypto path is unnecessary.
+/// Run the offline addr-index v1 → v2 migrator against an already-
+/// open `RocksDbStore`. Walks `addr_funding` + `addr_spending`,
+/// rewrites each row into the v2 schema (16-byte scripthash prefix),
+/// deletes the v1 row, then prints a summary. Returns the process
+/// exit code.
+fn run_offline_migrate_addr_index(
+    store: &node::storage::rocksdb_store::RocksDbStore,
+    config: &Config,
+) -> i32 {
+    use node::storage::addr_index_migrate::{
+        AddrIndexMigrateConfig, migrate_addr_index,
+    };
+
+    eprintln!(
+        "migrate-addr-index: starting (dry_run={})",
+        config.migrate_addr_index_dry_run
+    );
+
+    let migrate_cfg = AddrIndexMigrateConfig {
+        dry_run: config.migrate_addr_index_dry_run,
+        ..Default::default()
+    };
+    let stats = match migrate_addr_index(store, migrate_cfg) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error: migrate-addr-index failed: {}", e);
+            return 1;
+        }
+    };
+
+    let reclaimed = stats.bytes_reclaimed();
+    eprintln!(
+        "migrate-addr-index: funding_scanned={} funding_migrated={} \
+         funding_bad_key={} funding_bad_value={} funding_bytes_before={} \
+         funding_bytes_after={}",
+        stats.funding.rows_scanned,
+        stats.funding.rows_migrated,
+        stats.funding.rows_skipped_bad_key,
+        stats.funding.rows_skipped_bad_value,
+        stats.funding.bytes_before,
+        stats.funding.bytes_after,
+    );
+    eprintln!(
+        "migrate-addr-index: spending_scanned={} spending_migrated={} \
+         spending_bad_key={} spending_bad_value={} spending_bytes_before={} \
+         spending_bytes_after={}",
+        stats.spending.rows_scanned,
+        stats.spending.rows_migrated,
+        stats.spending.rows_skipped_bad_key,
+        stats.spending.rows_skipped_bad_value,
+        stats.spending.bytes_before,
+        stats.spending.bytes_after,
+    );
+    eprintln!(
+        "migrate-addr-index: total reclaimed={} bytes duration_ms={}",
+        reclaimed, stats.duration_ms,
+    );
+    if config.migrate_addr_index_dry_run {
+        eprintln!(
+            "migrate-addr-index: dry-run complete; re-run without \
+             --migrate-addr-index-dry-run to apply"
+        );
+    } else {
+        eprintln!(
+            "migrate-addr-index: complete; reclaimed {:.2} GB",
+            reclaimed as f64 / 1_073_741_824.0
+        );
+    }
+    0
+}
+
 fn hmac_sha256_hex(key: &[u8], msg: &[u8]) -> String {
     use bitcoin::hashes::{Hash, HashEngine, Hmac, HmacEngine, sha256};
     let mut hmac: HmacEngine<sha256::Hash> = HmacEngine::new(key);
