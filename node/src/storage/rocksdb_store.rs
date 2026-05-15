@@ -3636,6 +3636,75 @@ mod tests {
     }
 
     #[test]
+    fn dual_read_limited_per_cf_cap_during_migration() {
+        // Round-2 review M4 (2026-05-15): the Store trait now
+        // documents that during the v1/v2 migration window
+        // `iter_addr_*_limited` caps each source-format CF
+        // independently, so the total may reach up to `2 * limit`.
+        // Pin the contract with a mixed-state fixture: 50 v1 rows
+        // and 50 v2 rows for the same scripthash, query with
+        // limit=10, expect exactly 20 (10 from each CF). Callers
+        // that need a hard total cap (Electrum/Esplora) truncate
+        // above this layer — see the trait doc on
+        // `iter_addr_funding_limited`.
+        use crate::index::address::{
+            AddrFundingRow, encode_funding_key, encode_funding_value,
+        };
+
+        let (store, _dir) = temp_store(false);
+        let sh = [0xFE; 32];
+
+        // 50 v1 rows injected directly into the v1 CF.
+        let cf_v1 = store.cf(CF_ADDR_FUNDING);
+        for i in 0..50u32 {
+            let row = AddrFundingRow {
+                scripthash: sh,
+                height: 1000 + i,
+                txid: make_outpoint((0xA0u8).wrapping_add(i as u8), 0).txid,
+                vout: 0,
+                amount_sat: 1_000 + i as u64,
+            };
+            store
+                .db
+                .put_cf(
+                    &cf_v1,
+                    encode_funding_key(&row.key()),
+                    encode_funding_value(row.amount_sat),
+                )
+                .unwrap();
+        }
+
+        // 50 v2 rows via the normal write path.
+        let mut batch = StoreBatch::default();
+        for i in 0..50u32 {
+            batch.addr_funding_puts.push(AddrFundingRow {
+                scripthash: sh,
+                height: 2000 + i,
+                txid: make_outpoint((0xB0u8).wrapping_add(i as u8), 0).txid,
+                vout: 0,
+                amount_sat: 2_000 + i as u64,
+            });
+        }
+        store.write_batch(batch).unwrap();
+
+        let got = store.iter_addr_funding_limited(&sh, 10);
+        assert_eq!(
+            got.len(),
+            20,
+            "per-CF cap contract: expect 10 v1 + 10 v2 = 20 in mixed state",
+        );
+        // Half should come from v1 (heights ~1000) and half from v2
+        // (heights ~2000).
+        let v1_count = got.iter().filter(|(k, _)| k.height >= 1000 && k.height < 2000).count();
+        let v2_count = got.iter().filter(|(k, _)| k.height >= 2000).count();
+        assert_eq!(v1_count, 10, "v1 contribution should be capped at limit");
+        assert_eq!(v2_count, 10, "v2 contribution should be capped at limit");
+
+        // limit=0 must still return 0 from both CFs.
+        assert_eq!(store.iter_addr_funding_limited(&sh, 0).len(), 0);
+    }
+
+    #[test]
     fn test_outpoint_spend_persists_across_reopen() {
         // Verifies the CF descriptor is registered on subsequent opens
         // (so an existing chainstate-on-disk doesn't fail to mount).
