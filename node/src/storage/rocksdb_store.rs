@@ -1696,16 +1696,25 @@ impl Store for RocksDbStore {
     ) -> Vec<(crate::index::address::AddrFundingKey, u64)> {
         // Dual-read: walk v1 (32-byte scripthash) + v2 (16-byte
         // prefix) and concatenate. The address-index lookup layer
-        // sorts the merged stream post-fetch, so we don't need to
-        // produce a strictly merged order here. Each iterator
-        // respects its own bloom/prefix extractor and short-circuits
-        // when the prefix is exhausted.
+        // sorts the merged stream post-fetch and truncates to the
+        // caller's overall limit, so each CF is independently capped
+        // at `limit` — NOT at "limit minus what v1 already returned".
+        //
+        // Why two independent caps (review H1, 2026-05-15): if v1
+        // had `limit` rows at heights 100..150 and v2 had earlier
+        // rows at heights 50..99, gating v2 on `out.len() < limit`
+        // would skip the v2 entirely and the caller's
+        // "first `limit` by height" result would be wrong. Returning
+        // up to `2 * limit` rows here is intentional and matches the
+        // shape `confirmed_history_limited` already produces from
+        // (funding + spending).
         let mut out: Vec<(crate::index::address::AddrFundingKey, u64)> = Vec::new();
 
         // v1: 32-byte scripthash prefix, full key length 72.
         let cf_v1 = self.cf(CF_ADDR_FUNDING);
+        let mut v1_count = 0usize;
         for item in self.db.prefix_iterator_cf(&cf_v1, sh) {
-            if out.len() >= limit {
+            if v1_count >= limit {
                 break;
             }
             let (k, v) = match item {
@@ -1728,41 +1737,43 @@ impl Store for RocksDbStore {
                 None => continue,
             };
             out.push((key, amount));
+            v1_count += 1;
         }
 
-        // v2: 16-byte scripthash-prefix.
-        if out.len() < limit {
-            let cf_v2 = self.cf(CF_ADDR_FUNDING_V2);
-            let sh_prefix = &sh[..crate::index::address::SCRIPTHASH_PREFIX_LEN];
-            for item in self.db.prefix_iterator_cf(&cf_v2, sh_prefix) {
-                if out.len() >= limit {
-                    break;
-                }
-                let (k, v) = match item {
-                    Ok(kv) => kv,
-                    Err(_) => continue,
-                };
-                if k.len() != crate::index::address::KEY_LEN_V2 || &k[..sh_prefix.len()] != sh_prefix {
-                    break;
-                }
-                let payload = match crate::index::address::decode_funding_key_v2(&k) {
-                    Some(p) => p,
-                    None => continue,
-                };
-                let amount = match crate::index::address::decode_funding_value(&v) {
-                    Some(a) => a,
-                    None => continue,
-                };
-                // Reconstruct the canonical in-memory key by re-
-                // attaching the caller's full scripthash. Collisions
-                // (different full scripthashes sharing this 16-byte
-                // prefix) are admitted by design — see module
-                // docstring in `node_index::keys`. The lookup layer
-                // exposes results keyed by the caller-supplied
-                // scripthash regardless.
-                let key = crate::index::address::reconstruct_funding_key(sh, payload);
-                out.push((key, amount));
+        // v2: 16-byte scripthash-prefix. Independently capped at
+        // `limit` — see the comment above.
+        let cf_v2 = self.cf(CF_ADDR_FUNDING_V2);
+        let sh_prefix = &sh[..crate::index::address::SCRIPTHASH_PREFIX_LEN];
+        let mut v2_count = 0usize;
+        for item in self.db.prefix_iterator_cf(&cf_v2, sh_prefix) {
+            if v2_count >= limit {
+                break;
             }
+            let (k, v) = match item {
+                Ok(kv) => kv,
+                Err(_) => continue,
+            };
+            if k.len() != crate::index::address::KEY_LEN_V2 || &k[..sh_prefix.len()] != sh_prefix {
+                break;
+            }
+            let payload = match crate::index::address::decode_funding_key_v2(&k) {
+                Some(p) => p,
+                None => continue,
+            };
+            let amount = match crate::index::address::decode_funding_value(&v) {
+                Some(a) => a,
+                None => continue,
+            };
+            // Reconstruct the canonical in-memory key by re-
+            // attaching the caller's full scripthash. Collisions
+            // (different full scripthashes sharing this 16-byte
+            // prefix) are admitted by design — see module
+            // docstring in `node_index::keys`. The lookup layer
+            // exposes results keyed by the caller-supplied
+            // scripthash regardless.
+            let key = crate::index::address::reconstruct_funding_key(sh, payload);
+            out.push((key, amount));
+            v2_count += 1;
         }
         out
     }
@@ -1779,14 +1790,18 @@ impl Store for RocksDbStore {
         sh: &crate::index::address::Scripthash,
         limit: usize,
     ) -> Vec<(crate::index::address::AddrSpendingKey, OutPoint)> {
-        // Dual-read across v1 + v2 CFs. See iter_addr_funding_limited
-        // for the rationale; mirror its shape here.
+        // Dual-read across v1 + v2 CFs. Each CF is independently
+        // capped at `limit` — see iter_addr_funding_limited for the
+        // rationale (review H1, 2026-05-15). Returning up to
+        // `2 * limit` rows here is intentional; the lookup layer
+        // sorts and truncates post-fetch.
         let mut out: Vec<(crate::index::address::AddrSpendingKey, OutPoint)> = Vec::new();
 
         // v1: 32-byte scripthash prefix.
         let cf_v1 = self.cf(CF_ADDR_SPENDING);
+        let mut v1_count = 0usize;
         for item in self.db.prefix_iterator_cf(&cf_v1, sh) {
-            if out.len() >= limit {
+            if v1_count >= limit {
                 break;
             }
             let (k, v) = match item {
@@ -1805,34 +1820,36 @@ impl Store for RocksDbStore {
                 None => continue,
             };
             out.push((key, prev));
+            v1_count += 1;
         }
 
-        // v2: 16-byte scripthash prefix.
-        if out.len() < limit {
-            let cf_v2 = self.cf(CF_ADDR_SPENDING_V2);
-            let sh_prefix = &sh[..crate::index::address::SCRIPTHASH_PREFIX_LEN];
-            for item in self.db.prefix_iterator_cf(&cf_v2, sh_prefix) {
-                if out.len() >= limit {
-                    break;
-                }
-                let (k, v) = match item {
-                    Ok(kv) => kv,
-                    Err(_) => continue,
-                };
-                if k.len() != crate::index::address::KEY_LEN_V2 || &k[..sh_prefix.len()] != sh_prefix {
-                    break;
-                }
-                let payload = match crate::index::address::decode_spending_key_v2(&k) {
-                    Some(p) => p,
-                    None => continue,
-                };
-                let prev = match crate::index::address::decode_spending_value(&v) {
-                    Some(p) => p,
-                    None => continue,
-                };
-                let key = crate::index::address::reconstruct_spending_key(sh, payload);
-                out.push((key, prev));
+        // v2: 16-byte scripthash prefix. Independently capped at
+        // `limit`.
+        let cf_v2 = self.cf(CF_ADDR_SPENDING_V2);
+        let sh_prefix = &sh[..crate::index::address::SCRIPTHASH_PREFIX_LEN];
+        let mut v2_count = 0usize;
+        for item in self.db.prefix_iterator_cf(&cf_v2, sh_prefix) {
+            if v2_count >= limit {
+                break;
             }
+            let (k, v) = match item {
+                Ok(kv) => kv,
+                Err(_) => continue,
+            };
+            if k.len() != crate::index::address::KEY_LEN_V2 || &k[..sh_prefix.len()] != sh_prefix {
+                break;
+            }
+            let payload = match crate::index::address::decode_spending_key_v2(&k) {
+                Some(p) => p,
+                None => continue,
+            };
+            let prev = match crate::index::address::decode_spending_value(&v) {
+                Some(p) => p,
+                None => continue,
+            };
+            let key = crate::index::address::reconstruct_spending_key(sh, payload);
+            out.push((key, prev));
+            v2_count += 1;
         }
         out
     }
@@ -3490,6 +3507,132 @@ mod tests {
         for (k, _) in &got {
             assert_eq!(k.scripthash, sh_alice);
         }
+    }
+
+    #[test]
+    fn dual_read_limited_does_not_starve_v2_when_v1_fills_limit() {
+        // Regression for the H1 review finding (2026-05-15): the
+        // limited dual-read used to stop after v1 reached `limit`,
+        // dropping any v2 rows that should have been included.
+        // Construct a mixed-format scripthash whose v2 rows are at
+        // EARLIER heights than the v1 rows; under the old code the
+        // caller's "first `limit` by height" answer would skip the
+        // v2 rows entirely.
+        use crate::index::address::{
+            AddrFundingRow, encode_funding_key, encode_funding_value,
+        };
+
+        let (store, _dir) = temp_store(false);
+        let sh = [0xF0; 32];
+
+        // 10 v1 rows at heights 100..110, injected directly into v1 CF.
+        let cf_v1 = store.cf(CF_ADDR_FUNDING);
+        for i in 0..10u32 {
+            let row = AddrFundingRow {
+                scripthash: sh,
+                height: 100 + i,
+                txid: make_outpoint((0xC0u8).wrapping_add(i as u8), 0).txid,
+                vout: 0,
+                amount_sat: 100 + i as u64,
+            };
+            store
+                .db
+                .put_cf(
+                    &cf_v1,
+                    encode_funding_key(&row.key()),
+                    encode_funding_value(row.amount_sat),
+                )
+                .unwrap();
+        }
+
+        // 3 v2 rows at heights 50..53 — EARLIER than the v1 rows —
+        // written through the normal post-PR-D write path.
+        let mut batch = StoreBatch::default();
+        for i in 0..3u32 {
+            batch.addr_funding_puts.push(AddrFundingRow {
+                scripthash: sh,
+                height: 50 + i,
+                txid: make_outpoint((0xB0u8).wrapping_add(i as u8), 0).txid,
+                vout: 0,
+                amount_sat: 50 + i as u64,
+            });
+        }
+        store.write_batch(batch).unwrap();
+
+        // With limit=5: v1 has 10 rows, v2 has 3. Pre-fix, the
+        // iterator returned 5 rows entirely from v1 (heights
+        // 100..105) and skipped v2 entirely. Post-fix, each CF is
+        // independently capped at `limit`, so we get up to 5 v1
+        // rows + 3 v2 rows = 8 total, all carrying the caller's
+        // scripthash.
+        let got = store.iter_addr_funding_limited(&sh, 5);
+        let heights: std::collections::HashSet<u32> = got.iter().map(|(k, _)| k.height).collect();
+        assert!(
+            heights.contains(&50) && heights.contains(&51) && heights.contains(&52),
+            "v2 rows at heights 50..53 must appear in the limited result; got heights {:?}",
+            heights
+        );
+        // Sanity: the caller (confirmed_history_limited) would sort
+        // by height and truncate to `limit`, producing the correct
+        // earliest-height set. Simulate that here.
+        let mut sorted_heights: Vec<u32> = got.iter().map(|(k, _)| k.height).collect();
+        sorted_heights.sort();
+        sorted_heights.truncate(5);
+        assert_eq!(
+            sorted_heights,
+            vec![50, 51, 52, 100, 101],
+            "post-merge truncate-to-limit must surface the earliest-height rows"
+        );
+    }
+
+    #[test]
+    fn dual_read_limited_spending_does_not_starve_v2() {
+        // Mirror of the funding test for spending CFs.
+        use crate::index::address::{
+            AddrSpendingRow, encode_spending_key, encode_spending_value,
+        };
+
+        let (store, _dir) = temp_store(false);
+        let sh = [0xF1; 32];
+
+        let cf_v1 = store.cf(CF_ADDR_SPENDING);
+        for i in 0..10u32 {
+            let row = AddrSpendingRow {
+                scripthash: sh,
+                height: 100 + i,
+                txid: make_outpoint((0xD0u8).wrapping_add(i as u8), 0).txid,
+                vin: 0,
+                prev_outpoint: make_outpoint(0xFF, i),
+            };
+            store
+                .db
+                .put_cf(
+                    &cf_v1,
+                    encode_spending_key(&row.key()),
+                    encode_spending_value(&row.prev_outpoint),
+                )
+                .unwrap();
+        }
+
+        let mut batch = StoreBatch::default();
+        for i in 0..3u32 {
+            batch.addr_spending_puts.push(AddrSpendingRow {
+                scripthash: sh,
+                height: 50 + i,
+                txid: make_outpoint((0xE0u8).wrapping_add(i as u8), 0).txid,
+                vin: 0,
+                prev_outpoint: make_outpoint(0xEE, i),
+            });
+        }
+        store.write_batch(batch).unwrap();
+
+        let got = store.iter_addr_spending_limited(&sh, 5);
+        let heights: std::collections::HashSet<u32> = got.iter().map(|(k, _)| k.height).collect();
+        assert!(
+            heights.contains(&50) && heights.contains(&51) && heights.contains(&52),
+            "v2 spending rows at heights 50..53 must appear; got heights {:?}",
+            heights,
+        );
     }
 
     #[test]
