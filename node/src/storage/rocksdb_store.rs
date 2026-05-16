@@ -2468,6 +2468,73 @@ mod tests {
         assert_eq!(store.get_tx_location(&txid).unwrap(), genesis_hash);
     }
 
+    /// Regression: `ChainState` holds a `Box<dyn Store>` that is in
+    /// fact a `CoinCache` wrapping `RocksDbStore`. The Store trait
+    /// provides empty defaults for the per-CF diagnostics, so a
+    /// missing delegation on `CoinCache` short-circuits to those
+    /// defaults and reports zero — which is what shipped in #189/#192
+    /// and showed up as `RocksDB SST size snapshot total_mb=0
+    /// per_cf=` on the live mainnet node despite ~890 GB of SSTs.
+    /// This test goes through `CoinCache` (mirroring production)
+    /// rather than calling `RocksDbStore` directly.
+    #[test]
+    fn coin_cache_delegates_per_cf_diagnostics() {
+        use crate::storage::coin_cache::CoinCache;
+        let dir = tempfile::tempdir().unwrap();
+        let inner = RocksDbStore::open(dir.path(), false, 16, false, -1).unwrap();
+        // Hold a direct handle to the RocksDB so we can flush coins
+        // explicitly after write. After moving inner into CoinCache
+        // we can no longer touch RocksDB internals; cheaper to flush
+        // first via the bare store, then wrap.
+        let mut batch = StoreBatch::default();
+        for i in 0..512u32 {
+            batch
+                .coin_puts
+                .push((make_outpoint((i & 0xff) as u8, i), make_coin(i as u64, i)));
+        }
+        inner.write_batch(batch).unwrap();
+        // Flush the coins CF so its bytes land in an SST visible to
+        // the metadata API.
+        let cf = inner.cf(CF_COINS);
+        let mut fopts = rocksdb::FlushOptions::default();
+        fopts.set_wait(true);
+        inner.db.flush_cfs_opt(&[&cf], &fopts).unwrap();
+        drop(cf);
+
+        let cache = CoinCache::new(Box::new(inner), 16);
+        let breakdown = cache.sst_bytes_by_cf();
+        assert!(
+            !breakdown.is_empty(),
+            "CoinCache must forward sst_bytes_by_cf to the inner store, \
+             not return the trait default empty vec"
+        );
+        let coins = breakdown
+            .iter()
+            .find(|(name, _)| *name == CF_COINS)
+            .map(|(_, b)| *b)
+            .expect("coins CF must appear in breakdown");
+        assert!(
+            coins > 0,
+            "coins CF SST size must be non-zero after flush; got breakdown={:?}",
+            breakdown
+        );
+
+        // pending_compaction_bytes_by_cf delegates the same way; assert
+        // it returns the same shape (one entry per registered CF). It
+        // may be all-zero on a fresh DB, hence we only check shape.
+        let pending = cache.pending_compaction_bytes_by_cf();
+        assert!(
+            !pending.is_empty(),
+            "CoinCache must forward pending_compaction_bytes_by_cf to the \
+             inner store, not return the trait default empty vec"
+        );
+        assert_eq!(
+            pending.len(),
+            breakdown.len(),
+            "the two per-CF diagnostics must enumerate the same CF set"
+        );
+    }
+
     #[test]
     fn test_clear_chainstate() {
         let (store, _dir) = temp_store(true);
