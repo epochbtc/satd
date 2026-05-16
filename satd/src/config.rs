@@ -461,6 +461,12 @@ pub struct Config {
     pub prune: u64,
     pub reindex: bool,
     pub reindex_chainstate: bool,
+    // Offline maintenance flags. Defaulted from CLI only; not read
+    // from the config file (one-shot operations belong on the
+    // invocation line, not in long-lived state).
+    pub migrate_undo: bool,
+    pub migrate_undo_dry_run: bool,
+    pub migrate_undo_keep_recent: u32,
     // P2P
     pub maxconnections: usize,
     /// Maximum simultaneous inbound peers from the same source IP
@@ -1373,6 +1379,9 @@ impl Config {
             prune,
             reindex: cli.reindex,
             reindex_chainstate: cli.reindex_chainstate,
+            migrate_undo: cli.migrate_undo,
+            migrate_undo_dry_run: cli.migrate_undo_dry_run,
+            migrate_undo_keep_recent: cli.migrate_undo_keep_recent,
             maxconnections: cli
                 .maxconnections
                 .or_else(|| file_get("maxconnections").and_then(|v| v.parse().ok()))
@@ -2188,6 +2197,31 @@ pub struct CliArgs {
         help = "Rebuild UTXO set from existing block files"
     )]
     pub reindex_chainstate: bool,
+
+    // Maintenance: offline one-shot operations. When any of these is set,
+    // satd opens the datadir read/write, performs the work, prints a
+    // result line, and exits without starting the daemon. The datadir
+    // LOCK file is honoured exactly as during a normal startup — if
+    // another satd is running, the open fails fast.
+    #[arg(
+        long = "migrate-undo",
+        help = "Offline: prune old undo entries and rewrite remaining v0 rows to v1 (~60% smaller). Exits after running."
+    )]
+    pub migrate_undo: bool,
+
+    #[arg(
+        long = "migrate-undo-dry-run",
+        help = "With --migrate-undo: scan and report without writing or deleting anything."
+    )]
+    pub migrate_undo_dry_run: bool,
+
+    #[arg(
+        long = "migrate-undo-keep-recent",
+        value_name = "N",
+        default_value_t = 2016u32,
+        help = "With --migrate-undo: keep undo data for the most-recent N blocks (default: 2016 = ~2 weeks; deeper reorgs are not protected after migration)."
+    )]
+    pub migrate_undo_keep_recent: u32,
 
     // P2P flags
     #[arg(
@@ -3014,6 +3048,9 @@ rpcport=8332
             prune: None,
             reindex: false,
             reindex_chainstate: false,
+            migrate_undo: false,
+            migrate_undo_dry_run: false,
+            migrate_undo_keep_recent: 2016,
             maxconnections: None,
             maxinboundperip: None,
             bind: None,
@@ -3158,6 +3195,9 @@ rpcport=8332
             prune: None,
             reindex: false,
             reindex_chainstate: false,
+            migrate_undo: false,
+            migrate_undo_dry_run: false,
+            migrate_undo_keep_recent: 2016,
             maxconnections: None,
             maxinboundperip: None,
             bind: None,
