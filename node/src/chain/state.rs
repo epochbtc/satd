@@ -532,6 +532,17 @@ impl ChainState {
         self.store.compact_chainstate()
     }
 
+    /// Diagnose slack in the block flat files: compare every `block_index`
+    /// reference against the on-disk `blk*.dat` sizes and report per-file
+    /// referenced vs total bytes. Read-only. Cost is one seek+read of an
+    /// 8-byte header per indexed block (~minute on the current mainnet).
+    pub fn audit_block_files(
+        &self,
+    ) -> Result<crate::storage::blockfile_audit::BlockfileAuditReport, crate::storage::blockfile_audit::AuditError>
+    {
+        crate::storage::blockfile_audit::audit_blockfiles(&*self.store, &self.blocks_dir)
+    }
+
     /// Read the lock-free connect-heartbeat counter. Bumped on every
     /// successful connector iteration; read by the stall watchdog as its
     /// progress signal. Value is monotonic but not interpretable as a

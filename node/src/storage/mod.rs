@@ -1,3 +1,4 @@
+pub mod blockfile_audit;
 pub mod blockindex;
 pub mod coin_cache;
 pub mod coinview;
@@ -264,6 +265,20 @@ pub enum WriteMode {
     BulkLoad,
 }
 
+/// Counts of corruption surfaced during a `for_each_block_index` scan.
+/// Diagnostics that consume this iterator (the blockfile audit, future
+/// `block_index` integrity checks) surface these as separate fields
+/// rather than silently treating bad rows as nonexistent — the
+/// `block_index` is consensus-critical local state, and an unexpected
+/// non-zero count here usually indicates the index itself needs repair.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BlockIndexScanStats {
+    /// Rows whose key was not a valid 32-byte block hash.
+    pub skipped_bad_key: u64,
+    /// Rows whose value failed to bincode-decode as a `BlockIndexEntry`.
+    pub skipped_bad_value: u64,
+}
+
 /// Abstract storage backend for block index, UTXO set, and metadata.
 pub trait Store: Send + Sync {
     fn get_block_index(&self, hash: &BlockHash) -> Option<BlockIndexEntry>;
@@ -358,6 +373,25 @@ pub trait Store: Send + Sync {
     /// `ldb` dump. Default: empty.
     fn sst_bytes_by_cf(&self) -> Vec<(&'static str, u64)> {
         Vec::new()
+    }
+
+    /// Iterate every `block_index` entry, invoking `visit` once per row.
+    /// Used by the blockfile slack audit (and any other diagnostic that
+    /// needs the full block_index set). Order is unspecified. Returning
+    /// is non-cancellable — visitors must accept all rows.
+    ///
+    /// Rows whose key fails to decode as a 32-byte hash or whose value
+    /// fails bincode decode are NOT passed to `visit`; their counts are
+    /// returned in [`BlockIndexScanStats`] so diagnostics can surface
+    /// (and not silently mask) `block_index` corruption.
+    ///
+    /// Default: no-op for backends that don't carry a block_index (in-
+    /// memory test store, etc.) — returns zero stats.
+    fn for_each_block_index(
+        &self,
+        _visit: &mut dyn FnMut(BlockHash, BlockIndexEntry),
+    ) -> Result<BlockIndexScanStats, StoreError> {
+        Ok(BlockIndexScanStats::default())
     }
 
     /// Force a full compaction of the chainstate (coins) column family.

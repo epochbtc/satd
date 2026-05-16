@@ -616,6 +616,17 @@ impl Store for CoinCache {
         self.inner.get_undo(hash)
     }
 
+    /// Diagnostic delegation. The trait default returns Ok with zero
+    /// rows, so without this passthrough the blockfile audit would
+    /// silently report an empty `block_index` (same shape bug as
+    /// PR #193's per-CF diagnostics).
+    fn for_each_block_index(
+        &self,
+        visit: &mut dyn FnMut(BlockHash, BlockIndexEntry),
+    ) -> Result<crate::storage::BlockIndexScanStats, StoreError> {
+        self.inner.for_each_block_index(visit)
+    }
+
     fn coin_count(&self) -> u64 {
         let base = self.inner.coin_count() as i64;
         let delta = self.count_delta.load(Ordering::Relaxed);

@@ -102,6 +102,12 @@ enum Cmd {
         #[command(subcommand)]
         sub: NodeCmd,
     },
+    /// Diagnostics for operators. Read-only; outputs are humans-first
+    /// tables, with `--output json` available for scripting.
+    Debug {
+        #[command(subcommand)]
+        sub: DebugCmd,
+    },
     /// Bitcoin-Core-compatible raw RPC passthrough. Captures unknown
     /// subcommands so `sat-cli getblockchaininfo` still works.
     #[command(external_subcommand)]
@@ -150,6 +156,15 @@ enum FeeCmd {
         #[arg(long, default_value = "6")]
         target: u32,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum DebugCmd {
+    /// Audit `blk*.dat` slack — compares every `block_index` reference
+    /// against the on-disk file sizes and reports per-file referenced vs
+    /// total bytes. Read-only; safe on a live node. Cost on mainnet is
+    /// ~one minute.
+    BlockfileAudit,
 }
 
 #[derive(Subcommand, Debug)]
@@ -237,6 +252,9 @@ fn resolve_cmd(cmd: &Cmd) -> (String, Vec<serde_json::Value>) {
             NodeCmd::Reorgs { since } => ("getreorghistory".into(), vec![json!(since)]),
             NodeCmd::Stop => ("stop".into(), vec![]),
         },
+        Cmd::Debug { sub } => match sub {
+            DebugCmd::BlockfileAudit => ("getblockfileaudit".into(), vec![]),
+        },
         Cmd::Raw(args) => {
             let mut it = args.iter();
             let method = it.next().cloned().unwrap_or_default();
@@ -282,6 +300,14 @@ fn render_to_string(cmd: &Cmd, result: &serde_json::Value, output: &OutputFormat
         && let Some(obj) = result.as_object()
     {
         return render_mempool_top(obj, *limit);
+    }
+
+    // `debug blockfile-audit` — pretty table of per-file slack.
+    if let Cmd::Debug {
+        sub: DebugCmd::BlockfileAudit,
+    } = cmd
+    {
+        return render_blockfile_audit(result);
     }
 
     // `node version` — extract just the version fields from getnetworkinfo.
@@ -339,6 +365,116 @@ fn render_mempool_top(obj: &serde_json::Map<String, serde_json::Value>, limit: u
             let fee = entry["fees"]["base"].as_f64().unwrap_or(0.0);
             out.push_str(&format!("{:<64}  {:>8}  {:>14.8}\n", txid, vsize, fee));
         }
+    }
+    out
+}
+
+/// Render the `getblockfileaudit` response as a per-file slack table.
+/// Falls through to JSON if the response shape isn't what we expect, so
+/// older daemons or unfamiliar fields still display useful output.
+fn render_blockfile_audit(result: &serde_json::Value) -> String {
+    let Some(files) = result.get("files").and_then(|v| v.as_array()) else {
+        return format!("{}\n", serde_json::to_string_pretty(result).unwrap());
+    };
+    let totals = result.get("totals").cloned().unwrap_or(serde_json::Value::Null);
+    let blocks_dir = result
+        .get("blocks_dir")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+    let duration_ms = result
+        .get("duration_ms")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let unresolved = result
+        .get("unresolved_entries")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let bad_keys = result
+        .get("block_index_skipped_bad_key")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let bad_values = result
+        .get("block_index_skipped_bad_value")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "blocks_dir: {}\nduration:   {:.2}s\nunresolved: {}\n",
+        blocks_dir,
+        duration_ms as f64 / 1000.0,
+        unresolved
+    ));
+    if bad_keys != 0 || bad_values != 0 {
+        // Loud surface — non-zero counts here mean block_index itself
+        // failed to decode for some rows, which is consensus-critical
+        // local state. Don't bury it as "info".
+        out.push_str(&format!(
+            "WARNING: block_index decode skips — bad_keys={} bad_values={}\n",
+            bad_keys, bad_values,
+        ));
+    }
+    out.push('\n');
+    out.push_str(&format!(
+        "{:>8}  {:>12}  {:>12}  {:>12}  {:>6}  {:>10}\n",
+        "file_no", "size_MB", "referenced_MB", "slack_MB", "slack%", "blocks"
+    ));
+    for f in files {
+        let file_no = f.get("file_no").and_then(|v| v.as_u64()).unwrap_or(0);
+        let size = f.get("file_size").and_then(|v| v.as_u64()).unwrap_or(0);
+        let referenced = f.get("referenced_bytes").and_then(|v| v.as_u64()).unwrap_or(0);
+        let slack = f.get("slack_bytes").and_then(|v| v.as_i64()).unwrap_or(0);
+        let blocks = f
+            .get("indexed_block_count")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let pct = if size > 0 {
+            (slack as f64 / size as f64) * 100.0
+        } else {
+            0.0
+        };
+        out.push_str(&format!(
+            "{:>8}  {:>12.1}  {:>12.1}  {:>12.1}  {:>5.1}%  {:>10}\n",
+            file_no,
+            size as f64 / 1_048_576.0,
+            referenced as f64 / 1_048_576.0,
+            slack as f64 / 1_048_576.0,
+            pct,
+            blocks
+        ));
+    }
+
+    if let Some(t) = totals.as_object() {
+        let size = t.get("file_bytes_total").and_then(|v| v.as_u64()).unwrap_or(0);
+        let referenced = t
+            .get("referenced_bytes_total")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let slack = t.get("slack_bytes_total").and_then(|v| v.as_i64()).unwrap_or(0);
+        let file_count = t.get("file_count").and_then(|v| v.as_u64()).unwrap_or(0);
+        let pct = if size > 0 {
+            (slack as f64 / size as f64) * 100.0
+        } else {
+            0.0
+        };
+        out.push_str(&format!(
+            "\nTOTAL ({} files): size={:.2} GB, referenced={:.2} GB, slack={:.2} GB ({:.1}%)\n",
+            file_count,
+            size as f64 / 1_073_741_824.0,
+            referenced as f64 / 1_073_741_824.0,
+            slack as f64 / 1_073_741_824.0,
+            pct
+        ));
+        let trailing = t
+            .get("trailing_slack_total")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let gap = t.get("gap_slack_total").and_then(|v| v.as_u64()).unwrap_or(0);
+        out.push_str(&format!(
+            "  trailing slack: {:.2} GB  |  gap slack: {:.2} GB\n",
+            trailing as f64 / 1_073_741_824.0,
+            gap as f64 / 1_073_741_824.0
+        ));
     }
     out
 }

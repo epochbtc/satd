@@ -187,6 +187,42 @@ pub struct RpcContext {
     #[cfg(feature = "block-filter-index")]
     pub filter_backfill_cmd_tx:
         Option<tokio::sync::mpsc::Sender<crate::index::filter::BackfillCommand>>,
+    /// Single-flight guard for `getblockfileaudit`. The audit performs a
+    /// full `block_index` scan plus an 8-byte seek+read per indexed
+    /// block — ~minute-scale on mainnet — so concurrent invocations
+    /// would multiply the disk pressure and tie up `spawn_blocking`
+    /// workers. Set to `true` while an audit is in flight; released by
+    /// the RAII guard `AuditInflightGuard`.
+    pub blockfile_audit_running: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// RAII guard that releases the [`RpcContext::blockfile_audit_running`]
+/// flag on drop. Acquire via
+/// [`try_acquire_blockfile_audit`]; the only correct way to release the
+/// flag is letting the guard drop, so a panic mid-audit doesn't strand
+/// the flag in `true` (which would lock out the RPC for the lifetime
+/// of the process).
+struct AuditInflightGuard {
+    flag: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for AuditInflightGuard {
+    fn drop(&mut self) {
+        self.flag.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+fn try_acquire_blockfile_audit(
+    flag: &Arc<std::sync::atomic::AtomicBool>,
+) -> Option<AuditInflightGuard> {
+    flag.compare_exchange(
+        false,
+        true,
+        std::sync::atomic::Ordering::AcqRel,
+        std::sync::atomic::Ordering::Acquire,
+    )
+    .ok()
+    .map(|_| AuditInflightGuard { flag: flag.clone() })
 }
 
 /// Which data source `estimatesmartfee` / `estimatefees` draws from.
@@ -341,6 +377,7 @@ pub async fn start(
         filter_backfill,
         #[cfg(feature = "block-filter-index")]
         filter_backfill_cmd_tx,
+        blockfile_audit_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
 
     let mut module = RpcModule::new(ctx);
@@ -1369,6 +1406,62 @@ pub async fn start(
             "warnings": warnings,
         }))
     })?;
+
+    module.register_async_method(
+        "getblockfileaudit",
+        |_params, ctx, _extensions| async move {
+            // Slack audit: compares every `block_index` reference against
+            // the actual on-disk size of `blk*.dat` files. Read-only
+            // diagnostic, safe to run on a live node, but expensive —
+            // ~minute on mainnet for the 8-byte-header reads per indexed
+            // block. Two operational hardening points relative to the
+            // initial implementation (review findings from 2026-05-15):
+            //   1. The work runs on the blocking pool via
+            //      `tokio::task::spawn_blocking` so it doesn't tie up a
+            //      Tokio worker thread that other RPCs share.
+            //   2. A single-flight `AtomicBool` guard prevents concurrent
+            //      invocations from multiplying disk pressure. A second
+            //      caller sees a deterministic BUSY error rather than
+            //      queueing behind another minute-scale scan.
+            let guard = try_acquire_blockfile_audit(&ctx.blockfile_audit_running)
+                .ok_or_else(|| {
+                    ErrorObjectOwned::owned(
+                        -32000,
+                        "blockfile audit already running",
+                        None::<()>,
+                    )
+                })?;
+            let chain_state = ctx.chain_state.clone();
+            let report = tokio::task::spawn_blocking(move || {
+                let r = chain_state.audit_block_files();
+                drop(guard); // explicit: release flag once the work returns
+                r
+            })
+            .await
+            .map_err(|e| {
+                ErrorObjectOwned::owned(
+                    -32603,
+                    format!("blockfile audit task join error: {}", e),
+                    None::<()>,
+                )
+            })?
+            .map_err(|e| {
+                ErrorObjectOwned::owned(
+                    -32000,
+                    format!("blockfile audit failed: {}", e),
+                    None::<()>,
+                )
+            })?;
+            let value = serde_json::to_value(&report).map_err(|e| {
+                ErrorObjectOwned::owned(
+                    -32603,
+                    format!("blockfile audit serialization failed: {}", e),
+                    None::<()>,
+                )
+            })?;
+            Ok::<_, ErrorObjectOwned>(value)
+        },
+    )?;
 
     module.register_method("getreorghistory", |params, ctx, _extensions| {
         // `getreorghistory [since_secs]` — default 86400 (24 h).

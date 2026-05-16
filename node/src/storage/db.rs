@@ -192,6 +192,18 @@ impl Store for InMemoryStore {
         self.undo.read().get(hash).cloned()
     }
 
+    fn for_each_block_index(
+        &self,
+        visit: &mut dyn FnMut(BlockHash, BlockIndexEntry),
+    ) -> Result<crate::storage::BlockIndexScanStats, StoreError> {
+        let bi = self.block_index.read();
+        for (hash, entry) in bi.iter() {
+            visit(*hash, entry.clone());
+        }
+        // In-memory map can't carry corrupt rows; stats are always zero.
+        Ok(crate::storage::BlockIndexScanStats::default())
+    }
+
     fn coin_count(&self) -> u64 {
         self.coins.read().len() as u64
     }
