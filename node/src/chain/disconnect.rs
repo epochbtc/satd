@@ -92,7 +92,7 @@ pub fn disconnect_block(
         }
         let txid = txids[tx_idx];
         for (vin, input) in tx.input.iter().enumerate() {
-            let (_op_ser, coin) = undo.spent_coins.get(undo_cursor).ok_or(
+            let coin = undo.spent_coins.get(undo_cursor).ok_or(
                 DisconnectError::UndoExhausted {
                     height: block_height,
                     tx_idx,
@@ -118,6 +118,13 @@ pub fn disconnect_block(
             ) {
                 batch.outpoint_spend_removes.push(op);
             }
+            // Restore the spent coin. The outpoint is the input's
+            // previous_output (the v1 undo format omits outpoints because
+            // of exactly this invariant: undo entries are in connect-
+            // order, one per non-coinbase input).
+            batch
+                .coin_puts
+                .push((input.previous_output, coin.clone()));
             undo_cursor += 1;
         }
     }
@@ -156,15 +163,10 @@ pub fn disconnect_block(
         batch.tx_index_removes.push(txid);
     }
 
-    // Restore spent coins from undo data (reverse order isn't required
-    // for correctness — coin_puts is set-valued — but matches the
-    // semantic of "undo, in reverse").
-    for (op_ser, coin) in &undo.spent_coins {
-        let outpoint = op_ser.to_outpoint();
-        batch.coin_puts.push((outpoint, coin.clone()));
-    }
-
     // Update tip to previous block and clean height index
+    // (coin restoration happens in the input-walk above — the v1 undo
+    // format relies on input order for outpoint recovery, so we restore
+    // coins in the same pass that walks the tx inputs).
     batch.tip = Some(prev_hash);
     batch.height_hash_removes.push(block_height);
 
@@ -1175,10 +1177,7 @@ mod tests {
         // Synthesize a minimal-but-correct undo for the block (one
         // spent coin per non-coinbase input).
         let undo = UndoData {
-            spent_coins: vec![(
-                crate::storage::undo::OutPointSer::from(&outpoint),
-                _coin,
-            )],
+            spent_coins: vec![_coin],
         };
         let fcfg = crate::index::filter::FilterIndexConfig {
             enabled: true,
@@ -1204,10 +1203,7 @@ mod tests {
         let (_store, outpoint, _coin) = make_test_store_with_coin(0, false);
         let block = make_block_spending(outpoint, 1, 2, 0xffff_ffff, 0);
         let undo = UndoData {
-            spent_coins: vec![(
-                crate::storage::undo::OutPointSer::from(&outpoint),
-                _coin,
-            )],
+            spent_coins: vec![_coin],
         };
         let batch = disconnect_block(
             &block,

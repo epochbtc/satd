@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use crate::storage::blockindex::{BlockIndexEntry, BlockStatus, add_u256, work_for_bits};
 use crate::storage::coinview::Coin;
 use crate::storage::flatfile::FlatFilePos;
-use crate::storage::undo::{OutPointSer, UndoData};
+use crate::storage::undo::UndoData;
 use crate::storage::{Store, StoreBatch};
 use crate::validation::script::ScriptVerifier;
 use crate::validation::tx::check_transaction;
@@ -383,8 +383,11 @@ pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError>
                     }
                 }
 
-                // Save for undo
-                undo.spent_coins.push((OutPointSer::from(&outpoint), coin.clone()));
+                // Save for undo. The outpoint is recoverable from the
+                // disconnected block's `tx.input[i].previous_output`, so
+                // we don't store it — see `UndoData` docs and the
+                // disconnect path's index-aligned recovery.
+                undo.spent_coins.push(coin.clone());
 
                 sum_inputs += coin.amount;
 

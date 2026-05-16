@@ -1074,10 +1074,11 @@ impl Store for RocksDbStore {
             wb.delete_cf(&cf_hi, height.to_le_bytes());
         }
 
-        // Undo data
+        // Undo data — always v1 (compact, no outpoints). Legacy v0
+        // bincode entries already on disk are decoded transparently by
+        // `UndoData::deserialize` until the offline migrator rewrites them.
         for (hash, undo) in &batch.undo_puts {
-            let value =
-                bincode::serialize(undo).map_err(|e| StoreError::Serialization(e.to_string()))?;
+            let value = undo.serialize_v1();
             wb.put_cf(&cf_undo, hash_bytes(hash), &value);
         }
 
@@ -1450,7 +1451,11 @@ impl Store for RocksDbStore {
     fn get_undo(&self, hash: &BlockHash) -> Option<UndoData> {
         let cf = self.cf(CF_UNDO);
         let value = self.db.get_cf(&cf, hash_bytes(hash)).ok()??;
-        bincode::deserialize(&value).ok()
+        // `UndoData::deserialize` auto-detects v1 vs legacy v0 bincode
+        // by peeking the 8-byte v1 magic. A 2-byte magic was rejected
+        // in review because it collides with a legacy bincode `Vec`
+        // length prefix of exactly 510.
+        UndoData::deserialize(&value).ok()
     }
 
     fn for_each_block_index(
@@ -2384,10 +2389,9 @@ mod tests {
     fn test_undo_roundtrip() {
         let (store, _dir) = temp_store(false);
         let block_hash = make_block_hash(0x22);
-        let op = make_outpoint(0x01, 0);
         let coin = make_coin(1_000_000, 50);
         let undo = UndoData {
-            spent_coins: vec![(OutPointSer::from(&op), coin)],
+            spent_coins: vec![coin],
         };
 
         let mut batch = StoreBatch::default();
@@ -2396,7 +2400,43 @@ mod tests {
 
         let recovered = store.get_undo(&block_hash).unwrap();
         assert_eq!(recovered.spent_coins.len(), 1);
-        assert_eq!(recovered.spent_coins[0].1.amount, 1_000_000);
+        assert_eq!(recovered.spent_coins[0].amount, 1_000_000);
+    }
+
+    #[test]
+    fn test_undo_legacy_bincode_read_compat() {
+        // A row written in the v0 bincode format (the on-disk shape
+        // before this PR) must still decode after the schema change.
+        // We bypass the store's `write_batch` (which always emits v1)
+        // and put the raw bincode bytes directly into the undo CF,
+        // then verify `get_undo` recovers the spent coin.
+        let (store, _dir) = temp_store(false);
+        let block_hash = make_block_hash(0x77);
+        let op = make_outpoint(0xCC, 3);
+        let coin = make_coin(42_000_000, 999);
+
+        #[derive(serde::Serialize)]
+        struct V0Undo {
+            spent_coins: Vec<(OutPointSer, Coin)>,
+        }
+        let v0 = V0Undo {
+            spent_coins: vec![(OutPointSer::from(&op), coin.clone())],
+        };
+        let bytes = bincode::serialize(&v0).unwrap();
+        // The 8-byte v1 magic (`C0DECAFE_C0DECAFE` LE) is impossibly
+        // large as a `Vec` length prefix, so no realistic legacy row
+        // can collide. Single-entry rows in particular have length
+        // prefix `01 00 00 00 00 00 00 00`, nowhere near the magic.
+        let cf = store.cf(super::CF_UNDO);
+        store
+            .db
+            .put_cf(&cf, hash_bytes(&block_hash), &bytes)
+            .unwrap();
+
+        let recovered = store.get_undo(&block_hash).unwrap();
+        assert_eq!(recovered.spent_coins.len(), 1);
+        assert_eq!(recovered.spent_coins[0].amount, 42_000_000);
+        assert_eq!(recovered.spent_coins[0].height, 999);
     }
 
     #[test]
