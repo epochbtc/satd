@@ -413,13 +413,27 @@ pub trait Store: Send + Sync {
         Vec::new()
     }
 
-    /// Like [`iter_addr_funding`](Self::iter_addr_funding), but stops
-    /// after collecting `limit` rows. Used by streaming-cap callers
-    /// (Electrum / Esplora `get_history`, `listunspent`) so a
+    /// Like [`iter_addr_funding`](Self::iter_addr_funding), but bounds
+    /// the work per **source-format CF**. Used by streaming-cap
+    /// callers (Electrum / Esplora `get_history`, `listunspent`) so a
     /// pathologically large scripthash can't force a full RocksDB
     /// scan + Vec allocation just to fail the per-request cap check.
-    /// Round-1 review M4. Default: forwards to the unlimited
-    /// variant + truncates (correct but unoptimized).
+    ///
+    /// **Cap contract.** Returns at most `limit` rows per
+    /// source-format CF. Implementations that maintain a single
+    /// physical CF (the default; in-memory test backends) return at
+    /// most `limit` rows total. The RocksDB backend during the v1/v2
+    /// migration window walks both CFs and may therefore return up to
+    /// `2 * limit` rows — independent caps avoid v2-starvation when
+    /// v1 already filled `limit` (review H1, 2026-05-15). Callers
+    /// that need a hard `limit` (Electrum/Esplora) must truncate
+    /// after the merge above this layer; the existing
+    /// `confirmed_history_limited` already does this for funding +
+    /// spending, so its `2 * limit` budget naturally absorbs the
+    /// per-CF cap.
+    ///
+    /// Default: forwards to the unlimited variant + truncates
+    /// (correct but unoptimized). Round-1 review M4.
     fn iter_addr_funding_limited(
         &self,
         sh: &Scripthash,
@@ -437,7 +451,9 @@ pub trait Store: Send + Sync {
     }
 
     /// Like [`iter_addr_spending`](Self::iter_addr_spending), but
-    /// stops after collecting `limit` rows. Round-1 review M4.
+    /// bounds the work per source-format CF. See
+    /// [`iter_addr_funding_limited`](Self::iter_addr_funding_limited)
+    /// for the per-CF vs total cap contract. Round-1 review M4.
     fn iter_addr_spending_limited(
         &self,
         sh: &Scripthash,
