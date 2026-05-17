@@ -99,7 +99,17 @@ const BLOCK_FILTER_INDEX_COMPLETE_KEY: &[u8] = b"block_filter_index.complete";
 /// persisted value is just an upper bound).
 #[cfg(feature = "block-filter-index")]
 const BLOCK_FILTER_INDEX_TIP_HEIGHT_KEY: &[u8] = b"block_filter_index.tip_height";
-const CURRENT_SCHEMA_VERSION: u32 = 2; // v2 = compact varint coins
+// v2: compact varint coins. v3: storage-format cleanup — v1 undo
+// dual-read and v1 address-history CFs were dropped, so chainstates
+// stamped at v2 must be rebuilt with --reindex-chainstate before the
+// new binary can serve them.
+const CURRENT_SCHEMA_VERSION: u32 = 3;
+
+/// Address-history CFs from the pre-cleanup era. Discovered on open and
+/// dropped post-schema-check (or by the reindex path) so chainstates
+/// migrated under the prior optimization stack can mount cleanly. New
+/// installs never create these.
+const LEGACY_ADDR_CF_NAMES: &[&str] = &["addr_funding", "addr_spending"];
 
 pub(crate) fn hash_bytes(hash: &BlockHash) -> &[u8] {
     hash.as_ref()
@@ -355,20 +365,30 @@ impl RocksDbStore {
             ));
         }
 
-        // The deferred-backfill temp CF is created lazily when an
-        // operator triggers `backfillindex address`. RocksDB demands
-        // every existing CF be declared at open time, so probe the DB
-        // dir once and include the temp CF descriptor if it's present.
+        // Some CFs are created lazily or are leftovers from the
+        // pre-storage-cleanup era. RocksDB demands every existing CF
+        // be declared at open time, so probe the DB dir once and
+        // include any such descriptors that match what's on disk.
         // Skipped on first-open (path doesn't exist yet) — list_cf
         // requires the DB directory to exist.
-        if db_path.exists()
-            && let Ok(existing_cfs) = DB::list_cf(&Options::default(), &db_path)
-            && existing_cfs.iter().any(|n| n == CF_ADDR_BACKFILL_TEMP)
-        {
+        let existing_cfs: Vec<String> = if db_path.exists() {
+            DB::list_cf(&Options::default(), &db_path).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        if existing_cfs.iter().any(|n| n == CF_ADDR_BACKFILL_TEMP) {
             cf_descriptors.push(ColumnFamilyDescriptor::new(
                 CF_ADDR_BACKFILL_TEMP,
                 make_cf_opts(true, 32, None, false),
             ));
+        }
+        // Pre-cleanup `addr_funding` / `addr_spending`. Register with
+        // bare opts so RocksDB opens; we drop them after the schema
+        // check confirms it's safe to discard.
+        for legacy in LEGACY_ADDR_CF_NAMES {
+            if existing_cfs.iter().any(|n| n == legacy) {
+                cf_descriptors.push(ColumnFamilyDescriptor::new(*legacy, Options::default()));
+            }
         }
 
         let db = DB::open_cf_descriptors(&db_opts, &db_path, cf_descriptors).map_err(|e| {
@@ -379,8 +399,8 @@ impl RocksDbStore {
             ))
         })?;
 
-        // Schema version check: ensure coin format matches this binary.
-        // Skip when reindexing — the DB is about to be cleared.
+        // Schema version check: ensure on-disk format matches this
+        // binary. Skip when reindexing — the DB is about to be cleared.
         if !reindex {
             let cf_meta = db.cf_handle(CF_METADATA).expect("metadata CF missing");
             match db.get_cf(&cf_meta, SCHEMA_KEY) {
@@ -389,7 +409,7 @@ impl RocksDbStore {
                     if stored != CURRENT_SCHEMA_VERSION {
                         return Err(StoreError::Database(format!(
                             "Chainstate schema version mismatch: DB has v{}, binary expects v{}. \
-                             Run with --reindex to rebuild.",
+                             Run with --reindex-chainstate to rebuild from existing block files.",
                             stored, CURRENT_SCHEMA_VERSION
                         )));
                     }
@@ -403,7 +423,7 @@ impl RocksDbStore {
                     if has_coins {
                         return Err(StoreError::Database(
                             "Existing chainstate has no schema version (pre-compact format). \
-                             Run with --reindex to rebuild."
+                             Run with --reindex-chainstate to rebuild from existing block files."
                                 .to_string(),
                         ));
                     }
@@ -419,6 +439,22 @@ impl RocksDbStore {
         } else {
             // Reindexing — stamp version (clear_all will erase it, but
             // write_schema_version below handles the re-stamp after clear).
+        }
+
+        // Drop the legacy address-history CFs now that the schema
+        // check has either confirmed the chainstate is at the current
+        // version (so any leftover legacy CFs are empty residue from a
+        // prior optimization-stack migration) or `--reindex` was
+        // requested (chainstate is about to be wiped anyway). Doing
+        // this AFTER the schema check ensures a v2 chainstate with
+        // populated legacy CFs is rejected before we can discard the
+        // rows it still depends on.
+        for legacy in LEGACY_ADDR_CF_NAMES {
+            if db.cf_handle(legacy).is_some() {
+                db.drop_cf(legacy).map_err(|e| {
+                    StoreError::Database(format!("Failed to drop legacy CF '{}': {}", legacy, e))
+                })?;
+            }
         }
 
         let store = Self {
@@ -1092,9 +1128,7 @@ impl Store for RocksDbStore {
             wb.delete_cf(&cf_hi, height.to_le_bytes());
         }
 
-        // Undo data — always v1 (compact, no outpoints). Legacy v0
-        // bincode entries already on disk are decoded transparently by
-        // `UndoData::deserialize` until the offline migrator rewrites them.
+        // Undo data — v1-only on disk (compact, no outpoints).
         for (hash, undo) in &batch.undo_puts {
             let value = undo.serialize_v1();
             wb.put_cf(&cf_undo, hash_bytes(hash), &value);
@@ -1469,11 +1503,23 @@ impl Store for RocksDbStore {
     fn get_undo(&self, hash: &BlockHash) -> Option<UndoData> {
         let cf = self.cf(CF_UNDO);
         let value = self.db.get_cf(&cf, hash_bytes(hash)).ok()??;
-        // `UndoData::deserialize` auto-detects v1 vs legacy v0 bincode
-        // by peeking the 8-byte v1 magic. A 2-byte magic was rejected
-        // in review because it collides with a legacy bincode `Vec`
-        // length prefix of exactly 510.
-        UndoData::deserialize(&value).ok()
+        match UndoData::deserialize(&value) {
+            Ok(u) => Some(u),
+            Err(e) => {
+                // Log so an operator chasing "undo data missing" can
+                // distinguish genuine absence from a decode failure.
+                // The schema-version check at open should make this
+                // unreachable for legacy formats, but a corrupt row
+                // would otherwise look identical to a missing row.
+                tracing::error!(
+                    target: "storage",
+                    block_hash = %hash,
+                    error = %e,
+                    "undo row failed to decode; treating as missing"
+                );
+                None
+            }
+        }
     }
 
     fn for_each_block_index(
@@ -3237,5 +3283,102 @@ mod tests {
             before.spending_rows,
             after.spending_rows
         );
+    }
+
+    /// Create a datadir that *looks* like one written by a previous
+    /// satd build (schema-version stamped, legacy CFs registered in
+    /// the manifest). The optional `legacy_rows` populates the legacy
+    /// CFs with a single junk row so we can exercise the "non-empty"
+    /// branch. Returns the datadir path (the parent of the RocksDB
+    /// `chainstate/` directory; matches what `RocksDbStore::open`
+    /// expects as its `path` argument) plus the temp dir guard.
+    fn synth_prior_datadir(
+        schema_version: u32,
+        legacy_rows: bool,
+    ) -> (std::path::PathBuf, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let datadir = dir.path().to_path_buf();
+        let path = datadir.join("chainstate");
+        std::fs::create_dir_all(&path).unwrap();
+
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        opts.create_missing_column_families(true);
+        let cfs = vec![
+            ColumnFamilyDescriptor::new(CF_METADATA, Options::default()),
+            ColumnFamilyDescriptor::new(CF_COINS, Options::default()),
+            ColumnFamilyDescriptor::new("addr_funding", Options::default()),
+            ColumnFamilyDescriptor::new("addr_spending", Options::default()),
+        ];
+        let db = DB::open_cf_descriptors(&opts, &path, cfs).unwrap();
+        RocksDbStore::stamp_schema(&db, schema_version).unwrap();
+        if legacy_rows {
+            let af = db.cf_handle("addr_funding").unwrap();
+            let as_ = db.cf_handle("addr_spending").unwrap();
+            db.put_cf(&af, b"row", b"junk").unwrap();
+            db.put_cf(&as_, b"row", b"junk").unwrap();
+        }
+        drop(db);
+        (datadir, dir)
+    }
+
+    #[test]
+    fn open_with_legacy_addr_cfs_at_current_schema_drops_them() {
+        // Migration-tooling residue: legacy `addr_funding` /
+        // `addr_spending` CFs registered in the manifest but empty,
+        // chainstate stamped at the current schema version. Open must
+        // succeed and drop the legacy CFs.
+        let (path, _dir) = synth_prior_datadir(CURRENT_SCHEMA_VERSION, false);
+        let store = RocksDbStore::open(&path, false, 16, false, -1)
+            .expect("open should succeed: legacy CFs are empty and schema is current");
+        assert!(
+            store.db.cf_handle("addr_funding").is_none(),
+            "legacy addr_funding CF must be dropped",
+        );
+        assert!(
+            store.db.cf_handle("addr_spending").is_none(),
+            "legacy addr_spending CF must be dropped",
+        );
+        // Re-opening must still succeed (the drop is persisted in the manifest).
+        drop(store);
+        let _ = RocksDbStore::open(&path, false, 16, false, -1).expect("reopen ok");
+    }
+
+    #[test]
+    fn open_with_stale_schema_refuses_with_reindex_hint() {
+        // Chainstate stamped at the previous schema (v2). Open without
+        // reindex must refuse with a message pointing to
+        // --reindex-chainstate — recovery must be reachable, not
+        // require manual filesystem surgery.
+        let (path, _dir) = synth_prior_datadir(CURRENT_SCHEMA_VERSION - 1, true);
+        let err = RocksDbStore::open(&path, false, 16, false, -1)
+            .err()
+            .expect("open should refuse a stale-schema chainstate");
+        let msg = match err {
+            StoreError::Database(s) => s,
+            other => panic!("expected Database error, got {:?}", other),
+        };
+        assert!(
+            msg.contains("schema version mismatch"),
+            "error should mention schema mismatch: {}",
+            msg
+        );
+        assert!(
+            msg.contains("--reindex-chainstate"),
+            "error should mention the recovery flag: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn reindex_open_drops_legacy_cfs_even_with_rows() {
+        // Reindex flow: chainstate is about to be wiped anyway, so
+        // non-empty legacy CFs are not a refusal — they get dropped
+        // as part of opening for the reindex.
+        let (path, _dir) = synth_prior_datadir(CURRENT_SCHEMA_VERSION - 1, true);
+        let store = RocksDbStore::open(&path, false, 16, true, -1)
+            .expect("reindex open should succeed regardless of schema or legacy CFs");
+        assert!(store.db.cf_handle("addr_funding").is_none());
+        assert!(store.db.cf_handle("addr_spending").is_none());
     }
 }
