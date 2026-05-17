@@ -12,6 +12,19 @@ layout) per `STABILITY_POLICY.md`.
 
 - **Native TLS Support:** Direct TLS termination for JSON-RPC, Electrum, and Esplora servers via `--rpctlsbind`, `--electrumtlsbind`, and `--esploratlsbind`. Eliminates the need for a TLS-terminating sidecar.
 
+### Storage
+
+- **Breaking — storage format cleanup.** Undo entries are now v1-only
+  on disk (8-byte magic + 1-byte version + compact-coin stream);
+  address-history rows live exclusively in the `addr_funding_v2` /
+  `addr_spending_v2` column families (16-byte scripthash-prefix keys).
+  The dual-read fallbacks, the legacy v1 address CFs, and the offline
+  migrators (`--migrate-undo`, `--migrate-addr-index`) introduced
+  post-0.1.0 are all removed. Any chainstate written by an earlier
+  post-0.1.0 build that did not run both migrators must be rebuilt
+  with `--reindex-chainstate`. The `_v2` naming is preserved as a
+  fossilized marker — these are now the only address-history CFs.
+
 ## [0.1.0] — 2026-05-08
 
 First public release. Pre-1.0 in semver terms; the Tier 1 surfaces listed
