@@ -836,8 +836,8 @@ impl Store for CoinCache {
             .chain(pending_puts)
             .collect();
         all.sort_by(|(a, _), (b, _)| {
-            crate::index::address::encode_funding_key(a)
-                .cmp(&crate::index::address::encode_funding_key(b))
+            crate::index::address::encode_funding_key_v2(a)
+                .cmp(&crate::index::address::encode_funding_key_v2(b))
         });
         // Round-2 review M3: honor the trait contract — return at
         // most `limit` rows. Without this truncate a large in-flight
@@ -898,8 +898,8 @@ impl Store for CoinCache {
             .chain(pending_puts)
             .collect();
         all.sort_by(|(a, _), (b, _)| {
-            crate::index::address::encode_spending_key(a)
-                .cmp(&crate::index::address::encode_spending_key(b))
+            crate::index::address::encode_spending_key_v2(a)
+                .cmp(&crate::index::address::encode_spending_key_v2(b))
         });
         // Round-2 review M3: honor the trait contract — see
         // iter_addr_funding_limited for the rationale.

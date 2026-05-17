@@ -223,7 +223,7 @@ Rough dependency order. Items 2-4 and 6 have shipped; 1 and 5 are partial; 7-8 r
 
 Resolved (kept here for traceability; the resolution lives in code and `CORE_DIFFERENCES.md`):
 
-- ~~Address-history index column-family layout.~~ **Resolved**: two CFs (`addr_funding`, `addr_spending`) keyed by `(scripthash[32], height_be[4], txid[32], vout/vin_be[4])`. See `node-index/src/keys.rs`.
+- ~~Address-history index column-family layout.~~ **Resolved**: two CFs (`addr_funding_v2`, `addr_spending_v2`) keyed by `(scripthash_prefix[16], height_be[4], txid[32], vout/vin_be[4])`. See `node-index/src/keys.rs`.
 - ~~Address index opt-in vs. on-by-default.~~ **Resolved**: on by default (`--addressindex=1`); opt out with `--addressindex=0`. Esplora and Electrum auto-require it.
 - ~~AssumeUTXO interaction with the address-history index.~~ **Resolved**: deferred opt-in backfill via `backfillindex address` (and `backfillindex blockfilter` for the BIP 158 index). Operator triggers when convenient; node remains usable with partial history.
 

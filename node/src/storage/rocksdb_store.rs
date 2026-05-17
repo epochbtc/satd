@@ -20,14 +20,10 @@ const CF_HEIGHT_INDEX: &str = "height_index";
 pub(crate) const CF_UNDO: &str = "undo";
 const CF_TX_INDEX: &str = "tx_index";
 const CF_METADATA: &str = "metadata";
-pub(crate) const CF_ADDR_FUNDING: &str = "addr_funding";
-pub(crate) const CF_ADDR_SPENDING: &str = "addr_spending";
-/// v2 address-history CFs: same row shape, but the key carries only
-/// a 16-byte scripthash prefix (vs 32 bytes for v1). All writes after
-/// PR D land here; reads consult both v1 and v2 and concatenate (the
-/// lookup layer already sorts post-fetch). The offline addr-index
-/// migrator (`storage::addr_index_migrate`) rewrites v1 rows into
-/// these CFs.
+/// Address-history CFs. The `_v2` suffix is fossilized in the on-disk
+/// schema (legacy `addr_funding` / `addr_spending` were dropped in the
+/// storage-format-cleanup PR); keys carry a 16-byte scripthash prefix
+/// rather than a full 32-byte scripthash.
 pub(crate) const CF_ADDR_FUNDING_V2: &str = "addr_funding_v2";
 pub(crate) const CF_ADDR_SPENDING_V2: &str = "addr_spending_v2";
 /// Confirmed-side spend index: `prev_outpoint -> SpendingRef`. Written
@@ -103,7 +99,17 @@ const BLOCK_FILTER_INDEX_COMPLETE_KEY: &[u8] = b"block_filter_index.complete";
 /// persisted value is just an upper bound).
 #[cfg(feature = "block-filter-index")]
 const BLOCK_FILTER_INDEX_TIP_HEIGHT_KEY: &[u8] = b"block_filter_index.tip_height";
-const CURRENT_SCHEMA_VERSION: u32 = 2; // v2 = compact varint coins
+// v2: compact varint coins. v3: storage-format cleanup — v1 undo
+// dual-read and v1 address-history CFs were dropped, so chainstates
+// stamped at v2 must be rebuilt with --reindex-chainstate before the
+// new binary can serve them.
+const CURRENT_SCHEMA_VERSION: u32 = 3;
+
+/// Address-history CFs from the pre-cleanup era. Discovered on open and
+/// dropped post-schema-check (or by the reindex path) so chainstates
+/// migrated under the prior optimization stack can mount cleanly. New
+/// installs never create these.
+const LEGACY_ADDR_CF_NAMES: &[&str] = &["addr_funding", "addr_spending"];
 
 pub(crate) fn hash_bytes(hash: &BlockHash) -> &[u8] {
     hash.as_ref()
@@ -319,18 +325,10 @@ impl RocksDbStore {
             ColumnFamilyDescriptor::new(CF_METADATA, make_cf_opts(false, 2, None, false)),
             // Address-history index. Bloom on for fast point lookups,
             // 32 MB write-buffer because per-block emission is write-
-            // heavy during IBD, and a fixed 32-byte prefix-extractor so
+            // heavy during IBD, and a fixed 16-byte prefix-extractor so
             // `prefix_iterator_cf` over a single scripthash short-
             // circuits to the matching SST blocks instead of scanning.
-            // Marked hot — these two CFs accumulated 3,900 + 2,900 SSTs
-            // during the disk-full incident.
-            ColumnFamilyDescriptor::new(CF_ADDR_FUNDING, make_cf_opts(true, 32, Some(32), true)),
-            ColumnFamilyDescriptor::new(CF_ADDR_SPENDING, make_cf_opts(true, 32, Some(32), true)),
-            // v2 address-history CFs with a 16-byte fixed prefix
-            // extractor so prefix bloom + index work at the shorter
-            // key shape. Write-buf intentionally matches v1 because
-            // emission rate is identical — every block that writes v1
-            // rows now writes v2 rows.
+            // Marked hot.
             ColumnFamilyDescriptor::new(
                 CF_ADDR_FUNDING_V2,
                 make_cf_opts(true, 32, Some(16), true),
@@ -367,20 +365,30 @@ impl RocksDbStore {
             ));
         }
 
-        // The deferred-backfill temp CF is created lazily when an
-        // operator triggers `backfillindex address`. RocksDB demands
-        // every existing CF be declared at open time, so probe the DB
-        // dir once and include the temp CF descriptor if it's present.
+        // Some CFs are created lazily or are leftovers from the
+        // pre-storage-cleanup era. RocksDB demands every existing CF
+        // be declared at open time, so probe the DB dir once and
+        // include any such descriptors that match what's on disk.
         // Skipped on first-open (path doesn't exist yet) — list_cf
         // requires the DB directory to exist.
-        if db_path.exists()
-            && let Ok(existing_cfs) = DB::list_cf(&Options::default(), &db_path)
-            && existing_cfs.iter().any(|n| n == CF_ADDR_BACKFILL_TEMP)
-        {
+        let existing_cfs: Vec<String> = if db_path.exists() {
+            DB::list_cf(&Options::default(), &db_path).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        if existing_cfs.iter().any(|n| n == CF_ADDR_BACKFILL_TEMP) {
             cf_descriptors.push(ColumnFamilyDescriptor::new(
                 CF_ADDR_BACKFILL_TEMP,
                 make_cf_opts(true, 32, None, false),
             ));
+        }
+        // Pre-cleanup `addr_funding` / `addr_spending`. Register with
+        // bare opts so RocksDB opens; we drop them after the schema
+        // check confirms it's safe to discard.
+        for legacy in LEGACY_ADDR_CF_NAMES {
+            if existing_cfs.iter().any(|n| n == legacy) {
+                cf_descriptors.push(ColumnFamilyDescriptor::new(*legacy, Options::default()));
+            }
         }
 
         let db = DB::open_cf_descriptors(&db_opts, &db_path, cf_descriptors).map_err(|e| {
@@ -391,8 +399,8 @@ impl RocksDbStore {
             ))
         })?;
 
-        // Schema version check: ensure coin format matches this binary.
-        // Skip when reindexing — the DB is about to be cleared.
+        // Schema version check: ensure on-disk format matches this
+        // binary. Skip when reindexing — the DB is about to be cleared.
         if !reindex {
             let cf_meta = db.cf_handle(CF_METADATA).expect("metadata CF missing");
             match db.get_cf(&cf_meta, SCHEMA_KEY) {
@@ -401,7 +409,7 @@ impl RocksDbStore {
                     if stored != CURRENT_SCHEMA_VERSION {
                         return Err(StoreError::Database(format!(
                             "Chainstate schema version mismatch: DB has v{}, binary expects v{}. \
-                             Run with --reindex to rebuild.",
+                             Run with --reindex-chainstate to rebuild from existing block files.",
                             stored, CURRENT_SCHEMA_VERSION
                         )));
                     }
@@ -415,7 +423,7 @@ impl RocksDbStore {
                     if has_coins {
                         return Err(StoreError::Database(
                             "Existing chainstate has no schema version (pre-compact format). \
-                             Run with --reindex to rebuild."
+                             Run with --reindex-chainstate to rebuild from existing block files."
                                 .to_string(),
                         ));
                     }
@@ -431,6 +439,22 @@ impl RocksDbStore {
         } else {
             // Reindexing — stamp version (clear_all will erase it, but
             // write_schema_version below handles the re-stamp after clear).
+        }
+
+        // Drop the legacy address-history CFs now that the schema
+        // check has either confirmed the chainstate is at the current
+        // version (so any leftover legacy CFs are empty residue from a
+        // prior optimization-stack migration) or `--reindex` was
+        // requested (chainstate is about to be wiped anyway). Doing
+        // this AFTER the schema check ensures a v2 chainstate with
+        // populated legacy CFs is rejected before we can discard the
+        // rows it still depends on.
+        for legacy in LEGACY_ADDR_CF_NAMES {
+            if db.cf_handle(legacy).is_some() {
+                db.drop_cf(legacy).map_err(|e| {
+                    StoreError::Database(format!("Failed to drop legacy CF '{}': {}", legacy, e))
+                })?;
+            }
         }
 
         let store = Self {
@@ -486,8 +510,7 @@ impl RocksDbStore {
                     })
                     .unwrap_or(false)
             };
-            let addr_has_rows =
-                cf_has_rows(CF_ADDR_SPENDING) || cf_has_rows(CF_ADDR_SPENDING_V2);
+            let addr_has_rows = cf_has_rows(CF_ADDR_SPENDING_V2);
             store.write_outpoint_spend_complete(!addr_has_rows)?;
         }
         if !store.outpoint_spend_complete() {
@@ -727,14 +750,6 @@ impl RocksDbStore {
             .unwrap_or_else(|| panic!("column family '{}' not found", name))
     }
 
-    /// Shared accessor used by offline maintenance code (the undo
-    /// migrator and the addr-index migrator) that needs the raw
-    /// RocksDB handle. Keeps `self.db` itself private so migrators
-    /// can't accidentally bypass open-mode guards or schema gating.
-    pub(crate) fn raw_db(&self) -> &rocksdb::DBWithThreadMode<rocksdb::MultiThreaded> {
-        &self.db
-    }
-
     /// Build column family options for (re)creation.
     fn cf_options(&self, name: &str) -> Options {
         // Bloom-filtered CFs are those that see point-lookups in
@@ -743,8 +758,6 @@ impl RocksDbStore {
         let bloom = matches!(
             name,
             CF_COINS
-                | CF_ADDR_FUNDING
-                | CF_ADDR_SPENDING
                 | CF_ADDR_FUNDING_V2
                 | CF_ADDR_SPENDING_V2
                 | CF_OUTPOINT_SPEND
@@ -754,16 +767,11 @@ impl RocksDbStore {
         #[cfg(not(feature = "block-filter-index"))]
         let bloom = matches!(
             name,
-            CF_COINS
-                | CF_ADDR_FUNDING
-                | CF_ADDR_SPENDING
-                | CF_ADDR_FUNDING_V2
-                | CF_ADDR_SPENDING_V2
-                | CF_OUTPOINT_SPEND
+            CF_COINS | CF_ADDR_FUNDING_V2 | CF_ADDR_SPENDING_V2 | CF_OUTPOINT_SPEND
         );
         let write_buf_mb = match name {
             CF_COINS => 64,
-            CF_ADDR_FUNDING | CF_ADDR_SPENDING | CF_ADDR_FUNDING_V2 | CF_ADDR_SPENDING_V2 => 32,
+            CF_ADDR_FUNDING_V2 | CF_ADDR_SPENDING_V2 => 32,
             CF_OUTPOINT_SPEND => 16,
             CF_UNDO | CF_TX_INDEX => 16,
             CF_BLOCK_INDEX | CF_HEIGHT_INDEX => 8,
@@ -806,12 +814,7 @@ impl RocksDbStore {
         // initial open.
         let hot = matches!(
             name,
-            CF_ADDR_FUNDING
-                | CF_ADDR_SPENDING
-                | CF_ADDR_FUNDING_V2
-                | CF_ADDR_SPENDING_V2
-                | CF_OUTPOINT_SPEND
-                | CF_UNDO
+            CF_ADDR_FUNDING_V2 | CF_ADDR_SPENDING_V2 | CF_OUTPOINT_SPEND | CF_UNDO
         );
         let target_file_size = if hot {
             self.tuning.hot_cf_target_file_size_base
@@ -821,14 +824,14 @@ impl RocksDbStore {
         cf_opts.set_target_file_size_base(target_file_size);
         cf_opts.set_compression_per_level(&compression_per_level);
         cf_opts.set_bottommost_compression_type(DBCompressionType::Zstd);
-        // Address-index + outpoint-spend CFs share a 32-byte fixed
-        // prefix. Mirror the prefix-extractor we set on initial CF
-        // creation so `drop_and_recreate_cf` (used by `clear_*` paths)
-        // preserves it.
-        if matches!(name, CF_ADDR_FUNDING | CF_ADDR_SPENDING | CF_OUTPOINT_SPEND) {
-            cf_opts.set_prefix_extractor(SliceTransform::create_fixed_prefix(32));
-        } else if matches!(name, CF_ADDR_FUNDING_V2 | CF_ADDR_SPENDING_V2) {
+        // Address-index CFs share a 16-byte fixed prefix; outpoint-
+        // spend uses a 32-byte (txid) prefix. Mirror the
+        // prefix-extractor we set on initial CF creation so
+        // `drop_and_recreate_cf` (used by `clear_*` paths) preserves it.
+        if matches!(name, CF_ADDR_FUNDING_V2 | CF_ADDR_SPENDING_V2) {
             cf_opts.set_prefix_extractor(SliceTransform::create_fixed_prefix(16));
+        } else if matches!(name, CF_OUTPOINT_SPEND) {
+            cf_opts.set_prefix_extractor(SliceTransform::create_fixed_prefix(32));
         }
         cf_opts
     }
@@ -860,8 +863,6 @@ impl RocksDbStore {
     /// downstream tooling.
     fn query_cf_property(&self, property: &str) -> Vec<(&'static str, u64)> {
         let names: &[&'static str] = &[
-            CF_ADDR_SPENDING,
-            CF_ADDR_FUNDING,
             CF_ADDR_SPENDING_V2,
             CF_ADDR_FUNDING_V2,
             CF_OUTPOINT_SPEND,
@@ -1127,9 +1128,7 @@ impl Store for RocksDbStore {
             wb.delete_cf(&cf_hi, height.to_le_bytes());
         }
 
-        // Undo data — always v1 (compact, no outpoints). Legacy v0
-        // bincode entries already on disk are decoded transparently by
-        // `UndoData::deserialize` until the offline migrator rewrites them.
+        // Undo data — v1-only on disk (compact, no outpoints).
         for (hash, undo) in &batch.undo_puts {
             let value = undo.serialize_v1();
             wb.put_cf(&cf_undo, hash_bytes(hash), &value);
@@ -1152,40 +1151,28 @@ impl Store for RocksDbStore {
         // gating on emit-side (M2) keeps the write_batch path simple.
         // Empty-batch fast-path avoids touching the CF handles when
         // the index is disabled or the block had no relevant rows.
-        //
-        // All new writes target the v2 CFs (16-byte scripthash prefix
-        // keys). v1 puts are never emitted. Deletes target BOTH v1
-        // and v2 because a remove could refer to a pre-PR-D row that
-        // still lives in v1 — a v1-only or v2-only delete would miss
-        // half the time during the transition.
         if !batch.addr_funding_puts.is_empty() || !batch.addr_funding_removes.is_empty() {
-            let cf_af_v1 = self.cf(CF_ADDR_FUNDING);
-            let cf_af_v2 = self.cf(CF_ADDR_FUNDING_V2);
+            let cf_af = self.cf(CF_ADDR_FUNDING_V2);
             for row in &batch.addr_funding_puts {
                 let key = crate::index::address::encode_funding_key_v2(&row.key());
                 let value = crate::index::address::encode_funding_value(row.amount_sat);
-                wb.put_cf(&cf_af_v2, key, value);
+                wb.put_cf(&cf_af, key, value);
             }
             for key in &batch.addr_funding_removes {
-                let v1_encoded = crate::index::address::encode_funding_key(key);
-                let v2_encoded = crate::index::address::encode_funding_key_v2(key);
-                wb.delete_cf(&cf_af_v1, v1_encoded);
-                wb.delete_cf(&cf_af_v2, v2_encoded);
+                let encoded = crate::index::address::encode_funding_key_v2(key);
+                wb.delete_cf(&cf_af, encoded);
             }
         }
         if !batch.addr_spending_puts.is_empty() || !batch.addr_spending_removes.is_empty() {
-            let cf_as_v1 = self.cf(CF_ADDR_SPENDING);
-            let cf_as_v2 = self.cf(CF_ADDR_SPENDING_V2);
+            let cf_as = self.cf(CF_ADDR_SPENDING_V2);
             for row in &batch.addr_spending_puts {
                 let key = crate::index::address::encode_spending_key_v2(&row.key());
                 let value = crate::index::address::encode_spending_value(&row.prev_outpoint);
-                wb.put_cf(&cf_as_v2, key, value);
+                wb.put_cf(&cf_as, key, value);
             }
             for key in &batch.addr_spending_removes {
-                let v1_encoded = crate::index::address::encode_spending_key(key);
-                let v2_encoded = crate::index::address::encode_spending_key_v2(key);
-                wb.delete_cf(&cf_as_v1, v1_encoded);
-                wb.delete_cf(&cf_as_v2, v2_encoded);
+                let encoded = crate::index::address::encode_spending_key_v2(key);
+                wb.delete_cf(&cf_as, encoded);
             }
         }
 
@@ -1470,8 +1457,6 @@ impl Store for RocksDbStore {
         // typed accessor for the same number and does not depend on
         // the rocksdb property registry recognising the name.
         let names: &[&'static str] = &[
-            CF_ADDR_SPENDING,
-            CF_ADDR_FUNDING,
             CF_ADDR_SPENDING_V2,
             CF_ADDR_FUNDING_V2,
             CF_OUTPOINT_SPEND,
@@ -1518,11 +1503,23 @@ impl Store for RocksDbStore {
     fn get_undo(&self, hash: &BlockHash) -> Option<UndoData> {
         let cf = self.cf(CF_UNDO);
         let value = self.db.get_cf(&cf, hash_bytes(hash)).ok()??;
-        // `UndoData::deserialize` auto-detects v1 vs legacy v0 bincode
-        // by peeking the 8-byte v1 magic. A 2-byte magic was rejected
-        // in review because it collides with a legacy bincode `Vec`
-        // length prefix of exactly 510.
-        UndoData::deserialize(&value).ok()
+        match UndoData::deserialize(&value) {
+            Ok(u) => Some(u),
+            Err(e) => {
+                // Log so an operator chasing "undo data missing" can
+                // distinguish genuine absence from a decode failure.
+                // The schema-version check at open should make this
+                // unreachable for legacy formats, but a corrupt row
+                // would otherwise look identical to a missing row.
+                tracing::error!(
+                    target: "storage",
+                    block_hash = %hash,
+                    error = %e,
+                    "undo row failed to decode; treating as missing"
+                );
+                None
+            }
+        }
     }
 
     fn for_each_block_index(
@@ -1587,8 +1584,6 @@ impl Store for RocksDbStore {
         // Address-history index sits in chainstate and must clear too,
         // otherwise -reindex-chainstate would leave stale rows that
         // reference UTXOs the new chainstate is about to overwrite.
-        cfs.push(CF_ADDR_FUNDING);
-        cfs.push(CF_ADDR_SPENDING);
         cfs.push(CF_ADDR_FUNDING_V2);
         cfs.push(CF_ADDR_SPENDING_V2);
         cfs.push(CF_OUTPOINT_SPEND);
@@ -1633,8 +1628,6 @@ impl Store for RocksDbStore {
             CF_UNDO,
             CF_METADATA,
             CF_TX_INDEX,
-            CF_ADDR_FUNDING,
-            CF_ADDR_SPENDING,
             CF_ADDR_FUNDING_V2,
             CF_ADDR_SPENDING_V2,
             CF_OUTPOINT_SPEND,
@@ -1703,59 +1696,12 @@ impl Store for RocksDbStore {
         sh: &crate::index::address::Scripthash,
         limit: usize,
     ) -> Vec<(crate::index::address::AddrFundingKey, u64)> {
-        // Dual-read: walk v1 (32-byte scripthash) + v2 (16-byte
-        // prefix) and concatenate. The address-index lookup layer
-        // sorts the merged stream post-fetch and truncates to the
-        // caller's overall limit, so each CF is independently capped
-        // at `limit` — NOT at "limit minus what v1 already returned".
-        //
-        // Why two independent caps (review H1, 2026-05-15): if v1
-        // had `limit` rows at heights 100..150 and v2 had earlier
-        // rows at heights 50..99, gating v2 on `out.len() < limit`
-        // would skip the v2 entirely and the caller's
-        // "first `limit` by height" result would be wrong. Returning
-        // up to `2 * limit` rows here is intentional and matches the
-        // shape `confirmed_history_limited` already produces from
-        // (funding + spending).
         let mut out: Vec<(crate::index::address::AddrFundingKey, u64)> = Vec::new();
-
-        // v1: 32-byte scripthash prefix, full key length 72.
-        let cf_v1 = self.cf(CF_ADDR_FUNDING);
-        let mut v1_count = 0usize;
-        for item in self.db.prefix_iterator_cf(&cf_v1, sh) {
-            if v1_count >= limit {
-                break;
-            }
-            let (k, v) = match item {
-                Ok(kv) => kv,
-                Err(_) => continue,
-            };
-            // Defensive: prefix_iterator may yield trailing rows whose
-            // prefix is past `sh` once the underlying memtable was
-            // compacted across the prefix boundary. Verify before
-            // decoding.
-            if k.len() < 32 || &k[..32] != sh {
-                break;
-            }
-            let key = match crate::index::address::decode_funding_key(&k) {
-                Some(k) => k,
-                None => continue,
-            };
-            let amount = match crate::index::address::decode_funding_value(&v) {
-                Some(a) => a,
-                None => continue,
-            };
-            out.push((key, amount));
-            v1_count += 1;
-        }
-
-        // v2: 16-byte scripthash-prefix. Independently capped at
-        // `limit` — see the comment above.
-        let cf_v2 = self.cf(CF_ADDR_FUNDING_V2);
+        let cf = self.cf(CF_ADDR_FUNDING_V2);
         let sh_prefix = &sh[..crate::index::address::SCRIPTHASH_PREFIX_LEN];
-        let mut v2_count = 0usize;
-        for item in self.db.prefix_iterator_cf(&cf_v2, sh_prefix) {
-            if v2_count >= limit {
+        let mut count = 0usize;
+        for item in self.db.prefix_iterator_cf(&cf, sh_prefix) {
+            if count >= limit {
                 break;
             }
             let (k, v) = match item {
@@ -1773,16 +1719,13 @@ impl Store for RocksDbStore {
                 Some(a) => a,
                 None => continue,
             };
-            // Reconstruct the canonical in-memory key by re-
-            // attaching the caller's full scripthash. Collisions
-            // (different full scripthashes sharing this 16-byte
-            // prefix) are admitted by design — see module
-            // docstring in `node_index::keys`. The lookup layer
-            // exposes results keyed by the caller-supplied
-            // scripthash regardless.
+            // Reconstruct the canonical in-memory key by re-attaching
+            // the caller's full scripthash. Collisions (different full
+            // scripthashes sharing this 16-byte prefix) are admitted by
+            // design — see module docstring in `node_index::keys`.
             let key = crate::index::address::reconstruct_funding_key(sh, payload);
             out.push((key, amount));
-            v2_count += 1;
+            count += 1;
         }
         out
     }
@@ -1799,46 +1742,12 @@ impl Store for RocksDbStore {
         sh: &crate::index::address::Scripthash,
         limit: usize,
     ) -> Vec<(crate::index::address::AddrSpendingKey, OutPoint)> {
-        // Dual-read across v1 + v2 CFs. Each CF is independently
-        // capped at `limit` — see iter_addr_funding_limited for the
-        // rationale (review H1, 2026-05-15). Returning up to
-        // `2 * limit` rows here is intentional; the lookup layer
-        // sorts and truncates post-fetch.
         let mut out: Vec<(crate::index::address::AddrSpendingKey, OutPoint)> = Vec::new();
-
-        // v1: 32-byte scripthash prefix.
-        let cf_v1 = self.cf(CF_ADDR_SPENDING);
-        let mut v1_count = 0usize;
-        for item in self.db.prefix_iterator_cf(&cf_v1, sh) {
-            if v1_count >= limit {
-                break;
-            }
-            let (k, v) = match item {
-                Ok(kv) => kv,
-                Err(_) => continue,
-            };
-            if k.len() < 32 || &k[..32] != sh {
-                break;
-            }
-            let key = match crate::index::address::decode_spending_key(&k) {
-                Some(k) => k,
-                None => continue,
-            };
-            let prev = match crate::index::address::decode_spending_value(&v) {
-                Some(p) => p,
-                None => continue,
-            };
-            out.push((key, prev));
-            v1_count += 1;
-        }
-
-        // v2: 16-byte scripthash prefix. Independently capped at
-        // `limit`.
-        let cf_v2 = self.cf(CF_ADDR_SPENDING_V2);
+        let cf = self.cf(CF_ADDR_SPENDING_V2);
         let sh_prefix = &sh[..crate::index::address::SCRIPTHASH_PREFIX_LEN];
-        let mut v2_count = 0usize;
-        for item in self.db.prefix_iterator_cf(&cf_v2, sh_prefix) {
-            if v2_count >= limit {
+        let mut count = 0usize;
+        for item in self.db.prefix_iterator_cf(&cf, sh_prefix) {
+            if count >= limit {
                 break;
             }
             let (k, v) = match item {
@@ -1858,7 +1767,7 @@ impl Store for RocksDbStore {
             };
             let key = crate::index::address::reconstruct_spending_key(sh, payload);
             out.push((key, prev));
-            v2_count += 1;
+            count += 1;
         }
         out
     }
@@ -2228,7 +2137,7 @@ mod tests {
     use super::*;
     use crate::storage::blockindex::{BlockIndexEntry, BlockStatus, work_for_bits};
     use crate::storage::coinview::Coin;
-    use crate::storage::undo::{OutPointSer, UndoData};
+    use crate::storage::undo::UndoData;
     use crate::storage::{Store, StoreBatch};
     use bitcoin::hashes::Hash;
     use bitcoin::pow::CompactTarget;
@@ -2560,42 +2469,6 @@ mod tests {
     }
 
     #[test]
-    fn test_undo_legacy_bincode_read_compat() {
-        // A row written in the v0 bincode format (the on-disk shape
-        // before this PR) must still decode after the schema change.
-        // We bypass the store's `write_batch` (which always emits v1)
-        // and put the raw bincode bytes directly into the undo CF,
-        // then verify `get_undo` recovers the spent coin.
-        let (store, _dir) = temp_store(false);
-        let block_hash = make_block_hash(0x77);
-        let op = make_outpoint(0xCC, 3);
-        let coin = make_coin(42_000_000, 999);
-
-        #[derive(serde::Serialize)]
-        struct V0Undo {
-            spent_coins: Vec<(OutPointSer, Coin)>,
-        }
-        let v0 = V0Undo {
-            spent_coins: vec![(OutPointSer::from(&op), coin.clone())],
-        };
-        let bytes = bincode::serialize(&v0).unwrap();
-        // The 8-byte v1 magic (`C0DECAFE_C0DECAFE` LE) is impossibly
-        // large as a `Vec` length prefix, so no realistic legacy row
-        // can collide. Single-entry rows in particular have length
-        // prefix `01 00 00 00 00 00 00 00`, nowhere near the magic.
-        let cf = store.cf(super::CF_UNDO);
-        store
-            .db
-            .put_cf(&cf, hash_bytes(&block_hash), &bytes)
-            .unwrap();
-
-        let recovered = store.get_undo(&block_hash).unwrap();
-        assert_eq!(recovered.spent_coins.len(), 1);
-        assert_eq!(recovered.spent_coins[0].amount, 42_000_000);
-        assert_eq!(recovered.spent_coins[0].height, 999);
-    }
-
-    #[test]
     fn for_each_block_index_surfaces_decode_skip_counts() {
         // Regression for the M4 review finding: `for_each_block_index`
         // used to silently skip rows whose key/value failed to decode,
@@ -2868,8 +2741,8 @@ mod tests {
         let (store, _dir) = temp_store(false);
         // CF handles must resolve. cf() panics on missing CF, so this
         // exercises the descriptor registration path end-to-end.
-        let _af = store.cf(CF_ADDR_FUNDING);
-        let _as_ = store.cf(CF_ADDR_SPENDING);
+        let _af = store.cf(CF_ADDR_FUNDING_V2);
+        let _as_ = store.cf(CF_ADDR_SPENDING_V2);
     }
 
     #[test]
@@ -2879,18 +2752,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let store = RocksDbStore::open(dir.path(), false, 16, false, -1).unwrap();
-            let _af = store.cf(CF_ADDR_FUNDING);
+            let _af = store.cf(CF_ADDR_FUNDING_V2);
         }
         let store = RocksDbStore::open(dir.path(), false, 16, false, -1).unwrap();
-        let _af = store.cf(CF_ADDR_FUNDING);
-        let _as_ = store.cf(CF_ADDR_SPENDING);
+        let _af = store.cf(CF_ADDR_FUNDING_V2);
+        let _as_ = store.cf(CF_ADDR_SPENDING_V2);
     }
 
     #[test]
     fn test_address_index_write_batch_funding_put_then_read() {
-        use crate::index::address::{
-            AddrFundingRow, encode_funding_key, encode_funding_key_v2, encode_funding_value,
-        };
+        use crate::index::address::{AddrFundingRow, encode_funding_key_v2, encode_funding_value};
 
         let (store, _dir) = temp_store(false);
         let row = AddrFundingRow {
@@ -2905,22 +2776,13 @@ mod tests {
         batch.addr_funding_puts.push(row.clone());
         store.write_batch(batch).unwrap();
 
-        // Post-PR-D, write_batch emits to v2 only. The legacy v1 CF
-        // must NOT contain the row; the new v2 CF must.
-        let cf_v1 = store.cf(CF_ADDR_FUNDING);
-        let v1_encoded = encode_funding_key(&row.key());
-        assert!(
-            store.db.get_cf(&cf_v1, v1_encoded).unwrap().is_none(),
-            "v1 CF must be empty after a v2 write",
-        );
-
-        let cf_v2 = store.cf(CF_ADDR_FUNDING_V2);
-        let v2_encoded = encode_funding_key_v2(&row.key());
+        let cf = store.cf(CF_ADDR_FUNDING_V2);
+        let encoded = encode_funding_key_v2(&row.key());
         let raw = store
             .db
-            .get_cf(&cf_v2, v2_encoded)
+            .get_cf(&cf, encoded)
             .unwrap()
-            .expect("row present in v2");
+            .expect("row present");
         assert_eq!(
             raw.as_slice(),
             encode_funding_value(row.amount_sat).as_slice()
@@ -2930,7 +2792,7 @@ mod tests {
     #[test]
     fn test_address_index_write_batch_spending_put_then_remove() {
         use crate::index::address::{
-            AddrSpendingRow, encode_spending_key, encode_spending_key_v2, encode_spending_value,
+            AddrSpendingRow, encode_spending_key_v2, encode_spending_value,
         };
 
         let (store, _dir) = temp_store(false);
@@ -2943,38 +2805,27 @@ mod tests {
             prev_outpoint: prev,
         };
 
-        // Put. Post-PR-D, write_batch emits to v2 only.
         let mut batch = StoreBatch::default();
         batch.addr_spending_puts.push(row.clone());
         store.write_batch(batch).unwrap();
 
-        let cf_v1 = store.cf(CF_ADDR_SPENDING);
-        let v1_encoded = encode_spending_key(&row.key());
-        assert!(
-            store.db.get_cf(&cf_v1, v1_encoded).unwrap().is_none(),
-            "v1 CF must be empty after a v2 write",
-        );
-
-        let cf_v2 = store.cf(CF_ADDR_SPENDING_V2);
-        let v2_encoded = encode_spending_key_v2(&row.key());
+        let cf = store.cf(CF_ADDR_SPENDING_V2);
+        let encoded = encode_spending_key_v2(&row.key());
         let raw = store
             .db
-            .get_cf(&cf_v2, v2_encoded)
+            .get_cf(&cf, encoded)
             .unwrap()
-            .expect("row present in v2");
+            .expect("row present");
         assert_eq!(
             raw.as_slice(),
             encode_spending_value(&row.prev_outpoint).as_slice()
         );
 
-        // Remove via the same key. Round-trips the deletion path used
-        // by disconnect_block; under PR D's dual-CF delete, the tombstone
-        // lands in BOTH CFs, so we verify v2 (where the row was) goes
-        // away.
+        // Remove round-trips the deletion path used by disconnect_block.
         let mut rm = StoreBatch::default();
         rm.addr_spending_removes.push(row.key());
         store.write_batch(rm).unwrap();
-        assert!(store.db.get_cf(&cf_v2, v2_encoded).unwrap().is_none());
+        assert!(store.db.get_cf(&cf, encoded).unwrap().is_none());
     }
 
     #[test]
@@ -3285,186 +3136,7 @@ mod tests {
     }
 
     #[test]
-    fn dual_read_merges_v1_and_v2_funding_rows() {
-        // Mainnet scenario for the duration of the migration window:
-        // some scripthash has pre-PR-D rows in CF_ADDR_FUNDING and
-        // post-PR-D rows in CF_ADDR_FUNDING_V2. The merged read must
-        // surface BOTH sets keyed by the caller's full scripthash.
-        use crate::index::address::{
-            AddrFundingKey, AddrFundingRow, encode_funding_key, encode_funding_key_v2,
-            encode_funding_value,
-        };
-
-        let (store, _dir) = temp_store(false);
-        let sh = [0xCA; 32];
-
-        // 1. Inject a synthetic v1 row directly via the CF (writes
-        // would never produce v1 again post-PR-D).
-        let v1_row = AddrFundingRow {
-            scripthash: sh,
-            height: 100,
-            txid: make_outpoint(0xA1, 0).txid,
-            vout: 0,
-            amount_sat: 1_000,
-        };
-        let cf_v1 = store.cf(CF_ADDR_FUNDING);
-        store
-            .db
-            .put_cf(
-                &cf_v1,
-                encode_funding_key(&v1_row.key()),
-                encode_funding_value(v1_row.amount_sat),
-            )
-            .unwrap();
-
-        // 2. Drive a normal write to populate the v2 CF for the same
-        // scripthash at a different height.
-        let v2_row = AddrFundingRow {
-            scripthash: sh,
-            height: 200,
-            txid: make_outpoint(0xB2, 0).txid,
-            vout: 0,
-            amount_sat: 2_000,
-        };
-        let mut batch = StoreBatch::default();
-        batch.addr_funding_puts.push(v2_row.clone());
-        store.write_batch(batch).unwrap();
-
-        // Sanity: v1 CF carries v1 row only; v2 CF carries v2 row only.
-        let cf_v2 = store.cf(CF_ADDR_FUNDING_V2);
-        assert!(
-            store
-                .db
-                .get_cf(&cf_v2, encode_funding_key_v2(&v1_row.key()))
-                .unwrap()
-                .is_none(),
-            "v2 CF must not auto-populate from the v1 fixture",
-        );
-        assert!(
-            store
-                .db
-                .get_cf(&cf_v1, encode_funding_key(&v2_row.key()))
-                .unwrap()
-                .is_none(),
-            "v1 CF must not receive v2 writes",
-        );
-
-        // 3. Read via the merged iterator. Expect both rows.
-        let mut got = store.iter_addr_funding(&sh);
-        got.sort_by_key(|(k, _)| k.height);
-        assert_eq!(got.len(), 2);
-        assert_eq!(got[0].0.height, 100);
-        assert_eq!(got[0].1, 1_000);
-        assert_eq!(got[1].0.height, 200);
-        assert_eq!(got[1].1, 2_000);
-        // Both rows must carry the caller's full 32-byte scripthash,
-        // even the v2 row whose on-disk key has only the 16-byte prefix.
-        let expected_keys: Vec<AddrFundingKey> = vec![v1_row.key(), v2_row.key()];
-        let got_keys: Vec<AddrFundingKey> = got.iter().map(|(k, _)| k.clone()).collect();
-        for k in &got_keys {
-            assert_eq!(k.scripthash, sh);
-        }
-        assert!(expected_keys.iter().all(|e| got_keys.contains(e)));
-    }
-
-    #[test]
-    fn dual_read_merges_v1_and_v2_spending_rows() {
-        // Same shape as the funding test for spending CFs.
-        use crate::index::address::{
-            AddrSpendingKey, AddrSpendingRow, encode_spending_key, encode_spending_value,
-        };
-
-        let (store, _dir) = temp_store(false);
-        let sh = [0xDE; 32];
-
-        let v1_row = AddrSpendingRow {
-            scripthash: sh,
-            height: 10,
-            txid: make_outpoint(0x11, 0).txid,
-            vin: 0,
-            prev_outpoint: make_outpoint(0xC0, 0),
-        };
-        let cf_v1 = store.cf(CF_ADDR_SPENDING);
-        store
-            .db
-            .put_cf(
-                &cf_v1,
-                encode_spending_key(&v1_row.key()),
-                encode_spending_value(&v1_row.prev_outpoint),
-            )
-            .unwrap();
-
-        let v2_row = AddrSpendingRow {
-            scripthash: sh,
-            height: 20,
-            txid: make_outpoint(0x22, 0).txid,
-            vin: 1,
-            prev_outpoint: make_outpoint(0xC1, 0),
-        };
-        let mut batch = StoreBatch::default();
-        batch.addr_spending_puts.push(v2_row.clone());
-        store.write_batch(batch).unwrap();
-
-        let mut got = store.iter_addr_spending(&sh);
-        got.sort_by_key(|(k, _)| k.height);
-        assert_eq!(got.len(), 2);
-        assert_eq!(got[0].0.height, 10);
-        assert_eq!(got[1].0.height, 20);
-        let expected_keys: Vec<AddrSpendingKey> = vec![v1_row.key(), v2_row.key()];
-        let got_keys: Vec<AddrSpendingKey> = got.iter().map(|(k, _)| k.clone()).collect();
-        for k in &got_keys {
-            assert_eq!(k.scripthash, sh);
-        }
-        assert!(expected_keys.iter().all(|e| got_keys.contains(e)));
-    }
-
-    #[test]
-    fn remove_clears_row_from_v1_cf() {
-        // If a row exists in the v1 CF (pre-PR-D residue) and the
-        // disconnect path queues a remove, the merged delete must
-        // clear it from v1. Otherwise the row would re-appear on the
-        // next merged read.
-        use crate::index::address::{AddrFundingRow, encode_funding_key, encode_funding_value};
-
-        let (store, _dir) = temp_store(false);
-        let sh = [0xAA; 32];
-        let row = AddrFundingRow {
-            scripthash: sh,
-            height: 5,
-            txid: make_outpoint(0xBB, 0).txid,
-            vout: 0,
-            amount_sat: 999,
-        };
-        let cf_v1 = store.cf(CF_ADDR_FUNDING);
-        store
-            .db
-            .put_cf(
-                &cf_v1,
-                encode_funding_key(&row.key()),
-                encode_funding_value(row.amount_sat),
-            )
-            .unwrap();
-
-        assert_eq!(store.iter_addr_funding(&sh).len(), 1);
-
-        let mut batch = StoreBatch::default();
-        batch.addr_funding_removes.push(row.key());
-        store.write_batch(batch).unwrap();
-
-        // Both CFs must end up with no row for this key.
-        assert!(
-            store
-                .db
-                .get_cf(&cf_v1, encode_funding_key(&row.key()))
-                .unwrap()
-                .is_none(),
-            "v1 row must be tombstoned by the merged delete",
-        );
-        assert_eq!(store.iter_addr_funding(&sh).len(), 0);
-    }
-
-    #[test]
-    fn dual_read_admits_16_byte_prefix_collisions() {
+    fn prefix_collisions_admitted() {
         // Two different full scripthashes that share the first 16
         // bytes will both surface in a v2 read for either. The
         // module-level docstring spells out this collision-tolerant
@@ -3519,201 +3191,6 @@ mod tests {
     }
 
     #[test]
-    fn dual_read_limited_does_not_starve_v2_when_v1_fills_limit() {
-        // Regression for the H1 review finding (2026-05-15): the
-        // limited dual-read used to stop after v1 reached `limit`,
-        // dropping any v2 rows that should have been included.
-        // Construct a mixed-format scripthash whose v2 rows are at
-        // EARLIER heights than the v1 rows; under the old code the
-        // caller's "first `limit` by height" answer would skip the
-        // v2 rows entirely.
-        use crate::index::address::{
-            AddrFundingRow, encode_funding_key, encode_funding_value,
-        };
-
-        let (store, _dir) = temp_store(false);
-        let sh = [0xF0; 32];
-
-        // 10 v1 rows at heights 100..110, injected directly into v1 CF.
-        let cf_v1 = store.cf(CF_ADDR_FUNDING);
-        for i in 0..10u32 {
-            let row = AddrFundingRow {
-                scripthash: sh,
-                height: 100 + i,
-                txid: make_outpoint((0xC0u8).wrapping_add(i as u8), 0).txid,
-                vout: 0,
-                amount_sat: 100 + i as u64,
-            };
-            store
-                .db
-                .put_cf(
-                    &cf_v1,
-                    encode_funding_key(&row.key()),
-                    encode_funding_value(row.amount_sat),
-                )
-                .unwrap();
-        }
-
-        // 3 v2 rows at heights 50..53 — EARLIER than the v1 rows —
-        // written through the normal post-PR-D write path.
-        let mut batch = StoreBatch::default();
-        for i in 0..3u32 {
-            batch.addr_funding_puts.push(AddrFundingRow {
-                scripthash: sh,
-                height: 50 + i,
-                txid: make_outpoint((0xB0u8).wrapping_add(i as u8), 0).txid,
-                vout: 0,
-                amount_sat: 50 + i as u64,
-            });
-        }
-        store.write_batch(batch).unwrap();
-
-        // With limit=5: v1 has 10 rows, v2 has 3. Pre-fix, the
-        // iterator returned 5 rows entirely from v1 (heights
-        // 100..105) and skipped v2 entirely. Post-fix, each CF is
-        // independently capped at `limit`, so we get up to 5 v1
-        // rows + 3 v2 rows = 8 total, all carrying the caller's
-        // scripthash.
-        let got = store.iter_addr_funding_limited(&sh, 5);
-        let heights: std::collections::HashSet<u32> = got.iter().map(|(k, _)| k.height).collect();
-        assert!(
-            heights.contains(&50) && heights.contains(&51) && heights.contains(&52),
-            "v2 rows at heights 50..53 must appear in the limited result; got heights {:?}",
-            heights
-        );
-        // Sanity: the caller (confirmed_history_limited) would sort
-        // by height and truncate to `limit`, producing the correct
-        // earliest-height set. Simulate that here.
-        let mut sorted_heights: Vec<u32> = got.iter().map(|(k, _)| k.height).collect();
-        sorted_heights.sort();
-        sorted_heights.truncate(5);
-        assert_eq!(
-            sorted_heights,
-            vec![50, 51, 52, 100, 101],
-            "post-merge truncate-to-limit must surface the earliest-height rows"
-        );
-    }
-
-    #[test]
-    fn dual_read_limited_spending_does_not_starve_v2() {
-        // Mirror of the funding test for spending CFs.
-        use crate::index::address::{
-            AddrSpendingRow, encode_spending_key, encode_spending_value,
-        };
-
-        let (store, _dir) = temp_store(false);
-        let sh = [0xF1; 32];
-
-        let cf_v1 = store.cf(CF_ADDR_SPENDING);
-        for i in 0..10u32 {
-            let row = AddrSpendingRow {
-                scripthash: sh,
-                height: 100 + i,
-                txid: make_outpoint((0xD0u8).wrapping_add(i as u8), 0).txid,
-                vin: 0,
-                prev_outpoint: make_outpoint(0xFF, i),
-            };
-            store
-                .db
-                .put_cf(
-                    &cf_v1,
-                    encode_spending_key(&row.key()),
-                    encode_spending_value(&row.prev_outpoint),
-                )
-                .unwrap();
-        }
-
-        let mut batch = StoreBatch::default();
-        for i in 0..3u32 {
-            batch.addr_spending_puts.push(AddrSpendingRow {
-                scripthash: sh,
-                height: 50 + i,
-                txid: make_outpoint((0xE0u8).wrapping_add(i as u8), 0).txid,
-                vin: 0,
-                prev_outpoint: make_outpoint(0xEE, i),
-            });
-        }
-        store.write_batch(batch).unwrap();
-
-        let got = store.iter_addr_spending_limited(&sh, 5);
-        let heights: std::collections::HashSet<u32> = got.iter().map(|(k, _)| k.height).collect();
-        assert!(
-            heights.contains(&50) && heights.contains(&51) && heights.contains(&52),
-            "v2 spending rows at heights 50..53 must appear; got heights {:?}",
-            heights,
-        );
-    }
-
-    #[test]
-    fn dual_read_limited_per_cf_cap_during_migration() {
-        // Round-2 review M4 (2026-05-15): the Store trait now
-        // documents that during the v1/v2 migration window
-        // `iter_addr_*_limited` caps each source-format CF
-        // independently, so the total may reach up to `2 * limit`.
-        // Pin the contract with a mixed-state fixture: 50 v1 rows
-        // and 50 v2 rows for the same scripthash, query with
-        // limit=10, expect exactly 20 (10 from each CF). Callers
-        // that need a hard total cap (Electrum/Esplora) truncate
-        // above this layer — see the trait doc on
-        // `iter_addr_funding_limited`.
-        use crate::index::address::{
-            AddrFundingRow, encode_funding_key, encode_funding_value,
-        };
-
-        let (store, _dir) = temp_store(false);
-        let sh = [0xFE; 32];
-
-        // 50 v1 rows injected directly into the v1 CF.
-        let cf_v1 = store.cf(CF_ADDR_FUNDING);
-        for i in 0..50u32 {
-            let row = AddrFundingRow {
-                scripthash: sh,
-                height: 1000 + i,
-                txid: make_outpoint((0xA0u8).wrapping_add(i as u8), 0).txid,
-                vout: 0,
-                amount_sat: 1_000 + i as u64,
-            };
-            store
-                .db
-                .put_cf(
-                    &cf_v1,
-                    encode_funding_key(&row.key()),
-                    encode_funding_value(row.amount_sat),
-                )
-                .unwrap();
-        }
-
-        // 50 v2 rows via the normal write path.
-        let mut batch = StoreBatch::default();
-        for i in 0..50u32 {
-            batch.addr_funding_puts.push(AddrFundingRow {
-                scripthash: sh,
-                height: 2000 + i,
-                txid: make_outpoint((0xB0u8).wrapping_add(i as u8), 0).txid,
-                vout: 0,
-                amount_sat: 2_000 + i as u64,
-            });
-        }
-        store.write_batch(batch).unwrap();
-
-        let got = store.iter_addr_funding_limited(&sh, 10);
-        assert_eq!(
-            got.len(),
-            20,
-            "per-CF cap contract: expect 10 v1 + 10 v2 = 20 in mixed state",
-        );
-        // Half should come from v1 (heights ~1000) and half from v2
-        // (heights ~2000).
-        let v1_count = got.iter().filter(|(k, _)| k.height >= 1000 && k.height < 2000).count();
-        let v2_count = got.iter().filter(|(k, _)| k.height >= 2000).count();
-        assert_eq!(v1_count, 10, "v1 contribution should be capped at limit");
-        assert_eq!(v2_count, 10, "v2 contribution should be capped at limit");
-
-        // limit=0 must still return 0 from both CFs.
-        assert_eq!(store.iter_addr_funding_limited(&sh, 0).len(), 0);
-    }
-
-    #[test]
     fn test_outpoint_spend_persists_across_reopen() {
         // Verifies the CF descriptor is registered on subsequent opens
         // (so an existing chainstate-on-disk doesn't fail to mount).
@@ -3741,8 +3218,8 @@ mod tests {
         let (store, _dir) = temp_store(false);
         store.write_batch(StoreBatch::default()).unwrap();
         // Both CFs must still be empty.
-        let af = store.cf(CF_ADDR_FUNDING);
-        let as_ = store.cf(CF_ADDR_SPENDING);
+        let af = store.cf(CF_ADDR_FUNDING_V2);
+        let as_ = store.cf(CF_ADDR_SPENDING_V2);
         assert!(
             store
                 .db
@@ -3806,5 +3283,102 @@ mod tests {
             before.spending_rows,
             after.spending_rows
         );
+    }
+
+    /// Create a datadir that *looks* like one written by a previous
+    /// satd build (schema-version stamped, legacy CFs registered in
+    /// the manifest). The optional `legacy_rows` populates the legacy
+    /// CFs with a single junk row so we can exercise the "non-empty"
+    /// branch. Returns the datadir path (the parent of the RocksDB
+    /// `chainstate/` directory; matches what `RocksDbStore::open`
+    /// expects as its `path` argument) plus the temp dir guard.
+    fn synth_prior_datadir(
+        schema_version: u32,
+        legacy_rows: bool,
+    ) -> (std::path::PathBuf, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let datadir = dir.path().to_path_buf();
+        let path = datadir.join("chainstate");
+        std::fs::create_dir_all(&path).unwrap();
+
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        opts.create_missing_column_families(true);
+        let cfs = vec![
+            ColumnFamilyDescriptor::new(CF_METADATA, Options::default()),
+            ColumnFamilyDescriptor::new(CF_COINS, Options::default()),
+            ColumnFamilyDescriptor::new("addr_funding", Options::default()),
+            ColumnFamilyDescriptor::new("addr_spending", Options::default()),
+        ];
+        let db = DB::open_cf_descriptors(&opts, &path, cfs).unwrap();
+        RocksDbStore::stamp_schema(&db, schema_version).unwrap();
+        if legacy_rows {
+            let af = db.cf_handle("addr_funding").unwrap();
+            let as_ = db.cf_handle("addr_spending").unwrap();
+            db.put_cf(&af, b"row", b"junk").unwrap();
+            db.put_cf(&as_, b"row", b"junk").unwrap();
+        }
+        drop(db);
+        (datadir, dir)
+    }
+
+    #[test]
+    fn open_with_legacy_addr_cfs_at_current_schema_drops_them() {
+        // Migration-tooling residue: legacy `addr_funding` /
+        // `addr_spending` CFs registered in the manifest but empty,
+        // chainstate stamped at the current schema version. Open must
+        // succeed and drop the legacy CFs.
+        let (path, _dir) = synth_prior_datadir(CURRENT_SCHEMA_VERSION, false);
+        let store = RocksDbStore::open(&path, false, 16, false, -1)
+            .expect("open should succeed: legacy CFs are empty and schema is current");
+        assert!(
+            store.db.cf_handle("addr_funding").is_none(),
+            "legacy addr_funding CF must be dropped",
+        );
+        assert!(
+            store.db.cf_handle("addr_spending").is_none(),
+            "legacy addr_spending CF must be dropped",
+        );
+        // Re-opening must still succeed (the drop is persisted in the manifest).
+        drop(store);
+        let _ = RocksDbStore::open(&path, false, 16, false, -1).expect("reopen ok");
+    }
+
+    #[test]
+    fn open_with_stale_schema_refuses_with_reindex_hint() {
+        // Chainstate stamped at the previous schema (v2). Open without
+        // reindex must refuse with a message pointing to
+        // --reindex-chainstate — recovery must be reachable, not
+        // require manual filesystem surgery.
+        let (path, _dir) = synth_prior_datadir(CURRENT_SCHEMA_VERSION - 1, true);
+        let err = RocksDbStore::open(&path, false, 16, false, -1)
+            .err()
+            .expect("open should refuse a stale-schema chainstate");
+        let msg = match err {
+            StoreError::Database(s) => s,
+            other => panic!("expected Database error, got {:?}", other),
+        };
+        assert!(
+            msg.contains("schema version mismatch"),
+            "error should mention schema mismatch: {}",
+            msg
+        );
+        assert!(
+            msg.contains("--reindex-chainstate"),
+            "error should mention the recovery flag: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn reindex_open_drops_legacy_cfs_even_with_rows() {
+        // Reindex flow: chainstate is about to be wiped anyway, so
+        // non-empty legacy CFs are not a refusal — they get dropped
+        // as part of opening for the reindex.
+        let (path, _dir) = synth_prior_datadir(CURRENT_SCHEMA_VERSION - 1, true);
+        let store = RocksDbStore::open(&path, false, 16, true, -1)
+            .expect("reindex open should succeed regardless of schema or legacy CFs");
+        assert!(store.db.cf_handle("addr_funding").is_none());
+        assert!(store.db.cf_handle("addr_spending").is_none());
     }
 }

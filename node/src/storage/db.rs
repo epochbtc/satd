@@ -279,8 +279,8 @@ impl Store for InMemoryStore {
             .map(|r| (r.key(), r.amount_sat))
             .collect();
         rows.sort_by(|(a, _), (b, _)| {
-            crate::index::address::encode_funding_key(a)
-                .cmp(&crate::index::address::encode_funding_key(b))
+            crate::index::address::encode_funding_key_v2(a)
+                .cmp(&crate::index::address::encode_funding_key_v2(b))
         });
         rows
     }
@@ -295,8 +295,8 @@ impl Store for InMemoryStore {
             .map(|r| (r.key(), r.prev_outpoint))
             .collect();
         rows.sort_by(|(a, _), (b, _)| {
-            crate::index::address::encode_spending_key(a)
-                .cmp(&crate::index::address::encode_spending_key(b))
+            crate::index::address::encode_spending_key_v2(a)
+                .cmp(&crate::index::address::encode_spending_key_v2(b))
         });
         rows
     }

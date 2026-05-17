@@ -71,9 +71,9 @@ artifacts, signing stack) but no protocol consequences.
 **Why one RocksDB instance.** Core uses LevelDB and bundles indexes
 (`-txindex`, `-blockfilterindex`, `-coinstatsindex`) as separate
 LevelDB databases. satd uses one RocksDB with multiple column families
-(`block_index`, `coins`, `tx_index`, `addr_funding`, `addr_spending`,
-`block_filters`, `block_filter_headers`, `cf_meta`, `outpoint_spend`,
-`undo`, `tip`, `height_hash`). Index updates ride the same
+(`block_index`, `coins`, `tx_index`, `addr_funding_v2`,
+`addr_spending_v2`, `block_filters`, `block_filter_headers`,
+`cf_meta`, `outpoint_spend`, `undo`, `tip`, `height_hash`). Index updates ride the same
 `WriteBatch` as the connect-block / disconnect-block path, so
 protocol handlers cannot observe an index out of sync with the tip.
 This is the architectural foundation for native Esplora and Electrum
@@ -137,9 +137,9 @@ Atomic with `connect_block` / `disconnect_block`. Default-on
 (`--addressindex=1`); auto-required by Esplora and Electrum. Mempool
 variant in-memory; subscription registry per-scripthash; deferred
 AssumeUTXO backfill via `backfillindex address`. Two RocksDB column
-families (`addr_funding`, `addr_spending`) keyed by
-`(scripthash[32], height_be[4], txid[32], vout/vin_be[4])`. Source
-lives in `node-index/` and `node/src/index/address/`.
+families (`addr_funding_v2`, `addr_spending_v2`) keyed by
+`(scripthash_prefix[16], height_be[4], txid[32], vout/vin_be[4])`.
+Source lives in `node-index/` and `node/src/index/address/`.
 
 Bitcoin Core deliberately stays out of address-indexing for scaling
 reasons. satd accepts the disk cost (~120-180 GB compressed at mainnet
