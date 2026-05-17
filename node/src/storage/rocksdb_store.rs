@@ -23,11 +23,9 @@ const CF_METADATA: &str = "metadata";
 pub(crate) const CF_ADDR_FUNDING: &str = "addr_funding";
 pub(crate) const CF_ADDR_SPENDING: &str = "addr_spending";
 /// v2 address-history CFs: same row shape, but the key carries only
-/// a 16-byte scripthash prefix (vs 32 bytes for v1). All writes after
-/// PR D land here; reads consult both v1 and v2 and concatenate (the
-/// lookup layer already sorts post-fetch). The offline addr-index
-/// migrator (`storage::addr_index_migrate`) rewrites v1 rows into
-/// these CFs.
+/// a 16-byte scripthash prefix (vs 32 bytes for v1). All writes land
+/// here; reads consult both v1 and v2 and concatenate (the lookup
+/// layer already sorts post-fetch).
 pub(crate) const CF_ADDR_FUNDING_V2: &str = "addr_funding_v2";
 pub(crate) const CF_ADDR_SPENDING_V2: &str = "addr_spending_v2";
 /// Confirmed-side spend index: `prev_outpoint -> SpendingRef`. Written
@@ -725,14 +723,6 @@ impl RocksDbStore {
         self.db
             .cf_handle(name)
             .unwrap_or_else(|| panic!("column family '{}' not found", name))
-    }
-
-    /// Shared accessor used by offline maintenance code (the undo
-    /// migrator and the addr-index migrator) that needs the raw
-    /// RocksDB handle. Keeps `self.db` itself private so migrators
-    /// can't accidentally bypass open-mode guards or schema gating.
-    pub(crate) fn raw_db(&self) -> &rocksdb::DBWithThreadMode<rocksdb::MultiThreaded> {
-        &self.db
     }
 
     /// Build column family options for (re)creation.

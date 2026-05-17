@@ -1,4 +1,3 @@
-pub mod addr_index_migrate;
 pub mod blockfile_audit;
 pub mod blockindex;
 pub mod coin_cache;
@@ -9,7 +8,6 @@ pub mod flatfile;
 pub mod profile;
 pub mod rocksdb_store;
 pub mod undo;
-pub mod undo_migrate;
 
 use bitcoin::{BlockHash, OutPoint, Txid};
 
