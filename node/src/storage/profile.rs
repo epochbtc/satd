@@ -83,7 +83,7 @@ pub struct StorageTuning {
     /// `wal_bytes_per_sync` for WAL writes.
     pub wal_bytes_per_sync: u64,
     /// `target_file_size_base` for the high-write secondary index
-    /// CFs (`addr_funding`, `addr_spending`, `outpoint_spend`,
+    /// CFs (`addr_funding_v2`, `addr_spending_v2`, `outpoint_spend`,
     /// `undo`). Larger values produce fewer, larger SSTs at the
     /// bottom level — reduces metadata overhead and total compaction
     /// count, at the cost of longer individual compactions.
