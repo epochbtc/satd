@@ -23,9 +23,8 @@ pub use cursor::{BackfillCursor, BackfillState};
 pub use keys::{
     AddrFundingKey, AddrFundingKeyV2Payload, AddrFundingRow, AddrSpendingKey,
     AddrSpendingKeyV2Payload, AddrSpendingRow, KEY_LEN_V2, SCRIPTHASH_PREFIX_LEN, Scripthash,
-    decode_funding_key, decode_funding_key_v2, decode_funding_value, decode_spending_key,
-    decode_spending_key_v2, decode_spending_value, encode_funding_key, encode_funding_key_v2,
-    encode_funding_value, encode_spending_key, encode_spending_key_v2, encode_spending_value,
+    decode_funding_key_v2, decode_funding_value, decode_spending_key_v2, decode_spending_value,
+    encode_funding_key_v2, encode_funding_value, encode_spending_key_v2, encode_spending_value,
     reconstruct_funding_key, reconstruct_spending_key, scripthash_of,
 };
 pub use spend_keys::{

@@ -406,7 +406,7 @@ pub trait Store: Send + Sync {
 
     /// All committed `addr_funding` rows for `sh`, ordered ascending by
     /// `(height, txid, vout)` (i.e. ascending by encoded key — the BE
-    /// layout in `keys::encode_funding_key`). Returns the value
+    /// layout in `keys::encode_funding_key_v2`). Returns the value
     /// `amount_sat` alongside the decoded key. Default: empty (backends
     /// that don't carry the address index produce no rows).
     fn iter_addr_funding(&self, _sh: &Scripthash) -> Vec<(AddrFundingKey, u64)> {
@@ -414,26 +414,13 @@ pub trait Store: Send + Sync {
     }
 
     /// Like [`iter_addr_funding`](Self::iter_addr_funding), but bounds
-    /// the work per **source-format CF**. Used by streaming-cap
+    /// the work to at most `limit` rows. Used by streaming-cap
     /// callers (Electrum / Esplora `get_history`, `listunspent`) so a
     /// pathologically large scripthash can't force a full RocksDB
     /// scan + Vec allocation just to fail the per-request cap check.
     ///
-    /// **Cap contract.** Returns at most `limit` rows per
-    /// source-format CF. Implementations that maintain a single
-    /// physical CF (the default; in-memory test backends) return at
-    /// most `limit` rows total. The RocksDB backend during the v1/v2
-    /// migration window walks both CFs and may therefore return up to
-    /// `2 * limit` rows — independent caps avoid v2-starvation when
-    /// v1 already filled `limit` (review H1, 2026-05-15). Callers
-    /// that need a hard `limit` (Electrum/Esplora) must truncate
-    /// after the merge above this layer; the existing
-    /// `confirmed_history_limited` already does this for funding +
-    /// spending, so its `2 * limit` budget naturally absorbs the
-    /// per-CF cap.
-    ///
     /// Default: forwards to the unlimited variant + truncates
-    /// (correct but unoptimized). Round-1 review M4.
+    /// (correct but unoptimized).
     fn iter_addr_funding_limited(
         &self,
         sh: &Scripthash,
