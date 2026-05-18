@@ -2738,6 +2738,120 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Regression for the `-reindex-chainstate` + read-only blocks/
+    /// scenario: `clear_chainstate` wipes the tip pointer but keeps
+    /// `CF_BLOCK_INDEX` intact, so `ChainState::new` lands in the
+    /// "fresh node" branch on a non-fresh datadir. Without the
+    /// genesis-flat-pos reuse, that branch unconditionally appends a
+    /// duplicate genesis to flat files — which (a) wastes ~285 bytes
+    /// of slack on every reindex-chainstate and (b) outright fails
+    /// when `blocks/` is read-only at the file-mode level (e.g. a
+    /// sibling validation node that symlinks to a primary's
+    /// `blocks/` dir whose `blk*.dat` are mode 644 satd:satd).
+    ///
+    /// This test feeds `ChainState::new` a store that has a genesis
+    /// `BlockIndexEntry` at a distinctive `(file_number=12,
+    /// data_pos=34)` but no tip, then asserts that no new file is
+    /// written to `blocks_dir` and the existing flat_pos survives.
+    #[test]
+    fn chain_state_new_reuses_genesis_flatpos_when_block_index_populated() {
+        use crate::storage::blockindex::BlockIndexEntry;
+        use crate::storage::StoreBatch;
+
+        let dir = std::env::temp_dir().join(format!(
+            "satd-genesis-reuse-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let blocks_dir = dir.join("blocks");
+        std::fs::create_dir_all(&blocks_dir).unwrap();
+
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+        let genesis_hash = genesis.block_hash();
+
+        // Seed the store with a genesis block_index entry at a
+        // distinctive flat_pos (12, 34) — chosen so we can later
+        // distinguish "reused" from "overwritten by fresh append at
+        // (0, 0)". Tip stays None: that's the post-`clear_chainstate`
+        // shape.
+        let store = Box::new(InMemoryStore::new());
+        let genesis_entry = BlockIndexEntry {
+            header: genesis.header,
+            height: 0,
+            status: BlockStatus::Valid,
+            num_tx: 1,
+            file_number: 12,
+            data_pos: 34,
+            chainwork: [0u8; 32],
+        };
+        let mut batch = StoreBatch::default();
+        batch.block_index_puts.push((genesis_hash, genesis_entry));
+        batch.height_hash_puts.push((0, genesis_hash));
+        store.write_batch(batch).unwrap();
+
+        // Sanity: pre-conditions match what `clear_chainstate` leaves
+        // behind — tip cleared, block_index intact at (12, 34).
+        assert!(store.get_tip().is_none());
+        let pre = store.get_block_index(&genesis_hash).unwrap();
+        assert_eq!(pre.file_number, 12);
+        assert_eq!(pre.data_pos, 34);
+
+        let flat_files = FlatFileManager::new(&blocks_dir).unwrap();
+        let cs = ChainState::new(
+            store,
+            flat_files,
+            Network::Regtest,
+            Box::new(NoopVerifier),
+            AssumeValid::Disabled,
+            450,
+            4,
+            Default::default(),
+            Default::default(),
+        )
+        .unwrap();
+
+        // Tip is now at genesis (re-established by connect_block via
+        // the seeded entry).
+        assert_eq!(cs.tip_height(), 0);
+        assert_eq!(cs.tip_hash(), genesis_hash);
+
+        // The existing flat_pos survived — `ChainState::new` reused
+        // it instead of appending a fresh genesis at (0, 0).
+        let post = cs.get_block_index(&genesis_hash).unwrap();
+        assert_eq!(
+            post.file_number, 12,
+            "genesis flat_pos.file_number changed; chain init re-appended"
+        );
+        assert_eq!(
+            post.data_pos, 34,
+            "genesis flat_pos.data_pos changed; chain init re-appended"
+        );
+
+        // And no blk*.dat file was created in blocks_dir.
+        let blk_files: Vec<_> = std::fs::read_dir(&blocks_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("blk")
+            })
+            .collect();
+        assert!(
+            blk_files.is_empty(),
+            "blocks_dir should be empty; got {:?}",
+            blk_files
+                .iter()
+                .map(|e| e.file_name())
+                .collect::<Vec<_>>()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Both heartbeat counters start at zero and advance independently
     /// on bump. The stall watchdog relies on this to distinguish
     /// "connector idle but loop alive" (steady-state tip) from "loop
