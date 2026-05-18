@@ -331,13 +331,39 @@ impl ChainState {
                 });
             }
 
-        // Fresh node: store genesis block
+        // Fresh node: store genesis block.
+        //
+        // `-reindex-chainstate` drops `CF_METADATA` (which holds the tip
+        // pointer) but keeps `CF_BLOCK_INDEX` intact, so we land here on
+        // a non-fresh datadir. In that case genesis is already on disk
+        // at its original `(file_number, data_pos)` — reuse that
+        // position instead of appending a duplicate. Two reasons:
+        //   1. Avoids wasting ~285 bytes of flat-file slack on every
+        //      reindex-chainstate run.
+        //   2. The append outright fails when `blocks/` is read-only —
+        //      for example when a sibling node points its `blocks/`
+        //      symlink at a primary's `blocks/` directory whose files
+        //      are mode 644 satd:satd. Without this branch a validation
+        //      node sharing `blocks/` with a primary can never
+        //      `-reindex-chainstate`.
         tracing::info!("Initializing chain with genesis block");
 
-        let block_data = serialize(&genesis);
-        let flat_pos = flat_files
-            .write_block(&block_data, network_magic(network))
-            .map_err(|e| ChainError::FlatFile(e.to_string()))?;
+        let flat_pos = if let Some(entry) = store.get_block_index(&genesis_hash) {
+            tracing::info!(
+                file_number = entry.file_number,
+                data_pos = entry.data_pos,
+                "Genesis already in block_index; reusing flat-file position"
+            );
+            FlatFilePos {
+                file_number: entry.file_number,
+                data_pos: entry.data_pos,
+            }
+        } else {
+            let block_data = serialize(&genesis);
+            flat_files
+                .write_block(&block_data, network_magic(network))
+                .map_err(|e| ChainError::FlatFile(e.to_string()))?
+        };
 
         let parent_work = [0u8; 32];
         let noop = NoopVerifier; // Genesis has no scripts to verify
