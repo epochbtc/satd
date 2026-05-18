@@ -208,6 +208,32 @@ impl Store for InMemoryStore {
         self.coins.read().len() as u64
     }
 
+    fn for_each_coin_snapshot(
+        &self,
+        f: &mut dyn FnMut(&OutPoint, &Coin) -> Result<(), StoreError>,
+    ) -> Result<u64, StoreError> {
+        // For deterministic iteration order (matching Core's key sort),
+        // collect into a sorted vector before yielding. Tests use this
+        // backend so consistency with the RocksDB path matters.
+        let coins = self.coins.read();
+        let mut entries: Vec<(OutPoint, Coin)> = coins
+            .iter()
+            .map(|(op, c)| (*op, c.clone()))
+            .collect();
+        drop(coins);
+        entries.sort_by(|(a, _), (b, _)| {
+            let ak = crate::storage::coinview::outpoint_to_key(a);
+            let bk = crate::storage::coinview::outpoint_to_key(b);
+            ak.cmp(&bk)
+        });
+        let mut written = 0u64;
+        for (op, coin) in &entries {
+            f(op, coin)?;
+            written += 1;
+        }
+        Ok(written)
+    }
+
     fn coin_total_amount(&self) -> u64 {
         self.coins.read().values().map(|c| c.amount).sum()
     }

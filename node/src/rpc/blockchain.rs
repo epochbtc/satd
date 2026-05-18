@@ -707,6 +707,49 @@ pub fn save_mempool() -> Value {
     Value::Null
 }
 
+/// `dumptxoutset <path>` — emit a Bitcoin Core-compatible UTXO snapshot
+/// at the current tip. The file format is byte-compatible with
+/// `bitcoin-cli dumptxoutset` and can be loaded into either Core or
+/// satd via `loadtxoutset`.
+///
+/// Returns a JSON object matching Core's shape:
+///   `{coins_written, base_hash, base_height, path, txoutset_hash}`.
+///
+/// `txoutset_hash` is the SHA-256 of the file contents — operators
+/// compare this against Core's `m_assumeutxo_data.assumeutxo_hash`
+/// value to confirm format compatibility.
+pub fn dump_txout_set(chain_state: &ChainState, path: &str) -> Result<Value, (i32, String)> {
+    use crate::chain::state::DumpError;
+    use std::path::PathBuf;
+
+    let path_buf = PathBuf::from(path);
+    match chain_state.dump_utxo_snapshot(&path_buf) {
+        Ok(summary) => Ok(json!({
+            "coins_written": summary.coins_written,
+            "base_hash": summary.base_hash.to_string(),
+            "base_height": summary.base_height,
+            "path": summary.path.to_string_lossy(),
+            "txoutset_hash": hex::encode(summary.hash_serialized_3),
+        })),
+        Err(DumpError::RefuseOverwrite(p)) => Err((
+            -8,
+            format!(
+                "refusing to overwrite existing file: {}",
+                p.to_string_lossy()
+            ),
+        )),
+        Err(DumpError::Io(e)) => Err((-1, format!("io error writing snapshot: {e}"))),
+        Err(DumpError::Store(e)) => Err((-1, format!("storage error during snapshot: {e}"))),
+        Err(DumpError::CountMismatch { expected, actual }) => Err((
+            -1,
+            format!(
+                "snapshot wrote {actual} coins but UTXO count was {expected} \
+                 (concurrent modification or storage corruption)"
+            ),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
