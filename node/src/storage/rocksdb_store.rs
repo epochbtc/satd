@@ -111,6 +111,17 @@ const CURRENT_SCHEMA_VERSION: u32 = 3;
 /// installs never create these.
 const LEGACY_ADDR_CF_NAMES: &[&str] = &["addr_funding", "addr_spending"];
 
+/// Outcome of a v2 → v3 compatibility probe. See `probe_v3_compat`.
+#[derive(Debug)]
+enum V3CompatProbe {
+    /// No v0 undo rows, legacy address CFs empty. Safe to restamp v2 → v3.
+    Compatible,
+    /// At least one undo row lacks the v1 magic prefix.
+    HasLegacyUndo,
+    /// The named legacy address-index CF has at least one row.
+    HasLegacyAddrRows(&'static str),
+}
+
 pub(crate) fn hash_bytes(hash: &BlockHash) -> &[u8] {
     hash.as_ref()
 }
@@ -406,7 +417,43 @@ impl RocksDbStore {
             match db.get_cf(&cf_meta, SCHEMA_KEY) {
                 Ok(Some(v)) => {
                     let stored = u32::from_le_bytes(v[..].try_into().unwrap_or([0; 4]));
-                    if stored != CURRENT_SCHEMA_VERSION {
+                    if stored == CURRENT_SCHEMA_VERSION {
+                        // Already at current version.
+                    } else if stored == 2 {
+                        // v2 → v3 in-place upgrade. v3 differs from v2
+                        // only in what's *removed*: legacy v0 undo
+                        // dual-read and the `addr_funding` /
+                        // `addr_spending` CFs. If the chainstate ran
+                        // both prior offline migrators it's already in
+                        // a v3-compatible shape, so probe for the
+                        // incompatible artifacts; restamp if clean,
+                        // refuse if not.
+                        match Self::probe_v3_compat(&db)? {
+                            V3CompatProbe::Compatible => {
+                                Self::stamp_schema(&db, CURRENT_SCHEMA_VERSION)?;
+                                tracing::info!(
+                                    target: "storage",
+                                    "Schema marker upgraded v2 -> v3 in place; chainstate \
+                                     was already in the post-cleanup shape."
+                                );
+                            }
+                            V3CompatProbe::HasLegacyUndo => {
+                                return Err(StoreError::Database(
+                                    "Chainstate has pre-cleanup undo rows (no v1 magic). \
+                                     Run with --reindex-chainstate to rebuild from \
+                                     existing block files.".to_string(),
+                                ));
+                            }
+                            V3CompatProbe::HasLegacyAddrRows(cf) => {
+                                return Err(StoreError::Database(format!(
+                                    "Chainstate has non-empty legacy address-index CF \
+                                     '{}'. Run with --reindex-chainstate to rebuild from \
+                                     existing block files.",
+                                    cf
+                                )));
+                            }
+                        }
+                    } else {
                         return Err(StoreError::Database(format!(
                             "Chainstate schema version mismatch: DB has v{}, binary expects v{}. \
                              Run with --reindex-chainstate to rebuild from existing block files.",
@@ -843,6 +890,36 @@ impl RocksDbStore {
         wb.put_cf(&cf_meta, SCHEMA_KEY, version.to_le_bytes());
         db.write(wb)
             .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// Decide whether a chainstate stamped at schema v2 is structurally
+    /// already in the v3 shape (because the prior offline migrators
+    /// ran). v3 differs from v2 by removing the v0 undo dual-read and
+    /// the legacy `addr_funding` / `addr_spending` CFs, so the probe
+    /// just confirms neither artifact is present. Pure-read: no
+    /// writes, no side effects, so it's safe to call before deciding
+    /// whether to restamp or refuse.
+    ///
+    /// The undo scan reads only the first 8 bytes of each row's value
+    /// (the magic check) and short-circuits on the first non-v1 row.
+    fn probe_v3_compat(db: &DB) -> Result<V3CompatProbe, StoreError> {
+        if let Some(cf_undo) = db.cf_handle(CF_UNDO) {
+            for item in db.iterator_cf(&cf_undo, IteratorMode::Start) {
+                let (_, v) = item.map_err(|e| StoreError::Database(e.to_string()))?;
+                let magic = crate::storage::undo::V1_MAGIC;
+                if v.len() < magic.len() || v[..magic.len()] != magic {
+                    return Ok(V3CompatProbe::HasLegacyUndo);
+                }
+            }
+        }
+        for legacy in LEGACY_ADDR_CF_NAMES {
+            if let Some(cf) = db.cf_handle(legacy)
+                && db.iterator_cf(&cf, IteratorMode::Start).next().is_some()
+            {
+                return Ok(V3CompatProbe::HasLegacyAddrRows(legacy));
+            }
+        }
+        Ok(V3CompatProbe::Compatible)
     }
 
     /// Query a per-CF integer property across every CF this binary
@@ -3296,6 +3373,14 @@ mod tests {
         schema_version: u32,
         legacy_rows: bool,
     ) -> (std::path::PathBuf, tempfile::TempDir) {
+        synth_prior_datadir_with(schema_version, legacy_rows, false)
+    }
+
+    fn synth_prior_datadir_with(
+        schema_version: u32,
+        legacy_rows: bool,
+        v0_undo_row: bool,
+    ) -> (std::path::PathBuf, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let datadir = dir.path().to_path_buf();
         let path = datadir.join("chainstate");
@@ -3307,6 +3392,7 @@ mod tests {
         let cfs = vec![
             ColumnFamilyDescriptor::new(CF_METADATA, Options::default()),
             ColumnFamilyDescriptor::new(CF_COINS, Options::default()),
+            ColumnFamilyDescriptor::new(CF_UNDO, Options::default()),
             ColumnFamilyDescriptor::new("addr_funding", Options::default()),
             ColumnFamilyDescriptor::new("addr_spending", Options::default()),
         ];
@@ -3318,8 +3404,31 @@ mod tests {
             db.put_cf(&af, b"row", b"junk").unwrap();
             db.put_cf(&as_, b"row", b"junk").unwrap();
         }
+        if v0_undo_row {
+            // Bytes that DON'T start with V1_MAGIC — simulates a row
+            // written by the pre-cleanup bincode-format undo path.
+            let cf_undo = db.cf_handle(CF_UNDO).unwrap();
+            db.put_cf(&cf_undo, b"hash", [0x01u8, 0, 0, 0, 0, 0, 0, 0])
+                .unwrap();
+        }
         drop(db);
         (datadir, dir)
+    }
+
+    /// Read the persisted schema marker without going through
+    /// `RocksDbStore::open` (which would refuse on mismatch).
+    fn read_schema_version_raw(datadir: &std::path::Path) -> Option<u32> {
+        let path = datadir.join("chainstate");
+        let opts = Options::default();
+        let existing = DB::list_cf(&opts, &path).unwrap_or_default();
+        let cfs: Vec<_> = existing
+            .into_iter()
+            .map(|n| ColumnFamilyDescriptor::new(n, Options::default()))
+            .collect();
+        let db = DB::open_cf_descriptors(&opts, &path, cfs).unwrap();
+        let cf_meta = db.cf_handle(CF_METADATA)?;
+        let raw = db.get_cf(&cf_meta, SCHEMA_KEY).ok()??;
+        Some(u32::from_le_bytes(raw[..].try_into().ok()?))
     }
 
     #[test]
@@ -3345,22 +3454,23 @@ mod tests {
     }
 
     #[test]
-    fn open_with_stale_schema_refuses_with_reindex_hint() {
-        // Chainstate stamped at the previous schema (v2). Open without
-        // reindex must refuse with a message pointing to
+    fn open_at_v2_with_legacy_addr_rows_refuses() {
+        // v2 chainstate with non-empty legacy address-index CFs (i.e.,
+        // the prior `--migrate-addr-index` was never run). The v2→v3
+        // probe must catch this and refuse with a message pointing to
         // --reindex-chainstate — recovery must be reachable, not
         // require manual filesystem surgery.
-        let (path, _dir) = synth_prior_datadir(CURRENT_SCHEMA_VERSION - 1, true);
+        let (path, _dir) = synth_prior_datadir(2, true);
         let err = RocksDbStore::open(&path, false, 16, false, -1)
             .err()
-            .expect("open should refuse a stale-schema chainstate");
+            .expect("open should refuse a v2 chainstate with legacy addr rows");
         let msg = match err {
             StoreError::Database(s) => s,
             other => panic!("expected Database error, got {:?}", other),
         };
         assert!(
-            msg.contains("schema version mismatch"),
-            "error should mention schema mismatch: {}",
+            msg.contains("legacy address-index CF"),
+            "error should name the legacy CF: {}",
             msg
         );
         assert!(
@@ -3368,6 +3478,53 @@ mod tests {
             "error should mention the recovery flag: {}",
             msg
         );
+    }
+
+    #[test]
+    fn open_at_v2_with_v0_undo_refuses() {
+        // v2 chainstate carrying a pre-cleanup undo row (no v1 magic).
+        // Probe must catch it before serving traffic; opening anyway
+        // would surface later as generic "missing undo" during reorg
+        // or filter backfill.
+        let (path, _dir) = synth_prior_datadir_with(2, false, true);
+        let err = RocksDbStore::open(&path, false, 16, false, -1)
+            .err()
+            .expect("open should refuse a v2 chainstate with pre-cleanup undo");
+        let msg = match err {
+            StoreError::Database(s) => s,
+            other => panic!("expected Database error, got {:?}", other),
+        };
+        assert!(
+            msg.contains("pre-cleanup undo"),
+            "error should mention the undo format break: {}",
+            msg
+        );
+        assert!(
+            msg.contains("--reindex-chainstate"),
+            "error should mention the recovery flag: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn open_at_v2_with_clean_chainstate_autoupgrades_to_v3() {
+        // v2 chainstate where both prior migrators successfully ran:
+        // legacy address CFs are empty, undo has no pre-cleanup rows.
+        // Open must succeed without reindex AND must persist the v3
+        // marker so subsequent opens skip the probe.
+        let (path, _dir) = synth_prior_datadir(2, false);
+        let store = RocksDbStore::open(&path, false, 16, false, -1)
+            .expect("v2 chainstate with no incompatible artifacts should auto-upgrade");
+        drop(store);
+        assert_eq!(
+            read_schema_version_raw(&path),
+            Some(CURRENT_SCHEMA_VERSION),
+            "auto-upgrade must persist the v3 marker"
+        );
+        // Reopen using the normal path — no probe, no auto-upgrade
+        // needed, must just succeed.
+        let _ = RocksDbStore::open(&path, false, 16, false, -1)
+            .expect("reopen of an auto-upgraded chainstate should be a plain v3 open");
     }
 
     #[test]
