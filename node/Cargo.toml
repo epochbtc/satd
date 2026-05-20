@@ -44,7 +44,12 @@ default = ["block-filter-index"]
 # compiled in.
 block-filter-index = []
 
-[target.'cfg(target_os = "linux")'.dependencies]
+# `libc` is used by stall_watchdog.rs for raw signal raise (POSIX
+# sd_notify is irrelevant — this is the libc::raise SIGTERM path).
+# Available on all Unix targets (Linux, macOS, BSD). Previously gated
+# to Linux only; that left the macOS aarch64 release build failing on
+# unresolved `libc` lookups even though the underlying API is POSIX.
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]
