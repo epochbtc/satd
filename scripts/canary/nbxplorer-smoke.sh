@@ -32,6 +32,13 @@ NBX_DATADIR="$(mktemp -d -t satd-canary-nbxplorer.XXXXXX)"
 RPCUSER="canary"
 RPCPASSWORD="$(head -c 16 /dev/urandom | xxd -p)"
 
+# Export for boot-satd.sh's sat_cli helper. Without these, sat-cli
+# falls back to cookie discovery from $SATD_DATADIR — but satd does
+# not write a cookie when rpcuser/rpcpassword are configured, so the
+# readiness probe would hang the full 60s budget on 401.
+export SATD_RPCUSER="$RPCUSER"
+export SATD_RPCPASSWORD="$RPCPASSWORD"
+
 # satd's RPC binds to 127.0.0.1 by default and has no --rpcbind /
 # --rpcallowip CLI flags today (a Core-compat gap to be filed as a
 # separate follow-up). The workaround for the canary is to run the

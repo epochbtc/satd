@@ -82,7 +82,12 @@ boot_satd() {
     return 1
 }
 
-# sat-cli wrapper that uses the cookie file from $SATD_DATADIR.
+# sat-cli wrapper that authenticates via either cookie (default) or
+# basic auth when SATD_RPCUSER / SATD_RPCPASSWORD are exported by the
+# caller. Cookie auth is auto-discovered from --datadir; basic auth
+# requires the explicit --rpcuser / --rpcpassword pair, otherwise sat-
+# cli won't find a cookie (satd doesn't write one when basic-auth
+# creds are configured) and every call fails with 401.
 sat_cli() {
     local satd_bin_dir
     if [[ -x "target/release/sat-cli" ]]; then
@@ -90,10 +95,18 @@ sat_cli() {
     else
         satd_bin_dir="target/debug"
     fi
+    local auth_args=()
+    if [[ -n "${SATD_RPCUSER:-}" ]] && [[ -n "${SATD_RPCPASSWORD:-}" ]]; then
+        auth_args=(
+            --rpcuser="$SATD_RPCUSER"
+            --rpcpassword="$SATD_RPCPASSWORD"
+        )
+    fi
     "$satd_bin_dir/sat-cli" \
         --regtest \
         --datadir="$SATD_DATADIR" \
         --rpcport="$RPC_PORT" \
+        "${auth_args[@]}" \
         "$@"
 }
 
