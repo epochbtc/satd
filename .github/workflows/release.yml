@@ -10,8 +10,13 @@
 #   - workflow_dispatch → same as PR-trigger; useful for one-off matrix
 #                         smoke runs after toolchain bumps
 #
-# What's intentionally NOT here yet:
-#   - musl tarball targets — landing in a follow-up PR via cross-rs
+# musl tarballs run on the amd64 Linux runner via cross-rs (the build
+# happens inside a Docker container with a target-specific toolchain
+# pre-built, including a musl-compatible libstdc++ — managing musl-gcc
+# + libstdc++ ourselves is well-known fragile, especially for the
+# rocksdb-sys C++ build). aarch64-musl reuses the amd64 host because
+# cross handles the architecture switch inside the container, so we
+# don't need the ubuntu-24.04-arm runner.
 #
 # The supply-chain-gate job below runs cargo-deny against the workspace
 # graph as a hard precondition for every release artifact. If a RustSec
@@ -180,6 +185,17 @@ jobs:
           # from an arm64 darwin host.
           - target: aarch64-apple-darwin
             os: macos-14
+          # musl: built via cross-rs inside a Docker container on the
+          # amd64 Linux host. cross handles musl-gcc + libstdc++ + the
+          # aarch64 toolchain in its image; the host only needs Docker
+          # (hosted ubuntu provides it). See the file-header comment
+          # for the rationale.
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-24.04
+            use_cross: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04
+            use_cross: true
 
     permissions:
       contents: read
@@ -193,8 +209,12 @@ jobs:
       # cmake binaries but NOT libclang-dev — install explicitly.
       # libssl-dev is needed by the openssl-sys path in reqwest's
       # native-tls backend.
+      #
+      # Skipped for cross targets — the cross-rs Docker image carries
+      # its own toolchain, so installing apt packages on the host is
+      # wasted setup time.
       - name: Install Linux build deps
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && matrix.use_cross != true
         run: |
           set -euo pipefail
           sudo apt-get update
@@ -229,6 +249,17 @@ jobs:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: ${{ matrix.target }}
 
+      # Pinned cross-rs. Pre-built binary install (~5s) instead of
+      # `cargo install` (1-2 min). Keep the version pin in sync with
+      # the cross image tags hosted on ghcr.io/cross-rs/* — bumping
+      # cross without checking image availability for the target tag
+      # will fail the next build.
+      - name: Install cross-rs
+        if: matrix.use_cross == true
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross@0.2.5
+
       - name: Cache Cargo registry + git
         uses: actions/cache@v4
         with:
@@ -246,9 +277,17 @@ jobs:
           key: ${{ runner.os }}-${{ matrix.target }}-target-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-${{ matrix.target }}-target-
 
-      - name: Build release binaries
+      - name: Build release binaries (cargo)
+        if: matrix.use_cross != true
         run: |
           cargo build --release --locked \
+            --bin satd --bin sat-cli \
+            --target ${{ matrix.target }}
+
+      - name: Build release binaries (cross)
+        if: matrix.use_cross == true
+        run: |
+          cross build --release --locked \
             --bin satd --bin sat-cli \
             --target ${{ matrix.target }}
 
