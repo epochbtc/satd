@@ -44,7 +44,13 @@ permissions:
   contents: read
 
 env:
-  RUST_TOOLCHAIN: '1.93'
+  # Must exactly match rust-toolchain.toml's `channel`. Bare `1.93`
+  # resolves to the latest patch (e.g. `1.93.1`), so dtolnay/rust-
+  # toolchain installs that, but the workspace then uses
+  # `rust-toolchain.toml`'s pin (`1.93.0`) for the actual compile —
+  # any installed components/targets land on the wrong toolchain.
+  # Same drift class as the one fixed in release.yml on PR #203.
+  RUST_TOOLCHAIN: '1.93.0'
 
 jobs:
 
