@@ -111,15 +111,15 @@ Canaries gate every PR merge (not just release candidates) and boot real downstr
 
 - **Esplora wire-shape canary** (`scripts/canary/esplora-smoke.sh`) — raw `curl` + `jq` against documented endpoints (`/blocks/tip/{height,hash}`, `/block/:hash`, `/address/:addr/{utxo,txs}`, `/tx/:txid/{,/hex,/outspends}`, `/mempool`, `/fee-estimates`). Catches wire-format breaks at a layer below the Rust `esplora-client` crate.
 - **Electrum wire-shape canary** (`scripts/canary/electrum-smoke.sh`) — raw `nc` line-delimited JSON-RPC against `server.version`, `server.banner`, `blockchain.headers.subscribe`, `blockchain.estimatefee`, `blockchain.relayfee`. Catches wire-format breaks at a layer below the Rust `electrum-client` crate.
-- **NBXplorer integration canary** (`scripts/canary/nbxplorer-smoke.sh`) — runs the real `nicolasdorier/nbxplorer:<pin>` Docker container against a satd regtest backend; verifies it reaches `IsFullySynched: true` and tracks newly mined blocks. The third-party downstream canary; green here is a strong signal that BTCPayServer sits cleanly on top.
 - **In-tree Electrum + Esplora protocol suite** (`satd/tests/e2e.rs`, PR-gated via `ci.yml`) — drives satd via the Rust `electrum-client` crate (same library BDK consumes) and `reqwest` for Esplora. Deeper protocol coverage than the wire-shape canaries above, complementary to them.
 
-The canaries above run on `.github/workflows/canary.yml`, triggered on `pull_request`, weekly cron, and `workflow_dispatch`. They are marked as required status checks on the `master` branch protection.
+The wire-shape canaries above run on `.github/workflows/canary.yml`, triggered on `pull_request`, weekly cron, and `workflow_dispatch`. They are marked as required status checks on the `master` branch protection.
 
 ### Deferred
 
 Listed for traceability; each will enter PR-gating on the same terms when its prerequisites are met:
 
+- **NBXplorer integration canary** (`scripts/canary/nbxplorer-smoke.sh`) — runs the real `nicolasdorier/nbxplorer:<pin>` Docker container (with a Postgres sidecar, required by NBXplorer 2.5+) against a satd regtest backend. Postgres + container plumbing is wired up and works; the open issue is a P2P version-handshake interop with NBitcoin (NBXplorer's underlying lib) that surfaces as `node is not in a connected state` after TCP connect — needs deeper investigation. Job definition is commented out in `canary.yml`; the script in `scripts/canary/nbxplorer-smoke.sh` is left in-tree so the follow-up PR is small.
 - **BTCPayServer**: boot `btcpayserver/btcpayserver` with satd as the Bitcoin backend; verify `/api/v1/server/info` responds healthy. Deferred because the BTCPay stack is a multi-container docker-compose (Postgres + NBXplorer + BTCPay + optional Tor) — a follow-up PR will compose this on top of the NBXplorer canary infrastructure.
 - **Umbrel app**: install the satd Umbrel app on an Umbrel dev image; verify the dashboard reports the node as healthy. Blocked on shipping the satd Umbrel app first (`ECOSYSTEM.md` §6.6).
 
