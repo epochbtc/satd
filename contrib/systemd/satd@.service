@@ -12,11 +12,16 @@
 # instance EnvironmentFile is `/etc/default/satd@<network>` (falls back
 # to `/etc/default/satd` if absent).
 #
-# Network flag is inferred from the instance name. Supported values are
-# `mainnet` (no flag), `signet`, `testnet`, `testnet4`, `regtest`. Any
-# other value is treated as mainnet — no fail-fast, because operators
-# might want a `bench-mainnet` instance pointing at a custom data dir.
-# To be explicit, set SATD_NETWORK in the per-instance EnvironmentFile.
+# Network flag selection:
+#   1. If SATD_NETWORK is set in the per-instance EnvironmentFile,
+#      that wins. Use this for custom instance names (e.g. a
+#      `satd@bench` instance pointing at mainnet, set
+#      `SATD_NETWORK=mainnet` in /etc/default/satd@bench).
+#   2. Otherwise, the instance name `%i` is used as the network.
+# In either case the network value must be one of `mainnet`, `signet`,
+# `testnet`, `testnet3`, `testnet4`, `regtest`. Unknown values fail
+# fast at start — silently defaulting a typo (`satd@singet`) to
+# mainnet would be operationally dangerous.
 #
 # Mutual exclusion with the non-instance `satd.service`: the template
 # uses `/var/lib/satd/%i` (default `/var/lib/satd/mainnet`), so a host
@@ -50,19 +55,19 @@ Environment=SATD_OPTS=
 EnvironmentFile=-/etc/default/satd
 EnvironmentFile=-/etc/default/satd@%i
 
-# Pick the network flag from the instance name. mainnet stays unflagged
-# (Core convention). Anything not in the enumerated list also stays
-# unflagged — operators using a custom instance name should set
-# --signet / --testnet etc. in SATD_OPTS or the per-instance
-# EnvironmentFile.
+# Pick the network flag. SATD_NETWORK wins; otherwise fall back to
+# the instance name. Mainnet stays unflagged (Core convention). An
+# unknown value (e.g. typo) refuses to start instead of silently
+# falling back to mainnet — much safer for production hosts.
 ExecStart=/bin/sh -c '\
-  case "%i" in \
+  net="${SATD_NETWORK:-%i}"; \
+  case "$net" in \
     mainnet)                 net_flag="" ;; \
     signet)                  net_flag="--signet" ;; \
     testnet|testnet3)        net_flag="--testnet" ;; \
     testnet4)                net_flag="--testnet4" ;; \
     regtest)                 net_flag="--regtest" ;; \
-    *)                       net_flag="" ;; \
+    *) echo "satd@%i: refusing to start: unknown network \"$net\". Set SATD_NETWORK to one of mainnet,signet,testnet,testnet4,regtest in /etc/default/satd@%i, or rename the instance to a recognized network." >&2; exit 64 ;; \
   esac; \
   exec /usr/local/bin/satd --datadir="${SATD_DATADIR}" $net_flag $SATD_OPTS \
 '
@@ -74,20 +79,21 @@ ExecStop=/bin/kill -SIGTERM $MAINPID
 # instead).
 ExecStartPost=-/bin/chmod 0640 ${SATD_DATADIR}/.cookie
 
-# Reindex can run for hours; the EXTEND_TIMEOUT_USEC heartbeats inside
-# satd reset this every 30s during the pre-bind phase. `infinity`
-# removes the static budget that would otherwise kill us during
-# `--reindex-chainstate`.
-TimeoutStartSec=infinity
+# Finite startup budget + EXTEND_TIMEOUT_USEC heartbeat from satd
+# every 30s. Without a finite budget here, the heartbeat is a no-op
+# for startup liveness and a wedged pre-ready process can hang
+# forever. See contrib/systemd/satd.service for the full rationale.
+TimeoutStartSec=3min
 
 TimeoutStopSec=10min
 KillSignal=SIGTERM
 SendSIGKILL=yes
 
 # Same watchdog semantics as the non-instance unit — satd's post-ready
-# watchdog task pings WATCHDOG=1 every 30s when its subsystem probes
-# report healthy. See contrib/systemd/satd.service for the rationale.
-WatchdogSec=60s
+# watchdog task pings WATCHDOG=1 every 60s when its subsystem probes
+# report healthy. See contrib/systemd/satd.service for the rationale,
+# including the operator drop-in override pattern.
+WatchdogSec=120s
 
 # Same Restart=always rationale as the non-instance unit. The in-
 # process stall watchdog escalates a wedge by raising SIGTERM, which

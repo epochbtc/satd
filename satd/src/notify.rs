@@ -8,11 +8,18 @@
 //!
 //! systemd's default `TimeoutStartSec=90s` will SIGKILL a `Type=notify` unit
 //! that hasn't sent `READY=1` within the budget. Reindex on a fully-synced
-//! mainnet node runs for hours. Static `TimeoutStartSec=infinity` is the
-//! crude fix; the right fix is `EXTEND_TIMEOUT_USEC=N` heartbeats: each
-//! message tells systemd "we're alive, give us another N microseconds." The
-//! heartbeat IS the liveness check — if satd goes silent for >N usec, the
-//! unit gets killed (correctly, since it's stuck).
+//! mainnet node runs for hours. The naive workaround is to set
+//! `TimeoutStartSec=infinity`, but that throws out the liveness check —
+//! a startup wedge has no deadline.
+//!
+//! The right fix is a FINITE `TimeoutStartSec=` plus `EXTEND_TIMEOUT_USEC=N`
+//! heartbeats: each heartbeat tells systemd "we're alive, give us another
+//! N microseconds." So long as the heartbeats keep coming, the deadline
+//! keeps getting pushed out; if satd goes silent for >N usec, the unit
+//! gets killed (correctly, since it's stuck). The shipped unit pairs
+//! `TimeoutStartSec=3min` (initial budget) with `EXTEND_TIMEOUT_USEC=120s`
+//! on every 30s heartbeat — a wedge gets killed within ~2 minutes, an
+//! actively-progressing reindex runs as long as it needs to.
 //!
 //! See `man 5 systemd.service` and `man 3 sd_notify`.
 //!
