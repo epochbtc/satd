@@ -1,0 +1,226 @@
+# Compatibility canary CI — runs real downstream tools against satd
+# on every PR to catch wire-format / protocol breaks before they ship.
+# Gated as required-status-checks on PR merge.
+#
+# These canaries complement the in-tree e2e suite at `satd/tests/e2e.rs`
+# (which already drives satd via `electrum-client` and reqwest from the
+# same protocols downstream wallets consume). The canaries here go one
+# layer further: they exercise the same wire formats from *outside*
+# Rust — raw HTTP + `nc` + a real third-party Docker container —
+# catching the failure mode where the in-tree clients incidentally
+# tolerate something a real downstream wouldn't.
+#
+# Triggers:
+#   - pull_request → PR-gating (required status check)
+#   - schedule weekly → defence in depth against environmental drift
+#   - workflow_dispatch → manual rerun without pushing a commit
+#
+# Triage policy lives in STABILITY_POLICY.md. The short version:
+# canary failure → diagnose. If our regression: fix or revert. If a
+# downstream upgrade broke: pin downstream to last-known-good in the
+# canary, file a tracking issue. Infrastructure flake (network blip,
+# registry 5xx): rerun once. NEVER mark a canary advisory-only as a
+# flake response.
+
+name: Canary
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  schedule:
+    # Mondays 06:00 UTC. Weekly cadence is enough to surface
+    # environmental drift between PRs (downstream image tags moving,
+    # upstream regression in a pinned dep) without burning quota.
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+# Cancel superseded PR runs — the same posture as ci.yml. Doesn't
+# apply to scheduled / dispatched runs (each is its own ref).
+concurrency:
+  group: canary-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  RUST_TOOLCHAIN: '1.93'
+
+jobs:
+
+  # Shared satd build. Each canary downloads the same release-mode
+  # binary, so we pay the ~3-5min RocksDB + jemalloc compile cost
+  # once per workflow run, not 3×.
+  build:
+    name: build satd (release)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        # Hosted ubuntu-24.04 ships ~30 GB of pre-installed SDKs we
+        # don't use. Reclaim before the release build mid-links.
+        run: |
+          set -euo pipefail
+          df -h /
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+
+      - name: Install Linux build deps
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang cmake libclang-dev libssl-dev pkg-config
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Cache Cargo registry + git
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ runner.os }}-canary-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-canary-cargo-
+
+      - name: Cache target directory
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-canary-target-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-canary-target-
+
+      - name: Build satd + sat-cli (release)
+        run: cargo build --release --locked --bin satd --bin sat-cli
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: satd-canary-binaries
+          path: |
+            target/release/satd
+            target/release/sat-cli
+          if-no-files-found: error
+          retention-days: 1
+
+  # Esplora canary — raw HTTP + jq against the documented endpoints.
+  # Verifies wire-shape parity at the bytes/JSON level, independent
+  # of any Rust client library.
+  canary-esplora:
+    name: canary / Esplora
+    needs: [build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download satd binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: satd-canary-binaries
+          path: target/release/
+
+      - name: Mark binaries executable
+        run: chmod +x target/release/satd target/release/sat-cli
+
+      - name: Run Esplora canary
+        run: bash scripts/canary/esplora-smoke.sh
+
+      - name: Upload satd log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: esplora-canary-logs
+          path: /tmp/satd-canary-esplora.*/satd.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # Electrum protocol canary — line-delimited JSON-RPC over TCP via
+  # raw `nc`. Catches wire-format breaks at a level below the Rust
+  # `electrum-client` crate (which the in-tree e2e suite already
+  # exercises).
+  canary-electrum:
+    name: canary / Electrum
+    needs: [build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install netcat (BSD variant — supports -q)
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends netcat-openbsd
+
+      - name: Download satd binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: satd-canary-binaries
+          path: target/release/
+
+      - name: Mark binaries executable
+        run: chmod +x target/release/satd target/release/sat-cli
+
+      - name: Run Electrum canary
+        run: bash scripts/canary/electrum-smoke.sh
+
+      - name: Upload satd log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: electrum-canary-logs
+          path: /tmp/satd-canary-electrum.*/satd.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # NBXplorer canary — runs the actual NBXplorer Docker container
+  # against satd. This is the canary that catches third-party
+  # downstream regressions; the other two test the protocol surface
+  # against our shell-level expectations.
+  canary-nbxplorer:
+    name: canary / NBXplorer
+    needs: [build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download satd binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: satd-canary-binaries
+          path: target/release/
+
+      - name: Mark binaries executable
+        run: chmod +x target/release/satd target/release/sat-cli
+
+      - name: Run NBXplorer canary
+        run: bash scripts/canary/nbxplorer-smoke.sh
+
+      - name: Upload satd log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nbxplorer-canary-logs
+          path: /tmp/satd-canary-nbxplorer.*/satd.log
+          if-no-files-found: ignore
+          retention-days: 7
