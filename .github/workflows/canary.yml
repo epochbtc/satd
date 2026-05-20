@@ -1,14 +1,22 @@
-# Compatibility canary CI — runs real downstream tools against satd
-# on every PR to catch wire-format / protocol breaks before they ship.
-# Gated as required-status-checks on PR merge.
+# Compatibility canary CI — drives satd's downstream-facing protocols
+# from outside the Rust ecosystem to catch wire-format / protocol
+# breaks before they ship. Gated as required-status-checks on PR merge.
 #
 # These canaries complement the in-tree e2e suite at `satd/tests/e2e.rs`
 # (which already drives satd via `electrum-client` and reqwest from the
 # same protocols downstream wallets consume). The canaries here go one
 # layer further: they exercise the same wire formats from *outside*
-# Rust — raw HTTP + `nc` + a real third-party Docker container —
-# catching the failure mode where the in-tree clients incidentally
-# tolerate something a real downstream wouldn't.
+# Rust — raw HTTP + `nc` against satd's Esplora and Electrum surfaces
+# — catching the failure mode where the in-tree clients incidentally
+# tolerate something a stricter consumer wouldn't.
+#
+# Currently active: Esplora (HTTP) + Electrum (TCP). The NBXplorer
+# canary script ships in-tree (`scripts/canary/nbxplorer-smoke.sh`)
+# but the workflow job is intentionally commented out pending a P2P
+# version-handshake interop fix — see STABILITY_POLICY.md and the
+# commented block further down. The active canaries are wire-shape
+# gates, not full third-party-container coverage; don't over-interpret
+# green here as a full downstream-compatibility seal.
 #
 # Triggers:
 #   - pull_request → PR-gating (required status check)
