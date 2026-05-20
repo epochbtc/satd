@@ -26,6 +26,15 @@ NBXPLORER_IMAGE="nicolasdorier/nbxplorer:2.5.21"
 NBXPLORER_CONTAINER="satd-canary-nbxplorer-$$"
 NBXPLORER_PORT=18204
 
+# NBXplorer 2.5+ requires PostgreSQL (the SQLite mode was removed
+# upstream). We boot a throwaway postgres alongside the NBXplorer
+# container; both share the host's network namespace so they reach
+# each other via 127.0.0.1.
+POSTGRES_IMAGE="postgres:16-alpine"
+POSTGRES_CONTAINER="satd-canary-nbxplorer-pg-$$"
+POSTGRES_PORT=18205
+POSTGRES_PASSWORD="$(head -c 16 /dev/urandom | xxd -p)"
+
 # NBXplorer authenticates with rpcuser/rpcpassword (cookie auth would
 # require shared filesystem access).
 NBX_DATADIR="$(mktemp -d -t satd-canary-nbxplorer.XXXXXX)"
@@ -52,35 +61,68 @@ boot_satd "$NBX_DATADIR" 18300 \
     --txindex \
     --server
 
-# Cleanup of NBXplorer container too — boot-satd.sh's EXIT trap only
-# stops satd. Compose a combined trap.
-cleanup_nbxplorer() {
+# Cleanup of Postgres + NBXplorer containers — boot-satd.sh's EXIT
+# trap only stops satd. Compose a combined trap.
+cleanup_containers() {
     docker rm -f "$NBXPLORER_CONTAINER" >/dev/null 2>&1 || true
+    docker rm -f "$POSTGRES_CONTAINER" >/dev/null 2>&1 || true
 }
-trap 'cleanup_nbxplorer; stop_satd' EXIT
+trap 'cleanup_containers; stop_satd' EXIT
 
-# Pull the image with 3 retries (network flake mitigation per the
-# canary-gating posture in STABILITY_POLICY.md).
-for attempt in 1 2 3; do
-    if docker pull "$NBXPLORER_IMAGE"; then
+# Helper: docker-pull with 3 retries.
+pull_with_retries() {
+    local image="$1"
+    for attempt in 1 2 3; do
+        if docker pull "$image"; then
+            return 0
+        fi
+        if [[ $attempt -eq 3 ]]; then
+            echo "docker pull $image failed 3 times" >&2
+            return 1
+        fi
+        echo "docker pull $image attempt $attempt failed; retrying in ${attempt}s..."
+        sleep $((attempt * 2))
+    done
+}
+
+pull_with_retries "$POSTGRES_IMAGE"
+pull_with_retries "$NBXPLORER_IMAGE"
+
+# Boot Postgres. NBXplorer connects over TCP rather than via the
+# socket since --network=host means all containers share the host
+# loopback. Use a non-default port (18205) so we don't fight with a
+# real postgres install on a dev machine.
+docker run -d \
+    --name "$POSTGRES_CONTAINER" \
+    --network=host \
+    -e "POSTGRES_PASSWORD=$POSTGRES_PASSWORD" \
+    -e "POSTGRES_DB=nbxplorer" \
+    -e "PGPORT=$POSTGRES_PORT" \
+    "$POSTGRES_IMAGE"
+
+# Wait for Postgres to accept connections. Alpine postgres takes
+# ~5-10s cold to initdb. Use docker exec rather than pg_isready on
+# the host because the host runner may not have a postgres client.
+echo "Waiting for Postgres to accept connections..."
+pg_deadline=$(($(date +%s) + 60))
+while [[ $(date +%s) -lt $pg_deadline ]]; do
+    if docker exec "$POSTGRES_CONTAINER" pg_isready -h 127.0.0.1 -p "$POSTGRES_PORT" >/dev/null 2>&1; then
+        echo "Postgres is ready."
         break
     fi
-    if [[ $attempt -eq 3 ]]; then
-        echo "nbxplorer: docker pull failed 3 times" >&2
+    if ! docker ps --format '{{.Names}}' | grep -q "^$POSTGRES_CONTAINER\$"; then
+        echo "postgres: container exited unexpectedly" >&2
+        docker logs "$POSTGRES_CONTAINER" 2>&1 | tail -30 >&2 || true
         exit 1
     fi
-    echo "nbxplorer: docker pull attempt $attempt failed; retrying in ${attempt}s..."
-    sleep $((attempt * 2))
+    sleep 2
 done
 
-# Run NBXplorer on the host's network namespace so it can reach satd
-# at 127.0.0.1. NBXplorer's regtest support uses
-# `NBXPLORER_NETWORK=regtest` + Bitcoin RPC connection settings; with
-# --network=host the container's API listens on $NBXPLORER_PORT
-# directly on the host (no -p mapping needed).
+# Run NBXplorer on the host's network namespace so it can reach
+# satd at 127.0.0.1 and Postgres at 127.0.0.1:$POSTGRES_PORT.
 # `NBXPLORER_NOAUTH=1` disables NBXplorer's own client auth — this is
-# a localhost-only canary, the NBXplorer API surface never leaves the
-# runner.
+# a localhost-only canary, the NBXplorer API surface never leaves
+# the runner.
 docker run -d \
     --name "$NBXPLORER_CONTAINER" \
     --network=host \
@@ -91,6 +133,7 @@ docker run -d \
     -e "NBXPLORER_BTCRPCUSER=$RPCUSER" \
     -e "NBXPLORER_BTCRPCPASSWORD=$RPCPASSWORD" \
     -e "NBXPLORER_BTCNODEENDPOINT=127.0.0.1:$((RPC_PORT + 1))" \
+    -e "NBXPLORER_POSTGRES=Host=127.0.0.1;Port=$POSTGRES_PORT;Database=nbxplorer;Username=postgres;Password=$POSTGRES_PASSWORD" \
     -e "NBXPLORER_NOAUTH=1" \
     "$NBXPLORER_IMAGE"
 
@@ -110,7 +153,9 @@ while [[ $(date +%s) -lt $deadline ]]; do
     fi
     if ! docker ps --format '{{.Names}}' | grep -q "^$NBXPLORER_CONTAINER\$"; then
         echo "nbxplorer: container exited unexpectedly" >&2
-        docker logs "$NBXPLORER_CONTAINER" 2>&1 | tail -50 >&2 || true
+        docker logs "$NBXPLORER_CONTAINER" 2>&1 | tail -80 >&2 || true
+        echo "--- postgres logs ---" >&2
+        docker logs "$POSTGRES_CONTAINER" 2>&1 | tail -20 >&2 || true
         exit 1
     fi
     sleep 5
