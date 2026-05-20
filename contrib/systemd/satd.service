@@ -84,6 +84,21 @@ TimeoutStopSec=10min
 KillSignal=SIGTERM
 SendSIGKILL=yes
 
+# Runtime liveness: systemd kills the unit if it goes 60s without a
+# WATCHDOG=1 ping. After notify_ready, satd spawns a watchdog task that
+# ticks at WATCHDOG_USEC/2 (= 30s here) and pings only when its
+# subsystem probes report healthy (currently: a non-blocking try_read
+# on the chain-state tip lock). Catches runtime-level wedges that the
+# chain-level stall_watchdog (which itself runs on the tokio runtime)
+# can't detect on its own. Restart=always (below) brings us back after
+# a watchdog kill.
+#
+# 60s is the tightest interval that survives a brief scheduler stall
+# (e.g. a long RocksDB compaction pause) without false-positive kills.
+# Tightening this further requires per-subsystem probes proven bounded
+# under load.
+WatchdogSec=60s
+
 # `Restart=always` (vs. on-failure) is deliberate: the in-process stall
 # watchdog (node/src/stall_watchdog.rs) escalates a detected wedge by
 # raising SIGTERM, which runs the graceful `--max-shutdown-secs` flush

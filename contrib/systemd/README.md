@@ -1,23 +1,42 @@
 # systemd integration
 
-`satd.service` is a unit suitable for distro packages and hand-rolled
-deployments alike. It runs satd as a system user with the standard
-hardening directives applied (read-only /, private /tmp, restricted
-syscalls).
+Two units ship here:
 
-See the comment block at the top of the unit file for install steps.
-The user-facing operator guide for service ergonomics lives in
+- **`satd.service`** — single-instance unit for one satd daemon on the
+  default datadir (`/var/lib/satd`). The right choice for a host that
+  runs only one network.
+- **`satd@.service`** — template unit for per-network instances on the
+  same host (`satd@mainnet`, `satd@signet`, …). Each instance gets its
+  own `/var/lib/satd/<network>` datadir and reads
+  `/etc/default/satd@<network>` for per-instance flags.
+
+See the comment block at the top of each unit file for install steps.
+The user-facing operator guide lives in
 [`docs/PACKAGING.md`](../../docs/PACKAGING.md).
 
-## Type=simple → Type=notify
+## Lifecycle behaviour
 
-The unit ships as `Type=simple` because satd does not yet call
-`sd_notify(READY=1)`. The intended behaviour — and what a future PR
-will switch to — is `Type=notify` with `NotifyAccess=main`, so systemd
-considers the unit started only after RocksDB has finished opening.
+Both units use `Type=notify` with `NotifyAccess=main`:
 
-Operators who want notify-style behaviour today can use a wrapper that
-polls `/healthz` (when `--metricsport=` is configured) and call
-`systemd-notify --ready` from a `ExecStartPost=` shim. This is a
-short-term workaround; the in-process `sd_notify` integration is the
-intended end state.
+- **Startup heartbeat.** During long-running startup phases like
+  `--reindex-chainstate`, satd emits `EXTEND_TIMEOUT_USEC=120000000`
+  plus `STATUS=<phase: progress>` every 30s. `TimeoutStartSec=infinity`
+  is fine — the heartbeat IS the liveness check.
+- **Post-ready watchdog.** After `notify_ready()`, satd ticks
+  `WATCHDOG=1` every `WatchdogSec/2` (= 30s at the default 60s
+  setting), gated by non-blocking subsystem probes. A wedged tip lock
+  or stuck tokio runtime suppresses the ping; systemd kills the unit
+  at the deadline and `Restart=always` brings it back. Complements the
+  chain-level stall watchdog in `node/src/stall_watchdog.rs`, which
+  catches "alive but chain not advancing."
+- **Shutdown.** `notify_stopping()` fires before the blocking RocksDB
+  flush so `systemctl status` reads "deactivating" immediately rather
+  than staring at "active" for the full `TimeoutStopSec`.
+
+## OpenRC and runit equivalents
+
+The same lifecycle semantics ship for OpenRC (`contrib/openrc/`) and
+runit (`contrib/runit/`) — they don't carry the `Type=notify` /
+`WatchdogSec=` machinery (those are systemd-specific) but provide the
+same start / stop / restart behaviour, hardening, and resource
+limits where the supervisor supports them.

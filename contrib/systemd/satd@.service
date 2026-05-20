@@ -1,0 +1,138 @@
+# satd@.service — instance template for per-network satd deployments.
+#
+# A single host can run multiple satd instances (mainnet + signet + testnet
+# + ...) by enabling instance units derived from this template:
+#
+#   sudo install -Dm644 contrib/systemd/satd@.service /etc/systemd/system/satd@.service
+#   sudo systemctl enable --now satd@mainnet
+#   sudo systemctl enable --now satd@signet
+#
+# `%i` in this file is the instance name — the substring between `@` and
+# `.service`. Per-instance datadir is `/var/lib/satd/<network>/`; per-
+# instance EnvironmentFile is `/etc/default/satd@<network>` (falls back
+# to `/etc/default/satd` if absent).
+#
+# Network flag is inferred from the instance name. Supported values are
+# `mainnet` (no flag), `signet`, `testnet`, `testnet4`, `regtest`. Any
+# other value is treated as mainnet — no fail-fast, because operators
+# might want a `bench-mainnet` instance pointing at a custom data dir.
+# To be explicit, set SATD_NETWORK in the per-instance EnvironmentFile.
+#
+# Mutual exclusion with the non-instance `satd.service`: the template
+# uses `/var/lib/satd/%i` (default `/var/lib/satd/mainnet`), so a host
+# running both `satd.service` (which uses `/var/lib/satd`) and
+# `satd@mainnet.service` (which uses `/var/lib/satd/mainnet`) won't
+# clash on the datadir. They WILL clash on default RPC + P2P ports — set
+# SATD_OPTS in `/etc/default/satd@mainnet` to override `--rpcport` and
+# `--port`, or pick one shape (single-instance or per-network) and stick
+# with it.
+#
+# Cookie-auth from a non-root operator works the same as the single-
+# instance unit: add yourself to the `satd` group; the cookie chmod
+# survives.
+
+[Unit]
+Description=satd — Bitcoin full node (instance: %i)
+Documentation=https://github.com/epochbtc/satd/blob/master/docs/PACKAGING.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+NotifyAccess=main
+
+# Per-instance datadir. SATD_NETWORK + SATD_OPTS from the per-instance
+# EnvironmentFile override defaults. The `-` prefix on EnvironmentFile
+# makes a missing file non-fatal — useful so an operator can enable
+# `satd@mainnet` without touching `/etc/default/satd@mainnet` first.
+Environment=SATD_DATADIR=/var/lib/satd/%i
+Environment=SATD_OPTS=
+EnvironmentFile=-/etc/default/satd
+EnvironmentFile=-/etc/default/satd@%i
+
+# Pick the network flag from the instance name. mainnet stays unflagged
+# (Core convention). Anything not in the enumerated list also stays
+# unflagged — operators using a custom instance name should set
+# --signet / --testnet etc. in SATD_OPTS or the per-instance
+# EnvironmentFile.
+ExecStart=/bin/sh -c '\
+  case "%i" in \
+    mainnet)                 net_flag="" ;; \
+    signet)                  net_flag="--signet" ;; \
+    testnet|testnet3)        net_flag="--testnet" ;; \
+    testnet4)                net_flag="--testnet4" ;; \
+    regtest)                 net_flag="--regtest" ;; \
+    *)                       net_flag="" ;; \
+  esac; \
+  exec /usr/local/bin/satd --datadir="${SATD_DATADIR}" $net_flag $SATD_OPTS \
+'
+ExecStop=/bin/kill -SIGTERM $MAINPID
+
+# Loosen the cookie file from 0600 → 0640 once it's been written so
+# users in the `satd` group can authenticate without sudo. The `-`
+# prefix makes a missing cookie non-fatal (e.g. when --rpcuser is set
+# instead).
+ExecStartPost=-/bin/chmod 0640 ${SATD_DATADIR}/.cookie
+
+# Reindex can run for hours; the EXTEND_TIMEOUT_USEC heartbeats inside
+# satd reset this every 30s during the pre-bind phase. `infinity`
+# removes the static budget that would otherwise kill us during
+# `--reindex-chainstate`.
+TimeoutStartSec=infinity
+
+TimeoutStopSec=10min
+KillSignal=SIGTERM
+SendSIGKILL=yes
+
+# Same watchdog semantics as the non-instance unit — satd's post-ready
+# watchdog task pings WATCHDOG=1 every 30s when its subsystem probes
+# report healthy. See contrib/systemd/satd.service for the rationale.
+WatchdogSec=60s
+
+# Same Restart=always rationale as the non-instance unit. The in-
+# process stall watchdog escalates a wedge by raising SIGTERM, which
+# exits 0 — Restart=on-failure would NOT auto-restart that.
+Restart=always
+RestartSec=5s
+
+User=satd
+Group=satd
+
+# %i-scoped state dir; survives stop/start, isolated from sibling
+# instances.
+StateDirectory=satd/%i
+StateDirectoryMode=0750
+
+LimitNOFILE=65536
+TasksMax=16384
+
+# Hardening — identical to satd.service.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+# ReadWritePaths uses /var/lib/satd parent (not %i) — systemd's
+# StateDirectory creates and chowns the sub-path, and ReadWritePaths
+# at the parent transparently covers it. A more specific path would
+# need to be relisted per instance via drop-in.
+ReadWritePaths=/var/lib/satd
+
+[Install]
+WantedBy=multi-user.target

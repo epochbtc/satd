@@ -138,6 +138,123 @@ pub fn notify_ready() {
     }
 }
 
+/// Subsystem health probe consumed by the watchdog heartbeat. Returning
+/// false on any tick suppresses that tick's `WATCHDOG=1` send; if
+/// suppression persists past the unit's `WatchdogSec=`, systemd kills
+/// the unit and `Restart=always` brings us back. Implementations MUST
+/// be non-blocking — the watchdog tick runs on the tokio runtime and a
+/// slow probe inflates the tick interval enough to miss the deadline
+/// even when the underlying subsystem is fine.
+pub trait WatchdogProbe: Send + Sync + 'static {
+    /// True when the subsystem is healthy enough to advertise liveness.
+    /// Must not block.
+    fn healthy(&self) -> bool;
+    /// Short identifier (e.g. "chainstate") used in suppression-log
+    /// lines. Keep stable — operators grep for it.
+    fn name(&self) -> &'static str;
+}
+
+/// Spawn the post-ready watchdog heartbeat.
+///
+/// Reads `WATCHDOG_USEC` from the environment (systemd sets this when
+/// `WatchdogSec=` is configured in the unit) and ticks at half that
+/// interval. Each tick polls every probe — any `healthy() == false`
+/// suppresses the tick and logs a single WARN naming the failing
+/// probe. When all probes report healthy, sends `WATCHDOG=1` via
+/// sd_notify.
+///
+/// If `WATCHDOG_USEC` is unset (non-systemd host, or the unit doesn't
+/// configure `WatchdogSec=`), the spawned task is a no-op that just
+/// drains `stop_rx` so the caller's send doesn't dangle. Same binary
+/// works under OpenRC, runit, macOS, plain shell.
+///
+/// Cancel via `stop_rx` during shutdown, BEFORE [`notify_stopping`],
+/// so a final missed tick doesn't race the unit transitioning to
+/// `deactivating`.
+pub fn spawn_watchdog_heartbeat(
+    probes: Vec<Box<dyn WatchdogProbe>>,
+    stop_rx: oneshot::Receiver<()>,
+) -> tokio::task::JoinHandle<()> {
+    let Some(usec) = read_watchdog_usec() else {
+        // No watchdog configured. Spawn a no-op drain so the caller's
+        // stop send doesn't panic on a missing receiver.
+        return tokio::spawn(async move {
+            let _ = stop_rx.await;
+        });
+    };
+    let tick = Duration::from_micros(usec / 2);
+    spawn_watchdog_heartbeat_with_interval(probes, stop_rx, tick)
+}
+
+/// Same as [`spawn_watchdog_heartbeat`] but with a caller-supplied tick
+/// interval (bypassing the `WATCHDOG_USEC` lookup). Public-in-crate so
+/// tests don't depend on systemd-managed env vars; production callers
+/// use the public function.
+pub(crate) fn spawn_watchdog_heartbeat_with_interval(
+    probes: Vec<Box<dyn WatchdogProbe>>,
+    stop_rx: oneshot::Receiver<()>,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        // Delay (not Burst) — under a runtime stall, the default Burst
+        // would fire many WATCHDOG=1 in rapid succession on recovery,
+        // briefly masking a real subsequent stall. Skip the missed
+        // ticks and resume cadence from now.
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Skip the immediate first tick — gives subsystems a moment to
+        // settle after notify_ready before the first probe.
+        ticker.tick().await;
+
+        let mut stop_rx = stop_rx;
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    let mut unhealthy: Option<&'static str> = None;
+                    for probe in &probes {
+                        if !probe.healthy() {
+                            unhealthy = Some(probe.name());
+                            break;
+                        }
+                    }
+                    if let Some(name) = unhealthy {
+                        tracing::warn!(
+                            subsystem = name,
+                            "watchdog tick suppressed — subsystem reports unhealthy"
+                        );
+                    } else if let Err(e) =
+                        sd_notify::notify(&[NotifyState::Watchdog])
+                    {
+                        tracing::warn!(error = %e, "sd_notify WATCHDOG=1 failed");
+                    }
+                }
+                _ = &mut stop_rx => {
+                    return;
+                }
+            }
+        }
+    })
+}
+
+/// Parse `WATCHDOG_USEC` from the environment. systemd sets it when
+/// `WatchdogSec=` is configured; absent or zero means there's no
+/// watchdog to feed. Per `sd_watchdog_enabled(3)`, `WATCHDOG_PID` (if
+/// set) must match our PID — otherwise the env vars belong to a parent
+/// and we ignore them. Matches libsystemd's reference behavior.
+fn read_watchdog_usec() -> Option<u64> {
+    let usec: u64 = std::env::var("WATCHDOG_USEC").ok()?.parse().ok()?;
+    if usec == 0 {
+        return None;
+    }
+    if let Ok(pid_str) = std::env::var("WATCHDOG_PID") {
+        let want_pid: u32 = pid_str.parse().ok()?;
+        if want_pid != std::process::id() {
+            return None;
+        }
+    }
+    Some(usec)
+}
+
 /// Tell systemd we're shutting down. Lets the unit transition to
 /// `deactivating` immediately rather than waiting for the process to
 /// actually exit, which gives operators accurate state in
@@ -333,6 +450,202 @@ mod tests {
         assert!(msg.contains("EXTEND_TIMEOUT_USEC=120000000"), "got: {msg:?}");
 
         // Stop signal — task should drop out of its select arm and finish.
+        stop_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("task did not exit within timeout")
+            .expect("task panicked");
+
+        unsafe {
+            std::env::remove_var("NOTIFY_SOCKET");
+        }
+    }
+
+    /// Test probe — flips healthy/unhealthy via an AtomicBool.
+    #[cfg(target_os = "linux")]
+    struct AtomicProbe {
+        name: &'static str,
+        healthy: std::sync::atomic::AtomicBool,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl AtomicProbe {
+        fn new(name: &'static str, healthy: bool) -> Self {
+            Self {
+                name,
+                healthy: std::sync::atomic::AtomicBool::new(healthy),
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl WatchdogProbe for std::sync::Arc<AtomicProbe> {
+        fn healthy(&self) -> bool {
+            self.healthy.load(std::sync::atomic::Ordering::Relaxed)
+        }
+        fn name(&self) -> &'static str {
+            self.name
+        }
+    }
+
+    /// `WATCHDOG_USEC` parsing: absent / zero / mismatched PID all
+    /// return None; valid PID + non-zero usec returns Some.
+    ///
+    /// Holds NOTIFY_SOCKET_GUARD only because it serializes any test
+    /// that mutates process-global env vars.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn read_watchdog_usec_handles_all_states() {
+        let _guard = NOTIFY_SOCKET_GUARD
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+
+        // SAFETY: NOTIFY_SOCKET_GUARD serializes env-var mutators.
+        unsafe {
+            std::env::remove_var("WATCHDOG_USEC");
+            std::env::remove_var("WATCHDOG_PID");
+        }
+        assert_eq!(read_watchdog_usec(), None, "unset → None");
+
+        unsafe {
+            std::env::set_var("WATCHDOG_USEC", "0");
+        }
+        assert_eq!(read_watchdog_usec(), None, "zero → None");
+
+        unsafe {
+            std::env::set_var("WATCHDOG_USEC", "30000000");
+            std::env::set_var("WATCHDOG_PID", "1");
+        }
+        assert_eq!(
+            read_watchdog_usec(),
+            None,
+            "WATCHDOG_PID=1 (init) doesn't match ours → None"
+        );
+
+        unsafe {
+            std::env::set_var(
+                "WATCHDOG_PID",
+                std::process::id().to_string(),
+            );
+        }
+        assert_eq!(
+            read_watchdog_usec(),
+            Some(30_000_000),
+            "valid usec + our PID → Some"
+        );
+
+        unsafe {
+            std::env::remove_var("WATCHDOG_USEC");
+            std::env::remove_var("WATCHDOG_PID");
+        }
+    }
+
+    /// Heartbeat fires `WATCHDOG=1` on each tick when every probe is
+    /// healthy. Mirror of the startup-heartbeat smoke test but for the
+    /// post-ready watchdog path.
+    #[allow(clippy::await_holding_lock)]
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watchdog_fires_when_probes_healthy() {
+        use std::os::unix::net::UnixDatagram;
+
+        let _guard = NOTIFY_SOCKET_GUARD
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock_path = dir.path().join("notify.sock");
+        let listener = UnixDatagram::bind(&sock_path).expect("bind");
+        listener
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("read timeout");
+        unsafe {
+            std::env::set_var("NOTIFY_SOCKET", &sock_path);
+        }
+
+        let probe = std::sync::Arc::new(AtomicProbe::new("test_probe", true));
+        let probes: Vec<Box<dyn WatchdogProbe>> = vec![Box::new(probe.clone())];
+
+        let (stop_tx, stop_rx) = oneshot::channel::<()>();
+        let handle = spawn_watchdog_heartbeat_with_interval(
+            probes,
+            stop_rx,
+            Duration::from_millis(50),
+        );
+
+        // First tick is skipped, so the first datagram lands ~100ms in.
+        let recv_task = tokio::task::spawn_blocking(move || {
+            let mut buf = [0u8; 4096];
+            let n = listener.recv(&mut buf).expect("recv watchdog");
+            String::from_utf8(buf[..n].to_vec()).expect("utf8")
+        });
+        let msg = recv_task.await.expect("recv task");
+        assert!(msg.contains("WATCHDOG=1"), "got: {msg:?}");
+
+        stop_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("task did not exit within timeout")
+            .expect("task panicked");
+
+        unsafe {
+            std::env::remove_var("NOTIFY_SOCKET");
+        }
+    }
+
+    /// Heartbeat suppresses `WATCHDOG=1` when any probe reports
+    /// unhealthy. Verified by checking the socket reads time out — no
+    /// datagram should arrive while the probe is false.
+    #[allow(clippy::await_holding_lock)]
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watchdog_suppresses_when_probe_unhealthy() {
+        use std::io::ErrorKind;
+        use std::os::unix::net::UnixDatagram;
+
+        let _guard = NOTIFY_SOCKET_GUARD
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock_path = dir.path().join("notify.sock");
+        let listener = UnixDatagram::bind(&sock_path).expect("bind");
+        listener
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("read timeout");
+        unsafe {
+            std::env::set_var("NOTIFY_SOCKET", &sock_path);
+        }
+
+        let probe = std::sync::Arc::new(AtomicProbe::new("test_probe", false));
+        let probes: Vec<Box<dyn WatchdogProbe>> = vec![Box::new(probe.clone())];
+
+        let (stop_tx, stop_rx) = oneshot::channel::<()>();
+        let handle = spawn_watchdog_heartbeat_with_interval(
+            probes,
+            stop_rx,
+            Duration::from_millis(50),
+        );
+
+        // 500ms read timeout × ticker fires every 50ms = expected several
+        // suppressed ticks. None should reach the socket.
+        let recv_task = tokio::task::spawn_blocking(move || {
+            let mut buf = [0u8; 4096];
+            match listener.recv(&mut buf) {
+                Ok(n) => Err(format!(
+                    "unexpected datagram while probe unhealthy: {:?}",
+                    String::from_utf8_lossy(&buf[..n])
+                )),
+                Err(e) if e.kind() == ErrorKind::WouldBlock
+                    || e.kind() == ErrorKind::TimedOut =>
+                {
+                    Ok(())
+                }
+                Err(e) => Err(format!("unexpected recv error: {e}")),
+            }
+        });
+        recv_task.await.expect("recv task").expect("suppression");
+
         stop_tx.send(()).unwrap();
         tokio::time::timeout(Duration::from_secs(1), handle)
             .await
