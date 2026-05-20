@@ -26,22 +26,22 @@ NBXPLORER_IMAGE="nicolasdorier/nbxplorer:2.5.21"
 NBXPLORER_CONTAINER="satd-canary-nbxplorer-$$"
 NBXPLORER_PORT=18204
 
-# NBXplorer needs cookie auth disabled; pass an explicit rpcuser /
-# rpcpassword pair. Boot satd with -rpcuser/-rpcpassword + -server so
-# the JSON-RPC server uses HTTP Basic auth instead of cookie.
+# NBXplorer authenticates with rpcuser/rpcpassword (cookie auth would
+# require shared filesystem access).
 NBX_DATADIR="$(mktemp -d -t satd-canary-nbxplorer.XXXXXX)"
 RPCUSER="canary"
 RPCPASSWORD="$(head -c 16 /dev/urandom | xxd -p)"
 
-# satd's RPC port = 18300; NBXplorer reaches it via the host's docker0
-# gateway (commonly 172.17.0.1). Resolve dynamically via `ip route`.
-# Falls back to host.docker.internal if available (newer Docker for
-# Linux exposes this).
+# satd's RPC binds to 127.0.0.1 by default and has no --rpcbind /
+# --rpcallowip CLI flags today (a Core-compat gap to be filed as a
+# separate follow-up). The workaround for the canary is to run the
+# NBXplorer container on the host's network namespace via
+# `docker run --network=host`, so 127.0.0.1 inside the container
+# resolves to the runner's loopback — which is where satd actually
+# binds.
 boot_satd "$NBX_DATADIR" 18300 \
     --rpcuser="$RPCUSER" \
     --rpcpassword="$RPCPASSWORD" \
-    --rpcbind=0.0.0.0 \
-    --rpcallowip=0.0.0.0/0 \
     --txindex=1 \
     --server=1
 
@@ -51,15 +51,6 @@ cleanup_nbxplorer() {
     docker rm -f "$NBXPLORER_CONTAINER" >/dev/null 2>&1 || true
 }
 trap 'cleanup_nbxplorer; stop_satd' EXIT
-
-# Resolve the docker0 gateway IP (the address Docker containers can use
-# to reach a host service). Fallback to host.docker.internal (works on
-# Docker Desktop and newer Docker for Linux).
-HOST_IP=$(ip -4 route show default | awk '/default/ {print $3}' | head -1)
-if [[ -z "$HOST_IP" ]]; then
-    HOST_IP="host.docker.internal"
-fi
-echo "Host IP for NBXplorer → satd: $HOST_IP"
 
 # Pull the image with 3 retries (network flake mitigation per the
 # canary-gating posture in STABILITY_POLICY.md).
@@ -75,19 +66,24 @@ for attempt in 1 2 3; do
     sleep $((attempt * 2))
 done
 
-# Run NBXplorer pointing at satd. NBXplorer's regtest support uses
-# `NBXPLORER_NETWORK=regtest` + Bitcoin RPC connection settings. The
-# container exposes its API on 24446 internally; map to NBXPLORER_PORT.
+# Run NBXplorer on the host's network namespace so it can reach satd
+# at 127.0.0.1. NBXplorer's regtest support uses
+# `NBXPLORER_NETWORK=regtest` + Bitcoin RPC connection settings; with
+# --network=host the container's API listens on $NBXPLORER_PORT
+# directly on the host (no -p mapping needed).
+# `NBXPLORER_NOAUTH=1` disables NBXplorer's own client auth — this is
+# a localhost-only canary, the NBXplorer API surface never leaves the
+# runner.
 docker run -d \
     --name "$NBXPLORER_CONTAINER" \
-    -p "$NBXPLORER_PORT:24446" \
+    --network=host \
     -e "NBXPLORER_NETWORK=regtest" \
-    -e "NBXPLORER_BIND=0.0.0.0:24446" \
+    -e "NBXPLORER_BIND=127.0.0.1:$NBXPLORER_PORT" \
     -e "NBXPLORER_CHAINS=btc" \
-    -e "NBXPLORER_BTCRPCURL=http://$HOST_IP:$RPC_PORT" \
+    -e "NBXPLORER_BTCRPCURL=http://127.0.0.1:$RPC_PORT" \
     -e "NBXPLORER_BTCRPCUSER=$RPCUSER" \
     -e "NBXPLORER_BTCRPCPASSWORD=$RPCPASSWORD" \
-    -e "NBXPLORER_BTCNODEENDPOINT=$HOST_IP:$((RPC_PORT + 1))" \
+    -e "NBXPLORER_BTCNODEENDPOINT=127.0.0.1:$((RPC_PORT + 1))" \
     -e "NBXPLORER_NOAUTH=1" \
     "$NBXPLORER_IMAGE"
 
