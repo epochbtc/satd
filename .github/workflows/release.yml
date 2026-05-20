@@ -274,7 +274,10 @@ jobs:
           set -euo pipefail
           pip install --no-cache-dir 'cargo-zigbuild==0.20.1' 'ziglang==0.13.0'
           # Sanity: confirm both binaries are on PATH and report versions.
-          cargo zigbuild --version
+          # NOTE: invoking `cargo zigbuild --version` doesn't work because
+          # `cargo zigbuild` is the zigbuild *subcommand* (which has no
+          # --version flag); the top-level binary is `cargo-zigbuild`.
+          cargo-zigbuild --version
           python -m ziglang version
 
       - name: Cache Cargo registry + git
