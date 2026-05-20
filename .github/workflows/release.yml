@@ -61,7 +61,15 @@ on:
 permissions: {}
 
 env:
-  RUST_TOOLCHAIN: '1.93'
+  # Must exactly match rust-toolchain.toml's `channel`. dtolnay/rust-
+  # toolchain installs the toolchain *and* registers any matrix-listed
+  # cross-target std libs against it; if this resolves to a different
+  # patch (e.g. `1.93` → `1.93.1`) than rust-toolchain.toml's pin
+  # (`1.93.0`), rustup then routes the build to the toolchain.toml
+  # version and the cross-target std is missing on the toolchain that
+  # actually runs the compile. Bites only for musl (the gnu/macos
+  # matrix entries are native, so no target add is needed).
+  RUST_TOOLCHAIN: '1.93.0'
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
