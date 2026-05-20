@@ -1,24 +1,17 @@
 # Release workflow — runs on hosted runners (NOT the self-hosted runner
-# that ci.yml uses). Hosted runners give us free amd64 + arm64 Linux
-# and the Docker buildx multi-arch story without having to manage
-# QEMU on our own infra.
+# that ci.yml uses). Hosted runners give us free amd64 + arm64 Linux,
+# Apple Silicon, and the Docker buildx multi-arch story without having
+# to manage QEMU on our own infra. Actions minutes are free for public
+# repos, so PR-trigger dry-runs and workflow_dispatch are both enabled.
 #
-# Trigger: tag push only (`v*`). PR-trigger dry-runs and
-# workflow_dispatch were both removed during the private-repo phase
-# because hosted-runner minutes are scarce on the Team plan and the
-# PR dry-run was burning the bulk of the quota. The trade is that
-# release-workflow / Dockerfile / Cargo-lock breakage now first
-# manifests at tag time rather than on the PR that introduced it —
-# acceptable while quota matters; re-enable the PR + dispatch
-# triggers once the repo is public (Actions minutes are free for
-# public repos).
+# Triggers:
+#   - push tags `v*` → full release flow (build + push + sign + GitHub Release)
+#   - pull_request   → build-only dry-run; no push, no sign, no release
+#   - workflow_dispatch → same as PR-trigger; useful for one-off matrix
+#                         smoke runs after toolchain bumps
 #
-# What's intentionally NOT here yet (later PRs in the packaging stack):
-#   - musl tarball targets — rocksdb-sys + musl wants a dedicated
-#     cross toolchain
-#   - macOS Apple Silicon tarball — currently commented out in the
-#     matrix below (see comment at the matrix entry); re-enable when
-#     the repo is public
+# What's intentionally NOT here yet:
+#   - musl tarball targets — landing in a follow-up PR via cross-rs
 #
 # The supply-chain-gate job below runs cargo-deny against the workspace
 # graph as a hard precondition for every release artifact. If a RustSec
@@ -32,6 +25,26 @@ on:
   push:
     tags:
       - 'v*'
+  pull_request:
+    paths:
+      - '.github/workflows/release.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'Dockerfile'
+      - 'satd/**'
+      - 'sat-cli/**'
+      - 'node/**'
+      - 'node-index/**'
+      - 'node-filter-index/**'
+      - 'esplora-handlers/**'
+      - 'electrum-proto/**'
+      - 'tls-config/**'
+      - 'events/**'
+      - 'mcp/**'
+      - 'block-analyzer/**'
+      - 'consensus/**'
+      - 'sat-tui/**'
+  workflow_dispatch:
 
 permissions: {}
 
@@ -161,25 +174,12 @@ jobs:
             os: ubuntu-24.04
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
-          # Apple Silicon (macos-14) is intentionally disabled while
-          # the repo is private. Hosted Apple Silicon runners bill at
-          # 20× the linux-2-core rate; one PR-trigger dry-run run
-          # consumes ~200 minute-equivalents on this matrix entry
-          # alone, which depletes a Team-plan monthly quota in just a
-          # few PRs.
-          #
-          # Re-enable once the repo is public (Actions minutes are
-          # free for public repos) by uncommenting the entry below.
-          # The `Stage libclang for rocksdb-sys (macOS)` step further
-          # down already keys on `runner.os == 'macOS'`, so no other
-          # changes are needed.
-          #
-          # macos-13 (Intel) was previously dropped because Apple
-          # Silicon is the targeted macOS surface for satd; if a
-          # downstream packager needs an x86_64 darwin build they can
-          # cross-build from an arm64 darwin host.
-          # - target: aarch64-apple-darwin
-          #   os: macos-14
+          # macos-13 (Intel) is intentionally not in the matrix — Apple
+          # Silicon is the targeted macOS surface for satd; a downstream
+          # packager who needs an x86_64 darwin build can cross-build
+          # from an arm64 darwin host.
+          - target: aarch64-apple-darwin
+            os: macos-14
 
     permissions:
       contents: read
