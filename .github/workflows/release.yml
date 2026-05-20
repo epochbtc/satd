@@ -22,8 +22,9 @@
 # libclang too old for bindgen 0.69+'s `clang_Type_getValueType`
 # requirement, and apt-installing a newer libclang inside the image
 # led to clang-sys path-discovery failures. Zigbuild sidesteps the
-# whole container — bindgen runs on the host with the host's
-# libclang-19, and zig handles the cross-target C++ side cleanly.
+# whole container — bindgen runs on the host against whichever
+# libclang `libclang-dev` resolves to (currently 18 on Ubuntu 24.04),
+# and zig handles the cross-target C++ side cleanly.
 #
 # The supply-chain-gate job below runs cargo-deny against the workspace
 # graph as a hard precondition for every release artifact. If a RustSec
