@@ -42,8 +42,8 @@ RPCPASSWORD="$(head -c 16 /dev/urandom | xxd -p)"
 boot_satd "$NBX_DATADIR" 18300 \
     --rpcuser="$RPCUSER" \
     --rpcpassword="$RPCPASSWORD" \
-    --txindex=1 \
-    --server=1
+    --txindex \
+    --server
 
 # Cleanup of NBXplorer container too — boot-satd.sh's EXIT trap only
 # stops satd. Compose a combined trap.
