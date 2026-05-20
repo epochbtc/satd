@@ -1,0 +1,21 @@
+# cross-rs configuration overrides.
+#
+# librocksdb-sys's build-script uses bindgen, which links against
+# libclang to parse RocksDB's C++ headers. The default cross 0.2.5
+# musl images are Ubuntu-20.04-based with libclang-10, which is too
+# old for the bindgen version pulled in transitively — the linker
+# can't resolve `clang_Type_getValueType` (added in libclang 16).
+#
+# Point at cross-rs's `main`-tagged images for the musl targets;
+# those are Ubuntu-22.04-based with libclang-14+, which carries the
+# symbol. Tradeoff: `:main` floats — pin to a specific date-tagged
+# image once one is verified-green here.
+#
+# Only musl targets are overridden; the workspace doesn't build for
+# musl via plain `cargo`, only inside cross-rs.
+
+[target.x86_64-unknown-linux-musl]
+image = "ghcr.io/cross-rs/x86_64-unknown-linux-musl:main"
+
+[target.aarch64-unknown-linux-musl]
+image = "ghcr.io/cross-rs/aarch64-unknown-linux-musl:main"
