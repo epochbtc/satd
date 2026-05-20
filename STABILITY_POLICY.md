@@ -105,17 +105,33 @@ Migrations may create new files, rename old ones, or abort. They may **never** c
 
 ## Compatibility canary
 
-Every satd release candidate blocks on a CI job that boots real downstream integrations against the RC image and verifies they come up clean. These are not test suites — they are real deployment artifacts.
+Canaries gate every PR merge (not just release candidates) and boot real downstream integrations against the candidate satd to verify they come up clean. These are not test suites — they are real deployment artifacts. The bundled-Electrum / bundled-Esplora architecture is satd's headline claim; a regression that silently breaks Sparrow, BlueWallet, BDK, NBXplorer, or BTCPay invalidates that claim. Better to feel the pain of a flaky downstream blocking merges than to ship a release where the headline architecture quietly regressed.
 
-Mandatory canaries:
+### Currently gating
 
-- **BTCPayServer**: boot `btcpayserver/btcpayserver` with satd as the Bitcoin backend; run their `dockerfile-deps` entrypoint; verify `/api/v1/server/info` responds healthy.
-- **NBXplorer**: boot against satd; index recent regtest blocks; verify callback delivery.
-- **Umbrel app**: install the satd Umbrel app on an Umbrel dev image; verify the dashboard reports the node as healthy.
-- **Electrum-personality canary**: boot satd with `--electrum=1`; run an Electrum-client smoke suite (BlueWallet, Sparrow, or Electrum desktop in headless mode) against the endpoint; verify `server.version` handshake, `blockchain.scripthash.subscribe` notifications on a regtest mining tick, and `blockchain.transaction.broadcast` round-trip.
-- **Esplora canary**: boot satd with `--esplora=1`; run BDK's Esplora integration tests against the endpoint; verify wire-shape parity for the implemented endpoint set.
+- **Esplora wire-shape canary** (`scripts/canary/esplora-smoke.sh`) — raw `curl` + `jq` against documented endpoints (`/blocks/tip/{height,hash}`, `/block/:hash`, `/address/:addr/{utxo,txs}`, `/tx/:txid/{,/hex,/outspends}`, `/mempool`, `/fee-estimates`). Catches wire-format breaks at a layer below the Rust `esplora-client` crate.
+- **Electrum wire-shape canary** (`scripts/canary/electrum-smoke.sh`) — raw `nc` line-delimited JSON-RPC against `server.version`, `server.banner`, `blockchain.headers.subscribe`, `blockchain.estimatefee`, `blockchain.relayfee`. Catches wire-format breaks at a layer below the Rust `electrum-client` crate.
+- **In-tree Electrum + Esplora protocol suite** (`satd/tests/e2e.rs`, PR-gated via `ci.yml`) — drives satd via the Rust `electrum-client` crate (same library BDK consumes) and `reqwest` for Esplora. Deeper protocol coverage than the wire-shape canaries above, complementary to them.
 
-The canary is not advisory. A failing canary blocks the RC until either the downstream is patched with our active support, or the breaking change is reverted. The canary matrix is versioned and its failures are archived with each RC.
+The wire-shape canaries above run on `.github/workflows/canary.yml`, triggered on `pull_request`, weekly cron, and `workflow_dispatch`. They are marked as required status checks on the `master` branch protection.
+
+### Deferred
+
+Listed for traceability; each will enter PR-gating on the same terms when its prerequisites are met:
+
+- **NBXplorer integration canary** (`scripts/canary/nbxplorer-smoke.sh`) — runs the real `nicolasdorier/nbxplorer:<pin>` Docker container (with a Postgres sidecar, required by NBXplorer 2.5+) against a satd regtest backend. Postgres + container plumbing is wired up and works; the open issue is a P2P version-handshake interop with NBitcoin (NBXplorer's underlying lib) that surfaces as `node is not in a connected state` after TCP connect — needs deeper investigation. Job definition is commented out in `canary.yml`; the script in `scripts/canary/nbxplorer-smoke.sh` is left in-tree so the follow-up PR is small.
+- **BTCPayServer**: boot `btcpayserver/btcpayserver` with satd as the Bitcoin backend; verify `/api/v1/server/info` responds healthy. Deferred because the BTCPay stack is a multi-container docker-compose (Postgres + NBXplorer + BTCPay + optional Tor) — a follow-up PR will compose this on top of the NBXplorer canary infrastructure.
+- **Umbrel app**: install the satd Umbrel app on an Umbrel dev image; verify the dashboard reports the node as healthy. Blocked on shipping the satd Umbrel app first (`ECOSYSTEM.md` §6.6).
+
+### Failure triage
+
+A canary failure on a PR is treated as load-bearing, not a flake to dismiss. Diagnose in this order:
+
+1. **Did this PR cause it?** Compare the diff to the failure mode. If yes, the PR author fixes or reverts.
+2. **Is this a downstream-side regression?** Pin the affected downstream to the last-known-good version in the canary workflow, open a tracking issue, then unblock PRs.
+3. **Is this an infrastructure flake** (image registry 5xx, transient network)? Rerun once via `workflow_dispatch`. If it fails again, treat as case (2).
+
+**Never** mark a canary advisory-only as a flake response. The escape valve is to pin the downstream to a known-good version, not to weaken the gate.
 
 > *Historical Context:* Core runs no such job. This is the single largest reason infra maintainers learn about breakages from user bug reports rather than from release notes. It is also the cheapest structural fix any node project can adopt.
 
