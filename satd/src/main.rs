@@ -185,31 +185,62 @@ async fn main() {
     };
 
     // Beyond this point we're committing to daemon startup. Set up
-    // authentication, then the lightweight startup-status RPC server.
-    let auth = if let (Some(user), Some(pass)) = (&config.rpcuser, &config.rpcpassword) {
-        RpcAuth::from_user_pass(user.clone(), pass.clone())
-    } else {
-        match RpcAuth::generate_cookie(&net_datadir) {
-            Ok(a) => a,
+    // authentication: cookie (always written unless rpcuser is set),
+    // plus any --rpcauth lines, plus the optional plain --rpcuser /
+    // --rpcpassword pair. Bitcoin Core's policy is "any valid
+    // credential opens the door" — we mirror that exactly so an
+    // operator pasting their Core rpcauth.py output works unchanged.
+    let mut credentials = node::rpc::auth::Credentials::default();
+    // Cookie auth: generated unless the operator has set a static
+    // rpcuser+rpcpassword (which is the legacy Core "I don't want a
+    // cookie" signal). Operators who want both can always set
+    // rpcauth=... explicitly instead — that keeps the cookie file
+    // for sat-cli's no-flag default while still allowing user/pass.
+    if !(config.rpcuser.is_some() && config.rpcpassword.is_some()) {
+        let cookie_path = config
+            .rpc_cookie_file
+            .clone()
+            .unwrap_or_else(|| net_datadir.join(".cookie"));
+        match node::rpc::auth::RpcAuth::generate_cookie_with(
+            cookie_path,
+            config.rpc_cookie_perms.as_mode(),
+        ) {
+            Ok(node::rpc::auth::RpcAuth::Verify(c)) => {
+                credentials.cookie = c.cookie;
+            }
+            Ok(_) => unreachable!("generate_cookie_with always returns Verify"),
             Err(e) => {
                 eprintln!("Error generating cookie file: {}", e);
                 std::process::exit(1);
             }
         }
-    };
-    let auth = Arc::new(auth);
+    }
+    if let (Some(user), Some(pass)) = (&config.rpcuser, &config.rpcpassword) {
+        credentials.userpass.push(node::rpc::auth::UserPassCredential {
+            username: user.clone(),
+            password: pass.clone(),
+        });
+    }
+    for entry in &config.rpcauth {
+        credentials.rpcauth.push(node::rpc::auth::RpcAuthCredential {
+            username: entry.username.clone(),
+            salt: entry.salt.clone(),
+            hash: entry.hash.clone(),
+        });
+    }
+    let auth = Arc::new(RpcAuth::Verify(credentials));
 
-    // Start a lightweight startup-status RPC server.
-    // This lets the TUI show "Loading database..." instead of "Connecting...".
-    // It will be stopped once the full RPC server is ready.
-    let rpc_bind: SocketAddr = format!("{}:{}", config.rpcbind, config.rpcport)
-        .parse()
-        .expect("Invalid RPC bind address");
+    // Start a lightweight startup-status RPC server on each operator-
+    // configured bind. The TUI talks to it via the first loopback
+    // bind in the list; non-loopback binds are accepted too so a
+    // remote operator can also see "Loading database..." instead of
+    // "Connection refused" during long startups.
+    let rpc_binds: Vec<SocketAddr> = config.rpcbind.clone();
     let startup_progress = node::startup_progress::StartupProgress::new();
     let startup_handle = {
         let progress = startup_progress.clone();
         let auth_clone = auth.clone();
-        start_startup_rpc(rpc_bind, auth_clone, progress).await
+        start_startup_rpc(rpc_binds.clone(), auth_clone, progress).await
     };
 
     // Service-manager heartbeat. On systemd this prevents the unit from
@@ -855,7 +886,7 @@ async fn main() {
     // Give the port a moment to be released
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-    let bind_addr = rpc_bind;
+    let bind_addrs: Vec<SocketAddr> = rpc_binds.clone();
 
     let effective_config_view = config.effective_view();
 
@@ -1101,8 +1132,10 @@ async fn main() {
     } else {
         None
     };
+    let allowip = config.rpcallowip.clone();
     let server_handle = match node::rpc::server::start(
-        bind_addr,
+        bind_addrs.clone(),
+        allowip,
         rpc_tls,
         auth.clone(),
         tls_auth,
@@ -1139,7 +1172,10 @@ async fn main() {
         }
     };
 
-    tracing::info!(%bind_addr, "RPC server listening");
+    tracing::info!(
+        binds = ?bind_addrs.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+        "RPC server listening"
+    );
 
     // Start MCP server if enabled
     if config.mcp {
@@ -1923,15 +1959,40 @@ async fn main() {
     tracing::info!("satd stopped");
 }
 
-/// Start a minimal RPC server that only serves `getstartupinfo`.
-/// This runs on the RPC port before the full node is initialized,
+/// Composite handle returned by `start_startup_rpc` — one handle per
+/// `--rpcbind` value. `.stop()` fires every handle (ignoring already-
+/// stopped errors so a half-stopped state never propagates).
+pub struct StartupRpcHandle {
+    handles: Vec<jsonrpsee::server::ServerHandle>,
+}
+
+impl StartupRpcHandle {
+    pub fn stop(&self) -> Result<(), jsonrpsee::server::AlreadyStoppedError> {
+        let mut first_err = None;
+        for h in &self.handles {
+            if let Err(e) = h.stop()
+                && first_err.is_none()
+            {
+                first_err = Some(e);
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Start a minimal RPC server that only serves `getstartupinfo`. One
+/// listener per `bind_addrs` entry, all sharing the same Methods +
+/// auth. Runs on the RPC port(s) before the full node is initialized,
 /// so the TUI can show startup progress instead of "Connecting...".
 async fn start_startup_rpc(
-    bind_addr: SocketAddr,
+    bind_addrs: Vec<SocketAddr>,
     auth: Arc<RpcAuth>,
     progress: Arc<node::startup_progress::StartupProgress>,
-) -> jsonrpsee::server::ServerHandle {
-    use jsonrpsee::server::{RpcModule, ServerBuilder};
+) -> StartupRpcHandle {
+    use jsonrpsee::server::{Methods, RpcModule, ServerBuilder};
     use jsonrpsee::types::ErrorObjectOwned;
     use node::rpc::auth::AuthLayer;
 
@@ -1961,14 +2022,21 @@ async fn start_startup_rpc(
         })
         .unwrap();
 
-    let middleware = tower::ServiceBuilder::new().layer(AuthLayer::new(auth));
-    let server = ServerBuilder::new()
-        .set_http_middleware(middleware)
-        .build(bind_addr)
-        .await
-        .expect("Failed to start startup RPC server");
-
-    server.start(module)
+    let methods: Methods = module.into();
+    let mut handles = Vec::with_capacity(bind_addrs.len());
+    for bind_addr in &bind_addrs {
+        let middleware = tower::ServiceBuilder::new().layer(AuthLayer::new(auth.clone()));
+        let server = ServerBuilder::new()
+            .set_http_middleware(middleware)
+            .build(*bind_addr)
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!("Failed to start startup RPC server on {bind_addr}: {e}");
+                std::process::exit(1);
+            });
+        handles.push(server.start(methods.clone()));
+    }
+    StartupRpcHandle { handles }
 }
 
 /// Forwards reorg records to the configured HTTP webhook. Best effort —
