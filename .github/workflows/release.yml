@@ -10,13 +10,20 @@
 #   - workflow_dispatch → same as PR-trigger; useful for one-off matrix
 #                         smoke runs after toolchain bumps
 #
-# musl tarballs run on the amd64 Linux runner via cross-rs (the build
-# happens inside a Docker container with a target-specific toolchain
-# pre-built, including a musl-compatible libstdc++ — managing musl-gcc
-# + libstdc++ ourselves is well-known fragile, especially for the
-# rocksdb-sys C++ build). aarch64-musl reuses the amd64 host because
-# cross handles the architecture switch inside the container, so we
-# don't need the ubuntu-24.04-arm runner.
+# musl tarballs build via `cargo zigbuild` on the host (no container).
+# zig ships its own libc + headers for the target architecture, so
+# the host's toolchain doesn't need a musl-cross-gcc installed — zig
+# acts as both C and C++ cross-compiler. This is the cleanest path
+# for Rust + a C++ dep like rocksdb-sys: cmake spawns `zig c++ ...`
+# via the CC/CXX env vars that cargo-zigbuild wires up, and the
+# resulting object files link statically against musl.
+#
+# Previously this used cross-rs, but the cross-rs musl images ship
+# libclang too old for bindgen 0.69+'s `clang_Type_getValueType`
+# requirement, and apt-installing a newer libclang inside the image
+# led to clang-sys path-discovery failures. Zigbuild sidesteps the
+# whole container — bindgen runs on the host with the host's
+# libclang-19, and zig handles the cross-target C++ side cleanly.
 #
 # The supply-chain-gate job below runs cargo-deny against the workspace
 # graph as a hard precondition for every release artifact. If a RustSec
@@ -185,17 +192,19 @@ jobs:
           # from an arm64 darwin host.
           - target: aarch64-apple-darwin
             os: macos-14
-          # musl: built via cross-rs inside a Docker container on the
-          # amd64 Linux host. cross handles musl-gcc + libstdc++ + the
-          # aarch64 toolchain in its image; the host only needs Docker
-          # (hosted ubuntu provides it). See the file-header comment
-          # for the rationale.
+          # musl: built via cargo-zigbuild on the amd64 Linux host —
+          # no container, no musl-cross-gcc on the runner. zig brings
+          # its own libc + cross-compiler for both x86_64 and aarch64
+          # musl targets, and rocksdb-sys's cmake build picks it up
+          # via CC/CXX env vars that cargo-zigbuild sets. See the
+          # file-header comment for the rationale on the cross-rs
+          # switch.
           - target: x86_64-unknown-linux-musl
             os: ubuntu-24.04
-            use_cross: true
+            use_zigbuild: true
           - target: aarch64-unknown-linux-musl
             os: ubuntu-24.04
-            use_cross: true
+            use_zigbuild: true
 
     permissions:
       contents: read
@@ -207,14 +216,13 @@ jobs:
       # rocksdb-sys needs libclang (bindgen headers) and the rocksdb
       # native build wants cmake. Hosted ubuntu-24.04 ships clang +
       # cmake binaries but NOT libclang-dev — install explicitly.
-      # libssl-dev is needed by the openssl-sys path in reqwest's
-      # native-tls backend.
       #
-      # Skipped for cross targets — the cross-rs Docker image carries
-      # its own toolchain, so installing apt packages on the host is
-      # wasted setup time.
+      # Applies to musl builds too: cargo-zigbuild runs on the host,
+      # and bindgen (a build-script-time tool) needs libclang from
+      # the host regardless of which target it's generating bindings
+      # for. zig only owns the cross-target C/C++ side.
       - name: Install Linux build deps
-        if: runner.os == 'Linux' && matrix.use_cross != true
+        if: runner.os == 'Linux'
         run: |
           set -euo pipefail
           sudo apt-get update
@@ -222,7 +230,6 @@ jobs:
             clang \
             cmake \
             libclang-dev \
-            libssl-dev \
             pkg-config
 
       # macOS: librocksdb-sys's build-script binary is linked against
@@ -249,16 +256,26 @@ jobs:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: ${{ matrix.target }}
 
-      # Pinned cross-rs. Pre-built binary install (~5s) instead of
-      # `cargo install` (1-2 min). Keep the version pin in sync with
-      # the cross image tags hosted on ghcr.io/cross-rs/* — bumping
-      # cross without checking image availability for the target tag
-      # will fail the next build.
-      - name: Install cross-rs
-        if: matrix.use_cross == true
-        uses: taiki-e/install-action@v2
+      # Zig + cargo-zigbuild for musl cross-compilation. The
+      # `ziglang` PyPI wheel bundles a working zig binary (no
+      # third-party action needed) and cargo-zigbuild auto-discovers
+      # it on PATH. Pin both: cargo-zigbuild's zig-version detection
+      # is tightly coupled to the language's API, and an unpinned
+      # upgrade can break overnight.
+      - name: Install Python (for cargo-zigbuild + ziglang wheel)
+        if: matrix.use_zigbuild == true
+        uses: actions/setup-python@v5
         with:
-          tool: cross@0.2.5
+          python-version: '3.12'
+
+      - name: Install cargo-zigbuild + zig
+        if: matrix.use_zigbuild == true
+        run: |
+          set -euo pipefail
+          pip install --no-cache-dir 'cargo-zigbuild==0.20.1' 'ziglang==0.13.0'
+          # Sanity: confirm both binaries are on PATH and report versions.
+          cargo zigbuild --version
+          python -m ziglang version
 
       - name: Cache Cargo registry + git
         uses: actions/cache@v4
@@ -278,24 +295,21 @@ jobs:
           restore-keys: ${{ runner.os }}-${{ matrix.target }}-target-
 
       - name: Build release binaries (cargo)
-        if: matrix.use_cross != true
+        if: matrix.use_zigbuild != true
         run: |
           cargo build --release --locked \
             --bin satd --bin sat-cli \
             --target ${{ matrix.target }}
 
-      - name: Build release binaries (cross)
-        if: matrix.use_cross == true
+      - name: Build release binaries (zigbuild)
+        if: matrix.use_zigbuild == true
         env:
-          # bindgen (via librocksdb-sys's build script) looks for
-          # libclang in this path. Cross.toml installs libclang-dev
-          # via apt in pre-build; on the cross :main musl image
-          # (Ubuntu 24.04 base) that resolves to llvm-19. The env var
-          # is passed through to the container via Cross.toml's
-          # [build.env] passthrough.
+          # bindgen runs on the host (build-script time, not target
+          # time), so it needs the host's libclang — Ubuntu 24.04
+          # ships libclang-19 here.
           LIBCLANG_PATH: /usr/lib/llvm-19/lib
         run: |
-          cross build --release --locked \
+          cargo zigbuild --release --locked \
             --bin satd --bin sat-cli \
             --target ${{ matrix.target }}
 
