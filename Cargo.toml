@@ -28,7 +28,7 @@ tower = "0.5"
 tower-http = "0.6"
 hyper = "1"
 thiserror = "2"
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rocksdb = { version = "0.24", default-features = false, features = ["zstd", "lz4"] }
 hex = "0.4"
 bincode = "1"
