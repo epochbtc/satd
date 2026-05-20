@@ -39,10 +39,13 @@
 #
 # During reindex (which can run for many hours on a fully-synced
 # mainnet node) satd emits sd_notify(EXTEND_TIMEOUT_USEC=120000000)
-# every 30s plus STATUS=<phase: progress>. TimeoutStartSec is `infinity`
-# because the heartbeat IS the liveness check — silence for >120s and
-# systemd kills the unit (correctly: it's stuck). `systemctl status
-# satd` shows the live STATUS line during reindex.
+# every 30s plus STATUS=<phase: progress>. TimeoutStartSec= is a
+# FINITE 3min — large enough for the first heartbeat (30s) to land
+# and push the deadline out by 120s, and small enough that a pre-
+# heartbeat startup wedge gets killed in bounded time. EXTEND_TIMEOUT_USEC
+# only works against a finite TimeoutStartSec=; an infinite startup
+# timeout would let a wedged process hang indefinitely before READY=1.
+# `systemctl status satd` shows the live STATUS line during reindex.
 
 [Unit]
 Description=satd — Bitcoin full node
@@ -71,11 +74,13 @@ ExecStop=/bin/kill -SIGTERM $MAINPID
 # start, so this is no less secure than 0600 for outside-group users.
 ExecStartPost=-/bin/chmod 0640 ${SATD_DATADIR}/.cookie
 
-# Reindex can take hours. The EXTEND_TIMEOUT_USEC heartbeats inside
-# satd reset this every 30s during the pre-bind phase; `infinity`
-# removes the static budget that would otherwise kill us during
-# `--reindex-chainstate`. See the comment block above.
-TimeoutStartSec=infinity
+# Reindex can take hours, but the heartbeat IS the liveness check
+# only when there's a finite budget to extend. EXTEND_TIMEOUT_USEC=
+# 120000000 from satd's 30s heartbeat pushes this 3min initial
+# deadline out by 120s on every tick — so an actively-progressing
+# reindex never hits the wall, but a startup wedge (no heartbeat for
+# >120s) gets killed. See the comment block above.
+TimeoutStartSec=3min
 
 # RocksDB flush + undo-file fsync on shutdown can take a while under load.
 # 10 minutes matches Bitcoin Core's bitcoind.service ceiling and is the
@@ -83,6 +88,28 @@ TimeoutStartSec=infinity
 TimeoutStopSec=10min
 KillSignal=SIGTERM
 SendSIGKILL=yes
+
+# Runtime liveness: systemd kills the unit if it goes 120s without a
+# WATCHDOG=1 ping. After notify_ready, satd spawns a watchdog task that
+# ticks at WATCHDOG_USEC/2 (= 60s here) and pings only when its
+# subsystem probes report healthy (currently: a non-blocking try_read
+# on the chain-state tip lock). Catches runtime-level wedges that the
+# chain-level stall_watchdog (which itself runs on the tokio runtime)
+# can't detect on its own. Restart=always (below) brings us back after
+# a watchdog kill.
+#
+# 120s is chosen to absorb legitimate long-held write locks (e.g.
+# a slow RocksDB compaction pause, a large reorg connecting many
+# blocks) without false-positive kills. The probe is intentionally
+# coarse — any held write lock looks "unhealthy" — so this window is
+# the operational backstop, not the first line of detection (that's
+# stall_watchdog.rs).
+#
+# Operators on slow hardware can extend this further via a drop-in:
+#   /etc/systemd/system/satd.service.d/watchdog.conf:
+#     [Service]
+#     WatchdogSec=300s
+WatchdogSec=120s
 
 # `Restart=always` (vs. on-failure) is deliberate: the in-process stall
 # watchdog (node/src/stall_watchdog.rs) escalates a detected wedge by

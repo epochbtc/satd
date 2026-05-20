@@ -485,6 +485,17 @@ impl ChainState {
         self.tip.read().height
     }
 
+    /// Cheap liveness probe for the systemd watchdog. Returns true if the
+    /// tip lock is not held by a wedged writer (try_read succeeds). A
+    /// healthy node returns instantly; a node where a connect-block path
+    /// has deadlocked while holding the write lock returns false.
+    ///
+    /// Non-blocking by design — the watchdog tick must never wait on a
+    /// stuck subsystem.
+    pub fn is_responsive(&self) -> bool {
+        self.tip.try_read().is_some()
+    }
+
     /// Read the active-chain tip's hash and height under a single
     /// `tip.read()` guard. Callers that need both fields together —
     /// e.g. the address-index backfill's `verify_anchor_active` — must

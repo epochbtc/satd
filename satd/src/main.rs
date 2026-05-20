@@ -24,6 +24,24 @@ use node::validation::script::{ConsensusVerifier, RustVerifier, ScriptVerifier, 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+/// Watchdog probe over the shared chain state. Uses `is_responsive`
+/// (non-blocking try_read on the tip lock) so a wedged writer in
+/// connect/disconnect-block suppresses watchdog pings — systemd kills
+/// the unit at the WatchdogSec deadline and Restart=always brings us
+/// back. Complementary to stall_watchdog: stall_watchdog catches
+/// "alive but chain not advancing"; this probe catches "tip lock held
+/// by a wedged writer."
+struct ChainStateProbe(Arc<ChainState>);
+
+impl notify::WatchdogProbe for ChainStateProbe {
+    fn healthy(&self) -> bool {
+        self.0.is_responsive()
+    }
+    fn name(&self) -> &'static str {
+        "chainstate"
+    }
+}
+
 #[tokio::main]
 async fn main() {
     // Config must be parsed before tracing init so --log-format can select
@@ -1753,6 +1771,25 @@ async fn main() {
     let _ = heartbeat_handle.await;
     notify::notify_ready();
 
+    // Post-ready watchdog. Reads WATCHDOG_USEC (set by systemd when
+    // WatchdogSec= is configured in the unit) and pings WATCHDOG=1 on
+    // half the interval. If WATCHDOG_USEC is unset (non-systemd host,
+    // or the unit doesn't ask for watchdog), the spawned task is a
+    // no-op drain.
+    //
+    // Probe: ChainStateProbe wraps chain_state.is_responsive(), which
+    // uses try_read() on the tip lock — non-blocking and returns false
+    // if a wedged writer holds it. A future stuck inside a connect-
+    // block path while holding the tip write lock will suppress
+    // WATCHDOG=1 sends, and systemd kills us at the WatchdogSec
+    // deadline; Restart=always brings us back. Complements the chain-
+    // level stall_watchdog (which catches "alive but not advancing").
+    let chainstate_probe: Box<dyn notify::WatchdogProbe> =
+        Box::new(ChainStateProbe(chain_state.clone()));
+    let (watchdog_stop_tx, watchdog_stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let watchdog_handle =
+        notify::spawn_watchdog_heartbeat(vec![chainstate_probe], watchdog_stop_rx);
+
     // Wait for shutdown signal (stop RPC, Ctrl+C, or SIGTERM)
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .expect("Failed to register SIGTERM handler");
@@ -1773,6 +1810,11 @@ async fn main() {
             let _ = shutdown_signal_tx.send(true);
         }
     }
+
+    // Cancel the watchdog BEFORE notify_stopping so a final missed
+    // tick can't race the unit transitioning to deactivating.
+    let _ = watchdog_stop_tx.send(());
+    let _ = watchdog_handle.await;
 
     // Tell the service manager we're shutting down BEFORE the blocking
     // RocksDB flush. Operators running `systemctl stop satd` or watching
