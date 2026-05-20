@@ -286,6 +286,14 @@ jobs:
 
       - name: Build release binaries (cross)
         if: matrix.use_cross == true
+        env:
+          # bindgen (via librocksdb-sys's build script) looks for
+          # libclang in this path. Cross.toml installs libclang-dev
+          # via apt in pre-build; on the cross :main musl image
+          # (Ubuntu 24.04 base) that resolves to llvm-19. The env var
+          # is passed through to the container via Cross.toml's
+          # [build.env] passthrough.
+          LIBCLANG_PATH: /usr/lib/llvm-19/lib
         run: |
           cross build --release --locked \
             --bin satd --bin sat-cli \

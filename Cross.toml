@@ -1,21 +1,33 @@
 # cross-rs configuration overrides.
 #
 # librocksdb-sys's build-script uses bindgen, which links against
-# libclang to parse RocksDB's C++ headers. The default cross 0.2.5
-# musl images are Ubuntu-20.04-based with libclang-10, which is too
-# old for the bindgen version pulled in transitively — the linker
-# can't resolve `clang_Type_getValueType` (added in libclang 16).
+# libclang to parse RocksDB's C++ headers. The cross 0.2.5 musl
+# images ship libclang-10 by default; bindgen 0.69+ requires
+# libclang 16+ for `clang_Type_getValueType` and friends, so a vanilla
+# `cross build` against the default image fails at link time:
 #
-# Point at cross-rs's `main`-tagged images for the musl targets;
-# those are Ubuntu-22.04-based with libclang-14+, which carries the
-# symbol. Tradeoff: `:main` floats — pin to a specific date-tagged
-# image once one is verified-green here.
+#   rust-lld: error: undefined symbol: clang_Type_getValueType
 #
-# Only musl targets are overridden; the workspace doesn't build for
-# musl via plain `cargo`, only inside cross-rs.
+# The `:main` images are slightly newer but still don't carry a new
+# enough libclang. Workaround: pre-build install libclang-dev on top
+# of the base image (Ubuntu 24.04-based, so libclang-19) and point
+# bindgen at it via LIBCLANG_PATH. The bindgen build script also
+# passes LIBCLANG_PATH to the linker via clang-sys.
+#
+# Tradeoff: adds ~30s to each cross build for the apt-get. Cheap
+# compared to maintaining our own image.
+
+[build.env]
+passthrough = ["LIBCLANG_PATH"]
 
 [target.x86_64-unknown-linux-musl]
 image = "ghcr.io/cross-rs/x86_64-unknown-linux-musl:main"
+pre-build = [
+    "apt-get update && apt-get install -y --no-install-recommends libclang-dev",
+]
 
 [target.aarch64-unknown-linux-musl]
 image = "ghcr.io/cross-rs/aarch64-unknown-linux-musl:main"
+pre-build = [
+    "apt-get update && apt-get install -y --no-install-recommends libclang-dev",
+]
