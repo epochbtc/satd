@@ -314,12 +314,13 @@ jobs:
 
       - name: Build release binaries (zigbuild)
         if: matrix.use_zigbuild == true
-        env:
-          # bindgen runs on the host (build-script time, not target
-          # time), so it needs the host's libclang — Ubuntu 24.04
-          # ships libclang-19 here.
-          LIBCLANG_PATH: /usr/lib/llvm-19/lib
         run: |
+          # Leave LIBCLANG_PATH unset: clang-sys auto-discovers the
+          # apt-installed libclang via its built-in /usr/lib/llvm-*
+          # glob (the gnu/macos matrix entries rely on this same
+          # mechanism). Setting LIBCLANG_PATH to a hardcoded version
+          # is fragile — `libclang-dev` on ubuntu-24.04 currently
+          # points to libclang-18, but that's not contractual.
           cargo zigbuild --release --locked \
             --bin satd --bin sat-cli \
             --target ${{ matrix.target }}
