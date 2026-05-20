@@ -105,26 +105,45 @@ pub struct RpcTlsConfig {
     pub max_connections: usize,
 }
 
-/// Composite handle that stops both the plain-HTTP and (optional) TLS
-/// JSON-RPC surfaces. Returned by [`start`] so callers see a single
-/// `.stop()` call regardless of whether TLS is enabled. Mirrors the
-/// shutdown semantics of the plain-HTTP [`ServerHandle`] (i.e. an
-/// already-stopped surface is not an error).
+/// Composite handle that stops every plain-HTTP listener and the
+/// optional TLS surface. Returned by [`start`] so callers see a single
+/// `.stop()` call regardless of how many plain-HTTP binds were
+/// requested or whether TLS is enabled. Mirrors the shutdown
+/// semantics of the plain-HTTP [`ServerHandle`] (i.e. an already-
+/// stopped surface is not an error).
 #[derive(Clone)]
 pub struct RpcServerHandle {
-    plain: ServerHandle,
+    /// One handle per `--rpcbind` value. All share the same Methods +
+    /// auth middleware; per-bind listeners exist purely so a node can
+    /// bind several interfaces (the Bitcoin Core convention).
+    plain: Vec<ServerHandle>,
     tls: Option<ServerHandle>,
 }
 
 impl RpcServerHandle {
-    /// Tell both surfaces to stop. Ignores `AlreadyStopped` on the TLS
-    /// surface so a previously-fired bridge or test teardown does not
-    /// propagate an error to the caller.
+    /// Tell every plain-HTTP listener and the optional TLS surface to
+    /// stop. Ignores `AlreadyStopped` errors so a previously-fired
+    /// bridge or test teardown does not propagate to the caller.
     pub fn stop(&self) -> Result<(), jsonrpsee::server::AlreadyStoppedError> {
         if let Some(tls) = &self.tls {
             let _ = tls.stop();
         }
-        self.plain.stop()
+        // Stop every plain listener. We return the FIRST error if any,
+        // but always attempt to stop the rest — a half-stopped server
+        // leaves an open port that an operator can't easily close
+        // without killing the process.
+        let mut first_err: Option<jsonrpsee::server::AlreadyStoppedError> = None;
+        for h in &self.plain {
+            if let Err(e) = h.stop()
+                && first_err.is_none()
+            {
+                first_err = Some(e);
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 }
 
@@ -304,13 +323,26 @@ where
 
 /// Start the JSON-RPC HTTP server with authentication.
 ///
-/// When `tls` is `Some`, also binds a parallel HTTPS listener using
-/// the supplied PEM cert + key. The plain-HTTP path is unchanged from
-/// the no-TLS configuration; TLS is purely additive. The returned
-/// [`RpcServerHandle`] stops both surfaces on `.stop()`.
+/// `bind_addrs` is the list of plain-HTTP bind addresses (one or more,
+/// per `--rpcbind`). Each gets its own listener task; all share the
+/// same auth + Methods (Arc-backed, cheap to clone). When `tls` is
+/// `Some`, also binds a parallel HTTPS listener using the supplied
+/// PEM cert + key. The plain-HTTP path is unchanged from the no-TLS
+/// configuration; TLS is purely additive. The returned
+/// [`RpcServerHandle`] stops every plain listener AND the TLS surface
+/// on `.stop()`.
+///
+/// `_allowip` is parsed and surfaced to operators via `getconfig` /
+/// `effective_view`. Per-request enforcement is gated on a follow-up
+/// (PR-1b) which switches the plain-HTTP path to a manual accept loop
+/// — the source IP isn't surfaced by jsonrpsee's standard
+/// `Server::start()` flow. The static "must allowlist before exposing"
+/// check in `Config::load` already prevents the misconfigured-
+/// exposure case.
 #[allow(clippy::too_many_arguments)]
 pub async fn start(
-    bind_addr: SocketAddr,
+    bind_addrs: Vec<SocketAddr>,
+    _allowip: Vec<crate::rpc::allowip::IpAllowEntry>,
     tls: Option<RpcTlsConfig>,
     auth: Arc<RpcAuth>,
     // `tls_auth` is applied to the TLS surface only. `None` (the
@@ -1755,18 +1787,31 @@ pub async fn start(
     // future tightening on this builder from silently leaving the TLS
     // surface on the old (looser) defaults.
     let server_cfg = ServerConfig::default();
-    let plain_middleware = tower::ServiceBuilder::new().layer(AuthLayer::new(auth.clone()));
-    let server = ServerBuilder::new()
-        .set_config(server_cfg.clone())
-        .set_http_middleware(plain_middleware)
-        .build(bind_addr)
-        .await?;
-
-    // Methods is Arc-backed and cheap to clone; we keep one copy here
-    // to feed the TLS path's per-connection service builder if TLS is
-    // enabled. (`Server::start` consumes its own copy.)
+    // Methods is Arc-backed and cheap to clone — one copy is consumed
+    // by each per-bind `Server::start()` call below, plus one to feed
+    // the TLS path's per-connection service builder if TLS is enabled.
     let methods: Methods = module.into();
-    let plain_handle = server.start(methods.clone());
+    if bind_addrs.is_empty() {
+        return Err("rpc::server::start: bind_addrs is empty".into());
+    }
+    let mut plain_handles: Vec<ServerHandle> = Vec::with_capacity(bind_addrs.len());
+    for bind_addr in &bind_addrs {
+        // Each listener gets its own AuthLayer instance (cheap — the
+        // underlying Arc<RpcAuth> is shared). Building per-listener
+        // keeps middleware state owned by the listener that uses it,
+        // which simplifies a future per-bind allowlist policy.
+        let plain_middleware =
+            tower::ServiceBuilder::new().layer(AuthLayer::new(auth.clone()));
+        let server = ServerBuilder::new()
+            .set_config(server_cfg.clone())
+            .set_http_middleware(plain_middleware)
+            .build(*bind_addr)
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("failed to bind RPC server on {bind_addr}: {e}").into()
+            })?;
+        plain_handles.push(server.start(methods.clone()));
+    }
 
     let tls_handle = if let Some(tls_cfg) = tls {
         let mut shutdown_rx_for_tls = shutdown_tx_outer.subscribe();
@@ -1791,7 +1836,7 @@ pub async fn start(
     };
 
     Ok(RpcServerHandle {
-        plain: plain_handle,
+        plain: plain_handles,
         tls: tls_handle,
     })
 }
