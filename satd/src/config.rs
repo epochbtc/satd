@@ -620,6 +620,10 @@ pub struct Config {
     /// (Core-style flood guard; default 3).
     pub maxinboundperip: usize,
     pub bind: String,
+    /// P2P connection timeout in **milliseconds**, matching Bitcoin
+    /// Core's `-timeout` semantics. Defaults to 5000 (5s) when unset.
+    /// Parsed via [`parse_timeout_value`] which also accepts the
+    /// suffix-disambiguated forms `5s` / `5000ms`.
     #[allow(dead_code)]
     pub timeout: u64,
     pub addnode: Vec<String>,
@@ -1698,10 +1702,20 @@ impl Config {
                 .bind
                 .or_else(|| file_get("bind"))
                 .unwrap_or_else(|| "0.0.0.0".to_string()),
-            timeout: cli
-                .timeout
-                .or_else(|| file_get("timeout").and_then(|v| v.parse().ok()))
-                .unwrap_or(10),
+            timeout: {
+                // Resolve in CLI > config > default(5000ms) order.
+                // `parse_timeout_value` returns milliseconds and
+                // emits a one-time stderr warning if a bare integer
+                // looks like seconds-style legacy (≤300 — anything
+                // below that is way too short for a real ms timeout
+                // and almost certainly came from an old satd config
+                // where the field was seconds).
+                let raw = cli.timeout.clone().or_else(|| file_get("timeout"));
+                match raw {
+                    Some(s) => parse_timeout_value(&s)?,
+                    None => 5000,
+                }
+            },
             addnode: {
                 let mut nodes = cli.addnode;
                 if nodes.is_empty() {
@@ -2665,12 +2679,17 @@ pub struct CliArgs {
     )]
     pub bind: Option<String>,
 
+    /// P2P connection timeout. Bitcoin Core's `-timeout` takes
+    /// milliseconds (default 5000); satd matches that interpretation
+    /// for bare integers. Suffix-disambiguated forms — `5s`, `5000ms`
+    /// — are also accepted so an operator can be explicit. Stored in
+    /// `Config::timeout` as milliseconds.
     #[arg(
         long,
-        value_name = "SECS",
-        help = "P2P connection timeout in seconds (default: 10)"
+        value_name = "MS|Ns|Nms",
+        help = "P2P connection timeout, in milliseconds (default 5000). Accepts `5s` or `5000ms` for explicit units."
     )]
-    pub timeout: Option<u64>,
+    pub timeout: Option<String>,
 
     #[arg(
         long,
@@ -3231,11 +3250,18 @@ impl ConfigFile {
         Self::parse(&content)
     }
 
+    /// Parse Bitcoin-Core-format `bitcoin.conf` content. Returns an
+    /// error on any unrecognised key (key not in [`KNOWN_CONFIG_KEYS`]):
+    /// Bitcoin Core hard-errors here too, and silent acceptance of
+    /// typos is the kind of misconfiguration nobody catches until it
+    /// matters in production (e.g. `rpcusser=alice` in a hardened
+    /// node config that never opens the RPC).
     pub fn parse(content: &str) -> Result<Self, String> {
         let mut file = ConfigFile::default();
         let mut current_section: Option<String> = None;
 
-        for line in content.lines() {
+        for (idx, line) in content.lines().enumerate() {
+            let line_no = idx + 1;
             let trimmed = line.trim();
             if trimmed.is_empty() || trimmed.starts_with('#') {
                 continue;
@@ -3257,6 +3283,20 @@ impl ConfigFile {
                 (trimmed.to_string(), "1".to_string())
             };
 
+            // Reject unrecognised keys with a Core-style line-numbered
+            // error. Wallet keys (`wallet=`, `walletdir=`, ...) are
+            // not on the allowlist — satd intentionally has no wallet,
+            // and silently accepting them would leave operators
+            // unaware their wallet config has zero effect.
+            if !is_known_config_key(&key) {
+                return Err(format!(
+                    "Error reading configuration file: parse error on line {line_no}: \
+                    unrecognized key '{key}'. If this is a Bitcoin Core key satd does \
+                    not yet support, see SATD_CLI_COMPAT_AUDIT.md for the parity \
+                    roadmap; otherwise check for typos."
+                ));
+            }
+
             let map = match &current_section {
                 Some(section) => file.sections.entry(section.clone()).or_default(),
                 None => &mut file.global,
@@ -3266,6 +3306,185 @@ impl ConfigFile {
 
         Ok(file)
     }
+}
+
+/// Every config-file key satd recognises today. Sorted by source-of-
+/// truth: this list is derived from the union of (a) every `file_get`
+/// / `file_get_all` call in `Config::load`, (b) the CLI flags that
+/// have a `clap` long form, and (c) the Bitcoin-Core-compatibility
+/// aliases tracked in `SATD_CLI_COMPAT_AUDIT.md`.
+///
+/// The list deliberately includes keys for features that are still
+/// deferred (e.g. `includeconf`, `signetchallenge`): operators
+/// pasting their Core config get no hard-error on those lines; the
+/// keys are silently accepted and the feature lands without
+/// breaking existing configs.
+const KNOWN_CONFIG_KEYS: &[&str] = &[
+    // Network selection
+    "regtest",
+    "testnet",
+    "signet",
+    "chain",
+    // Filesystem
+    "datadir",
+    "blocksdir",
+    "conf",
+    "includeconf",
+    "pid",
+    "profile",
+    // Daemon control
+    "daemon",
+    "server",
+    "logformat",
+    "maxshutdownsecs",
+    // RPC server
+    "rpcport",
+    "rpcbind",
+    "rpcallowip",
+    "rpcuser",
+    "rpcpassword",
+    "rpcauth",
+    "rpccookiefile",
+    "rpccookieperms",
+    "rpcdefaultunits",
+    "rpcdisableauth",
+    "rpcextendederrors",
+    // RPC TLS
+    "rpctlsbind",
+    "rpctlscert",
+    "rpctlskey",
+    "rpctlshandshaketimeout",
+    "rpcmtls",
+    "rpcmtlsclientca",
+    "rpcmtlsclientallow",
+    // P2P
+    "listen",
+    "port",
+    "bind",
+    "connect",
+    "addnode",
+    "maxconnections",
+    "maxinboundperip",
+    "dns",
+    "bantime",
+    "timeout",
+    "onlynet",
+    "signetchallenge",
+    "signetseednode",
+    // Proxy / Tor
+    "proxy",
+    "onion",
+    "torcontrol",
+    "torpassword",
+    // Consensus
+    "assumevalid",
+    "assumevalidage",
+    "stopatheight",
+    "consensus",
+    // Indexing
+    "txindex",
+    "addressindex",
+    "addrindexsubscriptions",
+    "blockfilterindex",
+    "peerblockfilters",
+    // Mempool / relay policy
+    "mempoolfullrbf",
+    "maxmempool",
+    "minrelaytxfee",
+    "dustrelayfee",
+    "datacarrier",
+    "datacarriersize",
+    "limitancestorcount",
+    "limitdescendantcount",
+    "mempoolexpiry",
+    "permitbaremultisig",
+    // Esplora
+    "esplora",
+    "esplorabind",
+    "esploratlsbind",
+    "esploratlscert",
+    "esploratlskey",
+    "esploramtls",
+    "esploramtlsclientca",
+    "esploramtlsclientallow",
+    "esploraprefix",
+    "esploracors",
+    "esplorarequesttimeout",
+    "esploramaxconns",
+    "esplorasseconns",
+    "esploraauth",
+    "esploracookiefile",
+    "esplorauserpass",
+    // Electrum
+    "electrum",
+    "electrumbind",
+    "electrumtlsbind",
+    "electrumtlscert",
+    "electrumtlskey",
+    "electrummtls",
+    "electrummtlsclientca",
+    "electrummtlsclientallow",
+    "electrummaxconns",
+    "electrummaxsubsperconn",
+    "electrumrequesttimeout",
+    "electrummaxbatchrequests",
+    "electrummaxbroadcastpackagetxs",
+    "electrumfeehistogramttl",
+    "electrumbanner",
+    // Storage / pruning / reindex
+    "prune",
+    "reindex",
+    "reindexchainstate",
+    "dbcache",
+    "storageprofile",
+    "prefetchworkers",
+    "maxahead",
+    "maxopenfiles",
+    "rocksdbbackgroundjobs",
+    "rocksdbsubcompactions",
+    "rocksdbwalmb",
+    "compactiondiagintervalsecs",
+    "compactionintervalsecs",
+    "compactionl0at",
+    "ibdl0pauseat",
+    "stallwatchdogsecs",
+    "stallabortsecs",
+    "shadowqueuesize",
+    "shadowworkers",
+    // Mining
+    "blockmaxweight",
+    "blockmintxfee",
+    "par",
+    // Events
+    "eventsnodeid",
+    "eventsregion",
+    "eventsgrpcbind",
+    "eventsgrpcallowremote",
+    "eventszmqbind",
+    "eventszmqhashtx",
+    "eventszmqhashblock",
+    "eventszmqmpevict",
+    "eventszmqmpreplace",
+    "eventszmqmpconfirm",
+    "eventszmqnodeevent",
+    // Webhooks
+    "reorgwebhook",
+    "reorgwebhooksecret",
+    // MCP
+    "mcp",
+    "mcpstdio",
+    "mcpport",
+    "mcpbind",
+    // Metrics / health
+    "metricsport",
+    "metricsbind",
+];
+
+/// Is the given config-file key recognised? Returns true for any
+/// entry in [`KNOWN_CONFIG_KEYS`]. Case-sensitive — Bitcoin Core's
+/// behaviour is too.
+pub fn is_known_config_key(key: &str) -> bool {
+    KNOWN_CONFIG_KEYS.contains(&key)
 }
 
 fn default_datadir() -> PathBuf {
@@ -3355,6 +3574,53 @@ fn parse_rpcbind_entry(s: &str, default_port: u16) -> Result<SocketAddr, String>
         `127.0.0.1`, `127.0.0.1:8332`, `[::1]`, `[::1]:8332`, `0.0.0.0`."
             .to_string(),
     )
+}
+
+/// Parse a `-timeout=<value>` argument, returning milliseconds.
+///
+/// Accepts:
+///   - bare integer (`5000`)      → treated as ms (matches Bitcoin Core)
+///   - `Nms` suffix (`5000ms`)    → explicit ms
+///   - `Ns` suffix (`5s`)         → seconds × 1000
+///
+/// A bare integer ≤ 300 emits a one-time stderr warning: that range
+/// is suspiciously short for a real ms timeout (300ms ≈ 0.3s) and is
+/// almost certainly a leftover from satd's old `-timeout=N` interpretation
+/// where N was seconds. The value is still treated as ms — the
+/// warning is purely informational, the operator can update or use
+/// `Ns` to be explicit. Future release: turn into a hard error.
+pub fn parse_timeout_value(s: &str) -> Result<u64, String> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Err("--timeout: empty value".to_string());
+    }
+    // Suffix forms first so `5ms` doesn't trip the bare-int warning
+    // on the substring "5".
+    if let Some(rest) = trimmed.strip_suffix("ms") {
+        let n: u64 = rest
+            .parse()
+            .map_err(|e| format!("--timeout: invalid ms value {rest:?}: {e}"))?;
+        return Ok(n);
+    }
+    if let Some(rest) = trimmed.strip_suffix('s') {
+        let n: u64 = rest
+            .parse()
+            .map_err(|e| format!("--timeout: invalid seconds value {rest:?}: {e}"))?;
+        return Ok(n.saturating_mul(1000));
+    }
+    // Bare integer: ms (Core semantics). Warn if it looks like
+    // seconds-style legacy.
+    let n: u64 = trimmed
+        .parse()
+        .map_err(|e| format!("--timeout: expected integer or N[ms|s], got {trimmed:?}: {e}"))?;
+    if n > 0 && n <= 300 {
+        eprintln!(
+            "warning: --timeout={n} interpreted as {n} milliseconds (matches Bitcoin Core's \
+            -timeout=). If you meant {n} seconds, write --timeout={n}s explicitly. \
+            satd-of-the-past used seconds; this warning will become an error in a future release."
+        );
+    }
+    Ok(n)
 }
 
 /// Parse a Bitcoin Core `-chain=<name>` value to a `bitcoin::Network`.
@@ -4631,5 +4897,164 @@ rpcport=39999
         .unwrap();
         let cfg = Config::from_cli(cli).unwrap();
         assert_eq!(cfg.network, Network::Regtest);
+    }
+
+    // ---- PR-3: hard-error on unknown keys + --timeout unit fix ----
+
+    #[test]
+    fn unknown_config_key_hard_errors() {
+        // Typo in rpcuser → rpusser. This is exactly the silent-
+        // misconfiguration scenario this PR exists to prevent. The
+        // operator's config file should fail to load, citing the
+        // specific line number.
+        let content = "\
+rpcuser=alice
+rpusser=oops
+rpcpassword=secret
+";
+        let err = ConfigFile::parse(content).unwrap_err();
+        assert!(
+            err.contains("line 2"),
+            "expected line 2 in error, got: {err}"
+        );
+        assert!(
+            err.contains("rpusser"),
+            "expected the bad key in the error, got: {err}"
+        );
+        assert!(
+            err.contains("Error reading configuration file"),
+            "expected Core-style prefix, got: {err}"
+        );
+    }
+
+    #[test]
+    fn unknown_key_in_section_hard_errors() {
+        let content = "\
+[regtest]
+notarealkey=1
+";
+        let err = ConfigFile::parse(content).unwrap_err();
+        assert!(err.contains("notarealkey"));
+        assert!(err.contains("line 2"));
+    }
+
+    #[test]
+    fn wallet_keys_intentionally_rejected() {
+        // Wallet support is intentionally excluded. A Core operator
+        // pasting `wallet=mywallet.dat` should get a clear error,
+        // not silent ignore.
+        let content = "wallet=mywallet.dat\n";
+        let err = ConfigFile::parse(content).unwrap_err();
+        assert!(
+            err.contains("wallet"),
+            "expected the rejected wallet key cited, got: {err}"
+        );
+    }
+
+    #[test]
+    fn all_known_keys_round_trip() {
+        // Every entry in KNOWN_CONFIG_KEYS must round-trip through
+        // ConfigFile::parse. This catches the case where someone
+        // adds a key to the allowlist without making it actually
+        // parseable (e.g. accidentally introducing whitespace in
+        // the constant).
+        for key in KNOWN_CONFIG_KEYS {
+            let content = format!("{key}=1\n");
+            let cf = ConfigFile::parse(&content)
+                .unwrap_or_else(|e| panic!("known key {key:?} failed to parse: {e}"));
+            assert!(
+                cf.global.contains_key(*key),
+                "key {key:?} parsed but didn't land in global map"
+            );
+        }
+    }
+
+    #[test]
+    fn pr1_and_pr2_keys_are_known() {
+        // Cross-PR guard: PR-1's keys (rpcbind family, rpcauth,
+        // cookie controls) and PR-2's keys (chain, blocksdir,
+        // signetseednode, includeconf, signetchallenge) MUST be in
+        // the allowlist even though those clap bindings live on
+        // other branches. This way PR-3's hard-error doesn't
+        // immediately break an operator running PR-1+PR-2+PR-3
+        // post-merge.
+        let pr1_keys = [
+            "rpcbind",
+            "rpcallowip",
+            "rpcauth",
+            "rpccookiefile",
+            "rpccookieperms",
+        ];
+        let pr2_keys = [
+            "chain",
+            "blocksdir",
+            "signetseednode",
+            "signetchallenge",
+            "includeconf",
+        ];
+        for k in pr1_keys.iter().chain(pr2_keys.iter()) {
+            assert!(
+                is_known_config_key(k),
+                "{k:?} should be in KNOWN_CONFIG_KEYS"
+            );
+        }
+    }
+
+    #[test]
+    fn timeout_bare_integer_is_milliseconds() {
+        // Bare integer ≥ 1000 = clearly intentional ms; no warning.
+        assert_eq!(parse_timeout_value("5000").unwrap(), 5000);
+        assert_eq!(parse_timeout_value("60000").unwrap(), 60000);
+    }
+
+    #[test]
+    fn timeout_explicit_seconds_suffix() {
+        assert_eq!(parse_timeout_value("5s").unwrap(), 5000);
+        assert_eq!(parse_timeout_value("60s").unwrap(), 60_000);
+        // Whitespace-tolerant.
+        assert_eq!(parse_timeout_value("  10s  ").unwrap(), 10_000);
+    }
+
+    #[test]
+    fn timeout_explicit_milliseconds_suffix() {
+        assert_eq!(parse_timeout_value("5000ms").unwrap(), 5000);
+        assert_eq!(parse_timeout_value("250ms").unwrap(), 250);
+    }
+
+    #[test]
+    fn timeout_small_bare_integer_still_works() {
+        // The legacy seconds-style value (e.g. `10` from satd-of-the-
+        // past) is interpreted as 10 ms. Operator gets a stderr
+        // warning (not asserted here — captured warnings need a
+        // separate harness) but the value passes through.
+        assert_eq!(parse_timeout_value("10").unwrap(), 10);
+    }
+
+    #[test]
+    fn timeout_garbage_errors() {
+        assert!(parse_timeout_value("").is_err());
+        assert!(parse_timeout_value("abc").is_err());
+        assert!(parse_timeout_value("5seconds").is_err());
+        assert!(parse_timeout_value("5x").is_err());
+        // Suffix-stripping path: `abcs` strips trailing `s` → "abc"
+        // → fails to parse as integer via the seconds-path error.
+        let err = parse_timeout_value("abcs").unwrap_err();
+        assert!(err.contains("seconds"), "got: {err}");
+        // Suffix-stripping path: `xms` strips trailing `ms` → "x"
+        // → fails the ms-path int parse.
+        let err = parse_timeout_value("xms").unwrap_err();
+        assert!(err.contains("ms value"), "got: {err}");
+    }
+
+    #[test]
+    fn unknown_key_error_points_to_audit_doc() {
+        // The error message should hint at the audit doc so an
+        // operator confused by "why is `rpccookieperms` unknown?"
+        // can find the parity roadmap.
+        let err = ConfigFile::parse("garbagekey=1\n").unwrap_err();
+        assert!(
+            err.contains("SATD_CLI_COMPAT_AUDIT.md"),
+            "expected audit doc reference, got: {err}"
+        );
     }
 }
