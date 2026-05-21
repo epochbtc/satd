@@ -261,6 +261,14 @@ pub struct ProfileDefaults {
 pub struct Config {
     pub network: Network,
     pub datadir: PathBuf,
+    /// Alternative location for `blocks/`. `None` means use the
+    /// default `<datadir>/blocks` (or network-suffixed equivalent
+    /// like `<datadir>/regtest/blocks`). Mirrors Bitcoin Core's
+    /// `-blocksdir=<dir>`.
+    pub blocksdir: Option<PathBuf>,
+    /// Additional signet seed nodes. Empty = built-in seeds only.
+    /// Only consulted on signet.
+    pub signet_seed_nodes: Vec<String>,
     pub rpcport: u16,
     pub rpcbind: String,
     pub rpcuser: Option<String>,
@@ -688,8 +696,51 @@ impl Config {
             .transpose()?;
         let profile_defaults: ProfileDefaults = profile.map(|p| p.defaults()).unwrap_or_default();
 
-        // Determine network from CLI flags
-        let network = if cli.regtest || profile_defaults.network_regtest {
+        // Determine datadir (datadir lookup intentionally precedes
+        // network resolution because the config file location depends
+        // on datadir, and the config file may carry `chain=`).
+        let base_datadir = cli.datadir.clone().unwrap_or_else(default_datadir);
+
+        // Determine config file path and parse it.
+        let conf_path = cli
+            .conf
+            .clone()
+            .unwrap_or_else(|| base_datadir.join("bitcoin.conf"));
+        let config_file = if conf_path.exists() {
+            Some(ConfigFile::parse_file(&conf_path)?)
+        } else {
+            None
+        };
+
+        // Network resolution. Precedence:
+        //   1. --chain=<name>   (Bitcoin Core's unified selector)
+        //   2. --regtest / --testnet / --signet   (older form, still
+        //      accepted)
+        //   3. config-file `chain=<name>` line
+        //   4. profile defaults
+        //   5. mainnet
+        //
+        // Refuse to start if --chain conflicts with the older single-
+        // network flags: the operator's intent is ambiguous and
+        // silently picking one would be the wrong kind of helpful.
+        if cli.chain.is_some() && (cli.regtest || cli.testnet || cli.signet) {
+            return Err(
+                "--chain conflicts with --regtest/--testnet/--signet — pass only one of them"
+                    .to_string(),
+            );
+        }
+        let chain_from_cli = cli.chain.as_deref();
+        // `chain_from_cli` first, then look for `chain=` in the config
+        // file global. The section-keyed lookup is intentionally
+        // skipped here because sections are themselves chain-keyed
+        // — a `chain=` line inside `[main]` would be circular.
+        let chain_from_file: Option<String> = config_file
+            .as_ref()
+            .and_then(|cf| cf.global.get("chain"))
+            .and_then(|v: &Vec<String>| v.last().cloned());
+        let network = if let Some(name) = chain_from_cli.or(chain_from_file.as_deref()) {
+            parse_chain_name(name)?
+        } else if cli.regtest || profile_defaults.network_regtest {
             Network::Regtest
         } else if cli.testnet {
             Network::Testnet
@@ -699,23 +750,16 @@ impl Config {
             Network::Bitcoin
         };
 
-        // Determine datadir
-        let base_datadir = cli.datadir.unwrap_or_else(default_datadir);
-
-        // Determine config file path and parse it
-        let conf_path = cli
-            .conf
-            .unwrap_or_else(|| base_datadir.join("bitcoin.conf"));
-        let config_file = if conf_path.exists() {
-            Some(ConfigFile::parse_file(&conf_path)?)
-        } else {
-            None
-        };
-
-        // Section name for the active network
+        // Section name for the active network. Matches Bitcoin Core's
+        // section naming convention so a Core `bitcoin.conf` with
+        // `[regtest]` / `[test]` / `[signet]` / `[main]` blocks is
+        // picked up correctly. Before this PR, Signet fell through
+        // to `[main]` — that silently merged mainnet operator
+        // settings into a signet node, a real misconfiguration risk.
         let section = match network {
             Network::Regtest => "regtest",
             Network::Testnet => "test",
+            Network::Signet => "signet",
             Network::Bitcoin => "main",
             _ => "main",
         };
@@ -756,6 +800,36 @@ impl Config {
 
         let rpcuser = cli.rpcuser.or_else(|| file_get("rpcuser"));
         let rpcpassword = cli.rpcpassword.or_else(|| file_get("rpcpassword"));
+
+        // --blocksdir resolution: CLI > config file > None (= use
+        // default `<datadir>/<net>/blocks`). The path is kept as-is —
+        // the storage layer is what consults it; this layer just
+        // surfaces it to operator-visible config echo and asserts it
+        // is absolute when present (relative paths would be
+        // ambiguous against the network-suffixed datadir).
+        let blocksdir = cli
+            .blocksdir
+            .or_else(|| file_get("blocksdir").map(PathBuf::from));
+        if let Some(p) = &blocksdir
+            && p.is_relative()
+        {
+            return Err(format!(
+                "--blocksdir must be an absolute path, got {p:?}. Relative paths would \
+                be ambiguous against satd's network-suffixed datadir (regtest/, signet/, \
+                testnet3/)."
+            ));
+        }
+
+        // --signetseednode resolution: CLI list wins; else config
+        // (multi). Only meaningful on Signet; on other networks the
+        // value is parsed and stored but unused. Logging a warning
+        // when set off-signet would be noisy for operators with a
+        // single config used across networks via `[signet]` sections.
+        let signet_seed_nodes: Vec<String> = if !cli.signetseednode.is_empty() {
+            cli.signetseednode.clone()
+        } else {
+            file_get_all("signetseednode")
+        };
 
         let rpc_tls_bind = cli.rpctlsbind.or_else(|| file_get("rpctlsbind"));
         let rpc_tls_cert = cli
@@ -1306,6 +1380,8 @@ impl Config {
         Ok(Config {
             network,
             datadir: base_datadir,
+            blocksdir,
+            signet_seed_nodes,
             rpcport,
             rpcbind,
             rpcuser,
@@ -1647,6 +1723,8 @@ impl Config {
         serde_json::json!({
             "network": self.network.to_string(),
             "datadir": self.datadir.display().to_string(),
+            "blocksdir": self.blocksdir.as_ref().map(|p| p.display().to_string()),
+            "signet_seed_nodes": self.signet_seed_nodes,
             "profile": self.profile.map(|p| p.as_str()).unwrap_or("(none)"),
             "rpc": {
                 "port": self.rpcport,
@@ -1757,11 +1835,48 @@ pub struct CliArgs {
     #[arg(long, help = "Use signet network")]
     pub signet: bool,
 
+    /// Bitcoin Core's unified network selector. Accepted values:
+    /// `main`, `test`, `signet`, `regtest`. `testnet4` is recognised
+    /// but currently rejected with a clear error — the underlying
+    /// chain params are not yet wired through satd (tracked
+    /// separately; see SATD_CLI_COMPAT_AUDIT.md). Conflicts with the
+    /// older `--regtest`/`--testnet`/`--signet` flags; the operator
+    /// must pick one form.
+    #[arg(
+        long,
+        value_name = "NAME",
+        help = "Network selector: main|test|signet|regtest. Alternative to --regtest/--testnet/--signet."
+    )]
+    pub chain: Option<String>,
+
     #[arg(long, value_name = "DIR", help = "Data directory")]
     pub datadir: Option<PathBuf>,
 
+    /// Alternative location for `blocks/` and the flat-file undo
+    /// data. Mirrors Bitcoin Core's `-blocksdir=<dir>`: blocks live
+    /// here, chainstate and everything else live under `--datadir`.
+    /// Lets operators put a large block archive on a slow disk while
+    /// keeping the UTXO set on SSD.
+    #[arg(
+        long,
+        value_name = "DIR",
+        help = "Directory holding blocks/ (default: <datadir>/blocks)"
+    )]
+    pub blocksdir: Option<PathBuf>,
+
     #[arg(long, value_name = "FILE", help = "Config file path")]
     pub conf: Option<PathBuf>,
+
+    /// Additional signet seed nodes. Mirrors Bitcoin Core's
+    /// `-signetseednode=<host[:port]>`. Repeatable. Useful when
+    /// running a private signet that isn't in the built-in seed
+    /// list. Has no effect on non-signet networks.
+    #[arg(
+        long,
+        value_name = "HOST[:PORT]",
+        help = "Additional signet seed node (repeatable). Signet only."
+    )]
+    pub signetseednode: Vec<String>,
 
     #[arg(long, value_name = "PORT", help = "RPC server port")]
     pub rpcport: Option<u16>,
@@ -2632,7 +2747,10 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "regtest",
         "testnet",
         "signet",
+        "chain",
         "datadir",
+        "blocksdir",
+        "signetseednode",
         "conf",
         "rpcport",
         "rpcuser",
@@ -2836,6 +2954,30 @@ fn default_p2p_port(network: Network) -> u16 {
     }
 }
 
+/// Parse a Bitcoin Core `-chain=<name>` value to a `bitcoin::Network`.
+/// Accepts every canonical name Core does plus a few common aliases.
+/// `testnet4` is recognised but rejected with a clear error — the
+/// chain params aren't wired through satd yet, and silently mapping
+/// it to `Network::Testnet` (testnet3) would land an operator's
+/// node on the wrong chain.
+fn parse_chain_name(s: &str) -> Result<Network, String> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "main" | "mainnet" | "bitcoin" => Ok(Network::Bitcoin),
+        "test" | "testnet" | "testnet3" => Ok(Network::Testnet),
+        "signet" => Ok(Network::Signet),
+        "regtest" => Ok(Network::Regtest),
+        "testnet4" => Err(
+            "--chain=testnet4 is not yet supported by satd. Use --chain=test for \
+            testnet3, or wait for the testnet4 plumbing PR (see \
+            SATD_CLI_COMPAT_AUDIT.md)."
+                .to_string(),
+        ),
+        other => Err(format!(
+            "--chain: unknown network {other:?}. Accepted values: main, test, signet, regtest."
+        )),
+    }
+}
+
 fn parse_bool(s: &str) -> Option<bool> {
     match s {
         "1" | "true" | "yes" => Some(true),
@@ -2946,6 +3088,9 @@ rpcport=8332
             regtest: true,
             testnet: false,
             signet: false,
+            chain: None,
+            blocksdir: None,
+            signetseednode: Vec::new(),
             datadir: Some(PathBuf::from("/tmp/satd-test")),
             conf: None,
             rpcport: None,
@@ -3090,6 +3235,9 @@ rpcport=8332
             regtest: true,
             testnet: false,
             signet: false,
+            chain: None,
+            blocksdir: None,
+            signetseednode: Vec::new(),
             datadir: Some(PathBuf::from("/tmp/satd-test")),
             conf: None,
             rpcport: None,
@@ -3648,5 +3796,184 @@ rpcport=8332
             err.contains("electrummtlsclientallow") && err.contains("electrummtls"),
             "expected allowlist-without-mtls error, got: {err}"
         );
+    }
+
+    // ---- PR-2: --chain / [signet] / --blocksdir / --signetseednode ----
+
+    #[test]
+    fn chain_selector_parses_core_names() {
+        assert_eq!(parse_chain_name("main").unwrap(), Network::Bitcoin);
+        assert_eq!(parse_chain_name("mainnet").unwrap(), Network::Bitcoin);
+        assert_eq!(parse_chain_name("bitcoin").unwrap(), Network::Bitcoin);
+        assert_eq!(parse_chain_name("test").unwrap(), Network::Testnet);
+        assert_eq!(parse_chain_name("testnet").unwrap(), Network::Testnet);
+        assert_eq!(parse_chain_name("testnet3").unwrap(), Network::Testnet);
+        assert_eq!(parse_chain_name("signet").unwrap(), Network::Signet);
+        assert_eq!(parse_chain_name("regtest").unwrap(), Network::Regtest);
+        // Case-insensitive.
+        assert_eq!(parse_chain_name("REGTEST").unwrap(), Network::Regtest);
+        assert_eq!(parse_chain_name("Signet").unwrap(), Network::Signet);
+    }
+
+    #[test]
+    fn chain_selector_rejects_testnet4_with_helpful_error() {
+        let err = parse_chain_name("testnet4").unwrap_err();
+        assert!(
+            err.contains("not yet supported") && err.contains("--chain=test"),
+            "expected explicit testnet4 deferral error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn chain_selector_rejects_garbage() {
+        let err = parse_chain_name("mainnett").unwrap_err();
+        assert!(err.contains("unknown network"), "got: {err}");
+    }
+
+    #[test]
+    fn chain_flag_routes_to_network() {
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--chain=regtest",
+            "--datadir=/tmp/satd-chain-test1",
+        ])
+        .unwrap();
+        let cfg = Config::from_cli(cli).unwrap();
+        assert_eq!(cfg.network, Network::Regtest);
+    }
+
+    #[test]
+    fn chain_flag_conflicts_with_old_form() {
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--chain=regtest",
+            "--signet",
+            "--datadir=/tmp/satd-chain-test2",
+        ])
+        .unwrap();
+        let err = Config::from_cli(cli).unwrap_err();
+        assert!(
+            err.contains("--chain conflicts"),
+            "expected conflict error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn chain_single_dash_alias() {
+        let args = vec![
+            "satd".to_string(),
+            "-chain=signet".to_string(),
+            "-blocksdir=/data/blocks".to_string(),
+            "-signetseednode=seed.example.com".to_string(),
+        ];
+        let n = normalize_args(args);
+        assert_eq!(n[1], "--chain=signet");
+        assert_eq!(n[2], "--blocksdir=/data/blocks");
+        assert_eq!(n[3], "--signetseednode=seed.example.com");
+    }
+
+    #[test]
+    fn blocksdir_must_be_absolute() {
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-chain-test3",
+            "--blocksdir=relative/blocks",
+        ])
+        .unwrap();
+        let err = Config::from_cli(cli).unwrap_err();
+        assert!(
+            err.contains("absolute path"),
+            "expected absolute-path error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn blocksdir_absolute_is_accepted() {
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-chain-test4",
+            "--blocksdir=/var/lib/satd-blocks",
+        ])
+        .unwrap();
+        let cfg = Config::from_cli(cli).unwrap();
+        assert_eq!(
+            cfg.blocksdir.as_ref().unwrap().display().to_string(),
+            "/var/lib/satd-blocks"
+        );
+    }
+
+    #[test]
+    fn blocksdir_defaults_to_none() {
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-chain-test5",
+        ])
+        .unwrap();
+        let cfg = Config::from_cli(cli).unwrap();
+        assert!(cfg.blocksdir.is_none());
+    }
+
+    #[test]
+    fn signetseednode_collects_repeated_values() {
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--signet",
+            "--datadir=/tmp/satd-chain-test6",
+            "--signetseednode=seed-a.example",
+            "--signetseednode=seed-b.example:39333",
+        ])
+        .unwrap();
+        let cfg = Config::from_cli(cli).unwrap();
+        assert_eq!(cfg.signet_seed_nodes.len(), 2);
+        assert_eq!(cfg.signet_seed_nodes[0], "seed-a.example");
+        assert_eq!(cfg.signet_seed_nodes[1], "seed-b.example:39333");
+    }
+
+    #[test]
+    fn signet_section_takes_priority_for_signet() {
+        // Before this PR Signet fell through to [main]; verify the
+        // [signet] section now routes to Signet correctly. We use
+        // rpcport as the marker since it's a simple integer.
+        let content = "\
+[main]
+rpcport=8332
+[signet]
+rpcport=39999
+";
+        let tmpdir = tempfile::tempdir().unwrap();
+        let conf_path = tmpdir.path().join("bitcoin.conf");
+        std::fs::write(&conf_path, content).unwrap();
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--signet",
+            "--datadir",
+            tmpdir.path().to_str().unwrap(),
+            "--conf",
+            conf_path.to_str().unwrap(),
+        ])
+        .unwrap();
+        let cfg = Config::from_cli(cli).unwrap();
+        assert_eq!(cfg.rpcport, 39999, "signet section should win on signet");
+    }
+
+    #[test]
+    fn chain_from_config_file_global() {
+        let content = "chain=regtest\nrpcport=18443\n";
+        let tmpdir = tempfile::tempdir().unwrap();
+        let conf_path = tmpdir.path().join("bitcoin.conf");
+        std::fs::write(&conf_path, content).unwrap();
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--datadir",
+            tmpdir.path().to_str().unwrap(),
+            "--conf",
+            conf_path.to_str().unwrap(),
+        ])
+        .unwrap();
+        let cfg = Config::from_cli(cli).unwrap();
+        assert_eq!(cfg.network, Network::Regtest);
     }
 }
