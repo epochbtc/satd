@@ -2052,14 +2052,61 @@ impl Config {
 
     /// Returns the network-specific data directory (e.g. ~/.bitcoin/regtest/).
     pub fn network_datadir(&self) -> PathBuf {
-        match self.network {
-            Network::Regtest => self.datadir.join("regtest"),
-            Network::Testnet => self.datadir.join("testnet3"),
-            Network::Signet => self.datadir.join("signet"),
-            Network::Bitcoin => self.datadir.clone(),
-            _ => self.datadir.clone(),
+        match chain_subdir(self.network) {
+            Some(sub) => self.datadir.join(sub),
+            None => self.datadir.clone(),
         }
     }
+
+    /// Resolve the directory that holds the block flat-files (`blk*.dat`),
+    /// matching Bitcoin Core's `-blocksdir` semantics. See
+    /// [`resolve_blocks_dir`] for the path rules.
+    pub fn blocks_dir(&self) -> PathBuf {
+        resolve_blocks_dir(self.blocksdir.as_deref(), &self.datadir, self.network)
+    }
+}
+
+/// The chain-specific subdirectory name Bitcoin Core uses under the
+/// data/blocks roots: `None` for mainnet (no subdir), else the Core
+/// directory name. Centralised so `network_datadir` and `blocks_dir`
+/// can't drift apart.
+fn chain_subdir(network: Network) -> Option<&'static str> {
+    match network {
+        Network::Bitcoin => None,
+        Network::Regtest => Some("regtest"),
+        Network::Testnet => Some("testnet3"),
+        Network::Signet => Some("signet"),
+        _ => None,
+    }
+}
+
+/// Resolve the block flat-file directory per Bitcoin Core's `-blocksdir`
+/// semantics.
+///
+/// Core treats `-blocksdir` as the ROOT under which the chain-specific
+/// `blocks/` subtree lives — NOT as the flat-files directory itself. So
+/// `-blocksdir=/data` puts mainnet blocks at `/data/blocks` and regtest
+/// blocks at `/data/regtest/blocks`. Reusing one `-blocksdir` across
+/// networks therefore keeps each chain's blocks separated instead of
+/// dumping every network's `blk*.dat` into the same directory.
+///
+/// When `blocksdir` is `None`, blocks live under the network datadir
+/// (`<datadir>/<chain>/blocks`) — the same path satd produced before
+/// this helper existed.
+pub fn resolve_blocks_dir(
+    blocksdir: Option<&std::path::Path>,
+    datadir: &std::path::Path,
+    network: Network,
+) -> PathBuf {
+    let mut p = match blocksdir {
+        Some(root) => root.to_path_buf(),
+        None => datadir.to_path_buf(),
+    };
+    if let Some(sub) = chain_subdir(network) {
+        p.push(sub);
+    }
+    p.push("blocks");
+    p
 }
 
 /// CLI arguments compatible with bitcoind flags.
@@ -3588,6 +3635,47 @@ rpcport=8332
             PathBuf::from("/tmp/satd-test/regtest")
         );
         assert!(config.mempoolfullrbf); // full RBF on by default
+    }
+
+    #[test]
+    fn blocks_dir_matches_core_layout() {
+        use std::path::Path;
+        let data = Path::new("/data");
+        let blk = Path::new("/mnt/blocks");
+
+        // No -blocksdir: blocks live under the network datadir. Mainnet
+        // has no chain subdir; the others do.
+        assert_eq!(
+            resolve_blocks_dir(None, data, Network::Bitcoin),
+            PathBuf::from("/data/blocks")
+        );
+        assert_eq!(
+            resolve_blocks_dir(None, data, Network::Regtest),
+            PathBuf::from("/data/regtest/blocks")
+        );
+        assert_eq!(
+            resolve_blocks_dir(None, data, Network::Signet),
+            PathBuf::from("/data/signet/blocks")
+        );
+        assert_eq!(
+            resolve_blocks_dir(None, data, Network::Testnet),
+            PathBuf::from("/data/testnet3/blocks")
+        );
+
+        // With -blocksdir: the flag is the ROOT; the chain subdir + blocks
+        // are appended so different networks never share a flat-file dir.
+        assert_eq!(
+            resolve_blocks_dir(Some(blk), data, Network::Bitcoin),
+            PathBuf::from("/mnt/blocks/blocks")
+        );
+        assert_eq!(
+            resolve_blocks_dir(Some(blk), data, Network::Regtest),
+            PathBuf::from("/mnt/blocks/regtest/blocks")
+        );
+        assert_eq!(
+            resolve_blocks_dir(Some(blk), data, Network::Signet),
+            PathBuf::from("/mnt/blocks/signet/blocks")
+        );
     }
 
     #[test]

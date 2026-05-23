@@ -146,16 +146,12 @@ async fn main() {
     // setup so the legacy-detect error doesn't write to the cookie file
     // or bind a port unnecessarily.
     //
-    // `blocks_dir` honours --blocksdir if set, falling back to the
-    // default `<net_datadir>/blocks`. When --blocksdir is supplied,
-    // satd uses it directly (NOT joined with the network suffix): the
-    // operator who explicitly points satd at `/data/blocks` does not
-    // want satd to silently turn that into `/data/blocks/regtest/blocks`
-    // when switching networks. This matches Bitcoin Core's behavior.
-    let blocks_dir = config
-        .blocksdir
-        .clone()
-        .unwrap_or_else(|| net_datadir.join("blocks"));
+    // `blocks_dir` resolves --blocksdir per Bitcoin Core semantics: the
+    // flag is the ROOT under which the chain-specific `blocks/` subtree
+    // lives, so `-blocksdir=/data` yields `/data/blocks` on mainnet and
+    // `/data/regtest/blocks` on regtest — block files for different
+    // networks never collide. Unset => `<net_datadir>/blocks`.
+    let blocks_dir = config.blocks_dir();
     let legacy_redb = net_datadir.join("chainstate.redb");
     if legacy_redb.exists() {
         eprintln!(
