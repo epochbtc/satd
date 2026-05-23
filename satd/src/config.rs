@@ -3283,6 +3283,22 @@ impl ConfigFile {
                 (trimmed.to_string(), "1".to_string())
             };
 
+            // Hard-error on Bitcoin Core keys we RECOGNISE but do not yet
+            // honour. Silently accepting them is the dangerous case the
+            // strict parser exists to prevent: e.g. `includeconf` would
+            // make a config look valid while every setting in the
+            // included file is silently dropped. Better to fail loudly
+            // than to run with a security-sensitive option ignored.
+            if is_recognized_unsupported_key(&key) {
+                return Err(format!(
+                    "Error reading configuration file: parse error on line {line_no}: \
+                    '{key}' is a Bitcoin Core option that satd recognises but does NOT \
+                    yet implement, so honouring this line would silently drop its \
+                    effect. Remove it (or track its support in \
+                    SATD_CLI_COMPAT_AUDIT.md) before starting satd."
+                ));
+            }
+
             // Reject unrecognised keys with a Core-style line-numbered
             // error. Wallet keys (`wallet=`, `walletdir=`, ...) are
             // not on the allowlist — satd intentionally has no wallet,
@@ -3314,11 +3330,11 @@ impl ConfigFile {
 /// have a `clap` long form, and (c) the Bitcoin-Core-compatibility
 /// aliases tracked in `SATD_CLI_COMPAT_AUDIT.md`.
 ///
-/// The list deliberately includes keys for features that are still
-/// deferred (e.g. `includeconf`, `signetchallenge`): operators
-/// pasting their Core config get no hard-error on those lines; the
-/// keys are silently accepted and the feature lands without
-/// breaking existing configs.
+/// Keys for Core features satd recognises but has NOT yet implemented
+/// are deliberately NOT in this list — see [`RECOGNIZED_UNSUPPORTED_KEYS`].
+/// Those hard-error rather than being silently accepted, because an
+/// accepted-but-ignored option (e.g. `includeconf`) is more dangerous
+/// than a rejected one.
 const KNOWN_CONFIG_KEYS: &[&str] = &[
     // Network selection
     "regtest",
@@ -3329,7 +3345,6 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "datadir",
     "blocksdir",
     "conf",
-    "includeconf",
     "pid",
     "profile",
     // Daemon control
@@ -3369,7 +3384,6 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "bantime",
     "timeout",
     "onlynet",
-    "signetchallenge",
     "signetseednode",
     // Proxy / Tor
     "proxy",
@@ -3480,11 +3494,30 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "metricsbind",
 ];
 
+/// Bitcoin Core config keys satd RECOGNISES but does not yet implement.
+/// These hard-error at parse time instead of being silently accepted:
+/// an accepted-but-ignored option lets a config look valid while its
+/// effect is dropped. `includeconf` is the marquee hazard — operators
+/// routinely move security-sensitive options into an included file, so
+/// silently ignoring it could run a node wide open. When a key here
+/// gains real support, move it into [`KNOWN_CONFIG_KEYS`].
+const RECOGNIZED_UNSUPPORTED_KEYS: &[&str] = &[
+    "includeconf",     // recursive config inclusion (audit: PR-2b)
+    "signetchallenge", // custom signet challenge script (audit: PR-2b)
+];
+
 /// Is the given config-file key recognised? Returns true for any
 /// entry in [`KNOWN_CONFIG_KEYS`]. Case-sensitive — Bitcoin Core's
 /// behaviour is too.
 pub fn is_known_config_key(key: &str) -> bool {
     KNOWN_CONFIG_KEYS.contains(&key)
+}
+
+/// Is `key` a Bitcoin Core option satd recognises but has not yet
+/// implemented? Such keys hard-error rather than being silently
+/// accepted. See [`RECOGNIZED_UNSUPPORTED_KEYS`].
+pub fn is_recognized_unsupported_key(key: &str) -> bool {
+    RECOGNIZED_UNSUPPORTED_KEYS.contains(&key)
 }
 
 fn default_datadir() -> PathBuf {
@@ -4972,12 +5005,11 @@ notarealkey=1
     #[test]
     fn pr1_and_pr2_keys_are_known() {
         // Cross-PR guard: PR-1's keys (rpcbind family, rpcauth,
-        // cookie controls) and PR-2's keys (chain, blocksdir,
-        // signetseednode, includeconf, signetchallenge) MUST be in
-        // the allowlist even though those clap bindings live on
-        // other branches. This way PR-3's hard-error doesn't
-        // immediately break an operator running PR-1+PR-2+PR-3
-        // post-merge.
+        // cookie controls) and PR-2's IMPLEMENTED keys (chain,
+        // blocksdir, signetseednode) MUST be in the allowlist even
+        // though those clap bindings live on other branches. This way
+        // PR-3's hard-error doesn't immediately break an operator
+        // running PR-1+PR-2+PR-3 post-merge.
         let pr1_keys = [
             "rpcbind",
             "rpcallowip",
@@ -4985,19 +5017,46 @@ notarealkey=1
             "rpccookiefile",
             "rpccookieperms",
         ];
-        let pr2_keys = [
-            "chain",
-            "blocksdir",
-            "signetseednode",
-            "signetchallenge",
-            "includeconf",
-        ];
+        let pr2_keys = ["chain", "blocksdir", "signetseednode"];
         for k in pr1_keys.iter().chain(pr2_keys.iter()) {
             assert!(
                 is_known_config_key(k),
                 "{k:?} should be in KNOWN_CONFIG_KEYS"
             );
         }
+    }
+
+    #[test]
+    fn recognized_unsupported_keys_hard_error() {
+        // includeconf / signetchallenge are Core keys we recognise but
+        // do NOT implement. They must hard-error (not be silently
+        // accepted), and must NOT be in the plain known-keys allowlist.
+        for k in ["includeconf", "signetchallenge"] {
+            assert!(
+                is_recognized_unsupported_key(k),
+                "{k:?} should be a recognised-unsupported key"
+            );
+            assert!(
+                !is_known_config_key(k),
+                "{k:?} must not be in the implemented allowlist"
+            );
+            let err = ConfigFile::parse(&format!("{k}=/some/value")).unwrap_err();
+            assert!(
+                err.contains("recognises but does NOT") && err.contains(k),
+                "expected a recognised-unsupported error for {k:?}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn includeconf_does_not_silently_drop_settings() {
+        // The dangerous case: a config that looks valid while an
+        // included file's settings vanish. We must fail loudly instead.
+        let err = ConfigFile::parse("includeconf=secrets.conf\nserver=1\n").unwrap_err();
+        assert!(
+            err.contains("includeconf") && err.contains("silently drop"),
+            "got: {err}"
+        );
     }
 
     #[test]
