@@ -12,6 +12,20 @@ use crate::validation::tx::check_transaction;
 /// Coinbase maturity: outputs cannot be spent until this many confirmations.
 const COINBASE_MATURITY: u32 = 100;
 
+/// Bitcoin Core's `MAX_SCRIPT_SIZE` (`script.h`). Scripts larger than
+/// this are provably unspendable.
+const MAX_SCRIPT_SIZE: usize = 10_000;
+
+/// Core's `CScript::IsUnspendable`: an output is provably unspendable —
+/// and therefore must never enter the UTXO set — when its script begins
+/// with `OP_RETURN` or exceeds [`MAX_SCRIPT_SIZE`]. Mirrors
+/// `(size() > 0 && *begin() == OP_RETURN) || (size() > MAX_SCRIPT_SIZE)`.
+/// Used by both `connect_block` (skip on add) and `disconnect_block`
+/// (skip on remove) so the two stay symmetric.
+pub(crate) fn is_unspendable(script: &bitcoin::Script) -> bool {
+    script.is_op_return() || script.len() > MAX_SCRIPT_SIZE
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConnectError {
     #[error("bad-txns-inputs-missingorspent")]
@@ -459,6 +473,23 @@ pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError>
         // Add outputs as new UTXOs (skip genesis coinbase)
         if !is_genesis || !is_coinbase {
             for (vout, output) in tx.output.iter().enumerate() {
+                // Core parity: provably-unspendable outputs are never
+                // added to the UTXO set. `CCoinsViewCache::AddCoin`
+                // skips `scriptPubKey.IsUnspendable()` — an OP_RETURN
+                // prefix or a script larger than MAX_SCRIPT_SIZE
+                // (10000). Such outputs can never be spent, so
+                // excluding them is consensus-safe; it is also REQUIRED
+                // to match Core's UTXO set, `gettxoutsetinfo`,
+                // `hash_serialized_3`, and the AssumeUTXO snapshot. (At
+                // mainnet height 840000 — the Runes launch — these are
+                // ~24% of all outputs.) The same `continue` also skips
+                // the address-index funding emit, matching Core, which
+                // does not index unspendable outputs. The BIP158 filter
+                // emit is separate (built per-spec from the block) and
+                // applies its own OP_RETURN rule.
+                if is_unspendable(&output.script_pubkey) {
+                    continue;
+                }
                 let outpoint = OutPoint {
                     txid,
                     vout: vout as u32,
@@ -665,6 +696,109 @@ mod tests {
         assert_eq!(batch.block_index_puts.len(), 1);
         assert_eq!(batch.height_hash_puts.len(), 1);
         assert!(batch.tip.is_some());
+    }
+
+    #[test]
+    fn test_is_unspendable() {
+        use bitcoin::script::Builder;
+        // OP_RETURN prefix → unspendable.
+        let op_return = Builder::new()
+            .push_opcode(bitcoin::opcodes::all::OP_RETURN)
+            .push_slice(*b"hello world.....")
+            .into_script();
+        assert!(is_unspendable(&op_return));
+        // Bare OP_RETURN (no data) → unspendable.
+        let bare = Builder::new()
+            .push_opcode(bitcoin::opcodes::all::OP_RETURN)
+            .into_script();
+        assert!(is_unspendable(&bare));
+        // Oversized (> MAX_SCRIPT_SIZE) → unspendable.
+        let oversized = bitcoin::ScriptBuf::from(vec![0x51u8; MAX_SCRIPT_SIZE + 1]);
+        assert!(is_unspendable(&oversized));
+        // Exactly MAX_SCRIPT_SIZE → spendable (Core uses strict `>`).
+        let at_limit = bitcoin::ScriptBuf::from(vec![0x51u8; MAX_SCRIPT_SIZE]);
+        assert!(!is_unspendable(&at_limit));
+        // Empty script → NOT unspendable (Core requires size()>0 for the
+        // OP_RETURN clause).
+        assert!(!is_unspendable(bitcoin::ScriptBuf::new().as_script()));
+        // Normal P2WPKH → spendable.
+        let p2wpkh = bitcoin::ScriptBuf::from(vec![0x00, 0x14].into_iter().chain([0u8; 20]).collect::<Vec<_>>());
+        assert!(!is_unspendable(&p2wpkh));
+    }
+
+    #[test]
+    fn test_connect_skips_unspendable_outputs() {
+        use bitcoin::script::Builder;
+        let store = InMemoryStore::new();
+        // Seed genesis so block at height 1 has a valid parent context.
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+
+        // Coinbase (height 1, BIP34) with three outputs:
+        //   vout 0: OP_RETURN  (unspendable — must be skipped)
+        //   vout 1: normal anyone-can-spend (must be kept)
+        //   vout 2: oversized  (unspendable — must be skipped)
+        let coinbase_script = Builder::new()
+            .push_int(1)
+            .push_opcode(bitcoin::opcodes::OP_FALSE)
+            .into_script();
+        let op_return = Builder::new()
+            .push_opcode(bitcoin::opcodes::all::OP_RETURN)
+            .push_slice(*b"runes...........")
+            .into_script();
+        let normal = Builder::new()
+            .push_opcode(bitcoin::opcodes::OP_TRUE)
+            .into_script();
+        let oversized = bitcoin::ScriptBuf::from(vec![0x51u8; MAX_SCRIPT_SIZE + 1]);
+        let coinbase = Transaction {
+            version: Version(2),
+            lock_time: bitcoin::blockdata::locktime::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: coinbase_script,
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![
+                TxOut { value: Amount::from_sat(0), script_pubkey: op_return },
+                TxOut { value: Amount::from_sat(block_subsidy(1)), script_pubkey: normal },
+                TxOut { value: Amount::from_sat(0), script_pubkey: oversized },
+            ],
+        };
+        let mut block = Block {
+            header: Header {
+                version: bitcoin::block::Version::from_consensus(0x2000_0000),
+                prev_blockhash: genesis.block_hash(),
+                merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+                time: 1_700_000_000,
+                bits: CompactTarget::from_consensus(0x207f_ffff),
+                nonce: 0,
+            },
+            txdata: vec![coinbase],
+        };
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+
+        let batch = connect_block(&ConnectParams {
+            store: &store,
+            block: &block,
+            height: 1,
+            parent_chainwork: &[0u8; 32],
+            flat_pos: default_pos(),
+            script_verifier: &NoopVerifier,
+            median_time_past: 0,
+            network: Network::Regtest,
+            pre_verified_txs: None,
+            num_threads: 1,
+            precomputed_txids: None,
+            address_index: &Default::default(),
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &Default::default(),
+            phase_tracker: None,
+        })
+        .unwrap();
+
+        // Only the spendable output (vout 1) enters the UTXO set.
+        assert_eq!(batch.coin_puts.len(), 1, "only the spendable output should be added");
+        assert_eq!(batch.coin_puts[0].0.vout, 1, "kept coin must be vout 1");
     }
 
     #[test]

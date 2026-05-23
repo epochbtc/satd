@@ -735,7 +735,19 @@ impl ChainState {
         // before we attempt the rename.
         drop(writer);
 
-        let hash_serialized_3 = bitcoin::hashes::sha256::Hash::from_engine(hs3_engine);
+        // Core finalizes hash_serialized_3 with `HashWriter::GetHash()`
+        // — a DOUBLE SHA-256 (`kernel/coinstats.cpp` FinalizeHash). The
+        // result is a `uint256` whose `ToString()` (and therefore the
+        // value quoted in `m_assumeutxo_data` / `dumptxoutset`'s
+        // `txoutset_hash`) is the byte-reversed form. We reverse the
+        // raw digest so `hash_serialized_3` is stored in the same
+        // natural order the anchor table uses (see
+        // `chain::assumeutxo::decode_sha256`). A single SHA-256, or the
+        // un-reversed digest, will NOT match Core.
+        let first = bitcoin::hashes::sha256::Hash::from_engine(hs3_engine);
+        let double = bitcoin::hashes::sha256::Hash::hash(first.as_byte_array());
+        let mut hash_serialized_3 = double.to_byte_array();
+        hash_serialized_3.reverse();
 
         // Atomic-on-same-FS rename. After this point the user can see
         // the file at the requested path; before, it lived as
@@ -747,7 +759,7 @@ impl ChainState {
             base_hash,
             base_height,
             path: final_path.to_path_buf(),
-            hash_serialized_3: hash_serialized_3.to_byte_array(),
+            hash_serialized_3,
         })
     }
 
@@ -2892,27 +2904,23 @@ struct DumpState<'w> {
 
 impl DumpState<'_> {
     fn visit(&mut self, op: &OutPoint, coin: &Coin) {
-        use crate::storage::compressed_coin as cc;
-
         if self.out_err.is_some() {
             return;
         }
 
-        // (1) Feed the HASH_SERIALIZED_3 hasher. This serialization is
-        // distinct from the snapshot file's per-coin serialization;
-        // it's used only to compute the comparison hash against
-        // Core's `m_assumeutxo_data.hash_serialized`.
-        self.txout_buf.clear();
-        if let Err(e) = cc::write_txout_ser(&mut self.txout_buf, op, coin) {
-            self.out_err = Some(DumpError::Io(e));
-            return;
-        }
-        bitcoin::hashes::HashEngine::input(&mut self.hs3_engine, &self.txout_buf);
-
-        // (2) Group by txid for the snapshot file. The cursor yields
-        // keys in `(txid, vout)` ascending order, so coins from the
-        // same txid arrive contiguously and we can emit each group
-        // when the txid changes.
+        // Group by txid. The store cursor yields keys in
+        // `(txid, vout_le)` order — vout is the 4-byte LE encoding in
+        // satd's coins CF key. That is NOT the order Core's coins DB
+        // uses: Core encodes vout as a VARINT in the key, so its cursor
+        // (and therefore both the snapshot file layout and the
+        // order-dependent hash_serialized_3 stream) visits a txid's
+        // outputs in *integer* vout order. The two agree for vout < 256
+        // but diverge above. We buffer the whole group and re-sort by
+        // integer vout in `emit_current_group` before emitting — both
+        // the file bytes and the hash feed happen there, in Core's
+        // order. Feeding the hash here (in cursor order) is what made
+        // the 840k cross-validation hash mismatch for the ~157k txids
+        // with vout >= 256.
         if self.current_txid != Some(op.txid) {
             if self.current_txid.is_some()
                 && let Err(e) = self.emit_current_group()
@@ -2932,6 +2940,12 @@ impl DumpState<'_> {
             Some(t) => t,
             None => return Ok(()),
         };
+
+        // Sort by integer vout to match Core's VARINT-keyed cursor
+        // order. Load-bearing for both the file layout and the
+        // order-dependent hash_serialized_3 (see `visit`).
+        self.current_group.sort_by_key(|(vout, _)| *vout);
+
         // Per Core `WriteUTXOSnapshot`:
         //   txid (32 bytes)
         //   CompactSize(coins.size())
@@ -2941,6 +2955,18 @@ impl DumpState<'_> {
         self.writer.write_all(&txid[..])?;
         cc::write_compact_size(self.writer, self.current_group.len() as u64)?;
         for (vout, coin) in &self.current_group {
+            // Feed HASH_SERIALIZED_3 in the same (txid, vout-asc) order
+            // Core uses. This serialization is distinct from the file's
+            // per-coin form; it exists only to match Core's
+            // `m_assumeutxo_data.hash_serialized`.
+            self.txout_buf.clear();
+            let op = OutPoint {
+                txid,
+                vout: *vout,
+            };
+            cc::write_txout_ser(&mut self.txout_buf, &op, coin).map_err(DumpError::Io)?;
+            bitcoin::hashes::HashEngine::input(&mut self.hs3_engine, &self.txout_buf);
+
             cc::write_compact_size(self.writer, u64::from(*vout))?;
             cc::serialize_coin(self.writer, coin)?;
         }
@@ -4535,8 +4561,16 @@ pub(crate) mod tests {
         }
         assert_eq!(decoded, 5);
 
-        let expected_hs3 =
-            bitcoin::hashes::sha256::Hash::from_engine(hs3).to_byte_array();
+        // Finalize exactly as the dump does: double SHA-256
+        // (Core's HashWriter::GetHash) then byte-reverse to the
+        // natural order used by the anchor table.
+        let expected_hs3 = {
+            let first = bitcoin::hashes::sha256::Hash::from_engine(hs3);
+            let double = bitcoin::hashes::sha256::Hash::hash(first.as_byte_array());
+            let mut b = double.to_byte_array();
+            b.reverse();
+            b
+        };
         assert_eq!(
             summary.hash_serialized_3, expected_hs3,
             "reported hash_serialized_3 must equal independent recomputation"
