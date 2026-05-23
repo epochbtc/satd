@@ -246,17 +246,21 @@ impl std::str::FromStr for EsploraAuthMode {
 }
 
 /// A single Bitcoin-Core-format rpcauth credential: the line
-/// `user:salt$hash` where `hash = hex(HMAC-SHA256(salt, password))`.
-/// `salt` is hex-encoded (Core uses 16 random bytes). Parsing splits
-/// on the first `:` and the first `$`; we deliberately don't allow `:`
-/// in the username because Core's rpcauth.py forbids it too (Basic-auth
-/// header is `user:pass`, so a `:` in the user breaks the decode).
+/// `user:salt$hash` where `hash = hex(HMAC-SHA256(key=salt, msg=password))`.
+/// Parsing splits on the first `:` and the first `$`; we deliberately
+/// don't allow `:` in the username because Core's rpcauth.py forbids it
+/// too (Basic-auth header is `user:pass`, so a `:` in the user breaks
+/// the decode).
 #[derive(Debug, Clone)]
 pub struct RpcAuthEntry {
     pub username: String,
-    /// Stored as raw bytes (hex-decoded). The HMAC key.
-    pub salt: Vec<u8>,
-    /// Stored as raw bytes (hex-decoded). The expected HMAC tag.
+    /// The salt EXACTLY as written in the config line. Core's
+    /// `share/rpcauth/rpcauth.py` emits a printable hex string and then
+    /// uses `salt.encode('utf-8')` as the HMAC key — i.e. the ASCII bytes
+    /// of the string, NOT the hex-decoded bytes. We must store and key on
+    /// the string verbatim or real Core-generated lines won't verify.
+    pub salt: String,
+    /// The expected HMAC-SHA256 tag, hex-decoded to 32 raw bytes.
     pub hash: Vec<u8>,
 }
 
@@ -269,14 +273,17 @@ impl RpcAuthEntry {
         if user.is_empty() {
             return Err("invalid --rpcauth entry: empty username".to_string());
         }
-        let (salt_hex, hash_hex) = rest.split_once('$').ok_or_else(|| {
+        let (salt, hash_hex) = rest.split_once('$').ok_or_else(|| {
             format!(
                 "invalid --rpcauth entry for user {user:?}: expected `user:salt$hash`, no `$` separator found"
             )
         })?;
-        let salt = hex::decode(salt_hex.trim()).map_err(|e| {
-            format!("invalid --rpcauth entry for user {user:?}: salt is not hex: {e}")
-        })?;
+        let salt = salt.trim();
+        if salt.is_empty() {
+            return Err(format!(
+                "invalid --rpcauth entry for user {user:?}: empty salt"
+            ));
+        }
         let hash = hex::decode(hash_hex.trim()).map_err(|e| {
             format!("invalid --rpcauth entry for user {user:?}: hash is not hex: {e}")
         })?;
@@ -292,7 +299,7 @@ impl RpcAuthEntry {
         }
         Ok(Self {
             username: user.to_string(),
-            salt,
+            salt: salt.to_string(),
             hash,
         })
     }
@@ -4071,13 +4078,24 @@ rpcport=8332
 
     #[test]
     fn rpcauth_entry_parses_core_format() {
-        // user:salt$hash where salt and hash are hex.
-        let salt_hex = "000102030405060708090a0b0c0d0e0f";
+        // user:salt$hash. The salt is kept VERBATIM as the string from
+        // the line (Core HMAC-keys on its ASCII bytes, not hex-decoded);
+        // only the hash is hex-decoded to the 32-byte tag.
+        let salt = "000102030405060708090a0b0c0d0e0f";
         let hash_hex = "0".repeat(64); // 32 bytes
-        let entry = RpcAuthEntry::parse(&format!("alice:{salt_hex}${hash_hex}")).unwrap();
+        let entry = RpcAuthEntry::parse(&format!("alice:{salt}${hash_hex}")).unwrap();
         assert_eq!(entry.username, "alice");
-        assert_eq!(entry.salt, hex::decode(salt_hex).unwrap());
+        assert_eq!(entry.salt, salt);
         assert_eq!(entry.hash.len(), 32);
+    }
+
+    #[test]
+    fn rpcauth_entry_keeps_non_hex_salt() {
+        // Core's rpcauth.py salt is always hex, but the salt field is an
+        // opaque HMAC key — we must not require it to be hex-decodable.
+        let hash_hex = "0".repeat(64);
+        let entry = RpcAuthEntry::parse(&format!("bob:zzNotHex!!${hash_hex}")).unwrap();
+        assert_eq!(entry.salt, "zzNotHex!!");
     }
 
     #[test]

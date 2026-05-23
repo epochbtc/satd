@@ -47,11 +47,13 @@ pub struct UserPassCredential {
 }
 
 /// One Bitcoin-Core-compatible `-rpcauth` entry, post-parse. `salt` is
-/// the HMAC key (raw bytes); `hash` is the expected 32-byte tag.
+/// the printable salt string from the config line; its ASCII bytes are
+/// the HMAC key (Core's rpcauth.py does `salt.encode('utf-8')`). `hash`
+/// is the expected 32-byte tag.
 #[derive(Debug, Clone)]
 pub struct RpcAuthCredential {
     pub username: String,
-    pub salt: Vec<u8>,
+    pub salt: String,
     pub hash: Vec<u8>,
 }
 
@@ -67,9 +69,16 @@ impl RpcAuth {
 
     /// Generate the cookie file at the given path with `perms` (octal),
     /// and return the credential-bearing `RpcAuth`. The cookie value
-    /// stored is `__cookie__:<token>` per Core's convention. The file
-    /// is written atomically (write then chmod) and removed by
+    /// stored is `__cookie__:<token>` per Core's convention. Removed by
     /// `cleanup()` on shutdown.
+    ///
+    /// The secret must never exist on disk with broader permissions than
+    /// requested, even momentarily. On Unix we therefore write to a temp
+    /// file in the destination directory created with the target mode at
+    /// `open(2)` time (so the kernel applies it before any bytes land),
+    /// then atomically `rename(2)` it into place. A bare
+    /// `write`-then-`chmod` would leave a window where the cookie is
+    /// readable per the process umask.
     pub fn generate_cookie_with(
         path: PathBuf,
         perms: u32,
@@ -85,15 +94,45 @@ impl RpcAuth {
         {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&path, &content)?;
         #[cfg(unix)]
         {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+            // create_new + mode: born with restrictive perms, fails if a
+            // stale temp exists rather than reusing a foreign file.
+            let mut f = match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(perms)
+                .open(&tmp)
+            {
+                Ok(f) => f,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let _ = std::fs::remove_file(&tmp);
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .mode(perms)
+                        .open(&tmp)?
+                }
+                Err(e) => return Err(e),
+            };
+            f.write_all(content.as_bytes())?;
+            f.sync_all()?;
+            // open() honours mode only when creating; an inherited umask
+            // can still mask bits off. Force the exact perms before the
+            // rename publishes the file.
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(perms))?;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(perms))?;
+            std::fs::rename(&tmp, &path)?;
         }
-        // `perms` is unused on non-Unix; suppress the warning.
         #[cfg(not(unix))]
-        let _ = perms;
+        {
+            // No mode control on non-Unix; perms is best-effort only.
+            let _ = perms;
+            std::fs::write(&path, &content)?;
+        }
         tracing::info!(
             cookie_path = %path.display(),
             perms = format!("0{:o}", perms),
@@ -158,7 +197,7 @@ impl RpcAuth {
             if user != ra.username {
                 continue;
             }
-            let Ok(mut mac) = HmacSha256::new_from_slice(&ra.salt) else {
+            let Ok(mut mac) = HmacSha256::new_from_slice(ra.salt.as_bytes()) else {
                 continue;
             };
             mac.update(pass.as_bytes());
@@ -329,14 +368,19 @@ mod tests {
 
     #[test]
     fn test_rpcauth_validate() {
-        // Core's rpcauth.py output for `user=alice`, `password=hunter2`,
-        // `salt=000102030405060708090a0b0c0d0e0f`. Hash computed via
-        // HMAC-SHA256 with `salt` as the key and `hunter2` as the
-        // message. Re-derived here so the test is self-contained.
-        let salt = hex::decode("000102030405060708090a0b0c0d0e0f").unwrap();
-        let mut mac = HmacSha256::new_from_slice(&salt).unwrap();
-        mac.update(b"hunter2");
-        let hash = mac.finalize().into_bytes().to_vec();
+        // FIXED VECTOR from Bitcoin Core's share/rpcauth/rpcauth.py
+        // semantics: HMAC-SHA256 with key = salt.encode('utf-8') (the
+        // ASCII bytes of the printable salt string, NOT hex-decoded) and
+        // message = password. Generated independently with CPython:
+        //   hmac.new(salt.encode(), password.encode(), 'sha256').hexdigest()
+        // for salt="deadbeefcafef00d1122334455667788",
+        //     password="hunter2longpassword".
+        // This MUST NOT be re-derived by our own implementation, or it
+        // can't catch a salt-handling regression.
+        let salt = "deadbeefcafef00d1122334455667788".to_string();
+        let hash =
+            hex::decode("9383f6d244049af54e59a84188e2f2b1e58ff20de019156bc0c430ff8ae4c7a3")
+                .unwrap();
         let auth = RpcAuth::Verify(Credentials {
             rpcauth: vec![RpcAuthCredential {
                 username: "alice".to_string(),
@@ -345,18 +389,18 @@ mod tests {
             }],
             ..Default::default()
         });
-        let ok = BASE64.encode("alice:hunter2");
+        let ok = BASE64.encode("alice:hunter2longpassword");
         assert!(auth.validate(&format!("Basic {}", ok)));
         let bad_pass = BASE64.encode("alice:wrong");
         assert!(!auth.validate(&format!("Basic {}", bad_pass)));
-        let bad_user = BASE64.encode("bob:hunter2");
+        let bad_user = BASE64.encode("bob:hunter2longpassword");
         assert!(!auth.validate(&format!("Basic {}", bad_user)));
     }
 
     #[test]
     fn test_multi_credential_any_passes() {
-        let salt = hex::decode("aabbccddeeff00112233445566778899").unwrap();
-        let mut mac = HmacSha256::new_from_slice(&salt).unwrap();
+        let salt = "aabbccddeeff00112233445566778899".to_string();
+        let mut mac = HmacSha256::new_from_slice(salt.as_bytes()).unwrap();
         mac.update(b"p4ss");
         let hash = mac.finalize().into_bytes().to_vec();
         let auth = RpcAuth::Verify(Credentials {

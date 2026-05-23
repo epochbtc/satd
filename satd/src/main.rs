@@ -240,7 +240,7 @@ async fn main() {
     let startup_handle = {
         let progress = startup_progress.clone();
         let auth_clone = auth.clone();
-        start_startup_rpc(rpc_binds.clone(), auth_clone, progress).await
+        start_startup_rpc(rpc_binds.clone(), config.rpcallowip.clone(), auth_clone, progress).await
     };
 
     // Service-manager heartbeat. On systemd this prevents the unit from
@@ -1989,12 +1989,12 @@ impl StartupRpcHandle {
 /// so the TUI can show startup progress instead of "Connecting...".
 async fn start_startup_rpc(
     bind_addrs: Vec<SocketAddr>,
+    allowip: Vec<node::rpc::allowip::IpAllowEntry>,
     auth: Arc<RpcAuth>,
     progress: Arc<node::startup_progress::StartupProgress>,
 ) -> StartupRpcHandle {
-    use jsonrpsee::server::{Methods, RpcModule, ServerBuilder};
+    use jsonrpsee::server::{Methods, RpcModule, ServerConfig};
     use jsonrpsee::types::ErrorObjectOwned;
-    use node::rpc::auth::AuthLayer;
 
     let mut module = RpcModule::new(progress);
 
@@ -2023,18 +2023,29 @@ async fn start_startup_rpc(
         .unwrap();
 
     let methods: Methods = module.into();
+    // Enforce `-rpcallowip` on the startup RPC too: it binds the same
+    // addresses as the full server, so an allowlisted operator expects
+    // the source ACL to cover this surface as well. Reuses the full
+    // server's manual accept loop (403 for non-allowlisted IPs). No
+    // shutdown bridge — these handles are stopped directly on the
+    // IBD→full-RPC transition.
+    let allowip = Arc::new(allowip);
     let mut handles = Vec::with_capacity(bind_addrs.len());
     for bind_addr in &bind_addrs {
-        let middleware = tower::ServiceBuilder::new().layer(AuthLayer::new(auth.clone()));
-        let server = ServerBuilder::new()
-            .set_http_middleware(middleware)
-            .build(*bind_addr)
-            .await
-            .unwrap_or_else(|e| {
-                eprintln!("Failed to start startup RPC server on {bind_addr}: {e}");
-                std::process::exit(1);
-            });
-        handles.push(server.start(methods.clone()));
+        let handle = node::rpc::server::spawn_plain_surface(
+            *bind_addr,
+            ServerConfig::default(),
+            auth.clone(),
+            allowip.clone(),
+            methods.clone(),
+            None,
+        )
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("Failed to start startup RPC server on {bind_addr}: {e}");
+            std::process::exit(1);
+        });
+        handles.push(handle);
     }
     StartupRpcHandle { handles }
 }
