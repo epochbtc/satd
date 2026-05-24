@@ -2030,15 +2030,19 @@ async fn start_startup_rpc(
     // shutdown bridge — these handles are stopped directly on the
     // IBD→full-RPC transition.
     let allowip = Arc::new(allowip);
+    let server_cfg = ServerConfig::builder()
+        .max_connections(node::rpc::server::RPC_MAX_CONNECTIONS)
+        .build();
     let mut handles = Vec::with_capacity(bind_addrs.len());
     for bind_addr in &bind_addrs {
         let handle = node::rpc::server::spawn_plain_surface(
             *bind_addr,
-            ServerConfig::default(),
+            server_cfg.clone(),
             auth.clone(),
             allowip.clone(),
             methods.clone(),
             None,
+            node::rpc::server::RPC_MAX_CONNECTIONS as usize,
         )
         .await
         .unwrap_or_else(|e| {

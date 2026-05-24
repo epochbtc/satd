@@ -9,13 +9,15 @@
 //! same host without forcing the operator to redundantly list
 //! `127.0.0.1` in `rpcallowip=`.
 //!
-//! Per-request enforcement is wired in PR-1b (it depends on a manual
-//! accept-loop refactor of the plain-HTTP path so the source IP can be
-//! injected into request extensions before the AuthLayer runs). For
-//! PR-1 the allowlist is parsed and surfaced via `getconfig` for
-//! visibility, and the static "must allowlist before exposing"
-//! validation in `Config::load` already prevents the misconfigured-
-//! exposure case.
+//! Enforcement happens at the TCP accept boundary: the plain-HTTP and
+//! startup RPC listeners run a manual accept loop (see
+//! `rpc::server::spawn_plain_surface`) that calls [`is_allowed`] on the
+//! peer's source IP for each connection and answers `403 Forbidden` to
+//! any non-allowlisted, non-loopback source — jsonrpsee's high-level
+//! `Server::start` never exposes the peer address to HTTP middleware, so
+//! a tower layer couldn't do this. The static "must allowlist before
+//! exposing" validation in `Config::load` is a complementary guard that
+//! refuses to start a non-loopback bind without an allowlist.
 
 use ipnet::IpNet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};

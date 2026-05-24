@@ -22,6 +22,12 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
 
+/// Max concurrent RPC connections per listener. Mirrors jsonrpsee's own
+/// `ServerConfig` default (100). Used both as the inner `ConnectionGuard`
+/// limit and as the plain-HTTP accept-level semaphore size, so the two
+/// bounds can't drift. Also passed to the startup-status RPC.
+pub const RPC_MAX_CONNECTIONS: u32 = 100;
+
 /// Shared, mutable record of which optional listeners actually bound
 /// at startup. Updated by the listener wiring after each successful
 /// bind; read by `getserverstatus` to report runtime — not config —
@@ -1781,11 +1787,15 @@ pub async fn start(
     //
     // `server_cfg` is built once and shared with the TLS path below so
     // both surfaces enforce the same jsonrpsee core limits (connection
-    // cap, request/response size, batch config, etc.). Today the value
-    // is the library default — making the source explicit prevents a
-    // future tightening on this builder from silently leaving the TLS
-    // surface on the old (looser) defaults.
-    let server_cfg = ServerConfig::default();
+    // cap, request/response size, batch config, etc.). We set
+    // `max_connections` explicitly to [`RPC_MAX_CONNECTIONS`] so the
+    // plain path's accept-level semaphore (which bounds raw sockets,
+    // including denied/idle ones, before the per-request ConnectionGuard
+    // is reached) is provably the same number rather than coupled to
+    // jsonrpsee's library default.
+    let server_cfg = ServerConfig::builder()
+        .max_connections(RPC_MAX_CONNECTIONS)
+        .build();
     // Methods is Arc-backed and cheap to clone — one copy is consumed
     // by each per-bind `Server::start()` call below, plus one to feed
     // the TLS path's per-connection service builder if TLS is enabled.
@@ -1808,6 +1818,7 @@ pub async fn start(
             allowip.clone(),
             methods.clone(),
             Some(shutdown_tx_outer.subscribe()),
+            RPC_MAX_CONNECTIONS as usize,
         )
         .await?;
         plain_handles.push(handle);
@@ -2065,11 +2076,20 @@ async fn spawn_tls_surface(
 /// the whole connection, and either serve the real RPC stack or answer
 /// every request on that connection with `403 Forbidden`.
 ///
-/// Connection capping, batch limits, WebSocket upgrades and graceful
-/// shutdown are all preserved because the per-connection service is the
-/// same `to_service_builder().build()` stack jsonrpsee uses internally —
-/// including its `ConnectionGuard` built from `server_cfg.max_connections`
-/// (shared across the per-connection clones).
+/// Batch limits, WebSocket upgrades and graceful shutdown are preserved
+/// because the per-connection service is the same `to_service_builder()
+/// .build()` stack jsonrpsee uses internally. That stack's inner
+/// `ConnectionGuard` only acquires a permit per *request*, though, so it
+/// does NOT bound raw sockets that are denied (403), idle, or slow before
+/// a request is dispatched. To make `rpcallowip`-on-a-public-bind actually
+/// safe we add an accept-level `Semaphore` (sized `max_connections`,
+/// mirroring the TLS surface): the permit is taken at accept — before the
+/// allow/deny decision and before any serve task is spawned — and held
+/// for the whole connection, so floods of denied/idle connections can't
+/// exhaust fds/tasks. At capacity the socket is dropped (TCP reset).
+///
+/// `max_connections` MUST match `server_cfg`'s connection cap; callers
+/// pass [`RPC_MAX_CONNECTIONS`], which `server_cfg` is also built from.
 pub async fn spawn_plain_surface(
     bind_addr: SocketAddr,
     server_cfg: ServerConfig,
@@ -2077,6 +2097,7 @@ pub async fn spawn_plain_surface(
     allowip: Arc<Vec<crate::rpc::allowip::IpAllowEntry>>,
     methods: Methods,
     shutdown_rx: Option<watch::Receiver<bool>>,
+    max_connections: usize,
 ) -> Result<ServerHandle, Box<dyn std::error::Error + Send + Sync>> {
     // Bind synchronously so a port conflict is a startup-fatal error
     // rather than a silently-dropped task that never accepts.
@@ -2109,6 +2130,11 @@ pub async fn spawn_plain_surface(
         });
     }
 
+    // Accept-level connection cap (covers denied/idle/slow sockets that
+    // never reach the per-request ConnectionGuard). Permit is acquired at
+    // accept and held for the connection's lifetime.
+    let conn_cap = std::sync::Arc::new(tokio::sync::Semaphore::new(max_connections.max(1)));
+
     let accept_stop = stop_handle.clone();
     tokio::spawn(async move {
         loop {
@@ -2123,6 +2149,23 @@ pub async fn spawn_plain_surface(
                     }
                 },
                 _ = accept_stop.clone().shutdown() => break,
+            };
+
+            // Take a connection permit BEFORE the allow/deny check, so a
+            // flood of non-allowlisted (or idle) sockets is bounded too.
+            // At capacity we drop the socket (the client sees a TCP
+            // reset) rather than queueing unbounded work.
+            let permit = match conn_cap.clone().try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => {
+                    tracing::warn!(
+                        peer = %peer,
+                        "RPC at-capacity rejection ({} max connections)",
+                        max_connections,
+                    );
+                    drop(stream);
+                    continue;
+                }
             };
 
             // One allow/deny decision per connection — the source IP is
@@ -2175,11 +2218,23 @@ pub async fn spawn_plain_surface(
                 },
             );
 
-            tokio::spawn(serve_with_graceful_shutdown(
+            // Spawn the serve future DIRECTLY (no wrapping async block) —
+            // wrapping it bites an HRTB-inference quirk on the service's
+            // request lifetime (the TLS path documents the same). To hold
+            // the connection permit for the connection's lifetime without
+            // re-triggering that quirk, a separate task owns the permit
+            // and awaits the serve task's JoinHandle (whose type doesn't
+            // name the service's HRTB lifetime); the permit drops when the
+            // connection ends.
+            let serve = tokio::spawn(serve_with_graceful_shutdown(
                 stream,
                 svc,
                 conn_stop.shutdown(),
             ));
+            tokio::spawn(async move {
+                let _permit = permit;
+                let _ = serve.await;
+            });
         }
     });
 
