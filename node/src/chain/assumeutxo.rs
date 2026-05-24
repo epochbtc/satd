@@ -12,10 +12,10 @@
 //! It is **NOT** the SHA-256 of the snapshot file. Running
 //! `sha256sum utxo-840000.dat` does **not** produce this value.
 //!
-//! It is Core's `HASH_SERIALIZED_3` UTXO-set hash: a single SHA-256
-//! over a concatenation of `TxOutSer(outpoint, coin)` for every coin
-//! in the UTXO set (in `(txid, vout)` ascending key order). The
-//! per-coin contribution is:
+//! It is Core's `HASH_SERIALIZED_3` UTXO-set hash: the **double**
+//! SHA-256 (`HashWriter::GetHash()`) over a concatenation of
+//! `TxOutSer(outpoint, coin)` for every coin in the UTXO set (in
+//! `(txid, vout)` ascending key order). The per-coin contribution is:
 //!
 //! - `outpoint` (36 bytes: 32-byte txid + 4-byte vout LE)
 //! - `uint32 LE: (height << 1) | coinbase` — fixed-width, NOT a varint
@@ -39,8 +39,10 @@
 //! - `blockhash`: rust-bitcoin's `BlockHash: FromStr` parses the
 //!   reversed (display) hex order — same as `bitcoin-cli` output —
 //!   which is what Core's source quotes.
-//! - `hash_serialized_3`: stored byte-for-byte in natural order. The
-//!   internal SHA-256 finalization produces these bytes directly.
+//! - `hash_serialized_3`: stored in the same order Core's source quotes
+//!   it — the `uint256` display (byte-reversed) form. `dumptxoutset`
+//!   produces it by reversing the raw double-SHA256 digest before
+//!   returning it, so the two match byte-for-byte.
 //!
 //! ## Relationship to checkpoints
 //!
@@ -64,8 +66,9 @@ pub struct AssumeUtxoData {
     /// nodes that don't yet have the pre-snapshot block index walked.
     pub nchaintx: u64,
     /// Bitcoin Core's `hash_serialized_3` over the snapshot's UTXO
-    /// set (single SHA-256 over the `TxOutSer` stream from
-    /// `kernel/coinstats.cpp`). See module docs.
+    /// set (double SHA-256 / `HashWriter::GetHash()` over the `TxOutSer`
+    /// stream from `kernel/coinstats.cpp`, byte-reversed). See module
+    /// docs.
     ///
     /// **This is NOT `sha256sum` of the snapshot file.** PR 5/5's
     /// `loadtxoutset` recomputes this hash from the loaded UTXO set

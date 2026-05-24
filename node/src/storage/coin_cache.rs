@@ -636,10 +636,11 @@ impl Store for CoinCache {
     fn for_each_coin_snapshot(
         &self,
         f: &mut dyn FnMut(&OutPoint, &Coin) -> Result<(), StoreError>,
-    ) -> Result<u64, StoreError> {
+    ) -> Result<crate::storage::CoinSnapshotBase, StoreError> {
         // Pure delegation: the caller is required to flush dirty entries
         // before invoking this (see ChainState::dump_utxo_snapshot), so
-        // the inner Store's snapshot already contains every coin.
+        // the inner Store's snapshot already contains every coin and its
+        // consistent base.
         self.inner.for_each_coin_snapshot(f)
     }
 
