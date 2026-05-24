@@ -480,11 +480,31 @@ impl PeerManager {
             addr,
         };
 
+        // Bound the dial itself with Core's `-timeout` (the same value
+        // that bounds the version/verack reads). Without this a
+        // blackholed route or a stalled SOCKS/onion proxy hangs the dial
+        // for the OS/proxy default rather than the configured value. The
+        // `_guard` above releases the pending-connection slot on the
+        // timeout early-return too.
+        let connect_timeout = Duration::from_millis(self.connect_timeout_ms.load(Ordering::Relaxed));
         let stream = if let Some(ref proxy_addr) = self.proxy {
-            proxy::connect_socks5(proxy_addr, addr).await?
-        } else {
-            TcpStream::connect(addr)
+            tokio::time::timeout(connect_timeout, proxy::connect_socks5(proxy_addr, addr))
                 .await
+                .map_err(|_| {
+                    format!(
+                        "connect to {addr} via proxy timed out after {}ms",
+                        connect_timeout.as_millis()
+                    )
+                })??
+        } else {
+            tokio::time::timeout(connect_timeout, TcpStream::connect(addr))
+                .await
+                .map_err(|_| {
+                    format!(
+                        "connect to {addr} timed out after {}ms",
+                        connect_timeout.as_millis()
+                    )
+                })?
                 .map_err(|e| format!("connect failed: {}", e))?
         };
 
@@ -510,7 +530,21 @@ impl PeerManager {
             .or(self.proxy.as_deref())
             .ok_or("no proxy configured for .onion connections")?;
 
-        let stream = proxy::connect_socks5_onion(proxy_addr, host, port).await?;
+        // Bound the onion dial with Core's `-timeout` too — an
+        // unresponsive onion proxy must not hang past the configured
+        // value.
+        let connect_timeout = Duration::from_millis(self.connect_timeout_ms.load(Ordering::Relaxed));
+        let stream = tokio::time::timeout(
+            connect_timeout,
+            proxy::connect_socks5_onion(proxy_addr, host, port),
+        )
+        .await
+        .map_err(|_| {
+            format!(
+                "connect to onion {host}:{port} via proxy timed out after {}ms",
+                connect_timeout.as_millis()
+            )
+        })??;
 
         // Use a placeholder SocketAddr for .onion peers (the actual routing is via proxy)
         let placeholder_addr: SocketAddr = ([0, 0, 0, 0], port).into();
