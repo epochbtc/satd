@@ -134,6 +134,15 @@ pub fn disconnect_block(
     for (tx_idx_rev, tx) in block.txdata.iter().enumerate().rev() {
         let txid = txids[tx_idx_rev];
         for (vout, output) in tx.output.iter().enumerate() {
+            // Symmetric with `connect_block`: provably-unspendable
+            // outputs were never added to the UTXO set (nor the address
+            // index), so they must not be removed here. Removing a coin
+            // that was never inserted would wrongly decrement the
+            // UTXO counter/histogram and push a spurious address-index
+            // funding-remove. See `connect::is_unspendable`.
+            if crate::chain::connect::is_unspendable(&output.script_pubkey) {
+                continue;
+            }
             let outpoint = OutPoint {
                 txid,
                 vout: vout as u32,
