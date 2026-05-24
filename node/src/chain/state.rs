@@ -3027,60 +3027,30 @@ fn make_incomplete_path(path: &Path) -> PathBuf {
 ///
 /// `std::fs::rename` would silently overwrite a file created at
 /// `final_path` after `dump_utxo_snapshot`'s early `path.exists()` check
-/// (POSIX `rename(2)` replaces the target). On Linux we use
-/// `renameat2(RENAME_NOREPLACE)` for an atomic no-clobber move; on other
-/// platforms we hard-link then unlink the temp name (the link fails if
-/// the target exists). Either way an existing `final_path` yields
-/// [`DumpError::RefuseOverwrite`] and is never destroyed.
+/// (POSIX `rename(2)` replaces the target). Instead we hard-link the
+/// temp file to `final_path` — `link(2)` fails with `EEXIST` if the
+/// target already exists, so an existing `final_path` yields
+/// [`DumpError::RefuseOverwrite`] and is never destroyed — then unlink
+/// the temp name.
+///
+/// A single uniform implementation (rather than `renameat2(NOREPLACE)`
+/// on glibc) is deliberate: `libc::renameat2` is not exposed for the
+/// musl target, and the release binaries we ship are musl-static, so a
+/// glibc-only fast path would mean testing a code path we never ship.
+/// `final_path` and the `.incomplete` temp share a directory (hence a
+/// filesystem), so the link always succeeds when the target is free.
 fn finalize_dump_path(temp_path: &Path, final_path: &Path) -> Result<(), DumpError> {
-    #[cfg(target_os = "linux")]
-    {
-        use std::ffi::CString;
-        use std::os::unix::ffi::OsStrExt;
-
-        let from = CString::new(temp_path.as_os_str().as_bytes())
-            .map_err(|e| DumpError::Io(io::Error::new(io::ErrorKind::InvalidInput, e)))?;
-        let to = CString::new(final_path.as_os_str().as_bytes())
-            .map_err(|e| DumpError::Io(io::Error::new(io::ErrorKind::InvalidInput, e)))?;
-
-        // SAFETY: both pointers are valid NUL-terminated C strings that
-        // outlive the call; AT_FDCWD resolves relative paths against the
-        // cwd exactly like the path-based `rename`.
-        let rc = unsafe {
-            libc::renameat2(
-                libc::AT_FDCWD,
-                from.as_ptr(),
-                libc::AT_FDCWD,
-                to.as_ptr(),
-                libc::RENAME_NOREPLACE,
-            )
-        };
-        if rc == 0 {
-            return Ok(());
+    match std::fs::hard_link(temp_path, final_path) {
+        Ok(()) => {
+            // The data is already durable at `final_path` via the shared
+            // inode; dropping the temp name is best-effort cleanup.
+            let _ = std::fs::remove_file(temp_path);
+            Ok(())
         }
-        let err = io::Error::last_os_error();
-        if err.raw_os_error() == Some(libc::EEXIST) {
-            return Err(DumpError::RefuseOverwrite(final_path.to_path_buf()));
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            Err(DumpError::RefuseOverwrite(final_path.to_path_buf()))
         }
-        Err(DumpError::Io(err))
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        // Portable no-replace fallback. `hard_link` fails with
-        // AlreadyExists if `final_path` exists; otherwise it succeeds
-        // (temp and target share a directory, hence a filesystem). The
-        // temp name is then dropped — best-effort, since the data is
-        // already durable at `final_path` via the same inode.
-        match std::fs::hard_link(temp_path, final_path) {
-            Ok(()) => {
-                let _ = std::fs::remove_file(temp_path);
-                Ok(())
-            }
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                Err(DumpError::RefuseOverwrite(final_path.to_path_buf()))
-            }
-            Err(e) => Err(DumpError::Io(e)),
-        }
+        Err(e) => Err(DumpError::Io(e)),
     }
 }
 
