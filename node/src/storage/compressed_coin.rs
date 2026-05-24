@@ -511,9 +511,11 @@ pub fn serialize_coin<W: Write>(w: &mut W, coin: &Coin) -> io::Result<()> {
 /// stored in `m_assumeutxo_data.hash_serialized`. The contract is:
 ///
 /// > Concatenate `write_txout_ser(outpoint, coin)` for every coin in
-/// > the UTXO set (in `(txid_bytes, vout_le)` ascending key order),
-/// > feed into a single SHA-256 engine. The final digest matches
-/// > Core's `hash_serialized_3`.
+/// > the UTXO set (in `(txid_bytes, vout_le)` ascending key order) and
+/// > finalize with Core's `HashWriter::GetHash()` — a **double**
+/// > SHA-256, byte-reversed to the `uint256` display form. That value
+/// > matches Core's `hash_serialized_3`. (A single SHA-256, or the
+/// > un-reversed digest, will not match.)
 ///
 /// Wire layout (per coin, ~50–100 bytes typical):
 ///
