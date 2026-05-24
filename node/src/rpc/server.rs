@@ -577,6 +577,14 @@ pub async fn start(
         Ok::<_, ErrorObjectOwned>(blockchain::save_mempool())
     })?;
 
+    module.register_method("dumptxoutset", |params, ctx, _extensions| {
+        let path: String = params
+            .one()
+            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+        blockchain::dump_txout_set(&ctx.chain_state, &path)
+            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
+    })?;
+
     // --- Address-history index RPCs (M3) ---
 
     module.register_method("getaddressbalance", |params, ctx, _extensions| {
@@ -1294,6 +1302,7 @@ pub async fn start(
             "decoderawtransaction",
             "decodescript",
             "disconnectnode",
+            "dumptxoutset",
             "estimatefees",
             "estimatesmartfee",
             "generateblock",

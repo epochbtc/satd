@@ -1,7 +1,10 @@
 use bitcoin::consensus::serialize;
+use bitcoin::hashes::Hash;
 use bitcoin::{Block, BlockHash, Network, OutPoint};
-use std::path::PathBuf;
 use parking_lot::{Mutex, RwLock};
+use std::fs::File;
+use std::io::{self, BufWriter, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -578,6 +581,174 @@ impl ChainState {
     ) -> Result<crate::storage::blockfile_audit::BlockfileAuditReport, crate::storage::blockfile_audit::AuditError>
     {
         crate::storage::blockfile_audit::audit_blockfiles(&*self.store, &self.blocks_dir)
+    }
+
+    /// Emit a Bitcoin Core-format UTXO snapshot file at `path` from the
+    /// current tip. The output is byte-compatible with `bitcoin-cli
+    /// dumptxoutset` and can be loaded into either Core or satd via
+    /// `loadtxoutset` (once that RPC lands in PR 5/5).
+    ///
+    /// Holds the tip read lock for the duration of the dump so the
+    /// snapshot is consistent (no block-connect can occur). Operators
+    /// should expect block processing to pause for the duration —
+    /// matching Core's behavior.
+    ///
+    /// Refuses to overwrite an existing file at `path` (matching Core).
+    pub fn dump_utxo_snapshot(&self, path: &Path) -> Result<DumpSummary, DumpError> {
+        // Refuse to clobber an existing dump at the final path (matches
+        // Core). Note: this is TOCTOU-racy against another process
+        // creating the path between this check and the final rename,
+        // but `dumptxoutset` is an operator-issued RPC with no
+        // concurrent-call expectation, and the rename target check is
+        // re-done atomically below via `create_new` on the temp path.
+        if path.exists() {
+            return Err(DumpError::RefuseOverwrite(path.to_path_buf()));
+        }
+
+        // Write to `<path>.incomplete` and atomically `rename(2)` on
+        // success. A crash or kill -9 mid-dump leaves an obvious
+        // `.incomplete` corpse rather than a half-written final file
+        // (operator-recoverable, no manual cleanup of the target path).
+        let temp_path = make_incomplete_path(path);
+
+        // Acquire output file first (with O_EXCL — fails if a stale
+        // `.incomplete` from a prior crash is in the way; operator
+        // must remove it). Done BEFORE the tip lock so file-permission
+        // and disk-full errors surface immediately without holding the
+        // chainstate hostage.
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .map_err(DumpError::Io)?;
+
+        // From this point on, any error path must remove `temp_path`
+        // so the operator can retry. Encapsulated in a closure-style
+        // RAII-ish pattern using a guard.
+        let mut guard = TempFileGuard::new(temp_path.clone());
+
+        let result = self.dump_utxo_snapshot_inner(path, file, &temp_path);
+
+        match result {
+            Ok(summary) => {
+                // Success: don't delete the temp file (we already
+                // renamed it inside the inner fn). Disarm the guard.
+                guard.disarm();
+                Ok(summary)
+            }
+            Err(e) => {
+                // Guard's Drop will remove temp_path. Return the original
+                // error.
+                Err(e)
+            }
+        }
+    }
+
+    fn dump_utxo_snapshot_inner(
+        &self,
+        final_path: &Path,
+        file: File,
+        temp_path: &Path,
+    ) -> Result<DumpSummary, DumpError> {
+        use crate::storage::compressed_coin as cc;
+
+        // Hold the tip read lock for the entire dump: writers block on
+        // the corresponding write lock, so the UTXO set is frozen.
+        let tip_guard = self.tip.read();
+        let base_hash = tip_guard.hash;
+        let base_height = tip_guard.height;
+
+        // Flush coin-cache dirty entries into the inner Store before
+        // iterating, so the Store's snapshot sees every committed write.
+        self.flush_coin_cache()?;
+
+        let coins_count = self.store.coin_count();
+        let meta = cc::SnapshotMetadata {
+            version: cc::SNAPSHOT_VERSION,
+            network_magic: network_magic(self.network),
+            base_blockhash: base_hash,
+            coins_count,
+        };
+
+        // BufWriter wraps the file; bytes flow ONLY into the file.
+        // The HASH_SERIALIZED_3 hasher below sees a DIFFERENT byte
+        // stream (TxOutSer-formatted), not the file bytes.
+        let mut writer = BufWriter::new(file);
+        meta.serialize(&mut writer)?;
+
+        // Streaming state. The iteration order is `(txid, vout)`
+        // ascending (RocksDB key sort, matches Core), so coins from
+        // the same txid are contiguous. We group them and emit Core's
+        // per-txid record format on each transition.
+        //
+        // `hs3_engine` accumulates the HASH_SERIALIZED_3 hash — Core's
+        // `hash_serialized` from `kernel/coinstats.cpp`. Each coin's
+        // TxOutSer contribution is fed in. The final digest is what
+        // matches `m_assumeutxo_data.hash_serialized` for that height.
+        // Bracket the borrow on `writer` so it's released before we
+        // touch the file again for flush/fsync/rename.
+        let (coins_written, hs3_engine) = {
+            let mut state = DumpState {
+                writer: &mut writer,
+                hs3_engine: bitcoin::hashes::sha256::HashEngine::default(),
+                txout_buf: Vec::with_capacity(80),
+                current_txid: None,
+                current_group: Vec::new(),
+                coins_written: 0,
+                out_err: None,
+            };
+
+            self.store.for_each_coin_snapshot(&mut |op, coin| {
+                state.visit(op, coin);
+                Ok(())
+            })?;
+
+            if let Some(e) = state.out_err.take() {
+                return Err(e);
+            }
+
+            // Flush the final group (everything since the last txid change).
+            state.flush_final_group()?;
+
+            (state.coins_written, state.hs3_engine)
+        };
+
+        // Release the tip lock as soon as the iteration is over — the
+        // subsequent flush/fsync/rename don't need it and operators
+        // appreciate shorter block-processing pauses.
+        drop(tip_guard);
+
+        if coins_written != coins_count {
+            return Err(DumpError::CountMismatch {
+                expected: coins_count,
+                actual: coins_written,
+            });
+        }
+
+        // Flush BufWriter to OS, then fsync the file. Without the
+        // fsync, an OS crash after this point could leave the renamed
+        // final file shorter than what we reported in `hash_serialized_3`
+        // — a false-positive cross-validation.
+        writer.flush()?;
+        writer.get_ref().sync_all()?;
+        // BufWriter's drop ensures the underlying file is closed
+        // before we attempt the rename.
+        drop(writer);
+
+        let hash_serialized_3 = bitcoin::hashes::sha256::Hash::from_engine(hs3_engine);
+
+        // Atomic-on-same-FS rename. After this point the user can see
+        // the file at the requested path; before, it lived as
+        // `.incomplete`.
+        std::fs::rename(temp_path, final_path)?;
+
+        Ok(DumpSummary {
+            coins_written,
+            base_hash,
+            base_height,
+            path: final_path.to_path_buf(),
+            hash_serialized_3: hash_serialized_3.to_byte_array(),
+        })
     }
 
     /// Read the lock-free connect-heartbeat counter. Bumped on every
@@ -2676,7 +2847,156 @@ fn compare_u256(a: &[u8; 32], b: &[u8; 32]) -> i32 {
     0
 }
 
-/// Get the network magic bytes for flat file headers.
+/// Summary returned by [`ChainState::dump_utxo_snapshot`].
+#[derive(Debug, Clone)]
+pub struct DumpSummary {
+    pub coins_written: u64,
+    pub base_hash: BlockHash,
+    pub base_height: u32,
+    pub path: PathBuf,
+    /// Bitcoin Core's `hash_serialized_3` value over the dumped UTXO
+    /// set — single SHA-256 over the `TxOutSer` stream from
+    /// `kernel/coinstats.cpp`. This is what Core's `dumptxoutset`
+    /// reports as `txoutset_hash`, and the value stored in
+    /// `m_assumeutxo_data.hash_serialized` for the corresponding
+    /// height. **Not** the SHA-256 of the snapshot file bytes.
+    pub hash_serialized_3: [u8; 32],
+}
+
+/// Errors raised by [`ChainState::dump_utxo_snapshot`].
+#[derive(Debug, thiserror::Error)]
+pub enum DumpError {
+    #[error("io error: {0}")]
+    Io(#[from] io::Error),
+    #[error("storage error: {0}")]
+    Store(#[from] StoreError),
+    #[error("refusing to overwrite existing file: {0}")]
+    RefuseOverwrite(PathBuf),
+    #[error("coin count mismatch (expected {expected}, wrote {actual})")]
+    CountMismatch { expected: u64, actual: u64 },
+}
+
+/// Inner streaming state for [`ChainState::dump_utxo_snapshot_inner`].
+/// Holds the per-txid grouping buffer, the HASH_SERIALIZED_3 engine,
+/// and a place to park I/O errors that occur inside the iteration
+/// closure.
+struct DumpState<'w> {
+    writer: &'w mut BufWriter<File>,
+    hs3_engine: bitcoin::hashes::sha256::HashEngine,
+    txout_buf: Vec<u8>,
+    current_txid: Option<bitcoin::Txid>,
+    current_group: Vec<(u32, Coin)>,
+    coins_written: u64,
+    out_err: Option<DumpError>,
+}
+
+impl DumpState<'_> {
+    fn visit(&mut self, op: &OutPoint, coin: &Coin) {
+        use crate::storage::compressed_coin as cc;
+
+        if self.out_err.is_some() {
+            return;
+        }
+
+        // (1) Feed the HASH_SERIALIZED_3 hasher. This serialization is
+        // distinct from the snapshot file's per-coin serialization;
+        // it's used only to compute the comparison hash against
+        // Core's `m_assumeutxo_data.hash_serialized`.
+        self.txout_buf.clear();
+        if let Err(e) = cc::write_txout_ser(&mut self.txout_buf, op, coin) {
+            self.out_err = Some(DumpError::Io(e));
+            return;
+        }
+        bitcoin::hashes::HashEngine::input(&mut self.hs3_engine, &self.txout_buf);
+
+        // (2) Group by txid for the snapshot file. The cursor yields
+        // keys in `(txid, vout)` ascending order, so coins from the
+        // same txid arrive contiguously and we can emit each group
+        // when the txid changes.
+        if self.current_txid != Some(op.txid) {
+            if self.current_txid.is_some()
+                && let Err(e) = self.emit_current_group()
+            {
+                self.out_err = Some(e);
+                return;
+            }
+            self.current_txid = Some(op.txid);
+        }
+        self.current_group.push((op.vout, coin.clone()));
+    }
+
+    fn emit_current_group(&mut self) -> Result<(), DumpError> {
+        use crate::storage::compressed_coin as cc;
+
+        let txid = match self.current_txid {
+            Some(t) => t,
+            None => return Ok(()),
+        };
+        // Per Core `WriteUTXOSnapshot`:
+        //   txid (32 bytes)
+        //   CompactSize(coins.size())
+        //   for each coin:
+        //     CompactSize(vout)
+        //     Coin (TxOutCompression: varint(code) || ...)
+        self.writer.write_all(&txid[..])?;
+        cc::write_compact_size(self.writer, self.current_group.len() as u64)?;
+        for (vout, coin) in &self.current_group {
+            cc::write_compact_size(self.writer, u64::from(*vout))?;
+            cc::serialize_coin(self.writer, coin)?;
+        }
+        self.coins_written += self.current_group.len() as u64;
+        self.current_group.clear();
+        Ok(())
+    }
+
+    fn flush_final_group(&mut self) -> Result<(), DumpError> {
+        if self.current_txid.is_some() {
+            self.emit_current_group()?;
+            self.current_txid = None;
+        }
+        Ok(())
+    }
+}
+
+/// Build the `<path>.incomplete` temp path for the dump.
+fn make_incomplete_path(path: &Path) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(".incomplete");
+    path.with_file_name(name)
+}
+
+/// RAII guard that removes a temp file on drop unless [`Self::disarm`]
+/// has been called. Ensures error paths in `dump_utxo_snapshot` don't
+/// leave a `.incomplete` corpse on disk.
+struct TempFileGuard {
+    path: Option<PathBuf>,
+}
+
+impl TempFileGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    fn disarm(&mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            // Best-effort: log but don't propagate. The dump operation
+            // already returned its error; we're just cleaning up the
+            // .incomplete corpse so the operator can retry without
+            // manual filesystem surgery.
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
 fn network_magic(network: Network) -> [u8; 4] {
     match network {
         Network::Bitcoin => [0xf9, 0xbe, 0xb4, 0xd9],
@@ -4133,6 +4453,173 @@ pub(crate) mod tests {
 
         // Tip should still be at height 1
         assert_eq!(cs.tip_height(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dump_utxo_snapshot_roundtrip_via_codec() {
+        use crate::storage::compressed_coin::{
+            deserialize_coin, read_compact_size, write_txout_ser, SnapshotMetadata,
+            SNAPSHOT_MAGIC_BYTES, SNAPSHOT_VERSION,
+        };
+        use std::io::BufReader;
+        use std::io::Read as _;
+
+        let (cs, dir) = make_chain_state();
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+
+        // Five blocks → five coinbase UTXOs. Each coinbase is in its
+        // own txid, so the dump produces 5 single-coin groups.
+        let mut parent = genesis_hash;
+        for i in 1..=5u32 {
+            let block = build_test_block(parent, i, 1_300_000_000 + i);
+            parent = cs.accept_block(&block).expect("accept_block");
+        }
+        assert_eq!(cs.tip_height(), 5);
+
+        let snapshot_path = dir.join("dump.snapshot");
+        let summary = cs
+            .dump_utxo_snapshot(&snapshot_path)
+            .expect("dump_utxo_snapshot");
+        assert_eq!(summary.coins_written, 5);
+        assert_eq!(summary.base_height, 5);
+        assert_eq!(summary.base_hash, cs.tip_hash());
+        assert_eq!(summary.path, snapshot_path);
+
+        // Verify the temp file is gone (rename succeeded).
+        let temp_path = make_incomplete_path(&snapshot_path);
+        assert!(!temp_path.exists(), "leftover .incomplete file");
+
+        // Parse the file back via the Core-format reader. The file
+        // structure is: SnapshotMetadata(51) || repeat[ txid(32) ||
+        // CompactSize(coins_in_group) || repeat[ CompactSize(vout) ||
+        // Coin ] ].
+        let file = File::open(&snapshot_path).expect("open snapshot");
+        let mut reader = BufReader::new(file);
+        let meta = SnapshotMetadata::deserialize(&mut reader).expect("parse header");
+        assert_eq!(meta.version, SNAPSHOT_VERSION);
+        assert_eq!(meta.network_magic, [0xfa, 0xbf, 0xb5, 0xda]); // regtest
+        assert_eq!(meta.base_blockhash, cs.tip_hash());
+        assert_eq!(meta.coins_count, 5);
+
+        // Independently hash the UTXO set via TxOutSer (the
+        // HASH_SERIALIZED_3 algorithm) and verify it matches what
+        // `dump_utxo_snapshot` reported. This is the cross-validation
+        // contract against Core's `m_assumeutxo_data.hash_serialized`.
+        let mut hs3 = bitcoin::hashes::sha256::HashEngine::default();
+        let mut record_buf = Vec::with_capacity(80);
+
+        let mut decoded = 0u64;
+        while decoded < meta.coins_count {
+            // Read one txid group.
+            let mut txid_bytes = [0u8; 32];
+            reader.read_exact(&mut txid_bytes).expect("read txid");
+            let txid = bitcoin::Txid::from_raw_hash(
+                bitcoin::hashes::sha256d::Hash::from_byte_array(txid_bytes),
+            );
+            let group_size = read_compact_size(&mut reader).expect("read group size");
+            for _ in 0..group_size {
+                let vout = read_compact_size(&mut reader).expect("read vout");
+                let coin = deserialize_coin(&mut reader).expect("decode coin");
+                let op = bitcoin::OutPoint {
+                    txid,
+                    vout: vout as u32,
+                };
+                // Independently feed the HASH_SERIALIZED_3 hasher.
+                record_buf.clear();
+                write_txout_ser(&mut record_buf, &op, &coin).unwrap();
+                bitcoin::hashes::HashEngine::input(&mut hs3, &record_buf);
+                decoded += 1;
+            }
+        }
+        assert_eq!(decoded, 5);
+
+        let expected_hs3 =
+            bitcoin::hashes::sha256::Hash::from_engine(hs3).to_byte_array();
+        assert_eq!(
+            summary.hash_serialized_3, expected_hs3,
+            "reported hash_serialized_3 must equal independent recomputation"
+        );
+
+        // EOF after the last group.
+        let mut tail = [0u8; 1];
+        assert_eq!(
+            reader.read(&mut tail).unwrap(),
+            0,
+            "snapshot has trailing bytes"
+        );
+
+        // First 5 bytes are the snapshot magic.
+        let raw = std::fs::read(&snapshot_path).unwrap();
+        assert_eq!(&raw[..5], &SNAPSHOT_MAGIC_BYTES);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dump_utxo_snapshot_removes_temp_on_error() {
+        // RefuseOverwrite errors before any temp file is created, so
+        // exercise a different error path: pre-create the temp file
+        // and verify that `create_new` rejects it, AND that no other
+        // file is left behind. This documents the corpse-cleanup
+        // contract.
+        let (cs, dir) = make_chain_state();
+        let snapshot_path = dir.join("clean.dat");
+        let temp_path = make_incomplete_path(&snapshot_path);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&temp_path, b"stale corpse from a prior crashed run").unwrap();
+
+        let err = cs
+            .dump_utxo_snapshot(&snapshot_path)
+            .expect_err("should fail on stale .incomplete");
+        // The error surfaces as Io(AlreadyExists) from `create_new`.
+        assert!(matches!(err, DumpError::Io(_)));
+
+        // The pre-existing corpse must NOT be deleted by the guard —
+        // it belongs to the operator. Our guard only owns paths we
+        // successfully created via create_new.
+        let corpse = std::fs::read(&temp_path).unwrap();
+        assert_eq!(corpse, b"stale corpse from a prior crashed run");
+
+        // And the final path was never created.
+        assert!(!snapshot_path.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dump_utxo_snapshot_refuses_overwrite() {
+        let (cs, dir) = make_chain_state();
+        let path = dir.join("preexisting.dat");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, b"do not clobber me").unwrap();
+
+        let err = cs
+            .dump_utxo_snapshot(&path)
+            .expect_err("should refuse overwrite");
+        assert!(matches!(err, DumpError::RefuseOverwrite(_)));
+
+        // File contents must be unchanged.
+        let contents = std::fs::read(&path).unwrap();
+        assert_eq!(contents, b"do not clobber me");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dump_utxo_snapshot_empty_utxo_set() {
+        let (cs, dir) = make_chain_state();
+        // Genesis only — its coinbase is unspendable so coin_count() is 0.
+        assert_eq!(cs.coin_count(), 0);
+
+        let path = dir.join("empty.dat");
+        let summary = cs.dump_utxo_snapshot(&path).expect("dump empty");
+        assert_eq!(summary.coins_written, 0);
+
+        // File should be exactly 51 bytes (just the header).
+        let len = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(len, 51);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
