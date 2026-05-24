@@ -1,6 +1,8 @@
 use bitcoin::Network;
 use clap::Parser;
+use node::rpc::allowip::IpAllowEntry;
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 /// DB cache sizing mode. `Fixed(n)` is the Core-compatible static N-MB budget;
@@ -243,6 +245,114 @@ impl std::str::FromStr for EsploraAuthMode {
     }
 }
 
+/// A single Bitcoin-Core-format rpcauth credential: the line
+/// `user:salt$hash` where `hash = hex(HMAC-SHA256(key=salt, msg=password))`.
+/// Parsing splits on the first `:` and the first `$`; we deliberately
+/// don't allow `:` in the username because Core's rpcauth.py forbids it
+/// too (Basic-auth header is `user:pass`, so a `:` in the user breaks
+/// the decode).
+#[derive(Debug, Clone)]
+pub struct RpcAuthEntry {
+    pub username: String,
+    /// The salt EXACTLY as written in the config line. Core's
+    /// `share/rpcauth/rpcauth.py` emits a printable hex string and then
+    /// uses `salt.encode('utf-8')` as the HMAC key — i.e. the ASCII bytes
+    /// of the string, NOT the hex-decoded bytes. We must store and key on
+    /// the string verbatim or real Core-generated lines won't verify.
+    pub salt: String,
+    /// The expected HMAC-SHA256 tag, hex-decoded to 32 raw bytes.
+    pub hash: Vec<u8>,
+}
+
+impl RpcAuthEntry {
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let raw = s.trim();
+        let (user, rest) = raw.split_once(':').ok_or_else(|| {
+            format!("invalid --rpcauth entry: expected `user:salt$hash`, got {raw:?}")
+        })?;
+        if user.is_empty() {
+            return Err("invalid --rpcauth entry: empty username".to_string());
+        }
+        let (salt, hash_hex) = rest.split_once('$').ok_or_else(|| {
+            format!(
+                "invalid --rpcauth entry for user {user:?}: expected `user:salt$hash`, no `$` separator found"
+            )
+        })?;
+        let salt = salt.trim();
+        if salt.is_empty() {
+            return Err(format!(
+                "invalid --rpcauth entry for user {user:?}: empty salt"
+            ));
+        }
+        let hash = hex::decode(hash_hex.trim()).map_err(|e| {
+            format!("invalid --rpcauth entry for user {user:?}: hash is not hex: {e}")
+        })?;
+        // Sanity: Core's rpcauth.py always produces 32-byte HMAC-SHA256
+        // tags. A short tag is almost certainly a typo and would let
+        // through trivial collisions.
+        if hash.len() != 32 {
+            return Err(format!(
+                "invalid --rpcauth entry for user {user:?}: hash is {} bytes (hex {} chars); expected 32 bytes (hex 64 chars) for HMAC-SHA256",
+                hash.len(),
+                hash_hex.trim().len(),
+            ));
+        }
+        Ok(Self {
+            username: user.to_string(),
+            salt: salt.to_string(),
+            hash,
+        })
+    }
+}
+
+/// Filesystem permissions applied to the auto-generated cookie file.
+/// Mirrors Bitcoin Core's `-rpccookieperms=<owner|group|all>`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CookiePerms {
+    /// 0600 — readable by the satd UID only. Core's default.
+    #[default]
+    Owner,
+    /// 0640 — readable by the `satd` group. Lets group members
+    /// (operators in the systemd `satd` group) authenticate without
+    /// sudo. Matches the `ExecStartPost=chmod 0640` shim that
+    /// `satd.service` currently runs after every startup, with the
+    /// difference that this mode writes the file with the right perms
+    /// in the first place (no brief 0600 window).
+    Group,
+    /// 0644 — readable by every local user. Only ever sensible on
+    /// dedicated boxes where local-process separation isn't a concern.
+    All,
+}
+
+impl CookiePerms {
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "owner" => Ok(Self::Owner),
+            "group" => Ok(Self::Group),
+            "all" => Ok(Self::All),
+            other => Err(format!(
+                "invalid --rpccookieperms value {other:?}: expected one of owner/group/all"
+            )),
+        }
+    }
+
+    pub fn as_mode(self) -> u32 {
+        match self {
+            Self::Owner => 0o600,
+            Self::Group => 0o640,
+            Self::All => 0o644,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Owner => "owner",
+            Self::Group => "group",
+            Self::All => "all",
+        }
+    }
+}
+
 /// Per-field defaults contributed by a named `Profile`. None means the
 /// profile does not opine on this field.
 #[derive(Debug, Default, Clone, Copy)]
@@ -262,9 +372,44 @@ pub struct Config {
     pub network: Network,
     pub datadir: PathBuf,
     pub rpcport: u16,
-    pub rpcbind: String,
+    /// Concrete socket addresses the JSON-RPC HTTP listener binds to.
+    /// Mirrors Bitcoin Core's `-rpcbind=<addr>[:port]` — repeatable, so
+    /// one node can listen on multiple interfaces (e.g. both `127.0.0.1`
+    /// and `[::1]`, which is Core's no-flag default). When no operator
+    /// value is supplied, defaults to `127.0.0.1:rpcport` only — same
+    /// posture as Core when no `-rpcallowip` is configured.
+    pub rpcbind: Vec<SocketAddr>,
+    /// Per-request source-IP allowlist for the JSON-RPC HTTP listener.
+    /// Mirrors Bitcoin Core's `-rpcallowip=<ip|cidr>` — repeatable.
+    /// Empty list means loopback only (Core's default). If any
+    /// `rpcbind` entry is non-loopback while this list is empty,
+    /// `Config::load` refuses to start: that's the misconfiguration
+    /// Core specifically guards against.
+    pub rpcallowip: Vec<IpAllowEntry>,
     pub rpcuser: Option<String>,
     pub rpcpassword: Option<String>,
+    /// Bitcoin-Core-compatible HMAC-SHA256 RPC credentials. Each entry
+    /// is `user:salt$hash` where `hash = hex(HMAC-SHA256(salt, password))`.
+    /// Generated by Core's `share/rpcauth/rpcauth.py` — satd consumes
+    /// the same format verbatim so a Core operator's existing rpcauth
+    /// lines work unchanged. Repeatable so multiple users can be
+    /// configured. Coexists with `--rpcuser`/`--rpcpassword` and cookie
+    /// auth; any valid credential opens the door.
+    pub rpcauth: Vec<RpcAuthEntry>,
+    /// Operator-overridable path for the auto-generated cookie file
+    /// (Core's `-rpccookiefile`). `None` (default) keeps Core's
+    /// `$DATADIR/.cookie` behaviour. Absolute paths only — relative
+    /// paths would be ambiguous against the network-suffixed datadir.
+    pub rpc_cookie_file: Option<PathBuf>,
+    /// Filesystem permissions applied to the cookie file when it's
+    /// written, matching Core's `-rpccookieperms=<owner|group|all>`.
+    /// `Owner` (0600, default) restricts to the satd UID; `Group`
+    /// (0640) lets the `satd` group read it (this is what
+    /// `satd.service`'s `ExecStartPost=chmod 0640` already does post-
+    /// write); `All` (0644) lets every local user read — only ever
+    /// sensible on dedicated boxes where local separation isn't a
+    /// concern.
+    pub rpc_cookie_perms: CookiePerms,
     /// Optional TLS bind. When set, `rpc_tls_cert` and `rpc_tls_key`
     /// MUST also be set. Bitcoin Core's RPC is HTTP-only; this is a
     /// satd-specific addition for operators who want native TLS
@@ -752,7 +897,94 @@ impl Config {
             .or_else(|| file_get("rpcport").and_then(|v| v.parse().ok()))
             .unwrap_or_else(|| default_rpc_port(network));
 
-        let rpcbind = file_get("rpcbind").unwrap_or_else(|| "127.0.0.1".to_string());
+        // --rpcbind resolution: CLI list wins (multi-flag); else config
+        // file (multi-value); else single default loopback. Each entry
+        // is `addr[:port]` per Bitcoin Core; bare addresses inherit
+        // `rpcport`. Resolved to concrete `SocketAddr`s here so the
+        // server-side binding code doesn't have to re-parse.
+        let rpcbind_raw: Vec<String> = if !cli.rpcbind.is_empty() {
+            cli.rpcbind.clone()
+        } else {
+            file_get_all("rpcbind")
+        };
+        let mut rpcbind: Vec<SocketAddr> = Vec::new();
+        if rpcbind_raw.is_empty() {
+            // Core's posture when no -rpcbind is set: 127.0.0.1 (and
+            // ::1 when IPv6 is available). We default to 127.0.0.1
+            // only — adding ::1 by default risks an unexpected open
+            // listener on dual-stack boxes where IPv6 firewall rules
+            // haven't been written. Operators who want ::1 can pass
+            // `--rpcbind=[::1]` explicitly.
+            rpcbind.push(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), rpcport));
+        } else {
+            for entry in &rpcbind_raw {
+                let parsed = parse_rpcbind_entry(entry, rpcport).map_err(|e| {
+                    format!("invalid --rpcbind value {entry:?}: {e}")
+                })?;
+                rpcbind.push(parsed);
+            }
+        }
+
+        // --rpcallowip resolution: CLI list wins; else config (multi).
+        // Defer the "non-loopback bind requires non-empty allowlist"
+        // check until both are parsed so the operator gets one clear
+        // error message instead of two.
+        let rpcallowip_raw: Vec<String> = if !cli.rpcallowip.is_empty() {
+            cli.rpcallowip.clone()
+        } else {
+            file_get_all("rpcallowip")
+        };
+        let mut rpcallowip: Vec<IpAllowEntry> = Vec::new();
+        for entry in &rpcallowip_raw {
+            rpcallowip.push(IpAllowEntry::parse(entry)?);
+        }
+
+        // Core's gate against accidental exposure: if any rpcbind is
+        // non-loopback AND no rpcallowip is set, refuse to start. This
+        // is the configuration where a Core operator would also see
+        // `Cannot obtain a lock on data directory` style errors —
+        // satd is more explicit about the why.
+        let any_non_loopback = rpcbind.iter().any(|a| !a.ip().is_loopback());
+        if any_non_loopback && rpcallowip.is_empty() {
+            let exposed: Vec<String> =
+                rpcbind.iter().filter(|a| !a.ip().is_loopback()).map(|a| a.to_string()).collect();
+            return Err(format!(
+                "--rpcbind on non-loopback address(es) {exposed:?} requires at least one \
+                --rpcallowip entry. Add `--rpcallowip=<ip-or-cidr>` (or the matching \
+                `rpcallowip=` line in bitcoin.conf) so the JSON-RPC server isn't open \
+                to every IP that can reach the bind interface. This matches Bitcoin \
+                Core's behavior."
+            ));
+        }
+
+        // --rpcauth resolution: CLI list wins; else config (multi).
+        let rpcauth_raw: Vec<String> = if !cli.rpcauth.is_empty() {
+            cli.rpcauth.clone()
+        } else {
+            file_get_all("rpcauth")
+        };
+        let mut rpcauth: Vec<RpcAuthEntry> = Vec::new();
+        for entry in &rpcauth_raw {
+            rpcauth.push(RpcAuthEntry::parse(entry)?);
+        }
+
+        let rpc_cookie_file = cli
+            .rpccookiefile
+            .or_else(|| file_get("rpccookiefile").map(PathBuf::from));
+        if let Some(p) = &rpc_cookie_file
+            && p.is_relative()
+        {
+            return Err(format!(
+                "--rpccookiefile must be an absolute path, got {p:?}. Relative paths would \
+                be ambiguous against satd's network-suffixed datadir (regtest/, signet/, \
+                testnet3/)."
+            ));
+        }
+
+        let rpc_cookie_perms = match cli.rpccookieperms.or_else(|| file_get("rpccookieperms")) {
+            Some(s) => CookiePerms::parse(&s)?,
+            None => CookiePerms::default(),
+        };
 
         let rpcuser = cli.rpcuser.or_else(|| file_get("rpcuser"));
         let rpcpassword = cli.rpcpassword.or_else(|| file_get("rpcpassword"));
@@ -1308,8 +1540,12 @@ impl Config {
             datadir: base_datadir,
             rpcport,
             rpcbind,
+            rpcallowip,
             rpcuser,
             rpcpassword,
+            rpcauth,
+            rpc_cookie_file,
+            rpc_cookie_perms,
             rpc_tls_bind,
             rpc_mtls,
             rpc_mtls_client_ca,
@@ -1650,9 +1886,13 @@ impl Config {
             "profile": self.profile.map(|p| p.as_str()).unwrap_or("(none)"),
             "rpc": {
                 "port": self.rpcport,
-                "bind": self.rpcbind,
+                "bind": self.rpcbind.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+                "allowip": self.rpcallowip.iter().map(|e| e.raw.clone()).collect::<Vec<_>>(),
                 "user": self.rpcuser.as_deref().unwrap_or("(cookie)"),
                 "password": if self.rpcpassword.is_some() { "(set)" } else { "(none)" },
+                "rpcauth_users": self.rpcauth.iter().map(|e| e.username.clone()).collect::<Vec<_>>(),
+                "cookie_file": self.rpc_cookie_file.as_ref().map(|p| p.display().to_string()),
+                "cookie_perms": self.rpc_cookie_perms.as_str(),
                 "extended_errors": self.rpc_extended_errors,
                 "default_units": self.rpc_default_units.as_str(),
                 "tls_bind": self.rpc_tls_bind.clone(),
@@ -1771,6 +2011,58 @@ pub struct CliArgs {
 
     #[arg(long, value_name = "PASS", help = "RPC password")]
     pub rpcpassword: Option<String>,
+
+    /// Address (and optional port) for the plain-HTTP JSON-RPC
+    /// listener. Repeatable to listen on multiple interfaces; mirrors
+    /// Bitcoin Core's `-rpcbind=<addr>[:port]`. Defaults to
+    /// `127.0.0.1:rpcport` only when unset (Core's same posture when
+    /// `-rpcallowip` is empty). Non-loopback values REQUIRE at least
+    /// one `--rpcallowip` entry or satd refuses to start.
+    #[arg(
+        long,
+        value_name = "ADDR[:PORT]",
+        help = "Bind plain-HTTP JSON-RPC to this address (repeatable; default 127.0.0.1:<rpcport>)"
+    )]
+    pub rpcbind: Vec<String>,
+
+    /// Source-IP allowlist for the JSON-RPC HTTP listener. Mirrors
+    /// Bitcoin Core's `-rpcallowip=<ip|cidr>`. Repeatable. Empty list
+    /// means loopback only (matches Core). The middleware refuses
+    /// non-allowlisted source IPs with HTTP 403 before the auth layer
+    /// runs.
+    #[arg(
+        long,
+        value_name = "IP|CIDR",
+        help = "Allow JSON-RPC connections from this IP / CIDR (repeatable). Empty list = loopback only."
+    )]
+    pub rpcallowip: Vec<String>,
+
+    /// Bitcoin-Core-compatible HMAC-SHA256 RPC credential. Format:
+    /// `user:salt$hash`. Generated by Core's `share/rpcauth/rpcauth.py`
+    /// — paste those lines unchanged. Repeatable.
+    #[arg(
+        long,
+        value_name = "USER:SALT$HASH",
+        help = "RPC credential in Bitcoin Core's rpcauth format (repeatable). Use rpcauth.py to generate."
+    )]
+    pub rpcauth: Vec<String>,
+
+    /// Override the cookie file path. Default `$DATADIR/.cookie`.
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Override the auto-generated cookie file path (default: $DATADIR/.cookie)"
+    )]
+    pub rpccookiefile: Option<PathBuf>,
+
+    /// Cookie file filesystem permissions. owner=0600, group=0640,
+    /// all=0644. Default `owner`.
+    #[arg(
+        long,
+        value_name = "MODE",
+        help = "Cookie file permissions: owner (0600, default) | group (0640) | all (0644)"
+    )]
+    pub rpccookieperms: Option<String>,
 
     #[arg(
         long,
@@ -2645,6 +2937,11 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "rpcmtlsclientallow",
         "rpcdisableauth",
         "rpctlshandshaketimeout",
+        "rpcbind",
+        "rpcallowip",
+        "rpcauth",
+        "rpccookiefile",
+        "rpccookieperms",
         "listen",
         "port",
         "connect",
@@ -2836,6 +3133,65 @@ fn default_p2p_port(network: Network) -> u16 {
     }
 }
 
+/// Parse a single `-rpcbind=<addr>[:port]` value. Accepts:
+///   - `127.0.0.1`                  → 127.0.0.1:<default_port>
+///   - `127.0.0.1:18443`            → 127.0.0.1:18443
+///   - `[::1]`                      → [::1]:<default_port>
+///   - `[::1]:18443`                → [::1]:18443
+///   - `0.0.0.0`, `::`              → wildcards (also legal in Core)
+///
+/// Bare IPv6 without brackets is rejected — `::1:18443` is ambiguous
+/// (could be the IPv6 address `::1:18443` or the address `::1` with
+/// port `18443`). Matches Core's behaviour: square brackets are
+/// mandatory for IPv6 with port.
+fn parse_rpcbind_entry(s: &str, default_port: u16) -> Result<SocketAddr, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("empty value".to_string());
+    }
+    // Bracketed IPv6 form
+    if let Some(rest) = s.strip_prefix('[') {
+        let (host, after) = rest
+            .split_once(']')
+            .ok_or_else(|| "missing closing `]` for IPv6 address".to_string())?;
+        let ip: Ipv6Addr = host
+            .parse()
+            .map_err(|e| format!("invalid IPv6 address {host:?}: {e}"))?;
+        let port = if after.is_empty() {
+            default_port
+        } else if let Some(p) = after.strip_prefix(':') {
+            p.parse::<u16>()
+                .map_err(|e| format!("invalid port {p:?}: {e}"))?
+        } else {
+            return Err(format!("unexpected suffix after IPv6 address: {after:?}"));
+        };
+        return Ok(SocketAddr::new(IpAddr::V6(ip), port));
+    }
+    // Already-formed addr:port (no brackets) — accept if it parses
+    // directly as a SocketAddr (covers IPv4:port and bare IPv4-mapped
+    // forms that std accepts).
+    if let Ok(sa) = s.parse::<SocketAddr>() {
+        return Ok(sa);
+    }
+    // Bare host: parse as IpAddr, then attach default port. Reject
+    // bare IPv6 without brackets per the doc comment above; std's
+    // IpAddr::from_str accepts `::1` so we have to filter
+    // post-hoc — anything that parses as IPv4 is fine.
+    if let Ok(ip) = s.parse::<Ipv4Addr>() {
+        return Ok(SocketAddr::new(IpAddr::V4(ip), default_port));
+    }
+    if s.parse::<Ipv6Addr>().is_ok() {
+        return Err(format!(
+            "bare IPv6 address {s:?} requires square brackets: use `[{s}]`"
+        ));
+    }
+    Err(
+        "could not parse as IPv4/IPv6 address (with optional :port). Examples: \
+        `127.0.0.1`, `127.0.0.1:8332`, `[::1]`, `[::1]:8332`, `0.0.0.0`."
+            .to_string(),
+    )
+}
+
 fn parse_bool(s: &str) -> Option<bool> {
     match s {
         "1" | "true" | "yes" => Some(true),
@@ -2951,6 +3307,11 @@ rpcport=8332
             rpcport: None,
             rpcuser: None,
             rpcpassword: None,
+            rpcbind: Vec::new(),
+            rpcallowip: Vec::new(),
+            rpcauth: Vec::new(),
+            rpccookiefile: None,
+            rpccookieperms: None,
             rpctlsbind: None,
             rpctlscert: None,
             rpctlskey: None,
@@ -3095,6 +3456,11 @@ rpcport=8332
             rpcport: None,
             rpcuser: Some("alice".to_string()),
             rpcpassword: None, // missing password
+            rpcbind: Vec::new(),
+            rpcallowip: Vec::new(),
+            rpcauth: Vec::new(),
+            rpccookiefile: None,
+            rpccookieperms: None,
             rpctlsbind: None,
             rpctlscert: None,
             rpctlskey: None,
@@ -3647,6 +4013,208 @@ rpcport=8332
         assert!(
             err.contains("electrummtlsclientallow") && err.contains("electrummtls"),
             "expected allowlist-without-mtls error, got: {err}"
+        );
+    }
+
+    // ---- PR-1: --rpcbind / --rpcallowip / --rpcauth / cookie tests ----
+
+    #[test]
+    fn rpcbind_single_dash_alias_translates() {
+        // The five new RPC compat flags must work in Core-style
+        // single-dash form via the normalize_args shim. Regression
+        // guard so PR-1 doesn't accidentally rely on GNU `--`.
+        let args = vec![
+            "satd".to_string(),
+            "-rpcbind=0.0.0.0".to_string(),
+            "-rpcallowip=192.168.1.0/24".to_string(),
+            "-rpcauth=alice:abc$def".to_string(),
+            "-rpccookiefile=/var/run/satd.cookie".to_string(),
+            "-rpccookieperms=group".to_string(),
+        ];
+        let n = normalize_args(args);
+        assert_eq!(n[1], "--rpcbind=0.0.0.0");
+        assert_eq!(n[2], "--rpcallowip=192.168.1.0/24");
+        assert_eq!(n[3], "--rpcauth=alice:abc$def");
+        assert_eq!(n[4], "--rpccookiefile=/var/run/satd.cookie");
+        assert_eq!(n[5], "--rpccookieperms=group");
+    }
+
+    #[test]
+    fn rpcbind_parses_addr_port_combinations() {
+        // Bare IPv4 inherits default port.
+        let sa = parse_rpcbind_entry("127.0.0.1", 8332).unwrap();
+        assert_eq!(sa, "127.0.0.1:8332".parse().unwrap());
+        // IPv4 with explicit port.
+        let sa = parse_rpcbind_entry("127.0.0.1:18443", 8332).unwrap();
+        assert_eq!(sa, "127.0.0.1:18443".parse().unwrap());
+        // IPv6 bracketed, no port.
+        let sa = parse_rpcbind_entry("[::1]", 8332).unwrap();
+        assert_eq!(sa, "[::1]:8332".parse().unwrap());
+        // IPv6 bracketed, with port.
+        let sa = parse_rpcbind_entry("[::1]:18443", 8332).unwrap();
+        assert_eq!(sa, "[::1]:18443".parse().unwrap());
+        // Wildcard.
+        let sa = parse_rpcbind_entry("0.0.0.0", 8332).unwrap();
+        assert_eq!(sa, "0.0.0.0:8332".parse().unwrap());
+    }
+
+    #[test]
+    fn rpcbind_rejects_bare_ipv6_without_brackets() {
+        // `::1:8332` is ambiguous (IPv6 address or `::1` with port?);
+        // Core requires brackets for IPv6 + port, satd matches.
+        let err = parse_rpcbind_entry("::1", 8332).unwrap_err();
+        assert!(
+            err.contains("square brackets"),
+            "expected brackets advice, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rpcbind_rejects_garbage() {
+        assert!(parse_rpcbind_entry("", 8332).is_err());
+        assert!(parse_rpcbind_entry("not-an-ip", 8332).is_err());
+        assert!(parse_rpcbind_entry("999.0.0.1", 8332).is_err());
+    }
+
+    #[test]
+    fn rpcauth_entry_parses_core_format() {
+        // user:salt$hash. The salt is kept VERBATIM as the string from
+        // the line (Core HMAC-keys on its ASCII bytes, not hex-decoded);
+        // only the hash is hex-decoded to the 32-byte tag.
+        let salt = "000102030405060708090a0b0c0d0e0f";
+        let hash_hex = "0".repeat(64); // 32 bytes
+        let entry = RpcAuthEntry::parse(&format!("alice:{salt}${hash_hex}")).unwrap();
+        assert_eq!(entry.username, "alice");
+        assert_eq!(entry.salt, salt);
+        assert_eq!(entry.hash.len(), 32);
+    }
+
+    #[test]
+    fn rpcauth_entry_keeps_non_hex_salt() {
+        // Core's rpcauth.py salt is always hex, but the salt field is an
+        // opaque HMAC key — we must not require it to be hex-decodable.
+        let hash_hex = "0".repeat(64);
+        let entry = RpcAuthEntry::parse(&format!("bob:zzNotHex!!${hash_hex}")).unwrap();
+        assert_eq!(entry.salt, "zzNotHex!!");
+    }
+
+    #[test]
+    fn rpcauth_entry_rejects_short_hash() {
+        // 16-byte hash is not a valid HMAC-SHA256 tag — guard against
+        // truncation typos.
+        let err = RpcAuthEntry::parse("alice:abcd$00112233445566778899aabbccddeeff").unwrap_err();
+        assert!(err.contains("32 bytes"), "got: {err}");
+    }
+
+    #[test]
+    fn rpcauth_entry_rejects_missing_separator() {
+        let err = RpcAuthEntry::parse("alice-no-colon").unwrap_err();
+        assert!(err.contains("user:salt$hash"), "got: {err}");
+        let err = RpcAuthEntry::parse("alice:no-dollar").unwrap_err();
+        assert!(err.contains("$"), "got: {err}");
+    }
+
+    #[test]
+    fn cookie_perms_parses_three_modes() {
+        assert_eq!(CookiePerms::parse("owner").unwrap(), CookiePerms::Owner);
+        assert_eq!(CookiePerms::parse("group").unwrap(), CookiePerms::Group);
+        assert_eq!(CookiePerms::parse("all").unwrap(), CookiePerms::All);
+        assert_eq!(CookiePerms::parse("OWNER").unwrap(), CookiePerms::Owner);
+        assert!(CookiePerms::parse("world").is_err());
+    }
+
+    #[test]
+    fn cookie_perms_octal_modes() {
+        assert_eq!(CookiePerms::Owner.as_mode(), 0o600);
+        assert_eq!(CookiePerms::Group.as_mode(), 0o640);
+        assert_eq!(CookiePerms::All.as_mode(), 0o644);
+    }
+
+    #[test]
+    fn non_loopback_bind_requires_allowlist() {
+        // Operator binds to 0.0.0.0 without setting --rpcallowip ->
+        // Config::load must refuse. This is the misconfigured-
+        // exposure case Core specifically guards against, and the
+        // single most important static check in PR-1.
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-rpc-compat-test1",
+            "--rpcbind=0.0.0.0",
+        ])
+        .unwrap();
+        let err = Config::from_cli(cli).unwrap_err();
+        assert!(
+            err.contains("--rpcallowip"),
+            "expected allowlist requirement error, got: {err}"
+        );
+        assert!(
+            err.contains("0.0.0.0"),
+            "error should echo the offending bind, got: {err}"
+        );
+    }
+
+    #[test]
+    fn loopback_bind_does_not_require_allowlist() {
+        // Default + loopback explicit binds both bypass the
+        // allowlist-required check.
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-rpc-compat-test2",
+            "--rpcbind=127.0.0.1",
+            "--rpcbind=[::1]",
+        ])
+        .unwrap();
+        let cfg = Config::from_cli(cli).expect("loopback-only binds should be accepted");
+        assert_eq!(cfg.rpcbind.len(), 2);
+        assert!(cfg.rpcbind.iter().all(|a| a.ip().is_loopback()));
+    }
+
+    #[test]
+    fn non_loopback_bind_with_allowlist_is_accepted() {
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-rpc-compat-test3",
+            "--rpcbind=0.0.0.0",
+            "--rpcallowip=192.168.1.0/24",
+            "--rpcallowip=10.0.0.0/8",
+        ])
+        .unwrap();
+        let cfg = Config::from_cli(cli).expect("non-loopback bind with allowlist should pass");
+        assert_eq!(cfg.rpcbind.len(), 1);
+        assert_eq!(cfg.rpcallowip.len(), 2);
+        assert_eq!(cfg.rpcallowip[0].raw, "192.168.1.0/24");
+    }
+
+    #[test]
+    fn default_rpcbind_is_single_loopback() {
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-rpc-compat-test4",
+        ])
+        .unwrap();
+        let cfg = Config::from_cli(cli).unwrap();
+        assert_eq!(cfg.rpcbind.len(), 1);
+        assert!(cfg.rpcbind[0].ip().is_loopback());
+        assert_eq!(cfg.rpcbind[0].port(), cfg.rpcport);
+    }
+
+    #[test]
+    fn rpccookiefile_must_be_absolute() {
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-rpc-compat-test5",
+            "--rpccookiefile=relative/path/.cookie",
+        ])
+        .unwrap();
+        let err = Config::from_cli(cli).unwrap_err();
+        assert!(
+            err.contains("absolute path"),
+            "expected absolute-path error, got: {err}"
         );
     }
 }

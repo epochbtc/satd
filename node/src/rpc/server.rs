@@ -22,6 +22,12 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
 
+/// Max concurrent RPC connections per listener. Mirrors jsonrpsee's own
+/// `ServerConfig` default (100). Used both as the inner `ConnectionGuard`
+/// limit and as the plain-HTTP accept-level semaphore size, so the two
+/// bounds can't drift. Also passed to the startup-status RPC.
+pub const RPC_MAX_CONNECTIONS: u32 = 100;
+
 /// Shared, mutable record of which optional listeners actually bound
 /// at startup. Updated by the listener wiring after each successful
 /// bind; read by `getserverstatus` to report runtime — not config —
@@ -105,26 +111,42 @@ pub struct RpcTlsConfig {
     pub max_connections: usize,
 }
 
-/// Composite handle that stops both the plain-HTTP and (optional) TLS
-/// JSON-RPC surfaces. Returned by [`start`] so callers see a single
-/// `.stop()` call regardless of whether TLS is enabled. Mirrors the
-/// shutdown semantics of the plain-HTTP [`ServerHandle`] (i.e. an
-/// already-stopped surface is not an error).
+/// Composite handle that stops every plain-HTTP listener and the
+/// optional TLS surface. Returned by [`start`] so callers see a single
+/// `.stop()` call regardless of how many plain-HTTP binds were
+/// requested or whether TLS is enabled. Mirrors the shutdown
+/// semantics of the plain-HTTP [`ServerHandle`] (i.e. an already-
+/// stopped surface is not an error).
 #[derive(Clone)]
 pub struct RpcServerHandle {
-    plain: ServerHandle,
+    /// One handle per `--rpcbind` value. All share the same Methods +
+    /// auth middleware; per-bind listeners exist purely so a node can
+    /// bind several interfaces (the Bitcoin Core convention).
+    plain: Vec<ServerHandle>,
     tls: Option<ServerHandle>,
 }
 
 impl RpcServerHandle {
-    /// Tell both surfaces to stop. Ignores `AlreadyStopped` on the TLS
-    /// surface so a previously-fired bridge or test teardown does not
-    /// propagate an error to the caller.
+    /// Tell every plain-HTTP listener and the optional TLS surface to
+    /// stop. Ignores `AlreadyStopped` errors so a previously-fired
+    /// bridge or test teardown does not propagate to the caller.
     pub fn stop(&self) -> Result<(), jsonrpsee::server::AlreadyStoppedError> {
         if let Some(tls) = &self.tls {
             let _ = tls.stop();
         }
-        self.plain.stop()
+        // Stop every plain listener, ignoring `AlreadyStopped`. Each
+        // plain surface has a bridge task that stops it as soon as the
+        // process-wide shutdown watch fires (so it quits accepting
+        // before the flush phase), which means by the time main's
+        // explicit `stop()` runs the handle is usually already stopped.
+        // `AlreadyStoppedError` is the only error this can yield and it
+        // means the desired end state (stopped) already holds, so
+        // swallowing it keeps `stop()` idempotent — callers `.expect()`
+        // success here during shutdown.
+        for h in &self.plain {
+            let _ = h.stop();
+        }
+        Ok(())
     }
 }
 
@@ -304,13 +326,28 @@ where
 
 /// Start the JSON-RPC HTTP server with authentication.
 ///
-/// When `tls` is `Some`, also binds a parallel HTTPS listener using
-/// the supplied PEM cert + key. The plain-HTTP path is unchanged from
-/// the no-TLS configuration; TLS is purely additive. The returned
-/// [`RpcServerHandle`] stops both surfaces on `.stop()`.
+/// `bind_addrs` is the list of plain-HTTP bind addresses (one or more,
+/// per `--rpcbind`). Each gets its own listener task; all share the
+/// same auth + Methods (Arc-backed, cheap to clone). When `tls` is
+/// `Some`, also binds a parallel HTTPS listener using the supplied
+/// PEM cert + key. The plain-HTTP path is unchanged from the no-TLS
+/// configuration; TLS is purely additive. The returned
+/// [`RpcServerHandle`] stops every plain listener AND the TLS surface
+/// on `.stop()`.
+///
+/// `allowip` is the parsed `-rpcallowip` source-address allowlist and is
+/// ENFORCED per request: each plain-HTTP listener runs a manual accept
+/// loop (jsonrpsee's high-level `Server::start()` never surfaces the
+/// peer `SocketAddr` to the HTTP middleware, so a tower layer can't see
+/// it). A connection whose source IP is neither loopback nor inside a
+/// listed CIDR is answered with `403 Forbidden` and never reaches the
+/// RPC methods. An empty allowlist means loopback-only; the static
+/// "must allowlist before exposing" check in `Config::load` keeps a
+/// non-loopback bind from ever running without an allowlist.
 #[allow(clippy::too_many_arguments)]
 pub async fn start(
-    bind_addr: SocketAddr,
+    bind_addrs: Vec<SocketAddr>,
+    allowip: Vec<crate::rpc::allowip::IpAllowEntry>,
     tls: Option<RpcTlsConfig>,
     auth: Arc<RpcAuth>,
     // `tls_auth` is applied to the TLS surface only. `None` (the
@@ -1750,23 +1787,42 @@ pub async fn start(
     //
     // `server_cfg` is built once and shared with the TLS path below so
     // both surfaces enforce the same jsonrpsee core limits (connection
-    // cap, request/response size, batch config, etc.). Today the value
-    // is the library default — making the source explicit prevents a
-    // future tightening on this builder from silently leaving the TLS
-    // surface on the old (looser) defaults.
-    let server_cfg = ServerConfig::default();
-    let plain_middleware = tower::ServiceBuilder::new().layer(AuthLayer::new(auth.clone()));
-    let server = ServerBuilder::new()
-        .set_config(server_cfg.clone())
-        .set_http_middleware(plain_middleware)
-        .build(bind_addr)
-        .await?;
-
-    // Methods is Arc-backed and cheap to clone; we keep one copy here
-    // to feed the TLS path's per-connection service builder if TLS is
-    // enabled. (`Server::start` consumes its own copy.)
+    // cap, request/response size, batch config, etc.). We set
+    // `max_connections` explicitly to [`RPC_MAX_CONNECTIONS`] so the
+    // plain path's accept-level semaphore (which bounds raw sockets,
+    // including denied/idle ones, before the per-request ConnectionGuard
+    // is reached) is provably the same number rather than coupled to
+    // jsonrpsee's library default.
+    let server_cfg = ServerConfig::builder()
+        .max_connections(RPC_MAX_CONNECTIONS)
+        .build();
+    // Methods is Arc-backed and cheap to clone — one copy is consumed
+    // by each per-bind `Server::start()` call below, plus one to feed
+    // the TLS path's per-connection service builder if TLS is enabled.
     let methods: Methods = module.into();
-    let plain_handle = server.start(methods.clone());
+    if bind_addrs.is_empty() {
+        return Err("rpc::server::start: bind_addrs is empty".into());
+    }
+    // `-rpcallowip` is enforced at the TCP accept boundary, so the
+    // plain-HTTP path uses a manual accept loop (one per bind) rather
+    // than jsonrpsee's `Server::start()`: the high-level flow never
+    // exposes the peer `SocketAddr` to the HTTP middleware. The
+    // allowlist is shared (read-only) across every listener task.
+    let allowip = Arc::new(allowip);
+    let mut plain_handles: Vec<ServerHandle> = Vec::with_capacity(bind_addrs.len());
+    for bind_addr in &bind_addrs {
+        let handle = spawn_plain_surface(
+            *bind_addr,
+            server_cfg.clone(),
+            auth.clone(),
+            allowip.clone(),
+            methods.clone(),
+            Some(shutdown_tx_outer.subscribe()),
+            RPC_MAX_CONNECTIONS as usize,
+        )
+        .await?;
+        plain_handles.push(handle);
+    }
 
     let tls_handle = if let Some(tls_cfg) = tls {
         let mut shutdown_rx_for_tls = shutdown_tx_outer.subscribe();
@@ -1791,7 +1847,7 @@ pub async fn start(
     };
 
     Ok(RpcServerHandle {
-        plain: plain_handle,
+        plain: plain_handles,
         tls: tls_handle,
     })
 }
@@ -2001,6 +2057,183 @@ async fn spawn_tls_surface(
                     svc,
                     conn_stop.shutdown(),
                 ));
+            });
+        }
+    });
+
+    Ok(server_handle)
+}
+
+/// Bind one plain-HTTP RPC listener and spawn its accept loop, enforcing
+/// the `-rpcallowip` source-address allowlist at accept time.
+///
+/// We do NOT use jsonrpsee's high-level `Server::start()` here because it
+/// never surfaces the peer `SocketAddr` to the HTTP middleware (it only
+/// inserts `ConnectionId`/`ConnectionGuard` into the request extensions),
+/// so a tower layer cannot make an allow/deny decision on the source IP.
+/// Instead we mirror the TLS surface's manual loop: accept the TCP
+/// connection (where the peer addr IS known), decide allow/deny once for
+/// the whole connection, and either serve the real RPC stack or answer
+/// every request on that connection with `403 Forbidden`.
+///
+/// Batch limits, WebSocket upgrades and graceful shutdown are preserved
+/// because the per-connection service is the same `to_service_builder()
+/// .build()` stack jsonrpsee uses internally. That stack's inner
+/// `ConnectionGuard` only acquires a permit per *request*, though, so it
+/// does NOT bound raw sockets that are denied (403), idle, or slow before
+/// a request is dispatched. To make `rpcallowip`-on-a-public-bind actually
+/// safe we add an accept-level `Semaphore` (sized `max_connections`,
+/// mirroring the TLS surface): the permit is taken at accept — before the
+/// allow/deny decision and before any serve task is spawned — and held
+/// for the whole connection, so floods of denied/idle connections can't
+/// exhaust fds/tasks. At capacity the socket is dropped (TCP reset).
+///
+/// `max_connections` MUST match `server_cfg`'s connection cap; callers
+/// pass [`RPC_MAX_CONNECTIONS`], which `server_cfg` is also built from.
+pub async fn spawn_plain_surface(
+    bind_addr: SocketAddr,
+    server_cfg: ServerConfig,
+    auth: Arc<RpcAuth>,
+    allowip: Arc<Vec<crate::rpc::allowip::IpAllowEntry>>,
+    methods: Methods,
+    shutdown_rx: Option<watch::Receiver<bool>>,
+    max_connections: usize,
+) -> Result<ServerHandle, Box<dyn std::error::Error + Send + Sync>> {
+    // Bind synchronously so a port conflict is a startup-fatal error
+    // rather than a silently-dropped task that never accepts.
+    let tcp = tokio::net::TcpListener::bind(bind_addr)
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("failed to bind RPC server on {bind_addr}: {e}").into()
+        })?;
+
+    let (stop_handle, server_handle) = stop_channel();
+
+    let plain_middleware = tower::ServiceBuilder::new().layer(AuthLayer::new(auth));
+    let rpc_svc = ServerBuilder::new()
+        .set_config(server_cfg)
+        .set_http_middleware(plain_middleware)
+        .to_service_builder()
+        .build(methods, stop_handle.clone());
+
+    // Optionally bridge the process-wide shutdown watch into this
+    // surface's stop handle, mirroring the TLS path: the listener quits
+    // accepting as soon as shutdown fires rather than waiting for the
+    // owner's explicit `stop()`. Callers whose handle is stopped
+    // directly (e.g. the startup RPC, torn down on the IBD→full
+    // transition) pass `None`.
+    if let Some(mut bridge_rx) = shutdown_rx {
+        let bridge_handle = server_handle.clone();
+        tokio::spawn(async move {
+            let _ = bridge_rx.changed().await;
+            let _ = bridge_handle.stop();
+        });
+    }
+
+    // Accept-level connection cap (covers denied/idle/slow sockets that
+    // never reach the per-request ConnectionGuard). Permit is acquired at
+    // accept and held for the connection's lifetime.
+    let conn_cap = std::sync::Arc::new(tokio::sync::Semaphore::new(max_connections.max(1)));
+
+    let accept_stop = stop_handle.clone();
+    tokio::spawn(async move {
+        loop {
+            let (stream, peer) = tokio::select! {
+                res = tcp.accept() => match res {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "RPC accept error");
+                        // Brief backoff so an EMFILE storm can't busy-loop.
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        continue;
+                    }
+                },
+                _ = accept_stop.clone().shutdown() => break,
+            };
+
+            // Take a connection permit BEFORE the allow/deny check, so a
+            // flood of non-allowlisted (or idle) sockets is bounded too.
+            // At capacity we drop the socket (the client sees a TCP
+            // reset) rather than queueing unbounded work.
+            let permit = match conn_cap.clone().try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => {
+                    tracing::warn!(
+                        peer = %peer,
+                        "RPC at-capacity rejection ({} max connections)",
+                        max_connections,
+                    );
+                    drop(stream);
+                    continue;
+                }
+            };
+
+            // One allow/deny decision per connection — the source IP is
+            // fixed for the connection's lifetime. Loopback is always
+            // allowed (keeps sat-cli working); otherwise the IP must fall
+            // inside a configured CIDR.
+            let allowed = crate::rpc::allowip::is_allowed(peer.ip(), &allowip);
+            if !allowed {
+                tracing::warn!(
+                    peer = %peer,
+                    "RPC connection rejected: source IP not permitted by -rpcallowip",
+                );
+            }
+
+            let rpc_svc = rpc_svc.clone();
+            let conn_stop = accept_stop.clone();
+            // `service_fn` returns an explicitly boxed future so the
+            // spawn site sees a `Send + 'static` future (sidesteps the
+            // HRTB-inference quirk the TLS path documents).
+            let svc = tower::service_fn(
+                move |req: jsonrpsee::server::HttpRequest<hyper::body::Incoming>| {
+                    let mut rpc_svc = rpc_svc.clone();
+                    Box::pin(async move {
+                        if !allowed {
+                            let mut resp = jsonrpsee::server::HttpResponse::new(
+                                jsonrpsee::server::HttpBody::from(
+                                    "403 Forbidden: source IP not permitted by -rpcallowip\n",
+                                ),
+                            );
+                            *resp.status_mut() = hyper::StatusCode::FORBIDDEN;
+                            return Ok(resp);
+                        }
+                        tower::Service::<
+                            jsonrpsee::server::HttpRequest<hyper::body::Incoming>,
+                        >::call(&mut rpc_svc, req)
+                        .await
+                    })
+                        as std::pin::Pin<
+                            Box<
+                                dyn std::future::Future<
+                                        Output = Result<
+                                            jsonrpsee::server::HttpResponse<
+                                                jsonrpsee::server::HttpBody,
+                                            >,
+                                            tower::BoxError,
+                                        >,
+                                    > + Send,
+                            >,
+                        >
+                },
+            );
+
+            // Spawn the serve future DIRECTLY (no wrapping async block) —
+            // wrapping it bites an HRTB-inference quirk on the service's
+            // request lifetime (the TLS path documents the same). To hold
+            // the connection permit for the connection's lifetime without
+            // re-triggering that quirk, a separate task owns the permit
+            // and awaits the serve task's JoinHandle (whose type doesn't
+            // name the service's HRTB lifetime); the permit drops when the
+            // connection ends.
+            let serve = tokio::spawn(serve_with_graceful_shutdown(
+                stream,
+                svc,
+                conn_stop.shutdown(),
+            ));
+            tokio::spawn(async move {
+                let _permit = permit;
+                let _ = serve.await;
             });
         }
     });
