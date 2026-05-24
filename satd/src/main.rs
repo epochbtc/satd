@@ -145,7 +145,13 @@ async fn main() {
     // Detect legacy redb database and fail fast. Done before auth/RPC
     // setup so the legacy-detect error doesn't write to the cookie file
     // or bind a port unnecessarily.
-    let blocks_dir = net_datadir.join("blocks");
+    //
+    // `blocks_dir` resolves --blocksdir per Bitcoin Core semantics: the
+    // flag is the ROOT under which the chain-specific `blocks/` subtree
+    // lives, so `-blocksdir=/data` yields `/data/blocks` on mainnet and
+    // `/data/regtest/blocks` on regtest — block files for different
+    // networks never collide. Unset => `<net_datadir>/blocks`.
+    let blocks_dir = config.blocks_dir();
     let legacy_redb = net_datadir.join("chainstate.redb");
     if legacy_redb.exists() {
         eprintln!(
@@ -1725,8 +1731,12 @@ async fn main() {
 
     // DNS seeding: only if no explicit --connect peers and --dns is enabled
     if config.connect.is_empty() && config.dns {
-        let seed_addrs =
-            node::net::dns::resolve_seeds(config.network, config.proxy.as_deref()).await;
+        let seed_addrs = node::net::dns::resolve_seeds_with(
+            config.network,
+            config.proxy.as_deref(),
+            &config.signet_seed_nodes,
+        )
+        .await;
         let max_dns_outbound = 64;
         for addr in seed_addrs.into_iter().take(max_dns_outbound) {
             peer_manager.add_peer_addr(addr.clone());
