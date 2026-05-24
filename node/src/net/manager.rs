@@ -33,6 +33,9 @@ const BAN_THRESHOLD: u32 = 100;
 /// don't supply a value. Operator-facing path goes through
 /// `Config::maxinboundperip` and the `-maxinboundperip` CLI flag.
 const DEFAULT_MAX_INBOUND_PER_IP: usize = 3;
+/// Default handshake timeout in milliseconds, matching Bitcoin Core's
+/// `-timeout` default (5000ms).
+const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 5000;
 
 /// Per-address reconnect backoff state.
 struct ReconnectState {
@@ -131,6 +134,13 @@ pub struct PeerManager {
     pending_connections: RwLock<HashSet<SocketAddr>>,
     /// Ban duration in seconds (default: 86400).
     ban_duration_secs: u64,
+    /// Per-message timeout for the version/verack handshake, in
+    /// milliseconds (Bitcoin Core's `-timeout`, default 5000ms). A peer
+    /// that doesn't make handshake progress within this window is
+    /// dropped. Stored as an atomic so the satd binary can set it from
+    /// config after construction (see [`set_connect_timeout_ms`]) without
+    /// widening the already-large `with_config` argument list.
+    connect_timeout_ms: AtomicU64,
     /// IBD scheduler for parallel block download (shared with connect thread).
     ibd: Arc<parking_lot::RwLock<Option<IbdScheduler>>>,
     /// Signal to wake the connect thread when a block is stored.
@@ -260,6 +270,7 @@ impl PeerManager {
             max_inbound_per_ip,
             pending_connections: RwLock::new(HashSet::new()),
             ban_duration_secs,
+            connect_timeout_ms: AtomicU64::new(DEFAULT_CONNECT_TIMEOUT_MS),
             ibd: ibd.clone(),
             connect_signal: connect_signal.clone(),
             proxy,
@@ -286,6 +297,13 @@ impl PeerManager {
         });
 
         mgr
+    }
+
+    /// Set the handshake timeout (Bitcoin Core's `-timeout`), in
+    /// milliseconds. Call once at startup before peers connect. A value
+    /// of 0 is clamped to 1ms so the handshake can never block forever.
+    pub fn set_connect_timeout_ms(&self, ms: u64) {
+        self.connect_timeout_ms.store(ms.max(1), Ordering::Relaxed);
     }
 
     /// Resolve a max_ahead config value to an effective count.
@@ -462,11 +480,31 @@ impl PeerManager {
             addr,
         };
 
+        // Bound the dial itself with Core's `-timeout` (the same value
+        // that bounds the version/verack reads). Without this a
+        // blackholed route or a stalled SOCKS/onion proxy hangs the dial
+        // for the OS/proxy default rather than the configured value. The
+        // `_guard` above releases the pending-connection slot on the
+        // timeout early-return too.
+        let connect_timeout = Duration::from_millis(self.connect_timeout_ms.load(Ordering::Relaxed));
         let stream = if let Some(ref proxy_addr) = self.proxy {
-            proxy::connect_socks5(proxy_addr, addr).await?
-        } else {
-            TcpStream::connect(addr)
+            tokio::time::timeout(connect_timeout, proxy::connect_socks5(proxy_addr, addr))
                 .await
+                .map_err(|_| {
+                    format!(
+                        "connect to {addr} via proxy timed out after {}ms",
+                        connect_timeout.as_millis()
+                    )
+                })??
+        } else {
+            tokio::time::timeout(connect_timeout, TcpStream::connect(addr))
+                .await
+                .map_err(|_| {
+                    format!(
+                        "connect to {addr} timed out after {}ms",
+                        connect_timeout.as_millis()
+                    )
+                })?
                 .map_err(|e| format!("connect failed: {}", e))?
         };
 
@@ -492,7 +530,21 @@ impl PeerManager {
             .or(self.proxy.as_deref())
             .ok_or("no proxy configured for .onion connections")?;
 
-        let stream = proxy::connect_socks5_onion(proxy_addr, host, port).await?;
+        // Bound the onion dial with Core's `-timeout` too — an
+        // unresponsive onion proxy must not hang past the configured
+        // value.
+        let connect_timeout = Duration::from_millis(self.connect_timeout_ms.load(Ordering::Relaxed));
+        let stream = tokio::time::timeout(
+            connect_timeout,
+            proxy::connect_socks5_onion(proxy_addr, host, port),
+        )
+        .await
+        .map_err(|_| {
+            format!(
+                "connect to onion {host}:{port} via proxy timed out after {}ms",
+                connect_timeout.as_millis()
+            )
+        })??;
 
         // Use a placeholder SocketAddr for .onion peers (the actual routing is via proxy)
         let placeholder_addr: SocketAddr = ([0, 0, 0, 0], port).into();
@@ -2928,8 +2980,8 @@ impl PeerManager {
     }
 
     /// Receive a message with timeout.
-    async fn recv_with_timeout(conn: &mut Connection, secs: u64) -> Result<NetworkMessage, String> {
-        tokio::time::timeout(std::time::Duration::from_secs(secs), conn.recv())
+    async fn recv_with_timeout(conn: &mut Connection, timeout: Duration) -> Result<NetworkMessage, String> {
+        tokio::time::timeout(timeout, conn.recv())
             .await
             .map_err(|_| "handshake timeout".to_string())?
             .map_err(|e| format!("recv: {}", e))
@@ -2943,7 +2995,9 @@ impl PeerManager {
         direction: Direction,
     ) -> Result<VersionMessage, String> {
         let our_version = self.build_version_message(conn.peer_addr().map_err(|e| e.to_string())?);
-        let timeout_secs = 10;
+        // Bitcoin Core's `-timeout` (default 5000ms), set from config at
+        // startup; bounds each step of the version/verack exchange.
+        let timeout = Duration::from_millis(self.connect_timeout_ms.load(Ordering::Relaxed));
 
         match direction {
             Direction::Outbound => {
@@ -2957,7 +3011,7 @@ impl PeerManager {
                     .map_err(|e| format!("send sendaddrv2: {}", e))?;
 
                 let their_version = loop {
-                    let msg = Self::recv_with_timeout(conn, timeout_secs).await?;
+                    let msg = Self::recv_with_timeout(conn, timeout).await?;
                     if let NetworkMessage::Version(v) = msg {
                         break v;
                     }
@@ -2968,7 +3022,7 @@ impl PeerManager {
                     .map_err(|e| format!("send verack: {}", e))?;
 
                 loop {
-                    let msg = Self::recv_with_timeout(conn, timeout_secs).await?;
+                    let msg = Self::recv_with_timeout(conn, timeout).await?;
                     if matches!(msg, NetworkMessage::Verack) {
                         break;
                     }
@@ -2982,7 +3036,7 @@ impl PeerManager {
             }
             Direction::Inbound => {
                 let their_version = loop {
-                    let msg = Self::recv_with_timeout(conn, timeout_secs).await?;
+                    let msg = Self::recv_with_timeout(conn, timeout).await?;
                     if let NetworkMessage::Version(v) = msg {
                         break v;
                     }
@@ -3002,7 +3056,7 @@ impl PeerManager {
                     .map_err(|e| format!("send verack: {}", e))?;
 
                 loop {
-                    let msg = Self::recv_with_timeout(conn, timeout_secs).await?;
+                    let msg = Self::recv_with_timeout(conn, timeout).await?;
                     if matches!(msg, NetworkMessage::Verack) {
                         break;
                     }
