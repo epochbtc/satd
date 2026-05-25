@@ -38,25 +38,32 @@ on:
   push:
     tags:
       - 'v*'
+  # The PR dry-run exists to catch breakage in the release machinery
+  # itself — the cross-target matrix (musl/aarch64/macos), the
+  # rocksdb-sys C++ cross-build, tarball staging, the Docker image, and
+  # the cargo-deny supply-chain gate. That machinery breaks on changes
+  # to the build/packaging inputs below, NOT on ordinary code edits:
+  # the regular CI (ci.yml) already compiles + tests the workspace on
+  # every PR, and the *additional* coverage the release matrix provides
+  # (other architectures, static-musl linking, the dep-graph deny gate)
+  # is sensitive to dependency, toolchain, and packaging changes far
+  # more than to application code.
+  #
+  # So scope the dry-run to those inputs. The previous filter listed
+  # every workspace crate, which made the full hosted-runner matrix
+  # (the slowest, most flake-prone jobs we have) fire on essentially
+  # every code PR for no added safety. Tradeoff: a code change that
+  # breaks ONLY a cross-target build (e.g. a dep used in a non-portable
+  # way) won't surface until tag time — use workflow_dispatch to force
+  # a full matrix run on such a PR when in doubt.
   pull_request:
     paths:
       - '.github/workflows/release.yml'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'Dockerfile'
-      - 'satd/**'
-      - 'sat-cli/**'
-      - 'node/**'
-      - 'node-index/**'
-      - 'node-filter-index/**'
-      - 'esplora-handlers/**'
-      - 'electrum-proto/**'
-      - 'tls-config/**'
-      - 'events/**'
-      - 'mcp/**'
-      - 'block-analyzer/**'
-      - 'consensus/**'
-      - 'sat-tui/**'
+      - 'rust-toolchain.toml'
+      - 'deny.toml'
   workflow_dispatch:
 
 permissions: {}
