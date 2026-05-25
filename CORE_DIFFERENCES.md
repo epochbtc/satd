@@ -333,7 +333,7 @@ default behavior set the corresponding flag.
 | Block-filter index | off | off | Matches Core; enable with `--blockfilterindex=basic`. |
 | `--peerblockfilters` | off | off | Matches Core; opt in to advertise `NODE_COMPACT_FILTERS`. |
 | `--mempoolfullrbf` | on (Core v28+) | on | Matches Core post-v28. |
-| `--listenonion` | off | off | Matches Core; satd's hardcoded `.onion` seeds activate when on. |
+| `--listenonion` | on (no-op without Tor) | off (on if `-torcontrol` set) | Core defaults it on, but it's a silent no-op unless a Tor control port is reachable; satd defaults it off to avoid dialing the control port on every boot. When on, satd creates a v3 hidden service via `-torcontrol` (default `127.0.0.1:9051`). An explicit `-torcontrol` implies `-listenonion=1`; `-listenonion=0` forces it off. |
 
 ---
 
