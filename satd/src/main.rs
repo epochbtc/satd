@@ -900,6 +900,9 @@ async fn main() {
     // `config.timeout` is already normalised to milliseconds.
     peer_manager.set_connect_timeout_ms(config.timeout);
 
+    // -blocksonly: suppress P2P transaction relay.
+    peer_manager.set_blocksonly(config.blocksonly);
+
     // Wire the BIP 158 filter index into the peer manager so the BIP
     // 157 service arms can read filter rows and the version handshake
     // can advertise `NODE_COMPACT_FILTERS` when both runtime knobs say

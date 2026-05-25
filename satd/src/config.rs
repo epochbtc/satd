@@ -458,6 +458,10 @@ pub struct Config {
     /// `--rpctlshandshaketimeout`.
     pub rpc_tls_handshake_timeout: u64,
     pub listen: bool,
+    /// Bitcoin Core's `-blocksonly`: suppress P2P transaction relay
+    /// (advertise relay=false, ignore inbound tx, don't request txs).
+    /// Locally submitted (RPC) transactions are still relayed.
+    pub blocksonly: bool,
     pub port: u16,
     pub connect: Vec<String>,
     pub assumevalid: Option<String>,
@@ -1268,6 +1272,11 @@ impl Config {
             .or_else(|| file_get("listen").and_then(|v| parse_bool(&v)))
             .unwrap_or(true);
 
+        let blocksonly = cli
+            .blocksonly
+            .or_else(|| file_get("blocksonly").and_then(|v| parse_bool(&v)))
+            .unwrap_or(false);
+
         let port = cli
             .port
             .or_else(|| file_get("port").and_then(|v| v.parse().ok()))
@@ -1761,6 +1770,7 @@ impl Config {
             rpc_tls_cert,
             rpc_tls_key,
             listen,
+            blocksonly,
             port,
             connect,
             assumevalid,
@@ -2525,6 +2535,17 @@ pub struct CliArgs {
         help = "Accept P2P connections"
     )]
     pub listen: Option<bool>,
+
+    /// Bitcoin Core's `-blocksonly`: don't relay transactions over P2P.
+    #[arg(
+        long,
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
+        help = "Suppress P2P transaction relay (default: false)"
+    )]
+    pub blocksonly: Option<bool>,
 
     #[arg(long, value_name = "PORT", help = "P2P listen port")]
     pub port: Option<u16>,
@@ -3571,6 +3592,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "seednode",
         "dns",
         "dnsseed",
+        "blocksonly",
         "bantime",
         "proxy",
         "onion",
@@ -3621,6 +3643,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "testnet4",
         "signet",
         "listen",
+        "blocksonly",
         "dns",
         "dnsseed",
         "listenonion",
@@ -3923,6 +3946,7 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "rpcmtlsclientallow",
     // P2P
     "listen",
+    "blocksonly",
     "port",
     "bind",
     "connect",
@@ -4074,7 +4098,6 @@ const NOT_YET_IMPLEMENTED_KEYS: &[&str] = &[
     "maxuploadtarget", // upload bandwidth cap + serving limits
     "whitelist",       // NetPermissionFlags by IP / subnet
     "whitebind",       // NetPermissionFlags by bind address
-    "blocksonly",      // suppress transaction relay
     "externalip",      // advertise an external address to peers
     "asmap",           // ASN-based addrman bucketing (eclipse resistance)
     // The two below need machinery satd lacks today (persistent
@@ -4465,6 +4488,7 @@ rpcport=8332
             rpcdisableauth: None,
             rpctlshandshaketimeout: None,
             listen: None,
+            blocksonly: None,
             port: None,
             connect: vec![],
             assumevalid: None,
@@ -4667,6 +4691,7 @@ rpcport=8332
             rpcdisableauth: None,
             rpctlshandshaketimeout: None,
             listen: None,
+            blocksonly: None,
             port: None,
             connect: vec![],
             assumevalid: None,
@@ -5914,6 +5939,26 @@ rpcport=39999
         assert_eq!(parse_chain_name("testnet4").unwrap(), Network::Testnet4);
     }
 
+    // ---- blocksonly ----
+
+    #[test]
+    fn blocksonly_defaults_false() {
+        let cli = CliArgs::try_parse_from(["satd", "--regtest"]).unwrap();
+        assert!(!Config::from_cli(cli).unwrap().blocksonly);
+    }
+
+    #[test]
+    fn blocksonly_flag_and_negation() {
+        let cli = CliArgs::try_parse_from(["satd", "--regtest", "--blocksonly"]).unwrap();
+        assert!(Config::from_cli(cli).unwrap().blocksonly);
+
+        let argv = normalize_args(
+            ["satd", "--regtest", "-noblocksonly"].iter().map(|s| s.to_string()).collect(),
+        );
+        let cli = CliArgs::try_parse_from(argv).unwrap();
+        assert!(!Config::from_cli(cli).unwrap().blocksonly);
+    }
+
     // ---- signetchallenge: custom signet (BIP 325) ----
 
     #[test]
@@ -6055,7 +6100,6 @@ notarealkey=1
             "maxuploadtarget",
             "whitelist",
             "whitebind",
-            "blocksonly",
             "externalip",
             "asmap",
             "forcednsseed",

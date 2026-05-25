@@ -173,6 +173,12 @@ pub struct PeerManager {
     /// alongside `set_filter_index` from the satd binary.
     #[cfg(feature = "block-filter-index")]
     peer_serve_filters: std::sync::atomic::AtomicBool,
+    /// Bitcoin Core's `-blocksonly`: suppress transaction relay. When set,
+    /// the node advertises `relay=false` in its version, ignores inbound
+    /// `tx` messages from peers, and does not request advertised txs.
+    /// Transactions submitted locally via RPC are still relayed. Defaults
+    /// to false; set from the satd binary via `set_blocksonly`.
+    blocksonly: std::sync::atomic::AtomicBool,
 }
 
 impl PeerManager {
@@ -281,6 +287,7 @@ impl PeerManager {
             filter_index: std::sync::OnceLock::new(),
             #[cfg(feature = "block-filter-index")]
             peer_serve_filters: std::sync::atomic::AtomicBool::new(false),
+            blocksonly: std::sync::atomic::AtomicBool::new(false),
         });
 
         // Spawn block processing thread
@@ -335,6 +342,18 @@ impl PeerManager {
         let _ = self.filter_index.set(index);
         self.peer_serve_filters
             .store(peer_serve, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Enable/disable `-blocksonly` transaction-relay suppression. Set
+    /// once from the satd binary after construction.
+    pub fn set_blocksonly(&self, enabled: bool) {
+        self.blocksonly
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether transaction relay is suppressed (`-blocksonly`).
+    fn blocksonly(&self) -> bool {
+        self.blocksonly.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Predicate consulted by `handle_message` and the version
@@ -1367,8 +1386,9 @@ impl PeerManager {
                     }
                 }
                 Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
-                    // Don't request transactions during IBD — we can't validate them
-                    if !self.is_ibd() && self.mempool.get(&txid).is_none() {
+                    // Don't request transactions during IBD — we can't
+                    // validate them — nor under -blocksonly (no tx relay).
+                    if !self.is_ibd() && !self.blocksonly() && self.mempool.get(&txid).is_none() {
                         txs_to_get.push(txid);
                     }
                 }
@@ -2279,6 +2299,11 @@ impl PeerManager {
         if self.is_ibd() {
             return;
         }
+        // -blocksonly: ignore peer-relayed transactions entirely. Locally
+        // submitted (RPC) transactions still enter the mempool and relay.
+        if self.blocksonly() {
+            return;
+        }
 
         let txid = tx.compute_txid();
         match self.mempool.accept_transaction(
@@ -3092,7 +3117,7 @@ impl PeerManager {
             nonce: rand::random(),
             user_agent: crate::USER_AGENT.to_string(),
             start_height: self.chain_state.tip_height() as i32,
-            relay: true,
+            relay: !self.blocksonly(),
         }
     }
 }
