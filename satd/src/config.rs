@@ -467,6 +467,11 @@ pub struct Config {
     /// Operator-declared external addresses (Bitcoin Core's
     /// `-externalip`), resolved to socket addresses. Advertised to peers.
     pub externalip: Vec<SocketAddr>,
+    /// `-whitelist` permission entries by source subnet (NetPermissions).
+    pub whitelist: Vec<node::net::permissions::WhitelistEntry>,
+    /// `-whitebind` listeners: an extra bind address plus the permissions
+    /// granted to peers that connect to it.
+    pub whitebind: Vec<(SocketAddr, node::net::permissions::NetPermissions)>,
     pub assumevalid: Option<String>,
     pub assumevalidage: u64,
     /// Stop running once the active-chain tip reaches this height
@@ -1302,6 +1307,54 @@ impl Config {
             }
         }
 
+        // -whitelist: per-subnet net permissions.
+        let whitelist_raw: Vec<String> = if !cli.whitelist.is_empty() {
+            cli.whitelist.clone()
+        } else {
+            file_get_all("whitelist")
+        };
+        let mut whitelist: Vec<node::net::permissions::WhitelistEntry> =
+            Vec::with_capacity(whitelist_raw.len());
+        for raw in &whitelist_raw {
+            whitelist.push(
+                node::net::permissions::WhitelistEntry::parse(raw)
+                    .map_err(|e| format!("whitelist: {e}"))?,
+            );
+        }
+
+        // -whitebind: extra permissioned listeners. `[perms@]addr`, addr
+        // is a literal `IP:port` (a bare IP inherits the network port).
+        let whitebind_raw: Vec<String> = if !cli.whitebind.is_empty() {
+            cli.whitebind.clone()
+        } else {
+            file_get_all("whitebind")
+        };
+        let mut whitebind: Vec<(SocketAddr, node::net::permissions::NetPermissions)> =
+            Vec::with_capacity(whitebind_raw.len());
+        for raw in &whitebind_raw {
+            let (perms, addr_str) = match raw.split_once('@') {
+                Some((p, a)) => (
+                    node::net::permissions::NetPermissions::parse_list(p)
+                        .map_err(|e| format!("whitebind: {e}"))?,
+                    a.trim(),
+                ),
+                None => (
+                    node::net::permissions::NetPermissions::implicit(),
+                    raw.trim(),
+                ),
+            };
+            let sa = if let Ok(sa) = addr_str.parse::<SocketAddr>() {
+                sa
+            } else if let Ok(ip) = addr_str.parse::<std::net::IpAddr>() {
+                SocketAddr::new(ip, default_p2p_port(network))
+            } else {
+                return Err(format!(
+                    "whitebind: {addr_str:?} is not an IP or IP:port"
+                ));
+            };
+            whitebind.push((sa, perms));
+        }
+
         let port = cli
             .port
             .or_else(|| file_get("port").and_then(|v| v.parse().ok()))
@@ -1797,6 +1850,8 @@ impl Config {
             listen,
             blocksonly,
             externalip,
+            whitelist,
+            whitebind,
             port,
             connect,
             assumevalid,
@@ -2203,6 +2258,8 @@ impl Config {
                 "seednode": self.seednode,
                 "blocksonly": self.blocksonly,
                 "externalip": self.externalip.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+                "whitelist": self.whitelist.iter().map(|e| e.raw.clone()).collect::<Vec<_>>(),
+                "whitebind": self.whitebind.iter().map(|(a, _)| a.to_string()).collect::<Vec<_>>(),
             },
             "mempool": {
                 "max_bytes_mb": self.maxmempool,
@@ -2586,6 +2643,19 @@ pub struct CliArgs {
     /// (bare IP inherits the network's default P2P port).
     #[arg(long, value_name = "IP[:PORT]", help = "External address to advertise (repeatable)")]
     pub externalip: Vec<String>,
+
+    /// Grant net permissions to peers from a subnet. Mirrors Bitcoin
+    /// Core's `-whitelist=[perms@]IP/subnet`. Repeatable. `perms` is a
+    /// comma list (noban,relay,forcerelay,mempool,download,addr,all);
+    /// omitted = the implicit default set.
+    #[arg(long, value_name = "[PERMS@]NET", help = "Whitelist peers by subnet (repeatable)")]
+    pub whitelist: Vec<String>,
+
+    /// Bind an extra P2P listener whose inbound peers get net
+    /// permissions. Mirrors Bitcoin Core's `-whitebind=[perms@]addr`.
+    /// Repeatable.
+    #[arg(long, value_name = "[PERMS@]ADDR", help = "Permissioned bind address (repeatable)")]
+    pub whitebind: Vec<String>,
 
     #[arg(
         long,
@@ -3628,6 +3698,8 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "dnsseed",
         "blocksonly",
         "externalip",
+        "whitelist",
+        "whitebind",
         "bantime",
         "proxy",
         "onion",
@@ -3983,6 +4055,8 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "listen",
     "blocksonly",
     "externalip",
+    "whitelist",
+    "whitebind",
     "port",
     "bind",
     "connect",
@@ -4132,8 +4206,6 @@ pub enum UnsupportedKey {
 /// gains real support, move it into [`KNOWN_CONFIG_KEYS`].
 const NOT_YET_IMPLEMENTED_KEYS: &[&str] = &[
     "maxuploadtarget", // upload bandwidth cap + serving limits
-    "whitelist",       // NetPermissionFlags by IP / subnet
-    "whitebind",       // NetPermissionFlags by bind address
     "asmap",           // ASN-based addrman bucketing (eclipse resistance)
     // The two below need machinery satd lacks today (persistent
     // addrman / a compiled-in fixed-IP seed list). satd seeds at every
@@ -4527,6 +4599,8 @@ rpcport=8332
             port: None,
             connect: vec![],
             externalip: vec![],
+            whitelist: vec![],
+            whitebind: vec![],
             assumevalid: None,
             assumevalidage: None,
             stopatheight: None,
@@ -4731,6 +4805,8 @@ rpcport=8332
             port: None,
             connect: vec![],
             externalip: vec![],
+            whitelist: vec![],
+            whitebind: vec![],
             assumevalid: None,
             assumevalidage: None,
             stopatheight: None,
@@ -5976,6 +6052,54 @@ rpcport=39999
         assert_eq!(parse_chain_name("testnet4").unwrap(), Network::Testnet4);
     }
 
+    // ---- whitelist / whitebind ----
+
+    #[test]
+    fn whitelist_parses_perms_and_subnet() {
+        let cli = CliArgs::try_parse_from([
+            "satd", "--regtest",
+            "--whitelist", "noban,relay@10.0.0.0/8",
+            "--whitelist", "192.168.1.5",
+        ])
+        .unwrap();
+        let cfg = Config::from_cli(cli).unwrap();
+        assert_eq!(cfg.whitelist.len(), 2);
+        assert!(cfg.whitelist[0].perms.noban && cfg.whitelist[0].perms.relay);
+        // bare subnet → implicit perms
+        assert_eq!(
+            cfg.whitelist[1].perms,
+            node::net::permissions::NetPermissions::implicit()
+        );
+    }
+
+    #[test]
+    fn whitebind_parses_addr_and_perms() {
+        let cli = CliArgs::try_parse_from([
+            "satd", "--regtest",
+            "--whitebind", "noban@127.0.0.1:19999",
+        ])
+        .unwrap();
+        let cfg = Config::from_cli(cli).unwrap();
+        assert_eq!(cfg.whitebind.len(), 1);
+        assert_eq!(cfg.whitebind[0].0.to_string(), "127.0.0.1:19999");
+        assert!(cfg.whitebind[0].1.noban);
+    }
+
+    #[test]
+    fn whitelist_invalid_subnet_errors() {
+        let cli =
+            CliArgs::try_parse_from(["satd", "--regtest", "--whitelist", "relay@not-an-ip"])
+                .unwrap();
+        assert!(Config::from_cli(cli).unwrap_err().contains("whitelist"));
+    }
+
+    #[test]
+    fn whitelist_whitebind_now_recognised() {
+        assert_eq!(classify_unsupported_key("whitelist"), None);
+        assert_eq!(classify_unsupported_key("whitebind"), None);
+        assert!(is_known_config_key("whitelist") && is_known_config_key("whitebind"));
+    }
+
     // ---- externalip ----
 
     #[test]
@@ -6161,8 +6285,6 @@ notarealkey=1
         // allowlist.
         for k in [
             "maxuploadtarget",
-            "whitelist",
-            "whitebind",
             "asmap",
             "forcednsseed",
             "fixedseeds",

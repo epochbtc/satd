@@ -908,6 +908,11 @@ async fn main() {
         peer_manager.set_external_addrs(config.externalip.clone());
     }
 
+    // -whitelist: per-subnet net permissions (noban, relay, ...).
+    if !config.whitelist.is_empty() {
+        peer_manager.set_whitelist(config.whitelist.clone());
+    }
+
     // Wire the BIP 158 filter index into the peer manager so the BIP
     // 157 service arms can read filter rows and the version handshake
     // can advertise `NODE_COMPACT_FILTERS` when both runtime knobs say
@@ -1765,6 +1770,19 @@ async fn main() {
             }
         });
         tracing::info!(port = config.port, "P2P listening");
+    }
+
+    // -whitebind: extra permissioned listeners (independent of -listen).
+    for (bind_addr, perms) in &config.whitebind {
+        let pm = peer_manager.clone();
+        let bind_addr = *bind_addr;
+        let perms = *perms;
+        tokio::spawn(async move {
+            if let Err(e) = pm.listen_with_perms(bind_addr, perms).await {
+                tracing::error!(%bind_addr, "whitebind listener error: {}", e);
+            }
+        });
+        tracing::info!(%bind_addr, "whitebind P2P listening");
     }
 
     // Connect to configured peers (and register for auto-reconnect)
