@@ -57,6 +57,8 @@ single-dash Core spellings are aliased by `normalize_args`. Grouped:
   `permitbaremultisig`
 - **Native protocol surfaces:** the `esplora*` and `electrum*` families
   (see `OPERATOR_ERGONOMICS.md`)
+- **Peer-table / eclipse resistance:** `asmap` (ASN-based addrman
+  bucketing).
 - **Storage / pruning / reindex / mining / events / webhooks / MCP /
   metrics:** see `KNOWN_CONFIG_KEYS` for the full enumeration.
 
@@ -104,6 +106,11 @@ single-dash Core spellings are aliased by `normalize_args`. Grouped:
   `mempool.dat` format (Core's datadir is not byte-compatible; see
   `CORE_DIFFERENCES.md`); the file is re-validated against the current
   chainstate on load, never trusted blindly.
+- **`asmap`** — path to a Bitcoin Core `-asmap` file (relative to
+  `--datadir`). When set, the address manager buckets peers by ASN
+  instead of `/16`, so eclipse resistance is per-AS (matching Core). satd
+  ports Core's `asmap.cpp` bitstream interpreter; a missing/empty file is
+  fatal at startup. Unmapped addresses fall back to `/16` grouping.
 - **`maxuploadtarget`** — soft cap (bytes; bare number = MiB, suffix
   `B/K/M/G/T` overrides; `0` = unlimited) on *historical* block data
   served per rolling 24h window. Once spent, blocks older than a week

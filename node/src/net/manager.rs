@@ -525,7 +525,10 @@ impl PeerManager {
     }
 
     /// Install a custom addrman network-group function (e.g. `-asmap`).
-    pub fn set_addrman_group_fn(&self, f: fn(IpAddr) -> Vec<u8>) {
+    pub fn set_addrman_group_fn(
+        &self,
+        f: Box<dyn Fn(IpAddr) -> Vec<u8> + Send + Sync>,
+    ) {
         self.addrman.write().set_group_fn(f);
     }
 

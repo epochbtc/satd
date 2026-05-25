@@ -472,6 +472,9 @@ pub struct Config {
     /// `-whitebind` listeners: an extra bind address plus the permissions
     /// granted to peers that connect to it.
     pub whitebind: Vec<(SocketAddr, node::net::permissions::NetPermissions)>,
+    /// Path to a Bitcoin Core `-asmap` file. When set, the addrman
+    /// buckets by ASN instead of `/16` for eclipse resistance.
+    pub asmap: Option<PathBuf>,
     pub assumevalid: Option<String>,
     pub assumevalidage: u64,
     /// Stop running once the active-chain tip reaches this height
@@ -1358,6 +1361,25 @@ impl Config {
             whitebind.push((sa, perms));
         }
 
+        // -asmap: path to the ASN map file, resolved against datadir.
+        let asmap: Option<PathBuf> = {
+            let raw = cli.asmap.clone().or_else(|| file_get("asmap"));
+            match raw {
+                Some(p) => {
+                    let path = if Path::new(&p).is_absolute() {
+                        PathBuf::from(&p)
+                    } else {
+                        base_datadir.join(&p)
+                    };
+                    if !path.exists() {
+                        return Err(format!("asmap file not found: {}", path.display()));
+                    }
+                    Some(path)
+                }
+                None => None,
+            }
+        };
+
         let port = cli
             .port
             .or_else(|| file_get("port").and_then(|v| v.parse().ok()))
@@ -1855,6 +1877,7 @@ impl Config {
             externalip,
             whitelist,
             whitebind,
+            asmap,
             port,
             connect,
             assumevalid,
@@ -2274,6 +2297,7 @@ impl Config {
                 "whitelist": self.whitelist.iter().map(|e| e.raw.clone()).collect::<Vec<_>>(),
                 "whitebind": self.whitebind.iter().map(|(a, _)| a.to_string()).collect::<Vec<_>>(),
                 "max_upload_target_bytes": self.max_upload_target,
+                "asmap": self.asmap.as_ref().map(|p| p.display().to_string()),
             },
             "mempool": {
                 "max_bytes_mb": self.maxmempool,
@@ -2670,6 +2694,12 @@ pub struct CliArgs {
     /// Repeatable.
     #[arg(long, value_name = "[PERMS@]ADDR", help = "Permissioned bind address (repeatable)")]
     pub whitebind: Vec<String>,
+
+    /// Path to a Bitcoin Core `-asmap` file for ASN-based addrman
+    /// bucketing (eclipse resistance). Relative paths resolve against
+    /// `--datadir`.
+    #[arg(long, value_name = "FILE", help = "asmap file for ASN-based peer bucketing")]
+    pub asmap: Option<String>,
 
     #[arg(
         long,
@@ -3721,6 +3751,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "externalip",
         "whitelist",
         "whitebind",
+        "asmap",
         "bantime",
         "proxy",
         "onion",
@@ -4078,6 +4109,7 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "externalip",
     "whitelist",
     "whitebind",
+    "asmap",
     "port",
     "bind",
     "connect",
@@ -4227,7 +4259,6 @@ pub enum UnsupportedKey {
 /// silently ignoring it could run a node wide open. When a key here
 /// gains real support, move it into [`KNOWN_CONFIG_KEYS`].
 const NOT_YET_IMPLEMENTED_KEYS: &[&str] = &[
-    "asmap",           // ASN-based addrman bucketing (eclipse resistance)
     // The two below need machinery satd lacks today (persistent
     // addrman / a compiled-in fixed-IP seed list). satd seeds at every
     // startup and has no fixed-IP seed list, so neither flag has a
@@ -4650,6 +4681,7 @@ rpcport=8332
             externalip: vec![],
             whitelist: vec![],
             whitebind: vec![],
+            asmap: None,
             assumevalid: None,
             assumevalidage: None,
             stopatheight: None,
@@ -4857,6 +4889,7 @@ rpcport=8332
             externalip: vec![],
             whitelist: vec![],
             whitebind: vec![],
+            asmap: None,
             assumevalid: None,
             assumevalidage: None,
             stopatheight: None,
@@ -6103,6 +6136,40 @@ rpcport=39999
         assert_eq!(parse_chain_name("testnet4").unwrap(), Network::Testnet4);
     }
 
+    // ---- asmap ----
+
+    #[test]
+    fn asmap_resolves_relative_to_datadir_and_requires_file() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        std::fs::write(tmpdir.path().join("ip_asn.map"), b"\x00\x00").unwrap();
+        let cli = CliArgs::try_parse_from([
+            "satd", "--regtest",
+            "--datadir", tmpdir.path().to_str().unwrap(),
+            "--asmap", "ip_asn.map",
+        ])
+        .unwrap();
+        let cfg = Config::from_cli(cli).unwrap();
+        assert_eq!(cfg.asmap, Some(tmpdir.path().join("ip_asn.map")));
+    }
+
+    #[test]
+    fn asmap_missing_file_errors() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let cli = CliArgs::try_parse_from([
+            "satd", "--regtest",
+            "--datadir", tmpdir.path().to_str().unwrap(),
+            "--asmap", "nope.map",
+        ])
+        .unwrap();
+        assert!(Config::from_cli(cli).unwrap_err().contains("asmap file not found"));
+    }
+
+    #[test]
+    fn asmap_now_recognised() {
+        assert_eq!(classify_unsupported_key("asmap"), None);
+        assert!(is_known_config_key("asmap"));
+    }
+
     // ---- maxuploadtarget ----
 
     #[test]
@@ -6360,7 +6427,6 @@ notarealkey=1
         // NotYetImplemented, and NOT be in the plain known-keys
         // allowlist.
         for k in [
-            "asmap",
             "forcednsseed",
             "fixedseeds",
         ] {

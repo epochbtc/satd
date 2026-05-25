@@ -63,10 +63,12 @@ fn default_group(ip: IpAddr) -> Vec<u8> {
     }
 }
 
+type GroupFn = Box<dyn Fn(IpAddr) -> Vec<u8> + Send + Sync>;
+
 pub struct AddrMan {
     entries: HashMap<SocketAddr, AddrEntry>,
     /// Pluggable network-group function (replaced by `-asmap`).
-    group_fn: fn(IpAddr) -> Vec<u8>,
+    group_fn: GroupFn,
 }
 
 impl Default for AddrMan {
@@ -79,14 +81,14 @@ impl AddrMan {
     pub fn new() -> Self {
         Self {
             entries: HashMap::new(),
-            group_fn: default_group,
+            group_fn: Box::new(default_group),
         }
     }
 
     /// Install a custom network-group function (e.g. ASN-based via
     /// `-asmap`). Must be called before addresses are added for bucketing
     /// to use it consistently.
-    pub fn set_group_fn(&mut self, f: fn(IpAddr) -> Vec<u8>) {
+    pub fn set_group_fn(&mut self, f: GroupFn) {
         self.group_fn = f;
     }
 

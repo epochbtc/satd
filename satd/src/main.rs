@@ -906,6 +906,24 @@ async fn main() {
     // -maxuploadtarget: cap historical block upload per 24h (0 = off).
     peer_manager.set_max_upload_target(config.max_upload_target);
 
+    // -asmap: install ASN-based addrman bucketing before loading the
+    // address book so it buckets by AS. A bad asmap file is fatal (the
+    // config layer already verified the path exists).
+    if let Some(ref asmap_path) = config.asmap {
+        match node::net::asmap::AsMap::load(asmap_path) {
+            Ok(map) => {
+                let map = std::sync::Arc::new(map);
+                peer_manager.set_addrman_group_fn(Box::new(move |ip| map.group_key(ip)));
+                tracing::info!(path = %asmap_path.display(), "Loaded asmap for ASN-based peer bucketing");
+            }
+            Err(e) => {
+                eprintln!("Error loading asmap: {e}");
+                auth.cleanup();
+                std::process::exit(1);
+            }
+        }
+    }
+
     // Load the persistent address book (peers.dat) and seed the dial pool
     // with learned peers so we don't have to re-bootstrap from DNS seeds
     // on every restart.
