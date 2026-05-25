@@ -706,11 +706,11 @@ impl ChainState {
 
         // 4. Point the tip at the base block.
         {
-            let mut tip_batch = crate::storage::StoreBatch::default();
-            tip_batch.tip = Some(anchor.blockhash);
-            tip_batch
-                .height_hash_puts
-                .push((anchor.height, anchor.blockhash));
+            let tip_batch = crate::storage::StoreBatch {
+                tip: Some(anchor.blockhash),
+                height_hash_puts: vec![(anchor.height, anchor.blockhash)],
+                ..Default::default()
+            };
             self.store.write_batch(tip_batch)?;
         }
         {
@@ -729,8 +729,10 @@ impl ChainState {
         if actual != anchor.hash_serialized_3 {
             self.store.clear_chainstate()?;
             let genesis = bitcoin::constants::genesis_block(self.network).block_hash();
-            let mut reset = crate::storage::StoreBatch::default();
-            reset.tip = Some(genesis);
+            let reset = crate::storage::StoreBatch {
+                tip: Some(genesis),
+                ..Default::default()
+            };
             self.store.write_batch(reset)?;
             {
                 let mut tip = self.tip.write();
