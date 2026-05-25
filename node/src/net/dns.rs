@@ -133,6 +133,50 @@ pub async fn resolve_seeds(network: Network, proxy: Option<&str>) -> Vec<PeerAdd
 /// The extras come BEFORE the built-in seeds so a private-signet
 /// operator's nodes get tried first; the built-ins remain as
 /// fallback in case the private seeds are down.
+/// Resolve operator-supplied seed strings (Bitcoin Core's `-seednode` /
+/// `-signetseednode`, format `host[:port]`) into `PeerAddr`s, supplying
+/// the network default P2P port when the port is omitted. Handles:
+///
+/// - `.onion[:port]` — kept as an onion target (proxy-routed; safe in
+///   any mode);
+/// - literal IPv4 / `[IPv6]` — used directly (default port if omitted),
+///   no name resolution so nothing to leak;
+/// - DNS hostnames — resolved locally, EXCEPT under proxy mode where the
+///   lookup is skipped to avoid leaking it to the local resolver
+///   (`PeerAddr` has no clearnet-hostname variant to hand to the proxy
+///   for remote resolution; use a `.onion` or literal IP there instead).
+///
+/// Entries that fail to resolve are logged and dropped — never fatal.
+pub async fn resolve_operator_seeds(
+    seeds: &[String],
+    network: Network,
+    proxy: Option<&str>,
+) -> Vec<PeerAddr> {
+    let port = default_port(network);
+    let mut out: Vec<PeerAddr> = Vec::new();
+    for seed in seeds {
+        let (host, p) = split_seed_host_port(seed, port);
+        if host.ends_with(".onion") {
+            out.push(PeerAddr::Onion { host, port: p });
+        } else if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+            out.push(PeerAddr::Socket(SocketAddr::new(ip, p)));
+        } else if proxy.is_some() {
+            tracing::warn!(
+                seed = %host,
+                "skipping DNS seed node under proxy mode (would leak DNS); \
+                 use a .onion address or literal IP instead",
+            );
+        } else {
+            let target = format!("{host}:{p}");
+            match tokio::net::lookup_host(&target).await {
+                Ok(resolved) => out.extend(resolved.map(PeerAddr::Socket)),
+                Err(e) => tracing::warn!(seed = %host, "seed node lookup failed: {}", e),
+            }
+        }
+    }
+    out
+}
+
 pub async fn resolve_seeds_with(
     network: Network,
     proxy: Option<&str>,
@@ -140,50 +184,7 @@ pub async fn resolve_seeds_with(
 ) -> Vec<PeerAddr> {
     let mut prepend: Vec<PeerAddr> = Vec::new();
     if network == Network::Signet {
-        let port = default_port(network);
-        for seed in extra_signet_seeds {
-            let (host, p) = split_seed_host_port(seed, port);
-            if host.ends_with(".onion") {
-                // Onion is proxy-routed; safe regardless of proxy mode.
-                prepend.push(PeerAddr::Onion { host, port: p });
-            } else if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-                // Literal IP: no name resolution happens, so there is no
-                // DNS to leak — connect directly (or via proxy to the IP).
-                prepend.push(PeerAddr::Socket(SocketAddr::new(ip, p)));
-            } else if proxy.is_some() {
-                // DNS hostname under proxy mode: resolving it locally
-                // would leak the lookup to the local resolver, defeating
-                // the whole point of Tor/proxy mode. PeerAddr has no
-                // clearnet-hostname variant we could hand to the proxy
-                // for remote resolution, so the only safe action is to
-                // skip it. Operators who need a private signet seed over
-                // Tor should give its .onion address or a literal IP.
-                tracing::warn!(
-                    seed = %host,
-                    "skipping DNS signet seed node under proxy mode (would leak \
-                     DNS); use a .onion address or literal IP instead",
-                );
-            } else {
-                // Clearnet, no proxy: resolve locally so the rest of the
-                // seed pipeline sees concrete sockets. Failures are
-                // logged and skipped (as for the built-in seeds below).
-                let target = format!("{host}:{p}");
-                match tokio::net::lookup_host(&target).await {
-                    Ok(resolved) => {
-                        for sa in resolved {
-                            prepend.push(PeerAddr::Socket(sa));
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            seed = %host,
-                            "signet seed node lookup failed: {}",
-                            e
-                        );
-                    }
-                }
-            }
-        }
+        prepend = resolve_operator_seeds(extra_signet_seeds, network, proxy).await;
         if !prepend.is_empty() {
             tracing::info!(
                 count = prepend.len(),
@@ -345,6 +346,59 @@ mod tests {
             }
             _ => panic!("expected literal IP entry"),
         }
+    }
+
+    // ---- H2: operator -seednode resolution (host[:port], default port,
+    //      onion, proxy-leak guard). Uses RFC 5737 addrs / no live DNS. ----
+
+    #[tokio::test]
+    async fn operator_seed_literal_ip_gets_default_port() {
+        // The review's `1.2.3.4`-style case: a port-less literal IP must
+        // resolve to the network default port, not silently no-op.
+        let out =
+            resolve_operator_seeds(&["192.0.2.7".to_string()], Network::Bitcoin, None).await;
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            PeerAddr::Socket(sa) => assert_eq!(sa.port(), default_port(Network::Bitcoin)),
+            _ => panic!("expected a socket addr with the default port"),
+        }
+    }
+
+    #[tokio::test]
+    async fn operator_seed_ip_with_port_is_preserved() {
+        let out =
+            resolve_operator_seeds(&["192.0.2.7:8333".to_string()], Network::Bitcoin, None).await;
+        match &out[0] {
+            PeerAddr::Socket(sa) => assert_eq!(sa.port(), 8333),
+            _ => panic!("expected socket addr"),
+        }
+    }
+
+    #[tokio::test]
+    async fn operator_seed_onion_preserved_under_proxy() {
+        let out = resolve_operator_seeds(
+            &["abcdefghij234567.onion:8333".to_string()],
+            Network::Bitcoin,
+            Some("127.0.0.1:9050"),
+        )
+        .await;
+        match &out[0] {
+            PeerAddr::Onion { port, .. } => assert_eq!(*port, 8333),
+            _ => panic!("expected onion addr"),
+        }
+    }
+
+    #[tokio::test]
+    async fn operator_seed_hostname_skipped_under_proxy() {
+        // DNS-leak guard: a clearnet hostname under proxy mode is dropped
+        // (no local lookup), rather than leaking the query.
+        let out = resolve_operator_seeds(
+            &["seed.example.com".to_string()],
+            Network::Bitcoin,
+            Some("127.0.0.1:9050"),
+        )
+        .await;
+        assert!(out.is_empty());
     }
 
     #[test]

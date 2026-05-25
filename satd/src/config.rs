@@ -2476,6 +2476,8 @@ pub struct CliArgs {
         long,
         value_name = "BOOL",
         value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
         help = "Persist the mempool to mempool.dat across restarts (default: true)"
     )]
     pub persistmempool: Option<bool>,
@@ -2800,6 +2802,8 @@ pub struct CliArgs {
         long,
         value_name = "BOOL",
         value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
         help = "Query DNS seeds for peer addresses (default: true; requires -dns)"
     )]
     pub dnsseed: Option<bool>,
@@ -2840,6 +2844,8 @@ pub struct CliArgs {
         long,
         value_name = "BOOL",
         value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
         help = "Create a Tor hidden service via the control port (default: off; an explicit -torcontrol implies on)"
     )]
     pub listenonion: Option<bool>,
@@ -3058,7 +3064,9 @@ pub struct CliArgs {
     #[arg(
         long,
         value_name = "CATEGORY",
-        help = "Enable debug logging for a category (repeatable; 'all'/'1' = everything)"
+        num_args = 0..=1,
+        default_missing_value = "1",
+        help = "Enable debug logging for a category (repeatable; bare/'all'/'1' = everything)"
     )]
     pub debug: Vec<String>,
 
@@ -3348,8 +3356,25 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "reorgwebhooksecret",
     ];
 
+    // Bitcoin Core negates a boolean option with a `-no` prefix
+    // (`-nolistenonion` == `-listenonion=0`). satd supports this for the
+    // value-accepting boolean flags this family added; comprehensive
+    // `-no` coverage across every boolean (incl. clap `SetTrue` flags
+    // like `-server`, which reject a value) is tracked in
+    // SATD_CLI_COMPAT_AUDIT.md.
+    const NEGATABLE_BOOL_FLAGS: &[&str] = &["listenonion", "dnsseed", "persistmempool"];
+
     args.into_iter()
         .map(|arg| {
+            // `-no<flag>` / `--no<flag>` negation (no explicit value).
+            if arg.starts_with('-') && !arg.contains('=') {
+                let stripped = arg.trim_start_matches('-');
+                if let Some(flag) = stripped.strip_prefix("no")
+                    && NEGATABLE_BOOL_FLAGS.contains(&flag)
+                {
+                    return format!("--{flag}=0");
+                }
+            }
             // Skip the binary name or already double-dashed args
             if !arg.starts_with('-') || arg.starts_with("--") {
                 return arg;
@@ -5547,5 +5572,73 @@ notarealkey=1
     fn debug_directives_exclude_removes_included_target() {
         let (_all, dirs) = debug_directives(&["net".to_string()], &["net".to_string()]);
         assert!(dirs.is_empty());
+    }
+
+    // ---- H1: raw Core-style single-dash + bare + -no invocations ----
+
+    fn parse_raw(args: &[&str]) -> Config {
+        let argv = normalize_args(args.iter().map(|s| s.to_string()).collect());
+        let cli = CliArgs::try_parse_from(argv).expect("clap parse");
+        Config::from_cli(cli).expect("config build")
+    }
+
+    #[test]
+    fn bare_single_dash_listenonion_parses_true() {
+        // `satd -listenonion` (Core-style bare boolean) must enable it,
+        // not error with "a value is required".
+        let cfg = parse_raw(&["satd", "-regtest", "-listenonion", "-datadir=/tmp/satd-h1-1"]);
+        assert!(cfg.listenonion);
+    }
+
+    #[test]
+    fn bare_single_dash_dnsseed_and_persistmempool_parse_true() {
+        let cfg = parse_raw(&[
+            "satd",
+            "-regtest",
+            "-dnsseed",
+            "-persistmempool",
+            "-datadir=/tmp/satd-h1-2",
+        ]);
+        assert!(cfg.dnsseed);
+        assert!(cfg.persistmempool);
+    }
+
+    #[test]
+    fn bare_single_dash_debug_means_all() {
+        let cfg = parse_raw(&["satd", "-regtest", "-debug", "-datadir=/tmp/satd-h1-3"]);
+        let (enable_all, _) = debug_directives(&cfg.debug, &cfg.debugexclude);
+        assert!(enable_all, "bare -debug should enable all categories");
+    }
+
+    #[test]
+    fn no_prefix_negates_boolean_flags() {
+        // `-nolistenonion` / `-nodnsseed` / `-nopersistmempool` map to
+        // `--flag=0`. -nolistenonion must even override the
+        // torcontrol-implies-on rule.
+        let cfg = parse_raw(&[
+            "satd",
+            "-regtest",
+            "-torcontrol=127.0.0.1:9051",
+            "-nolistenonion",
+            "-nodnsseed",
+            "-nopersistmempool",
+            "-datadir=/tmp/satd-h1-4",
+        ]);
+        assert!(!cfg.listenonion);
+        assert!(!cfg.dnsseed);
+        assert!(!cfg.persistmempool);
+    }
+
+    #[test]
+    fn valued_single_dash_forms_still_work() {
+        let cfg = parse_raw(&[
+            "satd",
+            "-regtest",
+            "-listenonion=1",
+            "-dnsseed=0",
+            "-datadir=/tmp/satd-h1-5",
+        ]);
+        assert!(cfg.listenonion);
+        assert!(!cfg.dnsseed);
     }
 }

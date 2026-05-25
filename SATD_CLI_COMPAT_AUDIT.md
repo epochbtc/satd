@@ -58,6 +58,22 @@ single-dash Core spellings are aliased by `normalize_args`. Grouped:
 - **Storage / pruning / reindex / mining / events / webhooks / MCP /
   metrics:** see `KNOWN_CONFIG_KEYS` for the full enumeration.
 
+### CLI form compatibility
+
+- **Bare boolean flags.** Core-style bare invocations (`-listenonion`,
+  `-dnsseed`, `-persistmempool`) are accepted as "true" (clap
+  `default_missing_value`), as are valued forms (`-listenonion=0`).
+  Bare `-debug` means "all categories".
+- **`-no` negation.** Bitcoin Core negates a boolean with a `-no`
+  prefix (`-nolistenonion` == `-listenonion=0`). satd supports this for
+  the value-accepting boolean flags this family added (`listenonion`,
+  `dnsseed`, `persistmempool`). **Not yet implemented:** comprehensive
+  `-no` coverage across *every* boolean option — notably the clap
+  `SetTrue` flags (`-server`, `-daemon`, `-regtest`, `-reindex`, …)
+  which reject a value entirely, and the older `Option<bool>` flags
+  (`-listen`, `-dns`, `-txindex`, …). Extending `-no` to all booleans
+  is a follow-up.
+
 ### Notable semantics
 
 - **`listenonion`** — Bitcoin Core defaults this on (but it is a silent
@@ -70,8 +86,12 @@ single-dash Core spellings are aliased by `normalize_args`. Grouped:
 - **`dnsseed`** — satd gates DNS seeding on *both* `-dns` and `-dnsseed`,
   so either set to `0` disables it.
 - **`seednode`** — connected at startup to bootstrap peer discovery on
-  all networks. Core disconnects after pulling addresses; satd currently
-  keeps the connection (a harmless superset for bootstrap).
+  all networks. Accepts `host[:port]` (default P2P port when omitted),
+  literal IPv4/`[IPv6]`, and `.onion` — resolved through the shared
+  operator-seed resolver (clearnet hostnames are skipped under proxy
+  mode to avoid a DNS leak). Core disconnects after pulling addresses;
+  satd currently keeps the connection (a harmless superset for
+  bootstrap).
 - **`debug` / `debugexclude`** — Core categories are mapped onto satd's
   `tracing` subsystems (`net`, `mempool`, `rpc`, `validation`, `tor`,
   storage); `1` / `all` enable debug everywhere. Categories with no satd

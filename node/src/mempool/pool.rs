@@ -578,7 +578,10 @@ impl Mempool {
     pub fn prioritise_transaction(&self, txid: &Txid, fee_delta: i64) -> bool {
         let mut inner = self.inner.write();
         if let Some(entry) = inner.entries.get_mut(txid) {
-            entry.fee_delta += fee_delta;
+            // Saturating: fee_delta comes from `prioritisetransaction` RPC
+            // and from re-admitted persisted mempool entries (untrusted
+            // mempool.dat), so a malicious/corrupt value must not overflow.
+            entry.fee_delta = entry.fee_delta.saturating_add(fee_delta);
             true
         } else {
             false

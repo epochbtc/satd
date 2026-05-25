@@ -1766,21 +1766,24 @@ async fn main() {
     // addnode. (Core disconnects after pulling addresses; satd keeps the
     // connection — a harmless superset for bootstrap purposes.) These
     // apply regardless of -dnsseed so an operator can bootstrap with
-    // dnsseed=0.
-    for addr_str in &config.seednode {
-        match node::net::peer::PeerAddr::parse(addr_str) {
-            Ok(addr) => {
-                peer_manager.add_peer_addr(addr.clone());
-                let pm = peer_manager.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = pm.connect_peer_addr(&addr).await {
-                        tracing::warn!(%addr, "seednode connection failed: {}", e);
-                    }
-                });
-            }
-            Err(e) => {
-                tracing::warn!(addr = addr_str, "invalid seednode address: {}", e);
-            }
+    // dnsseed=0. Resolved through the shared operator-seed resolver so
+    // Core-style hostnames and port-less entries (`seed.example.com`,
+    // `1.2.3.4`) get the network default port instead of being rejected.
+    if !config.seednode.is_empty() {
+        let seed_addrs = node::net::dns::resolve_operator_seeds(
+            &config.seednode,
+            config.network,
+            config.proxy.as_deref(),
+        )
+        .await;
+        for addr in seed_addrs {
+            peer_manager.add_peer_addr(addr.clone());
+            let pm = peer_manager.clone();
+            tokio::spawn(async move {
+                if let Err(e) = pm.connect_peer_addr(&addr).await {
+                    tracing::warn!(%addr, "seednode connection failed: {}", e);
+                }
+            });
         }
     }
 
