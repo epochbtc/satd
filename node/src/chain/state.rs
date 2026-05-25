@@ -87,6 +87,17 @@ pub enum ChainError {
     FlatFile(String),
     #[error("{0}")]
     Disconnect(#[from] disconnect::DisconnectError),
+    #[error("snapshot load failed: {0}")]
+    Snapshot(String),
+}
+
+/// Result of a successful [`ChainState::load_utxo_snapshot`].
+#[derive(Debug, Clone)]
+pub struct LoadSnapshotSummary {
+    pub coins_loaded: u64,
+    pub base_height: u32,
+    pub base_hash: BlockHash,
+    pub tip_height: u32,
 }
 
 /// Result of a `repair_block_index_holes` pass.
@@ -586,6 +597,176 @@ impl ChainState {
             }
         }
         Ok(())
+    }
+
+    /// Load a Bitcoin Core-format UTXO snapshot into THIS (snapshot)
+    /// chainstate and attach a background chainstate to validate the
+    /// history behind it. `anchor` is the trusted
+    /// [`AssumeUtxoData`](crate::chain::assumeutxo::AssumeUtxoData) the
+    /// snapshot must match — the RPC layer looks it up by base block
+    /// hash; tests pass a synthetic one.
+    ///
+    /// Steps: parse + validate the header against the anchor and our
+    /// network; require a fresh chainstate (tip at genesis) with the
+    /// anchor's base header already in the block index; stream the coins
+    /// in; set the tip to the base block; recompute `hash_serialized_3`
+    /// over the loaded set and **reject** (rolling back) if it does not
+    /// match the anchor; then attach the background chainstate. The
+    /// background later re-validates genesis→base and completes the
+    /// handoff (see [`Self::background_connect_block`]).
+    pub fn load_utxo_snapshot<R: std::io::Read>(
+        &self,
+        reader: &mut R,
+        anchor: crate::chain::assumeutxo::AssumeUtxoData,
+        bg_dir: PathBuf,
+        dbcache_mb: u64,
+        max_open_files: i32,
+    ) -> Result<LoadSnapshotSummary, ChainError> {
+        use crate::storage::compressed_coin as cc;
+
+        // 1. Header: magic/version (in deserialize), network, base hash.
+        let meta = cc::SnapshotMetadata::deserialize(reader)
+            .map_err(|e| ChainError::Snapshot(format!("bad snapshot header: {e}")))?;
+        if meta.network_magic != network_magic(self.network) {
+            return Err(ChainError::Snapshot(
+                "snapshot network magic does not match this node's network".into(),
+            ));
+        }
+        if meta.base_blockhash != anchor.blockhash {
+            return Err(ChainError::Snapshot(
+                "snapshot base block hash does not match the requested anchor".into(),
+            ));
+        }
+
+        // 2. Preconditions: the base header must be known at the anchor
+        //    height (headers synced), and this must be a fresh chainstate.
+        let base_entry = self
+            .store
+            .get_block_index(&anchor.blockhash)
+            .ok_or_else(|| {
+                ChainError::Snapshot(
+                    "snapshot base header is not in the block index — sync headers past the \
+                     snapshot height first"
+                        .into(),
+                )
+            })?;
+        if base_entry.height != anchor.height {
+            return Err(ChainError::Snapshot(format!(
+                "block index height {} for the snapshot base disagrees with the anchor height {}",
+                base_entry.height, anchor.height
+            )));
+        }
+        if self.tip_height() != 0 {
+            return Err(ChainError::Snapshot(
+                "loadtxoutset requires a fresh chainstate (tip at genesis)".into(),
+            ));
+        }
+
+        // 3. Stream coins into the snapshot chainstate's coin set.
+        let mut loaded = 0u64;
+        let mut batch = crate::storage::StoreBatch::default();
+        while loaded < meta.coins_count {
+            let mut txid_bytes = [0u8; 32];
+            reader
+                .read_exact(&mut txid_bytes)
+                .map_err(|e| ChainError::Snapshot(format!("truncated snapshot (txid): {e}")))?;
+            let txid = bitcoin::Txid::from_raw_hash(
+                bitcoin::hashes::sha256d::Hash::from_byte_array(txid_bytes),
+            );
+            let group = cc::read_compact_size(reader)
+                .map_err(|e| ChainError::Snapshot(format!("bad group size: {e}")))?;
+            for _ in 0..group {
+                let vout = cc::read_compact_size(reader)
+                    .map_err(|e| ChainError::Snapshot(format!("bad vout: {e}")))?
+                    as u32;
+                let coin = cc::deserialize_coin(reader)
+                    .map_err(|e| ChainError::Snapshot(format!("bad coin record: {e}")))?;
+                batch
+                    .coin_puts
+                    .push((bitcoin::OutPoint { txid, vout }, coin));
+                loaded += 1;
+                if loaded > meta.coins_count {
+                    return Err(ChainError::Snapshot(
+                        "snapshot contains more coins than its header declares".into(),
+                    ));
+                }
+            }
+            if batch.coin_puts.len() >= 10_000 {
+                self.store.write_batch_mode(
+                    std::mem::take(&mut batch),
+                    crate::storage::WriteMode::BulkLoad,
+                )?;
+            }
+        }
+        if !batch.coin_puts.is_empty() {
+            self.store
+                .write_batch_mode(batch, crate::storage::WriteMode::BulkLoad)?;
+        }
+        self.store.flush_durable()?;
+
+        // 4. Point the tip at the base block.
+        {
+            let mut tip_batch = crate::storage::StoreBatch::default();
+            tip_batch.tip = Some(anchor.blockhash);
+            tip_batch
+                .height_hash_puts
+                .push((anchor.height, anchor.blockhash));
+            self.store.write_batch(tip_batch)?;
+        }
+        {
+            let mut tip = self.tip.write();
+            tip.hash = anchor.blockhash;
+            tip.height = anchor.height;
+        }
+        self.headers_tip_height
+            .fetch_max(anchor.height, Ordering::Relaxed);
+        self.store.flush()?;
+
+        // 5. Recompute the UTXO-set hash and reject on mismatch (rolling
+        //    back to a fresh genesis chainstate). This rejects a tampered
+        //    file immediately, before the slow background validation.
+        let (actual, _base) = cc::hash_utxo_set(&*self.store)?;
+        if actual != anchor.hash_serialized_3 {
+            self.store.clear_chainstate()?;
+            let genesis = bitcoin::constants::genesis_block(self.network).block_hash();
+            let mut reset = crate::storage::StoreBatch::default();
+            reset.tip = Some(genesis);
+            self.store.write_batch(reset)?;
+            {
+                let mut tip = self.tip.write();
+                tip.hash = genesis;
+                tip.height = 0;
+            }
+            return Err(ChainError::Snapshot(format!(
+                "loaded UTXO-set hash {} does not match the anchor {} — snapshot rejected",
+                hex::encode(actual),
+                hex::encode(anchor.hash_serialized_3),
+            )));
+        }
+
+        // 6. Attach the background chainstate (validates genesis→base).
+        self.attach_background(
+            bg_dir,
+            anchor.height,
+            anchor.blockhash,
+            anchor.hash_serialized_3,
+            dbcache_mb,
+            max_open_files,
+        )?;
+
+        tracing::info!(
+            height = anchor.height,
+            coins = loaded,
+            base = %anchor.blockhash,
+            "AssumeUTXO: snapshot loaded; background validation started"
+        );
+
+        Ok(LoadSnapshotSummary {
+            coins_loaded: loaded,
+            base_height: anchor.height,
+            base_hash: anchor.blockhash,
+            tip_height: anchor.height,
+        })
     }
 
     /// Subscribe to live chain events. Returns `None` if no sender
@@ -3382,6 +3563,93 @@ pub(crate) mod tests {
         assert!(warned, "a validation-failure warning should be recorded");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_utxo_snapshot_adopts_tip_and_attaches_background() {
+        use crate::chain::assumeutxo::AssumeUtxoData;
+
+        // Source chain: mine 5 blocks and dump its UTXO snapshot.
+        let (src, src_dir) = make_chain_state();
+        let blocks = build_and_connect_chain(&src, 5);
+        let snap_height = 5u32;
+        let snap_hash = src.tip_hash();
+        let snap_path = src_dir.join("snap.dat");
+        let dump = src.dump_utxo_snapshot(&snap_path).unwrap();
+
+        let anchor = AssumeUtxoData {
+            height: snap_height,
+            blockhash: snap_hash,
+            nchaintx: 0,
+            hash_serialized_3: dump.hash_serialized_3,
+        };
+
+        // Fresh node: sync only the headers, then load the snapshot.
+        let (dst, dst_dir) = make_chain_state();
+        for b in &blocks {
+            dst.accept_header(&b.header).unwrap();
+        }
+        assert_eq!(dst.tip_height(), 0, "fresh node starts at genesis");
+
+        let bg_dir = dst_dir.join("chainstate_background");
+        let mut f = std::fs::File::open(&snap_path).unwrap();
+        let summary = dst
+            .load_utxo_snapshot(&mut f, anchor, bg_dir, 64, -1)
+            .expect("snapshot load should succeed against a matching anchor");
+
+        assert_eq!(summary.tip_height, snap_height);
+        assert_eq!(summary.coins_loaded, dump.coins_written);
+        assert_eq!(dst.tip_height(), snap_height);
+        assert_eq!(dst.tip_hash(), snap_hash);
+        assert!(dst.has_background(), "background must be attached after load");
+
+        // getchainstates now reports two chainstates: the snapshot
+        // (validated=false, carries snapshot_blockhash) and background.
+        let states = crate::rpc::blockchain::get_chain_states(&dst);
+        let arr = states["chainstates"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["validated"], false);
+        assert_eq!(arr[0]["snapshot_blockhash"], snap_hash.to_string());
+
+        let _ = std::fs::remove_dir_all(&src_dir);
+        let _ = std::fs::remove_dir_all(&dst_dir);
+    }
+
+    #[test]
+    fn load_utxo_snapshot_rejects_and_rolls_back_on_hash_mismatch() {
+        use crate::chain::assumeutxo::AssumeUtxoData;
+
+        let (src, src_dir) = make_chain_state();
+        let blocks = build_and_connect_chain(&src, 4);
+        let snap_hash = src.tip_hash();
+        let snap_path = src_dir.join("snap.dat");
+        let _dump = src.dump_utxo_snapshot(&snap_path).unwrap();
+
+        // Anchor with a deliberately wrong UTXO-set hash.
+        let bad_anchor = AssumeUtxoData {
+            height: 4,
+            blockhash: snap_hash,
+            nchaintx: 0,
+            hash_serialized_3: [0x42u8; 32],
+        };
+
+        let (dst, dst_dir) = make_chain_state();
+        for b in &blocks {
+            dst.accept_header(&b.header).unwrap();
+        }
+        let bg_dir = dst_dir.join("chainstate_background");
+        let mut f = std::fs::File::open(&snap_path).unwrap();
+        let err = dst
+            .load_utxo_snapshot(&mut f, bad_anchor, bg_dir, 64, -1)
+            .expect_err("a hash mismatch must be rejected");
+        assert!(matches!(err, ChainError::Snapshot(_)));
+
+        // Rolled back to a fresh genesis chainstate; no background.
+        assert_eq!(dst.tip_height(), 0);
+        assert!(!dst.has_background());
+
+        let _ = std::fs::remove_dir_all(&src_dir);
+        let _ = std::fs::remove_dir_all(&dst_dir);
     }
 
     #[test]
