@@ -66,14 +66,15 @@ single-dash Core spellings are aliased by `normalize_args`. Grouped:
   `default_missing_value`), as are valued forms (`-listenonion=0`).
   Bare `-debug` means "all categories".
 - **`-no` negation.** Bitcoin Core negates a boolean with a `-no`
-  prefix (`-nolistenonion` == `-listenonion=0`). satd supports this for
-  the value-accepting boolean flags this family added (`listenonion`,
-  `dnsseed`, `persistmempool`). **Not yet implemented:** comprehensive
-  `-no` coverage across *every* boolean option — notably the clap
-  `SetTrue` flags (`-server`, `-daemon`, `-regtest`, `-reindex`, …)
-  which reject a value entirely, and the older `Option<bool>` flags
-  (`-listen`, `-dns`, `-txindex`, …). Extending `-no` to all booleans
-  is a follow-up.
+  prefix (`-nolistenonion` == `-listenonion=0`, `-noserver` ==
+  `-server=0`). satd implements this comprehensively: **every** boolean
+  CLI flag is value-accepting (`--flag`, `--flag=0/1`,
+  `--flag=true/false`) and negatable with `-no` / `--no`. This includes
+  the former network selectors and `SetTrue`-style flags (`-noregtest`,
+  `-noserver`, `-nodaemon`, `-noreindex`, `-notxindex`, …) and the
+  `Option<bool>` flags (`-nolisten`, `-nodns`, …). The single exception
+  is `blockfilterindex`, which is not a plain bool (it accepts `basic`);
+  its `-no` form is handled via the `-noindex=blockfilter` alias instead.
 
 ### Notable semantics
 
