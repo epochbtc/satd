@@ -546,6 +546,100 @@ pub fn write_txout_ser<W: Write>(
     Ok(())
 }
 
+/// Incremental engine for Bitcoin Core's `hash_serialized_3` UTXO-set
+/// hash — the value quoted in `m_assumeutxo_data.hash_serialized` and by
+/// `dumptxoutset`'s `txoutset_hash`.
+///
+/// Feed every `(OutPoint, Coin)` via [`Hs3Hasher::visit`]. Coins MUST
+/// arrive in ascending `(txid, vout_le)` cursor order — exactly what
+/// [`Store::for_each_coin_snapshot`](crate::storage::Store::for_each_coin_snapshot)
+/// yields. Within a txid the engine re-sorts to integer-vout order before
+/// feeding [`write_txout_ser`], because Core keys vout as a VARINT and so
+/// its cursor diverges from satd's 4-byte-LE key order for vout ≥ 256.
+/// [`Hs3Hasher::finalize`] returns the byte-reversed double SHA-256.
+///
+/// This mirrors the streaming hash in `ChainState::dump_utxo_snapshot`;
+/// the two are kept in lockstep by a cross-check test
+/// (`hash_utxo_set` == `dumptxoutset`'s reported `hash_serialized_3`).
+pub struct Hs3Hasher {
+    engine: bitcoin::hashes::sha256::HashEngine,
+    txout_buf: Vec<u8>,
+    current_txid: Option<bitcoin::Txid>,
+    current_group: Vec<(u32, Coin)>,
+}
+
+impl Default for Hs3Hasher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Hs3Hasher {
+    pub fn new() -> Self {
+        Self {
+            engine: bitcoin::hashes::sha256::HashEngine::default(),
+            txout_buf: Vec::with_capacity(80),
+            current_txid: None,
+            current_group: Vec::new(),
+        }
+    }
+
+    /// Feed one coin. Coins for the same txid are buffered and flushed
+    /// (in integer-vout order) when the txid changes or at finalize.
+    pub fn visit(&mut self, op: &OutPoint, coin: &Coin) {
+        if self.current_txid != Some(op.txid) {
+            self.flush_group();
+            self.current_txid = Some(op.txid);
+        }
+        self.current_group.push((op.vout, coin.clone()));
+    }
+
+    fn flush_group(&mut self) {
+        let txid = match self.current_txid {
+            Some(t) => t,
+            None => return,
+        };
+        self.current_group.sort_by_key(|(vout, _)| *vout);
+        for (vout, coin) in &self.current_group {
+            self.txout_buf.clear();
+            let op = OutPoint { txid, vout: *vout };
+            // Writing into a Vec is infallible.
+            let _ = write_txout_ser(&mut self.txout_buf, &op, coin);
+            bitcoin::hashes::HashEngine::input(&mut self.engine, &self.txout_buf);
+        }
+        self.current_group.clear();
+    }
+
+    /// Flush the final txid group and return the byte-reversed double
+    /// SHA-256 (`HashWriter::GetHash()` form). See the struct docs.
+    pub fn finalize(mut self) -> [u8; 32] {
+        self.flush_group();
+        let first = bitcoin::hashes::sha256::Hash::from_engine(self.engine);
+        let double = bitcoin::hashes::sha256::Hash::hash(first.as_byte_array());
+        let mut out = double.to_byte_array();
+        out.reverse();
+        out
+    }
+}
+
+/// Compute Core's `hash_serialized_3` over a store's entire UTXO set,
+/// using the same point-in-time snapshot as
+/// [`Store::for_each_coin_snapshot`](crate::storage::Store::for_each_coin_snapshot).
+/// Returns the hash plus the [`CoinSnapshotBase`] read from that view, so
+/// the AssumeUTXO handoff can assert both the UTXO hash and the base
+/// `(height, hash)` against the anchor. Callers must flush any in-memory
+/// coin cache first (the snapshot only sees committed writes).
+pub fn hash_utxo_set(
+    store: &dyn crate::storage::Store,
+) -> Result<([u8; 32], crate::storage::CoinSnapshotBase), crate::storage::StoreError> {
+    let mut hasher = Hs3Hasher::new();
+    let base = store.for_each_coin_snapshot(&mut |op, coin| {
+        hasher.visit(op, coin);
+        Ok(())
+    })?;
+    Ok((hasher.finalize(), base))
+}
+
 /// Deserialize a [`Coin`] in Core's snapshot wire format.
 pub fn deserialize_coin<R: Read>(r: &mut R) -> Result<Coin, CodecError> {
     let code = read_varint(r)?;

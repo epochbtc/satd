@@ -4636,6 +4636,21 @@ pub(crate) mod tests {
             "reported hash_serialized_3 must equal independent recomputation"
         );
 
+        // The shared `Hs3Hasher` / `hash_utxo_set` helper (used by the
+        // AssumeUTXO background-validation handoff) must produce the
+        // identical hash over the same chainstate — this keeps the
+        // handoff comparison in lockstep with the cross-validated dump
+        // path without re-deriving the algorithm.
+        cs.store.flush().unwrap();
+        let (helper_hash, helper_base) =
+            crate::storage::compressed_coin::hash_utxo_set(&*cs.store).unwrap();
+        assert_eq!(
+            helper_hash, summary.hash_serialized_3,
+            "hash_utxo_set must match dumptxoutset's reported hash_serialized_3"
+        );
+        assert_eq!(helper_base.base_hash, summary.base_hash);
+        assert_eq!(helper_base.coin_count, meta.coins_count);
+
         // EOF after the last group.
         let mut tail = [0u8; 1];
         assert_eq!(
