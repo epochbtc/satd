@@ -17,6 +17,9 @@ const RETARGET_INTERVAL: u32 = 2016;
 const TARGET_TIMESPAN: u32 = 14 * 24 * 60 * 60;
 /// Testnet: allow minimum difficulty if block is >20 minutes after previous.
 const TESTNET_ALLOW_MIN_DIFF_AFTER: u32 = 20 * 60;
+/// BIP 94 (testnet4) timewarp guard: the first block of a retarget period
+/// may not have a timestamp more than this many seconds before its parent.
+const MAX_TIMEWARP: u32 = 600;
 
 /// Check that the block header hash meets the proof-of-work target.
 pub fn check_proof_of_work(header: &Header) -> Result<(), ValidationError> {
@@ -57,6 +60,23 @@ where
         Network::Signet => {
             // Signet consensus is enforced by block signing, not PoW difficulty.
             // Accept whatever bits are set (PoW check still validates hash <= target).
+            Ok(())
+        }
+        Network::Testnet4 => {
+            // Testnet4 uses the same difficulty algorithm as testnet3 (the
+            // 20-minute min-difficulty rule + standard retarget), plus the
+            // BIP 94 timewarp guard: the first block of each retarget
+            // period must not be timestamped more than MAX_TIMEWARP before
+            // its parent.
+            if height.is_multiple_of(RETARGET_INTERVAL)
+                && header.time < prev.header.time.saturating_sub(MAX_TIMEWARP)
+            {
+                return Err(ValidationError::TimewarpAttack);
+            }
+            let expected = calculate_next_bits_testnet(height, header, prev, &get_ancestor);
+            if header.bits.to_consensus() != expected {
+                return Err(ValidationError::BadDifficulty);
+            }
             Ok(())
         }
         _ => {
@@ -203,6 +223,54 @@ where
 mod tests {
     use super::*;
     use crate::storage::blockindex::BlockStatus;
+
+    fn entry(header: Header, height: u32) -> BlockIndexEntry {
+        BlockIndexEntry {
+            header,
+            height,
+            status: BlockStatus::Valid,
+            num_tx: 1,
+            file_number: 0,
+            data_pos: 0,
+            chainwork: [0u8; 32],
+        }
+    }
+
+    #[test]
+    fn testnet4_timewarp_rejected_at_retarget_boundary() {
+        // BIP 94: the first block of a retarget period (height % 2016 == 0)
+        // may not be timestamped more than 600s before its parent.
+        let genesis = bitcoin::constants::genesis_block(Network::Testnet4);
+        let mut prev_header = genesis.header;
+        prev_header.time = 1_700_000_000;
+        let prev = entry(prev_header, 2015); // child height 2016 = boundary
+
+        let mut new_header = genesis.header;
+        new_header.time = prev_header.time - 601; // 601s before parent → violation
+        let res = check_difficulty(&new_header, &prev, Network::Testnet4, |_| None);
+        assert!(matches!(res, Err(ValidationError::TimewarpAttack)), "got {res:?}");
+
+        // Exactly 600s before is allowed by the timewarp rule.
+        new_header.time = prev_header.time - 600;
+        let res = check_difficulty(&new_header, &prev, Network::Testnet4, |_| None);
+        assert!(!matches!(res, Err(ValidationError::TimewarpAttack)), "600s must pass timewarp");
+    }
+
+    #[test]
+    fn testnet4_uses_testnet_min_difficulty_rule() {
+        // Mid-period, >20 minutes since parent → min-difficulty allowed,
+        // same as testnet3.
+        let genesis = bitcoin::constants::genesis_block(Network::Testnet4);
+        let mut prev_header = genesis.header;
+        prev_header.time = 1_700_000_000;
+        prev_header.bits = CompactTarget::from_consensus(0x1a00ffff); // non-powlimit
+        let prev = entry(prev_header, 100); // child height 101, not a boundary
+
+        let mut new_header = genesis.header;
+        new_header.time = prev_header.time + TESTNET_ALLOW_MIN_DIFF_AFTER + 1;
+        new_header.bits = CompactTarget::from_consensus(TESTNET_POWLIMIT_BITS);
+        assert!(check_difficulty(&new_header, &prev, Network::Testnet4, |_| None).is_ok());
+    }
 
     #[test]
     fn test_regtest_genesis_pow() {

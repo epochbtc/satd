@@ -38,4 +38,6 @@ pub enum ValidationError {
     BadWitnessCommitment,
     #[error("bad-signet-solution")]
     BadSignetSolution,
+    #[error("time-timewarp-attack")]
+    TimewarpAttack,
 }

@@ -30,8 +30,8 @@ When a not-yet-implemented key gains real support it moves into
 The authoritative list is `KNOWN_CONFIG_KEYS` in `satd/src/config.rs`;
 single-dash Core spellings are aliased by `normalize_args`. Grouped:
 
-- **Network / chain:** `regtest`, `testnet`, `signet`, `chain`,
-  `signetseednode`, `signetchallenge`
+- **Network / chain:** `regtest`, `testnet`, `testnet4`, `signet`,
+  `chain`, `signetseednode`, `signetchallenge`
 - **Filesystem:** `datadir`, `blocksdir`, `conf`, `includeconf`, `pid`,
   `profile`
 - **Daemon / logging:** `daemon`, `server`, `logformat`, `debug`,
@@ -103,6 +103,13 @@ single-dash Core spellings are aliased by `normalize_args`. Grouped:
   `mempool.dat` format (Core's datadir is not byte-compatible; see
   `CORE_DIFFERENCES.md`); the file is re-validated against the current
   chainstate on load, never trusted blindly.
+- **`testnet4`** — full network wiring for Bitcoin's testnet4. Selectable
+  via `-testnet4` or `--chain=testnet4`; magic `0x1c163f28`, P2P/RPC ports
+  48333/48332, datadir subdir + `[testnet4]` config section, and DNS
+  seeds. Difficulty follows testnet3's algorithm (20-minute
+  min-difficulty + standard retarget) plus the **BIP 94** timewarp guard:
+  the first block of each retarget period may not be timestamped more
+  than 600 s before its parent.
 - **`signetchallenge`** — selects a custom/private signet (BIP 325).
   Hex-encoded challenge script; signet only (hard-errors on other
   networks). When set, satd derives the P2P network magic from the
