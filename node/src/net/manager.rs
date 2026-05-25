@@ -186,6 +186,16 @@ pub struct PeerManager {
     /// Transactions submitted locally via RPC are still relayed. Defaults
     /// to false; set from the satd binary via `set_blocksonly`.
     blocksonly: std::sync::atomic::AtomicBool,
+    /// Bitcoin Core's `-maxuploadtarget`: a soft cap, in bytes, on the
+    /// volume of *historical* block data served in a rolling 24h window.
+    /// 0 = unlimited. When the cap is exceeded, serving blocks older than
+    /// a week is declined for peers without the `download`/`noban`
+    /// permission; recent blocks and headers are always served.
+    upload_target_bytes: AtomicU64,
+    /// Bytes of block data served in the current 24h cycle.
+    upload_bytes: AtomicU64,
+    /// Unix-seconds start of the current 24h upload cycle.
+    upload_cycle_start: AtomicU64,
 }
 
 impl PeerManager {
@@ -297,6 +307,9 @@ impl PeerManager {
             #[cfg(feature = "block-filter-index")]
             peer_serve_filters: std::sync::atomic::AtomicBool::new(false),
             blocksonly: std::sync::atomic::AtomicBool::new(false),
+            upload_target_bytes: AtomicU64::new(0),
+            upload_bytes: AtomicU64::new(0),
+            upload_cycle_start: AtomicU64::new(now_unix_secs()),
         });
 
         // Spawn block processing thread
@@ -389,6 +402,52 @@ impl PeerManager {
             .get(&id)
             .map(|h| h.info.permissions)
             .unwrap_or(crate::net::permissions::NetPermissions::NONE)
+    }
+
+    /// Set the `-maxuploadtarget` cap in bytes (0 = unlimited).
+    pub fn set_max_upload_target(&self, bytes: u64) {
+        self.upload_target_bytes.store(bytes, Ordering::Relaxed);
+    }
+
+    /// Roll the 24h upload cycle over if it has elapsed.
+    fn maybe_reset_upload_cycle(&self, now: u64) {
+        let start = self.upload_cycle_start.load(Ordering::Relaxed);
+        if now.saturating_sub(start) >= 24 * 60 * 60 {
+            self.upload_cycle_start.store(now, Ordering::Relaxed);
+            self.upload_bytes.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// Decide whether to serve `block` to peer `id` under the
+    /// `-maxuploadtarget` budget. Recent blocks (< 1 week old) and peers
+    /// with `download`/`noban` are always served; otherwise a historical
+    /// block is declined once the cycle budget is spent.
+    fn upload_permits_block(&self, id: PeerId, block: &bitcoin::Block) -> bool {
+        let target = self.upload_target_bytes.load(Ordering::Relaxed);
+        if target == 0 {
+            return true; // unlimited
+        }
+        const ONE_WEEK: u64 = 7 * 24 * 60 * 60;
+        let now = now_unix_secs();
+        let historical = (block.header.time as u64).saturating_add(ONE_WEEK) < now;
+        if !historical {
+            return true;
+        }
+        let perms = self.peer_permissions(id);
+        if perms.download || perms.noban {
+            return true;
+        }
+        self.maybe_reset_upload_cycle(now);
+        self.upload_bytes.load(Ordering::Relaxed) < target
+    }
+
+    /// Account `bytes` of served block data toward the upload budget.
+    fn record_upload(&self, bytes: u64) {
+        if self.upload_target_bytes.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        self.maybe_reset_upload_cycle(now_unix_secs());
+        self.upload_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 
     /// Predicate consulted by `handle_message` and the version
@@ -2760,6 +2819,15 @@ impl PeerManager {
             match inv {
                 Inventory::Block(hash) | Inventory::WitnessBlock(hash) => {
                     if let Some(block) = self.chain_state.get_block(&hash) {
+                        // -maxuploadtarget: decline historical blocks once
+                        // the rolling budget is spent (download/noban peers
+                        // and recent blocks are exempt).
+                        if !self.upload_permits_block(id, &block) {
+                            tracing::debug!(id, %hash, "maxuploadtarget reached; declining historical block");
+                            not_found.push(inv);
+                            continue;
+                        }
+                        self.record_upload(block.total_size() as u64);
                         self.send_to_peer(id, NetworkMessage::Block(block));
                     } else {
                         not_found.push(inv);
@@ -3206,6 +3274,14 @@ impl PeerManager {
             relay: !self.blocksonly(),
         }
     }
+}
+
+/// Current Unix time in whole seconds (saturating; 0 before the epoch).
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Reconsider orphans whose missing parent was just confirmed in `block`.

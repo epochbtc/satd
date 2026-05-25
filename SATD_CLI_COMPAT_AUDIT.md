@@ -42,9 +42,9 @@ single-dash Core spellings are aliased by `normalize_args`. Grouped:
   `rpctlsbind`, `rpctlscert`, `rpctlskey`, `rpctlshandshaketimeout`,
   `rpcmtls`, `rpcmtlsclientca`, `rpcmtlsclientallow`
 - **P2P:** `listen`, `blocksonly`, `externalip`, `whitelist`,
-  `whitebind`, `port`, `bind`, `connect`, `addnode`, `seednode`,
-  `maxconnections`, `maxinboundperip`, `dns`, `dnsseed`, `bantime`,
-  `timeout`, `onlynet`
+  `whitebind`, `maxuploadtarget`, `port`, `bind`, `connect`, `addnode`,
+  `seednode`, `maxconnections`, `maxinboundperip`, `dns`, `dnsseed`,
+  `bantime`, `timeout`, `onlynet`
 - **Proxy / Tor:** `proxy`, `onion`, `torcontrol`, `torpassword`,
   `listenonion`
 - **Consensus:** `assumevalid`, `assumevalidage`, `stopatheight`,
@@ -104,6 +104,13 @@ single-dash Core spellings are aliased by `normalize_args`. Grouped:
   `mempool.dat` format (Core's datadir is not byte-compatible; see
   `CORE_DIFFERENCES.md`); the file is re-validated against the current
   chainstate on load, never trusted blindly.
+- **`maxuploadtarget`** — soft cap (bytes; bare number = MiB, suffix
+  `B/K/M/G/T` overrides; `0` = unlimited) on *historical* block data
+  served per rolling 24h window. Once spent, blocks older than a week
+  are declined to peers without the `download`/`noban` permission;
+  recent blocks and headers are always served. satd meters block-serving
+  bytes (the dominant upload); the budget is approximate rather than a
+  total-bandwidth accountant.
 - **`whitelist` / `whitebind`** — peer net permissions
   (`NetPermissionFlags`). `-whitelist=[perms@]subnet` grants permissions
   to peers whose address is in the subnet; `-whitebind=[perms@]addr`
@@ -171,7 +178,6 @@ These hard-error today. Listed with what real support would require.
 
 | Key | Notes |
 |---|---|
-| `maxuploadtarget` | Upload bandwidth cap + serving limits. Needs per-peer/global byte accounting + disconnect logic. |
 | `asmap` | ASN-based addrman bucketing (eclipse resistance). Needs an ASN map loader + addrman bucketing. |
 | `forcednsseed` | Force DNS seeding even when addrman is full. satd has no persistent addrman and seeds at every start, so this has no distinct effect yet. |
 | `fixedseeds` | Fall back to the compiled-in fixed-IP seed list. satd has no fixed-IP seed list (only DNS + `.onion` seeds), so nothing to gate yet. |

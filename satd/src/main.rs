@@ -903,6 +903,9 @@ async fn main() {
     // -blocksonly: suppress P2P transaction relay.
     peer_manager.set_blocksonly(config.blocksonly);
 
+    // -maxuploadtarget: cap historical block upload per 24h (0 = off).
+    peer_manager.set_max_upload_target(config.max_upload_target);
+
     // -externalip: addresses advertised to peers.
     if !config.externalip.is_empty() {
         peer_manager.set_external_addrs(config.externalip.clone());
