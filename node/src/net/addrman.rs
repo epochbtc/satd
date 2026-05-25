@@ -36,6 +36,14 @@ pub struct AddrEntry {
     pub attempts: u32,
     /// Unix seconds this address was last seen (gossiped or connected).
     pub last_seen: u64,
+    /// Cached network-group key (`group_fn(ip)`), computed once when the
+    /// entry is inserted. Cached so the per-group cap check does not have
+    /// to re-run `group_fn` for every entry on every `add` — that recompute
+    /// is O(n) per gossiped address, and under `-asmap` each call is a trie
+    /// walk, which an address flood could amplify into a CPU sink. Not
+    /// persisted: it depends on the active `group_fn` (`-asmap`), so it is
+    /// recomputed on load.
+    group: Vec<u8>,
 }
 
 /// Network group key used for bucketing. IPv4 → the `/16`; IPv6 → the
@@ -95,9 +103,11 @@ impl AddrMan {
     }
 
     fn new_count_in_group(&self, group: &[u8]) -> usize {
+        // Uses the cached `e.group` rather than re-running `group_fn`, so
+        // this stays a cheap byte-slice comparison even under `-asmap`.
         self.entries
             .values()
-            .filter(|e| !e.tried && self.group_of(&e.addr) == group)
+            .filter(|e| !e.tried && e.group == group)
             .count()
     }
 
@@ -123,22 +133,34 @@ impl AddrMan {
                 last_success: 0,
                 attempts: 0,
                 last_seen: now,
+                group,
             },
         );
         true
     }
 
     /// Promote an address to the *tried* table after a successful connect.
+    ///
+    /// Only the addresses we successfully *dialed* (outbound) should be
+    /// passed here — an inbound peer's socket address is its ephemeral
+    /// source port, which is not re-dialable and would only pollute the
+    /// table. The total cap is enforced even on this path: a brand-new
+    /// address is not inserted once the table is full, so inbound churn (or
+    /// any future caller) cannot grow the table without bound. An address
+    /// already present is always refreshed/promoted.
     pub fn mark_good(&mut self, addr: SocketAddr, now: u64) {
-        let group_fn = self.group_fn;
+        if !self.entries.contains_key(&addr) && self.entries.len() >= MAX_ENTRIES {
+            return;
+        }
+        let group = self.group_of(&addr);
         let entry = self.entries.entry(addr).or_insert_with(|| AddrEntry {
             addr,
             tried: false,
             last_success: 0,
             attempts: 0,
             last_seen: now,
+            group,
         });
-        let _ = group_fn; // grouping handled on add/select
         entry.tried = true;
         entry.last_success = now;
         entry.last_seen = now;
@@ -204,7 +226,11 @@ impl AddrMan {
         let count = read_u32(&mut cur).unwrap_or(0).min(MAX_ENTRIES as u32);
         for _ in 0..count {
             match read_entry(&mut cur) {
-                Some(e) => {
+                Some(mut e) => {
+                    // Recompute the cached group under the active group_fn
+                    // (the on-disk format does not store it, since `-asmap`
+                    // can change the grouping between runs).
+                    e.group = self.group_of(&e.addr);
                     self.entries.insert(e.addr, e);
                 }
                 None => break, // truncated/garbage tail — keep what we have
@@ -282,6 +308,9 @@ fn read_entry(cur: &mut io::Cursor<&Vec<u8>>) -> Option<AddrEntry> {
         last_success,
         attempts,
         last_seen,
+        // Filled in by `load` under the active group_fn; the group is not
+        // part of the on-disk format.
+        group: Vec::new(),
     })
 }
 
@@ -374,5 +403,60 @@ mod tests {
         let bad = dir.path().join("bad.dat");
         std::fs::write(&bad, b"XXXXnonsense").unwrap();
         assert!(a.load(&bad).is_err());
+    }
+
+    #[test]
+    fn mark_good_does_not_insert_past_the_total_cap() {
+        // mark_good must honor MAX_ENTRIES for brand-new addresses, so a
+        // flood of (e.g. inbound) successful handshakes can't grow the
+        // table without bound. An already-present address is still promoted.
+        let mut a = AddrMan::new();
+        // Fill the table to the cap with tried entries from distinct groups
+        // (so the per-group new cap doesn't interfere).
+        for i in 0..MAX_ENTRIES {
+            let octet_b = (i / 256) as u8;
+            let octet_c = (i % 256) as u8;
+            a.mark_good(sa(&format!("10.{octet_b}.{octet_c}.1:8333")), 1);
+        }
+        assert_eq!(a.len(), MAX_ENTRIES);
+        // A brand-new address at capacity is rejected (not inserted).
+        a.mark_good(sa("203.0.113.7:8333"), 2);
+        assert_eq!(a.len(), MAX_ENTRIES);
+        assert!(!a.entries.contains_key(&sa("203.0.113.7:8333")));
+        // But an address already present is still refreshed/promoted.
+        a.mark_good(sa("10.0.0.1:8333"), 99);
+        assert_eq!(a.entries[&sa("10.0.0.1:8333")].last_success, 99);
+    }
+
+    #[test]
+    fn add_caches_the_group_key() {
+        // The per-group cap reads a cached group rather than re-running
+        // group_fn per entry; confirm the cache is populated with the
+        // active grouping (default: v4 /16, v6 /32).
+        let mut a = AddrMan::new();
+        a.add(sa("203.0.113.9:8333"), 1);
+        assert_eq!(a.entries[&sa("203.0.113.9:8333")].group, vec![203, 0]);
+        a.add(sa("[2001:db8::1]:8333"), 1);
+        assert_eq!(
+            a.entries[&sa("[2001:db8::1]:8333")].group,
+            vec![0x20, 0x01, 0x0d, 0xb8]
+        );
+        // The cached group is what the per-group cap counts against.
+        assert_eq!(a.new_count_in_group(&[203, 0]), 1);
+    }
+
+    #[test]
+    fn load_recomputes_group_key() {
+        // peers.dat does not store the group; it must be recomputed on load
+        // (the grouping can change between runs, e.g. when -asmap is added).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("peers.dat");
+        let mut a = AddrMan::new();
+        a.add(sa("1.2.3.4:8333"), 1);
+        a.dump(&path).unwrap();
+
+        let mut b = AddrMan::new();
+        b.load(&path).unwrap();
+        assert_eq!(b.entries[&sa("1.2.3.4:8333")].group, vec![1, 2]);
     }
 }

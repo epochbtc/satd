@@ -1312,8 +1312,14 @@ impl PeerManager {
             if let Some(handle) = peers.get_mut(&id) {
                 handle.info.set_version(version);
                 handle.info.state = PeerState::Connected;
-                // Promote to the tried table in the persistent address book.
-                self.addrman.write().mark_good(handle.info.addr, now_unix_secs());
+                // Promote to the tried table in the persistent address book,
+                // but only for outbound peers: their address is one we dialed
+                // and can dial again. An inbound peer's address is its
+                // ephemeral source port, which is not re-dialable and would
+                // only pollute (and, unbounded, bloat) the table.
+                if handle.info.direction == Direction::Outbound {
+                    self.addrman.write().mark_good(handle.info.addr, now_unix_secs());
+                }
                 tracing::info!(
                     id,
                     addr = %handle.info.addr,
