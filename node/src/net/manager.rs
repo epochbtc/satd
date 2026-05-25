@@ -112,6 +112,10 @@ pub struct PeerManager {
     /// `-whitelist` permission entries (by source subnet). Set once at
     /// startup; consulted on every peer connect to compute permissions.
     whitelist: RwLock<Vec<crate::net::permissions::WhitelistEntry>>,
+    /// Persistent address manager (peers.dat): learned + tried peers,
+    /// bucketed by network group. Fed by addr gossip and successful
+    /// connects; persisted across restarts.
+    addrman: RwLock<crate::net::addrman::AddrMan>,
     /// Channel to send received blocks to the processing thread.
     block_tx: mpsc::UnboundedSender<bitcoin::Block>,
     /// Pending compact blocks awaiting missing transactions.
@@ -282,6 +286,7 @@ impl PeerManager {
             connect_addrs: RwLock::new(Vec::new()),
             external_addrs: RwLock::new(Vec::new()),
             whitelist: RwLock::new(Vec::new()),
+            addrman: RwLock::new(crate::net::addrman::AddrMan::new()),
             block_tx,
             pending_compact: RwLock::new(HashMap::new()),
             fee_estimator: fee_estimator.clone(),
@@ -477,10 +482,51 @@ impl PeerManager {
     /// peer's per-IP rate limit will FIN all but the first within a few
     /// hundred ms — surfacing as severe peer churn.
     pub fn add_connect_addr(&self, addr: SocketAddr) {
+        // Record in the persistent address book (peers.dat) as a *new*
+        // address. This is the chokepoint for gossiped addresses.
+        self.addrman.write().add(addr, now_unix_secs());
         let mut addrs = self.connect_addrs.write();
         if !addrs.contains(&addr) {
             addrs.push(addr);
         }
+    }
+
+    /// Load the persistent address book from `path` (peers.dat), then
+    /// seed the in-memory dial pool with up to `seed` of its addresses so
+    /// learned peers survive a restart. No-op if the file is absent.
+    pub fn load_addrman(&self, path: &std::path::Path, seed: usize) {
+        let mut am = self.addrman.write();
+        if let Err(e) = am.load(path) {
+            tracing::warn!(path = %path.display(), "addrman load failed: {e}");
+            return;
+        }
+        let picks = am.select_n(seed);
+        drop(am);
+        let mut addrs = self.connect_addrs.write();
+        for a in picks {
+            if !addrs.contains(&a) {
+                addrs.push(a);
+            }
+        }
+        tracing::info!(loaded = self.addrman.read().len(), "Loaded persistent address book");
+    }
+
+    /// Persist the address book to `path` (peers.dat).
+    pub fn dump_addrman(&self, path: &std::path::Path) {
+        if let Err(e) = self.addrman.read().dump(path) {
+            tracing::warn!(path = %path.display(), "addrman dump failed: {e}");
+        }
+    }
+
+    /// Whether the address book is empty (used to gate DNS seeding /
+    /// fixed-seed fallback).
+    pub fn addrman_is_empty(&self) -> bool {
+        self.addrman.read().is_empty()
+    }
+
+    /// Install a custom addrman network-group function (e.g. `-asmap`).
+    pub fn set_addrman_group_fn(&self, f: fn(IpAddr) -> Vec<u8>) {
+        self.addrman.write().set_group_fn(f);
     }
 
     /// Register a PeerAddr (socket or .onion) for auto-reconnect. Same
@@ -1266,6 +1312,8 @@ impl PeerManager {
             if let Some(handle) = peers.get_mut(&id) {
                 handle.info.set_version(version);
                 handle.info.state = PeerState::Connected;
+                // Promote to the tried table in the persistent address book.
+                self.addrman.write().mark_good(handle.info.addr, now_unix_secs());
                 tracing::info!(
                     id,
                     addr = %handle.info.addr,

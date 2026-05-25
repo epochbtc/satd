@@ -1,3 +1,4 @@
+pub mod addrman;
 pub mod compact;
 pub mod connection;
 pub mod dns;
