@@ -36,9 +36,16 @@ const MAX_RESYNC_BYTES: usize = 256 * 1024;
 
 impl Connection {
     pub fn new(stream: TcpStream, network: Network) -> Self {
+        Self::with_magic(stream, Magic::from(network))
+    }
+
+    /// Construct a connection with an explicit network magic. Used for
+    /// custom signet, whose magic is derived from the challenge rather
+    /// than the `Network` enum (BIP 325).
+    pub fn with_magic(stream: TcpStream, magic: Magic) -> Self {
         Self {
             stream,
-            magic: Magic::from(network),
+            magic,
             buf: Vec::with_capacity(4096),
         }
     }

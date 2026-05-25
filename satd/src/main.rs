@@ -431,7 +431,12 @@ async fn main() {
             peer_serve: config.peerblockfilters,
         },
     ) {
-        Ok(cs) => Arc::new(cs),
+        Ok(mut cs) => {
+            // Custom signet (BIP 325): enables block-solution validation
+            // and custom P2P magic. Set before sharing the ChainState.
+            cs.set_signet_challenge(config.signet_challenge.clone());
+            Arc::new(cs)
+        }
         Err(e) => {
             eprintln!("Error initializing chain state: {}", e);
             auth.cleanup();

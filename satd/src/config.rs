@@ -379,6 +379,11 @@ pub struct Config {
     /// Additional signet seed nodes. Empty = built-in seeds only.
     /// Only consulted on signet.
     pub signet_seed_nodes: Vec<String>,
+    /// Custom signet challenge script (BIP 325), parsed from the
+    /// `-signetchallenge` hex. `Some` only on signet; when set, the node
+    /// validates each block's signet solution against it and derives the
+    /// P2P magic from it. `None` = default signet (or non-signet).
+    pub signet_challenge: Option<Vec<u8>>,
     pub rpcport: u16,
     /// Concrete socket addresses the JSON-RPC HTTP listener binds to.
     /// Mirrors Bitcoin Core's `-rpcbind=<addr>[:port]` — repeatable, so
@@ -1135,6 +1140,34 @@ impl Config {
             file_get_all("signetseednode")
         };
 
+        // -signetchallenge selects a custom signet (BIP 325). Parsed
+        // from hex; rejected on non-signet networks (it has no meaning
+        // there and silently ignoring it would be the accept-and-ignore
+        // hazard the strict parser exists to prevent).
+        let signet_challenge: Option<Vec<u8>> = {
+            let raw = cli
+                .signetchallenge
+                .clone()
+                .or_else(|| file_get("signetchallenge"));
+            match raw {
+                Some(hex) => {
+                    if network != Network::Signet {
+                        return Err(format!(
+                            "signetchallenge is only valid on signet (network is {network:?}); \
+                             remove it or select signet with --signet / --chain=signet"
+                        ));
+                    }
+                    let bytes = <Vec<u8> as bitcoin::hashes::hex::FromHex>::from_hex(hex.trim())
+                        .map_err(|e| format!("signetchallenge is not valid hex: {e}"))?;
+                    if bytes.is_empty() {
+                        return Err("signetchallenge must not be empty".to_string());
+                    }
+                    Some(bytes)
+                }
+                None => None,
+            }
+        };
+
         // -torcontrol address is needed both for the `torcontrol`
         // Config field and to resolve -listenonion's default below, so
         // hoist it out of the struct literal.
@@ -1705,6 +1738,7 @@ impl Config {
             datadir: base_datadir,
             blocksdir,
             signet_seed_nodes,
+            signet_challenge,
             rpcport,
             rpcbind,
             rpcallowip,
@@ -2089,6 +2123,10 @@ impl Config {
             "dbcache": self.dbcache,
             "blocksdir": self.blocksdir.as_ref().map(|p| p.display().to_string()),
             "signet_seed_nodes": self.signet_seed_nodes,
+            "signet_challenge": self.signet_challenge.as_ref().map(|c| {
+                use bitcoin::hashes::hex::DisplayHex;
+                c.as_hex().to_string()
+            }),
             "profile": self.profile.map(|p| p.as_str()).unwrap_or("(none)"),
             "rpc": {
                 "port": self.rpcport,
@@ -2327,6 +2365,17 @@ pub struct CliArgs {
         help = "Additional signet seed node (repeatable). Signet only."
     )]
     pub signetseednode: Vec<String>,
+
+    /// Custom signet challenge script, hex-encoded. Mirrors Bitcoin
+    /// Core's `-signetchallenge=<hex>`. Selects a private/custom signet:
+    /// the node validates block solutions against this script (BIP 325)
+    /// and derives the P2P network magic from it. Signet only.
+    #[arg(
+        long,
+        value_name = "HEX",
+        help = "Custom signet challenge script, hex (BIP 325). Signet only."
+    )]
+    pub signetchallenge: Option<String>,
 
     #[arg(long, value_name = "PORT", help = "RPC server port")]
     pub rpcport: Option<u16>,
@@ -3424,6 +3473,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "datadir",
         "blocksdir",
         "signetseednode",
+        "signetchallenge",
         "conf",
         "includeconf",
         "rpcport",
@@ -3867,6 +3917,7 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "timeout",
     "onlynet",
     "signetseednode",
+    "signetchallenge",
     // Proxy / Tor
     "proxy",
     "onion",
@@ -4001,7 +4052,6 @@ pub enum UnsupportedKey {
 /// silently ignoring it could run a node wide open. When a key here
 /// gains real support, move it into [`KNOWN_CONFIG_KEYS`].
 const NOT_YET_IMPLEMENTED_KEYS: &[&str] = &[
-    "signetchallenge", // custom signet challenge script (audit: PR-2b)
     "maxuploadtarget", // upload bandwidth cap + serving limits
     "whitelist",       // NetPermissionFlags by IP / subnet
     "whitebind",       // NetPermissionFlags by bind address
@@ -4383,6 +4433,7 @@ rpcport=8332
             chain: None,
             blocksdir: None,
             signetseednode: Vec::new(),
+            signetchallenge: None,
             datadir: Some(PathBuf::from("/tmp/satd-test")),
             conf: None,
             includeconf: Vec::new(),
@@ -4583,6 +4634,7 @@ rpcport=8332
             chain: None,
             blocksdir: None,
             signetseednode: Vec::new(),
+            signetchallenge: None,
             datadir: Some(PathBuf::from("/tmp/satd-test")),
             conf: None,
             includeconf: Vec::new(),
@@ -5822,6 +5874,43 @@ rpcport=39999
         assert!(!cfg.dnsseed, "-nodnsseed should disable dnsseed");
     }
 
+    // ---- signetchallenge: custom signet (BIP 325) ----
+
+    #[test]
+    fn signetchallenge_parses_hex_on_signet() {
+        let hex = "512103ad5e0edad18cb1f0fc0d28a3d4f1f3e445640337489abb10404f2d1e086be430210359ef5021964fe22d6f8e05b2463c9540ce96883fe3b278760f048f5189f2e6c452ae";
+        let cli = CliArgs::try_parse_from(["satd", "--signet", "--signetchallenge", hex]).unwrap();
+        let cfg = Config::from_cli(cli).unwrap();
+        assert_eq!(cfg.network, Network::Signet);
+        let ch = cfg.signet_challenge.expect("challenge should be set");
+        use bitcoin::hashes::hex::DisplayHex;
+        assert_eq!(ch.as_hex().to_string(), hex);
+    }
+
+    #[test]
+    fn signetchallenge_rejected_off_signet() {
+        // On mainnet the flag is meaningless — must hard-error, not be
+        // silently accepted-and-ignored.
+        let cli = CliArgs::try_parse_from(["satd", "--signetchallenge", "5187"]).unwrap();
+        let err = Config::from_cli(cli).unwrap_err();
+        assert!(err.contains("signetchallenge"), "got: {err}");
+        assert!(err.contains("signet"), "error should mention signet: {err}");
+    }
+
+    #[test]
+    fn signetchallenge_invalid_hex_errors() {
+        let cli =
+            CliArgs::try_parse_from(["satd", "--signet", "--signetchallenge", "zzzz"]).unwrap();
+        let err = Config::from_cli(cli).unwrap_err();
+        assert!(err.contains("not valid hex"), "got: {err}");
+    }
+
+    #[test]
+    fn signetchallenge_is_now_recognised() {
+        assert_eq!(classify_unsupported_key("signetchallenge"), None);
+        assert!(is_known_config_key("signetchallenge"));
+    }
+
     // ---- PR-3: hard-error on unknown keys + --timeout unit fix ----
 
     #[test]
@@ -5923,7 +6012,6 @@ notarealkey=1
         // NotYetImplemented, and NOT be in the plain known-keys
         // allowlist.
         for k in [
-            "signetchallenge",
             "maxuploadtarget",
             "whitelist",
             "whitebind",

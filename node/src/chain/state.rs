@@ -276,6 +276,12 @@ pub struct ChainState {
     /// chainstate serving the user-facing tip; the background validates
     /// the history behind it and is dropped (its DB removed) at handoff.
     background: RwLock<Option<Arc<crate::chain::background::BackgroundChainState>>>,
+    /// Custom signet challenge script (BIP 325), set via
+    /// `-signetchallenge`. When present (signet only), every accepted
+    /// block's signet solution is verified against it and the P2P magic
+    /// is derived from it. `None` for all other networks and for the
+    /// default signet (which satd does not solution-check today).
+    signet_challenge: Option<Vec<u8>>,
 }
 
 impl ChainState {
@@ -367,6 +373,7 @@ impl ChainState {
                         crate::chain::connect_phase::ConnectPhaseTracker::new(),
                     ),
                     background: RwLock::new(None),
+                    signet_challenge: None,
                 });
             }
 
@@ -453,7 +460,38 @@ impl ChainState {
                 crate::chain::connect_phase::ConnectPhaseTracker::new(),
             ),
             background: RwLock::new(None),
+            signet_challenge: None,
         })
+    }
+
+    /// Set the custom signet challenge (BIP 325). Call once, before the
+    /// `ChainState` is shared (wrapped in an `Arc`). On signet this
+    /// enables block-solution validation and custom P2P magic.
+    pub fn set_signet_challenge(&mut self, challenge: Option<Vec<u8>>) {
+        self.signet_challenge = challenge;
+    }
+
+    /// Effective P2P network magic. Custom-signet challenges derive their
+    /// own magic (BIP 325); everything else uses the `bitcoin` crate's
+    /// per-network value.
+    pub fn p2p_magic(&self) -> bitcoin::p2p::Magic {
+        match &self.signet_challenge {
+            Some(ch) if self.network == Network::Signet => {
+                crate::validation::signet::signet_magic(ch)
+            }
+            _ => bitcoin::p2p::Magic::from(self.network),
+        }
+    }
+
+    /// Verify a block's signet solution when a custom challenge is
+    /// configured (BIP 325). No-op on every other network and on the
+    /// default signet (no challenge set).
+    fn check_signet_solution(&self, block: &Block) -> Result<(), crate::validation::ValidationError> {
+        if let Some(ch) = &self.signet_challenge {
+            let genesis_hash = bitcoin::constants::genesis_block(self.network).block_hash();
+            validation::signet::check_signet_block_solution(block, ch, genesis_hash)?;
+        }
+        Ok(())
     }
 
     /// Wire the mempool handle for reorg re-add. Called once at
@@ -2090,6 +2128,9 @@ impl ChainState {
             store_ref.get_block_index(&hash)
         })?;
 
+        // Signet block-solution check (BIP 325), custom signet only.
+        self.check_signet_solution(block)?;
+
         // Checkpoint validation
         if !checkpoints::check_against_checkpoints(new_height, &block_hash, &self.checkpoints) {
             return Err(ChainError::CheckpointMismatch(new_height));
@@ -2660,6 +2701,9 @@ impl ChainState {
             let hash = store_ref.get_block_hash_by_height(h)?;
             store_ref.get_block_index(&hash)
         })?;
+
+        // Signet block-solution check (BIP 325), custom signet only.
+        self.check_signet_solution(block)?;
 
         // Checkpoint validation
         if !checkpoints::check_against_checkpoints(new_height, &block_hash, &self.checkpoints) {
