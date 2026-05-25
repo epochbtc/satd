@@ -464,6 +464,9 @@ pub struct Config {
     pub blocksonly: bool,
     pub port: u16,
     pub connect: Vec<String>,
+    /// Operator-declared external addresses (Bitcoin Core's
+    /// `-externalip`), resolved to socket addresses. Advertised to peers.
+    pub externalip: Vec<SocketAddr>,
     pub assumevalid: Option<String>,
     pub assumevalidage: u64,
     /// Stop running once the active-chain tip reaches this height
@@ -1277,6 +1280,28 @@ impl Config {
             .or_else(|| file_get("blocksonly").and_then(|v| parse_bool(&v)))
             .unwrap_or(false);
 
+        // -externalip: CLI list wins, else config (multi). Each entry is
+        // `IP` or `IP:port`; a bare IP inherits the network P2P port.
+        let externalip_raw: Vec<String> = if !cli.externalip.is_empty() {
+            cli.externalip.clone()
+        } else {
+            file_get_all("externalip")
+        };
+        let mut externalip: Vec<SocketAddr> = Vec::with_capacity(externalip_raw.len());
+        for raw in &externalip_raw {
+            let s = raw.trim();
+            if let Ok(sa) = s.parse::<SocketAddr>() {
+                externalip.push(sa);
+            } else if let Ok(ip) = s.parse::<std::net::IpAddr>() {
+                externalip.push(SocketAddr::new(ip, default_p2p_port(network)));
+            } else {
+                return Err(format!(
+                    "externalip: {s:?} is not an IP or IP:port. satd's externalip accepts \
+                     literal addresses only (hostnames/.onion are not resolved here)."
+                ));
+            }
+        }
+
         let port = cli
             .port
             .or_else(|| file_get("port").and_then(|v| v.parse().ok()))
@@ -1771,6 +1796,7 @@ impl Config {
             rpc_tls_key,
             listen,
             blocksonly,
+            externalip,
             port,
             connect,
             assumevalid,
@@ -2175,6 +2201,8 @@ impl Config {
                 "connect": self.connect,
                 "addnode": self.addnode,
                 "seednode": self.seednode,
+                "blocksonly": self.blocksonly,
+                "externalip": self.externalip.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
             },
             "mempool": {
                 "max_bytes_mb": self.maxmempool,
@@ -2552,6 +2580,12 @@ pub struct CliArgs {
 
     #[arg(long, value_name = "ADDR", help = "Connect to specific peer")]
     pub connect: Vec<String>,
+
+    /// Declare an external address to advertise to peers. Mirrors Bitcoin
+    /// Core's `-externalip=<ip[:port]>`. Repeatable. `IP` or `IP:port`
+    /// (bare IP inherits the network's default P2P port).
+    #[arg(long, value_name = "IP[:PORT]", help = "External address to advertise (repeatable)")]
+    pub externalip: Vec<String>,
 
     #[arg(
         long,
@@ -3593,6 +3627,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "dns",
         "dnsseed",
         "blocksonly",
+        "externalip",
         "bantime",
         "proxy",
         "onion",
@@ -3947,6 +3982,7 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     // P2P
     "listen",
     "blocksonly",
+    "externalip",
     "port",
     "bind",
     "connect",
@@ -4098,7 +4134,6 @@ const NOT_YET_IMPLEMENTED_KEYS: &[&str] = &[
     "maxuploadtarget", // upload bandwidth cap + serving limits
     "whitelist",       // NetPermissionFlags by IP / subnet
     "whitebind",       // NetPermissionFlags by bind address
-    "externalip",      // advertise an external address to peers
     "asmap",           // ASN-based addrman bucketing (eclipse resistance)
     // The two below need machinery satd lacks today (persistent
     // addrman / a compiled-in fixed-IP seed list). satd seeds at every
@@ -4491,6 +4526,7 @@ rpcport=8332
             blocksonly: None,
             port: None,
             connect: vec![],
+            externalip: vec![],
             assumevalid: None,
             assumevalidage: None,
             stopatheight: None,
@@ -4694,6 +4730,7 @@ rpcport=8332
             blocksonly: None,
             port: None,
             connect: vec![],
+            externalip: vec![],
             assumevalid: None,
             assumevalidage: None,
             stopatheight: None,
@@ -5939,6 +5976,32 @@ rpcport=39999
         assert_eq!(parse_chain_name("testnet4").unwrap(), Network::Testnet4);
     }
 
+    // ---- externalip ----
+
+    #[test]
+    fn externalip_parses_ip_and_ip_port() {
+        let cli = CliArgs::try_parse_from([
+            "satd", "--regtest",
+            "--externalip", "203.0.113.7",
+            "--externalip", "198.51.100.9:12345",
+        ])
+        .unwrap();
+        let cfg = Config::from_cli(cli).unwrap();
+        assert_eq!(cfg.externalip.len(), 2);
+        // bare IP inherits the regtest default P2P port (18444)
+        assert_eq!(cfg.externalip[0].to_string(), "203.0.113.7:18444");
+        assert_eq!(cfg.externalip[1].to_string(), "198.51.100.9:12345");
+    }
+
+    #[test]
+    fn externalip_rejects_hostname() {
+        let cli =
+            CliArgs::try_parse_from(["satd", "--regtest", "--externalip", "node.example.com"])
+                .unwrap();
+        let err = Config::from_cli(cli).unwrap_err();
+        assert!(err.contains("externalip"), "got: {err}");
+    }
+
     // ---- blocksonly ----
 
     #[test]
@@ -6100,7 +6163,6 @@ notarealkey=1
             "maxuploadtarget",
             "whitelist",
             "whitebind",
-            "externalip",
             "asmap",
             "forcednsseed",
             "fixedseeds",

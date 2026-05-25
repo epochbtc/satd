@@ -41,9 +41,9 @@ single-dash Core spellings are aliased by `normalize_args`. Grouped:
   `rpcdefaultunits`, `rpcdisableauth`, `rpcextendederrors`,
   `rpctlsbind`, `rpctlscert`, `rpctlskey`, `rpctlshandshaketimeout`,
   `rpcmtls`, `rpcmtlsclientca`, `rpcmtlsclientallow`
-- **P2P:** `listen`, `blocksonly`, `port`, `bind`, `connect`, `addnode`,
-  `seednode`, `maxconnections`, `maxinboundperip`, `dns`, `dnsseed`,
-  `bantime`, `timeout`, `onlynet`
+- **P2P:** `listen`, `blocksonly`, `externalip`, `port`, `bind`,
+  `connect`, `addnode`, `seednode`, `maxconnections`, `maxinboundperip`,
+  `dns`, `dnsseed`, `bantime`, `timeout`, `onlynet`
 - **Proxy / Tor:** `proxy`, `onion`, `torcontrol`, `torpassword`,
   `listenonion`
 - **Consensus:** `assumevalid`, `assumevalidage`, `stopatheight`,
@@ -103,6 +103,12 @@ single-dash Core spellings are aliased by `normalize_args`. Grouped:
   `mempool.dat` format (Core's datadir is not byte-compatible; see
   `CORE_DIFFERENCES.md`); the file is re-validated against the current
   chainstate on load, never trusted blindly.
+- **`externalip`** — Bitcoin Core's `-externalip=<ip[:port]>`,
+  repeatable. Declares external addresses the node advertises to peers
+  (prepended to `getaddr` responses, and used as the version message's
+  `addr_from`). satd accepts literal `IP` / `IP:port` only (a bare IP
+  inherits the network's default P2P port); hostnames/.onion are not
+  resolved here.
 - **`blocksonly`** — Bitcoin Core's `-blocksonly`. When set, the node
   advertises `relay=false` in its version message, ignores inbound `tx`
   messages from peers, and does not request advertised transactions.
@@ -156,7 +162,6 @@ These hard-error today. Listed with what real support would require.
 |---|---|
 | `maxuploadtarget` | Upload bandwidth cap + serving limits. Needs per-peer/global byte accounting + disconnect logic. |
 | `whitelist` / `whitebind` | Peer permission flags (`NetPermissionFlags`). Needs a peer-permission model in the peer manager. |
-| `externalip` | Advertise an external address to peers. Needs local-address tracking + version-message wiring. |
 | `asmap` | ASN-based addrman bucketing (eclipse resistance). Needs an ASN map loader + addrman bucketing. |
 | `forcednsseed` | Force DNS seeding even when addrman is full. satd has no persistent addrman and seeds at every start, so this has no distinct effect yet. |
 | `fixedseeds` | Fall back to the compiled-in fixed-IP seed list. satd has no fixed-IP seed list (only DNS + `.onion` seeds), so nothing to gate yet. |
