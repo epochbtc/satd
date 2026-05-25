@@ -91,19 +91,61 @@ pub fn get_chain_states(chain_state: &ChainState) -> Value {
         1.0
     };
 
-    let normal = json!({
-        "blocks": tip_height,
-        "bestblockhash": tip_hash.to_string(),
-        "difficulty": difficulty,
-        "verificationprogress": verificationprogress,
-        "coins_db_cache_bytes": 0,
-        "coins_tip_cache_bytes": 0,
-        "validated": true,
-    });
+    let mut chainstates = Vec::new();
+
+    match chain_state.background() {
+        // AssumeUTXO snapshot loaded: this chainstate serves the tip but
+        // is not yet fully validated; a background chainstate validates
+        // genesis→snapshot in parallel.
+        Some(bg) => {
+            chainstates.push(json!({
+                "blocks": tip_height,
+                "bestblockhash": tip_hash.to_string(),
+                "difficulty": difficulty,
+                "verificationprogress": verificationprogress,
+                "coins_db_cache_bytes": 0,
+                "coins_tip_cache_bytes": 0,
+                "snapshot_blockhash": bg.snapshot_hash().to_string(),
+                "validated": false,
+            }));
+
+            let bg_height = bg.tip_height();
+            let bg_difficulty = chain_state
+                .get_block_index(&bg.tip_hash())
+                .map(|e| target_to_difficulty(e.header.bits))
+                .unwrap_or(0.0);
+            let bg_progress = if bg.snapshot_height() > 0 {
+                (bg_height as f64 / bg.snapshot_height() as f64).min(1.0)
+            } else {
+                1.0
+            };
+            chainstates.push(json!({
+                "blocks": bg_height,
+                "bestblockhash": bg.tip_hash().to_string(),
+                "difficulty": bg_difficulty,
+                "verificationprogress": bg_progress,
+                "coins_db_cache_bytes": 0,
+                "coins_tip_cache_bytes": 0,
+                "validated": true,
+            }));
+        }
+        // No snapshot: a single, fully validated chainstate.
+        None => {
+            chainstates.push(json!({
+                "blocks": tip_height,
+                "bestblockhash": tip_hash.to_string(),
+                "difficulty": difficulty,
+                "verificationprogress": verificationprogress,
+                "coins_db_cache_bytes": 0,
+                "coins_tip_cache_bytes": 0,
+                "validated": true,
+            }));
+        }
+    }
 
     json!({
         "headers": chain_state.headers_tip_height().max(tip_height),
-        "chainstates": [normal],
+        "chainstates": chainstates,
     })
 }
 

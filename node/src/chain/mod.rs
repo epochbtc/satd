@@ -1,4 +1,5 @@
 pub mod assumeutxo;
+pub mod background;
 pub mod checkpoints;
 pub mod connect;
 pub mod connect_phase;

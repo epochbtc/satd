@@ -177,12 +177,12 @@ struct PendingReorgRecord {
 /// Central chain state manager.
 pub struct ChainState {
     store: std::sync::Arc<CoinCache>,
-    flat_files: Mutex<FlatFileManager>,
+    flat_files: Arc<Mutex<FlatFileManager>>,
     /// Path to the blocks directory, for mutex-free reads.
     blocks_dir: PathBuf,
     tip: RwLock<ChainTip>,
     pub network: Network,
-    script_verifier: Box<dyn ScriptVerifier>,
+    script_verifier: Arc<dyn ScriptVerifier>,
     assumevalid: AssumeValid,
     checkpoints: Vec<Checkpoint>,
     /// Highest header height stored (may be ahead of connected block tip during IBD).
@@ -246,6 +246,13 @@ pub struct ChainState {
     /// definitions. Arc'd so the watchdog (a separate `std::thread`)
     /// can share it with the connector.
     connect_phases: std::sync::Arc<crate::chain::connect_phase::ConnectPhaseTracker>,
+    /// AssumeUTXO background chainstate. `None` on a normally-synced node
+    /// (every existing code path is unchanged). `Some` only between a
+    /// successful `loadtxoutset` and the handoff that validates
+    /// genesis→snapshot_height. While present, `self` is the *snapshot*
+    /// chainstate serving the user-facing tip; the background validates
+    /// the history behind it and is dropped (its DB removed) at handoff.
+    background: RwLock<Option<Arc<crate::chain::background::BackgroundChainState>>>,
 }
 
 impl ChainState {
@@ -269,6 +276,11 @@ impl ChainState {
         let blocks_dir = flat_files.blocks_dir().to_path_buf();
 
         let checkpoints = checkpoints::checkpoints_for_network(network);
+
+        // Share the script verifier with any background chainstate
+        // (AssumeUTXO) via Arc. Callers still pass a Box; the conversion
+        // is free and keeps every existing call site unchanged.
+        let script_verifier: Arc<dyn ScriptVerifier> = Arc::from(script_verifier);
 
         // Wrap the store in a CoinCache for batched UTXO writes
         let store = std::sync::Arc::new(CoinCache::new(store, dbcache_mb));
@@ -306,7 +318,7 @@ impl ChainState {
                 );
                 return Ok(Self {
                     store,
-                    flat_files: Mutex::new(flat_files),
+                    flat_files: Arc::new(Mutex::new(flat_files)),
                     blocks_dir,
                     tip: RwLock::new(ChainTip {
                         hash: tip_hash,
@@ -331,6 +343,7 @@ impl ChainState {
                     connect_phases: std::sync::Arc::new(
                         crate::chain::connect_phase::ConnectPhaseTracker::new(),
                     ),
+                    background: RwLock::new(None),
                 });
             }
 
@@ -391,7 +404,7 @@ impl ChainState {
 
         Ok(Self {
             store,
-            flat_files: Mutex::new(flat_files),
+            flat_files: Arc::new(Mutex::new(flat_files)),
             blocks_dir,
             tip: RwLock::new(ChainTip {
                 hash: genesis_hash,
@@ -416,6 +429,7 @@ impl ChainState {
             connect_phases: std::sync::Arc::new(
                 crate::chain::connect_phase::ConnectPhaseTracker::new(),
             ),
+            background: RwLock::new(None),
         })
     }
 
@@ -439,6 +453,139 @@ impl ChainState {
         tx: tokio::sync::broadcast::Sender<crate::chain::events::ChainEvent>,
     ) {
         *self.chain_event_tx.lock() = Some(tx);
+    }
+
+    // ---- AssumeUTXO background chainstate ----
+
+    /// Attach a background chainstate that re-validates genesis→
+    /// `snapshot_height` behind a loaded AssumeUTXO snapshot. Called by
+    /// `loadtxoutset`. The background shares this chainstate's block
+    /// store, flat files, and script verifier; it keeps its own UTXO set
+    /// in `bg_dir` (`<datadir>/chainstate_background`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn attach_background(
+        &self,
+        bg_dir: PathBuf,
+        snapshot_height: u32,
+        snapshot_hash: BlockHash,
+        target_utxo_hash: [u8; 32],
+        dbcache_mb: u64,
+        max_open_files: i32,
+    ) -> Result<(), ChainError> {
+        let bg = crate::chain::background::BackgroundChainState::open(
+            self.store.clone() as Arc<dyn crate::storage::Store>,
+            self.flat_files.clone(),
+            self.script_verifier.clone(),
+            self.checkpoints.clone(),
+            self.network,
+            self.num_threads,
+            bg_dir,
+            snapshot_height,
+            snapshot_hash,
+            target_utxo_hash,
+            dbcache_mb,
+            max_open_files,
+        )?;
+        *self.background.write() = Some(Arc::new(bg));
+        Ok(())
+    }
+
+    /// The active background chainstate, if one is attached (i.e. an
+    /// AssumeUTXO snapshot is loaded and not yet validated).
+    pub fn background(&self) -> Option<Arc<crate::chain::background::BackgroundChainState>> {
+        self.background.read().clone()
+    }
+
+    /// Whether a background chainstate is currently attached.
+    pub fn has_background(&self) -> bool {
+        self.background.read().is_some()
+    }
+
+    /// Connect one historical block to the background chainstate (driven
+    /// by the catch-up loop). When the connect reaches `snapshot_height`,
+    /// runs the handoff verification. Returns `None` when no background is
+    /// attached (the normal, non-AssumeUTXO case).
+    pub fn background_connect_block(
+        &self,
+        block: &Block,
+    ) -> Result<Option<crate::chain::background::BackgroundConnect>, ChainError> {
+        let bg = match self.background() {
+            Some(b) => b,
+            None => return Ok(None),
+        };
+        let outcome = bg.connect_next_block(block)?;
+        if outcome.reached_snapshot {
+            self.run_background_handoff(&bg)?;
+        }
+        Ok(Some(outcome))
+    }
+
+    /// Resolve the handoff once the background reaches `snapshot_height`.
+    /// On a hash match: mark validated by dropping the background and
+    /// removing its private DB (the shared block store now holds the full
+    /// genesis→tip block index). On a mismatch: do NOT panic — raise a
+    /// loud error warning and leave the background in place for operator
+    /// intervention (full demote-to-primary recovery is a follow-up).
+    fn run_background_handoff(
+        &self,
+        bg: &Arc<crate::chain::background::BackgroundChainState>,
+    ) -> Result<(), ChainError> {
+        use crate::chain::background::HandoffOutcome;
+        match bg.verify_at_snapshot()? {
+            HandoffOutcome::Validated => {
+                tracing::info!(
+                    height = bg.snapshot_height(),
+                    "AssumeUTXO: background validation matched the anchor; completing handoff"
+                );
+                let dir = bg.bg_dir().to_path_buf();
+                *self.background.write() = None;
+                if let Err(e) = std::fs::remove_dir_all(&dir) {
+                    tracing::warn!(
+                        error = %e,
+                        dir = %dir.display(),
+                        "AssumeUTXO: could not remove background chainstate dir after handoff"
+                    );
+                }
+            }
+            HandoffOutcome::HashMismatch { expected, actual } => {
+                tracing::error!(
+                    expected = %hex::encode(expected),
+                    actual = %hex::encode(actual),
+                    "AssumeUTXO: background UTXO-set hash does NOT match the anchor — snapshot is invalid"
+                );
+                self.warnings.record(
+                    "assumeutxo-validation-failed",
+                    crate::warnings::Severity::Error,
+                    "AssumeUTXO snapshot failed background validation: UTXO-set hash \
+                     mismatch at the snapshot height. The loaded snapshot is not \
+                     trustworthy.",
+                    serde_json::json!({
+                        "expected_hash_serialized_3": hex::encode(expected),
+                        "actual_hash_serialized_3": hex::encode(actual),
+                        "snapshot_height": bg.snapshot_height(),
+                    }),
+                );
+            }
+            HandoffOutcome::BaseMismatch { expected, actual } => {
+                tracing::error!(
+                    expected = %expected,
+                    actual = %actual,
+                    "AssumeUTXO: background tip at snapshot height is not the anchor block"
+                );
+                self.warnings.record(
+                    "assumeutxo-validation-failed",
+                    crate::warnings::Severity::Error,
+                    "AssumeUTXO snapshot failed background validation: the block at the \
+                     snapshot height does not match the anchor block hash.",
+                    serde_json::json!({
+                        "expected_base": expected.to_string(),
+                        "actual_base": actual.to_string(),
+                        "snapshot_height": bg.snapshot_height(),
+                    }),
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Subscribe to live chain events. Returns `None` if no sender
@@ -2250,6 +2397,27 @@ impl ChainState {
                     .ok_or(ChainError::BadPrevBlock)?
             };
 
+            // AssumeUTXO reorg-depth guard: while a snapshot is loaded,
+            // this (snapshot) chainstate's UTXO base IS the snapshot
+            // block — it has connected no blocks below `snapshot_height`.
+            // A reorg whose fork point is below the snapshot height would
+            // try to disconnect blocks the snapshot assumes as final and
+            // that this chainstate never connected. Decline the reorg
+            // (keep the side-chain block stored) rather than corrupt the
+            // snapshot base. The background chainstate is what validates
+            // that buried history.
+            if let Some(bg) = self.background()
+                && fork_entry.height < bg.snapshot_height()
+            {
+                tracing::warn!(
+                    fork_height = fork_entry.height,
+                    snapshot_height = bg.snapshot_height(),
+                    new_height,
+                    "AssumeUTXO: refusing reorg below the snapshot height"
+                );
+                return Ok(block_hash);
+            }
+
             // Disconnect blocks from current tip down to fork point.
             // The returned info carries the data we need to build an
             // accurate reorg record once reconnection is complete.
@@ -3083,7 +3251,7 @@ impl Drop for TempFileGuard {
     }
 }
 
-fn network_magic(network: Network) -> [u8; 4] {
+pub(crate) fn network_magic(network: Network) -> [u8; 4] {
     match network {
         Network::Bitcoin => [0xf9, 0xbe, 0xb4, 0xd9],
         Network::Testnet => [0x0b, 0x11, 0x09, 0x07],
@@ -3124,6 +3292,96 @@ pub(crate) mod tests {
         )
         .unwrap();
         (cs, dir)
+    }
+
+    /// Mine `n` regtest blocks into `cs` via the proven
+    /// accept_header→store_block→connect_stored_block path, returning the
+    /// connected blocks in height order.
+    fn build_and_connect_chain(cs: &ChainState, n: u32) -> Vec<Block> {
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+        let mut parent = genesis.block_hash();
+        let mut blocks = Vec::new();
+        for h in 1..=n {
+            let b = build_test_block(parent, h, 1_300_000_000 + h);
+            cs.accept_header(&b.header).unwrap();
+            cs.store_block(&b).unwrap();
+            cs.connect_stored_block(&b.block_hash()).unwrap();
+            parent = b.block_hash();
+            blocks.push(b);
+        }
+        blocks
+    }
+
+    #[test]
+    fn background_handoff_validates_and_drops_on_hash_match() {
+        let (cs, dir) = make_chain_state();
+        let n = 5u32;
+        let blocks = build_and_connect_chain(&cs, n);
+        assert_eq!(cs.tip_height(), n);
+        let snapshot_hash = cs.tip_hash();
+
+        // Anchor = the primary's UTXO-set hash at the snapshot height.
+        cs.store.flush().unwrap();
+        let (anchor, _) =
+            crate::storage::compressed_coin::hash_utxo_set(&*cs.store).unwrap();
+
+        // Attach a background that must reproduce that hash by
+        // re-validating genesis→N into its own coins DB.
+        let bg_dir = dir.join("chainstate_background");
+        cs.attach_background(bg_dir.clone(), n, snapshot_hash, anchor, 64, -1)
+            .unwrap();
+        assert!(cs.has_background());
+
+        for b in &blocks {
+            cs.background_connect_block(b).unwrap();
+        }
+
+        // Hash matched at the snapshot height → handoff completed: the
+        // background is dropped and its private DB removed.
+        assert!(
+            !cs.has_background(),
+            "background should be dropped after a successful handoff"
+        );
+        assert!(
+            !bg_dir.exists(),
+            "background DB dir should be removed after handoff"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn background_handoff_keeps_chainstate_and_warns_on_hash_mismatch() {
+        let (cs, dir) = make_chain_state();
+        let n = 4u32;
+        let blocks = build_and_connect_chain(&cs, n);
+        let snapshot_hash = cs.tip_hash();
+
+        // A deliberately wrong anchor: the background's recomputed hash
+        // will not match.
+        let bad_anchor = [0x42u8; 32];
+        let bg_dir = dir.join("chainstate_background");
+        cs.attach_background(bg_dir.clone(), n, snapshot_hash, bad_anchor, 64, -1)
+            .unwrap();
+
+        for b in &blocks {
+            cs.background_connect_block(b).unwrap();
+        }
+
+        // Mismatch → background NOT dropped (left for the operator), and a
+        // loud validation-failure warning is recorded.
+        assert!(
+            cs.has_background(),
+            "background must remain attached on a hash mismatch"
+        );
+        let warned = cs
+            .warnings()
+            .as_strings()
+            .iter()
+            .any(|w| w.contains("AssumeUTXO") || w.to_lowercase().contains("validation"));
+        assert!(warned, "a validation-failure warning should be recorded");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
