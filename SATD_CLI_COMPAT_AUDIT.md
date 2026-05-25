@@ -32,7 +32,8 @@ single-dash Core spellings are aliased by `normalize_args`. Grouped:
 
 - **Network / chain:** `regtest`, `testnet`, `signet`, `chain`,
   `signetseednode`
-- **Filesystem:** `datadir`, `blocksdir`, `conf`, `pid`, `profile`
+- **Filesystem:** `datadir`, `blocksdir`, `conf`, `includeconf`, `pid`,
+  `profile`
 - **Daemon / logging:** `daemon`, `server`, `logformat`, `debug`,
   `debugexclude`, `maxshutdownsecs`
 - **RPC + TLS / mTLS:** `rpcport`, `rpcbind`, `rpcallowip`, `rpcuser`,
@@ -101,6 +102,16 @@ single-dash Core spellings are aliased by `normalize_args`. Grouped:
   `mempool.dat` format (Core's datadir is not byte-compatible; see
   `CORE_DIFFERENCES.md`); the file is re-validated against the current
   chainstate on load, never trusted blindly.
+- **`includeconf`** — splices an additional config file (resolved
+  relative to `--datadir`, absolute paths used as-is) at the directive's
+  position; the included file's values are merged after the main file's,
+  so for single-valued keys the include wins (last-wins) and for
+  repeatable keys it adds. Processed for the global scope plus the active
+  network's section. Like Core: an `includeconf` *inside* an included
+  file is ignored with a warning (recursion guard), and a command-line
+  `-includeconf` is ignored with a warning (config-file-only feature). A
+  `chain=` inside an included file does not change the active network —
+  the network is resolved from the main file + CLI before includes run.
 
 ---
 
@@ -110,7 +121,6 @@ These hard-error today. Listed with what real support would require.
 
 | Key | Notes |
 |---|---|
-| `includeconf` | Recursive config inclusion. High-value; the marquee strict-parser hazard. Tracked as PR-2b. |
 | `signetchallenge` | Custom signet challenge script. Tracked as PR-2b. |
 | `maxuploadtarget` | Upload bandwidth cap + serving limits. Needs per-peer/global byte accounting + disconnect logic. |
 | `whitelist` / `whitebind` | Peer permission flags (`NetPermissionFlags`). Needs a peer-permission model in the peer manager. |

@@ -881,7 +881,7 @@ impl Config {
             .conf
             .clone()
             .unwrap_or_else(|| base_datadir.join("bitcoin.conf"));
-        let config_file = if conf_path.exists() {
+        let mut config_file = if conf_path.exists() {
             Some(ConfigFile::parse_file(&conf_path)?)
         } else {
             None
@@ -938,6 +938,35 @@ impl Config {
             Network::Bitcoin => "main",
             _ => "main",
         };
+
+        // Resolve `includeconf` directives now that the active network
+        // section is known. Core processes includes from the global
+        // scope plus the running network's section; an included file's
+        // settings are merged into `config_file` before any `file_get`
+        // lookup below sees them. Notes (ignored nested includes) are
+        // carried into `pending_notes` for main.rs to emit. A config
+        // chain= inside an included file does NOT change the network —
+        // network is resolved from the main file + CLI above, matching
+        // Core's need to know the chain before section selection.
+        let mut include_notes: Vec<ConfigNote> = Vec::new();
+        if let Some(cf) = config_file.as_mut() {
+            include_notes = cf.resolve_includes(&base_datadir, section)?;
+        }
+        // Command-line -includeconf is recognised but not honoured, the
+        // same as Bitcoin Core: includes are a config-file-only feature
+        // (a command-line include can't be processed before the config
+        // file is read). Warn rather than silently drop.
+        if !cli.includeconf.is_empty() {
+            include_notes.push(ConfigNote {
+                level: NoteLevel::Warn,
+                message: format!(
+                    "-includeconf on the command line is ignored ({} entr{} dropped); \
+                     includeconf is only honoured inside a config file (matches Bitcoin Core)",
+                    cli.includeconf.len(),
+                    if cli.includeconf.len() == 1 { "y" } else { "ies" }
+                ),
+            });
+        }
 
         // Helper: look up a key from config file (section first, then global)
         let file_get = |key: &str| -> Option<String> {
@@ -1550,7 +1579,7 @@ impl Config {
         // before `tracing_subscriber::fmt()...init()` (because
         // --log-format selects the formatter), so direct
         // `tracing::warn!` calls would silently drop on the floor.
-        let mut pending_notes: Vec<ConfigNote> = Vec::new();
+        let mut pending_notes: Vec<ConfigNote> = std::mem::take(&mut include_notes);
         let mut esplora_resolved = esplora;
         if esplora_resolved && prune > 0 {
             pending_notes.push(ConfigNote {
@@ -2249,6 +2278,14 @@ pub struct CliArgs {
 
     #[arg(long, value_name = "FILE", help = "Config file path")]
     pub conf: Option<PathBuf>,
+
+    /// Additional config files to splice in, resolved relative to
+    /// `--datadir`. Mirrors Bitcoin Core's `-includeconf=<file>`.
+    /// Repeatable. Recognised on the command line for compatibility
+    /// but, like Core, only honoured inside a config file — a
+    /// command-line value is ignored with a warning.
+    #[arg(long, value_name = "FILE", help = "Additional config file (config-file only)")]
+    pub includeconf: Vec<String>,
 
     /// Additional signet seed nodes. Mirrors Bitcoin Core's
     /// `-signetseednode=<host[:port]>`. Repeatable. Useful when
@@ -3245,6 +3282,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "blocksdir",
         "signetseednode",
         "conf",
+        "includeconf",
         "rpcport",
         "rpcuser",
         "rpcpassword",
@@ -3494,6 +3532,90 @@ impl ConfigFile {
 
         Ok(file)
     }
+
+    /// Drain `includeconf` directives from the global scope and the
+    /// active-network `section`, in that order. Other sections are
+    /// ignored: Bitcoin Core only processes includes from the global
+    /// scope plus the section matching the running network.
+    fn drain_includeconf(&mut self, section: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(v) = self.global.remove("includeconf") {
+            out.extend(v);
+        }
+        if let Some(s) = self.sections.get_mut(section)
+            && let Some(v) = s.remove("includeconf")
+        {
+            out.extend(v);
+        }
+        out
+    }
+
+    /// Merge another parsed config into this one. Included values are
+    /// appended after existing values, so for single-valued keys (read
+    /// via `.last()`) the included file overrides the main file, and
+    /// for repeatable keys the included entries add to the list. This
+    /// models `includeconf` as splicing the included file in after the
+    /// directive — the common case is an included file that holds keys
+    /// (e.g. `rpcpassword`) the main file never sets.
+    fn merge_from(&mut self, other: ConfigFile) {
+        for (k, mut v) in other.global {
+            self.global.entry(k).or_default().append(&mut v);
+        }
+        for (sec, map) in other.sections {
+            let dst = self.sections.entry(sec).or_default();
+            for (k, mut v) in map {
+                dst.entry(k).or_default().append(&mut v);
+            }
+        }
+    }
+
+    /// Resolve `includeconf` directives (global + active `section`)
+    /// relative to `datadir`, parsing and merging each referenced file.
+    ///
+    /// Matches Bitcoin Core's semantics: paths are resolved against the
+    /// data directory (absolute paths are used as-is), and an
+    /// `includeconf` found *inside* an included file is ignored with a
+    /// warning rather than followed — this is what prevents infinite
+    /// include recursion. Returns operator-facing notes for any such
+    /// ignored nested includes.
+    pub fn resolve_includes(
+        &mut self,
+        datadir: &Path,
+        section: &str,
+    ) -> Result<Vec<ConfigNote>, String> {
+        let mut notes = Vec::new();
+        let includes = self.drain_includeconf(section);
+        for rel in includes {
+            let inc_path = if Path::new(&rel).is_absolute() {
+                PathBuf::from(&rel)
+            } else {
+                datadir.join(&rel)
+            };
+            let mut included = ConfigFile::parse_file(&inc_path).map_err(|e| {
+                format!("includeconf='{rel}' (resolved to {}): {e}", inc_path.display())
+            })?;
+            // No recursion: drain any includeconf the included file
+            // carries (global or any section) and warn, matching Core.
+            let mut nested = included.global.remove("includeconf").unwrap_or_default();
+            for s in included.sections.values_mut() {
+                if let Some(v) = s.remove("includeconf") {
+                    nested.extend(v);
+                }
+            }
+            for n in nested {
+                notes.push(ConfigNote {
+                    level: NoteLevel::Warn,
+                    message: format!(
+                        "includeconf='{n}' inside included file {} ignored: nested includes \
+                         are not processed (matches Bitcoin Core; prevents recursion)",
+                        inc_path.display()
+                    ),
+                });
+            }
+            self.merge_from(included);
+        }
+        Ok(notes)
+    }
 }
 
 /// Every config-file key satd recognises today. Sorted by source-of-
@@ -3517,6 +3639,7 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "datadir",
     "blocksdir",
     "conf",
+    "includeconf",
     "pid",
     "profile",
     // Daemon control
@@ -3695,7 +3818,6 @@ pub enum UnsupportedKey {
 /// silently ignoring it could run a node wide open. When a key here
 /// gains real support, move it into [`KNOWN_CONFIG_KEYS`].
 const NOT_YET_IMPLEMENTED_KEYS: &[&str] = &[
-    "includeconf",     // recursive config inclusion (audit: PR-2b)
     "signetchallenge", // custom signet challenge script (audit: PR-2b)
     "maxuploadtarget", // upload bandwidth cap + serving limits
     "whitelist",       // NetPermissionFlags by IP / subnet
@@ -4080,6 +4202,7 @@ rpcport=8332
             signetseednode: Vec::new(),
             datadir: Some(PathBuf::from("/tmp/satd-test")),
             conf: None,
+            includeconf: Vec::new(),
             rpcport: None,
             rpcuser: None,
             rpcpassword: None,
@@ -4279,6 +4402,7 @@ rpcport=8332
             signetseednode: Vec::new(),
             datadir: Some(PathBuf::from("/tmp/satd-test")),
             conf: None,
+            includeconf: Vec::new(),
             rpcport: None,
             rpcuser: Some("alice".to_string()),
             rpcpassword: None, // missing password
@@ -5229,6 +5353,162 @@ rpcport=39999
         assert_eq!(cfg.network, Network::Regtest);
     }
 
+    // ---- includeconf: chained config files ----
+
+    /// Build a datadir with a main `bitcoin.conf` plus named included
+    /// files, then load via `from_cli` on regtest. Returns the loaded
+    /// Config (or the load error) for assertions.
+    fn load_with_files(
+        main: &str,
+        included: &[(&str, &str)],
+    ) -> (tempfile::TempDir, Result<Config, String>) {
+        let tmpdir = tempfile::tempdir().unwrap();
+        std::fs::write(tmpdir.path().join("bitcoin.conf"), main).unwrap();
+        for (name, body) in included {
+            std::fs::write(tmpdir.path().join(name), body).unwrap();
+        }
+        let conf_path = tmpdir.path().join("bitcoin.conf");
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir",
+            tmpdir.path().to_str().unwrap(),
+            "--conf",
+            conf_path.to_str().unwrap(),
+        ])
+        .unwrap();
+        let cfg = Config::from_cli(cli);
+        (tmpdir, cfg)
+    }
+
+    #[test]
+    fn includeconf_merges_included_file() {
+        // The classic use: secrets live in a separate, tighter-perms
+        // file pulled in via includeconf. The key set only there must
+        // take effect.
+        let (_d, cfg) = load_with_files(
+            "includeconf=secrets.conf\n",
+            &[("secrets.conf", "rpcuser=alice\nrpcpassword=topsecret\n")],
+        );
+        let cfg = cfg.unwrap();
+        assert_eq!(cfg.rpcuser.as_deref(), Some("alice"));
+        assert_eq!(cfg.rpcpassword.as_deref(), Some("topsecret"));
+    }
+
+    #[test]
+    fn includeconf_included_value_overrides_main() {
+        // Included files splice in *after* the directive, so a key set
+        // in both wins from the include (last-wins, like Core's later
+        // config lines).
+        let (_d, cfg) = load_with_files(
+            "rpcport=18443\nincludeconf=override.conf\n",
+            &[("override.conf", "rpcport=19999\n")],
+        );
+        assert_eq!(cfg.unwrap().rpcport, 19999);
+    }
+
+    #[test]
+    fn includeconf_multiple_files_in_order() {
+        let (_d, cfg) = load_with_files(
+            "includeconf=a.conf\nincludeconf=b.conf\n",
+            &[("a.conf", "rpcuser=from_a\n"), ("b.conf", "rpcpassword=from_b\n")],
+        );
+        let cfg = cfg.unwrap();
+        assert_eq!(cfg.rpcuser.as_deref(), Some("from_a"));
+        assert_eq!(cfg.rpcpassword.as_deref(), Some("from_b"));
+    }
+
+    #[test]
+    fn includeconf_nested_is_ignored_with_warning() {
+        // An includeconf inside an included file must NOT be followed
+        // (Core's recursion guard). deep.conf would set maxconnections,
+        // but it's never read; instead a warning is queued.
+        let (_d, cfg) = load_with_files(
+            "includeconf=mid.conf\n",
+            &[
+                ("mid.conf", "maxconnections=42\nincludeconf=deep.conf\n"),
+                ("deep.conf", "maxconnections=999\n"),
+            ],
+        );
+        let cfg = cfg.unwrap();
+        assert_eq!(cfg.maxconnections, 42, "mid.conf value should apply");
+        assert_ne!(cfg.maxconnections, 999, "nested include must not be followed");
+        assert!(
+            cfg.pending_notes
+                .iter()
+                .any(|n| n.message.contains("nested includes are not processed")),
+            "expected a warning about the ignored nested include"
+        );
+    }
+
+    #[test]
+    fn includeconf_missing_file_hard_errors() {
+        let (_d, cfg) = load_with_files("includeconf=nope.conf\n", &[]);
+        let err = cfg.unwrap_err();
+        assert!(err.contains("includeconf"), "error should name includeconf: {err}");
+        assert!(err.contains("nope.conf"), "error should name the missing file: {err}");
+    }
+
+    #[test]
+    fn includeconf_bad_key_in_included_file_hard_errors() {
+        // The included file is held to the same strict allowlist.
+        let (_d, cfg) =
+            load_with_files("includeconf=bad.conf\n", &[("bad.conf", "rpusser=typo\n")]);
+        let err = cfg.unwrap_err();
+        assert!(err.contains("rpusser"), "should reject the typo'd key: {err}");
+    }
+
+    #[test]
+    fn includeconf_section_scoped_to_active_network() {
+        // includeconf under [regtest] only fires on regtest. Loading on
+        // regtest pulls it in; loading the same file on mainnet does not.
+        let main = "[regtest]\nincludeconf=rt.conf\n";
+        let inc = [("rt.conf", "rpcport=19999\n")];
+
+        let (_d, cfg) = load_with_files(main, &inc);
+        assert_eq!(cfg.unwrap().rpcport, 19999, "regtest section include should apply");
+
+        // Same files, but loaded on mainnet → the [regtest] include is
+        // never processed.
+        let tmpdir = tempfile::tempdir().unwrap();
+        std::fs::write(tmpdir.path().join("bitcoin.conf"), main).unwrap();
+        std::fs::write(tmpdir.path().join("rt.conf"), inc[0].1).unwrap();
+        let conf_path = tmpdir.path().join("bitcoin.conf");
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--datadir",
+            tmpdir.path().to_str().unwrap(),
+            "--conf",
+            conf_path.to_str().unwrap(),
+        ])
+        .unwrap();
+        let cfg = Config::from_cli(cli).unwrap();
+        assert_eq!(cfg.rpcport, 8332, "mainnet must not process the [regtest] include");
+    }
+
+    #[test]
+    fn command_line_includeconf_is_ignored_with_warning() {
+        // Matches Core: -includeconf on the command line is dropped
+        // (with a warning), not honoured. The node still loads.
+        let tmpdir = tempfile::tempdir().unwrap();
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir",
+            tmpdir.path().to_str().unwrap(),
+            "--includeconf",
+            "would-be-ignored.conf",
+        ])
+        .unwrap();
+        let cfg = Config::from_cli(cli).unwrap();
+        assert!(
+            cfg.pending_notes
+                .iter()
+                .any(|n| n.message.contains("command line is ignored")),
+            "expected a warning that command-line includeconf is ignored"
+        );
+    }
+
     // ---- PR-3: hard-error on unknown keys + --timeout unit fix ----
 
     #[test]
@@ -5330,7 +5610,6 @@ notarealkey=1
         // NotYetImplemented, and NOT be in the plain known-keys
         // allowlist.
         for k in [
-            "includeconf",
             "signetchallenge",
             "maxuploadtarget",
             "whitelist",
@@ -5386,14 +5665,14 @@ notarealkey=1
     }
 
     #[test]
-    fn includeconf_does_not_silently_drop_settings() {
-        // The dangerous case: a config that looks valid while an
-        // included file's settings vanish. We must fail loudly instead.
-        let err = ConfigFile::parse("includeconf=secrets.conf\nserver=1\n").unwrap_err();
-        assert!(
-            err.contains("includeconf") && err.contains("silently drop"),
-            "got: {err}"
-        );
+    fn includeconf_is_now_a_recognised_key() {
+        // includeconf used to hard-error (not-yet-implemented). It is
+        // now honoured, so the bare parse stores it rather than
+        // rejecting it; resolution happens later against the datadir.
+        let cf = ConfigFile::parse("includeconf=secrets.conf\nserver=1\n").unwrap();
+        assert_eq!(cf.global.get("includeconf").map(|v| v.as_slice()), Some(&["secrets.conf".to_string()][..]));
+        assert_eq!(classify_unsupported_key("includeconf"), None);
+        assert!(is_known_config_key("includeconf"));
     }
 
     #[test]
