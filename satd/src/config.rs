@@ -475,6 +475,10 @@ pub struct Config {
     pub limitancestorcount: usize,
     pub limitdescendantcount: usize,
     pub mempoolexpiry: u64,
+    /// Bitcoin Core's `-persistmempool`: save the mempool to
+    /// `<datadir>/<chain>/mempool.dat` on clean shutdown and re-admit
+    /// it (re-validated) on startup. Default true, matching Core.
+    pub persistmempool: bool,
     pub permitbaremultisig: bool,
     pub txindex: bool,
     /// Address-history index. On by default; disable via
@@ -627,13 +631,27 @@ pub struct Config {
     #[allow(dead_code)]
     pub timeout: u64,
     pub addnode: Vec<String>,
+    /// One-shot seed peers (Bitcoin Core's `-seednode`, repeatable).
+    /// Connected at startup to bootstrap peer discovery, across all
+    /// networks (unlike `signet_seed_nodes`, which is signet-only).
+    pub seednode: Vec<String>,
     pub dns: bool,
+    /// Bitcoin Core's `-dnsseed`: query the DNS seeds for peer
+    /// addresses. Default true. satd gates DNS seeding on both `dns`
+    /// and `dnsseed`, so either set to false disables it.
+    pub dnsseed: bool,
     pub bantime: u64,
     // Proxy / Tor
     pub proxy: Option<String>,
     pub onion: Option<String>,
     pub torcontrol: Option<String>,
     pub torpassword: Option<String>,
+    /// Bitcoin Core's `-listenonion`: create a Tor v3 hidden service
+    /// via the control port and accept inbound P2P over it. Resolved
+    /// to a single bool at load time — see [`Config::load`] for the
+    /// default rule (off, unless `-torcontrol` is set). The control
+    /// port address is `torcontrol`, defaulting to `127.0.0.1:9051`.
+    pub listenonion: bool,
     #[allow(dead_code)]
     pub onlynet: Vec<String>,
     // Mining
@@ -734,6 +752,14 @@ pub struct Config {
     /// Log output format. `Text` is human-readable (default); `Json`
     /// emits one JSON object per event for log-shipping pipelines.
     pub log_format: LogFormat,
+    /// Bitcoin Core `-debug=<category>` (repeatable). Enables
+    /// debug-level tracing for the matching satd subsystem(s). The
+    /// special values `1` / `all` enable debug everywhere. See
+    /// [`debug_directives`] for the category → tracing-target map.
+    pub debug: Vec<String>,
+    /// Bitcoin Core `-debugexclude=<category>` (repeatable). Suppresses
+    /// debug logging for a category that `debug` would otherwise enable.
+    pub debugexclude: Vec<String>,
     /// Named profile the operator selected (if any). Informational —
     /// the profile's effects are already baked into the other fields.
     pub profile: Option<Profile>,
@@ -1066,6 +1092,24 @@ impl Config {
         } else {
             file_get_all("signetseednode")
         };
+
+        // -torcontrol address is needed both for the `torcontrol`
+        // Config field and to resolve -listenonion's default below, so
+        // hoist it out of the struct literal.
+        let torcontrol = cli.torcontrol.clone().or_else(|| file_get("torcontrol"));
+
+        // -listenonion gates Tor hidden-service creation. Bitcoin Core
+        // defaults it on (but it's a silent no-op without a reachable
+        // control port); satd defaults it OFF to avoid dialing the
+        // control port on every boot, with one backward-compat
+        // carve-out: an explicitly-set -torcontrol implies opting in
+        // (that was satd's original trigger for the hidden service),
+        // unless -listenonion=0 overrides. The control-port address
+        // defaults to Core's 127.0.0.1:9051 at use time (see main.rs).
+        let listenonion = cli
+            .listenonion
+            .or_else(|| file_get("listenonion").and_then(|v| parse_bool(&v)))
+            .unwrap_or_else(|| torcontrol.is_some());
 
         let rpc_tls_bind = cli.rpctlsbind.or_else(|| file_get("rpctlsbind"));
         let rpc_tls_cert = cli
@@ -1649,6 +1693,10 @@ impl Config {
             limitancestorcount,
             limitdescendantcount,
             mempoolexpiry,
+            persistmempool: cli
+                .persistmempool
+                .or_else(|| file_get("persistmempool").and_then(|v| parse_bool(&v)))
+                .unwrap_or(true),
             permitbaremultisig,
             txindex,
             addressindex,
@@ -1723,9 +1771,20 @@ impl Config {
                 }
                 nodes
             },
+            seednode: {
+                let mut nodes = cli.seednode;
+                if nodes.is_empty() {
+                    nodes = file_get_all("seednode");
+                }
+                nodes
+            },
             dns: cli
                 .dns
                 .or_else(|| file_get("dns").and_then(|v| parse_bool(&v)))
+                .unwrap_or(true),
+            dnsseed: cli
+                .dnsseed
+                .or_else(|| file_get("dnsseed").and_then(|v| parse_bool(&v)))
                 .unwrap_or(true),
             bantime: cli
                 .bantime
@@ -1733,8 +1792,9 @@ impl Config {
                 .unwrap_or(86400),
             proxy: cli.proxy.or_else(|| file_get("proxy")),
             onion: cli.onion.or_else(|| file_get("onion")),
-            torcontrol: cli.torcontrol.or_else(|| file_get("torcontrol")),
+            torcontrol,
             torpassword: cli.torpassword.or_else(|| file_get("torpassword")),
+            listenonion,
             onlynet: {
                 let mut nets = cli.onlynet;
                 if nets.is_empty() {
@@ -1922,6 +1982,20 @@ impl Config {
                     .unwrap_or_else(|| "text".to_string());
                 LogFormat::parse(&raw).unwrap_or_default()
             },
+            debug: {
+                let mut v = cli.debug;
+                if v.is_empty() {
+                    v = file_get_all("debug");
+                }
+                v
+            },
+            debugexclude: {
+                let mut v = cli.debugexclude;
+                if v.is_empty() {
+                    v = file_get_all("debugexclude");
+                }
+                v
+            },
             profile,
             reorg_webhook: cli.reorg_webhook.or_else(|| file_get("reorgwebhook")),
             reorg_webhook_secret: cli
@@ -2004,14 +2078,17 @@ impl Config {
                 "max_inbound_per_ip": self.maxinboundperip,
                 "bind": self.bind,
                 "dns": self.dns,
+                "dnsseed": self.dnsseed,
                 "connect": self.connect,
                 "addnode": self.addnode,
+                "seednode": self.seednode,
             },
             "mempool": {
                 "max_bytes_mb": self.maxmempool,
                 "min_relay_tx_fee_sat_per_kvb": self.minrelaytxfee,
                 "full_rbf": self.mempoolfullrbf,
                 "expiry_hours": self.mempoolexpiry,
+                "persist": self.persistmempool,
             },
             "storage": {
                 "txindex": self.txindex,
@@ -2028,12 +2105,15 @@ impl Config {
                 LogFormat::Text => "text",
                 LogFormat::Json => "json",
             },
+            "debug": self.debug,
+            "debugexclude": self.debugexclude,
             "max_shutdown_secs": self.max_shutdown_secs,
             "tor": {
                 "proxy": self.proxy,
                 "onion": self.onion,
                 "control": self.torcontrol,
                 "password": if self.torpassword.is_some() { "(set)" } else { "(none)" },
+                "listenonion": self.listenonion,
             },
             "esplora": {
                 "enabled": self.esplora,
@@ -2395,6 +2475,16 @@ pub struct CliArgs {
     #[arg(
         long,
         value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
+        help = "Persist the mempool to mempool.dat across restarts (default: true)"
+    )]
+    pub persistmempool: Option<bool>,
+
+    #[arg(
+        long,
+        value_name = "BOOL",
         help = "Allow bare multisig outputs (default: true)"
     )]
     pub permitbaremultisig: Option<bool>,
@@ -2698,8 +2788,25 @@ pub struct CliArgs {
     )]
     pub addnode: Vec<String>,
 
+    #[arg(
+        long,
+        value_name = "ADDR",
+        help = "Connect to a node to retrieve peer addresses (repeatable). All networks."
+    )]
+    pub seednode: Vec<String>,
+
     #[arg(long, value_name = "BOOL", help = "Allow DNS seeding (default: true)")]
     pub dns: Option<bool>,
+
+    #[arg(
+        long,
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
+        help = "Query DNS seeds for peer addresses (default: true; requires -dns)"
+    )]
+    pub dnsseed: Option<bool>,
 
     #[arg(
         long,
@@ -2732,6 +2839,16 @@ pub struct CliArgs {
 
     #[arg(long, value_name = "PASS", help = "Tor control port password")]
     pub torpassword: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
+        help = "Create a Tor hidden service via the control port (default: off; an explicit -torcontrol implies on)"
+    )]
+    pub listenonion: Option<bool>,
 
     #[arg(
         long,
@@ -2946,6 +3063,22 @@ pub struct CliArgs {
 
     #[arg(
         long,
+        value_name = "CATEGORY",
+        num_args = 0..=1,
+        default_missing_value = "1",
+        help = "Enable debug logging for a category (repeatable; bare/'all'/'1' = everything)"
+    )]
+    pub debug: Vec<String>,
+
+    #[arg(
+        long,
+        value_name = "CATEGORY",
+        help = "Disable debug logging for a category that -debug would enable (repeatable)"
+    )]
+    pub debugexclude: Vec<String>,
+
+    #[arg(
+        long,
         help = "Emit structured error payloads (category, suggestion, debug) on RPC errors. Default: off (Core-compat)"
     )]
     pub rpcextendederrors: bool,
@@ -3141,6 +3274,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "limitancestorcount",
         "limitdescendantcount",
         "mempoolexpiry",
+        "persistmempool",
         "permitbaremultisig",
         "txindex",
         "addressindex",
@@ -3184,12 +3318,15 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "bind",
         "timeout",
         "addnode",
+        "seednode",
         "dns",
+        "dnsseed",
         "bantime",
         "proxy",
         "onion",
         "torcontrol",
         "torpassword",
+        "listenonion",
         "onlynet",
         "blockmaxweight",
         "blockmintxfee",
@@ -3210,6 +3347,8 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "rpcdefaultunits",
         "log-format",
         "logformat",
+        "debug",
+        "debugexclude",
         "profile",
         "reorg-webhook",
         "reorgwebhook",
@@ -3217,8 +3356,25 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "reorgwebhooksecret",
     ];
 
+    // Bitcoin Core negates a boolean option with a `-no` prefix
+    // (`-nolistenonion` == `-listenonion=0`). satd supports this for the
+    // value-accepting boolean flags this family added; comprehensive
+    // `-no` coverage across every boolean (incl. clap `SetTrue` flags
+    // like `-server`, which reject a value) is tracked in
+    // SATD_CLI_COMPAT_AUDIT.md.
+    const NEGATABLE_BOOL_FLAGS: &[&str] = &["listenonion", "dnsseed", "persistmempool"];
+
     args.into_iter()
         .map(|arg| {
+            // `-no<flag>` / `--no<flag>` negation (no explicit value).
+            if arg.starts_with('-') && !arg.contains('=') {
+                let stripped = arg.trim_start_matches('-');
+                if let Some(flag) = stripped.strip_prefix("no")
+                    && NEGATABLE_BOOL_FLAGS.contains(&flag)
+                {
+                    return format!("--{flag}=0");
+                }
+            }
             // Skip the binary name or already double-dashed args
             if !arg.starts_with('-') || arg.starts_with("--") {
                 return arg;
@@ -3283,20 +3439,34 @@ impl ConfigFile {
                 (trimmed.to_string(), "1".to_string())
             };
 
-            // Hard-error on Bitcoin Core keys we RECOGNISE but do not yet
-            // honour. Silently accepting them is the dangerous case the
+            // Hard-error on Bitcoin Core keys we RECOGNISE but do not
+            // accept. Silently accepting them is the dangerous case the
             // strict parser exists to prevent: e.g. `includeconf` would
             // make a config look valid while every setting in the
-            // included file is silently dropped. Better to fail loudly
-            // than to run with a security-sensitive option ignored.
-            if is_recognized_unsupported_key(&key) {
-                return Err(format!(
-                    "Error reading configuration file: parse error on line {line_no}: \
-                    '{key}' is a Bitcoin Core option that satd recognises but does NOT \
-                    yet implement, so honouring this line would silently drop its \
-                    effect. Remove it (or track its support in \
-                    SATD_CLI_COMPAT_AUDIT.md) before starting satd."
-                ));
+            // included file is silently dropped. The message differs by
+            // reason so the operator knows whether to wait for support
+            // (not-yet-implemented) or remove the line for good
+            // (intentionally-excluded).
+            match classify_unsupported_key(&key) {
+                Some(UnsupportedKey::NotYetImplemented) => {
+                    return Err(format!(
+                        "Error reading configuration file: parse error on line {line_no}: \
+                        '{key}' is a Bitcoin Core option that satd recognises but does NOT \
+                        yet implement, so honouring this line would silently drop its \
+                        effect. Remove it for now — its support is tracked in \
+                        SATD_CLI_COMPAT_AUDIT.md — before starting satd."
+                    ));
+                }
+                Some(UnsupportedKey::IntentionallyExcluded) => {
+                    return Err(format!(
+                        "Error reading configuration file: parse error on line {line_no}: \
+                        '{key}' is a Bitcoin Core option that satd intentionally does NOT \
+                        support (deprecated upstream or out of scope — see \
+                        CORE_DIFFERENCES.md and SATD_CLI_COMPAT_AUDIT.md). Remove this \
+                        line before starting satd."
+                    ));
+                }
+                None => {}
             }
 
             // Reject unrecognised keys with a Core-style line-numbered
@@ -3351,6 +3521,8 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "daemon",
     "server",
     "logformat",
+    "debug",
+    "debugexclude",
     "maxshutdownsecs",
     // RPC server
     "rpcport",
@@ -3378,9 +3550,11 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "bind",
     "connect",
     "addnode",
+    "seednode",
     "maxconnections",
     "maxinboundperip",
     "dns",
+    "dnsseed",
     "bantime",
     "timeout",
     "onlynet",
@@ -3390,6 +3564,7 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "onion",
     "torcontrol",
     "torpassword",
+    "listenonion",
     // Consensus
     "assumevalid",
     "assumevalidage",
@@ -3411,6 +3586,7 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "limitancestorcount",
     "limitdescendantcount",
     "mempoolexpiry",
+    "persistmempool",
     "permitbaremultisig",
     // Esplora
     "esplora",
@@ -3494,16 +3670,56 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "metricsbind",
 ];
 
-/// Bitcoin Core config keys satd RECOGNISES but does not yet implement.
+/// Why a recognised Bitcoin Core key is rejected rather than honoured.
+/// Drives the parse-time error message so the operator gets an
+/// actionable reason instead of a generic "unknown key".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnsupportedKey {
+    /// A real Core feature satd intends to support but hasn't built
+    /// yet. The operator should remove the line for now; support is
+    /// tracked in `SATD_CLI_COMPAT_AUDIT.md`.
+    NotYetImplemented,
+    /// A Core feature satd will not implement — deprecated upstream or
+    /// deliberately out of scope. The operator should remove the line
+    /// permanently. See `CORE_DIFFERENCES.md`.
+    IntentionallyExcluded,
+}
+
+/// Bitcoin Core config keys satd RECOGNISES but has not yet implemented.
 /// These hard-error at parse time instead of being silently accepted:
 /// an accepted-but-ignored option lets a config look valid while its
 /// effect is dropped. `includeconf` is the marquee hazard — operators
 /// routinely move security-sensitive options into an included file, so
 /// silently ignoring it could run a node wide open. When a key here
 /// gains real support, move it into [`KNOWN_CONFIG_KEYS`].
-const RECOGNIZED_UNSUPPORTED_KEYS: &[&str] = &[
+const NOT_YET_IMPLEMENTED_KEYS: &[&str] = &[
     "includeconf",     // recursive config inclusion (audit: PR-2b)
     "signetchallenge", // custom signet challenge script (audit: PR-2b)
+    "maxuploadtarget", // upload bandwidth cap + serving limits
+    "whitelist",       // NetPermissionFlags by IP / subnet
+    "whitebind",       // NetPermissionFlags by bind address
+    "blocksonly",      // suppress transaction relay
+    "externalip",      // advertise an external address to peers
+    "asmap",           // ASN-based addrman bucketing (eclipse resistance)
+    // The two below need machinery satd lacks today (persistent
+    // addrman / a compiled-in fixed-IP seed list). satd seeds at every
+    // startup and has no fixed-IP seed list, so neither flag has a
+    // distinct effect to attach to — defer rather than accept-and-ignore.
+    "forcednsseed", // always query DNS seeds even when addrman is full
+    "fixedseeds",   // fall back to the compiled-in fixed-IP seed list
+];
+
+/// Bitcoin Core config keys satd RECOGNISES but will NOT implement —
+/// either deprecated upstream or deliberately out of scope (see
+/// `CORE_DIFFERENCES.md` "Intentional exclusions"). Hard-error so a
+/// migrated config fails loudly with a clear reason rather than a
+/// confusing "unknown key", but unlike [`NOT_YET_IMPLEMENTED_KEYS`]
+/// these will never move into [`KNOWN_CONFIG_KEYS`].
+const INTENTIONALLY_EXCLUDED_KEYS: &[&str] = &[
+    "upnp",              // UPnP port mapping — deprecated in Core
+    "natpmp",            // NAT-PMP port mapping — deprecated in Core
+    "i2psam",            // I2P SAM proxy — Tor is satd's supported anonymity net
+    "i2pacceptincoming", // I2P inbound — out of scope (see i2psam)
 ];
 
 /// Is the given config-file key recognised? Returns true for any
@@ -3513,12 +3729,79 @@ pub fn is_known_config_key(key: &str) -> bool {
     KNOWN_CONFIG_KEYS.contains(&key)
 }
 
-/// Is `key` a Bitcoin Core option satd recognises but has not yet
-/// implemented? Such keys hard-error rather than being silently
-/// accepted. See [`RECOGNIZED_UNSUPPORTED_KEYS`].
-pub fn is_recognized_unsupported_key(key: &str) -> bool {
-    RECOGNIZED_UNSUPPORTED_KEYS.contains(&key)
+/// Classify a Core key that satd recognises but does not accept.
+/// Returns `None` for keys that are not in either unsupported list
+/// (i.e. genuinely unknown, or actually supported).
+pub fn classify_unsupported_key(key: &str) -> Option<UnsupportedKey> {
+    if NOT_YET_IMPLEMENTED_KEYS.contains(&key) {
+        Some(UnsupportedKey::NotYetImplemented)
+    } else if INTENTIONALLY_EXCLUDED_KEYS.contains(&key) {
+        Some(UnsupportedKey::IntentionallyExcluded)
+    } else {
+        None
+    }
 }
+
+/// Map a Bitcoin Core `-debug` category to the satd `tracing` target
+/// prefix it controls. Core's categories don't correspond 1:1 to Rust
+/// module paths, so this is a best-effort grouping onto satd's
+/// subsystems. Returns `None` for categories satd has no equivalent
+/// for (e.g. `qt`, `zmq`, `walletdb`, `leveldb`) — those are accepted
+/// but produce no directive, matching the spirit of Core where a
+/// category for an inactive subsystem simply yields no extra output.
+fn debug_category_target(category: &str) -> Option<&'static str> {
+    match category {
+        "net" | "addrman" | "cmpctblock" | "txreconciliation" | "proxy" => Some("node::net"),
+        "tor" | "i2p" => Some("node::net::tor"),
+        "mempool" | "mempoolrej" | "estimatefee" | "txpackages" => Some("node::mempool"),
+        "rpc" | "http" => Some("node::rpc"),
+        "validation" | "bench" => Some("node::validation"),
+        "coindb" | "blockstorage" | "leveldb" | "prune" | "reindex" => Some("node::storage"),
+        _ => None,
+    }
+}
+
+/// Translate Bitcoin Core `-debug` / `-debugexclude` categories into
+/// `tracing_subscriber` `EnvFilter` directives layered on the base
+/// filter. Returns `(enable_all, directives)`:
+///
+/// - `enable_all` is true when any `-debug` value is `1` or `all` — the
+///   caller should base the filter on `debug` rather than `info`.
+/// - `directives` are per-target overrides to add: `target=debug` for
+///   each included subsystem (when not enabling all), or `target=info`
+///   for each excluded subsystem (when enabling all, to claw it back).
+///
+/// Categories with no satd subsystem (see [`debug_category_target`])
+/// are silently dropped from the directive set.
+pub fn debug_directives(debug: &[String], debugexclude: &[String]) -> (bool, Vec<String>) {
+    let norm = |s: &str| s.trim().to_ascii_lowercase();
+    let enable_all = debug.iter().any(|c| matches!(norm(c).as_str(), "1" | "all"));
+
+    let excluded: std::collections::BTreeSet<&'static str> = debugexclude
+        .iter()
+        .filter_map(|c| debug_category_target(&norm(c)))
+        .collect();
+
+    let mut directives = Vec::new();
+    if enable_all {
+        for t in &excluded {
+            directives.push(format!("{t}=info"));
+        }
+    } else {
+        let mut included: std::collections::BTreeSet<&'static str> = debug
+            .iter()
+            .filter_map(|c| debug_category_target(&norm(c)))
+            .collect();
+        for t in &excluded {
+            included.remove(t);
+        }
+        for t in &included {
+            directives.push(format!("{t}=debug"));
+        }
+    }
+    (enable_all, directives)
+}
+
 
 fn default_datadir() -> PathBuf {
     dirs_home().join(".bitcoin")
@@ -3826,6 +4109,7 @@ rpcport=8332
             limitancestorcount: None,
             limitdescendantcount: None,
             mempoolexpiry: None,
+            persistmempool: None,
             permitbaremultisig: None,
             txindex: false,
             addressindex: None,
@@ -3871,7 +4155,9 @@ rpcport=8332
             bind: None,
             timeout: None,
             addnode: vec![],
+            seednode: vec![],
             dns: None,
+            dnsseed: None,
             bantime: None,
             blockmaxweight: None,
             blockmintxfee: None,
@@ -3885,6 +4171,7 @@ rpcport=8332
             onion: None,
             torcontrol: None,
             torpassword: None,
+            listenonion: None,
             onlynet: vec![],
             mcp: false,
             mcpstdio: None,
@@ -3911,6 +4198,8 @@ rpcport=8332
             maxshutdownsecs: None,
             rpcdefaultunits: None,
             log_format: None,
+            debug: vec![],
+            debugexclude: vec![],
             profile: None,
             reorg_webhook: None,
             reorg_webhook_secret: None,
@@ -4019,6 +4308,7 @@ rpcport=8332
             limitancestorcount: None,
             limitdescendantcount: None,
             mempoolexpiry: None,
+            persistmempool: None,
             permitbaremultisig: None,
             txindex: false,
             addressindex: None,
@@ -4064,7 +4354,9 @@ rpcport=8332
             bind: None,
             timeout: None,
             addnode: vec![],
+            seednode: vec![],
             dns: None,
+            dnsseed: None,
             bantime: None,
             blockmaxweight: None,
             blockmintxfee: None,
@@ -4078,6 +4370,7 @@ rpcport=8332
             onion: None,
             torcontrol: None,
             torpassword: None,
+            listenonion: None,
             onlynet: vec![],
             mcp: false,
             mcpstdio: None,
@@ -4104,6 +4397,8 @@ rpcport=8332
             maxshutdownsecs: None,
             rpcdefaultunits: None,
             log_format: None,
+            debug: vec![],
+            debugexclude: vec![],
             profile: None,
             reorg_webhook: None,
             reorg_webhook_secret: None,
@@ -5027,23 +5322,63 @@ notarealkey=1
     }
 
     #[test]
-    fn recognized_unsupported_keys_hard_error() {
-        // includeconf / signetchallenge are Core keys we recognise but
-        // do NOT implement. They must hard-error (not be silently
-        // accepted), and must NOT be in the plain known-keys allowlist.
-        for k in ["includeconf", "signetchallenge"] {
-            assert!(
-                is_recognized_unsupported_key(k),
-                "{k:?} should be a recognised-unsupported key"
+    fn not_yet_implemented_keys_hard_error() {
+        // Core keys we recognise but have not built yet. They must
+        // hard-error (not be silently accepted), classify as
+        // NotYetImplemented, and NOT be in the plain known-keys
+        // allowlist.
+        for k in [
+            "includeconf",
+            "signetchallenge",
+            "maxuploadtarget",
+            "whitelist",
+            "whitebind",
+            "blocksonly",
+            "externalip",
+            "asmap",
+            "forcednsseed",
+            "fixedseeds",
+        ] {
+            assert_eq!(
+                classify_unsupported_key(k),
+                Some(UnsupportedKey::NotYetImplemented),
+                "{k:?} should classify as NotYetImplemented"
             );
             assert!(
                 !is_known_config_key(k),
                 "{k:?} must not be in the implemented allowlist"
             );
-            let err = ConfigFile::parse(&format!("{k}=/some/value")).unwrap_err();
+            let err = ConfigFile::parse(&format!("{k}=1")).unwrap_err();
             assert!(
-                err.contains("recognises but does NOT") && err.contains(k),
-                "expected a recognised-unsupported error for {k:?}, got: {err}"
+                err.contains("recognises but does NOT")
+                    && err.contains("SATD_CLI_COMPAT_AUDIT.md")
+                    && err.contains(k),
+                "expected a not-yet-implemented error for {k:?}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn intentionally_excluded_keys_hard_error() {
+        // Core keys satd will never implement (deprecated upstream or
+        // out of scope). They hard-error with a distinct message that
+        // tells the operator to remove the line permanently.
+        for k in ["upnp", "natpmp", "i2psam", "i2pacceptincoming"] {
+            assert_eq!(
+                classify_unsupported_key(k),
+                Some(UnsupportedKey::IntentionallyExcluded),
+                "{k:?} should classify as IntentionallyExcluded"
+            );
+            assert!(
+                !is_known_config_key(k),
+                "{k:?} must not be in the implemented allowlist"
+            );
+            let err = ConfigFile::parse(&format!("{k}=1")).unwrap_err();
+            assert!(
+                err.contains("intentionally does NOT support")
+                    && err.contains("CORE_DIFFERENCES.md")
+                    && err.contains(k),
+                "expected an intentionally-excluded error for {k:?}, got: {err}"
             );
         }
     }
@@ -5115,5 +5450,195 @@ notarealkey=1
             err.contains("SATD_CLI_COMPAT_AUDIT.md"),
             "expected audit doc reference, got: {err}"
         );
+    }
+
+    // ---- config-migration completeness: listenonion / seeds / debug /
+    //      persistmempool ----
+
+    #[test]
+    fn listenonion_defaults_off() {
+        let cli =
+            CliArgs::try_parse_from(["satd", "--regtest", "--datadir=/tmp/satd-lo-1"]).unwrap();
+        assert!(!Config::from_cli(cli).unwrap().listenonion);
+    }
+
+    #[test]
+    fn listenonion_torcontrol_implies_on() {
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-lo-2",
+            "--torcontrol=127.0.0.1:9051",
+        ])
+        .unwrap();
+        assert!(Config::from_cli(cli).unwrap().listenonion);
+    }
+
+    #[test]
+    fn listenonion_explicit_off_overrides_torcontrol() {
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-lo-3",
+            "--torcontrol=127.0.0.1:9051",
+            "--listenonion=0",
+        ])
+        .unwrap();
+        assert!(!Config::from_cli(cli).unwrap().listenonion);
+    }
+
+    #[test]
+    fn listenonion_explicit_on_without_torcontrol() {
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-lo-4",
+            "--listenonion=1",
+        ])
+        .unwrap();
+        let cfg = Config::from_cli(cli).unwrap();
+        assert!(cfg.listenonion);
+        assert!(cfg.torcontrol.is_none());
+    }
+
+    #[test]
+    fn dnsseed_defaults_true_and_parses_false() {
+        let cli =
+            CliArgs::try_parse_from(["satd", "--regtest", "--datadir=/tmp/satd-ds-1"]).unwrap();
+        assert!(Config::from_cli(cli).unwrap().dnsseed);
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-ds-2",
+            "--dnsseed=0",
+        ])
+        .unwrap();
+        assert!(!Config::from_cli(cli).unwrap().dnsseed);
+    }
+
+    #[test]
+    fn seednode_collects_repeated_values() {
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-sn-1",
+            "--seednode=1.2.3.4:8333",
+            "--seednode=5.6.7.8",
+        ])
+        .unwrap();
+        let cfg = Config::from_cli(cli).unwrap();
+        assert_eq!(cfg.seednode, vec!["1.2.3.4:8333", "5.6.7.8"]);
+    }
+
+    #[test]
+    fn persistmempool_defaults_on_and_parses_off() {
+        let cli =
+            CliArgs::try_parse_from(["satd", "--regtest", "--datadir=/tmp/satd-pm-1"]).unwrap();
+        assert!(Config::from_cli(cli).unwrap().persistmempool);
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-pm-2",
+            "--persistmempool=0",
+        ])
+        .unwrap();
+        assert!(!Config::from_cli(cli).unwrap().persistmempool);
+    }
+
+    #[test]
+    fn debug_directives_maps_known_categories() {
+        let (all, dirs) =
+            debug_directives(&["net".to_string(), "mempool".to_string()], &[]);
+        assert!(!all);
+        assert!(dirs.contains(&"node::net=debug".to_string()));
+        assert!(dirs.contains(&"node::mempool=debug".to_string()));
+    }
+
+    #[test]
+    fn debug_directives_all_enables_and_exclude_claws_back() {
+        let (all, dirs) = debug_directives(&["all".to_string()], &["net".to_string()]);
+        assert!(all);
+        assert!(dirs.contains(&"node::net=info".to_string()));
+    }
+
+    #[test]
+    fn debug_directives_unknown_category_is_noop() {
+        let (all, dirs) = debug_directives(&["qt".to_string(), "zmq".to_string()], &[]);
+        assert!(!all);
+        assert!(dirs.is_empty());
+    }
+
+    #[test]
+    fn debug_directives_exclude_removes_included_target() {
+        let (_all, dirs) = debug_directives(&["net".to_string()], &["net".to_string()]);
+        assert!(dirs.is_empty());
+    }
+
+    // ---- H1: raw Core-style single-dash + bare + -no invocations ----
+
+    fn parse_raw(args: &[&str]) -> Config {
+        let argv = normalize_args(args.iter().map(|s| s.to_string()).collect());
+        let cli = CliArgs::try_parse_from(argv).expect("clap parse");
+        Config::from_cli(cli).expect("config build")
+    }
+
+    #[test]
+    fn bare_single_dash_listenonion_parses_true() {
+        // `satd -listenonion` (Core-style bare boolean) must enable it,
+        // not error with "a value is required".
+        let cfg = parse_raw(&["satd", "-regtest", "-listenonion", "-datadir=/tmp/satd-h1-1"]);
+        assert!(cfg.listenonion);
+    }
+
+    #[test]
+    fn bare_single_dash_dnsseed_and_persistmempool_parse_true() {
+        let cfg = parse_raw(&[
+            "satd",
+            "-regtest",
+            "-dnsseed",
+            "-persistmempool",
+            "-datadir=/tmp/satd-h1-2",
+        ]);
+        assert!(cfg.dnsseed);
+        assert!(cfg.persistmempool);
+    }
+
+    #[test]
+    fn bare_single_dash_debug_means_all() {
+        let cfg = parse_raw(&["satd", "-regtest", "-debug", "-datadir=/tmp/satd-h1-3"]);
+        let (enable_all, _) = debug_directives(&cfg.debug, &cfg.debugexclude);
+        assert!(enable_all, "bare -debug should enable all categories");
+    }
+
+    #[test]
+    fn no_prefix_negates_boolean_flags() {
+        // `-nolistenonion` / `-nodnsseed` / `-nopersistmempool` map to
+        // `--flag=0`. -nolistenonion must even override the
+        // torcontrol-implies-on rule.
+        let cfg = parse_raw(&[
+            "satd",
+            "-regtest",
+            "-torcontrol=127.0.0.1:9051",
+            "-nolistenonion",
+            "-nodnsseed",
+            "-nopersistmempool",
+            "-datadir=/tmp/satd-h1-4",
+        ]);
+        assert!(!cfg.listenonion);
+        assert!(!cfg.dnsseed);
+        assert!(!cfg.persistmempool);
+    }
+
+    #[test]
+    fn valued_single_dash_forms_still_work() {
+        let cfg = parse_raw(&[
+            "satd",
+            "-regtest",
+            "-listenonion=1",
+            "-dnsseed=0",
+            "-datadir=/tmp/satd-h1-5",
+        ]);
+        assert!(cfg.listenonion);
+        assert!(!cfg.dnsseed);
     }
 }

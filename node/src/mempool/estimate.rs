@@ -92,8 +92,10 @@ const HISTOGRAM_BOUNDARIES_SAT_PER_VB: &[u64] = &[
 ];
 
 /// Effective (post-prioritisation) fee of an entry, clamped at zero.
+/// Saturating add: `fee_delta` may be an extreme value from a corrupt
+/// persisted mempool, and must not overflow the i64 sum.
 fn effective_fee(entry: &MempoolEntry) -> u64 {
-    (entry.fee as i64 + entry.fee_delta).max(0) as u64
+    (entry.fee as i64).saturating_add(entry.fee_delta).max(0) as u64
 }
 
 /// Compute the set of in-mempool ancestor txids for `txid`, memoized.

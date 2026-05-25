@@ -44,9 +44,12 @@ pub fn create_template(chain_state: &ChainState, mempool: &Mempool) -> BlockTemp
     // Select transactions from mempool by effective fee rate (includes fee_delta)
     let mut entries = mempool.get_all_entries();
     entries.sort_by(|a, b| {
-        let eff_a = (a.1.fee as i64 + a.1.fee_delta).max(0) as u64 * 1000
+        // Saturating add: a corrupt persisted mempool could carry an
+        // extreme fee_delta; it must not overflow the effective-fee sum
+        // (which would mis-order block-template selection).
+        let eff_a = (a.1.fee as i64).saturating_add(a.1.fee_delta).max(0) as u64 * 1000
             / a.1.weight.max(1) as u64;
-        let eff_b = (b.1.fee as i64 + b.1.fee_delta).max(0) as u64 * 1000
+        let eff_b = (b.1.fee as i64).saturating_add(b.1.fee_delta).max(0) as u64 * 1000
             / b.1.weight.max(1) as u64;
         eff_b.cmp(&eff_a)
     });

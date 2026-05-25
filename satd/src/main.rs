@@ -54,8 +54,31 @@ async fn main() {
         }
     };
 
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    // Base log filter. With no -debug/-debugexclude flags this is the
+    // historical behavior (RUST_LOG if set, else "info"). When -debug
+    // flags are present we layer Core's category directives on top: an
+    // explicit RUST_LOG still wins as the base (developer override),
+    // otherwise the base is "debug" for -debug=all/1 else "info", and
+    // each mapped category is added as a `target=debug` directive
+    // (`target=info` claws back -debugexclude under -debug=all).
+    let (debug_all, debug_directives) =
+        config::debug_directives(&config.debug, &config.debugexclude);
+    let debug_flags_given = !config.debug.is_empty() || !config.debugexclude.is_empty();
+    let mut env_filter = if !debug_flags_given {
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+    } else {
+        match std::env::var("RUST_LOG") {
+            Ok(rl) if !rl.trim().is_empty() => tracing_subscriber::EnvFilter::new(rl),
+            _ => tracing_subscriber::EnvFilter::new(if debug_all { "debug" } else { "info" }),
+        }
+    };
+    for d in &debug_directives {
+        match d.parse() {
+            Ok(directive) => env_filter = env_filter.add_directive(directive),
+            Err(e) => eprintln!("Warning: ignoring invalid debug directive {d:?}: {e}"),
+        }
+    }
     match config.log_format {
         config::LogFormat::Json => {
             // Stable JSON shape: `timestamp`, `level`, `target`,
@@ -861,9 +884,14 @@ async fn main() {
         );
     }
 
-    // Start Tor hidden service if -torcontrol is set
+    // Start a Tor hidden service when -listenonion is on. The control
+    // port address comes from -torcontrol, defaulting to Bitcoin Core's
+    // 127.0.0.1:9051 when unset. `Config::load` resolves listenonion:
+    // off by default, implicitly on when -torcontrol is set (the legacy
+    // satd trigger), and forced off by an explicit -listenonion=0.
     let mut _onion_addr: Option<String> = None;
-    if let Some(ref torcontrol) = config.torcontrol {
+    if config.listenonion {
+        let torcontrol = config.torcontrol.as_deref().unwrap_or("127.0.0.1:9051");
         match node::net::tor::TorController::connect(torcontrol).await {
             Ok(mut controller) => {
                 let password = config.torpassword.as_deref().unwrap_or("");
@@ -1733,8 +1761,35 @@ async fn main() {
         }
     }
 
-    // DNS seeding: only if no explicit --connect peers and --dns is enabled
-    if config.connect.is_empty() && config.dns {
+    // -seednode: operator-supplied bootstrap peers (Bitcoin Core's
+    // `-seednode`, repeatable, all networks). Connected at startup like
+    // addnode. (Core disconnects after pulling addresses; satd keeps the
+    // connection — a harmless superset for bootstrap purposes.) These
+    // apply regardless of -dnsseed so an operator can bootstrap with
+    // dnsseed=0. Resolved through the shared operator-seed resolver so
+    // Core-style hostnames and port-less entries (`seed.example.com`,
+    // `1.2.3.4`) get the network default port instead of being rejected.
+    if !config.seednode.is_empty() {
+        let seed_addrs = node::net::dns::resolve_operator_seeds(
+            &config.seednode,
+            config.network,
+            config.proxy.as_deref(),
+        )
+        .await;
+        for addr in seed_addrs {
+            peer_manager.add_peer_addr(addr.clone());
+            let pm = peer_manager.clone();
+            tokio::spawn(async move {
+                if let Err(e) = pm.connect_peer_addr(&addr).await {
+                    tracing::warn!(%addr, "seednode connection failed: {}", e);
+                }
+            });
+        }
+    }
+
+    // DNS seeding: only if no explicit --connect peers and both -dns
+    // (hostname resolution) and -dnsseed (query DNS seeds) are enabled.
+    if config.connect.is_empty() && config.dns && config.dnsseed {
         let seed_addrs = node::net::dns::resolve_seeds_with(
             config.network,
             config.proxy.as_deref(),
@@ -1750,6 +1805,31 @@ async fn main() {
                     tracing::warn!(%addr, "Seed peer connection failed: {}", e);
                 }
             });
+        }
+    }
+
+    // -persistmempool: re-admit the mempool persisted at the previous
+    // clean shutdown. Done here — after the address-index task is live
+    // (so re-admission Enter events are observed) and before the P2P
+    // loop starts accepting new transactions. Each tx is re-validated
+    // against the current chainstate by `accept_transaction`; ones that
+    // have since confirmed or become invalid are silently dropped.
+    if config.persistmempool {
+        match node::mempool::persist::load_mempool(
+            mempool.as_ref(),
+            &chain_state,
+            chain_state.script_verifier(),
+            &net_datadir,
+        ) {
+            Ok(stats) if stats.accepted > 0 || stats.skipped > 0 => {
+                tracing::info!(
+                    accepted = stats.accepted,
+                    skipped = stats.skipped,
+                    "Re-admitted persisted mempool from mempool.dat"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "Failed to load persisted mempool"),
         }
     }
 
@@ -1954,6 +2034,16 @@ async fn main() {
             tracing::warn!(error = %e, "Failed to write clean-shutdown marker");
         } else {
             tracing::info!(tip_height, "Wrote clean-shutdown marker");
+        }
+    }
+
+    // -persistmempool: dump the mempool so the next start can re-admit
+    // it. Only on a clean shutdown — a dirty exit's mempool may be
+    // inconsistent with the (unflushed) chainstate.
+    if config.persistmempool && flushed_ok {
+        match node::mempool::persist::dump_mempool(mempool.as_ref(), &net_datadir) {
+            Ok(n) => tracing::info!(count = n, "Persisted mempool to mempool.dat"),
+            Err(e) => tracing::warn!(error = %e, "Failed to persist mempool"),
         }
     }
 

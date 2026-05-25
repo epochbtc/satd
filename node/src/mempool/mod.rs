@@ -3,5 +3,6 @@ pub mod events;
 pub mod fee;
 pub mod history;
 pub mod orphanage;
+pub mod persist;
 pub mod policy;
 pub mod pool;
