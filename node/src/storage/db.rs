@@ -211,11 +211,25 @@ impl Store for InMemoryStore {
     fn for_each_coin_snapshot(
         &self,
         f: &mut dyn FnMut(&OutPoint, &Coin) -> Result<(), StoreError>,
-    ) -> Result<u64, StoreError> {
+    ) -> Result<crate::storage::CoinSnapshotBase, StoreError> {
+        // Capture the base and the coins under the same coins read lock so
+        // the in-memory backend matches the RocksDB snapshot's consistency
+        // guarantee (tests rely on the base matching the iterated coins).
+        let coins = self.coins.read();
+        let base_hash = self.tip.read().unwrap_or_else(|| {
+            use bitcoin::hashes::Hash;
+            BlockHash::all_zeros()
+        });
+        let base_height = self
+            .block_index
+            .read()
+            .get(&base_hash)
+            .map(|e| e.height)
+            .unwrap_or(0);
+        let coin_count = coins.len() as u64;
         // For deterministic iteration order (matching Core's key sort),
         // collect into a sorted vector before yielding. Tests use this
         // backend so consistency with the RocksDB path matters.
-        let coins = self.coins.read();
         let mut entries: Vec<(OutPoint, Coin)> = coins
             .iter()
             .map(|(op, c)| (*op, c.clone()))
@@ -226,12 +240,17 @@ impl Store for InMemoryStore {
             let bk = crate::storage::coinview::outpoint_to_key(b);
             ak.cmp(&bk)
         });
-        let mut written = 0u64;
+        let mut coins_written = 0u64;
         for (op, coin) in &entries {
             f(op, coin)?;
-            written += 1;
+            coins_written += 1;
         }
-        Ok(written)
+        Ok(crate::storage::CoinSnapshotBase {
+            base_hash,
+            base_height,
+            coin_count,
+            coins_written,
+        })
     }
 
     fn coin_total_amount(&self) -> u64 {

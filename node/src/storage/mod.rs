@@ -22,6 +22,32 @@ use crate::storage::blockindex::BlockIndexEntry;
 use crate::storage::coinview::Coin;
 use crate::storage::undo::UndoData;
 
+/// Self-consistent base captured during [`Store::for_each_coin_snapshot`].
+///
+/// All four fields are read from the **same** point-in-time view as the
+/// coin iteration (for RocksDB, one `Snapshot` across every column
+/// family). Because each chainstate commit writes the tip pointer, the
+/// UTXO-count metadata, and the coin rows in a single atomic
+/// `WriteBatch`, a single snapshot always observes a consistent
+/// `(base_hash, base_height, coin_count)` triple together with the coins
+/// it iterates — even if block connection commits concurrently. Callers
+/// must therefore take `base_hash`/`base_height` from here, never from a
+/// separately-locked in-memory tip, or the snapshot's advertised base
+/// can drift from its contents.
+#[derive(Debug, Clone, Copy)]
+pub struct CoinSnapshotBase {
+    /// Block hash the snapshot's UTXO set corresponds to.
+    pub base_hash: BlockHash,
+    /// Height of `base_hash`.
+    pub base_height: u32,
+    /// UTXO count recorded in metadata at the snapshot point-in-time.
+    pub coin_count: u64,
+    /// Coins actually yielded by the iteration. Equals `coin_count`
+    /// unless the chainstate is corrupt (both are from the same view,
+    /// so a mismatch is no longer a benign race).
+    pub coins_written: u64,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("database error: {0}")]
@@ -334,13 +360,21 @@ pub trait Store: Send + Sync {
     /// in-memory caches (e.g. `CoinCache::flush`) before calling, so
     /// that pending writes are visible to the snapshot.
     ///
+    /// Returns a [`CoinSnapshotBase`] whose `base_hash`/`base_height`/
+    /// `coin_count` are read from the **same** point-in-time view as the
+    /// iteration. `dumptxoutset` must use that base for the snapshot
+    /// header rather than the in-memory chain tip: block connection
+    /// commits the coin batch before publishing the in-memory tip, so a
+    /// base read from the in-memory tip can name a different block than
+    /// the coins the snapshot actually contains.
+    ///
     /// Used by `dumptxoutset` to emit AssumeUTXO snapshot files. The
     /// closure receives borrowed references so backends don't have to
     /// heap-allocate per coin.
     fn for_each_coin_snapshot(
         &self,
         f: &mut dyn FnMut(&OutPoint, &Coin) -> Result<(), StoreError>,
-    ) -> Result<u64, StoreError>;
+    ) -> Result<CoinSnapshotBase, StoreError>;
 
     /// Live-resize the block cache (e.g. RocksDB's shared LRU). Called by
     /// the adaptive-dbcache controller. Default: no-op for backends without

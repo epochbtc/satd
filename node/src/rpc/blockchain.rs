@@ -715,9 +715,13 @@ pub fn save_mempool() -> Value {
 /// Returns a JSON object matching Core's shape:
 ///   `{coins_written, base_hash, base_height, path, txoutset_hash}`.
 ///
-/// `txoutset_hash` is the SHA-256 of the file contents — operators
-/// compare this against Core's `m_assumeutxo_data.assumeutxo_hash`
-/// value to confirm format compatibility.
+/// `txoutset_hash` is Core's `hash_serialized_3` UTXO-set hash, NOT the
+/// SHA-256 of the file. It is the double SHA-256 (`HashWriter::GetHash`)
+/// over each coin's `TxOutSer` contribution in Core iteration order,
+/// shown byte-reversed (uint256 display form). Operators compare it
+/// against the height's `hash_serialized` in Core's
+/// `m_assumeutxo_data` / `chain::assumeutxo`; `sha256sum` of the file
+/// is unrelated and will not match.
 pub fn dump_txout_set(chain_state: &ChainState, path: &str) -> Result<Value, (i32, String)> {
     use crate::chain::state::DumpError;
     use std::path::PathBuf;

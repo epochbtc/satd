@@ -588,19 +588,20 @@ impl ChainState {
     /// dumptxoutset` and can be loaded into either Core or satd via
     /// `loadtxoutset` (once that RPC lands in PR 5/5).
     ///
-    /// Holds the tip read lock for the duration of the dump so the
-    /// snapshot is consistent (no block-connect can occur). Operators
-    /// should expect block processing to pause for the duration —
-    /// matching Core's behavior.
+    /// The snapshot does not pause block processing. Instead, the base
+    /// block, height, coin count and coin rows are all read from one
+    /// RocksDB point-in-time snapshot inside `for_each_coin_snapshot`,
+    /// which is internally consistent even if blocks connect during the
+    /// dump (every chainstate commit is one atomic `WriteBatch`).
     ///
     /// Refuses to overwrite an existing file at `path` (matching Core).
     pub fn dump_utxo_snapshot(&self, path: &Path) -> Result<DumpSummary, DumpError> {
-        // Refuse to clobber an existing dump at the final path (matches
-        // Core). Note: this is TOCTOU-racy against another process
-        // creating the path between this check and the final rename,
-        // but `dumptxoutset` is an operator-issued RPC with no
-        // concurrent-call expectation, and the rename target check is
-        // re-done atomically below via `create_new` on the temp path.
+        // Early refusal to clobber an existing dump at the final path
+        // (matches Core, and gives a clean error before doing any work).
+        // This check is advisory only: it races a concurrent creator,
+        // so the *authoritative* no-overwrite guarantee is enforced at
+        // finalization time by `finalize_dump_path`, which links the
+        // temp file to the target without replacing an existing file.
         if path.exists() {
             return Err(DumpError::RefuseOverwrite(path.to_path_buf()));
         }
@@ -631,8 +632,9 @@ impl ChainState {
 
         match result {
             Ok(summary) => {
-                // Success: don't delete the temp file (we already
-                // renamed it inside the inner fn). Disarm the guard.
+                // Success: the inner fn already moved the temp file to
+                // the final path via `finalize_dump_path`, so there's no
+                // `.incomplete` corpse to clean up. Disarm the guard.
                 guard.disarm();
                 Ok(summary)
             }
@@ -652,29 +654,35 @@ impl ChainState {
     ) -> Result<DumpSummary, DumpError> {
         use crate::storage::compressed_coin as cc;
 
-        // Hold the tip read lock for the entire dump: writers block on
-        // the corresponding write lock, so the UTXO set is frozen.
-        let tip_guard = self.tip.read();
-        let base_hash = tip_guard.hash;
-        let base_height = tip_guard.height;
-
         // Flush coin-cache dirty entries into the inner Store before
         // iterating, so the Store's snapshot sees every committed write.
         self.flush_coin_cache()?;
 
-        let coins_count = self.store.coin_count();
-        let meta = cc::SnapshotMetadata {
-            version: cc::SNAPSHOT_VERSION,
-            network_magic: network_magic(self.network),
-            base_blockhash: base_hash,
-            coins_count,
-        };
-
+        // The snapshot's base block, height and coin count are read by
+        // `for_each_coin_snapshot` from the SAME RocksDB point-in-time
+        // view as the coins themselves (see `CoinSnapshotBase`). We do
+        // NOT read them from the in-memory tip: block connection commits
+        // the coin batch before publishing the in-memory tip, so an
+        // in-memory base could name a block the snapshot's coins don't
+        // correspond to. Because the base is only known once the
+        // snapshot is taken (inside the iteration), we first write a
+        // placeholder header, stream the coins, then seek back and
+        // rewrite the header with the real base/count.
+        //
         // BufWriter wraps the file; bytes flow ONLY into the file.
         // The HASH_SERIALIZED_3 hasher below sees a DIFFERENT byte
         // stream (TxOutSer-formatted), not the file bytes.
         let mut writer = BufWriter::new(file);
-        meta.serialize(&mut writer)?;
+        let placeholder = cc::SnapshotMetadata {
+            version: cc::SNAPSHOT_VERSION,
+            network_magic: network_magic(self.network),
+            base_blockhash: {
+                use bitcoin::hashes::Hash;
+                bitcoin::BlockHash::all_zeros()
+            },
+            coins_count: 0,
+        };
+        placeholder.serialize(&mut writer)?;
 
         // Streaming state. The iteration order is `(txid, vout)`
         // ascending (RocksDB key sort, matches Core), so coins from
@@ -686,8 +694,8 @@ impl ChainState {
         // TxOutSer contribution is fed in. The final digest is what
         // matches `m_assumeutxo_data.hash_serialized` for that height.
         // Bracket the borrow on `writer` so it's released before we
-        // touch the file again for flush/fsync/rename.
-        let (coins_written, hs3_engine) = {
+        // touch the file again for the header rewrite/flush/fsync/rename.
+        let (base, hs3_engine) = {
             let mut state = DumpState {
                 writer: &mut writer,
                 hs3_engine: bitcoin::hashes::sha256::HashEngine::default(),
@@ -698,7 +706,7 @@ impl ChainState {
                 out_err: None,
             };
 
-            self.store.for_each_coin_snapshot(&mut |op, coin| {
+            let base = self.store.for_each_coin_snapshot(&mut |op, coin| {
                 state.visit(op, coin);
                 Ok(())
             })?;
@@ -710,19 +718,35 @@ impl ChainState {
             // Flush the final group (everything since the last txid change).
             state.flush_final_group()?;
 
-            (state.coins_written, state.hs3_engine)
+            (base, state.hs3_engine)
         };
 
-        // Release the tip lock as soon as the iteration is over — the
-        // subsequent flush/fsync/rename don't need it and operators
-        // appreciate shorter block-processing pauses.
-        drop(tip_guard);
+        let base_hash = base.base_hash;
+        let base_height = base.base_height;
+        let coins_written = base.coins_written;
 
-        if coins_written != coins_count {
+        // Both counts come from the same snapshot now, so a mismatch is
+        // genuine chainstate corruption rather than a benign write race.
+        if coins_written != base.coin_count {
             return Err(DumpError::CountMismatch {
-                expected: coins_count,
+                expected: base.coin_count,
                 actual: coins_written,
             });
+        }
+
+        // Rewrite the header in place with the snapshot-consistent base
+        // and count. The header is a fixed 51 bytes, so this never
+        // overruns into the coin records.
+        {
+            use std::io::{Seek, SeekFrom};
+            writer.seek(SeekFrom::Start(0))?;
+            let meta = cc::SnapshotMetadata {
+                version: cc::SNAPSHOT_VERSION,
+                network_magic: network_magic(self.network),
+                base_blockhash: base_hash,
+                coins_count: base.coin_count,
+            };
+            meta.serialize(&mut writer)?;
         }
 
         // Flush BufWriter to OS, then fsync the file. Without the
@@ -749,10 +773,13 @@ impl ChainState {
         let mut hash_serialized_3 = double.to_byte_array();
         hash_serialized_3.reverse();
 
-        // Atomic-on-same-FS rename. After this point the user can see
-        // the file at the requested path; before, it lived as
+        // Finalize without replacing: a plain `rename(2)` would silently
+        // clobber a file that appeared at `final_path` after the early
+        // `path.exists()` check (POSIX rename replaces the destination).
+        // `finalize_dump_path` refuses instead. After this point the user
+        // can see the file at the requested path; before, it lived as
         // `.incomplete`.
-        std::fs::rename(temp_path, final_path)?;
+        finalize_dump_path(temp_path, final_path)?;
 
         Ok(DumpSummary {
             coins_written,
@@ -2867,8 +2894,9 @@ pub struct DumpSummary {
     pub base_height: u32,
     pub path: PathBuf,
     /// Bitcoin Core's `hash_serialized_3` value over the dumped UTXO
-    /// set — single SHA-256 over the `TxOutSer` stream from
-    /// `kernel/coinstats.cpp`. This is what Core's `dumptxoutset`
+    /// set — the double SHA-256 (`HashWriter::GetHash()`) over the
+    /// `TxOutSer` stream from `kernel/coinstats.cpp`, byte-reversed to
+    /// the `uint256` display form. This is what Core's `dumptxoutset`
     /// reports as `txoutset_hash`, and the value stored in
     /// `m_assumeutxo_data.hash_serialized` for the corresponding
     /// height. **Not** the SHA-256 of the snapshot file bytes.
@@ -2992,6 +3020,38 @@ fn make_incomplete_path(path: &Path) -> PathBuf {
         .unwrap_or_default();
     name.push(".incomplete");
     path.with_file_name(name)
+}
+
+/// Move the completed temp file to `final_path` WITHOUT replacing an
+/// existing destination.
+///
+/// `std::fs::rename` would silently overwrite a file created at
+/// `final_path` after `dump_utxo_snapshot`'s early `path.exists()` check
+/// (POSIX `rename(2)` replaces the target). Instead we hard-link the
+/// temp file to `final_path` — `link(2)` fails with `EEXIST` if the
+/// target already exists, so an existing `final_path` yields
+/// [`DumpError::RefuseOverwrite`] and is never destroyed — then unlink
+/// the temp name.
+///
+/// A single uniform implementation (rather than `renameat2(NOREPLACE)`
+/// on glibc) is deliberate: `libc::renameat2` is not exposed for the
+/// musl target, and the release binaries we ship are musl-static, so a
+/// glibc-only fast path would mean testing a code path we never ship.
+/// `final_path` and the `.incomplete` temp share a directory (hence a
+/// filesystem), so the link always succeeds when the target is free.
+fn finalize_dump_path(temp_path: &Path, final_path: &Path) -> Result<(), DumpError> {
+    match std::fs::hard_link(temp_path, final_path) {
+        Ok(()) => {
+            // The data is already durable at `final_path` via the shared
+            // inode; dropping the temp name is best-effort cleanup.
+            let _ = std::fs::remove_file(temp_path);
+            Ok(())
+        }
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            Err(DumpError::RefuseOverwrite(final_path.to_path_buf()))
+        }
+        Err(e) => Err(DumpError::Io(e)),
+    }
 }
 
 /// RAII guard that removes a temp file on drop unless [`Self::disarm`]
@@ -4587,6 +4647,96 @@ pub(crate) mod tests {
         // First 5 bytes are the snapshot magic.
         let raw = std::fs::read(&snapshot_path).unwrap();
         assert_eq!(&raw[..5], &SNAPSHOT_MAGIC_BYTES);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dump_base_comes_from_store_snapshot_not_in_memory_tip() {
+        // Regression for the dumptxoutset base/coins race. The snapshot's
+        // base block MUST be read from the same store snapshot as the
+        // coins, never from the in-memory `ChainState` tip: block
+        // connection commits the coin batch to the store BEFORE
+        // publishing the in-memory tip, so a base read from the in-memory
+        // tip can name a block whose coins the snapshot doesn't contain.
+        //
+        // We reproduce that skew directly. Connect 5 blocks (store and
+        // in-memory tip in sync), then poison ONLY the in-memory tip with
+        // a bogus hash/height and dump. The reported base must track the
+        // store's real height-5 tip, not the poisoned in-memory value —
+        // which is exactly what the pre-fix code (reading `self.tip`)
+        // would have emitted.
+        let (cs, dir) = make_chain_state();
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+
+        let mut parent = genesis_hash;
+        for i in 1..=5u32 {
+            let block = build_test_block(parent, i, 1_300_000_000 + i);
+            parent = cs.accept_block(&block).expect("accept_block");
+        }
+        let real_tip = cs.tip_hash();
+        assert_eq!(cs.tip_height(), 5);
+
+        // Poison the in-memory tip; the store still reflects height 5.
+        {
+            let bogus = {
+                use bitcoin::hashes::Hash;
+                BlockHash::from_byte_array([0x7c; 32])
+            };
+            let mut tip = cs.tip.write();
+            tip.hash = bogus;
+            tip.height = 999;
+        }
+
+        let path = dir.join("base-from-store.dat");
+        let summary = cs.dump_utxo_snapshot(&path).expect("dump");
+
+        assert_eq!(
+            summary.base_hash, real_tip,
+            "dump base must come from the store snapshot, not the in-memory tip"
+        );
+        assert_eq!(summary.base_height, 5);
+        assert_eq!(summary.coins_written, 5);
+
+        // The on-disk header (rewritten after iteration) must agree.
+        let file = File::open(&path).expect("open snapshot");
+        let mut reader = std::io::BufReader::new(file);
+        let meta = crate::storage::compressed_coin::SnapshotMetadata::deserialize(&mut reader)
+            .expect("parse header");
+        assert_eq!(meta.base_blockhash, real_tip);
+        assert_eq!(meta.coins_count, 5);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dump_finalize_refuses_to_clobber_concurrently_created_target() {
+        // Finding 2 regression: the early `path.exists()` check is
+        // advisory; the authoritative no-overwrite guarantee is enforced
+        // at finalization. Simulate a target that appears AFTER that
+        // early check by calling `finalize_dump_path` directly against a
+        // destination that already exists. It must refuse, not clobber.
+        let (_, dir) = make_chain_state();
+        std::fs::create_dir_all(&dir).unwrap();
+        let temp_path = dir.join("snap.dat.incomplete");
+        let final_path = dir.join("snap.dat");
+        std::fs::write(&temp_path, b"freshly completed dump").unwrap();
+        std::fs::write(&final_path, b"PRECIOUS pre-existing file").unwrap();
+
+        let err = finalize_dump_path(&temp_path, &final_path)
+            .expect_err("must refuse to overwrite existing target");
+        assert!(matches!(err, DumpError::RefuseOverwrite(_)));
+
+        // The pre-existing file is untouched.
+        assert_eq!(
+            std::fs::read(&final_path).unwrap(),
+            b"PRECIOUS pre-existing file"
+        );
+
+        // And a free target succeeds, moving the temp file into place.
+        let fresh = dir.join("fresh.dat");
+        finalize_dump_path(&temp_path, &fresh).expect("finalize into free path");
+        assert_eq!(std::fs::read(&fresh).unwrap(), b"freshly completed dump");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -1764,15 +1764,54 @@ impl Store for RocksDbStore {
     fn for_each_coin_snapshot(
         &self,
         f: &mut dyn FnMut(&OutPoint, &Coin) -> Result<(), StoreError>,
-    ) -> Result<u64, StoreError> {
+    ) -> Result<crate::storage::CoinSnapshotBase, StoreError> {
         // Acquire a RocksDB snapshot — point-in-time view that isolates
-        // the iteration from concurrent writes. The snapshot is dropped
-        // at the end of this function; the iterator stays valid for as
-        // long as `snap` lives.
+        // the iteration from concurrent writes. The snapshot covers ALL
+        // column families at one sequence number, so the tip pointer,
+        // the block-index entry, the UTXO count and the coin rows are
+        // mutually consistent. `write_batch_mode` commits all of them in
+        // one atomic `WriteBatch`, so this snapshot can never straddle a
+        // half-applied block. We must read the base from THIS snapshot
+        // (not the in-memory tip) — see `CoinSnapshotBase` docs.
         let snap = self.db.snapshot();
-        let cf = self.cf(CF_COINS);
-        let mut written = 0u64;
-        for kv in snap.iterator_cf(&cf, IteratorMode::Start) {
+        let cf_meta = self.cf(CF_METADATA);
+        let cf_bi = self.cf(CF_BLOCK_INDEX);
+        let cf_coins = self.cf(CF_COINS);
+
+        // Base tip from the snapshot's metadata CF.
+        let tip_val = snap
+            .get_cf(&cf_meta, TIP_KEY)
+            .map_err(|e| StoreError::Database(e.to_string()))?
+            .ok_or_else(|| StoreError::Database("snapshot has no tip marker".into()))?;
+        let base_hash = hash_from_bytes(&tip_val)
+            .ok_or_else(|| StoreError::Database("snapshot tip marker is corrupt".into()))?;
+
+        // Height of the base block, from the snapshot's block-index CF.
+        let bi_val = snap
+            .get_cf(&cf_bi, hash_bytes(&base_hash))
+            .map_err(|e| StoreError::Database(e.to_string()))?
+            .ok_or_else(|| {
+                StoreError::Database("snapshot tip has no block-index entry".into())
+            })?;
+        let base_entry: BlockIndexEntry = bincode::deserialize(&bi_val)
+            .map_err(|e| StoreError::Serialization(e.to_string()))?;
+        let base_height = base_entry.height;
+
+        // UTXO count from the same snapshot. Missing key == empty set.
+        let coin_count = match snap
+            .get_cf(&cf_meta, UTXO_COUNT_KEY)
+            .map_err(|e| StoreError::Database(e.to_string()))?
+        {
+            Some(v) if v.len() == 8 => {
+                let mut a = [0u8; 8];
+                a.copy_from_slice(&v);
+                u64::from_le_bytes(a)
+            }
+            _ => 0,
+        };
+
+        let mut coins_written = 0u64;
+        for kv in snap.iterator_cf(&cf_coins, IteratorMode::Start) {
             let (key, value) = kv.map_err(|e| StoreError::Database(e.to_string()))?;
             if key.len() != 36 {
                 return Err(StoreError::Database(format!(
@@ -1790,9 +1829,14 @@ impl Store for RocksDbStore {
                 ))
             })?;
             f(&outpoint, &coin)?;
-            written += 1;
+            coins_written += 1;
         }
-        Ok(written)
+        Ok(crate::storage::CoinSnapshotBase {
+            base_hash,
+            base_height,
+            coin_count,
+            coins_written,
+        })
     }
 
     fn iter_addr_funding(
