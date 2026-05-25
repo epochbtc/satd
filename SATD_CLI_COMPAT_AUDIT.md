@@ -44,7 +44,7 @@ single-dash Core spellings are aliased by `normalize_args`. Grouped:
 - **P2P:** `listen`, `blocksonly`, `externalip`, `whitelist`,
   `whitebind`, `maxuploadtarget`, `port`, `bind`, `connect`, `addnode`,
   `seednode`, `maxconnections`, `maxinboundperip`, `dns`, `dnsseed`,
-  `bantime`, `timeout`, `onlynet`
+  `forcednsseed`, `fixedseeds`, `bantime`, `timeout`, `onlynet`
 - **Proxy / Tor:** `proxy`, `onion`, `torcontrol`, `torpassword`,
   `listenonion`
 - **Consensus:** `assumevalid`, `assumevalidage`, `stopatheight`,
@@ -106,6 +106,15 @@ single-dash Core spellings are aliased by `normalize_args`. Grouped:
   `mempool.dat` format (Core's datadir is not byte-compatible; see
   `CORE_DIFFERENCES.md`); the file is re-validated against the current
   chainstate on load, never trusted blindly.
+- **`forcednsseed` / `fixedseeds`** — seeding policy over the persistent
+  address book. `-forcednsseed` queries the DNS seeds even when the
+  address book is already populated (default off; satd otherwise skips
+  DNS once it has known peers, instead of querying on every boot).
+  `-fixedseeds` (default on) permits a last-resort fallback to satd's
+  compiled-in fixed seed list when the address book is empty, there are
+  no `-connect` peers, and DNS seeding did not run; `-fixedseeds=0`
+  forbids it. satd's fixed seeds are the shipped `.onion` v3 nodes (also
+  the Tor-mode fallback); clearnet fixed-IP seeds are not embedded.
 - **`asmap`** — path to a Bitcoin Core `-asmap` file (relative to
   `--datadir`). When set, the address manager buckets peers by ASN
   instead of `/16`, so eclipse resistance is per-AS (matching Core). satd
@@ -181,12 +190,11 @@ single-dash Core spellings are aliased by `normalize_args`. Grouped:
 
 ## Recognised but not yet implemented
 
-These hard-error today. Listed with what real support would require.
-
-| Key | Notes |
-|---|---|
-| `forcednsseed` | Force DNS seeding even when addrman is full. satd has no persistent addrman and seeds at every start, so this has no distinct effect yet. |
-| `fixedseeds` | Fall back to the compiled-in fixed-IP seed list. satd has no fixed-IP seed list (only DNS + `.onion` seeds), so nothing to gate yet. |
+*(None.)* Every Core option satd previously deferred has been
+implemented and moved into the "Implemented" section above. The
+classification path is retained: any future deferral is added to
+`NOT_YET_IMPLEMENTED_KEYS` in `satd/src/config.rs` and hard-errors at
+parse time rather than being silently accepted.
 
 ---
 
