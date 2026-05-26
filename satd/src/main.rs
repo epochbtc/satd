@@ -903,6 +903,11 @@ async fn main() {
     // -blocksonly: suppress P2P transaction relay.
     peer_manager.set_blocksonly(config.blocksonly);
 
+    // -externalip: addresses advertised to peers.
+    if !config.externalip.is_empty() {
+        peer_manager.set_external_addrs(config.externalip.clone());
+    }
+
     // Wire the BIP 158 filter index into the peer manager so the BIP
     // 157 service arms can read filter rows and the version handshake
     // can advertise `NODE_COMPACT_FILTERS` when both runtime knobs say

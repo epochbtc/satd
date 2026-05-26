@@ -105,6 +105,10 @@ pub struct PeerManager {
     in_flight_blocks: RwLock<std::collections::HashSet<bitcoin::BlockHash>>,
     /// Configured outbound peer addresses for auto-reconnect.
     connect_addrs: RwLock<Vec<SocketAddr>>,
+    /// Operator-declared external addresses (Bitcoin Core's
+    /// `-externalip`). Advertised in `getaddr` responses and used as the
+    /// version message's `addr_from`. Set once at startup.
+    external_addrs: RwLock<Vec<SocketAddr>>,
     /// Channel to send received blocks to the processing thread.
     block_tx: mpsc::UnboundedSender<bitcoin::Block>,
     /// Pending compact blocks awaiting missing transactions.
@@ -263,6 +267,7 @@ impl PeerManager {
             headers_tip: AtomicU64::new(headers_tip_height as u64),
             in_flight_blocks: RwLock::new(std::collections::HashSet::new()),
             connect_addrs: RwLock::new(Vec::new()),
+            external_addrs: RwLock::new(Vec::new()),
             block_tx,
             pending_compact: RwLock::new(HashMap::new()),
             fee_estimator: fee_estimator.clone(),
@@ -354,6 +359,12 @@ impl PeerManager {
     /// Whether transaction relay is suppressed (`-blocksonly`).
     fn blocksonly(&self) -> bool {
         self.blocksonly.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Declare operator-supplied external addresses (`-externalip`). Set
+    /// once from the satd binary after construction.
+    pub fn set_external_addrs(&self, addrs: Vec<SocketAddr>) {
+        *self.external_addrs.write() = addrs;
     }
 
     /// Predicate consulted by `handle_message` and the version
@@ -1219,60 +1230,63 @@ impl PeerManager {
                 }
             }
             NetworkMessage::GetAddr => {
-                // Respond with addresses of our connected peers
+                // Respond with our declared external addresses (-externalip)
+                // followed by addresses of our connected peers.
                 let peers = self.peers.read();
                 let wants_v2 = peers.get(&id).is_some_and(|h| h.info.wants_addrv2);
                 let addr_entries: Vec<_> = peers
                     .values()
                     .filter(|h| h.info.state == PeerState::Connected)
                     .collect();
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as u32;
+                let our_services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+                let externals = self.external_addrs.read().clone();
 
                 if wants_v2 {
-                    let addrs: Vec<bitcoin::p2p::address::AddrV2Message> = addr_entries
+                    let to_v2 = |addr: SocketAddr, time: u32, services: ServiceFlags| {
+                        let v2 = match addr.ip() {
+                            std::net::IpAddr::V4(ip) => bitcoin::p2p::address::AddrV2::Ipv4(ip),
+                            std::net::IpAddr::V6(ip) => match ip.to_ipv4_mapped() {
+                                Some(ip4) => bitcoin::p2p::address::AddrV2::Ipv4(ip4),
+                                None => bitcoin::p2p::address::AddrV2::Ipv6(ip),
+                            },
+                        };
+                        bitcoin::p2p::address::AddrV2Message {
+                            time,
+                            services,
+                            addr: v2,
+                            port: addr.port(),
+                        }
+                    };
+                    let mut addrs: Vec<bitcoin::p2p::address::AddrV2Message> = externals
                         .iter()
-                        .map(|h| {
-                            let time = h.info.conn_time
-                                .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs() as u32;
-                            bitcoin::p2p::address::AddrV2Message {
-                                time,
-                                services: h.info.services,
-                                addr: bitcoin::p2p::address::AddrV2::Ipv4(match h.info.addr.ip() {
-                                    std::net::IpAddr::V4(ip) => ip,
-                                    std::net::IpAddr::V6(ip) => {
-                                        // Try to extract mapped IPv4, otherwise skip
-                                        if let Some(ip4) = ip.to_ipv4_mapped() {
-                                            ip4
-                                        } else {
-                                            // Fall back — use AddrV2::Ipv6 instead
-                                            return bitcoin::p2p::address::AddrV2Message {
-                                                time,
-                                                services: h.info.services,
-                                                addr: bitcoin::p2p::address::AddrV2::Ipv6(ip),
-                                                port: h.info.addr.port(),
-                                            };
-                                        }
-                                    }
-                                }),
-                                port: h.info.addr.port(),
-                            }
-                        })
+                        .map(|a| to_v2(*a, now, our_services))
                         .collect();
+                    addrs.extend(addr_entries.iter().map(|h| {
+                        let time = h.info.conn_time
+                            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs() as u32;
+                        to_v2(h.info.addr, time, h.info.services)
+                    }));
                     if !addrs.is_empty() {
                         self.send_to_peer(id, NetworkMessage::AddrV2(addrs));
                     }
                 } else {
-                    let addrs: Vec<(u32, bitcoin::p2p::Address)> = addr_entries
+                    let mut addrs: Vec<(u32, bitcoin::p2p::Address)> = externals
                         .iter()
-                        .map(|h| {
-                            let time = h.info.conn_time
-                                .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs() as u32;
-                            (time, bitcoin::p2p::Address::new(&h.info.addr, h.info.services))
-                        })
+                        .map(|a| (now, bitcoin::p2p::Address::new(a, our_services)))
                         .collect();
+                    addrs.extend(addr_entries.iter().map(|h| {
+                        let time = h.info.conn_time
+                            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs() as u32;
+                        (time, bitcoin::p2p::Address::new(&h.info.addr, h.info.services))
+                    }));
                     if !addrs.is_empty() {
                         self.send_to_peer(id, NetworkMessage::Addr(addrs));
                     }
@@ -3106,7 +3120,14 @@ impl PeerManager {
             .unwrap_or_default()
             .as_secs() as i64;
 
-        let sender = SocketAddr::from(([0, 0, 0, 0], 0));
+        // Advertise our first declared external address (`-externalip`)
+        // as addr_from; fall back to the unspecified address otherwise.
+        let sender = self
+            .external_addrs
+            .read()
+            .first()
+            .copied()
+            .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
 
         VersionMessage {
             version: 70016,
