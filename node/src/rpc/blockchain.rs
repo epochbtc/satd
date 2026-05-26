@@ -98,6 +98,9 @@ pub fn get_chain_states(chain_state: &ChainState) -> Value {
         // is not yet fully validated; a background chainstate validates
         // genesis→snapshot in parallel.
         Some(bg) => {
+            // `assumeutxo_rejected` (satd extension) is set when background
+            // validation has proven this snapshot invalid — distinct from
+            // the merely-not-yet-validated state.
             chainstates.push(json!({
                 "blocks": tip_height,
                 "bestblockhash": tip_hash.to_string(),
@@ -107,6 +110,7 @@ pub fn get_chain_states(chain_state: &ChainState) -> Value {
                 "coins_tip_cache_bytes": 0,
                 "snapshot_blockhash": bg.snapshot_hash().to_string(),
                 "validated": false,
+                "assumeutxo_rejected": bg.is_rejected(),
             }));
 
             let bg_height = bg.tip_height();
@@ -856,6 +860,7 @@ pub fn load_txout_set(
     chain_state: &ChainState,
     datadir: &std::path::Path,
     prune_target: u64,
+    dbcache_mb: u64,
     path: &str,
 ) -> Result<Value, (i32, String)> {
     use crate::chain::assumeutxo;
@@ -889,9 +894,9 @@ pub fn load_txout_set(
     let mut reader = std::fs::File::open(path)
         .map_err(|e| (-1, format!("cannot open snapshot file {path}: {e}")))?;
 
-    // dbcache_mb / max_open_files for the background coins DB: modest
-    // fixed defaults (the background is transient and dropped at handoff).
-    match chain_state.load_utxo_snapshot(&mut reader, anchor, bg_dir, 256, -1) {
+    // max_open_files for the background coins DB: -1 (RocksDB default);
+    // dbcache is operator-configured (passed in).
+    match chain_state.load_utxo_snapshot(&mut reader, anchor, bg_dir, dbcache_mb, -1) {
         Ok(summary) => Ok(json!({
             "coins_loaded": summary.coins_loaded,
             "base_height": summary.base_height,

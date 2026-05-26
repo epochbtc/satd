@@ -2048,6 +2048,7 @@ impl Config {
             "network": self.network.to_string(),
             "datadir": self.datadir.display().to_string(),
             "prune": self.prune,
+            "dbcache": self.dbcache,
             "blocksdir": self.blocksdir.as_ref().map(|p| p.display().to_string()),
             "signet_seed_nodes": self.signet_seed_nodes,
             "profile": self.profile.map(|p| p.as_str()).unwrap_or("(none)"),

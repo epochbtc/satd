@@ -91,6 +91,18 @@ pub enum ChainError {
     Snapshot(String),
 }
 
+/// Outcome of [`ChainState::resume_pending_snapshot`] at startup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SnapshotResume {
+    /// No pending snapshot — normal startup.
+    None,
+    /// Re-attached a background validator for a snapshot at `height`.
+    Resumed { height: u32 },
+    /// A loaded snapshot was durably rejected by background validation;
+    /// the caller should refuse to start and force operator recovery.
+    Rejected,
+}
+
 /// Result of a successful [`ChainState::load_utxo_snapshot`].
 #[derive(Debug, Clone)]
 pub struct LoadSnapshotSummary {
@@ -497,8 +509,65 @@ impl ChainState {
             dbcache_mb,
             max_open_files,
         )?;
+        // Persist the anchor identity so a restart before handoff can
+        // re-attach the background (the primary tip may have advanced past
+        // the snapshot height, so the tip alone can't name the anchor).
+        // Best-effort: a failure here only affects cross-restart resume,
+        // not this session.
+        if let Err(e) = crate::chain::background::write_anchor_marker(
+            bg.bg_dir(),
+            snapshot_height,
+            &snapshot_hash,
+            &target_utxo_hash,
+        ) {
+            tracing::warn!(
+                error = %e,
+                "AssumeUTXO: could not persist the background anchor marker; \
+                 a restart before handoff will not auto-resume validation"
+            );
+        }
         *self.background.write() = Some(Arc::new(bg));
         Ok(())
+    }
+
+    /// On startup, re-attach a pending AssumeUTXO background validator if
+    /// one was left behind by a previous run, or refuse to start if that
+    /// snapshot was durably rejected. `net_datadir` is the network datadir
+    /// (parent of `chainstate/`). Presence of `chainstate_background/`
+    /// means a snapshot was loaded and handoff did not complete (a
+    /// successful handoff removes the dir).
+    pub fn resume_pending_snapshot(
+        &self,
+        net_datadir: &std::path::Path,
+        dbcache_mb: u64,
+        max_open_files: i32,
+    ) -> Result<SnapshotResume, ChainError> {
+        let bg_dir = net_datadir.join("chainstate_background");
+        if !bg_dir.exists() {
+            return Ok(SnapshotResume::None);
+        }
+        if bg_dir.join(".rejected").exists() {
+            return Ok(SnapshotResume::Rejected);
+        }
+        match crate::chain::background::read_anchor_marker(&bg_dir) {
+            Some((height, blockhash, target)) => {
+                self.attach_background(
+                    bg_dir,
+                    height,
+                    blockhash,
+                    target,
+                    dbcache_mb,
+                    max_open_files,
+                )?;
+                Ok(SnapshotResume::Resumed { height })
+            }
+            None => Err(ChainError::Snapshot(format!(
+                "found a background chainstate dir at {} with no anchor marker; refusing to \
+                 start with an ambiguous pending snapshot. Remove it to discard the pending \
+                 snapshot.",
+                bg_dir.display()
+            ))),
+        }
     }
 
     /// The active background chainstate, if one is attached (i.e. an
@@ -532,11 +601,18 @@ impl ChainState {
     }
 
     /// Resolve the handoff once the background reaches `snapshot_height`.
+    ///
     /// On a hash match: mark validated by dropping the background and
     /// removing its private DB (the shared block store now holds the full
-    /// genesis→tip block index). On a mismatch: do NOT panic — raise a
-    /// loud error warning and leave the background in place for operator
-    /// intervention (full demote-to-primary recovery is a follow-up).
+    /// genesis→tip block index).
+    ///
+    /// On a mismatch the node has just *proven* the active snapshot is
+    /// invalid, so we fail closed: persist a durable rejected marker (so
+    /// the rejection survives restart and startup refuses to keep serving
+    /// the snapshot), raise a loud error warning, and return an error so
+    /// the catch-up driver halts instead of continuing to advance an
+    /// invalid chain. We do NOT panic. Full demote-to-primary recovery is
+    /// a follow-up; until then the operator must reindex/reload.
     fn run_background_handoff(
         &self,
         bg: &Arc<crate::chain::background::BackgroundChainState>,
@@ -557,6 +633,7 @@ impl ChainState {
                         "AssumeUTXO: could not remove background chainstate dir after handoff"
                     );
                 }
+                Ok(())
             }
             HandoffOutcome::HashMismatch { expected, actual } => {
                 tracing::error!(
@@ -564,18 +641,26 @@ impl ChainState {
                     actual = %hex::encode(actual),
                     "AssumeUTXO: background UTXO-set hash does NOT match the anchor — snapshot is invalid"
                 );
+                bg.mark_rejected();
                 self.warnings.record(
                     "assumeutxo-validation-failed",
                     crate::warnings::Severity::Error,
                     "AssumeUTXO snapshot failed background validation: UTXO-set hash \
                      mismatch at the snapshot height. The loaded snapshot is not \
-                     trustworthy.",
+                     trustworthy; reindex or reload a valid snapshot.",
                     serde_json::json!({
                         "expected_hash_serialized_3": hex::encode(expected),
                         "actual_hash_serialized_3": hex::encode(actual),
                         "snapshot_height": bg.snapshot_height(),
                     }),
                 );
+                Err(ChainError::Snapshot(format!(
+                    "background validation FAILED at height {}: UTXO-set hash {} does not match \
+                     the anchor {}",
+                    bg.snapshot_height(),
+                    hex::encode(actual),
+                    hex::encode(expected),
+                )))
             }
             HandoffOutcome::BaseMismatch { expected, actual } => {
                 tracing::error!(
@@ -583,20 +668,166 @@ impl ChainState {
                     actual = %actual,
                     "AssumeUTXO: background tip at snapshot height is not the anchor block"
                 );
+                bg.mark_rejected();
                 self.warnings.record(
                     "assumeutxo-validation-failed",
                     crate::warnings::Severity::Error,
                     "AssumeUTXO snapshot failed background validation: the block at the \
-                     snapshot height does not match the anchor block hash.",
+                     snapshot height does not match the anchor block hash; reindex or \
+                     reload a valid snapshot.",
                     serde_json::json!({
                         "expected_base": expected.to_string(),
                         "actual_base": actual.to_string(),
                         "snapshot_height": bg.snapshot_height(),
                     }),
                 );
+                Err(ChainError::Snapshot(format!(
+                    "background validation FAILED at height {}: base block {} does not match \
+                     the anchor {}",
+                    bg.snapshot_height(),
+                    actual,
+                    expected,
+                )))
             }
         }
+    }
+
+    /// Stream snapshot coins into the snapshot chainstate's coin set,
+    /// rejecting malformed input. Returns the number of coins loaded.
+    ///
+    /// Validation: every `(txid, vout)` outpoint must be **strictly
+    /// increasing** in `(txid_bytes, vout)` order (Core's snapshot order),
+    /// which rejects duplicates and disorder without a large seen-set;
+    /// `vout` must fit in `u32`; and the running count must not exceed the
+    /// header's. Duplicates would otherwise overwrite the same coin row
+    /// (same final hash) while double-incrementing the persisted UTXO
+    /// counters, and an oversized `vout` would silently truncate the key.
+    fn stream_snapshot_coins<R: std::io::Read>(
+        &self,
+        reader: &mut R,
+        meta: &crate::storage::compressed_coin::SnapshotMetadata,
+    ) -> Result<u64, ChainError> {
+        use crate::storage::compressed_coin as cc;
+
+        let mut loaded = 0u64;
+        let mut prev: Option<([u8; 32], u32)> = None;
+        let mut batch = crate::storage::StoreBatch::default();
+        while loaded < meta.coins_count {
+            let mut txid_bytes = [0u8; 32];
+            reader
+                .read_exact(&mut txid_bytes)
+                .map_err(|e| ChainError::Snapshot(format!("truncated snapshot (txid): {e}")))?;
+            let group = cc::read_compact_size(reader)
+                .map_err(|e| ChainError::Snapshot(format!("bad group size: {e}")))?;
+            if group == 0 {
+                return Err(ChainError::Snapshot(
+                    "snapshot has an empty txid group".into(),
+                ));
+            }
+            let txid = bitcoin::Txid::from_raw_hash(
+                bitcoin::hashes::sha256d::Hash::from_byte_array(txid_bytes),
+            );
+            for _ in 0..group {
+                let vout_u64 = cc::read_compact_size(reader)
+                    .map_err(|e| ChainError::Snapshot(format!("bad vout: {e}")))?;
+                if vout_u64 > u64::from(u32::MAX) {
+                    return Err(ChainError::Snapshot(format!(
+                        "snapshot vout {vout_u64} exceeds u32::MAX"
+                    )));
+                }
+                let vout = vout_u64 as u32;
+                if let Some((prev_txid, prev_vout)) = prev {
+                    let strictly_increasing = txid_bytes > prev_txid
+                        || (txid_bytes == prev_txid && vout > prev_vout);
+                    if !strictly_increasing {
+                        return Err(ChainError::Snapshot(
+                            "snapshot outpoints are not strictly increasing (duplicate or \
+                             out-of-order)"
+                                .into(),
+                        ));
+                    }
+                }
+                prev = Some((txid_bytes, vout));
+
+                let coin = cc::deserialize_coin(reader)
+                    .map_err(|e| ChainError::Snapshot(format!("bad coin record: {e}")))?;
+                batch
+                    .coin_puts
+                    .push((bitcoin::OutPoint { txid, vout }, coin));
+                loaded += 1;
+                if loaded > meta.coins_count {
+                    return Err(ChainError::Snapshot(
+                        "snapshot contains more coins than its header declares".into(),
+                    ));
+                }
+                if batch.coin_puts.len() >= 10_000 {
+                    self.store.write_batch_mode(
+                        std::mem::take(&mut batch),
+                        crate::storage::WriteMode::BulkLoad,
+                    )?;
+                }
+            }
+        }
+        if !batch.coin_puts.is_empty() {
+            self.store
+                .write_batch_mode(batch, crate::storage::WriteMode::BulkLoad)?;
+        }
+        self.store.flush_durable()?;
+        Ok(loaded)
+    }
+
+    /// Point the active tip at the snapshot base block and persist it.
+    fn adopt_snapshot_tip(
+        &self,
+        anchor: &crate::chain::assumeutxo::AssumeUtxoData,
+    ) -> Result<(), ChainError> {
+        let tip_batch = crate::storage::StoreBatch {
+            tip: Some(anchor.blockhash),
+            height_hash_puts: vec![(anchor.height, anchor.blockhash)],
+            ..Default::default()
+        };
+        self.store.write_batch(tip_batch)?;
+        {
+            let mut tip = self.tip.write();
+            tip.hash = anchor.blockhash;
+            tip.height = anchor.height;
+        }
+        self.headers_tip_height
+            .fetch_max(anchor.height, Ordering::Relaxed);
+        self.store.flush()?;
         Ok(())
+    }
+
+    /// Undo a partial snapshot activation: detach + remove the background
+    /// chainstate, clear any loaded coins, and reset the tip to genesis.
+    /// Best-effort (used on an error path) — failures are logged, not
+    /// propagated, since the caller is already returning an error.
+    fn rollback_snapshot_load(&self) {
+        if let Some(bg) = self.background.write().take()
+            && let Err(e) = std::fs::remove_dir_all(bg.bg_dir())
+        {
+            tracing::warn!(
+                error = %e,
+                dir = %bg.bg_dir().display(),
+                "snapshot rollback: could not remove background chainstate dir"
+            );
+        }
+        if let Err(e) = self.store.clear_chainstate() {
+            tracing::error!(error = %e, "snapshot rollback: clear_chainstate failed");
+        }
+        let genesis = bitcoin::constants::genesis_block(self.network).block_hash();
+        let reset = crate::storage::StoreBatch {
+            tip: Some(genesis),
+            ..Default::default()
+        };
+        if let Err(e) = self.store.write_batch(reset) {
+            tracing::error!(error = %e, "snapshot rollback: tip reset failed");
+        }
+        {
+            let mut tip = self.tip.write();
+            tip.hash = genesis;
+            tip.height = 0;
+        }
     }
 
     /// Load a Bitcoin Core-format UTXO snapshot into THIS (snapshot)
@@ -662,91 +893,12 @@ impl ChainState {
             ));
         }
 
-        // 3. Stream coins into the snapshot chainstate's coin set.
-        let mut loaded = 0u64;
-        let mut batch = crate::storage::StoreBatch::default();
-        while loaded < meta.coins_count {
-            let mut txid_bytes = [0u8; 32];
-            reader
-                .read_exact(&mut txid_bytes)
-                .map_err(|e| ChainError::Snapshot(format!("truncated snapshot (txid): {e}")))?;
-            let txid = bitcoin::Txid::from_raw_hash(
-                bitcoin::hashes::sha256d::Hash::from_byte_array(txid_bytes),
-            );
-            let group = cc::read_compact_size(reader)
-                .map_err(|e| ChainError::Snapshot(format!("bad group size: {e}")))?;
-            for _ in 0..group {
-                let vout = cc::read_compact_size(reader)
-                    .map_err(|e| ChainError::Snapshot(format!("bad vout: {e}")))?
-                    as u32;
-                let coin = cc::deserialize_coin(reader)
-                    .map_err(|e| ChainError::Snapshot(format!("bad coin record: {e}")))?;
-                batch
-                    .coin_puts
-                    .push((bitcoin::OutPoint { txid, vout }, coin));
-                loaded += 1;
-                if loaded > meta.coins_count {
-                    return Err(ChainError::Snapshot(
-                        "snapshot contains more coins than its header declares".into(),
-                    ));
-                }
-            }
-            if batch.coin_puts.len() >= 10_000 {
-                self.store.write_batch_mode(
-                    std::mem::take(&mut batch),
-                    crate::storage::WriteMode::BulkLoad,
-                )?;
-            }
-        }
-        if !batch.coin_puts.is_empty() {
-            self.store
-                .write_batch_mode(batch, crate::storage::WriteMode::BulkLoad)?;
-        }
-        self.store.flush_durable()?;
-
-        // 4. Point the tip at the base block.
-        {
-            let tip_batch = crate::storage::StoreBatch {
-                tip: Some(anchor.blockhash),
-                height_hash_puts: vec![(anchor.height, anchor.blockhash)],
-                ..Default::default()
-            };
-            self.store.write_batch(tip_batch)?;
-        }
-        {
-            let mut tip = self.tip.write();
-            tip.hash = anchor.blockhash;
-            tip.height = anchor.height;
-        }
-        self.headers_tip_height
-            .fetch_max(anchor.height, Ordering::Relaxed);
-        self.store.flush()?;
-
-        // 5. Recompute the UTXO-set hash and reject on mismatch (rolling
-        //    back to a fresh genesis chainstate). This rejects a tampered
-        //    file immediately, before the slow background validation.
-        let (actual, _base) = cc::hash_utxo_set(&*self.store)?;
-        if actual != anchor.hash_serialized_3 {
-            self.store.clear_chainstate()?;
-            let genesis = bitcoin::constants::genesis_block(self.network).block_hash();
-            let reset = crate::storage::StoreBatch {
-                tip: Some(genesis),
-                ..Default::default()
-            };
-            self.store.write_batch(reset)?;
-            {
-                let mut tip = self.tip.write();
-                tip.hash = genesis;
-                tip.height = 0;
-            }
-            return Err(ChainError::Snapshot(format!(
-                "loaded UTXO-set hash {} does not match the anchor {} — snapshot rejected",
-                hex::encode(actual),
-                hex::encode(anchor.hash_serialized_3),
-            )));
-        }
-
-        // 6. Attach the background chainstate (validates genesis→base).
+        // 3. Attach the background validator BEFORE mutating the active
+        //    chainstate. Opening the background DB is the failure-prone
+        //    step (locked dir, incompatible contents, I/O); doing it
+        //    first means a failure here cannot strand the node on an
+        //    unvalidated snapshot. From this point on, ANY error rolls
+        //    the whole activation back (see `rollback_snapshot_load`).
         self.attach_background(
             bg_dir,
             anchor.height,
@@ -755,6 +907,52 @@ impl ChainState {
             dbcache_mb,
             max_open_files,
         )?;
+
+        // 4. Stream coins into the snapshot chainstate's coin set,
+        //    validating the stream (strictly-increasing outpoints, vout
+        //    bound, count drift) so a malformed file cannot inflate the
+        //    persisted UTXO counters while still matching the anchor hash.
+        let loaded = match self.stream_snapshot_coins(reader, &meta) {
+            Ok(n) => n,
+            Err(e) => {
+                self.rollback_snapshot_load();
+                return Err(e);
+            }
+        };
+
+        // 5. Point the tip at the base block.
+        if let Err(e) = self.adopt_snapshot_tip(&anchor) {
+            self.rollback_snapshot_load();
+            return Err(e);
+        }
+
+        // 6. Recompute the UTXO-set hash AND verify the loaded coin count
+        //    against the header, rolling back on any mismatch. This
+        //    rejects a tampered file immediately, before the slow
+        //    background validation.
+        let (actual, base) = match cc::hash_utxo_set(&*self.store) {
+            Ok(v) => v,
+            Err(e) => {
+                self.rollback_snapshot_load();
+                return Err(e.into());
+            }
+        };
+        if actual != anchor.hash_serialized_3 {
+            self.rollback_snapshot_load();
+            return Err(ChainError::Snapshot(format!(
+                "loaded UTXO-set hash {} does not match the anchor {} — snapshot rejected",
+                hex::encode(actual),
+                hex::encode(anchor.hash_serialized_3),
+            )));
+        }
+        if base.coin_count != meta.coins_count || base.coins_written != meta.coins_count {
+            self.rollback_snapshot_load();
+            return Err(ChainError::Snapshot(format!(
+                "snapshot coin-count mismatch: header declares {}, persisted count {}, \
+                 iterated {} — snapshot rejected",
+                meta.coins_count, base.coin_count, base.coins_written,
+            )));
+        }
 
         tracing::info!(
             height = anchor.height,
@@ -3547,22 +3745,30 @@ pub(crate) mod tests {
         cs.attach_background(bg_dir.clone(), n, snapshot_hash, bad_anchor, 64, -1)
             .unwrap();
 
+        // Connecting blocks below the snapshot height succeeds; the block
+        // that reaches the snapshot height triggers the handoff, which now
+        // FAILS CLOSED on the hash mismatch and returns an error.
+        let mut last: Result<_, ChainError> = Ok(None);
         for b in &blocks {
-            cs.background_connect_block(b).unwrap();
+            last = cs.background_connect_block(b);
         }
-
-        // Mismatch → background NOT dropped (left for the operator), and a
-        // loud validation-failure warning is recorded.
         assert!(
-            cs.has_background(),
-            "background must remain attached on a hash mismatch"
+            matches!(last, Err(ChainError::Snapshot(_))),
+            "the handoff at the snapshot height must fail closed on a hash mismatch, got {last:?}"
         );
+
+        // Background retained + durably marked rejected; a loud warning is
+        // recorded and getchainstates surfaces the rejected state.
+        let bg = cs.background().expect("background retained on mismatch");
+        assert!(bg.is_rejected(), "snapshot must be durably marked rejected");
         let warned = cs
             .warnings()
             .as_strings()
             .iter()
             .any(|w| w.contains("AssumeUTXO") || w.to_lowercase().contains("validation"));
         assert!(warned, "a validation-failure warning should be recorded");
+        let states = crate::rpc::blockchain::get_chain_states(&cs);
+        assert_eq!(states["chainstates"][0]["assumeutxo_rejected"], true);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3652,6 +3858,227 @@ pub(crate) mod tests {
 
         let _ = std::fs::remove_dir_all(&src_dir);
         let _ = std::fs::remove_dir_all(&dst_dir);
+    }
+
+    #[test]
+    fn load_utxo_snapshot_rolls_back_when_attach_background_fails() {
+        use crate::chain::assumeutxo::AssumeUtxoData;
+
+        let (src, src_dir) = make_chain_state();
+        let blocks = build_and_connect_chain(&src, 3);
+        let snap_hash = src.tip_hash();
+        let snap_path = src_dir.join("snap.dat");
+        let dump = src.dump_utxo_snapshot(&snap_path).unwrap();
+        let anchor = AssumeUtxoData {
+            height: 3,
+            blockhash: snap_hash,
+            nchaintx: 0,
+            hash_serialized_3: dump.hash_serialized_3,
+        };
+
+        let (dst, dst_dir) = make_chain_state();
+        for b in &blocks {
+            dst.accept_header(&b.header).unwrap();
+        }
+
+        // Force attach_background to fail by planting a regular FILE where
+        // the background chainstate dir must be opened.
+        let bg_dir = dst_dir.join("chainstate_background");
+        std::fs::write(&bg_dir, b"not a directory").unwrap();
+
+        let mut f = std::fs::File::open(&snap_path).unwrap();
+        let err = dst
+            .load_utxo_snapshot(&mut f, anchor, bg_dir, 64, -1)
+            .expect_err("attach_background must fail when its dir is unusable");
+        // The anchor hash is VALID here; the failure is purely the
+        // background open. The node must not be left bootstrapped.
+        assert!(matches!(err, ChainError::Storage(_) | ChainError::Snapshot(_)));
+        assert_eq!(dst.tip_height(), 0, "tip must stay at genesis");
+        assert!(!dst.has_background(), "no background may be attached");
+        assert_eq!(dst.coin_count(), 0, "no snapshot coins may persist");
+
+        let _ = std::fs::remove_dir_all(&src_dir);
+        let _ = std::fs::remove_dir_all(&dst_dir);
+    }
+
+    /// Build a snapshot byte stream by hand (header + raw txid groups) so
+    /// tests can inject malformed input.
+    #[allow(clippy::type_complexity)]
+    fn craft_snapshot(
+        base: BlockHash,
+        declared_count: u64,
+        groups: &[([u8; 32], Vec<(u64, crate::storage::coinview::Coin)>)],
+    ) -> Vec<u8> {
+        use crate::storage::compressed_coin as cc;
+        let mut buf = Vec::new();
+        let meta = cc::SnapshotMetadata {
+            version: cc::SNAPSHOT_VERSION,
+            network_magic: network_magic(Network::Regtest),
+            base_blockhash: base,
+            coins_count: declared_count,
+        };
+        meta.serialize(&mut buf).unwrap();
+        for (txid_bytes, coins) in groups {
+            buf.extend_from_slice(txid_bytes);
+            cc::write_compact_size(&mut buf, coins.len() as u64).unwrap();
+            for (vout, coin) in coins {
+                cc::write_compact_size(&mut buf, *vout).unwrap();
+                cc::serialize_coin(&mut buf, coin).unwrap();
+            }
+        }
+        buf
+    }
+
+    fn tiny_coin() -> crate::storage::coinview::Coin {
+        crate::storage::coinview::Coin {
+            amount: 1_000,
+            script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x51]),
+            height: 1,
+            coinbase: false,
+        }
+    }
+
+    /// Build a fresh node with the height-1 base header synced (tip at
+    /// genesis), plus an anchor pointing at that base. Used by the
+    /// malformed-stream tests; the anchor hash is irrelevant because the
+    /// load fails while streaming, before the hash check.
+    fn dst_with_base_header() -> (
+        ChainState,
+        std::path::PathBuf,
+        crate::chain::assumeutxo::AssumeUtxoData,
+    ) {
+        use crate::chain::assumeutxo::AssumeUtxoData;
+        let (src, src_dir) = make_chain_state();
+        let blocks = build_and_connect_chain(&src, 1);
+        let base = src.tip_hash();
+        let _ = std::fs::remove_dir_all(&src_dir);
+
+        let (dst, dst_dir) = make_chain_state();
+        dst.accept_header(&blocks[0].header).unwrap();
+        let anchor = AssumeUtxoData {
+            height: 1,
+            blockhash: base,
+            nchaintx: 0,
+            hash_serialized_3: [0u8; 32],
+        };
+        (dst, dst_dir, anchor)
+    }
+
+    #[test]
+    fn load_utxo_snapshot_rejects_duplicate_outpoint() {
+        let (dst, dst_dir, anchor) = dst_with_base_header();
+        let base = anchor.blockhash;
+        // One txid group with the SAME vout twice — a duplicate outpoint
+        // that would double-count if accepted.
+        let bytes = craft_snapshot(
+            base,
+            2,
+            &[([0x11u8; 32], vec![(0u64, tiny_coin()), (0u64, tiny_coin())])],
+        );
+        let bg_dir = dst_dir.join("chainstate_background");
+        let err = dst
+            .load_utxo_snapshot(&mut bytes.as_slice(), anchor, bg_dir, 64, -1)
+            .expect_err("duplicate outpoint must be rejected");
+        assert!(matches!(err, ChainError::Snapshot(_)));
+        assert_eq!(dst.tip_height(), 0);
+        assert!(!dst.has_background());
+        assert_eq!(dst.coin_count(), 0);
+
+        let _ = std::fs::remove_dir_all(&dst_dir);
+    }
+
+    #[test]
+    fn load_utxo_snapshot_rejects_oversized_vout() {
+        let (dst, dst_dir, anchor) = dst_with_base_header();
+        let base = anchor.blockhash;
+        // A single coin whose vout exceeds u32::MAX.
+        let bytes = craft_snapshot(
+            base,
+            1,
+            &[([0x22u8; 32], vec![(u64::from(u32::MAX) + 1, tiny_coin())])],
+        );
+        let bg_dir = dst_dir.join("chainstate_background");
+        let err = dst
+            .load_utxo_snapshot(&mut bytes.as_slice(), anchor, bg_dir, 64, -1)
+            .expect_err("vout > u32::MAX must be rejected");
+        assert!(matches!(err, ChainError::Snapshot(_)));
+        assert_eq!(dst.tip_height(), 0);
+        assert!(!dst.has_background());
+
+        let _ = std::fs::remove_dir_all(&dst_dir);
+    }
+
+    #[test]
+    fn resume_pending_snapshot_none_when_no_dir() {
+        let (cs, dir) = make_chain_state();
+        assert_eq!(
+            cs.resume_pending_snapshot(&dir, 64, -1).unwrap(),
+            SnapshotResume::None
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resume_pending_snapshot_refuses_when_rejected() {
+        let (cs, dir) = make_chain_state();
+        let bg_dir = dir.join("chainstate_background");
+        std::fs::create_dir_all(&bg_dir).unwrap();
+        std::fs::write(bg_dir.join(".rejected"), b"x").unwrap();
+        assert_eq!(
+            cs.resume_pending_snapshot(&dir, 64, -1).unwrap(),
+            SnapshotResume::Rejected
+        );
+        assert!(!cs.has_background());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resume_pending_snapshot_errors_on_missing_marker() {
+        let (cs, dir) = make_chain_state();
+        let bg_dir = dir.join("chainstate_background");
+        std::fs::create_dir_all(&bg_dir).unwrap();
+        assert!(
+            cs.resume_pending_snapshot(&dir, 64, -1).is_err(),
+            "a background dir with no anchor marker must refuse startup"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn background_resume_uses_private_tip_not_shared_block_index() {
+        // Primary chain to height 5; the shared block index covers 0..5.
+        let (cs, dir) = make_chain_state();
+        let blocks = build_and_connect_chain(&cs, 5);
+        let snap_hash = cs.tip_hash();
+        let bg_dir = dir.join("chainstate_background");
+        cs.attach_background(bg_dir.clone(), 5, snap_hash, [0u8; 32], 64, -1)
+            .unwrap();
+
+        // Connect only the first 3 blocks to the background → its private
+        // coins tip is height 3 while the shared block index is at 5.
+        for b in &blocks[..3] {
+            cs.background_connect_block(b).unwrap();
+        }
+        // Flush so the private tip is durable, then drop the in-memory
+        // background to release its RocksDB lock and resume from disk. It
+        // must resume from the PRIVATE coins tip (3), not the shared
+        // block-index height (5).
+        cs.background().unwrap().flush().unwrap();
+        assert_eq!(cs.background().unwrap().tip_height(), 3);
+        *cs.background.write() = None;
+        match cs.resume_pending_snapshot(&dir, 64, -1).unwrap() {
+            SnapshotResume::Resumed { height } => assert_eq!(height, 5),
+            other => panic!("expected Resumed, got {other:?}"),
+        }
+        let bg = cs.background().unwrap();
+        assert_eq!(
+            bg.tip_height(),
+            3,
+            "background must resume from its private coins tip, not the shared block index"
+        );
+        assert_eq!(bg.snapshot_height(), 5);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -609,7 +609,15 @@ pub async fn start(
             .get("prune")
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
-        blockchain::load_txout_set(&ctx.chain_state, &datadir, prune_target, &path)
+        // Background coins-DB cache: honor the operator's configured
+        // dbcache (the background is transient and dropped at handoff),
+        // falling back to a modest default.
+        let dbcache_mb = ctx
+            .effective_config
+            .get("dbcache")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(256);
+        blockchain::load_txout_set(&ctx.chain_state, &datadir, prune_target, dbcache_mb, &path)
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 

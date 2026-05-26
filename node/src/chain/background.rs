@@ -41,6 +41,40 @@ use crate::storage::Store;
 use crate::validation;
 use crate::validation::script::ScriptVerifier;
 
+/// Marker file (in the background dir) recording the anchor a pending
+/// snapshot is validating toward, so startup can re-attach the background
+/// validator after a restart (the primary tip may have advanced past the
+/// snapshot height, so it alone can't identify the anchor).
+const ANCHOR_MARKER: &str = ".anchor";
+
+/// Persist the anchor identity next to the background coins DB.
+pub fn write_anchor_marker(
+    bg_dir: &std::path::Path,
+    height: u32,
+    blockhash: &BlockHash,
+    target_hash: &[u8; 32],
+) -> std::io::Result<()> {
+    let v = serde_json::json!({
+        "height": height,
+        "blockhash": blockhash.to_string(),
+        "hash_serialized_3": hex::encode(target_hash),
+    });
+    let bytes = serde_json::to_vec(&v).map_err(std::io::Error::other)?;
+    std::fs::write(bg_dir.join(ANCHOR_MARKER), bytes)
+}
+
+/// Read the anchor marker written by [`write_anchor_marker`], if present
+/// and well-formed.
+pub fn read_anchor_marker(bg_dir: &std::path::Path) -> Option<(u32, BlockHash, [u8; 32])> {
+    let raw = std::fs::read(bg_dir.join(ANCHOR_MARKER)).ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+    let height = u32::try_from(v.get("height")?.as_u64()?).ok()?;
+    let blockhash: BlockHash = v.get("blockhash")?.as_str()?.parse().ok()?;
+    let bytes = hex::decode(v.get("hash_serialized_3")?.as_str()?).ok()?;
+    let target: [u8; 32] = bytes.try_into().ok()?;
+    Some((height, blockhash, target))
+}
+
 /// Result of connecting one block to the background chainstate.
 #[derive(Debug, Clone, Copy)]
 pub struct BackgroundConnect {
@@ -175,6 +209,41 @@ impl BackgroundChainState {
     /// On-disk directory of the private coins DB (removed at handoff).
     pub fn bg_dir(&self) -> &std::path::Path {
         &self.bg_dir
+    }
+
+    /// Path of the durable "this snapshot failed background validation"
+    /// marker. Its presence makes the rejection survive restart so the
+    /// node refuses to keep serving a known-invalid snapshot.
+    fn rejected_marker(&self) -> PathBuf {
+        self.bg_dir.join(".rejected")
+    }
+
+    /// Persist the rejected marker (best-effort) after a validation
+    /// mismatch at the snapshot height.
+    pub fn mark_rejected(&self) {
+        if let Err(e) = std::fs::write(
+            self.rejected_marker(),
+            b"AssumeUTXO snapshot failed background validation\n",
+        ) {
+            tracing::error!(
+                error = %e,
+                dir = %self.bg_dir.display(),
+                "AssumeUTXO: could not write the rejected marker"
+            );
+        }
+    }
+
+    /// Whether this snapshot has been durably marked rejected.
+    pub fn is_rejected(&self) -> bool {
+        self.rejected_marker().exists()
+    }
+
+    /// Flush the private coin cache so the background tip + coins are
+    /// durable. The catch-up driver should call this periodically so a
+    /// crash resumes from a recent (consistent) private tip rather than
+    /// redoing the whole validation.
+    pub fn flush(&self) -> Result<(), ChainError> {
+        self.coins.flush().map_err(ChainError::from)
     }
 
     /// True once the background has connected up to `snapshot_height`.
