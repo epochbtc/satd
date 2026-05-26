@@ -451,4 +451,35 @@ mod tests {
 
         server.await.unwrap();
     }
+
+    /// A v2 initiator against a v1-only peer must fail the handshake — this
+    /// is the trigger for the outbound v1 downgrade in the peer manager.
+    /// The "v1 peer" replies to the initiator's key with bytes whose first
+    /// four are the network magic, which BIP 324 treats as a v1 fallback.
+    #[tokio::test]
+    async fn initiator_handshake_fails_against_v1_peer() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            // Consume the initiator's ellswift key.
+            let mut key = [0u8; 64];
+            sock.read_exact(&mut key).await.unwrap();
+            // Respond as a v1 peer would: a message starting with the
+            // network magic (padded to a full ellswift-key read).
+            let magic = bitcoin::p2p::Magic::from(Network::Bitcoin).to_bytes();
+            let mut reply = magic.to_vec();
+            reply.extend_from_slice(&[0u8; 60]);
+            let _ = sock.write_all(&reply).await;
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let result = initiator_handshake(&mut client, Network::Bitcoin).await;
+        assert!(
+            result.is_err(),
+            "v2 initiator handshake must fail against a v1 peer"
+        );
+        let _ = server.await;
+    }
 }

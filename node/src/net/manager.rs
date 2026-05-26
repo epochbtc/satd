@@ -107,6 +107,25 @@ struct PeerHandle {
     msg_tx: mpsc::Sender<NetworkMessage>,
 }
 
+/// How a peer task receives its transport.
+///
+/// Inbound connections are handed the raw socket and negotiate v1/v2 in
+/// the spawned task (so the accept loop never blocks on a handshake).
+/// Outbound connections establish their transport in the connect path —
+/// where re-dialing for a v1 downgrade is possible — and hand over an
+/// already-built [`Connection`].
+enum IncomingTransport {
+    Raw(TcpStream),
+    Established(Box<Connection>),
+}
+
+/// How to (re-)dial an outbound peer, so a v2 handshake failure can fall
+/// back to a fresh v1 connection to the same destination.
+enum OutboundDial {
+    Direct(SocketAddr),
+    Onion(String, u16),
+}
+
 /// Manages all peer connections and routes messages.
 pub struct PeerManager {
     peers: RwLock<HashMap<PeerId, PeerHandle>>,
@@ -220,6 +239,10 @@ pub struct PeerManager {
     /// Defaults to false here; the satd binary sets it from config via
     /// `set_v2transport` (default-on at that layer, matching Core).
     v2_transport: std::sync::atomic::AtomicBool,
+    /// Outbound destinations whose v2 handshake failed this session, so we
+    /// connect them straight as v1 instead of wasting a v2 round trip on
+    /// every reconnect. Keyed by socket address (direct peers only).
+    v2_downgraded: RwLock<HashSet<SocketAddr>>,
     /// Bitcoin Core's `-maxuploadtarget`: a soft cap, in bytes, on the
     /// volume of *historical* block data served in a rolling 24h window.
     /// 0 = unlimited. When the cap is exceeded, serving blocks older than
@@ -352,6 +375,7 @@ impl PeerManager {
             peer_serve_filters: std::sync::atomic::AtomicBool::new(false),
             blocksonly: std::sync::atomic::AtomicBool::new(false),
             v2_transport: std::sync::atomic::AtomicBool::new(false),
+            v2_downgraded: RwLock::new(HashSet::new()),
             upload_target_bytes: AtomicU64::new(0),
             upload_bytes: AtomicU64::new(0),
             upload_cycle_start: AtomicU64::new(now_unix_secs()),
@@ -707,32 +731,22 @@ impl PeerManager {
         // for the OS/proxy default rather than the configured value. The
         // `_guard` above releases the pending-connection slot on the
         // timeout early-return too.
-        let connect_timeout = Duration::from_millis(self.connect_timeout_ms.load(Ordering::Relaxed));
-        let stream = if let Some(ref proxy_addr) = self.proxy {
-            tokio::time::timeout(connect_timeout, proxy::connect_socks5(proxy_addr, addr))
-                .await
-                .map_err(|_| {
-                    format!(
-                        "connect to {addr} via proxy timed out after {}ms",
-                        connect_timeout.as_millis()
-                    )
-                })??
-        } else {
-            tokio::time::timeout(connect_timeout, TcpStream::connect(addr))
-                .await
-                .map_err(|_| {
-                    format!(
-                        "connect to {addr} timed out after {}ms",
-                        connect_timeout.as_millis()
-                    )
-                })?
-                .map_err(|e| format!("connect failed: {}", e))?
-        };
+        let stream = self.dial_direct(addr).await?;
 
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         tracing::info!(%addr, id, "Connecting to peer");
 
-        self.spawn_peer(id, addr, stream, Direction::Outbound);
+        // Establish the transport before spawning so a failed v2 handshake
+        // can re-dial for v1. Peers that already failed v2 this session are
+        // connected straight as v1 to avoid a wasted round trip.
+        let conn = self.establish_outbound(stream, OutboundDial::Direct(addr)).await?;
+
+        self.spawn_peer(
+            id,
+            addr,
+            IncomingTransport::Established(Box::new(conn)),
+            Direction::Outbound,
+        );
         Ok(())
     }
 
@@ -744,28 +758,7 @@ impl PeerManager {
     ) -> Result<(), String> {
         self.check_outbound_limit()?;
 
-        // Use onion-specific proxy, or fall back to general proxy
-        let proxy_addr = self
-            .onion_proxy
-            .as_deref()
-            .or(self.proxy.as_deref())
-            .ok_or("no proxy configured for .onion connections")?;
-
-        // Bound the onion dial with Core's `-timeout` too — an
-        // unresponsive onion proxy must not hang past the configured
-        // value.
-        let connect_timeout = Duration::from_millis(self.connect_timeout_ms.load(Ordering::Relaxed));
-        let stream = tokio::time::timeout(
-            connect_timeout,
-            proxy::connect_socks5_onion(proxy_addr, host, port),
-        )
-        .await
-        .map_err(|_| {
-            format!(
-                "connect to onion {host}:{port} via proxy timed out after {}ms",
-                connect_timeout.as_millis()
-            )
-        })??;
+        let stream = self.dial_onion(host, port).await?;
 
         // Use a placeholder SocketAddr for .onion peers (the actual routing is via proxy)
         let placeholder_addr: SocketAddr = ([0, 0, 0, 0], port).into();
@@ -773,7 +766,16 @@ impl PeerManager {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         tracing::info!(onion = host, id, "Connecting to .onion peer via proxy");
 
-        self.spawn_peer(id, placeholder_addr, stream, Direction::Outbound);
+        let conn = self
+            .establish_outbound(stream, OutboundDial::Onion(host.to_string(), port))
+            .await?;
+
+        self.spawn_peer(
+            id,
+            placeholder_addr,
+            IncomingTransport::Established(Box::new(conn)),
+            Direction::Outbound,
+        );
         Ok(())
     }
 
@@ -844,7 +846,13 @@ impl PeerManager {
             msg_rx
         };
         tracing::info!(%addr, id, noban = perms.noban, "Accepted inbound peer");
-        self.spawn_peer_task(id, addr, stream, Direction::Inbound, msg_rx);
+        self.spawn_peer_task(
+            id,
+            addr,
+            IncomingTransport::Raw(stream),
+            Direction::Inbound,
+            msg_rx,
+        );
     }
 
     /// Listen for inbound connections.
@@ -3453,7 +3461,7 @@ impl PeerManager {
         self: &Arc<Self>,
         id: PeerId,
         addr: SocketAddr,
-        stream: TcpStream,
+        transport: IncomingTransport,
         direction: Direction,
     ) {
         let (msg_tx, msg_rx) = mpsc::channel::<NetworkMessage>(256);
@@ -3464,7 +3472,7 @@ impl PeerManager {
             let mut peers = self.peers.write();
             peers.insert(id, handle);
         }
-        self.spawn_peer_task(id, addr, stream, direction, msg_rx);
+        self.spawn_peer_task(id, addr, transport, direction, msg_rx);
     }
 
     /// Inner half of `spawn_peer`: spawns the peer task once the
@@ -3475,13 +3483,13 @@ impl PeerManager {
         self: &Arc<Self>,
         id: PeerId,
         addr: SocketAddr,
-        stream: TcpStream,
+        transport: IncomingTransport,
         direction: Direction,
         msg_rx: mpsc::Receiver<NetworkMessage>,
     ) {
         let manager = Arc::clone(self);
         tokio::spawn(async move {
-            if let Err(e) = manager.peer_task(id, stream, direction, msg_rx).await {
+            if let Err(e) = manager.peer_task(id, transport, direction, msg_rx).await {
                 tracing::warn!(id, %addr, "Peer task ended: {}", e);
             }
             let _ = manager.event_tx.send(NetEvent::PeerDisconnected { id }).await;
@@ -3524,20 +3532,131 @@ impl PeerManager {
         }
     }
 
+    /// Dial a direct outbound peer (through the SOCKS5 proxy when one is
+    /// configured), bounded by Core's `-timeout`.
+    async fn dial_direct(&self, addr: SocketAddr) -> Result<TcpStream, String> {
+        let connect_timeout = Duration::from_millis(self.connect_timeout_ms.load(Ordering::Relaxed));
+        if let Some(ref proxy_addr) = self.proxy {
+            tokio::time::timeout(connect_timeout, proxy::connect_socks5(proxy_addr, addr))
+                .await
+                .map_err(|_| {
+                    format!(
+                        "connect to {addr} via proxy timed out after {}ms",
+                        connect_timeout.as_millis()
+                    )
+                })?
+                .map_err(|e| e.to_string())
+        } else {
+            tokio::time::timeout(connect_timeout, TcpStream::connect(addr))
+                .await
+                .map_err(|_| {
+                    format!(
+                        "connect to {addr} timed out after {}ms",
+                        connect_timeout.as_millis()
+                    )
+                })?
+                .map_err(|e| format!("connect failed: {}", e))
+        }
+    }
+
+    /// Dial a .onion outbound peer through the configured SOCKS5 proxy,
+    /// bounded by Core's `-timeout`.
+    async fn dial_onion(&self, host: &str, port: u16) -> Result<TcpStream, String> {
+        let proxy_addr = self
+            .onion_proxy
+            .as_deref()
+            .or(self.proxy.as_deref())
+            .ok_or("no proxy configured for .onion connections")?;
+        let connect_timeout = Duration::from_millis(self.connect_timeout_ms.load(Ordering::Relaxed));
+        tokio::time::timeout(
+            connect_timeout,
+            proxy::connect_socks5_onion(proxy_addr, host, port),
+        )
+        .await
+        .map_err(|_| {
+            format!(
+                "connect to onion {host}:{port} via proxy timed out after {}ms",
+                connect_timeout.as_millis()
+            )
+        })?
+        .map_err(|e| e.to_string())
+    }
+
+    /// (Re-)dial an outbound destination.
+    async fn redial(&self, target: &OutboundDial) -> Result<TcpStream, String> {
+        match target {
+            OutboundDial::Direct(addr) => self.dial_direct(*addr).await,
+            OutboundDial::Onion(host, port) => self.dial_onion(host, *port).await,
+        }
+    }
+
+    /// Establish the transport for an outbound connection on an
+    /// already-dialed socket.
+    ///
+    /// When `-v2transport` is enabled, attempt the BIP 324 v2 initiator
+    /// handshake; if it fails (a v1-only peer rejects the ellswift bytes as
+    /// bad magic), re-dial a fresh socket and fall back to plaintext v1,
+    /// remembering the destination so the next attempt skips v2 directly.
+    /// `-v2only` peers are out of scope here (added in PR 5).
+    async fn establish_outbound(
+        self: &Arc<Self>,
+        mut stream: TcpStream,
+        target: OutboundDial,
+    ) -> Result<Connection, String> {
+        let magic = self.chain_state.p2p_magic();
+        let skip_v2 = match &target {
+            OutboundDial::Direct(addr) => self.v2_downgraded.read().contains(addr),
+            OutboundDial::Onion(..) => false,
+        };
+        if !self.v2_transport_enabled() || skip_v2 {
+            return Ok(Connection::with_magic(stream, magic));
+        }
+
+        let network = self.chain_state.network;
+        let timeout = Duration::from_millis(self.connect_timeout_ms.load(Ordering::Relaxed));
+        let v2 = tokio::time::timeout(
+            timeout,
+            crate::net::v2transport::initiator_handshake(&mut stream, network),
+        )
+        .await;
+        match v2 {
+            Ok(Ok((cipher, leftover))) => Ok(Connection::v2(
+                crate::net::v2transport::V2Connection::new(stream, cipher, leftover),
+            )),
+            _ => {
+                drop(stream);
+                if let OutboundDial::Direct(addr) = &target {
+                    self.v2_downgraded.write().insert(*addr);
+                }
+                tracing::debug!("v2 outbound handshake failed; re-dialing for v1");
+                let stream = self.redial(&target).await?;
+                Ok(Connection::with_magic(stream, magic))
+            }
+        }
+    }
+
     /// The main task for a single peer.
     async fn peer_task(
         self: &Arc<Self>,
         id: PeerId,
-        stream: TcpStream,
+        transport: IncomingTransport,
         direction: Direction,
         mut msg_rx: mpsc::Receiver<NetworkMessage>,
     ) -> Result<(), String> {
-        // Negotiate the transport. Inbound peers may offer BIP 324 v2 when
-        // it is enabled; everything else is plaintext v1.
-        let mut conn = if direction == Direction::Inbound && self.v2_transport_enabled() {
-            self.accept_transport(stream).await?
-        } else {
-            Connection::with_magic(stream, self.chain_state.p2p_magic())
+        // Outbound transports are established before spawn (so a failed v2
+        // handshake can re-dial for v1). Inbound transports are negotiated
+        // here, in the spawned task, so the accept loop is never blocked on
+        // a peer's handshake: read the first bytes and run v2 detection
+        // when enabled, else plaintext v1.
+        let mut conn = match transport {
+            IncomingTransport::Established(conn) => *conn,
+            IncomingTransport::Raw(stream) => {
+                if self.v2_transport_enabled() {
+                    self.accept_transport(stream).await?
+                } else {
+                    Connection::with_magic(stream, self.chain_state.p2p_magic())
+                }
+            }
         };
 
         // Perform handshake with timeout
