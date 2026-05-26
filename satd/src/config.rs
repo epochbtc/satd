@@ -952,20 +952,19 @@ impl Config {
         if let Some(cf) = config_file.as_mut() {
             include_notes = cf.resolve_includes(&base_datadir, section)?;
         }
-        // Command-line -includeconf is recognised but not honoured, the
-        // same as Bitcoin Core: includes are a config-file-only feature
-        // (a command-line include can't be processed before the config
-        // file is read). Warn rather than silently drop.
+        // Command-line -includeconf is rejected, the same as Bitcoin Core:
+        // includes are a config-file-only feature (a command-line include
+        // can't be processed before the config file is read), and Core
+        // hard-errors rather than starting up having silently dropped a
+        // config the operator asked for. This also upholds this stack's
+        // rule: every recognised key is honoured or explicitly rejected,
+        // never accepted-and-ignored.
         if !cli.includeconf.is_empty() {
-            include_notes.push(ConfigNote {
-                level: NoteLevel::Warn,
-                message: format!(
-                    "-includeconf on the command line is ignored ({} entr{} dropped); \
-                     includeconf is only honoured inside a config file (matches Bitcoin Core)",
-                    cli.includeconf.len(),
-                    if cli.includeconf.len() == 1 { "y" } else { "ies" }
-                ),
-            });
+            return Err(format!(
+                "-includeconf cannot be used from commandline; -includeconf={} \
+                 (includeconf is only honoured inside a config file, matching Bitcoin Core)",
+                cli.includeconf[0]
+            ));
         }
 
         // Helper: look up a key from config file (section first, then global)
@@ -5487,9 +5486,11 @@ rpcport=39999
     }
 
     #[test]
-    fn command_line_includeconf_is_ignored_with_warning() {
-        // Matches Core: -includeconf on the command line is dropped
-        // (with a warning), not honoured. The node still loads.
+    fn command_line_includeconf_is_rejected() {
+        // Matches Core: -includeconf on the command line is rejected with
+        // an error ("cannot be used from commandline"), not accepted and
+        // ignored — so a config that fails fast under Core also fails fast
+        // under satd instead of booting without the included settings.
         let tmpdir = tempfile::tempdir().unwrap();
         let cli = CliArgs::try_parse_from([
             "satd",
@@ -5500,12 +5501,10 @@ rpcport=39999
             "would-be-ignored.conf",
         ])
         .unwrap();
-        let cfg = Config::from_cli(cli).unwrap();
+        let err = Config::from_cli(cli).unwrap_err();
         assert!(
-            cfg.pending_notes
-                .iter()
-                .any(|n| n.message.contains("command line is ignored")),
-            "expected a warning that command-line includeconf is ignored"
+            err.contains("includeconf cannot be used from commandline"),
+            "expected a hard error rejecting command-line includeconf, got: {err}"
         );
     }
 
