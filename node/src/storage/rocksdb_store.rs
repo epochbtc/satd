@@ -1812,15 +1812,21 @@ impl Store for RocksDbStore {
             .ok_or_else(|| StoreError::Database("snapshot tip marker is corrupt".into()))?;
 
         // Height of the base block, from the snapshot's block-index CF.
-        let bi_val = snap
+        // The block index may live in a DIFFERENT store than the coins:
+        // the AssumeUTXO background coins DB (`chainstate_background/`)
+        // shares the snapshot chainstate's block index, so its own
+        // block-index CF is empty. In that case there is no entry here
+        // and the height is not knowable from this DB alone — fall back
+        // to 0. The handoff that hashes the background coins reads the
+        // true base height/hash from the anchor, not from this value. For
+        // the primary chainstate the entry is always present, so this is
+        // the real height and behavior is unchanged.
+        let base_height = snap
             .get_cf(&cf_bi, hash_bytes(&base_hash))
             .map_err(|e| StoreError::Database(e.to_string()))?
-            .ok_or_else(|| {
-                StoreError::Database("snapshot tip has no block-index entry".into())
-            })?;
-        let base_entry: BlockIndexEntry = bincode::deserialize(&bi_val)
-            .map_err(|e| StoreError::Serialization(e.to_string()))?;
-        let base_height = base_entry.height;
+            .and_then(|bi_val| bincode::deserialize::<BlockIndexEntry>(&bi_val).ok())
+            .map(|entry| entry.height)
+            .unwrap_or(0);
 
         // UTXO count from the same snapshot. Missing key == empty set.
         let coin_count = match snap

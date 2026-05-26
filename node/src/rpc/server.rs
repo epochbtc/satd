@@ -491,6 +491,10 @@ pub async fn start(
         Ok::<_, ErrorObjectOwned>(blockchain::get_chain_tips(&ctx.chain_state))
     })?;
 
+    module.register_method("getchainstates", |_params, ctx, _extensions| {
+        Ok::<_, ErrorObjectOwned>(blockchain::get_chain_states(&ctx.chain_state))
+    })?;
+
     module.register_method("getchaintxstats", |params, ctx, _extensions| {
         let mut seq = params.sequence();
         let nblocks: Option<u32> = seq.optional_next().unwrap_or(None);

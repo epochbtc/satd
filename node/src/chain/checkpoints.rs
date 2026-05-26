@@ -4,6 +4,7 @@ use bitcoin::Network;
 /// A checkpoint: a known-good block hash at a specific height.
 /// During IBD, if a block at a checkpoint height has a different hash,
 /// it is rejected. This prevents long-range attacks.
+#[derive(Clone)]
 pub struct Checkpoint {
     pub height: u32,
     pub hash: BlockHash,

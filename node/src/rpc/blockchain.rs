@@ -63,6 +63,92 @@ pub fn get_blockchain_info(chain_state: &ChainState) -> Value {
     })
 }
 
+/// `getchainstates` — Core 27+ RPC describing the active chainstate(s).
+///
+/// A node with no loaded AssumeUTXO snapshot runs a single, fully
+/// validated chainstate, so `chainstates` is a one-element array and no
+/// entry carries `snapshot_blockhash`. Once `loadtxoutset` lands a
+/// snapshot, this grows a second entry for the background chainstate and
+/// the snapshot entry gains `snapshot_blockhash` + `validated: false`
+/// until the background catch-up completes the handoff.
+pub fn get_chain_states(chain_state: &ChainState) -> Value {
+    let tip_hash = chain_state.tip_hash();
+    let tip_height = chain_state.tip_height();
+
+    let (difficulty, time) = chain_state
+        .get_block_index(&tip_hash)
+        .map(|entry| (target_to_difficulty(entry.header.bits), entry.header.time as u64))
+        .unwrap_or((0.0, 0));
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let is_ibd = time + 86400 < now;
+    let verificationprogress = if is_ibd && now > 0 {
+        time as f64 / now as f64
+    } else {
+        1.0
+    };
+
+    let mut chainstates = Vec::new();
+
+    match chain_state.background() {
+        // AssumeUTXO snapshot loaded: this chainstate serves the tip but
+        // is not yet fully validated; a background chainstate validates
+        // genesis→snapshot in parallel.
+        Some(bg) => {
+            chainstates.push(json!({
+                "blocks": tip_height,
+                "bestblockhash": tip_hash.to_string(),
+                "difficulty": difficulty,
+                "verificationprogress": verificationprogress,
+                "coins_db_cache_bytes": 0,
+                "coins_tip_cache_bytes": 0,
+                "snapshot_blockhash": bg.snapshot_hash().to_string(),
+                "validated": false,
+            }));
+
+            let bg_height = bg.tip_height();
+            let bg_difficulty = chain_state
+                .get_block_index(&bg.tip_hash())
+                .map(|e| target_to_difficulty(e.header.bits))
+                .unwrap_or(0.0);
+            let bg_progress = if bg.snapshot_height() > 0 {
+                (bg_height as f64 / bg.snapshot_height() as f64).min(1.0)
+            } else {
+                1.0
+            };
+            chainstates.push(json!({
+                "blocks": bg_height,
+                "bestblockhash": bg.tip_hash().to_string(),
+                "difficulty": bg_difficulty,
+                "verificationprogress": bg_progress,
+                "coins_db_cache_bytes": 0,
+                "coins_tip_cache_bytes": 0,
+                "validated": true,
+            }));
+        }
+        // No snapshot: a single, fully validated chainstate.
+        None => {
+            chainstates.push(json!({
+                "blocks": tip_height,
+                "bestblockhash": tip_hash.to_string(),
+                "difficulty": difficulty,
+                "verificationprogress": verificationprogress,
+                "coins_db_cache_bytes": 0,
+                "coins_tip_cache_bytes": 0,
+                "validated": true,
+            }));
+        }
+    }
+
+    json!({
+        "headers": chain_state.headers_tip_height().max(tip_height),
+        "chainstates": chainstates,
+    })
+}
+
 /// `getbestblockhash` — return the tip block hash.
 pub fn get_best_block_hash(chain_state: &ChainState) -> Value {
     Value::String(chain_state.tip_hash().to_string())
@@ -797,6 +883,29 @@ mod tests {
 
         let genesis = bitcoin::constants::genesis_block(Network::Regtest);
         assert_eq!(info["bestblockhash"], genesis.block_hash().to_string());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_getchainstates_single_validated_chainstate() {
+        let (cs, dir) = make_cs();
+        let out = get_chain_states(&cs);
+
+        let states = out["chainstates"].as_array().expect("chainstates array");
+        // No snapshot loaded → exactly one, fully validated, chainstate.
+        assert_eq!(states.len(), 1);
+        let only = &states[0];
+        assert_eq!(only["blocks"], 0);
+        assert_eq!(only["validated"], true);
+        assert!(
+            only.get("snapshot_blockhash").is_none(),
+            "non-snapshot chainstate must not carry snapshot_blockhash",
+        );
+
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+        assert_eq!(only["bestblockhash"], genesis.block_hash().to_string());
+        assert_eq!(out["headers"], 0);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
