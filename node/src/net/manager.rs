@@ -9,6 +9,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
@@ -212,6 +213,13 @@ pub struct PeerManager {
     /// Transactions submitted locally via RPC are still relayed. Defaults
     /// to false; set from the satd binary via `set_blocksonly`.
     blocksonly: std::sync::atomic::AtomicBool,
+    /// Bitcoin Core's `-v2transport`: offer/accept the BIP 324 v2 encrypted
+    /// transport. When set, inbound connections that do not begin with the
+    /// network magic are treated as v2 and run through the v2 handshake;
+    /// when unset, every connection is plaintext v1 (legacy behavior).
+    /// Defaults to false here; the satd binary sets it from config via
+    /// `set_v2transport` (default-on at that layer, matching Core).
+    v2_transport: std::sync::atomic::AtomicBool,
     /// Bitcoin Core's `-maxuploadtarget`: a soft cap, in bytes, on the
     /// volume of *historical* block data served in a rolling 24h window.
     /// 0 = unlimited. When the cap is exceeded, serving blocks older than
@@ -343,6 +351,7 @@ impl PeerManager {
             #[cfg(feature = "block-filter-index")]
             peer_serve_filters: std::sync::atomic::AtomicBool::new(false),
             blocksonly: std::sync::atomic::AtomicBool::new(false),
+            v2_transport: std::sync::atomic::AtomicBool::new(false),
             upload_target_bytes: AtomicU64::new(0),
             upload_bytes: AtomicU64::new(0),
             upload_cycle_start: AtomicU64::new(now_unix_secs()),
@@ -421,6 +430,18 @@ impl PeerManager {
     /// Whether transaction relay is suppressed (`-blocksonly`).
     fn blocksonly(&self) -> bool {
         self.blocksonly.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Enable/disable BIP 324 v2 transport (`-v2transport`). Set from the
+    /// satd binary at startup.
+    pub fn set_v2transport(&self, enabled: bool) {
+        self.v2_transport
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether the BIP 324 v2 transport is enabled (`-v2transport`).
+    fn v2_transport_enabled(&self) -> bool {
+        self.v2_transport.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Declare operator-supplied external addresses (`-externalip`). Set
@@ -3467,6 +3488,42 @@ impl PeerManager {
         });
     }
 
+    /// Negotiate the transport for an inbound connection.
+    ///
+    /// BIP 324 leaves v1/v2 detection to the responder: read the first
+    /// bytes and, if they are the network magic, the peer is speaking
+    /// plaintext v1 (a `version` message starts with the magic); otherwise
+    /// treat the bytes as the front of the peer's ElligatorSwift key and
+    /// run the v2 handshake. The detection bytes are consumed off the
+    /// socket and replayed into whichever transport is built.
+    async fn accept_transport(self: &Arc<Self>, mut stream: TcpStream) -> Result<Connection, String> {
+        let magic = self.chain_state.p2p_magic();
+        let expected = magic.to_bytes();
+        let timeout = Duration::from_millis(self.connect_timeout_ms.load(Ordering::Relaxed));
+
+        let mut first = [0u8; 4];
+        tokio::time::timeout(timeout, stream.read_exact(&mut first))
+            .await
+            .map_err(|_| "v2 detection timeout".to_string())?
+            .map_err(|e| format!("v2 detection read: {}", e))?;
+
+        if first == expected {
+            Ok(Connection::v1_with_leading(stream, magic, first.to_vec()))
+        } else {
+            let network = self.chain_state.network;
+            let (cipher, leftover) = tokio::time::timeout(
+                timeout,
+                crate::net::v2transport::responder_handshake(&mut stream, network, &first),
+            )
+            .await
+            .map_err(|_| "v2 handshake timeout".to_string())?
+            .map_err(|e| format!("v2 responder handshake: {}", e))?;
+            Ok(Connection::v2(crate::net::v2transport::V2Connection::new(
+                stream, cipher, leftover,
+            )))
+        }
+    }
+
     /// The main task for a single peer.
     async fn peer_task(
         self: &Arc<Self>,
@@ -3475,7 +3532,13 @@ impl PeerManager {
         direction: Direction,
         mut msg_rx: mpsc::Receiver<NetworkMessage>,
     ) -> Result<(), String> {
-        let mut conn = Connection::with_magic(stream, self.chain_state.p2p_magic());
+        // Negotiate the transport. Inbound peers may offer BIP 324 v2 when
+        // it is enabled; everything else is plaintext v1.
+        let mut conn = if direction == Direction::Inbound && self.v2_transport_enabled() {
+            self.accept_transport(stream).await?
+        } else {
+            Connection::with_magic(stream, self.chain_state.p2p_magic())
+        };
 
         // Perform handshake with timeout
         let version = self.perform_handshake(id, &mut conn, direction).await?;
