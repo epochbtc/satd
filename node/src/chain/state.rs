@@ -3779,6 +3779,66 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn background_connect_reuses_prestored_block_data() {
+        // The live catch-up driver stores each downloaded historical block
+        // via `store_block` (status DataStored) into the SHARED flat files,
+        // then wakes the connector. `background_connect_block` must REUSE
+        // that on-disk copy rather than writing the block a second time —
+        // otherwise the whole genesis→snapshot range is duplicated on disk.
+        use crate::storage::blockindex::BlockStatus;
+
+        let (cs, dir) = make_chain_state();
+
+        // Build a short chain and store (but do NOT connect to the primary)
+        // each block, mirroring the live flow where the primary tip starts
+        // at the snapshot height and never connects the historical range.
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+        let mut parent = genesis.block_hash();
+        let mut blocks = Vec::new();
+        for h in 1..=3u32 {
+            let b = build_test_block(parent, h, 1_300_000_000 + h);
+            cs.accept_header(&b.header).unwrap();
+            cs.store_block(&b).unwrap();
+            parent = b.block_hash();
+            blocks.push(b);
+        }
+        assert_eq!(cs.tip_height(), 0, "primary tip must stay at genesis");
+
+        // Record where store_block placed block #1.
+        let h1 = blocks[0].block_hash();
+        let pre = cs.get_block_index(&h1).expect("block 1 stored");
+        assert_eq!(pre.status, BlockStatus::DataStored);
+        let (pre_file, pre_pos) = (pre.file_number, pre.data_pos);
+
+        // Attach a background validating toward snapshot_height = 3. We only
+        // connect block #1 (below the snapshot), so the handoff never runs
+        // and the dummy anchor is never checked.
+        let bg_dir = dir.join("chainstate_background");
+        cs.attach_background(bg_dir, 3, blocks[2].block_hash(), [0u8; 32], 64, -1)
+            .unwrap();
+
+        let outcome = cs
+            .background_connect_block(&blocks[0])
+            .unwrap()
+            .expect("background attached");
+        assert_eq!(outcome.height, 1);
+        assert!(!outcome.reached_snapshot);
+
+        // The shared block-index entry now reads Valid but still points at
+        // the SAME flat-file position store_block wrote — proof the block
+        // data was reused, not appended a second time.
+        let post = cs.get_block_index(&h1).expect("block 1 still indexed");
+        assert_eq!(post.status, BlockStatus::Valid);
+        assert_eq!(
+            (post.file_number, post.data_pos),
+            (pre_file, pre_pos),
+            "background connect must reuse the pre-stored flat position, not rewrite the block"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn background_handoff_keeps_chainstate_and_warns_on_hash_mismatch() {
         let (cs, dir) = make_chain_state();
         let n = 4u32;
@@ -3865,6 +3925,64 @@ pub(crate) mod tests {
         assert_eq!(arr.len(), 2);
         assert_eq!(arr[0]["validated"], false);
         assert_eq!(arr[0]["snapshot_blockhash"], snap_hash.to_string());
+
+        let _ = std::fs::remove_dir_all(&src_dir);
+        let _ = std::fs::remove_dir_all(&dst_dir);
+    }
+
+    #[test]
+    fn live_catchup_flow_store_then_connect_reaches_handoff() {
+        // End-to-end of the live driver's per-block flow: after
+        // loadtxoutset, the catch-up downloader `store_block`s each
+        // historical block (DataStored) and the connector
+        // `background_connect_block`s them in order. On reaching
+        // snapshot_height the handoff validates against the real anchor and
+        // drops the background — exactly what the wired loops do, minus the
+        // P2P transport.
+        use crate::chain::assumeutxo::AssumeUtxoData;
+
+        let (src, src_dir) = make_chain_state();
+        let blocks = build_and_connect_chain(&src, 5);
+        let snap_height = 5u32;
+        let snap_hash = src.tip_hash();
+        let snap_path = src_dir.join("snap.dat");
+        let dump = src.dump_utxo_snapshot(&snap_path).unwrap();
+        let anchor = AssumeUtxoData {
+            height: snap_height,
+            blockhash: snap_hash,
+            nchaintx: 0,
+            hash_serialized_3: dump.hash_serialized_3,
+        };
+
+        // Fresh node: headers only, then load the snapshot.
+        let (dst, dst_dir) = make_chain_state();
+        for b in &blocks {
+            dst.accept_header(&b.header).unwrap();
+        }
+        let bg_dir = dst_dir.join("chainstate_background");
+        let mut f = std::fs::File::open(&snap_path).unwrap();
+        dst.load_utxo_snapshot(&mut f, anchor, bg_dir.clone(), 64, -1)
+            .expect("snapshot load should succeed");
+        assert_eq!(dst.tip_height(), snap_height);
+        assert!(dst.has_background());
+
+        // Drive the historical range exactly as the wired loops do.
+        for (i, b) in blocks.iter().enumerate() {
+            dst.store_block(b).unwrap();
+            let outcome = dst
+                .background_connect_block(b)
+                .unwrap()
+                .expect("background attached until handoff");
+            let expected_height = i as u32 + 1;
+            assert_eq!(outcome.height, expected_height);
+            assert_eq!(outcome.reached_snapshot, expected_height == snap_height);
+        }
+
+        // Handoff completed on the real anchor: background dropped + removed,
+        // and the primary tip is unchanged at the snapshot height.
+        assert!(!dst.has_background(), "handoff should drop the background");
+        assert!(!bg_dir.exists(), "background DB dir should be removed");
+        assert_eq!(dst.tip_height(), snap_height);
 
         let _ = std::fs::remove_dir_all(&src_dir);
         let _ = std::fs::remove_dir_all(&dst_dir);

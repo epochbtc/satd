@@ -19,6 +19,7 @@ use crate::chain::state::ChainState;
 use crate::mempool::fee::FeeEstimator;
 use crate::mempool::orphanage::{AddOutcome, OrphanReject, TxOrphanage};
 use crate::mempool::pool::{Mempool, MempoolError};
+use crate::net::bg_catchup::BgDownloader;
 use crate::net::compact;
 use crate::net::connection::{Connection, ConnectionWriter};
 use crate::net::ibd::IbdScheduler;
@@ -36,6 +37,21 @@ const DEFAULT_MAX_INBOUND_PER_IP: usize = 3;
 /// Default handshake timeout in milliseconds, matching Bitcoin Core's
 /// `-timeout` default (5000ms).
 const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 5000;
+/// How far above the background connect cursor the AssumeUTXO catch-up
+/// downloader keeps historical blocks requested/on-disk. Bounds disk
+/// read-ahead and outstanding `getdata` for the background range.
+const BG_CATCHUP_WINDOW: u32 = 1024;
+/// A background-range `getdata` older than this is assumed lost and
+/// becomes eligible for re-request on the next download pass.
+const BG_CATCHUP_STALE_SECS: u64 = 30;
+/// Cap on the number of fresh background-range `getdata` heights issued
+/// per peer per download pass, so the catch-up downloader does not flood
+/// a single peer.
+const BG_CATCHUP_PER_PEER_PER_PASS: usize = 16;
+/// Flush the background coin cache to disk every N connected blocks so a
+/// crash resumes from a recent private tip instead of redoing the whole
+/// genesis→snapshot validation.
+const BG_CATCHUP_FLUSH_EVERY: u64 = 2000;
 
 /// Per-address reconnect backoff state.
 struct ReconnectState {
@@ -155,6 +171,12 @@ pub struct PeerManager {
     ibd: Arc<parking_lot::RwLock<Option<IbdScheduler>>>,
     /// Signal to wake the connect thread when a block is stored.
     connect_signal: Arc<(parking_lot::Mutex<bool>, Condvar)>,
+    /// AssumeUTXO background catch-up download tracker. Drives downloading
+    /// historical block data (genesis→`snapshot_height`) for the
+    /// background validator. Idle (empty) unless a snapshot is loaded.
+    bg_downloader: RwLock<BgDownloader>,
+    /// Wakes the background connect loop when a historical block is stored.
+    bg_connect_signal: Arc<(parking_lot::Mutex<bool>, Condvar)>,
     /// SOCKS5 proxy for all outbound connections (e.g. "127.0.0.1:9050").
     proxy: Option<String>,
     /// Separate SOCKS5 proxy for .onion connections (defaults to proxy).
@@ -246,6 +268,10 @@ impl PeerManager {
         let (event_tx, event_rx) = mpsc::channel(4096);
         let (block_tx, block_rx) = mpsc::unbounded_channel();
         let connect_signal = Arc::new((parking_lot::Mutex::new(false), Condvar::new()));
+        let bg_connect_signal = Arc::new((parking_lot::Mutex::new(false), Condvar::new()));
+        // Cloned for the background catch-up connect loop, which must
+        // observe shutdown (it has no channel to close like block_processor).
+        let bg_shutdown = shutdown.clone();
 
         // Check for IBD resume: if headers are ahead of tip, create scheduler
         let tip_height = chain_state.tip_height();
@@ -301,6 +327,11 @@ impl PeerManager {
             connect_timeout_ms: AtomicU64::new(DEFAULT_CONNECT_TIMEOUT_MS),
             ibd: ibd.clone(),
             connect_signal: connect_signal.clone(),
+            bg_downloader: RwLock::new(BgDownloader::new(
+                BG_CATCHUP_WINDOW,
+                Duration::from_secs(BG_CATCHUP_STALE_SECS),
+            )),
+            bg_connect_signal: bg_connect_signal.clone(),
             proxy,
             onion_proxy,
             connect_peer_addrs: RwLock::new(Vec::new()),
@@ -324,8 +355,17 @@ impl PeerManager {
         let prune_mb = prune_target_mb;
         let eta_secs = mgr.ibd_eta_secs.clone();
         let orph = mgr.orphanage.clone();
+        let cs_for_block = cs.clone();
         std::thread::spawn(move || {
-            Self::block_processor(block_rx, cs, mp, fe, prune_mb, connect_signal, ibd, prefetch_workers, max_ahead, ibd_l0_pause_at, network, eta_secs, orph);
+            Self::block_processor(block_rx, cs_for_block, mp, fe, prune_mb, connect_signal, ibd, prefetch_workers, max_ahead, ibd_l0_pause_at, network, eta_secs, orph);
+        });
+
+        // Background AssumeUTXO catch-up connect loop. Long-lived: idles
+        // (waiting on `bg_connect_signal`) until a snapshot is loaded and a
+        // background chainstate is attached, then connects downloaded
+        // historical blocks in order until handoff.
+        std::thread::spawn(move || {
+            Self::bg_catchup_connect_loop(&cs, &bg_connect_signal, &bg_shutdown);
         });
 
         mgr
@@ -1177,6 +1217,17 @@ impl PeerManager {
                 }
             }
 
+            // AssumeUTXO background catch-up: drive downloading historical
+            // block data (genesis→snapshot_height) for the background
+            // validator. Independent of forward IBD — the background range
+            // is below the primary tip, which the forward scheduler never
+            // requests. Runs every 4 ticks (2s) whenever a background
+            // chainstate is attached; idles (and frees the tracker) once
+            // handoff completes.
+            if ticks.is_multiple_of(4) {
+                self.drive_bg_catchup_download();
+            }
+
             // Request blocks: immediately on tip advance, or every 10 ticks as fallback
             // Skip during IBD swarming — the scheduler handles block requests
             if !has_ibd && (tip_advanced || ticks.is_multiple_of(10)) {
@@ -1350,6 +1401,10 @@ impl PeerManager {
         if let Some(scheduler) = ibd.as_mut() {
             scheduler.peer_disconnected(id);
         }
+        drop(ibd);
+        // Return the peer's background-range requests to the pool so they
+        // re-request promptly rather than waiting out the stale timeout.
+        self.bg_downloader.write().note_peer_gone(id);
     }
 
     fn handle_message(&self, id: PeerId, msg: NetworkMessage) {
@@ -1742,52 +1797,345 @@ impl PeerManager {
     }
 
     fn handle_block(&self, id: PeerId, block: bitcoin::Block) {
-        // Check if IBD scheduler is active
-        let has_ibd = self.ibd.read().is_some();
-        if has_ibd {
-            let hash = block.block_hash();
-            match self.chain_state.store_block(&block) {
-                Ok((_, height)) => {
-                    let needs_more = {
-                        let mut ibd = self.ibd.write();
-                        if let Some(scheduler) = ibd.as_mut() {
-                            scheduler.block_received(id, height)
-                        } else {
-                            false
-                        }
-                    };
-                    // Wake connect thread
-                    let (lock, cvar) = &*self.connect_signal;
-                    *lock.lock() = true;
-                    cvar.notify_one();
-                    // Assign more work if peer has capacity
-                    if needs_more {
-                        self.assign_peer_work(id);
+        // Forward IBD swarm: store every arriving block to disk; the
+        // ibd_connect_loop connects them in order. Historical blocks the
+        // background catch-up requested also land here and are stored — we
+        // notify the background connector from the same path.
+        if self.ibd.read().is_some() {
+            self.handle_block_ibd(id, block);
+            return;
+        }
+        // Forward IBD inactive. If a background catch-up is active and this
+        // block falls in the historical range it validates (at or below
+        // snapshot_height), store it for the background connector instead
+        // of the normal connect path — accept_block would reject a
+        // below-tip block as a stale side branch.
+        if let Some(bg) = self.chain_state.background() {
+            let prospective_height = self
+                .chain_state
+                .get_block_index(&block.header.prev_blockhash)
+                .map(|p| p.height + 1);
+            if matches!(prospective_height, Some(h) if h <= bg.snapshot_height()) {
+                self.store_bg_block(id, block);
+                return;
+            }
+        }
+        // Normal mode
+        let _ = self.block_tx.send(block);
+    }
+
+    /// Block arrival during forward IBD swarm. Stores the block and
+    /// advances the forward scheduler; if a background catch-up is also
+    /// active, a stored historical block additionally wakes the background
+    /// connector.
+    fn handle_block_ibd(&self, id: PeerId, block: bitcoin::Block) {
+        let hash = block.block_hash();
+        match self.chain_state.store_block(&block) {
+            Ok((_, height)) => {
+                let needs_more = {
+                    let mut ibd = self.ibd.write();
+                    if let Some(scheduler) = ibd.as_mut() {
+                        scheduler.block_received(id, height)
+                    } else {
+                        false
                     }
+                };
+                // Wake connect thread
+                let (lock, cvar) = &*self.connect_signal;
+                *lock.lock() = true;
+                cvar.notify_one();
+                // Assign more work if peer has capacity
+                if needs_more {
+                    self.assign_peer_work(id);
                 }
-                Err(crate::chain::state::ChainError::Duplicate) => {
-                    // Already have it, mark in scheduler anyway
-                    if let Some(entry) = self.chain_state.get_block_index(&hash) {
+                // A historical block requested by the background catch-up
+                // also lands here during forward IBD. Only poke the
+                // background connector when a snapshot is actually loaded
+                // (the common no-AssumeUTXO path skips this entirely).
+                if self.chain_state.has_background() {
+                    self.note_bg_block_stored(height);
+                }
+            }
+            Err(crate::chain::state::ChainError::Duplicate) => {
+                // Already have it, mark in scheduler anyway
+                if let Some(entry) = self.chain_state.get_block_index(&hash) {
+                    {
                         let mut ibd = self.ibd.write();
                         if let Some(scheduler) = ibd.as_mut() {
                             scheduler.block_received(id, entry.height);
                         }
                     }
-                }
-                Err(crate::chain::state::ChainError::BadPrevBlock) => {
-                    // Parent header not yet accepted — normal during swarm IBD.
-                    // Don't penalize the peer; the block may become valid later.
-                    tracing::debug!(%hash, "IBD block store: parent unknown, skipping");
-                }
-                Err(e) => {
-                    tracing::debug!(%hash, "IBD block store failed: {}", e);
-                    self.add_ban_score(id, 10, &format!("block rejected: {}", e));
+                    if self.chain_state.has_background() {
+                        self.note_bg_block_stored(entry.height);
+                    }
                 }
             }
+            Err(crate::chain::state::ChainError::BadPrevBlock) => {
+                // Parent header not yet accepted — normal during swarm IBD.
+                // Don't penalize the peer; the block may become valid later.
+                tracing::debug!(%hash, "IBD block store: parent unknown, skipping");
+            }
+            Err(e) => {
+                tracing::debug!(%hash, "IBD block store failed: {}", e);
+                self.add_ban_score(id, 10, &format!("block rejected: {}", e));
+            }
+        }
+    }
+
+    /// Store a downloaded historical block for the background catch-up
+    /// validator and wake the background connector. Runs only when forward
+    /// IBD is inactive and the block is in the background's range.
+    fn store_bg_block(&self, id: PeerId, block: bitcoin::Block) {
+        let hash = block.block_hash();
+        match self.chain_state.store_block(&block) {
+            Ok((_, height)) => self.note_bg_block_stored(height),
+            Err(crate::chain::state::ChainError::Duplicate) => {
+                if let Some(entry) = self.chain_state.get_block_index(&hash) {
+                    self.note_bg_block_stored(entry.height);
+                }
+            }
+            Err(crate::chain::state::ChainError::BadPrevBlock) => {
+                tracing::debug!(%hash, "bg catch-up block store: parent unknown, skipping");
+            }
+            Err(e) => {
+                tracing::debug!(%hash, "bg catch-up block store failed: {}", e);
+                // Smaller penalty than forward IBD: a malformed historical
+                // block is suspicious but the catch-up download is best-
+                // effort and will re-request from another peer.
+                self.add_ban_score(id, 5, &format!("bg block rejected: {}", e));
+            }
+        }
+    }
+
+    /// A block's data was stored — clear it from the background download
+    /// tracker (no-op for forward-range heights) and wake the background
+    /// connect loop so it can attempt the next in-order connect.
+    fn note_bg_block_stored(&self, height: u32) {
+        self.bg_downloader.write().note_stored(height);
+        let (lock, cvar) = &*self.bg_connect_signal;
+        *lock.lock() = true;
+        cvar.notify_one();
+    }
+
+    /// Drive the AssumeUTXO background catch-up download: request the next
+    /// window of historical block data above the background connect cursor
+    /// from connected peers. Frees the tracker once no background remains.
+    fn drive_bg_catchup_download(&self) {
+        let bg = match self.chain_state.background() {
+            Some(b) => b,
+            None => {
+                // Background detached (handoff done or never attached) —
+                // release any lingering request bookkeeping once.
+                if self.bg_downloader.read().in_flight_len() > 0 {
+                    self.bg_downloader.write().reset();
+                }
+                return;
+            }
+        };
+        let snapshot_height = bg.snapshot_height();
+        let cursor = bg.tip_height();
+        if cursor >= snapshot_height {
             return;
         }
-        // Normal mode
-        let _ = self.block_tx.send(block);
+
+        let now = Instant::now();
+        self.bg_downloader.write().release_stale(now);
+
+        // Heights we still need data for, within the read-ahead window.
+        let range = self.bg_downloader.read().wanted_range(cursor, snapshot_height);
+        if range.is_empty() {
+            return;
+        }
+        let mut needed: Vec<(u32, bitcoin::BlockHash)> = Vec::new();
+        {
+            let dl = self.bg_downloader.read();
+            for h in range {
+                if dl.is_in_flight(h) {
+                    continue;
+                }
+                if let Some(hash) = self.chain_state.get_block_hash_by_height(h) {
+                    // Already on disk (downloaded earlier / crash-resume) —
+                    // the connector will pick it up; no request needed.
+                    if self.chain_state.has_block_data(&hash) {
+                        continue;
+                    }
+                    needed.push((h, hash));
+                }
+            }
+        }
+        if needed.is_empty() {
+            return;
+        }
+
+        let peer_ids: Vec<PeerId> = {
+            let peers = self.peers.read();
+            peers
+                .iter()
+                .filter(|(_, h)| h.info.state == PeerState::Connected)
+                .map(|(id, _)| *id)
+                .collect()
+        };
+        if peer_ids.is_empty() {
+            return;
+        }
+
+        // Round-robin the needed heights across peers, capping how many we
+        // assign to any one peer this pass.
+        let mut assignments: HashMap<PeerId, Vec<bitcoin::BlockHash>> = HashMap::new();
+        {
+            let mut dl = self.bg_downloader.write();
+            let mut next_peer = 0usize;
+            let mut per_peer: HashMap<PeerId, usize> = HashMap::new();
+            for (h, hash) in needed {
+                // Find a peer under the per-pass cap.
+                let mut placed = false;
+                for _ in 0..peer_ids.len() {
+                    let pid = peer_ids[next_peer % peer_ids.len()];
+                    next_peer += 1;
+                    let count = per_peer.entry(pid).or_insert(0);
+                    if *count < BG_CATCHUP_PER_PEER_PER_PASS {
+                        *count += 1;
+                        dl.mark_in_flight(h, pid, now);
+                        assignments.entry(pid).or_default().push(hash);
+                        placed = true;
+                        break;
+                    }
+                }
+                if !placed {
+                    // Every peer is at the per-pass cap; defer the rest.
+                    break;
+                }
+            }
+        }
+        for (pid, hashes) in assignments {
+            for chunk in hashes.chunks(128) {
+                self.send_to_peer(pid, sync::make_getdata_blocks(chunk));
+            }
+        }
+    }
+
+    /// Long-lived background catch-up connect loop. Idles on
+    /// `bg_connect_signal` until a snapshot is loaded and a background
+    /// chainstate is attached, then connects downloaded historical blocks
+    /// in strict order until handoff (which `background_connect_block`
+    /// performs internally on reaching `snapshot_height`). Periodically
+    /// flushes the background coin cache so a crash resumes from a recent
+    /// private tip. Exits on shutdown.
+    fn bg_catchup_connect_loop(
+        chain_state: &Arc<ChainState>,
+        bg_connect_signal: &Arc<(parking_lot::Mutex<bool>, Condvar)>,
+        shutdown: &tokio::sync::watch::Receiver<bool>,
+    ) {
+        let mut since_flush: u64 = 0;
+        loop {
+            if *shutdown.borrow() {
+                return;
+            }
+            let bg = match chain_state.background() {
+                Some(b) => b,
+                None => {
+                    // No snapshot loaded — sleep until woken (loadtxoutset /
+                    // startup resume pokes the signal) or a 1s timeout.
+                    let (lock, cvar) = &**bg_connect_signal;
+                    let mut ready = lock.lock();
+                    *ready = false;
+                    let _ = cvar.wait_for(&mut ready, Duration::from_secs(1));
+                    continue;
+                }
+            };
+
+            // A snapshot proven invalid at handoff stays attached with a
+            // durable rejected marker; stop trying to advance it.
+            if bg.is_rejected() {
+                return;
+            }
+
+            let next_height = bg.tip_height() + 1;
+            if next_height > bg.snapshot_height() {
+                // At/past the snapshot but still attached: handoff did not
+                // complete (e.g. it errored). Don't spin — wait and re-check.
+                let (lock, cvar) = &**bg_connect_signal;
+                let mut ready = lock.lock();
+                *ready = false;
+                let _ = cvar.wait_for(&mut ready, Duration::from_secs(1));
+                continue;
+            }
+
+            let hash = match chain_state.get_block_hash_by_height(next_height) {
+                Some(h) => h,
+                None => {
+                    // Header missing for this height (shouldn't happen given
+                    // loadtxoutset's headers precondition) — wait and retry.
+                    let (lock, cvar) = &**bg_connect_signal;
+                    let mut ready = lock.lock();
+                    *ready = false;
+                    let _ = cvar.wait_for(&mut ready, Duration::from_secs(1));
+                    continue;
+                }
+            };
+
+            if !chain_state.has_block_data(&hash) {
+                // Not downloaded yet — the run-loop downloader will request
+                // it; wait to be woken when it's stored.
+                let (lock, cvar) = &**bg_connect_signal;
+                let mut ready = lock.lock();
+                *ready = false;
+                let _ = cvar.wait_for(&mut ready, Duration::from_secs(1));
+                continue;
+            }
+
+            let block = match chain_state.get_block(&hash) {
+                Some(b) => b,
+                None => {
+                    // Index says DataStored but the read failed — back off
+                    // briefly and retry rather than busy-looping.
+                    std::thread::sleep(Duration::from_millis(200));
+                    continue;
+                }
+            };
+
+            match chain_state.background_connect_block(&block) {
+                Ok(Some(outcome)) => {
+                    since_flush += 1;
+                    if outcome.reached_snapshot {
+                        // Handoff ran inside background_connect_block. On a
+                        // match the background is now detached; the next loop
+                        // iteration idles. On a mismatch it returned Err
+                        // (handled below), not here.
+                        tracing::info!(
+                            height = outcome.height,
+                            "AssumeUTXO: background reached snapshot height; handoff complete"
+                        );
+                        since_flush = 0;
+                        continue;
+                    }
+                    if since_flush >= BG_CATCHUP_FLUSH_EVERY {
+                        if let Err(e) = bg.flush() {
+                            tracing::warn!(error = %e, "AssumeUTXO: background flush failed");
+                        }
+                        since_flush = 0;
+                    }
+                }
+                Ok(None) => {
+                    // Background detached between the guard and here.
+                    continue;
+                }
+                Err(e) => {
+                    // Either a validation failure on a historical block or a
+                    // handoff mismatch (which already marked the snapshot
+                    // rejected). Either way we cannot make forward progress;
+                    // log once and stop the loop. The operator must reindex
+                    // or reload a valid snapshot.
+                    tracing::error!(
+                        height = next_height,
+                        error = %e,
+                        "AssumeUTXO: background catch-up halted — connect failed"
+                    );
+                    let _ = bg.flush();
+                    return;
+                }
+            }
+        }
     }
 
     /// Block processing runs on a dedicated OS thread (not tokio) to avoid

@@ -1,5 +1,6 @@
 pub mod addrman;
 pub mod asmap;
+pub mod bg_catchup;
 pub mod compact;
 pub mod connection;
 pub mod dns;

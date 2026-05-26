@@ -292,14 +292,34 @@ impl BackgroundChainState {
             return Err(ChainError::CheckpointMismatch(new_height));
         }
 
-        // Write the block into the SHARED flat files so the snapshot
-        // chainstate can read it after handoff.
-        let block_data = serialize(block);
-        let flat_pos = self
-            .flat_files
-            .lock()
-            .write_block(&block_data, network_magic(self.network))
-            .map_err(|e| ChainError::FlatFile(e.to_string()))?;
+        // The block data may already be in the SHARED flat files: the
+        // live catch-up downloader stores each arriving historical block
+        // via `ChainState::store_block` before waking the connector. Reuse
+        // that copy when present — writing again would duplicate the entire
+        // genesis→snapshot block data (hundreds of GB on mainnet). Only
+        // write when the block isn't stored yet (e.g. a test or a caller
+        // that connects without pre-storing).
+        let flat_pos = match store_ref.get_block_index(&block_hash) {
+            Some(entry)
+                if matches!(
+                    entry.status,
+                    crate::storage::blockindex::BlockStatus::DataStored
+                        | crate::storage::blockindex::BlockStatus::Valid
+                ) =>
+            {
+                crate::storage::flatfile::FlatFilePos {
+                    file_number: entry.file_number,
+                    data_pos: entry.data_pos,
+                }
+            }
+            _ => {
+                let block_data = serialize(block);
+                self.flat_files
+                    .lock()
+                    .write_block(&block_data, network_magic(self.network))
+                    .map_err(|e| ChainError::FlatFile(e.to_string()))?
+            }
+        };
 
         let mtp = connect::get_median_time_past(store_ref, new_height);
         // The background runs with secondary indexes disabled.
