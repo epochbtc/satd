@@ -967,14 +967,26 @@ impl Config {
             ));
         }
 
-        // Helper: look up a key from config file (section first, then global)
+        // Helper: look up a single-valued key from the config file. The
+        // active network section wins over the global scope (Core merges
+        // the network-specific section ahead of the default section).
+        // Within a scope we take the FIRST occurrence, matching Bitcoin
+        // Core's `reverse_precedence` for config-file settings
+        // (common/settings.cpp: "Take first assigned value instead of last
+        // ... for backwards compatibility in the config file the precedence
+        // is reversed for all settings except chain type settings"). Since
+        // `includeconf` appends an included file's values *after* the main
+        // file's (see `merge_from`), first-wins means the main file always
+        // beats an included file for a key set in both — independent of
+        // where the `includeconf=` directive sits. The `chain=` selector
+        // above is Core's documented exception and keeps last-wins.
         let file_get = |key: &str| -> Option<String> {
             config_file.as_ref().and_then(|cf| {
                 cf.sections
                     .get(section)
                     .and_then(|s| s.get(key))
-                    .and_then(|v| v.last().cloned())
-                    .or_else(|| cf.global.get(key).and_then(|v| v.last().cloned()))
+                    .and_then(|v| v.first().cloned())
+                    .or_else(|| cf.global.get(key).and_then(|v| v.first().cloned()))
             })
         };
 
@@ -3550,12 +3562,14 @@ impl ConfigFile {
     }
 
     /// Merge another parsed config into this one. Included values are
-    /// appended after existing values, so for single-valued keys (read
-    /// via `.last()`) the included file overrides the main file, and
-    /// for repeatable keys the included entries add to the list. This
-    /// models `includeconf` as splicing the included file in after the
-    /// directive — the common case is an included file that holds keys
-    /// (e.g. `rpcpassword`) the main file never sets.
+    /// appended after existing values, matching Bitcoin Core, which reads
+    /// the whole main config file before reading any `includeconf` file
+    /// (common/config.cpp `ReadConfigFiles`). Single-valued keys are read
+    /// first-wins (see `file_get`), so a key set in both the main file and
+    /// an included file resolves to the main file's value; repeatable keys
+    /// keep main-then-included order. The common case is an included file
+    /// holding keys (e.g. `rpcpassword`) the main file never sets, which
+    /// take effect unopposed.
     fn merge_from(&mut self, other: ConfigFile) {
         for (k, mut v) in other.global {
             self.global.entry(k).or_default().append(&mut v);
@@ -5395,15 +5409,34 @@ rpcport=39999
     }
 
     #[test]
-    fn includeconf_included_value_overrides_main() {
-        // Included files splice in *after* the directive, so a key set
-        // in both wins from the include (last-wins, like Core's later
-        // config lines).
+    fn includeconf_main_value_beats_included() {
+        // Bitcoin Core reads the whole main file, then appends included
+        // files, and resolves single-valued config keys first-wins
+        // (`reverse_precedence`). So a key set in both the main file and an
+        // included file resolves to the MAIN file's value.
         let (_d, cfg) = load_with_files(
             "rpcport=18443\nincludeconf=override.conf\n",
             &[("override.conf", "rpcport=19999\n")],
         );
-        assert_eq!(cfg.unwrap().rpcport, 19999);
+        assert_eq!(cfg.unwrap().rpcport, 18443);
+    }
+
+    #[test]
+    fn includeconf_main_wins_regardless_of_directive_position() {
+        // Core does NOT splice the include at the directive's position —
+        // it appends after the entire main file. So the main value wins
+        // whether `includeconf=` precedes or follows the setting.
+        let (_d, before) = load_with_files(
+            "includeconf=override.conf\nrpcport=18443\n",
+            &[("override.conf", "rpcport=19999\n")],
+        );
+        assert_eq!(before.unwrap().rpcport, 18443, "includeconf before the setting");
+
+        let (_d2, after) = load_with_files(
+            "rpcport=18443\nincludeconf=override.conf\n",
+            &[("override.conf", "rpcport=19999\n")],
+        );
+        assert_eq!(after.unwrap().rpcport, 18443, "includeconf after the setting");
     }
 
     #[test]

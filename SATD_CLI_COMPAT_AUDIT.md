@@ -102,17 +102,24 @@ single-dash Core spellings are aliased by `normalize_args`. Grouped:
   `mempool.dat` format (Core's datadir is not byte-compatible; see
   `CORE_DIFFERENCES.md`); the file is re-validated against the current
   chainstate on load, never trusted blindly.
-- **`includeconf`** — splices an additional config file (resolved
-  relative to `--datadir`, absolute paths used as-is) at the directive's
-  position; the included file's values are merged after the main file's,
-  so for single-valued keys the include wins (last-wins) and for
-  repeatable keys it adds. Processed for the global scope plus the active
-  network's section. Like Core: an `includeconf` *inside* an included
-  file is ignored with a warning (recursion guard), and a command-line
-  `-includeconf` is **rejected with an error** (config-file-only feature —
-  matches Core's "cannot be used from commandline"). A
-  `chain=` inside an included file does not change the active network —
-  the network is resolved from the main file + CLI before includes run.
+- **`includeconf`** — pulls in an additional config file (resolved
+  relative to `--datadir`, absolute paths used as-is). Matching Core,
+  the **entire main file is read first**, then included files are
+  appended (Core does *not* splice at the directive's position).
+  Single-valued keys resolve **first-wins** — Core's `reverse_precedence`
+  for config-file settings — so a key set in both the main file and an
+  included file takes the **main file's** value, regardless of where the
+  `includeconf=` line sits; repeatable keys add in main-then-included
+  order. The common case (an included file holding keys the main file
+  never sets, e.g. `rpcpassword`) takes effect unopposed. Processed for
+  the global scope plus the active network's section. Like Core: an
+  `includeconf` *inside* an included file is ignored with a warning
+  (recursion guard), and a command-line `-includeconf` is **rejected with
+  an error** (config-file-only feature — matches Core's "cannot be used
+  from commandline"). A `chain=` inside an included file does not change
+  the active network — the network is resolved from the main file + CLI
+  before includes run (and `chain=` itself stays last-wins, Core's
+  documented chain-type exception to first-wins).
 
 ---
 
