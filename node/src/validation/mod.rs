@@ -1,6 +1,7 @@
 pub mod block;
 pub mod pow;
 pub mod script;
+pub mod signet;
 pub mod tx;
 
 #[derive(Debug, thiserror::Error)]
@@ -35,4 +36,6 @@ pub enum ValidationError {
     BadTxNullInput,
     #[error("bad-witness-commitment")]
     BadWitnessCommitment,
+    #[error("bad-signet-solution")]
+    BadSignetSolution,
 }

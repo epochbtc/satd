@@ -95,7 +95,6 @@ pub struct PeerManager {
     peers: RwLock<HashMap<PeerId, PeerHandle>>,
     chain_state: Arc<ChainState>,
     mempool: Arc<Mempool>,
-    network: Network,
     next_id: AtomicU64,
     event_tx: mpsc::Sender<NetEvent>,
     event_rx: tokio::sync::Mutex<mpsc::Receiver<NetEvent>>,
@@ -252,7 +251,6 @@ impl PeerManager {
             peers: RwLock::new(HashMap::new()),
             chain_state: chain_state.clone(),
             mempool: mempool.clone(),
-            network,
             next_id: AtomicU64::new(1),
             event_tx,
             event_rx: tokio::sync::Mutex::new(event_rx),
@@ -2846,7 +2844,7 @@ impl PeerManager {
         direction: Direction,
         mut msg_rx: mpsc::Receiver<NetworkMessage>,
     ) -> Result<(), String> {
-        let mut conn = Connection::new(stream, self.network);
+        let mut conn = Connection::with_magic(stream, self.chain_state.p2p_magic());
 
         // Perform handshake with timeout
         let version = self.perform_handshake(id, &mut conn, direction).await?;

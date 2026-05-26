@@ -31,7 +31,7 @@ The authoritative list is `KNOWN_CONFIG_KEYS` in `satd/src/config.rs`;
 single-dash Core spellings are aliased by `normalize_args`. Grouped:
 
 - **Network / chain:** `regtest`, `testnet`, `signet`, `chain`,
-  `signetseednode`
+  `signetseednode`, `signetchallenge`
 - **Filesystem:** `datadir`, `blocksdir`, `conf`, `includeconf`, `pid`,
   `profile`
 - **Daemon / logging:** `daemon`, `server`, `logformat`, `debug`,
@@ -103,6 +103,17 @@ single-dash Core spellings are aliased by `normalize_args`. Grouped:
   `mempool.dat` format (Core's datadir is not byte-compatible; see
   `CORE_DIFFERENCES.md`); the file is re-validated against the current
   chainstate on load, never trusted blindly.
+- **`signetchallenge`** — selects a custom/private signet (BIP 325).
+  Hex-encoded challenge script; signet only (hard-errors on other
+  networks). When set, satd derives the P2P network magic from the
+  challenge (`SHA256d` of the length-prefixed bytes, first 4 — verified
+  against the default-signet magic in tests) and validates each block's
+  signet solution against the challenge. **Opt-in:** the default signet
+  (no `-signetchallenge`) is not solution-checked today, so this flag
+  only adds validation for the custom signet it configures — bounding
+  consensus risk to nodes explicitly running a custom signet. Wiring
+  default-signet solution validation is a follow-up. The signet genesis
+  is identical across signets, so it is not overridden.
 - **`includeconf`** — pulls in an additional config file (resolved
   relative to `--datadir`, absolute paths used as-is). Matching Core,
   the **entire main file is read first**, then included files are
@@ -130,7 +141,6 @@ These hard-error today. Listed with what real support would require.
 
 | Key | Notes |
 |---|---|
-| `signetchallenge` | Custom signet challenge script. Tracked as PR-2b. |
 | `maxuploadtarget` | Upload bandwidth cap + serving limits. Needs per-peer/global byte accounting + disconnect logic. |
 | `whitelist` / `whitebind` | Peer permission flags (`NetPermissionFlags`). Needs a peer-permission model in the peer manager. |
 | `blocksonly` | Suppress transaction relay. Needs a relay-suppression path in P2P. |
