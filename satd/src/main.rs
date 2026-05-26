@@ -906,6 +906,11 @@ async fn main() {
     // -maxuploadtarget: cap historical block upload per 24h (0 = off).
     peer_manager.set_max_upload_target(config.max_upload_target);
 
+    // Load the persistent address book (peers.dat) and seed the dial pool
+    // with learned peers so we don't have to re-bootstrap from DNS seeds
+    // on every restart.
+    peer_manager.load_addrman(&net_datadir.join("peers.dat"), 256);
+
     // -externalip: addresses advertised to peers.
     if !config.externalip.is_empty() {
         peer_manager.set_external_addrs(config.externalip.clone());
@@ -2109,6 +2114,9 @@ async fn main() {
             Err(e) => tracing::warn!(error = %e, "Failed to persist mempool"),
         }
     }
+
+    // Persist the address book so learned peers survive a restart.
+    peer_manager.dump_addrman(&net_datadir.join("peers.dat"));
 
     server_handle.stop().expect("Failed to stop server");
     auth.cleanup();
