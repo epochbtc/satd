@@ -6,23 +6,131 @@ use std::io;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 
-/// Wire-level P2P connection wrapping a TCP stream.
-pub struct Connection {
+use crate::net::v2transport::{V2Connection, V2Reader, V2Writer};
+
+/// Wire-level P2P connection.
+///
+/// This is the transport seam: every peer connection is either a plaintext
+/// v1 link (`V1`) or a BIP 324 v2 encrypted link (`V2`). The rest of the
+/// peer pipeline (handshake, read/write tasks, manager event loop) speaks
+/// `NetworkMessage` and is unaware of which transport carries it. The v2
+/// arms are scaffolding wired in a later PR of the BIP 324 stack.
+pub enum Connection {
+    V1(V1Connection),
+    V2(V2Connection),
+}
+
+/// Read half of a split [`Connection`]. Used in a dedicated read task
+/// to avoid cancel-safety issues with `tokio::select!`.
+pub enum ConnectionReader {
+    V1(V1Reader),
+    V2(V2Reader),
+}
+
+/// Write half of a split [`Connection`].
+pub enum ConnectionWriter {
+    V1(V1Writer),
+    V2(V2Writer),
+}
+
+impl Connection {
+    pub fn new(stream: TcpStream, network: Network) -> Self {
+        Self::with_magic(stream, Magic::from(network))
+    }
+
+    /// Construct a v1 connection with an explicit network magic. Used for
+    /// custom signet, whose magic is derived from the challenge rather
+    /// than the `Network` enum (BIP 325).
+    pub fn with_magic(stream: TcpStream, magic: Magic) -> Self {
+        Connection::V1(V1Connection {
+            stream,
+            magic,
+            buf: Vec::with_capacity(4096),
+        })
+    }
+
+    /// Split into separate read and write halves.
+    ///
+    /// This is used after the handshake to avoid cancel-safety issues:
+    /// the reader runs in a dedicated task that is never cancelled,
+    /// preventing stream misalignment from partial reads.
+    pub fn split(self) -> (ConnectionReader, ConnectionWriter) {
+        match self {
+            Connection::V1(c) => {
+                let (r, w) = c.split();
+                (ConnectionReader::V1(r), ConnectionWriter::V1(w))
+            }
+            Connection::V2(c) => {
+                let (r, w) = c.split();
+                (ConnectionReader::V2(r), ConnectionWriter::V2(w))
+            }
+        }
+    }
+
+    /// Send a network message.
+    pub async fn send(&mut self, msg: NetworkMessage) -> io::Result<()> {
+        match self {
+            Connection::V1(c) => c.send(msg).await,
+            Connection::V2(c) => c.send(msg).await,
+        }
+    }
+
+    /// Receive the next network message. Skips messages that fail to deserialize.
+    pub async fn recv(&mut self) -> io::Result<NetworkMessage> {
+        match self {
+            Connection::V1(c) => c.recv().await,
+            Connection::V2(c) => c.recv().await,
+        }
+    }
+
+    /// Get the peer's remote address.
+    pub fn peer_addr(&self) -> io::Result<std::net::SocketAddr> {
+        match self {
+            Connection::V1(c) => c.peer_addr(),
+            Connection::V2(c) => c.peer_addr(),
+        }
+    }
+}
+
+impl ConnectionWriter {
+    /// Send a network message.
+    pub async fn send(&mut self, msg: NetworkMessage) -> io::Result<()> {
+        match self {
+            ConnectionWriter::V1(w) => w.send(msg).await,
+            ConnectionWriter::V2(w) => w.send(msg).await,
+        }
+    }
+}
+
+impl ConnectionReader {
+    /// Receive the next network message. Skips messages that fail to deserialize.
+    ///
+    /// This method must NOT be used inside `tokio::select!` — it is not
+    /// cancel-safe. Instead, run it in a dedicated task that is never cancelled.
+    pub async fn recv(&mut self) -> io::Result<NetworkMessage> {
+        match self {
+            ConnectionReader::V1(r) => r.recv().await,
+            ConnectionReader::V2(r) => r.recv().await,
+        }
+    }
+}
+
+/// Plaintext v1 P2P connection wrapping a TCP stream.
+pub struct V1Connection {
     stream: TcpStream,
     magic: Magic,
     buf: Vec<u8>,
 }
 
-/// Read half of a split Connection. Used in a dedicated read task
-/// to avoid cancel-safety issues with tokio::select!.
-pub struct ConnectionReader {
+/// Read half of a split [`V1Connection`].
+pub struct V1Reader {
     stream: ReadHalf<TcpStream>,
     magic: Magic,
     buf: Vec<u8>,
 }
 
-/// Write half of a split Connection.
-pub struct ConnectionWriter {
+/// Write half of a split [`V1Connection`].
+pub struct V1Writer {
     stream: WriteHalf<TcpStream>,
     magic: Magic,
 }
@@ -34,36 +142,17 @@ const MAX_PAYLOAD_SIZE: usize = 32 * 1024 * 1024;
 /// Maximum bytes to scan when resyncing to magic after stream misalignment.
 const MAX_RESYNC_BYTES: usize = 256 * 1024;
 
-impl Connection {
-    pub fn new(stream: TcpStream, network: Network) -> Self {
-        Self::with_magic(stream, Magic::from(network))
-    }
-
-    /// Construct a connection with an explicit network magic. Used for
-    /// custom signet, whose magic is derived from the challenge rather
-    /// than the `Network` enum (BIP 325).
-    pub fn with_magic(stream: TcpStream, magic: Magic) -> Self {
-        Self {
-            stream,
-            magic,
-            buf: Vec::with_capacity(4096),
-        }
-    }
-
+impl V1Connection {
     /// Split into separate read and write halves.
-    ///
-    /// This is used after the handshake to avoid cancel-safety issues:
-    /// the reader runs in a dedicated task that is never cancelled,
-    /// preventing stream misalignment from partial reads.
-    pub fn split(self) -> (ConnectionReader, ConnectionWriter) {
+    pub fn split(self) -> (V1Reader, V1Writer) {
         let (read_half, write_half) = tokio::io::split(self.stream);
         (
-            ConnectionReader {
+            V1Reader {
                 stream: read_half,
                 magic: self.magic,
                 buf: self.buf,
             },
-            ConnectionWriter {
+            V1Writer {
                 stream: write_half,
                 magic: self.magic,
             },
@@ -88,7 +177,7 @@ impl Connection {
     }
 }
 
-impl ConnectionWriter {
+impl V1Writer {
     /// Send a network message.
     pub async fn send(&mut self, msg: NetworkMessage) -> io::Result<()> {
         let raw = RawNetworkMessage::new(self.magic, msg);
@@ -97,17 +186,17 @@ impl ConnectionWriter {
     }
 }
 
-impl ConnectionReader {
+impl V1Reader {
     /// Receive the next network message. Skips messages that fail to deserialize.
     ///
-    /// This method must NOT be used inside tokio::select! — it is not cancel-safe.
-    /// Instead, run it in a dedicated task that is never cancelled.
+    /// This method must NOT be used inside `tokio::select!` — it is not
+    /// cancel-safe. Instead, run it in a dedicated task that is never cancelled.
     pub async fn recv(&mut self) -> io::Result<NetworkMessage> {
         recv_message(&mut self.stream, self.magic, &mut self.buf).await
     }
 }
 
-/// Shared recv implementation for both Connection and ConnectionReader.
+/// Shared recv implementation for both V1Connection and V1Reader.
 async fn recv_message<R: AsyncReadExt + Unpin>(
     stream: &mut R,
     magic: Magic,

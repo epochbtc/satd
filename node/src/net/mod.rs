@@ -10,3 +10,4 @@ pub mod permissions;
 pub mod proxy;
 pub mod tor;
 pub mod sync;
+pub mod v2transport;
