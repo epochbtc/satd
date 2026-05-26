@@ -98,6 +98,9 @@ pub fn get_chain_states(chain_state: &ChainState) -> Value {
         // is not yet fully validated; a background chainstate validates
         // genesis→snapshot in parallel.
         Some(bg) => {
+            // `assumeutxo_rejected` (satd extension) is set when background
+            // validation has proven this snapshot invalid — distinct from
+            // the merely-not-yet-validated state.
             chainstates.push(json!({
                 "blocks": tip_height,
                 "bestblockhash": tip_hash.to_string(),
@@ -107,6 +110,7 @@ pub fn get_chain_states(chain_state: &ChainState) -> Value {
                 "coins_tip_cache_bytes": 0,
                 "snapshot_blockhash": bg.snapshot_hash().to_string(),
                 "validated": false,
+                "assumeutxo_rejected": bg.is_rejected(),
             }));
 
             let bg_height = bg.tip_height();
@@ -837,6 +841,69 @@ pub fn dump_txout_set(chain_state: &ChainState, path: &str) -> Result<Value, (i3
                  (concurrent modification or storage corruption)"
             ),
         )),
+    }
+}
+
+/// `loadtxoutset` — load a Bitcoin Core-format UTXO snapshot to bootstrap
+/// from the snapshot's height, validating the chain behind it in the
+/// background (AssumeUTXO).
+///
+/// `datadir` is the network datadir (the parent of `chainstate/`), used
+/// to site the background chainstate at `chainstate_background/`.
+/// `prune_target` is the configured `-prune` value; loadtxoutset refuses
+/// when pruning is enabled (a follow-up milestone).
+///
+/// The snapshot's base block hash must match a hardcoded AssumeUTXO anchor
+/// for this network, and the recomputed UTXO-set hash must match that
+/// anchor — otherwise the load is rejected (and rolled back).
+pub fn load_txout_set(
+    chain_state: &ChainState,
+    datadir: &std::path::Path,
+    prune_target: u64,
+    dbcache_mb: u64,
+    path: &str,
+) -> Result<Value, (i32, String)> {
+    use crate::chain::assumeutxo;
+    use crate::storage::compressed_coin::SnapshotMetadata;
+
+    if prune_target > 0 {
+        return Err((
+            -1,
+            "loadtxoutset is not supported with pruning enabled (-prune > 0)".to_string(),
+        ));
+    }
+
+    // Peek the header to discover the base block, then look up the anchor.
+    let mut header_reader = std::fs::File::open(path)
+        .map_err(|e| (-1, format!("cannot open snapshot file {path}: {e}")))?;
+    let meta = SnapshotMetadata::deserialize(&mut header_reader)
+        .map_err(|e| (-22, format!("invalid snapshot header: {e}")))?;
+    drop(header_reader);
+
+    let anchor = assumeutxo::lookup_by_blockhash(chain_state.network, &meta.base_blockhash)
+        .ok_or((
+            -22,
+            format!(
+                "unknown snapshot: base block {} is not a recognized AssumeUTXO anchor for this \
+                 network",
+                meta.base_blockhash
+            ),
+        ))?;
+
+    let bg_dir = datadir.join("chainstate_background");
+    let mut reader = std::fs::File::open(path)
+        .map_err(|e| (-1, format!("cannot open snapshot file {path}: {e}")))?;
+
+    // max_open_files for the background coins DB: -1 (RocksDB default);
+    // dbcache is operator-configured (passed in).
+    match chain_state.load_utxo_snapshot(&mut reader, anchor, bg_dir, dbcache_mb, -1) {
+        Ok(summary) => Ok(json!({
+            "coins_loaded": summary.coins_loaded,
+            "base_height": summary.base_height,
+            "base_hash": summary.base_hash.to_string(),
+            "tip_height": summary.tip_height,
+        })),
+        Err(e) => Err((-32, e.to_string())),
     }
 }
 

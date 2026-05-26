@@ -445,6 +445,35 @@ async fn main() {
         "Chain state initialized"
     );
 
+    // AssumeUTXO: re-attach a pending background validator left by a prior
+    // run, or refuse to start if that snapshot was proven invalid. A
+    // completed handoff removes `chainstate_background/`, so its presence
+    // means validation was still in progress (or failed).
+    match chain_state.resume_pending_snapshot(&net_datadir, 256, -1) {
+        Ok(node::chain::state::SnapshotResume::None) => {}
+        Ok(node::chain::state::SnapshotResume::Resumed { height }) => {
+            tracing::warn!(
+                snapshot_height = height,
+                "AssumeUTXO: resumed pending background validation; this node is serving an \
+                 assumed-valid snapshot until validation completes"
+            );
+        }
+        Ok(node::chain::state::SnapshotResume::Rejected) => {
+            eprintln!(
+                "FATAL: the loaded AssumeUTXO snapshot FAILED background validation in a prior \
+                 run. Refusing to serve a known-invalid UTXO set. Recover by reindexing \
+                 (--reindex) or removing the datadir's chainstate and reloading a valid snapshot."
+            );
+            auth.cleanup();
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("FATAL: cannot resume pending AssumeUTXO snapshot: {e}");
+            auth.cleanup();
+            std::process::exit(1);
+        }
+    }
+
     // Repair any HeaderOnly block-index entries above tip whose data is
     // actually present in the flat files. Idempotent: when there are no
     // holes (the healthy case) it's just one cheap index walk over

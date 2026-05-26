@@ -589,6 +589,38 @@ pub async fn start(
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
+    module.register_method("loadtxoutset", |params, ctx, _extensions| {
+        let path: String = params
+            .one()
+            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+        // Network datadir (parent of chainstate/) and prune target from
+        // the effective config. For mainnet — the only network with
+        // AssumeUTXO anchors — the network datadir is the base datadir.
+        let datadir = ctx
+            .effective_config
+            .get("datadir")
+            .and_then(|v| v.as_str())
+            .map(std::path::PathBuf::from)
+            .ok_or_else(|| {
+                ErrorObjectOwned::owned(-1, "datadir not available in config", None::<()>)
+            })?;
+        let prune_target = ctx
+            .effective_config
+            .get("prune")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        // Background coins-DB cache: honor the operator's configured
+        // dbcache (the background is transient and dropped at handoff),
+        // falling back to a modest default.
+        let dbcache_mb = ctx
+            .effective_config
+            .get("dbcache")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(256);
+        blockchain::load_txout_set(&ctx.chain_state, &datadir, prune_target, dbcache_mb, &path)
+            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
+    })?;
+
     // --- Address-history index RPCs (M3) ---
 
     module.register_method("getaddressbalance", |params, ctx, _extensions| {
