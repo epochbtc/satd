@@ -117,7 +117,12 @@ pub fn interpret(asmap: &[bool], ip_bits: &[bool]) -> u32 {
     while !bits.at_end() {
         let opcode = decode_type(&mut bits);
         if opcode == RETURN {
-            return decode_asn(&mut bits);
+            let asn = decode_asn(&mut bits);
+            // A truncated/malformed map can make decode_asn return INVALID
+            // (u32::MAX). Never surface that as a real ASN — treat it as
+            // unmapped (0) so `group_key` falls back to /16 rather than
+            // bucketing every peer into the bogus group 0xA0||ffffffff.
+            return if asn == INVALID { 0 } else { asn };
         } else if opcode == JUMP {
             let jump = decode_jump(&mut bits);
             if jump == INVALID || remaining == 0 {
@@ -165,6 +170,109 @@ pub fn interpret(asmap: &[bool], ip_bits: &[bool]) -> u32 {
     0
 }
 
+/// Structural validation of an asmap bitstream — a direct port of Bitcoin
+/// Core's `SanityCheckASMap` (`util/asmap.cpp`). Rejects truncated or
+/// malformed maps (instructions/ASNs that straddle EOF, jumps out of range
+/// or into the middle of another instruction, over-consumed IP bits,
+/// excessive or nonzero padding, missing terminal RETURN). `bits` is the
+/// number of address bits a lookup consumes (128, IPv4-mapped). Core
+/// refuses to start with a map that fails this, and so does satd's `load`.
+fn sanity_check_asmap(asmap: &[bool], bits: i64) -> bool {
+    let endpos = asmap.len();
+    let mut cur = Bits::new(asmap);
+    // Future jump targets: (bit offset in asmap, IP bits left after jump).
+    let mut jumps: Vec<(usize, i64)> = Vec::new();
+    let mut prevopcode = JUMP;
+    let mut had_incomplete_match = false;
+    let mut bits = bits;
+
+    while !cur.at_end() {
+        let offset = cur.pos;
+        if let Some(&(top, _)) = jumps.last()
+            && offset >= top
+        {
+            return false; // jumped into the middle of the previous instruction
+        }
+        let opcode = decode_type(&mut cur);
+        if opcode == RETURN {
+            if prevopcode == DEFAULT {
+                return false; // RETURN immediately after DEFAULT (should be combined)
+            }
+            if decode_asn(&mut cur) == INVALID {
+                return false; // ASN straddles EOF
+            }
+            if let Some(&(joff, jbits)) = jumps.last() {
+                if cur.pos != joff {
+                    return false; // unreachable code
+                }
+                bits = jbits;
+                jumps.pop();
+                prevopcode = JUMP;
+            } else {
+                // Nothing left to execute: only zero padding (<= 7 bits) may remain.
+                if endpos - cur.pos > 7 {
+                    return false; // excessive padding
+                }
+                while let Some(b) = cur.next() {
+                    if b {
+                        return false; // nonzero padding bit
+                    }
+                }
+                return true; // sanely reached EOF
+            }
+        } else if opcode == JUMP {
+            let jump = decode_jump(&mut cur);
+            if jump == INVALID {
+                return false; // jump offset straddles EOF
+            }
+            if jump as i64 > (endpos - cur.pos) as i64 {
+                return false; // jump out of range
+            }
+            if bits == 0 {
+                return false; // consuming an IP bit past the end
+            }
+            bits -= 1;
+            let jump_offset = cur.pos + jump as usize;
+            if let Some(&(top, _)) = jumps.last()
+                && jump_offset >= top
+            {
+                return false; // intersecting jumps
+            }
+            jumps.push((jump_offset, bits));
+            prevopcode = JUMP;
+        } else if opcode == MATCH {
+            let m = decode_match(&mut cur);
+            if m == INVALID {
+                return false; // match bits straddle EOF
+            }
+            let matchlen = (count_bits(m) - 1) as i64;
+            if prevopcode != MATCH {
+                had_incomplete_match = false;
+            }
+            if matchlen < 8 && had_incomplete_match {
+                return false; // at most one incomplete match per sequence
+            }
+            had_incomplete_match = matchlen < 8;
+            if bits < matchlen {
+                return false; // consuming IP bits past the end
+            }
+            bits -= matchlen;
+            prevopcode = MATCH;
+        } else if opcode == DEFAULT {
+            if prevopcode == DEFAULT {
+                return false; // two successive DEFAULTs (should be combined)
+            }
+            if decode_asn(&mut cur) == INVALID {
+                return false; // ASN straddles EOF
+            }
+            prevopcode = DEFAULT;
+        } else {
+            return false; // instruction straddles EOF
+        }
+    }
+    false // reached EOF without a terminal RETURN
+}
+
 /// Convert an IP address to its 128-bit big-endian bit vector (IPv4 is
 /// represented as IPv4-mapped, matching how asmap files are built).
 pub fn ip_to_bits(ip: IpAddr) -> Vec<bool> {
@@ -208,7 +316,17 @@ impl AsMap {
         if bytes.is_empty() {
             return Err(format!("asmap {} is empty", path.display()));
         }
-        Ok(Self::from_bytes(&bytes))
+        let map = Self::from_bytes(&bytes);
+        // Reject malformed/truncated maps up front, like Core's
+        // SanityCheckASMap — otherwise a bad file could degrade addrman
+        // grouping at runtime instead of failing fast at startup.
+        if !sanity_check_asmap(&map.bits, 128) {
+            return Err(format!(
+                "asmap {} is malformed (failed structural sanity check)",
+                path.display()
+            ));
+        }
+        Ok(map)
     }
 
     /// Look up the ASN for `ip` (0 = unknown / not in the map).
@@ -380,5 +498,42 @@ mod tests {
         // All-zero bytes are RETURN(ASN=1) (every field at its minimum).
         let am0 = AsMap::from_bytes(&[0x00, 0x00, 0x00]);
         assert_eq!(am0.lookup("8.8.8.8".parse().unwrap()), 1);
+    }
+
+    #[test]
+    fn truncated_return_decodes_to_unmapped_not_max() {
+        // A RETURN type bit followed by EOF (no ASN field) makes decode_asn
+        // return INVALID; interpret must surface 0 (unmapped), never
+        // u32::MAX — otherwise group_key would bucket everyone into
+        // 0xA0||ffffffff and destroy addrman diversity.
+        let asmap = vec![false]; // single RETURN type bit, then EOF
+        assert_eq!(interpret(&asmap, &[false; 128]), 0);
+        let am = AsMap::from_bytes(&[0x00]); // 8 bits: RETURN + truncated ASN
+        assert_ne!(am.lookup("1.2.3.4".parse().unwrap()), u32::MAX);
+        // Unmapped → /16 fallback group, not the ASN-tagged 0xA0 prefix.
+        assert_ne!(am.group_key("1.2.3.4".parse().unwrap())[0], 0xA0);
+    }
+
+    #[test]
+    fn sanity_check_accepts_valid_and_rejects_malformed() {
+        // Valid single-RETURN maps (with <=7 zero padding bits) pass.
+        assert!(sanity_check_asmap(&AsMap::from_bytes(&[0x00, 0x00, 0x00]).bits, 128));
+        assert!(sanity_check_asmap(&AsMap::from_bytes(&[0x00, 0x00, 0x01]).bits, 128));
+        // A one-byte file can't hold a full RETURN+ASN → ASN straddles EOF.
+        assert!(!sanity_check_asmap(&AsMap::from_bytes(&[0x00]).bits, 128));
+        // No terminal RETURN reachable (empty) → not sane.
+        assert!(!sanity_check_asmap(&[], 128));
+    }
+
+    #[test]
+    fn load_rejects_malformed_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad = dir.path().join("bad.map");
+        std::fs::write(&bad, [0x00u8]).unwrap(); // truncated RETURN
+        assert!(AsMap::load(&bad).err().unwrap().contains("malformed"));
+
+        let good = dir.path().join("good.map");
+        std::fs::write(&good, [0x00u8, 0x00, 0x00]).unwrap(); // RETURN(ASN=1)
+        assert_eq!(AsMap::load(&good).unwrap().lookup("9.9.9.9".parse().unwrap()), 1);
     }
 }

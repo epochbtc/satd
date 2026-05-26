@@ -185,7 +185,6 @@ These hard-error today. Listed with what real support would require.
 
 | Key | Notes |
 |---|---|
-| `asmap` | ASN-based addrman bucketing (eclipse resistance). Needs an ASN map loader + addrman bucketing. |
 | `forcednsseed` | Force DNS seeding even when addrman is full. satd has no persistent addrman and seeds at every start, so this has no distinct effect yet. |
 | `fixedseeds` | Fall back to the compiled-in fixed-IP seed list. satd has no fixed-IP seed list (only DNS + `.onion` seeds), so nothing to gate yet. |
 
