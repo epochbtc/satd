@@ -1875,7 +1875,13 @@ async fn main() {
 
     // DNS seeding: only if no explicit --connect peers and both -dns
     // (hostname resolution) and -dnsseed (query DNS seeds) are enabled.
-    if config.connect.is_empty() && config.dns && config.dnsseed {
+    // Now that the address book persists, skip DNS when it already has
+    // entries — unless -forcednsseed demands a query regardless.
+    let dns_seeding = config.connect.is_empty()
+        && config.dns
+        && config.dnsseed
+        && (config.forcednsseed || peer_manager.addrman_is_empty());
+    if dns_seeding {
         let seed_addrs = node::net::dns::resolve_seeds_with(
             config.network,
             config.proxy.as_deref(),
@@ -1891,6 +1897,30 @@ async fn main() {
                     tracing::warn!(%addr, "Seed peer connection failed: {}", e);
                 }
             });
+        }
+    }
+
+    // -fixedseeds: last-resort fallback to satd's compiled-in fixed seed
+    // list when DNS seeding did not run (disabled), the address book is
+    // empty, and there are no explicit -connect peers. -fixedseeds=0
+    // forbids it.
+    if config.fixedseeds
+        && config.connect.is_empty()
+        && peer_manager.addrman_is_empty()
+        && !dns_seeding
+    {
+        let fixed = node::net::dns::fixed_seeds_for_network(config.network);
+        if !fixed.is_empty() {
+            tracing::info!(count = fixed.len(), "Bootstrapping from compiled-in fixed seeds");
+            for addr in fixed {
+                peer_manager.add_peer_addr(addr.clone());
+                let pm = peer_manager.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = pm.connect_peer_addr(&addr).await {
+                        tracing::warn!(%addr, "Fixed seed connection failed: {}", e);
+                    }
+                });
+            }
         }
     }
 

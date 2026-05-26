@@ -124,6 +124,23 @@ fn onion_seeds_for_network(network: Network) -> &'static [(&'static str, u16)] {
     }
 }
 
+/// satd's compiled-in *fixed seeds* (Bitcoin Core's `-fixedseeds`
+/// fallback). These are the hardcoded node addresses satd ships — used
+/// as a last resort to bootstrap a node with an empty address book and
+/// DNS seeding disabled. satd ships well-known `.onion` v3 nodes (which
+/// double as the Tor-mode fallback); clearnet fixed-IP seeds are not
+/// embedded (they go stale), so on clearnet this list is `.onion`-only
+/// and only reachable via a configured proxy.
+pub fn fixed_seeds_for_network(network: Network) -> Vec<PeerAddr> {
+    onion_seeds_for_network(network)
+        .iter()
+        .map(|(host, port)| PeerAddr::Onion {
+            host: host.to_string(),
+            port: *port,
+        })
+        .collect()
+}
+
 /// Resolve seeds for the given network, returning PeerAddr values.
 ///
 /// When a proxy is configured, uses hardcoded .onion seeds instead of

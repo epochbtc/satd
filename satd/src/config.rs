@@ -663,6 +663,13 @@ pub struct Config {
     /// addresses. Default true. satd gates DNS seeding on both `dns`
     /// and `dnsseed`, so either set to false disables it.
     pub dnsseed: bool,
+    /// Bitcoin Core's `-forcednsseed`: query DNS seeds even when the
+    /// address book already has entries. Default false.
+    pub forcednsseed: bool,
+    /// Bitcoin Core's `-fixedseeds`: allow falling back to the compiled-in
+    /// fixed seed list when the address book is empty and DNS seeding is
+    /// off. Default true.
+    pub fixedseeds: bool,
     pub bantime: u64,
     // Proxy / Tor
     pub proxy: Option<String>,
@@ -1995,6 +2002,14 @@ impl Config {
                 .dnsseed
                 .or_else(|| file_get("dnsseed").and_then(|v| parse_bool(&v)))
                 .unwrap_or(true),
+            forcednsseed: cli
+                .forcednsseed
+                .or_else(|| file_get("forcednsseed").and_then(|v| parse_bool(&v)))
+                .unwrap_or(false),
+            fixedseeds: cli
+                .fixedseeds
+                .or_else(|| file_get("fixedseeds").and_then(|v| parse_bool(&v)))
+                .unwrap_or(true),
             bantime: cli
                 .bantime
                 .or_else(|| file_get("bantime").and_then(|v| v.parse().ok()))
@@ -2289,6 +2304,8 @@ impl Config {
                 "bind": self.bind,
                 "dns": self.dns,
                 "dnsseed": self.dnsseed,
+                "forcednsseed": self.forcednsseed,
+                "fixedseeds": self.fixedseeds,
                 "connect": self.connect,
                 "addnode": self.addnode,
                 "seednode": self.seednode,
@@ -3186,6 +3203,30 @@ pub struct CliArgs {
     )]
     pub dnsseed: Option<bool>,
 
+    /// Bitcoin Core's `-forcednsseed`: always query DNS seeds, even when
+    /// the address book is already populated.
+    #[arg(
+        long,
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
+        help = "Always query DNS seeds even with a populated address book (default: false)"
+    )]
+    pub forcednsseed: Option<bool>,
+
+    /// Bitcoin Core's `-fixedseeds`: allow the compiled-in fixed-seed
+    /// fallback (default true; set 0 to forbid it).
+    #[arg(
+        long,
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
+        help = "Allow the compiled-in fixed seed fallback (default: true)"
+    )]
+    pub fixedseeds: Option<bool>,
+
     #[arg(
         long,
         value_name = "SECS",
@@ -3747,6 +3788,8 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "seednode",
         "dns",
         "dnsseed",
+        "forcednsseed",
+        "fixedseeds",
         "blocksonly",
         "externalip",
         "whitelist",
@@ -3805,6 +3848,8 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "blocksonly",
         "dns",
         "dnsseed",
+        "forcednsseed",
+        "fixedseeds",
         "listenonion",
         "txindex",
         "addressindex",
@@ -4120,6 +4165,8 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "maxuploadtarget",
     "dns",
     "dnsseed",
+    "forcednsseed",
+    "fixedseeds",
     "bantime",
     "timeout",
     "onlynet",
@@ -4258,14 +4305,11 @@ pub enum UnsupportedKey {
 /// routinely move security-sensitive options into an included file, so
 /// silently ignoring it could run a node wide open. When a key here
 /// gains real support, move it into [`KNOWN_CONFIG_KEYS`].
-const NOT_YET_IMPLEMENTED_KEYS: &[&str] = &[
-    // The two below need machinery satd lacks today (persistent
-    // addrman / a compiled-in fixed-IP seed list). satd seeds at every
-    // startup and has no fixed-IP seed list, so neither flag has a
-    // distinct effect to attach to — defer rather than accept-and-ignore.
-    "forcednsseed", // always query DNS seeds even when addrman is full
-    "fixedseeds",   // fall back to the compiled-in fixed-IP seed list
-];
+// Currently empty: every Core key satd previously deferred has been
+// implemented and moved into KNOWN_CONFIG_KEYS. The NotYetImplemented
+// classification path is retained for any future deferral — add the key
+// here and it hard-errors at parse time (see ConfigFile::parse).
+const NOT_YET_IMPLEMENTED_KEYS: &[&str] = &[];
 
 /// Bitcoin Core config keys satd RECOGNISES but will NOT implement —
 /// either deprecated upstream or deliberately out of scope (see
@@ -4744,6 +4788,8 @@ rpcport=8332
             seednode: vec![],
             dns: None,
             dnsseed: None,
+            forcednsseed: None,
+            fixedseeds: None,
             bantime: None,
             blockmaxweight: None,
             blockmintxfee: None,
@@ -4952,6 +4998,8 @@ rpcport=8332
             seednode: vec![],
             dns: None,
             dnsseed: None,
+            forcednsseed: None,
+            fixedseeds: None,
             bantime: None,
             blockmaxweight: None,
             blockmintxfee: None,
@@ -6136,6 +6184,42 @@ rpcport=39999
         assert_eq!(parse_chain_name("testnet4").unwrap(), Network::Testnet4);
     }
 
+    // ---- forcednsseed / fixedseeds ----
+
+    #[test]
+    fn forcednsseed_fixedseeds_defaults() {
+        let cfg = Config::from_cli(CliArgs::try_parse_from(["satd", "--regtest"]).unwrap()).unwrap();
+        assert!(!cfg.forcednsseed, "forcednsseed defaults off");
+        assert!(cfg.fixedseeds, "fixedseeds defaults on");
+    }
+
+    #[test]
+    fn forcednsseed_and_fixedseeds_flags() {
+        let cfg = Config::from_cli(
+            CliArgs::try_parse_from(["satd", "--regtest", "--forcednsseed", "--fixedseeds=0"])
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(cfg.forcednsseed);
+        assert!(!cfg.fixedseeds);
+    }
+
+    #[test]
+    fn forcednsseed_fixedseeds_negation() {
+        let argv = normalize_args(
+            ["satd", "--regtest", "-nofixedseeds"].iter().map(|s| s.to_string()).collect(),
+        );
+        let cfg = Config::from_cli(CliArgs::try_parse_from(argv).unwrap()).unwrap();
+        assert!(!cfg.fixedseeds);
+    }
+
+    #[test]
+    fn forcednsseed_fixedseeds_recognised() {
+        assert_eq!(classify_unsupported_key("forcednsseed"), None);
+        assert_eq!(classify_unsupported_key("fixedseeds"), None);
+        assert!(is_known_config_key("forcednsseed") && is_known_config_key("fixedseeds"));
+    }
+
     // ---- asmap ----
 
     #[test]
@@ -6421,32 +6505,15 @@ notarealkey=1
     }
 
     #[test]
-    fn not_yet_implemented_keys_hard_error() {
-        // Core keys we recognise but have not built yet. They must
-        // hard-error (not be silently accepted), classify as
-        // NotYetImplemented, and NOT be in the plain known-keys
-        // allowlist.
-        for k in [
-            "forcednsseed",
-            "fixedseeds",
-        ] {
-            assert_eq!(
-                classify_unsupported_key(k),
-                Some(UnsupportedKey::NotYetImplemented),
-                "{k:?} should classify as NotYetImplemented"
-            );
-            assert!(
-                !is_known_config_key(k),
-                "{k:?} must not be in the implemented allowlist"
-            );
-            let err = ConfigFile::parse(&format!("{k}=1")).unwrap_err();
-            assert!(
-                err.contains("recognises but does NOT")
-                    && err.contains("SATD_CLI_COMPAT_AUDIT.md")
-                    && err.contains(k),
-                "expected a not-yet-implemented error for {k:?}, got: {err}"
-            );
-        }
+    fn not_yet_implemented_list_is_empty_after_migration() {
+        // Every formerly-deferred Core key has now been implemented, so
+        // the not-yet-implemented list is empty. The NotYetImplemented
+        // classification path itself remains wired (ConfigFile::parse
+        // still hard-errors on any future entry added here).
+        assert!(
+            NOT_YET_IMPLEMENTED_KEYS.is_empty(),
+            "an entry was re-added; ensure it hard-errors and update this test"
+        );
     }
 
     #[test]
