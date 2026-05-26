@@ -62,6 +62,7 @@ impl MetricsContext {
         let flush_threshold = self.chain_state.flush_threshold() as u64;
         let mempool_info = self.mempool.info();
         let peer_count = self.peer_manager.connection_count() as u64;
+        let peer_count_v2 = self.peer_manager.connection_count_v2() as u64;
         let uptime_secs = self.start_time.elapsed().as_secs();
         let network_str = network_label(self.network);
         let (rss_bytes, vm_bytes) = process_memory().unwrap_or((0, 0));
@@ -171,6 +172,14 @@ impl MetricsContext {
             "gauge",
             &[],
             peer_count,
+        );
+        metric(
+            &mut out,
+            "satd_peer_connections_v2",
+            "Number of connected P2P peers using the BIP 324 v2 transport.",
+            "gauge",
+            &[],
+            peer_count_v2,
         );
         metric(
             &mut out,

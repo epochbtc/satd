@@ -111,6 +111,14 @@ impl Connection {
             Connection::V2(c) => c.peer_addr(),
         }
     }
+
+    /// Which wire transport this connection uses.
+    pub fn transport_protocol(&self) -> crate::net::peer::TransportProtocol {
+        match self {
+            Connection::V1(_) => crate::net::peer::TransportProtocol::V1,
+            Connection::V2(_) => crate::net::peer::TransportProtocol::V2,
+        }
+    }
 }
 
 impl ConnectionWriter {
