@@ -67,3 +67,17 @@ Operators could define local rulesets using simple boolean logic on transaction 
 
 ### SD-card-friendly write discipline
 **Proposal:** `--sdcard-safe` mode: rate-limit RocksDB compactions, batch log writes, and warn if OS appears to be on removable media.
+
+## Network Privacy & Anti-Surveillance
+
+### BIP 324 v2 encrypted transport + v2-only peer policy
+**Status:** Not yet implemented. (NOTE: `README.md` and `CORE_DIFFERENCES.md` currently overstate this — they list BIP 324 as supported / "in progress", but there is no v2 transport in the codebase yet. Those claims should be corrected when this lands.)
+
+**Proposal:** Implement the BIP 324 v2 encrypted P2P transport (the `BIP324Cipher`/`ElligatorSwift` handshake + ChaCha20-Poly1305 packet encryption) for both responding to and initiating connections, with the v1↔v2 negotiation/downgrade dance. Then expose operator toggles:
+
+- `-v2transport=1` (Core-compatible) — offer/accept v2; fall back to v1 otherwise. This is the baseline.
+- **`-v2only`** (satd-specific) — refuse or immediately disconnect any peer that does not speak v2. This is the privacy/anti-surveillance lever.
+
+**Why this matters (the motivating rationale):** Greg Maxwell (gmaxwell) has observed that, as of 2025, virtually none of the spy / DoS / surveillance nodes on the network support v2 transport. Simply **disconnecting anything not using v2 eliminates essentially all of the spy and abuse traffic** — without having to maintain banlists, monitor for mass-connectors, or fingerprint abuse patterns. A `-v2only` toggle gives privacy-conscious operators that mitigation as a single switch. (Caveat to revisit before shipping the default: this also drops legitimate not-yet-upgraded honest peers, so `-v2only` should stay **opt-in**, off by default, until v2 adoption is high enough that the connectivity tradeoff is safe.)
+
+**Scope notes:** v2 transport is a peer-link concern (no consensus impact). It should integrate with the existing `PeerManager`/`Connection` layer and compose with `-onlynet`, `-proxy`/Tor, and the addrman. Surface v2/v1 status per peer in `getpeerinfo` (`transport_protocol_type` / `v2` fields, Core-compatible) and as a metrics gauge.
