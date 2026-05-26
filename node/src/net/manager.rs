@@ -1810,18 +1810,61 @@ impl PeerManager {
         // snapshot_height), store it for the background connector instead
         // of the normal connect path — accept_block would reject a
         // below-tip block as a stale side branch.
-        if let Some(bg) = self.chain_state.background() {
-            let prospective_height = self
-                .chain_state
-                .get_block_index(&block.header.prev_blockhash)
-                .map(|p| p.height + 1);
-            if matches!(prospective_height, Some(h) if h <= bg.snapshot_height()) {
+        if let Some(bg) = self.chain_state.background()
+            && let Some(parent) = self.chain_state.get_block_index(&block.header.prev_blockhash)
+            && parent.height < bg.snapshot_height()
+        {
+            let height = parent.height + 1;
+            // Only the canonical block for this height may be stored — see
+            // `historical_block_storable`. A valid non-canonical side block
+            // here would overwrite the shared height→hash mapping the
+            // background connector depends on and derail validation.
+            if historical_block_storable(
+                bg.snapshot_height(),
+                height,
+                self.chain_state.get_block_hash_by_height(height),
+                block.block_hash(),
+            ) {
                 self.store_bg_block(id, block);
-                return;
+            } else {
+                tracing::debug!(
+                    height,
+                    hash = %block.block_hash(),
+                    "bg catch-up: dropping non-canonical historical block"
+                );
             }
+            return;
         }
         // Normal mode
         let _ = self.block_tx.send(block);
+    }
+
+    /// While an AssumeUTXO background validator is attached, refuse to
+    /// store a block in the historical range (≤ snapshot_height) that is
+    /// NOT the canonical block for its height. The headers for the whole
+    /// genesis→snapshot range are canonical and fixed (a loadtxoutset
+    /// precondition); a peer may still relay a valid non-canonical
+    /// historical block extending a known ancestor, and storing it would
+    /// overwrite the shared height→hash mapping the background connector
+    /// reads — derailing validation or falsely rejecting the snapshot.
+    /// Returns true when the block must be dropped before `store_block`.
+    fn is_poisoning_historical_block(&self, block: &bitcoin::Block) -> bool {
+        let bg = match self.chain_state.background() {
+            Some(b) => b,
+            None => return false,
+        };
+        let height = match self.chain_state.get_block_index(&block.header.prev_blockhash) {
+            // Parent unknown — store_block rejects with BadPrevBlock and
+            // never writes a height→hash mapping, so it cannot poison.
+            None => return false,
+            Some(p) => p.height + 1,
+        };
+        !historical_block_storable(
+            bg.snapshot_height(),
+            height,
+            self.chain_state.get_block_hash_by_height(height),
+            block.block_hash(),
+        )
     }
 
     /// Block arrival during forward IBD swarm. Stores the block and
@@ -1829,6 +1872,17 @@ impl PeerManager {
     /// active, a stored historical block additionally wakes the background
     /// connector.
     fn handle_block_ibd(&self, id: PeerId, block: bitcoin::Block) {
+        // A non-canonical historical block (≤ snapshot_height) can arrive
+        // unsolicited even during forward IBD; storing it would poison the
+        // shared height→hash mapping the background connector relies on.
+        // Drop it before store_block. (No-op when no snapshot is loaded.)
+        if self.is_poisoning_historical_block(&block) {
+            tracing::debug!(
+                hash = %block.block_hash(),
+                "IBD: dropping non-canonical sub-snapshot block while a background validator is active"
+            );
+            return;
+        }
         let hash = block.block_hash();
         match self.chain_state.store_block(&block) {
             Ok((_, height)) => {
@@ -3689,6 +3743,28 @@ fn now_unix_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Whether a block arriving for the background's historical range may be
+/// stored. Pure decision so the AssumeUTXO height→hash poisoning guard is
+/// unit-testable without a full `PeerManager`.
+///
+/// - A block above `snapshot_height` is forward-range, not part of the
+///   fixed historical mapping → storable.
+/// - At or below the snapshot it must be the canonical block for its
+///   height (`canonical_at_height == Some(block_hash)`); a valid
+///   non-canonical side block is refused so it cannot overwrite the
+///   shared height→hash mapping the background connector reads.
+fn historical_block_storable(
+    snapshot_height: u32,
+    prospective_height: u32,
+    canonical_at_height: Option<bitcoin::BlockHash>,
+    block_hash: bitcoin::BlockHash,
+) -> bool {
+    if prospective_height > snapshot_height {
+        return true;
+    }
+    canonical_at_height == Some(block_hash)
+}
+
 /// Reconsider orphans whose missing parent was just confirmed in `block`.
 ///
 /// Standalone so the `block_processor` thread — which doesn't have a
@@ -3793,6 +3869,50 @@ impl Drop for BulkLoadGuard<'_> {
 mod tests {
     use super::*;
     use crate::net::peer::{Direction, PeerInfo, PeerState};
+
+    fn bh(byte: u8) -> bitcoin::BlockHash {
+        use bitcoin::hashes::Hash;
+        bitcoin::BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+            [byte; 32],
+        ))
+    }
+
+    #[test]
+    fn historical_block_storable_accepts_canonical_in_range() {
+        // At/below the snapshot, only the canonical block for the height
+        // may be stored.
+        assert!(historical_block_storable(800_000, 500, Some(bh(1)), bh(1)));
+    }
+
+    #[test]
+    fn historical_block_storable_rejects_noncanonical_side_block() {
+        // A valid non-canonical block at a historical height is refused so
+        // it cannot overwrite the shared height→hash mapping.
+        assert!(!historical_block_storable(800_000, 500, Some(bh(1)), bh(2)));
+    }
+
+    #[test]
+    fn historical_block_storable_rejects_when_no_canonical_mapping() {
+        // No canonical header for the height (cannot happen given the
+        // loadtxoutset precondition, but fail safe): refuse rather than
+        // poison.
+        assert!(!historical_block_storable(800_000, 500, None, bh(2)));
+    }
+
+    #[test]
+    fn historical_block_storable_allows_forward_range() {
+        // Above the snapshot height the block is not part of the fixed
+        // historical mapping and is always storable (forward IBD).
+        assert!(historical_block_storable(800_000, 800_001, None, bh(9)));
+        assert!(historical_block_storable(800_000, 800_001, Some(bh(1)), bh(9)));
+    }
+
+    #[test]
+    fn historical_block_storable_snapshot_boundary_requires_canonical() {
+        // Exactly at the snapshot height the canonical check still applies.
+        assert!(historical_block_storable(800_000, 800_000, Some(bh(7)), bh(7)));
+        assert!(!historical_block_storable(800_000, 800_000, Some(bh(7)), bh(8)));
+    }
 
     fn mk_handle(id: PeerId, addr: SocketAddr, dir: Direction, state: PeerState) -> PeerHandle {
         let mut info = PeerInfo::new(id, addr, dir);
