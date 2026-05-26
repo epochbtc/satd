@@ -109,7 +109,8 @@ single-dash Core spellings are aliased by `normalize_args`. Grouped:
   repeatable keys it adds. Processed for the global scope plus the active
   network's section. Like Core: an `includeconf` *inside* an included
   file is ignored with a warning (recursion guard), and a command-line
-  `-includeconf` is ignored with a warning (config-file-only feature). A
+  `-includeconf` is **rejected with an error** (config-file-only feature —
+  matches Core's "cannot be used from commandline"). A
   `chain=` inside an included file does not change the active network —
   the network is resolved from the main file + CLI before includes run.
 
