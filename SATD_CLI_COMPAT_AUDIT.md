@@ -32,7 +32,8 @@ single-dash Core spellings are aliased by `normalize_args`. Grouped:
 
 - **Network / chain:** `regtest`, `testnet`, `signet`, `chain`,
   `signetseednode`
-- **Filesystem:** `datadir`, `blocksdir`, `conf`, `pid`, `profile`
+- **Filesystem:** `datadir`, `blocksdir`, `conf`, `includeconf`, `pid`,
+  `profile`
 - **Daemon / logging:** `daemon`, `server`, `logformat`, `debug`,
   `debugexclude`, `maxshutdownsecs`
 - **RPC + TLS / mTLS:** `rpcport`, `rpcbind`, `rpcallowip`, `rpcuser`,
@@ -101,6 +102,24 @@ single-dash Core spellings are aliased by `normalize_args`. Grouped:
   `mempool.dat` format (Core's datadir is not byte-compatible; see
   `CORE_DIFFERENCES.md`); the file is re-validated against the current
   chainstate on load, never trusted blindly.
+- **`includeconf`** — pulls in an additional config file (resolved
+  relative to `--datadir`, absolute paths used as-is). Matching Core,
+  the **entire main file is read first**, then included files are
+  appended (Core does *not* splice at the directive's position).
+  Single-valued keys resolve **first-wins** — Core's `reverse_precedence`
+  for config-file settings — so a key set in both the main file and an
+  included file takes the **main file's** value, regardless of where the
+  `includeconf=` line sits; repeatable keys add in main-then-included
+  order. The common case (an included file holding keys the main file
+  never sets, e.g. `rpcpassword`) takes effect unopposed. Processed for
+  the global scope plus the active network's section. Like Core: an
+  `includeconf` *inside* an included file is ignored with a warning
+  (recursion guard), and a command-line `-includeconf` is **rejected with
+  an error** (config-file-only feature — matches Core's "cannot be used
+  from commandline"). A `chain=` inside an included file does not change
+  the active network — the network is resolved from the main file + CLI
+  before includes run (and `chain=` itself stays last-wins, Core's
+  documented chain-type exception to first-wins).
 
 ---
 
@@ -110,7 +129,6 @@ These hard-error today. Listed with what real support would require.
 
 | Key | Notes |
 |---|---|
-| `includeconf` | Recursive config inclusion. High-value; the marquee strict-parser hazard. Tracked as PR-2b. |
 | `signetchallenge` | Custom signet challenge script. Tracked as PR-2b. |
 | `maxuploadtarget` | Upload bandwidth cap + serving limits. Needs per-peer/global byte accounting + disconnect logic. |
 | `whitelist` / `whitebind` | Peer permission flags (`NetPermissionFlags`). Needs a peer-permission model in the peer manager. |
