@@ -98,6 +98,9 @@ pub struct PeerInfo {
     pub bytes_sent: u64,
     pub bytes_recv: u64,
     pub conn_time: SystemTime,
+    /// Net permissions granted via -whitelist / -whitebind (noban,
+    /// relay, ...). Default empty.
+    pub permissions: crate::net::permissions::NetPermissions,
 }
 
 impl PeerInfo {
@@ -118,6 +121,7 @@ impl PeerInfo {
             bytes_sent: 0,
             bytes_recv: 0,
             conn_time: SystemTime::now(),
+            permissions: crate::net::permissions::NetPermissions::NONE,
         }
     }
 

@@ -4,6 +4,7 @@ pub mod dns;
 pub mod ibd;
 pub mod manager;
 pub mod peer;
+pub mod permissions;
 pub mod proxy;
 pub mod tor;
 pub mod sync;

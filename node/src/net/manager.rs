@@ -109,6 +109,9 @@ pub struct PeerManager {
     /// `-externalip`). Advertised in `getaddr` responses and used as the
     /// version message's `addr_from`. Set once at startup.
     external_addrs: RwLock<Vec<SocketAddr>>,
+    /// `-whitelist` permission entries (by source subnet). Set once at
+    /// startup; consulted on every peer connect to compute permissions.
+    whitelist: RwLock<Vec<crate::net::permissions::WhitelistEntry>>,
     /// Channel to send received blocks to the processing thread.
     block_tx: mpsc::UnboundedSender<bitcoin::Block>,
     /// Pending compact blocks awaiting missing transactions.
@@ -268,6 +271,7 @@ impl PeerManager {
             in_flight_blocks: RwLock::new(std::collections::HashSet::new()),
             connect_addrs: RwLock::new(Vec::new()),
             external_addrs: RwLock::new(Vec::new()),
+            whitelist: RwLock::new(Vec::new()),
             block_tx,
             pending_compact: RwLock::new(HashMap::new()),
             fee_estimator: fee_estimator.clone(),
@@ -365,6 +369,26 @@ impl PeerManager {
     /// once from the satd binary after construction.
     pub fn set_external_addrs(&self, addrs: Vec<SocketAddr>) {
         *self.external_addrs.write() = addrs;
+    }
+
+    /// Install `-whitelist` permission entries. Set once at startup.
+    pub fn set_whitelist(&self, entries: Vec<crate::net::permissions::WhitelistEntry>) {
+        *self.whitelist.write() = entries;
+    }
+
+    /// Compute the net permissions an inbound/outbound peer at `ip` earns
+    /// from the `-whitelist` subnets.
+    fn whitelist_permissions(&self, ip: IpAddr) -> crate::net::permissions::NetPermissions {
+        crate::net::permissions::permissions_for_ip(&self.whitelist.read(), ip)
+    }
+
+    /// Permissions currently held by peer `id` (empty if unknown).
+    fn peer_permissions(&self, id: PeerId) -> crate::net::permissions::NetPermissions {
+        self.peers
+            .read()
+            .get(&id)
+            .map(|h| h.info.permissions)
+            .unwrap_or(crate::net::permissions::NetPermissions::NONE)
     }
 
     /// Predicate consulted by `handle_message` and the version
@@ -601,47 +625,81 @@ impl PeerManager {
     /// a TOCTOU window that, combined with counting only `Connected`
     /// peers, let handshake bursts bypass the per-IP cap. Review F4.
     pub fn accept_inbound(self: &Arc<Self>, stream: TcpStream, addr: SocketAddr) {
+        self.accept_inbound_with_perms(
+            stream,
+            addr,
+            crate::net::permissions::NetPermissions::NONE,
+        );
+    }
+
+    /// Accept an inbound connection, granting `bind_perms` on top of any
+    /// `-whitelist` source-subnet permissions. `bind_perms` carries the
+    /// permissions of a `-whitebind` listener; it is NONE for the normal
+    /// `-bind` listener.
+    pub fn accept_inbound_with_perms(
+        self: &Arc<Self>,
+        stream: TcpStream,
+        addr: SocketAddr,
+        bind_perms: crate::net::permissions::NetPermissions,
+    ) {
         let ip = addr.ip();
+        let perms = self.whitelist_permissions(ip).union(bind_perms);
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let msg_rx = {
             let mut peers = self.peers.write();
-            let (inbound_count, same_ip_count) = Self::count_inbound(&peers, ip);
-            if inbound_count >= self.max_connections.saturating_sub(MAX_OUTBOUND) {
-                tracing::warn!(%addr, "Max inbound connections reached, dropping connection");
-                return;
-            }
-            if same_ip_count >= self.max_inbound_per_ip {
-                tracing::warn!(
-                    %addr,
-                    same_ip_count,
-                    limit = self.max_inbound_per_ip,
-                    "Per-IP inbound limit reached, dropping connection",
-                );
-                return;
+            // NoBan peers are exempt from the inbound connection caps
+            // (matches Bitcoin Core's manual-conn / whitelist handling).
+            if !perms.noban {
+                let (inbound_count, same_ip_count) = Self::count_inbound(&peers, ip);
+                if inbound_count >= self.max_connections.saturating_sub(MAX_OUTBOUND) {
+                    tracing::warn!(%addr, "Max inbound connections reached, dropping connection");
+                    return;
+                }
+                if same_ip_count >= self.max_inbound_per_ip {
+                    tracing::warn!(
+                        %addr,
+                        same_ip_count,
+                        limit = self.max_inbound_per_ip,
+                        "Per-IP inbound limit reached, dropping connection",
+                    );
+                    return;
+                }
             }
             // Reserve the slot under the same write lock so further
             // accepts on this thread (or another) see this peer in
             // count_inbound's tally before they themselves cap-check.
             let (msg_tx, msg_rx) = mpsc::channel::<NetworkMessage>(256);
-            let info = PeerInfo::new(id, addr, Direction::Inbound);
+            let mut info = PeerInfo::new(id, addr, Direction::Inbound);
+            info.permissions = perms;
             peers.insert(id, PeerHandle { info, msg_tx });
             msg_rx
         };
-        tracing::info!(%addr, id, "Accepted inbound peer");
+        tracing::info!(%addr, id, noban = perms.noban, "Accepted inbound peer");
         self.spawn_peer_task(id, addr, stream, Direction::Inbound, msg_rx);
     }
 
     /// Listen for inbound connections.
     pub async fn listen(self: &Arc<Self>, bind_addr: SocketAddr) -> Result<(), String> {
+        self.listen_with_perms(bind_addr, crate::net::permissions::NetPermissions::NONE)
+            .await
+    }
+
+    /// Listen on `bind_addr`, granting every peer accepted here
+    /// `bind_perms` (Bitcoin Core's `-whitebind`).
+    pub async fn listen_with_perms(
+        self: &Arc<Self>,
+        bind_addr: SocketAddr,
+        bind_perms: crate::net::permissions::NetPermissions,
+    ) -> Result<(), String> {
         let listener = TcpListener::bind(bind_addr)
             .await
             .map_err(|e| format!("listen failed: {}", e))?;
-        tracing::info!(%bind_addr, "P2P listening");
+        tracing::info!(%bind_addr, whitebind = bind_perms.any(), "P2P listening");
 
         loop {
             match listener.accept().await {
                 Ok((stream, addr)) => {
-                    self.accept_inbound(stream, addr);
+                    self.accept_inbound_with_perms(stream, addr, bind_perms);
                 }
                 Err(e) => {
                     tracing::warn!("Accept error: {}", e);
@@ -833,6 +891,12 @@ impl PeerManager {
     fn add_ban_score(&self, id: PeerId, score: u32, reason: &str) {
         let mut peers = self.peers.write();
         let (should_ban, ban_addr) = if let Some(handle) = peers.get_mut(&id) {
+            // NoBan peers (-whitelist/-whitebind) are never banned or
+            // disconnected for misbehavior.
+            if handle.info.permissions.noban {
+                tracing::debug!(id, addr = %handle.info.addr, reason, "Skipping ban score for noban peer");
+                return;
+            }
             handle.info.ban_score += score;
             if handle.info.ban_score >= BAN_THRESHOLD {
                 tracing::warn!(id, addr = %handle.info.addr, score = handle.info.ban_score, reason, "Banning peer");
@@ -2313,9 +2377,9 @@ impl PeerManager {
         if self.is_ibd() {
             return;
         }
-        // -blocksonly: ignore peer-relayed transactions entirely. Locally
-        // submitted (RPC) transactions still enter the mempool and relay.
-        if self.blocksonly() {
+        // -blocksonly: ignore peer-relayed transactions, unless the peer
+        // holds the `relay`/`forcerelay` permission (-whitelist).
+        if self.blocksonly() && !self.peer_permissions(id).relays_txes() {
             return;
         }
 
@@ -2845,7 +2909,8 @@ impl PeerManager {
         direction: Direction,
     ) {
         let (msg_tx, msg_rx) = mpsc::channel::<NetworkMessage>(256);
-        let info = PeerInfo::new(id, addr, direction);
+        let mut info = PeerInfo::new(id, addr, direction);
+        info.permissions = self.whitelist_permissions(addr.ip());
         let handle = PeerHandle { info, msg_tx };
         {
             let mut peers = self.peers.write();
