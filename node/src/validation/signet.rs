@@ -33,10 +33,15 @@ const SIGNET_HEADER: [u8; 4] = [0xec, 0xc7, 0xda, 0xa2];
 /// BIP 141 witness-commitment header: `OP_RETURN OP_PUSHBYTES_36 <aa21a9ed…>`.
 const WITNESS_COMMITMENT_HEADER: [u8; 6] = [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
 
-/// Script flags Core applies when checking a signet block solution
-/// (`BLOCK_SCRIPT_VERIFY_FLAGS`): P2SH + witness only.
+/// Script flags Core applies when checking a signet block solution.
+/// Must match Core's `BLOCK_SCRIPT_VERIFY_FLAGS` exactly, or satd could
+/// accept a solution Core rejects (consensus divergence on a custom
+/// signet): `P2SH | WITNESS | DERSIG | NULLDUMMY`.
 fn block_script_verify_flags() -> u32 {
-    bitcoinconsensus::VERIFY_P2SH | bitcoinconsensus::VERIFY_WITNESS
+    bitcoinconsensus::VERIFY_P2SH
+        | bitcoinconsensus::VERIFY_WITNESS
+        | bitcoinconsensus::VERIFY_DERSIG
+        | bitcoinconsensus::VERIFY_NULLDUMMY
 }
 
 /// Derive the P2P network magic for a signet from its challenge, the way
@@ -442,5 +447,17 @@ mod tests {
             check_signet_block_solution(&genesis, challenge.as_bytes(), genesis.block_hash())
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn verify_flags_match_core() {
+        // Core's BLOCK_SCRIPT_VERIFY_FLAGS = P2SH | WITNESS | DERSIG |
+        // NULLDUMMY. Pin the mask so a future edit can't silently drop a
+        // flag and make satd accept solutions Core rejects.
+        let expected = bitcoinconsensus::VERIFY_P2SH
+            | bitcoinconsensus::VERIFY_WITNESS
+            | bitcoinconsensus::VERIFY_DERSIG
+            | bitcoinconsensus::VERIFY_NULLDUMMY;
+        assert_eq!(block_script_verify_flags(), expected);
     }
 }
