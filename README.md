@@ -19,7 +19,7 @@
 ### Consensus & Network
 *   **Dual Consensus Engine:** A complete, independently written Rust consensus engine that passes the Bitcoin Core test suite, with a C++ `libbitcoinconsensus` conservative fallback.
 *   **Swarm-Style IBD:** BitTorrent-like parallel block downloading and speculative verification pipeline for heavily optimized Initial Block Download.
-*   **Full P2P:** BIP 152 compact blocks, ban scoring, addrv2, BIP 324 v2 transport (in progress), Tor v3 (hardcoded `.onion` seeds).
+*   **Full P2P:** BIP 152 compact blocks, ban scoring, addrv2, Tor v3 (hardcoded `.onion` seeds), SOCKS5 `-proxy`. (BIP 324 v2 transport is on the [roadmap](ROADMAP.md), not yet implemented.)
 *   **Policy Sovereignty (Mempool):** Strict, first-class control over what your node relays. Easily filter spam, block `OP_RETURN` data, or adjust limits via exposed flags (`-datacarrier`, `-datacarriersize`, `-dustrelayfee`, `-limitancestorcount`, `-permitbaremultisig`) without needing a patched fork.
 *   **Modern Mempool:** Full RBF / opt-in BIP 125 and CPFP ancestor tracking.
 
@@ -42,7 +42,7 @@
 
 *   **Native TUI (`sat-tui`):** A beautiful Ratatui-based terminal interface for real-time IBD bitmap visualization, peer stats, and node observability.
 *   **Metrics & Observability:** Native Prometheus `/metrics`, `/healthz`, and JSON-structured logs.
-*   **Core-Compatible:** Accepts standard `bitcoin.conf` and CLI flags (`-prune`, `-txindex`, `-assumeutxo`). Uses standard `.cookie` auth.
+*   **Core-Compatible:** Accepts standard `bitcoin.conf` and CLI flags (`-prune`, `-txindex`, `-assumevalid`). Uses standard `.cookie` auth. AssumeUTXO fast-sync is supported via the `loadtxoutset` RPC (Core's snapshot files load directly).
 *   **Mempool Stream:** `subscribemempool` JSON-RPC WS subscription with explicit eviction/replacement reasons.
 *   **Events Bus:** gRPC + ZMQ publishers for chain and mempool events (`satd-events`).
 *   **Reorg Logging:** Persistent reorg log with an optional webhook.
@@ -99,7 +99,7 @@ cargo run --bin sat-cli -- --regtest stop
 
 ## Configuration
 
-Bitcoin Core-compatible flags (`-regtest`, `-datadir`, `-rpcport`, `-prune`, `-txindex`, `-assumeutxo`, …) and the `bitcoin.conf` file format are accepted as the default surface. 
+Bitcoin Core-compatible flags (`-regtest`, `-datadir`, `-rpcport`, `-prune`, `-txindex`, `-assumevalid`, `-includeconf`, …) and the `bitcoin.conf` file format are accepted as the default surface. Core's CLI/config compatibility surface is now complete — every recognized `bitcoin.conf` key is either honored or recognize-rejected with a clear message (no silent accept-and-ignore). 
 
 Bundled `--profile=<preset>` selects from `archival`, `pruned-home`, `mining`, `regtest-dev`, and `signet-watchtower`. CLI flags override profile values; `getconfig` / `sat-cli node config` shows the effective post-merge configuration.
 

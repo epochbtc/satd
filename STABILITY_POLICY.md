@@ -121,7 +121,7 @@ Listed for traceability; each will enter PR-gating on the same terms when its pr
 
 - **NBXplorer integration canary** (`scripts/canary/nbxplorer-smoke.sh`) — runs the real `nicolasdorier/nbxplorer:<pin>` Docker container (with a Postgres sidecar, required by NBXplorer 2.5+) against a satd regtest backend. Postgres + container plumbing is wired up and works; the open issue is a P2P version-handshake interop with NBitcoin (NBXplorer's underlying lib) that surfaces as `node is not in a connected state` after TCP connect — needs deeper investigation. Job definition is commented out in `canary.yml`; the script in `scripts/canary/nbxplorer-smoke.sh` is left in-tree so the follow-up PR is small.
 - **BTCPayServer**: boot `btcpayserver/btcpayserver` with satd as the Bitcoin backend; verify `/api/v1/server/info` responds healthy. Deferred because the BTCPay stack is a multi-container docker-compose (Postgres + NBXplorer + BTCPay + optional Tor) — a follow-up PR will compose this on top of the NBXplorer canary infrastructure.
-- **Umbrel app**: install the satd Umbrel app on an Umbrel dev image; verify the dashboard reports the node as healthy. Blocked on shipping the satd Umbrel app first (`ECOSYSTEM.md` §6.6).
+- **Umbrel app**: install the satd Umbrel app on an Umbrel dev image; verify the dashboard reports the node as healthy. Blocked on shipping the satd Umbrel app first (`ECOSYSTEM.md` §6).
 
 ### Failure triage
 

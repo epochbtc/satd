@@ -16,7 +16,7 @@ The compatibility contract itself — what is Tier 1 / Tier 2 / Tier 3,
 how deprecations are staged, what migration invariants apply — lives
 in `STABILITY_POLICY.md`.
 
-Last updated: 2026-05-05.
+Last updated: 2026-05-26.
 
 ---
 
@@ -33,14 +33,15 @@ as a bug unless explicitly enumerated below.
   semantics all match.
 - **P2P wire** — standard `NetworkMessage` types via the `bitcoin`
   crate; BIP 152 compact blocks, BIP 155 addrv2, BIP 157/158 compact
-  filters, BIP 339 wtxid relay, BIP 324 v2 transport.
+  filters, BIP 339 wtxid relay. (BIP 324 v2 transport is roadmap-only,
+  not yet implemented — see `ROADMAP.md`.)
 - **JSON-RPC method shapes** — 80 Core-named methods, response field
   names + types preserved by default. RPC extensions are **opt-in per
   request** (the `amounts=sats` and structured-error patterns below)
   rather than unconditional schema additions.
 - **CLI flag names + defaults** — `-regtest`, `-datadir`, `-rpcport`,
   `-rpcuser`, `-rpcpassword`, `-prune`, `-txindex`, `-reindex`,
-  `-reindex-chainstate`, `-assumeutxo`, `-mempoolfullrbf`, `-maxmempool`,
+  `-reindex-chainstate`, `-assumevalid`, `-mempoolfullrbf`, `-maxmempool`,
   `-minrelaytxfee`, `-dustrelayfee`, `-datacarrier`, `-datacarriersize`,
   `-limitancestorcount`, `-limitdescendantcount`, `-mempoolexpiry`,
   `-permitbaremultisig`, etc.
@@ -67,6 +68,15 @@ artifacts, signing stack) but no protocol consequences.
 | **JSON-RPC server** | bespoke HTTP / SSL stack | `jsonrpsee` over `tower` middleware (with native TLS support) |
 | **Reproducible builds** | Guix | Nix flake (Guix may follow if a downstream packager needs it) |
 | **Release signing** | GPG (PGP) | minisign (artifacts) + cosign keyless (containers) + SSH sigs (git tags). No GPG. |
+| **Peer address store** | `peers.dat` (Core bucketed addrman serialization) | `peers.dat` with a satd-native versioned format (magic `SADR`) — **not** byte-compatible with Core's file |
+
+**On `peers.dat` compatibility.** satd persists its address manager to
+`peers.dat` (same filename), but the on-disk format is satd-native and
+not interchangeable with Core's. The two daemons will not read each
+other's `peers.dat`; satd silently discards an unrecognized file and
+rebuilds its address set from DNS seeds / `-seednode`. Operators
+migrating a datadir should let satd regenerate `peers.dat` rather than
+expect Core's peer set to carry over.
 
 **Why one RocksDB instance.** Core uses LevelDB and bundles indexes
 (`-txindex`, `-blockfilterindex`, `-coinstatsindex`) as separate
@@ -302,9 +312,6 @@ These surfaces will not ship. Each is a deliberate scope decision.
 
 - **`MemPool` P2P message.** Rarely used; mostly by bloom filter
   clients.
-
-- **SOCKS5 `-proxy`.** Tor v3 is supported natively via control-port;
-  generic SOCKS5 proxying is out of scope.
 
 - **Bitcoin Core-style `-zmqpub*` raw topic publication.** Core's
   per-topic ZMQ model (one topic per event type, raw bytes) is replaced
