@@ -8,6 +8,10 @@ layout) per `STABILITY_POLICY.md`.
 
 ## [Unreleased]
 
+### Network
+
+- **BIP 324 v2 encrypted transport** (`-v2transport`, on by default, matching Bitcoin Core). satd offers/accepts the ElligatorSwift + ChaCha20-Poly1305 v2 handshake on inbound and outbound connections, transparently falling back to plaintext v1 for legacy peers. The satd-specific **`-v2only`** flag (off by default) refuses non-v2 peers as an anti-surveillance lever. `getpeerinfo` reports `transport_protocol_type`; a `satd_peer_connections_v2` Prometheus gauge counts v2 peers. Built on the rust-bitcoin `bip324` crate.
+
 ### Native protocol surfaces
 
 - **Native TLS Support:** Direct TLS termination for JSON-RPC, Electrum, and Esplora servers via `--rpctlsbind`, `--electrumtlsbind`, and `--esploratlsbind`. Eliminates the need for a TLS-terminating sidecar.

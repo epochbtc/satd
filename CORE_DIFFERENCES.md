@@ -33,8 +33,8 @@ as a bug unless explicitly enumerated below.
   semantics all match.
 - **P2P wire** — standard `NetworkMessage` types via the `bitcoin`
   crate; BIP 152 compact blocks, BIP 155 addrv2, BIP 157/158 compact
-  filters, BIP 339 wtxid relay. (BIP 324 v2 transport is roadmap-only,
-  not yet implemented — see `ROADMAP.md`.)
+  filters, BIP 339 wtxid relay, BIP 324 v2 encrypted transport
+  (`-v2transport`, on by default).
 - **JSON-RPC method shapes** — 80 Core-named methods, response field
   names + types preserved by default. RPC extensions are **opt-in per
   request** (the `amounts=sats` and structured-error patterns below)
@@ -243,6 +243,16 @@ No Bitcoin Core equivalent.
 
 These ride on top of Core-shape behavior. The Core-shape default is
 preserved; the satd extension is opt-in per request or per flag.
+
+- **`-v2only`** — refuse peers that do not speak the BIP 324 v2 encrypted
+  transport. Core's `-v2transport` (offer/accept v2, fall back to v1) is
+  supported and on by default; `-v2only` is a satd-specific privacy lever
+  that drops inbound v1 peers at detection and never downgrades outbound
+  connections to v1. Off by default: as of 2026 most surveillance and
+  DoS nodes do not speak v2, so `-v2only` sheds essentially all of that
+  traffic without banlists — at the cost of also dropping honest peers
+  that have not yet upgraded, so it stays opt-in until v2 adoption is
+  high. `getpeerinfo.transport_protocol_type` reports `v1`/`v2` per peer.
 
 - **`--profile=<preset>`** — bundled config presets (`archival`,
   `pruned-home`, `mining`, `regtest-dev`, `signet-watchtower`). CLI
