@@ -3,7 +3,9 @@ use bitcoin::p2p::message::{NetworkMessage, RawNetworkMessage};
 use bitcoin::p2p::Magic;
 use bitcoin::Network;
 use std::io;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 
 use crate::net::v2transport::{V2Connection, V2Reader, V2Writer};
@@ -46,7 +48,26 @@ impl Connection {
             stream,
             magic,
             buf: Vec::with_capacity(4096),
+            leading: None,
         })
+    }
+
+    /// Construct a v1 connection where `leading` bytes were already read
+    /// off the socket (e.g. during v1/v2 transport detection) and must be
+    /// replayed before the rest of the stream. The first `recv` consumes
+    /// `leading` ahead of any socket reads.
+    pub fn v1_with_leading(stream: TcpStream, magic: Magic, leading: Vec<u8>) -> Self {
+        Connection::V1(V1Connection {
+            stream,
+            magic,
+            buf: Vec::with_capacity(4096),
+            leading: Some(leading),
+        })
+    }
+
+    /// Wrap an established BIP 324 v2 encrypted connection.
+    pub fn v2(conn: V2Connection) -> Self {
+        Connection::V2(conn)
     }
 
     /// Split into separate read and write halves.
@@ -120,6 +141,10 @@ pub struct V1Connection {
     stream: TcpStream,
     magic: Magic,
     buf: Vec<u8>,
+    /// Bytes already read off the socket before the connection was built
+    /// (transport detection), replayed ahead of the socket on the first
+    /// `recv`. Consumed during the version handshake, before `split`.
+    leading: Option<Vec<u8>>,
 }
 
 /// Read half of a split [`V1Connection`].
@@ -168,12 +193,52 @@ impl V1Connection {
 
     /// Receive the next network message. Skips messages that fail to deserialize.
     pub async fn recv(&mut self) -> io::Result<NetworkMessage> {
+        if let Some(lead) = self.leading.take() {
+            let mut reader = LeadingReader::new(lead, &mut self.stream);
+            return recv_message(&mut reader, self.magic, &mut self.buf).await;
+        }
         recv_message(&mut self.stream, self.magic, &mut self.buf).await
     }
 
     /// Get the peer's remote address.
     pub fn peer_addr(&self) -> io::Result<std::net::SocketAddr> {
         self.stream.peer_addr()
+    }
+}
+
+/// An `AsyncRead` adapter that yields a fixed prefix of bytes before
+/// delegating to an inner reader. Used to replay bytes consumed during
+/// transport detection without losing stream alignment.
+struct LeadingReader<'a, R> {
+    lead: Vec<u8>,
+    pos: usize,
+    inner: &'a mut R,
+}
+
+impl<'a, R> LeadingReader<'a, R> {
+    fn new(lead: Vec<u8>, inner: &'a mut R) -> Self {
+        Self {
+            lead,
+            pos: 0,
+            inner,
+        }
+    }
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for LeadingReader<'_, R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if self.pos < self.lead.len() {
+            let remaining = &self.lead[self.pos..];
+            let n = remaining.len().min(buf.remaining());
+            buf.put_slice(&remaining[..n]);
+            self.pos += n;
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut *self.inner).poll_read(cx, buf)
     }
 }
 
