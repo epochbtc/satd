@@ -22,6 +22,12 @@ const TESTNET_SEEDS: &[&str] = &[
     "testnet-seed.bluematt.me",
 ];
 
+/// DNS seeds for Bitcoin testnet4.
+const TESTNET4_SEEDS: &[&str] = &[
+    "seed.testnet4.bitcoin.sprovoost.nl",
+    "seed.testnet4.wiz.biz",
+];
+
 /// DNS seeds for Bitcoin signet.
 const SIGNET_SEEDS: &[&str] = &[
     "seed.signet.bitcoin.sprovoost.nl",
@@ -53,9 +59,9 @@ fn default_port(network: Network) -> u16 {
     match network {
         Network::Bitcoin => 8333,
         Network::Testnet => 18333,
+        Network::Testnet4 => 48333,
         Network::Signet => 38333,
         Network::Regtest => 18444,
-        _ => 8333,
     }
 }
 
@@ -103,9 +109,9 @@ fn seeds_for_network(network: Network) -> &'static [&'static str] {
     match network {
         Network::Bitcoin => MAINNET_SEEDS,
         Network::Testnet => TESTNET_SEEDS,
+        Network::Testnet4 => TESTNET4_SEEDS,
         Network::Signet => SIGNET_SEEDS,
         Network::Regtest => REGTEST_SEEDS,
-        _ => &[],
     }
 }
 

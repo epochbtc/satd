@@ -120,9 +120,9 @@ pub fn get_mining_info(chain_state: &ChainState) -> Value {
     let chain = match chain_state.network {
         bitcoin::Network::Regtest => "regtest",
         bitcoin::Network::Testnet => "test",
+        bitcoin::Network::Testnet4 => "testnet4",
         bitcoin::Network::Signet => "signet",
         bitcoin::Network::Bitcoin => "main",
-        _ => "main",
     };
 
     json!({

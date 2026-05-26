@@ -56,14 +56,17 @@ pub fn default_assumevalid(network: Network) -> AssumeValid {
             )
         }
         Network::Testnet => {
-            // Testnet4 — no default yet
+            // Testnet3 — no default yet
+            AssumeValid::Disabled
+        }
+        Network::Testnet4 => {
+            // Testnet4 — no default yet; validate everything
             AssumeValid::Disabled
         }
         Network::Regtest => {
             // Regtest has no meaningful default
             AssumeValid::Disabled
         }
-        _ => AssumeValid::Disabled,
     }
 }
 
@@ -3680,9 +3683,9 @@ pub(crate) fn network_magic(network: Network) -> [u8; 4] {
     match network {
         Network::Bitcoin => [0xf9, 0xbe, 0xb4, 0xd9],
         Network::Testnet => [0x0b, 0x11, 0x09, 0x07],
+        Network::Testnet4 => [0x1c, 0x16, 0x3f, 0x28],
         Network::Signet => [0x0a, 0x03, 0xcf, 0x40],
         Network::Regtest => [0xfa, 0xbf, 0xb5, 0xda],
-        _ => [0xf9, 0xbe, 0xb4, 0xd9],
     }
 }
 

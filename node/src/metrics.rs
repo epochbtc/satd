@@ -324,9 +324,9 @@ fn network_label(n: Network) -> &'static str {
     match n {
         Network::Bitcoin => "mainnet",
         Network::Testnet => "testnet",
+        Network::Testnet4 => "testnet4",
         Network::Signet => "signet",
         Network::Regtest => "regtest",
-        _ => "unknown",
     }
 }
 

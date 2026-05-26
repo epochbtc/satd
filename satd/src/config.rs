@@ -904,10 +904,13 @@ impl Config {
         // network flags: the operator's intent is ambiguous and
         // silently picking one would be the wrong kind of helpful.
         if cli.chain.is_some()
-            && (cli.regtest == Some(true) || cli.testnet == Some(true) || cli.signet == Some(true))
+            && (cli.regtest == Some(true)
+                || cli.testnet == Some(true)
+                || cli.testnet4 == Some(true)
+                || cli.signet == Some(true))
         {
             return Err(
-                "--chain conflicts with --regtest/--testnet/--signet — pass only one of them"
+                "--chain conflicts with --regtest/--testnet/--testnet4/--signet — pass only one"
                     .to_string(),
             );
         }
@@ -926,6 +929,8 @@ impl Config {
             Network::Regtest
         } else if cli.testnet == Some(true) {
             Network::Testnet
+        } else if cli.testnet4 == Some(true) {
+            Network::Testnet4
         } else if cli.signet == Some(true) || profile_defaults.network_signet {
             Network::Signet
         } else {
@@ -941,9 +946,9 @@ impl Config {
         let section = match network {
             Network::Regtest => "regtest",
             Network::Testnet => "test",
+            Network::Testnet4 => "testnet4",
             Network::Signet => "signet",
             Network::Bitcoin => "main",
-            _ => "main",
         };
 
         // Resolve `includeconf` directives now that the active network
@@ -2247,8 +2252,8 @@ fn chain_subdir(network: Network) -> Option<&'static str> {
         Network::Bitcoin => None,
         Network::Regtest => Some("regtest"),
         Network::Testnet => Some("testnet3"),
+        Network::Testnet4 => Some("testnet4"),
         Network::Signet => Some("signet"),
-        _ => None,
     }
 }
 
@@ -2314,6 +2319,17 @@ pub struct CliArgs {
         help = "Use signet network"
     )]
     pub signet: Option<bool>,
+
+    /// Use the testnet4 network (Bitcoin Core's `-testnet4`).
+    #[arg(
+        long,
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
+        help = "Use testnet4 network"
+    )]
+    pub testnet4: Option<bool>,
 
     /// Bitcoin Core's unified network selector. Accepted values:
     /// `main`, `test`, `signet`, `regtest`. `testnet4` is recognised
@@ -3468,6 +3484,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
     let known_flags = [
         "regtest",
         "testnet",
+        "testnet4",
         "signet",
         "chain",
         "datadir",
@@ -3601,6 +3618,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
     const NEGATABLE_BOOL_FLAGS: &[&str] = &[
         "regtest",
         "testnet",
+        "testnet4",
         "signet",
         "listen",
         "dns",
@@ -3866,6 +3884,7 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     // Network selection
     "regtest",
     "testnet",
+    "testnet4",
     "signet",
     "chain",
     // Filesystem
@@ -4174,9 +4193,9 @@ fn default_rpc_port(network: Network) -> u16 {
     match network {
         Network::Bitcoin => 8332,
         Network::Testnet => 18332,
+        Network::Testnet4 => 48332,
         Network::Signet => 38332,
         Network::Regtest => 18443,
-        _ => 8332,
     }
 }
 
@@ -4184,9 +4203,9 @@ fn default_p2p_port(network: Network) -> u16 {
     match network {
         Network::Bitcoin => 8333,
         Network::Testnet => 18333,
+        Network::Testnet4 => 48333,
         Network::Signet => 38333,
         Network::Regtest => 18444,
-        _ => 8333,
     }
 }
 
@@ -4298,24 +4317,15 @@ pub fn parse_timeout_value(s: &str) -> Result<u64, String> {
 
 /// Parse a Bitcoin Core `-chain=<name>` value to a `bitcoin::Network`.
 /// Accepts every canonical name Core does plus a few common aliases.
-/// `testnet4` is recognised but rejected with a clear error — the
-/// chain params aren't wired through satd yet, and silently mapping
-/// it to `Network::Testnet` (testnet3) would land an operator's
-/// node on the wrong chain.
 fn parse_chain_name(s: &str) -> Result<Network, String> {
     match s.trim().to_ascii_lowercase().as_str() {
         "main" | "mainnet" | "bitcoin" => Ok(Network::Bitcoin),
         "test" | "testnet" | "testnet3" => Ok(Network::Testnet),
+        "testnet4" => Ok(Network::Testnet4),
         "signet" => Ok(Network::Signet),
         "regtest" => Ok(Network::Regtest),
-        "testnet4" => Err(
-            "--chain=testnet4 is not yet supported by satd. Use --chain=test for \
-            testnet3, or wait for the testnet4 plumbing PR (see \
-            SATD_CLI_COMPAT_AUDIT.md)."
-                .to_string(),
-        ),
         other => Err(format!(
-            "--chain: unknown network {other:?}. Accepted values: main, test, signet, regtest."
+            "--chain: unknown network {other:?}. Accepted values: main, test, testnet4, signet, regtest."
         )),
     }
 }
@@ -4430,6 +4440,7 @@ rpcport=8332
             regtest: Some(true),
             testnet: Some(false),
             signet: Some(false),
+            testnet4: None,
             chain: None,
             blocksdir: None,
             signetseednode: Vec::new(),
@@ -4631,6 +4642,7 @@ rpcport=8332
             regtest: Some(true),
             testnet: Some(false),
             signet: Some(false),
+            testnet4: None,
             chain: None,
             blocksdir: None,
             signetseednode: Vec::new(),
@@ -5427,15 +5439,6 @@ rpcport=8332
     }
 
     #[test]
-    fn chain_selector_rejects_testnet4_with_helpful_error() {
-        let err = parse_chain_name("testnet4").unwrap_err();
-        assert!(
-            err.contains("not yet supported") && err.contains("--chain=test"),
-            "expected explicit testnet4 deferral error, got: {err}"
-        );
-    }
-
-    #[test]
     fn chain_selector_rejects_garbage() {
         let err = parse_chain_name("mainnett").unwrap_err();
         assert!(err.contains("unknown network"), "got: {err}");
@@ -5872,6 +5875,43 @@ rpcport=39999
         ])
         .unwrap();
         assert!(!cfg.dnsseed, "-nodnsseed should disable dnsseed");
+    }
+
+    // ---- testnet4 ----
+
+    #[test]
+    fn testnet4_via_chain_selector() {
+        let cli = CliArgs::try_parse_from(["satd", "--chain=testnet4"]).unwrap();
+        let cfg = Config::from_cli(cli).unwrap();
+        assert_eq!(cfg.network, Network::Testnet4);
+        assert_eq!(cfg.rpcport, 48332);
+        assert_eq!(cfg.port, 48333);
+    }
+
+    #[test]
+    fn testnet4_via_flag() {
+        let cli = CliArgs::try_parse_from(["satd", "--testnet4"]).unwrap();
+        let cfg = Config::from_cli(cli).unwrap();
+        assert_eq!(cfg.network, Network::Testnet4);
+    }
+
+    #[test]
+    fn testnet4_negation_resolves_to_mainnet() {
+        let argv = normalize_args(vec!["satd".into(), "-notestnet4".into()]);
+        let cli = CliArgs::try_parse_from(argv).unwrap();
+        let cfg = Config::from_cli(cli).unwrap();
+        assert_eq!(cfg.network, Network::Bitcoin);
+    }
+
+    #[test]
+    fn testnet4_conflicts_with_chain() {
+        let cli = CliArgs::try_parse_from(["satd", "--chain=main", "--testnet4"]).unwrap();
+        assert!(Config::from_cli(cli).is_err());
+    }
+
+    #[test]
+    fn parse_chain_name_accepts_testnet4() {
+        assert_eq!(parse_chain_name("testnet4").unwrap(), Network::Testnet4);
     }
 
     // ---- signetchallenge: custom signet (BIP 325) ----
