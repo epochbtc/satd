@@ -180,7 +180,7 @@ impl Profile {
                 network_signet: false,
             },
             Self::PrunedHome => ProfileDefaults {
-                txindex: Some(false),
+                txindex: None,
                 prune: Some(10_000),
                 dbcache: Some(450),
                 maxconnections: Some(20),
@@ -898,7 +898,9 @@ impl Config {
         // Refuse to start if --chain conflicts with the older single-
         // network flags: the operator's intent is ambiguous and
         // silently picking one would be the wrong kind of helpful.
-        if cli.chain.is_some() && (cli.regtest || cli.testnet || cli.signet) {
+        if cli.chain.is_some()
+            && (cli.regtest == Some(true) || cli.testnet == Some(true) || cli.signet == Some(true))
+        {
             return Err(
                 "--chain conflicts with --regtest/--testnet/--signet — pass only one of them"
                     .to_string(),
@@ -915,11 +917,11 @@ impl Config {
             .and_then(|v: &Vec<String>| v.last().cloned());
         let network = if let Some(name) = chain_from_cli.or(chain_from_file.as_deref()) {
             parse_chain_name(name)?
-        } else if cli.regtest || profile_defaults.network_regtest {
+        } else if cli.regtest == Some(true) || profile_defaults.network_regtest {
             Network::Regtest
-        } else if cli.testnet {
+        } else if cli.testnet == Some(true) {
             Network::Testnet
-        } else if cli.signet || profile_defaults.network_signet {
+        } else if cli.signet == Some(true) || profile_defaults.network_signet {
             Network::Signet
         } else {
             Network::Bitcoin
@@ -1312,10 +1314,11 @@ impl Config {
         // Without this, the Esplora hard-fail below would refuse to
         // start despite the operator's clear intent.
         let txindex_file = file_get("txindex").and_then(|v| parse_bool(&v));
-        let txindex_explicitly_disabled = !cli.txindex && matches!(txindex_file, Some(false));
-        let mut txindex = cli.txindex
-            || matches!(txindex_file, Some(true))
-            || profile_defaults.txindex.unwrap_or(false);
+        let txindex_explicitly_disabled = cli.txindex == Some(false)
+            || (cli.txindex.is_none() && matches!(txindex_file, Some(false)));
+        let mut txindex = cli.txindex.unwrap_or_else(|| {
+            matches!(txindex_file, Some(true)) || profile_defaults.txindex.unwrap_or(false)
+        });
 
         // Address-history index: on by default. CLI `--addressindex=0`,
         // config `addressindex=0`, or the Bitcoin-Core-compatible
@@ -1775,8 +1778,8 @@ impl Config {
             blockfilterindex,
             peerblockfilters,
             prune,
-            reindex: cli.reindex,
-            reindex_chainstate: cli.reindex_chainstate,
+            reindex: cli.reindex.unwrap_or(false),
+            reindex_chainstate: cli.reindex_chainstate.unwrap_or(false),
             maxconnections: cli
                 .maxconnections
                 .or_else(|| file_get("maxconnections").and_then(|v| v.parse().ok()))
@@ -1851,10 +1854,9 @@ impl Config {
                 .or_else(|| file_get("blockmintxfee").and_then(|v| v.parse().ok()))
                 .unwrap_or(1_000),
             pid: cli.pid.or_else(|| file_get("pid")),
-            mcp: cli.mcp
-                || file_get("mcp")
-                    .and_then(|v| parse_bool(&v))
-                    .unwrap_or(false),
+            mcp: cli.mcp.unwrap_or_else(|| {
+                file_get("mcp").and_then(|v| parse_bool(&v)).unwrap_or(false)
+            }),
             mcp_stdio: cli
                 .mcpstdio
                 .or_else(|| file_get("mcpstdio").and_then(|v| parse_bool(&v)))
@@ -1984,14 +1986,12 @@ impl Config {
                         .filter(|&n| n > 0)
                 })
                 .unwrap_or(4),
-            server: cli.server
-                || file_get("server")
-                    .and_then(|v| parse_bool(&v))
-                    .unwrap_or(false),
-            daemon: cli.daemon
-                || file_get("daemon")
-                    .and_then(|v| parse_bool(&v))
-                    .unwrap_or(false),
+            server: cli.server.unwrap_or_else(|| {
+                file_get("server").and_then(|v| parse_bool(&v)).unwrap_or(false)
+            }),
+            daemon: cli.daemon.unwrap_or_else(|| {
+                file_get("daemon").and_then(|v| parse_bool(&v)).unwrap_or(false)
+            }),
             metricsport: cli
                 .metricsport
                 .or_else(|| file_get("metricsport").and_then(|v| v.parse().ok())),
@@ -1999,10 +1999,9 @@ impl Config {
                 .metricsbind
                 .or_else(|| file_get("metricsbind"))
                 .unwrap_or_else(|| "127.0.0.1".to_string()),
-            rpc_extended_errors: cli.rpcextendederrors
-                || file_get("rpcextendederrors")
-                    .and_then(|v| parse_bool(&v))
-                    .unwrap_or(false),
+            rpc_extended_errors: cli.rpcextendederrors.unwrap_or_else(|| {
+                file_get("rpcextendederrors").and_then(|v| parse_bool(&v)).unwrap_or(false)
+            }),
             max_shutdown_secs: cli
                 .maxshutdownsecs
                 .or_else(|| file_get("maxshutdownsecs").and_then(|v| v.parse().ok()))
@@ -2044,10 +2043,9 @@ impl Config {
             events_node_id: cli.events_node_id.or_else(|| file_get("eventsnodeid")),
             events_region: cli.events_region.or_else(|| file_get("eventsregion")),
             events_grpc_bind: cli.events_grpc_bind.or_else(|| file_get("eventsgrpcbind")),
-            events_grpc_allow_remote: cli.events_grpc_allow_remote
-                || file_get("eventsgrpcallowremote")
-                    .and_then(|v| parse_bool(&v))
-                    .unwrap_or(false),
+            events_grpc_allow_remote: cli.events_grpc_allow_remote.unwrap_or_else(|| {
+                file_get("eventsgrpcallowremote").and_then(|v| parse_bool(&v)).unwrap_or(false)
+            }),
             events_zmq_bind: cli.events_zmq_bind.or_else(|| file_get("eventszmqbind")),
             events_zmq_hashtx: cli
                 .events_zmq_hashtx
@@ -2249,14 +2247,35 @@ pub fn resolve_blocks_dir(
 #[derive(Parser, Debug)]
 #[command(name = "satd", version, about = "Bitcoin Core-compatible node in Rust")]
 pub struct CliArgs {
-    #[arg(long, help = "Use regtest network")]
-    pub regtest: bool,
+    #[arg(
+        long,
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
+        help = "Use regtest network"
+    )]
+    pub regtest: Option<bool>,
 
-    #[arg(long, help = "Use testnet network")]
-    pub testnet: bool,
+    #[arg(
+        long,
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
+        help = "Use testnet network"
+    )]
+    pub testnet: Option<bool>,
 
-    #[arg(long, help = "Use signet network")]
-    pub signet: bool,
+    #[arg(
+        long,
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
+        help = "Use signet network"
+    )]
+    pub signet: Option<bool>,
 
     /// Bitcoin Core's unified network selector. Accepted values:
     /// `main`, `test`, `signet`, `regtest`. `testnet4` is recognised
@@ -2395,6 +2414,8 @@ pub struct CliArgs {
         long,
         value_name = "BOOL",
         value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
         help = "Require mutual TLS on the JSON-RPC TLS listener (default: false). Requires --rpctlsbind and --rpcmtlsclientca."
     )]
     pub rpcmtls: Option<bool>,
@@ -2417,6 +2438,8 @@ pub struct CliArgs {
         long,
         value_name = "BOOL",
         value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
         help = "Disable HTTP Basic auth on the JSON-RPC TLS surface (default: false). Only accepted with --rpcmtls=1. Plain HTTP keeps full auth."
     )]
     pub rpcdisableauth: Option<bool>,
@@ -2428,7 +2451,14 @@ pub struct CliArgs {
     )]
     pub rpctlshandshaketimeout: Option<u64>,
 
-    #[arg(long, value_name = "BOOL", help = "Accept P2P connections")]
+    #[arg(
+        long,
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
+        help = "Accept P2P connections"
+    )]
     pub listen: Option<bool>,
 
     #[arg(long, value_name = "PORT", help = "P2P listen port")]
@@ -2462,6 +2492,9 @@ pub struct CliArgs {
     #[arg(
         long,
         value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
         help = "Enable full replace-by-fee (default: true)"
     )]
     pub mempoolfullrbf: Option<bool>,
@@ -2497,6 +2530,9 @@ pub struct CliArgs {
     #[arg(
         long,
         value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
         help = "Accept OP_RETURN outputs (default: true)"
     )]
     pub datacarrier: Option<bool>,
@@ -2535,14 +2571,31 @@ pub struct CliArgs {
     #[arg(
         long,
         value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
         help = "Allow bare multisig outputs (default: true)"
     )]
     pub permitbaremultisig: Option<bool>,
 
-    #[arg(long, help = "Maintain a full transaction index")]
-    pub txindex: bool,
+    #[arg(
+        long,
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
+        help = "Maintain a full transaction index"
+    )]
+    pub txindex: Option<bool>,
 
-    #[arg(long, value_name = "BOOL", value_parser = parse_bool_arg, help = "Maintain an address-history index (default: true). Accepts 0/1/true/false.")]
+    #[arg(
+        long,
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
+        help = "Maintain an address-history index (default: true). Accepts 0/1/true/false."
+    )]
     pub addressindex: Option<bool>,
 
     #[arg(
@@ -2552,7 +2605,14 @@ pub struct CliArgs {
     )]
     pub addrindexsubscriptions: Option<usize>,
 
-    #[arg(long, value_name = "BOOL", value_parser = parse_bool_arg, help = "Run the native Esplora REST server (default: true). Requires --addressindex=1.")]
+    #[arg(
+        long,
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
+        help = "Run the native Esplora REST server (default: true). Requires --addressindex=1."
+    )]
     pub esplora: Option<bool>,
 
     #[arg(
@@ -2587,6 +2647,8 @@ pub struct CliArgs {
         long,
         value_name = "BOOL",
         value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
         help = "Require mutual TLS on the Esplora TLS listener (default: false). Requires --esploratlsbind and --esploramtlsclientca."
     )]
     pub esploramtls: Option<bool>,
@@ -2661,7 +2723,14 @@ pub struct CliArgs {
     )]
     pub esplorauserpass: Option<String>,
 
-    #[arg(long, value_name = "BOOL", value_parser = parse_bool_arg, help = "Run the native Electrum protocol server (default: false). Requires --addressindex=1 and --txindex=1.")]
+    #[arg(
+        long,
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
+        help = "Run the native Electrum protocol server (default: false). Requires --addressindex=1 and --txindex=1."
+    )]
     pub electrum: Option<bool>,
 
     #[arg(
@@ -2696,6 +2765,8 @@ pub struct CliArgs {
         long,
         value_name = "BOOL",
         value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
         help = "Require mutual TLS on the Electrum TLS listener (default: false). Requires --electrumtlsbind and --electrummtlsclientca."
     )]
     pub electrummtls: Option<bool>,
@@ -2774,6 +2845,8 @@ pub struct CliArgs {
         long,
         value_name = "BOOL",
         value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
         help = "Advertise NODE_COMPACT_FILTERS and answer getcfilters / getcfheaders / getcfcheckpt over P2P (default: false). Implies --blockfilterindex=basic."
     )]
     pub peerblockfilters: Option<bool>,
@@ -2787,15 +2860,23 @@ pub struct CliArgs {
 
     #[arg(
         long,
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
         help = "Rebuild block index and chain state from block files on disk"
     )]
-    pub reindex: bool,
+    pub reindex: Option<bool>,
 
     #[arg(
         long = "reindex-chainstate",
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
         help = "Rebuild UTXO set from existing block files"
     )]
-    pub reindex_chainstate: bool,
+    pub reindex_chainstate: Option<bool>,
 
     // P2P flags
     #[arg(
@@ -2845,7 +2926,14 @@ pub struct CliArgs {
     )]
     pub seednode: Vec<String>,
 
-    #[arg(long, value_name = "BOOL", help = "Allow DNS seeding (default: true)")]
+    #[arg(
+        long,
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
+        help = "Allow DNS seeding (default: true)"
+    )]
     pub dns: Option<bool>,
 
     #[arg(
@@ -3052,12 +3140,22 @@ pub struct CliArgs {
     pub shadowworkers: Option<usize>,
 
     // MCP server flags
-    #[arg(long, help = "Enable MCP (Model Context Protocol) server")]
-    pub mcp: bool,
+    #[arg(
+        long,
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
+        help = "Enable MCP (Model Context Protocol) server"
+    )]
+    pub mcp: Option<bool>,
 
     #[arg(
         long,
         value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
         help = "Enable MCP stdio transport (default: true when --mcp)"
     )]
     pub mcpstdio: Option<bool>,
@@ -3094,15 +3192,23 @@ pub struct CliArgs {
     // No-op compatibility flags (accepted silently, not wired)
     #[arg(
         long,
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
         help = "Accept RPC commands (always on, accepted for compatibility)"
     )]
-    pub server: bool,
+    pub server: Option<bool>,
 
     #[arg(
         long,
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
         help = "Run in background (use systemd instead, accepted for compatibility)"
     )]
-    pub daemon: bool,
+    pub daemon: Option<bool>,
 
     #[arg(
         long,
@@ -3129,9 +3235,13 @@ pub struct CliArgs {
 
     #[arg(
         long,
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
         help = "Emit structured error payloads (category, suggestion, debug) on RPC errors. Default: off (Core-compat)"
     )]
-    pub rpcextendederrors: bool,
+    pub rpcextendederrors: Option<bool>,
 
     #[arg(
         long,
@@ -3198,9 +3308,13 @@ pub struct CliArgs {
 
     #[arg(
         long = "events-grpc-allow-remote",
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
         help = "Permit --events-grpc-bind to point at a non-loopback address. Operator must firewall or auth-proxy the endpoint — the sink has no auth"
     )]
-    pub events_grpc_allow_remote: bool,
+    pub events_grpc_allow_remote: Option<bool>,
 
     #[arg(
         long = "events-zmq-bind",
@@ -3212,6 +3326,9 @@ pub struct CliArgs {
     #[arg(
         long = "events-zmq-hashtx",
         value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
         help = "Enable Bitcoin Core-compatible 'hashtx' topic on the events ZMQ sink (default: enabled when --events-zmq-bind is set)"
     )]
     pub events_zmq_hashtx: Option<bool>,
@@ -3219,6 +3336,9 @@ pub struct CliArgs {
     #[arg(
         long = "events-zmq-hashblock",
         value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
         help = "Enable Bitcoin Core-compatible 'hashblock' topic on the events ZMQ sink (default: enabled)"
     )]
     pub events_zmq_hashblock: Option<bool>,
@@ -3226,6 +3346,9 @@ pub struct CliArgs {
     #[arg(
         long = "events-zmq-mpevict",
         value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
         help = "Enable 'mpevict' topic (mempool eviction with reason) on the events ZMQ sink (default: enabled)"
     )]
     pub events_zmq_mpevict: Option<bool>,
@@ -3233,6 +3356,9 @@ pub struct CliArgs {
     #[arg(
         long = "events-zmq-mpreplace",
         value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
         help = "Enable 'mpreplace' topic (RBF replacement) on the events ZMQ sink (default: enabled)"
     )]
     pub events_zmq_mpreplace: Option<bool>,
@@ -3240,6 +3366,9 @@ pub struct CliArgs {
     #[arg(
         long = "events-zmq-mpconfirm",
         value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
         help = "Enable 'mpconfirm' topic (mempool tx confirmed in block) on the events ZMQ sink (default: enabled)"
     )]
     pub events_zmq_mpconfirm: Option<bool>,
@@ -3247,6 +3376,9 @@ pub struct CliArgs {
     #[arg(
         long = "events-zmq-nodeevent",
         value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
         help = "Enable 'nodeevent' topic (full envelope JSON) on the events ZMQ sink (default: enabled)"
     )]
     pub events_zmq_nodeevent: Option<bool>,
@@ -3408,12 +3540,50 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
     ];
 
     // Bitcoin Core negates a boolean option with a `-no` prefix
-    // (`-nolistenonion` == `-listenonion=0`). satd supports this for the
-    // value-accepting boolean flags this family added; comprehensive
-    // `-no` coverage across every boolean (incl. clap `SetTrue` flags
-    // like `-server`, which reject a value) is tracked in
-    // SATD_CLI_COMPAT_AUDIT.md.
-    const NEGATABLE_BOOL_FLAGS: &[&str] = &["listenonion", "dnsseed", "persistmempool"];
+    // (`-nolistenonion` == `-listenonion=0`, `-noserver` == `-server=0`).
+    // satd now mirrors this comprehensively: every boolean CLI flag is
+    // value-accepting and listed here, so `-no<flag>` / `--no<flag>`
+    // rewrites to `--<flag>=0` for all of them. Entries are the clap
+    // long-name spelling (dash form for renamed flags) so the rewritten
+    // `--<flag>=0` is a flag clap recognises. `blockfilterindex` is
+    // intentionally absent: it is not a plain bool (accepts `basic`), so
+    // its `-no` form is handled via translate_index_aliases instead.
+    const NEGATABLE_BOOL_FLAGS: &[&str] = &[
+        "regtest",
+        "testnet",
+        "signet",
+        "listen",
+        "dns",
+        "dnsseed",
+        "listenonion",
+        "txindex",
+        "addressindex",
+        "peerblockfilters",
+        "mempoolfullrbf",
+        "datacarrier",
+        "permitbaremultisig",
+        "persistmempool",
+        "esplora",
+        "esploramtls",
+        "electrum",
+        "electrummtls",
+        "rpcmtls",
+        "rpcdisableauth",
+        "rpcextendederrors",
+        "reindex",
+        "reindex-chainstate",
+        "mcp",
+        "mcpstdio",
+        "server",
+        "daemon",
+        "events-grpc-allow-remote",
+        "events-zmq-hashtx",
+        "events-zmq-hashblock",
+        "events-zmq-mpevict",
+        "events-zmq-mpreplace",
+        "events-zmq-mpconfirm",
+        "events-zmq-nodeevent",
+    ];
 
     args.into_iter()
         .map(|arg| {
@@ -4207,9 +4377,9 @@ rpcport=8332
     #[test]
     fn test_config_from_cli_regtest() {
         let cli = CliArgs {
-            regtest: true,
-            testnet: false,
-            signet: false,
+            regtest: Some(true),
+            testnet: Some(false),
+            signet: Some(false),
             chain: None,
             blocksdir: None,
             signetseednode: Vec::new(),
@@ -4249,7 +4419,7 @@ rpcport=8332
             mempoolexpiry: None,
             persistmempool: None,
             permitbaremultisig: None,
-            txindex: false,
+            txindex: None,
             addressindex: None,
             addrindexsubscriptions: None,
             esplora: None,
@@ -4286,8 +4456,8 @@ rpcport=8332
             blockfilterindex: None,
             peerblockfilters: None,
             prune: None,
-            reindex: false,
-            reindex_chainstate: false,
+            reindex: Some(false),
+            reindex_chainstate: Some(false),
             maxconnections: None,
             maxinboundperip: None,
             bind: None,
@@ -4300,8 +4470,8 @@ rpcport=8332
             blockmaxweight: None,
             blockmintxfee: None,
             pid: None,
-            server: false,
-            daemon: false,
+            server: Some(false),
+            daemon: Some(false),
             dbcache: None,
             prefetchworkers: None,
             par: None,
@@ -4311,7 +4481,7 @@ rpcport=8332
             torpassword: None,
             listenonion: None,
             onlynet: vec![],
-            mcp: false,
+            mcp: Some(false),
             mcpstdio: None,
             mcpport: None,
             mcpbind: None,
@@ -4332,7 +4502,7 @@ rpcport=8332
             consensus: None,
             shadowqueuesize: None,
             shadowworkers: None,
-            rpcextendederrors: false,
+            rpcextendederrors: Some(false),
             maxshutdownsecs: None,
             rpcdefaultunits: None,
             log_format: None,
@@ -4344,7 +4514,7 @@ rpcport=8332
             events_node_id: None,
             events_region: None,
             events_grpc_bind: None,
-            events_grpc_allow_remote: false,
+            events_grpc_allow_remote: Some(false),
             events_zmq_bind: None,
             events_zmq_hashtx: None,
             events_zmq_hashblock: None,
@@ -4407,9 +4577,9 @@ rpcport=8332
     #[test]
     fn test_config_auth_validation() {
         let cli = CliArgs {
-            regtest: true,
-            testnet: false,
-            signet: false,
+            regtest: Some(true),
+            testnet: Some(false),
+            signet: Some(false),
             chain: None,
             blocksdir: None,
             signetseednode: Vec::new(),
@@ -4449,7 +4619,7 @@ rpcport=8332
             mempoolexpiry: None,
             persistmempool: None,
             permitbaremultisig: None,
-            txindex: false,
+            txindex: None,
             addressindex: None,
             addrindexsubscriptions: None,
             esplora: None,
@@ -4486,8 +4656,8 @@ rpcport=8332
             blockfilterindex: None,
             peerblockfilters: None,
             prune: None,
-            reindex: false,
-            reindex_chainstate: false,
+            reindex: Some(false),
+            reindex_chainstate: Some(false),
             maxconnections: None,
             maxinboundperip: None,
             bind: None,
@@ -4500,8 +4670,8 @@ rpcport=8332
             blockmaxweight: None,
             blockmintxfee: None,
             pid: None,
-            server: false,
-            daemon: false,
+            server: Some(false),
+            daemon: Some(false),
             dbcache: None,
             prefetchworkers: None,
             par: None,
@@ -4511,7 +4681,7 @@ rpcport=8332
             torpassword: None,
             listenonion: None,
             onlynet: vec![],
-            mcp: false,
+            mcp: Some(false),
             mcpstdio: None,
             mcpport: None,
             mcpbind: None,
@@ -4532,7 +4702,7 @@ rpcport=8332
             consensus: None,
             shadowqueuesize: None,
             shadowworkers: None,
-            rpcextendederrors: false,
+            rpcextendederrors: Some(false),
             maxshutdownsecs: None,
             rpcdefaultunits: None,
             log_format: None,
@@ -4544,7 +4714,7 @@ rpcport=8332
             events_node_id: None,
             events_region: None,
             events_grpc_bind: None,
-            events_grpc_allow_remote: false,
+            events_grpc_allow_remote: Some(false),
             events_zmq_bind: None,
             events_zmq_hashtx: None,
             events_zmq_hashblock: None,
@@ -5539,6 +5709,117 @@ rpcport=39999
             err.contains("includeconf cannot be used from commandline"),
             "expected a hard error rejecting command-line includeconf, got: {err}"
         );
+    }
+
+    // ---- comprehensive `-no` negation + value-accepting boolean flags ----
+
+    /// Run `args` through the full CLI pipeline (normalize_args →
+    /// clap → from_cli) the same way `main` does.
+    fn parse_negation(args: &[&str]) -> Result<Config, String> {
+        let normalized = normalize_args(args.iter().map(|s| s.to_string()).collect());
+        let cli = CliArgs::try_parse_from(normalized).map_err(|e| e.to_string())?;
+        Config::from_cli(cli)
+    }
+
+    #[test]
+    fn noserver_negates_former_settrue_flag_and_overrides_config() {
+        // The key correctness test: `-noserver` (a flag that used to be
+        // clap SetTrue and rejected a value) must both parse AND defeat
+        // a config-file `server=1`.
+        let tmpdir = tempfile::tempdir().unwrap();
+        std::fs::write(tmpdir.path().join("bitcoin.conf"), "server=1\n").unwrap();
+        let conf_path = tmpdir.path().join("bitcoin.conf");
+        let cfg = parse_negation(&[
+            "satd",
+            "--regtest",
+            "--datadir",
+            tmpdir.path().to_str().unwrap(),
+            "--conf",
+            conf_path.to_str().unwrap(),
+            "-noserver",
+        ])
+        .unwrap();
+        assert!(!cfg.server, "-noserver must override config server=1");
+    }
+
+    #[test]
+    fn noregtest_resolves_to_mainnet() {
+        // `-noregtest` on a former network-selector should disable the
+        // regtest selection, leaving mainnet.
+        let tmpdir = tempfile::tempdir().unwrap();
+        let cfg = parse_negation(&[
+            "satd",
+            "--datadir",
+            tmpdir.path().to_str().unwrap(),
+            "-noregtest",
+        ])
+        .unwrap();
+        assert_eq!(cfg.network, Network::Bitcoin, "-noregtest should leave mainnet");
+    }
+
+    #[test]
+    fn txindex_zero_overrides_config_one() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        std::fs::write(tmpdir.path().join("bitcoin.conf"), "txindex=1\n").unwrap();
+        let conf_path = tmpdir.path().join("bitcoin.conf");
+        let cfg = parse_negation(&[
+            "satd",
+            "--regtest",
+            "--datadir",
+            tmpdir.path().to_str().unwrap(),
+            "--conf",
+            conf_path.to_str().unwrap(),
+            "--txindex=0",
+            // esplora defaults on and refuses to start with txindex
+            // explicitly disabled; disable it to isolate the assertion.
+            "--esplora=0",
+        ])
+        .unwrap();
+        assert!(!cfg.txindex, "--txindex=0 must override config txindex=1");
+    }
+
+    #[test]
+    fn bare_former_settrue_flag_still_enables() {
+        // A bare `-server` (no value) must still turn the flag on via
+        // default_missing_value.
+        let tmpdir = tempfile::tempdir().unwrap();
+        let cfg = parse_negation(&[
+            "satd",
+            "--regtest",
+            "--datadir",
+            tmpdir.path().to_str().unwrap(),
+            "-server",
+        ])
+        .unwrap();
+        assert!(cfg.server, "bare -server should enable server");
+    }
+
+    #[test]
+    fn listen_negation_and_value_forms() {
+        // `listen` was already Option<bool>; verify both `-nolisten`
+        // and `--listen=0` disable it now that it is value-accepting.
+        let tmpdir = tempfile::tempdir().unwrap();
+        let dd = tmpdir.path().to_str().unwrap();
+
+        let cfg = parse_negation(&["satd", "--regtest", "--datadir", dd, "-nolisten"]).unwrap();
+        assert!(!cfg.listen, "-nolisten should disable listen");
+
+        let cfg = parse_negation(&["satd", "--regtest", "--datadir", dd, "--listen=0"]).unwrap();
+        assert!(!cfg.listen, "--listen=0 should disable listen");
+    }
+
+    #[test]
+    fn nodnsseed_still_works_regression() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let cfg = parse_negation(&[
+            "satd",
+            "--regtest",
+            "--datadir",
+            tmpdir.path().to_str().unwrap(),
+            "-nodnsseed",
+        ])
+        .unwrap();
+        assert!(!cfg.dnsseed, "-nodnsseed should disable dnsseed");
     }
 
     // ---- PR-3: hard-error on unknown keys + --timeout unit fix ----
