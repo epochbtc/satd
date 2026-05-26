@@ -17,13 +17,12 @@ const JUMP: u32 = 1;
 const MATCH: u32 = 2;
 const DEFAULT: u32 = 3;
 
+// These ladders and minvals must match Bitcoin Core's `util/asmap.cpp`
+// exactly (DecodeType/DecodeASN/DecodeMatch/DecodeJump) — otherwise real
+// Core-produced asmap files decode to the wrong ASNs.
 const TYPE_BIT_SIZES: &[u8] = &[0, 0, 1];
-const ASN_BIT_SIZES: &[u8] = &[
-    15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
-];
-const MATCH_BIT_SIZES: &[u8] = &[
-    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
-];
+const ASN_BIT_SIZES: &[u8] = &[15, 16, 17, 18, 19, 20, 21, 22, 23, 24];
+const MATCH_BIT_SIZES: &[u8] = &[1, 2, 3, 4, 5, 6, 7, 8];
 const JUMP_BIT_SIZES: &[u8] = &[
     5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29,
     30,
@@ -98,7 +97,7 @@ fn decode_match(bits: &mut Bits) -> u32 {
     decode_bits(bits, 2, MATCH_BIT_SIZES)
 }
 fn decode_jump(bits: &mut Bits) -> u32 {
-    decode_bits(bits, 5, JUMP_BIT_SIZES)
+    decode_bits(bits, 17, JUMP_BIT_SIZES)
 }
 
 /// Bits needed to represent `x` (Core's `CountBits`): position of the
@@ -188,12 +187,15 @@ pub struct AsMap {
 }
 
 impl AsMap {
-    /// Build from the raw file bytes (each byte expands to 8 bits,
-    /// most-significant first).
+    /// Build from the raw file bytes. Bitcoin Core's `DecodeAsmap` expands
+    /// each byte **least-significant-bit first** (`(byte >> i) & 1` for
+    /// i = 0..8), so satd must too or real asmap files decode wrongly.
+    /// (Note: the IP bitstream in `ip_to_bits` is the opposite order —
+    /// most-significant-bit first — matching Core's prefix matching.)
     pub fn from_bytes(bytes: &[u8]) -> Self {
         let mut bits = Vec::with_capacity(bytes.len() * 8);
         for &byte in bytes {
-            for i in (0..8).rev() {
+            for i in 0..8 {
                 bits.push((byte >> i) & 1 == 1);
             }
         }
@@ -267,7 +269,7 @@ mod tests {
         enc_bits(out, asn, 1, ASN_BIT_SIZES);
     }
     fn enc_jump(out: &mut Vec<bool>, j: u32) {
-        enc_bits(out, j, 5, JUMP_BIT_SIZES);
+        enc_bits(out, j, 17, JUMP_BIT_SIZES);
     }
 
     fn ret(asn: u32) -> Vec<bool> {
@@ -346,7 +348,8 @@ mod tests {
         let mut bytes = vec![0u8; bitvec.len().div_ceil(8)];
         for (i, &bit) in bitvec.iter().enumerate() {
             if bit {
-                bytes[i / 8] |= 1 << (7 - (i % 8));
+                // LSB-first packing, matching Core's DecodeAsmap byte order.
+                bytes[i / 8] |= 1 << (i % 8);
             }
         }
         let am = AsMap::from_bytes(&bytes);
@@ -355,5 +358,27 @@ mod tests {
         assert_eq!(am.lookup("1.2.3.4".parse().unwrap()), 64512);
         let key = am.group_key("1.2.3.4".parse().unwrap());
         assert_eq!(key[0], 0xA0);
+    }
+
+    #[test]
+    fn golden_core_format_bytes_decode_to_expected_asn() {
+        // A hand-derived asmap in Core's exact wire format, independent of
+        // the test encoder, so this pins both the LSB-first byte order and
+        // the ASN ladder (minval 1, first field 15 bits) against Core.
+        //
+        // Bytes [0x00, 0x00, 0x01], expanded LSB-first, are 17 bits with
+        // only bit index 16 set:
+        //   bit 0  : RETURN type selector (0)
+        //   bit 1  : ASN field selector (0 → 15-bit field)
+        //   bits 2..17: the 15-bit ASN delta, MSB-first, value 1
+        // → DecodeType=RETURN, DecodeASN = minval(1) + 1 = 2.
+        // Under the previous MSB-first byte order this same input decoded
+        // to ASN 1, so this test fails if the byte order regresses.
+        let am = AsMap::from_bytes(&[0x00, 0x00, 0x01]);
+        assert_eq!(am.lookup("1.2.3.4".parse().unwrap()), 2);
+
+        // All-zero bytes are RETURN(ASN=1) (every field at its minimum).
+        let am0 = AsMap::from_bytes(&[0x00, 0x00, 0x00]);
+        assert_eq!(am0.lookup("8.8.8.8".parse().unwrap()), 1);
     }
 }
