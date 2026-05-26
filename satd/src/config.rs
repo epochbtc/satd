@@ -462,6 +462,13 @@ pub struct Config {
     /// (advertise relay=false, ignore inbound tx, don't request txs).
     /// Locally submitted (RPC) transactions are still relayed.
     pub blocksonly: bool,
+    /// Bitcoin Core's `-v2transport`: offer/accept the BIP 324 v2 encrypted
+    /// transport. Defaults to true, matching Bitcoin Core (since v26).
+    pub v2transport: bool,
+    /// satd-specific `-v2only`: refuse peers that do not speak BIP 324 v2
+    /// (drop inbound v1, do not downgrade outbound). Implies `v2transport`.
+    /// Defaults to false. Privacy lever — see CORE_DIFFERENCES.md.
+    pub v2only: bool,
     pub port: u16,
     pub connect: Vec<String>,
     /// Operator-declared external addresses (Bitcoin Core's
@@ -1298,6 +1305,17 @@ impl Config {
             .or_else(|| file_get("blocksonly").and_then(|v| parse_bool(&v)))
             .unwrap_or(false);
 
+        // -v2transport defaults on, matching Bitcoin Core since v26.
+        let v2transport = cli
+            .v2transport
+            .or_else(|| file_get("v2transport").and_then(|v| parse_bool(&v)))
+            .unwrap_or(true);
+        // -v2only is satd-specific and off by default; it implies v2transport.
+        let v2only = cli
+            .v2only
+            .or_else(|| file_get("v2only").and_then(|v| parse_bool(&v)))
+            .unwrap_or(false);
+
         // -externalip: CLI list wins, else config (multi). Each entry is
         // `IP` or `IP:port`; a bare IP inherits the network P2P port.
         let externalip_raw: Vec<String> = if !cli.externalip.is_empty() {
@@ -1881,6 +1899,8 @@ impl Config {
             rpc_tls_key,
             listen,
             blocksonly,
+            v2transport,
+            v2only,
             externalip,
             whitelist,
             whitebind,
@@ -2310,6 +2330,8 @@ impl Config {
                 "addnode": self.addnode,
                 "seednode": self.seednode,
                 "blocksonly": self.blocksonly,
+                "v2transport": self.v2transport,
+                "v2only": self.v2only,
                 "externalip": self.externalip.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
                 "whitelist": self.whitelist.iter().map(|e| e.raw.clone()).collect::<Vec<_>>(),
                 "whitebind": self.whitebind.iter().map(|(a, _)| a.to_string()).collect::<Vec<_>>(),
@@ -2686,6 +2708,28 @@ pub struct CliArgs {
         help = "Suppress P2P transaction relay (default: false)"
     )]
     pub blocksonly: Option<bool>,
+
+    /// Bitcoin Core's `-v2transport`: BIP 324 v2 encrypted transport.
+    #[arg(
+        long,
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
+        help = "Offer/accept BIP 324 v2 encrypted transport (default: true)"
+    )]
+    pub v2transport: Option<bool>,
+
+    /// satd-specific `-v2only`: refuse non-v2 peers.
+    #[arg(
+        long,
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
+        help = "Refuse peers that do not speak BIP 324 v2 (default: false)"
+    )]
+    pub v2only: Option<bool>,
 
     #[arg(long, value_name = "PORT", help = "P2P listen port")]
     pub port: Option<u16>,
@@ -3791,6 +3835,8 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "forcednsseed",
         "fixedseeds",
         "blocksonly",
+        "v2transport",
+        "v2only",
         "externalip",
         "whitelist",
         "whitebind",
@@ -3846,6 +3892,8 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "signet",
         "listen",
         "blocksonly",
+        "v2transport",
+        "v2only",
         "dns",
         "dnsseed",
         "forcednsseed",
@@ -4151,6 +4199,8 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     // P2P
     "listen",
     "blocksonly",
+    "v2transport",
+    "v2only",
     "externalip",
     "whitelist",
     "whitebind",
@@ -4720,6 +4770,8 @@ rpcport=8332
             rpctlshandshaketimeout: None,
             listen: None,
             blocksonly: None,
+            v2transport: None,
+            v2only: None,
             port: None,
             connect: vec![],
             externalip: vec![],
@@ -4930,6 +4982,8 @@ rpcport=8332
             rpctlshandshaketimeout: None,
             listen: None,
             blocksonly: None,
+            v2transport: None,
+            v2only: None,
             port: None,
             connect: vec![],
             externalip: vec![],
@@ -6371,6 +6425,29 @@ rpcport=39999
         );
         let cli = CliArgs::try_parse_from(argv).unwrap();
         assert!(!Config::from_cli(cli).unwrap().blocksonly);
+    }
+
+    // ---- v2transport / v2only ----
+
+    #[test]
+    fn v2transport_defaults_true_v2only_false() {
+        let cli = CliArgs::try_parse_from(["satd", "--regtest"]).unwrap();
+        let cfg = Config::from_cli(cli).unwrap();
+        assert!(cfg.v2transport, "v2transport should default on (Core parity)");
+        assert!(!cfg.v2only);
+    }
+
+    #[test]
+    fn v2transport_negation_and_v2only_flag() {
+        let argv = normalize_args(
+            ["satd", "--regtest", "-nov2transport"].iter().map(|s| s.to_string()).collect(),
+        );
+        let cli = CliArgs::try_parse_from(argv).unwrap();
+        assert!(!Config::from_cli(cli).unwrap().v2transport);
+
+        let cli = CliArgs::try_parse_from(["satd", "--regtest", "--v2only"]).unwrap();
+        let cfg = Config::from_cli(cli).unwrap();
+        assert!(cfg.v2only);
     }
 
     // ---- signetchallenge: custom signet (BIP 325) ----

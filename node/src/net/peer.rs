@@ -78,12 +78,39 @@ pub enum PeerState {
     Disconnected,
 }
 
+/// The wire transport carrying a peer connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportProtocol {
+    /// Legacy plaintext v1.
+    V1,
+    /// BIP 324 v2 encrypted transport.
+    V2,
+}
+
+impl TransportProtocol {
+    /// Bitcoin Core's `getpeerinfo.transport_protocol_type` string.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TransportProtocol::V1 => "v1",
+            TransportProtocol::V2 => "v2",
+        }
+    }
+
+    /// Whether this is the BIP 324 v2 transport.
+    pub fn is_v2(self) -> bool {
+        matches!(self, TransportProtocol::V2)
+    }
+}
+
 /// Per-peer state tracked by the peer manager.
 #[derive(Debug)]
 pub struct PeerInfo {
     pub id: PeerId,
     pub addr: SocketAddr,
     pub direction: Direction,
+    /// Wire transport (v1 plaintext or BIP 324 v2). Set once the
+    /// connection is established; defaults to v1.
+    pub transport: TransportProtocol,
     pub state: PeerState,
     pub version: Option<VersionMessage>,
     pub services: ServiceFlags,
@@ -109,6 +136,7 @@ impl PeerInfo {
             id,
             addr,
             direction,
+            transport: TransportProtocol::V1,
             state: PeerState::Connecting,
             version: None,
             services: ServiceFlags::NONE,
@@ -154,6 +182,7 @@ impl PeerInfo {
             "version": self.version.as_ref().map(|v| v.version).unwrap_or(0),
             "subver": &self.user_agent,
             "inbound": self.direction == Direction::Inbound,
+            "transport_protocol_type": self.transport.as_str(),
             "startingheight": self.best_height,
             "synced_headers": -1,
             "synced_blocks": -1,

@@ -239,6 +239,10 @@ pub struct PeerManager {
     /// Defaults to false here; the satd binary sets it from config via
     /// `set_v2transport` (default-on at that layer, matching Core).
     v2_transport: std::sync::atomic::AtomicBool,
+    /// satd-specific `-v2only`: refuse peers that don't speak BIP 324 v2.
+    /// Inbound v1 peers are dropped at detection; outbound v2 failures are
+    /// not downgraded. Implies `v2_transport`. Defaults to false.
+    v2_only: std::sync::atomic::AtomicBool,
     /// Outbound destinations whose v2 handshake failed this session, so we
     /// connect them straight as v1 instead of wasting a v2 round trip on
     /// every reconnect. Keyed by socket address (direct peers only).
@@ -375,6 +379,7 @@ impl PeerManager {
             peer_serve_filters: std::sync::atomic::AtomicBool::new(false),
             blocksonly: std::sync::atomic::AtomicBool::new(false),
             v2_transport: std::sync::atomic::AtomicBool::new(false),
+            v2_only: std::sync::atomic::AtomicBool::new(false),
             v2_downgraded: RwLock::new(HashSet::new()),
             upload_target_bytes: AtomicU64::new(0),
             upload_bytes: AtomicU64::new(0),
@@ -466,6 +471,18 @@ impl PeerManager {
     /// Whether the BIP 324 v2 transport is enabled (`-v2transport`).
     fn v2_transport_enabled(&self) -> bool {
         self.v2_transport.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Enable/disable v2-only peering (`-v2only`). Set from the satd binary
+    /// at startup; implies v2 transport is enabled.
+    pub fn set_v2only(&self, enabled: bool) {
+        self.v2_only
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether non-v2 peers are refused (`-v2only`).
+    fn v2_only(&self) -> bool {
+        self.v2_only.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Declare operator-supplied external addresses (`-externalip`). Set
@@ -913,6 +930,15 @@ impl PeerManager {
         peers
             .values()
             .filter(|h| h.info.state == PeerState::Connected)
+            .count()
+    }
+
+    /// Number of connected peers using the BIP 324 v2 encrypted transport.
+    pub fn connection_count_v2(&self) -> usize {
+        let peers = self.peers.read();
+        peers
+            .values()
+            .filter(|h| h.info.state == PeerState::Connected && h.info.transport.is_v2())
             .count()
     }
 
@@ -3516,6 +3542,9 @@ impl PeerManager {
             .map_err(|e| format!("v2 detection read: {}", e))?;
 
         if first == expected {
+            if self.v2_only() {
+                return Err("v2only: rejecting inbound v1 peer".to_string());
+            }
             Ok(Connection::v1_with_leading(stream, magic, first.to_vec()))
         } else {
             let network = self.chain_state.network;
@@ -3625,6 +3654,10 @@ impl PeerManager {
             )),
             _ => {
                 drop(stream);
+                // Under -v2only we never fall back to v1.
+                if self.v2_only() {
+                    return Err("v2only: outbound v2 handshake failed".to_string());
+                }
                 if let OutboundDial::Direct(addr) = &target {
                     self.v2_downgraded.write().insert(*addr);
                 }
@@ -3658,6 +3691,12 @@ impl PeerManager {
                 }
             }
         };
+
+        // Record the negotiated transport for getpeerinfo / metrics.
+        let transport_protocol = conn.transport_protocol();
+        if let Some(handle) = self.peers.write().get_mut(&id) {
+            handle.info.transport = transport_protocol;
+        }
 
         // Perform handshake with timeout
         let version = self.perform_handshake(id, &mut conn, direction).await?;

@@ -903,6 +903,11 @@ async fn main() {
     // -blocksonly: suppress P2P transaction relay.
     peer_manager.set_blocksonly(config.blocksonly);
 
+    // -v2transport / -v2only: BIP 324 encrypted transport. -v2only implies
+    // the transport is enabled (it just additionally refuses v1 peers).
+    peer_manager.set_v2transport(config.v2transport || config.v2only);
+    peer_manager.set_v2only(config.v2only);
+
     // -maxuploadtarget: cap historical block upload per 24h (0 = off).
     peer_manager.set_max_upload_target(config.max_upload_target);
 
