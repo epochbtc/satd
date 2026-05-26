@@ -82,7 +82,7 @@ satd is as drop-in as Bitcoin Core for Umbrel, Start9 / StartOS, RaspiBlitz, MyN
 - **Systemd unit** in `contrib/systemd/satd.service` — *shipped*. `Type=notify` with `sd_notify(READY=1)` after every listener is bound; during reindex (hours on mainnet), satd emits `EXTEND_TIMEOUT_USEC=120000000` + `STATUS=...` heartbeats every 30s so the unit doesn't fight `TimeoutStartSec`. `StateDirectory=satd`, `LimitNOFILE=65536`, `Restart=on-failure`, `TimeoutStopSec=10min` (RocksDB flush). OpenRC (`contrib/openrc/init.d/satd`) and runit (`contrib/runit/satd/`) equivalents shipped for StartOS / Alpine / Void.
 - **Clean SIGTERM shutdown** — RocksDB flush, undo-file sync, bounded under 10s. One botched shutdown = one corrupted chainstate = a packager bug ticket.
 - **Health endpoint** (`GET /health` or `/rest/chaininfo.json`) returning `{tip, height, ibd, peers, synced}`, responding under 100 ms even during IBD. Both Umbrel and Start9 poll this constantly.
-- **Prometheus `/metrics`** endpoint out of the box — block height, mempool size, peer count, RocksDB stats, verify time. Ship a Grafana dashboard JSON in `contrib/grafana/`.
+- **Prometheus `/metrics`** endpoint out of the box — block height, mempool size, peer count, RocksDB stats, verify time. (A bundled Grafana dashboard JSON in `contrib/grafana/` is still a TODO.)
 - **Structured JSON logs** to stdout (already available via `tracing-subscriber` JSON layer). Docker log drivers just work.
 - **Log noise discipline** — no per-block INFO lines. Packagers debug via `journalctl` and drown in chatty nodes.
 

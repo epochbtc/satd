@@ -12,6 +12,41 @@ layout) per `STABILITY_POLICY.md`.
 
 - **Native TLS Support:** Direct TLS termination for JSON-RPC, Electrum, and Esplora servers via `--rpctlsbind`, `--electrumtlsbind`, and `--esploratlsbind`. Eliminates the need for a TLS-terminating sidecar.
 
+### Configuration and CLI compatibility
+
+- **Bitcoin Core CLI/config-compatibility gap closed.** Every recognized
+  `bitcoin.conf` key is now either honored or recognize-rejected with a
+  clear message — no silent accept-and-ignore. Newly implemented:
+  `-includeconf` chained config files (main file read first, included
+  files appended; single-valued keys resolve first-wins, matching Core's
+  `reverse_precedence`); comprehensive `-no<option>` boolean negation
+  across all boolean flags; `-signetchallenge` custom signet with
+  opt-in BIP 325 block-solution validation; `-testnet4` chain params
+  including BIP 94 (timewarp guard + first-block-seeded retarget);
+  `-blocksonly`; `-externalip`; `-whitelist` / `-whitebind` peer
+  permissions (NoBan + Relay/ForceRelay acted on); `-maxuploadtarget`
+  (meters block-serving bytes); persistent address manager
+  (`peers.dat`, satd-native format — see `CORE_DIFFERENCES.md`); `-asmap`
+  ASN-based bucketing (Core `util/asmap.cpp` port); `-forcednsseed` and
+  `-fixedseeds`. `-includeconf` on the command line is now a hard error,
+  matching Core.
+
+### AssumeUTXO
+
+- **`loadtxoutset` / `getchainstates` RPCs** plus two-chainstate
+  (background) sync. satd loads Bitcoin Core's published UTXO snapshot
+  files directly; the anchor table is copied verbatim from Core's
+  `m_assumeutxo_data`. Refuses to load under pruning. Signed snapshot
+  distribution and a `--fast-start` UX remain deferred.
+
+### Packaging
+
+- **musl-linux static tarballs** (`x86_64`/`aarch64-unknown-linux-musl`,
+  built via `cargo-zigbuild`) and **macOS Apple Silicon tarballs**
+  (`aarch64-apple-darwin`) now ship in the release matrix.
+- **systemd `WatchdogSec=` liveness** wired into both `satd.service` and
+  the new **`satd@.service`** template unit for per-network instances.
+
 ### Storage
 
 - **Breaking — storage format cleanup.** Undo entries are now v1-only
@@ -93,17 +128,12 @@ below are governed by `STABILITY_POLICY.md` from this tag forward.
 
 ### Known deferred items
 
-Tracked in `ECOSYSTEM.md` and `docs/PACKAGING.md` for the v0.1.x line:
+Tracked in `ECOSYSTEM.md` and `docs/PACKAGING.md` for the v0.1.x line.
+(macOS Apple Silicon tarballs, musl-linux tarballs, systemd
+`WatchdogSec=`, and the `satd@.service` template all shipped post-0.1.0
+— see the `[Unreleased]` section above.)
 
-- macOS Apple Silicon tarballs (re-enable after the public flip; hosted Apple
-  Silicon runners bill at 20× the linux rate).
-- musl-linux tarballs (`rocksdb-sys` + musl wants a dedicated cross
-  toolchain).
 - `cargo-auditable` to embed the dependency manifest in the binary.
-- `WatchdogSec=` runtime liveness in the systemd unit (needs per-subsystem
-  health criteria).
-- `satd@.service` template unit for per-network instances; the drop-in
-  pattern is documented in `docs/PACKAGING.md` as the workaround.
 - Signed AssumeUTXO snapshot distribution and `--fast-start` UX.
 
 [Unreleased]: https://github.com/epochbtc/satd/compare/v0.1.0...HEAD

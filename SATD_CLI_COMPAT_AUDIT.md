@@ -1,5 +1,13 @@
 # satd ↔ Bitcoin Core CLI / config compatibility audit
 
+> **Status (2026-05-26): the parity gap is closed.** Every P0/P1 key this
+> audit flagged as missing was implemented by the #214–#225 PR stack;
+> `NOT_YET_IMPLEMENTED_KEYS` in `satd/src/config.rs` is now empty. This
+> document is retained as the historical record of the gap analysis and
+> the disposition rules — the per-row "missing" status in the tables
+> below is no longer current. The disposition framework (implemented /
+> recognized-rejected / intentionally-excluded) is still authoritative.
+
 The parity roadmap for satd's command-line flags and `bitcoin.conf` /
 `satd.conf` config keys. satd's config parser is **strict**: like Bitcoin
 Core (since the v0.17 args overhaul), an unrecognized option is a fatal
