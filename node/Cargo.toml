@@ -32,6 +32,7 @@ parking_lot = { workspace = true }
 ipnet = "2.12"
 hmac = "0.12"
 sha2 = "0.10"
+bip324 = "0.10"
 tls-config = { path = "../tls-config" }
 
 consensus = { path = "../consensus" }
