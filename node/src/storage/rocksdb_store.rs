@@ -207,10 +207,11 @@ impl RocksDbStore {
         )
     }
 
-    /// Open the chainstate with explicit storage tuning. See
-    /// [`StorageTuning`] for the per-field semantics; the resolved
-    /// values are logged at INFO so an operator can verify what
-    /// RocksDB is actually running with.
+    /// Open the chainstate with explicit storage tuning. `path` is the
+    /// node datadir; the RocksDB instance lives in its `chainstate/`
+    /// subdirectory. See [`StorageTuning`] for the per-field semantics;
+    /// the resolved values are logged at INFO so an operator can verify
+    /// what RocksDB is actually running with.
     pub fn open_with_tuning(
         path: &Path,
         txindex: bool,
@@ -219,7 +220,31 @@ impl RocksDbStore {
         max_open_files: i32,
         tuning: StorageTuning,
     ) -> Result<Self, StoreError> {
-        let db_path = path.join("chainstate");
+        Self::open_at(
+            &path.join("chainstate"),
+            txindex,
+            cache_mb,
+            reindex,
+            max_open_files,
+            tuning,
+        )
+    }
+
+    /// Open a RocksDB chainstate rooted at an explicit directory, rather
+    /// than the datadir's default `chainstate/` subdir. This is the entry
+    /// point for opening a *second* chainstate alongside the primary one
+    /// (e.g. AssumeUTXO's `chainstate_background/`), where the caller
+    /// chooses the subdirectory. `open`/`open_with_tuning` are thin
+    /// wrappers that pass `<datadir>/chainstate`.
+    pub fn open_at(
+        chainstate_dir: &Path,
+        txindex: bool,
+        cache_mb: usize,
+        reindex: bool,
+        max_open_files: i32,
+        tuning: StorageTuning,
+    ) -> Result<Self, StoreError> {
+        let db_path = chainstate_dir.to_path_buf();
 
         let cpus = std::thread::available_parallelism()
             .map(|n| n.get())
@@ -2912,6 +2937,54 @@ mod tests {
         let store = RocksDbStore::open(dir.path(), false, 16, false, -1).unwrap();
         let _af = store.cf(CF_ADDR_FUNDING_V2);
         let _as_ = store.cf(CF_ADDR_SPENDING_V2);
+    }
+
+    #[test]
+    fn open_at_isolates_two_chainstates_under_one_datadir() {
+        // AssumeUTXO runs a primary (snapshot) chainstate at
+        // `<datadir>/chainstate` and a background chainstate at
+        // `<datadir>/chainstate_background`. They must be independent
+        // RocksDB instances: a write to one is invisible to the other,
+        // and each persists to its own subdir.
+        let dir = tempfile::tempdir().unwrap();
+        let datadir = dir.path();
+        let bg_path = datadir.join("chainstate_background");
+
+        let primary = RocksDbStore::open(datadir, false, 16, false, -1).unwrap();
+        let background =
+            RocksDbStore::open_at(&bg_path, false, 16, false, -1, StorageTuning::default())
+                .unwrap();
+
+        let op_primary = make_outpoint(0x11, 0);
+        let op_bg = make_outpoint(0x22, 0);
+
+        let mut b = StoreBatch::default();
+        b.coin_puts.push((op_primary, make_coin(1_000, 1)));
+        primary.write_batch(b).unwrap();
+
+        let mut b = StoreBatch::default();
+        b.coin_puts.push((op_bg, make_coin(2_000, 2)));
+        background.write_batch(b).unwrap();
+
+        // Each store sees only its own coin.
+        assert!(primary.get_coin(&op_primary).is_some());
+        assert!(primary.get_coin(&op_bg).is_none());
+        assert!(background.get_coin(&op_bg).is_some());
+        assert!(background.get_coin(&op_primary).is_none());
+
+        // Both subdirs exist on disk and are distinct.
+        assert!(datadir.join("chainstate").is_dir());
+        assert!(bg_path.is_dir());
+
+        // The background DB persists to its chosen subdir: drop and
+        // reopen via open_at, its coin survives and the primary's never
+        // bled across.
+        drop(background);
+        let reopened =
+            RocksDbStore::open_at(&bg_path, false, 16, false, -1, StorageTuning::default())
+                .unwrap();
+        assert!(reopened.get_coin(&op_bg).is_some());
+        assert!(reopened.get_coin(&op_primary).is_none());
     }
 
     #[test]
