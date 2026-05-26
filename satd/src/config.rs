@@ -640,6 +640,9 @@ pub struct Config {
     /// Maximum simultaneous inbound peers from the same source IP
     /// (Core-style flood guard; default 3).
     pub maxinboundperip: usize,
+    /// Bitcoin Core's `-maxuploadtarget`: soft cap in bytes on historical
+    /// block upload per rolling 24h. 0 = unlimited.
+    pub max_upload_target: u64,
     pub bind: String,
     /// P2P connection timeout in **milliseconds**, matching Bitcoin
     /// Core's `-timeout` semantics. Defaults to 5000 (5s) when unset.
@@ -1919,6 +1922,16 @@ impl Config {
                 .maxinboundperip
                 .or_else(|| file_get("maxinboundperip").and_then(|v| v.parse().ok()))
                 .unwrap_or(3),
+            max_upload_target: {
+                let raw = cli
+                    .maxuploadtarget
+                    .clone()
+                    .or_else(|| file_get("maxuploadtarget"));
+                match raw {
+                    Some(s) => parse_maxuploadtarget(&s)?,
+                    None => 0,
+                }
+            },
             bind: cli
                 .bind
                 .or_else(|| file_get("bind"))
@@ -2260,6 +2273,7 @@ impl Config {
                 "externalip": self.externalip.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
                 "whitelist": self.whitelist.iter().map(|e| e.raw.clone()).collect::<Vec<_>>(),
                 "whitebind": self.whitebind.iter().map(|(a, _)| a.to_string()).collect::<Vec<_>>(),
+                "max_upload_target_bytes": self.max_upload_target,
             },
             "mempool": {
                 "max_bytes_mb": self.maxmempool,
@@ -3083,6 +3097,12 @@ pub struct CliArgs {
     )]
     pub maxinboundperip: Option<usize>,
 
+    /// Bitcoin Core's `-maxuploadtarget`: cap historical block upload per
+    /// 24h. Plain number = MiB; suffix `B/K/M/G/T` (or `KiB`/`MiB`/…)
+    /// overrides. 0 = unlimited.
+    #[arg(long, value_name = "SIZE", help = "Max historical upload per 24h (e.g. 500M; 0=off)")]
+    pub maxuploadtarget: Option<String>,
+
     #[arg(
         long,
         value_name = "ADDR",
@@ -3690,6 +3710,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "reindex-chainstate",
         "maxconnections",
         "maxinboundperip",
+        "maxuploadtarget",
         "bind",
         "timeout",
         "addnode",
@@ -4064,6 +4085,7 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "seednode",
     "maxconnections",
     "maxinboundperip",
+    "maxuploadtarget",
     "dns",
     "dnsseed",
     "bantime",
@@ -4205,7 +4227,6 @@ pub enum UnsupportedKey {
 /// silently ignoring it could run a node wide open. When a key here
 /// gains real support, move it into [`KNOWN_CONFIG_KEYS`].
 const NOT_YET_IMPLEMENTED_KEYS: &[&str] = &[
-    "maxuploadtarget", // upload bandwidth cap + serving limits
     "asmap",           // ASN-based addrman bucketing (eclipse resistance)
     // The two below need machinery satd lacks today (persistent
     // addrman / a compiled-in fixed-IP seed list). satd seeds at every
@@ -4447,6 +4468,34 @@ pub fn parse_timeout_value(s: &str) -> Result<u64, String> {
 
 /// Parse a Bitcoin Core `-chain=<name>` value to a `bitcoin::Network`.
 /// Accepts every canonical name Core does plus a few common aliases.
+/// Parse a `-maxuploadtarget` size into bytes. A bare number is MiB
+/// (Bitcoin Core's historical unit); a `B/K/M/G/T` suffix (optionally
+/// `iB`) overrides. `0` means unlimited.
+fn parse_maxuploadtarget(s: &str) -> Result<u64, String> {
+    let s = s.trim().to_ascii_lowercase();
+    if s.is_empty() {
+        return Err("maxuploadtarget: empty value".to_string());
+    }
+    let split = s.find(|c: char| !c.is_ascii_digit() && c != '.').unwrap_or(s.len());
+    let (num_str, unit) = s.split_at(split);
+    let num: f64 = num_str
+        .parse()
+        .map_err(|_| format!("maxuploadtarget: invalid number in {s:?}"))?;
+    let mult: u64 = match unit.trim() {
+        "" | "m" | "mb" | "mib" => 1024 * 1024, // bare = MiB (Core default)
+        "b" => 1,
+        "k" | "kb" | "kib" => 1024,
+        "g" | "gb" | "gib" => 1024 * 1024 * 1024,
+        "t" | "tb" | "tib" => 1024u64.pow(4),
+        other => {
+            return Err(format!(
+                "maxuploadtarget: unknown unit {other:?}; use B, K, M, G or T"
+            ));
+        }
+    };
+    Ok((num * mult as f64) as u64)
+}
+
 fn parse_chain_name(s: &str) -> Result<Network, String> {
     match s.trim().to_ascii_lowercase().as_str() {
         "main" | "mainnet" | "bitcoin" => Ok(Network::Bitcoin),
@@ -4656,6 +4705,7 @@ rpcport=8332
             reindex_chainstate: Some(false),
             maxconnections: None,
             maxinboundperip: None,
+            maxuploadtarget: None,
             bind: None,
             timeout: None,
             addnode: vec![],
@@ -4862,6 +4912,7 @@ rpcport=8332
             reindex_chainstate: Some(false),
             maxconnections: None,
             maxinboundperip: None,
+            maxuploadtarget: None,
             bind: None,
             timeout: None,
             addnode: vec![],
@@ -6052,6 +6103,31 @@ rpcport=39999
         assert_eq!(parse_chain_name("testnet4").unwrap(), Network::Testnet4);
     }
 
+    // ---- maxuploadtarget ----
+
+    #[test]
+    fn maxuploadtarget_size_parsing() {
+        // bare number = MiB
+        assert_eq!(parse_maxuploadtarget("500").unwrap(), 500 * 1024 * 1024);
+        assert_eq!(parse_maxuploadtarget("1G").unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(parse_maxuploadtarget("10mib").unwrap(), 10 * 1024 * 1024);
+        assert_eq!(parse_maxuploadtarget("2048k").unwrap(), 2048 * 1024);
+        assert_eq!(parse_maxuploadtarget("0").unwrap(), 0); // unlimited
+        assert!(parse_maxuploadtarget("5Z").is_err());
+        assert!(parse_maxuploadtarget("abc").is_err());
+    }
+
+    #[test]
+    fn maxuploadtarget_flows_to_config() {
+        let cli =
+            CliArgs::try_parse_from(["satd", "--regtest", "--maxuploadtarget", "250M"]).unwrap();
+        let cfg = Config::from_cli(cli).unwrap();
+        assert_eq!(cfg.max_upload_target, 250 * 1024 * 1024);
+        // default off
+        let cli2 = CliArgs::try_parse_from(["satd", "--regtest"]).unwrap();
+        assert_eq!(Config::from_cli(cli2).unwrap().max_upload_target, 0);
+    }
+
     // ---- whitelist / whitebind ----
 
     #[test]
@@ -6284,7 +6360,6 @@ notarealkey=1
         // NotYetImplemented, and NOT be in the plain known-keys
         // allowlist.
         for k in [
-            "maxuploadtarget",
             "asmap",
             "forcednsseed",
             "fixedseeds",
