@@ -1,4 +1,5 @@
 mod config;
+mod fast_start;
 mod notify;
 
 #[global_allocator]
@@ -572,6 +573,36 @@ async fn main() {
             return;
         }
     }
+
+    // AssumeUTXO --fast-start: download the snapshot now, as a pre-RPC
+    // startup phase, so its progress renders in the same TUI gauge a
+    // reindex uses (the snapshot is the big, slow part). The load itself
+    // is deferred to after P2P comes up, because loadtxoutset requires
+    // headers synced past the anchor — see the load task below. On a node
+    // that already has chainstate the flag is a logged no-op (so it can
+    // be left in a systemd unit indefinitely). Any failure here exits
+    // before the node advertises readiness, honoring the operator's
+    // explicit request rather than silently falling back to a genesis IBD.
+    let fast_start_path: Option<std::path::PathBuf> = if let Some(ref src) = config.fast_start {
+        if fast_start::node_is_fresh(&chain_state, &net_datadir) {
+            match fast_start::download_phase(src, &net_datadir, startup_progress.clone()).await {
+                Ok(path) => Some(path),
+                Err(e) => {
+                    eprintln!("FATAL: --fast-start: {e}");
+                    auth.cleanup();
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            tracing::info!(
+                "--fast-start ignored: chainstate is already initialized (tip past genesis or a \
+                 background snapshot validation is pending)"
+            );
+            None
+        }
+    } else {
+        None
+    };
 
     // Shutdown channel — created before the mempool so the snapshotter
     // task can subscribe to it.
@@ -1958,6 +1989,26 @@ async fn main() {
     {
         let pm = peer_manager.clone();
         tokio::spawn(async move { pm.run().await });
+    }
+
+    // AssumeUTXO --fast-start: with the snapshot already downloaded (above)
+    // and P2P now syncing headers, load it once headers reach the anchor.
+    // loadtxoutset re-verifies the snapshot against the hardcoded anchor
+    // hash and rolls back on mismatch, so a bad file is caught here. The
+    // operator asked for fast-start explicitly; if the load fails we exit
+    // non-zero rather than quietly serving genesis.
+    if let Some(path) = fast_start_path {
+        let cs = chain_state.clone();
+        let dd = net_datadir.clone();
+        let prune = config.prune;
+        let dbcache = config.dbcache as u64;
+        let sd = shutdown_rx.clone();
+        tokio::spawn(async move {
+            if let Err(e) = fast_start::load_when_ready(cs, dd, path, prune, dbcache, sd).await {
+                tracing::error!(error = %e, "FATAL: --fast-start snapshot load failed");
+                std::process::exit(1);
+            }
+        });
     }
 
     // Spawn adaptive-dbcache controller if --dbcache=auto was requested.

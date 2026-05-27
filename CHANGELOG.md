@@ -46,7 +46,20 @@ layout) per `STABILITY_POLICY.md`.
 - **`loadtxoutset` / `getchainstates` RPCs** plus two-chainstate
   (background) sync. satd loads Bitcoin Core's published UTXO snapshot
   files directly; the anchor table is copied verbatim from Core's
-  `m_assumeutxo_data`. Refuses to load under pruning. Note: While AssumeUTXO is fully compatible with commonly-distributed snapshots, satd does not create or distribute these snapshots. Users must find their own source for trusted snapshots (the `--fast-start` UX remains deferred).
+  `m_assumeutxo_data`. Refuses to load under pruning. Note: While AssumeUTXO is fully compatible with commonly-distributed snapshots, satd does not create or distribute these snapshots. Users must find their own source for trusted snapshots.
+- **`--fast-start=<url>` one-flag startup UX.** Downloads a UTXO snapshot
+  at startup (from an `https://` URL or a local file path), waits for
+  header sync to reach the snapshot's anchor, and loads it automatically
+  — no manual `loadtxoutset`. Remote sources **must** be `https://`
+  (plain `http://` is refused at config time; TLS certificates are
+  validated), and the snapshot is verified against satd's hardcoded
+  anchor hash at load, so a tampered or wrong file is rejected regardless
+  of its source. The download is resumable and its progress renders in
+  the pre-RPC startup TUI gauge (like a reindex); the genesis→snapshot
+  background re-validation shows in `getchainstates`. Incompatible with
+  `-prune`. On a node that already has chainstate the flag is a no-op, so
+  it is safe to leave in a systemd unit. satd never fetches snapshots
+  over P2P and hosts none — the operator names a trusted source.
 
 ### Packaging
 
@@ -139,11 +152,11 @@ below are governed by `STABILITY_POLICY.md` from this tag forward.
 
 Tracked in `ECOSYSTEM.md` and `docs/PACKAGING.md` for the v0.1.x line.
 (macOS Apple Silicon tarballs, musl-linux tarballs, systemd
-`WatchdogSec=`, and the `satd@.service` template all shipped post-0.1.0
-— see the `[Unreleased]` section above.)
+`WatchdogSec=`, the `satd@.service` template, and the AssumeUTXO
+`--fast-start` UX all shipped post-0.1.0 — see the `[Unreleased]`
+section above.)
 
 - `cargo-auditable` to embed the dependency manifest in the binary.
-- `--fast-start` UX (compatible with standard snapshots, but satd will not create or distribute these snapshots itself).
 
 [Unreleased]: https://github.com/epochbtc/satd/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/epochbtc/satd/releases/tag/v0.1.0

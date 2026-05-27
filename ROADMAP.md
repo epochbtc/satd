@@ -33,8 +33,18 @@ Operators could define local rulesets using simple boolean logic on transaction 
 - **Next:** Miniscript-aware signing (BIP 388 wallet policies) — descriptor language + output modeled on Sparrow's UX, for signing arbitrary script paths beyond the standard single-key types.
 
 ### AssumeUTXO `--fast-start`
-**Proposal:** `satd` automatically fetches the latest published AssumeUTXO snapshot over P2P, loads it into a background RocksDB instance, and swaps it in when ready.
-**Why it matters:** Fast node sync without manual `loadtxoutset` commands.
+**Status:** ✅ Shipped. `--fast-start=<url>` (or a local file path) downloads a
+UTXO snapshot at startup, waits for header sync to reach the snapshot's anchor,
+and loads it automatically — no manual `loadtxoutset`. Remote sources must be
+`https://` (plain `http://` is refused; certificates are validated); the file
+itself is verified against satd's hardcoded anchor hash, so a tampered or wrong
+snapshot is rejected regardless of where it came from. Download progress renders
+in the pre-RPC startup TUI gauge (like a reindex); the genesis→snapshot
+background re-validation is visible in `getchainstates`. satd deliberately does
+**not** host or distribute snapshots, and there is no P2P snapshot fetch — the
+operator names a trusted source.
+**Next:** mirror lists / multiple fallback URLs are a possible ergonomic
+follow-up; the trust root stays the hardcoded anchor either way.
 
 ### Resource budget caps (`--max-cpu`, `--max-memory`, `--max-disk-growth-per-day`)
 **Proposal:** Hard caps enforced at the scheduler layer:

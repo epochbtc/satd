@@ -50,7 +50,10 @@ serde_json = { workspace = true }
 rand = { workspace = true }
 jsonrpsee = { workspace = true }
 tower = { workspace = true }
-reqwest = { workspace = true }
+# `blocking` adds reqwest's thread-backed client, used by the
+# `--fast-start` snapshot downloader (run inside spawn_blocking). Same
+# rustls-tls provider as the async client, so no crypto-provider conflict.
+reqwest = { workspace = true, features = ["blocking"] }
 hex = { workspace = true }
 parking_lot = { workspace = true }
 sd-notify = { workspace = true }
