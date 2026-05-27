@@ -1796,39 +1796,36 @@ impl ChainState {
     /// Gated by the `chain_tx.backfill_complete` marker; a no-op once
     /// stamped. Returns the number of block entries written.
     ///
-    /// Walks the active chain's contiguous height range ending at the tip
-    /// downward to find its start, then applies cumulative counts upward.
-    /// The start is one of:
+    /// Walks the active chain downward from the tip via `prev_blockhash`
+    /// (authoritative — never the `height_hash` index, which can be polluted
+    /// by side-chain `store_block`/header paths) to find its start, then
+    /// applies cumulative counts upward. The start is one of:
     ///   * genesis (height 0) → cumulative begins at 0,
-    ///   * a height whose cumulative is already known (a prior partial run
+    ///   * a block whose cumulative is already known (a prior partial run
     ///     or a seeded snapshot base) → resume from it,
-    ///   * a snapshot base above genesis with a gap below (an AssumeUTXO
-    ///     node whose background hasn't filled genesis→base) → seed from
-    ///     the hardcoded anchor's `nchaintx`.
+    ///   * a snapshot base whose pre-snapshot ancestor is absent/`HeaderOnly`
+    ///     (an AssumeUTXO node whose background hasn't validated genesis→base)
+    ///     → seed from the hardcoded anchor's `nchaintx`.
     pub fn backfill_chain_tx_counts(&self) -> Result<u64, ChainError> {
         if self.store.chain_tx_backfill_complete() {
             return Ok(0);
         }
-        let tip_height = self.tip_height();
+        let (tip_hash, tip_height) = self.tip_snapshot();
         if tip_height == 0 {
             // Genesis-only (or empty): the walk below is skipped, but we must
             // still record the genesis cumulative. connect_block reads the
             // parent's cumulative via get_cumulative_tx_count().unwrap_or(0),
             // so if chain_tx[genesis] is absent the first connected block
             // (height 1) treats genesis as 0 txs and undercounts the whole
-            // chain by the genesis tx forever.
-            if let Some(genesis_hash) = self.store.get_block_hash_by_height(0)
-                && self.store.get_cumulative_tx_count(&genesis_hash).is_none()
-            {
-                let entry = self.store.get_block_index(&genesis_hash).ok_or_else(|| {
+            // chain by the genesis tx forever. The tip IS genesis here.
+            if self.store.get_cumulative_tx_count(&tip_hash).is_none() {
+                let entry = self.store.get_block_index(&tip_hash).ok_or_else(|| {
                     ChainError::Storage(crate::storage::StoreError::Database(
                         "missing genesis block index entry".to_string(),
                     ))
                 })?;
                 let mut batch = crate::storage::StoreBatch::default();
-                batch
-                    .chain_tx_puts
-                    .push((genesis_hash, entry.num_tx as u64));
+                batch.chain_tx_puts.push((tip_hash, entry.num_tx as u64));
                 self.store.write_batch(batch)?;
                 self.store.flush()?;
             }
@@ -1836,34 +1833,46 @@ impl ChainState {
             return Ok(0);
         }
 
-        // Collect (hash, num_tx) for the contiguous heights tip..start,
-        // descending, stopping at the first height whose cumulative is
-        // already known (resume point) or when we run off the bottom of
-        // the contiguous range.
+        // Collect (hash, num_tx) descending the active chain from the tip via
+        // prev_blockhash — never get_block_hash_by_height, whose index can be
+        // clobbered by a side-chain block at an active height. Following parent
+        // links visits only active-chain blocks, so a polluting side block is
+        // never counted (and the real active block is never skipped). Stop at:
+        //   * a block whose cumulative is already recorded (resume point), or
+        //   * genesis (height 0), or
+        //   * a block with no real tx count (absent/HeaderOnly entry) — the
+        //     bottom of the connected range, i.e. an AssumeUTXO snapshot base
+        //     whose pre-snapshot ancestors aren't validated yet.
         let mut collected: Vec<(BlockHash, u64)> = Vec::new();
-        let mut resume_cum: Option<u64> = None; // cumulative just below the lowest collected height
+        let mut resume_cum: Option<u64> = None; // cumulative just below the lowest collected block
+        let mut cur = tip_hash;
         let mut h = tip_height;
         loop {
-            let Some(hash) = self.store.get_block_hash_by_height(h) else {
-                // Gap at h: the lowest collected height (h+1) is the chain
-                // start. Handled after the loop via the snapshot anchor.
-                break;
-            };
-            if let Some(c) = self.store.get_cumulative_tx_count(&hash) {
-                // Already known — this height is done; start above it.
+            if let Some(c) = self.store.get_cumulative_tx_count(&cur) {
+                // Already known — this block is done; start above it.
                 resume_cum = Some(c);
                 break;
             }
-            let entry = self.store.get_block_index(&hash).ok_or_else(|| {
-                ChainError::Storage(crate::storage::StoreError::Database(format!(
-                    "missing block index entry at height {h}"
-                )))
-            })?;
-            collected.push((hash, entry.num_tx as u64));
+            let Some(entry) = self.store.get_block_index(&cur) else {
+                // Entry absent: bottom of the stored chain. The lowest
+                // collected block is the snapshot base (handled below).
+                break;
+            };
+            // HeaderOnly/Invalid blocks carry no real num_tx; they are below
+            // the connected active range, so the lowest collected block is the
+            // start. Valid/DataStored/Pruned all retain a real tx count.
+            if !matches!(
+                entry.status,
+                BlockStatus::Valid | BlockStatus::DataStored | BlockStatus::Pruned
+            ) {
+                break;
+            }
+            collected.push((cur, entry.num_tx as u64));
             if h == 0 {
                 resume_cum = Some(0); // below genesis
                 break;
             }
+            cur = entry.header.prev_blockhash;
             h -= 1;
         }
 
@@ -4207,6 +4216,47 @@ pub(crate) mod tests {
         // Idempotent: marker stamped, value preserved.
         assert_eq!(cs.backfill_chain_tx_counts().unwrap(), 0);
         assert_eq!(cs.cumulative_tx_count(&hashes[0]), Some(1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn backfill_chain_tx_counts_ignores_polluted_height_index() {
+        // Regression for the Round-3 review finding: the upgraded-datadir
+        // backfill must follow the active chain via prev_blockhash, not the
+        // pollutable height_hash index. We seed a chain (cumulative 1,3,6,10),
+        // then clobber height_hash[2] to point at a bogus side block. The
+        // backfill must still count the real active blocks and never the side
+        // block.
+        let (cs, dir, hashes) = chain_state_with_seeded_chain(&[1, 2, 3, 4]);
+
+        // Inject a side block at height 2 and repoint the height index at it.
+        let bogus = BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+            [0xB0; 32],
+        ));
+        let base_header = bitcoin::constants::genesis_block(Network::Regtest).header;
+        let bogus_entry = BlockIndexEntry {
+            header: base_header,
+            height: 2,
+            status: BlockStatus::Valid,
+            num_tx: 99, // would corrupt the totals if it were ever counted
+            file_number: 0,
+            data_pos: 0,
+            chainwork: [0u8; 32],
+        };
+        let mut pollute = crate::storage::StoreBatch::default();
+        pollute.block_index_puts.push((bogus, bogus_entry));
+        pollute.height_hash_puts.push((2, bogus));
+        cs.store.write_batch(pollute).unwrap();
+        assert_eq!(cs.get_block_hash_by_height(2), Some(bogus), "test premise");
+
+        let written = cs.backfill_chain_tx_counts().unwrap();
+        assert_eq!(written, 4);
+        // Real active chain counted correctly; the side block never counted.
+        assert_eq!(cs.cumulative_tx_count(&hashes[0]), Some(1));
+        assert_eq!(cs.cumulative_tx_count(&hashes[1]), Some(3));
+        assert_eq!(cs.cumulative_tx_count(&hashes[2]), Some(6));
+        assert_eq!(cs.cumulative_tx_count(&hashes[3]), Some(10));
+        assert_eq!(cs.cumulative_tx_count(&bogus), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
