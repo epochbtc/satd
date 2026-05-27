@@ -626,9 +626,11 @@ pub fn get_chain_tips(chain_state: &ChainState) -> Value {
 ///
 /// `final_blockhash` is Bitcoin Core's optional second argument: the block
 /// that *ends* the window (default = chain tip). `txcount` is the cumulative
-/// chain-wide transaction total through that block; it is omitted when not
-/// yet recorded (e.g. a pre-snapshot block on an AssumeUTXO node whose
-/// background validation hasn't reached it) — matching Core.
+/// chain-wide transaction total through that block. When a cumulative count is
+/// not yet recorded (e.g. a pre-snapshot block on an AssumeUTXO node whose
+/// background validation hasn't reached it) the dependent fields are omitted
+/// exactly as Core does: `txcount` (final block uncounted), `window_tx_count`
+/// (either endpoint uncounted), and `txrate` (no `window_tx_count`).
 pub fn get_chain_tx_stats(
     chain_state: &ChainState,
     nblocks: Option<u32>,
@@ -668,27 +670,24 @@ pub fn get_chain_tx_stats(
         .get_block_index(&start_hash)
         .ok_or("Start block not found")?;
 
-    // Window tx count: summed from per-block `num_tx` over the window, so
-    // it is available regardless of whether the cumulative count is.
-    let mut window_tx_count: u64 = 0;
-    for h in (start_height + 1)..=final_height {
-        if let Some(hash) = chain_state.get_block_hash_by_height(h)
-            && let Some(entry) = chain_state.get_block_index(&hash)
-        {
-            window_tx_count += entry.num_tx as u64;
-        }
-    }
-
     let time_diff = final_entry.header.time.saturating_sub(start_entry.header.time);
-    let tx_rate = if time_diff > 0 {
-        window_tx_count as f64 / time_diff as f64
-    } else {
-        0.0
-    };
+
+    // Cumulative tx counts at the window endpoints. Either may be absent on an
+    // AssumeUTXO node whose background validation hasn't reached that block.
+    // Core gates each field on availability (src/rpc/blockchain.cpp,
+    // getchaintxstats):
+    //   * `txcount`         — omitted unless the final block's cumulative is known.
+    //   * `window_tx_count` — the difference of the two cumulatives; omitted
+    //                         unless BOTH endpoints are known.
+    //   * `txrate`          — omitted unless `window_tx_count` is present and the
+    //                         interval is positive.
+    // `window_interval` is always emitted here (window > 0).
+    let final_cum = chain_state.cumulative_tx_count(&final_hash);
+    let start_cum = chain_state.cumulative_tx_count(&start_hash);
 
     let mut obj = serde_json::Map::new();
     obj.insert("time".to_string(), json!(final_entry.header.time));
-    if let Some(txcount) = chain_state.cumulative_tx_count(&final_hash) {
+    if let Some(txcount) = final_cum {
         obj.insert("txcount".to_string(), json!(txcount));
     }
     obj.insert(
@@ -700,9 +699,17 @@ pub fn get_chain_tx_stats(
         json!(final_height),
     );
     obj.insert("window_block_count".to_string(), json!(window));
-    obj.insert("window_tx_count".to_string(), json!(window_tx_count));
     obj.insert("window_interval".to_string(), json!(time_diff));
-    obj.insert("txrate".to_string(), json!(tx_rate));
+    if let (Some(fc), Some(sc)) = (final_cum, start_cum) {
+        let window_tx_count = fc.saturating_sub(sc);
+        obj.insert("window_tx_count".to_string(), json!(window_tx_count));
+        if time_diff > 0 {
+            obj.insert(
+                "txrate".to_string(),
+                json!(window_tx_count as f64 / time_diff as f64),
+            );
+        }
+    }
     Ok(Value::Object(obj))
 }
 

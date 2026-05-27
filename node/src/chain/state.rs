@@ -1786,8 +1786,27 @@ impl ChainState {
         }
         let tip_height = self.tip_height();
         if tip_height == 0 {
-            // Genesis-only (or empty): nothing to walk; connects maintain
-            // it going forward.
+            // Genesis-only (or empty): the walk below is skipped, but we must
+            // still record the genesis cumulative. connect_block reads the
+            // parent's cumulative via get_cumulative_tx_count().unwrap_or(0),
+            // so if chain_tx[genesis] is absent the first connected block
+            // (height 1) treats genesis as 0 txs and undercounts the whole
+            // chain by the genesis tx forever.
+            if let Some(genesis_hash) = self.store.get_block_hash_by_height(0)
+                && self.store.get_cumulative_tx_count(&genesis_hash).is_none()
+            {
+                let entry = self.store.get_block_index(&genesis_hash).ok_or_else(|| {
+                    ChainError::Storage(crate::storage::StoreError::Database(
+                        "missing genesis block index entry".to_string(),
+                    ))
+                })?;
+                let mut batch = crate::storage::StoreBatch::default();
+                batch
+                    .chain_tx_puts
+                    .push((genesis_hash, entry.num_tx as u64));
+                self.store.write_batch(batch)?;
+                self.store.flush()?;
+            }
             self.store.mark_chain_tx_backfill_complete()?;
             return Ok(0);
         }
@@ -4120,13 +4139,43 @@ pub(crate) mod tests {
         // Seed a chain but do NOT backfill: cumulative is absent.
         let (cs, dir, _hashes) = chain_state_with_seeded_chain(&[1, 2, 3, 4]);
         let stats = crate::rpc::blockchain::get_chain_tx_stats(&cs, None, None).unwrap();
-        // Core omits txcount (and txrate) when the count isn't available;
-        // window_tx_count is still computed from per-block num_tx.
+        // Core omits txcount, window_tx_count, and txrate when the cumulative
+        // counts at the window endpoints aren't available (window_tx_count is
+        // their difference). window_interval is still emitted.
         assert!(
             stats.get("txcount").is_none(),
             "txcount must be omitted when cumulative is unavailable, got: {stats}"
         );
-        assert_eq!(stats["window_tx_count"], 9);
+        assert!(
+            stats.get("window_tx_count").is_none(),
+            "window_tx_count must be omitted when cumulative is unavailable, got: {stats}"
+        );
+        assert!(
+            stats.get("txrate").is_none(),
+            "txrate must be omitted when window_tx_count is unavailable, got: {stats}"
+        );
+        assert!(stats.get("window_interval").is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn backfill_seeds_genesis_cumulative_on_genesis_only_datadir() {
+        // Upgraded datadir with only genesis indexed and no chain_tx rows: the
+        // backfill must still record chain_tx[genesis] (= genesis num_tx)
+        // before stamping the marker. Otherwise the next connected block reads
+        // its parent's cumulative as 0 (unwrap_or) and undercounts the whole
+        // chain by the genesis tx forever.
+        let (cs, dir, hashes) = chain_state_with_seeded_chain(&[1]);
+        assert_eq!(cs.tip_height(), 0);
+        assert_eq!(cs.cumulative_tx_count(&hashes[0]), None);
+
+        // Genesis-only walk writes nothing (returns 0) but must seed genesis.
+        assert_eq!(cs.backfill_chain_tx_counts().unwrap(), 0);
+        assert_eq!(cs.cumulative_tx_count(&hashes[0]), Some(1));
+
+        // Idempotent: marker stamped, value preserved.
+        assert_eq!(cs.backfill_chain_tx_counts().unwrap(), 0);
+        assert_eq!(cs.cumulative_tx_count(&hashes[0]), Some(1));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
