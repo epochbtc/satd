@@ -21,7 +21,6 @@
 //!     loads the snapshot. The genesis→snapshot background re-validation is
 //!     then visible through `getchainstates`.
 
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -40,9 +39,11 @@ const SNAPSHOT_FILENAME: &str = "fast-start-snapshot.dat";
 /// request, so a transient drop costs only the un-fetched tail.
 const MAX_DOWNLOAD_ATTEMPTS: u32 = 5;
 
-/// Read buffer for the streaming copy. 1 MiB keeps syscall overhead low
-/// without holding much memory.
-const COPY_BUF_BYTES: usize = 1 << 20;
+/// Per-read inactivity timeout. Bounds each socket read so a server that
+/// accepts the connection then stops sending can't hang startup forever;
+/// it does NOT bound the whole (multi-GB) transfer. On expiry the attempt
+/// errors and the retry loop resumes from the bytes already on disk.
+const READ_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Where a fast-start snapshot comes from.
 #[derive(Debug)]
@@ -120,15 +121,9 @@ pub async fn download_phase(
                     url = %url,
                     "fast-start: downloading snapshot (resumable)"
                 );
-                let url_c = url.clone();
-                let dest_c = dest.clone();
-                let progress_c = progress.clone();
-                let download =
-                    tokio::task::spawn_blocking(move || download_blocking(&url_c, &dest_c, &progress_c));
-
                 tokio::select! {
-                    joined = download => {
-                        match joined.map_err(|e| format!("download task panicked: {e}"))? {
+                    res = download_once(&url, &dest, &progress) => {
+                        match res {
                             Ok(()) => return Ok(dest),
                             Err(e) => {
                                 last_err = e;
@@ -188,17 +183,27 @@ fn resume_plan(existing: u64, partial_content: bool, body_len: Option<u64>) -> R
     }
 }
 
-/// Blocking, resumable HTTPS download. Runs inside `spawn_blocking`.
+/// One resumable, timeout-bounded HTTPS download attempt.
 ///
 /// Resume: if `dest` already holds bytes, request `Range: bytes=<len>-`. A
 /// `206 Partial Content` response is appended; a `200 OK` (server ignored
-/// the range) restarts the file from scratch. Certificates are validated by
-/// reqwest's default rustls verifier — never disabled.
-fn download_blocking(url: &str, dest: &Path, progress: &StartupProgress) -> Result<(), String> {
-    use reqwest::header::{CONTENT_LENGTH, RANGE};
+/// the range) restarts the file from scratch; a `416 Range Not Satisfiable`
+/// means the file is already complete (a prior run downloaded it but exited
+/// before loading) so we proceed to load as-is. Certificates are validated
+/// by reqwest's default rustls verifier — never disabled. `read_timeout`
+/// bounds each socket read so a stalled body cannot hang startup forever:
+/// on expiry this attempt errors and the caller's retry loop resumes from
+/// the bytes already written.
+async fn download_once(
+    url: &str,
+    dest: &Path,
+    progress: &StartupProgress,
+) -> Result<(), String> {
+    use reqwest::header::RANGE;
 
-    let client = reqwest::blocking::Client::builder()
+    let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(30))
+        .read_timeout(READ_TIMEOUT)
         .build()
         .map_err(|e| format!("building HTTPS client: {e}"))?;
 
@@ -207,20 +212,29 @@ fn download_blocking(url: &str, dest: &Path, progress: &StartupProgress) -> Resu
     if existing > 0 {
         req = req.header(RANGE, format!("bytes={existing}-"));
     }
-    let mut resp = req.send().map_err(|e| format!("request failed: {e}"))?;
+    let mut resp = req.send().await.map_err(|e| format!("request failed: {e}"))?;
     let status = resp.status();
+    // We already hold `existing` bytes and asked to resume past them, but
+    // the server says that range is unsatisfiable — i.e. the file is
+    // already at (or beyond) full size. This is the "downloaded last run,
+    // exited before load" case. Treat it as complete: the load step
+    // re-verifies against the anchor hash and re-downloads fresh if the
+    // file turns out corrupt, so this can't mask a bad snapshot.
+    if existing > 0 && status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+        tracing::info!(
+            path = %dest.display(),
+            "fast-start: snapshot already fully downloaded; skipping re-download"
+        );
+        return Ok(());
+    }
     if !status.is_success() {
         return Err(format!("server returned HTTP {status}"));
     }
 
-    // Did the server honor our resume request?
+    // Did the server honor our resume request? `content_length()` is the
+    // body length: the remaining tail for a 206, the whole file for a 200.
     let partial = status == reqwest::StatusCode::PARTIAL_CONTENT;
-    let body_len = resp
-        .headers()
-        .get(CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok());
-    let plan = resume_plan(existing, partial, body_len);
+    let plan = resume_plan(existing, partial, resp.content_length());
     if let Some(t) = plan.total {
         progress.set_total(t);
     }
@@ -235,18 +249,15 @@ fn download_blocking(url: &str, dest: &Path, progress: &StartupProgress) -> Resu
 
     let mut written: u64 = plan.start;
     progress.set_current(written);
-    let mut buf = vec![0u8; COPY_BUF_BYTES];
-    loop {
-        let n = resp
-            .read(&mut buf)
-            .map_err(|e| format!("read from server failed: {e}"))?;
-        if n == 0 {
-            break;
-        }
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| format!("read from server failed: {e}"))?
+    {
         use std::io::Write;
-        file.write_all(&buf[..n])
+        file.write_all(&chunk)
             .map_err(|e| format!("write to {} failed: {e}", dest.display()))?;
-        written += n as u64;
+        written += chunk.len() as u64;
         progress.set_current(written);
     }
     file.sync_all()
