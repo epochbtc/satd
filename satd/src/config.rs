@@ -806,6 +806,19 @@ pub struct Config {
     /// Optional HMAC-SHA256 secret for `X-Satd-Signature`. If set, the
     /// dispatcher signs each webhook body. Absent = unsigned POSTs.
     pub reorg_webhook_secret: Option<String>,
+    /// AssumeUTXO `--fast-start`: a snapshot source to download and load
+    /// at startup. Either an `https://` URL or a local filesystem path
+    /// (optionally `file://`). `None` = disabled. Validated at config
+    /// time: plain `http://` and `-prune > 0` are rejected. The snapshot
+    /// content is verified against the hardcoded anchor hash at load.
+    pub fast_start: Option<String>,
+    /// Optional expected SHA-256 (lowercased 64-hex) of the `--fast-start`
+    /// snapshot file, checked immediately after download as a fast-fail
+    /// guard. Opt-in (no canonical published file digest exists, so there
+    /// is no default); the mandatory anchor-hash check at load is the
+    /// authoritative integrity gate regardless. Validated at config time
+    /// to be 32 bytes of hex and to require `--fast-start`.
+    pub fast_start_sha256: Option<String>,
     /// Operator-pinned per-node identifier for the events bus. 32-char
     /// lowercase hex (UUIDv4). `None` = auto-generate and persist to
     /// `<datadir>/node_id` on first start.
@@ -1750,6 +1763,60 @@ impl Config {
             .or(profile_defaults.prune)
             .unwrap_or(0); // 0 = no pruning
 
+        // AssumeUTXO --fast-start source resolution + validation.
+        //   - Remote sources MUST be https:// (TLS, validated certs).
+        //     Plain http:// is rejected, not silently downgraded, so a
+        //     MITM cannot feed a snapshot URL; the file is still verified
+        //     against the hardcoded anchor hash at load, but transport
+        //     authentication is defense-in-depth and protects operator
+        //     opsec (the URL/content is never sent in cleartext).
+        //   - A bare path or file:// is the operator's own disk and is
+        //     allowed (no transport to secure).
+        //   - Incompatible with pruning (same as the loadtxoutset RPC).
+        let fast_start = cli.fast_start.or_else(|| file_get("faststart"));
+        if let Some(ref src) = fast_start {
+            if src.contains("://") {
+                let scheme = src.split("://").next().unwrap_or("");
+                if scheme.eq_ignore_ascii_case("http") {
+                    return Err(
+                        "--fast-start requires https:// (plain http:// is refused). Use an \
+                         https URL or a local file path."
+                            .into(),
+                    );
+                }
+                if !scheme.eq_ignore_ascii_case("https") && !scheme.eq_ignore_ascii_case("file") {
+                    return Err(format!(
+                        "--fast-start scheme '{scheme}://' is unsupported; use https:// or a \
+                         local file path"
+                    ));
+                }
+            }
+            if prune > 0 {
+                return Err(format!(
+                    "--fast-start is incompatible with --prune={prune} (loadtxoutset cannot run \
+                     under pruning). Remove one of them."
+                ));
+            }
+        }
+        let fast_start_sha256 = cli
+            .fast_start_sha256
+            .or_else(|| file_get("faststartsha256"))
+            .map(|s| s.to_ascii_lowercase());
+        if let Some(ref digest) = fast_start_sha256 {
+            if fast_start.is_none() {
+                return Err("--fast-start-sha256 requires --fast-start".into());
+            }
+            match hex::decode(digest) {
+                Ok(bytes) if bytes.len() == 32 => {}
+                _ => {
+                    return Err(
+                        "--fast-start-sha256 must be exactly 64 hex characters (a 32-byte SHA-256)"
+                            .into(),
+                    );
+                }
+            }
+        }
+
         // Esplora ↔ txindex coupling (review-2 H3, round-3 M2).
         //
         // Esplora's tx + outspend endpoints depend on txindex. Rather
@@ -2241,6 +2308,8 @@ impl Config {
             reorg_webhook_secret: cli
                 .reorg_webhook_secret
                 .or_else(|| file_get("reorgwebhooksecret")),
+            fast_start,
+            fast_start_sha256,
             events_node_id: cli.events_node_id.or_else(|| file_get("eventsnodeid")),
             events_region: cli.events_region.or_else(|| file_get("eventsregion")),
             events_grpc_bind: cli.events_grpc_bind.or_else(|| file_get("eventsgrpcbind")),
@@ -3611,6 +3680,20 @@ pub struct CliArgs {
     pub reorg_webhook_secret: Option<String>,
 
     #[arg(
+        long = "fast-start",
+        value_name = "URL",
+        help = "AssumeUTXO: download a UTXO snapshot from URL and load it at startup (https:// or a local file path). The snapshot is verified against satd's hardcoded anchor hash; a bad file is rejected. Incompatible with -prune."
+    )]
+    pub fast_start: Option<String>,
+
+    #[arg(
+        long = "fast-start-sha256",
+        value_name = "HEX64",
+        help = "Optional expected SHA-256 (64 hex chars) of the --fast-start snapshot file, checked right after download as a fast-fail integrity guard. Independent of the mandatory anchor-hash verification at load."
+    )]
+    pub fast_start_sha256: Option<String>,
+
+    #[arg(
         long = "events-node-id",
         value_name = "HEX32",
         help = "Stable per-node identifier stamped on every events envelope (32-char hex). Default: auto-generated and persisted to <datadir>/node_id"
@@ -4887,6 +4970,8 @@ rpcport=8332
             profile: None,
             reorg_webhook: None,
             reorg_webhook_secret: None,
+            fast_start: None,
+            fast_start_sha256: None,
             events_node_id: None,
             events_region: None,
             events_grpc_bind: None,
@@ -5099,6 +5184,8 @@ rpcport=8332
             profile: None,
             reorg_webhook: None,
             reorg_webhook_secret: None,
+            fast_start: None,
+            fast_start_sha256: None,
             events_node_id: None,
             events_region: None,
             events_grpc_bind: None,
@@ -5121,6 +5208,104 @@ rpcport=8332
     /// hits the same hard error. Mirrors the documented Electrum-TLS
     /// behaviour so an operator who learned the one rule applies it
     /// uniformly.
+    #[test]
+    fn test_fast_start_validation() {
+        // Plain http:// is refused (must be https).
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-test",
+            "--fast-start=http://example.com/utxo-840000.dat",
+        ])
+        .unwrap();
+        let err = Config::from_cli(cli).unwrap_err();
+        assert!(err.contains("https://"), "expected https-required error, got: {err}");
+
+        // https:// is accepted and preserved.
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-test",
+            "--fast-start=https://example.com/utxo-840000.dat",
+        ])
+        .unwrap();
+        let config = Config::from_cli(cli).expect("https fast-start should load");
+        assert_eq!(
+            config.fast_start.as_deref(),
+            Some("https://example.com/utxo-840000.dat")
+        );
+
+        // A bare local path is accepted (operator's own disk).
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-test",
+            "--fast-start=/opt/utxo-840000.dat",
+        ])
+        .unwrap();
+        let config = Config::from_cli(cli).expect("local-path fast-start should load");
+        assert_eq!(config.fast_start.as_deref(), Some("/opt/utxo-840000.dat"));
+
+        // fast-start is incompatible with pruning.
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-test",
+            "--fast-start=https://example.com/utxo-840000.dat",
+            "--prune=550",
+        ])
+        .unwrap();
+        let err = Config::from_cli(cli).unwrap_err();
+        assert!(err.contains("prune"), "expected prune-conflict error, got: {err}");
+
+        // An unsupported scheme is rejected.
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-test",
+            "--fast-start=ftp://example.com/utxo-840000.dat",
+        ])
+        .unwrap();
+        assert!(Config::from_cli(cli).is_err());
+
+        // --fast-start-sha256 requires --fast-start.
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-test",
+            "--fast-start-sha256=b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9",
+        ])
+        .unwrap();
+        let err = Config::from_cli(cli).unwrap_err();
+        assert!(err.contains("--fast-start"), "got: {err}");
+
+        // A malformed (short) digest is rejected.
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-test",
+            "--fast-start=https://example.com/utxo-840000.dat",
+            "--fast-start-sha256=deadbeef",
+        ])
+        .unwrap();
+        assert!(Config::from_cli(cli).is_err());
+
+        // A valid digest is accepted and normalized to lowercase.
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-test",
+            "--fast-start=https://example.com/utxo-840000.dat",
+            "--fast-start-sha256=B94D27B9934D3E08A52E52D7DA7DABFAC484EFE37A5380EE9088F7ACE2EFCDE9",
+        ])
+        .unwrap();
+        let config = Config::from_cli(cli).expect("valid digest should load");
+        assert_eq!(
+            config.fast_start_sha256.as_deref(),
+            Some("b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9")
+        );
+    }
+
     #[test]
     fn test_esplora_tls_partial_config_is_rejected() {
         // Missing both cert and key.

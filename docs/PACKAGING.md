@@ -605,7 +605,6 @@ The policy runs as a hard gate in two places:
 ### Known deferred items
 
 - **`cargo-auditable`** — Embedding the dependency manifest directly into the compiled binaries for improved runtime supply-chain verification.
-- **AssumeUTXO `--fast-start` UX** — A simplified one-flag UX to bootstrap from user-provided snapshots. Note that while satd is fully compatible with standard, commonly-distributed snapshots, we will not be creating or distributing these snapshots ourselves; users must find their own source for trusted snapshots.
 
 ## Stability contract
 

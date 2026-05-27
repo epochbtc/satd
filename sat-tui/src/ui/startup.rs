@@ -57,7 +57,16 @@ pub fn draw(f: &mut Frame, st: &AppState) {
     // block files extend past the stop height. Without a stop target,
     // fall back to the old `current / total` layout.
     let phase_title = phase_label(&status.phase);
-    let count_line = match status.stop_height {
+    let is_download = status.phase == "fast_start_download";
+    let count_line = if is_download {
+        // Bytes, not blocks: show human-readable sizes.
+        if status.total > 0 {
+            format!("{} / {}", format_bytes(status.current), format_bytes(status.total))
+        } else {
+            format!("{} (size tbd)", format_bytes(status.current))
+        }
+    } else {
+        match status.stop_height {
         Some(stop) if status.total > stop => format!(
             "{} / {}  (file tip: {})",
             format_num(status.current),
@@ -75,6 +84,7 @@ pub fn draw(f: &mut Frame, st: &AppState) {
             } else {
                 format!("{} (total tbd)", format_num(status.current))
             }
+        }
         }
     };
     let header = Paragraph::new(vec![
@@ -145,7 +155,11 @@ pub fn draw(f: &mut Frame, st: &AppState) {
             Color::Cyan,
         ));
     }
+    // The startup rate is items/sec of whatever the phase counts. For the
+    // fast-start download those items are bytes, so render it as a transfer
+    // rate rather than the block-replay "blocks/s" used by reindex phases.
     let rate_str = match rate {
+        Some(r) if is_download => format!("{}/s", format_bytes(r as u64)),
         Some(r) if r >= 1.0 => format!("{:.0} blocks/s", r),
         Some(r) => format!("{:.2} blocks/s", r),
         None => "—".to_string(),
@@ -202,8 +216,26 @@ fn phase_label(phase: &str) -> String {
         "reindex_scan" => "Reindex — phase 1/2: scanning block files".to_string(),
         "reindex_connect" => "Reindex — phase 2/2: replaying blocks".to_string(),
         "reindex_chainstate" => "Reindex chainstate".to_string(),
+        "fast_start_download" => "Fast-start — downloading AssumeUTXO snapshot".to_string(),
         "" => "Starting".to_string(),
         other => other.to_string(),
+    }
+}
+
+/// Human-readable byte size (e.g. `9.10 GB`), for byte-counted phases like
+/// the fast-start download where the raw item count is bytes, not blocks.
+fn format_bytes(n: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut v = n as f64;
+    let mut u = 0;
+    while v >= 1024.0 && u < UNITS.len() - 1 {
+        v /= 1024.0;
+        u += 1;
+    }
+    if u == 0 {
+        format!("{n} B")
+    } else {
+        format!("{v:.2} {}", UNITS[u])
     }
 }
 

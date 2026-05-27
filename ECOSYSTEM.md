@@ -206,9 +206,9 @@ Six items to gate the first packager-friendly tag on:
 
 ## Sequencing notes
 
-Rough dependency order. Items 2-4 and 6 have shipped; 1 and 5 are partial; 7-8 remain.
+Rough dependency order. Items 1-4 and 6 have shipped; 5 is partial; 7-8 remain.
 
-1. **AssumeUTXO** *(partial)* — `loadtxoutset` and the snapshot-validation pipeline are wired; `--fast-start` (one-flag UX with embedded snapshot hash) is still future work. Already unlocks realistic Pi deployment for operators willing to fetch a snapshot manually.
+1. **AssumeUTXO** ✅ shipped — `loadtxoutset` + the two-chainstate background-validation pipeline, plus `--fast-start=<url>` (one-flag startup UX: download from an `https://` URL or local file, verify against the hardcoded anchor hash, auto-load once headers reach the anchor). Unlocks realistic Pi deployment without a manual `loadtxoutset` step. satd hosts no snapshots and does no P2P snapshot fetch — the operator names a trusted source.
 2. **Address-history index** ✅ shipped — `node-index` crate; updated inside `connect_block` / `disconnect_block` for atomic reorg consistency.
 3. **Esplora REST** ✅ shipped — `esplora-handlers` crate; on by default on loopback.
 4. **Electrum protocol** ✅ shipped — `electrum-proto` crate; vendored protocol code from `romanz/electrs` (MIT) over the address-index trait surface.
@@ -226,7 +226,7 @@ Resolved (kept here for traceability; the resolution lives in code and `CORE_DIF
 - ~~Address-history index column-family layout.~~ **Resolved**: two CFs (`addr_funding_v2`, `addr_spending_v2`) keyed by `(scripthash_prefix[16], height_be[4], txid[32], vout/vin_be[4])`. See `node-index/src/keys.rs`.
 - ~~Address index opt-in vs. on-by-default.~~ **Resolved**: on by default (`--addressindex=1`); opt out with `--addressindex=0`. Esplora and Electrum auto-require it.
 - ~~AssumeUTXO interaction with the address-history index.~~ **Resolved**: deferred opt-in backfill via `backfillindex address` (and `backfillindex blockfilter` for the BIP 158 index). Operator triggers when convenient; node remains usable with partial history.
-- ~~Signed AssumeUTXO snapshot distribution.~~ **Resolved**: To maintain strict keyless trust-minimization, `satd` will not create or distribute these snapshots itself. We are fully compatible with commonly-distributed snapshots, and users are advised to source their own. The `--fast-start` UX remains a deferred client-side enhancement.
+- ~~Signed AssumeUTXO snapshot distribution.~~ **Resolved**: To maintain strict keyless trust-minimization, `satd` will not create or distribute these snapshots itself. We are fully compatible with commonly-distributed snapshots, and users source their own. The `--fast-start=<url>` UX (shipped) automates download + load from an operator-named `https://` URL or local file; it never fetches over P2P and trusts no mirror — integrity is gated by the hardcoded anchor hash at load.
 
 Open:
 - Do we sponsor or upstream satd-specific presets to an existing mobile wallet (Nunchuk, BlueWallet) vs. being a pure server?
