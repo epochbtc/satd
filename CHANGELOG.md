@@ -41,6 +41,26 @@ layout) per `STABILITY_POLICY.md`.
   `-fixedseeds`. `-includeconf` on the command line is now a hard error,
   matching Core.
 
+### RPC compatibility
+
+- **`getchaintxstats` now reports Core-faithful cumulative statistics.**
+  `txcount` is the cumulative chain-wide transaction total through the
+  window's final block (previously it duplicated the window count), and
+  the optional second `blockhash` argument — which selects the block that
+  *ends* the window (default = chain tip) — is now honored (previously
+  silently ignored). The cumulative count is maintained in a new
+  additive `chain_tx` column family, seeded at the AssumeUTXO anchor and
+  backfilled at startup on upgraded datadirs with no reindex. Field
+  optionality matches Core exactly: `txcount` is omitted when the final
+  block's count is unknown (e.g. a pre-snapshot block on an AssumeUTXO
+  node still validating in the background), `window_tx_count` is the
+  difference of the two endpoint counts and is omitted unless both are
+  known, and `txrate` is omitted unless `window_tx_count` exists and the
+  interval is positive. The window interval is measured between the
+  endpoints' median-time-past values (BIP 113), as in Core. Active-chain
+  membership for an explicit `blockhash` is resolved authoritatively
+  (rejecting side-chain blocks with "Block is not in main chain").
+
 ### AssumeUTXO
 
 - **`loadtxoutset` / `getchainstates` RPCs** plus two-chainstate

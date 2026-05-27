@@ -1036,7 +1036,43 @@ fn test_getchaintxstats() {
         .unwrap();
     let result = &response["result"];
     assert_eq!(result["window_block_count"], 3);
-    assert!(result["txcount"].as_u64().unwrap() > 0);
+    // Cumulative chain-wide total: genesis + 5 coinbases = 6 txs.
+    assert_eq!(result["txcount"].as_u64().unwrap(), 6);
+    // Window of 3 blocks, each a single coinbase → 3 (distinct from the
+    // cumulative total, proving txcount is no longer the window count).
+    assert_eq!(result["window_tx_count"].as_u64().unwrap(), 3);
+    assert_eq!(result["window_final_block_height"].as_u64().unwrap(), 5);
+
+    // Core's optional `blockhash` arg selects the window's final block.
+    // Cumulative through height 3 = genesis + 3 coinbases = 4.
+    let h3 = node
+        .rpc_call_with_params("getblockhash", vec![serde_json::json!(3)])
+        .unwrap();
+    let h3_hash = h3["result"].as_str().unwrap();
+    let response = node
+        .rpc_call_with_params(
+            "getchaintxstats",
+            vec![serde_json::json!(2), serde_json::json!(h3_hash)],
+        )
+        .unwrap();
+    let result = &response["result"];
+    assert_eq!(result["txcount"].as_u64().unwrap(), 4);
+    assert_eq!(result["window_final_block_height"].as_u64().unwrap(), 3);
+    assert_eq!(result["window_block_count"].as_u64().unwrap(), 2);
+
+    // An unknown block hash is rejected.
+    let response = node
+        .rpc_call_with_params(
+            "getchaintxstats",
+            vec![
+                serde_json::json!(1),
+                serde_json::json!(
+                    "00000000000000000000000000000000000000000000000000000000deadbeef"
+                ),
+            ],
+        )
+        .unwrap();
+    assert!(response["error"].is_object());
     node.stop();
 }
 

@@ -72,6 +72,13 @@ pub struct StoreBatch {
     pub undo_puts: Vec<(BlockHash, UndoData)>,
     pub tx_index_puts: Vec<(Txid, BlockHash)>,
     pub tx_index_removes: Vec<Txid>,
+    /// Cumulative transaction count through each connected block:
+    /// `(block_hash, nchaintx)` where `nchaintx = nchaintx(parent) + num_tx`.
+    /// Written by `connect_block` for active-chain blocks and by the
+    /// AssumeUTXO snapshot seed; consumed by `getchaintxstats`. Hash-keyed,
+    /// so reorgs need no removal (a stale block's value stays correct for
+    /// that block and is simply off the active chain).
+    pub chain_tx_puts: Vec<(BlockHash, u64)>,
     /// Address-history index funding rows. Populated in M2.
     pub addr_funding_puts: Vec<AddrFundingRow>,
     /// Address-history index spending rows. Populated in M2.
@@ -176,6 +183,9 @@ impl StoreBatch {
         self.undo_puts.extend(other.undo_puts);
         self.tx_index_puts.extend(other.tx_index_puts);
         self.tx_index_removes.extend(other.tx_index_removes);
+        // chain_tx is hash-keyed; extend like block_index_puts (last write
+        // for a given hash wins at flush time).
+        self.chain_tx_puts.extend(other.chain_tx_puts);
 
         // addr_funding: incoming removes invalidate any prior put for
         // the same key, and incoming puts invalidate any prior remove.
@@ -313,6 +323,15 @@ pub trait Store: Send + Sync {
     fn has_coin(&self, outpoint: &OutPoint) -> bool;
     fn get_tip(&self) -> Option<BlockHash>;
     fn get_block_hash_by_height(&self, height: u32) -> Option<BlockHash>;
+    /// Cumulative number of transactions in the chain through (and
+    /// including) the given block, as written by `connect_block` /
+    /// the AssumeUTXO seed. `None` if not yet recorded for this block
+    /// (e.g. a pre-snapshot block whose background validation hasn't
+    /// reached it). Consumed by `getchaintxstats`. Default: `None` for
+    /// backends that don't track it.
+    fn get_cumulative_tx_count(&self, _hash: &BlockHash) -> Option<u64> {
+        None
+    }
     fn write_batch(&self, batch: StoreBatch) -> Result<(), StoreError>;
     /// Write with the given durability mode. Default delegates to
     /// `write_batch` (ignoring the mode) — concrete backends that can honor
@@ -538,6 +557,21 @@ pub trait Store: Send + Sync {
     /// `true` for non-Rocks backends.
     fn tx_index_complete(&self) -> bool {
         true
+    }
+
+    /// True when the `chain_tx` cumulative-count CF has been backfilled
+    /// for the active chain (the one-shot startup migration ran). False
+    /// on an upgraded datadir before the backfill. Default: `true` for
+    /// non-Rocks backends (in-memory stores are always freshly built).
+    fn chain_tx_backfill_complete(&self) -> bool {
+        true
+    }
+
+    /// Stamp the `chain_tx.backfill_complete` marker true. Called once
+    /// the startup backfill has populated the cumulative-count CF for
+    /// the active chain. Default: no-op for backends that don't track it.
+    fn mark_chain_tx_backfill_complete(&self) -> Result<(), StoreError> {
+        Ok(())
     }
 
     /// True when the address-history CFs are fully populated for the

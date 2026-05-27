@@ -57,7 +57,7 @@ pub fn get_block_stats(ctx: &McpContext, identifier: &str) -> String {
 /// Get chain analysis: tips, tx rate over a window, and difficulty.
 pub fn get_chain_info(ctx: &McpContext, window: u32) -> String {
     let tips = rpc::get_chain_tips(&ctx.chain_state);
-    let tx_stats = rpc::get_chain_tx_stats(&ctx.chain_state, Some(window));
+    let tx_stats = rpc::get_chain_tx_stats(&ctx.chain_state, Some(window), None);
     let difficulty = rpc::get_difficulty(&ctx.chain_state);
 
     let result = json!({

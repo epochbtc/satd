@@ -623,56 +623,131 @@ pub fn get_chain_tips(chain_state: &ChainState) -> Value {
 }
 
 /// `getchaintxstats` — return tx rate statistics over a window.
+///
+/// `final_blockhash` is Bitcoin Core's optional second argument: the block
+/// that *ends* the window (default = chain tip). `txcount` is the cumulative
+/// chain-wide transaction total through that block. When a cumulative count is
+/// not yet recorded (e.g. a pre-snapshot block on an AssumeUTXO node whose
+/// background validation hasn't reached it) the dependent fields are omitted
+/// exactly as Core does: `txcount` (final block uncounted), `window_tx_count`
+/// (either endpoint uncounted), and `txrate` (no `window_tx_count`).
 pub fn get_chain_tx_stats(
     chain_state: &ChainState,
     nblocks: Option<u32>,
+    final_blockhash: Option<bitcoin::BlockHash>,
 ) -> Result<Value, String> {
-    let tip_height = chain_state.tip_height();
-    let window = nblocks.unwrap_or(30).min(tip_height);
+    // Resolve the window's final block (default = tip).
+    let (final_hash, final_entry) = match final_blockhash {
+        Some(hash) => {
+            let entry = chain_state
+                .get_block_index(&hash)
+                .ok_or("Block not found")?;
+            // Active-chain membership must be exact: the `height_hash` index is
+            // "best known at height" and can be clobbered by side-chain
+            // store_block/header paths (see the chain-state test
+            // `test_reorg_fork_point_immune_to_polluted_height_hash`), so it is
+            // NOT an active-chain oracle. Confirm authoritatively that the block
+            // is the tip's ancestor at its height (Core: CChain::Contains).
+            if chain_state.active_chain_hash_at_height(entry.height) != Some(hash) {
+                return Err("Block is not in main chain".to_string());
+            }
+            (hash, entry)
+        }
+        None => {
+            let hash = chain_state.tip_hash();
+            let entry = chain_state.get_block_index(&hash).ok_or("Tip not found")?;
+            (hash, entry)
+        }
+    };
+    let final_height = final_entry.height;
 
+    let window = nblocks.unwrap_or(30).min(final_height);
     if window == 0 {
         return Err("Window must be > 0".to_string());
     }
+    let start_height = final_height - window;
 
-    let tip_hash = chain_state.tip_hash();
-    let tip_entry = chain_state
-        .get_block_index(&tip_hash)
-        .ok_or("Tip not found")?;
-
-    let start_height = tip_height.saturating_sub(window);
-    let start_hash = chain_state
-        .get_block_hash_by_height(start_height)
-        .ok_or("Start block not found")?;
-    let start_entry = chain_state
-        .get_block_index(&start_hash)
-        .ok_or("Start block not found")?;
-
-    // Count transactions in the window
-    let mut tx_count: u64 = 0;
-    for h in (start_height + 1)..=tip_height {
-        if let Some(hash) = chain_state.get_block_hash_by_height(h)
-            && let Some(entry) = chain_state.get_block_index(&hash) {
-                tx_count += entry.num_tx as u64;
-            }
+    // Collect everything the window needs by walking back from the final block
+    // (verified active above, or the tip) via `prev_blockhash`: the start block
+    // hash and the per-height timestamps for both median-time-past windows. All
+    // ancestors of an active block are themselves active, so this is immune to
+    // height-index pollution — unlike `get_block_hash_by_height` /
+    // `get_median_time_past`, which read that index. We descend to the lowest
+    // height either MTP window touches.
+    let mtp_lowest = start_height.saturating_sub(10);
+    let mut ts_by_height: std::collections::HashMap<u32, u32> =
+        std::collections::HashMap::new();
+    ts_by_height.insert(final_height, final_entry.header.time);
+    let mut start_hash: Option<bitcoin::BlockHash> = None;
+    let mut cur = final_entry.header.prev_blockhash;
+    let mut h = final_height;
+    while h > mtp_lowest {
+        h -= 1;
+        let entry = chain_state
+            .get_block_index(&cur)
+            .ok_or("Block index entry missing while walking the active chain")?;
+        ts_by_height.insert(h, entry.header.time);
+        if h == start_height {
+            start_hash = Some(cur);
+        }
+        cur = entry.header.prev_blockhash;
     }
+    let start_hash = start_hash.ok_or("Start block not found")?;
 
-    let time_diff = tip_entry.header.time.saturating_sub(start_entry.header.time);
-    let tx_rate = if time_diff > 0 {
-        tx_count as f64 / time_diff as f64
-    } else {
-        0.0
+    // Core measures the window interval between the two endpoint blocks'
+    // median-time-past values (BIP113 MTP, including the block itself), not raw
+    // header timestamps. MTP of a block at height H is the median of timestamps
+    // over heights [H-10, H] (clamped at genesis), matching the semantics of
+    // `get_median_time_past(H + 1)`. MTP is monotonic non-decreasing, so the
+    // final block's value is never below the start's.
+    let mtp_of = |height: u32| -> u32 {
+        let mut times: Vec<u32> = (height.saturating_sub(10)..=height)
+            .filter_map(|hh| ts_by_height.get(&hh).copied())
+            .collect();
+        times.sort_unstable();
+        times[times.len() / 2]
     };
+    let time_diff = mtp_of(final_height).saturating_sub(mtp_of(start_height));
 
-    Ok(json!({
-        "time": tip_entry.header.time,
-        "txcount": tx_count,
-        "window_final_block_hash": tip_hash.to_string(),
-        "window_final_block_height": tip_height,
-        "window_block_count": window,
-        "window_tx_count": tx_count,
-        "window_interval": time_diff,
-        "txrate": tx_rate,
-    }))
+    // Cumulative tx counts at the window endpoints. Either may be absent on an
+    // AssumeUTXO node whose background validation hasn't reached that block.
+    // Core gates each field on availability (src/rpc/blockchain.cpp,
+    // getchaintxstats):
+    //   * `txcount`         — omitted unless the final block's cumulative is known.
+    //   * `window_tx_count` — the difference of the two cumulatives; omitted
+    //                         unless BOTH endpoints are known.
+    //   * `txrate`          — omitted unless `window_tx_count` is present and the
+    //                         interval (MTP difference, computed above) is positive.
+    // `window_interval` is always emitted here (window > 0).
+    let final_cum = chain_state.cumulative_tx_count(&final_hash);
+    let start_cum = chain_state.cumulative_tx_count(&start_hash);
+
+    let mut obj = serde_json::Map::new();
+    obj.insert("time".to_string(), json!(final_entry.header.time));
+    if let Some(txcount) = final_cum {
+        obj.insert("txcount".to_string(), json!(txcount));
+    }
+    obj.insert(
+        "window_final_block_hash".to_string(),
+        json!(final_hash.to_string()),
+    );
+    obj.insert(
+        "window_final_block_height".to_string(),
+        json!(final_height),
+    );
+    obj.insert("window_block_count".to_string(), json!(window));
+    obj.insert("window_interval".to_string(), json!(time_diff));
+    if let (Some(fc), Some(sc)) = (final_cum, start_cum) {
+        let window_tx_count = fc.saturating_sub(sc);
+        obj.insert("window_tx_count".to_string(), json!(window_tx_count));
+        if time_diff > 0 {
+            obj.insert(
+                "txrate".to_string(),
+                json!(window_tx_count as f64 / time_diff as f64),
+            );
+        }
+    }
+    Ok(Value::Object(obj))
 }
 
 /// `getmempoolancestors` — return in-mempool ancestors of a transaction.

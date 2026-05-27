@@ -506,6 +506,20 @@ async fn main() {
         }
     }
 
+    // One-shot cumulative-tx-count backfill (chain_tx CF) for datadirs
+    // that predate it. Index-only walk — no block reads, no validation —
+    // gated by a marker so it runs at most once. Non-fatal: a failure just
+    // means getchaintxstats omits txcount until a later start succeeds.
+    match chain_state.backfill_chain_tx_counts() {
+        Ok(0) => {}
+        Ok(written) => {
+            tracing::info!(blocks = written, "Cumulative tx-count backfill finished");
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Cumulative tx-count backfill failed; continuing startup");
+        }
+    }
+
     // Open reorg log + optional webhook dispatcher. Failure is non-fatal
     // — the node still runs, just without persistent reorg history.
     match node::chain::reorg_log::ReorgLog::open(

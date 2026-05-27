@@ -636,6 +636,19 @@ pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError>
     batch.block_index_puts.push((block_hash, entry));
     batch.tip = Some(block_hash);
     batch.height_hash_puts.push((height, block_hash));
+
+    // Cumulative transaction count = count(parent) + this block's tx count.
+    // The parent is already connected (this is the single active-chain
+    // connect path), so its count is in the store. Genesis has no parent
+    // (prev = all-zeros → None → 0), so it correctly starts at its own
+    // num_tx. Consumed by getchaintxstats.
+    let parent_chain_tx = store
+        .get_cumulative_tx_count(&block.header.prev_blockhash)
+        .unwrap_or(0);
+    batch
+        .chain_tx_puts
+        .push((block_hash, parent_chain_tx + block.txdata.len() as u64));
+
     if !is_genesis {
         batch.undo_puts.push((block_hash, undo));
     }
