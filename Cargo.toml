@@ -4,7 +4,7 @@ resolver = "2"
 
 [workspace.package]
 authors = ["Benjamen Keroack <ben@keroack.com>", "20 Gauge Software, Inc.", "The satd developers"]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/epochbtc/satd"
