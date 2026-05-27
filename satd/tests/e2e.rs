@@ -3532,3 +3532,166 @@ fn test_e2e_signpsbtwithkey_xpriv_roundtrip() {
 
     e2e.node.stop();
 }
+
+/// External-signer dispatch (`signpsbtwithsigner`) end to end, using a fake
+/// HWI-compatible signer: a /bin/sh script that answers `enumerate` with a
+/// fixed fingerprint and delegates `signtx` to `sat-cli signpsbtwithkey` with a
+/// known WIF. This exercises the full HWI contract path (argv, enumerate,
+/// signtx, JSON parsing) without real hardware; broadcast acceptance proves the
+/// signer-relayed signature is consensus-valid.
+#[test]
+fn test_e2e_signpsbtwithsigner_p2wpkh_roundtrip() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut e2e = E2eNode::boot_with(&[]);
+    let wallet = DeterministicWallet::from_secret([0x55u8; 32]);
+    let src = wallet.address.to_string();
+    let wif = bitcoin::PrivateKey::new(wallet.sk, bitcoin::Network::Regtest).to_wif();
+    let cli = sat_cli_path();
+
+    // Write the fake HWI signer script into the node's datadir.
+    let script_path = e2e.node.datadir.join("fake-signer.sh");
+    let script = format!(
+        "#!/bin/sh\n\
+         case \"$*\" in\n\
+         *enumerate*) printf '[{{\"fingerprint\":\"00000000\",\"name\":\"fake\"}}]'; exit 0 ;;\n\
+         esac\n\
+         last=\"\"\n\
+         for a in \"$@\"; do last=\"$a\"; done\n\
+         signed=$(printf '%s' \"{wif}\" | \"{cli}\" --regtest signpsbtwithkey \"$last\")\n\
+         printf '{{\"psbt\":\"%s\"}}' \"$signed\"\n",
+        wif = wif,
+        cli = cli.display(),
+    );
+    std::fs::write(&script_path, script).expect("write fake signer");
+    std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod fake signer");
+
+    let g = sat_cli_for(&e2e.node)
+        .args(["generatetoaddress", "101", &src])
+        .output()
+        .expect("generatetoaddress");
+    assert!(g.status.success());
+
+    let h1 = e2e.node.rpc_call_with_params("getblockhash", vec![serde_json::json!(1)]).unwrap();
+    let block1_hash = h1["result"].as_str().unwrap();
+    let b1 = e2e
+        .node
+        .rpc_call_with_params("getblock", vec![serde_json::json!(block1_hash), serde_json::json!(1)])
+        .unwrap();
+    let cb_txid = b1["result"]["tx"][0].as_str().unwrap().to_string();
+
+    let dest = DeterministicWallet::from_secret([0x43u8; 32]).address.to_string();
+    let created = e2e
+        .node
+        .rpc_call_with_params(
+            "createpsbt",
+            vec![serde_json::json!([{ "txid": cb_txid, "vout": 0 }]), serde_json::json!({ dest: 49.999 })],
+        )
+        .unwrap();
+    let unsigned = created["result"].as_str().unwrap().to_string();
+    let updated = e2e
+        .node
+        .rpc_call_with_params("utxoupdatepsbt", vec![serde_json::json!(unsigned)])
+        .unwrap();
+    let updated_psbt = updated["result"].as_str().unwrap().to_string();
+
+    // Sign via the external signer — no key on our stdin; the signer supplies it.
+    let out = sat_cli_for(&e2e.node)
+        .arg("signpsbtwithsigner")
+        .arg(&updated_psbt)
+        .arg(format!("--signer={}", script_path.display()))
+        .output()
+        .expect("run signpsbtwithsigner");
+    assert!(
+        out.status.success(),
+        "signpsbtwithsigner exit {:?}; stderr: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let signed_psbt = String::from_utf8(out.stdout).unwrap().trim().to_string();
+
+    let finalized = e2e
+        .node
+        .rpc_call_with_params("finalizepsbt", vec![serde_json::json!(signed_psbt), serde_json::json!(true)])
+        .unwrap();
+    assert_eq!(finalized["result"]["complete"], serde_json::json!(true), "finalize: {finalized}");
+    let raw_hex = finalized["result"]["hex"].as_str().unwrap().to_string();
+
+    let sent = e2e
+        .node
+        .rpc_call_with_params("sendrawtransaction", vec![serde_json::json!(raw_hex)])
+        .unwrap();
+    assert!(
+        sent["result"].is_string(),
+        "sendrawtransaction must accept the signer-relayed tx; got {sent}"
+    );
+
+    e2e.node.stop();
+}
+
+/// A signer must only add signatures, never substitute a different transaction.
+/// A hostile signer that returns a PSBT with a different unsigned tx must be
+/// rejected — sat-cli must not emit it.
+#[test]
+fn test_e2e_signpsbtwithsigner_rejects_tampered_psbt() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut e2e = E2eNode::boot_with(&[]);
+    let dest = DeterministicWallet::from_secret([0x56u8; 32]).address.to_string();
+    let dummy_txid = "0000000000000000000000000000000000000000000000000000000000000000";
+
+    // The PSBT we hand to the signer.
+    let a = e2e
+        .node
+        .rpc_call_with_params(
+            "createpsbt",
+            vec![serde_json::json!([{ "txid": dummy_txid, "vout": 0 }]), serde_json::json!({ &dest: 1.0 })],
+        )
+        .unwrap();
+    let psbt_a = a["result"].as_str().unwrap().to_string();
+
+    // A DIFFERENT transaction (different output amount) the signer will try to
+    // substitute in its response.
+    let b = e2e
+        .node
+        .rpc_call_with_params(
+            "createpsbt",
+            vec![serde_json::json!([{ "txid": dummy_txid, "vout": 0 }]), serde_json::json!({ &dest: 2.0 })],
+        )
+        .unwrap();
+    let psbt_b = b["result"].as_str().unwrap().to_string();
+
+    // Hostile signer: ignores its input and always returns psbt_b.
+    let script_path = e2e.node.datadir.join("tamper-signer.sh");
+    let script = format!(
+        "#!/bin/sh\n\
+         case \"$*\" in\n\
+         *enumerate*) printf '[{{\"fingerprint\":\"00000000\",\"name\":\"fake\"}}]'; exit 0 ;;\n\
+         esac\n\
+         printf '{{\"psbt\":\"%s\"}}' \"{psbt_b}\"\n",
+        psbt_b = psbt_b,
+    );
+    std::fs::write(&script_path, script).unwrap();
+    std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let out = sat_cli_for(&e2e.node)
+        .arg("signpsbtwithsigner")
+        .arg(&psbt_a)
+        .arg(format!("--signer={}", script_path.display()))
+        .output()
+        .expect("run signpsbtwithsigner");
+    assert_eq!(out.status.code(), Some(1), "tampered PSBT must be rejected");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("different unsigned transaction"),
+        "stderr should explain the rejection; got: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains(&psbt_b),
+        "the substituted PSBT must not be emitted on stdout"
+    );
+
+    e2e.node.stop();
+}
