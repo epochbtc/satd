@@ -2334,82 +2334,93 @@ impl ChainState {
             self.primary_engine(),
         );
 
-        let mut height = start_height;
-        while let Some(hash) = self.store.get_block_hash_by_height(height) {
-            // Prefer the prefetched, pre-processed block; fall back to a
-            // direct read on a miss (cold start, or a worker behind the
-            // cursor). Both paths connect via `connect_block` directly,
-            // bypassing the `DataStored` precondition the IBD connect
-            // methods enforce — after `clear_chainstate` the block-index
-            // entries are still `Valid` from the original sync.
-            match prefetch.take_block(height) {
-                Some(pre) if pre.hash == hash => self.reindex_connect_prefetched(pre)?,
-                _ => self.reindex_connect_direct(height, hash)?,
-            }
-            prefetch.advance_cursor(height + 1);
-            self.bump_connect_heartbeat();
+        // Run the replay in an inner closure so the prefetch workers are
+        // ALWAYS shut down afterward — including on the `?` error paths. A
+        // bare early return (connect failure, flat-file read failure, a
+        // flush error, etc.) would drop the handle without setting shutdown
+        // or joining, leaving detached workers reading the store/block files
+        // after a failed reindex.
+        let result = (|| -> Result<(), ChainError> {
+            let mut height = start_height;
+            while let Some(hash) = self.store.get_block_hash_by_height(height) {
+                // Prefer the prefetched, pre-processed block; fall back to a
+                // direct read on a miss (cold start, or a worker behind the
+                // cursor). Both paths connect via `connect_block` directly,
+                // bypassing the `DataStored` precondition the IBD connect
+                // methods enforce — after `clear_chainstate` the block-index
+                // entries are still `Valid` from the original sync.
+                match prefetch.take_block(height) {
+                    Some(pre) if pre.hash == hash => self.reindex_connect_prefetched(pre)?,
+                    _ => self.reindex_connect_direct(height, hash)?,
+                }
+                prefetch.advance_cursor(height + 1);
+                self.bump_connect_heartbeat();
 
-            // Emit a chain event so subscribers see reindex progress as they
-            // would IBD. No-op when the broadcaster isn't wired yet (the
-            // normal `-reindex-chainstate` startup case).
-            self.emit_chain_event(crate::chain::events::ChainEvent::BlockConnected {
-                hash,
-                height,
-            });
+                // Emit a chain event so subscribers see reindex progress as
+                // they would IBD. No-op when the broadcaster isn't wired yet
+                // (the normal `-reindex-chainstate` startup case).
+                self.emit_chain_event(crate::chain::events::ChainEvent::BlockConnected {
+                    hash,
+                    height,
+                });
 
-            // Bound memory: drain the in-memory dirty set to RocksDB when it
-            // crosses the threshold (a full reindex once hit 122 GiB RSS at
-            // ~block 430k before the OOM killer fired).
-            if self.store.dirty_count() > self.store.flush_threshold() {
-                self.store.flush()?;
-            }
+                // Bound memory: drain the in-memory dirty set to RocksDB when
+                // it crosses the threshold (a full reindex once hit 122 GiB
+                // RSS at ~block 430k before the OOM killer fired).
+                if self.store.dirty_count() > self.store.flush_threshold() {
+                    self.store.flush()?;
+                }
 
-            if height.is_multiple_of(DURABLE_FLUSH_EVERY) {
-                self.store.flush()?;
-                self.store.flush_durable()?;
-            }
+                if height.is_multiple_of(DURABLE_FLUSH_EVERY) {
+                    self.store.flush()?;
+                    self.store.flush_durable()?;
+                }
 
-            if let Some(p) = &progress
-                && height.is_multiple_of(100)
-            {
-                p.set_current(height as u64);
-            }
-
-            if height.is_multiple_of(10_000) {
-                tracing::info!(height, "Reindexing chainstate...");
-            }
-
-            // Honor `-stopatheight`: exit after the targeted height is
-            // durable. Subsequent heights, if present in the block index,
-            // are left for a follow-up run (no chainstate rollback).
-            if let Some(target) = stop_at
-                && height >= target
-            {
-                if let Some(p) = &progress {
+                if let Some(p) = &progress
+                    && height.is_multiple_of(100)
+                {
                     p.set_current(height as u64);
                 }
-                tracing::info!(
-                    height,
-                    target,
-                    "Reached -stopatheight during chainstate reindex; exiting"
-                );
-                prefetch.stop();
-                self.store.flush()?;
-                self.store.flush_durable()?;
-                return Ok(());
-            }
 
-            height += 1;
-        }
+                if height.is_multiple_of(10_000) {
+                    tracing::info!(height, "Reindexing chainstate...");
+                }
+
+                // Honor `-stopatheight`: exit after the targeted height is
+                // durable. Subsequent heights, if present in the block index,
+                // are left for a follow-up run (no chainstate rollback).
+                if let Some(target) = stop_at
+                    && height >= target
+                {
+                    if let Some(p) = &progress {
+                        p.set_current(height as u64);
+                    }
+                    tracing::info!(
+                        height,
+                        target,
+                        "Reached -stopatheight during chainstate reindex; exiting"
+                    );
+                    self.store.flush()?;
+                    self.store.flush_durable()?;
+                    return Ok(());
+                }
+
+                height += 1;
+            }
+            // Final flush so the reindexed tip is durable before we return.
+            self.store.flush()?;
+            self.store.flush_durable()?;
+            if let Some(p) = &progress {
+                p.set_current((height - 1) as u64);
+            }
+            tracing::info!(height = height - 1, "Chainstate reindex complete");
+            Ok(())
+        })();
+
+        // Always join the prefetch workers, whether the replay succeeded,
+        // hit `-stopatheight`, or errored out.
         prefetch.stop();
-        // Final flush so the reindexed tip is durable before we return.
-        self.store.flush()?;
-        self.store.flush_durable()?;
-        if let Some(p) = &progress {
-            p.set_current((height - 1) as u64);
-        }
-        tracing::info!(height = height - 1, "Chainstate reindex complete");
-        Ok(())
+        result
     }
 
     /// Connect a prefetched, pre-processed block during reindex. Reuses the
