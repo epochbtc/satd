@@ -40,6 +40,21 @@ layout) per `STABILITY_POLICY.md`.
   ASN-based bucketing (Core `util/asmap.cpp` port); `-forcednsseed` and
   `-fixedseeds`. `-includeconf` on the command line is now a hard error,
   matching Core.
+- **JSON-RPC server CLI flags.** `-rpcbind=<addr>[:port]` (repeatable),
+  `-rpcallowip=<subnet>` allow-list, `-rpcauth=<user>:<salt>$<hash>`
+  HMAC credentials, and the `-rpccookiefile` / `-rpccookieperms` cookie
+  controls, all matching Bitcoin Core.
+- **`-chain=<name>` unified network selector** (Core's single-flag form),
+  mutually exclusive with `-regtest` / `-testnet` / `-testnet4` / `-signet`;
+  a `[signet]` config section; `-blocksdir` for a separate blocks directory;
+  `-signetseednode`; and `-timeout=<ms>` peer-connection timeout. `sat-cli`
+  gains `-rpcwait` to block until the daemon's RPC is reachable.
+- **`-persistmempool`** — the mempool is saved to `mempool.dat` on clean
+  shutdown and reloaded (each tx re-validated against the chainstate) at
+  startup. The flag, filename, and behavior match Bitcoin Core, but the
+  on-disk format is satd-native and **not** byte-compatible with Core's
+  `mempool.dat` (like `peers.dat` — see `CORE_DIFFERENCES.md`).
+- **`-listenonion`** Tor hidden-service wiring is honored end-to-end.
 
 ### RPC compatibility
 
@@ -67,6 +82,16 @@ layout) per `STABILITY_POLICY.md`.
   (background) sync. satd loads Bitcoin Core's published UTXO snapshot
   files directly; the anchor table is copied verbatim from Core's
   `m_assumeutxo_data`. Refuses to load under pruning. Note: While AssumeUTXO is fully compatible with commonly-distributed snapshots, satd does not create or distribute these snapshots. Users must find their own source for trusted snapshots.
+- **`dumptxoutset` RPC** — exports a byte-compatible UTXO snapshot at the
+  current tip, loadable into either Core or satd via `loadtxoutset`. The
+  returned `txoutset_hash` is Core's `hash_serialized_3` UTXO-set hash
+  (not the file digest), so it can be checked against a height's
+  `hash_serialized` in Core's `m_assumeutxo_data`. Finalize is atomic and
+  refuses to clobber an existing file.
+- **UTXO-set hash parity with Core.** Provably-unspendable outputs are
+  now excluded from the UTXO set, so `gettxoutsetinfo` and `dumptxoutset`
+  produce the same `hash_serialized_3` as Bitcoin Core at a given height —
+  required for AssumeUTXO snapshots to cross-validate against Core anchors.
 - **`--fast-start=<url>` one-flag startup UX.** Downloads a UTXO snapshot
   at startup (from an `https://` URL or a local file path), waits for
   header sync to reach the snapshot's anchor, and loads it automatically
@@ -84,6 +109,13 @@ layout) per `STABILITY_POLICY.md`.
   optional `--fast-start-sha256=<hex>` fails fast if the file doesn't match
   an operator-supplied digest (opt-in; the anchor-hash check at load is the
   authoritative gate regardless).
+
+### Performance
+
+- **Pipelined `-reindex-chainstate`.** Rebuilding the UTXO set from
+  on-disk blocks now uses the same parallel block-processing pipeline as
+  initial block download instead of a serial pass, substantially reducing
+  reindex-chainstate wall-clock time on multi-core hosts.
 
 ### Packaging
 
