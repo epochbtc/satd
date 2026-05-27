@@ -744,6 +744,16 @@ fn run_sign(psbt_arg: Option<&str>, psbt_file: Option<&std::path::Path>) -> i32 
     }
 
     let summary = sign::sign_psbt(&mut psbt, &wif_keys, &xprivs);
+    // Best-effort wipe of the parsed key material before it leaves scope.
+    // `secp256k1` has no `Zeroize` impl; `non_secure_erase` is its volatile
+    // overwrite (same technique as the zeroize crate). Residual copies the
+    // compiler or secp's C path may have made are unreachable.
+    for pk in &mut wif_keys {
+        pk.inner.non_secure_erase();
+    }
+    for xp in &mut xprivs {
+        xp.private_key.non_secure_erase();
+    }
     drop(wif_keys);
     drop(xprivs);
 

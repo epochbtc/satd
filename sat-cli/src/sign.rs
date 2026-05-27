@@ -12,6 +12,13 @@
 //! is exactly what the node's `finalizepsbt` consumes. The xpriv path defers to
 //! rust-bitcoin's `Psbt::sign`, which keys off the PSBT's `bip32_derivation` /
 //! `tap_key_origins`.
+//!
+//! Key erasure is best-effort. `secp256k1` deliberately does not implement
+//! `Zeroize` (the compiler may copy/move secrets freely, so it can't be
+//! guaranteed); instead it exposes `SecretKey::non_secure_erase`, a volatile
+//! overwrite plus compiler fence — the same primitive the `zeroize` crate
+//! uses. We call it on every key copy we hold, but copies made inside the C
+//! signing path or spilled to the stack are unreachable.
 
 use std::collections::HashMap;
 
@@ -146,6 +153,17 @@ pub fn sign_psbt(
     // the final per-input outcome is read from PSBT state below.
     for xpriv in xprivs {
         let _ = psbt.sign(xpriv, &secp);
+    }
+
+    // Best-effort wipe of the secret-key copies we hold. `SecretKey` is
+    // `Copy`, so this only erases the bindings in these maps — copies made by
+    // the compiler or inside secp256k1's C signing path are unreachable. See
+    // the module docs for the honest limitation.
+    for sk in key_map.values_mut() {
+        sk.non_secure_erase();
+    }
+    for sk in xonly_key_map.values_mut() {
+        sk.non_secure_erase();
     }
 
     // Derive outcomes from the resulting PSBT state.
