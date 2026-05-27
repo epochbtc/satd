@@ -12,6 +12,10 @@ layout) per `STABILITY_POLICY.md`.
 
 - **BIP 324 v2 encrypted transport** (`-v2transport`, on by default, matching Bitcoin Core). satd offers/accepts the ElligatorSwift + ChaCha20-Poly1305 v2 handshake on inbound and outbound connections, transparently falling back to plaintext v1 for legacy peers. The satd-specific **`-v2only`** flag (off by default) refuses non-v2 peers as an anti-surveillance lever. `getpeerinfo` reports `transport_protocol_type`; a `satd_peer_connections_v2` Prometheus gauge counts v2 peers. Built on the rust-bitcoin `bip324` crate.
 
+### Wallet / signing
+
+- **`sat-cli signpsbtwithkey` — client-side PSBT signing.** Signs a base64 PSBT locally using a private key (WIF or xpriv) read from **stdin**; the key is never sent over JSON-RPC, keeping the daemon keyless. On an interactive terminal the key is read with a no-echo prompt; when piped, newline-separated keys are accepted. Key material is best-effort erased after use. Signs p2pkh, p2wpkh, p2sh-wrapped-p2wpkh, and p2tr key-path inputs (populating `partial_sigs` / `tap_key_sig`); the signed PSBT is emitted on stdout to feed into the existing `finalizepsbt` RPC. Exits `0` when fully signed, `2` when partial (PSBT still emitted, unsigned inputs reported on stderr). Intended workflow: `createpsbt` → `utxoupdatepsbt` → `signpsbtwithkey` → `finalizepsbt` → `sendrawtransaction`. For an xpriv, standard BIP 44/49/84/86 child keys are derived client-side (account 0, receive + change, over a `--gap`-bounded scan, default 100) and matched against the input scripts, so an xpriv signs PSBTs that carry no derivation metadata — including satd's own `createpsbt` output; PSBTs that *do* carry `bip32_derivation` also sign on their declared paths.
+
 ### Native protocol surfaces
 
 - **Native TLS Support:** Direct TLS termination for JSON-RPC, Electrum, and Esplora servers via `--rpctlsbind`, `--electrumtlsbind`, and `--esploratlsbind`. Eliminates the need for a TLS-terminating sidecar.

@@ -3266,3 +3266,269 @@ fn test_e2e_typed_esplora_tx_status_via_typed_client() {
 
     e2e.node.stop();
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// signpsbtwithkey — client-side PSBT signing (key on stdin, never over RPC)
+// ─────────────────────────────────────────────────────────────────────
+
+/// Full keyless-signing pipeline: createpsbt → utxoupdatepsbt → sign via
+/// `sat-cli signpsbtwithkey` (WIF on stdin) → finalizepsbt → sendrawtransaction.
+/// A successful broadcast is the load-bearing assertion: `sendrawtransaction`
+/// runs full consensus script verification, so the tx is only accepted if the
+/// client-side signature is valid. Per-script-type signing correctness is
+/// covered by unit tests in `sat-cli/src/sign.rs`; this proves the end-to-end
+/// CLI/stdin/finalize/broadcast path for the common P2WPKH case.
+#[test]
+fn test_e2e_signpsbtwithkey_p2wpkh_roundtrip() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let mut e2e = E2eNode::boot_with(&[]);
+    let wallet = DeterministicWallet::from_secret([0x42u8; 32]);
+    let src = wallet.address.to_string();
+    let wif = bitcoin::PrivateKey::new(wallet.sk, bitcoin::Network::Regtest).to_wif();
+
+    // Mine 101 blocks to the P2WPKH source so block-1's coinbase (50 BTC) is mature.
+    let g = sat_cli_for(&e2e.node)
+        .args(["generatetoaddress", "101", &src])
+        .output()
+        .expect("generatetoaddress");
+    assert!(g.status.success(), "generatetoaddress: {}", String::from_utf8_lossy(&g.stderr));
+
+    // Resolve block-1 coinbase txid.
+    let h1 = e2e.node.rpc_call_with_params("getblockhash", vec![serde_json::json!(1)]).unwrap();
+    let block1_hash = h1["result"].as_str().expect("block1 hash");
+    let b1 = e2e
+        .node
+        .rpc_call_with_params("getblock", vec![serde_json::json!(block1_hash), serde_json::json!(1)])
+        .unwrap();
+    let cb_txid = b1["result"]["tx"][0].as_str().expect("coinbase txid").to_string();
+
+    // createpsbt spending the coinbase, sending most of it to a second address.
+    let dest = DeterministicWallet::from_secret([0x43u8; 32]).address.to_string();
+    let inputs = serde_json::json!([{ "txid": cb_txid, "vout": 0 }]);
+    let outputs = serde_json::json!({ dest: 49.999 });
+    let created = e2e.node.rpc_call_with_params("createpsbt", vec![inputs, outputs]).unwrap();
+    let unsigned = created["result"].as_str().expect("createpsbt psbt").to_string();
+
+    // utxoupdatepsbt populates witness_utxo from chainstate.
+    let updated = e2e
+        .node
+        .rpc_call_with_params("utxoupdatepsbt", vec![serde_json::json!(unsigned)])
+        .unwrap();
+    let updated_psbt = updated["result"].as_str().expect("utxoupdatepsbt psbt").to_string();
+
+    // Sign locally: WIF goes in on stdin, signed PSBT comes out on stdout.
+    let mut child = sat_cli_for(&e2e.node)
+        .arg("signpsbtwithkey")
+        .arg(&updated_psbt)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn signpsbtwithkey");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(format!("{wif}\n").as_bytes())
+        .unwrap();
+    let signed_out = child.wait_with_output().expect("signpsbtwithkey output");
+    assert!(
+        signed_out.status.success(),
+        "signpsbtwithkey exit {:?}; stderr: {}",
+        signed_out.status.code(),
+        String::from_utf8_lossy(&signed_out.stderr)
+    );
+    let signed_psbt = String::from_utf8(signed_out.stdout).unwrap().trim().to_string();
+    assert_ne!(signed_psbt, updated_psbt, "signed PSBT must differ from unsigned");
+
+    // finalizepsbt assembles the witness from our partial_sig.
+    let finalized = e2e
+        .node
+        .rpc_call_with_params("finalizepsbt", vec![serde_json::json!(signed_psbt), serde_json::json!(true)])
+        .unwrap();
+    assert_eq!(finalized["result"]["complete"], serde_json::json!(true), "finalize: {finalized}");
+    let raw_hex = finalized["result"]["hex"].as_str().expect("final tx hex").to_string();
+
+    // Broadcast — acceptance proves the client-side signature is consensus-valid.
+    let sent = e2e
+        .node
+        .rpc_call_with_params("sendrawtransaction", vec![serde_json::json!(raw_hex)])
+        .unwrap();
+    assert!(
+        sent["result"].is_string(),
+        "sendrawtransaction must accept the client-signed tx; got {sent}"
+    );
+
+    // Confirm it: mine one block, mempool should drain.
+    let _ = e2e
+        .node
+        .rpc_call_with_params("generatetoaddress", vec![serde_json::json!(1), serde_json::json!(src)])
+        .unwrap();
+    let mempool = e2e.node.rpc_call("getrawmempool").unwrap();
+    assert_eq!(
+        mempool["result"].as_array().map(|a| a.len()),
+        Some(0),
+        "mempool should be empty after confirming the spend"
+    );
+
+    e2e.node.stop();
+}
+
+/// Fail-closed: signing a PSBT whose inputs lack `witness_utxo` (skipped
+/// `utxoupdatepsbt`) must report the input as unsigned and exit 2 — never
+/// silently emit an unsigned PSBT as if it were complete.
+#[test]
+fn test_e2e_signpsbtwithkey_missing_utxo_exits_2() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let mut e2e = E2eNode::boot_with(&[]);
+    let wallet = DeterministicWallet::from_secret([0x42u8; 32]);
+    let src = wallet.address.to_string();
+    let wif = bitcoin::PrivateKey::new(wallet.sk, bitcoin::Network::Regtest).to_wif();
+
+    let g = sat_cli_for(&e2e.node)
+        .args(["generatetoaddress", "101", &src])
+        .output()
+        .expect("generatetoaddress");
+    assert!(g.status.success());
+
+    let h1 = e2e.node.rpc_call_with_params("getblockhash", vec![serde_json::json!(1)]).unwrap();
+    let block1_hash = h1["result"].as_str().unwrap();
+    let b1 = e2e
+        .node
+        .rpc_call_with_params("getblock", vec![serde_json::json!(block1_hash), serde_json::json!(1)])
+        .unwrap();
+    let cb_txid = b1["result"]["tx"][0].as_str().unwrap().to_string();
+
+    let dest = DeterministicWallet::from_secret([0x43u8; 32]).address.to_string();
+    let created = e2e
+        .node
+        .rpc_call_with_params(
+            "createpsbt",
+            vec![serde_json::json!([{ "txid": cb_txid, "vout": 0 }]), serde_json::json!({ dest: 49.999 })],
+        )
+        .unwrap();
+    // NOTE: deliberately skip utxoupdatepsbt, so witness_utxo is absent.
+    let unsigned = created["result"].as_str().unwrap().to_string();
+
+    let mut child = sat_cli_for(&e2e.node)
+        .arg("signpsbtwithkey")
+        .arg(&unsigned)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    child.stdin.take().unwrap().write_all(format!("{wif}\n").as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+
+    assert_eq!(out.status.code(), Some(2), "missing witness_utxo must exit 2");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("missing witness_utxo"),
+        "stderr should explain the unsigned input; got: {stderr}"
+    );
+
+    e2e.node.stop();
+}
+
+/// An xpriv signs a PSBT that carries no derivation metadata — satd's own
+/// `createpsbt` output — by deriving standard BIP84 child keys client-side and
+/// matching them against the input scripts. Broadcast acceptance proves the
+/// derived-key signature is consensus-valid.
+#[test]
+fn test_e2e_signpsbtwithkey_xpriv_roundtrip() {
+    use bitcoin::bip32::{ChildNumber, Xpriv};
+    use bitcoin::key::CompressedPublicKey;
+    use bitcoin::secp256k1::Secp256k1;
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let mut e2e = E2eNode::boot_with(&[]);
+    let secp = Secp256k1::new();
+    let master = Xpriv::new_master(bitcoin::Network::Regtest, &[0x77u8; 32]).unwrap();
+    let h = |i| ChildNumber::from_hardened_idx(i).unwrap();
+    let n = |i| ChildNumber::from_normal_idx(i).unwrap();
+    // Fund an address on the standard regtest BIP84 path m/84'/1'/0'/0/0.
+    let child = master
+        .derive_priv(&secp, &[h(84), h(1), h(0), n(0), n(0)])
+        .unwrap();
+    let cpk =
+        CompressedPublicKey::from_slice(&child.to_priv().public_key(&secp).to_bytes()).unwrap();
+    let src = bitcoin::Address::p2wpkh(&cpk, bitcoin::Network::Regtest).to_string();
+
+    let g = sat_cli_for(&e2e.node)
+        .args(["generatetoaddress", "101", &src])
+        .output()
+        .expect("generatetoaddress");
+    assert!(g.status.success());
+
+    let h1 = e2e.node.rpc_call_with_params("getblockhash", vec![serde_json::json!(1)]).unwrap();
+    let block1_hash = h1["result"].as_str().unwrap();
+    let b1 = e2e
+        .node
+        .rpc_call_with_params("getblock", vec![serde_json::json!(block1_hash), serde_json::json!(1)])
+        .unwrap();
+    let cb_txid = b1["result"]["tx"][0].as_str().unwrap().to_string();
+
+    let dest = DeterministicWallet::from_secret([0x43u8; 32]).address.to_string();
+    let created = e2e
+        .node
+        .rpc_call_with_params(
+            "createpsbt",
+            vec![serde_json::json!([{ "txid": cb_txid, "vout": 0 }]), serde_json::json!({ dest: 49.999 })],
+        )
+        .unwrap();
+    let unsigned = created["result"].as_str().unwrap().to_string();
+    let updated = e2e
+        .node
+        .rpc_call_with_params("utxoupdatepsbt", vec![serde_json::json!(unsigned)])
+        .unwrap();
+    let updated_psbt = updated["result"].as_str().unwrap().to_string();
+
+    // Sign with the MASTER xpriv on stdin — the PSBT has no derivation info,
+    // so this exercises the client-side standard-path key expansion.
+    let mut child_proc = sat_cli_for(&e2e.node)
+        .arg("signpsbtwithkey")
+        .arg(&updated_psbt)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    child_proc
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(format!("{master}\n").as_bytes())
+        .unwrap();
+    let out = child_proc.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "xpriv sign exit {:?}; stderr: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let signed_psbt = String::from_utf8(out.stdout).unwrap().trim().to_string();
+
+    let finalized = e2e
+        .node
+        .rpc_call_with_params("finalizepsbt", vec![serde_json::json!(signed_psbt), serde_json::json!(true)])
+        .unwrap();
+    assert_eq!(finalized["result"]["complete"], serde_json::json!(true), "finalize: {finalized}");
+    let raw_hex = finalized["result"]["hex"].as_str().unwrap().to_string();
+
+    let sent = e2e
+        .node
+        .rpc_call_with_params("sendrawtransaction", vec![serde_json::json!(raw_hex)])
+        .unwrap();
+    assert!(
+        sent["result"].is_string(),
+        "sendrawtransaction must accept the xpriv-signed tx; got {sent}"
+    );
+
+    e2e.node.stop();
+}

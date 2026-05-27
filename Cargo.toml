@@ -55,3 +55,5 @@ crossterm = "0.28"
 rmcp = { version = "1", features = ["server", "transport-io", "transport-streamable-http-server"] }
 schemars = { version = "0.8", features = ["derive"] }
 sd-notify = "0.5"
+zeroize = "1"
+rpassword = "7"
