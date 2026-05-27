@@ -49,9 +49,12 @@ layout) per `STABILITY_POLICY.md`.
   a `[signet]` config section; `-blocksdir` for a separate blocks directory;
   `-signetseednode`; and `-timeout=<ms>` peer-connection timeout. `sat-cli`
   gains `-rpcwait` to block until the daemon's RPC is reachable.
-- **`-persistmempool`** — the mempool is now saved to `mempool.dat` on
-  shutdown and reloaded at startup (Core-compatible), with `-listenonion`
-  Tor hidden-service wiring honored end-to-end.
+- **`-persistmempool`** — the mempool is saved to `mempool.dat` on clean
+  shutdown and reloaded (each tx re-validated against the chainstate) at
+  startup. The flag, filename, and behavior match Bitcoin Core, but the
+  on-disk format is satd-native and **not** byte-compatible with Core's
+  `mempool.dat` (like `peers.dat` — see `CORE_DIFFERENCES.md`).
+- **`-listenonion`** Tor hidden-service wiring is honored end-to-end.
 
 ### RPC compatibility
 
