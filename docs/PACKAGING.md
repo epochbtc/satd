@@ -485,17 +485,11 @@ Tag-triggered (`v*`) releases produce, per tag, via
 - `satd-<version>-<target>.tar.zst` for the targets currently shipped:
   - `x86_64-unknown-linux-gnu`
   - `aarch64-unknown-linux-gnu`
+  - `x86_64-unknown-linux-musl` (statically-linked musl)
+  - `aarch64-unknown-linux-musl` (statically-linked musl)
+  - `aarch64-apple-darwin` (macOS Apple Silicon)
 
-  **macOS Apple Silicon (`aarch64-apple-darwin`) is temporarily
-  disabled** while the repo is private. Hosted Apple Silicon runners
-  bill at 20× the linux-2-core rate, which is uneconomical on the
-  current Team plan. The matrix entry is commented out (not removed)
-  in `.github/workflows/release.yml`; it will be re-enabled when the
-  repo flips to public, at which point hosted Actions minutes are
-  free. Until then, macOS users can `cargo install --git` or
-  cross-build from any host.
-
-  `x86_64-apple-darwin` is also not built — macos-13 is being
+  `x86_64-apple-darwin` is not built in the standard release matrix — macos-13 is being
   deprecated by GitHub and Apple Silicon is the targeted macOS
   surface. Operators who need x86_64 darwin can cross-compile from
   an arm64 darwin host (`cargo build --release --target=x86_64-apple-darwin`).
@@ -520,13 +514,7 @@ Tag-triggered (`v*`) releases produce, per tag, via
   and a `*.minisig` produced by the same maintainer-side
   `contrib/release/sign-tarballs.sh` flow that signs the tarballs.
 
-The workflow currently runs on tag pushes only. PR-trigger dry-runs
-and `workflow_dispatch` were removed during the private-repo phase
-to conserve hosted-runner minutes; they will be re-enabled when the
-repo flips to public (Actions minutes are free for public repos).
-Until then, release-workflow / Dockerfile / Cargo-lock breakage
-first manifests at tag time rather than on the PR that introduced
-it — fix forward by reverting or patching, then re-tag.
+The release workflow is triggered on tag pushes (`v*`) and manual triggers (`workflow_dispatch`), building the full set of binary, container, and SBOM artifacts in parallel.
 
 ### Signed releases
 
@@ -614,17 +602,10 @@ The policy runs as a hard gate in two places:
   A new RustSec advisory landed during a quiet period between merges
   cannot ship a release.
 
-### Coming in later PRs
+### Known deferred items
 
-- **musl-linux tarballs.** Targets `x86_64-unknown-linux-musl` and
-  `aarch64-unknown-linux-musl`. Deferred to a follow-up because
-  `rocksdb-sys` + musl wants a dedicated cross toolchain and the
-  v0.1.0 priority is gnu-linux + macOS, both of which downstream
-  package managers handle natively.
-- **Runtime watchdog** (`WatchdogSec=` in the systemd unit, paired
-  with `sd_notify(WATCHDOG=1)` from satd's main event loop). The
-  PR-6 plumbing covers startup; runtime liveness needs explicit
-  per-subsystem health criteria and is deferred to a v0.1.x follow-up.
+- **`cargo-auditable`** — Embedding the dependency manifest directly into the compiled binaries for improved runtime supply-chain verification.
+- **AssumeUTXO `--fast-start` UX** — A simplified one-flag UX to bootstrap from user-provided snapshots. Note that while satd is fully compatible with standard, commonly-distributed snapshots, we will not be creating or distributing these snapshots ourselves; users must find their own source for trusted snapshots.
 
 ## Stability contract
 

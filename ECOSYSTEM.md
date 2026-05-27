@@ -181,7 +181,7 @@ Both protocols and the index landed in the timeframe estimated. The shipped surf
 - **`iowait`-friendly** — batched RocksDB writes; optional `fsync=false` for USB-SSD + UPS setups.
 - **Thermal-aware** — back off CPU-bound work under `nice` / `cpuset` throttling.
 - **Unclean-shutdown resilience** — assume power-yank is routine; WAL + atomic UTXO batch writes must always survive.
-- **Signed AssumeUTXO snapshots** hosted on a CDN (Cloudflare R2, IPFS, or similar) so Pi IBD drops from days to hours.
+- **AssumeUTXO snapshots** sourced from trusted third-party origins (while compatible with commonly-distributed snapshots, satd will not create or distribute these snapshots itself; users are advised to find their own trusted sources) so Pi IBD drops from days to hours.
 
 ### 6. Ecosystem outreach (the non-code half)
 
@@ -226,10 +226,9 @@ Resolved (kept here for traceability; the resolution lives in code and `CORE_DIF
 - ~~Address-history index column-family layout.~~ **Resolved**: two CFs (`addr_funding_v2`, `addr_spending_v2`) keyed by `(scripthash_prefix[16], height_be[4], txid[32], vout/vin_be[4])`. See `node-index/src/keys.rs`.
 - ~~Address index opt-in vs. on-by-default.~~ **Resolved**: on by default (`--addressindex=1`); opt out with `--addressindex=0`. Esplora and Electrum auto-require it.
 - ~~AssumeUTXO interaction with the address-history index.~~ **Resolved**: deferred opt-in backfill via `backfillindex address` (and `backfillindex blockfilter` for the BIP 158 index). Operator triggers when convenient; node remains usable with partial history.
+- ~~Signed AssumeUTXO snapshot distribution.~~ **Resolved**: To maintain strict keyless trust-minimization, `satd` will not create or distribute these snapshots itself. We are fully compatible with commonly-distributed snapshots, and users are advised to source their own. The `--fast-start` UX remains a deferred client-side enhancement.
 
 Open:
-
-- Signed AssumeUTXO snapshot distribution — signing key policy, CDN choice, update cadence. Tied to `--fast-start` UX (Tier 2 #10 in `OPERATOR_ERGONOMICS.md`).
 - Do we sponsor or upstream satd-specific presets to an existing mobile wallet (Nunchuk, BlueWallet) vs. being a pure server?
 - Non-Tor cloud-accessible deployment path (HTTPS reverse proxy, Tailscale, mutual-TLS) — do we support it or intentionally de-emphasize in favor of Tor-first?
 - Silent Payments index: built on top of the address-history index infrastructure, or as a parallel index? (Likely the former, given they share the same scan-every-output shape.)

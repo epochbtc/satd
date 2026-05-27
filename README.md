@@ -42,7 +42,7 @@
 
 *   **Native TUI (`sat-tui`):** A beautiful Ratatui-based terminal interface for real-time IBD bitmap visualization, peer stats, and node observability.
 *   **Metrics & Observability:** Native Prometheus `/metrics`, `/healthz`, and JSON-structured logs.
-*   **Core-Compatible:** Accepts standard `bitcoin.conf` and CLI flags (`-prune`, `-txindex`, `-assumevalid`). Uses standard `.cookie` auth. AssumeUTXO fast-sync is supported via the `loadtxoutset` RPC (Core's snapshot files load directly).
+*   **Core-Compatible:** Accepts standard `bitcoin.conf` and CLI flags (`-prune`, `-txindex`, `-assumevalid`). Uses standard `.cookie` auth. AssumeUTXO fast-sync is supported via the `loadtxoutset` RPC (Core's snapshot files load directly). *Note: While AssumeUTXO support is fully implemented and compatible with existing commonly-distributed snapshots, we do not create or distribute these snapshots ourselves; users must find their own source for trusted snapshots.*
 *   **Mempool Stream:** `subscribemempool` JSON-RPC WS subscription with explicit eviction/replacement reasons.
 *   **Events Bus:** gRPC + ZMQ publishers for chain and mempool events (`satd-events`).
 *   **Reorg Logging:** Persistent reorg log with an optional webhook.

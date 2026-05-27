@@ -45,6 +45,9 @@ Instead of manually tuning `-dbcache`, `-maxmempool`, and connection limits, ope
 | `--rpctlsbind=<addr:port>` | None | Enables native TLS for JSON-RPC, eliminating the need for a TLS-terminating sidecar. Requires `--rpctlscert` and `--rpctlskey`. |
 | `--electrumtlsbind=<addr:port>`| None | Enables native TLS for the Electrum server. Requires `--electrumtlscert` and `--electrumtlskey`. |
 | `--esploratlsbind=<addr:port>` | None | Enables native TLS for the Esplora REST API. Requires `--esploratlscert` and `--esploratlskey`. |
+| `--v2transport=<0\|1>` | `1` | Enables BIP 324 v2 encrypted P2P transport. Offers/accepts the ElligatorSwift + ChaCha20-Poly1305 v2 handshake, transparently falling back to v1. |
+| `--v2only=<0\|1>` | `0` | satd-specific privacy/anti-surveillance flag. If `1`, strictly refuses or immediately disconnects any peer not using the v2 encrypted P2P transport. |
+| `--dbcache=auto` | None | Spawns the adaptive dbcache resizing task to automatically scale RocksDB block cache and CoinCache clean-LRU in response to system memory pressure. |
 
 ### Mempool Policy Sovereignty
 `satd` believes that operators should have strict, ultimate control over what their hardware validates and relays. Instead of requiring a patched C++ fork (like Bitcoin Knots) to filter spam or unwanted data, `satd` exposes these policies as first-class configuration knobs:
@@ -73,3 +76,6 @@ Instead of manually tuning `-dbcache`, `-maxmempool`, and connection limits, ope
 ### Persistent Reorg Log & Webhook
 *   A persistent, append-only JSONL log at `$datadir/reorg.log` survives restarts.
 *   Optional HTTP POST on reorgs via `--reorg-webhook=<url>`.
+
+### Client-Side PSBT Signing
+*   `sat-cli signpsbtwithkey` is a client-side command that reads a WIF or xpriv from **stdin** and signs Taproot key-path, SegWit, or Legacy inputs locally. Because the private key is never passed over JSON-RPC, the `satd` daemon stays strictly keyless while allowing operators to securely sign PSBTs via their CLI terminal.

@@ -46,8 +46,7 @@ layout) per `STABILITY_POLICY.md`.
 - **`loadtxoutset` / `getchainstates` RPCs** plus two-chainstate
   (background) sync. satd loads Bitcoin Core's published UTXO snapshot
   files directly; the anchor table is copied verbatim from Core's
-  `m_assumeutxo_data`. Refuses to load under pruning. Signed snapshot
-  distribution and a `--fast-start` UX remain deferred.
+  `m_assumeutxo_data`. Refuses to load under pruning. Note: While AssumeUTXO is fully compatible with commonly-distributed snapshots, satd does not create or distribute these snapshots. Users must find their own source for trusted snapshots (the `--fast-start` UX remains deferred).
 
 ### Packaging
 
@@ -144,7 +143,7 @@ Tracked in `ECOSYSTEM.md` and `docs/PACKAGING.md` for the v0.1.x line.
 — see the `[Unreleased]` section above.)
 
 - `cargo-auditable` to embed the dependency manifest in the binary.
-- Signed AssumeUTXO snapshot distribution and `--fast-start` UX.
+- `--fast-start` UX (compatible with standard snapshots, but satd will not create or distribute these snapshots itself).
 
 [Unreleased]: https://github.com/epochbtc/satd/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/epochbtc/satd/releases/tag/v0.1.0

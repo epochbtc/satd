@@ -50,7 +50,7 @@ Operators could define local rulesets using simple boolean logic on transaction 
 - Configurable "upload-only at night" window.
 
 ### Adaptive dbcache sizing
-**Proposal:** Instead of a static `-dbcache=N`, an adaptive mechanism that monitors system RAM and scales RocksDB block cache dynamically, releasing memory under OS pressure.
+**Status:** ✅ Shipped. Exposes `--dbcache=auto` which spawns a background controller task monitoring `/proc/meminfo` on Linux hosts. It resizes both the RocksDB block cache and CoinCache clean-LRU on a 30s tick in response to system memory pressure, automatically backing off during IBD vs. steady tip operation and contracting on sharp memory drops.
 
 ### Config hot reload on SIGHUP
 **Proposal:** Reload `satd.conf` on `SIGHUP` and apply changes (e.g. log levels, P2P limits, metrics binds) without dropping the P2P swarm or flushing the chainstate.
