@@ -2279,92 +2279,91 @@ impl ChainState {
         stop_at: Option<u32>,
         progress: Option<Arc<crate::startup_progress::StartupProgress>>,
     ) -> Result<(), ChainError> {
-        // Periodic flush cadence for the durable checkpoint. The
-        // dirty-cache threshold (see `flush_threshold`) already triggers
-        // in-cache flushes when memory pressure requires — but reindex
-        // runs without the normal connect-loop's periodic `flush_durable`
-        // call, so large reindexes would still hold weeks of writes in
-        // the in-memory dirty set until the whole reindex completed.
-        // 1000 blocks mirrors the production IBD connect loop's cadence.
-        const DURABLE_FLUSH_EVERY: u32 = 1000;
-
         if let Some(p) = &progress {
             let total = self.max_indexed_height();
             p.set_total(total as u64);
             p.set_stop_height(stop_at.map(|h| h as u64));
         }
 
-        let mut height = 1; // genesis already connected by ChainState::new()
+        // Pipeline the replay like the IBD connect loop. A plain serial
+        // read->connect->write loop leaves both CPU and disk idle between
+        // blocks: each iteration waits on a flat-file read, then UTXO
+        // lookups, then a WAL'd write, with nothing overlapping. Instead we
+        // enter BulkLoad (WAL off) and run the prefetcher so worker threads
+        // read, deserialize, hash txids, warm the UTXO cache (and, in
+        // assumevalid mode, speculatively verify scripts) for blocks AHEAD
+        // of the connect cursor. Normal write mode + a durable flush are
+        // restored on EVERY exit path (including the `?` error paths in the
+        // inner replay), so BulkLoad semantics never leak into steady state.
+        self.set_write_mode(crate::storage::WriteMode::BulkLoad);
+        let result = self.reindex_replay(stop_at, progress);
+        if let Err(e) = self.flush_durable() {
+            tracing::error!(
+                error = %e,
+                "reindex: durable flush on exit failed; restoring Normal write mode anyway \
+                 (next startup replays from the flat-file block store)"
+            );
+        }
+        self.set_write_mode(crate::storage::WriteMode::Normal);
+        result
+    }
+
+    /// Inner replay loop for [`Self::reindex_chainstate`]. Runs under
+    /// BulkLoad with the prefetch pipeline; the caller restores Normal write
+    /// mode regardless of how this returns.
+    fn reindex_replay(
+        &self,
+        stop_at: Option<u32>,
+        progress: Option<Arc<crate::startup_progress::StartupProgress>>,
+    ) -> Result<(), ChainError> {
+        // Periodic durable checkpoint cadence. The dirty-cache threshold
+        // (see `flush_threshold`) handles memory pressure; this bounds the
+        // replay window on a crash/OOM so progress sticks. 1000 mirrors the
+        // production IBD connect loop.
+        const DURABLE_FLUSH_EVERY: u32 = 1000;
+
+        let start_height = self.tip_height() + 1; // genesis already connected
+        let workers = self.num_threads.max(1);
+        let prefetch = crate::chain::prefetch::start_prefetcher(
+            self.store_ref().clone() as Arc<dyn crate::storage::Store + Send + Sync>,
+            self.blocks_dir().to_path_buf(),
+            start_height,
+            workers,
+            128, // lookahead blocks, matching the IBD connect loop
+            self.is_assumevalid_active(),
+            self.primary_engine(),
+        );
+
+        let mut height = start_height;
         while let Some(hash) = self.store.get_block_hash_by_height(height) {
-            let entry = self
-                .store
-                .get_block_index(&hash)
-                .ok_or(ChainError::BadPrevBlock)?;
-
-            let flat_pos = FlatFilePos {
-                file_number: entry.file_number,
-                data_pos: entry.data_pos,
-            };
-            let block = self
-                .read_block_direct(&flat_pos)
-                .ok_or(ChainError::FlatFile("cannot read block during reindex".into()))?;
-
-            let parent = self
-                .store
-                .get_block_index(&entry.header.prev_blockhash)
-                .ok_or(ChainError::BadPrevBlock)?;
-
-            let use_noop = self.should_skip_scripts(height);
-            let noop = NoopVerifier;
-            let verifier: &dyn ScriptVerifier =
-                if use_noop { &noop } else { &*self.script_verifier };
-
-            let mtp = self.get_median_time_past(height);
-            let batch = connect::connect_block(&connect::ConnectParams {
-                store: &*self.store,
-                block: &block,
-                height,
-                parent_chainwork: &parent.chainwork,
-                flat_pos,
-                script_verifier: verifier,
-                median_time_past: mtp,
-                network: self.network,
-                pre_verified_txs: None,
-                num_threads: self.num_threads,
-            precomputed_txids: None,
-            address_index: &self.address_index,
-            #[cfg(feature = "block-filter-index")]
-            filter_index: &self.filter_index,
-            phase_tracker: None,
-            })?;
-            self.store.write_batch(batch)?;
-
-            {
-                let mut tip = self.tip.write();
-                tip.hash = hash;
-                tip.height = height;
+            // Prefer the prefetched, pre-processed block; fall back to a
+            // direct read on a miss (cold start, or a worker behind the
+            // cursor). Both paths connect via `connect_block` directly,
+            // bypassing the `DataStored` precondition the IBD connect
+            // methods enforce — after `clear_chainstate` the block-index
+            // entries are still `Valid` from the original sync.
+            match prefetch.take_block(height) {
+                Some(pre) if pre.hash == hash => self.reindex_connect_prefetched(pre)?,
+                _ => self.reindex_connect_direct(height, hash)?,
             }
+            prefetch.advance_cursor(height + 1);
+            self.bump_connect_heartbeat();
 
-            // Emit a chain event so subscribers (events bus, future
-            // observers) see reindex progress just as they would IBD.
-            // No-op when the broadcaster isn't wired yet (the case
-            // during normal `-reindex-chainstate` startup); kept here so
-            // moving the wiring earlier needs no further change.
+            // Emit a chain event so subscribers see reindex progress as they
+            // would IBD. No-op when the broadcaster isn't wired yet (the
+            // normal `-reindex-chainstate` startup case).
             self.emit_chain_event(crate::chain::events::ChainEvent::BlockConnected {
                 hash,
                 height,
             });
 
-            // Bound memory: drain the in-memory dirty set to RocksDB
-            // whenever it crosses the configured threshold. Without
-            // this a full-chain reindex accumulated 122 GiB RSS at
-            // ~block 430k on mainnet before the OOM killer fired.
+            // Bound memory: drain the in-memory dirty set to RocksDB when it
+            // crosses the threshold (a full reindex once hit 122 GiB RSS at
+            // ~block 430k before the OOM killer fired).
             if self.store.dirty_count() > self.store.flush_threshold() {
                 self.store.flush()?;
             }
 
-            // Periodic durable checkpoint: bounds the replay window on
-            // a crash/OOM during a long reindex so progress sticks.
             if height.is_multiple_of(DURABLE_FLUSH_EVERY) {
                 self.store.flush()?;
                 self.store.flush_durable()?;
@@ -2394,6 +2393,7 @@ impl ChainState {
                     target,
                     "Reached -stopatheight during chainstate reindex; exiting"
                 );
+                prefetch.stop();
                 self.store.flush()?;
                 self.store.flush_durable()?;
                 return Ok(());
@@ -2401,6 +2401,7 @@ impl ChainState {
 
             height += 1;
         }
+        prefetch.stop();
         // Final flush so the reindexed tip is durable before we return.
         self.store.flush()?;
         self.store.flush_durable()?;
@@ -2408,6 +2409,97 @@ impl ChainState {
             p.set_current((height - 1) as u64);
         }
         tracing::info!(height = height - 1, "Chainstate reindex complete");
+        Ok(())
+    }
+
+    /// Connect a prefetched, pre-processed block during reindex. Reuses the
+    /// prefetcher's deserialized block, precomputed txids, and (in
+    /// assumevalid mode) speculatively pre-verified scripts. Does NOT check
+    /// `entry.status` — reindex replays `Valid` entries (see `reindex_replay`).
+    fn reindex_connect_prefetched(
+        &self,
+        pre: crate::chain::prefetch::PreprocessedBlock,
+    ) -> Result<(), ChainError> {
+        let use_noop = self.should_skip_scripts(pre.height);
+        let noop = NoopVerifier;
+        let verifier: &dyn ScriptVerifier =
+            if use_noop { &noop } else { &*self.script_verifier };
+        let pre_verified = if pre.script_verified_txs.is_empty() {
+            None
+        } else {
+            Some(&pre.script_verified_txs)
+        };
+        let batch = connect::connect_block(&connect::ConnectParams {
+            store: &*self.store,
+            block: &pre.block,
+            height: pre.height,
+            parent_chainwork: &pre.parent.chainwork,
+            flat_pos: pre.flat_pos,
+            script_verifier: verifier,
+            median_time_past: pre.mtp,
+            network: self.network,
+            pre_verified_txs: pre_verified,
+            num_threads: self.num_threads,
+            precomputed_txids: Some(&pre.txids),
+            address_index: &self.address_index,
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &self.filter_index,
+            phase_tracker: None,
+        })?;
+        self.store.write_batch(batch)?;
+        let mut tip = self.tip.write();
+        tip.hash = pre.hash;
+        tip.height = pre.height;
+        Ok(())
+    }
+
+    /// Connect a block during reindex by reading it directly from the flat
+    /// files (prefetch miss). Same connect path as
+    /// [`Self::reindex_connect_prefetched`], minus the prefetched extras.
+    fn reindex_connect_direct(&self, height: u32, hash: BlockHash) -> Result<(), ChainError> {
+        let entry = self
+            .store
+            .get_block_index(&hash)
+            .ok_or(ChainError::BadPrevBlock)?;
+        let flat_pos = FlatFilePos {
+            file_number: entry.file_number,
+            data_pos: entry.data_pos,
+        };
+        let block = self
+            .read_block_direct(&flat_pos)
+            .ok_or(ChainError::FlatFile("cannot read block during reindex".into()))?;
+        let parent = self
+            .store
+            .get_block_index(&entry.header.prev_blockhash)
+            .ok_or(ChainError::BadPrevBlock)?;
+
+        let use_noop = self.should_skip_scripts(height);
+        let noop = NoopVerifier;
+        let verifier: &dyn ScriptVerifier =
+            if use_noop { &noop } else { &*self.script_verifier };
+
+        let mtp = self.get_median_time_past(height);
+        let batch = connect::connect_block(&connect::ConnectParams {
+            store: &*self.store,
+            block: &block,
+            height,
+            parent_chainwork: &parent.chainwork,
+            flat_pos,
+            script_verifier: verifier,
+            median_time_past: mtp,
+            network: self.network,
+            pre_verified_txs: None,
+            num_threads: self.num_threads,
+            precomputed_txids: None,
+            address_index: &self.address_index,
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &self.filter_index,
+            phase_tracker: None,
+        })?;
+        self.store.write_batch(batch)?;
+        let mut tip = self.tip.write();
+        tip.hash = hash;
+        tip.height = height;
         Ok(())
     }
 
@@ -6135,6 +6227,55 @@ pub(crate) mod tests {
 
         // Verify correctness: tip is back at the last block.
         assert_eq!(cs.tip_height(), 1200);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reindex_chainstate_reproduces_utxo_set() {
+        // The pipelined reindex (prefetcher + BulkLoad) must rebuild a
+        // byte-identical UTXO set. Build a chain, snapshot its UTXO-set
+        // hash, wipe the chainstate (keeping the block index), replay, and
+        // compare. 300 blocks is long enough for the prefetch workers to
+        // run ahead of the connect cursor, so both the prefetched and
+        // direct-read connect paths are exercised.
+        let (cs, dir) = make_chain_state();
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+        let mut parent = genesis.block_hash();
+        for h in 1..=300u32 {
+            let block = build_test_block(parent, h, 1_300_000_000 + h);
+            parent = cs.accept_block(&block).unwrap();
+        }
+        cs.store.flush().unwrap();
+        let count_before = cs.coin_count();
+        let (hash_before, _) =
+            crate::storage::compressed_coin::hash_utxo_set(&*cs.store).unwrap();
+        assert_eq!(cs.tip_height(), 300);
+
+        // Wipe chainstate (block index is preserved) and reset the in-memory
+        // tip, mirroring `-reindex-chainstate` startup.
+        cs.store.clear_chainstate().unwrap();
+        {
+            let mut tip = cs.tip.write();
+            tip.hash = genesis.block_hash();
+            tip.height = 0;
+        }
+
+        cs.reindex_chainstate(None, None).unwrap();
+        cs.store.flush().unwrap();
+
+        assert_eq!(cs.tip_height(), 300, "reindex must restore the tip height");
+        assert_eq!(
+            cs.coin_count(),
+            count_before,
+            "coin count must match after reindex"
+        );
+        let (hash_after, _) =
+            crate::storage::compressed_coin::hash_utxo_set(&*cs.store).unwrap();
+        assert_eq!(
+            hash_after, hash_before,
+            "reindexed UTXO set must be byte-identical to the original"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
