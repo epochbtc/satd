@@ -585,7 +585,14 @@ async fn main() {
     // explicit request rather than silently falling back to a genesis IBD.
     let fast_start_path: Option<std::path::PathBuf> = if let Some(ref src) = config.fast_start {
         if fast_start::node_is_fresh(&chain_state, &net_datadir) {
-            match fast_start::download_phase(src, &net_datadir, startup_progress.clone()).await {
+            match fast_start::download_phase(
+                src,
+                &net_datadir,
+                startup_progress.clone(),
+                config.fast_start_sha256.as_deref(),
+            )
+            .await
+            {
                 Ok(path) => Some(path),
                 Err(e) => {
                     eprintln!("FATAL: --fast-start: {e}");

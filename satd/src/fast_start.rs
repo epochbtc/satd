@@ -88,74 +88,131 @@ pub fn node_is_fresh(chain_state: &ChainState, net_datadir: &Path) -> bool {
 /// progress through `progress`. Returns the local path of the snapshot
 /// (whether downloaded or operator-supplied) for [`load_when_ready`].
 ///
-/// Interruptible: a Ctrl+C / SIGTERM during the download aborts and returns
-/// an error so the caller can exit cleanly.
+/// If `expected_sha256` is set (operator-supplied, opt-in), the finished
+/// file's SHA-256 is checked before returning — a fast-fail guard that is
+/// independent of, and strictly weaker than, the mandatory anchor-hash
+/// verification done at load. Interruptible: a Ctrl+C / SIGTERM during the
+/// download aborts and returns an error so the caller can exit cleanly.
 pub async fn download_phase(
     raw_source: &str,
     net_datadir: &Path,
     progress: Arc<StartupProgress>,
+    expected_sha256: Option<&str>,
 ) -> Result<PathBuf, String> {
-    let source = Source::parse(raw_source)?;
-
-    match source {
+    let local_path = match Source::parse(raw_source)? {
         Source::Local(path) => {
             if !path.exists() {
                 return Err(format!("snapshot file not found: {}", path.display()));
             }
             tracing::info!(path = %path.display(), "fast-start: using local snapshot file");
-            Ok(path)
+            path
         }
         Source::Https(url) => {
             let dest = net_datadir.join(SNAPSHOT_FILENAME);
             progress.set_phase("fast_start_download", "Downloading AssumeUTXO snapshot");
+            download_with_retries(&url, &dest, &progress).await?
+        }
+    };
 
-            let mut sigterm =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                    .map_err(|e| format!("registering SIGTERM handler: {e}"))?;
+    if let Some(expected) = expected_sha256 {
+        verify_sha256(&local_path, expected).await?;
+    }
+    Ok(local_path)
+}
 
-            let mut last_err = String::new();
-            for attempt in 1..=MAX_DOWNLOAD_ATTEMPTS {
-                tracing::info!(
-                    attempt,
-                    max = MAX_DOWNLOAD_ATTEMPTS,
-                    url = %url,
-                    "fast-start: downloading snapshot (resumable)"
-                );
-                tokio::select! {
-                    res = download_once(&url, &dest, &progress) => {
-                        match res {
-                            Ok(()) => return Ok(dest),
-                            Err(e) => {
-                                last_err = e;
-                                tracing::warn!(attempt, error = %last_err, "fast-start: download attempt failed");
-                            }
-                        }
-                    }
-                    _ = tokio::signal::ctrl_c() => {
-                        return Err("interrupted by Ctrl+C during snapshot download".to_string());
-                    }
-                    _ = sigterm.recv() => {
-                        return Err("interrupted by SIGTERM during snapshot download".to_string());
-                    }
-                }
+/// Run [`download_once`] with bounded, resumable retries, interruptible by
+/// Ctrl+C / SIGTERM. Returns the destination path on success.
+async fn download_with_retries(
+    url: &str,
+    dest: &Path,
+    progress: &StartupProgress,
+) -> Result<PathBuf, String> {
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .map_err(|e| format!("registering SIGTERM handler: {e}"))?;
 
-                // Linear backoff before the next resume attempt, interruptible.
-                let backoff = Duration::from_secs(5 * attempt as u64);
-                tokio::select! {
-                    _ = tokio::time::sleep(backoff) => {}
-                    _ = tokio::signal::ctrl_c() => {
-                        return Err("interrupted by Ctrl+C during snapshot download".to_string());
-                    }
-                    _ = sigterm.recv() => {
-                        return Err("interrupted by SIGTERM during snapshot download".to_string());
+    let mut last_err = String::new();
+    for attempt in 1..=MAX_DOWNLOAD_ATTEMPTS {
+        tracing::info!(
+            attempt,
+            max = MAX_DOWNLOAD_ATTEMPTS,
+            url = %url,
+            "fast-start: downloading snapshot (resumable)"
+        );
+        tokio::select! {
+            res = download_once(url, dest, progress) => {
+                match res {
+                    Ok(()) => return Ok(dest.to_path_buf()),
+                    Err(e) => {
+                        last_err = e;
+                        tracing::warn!(attempt, error = %last_err, "fast-start: download attempt failed");
                     }
                 }
             }
-            Err(format!(
-                "snapshot download failed after {MAX_DOWNLOAD_ATTEMPTS} attempts: {last_err}"
-            ))
+            _ = tokio::signal::ctrl_c() => {
+                return Err("interrupted by Ctrl+C during snapshot download".to_string());
+            }
+            _ = sigterm.recv() => {
+                return Err("interrupted by SIGTERM during snapshot download".to_string());
+            }
+        }
+
+        // Linear backoff before the next resume attempt, interruptible.
+        let backoff = Duration::from_secs(5 * attempt as u64);
+        tokio::select! {
+            _ = tokio::time::sleep(backoff) => {}
+            _ = tokio::signal::ctrl_c() => {
+                return Err("interrupted by Ctrl+C during snapshot download".to_string());
+            }
+            _ = sigterm.recv() => {
+                return Err("interrupted by SIGTERM during snapshot download".to_string());
+            }
         }
     }
+    Err(format!(
+        "snapshot download failed after {MAX_DOWNLOAD_ATTEMPTS} attempts: {last_err}"
+    ))
+}
+
+/// Verify a file's SHA-256 against an operator-supplied hex digest. The
+/// hash is streamed on a blocking thread (a single sequential pass, cheap
+/// next to the load-time UTXO hashing). Compared on raw bytes to avoid any
+/// hex-display-order ambiguity.
+async fn verify_sha256(path: &Path, expected_hex: &str) -> Result<(), String> {
+    let expected = hex::decode(expected_hex)
+        .map_err(|_| "--fast-start-sha256 is not valid hex".to_string())?;
+    let path_buf = path.to_path_buf();
+    let actual = tokio::task::spawn_blocking(move || sha256_file(&path_buf))
+        .await
+        .map_err(|e| format!("sha256 task panicked: {e}"))??;
+    if actual.as_slice() != expected.as_slice() {
+        return Err(format!(
+            "--fast-start-sha256 mismatch: expected {expected_hex}, downloaded file is {}",
+            hex::encode(actual)
+        ));
+    }
+    tracing::info!("fast-start: snapshot SHA-256 matches --fast-start-sha256");
+    Ok(())
+}
+
+/// Streaming SHA-256 of a file. Blocking; call via `spawn_blocking`.
+fn sha256_file(path: &Path) -> Result<[u8; 32], String> {
+    use bitcoin::hashes::{Hash, HashEngine, sha256};
+    use std::io::Read;
+
+    let mut f = std::fs::File::open(path)
+        .map_err(|e| format!("opening {} for hashing: {e}", path.display()))?;
+    let mut engine = sha256::Hash::engine();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = f
+            .read(&mut buf)
+            .map_err(|e| format!("reading {} for hashing: {e}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        engine.input(&buf[..n]);
+    }
+    Ok(sha256::Hash::from_engine(engine).to_byte_array())
 }
 
 /// How to continue a download given what's already on disk and how the
@@ -262,6 +319,17 @@ async fn download_once(
     }
     file.sync_all()
         .map_err(|e| format!("fsync {} failed: {e}", dest.display()))?;
+
+    // Guard against a silently-short transfer: if the server told us the
+    // size, the file must match it. A mismatch errors this attempt; the
+    // bytes already written stay on disk so the retry resumes from them.
+    if let Some(expected_total) = plan.total
+        && written != expected_total
+    {
+        return Err(format!(
+            "incomplete download: wrote {written} of {expected_total} expected bytes"
+        ));
+    }
     Ok(())
 }
 
@@ -433,5 +501,29 @@ mod tests {
         // No Content-Length: total is unknown, but we still download.
         let p = resume_plan(0, false, None);
         assert_eq!(p, ResumePlan { append: false, total: None, start: 0 });
+    }
+
+    #[tokio::test]
+    async fn verify_sha256_accepts_matching_digest() {
+        let dir = std::env::temp_dir().join(format!("satd-fs-sha-ok-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("snap.dat");
+        std::fs::write(&path, b"hello world").unwrap();
+        // sha256("hello world")
+        let expected = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
+        assert!(verify_sha256(&path, expected).await.is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn verify_sha256_rejects_mismatch() {
+        let dir = std::env::temp_dir().join(format!("satd-fs-sha-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("snap.dat");
+        std::fs::write(&path, b"hello world").unwrap();
+        let wrong = "0000000000000000000000000000000000000000000000000000000000000000";
+        let err = verify_sha256(&path, wrong).await.unwrap_err();
+        assert!(err.contains("mismatch"), "got: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

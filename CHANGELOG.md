@@ -59,7 +59,11 @@ layout) per `STABILITY_POLICY.md`.
   background re-validation shows in `getchainstates`. Incompatible with
   `-prune`. On a node that already has chainstate the flag is a no-op, so
   it is safe to leave in a systemd unit. satd never fetches snapshots
-  over P2P and hosts none — the operator names a trusted source.
+  over P2P and hosts none — the operator names a trusted source. The
+  download is length-checked against the server's `Content-Length`, and an
+  optional `--fast-start-sha256=<hex>` fails fast if the file doesn't match
+  an operator-supplied digest (opt-in; the anchor-hash check at load is the
+  authoritative gate regardless).
 
 ### Packaging
 
