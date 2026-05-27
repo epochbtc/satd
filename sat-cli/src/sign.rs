@@ -130,16 +130,18 @@ pub fn sign_psbt(
     let prevouts: Vec<Option<TxOut>> = (0..psbt.inputs.len())
         .map(|i| input_prevout(psbt, i))
         .collect();
-    // Placeholder-filled prevout vector for taproot's Prevouts::All.
-    let all_prevouts: Vec<TxOut> = prevouts
-        .iter()
-        .map(|p| {
-            p.clone().unwrap_or(TxOut {
-                value: bitcoin::Amount::ZERO,
-                script_pubkey: ScriptBuf::new(),
-            })
-        })
-        .collect();
+    // Taproot key-spend (SIGHASH_DEFAULT) commits to EVERY input's amount and
+    // script via Prevouts::All, so we can only sign a taproot input when all
+    // prevouts are known. We must never fabricate placeholder prevouts — that
+    // would yield a signature over the wrong data while still marking the input
+    // signed. The real vector is built only when complete; otherwise taproot
+    // inputs are left unsigned and reported (see the per-input outcome below).
+    let all_prevouts_known = prevouts.iter().all(Option::is_some);
+    let all_prevouts: Vec<TxOut> = if all_prevouts_known {
+        prevouts.iter().map(|p| p.clone().unwrap()).collect()
+    } else {
+        Vec::new()
+    };
 
     let mut cache = SighashCache::new(&tx);
     for i in 0..psbt.inputs.len() {
@@ -155,6 +157,7 @@ pub fn sign_psbt(
             i,
             &prevout,
             &all_prevouts,
+            all_prevouts_known,
             &key_map,
             &xonly_key_map,
             &mut psbt.inputs[i],
@@ -192,14 +195,18 @@ pub fn sign_psbt(
             if !input.partial_sigs.is_empty() || input.tap_key_sig.is_some() {
                 return InputOutcome::Signed;
             }
-            if prevouts[i].is_none() {
+            let Some(prevout) = &prevouts[i] else {
                 return InputOutcome::MissingUtxo;
-            }
-            let script = &prevouts[i].as_ref().unwrap().script_pubkey;
-            if is_supported_script(script) {
-                InputOutcome::NoMatchingKey
-            } else {
+            };
+            let script = &prevout.script_pubkey;
+            if !is_supported_script(script) {
                 InputOutcome::Unsupported
+            } else if script.is_p2tr() && !all_prevouts_known {
+                // Taproot key-spend needs every prevout; a missing sibling
+                // means we couldn't sign even with the key.
+                InputOutcome::MissingUtxo
+            } else {
+                InputOutcome::NoMatchingKey
             }
         })
         .collect();
@@ -283,6 +290,7 @@ fn sign_input_wif(
     i: usize,
     prevout: &TxOut,
     all_prevouts: &[TxOut],
+    all_prevouts_known: bool,
     key_map: &HashMap<PublicKey, SecretKey>,
     xonly_key_map: &HashMap<XOnlyPublicKey, SecretKey>,
     input: &mut bitcoin::psbt::Input,
@@ -348,6 +356,12 @@ fn sign_input_wif(
             return;
         }
     } else if script.is_p2tr() {
+        // Refuse to sign a taproot key-spend unless every prevout is known —
+        // the sighash commits to all of them, so a missing sibling would make
+        // any signature we produce invalid.
+        if !all_prevouts_known {
+            return;
+        }
         let Ok(sighash) = cache.taproot_key_spend_signature_hash(
             i,
             &Prevouts::All(all_prevouts),
@@ -428,6 +442,60 @@ mod tests {
         assert_eq!(summary.per_input, vec![InputOutcome::Signed]);
         assert!(summary.complete());
         assert_eq!(psbt.inputs[0].partial_sigs.len(), 1);
+    }
+
+    #[test]
+    fn taproot_not_signed_when_sibling_prevout_missing() {
+        // SIGHASH_DEFAULT commits to every input's prevout. If a sibling input
+        // lacks its witness_utxo, our taproot input must NOT be signed (a
+        // fabricated placeholder would yield an invalid signature marked
+        // "signed"). It must be reported MissingUtxo instead.
+        let (pk, secp) = key(0x66);
+        let (xonly, _) = pk.public_key(&secp).inner.x_only_public_key();
+        let spk = ScriptBuf::new_p2tr(&secp, xonly, None);
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![
+                TxIn {
+                    previous_output: OutPoint {
+                        txid: bitcoin::Txid::from_slice(&[7u8; 32]).unwrap(),
+                        vout: 0,
+                    },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                },
+                TxIn {
+                    previous_output: OutPoint {
+                        txid: bitcoin::Txid::from_slice(&[8u8; 32]).unwrap(),
+                        vout: 0,
+                    },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                },
+            ],
+            output: vec![TxOut {
+                value: Amount::from_sat(1000),
+                script_pubkey: ScriptBuf::new_op_return([]),
+            }],
+        };
+        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(10_000),
+            script_pubkey: spk,
+        });
+        // input 1 intentionally has no witness_utxo (sibling prevout unknown).
+
+        let summary = sign_psbt(&mut psbt, &[pk], &[], 0);
+        assert!(
+            psbt.inputs[0].tap_key_sig.is_none(),
+            "must not fabricate a taproot signature over a missing sibling prevout"
+        );
+        assert_eq!(summary.per_input[0], InputOutcome::MissingUtxo);
+        assert_eq!(summary.per_input[1], InputOutcome::MissingUtxo);
+        assert!(!summary.complete());
     }
 
     #[test]
