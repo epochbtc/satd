@@ -34,7 +34,7 @@ fn test_regtest_getnetworkinfo() {
     let response = node.rpc_call("getnetworkinfo").unwrap();
     let result = &response["result"];
 
-    assert_eq!(result["subversion"], "/satd:0.1.0/");
+    assert_eq!(result["subversion"], node::USER_AGENT);
     assert_eq!(result["connections"], 0);
     assert_eq!(result["protocolversion"], 70016);
     assert_eq!(result["networkactive"], true);
@@ -485,7 +485,7 @@ fn test_getnetworkinfo_connections() {
     let response = node.rpc_call("getnetworkinfo").unwrap();
     let result = &response["result"];
     assert_eq!(result["connections"], 0);
-    assert_eq!(result["subversion"], "/satd:0.1.0/");
+    assert_eq!(result["subversion"], node::USER_AGENT);
     node.stop();
 }
 
