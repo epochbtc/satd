@@ -4180,6 +4180,33 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn getchaintxstats_window_interval_uses_median_time_past() {
+        // 13 blocks (heights 0..=12), one tx each, header times 600s apart
+        // (T + 600*h). Core measures window_interval as the MTP difference of
+        // the endpoint blocks, not the raw header-time difference.
+        let (cs, dir, _hashes) = chain_state_with_seeded_chain(&[1u32; 13]);
+        cs.backfill_chain_tx_counts().unwrap();
+
+        // Default window = min(30, 12) = 12 → start at genesis (height 0).
+        //   MTP(tip=12)   = median of heights [2..=12] = ts[7] = T + 4200
+        //   MTP(start=0)  = median of heights [0..=0]  = ts[0] = T
+        //   window_interval = 4200   (raw header diff would be 12*600 = 7200)
+        let stats = crate::rpc::blockchain::get_chain_tx_stats(&cs, None, None).unwrap();
+        assert_eq!(stats["window_final_block_height"], 12);
+        assert_eq!(stats["window_interval"].as_u64().unwrap(), 4200);
+        assert_ne!(
+            stats["window_interval"].as_u64().unwrap(),
+            7200,
+            "window_interval must be the MTP difference, not the raw header-time difference"
+        );
+        // window_tx_count = cum[12] - cum[0] = 13 - 1 = 12; txrate over MTP interval.
+        assert_eq!(stats["window_tx_count"].as_u64().unwrap(), 12);
+        let txrate = stats["txrate"].as_f64().unwrap();
+        assert!((txrate - 12.0 / 4200.0).abs() < 1e-12, "txrate {txrate}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn background_handoff_validates_and_drops_on_hash_match() {
         let (cs, dir) = make_chain_state();
         let n = 5u32;

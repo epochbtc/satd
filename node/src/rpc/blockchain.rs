@@ -666,11 +666,15 @@ pub fn get_chain_tx_stats(
     let start_hash = chain_state
         .get_block_hash_by_height(start_height)
         .ok_or("Start block not found")?;
-    let start_entry = chain_state
-        .get_block_index(&start_hash)
-        .ok_or("Start block not found")?;
 
-    let time_diff = final_entry.header.time.saturating_sub(start_entry.header.time);
+    // Core measures the window interval between the two blocks' median-time-past
+    // values (BIP113 MTP, which includes the block itself), not raw header
+    // timestamps. Our `get_median_time_past(h)` returns the median over heights
+    // [h-11, h-1] (the MTP applied when *connecting* height h), so the MTP *of*
+    // the block at height H is `get_median_time_past(H + 1)`. MTP is monotonic
+    // non-decreasing, so the final block's value is never below the start's.
+    let mtp_of = |height: u32| chain_state.get_median_time_past(height + 1);
+    let time_diff = mtp_of(final_height).saturating_sub(mtp_of(start_height));
 
     // Cumulative tx counts at the window endpoints. Either may be absent on an
     // AssumeUTXO node whose background validation hasn't reached that block.
@@ -680,7 +684,7 @@ pub fn get_chain_tx_stats(
     //   * `window_tx_count` — the difference of the two cumulatives; omitted
     //                         unless BOTH endpoints are known.
     //   * `txrate`          — omitted unless `window_tx_count` is present and the
-    //                         interval is positive.
+    //                         interval (MTP difference, computed above) is positive.
     // `window_interval` is always emitted here (window > 0).
     let final_cum = chain_state.cumulative_tx_count(&final_hash);
     let start_cum = chain_state.cumulative_tx_count(&start_hash);
