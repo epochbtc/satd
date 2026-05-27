@@ -636,15 +636,19 @@ pub fn get_chain_tx_stats(
     nblocks: Option<u32>,
     final_blockhash: Option<bitcoin::BlockHash>,
 ) -> Result<Value, String> {
-    // Resolve the window's final block.
+    // Resolve the window's final block (default = tip).
     let (final_hash, final_entry) = match final_blockhash {
         Some(hash) => {
             let entry = chain_state
                 .get_block_index(&hash)
                 .ok_or("Block not found")?;
-            // Must be on the active chain — `getchaintxstats` is undefined
-            // for side-chain blocks (Core: "Block is not in main chain").
-            if chain_state.get_block_hash_by_height(entry.height) != Some(hash) {
+            // Active-chain membership must be exact: the `height_hash` index is
+            // "best known at height" and can be clobbered by side-chain
+            // store_block/header paths (see the chain-state test
+            // `test_reorg_fork_point_immune_to_polluted_height_hash`), so it is
+            // NOT an active-chain oracle. Confirm authoritatively that the block
+            // is the tip's ancestor at its height (Core: CChain::Contains).
+            if chain_state.active_chain_hash_at_height(entry.height) != Some(hash) {
                 return Err("Block is not in main chain".to_string());
             }
             (hash, entry)
@@ -661,19 +665,48 @@ pub fn get_chain_tx_stats(
     if window == 0 {
         return Err("Window must be > 0".to_string());
     }
-
     let start_height = final_height - window;
-    let start_hash = chain_state
-        .get_block_hash_by_height(start_height)
-        .ok_or("Start block not found")?;
 
-    // Core measures the window interval between the two blocks' median-time-past
-    // values (BIP113 MTP, which includes the block itself), not raw header
-    // timestamps. Our `get_median_time_past(h)` returns the median over heights
-    // [h-11, h-1] (the MTP applied when *connecting* height h), so the MTP *of*
-    // the block at height H is `get_median_time_past(H + 1)`. MTP is monotonic
-    // non-decreasing, so the final block's value is never below the start's.
-    let mtp_of = |height: u32| chain_state.get_median_time_past(height + 1);
+    // Collect everything the window needs by walking back from the final block
+    // (verified active above, or the tip) via `prev_blockhash`: the start block
+    // hash and the per-height timestamps for both median-time-past windows. All
+    // ancestors of an active block are themselves active, so this is immune to
+    // height-index pollution — unlike `get_block_hash_by_height` /
+    // `get_median_time_past`, which read that index. We descend to the lowest
+    // height either MTP window touches.
+    let mtp_lowest = start_height.saturating_sub(10);
+    let mut ts_by_height: std::collections::HashMap<u32, u32> =
+        std::collections::HashMap::new();
+    ts_by_height.insert(final_height, final_entry.header.time);
+    let mut start_hash: Option<bitcoin::BlockHash> = None;
+    let mut cur = final_entry.header.prev_blockhash;
+    let mut h = final_height;
+    while h > mtp_lowest {
+        h -= 1;
+        let entry = chain_state
+            .get_block_index(&cur)
+            .ok_or("Block index entry missing while walking the active chain")?;
+        ts_by_height.insert(h, entry.header.time);
+        if h == start_height {
+            start_hash = Some(cur);
+        }
+        cur = entry.header.prev_blockhash;
+    }
+    let start_hash = start_hash.ok_or("Start block not found")?;
+
+    // Core measures the window interval between the two endpoint blocks'
+    // median-time-past values (BIP113 MTP, including the block itself), not raw
+    // header timestamps. MTP of a block at height H is the median of timestamps
+    // over heights [H-10, H] (clamped at genesis), matching the semantics of
+    // `get_median_time_past(H + 1)`. MTP is monotonic non-decreasing, so the
+    // final block's value is never below the start's.
+    let mtp_of = |height: u32| -> u32 {
+        let mut times: Vec<u32> = (height.saturating_sub(10)..=height)
+            .filter_map(|hh| ts_by_height.get(&hh).copied())
+            .collect();
+        times.sort_unstable();
+        times[times.len() / 2]
+    };
     let time_diff = mtp_of(final_height).saturating_sub(mtp_of(start_height));
 
     // Cumulative tx counts at the window endpoints. Either may be absent on an

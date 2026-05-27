@@ -1669,6 +1669,31 @@ impl ChainState {
         timestamps[timestamps.len() / 2]
     }
 
+    /// Authoritative active-chain lookup: the hash of the block at `height` on
+    /// the *active* chain, or `None` if `height` is above the tip.
+    ///
+    /// Unlike [`get_block_hash_by_height`](Self::get_block_hash_by_height),
+    /// which reads the `height_hash` index ("best known at height" — pollutable
+    /// by side-chain `store_block`/header paths, see
+    /// `test_reorg_fork_point_immune_to_polluted_height_hash`), this walks back
+    /// from the tip via `prev_blockhash`, so it never returns a side-chain
+    /// block. Use it where active-chain membership must be exact. Cost is
+    /// `O(tip_height - height)`; querying the tip itself is free.
+    pub fn active_chain_hash_at_height(&self, height: u32) -> Option<BlockHash> {
+        let (tip_hash, tip_height) = self.tip_snapshot();
+        if height > tip_height {
+            return None;
+        }
+        let mut cur = tip_hash;
+        let mut h = tip_height;
+        while h > height {
+            let entry = self.store.get_block_index(&cur)?;
+            cur = entry.header.prev_blockhash;
+            h -= 1;
+        }
+        Some(cur)
+    }
+
     /// Push a block's timestamp into the MTP cache after connection.
     pub fn push_mtp_cache(&self, height: u32, timestamp: u32) {
         let mut cache = self.mtp_cache.lock();
@@ -4001,6 +4026,10 @@ pub(crate) mod tests {
         let base_header = bitcoin::constants::genesis_block(Network::Regtest).header;
         let mut batch = crate::storage::StoreBatch::default();
         let mut hashes = Vec::new();
+        // Link each block to its predecessor via prev_blockhash so an
+        // active-chain ancestor walk (e.g. get_chain_tx_stats) resolves
+        // correctly; height 0 keeps the genesis (all-zeros) parent.
+        let mut prev_hash = base_header.prev_blockhash;
         for (h, &num_tx) in num_tx_by_height.iter().enumerate() {
             let mut arr = [0u8; 32];
             arr[0] = h as u8;
@@ -4011,6 +4040,8 @@ pub(crate) mod tests {
             );
             let mut header = base_header;
             header.time = 1_500_000_000 + h as u32 * 600;
+            header.prev_blockhash = prev_hash;
+            prev_hash = hash;
             let entry = BlockIndexEntry {
                 header,
                 height: h as u32,
@@ -5050,6 +5081,45 @@ pub(crate) mod tests {
         let err = crate::rpc::blockchain::get_chain_tx_stats(&cs, Some(1), Some(a2_hash))
             .unwrap_err();
         assert!(err.contains("not in main chain"), "got: {err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn getchaintxstats_rejects_blockhash_when_height_index_polluted() {
+        // Regression for the Round-2 review finding: getchaintxstats must use
+        // an authoritative active-chain check, not the pollutable height_hash
+        // index. A side block stored via store_block clobbers height_hash at
+        // its height even though the active chain is unchanged.
+        let (cs, dir) = make_chain_state();
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+
+        // Active chain: genesis -> A1 -> A2 (A1 is active at height 1).
+        let a1 = build_test_block(genesis_hash, 1, 1_300_000_001);
+        let a1_hash = cs.accept_block(&a1).expect("accept A1");
+        let a2 = build_test_block(a1_hash, 2, 1_300_000_002);
+        cs.accept_block(&a2).expect("accept A2");
+
+        // Store a side block at height 1; this clobbers height_hash[1] = B1.
+        let b1 = build_test_block(genesis_hash, 1, 1_300_000_010);
+        let b1_hash = b1.block_hash();
+        cs.store_block(&b1).expect("store B1");
+        assert_eq!(
+            cs.get_block_hash_by_height(1),
+            Some(b1_hash),
+            "test premise: store_block clobbers the height index"
+        );
+
+        // The side block must be rejected even though height_hash[1] == B1 …
+        let err = crate::rpc::blockchain::get_chain_tx_stats(&cs, Some(1), Some(b1_hash))
+            .unwrap_err();
+        assert!(err.contains("not in main chain"), "got: {err}");
+
+        // … and the genuinely-active A1 must be accepted even though the height
+        // index no longer points at it.
+        let ok = crate::rpc::blockchain::get_chain_tx_stats(&cs, Some(1), Some(a1_hash))
+            .expect("A1 is on the active chain");
+        assert_eq!(ok["window_final_block_height"], 1);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
