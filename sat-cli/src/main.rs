@@ -821,11 +821,15 @@ fn run_sign_with_signer(
         Ok(s) => s,
         Err(code) => return code,
     };
-    // Validate the PSBT locally before handing it to the signer.
-    if let Err(e) = sign::psbt_from_base64(&psbt_b64) {
-        eprintln!("error: {e}");
-        return 1;
-    }
+    // Parse the PSBT locally before handing it to the signer; keep it so we can
+    // verify the signer didn't alter the transaction.
+    let original = match sign::psbt_from_base64(&psbt_b64) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return 1;
+        }
+    };
 
     let argv = match signer::parse_signer_argv(signer) {
         Ok(a) => a,
@@ -855,6 +859,16 @@ fn run_sign_with_signer(
             return 1;
         }
     };
+
+    // A signer must only add signature data — never alter the transaction being
+    // signed. Reject a returned PSBT whose unsigned tx differs from what we sent,
+    // so a buggy or hostile signer can't substitute a different transaction.
+    if psbt.unsigned_tx != original.unsigned_tx {
+        eprintln!(
+            "error: signer returned a PSBT with a different unsigned transaction; refusing to emit it"
+        );
+        return 1;
+    }
 
     let summary = sign::summarize(&psbt);
     emit_result(&psbt, &summary)

@@ -3629,3 +3629,69 @@ fn test_e2e_signpsbtwithsigner_p2wpkh_roundtrip() {
 
     e2e.node.stop();
 }
+
+/// A signer must only add signatures, never substitute a different transaction.
+/// A hostile signer that returns a PSBT with a different unsigned tx must be
+/// rejected — sat-cli must not emit it.
+#[test]
+fn test_e2e_signpsbtwithsigner_rejects_tampered_psbt() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut e2e = E2eNode::boot_with(&[]);
+    let dest = DeterministicWallet::from_secret([0x56u8; 32]).address.to_string();
+    let dummy_txid = "0000000000000000000000000000000000000000000000000000000000000000";
+
+    // The PSBT we hand to the signer.
+    let a = e2e
+        .node
+        .rpc_call_with_params(
+            "createpsbt",
+            vec![serde_json::json!([{ "txid": dummy_txid, "vout": 0 }]), serde_json::json!({ &dest: 1.0 })],
+        )
+        .unwrap();
+    let psbt_a = a["result"].as_str().unwrap().to_string();
+
+    // A DIFFERENT transaction (different output amount) the signer will try to
+    // substitute in its response.
+    let b = e2e
+        .node
+        .rpc_call_with_params(
+            "createpsbt",
+            vec![serde_json::json!([{ "txid": dummy_txid, "vout": 0 }]), serde_json::json!({ &dest: 2.0 })],
+        )
+        .unwrap();
+    let psbt_b = b["result"].as_str().unwrap().to_string();
+
+    // Hostile signer: ignores its input and always returns psbt_b.
+    let script_path = e2e.node.datadir.join("tamper-signer.sh");
+    let script = format!(
+        "#!/bin/sh\n\
+         case \"$*\" in\n\
+         *enumerate*) printf '[{{\"fingerprint\":\"00000000\",\"name\":\"fake\"}}]'; exit 0 ;;\n\
+         esac\n\
+         printf '{{\"psbt\":\"%s\"}}' \"{psbt_b}\"\n",
+        psbt_b = psbt_b,
+    );
+    std::fs::write(&script_path, script).unwrap();
+    std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let out = sat_cli_for(&e2e.node)
+        .arg("signpsbtwithsigner")
+        .arg(&psbt_a)
+        .arg(format!("--signer={}", script_path.display()))
+        .output()
+        .expect("run signpsbtwithsigner");
+    assert_eq!(out.status.code(), Some(1), "tampered PSBT must be rejected");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("different unsigned transaction"),
+        "stderr should explain the rejection; got: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains(&psbt_b),
+        "the substituted PSBT must not be emitted on stdout"
+    );
+
+    e2e.node.stop();
+}
