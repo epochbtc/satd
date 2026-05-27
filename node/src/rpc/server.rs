@@ -498,7 +498,15 @@ pub async fn start(
     module.register_method("getchaintxstats", |params, ctx, _extensions| {
         let mut seq = params.sequence();
         let nblocks: Option<u32> = seq.optional_next().unwrap_or(None);
-        blockchain::get_chain_tx_stats(&ctx.chain_state, nblocks)
+        // Core's optional second arg: the block that ends the window.
+        let blockhash_str: Option<String> = seq.optional_next().unwrap_or(None);
+        let final_blockhash = match blockhash_str {
+            Some(s) => Some(s.parse::<bitcoin::BlockHash>().map_err(|e| {
+                ErrorObjectOwned::owned(-8, format!("invalid blockhash: {e}"), None::<()>)
+            })?),
+            None => None,
+        };
+        blockchain::get_chain_tx_stats(&ctx.chain_state, nblocks, final_blockhash)
             .map_err(|e| ErrorObjectOwned::owned(-1, e, None::<()>))
     })?;
 

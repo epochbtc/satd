@@ -53,6 +53,11 @@ pub struct CoinCache {
     height_hash_cache: Mutex<LruCache<u32, BlockHash>>,
     undo_cache: Mutex<LruCache<BlockHash, UndoData>>,
     tx_index_cache: Mutex<LruCache<Txid, BlockHash>>,
+    /// Read-through cache for cumulative tx counts written by the current
+    /// connect run but not yet flushed to the inner store, so
+    /// `getchaintxstats` sees the tip's count immediately after a block
+    /// connects. Falls back to the inner store on miss.
+    chain_tx_cache: Mutex<LruCache<BlockHash, u64>>,
     /// Dirty coin flush threshold (~25% of clean coin cap). Atomic so that
     /// `resize_clean()` can update it live — otherwise the node would keep
     /// accumulating dirty entries up to the original high-water mark after
@@ -100,6 +105,7 @@ impl CoinCache {
         let block_index_cap = (budget * 2 / 100) / 300; // 2% at ~300 bytes/entry
         let undo_cap = 1_000; // fixed — recent blocks only
         let tx_index_cap = (budget * 5 / 100) / 64; // 5% at ~64 bytes/entry
+        let chain_tx_cap = 8_192; // fixed — only the unflushed-block window
         let flush_threshold = (clean_cap / 4) as u32; // 25% of clean cap
 
         Self {
@@ -115,6 +121,7 @@ impl CoinCache {
             height_hash_cache: Mutex::new(lru(height_hash_cap)),
             undo_cache: Mutex::new(lru(undo_cap)),
             tx_index_cache: Mutex::new(lru(tx_index_cap.max(1))),
+            chain_tx_cache: Mutex::new(lru(chain_tx_cap)),
             flush_threshold: AtomicU32::new(flush_threshold),
             perf_dirty_hits: AtomicU64::new(0),
             perf_clean_hits: AtomicU64::new(0),
@@ -228,6 +235,7 @@ impl CoinCache {
             || !batch.height_hash_puts.is_empty()
             || !batch.undo_puts.is_empty()
             || !batch.tx_index_puts.is_empty()
+            || !batch.chain_tx_puts.is_empty()
             || has_filter_rows;
 
         if has_data {
@@ -470,6 +478,12 @@ impl Store for CoinCache {
                 ti.pop(txid);
             }
         }
+        {
+            let mut ctx = self.chain_tx_cache.lock();
+            for &(hash, count) in &batch.chain_tx_puts {
+                ctx.put(hash, count);
+            }
+        }
 
         // Non-coin operations:
         // - Without coins (store_block, accept_headers): write to backing store immediately
@@ -486,6 +500,7 @@ impl Store for CoinCache {
             || !batch.undo_puts.is_empty()
             || !batch.tx_index_puts.is_empty()
             || !batch.tx_index_removes.is_empty()
+            || !batch.chain_tx_puts.is_empty()
             || !batch.addr_funding_puts.is_empty()
             || !batch.addr_spending_puts.is_empty()
             || !batch.addr_funding_removes.is_empty()
@@ -518,6 +533,7 @@ impl Store for CoinCache {
                     undo_puts: batch.undo_puts,
                     tx_index_puts: batch.tx_index_puts,
                     tx_index_removes: batch.tx_index_removes,
+                    chain_tx_puts: batch.chain_tx_puts,
                     addr_funding_puts: batch.addr_funding_puts,
                     addr_spending_puts: batch.addr_spending_puts,
                     addr_funding_removes: batch.addr_funding_removes,
@@ -546,6 +562,7 @@ impl Store for CoinCache {
                 pending.undo_puts.extend(batch.undo_puts);
                 pending.tx_index_puts.extend(batch.tx_index_puts);
                 pending.tx_index_removes.extend(batch.tx_index_removes);
+                pending.chain_tx_puts.extend(batch.chain_tx_puts);
                 // Address-index, outpoint-spend, backfill-temp, and
                 // filter-index puts and removes all need last-writer-wins
                 // dedup by key (so connect→disconnect→connect or
@@ -616,6 +633,21 @@ impl Store for CoinCache {
         self.inner.get_undo(hash)
     }
 
+    fn get_cumulative_tx_count(&self, hash: &BlockHash) -> Option<u64> {
+        if let Some(&count) = self.chain_tx_cache.lock().get(hash) {
+            return Some(count);
+        }
+        self.inner.get_cumulative_tx_count(hash)
+    }
+
+    fn chain_tx_backfill_complete(&self) -> bool {
+        self.inner.chain_tx_backfill_complete()
+    }
+
+    fn mark_chain_tx_backfill_complete(&self) -> Result<(), StoreError> {
+        self.inner.mark_chain_tx_backfill_complete()
+    }
+
     /// Diagnostic delegation. The trait default returns Ok with zero
     /// rows, so without this passthrough the blockfile audit would
     /// silently report an empty `block_index` (same shape bug as
@@ -677,6 +709,7 @@ impl Store for CoinCache {
         self.height_hash_cache.lock().clear();
         self.undo_cache.lock().clear();
         self.tx_index_cache.lock().clear();
+        self.chain_tx_cache.lock().clear();
         self.inner.clear_chainstate()
     }
 
@@ -692,6 +725,7 @@ impl Store for CoinCache {
         self.height_hash_cache.lock().clear();
         self.undo_cache.lock().clear();
         self.tx_index_cache.lock().clear();
+        self.chain_tx_cache.lock().clear();
         self.inner.clear_all()
     }
 

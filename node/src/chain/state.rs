@@ -825,6 +825,12 @@ impl ChainState {
         let tip_batch = crate::storage::StoreBatch {
             tip: Some(anchor.blockhash),
             height_hash_puts: vec![(anchor.height, anchor.blockhash)],
+            // Seed the cumulative tx count at the snapshot base from the
+            // hardcoded anchor so getchaintxstats reports the correct
+            // chain-wide total immediately, before the background has
+            // validated any pre-snapshot blocks. Forward connects build on
+            // this; the background fills the genesis→base range over time.
+            chain_tx_puts: vec![(anchor.blockhash, anchor.nchaintx)],
             ..Default::default()
         };
         self.store.write_batch(tip_batch)?;
@@ -1409,6 +1415,13 @@ impl ChainState {
         self.store.get_block_hash_by_height(height)
     }
 
+    /// Cumulative transaction count through (and including) the given
+    /// block, or `None` if not yet recorded (e.g. a pre-snapshot block an
+    /// AssumeUTXO background hasn't validated). Backs `getchaintxstats`.
+    pub fn cumulative_tx_count(&self, hash: &BlockHash) -> Option<u64> {
+        self.store.get_cumulative_tx_count(hash)
+    }
+
     pub fn get_coin(&self, outpoint: &OutPoint) -> Option<Coin> {
         self.store.get_coin(outpoint)
     }
@@ -1751,6 +1764,111 @@ impl ChainState {
     /// at typical SSD bandwidth. The pass is skipped entirely when
     /// there are no holes above the tip, so a healthy node pays only
     /// the index walk.
+    /// One-shot, index-only backfill of the cumulative-tx-count CF
+    /// (`chain_tx`) for an upgraded datadir that predates it. Reads
+    /// `num_tx` from the existing block index — no block-body reads, no
+    /// re-validation — so it is cheap (minutes) and never a reindex.
+    /// Gated by the `chain_tx.backfill_complete` marker; a no-op once
+    /// stamped. Returns the number of block entries written.
+    ///
+    /// Walks the active chain's contiguous height range ending at the tip
+    /// downward to find its start, then applies cumulative counts upward.
+    /// The start is one of:
+    ///   * genesis (height 0) → cumulative begins at 0,
+    ///   * a height whose cumulative is already known (a prior partial run
+    ///     or a seeded snapshot base) → resume from it,
+    ///   * a snapshot base above genesis with a gap below (an AssumeUTXO
+    ///     node whose background hasn't filled genesis→base) → seed from
+    ///     the hardcoded anchor's `nchaintx`.
+    pub fn backfill_chain_tx_counts(&self) -> Result<u64, ChainError> {
+        if self.store.chain_tx_backfill_complete() {
+            return Ok(0);
+        }
+        let tip_height = self.tip_height();
+        if tip_height == 0 {
+            // Genesis-only (or empty): nothing to walk; connects maintain
+            // it going forward.
+            self.store.mark_chain_tx_backfill_complete()?;
+            return Ok(0);
+        }
+
+        // Collect (hash, num_tx) for the contiguous heights tip..start,
+        // descending, stopping at the first height whose cumulative is
+        // already known (resume point) or when we run off the bottom of
+        // the contiguous range.
+        let mut collected: Vec<(BlockHash, u64)> = Vec::new();
+        let mut resume_cum: Option<u64> = None; // cumulative just below the lowest collected height
+        let mut h = tip_height;
+        loop {
+            let Some(hash) = self.store.get_block_hash_by_height(h) else {
+                // Gap at h: the lowest collected height (h+1) is the chain
+                // start. Handled after the loop via the snapshot anchor.
+                break;
+            };
+            if let Some(c) = self.store.get_cumulative_tx_count(&hash) {
+                // Already known — this height is done; start above it.
+                resume_cum = Some(c);
+                break;
+            }
+            let entry = self.store.get_block_index(&hash).ok_or_else(|| {
+                ChainError::Storage(crate::storage::StoreError::Database(format!(
+                    "missing block index entry at height {h}"
+                )))
+            })?;
+            collected.push((hash, entry.num_tx as u64));
+            if h == 0 {
+                resume_cum = Some(0); // below genesis
+                break;
+            }
+            h -= 1;
+        }
+
+        // If we stopped on a gap (not genesis, not a known cumulative), the
+        // lowest collected block is a snapshot base; seed its cumulative
+        // from the hardcoded anchor. `anchor.nchaintx` is the count through
+        // (and including) the base, so seed the value *below* it.
+        if resume_cum.is_none() {
+            let (base_hash, base_num_tx) = *collected
+                .last()
+                .expect("loop pushes at least one entry before a gap break");
+            match crate::chain::assumeutxo::lookup_by_blockhash(self.network, &base_hash) {
+                Some(anchor) => resume_cum = Some(anchor.nchaintx.saturating_sub(base_num_tx)),
+                None => {
+                    // Active chain starts above genesis but the base isn't a
+                    // recognized anchor — can't seed. Leave the marker unset
+                    // so a later start retries; surface loudly.
+                    tracing::warn!(
+                        start_hash = %base_hash,
+                        "chain_tx backfill: active chain starts above genesis but its base is \
+                         not a recognized AssumeUTXO anchor; skipping (getchaintxstats.txcount \
+                         will omit until resolved)"
+                    );
+                    return Ok(0);
+                }
+            }
+        }
+
+        // Apply cumulative counts ascending, flushing in bounded chunks.
+        let mut cum = resume_cum.expect("resume_cum set above");
+        let mut written = 0u64;
+        let mut batch = crate::storage::StoreBatch::default();
+        const CHUNK: usize = 50_000;
+        for (hash, num_tx) in collected.into_iter().rev() {
+            cum += num_tx;
+            batch.chain_tx_puts.push((hash, cum));
+            written += 1;
+            if batch.chain_tx_puts.len() >= CHUNK {
+                self.store.write_batch(std::mem::take(&mut batch))?;
+            }
+        }
+        if !batch.chain_tx_puts.is_empty() {
+            self.store.write_batch(batch)?;
+        }
+        self.store.flush()?;
+        self.store.mark_chain_tx_backfill_complete()?;
+        Ok(written)
+    }
+
     pub fn repair_block_index_holes(&self) -> Result<RepairOutcome, ChainError> {
         use crate::storage::flatfile::FlatFilePos;
         let tip_height = self.tip_height();
@@ -3843,6 +3961,175 @@ pub(crate) mod tests {
         blocks
     }
 
+    /// Build a `ChainState` over an `InMemoryStore` pre-seeded with a fake
+    /// active chain: `num_tx_by_height[i]` is the tx count for the block at
+    /// height `i` (index 0 = genesis). No `chain_tx` rows are written, so
+    /// the resulting state mimics an upgraded datadir whose cumulative
+    /// index hasn't been backfilled. Returns the chain state, its temp dir,
+    /// and the per-height block hashes.
+    fn chain_state_with_seeded_chain(
+        num_tx_by_height: &[u32],
+    ) -> (ChainState, std::path::PathBuf, Vec<BlockHash>) {
+        let dir = std::env::temp_dir().join(format!(
+            "satd-chaintx-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let store = InMemoryStore::new();
+        let base_header = bitcoin::constants::genesis_block(Network::Regtest).header;
+        let mut batch = crate::storage::StoreBatch::default();
+        let mut hashes = Vec::new();
+        for (h, &num_tx) in num_tx_by_height.iter().enumerate() {
+            let mut arr = [0u8; 32];
+            arr[0] = h as u8;
+            arr[1] = (h >> 8) as u8;
+            arr[3] = 0x5A; // distinguish from real hashes
+            let hash = BlockHash::from_raw_hash(
+                bitcoin::hashes::sha256d::Hash::from_byte_array(arr),
+            );
+            let mut header = base_header;
+            header.time = 1_500_000_000 + h as u32 * 600;
+            let entry = BlockIndexEntry {
+                header,
+                height: h as u32,
+                status: BlockStatus::Valid,
+                num_tx,
+                file_number: 0,
+                data_pos: 0,
+                chainwork: [0u8; 32],
+            };
+            batch.block_index_puts.push((hash, entry));
+            batch.height_hash_puts.push((h as u32, hash));
+            hashes.push(hash);
+        }
+        batch.tip = Some(*hashes.last().unwrap());
+        store.write_batch(batch).unwrap();
+
+        let blocks_dir = dir.join("blocks");
+        let flat_files = FlatFileManager::new(&blocks_dir).unwrap();
+        let cs = ChainState::new(
+            Box::new(store),
+            flat_files,
+            Network::Regtest,
+            Box::new(NoopVerifier),
+            AssumeValid::Disabled,
+            450,
+            4,
+            Default::default(),
+            Default::default(),
+        )
+        .unwrap();
+        (cs, dir, hashes)
+    }
+
+    #[test]
+    fn cumulative_tx_count_tracks_connects() {
+        let (cs, dir) = make_chain_state();
+        let blocks = build_and_connect_chain(&cs, 5);
+
+        // Genesis carries 1 tx; expected cumulative climbs by each block's
+        // tx count. Verify per height against an independent running sum.
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+        let mut expected = genesis.txdata.len() as u64;
+        assert_eq!(cs.cumulative_tx_count(&genesis.block_hash()), Some(expected));
+        for (i, b) in blocks.iter().enumerate() {
+            expected += b.txdata.len() as u64;
+            assert_eq!(
+                cs.cumulative_tx_count(&b.block_hash()),
+                Some(expected),
+                "cumulative mismatch at connected block index {i}"
+            );
+        }
+        assert_eq!(cs.cumulative_tx_count(&cs.tip_hash()), Some(expected));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn backfill_chain_tx_counts_rebuilds_and_is_idempotent() {
+        // num_tx by height: genesis=1, then 2,3,4 → cumulative 1,3,6,10.
+        let (cs, dir, hashes) = chain_state_with_seeded_chain(&[1, 2, 3, 4]);
+        // Pre-backfill: no cumulative recorded.
+        assert_eq!(cs.cumulative_tx_count(&hashes[3]), None);
+
+        let written = cs.backfill_chain_tx_counts().unwrap();
+        assert_eq!(written, 4);
+        assert_eq!(cs.cumulative_tx_count(&hashes[0]), Some(1));
+        assert_eq!(cs.cumulative_tx_count(&hashes[1]), Some(3));
+        assert_eq!(cs.cumulative_tx_count(&hashes[2]), Some(6));
+        assert_eq!(cs.cumulative_tx_count(&hashes[3]), Some(10));
+
+        // Second run is a no-op (marker stamped).
+        assert_eq!(cs.backfill_chain_tx_counts().unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn getchaintxstats_reports_cumulative_and_honors_blockhash() {
+        let (cs, dir, hashes) = chain_state_with_seeded_chain(&[1, 2, 3, 4]);
+        cs.backfill_chain_tx_counts().unwrap();
+
+        // Default (tip): cumulative through height 3 = 10; window of 30 is
+        // clamped to height 3 → window sums heights 1..=3 = 2+3+4 = 9.
+        let tip_stats =
+            crate::rpc::blockchain::get_chain_tx_stats(&cs, None, None).unwrap();
+        assert_eq!(tip_stats["txcount"], 10);
+        assert_eq!(tip_stats["window_tx_count"], 9);
+        assert_eq!(tip_stats["window_final_block_height"], 3);
+
+        // Explicit historical blockhash (height 2): cumulative = 6, window
+        // of 2 sums heights 1..=2 = 2+3 = 5.
+        let hist =
+            crate::rpc::blockchain::get_chain_tx_stats(&cs, Some(2), Some(hashes[2])).unwrap();
+        assert_eq!(hist["txcount"], 6);
+        assert_eq!(hist["window_block_count"], 2);
+        assert_eq!(hist["window_tx_count"], 5);
+        assert_eq!(hist["window_final_block_height"], 2);
+
+        // An unknown block hash → error.
+        let bogus = BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+            [0xEE; 32],
+        ));
+        assert!(crate::rpc::blockchain::get_chain_tx_stats(&cs, None, Some(bogus)).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snapshot_seed_sets_cumulative_at_base() {
+        let (cs, dir) = make_chain_state();
+        let base_hash = BlockHash::from_raw_hash(
+            bitcoin::hashes::sha256d::Hash::from_byte_array([0x7E; 32]),
+        );
+        let anchor = crate::chain::assumeutxo::AssumeUtxoData {
+            height: 840_000,
+            blockhash: base_hash,
+            nchaintx: 1_009_000_000,
+            hash_serialized_3: [0u8; 32],
+        };
+        cs.adopt_snapshot_tip(&anchor).unwrap();
+        // The served snapshot tip reports the anchor's cumulative count
+        // immediately, before any background validation.
+        assert_eq!(cs.cumulative_tx_count(&base_hash), Some(1_009_000_000));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn getchaintxstats_omits_txcount_when_not_counted() {
+        // Seed a chain but do NOT backfill: cumulative is absent.
+        let (cs, dir, _hashes) = chain_state_with_seeded_chain(&[1, 2, 3, 4]);
+        let stats = crate::rpc::blockchain::get_chain_tx_stats(&cs, None, None).unwrap();
+        // Core omits txcount (and txrate) when the count isn't available;
+        // window_tx_count is still computed from per-block num_tx.
+        assert!(
+            stats.get("txcount").is_none(),
+            "txcount must be omitted when cumulative is unavailable, got: {stats}"
+        );
+        assert_eq!(stats["window_tx_count"], 9);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn background_handoff_validates_and_drops_on_hash_match() {
         let (cs, dir) = make_chain_state();
@@ -4649,6 +4936,44 @@ pub(crate) mod tests {
         assert_eq!(cs.get_block_hash_by_height(1), Some(b1_hash));
         assert_eq!(cs.get_block_hash_by_height(2), Some(b2_hash));
         assert_eq!(cs.get_block_hash_by_height(3), Some(b3_hash));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cumulative_tx_count_survives_reorg() {
+        let (cs, dir) = make_chain_state();
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+        let genesis_hash = genesis.block_hash();
+        let genesis_txs = genesis.txdata.len() as u64;
+
+        // Chain A: genesis -> A1 -> A2 (tip).
+        let a1 = build_test_block(genesis_hash, 1, 1_300_000_001);
+        let a1_hash = cs.accept_block(&a1).expect("accept A1");
+        let a2 = build_test_block(a1_hash, 2, 1_300_000_002);
+        let a2_hash = cs.accept_block(&a2).expect("accept A2");
+        assert_eq!(cs.tip_hash(), a2_hash);
+
+        // Chain B: genesis -> B1 -> B2 -> B3 outweighs A → reorg.
+        let b1 = build_test_block(genesis_hash, 1, 1_300_000_003);
+        let b1_hash = cs.accept_block(&b1).expect("accept B1");
+        let b2 = build_test_block(b1_hash, 2, 1_300_000_004);
+        let b2_hash = cs.accept_block(&b2).expect("accept B2");
+        let b3 = build_test_block(b2_hash, 3, 1_300_000_005);
+        let b3_hash = cs.accept_block(&b3).expect("accept B3");
+        assert_eq!(cs.tip_hash(), b3_hash);
+
+        // New tip's cumulative reflects the B chain from genesis.
+        let expected = genesis_txs
+            + b1.txdata.len() as u64
+            + b2.txdata.len() as u64
+            + b3.txdata.len() as u64;
+        assert_eq!(cs.cumulative_tx_count(&b3_hash), Some(expected));
+
+        // The orphaned A2 is off the active chain → getchaintxstats refuses it.
+        let err = crate::rpc::blockchain::get_chain_tx_stats(&cs, Some(1), Some(a2_hash))
+            .unwrap_err();
+        assert!(err.contains("not in main chain"), "got: {err}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

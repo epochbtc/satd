@@ -64,6 +64,11 @@ impl SplitStore {
             height_hash_removes: std::mem::take(&mut batch.height_hash_removes),
             tx_index_puts: std::mem::take(&mut batch.tx_index_puts),
             tx_index_removes: std::mem::take(&mut batch.tx_index_removes),
+            // Cumulative tx counts live with the block index in the shared
+            // store so the served (snapshot) chain and the background's
+            // genesis→base fills land in one CF — visible to getchaintxstats
+            // before and after handoff.
+            chain_tx_puts: std::mem::take(&mut batch.chain_tx_puts),
             ..StoreBatch::default()
         };
         (block_batch, batch)
@@ -78,6 +83,18 @@ impl Store for SplitStore {
 
     fn get_block_hash_by_height(&self, height: u32) -> Option<BlockHash> {
         self.block_store.get_block_hash_by_height(height)
+    }
+
+    fn get_cumulative_tx_count(&self, hash: &BlockHash) -> Option<u64> {
+        self.block_store.get_cumulative_tx_count(hash)
+    }
+
+    fn chain_tx_backfill_complete(&self) -> bool {
+        self.block_store.chain_tx_backfill_complete()
+    }
+
+    fn mark_chain_tx_backfill_complete(&self) -> Result<(), StoreError> {
+        self.block_store.mark_chain_tx_backfill_complete()
     }
 
     fn get_tx_location(&self, txid: &Txid) -> Option<BlockHash> {

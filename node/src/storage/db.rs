@@ -19,6 +19,8 @@ pub struct InMemoryStore {
     height_index: parking_lot::RwLock<std::collections::HashMap<u32, BlockHash>>,
     undo: parking_lot::RwLock<std::collections::HashMap<BlockHash, UndoData>>,
     tx_index: parking_lot::RwLock<std::collections::HashMap<Txid, BlockHash>>,
+    chain_tx: parking_lot::RwLock<std::collections::HashMap<BlockHash, u64>>,
+    chain_tx_backfill_complete: parking_lot::RwLock<bool>,
     addr_funding: parking_lot::RwLock<Vec<AddrFundingRow>>,
     addr_spending: parking_lot::RwLock<Vec<AddrSpendingRow>>,
     outpoint_spend: parking_lot::RwLock<std::collections::HashMap<OutPoint, SpendingRef>>,
@@ -49,6 +51,12 @@ impl InMemoryStore {
             height_index: parking_lot::RwLock::new(std::collections::HashMap::new()),
             undo: parking_lot::RwLock::new(std::collections::HashMap::new()),
             tx_index: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            chain_tx: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            // Default false so a manually-populated InMemoryStore behaves
+            // like an upgraded datadir (backfill runs); connect-driven test
+            // chains populate chain_tx directly, so the backfill is a no-op
+            // there regardless.
+            chain_tx_backfill_complete: parking_lot::RwLock::new(false),
             addr_funding: parking_lot::RwLock::new(Vec::new()),
             addr_spending: parking_lot::RwLock::new(Vec::new()),
             outpoint_spend: parking_lot::RwLock::new(std::collections::HashMap::new()),
@@ -92,6 +100,19 @@ impl Store for InMemoryStore {
         self.height_index.read().get(&height).copied()
     }
 
+    fn get_cumulative_tx_count(&self, hash: &BlockHash) -> Option<u64> {
+        self.chain_tx.read().get(hash).copied()
+    }
+
+    fn chain_tx_backfill_complete(&self) -> bool {
+        *self.chain_tx_backfill_complete.read()
+    }
+
+    fn mark_chain_tx_backfill_complete(&self) -> Result<(), StoreError> {
+        *self.chain_tx_backfill_complete.write() = true;
+        Ok(())
+    }
+
     fn write_batch(&self, batch: StoreBatch) -> Result<(), StoreError> {
         let mut bi = self.block_index.write();
         let mut coins = self.coins.write();
@@ -99,6 +120,7 @@ impl Store for InMemoryStore {
         let mut hi = self.height_index.write();
         let mut undo = self.undo.write();
         let mut txi = self.tx_index.write();
+        let mut ctx = self.chain_tx.write();
 
         for (hash, entry) in batch.block_index_puts {
             bi.insert(hash, entry);
@@ -126,6 +148,9 @@ impl Store for InMemoryStore {
         }
         for txid in batch.tx_index_removes {
             txi.remove(&txid);
+        }
+        for (hash, count) in batch.chain_tx_puts {
+            ctx.insert(hash, count);
         }
         if !batch.addr_funding_puts.is_empty() || !batch.addr_funding_removes.is_empty() {
             let mut af = self.addr_funding.write();
@@ -282,6 +307,7 @@ impl Store for InMemoryStore {
         self.coins.write().clear();
         self.undo.write().clear();
         self.tx_index.write().clear();
+        self.chain_tx.write().clear();
         self.addr_funding.write().clear();
         self.addr_spending.write().clear();
         self.outpoint_spend.write().clear();
@@ -301,6 +327,7 @@ impl Store for InMemoryStore {
         self.coins.write().clear();
         self.undo.write().clear();
         self.tx_index.write().clear();
+        self.chain_tx.write().clear();
         self.addr_funding.write().clear();
         self.addr_spending.write().clear();
         self.outpoint_spend.write().clear();

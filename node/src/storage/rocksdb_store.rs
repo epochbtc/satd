@@ -20,6 +20,14 @@ const CF_HEIGHT_INDEX: &str = "height_index";
 pub(crate) const CF_UNDO: &str = "undo";
 const CF_TX_INDEX: &str = "tx_index";
 const CF_METADATA: &str = "metadata";
+/// Cumulative-transaction-count index: `block_hash -> u64_le`. The value
+/// is the number of transactions in the chain through (and including)
+/// that block. Written by `connect_block` for active-chain blocks and by
+/// the AssumeUTXO snapshot seed; backed by a one-shot startup backfill on
+/// upgraded datadirs. Consumed by `getchaintxstats`. Hash-keyed, so a
+/// reorg needs no deletion — a stale block's value stays correct for that
+/// block and is simply not on the active chain.
+const CF_CHAIN_TX: &str = "chain_tx";
 /// Address-history CFs. The `_v2` suffix is fossilized in the on-disk
 /// schema (legacy `addr_funding` / `addr_spending` were dropped in the
 /// storage-format-cleanup PR); keys carry a 16-byte scripthash prefix
@@ -77,6 +85,11 @@ const OUTPOINT_SPEND_COMPLETE_KEY: &[u8] = b"outpoint_spend.complete";
 /// has historical block-index entries but the tx_index CF is empty
 /// (the operator previously ran with `txindex=0`). (Round-3 H1.)
 const TX_INDEX_COMPLETE_KEY: &[u8] = b"tx_index.complete";
+/// `chain_tx.backfill_complete` metadata flag. True once the one-shot
+/// cumulative-tx-count backfill has populated `CF_CHAIN_TX` for the
+/// active chain. Absent/false on an upgraded datadir before the backfill
+/// runs; stamped true on fresh datadirs and after the backfill completes.
+const CHAIN_TX_BACKFILL_COMPLETE_KEY: &[u8] = b"chain_tx.backfill_complete";
 /// Persisted "address-history index is complete for the active chain"
 /// marker. Mirrors `TX_INDEX_COMPLETE_KEY` — set true after a clean
 /// backfill (or on fresh datadirs that started with addressindex=1
@@ -359,6 +372,11 @@ impl RocksDbStore {
             ColumnFamilyDescriptor::new(CF_UNDO, make_cf_opts(false, 16, None, true)),
             ColumnFamilyDescriptor::new(CF_TX_INDEX, make_cf_opts(false, 16, None, false)),
             ColumnFamilyDescriptor::new(CF_METADATA, make_cf_opts(false, 2, None, false)),
+            // chain_tx: one 8-byte row per block (block_hash -> cumulative
+            // tx count). Small, point-lookup only (getchaintxstats), no
+            // prefix scans. Modest write-buffer; no bloom needed at this
+            // row count.
+            ColumnFamilyDescriptor::new(CF_CHAIN_TX, make_cf_opts(false, 2, None, false)),
             // Address-history index. Bloom on for fast point lookups,
             // 32 MB write-buffer because per-block emission is write-
             // heavy during IBD, and a fixed 16-byte prefix-extractor so
@@ -671,6 +689,28 @@ impl RocksDbStore {
             store.write_address_index_complete(!block_index_has_rows)?;
         }
 
+        // chain_tx.backfill_complete marker. Same three open-time states:
+        //   - Fresh datadir (no block_index rows) → stamp true; connects
+        //     populate chain_tx from genesis, no backfill needed.
+        //   - Upgraded datadir (block_index has rows, marker absent) →
+        //     stamp false so the one-shot startup backfill runs.
+        //   - Marker already present → leave it (the backfill / clear_*
+        //     paths own it thereafter).
+        if store.read_chain_tx_backfill_complete().is_none() {
+            let block_index_has_rows = store
+                .db
+                .cf_handle(CF_BLOCK_INDEX)
+                .and_then(|cf| {
+                    store
+                        .db
+                        .iterator_cf(&cf, IteratorMode::Start)
+                        .next()
+                        .map(|item| item.is_ok())
+                })
+                .unwrap_or(false);
+            store.write_chain_tx_backfill_complete(!block_index_has_rows)?;
+        }
+
         // block_filter_index.complete marker — same shape as the
         // address-index marker above. Three reachable open-time states:
         //
@@ -775,6 +815,24 @@ impl RocksDbStore {
             .ok_or_else(|| StoreError::Database("metadata CF missing".into()))?;
         self.db
             .put_cf(&cf, TX_INDEX_COMPLETE_KEY, [u8::from(value)])
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    fn read_chain_tx_backfill_complete(&self) -> Option<bool> {
+        let cf = self.db.cf_handle(CF_METADATA)?;
+        match self.db.get_cf(&cf, CHAIN_TX_BACKFILL_COMPLETE_KEY) {
+            Ok(Some(v)) => v.first().map(|b| *b != 0),
+            _ => None,
+        }
+    }
+
+    fn write_chain_tx_backfill_complete(&self, value: bool) -> Result<(), StoreError> {
+        let cf = self
+            .db
+            .cf_handle(CF_METADATA)
+            .ok_or_else(|| StoreError::Database("metadata CF missing".into()))?;
+        self.db
+            .put_cf(&cf, CHAIN_TX_BACKFILL_COMPLETE_KEY, [u8::from(value)])
             .map_err(|e| StoreError::Database(e.to_string()))
     }
 
@@ -1063,6 +1121,13 @@ impl Store for RocksDbStore {
         hash_from_bytes(&value)
     }
 
+    fn get_cumulative_tx_count(&self, hash: &BlockHash) -> Option<u64> {
+        let cf = self.cf(CF_CHAIN_TX);
+        let value = self.db.get_cf(&cf, hash_bytes(hash)).ok()??;
+        let arr: [u8; 8] = value.as_slice().try_into().ok()?;
+        Some(u64::from_le_bytes(arr))
+    }
+
     fn write_batch(&self, batch: StoreBatch) -> Result<(), StoreError> {
         self.write_batch_mode(batch, WriteMode::Normal)
     }
@@ -1246,6 +1311,16 @@ impl Store for RocksDbStore {
             }
             for txid in &batch.tx_index_removes {
                 wb.delete_cf(&cf_txi, txid_bytes(txid));
+            }
+        }
+
+        // Cumulative tx count (chain_tx). Always written when present —
+        // unlike tx_index it is not gated on a runtime flag. Hash-keyed,
+        // so there are no removals on disconnect.
+        if !batch.chain_tx_puts.is_empty() {
+            let cf_ctx = self.cf(CF_CHAIN_TX);
+            for (block_hash, count) in &batch.chain_tx_puts {
+                wb.put_cf(&cf_ctx, hash_bytes(block_hash), count.to_le_bytes());
             }
         }
 
@@ -1689,6 +1764,10 @@ impl Store for RocksDbStore {
         cfs.push(CF_ADDR_FUNDING_V2);
         cfs.push(CF_ADDR_SPENDING_V2);
         cfs.push(CF_OUTPOINT_SPEND);
+        // Cumulative-tx-count index: rebuilt from genesis by the reindex
+        // replay's connect_block calls, so clear it here and re-stamp the
+        // backfill marker below (same reasoning as tx_index).
+        cfs.push(CF_CHAIN_TX);
         // Same reasoning for the BIP 158 filter index: -reindex-chainstate
         // is going to rebuild filters from genesis via the normal
         // connect_block emit path.
@@ -1717,6 +1796,9 @@ impl Store for RocksDbStore {
         self.write_outpoint_spend_complete(true)?;
         self.write_tx_index_complete(true)?;
         self.write_address_index_complete(true)?;
+        // The reindex replay repopulates chain_tx from genesis via
+        // connect_block, so the cumulative index is complete afterward.
+        self.write_chain_tx_backfill_complete(true)?;
         #[cfg(feature = "block-filter-index")]
         self.write_block_filter_index_complete(true)?;
         Ok(())
@@ -1733,6 +1815,7 @@ impl Store for RocksDbStore {
             CF_ADDR_FUNDING_V2,
             CF_ADDR_SPENDING_V2,
             CF_OUTPOINT_SPEND,
+            CF_CHAIN_TX,
         ];
         #[cfg(feature = "block-filter-index")]
         {
@@ -1747,11 +1830,12 @@ impl Store for RocksDbStore {
         self.drop_backfill_temp_cf()?;
         // Re-stamp schema version after metadata CF was recreated
         Self::stamp_schema(&self.db, CURRENT_SCHEMA_VERSION)?;
-        // Same three completeness markers as `clear_chainstate` —
+        // Same completeness markers as `clear_chainstate` —
         // see comment there for the round-2-review H2 rationale.
         self.write_outpoint_spend_complete(true)?;
         self.write_tx_index_complete(true)?;
         self.write_address_index_complete(true)?;
+        self.write_chain_tx_backfill_complete(true)?;
         #[cfg(feature = "block-filter-index")]
         self.write_block_filter_index_complete(true)?;
         Ok(())
@@ -1971,6 +2055,16 @@ impl Store for RocksDbStore {
 
     fn tx_index_complete(&self) -> bool {
         self.read_tx_index_complete().unwrap_or(false)
+    }
+
+    fn chain_tx_backfill_complete(&self) -> bool {
+        // Default false when the marker is missing so the one-shot
+        // backfill runs on an upgraded datadir that predates this CF.
+        self.read_chain_tx_backfill_complete().unwrap_or(false)
+    }
+
+    fn mark_chain_tx_backfill_complete(&self) -> Result<(), StoreError> {
+        self.write_chain_tx_backfill_complete(true)
     }
 
     fn address_index_complete(&self) -> bool {

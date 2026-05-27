@@ -623,23 +623,44 @@ pub fn get_chain_tips(chain_state: &ChainState) -> Value {
 }
 
 /// `getchaintxstats` — return tx rate statistics over a window.
+///
+/// `final_blockhash` is Bitcoin Core's optional second argument: the block
+/// that *ends* the window (default = chain tip). `txcount` is the cumulative
+/// chain-wide transaction total through that block; it is omitted when not
+/// yet recorded (e.g. a pre-snapshot block on an AssumeUTXO node whose
+/// background validation hasn't reached it) — matching Core.
 pub fn get_chain_tx_stats(
     chain_state: &ChainState,
     nblocks: Option<u32>,
+    final_blockhash: Option<bitcoin::BlockHash>,
 ) -> Result<Value, String> {
-    let tip_height = chain_state.tip_height();
-    let window = nblocks.unwrap_or(30).min(tip_height);
+    // Resolve the window's final block.
+    let (final_hash, final_entry) = match final_blockhash {
+        Some(hash) => {
+            let entry = chain_state
+                .get_block_index(&hash)
+                .ok_or("Block not found")?;
+            // Must be on the active chain — `getchaintxstats` is undefined
+            // for side-chain blocks (Core: "Block is not in main chain").
+            if chain_state.get_block_hash_by_height(entry.height) != Some(hash) {
+                return Err("Block is not in main chain".to_string());
+            }
+            (hash, entry)
+        }
+        None => {
+            let hash = chain_state.tip_hash();
+            let entry = chain_state.get_block_index(&hash).ok_or("Tip not found")?;
+            (hash, entry)
+        }
+    };
+    let final_height = final_entry.height;
 
+    let window = nblocks.unwrap_or(30).min(final_height);
     if window == 0 {
         return Err("Window must be > 0".to_string());
     }
 
-    let tip_hash = chain_state.tip_hash();
-    let tip_entry = chain_state
-        .get_block_index(&tip_hash)
-        .ok_or("Tip not found")?;
-
-    let start_height = tip_height.saturating_sub(window);
+    let start_height = final_height - window;
     let start_hash = chain_state
         .get_block_hash_by_height(start_height)
         .ok_or("Start block not found")?;
@@ -647,32 +668,42 @@ pub fn get_chain_tx_stats(
         .get_block_index(&start_hash)
         .ok_or("Start block not found")?;
 
-    // Count transactions in the window
-    let mut tx_count: u64 = 0;
-    for h in (start_height + 1)..=tip_height {
+    // Window tx count: summed from per-block `num_tx` over the window, so
+    // it is available regardless of whether the cumulative count is.
+    let mut window_tx_count: u64 = 0;
+    for h in (start_height + 1)..=final_height {
         if let Some(hash) = chain_state.get_block_hash_by_height(h)
-            && let Some(entry) = chain_state.get_block_index(&hash) {
-                tx_count += entry.num_tx as u64;
-            }
+            && let Some(entry) = chain_state.get_block_index(&hash)
+        {
+            window_tx_count += entry.num_tx as u64;
+        }
     }
 
-    let time_diff = tip_entry.header.time.saturating_sub(start_entry.header.time);
+    let time_diff = final_entry.header.time.saturating_sub(start_entry.header.time);
     let tx_rate = if time_diff > 0 {
-        tx_count as f64 / time_diff as f64
+        window_tx_count as f64 / time_diff as f64
     } else {
         0.0
     };
 
-    Ok(json!({
-        "time": tip_entry.header.time,
-        "txcount": tx_count,
-        "window_final_block_hash": tip_hash.to_string(),
-        "window_final_block_height": tip_height,
-        "window_block_count": window,
-        "window_tx_count": tx_count,
-        "window_interval": time_diff,
-        "txrate": tx_rate,
-    }))
+    let mut obj = serde_json::Map::new();
+    obj.insert("time".to_string(), json!(final_entry.header.time));
+    if let Some(txcount) = chain_state.cumulative_tx_count(&final_hash) {
+        obj.insert("txcount".to_string(), json!(txcount));
+    }
+    obj.insert(
+        "window_final_block_hash".to_string(),
+        json!(final_hash.to_string()),
+    );
+    obj.insert(
+        "window_final_block_height".to_string(),
+        json!(final_height),
+    );
+    obj.insert("window_block_count".to_string(), json!(window));
+    obj.insert("window_tx_count".to_string(), json!(window_tx_count));
+    obj.insert("window_interval".to_string(), json!(time_diff));
+    obj.insert("txrate".to_string(), json!(tx_rate));
+    Ok(Value::Object(obj))
 }
 
 /// `getmempoolancestors` — return in-mempool ancestors of a transaction.
