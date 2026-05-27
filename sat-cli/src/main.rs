@@ -25,6 +25,8 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+mod sign;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "sat-cli",
@@ -107,6 +109,17 @@ enum Cmd {
     Debug {
         #[command(subcommand)]
         sub: DebugCmd,
+    },
+    /// Sign a base64 PSBT locally with key(s) read from STDIN. The key is
+    /// never sent over RPC — signing happens entirely in the client. Emits
+    /// the signed PSBT (base64) on stdout; feed it to `finalizepsbt`.
+    #[command(name = "signpsbtwithkey")]
+    SignPsbtWithKey {
+        /// PSBT to sign (base64). Omit to read from --psbt-file.
+        psbt: Option<String>,
+        /// Read the PSBT (base64) from this file instead of the argument.
+        #[arg(long)]
+        psbt_file: Option<PathBuf>,
     },
     /// Bitcoin-Core-compatible raw RPC passthrough. Captures unknown
     /// subcommands so `sat-cli getblockchaininfo` still works.
@@ -255,6 +268,9 @@ fn resolve_cmd(cmd: &Cmd) -> (String, Vec<serde_json::Value>) {
         Cmd::Debug { sub } => match sub {
             DebugCmd::BlockfileAudit => ("getblockfileaudit".into(), vec![]),
         },
+        Cmd::SignPsbtWithKey { .. } => {
+            unreachable!("signpsbtwithkey is handled locally before RPC dispatch")
+        }
         Cmd::Raw(args) => {
             let mut it = args.iter();
             let method = it.next().cloned().unwrap_or_default();
@@ -520,6 +536,12 @@ async fn main() {
         }
     };
 
+    // `signpsbtwithkey` signs locally and makes no RPC call — handle it before
+    // any RPC credential/connection setup so a missing cookie can't block it.
+    if let Cmd::SignPsbtWithKey { psbt, psbt_file } = &cli.command {
+        std::process::exit(run_sign(psbt.as_deref(), psbt_file.as_deref()));
+    }
+
     let rpcport = cli.rpcport.unwrap_or({
         if cli.regtest {
             18443
@@ -641,6 +663,112 @@ async fn main() {
 
 fn is_connection_error(e: &reqwest::Error) -> bool {
     e.is_connect() || e.is_request()
+}
+
+/// Read one or more private keys. When stdin is a terminal, prompt without echo
+/// (single key). When piped, read newline-separated keys. Key text is held in
+/// `Zeroizing` so it is wiped from memory on drop.
+fn read_keys() -> Result<zeroize::Zeroizing<Vec<String>>, String> {
+    use std::io::{IsTerminal, Read};
+    let stdin = std::io::stdin();
+    if stdin.is_terminal() {
+        let key = rpassword::prompt_password("Private key (WIF or xpriv): ")
+            .map_err(|e| format!("failed to read key: {e}"))?;
+        Ok(zeroize::Zeroizing::new(vec![key]))
+    } else {
+        let mut buf = zeroize::Zeroizing::new(String::new());
+        stdin
+            .lock()
+            .read_to_string(&mut buf)
+            .map_err(|e| format!("failed to read stdin: {e}"))?;
+        let keys = buf
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
+        Ok(zeroize::Zeroizing::new(keys))
+    }
+}
+
+/// Handle `signpsbtwithkey`. Returns the process exit code:
+/// `0` all inputs signed, `2` partial (PSBT still emitted), `1` hard error.
+fn run_sign(psbt_arg: Option<&str>, psbt_file: Option<&std::path::Path>) -> i32 {
+    use std::str::FromStr;
+
+    let psbt_b64 = match (psbt_arg, psbt_file) {
+        (Some(s), _) => s.to_string(),
+        (None, Some(p)) => match std::fs::read_to_string(p) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("error: cannot read PSBT file {}: {e}", p.display());
+                return 1;
+            }
+        },
+        (None, None) => {
+            eprintln!("error: provide a PSBT as an argument or via --psbt-file");
+            return 1;
+        }
+    };
+
+    let mut psbt = match sign::psbt_from_base64(&psbt_b64) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return 1;
+        }
+    };
+
+    let key_lines = match read_keys() {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return 1;
+        }
+    };
+    if key_lines.is_empty() {
+        eprintln!("error: no private key provided on stdin");
+        return 1;
+    }
+
+    let mut wif_keys = Vec::new();
+    let mut xprivs = Vec::new();
+    for line in key_lines.iter() {
+        if let Ok(pk) = bitcoin::PrivateKey::from_wif(line) {
+            wif_keys.push(pk);
+        } else if let Ok(xp) = bitcoin::bip32::Xpriv::from_str(line) {
+            xprivs.push(xp);
+        } else {
+            eprintln!("error: input is neither a valid WIF private key nor an xpriv");
+            return 1;
+        }
+    }
+
+    let summary = sign::sign_psbt(&mut psbt, &wif_keys, &xprivs);
+    drop(wif_keys);
+    drop(xprivs);
+
+    // Signed PSBT on stdout (pipeable into finalizepsbt); report on stderr.
+    println!("{}", sign::psbt_to_base64(&psbt));
+    for (i, outcome) in summary.per_input.iter().enumerate() {
+        eprintln!("input {i}: {}", outcome.as_str());
+    }
+
+    if summary.complete() {
+        0
+    } else {
+        let unsigned = summary
+            .per_input
+            .iter()
+            .filter(|o| {
+                !matches!(
+                    o,
+                    sign::InputOutcome::Signed | sign::InputOutcome::AlreadyFinal
+                )
+            })
+            .count();
+        eprintln!("warning: {unsigned} input(s) not signed; emitted partial PSBT");
+        2
+    }
 }
 
 fn read_cookie_file(path: &std::path::Path) -> Result<(String, String), String> {
