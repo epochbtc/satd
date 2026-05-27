@@ -26,6 +26,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 mod sign;
+mod signer;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -125,6 +126,25 @@ enum Cmd {
         /// derivation metadata.
         #[arg(long, default_value_t = 100)]
         gap: u32,
+    },
+    /// Sign a base64 PSBT with an external signer (HWI / Bitcoin-Core
+    /// compatible). Spawns the `--signer` command locally; the key stays in
+    /// that process and is never sent over RPC. Emits the signed PSBT (base64)
+    /// on stdout; feed it to `finalizepsbt`.
+    #[command(name = "signpsbtwithsigner")]
+    SignPsbtWithSigner {
+        /// PSBT to sign (base64). Omit to read from --psbt-file.
+        psbt: Option<String>,
+        /// Read the PSBT (base64) from this file instead of the argument.
+        #[arg(long)]
+        psbt_file: Option<PathBuf>,
+        /// External signer command, e.g. "hwi" or "python3 -m hwilib".
+        #[arg(long)]
+        signer: String,
+        /// Device fingerprint (8 hex). If omitted, the signer is enumerated and
+        /// the sole device is used; ambiguous if more than one is present.
+        #[arg(long)]
+        fingerprint: Option<String>,
     },
     /// Bitcoin-Core-compatible raw RPC passthrough. Captures unknown
     /// subcommands so `sat-cli getblockchaininfo` still works.
@@ -275,6 +295,9 @@ fn resolve_cmd(cmd: &Cmd) -> (String, Vec<serde_json::Value>) {
         },
         Cmd::SignPsbtWithKey { .. } => {
             unreachable!("signpsbtwithkey is handled locally before RPC dispatch")
+        }
+        Cmd::SignPsbtWithSigner { .. } => {
+            unreachable!("signpsbtwithsigner is handled locally before RPC dispatch")
         }
         Cmd::Raw(args) => {
             let mut it = args.iter();
@@ -552,6 +575,31 @@ async fn main() {
         std::process::exit(run_sign(psbt.as_deref(), psbt_file.as_deref(), *gap));
     }
 
+    // `signpsbtwithsigner` also signs locally (via an external signer process)
+    // and makes no RPC call — dispatch before any RPC credential setup.
+    if let Cmd::SignPsbtWithSigner {
+        psbt,
+        psbt_file,
+        signer,
+        fingerprint,
+    } = &cli.command
+    {
+        let chain = if cli.regtest {
+            "regtest"
+        } else if cli.testnet {
+            "test"
+        } else {
+            "main"
+        };
+        std::process::exit(run_sign_with_signer(
+            psbt.as_deref(),
+            psbt_file.as_deref(),
+            signer,
+            fingerprint.as_deref(),
+            chain,
+        ));
+    }
+
     let rpcport = cli.rpcport.unwrap_or({
         if cli.regtest {
             18443
@@ -705,19 +753,9 @@ fn read_keys() -> Result<zeroize::Zeroizing<Vec<String>>, String> {
 fn run_sign(psbt_arg: Option<&str>, psbt_file: Option<&std::path::Path>, gap: u32) -> i32 {
     use std::str::FromStr;
 
-    let psbt_b64 = match (psbt_arg, psbt_file) {
-        (Some(s), _) => s.to_string(),
-        (None, Some(p)) => match std::fs::read_to_string(p) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("error: cannot read PSBT file {}: {e}", p.display());
-                return 1;
-            }
-        },
-        (None, None) => {
-            eprintln!("error: provide a PSBT as an argument or via --psbt-file");
-            return 1;
-        }
+    let psbt_b64 = match resolve_psbt_b64(psbt_arg, psbt_file) {
+        Ok(s) => s,
+        Err(code) => return code,
     };
 
     let mut psbt = match sign::psbt_from_base64(&psbt_b64) {
@@ -767,12 +805,87 @@ fn run_sign(psbt_arg: Option<&str>, psbt_file: Option<&std::path::Path>, gap: u3
     drop(wif_keys);
     drop(xprivs);
 
-    // Signed PSBT on stdout (pipeable into finalizepsbt); report on stderr.
-    println!("{}", sign::psbt_to_base64(&psbt));
+    emit_result(&psbt, &summary)
+}
+
+/// Handle `signpsbtwithsigner`. Resolves the PSBT, dispatches it to the external
+/// signer, and reports on the returned PSBT. Same exit codes as `run_sign`.
+fn run_sign_with_signer(
+    psbt_arg: Option<&str>,
+    psbt_file: Option<&std::path::Path>,
+    signer: &str,
+    fingerprint: Option<&str>,
+    chain: &str,
+) -> i32 {
+    let psbt_b64 = match resolve_psbt_b64(psbt_arg, psbt_file) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    // Validate the PSBT locally before handing it to the signer.
+    if let Err(e) = sign::psbt_from_base64(&psbt_b64) {
+        eprintln!("error: {e}");
+        return 1;
+    }
+
+    let argv = match signer::parse_signer_argv(signer) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return 1;
+        }
+    };
+    let fp = match signer::resolve_fingerprint(&argv, fingerprint) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return 1;
+        }
+    };
+    let signed_b64 = match signer::signtx(&argv, &fp, chain, &psbt_b64) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return 1;
+        }
+    };
+    let psbt = match sign::psbt_from_base64(&signed_b64) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: signer returned an unparseable PSBT: {e}");
+            return 1;
+        }
+    };
+
+    let summary = sign::summarize(&psbt);
+    emit_result(&psbt, &summary)
+}
+
+/// Resolve the PSBT base64 from a positional argument or `--psbt-file`. On
+/// failure prints the error and returns the exit code to use.
+fn resolve_psbt_b64(
+    psbt_arg: Option<&str>,
+    psbt_file: Option<&std::path::Path>,
+) -> Result<String, i32> {
+    match (psbt_arg, psbt_file) {
+        (Some(s), _) => Ok(s.to_string()),
+        (None, Some(p)) => std::fs::read_to_string(p).map_err(|e| {
+            eprintln!("error: cannot read PSBT file {}: {e}", p.display());
+            1
+        }),
+        (None, None) => {
+            eprintln!("error: provide a PSBT as an argument or via --psbt-file");
+            Err(1)
+        }
+    }
+}
+
+/// Print the signed PSBT to stdout and a per-input report to stderr; return the
+/// exit code (0 fully signed, 2 partial — PSBT still emitted).
+fn emit_result(psbt: &bitcoin::psbt::Psbt, summary: &sign::SignSummary) -> i32 {
+    println!("{}", sign::psbt_to_base64(psbt));
     for (i, outcome) in summary.per_input.iter().enumerate() {
         eprintln!("input {i}: {}", outcome.as_str());
     }
-
     if summary.complete() {
         0
     } else {

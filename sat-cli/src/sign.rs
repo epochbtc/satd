@@ -186,31 +186,38 @@ pub fn sign_psbt(
     }
 
     // Derive outcomes from the resulting PSBT state.
+    summarize(psbt)
+}
+
+/// Classify each input of a PSBT by its current signing state. Used both as the
+/// return of [`sign_psbt`] and by the external-signer path to report on a PSBT
+/// returned by the signer — so both share identical reporting and exit codes.
+pub fn summarize(psbt: &Psbt) -> SignSummary {
+    // Taproot key-spend needs every input's prevout; if any is missing, no
+    // taproot input is signable, so report those as MissingUtxo rather than
+    // NoMatchingKey.
+    let all_prevouts_known = (0..psbt.inputs.len()).all(|i| input_prevout(psbt, i).is_some());
     let per_input = (0..psbt.inputs.len())
         .map(|i| {
-            if was_final[i] {
+            let input = &psbt.inputs[i];
+            if input.final_script_sig.is_some() || input.final_script_witness.is_some() {
                 return InputOutcome::AlreadyFinal;
             }
-            let input = &psbt.inputs[i];
             if !input.partial_sigs.is_empty() || input.tap_key_sig.is_some() {
                 return InputOutcome::Signed;
             }
-            let Some(prevout) = &prevouts[i] else {
-                return InputOutcome::MissingUtxo;
-            };
-            let script = &prevout.script_pubkey;
-            if !is_supported_script(script) {
-                InputOutcome::Unsupported
-            } else if script.is_p2tr() && !all_prevouts_known {
-                // Taproot key-spend needs every prevout; a missing sibling
-                // means we couldn't sign even with the key.
-                InputOutcome::MissingUtxo
-            } else {
-                InputOutcome::NoMatchingKey
+            match input_prevout(psbt, i) {
+                None => InputOutcome::MissingUtxo,
+                Some(prevout) if !is_supported_script(&prevout.script_pubkey) => {
+                    InputOutcome::Unsupported
+                }
+                Some(prevout) if prevout.script_pubkey.is_p2tr() && !all_prevouts_known => {
+                    InputOutcome::MissingUtxo
+                }
+                Some(_) => InputOutcome::NoMatchingKey,
             }
         })
         .collect();
-
     SignSummary { per_input }
 }
 

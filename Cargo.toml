@@ -57,3 +57,4 @@ schemars = { version = "0.8", features = ["derive"] }
 sd-notify = "0.5"
 zeroize = "1"
 rpassword = "7"
+shlex = "1"
