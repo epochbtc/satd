@@ -28,9 +28,9 @@ Operators could define local rulesets using simple boolean logic on transaction 
 
 ### PSBT signing (stdin-keyed, no stored keys)
 `satd` has all the non-signing PSBT ops (create, decode, analyze, combine, finalize, join, utxoupdate). The node stays keyless by design, so signing happens **client-side in `sat-cli`** — the key never travels over RPC.
-- ✅ **Shipped:** `sat-cli signpsbtwithkey` — WIF or xpriv read from stdin (no-echo prompt on a TTY), key text zeroized after use, never sent to the daemon. Signs p2pkh / p2wpkh / p2sh-p2wpkh / p2tr key-path inputs, emitting a signed PSBT to feed into `finalizepsbt`. Workflow: `createpsbt` → `utxoupdatepsbt` → `signpsbtwithkey` → `finalizepsbt` → `sendrawtransaction`.
+- ✅ **Shipped:** `sat-cli signpsbtwithkey` — WIF or xpriv read from stdin (no-echo prompt on a TTY), key material best-effort erased after use, never sent to the daemon. Signs p2pkh / p2wpkh / p2sh-p2wpkh / p2tr key-path inputs, emitting a signed PSBT to feed into `finalizepsbt`. An xpriv is expanded client-side over the standard BIP 44/49/84/86 paths (`--gap`-bounded), so it signs derivation-free PSBTs — including satd's own `createpsbt` output — as well as PSBTs that carry `bip32_derivation`. Workflow: `createpsbt` → `utxoupdatepsbt` → `signpsbtwithkey` → `finalizepsbt` → `sendrawtransaction`.
 - **Next:** External-signer dispatch protocol: stdin/stdout JSON frames so hardware wallets / SSS / airgap signers can plug in.
-- **Next:** Miniscript-aware signing (BIP 388 wallet policies) — descriptor language + output modeled on Sparrow's UX. Also: populate `bip32_derivation` in `createpsbt` so an xpriv can sign satd-produced PSBTs (today xpriv only signs PSBTs that already carry derivation metadata).
+- **Next:** Miniscript-aware signing (BIP 388 wallet policies) — descriptor language + output modeled on Sparrow's UX, for signing arbitrary script paths beyond the standard single-key types.
 
 ### AssumeUTXO `--fast-start`
 **Proposal:** `satd` automatically fetches the latest published AssumeUTXO snapshot over P2P, loads it into a background RocksDB instance, and swaps it in when ready.

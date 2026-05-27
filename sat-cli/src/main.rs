@@ -120,6 +120,11 @@ enum Cmd {
         /// Read the PSBT (base64) from this file instead of the argument.
         #[arg(long)]
         psbt_file: Option<PathBuf>,
+        /// For an xpriv: how many addresses per chain to scan on the standard
+        /// BIP 44/49/84/86 derivation paths when the PSBT carries no
+        /// derivation metadata.
+        #[arg(long, default_value_t = 100)]
+        gap: u32,
     },
     /// Bitcoin-Core-compatible raw RPC passthrough. Captures unknown
     /// subcommands so `sat-cli getblockchaininfo` still works.
@@ -538,8 +543,13 @@ async fn main() {
 
     // `signpsbtwithkey` signs locally and makes no RPC call — handle it before
     // any RPC credential/connection setup so a missing cookie can't block it.
-    if let Cmd::SignPsbtWithKey { psbt, psbt_file } = &cli.command {
-        std::process::exit(run_sign(psbt.as_deref(), psbt_file.as_deref()));
+    if let Cmd::SignPsbtWithKey {
+        psbt,
+        psbt_file,
+        gap,
+    } = &cli.command
+    {
+        std::process::exit(run_sign(psbt.as_deref(), psbt_file.as_deref(), *gap));
     }
 
     let rpcport = cli.rpcport.unwrap_or({
@@ -692,7 +702,7 @@ fn read_keys() -> Result<zeroize::Zeroizing<Vec<String>>, String> {
 
 /// Handle `signpsbtwithkey`. Returns the process exit code:
 /// `0` all inputs signed, `2` partial (PSBT still emitted), `1` hard error.
-fn run_sign(psbt_arg: Option<&str>, psbt_file: Option<&std::path::Path>) -> i32 {
+fn run_sign(psbt_arg: Option<&str>, psbt_file: Option<&std::path::Path>, gap: u32) -> i32 {
     use std::str::FromStr;
 
     let psbt_b64 = match (psbt_arg, psbt_file) {
@@ -743,7 +753,7 @@ fn run_sign(psbt_arg: Option<&str>, psbt_file: Option<&std::path::Path>) -> i32 
         }
     }
 
-    let summary = sign::sign_psbt(&mut psbt, &wif_keys, &xprivs);
+    let summary = sign::sign_psbt(&mut psbt, &wif_keys, &xprivs, gap);
     // Best-effort wipe of the parsed key material before it leaves scope.
     // `secp256k1` has no `Zeroize` impl; `non_secure_erase` is its volatile
     // overwrite (same technique as the zeroize crate). Residual copies the

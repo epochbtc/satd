@@ -9,9 +9,15 @@
 //! The WIF path mirrors the node's `sign_raw_transaction_with_key`
 //! (`node/src/rpc/rawtx.rs`) for the four common script types, but writes
 //! `partial_sigs` / `tap_key_sig` instead of assembling final witnesses. That
-//! is exactly what the node's `finalizepsbt` consumes. The xpriv path defers to
-//! rust-bitcoin's `Psbt::sign`, which keys off the PSBT's `bip32_derivation` /
-//! `tap_key_origins`.
+//! is exactly what the node's `finalizepsbt` consumes.
+//!
+//! An xpriv is handled two ways. First it is expanded into standard-path child
+//! keys (BIP 44/49/84/86, account 0, receive + change, over a bounded gap)
+//! which feed the same script-matching pass — so an xpriv can sign PSBTs that
+//! carry no derivation metadata, including satd's own `createpsbt` output.
+//! Second, `Psbt::sign` is still run so PSBTs that *do* carry
+//! `bip32_derivation` / `tap_key_origins` (e.g. from another wallet) sign on
+//! their declared paths even when those fall outside the standard scan.
 //!
 //! Key erasure is best-effort. `secp256k1` deliberately does not implement
 //! `Zeroize` (the compiler may copy/move secrets freely, so it can't be
@@ -90,6 +96,7 @@ pub fn sign_psbt(
     psbt: &mut Psbt,
     wif_keys: &[bitcoin::PrivateKey],
     xprivs: &[bitcoin::bip32::Xpriv],
+    gap: u32,
 ) -> SignSummary {
     let secp = Secp256k1::new();
 
@@ -101,10 +108,16 @@ pub fn sign_psbt(
         .map(|i| i.final_script_sig.is_some() || i.final_script_witness.is_some())
         .collect();
 
-    // Build pubkey -> secret lookups for the WIF path.
+    // Candidate keys: explicit WIF keys plus standard-path children expanded
+    // from each xpriv, so an xpriv signs PSBTs that carry no derivation
+    // metadata (e.g. satd's own `createpsbt` output).
+    let mut derived: Vec<bitcoin::PrivateKey> = Vec::new();
+    for xpriv in xprivs {
+        derived.extend(expand_xpriv(&secp, xpriv, gap));
+    }
     let mut key_map: HashMap<PublicKey, SecretKey> = HashMap::new();
     let mut xonly_key_map: HashMap<XOnlyPublicKey, SecretKey> = HashMap::new();
-    for pk in wif_keys {
+    for pk in wif_keys.iter().chain(derived.iter()) {
         let pubkey = pk.public_key(&secp);
         let (xonly, _parity) = pubkey.inner.x_only_public_key();
         key_map.insert(pubkey, pk.inner);
@@ -165,6 +178,9 @@ pub fn sign_psbt(
     for sk in xonly_key_map.values_mut() {
         sk.non_secure_erase();
     }
+    for pk in &mut derived {
+        pk.inner.non_secure_erase();
+    }
 
     // Derive outcomes from the resulting PSBT state.
     let per_input = (0..psbt.inputs.len())
@@ -207,6 +223,54 @@ fn input_prevout(psbt: &Psbt, i: usize) -> Option<TxOut> {
 
 fn is_supported_script(script: &bitcoin::Script) -> bool {
     script.is_p2pkh() || script.is_p2wpkh() || script.is_p2sh() || script.is_p2tr()
+}
+
+/// Expand an xpriv into candidate signing keys over the standard derivation
+/// paths, so script-matching can find the key for a PSBT that carries no
+/// derivation metadata. Covers BIP 44/49/84/86 (account 0, receive + change)
+/// when given a master key, plus the bare key and a receive/change leaf scan
+/// for account-level keys — each over `0..gap`. The coin type follows the
+/// key's network (0' mainnet, 1' otherwise).
+fn expand_xpriv(
+    secp: &Secp256k1<bitcoin::secp256k1::All>,
+    xpriv: &bitcoin::bip32::Xpriv,
+    gap: u32,
+) -> Vec<bitcoin::PrivateKey> {
+    use bitcoin::bip32::ChildNumber;
+    let h = |i| ChildNumber::from_hardened_idx(i).expect("valid hardened index");
+    let n = |i| ChildNumber::from_normal_idx(i).expect("valid normal index");
+    let coin = match xpriv.network {
+        bitcoin::NetworkKind::Main => 0u32,
+        bitcoin::NetworkKind::Test => 1u32,
+    };
+
+    let mut out = Vec::new();
+    // The key itself (e.g. a leaf xpriv).
+    out.push(xpriv.to_priv());
+
+    // Treat as an account-level key: scan receive/change leaves.
+    for change in [0u32, 1] {
+        for i in 0..gap {
+            if let Ok(child) = xpriv.derive_priv(secp, &[n(change), n(i)]) {
+                out.push(child.to_priv());
+            }
+        }
+    }
+
+    // Treat as a master key: descend the four standard BIP purposes, account 0.
+    if xpriv.depth == 0 {
+        for purpose in [44u32, 49, 84, 86] {
+            for change in [0u32, 1] {
+                for i in 0..gap {
+                    let path = [h(purpose), h(coin), h(0), n(change), n(i)];
+                    if let Ok(child) = xpriv.derive_priv(secp, &path) {
+                        out.push(child.to_priv());
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Try to add a signature to one input using the WIF key maps. Writes
@@ -311,6 +375,7 @@ fn sign_input_wif(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bitcoin::bip32::Xpriv;
     use bitcoin::key::CompressedPublicKey;
     use bitcoin::secp256k1::SecretKey;
     use bitcoin::transaction::Version;
@@ -359,7 +424,7 @@ mod tests {
         let spk = Address::p2wpkh(&cpk, Network::Regtest).script_pubkey();
         let mut psbt = psbt_spending(spk, 50 * 100_000_000);
 
-        let summary = sign_psbt(&mut psbt, &[pk], &[]);
+        let summary = sign_psbt(&mut psbt, &[pk], &[], 0);
         assert_eq!(summary.per_input, vec![InputOutcome::Signed]);
         assert!(summary.complete());
         assert_eq!(psbt.inputs[0].partial_sigs.len(), 1);
@@ -371,7 +436,7 @@ mod tests {
         let spk = Address::p2pkh(pk.public_key(&secp), Network::Regtest).script_pubkey();
         let mut psbt = psbt_spending(spk, 10_000_000);
 
-        let summary = sign_psbt(&mut psbt, &[pk], &[]);
+        let summary = sign_psbt(&mut psbt, &[pk], &[], 0);
         assert_eq!(summary.per_input, vec![InputOutcome::Signed]);
         assert_eq!(psbt.inputs[0].partial_sigs.len(), 1);
     }
@@ -383,7 +448,7 @@ mod tests {
         let spk = Address::p2shwpkh(&cpk, Network::Regtest).script_pubkey();
         let mut psbt = psbt_spending(spk, 10_000_000);
 
-        let summary = sign_psbt(&mut psbt, &[pk], &[]);
+        let summary = sign_psbt(&mut psbt, &[pk], &[], 0);
         assert_eq!(summary.per_input, vec![InputOutcome::Signed]);
         assert_eq!(psbt.inputs[0].partial_sigs.len(), 1);
         assert!(
@@ -399,7 +464,7 @@ mod tests {
         let spk = ScriptBuf::new_p2tr(&secp, xonly, None);
         let mut psbt = psbt_spending(spk, 10_000_000);
 
-        let summary = sign_psbt(&mut psbt, &[pk], &[]);
+        let summary = sign_psbt(&mut psbt, &[pk], &[], 0);
         assert_eq!(summary.per_input, vec![InputOutcome::Signed]);
         assert!(psbt.inputs[0].tap_key_sig.is_some());
     }
@@ -412,7 +477,7 @@ mod tests {
         let mut psbt = psbt_spending(spk, 10_000_000);
         psbt.inputs[0].witness_utxo = None; // strip the prevout
 
-        let summary = sign_psbt(&mut psbt, &[pk], &[]);
+        let summary = sign_psbt(&mut psbt, &[pk], &[], 0);
         assert_eq!(summary.per_input, vec![InputOutcome::MissingUtxo]);
         assert!(!summary.complete());
     }
@@ -426,7 +491,83 @@ mod tests {
         let spk = Address::p2wpkh(&cpk, Network::Regtest).script_pubkey();
         let mut psbt = psbt_spending(spk, 10_000_000);
 
-        let summary = sign_psbt(&mut psbt, &[signing_key], &[]);
+        let summary = sign_psbt(&mut psbt, &[signing_key], &[], 0);
+        assert_eq!(summary.per_input, vec![InputOutcome::NoMatchingKey]);
+    }
+
+    fn h(i: u32) -> bitcoin::bip32::ChildNumber {
+        bitcoin::bip32::ChildNumber::from_hardened_idx(i).unwrap()
+    }
+    fn nn(i: u32) -> bitcoin::bip32::ChildNumber {
+        bitcoin::bip32::ChildNumber::from_normal_idx(i).unwrap()
+    }
+
+    #[test]
+    fn signs_via_master_xpriv_standard_path() {
+        // A bare PSBT (no derivation metadata) spending an address on the
+        // standard BIP84 path must sign from the master xpriv alone.
+        let secp = Secp256k1::new();
+        let master = Xpriv::new_master(Network::Regtest, &[0x11u8; 32]).unwrap();
+        let child = master
+            .derive_priv(&secp, &[h(84), h(1), h(0), nn(0), nn(0)])
+            .unwrap();
+        let cpk =
+            CompressedPublicKey::from_slice(&child.to_priv().public_key(&secp).to_bytes()).unwrap();
+        let spk = Address::p2wpkh(&cpk, Network::Regtest).script_pubkey();
+        let mut psbt = psbt_spending(spk, 10_000_000);
+
+        let summary = sign_psbt(&mut psbt, &[], &[master], 5);
+        assert_eq!(summary.per_input, vec![InputOutcome::Signed]);
+        assert_eq!(psbt.inputs[0].partial_sigs.len(), 1);
+    }
+
+    #[test]
+    fn signs_via_account_level_xpriv() {
+        // Wallets export account-level xprivs (depth 3); the receive/change
+        // leaf scan must find m/.../0/0 from such a key.
+        let secp = Secp256k1::new();
+        let master = Xpriv::new_master(Network::Regtest, &[0x22u8; 32]).unwrap();
+        let account = master.derive_priv(&secp, &[h(84), h(1), h(0)]).unwrap();
+        let leaf = account.derive_priv(&secp, &[nn(0), nn(0)]).unwrap();
+        let cpk =
+            CompressedPublicKey::from_slice(&leaf.to_priv().public_key(&secp).to_bytes()).unwrap();
+        let spk = Address::p2wpkh(&cpk, Network::Regtest).script_pubkey();
+        let mut psbt = psbt_spending(spk, 10_000_000);
+
+        let summary = sign_psbt(&mut psbt, &[], &[account], 5);
+        assert_eq!(summary.per_input, vec![InputOutcome::Signed]);
+    }
+
+    #[test]
+    fn signs_taproot_via_master_xpriv() {
+        let secp = Secp256k1::new();
+        let master = Xpriv::new_master(Network::Regtest, &[0x33u8; 32]).unwrap();
+        let child = master
+            .derive_priv(&secp, &[h(86), h(1), h(0), nn(0), nn(0)])
+            .unwrap();
+        let (xonly, _) = child.to_priv().public_key(&secp).inner.x_only_public_key();
+        let spk = ScriptBuf::new_p2tr(&secp, xonly, None);
+        let mut psbt = psbt_spending(spk, 10_000_000);
+
+        let summary = sign_psbt(&mut psbt, &[], &[master], 5);
+        assert_eq!(summary.per_input, vec![InputOutcome::Signed]);
+        assert!(psbt.inputs[0].tap_key_sig.is_some());
+    }
+
+    #[test]
+    fn xpriv_outside_gap_is_not_found() {
+        // An address beyond the scanned gap stays unsigned (fail-closed).
+        let secp = Secp256k1::new();
+        let master = Xpriv::new_master(Network::Regtest, &[0x44u8; 32]).unwrap();
+        let child = master
+            .derive_priv(&secp, &[h(84), h(1), h(0), nn(0), nn(50)])
+            .unwrap();
+        let cpk =
+            CompressedPublicKey::from_slice(&child.to_priv().public_key(&secp).to_bytes()).unwrap();
+        let spk = Address::p2wpkh(&cpk, Network::Regtest).script_pubkey();
+        let mut psbt = psbt_spending(spk, 10_000_000);
+
+        let summary = sign_psbt(&mut psbt, &[], &[master], 5);
         assert_eq!(summary.per_input, vec![InputOutcome::NoMatchingKey]);
     }
 
