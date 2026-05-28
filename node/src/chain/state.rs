@@ -2505,6 +2505,26 @@ impl ChainState {
             self.primary_engine(),
         );
 
+        // Weight-aware ETA over the replay, reused from the IBD connect loop.
+        // The replay is the same per-block cost profile as IBD, so the cost
+        // weights apply directly. Target the configured `-stopatheight` when
+        // set — the loop below exits there, so an ETA to the full file tip
+        // would be materially inflated.
+        let target_height = stop_at.unwrap_or_else(|| self.max_indexed_height());
+        let mut eta_est = crate::ibd_eta::IbdEtaEstimator::new(
+            start_height,
+            target_height,
+            self.network == Network::Bitcoin,
+        );
+        let mut interval_start = std::time::Instant::now();
+        let mut last_interval: u32 = start_height / 1000;
+        if let Some(p) = &progress {
+            // Switch to driver-controlled ETA immediately and suppress the
+            // linear fallback: with ~50x cost variation across history a
+            // naive remaining/rate ETA is meaningless here.
+            p.set_eta(None);
+        }
+
         // Run the replay in an inner closure so the prefetch workers are
         // ALWAYS shut down afterward — including on the `?` error paths. A
         // bare early return (connect failure, flat-file read failure, a
@@ -2547,10 +2567,22 @@ impl ChainState {
                     self.store.flush_durable()?;
                 }
 
+                // Feed the ETA estimator one observation per 1000-block
+                // interval.
+                let cur_interval = height / 1000;
+                if cur_interval > last_interval {
+                    let secs = interval_start.elapsed().as_secs_f64();
+                    let spans = (cur_interval - last_interval) as f64;
+                    eta_est.record_interval(cur_interval * 1000, secs / spans);
+                    interval_start = std::time::Instant::now();
+                    last_interval = cur_interval;
+                }
+
                 if let Some(p) = &progress
                     && height.is_multiple_of(100)
                 {
                     p.set_current(height as u64);
+                    p.set_eta(eta_est.estimate_eta(height, target_height));
                 }
 
                 if height.is_multiple_of(10_000) {
@@ -2803,7 +2835,21 @@ impl ChainState {
             p.set_phase("reindex_connect", "Replaying blocks (phase 2/2)");
             p.set_total(total);
             p.set_stop_height(stop_at.map(|h| h as u64));
+            // Switch the ETA into driver-controlled mode up front so the
+            // generic linear estimate never briefly shows a bogus tiny ETA
+            // over the trivial early blocks before the weight-aware estimator
+            // has data.
+            p.set_eta(None);
         }
+        // Weight-aware ETA over the heavy connect phase (reused from IBD). The
+        // block count scanned in phase 1 is a close proxy for the final tip
+        // height of a from-genesis reindex; precision at 1000-block weight
+        // granularity isn't critical.
+        let target_height = stop_at.unwrap_or(total as u32);
+        let mut eta_est =
+            crate::ibd_eta::IbdEtaEstimator::new(0, target_height, self.network == Network::Bitcoin);
+        let mut interval_start = std::time::Instant::now();
+        let mut last_interval: u32 = 0;
         let genesis_hash = bitcoin::constants::genesis_block(self.network).block_hash();
         let mut queue: VecDeque<BlockHash> = VecDeque::new();
         if let Some(child_hashes) = children.get(&genesis_hash) {
@@ -2880,10 +2926,20 @@ impl ChainState {
             }
 
             connected += 1;
+            // Feed the ETA estimator one observation per 1000-block interval.
+            let cur_interval = height / 1000;
+            if cur_interval > last_interval {
+                let secs = interval_start.elapsed().as_secs_f64();
+                let spans = (cur_interval - last_interval) as f64;
+                eta_est.record_interval(cur_interval * 1000, secs / spans);
+                interval_start = std::time::Instant::now();
+                last_interval = cur_interval;
+            }
             if let Some(p) = &progress
                 && connected.is_multiple_of(100)
             {
                 p.set_current(connected as u64);
+                p.set_eta(eta_est.estimate_eta(height, target_height));
             }
             if connected.is_multiple_of(10_000) {
                 tracing::info!(connected, height, "Reindexing from flat files...");

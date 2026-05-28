@@ -8,6 +8,22 @@ layout) per `STABILITY_POLICY.md`.
 
 ## [Unreleased]
 
+### Monitoring
+
+- **Startup/reindex progress timing is now computed daemon-side.** The node
+  tracks elapsed time, throughput rate, and ETA for the pre-RPC startup
+  phases (reindex scan/connect, chainstate replay, and the AssumeUTXO
+  fast-start download) and reports them on `getstartupinfo` as `elapsed_secs`,
+  `total_elapsed_secs`, `rate`, and `eta_secs`. Previously `sat-tui` derived
+  these client-side from a cold sample window, so elapsed reset to zero on
+  every TUI launch, rate took tens of seconds to appear, and ETA stayed
+  blank. Reindex ETAs reuse the weight-aware IBD estimator — which models the
+  ~50x per-block processing-cost variation across Bitcoin's history — for a
+  stable, converging estimate; the fast-start download gets a simple
+  remaining-bytes/rate ETA. `getstartupinfo` is a satd-native pre-init RPC
+  with no Bitcoin Core equivalent, so the added fields don't affect Core
+  compatibility.
+
 ## [0.2.0] — 2026-05-27
 
 ### Network

@@ -2318,6 +2318,13 @@ async fn start_startup_rpc(
                 "total": snap.total,
                 "stop_height": snap.stop_height,
                 "percent": percent,
+                // Daemon-computed timing so clients render it instantly and
+                // consistently across reconnects, rather than each deriving
+                // it from a cold local sample window.
+                "elapsed_secs": snap.elapsed_secs,
+                "total_elapsed_secs": snap.total_elapsed_secs,
+                "rate": snap.rate,
+                "eta_secs": snap.eta_secs,
             }))
         })
         .unwrap();
