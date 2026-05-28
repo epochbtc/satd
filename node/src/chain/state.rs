@@ -2507,8 +2507,10 @@ impl ChainState {
 
         // Weight-aware ETA over the replay, reused from the IBD connect loop.
         // The replay is the same per-block cost profile as IBD, so the cost
-        // weights apply directly.
-        let target_height = self.max_indexed_height();
+        // weights apply directly. Target the configured `-stopatheight` when
+        // set — the loop below exits there, so an ETA to the full file tip
+        // would be materially inflated.
+        let target_height = stop_at.unwrap_or_else(|| self.max_indexed_height());
         let mut eta_est = crate::ibd_eta::IbdEtaEstimator::new(
             start_height,
             target_height,
