@@ -2,12 +2,14 @@
 //!
 //! Rendered when the node is in pre-RPC startup (DB open, reindex,
 //! chainstate replay). Shows the active phase, a progress bar, and
-//! elapsed / rate / ETA derived from a rolling sample window kept by
-//! `AppState::update_startup`.
+//! elapsed / rate / ETA — all daemon-computed and delivered by
+//! `getstartupinfo`, so they are correct on the first frame and stable
+//! across TUI restarts.
 //!
-//! ETA is intentionally per-phase, not whole-startup: phase 1 (header
-//! scan) and phase 2 (block replay) have very different per-item costs,
-//! so a unified estimate would be misleading until phase 2 dominates.
+//! ETA is per-phase, not whole-startup: phase 1 (header scan) and phase 2
+//! (block replay) have very different per-item costs, so a unified estimate
+//! would be misleading. The reindex phases get a weight-aware estimate; the
+//! fast-start download gets a simple remaining/rate estimate.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -124,23 +126,14 @@ pub fn draw(f: &mut Frame, st: &AppState) {
         .ratio(pct / 100.0);
     f.render_widget(gauge, chunks[2]);
 
-    // Stats: elapsed | rate | ETA. ETA is suppressed outside the long
-    // phase (`reindex_connect`) — phase 1 finishes in seconds, an ETA
-    // there is noise.
-    let elapsed = st
-        .startup_phase_started_at
-        .map(|t| t.elapsed().as_secs())
-        .unwrap_or(0);
-    let total_elapsed = st
-        .startup_started_at
-        .map(|t| t.elapsed().as_secs())
-        .unwrap_or(0);
-    let rate = st.startup_rate();
-    let eta = if status.phase == "reindex_connect" {
-        st.startup_eta_secs()
-    } else {
-        None
-    };
+    // Stats: elapsed | rate | ETA — all daemon-computed (see getstartupinfo).
+    // The ETA is weight-aware for the reindex phases and a plain remaining/rate
+    // estimate for the download; `None` (rendered "—") whenever the daemon
+    // can't yet estimate it.
+    let elapsed = status.elapsed_secs;
+    let total_elapsed = status.total_elapsed_secs;
+    let rate = status.rate;
+    let eta = status.eta_secs;
 
     let mut stat_lines: Vec<Line> = Vec::new();
     stat_lines.push(stat_line(
@@ -183,10 +176,10 @@ pub fn draw(f: &mut Frame, st: &AppState) {
         ));
     }
 
-    if !st.startup_phase.is_empty() {
+    if !status.phase.is_empty() {
         stat_lines.push(stat_line(
             "Phase id",
-            st.startup_phase.clone(),
+            status.phase.clone(),
             Color::DarkGray,
         ));
     }
