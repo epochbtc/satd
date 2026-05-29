@@ -8,6 +8,19 @@ layout) per `STABILITY_POLICY.md`.
 
 ## [Unreleased]
 
+## [0.2.1] — 2026-05-29
+
+### Packaging
+
+- **`sat-tui` is now included in the release tarballs.** The terminal
+  dashboard (`sat-tui`) ships in `bin/` of every `satd-<version>-<target>.tar.zst`
+  alongside `satd` and `sat-cli`, with a CycloneDX SBOM
+  (`sat-tui-v<version>.cdx.json`) and a minisign signature like the other
+  artifacts. It was a workspace member but was never built or staged into the
+  tarball through 0.2.0, so operators who installed from a release archive had
+  no TUI. No code changed from 0.2.0 — this release exists solely to package
+  the binary.
+
 ## [0.2.0] — 2026-05-27
 
 ### Network
