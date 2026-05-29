@@ -120,6 +120,14 @@ layout) per `STABILITY_POLICY.md`.
   block sync both ways (satd↔Core), and tx relay both ways. The only canary
   that tests satd against the reference implementation directly; it surfaced
   the two P2P fixes above. See `STABILITY_POLICY.md`.
+- **Electrum reference-wallet canary is now PR-gating**
+  (`scripts/canary/electrum-wallet-smoke.sh`). Runs the actual Electrum
+  wallet (`spesmilo/electrum` 4.5.8) headless against satd's Electrum
+  server and exercises **SPV** — header-chain verification and merkle
+  proofs — which the library-level Electrum checks don't fully cover.
+  Asserts Electrum connects + SPV-syncs to satd's tip and reports an
+  SPV-verified confirmed balance for a funded+matured wallet address.
+  See `STABILITY_POLICY.md`.
 - **LND Neutrino canary is now PR-gating**
   (`scripts/canary/lnd-neutrino-smoke.sh`). Runs a real LND node
   (`lightninglabs/lnd:v0.18.5-beta`) as a BIP 157/158 light client backed by

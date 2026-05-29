@@ -454,3 +454,49 @@ jobs:
           path: /tmp/satd-canary-lnd.*/satd.log
           if-no-files-found: ignore
           retention-days: 7
+
+  # Electrum reference-wallet canary — runs the actual Electrum wallet
+  # (spesmilo/electrum, the canonical client) headless against satd's
+  # Electrum server. Unlike the BDK canary (electrum-client library) and
+  # the electrum-smoke wire canary (raw nc), the reference wallet does
+  # SPV: it syncs + verifies the header chain and checks merkle proofs
+  # for its txs. Asserts Electrum connects + SPV-syncs to satd's tip, then
+  # that a funded+matured wallet address yields an SPV-verified confirmed
+  # balance. Electrum ships only as an AppImage (bundles its own Python +
+  # libsecp256k1), run extracted in a thin Debian container.
+  canary-electrum-wallet:
+    name: canary / Electrum wallet
+    needs: [build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install jq
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends jq
+
+      - name: Download satd binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: satd-canary-binaries
+          path: target/release/
+
+      - name: Mark binaries executable
+        run: chmod +x target/release/satd target/release/sat-cli
+
+      - name: Run Electrum reference-wallet canary
+        run: bash scripts/canary/electrum-wallet-smoke.sh
+
+      - name: Upload satd log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: electrum-wallet-canary-logs
+          path: /tmp/satd-canary-electrum-wallet.*/satd.log
+          if-no-files-found: ignore
+          retention-days: 7
