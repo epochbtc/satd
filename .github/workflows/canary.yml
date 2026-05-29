@@ -43,6 +43,21 @@ name: Canary
 on:
   pull_request:
     types: [opened, synchronize, reopened]
+    # Skip the canary fleet on PRs that touch only documentation / text:
+    # there's no code change that could affect a downstream, so spinning
+    # up ~9 container jobs would only burn runner minutes. Anything that
+    # touches code still runs the full fleet. NOTE: this is safe only
+    # because the canary jobs are NOT required status checks (branch
+    # protection requires `Lint` + `Tests`, which live in ci.yml and run
+    # on every PR). If the canaries are ever made required checks, this
+    # `paths-ignore` must be replaced with a job-level skip gate — a
+    # path-skipped *workflow* leaves required checks stuck pending and
+    # blocks the PR, whereas a skipped *job* reports success.
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'LICENSE*'
+      - '.gitignore'
   schedule:
     # Mondays 06:00 UTC. Weekly cadence is enough to surface
     # environmental drift between PRs (downstream image tags moving,
