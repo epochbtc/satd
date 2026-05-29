@@ -500,3 +500,51 @@ jobs:
           path: /tmp/satd-canary-electrum-wallet.*/satd.log
           if-no-files-found: ignore
           retention-days: 7
+
+  # Core Lightning (CLN) canary — runs a real CLN node (lightningd) with
+  # satd as its Bitcoin backend over JSON-RPC (the bcli plugin, no ZMQ).
+  # Exercises a strict slice of the RPC surface nothing else covers the
+  # same way (getchaininfo, getrawblockbyheight, getutxout, estimatefees,
+  # sendrawtransaction). Asserts CLN syncs against satd (getinfo blockheight
+  # == tip) and that a funded+matured wallet address shows in listfunds.
+  #
+  # Surfaced (and now guards against regression of) the Core-amount
+  # formatting fix: satd previously emitted BTC amounts in shortest form
+  # (0.00001) rather than Core's fixed 8-decimal 0.00001000, which CLN's
+  # bcli json_to_bitcoin_amount parser rejected — CLN couldn't even start.
+  canary-cln:
+    name: canary / Core Lightning
+    needs: [build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install jq
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends jq
+
+      - name: Download satd binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: satd-canary-binaries
+          path: target/release/
+
+      - name: Mark binaries executable
+        run: chmod +x target/release/satd target/release/sat-cli
+
+      - name: Run Core Lightning canary
+        run: bash scripts/canary/cln-smoke.sh
+
+      - name: Upload satd log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cln-canary-logs
+          path: /tmp/satd-canary-cln.*/satd.log
+          if-no-files-found: ignore
+          retention-days: 7

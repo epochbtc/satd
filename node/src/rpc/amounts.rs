@@ -16,11 +16,34 @@
 //!
 //! When `Sats` is active, `format_amount` emits JSON integers (no
 //! precision loss up to the Bitcoin max supply and beyond). When `Btc` is
-//! active, the output matches Bitcoin Core exactly: `f64` with 8 decimals
-//! of precision.
+//! active, the output matches Bitcoin Core **byte-for-byte**: a JSON number
+//! with a fixed 8 decimal places (`%d.%08d`), e.g. `0.00001000` — never the
+//! shortest-form `0.00001`. This matters: strict Core-amount parsers (e.g.
+//! Core Lightning's `bcli` `json_to_bitcoin_amount`, which reads exactly 8
+//! fractional digits) reject the shortest form. Emitting the fixed-decimal
+//! literal requires serde_json's `arbitrary_precision` feature (enabled in
+//! the workspace manifest) — a plain `Number::from_f64` would re-render in
+//! shortest form regardless. Formatting is done from the integer satoshi
+//! value (not via `f64`), so it is exact for every amount.
 
 use serde_json::Value;
 use std::sync::atomic::{AtomicU8, Ordering};
+
+/// Format an integer satoshi amount as a Bitcoin-Core-exact fixed
+/// 8-decimal BTC value (`<whole>.<8-digit frac>`) emitted as a JSON number
+/// literal. Integer arithmetic only — no `f64`, so exact for all amounts.
+fn btc_fixed_8dp(sats: u64) -> Value {
+    let whole = sats / 100_000_000;
+    let frac = sats % 100_000_000;
+    let literal = format!("{whole}.{frac:08}");
+    // Under `arbitrary_precision`, `Number: FromStr` preserves the exact
+    // source text, so this serializes as `0.00001000`, not `0.00001`.
+    Value::Number(
+        literal
+            .parse()
+            .expect("fixed 8-decimal literal is always a valid JSON number"),
+    )
+}
 
 /// Unit used to emit amounts on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -78,12 +101,7 @@ impl AmountUnit {
 /// - `Sats`: returns `Value::Number` as integer (`u64`), no precision loss.
 pub fn format_amount(sats: u64, unit: AmountUnit) -> Value {
     match unit {
-        AmountUnit::Btc => {
-            let btc = sats as f64 / 100_000_000.0;
-            // `Number::from_f64` returns `None` for NaN/Inf; neither is
-            // reachable from a `u64 / 100_000_000.0` division, so we unwrap.
-            Value::Number(serde_json::Number::from_f64(btc).unwrap())
-        }
+        AmountUnit::Btc => btc_fixed_8dp(sats),
         AmountUnit::Sats => Value::Number(serde_json::Number::from(sats)),
     }
 }
@@ -108,10 +126,8 @@ pub fn annotate_units(response: &mut Value, unit: AmountUnit) {
 /// modern wallets actually want.
 pub fn format_feerate_sat_per_kvb(sat_per_kvb: u64, unit: AmountUnit) -> Value {
     match unit {
-        AmountUnit::Btc => {
-            let btc_per_kvb = sat_per_kvb as f64 / 100_000_000.0;
-            Value::Number(serde_json::Number::from_f64(btc_per_kvb).unwrap())
-        }
+        // BTC/kvB with Core-exact fixed 8 decimals (same as `estimatesmartfee`).
+        AmountUnit::Btc => btc_fixed_8dp(sat_per_kvb),
         AmountUnit::Sats => Value::Number(serde_json::Number::from(sat_per_kvb)),
     }
 }
@@ -122,12 +138,22 @@ mod tests {
 
     #[test]
     fn btc_output_matches_core_formatting() {
-        let v = format_amount(50_000, AmountUnit::Btc);
-        // 50_000 sats = 0.0005 BTC
+        // Bitcoin Core emits BTC amounts with a FIXED 8 decimal places
+        // (`%d.%08d`), e.g. 50_000 sats → `0.00050000` — not the shortest
+        // form `0.0005`. The serialized literal must match byte-for-byte.
+        assert_eq!(format_amount(50_000, AmountUnit::Btc).to_string(), "0.00050000");
+        assert_eq!(format_amount(100_000_000, AmountUnit::Btc).to_string(), "1.00000000");
+        assert_eq!(format_amount(0, AmountUnit::Btc).to_string(), "0.00000000");
+        // Regression: the exact value (1000 sat/kvB = 0.00001000 BTC) whose
+        // shortest form `0.00001` Core Lightning's bcli parser rejected.
+        assert_eq!(format_amount(1000, AmountUnit::Btc).to_string(), "0.00001000");
+        // Largest valid amount still formats exactly (integer-based, no f64 drift).
         assert_eq!(
-            v,
-            Value::Number(serde_json::Number::from_f64(0.0005).unwrap())
+            format_amount(21_000_000 * 100_000_000, AmountUnit::Btc).to_string(),
+            "21000000.00000000"
         );
+        // Numeric accessor is unaffected.
+        assert_eq!(format_amount(50_000, AmountUnit::Btc).as_f64(), Some(0.0005));
     }
 
     #[test]
@@ -180,7 +206,11 @@ mod tests {
 
     #[test]
     fn feerate_formats_in_both_units() {
-        // 1000 sat/kvB = 0.00001 BTC/kvB
+        // 1000 sat/kvB = 0.00001000 BTC/kvB — fixed 8 decimals, Core-exact.
+        assert_eq!(
+            format_feerate_sat_per_kvb(1000, AmountUnit::Btc).to_string(),
+            "0.00001000"
+        );
         assert_eq!(
             format_feerate_sat_per_kvb(1000, AmountUnit::Btc).as_f64(),
             Some(0.00001)
