@@ -5950,7 +5950,25 @@ fn test_esplora_tx_detail_confirmed_coinbase() {
     let vin = body["vin"].as_array().unwrap();
     assert_eq!(vin.len(), 1);
     assert!(vin[0]["is_coinbase"].as_bool().unwrap());
-    assert!(vin[0]["txid"].is_null(), "coinbase vin omits prev txid");
+    // Coinbase vin carries the all-zeros outpoint, byte-for-byte matching
+    // upstream Esplora (blockstream.info): txid all-zeros, vout 0xffffffff,
+    // prevout explicit null. These MUST be present (not omitted) — strict
+    // typed clients (e.g. BDK's esplora_client) type vin[].txid as a
+    // required field and fail to deserialize the tx otherwise.
+    assert_eq!(
+        vin[0]["txid"].as_str().unwrap(),
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "coinbase vin.txid present as all-zeros"
+    );
+    assert_eq!(
+        vin[0]["vout"].as_u64().unwrap(),
+        4294967295,
+        "coinbase vin.vout present as 0xffffffff"
+    );
+    assert!(
+        vin[0].get("prevout").is_some() && vin[0]["prevout"].is_null(),
+        "coinbase vin.prevout present and null"
+    );
     let vout = body["vout"].as_array().unwrap();
     assert!(!vout.is_empty(), "coinbase has at least one output");
     assert_eq!(vout[0]["scriptpubkey_type"].as_str().unwrap(), "v0_p2wpkh");

@@ -59,6 +59,21 @@ layout) per `STABILITY_POLICY.md`.
   announces each connected tip (suppressed during bulk IBD); peers pull
   the block with their existing `getdata` path.
 
+### Esplora
+
+- **Coinbase transaction inputs now carry `txid`, `vout`, and `prevout`.**
+  satd's Esplora `vin` serialization previously omitted these three fields
+  on coinbase inputs. Reference Esplora (blockstream.info) always emits
+  them — `txid` as the all-zeros hash, `vout` as `4294967295`, and
+  `prevout` as `null` — and strict typed clients (notably BDK's
+  `esplora_client`, which types `vin[].txid` as a required field) fail to
+  deserialize *any* transaction with a coinbase input when they are
+  absent. That broke descriptor-wallet `full_scan` over every
+  coinbase-funded address. The fields are now always present and
+  byte-identical to upstream. Surfaced by the new BDK descriptor-wallet
+  canary; locked by a new in-tree regression test
+  (`test_e2e_esplora_coinbase_vin_shape`).
+
 ### Testing / CI
 
 - **NBXplorer and BTCPayServer compatibility canaries are now PR-gating**
@@ -67,6 +82,15 @@ layout) per `STABILITY_POLICY.md`.
   images against a satd regtest backend and assert full sync / healthy
   operation end-to-end — the first canaries exercising real third-party
   downstreams over RPC **and** P2P. See `STABILITY_POLICY.md`.
+- **BDK descriptor-wallet canary is now PR-gating**
+  (`scripts/canary/bdk-smoke.sh` + the standalone `scripts/canary/bdk-canary`
+  crate). Drives a real third-party wallet (`bdk_wallet` + `bdk_electrum` +
+  `bdk_esplora`) through a full descriptor-wallet workflow against a live
+  satd — gap-limit `full_scan` over **both** the Electrum and Esplora
+  surfaces, coinbase-maturity accounting, a signed spend broadcast via
+  Esplora and observed over Electrum, and a confirm step — asserting the two
+  surfaces agree byte-for-byte throughout. The real-consumer gate for the
+  native Electrum + Esplora surfaces. See `STABILITY_POLICY.md`.
 
 ## [0.2.1] — 2026-05-29
 

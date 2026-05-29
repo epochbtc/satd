@@ -10,13 +10,18 @@
 # — catching the failure mode where the in-tree clients incidentally
 # tolerate something a stricter consumer wouldn't.
 #
-# Active jobs: Esplora (HTTP) + Electrum (TCP) wire-shape gates, plus
-# the real third-party-container canaries NBXplorer and BTCPayServer.
-# The container canaries boot the actual downstream images against a
-# satd regtest backend (NBXplorer indexes blocks over RPC + P2P;
-# BTCPayServer runs the whole merchant stack on top of NBXplorer), so
-# green here is a genuine end-to-end downstream-compatibility signal,
-# not just wire-shape parity.
+# Active jobs: Esplora (HTTP) + Electrum (TCP) wire-shape gates; the
+# BDK descriptor-wallet canary (a real third-party wallet doing a full
+# gap-limit scan + spend over BOTH surfaces); and the real third-party-
+# container canaries NBXplorer and BTCPayServer. The container canaries
+# boot the actual downstream images against a satd regtest backend
+# (NBXplorer indexes blocks over RPC + P2P; BTCPayServer runs the whole
+# merchant stack on top of NBXplorer), so green here is a genuine
+# end-to-end downstream-compatibility signal, not just wire-shape parity.
+# The BDK canary is the analogous real-consumer gate for the Electrum +
+# Esplora surfaces: it exercises the realistic wallet workflow (full_scan,
+# coinbase-maturity accounting, broadcast, cross-surface consistency)
+# that the wire-shape smoke jobs don't.
 #
 # Triggers:
 #   - pull_request → PR-gating (required status check)
@@ -285,5 +290,70 @@ jobs:
         with:
           name: btcpay-canary-logs
           path: /tmp/satd-canary-btcpay.*/satd.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # BDK descriptor-wallet canary — the real-consumer gate for the
+  # Electrum + Esplora surfaces. Unlike the curl/nc wire-shape jobs and
+  # the container canaries, this one needs the Rust toolchain: it builds
+  # a STANDALONE cargo project (scripts/canary/bdk-canary, its own
+  # workspace + lockfile, so BDK never enters satd's build) that uses
+  # bdk_wallet + bdk_electrum + bdk_esplora to run a full descriptor
+  # wallet over BOTH surfaces — gap-limit full_scan, coinbase-maturity
+  # accounting, a signed spend broadcast via Esplora and observed over
+  # Electrum, and a cross-surface balance-agreement check. This is the
+  # path that surfaced (and now guards against regression of) the
+  # coinbase `vin` omission (missing txid/vout/prevout) that broke
+  # strict typed-client deserialization. See the PR that added this job.
+  canary-bdk:
+    name: canary / BDK wallet
+    needs: [build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Cache Cargo registry + git
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ runner.os }}-canary-bdk-cargo-${{ hashFiles('scripts/canary/bdk-canary/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-canary-bdk-cargo-
+
+      - name: Cache BDK canary target
+        uses: actions/cache@v4
+        with:
+          path: scripts/canary/bdk-canary/target
+          key: ${{ runner.os }}-canary-bdk-target-${{ hashFiles('scripts/canary/bdk-canary/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-canary-bdk-target-
+
+      - name: Download satd binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: satd-canary-binaries
+          path: target/release/
+
+      - name: Mark binaries executable
+        run: chmod +x target/release/satd target/release/sat-cli
+
+      - name: Run BDK descriptor-wallet canary
+        run: bash scripts/canary/bdk-smoke.sh
+
+      - name: Upload satd log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bdk-canary-logs
+          path: /tmp/satd-canary-bdk.*/satd.log
           if-no-files-found: ignore
           retention-days: 7
