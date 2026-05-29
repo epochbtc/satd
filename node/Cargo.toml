@@ -18,6 +18,8 @@ base64 = { workspace = true }
 tower = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
 thiserror = { workspace = true }
 rocksdb = { workspace = true }
 hex = { workspace = true }

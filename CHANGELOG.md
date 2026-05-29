@@ -24,6 +24,50 @@ layout) per `STABILITY_POLICY.md`.
   with no Bitcoin Core equivalent, so the added fields don't affect Core
   compatibility.
 
+### RPC / P2P compatibility (Bitcoin Core clients)
+
+- **JSON-RPC 1.0 / 1.1 requests are now accepted.** satd's RPC server
+  previously required strict `"jsonrpc":"2.0"` and rejected any other
+  form (including a missing `jsonrpc` member) with `-32600 Invalid
+  request`. Bitcoin Core accepts the 1.0/1.1 shapes, and the canonical
+  Core client libraries emit them — NBitcoin (→ NBXplorer → BTCPayServer)
+  sends `"jsonrpc":"1.0"`, and `python-bitcoinrpc` and many scripts omit
+  the member. satd now normalizes request bodies (a `"method"`-bearing
+  object, single or batched, gets `"jsonrpc":"2.0"`) before dispatch, so
+  these clients work unmodified. Malformed bodies still yield the correct
+  `-32700` parse error; responses keep their JSON-RPC 2.0 shape (the Core
+  client libraries read `result`/`error`/`id` and don't validate it).
+- **`getpeerinfo` now includes `timeoffset` and `inflight`.** Bitcoin
+  Core always emits both, and Core client libraries read them without a
+  null guard (NBitcoin's `GetPeersInfoAsync` threw on their absence,
+  aborting its node connection). `timeoffset` reports `0` (satd does not
+  track a per-peer clock offset); `inflight` is an array of in-flight
+  block heights, empty in this per-peer record.
+- **The per-IP inbound connection cap (`-maxinboundperip`, default 3) no
+  longer applies to loopback.** It is an anti-eclipse guard against a
+  single remote source; localhost integrations (NBXplorer/BTCPayServer,
+  the Electrum/Esplora-personality wallets, multiple local clients) open
+  several connections from `127.0.0.1` and were tripping a cap meant for
+  hostile peers. Bitcoin Core does not throttle localhost this way. The
+  total inbound cap still bounds loopback.
+- **New-tip blocks are now announced to peers (BIP 130 `headers` /
+  legacy `inv`).** satd connected blocks — whether self-mined via
+  `generatetoaddress`/`submitblock` or relayed — without advertising the
+  new tip to its peers, so an announcement-driven consumer (another node,
+  or a Core-client backend indexing blocks over P2P) learned the height
+  by polling yet never fetched the block and stayed unsynced. satd now
+  announces each connected tip (suppressed during bulk IBD); peers pull
+  the block with their existing `getdata` path.
+
+### Testing / CI
+
+- **NBXplorer and BTCPayServer compatibility canaries are now PR-gating**
+  (`scripts/canary/nbxplorer-smoke.sh`, `scripts/canary/btcpay-smoke.sh`;
+  `.github/workflows/canary.yml`). They boot the real downstream Docker
+  images against a satd regtest backend and assert full sync / healthy
+  operation end-to-end — the first canaries exercising real third-party
+  downstreams over RPC **and** P2P. See `STABILITY_POLICY.md`.
+
 ## [0.2.0] — 2026-05-27
 
 ### Network

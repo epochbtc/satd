@@ -8,6 +8,7 @@ use crate::rpc::amounts::{
     annotate_units, default_unit, format_amount, format_feerate_sat_per_kvb,
 };
 use crate::rpc::auth::{AuthLayer, RpcAuth};
+use crate::rpc::compat::JsonRpcCompatLayer;
 use crate::rpc::{address, blockchain, indexes, mining, network, psbt, rawtx, util};
 use crate::storage::Store;
 use jsonrpsee::server::{
@@ -1955,7 +1956,13 @@ async fn spawn_tls_surface(
     // Building once side-steps an HRTB inference quirk that bites if
     // you defer the `.build()` call into the per-connection `async`
     // block.
-    let tls_middleware = tower::ServiceBuilder::new().layer(AuthLayer::new(auth));
+    // AuthLayer is outermost so an unauthenticated request is rejected
+    // before the compat layer buffers its body; JsonRpcCompatLayer then
+    // normalizes Core-style (`jsonrpc` 1.0/1.1/absent) requests to 2.0
+    // so jsonrpsee accepts them (see `compat.rs`).
+    let tls_middleware = tower::ServiceBuilder::new()
+        .layer(AuthLayer::new(auth))
+        .layer(JsonRpcCompatLayer::new());
     let rpc_svc = ServerBuilder::new()
         .set_config(server_cfg)
         .set_http_middleware(tls_middleware)
@@ -2162,7 +2169,9 @@ pub async fn spawn_plain_surface(
 
     let (stop_handle, server_handle) = stop_channel();
 
-    let plain_middleware = tower::ServiceBuilder::new().layer(AuthLayer::new(auth));
+    let plain_middleware = tower::ServiceBuilder::new()
+        .layer(AuthLayer::new(auth))
+        .layer(JsonRpcCompatLayer::new());
     let rpc_svc = ServerBuilder::new()
         .set_config(server_cfg)
         .set_http_middleware(plain_middleware)

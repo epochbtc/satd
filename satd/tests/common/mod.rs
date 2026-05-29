@@ -360,6 +360,65 @@ impl TestNode {
         Ok(json)
     }
 
+    /// POST an exact request body string (verbatim, no shaping) and
+    /// return the parsed JSON response. Used to exercise Bitcoin Core
+    /// JSON-RPC compatibility: requests carrying `jsonrpc` 1.0 / 1.1 /
+    /// no version member at all, which Core accepts and the canonical
+    /// client libraries (NBitcoin, python-bitcoinrpc) emit.
+    pub fn rpc_call_raw_body(&self, body: &str) -> Result<serde_json::Value, String> {
+        let url = format!("http://127.0.0.1:{}/", self.rpcport);
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+        let (user, pass) = self
+            .cookie
+            .split_once(':')
+            .unwrap_or(("__cookie__", "none"));
+        let response = client
+            .post(&url)
+            .basic_auth(user, Some(pass))
+            .header("Content-Type", "application/json")
+            .body(body.to_string())
+            .send()
+            .map_err(|e| e.to_string())?;
+        let json: serde_json::Value = response.json().map_err(|e| e.to_string())?;
+        Ok(json)
+    }
+
+    /// POST an exact body string and report the transport outcome:
+    /// `Some(status)` if the server returned an HTTP response, or `None`
+    /// if the connection was dropped mid-send. Both are valid ways for
+    /// the server to reject an oversized body early (when it rejects on
+    /// `Content-Length` without draining the upload, the client's
+    /// in-flight write breaks before it can read the response) — what
+    /// must never happen is a hang or OOM. Used to assert the
+    /// request-size cap in the JSON-RPC compat shim.
+    pub fn rpc_post_raw_outcome(&self, body: &str) -> Option<u16> {
+        let url = format!("http://127.0.0.1:{}/", self.rpcport);
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .unwrap();
+        let (user, pass) = self
+            .cookie
+            .split_once(':')
+            .unwrap_or(("__cookie__", "none"));
+        match client
+            .post(&url)
+            .basic_auth(user, Some(pass))
+            .header("Content-Type", "application/json")
+            .body(body.to_string())
+            .send()
+        {
+            Ok(resp) => Some(resp.status().as_u16()),
+            // Connection dropped mid-send (e.g. broken pipe) — the server
+            // rejected without draining. Treated as a rejection, not a
+            // hang. The caller proves liveness with a follow-up request.
+            Err(_) => None,
+        }
+    }
+
     pub fn rpc_call_raw_status(&self, method: &str, user: &str, pass: &str) -> u16 {
         let url = format!("http://127.0.0.1:{}/", self.rpcport);
         let body = serde_json::json!({

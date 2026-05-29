@@ -38,7 +38,11 @@ as a bug unless explicitly enumerated below.
 - **JSON-RPC method shapes** — 80 Core-named methods, response field
   names + types preserved by default. RPC extensions are **opt-in per
   request** (the `amounts=sats` and structured-error patterns below)
-  rather than unconditional schema additions.
+  rather than unconditional schema additions. Like Core, the server
+  accepts JSON-RPC **1.0 / 1.1 / 2.0** request envelopes (and a missing
+  `jsonrpc` member), since the canonical Core client libraries —
+  NBitcoin/NBXplorer/BTCPayServer, `python-bitcoinrpc` — send the 1.0
+  form; responses use the JSON-RPC 2.0 shape.
 - **CLI flag names + defaults** — `-regtest`, `-datadir`, `-rpcport`,
   `-rpcuser`, `-rpcpassword`, `-prune`, `-txindex`, `-reindex`,
   `-reindex-chainstate`, `-assumevalid`, `-mempoolfullrbf`, `-maxmempool`,

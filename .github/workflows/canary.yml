@@ -10,13 +10,13 @@
 # — catching the failure mode where the in-tree clients incidentally
 # tolerate something a stricter consumer wouldn't.
 #
-# Currently active: Esplora (HTTP) + Electrum (TCP). The NBXplorer
-# canary script ships in-tree (`scripts/canary/nbxplorer-smoke.sh`)
-# but the workflow job is intentionally commented out pending a P2P
-# version-handshake interop fix — see STABILITY_POLICY.md and the
-# commented block further down. The active canaries are wire-shape
-# gates, not full third-party-container coverage; don't over-interpret
-# green here as a full downstream-compatibility seal.
+# Active jobs: Esplora (HTTP) + Electrum (TCP) wire-shape gates, plus
+# the real third-party-container canaries NBXplorer and BTCPayServer.
+# The container canaries boot the actual downstream images against a
+# satd regtest backend (NBXplorer indexes blocks over RPC + P2P;
+# BTCPayServer runs the whole merchant stack on top of NBXplorer), so
+# green here is a genuine end-to-end downstream-compatibility signal,
+# not just wire-shape parity.
 #
 # Triggers:
 #   - pull_request → PR-gating (required status check)
@@ -204,48 +204,86 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-  # NBXplorer canary — deferred to a follow-up PR.
+  # NBXplorer canary — the first real third-party downstream (not an
+  # in-tree library against in-tree code). Boots the real
+  # nicolasdorier/nbxplorer container (with a Postgres sidecar) against
+  # a satd regtest backend and asserts it handshakes, passes its RPC
+  # probe, and fully syncs + indexes 10 mined blocks over P2P. NBXplorer
+  # is the indexer underneath BTCPayServer, so green here is the
+  # load-bearing signal that the Core-client backend path works.
   #
-  # First-pass debugging surfaced a P2P version-handshake problem
-  # between satd and NBitcoin (NBXplorer's underlying lib): TCP
-  # connects, but NBitcoin's VersionHandshake raises "node is not in
-  # a connected state" before the handshake completes. The Postgres
-  # + container plumbing is wired up and working
-  # (scripts/canary/nbxplorer-smoke.sh) — the remaining work is
-  # diagnosing the P2P interop issue, which is a deeper rabbit hole
-  # than the rest of the launch-readiness bundle merits delaying for.
-  #
-  # The script is left in-tree so the follow-up PR is a one-line
-  # uncomment of this job (plus whatever P2P fix turns out to be
-  # required). See PR description for the deferral rationale.
-  #
-  # canary-nbxplorer:
-  #   name: canary / NBXplorer
-  #   needs: [build]
-  #   runs-on: ubuntu-24.04
-  #   timeout-minutes: 15
-  #
-  #   steps:
-  #     - name: Checkout
-  #       uses: actions/checkout@v4
-  #
-  #     - name: Download satd binaries
-  #       uses: actions/download-artifact@v4
-  #       with:
-  #         name: satd-canary-binaries
-  #         path: target/release/
-  #
-  #     - name: Mark binaries executable
-  #       run: chmod +x target/release/satd target/release/sat-cli
-  #
-  #     - name: Run NBXplorer canary
-  #       run: bash scripts/canary/nbxplorer-smoke.sh
-  #
-  #     - name: Upload satd log on failure
-  #       if: failure()
-  #       uses: actions/upload-artifact@v4
-  #       with:
-  #         name: nbxplorer-canary-logs
-  #         path: /tmp/satd-canary-nbxplorer.*/satd.log
-  #         if-no-files-found: ignore
-  #         retention-days: 7
+  # Surfaced (and now guards against regression of) four satd↔Core-client
+  # compatibility gaps: JSON-RPC 1.0/1.1 request acceptance, getpeerinfo
+  # field completeness (timeoffset/inflight), the per-IP inbound cap vs.
+  # loopback, and P2P block announcement on a new tip. See the PR that
+  # enabled this job.
+  canary-nbxplorer:
+    name: canary / NBXplorer
+    needs: [build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download satd binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: satd-canary-binaries
+          path: target/release/
+
+      - name: Mark binaries executable
+        run: chmod +x target/release/satd target/release/sat-cli
+
+      - name: Run NBXplorer canary
+        run: bash scripts/canary/nbxplorer-smoke.sh
+
+      - name: Upload satd log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nbxplorer-canary-logs
+          path: /tmp/satd-canary-nbxplorer.*/satd.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # BTCPayServer canary — the top of the stack. Boots the full
+  # satd + NBXplorer + Postgres + BTCPayServer deployment and asserts
+  # BTCPay reports healthy and BTC-synchronized against a satd backend
+  # (GET /api/v1/health -> {"synchronized": true}). Depends on the same
+  # satd compatibility surface the NBXplorer canary guards, plus
+  # BTCPay's own boot path; green here is the end-to-end "self-custody
+  # merchant stack runs on satd unmodified" signal. Heavier than the
+  # other canaries (multi-container, ~2-3 min BTCPay boot), hence the
+  # longer timeout.
+  canary-btcpay:
+    name: canary / BTCPayServer
+    needs: [build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download satd binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: satd-canary-binaries
+          path: target/release/
+
+      - name: Mark binaries executable
+        run: chmod +x target/release/satd target/release/sat-cli
+
+      - name: Run BTCPayServer canary
+        run: bash scripts/canary/btcpay-smoke.sh
+
+      - name: Upload satd log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: btcpay-canary-logs
+          path: /tmp/satd-canary-btcpay.*/satd.log
+          if-no-files-found: ignore
+          retention-days: 7
