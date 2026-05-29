@@ -31,13 +31,18 @@
 //! Matching Core's leniency here is a Tier 1 compatibility obligation
 //! (CLI/RPC wire shape) — see `STABILITY_POLICY.md`.
 
-use http_body_util::BodyExt;
+use http_body_util::{BodyExt, Limited};
 use jsonrpsee::server::{HttpBody, HttpRequest, HttpResponse};
 
 /// jsonrpsee's default `max_request_body_size` (10 MiB). The shim must
-/// not buffer more than the engine would itself accept; a larger body is
-/// forwarded untouched so jsonrpsee returns its own oversized-request
-/// error rather than this layer silently truncating or OOMing.
+/// not buffer more than the engine would itself accept. The cap is
+/// enforced *while* reading the body (via `http_body_util::Limited`,
+/// plus a `Content-Length` pre-check), never after a full
+/// `collect()` — otherwise this middleware would itself be a memory-DoS
+/// vector, allocating the entire (authenticated or not) request body
+/// before the limit could reject it. An over-limit request is answered
+/// with `413 Payload Too Large`, the same outcome jsonrpsee gives for a
+/// request exceeding its own `max_request_body_size`.
 const MAX_NORMALIZE_BODY: usize = 10 * 1024 * 1024;
 
 /// Rewrite a JSON-RPC request body so Core-style (`1.0` / `1.1` /
@@ -46,6 +51,9 @@ const MAX_NORMALIZE_BODY: usize = 10 * 1024 * 1024;
 /// request object needing a fix), so the caller forwards the original
 /// bytes verbatim.
 fn normalize_jsonrpc_version(body: &[u8]) -> Option<Vec<u8>> {
+    // The body is already size-bounded by the caller (Content-Length
+    // pre-check + `Limited` read), so this only guards the empty case;
+    // the length check is kept as defense-in-depth.
     if body.is_empty() || body.len() > MAX_NORMALIZE_BODY {
         return None;
     }
@@ -152,14 +160,33 @@ where
         Box::pin(async move {
             let (parts, body) = req.into_parts();
 
-            // Buffer the body. On any collection error, fall back to an
-            // empty body so the inner service produces a normal parse
-            // error rather than this layer failing the connection.
-            let collected = body
-                .collect()
-                .await
-                .map(|b| b.to_bytes())
-                .unwrap_or_default();
+            // Reject before reading a byte if the declared length already
+            // exceeds the cap. Covers the common DoS shape (a client
+            // advertising a huge `Content-Length`) without allocating.
+            if let Some(len) = parts
+                .headers
+                .get(hyper::header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<usize>().ok())
+                && len > MAX_NORMALIZE_BODY
+            {
+                return Ok(payload_too_large());
+            }
+
+            // Bound the actual read: `Limited` returns an error once more
+            // than `MAX_NORMALIZE_BODY` bytes arrive, so a chunked /
+            // length-omitting body cannot force unbounded allocation
+            // either. On the length-limit error answer 413; any other
+            // (transport) error yields an empty body so the inner service
+            // produces a normal parse/te error rather than this layer
+            // panicking.
+            let collected = match Limited::new(body, MAX_NORMALIZE_BODY).collect().await {
+                Ok(buf) => buf.to_bytes(),
+                Err(e) if e.downcast_ref::<http_body_util::LengthLimitError>().is_some() => {
+                    return Ok(payload_too_large());
+                }
+                Err(_) => bytes::Bytes::new(),
+            };
 
             let new_body = match normalize_jsonrpc_version(&collected) {
                 Some(rewritten) => HttpBody::from(rewritten),
@@ -170,6 +197,16 @@ where
             inner.call(new_req).await
         })
     }
+}
+
+/// `413 Payload Too Large` — the response for a request body exceeding
+/// [`MAX_NORMALIZE_BODY`], matching jsonrpsee's own oversized-request
+/// outcome.
+fn payload_too_large() -> HttpResponse<HttpBody> {
+    hyper::Response::builder()
+        .status(hyper::StatusCode::PAYLOAD_TOO_LARGE)
+        .body(HttpBody::from("Payload Too Large"))
+        .expect("static 413 response is always valid")
 }
 
 #[cfg(test)]
