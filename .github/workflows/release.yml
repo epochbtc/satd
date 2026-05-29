@@ -142,8 +142,8 @@ jobs:
           set -euo pipefail
           # cargo-cyclonedx writes one .cdx.json per workspace member into
           # that member's directory. We want the binaries' SBOMs only —
-          # collect satd.cdx.json + sat-cli.cdx.json, version-suffix the
-          # filenames, drop the rest.
+          # collect satd.cdx.json + sat-cli.cdx.json + sat-tui.cdx.json,
+          # version-suffix the filenames, drop the rest.
           #
           # CycloneDX 1.5 is the current widely-tooled spec version. 1.6
           # is the latest but adds only minor enrichment (e.g. licensing
@@ -154,6 +154,7 @@ jobs:
           v="${{ steps.version.outputs.version }}"
           cp satd/satd.cdx.json       "sbom/satd-v${v}.cdx.json"
           cp sat-cli/sat-cli.cdx.json "sbom/sat-cli-v${v}.cdx.json"
+          cp sat-tui/sat-tui.cdx.json "sbom/sat-tui-v${v}.cdx.json"
           cd sbom
           for f in *.cdx.json; do
             sha256sum "$f" > "${f}.sha256"
@@ -170,7 +171,7 @@ jobs:
         run: |
           set -euo pipefail
           v="${{ steps.version.outputs.version }}"
-          for f in sbom/satd-v${v}.cdx.json sbom/sat-cli-v${v}.cdx.json; do
+          for f in sbom/satd-v${v}.cdx.json sbom/sat-cli-v${v}.cdx.json sbom/sat-tui-v${v}.cdx.json; do
             jq empty "$f"
             n=$(jq '.components | length' "$f")
             if [[ "$n" -lt 10 ]]; then
@@ -317,7 +318,7 @@ jobs:
         if: matrix.use_zigbuild != true
         run: |
           cargo build --release --locked \
-            --bin satd --bin sat-cli \
+            --bin satd --bin sat-cli --bin sat-tui \
             --target ${{ matrix.target }}
 
       - name: Build release binaries (zigbuild)
@@ -330,7 +331,7 @@ jobs:
           # is fragile — `libclang-dev` on ubuntu-24.04 currently
           # points to libclang-18, but that's not contractual.
           cargo zigbuild --release --locked \
-            --bin satd --bin sat-cli \
+            --bin satd --bin sat-cli --bin sat-tui \
             --target ${{ matrix.target }}
 
       - name: Determine version string
@@ -353,11 +354,13 @@ jobs:
           mkdir -p "$stage/bin"
           cp "target/${{ matrix.target }}/release/satd"    "$stage/bin/satd"
           cp "target/${{ matrix.target }}/release/sat-cli" "$stage/bin/sat-cli"
+          cp "target/${{ matrix.target }}/release/sat-tui" "$stage/bin/sat-tui"
           # Strip is best-effort: macOS strip on cross-compiled aarch64
           # binaries from a macos-13 runner can fail on signature
           # checks. Don't gate the release on it.
           strip "$stage/bin/satd"    || true
           strip "$stage/bin/sat-cli" || true
+          strip "$stage/bin/sat-tui" || true
           cp README.md           "$stage/README.md"
           cp docs/PACKAGING.md   "$stage/PACKAGING.md"
           cp CORE_DIFFERENCES.md "$stage/CORE_DIFFERENCES.md"
