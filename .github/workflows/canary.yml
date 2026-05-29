@@ -409,3 +409,48 @@ jobs:
           path: /tmp/satd-canary-core.*/satd.log
           if-no-files-found: ignore
           retention-days: 7
+
+  # LND Neutrino canary — runs a real LND node as a BIP 157/158 light
+  # client (Neutrino) backed by satd over P2P. The dominant Lightning
+  # light-client backend; it exercises a path nothing else does — satd
+  # serving BIP 158 compact block filters + filter headers over P2P
+  # (`--peerblockfilters=1` → NODE_COMPACT_FILTERS, getcfilters/
+  # getcfheaders/getcfcheckpt). Asserts LND reaches synced_to_chain at
+  # satd's tip, then that a single filter-matched funding block is
+  # selectively downloaded and credited to LND's wallet.
+  canary-lnd-neutrino:
+    name: canary / LND Neutrino
+    needs: [build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install jq
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends jq
+
+      - name: Download satd binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: satd-canary-binaries
+          path: target/release/
+
+      - name: Mark binaries executable
+        run: chmod +x target/release/satd target/release/sat-cli
+
+      - name: Run LND Neutrino canary
+        run: bash scripts/canary/lnd-neutrino-smoke.sh
+
+      - name: Upload satd log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lnd-neutrino-canary-logs
+          path: /tmp/satd-canary-lnd.*/satd.log
+          if-no-files-found: ignore
+          retention-days: 7

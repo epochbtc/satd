@@ -120,6 +120,13 @@ layout) per `STABILITY_POLICY.md`.
   block sync both ways (satd↔Core), and tx relay both ways. The only canary
   that tests satd against the reference implementation directly; it surfaced
   the two P2P fixes above. See `STABILITY_POLICY.md`.
+- **LND Neutrino canary is now PR-gating**
+  (`scripts/canary/lnd-neutrino-smoke.sh`). Runs a real LND node
+  (`lightninglabs/lnd:v0.18.5-beta`) as a BIP 157/158 light client backed by
+  satd over P2P — the only canary exercising satd's compact-block-filter
+  serving (`--peerblockfilters=1`). Asserts LND reaches `synced_to_chain` at
+  satd's tip and that a single filter-matched funding block is selectively
+  downloaded and credited to LND's wallet. See `STABILITY_POLICY.md`.
 
 ## [0.2.1] — 2026-05-29
 
