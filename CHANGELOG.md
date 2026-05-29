@@ -8,6 +8,66 @@ layout) per `STABILITY_POLICY.md`.
 
 ## [Unreleased]
 
+### Monitoring
+
+- **Startup/reindex progress timing is now computed daemon-side.** The node
+  tracks elapsed time, throughput rate, and ETA for the pre-RPC startup
+  phases (reindex scan/connect, chainstate replay, and the AssumeUTXO
+  fast-start download) and reports them on `getstartupinfo` as `elapsed_secs`,
+  `total_elapsed_secs`, `rate`, and `eta_secs`. Previously `sat-tui` derived
+  these client-side from a cold sample window, so elapsed reset to zero on
+  every TUI launch, rate took tens of seconds to appear, and ETA stayed
+  blank. Reindex ETAs reuse the weight-aware IBD estimator — which models the
+  ~50x per-block processing-cost variation across Bitcoin's history — for a
+  stable, converging estimate; the fast-start download gets a simple
+  remaining-bytes/rate ETA. `getstartupinfo` is a satd-native pre-init RPC
+  with no Bitcoin Core equivalent, so the added fields don't affect Core
+  compatibility.
+
+### RPC / P2P compatibility (Bitcoin Core clients)
+
+- **JSON-RPC 1.0 / 1.1 requests are now accepted.** satd's RPC server
+  previously required strict `"jsonrpc":"2.0"` and rejected any other
+  form (including a missing `jsonrpc` member) with `-32600 Invalid
+  request`. Bitcoin Core accepts the 1.0/1.1 shapes, and the canonical
+  Core client libraries emit them — NBitcoin (→ NBXplorer → BTCPayServer)
+  sends `"jsonrpc":"1.0"`, and `python-bitcoinrpc` and many scripts omit
+  the member. satd now normalizes request bodies (a `"method"`-bearing
+  object, single or batched, gets `"jsonrpc":"2.0"`) before dispatch, so
+  these clients work unmodified. Malformed bodies still yield the correct
+  `-32700` parse error; responses keep their JSON-RPC 2.0 shape (the Core
+  client libraries read `result`/`error`/`id` and don't validate it).
+- **`getpeerinfo` now includes `timeoffset` and `inflight`.** Bitcoin
+  Core always emits both, and Core client libraries read them without a
+  null guard (NBitcoin's `GetPeersInfoAsync` threw on their absence,
+  aborting its node connection). `timeoffset` reports `0` (satd does not
+  track a per-peer clock offset); `inflight` is an array of in-flight
+  block heights, empty in this per-peer record.
+- **The per-IP inbound connection cap (`-maxinboundperip`, default 3) no
+  longer applies to loopback.** It is an anti-eclipse guard against a
+  single remote source; localhost integrations (NBXplorer/BTCPayServer,
+  the Electrum/Esplora-personality wallets, multiple local clients) open
+  several connections from `127.0.0.1` and were tripping a cap meant for
+  hostile peers. Bitcoin Core does not throttle localhost this way. The
+  total inbound cap still bounds loopback.
+- **New-tip blocks are now announced to peers (BIP 130 `headers` /
+  legacy `inv`).** satd connected blocks — whether self-mined via
+  `generatetoaddress`/`submitblock` or relayed — without advertising the
+  new tip to its peers, so an announcement-driven consumer (another node,
+  or a Core-client backend indexing blocks over P2P) learned the height
+  by polling yet never fetched the block and stayed unsynced. satd now
+  announces each connected tip (suppressed during bulk IBD); peers pull
+  the block with their existing `getdata` path.
+
+### Testing / CI
+
+- **NBXplorer and BTCPayServer compatibility canaries are now PR-gating**
+  (`scripts/canary/nbxplorer-smoke.sh`, `scripts/canary/btcpay-smoke.sh`;
+  `.github/workflows/canary.yml`). They boot the real downstream Docker
+  images against a satd regtest backend and assert full sync / healthy
+  operation end-to-end — the first canaries exercising real third-party
+  downstreams over RPC **and** P2P. See `STABILITY_POLICY.md`.
+
 ## [0.2.1] — 2026-05-29
 
 ### Packaging

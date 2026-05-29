@@ -3,6 +3,7 @@ pub mod allowip;
 pub mod amounts;
 pub mod auth;
 pub mod blockchain;
+pub mod compat;
 pub mod error;
 pub mod indexes;
 pub mod mining;

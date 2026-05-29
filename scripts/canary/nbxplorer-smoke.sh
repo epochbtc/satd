@@ -123,6 +123,16 @@ done
 # `NBXPLORER_NOAUTH=1` disables NBXplorer's own client auth — this is
 # a localhost-only canary, the NBXplorer API surface never leaves
 # the runner.
+#
+# `NBXPLORER_NOWARMUP=1` disables NBXplorer's regtest auto-mining
+# warmup. That warmup calls `getnewaddress` + `generate`, which satd
+# deliberately does not implement: satd is keyless by design and ships
+# no wallet RPCs (see CORE_DIFFERENCES.md "Intentional exclusions").
+# This canary mines its own blocks below via `generatetoaddress` to a
+# fixed address, so the node-side warmup is both unnecessary and
+# incompatible with a keyless node. (Bitcoin Core only has
+# `getnewaddress` because it bundles a wallet; pointing NBXplorer at a
+# wallet-less node is exactly the satd deployment model.)
 docker run -d \
     --name "$NBXPLORER_CONTAINER" \
     --network=host \
@@ -135,6 +145,7 @@ docker run -d \
     -e "NBXPLORER_BTCNODEENDPOINT=127.0.0.1:$((RPC_PORT + 1))" \
     -e "NBXPLORER_POSTGRES=Host=127.0.0.1;Port=$POSTGRES_PORT;Database=nbxplorer;Username=postgres;Password=$POSTGRES_PASSWORD" \
     -e "NBXPLORER_NOAUTH=1" \
+    -e "NBXPLORER_NOWARMUP=1" \
     "$NBXPLORER_IMAGE"
 
 # Poll NBXplorer status with a 5-minute budget. Regtest sync of an
@@ -167,8 +178,15 @@ if [[ $(date +%s) -ge $deadline ]]; then
     exit 1
 fi
 
-# Mine 10 blocks and verify NBXplorer follows. IsFullySynched ==
-# true and headers == blocks count is the contract.
+# Mine 10 blocks and verify NBXplorer follows end-to-end. This is the
+# load-bearing assertion: reaching `isFullySynched == true` at
+# chainHeight 10 means NBXplorer not only learned the new tip (RPC +
+# header announcement) but actually pulled and indexed each block over
+# P2P (`getdata`/`block`) — the full Core-client backend path. It is
+# also the exact path that regressed historically (satd announced no
+# blocks to peers, so the indexer learned the height but sat forever at
+# syncHeight 0). We additionally assert the node's own block/header
+# counts agree at 10 so a partial-sync state can't masquerade as a pass.
 # Deterministic P2WPKH from secret [0x11; 32].
 ADDR="bcrt1ql3e9pgs3mmwuwrh95fecme0s0qtn2880hlwwpw"
 sat_cli generatetoaddress 10 "$ADDR" > /dev/null
@@ -176,8 +194,10 @@ sat_cli generatetoaddress 10 "$ADDR" > /dev/null
 deadline=$(($(date +%s) + 60))
 while [[ $(date +%s) -lt $deadline ]]; do
     status=$(curl -sf --max-time 10 "$NBX_BASE/v1/cryptos/btc/status")
-    if jq -e '.isFullySynched == true and .chainHeight == 10' <<< "$status" > /dev/null; then
-        echo "ok: NBXplorer synced to height 10:"
+    if jq -e '.isFullySynched == true and .chainHeight == 10
+              and .bitcoinStatus.blocks == 10
+              and .bitcoinStatus.headers == 10' <<< "$status" > /dev/null; then
+        echo "ok: NBXplorer fully synced + indexed to height 10:"
         jq '.' <<< "$status"
         echo "nbxplorer canary: PASS"
         exit 0
