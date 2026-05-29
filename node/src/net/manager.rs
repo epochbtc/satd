@@ -3110,6 +3110,30 @@ impl PeerManager {
         }
     }
 
+    /// Announce a locally-originated transaction (submitted via the
+    /// `sendrawtransaction` RPC) to all fee-permitting peers.
+    ///
+    /// Without this, an RPC-broadcast tx enters the mempool but is never
+    /// announced to the network, so it never propagates — peers only
+    /// learn of txs we received from *another* peer (via `broadcast_inv`
+    /// on the relay path). This is the local-origin counterpart: there is
+    /// no source peer to exclude, so it invs every connected peer whose
+    /// fee filter the tx clears. It is called synchronously from the RPC
+    /// handler (not via the lossy mempool event broadcast) so a
+    /// successful `sendrawtransaction` reliably reaches the wire.
+    pub fn announce_tx(&self, txid: bitcoin::Txid) {
+        let entry_fee_rate = self.mempool.get(&txid).map(|e| e.fee_rate).unwrap_or(0);
+        let inv = NetworkMessage::Inv(vec![Inventory::WitnessTransaction(txid)]);
+        let peers = self.peers.read();
+        for handle in peers.values() {
+            if handle.info.state == PeerState::Connected
+                && entry_fee_rate >= handle.info.fee_filter
+            {
+                let _ = handle.msg_tx.try_send(inv.clone());
+            }
+        }
+    }
+
     /// BFS-drain orphans that listed `parent` as a missing parent. Newly
     /// admitted children recursively trigger further drains. Orphans that
     /// still don't validate (other missing parents, or genuinely invalid)
@@ -3392,7 +3416,23 @@ impl PeerManager {
         let mut not_found = Vec::new();
         for inv in inventory {
             match inv {
-                Inventory::Block(hash) | Inventory::WitnessBlock(hash) => {
+                // `MSG_CMPCT_BLOCK` (BIP 152). A peer requests the tip block
+                // as a compact block when it has a high-bandwidth compact-
+                // relay relationship with us — Bitcoin Core does this for
+                // the block immediately after its tip. We don't yet build
+                // `cmpctblock` responses, but BIP 152 explicitly permits
+                // answering a `MSG_CMPCT_BLOCK` getdata with a full `block`
+                // message (it is what Core itself sends for any block more
+                // than a few back from the tip), and Core accepts the full
+                // block against its in-flight compact request. Serving it
+                // as a full block is therefore correct; the alternative —
+                // letting it fall through to `_ => {}` — silently drops the
+                // request, so a Core peer stalls forever on the next block
+                // (it never re-requests). Treat it exactly like a block
+                // request.
+                Inventory::Block(hash)
+                | Inventory::WitnessBlock(hash)
+                | Inventory::CompactBlock(hash) => {
                     if let Some(block) = self.chain_state.get_block(&hash) {
                         // -maxuploadtarget: decline historical blocks once
                         // the rolling budget is spent (download/noban peers

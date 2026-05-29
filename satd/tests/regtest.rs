@@ -944,6 +944,129 @@ fn test_block_sync_between_nodes() {
 }
 
 #[test]
+fn test_rpc_submitted_tx_relays_to_peer() {
+    // Regression: a transaction submitted via `sendrawtransaction` must be
+    // announced to peers so it propagates to the network. Before the fix,
+    // only txs RECEIVED from another peer were relayed (`broadcast_inv` on
+    // the relay path); an RPC-submitted tx entered the local mempool but was
+    // never `inv`'d to peers, so an RPC broadcast never left the node. The
+    // Bitcoin Core interop canary caught this end-to-end; this locks it in
+    // with two satd nodes. The peer is connected BEFORE the broadcast —
+    // relay is push-based, so a late-joining peer wouldn't learn an
+    // already-broadcast mempool tx.
+    use bitcoin::hashes::Hash as _;
+    use bitcoin::key::CompressedPublicKey;
+    use bitcoin::secp256k1::{Message, Secp256k1, SecretKey};
+    use bitcoin::sighash::{EcdsaSighashType, SighashCache};
+    use bitcoin::{
+        Address, Amount, Network, OutPoint, PublicKey, ScriptBuf, Sequence, Transaction, TxIn,
+        TxOut, Witness, absolute::LockTime,
+    };
+    use std::str::FromStr;
+
+    let p2p_port_a = find_available_port();
+    let mut node_a = TestNode::start(&[&format!("--port={}", p2p_port_a)]);
+
+    // Fund a known key: mine 101 blocks to it so block-1's coinbase matures.
+    let secp = Secp256k1::new();
+    let sk = SecretKey::from_slice(&[0x73u8; 32]).unwrap();
+    let pk = PublicKey::new(sk.public_key(&secp));
+    let cpk = CompressedPublicKey::from_slice(&pk.to_bytes()).unwrap();
+    let src_addr = Address::p2wpkh(&cpk, Network::Regtest);
+    node_a
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(101), serde_json::json!(src_addr.to_string())],
+        )
+        .unwrap();
+
+    // Connect node B and let it sync the chain BEFORE we broadcast.
+    let mut node_b = TestNode::start(&[&format!("--connect=127.0.0.1:{}", p2p_port_a)]);
+    poll_until(
+        || get_rpc_u64(&node_b, "getblockcount").unwrap_or(0) >= 101,
+        Duration::from_secs(30),
+        "node B did not sync to height 101",
+    );
+
+    // Build + sign a spend of block-1's coinbase (do NOT broadcast yet).
+    let block1_hash = node_a
+        .rpc_call_with_params("getblockhash", vec![serde_json::json!(1)])
+        .unwrap()["result"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let block1 = node_a
+        .rpc_call_with_params(
+            "getblock",
+            vec![serde_json::json!(block1_hash), serde_json::json!(1)],
+        )
+        .unwrap();
+    let cb_txid = bitcoin::Txid::from_str(block1["result"]["tx"][0].as_str().unwrap()).unwrap();
+    let cb_value = 50u64 * 100_000_000;
+    let dest = Address::from_str("bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202")
+        .unwrap()
+        .require_network(Network::Regtest)
+        .unwrap()
+        .script_pubkey();
+
+    let mut spend = Transaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint { txid: cb_txid, vout: 0 },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(cb_value - 1000),
+            script_pubkey: dest,
+        }],
+    };
+    let src_script = src_addr.script_pubkey();
+    let sighash = SighashCache::new(&spend)
+        .p2wpkh_signature_hash(0, &src_script, Amount::from_sat(cb_value), EcdsaSighashType::All)
+        .unwrap();
+    let sig = secp.sign_ecdsa(&Message::from_digest(sighash.to_byte_array()), &sk);
+    let mut sig_bytes = sig.serialize_der().to_vec();
+    sig_bytes.push(EcdsaSighashType::All as u8);
+    let mut witness = Witness::new();
+    witness.push(sig_bytes);
+    witness.push(pk.to_bytes());
+    spend.input[0].witness = witness;
+    let raw_hex = hex::encode(bitcoin::consensus::serialize(&spend));
+    let spend_txid = spend.compute_txid().to_string();
+
+    // Broadcast via node A's RPC — the path under test.
+    let returned = node_a
+        .rpc_call_with_params("sendrawtransaction", vec![serde_json::json!(raw_hex)])
+        .unwrap()["result"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(returned, spend_txid, "sendrawtransaction echoes the txid");
+
+    // Node B must learn the tx purely via relay: announce_tx -> inv ->
+    // getdata -> tx. Before the fix this never happened and B's mempool
+    // stayed empty.
+    poll_until(
+        || {
+            node_b
+                .rpc_call("getrawmempool")
+                .ok()
+                .and_then(|v| v["result"].as_array().cloned())
+                .map(|a| a.iter().any(|t| t.as_str() == Some(spend_txid.as_str())))
+                .unwrap_or(false)
+        },
+        Duration::from_secs(30),
+        "RPC-submitted tx did not relay to peer node B",
+    );
+
+    node_b.stop();
+    node_a.stop();
+}
+
+#[test]
 fn test_parallel_ibd() {
     let p2p_port_a = find_available_port();
     let mut node_a = TestNode::start(&[&format!("--port={}", p2p_port_a)]);

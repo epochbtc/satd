@@ -21,7 +21,10 @@
 # The BDK canary is the analogous real-consumer gate for the Electrum +
 # Esplora surfaces: it exercises the realistic wallet workflow (full_scan,
 # coinbase-maturity accounting, broadcast, cross-surface consistency)
-# that the wire-shape smoke jobs don't.
+# that the wire-shape smoke jobs don't. The Bitcoin Core interop canary
+# peers satd with a real bitcoind and checks bidirectional P2P interop
+# (handshake, BIP324 v2 transport, block sync + tx relay both ways) —
+# the only canary that tests satd against the reference node directly.
 #
 # Triggers:
 #   - pull_request → PR-gating (required status check)
@@ -355,5 +358,54 @@ jobs:
         with:
           name: bdk-canary-logs
           path: /tmp/satd-canary-bdk.*/satd.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # Bitcoin Core P2P interop canary — the only canary that tests satd
+  # against the reference implementation itself. Peers satd with a real
+  # bitcoind regtest node and verifies bidirectional P2P interop:
+  # handshake + identity, BIP324 v2 encrypted transport, block sync in
+  # BOTH directions, and tx relay in BOTH directions. Catches consensus/
+  # relay/wire drift vs. Core directly (not via a downstream's tolerance).
+  #
+  # Surfaced (and now guards against regression of) two satd P2P bugs:
+  # `getdata MSG_CMPCT_BLOCK` was silently dropped (so satd-mined blocks
+  # never reached a Core peer that requested the tip as a compact block),
+  # and `sendrawtransaction`-submitted txs were never announced to peers
+  # (so RPC broadcasts never propagated). See the PR that added this job.
+  canary-core-interop:
+    name: canary / Bitcoin Core interop
+    needs: [build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install jq
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends jq
+
+      - name: Download satd binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: satd-canary-binaries
+          path: target/release/
+
+      - name: Mark binaries executable
+        run: chmod +x target/release/satd target/release/sat-cli
+
+      - name: Run Bitcoin Core interop canary
+        run: bash scripts/canary/core-interop-smoke.sh
+
+      - name: Upload satd log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-interop-canary-logs
+          path: /tmp/satd-canary-core.*/satd.log
           if-no-files-found: ignore
           retention-days: 7
