@@ -1023,6 +1023,75 @@ fn test_e2e_esplora_block_family_suite() {
 }
 
 #[test]
+fn test_e2e_esplora_coinbase_vin_shape() {
+    // Regression guard for the coinbase `vin` wire shape. Upstream
+    // Esplora ALWAYS emits `txid` (all-zeros), `vout` (4294967295), and
+    // `prevout` (null) on a coinbase input. satd previously omitted all
+    // three, which made strict typed clients (BDK's `esplora_client`
+    // types `vin[].txid` as a required `Txid`) fail to deserialize any
+    // tx with a coinbase input — i.e. every coinbase, breaking wallet
+    // `full_scan` over coinbase-funded addresses. The BDK descriptor-
+    // wallet canary (scripts/canary/bdk-canary) caught this; this test
+    // locks the exact shape so it can't regress without the in-tree
+    // suite going red too.
+    let mut e2e = E2eNode::boot_with(&esplora_e2e_args());
+    let esplora = esplora_for(&e2e);
+    let wallet = DeterministicWallet::from_secret([0x11u8; 32]);
+
+    let _ = e2e
+        .node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![
+                serde_json::json!(1),
+                serde_json::json!(wallet.address.to_string()),
+            ],
+        )
+        .expect("generatetoaddress 1");
+
+    // The block-1 coinbase txid via the block-family endpoints.
+    let h1_hash = e2e
+        .node
+        .rpc_call_with_params("getblockhash", vec![serde_json::json!(1)])
+        .expect("getblockhash 1")["result"]
+        .as_str()
+        .expect("hash string")
+        .to_string();
+    let cb_txid = esplora_get_json(&esplora, &format!("/block/{}/txids", h1_hash))[0]
+        .as_str()
+        .expect("coinbase txid")
+        .to_string();
+
+    let tx = esplora_get_json(&esplora, &format!("/tx/{}", cb_txid));
+    let vin = tx["vin"].as_array().expect("vin array");
+    assert_eq!(vin.len(), 1, "coinbase tx has exactly one input");
+    let cb = &vin[0];
+
+    assert_eq!(
+        cb["txid"].as_str(),
+        Some("0000000000000000000000000000000000000000000000000000000000000000"),
+        "coinbase vin.txid present as all-zeros (upstream-exact)"
+    );
+    assert_eq!(
+        cb["vout"].as_u64(),
+        Some(4294967295),
+        "coinbase vin.vout present as 0xffffffff (upstream-exact)"
+    );
+    assert!(
+        cb.get("prevout").is_some() && cb["prevout"].is_null(),
+        "coinbase vin.prevout present and null (not omitted), got {:?}",
+        cb.get("prevout")
+    );
+    assert_eq!(cb["is_coinbase"], true, "is_coinbase true");
+    assert!(
+        cb["sequence"].as_u64().is_some(),
+        "sequence present on coinbase vin"
+    );
+
+    e2e.node.stop();
+}
+
+#[test]
 fn test_e2e_esplora_tx_family_suite() {
     // Boot once, mature cb1, broadcast a spend, mine 1, then assert
     // every tx-family endpoint against the confirmed spend.

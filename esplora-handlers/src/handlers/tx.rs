@@ -134,11 +134,21 @@ pub struct PrevOutJson {
 
 #[derive(Debug, Serialize)]
 pub struct VinJson {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub txid: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub vout: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Outpoint txid. ALWAYS present, including for coinbase inputs —
+    /// upstream Esplora emits the all-zeros txid for coinbase, so a
+    /// coinbase's `previous_output.txid` (which IS the null txid)
+    /// serializes to "0000…0000", byte-for-byte matching upstream.
+    /// Must not be omitted: strict typed clients (e.g. BDK's
+    /// `esplora_client`) type this as a required field and fail to
+    /// deserialize the whole tx if it is absent.
+    pub txid: String,
+    /// Outpoint vout. ALWAYS present; `4294967295` for coinbase (the
+    /// null outpoint's vout). Same required-field rationale as `txid`.
+    pub vout: u32,
+    /// Resolved previous output, or `null`. Serialized as explicit
+    /// `null` (not omitted) for coinbase inputs and for any input whose
+    /// prevout could not be resolved — matching upstream Esplora, which
+    /// always emits the `prevout` key.
     pub prevout: Option<PrevOutJson>,
     pub scriptsig: String,
     pub scriptsig_asm: String,
@@ -303,16 +313,11 @@ fn build_tx_json(
         };
         let witness: Vec<String> = input.witness.iter().map(hex::encode).collect();
         vin.push(VinJson {
-            txid: if is_coinbase {
-                None
-            } else {
-                Some(input.previous_output.txid.to_string())
-            },
-            vout: if is_coinbase {
-                None
-            } else {
-                Some(input.previous_output.vout)
-            },
+            // Always emit txid/vout from the outpoint. For coinbase the
+            // outpoint is null → "0000…0000" / 4294967295, exactly what
+            // upstream Esplora returns.
+            txid: input.previous_output.txid.to_string(),
+            vout: input.previous_output.vout,
             prevout,
             scriptsig: hex::encode(input.script_sig.as_bytes()),
             scriptsig_asm: input.script_sig.to_asm_string(),

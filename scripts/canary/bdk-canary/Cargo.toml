@@ -1,0 +1,40 @@
+# BDK descriptor-wallet canary — a standalone third-party consumer of
+# satd's Electrum + Esplora surfaces, NOT a member of the satd
+# workspace. The empty `[workspace]` table below detaches it from the
+# parent workspace so:
+#   - the heavy BDK dependency tree never leaks into satd's own build
+#     or Cargo.lock, and
+#   - it resolves exactly like a real downstream project would: its own
+#     lockfile, its own published-crate versions.
+#
+# Pins mirror the BDK 2.x release train (bdk_wallet 2.x + bdk_electrum
+# 0.23 + bdk_esplora 0.22 share the same bdk_core, so the FullScan
+# update types unify across both backends). Bumping a pin is a
+# deliberate maintenance step in a follow-up PR after re-verifying the
+# canary still passes — the same policy as the container canaries.
+[workspace]
+
+[package]
+name = "bdk-canary"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "bdk-canary"
+path = "src/main.rs"
+
+[dependencies]
+# The dominant descriptor-wallet toolkit; the canonical real-world
+# consumer of both the Electrum and Esplora surfaces (Bitkey, Bull
+# Bitcoin, and many others build on it).
+bdk_wallet = "2.1"
+bdk_electrum = "0.23"
+bdk_esplora = { version = "0.22", features = ["blocking"] }
+# Used ONLY to advance the regtest chain (generatetoaddress). On
+# mainnet this is what miners do; here it is the test driver's
+# chain-advancement affordance. Every *wallet* operation (scan,
+# broadcast) goes through the Electrum/Esplora surfaces under test.
+bitcoincore-rpc = "0.19"
+serde_json = "1"
+anyhow = "1"
