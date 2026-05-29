@@ -81,6 +81,23 @@ layout) per `STABILITY_POLICY.md`.
   canary; locked by a new two-node regression test
   (`test_rpc_submitted_tx_relays_to_peer`).
 
+### RPC amount formatting (Bitcoin Core parity)
+
+- **BTC-denominated amounts are now emitted with a fixed 8 decimal places**
+  (`0.00001000`), byte-for-byte matching Bitcoin Core's `%d.%08d` output,
+  instead of the shortest form (`0.00001`). satd previously rendered
+  amounts via `serde_json`'s default f64 formatting, which strips trailing
+  zeros — and strict Core-amount parsers reject that. In particular **Core
+  Lightning's `bcli` plugin** (`json_to_bitcoin_amount`, which reads exactly
+  8 fractional digits) failed on `getmempoolinfo`/`estimatefees`, so CLN
+  could not start against satd at all. Formatting is now done from the
+  integer satoshi value (exact for every amount, no f64 drift) and emitted
+  as a JSON **number** literal via `serde_json`'s `arbitrary_precision`
+  feature. Affects every BTC-mode amount field (`getmempoolinfo`,
+  `gettxout`, `getbalance`, `getrawmempool` fees, `estimatesmartfee`, …);
+  the satoshi-unit mode (`-rpc-default-units=sats`) is unchanged. Surfaced
+  by the new Core Lightning canary.
+
 ### Esplora
 
 - **Coinbase transaction inputs now carry `txid`, `vout`, and `prevout`.**
@@ -120,6 +137,12 @@ layout) per `STABILITY_POLICY.md`.
   block sync both ways (satd↔Core), and tx relay both ways. The only canary
   that tests satd against the reference implementation directly; it surfaced
   the two P2P fixes above. See `STABILITY_POLICY.md`.
+- **Core Lightning (CLN) canary is now PR-gating**
+  (`scripts/canary/cln-smoke.sh`). Runs a real CLN node
+  (`elementsproject/lightningd:v24.11`) with satd as its Bitcoin backend
+  over JSON-RPC (`bcli`, no ZMQ). Asserts CLN syncs against satd and that a
+  funded+matured wallet address shows in `listfunds`. Surfaced the
+  Core-amount formatting fix above. See `STABILITY_POLICY.md`.
 - **Electrum reference-wallet canary is now PR-gating**
   (`scripts/canary/electrum-wallet-smoke.sh`). Runs the actual Electrum
   wallet (`spesmilo/electrum` 4.5.8) headless against satd's Electrum

@@ -21,7 +21,15 @@ tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `arbitrary_precision`: required so JSON-RPC monetary amounts can be emitted
+# as fixed 8-decimal number literals (e.g. `0.00001000`), byte-for-byte
+# matching Bitcoin Core's `%d.%08d` univalue output. Without it serde_json
+# renders f64s in shortest form (`0.00001`), which strict Core-amount parsers
+# (notably Core Lightning's bcli `json_to_bitcoin_amount`) reject. See
+# node/src/rpc/amounts.rs. The feature stores Numbers as their source string,
+# so amounts round-trip exactly; numeric accessors (`as_f64`/`as_u64`) are
+# unaffected.
+serde_json = { version = "1", features = ["arbitrary_precision"] }
 rand = "0.8"
 base64 = "0.22"
 tower = "0.5"

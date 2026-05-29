@@ -70,11 +70,69 @@ env:
 
 jobs:
 
+  # Docs-only skip gate. Detects whether the PR changes any non-docs file.
+  # Every other job is gated on this (the canaries via `build`, which
+  # `needs: [changes]`); when a PR touches only Markdown / docs / LICENSE /
+  # .gitignore, `code` is false, `build` is skipped, and the whole fleet
+  # cascade-skips — saving ~9 container jobs' worth of runner minutes.
+  #
+  # This is a JOB-level skip (not a workflow-level `paths-ignore`) on
+  # purpose: the canary jobs are required status checks, and a *skipped
+  # job* reports a "skipped" conclusion that satisfies branch protection,
+  # whereas a path-skipped *workflow* never reports those contexts and
+  # leaves the PR stuck "Expected — waiting for status". So docs-only PRs
+  # stay green + mergeable without running the fleet.
+  #
+  # Non-PR triggers (schedule / workflow_dispatch) have no base SHA, so
+  # `code` defaults to true and the full fleet runs.
+  changes:
+    name: detect code changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.detect.outputs.code }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Detect non-docs changes
+        id: detect
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          if [ -z "${BASE_SHA:-}" ]; then
+            echo "no PR base SHA (schedule/dispatch) — running full fleet"
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          changed="$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")"
+          echo "Changed files:"; printf '%s\n' "$changed"
+          if [ -z "$changed" ]; then
+            echo "code=false" >> "$GITHUB_OUTPUT"
+            echo "result: no changed files -> skip"
+            exit 0
+          fi
+          # `code` = at least one changed path that is NOT docs/text-only.
+          if printf '%s\n' "$changed" | grep -qvE '(\.md$|^docs/|^LICENSE|^\.gitignore$)'; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            echo "result: code change present -> run fleet"
+          else
+            echo "code=false" >> "$GITHUB_OUTPUT"
+            echo "result: docs-only -> skip fleet"
+          fi
+
   # Shared satd build. Each canary downloads the same release-mode
   # binary, so we pay the ~3-5min RocksDB + jemalloc compile cost
-  # once per workflow run, not 3×.
+  # once per workflow run, not 3×. Gated on `changes` so a docs-only PR
+  # skips the build (and therefore the whole canary fleet, which all
+  # `needs: [build]`).
   build:
     name: build satd (release)
+    needs: [changes]
+    if: ${{ needs.changes.outputs.code == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
 
@@ -498,5 +556,53 @@ jobs:
         with:
           name: electrum-wallet-canary-logs
           path: /tmp/satd-canary-electrum-wallet.*/satd.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # Core Lightning (CLN) canary — runs a real CLN node (lightningd) with
+  # satd as its Bitcoin backend over JSON-RPC (the bcli plugin, no ZMQ).
+  # Exercises a strict slice of the RPC surface nothing else covers the
+  # same way (getchaininfo, getrawblockbyheight, getutxout, estimatefees,
+  # sendrawtransaction). Asserts CLN syncs against satd (getinfo blockheight
+  # == tip) and that a funded+matured wallet address shows in listfunds.
+  #
+  # Surfaced (and now guards against regression of) the Core-amount
+  # formatting fix: satd previously emitted BTC amounts in shortest form
+  # (0.00001) rather than Core's fixed 8-decimal 0.00001000, which CLN's
+  # bcli json_to_bitcoin_amount parser rejected — CLN couldn't even start.
+  canary-cln:
+    name: canary / Core Lightning
+    needs: [build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install jq
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends jq
+
+      - name: Download satd binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: satd-canary-binaries
+          path: target/release/
+
+      - name: Mark binaries executable
+        run: chmod +x target/release/satd target/release/sat-cli
+
+      - name: Run Core Lightning canary
+        run: bash scripts/canary/cln-smoke.sh
+
+      - name: Upload satd log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cln-canary-logs
+          path: /tmp/satd-canary-cln.*/satd.log
           if-no-files-found: ignore
           retention-days: 7
