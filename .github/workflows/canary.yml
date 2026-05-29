@@ -43,21 +43,6 @@ name: Canary
 on:
   pull_request:
     types: [opened, synchronize, reopened]
-    # Skip the canary fleet on PRs that touch only documentation / text:
-    # there's no code change that could affect a downstream, so spinning
-    # up ~9 container jobs would only burn runner minutes. Anything that
-    # touches code still runs the full fleet. NOTE: this is safe only
-    # because the canary jobs are NOT required status checks (branch
-    # protection requires `Lint` + `Tests`, which live in ci.yml and run
-    # on every PR). If the canaries are ever made required checks, this
-    # `paths-ignore` must be replaced with a job-level skip gate — a
-    # path-skipped *workflow* leaves required checks stuck pending and
-    # blocks the PR, whereas a skipped *job* reports success.
-    paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
-      - 'LICENSE*'
-      - '.gitignore'
   schedule:
     # Mondays 06:00 UTC. Weekly cadence is enough to surface
     # environmental drift between PRs (downstream image tags moving,
@@ -85,11 +70,69 @@ env:
 
 jobs:
 
+  # Docs-only skip gate. Detects whether the PR changes any non-docs file.
+  # Every other job is gated on this (the canaries via `build`, which
+  # `needs: [changes]`); when a PR touches only Markdown / docs / LICENSE /
+  # .gitignore, `code` is false, `build` is skipped, and the whole fleet
+  # cascade-skips — saving ~9 container jobs' worth of runner minutes.
+  #
+  # This is a JOB-level skip (not a workflow-level `paths-ignore`) on
+  # purpose: the canary jobs are required status checks, and a *skipped
+  # job* reports a "skipped" conclusion that satisfies branch protection,
+  # whereas a path-skipped *workflow* never reports those contexts and
+  # leaves the PR stuck "Expected — waiting for status". So docs-only PRs
+  # stay green + mergeable without running the fleet.
+  #
+  # Non-PR triggers (schedule / workflow_dispatch) have no base SHA, so
+  # `code` defaults to true and the full fleet runs.
+  changes:
+    name: detect code changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.detect.outputs.code }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Detect non-docs changes
+        id: detect
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          if [ -z "${BASE_SHA:-}" ]; then
+            echo "no PR base SHA (schedule/dispatch) — running full fleet"
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          changed="$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")"
+          echo "Changed files:"; printf '%s\n' "$changed"
+          if [ -z "$changed" ]; then
+            echo "code=false" >> "$GITHUB_OUTPUT"
+            echo "result: no changed files -> skip"
+            exit 0
+          fi
+          # `code` = at least one changed path that is NOT docs/text-only.
+          if printf '%s\n' "$changed" | grep -qvE '(\.md$|^docs/|^LICENSE|^\.gitignore$)'; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            echo "result: code change present -> run fleet"
+          else
+            echo "code=false" >> "$GITHUB_OUTPUT"
+            echo "result: docs-only -> skip fleet"
+          fi
+
   # Shared satd build. Each canary downloads the same release-mode
   # binary, so we pay the ~3-5min RocksDB + jemalloc compile cost
-  # once per workflow run, not 3×.
+  # once per workflow run, not 3×. Gated on `changes` so a docs-only PR
+  # skips the build (and therefore the whole canary fleet, which all
+  # `needs: [build]`).
   build:
     name: build satd (release)
+    needs: [changes]
+    if: ${{ needs.changes.outputs.code == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
 
