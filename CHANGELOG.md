@@ -59,6 +59,28 @@ layout) per `STABILITY_POLICY.md`.
   announces each connected tip (suppressed during bulk IBD); peers pull
   the block with their existing `getdata` path.
 
+### P2P
+
+- **`getdata MSG_CMPCT_BLOCK` requests are now served.** satd's getdata
+  handler answered `MSG_BLOCK` / `MSG_WITNESS_BLOCK` and tx requests but
+  silently ignored `MSG_CMPCT_BLOCK` (BIP 152). A Bitcoin Core peer with a
+  high-bandwidth compact-block relationship requests the block right after
+  its tip as a compact block, so satd never served it — a Core peer would
+  receive satd's block *headers* but never the body of the next block,
+  stalling with headers-only orphans and never advancing. satd now serves
+  these requests with a full `block` message (BIP 152 explicitly permits
+  answering `MSG_CMPCT_BLOCK` with a full block, and it is what Core itself
+  sends for any block more than a few back from the tip). Block propagation
+  satd→Core now works. Surfaced by the new Bitcoin Core interop canary.
+- **`sendrawtransaction`-submitted transactions are now relayed to peers.**
+  A tx accepted via the `sendrawtransaction` RPC entered the local mempool
+  but was never announced to peers — only txs *received from another peer*
+  were relayed. An RPC broadcast therefore never propagated to the network.
+  satd now `inv`s a locally-accepted tx to every fee-permitting peer,
+  synchronously from the RPC handler. Surfaced by the Bitcoin Core interop
+  canary; locked by a new two-node regression test
+  (`test_rpc_submitted_tx_relays_to_peer`).
+
 ### Esplora
 
 - **Coinbase transaction inputs now carry `txid`, `vout`, and `prevout`.**
@@ -91,6 +113,13 @@ layout) per `STABILITY_POLICY.md`.
   Esplora and observed over Electrum, and a confirm step — asserting the two
   surfaces agree byte-for-byte throughout. The real-consumer gate for the
   native Electrum + Esplora surfaces. See `STABILITY_POLICY.md`.
+- **Bitcoin Core interop canary is now PR-gating**
+  (`scripts/canary/core-interop-smoke.sh`). Peers satd with a real
+  `bitcoind` (`lncm/bitcoind:v27.0`) regtest node and asserts bidirectional
+  P2P interop: handshake + peer identity, BIP 324 v2 encrypted transport,
+  block sync both ways (satd↔Core), and tx relay both ways. The only canary
+  that tests satd against the reference implementation directly; it surfaced
+  the two P2P fixes above. See `STABILITY_POLICY.md`.
 
 ## [0.2.1] — 2026-05-29
 

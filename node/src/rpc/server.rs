@@ -820,7 +820,7 @@ pub async fn start(
                 .with_suggestion("Pass the raw transaction as a hex string in the first argument.")
                 .into_error_object()
         })?;
-        rawtx::send_raw_transaction(&ctx.chain_state, &ctx.mempool, &hex_tx).map_err(
+        let result = rawtx::send_raw_transaction(&ctx.chain_state, &ctx.mempool, &hex_tx).map_err(
             |(code, msg)| {
                 // Classify the mempool error by its code (Core taxonomy):
                 // -22 = decode failed, -25 = mempool acceptance failure.
@@ -841,7 +841,16 @@ pub async fn start(
                 }
                 err.into_error_object()
             },
-        )
+        )?;
+        // Announce the just-accepted tx to peers so an RPC broadcast
+        // actually propagates to the network. `send_raw_transaction`
+        // only enters it into the mempool; without this it would sit
+        // there unannounced (the relay path only fires for txs received
+        // from another peer).
+        if let Some(txid) = result.as_str().and_then(|s| s.parse().ok()) {
+            ctx.peer_manager.announce_tx(txid);
+        }
+        Ok::<_, ErrorObjectOwned>(result)
     })?;
 
     module.register_method("getmempoolinfo", |_params, ctx, _extensions| {
