@@ -118,6 +118,10 @@ pub struct PeerInfo {
     pub user_agent: String,
     pub ban_score: u32,
     pub compact_blocks: bool,
+    /// Peer requested BIP 130 header announcements via `sendheaders`.
+    /// When true, new-tip blocks are announced to this peer with a
+    /// `headers` message rather than a legacy `inv`.
+    pub prefers_headers: bool,
     /// Peer signaled BIP 155 addrv2 support via SendAddrV2.
     pub wants_addrv2: bool,
     /// Peer's minimum fee rate for tx relay (BIP 133 feefilter), in sat/kvB.
@@ -144,6 +148,7 @@ impl PeerInfo {
             user_agent: String::new(),
             ban_score: 0,
             compact_blocks: false,
+            prefers_headers: false,
             wants_addrv2: false,
             fee_filter: 0,
             bytes_sent: 0,
@@ -186,6 +191,19 @@ impl PeerInfo {
             "startingheight": self.best_height,
             "synced_headers": -1,
             "synced_blocks": -1,
+            // Bitcoin Core always emits these two; canonical Core client
+            // libraries read them without a null guard. NBitcoin's
+            // `GetPeersInfoAsync` does `(long)peer["timeoffset"]` and
+            // `peer["inflight"].Select(..)` — a missing field throws and
+            // aborts the client's node connection (this is what made the
+            // NBXplorer canary churn until the per-IP cap locked it out).
+            // satd does not track a per-peer clock offset, so 0 (no
+            // offset) is the truthful value; `inflight` is the set of
+            // block heights being downloaded from this peer, empty here
+            // since block-download scheduling is owned by the IBD layer,
+            // not this per-peer record.
+            "timeoffset": 0,
+            "inflight": [],
             "minfeefilter": self.fee_filter as f64 / 100_000_000.0,
             "connection_type": match self.direction {
                 Direction::Inbound => "inbound-full-relay",

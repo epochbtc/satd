@@ -666,6 +666,12 @@ async fn main() {
     );
     let addr_notifier_chain_event_rx = chain_event_tx.subscribe();
     let events_bus_chain_rx = chain_event_tx.subscribe();
+    // Drives P2P block announcement: on each new connected tip, satd
+    // tells its peers (BIP 130 `headers` / legacy `inv`) so they fetch
+    // the block. Subscribed here, before the sender is handed to the
+    // chain state, and consumed by a task spawned once the peer manager
+    // exists (below).
+    let block_announce_chain_event_rx = chain_event_tx.subscribe();
 
     // -stopatheight watcher: subscribe to chain events and broadcast
     // graceful shutdown when the active-chain tip first reaches the
@@ -1002,6 +1008,33 @@ async fn main() {
     // yes (`--blockfilterindex=basic` AND `--peerblockfilters=1`) AND
     // the on-disk completeness marker is true.
     peer_manager.set_filter_index(filter_index.clone(), config.peerblockfilters);
+
+    // P2P block announcement task. Each `BlockConnected` event triggers
+    // an announcement of the new tip to connected peers; `announce_block`
+    // itself suppresses announcements while bulk-syncing. Lagged events
+    // are harmless here — a missed announcement is recovered by the
+    // peer's own `getheaders`, and `announce_block` always reflects the
+    // current tip.
+    {
+        let pm = peer_manager.clone();
+        let mut rx = block_announce_chain_event_rx;
+        let mut task_shutdown = shutdown_rx.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = task_shutdown.changed() => break,
+                    ev = rx.recv() => match ev {
+                        Ok(node::chain::events::ChainEvent::BlockConnected { hash, .. }) => {
+                            pm.announce_block(hash);
+                        }
+                        Ok(_) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    },
+                }
+            }
+        });
+    }
 
     if config.prune > 0 {
         tracing::info!(target_mb = config.prune, "Block pruning enabled");

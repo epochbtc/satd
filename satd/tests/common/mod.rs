@@ -360,6 +360,32 @@ impl TestNode {
         Ok(json)
     }
 
+    /// POST an exact request body string (verbatim, no shaping) and
+    /// return the parsed JSON response. Used to exercise Bitcoin Core
+    /// JSON-RPC compatibility: requests carrying `jsonrpc` 1.0 / 1.1 /
+    /// no version member at all, which Core accepts and the canonical
+    /// client libraries (NBitcoin, python-bitcoinrpc) emit.
+    pub fn rpc_call_raw_body(&self, body: &str) -> Result<serde_json::Value, String> {
+        let url = format!("http://127.0.0.1:{}/", self.rpcport);
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+        let (user, pass) = self
+            .cookie
+            .split_once(':')
+            .unwrap_or(("__cookie__", "none"));
+        let response = client
+            .post(&url)
+            .basic_auth(user, Some(pass))
+            .header("Content-Type", "application/json")
+            .body(body.to_string())
+            .send()
+            .map_err(|e| e.to_string())?;
+        let json: serde_json::Value = response.json().map_err(|e| e.to_string())?;
+        Ok(json)
+    }
+
     pub fn rpc_call_raw_status(&self, method: &str, user: &str, pass: &str) -> u16 {
         let url = format!("http://127.0.0.1:{}/", self.rpcport);
         let body = serde_json::json!({

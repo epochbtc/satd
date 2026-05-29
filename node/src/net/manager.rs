@@ -843,7 +843,18 @@ impl PeerManager {
                     tracing::warn!(%addr, "Max inbound connections reached, dropping connection");
                     return;
                 }
-                if same_ip_count >= self.max_inbound_per_ip {
+                // The per-IP sub-cap is an anti-eclipse / anti-DoS guard
+                // against a single *remote* source monopolizing inbound
+                // slots. Loopback is the operator's own machine: local
+                // integrations (NBXplorer/BTCPayServer, the Electrum and
+                // Esplora-personality wallets, multiple local clients all
+                // dialing 127.0.0.1) legitimately open several connections
+                // from the one loopback address and would otherwise trip a
+                // cap meant for hostile peers. Bitcoin Core does not
+                // throttle localhost this way. The total `inbound_count`
+                // cap above still bounds loopback, so this cannot exhaust
+                // all slots.
+                if !ip.is_loopback() && same_ip_count >= self.max_inbound_per_ip {
                     tracing::warn!(
                         %addr,
                         same_ip_count,
@@ -1654,6 +1665,11 @@ impl PeerManager {
             }
             NetworkMessage::SendHeaders => {
                 tracing::debug!(id, "Peer prefers headers announcements");
+                // BIP 130: remember the preference so new-tip blocks are
+                // announced to this peer as `headers`, not `inv`.
+                if let Some(handle) = self.peers.write().get_mut(&id) {
+                    handle.info.prefers_headers = true;
+                }
             }
             #[cfg(feature = "block-filter-index")]
             NetworkMessage::GetCFilters(req) => {
@@ -3032,6 +3048,51 @@ impl PeerManager {
             missing.insert(parent);
         }
         missing
+    }
+
+    /// Announce a newly-connected best-tip block to peers. Peers that
+    /// sent `sendheaders` (BIP 130) receive a `headers` message carrying
+    /// the new header; the rest receive a legacy `inv` advertising the
+    /// block hash. In both cases the peer pulls the full block with a
+    /// follow-up `getdata`, which [`handle_getdata`] serves.
+    ///
+    /// Without this, satd connected blocks (whether self-mined via
+    /// `generatetoaddress`/`submitblock` or relayed from another peer)
+    /// but never told its peers, so any announcement-driven consumer —
+    /// another node, or a Core-client backend like NBXplorer/BTCPayServer
+    /// that indexes blocks over P2P — would learn the new height via
+    /// polling yet never fetch the block, and sit permanently unsynced.
+    ///
+    /// Suppressed while bulk-syncing (`tip` far below the best known
+    /// header): during IBD peers drive their own sync via `getheaders`,
+    /// and announcing every connected block would be redundant spam. The
+    /// guard mirrors [`Self::is_ibd`] but, unlike it, treats an unknown
+    /// header tip (`htip == 0`, e.g. a regtest node whose peers have no
+    /// chain) as "at the frontier" so self-mined blocks are still
+    /// announced.
+    pub fn announce_block(&self, hash: bitcoin::BlockHash) {
+        let tip = self.chain_state.tip_height();
+        let htip = self.headers_tip.load(Ordering::Relaxed) as u32;
+        if htip != 0 && tip + 24 < htip {
+            return;
+        }
+        let Some(entry) = self.chain_state.get_block_index(&hash) else {
+            return;
+        };
+        let headers_msg = NetworkMessage::Headers(vec![entry.header]);
+        let inv_msg = NetworkMessage::Inv(vec![Inventory::Block(hash)]);
+        let peers = self.peers.read();
+        for handle in peers.values() {
+            if handle.info.state != PeerState::Connected {
+                continue;
+            }
+            let msg = if handle.info.prefers_headers {
+                headers_msg.clone()
+            } else {
+                inv_msg.clone()
+            };
+            let _ = handle.msg_tx.try_send(msg);
+        }
     }
 
     /// Relay a newly-admitted tx to other peers whose fee filter allows it.

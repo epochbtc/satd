@@ -50,6 +50,81 @@ fn test_auth_rejection() {
     node.stop();
 }
 
+/// Bitcoin Core JSON-RPC compatibility: satd must accept requests that
+/// carry `jsonrpc` 1.0 / 1.1 or omit the version member entirely, the
+/// way Core does and the canonical Core client libraries (NBitcoin →
+/// NBXplorer → BTCPayServer, python-bitcoinrpc) emit. Without the
+/// `JsonRpcCompatLayer` shim, jsonrpsee rejects these with
+/// `-32600 Invalid request` during parsing — which is exactly what
+/// broke the NBXplorer compatibility canary (the indexer's
+/// `getblockchaininfo` probe failed on every connect, so it churned
+/// connections and never synced). This is the in-tree regression guard
+/// for that fix; the NBXplorer container canary is the end-to-end
+/// counterpart.
+#[test]
+fn test_rpc_accepts_jsonrpc_1_0_and_missing_version() {
+    let mut node = TestNode::start(&[]);
+
+    // 1.0 form (NBitcoin's exact shape): integer id, params present.
+    let r = node
+        .rpc_call_raw_body(r#"{"jsonrpc":"1.0","id":1,"method":"getblockcount","params":[]}"#)
+        .unwrap();
+    assert!(
+        r.get("error").is_none() || r["error"].is_null(),
+        "jsonrpc 1.0 request should succeed, got: {r}"
+    );
+    assert_eq!(r["result"], 0, "jsonrpc 1.0 getblockcount result");
+    assert_eq!(r["id"], 1, "id preserved for 1.0 request");
+
+    // No `jsonrpc` member at all (python-bitcoinrpc / older tooling).
+    let r = node
+        .rpc_call_raw_body(r#"{"id":2,"method":"getblockcount","params":[]}"#)
+        .unwrap();
+    assert_eq!(r["result"], 0, "missing-version request should succeed: {r}");
+    assert_eq!(r["id"], 2);
+
+    // 1.1 form.
+    let r = node
+        .rpc_call_raw_body(r#"{"jsonrpc":"1.1","id":"x","method":"getbestblockhash"}"#)
+        .unwrap();
+    assert_eq!(
+        r["result"],
+        "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206",
+        "jsonrpc 1.1 request should succeed: {r}"
+    );
+
+    // Regression: strict 2.0 must still work unchanged.
+    let r = node
+        .rpc_call_raw_body(r#"{"jsonrpc":"2.0","id":"s","method":"getblockcount","params":[]}"#)
+        .unwrap();
+    assert_eq!(r["result"], 0, "jsonrpc 2.0 must remain supported: {r}");
+
+    // Batch with mixed 1.0 / missing-version members.
+    let r = node
+        .rpc_call_raw_body(
+            r#"[{"jsonrpc":"1.0","id":1,"method":"getblockcount"},{"id":2,"method":"getbestblockhash"}]"#,
+        )
+        .unwrap();
+    let arr = r.as_array().expect("batch response is an array");
+    assert_eq!(arr.len(), 2, "batch returns two responses: {r}");
+    for item in arr {
+        assert!(
+            item.get("error").is_none() || item["error"].is_null(),
+            "each batch element succeeds: {item}"
+        );
+    }
+
+    // Malformed JSON must still yield jsonrpsee's parse error, not a
+    // panic or a hang — the shim forwards unparseable bodies verbatim.
+    let r = node.rpc_call_raw_body("this is not json").unwrap();
+    assert_eq!(
+        r["error"]["code"], -32700,
+        "garbage body should produce -32700 Parse error: {r}"
+    );
+
+    node.stop();
+}
+
 #[test]
 fn test_stop_rpc() {
     let mut node = TestNode::start(&[]);
