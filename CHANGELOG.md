@@ -115,7 +115,11 @@ layout) per `STABILITY_POLICY.md`.
 
 ### Testing / CI
 
-- **NBXplorer and BTCPayServer compatibility canaries are now PR-gating**
+- **The third-party canary fleet is now enforced as required status checks**
+  on `master` (BDK, Bitcoin Core interop, LND Neutrino, Electrum reference
+  wallet, Core Lightning, NBXplorer, BTCPayServer), with a job-level skip
+  gate that exempts docs-only PRs so they stay mergeable without running the
+  fleet. See `STABILITY_POLICY.md`.
   (`scripts/canary/nbxplorer-smoke.sh`, `scripts/canary/btcpay-smoke.sh`;
   `.github/workflows/canary.yml`). They boot the real downstream Docker
   images against a satd regtest backend and assert full sync / healthy
