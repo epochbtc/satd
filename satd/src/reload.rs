@@ -76,7 +76,12 @@ pub struct ReloadHandles {
 /// both startup (`main`) and SIGHUP reload, so the two cannot drift.
 pub fn mempool_config_from(c: &Config) -> MempoolConfig {
     MempoolConfig {
-        max_size_bytes: c.maxmempool * 1_000_000,
+        // Saturating: a pathological `maxmempool`/`mempoolexpiry` in the config
+        // must not overflow-panic (overflow-checks abort the process in debug/
+        // test builds; release would silently wrap to a tiny/garbage policy).
+        // This runs on the main task on every SIGHUP, so a panic here would
+        // crash the daemon — exactly the "never crash on a bad reload" case.
+        max_size_bytes: c.maxmempool.saturating_mul(1_000_000),
         min_fee_rate: c.minrelaytxfee,
         full_rbf: c.mempoolfullrbf,
         dust_relay_fee: c.dustrelayfee,
@@ -84,7 +89,7 @@ pub fn mempool_config_from(c: &Config) -> MempoolConfig {
         data_carrier_size: c.datacarriersize,
         max_ancestor_count: c.limitancestorcount,
         max_descendant_count: c.limitdescendantcount,
-        expiry_secs: c.mempoolexpiry * 3600,
+        expiry_secs: c.mempoolexpiry.saturating_mul(3600),
         permit_bare_multisig: c.permitbaremultisig,
     }
 }
