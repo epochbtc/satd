@@ -2555,6 +2555,76 @@ fn test_rpc_extended_errors_on_emits_structured_payload() {
     node.stop();
 }
 
+/// Send SIGHUP (config reload) to a running test node.
+fn send_sighup(node: &TestNode) {
+    let status = Command::new("kill")
+        .arg("-HUP")
+        .arg(node.process.id().to_string())
+        .status()
+        .expect("spawn kill -HUP");
+    assert!(status.success(), "kill -HUP returned {status:?}");
+}
+
+#[test]
+fn test_sighup_config_reload_applies_and_survives_bad_config() {
+    // satd repurposes SIGHUP (Bitcoin Core reopens debug.log; satd has none and
+    // logs to stdout) for live config reload. This exercises the end-to-end
+    // signal path: (1) a hot-reloadable change takes effect without a restart,
+    // and (2) a reload with a bad/unknown key keeps the running config and
+    // never crashes the daemon.
+    let mut node = TestNode::start(&[]);
+
+    // Baseline: extended RPC errors are OFF by default → no `data` payload.
+    let resp = node
+        .rpc_call_with_params("getblockhash", vec![serde_json::json!(9999)])
+        .unwrap();
+    assert!(
+        resp["error"].get("data").is_none() || resp["error"]["data"].is_null(),
+        "extended errors should be off at startup; got: {}",
+        resp["error"]
+    );
+
+    // Enable extended errors via the config file, then SIGHUP. `rpcextendederrors`
+    // is applied live (a process-wide AtomicBool in node/src/rpc/error.rs), so
+    // the change must become observable without a restart.
+    let conf = node.datadir.join("bitcoin.conf");
+    std::fs::write(&conf, "[regtest]\nrpcextendederrors=1\n").unwrap();
+    send_sighup(&node);
+
+    // Poll until the live apply is observable (the reload runs on the main task
+    // between signal-loop iterations).
+    let deadline = Instant::now() + test_timeout(10);
+    let applied = loop {
+        let resp = node
+            .rpc_call_with_params("getblockhash", vec![serde_json::json!(9999)])
+            .unwrap();
+        if resp["error"]["data"]["category"] == "rpc.input.range" {
+            break true;
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert!(applied, "SIGHUP did not apply rpcextendederrors=1 live");
+
+    // A reload with an UNKNOWN key hard-errors at parse; the daemon must log it
+    // and keep the running config rather than crash. After this SIGHUP the node
+    // is still responsive AND still has the previously-applied extended errors.
+    std::fs::write(&conf, "this_is_not_a_real_satd_key=1\n").unwrap();
+    send_sighup(&node);
+    std::thread::sleep(Duration::from_millis(500));
+    let resp = node
+        .rpc_call_with_params("getblockhash", vec![serde_json::json!(9999)])
+        .expect("node still responsive after bad-config SIGHUP");
+    assert_eq!(
+        resp["error"]["data"]["category"], "rpc.input.range",
+        "a bad reload must keep the previously-applied running config"
+    );
+
+    node.stop();
+}
+
 #[test]
 fn test_clean_shutdown_marker_graceful_stop() {
     // Graceful RPC stop should write the marker and next startup should see it.

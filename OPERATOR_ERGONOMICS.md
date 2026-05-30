@@ -60,6 +60,29 @@ Instead of manually tuning `-dbcache`, `-maxmempool`, and connection limits, ope
 | `--permitbaremultisig=<0\|1>` | `1` | If `0`, rejects complex, non-standard bare multisig setups often used for data-storage hacks. |
 | `--limitancestorcount=<N>` | `25` | Maximum unconfirmed ancestor count. |
 
+### Live Config Reload (`SIGHUP`)
+Edit `bitcoin.conf` and send `SIGHUP` — `kill -HUP <pid>`, or `systemctl reload satd` — to re-read the file and apply the hot-reloadable settings **without restarting**. The P2P swarm and chainstate are untouched. CLI flags remain authoritative across reloads: only the config *file* is re-read, so a flag passed on the command line always wins over the same key in the file.
+
+> **Difference from Bitcoin Core.** Core uses `SIGHUP` to reopen `debug.log` for logrotate. satd has no `debug.log` — it logs to **stdout**, delegating rotation/retention to systemd-journald or the container runtime — so `SIGHUP` is repurposed for config reload. See `CORE_DIFFERENCES.md`.
+
+**Safety:** a reload that fails to parse (a typo'd, unknown, or invalid key — these hard-error at load) is logged and the **running config is kept**; the daemon never crashes on a bad reload. Every change is either applied live or logged as `restart required` — nothing is silently ignored.
+
+**Hot-reloadable (applied live):**
+
+| Key(s) | Effect on reload |
+|---|---|
+| `debug`, `debugexclude` | Log verbosity/categories change immediately (the env-filter is swapped live). |
+| `timeout` | New peer-handshake timeout for subsequent connections. |
+| `blocksonly` | Toggles transaction-relay suppression. |
+| `maxuploadtarget` | New rolling 24h upload cap. |
+| `v2transport`, `v2only` | Adjusts BIP 324 v2 transport / v2-only peering for new connections. |
+| `externalip`, `whitelist` | Replaces advertised external addresses / `-whitelist` permission set. |
+| `rpcextendederrors`, `rpcdefaultunits` | Switches RPC error-payload shape / default amount unit. |
+
+> `logformat` (json vs text) is **not** hot-reloadable — only verbosity is. Changing the format requires a restart.
+
+**Restart required (reported, not applied):** network selection, `datadir`/`blocksdir`, all RPC/P2P/Esplora/Electrum **ports and binds**, RPC auth (`rpcuser`/`rpcpassword`/`rpcauth`/cookie), all TLS/mTLS material, `dbcache`/`prune`/`storageprofile`/reindex, index enable/disable (`txindex`/`addressindex`/`blockfilterindex`), seeds (`dns*`/`connect`/`addnode`/`seednode`/`fixedseeds`/`asmap`), Tor (`proxy`/`onion`/`torcontrol`/`listenonion`), `consensus`, and `assumevalid`/`stopatheight`. Mempool/relay policy (`minrelaytxfee`, `maxmempool`, `dustrelayfee`, `datacarrier(size)`, `mempoolfullrbf`, `limitancestorcount`/`limitdescendantcount`, `mempoolexpiry`, `permitbaremultisig`) and the peer-limit knobs (`maxconnections`/`maxinboundperip`/`bantime`) are reported as restart-required today; live reload for these is landing in a follow-up.
+
 ## 3. Developer & Integrator APIs
 
 ### Mempool-Based Fee Estimation

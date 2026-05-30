@@ -1,6 +1,7 @@
 mod config;
 mod fast_start;
 mod notify;
+mod reload;
 
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
@@ -46,55 +47,47 @@ impl notify::WatchdogProbe for ChainStateProbe {
 #[tokio::main]
 async fn main() {
     // Config must be parsed before tracing init so --log-format can select
-    // the formatter. Config parse errors go to stderr as plain text.
-    let mut config = match Config::load() {
-        Ok(c) => c,
+    // the formatter. Config parse errors go to stderr as plain text. The
+    // parsed CLI is retained (`cli_snapshot`) so SIGHUP config reload can
+    // re-merge the config file against the same authoritative CLI flags.
+    let (mut config, cli_snapshot) = match Config::load_with_cli() {
+        Ok(pair) => pair,
         Err(e) => {
             eprintln!("Error: {}", e);
             std::process::exit(1);
         }
     };
 
-    // Base log filter. With no -debug/-debugexclude flags this is the
-    // historical behavior (RUST_LOG if set, else "info"). When -debug
-    // flags are present we layer Core's category directives on top: an
-    // explicit RUST_LOG still wins as the base (developer override),
-    // otherwise the base is "debug" for -debug=all/1 else "info", and
-    // each mapped category is added as a `target=debug` directive
-    // (`target=info` claws back -debugexclude under -debug=all).
-    let (debug_all, debug_directives) =
-        config::debug_directives(&config.debug, &config.debugexclude);
-    let debug_flags_given = !config.debug.is_empty() || !config.debugexclude.is_empty();
-    let mut env_filter = if !debug_flags_given {
-        tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
-    } else {
-        match std::env::var("RUST_LOG") {
-            Ok(rl) if !rl.trim().is_empty() => tracing_subscriber::EnvFilter::new(rl),
-            _ => tracing_subscriber::EnvFilter::new(if debug_all { "debug" } else { "info" }),
-        }
-    };
-    for d in &debug_directives {
-        match d.parse() {
-            Ok(directive) => env_filter = env_filter.add_directive(directive),
-            Err(e) => eprintln!("Warning: ignoring invalid debug directive {d:?}: {e}"),
-        }
-    }
-    match config.log_format {
-        config::LogFormat::Json => {
-            // Stable JSON shape: `timestamp`, `level`, `target`,
-            // `fields.message`, plus any per-event structured fields.
-            tracing_subscriber::fmt()
-                .json()
-                .with_current_span(true)
-                .with_span_list(false)
-                .with_env_filter(env_filter)
-                .init();
-        }
-        config::LogFormat::Text => {
-            tracing_subscriber::fmt().with_env_filter(env_filter).init();
+    // Base log filter (see `config::build_env_filter` for the full precedence
+    // rules). The filter is wrapped in a `reload::Layer` so SIGHUP can change
+    // log verbosity live (`reload::LogReloadHandle`). Only the EnvFilter is
+    // reloadable; the fmt layer stays static, which keeps both the json and
+    // text branches yielding the same handle type.
+    let env_filter = config::build_env_filter(&config);
+    let (filter_layer, filter_reload_handle) = tracing_subscriber::reload::Layer::new(env_filter);
+    {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+        let registry = tracing_subscriber::registry().with(filter_layer);
+        match config.log_format {
+            config::LogFormat::Json => {
+                // Stable JSON shape: `timestamp`, `level`, `target`,
+                // `fields.message`, plus any per-event structured fields.
+                registry
+                    .with(
+                        tracing_subscriber::fmt::layer()
+                            .json()
+                            .with_current_span(true)
+                            .with_span_list(false),
+                    )
+                    .init();
+            }
+            config::LogFormat::Text => {
+                registry.with(tracing_subscriber::fmt::layer()).init();
+            }
         }
     }
+    let log_reload_handle = reload::LogReloadHandle::new(filter_reload_handle);
 
     // Drain config-load notes (Esplora ↔ txindex reconciliation,
     // prune auto-disable). These were collected before tracing was
@@ -2146,24 +2139,45 @@ async fn main() {
     let watchdog_handle =
         notify::spawn_watchdog_heartbeat(vec![chainstate_probe], watchdog_stop_rx);
 
-    // Wait for shutdown signal (stop RPC, Ctrl+C, or SIGTERM)
+    // Wait for a shutdown signal (RPC stop, Ctrl+C, SIGTERM) or a SIGHUP
+    // config-reload request. SIGHUP re-reads bitcoin.conf and applies the
+    // hot-reloadable subset live (see `reload`), then the loop continues so the
+    // daemon keeps running; a bad reload is logged and the running config is
+    // kept. Shutdown signals break out of the loop into the graceful-flush path
+    // below.
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .expect("Failed to register SIGTERM handler");
-    tokio::select! {
-        _ = shutdown_rx.wait_for(|v| *v) => {
-            tracing::info!("Shutdown signal received from RPC");
-        }
-        _ = tokio::signal::ctrl_c() => {
-            tracing::info!("Ctrl+C received, shutting down");
-            // Broadcast shutdown so the backfill runner + supervisor
-            // and any other watch subscribers exit promptly. Without
-            // this, a paused or running blocking task could keep the
-            // Tokio runtime alive past the flush deadline.
-            let _ = shutdown_signal_tx.send(true);
-        }
-        _ = sigterm.recv() => {
-            tracing::info!("SIGTERM received, shutting down");
-            let _ = shutdown_signal_tx.send(true);
+    let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        .expect("Failed to register SIGHUP handler");
+    let reload_handles = reload::ReloadHandles {
+        cli: cli_snapshot,
+        peer_manager: peer_manager.clone(),
+        log_filter: log_reload_handle,
+    };
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.wait_for(|v| *v) => {
+                tracing::info!("Shutdown signal received from RPC");
+                break;
+            }
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("Ctrl+C received, shutting down");
+                // Broadcast shutdown so the backfill runner + supervisor
+                // and any other watch subscribers exit promptly. Without
+                // this, a paused or running blocking task could keep the
+                // Tokio runtime alive past the flush deadline.
+                let _ = shutdown_signal_tx.send(true);
+                break;
+            }
+            _ = sigterm.recv() => {
+                tracing::info!("SIGTERM received, shutting down");
+                let _ = shutdown_signal_tx.send(true);
+                break;
+            }
+            _ = sighup.recv() => {
+                tracing::info!("SIGHUP received — reloading config");
+                config = reload::reload_from_sighup(&reload_handles, &config);
+            }
         }
     }
 
