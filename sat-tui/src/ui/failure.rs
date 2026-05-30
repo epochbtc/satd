@@ -10,22 +10,40 @@ use crate::state::{AppState, RpcFailure};
 /// every other view so the operator can't miss it — replaces the
 /// silent "Connecting..." screen for cases that won't self-heal.
 ///
-/// AuthFailed fires immediately (the cookie is almost certainly
-/// unreadable or stale — operator action required). Other failures
-/// wait 5s before surfacing so transient restart blips don't flash
-/// a modal at every satd reload.
+/// CookieUnreadable and AuthFailed fire immediately (the cookie is almost
+/// certainly unreadable or stale, or the credentials are wrong — operator
+/// action required either way). Other failures wait 5s before surfacing so
+/// transient restart blips don't flash a modal at every satd reload.
 pub fn draw(f: &mut Frame, state: &AppState) {
     let Some(rec) = state.last_failure.as_ref() else {
         return;
     };
 
     let age = rec.first_seen.elapsed();
-    let show_immediately = matches!(rec.kind, RpcFailure::AuthFailed);
+    let show_immediately = matches!(
+        rec.kind,
+        RpcFailure::CookieUnreadable | RpcFailure::AuthFailed
+    );
     if !show_immediately && age.as_secs() < 5 {
         return;
     }
 
     let (title, headline, hints): (&str, &str, &[&str]) = match rec.kind {
+        RpcFailure::CookieUnreadable => (
+            " ✗ RPC COOKIE UNREADABLE ",
+            "Can't read satd's RPC cookie file (see details below).",
+            &[
+                "• satd holds the cookie at `0600 satd:satd` until it reaches",
+                "  READY — during a long --reindex/--reindex-chainstate run a",
+                "  non-satd user can't read it yet. It auto-recovers here once",
+                "  satd relaxes it to `0640` at READY.",
+                "• To watch sooner, run sat-tui as the satd user, or add yourself",
+                "  to the `satd` group and start a NEW shell (group memberships",
+                "  only refresh on login): `sudo usermod -aG satd $USER`.",
+                "• Confirm the path + perms: `ls -l <datadir>/.cookie`.",
+                "• Or authenticate explicitly with --rpcuser/--rpcpassword.",
+            ],
+        ),
         RpcFailure::AuthFailed => (
             " ✗ RPC AUTHENTICATION FAILED ",
             "satd rejected our credentials (HTTP 401).",
