@@ -294,6 +294,11 @@ async fn poller(rpc: Arc<RpcClient>, state: Arc<Mutex<AppState>>) {
             None
         };
 
+        // The cookie-read state is the root cause of any auth failure, so
+        // snapshot it before locking state and let it override the generic
+        // downstream classification below.
+        let cookie_error = rpc.cookie_error();
+
         let need_startup_check = {
             let mut st = state.lock();
 
@@ -303,14 +308,17 @@ async fn poller(rpc: Arc<RpcClient>, state: Arc<Mutex<AppState>>) {
             // below — once we move the inner Values out, the original
             // Results can't be borrowed again. Only used when `any_ok`
             // is false, but computing unconditionally is cheap.
-            let batch_failure = classify_batch_error(&[
-                chain_res.as_ref().err(),
-                peers_res.as_ref().err(),
-                mempool_res.as_ref().err(),
-                conn_res.as_ref().err(),
-                sysinfo_res.as_ref().err(),
-                warnings_res.as_ref().err(),
-            ]);
+            let batch_failure = resolve_failure(
+                cookie_error,
+                classify_batch_error(&[
+                    chain_res.as_ref().err(),
+                    peers_res.as_ref().err(),
+                    mempool_res.as_ref().err(),
+                    conn_res.as_ref().err(),
+                    sysinfo_res.as_ref().err(),
+                    warnings_res.as_ref().err(),
+                ]),
+            );
 
             if let Ok(v) = chain_res {
                 st.update_chain_info(&v);
@@ -434,6 +442,24 @@ async fn poller(rpc: Arc<RpcClient>, state: Arc<Mutex<AppState>>) {
     }
 }
 
+/// Fold the cookie-read state into the batch classification. An unreadable
+/// cookie is the *root cause* of any auth failure in the batch — the
+/// credentials never left the client — so when one is present we surface
+/// that specific, actionable error (e.g. "Permission denied", with
+/// cookie-side remediation) instead of the generic downstream 401. It
+/// clears automatically: `RpcClient::refresh_auth` re-reads the cookie on
+/// each auth failure, so once satd relaxes it to `0640` at READY the next
+/// good poll dismisses the modal.
+fn resolve_failure(
+    cookie_error: Option<String>,
+    batch: Option<(RpcFailure, String)>,
+) -> Option<(RpcFailure, String)> {
+    match cookie_error {
+        Some(msg) => Some((RpcFailure::CookieUnreadable, msg)),
+        None => batch,
+    }
+}
+
 /// Pick the most informative error from a fast-poll batch. Auth/connect
 /// failures take priority — they're the actionable ones that should
 /// trigger the modal immediately. Timeouts and Rpc errors come behind.
@@ -485,5 +511,27 @@ mod tests {
 
         // All-None batch yields None.
         assert!(classify_batch_error(&[None, None]).is_none());
+    }
+
+    #[test]
+    fn cookie_error_overrides_downstream_failure() {
+        // An unreadable cookie is the root cause: surface it (with the real
+        // message) instead of the generic 401 it produces downstream.
+        let (k, msg) = resolve_failure(
+            Some("Cannot read cookie file: Permission denied (os error 13)".into()),
+            Some((RpcFailure::AuthFailed, "Authentication failed".into())),
+        )
+        .unwrap();
+        assert_eq!(k, RpcFailure::CookieUnreadable);
+        assert!(msg.contains("Permission denied"));
+    }
+
+    #[test]
+    fn no_cookie_error_passes_batch_through() {
+        // Readable cookie (or user/pass auth): keep the batch classification.
+        let r = resolve_failure(None, Some((RpcFailure::ConnectionFailed, "refused".into())));
+        assert_eq!(r.unwrap().0, RpcFailure::ConnectionFailed);
+        // No failure at all stays None.
+        assert!(resolve_failure(None, None).is_none());
     }
 }

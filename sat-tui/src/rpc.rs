@@ -8,6 +8,14 @@ pub struct RpcClient {
     url: String,
     auth_header: parking_lot::RwLock<String>,
     cookie_path: Option<PathBuf>,
+    /// The most recent cookie-file *read* failure, if the cookie is
+    /// currently unreadable (permission denied, missing, malformed).
+    /// `None` when authenticating with `--rpcuser`/`--rpcpassword`, or
+    /// when the cookie last read successfully. A cookie that can't be read
+    /// is the root cause of every downstream 401, so we keep the specific
+    /// error here and surface it instead of the generic "auth failed" — see
+    /// `RpcClient::cookie_error`.
+    cookie_error: parking_lot::RwLock<Option<String>>,
     client: reqwest::Client,
 }
 
@@ -18,6 +26,7 @@ impl RpcClient {
             url: format!("http://{}:{}/", host, port),
             auth_header: parking_lot::RwLock::new(auth_header),
             cookie_path: None,
+            cookie_error: parking_lot::RwLock::new(None),
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
@@ -26,14 +35,26 @@ impl RpcClient {
     }
 
     /// Create with cookie file path for automatic re-auth on satd restart.
+    ///
+    /// A cookie that can't be read at construction is recorded (not
+    /// silently swallowed into an empty auth header): the resulting requests
+    /// would only ever 401, and the operator needs the real reason —
+    /// e.g. "Permission denied" while satd holds the cookie `0600` until it
+    /// reaches READY. `refresh_auth` retries the read on each auth failure,
+    /// so the client recovers automatically once the cookie becomes readable.
     pub fn with_cookie(host: &str, port: u16, cookie_path: PathBuf) -> Self {
-        let auth_header = read_cookie_file(&cookie_path)
-            .map(|(u, p)| format!("Basic {}", BASE64.encode(format!("{}:{}", u, p))))
-            .unwrap_or_default();
+        let (auth_header, cookie_error) = match read_cookie_file(&cookie_path) {
+            Ok((u, p)) => (
+                format!("Basic {}", BASE64.encode(format!("{}:{}", u, p))),
+                None,
+            ),
+            Err(e) => (String::new(), Some(e)),
+        };
         Self {
             url: format!("http://{}:{}/", host, port),
             auth_header: parking_lot::RwLock::new(auth_header),
             cookie_path: Some(cookie_path),
+            cookie_error: parking_lot::RwLock::new(cookie_error),
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
@@ -41,16 +62,33 @@ impl RpcClient {
         }
     }
 
-    /// Re-read the cookie file and update the auth header.
+    /// The current cookie-file read error, if the cookie is unreadable.
+    /// The poller surfaces this over a generic 401 because it's the
+    /// actionable root cause; it clears the moment the cookie reads.
+    pub fn cookie_error(&self) -> Option<String> {
+        self.cookie_error.read().clone()
+    }
+
+    /// Re-read the cookie file and update the auth header. Records the
+    /// read error (or clears it on success) so a cookie that becomes
+    /// readable — e.g. satd relaxing it to `0640` at READY — flips the
+    /// client back to a good state and dismisses the failure modal.
     fn refresh_auth(&self) -> bool {
-        if let Some(path) = &self.cookie_path
-            && let Ok((u, p)) = read_cookie_file(path)
-        {
-            let new_auth = format!("Basic {}", BASE64.encode(format!("{}:{}", u, p)));
-            *self.auth_header.write() = new_auth;
-            return true;
+        let Some(path) = &self.cookie_path else {
+            return false;
+        };
+        match read_cookie_file(path) {
+            Ok((u, p)) => {
+                let new_auth = format!("Basic {}", BASE64.encode(format!("{}:{}", u, p)));
+                *self.auth_header.write() = new_auth;
+                *self.cookie_error.write() = None;
+                true
+            }
+            Err(e) => {
+                *self.cookie_error.write() = Some(e);
+                false
+            }
         }
-        false
     }
 
     pub async fn call(&self, method: &str, params: &[serde_json::Value]) -> Result<serde_json::Value, RpcError> {
@@ -234,4 +272,56 @@ pub fn default_datadir() -> PathBuf {
     std::env::var("HOME")
         .map(|h| PathBuf::from(h).join(".bitcoin"))
         .unwrap_or_else(|_| PathBuf::from("/tmp/.bitcoin"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A unique, definitely-missing path. Uses the process id rather than a
+    // clock/RNG so the test stays deterministic.
+    fn scratch(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("sat-tui-cookie-{}-{}", std::process::id(), name))
+    }
+
+    #[test]
+    fn with_cookie_surfaces_read_error_for_missing_file() {
+        let path = scratch("missing.cookie");
+        let _ = std::fs::remove_file(&path);
+        let c = RpcClient::with_cookie("127.0.0.1", 8332, path);
+        // The real read error is kept, not laundered into an empty auth
+        // header that would only ever produce a confusing downstream 401.
+        let err = c.cookie_error().expect("a missing cookie must surface a read error");
+        assert!(err.contains("Cannot read cookie file"), "got: {err}");
+        assert!(
+            c.auth_header.read().is_empty(),
+            "no credentials when the cookie can't be read"
+        );
+    }
+
+    #[test]
+    fn refresh_auth_recovers_once_cookie_becomes_readable() {
+        let path = scratch("recover.cookie");
+        let _ = std::fs::remove_file(&path);
+        let c = RpcClient::with_cookie("127.0.0.1", 8332, path.clone());
+        assert!(c.cookie_error().is_some(), "missing cookie -> error recorded");
+
+        // satd relaxes the cookie to 0640 at READY; the next auth-failure
+        // retry re-reads it and the client flips back to a good state.
+        std::fs::write(&path, "__cookie__:s3cr3t").unwrap();
+        assert!(c.refresh_auth(), "refresh must succeed once the cookie is readable");
+        assert!(c.cookie_error().is_none(), "the read error must clear on success");
+        assert!(
+            c.auth_header.read().starts_with("Basic "),
+            "auth header must be rebuilt from the cookie"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn user_pass_client_has_no_cookie_error() {
+        let c = RpcClient::new("127.0.0.1", 8332, "u", "p");
+        assert!(c.cookie_error().is_none());
+    }
 }

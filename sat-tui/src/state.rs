@@ -416,6 +416,11 @@ pub struct AppState {
 /// but lives in state so the UI layer doesn't import rpc types.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RpcFailure {
+    /// The RPC cookie file itself can't be read (permission denied,
+    /// missing, malformed). Distinct from `AuthFailed`: the credentials
+    /// never even left the client, so the fix is on the cookie/filesystem
+    /// side, not the password side.
+    CookieUnreadable,
     AuthFailed,
     ConnectionFailed,
     Timeout,

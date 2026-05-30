@@ -23,6 +23,17 @@ layout) per `STABILITY_POLICY.md`.
   remaining-bytes/rate ETA. `getstartupinfo` is a satd-native pre-init RPC
   with no Bitcoin Core equivalent, so the added fields don't affect Core
   compatibility.
+- **`sat-tui` now surfaces an unreadable RPC cookie instead of hanging at
+  "Connecting to satd…".** When the cookie file couldn't be read (permission
+  denied, missing, or malformed) the TUI silently fell back to an empty auth
+  header, so every request 401'd with no explanation. This is easy to hit
+  against a node mid-`--reindex-chainstate`: satd holds the cookie at
+  `0600 satd:satd` until it reaches READY, so a non-`satd` user can't read it
+  yet. The client now keeps the real read error and shows a dedicated
+  "RPC cookie unreadable" modal with the underlying message and remediation,
+  distinct from the credentials-rejected (HTTP 401) case. It auto-recovers:
+  the cookie is re-read on each auth failure, so once satd relaxes it to
+  `0640` at READY the next good poll dismisses the modal.
 
 ### RPC / P2P compatibility (Bitcoin Core clients)
 
