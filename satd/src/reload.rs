@@ -81,6 +81,11 @@ struct FieldSpec {
     /// `None` => restart-required (report only). `Some(apply)` => live path:
     /// `apply(new_config, handles)` pushes the value into the running node.
     apply: Option<fn(&Config, &ReloadHandles)>,
+    /// When true, the field holds secret material (passwords, auth hashes,
+    /// HMAC secrets). The reload report still records that the key *changed*,
+    /// but the old/new values are redacted so secrets never reach the log
+    /// (stdout/journald has a broader trust boundary than `bitcoin.conf`).
+    sensitive: bool,
 }
 
 /// Config-file keys with no per-field reload disposition: consumed only at load
@@ -124,6 +129,22 @@ fn field_specs() -> Vec<FieldSpec> {
                     if o != n { Some((o, n)) } else { None }
                 },
                 apply: None,
+                sensitive: false,
+            }
+        };
+    }
+    // restart-required AND secret: report the change but redact the values.
+    macro_rules! restart_secret {
+        ($key:expr, $field:ident) => {
+            FieldSpec {
+                key: $key,
+                diff: |old, new| {
+                    let o = format!("{:?}", old.$field);
+                    let n = format!("{:?}", new.$field);
+                    if o != n { Some((o, n)) } else { None }
+                },
+                apply: None,
+                sensitive: true,
             }
         };
     }
@@ -138,6 +159,7 @@ fn field_specs() -> Vec<FieldSpec> {
                     if o != n { Some((o, n)) } else { None }
                 },
                 apply: Some($apply),
+                sensitive: false,
             }
         };
     }
@@ -160,9 +182,9 @@ fn field_specs() -> Vec<FieldSpec> {
         restart!("rpcport", rpcport),
         restart!("rpcbind", rpcbind),
         restart!("rpcallowip", rpcallowip),
-        restart!("rpcuser", rpcuser),
-        restart!("rpcpassword", rpcpassword),
-        restart!("rpcauth", rpcauth),
+        restart_secret!("rpcuser", rpcuser),
+        restart_secret!("rpcpassword", rpcpassword),
+        restart_secret!("rpcauth", rpcauth),
         restart!("rpccookiefile", rpc_cookie_file),
         restart!("rpccookieperms", rpc_cookie_perms),
         restart!("rpcdisableauth", rpc_disable_auth),
@@ -227,7 +249,7 @@ fn field_specs() -> Vec<FieldSpec> {
         restart!("proxy", proxy),
         restart!("onion", onion),
         restart!("torcontrol", torcontrol),
-        restart!("torpassword", torpassword),
+        restart_secret!("torpassword", torpassword),
         restart!("listenonion", listenonion),
         // ---- Consensus ----
         restart!("assumevalid", assumevalid),
@@ -268,7 +290,7 @@ fn field_specs() -> Vec<FieldSpec> {
         restart!("esplorasseconns", esplora_sse_max_conns),
         restart!("esploraauth", esplora_auth),
         restart!("esploracookiefile", esplora_cookie_file),
-        restart!("esplorauserpass", esplora_userpass),
+        restart_secret!("esplorauserpass", esplora_userpass),
         // ---- Electrum ----
         restart!("electrum", electrum),
         restart!("electrumbind", electrum_bind),
@@ -322,7 +344,7 @@ fn field_specs() -> Vec<FieldSpec> {
         restart!("eventszmqnodeevent", events_zmq_nodeevent),
         // ---- Webhooks ----
         restart!("reorgwebhook", reorg_webhook),
-        restart!("reorgwebhooksecret", reorg_webhook_secret),
+        restart_secret!("reorgwebhooksecret", reorg_webhook_secret),
         // ---- MCP ----
         restart!("mcp", mcp),
         restart!("mcpstdio", mcp_stdio),
@@ -356,6 +378,13 @@ pub fn reload_from_sighup(handles: &ReloadHandles, running: &Config) -> Config {
     let mut restart_required = 0usize;
     for spec in field_specs() {
         if let Some((old, newv)) = (spec.diff)(running, &new) {
+            // Redact secret material: report that the key changed, never the
+            // value. The diff itself still ran, so the change is detected.
+            let (old, newv) = if spec.sensitive {
+                ("<redacted>".to_string(), "<redacted>".to_string())
+            } else {
+                (old, newv)
+            };
             match spec.apply {
                 Some(apply) => {
                     apply(&new, handles);
@@ -484,5 +513,51 @@ mod tests {
         bo.blocksonly = !base.blocksonly;
         let blocksonly = specs.iter().find(|s| s.key == "blocksonly").unwrap();
         assert!((blocksonly.diff)(&base, &bo).is_some());
+    }
+
+    /// Comparing a config to its own clone must yield NO changes for ANY spec.
+    /// Guards against a field whose `Debug` output is non-deterministic (e.g. a
+    /// future `HashMap`/`HashSet` config field), which would otherwise report
+    /// "changed" on every reload and spam the log forever.
+    #[test]
+    fn identical_config_yields_no_changes() {
+        let c = test_config();
+        let same = c.clone();
+        for spec in field_specs() {
+            assert!(
+                (spec.diff)(&c, &same).is_none(),
+                "spec {:?} reported a change comparing a config to its own clone \
+                 — likely a non-deterministic Debug field",
+                spec.key
+            );
+        }
+    }
+
+    /// Secret-bearing keys must stay marked `sensitive` so the reload report
+    /// redacts their values. Guards against a refactor that downgrades one of
+    /// these to a plain `restart!` and leaks credentials into the log.
+    #[test]
+    fn secret_fields_are_marked_sensitive() {
+        let specs = field_specs();
+        for key in [
+            "rpcuser",
+            "rpcpassword",
+            "rpcauth",
+            "torpassword",
+            "esplorauserpass",
+            "reorgwebhooksecret",
+        ] {
+            let spec = specs
+                .iter()
+                .find(|s| s.key == key)
+                .unwrap_or_else(|| panic!("secret key {key:?} missing from field_specs()"));
+            assert!(
+                spec.sensitive,
+                "{key:?} holds secret material and must be marked sensitive \
+                 (redacted in the reload report)"
+            );
+            // Secrets are never live-applied (they're wired at startup).
+            assert!(spec.apply.is_none(), "{key:?} must be restart-only");
+        }
     }
 }

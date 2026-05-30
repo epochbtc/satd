@@ -927,12 +927,18 @@ impl Config {
     /// Build a `Config` from already-parsed CLI args by merging in the config
     /// file and profile/hardcoded defaults.
     ///
-    /// MUST stay side-effect-free: this function only *reads* (the config file
-    /// and any `includeconf` files) and returns a value. It must never write to
-    /// disk (cookie/PID files), mutate global/process state, or call
-    /// `process::exit`. The SIGHUP reload path (`satd::reload`) calls this on
-    /// every reload, so any side effect introduced here would re-fire on each
-    /// `kill -HUP`.
+    /// Reload-safety contract — the SIGHUP reload path (`satd::reload`) calls
+    /// this on every `kill -HUP`, so it MUST be safe to re-run repeatedly:
+    /// - never writes to disk (cookie/PID files are written in `main`, not here),
+    /// - never mutates global/process state,
+    /// - never calls `process::exit` (bad input returns `Err`, which the reload
+    ///   path logs while keeping the running config — so a typo'd or unknown
+    ///   key can never crash the daemon),
+    /// - never panics on operator input.
+    ///
+    /// The only side effect is a pair of benign `eprintln!` warnings on a
+    /// malformed `storageprofile`/`consensus` value (it falls back to the
+    /// default). These are idempotent and acceptable; do not add others.
     pub fn from_cli(cli: CliArgs) -> Result<Self, String> {
         // Resolve named profile (if any). Fields from the profile flow
         // through as a lower-priority default: CLI flags always override,

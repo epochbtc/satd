@@ -2149,6 +2149,14 @@ async fn main() {
         .expect("Failed to register SIGTERM handler");
     let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
         .expect("Failed to register SIGHUP handler");
+    // SIGINT (Ctrl+C) registered as a persistent `Signal` rather than a fresh
+    // `tokio::signal::ctrl_c()` future per loop iteration. A recreated-each-
+    // iteration future can miss a SIGINT delivered while the loop is busy in a
+    // SIGHUP reload: the new receiver subscribes after the signal driver has
+    // already broadcast, so the delivery is lost. A long-lived `Signal`
+    // coalesces and yields it on the next poll.
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .expect("Failed to register SIGINT handler");
     let reload_handles = reload::ReloadHandles {
         cli: cli_snapshot,
         peer_manager: peer_manager.clone(),
@@ -2160,7 +2168,7 @@ async fn main() {
                 tracing::info!("Shutdown signal received from RPC");
                 break;
             }
-            _ = tokio::signal::ctrl_c() => {
+            _ = sigint.recv() => {
                 tracing::info!("Ctrl+C received, shutting down");
                 // Broadcast shutdown so the backfill runner + supervisor
                 // and any other watch subscribers exit promptly. Without

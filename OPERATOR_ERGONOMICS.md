@@ -65,7 +65,7 @@ Edit `bitcoin.conf` and send `SIGHUP` — `kill -HUP <pid>`, or `systemctl reloa
 
 > **Difference from Bitcoin Core.** Core uses `SIGHUP` to reopen `debug.log` for logrotate. satd has no `debug.log` — it logs to **stdout**, delegating rotation/retention to systemd-journald or the container runtime — so `SIGHUP` is repurposed for config reload. See `CORE_DIFFERENCES.md`.
 
-**Safety:** a reload that fails to parse (a typo'd, unknown, or invalid key — these hard-error at load) is logged and the **running config is kept**; the daemon never crashes on a bad reload. Every change is either applied live or logged as `restart required` — nothing is silently ignored.
+**Safety:** a reload that fails to parse (a typo'd, unknown, or invalid key — these hard-error at load) is logged and the **running config is kept**; the daemon never crashes on a bad reload. Every change is either applied live or logged as `restart required` — nothing is silently ignored. Secret-bearing keys (`rpcuser`, `rpcpassword`, `rpcauth`, `torpassword`, `esplorauserpass`, `reorgwebhooksecret`) report only that they changed — their values are **redacted** in the log, never printed.
 
 **Hot-reloadable (applied live):**
 
