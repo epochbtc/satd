@@ -6907,6 +6907,19 @@ pub(crate) mod tests {
         );
         assert_eq!(snap.total, 600, "progress total must reflect file tip");
         assert_eq!(snap.current, 400, "current must end exactly at stop_at");
+        // Regression guard for the reindex-chainstate ETA (issue #254): the
+        // replay loop must feed the weight-aware estimator via `set_eta`. At
+        // the stop target current == target, so `estimate_eta` returns
+        // `Some(0)` and the snapshot surfaces it. If the `set_eta` wiring is
+        // ever dropped the phase falls back to the linear estimate, which is
+        // `None` here (denominator == current) — so this pins that the daemon
+        // actually populates `eta_secs` for the `reindex_chainstate` phase
+        // rather than leaving the TUI's ETA blank for the whole reindex.
+        assert_eq!(
+            snap.eta_secs,
+            Some(0),
+            "reindex must feed the ETA estimator so getstartupinfo reports eta_secs"
+        );
 
         // Final flush must still drain the dirty set so the tip at 400
         // is durable; the operator restarts and continues from here.
