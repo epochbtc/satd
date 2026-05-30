@@ -46,18 +46,30 @@ operator names a trusted source.
 **Next:** mirror lists / multiple fallback URLs are a possible ergonomic
 follow-up; the trust root stays the hardcoded anchor either way.
 
-### Resource budget caps (`--max-cpu`, `--max-memory`, `--max-disk-growth-per-day`)
-**Proposal:** Hard caps enforced at the scheduler layer:
-- `--max-cpu=50%` — cgroup-style throttle.
-- `--max-memory=3GB` — strict memory ceiling covering coin cache + mempool + RocksDB block cache. Shrink caches proactively before OOM.
-- `--max-disk-growth-per-day=5GB` — if about to exceed, prune aggressively or pause non-critical indexes.
-**Why it matters:** On shared hardware (e.g., Pi running Umbrel), the node can starve its neighbors during IBD.
+### Resource governance on shared & constrained hardware
+On shared hardware (e.g., a Pi running Umbrel) the node can starve its neighbors, fill the disk, or get OOM-killed mid-write. But not every resource belongs under daemon control.
 
-### Bandwidth caps + "data cap" awareness
-**Proposal:**
-- `--max-upload-per-month=500GB` — cumulative counter persisted across restarts.
-- `--max-upload-rate=5Mbps` and `--max-download-rate=50Mbps` — token bucket at the socket layer.
-- Configurable "upload-only at night" window.
+**Guiding principle:** satd owns a resource control only when enforcement needs *internal knowledge* (which bytes are prunable vs. load-bearing, which cache to shrink) or must *survive restarts* (a persistent counter). Otherwise the kernel, cgroups, systemd, or the container does the job better, and satd's job is to document the knob — not reinvent it. Our deployment targets (Umbrel, Start9, Pi-in-a-container) already run everything under cgroups, so a daemon-side reimplementation would duplicate infrastructure that's already present and more capable. The subsections below apply this principle to CPU, memory, disk, and bandwidth.
+
+#### CPU — delegate to cgroups / systemd
+No daemon-side flag. The kernel CFS scheduler — `CPUQuota=` under systemd, `--cpus` under Docker, `cpu.max` under a raw cgroup — throttles more precisely than satd could from userspace, where the only lever is inserting sleeps into its own verification loops (strictly worse). `docs/PACKAGING.md` should document the recommended `CPUQuota=` for a Pi profile rather than satd growing a `--max-cpu` flag.
+
+#### Memory — daemon governs, cgroup backstops
+An external memory limit (cgroup `memory.max`, Docker `-m`) enforces via the **OOM killer**: when satd crosses the limit it is SIGKILL'd mid-write — exactly the unclean-shutdown / corrupted-chainstate scenario the Pi-ergonomics work guards against. The daemon's value-add is *staying below* the cap, not capping: it knows its footprint is split across the CoinCache clean-LRU, the RocksDB block cache, and the mempool, and can shrink them proactively under pressure.
+
+**Proposal:** `--max-memory=3GB` — a soft **governor target**, not a hard ceiling. It extends the existing `--dbcache=auto` controller (see "Adaptive dbcache sizing" below, already monitoring `/proc/meminfo` and resizing both caches) from "react to system memory pressure" to "hold caches under an operator-set budget." Set it ~15% below the cgroup `memory.max` so the daemon back-pressures before the kernel kills. Best practice is both layers — cgroup as the hard backstop, daemon as the soft governor — not one or the other.
+
+#### Disk — total footprint cap (`-maxdiskusage`)
+**Proposal:** `-maxdiskusage=<size>` — a holistic cap on satd's datadir footprint. This replaces the earlier `--max-disk-growth-per-day` idea: a *rate* cap is the wrong unit. It bites hardest during IBD / index backfill (when growth is fast and you want sync to finish) and almost never triggers at steady-state tip. Operators don't fear "grew 5 GB today"; they fear "my SSD fills up" — a total cap maps directly to that, and to the mental model they already have from `-prune`.
+
+It is a **superset of `-prune`, not a parallel knob.** Core's `-prune=<MiB>` caps *block files* only; it ignores chainstate and indexes (the address index alone is 120–180 GB at mainnet tip). `-maxdiskusage` accounts for blocks + chainstate + indexes + undo together, and as it approaches the limit grades its response: tighten the effective prune target → pause non-critical index backfill (address, filters) → refuse new backfills → alert. Only satd can do this, because only satd knows which bytes are prunable vs. load-bearing — a filesystem quota just returns `ENOSPC`, which is catastrophic for a database mid-write.
+
+**Hard floor, fail loud.** Chainstate is not prunable and grows on its own, so if `-maxdiskusage` is set below `chainstate + minimum block window + WAL`, satd cannot honor it and must refuse at startup with a clear message — never silently thrash or corrupt.
+
+**Optional refinement (not first):** `-mindiskfree=<size>` — stop growing when free space on the *volume* drops below N, protecting other tenants on a shared host (the Umbrel "don't starve neighbors" concern). Complementary to the footprint cap; the footprint cap ships first.
+
+#### Bandwidth — mostly delegated / already shipped
+The cumulative upload cap is application state with block-serving semantics — the daemon is the only thing that knows the rolling counter and can stop serving historical blocks while still relaying — which is why Core has `-maxuploadtarget`, and satd shipped it in 0.2.0. What remains is marginal: a socket-layer token bucket (`--max-upload-rate` / `--max-download-rate`) that overlaps with `tc` traffic shaping, and a configurable "upload-only at night" window. Low priority; the persistent-counter need is already met. The disk-*rate* signal, likewise, belongs in the alerting-hooks feature as an early-warning webhook ("disk growing faster than expected"), not as an enforcement knob.
 
 ### Adaptive dbcache sizing
 **Status:** ✅ Shipped. Exposes `--dbcache=auto` which spawns a background controller task monitoring `/proc/meminfo` on Linux hosts. It resizes both the RocksDB block cache and CoinCache clean-LRU on a 30s tick in response to system memory pressure, automatically backing off during IBD vs. steady tip operation and contracting on sharp memory drops.
