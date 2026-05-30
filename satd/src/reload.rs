@@ -28,6 +28,7 @@
 //! daemon: it is logged and the running config is kept.
 
 use crate::config::{self, Config};
+use node::mempool::pool::{Mempool, MempoolConfig};
 use node::net::manager::PeerManager;
 use std::sync::Arc;
 use tracing_subscriber::{EnvFilter, Registry};
@@ -66,8 +67,26 @@ pub struct ReloadHandles {
     /// CLI args captured at startup — re-used verbatim on every reload so CLI
     /// flags stay authoritative and only the config file can change.
     pub cli: config::CliArgs,
+    pub mempool: Arc<Mempool>,
     pub peer_manager: Arc<PeerManager>,
     pub log_filter: LogReloadHandle,
+}
+
+/// Map a `Config` to the mempool's `MempoolConfig`. Single source of truth for
+/// both startup (`main`) and SIGHUP reload, so the two cannot drift.
+pub fn mempool_config_from(c: &Config) -> MempoolConfig {
+    MempoolConfig {
+        max_size_bytes: c.maxmempool * 1_000_000,
+        min_fee_rate: c.minrelaytxfee,
+        full_rbf: c.mempoolfullrbf,
+        dust_relay_fee: c.dustrelayfee,
+        data_carrier: c.datacarrier,
+        data_carrier_size: c.datacarriersize,
+        max_ancestor_count: c.limitancestorcount,
+        max_descendant_count: c.limitdescendantcount,
+        expiry_secs: c.mempoolexpiry * 3600,
+        permit_bare_multisig: c.permitbaremultisig,
+    }
 }
 
 /// One config field's reload disposition.
@@ -229,8 +248,12 @@ fn field_specs() -> Vec<FieldSpec> {
         restart!("connect", connect),
         restart!("addnode", addnode),
         restart!("seednode", seednode),
-        restart!("maxconnections", maxconnections),
-        restart!("maxinboundperip", maxinboundperip),
+        live!("maxconnections", maxconnections, |c, h| {
+            h.peer_manager.set_max_connections(c.maxconnections)
+        }),
+        live!("maxinboundperip", maxinboundperip, |c, h| {
+            h.peer_manager.set_max_inbound_per_ip(c.maxinboundperip)
+        }),
         live!("maxuploadtarget", max_upload_target, |c, h| {
             h.peer_manager.set_max_upload_target(c.max_upload_target)
         }),
@@ -238,7 +261,9 @@ fn field_specs() -> Vec<FieldSpec> {
         restart!("dnsseed", dnsseed),
         restart!("forcednsseed", forcednsseed),
         restart!("fixedseeds", fixedseeds),
-        restart!("bantime", bantime),
+        live!("bantime", bantime, |c, h| {
+            h.peer_manager.set_ban_duration_secs(c.bantime)
+        }),
         live!("timeout", timeout, |c, h| {
             h.peer_manager.set_connect_timeout_ms(c.timeout)
         }),
@@ -262,18 +287,44 @@ fn field_specs() -> Vec<FieldSpec> {
         restart!("addrindexsubscriptions", addrindexsubscriptions),
         restart!("blockfilterindex", blockfilterindex),
         restart!("peerblockfilters", peerblockfilters),
-        // ---- Mempool / relay policy (live-applied in PR2) ----
-        restart!("mempoolfullrbf", mempoolfullrbf),
-        restart!("maxmempool", maxmempool),
-        restart!("minrelaytxfee", minrelaytxfee),
-        restart!("dustrelayfee", dustrelayfee),
-        restart!("datacarrier", datacarrier),
-        restart!("datacarriersize", datacarriersize),
-        restart!("limitancestorcount", limitancestorcount),
-        restart!("limitdescendantcount", limitdescendantcount),
-        restart!("mempoolexpiry", mempoolexpiry),
+        // ---- Mempool / relay policy ----
+        // All map into a single `MempoolConfig` swapped atomically via
+        // `reload_policy`; `accept_transaction` snapshots the policy at entry,
+        // so the change governs subsequent admissions (admitted entries are not
+        // re-evaluated). They share one apply that rebuilds the whole policy.
+        live!("mempoolfullrbf", mempoolfullrbf, |c, h| {
+            h.mempool.reload_policy(mempool_config_from(c))
+        }),
+        live!("maxmempool", maxmempool, |c, h| {
+            h.mempool.reload_policy(mempool_config_from(c))
+        }),
+        live!("minrelaytxfee", minrelaytxfee, |c, h| {
+            h.mempool.reload_policy(mempool_config_from(c))
+        }),
+        live!("dustrelayfee", dustrelayfee, |c, h| {
+            h.mempool.reload_policy(mempool_config_from(c))
+        }),
+        live!("datacarrier", datacarrier, |c, h| {
+            h.mempool.reload_policy(mempool_config_from(c))
+        }),
+        live!("datacarriersize", datacarriersize, |c, h| {
+            h.mempool.reload_policy(mempool_config_from(c))
+        }),
+        live!("limitancestorcount", limitancestorcount, |c, h| {
+            h.mempool.reload_policy(mempool_config_from(c))
+        }),
+        live!("limitdescendantcount", limitdescendantcount, |c, h| {
+            h.mempool.reload_policy(mempool_config_from(c))
+        }),
+        live!("mempoolexpiry", mempoolexpiry, |c, h| {
+            h.mempool.reload_policy(mempool_config_from(c))
+        }),
+        // `persistmempool` only governs save-on-shutdown behavior, which reads
+        // the (reassigned) running config at exit — report rather than apply.
         restart!("persistmempool", persistmempool),
-        restart!("permitbaremultisig", permitbaremultisig),
+        live!("permitbaremultisig", permitbaremultisig, |c, h| {
+            h.mempool.reload_policy(mempool_config_from(c))
+        }),
         // ---- Esplora ----
         restart!("esplora", esplora),
         restart!("esplorabind", esplora_bind),

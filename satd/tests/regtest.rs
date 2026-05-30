@@ -2626,6 +2626,48 @@ fn test_sighup_config_reload_applies_and_survives_bad_config() {
 }
 
 #[test]
+fn test_sighup_reload_applies_mempool_policy_live() {
+    // Mempool/relay policy is hot-reloadable: SIGHUP swaps the live policy and
+    // `getmempoolinfo` (which reads the live policy) reflects it without a
+    // restart. `maxmempool` is an unambiguous integer (bytes), so we assert it
+    // changes from its startup value to the reloaded one.
+    let mut node = TestNode::start(&[]);
+
+    let before = node.rpc_call("getmempoolinfo").unwrap()["result"]["maxmempool"]
+        .as_u64()
+        .expect("maxmempool is an integer");
+
+    // Pick a target distinct from the startup value (bytes = MB * 1_000_000).
+    let target_mb: u64 = 50;
+    let target_bytes = target_mb * 1_000_000;
+    assert_ne!(before, target_bytes, "test target must differ from startup value");
+
+    let conf = node.datadir.join("bitcoin.conf");
+    std::fs::write(&conf, format!("[regtest]\nmaxmempool={target_mb}\n")).unwrap();
+    send_sighup(&node);
+
+    let deadline = Instant::now() + test_timeout(10);
+    let applied = loop {
+        let v = node.rpc_call("getmempoolinfo").unwrap()["result"]["maxmempool"]
+            .as_u64()
+            .unwrap_or(0);
+        if v == target_bytes {
+            break true;
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert!(
+        applied,
+        "SIGHUP did not apply maxmempool={target_mb} live (still {before} bytes)"
+    );
+
+    node.stop();
+}
+
+#[test]
 fn test_clean_shutdown_marker_graceful_stop() {
     // Graceful RPC stop should write the marker and next startup should see it.
     let rpcport = find_available_port();

@@ -20,7 +20,12 @@ layout) per `STABILITY_POLICY.md`.
   runtime), so `SIGHUP` is free for config reload. Applied live: log verbosity
   (`-debug`/`-debugexclude`), connection knobs
   (`-timeout`/`-blocksonly`/`-maxuploadtarget`/`-v2transport`/`-v2only`/`-externalip`/`-whitelist`),
-  and the RPC-behavior switches (`-rpcextendederrors`/`-rpcdefaultunits`).
+  the RPC-behavior switches (`-rpcextendederrors`/`-rpcdefaultunits`), mempool
+  and relay policy
+  (`-minrelaytxfee`/`-maxmempool`/`-dustrelayfee`/`-datacarrier(size)`/`-mempoolfullrbf`/`-limitancestorcount`/`-limitdescendantcount`/`-mempoolexpiry`/`-permitbaremultisig`),
+  and the peer-limit knobs (`-maxconnections`/`-maxinboundperip`/`-bantime`).
+  Mempool-policy changes govern subsequent transaction admissions;
+  connection/ban-limit changes apply to new connections and future bans.
   Settings wired into long-lived state at startup (network, datadir,
   ports/binds, `-dbcache`, indexes, TLS, seeds, Tor) are logged as "restart
   required" and never silently ignored. A reload that fails to parse — e.g. a

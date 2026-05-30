@@ -110,8 +110,7 @@ pub fn load_mempool(
     // overhead, so a corrupt or oversized mempool.dat can't force a large
     // allocation (startup OOM) before the header checks even run.
     let max_bytes = mempool
-        .policy()
-        .max_size_bytes
+        .max_size_bytes()
         .saturating_mul(2)
         .saturating_add(16 * 1024 * 1024) as u64;
     match std::fs::metadata(&path) {

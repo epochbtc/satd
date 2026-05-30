@@ -729,7 +729,7 @@ pub fn relayfee(state: &ElectrumState) -> Result<Value, JsonRpcError> {
     // Same conversion as `estimatefee` — sat/(1000 WU) → BTC/kB.
     // `min_fee_rate` is the mempool's admission policy in sat per
     // 1000 weight units, mirroring `Mempool::accept_transaction`.
-    let sat_per_1000_wu = state.mempool.policy().min_fee_rate;
+    let sat_per_1000_wu = state.mempool.min_fee_rate();
     Ok(json!(sat_per_1000_wu_to_btc_per_kb(sat_per_1000_wu)))
 }
 

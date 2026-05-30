@@ -7,7 +7,7 @@ use parking_lot::{Condvar, RwLock};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
@@ -168,18 +168,21 @@ pub struct PeerManager {
     /// Prune target in MB (0 = disabled).
     #[allow(dead_code)]
     prune_target_mb: u64,
-    /// Maximum total connections (default: 125).
-    max_connections: usize,
+    /// Maximum total connections (default: 125). Atomic so SIGHUP config
+    /// reload can adjust it live (applies to new connections; existing peers
+    /// above a lowered cap are not dropped).
+    max_connections: AtomicUsize,
     /// Maximum simultaneous inbound peers from the same source IP
-    /// (Core-style flood guard).
-    max_inbound_per_ip: usize,
+    /// (Core-style flood guard). Atomic for live SIGHUP reload.
+    max_inbound_per_ip: AtomicUsize,
     /// Outbound `connect_outbound` calls that have started but haven't
     /// yet finished registering a peer. Used to dedup concurrent dial
     /// attempts against the same addr (e.g. an addr arriving from
     /// multiple peers' gossip).
     pending_connections: RwLock<HashSet<SocketAddr>>,
-    /// Ban duration in seconds (default: 86400).
-    ban_duration_secs: u64,
+    /// Ban duration in seconds (default: 86400). Atomic for live SIGHUP
+    /// reload (applies to bans created after the change).
+    ban_duration_secs: AtomicU64,
     /// Per-message timeout for the version/verack handshake, in
     /// milliseconds (Bitcoin Core's `-timeout`, default 5000ms). A peer
     /// that doesn't make handshake progress within this window is
@@ -355,10 +358,10 @@ impl PeerManager {
             banned_addrs: RwLock::new(HashMap::new()),
             shutdown,
             prune_target_mb,
-            max_connections,
-            max_inbound_per_ip,
+            max_connections: AtomicUsize::new(max_connections),
+            max_inbound_per_ip: AtomicUsize::new(max_inbound_per_ip),
             pending_connections: RwLock::new(HashSet::new()),
-            ban_duration_secs,
+            ban_duration_secs: AtomicU64::new(ban_duration_secs),
             connect_timeout_ms: AtomicU64::new(DEFAULT_CONNECT_TIMEOUT_MS),
             ibd: ibd.clone(),
             connect_signal: connect_signal.clone(),
@@ -514,6 +517,26 @@ impl PeerManager {
     /// Set the `-maxuploadtarget` cap in bytes (0 = unlimited).
     pub fn set_max_upload_target(&self, bytes: u64) {
         self.upload_target_bytes.store(bytes, Ordering::Relaxed);
+    }
+
+    /// Set the `-maxconnections` cap. Applies to connections accepted/dialed
+    /// after the change; peers already connected above a lowered cap are not
+    /// disconnected. Used at startup and by SIGHUP config reload.
+    pub fn set_max_connections(&self, n: usize) {
+        self.max_connections.store(n, Ordering::Relaxed);
+    }
+
+    /// Set the `-maxinboundperip` flood-guard limit. Applies to new inbound
+    /// connections. Used at startup and by SIGHUP config reload.
+    pub fn set_max_inbound_per_ip(&self, n: usize) {
+        self.max_inbound_per_ip.store(n, Ordering::Relaxed);
+    }
+
+    /// Set the `-bantime` duration in seconds. Applies to bans created after
+    /// the change; already-active bans keep their original expiry. Used at
+    /// startup and by SIGHUP config reload.
+    pub fn set_ban_duration_secs(&self, secs: u64) {
+        self.ban_duration_secs.store(secs, Ordering::Relaxed);
     }
 
     /// Roll the 24h upload cycle over if it has elapsed.
@@ -698,7 +721,7 @@ impl PeerManager {
         let max_outbound = if self.is_ibd() {
             MAX_OUTBOUND_IBD
         } else {
-            self.max_connections.min(MAX_OUTBOUND)
+            self.max_connections.load(Ordering::Relaxed).min(MAX_OUTBOUND)
         };
         let outbound = self.outbound_count();
         if outbound >= max_outbound {
@@ -839,7 +862,7 @@ impl PeerManager {
             // (matches Bitcoin Core's manual-conn / whitelist handling).
             if !perms.noban {
                 let (inbound_count, same_ip_count) = Self::count_inbound(&peers, ip);
-                if inbound_count >= self.max_connections.saturating_sub(MAX_OUTBOUND) {
+                if inbound_count >= self.max_connections.load(Ordering::Relaxed).saturating_sub(MAX_OUTBOUND) {
                     tracing::warn!(%addr, "Max inbound connections reached, dropping connection");
                     return;
                 }
@@ -854,11 +877,11 @@ impl PeerManager {
                 // throttle localhost this way. The total `inbound_count`
                 // cap above still bounds loopback, so this cannot exhaust
                 // all slots.
-                if !ip.is_loopback() && same_ip_count >= self.max_inbound_per_ip {
+                if !ip.is_loopback() && same_ip_count >= self.max_inbound_per_ip.load(Ordering::Relaxed) {
                     tracing::warn!(
                         %addr,
                         same_ip_count,
-                        limit = self.max_inbound_per_ip,
+                        limit = self.max_inbound_per_ip.load(Ordering::Relaxed),
                         "Per-IP inbound limit reached, dropping connection",
                     );
                     return;
@@ -1021,7 +1044,7 @@ impl PeerManager {
                     "address": addr.to_string(),
                     "ban_created": 0,
                     "banned_until": remaining,
-                    "ban_duration": self.ban_duration_secs,
+                    "ban_duration": self.ban_duration_secs.load(Ordering::Relaxed),
                     "ban_reason": "node misbehaving",
                 })
             })
@@ -1034,7 +1057,7 @@ impl PeerManager {
             self.banned_addrs
                 .write()
                 
-                .insert(addr, Instant::now() + Duration::from_secs(self.ban_duration_secs));
+                .insert(addr, Instant::now() + Duration::from_secs(self.ban_duration_secs.load(Ordering::Relaxed)));
         } else {
             self.banned_addrs.write().remove(&addr);
         }
@@ -1129,7 +1152,7 @@ impl PeerManager {
                 self.banned_addrs
                     .write()
                     
-                    .insert(addr, Instant::now() + Duration::from_secs(self.ban_duration_secs));
+                    .insert(addr, Instant::now() + Duration::from_secs(self.ban_duration_secs.load(Ordering::Relaxed)));
             }
         }
     }
@@ -3836,7 +3859,7 @@ impl PeerManager {
         .map_err(|e| format!("send sendcmpct: {}", e))?;
 
         // Send our fee filter (BIP 133) so peer doesn't relay low-fee txs to us
-        writer.send(NetworkMessage::FeeFilter(self.mempool.policy().min_fee_rate as i64))
+        writer.send(NetworkMessage::FeeFilter(self.mempool.min_fee_rate() as i64))
             .await
             .map_err(|e| format!("send feefilter: {}", e))?;
 
