@@ -23,17 +23,21 @@ layout) per `STABILITY_POLICY.md`.
   remaining-bytes/rate ETA. `getstartupinfo` is a satd-native pre-init RPC
   with no Bitcoin Core equivalent, so the added fields don't affect Core
   compatibility.
-- **`sat-tui` now surfaces an unreadable RPC cookie instead of hanging at
-  "Connecting to satd…".** When the cookie file couldn't be read (permission
-  denied, missing, or malformed) the TUI silently fell back to an empty auth
-  header, so every request 401'd with no explanation. This is easy to hit
-  against a node mid-`--reindex-chainstate`: satd holds the cookie at
-  `0600 satd:satd` until it reaches READY, so a non-`satd` user can't read it
-  yet. The client now keeps the real read error and shows a dedicated
-  "RPC cookie unreadable" modal with the underlying message and remediation,
-  distinct from the credentials-rejected (HTTP 401) case. It auto-recovers:
-  the cookie is re-read on each auth failure, so once satd relaxes it to
-  `0640` at READY the next good poll dismisses the modal.
+- **`sat-tui` now identifies an unreadable RPC cookie specifically, instead
+  of reporting a generic authentication failure.** When the cookie file
+  couldn't be read (permission denied, missing, malformed) the TUI fell back
+  to an empty auth header, so the request 401'd and surfaced the generic
+  "RPC authentication failed" modal — leaving the operator to guess between a
+  wrong password and an unreadable cookie. This is easy to hit against a node
+  mid-`--reindex-chainstate`: satd holds the cookie at `0600 satd:satd` until
+  it reaches READY, so a non-`satd` user can't read it yet. The client now
+  keeps the actual read error (e.g. "Permission denied") and shows a dedicated
+  "RPC cookie unreadable" modal with that message and cookie-side remediation,
+  distinct from the credentials-rejected case. It only applies when satd
+  actually returned a 401 (a connection failure still reads as "is satd
+  running?"), and auto-recovers: the cookie is re-read on each auth failure,
+  so once satd relaxes it to `0640` at READY the next good poll dismisses the
+  modal.
 
 ### RPC / P2P compatibility (Bitcoin Core clients)
 

@@ -294,9 +294,10 @@ async fn poller(rpc: Arc<RpcClient>, state: Arc<Mutex<AppState>>) {
             None
         };
 
-        // The cookie-read state is the root cause of any auth failure, so
-        // snapshot it before locking state and let it override the generic
-        // downstream classification below.
+        // The cookie-read state is the root cause of a 401, so snapshot it
+        // before locking state and let it refine an `AuthFailed` into the
+        // specific cookie error below (it does not override connect/timeout
+        // failures — see `resolve_failure`).
         let cookie_error = rpc.cookie_error();
 
         let need_startup_check = {
@@ -443,20 +444,28 @@ async fn poller(rpc: Arc<RpcClient>, state: Arc<Mutex<AppState>>) {
 }
 
 /// Fold the cookie-read state into the batch classification. An unreadable
-/// cookie is the *root cause* of any auth failure in the batch — the
-/// credentials never left the client — so when one is present we surface
-/// that specific, actionable error (e.g. "Permission denied", with
-/// cookie-side remediation) instead of the generic downstream 401. It
-/// clears automatically: `RpcClient::refresh_auth` re-reads the cookie on
-/// each auth failure, so once satd relaxes it to `0640` at READY the next
-/// good poll dismisses the modal.
+/// cookie is the root cause of an *auth* failure — we reached satd and it
+/// returned 401 because the credentials we sent were empty/stale — so in
+/// that case we surface the specific, actionable cookie error (e.g.
+/// "Permission denied", with cookie-side remediation) and its exact OS
+/// message instead of the generic 401. It clears automatically:
+/// `RpcClient::refresh_auth` re-reads the cookie on each auth failure, so
+/// once satd relaxes it to `0640` at READY the next good poll dismisses the
+/// modal.
+///
+/// Crucially this only overrides `AuthFailed`. A `ConnectionFailed` /
+/// `Timeout` means we couldn't even talk to satd, and the cookie being
+/// missing there is a *symptom* of satd being down (it hasn't created the
+/// file yet), not the cause — so the "is satd running?" diagnosis must win.
 fn resolve_failure(
     cookie_error: Option<String>,
     batch: Option<(RpcFailure, String)>,
 ) -> Option<(RpcFailure, String)> {
-    match cookie_error {
-        Some(msg) => Some((RpcFailure::CookieUnreadable, msg)),
-        None => batch,
+    match (cookie_error, &batch) {
+        (Some(msg), Some((RpcFailure::AuthFailed, _))) => {
+            Some((RpcFailure::CookieUnreadable, msg))
+        }
+        _ => batch,
     }
 }
 
@@ -514,9 +523,9 @@ mod tests {
     }
 
     #[test]
-    fn cookie_error_overrides_downstream_failure() {
-        // An unreadable cookie is the root cause: surface it (with the real
-        // message) instead of the generic 401 it produces downstream.
+    fn cookie_error_refines_auth_failure() {
+        // Reached satd, got 401, cookie unreadable: surface the real cookie
+        // error (with its OS message) instead of the generic 401.
         let (k, msg) = resolve_failure(
             Some("Cannot read cookie file: Permission denied (os error 13)".into()),
             Some((RpcFailure::AuthFailed, "Authentication failed".into())),
@@ -527,10 +536,32 @@ mod tests {
     }
 
     #[test]
+    fn cookie_error_does_not_mask_connection_failure() {
+        // satd is down: the missing cookie is a symptom, not the cause. The
+        // "is satd running?" diagnosis must win over a misleading cookie modal.
+        let r = resolve_failure(
+            Some("Cannot read cookie file: No such file or directory".into()),
+            Some((RpcFailure::ConnectionFailed, "refused".into())),
+        );
+        assert_eq!(r.unwrap().0, RpcFailure::ConnectionFailed);
+
+        // Same for a timeout.
+        let r = resolve_failure(
+            Some("Cannot read cookie file: Permission denied".into()),
+            Some((RpcFailure::Timeout, "30s".into())),
+        );
+        assert_eq!(r.unwrap().0, RpcFailure::Timeout);
+    }
+
+    #[test]
     fn no_cookie_error_passes_batch_through() {
         // Readable cookie (or user/pass auth): keep the batch classification.
         let r = resolve_failure(None, Some((RpcFailure::ConnectionFailed, "refused".into())));
         assert_eq!(r.unwrap().0, RpcFailure::ConnectionFailed);
+        // A readable cookie with a genuine 401 stays AuthFailed (credentials
+        // really are wrong — e.g. mismatched --rpcuser/--rpcpassword).
+        let r = resolve_failure(None, Some((RpcFailure::AuthFailed, "401".into())));
+        assert_eq!(r.unwrap().0, RpcFailure::AuthFailed);
         // No failure at all stays None.
         assert!(resolve_failure(None, None).is_none());
     }
