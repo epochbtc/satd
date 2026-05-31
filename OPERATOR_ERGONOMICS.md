@@ -92,7 +92,17 @@ Edit `bitcoin.conf` and send `SIGHUP` — `kill -HUP <pid>`, or `systemctl reloa
 
 > **Credential rotation caveat.** Removing `rpcuser`/`rpcpassword` from a node started *without* a cookie (i.e. one started *with* a static user/pass) leaves no credentials at all — the RPC interface then rejects everything until you restore a credential or restart (a restart regenerates the cookie). satd logs a warning when a reload lands in this state. The cookie **file** (`rpccookiefile`/`rpccookieperms`) and the `rpcdisableauth` mTLS toggle remain restart-only.
 
-**Restart required (reported, not applied):** network selection, `datadir`/`blocksdir`, all RPC/P2P/Esplora/Electrum **ports and binds**, the RPC cookie file (`rpccookiefile`/`rpccookieperms`) and `rpcdisableauth`, all TLS/mTLS material, `dbcache`/`prune`/`storageprofile`/reindex, index enable/disable (`txindex`/`addressindex`/`blockfilterindex`), DNS-seed bootstrap (`dns`/`dnsseed`/`forcednsseed`/`fixedseeds`/`asmap`), Tor (`proxy`/`onion`/`torcontrol`/`listenonion`), `consensus`, and `assumevalid`/`stopatheight`. These are wired into long-lived state at startup (a bound socket, an opened database, the chain identity) and cannot be swapped without restarting the relevant socket/engine/process.
+**Restart required (reported, not applied):** network selection, `datadir`/`blocksdir`, all RPC/P2P/Esplora/Electrum **ports and binds**, the RPC cookie file (`rpccookiefile`/`rpccookieperms`) and `rpcdisableauth`, TLS/mTLS **paths** and the mTLS **CA** (the cert/key *contents* reload via `SIGUSR1` — see below), `dbcache`/`prune`/`storageprofile`/reindex, index enable/disable (`txindex`/`addressindex`/`blockfilterindex`), DNS-seed bootstrap (`dns`/`dnsseed`/`forcednsseed`/`fixedseeds`/`asmap`), Tor (`proxy`/`onion`/`torcontrol`/`listenonion`), `consensus`, and `assumevalid`/`stopatheight`. These are wired into long-lived state at startup (a bound socket, an opened database, the chain identity) and cannot be swapped without restarting the relevant socket/engine/process.
+
+### Live TLS Certificate Reload (`SIGUSR1`)
+Send `SIGUSR1` — `kill -USR1 <pid>` — to reload the TLS server certificates from their **already-configured** paths (`rpctlscert`/`rpctlskey`, `esploratlscert`/`esploratlskey`, `electrumtlscert`/`electrumtlskey`) without restarting. Every TLS surface re-reads its leaf cert/key from disk and swaps it in atomically. This is purpose-built for infrastructure that auto-rotates certificates on short TTLs (cert-manager, Vault, ACME sidecars): point a renewal hook (or a systemd `path` unit watching the cert file) at `kill -USR1`.
+
+- **New handshakes** use the new cert; **in-flight connections** keep theirs — no dropped connections, no socket rebind.
+- It reloads the **leaf cert/key only**. Changing the cert/key **paths**, or rotating the mTLS **client CA** (`rpcmtlsclientca` etc.), still requires a restart — CAs are long-lived and don't rotate on the short TTLs this targets.
+- **Safe:** a reload that fails (unreadable, malformed, or a cert/key that don't match) is logged per-surface and the **previous, still-valid certificate is kept** — the listener is never left without a usable cert. Each surface reloads independently; one failure doesn't affect the others.
+- Distinct from `SIGHUP` (config reload) on purpose: cert rotation is frequent and automation-driven, so it gets a dedicated signal that doesn't re-read `bitcoin.conf` or run the config diff/apply machinery.
+
+> **Difference from Bitcoin Core.** Core has no `SIGUSR1` handler and no native TLS (its RPC is HTTP-only behind a sidecar). satd's native TLS makes in-place cert reload meaningful. See `CORE_DIFFERENCES.md`.
 
 ## 3. Developer & Integrator APIs
 

@@ -10,6 +10,21 @@ layout) per `STABILITY_POLICY.md`.
 
 ### Operator
 
+- **`SIGUSR1` now hot-reloads TLS certificates in place.** `kill -USR1 <pid>`
+  re-reads each native-TLS surface's leaf cert/key (`rpctls*`, `esploratls*`,
+  `electrumtls*`) from its **already-configured** path and swaps it into the
+  live listener without a restart — new handshakes use the new cert, in-flight
+  connections keep theirs, and the bound socket never changes. Purpose-built
+  for short-TTL auto-rotated certs (cert-manager / ACME / Vault): point a
+  renewal hook or a systemd `path` unit at `kill -USR1`. It reloads the leaf
+  cert/key only; the cert/key **paths** and the mTLS **client CA** stay
+  restart-only. A failed reload (unreadable / malformed / mismatched key) is
+  logged per-surface and the previous, still-valid certificate is kept — the
+  listener is never left without a usable cert. Deliberately separate from
+  `SIGHUP` config reload so frequent automated cert rotation doesn't re-read
+  `bitcoin.conf`. Bitcoin Core has no equivalent (no `SIGUSR1` handler, no
+  native TLS). See `OPERATOR_ERGONOMICS.md` / `CORE_DIFFERENCES.md`.
+
 - **`SIGHUP` now reloads `bitcoin.conf` live.** Edit the config file and
   `kill -HUP <pid>` (or `systemctl reload satd`) to re-read it and apply the
   hot-reloadable subset of settings without a restart — the P2P swarm and

@@ -35,12 +35,14 @@ use std::collections::HashSet;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, RwLock};
 
 use thiserror::Error;
 use tokio_rustls::rustls::RootCertStore;
+use tokio_rustls::rustls::crypto::ring::sign::any_supported_type;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use tokio_rustls::rustls::server::WebPkiClientVerifier;
+use tokio_rustls::rustls::server::{ClientHello, ResolvesServerCert, WebPkiClientVerifier};
+use tokio_rustls::rustls::sign::CertifiedKey;
 
 pub use tokio_rustls::TlsAcceptor;
 pub use tokio_rustls::rustls::ServerConnection;
@@ -168,6 +170,13 @@ pub fn build_acceptor(
 ) -> Result<TlsAcceptor, TlsConfigError> {
     let certs = load_certs(cert_path)?;
     let key = load_private_key(key_path)?;
+    // Build the server cert behind a runtime-swappable resolver instead of
+    // `with_single_cert`, so the leaf cert/key can be hot-reloaded from the
+    // SAME paths on SIGUSR1 (see [`reload_all_certs`]) without rebinding the
+    // socket. rustls consults the resolver per handshake, so a swap takes
+    // effect for new connections; in-flight connections keep their cert.
+    let certified = build_certified_key(certs, key)?;
+    let resolver = Arc::new(ReloadableCertResolver::new(certified));
     let builder = tokio_rustls::rustls::ServerConfig::builder();
     let builder = match client_auth {
         ClientAuthPolicy::Disabled => builder.with_no_client_auth(),
@@ -176,13 +185,151 @@ pub fn build_acceptor(
             let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
                 .build()
                 .map_err(|e| TlsConfigError::ClientVerifier(e.to_string()))?;
+            // The client-CA verifier is baked in (the CA is long-lived and
+            // does not rotate on the short TTLs that motivate cert reload).
+            // A SIGUSR1 reload swaps only the server leaf cert/key; changing
+            // the mTLS CA still requires a restart.
             builder.with_client_cert_verifier(verifier)
         }
     };
-    let server_config = builder
-        .with_single_cert(certs, key)
-        .map_err(|e| TlsConfigError::Rustls(e.to_string()))?;
+    let server_config = builder.with_cert_resolver(resolver.clone());
+    register_reloader(CertReloader {
+        cert_path: cert_path.to_path_buf(),
+        key_path: key_path.to_path_buf(),
+        resolver,
+    });
     Ok(TlsAcceptor::from(Arc::new(server_config)))
+}
+
+/// Build a rustls [`CertifiedKey`] from a parsed cert chain + private key,
+/// validating that the key matches the leaf cert. Uses the `ring` provider's
+/// key loader explicitly (the workspace pins `tokio-rustls` to the `ring`
+/// provider), so this does not depend on a process-default crypto provider.
+fn build_certified_key(
+    certs: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+) -> Result<Arc<CertifiedKey>, TlsConfigError> {
+    let signing_key = any_supported_type(&key)
+        .map_err(|e| TlsConfigError::Rustls(format!("unsupported private key: {e}")))?;
+    let certified = CertifiedKey::new(certs, signing_key);
+    // Equivalent to the check `with_single_cert` performed: the private key
+    // must correspond to the end-entity cert. Preserves fail-fast on a
+    // mismatched cert/key pair (at startup and on every reload).
+    certified
+        .keys_match()
+        .map_err(|e| TlsConfigError::Rustls(format!("certificate/key mismatch: {e}")))?;
+    Ok(Arc::new(certified))
+}
+
+/// A `ResolvesServerCert` whose certificate can be swapped at runtime. Holds
+/// the current [`CertifiedKey`] behind an `RwLock`; `resolve` (per handshake)
+/// takes a read lock and clones the `Arc`, and [`reload`](CertReloader::reload)
+/// takes a brief write lock to swap it.
+#[derive(Debug)]
+struct ReloadableCertResolver {
+    current: RwLock<Arc<CertifiedKey>>,
+}
+
+impl ReloadableCertResolver {
+    fn new(certified: Arc<CertifiedKey>) -> Self {
+        Self {
+            current: RwLock::new(certified),
+        }
+    }
+}
+
+impl ResolvesServerCert for ReloadableCertResolver {
+    fn resolve(&self, _client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        // Lock poisoning can only happen if a writer panicked mid-swap; the
+        // swap is a single assignment that can't panic, so this is effectively
+        // infallible. Recover the guard rather than panic on the handshake path.
+        Some(
+            self.current
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone(),
+        )
+    }
+}
+
+/// Handle that reloads one TLS surface's leaf cert/key from its configured
+/// paths into the live resolver. Cloneable (cheap: two `PathBuf`s + an `Arc`).
+#[derive(Clone)]
+struct CertReloader {
+    cert_path: PathBuf,
+    key_path: PathBuf,
+    resolver: Arc<ReloadableCertResolver>,
+}
+
+impl CertReloader {
+    /// Re-read the cert/key from disk and swap them into the resolver. On any
+    /// error (unreadable/missing/malformed/mismatched) the resolver keeps its
+    /// previous, still-valid certificate — the live listener is never left
+    /// without a usable cert.
+    fn reload(&self) -> Result<(), TlsConfigError> {
+        let certs = load_certs(&self.cert_path)?;
+        let key = load_private_key(&self.key_path)?;
+        let certified = build_certified_key(certs, key)?;
+        *self
+            .resolver
+            .current
+            .write()
+            .unwrap_or_else(|p| p.into_inner()) = certified;
+        Ok(())
+    }
+}
+
+/// Process-wide registry of reloadable TLS surfaces. Append-only at startup
+/// (each [`build_acceptor`] pushes one entry), read on SIGUSR1. A global is the
+/// least invasive wiring: the three TLS acceptors are built in three different
+/// crates (RPC/Esplora/Electrum), and this avoids threading a handle out of
+/// each surface's startup into the signal loop.
+static CERT_RELOADERS: Mutex<Vec<CertReloader>> = Mutex::new(Vec::new());
+
+fn register_reloader(reloader: CertReloader) {
+    CERT_RELOADERS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .push(reloader);
+}
+
+/// Outcome of reloading one TLS surface's certificate.
+pub struct CertReloadOutcome {
+    /// The cert path that was (re)loaded — identifies the surface in logs.
+    pub cert_path: PathBuf,
+    /// `Ok(())` if the new cert is now live; `Err` if the reload failed and the
+    /// previous cert was kept.
+    pub result: Result<(), TlsConfigError>,
+}
+
+/// Reload every registered TLS surface's leaf cert/key from its configured
+/// paths. Driven by SIGUSR1. Each surface reloads independently — a failure on
+/// one keeps that surface's previous cert and is reported in the returned
+/// outcomes, never aborting the others or the process.
+///
+/// The registry lock is released before any disk I/O (the reloaders are cloned
+/// out first), so a reload can never block `build_acceptor` or another reload.
+pub fn reload_all_certs() -> Vec<CertReloadOutcome> {
+    let reloaders: Vec<CertReloader> = CERT_RELOADERS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+    reloaders
+        .iter()
+        .map(|r| CertReloadOutcome {
+            cert_path: r.cert_path.clone(),
+            result: r.reload(),
+        })
+        .collect()
+}
+
+/// Number of registered reloadable TLS surfaces. Lets the signal handler skip
+/// logging entirely when no TLS surface is configured.
+pub fn registered_cert_count() -> usize {
+    CERT_RELOADERS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .len()
 }
 
 fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, TlsConfigError> {
@@ -533,5 +680,101 @@ mod tests {
     fn extract_leaf_names_handles_garbage_input() {
         let names = extract_leaf_names(b"not a cert");
         assert!(names.is_empty());
+    }
+
+    // --- TLS cert hot-reload (SIGUSR1) ---
+
+    /// Build a `CertReloader` directly (bypassing the global registry, so these
+    /// tests don't pollute it / race with each other).
+    fn make_reloader(cert_path: PathBuf, key_path: PathBuf) -> CertReloader {
+        let certs = load_certs(&cert_path).unwrap();
+        let key = load_private_key(&key_path).unwrap();
+        let certified = build_certified_key(certs, key).unwrap();
+        CertReloader {
+            cert_path,
+            key_path,
+            resolver: Arc::new(ReloadableCertResolver::new(certified)),
+        }
+    }
+
+    /// The leaf DER currently served by the resolver.
+    fn current_leaf(r: &CertReloader) -> Vec<u8> {
+        r.resolver.current.read().unwrap().cert[0].to_vec()
+    }
+
+    #[test]
+    fn reload_swaps_certificate_from_same_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert_a = simple_cert();
+        let cert_path = write_pem(dir.path(), "cert.pem", &cert_a.cert.pem());
+        let key_path = write_pem(dir.path(), "key.pem", &cert_a.key_pair.serialize_pem());
+
+        let reloader = make_reloader(cert_path.clone(), key_path.clone());
+        let before = current_leaf(&reloader);
+
+        // Rotate the cert IN PLACE (same paths) — as cert-manager would.
+        let cert_b = simple_cert();
+        write_pem(dir.path(), "cert.pem", &cert_b.cert.pem());
+        write_pem(dir.path(), "key.pem", &cert_b.key_pair.serialize_pem());
+
+        reloader.reload().expect("reload from same paths succeeds");
+        let after = current_leaf(&reloader);
+        assert_ne!(before, after, "resolver should serve the rotated cert");
+    }
+
+    #[test]
+    fn build_certified_key_rejects_mismatched_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert_a = simple_cert();
+        let cert_b = simple_cert(); // independent key
+        let cert_path = write_pem(dir.path(), "cert.pem", &cert_a.cert.pem());
+        let key_path = write_pem(dir.path(), "key.pem", &cert_b.key_pair.serialize_pem());
+
+        let certs = load_certs(&cert_path).unwrap();
+        let key = load_private_key(&key_path).unwrap();
+        let result = build_certified_key(certs, key);
+        assert!(
+            matches!(result, Err(TlsConfigError::Rustls(_))),
+            "mismatched cert/key must fail keys_match: {result:?}"
+        );
+    }
+
+    #[test]
+    fn reload_failure_keeps_previous_cert() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert_a = simple_cert();
+        let cert_path = write_pem(dir.path(), "cert.pem", &cert_a.cert.pem());
+        let key_path = write_pem(dir.path(), "key.pem", &cert_a.key_pair.serialize_pem());
+
+        let reloader = make_reloader(cert_path.clone(), key_path.clone());
+        let original = current_leaf(&reloader);
+
+        // Corrupt the cert file, then attempt a reload.
+        write_pem(dir.path(), "cert.pem", "-----BEGIN CERTIFICATE-----\ngarbage\n");
+        let result = reloader.reload();
+        assert!(result.is_err(), "reload of a corrupt cert must fail");
+        assert_eq!(
+            current_leaf(&reloader),
+            original,
+            "failed reload must keep the previous, still-valid cert"
+        );
+    }
+
+    #[test]
+    fn build_acceptor_registers_a_reloader() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert = simple_cert();
+        let cert_path = write_pem(dir.path(), "cert.pem", &cert.cert.pem());
+        let key_path = write_pem(dir.path(), "key.pem", &cert.key_pair.serialize_pem());
+
+        let before = registered_cert_count();
+        let acceptor = build_acceptor(&cert_path, &key_path, &ClientAuthPolicy::Disabled);
+        assert!(acceptor.is_ok());
+        // Registry is append-only and shared across parallel tests, so assert
+        // monotonic growth rather than an exact count.
+        assert!(
+            registered_cert_count() > before,
+            "build_acceptor should register a reloadable surface"
+        );
     }
 }

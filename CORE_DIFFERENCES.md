@@ -314,6 +314,19 @@ preserved; the satd extension is opt-in per request or per flag.
   running config is kept — the daemon never crashes on a bad reload. The
   authoritative per-key list is in `OPERATOR_ERGONOMICS.md`.
 
+- **`SIGUSR1` reloads TLS certificates in place.** Bitcoin Core has no
+  `SIGUSR1` handler and no native TLS (its JSON-RPC is HTTP-only, fronted by a
+  TLS-terminating sidecar). satd terminates TLS natively on the RPC, Esplora,
+  and Electrum surfaces, so `kill -USR1 <pid>` re-reads each surface's leaf
+  cert/key from its **already-configured** path and swaps it into the live
+  listener — new handshakes use the new cert, in-flight connections keep
+  theirs, and the socket never rebinds. Built for short-TTL auto-rotated certs
+  (cert-manager / ACME / Vault). The cert/key **paths** and the mTLS **CA**
+  remain restart-only. A failed reload keeps the previous, still-valid cert.
+  Kept separate from `SIGHUP` so frequent automated cert rotation doesn't
+  re-read `bitcoin.conf` or run the config diff/apply machinery. See
+  `OPERATOR_ERGONOMICS.md`.
+
 - **`getibdprogress`** — IBD bitmap + per-peer tracking; richer than
   Core's `verificationprogress` scalar.
 
