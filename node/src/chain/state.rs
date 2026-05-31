@@ -1086,6 +1086,30 @@ impl ChainState {
         (tip.hash, tip.height)
     }
 
+    /// Initial-block-download heuristic from a tip timestamp. Matches the
+    /// `initialblockdownload` signal in `getblockchaininfo`
+    /// (`rpc::blockchain`): the node is considered to be in IBD while its
+    /// active-chain tip is more than 24h behind wall-clock time. Shared so
+    /// the RPC and the per-block flush gate use one definition.
+    pub(crate) fn tip_time_is_ibd(tip_time: u32) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        (tip_time as u64) + 86_400 < now
+    }
+
+    /// Whether the node is in initial block download, judged by the active
+    /// tip's timestamp. Returns `true` when the tip header is unavailable
+    /// (treated as far-behind) so callers fail safe toward "still syncing".
+    pub fn is_initial_block_download(&self) -> bool {
+        let tip_time = self
+            .get_block_index(&self.tip_hash())
+            .map(|e| e.header.time)
+            .unwrap_or(0);
+        Self::tip_time_is_ibd(tip_time)
+    }
+
     /// Flush the UTXO write cache to disk. Call periodically during IBD
     /// and on graceful shutdown.
     pub fn flush_coin_cache(&self) -> Result<(), StoreError> {
@@ -3500,6 +3524,32 @@ impl ChainState {
             txs = block.txdata.len(),
             "Block connected"
         );
+
+        // Mitigation for the FRESH-elision-on-failed-reorg bug (#262).
+        // Outside IBD, flush the coin cache after every connected block so
+        // freshly-created coins become durable — and lose their FRESH
+        // (elidable) status — before any *subsequent* block can trigger a
+        // reorg that disconnects them. The bug needs a multi-block dirty
+        // window at the tip: a still-FRESH coin disconnected by a reorg
+        // turns into `Spent { fresh: true }` and is elided at the next
+        // flush, silently dropping a live coin. At the tip this is one
+        // flush per block (~10 min on mainnet), negligible cost. During
+        // IBD/reindex the connector loop's threshold-gated flush governs
+        // instead and this is skipped, since `block` is the new tip its
+        // timestamp is the tip time. A flush failure here does not
+        // un-connect the block (it is already committed), so we log loudly
+        // and continue rather than returning a misleading error — the
+        // coins remain in cache for the next flush attempt.
+        if !Self::tip_time_is_ibd(block.header.time)
+            && let Err(e) = self.store.flush()
+        {
+            tracing::error!(
+                error = %e,
+                height = new_height,
+                hash = %block_hash,
+                "Per-block coin-cache flush failed after tip connect (#262 mitigation); coins remain dirty in cache"
+            );
+        }
 
         Ok(block_hash)
     }
