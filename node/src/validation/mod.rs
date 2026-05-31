@@ -10,6 +10,10 @@ pub enum ValidationError {
     BadProofOfWork,
     #[error("time-too-old")]
     TimeTooOld,
+    #[error("time-too-new")]
+    TimeTooNew,
+    #[error("bad-version(0x{0:08x})")]
+    BadVersion(u32),
     #[error("bad-txnmrklroot")]
     BadMerkleRoot,
     #[error("bad-cb-missing")]

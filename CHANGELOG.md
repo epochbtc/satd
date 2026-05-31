@@ -8,6 +8,29 @@ layout) per `STABILITY_POLICY.md`.
 
 ## [Unreleased]
 
+### Consensus
+
+- **Enforce four previously-missing block-level consensus rules**, all
+  surfaced by the differential matrix (see Testing) and now matching Bitcoin
+  Core. Each is exercised by the matrix (regtest) and by unit tests; the
+  height-gating and exemptions are written to reproduce Core on historical
+  mainnet blocks.
+  - **Block sigop-cost limit** (`bad-blk-sigops`): `connect_block` now
+    accumulates the witness-scaled signature-operation cost across the block
+    and rejects when it exceeds `MAX_BLOCK_SIGOPS_COST` (80 000). Height-gated
+    to match Core's `GetTransactionSigOpCost` (legacy-only below P2SH
+    activation; full BIP141 cost at/after).
+  - **BIP30** (`bad-txns-BIP30`): reject a block that re-creates an outpoint
+    already holding an unspent coin. Gated to where Core enforces it and
+    exempting the two grandfathered mainnet blocks (91 842 / 91 880,
+    CVE-2012-1909) so historical replay is unaffected.
+  - **Future timestamp** (`time-too-new`): reject a block whose timestamp is
+    more than 2 hours ahead of the node's clock. No-op for historical replay.
+  - **Block version gate** (`bad-version`): enforce the mandatory minimum
+    block version per height (BIP34 ⇒ v≥2, BIP66 ⇒ v≥3, BIP65 ⇒ v≥4).
+  - Mainnet IBD-replay verification is recommended before relying on the
+    sigop/BIP30 height-gating on mainnet (regtest cannot exercise it).
+
 ### Testing
 
 - **Block-level consensus differential matrix.** A new golden fixture suite
@@ -19,9 +42,12 @@ layout) per `STABILITY_POLICY.md`.
   reason, and the runner fails CI if satd's verdict drifts in either direction
   — a covered rule that stops matching is a regression, and a known gap that
   starts matching forces the case to be promoted. Phase B of the consensus
-  differential-fuzzing roadmap. The matrix surfaced four block-level
-  consensus rules satd did not yet enforce on its accept path; no consensus
-  behavior changes in this PR — those fixes land in a follow-up.
+  differential-fuzzing roadmap. The matrix surfaced four consensus rules satd
+  did not enforce on its accept path — block-wide sigop limit
+  (`bad-blk-sigops`), BIP30 duplicate-unspent-txid (`bad-txns-BIP30`),
+  2-hour-ahead future timestamp (`time-too-new`), and the mandatory block
+  version gate (`bad-version`) — all of which are now enforced (see Consensus
+  above).
 
 ### Operator
 

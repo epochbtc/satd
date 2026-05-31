@@ -31,11 +31,13 @@
 //! was closed and the case must be promoted to `Match` (the test says so
 //! explicitly). Nothing is silently ignored.
 //!
-//! Known gaps surfaced by this suite (each needs its own consensus PR):
-//!   * `bad-blk-sigops`   — no block-wide sigop-cost limit in `connect_block`.
-//!   * `bad-txns-BIP30`   — no duplicate-unspent-txid (BIP30) check.
-//!   * `time-too-new`     — no 2-hour-ahead future-timestamp rejection.
-//!   * `bad-version`      — no mandatory block-version gate.
+//! Consensus gaps this suite originally surfaced — all four are now ENFORCED
+//! (each case is an `Expect::Match` against Core) as of the block-consensus
+//! gap fixes; they remain in the matrix as live regression guards:
+//!   * `bad-blk-sigops`   — block-wide sigop-cost limit in `connect_block`.
+//!   * `bad-txns-BIP30`   — duplicate-unspent-txid (BIP30) check.
+//!   * `time-too-new`     — 2-hour-ahead future-timestamp rejection.
+//!   * `bad-version`      — mandatory block-version gate (BIP34/66/65).
 
 use bitcoin::absolute::LockTime;
 use bitcoin::block::Header;
@@ -47,14 +49,16 @@ use bitcoin::{
     Txid, Witness,
 };
 
-use node::chain::connect::{block_subsidy, connect_block, ConnectParams};
+use node::chain::connect::{block_subsidy, check_block_version, connect_block, ConnectParams};
 use node::storage::blockindex::{BlockIndexEntry, BlockStatus};
 use node::storage::coinview::Coin;
 use node::storage::db::InMemoryStore;
 use node::storage::flatfile::FlatFilePos;
 use node::storage::{Store, StoreBatch};
 use node::validation::block::check_block;
-use node::validation::pow::{check_difficulty, check_proof_of_work, check_timestamp};
+use node::validation::pow::{
+    check_difficulty, check_future_timestamp, check_proof_of_work, check_timestamp,
+};
 use node::validation::script::NoopVerifier;
 use node::validation::tx::check_transaction;
 
@@ -79,6 +83,12 @@ enum Expect {
     /// The string is the reason satd currently emits.
     ReasonDiffers(&'static str),
     /// Core rejects but satd accepts — a known, unclosed consensus gap.
+    ///
+    /// No case currently uses this (all gaps this suite surfaced are now
+    /// enforced), but it is a permanent part of the matrix's vocabulary:
+    /// the next gap a new case uncovers is declared `Gap`, and the runner
+    /// keeps it pinned open until a fix closes it. Retained deliberately.
+    #[allow(dead_code)]
     Gap,
 }
 
@@ -505,23 +515,20 @@ fn case_gap_bip30() -> Satd {
 }
 
 fn case_gap_time_too_new() -> Satd {
-    // Header timestamp 3 hours in the future. Core: `time-too-new`.
-    // satd's only header-time rule is MTP (time-too-old), so this passes.
-    let ancestors: Vec<BlockIndexEntry> =
-        (1..=11).map(|h| block_index_entry(h, BASE_TIME + h * 100, REGTEST_POWLIMIT_BITS)).collect();
+    // Header timestamp 3 hours ahead of `now` → Core: `time-too-new`.
+    // Now enforced by check_future_timestamp (2h slack).
     let mut header = bitcoin::constants::genesis_block(Network::Regtest).header;
     header.time = BASE_TIME + 3 * 60 * 60;
-    check_timestamp(&header, 12, |h| ancestors.iter().find(|e| e.height == h).cloned())
-        .map_err(|e| e.to_string())
+    check_future_timestamp(&header, BASE_TIME as u64).map_err(|e| e.to_string())
 }
 
 fn case_gap_block_version() -> Satd {
-    // Block version 1 (below the BIP34/66/65 mandatory floor). Core:
-    // `bad-version`. satd has no block-version gate in check_block.
+    // Block version 1 at a height where BIP34/66/65 are active → Core:
+    // `bad-version(0x00000001)`. Now enforced by check_block_version.
     let mut b = block_of(vec![coinbase(1, block_subsidy(1))]);
     b.header.version = bitcoin::block::Version::from_consensus(1);
     b.header.merkle_root = b.compute_merkle_root().unwrap();
-    cb(&b)
+    check_block_version(&b.header, 1, Network::Regtest).map_err(|e| e.to_string())
 }
 
 // ── The matrix ────────────────────────────────────────────────────────
@@ -560,11 +567,12 @@ fn cases() -> Vec<Case> {
         Case { name: "high_hash_bad_pow", core: Reject("high-hash"), expect: ReasonDiffers("bad-pow"), run: case_high_hash_bad_pow },
         Case { name: "bad_diffbits", core: Reject("bad-diffbits"), expect: Match, run: case_bad_diffbits },
         Case { name: "time_too_old_mtp", core: Reject("time-too-old"), expect: Match, run: case_time_too_old_mtp },
-        // KNOWN GAPS (Core rejects, satd accepts) — each needs a consensus PR
-        Case { name: "GAP_block_sigops", core: Reject("bad-blk-sigops"), expect: Gap, run: case_gap_block_sigops },
-        Case { name: "GAP_bip30_duplicate_txid", core: Reject("bad-txns-BIP30"), expect: Gap, run: case_gap_bip30 },
-        Case { name: "GAP_time_too_new", core: Reject("time-too-new"), expect: Gap, run: case_gap_time_too_new },
-        Case { name: "GAP_block_version", core: Reject("bad-version"), expect: Gap, run: case_gap_block_version },
+        // Formerly gaps (Core rejects, satd accepted) — now enforced and
+        // promoted to exact matches by the consensus fixes in this PR.
+        Case { name: "block_sigops", core: Reject("bad-blk-sigops"), expect: Match, run: case_gap_block_sigops },
+        Case { name: "bip30_duplicate_txid", core: Reject("bad-txns-BIP30"), expect: Match, run: case_gap_bip30 },
+        Case { name: "time_too_new", core: Reject("time-too-new"), expect: Match, run: case_gap_time_too_new },
+        Case { name: "block_version", core: Reject("bad-version(0x00000001)"), expect: Match, run: case_gap_block_version },
     ]
 }
 
