@@ -40,11 +40,12 @@
 //!   * `bad-version`      — mandatory block-version gate (BIP34/66/65).
 //!
 //! The deeper code-path equivalence audit (vs Core v28) then surfaced two
-//! further divergences, currently OPEN `Expect::Gap` cases pending fixes:
-//!   * `bad-txns-duplicate` — merkle-tree mutation / CVE-2012-2459 not detected
-//!     by `check_block` (caught later as a double-spend, wrong stage/reason).
-//!   * `bad-txns-oversize`  — no per-transaction weight cap in
-//!     `check_transaction` (block-weight covers the block path only).
+//! further divergences, both now ENFORCED (`Expect::Match`) and retained as
+//! live regression guards:
+//!   * `bad-txns-duplicate` — merkle-tree mutation / CVE-2012-2459, now
+//!     detected by `check_block`'s `merkle_tree_mutated` flag (Core parity).
+//!   * `bad-txns-oversize`  — per-transaction weight cap now enforced in
+//!     `check_transaction` (previously only the block-weight check covered it).
 
 use bitcoin::absolute::LockTime;
 use bitcoin::block::Header;
@@ -91,7 +92,10 @@ enum Expect {
     ReasonDiffers(&'static str),
     /// Core rejects but satd accepts — a known, unclosed consensus gap.
     /// The runner keeps it pinned open and fails the day a fix closes it,
-    /// forcing promotion to `Match`.
+    /// forcing promotion to `Match`. No cases currently carry this disposition
+    /// (all surfaced gaps are closed), but the variant and its runner arms are
+    /// retained so a future audit finding can be pinned without re-plumbing.
+    #[allow(dead_code)]
     Gap,
 }
 
@@ -541,10 +545,9 @@ fn case_merkle_mutation_cve_2012_2459() -> Satd {
     // the SAME merkle root as the honest list, because the odd-node
     // duplication in `[cb, t1, t2]` produces the identical tree as the
     // explicit `[cb, t1, t2, t2]`. Core's CheckBlock computes a `mutated`
-    // flag and rejects `bad-txns-duplicate`; satd's check_block only compares
-    // the recomputed root (which matches), so it ACCEPTS — the duplicate is
-    // only caught later in connect_block as a double-spend (wrong stage and
-    // reason). Gap.
+    // flag and rejects `bad-txns-duplicate`. Now enforced by check_block's
+    // merkle_tree_mutated detector → exact match (was a Gap; satd previously
+    // only caught the duplicate later in connect_block as a double-spend).
     let t1 = spending_tx(OutPoint { txid: Txid::from_byte_array([0x11; 32]), vout: 0 }, 1_000, 1, 0xffff_ffff, 0);
     let t2 = spending_tx(OutPoint { txid: Txid::from_byte_array([0x22; 32]), vout: 0 }, 1_000, 1, 0xffff_ffff, 0);
     let b = block_of(vec![coinbase(1, 50_0000_0000), t1, t2.clone(), t2]);
@@ -553,10 +556,10 @@ fn case_merkle_mutation_cve_2012_2459() -> Satd {
 
 fn case_tx_oversize() -> Satd {
     // A single transaction whose no-witness serialized size * 4 exceeds
-    // MAX_BLOCK_WEIGHT. Core's CheckTransaction rejects `bad-txns-oversize`;
-    // satd's check_transaction has no per-tx size cap, so it ACCEPTS. (In the
-    // block path the block-weight check catches it; standalone — e.g.
-    // sendrawtransaction — satd diverges.) Gap.
+    // MAX_BLOCK_WEIGHT. Core's CheckTransaction rejects `bad-txns-oversize`.
+    // Now enforced by check_transaction's per-tx weight cap → exact match (was
+    // a Gap; in the block path the block-weight check already caught it, but a
+    // standalone tx — e.g. sendrawtransaction — previously slipped through).
     let big = bitcoin::ScriptBuf::from(vec![0x00; 1_100_000]); // ~1.1 MB; *4 > 4 M WU
     let t = Transaction {
         version: Version::ONE,
@@ -614,10 +617,11 @@ fn cases() -> Vec<Case> {
         Case { name: "bip30_duplicate_txid", core: Reject("bad-txns-BIP30"), expect: Match, run: case_gap_bip30 },
         Case { name: "time_too_new", core: Reject("time-too-new"), expect: Match, run: case_gap_time_too_new },
         Case { name: "block_version", core: Reject("bad-version(0x00000001)"), expect: Match, run: case_gap_block_version },
-        // Audit-discovered gaps (Core rejects, satd accepts) — pending fixes.
-        // See the monorepo block-handling equivalence audit (findings A, F).
-        Case { name: "merkle_mutation_cve_2012_2459", core: Reject("bad-txns-duplicate"), expect: Gap, run: case_merkle_mutation_cve_2012_2459 },
-        Case { name: "tx_oversize", core: Reject("bad-txns-oversize"), expect: Gap, run: case_tx_oversize },
+        // Audit-discovered gaps (block-handling equivalence audit, findings A
+        // and F) — now enforced and promoted to exact matches: merkle-mutation
+        // detection in check_block and a per-tx weight cap in check_transaction.
+        Case { name: "merkle_mutation_cve_2012_2459", core: Reject("bad-txns-duplicate"), expect: Match, run: case_merkle_mutation_cve_2012_2459 },
+        Case { name: "tx_oversize", core: Reject("bad-txns-oversize"), expect: Match, run: case_tx_oversize },
     ]
 }
 

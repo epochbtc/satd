@@ -16,6 +16,8 @@ pub enum ValidationError {
     BadVersion(u32),
     #[error("bad-txnmrklroot")]
     BadMerkleRoot,
+    #[error("bad-txns-duplicate")]
+    BadTxDuplicate,
     #[error("bad-cb-missing")]
     NoCoinbase,
     #[error("bad-cb-multiple")]
@@ -30,6 +32,8 @@ pub enum ValidationError {
     BadTxNoInputs,
     #[error("bad-txns-vout-empty")]
     BadTxNoOutputs,
+    #[error("bad-txns-oversize")]
+    BadTxOversize,
     #[error("bad-txns-vout-negative")]
     BadTxOutputValue,
     #[error("bad-txns-inputs-duplicate")]
