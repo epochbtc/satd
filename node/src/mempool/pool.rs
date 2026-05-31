@@ -123,7 +123,16 @@ impl Default for MempoolConfig {
 /// In-memory transaction pool.
 pub struct Mempool {
     inner: RwLock<MempoolInner>,
-    config: MempoolConfig,
+    /// Mempool/relay policy. Behind a `RwLock` so SIGHUP config reload can swap
+    /// it live (`reload_policy`); `accept_transaction` snapshots it once at
+    /// entry so a transaction is judged against a single policy version.
+    ///
+    /// Lock discipline: this is a **leaf lock** — acquire, read/clone what you
+    /// need, release. NEVER hold it while acquiring `inner` (snapshot the needed
+    /// fields into locals first, as `remove_expired`/`info` do). This keeps the
+    /// lock order uniform so a concurrent `reload_policy` write can never form a
+    /// cycle with `inner`.
+    config: RwLock<MempoolConfig>,
     /// Broadcast channel fanout for `subscribemempool`. Populated via
     /// `set_event_sender`; remains `None` in tests that don't need
     /// event emission.
@@ -150,7 +159,7 @@ impl Mempool {
                 spends: HashMap::new(),
                 total_bytes: 0,
             }),
-            config,
+            config: RwLock::new(config),
             event_tx: Mutex::new(None),
             event_ring: Mutex::new(VecDeque::with_capacity(EVENT_RING_CAPACITY)),
         }
@@ -190,9 +199,28 @@ impl Mempool {
         }
     }
 
-    /// Get the mempool configuration.
-    pub fn policy(&self) -> &MempoolConfig {
-        &self.config
+    /// Get a snapshot of the current mempool policy. Returns a clone because
+    /// the policy is behind a lock (live-reloadable via [`Mempool::reload_policy`]).
+    pub fn policy(&self) -> MempoolConfig {
+        self.config.read().clone()
+    }
+
+    /// Current minimum relay fee rate (sat/kvB). Scalar accessor so hot paths
+    /// (e.g. per-peer `feefilter`) avoid cloning the whole policy struct.
+    pub fn min_fee_rate(&self) -> u64 {
+        self.config.read().min_fee_rate
+    }
+
+    /// Current maximum mempool size in bytes.
+    pub fn max_size_bytes(&self) -> usize {
+        self.config.read().max_size_bytes
+    }
+
+    /// Swap in a new mempool/relay policy live (SIGHUP config reload). Takes
+    /// effect on the next `accept_transaction` call; already-admitted entries
+    /// are not re-evaluated.
+    pub fn reload_policy(&self, new: MempoolConfig) {
+        *self.config.write() = new;
     }
 
     /// Accept a transaction into the mempool after full validation.
@@ -203,6 +231,11 @@ impl Mempool {
         script_verifier: &dyn ScriptVerifier,
     ) -> Result<Txid, MempoolError> {
         let txid = tx.compute_txid();
+
+        // Snapshot the live policy once so the entire acceptance is judged
+        // against a single config version. A concurrent SIGHUP reload can swap
+        // `self.config` between calls but never mid-transaction.
+        let cfg = self.config.read().clone();
 
         // Context-free checks
         check_transaction(&tx).map_err(|e| MempoolError::Validation(e.to_string()))?;
@@ -221,13 +254,13 @@ impl Mempool {
         }
 
         // Policy: dust output check (configurable via -dustrelayfee, 0 = disable)
-        if self.config.dust_relay_fee > 0 {
+        if cfg.dust_relay_fee > 0 {
             for output in &tx.output {
                 if output.script_pubkey.is_op_return() {
                     continue;
                 }
                 let threshold =
-                    policy::dust_threshold_with_rate(&output.script_pubkey, self.config.dust_relay_fee);
+                    policy::dust_threshold_with_rate(&output.script_pubkey, cfg.dust_relay_fee);
                 if output.value.to_sat() < threshold {
                     return Err(MempoolError::Dust);
                 }
@@ -235,7 +268,7 @@ impl Mempool {
         }
 
         // Policy: OP_RETURN limits (configurable via -datacarrier and -datacarriersize)
-        if !self.config.data_carrier {
+        if !cfg.data_carrier {
             // Reject all OP_RETURN outputs
             for output in &tx.output {
                 if output.script_pubkey.is_op_return() {
@@ -250,7 +283,7 @@ impl Mempool {
                     if op_return_count > 1 {
                         return Err(MempoolError::NonStandardOpReturn);
                     }
-                    if output.script_pubkey.len() > self.config.data_carrier_size {
+                    if output.script_pubkey.len() > cfg.data_carrier_size {
                         return Err(MempoolError::NonStandardOpReturn);
                     }
                 }
@@ -261,7 +294,7 @@ impl Mempool {
         for output in &tx.output {
             if !policy::is_standard_output_script(
                 &output.script_pubkey,
-                self.config.permit_bare_multisig,
+                cfg.permit_bare_multisig,
             ) {
                 return Err(MempoolError::Validation("scriptpubkey".to_string()));
             }
@@ -335,7 +368,7 @@ impl Mempool {
                         }
                     }
                 }
-                if ancestors.len() > self.config.max_ancestor_count {
+                if ancestors.len() > cfg.max_ancestor_count {
                     return Err(MempoolError::TooLongMempoolChain);
                 }
             }
@@ -349,7 +382,7 @@ impl Mempool {
                 if let Some(conflict_entry) = inner.entries.get(conflict_txid) {
                     // RBF: in opt-in mode, conflicted tx must signal replaceability
                     // (any input with sequence < 0xfffffffe). Full RBF skips this check.
-                    if !self.config.full_rbf {
+                    if !cfg.full_rbf {
                         let signals_rbf = conflict_entry
                             .tx
                             .input
@@ -395,13 +428,13 @@ impl Mempool {
         } else {
             0
         };
-        if fee_rate < self.config.min_fee_rate {
-            return Err(MempoolError::InsufficientFee(fee_rate, self.config.min_fee_rate));
+        if fee_rate < cfg.min_fee_rate {
+            return Err(MempoolError::InsufficientFee(fee_rate, cfg.min_fee_rate));
         }
 
         // Check mempool size — evict lowest-fee entries if needed
         let mut evicted_full_pool: Vec<Txid> = Vec::new();
-        if inner.total_bytes + tx_size > self.config.max_size_bytes {
+        if inner.total_bytes + tx_size > cfg.max_size_bytes {
             // Only evict if the new tx has a higher fee rate than the minimum in the pool
             let min_pool_fee_rate = inner
                 .entries
@@ -415,7 +448,7 @@ impl Mempool {
             // Evict enough lowest-fee-rate entries to make room
             evicted_full_pool = Self::evict_lowest_fee_entries(&mut inner, tx_size);
             // If still not enough room after eviction, reject
-            if inner.total_bytes + tx_size > self.config.max_size_bytes {
+            if inner.total_bytes + tx_size > cfg.max_size_bytes {
                 return Err(MempoolError::MempoolFull);
             }
         }
@@ -629,13 +662,19 @@ impl Mempool {
             .unwrap_or_default()
             .as_secs();
 
+        // Snapshot the policy field BEFORE locking `inner`, so the policy lock
+        // is never held while `inner` is. This keeps the policy lock a leaf
+        // (acquire → read → release) and the lock order uniform across the pool,
+        // so a concurrent `reload_policy` (config.write) can never form a lock
+        // cycle with the mempool lock.
+        let expiry_secs = self.config.read().expiry_secs;
         let mut expired_txids: Vec<Txid> = Vec::new();
         {
             let mut inner = self.inner.write();
             let expired: Vec<Txid> = inner
                 .entries
                 .iter()
-                .filter(|(_, entry)| now.saturating_sub(entry.time) > self.config.expiry_secs)
+                .filter(|(_, entry)| now.saturating_sub(entry.time) > expiry_secs)
                 .map(|(txid, _)| *txid)
                 .collect();
 
@@ -964,13 +1003,19 @@ impl Mempool {
 
     /// Get mempool statistics.
     pub fn info(&self) -> MempoolInfo {
+        // Snapshot policy first (lock released) so the policy lock is never held
+        // while `inner` is — uniform leaf-lock discipline (see `remove_expired`).
+        let (max_size, min_fee_rate, full_rbf) = {
+            let cfg = self.config.read();
+            (cfg.max_size_bytes, cfg.min_fee_rate, cfg.full_rbf)
+        };
         let inner = self.inner.read();
         MempoolInfo {
             size: inner.entries.len(),
             bytes: inner.total_bytes,
-            max_size: self.config.max_size_bytes,
-            min_fee_rate: self.config.min_fee_rate,
-            full_rbf: self.config.full_rbf,
+            max_size,
+            min_fee_rate,
+            full_rbf,
         }
     }
 }
@@ -1154,6 +1199,45 @@ mod tests {
         assert!(result.is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reload_policy_swaps_live() {
+        // SIGHUP config reload swaps the policy behind the RwLock; every read
+        // path (the scalar accessors, policy(), and info() — which shares the
+        // exact `self.config.read()` path accept_transaction snapshots) must
+        // observe the new values immediately.
+        let mp = Mempool::with_config(MempoolConfig {
+            min_fee_rate: 1_000,
+            max_size_bytes: 1_000_000,
+            full_rbf: true,
+            ..Default::default()
+        });
+        assert_eq!(mp.min_fee_rate(), 1_000);
+        assert_eq!(mp.max_size_bytes(), 1_000_000);
+        assert!(mp.info().full_rbf);
+
+        mp.reload_policy(MempoolConfig {
+            min_fee_rate: 5_000,
+            max_size_bytes: 2_000_000,
+            full_rbf: false,
+            ..Default::default()
+        });
+        assert_eq!(
+            mp.min_fee_rate(),
+            5_000,
+            "scalar accessor must read the reloaded policy"
+        );
+        assert_eq!(mp.max_size_bytes(), 2_000_000);
+        assert_eq!(
+            mp.policy().min_fee_rate,
+            5_000,
+            "policy() must read the reloaded policy"
+        );
+        let info = mp.info();
+        assert_eq!(info.min_fee_rate, 5_000, "info() must read the reloaded policy");
+        assert_eq!(info.max_size, 2_000_000);
+        assert!(!info.full_rbf, "info() must reflect the reloaded full_rbf");
     }
 
     #[test]

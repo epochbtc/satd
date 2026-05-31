@@ -304,7 +304,9 @@ preserved; the satd extension is opt-in per request or per flag.
   reloads (only the file is re-read). Hot-reloadable settings include log
   verbosity (`-debug`/`-debugexclude`), connection knobs
   (`-timeout`/`-blocksonly`/`-maxuploadtarget`/`-v2transport`/`-v2only`/`-externalip`/`-whitelist`),
-  and the RPC-behavior switches (`-rpcextendederrors`/`-rpcdefaultunits`).
+  the RPC-behavior switches (`-rpcextendederrors`/`-rpcdefaultunits`), mempool
+  and relay policy (`-minrelaytxfee`/`-maxmempool`/`-dustrelayfee`/`-datacarrier(size)`/`-mempoolfullrbf`/`-limit{ancestor,descendant}count`/`-mempoolexpiry`/`-permitbaremultisig`),
+  and the peer-limit knobs (`-maxconnections`/`-maxinboundperip`/`-bantime`).
   Settings wired into long-lived state at startup (network, datadir, ports,
   binds, `-dbcache`, indexes, TLS, seeds, Tor) are reported in the log as
   "restart required" and never silently ignored. A reload that fails to parse

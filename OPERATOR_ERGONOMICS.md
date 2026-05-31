@@ -78,10 +78,13 @@ Edit `bitcoin.conf` and send `SIGHUP` — `kill -HUP <pid>`, or `systemctl reloa
 | `v2transport`, `v2only` | Adjusts BIP 324 v2 transport / v2-only peering for new connections. |
 | `externalip`, `whitelist` | Replaces advertised external addresses / `-whitelist` permission set. |
 | `rpcextendederrors`, `rpcdefaultunits` | Switches RPC error-payload shape / default amount unit. |
+| `maxconnections`, `maxinboundperip` | New limits govern subsequent connections (existing peers above a lowered cap are not dropped). |
+| `bantime` | New ban duration applies to bans created after the change. |
+| `minrelaytxfee`, `maxmempool`, `dustrelayfee`, `datacarrier`, `datacarriersize`, `mempoolfullrbf`, `limitancestorcount`, `limitdescendantcount`, `mempoolexpiry`, `permitbaremultisig` | Mempool/relay policy swapped atomically; governs subsequent transaction admissions (already-admitted entries are not re-evaluated). |
 
 > `logformat` (json vs text) is **not** hot-reloadable — only verbosity is. Changing the format requires a restart.
 
-**Restart required (reported, not applied):** network selection, `datadir`/`blocksdir`, all RPC/P2P/Esplora/Electrum **ports and binds**, RPC auth (`rpcuser`/`rpcpassword`/`rpcauth`/cookie), all TLS/mTLS material, `dbcache`/`prune`/`storageprofile`/reindex, index enable/disable (`txindex`/`addressindex`/`blockfilterindex`), seeds (`dns*`/`connect`/`addnode`/`seednode`/`fixedseeds`/`asmap`), Tor (`proxy`/`onion`/`torcontrol`/`listenonion`), `consensus`, and `assumevalid`/`stopatheight`. Mempool/relay policy (`minrelaytxfee`, `maxmempool`, `dustrelayfee`, `datacarrier(size)`, `mempoolfullrbf`, `limitancestorcount`/`limitdescendantcount`, `mempoolexpiry`, `permitbaremultisig`) and the peer-limit knobs (`maxconnections`/`maxinboundperip`/`bantime`) are reported as restart-required today; live reload for these is landing in a follow-up.
+**Restart required (reported, not applied):** network selection, `datadir`/`blocksdir`, all RPC/P2P/Esplora/Electrum **ports and binds**, RPC auth (`rpcuser`/`rpcpassword`/`rpcauth`/cookie), all TLS/mTLS material, `dbcache`/`prune`/`storageprofile`/reindex, index enable/disable (`txindex`/`addressindex`/`blockfilterindex`), seeds (`dns*`/`connect`/`addnode`/`seednode`/`fixedseeds`/`asmap`), Tor (`proxy`/`onion`/`torcontrol`/`listenonion`), `consensus`, and `assumevalid`/`stopatheight`.
 
 ## 3. Developer & Integrator APIs
 

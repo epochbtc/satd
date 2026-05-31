@@ -17,7 +17,7 @@ use config::Config;
 use config::ConsensusEngine;
 use node::chain::state::ChainState;
 use node::mempool::fee::FeeEstimator;
-use node::mempool::pool::{Mempool, MempoolConfig};
+use node::mempool::pool::Mempool;
 use node::rpc::auth::RpcAuth;
 use node::storage::Store;
 use node::storage::flatfile::FlatFileManager;
@@ -623,18 +623,9 @@ async fn main() {
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
     // Initialize mempool with policy from config
-    let mempool = Arc::new(Mempool::with_config(MempoolConfig {
-        max_size_bytes: config.maxmempool * 1_000_000,
-        min_fee_rate: config.minrelaytxfee,
-        full_rbf: config.mempoolfullrbf,
-        dust_relay_fee: config.dustrelayfee,
-        data_carrier: config.datacarrier,
-        data_carrier_size: config.datacarriersize,
-        max_ancestor_count: config.limitancestorcount,
-        max_descendant_count: config.limitdescendantcount,
-        expiry_secs: config.mempoolexpiry * 3600,
-        permit_bare_multisig: config.permitbaremultisig,
-    }));
+    // Built via the shared `reload::mempool_config_from` so startup and SIGHUP
+    // reload use one mapping and cannot drift.
+    let mempool = Arc::new(Mempool::with_config(reload::mempool_config_from(&config)));
     let fee_estimator = Arc::new(FeeEstimator::new());
 
     // Wire the mempool event broadcaster used by `subscribemempool`
@@ -2159,6 +2150,7 @@ async fn main() {
         .expect("Failed to register SIGINT handler");
     let reload_handles = reload::ReloadHandles {
         cli: cli_snapshot,
+        mempool: mempool.clone(),
         peer_manager: peer_manager.clone(),
         log_filter: log_reload_handle,
     };
