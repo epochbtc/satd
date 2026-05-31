@@ -126,6 +126,12 @@ pub struct Mempool {
     /// Mempool/relay policy. Behind a `RwLock` so SIGHUP config reload can swap
     /// it live (`reload_policy`); `accept_transaction` snapshots it once at
     /// entry so a transaction is judged against a single policy version.
+    ///
+    /// Lock discipline: this is a **leaf lock** — acquire, read/clone what you
+    /// need, release. NEVER hold it while acquiring `inner` (snapshot the needed
+    /// fields into locals first, as `remove_expired`/`info` do). This keeps the
+    /// lock order uniform so a concurrent `reload_policy` write can never form a
+    /// cycle with `inner`.
     config: RwLock<MempoolConfig>,
     /// Broadcast channel fanout for `subscribemempool`. Populated via
     /// `set_event_sender`; remains `None` in tests that don't need
@@ -656,13 +662,19 @@ impl Mempool {
             .unwrap_or_default()
             .as_secs();
 
+        // Snapshot the policy field BEFORE locking `inner`, so the policy lock
+        // is never held while `inner` is. This keeps the policy lock a leaf
+        // (acquire → read → release) and the lock order uniform across the pool,
+        // so a concurrent `reload_policy` (config.write) can never form a lock
+        // cycle with the mempool lock.
+        let expiry_secs = self.config.read().expiry_secs;
         let mut expired_txids: Vec<Txid> = Vec::new();
         {
             let mut inner = self.inner.write();
             let expired: Vec<Txid> = inner
                 .entries
                 .iter()
-                .filter(|(_, entry)| now.saturating_sub(entry.time) > self.config.read().expiry_secs)
+                .filter(|(_, entry)| now.saturating_sub(entry.time) > expiry_secs)
                 .map(|(txid, _)| *txid)
                 .collect();
 
@@ -991,14 +1003,19 @@ impl Mempool {
 
     /// Get mempool statistics.
     pub fn info(&self) -> MempoolInfo {
+        // Snapshot policy first (lock released) so the policy lock is never held
+        // while `inner` is — uniform leaf-lock discipline (see `remove_expired`).
+        let (max_size, min_fee_rate, full_rbf) = {
+            let cfg = self.config.read();
+            (cfg.max_size_bytes, cfg.min_fee_rate, cfg.full_rbf)
+        };
         let inner = self.inner.read();
-        let cfg = self.config.read();
         MempoolInfo {
             size: inner.entries.len(),
             bytes: inner.total_bytes,
-            max_size: cfg.max_size_bytes,
-            min_fee_rate: cfg.min_fee_rate,
-            full_rbf: cfg.full_rbf,
+            max_size,
+            min_fee_rate,
+            full_rbf,
         }
     }
 }
