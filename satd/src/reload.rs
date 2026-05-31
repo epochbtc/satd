@@ -167,8 +167,26 @@ pub struct ReloadHandles {
     pub log_filter: LogReloadHandle,
     /// Address-index subscription registry — its cap is reloadable.
     pub addr_sub_registry: Arc<SubscriptionRegistry>,
-    /// Reloadable reorg-webhook target read by the dispatcher.
-    pub webhook: SharedWebhook,
+    /// Reloadable reorg-webhook target read by the dispatcher. `None` when the
+    /// reorg log failed to open at startup (no dispatcher exists), in which
+    /// case a webhook config change cannot take effect — `apply_webhook` warns
+    /// rather than letting the generic "applied live" line mislead the operator.
+    pub webhook: Option<SharedWebhook>,
+}
+
+/// Apply a reorg-webhook config change to the running dispatcher. Shared by the
+/// `reorgwebhook` and `reorgwebhooksecret` specs. When the reorg log failed to
+/// open at startup there is no dispatcher to feed, so the change cannot take
+/// effect; warn explicitly instead of silently claiming success.
+fn apply_webhook(c: &Config, h: &ReloadHandles) {
+    match &h.webhook {
+        Some(target) => *target.write() = webhook_target_from(c),
+        None => tracing::warn!(
+            "reorg-webhook config changed, but reorg logging is unavailable \
+             (the reorg log failed to open at startup) — the change has no \
+             effect until the daemon is restarted"
+        ),
+    }
 }
 
 /// Map a `Config` to the mempool's `MempoolConfig`. Single source of truth for
@@ -556,11 +574,8 @@ fn field_specs() -> Vec<FieldSpec> {
         restart!("eventszmqmpconfirm", events_zmq_mpconfirm),
         restart!("eventszmqnodeevent", events_zmq_nodeevent),
         // ---- Webhooks ----
-        live!("reorgwebhook", reorg_webhook, |c, h| *h.webhook.write() =
-            webhook_target_from(c)),
-        live_secret!("reorgwebhooksecret", reorg_webhook_secret, |c, h| *h
-            .webhook
-            .write() = webhook_target_from(c)),
+        live!("reorgwebhook", reorg_webhook, apply_webhook),
+        live_secret!("reorgwebhooksecret", reorg_webhook_secret, apply_webhook),
         // ---- MCP ----
         restart!("mcp", mcp),
         restart!("mcpstdio", mcp_stdio),

@@ -513,15 +513,15 @@ async fn main() {
         }
     }
 
-    // Reloadable reorg-webhook target, shared with the dispatcher. Seeded from
-    // the current config; SIGHUP swaps its contents (add / change / remove the
-    // webhook) via `reload`. Declared here so it outlives the startup block and
-    // can be handed to `ReloadHandles` further down.
-    let reorg_webhook_shared: reload::SharedWebhook =
-        Arc::new(parking_lot::RwLock::new(reload::webhook_target_from(&config)));
+    // Reloadable reorg-webhook target, shared with the dispatcher. Stays `None`
+    // if the reorg log fails to open below — there's no dispatcher to feed, so a
+    // webhook config change can't take effect and `apply_webhook` warns instead
+    // of claiming success. Handed to `ReloadHandles` further down.
+    let mut reorg_webhook_handle: Option<reload::SharedWebhook> = None;
 
     // Open reorg log + webhook dispatcher. Failure is non-fatal — the node
-    // still runs, just without persistent reorg history.
+    // still runs, just without persistent reorg history (and, since reorgs are
+    // then not recorded, without webhook delivery either).
     match node::chain::reorg_log::ReorgLog::open(
         &net_datadir,
         node::chain::reorg_log::DEFAULT_RING_CAPACITY,
@@ -534,13 +534,20 @@ async fn main() {
             // it is `None`; `record()` only enqueues on actual reorgs, so an
             // unconfigured webhook costs one idle task and nothing on the hot
             // path.
+            let shared: reload::SharedWebhook =
+                Arc::new(parking_lot::RwLock::new(reload::webhook_target_from(&config)));
             let (tx, rx) = tokio::sync::mpsc::channel::<node::chain::reorg_log::ReorgRecord>(64);
             reorg_log.set_webhook_sender(tx);
-            tokio::spawn(reorg_webhook_dispatcher(reorg_webhook_shared.clone(), rx));
+            tokio::spawn(reorg_webhook_dispatcher(shared.clone(), rx));
             chain_state.attach_reorg_log(reorg_log);
+            reorg_webhook_handle = Some(shared);
         }
         Err(e) => {
-            tracing::warn!(error = %e, "Failed to open reorg log; running without persistent reorg history");
+            tracing::warn!(
+                error = %e,
+                "Failed to open reorg log; running without persistent reorg history \
+                 (reorg webhook delivery is also disabled until restart)"
+            );
         }
     }
 
@@ -2163,7 +2170,7 @@ async fn main() {
         peer_manager: peer_manager.clone(),
         log_filter: log_reload_handle,
         addr_sub_registry: address_index_concrete.subscription_registry(),
-        webhook: reorg_webhook_shared.clone(),
+        webhook: reorg_webhook_handle,
     };
     loop {
         tokio::select! {
