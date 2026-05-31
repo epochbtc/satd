@@ -513,25 +513,41 @@ async fn main() {
         }
     }
 
-    // Open reorg log + optional webhook dispatcher. Failure is non-fatal
-    // — the node still runs, just without persistent reorg history.
+    // Reloadable reorg-webhook target, shared with the dispatcher. Stays `None`
+    // if the reorg log fails to open below — there's no dispatcher to feed, so a
+    // webhook config change can't take effect and `apply_webhook` warns instead
+    // of claiming success. Handed to `ReloadHandles` further down.
+    let mut reorg_webhook_handle: Option<reload::SharedWebhook> = None;
+
+    // Open reorg log + webhook dispatcher. Failure is non-fatal — the node
+    // still runs, just without persistent reorg history (and, since reorgs are
+    // then not recorded, without webhook delivery either).
     match node::chain::reorg_log::ReorgLog::open(
         &net_datadir,
         node::chain::reorg_log::DEFAULT_RING_CAPACITY,
     ) {
         Ok(log) => {
             let reorg_log = Arc::new(log);
-            if let Some(url) = config.reorg_webhook.clone() {
-                let (tx, rx) =
-                    tokio::sync::mpsc::channel::<node::chain::reorg_log::ReorgRecord>(64);
-                reorg_log.set_webhook_sender(tx);
-                let secret = config.reorg_webhook_secret.clone();
-                tokio::spawn(reorg_webhook_dispatcher(url, secret, rx));
-            }
+            // Always wire the dispatcher (even with no webhook configured) so a
+            // SIGHUP can turn the webhook on without a restart. The dispatcher
+            // reads the live target per record and idles (drains and drops) when
+            // it is `None`; `record()` only enqueues on actual reorgs, so an
+            // unconfigured webhook costs one idle task and nothing on the hot
+            // path.
+            let shared: reload::SharedWebhook =
+                Arc::new(parking_lot::RwLock::new(reload::webhook_target_from(&config)));
+            let (tx, rx) = tokio::sync::mpsc::channel::<node::chain::reorg_log::ReorgRecord>(64);
+            reorg_log.set_webhook_sender(tx);
+            tokio::spawn(reorg_webhook_dispatcher(shared.clone(), rx));
             chain_state.attach_reorg_log(reorg_log);
+            reorg_webhook_handle = Some(shared);
         }
         Err(e) => {
-            tracing::warn!(error = %e, "Failed to open reorg log; running without persistent reorg history");
+            tracing::warn!(
+                error = %e,
+                "Failed to open reorg log; running without persistent reorg history \
+                 (reorg webhook delivery is also disabled until restart)"
+            );
         }
     }
 
@@ -2153,6 +2169,8 @@ async fn main() {
         mempool: mempool.clone(),
         peer_manager: peer_manager.clone(),
         log_filter: log_reload_handle,
+        addr_sub_registry: address_index_concrete.subscription_registry(),
+        webhook: reorg_webhook_handle,
     };
     loop {
         tokio::select! {
@@ -2412,9 +2430,13 @@ async fn start_startup_rpc(
 /// failures are logged and dropped. Never blocks the consensus path:
 /// the only backpressure is the channel itself, which `ReorgLog::record`
 /// `try_send`s into (full queue = silent drop, counted).
+///
+/// The target (URL + optional signing secret) is read from `webhook` per
+/// record, so a SIGHUP reload that changes or removes it takes effect on the
+/// next reorg without restarting this task. When the target is `None` the
+/// record is drained and dropped (no webhook configured).
 async fn reorg_webhook_dispatcher(
-    url: String,
-    secret: Option<String>,
+    webhook: reload::SharedWebhook,
     mut rx: tokio::sync::mpsc::Receiver<node::chain::reorg_log::ReorgRecord>,
 ) {
     use reqwest::header::{HeaderMap, HeaderValue};
@@ -2428,8 +2450,17 @@ async fn reorg_webhook_dispatcher(
             return;
         }
     };
-    tracing::info!(url = %url, signed = secret.is_some(), "Reorg webhook dispatcher started");
+    tracing::info!("Reorg webhook dispatcher started");
     while let Some(record) = rx.recv().await {
+        // Snapshot the live target. `None` => no webhook configured right now;
+        // drop the record. The guard is released before any `.await`.
+        let target = match webhook.read().clone() {
+            Some(t) => t,
+            None => continue,
+        };
+        let url = target.url;
+        let secret = target.secret;
+
         let body = match serde_json::to_vec(&record) {
             Ok(b) => b,
             Err(e) => {

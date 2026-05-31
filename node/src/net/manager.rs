@@ -452,6 +452,21 @@ impl PeerManager {
             .store(peer_serve, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Toggle the BIP 157 `NODE_COMPACT_FILTERS` advertisement
+    /// (`--peerblockfilters`) at runtime, independent of the (write-once)
+    /// filter-index wiring. `peer_serve_filters_ready()` is re-evaluated per
+    /// outgoing handshake, so a SIGHUP reload that flips `peerblockfilters`
+    /// takes effect for new connections without a restart. No-op when the
+    /// `block-filter-index` feature is compiled out (the flag has no backing
+    /// field, and the service can't be served anyway).
+    pub fn set_peer_serve_filters(&self, enabled: bool) {
+        #[cfg(feature = "block-filter-index")]
+        self.peer_serve_filters
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(not(feature = "block-filter-index"))]
+        let _ = enabled;
+    }
+
     /// Enable/disable `-blocksonly` transaction-relay suppression. Set
     /// once from the satd binary after construction.
     pub fn set_blocksonly(&self, enabled: bool) {

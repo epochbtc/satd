@@ -24,6 +24,7 @@
 //! the all-zero array; we mirror that).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bitcoin::Txid;
 use parking_lot::Mutex;
@@ -41,8 +42,11 @@ pub struct SubscriptionRegistry {
     channels: Mutex<HashMap<Scripthash, broadcast::Sender<StatusUpdate>>>,
     /// Maximum concurrent scripthashes; default 10000 per
     /// `--addrindexsubscriptions=N`. Past the cap, `subscribe` returns
-    /// `Err(SubscribeError::CapReached)`.
-    max_subs: usize,
+    /// `Err(SubscribeError::CapReached)`. Atomic so a SIGHUP reload can
+    /// raise/lower the cap live via [`set_max_subs`](Self::set_max_subs);
+    /// the check in `subscribe` reads it fresh. Lowering below the live
+    /// count keeps existing subscriptions and only rejects new ones.
+    max_subs: AtomicUsize,
     /// Capacity of each scripthash's broadcast channel. Slow
     /// subscribers see `RecvError::Lagged` past this depth.
     per_channel_capacity: usize,
@@ -62,10 +66,22 @@ impl SubscriptionRegistry {
     pub fn new(max_subs: usize, per_channel_capacity: usize) -> Self {
         Self {
             channels: Mutex::new(HashMap::new()),
-            max_subs,
+            max_subs: AtomicUsize::new(max_subs),
             per_channel_capacity,
             last_status: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Update the subscription cap live (SIGHUP `--addrindexsubscriptions`).
+    /// Affects subsequent `subscribe` calls only; subscriptions already
+    /// established when the cap is lowered are not torn down.
+    pub fn set_max_subs(&self, max_subs: usize) {
+        self.max_subs.store(max_subs, Ordering::Relaxed);
+    }
+
+    /// Current subscription cap.
+    pub fn max_subs(&self) -> usize {
+        self.max_subs.load(Ordering::Relaxed)
     }
 
     /// Subscribe to status updates for `sh`. Multiple subscribers per
@@ -99,8 +115,9 @@ impl SubscriptionRegistry {
             .lock()
             
             .retain(|sh, _| live_keys.contains(sh));
-        if channels.len() >= self.max_subs {
-            return Err(SubscribeError::CapReached(self.max_subs));
+        let max_subs = self.max_subs.load(Ordering::Relaxed);
+        if channels.len() >= max_subs {
+            return Err(SubscribeError::CapReached(max_subs));
         }
         let (tx, rx) = broadcast::channel(self.per_channel_capacity);
         channels.insert(sh, tx);
@@ -296,6 +313,40 @@ mod tests {
         let _rx_b = reg.subscribe([0xbb; 32]).unwrap();
         let third = reg.subscribe([0xcc; 32]);
         assert!(matches!(third, Err(SubscribeError::CapReached(2))));
+    }
+
+    #[test]
+    fn test_address_index_set_max_subs_live() {
+        // SIGHUP `--addrindexsubscriptions` reload: the cap is read fresh on
+        // every subscribe, so raising it lets previously-rejected scripthashes
+        // through, and lowering it rejects new ones without tearing down
+        // existing subscriptions.
+        let reg = SubscriptionRegistry::new(1, 32);
+        let _rx_a = reg.subscribe([0xaa; 32]).unwrap();
+        assert!(matches!(
+            reg.subscribe([0xbb; 32]),
+            Err(SubscribeError::CapReached(1))
+        ));
+
+        // Raise the cap live → the previously-rejected scripthash now fits.
+        reg.set_max_subs(3);
+        assert_eq!(reg.max_subs(), 3);
+        let _rx_b = reg.subscribe([0xbb; 32]).unwrap();
+        let _rx_c = reg.subscribe([0xcc; 32]).unwrap();
+        assert!(matches!(
+            reg.subscribe([0xdd; 32]),
+            Err(SubscribeError::CapReached(3))
+        ));
+
+        // Lower the cap below the live count → existing subscriptions survive
+        // (re-subscribing an already-open scripthash still works), but a brand
+        // new scripthash is rejected.
+        reg.set_max_subs(1);
+        assert!(reg.subscribe([0xaa; 32]).is_ok(), "existing sub still served");
+        assert!(matches!(
+            reg.subscribe([0xee; 32]),
+            Err(SubscribeError::CapReached(1))
+        ));
     }
 
     #[test]

@@ -28,8 +28,10 @@
 //! daemon: it is logged and the running config is kept.
 
 use crate::config::{self, Config};
+use node::index::address::SubscriptionRegistry;
 use node::mempool::pool::{Mempool, MempoolConfig};
 use node::net::manager::PeerManager;
+use parking_lot::RwLock;
 use std::sync::Arc;
 use tracing_subscriber::{EnvFilter, Registry};
 
@@ -61,6 +63,99 @@ impl LogReloadHandle {
     }
 }
 
+/// Reorg-webhook target the dispatcher reads per record. Held behind a
+/// [`SharedWebhook`] so a SIGHUP reload can change the URL/secret — or turn the
+/// webhook on/off — without restarting the dispatcher task. `None` means "no
+/// webhook configured"; the dispatcher then drains and drops records.
+#[derive(Clone, Debug)]
+pub struct WebhookTarget {
+    pub url: String,
+    pub secret: Option<String>,
+}
+
+/// Shared, reloadable reorg-webhook target. The dispatcher (spawned once at
+/// startup regardless of whether a webhook is configured) snapshots this per
+/// record; the reload path swaps its contents.
+pub type SharedWebhook = Arc<RwLock<Option<WebhookTarget>>>;
+
+/// Build a [`WebhookTarget`] from a config, or `None` if no URL is set.
+pub fn webhook_target_from(c: &Config) -> Option<WebhookTarget> {
+    c.reorg_webhook.clone().map(|url| WebhookTarget {
+        url,
+        secret: c.reorg_webhook_secret.clone(),
+    })
+}
+
+/// No-op live apply for keys whose only consumer reads them from the reloaded
+/// `Config` snapshot at a later point — there is no separate running copy to
+/// push into. `main` reassigns its `config` local from `reload_from_sighup`'s
+/// return value, so the shutdown path (`-persistmempool`, `-maxshutdownsecs`)
+/// already sees the new value; classifying these as live (not restart-required)
+/// reflects that they take effect without a restart.
+fn consumed_from_reloaded_config(_c: &Config, _h: &ReloadHandles) {}
+
+/// Register + dial the socket-style peer addresses present in `new` but not in
+/// `old` (`-addnode`/`-connect` reload). Mirrors the startup path: `add_peer_addr`
+/// registers for auto-reconnect (idempotent/deduped), then a spawned task dials.
+///
+/// Only the *added* entries are dialed — existing peers are left alone, so a
+/// reload that merely appends a peer doesn't churn live connections. Removing an
+/// entry from the file does NOT disconnect that peer (matches Core's `-addnode`:
+/// use `disconnectnode` for that). Runs inside the tokio runtime (the reload is
+/// driven from the main select loop), so `tokio::spawn` is valid here.
+fn dial_added_peers(old: &[String], new: &[String], pm: &Arc<PeerManager>, label: &'static str) {
+    for addr_str in new {
+        if old.iter().any(|o| o == addr_str) {
+            continue;
+        }
+        match node::net::peer::PeerAddr::parse(addr_str) {
+            Ok(addr) => {
+                pm.add_peer_addr(addr.clone());
+                let pm = pm.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = pm.connect_peer_addr(&addr).await {
+                        tracing::warn!(addr = %addr, "{label} reload connect failed: {e}");
+                    }
+                });
+            }
+            Err(e) => {
+                tracing::warn!(addr = addr_str, "invalid {label} address on reload: {e}");
+            }
+        }
+    }
+}
+
+/// `-seednode` reload: resolve + dial the entries added since the last config.
+/// Seednodes need DNS/Tor resolution (async), so the whole add-set is resolved
+/// in one spawned task — same resolver and semantics as the startup path.
+fn dial_added_seednodes(old: &Config, new: &Config, h: &ReloadHandles) {
+    let added: Vec<String> = new
+        .seednode
+        .iter()
+        .filter(|s| !old.seednode.contains(s))
+        .cloned()
+        .collect();
+    if added.is_empty() {
+        return;
+    }
+    let pm = h.peer_manager.clone();
+    let network = new.network;
+    let proxy = new.proxy.clone();
+    tokio::spawn(async move {
+        let seed_addrs =
+            node::net::dns::resolve_operator_seeds(&added, network, proxy.as_deref()).await;
+        for addr in seed_addrs {
+            pm.add_peer_addr(addr.clone());
+            let pm = pm.clone();
+            tokio::spawn(async move {
+                if let Err(e) = pm.connect_peer_addr(&addr).await {
+                    tracing::warn!(addr = %addr, "seednode reload connection failed: {e}");
+                }
+            });
+        }
+    });
+}
+
 /// Long-lived component handles the reload path pushes live changes into.
 /// Constructed once before the signal loop; holds cheap `Arc`/handle clones.
 pub struct ReloadHandles {
@@ -70,6 +165,28 @@ pub struct ReloadHandles {
     pub mempool: Arc<Mempool>,
     pub peer_manager: Arc<PeerManager>,
     pub log_filter: LogReloadHandle,
+    /// Address-index subscription registry — its cap is reloadable.
+    pub addr_sub_registry: Arc<SubscriptionRegistry>,
+    /// Reloadable reorg-webhook target read by the dispatcher. `None` when the
+    /// reorg log failed to open at startup (no dispatcher exists), in which
+    /// case a webhook config change cannot take effect — `apply_webhook` warns
+    /// rather than letting the generic "applied live" line mislead the operator.
+    pub webhook: Option<SharedWebhook>,
+}
+
+/// Apply a reorg-webhook config change to the running dispatcher. Shared by the
+/// `reorgwebhook` and `reorgwebhooksecret` specs. When the reorg log failed to
+/// open at startup there is no dispatcher to feed, so the change cannot take
+/// effect; warn explicitly instead of silently claiming success.
+fn apply_webhook(c: &Config, h: &ReloadHandles) {
+    match &h.webhook {
+        Some(target) => *target.write() = webhook_target_from(c),
+        None => tracing::warn!(
+            "reorg-webhook config changed, but reorg logging is unavailable \
+             (the reorg log failed to open at startup) — the change has no \
+             effect until the daemon is restarted"
+        ),
+    }
 }
 
 /// Map a `Config` to the mempool's `MempoolConfig`. Single source of truth for
@@ -94,6 +211,17 @@ pub fn mempool_config_from(c: &Config) -> MempoolConfig {
     }
 }
 
+/// How a live field is pushed into the running node.
+enum Apply {
+    /// Apply from the new config alone: `f(new, handles)`. The common case —
+    /// the value is absolute (a fee rate, a flag), not a delta.
+    Whole(fn(&Config, &ReloadHandles)),
+    /// Apply from the (old, new) delta: `f(old, new, handles)`. For list-valued
+    /// keys where only the *added* entries should act (e.g. dialing newly-added
+    /// `-addnode` peers without re-dialing existing ones).
+    Delta(fn(&Config, &Config, &ReloadHandles)),
+}
+
 /// One config field's reload disposition.
 struct FieldSpec {
     /// The `bitcoin.conf` key name (matches [`config::KNOWN_CONFIG_KEYS`]).
@@ -102,9 +230,9 @@ struct FieldSpec {
     /// Debug-format comparison is uniform across all field types and needs no
     /// `PartialEq` impl on the field (e.g. `WhitelistEntry` has none).
     diff: fn(&Config, &Config) -> Option<(String, String)>,
-    /// `None` => restart-required (report only). `Some(apply)` => live path:
-    /// `apply(new_config, handles)` pushes the value into the running node.
-    apply: Option<fn(&Config, &ReloadHandles)>,
+    /// `None` => restart-required (report only). `Some(_)` => live path that
+    /// pushes the value into the running node.
+    apply: Option<Apply>,
     /// When true, the field holds secret material (passwords, auth hashes,
     /// HMAC secrets). The reload report still records that the key *changed*,
     /// but the old/new values are redacted so secrets never reach the log
@@ -172,7 +300,8 @@ fn field_specs() -> Vec<FieldSpec> {
             }
         };
     }
-    // live: report if changed AND push to the running node via `$apply`.
+    // live: report if changed AND push to the running node via `$apply`
+    // (`fn(&Config, &ReloadHandles)`).
     macro_rules! live {
         ($key:expr, $field:ident, $apply:expr) => {
             FieldSpec {
@@ -182,7 +311,39 @@ fn field_specs() -> Vec<FieldSpec> {
                     let n = format!("{:?}", new.$field);
                     if o != n { Some((o, n)) } else { None }
                 },
-                apply: Some($apply),
+                apply: Some(Apply::Whole($apply)),
+                sensitive: false,
+            }
+        };
+    }
+    // live AND secret: applied live, but old/new values redacted in the report.
+    macro_rules! live_secret {
+        ($key:expr, $field:ident, $apply:expr) => {
+            FieldSpec {
+                key: $key,
+                diff: |old, new| {
+                    let o = format!("{:?}", old.$field);
+                    let n = format!("{:?}", new.$field);
+                    if o != n { Some((o, n)) } else { None }
+                },
+                apply: Some(Apply::Whole($apply)),
+                sensitive: true,
+            }
+        };
+    }
+    // live, delta-aware: `$apply` is `fn(&Config /*old*/, &Config /*new*/,
+    // &ReloadHandles)` so it can act on only the entries added since the last
+    // config (e.g. dial newly-added peers without churning existing ones).
+    macro_rules! live_delta {
+        ($key:expr, $field:ident, $apply:expr) => {
+            FieldSpec {
+                key: $key,
+                diff: |old, new| {
+                    let o = format!("{:?}", old.$field);
+                    let n = format!("{:?}", new.$field);
+                    if o != n { Some((o, n)) } else { None }
+                },
+                apply: Some(Apply::Delta($apply)),
                 sensitive: false,
             }
         };
@@ -199,7 +360,7 @@ fn field_specs() -> Vec<FieldSpec> {
         restart!("daemon", daemon),
         restart!("server", server),
         restart!("logformat", log_format), // only verbosity hot-reloads, not format
-        restart!("maxshutdownsecs", max_shutdown_secs),
+        live!("maxshutdownsecs", max_shutdown_secs, consumed_from_reloaded_config),
         live!("debug", debug, |c, h| h.log_filter.reload(c)),
         live!("debugexclude", debugexclude, |c, h| h.log_filter.reload(c)),
         // ---- RPC server ----
@@ -250,9 +411,19 @@ fn field_specs() -> Vec<FieldSpec> {
         restart!("asmap", asmap),
         restart!("port", port),
         restart!("bind", bind),
-        restart!("connect", connect),
-        restart!("addnode", addnode),
-        restart!("seednode", seednode),
+        live_delta!("connect", connect, |old, new, h| dial_added_peers(
+            &old.connect,
+            &new.connect,
+            &h.peer_manager,
+            "connect"
+        )),
+        live_delta!("addnode", addnode, |old, new, h| dial_added_peers(
+            &old.addnode,
+            &new.addnode,
+            &h.peer_manager,
+            "addnode"
+        )),
+        live_delta!("seednode", seednode, dial_added_seednodes),
         live!("maxconnections", maxconnections, |c, h| {
             h.peer_manager.set_max_connections(c.maxconnections)
         }),
@@ -289,9 +460,13 @@ fn field_specs() -> Vec<FieldSpec> {
         // ---- Indexing ----
         restart!("txindex", txindex),
         restart!("addressindex", addressindex),
-        restart!("addrindexsubscriptions", addrindexsubscriptions),
+        live!("addrindexsubscriptions", addrindexsubscriptions, |c, h| h
+            .addr_sub_registry
+            .set_max_subs(c.addrindexsubscriptions)),
         restart!("blockfilterindex", blockfilterindex),
-        restart!("peerblockfilters", peerblockfilters),
+        live!("peerblockfilters", peerblockfilters, |c, h| h
+            .peer_manager
+            .set_peer_serve_filters(c.peerblockfilters)),
         // ---- Mempool / relay policy ----
         // All map into a single `MempoolConfig` swapped atomically via
         // `reload_policy`; `accept_transaction` snapshots the policy at entry,
@@ -326,7 +501,7 @@ fn field_specs() -> Vec<FieldSpec> {
         }),
         // `persistmempool` only governs save-on-shutdown behavior, which reads
         // the (reassigned) running config at exit — report rather than apply.
-        restart!("persistmempool", persistmempool),
+        live!("persistmempool", persistmempool, consumed_from_reloaded_config),
         live!("permitbaremultisig", permitbaremultisig, |c, h| {
             h.mempool.reload_policy(mempool_config_from(c))
         }),
@@ -399,8 +574,8 @@ fn field_specs() -> Vec<FieldSpec> {
         restart!("eventszmqmpconfirm", events_zmq_mpconfirm),
         restart!("eventszmqnodeevent", events_zmq_nodeevent),
         // ---- Webhooks ----
-        restart!("reorgwebhook", reorg_webhook),
-        restart_secret!("reorgwebhooksecret", reorg_webhook_secret),
+        live!("reorgwebhook", reorg_webhook, apply_webhook),
+        live_secret!("reorgwebhooksecret", reorg_webhook_secret, apply_webhook),
         // ---- MCP ----
         restart!("mcp", mcp),
         restart!("mcpstdio", mcp_stdio),
@@ -443,7 +618,10 @@ pub fn reload_from_sighup(handles: &ReloadHandles, running: &Config) -> Config {
             };
             match spec.apply {
                 Some(apply) => {
-                    apply(&new, handles);
+                    match apply {
+                        Apply::Whole(f) => f(&new, handles),
+                        Apply::Delta(f) => f(running, &new, handles),
+                    }
                     applied += 1;
                     tracing::info!(
                         key = spec.key,
@@ -548,6 +726,59 @@ mod tests {
         assert!(find("rpcport").apply.is_none(), "rpcport should be restart-only");
     }
 
+    /// The settings promoted to hot-reloadable in this change are all live.
+    /// Guards against a refactor silently dropping one back to restart-only.
+    #[test]
+    fn tier1_keys_are_live() {
+        let specs = field_specs();
+        let find = |k: &str| specs.iter().find(|s| s.key == k).unwrap();
+        for key in [
+            "connect",
+            "addnode",
+            "seednode",
+            "peerblockfilters",
+            "addrindexsubscriptions",
+            "persistmempool",
+            "maxshutdownsecs",
+            "reorgwebhook",
+            "reorgwebhooksecret",
+        ] {
+            assert!(
+                find(key).apply.is_some(),
+                "{key:?} should be hot-reloadable (live)"
+            );
+        }
+        // The peer-list keys act on the (old, new) delta, not the new value
+        // alone — verify they use the delta apply path.
+        for key in ["connect", "addnode", "seednode"] {
+            assert!(
+                matches!(find(key).apply, Some(Apply::Delta(_))),
+                "{key:?} should use the delta apply (dial only added peers)"
+            );
+        }
+    }
+
+    /// `webhook_target_from` mirrors the config: `None` with no URL, else the
+    /// URL plus optional secret. This is what the reload apply stores into the
+    /// shared target the dispatcher reads.
+    #[test]
+    fn webhook_target_tracks_config() {
+        let mut c = test_config();
+        c.reorg_webhook = None;
+        c.reorg_webhook_secret = None;
+        assert!(webhook_target_from(&c).is_none(), "no URL => no target");
+
+        c.reorg_webhook = Some("https://example.com/hook".to_string());
+        c.reorg_webhook_secret = Some("s3cret".to_string());
+        let t = webhook_target_from(&c).expect("target built");
+        assert_eq!(t.url, "https://example.com/hook");
+        assert_eq!(t.secret.as_deref(), Some("s3cret"));
+
+        // URL without a secret => unsigned webhook.
+        c.reorg_webhook_secret = None;
+        assert!(webhook_target_from(&c).unwrap().secret.is_none());
+    }
+
     /// The `diff` closures detect a change and report Debug-formatted values,
     /// across several field types (numeric, bool, Option, Vec, enum).
     #[test]
@@ -595,6 +826,14 @@ mod tests {
     #[test]
     fn secret_fields_are_marked_sensitive() {
         let specs = field_specs();
+        let find = |key: &str| {
+            specs
+                .iter()
+                .find(|s| s.key == key)
+                .unwrap_or_else(|| panic!("secret key {key:?} missing from field_specs()"))
+        };
+        // Every secret-bearing key must redact its value in the report,
+        // whether or not it is applied live.
         for key in [
             "rpcuser",
             "rpcpassword",
@@ -603,17 +842,21 @@ mod tests {
             "esplorauserpass",
             "reorgwebhooksecret",
         ] {
-            let spec = specs
-                .iter()
-                .find(|s| s.key == key)
-                .unwrap_or_else(|| panic!("secret key {key:?} missing from field_specs()"));
             assert!(
-                spec.sensitive,
+                find(key).sensitive,
                 "{key:?} holds secret material and must be marked sensitive \
                  (redacted in the reload report)"
             );
-            // Secrets are never live-applied (they're wired at startup).
-            assert!(spec.apply.is_none(), "{key:?} must be restart-only");
         }
+        // Secrets wired into long-lived startup state stay restart-only.
+        for key in ["rpcuser", "rpcpassword", "rpcauth", "torpassword", "esplorauserpass"] {
+            assert!(find(key).apply.is_none(), "{key:?} must be restart-only");
+        }
+        // The reorg-webhook secret is applied live (the dispatcher reads it
+        // from shared state per record) — it must still be redacted.
+        assert!(
+            find("reorgwebhooksecret").apply.is_some(),
+            "reorgwebhooksecret should be live (dispatcher reads shared target)"
+        );
     }
 }

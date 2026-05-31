@@ -81,10 +81,15 @@ Edit `bitcoin.conf` and send `SIGHUP` — `kill -HUP <pid>`, or `systemctl reloa
 | `maxconnections`, `maxinboundperip` | New limits govern subsequent connections (existing peers above a lowered cap are not dropped). |
 | `bantime` | New ban duration applies to bans created after the change. |
 | `minrelaytxfee`, `maxmempool`, `dustrelayfee`, `datacarrier`, `datacarriersize`, `mempoolfullrbf`, `limitancestorcount`, `limitdescendantcount`, `mempoolexpiry`, `permitbaremultisig` | Mempool/relay policy swapped atomically; governs subsequent transaction admissions (already-admitted entries are not re-evaluated). |
+| `connect`, `addnode`, `seednode` | Newly-added peers are registered and dialed immediately; existing connections are untouched. Removing an entry does **not** disconnect that peer (use `disconnectnode`), matching Core's `-addnode`. Note: `-connect`'s *exclusivity* (connect ONLY to these peers, suppress automatic outbound + DNS seeding) is a startup-time decision and is **not** re-evaluated on reload — adding `-connect` live dials the new peer but does not put a running node into connect-only mode (restart for that). |
+| `peerblockfilters` | Toggles `NODE_COMPACT_FILTERS` advertisement for **new** handshakes (still gated on a complete `blockfilterindex`). |
+| `addrindexsubscriptions` | New address-index subscription cap; applied to subsequent subscriptions (lowering it does not evict existing subscribers). |
+| `reorgwebhook`, `reorgwebhooksecret` | Adds, changes, or removes the reorg webhook URL/signing secret; the next reorg uses the new target. |
+| `persistmempool`, `maxshutdownsecs` | No restart needed — the new value is read from the reloaded config at shutdown time (governs the *next* shutdown, not an in-flight one). |
 
 > `logformat` (json vs text) is **not** hot-reloadable — only verbosity is. Changing the format requires a restart.
 
-**Restart required (reported, not applied):** network selection, `datadir`/`blocksdir`, all RPC/P2P/Esplora/Electrum **ports and binds**, RPC auth (`rpcuser`/`rpcpassword`/`rpcauth`/cookie), all TLS/mTLS material, `dbcache`/`prune`/`storageprofile`/reindex, index enable/disable (`txindex`/`addressindex`/`blockfilterindex`), seeds (`dns*`/`connect`/`addnode`/`seednode`/`fixedseeds`/`asmap`), Tor (`proxy`/`onion`/`torcontrol`/`listenonion`), `consensus`, and `assumevalid`/`stopatheight`.
+**Restart required (reported, not applied):** network selection, `datadir`/`blocksdir`, all RPC/P2P/Esplora/Electrum **ports and binds**, RPC auth (`rpcuser`/`rpcpassword`/`rpcauth`/cookie), all TLS/mTLS material, `dbcache`/`prune`/`storageprofile`/reindex, index enable/disable (`txindex`/`addressindex`/`blockfilterindex`), DNS-seed bootstrap (`dns`/`dnsseed`/`forcednsseed`/`fixedseeds`/`asmap`), Tor (`proxy`/`onion`/`torcontrol`/`listenonion`), `consensus`, and `assumevalid`/`stopatheight`. These are wired into long-lived state at startup (a bound socket, an opened database, the chain identity) and cannot be swapped without restarting the relevant socket/engine/process.
 
 ## 3. Developer & Integrator APIs
 
