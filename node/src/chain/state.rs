@@ -3025,6 +3025,16 @@ impl ChainState {
         // actually became the active chain tip.
         let mut pending_reorg: Option<PendingReorgRecord> = None;
 
+        // Flush-exclusion held only while a reorg is mutating the cache
+        // across multiple steps (issue #262 follow-up). Acquired just
+        // before the pre-reorg checkpoint flush and released the moment the
+        // cache holds a consistent full-reorg delta (after the triggering
+        // block commits) or on abort — so concurrent external flushes
+        // (`gettxoutsetinfo`, `dumptxoutset`, the filter backfill runner)
+        // cannot persist a partially-applied reorg. `None` for the common
+        // tip-extending path, which never leaves the cache inconsistent.
+        let mut reorg_excl: Option<crate::storage::coin_cache::FlushExclusion> = None;
+
         // Check for duplicate (HeaderOnly entries are OK — we're now providing data)
         if let Some(existing) = self.store.get_block_index(&block_hash)
             && existing.status != BlockStatus::HeaderOnly {
@@ -3213,7 +3223,16 @@ impl ChainState {
             // reconnect") and leave FRESH coins elided — the root cause of
             // the silent UTXO drop. If the checkpoint flush itself fails we
             // abort before mutating any chain state.
-            self.store.flush()?;
+            //
+            // Take the flush-exclusion lock FIRST, then flush the
+            // checkpoint through it. Holding it blocks concurrent external
+            // flushes for the rest of the reorg, so none can persist a
+            // partially-applied reorg between here and the triggering
+            // commit/abort. The checkpoint flush goes through the held
+            // handle (no re-acquire).
+            let excl = self.store.lock_flush_exclusion();
+            excl.flush()?;
+            reorg_excl = Some(excl);
 
             // Disconnect blocks from current tip down to fork point.
             // The returned info carries the data we need to build an
@@ -3416,6 +3435,16 @@ impl ChainState {
             tip.hash = block_hash;
             tip.height = new_height;
         }
+
+        // Reorg fully committed: the cache now holds a consistent
+        // full-reorg delta. Release the flush-exclusion lock so the
+        // mempool reconcile, chain-event emission, and the Layer-1
+        // per-block flush below run unguarded (they only ever observe a
+        // consistent cache) and external flushes can proceed. A no-op for
+        // the tip-extending path (never acquired). Dropping here also
+        // guarantees the Layer-1 `self.store.flush()` at the tail does not
+        // self-deadlock on the still-held guard.
+        drop(reorg_excl.take());
 
         // The reorg (if one happened) is now fully complete: disconnect,
         // all intermediate reconnections, and the final tip-extending
