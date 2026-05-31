@@ -884,7 +884,21 @@ pub enum NoteLevel {
 
 impl Config {
     /// Load configuration by merging CLI args → config file → defaults.
+    ///
+    /// Retained as the canonical entry point (and for the intra-doc links that
+    /// reference it); `main` uses [`Config::load_with_cli`] so it can keep the
+    /// parsed CLI for SIGHUP reloads.
+    #[allow(dead_code)]
     pub fn load() -> Result<Self, String> {
+        Self::load_with_cli().map(|(config, _cli)| config)
+    }
+
+    /// Like [`Config::load`], but also returns the parsed [`CliArgs`] so the
+    /// caller can retain it for the lifetime of the process. The SIGHUP config
+    /// reload (`satd::reload`) re-runs [`Config::from_cli`] with this same
+    /// `CliArgs`, so CLI flags stay authoritative across reloads and only the
+    /// config file is re-read from disk.
+    pub fn load_with_cli() -> Result<(Self, CliArgs), String> {
         let raw_args: Vec<String> = std::env::args().collect();
         let normalized = normalize_args(raw_args);
         let cli = match CliArgs::try_parse_from(normalized) {
@@ -906,9 +920,25 @@ impl Config {
                 return Err(e.to_string());
             }
         };
-        Self::from_cli(cli)
+        let config = Self::from_cli(cli.clone())?;
+        Ok((config, cli))
     }
 
+    /// Build a `Config` from already-parsed CLI args by merging in the config
+    /// file and profile/hardcoded defaults.
+    ///
+    /// Reload-safety contract — the SIGHUP reload path (`satd::reload`) calls
+    /// this on every `kill -HUP`, so it MUST be safe to re-run repeatedly:
+    /// - never writes to disk (cookie/PID files are written in `main`, not here),
+    /// - never mutates global/process state,
+    /// - never calls `process::exit` (bad input returns `Err`, which the reload
+    ///   path logs while keeping the running config — so a typo'd or unknown
+    ///   key can never crash the daemon),
+    /// - never panics on operator input.
+    ///
+    /// The only side effect is a pair of benign `eprintln!` warnings on a
+    /// malformed `storageprofile`/`consensus` value (it falls back to the
+    /// default). These are idempotent and acceptable; do not add others.
     pub fn from_cli(cli: CliArgs) -> Result<Self, String> {
         // Resolve named profile (if any). Fields from the profile flow
         // through as a lower-priority default: CLI flags always override,
@@ -2528,7 +2558,12 @@ pub fn resolve_blocks_dir(
 }
 
 /// CLI arguments compatible with bitcoind flags.
-#[derive(Parser, Debug)]
+///
+/// `Clone` is required so the parsed CLI can be captured once at startup and
+/// reused on every SIGHUP config reload (see [`Config::load_with_cli`] and
+/// `satd::reload`): the CLI stays authoritative while only the config file is
+/// re-read.
+#[derive(Parser, Debug, Clone)]
 #[command(name = "satd", version, about = "Bitcoin Core-compatible node in Rust")]
 pub struct CliArgs {
     #[arg(
@@ -4238,7 +4273,7 @@ impl ConfigFile {
 /// Those hard-error rather than being silently accepted, because an
 /// accepted-but-ignored option (e.g. `includeconf`) is more dangerous
 /// than a rejected one.
-const KNOWN_CONFIG_KEYS: &[&str] = &[
+pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     // Network selection
     "regtest",
     "testnet",
@@ -4537,6 +4572,36 @@ pub fn debug_directives(debug: &[String], debugexclude: &[String]) -> (bool, Vec
     (enable_all, directives)
 }
 
+/// Build the tracing `EnvFilter` for the current config.
+///
+/// This is the single source of truth for log verbosity, shared by the initial
+/// subscriber init at startup and the SIGHUP reload path (`satd::reload`), so
+/// the two can never drift. The base filter follows the historical behavior:
+/// with no `-debug`/`-debugexclude` flags it honors `RUST_LOG` (else `info`);
+/// when debug flags are present an explicit `RUST_LOG` still wins as the base,
+/// otherwise the base is `debug` for `-debug=all/1` else `info`, and each mapped
+/// category from [`debug_directives`] is layered on top.
+pub fn build_env_filter(config: &Config) -> tracing_subscriber::EnvFilter {
+    use tracing_subscriber::EnvFilter;
+
+    let (debug_all, debug_directives) = debug_directives(&config.debug, &config.debugexclude);
+    let debug_flags_given = !config.debug.is_empty() || !config.debugexclude.is_empty();
+    let mut env_filter = if !debug_flags_given {
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
+    } else {
+        match std::env::var("RUST_LOG") {
+            Ok(rl) if !rl.trim().is_empty() => EnvFilter::new(rl),
+            _ => EnvFilter::new(if debug_all { "debug" } else { "info" }),
+        }
+    };
+    for d in &debug_directives {
+        match d.parse() {
+            Ok(directive) => env_filter = env_filter.add_directive(directive),
+            Err(e) => eprintln!("Warning: ignoring invalid debug directive {d:?}: {e}"),
+        }
+    }
+    env_filter
+}
 
 fn default_datadir() -> PathBuf {
     dirs_home().join(".bitcoin")

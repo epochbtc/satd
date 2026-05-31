@@ -8,6 +8,28 @@ layout) per `STABILITY_POLICY.md`.
 
 ## [Unreleased]
 
+### Operator
+
+- **`SIGHUP` now reloads `bitcoin.conf` live.** Edit the config file and
+  `kill -HUP <pid>` (or `systemctl reload satd`) to re-read it and apply the
+  hot-reloadable subset of settings without a restart — the P2P swarm and
+  chainstate are untouched. CLI flags stay authoritative across reloads (only
+  the file is re-read). This is an intentional difference from Bitcoin Core,
+  which uses `SIGHUP` to reopen `debug.log`: satd logs to stdout (no
+  `debug.log`; rotation is delegated to systemd-journald or the container
+  runtime), so `SIGHUP` is free for config reload. Applied live: log verbosity
+  (`-debug`/`-debugexclude`), connection knobs
+  (`-timeout`/`-blocksonly`/`-maxuploadtarget`/`-v2transport`/`-v2only`/`-externalip`/`-whitelist`),
+  and the RPC-behavior switches (`-rpcextendederrors`/`-rpcdefaultunits`).
+  Settings wired into long-lived state at startup (network, datadir,
+  ports/binds, `-dbcache`, indexes, TLS, seeds, Tor) are logged as "restart
+  required" and never silently ignored. A reload that fails to parse — e.g. a
+  typo'd or unknown key, which hard-errors at load — is logged and the running
+  config is kept; the daemon never crashes on a bad reload. A test asserts
+  every known `bitcoin.conf` key has an explicit reload disposition, so no key
+  can silently fall through. See `OPERATOR_ERGONOMICS.md` for the per-key
+  reference and `CORE_DIFFERENCES.md` for the behavior contract.
+
 ### Monitoring
 
 - **Startup/reindex progress timing is now computed daemon-side.** The node

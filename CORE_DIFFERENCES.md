@@ -16,7 +16,7 @@ The compatibility contract itself — what is Tier 1 / Tier 2 / Tier 3,
 how deprecations are staged, what migration invariants apply — lives
 in `STABILITY_POLICY.md`.
 
-Last updated: 2026-05-26.
+Last updated: 2026-05-30.
 
 ---
 
@@ -73,6 +73,7 @@ artifacts, signing stack) but no protocol consequences.
 | **Reproducible builds** | Guix | Nix flake (Guix may follow if a downstream packager needs it) |
 | **Release signing** | GPG (PGP) | minisign (artifacts) + cosign keyless (containers) + SSH sigs (git tags). No GPG. |
 | **Peer address store** | `peers.dat` (Core bucketed addrman serialization) | `peers.dat` with a satd-native versioned format (magic `SADR`) — **not** byte-compatible with Core's file |
+| **Log destination** | `debug.log` file in the datadir (plus optional console); internal rotation; `SIGHUP` reopens the file | **stdout only**; no `debug.log`. Rotation/retention is delegated to systemd-journald or the container runtime. `SIGHUP` is therefore free for config reload (see Operator-facing additions). |
 
 **On `peers.dat` compatibility.** satd persists its address manager to
 `peers.dat` (same filename), but the on-disk format is satd-native and
@@ -292,6 +293,24 @@ preserved; the satd extension is opt-in per request or per flag.
 - **Structured-JSON logs** — `--log-format=json|text`. Default text for
   humans, json for production. Stable field schema, trace IDs on the
   block-validation pipeline.
+
+- **`SIGHUP` reloads config (does not reopen a log file).** Bitcoin Core
+  treats `SIGHUP` as "reopen `debug.log`" for logrotate. satd has no
+  `debug.log` (it logs to stdout — see the **Log destination** row in
+  Architectural differences), so `SIGHUP` is repurposed for **live config
+  reload**: edit `bitcoin.conf` and `kill -HUP <pid>` (or
+  `systemctl reload satd`) to re-read the file and apply the hot-reloadable
+  subset of settings without a restart. CLI flags stay authoritative across
+  reloads (only the file is re-read). Hot-reloadable settings include log
+  verbosity (`-debug`/`-debugexclude`), connection knobs
+  (`-timeout`/`-blocksonly`/`-maxuploadtarget`/`-v2transport`/`-v2only`/`-externalip`/`-whitelist`),
+  and the RPC-behavior switches (`-rpcextendederrors`/`-rpcdefaultunits`).
+  Settings wired into long-lived state at startup (network, datadir, ports,
+  binds, `-dbcache`, indexes, TLS, seeds, Tor) are reported in the log as
+  "restart required" and never silently ignored. A reload that fails to parse
+  (e.g. a typo'd or unknown key, which hard-errors at load) is logged and the
+  running config is kept — the daemon never crashes on a bad reload. The
+  authoritative per-key list is in `OPERATOR_ERGONOMICS.md`.
 
 - **`getibdprogress`** — IBD bitmap + per-peer tracking; richer than
   Core's `verificationprogress` scalar.
