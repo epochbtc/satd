@@ -319,8 +319,14 @@ impl CoinCache {
     /// replay, and it cannot itself fail. Because the inner store already
     /// holds the pre-reorg chain, clearing the dirty map, the buffered
     /// non-coin batch, the pending tip, the running deltas, and the
-    /// read-through overlays is sufficient and exact: every subsequent read
-    /// falls through to the inner store's pre-reorg state.
+    /// non-coin read-through overlays is sufficient and exact: every
+    /// subsequent read resolves to the inner store's pre-reorg state.
+    ///
+    /// Caller contract: block connection and cache flushing must be
+    /// serialized (satd connects on a single thread; see the connect loop
+    /// in `net::manager`). The atomicity relies on no flush landing the
+    /// partial reorg on disk between the pre-reorg checkpoint flush and
+    /// this call — an in-memory discard cannot undo an on-disk write.
     ///
     /// Mirrors `clear_chainstate` but deliberately omits the
     /// `inner.clear_chainstate()` call — the inner store must be preserved.
@@ -331,19 +337,26 @@ impl CoinCache {
         self.amount_delta.store(0, Ordering::Relaxed);
         *self.pending_tip.lock() = None;
         *self.pending_batch.lock() = StoreBatch::default();
+        // The non-coin overlays receive reorg-tentative values
+        // unconditionally in `write_batch_mode` (the side-chain blocks'
+        // index/height/undo/tx/chain-tx rows), so they MUST be cleared —
+        // otherwise a stale height->side-hash mapping would survive the
+        // abort. Reads then fall through to the inner store's pre-reorg
+        // state.
         self.block_index_cache.lock().clear();
         self.height_hash_cache.lock().clear();
         self.undo_cache.lock().clear();
         self.tx_index_cache.lock().clear();
         self.chain_tx_cache.lock().clear();
-        // Clean LRU holds only coins read from / promoted to the inner
-        // store, never reorg-tentative values (no mid-reorg flush promotes
-        // into it). Clearing is not required for correctness — reads fall
-        // through to the dirty map (now empty) then the inner store — but
-        // we clear it to keep the post-abort cache free of any entry the
-        // discarded reorg popped and never repopulated, matching
-        // clear_chainstate's behavior.
-        self.clean.lock().clear();
+        // The clean coin LRU is deliberately NOT cleared. During a reorg
+        // it only ever loses entries — `write_batch_mode` pops every coin
+        // it touches — and gains none with a reorg-tentative value (coins
+        // enter `clean` solely via flush-promotion, which does not run
+        // mid-reorg, or via read-through, which serves the inner store's
+        // pre-reorg value). So every entry remaining in `clean` already
+        // agrees with the restored inner state. Clearing a multi-million-
+        // entry LRU on every failed reorg would impose a cold-cache stall
+        // for no correctness gain, so we keep it warm.
     }
 }
 

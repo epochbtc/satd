@@ -3233,30 +3233,34 @@ impl ChainState {
                 }
             };
 
-            // Now connect the side chain blocks from fork point up to (but not including)
-            // the new block. Collect them first since we need to connect in forward order.
-            let mut to_connect = Vec::new();
-            {
-                let mut hash = prev_hash;
-                let fork_hash = fork_entry.header.block_hash();
-                while hash != fork_hash {
-                    to_connect.push(hash);
-                    let e = self.store.get_block_index(&hash)
-                        .ok_or(ChainError::BadPrevBlock)?;
-                    hash = e.header.prev_blockhash;
-                }
-                to_connect.reverse();
-            }
-            let mut reconnected_hashes: Vec<BlockHash> = Vec::with_capacity(to_connect.len() + 1);
-            let mut reconnected_blocks: Vec<(bitcoin::Block, u32)> =
-                Vec::with_capacity(to_connect.len());
+            // Reconnect the side chain from the fork point up to (but not
+            // including) the new block; the new block itself connects via
+            // the shared path below. BOTH the collection walk and the
+            // per-block reconnect run inside the closure so that ANY
+            // failure — a missing/evicted block index as well as a block
+            // that fails to connect — is caught and routed through
+            // `abort_reorg`, never escaping with `?` and stranding a
+            // partially-reorged chainstate at the fork point. The pre-reorg
+            // checkpoint flush makes that abort a pure in-cache discard.
+            let mut reconnected_hashes: Vec<BlockHash> = Vec::new();
+            let mut reconnected_blocks: Vec<(bitcoin::Block, u32)> = Vec::new();
 
-            // Side-chain reconnect — wrapped so a per-block failure
-            // unwinds the partial activation back to the original
-            // chain. Without this, a high-work side chain whose
-            // intermediate or final block fails validation would leave
-            // the node partially reorged.
             let side_result: Result<(), ChainError> = (|| {
+                // Collect side-chain blocks fork+1..=prev, forward order.
+                let mut to_connect = Vec::new();
+                {
+                    let mut hash = prev_hash;
+                    let fork_hash = fork_entry.header.block_hash();
+                    while hash != fork_hash {
+                        to_connect.push(hash);
+                        let e = self
+                            .store
+                            .get_block_index(&hash)
+                            .ok_or(ChainError::BadPrevBlock)?;
+                        hash = e.header.prev_blockhash;
+                    }
+                    to_connect.reverse();
+                }
                 for side_hash in &to_connect {
                     let side_block = self
                         .get_block(side_hash)
