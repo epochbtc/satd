@@ -33,12 +33,14 @@ pub fn get_blockchain_info(chain_state: &ChainState) -> Value {
             (0.0, 0u64, 0u64, "0".to_string())
         };
 
-    // IBD heuristic: if tip is more than 24 hours behind wall clock, we're in IBD
+    // IBD heuristic: if tip is more than 24 hours behind wall clock, we're
+    // in IBD. Shares one definition with the per-block flush gate in
+    // `ChainState` (see `tip_time_is_ibd` / issue #262).
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let is_ibd = time + 86400 < now;
+    let is_ibd = ChainState::tip_time_is_ibd(time as u32);
 
     json!({
         "chain": chain,

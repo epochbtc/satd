@@ -1086,6 +1086,30 @@ impl ChainState {
         (tip.hash, tip.height)
     }
 
+    /// Initial-block-download heuristic from a tip timestamp. Matches the
+    /// `initialblockdownload` signal in `getblockchaininfo`
+    /// (`rpc::blockchain`): the node is considered to be in IBD while its
+    /// active-chain tip is more than 24h behind wall-clock time. Shared so
+    /// the RPC and the per-block flush gate use one definition.
+    pub(crate) fn tip_time_is_ibd(tip_time: u32) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        (tip_time as u64) + 86_400 < now
+    }
+
+    /// Whether the node is in initial block download, judged by the active
+    /// tip's timestamp. Returns `true` when the tip header is unavailable
+    /// (treated as far-behind) so callers fail safe toward "still syncing".
+    pub fn is_initial_block_download(&self) -> bool {
+        let tip_time = self
+            .get_block_index(&self.tip_hash())
+            .map(|e| e.header.time)
+            .unwrap_or(0);
+        Self::tip_time_is_ibd(tip_time)
+    }
+
     /// Flush the UTXO write cache to disk. Call periodically during IBD
     /// and on graceful shutdown.
     pub fn flush_coin_cache(&self) -> Result<(), StoreError> {
@@ -3176,35 +3200,67 @@ impl ChainState {
                 return Ok(block_hash);
             }
 
+            // Atomic-reorg durable checkpoint (issue #262). Flush the
+            // pre-reorg active chain to the inner store so it becomes the
+            // exact rollback target. Every reorg write below
+            // (disconnect, reconnect, triggering connect) lands in the
+            // coin cache only — never on disk — until the reorg fully
+            // succeeds and a later flush commits it. On any failure we
+            // call `abort_reorg`, which discards the whole cache delta and
+            // restores the tip to this checkpoint. This replaces the old
+            // `rollback_partial_reorg` block-body replay, which could
+            // itself fail (e.g. "block data missing during rollback
+            // reconnect") and leave FRESH coins elided — the root cause of
+            // the silent UTXO drop. If the checkpoint flush itself fails we
+            // abort before mutating any chain state.
+            self.store.flush()?;
+
             // Disconnect blocks from current tip down to fork point.
             // The returned info carries the data we need to build an
             // accurate reorg record once reconnection is complete.
-            let disconnect_info = self.perform_reorg(&fork_entry, current_tip)?;
-
-            // Now connect the side chain blocks from fork point up to (but not including)
-            // the new block. Collect them first since we need to connect in forward order.
-            let mut to_connect = Vec::new();
-            {
-                let mut hash = prev_hash;
-                let fork_hash = fork_entry.header.block_hash();
-                while hash != fork_hash {
-                    to_connect.push(hash);
-                    let e = self.store.get_block_index(&hash)
-                        .ok_or(ChainError::BadPrevBlock)?;
-                    hash = e.header.prev_blockhash;
+            let disconnect_info = match self.perform_reorg(&fork_entry, current_tip) {
+                Ok(info) => info,
+                Err(e) => {
+                    // perform_reorg only mutates the cache via its single
+                    // batch write + tip update; abort restores both.
+                    let old_height = self
+                        .store
+                        .get_block_index(&current_tip)
+                        .map(|en| en.height)
+                        .unwrap_or(tip_entry.height);
+                    self.abort_reorg(current_tip, old_height);
+                    return Err(e);
                 }
-                to_connect.reverse();
-            }
-            let mut reconnected_hashes: Vec<BlockHash> = Vec::with_capacity(to_connect.len() + 1);
-            let mut reconnected_blocks: Vec<(bitcoin::Block, u32)> =
-                Vec::with_capacity(to_connect.len());
+            };
 
-            // Side-chain reconnect — wrapped so a per-block failure
-            // unwinds the partial activation back to the original
-            // chain. Without this, a high-work side chain whose
-            // intermediate or final block fails validation would leave
-            // the node partially reorged.
+            // Reconnect the side chain from the fork point up to (but not
+            // including) the new block; the new block itself connects via
+            // the shared path below. BOTH the collection walk and the
+            // per-block reconnect run inside the closure so that ANY
+            // failure — a missing/evicted block index as well as a block
+            // that fails to connect — is caught and routed through
+            // `abort_reorg`, never escaping with `?` and stranding a
+            // partially-reorged chainstate at the fork point. The pre-reorg
+            // checkpoint flush makes that abort a pure in-cache discard.
+            let mut reconnected_hashes: Vec<BlockHash> = Vec::new();
+            let mut reconnected_blocks: Vec<(bitcoin::Block, u32)> = Vec::new();
+
             let side_result: Result<(), ChainError> = (|| {
+                // Collect side-chain blocks fork+1..=prev, forward order.
+                let mut to_connect = Vec::new();
+                {
+                    let mut hash = prev_hash;
+                    let fork_hash = fork_entry.header.block_hash();
+                    while hash != fork_hash {
+                        to_connect.push(hash);
+                        let e = self
+                            .store
+                            .get_block_index(&hash)
+                            .ok_or(ChainError::BadPrevBlock)?;
+                        hash = e.header.prev_blockhash;
+                    }
+                    to_connect.reverse();
+                }
                 for side_hash in &to_connect {
                     let side_block = self
                         .get_block(side_hash)
@@ -3268,17 +3324,14 @@ impl ChainState {
             })();
 
             if let Err(e) = side_result {
-                tracing::warn!(error = %e, "Reorg side-chain reconnect failed; rolling back to old tip");
-                if let Err(re) = self.rollback_partial_reorg(
-                    &reconnected_blocks,
-                    &disconnect_info.disconnected_with_height,
-                ) {
-                    tracing::error!(
-                        original_error = %e,
-                        rollback_error = %re,
-                        "Reorg rollback FAILED — chainstate is inconsistent; operator must reindex"
-                    );
-                }
+                tracing::warn!(
+                    error = %e,
+                    "Reorg side-chain reconnect failed; discarding the cache delta and restoring the pre-reorg tip"
+                );
+                // Atomic rollback (#262): drop the entire in-cache reorg
+                // delta and restore the tip to the pre-reorg checkpoint.
+                // Cannot fail — no block-body replay.
+                self.abort_reorg(disconnect_info.old_tip, disconnect_info.old_height);
                 return Err(e);
             }
 
@@ -3336,17 +3389,11 @@ impl ChainState {
             Ok(b) => b,
             Err(e) => {
                 if let Some(pending) = pending_reorg.as_ref() {
-                    tracing::warn!(error = %e, "Reorg triggering block validation failed; rolling back to old tip");
-                    if let Err(re) = self.rollback_partial_reorg(
-                        &pending.reconnected_blocks,
-                        &pending.original_disconnected,
-                    ) {
-                        tracing::error!(
-                            original_error = %e,
-                            rollback_error = %re,
-                            "Reorg rollback FAILED — chainstate is inconsistent; operator must reindex"
-                        );
-                    }
+                    tracing::warn!(
+                        error = %e,
+                        "Reorg triggering block validation failed; discarding the cache delta and restoring the pre-reorg tip"
+                    );
+                    self.abort_reorg(pending.old_tip, pending.old_height);
                 }
                 return Err(e.into());
             }
@@ -3354,17 +3401,11 @@ impl ChainState {
 
         if let Err(e) = self.store.write_batch(batch) {
             if let Some(pending) = pending_reorg.as_ref() {
-                tracing::warn!(error = %e, "Reorg triggering block commit failed; rolling back to old tip");
-                if let Err(re) = self.rollback_partial_reorg(
-                    &pending.reconnected_blocks,
-                    &pending.original_disconnected,
-                ) {
-                    tracing::error!(
-                        original_error = %e,
-                        rollback_error = %re,
-                        "Reorg rollback FAILED — chainstate is inconsistent; operator must reindex"
-                    );
-                }
+                tracing::warn!(
+                    error = %e,
+                    "Reorg triggering block commit failed; discarding the cache delta and restoring the pre-reorg tip"
+                );
+                self.abort_reorg(pending.old_tip, pending.old_height);
             }
             return Err(e.into());
         }
@@ -3501,102 +3542,54 @@ impl ChainState {
             "Block connected"
         );
 
+        // Mitigation for the FRESH-elision-on-failed-reorg bug (#262).
+        // Outside IBD, flush the coin cache after every connected block so
+        // freshly-created coins become durable — and lose their FRESH
+        // (elidable) status — before any *subsequent* block can trigger a
+        // reorg that disconnects them. The bug needs a multi-block dirty
+        // window at the tip: a still-FRESH coin disconnected by a reorg
+        // turns into `Spent { fresh: true }` and is elided at the next
+        // flush, silently dropping a live coin. At the tip this is one
+        // flush per block (~10 min on mainnet), negligible cost. During
+        // IBD/reindex the connector loop's threshold-gated flush governs
+        // instead and this is skipped, since `block` is the new tip its
+        // timestamp is the tip time. A flush failure here does not
+        // un-connect the block (it is already committed), so we log loudly
+        // and continue rather than returning a misleading error — the
+        // coins remain in cache for the next flush attempt.
+        if !Self::tip_time_is_ibd(block.header.time)
+            && let Err(e) = self.store.flush()
+        {
+            tracing::error!(
+                error = %e,
+                height = new_height,
+                hash = %block_hash,
+                "Per-block coin-cache flush failed after tip connect (#262 mitigation); coins remain dirty in cache"
+            );
+        }
+
         Ok(block_hash)
     }
 
-    /// Best-effort rollback of an in-progress reorg: disconnects any
-    /// side-chain blocks that were reconnected, then re-connects the
-    /// original-chain blocks the reorg disconnected. After this
-    /// returns Ok, the active tip is restored to the pre-reorg state
-    /// and the chainstate is consistent with that tip.
+    /// Abort an in-progress reorg atomically and infallibly (issue #262).
     ///
-    /// Failure here is logged loudly by the caller; we continue to
-    /// propagate the original reorg error rather than masking it.
-    /// Original-chain blocks were already validated when they first
-    /// connected, so we re-connect them with `NoopVerifier` to avoid a
-    /// transient script-verifier failure during rollback.
-    fn rollback_partial_reorg(
-        &self,
-        side_blocks_committed: &[(bitcoin::Block, u32)],
-        original_disconnected: &[(BlockHash, u32)],
-    ) -> Result<(), ChainError> {
-        // Disconnect side chain in reverse order (newest first).
-        for (side_block, side_height) in side_blocks_committed.iter().rev() {
-            let side_hash = side_block.block_hash();
-            let entry = self
-                .store
-                .get_block_index(&side_hash)
-                .ok_or(ChainError::BadPrevBlock)?;
-            let undo = self
-                .store
-                .get_undo(&side_hash)
-                .ok_or(ChainError::FlatFile(
-                    "undo data missing during rollback".to_string(),
-                ))?;
-            let prev_hash = entry.header.prev_blockhash;
-            let batch = disconnect::disconnect_block(
-                side_block,
-                &undo,
-                *side_height,
-                prev_hash,
-                &self.address_index,
-                #[cfg(feature = "block-filter-index")]
-                &self.filter_index,
-            )?;
-            self.store.write_batch(batch)?;
-            let prev_entry = self
-                .store
-                .get_block_index(&prev_hash)
-                .ok_or(ChainError::BadPrevBlock)?;
-            let mut tip = self.tip.write();
-            tip.hash = prev_hash;
-            tip.height = prev_entry.height;
-        }
-
-        // Reconnect the original chain in oldest-first order. The
-        // original disconnect captured them newest-first (walk from
-        // old_tip toward fork), so we reverse to play them forward.
-        for (hash, _height) in original_disconnected.iter().rev() {
-            let block = self.get_block(hash).ok_or(ChainError::FlatFile(
-                "block data missing during rollback reconnect".to_string(),
-            ))?;
-            let entry = self
-                .store
-                .get_block_index(hash)
-                .ok_or(ChainError::BadPrevBlock)?;
-            let parent_entry = self
-                .store
-                .get_block_index(&entry.header.prev_blockhash)
-                .ok_or(ChainError::BadPrevBlock)?;
-            let mtp = self.get_median_time_past(entry.height);
-            let flat_pos = FlatFilePos {
-                file_number: entry.file_number,
-                data_pos: entry.data_pos,
-            };
-            let noop = NoopVerifier;
-            let batch = connect::connect_block(&connect::ConnectParams {
-                store: &*self.store,
-                block: &block,
-                height: entry.height,
-                parent_chainwork: &parent_entry.chainwork,
-                flat_pos,
-                script_verifier: &noop,
-                median_time_past: mtp,
-                network: self.network,
-                pre_verified_txs: None,
-                num_threads: 1,
-                precomputed_txids: None,
-                address_index: &self.address_index,
-            #[cfg(feature = "block-filter-index")]
-            filter_index: &self.filter_index,
-            phase_tracker: None,
-            })?;
-            self.store.write_batch(batch)?;
-            let mut tip = self.tip.write();
-            tip.hash = *hash;
-            tip.height = entry.height;
-        }
-        Ok(())
+    /// Precondition: the caller flushed the pre-reorg active chain to the
+    /// inner store before starting the reorg (see the checkpoint flush in
+    /// `accept_block`), so the inner store holds the exact pre-reorg
+    /// chainstate and every reorg write so far lives only in the coin
+    /// cache. This drops that entire uncommitted cache delta and restores
+    /// the in-memory tip to the pre-reorg tip.
+    ///
+    /// Unlike the previous `rollback_partial_reorg`, this performs no
+    /// block-body replay and cannot fail — the failure mode that silently
+    /// dropped FRESH coins (a rollback reconnect that itself errored with
+    /// "block data missing", leaving disconnected-but-FRESH coins elided)
+    /// is structurally impossible here.
+    fn abort_reorg(&self, old_tip: BlockHash, old_height: u32) {
+        self.store.discard_uncommitted();
+        let mut tip = self.tip.write();
+        tip.hash = old_tip;
+        tip.height = old_height;
     }
 
     /// Disconnect blocks from current tip down to the fork point (parent of the new chain).
@@ -5110,6 +5103,145 @@ pub(crate) mod tests {
             }
         }
         panic!("Failed to mine test block within 1,000,000 nonce iterations");
+    }
+
+    /// Like `build_test_block` but appends a second transaction that spends
+    /// `spend`. Pass a non-existent outpoint to produce a block that is
+    /// context-free valid (well-formed, correct merkle root, mined) yet
+    /// fails `connect_block` with a missing-input error — exactly what is
+    /// needed to force a reorg's *triggering* block to fail at connect.
+    pub(crate) fn build_test_block_spending(
+        parent_hash: BlockHash,
+        height: u32,
+        time: u32,
+        spend: bitcoin::OutPoint,
+    ) -> Block {
+        use bitcoin::blockdata::locktime::absolute::LockTime;
+        use bitcoin::pow::CompactTarget;
+        use bitcoin::transaction;
+        use bitcoin::{Amount, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
+
+        // Start from a normal coinbase-only block, then graft the spend tx
+        // in and re-mine (merkle root and PoW both change).
+        let mut block = build_test_block(parent_hash, height, time);
+        let spend_tx = Transaction {
+            version: transaction::Version(2),
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: spend,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        block.txdata.push(spend_tx);
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+
+        let bits = CompactTarget::from_consensus(0x207fffff);
+        let target = crate::storage::blockindex::target_from_compact(bits);
+        for nonce in 0u32..2_000_000 {
+            block.header.nonce = nonce;
+            let hash_bytes = *block.block_hash().as_raw_hash().as_byte_array();
+            let mut hash_be = [0u8; 32];
+            for i in 0..32 {
+                hash_be[i] = hash_bytes[31 - i];
+            }
+            let mut ok = true;
+            for i in 0..32 {
+                if hash_be[i] < target[i] {
+                    break;
+                }
+                if hash_be[i] > target[i] {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                return block;
+            }
+        }
+        panic!("Failed to mine spending test block within 2,000,000 nonce iterations");
+    }
+
+    /// Regression for issue #262: a reorg whose triggering block fails to
+    /// connect must leave the original active chain — and its still-FRESH
+    /// (un-flushed) coins — fully intact and durable. The old replay-based
+    /// rollback could leave disconnected FRESH coins marked
+    /// `Spent { fresh: true }` and silently elide them at the next flush;
+    /// the atomic flush-checkpoint + cache-delta-discard path cannot.
+    #[test]
+    fn test_failed_reorg_preserves_fresh_coins() {
+        use bitcoin::hashes::Hash;
+
+        let (cs, dir) = make_chain_state();
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+
+        // Chain A: genesis -> A1 -> A2. Coins are FRESH — deliberately
+        // never flushed, reproducing the unflushed-tip window.
+        let a1 = build_test_block(genesis_hash, 1, 1_700_000_001);
+        let a1_hash = cs.accept_block(&a1).expect("accept A1");
+        let a2 = build_test_block(a1_hash, 2, 1_700_000_002);
+        let a2_hash = cs.accept_block(&a2).expect("accept A2");
+        assert_eq!(cs.tip_height(), 2);
+        assert_eq!(cs.tip_hash(), a2_hash);
+
+        let a1_op = OutPoint { txid: a1.txdata[0].compute_txid(), vout: 0 };
+        let a2_op = OutPoint { txid: a2.txdata[0].compute_txid(), vout: 0 };
+        assert!(cs.get_coin(&a1_op).is_some(), "A1 coin present before reorg");
+        assert!(cs.get_coin(&a2_op).is_some(), "A2 coin present before reorg");
+
+        // Competing chain B with strictly more work (3 blocks > 2). B1/B2
+        // are valid side blocks; B3 is the triggering block and is invalid
+        // — it spends a non-existent outpoint, so it fails at connect.
+        let b1 = build_test_block(genesis_hash, 1, 1_700_000_011);
+        let b1_hash = cs.accept_block(&b1).expect("store B1 side block");
+        let b2 = build_test_block(b1_hash, 2, 1_700_000_012);
+        let b2_hash = cs.accept_block(&b2).expect("store B2 side block");
+        // Tip is unchanged: B has only equal work so far.
+        assert_eq!(cs.tip_hash(), a2_hash, "no reorg before B has more work");
+
+        let bogus = OutPoint {
+            txid: bitcoin::Txid::from_raw_hash(
+                bitcoin::hashes::sha256d::Hash::from_byte_array([0x9e; 32]),
+            ),
+            vout: 0,
+        };
+        let b3 = build_test_block_spending(b2_hash, 3, 1_700_000_013, bogus);
+        let res = cs.accept_block(&b3);
+        assert!(
+            res.is_err(),
+            "reorg triggering block spending a non-existent coin must fail to connect"
+        );
+
+        // The original chain must be fully restored.
+        assert_eq!(cs.tip_height(), 2, "tip height restored to chain A");
+        assert_eq!(cs.tip_hash(), a2_hash, "tip hash restored to chain A");
+        assert!(cs.get_coin(&a1_op).is_some(), "A1 coin survives failed reorg");
+        assert!(cs.get_coin(&a2_op).is_some(), "A2 coin survives failed reorg");
+
+        // The crux: flush. A pre-fix bug would elide the disconnected-then-
+        // not-restored FRESH coins here, silently dropping live UTXOs.
+        cs.flush_coin_cache().expect("flush after failed reorg");
+        assert!(
+            cs.get_coin(&a1_op).is_some(),
+            "A1 coin must survive the post-failure flush (no FRESH elision)"
+        );
+        assert!(
+            cs.get_coin(&a2_op).is_some(),
+            "A2 coin must survive the post-failure flush (no FRESH elision)"
+        );
+        assert_eq!(cs.coin_count(), 2, "exactly the two chain-A coins remain");
+
+        // Sanity: the node still accepts the next valid block on chain A.
+        let a3 = build_test_block(a2_hash, 3, 1_700_000_020);
+        cs.accept_block(&a3).expect("chain A still extendable after failed reorg");
+        assert_eq!(cs.tip_height(), 3);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
