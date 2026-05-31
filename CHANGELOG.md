@@ -23,12 +23,20 @@ layout) per `STABILITY_POLICY.md`.
   the RPC-behavior switches (`-rpcextendederrors`/`-rpcdefaultunits`), mempool
   and relay policy
   (`-minrelaytxfee`/`-maxmempool`/`-dustrelayfee`/`-datacarrier(size)`/`-mempoolfullrbf`/`-limitancestorcount`/`-limitdescendantcount`/`-mempoolexpiry`/`-permitbaremultisig`),
-  and the peer-limit knobs (`-maxconnections`/`-maxinboundperip`/`-bantime`).
-  Mempool-policy changes govern subsequent transaction admissions;
+  the peer-limit knobs (`-maxconnections`/`-maxinboundperip`/`-bantime`),
+  outbound peers (`-connect`/`-addnode`/`-seednode` — newly-added entries are
+  dialed immediately, existing connections untouched), compact-filter serving
+  (`-peerblockfilters`), the address-index subscription cap
+  (`-addrindexsubscriptions`), the reorg webhook
+  (`-reorgwebhook`/`-reorgwebhooksecret`), and the shutdown knobs
+  (`-persistmempool`/`-maxshutdownsecs`, which take effect at the next
+  shutdown). Mempool-policy changes govern subsequent transaction admissions;
   connection/ban-limit changes apply to new connections and future bans.
-  Settings wired into long-lived state at startup (network, datadir,
-  ports/binds, `-dbcache`, indexes, TLS, seeds, Tor) are logged as "restart
-  required" and never silently ignored. A reload that fails to parse — e.g. a
+  Settings wired into long-lived state at startup that cannot change without
+  restarting the relevant socket/engine/process — network, `datadir`,
+  ports/binds, `-dbcache`, index enable/disable, TLS material, DNS-seed
+  bootstrap, and Tor — are logged as "restart required" and never silently
+  ignored. A reload that fails to parse — e.g. a
   typo'd or unknown key, which hard-errors at load — is logged and the running
   config is kept; the daemon never crashes on a bad reload. A test asserts
   every known `bitcoin.conf` key has an explicit reload disposition, so no key
