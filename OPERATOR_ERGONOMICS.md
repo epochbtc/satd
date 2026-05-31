@@ -86,10 +86,13 @@ Edit `bitcoin.conf` and send `SIGHUP` — `kill -HUP <pid>`, or `systemctl reloa
 | `addrindexsubscriptions` | New address-index subscription cap; applied to subsequent subscriptions (lowering it does not evict existing subscribers). |
 | `reorgwebhook`, `reorgwebhooksecret` | Adds, changes, or removes the reorg webhook URL/signing secret; the next reorg uses the new target. |
 | `persistmempool`, `maxshutdownsecs` | No restart needed — the new value is read from the reloaded config at shutdown time (governs the *next* shutdown, not an in-flight one). |
+| `rpcuser`, `rpcpassword`, `rpcauth` | RPC credentials rotate live on **every** listener surface; subsequent requests are checked against the new set. The auto-generated cookie is preserved. Values are redacted in the reload log. |
 
 > `logformat` (json vs text) is **not** hot-reloadable — only verbosity is. Changing the format requires a restart.
 
-**Restart required (reported, not applied):** network selection, `datadir`/`blocksdir`, all RPC/P2P/Esplora/Electrum **ports and binds**, RPC auth (`rpcuser`/`rpcpassword`/`rpcauth`/cookie), all TLS/mTLS material, `dbcache`/`prune`/`storageprofile`/reindex, index enable/disable (`txindex`/`addressindex`/`blockfilterindex`), DNS-seed bootstrap (`dns`/`dnsseed`/`forcednsseed`/`fixedseeds`/`asmap`), Tor (`proxy`/`onion`/`torcontrol`/`listenonion`), `consensus`, and `assumevalid`/`stopatheight`. These are wired into long-lived state at startup (a bound socket, an opened database, the chain identity) and cannot be swapped without restarting the relevant socket/engine/process.
+> **Credential rotation caveat.** Removing `rpcuser`/`rpcpassword` from a node started *without* a cookie (i.e. one started *with* a static user/pass) leaves no credentials at all — the RPC interface then rejects everything until you restore a credential or restart (a restart regenerates the cookie). satd logs a warning when a reload lands in this state. The cookie **file** (`rpccookiefile`/`rpccookieperms`) and the `rpcdisableauth` mTLS toggle remain restart-only.
+
+**Restart required (reported, not applied):** network selection, `datadir`/`blocksdir`, all RPC/P2P/Esplora/Electrum **ports and binds**, the RPC cookie file (`rpccookiefile`/`rpccookieperms`) and `rpcdisableauth`, all TLS/mTLS material, `dbcache`/`prune`/`storageprofile`/reindex, index enable/disable (`txindex`/`addressindex`/`blockfilterindex`), DNS-seed bootstrap (`dns`/`dnsseed`/`forcednsseed`/`fixedseeds`/`asmap`), Tor (`proxy`/`onion`/`torcontrol`/`listenonion`), `consensus`, and `assumevalid`/`stopatheight`. These are wired into long-lived state at startup (a bound socket, an opened database, the chain identity) and cannot be swapped without restarting the relevant socket/engine/process.
 
 ## 3. Developer & Integrator APIs
 
