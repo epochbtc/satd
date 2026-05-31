@@ -1,6 +1,7 @@
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use hmac::{Hmac, Mac};
+use parking_lot::RwLock;
 use sha2::Sha256;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -21,10 +22,18 @@ type HmacSha256 = Hmac<Sha256>;
 /// Basic-auth header. This matches Bitcoin Core's behaviour, where
 /// `-rpcuser`/`-rpcpassword`, `-rpcauth=` (repeatable), and the
 /// auto-generated cookie all open the door simultaneously.
-#[derive(Debug, Clone)]
+///
+/// The credential set is held behind a `RwLock` so a SIGHUP config
+/// reload can rotate the `-rpcuser`/`-rpcpassword`/`-rpcauth`
+/// credentials live ([`reload_credentials`](Self::reload_credentials))
+/// without dropping the shared `Arc<RpcAuth>` the listener surfaces
+/// hold. `validate` takes a read lock per request (cheap, concurrent);
+/// the reload path takes a brief write lock. The auto-generated cookie
+/// credential is preserved across reloads.
+#[derive(Debug)]
 pub enum RpcAuth {
     Disabled,
-    Verify(Credentials),
+    Verify(RwLock<Credentials>),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -61,10 +70,10 @@ impl RpcAuth {
     /// Build the legacy single-userpass form. Retained for call sites
     /// (and tests) that don't yet need multi-credential support.
     pub fn from_user_pass(username: String, password: String) -> Self {
-        RpcAuth::Verify(Credentials {
+        RpcAuth::Verify(RwLock::new(Credentials {
             userpass: vec![UserPassCredential { username, password }],
             ..Default::default()
-        })
+        }))
     }
 
     /// Generate the cookie file at the given path with `perms` (octal),
@@ -138,10 +147,10 @@ impl RpcAuth {
             perms = format!("0{:o}", perms),
             "Cookie file written"
         );
-        Ok(RpcAuth::Verify(Credentials {
+        Ok(RpcAuth::Verify(RwLock::new(Credentials {
             cookie: Some(CookieCredential { path, token }),
             ..Default::default()
-        }))
+        })))
     }
 
     /// Convenience for the legacy default path (`$DATADIR/.cookie`,
@@ -156,10 +165,11 @@ impl RpcAuth {
     /// the rpcauth path; cookie / userpass comparisons are plain
     /// `==` (the secret length is fixed and known to the operator).
     pub fn validate(&self, auth_header: &str) -> bool {
-        let creds = match self {
+        let guard = match self {
             RpcAuth::Disabled => return true,
-            RpcAuth::Verify(c) => c,
+            RpcAuth::Verify(c) => c.read(),
         };
+        let creds = &*guard;
         let encoded = match auth_header.strip_prefix("Basic ") {
             Some(e) => e,
             None => return false,
@@ -217,12 +227,45 @@ impl RpcAuth {
 
     /// Delete the cookie file on shutdown.
     pub fn cleanup(&self) {
-        if let RpcAuth::Verify(creds) = self
-            && let Some(c) = &creds.cookie
+        if let RpcAuth::Verify(lock) = self
+            && let Some(c) = &lock.read().cookie
             && c.path.exists()
         {
             let _ = std::fs::remove_file(&c.path);
             tracing::info!("Cookie file removed");
+        }
+    }
+
+    /// Rotate the `-rpcuser`/`-rpcpassword` (userpass) and `-rpcauth`
+    /// credentials live, preserving the auto-generated cookie credential.
+    /// Driven by SIGHUP config reload. No-op on `Disabled`.
+    ///
+    /// The cookie is intentionally NOT touched: it is generated (and its
+    /// file written with restrictive perms) once at startup, and `sat-cli`'s
+    /// no-flag default depends on it. The cookie *file path/perms* remain
+    /// restart-only.
+    ///
+    /// If the rotation leaves zero credentials of any kind (e.g. the operator
+    /// removed `rpcuser`/`rpcpassword` from a node that was started without a
+    /// cookie), a warning is logged: the RPC surface is now unauthenticatable
+    /// until a credential is restored or the daemon is restarted (a restart
+    /// would regenerate the cookie).
+    pub fn reload_credentials(
+        &self,
+        userpass: Vec<UserPassCredential>,
+        rpcauth: Vec<RpcAuthCredential>,
+    ) {
+        if let RpcAuth::Verify(lock) = self {
+            let mut creds = lock.write();
+            creds.userpass = userpass;
+            creds.rpcauth = rpcauth;
+            if creds.cookie.is_none() && creds.userpass.is_empty() && creds.rpcauth.is_empty() {
+                tracing::warn!(
+                    "RPC credential reload left no credentials configured — the RPC \
+                     interface is now inaccessible until a credential is restored or \
+                     the daemon is restarted (restart regenerates the cookie)"
+                );
+            }
         }
     }
 }
@@ -331,13 +374,13 @@ mod tests {
     use super::*;
 
     fn cookie_auth(token: &str) -> RpcAuth {
-        RpcAuth::Verify(Credentials {
+        RpcAuth::Verify(RwLock::new(Credentials {
             cookie: Some(CookieCredential {
                 path: PathBuf::from("/tmp/test.cookie"),
                 token: token.to_string(),
             }),
             ..Default::default()
-        })
+        }))
     }
 
     #[test]
@@ -381,14 +424,14 @@ mod tests {
         let hash =
             hex::decode("9383f6d244049af54e59a84188e2f2b1e58ff20de019156bc0c430ff8ae4c7a3")
                 .unwrap();
-        let auth = RpcAuth::Verify(Credentials {
+        let auth = RpcAuth::Verify(RwLock::new(Credentials {
             rpcauth: vec![RpcAuthCredential {
                 username: "alice".to_string(),
                 salt,
                 hash,
             }],
             ..Default::default()
-        });
+        }));
         let ok = BASE64.encode("alice:hunter2longpassword");
         assert!(auth.validate(&format!("Basic {}", ok)));
         let bad_pass = BASE64.encode("alice:wrong");
@@ -403,7 +446,7 @@ mod tests {
         let mut mac = HmacSha256::new_from_slice(salt.as_bytes()).unwrap();
         mac.update(b"p4ss");
         let hash = mac.finalize().into_bytes().to_vec();
-        let auth = RpcAuth::Verify(Credentials {
+        let auth = RpcAuth::Verify(RwLock::new(Credentials {
             cookie: Some(CookieCredential {
                 path: PathBuf::from("/tmp/x.cookie"),
                 token: "tok".to_string(),
@@ -417,7 +460,7 @@ mod tests {
                 salt,
                 hash,
             }],
-        });
+        }));
         let cookie_ok = BASE64.encode("__cookie__:tok");
         let userpass_ok = BASE64.encode("alice:secret");
         let rpcauth_ok = BASE64.encode("bob:p4ss");
@@ -426,6 +469,45 @@ mod tests {
         assert!(auth.validate(&format!("Basic {}", rpcauth_ok)));
         let none = BASE64.encode("eve:noway");
         assert!(!auth.validate(&format!("Basic {}", none)));
+    }
+
+    #[test]
+    fn test_reload_credentials_rotates_userpass_keeps_cookie() {
+        // Start with cookie + alice:secret.
+        let auth = RpcAuth::Verify(RwLock::new(Credentials {
+            cookie: Some(CookieCredential {
+                path: PathBuf::from("/tmp/reload.cookie"),
+                token: "tok".to_string(),
+            }),
+            userpass: vec![UserPassCredential {
+                username: "alice".to_string(),
+                password: "secret".to_string(),
+            }],
+            ..Default::default()
+        }));
+        let alice = BASE64.encode("alice:secret");
+        let cookie = BASE64.encode("__cookie__:tok");
+        assert!(auth.validate(&format!("Basic {}", alice)));
+        assert!(auth.validate(&format!("Basic {}", cookie)));
+
+        // Reload: rotate to bob:newpass, drop alice. Cookie must survive.
+        auth.reload_credentials(
+            vec![UserPassCredential {
+                username: "bob".to_string(),
+                password: "newpass".to_string(),
+            }],
+            vec![],
+        );
+        let bob = BASE64.encode("bob:newpass");
+        assert!(auth.validate(&format!("Basic {}", bob)), "new cred works");
+        assert!(
+            !auth.validate(&format!("Basic {}", alice)),
+            "old userpass revoked"
+        );
+        assert!(
+            auth.validate(&format!("Basic {}", cookie)),
+            "cookie preserved across reload"
+        );
     }
 
     #[test]

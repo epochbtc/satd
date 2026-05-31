@@ -31,6 +31,7 @@ use crate::config::{self, Config};
 use node::index::address::SubscriptionRegistry;
 use node::mempool::pool::{Mempool, MempoolConfig};
 use node::net::manager::PeerManager;
+use node::rpc::auth::{RpcAuth, RpcAuthCredential, UserPassCredential};
 use parking_lot::RwLock;
 use std::sync::Arc;
 use tracing_subscriber::{EnvFilter, Registry};
@@ -172,6 +173,10 @@ pub struct ReloadHandles {
     /// case a webhook config change cannot take effect — `apply_webhook` warns
     /// rather than letting the generic "applied live" line mislead the operator.
     pub webhook: Option<SharedWebhook>,
+    /// RPC auth handle — its `-rpcuser`/`-rpcpassword`/`-rpcauth` credentials
+    /// are rotatable live (the cookie is preserved). Shared with every RPC
+    /// listener surface, so a reload covers all of them at once.
+    pub rpc_auth: Arc<RpcAuth>,
 }
 
 /// Apply a reorg-webhook config change to the running dispatcher. Shared by the
@@ -187,6 +192,39 @@ fn apply_webhook(c: &Config, h: &ReloadHandles) {
              effect until the daemon is restarted"
         ),
     }
+}
+
+/// Rebuild the live-rotatable RPC credentials (userpass + rpcauth) from a
+/// config. Mirrors the startup construction in `main`: a userpass credential
+/// exists only when BOTH `-rpcuser` and `-rpcpassword` are set; each `-rpcauth`
+/// line becomes one HMAC credential. The cookie is NOT rebuilt here — it is
+/// generated once at startup and preserved across reloads.
+fn rebuild_rpc_credentials(c: &Config) -> (Vec<UserPassCredential>, Vec<RpcAuthCredential>) {
+    let userpass = match (&c.rpcuser, &c.rpcpassword) {
+        (Some(user), Some(pass)) => vec![UserPassCredential {
+            username: user.clone(),
+            password: pass.clone(),
+        }],
+        _ => vec![],
+    };
+    let rpcauth = c
+        .rpcauth
+        .iter()
+        .map(|e| RpcAuthCredential {
+            username: e.username.clone(),
+            salt: e.salt.clone(),
+            hash: e.hash.clone(),
+        })
+        .collect();
+    (userpass, rpcauth)
+}
+
+/// Apply the RPC credential set from `c` to the running auth handle. Shared by
+/// the `rpcuser`/`rpcpassword`/`rpcauth` specs (any one changing rebuilds the
+/// whole set — idempotent).
+fn apply_rpc_credentials(c: &Config, h: &ReloadHandles) {
+    let (userpass, rpcauth) = rebuild_rpc_credentials(c);
+    h.rpc_auth.reload_credentials(userpass, rpcauth);
 }
 
 /// Map a `Config` to the mempool's `MempoolConfig`. Single source of truth for
@@ -367,9 +405,9 @@ fn field_specs() -> Vec<FieldSpec> {
         restart!("rpcport", rpcport),
         restart!("rpcbind", rpcbind),
         restart!("rpcallowip", rpcallowip),
-        restart_secret!("rpcuser", rpcuser),
-        restart_secret!("rpcpassword", rpcpassword),
-        restart_secret!("rpcauth", rpcauth),
+        live_secret!("rpcuser", rpcuser, apply_rpc_credentials),
+        live_secret!("rpcpassword", rpcpassword, apply_rpc_credentials),
+        live_secret!("rpcauth", rpcauth, apply_rpc_credentials),
         restart!("rpccookiefile", rpc_cookie_file),
         restart!("rpccookieperms", rpc_cookie_perms),
         restart!("rpcdisableauth", rpc_disable_auth),
@@ -849,14 +887,17 @@ mod tests {
             );
         }
         // Secrets wired into long-lived startup state stay restart-only.
-        for key in ["rpcuser", "rpcpassword", "rpcauth", "torpassword", "esplorauserpass"] {
+        for key in ["torpassword", "esplorauserpass"] {
             assert!(find(key).apply.is_none(), "{key:?} must be restart-only");
         }
-        // The reorg-webhook secret is applied live (the dispatcher reads it
-        // from shared state per record) — it must still be redacted.
-        assert!(
-            find("reorgwebhooksecret").apply.is_some(),
-            "reorgwebhooksecret should be live (dispatcher reads shared target)"
-        );
+        // Live-rotatable secrets: applied live but still redacted in the
+        // report. RPC credentials rotate via the shared auth handle; the
+        // reorg-webhook secret via the shared dispatcher target.
+        for key in ["rpcuser", "rpcpassword", "rpcauth", "reorgwebhooksecret"] {
+            assert!(
+                find(key).apply.is_some(),
+                "{key:?} should be live (rotatable without restart)"
+            );
+        }
     }
 }

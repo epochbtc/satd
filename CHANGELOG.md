@@ -28,10 +28,13 @@ layout) per `STABILITY_POLICY.md`.
   dialed immediately, existing connections untouched), compact-filter serving
   (`-peerblockfilters`), the address-index subscription cap
   (`-addrindexsubscriptions`), the reorg webhook
-  (`-reorgwebhook`/`-reorgwebhooksecret`), and the shutdown knobs
+  (`-reorgwebhook`/`-reorgwebhooksecret`), the shutdown knobs
   (`-persistmempool`/`-maxshutdownsecs`, which take effect at the next
-  shutdown). Mempool-policy changes govern subsequent transaction admissions;
-  connection/ban-limit changes apply to new connections and future bans.
+  shutdown), and RPC credentials (`-rpcuser`/`-rpcpassword`/`-rpcauth` rotate
+  live on every listener surface; the auto-generated cookie is preserved, and
+  the credential values stay redacted in the reload log). Mempool-policy
+  changes govern subsequent transaction admissions; connection/ban-limit
+  changes apply to new connections and future bans.
   Settings wired into long-lived state at startup that cannot change without
   restarting the relevant socket/engine/process — network, `datadir`,
   ports/binds, `-dbcache`, index enable/disable, TLS material, DNS-seed

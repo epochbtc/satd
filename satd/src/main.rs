@@ -229,7 +229,7 @@ async fn main() {
             config.rpc_cookie_perms.as_mode(),
         ) {
             Ok(node::rpc::auth::RpcAuth::Verify(c)) => {
-                credentials.cookie = c.cookie;
+                credentials.cookie = c.into_inner().cookie;
             }
             Ok(_) => unreachable!("generate_cookie_with always returns Verify"),
             Err(e) => {
@@ -251,7 +251,7 @@ async fn main() {
             hash: entry.hash.clone(),
         });
     }
-    let auth = Arc::new(RpcAuth::Verify(credentials));
+    let auth = Arc::new(RpcAuth::Verify(parking_lot::RwLock::new(credentials)));
 
     // Start a lightweight startup-status RPC server on each operator-
     // configured bind. The TUI talks to it via the first loopback
@@ -2171,6 +2171,7 @@ async fn main() {
         log_filter: log_reload_handle,
         addr_sub_registry: address_index_concrete.subscription_registry(),
         webhook: reorg_webhook_handle,
+        rpc_auth: auth.clone(),
     };
     loop {
         tokio::select! {
