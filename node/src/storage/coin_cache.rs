@@ -306,6 +306,45 @@ impl CoinCache {
     pub fn clean_cap(&self) -> usize {
         self.clean.lock().cap().get()
     }
+
+    /// Discard every uncommitted (un-flushed) cache mutation, returning the
+    /// cache to exactly the last-flushed on-disk state held by the inner
+    /// store. Does NOT touch the inner store.
+    ///
+    /// This is the rollback primitive for the atomic-reorg path (issue
+    /// #262). The reorg driver flushes the pre-reorg active chain to the
+    /// inner store first, then applies the whole reorg (disconnect +
+    /// reconnect + triggering connect) to this cache *only*. On any failure
+    /// it calls this to drop the partial reorg wholesale — no block-body
+    /// replay, and it cannot itself fail. Because the inner store already
+    /// holds the pre-reorg chain, clearing the dirty map, the buffered
+    /// non-coin batch, the pending tip, the running deltas, and the
+    /// read-through overlays is sufficient and exact: every subsequent read
+    /// falls through to the inner store's pre-reorg state.
+    ///
+    /// Mirrors `clear_chainstate` but deliberately omits the
+    /// `inner.clear_chainstate()` call — the inner store must be preserved.
+    pub fn discard_uncommitted(&self) {
+        self.dirty.write().clear();
+        self.dirty_count.store(0, Ordering::Relaxed);
+        self.count_delta.store(0, Ordering::Relaxed);
+        self.amount_delta.store(0, Ordering::Relaxed);
+        *self.pending_tip.lock() = None;
+        *self.pending_batch.lock() = StoreBatch::default();
+        self.block_index_cache.lock().clear();
+        self.height_hash_cache.lock().clear();
+        self.undo_cache.lock().clear();
+        self.tx_index_cache.lock().clear();
+        self.chain_tx_cache.lock().clear();
+        // Clean LRU holds only coins read from / promoted to the inner
+        // store, never reorg-tentative values (no mid-reorg flush promotes
+        // into it). Clearing is not required for correctness — reads fall
+        // through to the dirty map (now empty) then the inner store — but
+        // we clear it to keep the post-abort cache free of any entry the
+        // discarded reorg popped and never repopulated, matching
+        // clear_chainstate's behavior.
+        self.clean.lock().clear();
+    }
 }
 
 impl Store for CoinCache {
@@ -2236,5 +2275,60 @@ mod tests {
         let from_inner = cache.get_block_index(&hash).unwrap();
         assert_eq!(from_inner.status, BlockStatus::DataStored);
         assert_eq!(from_inner.file_number, 3);
+    }
+
+    // ---------------------------------------------------------------
+    // discard_uncommitted: the atomic-reorg rollback primitive (#262)
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_discard_uncommitted_restores_flushed_state() {
+        let cache = make_cache(10);
+
+        // Committed (flushed) baseline: coin X exists on disk.
+        let x = make_outpoint(0xC0, 0);
+        let mut base = StoreBatch::default();
+        base.coin_puts.push((x, make_coin(5_000, 1)));
+        base.tip = Some(make_block_hash(0x01));
+        cache.write_batch(base).unwrap();
+        cache.flush().unwrap();
+        assert_eq!(cache.dirty_count(), 0);
+        let base_count = cache.coin_count();
+
+        // Uncommitted reorg-style delta: create a FRESH coin Y, spend the
+        // committed coin X, and advance the pending tip — none flushed.
+        let y = make_outpoint(0xC1, 0);
+        let mut delta = StoreBatch::default();
+        delta.coin_puts.push((y, make_coin(7_000, 2)));
+        delta.coin_removes.push((x, 5_000, 1));
+        delta.tip = Some(make_block_hash(0x02));
+        cache.write_batch(delta).unwrap();
+        assert!(cache.dirty_count() > 0, "delta is dirty before discard");
+        assert!(cache.get_coin(&y).is_some(), "fresh coin visible pre-discard");
+        assert!(cache.get_coin(&x).is_none(), "X spent in the delta pre-discard");
+        assert_eq!(cache.get_tip(), Some(make_block_hash(0x02)));
+
+        // Discard the delta: cache returns to exactly the flushed state.
+        cache.discard_uncommitted();
+        assert_eq!(cache.dirty_count(), 0, "no dirty entries after discard");
+        assert!(
+            cache.get_coin(&y).is_none(),
+            "FRESH coin from the discarded delta must be gone"
+        );
+        assert!(
+            cache.get_coin(&x).is_some(),
+            "committed coin X must be restored (the spend was discarded)"
+        );
+        assert_eq!(cache.get_tip(), Some(make_block_hash(0x01)), "tip back to flushed");
+        assert_eq!(cache.coin_count(), base_count, "coin_count back to baseline");
+
+        // A subsequent flush must NOT elide or drop the restored coin —
+        // the exact failure the fix prevents.
+        cache.flush().unwrap();
+        assert!(
+            cache.get_coin(&x).is_some(),
+            "committed coin survives the post-discard flush"
+        );
+        assert!(cache.get_coin(&y).is_none(), "discarded coin stays gone after flush");
+        assert_eq!(cache.coin_count(), base_count);
     }
 }
