@@ -2565,6 +2565,16 @@ fn send_sighup(node: &TestNode) {
     assert!(status.success(), "kill -HUP returned {status:?}");
 }
 
+/// Send SIGUSR1 (TLS certificate reload) to a running test node.
+fn send_sigusr1(node: &TestNode) {
+    let status = Command::new("kill")
+        .arg("-USR1")
+        .arg(node.process.id().to_string())
+        .status()
+        .expect("spawn kill -USR1");
+    assert!(status.success(), "kill -USR1 returned {status:?}");
+}
+
 #[test]
 fn test_sighup_config_reload_applies_and_survives_bad_config() {
     // satd repurposes SIGHUP (Bitcoin Core reopens debug.log; satd has none and
@@ -9884,6 +9894,91 @@ fn test_rpc_tls_round_trip() {
         .send()
         .expect("HTTPS unauth request");
     assert_eq!(resp.status(), 401);
+
+    node.stop();
+}
+
+/// End-to-end: SIGUSR1 hot-reloads the RPC TLS certificate from its
+/// configured path WITHOUT a restart. Boots with cert A, rotates the cert
+/// files in place to cert B (as cert-manager would on a short-TTL renewal),
+/// sends SIGUSR1, and proves new handshakes serve cert B while the old cert
+/// is no longer accepted — the bound socket never changes.
+#[test]
+fn test_sigusr1_reloads_tls_cert_in_place() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (cert_path, key_path) = mint_test_tls_cert(tmp.path());
+    // Keep a copy of cert A so we can build a client that trusts ONLY the old
+    // cert after rotation (the live files will hold cert B by then).
+    let cert_a_copy = tmp.path().join("cert-a.pem");
+    std::fs::copy(&cert_path, &cert_a_copy).unwrap();
+
+    let tls_port = find_available_port();
+    let tls_bind = format!("127.0.0.1:{}", tls_port);
+    let url = format!("https://localhost:{}/", tls_port);
+
+    let mut node = TestNode::start(&[
+        &format!("--rpctlsbind={}", tls_bind),
+        &format!("--rpctlscert={}", cert_path.display()),
+        &format!("--rpctlskey={}", key_path.display()),
+    ]);
+    let auth = base64::engine::general_purpose::STANDARD.encode(node.cookie.trim());
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"getblockchaininfo"}"#;
+
+    // Cert A: a successful HTTPS round-trip.
+    let resp: serde_json::Value = https_client(&cert_path)
+        .post(&url)
+        .header("Authorization", format!("Basic {}", auth))
+        .header("Content-Type", "application/json")
+        .body(body)
+        .send()
+        .expect("HTTPS with cert A")
+        .json()
+        .expect("json");
+    assert_eq!(resp["result"]["chain"].as_str(), Some("regtest"));
+
+    // Rotate the cert + key IN PLACE (same paths) to a fresh self-signed cert.
+    let cert_b = rcgen::generate_simple_self_signed(["localhost".to_string()]).unwrap();
+    std::fs::write(&cert_path, cert_b.cert.pem()).unwrap();
+    std::fs::write(&key_path, cert_b.key_pair.serialize_pem()).unwrap();
+
+    send_sigusr1(&node);
+
+    // New handshakes must serve cert B. Reload is async, so poll with a FRESH
+    // client per attempt (new connection => new handshake). `https_client`
+    // re-reads the (now cert-B) file, so it trusts cert B.
+    let mut served_b = false;
+    for _ in 0..50 {
+        let r = https_client(&cert_path)
+            .post(&url)
+            .header("Authorization", format!("Basic {}", auth))
+            .header("Content-Type", "application/json")
+            .body(body)
+            .send();
+        if matches!(&r, Ok(resp) if resp.status().is_success()) {
+            served_b = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        served_b,
+        "after SIGUSR1, new handshakes should serve the rotated (cert B) certificate"
+    );
+
+    // A client that trusts ONLY the old cert A must now fail: the server
+    // presents cert B, which is not signed by cert A. This proves the cert
+    // genuinely changed (not a stale-connection false pass).
+    let old_trust = https_client(&cert_a_copy);
+    let r = old_trust
+        .post(&url)
+        .header("Authorization", format!("Basic {}", auth))
+        .header("Content-Type", "application/json")
+        .body(body)
+        .send();
+    assert!(
+        r.is_err(),
+        "a client trusting only the pre-rotation cert must fail the TLS handshake after reload"
+    );
 
     node.stop();
 }

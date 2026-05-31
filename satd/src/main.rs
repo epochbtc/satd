@@ -2164,6 +2164,13 @@ async fn main() {
     // coalesces and yields it on the next poll.
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
         .expect("Failed to register SIGINT handler");
+    // SIGUSR1 reloads TLS certificates from their configured paths (the leaf
+    // cert/key only — same paths, no rebind). Dedicated signal, separate from
+    // SIGHUP config reload, so automated short-TTL cert rotation (cert-manager
+    // hooks, systemd path units) can refresh certs cheaply and without running
+    // the full config diff/apply machinery.
+    let mut sigusr1 = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
+        .expect("Failed to register SIGUSR1 handler");
     let reload_handles = reload::ReloadHandles {
         cli: cli_snapshot,
         mempool: mempool.clone(),
@@ -2196,6 +2203,9 @@ async fn main() {
             _ = sighup.recv() => {
                 tracing::info!("SIGHUP received — reloading config");
                 config = reload::reload_from_sighup(&reload_handles, &config);
+            }
+            _ = sigusr1.recv() => {
+                reload_tls_certificates();
             }
         }
     }
@@ -2425,6 +2435,37 @@ async fn start_startup_rpc(
         handles.push(handle);
     }
     StartupRpcHandle { handles }
+}
+
+/// Reload all TLS surfaces' leaf certificates from their configured paths, in
+/// response to SIGUSR1. Each surface reloads independently; a failure keeps
+/// that surface's previous (still-valid) cert and is logged, never fatal. New
+/// handshakes use the new cert; in-flight connections keep theirs.
+fn reload_tls_certificates() {
+    if tls_config::registered_cert_count() == 0 {
+        tracing::info!("SIGUSR1 received — no TLS surfaces configured, nothing to reload");
+        return;
+    }
+    tracing::info!("SIGUSR1 received — reloading TLS certificates from configured paths");
+    let mut reloaded = 0usize;
+    let mut failed = 0usize;
+    for outcome in tls_config::reload_all_certs() {
+        match outcome.result {
+            Ok(()) => {
+                reloaded += 1;
+                tracing::info!(cert = %outcome.cert_path.display(), "TLS certificate reloaded");
+            }
+            Err(e) => {
+                failed += 1;
+                tracing::error!(
+                    cert = %outcome.cert_path.display(),
+                    error = %e,
+                    "TLS certificate reload failed — keeping the previous certificate"
+                );
+            }
+        }
+    }
+    tracing::info!(reloaded, failed, "TLS certificate reload complete");
 }
 
 /// Forwards reorg records to the configured HTTP webhook. Best effort —

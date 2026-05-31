@@ -3506,6 +3506,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tikv-jemallocator",
+ "tls-config",
  "tokio",
  "tower 0.5.3",
  "tracing",
