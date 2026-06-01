@@ -38,6 +38,13 @@
 //!   * `bad-txns-BIP30`   — duplicate-unspent-txid (BIP30) check.
 //!   * `time-too-new`     — 2-hour-ahead future-timestamp rejection.
 //!   * `bad-version`      — mandatory block-version gate (BIP34/66/65).
+//!
+//! The deeper code-path equivalence audit (vs Core v28) then surfaced two
+//! further divergences, currently OPEN `Expect::Gap` cases pending fixes:
+//!   * `bad-txns-duplicate` — merkle-tree mutation / CVE-2012-2459 not detected
+//!     by `check_block` (caught later as a double-spend, wrong stage/reason).
+//!   * `bad-txns-oversize`  — no per-transaction weight cap in
+//!     `check_transaction` (block-weight covers the block path only).
 
 use bitcoin::absolute::LockTime;
 use bitcoin::block::Header;
@@ -83,12 +90,8 @@ enum Expect {
     /// The string is the reason satd currently emits.
     ReasonDiffers(&'static str),
     /// Core rejects but satd accepts — a known, unclosed consensus gap.
-    ///
-    /// No case currently uses this (all gaps this suite surfaced are now
-    /// enforced), but it is a permanent part of the matrix's vocabulary:
-    /// the next gap a new case uncovers is declared `Gap`, and the runner
-    /// keeps it pinned open until a fix closes it. Retained deliberately.
-    #[allow(dead_code)]
+    /// The runner keeps it pinned open and fails the day a fix closes it,
+    /// forcing promotion to `Match`.
     Gap,
 }
 
@@ -531,6 +534,44 @@ fn case_gap_block_version() -> Satd {
     check_block_version(&b.header, 1, Network::Regtest).map_err(|e| e.to_string())
 }
 
+// -- audit-discovered edge cases (deeper than feature_block.py) --
+
+fn case_merkle_mutation_cve_2012_2459() -> Satd {
+    // CVE-2012-2459: a block whose tx list ends in a duplicated subtree has
+    // the SAME merkle root as the honest list, because the odd-node
+    // duplication in `[cb, t1, t2]` produces the identical tree as the
+    // explicit `[cb, t1, t2, t2]`. Core's CheckBlock computes a `mutated`
+    // flag and rejects `bad-txns-duplicate`; satd's check_block only compares
+    // the recomputed root (which matches), so it ACCEPTS — the duplicate is
+    // only caught later in connect_block as a double-spend (wrong stage and
+    // reason). Gap.
+    let t1 = spending_tx(OutPoint { txid: Txid::from_byte_array([0x11; 32]), vout: 0 }, 1_000, 1, 0xffff_ffff, 0);
+    let t2 = spending_tx(OutPoint { txid: Txid::from_byte_array([0x22; 32]), vout: 0 }, 1_000, 1, 0xffff_ffff, 0);
+    let b = block_of(vec![coinbase(1, 50_0000_0000), t1, t2.clone(), t2]);
+    cb(&b)
+}
+
+fn case_tx_oversize() -> Satd {
+    // A single transaction whose no-witness serialized size * 4 exceeds
+    // MAX_BLOCK_WEIGHT. Core's CheckTransaction rejects `bad-txns-oversize`;
+    // satd's check_transaction has no per-tx size cap, so it ACCEPTS. (In the
+    // block path the block-weight check catches it; standalone — e.g.
+    // sendrawtransaction — satd diverges.) Gap.
+    let big = bitcoin::ScriptBuf::from(vec![0x00; 1_100_000]); // ~1.1 MB; *4 > 4 M WU
+    let t = Transaction {
+        version: Version::ONE,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint { txid: Txid::from_byte_array([0xab; 32]), vout: 0 },
+            script_sig: bitcoin::ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::default(),
+        }],
+        output: vec![TxOut { value: Amount::from_sat(1_000), script_pubkey: big }],
+    };
+    tx(&t)
+}
+
 // ── The matrix ────────────────────────────────────────────────────────
 
 fn cases() -> Vec<Case> {
@@ -573,6 +614,10 @@ fn cases() -> Vec<Case> {
         Case { name: "bip30_duplicate_txid", core: Reject("bad-txns-BIP30"), expect: Match, run: case_gap_bip30 },
         Case { name: "time_too_new", core: Reject("time-too-new"), expect: Match, run: case_gap_time_too_new },
         Case { name: "block_version", core: Reject("bad-version(0x00000001)"), expect: Match, run: case_gap_block_version },
+        // Audit-discovered gaps (Core rejects, satd accepts) — pending fixes.
+        // See the monorepo block-handling equivalence audit (findings A, F).
+        Case { name: "merkle_mutation_cve_2012_2459", core: Reject("bad-txns-duplicate"), expect: Gap, run: case_merkle_mutation_cve_2012_2459 },
+        Case { name: "tx_oversize", core: Reject("bad-txns-oversize"), expect: Gap, run: case_tx_oversize },
     ]
 }
 
