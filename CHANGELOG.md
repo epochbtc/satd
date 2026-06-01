@@ -107,8 +107,24 @@ layout) per `STABILITY_POLICY.md`.
   plus the documented BIP68 reject-label difference where both nodes reject);
   the run also re-validates the Phase B reject strings against the live node.
   Wired as the PR-gating `canary / Bitcoin Core block-acceptance differential`
-  job. Layer 1 of the live differential harness (a generative cargo-fuzz target
-  is the planned follow-up).
+  job. Layer 1 of the live differential harness.
+- **In-process consensus fuzzer with a live Core oracle (Phase C, Layer 2).** A
+  cargo-fuzz/libFuzzer target (`fuzz/fuzz_targets/block_differential.rs`,
+  standalone workspace excluded from the normal build) mutates raw bytes into a
+  `Block`, fixes the header connectivity fields so it builds on the shared
+  genesis tip with valid PoW/time, then runs satd's **real** validation
+  IN-PROCESS (`check_block` + `check_block_version` + `connect_block` with the
+  bitcoinconsensus script verifier) — so libFuzzer's coverage feedback is
+  driven by satd's actual consensus code and a satd panic is caught directly —
+  and submits the identical bytes to a resident `bitcoind` as the accept/reject
+  oracle. It asserts **verdict (accept/reject) parity**, not reason parity: a
+  randomly-mutated block usually violates several rules at once and the two
+  implementations legitimately report different first-fault reasons by check
+  order, so reason parity stays the curated Layer-1 cases' job. A divergence
+  dumps the block hex and aborts (libFuzzer records the input). Runs as the
+  nightly/on-demand `Bitcoin Core block-acceptance fuzz` workflow (not
+  PR-gating), seeded by `gen_corpus`; a 12.7k-run smoke against Core v27 found
+  zero divergences.
 
 ### Operator
 
