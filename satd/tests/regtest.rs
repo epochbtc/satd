@@ -10603,3 +10603,183 @@ fn test_rpc_disableauth_without_mtls_aborts_startup() {
 
     let _ = std::fs::remove_dir_all(&datadir);
 }
+
+/// The opt-in read-only RPC listener (`-rpcreadonlybind`) serves reads +
+/// mempool-submit and rejects block-connecting / control methods, while the
+/// main listener keeps serving everything. Enabling the read-only listener
+/// also exercises the fail-closed completeness audit (a `debug_assert` in
+/// `rpc::server::start`) over every registered method, so an unclassified
+/// method would panic this test rather than ship.
+#[test]
+fn test_readonly_rpc_listener_filters_methods() {
+    let ro_port = find_available_port();
+    let node = TestNode::start(&[&format!("--rpcreadonlybind=127.0.0.1:{ro_port}")]);
+
+    // POST a JSON-RPC call to an arbitrary port using the node's cookie.
+    let call = |port: u16, method: &str, params: serde_json::Value| -> serde_json::Value {
+        let url = format!("http://127.0.0.1:{port}/");
+        let (user, pass) = node
+            .cookie
+            .split_once(':')
+            .unwrap_or(("__cookie__", "none"));
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+        let body = serde_json::json!({
+            "jsonrpc": "2.0", "id": "t", "method": method, "params": params,
+        });
+        client
+            .post(&url)
+            .basic_auth(user, Some(pass))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .unwrap()
+            .json()
+            .unwrap()
+    };
+
+    // The read-only listener binds during start() but its accept loop spins
+    // up on the API runtime; wait until it is accepting connections.
+    let mut ready = false;
+    for _ in 0..50 {
+        let url = format!("http://127.0.0.1:{ro_port}/");
+        if reqwest::blocking::Client::new()
+            .post(&url)
+            .body("")
+            .timeout(Duration::from_secs(2))
+            .send()
+            .is_ok()
+        {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(ready, "read-only listener never came up on {ro_port}");
+
+    // 1. Allowed read is served on the read-only listener.
+    let r = call(ro_port, "getblockcount", serde_json::json!([]));
+    assert_eq!(r["result"], 0, "getblockcount on RO listener: {r}");
+
+    // 2. Block-connecting method is rejected on the RO listener. The filter
+    //    runs before dispatch, so the params are irrelevant.
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let r = call(ro_port, "generatetoaddress", serde_json::json!([1, addr]));
+    assert_eq!(
+        r["error"]["code"], -32001,
+        "generatetoaddress must be filtered on RO listener: {r}"
+    );
+    assert!(
+        r["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("read-only"),
+        "rejection message should explain the read-only listener: {r}"
+    );
+
+    // 3. Control method is rejected — and the node stays up, because `stop`
+    //    never reaches the handler.
+    let r = call(ro_port, "stop", serde_json::json!([]));
+    assert_eq!(r["error"]["code"], -32001, "stop must be filtered: {r}");
+
+    // 4. Mempool submit passes the filter: junk hex fails later decode/
+    //    validation, but NOT with the read-only rejection code.
+    let r = call(ro_port, "sendrawtransaction", serde_json::json!(["00"]));
+    assert!(
+        r.get("error").is_some(),
+        "sendrawtransaction on junk should error: {r}"
+    );
+    assert_ne!(
+        r["error"]["code"], -32001,
+        "sendrawtransaction must pass the RO filter (fail on validation, not the filter): {r}"
+    );
+
+    // 5. The MAIN listener has no filter: the same block-connecting method
+    //    is dispatched and actually mines, proving the split.
+    let r = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(1), serde_json::json!(addr)],
+        )
+        .unwrap();
+    assert!(
+        r.get("result").is_some() && r["error"].is_null(),
+        "generatetoaddress on the main listener should work: {r}"
+    );
+
+    // The mined block is visible through the read-only listener too.
+    let r = call(ro_port, "getblockcount", serde_json::json!([]));
+    assert_eq!(r["result"], 1, "RO listener should see the mined block: {r}");
+}
+
+/// The read-only listener supports TLS like every other API surface:
+/// `-rpcreadonlytlsbind` + cert + key boots an HTTPS read-only surface that
+/// authenticates, serves reads, and applies the same read-only method filter
+/// (block-connecting methods are rejected over TLS too).
+#[test]
+fn test_readonly_rpc_tls_round_trip() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (cert_path, key_path) = mint_test_tls_cert(tmp.path());
+    let tls_port = find_available_port();
+    let tls_bind = format!("127.0.0.1:{}", tls_port);
+
+    let mut node = TestNode::start(&[
+        &format!("--rpcreadonlytlsbind={}", tls_bind),
+        &format!("--rpcreadonlytlscert={}", cert_path.display()),
+        &format!("--rpcreadonlytlskey={}", key_path.display()),
+    ]);
+
+    // The main plain-HTTP listener is unaffected.
+    let info = node.rpc_call("getblockchaininfo").expect("plain HTTP rpc");
+    assert_eq!(info["result"]["chain"].as_str(), Some("regtest"));
+
+    // Trust the self-signed cert (real chain check, not validation-disabled).
+    let cert_pem = std::fs::read(&cert_path).unwrap();
+    let root = reqwest::Certificate::from_pem(&cert_pem).unwrap();
+    let basic = base64::engine::general_purpose::STANDARD.encode(node.cookie.trim());
+    let client = reqwest::blocking::Client::builder()
+        .add_root_certificate(root)
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let url = format!("https://localhost:{}/", tls_port);
+    let https = |method: &str| -> serde_json::Value {
+        client
+            .post(&url)
+            .header("Authorization", format!("Basic {}", basic))
+            .header("Content-Type", "application/json")
+            .body(format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":"{method}"}}"#
+            ))
+            .send()
+            .expect("HTTPS request")
+            .json()
+            .expect("HTTPS response JSON")
+    };
+
+    // A read is served over the read-only TLS surface.
+    let r = https("getblockchaininfo");
+    assert_eq!(r["result"]["chain"].as_str(), Some("regtest"));
+
+    // The read-only method filter applies over TLS too: a control method is
+    // rejected with the read-only rejection code, not dispatched.
+    let r = https("stop");
+    assert_eq!(
+        r["error"]["code"], -32001,
+        "stop must be filtered on the read-only TLS surface: {r}"
+    );
+
+    // No-auth HTTPS request is rejected by the Basic-auth layer (auth is the
+    // HTTP layer, TLS is transport).
+    let resp = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .body(r#"{"jsonrpc":"2.0","id":1,"method":"getblockcount"}"#)
+        .send()
+        .expect("HTTPS unauth request");
+    assert_eq!(resp.status(), 401);
+
+    node.stop();
+}

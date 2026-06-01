@@ -413,6 +413,23 @@ fn field_specs() -> Vec<FieldSpec> {
         // The API runtime's worker count is fixed when the runtime is built
         // at startup; changing it requires a restart.
         restart!("apithreads", api_threads),
+        // The opt-in read-only listener is bound and its admission budget +
+        // method filter wired at server-build time, so every read-only knob
+        // is restart-only.
+        restart!("rpcreadonlybind", rpc_readonly_bind),
+        restart!("rpcreadonlyport", rpc_readonly_port),
+        restart!("rpcreadonlyallowip", rpc_readonly_allowip),
+        restart!("rpcreadonlythreads", rpc_readonly_threads),
+        restart!("rpcreadonlyworkqueue", rpc_readonly_workqueue),
+        // Read-only TLS surface: bound + acceptor built at startup. The cert/
+        // key themselves hot-reload via SIGUSR1 (tls_config registry), but
+        // the bind/mTLS-policy wiring is restart-only, like the main RPC TLS.
+        restart!("rpcreadonlytlsbind", rpc_readonly_tls_bind),
+        restart!("rpcreadonlytlscert", rpc_readonly_tls_cert),
+        restart!("rpcreadonlytlskey", rpc_readonly_tls_key),
+        restart!("rpcreadonlymtls", rpc_readonly_mtls),
+        restart!("rpcreadonlymtlsclientca", rpc_readonly_mtls_client_ca),
+        restart!("rpcreadonlymtlsclientallow", rpc_readonly_mtls_client_allow),
         live_secret!("rpcuser", rpcuser, apply_rpc_credentials),
         live_secret!("rpcpassword", rpcpassword, apply_rpc_credentials),
         live_secret!("rpcauth", rpcauth, apply_rpc_credentials),

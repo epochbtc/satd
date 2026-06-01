@@ -1,3 +1,4 @@
+pub mod access;
 pub mod address;
 pub mod admission;
 pub mod allowip;
@@ -11,5 +12,6 @@ pub mod mining;
 pub mod network;
 pub mod psbt;
 pub mod rawtx;
+pub mod readonly;
 pub mod server;
 pub mod util;

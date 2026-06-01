@@ -1065,6 +1065,27 @@ impl ChainState {
     /// events sees `RecvError::Lagged`; emission never blocks the
     /// connect/disconnect path.
     fn emit_chain_event(&self, event: crate::chain::events::ChainEvent) {
+        // Invariant guarding the API-runtime split (see `rpc::access` and the
+        // read-only RPC listener): block-level chain events — and therefore
+        // block connection / disconnection / reorg — must originate on the
+        // core runtime, never the bounded API runtime. If a chain-mutating
+        // path ran on the API runtime, the cross-runtime wakeup could reorder
+        // the address-index status notifier ahead of the inline index write,
+        // delivering a stale all-zeros status to SSE/Electrum subscribers.
+        //
+        // The API runtime's worker threads are named "satd-api"; assert we
+        // are not on one. This is the structural backstop for the read-only
+        // listener's method classification: even a *misclassified* future
+        // block-connecting RPC (wrongly allowed onto the API runtime) trips
+        // this on the very first block it connects. `debug_assert` keeps
+        // release builds unaffected while the regtest suite — which connects
+        // blocks in nearly every test — actively enforces it in CI.
+        debug_assert_ne!(
+            std::thread::current().name(),
+            Some("satd-api"),
+            "block-level chain event emitted from the API runtime; block \
+             connection must stay on the core runtime (see rpc::access)"
+        );
         if let Some(tx) = self.chain_event_tx.lock().as_ref() {
             let _ = tx.send(event);
         }

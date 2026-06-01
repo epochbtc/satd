@@ -10,8 +10,10 @@ use crate::rpc::amounts::{
 use crate::rpc::admission::{AdmissionLayer, AdmissionState};
 use crate::rpc::auth::{AuthLayer, RpcAuth};
 use crate::rpc::compat::JsonRpcCompatLayer;
-use crate::rpc::{address, blockchain, indexes, mining, network, psbt, rawtx, util};
+use crate::rpc::readonly::ReadOnlyLayer;
+use crate::rpc::{access, address, blockchain, indexes, mining, network, psbt, rawtx, util};
 use crate::storage::Store;
+use jsonrpsee::server::middleware::rpc::RpcServiceBuilder;
 use jsonrpsee::server::{
     Methods, RpcModule, ServerBuilder, ServerConfig, ServerHandle, serve_with_graceful_shutdown,
     stop_channel,
@@ -126,12 +128,19 @@ pub struct RpcServerHandle {
     /// bind several interfaces (the Bitcoin Core convention).
     plain: Vec<ServerHandle>,
     tls: Option<ServerHandle>,
+    /// Handles for the opt-in read-only listener(s) (`-rpcreadonlybind`),
+    /// one per bind. These run the same `Methods` behind the
+    /// [`ReadOnlyLayer`] method filter, on the bounded API runtime rather
+    /// than the consensus core. Empty when the read-only listener is not
+    /// configured.
+    readonly: Vec<ServerHandle>,
 }
 
 impl RpcServerHandle {
-    /// Tell every plain-HTTP listener and the optional TLS surface to
-    /// stop. Ignores `AlreadyStopped` errors so a previously-fired
-    /// bridge or test teardown does not propagate to the caller.
+    /// Tell every plain-HTTP listener, the optional TLS surface, and any
+    /// read-only listener to stop. Ignores `AlreadyStopped` errors so a
+    /// previously-fired bridge or test teardown does not propagate to the
+    /// caller.
     pub fn stop(&self) -> Result<(), jsonrpsee::server::AlreadyStoppedError> {
         if let Some(tls) = &self.tls {
             let _ = tls.stop();
@@ -148,8 +157,45 @@ impl RpcServerHandle {
         for h in &self.plain {
             let _ = h.stop();
         }
+        // Read-only listeners get the same idempotent stop. They also
+        // carry a shutdown-watch bridge, so they are usually already
+        // stopped by the time this runs.
+        for h in &self.readonly {
+            let _ = h.stop();
+        }
         Ok(())
     }
+}
+
+/// Configuration for the opt-in read-only JSON-RPC listener.
+///
+/// When `Some(..)` is passed to [`start`], satd binds one additional
+/// listener per `bind_addr` that serves the **same** `Methods` as the main
+/// listener but behind the [`ReadOnlyLayer`] method filter — only read and
+/// mempool-submit methods are dispatched (see [`crate::rpc::access`]). These
+/// listeners run on `api_handle` (the bounded API runtime) rather than the
+/// consensus core, so a flood of consumer read traffic cannot starve block
+/// connection. They reuse the main listener's auth (same credentials) and
+/// have their own admission budget.
+pub struct ReadOnlyListener {
+    /// Bind addresses (`-rpcreadonlybind`). Non-empty enables the listener.
+    pub bind_addrs: Vec<SocketAddr>,
+    /// Source-address allowlist (`-rpcreadonlyallowip`), independent of the
+    /// main listener's `-rpcallowip`.
+    pub allowip: Vec<crate::rpc::allowip::IpAllowEntry>,
+    /// Admission concurrency / backlog for this listener
+    /// (`-rpcreadonlythreads` / `-rpcreadonlyworkqueue`), independent of the
+    /// main listener's `-rpcthreads`/`-rpcworkqueue` budget.
+    pub rpc_threads: usize,
+    pub rpc_workqueue: usize,
+    /// Optional TLS surface for the read-only listener (`-rpcreadonlytls*` /
+    /// `-rpcreadonlymtls*`). `None` = plain-HTTP only. Serves the same
+    /// read-only-filtered methods over TLS (and optional mTLS) on the API
+    /// runtime, mirroring the main listener's TLS surface.
+    pub tls: Option<RpcTlsConfig>,
+    /// Handle to the bounded API runtime the listener's accept loop and
+    /// per-connection tasks run on.
+    pub api_handle: tokio::runtime::Handle,
 }
 
 /// Shared state for RPC handlers.
@@ -390,6 +436,10 @@ pub async fn start(
     #[cfg(feature = "block-filter-index")] filter_backfill_cmd_tx: Option<
         tokio::sync::mpsc::Sender<crate::index::filter::BackfillCommand>,
     >,
+    // Opt-in read-only listener (`-rpcreadonlybind`). `None` (the default)
+    // means only the full read/write listener on the consensus runtime is
+    // served — the Core-compatible single-listener behavior.
+    readonly: Option<ReadOnlyListener>,
 ) -> Result<RpcServerHandle, Box<dyn std::error::Error + Send + Sync>> {
     // Listener-status + shutdown_tx are needed both inside the RPC
     // context (so the `stop` RPC + `getserverstatus` can use them) AND
@@ -1893,6 +1943,7 @@ pub async fn start(
             Some(shutdown_tx_outer.subscribe()),
             RPC_MAX_CONNECTIONS as usize,
             admission.clone(),
+            None,
         )
         .await?;
         plain_handles.push(handle);
@@ -1908,12 +1959,13 @@ pub async fn start(
         Some(
             spawn_tls_surface(
                 tls_cfg,
-                server_cfg,
+                server_cfg.clone(),
                 surface_auth,
-                methods,
+                methods.clone(),
                 listener_status_outer,
                 &mut shutdown_rx_for_tls,
                 admission.clone(),
+                None,
             )
             .await?,
         )
@@ -1921,10 +1973,142 @@ pub async fn start(
         None
     };
 
+    // Opt-in read-only listener(s). Same `Methods`, on the bounded API
+    // runtime, behind the read-only method filter, with their own admission
+    // budget and source-address allowlist.
+    let readonly_handles = if let Some(ro) = readonly {
+        spawn_readonly_listeners(ro, &server_cfg, &auth, &methods, &shutdown_tx_outer).await?
+    } else {
+        Vec::new()
+    };
+
     Ok(RpcServerHandle {
         plain: plain_handles,
         tls: tls_handle,
+        readonly: readonly_handles,
     })
+}
+
+/// Bind the opt-in read-only listener(s) on the API runtime.
+///
+/// Each bind runs the same `Methods` as the main listener but behind the
+/// [`ReadOnlyLayer`] method filter and with its own admission budget. The
+/// accept loop and all per-connection tasks must run on the **API runtime**,
+/// not the consensus core: we therefore drive each `spawn_plain_surface`
+/// from inside an `api_handle.spawn(..)` task and recover the resulting
+/// `ServerHandle` over a oneshot. A bind failure (e.g. port conflict) is
+/// surfaced as a startup-fatal error, matching the main listener.
+async fn spawn_readonly_listeners(
+    ro: ReadOnlyListener,
+    server_cfg: &ServerConfig,
+    auth: &Arc<RpcAuth>,
+    methods: &Methods,
+    shutdown_tx: &watch::Sender<bool>,
+) -> Result<Vec<ServerHandle>, Box<dyn std::error::Error + Send + Sync>> {
+    // Fail-closed completeness audit: every registered method must be
+    // classified in `rpc::access`, otherwise it would be silently rejected
+    // on the read-only listener. The filter is safe either way (unclassified
+    // → rejected), but an unclassified *read* would be an unintended feature
+    // gap, so flag it. `debug_assert` turns this into a hard gate in the test
+    // suite (which runs debug builds with the read-only listener enabled).
+    let unclassified: Vec<&str> = methods
+        .method_names()
+        .filter(|m| access::classify(m).is_none())
+        .collect();
+    if !unclassified.is_empty() {
+        tracing::warn!(
+            ?unclassified,
+            "read-only RPC listener enabled but these registered methods are unclassified in \
+             rpc::access; they will be REJECTED on the read-only listener (fail-closed). Classify \
+             them to expose them."
+        );
+        debug_assert!(
+            unclassified.is_empty(),
+            "unclassified RPC methods (classify in rpc::access): {unclassified:?}"
+        );
+    }
+
+    let allowip = Arc::new(ro.allowip);
+    // Independent admission budget so read-only load is bounded separately
+    // from the main listener's `-rpcthreads`/`-rpcworkqueue`.
+    let admission = AdmissionState::new(ro.rpc_threads, ro.rpc_workqueue);
+    let mut handles: Vec<ServerHandle> = Vec::with_capacity(ro.bind_addrs.len());
+    for bind_addr in ro.bind_addrs {
+        let server_cfg = server_cfg.clone();
+        let auth = auth.clone();
+        let allowip = allowip.clone();
+        let methods = methods.clone();
+        let admission = admission.clone();
+        let shutdown_rx = shutdown_tx.subscribe();
+        // Run the bind + accept loop on the API runtime: the inner
+        // `tokio::spawn` calls in `spawn_plain_surface` inherit whichever
+        // runtime drives this task.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        ro.api_handle.spawn(async move {
+            let res = spawn_plain_surface(
+                bind_addr,
+                server_cfg,
+                auth,
+                allowip,
+                methods,
+                Some(shutdown_rx),
+                RPC_MAX_CONNECTIONS as usize,
+                admission,
+                Some(ReadOnlyLayer::new()),
+            )
+            .await;
+            let _ = tx.send(res);
+        });
+        let handle = rx
+            .await
+            .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
+                "read-only RPC listener task cancelled before bind".into()
+            })??;
+        tracing::info!(%bind_addr, "read-only RPC listener bound");
+        handles.push(handle);
+    }
+
+    // Optional read-only TLS surface (`-rpcreadonlytls*` / `-rpcreadonlymtls*`).
+    // Same Methods + read-only filter + admission budget as the plain
+    // read-only surface, just over TLS (with optional mTLS), on the API
+    // runtime. Reuses the main listener's HTTP auth.
+    if let Some(tls_cfg) = ro.tls {
+        let bind_addr = tls_cfg.bind_addr;
+        let server_cfg = server_cfg.clone();
+        let auth = auth.clone();
+        let methods = methods.clone();
+        let admission = admission.clone();
+        // Throwaway status: the read-only TLS surface reports via the log
+        // below rather than the main `getserverstatus` `rpc_tls` slot, which
+        // it must not clobber. (getserverstatus visibility for the read-only
+        // listener is a follow-up.)
+        let status = Arc::new(ServerListenerStatus::default());
+        let mut shutdown_rx = shutdown_tx.subscribe();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        ro.api_handle.spawn(async move {
+            let res = spawn_tls_surface(
+                tls_cfg,
+                server_cfg,
+                auth,
+                methods,
+                status,
+                &mut shutdown_rx,
+                admission,
+                Some(ReadOnlyLayer::new()),
+            )
+            .await;
+            let _ = tx.send(res);
+        });
+        let handle = rx
+            .await
+            .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
+                "read-only RPC TLS listener task cancelled before bind".into()
+            })??;
+        tracing::info!(%bind_addr, "read-only RPC TLS listener bound");
+        handles.push(handle);
+    }
+
+    Ok(handles)
 }
 
 /// Bind the TLS listener and spawn the per-connection accept loop.
@@ -1934,6 +2118,7 @@ pub async fn start(
 /// from main shutdown, or by a bridge task wired here that forwards
 /// the global `shutdown_tx` watch into the TLS stop handle so a
 /// process-level shutdown also terminates this surface.
+#[allow(clippy::too_many_arguments)]
 async fn spawn_tls_surface(
     cfg: RpcTlsConfig,
     server_cfg: ServerConfig,
@@ -1942,6 +2127,10 @@ async fn spawn_tls_surface(
     listener_status: Arc<ServerListenerStatus>,
     shutdown_rx: &mut watch::Receiver<bool>,
     admission: Arc<AdmissionState>,
+    // `Some` only for a read-only TLS listener (none today; the read-only
+    // listener is plain-HTTP for now). `None` keeps this a zero-cost
+    // identity, matching `spawn_plain_surface`.
+    rpc_filter: Option<ReadOnlyLayer>,
 ) -> Result<ServerHandle, Box<dyn std::error::Error + Send + Sync>> {
     // mTLS policy: `Required` when the operator opted in via
     // `--rpcmtls=1`; otherwise `Disabled` (plain server-auth TLS).
@@ -1990,6 +2179,7 @@ async fn spawn_tls_surface(
     let rpc_svc = ServerBuilder::new()
         .set_config(server_cfg)
         .set_http_middleware(tls_middleware)
+        .set_rpc_middleware(RpcServiceBuilder::new().option_layer(rpc_filter))
         .to_service_builder()
         .build(methods, stop_handle.clone());
 
@@ -2184,6 +2374,10 @@ pub async fn spawn_plain_surface(
     shutdown_rx: Option<watch::Receiver<bool>>,
     max_connections: usize,
     admission: Arc<AdmissionState>,
+    // `Some` only for read-only listeners: an RPC-layer method filter that
+    // rejects non-read methods before dispatch. `None` (the default
+    // read/write listener) is a zero-cost identity in the middleware chain.
+    rpc_filter: Option<ReadOnlyLayer>,
 ) -> Result<ServerHandle, Box<dyn std::error::Error + Send + Sync>> {
     // Bind synchronously so a port conflict is a startup-fatal error
     // rather than a silently-dropped task that never accepts.
@@ -2202,6 +2396,10 @@ pub async fn spawn_plain_surface(
     let rpc_svc = ServerBuilder::new()
         .set_config(server_cfg)
         .set_http_middleware(plain_middleware)
+        // `option_layer(None)` is `Identity` — the read/write listener pays
+        // nothing; the read-only listener gets the method filter at the RPC
+        // layer (after jsonrpsee has parsed the method + split batches).
+        .set_rpc_middleware(RpcServiceBuilder::new().option_layer(rpc_filter))
         .to_service_builder()
         .build(methods, stop_handle.clone());
 

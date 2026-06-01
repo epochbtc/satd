@@ -179,6 +179,55 @@ layout) per `STABILITY_POLICY.md`.
   can silently fall through. See `OPERATOR_ERGONOMICS.md` for the per-key
   reference and `CORE_DIFFERENCES.md` for the behavior contract.
 
+### API surface scaling
+
+The unifying goal of these three changes is to bound the blast radius of the
+remotely-consumed API surfaces so they can never starve or stall the consensus
+core. Default behavior is unchanged and Bitcoin Core-compatible; everything
+new is opt-in or a safe-by-default backstop.
+
+- **Consistent per-surface admission control, and recognition of Core's
+  `-rpcthreads` / `-rpcworkqueue`.** The JSON-RPC listener now bounds
+  concurrent in-flight method calls to `-rpcthreads` (default 16, Core's
+  default) and the backlog of waiting requests to `-rpcthreads + -rpcworkqueue`
+  (default 64), shedding over-budget requests with **HTTP 429 + `Retry-After`**
+  rather than queueing unboundedly. satd previously hard-errored on these two
+  Core config keys; they are now honored (a Core-shaped config carrying them
+  loads). The events gRPC stream gained matching connection and concurrent-
+  subscription caps (`-eventsgrpcmaxconns` / `-eventsgrpcmaxsubscriptions`,
+  defaults 64 / 256), returning `RESOURCE_EXHAUSTED` past the cap. Shedding runs
+  ahead of authentication and request-body buffering, so a flood — authenticated
+  or not — is bounded before it does work. The admission knobs are clamped to a
+  sane ceiling so a fat-fingered value can't panic the daemon at boot.
+- **Isolated, bounded runtime for the read/streaming surfaces (`--api-threads`).**
+  Esplora, Electrum, the events gRPC + ZMQ sinks, and the metrics endpoint now
+  run on a **separate, bounded tokio runtime** (default `max(2, cores/4)`
+  workers, clamped to 1024) rather than sharing the consensus/P2P core runtime.
+  A flood on any consumption surface therefore **cannot** starve block
+  connection or mempool acceptance — the isolation is structural, not policy.
+  JSON-RPC and MCP stay on the core runtime: they carry the block-connecting
+  control methods (`generate*` / `submitblock` / `submitheader` /
+  `preciousblock` / `loadtxoutset`), which must originate on the core runtime
+  to preserve address-index/SSE event ordering, and keeping JSON-RPC there also
+  makes it a "break-glass" admin endpoint that public API load cannot starve.
+  `SIGHUP`/`SIGUSR1` reload continues to reach the relocated surfaces unchanged.
+- **Opt-in read-only JSON-RPC listener (`-rpcreadonlybind`).** A second
+  JSON-RPC listener, served on the bounded API runtime, that dispatches only
+  read and mempool-submit methods (`sendrawtransaction`) and rejects block-
+  connecting and node-control methods with JSON-RPC error `-32001`. The method
+  filter is **fail-closed** — an unclassified method is rejected, never served —
+  and a release-safe invariant guard asserts block connection never originates
+  on the API runtime. It has its own bind, source-IP allowlist
+  (`-rpcreadonlyallowip`), and admission budget (`-rpcreadonlythreads` /
+  `-rpcreadonlyworkqueue`), reuses the main listener's authentication, and
+  supports **TLS and optional mTLS** like every other surface
+  (`-rpcreadonlytlsbind` / `-rpcreadonlytlscert` / `-rpcreadonlytlskey` /
+  `-rpcreadonlymtls` / `-rpcreadonlymtlsclientca` / `-rpcreadonlymtlsclientallow`).
+  The default remains a single full read/write listener on `-rpcport`; the
+  read-only listener is off unless a bind is configured. Lets operators scale
+  read RPC traffic horizontally (behind a load balancer) without exposing the
+  control plane. See `SATD_API_SCALING.md`.
+
 ### Monitoring
 
 - **Startup/reindex progress timing is now computed daemon-side.** The node
