@@ -97,3 +97,49 @@ The cumulative upload cap is application state with block-serving semantics — 
 **Why `-v2only` matters:** Greg Maxwell (gmaxwell) has observed that, as of 2025, virtually none of the spy / DoS / surveillance nodes on the network support v2 transport. Disconnecting anything not using v2 sheds essentially all of that traffic without banlists or mass-connector heuristics. It also drops legitimate not-yet-upgraded honest peers, so `-v2only` stays **opt-in** until v2 adoption is high enough that the connectivity tradeoff is safe.
 
 **Future work:** consider surfacing v2 vs v1 peer ratios in the TUI, and revisiting the `-v2only` default as adoption rises.
+
+## Streaming Consumption API
+
+The dominant ways to consume a Bitcoin node all date from a different era and leave the same gaps. Core JSON-RPC + ZMQ is request/response plus a fire-and-forget pub-sub with no subscriptions, cursors, descriptors, or reorg events. The Electrum protocol is pre-descriptor, scripthash-only, one-subscription-per-scripthash, no reorg events. Esplora is fundamentally an indexer REST API with bolt-on WebSocket extensions and no spec stability. Every serious consumer — wallets, Lightning nodes, exchanges, watchtowers, explorers, L2 projects — ends up reinventing the same three things on top: **descriptor lifecycle**, **outpoint-level subscriptions**, and **cursor-based event replay**. None of the incumbents serve these natively.
+
+The strategic opening: a clean, streaming-first node-consumption API, specced as an open protocol, with satd as the reference native implementation. The key generalization is that **outpoint subscription is the right base primitive** — Lightning channel-close detection, watchtower triggers, exchange deposit confirmation, and theft monitoring all reduce to it, and address-watching is just outpoint-watching with a derivation rule on top. Build down to outpoints; layer descriptors on as a convenience.
+
+### Where satd already is
+
+This is mostly a **consolidation effort, not a greenfield build** — satd has organically grown ~60–70% of the substrate:
+
+- ✅ **Internal event bus** (`node::events`): `NodeEvent` envelope (schema version + edge stamp + monotonic `seq`) carrying `ChainEvent::{BlockConnected, BlockDisconnected}` and `MempoolEvent::{Enter, LeaveConfirmed, LeaveEvicted, LeaveReplaced}` with eviction reasons — published read-only out of the connect/disconnect and mempool-accept paths. This is **consensus ground truth**, not reconstructed.
+- ✅ **gRPC server-streaming adapter** (`satd-events`, `tonic`, proto `satd.events.v1`): `NodeEventStream.Subscribe` on its own port, loopback-guarded, with a category bitfield filter and forward-only `since_seq` dedup.
+- ✅ **Core-compatible ZMQ PUB** sink (`satd-events`).
+- ✅ **Electrum protocol** (`electrum-proto`): per-scripthash subscriptions, SPV merkle proofs, status-hash broadcast over `tokio::broadcast`.
+- ✅ **Esplora REST + SSE** (`esplora-handlers`).
+- ✅ **BIP158 compact-filter index** (`node-filter-index`) and an **outpoint spend index** (`node-index::SpendIndex`, outpoint → confirmed spending input), both with persistent backfill cursors.
+
+### Why this is the right place to build it — and the trap to avoid
+
+The cautionary precedent is btcd: it shipped a streaming-style WebSocket API and gained almost no traction outside LND. The failure was **adoption strategy**, not the idea — the API was hostage to running a non-Core consensus node, with no spec, no cursor replay, and no second implementation. That is *not* an argument against a node implementing the protocol; it is an argument for three disciplines:
+
+1. **Spec the wire protocol as an open, transport-agnostic thing**, separate from satd, so a bitcoind sidecar (or Knots, libbitcoin, a future Rust node) can serve the same protocol. satd is the *reference* native implementation, not a proprietary lure to pull operators off Core. The sidecar path stays on the roadmap as the adoption hedge.
+2. **Keep it a distinct service on a distinct port** (already true). The live danger is the **compatibility trap** — satd already ships Core-compatible JSON-RPC *and* Electrum *and* Esplora, so integrators reach for those and never touch the differentiated stream, exactly how btcd's notifications stayed invisible. The streaming API has to be pitched as a first-class reason to point at satd.
+3. **satd-native is genuinely the better implementation**, and a bitcoind sidecar structurally cannot match it: a sidecar diffs headers off ZMQ to *infer* reorgs (ZMQ has no reorg semantics), infers mempool transitions from `rawtx` with no replaced/evicted *reason*, and needs its own index for outpoint spends. satd emits all of this in-process as ground truth.
+
+### The delta — two additions turn the firehose into the differentiator
+
+The existing gRPC `Subscribe` is a coarse category-filtered firehose with no replay. Two pieces of work close the gap to the proposal, in priority order:
+
+1. **Durable replay cursors (the single highest-value item).** Cursor durability is the main reason an operator would choose this over Core RPC + ZMQ. satd's current proto explicitly punts replay ("consume from a durable broker upstream"). The clean satd-specific design: **confirmed-side cursors are `(height, tx_index)` and replay exactly from the block index** — no extra log, subsuming Electrum's subscribe-then-get-history dance and Esplora's per-address pagination. Mempool-side replay is best-effort within a bounded in-memory window (the mempool isn't durable anyway); persist only the high-water `seq`. Reconnect-with-cursor becomes the single replay primitive for every subscription type.
+2. **Live outpoint/script notifier (not just the query index).** satd has `SpendIndex` (query) and the Electrum scripthash registry (push), but no live outpoint *subscription*. Add an outpoint-keyed matcher in the connect/mempool path that pushes `OutpointSpent`/`TxSeen`, and lift the gRPC `Subscribe` from a one-way stream + bitfield into a **bidi tagged-union** (`AddScripts` / `AddOutpoints` / `AddTransactions` / `SetCursor`), mirroring the `oneof` style already in `NodeEvent`. Tagged-union composition is also what avoids btcd's BIP37 dead-end: new subscription kinds slot in without protocol breakage. This is the LDK/watchtower primitive and satd can serve it in-process with zero ZMQ reconstruction.
+
+A **descriptor convenience layer** (rust-miniscript expansion → watch-set, gap-limit rotation, a `DescriptorNeedsAddresses` side-channel) layers on top of the outpoint/script primitive. Lowest consensus risk, pure library work — sequence it last.
+
+### Transport
+
+satd is already over-equipped (gRPC, jsonrpsee/WS, Electrum, Esplora/SSE) — which is itself the trap: four transports, no shared schema or cursor. Consolidate to **one schema (the proto is the natural source of truth) over two transports: gRPC native + JSON-over-WebSocket via the existing jsonrpsee server**, reusing the Esplora SSE pattern for firehose consumers. Deliberately **skip grpc-gateway/REST transcoding early** — it drags a Go toolchain into a build that already fights bindgen/libclang/musl-static; hand-roll the JSON/WS mapping instead.
+
+### Constraints and risks
+
+- **Never let the stream touch consensus.** satd's first value is being a correct Core-compatible node. The event bus is publish-only out of `connect_block` today — preserve that invariant absolutely. A slow client must **never** backpressure mempool acceptance or block connection; degrade by drop-with-notice (the current `Lagged` → log → continue handling is correct — protect it as load grows). This is a *safety* property, not just UX.
+- **Auth/multi-tenancy is genuinely missing and must be day-one for remote exposure.** The events gRPC is unauthenticated, loopback-only, with `--events-grpc-allow-remote` as the only knob — that flag is not a multi-tenancy answer. Scoped tokens + watch-set quotas need designing before remote exposure is encouraged; bolting auth on later is what condemned Electrum to "trust the operator."
+- **Prove the shape with one anchor consumer before spec-and-evangelize.** The open-protocol / two-implementations / BIP-style-spec ambition is real but a governance lift. The pragmatic near-term path is internal consolidation plus a single downstream integrator co-designing the surface, then deciding whether to standardize.
+
+**Explicitly out of scope:** mining ops (`getblocktemplate`/`submitblock` — Stratum is the right venue), wallet key management and signing (the node stays keyless by design), and any consensus/block-production knobs.
