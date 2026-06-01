@@ -101,6 +101,42 @@ impl TestNode {
     }
 
     fn start_inner(extra_args: &[&str], env: &[(&str, &str)], capture_stderr: bool) -> Self {
+        // A satd that never answers RPC has almost always *crashed* on startup
+        // (a port race, a datadir lock, a panic) rather than merely being slow:
+        // the 120s×MULT deadline is far longer than even a heavily contended CI
+        // start. The old code polled such a dead process until the full deadline
+        // and then panicked with an opaque "timed out". Instead, watch for early
+        // process exit and retry the whole spawn on a fresh port/datadir — which
+        // auto-recovers the transient startup races that previously required a
+        // manual CI re-run. A genuinely broken binary still fails, after
+        // exhausting the attempts, with the real exit status.
+        const MAX_ATTEMPTS: u32 = 3;
+        let mut last_failure = String::new();
+        for attempt in 1..=MAX_ATTEMPTS {
+            match Self::try_start_once(extra_args, env, capture_stderr) {
+                Ok(node) => return node,
+                Err(reason) => {
+                    last_failure = format!("attempt {attempt}/{MAX_ATTEMPTS}: {reason}");
+                    if attempt < MAX_ATTEMPTS {
+                        eprintln!(
+                            "satd startup failed ({last_failure}); retrying on a fresh port"
+                        );
+                    }
+                }
+            }
+        }
+        panic!("satd failed to start after {MAX_ATTEMPTS} attempts; last failure: {last_failure}");
+    }
+
+    /// One spawn-and-wait attempt. Returns `Err` (after reaping the process) if
+    /// satd exits before its RPC comes up or doesn't answer within the deadline,
+    /// so the caller can retry on a fresh port. Each attempt allocates its own
+    /// port/datadir, so a retry never reuses a contended port or a locked dir.
+    fn try_start_once(
+        extra_args: &[&str],
+        env: &[(&str, &str)],
+        capture_stderr: bool,
+    ) -> Result<Self, String> {
         let rpcport = find_available_port();
         let datadir = std::env::temp_dir().join(format!("satd-test-{}", rpcport));
         let _ = std::fs::create_dir_all(&datadir);
@@ -143,7 +179,7 @@ impl TestNode {
         } else {
             std::process::Stdio::null()
         };
-        let process = cmd
+        let mut process = cmd
             .stdout(std::process::Stdio::null())
             .stderr(stderr_target)
             .spawn()
@@ -171,6 +207,13 @@ impl TestNode {
         let deadline = Instant::now() + test_timeout(120);
         let cookie_path = datadir.join("regtest").join(".cookie");
         loop {
+            // Fail fast if satd already exited — no point polling a corpse until
+            // the deadline. `try_wait` reaps the child when it reports `Some`.
+            if let Ok(Some(status)) = process.try_wait() {
+                return Err(format!(
+                    "satd (port {rpcport}) exited with {status} before its RPC came up"
+                ));
+            }
             let rpc_ready = if uses_userpass {
                 let client = reqwest::blocking::Client::builder()
                     .timeout(Duration::from_secs(2))
@@ -207,7 +250,12 @@ impl TestNode {
                 break;
             }
             if Instant::now() >= deadline {
-                panic!("Timed out waiting for satd to start on port {}", rpcport);
+                // Kill and reap the hung process so it can't leak across a retry.
+                let _ = process.kill();
+                let _ = process.wait();
+                return Err(format!(
+                    "satd (port {rpcport}) did not answer RPC within the startup deadline"
+                ));
             }
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -218,14 +266,14 @@ impl TestNode {
             std::fs::read_to_string(&cookie_path).expect("Failed to read cookie file")
         };
 
-        TestNode {
+        Ok(TestNode {
             process,
             datadir,
             rpcport,
             p2p_port: tracked_p2p_port,
             cookie,
             stderr_log,
-        }
+        })
     }
 
     /// Start a node reusing an existing datadir (for restart/reindex tests).
