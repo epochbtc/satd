@@ -90,6 +90,25 @@ layout) per `STABILITY_POLICY.md`.
   enforced (see Consensus above), so every case in the matrix matches Core
   exactly on accept/reject (28 also match the reject *reason*; the remaining 4
   reject for the same cause under a different label).
+- **Live block-acceptance differential against Bitcoin Core (Phase C).** A new
+  integration test (`satd/tests/phase_c_differential.rs`, gated behind the
+  `phase-c` cargo feature) spawns BOTH a satd regtest node and a real
+  `bitcoind` (`lncm/bitcoind:v27.0`, in Docker) and submits identical
+  adversarial blocks/transactions to each via `submitblock` /
+  `testmempoolaccept`, asserting they reach the identical accept/reject
+  verdict. Where Phase B bakes in Core's verdicts from `feature_block.py`,
+  Phase C observes them from a *live* Core (the oracle) and, crucially,
+  exercises satd's real composite acceptance path (`accept_block`) rather than
+  the validation functions in isolation. Every candidate is built on a tip
+  both nodes provably share (a base mined by dual-submitting identical valid
+  blocks, coinbases paying bare `OP_TRUE` so spends need no signing), and any
+  connectivity/duplicate verdict is treated as a harness bug so it can never
+  mask a real divergence. 25 cases run live (24 exact verdict+reason matches,
+  plus the documented BIP68 reject-label difference where both nodes reject);
+  the run also re-validates the Phase B reject strings against the live node.
+  Wired as the PR-gating `canary / Bitcoin Core block-acceptance differential`
+  job. Layer 1 of the live differential harness (a generative cargo-fuzz target
+  is the planned follow-up).
 
 ### Operator
 

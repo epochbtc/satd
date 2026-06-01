@@ -20,6 +20,14 @@ block-filter-index = ["node/block-filter-index"]
 # run the suite once with `RUST_TEST_THREADS=4` (defeating the
 # serialized contract) before the dedicated step runs it again.
 e2e = []
+# Marker for the Phase C live differential test target (see the `[[test]]`
+# section below). Phase C spawns a real Bitcoin Core in Docker and compares
+# block-acceptance verdicts against satd; it must NOT run under the general
+# `cargo test --all --locked` step (no Docker there, and it would race the
+# e2e serialization contract). The dedicated canary job enables it with
+# `--features phase-c`. The Lint job's `cargo clippy --all-features` still
+# type-checks the harness on every PR.
+phase-c = []
 
 # Pin the e2e integration test target to its own feature. Combined
 # with the `e2e = []` feature above, this keeps `cargo test --all`
@@ -30,6 +38,12 @@ e2e = []
 name = "e2e"
 path = "tests/e2e.rs"
 required-features = ["e2e"]
+
+# Phase C live differential — Docker-gated, mirrors the `e2e` pattern above.
+[[test]]
+name = "phase_c_differential"
+path = "tests/phase_c_differential.rs"
+required-features = ["phase-c"]
 
 [dependencies]
 node = { path = "../node", default-features = false }
