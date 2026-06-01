@@ -14,16 +14,42 @@
 
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Context, Poll};
 
 use async_trait::async_trait;
 use node::events::{EventSink, NodeEvent, NodeEventBody};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpListener;
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, watch};
 use tokio_stream::Stream;
 use tokio_stream::wrappers::{BroadcastStream, TcpListenerStream};
 use tonic::transport::Server;
+use tonic::transport::server::Connected;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, info, warn};
+
+/// Admission limits for the events gRPC sink. `0` on either field disables
+/// that cap. Defaults mirror `satd`'s config defaults (64 / 256).
+#[derive(Debug, Clone, Copy)]
+pub struct GrpcLimits {
+    /// Hard cap on simultaneously-open TCP connections. A connection beyond
+    /// the cap is dropped at accept (the client sees a connection reset).
+    pub max_conns: usize,
+    /// Hard cap on concurrent `Subscribe` streams across all connections. A
+    /// `Subscribe` beyond the cap is rejected with `RESOURCE_EXHAUSTED`.
+    pub max_subscriptions: usize,
+}
+
+impl Default for GrpcLimits {
+    fn default() -> Self {
+        Self {
+            max_conns: 64,
+            max_subscriptions: 256,
+        }
+    }
+}
 
 use crate::proto::v1 as pb;
 use crate::proto::v1::node_event_stream_server::{
@@ -55,6 +81,7 @@ pub struct GrpcEventSink {
     addr: SocketAddr,
     listener: TcpListener,
     publisher: std::sync::Arc<node::events::EventPublisher>,
+    limits: GrpcLimits,
 }
 
 impl GrpcEventSink {
@@ -75,6 +102,7 @@ impl GrpcEventSink {
         bind: &str,
         allow_remote: bool,
         publisher: std::sync::Arc<node::events::EventPublisher>,
+        limits: GrpcLimits,
     ) -> Result<Self, GrpcEventSinkError> {
         let addr: SocketAddr = bind
             .parse()
@@ -90,12 +118,15 @@ impl GrpcEventSink {
             target: "events::grpc",
             addr = %bound,
             allow_remote,
+            max_conns = limits.max_conns,
+            max_subscriptions = limits.max_subscriptions,
             "events gRPC server bound",
         );
         Ok(Self {
             addr: bound,
             listener,
             publisher,
+            limits,
         })
     }
 
@@ -131,6 +162,8 @@ impl EventSink for GrpcEventSink {
     ) {
         let svc = NodeEventStreamServer::new(NodeEventStreamSvc {
             publisher: self.publisher.clone(),
+            active_subs: Arc::new(AtomicUsize::new(0)),
+            max_subscriptions: self.limits.max_subscriptions,
         });
         info!(target: "events::grpc", addr = %self.addr, "events gRPC server starting");
         let shutdown_signal = async move {
@@ -138,8 +171,40 @@ impl EventSink for GrpcEventSink {
         };
         // The TCP listener was already bound in `bind()` (so any
         // operator-visible bind failure happens at startup, not here).
-        // Hand it to tonic via `serve_with_incoming_shutdown`.
-        let incoming = TcpListenerStream::new(self.listener);
+        // Hand it to tonic via `serve_with_incoming_shutdown`, gating
+        // accepted connections through a semaphore so no more than
+        // `max_conns` are open at once. Each accepted connection carries an
+        // owned permit released when the connection (and thus the wrapping
+        // `PermittedTcp`) is dropped. `0` disables the cap.
+        let conn_sem = if self.limits.max_conns > 0 {
+            Some(Arc::new(Semaphore::new(self.limits.max_conns)))
+        } else {
+            None
+        };
+        let max_conns = self.limits.max_conns;
+        let incoming = TcpListenerStream::new(self.listener).filter_map(move |res| match res {
+            Ok(stream) => match &conn_sem {
+                Some(sem) => match sem.clone().try_acquire_owned() {
+                    Ok(permit) => Some(Ok(PermittedTcp {
+                        inner: stream,
+                        _permit: Some(permit),
+                    })),
+                    Err(_) => {
+                        warn!(
+                            target: "events::grpc",
+                            max_conns,
+                            "events gRPC at-capacity rejection (dropping connection)",
+                        );
+                        None
+                    }
+                },
+                None => Some(Ok(PermittedTcp {
+                    inner: stream,
+                    _permit: None,
+                })),
+            },
+            Err(e) => Some(Err(e)),
+        });
         if let Err(e) = Server::builder()
             .add_service(svc)
             .serve_with_incoming_shutdown(incoming, shutdown_signal)
@@ -152,6 +217,85 @@ impl EventSink for GrpcEventSink {
 
 struct NodeEventStreamSvc {
     publisher: std::sync::Arc<node::events::EventPublisher>,
+    /// Live count of active `Subscribe` streams, shared across all
+    /// connections. Bounded by `max_subscriptions` (when non-zero).
+    active_subs: Arc<AtomicUsize>,
+    /// Hard cap on concurrent `Subscribe` streams. `0` disables the cap.
+    max_subscriptions: usize,
+}
+
+/// RAII guard decrementing the active-subscription counter when a stream is
+/// dropped (client disconnect or server shutdown). Held inside the per-
+/// subscriber stream closure so its lifetime matches the stream's.
+struct SubscriptionGuard(Arc<AtomicUsize>);
+
+impl Drop for SubscriptionGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// A TCP stream carrying an owned connection-cap permit. Delegates all I/O
+/// to the inner `TcpStream`; the permit is released when this is dropped,
+/// i.e. when tonic finishes serving the connection. `_permit` is `None`
+/// when the connection cap is disabled.
+struct PermittedTcp {
+    inner: tokio::net::TcpStream,
+    _permit: Option<OwnedSemaphorePermit>,
+}
+
+impl AsyncRead for PermittedTcp {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for PermittedTcp {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+}
+
+impl Connected for PermittedTcp {
+    type ConnectInfo = <tokio::net::TcpStream as Connected>::ConnectInfo;
+
+    fn connect_info(&self) -> Self::ConnectInfo {
+        self.inner.connect_info()
+    }
 }
 
 #[async_trait]
@@ -164,6 +308,30 @@ impl NodeEventStream for NodeEventStreamSvc {
         request: Request<pb::SubscribeRequest>,
     ) -> Result<Response<Self::SubscribeStream>, Status> {
         let req = request.into_inner();
+
+        // Enforce the global concurrent-subscription cap before attaching a
+        // receiver. We reserve a slot up front (fetch_add) and roll back if
+        // over the cap, so concurrent `Subscribe` calls can't race past the
+        // limit. The reserved slot is released by `SubscriptionGuard` when
+        // the returned stream is dropped. `0` disables the cap.
+        let sub_guard = if self.max_subscriptions > 0 {
+            let active = self.active_subs.fetch_add(1, Ordering::AcqRel) + 1;
+            if active > self.max_subscriptions {
+                self.active_subs.fetch_sub(1, Ordering::AcqRel);
+                warn!(
+                    target: "events::grpc",
+                    max_subscriptions = self.max_subscriptions,
+                    "events gRPC subscription cap reached — rejecting Subscribe",
+                );
+                return Err(Status::resource_exhausted(
+                    "events gRPC concurrent-subscription cap reached",
+                ));
+            }
+            Some(SubscriptionGuard(self.active_subs.clone()))
+        } else {
+            None
+        };
+
         // 0 means "all categories" — same convention as the in-process
         // `EventSink`. Otherwise it's a bitfield (mempool=1, chain=2,
         // heartbeat=4). Unknown bits are silently ignored: a future
@@ -198,19 +366,26 @@ impl NodeEventStream for NodeEventStreamSvc {
             "events gRPC subscriber attached (forward-only; no replay)",
         );
 
-        let stream = BroadcastStream::new(rx).filter_map(move |item| match item {
-            Ok(env) => {
-                if (env.category_bit() & category_mask) == 0 {
-                    return None;
+        // `sub_guard` is moved into the stream closure so the subscription
+        // slot is held for exactly as long as the stream lives; it is never
+        // read, only kept alive (and dropped — decrementing the counter —
+        // when the client disconnects or the server shuts down).
+        let stream = BroadcastStream::new(rx).filter_map(move |item| {
+            let _keep_slot = &sub_guard;
+            match item {
+                Ok(env) => {
+                    if (env.category_bit() & category_mask) == 0 {
+                        return None;
+                    }
+                    if since_seq > 0 && env.stamp.seq <= since_seq {
+                        return None;
+                    }
+                    Some(Ok(envelope_to_proto(&env)))
                 }
-                if since_seq > 0 && env.stamp.seq <= since_seq {
-                    return None;
+                Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
+                    warn!(target: "events::grpc", dropped = n, "gRPC subscriber lagged");
+                    None
                 }
-                Some(Ok(envelope_to_proto(&env)))
-            }
-            Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
-                warn!(target: "events::grpc", dropped = n, "gRPC subscriber lagged");
-                None
             }
         });
 
@@ -419,7 +594,7 @@ mod tests {
     #[tokio::test]
     async fn bind_rejects_remote_address_by_default() {
         let publisher = EventPublisher::new(edge(), 16);
-        match GrpcEventSink::bind("0.0.0.0:0", false, publisher).await {
+        match GrpcEventSink::bind("0.0.0.0:0", false, publisher, GrpcLimits::default()).await {
             Err(GrpcEventSinkError::RemoteBindRejected(_)) => {}
             Ok(_) => panic!("non-loopback bind without allow_remote should fail"),
             Err(e) => panic!("expected RemoteBindRejected, got {e}"),
@@ -429,7 +604,7 @@ mod tests {
     #[tokio::test]
     async fn bind_allows_loopback_without_override() {
         let publisher = EventPublisher::new(edge(), 16);
-        let sink = GrpcEventSink::bind("127.0.0.1:0", false, publisher)
+        let sink = GrpcEventSink::bind("127.0.0.1:0", false, publisher, GrpcLimits::default())
             .await
             .expect("loopback bind should succeed");
         let addr = sink.local_addr().expect("local_addr");
@@ -442,7 +617,7 @@ mod tests {
         // 0.0.0.0:0 with allow_remote = true: must succeed (the actual
         // port the OS picks is irrelevant; the test asserts only that
         // the loopback gate is bypassed when the caller opts in).
-        let sink = GrpcEventSink::bind("0.0.0.0:0", true, publisher)
+        let sink = GrpcEventSink::bind("0.0.0.0:0", true, publisher, GrpcLimits::default())
             .await
             .expect("explicit remote bind should be allowed");
         let addr = sink.local_addr().unwrap();
@@ -476,7 +651,7 @@ mod tests {
 
         // 2. Bind directly (the new API picks the actual ephemeral port
         // from the OS, no TOCTOU window).
-        let sink = GrpcEventSink::bind("127.0.0.1:0", false, publisher.clone())
+        let sink = GrpcEventSink::bind("127.0.0.1:0", false, publisher.clone(), GrpcLimits::default())
             .await
             .expect("bind");
         let actual = sink.local_addr().unwrap();
@@ -556,5 +731,74 @@ mod tests {
 
         // 7. Shutdown.
         let _ = shutdown_tx.send(true);
+    }
+
+    /// The concurrent-subscription cap rejects `Subscribe` beyond the limit
+    /// with `RESOURCE_EXHAUSTED`, and frees a slot when a stream is dropped.
+    #[tokio::test]
+    async fn subscription_cap_rejects_when_full() {
+        let publisher = EventPublisher::new(edge(), 16);
+        let svc = NodeEventStreamSvc {
+            publisher,
+            active_subs: Arc::new(AtomicUsize::new(0)),
+            max_subscriptions: 2,
+        };
+        let mk = || {
+            Request::new(pb::SubscribeRequest {
+                categories: 0,
+                since_seq: None,
+            })
+        };
+
+        let s1 = svc.subscribe(mk()).await.expect("first subscribe ok");
+        let s2 = svc.subscribe(mk()).await.expect("second subscribe ok");
+        assert_eq!(svc.active_subs.load(Ordering::Acquire), 2);
+
+        // Third exceeds the cap → RESOURCE_EXHAUSTED, count rolled back.
+        // (`Response` wraps a boxed stream that isn't `Debug`, so match
+        // rather than `expect_err`.)
+        let err = match svc.subscribe(mk()).await {
+            Ok(_) => panic!("third subscribe must be rejected"),
+            Err(e) => e,
+        };
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(svc.active_subs.load(Ordering::Acquire), 2);
+
+        // Dropping a stream frees its slot (the guard decrements on drop),
+        // so a fresh subscribe then succeeds.
+        drop(s1);
+        assert_eq!(svc.active_subs.load(Ordering::Acquire), 1);
+        let s3 = svc
+            .subscribe(mk())
+            .await
+            .expect("subscribe ok after a slot frees");
+        assert_eq!(svc.active_subs.load(Ordering::Acquire), 2);
+
+        drop(s2);
+        drop(s3);
+    }
+
+    /// `max_subscriptions = 0` disables the cap entirely.
+    #[tokio::test]
+    async fn subscription_cap_disabled_when_zero() {
+        let publisher = EventPublisher::new(edge(), 16);
+        let svc = NodeEventStreamSvc {
+            publisher,
+            active_subs: Arc::new(AtomicUsize::new(0)),
+            max_subscriptions: 0,
+        };
+        let mut held = Vec::new();
+        for _ in 0..16 {
+            held.push(
+                svc.subscribe(Request::new(pb::SubscribeRequest {
+                    categories: 0,
+                    since_seq: None,
+                }))
+                .await
+                .expect("uncapped subscribe always ok"),
+            );
+        }
+        // Counter stays at zero when the cap is disabled.
+        assert_eq!(svc.active_subs.load(Ordering::Acquire), 0);
     }
 }

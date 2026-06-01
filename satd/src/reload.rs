@@ -405,6 +405,11 @@ fn field_specs() -> Vec<FieldSpec> {
         restart!("rpcport", rpcport),
         restart!("rpcbind", rpcbind),
         restart!("rpcallowip", rpcallowip),
+        // RPC admission budget is fixed at server-build time (the
+        // AdmissionState is constructed in rpc::server::start), so changing
+        // it requires a restart.
+        restart!("rpcthreads", rpc_threads),
+        restart!("rpcworkqueue", rpc_workqueue),
         live_secret!("rpcuser", rpcuser, apply_rpc_credentials),
         live_secret!("rpcpassword", rpcpassword, apply_rpc_credentials),
         live_secret!("rpcauth", rpcauth, apply_rpc_credentials),
@@ -604,6 +609,10 @@ fn field_specs() -> Vec<FieldSpec> {
         restart!("eventsregion", events_region),
         restart!("eventsgrpcbind", events_grpc_bind),
         restart!("eventsgrpcallowremote", events_grpc_allow_remote),
+        // gRPC admission caps are applied when the sink is built at
+        // startup; changing them requires a restart.
+        restart!("eventsgrpcmaxconns", events_grpc_max_conns),
+        restart!("eventsgrpcmaxsubscriptions", events_grpc_max_subscriptions),
         restart!("eventszmqbind", events_zmq_bind),
         restart!("eventszmqhashtx", events_zmq_hashtx),
         restart!("eventszmqhashblock", events_zmq_hashblock),
