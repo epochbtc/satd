@@ -206,6 +206,10 @@ impl TestNode {
         // the runner. Scaled by SATD_TEST_TIMEOUT_MULT.
         let deadline = Instant::now() + test_timeout(120);
         let cookie_path = datadir.join("regtest").join(".cookie");
+        // Captured from the readiness probe below so we never re-read the
+        // cookie file after the loop — that second read used to race the file
+        // momentarily vanishing under parallel-startup contention and panic.
+        let mut captured_cookie = String::new();
         loop {
             // Fail fast if satd already exited — no point polling a corpse until
             // the deadline. `try_wait` reaps the child when it reports `Some`.
@@ -234,7 +238,7 @@ impl TestNode {
                     .timeout(Duration::from_secs(2))
                     .build()
                     .unwrap();
-                client
+                let ready = client
                     .post(format!("http://127.0.0.1:{}/", rpcport))
                     .header("Authorization", format!("Basic {}", auth))
                     .header("Content-Type", "application/json")
@@ -242,7 +246,13 @@ impl TestNode {
                     .send()
                     .ok()
                     .and_then(|r| r.json::<serde_json::Value>().ok())
-                    .is_some_and(|j| !j["result"]["chain"].is_null())
+                    .is_some_and(|j| !j["result"]["chain"].is_null());
+                // Keep the exact cookie we just authenticated with rather than
+                // re-reading the file after the loop (which can race).
+                if ready {
+                    captured_cookie = cookie;
+                }
+                ready
             } else {
                 false
             };
@@ -260,11 +270,9 @@ impl TestNode {
             std::thread::sleep(Duration::from_millis(100));
         }
 
-        let cookie = if uses_userpass {
-            String::new()
-        } else {
-            std::fs::read_to_string(&cookie_path).expect("Failed to read cookie file")
-        };
+        // `captured_cookie` is the value the readiness probe authenticated
+        // with (empty for the userpass path, which doesn't use a cookie).
+        let cookie = captured_cookie;
 
         Ok(TestNode {
             process,
