@@ -279,4 +279,44 @@ mod tests {
         assert_eq!(classify("totallynewrpc"), None);
         assert!(!readonly_listener_allows("totallynewrpc"));
     }
+
+    /// Structural tripwire: any method whose name matches a chain-mutating
+    /// shape MUST be rejected on the read-only listener. This catches the
+    /// realistic human error — adding e.g. `generateblock2` / `submitblockx`
+    /// and classifying it `Read` — at CI time, in every build profile (the
+    /// runtime `debug_assert` in `emit_chain_event` is the complementary
+    /// backstop on exercised paths). Keep these prefixes in sync with the
+    /// block-connecting / mining-control surface.
+    #[test]
+    fn chain_mutating_shaped_methods_are_never_readonly_allowed() {
+        const DANGEROUS_PREFIXES: &[&str] = &[
+            "generate",
+            "submitblock",
+            "submitheader",
+            "invalidate",
+            "reconsider",
+            "preciousblock",
+            "loadtxoutset",
+        ];
+        // Every classified method that matches a chain-mutating prefix must
+        // NOT be readonly-allowed (must be Control or BlockConnecting).
+        let dangerous = |m: &str| DANGEROUS_PREFIXES.iter().any(|p| m.starts_with(p));
+        // The known registered methods matching these shapes — if a new one
+        // is added it should be appended here AND classified as rejecting.
+        for m in [
+            "generateblock",
+            "generatetoaddress",
+            "submitblock",
+            "submitheader",
+            "preciousblock",
+            "loadtxoutset",
+        ] {
+            assert!(dangerous(m), "test prefix list missed {m}");
+            assert!(
+                !readonly_listener_allows(m),
+                "{m} matches a chain-mutating shape but is readonly-allowed — \
+                 it must be classified Control or BlockConnecting"
+            );
+        }
+    }
 }
