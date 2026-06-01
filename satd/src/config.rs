@@ -1229,11 +1229,15 @@ impl Config {
         // Worker count for the isolated API runtime. Default is a modest
         // fraction of host parallelism (the core runtime keeps the rest),
         // floored at 2 so the API surfaces always have more than one worker.
+        // Clamped to a sane ceiling so a fat-fingered value can't make the
+        // tokio runtime builder fail to spawn the threads and panic the
+        // daemon at boot (the builder is `.expect()`-ed in main); no real
+        // host benefits from more than this many API worker threads.
         let api_threads = cli
             .apithreads
             .or_else(|| file_get("apithreads").and_then(|v| v.parse().ok()))
             .unwrap_or_else(default_api_threads)
-            .max(1);
+            .clamp(1, 1024);
 
         // --blocksdir resolution: CLI > config file > None (= use
         // default `<datadir>/<net>/blocks`). The path is kept as-is —
@@ -5104,6 +5108,23 @@ rpcport=8332
         )
         .unwrap();
         assert_eq!(cfg.api_threads, 3);
+
+        // A pathological value is clamped to the ceiling, not passed to the
+        // runtime builder (which would fail to spawn the threads and panic
+        // the daemon at boot).
+        let cfg = Config::from_cli(
+            CliArgs::try_parse_from([
+                "satd",
+                "--regtest",
+                "--datadir",
+                dir.to_str().unwrap(),
+                "--api-threads",
+                "1000000000",
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cfg.api_threads, 1024);
 
         // Config-file form (`apithreads`) is accepted, not rejected.
         assert!(
