@@ -81,7 +81,9 @@ pub enum ConnectError {
 /// non-minimal pushes (e.g., 4-byte push for a 3-byte height), so we only
 /// compare the decoded value, not the encoding length.
 fn decode_coinbase_height(bytes: &[u8]) -> Option<u32> {
-    let first = bytes[0];
+    // Callers guard against an empty scriptSig, but return None rather than
+    // index-panic so this helper is safe to call on any input.
+    let first = *bytes.first()?;
     match first {
         0x00 => Some(0), // OP_0
         0x51..=0x60 => Some((first - 0x50) as u32), // OP_1..OP_16

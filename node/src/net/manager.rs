@@ -1905,7 +1905,31 @@ impl PeerManager {
         }
     }
 
+    /// Core's `IsBlockMutated` gate. Returns true (and penalizes the peer) when
+    /// the block is malleated — its merkle tree is malleable (CVE-2012-2459) or
+    /// it contains a transaction whose non-witness serialized size is exactly 64
+    /// bytes (reinterpretable as an inner merkle node, enabling forged SPV
+    /// merkle proofs). Must be applied at EVERY block-ingress point before the
+    /// block enters the processing channel, since blocks reach `block_tx` via
+    /// several routes (direct `Block` messages and both compact-block
+    /// reconstruction paths). The peer is penalized but the block is NOT marked
+    /// permanently invalid: an honest block sharing the same hash must remain
+    /// acceptable from another peer (avoids the CVE-2012-2459 index-poisoning
+    /// DoS).
+    fn reject_if_mutated(&self, id: PeerId, block: &bitcoin::Block) -> bool {
+        if crate::validation::block::is_block_mutated(block) {
+            tracing::warn!(hash = %block.block_hash(), id, "Rejecting mutated block");
+            self.add_ban_score(id, 100, "mutated-block");
+            return true;
+        }
+        false
+    }
+
     fn handle_block(&self, id: PeerId, block: bitcoin::Block) {
+        if self.reject_if_mutated(id, &block) {
+            return;
+        }
+
         // Forward IBD swarm: store every arriving block to disk; the
         // ibd_connect_loop connects them in order. Historical blocks the
         // background catch-up requested also land here and are stored — we
@@ -3512,6 +3536,9 @@ impl PeerManager {
 
         match compact::try_reconstruct(&compact, &self.mempool) {
             Ok(block) => {
+                if self.reject_if_mutated(id, &block) {
+                    return;
+                }
                 tracing::debug!(%block_hash, "Compact block fully reconstructed from mempool");
                 let _ = self.block_tx.send(block);
             }
@@ -3562,11 +3589,14 @@ impl PeerManager {
         }
     }
 
-    fn handle_block_txn(&self, _id: PeerId, txns: bitcoin::bip152::BlockTransactions) {
+    fn handle_block_txn(&self, id: PeerId, txns: bitcoin::bip152::BlockTransactions) {
         let block_hash = txns.block_hash;
         let pending = self.pending_compact.write().remove(&block_hash);
         if let Some(pending) = pending {
             if let Some(block) = compact::complete_pending(pending, &txns) {
+                if self.reject_if_mutated(id, &block) {
+                    return;
+                }
                 tracing::debug!(%block_hash, "Compact block completed with BlockTxn");
                 let _ = self.block_tx.send(block);
             } else {

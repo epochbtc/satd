@@ -6,7 +6,7 @@ pub mod tx;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ValidationError {
-    #[error("bad-pow")]
+    #[error("high-hash")]
     BadProofOfWork,
     #[error("time-too-old")]
     TimeTooOld,
@@ -26,7 +26,10 @@ pub enum ValidationError {
     OversizedBlock,
     #[error("bad-diffbits")]
     BadDifficulty,
-    #[error("bad-txns-empty")]
+    // Core folds the empty-block case into its size-limits check, which emits
+    // `bad-blk-length` (the same reason as an over-weight block). We keep a
+    // distinct variant for internal clarity but match Core's reject string.
+    #[error("bad-blk-length")]
     EmptyBlock,
     #[error("bad-txns-vin-empty")]
     BadTxNoInputs,
@@ -34,15 +37,21 @@ pub enum ValidationError {
     BadTxNoOutputs,
     #[error("bad-txns-oversize")]
     BadTxOversize,
-    #[error("bad-txns-vout-negative")]
-    BadTxOutputValue,
+    // Core distinguishes a single output exceeding MAX_MONEY
+    // (`bad-txns-vout-toolarge`) from the running/total sum exceeding it
+    // (`bad-txns-txouttotal-toolarge`). The negative-value case
+    // (`bad-txns-vout-negative`) cannot occur with an unsigned amount type.
+    #[error("bad-txns-vout-toolarge")]
+    BadTxOutputTooLarge,
+    #[error("bad-txns-txouttotal-toolarge")]
+    BadTxOutputTotalTooLarge,
     #[error("bad-txns-inputs-duplicate")]
     BadTxDuplicateInput,
     #[error("bad-cb-length")]
     BadTxCoinbaseSize,
     #[error("bad-txns-prevout-null")]
     BadTxNullInput,
-    #[error("bad-witness-commitment")]
+    #[error("bad-witness-merkle-match")]
     BadWitnessCommitment,
     #[error("bad-signet-solution")]
     BadSignetSolution,
