@@ -73,6 +73,41 @@ pub struct CoinCache {
     /// regression that stops flushing would be silent until memory
     /// exhaustion.
     pub flush_count: AtomicU64,
+    /// Serializes cache flushes against a reorg's multi-step cache mutation
+    /// (issue #262 follow-up). A reorg applies disconnect + reconnect +
+    /// triggering connect to the cache only, then commits with a flush or
+    /// discards on failure; the in-memory discard cannot undo an on-disk
+    /// write. Block connection runs on one thread, but `flush()` /
+    /// `flush_durable()` are also reachable from other threads
+    /// (`gettxoutsetinfo`, `dumptxoutset`, the block-filter backfill
+    /// runner). The reorg holds this lock for its window (via
+    /// `FlushExclusion`) so no such external flush can persist a
+    /// partially-applied reorg. The reorg's own checkpoint flush goes
+    /// through the held handle (`flush_inner`) and never re-acquires, so
+    /// the lock is non-reentrant by construction.
+    flush_guard: Mutex<()>,
+}
+
+/// RAII flush-exclusion held by a reorg for the duration of its cache
+/// mutation. While alive, external `CoinCache::flush` / `flush_durable`
+/// calls block. The holder flushes via [`FlushExclusion::flush`], which
+/// does NOT re-acquire the guard (avoiding self-deadlock).
+///
+/// Crate-internal: this is a reorg-coordination primitive, not part of the
+/// public API. Exposing the ability to freeze all cache flushes to library
+/// consumers would be a footgun.
+pub(crate) struct FlushExclusion<'a> {
+    cache: &'a CoinCache,
+    _guard: parking_lot::MutexGuard<'a, ()>,
+}
+
+impl FlushExclusion<'_> {
+    /// Flush while already holding the exclusion lock — used for the
+    /// reorg's own pre-reorg checkpoint flush. Equivalent to `flush()`
+    /// minus the guard acquisition.
+    pub(crate) fn flush(&self) -> Result<(), StoreError> {
+        self.cache.flush_inner()
+    }
 }
 
 fn decode_write_mode(v: u8) -> WriteMode {
@@ -128,6 +163,7 @@ impl CoinCache {
             perf_store_misses: AtomicU64::new(0),
             write_mode: AtomicU8::new(0),
             flush_count: AtomicU64::new(0),
+            flush_guard: Mutex::new(()),
         }
     }
 
@@ -174,12 +210,39 @@ impl CoinCache {
 
     /// Flush dirty coins to the backing store.
     ///
+    /// Acquires the flush-exclusion lock so a concurrent reorg (which holds
+    /// it via [`CoinCache::lock_flush_exclusion`]) cannot have this
+    /// thread persist a partially-applied reorg. See `flush_guard`.
+    pub fn flush(&self) -> Result<(), StoreError> {
+        let _g = self.flush_guard.lock();
+        self.flush_inner()
+    }
+
+    /// Acquire the flush-exclusion lock for the duration of a reorg's
+    /// multi-step cache mutation. Hold the returned guard from the
+    /// pre-reorg checkpoint flush until the cache holds a *consistent*
+    /// full-reorg delta (i.e. through the triggering block's commit) or
+    /// until the reorg is discarded — whichever comes first. While held,
+    /// external `flush` / `flush_durable` block. Flush the checkpoint via
+    /// `FlushExclusion::flush` (no re-acquire). See `flush_guard`.
+    ///
+    /// Crate-internal: only the reorg path in `chain::state` may hold this.
+    pub(crate) fn lock_flush_exclusion(&self) -> FlushExclusion<'_> {
+        FlushExclusion {
+            cache: self,
+            _guard: self.flush_guard.lock(),
+        }
+    }
+
+    /// Flush dirty coins to the backing store. Caller must hold the
+    /// flush-exclusion lock (via `flush` or `FlushExclusion`).
+    ///
     /// Optimizations:
     /// - **FRESH elision**: coins created and spent in the same flush window never
     ///   touch the backing store (Core PR #17487 insight).
     /// - **Move semantics**: flushed coins are moved (not cloned) to the clean LRU,
     ///   avoiding the allocation burst that caused glibc malloc fragmentation.
-    pub fn flush(&self) -> Result<(), StoreError> {
+    fn flush_inner(&self) -> Result<(), StoreError> {
         let mut dirty = self.dirty.write();
         let mut batch = {
             let mut pending = self.pending_batch.lock();
@@ -653,7 +716,14 @@ impl Store for CoinCache {
         // inner store to flush its memtables to SST files. After this returns,
         // the on-disk state includes every write observed so far even with
         // the WAL disabled (BulkLoad mode).
-        self.flush()?;
+        //
+        // Hold the flush-exclusion lock across BOTH steps — and call
+        // `flush_inner` rather than `self.flush()` so the single
+        // acquisition is non-reentrant — so a concurrent reorg can neither
+        // have its partial cache drained here nor have the inner store
+        // sync'd to disk mid-reorg. See `flush_guard`.
+        let _g = self.flush_guard.lock();
+        self.flush_inner()?;
         self.inner.flush_durable()
     }
 
@@ -2343,5 +2413,73 @@ mod tests {
         );
         assert!(cache.get_coin(&y).is_none(), "discarded coin stays gone after flush");
         assert_eq!(cache.coin_count(), base_count);
+    }
+
+    // ---------------------------------------------------------------
+    // Flush-exclusion lock: a held FlushExclusion (a reorg in progress)
+    // blocks a concurrent flush from another thread until released, so no
+    // external flush can persist a partially-applied reorg (#262 followup).
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_flush_exclusion_blocks_concurrent_flush() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        let cache = Arc::new(make_cache(10));
+
+        // Stage a dirty coin so the other thread's flush has real work.
+        let op = make_outpoint(0xE0, 0);
+        let mut b = StoreBatch::default();
+        b.coin_puts.push((op, make_coin(4_242, 1)));
+        cache.write_batch(b).unwrap();
+
+        // Hold the exclusion on this thread (simulating a reorg window).
+        let excl = cache.lock_flush_exclusion();
+
+        let other_started = Arc::new(AtomicBool::new(false));
+        let other_done = Arc::new(AtomicBool::new(false));
+        let handle = {
+            let cache = Arc::clone(&cache);
+            let other_started = Arc::clone(&other_started);
+            let other_done = Arc::clone(&other_done);
+            std::thread::spawn(move || {
+                // Signal that we have reached the flush call, then block on
+                // flush_guard until the exclusion is released.
+                other_started.store(true, Ordering::SeqCst);
+                cache.flush().unwrap();
+                other_done.store(true, Ordering::SeqCst);
+            })
+        };
+
+        // Wait until the other thread has actually reached the flush call
+        // (so the assertion below provably exercises the block, not a
+        // not-yet-started thread), then give it time to park on the lock.
+        while !other_started.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !other_done.load(Ordering::SeqCst),
+            "concurrent flush must be blocked while the reorg exclusion is held"
+        );
+
+        // The reorg's own checkpoint-style flush works through the held
+        // handle without re-acquiring (would deadlock otherwise).
+        excl.flush().unwrap();
+
+        // Release the exclusion; the blocked flush now completes.
+        drop(excl);
+        handle.join().expect("other flush thread");
+        assert!(
+            other_done.load(Ordering::SeqCst),
+            "flush must complete once the exclusion is released"
+        );
+
+        // No deadlock / lock left poisoned: ordinary flush + durable flush
+        // still work after the exclusion lifecycle.
+        cache.flush().unwrap();
+        cache.flush_durable().unwrap();
+        assert_eq!(cache.get_coin(&op).unwrap().amount, 4_242);
     }
 }
