@@ -56,11 +56,18 @@ impl AdmissionState {
     /// progress); `workqueue` may be 0 (reject as soon as all workers are
     /// busy).
     pub fn new(threads: usize, workqueue: usize) -> Arc<Self> {
-        let threads = threads.max(1);
+        // Clamp to a sane ceiling so a fat-fingered config value can't panic
+        // `tokio::sync::Semaphore::new` (which panics above `usize::MAX >> 3`)
+        // or overflow `threads + workqueue`. A few thousand concurrent
+        // in-flight RPCs already dwarfs any real workload, so the ceiling only
+        // ever catches typos / hostile configs, never a legitimate value.
+        const MAX: usize = 100_000;
+        let threads = threads.clamp(1, MAX);
+        let workqueue = workqueue.min(MAX);
         Arc::new(Self {
             sem: Semaphore::new(threads),
             outstanding: AtomicUsize::new(0),
-            max_outstanding: threads + workqueue,
+            max_outstanding: threads.saturating_add(workqueue),
         })
     }
 
@@ -90,6 +97,22 @@ impl<S> tower::Layer<S> for AdmissionLayer {
             inner,
             state: self.state.clone(),
         }
+    }
+}
+
+/// RAII release of the backlog reservation taken at the top of
+/// [`AdmissionMiddleware::call`]. The reservation MUST be released on every
+/// exit path — completion, inner error, future cancellation, panic — so the
+/// decrement lives in `Drop` rather than as a trailing statement that
+/// cancellation or unwinding would skip. A leaked reservation permanently
+/// shrinks effective capacity (every later request sheds with 429 at zero
+/// real load) until the process restarts. Mirrors the RAII pattern used by
+/// the gRPC `SubscriptionGuard` and the RPC audit guard.
+struct OutstandingGuard(Arc<AdmissionState>);
+
+impl Drop for OutstandingGuard {
+    fn drop(&mut self) {
+        self.0.outstanding.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -140,6 +163,14 @@ where
                 return Ok(too_many_requests());
             }
 
+            // From here the reservation is released by RAII on EVERY exit
+            // path — normal completion, inner-service error, future
+            // cancellation (hyper drops the in-flight service future when a
+            // client disconnects mid-request), and panic — exactly like the
+            // semaphore permit below. The shed branch above returns before
+            // this guard exists, so it rolls the reservation back manually.
+            let _outstanding = OutstandingGuard(state.clone());
+
             // Wait for a worker permit. Holding it across `inner.call`
             // bounds concurrent in-flight calls to `threads`; requests that
             // get here but can't yet acquire a permit are the "queued"
@@ -148,10 +179,7 @@ where
             // `Ok`; `.ok()` degrades to unbounded rather than panicking in
             // the impossible closed case.
             let _permit = state.sem.acquire().await.ok();
-            let result = inner.call(req).await;
-            drop(_permit);
-            state.outstanding.fetch_sub(1, Ordering::AcqRel);
-            result
+            inner.call(req).await
         })
     }
 }
@@ -273,6 +301,49 @@ mod tests {
         let _ = h1.await.unwrap();
         let _ = h2.await.unwrap();
         wait_until(|| state.outstanding() == 0).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_request_does_not_leak_outstanding() {
+        // A request that is admitted and then has its future dropped mid-
+        // flight (the client disconnects and hyper drops the in-flight
+        // service future) MUST release its backlog reservation. With a bare
+        // trailing `fetch_sub`, the drop would skip it and `outstanding`
+        // would leak — the server would eventually shed every request with
+        // 429 at zero real load. Here the inner service parks forever (gate
+        // never released), so the only way `outstanding` returns to 0 is the
+        // RAII guard firing on cancellation.
+        let state = AdmissionState::new(1, 1);
+        let gate = Arc::new(Semaphore::new(0));
+        let active = Arc::new(AtomicUsize::new(0));
+        let inner = Parker {
+            gate,
+            active: active.clone(),
+        };
+        let layer = AdmissionLayer::new(state.clone());
+        let svc = tower::layer::Layer::layer(&layer, inner);
+
+        let mut s = svc.clone();
+        let h = tokio::spawn(async move { s.ready().await.unwrap().call(req()).await });
+        // Admitted and parked inside the inner service.
+        wait_until(|| state.outstanding() == 1).await;
+        wait_until(|| active.load(Ordering::Acquire) == 1).await;
+
+        // Client disconnect: drop the in-flight future.
+        h.abort();
+
+        // The reservation must drain back to zero (panics if it leaks).
+        wait_until(|| state.outstanding() == 0).await;
+    }
+
+    #[tokio::test]
+    async fn oversized_admission_knobs_are_clamped_not_panicking() {
+        // A hostile / fat-fingered config must not panic `Semaphore::new`
+        // (panics above `usize::MAX >> 3`) or overflow `threads + workqueue`.
+        let state = AdmissionState::new(usize::MAX, usize::MAX);
+        // Clamped, finite, and still admits at least one request.
+        assert!(state.max_outstanding <= 200_000);
+        assert!(state.outstanding() == 0);
     }
 
     #[tokio::test]
