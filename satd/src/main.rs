@@ -1396,6 +1396,44 @@ async fn main() {
         }
     };
 
+    // Optional TLS surface for the read-only listener, built the same way as
+    // the main RPC TLS surface above. Independent cert/key/mTLS (per-surface
+    // convention); the handshake timeout is shared with the main RPC TLS
+    // surface. Partial-config and mTLS validation already ran in Config::load.
+    let rpc_readonly_tls = match (
+        config.rpc_readonly_tls_bind.as_deref(),
+        config.rpc_readonly_tls_cert.as_deref(),
+        config.rpc_readonly_tls_key.as_deref(),
+    ) {
+        (Some(addr_str), Some(cert), Some(key)) => match addr_str.parse::<SocketAddr>() {
+            Ok(bind_addr) => Some(node::rpc::server::RpcTlsConfig {
+                bind_addr,
+                cert_path: cert.to_path_buf(),
+                key_path: key.to_path_buf(),
+                mtls_enabled: config.rpc_readonly_mtls,
+                mtls_client_ca: config.rpc_readonly_mtls_client_ca.clone(),
+                mtls_client_allow: config.rpc_readonly_mtls_client_allow.clone(),
+                handshake_timeout: std::time::Duration::from_secs(
+                    config.rpc_tls_handshake_timeout,
+                ),
+                max_connections: node::rpc::server::RPC_MAX_CONNECTIONS as usize,
+            }),
+            Err(e) => {
+                eprintln!("Error: invalid --rpcreadonlytlsbind {addr_str:?}: {e}");
+                auth.cleanup();
+                std::process::exit(1);
+            }
+        },
+        (None, None, None) => None,
+        _ => {
+            eprintln!(
+                "Error: --rpcreadonlytlsbind requires --rpcreadonlytlscert AND --rpcreadonlytlskey"
+            );
+            auth.cleanup();
+            std::process::exit(1);
+        }
+    };
+
     // When `--rpcdisableauth=1` is combined with `--rpcmtls=1`, the
     // TLS surface gets a separate "auth disabled" handle so the
     // rustls handshake is the only gate. The plain-HTTP surface
@@ -1448,8 +1486,9 @@ async fn main() {
         Some(filter_backfill_cmd_tx.clone()),
         // Opt-in read-only listener: served on the bounded API runtime
         // (`api_handle`) so consumer read traffic can never starve block
-        // connection. `None` unless `-rpcreadonlybind` is configured.
-        if config.rpc_readonly_bind.is_empty() {
+        // connection. Enabled by a plain `-rpcreadonlybind` and/or a TLS
+        // `-rpcreadonlytlsbind`; `None` when neither is configured.
+        if config.rpc_readonly_bind.is_empty() && rpc_readonly_tls.is_none() {
             None
         } else {
             Some(node::rpc::server::ReadOnlyListener {
@@ -1457,6 +1496,7 @@ async fn main() {
                 allowip: config.rpc_readonly_allowip.clone(),
                 rpc_threads: config.rpc_readonly_threads,
                 rpc_workqueue: config.rpc_readonly_workqueue,
+                tls: rpc_readonly_tls,
                 api_handle: api_handle.clone(),
             })
         },

@@ -188,6 +188,11 @@ pub struct ReadOnlyListener {
     /// main listener's `-rpcthreads`/`-rpcworkqueue` budget.
     pub rpc_threads: usize,
     pub rpc_workqueue: usize,
+    /// Optional TLS surface for the read-only listener (`-rpcreadonlytls*` /
+    /// `-rpcreadonlymtls*`). `None` = plain-HTTP only. Serves the same
+    /// read-only-filtered methods over TLS (and optional mTLS) on the API
+    /// runtime, mirroring the main listener's TLS surface.
+    pub tls: Option<RpcTlsConfig>,
     /// Handle to the bounded API runtime the listener's accept loop and
     /// per-connection tasks run on.
     pub api_handle: tokio::runtime::Handle,
@@ -2062,6 +2067,47 @@ async fn spawn_readonly_listeners(
         tracing::info!(%bind_addr, "read-only RPC listener bound");
         handles.push(handle);
     }
+
+    // Optional read-only TLS surface (`-rpcreadonlytls*` / `-rpcreadonlymtls*`).
+    // Same Methods + read-only filter + admission budget as the plain
+    // read-only surface, just over TLS (with optional mTLS), on the API
+    // runtime. Reuses the main listener's HTTP auth.
+    if let Some(tls_cfg) = ro.tls {
+        let bind_addr = tls_cfg.bind_addr;
+        let server_cfg = server_cfg.clone();
+        let auth = auth.clone();
+        let methods = methods.clone();
+        let admission = admission.clone();
+        // Throwaway status: the read-only TLS surface reports via the log
+        // below rather than the main `getserverstatus` `rpc_tls` slot, which
+        // it must not clobber. (getserverstatus visibility for the read-only
+        // listener is a follow-up.)
+        let status = Arc::new(ServerListenerStatus::default());
+        let mut shutdown_rx = shutdown_tx.subscribe();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        ro.api_handle.spawn(async move {
+            let res = spawn_tls_surface(
+                tls_cfg,
+                server_cfg,
+                auth,
+                methods,
+                status,
+                &mut shutdown_rx,
+                admission,
+                Some(ReadOnlyLayer::new()),
+            )
+            .await;
+            let _ = tx.send(res);
+        });
+        let handle = rx
+            .await
+            .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
+                "read-only RPC TLS listener task cancelled before bind".into()
+            })??;
+        tracing::info!(%bind_addr, "read-only RPC TLS listener bound");
+        handles.push(handle);
+    }
+
     Ok(handles)
 }
 

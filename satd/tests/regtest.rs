@@ -10713,3 +10713,73 @@ fn test_readonly_rpc_listener_filters_methods() {
     let r = call(ro_port, "getblockcount", serde_json::json!([]));
     assert_eq!(r["result"], 1, "RO listener should see the mined block: {r}");
 }
+
+/// The read-only listener supports TLS like every other API surface:
+/// `-rpcreadonlytlsbind` + cert + key boots an HTTPS read-only surface that
+/// authenticates, serves reads, and applies the same read-only method filter
+/// (block-connecting methods are rejected over TLS too).
+#[test]
+fn test_readonly_rpc_tls_round_trip() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (cert_path, key_path) = mint_test_tls_cert(tmp.path());
+    let tls_port = find_available_port();
+    let tls_bind = format!("127.0.0.1:{}", tls_port);
+
+    let mut node = TestNode::start(&[
+        &format!("--rpcreadonlytlsbind={}", tls_bind),
+        &format!("--rpcreadonlytlscert={}", cert_path.display()),
+        &format!("--rpcreadonlytlskey={}", key_path.display()),
+    ]);
+
+    // The main plain-HTTP listener is unaffected.
+    let info = node.rpc_call("getblockchaininfo").expect("plain HTTP rpc");
+    assert_eq!(info["result"]["chain"].as_str(), Some("regtest"));
+
+    // Trust the self-signed cert (real chain check, not validation-disabled).
+    let cert_pem = std::fs::read(&cert_path).unwrap();
+    let root = reqwest::Certificate::from_pem(&cert_pem).unwrap();
+    let basic = base64::engine::general_purpose::STANDARD.encode(node.cookie.trim());
+    let client = reqwest::blocking::Client::builder()
+        .add_root_certificate(root)
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let url = format!("https://localhost:{}/", tls_port);
+    let https = |method: &str| -> serde_json::Value {
+        client
+            .post(&url)
+            .header("Authorization", format!("Basic {}", basic))
+            .header("Content-Type", "application/json")
+            .body(format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":"{method}"}}"#
+            ))
+            .send()
+            .expect("HTTPS request")
+            .json()
+            .expect("HTTPS response JSON")
+    };
+
+    // A read is served over the read-only TLS surface.
+    let r = https("getblockchaininfo");
+    assert_eq!(r["result"]["chain"].as_str(), Some("regtest"));
+
+    // The read-only method filter applies over TLS too: a control method is
+    // rejected with the read-only rejection code, not dispatched.
+    let r = https("stop");
+    assert_eq!(
+        r["error"]["code"], -32001,
+        "stop must be filtered on the read-only TLS surface: {r}"
+    );
+
+    // No-auth HTTPS request is rejected by the Basic-auth layer (auth is the
+    // HTTP layer, TLS is transport).
+    let resp = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .body(r#"{"jsonrpc":"2.0","id":1,"method":"getblockcount"}"#)
+        .send()
+        .expect("HTTPS unauth request");
+    assert_eq!(resp.status(), 401);
+
+    node.stop();
+}
