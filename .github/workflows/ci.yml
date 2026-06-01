@@ -74,15 +74,19 @@ jobs:
           components: clippy
           override: true
 
-      - name: Cache Cargo registry & build artifacts
-        uses: actions/cache@v3
+      # Caches ~/.cargo/{registry,git,bin} AND target/, pruning the
+      # fast-changing first-party crate artifacts so the expensive dependency
+      # builds (rocksdb-sys + its C++ tree, bindgen, proc-macros) are restored
+      # instead of recompiled every run. Keyed automatically on the rustc
+      # version + Cargo.lock. Replaces the old registry-only actions/cache@v3,
+      # which left target/ uncached — so every run rebuilt rocksdb from scratch
+      # (~8 min of an ~9 min job). cache-on-failure keeps the warm cache even
+      # when tests fail, so iterating on a red PR doesn't pay the full rebuild
+      # each push. SHA-pinned (v2.9.1) for supply-chain hygiene.
+      - name: Cache Rust dependencies & target dir
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+          cache-on-failure: true
 
       # Pre-build sat-cli. The satd integration tests reach `sat-cli` by
       # path lookup (`Path::new(CARGO_BIN_EXE_satd).parent().join("sat-cli")`)
@@ -177,15 +181,19 @@ jobs:
           components: clippy
           override: true
 
-      - name: Cache Cargo registry & build artifacts
-        uses: actions/cache@v3
+      # Caches ~/.cargo/{registry,git,bin} AND target/, pruning the
+      # fast-changing first-party crate artifacts so the expensive dependency
+      # builds (rocksdb-sys + its C++ tree, bindgen, proc-macros) are restored
+      # instead of recompiled every run. Keyed automatically on the rustc
+      # version + Cargo.lock. Replaces the old registry-only actions/cache@v3,
+      # which left target/ uncached — so every run rebuilt rocksdb from scratch
+      # (~8 min of an ~9 min job). cache-on-failure keeps the warm cache even
+      # when tests fail, so iterating on a red PR doesn't pay the full rebuild
+      # each push. SHA-pinned (v2.9.1) for supply-chain hygiene.
+      - name: Cache Rust dependencies & target dir
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+          cache-on-failure: true
 
       - name: Run clippy (deny warnings)
         run: cargo clippy --all-targets --all-features -- -D warnings
