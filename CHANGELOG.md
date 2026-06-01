@@ -106,9 +106,9 @@ layout) per `STABILITY_POLICY.md`.
   mask a real divergence. 25 cases run live (24 exact verdict+reason matches,
   plus the documented BIP68 reject-label difference where both nodes reject);
   the run also re-validates the Phase B reject strings against the live node.
-  Wired as the PR-gating `canary / Phase C differential` job. Layer 1 of the
-  live differential harness (a generative cargo-fuzz target is the planned
-  follow-up).
+  Wired as the PR-gating `canary / Bitcoin Core block-acceptance differential`
+  job. Layer 1 of the live differential harness (a generative cargo-fuzz target
+  is the planned follow-up).
 
 ### Operator
 

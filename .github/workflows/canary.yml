@@ -468,25 +468,25 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-  # Phase C live consensus differential — the deepest Core-parity gate in the
-  # fleet. Spawns BOTH a satd regtest node and a real bitcoind
-  # (lncm/bitcoind:v27.0, in Docker) and submits identical adversarial blocks /
-  # transactions to each via `submitblock` / `testmempoolaccept`, asserting they
-  # reach the IDENTICAL accept/reject verdict — Core is the live oracle. Where
-  # the interop canary above checks P2P relay, this checks block-acceptance
-  # *consensus* verdicts across the whole pipeline (check_block → pow →
-  # contextual → connect) — the layer libbitcoinconsensus never covered. It
-  # also re-validates, against a live Core, the reject strings the static
-  # Phase B matrix (node/tests/feature_block_consensus.rs) transcribed by hand
-  # from feature_block.py.
+  # Live block-acceptance consensus differential vs Bitcoin Core — the deepest
+  # Core-parity gate in the fleet. Spawns BOTH a satd regtest node and a real
+  # bitcoind (lncm/bitcoind:v27.0, in Docker) and submits identical adversarial
+  # blocks / transactions to each via `submitblock` / `testmempoolaccept`,
+  # asserting they reach the IDENTICAL accept/reject verdict — Core is the live
+  # oracle. Where the interop canary above checks P2P relay, this checks
+  # block-acceptance *consensus* verdicts across the whole pipeline (check_block
+  # → pow → contextual → connect) — the layer libbitcoinconsensus never covered.
+  # It also re-validates, against a live Core, the reject strings the static
+  # feature_block matrix (node/tests/feature_block_consensus.rs) transcribed by
+  # hand from feature_block.py.
   #
   # Unlike the other canaries this is a Rust integration test: it drives satd
   # through its own RPC and must compile the harness, so it builds with cargo
   # rather than consuming the shared release artifact (hence `needs: [changes]`,
   # not `[build]`). Gated behind the `phase-c` cargo feature so the general
   # `cargo test --all` step never runs it.
-  canary-phase-c-differential:
-    name: canary / Phase C differential
+  core-block-acceptance-differential:
+    name: canary / Bitcoin Core block-acceptance differential
     needs: [changes]
     if: ${{ needs.changes.outputs.code == 'true' }}
     runs-on: ubuntu-24.04
@@ -538,7 +538,7 @@ jobs:
           set -euo pipefail
           for i in 1 2 3; do docker pull lncm/bitcoind:v27.0 && break || sleep $((i * 2)); done
 
-      - name: Run Phase C live differential
+      - name: Run block-acceptance differential
         env:
           # Absorb hosted-runner load on satd startup, as ci.yml does.
           SATD_TEST_TIMEOUT_MULT: '2'
