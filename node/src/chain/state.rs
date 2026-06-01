@@ -285,6 +285,26 @@ pub struct ChainState {
     /// is derived from it. `None` for all other networks and for the
     /// default signet (which satd does not solution-check today).
     signet_challenge: Option<Vec<u8>>,
+    /// Serializes the entire `accept_block` critical section so that at
+    /// most one thread mutates this (primary) chainstate at a time.
+    ///
+    /// The P2P side already has a single-writer invariant: every network
+    /// block funnels through one `block_processor` thread. But
+    /// `submitblock` (and internal mining) call `accept_block` directly
+    /// from RPC worker threads, so without this lock a miner-submitted
+    /// block can race the connect thread — two writers interleaving into
+    /// the shared `CoinCache` dirty map / `pending_batch` and both writing
+    /// `tip`, corrupting the UTXO delta (issue #262 follow-up: the second
+    /// concurrent writer, distinct from the flush-vs-reorg race that
+    /// #268's `flush_guard` already closed).
+    ///
+    /// Uncontended on the IBD, reindex, and steady-state P2P paths (each
+    /// drives `accept_block` from a single thread), so the cost there is a
+    /// single uncontended lock/unlock. It contends only in exactly the
+    /// racing case it exists to prevent. Scoped to the primary chainstate;
+    /// the AssumeUTXO background catch-up mutates a *separate* `ChainState`
+    /// and neither needs nor touches this lock.
+    accept_lock: Mutex<()>,
 }
 
 impl ChainState {
@@ -377,6 +397,7 @@ impl ChainState {
                     ),
                     background: RwLock::new(None),
                     signet_challenge: None,
+                    accept_lock: Mutex::new(()),
                 });
             }
 
@@ -464,6 +485,7 @@ impl ChainState {
             ),
             background: RwLock::new(None),
             signet_challenge: None,
+            accept_lock: Mutex::new(()),
         })
     }
 
@@ -3009,6 +3031,17 @@ impl ChainState {
 
     /// Accept a new block into the chain.
     pub fn accept_block(&self, block: &Block) -> Result<BlockHash, ChainError> {
+        // Serialize the whole accept→connect→commit critical section. The
+        // connect thread already holds this implicitly (it is the sole P2P
+        // writer); the guard exists to stop a concurrent `submitblock` /
+        // internal-mine call on an RPC worker thread from interleaving a
+        // second `accept_block` into the shared coin cache and `tip`. Held
+        // for the full body — including the reorg path and the trailing
+        // per-block flush — so the entire mutation is atomic w.r.t. other
+        // writers. Uncontended on IBD/reindex/normal-P2P (single writer);
+        // see the `accept_lock` field doc.
+        let _accept_guard = self.accept_lock.lock();
+
         let block_hash = block.block_hash();
         let trace_id = rand::random::<u32>();
         let _span = tracing::info_span!(
@@ -5269,6 +5302,66 @@ pub(crate) mod tests {
         let a3 = build_test_block(a2_hash, 3, 1_700_000_020);
         cs.accept_block(&a3).expect("chain A still extendable after failed reorg");
         assert_eq!(cs.tip_height(), 3);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two threads call `accept_block` at once — modeling a `submitblock`
+    /// RPC (or internal mine) racing the connect thread. `accept_lock`
+    /// must serialize them so the shared coin cache and `tip` are never
+    /// mutated by two writers concurrently. The assertion is that the
+    /// final chainstate is internally consistent (tip and UTXO set agree)
+    /// and survives a flush + extend; an interleaved connect would desync
+    /// them. Also guards against `accept_lock` deadlocking itself.
+    #[test]
+    fn test_concurrent_accept_block_is_serialized() {
+        use std::sync::Barrier;
+
+        let (cs, dir) = make_chain_state();
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+
+        // Two competing height-1 blocks with equal work. Distinct
+        // timestamps → distinct block hashes and distinct coinbase txids.
+        let x = build_test_block(genesis_hash, 1, 1_700_100_001);
+        let y = build_test_block(genesis_hash, 1, 1_700_100_002);
+        let x_hash = x.block_hash();
+        let y_hash = y.block_hash();
+
+        // Barrier forces both threads into `accept_block` at the same
+        // instant, maximizing the overlap the lock has to absorb.
+        let barrier = Barrier::new(2);
+        std::thread::scope(|s| {
+            let (bx, csx, xb) = (&barrier, &cs, &x);
+            s.spawn(move || {
+                bx.wait();
+                csx.accept_block(xb).expect("accept X");
+            });
+            let (by, csy, yb) = (&barrier, &cs, &y);
+            s.spawn(move || {
+                by.wait();
+                csy.accept_block(yb).expect("accept Y");
+            });
+        });
+
+        // Exactly one became the tip at height 1; the other is a stored
+        // side block (equal work → no reorg). A corrupted interleave would
+        // leave tip height != 1 or the UTXO set out of sync with the tip.
+        assert_eq!(cs.tip_height(), 1, "tip advanced by exactly one block");
+        let tip = cs.tip_hash();
+        assert!(tip == x_hash || tip == y_hash, "tip is one of the two competitors");
+        assert_eq!(cs.coin_count(), 1, "exactly the winning coinbase is live");
+
+        let winner = if tip == x_hash { &x } else { &y };
+        let win_op = OutPoint { txid: winner.txdata[0].compute_txid(), vout: 0 };
+        assert!(cs.get_coin(&win_op).is_some(), "winning coinbase is in the UTXO set");
+
+        // Survives a flush + a further extend — proving the loser's connect
+        // attempt left no half-applied delta behind.
+        cs.flush_coin_cache().expect("flush after concurrent accept");
+        assert_eq!(cs.coin_count(), 1, "coin set stable across flush");
+        let next = build_test_block(tip, 2, 1_700_100_010);
+        cs.accept_block(&next).expect("chain extendable after concurrent accept");
+        assert_eq!(cs.tip_height(), 2);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
