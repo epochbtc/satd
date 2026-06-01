@@ -6,6 +6,12 @@ use crate::validation::ValidationError;
 /// Maximum money supply: 21 million BTC in satoshis.
 const MAX_MONEY: u64 = 21_000_000 * 100_000_000;
 
+/// Maximum block weight (BIP 141); a single transaction may not exceed it.
+const MAX_BLOCK_WEIGHT: usize = 4_000_000;
+
+/// BIP 141 witness scale factor.
+const WITNESS_SCALE_FACTOR: usize = 4;
+
 /// Context-free transaction validation (CheckTransaction in Bitcoin Core).
 pub fn check_transaction(tx: &Transaction) -> Result<(), ValidationError> {
     // Must have at least one input
@@ -16,6 +22,15 @@ pub fn check_transaction(tx: &Transaction) -> Result<(), ValidationError> {
     // Must have at least one output
     if tx.output.is_empty() {
         return Err(ValidationError::BadTxNoOutputs);
+    }
+
+    // Size limit (Core CheckTransaction "bad-txns-oversize"): the no-witness
+    // serialized size scaled by WITNESS_SCALE_FACTOR must not exceed
+    // MAX_BLOCK_WEIGHT. The witness is excluded because it has not yet been
+    // checked for malleability. In the block path this is subsumed by the
+    // block-weight check, but a standalone tx (e.g. sendrawtransaction) needs it.
+    if tx.base_size().saturating_mul(WITNESS_SCALE_FACTOR) > MAX_BLOCK_WEIGHT {
+        return Err(ValidationError::BadTxOversize);
     }
 
     // Check output values
@@ -319,6 +334,33 @@ mod tests {
         assert!(matches!(
             check_transaction(&tx),
             Err(ValidationError::BadTxNullInput)
+        ));
+    }
+
+    #[test]
+    fn test_oversize_tx_rejected() {
+        // A ~1.1 MB no-witness tx: base_size * 4 > MAX_BLOCK_WEIGHT (4 M WU).
+        let big = bitcoin::ScriptBuf::from(vec![0x00; 1_100_000]);
+        let tx = Transaction {
+            version: Version::ONE,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::from_byte_array([0xab; 32]),
+                    vout: 0,
+                },
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: big,
+            }],
+        };
+        assert!(matches!(
+            check_transaction(&tx),
+            Err(ValidationError::BadTxOversize)
         ));
     }
 

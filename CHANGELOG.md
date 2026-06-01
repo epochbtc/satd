@@ -30,13 +30,26 @@ layout) per `STABILITY_POLICY.md`.
     block version per height (BIP34 ⇒ v≥2, BIP66 ⇒ v≥3, BIP65 ⇒ v≥4).
   - Mainnet IBD-replay verification is recommended before relying on the
     sigop/BIP30 height-gating on mainnet (regtest cannot exercise it).
+- **Reject merkle-tree mutation (CVE-2012-2459)** (`bad-txns-duplicate`):
+  `check_block` now mirrors Core's `ComputeMerkleRoot` `mutated` out-flag — a
+  block whose transaction list duplicates a trailing subtree (e.g.
+  `[cb, t1, t2, t2]`) has the **same** merkle root as the honest list, so the
+  root comparison alone passes; satd now detects the duplicated adjacent
+  subtree and rejects at the correct stage, instead of only catching it later
+  in `connect_block` as a double-spend. Surfaced by the block-handling
+  equivalence audit (finding A).
+- **Per-transaction weight cap in `check_transaction`** (`bad-txns-oversize`):
+  reject a transaction whose no-witness serialized size × 4 exceeds
+  `MAX_BLOCK_WEIGHT`. The block path was already covered by the block-weight
+  check, but a standalone transaction (e.g. `sendrawtransaction`) previously
+  slipped through. Surfaced by the block-handling equivalence audit (finding F).
 
 ### Testing
 
 - **Block-level consensus differential matrix.** A new golden fixture suite
   (`node/tests/feature_block_consensus.rs`), ported from Bitcoin Core's
   `test/functional/feature_block.py`, pins satd's block- and chain-level
-  validation verdicts against Core's reference behavior across 30 cases
+  validation verdicts against Core's reference behavior across 32 cases
   (coinbase structure, merkle, weight, UTXO/amount rules, locktime/sequence,
   difficulty, MTP). Core is the oracle: each case carries Core's exact reject
   reason, and the runner fails CI if satd's verdict drifts in either direction
@@ -46,8 +59,12 @@ layout) per `STABILITY_POLICY.md`.
   did not enforce on its accept path — block-wide sigop limit
   (`bad-blk-sigops`), BIP30 duplicate-unspent-txid (`bad-txns-BIP30`),
   2-hour-ahead future timestamp (`time-too-new`), and the mandatory block
-  version gate (`bad-version`) — all of which are now enforced (see Consensus
-  above).
+  version gate (`bad-version`) — and the deeper code-path equivalence audit
+  added two more — merkle-tree mutation (`bad-txns-duplicate`, CVE-2012-2459)
+  and a per-transaction weight cap (`bad-txns-oversize`). All six are now
+  enforced (see Consensus above), so every case in the matrix matches Core
+  exactly on accept/reject (28 also match the reject *reason*; the remaining 4
+  reject for the same cause under a different label).
 
 ### Operator
 

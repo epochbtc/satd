@@ -41,6 +41,16 @@ pub fn check_block(block: &Block) -> Result<(), ValidationError> {
         }
     }
 
+    // CVE-2012-2459: reject a merkle-mutated block. A tx list that duplicates a
+    // trailing subtree (e.g. `[cb, t1, t2, t2]`) yields the SAME merkle root as
+    // the honest `[cb, t1, t2]`, so the comparison above passes. Core computes a
+    // `mutated` flag inside ComputeMerkleRoot and rejects `bad-txns-duplicate`;
+    // we mirror that flag here so the malleated copy is rejected cheaply, at the
+    // right stage, rather than later in connect_block as a double-spend.
+    if merkle_tree_mutated(block) {
+        return Err(ValidationError::BadTxDuplicate);
+    }
+
     // Check block weight
     let weight = block.weight().to_wu() as usize;
     if weight > MAX_BLOCK_WEIGHT {
@@ -118,6 +128,49 @@ fn check_witness_commitment(block: &Block) -> Result<(), ValidationError> {
     }
 
     Ok(())
+}
+
+/// CVE-2012-2459 detection. Mirrors the `mutated` out-flag of Bitcoin Core's
+/// `ComputeMerkleRoot`: walking the merkle tree level by level over the block's
+/// txids, a merkle root is "mutated" iff at some level two adjacent hashes in an
+/// even-indexed pair are equal. The equality is tested BEFORE the odd-length
+/// tail is duplicated for that level, so the honest odd-node padding is not
+/// itself counted — only a transaction list that already contains the duplicate
+/// (the malleated copy of a valid block) trips it.
+fn merkle_tree_mutated(block: &Block) -> bool {
+    let mut current: Vec<[u8; 32]> = block
+        .txdata
+        .iter()
+        .map(|tx| tx.compute_txid().to_raw_hash().to_byte_array())
+        .collect();
+    if current.is_empty() {
+        return false;
+    }
+    while current.len() > 1 {
+        // Equal adjacent pairs in the current (pre-padding) level signal a
+        // duplicated subtree. Check before the odd-tail duplication below.
+        let mut i = 0;
+        while i + 1 < current.len() {
+            if current[i] == current[i + 1] {
+                return true;
+            }
+            i += 2;
+        }
+        if !current.len().is_multiple_of(2) {
+            let last = *current.last().unwrap();
+            current.push(last);
+        }
+        let mut next = Vec::with_capacity(current.len() / 2);
+        for j in (0..current.len()).step_by(2) {
+            let mut combined = [0u8; 64];
+            combined[..32].copy_from_slice(&current[j]);
+            combined[32..].copy_from_slice(&current[j + 1]);
+            let hash = bitcoin::hashes::sha256d::Hash::hash(&combined);
+            next.push(hash.to_byte_array());
+        }
+        current = next;
+    }
+    false
 }
 
 fn compute_merkle_root_from_hashes(hashes: &[[u8; 32]]) -> [u8; 32] {
@@ -540,5 +593,59 @@ mod tests {
             check_block(&block),
             Err(ValidationError::BadWitnessCommitment)
         ));
+    }
+
+    // -- CVE-2012-2459 merkle mutation --
+
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
+
+    fn dummy_spend(seed: u8) -> Transaction {
+        Transaction {
+            version: TxVersion::ONE,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::from_byte_array([seed; 32]),
+                    vout: 0,
+                },
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        }
+    }
+
+    #[test]
+    fn test_merkle_mutation_rejected() {
+        // [cb, t1, t2, t2] has the same merkle root as the honest [cb, t1, t2]
+        // (the odd-node duplication). check_block must reject bad-txns-duplicate
+        // rather than letting the root match and accepting.
+        let coinbase = bitcoin::constants::genesis_block(Network::Regtest).txdata[0].clone();
+        let t1 = dummy_spend(0x11);
+        let t2 = dummy_spend(0x22);
+        let mut block = bitcoin::constants::genesis_block(Network::Regtest);
+        block.txdata = vec![coinbase, t1, t2.clone(), t2];
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+        assert!(matches!(
+            check_block(&block),
+            Err(ValidationError::BadTxDuplicate)
+        ));
+    }
+
+    #[test]
+    fn test_honest_odd_tx_count_not_mutated() {
+        // The honest [cb, t1, t2] (3 txs → odd-node padding at level 0) must NOT
+        // be flagged as mutated: the padded duplicate is not a real adjacent pair.
+        let coinbase = bitcoin::constants::genesis_block(Network::Regtest).txdata[0].clone();
+        let mut block = bitcoin::constants::genesis_block(Network::Regtest);
+        block.txdata = vec![coinbase, dummy_spend(0x11), dummy_spend(0x22)];
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+        assert!(!merkle_tree_mutated(&block));
+        assert!(check_block(&block).is_ok());
     }
 }
