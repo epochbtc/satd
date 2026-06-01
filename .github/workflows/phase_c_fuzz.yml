@@ -27,6 +27,8 @@ on:
 
 permissions:
   contents: read
+  # Allow the failure step to open / comment on a tracking issue.
+  issues: write
 
 concurrency:
   group: phase-c-fuzz-${{ github.ref }}
@@ -80,3 +82,68 @@ jobs:
           path: fuzz/artifacts/**
           if-no-files-found: ignore
           retention-days: 30
+
+      # File an issue ONLY for a real divergence, never for an infra flake.
+      # libFuzzer writes a reproducer (crash-/timeout-/oom-*) under
+      # fuzz/artifacts/ if and only if the target actually diverged or hung on
+      # a specific block. Infra failures (image-pull 5xx, apt, cargo install,
+      # runner OOM, docker) fail the job *before* any reproducer is produced —
+      # those get no issue; GitHub's built-in scheduled-failure email is the
+      # low-priority backstop for a persistently-red pipeline. Manual
+      # workflow_dispatch runs are skipped too: whoever dispatched is watching.
+      - name: File issue on a real divergence
+        if: failure() && github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          repros=$(find fuzz/artifacts -type f 2>/dev/null | sort || true)
+          if [ -z "$repros" ]; then
+            echo "No reproducer under fuzz/artifacts/ — this failure looks like"
+            echo "infra/flake, not a divergence. Not filing an issue."
+            exit 0
+          fi
+
+          echo "Reproducer(s) found — filing/updating a divergence issue:"
+          echo "$repros"
+          repro_list=$(echo "$repros" | sed 's/^/- `/; s/$/`/')
+
+          # Ensure the dedup label exists (idempotent).
+          gh label create fuzz-divergence \
+            --color B60205 \
+            --description "block-differential fuzz found a satd/Core divergence" \
+            2>/dev/null || true
+
+          existing=$(gh issue list --label fuzz-divergence --state open \
+            --json number --jq '.[0].number // empty')
+
+          body=$(cat <<EOF
+          The **block-differential fuzzer** found a \`satd\` ↔ Bitcoin Core
+          accept/reject divergence (or a hang/OOM) on a specific block.
+
+          - Run: $RUN_URL
+          - Commit: \`${{ github.sha }}\`
+          - Reproducer(s) (also in the \`phase-c-fuzz-artifacts\` artifact):
+
+          $repro_list
+
+          The offending block hex is also printed to stderr in the run log.
+          This is a confirmed finding, not a flake — investigate before
+          closing, and never weaken the accept/reject assertion to make it
+          pass. Close this issue once resolved; the next divergence opens a
+          fresh one.
+          EOF
+          )
+
+          if [ -n "$existing" ]; then
+            echo "Commenting on existing issue #$existing"
+            gh issue comment "$existing" --body "Another divergence on $(date -u +%F): $RUN_URL"
+          else
+            echo "Opening new tracking issue"
+            gh issue create \
+              --label fuzz-divergence \
+              --title "Fuzz divergence: satd vs Bitcoin Core ($(date -u +%F))" \
+              --body "$body"
+          fi
