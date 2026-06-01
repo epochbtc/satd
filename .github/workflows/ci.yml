@@ -87,6 +87,10 @@ jobs:
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           cache-on-failure: true
+          # Match the `seed-cache` job's `tests` key so a fresh branch's first
+          # run restores master's seeded dependency cache (key = shared-key +
+          # rustc + Cargo.lock hash, independent of job/event), not a cold one.
+          shared-key: tests
 
       # Pre-build sat-cli. The satd integration tests reach `sat-cli` by
       # path lookup (`Path::new(CARGO_BIN_EXE_satd).parent().join("sat-cli")`)
@@ -194,6 +198,91 @@ jobs:
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           cache-on-failure: true
+          # Match the `seed-cache` job's `lint` key (see the test job). The
+          # lint cache is separate from `tests` because clippy compiles a
+          # different feature set (`--all-features`).
+          shared-key: lint
 
       - name: Run clippy (deny warnings)
         run: cargo clippy --all-targets --all-features -- -D warnings
+
+  # Seed the dependency cache from master so a fresh branch's FIRST CI run is
+  # warm instead of paying the full ~8 min rocksdb-and-deps rebuild. The
+  # Tests/Lint jobs run only on pull_request, so nothing otherwise populates a
+  # master (default-branch) cache for new branches to fall back to. This job
+  # runs only on push to master and compiles the SAME surfaces the Tests and
+  # Lint jobs compile — so their dependency artifacts land in cache — WITHOUT
+  # running the suite (no slow/flaky regtest + e2e execution on master). Each
+  # matrix leg uses the same `shared-key` as its consumer job (`tests` / `lint`)
+  # so the caches match by key.
+  seed-cache:
+    name: "Seed build cache (${{ matrix.leg }})"
+    runs-on: ubuntu-24.04
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    strategy:
+      fail-fast: false
+      matrix:
+        leg: [tests, lint]
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /opt/hostedtoolcache/PyPy
+          sudo rm -rf /opt/hostedtoolcache/Ruby
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+
+      - name: Install Linux build deps
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang \
+            cmake \
+            libclang-dev \
+            libssl-dev \
+            pkg-config
+
+      - name: Set up Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: 1.93
+          components: clippy
+          override: true
+
+      # rust-cache's default save-if persists only on success, so a failed
+      # compile never poisons the seed cache (hence no cache-on-failure here).
+      - name: Cache Rust dependencies & target dir
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: ${{ matrix.leg }}
+
+      # Compile (don't run) exactly what the Tests job builds: the workspace
+      # test binaries, the sat-cli path fixture, and the e2e target. `--no-run`
+      # links the test binaries but executes nothing.
+      - name: Warm the tests cache
+        if: matrix.leg == 'tests'
+        run: |
+          set -euo pipefail
+          cargo test --all --no-run --locked
+          cargo build -p sat-cli --locked
+          cargo test --test e2e --no-run --locked --features e2e
+
+      # Match the Lint job: clippy --all-targets --all-features. clippy
+      # type-checks without linking (dodging the bench/example link that
+      # SIGBUSes a plain --all-targets build on the 14 GB runner), and the
+      # dependency .rlibs it builds are shared with the PR Lint run. Warnings
+      # are allowed here (no `-D warnings`): the goal is to populate deps, not
+      # to gate lints — that gate lives in the Lint job.
+      - name: Warm the lint cache
+        if: matrix.leg == 'lint'
+        run: cargo clippy --all-targets --all-features --locked
