@@ -16,7 +16,7 @@ The compatibility contract itself — what is Tier 1 / Tier 2 / Tier 3,
 how deprecations are staged, what migration invariants apply — lives
 in `STABILITY_POLICY.md`.
 
-Last updated: 2026-05-30.
+Last updated: 2026-06-01.
 
 ---
 
@@ -25,12 +25,16 @@ Last updated: 2026-05-30.
 These surfaces match Bitcoin Core. We treat any user-visible deviation
 as a bug unless explicitly enumerated below.
 
-- **Consensus rules** — full P0 parity; mainnet shadow-validated against
-  `libbitcoinconsensus` from genesis through ~945k blocks. Soft-forks
-  through Taproot (BIPs 141, 143, 152, 155, 158, 340, 341, 342, 345)
-  are active. Locktime, BIP 68 sequence locks, BIP 34 coinbase height
-  enforcement, witness commitment validation, and median-time-past
-  semantics all match.
+- **Consensus rules** — full P0 parity; script evaluation is mainnet
+  shadow-validated against `libbitcoinconsensus` from genesis through
+  ~945k blocks (zero divergence). The block-acceptance pipeline around
+  scripts is held to Core by a differential test battery: static fixtures
+  ported from Core's own block-acceptance tests, plus a generative fuzzer
+  that dual-submits adversarial blocks to `satd` and a live `bitcoind` and
+  asserts identical accept/reject. Soft-forks through Taproot (BIPs 141,
+  143, 152, 155, 158, 340, 341, 342, 345) are active. Locktime, BIP 68
+  sequence locks, BIP 34 coinbase height enforcement, witness commitment
+  validation, and median-time-past semantics all match.
 - **P2P wire** — standard `NetworkMessage` types via the `bitcoin`
   crate; BIP 152 compact blocks, BIP 155 addrv2, BIP 157/158 compact
   filters, BIP 339 wtxid relay, BIP 324 v2 encrypted transport

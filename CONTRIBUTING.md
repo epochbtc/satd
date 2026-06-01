@@ -82,6 +82,13 @@ are not required to. Verification details are in `SECURITY.md`.
   asserting the wire shape for a representative request.
 - Consensus-adjacent changes — extend the shadow-verifier coverage if
   applicable; mismatches must produce a structured `ShadowMismatch`.
+  Script evaluation is shadow-checked against `libbitcoinconsensus`; the
+  block-acceptance pipeline around it is covered by the differential
+  battery — static fixtures in `node/tests/feature_block_consensus.rs`
+  and the live-Core differential / fuzzer (`satd/tests/phase_c_differential.rs`,
+  `fuzz/`). If your change touches block acceptance (PoW, commitments,
+  sigops, BIP 34, value conservation, maturity, timestamps, locktime),
+  add or extend a case there.
 
 ## AI-assisted contributions
 
