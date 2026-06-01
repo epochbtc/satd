@@ -92,7 +92,11 @@ pub struct CoinCache {
 /// mutation. While alive, external `CoinCache::flush` / `flush_durable`
 /// calls block. The holder flushes via [`FlushExclusion::flush`], which
 /// does NOT re-acquire the guard (avoiding self-deadlock).
-pub struct FlushExclusion<'a> {
+///
+/// Crate-internal: this is a reorg-coordination primitive, not part of the
+/// public API. Exposing the ability to freeze all cache flushes to library
+/// consumers would be a footgun.
+pub(crate) struct FlushExclusion<'a> {
     cache: &'a CoinCache,
     _guard: parking_lot::MutexGuard<'a, ()>,
 }
@@ -101,7 +105,7 @@ impl FlushExclusion<'_> {
     /// Flush while already holding the exclusion lock — used for the
     /// reorg's own pre-reorg checkpoint flush. Equivalent to `flush()`
     /// minus the guard acquisition.
-    pub fn flush(&self) -> Result<(), StoreError> {
+    pub(crate) fn flush(&self) -> Result<(), StoreError> {
         self.cache.flush_inner()
     }
 }
@@ -221,7 +225,9 @@ impl CoinCache {
     /// until the reorg is discarded — whichever comes first. While held,
     /// external `flush` / `flush_durable` block. Flush the checkpoint via
     /// `FlushExclusion::flush` (no re-acquire). See `flush_guard`.
-    pub fn lock_flush_exclusion(&self) -> FlushExclusion<'_> {
+    ///
+    /// Crate-internal: only the reorg path in `chain::state` may hold this.
+    pub(crate) fn lock_flush_exclusion(&self) -> FlushExclusion<'_> {
         FlushExclusion {
             cache: self,
             _guard: self.flush_guard.lock(),
@@ -2431,20 +2437,27 @@ mod tests {
         // Hold the exclusion on this thread (simulating a reorg window).
         let excl = cache.lock_flush_exclusion();
 
+        let other_started = Arc::new(AtomicBool::new(false));
         let other_done = Arc::new(AtomicBool::new(false));
         let handle = {
             let cache = Arc::clone(&cache);
+            let other_started = Arc::clone(&other_started);
             let other_done = Arc::clone(&other_done);
             std::thread::spawn(move || {
-                // Blocks on flush_guard until the exclusion is released.
+                // Signal that we have reached the flush call, then block on
+                // flush_guard until the exclusion is released.
+                other_started.store(true, Ordering::SeqCst);
                 cache.flush().unwrap();
                 other_done.store(true, Ordering::SeqCst);
             })
         };
 
-        // Give the other thread time to reach (and block on) the lock. It
-        // genuinely cannot proceed while we hold the exclusion, so this is
-        // not a flaky timing assertion — the flag stays false.
+        // Wait until the other thread has actually reached the flush call
+        // (so the assertion below provably exercises the block, not a
+        // not-yet-started thread), then give it time to park on the lock.
+        while !other_started.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
         std::thread::sleep(Duration::from_millis(100));
         assert!(
             !other_done.load(Ordering::SeqCst),
