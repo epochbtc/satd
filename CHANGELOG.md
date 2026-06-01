@@ -8,6 +8,21 @@ layout) per `STABILITY_POLICY.md`.
 
 ## [Unreleased]
 
+### Testing
+
+- **Block-level consensus differential matrix.** A new golden fixture suite
+  (`node/tests/feature_block_consensus.rs`), ported from Bitcoin Core's
+  `test/functional/feature_block.py`, pins satd's block- and chain-level
+  validation verdicts against Core's reference behavior across 30 cases
+  (coinbase structure, merkle, weight, UTXO/amount rules, locktime/sequence,
+  difficulty, MTP). Core is the oracle: each case carries Core's exact reject
+  reason, and the runner fails CI if satd's verdict drifts in either direction
+  — a covered rule that stops matching is a regression, and a known gap that
+  starts matching forces the case to be promoted. Phase B of the consensus
+  differential-fuzzing roadmap. The matrix surfaced four block-level
+  consensus rules satd did not yet enforce on its accept path; no consensus
+  behavior changes in this PR — those fixes land in a follow-up.
+
 ### Operator
 
 - **`SIGUSR1` now hot-reloads TLS certificates in place.** `kill -USR1 <pid>`
