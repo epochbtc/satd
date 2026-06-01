@@ -26,11 +26,13 @@ The existence of multiple serious implementations strengthens the BIP process. I
 
 ## 3. The Consensus Shield
 
-The historical argument against alternative Bitcoin clients is the fear of consensus divergence: the risk that a subtle difference in script evaluation could cause the network to split.
+The historical argument against alternative Bitcoin clients is the fear of consensus divergence: the risk that a subtle difference in validation could quietly split a node off the network. We take that risk seriously, and we do not ask operators to take our correctness on faith. `satd` ships a complete, independently written Rust consensus engine — it is *not* a wrapper around Core's — and we hold it to Core's behavior with two distinct, complementary defenses.
 
-`satd` solves this via **Shadow Validation**. While `satd` uses Rust for its networking, mempool, indexing, and storage layers, it shadow-validates every block against `libbitcoinconsensus`—the exact C++ consensus engine used by Bitcoin Core. 
+**Shadow validation of script evaluation.** Script evaluation is the subtlest and most divergence-prone surface in consensus — historically the source of the most dangerous client bugs. For this layer `satd` runs both engines at once: alongside its native Rust verifier it validates every script against `libbitcoinconsensus`, the exact C++ engine compiled from Bitcoin Core, and compares the two results at runtime. A disagreement is detected at the moment it would occur and raised as a loud, explicit alert, pinned to the offending block and input — a divergence cannot slip through silently. This is runtime-verified equivalence on every script your node actually evaluates, not a guarantee transcribed from a spec. It has been run across the mainnet chain from genesis through ~945k blocks with zero divergence.
 
-This provides the ultimate defense: the systemic resilience and operational ergonomics of a completely independent Rust implementation, backed by mathematical certainty of zero consensus divergence from the reference node.
+**Differential testing of block acceptance.** `libbitcoinconsensus` only checks scripts. The rest of the consensus pipeline — proof-of-work, merkle and witness commitments, sigop limits, BIP 34 height, value conservation, coinbase maturity, timestamps, locktime and sequence locks — is held to Core's exact behavior by an independent differential test battery. Static fixtures port Bitcoin Core's own block-acceptance test cases; a generative fuzzer then submits adversarial, mutated blocks to `satd` and a live `bitcoind` in lockstep and asserts that both nodes accept, or both reject, every one. Where no human thought to write a test, the fuzzer finds the divergence.
+
+Together these give the systemic resilience and operational ergonomics of a fully independent Rust implementation, with divergence from the reference node caught before it can fork your node off the chain — at runtime for scripts, and continuously in CI for the block-acceptance rules around them.
 
 ## 4. The BIP Policy: The Status Quo is the Default
 

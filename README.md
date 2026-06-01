@@ -11,13 +11,14 @@
 ## Why satd?
 
 *   **Node Sovereignty:** Built to give economic node operators a robust, memory-safe alternative to the monoculture, strengthening the network's resilience. Read the [Manifesto](MANIFESTO.md).
-*   **Zero Consensus Divergence (Dual Engine):** Features a full Rust implementation of the consensus rules that passes Bitcoin Core's test suite (and beyond). Operators can choose to run the pure Rust engine, the C++ `libbitcoinconsensus` engine, or both simultaneously with bidirectional shadow-validation to mathematically guarantee zero divergence.
+*   **Zero Consensus Divergence (Dual Engine):** Features a full Rust implementation of the consensus rules that passes Bitcoin Core's test suite (and beyond). Operators can choose to run the pure Rust engine, the C++ `libbitcoinconsensus` engine, or both simultaneously with shadow-validation — every script cross-checked against Core's engine at runtime (genesis→~945k, zero divergence). The block-acceptance rules around scripts are held to Core by a differential test battery: static fixtures ported from Core's own tests plus a generative fuzzer that submits adversarial blocks to `satd` and a live `bitcoind` in lockstep.
 *   **Built for the Operator:** Eliminates the `bitcoind` + `electrs` + `esplora` multi-process headache. Everything shares a single chainstate and a single RocksDB instance.
 
 ## Features
 
 ### Consensus & Network
-*   **Dual Consensus Engine:** A complete, independently written Rust consensus engine that passes the Bitcoin Core test suite, with a C++ `libbitcoinconsensus` conservative fallback.
+*   **Dual Consensus Engine:** A complete, independently written Rust consensus engine that passes the Bitcoin Core test suite, with a C++ `libbitcoinconsensus` conservative fallback and runtime script-level shadow validation between the two.
+*   **Differential Block-Acceptance Testing:** Beyond script verification, the full block-acceptance pipeline (PoW, merkle/witness commitments, sigops, BIP 34, value conservation, maturity, timestamps, locktime/BIP 68) is checked against Core by static fixtures ported from Core's own tests and a generative fuzzer that dual-submits adversarial blocks to `satd` and a live `bitcoind`.
 *   **Swarm-Style IBD:** BitTorrent-like parallel block downloading and speculative verification pipeline for heavily optimized Initial Block Download.
 *   **Full P2P:** BIP 152 compact blocks, ban scoring, addrv2, BIP 324 v2 encrypted transport (`-v2transport`, on by default; opt-in `-v2only` anti-surveillance mode), Tor v3 (hardcoded `.onion` seeds), SOCKS5 `-proxy`.
 *   **Policy Sovereignty (Mempool):** Strict, first-class control over what your node relays. Easily filter spam, block `OP_RETURN` data, or adjust limits via exposed flags (`-datacarrier`, `-datacarriersize`, `-dustrelayfee`, `-limitancestorcount`, `-permitbaremultisig`) without needing a patched fork.
