@@ -413,6 +413,14 @@ fn field_specs() -> Vec<FieldSpec> {
         // The API runtime's worker count is fixed when the runtime is built
         // at startup; changing it requires a restart.
         restart!("apithreads", api_threads),
+        // The opt-in read-only listener is bound and its admission budget +
+        // method filter wired at server-build time, so every read-only knob
+        // is restart-only.
+        restart!("rpcreadonlybind", rpc_readonly_bind),
+        restart!("rpcreadonlyport", rpc_readonly_port),
+        restart!("rpcreadonlyallowip", rpc_readonly_allowip),
+        restart!("rpcreadonlythreads", rpc_readonly_threads),
+        restart!("rpcreadonlyworkqueue", rpc_readonly_workqueue),
         live_secret!("rpcuser", rpcuser, apply_rpc_credentials),
         live_secret!("rpcpassword", rpcpassword, apply_rpc_credentials),
         live_secret!("rpcauth", rpcauth, apply_rpc_credentials),

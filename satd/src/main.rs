@@ -1446,6 +1446,20 @@ async fn main() {
         Some(filter_index.clone()),
         Some(filter_backfill_handle.clone()),
         Some(filter_backfill_cmd_tx.clone()),
+        // Opt-in read-only listener: served on the bounded API runtime
+        // (`api_handle`) so consumer read traffic can never starve block
+        // connection. `None` unless `-rpcreadonlybind` is configured.
+        if config.rpc_readonly_bind.is_empty() {
+            None
+        } else {
+            Some(node::rpc::server::ReadOnlyListener {
+                bind_addrs: config.rpc_readonly_bind.clone(),
+                allowip: config.rpc_readonly_allowip.clone(),
+                rpc_threads: config.rpc_readonly_threads,
+                rpc_workqueue: config.rpc_readonly_workqueue,
+                api_handle: api_handle.clone(),
+            })
+        },
     )
     .await
     {
@@ -2530,6 +2544,9 @@ async fn start_startup_rpc(
             None,
             node::rpc::server::RPC_MAX_CONNECTIONS as usize,
             admission.clone(),
+            // The IBD-phase startup RPC is a full read/write listener (no
+            // read-only method filter).
+            None,
         )
         .await
         .unwrap_or_else(|e| {

@@ -10603,3 +10603,113 @@ fn test_rpc_disableauth_without_mtls_aborts_startup() {
 
     let _ = std::fs::remove_dir_all(&datadir);
 }
+
+/// The opt-in read-only RPC listener (`-rpcreadonlybind`) serves reads +
+/// mempool-submit and rejects block-connecting / control methods, while the
+/// main listener keeps serving everything. Enabling the read-only listener
+/// also exercises the fail-closed completeness audit (a `debug_assert` in
+/// `rpc::server::start`) over every registered method, so an unclassified
+/// method would panic this test rather than ship.
+#[test]
+fn test_readonly_rpc_listener_filters_methods() {
+    let ro_port = find_available_port();
+    let node = TestNode::start(&[&format!("--rpcreadonlybind=127.0.0.1:{ro_port}")]);
+
+    // POST a JSON-RPC call to an arbitrary port using the node's cookie.
+    let call = |port: u16, method: &str, params: serde_json::Value| -> serde_json::Value {
+        let url = format!("http://127.0.0.1:{port}/");
+        let (user, pass) = node
+            .cookie
+            .split_once(':')
+            .unwrap_or(("__cookie__", "none"));
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+        let body = serde_json::json!({
+            "jsonrpc": "2.0", "id": "t", "method": method, "params": params,
+        });
+        client
+            .post(&url)
+            .basic_auth(user, Some(pass))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .unwrap()
+            .json()
+            .unwrap()
+    };
+
+    // The read-only listener binds during start() but its accept loop spins
+    // up on the API runtime; wait until it is accepting connections.
+    let mut ready = false;
+    for _ in 0..50 {
+        let url = format!("http://127.0.0.1:{ro_port}/");
+        if reqwest::blocking::Client::new()
+            .post(&url)
+            .body("")
+            .timeout(Duration::from_secs(2))
+            .send()
+            .is_ok()
+        {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(ready, "read-only listener never came up on {ro_port}");
+
+    // 1. Allowed read is served on the read-only listener.
+    let r = call(ro_port, "getblockcount", serde_json::json!([]));
+    assert_eq!(r["result"], 0, "getblockcount on RO listener: {r}");
+
+    // 2. Block-connecting method is rejected on the RO listener. The filter
+    //    runs before dispatch, so the params are irrelevant.
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let r = call(ro_port, "generatetoaddress", serde_json::json!([1, addr]));
+    assert_eq!(
+        r["error"]["code"], -32001,
+        "generatetoaddress must be filtered on RO listener: {r}"
+    );
+    assert!(
+        r["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("read-only"),
+        "rejection message should explain the read-only listener: {r}"
+    );
+
+    // 3. Control method is rejected — and the node stays up, because `stop`
+    //    never reaches the handler.
+    let r = call(ro_port, "stop", serde_json::json!([]));
+    assert_eq!(r["error"]["code"], -32001, "stop must be filtered: {r}");
+
+    // 4. Mempool submit passes the filter: junk hex fails later decode/
+    //    validation, but NOT with the read-only rejection code.
+    let r = call(ro_port, "sendrawtransaction", serde_json::json!(["00"]));
+    assert!(
+        r.get("error").is_some(),
+        "sendrawtransaction on junk should error: {r}"
+    );
+    assert_ne!(
+        r["error"]["code"], -32001,
+        "sendrawtransaction must pass the RO filter (fail on validation, not the filter): {r}"
+    );
+
+    // 5. The MAIN listener has no filter: the same block-connecting method
+    //    is dispatched and actually mines, proving the split.
+    let r = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(1), serde_json::json!(addr)],
+        )
+        .unwrap();
+    assert!(
+        r.get("result").is_some() && r["error"].is_null(),
+        "generatetoaddress on the main listener should work: {r}"
+    );
+
+    // The mined block is visible through the read-only listener too.
+    let r = call(ro_port, "getblockcount", serde_json::json!([]));
+    assert_eq!(r["result"], 1, "RO listener should see the mined block: {r}");
+}
