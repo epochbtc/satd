@@ -46,6 +46,13 @@
 //!     detected by `check_block`'s `merkle_tree_mutated` flag (Core parity).
 //!   * `bad-txns-oversize`  — per-transaction weight cap now enforced in
 //!     `check_transaction` (previously only the block-weight check covered it).
+//!
+//! Finally, the four cases that previously rejected with a satd-specific reason
+//! string (tracked as `Expect::ReasonDiffers`) have been aligned to Core's exact
+//! reject reason and promoted to `Expect::Match`: empty block (`bad-blk-length`),
+//! missing/!match witness commitment (`bad-witness-merkle-match`), output over
+//! `MAX_MONEY` (`bad-txns-vout-toolarge`), and bad PoW (`high-hash`). The matrix
+//! is now 32/32 exact (verdict **and** reject reason) against Core.
 
 use bitcoin::absolute::LockTime;
 use bitcoin::block::Header;
@@ -88,7 +95,11 @@ enum Expect {
     /// same reason string.
     Match,
     /// satd rejects (like Core) but with a *different* reason label.
-    /// The string is the reason satd currently emits.
+    /// The string is the reason satd currently emits. No cases currently carry
+    /// this disposition (all reject-reason strings now align with Core), but the
+    /// variant and its runner arms are retained so a future divergence can be
+    /// pinned without re-plumbing.
+    #[allow(dead_code)]
     ReasonDiffers(&'static str),
     /// Core rejects but satd accepts — a known, unclosed consensus gap.
     /// The runner keeps it pinned open and fails the day a fix closes it,
@@ -583,16 +594,16 @@ fn cases() -> Vec<Case> {
     vec![
         // context-free block structure
         Case { name: "accept_genesis", core: Accept, expect: Match, run: case_accept_genesis },
-        Case { name: "empty_block", core: Reject("bad-blk-length"), expect: ReasonDiffers("bad-txns-empty"), run: case_empty_block },
+        Case { name: "empty_block", core: Reject("bad-blk-length"), expect: Match, run: case_empty_block },
         Case { name: "first_tx_not_coinbase", core: Reject("bad-cb-missing"), expect: Match, run: case_first_tx_not_coinbase },
         Case { name: "multiple_coinbase", core: Reject("bad-cb-multiple"), expect: Match, run: case_multiple_coinbase },
         Case { name: "bad_merkle_root", core: Reject("bad-txnmrklroot"), expect: Match, run: case_bad_merkle_root },
         Case { name: "oversize_block", core: Reject("bad-blk-length"), expect: Match, run: case_oversize_block },
-        Case { name: "witness_commitment_missing", core: Reject("bad-witness-merkle-match"), expect: ReasonDiffers("bad-witness-commitment"), run: case_witness_commitment_missing },
+        Case { name: "witness_commitment_missing", core: Reject("bad-witness-merkle-match"), expect: Match, run: case_witness_commitment_missing },
         // context-free transaction
         Case { name: "tx_no_inputs", core: Reject("bad-txns-vin-empty"), expect: Match, run: case_tx_no_inputs },
         Case { name: "tx_no_outputs", core: Reject("bad-txns-vout-empty"), expect: Match, run: case_tx_no_outputs },
-        Case { name: "tx_output_over_max", core: Reject("bad-txns-vout-toolarge"), expect: ReasonDiffers("bad-txns-vout-negative"), run: case_tx_output_over_max },
+        Case { name: "tx_output_over_max", core: Reject("bad-txns-vout-toolarge"), expect: Match, run: case_tx_output_over_max },
         Case { name: "tx_duplicate_inputs", core: Reject("bad-txns-inputs-duplicate"), expect: Match, run: case_tx_duplicate_inputs },
         Case { name: "coinbase_scriptsig_too_short", core: Reject("bad-cb-length"), expect: Match, run: case_coinbase_scriptsig_too_short },
         Case { name: "coinbase_scriptsig_too_long", core: Reject("bad-cb-length"), expect: Match, run: case_coinbase_scriptsig_too_long },
@@ -608,7 +619,7 @@ fn cases() -> Vec<Case> {
         Case { name: "bip68_sequence_not_met", core: Reject("bad-txns-nonBIP68-final"), expect: Match, run: case_bip68_sequence_not_met },
         Case { name: "intra_block_spend_ok", core: Accept, expect: Match, run: case_intra_block_spend_ok },
         // proof-of-work / difficulty / timestamp
-        Case { name: "high_hash_bad_pow", core: Reject("high-hash"), expect: ReasonDiffers("bad-pow"), run: case_high_hash_bad_pow },
+        Case { name: "high_hash_bad_pow", core: Reject("high-hash"), expect: Match, run: case_high_hash_bad_pow },
         Case { name: "bad_diffbits", core: Reject("bad-diffbits"), expect: Match, run: case_bad_diffbits },
         Case { name: "time_too_old_mtp", core: Reject("time-too-old"), expect: Match, run: case_time_too_old_mtp },
         // Formerly gaps (Core rejects, satd accepted) — now enforced and

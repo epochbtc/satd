@@ -43,6 +43,31 @@ layout) per `STABILITY_POLICY.md`.
   `MAX_BLOCK_WEIGHT`. The block path was already covered by the block-weight
   check, but a standalone transaction (e.g. `sendrawtransaction`) previously
   slipped through. Surfaced by the block-handling equivalence audit (finding F).
+- **Align four block-rejection reason strings to Bitcoin Core** (finding H).
+  satd already rejected these blocks/transactions; only the reject-*reason*
+  label differed, which matters for operators and tools that key on Core's
+  strings. Now matched exactly: empty block `bad-txns-empty` → `bad-blk-length`;
+  missing/mismatched witness commitment `bad-witness-commitment` →
+  `bad-witness-merkle-match`; output over `MAX_MONEY` `bad-txns-vout-negative` →
+  `bad-txns-vout-toolarge` (and the running-total case now distinctly reports
+  `bad-txns-txouttotal-toolarge`, matching Core); bad proof-of-work `bad-pow` →
+  `high-hash`. The differential matrix is now **32/32 exact** against Core on
+  both verdict and reject reason.
+- **Reject mutated blocks on receipt (Core's `IsBlockMutated` gate)** (finding
+  D). At every P2P block-ingress point — direct `Block` messages and both
+  compact-block reconstruction paths (`cmpctblock` reconstructed from mempool
+  and the `blocktxn` completion) — satd now rejects a block whose merkle tree is
+  malleable (CVE-2012-2459) or that contains a transaction whose non-witness
+  serialized size is exactly 64 bytes — a tx that can be reinterpreted as an
+  inner merkle node, enabling forged merkle proofs against SPV clients. The
+  check is centralized in one `reject_if_mutated` helper applied at all three
+  ingress sites so no route into the block-processing channel can bypass it. The
+  sending peer is penalized, but the block is **not** marked permanently
+  invalid, so an honest block sharing the same hash remains acceptable from
+  another peer (avoiding the CVE-2012-2459 index-poisoning DoS). This is a
+  networking-layer anti-malleation check, not a new consensus rule: a 64-byte
+  transaction remains consensus-valid, matching Core, which performs this check
+  outside `CheckBlock`/`ConnectBlock`.
 
 ### Testing
 

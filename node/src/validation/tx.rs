@@ -38,13 +38,13 @@ pub fn check_transaction(tx: &Transaction) -> Result<(), ValidationError> {
     for output in &tx.output {
         let value = output.value.to_sat();
         if value > MAX_MONEY {
-            return Err(ValidationError::BadTxOutputValue);
+            return Err(ValidationError::BadTxOutputTooLarge);
         }
         total_out = total_out
             .checked_add(value)
-            .ok_or(ValidationError::BadTxOutputValue)?;
+            .ok_or(ValidationError::BadTxOutputTotalTooLarge)?;
         if total_out > MAX_MONEY {
-            return Err(ValidationError::BadTxOutputValue);
+            return Err(ValidationError::BadTxOutputTotalTooLarge);
         }
     }
 
@@ -158,7 +158,7 @@ mod tests {
         };
         assert!(matches!(
             check_transaction(&tx),
-            Err(ValidationError::BadTxOutputValue)
+            Err(ValidationError::BadTxOutputTooLarge)
         ));
     }
 
@@ -187,9 +187,13 @@ mod tests {
                 },
             ],
         };
+        // Each output alone (u64::MAX/2) already exceeds MAX_MONEY, so the
+        // per-output check fires first → BadTxOutputTooLarge (the running-total
+        // / checked_add path is exercised by test_total_output_exceeds_max_money,
+        // where each output is individually within range).
         assert!(matches!(
             check_transaction(&tx),
-            Err(ValidationError::BadTxOutputValue)
+            Err(ValidationError::BadTxOutputTooLarge)
         ));
     }
 
@@ -221,7 +225,7 @@ mod tests {
         };
         assert!(matches!(
             check_transaction(&tx),
-            Err(ValidationError::BadTxOutputValue)
+            Err(ValidationError::BadTxOutputTotalTooLarge)
         ));
     }
 

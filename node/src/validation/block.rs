@@ -94,9 +94,13 @@ fn check_witness_commitment(block: &Block) -> Result<(), ValidationError> {
         None => return Err(ValidationError::BadWitnessCommitment),
     };
 
-    // Get the witness nonce from coinbase witness
-    let witness_nonce = if !coinbase.input[0].witness.is_empty() {
-        let item = coinbase.input[0].witness.nth(0).unwrap_or(&[0u8; 32]);
+    // Get the witness nonce from the coinbase's first input. `check_block`
+    // already rejected a non-coinbase first tx (a coinbase has exactly one
+    // input), so `input[0]` is present on the validated path; use `first()`
+    // anyway so this function never panics if called in another context.
+    let coinbase_witness = coinbase.input.first().map(|i| &i.witness);
+    let witness_nonce = if coinbase_witness.is_some_and(|w| !w.is_empty()) {
+        let item = coinbase_witness.unwrap().nth(0).unwrap_or(&[0u8; 32]);
         if item.len() == 32 {
             let mut nonce = [0u8; 32];
             nonce.copy_from_slice(item);
@@ -171,6 +175,20 @@ fn merkle_tree_mutated(block: &Block) -> bool {
         current = next;
     }
     false
+}
+
+/// Detect a "mutated" block per Bitcoin Core's `IsBlockMutated` — the P2P-layer
+/// anti-malleation gate, distinct from consensus `check_block`. A block is
+/// mutated if its merkle tree is malleable (CVE-2012-2459; see
+/// `merkle_tree_mutated`) or it contains a transaction whose non-witness
+/// serialized size is exactly 64 bytes. A 64-byte transaction can be
+/// reinterpreted as a pair of 32-byte hashes (an internal merkle node),
+/// enabling forged merkle proofs against SPV clients. Core refuses to process a
+/// mutated block and penalizes the sender, but does NOT mark the block
+/// permanently invalid (an honest block sharing the same hash must remain
+/// acceptable). satd applies this at block receipt, before acceptance.
+pub fn is_block_mutated(block: &Block) -> bool {
+    merkle_tree_mutated(block) || block.txdata.iter().any(|tx| tx.base_size() == 64)
 }
 
 fn compute_merkle_root_from_hashes(hashes: &[[u8; 32]]) -> [u8; 32] {
@@ -647,5 +665,56 @@ mod tests {
         block.header.merkle_root = block.compute_merkle_root().unwrap();
         assert!(!merkle_tree_mutated(&block));
         assert!(check_block(&block).is_ok());
+    }
+
+    // -- IsBlockMutated (P2P-layer 64-byte / merkle malleation gate) --
+
+    #[test]
+    fn test_is_block_mutated_64byte_tx() {
+        // A 1-in/1-out tx serializes (no witness) to 60 bytes + the output
+        // script length; a 4-byte output script makes it exactly 64 bytes — the
+        // merkle-node-confusion vector. is_block_mutated must flag it even though
+        // the block is otherwise well-formed (correct merkle root, no dup txs).
+        let coinbase = bitcoin::constants::genesis_block(Network::Regtest).txdata[0].clone();
+        let tx64 = Transaction {
+            version: TxVersion::ONE,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::from_byte_array([0x33; 32]),
+                    vout: 0,
+                },
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: bitcoin::ScriptBuf::from(vec![0x6a, 0x00, 0x00, 0x00]),
+            }],
+        };
+        assert_eq!(tx64.base_size(), 64, "test setup: tx must be 64 base bytes");
+        let mut block = bitcoin::constants::genesis_block(Network::Regtest);
+        block.txdata = vec![coinbase, tx64];
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+        assert!(is_block_mutated(&block));
+    }
+
+    #[test]
+    fn test_is_block_mutated_flags_merkle_mutation() {
+        // The CVE-2012-2459 case is also covered by is_block_mutated.
+        let coinbase = bitcoin::constants::genesis_block(Network::Regtest).txdata[0].clone();
+        let t2 = dummy_spend(0x22);
+        let mut block = bitcoin::constants::genesis_block(Network::Regtest);
+        block.txdata = vec![coinbase, dummy_spend(0x11), t2.clone(), t2];
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+        assert!(is_block_mutated(&block));
+    }
+
+    #[test]
+    fn test_honest_block_not_mutated() {
+        // The plain regtest genesis block (coinbase only) is not mutated.
+        let block = bitcoin::constants::genesis_block(Network::Regtest);
+        assert!(!is_block_mutated(&block));
     }
 }
