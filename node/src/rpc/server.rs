@@ -7,6 +7,7 @@ use crate::net::manager::PeerManager;
 use crate::rpc::amounts::{
     annotate_units, default_unit, format_amount, format_feerate_sat_per_kvb,
 };
+use crate::rpc::admission::{AdmissionLayer, AdmissionState};
 use crate::rpc::auth::{AuthLayer, RpcAuth};
 use crate::rpc::compat::JsonRpcCompatLayer;
 use crate::rpc::{address, blockchain, indexes, mining, network, psbt, rawtx, util};
@@ -360,6 +361,12 @@ pub async fn start(
     // config-load validation enforces "Disabled requires mTLS"; this
     // layer accepts whatever the caller passes.
     tls_auth: Option<Arc<RpcAuth>>,
+    // RPC admission control (Bitcoin Core `-rpcthreads` / `-rpcworkqueue`).
+    // Bounds concurrent in-flight method calls and the backlog allowed to
+    // wait before shedding with HTTP 429. Shared across the plain-HTTP and
+    // TLS surfaces as a single node-wide RPC work budget.
+    rpc_threads: usize,
+    rpc_workqueue: usize,
     chain_state: Arc<ChainState>,
     mempool: Arc<Mempool>,
     peer_manager: Arc<PeerManager>,
@@ -1872,6 +1879,9 @@ pub async fn start(
     // exposes the peer `SocketAddr` to the HTTP middleware. The
     // allowlist is shared (read-only) across every listener task.
     let allowip = Arc::new(allowip);
+    // One shared admission budget (`-rpcthreads` / `-rpcworkqueue`) across
+    // every plain-HTTP and TLS surface: a single node-wide RPC work queue.
+    let admission = AdmissionState::new(rpc_threads, rpc_workqueue);
     let mut plain_handles: Vec<ServerHandle> = Vec::with_capacity(bind_addrs.len());
     for bind_addr in &bind_addrs {
         let handle = spawn_plain_surface(
@@ -1882,6 +1892,7 @@ pub async fn start(
             methods.clone(),
             Some(shutdown_tx_outer.subscribe()),
             RPC_MAX_CONNECTIONS as usize,
+            admission.clone(),
         )
         .await?;
         plain_handles.push(handle);
@@ -1902,6 +1913,7 @@ pub async fn start(
                 methods,
                 listener_status_outer,
                 &mut shutdown_rx_for_tls,
+                admission.clone(),
             )
             .await?,
         )
@@ -1929,6 +1941,7 @@ async fn spawn_tls_surface(
     methods: Methods,
     listener_status: Arc<ServerListenerStatus>,
     shutdown_rx: &mut watch::Receiver<bool>,
+    admission: Arc<AdmissionState>,
 ) -> Result<ServerHandle, Box<dyn std::error::Error + Send + Sync>> {
     // mTLS policy: `Required` when the operator opted in via
     // `--rpcmtls=1`; otherwise `Disabled` (plain server-auth TLS).
@@ -1965,11 +1978,13 @@ async fn spawn_tls_surface(
     // Building once side-steps an HRTB inference quirk that bites if
     // you defer the `.build()` call into the per-connection `async`
     // block.
-    // AuthLayer is outermost so an unauthenticated request is rejected
-    // before the compat layer buffers its body; JsonRpcCompatLayer then
-    // normalizes Core-style (`jsonrpc` 1.0/1.1/absent) requests to 2.0
-    // so jsonrpsee accepts them (see `compat.rs`).
+    // AdmissionLayer is outermost so an over-budget request is shed (429)
+    // before any auth/compat work. AuthLayer is next so an unauthenticated
+    // request is rejected before the compat layer buffers its body;
+    // JsonRpcCompatLayer then normalizes Core-style (`jsonrpc` 1.0/1.1/
+    // absent) requests to 2.0 so jsonrpsee accepts them (see `compat.rs`).
     let tls_middleware = tower::ServiceBuilder::new()
+        .layer(AdmissionLayer::new(admission))
         .layer(AuthLayer::new(auth))
         .layer(JsonRpcCompatLayer::new());
     let rpc_svc = ServerBuilder::new()
@@ -2159,6 +2174,7 @@ async fn spawn_tls_surface(
 ///
 /// `max_connections` MUST match `server_cfg`'s connection cap; callers
 /// pass [`RPC_MAX_CONNECTIONS`], which `server_cfg` is also built from.
+#[allow(clippy::too_many_arguments)]
 pub async fn spawn_plain_surface(
     bind_addr: SocketAddr,
     server_cfg: ServerConfig,
@@ -2167,6 +2183,7 @@ pub async fn spawn_plain_surface(
     methods: Methods,
     shutdown_rx: Option<watch::Receiver<bool>>,
     max_connections: usize,
+    admission: Arc<AdmissionState>,
 ) -> Result<ServerHandle, Box<dyn std::error::Error + Send + Sync>> {
     // Bind synchronously so a port conflict is a startup-fatal error
     // rather than a silently-dropped task that never accepts.
@@ -2179,6 +2196,7 @@ pub async fn spawn_plain_surface(
     let (stop_handle, server_handle) = stop_channel();
 
     let plain_middleware = tower::ServiceBuilder::new()
+        .layer(AdmissionLayer::new(admission))
         .layer(AuthLayer::new(auth))
         .layer(JsonRpcCompatLayer::new());
     let rpc_svc = ServerBuilder::new()

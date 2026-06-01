@@ -263,7 +263,15 @@ async fn main() {
     let startup_handle = {
         let progress = startup_progress.clone();
         let auth_clone = auth.clone();
-        start_startup_rpc(rpc_binds.clone(), config.rpcallowip.clone(), auth_clone, progress).await
+        start_startup_rpc(
+            rpc_binds.clone(),
+            config.rpcallowip.clone(),
+            auth_clone,
+            progress,
+            config.rpc_threads,
+            config.rpc_workqueue,
+        )
+        .await
     };
 
     // Service-manager heartbeat. On systemd this prevents the unit from
@@ -779,6 +787,10 @@ async fn main() {
             bind,
             config.events_grpc_allow_remote,
             event_publisher.clone(),
+            satd_events::GrpcLimits {
+                max_conns: config.events_grpc_max_conns,
+                max_subscriptions: config.events_grpc_max_subscriptions,
+            },
         )
         .await
         {
@@ -1299,11 +1311,12 @@ async fn main() {
                 handshake_timeout: std::time::Duration::from_secs(
                     config.rpc_tls_handshake_timeout,
                 ),
-                // Default 100 mirrors jsonrpsee's
-                // `ServerConfig::max_connections`. The plain-HTTP
-                // path's cap; the TLS surface keeps the same default
-                // so operator expectations don't drift between paths.
-                max_connections: 100,
+                // Socket-level connection cap. Derived from the single
+                // source of truth (`RPC_MAX_CONNECTIONS`) so the plain-HTTP
+                // and TLS surfaces provably share one number rather than two
+                // hand-synced literals. This is the raw-socket cap; the
+                // request-concurrency budget is `-rpcthreads`/`-rpcworkqueue`.
+                max_connections: node::rpc::server::RPC_MAX_CONNECTIONS as usize,
             }),
             Err(e) => {
                 eprintln!("Error: invalid --rpctlsbind {addr_str:?}: {e}");
@@ -1340,6 +1353,8 @@ async fn main() {
         rpc_tls,
         auth.clone(),
         tls_auth,
+        config.rpc_threads,
+        config.rpc_workqueue,
         chain_state.clone(),
         mempool.clone(),
         peer_manager.clone(),
@@ -2368,6 +2383,8 @@ async fn start_startup_rpc(
     allowip: Vec<node::rpc::allowip::IpAllowEntry>,
     auth: Arc<RpcAuth>,
     progress: Arc<node::startup_progress::StartupProgress>,
+    rpc_threads: usize,
+    rpc_workqueue: usize,
 ) -> StartupRpcHandle {
     use jsonrpsee::server::{Methods, RpcModule, ServerConfig};
     use jsonrpsee::types::ErrorObjectOwned;
@@ -2416,6 +2433,9 @@ async fn start_startup_rpc(
     let server_cfg = ServerConfig::builder()
         .max_connections(node::rpc::server::RPC_MAX_CONNECTIONS)
         .build();
+    // The startup RPC honors the same admission budget as the full server,
+    // so an operator's `-rpcthreads` / `-rpcworkqueue` applies during IBD too.
+    let admission = node::rpc::admission::AdmissionState::new(rpc_threads, rpc_workqueue);
     let mut handles = Vec::with_capacity(bind_addrs.len());
     for bind_addr in &bind_addrs {
         let handle = node::rpc::server::spawn_plain_surface(
@@ -2426,6 +2446,7 @@ async fn start_startup_rpc(
             methods.clone(),
             None,
             node::rpc::server::RPC_MAX_CONNECTIONS as usize,
+            admission.clone(),
         )
         .await
         .unwrap_or_else(|e| {

@@ -1,4 +1,5 @@
 pub mod address;
+pub mod admission;
 pub mod allowip;
 pub mod amounts;
 pub mod auth;
