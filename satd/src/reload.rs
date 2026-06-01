@@ -410,6 +410,9 @@ fn field_specs() -> Vec<FieldSpec> {
         // it requires a restart.
         restart!("rpcthreads", rpc_threads),
         restart!("rpcworkqueue", rpc_workqueue),
+        // The API runtime's worker count is fixed when the runtime is built
+        // at startup; changing it requires a restart.
+        restart!("apithreads", api_threads),
         live_secret!("rpcuser", rpcuser, apply_rpc_credentials),
         live_secret!("rpcpassword", rpcpassword, apply_rpc_credentials),
         live_secret!("rpcauth", rpcauth, apply_rpc_credentials),
