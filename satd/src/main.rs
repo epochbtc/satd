@@ -44,6 +44,29 @@ impl notify::WatchdogProbe for ChainStateProbe {
     }
 }
 
+/// Owns the isolated API runtime and tears it down on **any** exit path.
+///
+/// `main` runs inside the core runtime's `block_on`, so dropping a tokio
+/// runtime directly here panics ("Cannot drop a runtime in a context where
+/// blocking is not allowed"). `main` also has several early `return`s (e.g.
+/// reindex `-stopatheight`), each of which would unwind and drop the
+/// runtime. This guard funnels every such drop onto a plain OS thread —
+/// where dropping a runtime is allowed — and bounds the wait so a wedged
+/// streaming client can't hold shutdown open. (`std::process::exit` paths
+/// skip the destructor entirely, which is fine: no drop, no panic.)
+struct ApiRuntimeGuard(Option<tokio::runtime::Runtime>);
+
+impl Drop for ApiRuntimeGuard {
+    fn drop(&mut self) {
+        if let Some(rt) = self.0.take() {
+            let _ = std::thread::spawn(move || {
+                rt.shutdown_timeout(std::time::Duration::from_secs(5));
+            })
+            .join();
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     // Config must be parsed before tracing init so --log-format can select
@@ -105,6 +128,33 @@ async fn main() {
         datadir = %config.datadir.display(),
         rpcport = config.rpcport,
         "satd v0.1.0 starting"
+    );
+
+    // Separate, bounded tokio runtime for the remotely-consumed *read*
+    // surfaces — Esplora, Electrum, events gRPC, and metrics. The
+    // consensus/P2P core keeps the `#[tokio::main]` runtime, and so do the
+    // control-plane surfaces that can mutate chain state (JSON-RPC and MCP,
+    // which carry block-connecting methods): originating block connection
+    // from the API runtime would reorder the address-index status notifier.
+    // Isolating the high-volume read surfaces onto their own bounded worker
+    // pool means a flood on any of them can never starve block connection or
+    // mempool acceptance — the isolation is structural, not policy.
+    // `--api-threads` sizes this pool; the signal handlers and SIGHUP/SIGUSR1
+    // reload stay on the core runtime, reaching the relocated surfaces
+    // through the shared Arc/atomic handles they already hold.
+    let api_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(config.api_threads)
+        .thread_name("satd-api")
+        .enable_all()
+        .build()
+        .expect("Failed to build API runtime");
+    let api_handle = api_runtime.handle().clone();
+    // The guard tears the runtime down off-thread on every drop path (normal
+    // shutdown AND early returns), avoiding the async-context drop panic.
+    let _api_runtime_guard = ApiRuntimeGuard(Some(api_runtime));
+    tracing::info!(
+        api_threads = config.api_threads,
+        "isolated API runtime started (Esplora/Electrum/events-gRPC/metrics)"
     );
 
     // Configure server-wide structured-error switch before any RPC handlers run.
@@ -261,6 +311,9 @@ async fn main() {
     let rpc_binds: Vec<SocketAddr> = config.rpcbind.clone();
     let startup_progress = node::startup_progress::StartupProgress::new();
     let startup_handle = {
+        // Like the full JSON-RPC server, the IBD-phase RPC stays on the
+        // consensus (core) runtime — it's the control plane and must remain
+        // reachable independently of API-surface load.
         let progress = startup_progress.clone();
         let auth_clone = auth.clone();
         start_startup_rpc(
@@ -832,7 +885,15 @@ async fn main() {
         }
     }
     if !event_sinks.is_empty() {
-        let count = event_publisher.attach_sinks(event_sinks, shutdown_rx.clone());
+        // Spawn the external sink tasks (events gRPC server, ZMQ PUB) on the
+        // isolated API runtime: `attach_sinks` calls `tokio::spawn`
+        // synchronously, so entering the API runtime's context here routes
+        // those spawns — and every per-connection task they later spawn — to
+        // the API pool rather than the consensus core.
+        let count = {
+            let _api_guard = api_handle.enter();
+            event_publisher.attach_sinks(event_sinks, shutdown_rx.clone())
+        };
         tracing::info!(target: "events", sinks = count, "events bus external sinks attached");
     }
 
@@ -1347,6 +1408,14 @@ async fn main() {
         None
     };
     let allowip = config.rpcallowip.clone();
+    // JSON-RPC stays on the consensus (core) runtime — it is the control
+    // plane and carries the chain-mutating methods (generate*/submitblock/
+    // invalidateblock/reconsiderblock). Keeping it here both avoids
+    // originating block-connection from the API runtime (which would
+    // reorder the address-index status notifier and corrupt subscriber
+    // status) and makes it a "break glass" admin endpoint that API-surface
+    // load cannot starve. A scalable read-only RPC listener on the API
+    // runtime is a planned follow-up.
     let server_handle = match node::rpc::server::start(
         bind_addrs.clone(),
         allowip,
@@ -1408,6 +1477,12 @@ async fn main() {
 
         if config.mcp_stdio {
             let ctx = mcp_ctx.clone();
+            // MCP stays on the consensus (core) runtime: it exposes a
+            // block-connecting `generate_blocks` tool, so — like JSON-RPC —
+            // it must not originate block connection from the API runtime.
+            // (It is also loopback-only today, so it carries no public load
+            // that would need isolating.) Revisit when the read-only split
+            // lands.
             tokio::spawn(async move {
                 if let Err(e) = satd_mcp::serve_stdio(ctx).await {
                     tracing::error!("MCP stdio server error: {}", e);
@@ -1422,6 +1497,8 @@ async fn main() {
                 .expect("Invalid MCP bind address");
             let ctx = mcp_ctx.clone();
             let rx = shutdown_rx.clone();
+            // MCP HTTP stays on the consensus runtime for the same reason
+            // as the stdio transport above (block-connecting tool).
             tokio::spawn(async move {
                 if let Err(e) = satd_mcp::serve_http(ctx, mcp_bind, rx).await {
                     tracing::error!("MCP HTTP server error: {}", e);
@@ -1447,7 +1524,7 @@ async fn main() {
             addr_enabled: config.addressindex,
         };
         let rx = shutdown_rx.clone();
-        tokio::spawn(async move {
+        api_handle.spawn(async move {
             if let Err(e) = node::metrics::serve_metrics_http(metrics_ctx, metrics_bind, rx).await {
                 tracing::error!("Metrics HTTP server error: {}", e);
             }
@@ -1692,7 +1769,7 @@ async fn main() {
             // Router is Clone-cheap). They observe the same shutdown
             // watch, so SIGTERM gracefully drains both surfaces.
             let plain_router = router.clone();
-            tokio::spawn(async move {
+            api_handle.spawn(async move {
                 let serve =
                     axum::serve(listener, plain_router).with_graceful_shutdown(async move {
                         let _ = esplora_shutdown.changed().await;
@@ -1714,7 +1791,7 @@ async fn main() {
                     config.esplora_mtls,
                     allow,
                 );
-                tokio::spawn(async move {
+                api_handle.spawn(async move {
                     let serve = axum::serve(tls_wrap, tls_router)
                         .with_graceful_shutdown(async move {
                             let _ = tls_shutdown.changed().await;
@@ -1877,7 +1954,7 @@ async fn main() {
             listener_status.set_electrum_tls(tls_bind);
         }
         let electrum_shutdown = shutdown_rx.clone();
-        tokio::spawn(async move {
+        api_handle.spawn(async move {
             server.serve(electrum_shutdown).await;
         });
     }
@@ -2335,6 +2412,12 @@ async fn main() {
     peer_manager.dump_addrman(&net_datadir.join("peers.dat"));
 
     server_handle.stop().expect("Failed to stop server");
+
+    // The isolated API runtime is torn down by `ApiRuntimeGuard` when `main`
+    // returns (it drains surfaces with a bounded deadline on a plain OS
+    // thread). Surfaces were already told to stop via the shutdown-watch
+    // broadcast at signal time, so this is a fast join in the common case.
+
     auth.cleanup();
     if let Some(ref pid_path) = config.pid {
         let _ = std::fs::remove_file(pid_path);
