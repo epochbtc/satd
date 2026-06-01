@@ -1,4 +1,4 @@
-use bitcoin::{Block, Network, OutPoint, Transaction, TxOut};
+use bitcoin::{Block, BlockHash, Network, OutPoint, Transaction, TxOut};
 use std::collections::{HashMap, HashSet};
 
 use crate::storage::blockindex::{BlockIndexEntry, BlockStatus, add_u256, work_for_bits};
@@ -11,6 +11,18 @@ use crate::validation::tx::check_transaction;
 
 /// Coinbase maturity: outputs cannot be spent until this many confirmations.
 const COINBASE_MATURITY: u32 = 100;
+
+/// Bitcoin Core's `MAX_BLOCK_SIGOPS_COST`: the maximum total
+/// (witness-scaled) signature-operation cost permitted in a single block.
+/// Equals the pre-segwit `MAX_BLOCK_SIGOPS` (20 000) times
+/// `WITNESS_SCALE_FACTOR` (4).
+const MAX_BLOCK_SIGOPS_COST: u64 = 80_000;
+
+/// BIP 16 (P2SH) activation height on mainnet. Below it, only legacy
+/// sigops count toward [`MAX_BLOCK_SIGOPS_COST`]; at/after it, P2SH
+/// redeem-script (and, post-segwit, witness) sigops are included. Mirrors
+/// the height gate used by the script verifier (`validation::script`).
+const P2SH_ACTIVATION_HEIGHT: u32 = 173_805;
 
 /// Bitcoin Core's `MAX_SCRIPT_SIZE` (`script.h`). Scripts larger than
 /// this are provably unspendable.
@@ -36,6 +48,10 @@ pub enum ConnectError {
     BadAmounts,
     #[error("bad-cb-amount")]
     BadCoinbaseValue,
+    #[error("bad-blk-sigops")]
+    BadBlockSigops,
+    #[error("bad-txns-BIP30")]
+    BadBip30,
     #[error("mandatory-script-verify-flag-failed ({0})")]
     ScriptFailed(String),
     #[error("bad-txns-nonfinal")]
@@ -145,6 +161,104 @@ pub fn bip113_activation_height(network: Network) -> u32 {
     }
 }
 
+/// BIP 66 (strict DER) activation height per network. Used by the mandatory
+/// block-version gate (`version >= 3` at/after this height).
+pub fn bip66_activation_height(network: Network) -> u32 {
+    match network {
+        Network::Bitcoin => 363_725,
+        Network::Testnet => 330_776,
+        _ => 1, // Signet, Regtest: always active
+    }
+}
+
+/// BIP 65 (CHECKLOCKTIMEVERIFY) activation height per network. Used by the
+/// mandatory block-version gate (`version >= 4` at/after this height).
+pub fn bip65_activation_height(network: Network) -> u32 {
+    match network {
+        Network::Bitcoin => 388_381,
+        Network::Testnet => 581_885,
+        _ => 1, // Signet, Regtest: always active
+    }
+}
+
+/// Enforce the mandatory minimum block version for `height` (Bitcoin Core's
+/// `bad-version` check in `ContextualCheckBlockHeader`): BIP 34 requires
+/// `version >= 2`, BIP 66 requires `version >= 3`, and BIP 65 requires
+/// `version >= 4`, each once the corresponding softfork has activated. The
+/// reject-reason string matches Core's `bad-version(0x%08x)` format.
+pub fn check_block_version(
+    header: &bitcoin::block::Header,
+    height: u32,
+    network: Network,
+) -> Result<(), crate::validation::ValidationError> {
+    let version = header.version.to_consensus();
+    let too_low = (version < 2 && height >= bip34_activation_height(network))
+        || (version < 3 && height >= bip66_activation_height(network))
+        || (version < 4 && height >= bip65_activation_height(network));
+    if too_low {
+        return Err(crate::validation::ValidationError::BadVersion(version as u32));
+    }
+    Ok(())
+}
+
+/// Whether BIP 30 (no overwriting an unspent transaction) must be enforced
+/// for a block at `height`.
+///
+/// Core skips the BIP 30 scan once BIP 34 is *buried* — past BIP 34's
+/// activation height, coinbase txids are unique by construction (the height
+/// is encoded in the scriptSig), so a duplicate-unspent-txid is impossible
+/// and the per-output scan is pure cost. On regtest/signet Core's
+/// `BIP34Hash` is null, so the buried-skip never triggers and BIP 30 is
+/// always enforced.
+fn bip30_enforced(network: Network, height: u32) -> bool {
+    match network {
+        Network::Bitcoin => height <= 227_931,
+        Network::Testnet => height <= 21_111,
+        // Regtest/Signet/Testnet4: buried-skip never triggers (null BIP34Hash).
+        _ => true,
+    }
+}
+
+/// The two pre-BIP34 mainnet blocks (CVE-2012-1909) that intentionally
+/// duplicate an earlier coinbase txid and were grandfathered in. BIP 30 is
+/// suspended for exactly these so historical replay reproduces Core.
+fn bip30_exempt(network: Network, height: u32, hash: &BlockHash) -> bool {
+    if network != Network::Bitcoin {
+        return false;
+    }
+    (height == 91_842
+        && hash.to_string() == "00000000000a4d0a398161ffc163c503763b1f4360639393e0e4c8e300e0caec")
+        || (height == 91_880
+            && hash.to_string()
+                == "00000000000743f190a18c5577a3c2d2a1f610ae9601ac046a38084ccb7cd721")
+}
+
+/// Block-level signature-operation cost for one transaction, height-gated to
+/// match Bitcoin Core's `GetTransactionSigOpCost`. Below P2SH activation only
+/// legacy sigops count (scaled by the witness factor); at/after it the full
+/// BIP 141 witness-aware cost applies. Witness sigops are naturally zero
+/// before any witness data exists, so the single `>= P2SH` gate is exact
+/// across the P2SH→segwit range. `spent` maps each input's prevout to the
+/// output it spends (empty for coinbase, which Core counts as legacy-only).
+fn transaction_sigop_cost(
+    tx: &Transaction,
+    height: u32,
+    spent: &HashMap<OutPoint, TxOut>,
+) -> u64 {
+    if height >= P2SH_ACTIVATION_HEIGHT {
+        tx.total_sigop_cost(|op| spent.get(op).cloned()) as u64
+    } else {
+        let mut legacy: usize = 0;
+        for input in &tx.input {
+            legacy = legacy.saturating_add(input.script_sig.count_sigops_legacy());
+        }
+        for output in &tx.output {
+            legacy = legacy.saturating_add(output.script_pubkey.count_sigops_legacy());
+        }
+        (legacy.saturating_mul(4)) as u64
+    }
+}
+
 /// Parameters for block connection. Groups the many inputs needed by connect_block
 /// into a single struct for readability.
 pub struct ConnectParams<'a> {
@@ -220,6 +334,17 @@ pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError>
     let block_hash = block.block_hash();
     let is_genesis = height == 0;
     let mut total_fees: u64 = 0;
+
+    // Block-wide signature-operation cost accumulator (Core: nSigOpsCost),
+    // checked against MAX_BLOCK_SIGOPS_COST as each transaction is processed.
+    let mut block_sigops: u64 = 0;
+    // Reused per-tx prevout lookup for sigop counting; cleared each iteration
+    // to avoid per-transaction allocation on the hot connect path.
+    let mut sigop_spent: HashMap<OutPoint, TxOut> = HashMap::new();
+    // BIP 30: enforce the no-overwrite-of-an-unspent-txid rule unless this
+    // block is past the buried BIP 34 height or is a grandfathered exception.
+    let enforce_bip30 =
+        bip30_enforced(network, height) && !bip30_exempt(network, height, &block_hash);
 
     // Pre-allocate based on block size
     let total_inputs: usize = block.txdata.iter().map(|tx| tx.input.len()).sum();
@@ -457,6 +582,19 @@ pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError>
 
             total_fees += sum_inputs - sum_outputs;
 
+            // Block sigop-cost accounting for this (non-coinbase) tx. Build
+            // the prevout lookup now, before `prev_outputs` is moved into the
+            // verify queue below.
+            sigop_spent.clear();
+            for (input, prevout) in tx.input.iter().zip(prev_outputs.iter()) {
+                sigop_spent.insert(input.previous_output, prevout.clone());
+            }
+            block_sigops =
+                block_sigops.saturating_add(transaction_sigop_cost(tx, height, &sigop_spent));
+            if block_sigops > MAX_BLOCK_SIGOPS_COST {
+                return Err(ConnectError::BadBlockSigops);
+            }
+
             // Collect for parallel script verification.
             // If this tx was speculatively pre-verified by the prefetch pipeline,
             // skip primary verification but still queue for shadow dispatch.
@@ -467,6 +605,31 @@ pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError>
                 verify_queue.push((tx, prev_outputs));
             } else {
                 shadow_queue.push((tx, prev_outputs));
+            }
+        } else {
+            // Coinbase: no resolved inputs to spend; its sigop cost is
+            // legacy-only (scriptSig + output scriptPubkeys) and still counts
+            // toward the block-wide limit, matching Core.
+            sigop_spent.clear();
+            block_sigops =
+                block_sigops.saturating_add(transaction_sigop_cost(tx, height, &sigop_spent));
+            if block_sigops > MAX_BLOCK_SIGOPS_COST {
+                return Err(ConnectError::BadBlockSigops);
+            }
+        }
+
+        // BIP 30: a block must not create an output at an outpoint that
+        // already holds an unspent coin (no overwriting an unspent
+        // transaction). Checked against the authoritative UTXO set and coins
+        // created earlier in this same block. Skipped for the genesis
+        // coinbase and where `enforce_bip30` is false (past buried BIP 34 /
+        // grandfathered exception blocks).
+        if enforce_bip30 && (!is_genesis || !is_coinbase) {
+            for vout in 0..tx.output.len() {
+                let op = OutPoint { txid, vout: vout as u32 };
+                if intra_block_coins.contains_key(&op) || store.get_coin(&op).is_some() {
+                    return Err(ConnectError::BadBip30);
+                }
             }
         }
 
@@ -821,6 +984,107 @@ mod tests {
         assert_eq!(block_subsidy(210_000), 25 * 100_000_000);
         assert_eq!(block_subsidy(420_000), 1_250_000_000);
         assert_eq!(block_subsidy(210_000 * 64), 0);
+    }
+
+    // ── BIP30 gating / exemption (historical-correctness, untestable on
+    //    regtest — these guard against breaking mainnet replay) ──────────
+
+    #[test]
+    fn test_bip30_exempt_only_known_mainnet_blocks() {
+        let h91842: BlockHash = "00000000000a4d0a398161ffc163c503763b1f4360639393e0e4c8e300e0caec"
+            .parse()
+            .unwrap();
+        let h91880: BlockHash = "00000000000743f190a18c5577a3c2d2a1f610ae9601ac046a38084ccb7cd721"
+            .parse()
+            .unwrap();
+        // The two grandfathered duplicate-coinbase blocks are exempt.
+        assert!(bip30_exempt(Network::Bitcoin, 91_842, &h91842));
+        assert!(bip30_exempt(Network::Bitcoin, 91_880, &h91880));
+        // Right height, wrong hash → not exempt (must match both).
+        assert!(!bip30_exempt(Network::Bitcoin, 91_842, &BlockHash::all_zeros()));
+        // Right hash, wrong height → not exempt.
+        assert!(!bip30_exempt(Network::Bitcoin, 91_843, &h91842));
+        // Other networks are never exempt.
+        assert!(!bip30_exempt(Network::Regtest, 91_842, &h91842));
+        assert!(!bip30_exempt(Network::Testnet, 91_880, &h91880));
+    }
+
+    #[test]
+    fn test_bip30_enforced_gating() {
+        // Mainnet: enforced up to and including the buried BIP34 height,
+        // skipped above it (heights then guarantee unique coinbase txids).
+        assert!(bip30_enforced(Network::Bitcoin, 91_842));
+        assert!(bip30_enforced(Network::Bitcoin, 227_931));
+        assert!(!bip30_enforced(Network::Bitcoin, 227_932));
+        assert!(bip30_enforced(Network::Testnet, 21_111));
+        assert!(!bip30_enforced(Network::Testnet, 21_112));
+        // Regtest/Signet: always enforced (Core's BIP34Hash is null there,
+        // so the buried-skip never triggers).
+        assert!(bip30_enforced(Network::Regtest, 5_000_000));
+        assert!(bip30_enforced(Network::Signet, 5_000_000));
+    }
+
+    // ── Mandatory block-version floors (Core: bad-version) ─────────────
+
+    #[test]
+    fn test_check_block_version_bip_floors() {
+        use crate::validation::ValidationError;
+        let hdr = |v: i32| {
+            let mut h = bitcoin::constants::genesis_block(Network::Bitcoin).header;
+            h.version = bitcoin::block::Version::from_consensus(v);
+            h
+        };
+        // Below all mainnet activations: any version is accepted.
+        assert!(check_block_version(&hdr(1), 1, Network::Bitcoin).is_ok());
+        // BIP34 (>= 227_931): v < 2 rejected, v2 ok.
+        assert!(matches!(
+            check_block_version(&hdr(1), 227_931, Network::Bitcoin),
+            Err(ValidationError::BadVersion(1))
+        ));
+        assert!(check_block_version(&hdr(2), 227_931, Network::Bitcoin).is_ok());
+        // BIP66 (>= 363_725): v < 3 rejected, v3 ok.
+        assert!(matches!(
+            check_block_version(&hdr(2), 363_725, Network::Bitcoin),
+            Err(ValidationError::BadVersion(2))
+        ));
+        assert!(check_block_version(&hdr(3), 363_725, Network::Bitcoin).is_ok());
+        // BIP65 (>= 388_381): v < 4 rejected, v4 ok.
+        assert!(matches!(
+            check_block_version(&hdr(3), 388_381, Network::Bitcoin),
+            Err(ValidationError::BadVersion(3))
+        ));
+        assert!(check_block_version(&hdr(4), 388_381, Network::Bitcoin).is_ok());
+        // Modern high version is always accepted.
+        assert!(check_block_version(&hdr(0x2000_0000), 800_000, Network::Bitcoin).is_ok());
+    }
+
+    // ── Sigop-cost height gating ───────────────────────────────────────
+
+    #[test]
+    fn test_transaction_sigop_cost_p2sh_gate() {
+        use std::collections::HashMap;
+        // A coinbase whose output carries 10 bare OP_CHECKMULTISIG opcodes:
+        // 10 * 20 = 200 legacy sigops → cost 800 regardless of gate (no
+        // P2SH/witness data present, so both paths agree).
+        let script = bitcoin::ScriptBuf::from(vec![
+            bitcoin::opcodes::all::OP_CHECKMULTISIG.to_u8();
+            10
+        ]);
+        let cb = Transaction {
+            version: Version(2),
+            lock_time: bitcoin::blockdata::locktime::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: bitcoin::ScriptBuf::from(vec![0x51, 0x00]),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut { value: Amount::from_sat(0), script_pubkey: script }],
+        };
+        let empty: HashMap<OutPoint, TxOut> = HashMap::new();
+        // 10 OP_CHECKMULTISIG * 20 legacy sigops * 4 (witness scale) = 800.
+        assert_eq!(transaction_sigop_cost(&cb, 0, &empty), 800);
+        assert_eq!(transaction_sigop_cost(&cb, P2SH_ACTIVATION_HEIGHT, &empty), 800);
     }
 
     // ── decode_coinbase_height tests ──────────────────────────────────

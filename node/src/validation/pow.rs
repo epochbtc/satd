@@ -20,6 +20,9 @@ const TESTNET_ALLOW_MIN_DIFF_AFTER: u32 = 20 * 60;
 /// BIP 94 (testnet4) timewarp guard: the first block of a retarget period
 /// may not have a timestamp more than this many seconds before its parent.
 const MAX_TIMEWARP: u32 = 600;
+/// Bitcoin Core's `MAX_FUTURE_BLOCK_TIME` (2 hours): a block whose timestamp
+/// is more than this far ahead of the node's current time is rejected.
+const MAX_FUTURE_BLOCK_TIME: u64 = 2 * 60 * 60;
 
 /// Check that the block header hash meets the proof-of-work target.
 pub fn check_proof_of_work(header: &Header) -> Result<(), ValidationError> {
@@ -254,10 +257,45 @@ where
     Ok(())
 }
 
+/// Reject a header whose timestamp is more than `MAX_FUTURE_BLOCK_TIME`
+/// (2 hours) ahead of `now` (seconds since the Unix epoch). Mirrors Bitcoin
+/// Core's `time-too-new` check in `ContextualCheckBlockHeader`.
+///
+/// `now` is the node's current/adjusted time; live callers pass wall-clock.
+/// Historical replay (IBD, reindex, background validation) is unaffected:
+/// past blocks are never ahead of the present, so this check is a no-op
+/// for them. Core uses median-of-peers adjusted time; satd uses system
+/// time, which Core's own `MAX_FUTURE_BLOCK_TIME` slack (2h) absorbs.
+pub fn check_future_timestamp(header: &Header, now: u64) -> Result<(), ValidationError> {
+    if header.time as u64 > now.saturating_add(MAX_FUTURE_BLOCK_TIME) {
+        return Err(ValidationError::TimeTooNew);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::storage::blockindex::BlockStatus;
+
+    #[test]
+    fn test_future_timestamp_2h_window() {
+        let now = 1_700_000_000u64;
+        let mut h = bitcoin::constants::genesis_block(Network::Regtest).header;
+        // Exactly at the 2-hour boundary is accepted (Core uses strict `>`).
+        h.time = (now + MAX_FUTURE_BLOCK_TIME) as u32;
+        assert!(check_future_timestamp(&h, now).is_ok());
+        // One second past the window is rejected.
+        h.time = (now + MAX_FUTURE_BLOCK_TIME + 1) as u32;
+        assert!(matches!(
+            check_future_timestamp(&h, now),
+            Err(ValidationError::TimeTooNew)
+        ));
+        // A historical block (timestamp in the past) always passes — this is
+        // why the check is a no-op during IBD / background replay.
+        h.time = 1_500_000_000;
+        assert!(check_future_timestamp(&h, now).is_ok());
+    }
 
     fn entry(header: Header, height: u32) -> BlockIndexEntry {
         BlockIndexEntry {

@@ -18,6 +18,17 @@ use crate::storage::{Store, StoreError};
 use crate::validation;
 use crate::validation::script::{NoopVerifier, ScriptVerifier};
 
+/// Current wall-clock time in seconds since the Unix epoch, for the
+/// future-block-time consensus check. Returns 0 if the system clock is
+/// before the epoch (impossible in practice), which only makes the check
+/// stricter, never laxer.
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// Controls script verification skipping during IBD.
 /// Matches Bitcoin Core's `--assumevalid` semantics as a superset.
 #[derive(Debug, Clone)]
@@ -3068,6 +3079,14 @@ impl ChainState {
             let hash = store_ref.get_block_hash_by_height(h)?;
             store_ref.get_block_index(&hash)
         })?;
+
+        // Future-timestamp check (Core: time-too-new, 2h ahead of now).
+        // Historical blocks always pass; only live, ahead-of-clock blocks
+        // are rejected.
+        validation::pow::check_future_timestamp(&block.header, unix_now_secs())?;
+
+        // Mandatory block-version gate (Core: bad-version) — BIP34/66/65.
+        connect::check_block_version(&block.header, new_height, self.network)?;
 
         // Signet block-solution check (BIP 325), custom signet only.
         self.check_signet_solution(block)?;

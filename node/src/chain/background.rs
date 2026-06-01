@@ -288,6 +288,9 @@ impl BackgroundChainState {
             let hash = store_ref.get_block_hash_by_height(h)?;
             store_ref.get_block_index(&hash)
         })?;
+        // Mandatory block-version gate (Core: bad-version) — BIP34/66/65.
+        // Deterministic, height-based; mirrors the live accept path.
+        connect::check_block_version(&block.header, new_height, self.network)?;
         if !checkpoints::check_against_checkpoints(new_height, &block_hash, &self.checkpoints) {
             return Err(ChainError::CheckpointMismatch(new_height));
         }
