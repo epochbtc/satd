@@ -1,0 +1,82 @@
+# Phase C Layer 2 — in-process consensus fuzzer with a live Bitcoin Core
+# oracle (fuzz/fuzz_targets/block_differential.rs). libFuzzer mutates blocks,
+# satd validates them in-process (coverage-guided, catches panics), and a
+# resident bitcoind is the accept/reject oracle.
+#
+# NOT a PR gate. It is long-running and needs a nightly toolchain + cargo-fuzz
+# + Docker, so it runs on a nightly schedule and on demand. A discovered
+# divergence fails the job; the offending block is in the run log (printed to
+# stderr) and uploaded as an artifact.
+#
+# Triage: a divergence is a real consensus difference between satd and Core —
+# investigate before dismissing. Infra flakes (image pull 5xx, runner OOM):
+# rerun. Never weaken the accept/reject assertion in response to a flake.
+
+name: Bitcoin Core block-acceptance fuzz
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_total_time:
+        description: "Fuzz duration in seconds"
+        required: false
+        default: "1800"
+  schedule:
+    # Nightly 04:00 UTC.
+    - cron: '0 4 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: phase-c-fuzz-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  block-differential:
+    name: block-differential fuzz
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+
+      - name: Install Linux build deps
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang cmake libclang-dev libssl-dev pkg-config
+
+      - name: Install nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Pre-pull Bitcoin Core image
+        run: |
+          set -euo pipefail
+          for i in 1 2 3; do docker pull lncm/bitcoind:v27.0 && break || sleep $((i * 2)); done
+
+      - name: Run block-differential fuzz
+        env:
+          MAX_TOTAL_TIME: ${{ github.event.inputs.max_total_time || '1800' }}
+        run: bash scripts/fuzz/run-block-differential.sh
+
+      - name: Upload divergence artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase-c-fuzz-artifacts
+          path: fuzz/artifacts/**
+          if-no-files-found: ignore
+          retention-days: 30

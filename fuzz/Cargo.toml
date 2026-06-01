@@ -1,0 +1,48 @@
+# Phase C Layer 2 — in-process consensus fuzz target with a live Bitcoin Core
+# oracle. See fuzz_targets/block_differential.rs.
+#
+# Deliberately a STANDALONE workspace (note the empty `[workspace]` table
+# below) and excluded from the parent workspace (`exclude = ["fuzz"]` in the
+# root Cargo.toml): cargo-fuzz needs a nightly toolchain + sanitizer
+# instrumentation, which must not leak into the normal `cargo build` /
+# `cargo test --all`. This mirrors how the BDK canary is kept out-of-tree.
+#
+# `bitcoin` / `bitcoincore-rpc` are pinned to the EXACT versions the parent
+# workspace resolves (`node` is a path dep here), so the `bitcoin` types the
+# fuzz target constructs are identical to the ones `node`'s public API
+# expects — a separate lockfile could otherwise pick a different 0.32.x patch
+# and break type identity across the crate boundary.
+
+[package]
+name = "satd-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bitcoin = "=0.32.9"
+bitcoincore-rpc = "=0.19.0"
+hex = "0.4"
+serde_json = "1"
+# Consensus-only build of node (no BIP158 filter index) — matches how the satd
+# binary depends on node and keeps ConnectParams free of the cfg-gated
+# filter-index field.
+node = { path = "../node", default-features = false }
+
+[[bin]]
+name = "block_differential"
+path = "fuzz_targets/block_differential.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+# Keep line tables for readable artifact backtraces.
+debug = 1
+
+# Standalone workspace (see header).
+[workspace]
