@@ -3561,11 +3561,14 @@ name = "satd-mcp"
 version = "0.2.1"
 dependencies = [
  "bitcoin",
+ "bytes",
  "hex",
+ "http-body-util",
  "hyper",
  "hyper-util",
  "node",
  "rmcp",
+ "satd-auth",
  "schemars 0.8.22",
  "serde",
  "serde_json",

@@ -851,6 +851,14 @@ pub struct Config {
     pub mcp_stdio: bool,
     pub mcp_port: Option<u16>,
     pub mcp_bind: String,
+    /// Require bearer tokens (`mcp:*`) on the MCP HTTP server. Requires
+    /// `authfile`. Default false (loopback-trust). Also the precondition for a
+    /// non-loopback MCP bind.
+    pub mcp_auth: bool,
+    /// Permit a non-loopback MCP HTTP bind. Requires `mcp_auth` (and thus
+    /// `authfile`). Default false — a non-loopback `mcpbind` without this is
+    /// refused at startup, so MCP can never be exposed remotely unauthenticated.
+    pub mcp_allow_remote: bool,
     // Metrics / health HTTP server (unauthenticated — bind to loopback or firewall)
     pub metricsport: Option<u16>,
     pub metricsbind: String,
@@ -1898,6 +1906,28 @@ impl Config {
                     .to_string(),
             );
         }
+        let mcp_auth = cli
+            .mcpauth
+            .or_else(|| file_get("mcpauth").and_then(|v| parse_bool(&v)))
+            .unwrap_or(false);
+        if mcp_auth && authfile.is_none() {
+            return Err(
+                "--mcpauth requires --authfile (there is no token table to honor bearer \
+                 tokens against)"
+                    .to_string(),
+            );
+        }
+        let mcp_allow_remote = cli
+            .mcpallowremote
+            .or_else(|| file_get("mcpallowremote").and_then(|v| parse_bool(&v)))
+            .unwrap_or(false);
+        if mcp_allow_remote && !mcp_auth {
+            return Err(
+                "--mcpallowremote requires --mcpauth (a remote MCP bind must be \
+                 authenticated; --mcpauth in turn requires --authfile)"
+                    .to_string(),
+            );
+        }
         let esplora_tls_bind = cli.esploratlsbind.or_else(|| file_get("esploratlsbind"));
         let esplora_tls_cert = cli
             .esploratlscert
@@ -2465,6 +2495,8 @@ impl Config {
                 .mcpbind
                 .or_else(|| file_get("mcpbind"))
                 .unwrap_or_else(|| "127.0.0.1".to_string()),
+            mcp_auth,
+            mcp_allow_remote,
             dbcache: {
                 // Pre-compute static-partition size: the initial budget that
                 // the coin/rocksdb partition is built from. For Auto we use
@@ -4066,6 +4098,28 @@ pub struct CliArgs {
     )]
     pub mcpbind: Option<String>,
 
+    /// Require bearer tokens (mcp:*) on the MCP HTTP server.
+    #[arg(
+        long,
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
+        help = "Require Authorization: Bearer tokens (mcp:*) on the MCP HTTP server (default: false). Requires --authfile."
+    )]
+    pub mcpauth: Option<bool>,
+
+    /// Permit a non-loopback MCP HTTP bind.
+    #[arg(
+        long,
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
+        help = "Permit a non-loopback MCP HTTP bind (default: false). Requires --mcpauth (and --authfile)."
+    )]
+    pub mcpallowremote: Option<bool>,
+
     // Metrics / health HTTP server (unauthenticated — bind to loopback or firewall)
     #[arg(
         long,
@@ -4477,6 +4531,8 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "mcpstdio",
         "mcpport",
         "mcpbind",
+        "mcpauth",
+        "mcpallowremote",
         "metricsport",
         "metricsbind",
         "server",
@@ -4541,6 +4597,8 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "reindex-chainstate",
         "mcp",
         "mcpstdio",
+        "mcpauth",
+        "mcpallowremote",
         "server",
         "daemon",
         "events-grpc-allow-remote",
@@ -4972,6 +5030,8 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "mcpstdio",
     "mcpport",
     "mcpbind",
+    "mcpauth",
+    "mcpallowremote",
     // Metrics / health
     "metricsport",
     "metricsbind",
@@ -5833,6 +5893,8 @@ rpcport=8332
             mcpstdio: None,
             mcpport: None,
             mcpbind: None,
+            mcpauth: None,
+            mcpallowremote: None,
             metricsport: None,
             metricsbind: None,
             maxahead: None,
@@ -6067,6 +6129,8 @@ rpcport=8332
             mcpstdio: None,
             mcpport: None,
             mcpbind: None,
+            mcpauth: None,
+            mcpallowremote: None,
             metricsport: None,
             metricsbind: None,
             maxahead: None,
@@ -6912,6 +6976,48 @@ rpcport=8332
         .unwrap();
         let err = Config::from_cli(cli).unwrap_err();
         assert!(err.contains("authfile"), "expected authfile requirement, got: {err}");
+    }
+
+    #[test]
+    fn mcpauth_requires_authfile() {
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-mcp-test1",
+            "--mcpauth=1",
+        ])
+        .unwrap();
+        let err = Config::from_cli(cli).unwrap_err();
+        assert!(err.contains("authfile"), "got: {err}");
+    }
+
+    #[test]
+    fn mcpallowremote_requires_mcpauth() {
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-mcp-test2",
+            "--authfile=/etc/satd/auth.toml",
+            "--mcpallowremote=1",
+        ])
+        .unwrap();
+        let err = Config::from_cli(cli).unwrap_err();
+        assert!(err.contains("mcpauth"), "got: {err}");
+    }
+
+    #[test]
+    fn mcp_remote_auth_chain_is_accepted() {
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-mcp-test3",
+            "--authfile=/etc/satd/auth.toml",
+            "--mcpauth=1",
+            "--mcpallowremote=1",
+        ])
+        .unwrap();
+        let cfg = Config::from_cli(cli).unwrap();
+        assert!(cfg.mcp_auth && cfg.mcp_allow_remote);
     }
 
     #[test]

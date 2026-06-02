@@ -1601,12 +1601,30 @@ async fn main() {
             let mcp_bind: SocketAddr = format!("{}:{}", config.mcp_bind, mcp_port)
                 .parse()
                 .expect("Invalid MCP bind address");
+            // Safety guard: MCP exposes block-connecting tools. A non-loopback
+            // bind is refused unless the operator opted into authenticated
+            // remote exposure (`-mcpallowremote`, which requires `-mcpauth` +
+            // `authfile`). This closes the prior gap where `mcpbind=0.0.0.0`
+            // would serve MCP unauthenticated.
+            if !mcp_bind.ip().is_loopback() && !config.mcp_allow_remote {
+                eprintln!(
+                    "Error: MCP HTTP bind {mcp_bind} is non-loopback but --mcpallowremote is not \
+                     set. A remote MCP listener must be authenticated; set --mcpallowremote \
+                     (which requires --mcpauth and --authfile), or bind to loopback."
+                );
+                std::process::exit(1);
+            }
+            let mcp_auth = if config.mcp_auth {
+                token_store.clone()
+            } else {
+                None
+            };
             let ctx = mcp_ctx.clone();
             let rx = shutdown_rx.clone();
             // MCP HTTP stays on the consensus runtime for the same reason
             // as the stdio transport above (block-connecting tool).
             tokio::spawn(async move {
-                if let Err(e) = satd_mcp::serve_http(ctx, mcp_bind, rx).await {
+                if let Err(e) = satd_mcp::serve_http(ctx, mcp_bind, mcp_auth, rx).await {
                     tracing::error!("MCP HTTP server error: {}", e);
                 }
             });

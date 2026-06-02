@@ -470,9 +470,51 @@ pub async fn serve_stdio(
 }
 
 /// Start the MCP server over Streamable HTTP (also serves legacy SSE clients).
+fn mcp_now_unix() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Is the request authorized for MCP? Requires an `Authorization: Bearer <token>`
+/// resolving to a principal that holds the `mcp:*` capability.
+fn mcp_authorized(headers: &hyper::HeaderMap, store: &satd_auth::TokenStore) -> bool {
+    let Some(hdr) = headers.get("authorization").and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    let mut scratch = String::new();
+    match satd_auth::Credential::from_authorization(hdr, &mut scratch) {
+        Some(satd_auth::Credential::Bearer { token }) => store
+            .resolve(token, mcp_now_unix())
+            .is_some_and(|p| p.has(satd_auth::Capability::McpAll)),
+        _ => false,
+    }
+}
+
+fn mcp_unauthorized()
+-> hyper::Response<http_body_util::combinators::BoxBody<bytes::Bytes, std::convert::Infallible>> {
+    use http_body_util::{BodyExt, Full};
+    let body = Full::new(bytes::Bytes::from_static(b"Unauthorized")).boxed();
+    hyper::Response::builder()
+        .status(401)
+        .header("WWW-Authenticate", "Bearer")
+        .body(body)
+        .expect("static 401 response is valid")
+}
+
+/// Serve MCP over streamable HTTP.
+///
+/// When `auth` is `Some` (operator set `-mcpauth`, which requires `authfile`),
+/// every request must present an `Authorization: Bearer <token>` resolving to a
+/// principal with the `mcp:*` capability; otherwise it is answered with 401.
+/// `auth = None` is the loopback-trust default. The caller is responsible for
+/// refusing a non-loopback bind unless auth is enabled.
 pub async fn serve_http(
     ctx: Arc<McpContext>,
     bind_addr: std::net::SocketAddr,
+    auth: Option<Arc<satd_auth::TokenStore>>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use rmcp::transport::streamable_http_server::{
@@ -505,11 +547,18 @@ pub async fn serve_http(
                 match accept {
                     Ok((stream, _addr)) => {
                         let svc = mcp_service.clone();
+                        let conn_auth = auth.clone();
                         tokio::spawn(async move {
                             let io = hyper_util::rt::TokioIo::new(stream);
                             let svc = hyper::service::service_fn(move |req| {
                                 let svc = svc.clone();
+                                let conn_auth = conn_auth.clone();
                                 async move {
+                                    if let Some(store) = &conn_auth
+                                        && !mcp_authorized(req.headers(), store)
+                                    {
+                                        return Ok::<_, std::convert::Infallible>(mcp_unauthorized());
+                                    }
                                     Ok::<_, std::convert::Infallible>(svc.handle(req).await)
                                 }
                             });

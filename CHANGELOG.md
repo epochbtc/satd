@@ -214,6 +214,13 @@ working when the layer is enabled.
   `stream:subscribe` capability; otherwise the stream is rejected with gRPC
   `UNAUTHENTICATED` / `PERMISSION_DENIED`. The loopback / `-events-grpc-allow-remote`
   gate stays as a transport pre-check beneath this app-layer auth.
+- **`-mcpauth` / `-mcpallowremote` — bearer tokens + safe remote exposure for
+  the MCP HTTP server.** With `-mcpauth` (requires `-authfile`), every MCP
+  request must present an `Authorization: Bearer <token>` for a token holding
+  the `mcp:*` capability; otherwise it is answered with 401. A **non-loopback
+  `-mcpbind` is now refused at startup** unless `-mcpallowremote` (which requires
+  `-mcpauth`) is set — closing the prior gap where `mcpbind=0.0.0.0` would serve
+  the block-connecting MCP tools unauthenticated. Loopback MCP is unchanged.
 
 ### API surface scaling
 
