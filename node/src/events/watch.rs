@@ -419,10 +419,11 @@ pub async fn run_watch_matcher(
                         registry.scan_block(&block, height);
                     }
                 }
-                // Disconnects are surfaced to clients as a first-class reorg
-                // event in a later PR; the matcher itself is spend/funding
-                // oriented and needs no action on disconnect.
-                Ok(ChainEvent::BlockDisconnected { .. }) => {}
+                // Disconnects and the reorg marker are surfaced to clients
+                // as first-class events; the matcher itself is spend/funding
+                // oriented (append-only) and takes no action on either.
+                // Clients roll back their own confirmed state on a Reorg.
+                Ok(ChainEvent::BlockDisconnected { .. }) | Ok(ChainEvent::Reorg { .. }) => {}
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     warn!(target: "events::watch", dropped = n, "watch matcher lagged on chain events");
                 }

@@ -166,6 +166,7 @@ message ChainEvent {
   oneof body {
     BlockConnected block_connected = 1;
     BlockDisconnected block_disconnected = 2;
+    Reorg reorg = 3;
   }
 }
 
@@ -177,6 +178,16 @@ message BlockConnected {
 message BlockDisconnected {
   bytes hash = 1;
   uint32 height = 2;
+}
+
+// First-class reorg marker — in-process ground truth (a ZMQ/header
+// sidecar can only infer a reorg). Emitted once before the per-block
+// disconnect/connect sequence.
+message Reorg {
+  uint32 from_height = 1; // height of the abandoned tip
+  bytes  old_tip = 2;     // hash of the abandoned tip
+  uint32 to_height = 3;   // height of the new active tip
+  bytes  new_tip = 4;     // hash of the new active tip
 }
 
 // Periodic synthetic event for end-to-end latency probes.

@@ -267,8 +267,11 @@ async fn forward_headers(
                     return;
                 }
             }
-            Ok(ChainEvent::BlockDisconnected { .. }) => {
-                // Suppress — see fn doc.
+            Ok(ChainEvent::BlockDisconnected { .. }) | Ok(ChainEvent::Reorg { .. }) => {
+                // Suppress — see fn doc. The Electrum client learns of a
+                // reorg via the next BlockConnected for the new tip (which
+                // carries the new header); the explicit Reorg marker is a
+                // satd streaming-API concept, not part of the Electrum wire.
             }
             Err(broadcast::error::RecvError::Lagged(n)) => {
                 warn!(
