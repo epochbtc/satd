@@ -467,6 +467,15 @@ pub struct Config {
     /// configured. Coexists with `--rpcuser`/`--rpcpassword` and cookie
     /// auth; any valid credential opens the door.
     pub rpcauth: Vec<RpcAuthEntry>,
+    /// Path to the unified-auth bearer-token file (TOML), Core-shaped switch
+    /// `authfile=<path>`. `None` (default) keeps today's behavior exactly:
+    /// only the Core-compatible cookie/userpass/rpcauth operator path is live.
+    /// When set, the TOML token table is loaded at startup (and re-read on
+    /// SIGHUP for live revocation) and per-surface participation flags decide
+    /// where bearer tokens are honored. Absolute paths only — relative paths
+    /// would be ambiguous against the network-suffixed datadir. The file itself
+    /// is loaded/validated at startup (see `satd_auth::TokenStore::load`).
+    pub authfile: Option<PathBuf>,
     /// Operator-overridable path for the auto-generated cookie file
     /// (Core's `-rpccookiefile`). `None` (default) keeps Core's
     /// `$DATADIR/.cookie` behaviour. Absolute paths only — relative
@@ -1252,6 +1261,23 @@ impl Config {
             Some(s) => CookiePerms::parse(&s)?,
             None => CookiePerms::default(),
         };
+
+        // Unified-auth bearer-token file. CLI > file > unset. Absolute paths
+        // only (same rationale as the cookie file). The TOML is loaded and
+        // validated at startup (`satd_auth::TokenStore::load`), not here —
+        // config parsing stays IO-light and reload-safe.
+        let authfile = cli
+            .authfile
+            .or_else(|| file_get("authfile").map(PathBuf::from));
+        if let Some(p) = &authfile
+            && p.is_relative()
+        {
+            return Err(format!(
+                "--authfile must be an absolute path, got {p:?}. Relative paths would be \
+                ambiguous against satd's network-suffixed datadir (regtest/, signet/, \
+                testnet3/)."
+            ));
+        }
 
         let rpcuser = cli.rpcuser.or_else(|| file_get("rpcuser"));
         let rpcpassword = cli.rpcpassword.or_else(|| file_get("rpcpassword"));
@@ -2202,6 +2228,7 @@ impl Config {
             rpc_readonly_mtls_client_ca,
             rpc_readonly_mtls_client_allow,
             rpcauth,
+            authfile,
             rpc_cookie_file,
             rpc_cookie_perms,
             rpc_tls_bind,
@@ -3063,6 +3090,14 @@ pub struct CliArgs {
         help = "RPC credential in Bitcoin Core's rpcauth format (repeatable). Use rpcauth.py to generate."
     )]
     pub rpcauth: Vec<String>,
+
+    /// Path to the unified-auth bearer-token file (TOML).
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Path to the unified-auth bearer-token file (TOML). Enables the opt-in auth layer; per-surface flags decide where tokens are honored."
+    )]
+    pub authfile: Option<PathBuf>,
 
     /// Override the cookie file path. Default `$DATADIR/.cookie`.
     #[arg(
@@ -4263,6 +4298,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "rpcreadonlymtlsclientca",
         "rpcreadonlymtlsclientallow",
         "rpcauth",
+        "authfile",
         "rpccookiefile",
         "rpccookieperms",
         "listen",
@@ -4693,6 +4729,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "rpcreadonlymtlsclientca",
     "rpcreadonlymtlsclientallow",
     "rpcauth",
+    "authfile",
     "rpccookiefile",
     "rpccookieperms",
     "rpcdefaultunits",
@@ -5595,6 +5632,7 @@ rpcport=8332
             rpcreadonlymtlsclientca: None,
             rpcreadonlymtlsclientallow: Vec::new(),
             rpcauth: Vec::new(),
+            authfile: None,
             rpccookiefile: None,
             rpccookieperms: None,
             rpctlsbind: None,
@@ -5825,6 +5863,7 @@ rpcport=8332
             rpcreadonlymtlsclientca: None,
             rpcreadonlymtlsclientallow: Vec::new(),
             rpcauth: Vec::new(),
+            authfile: None,
             rpccookiefile: None,
             rpccookieperms: None,
             rpctlsbind: None,
@@ -6700,6 +6739,52 @@ rpcport=8332
             err.contains("absolute path"),
             "expected absolute-path error, got: {err}"
         );
+    }
+
+    #[test]
+    fn authfile_defaults_to_none() {
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-authfile-test1",
+        ])
+        .unwrap();
+        let cfg = Config::from_cli(cli).unwrap();
+        assert!(cfg.authfile.is_none());
+    }
+
+    #[test]
+    fn authfile_cli_sets_path() {
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-authfile-test2",
+            "--authfile=/etc/satd/auth.toml",
+        ])
+        .unwrap();
+        let cfg = Config::from_cli(cli).unwrap();
+        assert_eq!(cfg.authfile.as_deref(), Some(std::path::Path::new("/etc/satd/auth.toml")));
+    }
+
+    #[test]
+    fn authfile_must_be_absolute() {
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-authfile-test3",
+            "--authfile=relative/auth.toml",
+        ])
+        .unwrap();
+        let err = Config::from_cli(cli).unwrap_err();
+        assert!(
+            err.contains("absolute path"),
+            "expected absolute-path error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn authfile_is_a_known_config_key() {
+        assert!(is_known_config_key("authfile"));
     }
 
     // ---- PR-2: --chain / [signet] / --blocksdir / --signetseednode ----

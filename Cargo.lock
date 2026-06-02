@@ -3501,6 +3501,7 @@ dependencies = [
  "rand 0.8.6",
  "rcgen",
  "reqwest",
+ "satd-auth",
  "satd-events",
  "satd-mcp",
  "sd-notify",

@@ -301,7 +301,43 @@ async fn main() {
             hash: entry.hash.clone(),
         });
     }
+    // Operator-lockout guard: enabling the unified auth layer must never strip
+    // the operator's own Core-compatible credential path. In normal flows the
+    // cookie (or an rpcuser/rpcpassword pair) always provides one; assert it
+    // explicitly so an `authfile`-only misconfiguration can't lock out
+    // bitcoin-cli / sat-cli.
+    if config.authfile.is_some() && credentials.is_empty() {
+        eprintln!(
+            "Error: authfile is set but no operator credential (cookie / rpcuser+rpcpassword / \
+             rpcauth) is configured — refusing to start to avoid locking out bitcoin-cli/sat-cli"
+        );
+        std::process::exit(1);
+    }
     let auth = Arc::new(RpcAuth::Verify(parking_lot::RwLock::new(credentials)));
+
+    // Unified-auth bearer-token store (opt-in via `authfile`). Loaded here so a
+    // bad file — missing, group/world-readable, malformed, or carrying an
+    // unknown capability — aborts startup loudly rather than silently leaving
+    // the auth layer disabled. No surface honors bearer tokens yet; the store is
+    // held for the per-surface carriers (later) and re-read on SIGHUP for live
+    // revocation (see `reload::ReloadHandles::token_store`).
+    let token_store: Option<Arc<satd_auth::TokenStore>> = match &config.authfile {
+        Some(path) => match satd_auth::TokenStore::load(path) {
+            Ok(store) => {
+                tracing::info!(
+                    path = %path.display(),
+                    tokens = store.snapshot().len(),
+                    "Loaded unified-auth token file"
+                );
+                Some(Arc::new(store))
+            }
+            Err(e) => {
+                eprintln!("Error loading authfile {}: {}", path.display(), e);
+                std::process::exit(1);
+            }
+        },
+        None => None,
+    };
 
     // Start a lightweight startup-status RPC server on each operator-
     // configured bind. The TUI talks to it via the first loopback
@@ -2325,6 +2361,7 @@ async fn main() {
         addr_sub_registry: address_index_concrete.subscription_registry(),
         webhook: reorg_webhook_handle,
         rpc_auth: auth.clone(),
+        token_store: token_store.clone(),
     };
     loop {
         tokio::select! {

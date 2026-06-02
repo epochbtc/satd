@@ -50,6 +50,7 @@ node = { path = "../node", default-features = false }
 node-index = { path = "../node-index" }
 node-filter-index = { path = "../node-filter-index" }
 esplora-handlers = { path = "../esplora-handlers" }
+satd-auth = { path = "../satd-auth" }
 electrum-proto = { path = "../electrum-proto" }
 tls-config = { path = "../tls-config" }
 satd-events = { path = "../events", features = ["grpc", "zmq"] }
