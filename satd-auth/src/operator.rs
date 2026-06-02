@@ -11,8 +11,17 @@ use std::path::PathBuf;
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
+use subtle::ConstantTimeEq;
 
 type HmacSha256 = Hmac<Sha256>;
+
+/// Constant-time byte equality. A length mismatch short-circuits (the secret's
+/// length is not itself the secret — the same trade-off the cookie and rpcauth
+/// paths already accept); equal-length contents are compared without an
+/// early-exit so server timing can't reveal a matching prefix.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && bool::from(a.ct_eq(b))
+}
 
 /// The auto-generated cookie credential (`__cookie__:<hex>`).
 #[derive(Debug, Clone)]
@@ -70,20 +79,21 @@ impl OperatorCreds {
         }
     }
 
-    /// Does `user`/`pass` match any held credential? Constant-time for the HMAC
-    /// tag compare; cookie/userpass use value equality (fixed, operator-known
-    /// secret lengths — same trade-off as Bitcoin Core).
+    /// Does `user`/`pass` match any held credential? The secret (cookie token,
+    /// password, or HMAC tag) is always compared in constant time; the username
+    /// selects which credential to check (it is not the secret). This is the one
+    /// operator matcher every surface routes through.
     pub fn matches(&self, user: &str, pass: &str) -> bool {
         // Cookie — only the `__cookie__` username is valid.
         if let Some(c) = &self.cookie
             && user == "__cookie__"
-            && pass == c.token
+            && ct_eq(pass.as_bytes(), c.token.as_bytes())
         {
             return true;
         }
         // Plain user/password.
         for up in &self.userpass {
-            if user == up.username && pass == up.password {
+            if user == up.username && ct_eq(pass.as_bytes(), up.password.as_bytes()) {
                 return true;
             }
         }

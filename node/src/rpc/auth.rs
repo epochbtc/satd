@@ -1,34 +1,39 @@
+//! RPC authentication policy attached to a listener surface.
+//!
+//! The Bitcoin-Core-compatible credential model (cookie, `-rpcuser`/
+//! `-rpcpassword`, `-rpcauth` HMAC) now lives in the transport-agnostic
+//! [`satd_auth`] crate; this module is a thin shim that owns the JSON-RPC
+//! listener concerns: the reload-able credential set behind a lock, the cookie
+//! file lifecycle, and the tower middleware that enforces HTTP Basic auth. The
+//! credential *matching* itself (including the constant-time compares) is
+//! delegated to [`satd_auth::OperatorCreds`], the single audited verifier.
+
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use hmac::{Hmac, Mac};
 use parking_lot::RwLock;
-use sha2::Sha256;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-type HmacSha256 = Hmac<Sha256>;
+// Re-export the Core-compatible credential types from their single home so
+// existing call sites (`main.rs`, `reload.rs`) keep their import paths.
+pub use satd_auth::{
+    CookieCredential, OperatorCreds as Credentials, RpcAuthCredential, UserPassCredential,
+};
 
 /// RPC authentication policy attached to a listener surface.
 ///
-/// `Disabled` is reserved for the mTLS escape hatch on the TLS
-/// surface (`--rpcdisableauth=1` + `--rpcmtls=1`): clients prove
-/// identity via the mTLS client cert and the AuthLayer becomes a
-/// pass-through. It must NEVER be used on the plain-HTTP surface —
-/// the satd binary refuses that configuration at startup.
+/// `Disabled` is reserved for the mTLS escape hatch on the TLS surface
+/// (`--rpcdisableauth=1` + `--rpcmtls=1`): clients prove identity via the mTLS
+/// client cert and the AuthLayer becomes a pass-through. It must NEVER be used
+/// on the plain-HTTP surface — the satd binary refuses that configuration at
+/// startup.
 ///
-/// `Verify` holds zero or more credentials of three Bitcoin-Core-
-/// compatible kinds (cookie, userpass, rpcauth). A request is
-/// accepted if ANY single credential validates against the supplied
-/// Basic-auth header. This matches Bitcoin Core's behaviour, where
-/// `-rpcuser`/`-rpcpassword`, `-rpcauth=` (repeatable), and the
-/// auto-generated cookie all open the door simultaneously.
-///
-/// The credential set is held behind a `RwLock` so a SIGHUP config
-/// reload can rotate the `-rpcuser`/`-rpcpassword`/`-rpcauth`
-/// credentials live ([`reload_credentials`](Self::reload_credentials))
-/// without dropping the shared `Arc<RpcAuth>` the listener surfaces
-/// hold. `validate` takes a read lock per request (cheap, concurrent);
-/// the reload path takes a brief write lock. The auto-generated cookie
+/// `Verify` holds the operator credential set; a request is accepted if ANY
+/// single credential validates against the supplied Basic-auth header, matching
+/// Bitcoin Core's behaviour. The set is behind an `RwLock` so a SIGHUP config
+/// reload can rotate `-rpcuser`/`-rpcpassword`/`-rpcauth` live
+/// ([`reload_credentials`](Self::reload_credentials)) without dropping the
+/// shared `Arc<RpcAuth>` the listener surfaces hold. The auto-generated cookie
 /// credential is preserved across reloads.
 #[derive(Debug)]
 pub enum RpcAuth {
@@ -36,62 +41,24 @@ pub enum RpcAuth {
     Verify(RwLock<Credentials>),
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct Credentials {
-    pub cookie: Option<CookieCredential>,
-    pub userpass: Vec<UserPassCredential>,
-    pub rpcauth: Vec<RpcAuthCredential>,
-}
-
-#[derive(Debug, Clone)]
-pub struct CookieCredential {
-    pub path: PathBuf,
-    pub token: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct UserPassCredential {
-    pub username: String,
-    pub password: String,
-}
-
-/// One Bitcoin-Core-compatible `-rpcauth` entry, post-parse. `salt` is
-/// the printable salt string from the config line; its ASCII bytes are
-/// the HMAC key (Core's rpcauth.py does `salt.encode('utf-8')`). `hash`
-/// is the expected 32-byte tag.
-#[derive(Debug, Clone)]
-pub struct RpcAuthCredential {
-    pub username: String,
-    pub salt: String,
-    pub hash: Vec<u8>,
-}
-
 impl RpcAuth {
-    /// Build the legacy single-userpass form. Retained for call sites
-    /// (and tests) that don't yet need multi-credential support.
+    /// Build the legacy single-userpass form. Retained for call sites (and
+    /// tests) that don't yet need multi-credential support.
     pub fn from_user_pass(username: String, password: String) -> Self {
-        RpcAuth::Verify(RwLock::new(Credentials {
-            userpass: vec![UserPassCredential { username, password }],
-            ..Default::default()
-        }))
+        RpcAuth::Verify(RwLock::new(Credentials::from_user_pass(username, password)))
     }
 
-    /// Generate the cookie file at the given path with `perms` (octal),
-    /// and return the credential-bearing `RpcAuth`. The cookie value
-    /// stored is `__cookie__:<token>` per Core's convention. Removed by
-    /// `cleanup()` on shutdown.
+    /// Generate the cookie file at the given path with `perms` (octal), and
+    /// return the credential-bearing `RpcAuth`. The cookie value stored is
+    /// `__cookie__:<token>` per Core's convention. Removed by `cleanup()` on
+    /// shutdown.
     ///
     /// The secret must never exist on disk with broader permissions than
-    /// requested, even momentarily. On Unix we therefore write to a temp
-    /// file in the destination directory created with the target mode at
-    /// `open(2)` time (so the kernel applies it before any bytes land),
-    /// then atomically `rename(2)` it into place. A bare
-    /// `write`-then-`chmod` would leave a window where the cookie is
-    /// readable per the process umask.
-    pub fn generate_cookie_with(
-        path: PathBuf,
-        perms: u32,
-    ) -> std::io::Result<Self> {
+    /// requested, even momentarily. On Unix we therefore write to a temp file in
+    /// the destination directory created with the target mode at `open(2)` time
+    /// (so the kernel applies it before any bytes land), then atomically
+    /// `rename(2)` it into place.
+    pub fn generate_cookie_with(path: PathBuf, perms: u32) -> std::io::Result<Self> {
         let token: String = {
             let mut rng = rand::thread_rng();
             let bytes: Vec<u8> = (0..32).map(|_| rand::Rng::r#gen::<u8>(&mut rng)).collect();
@@ -108,8 +75,8 @@ impl RpcAuth {
             use std::io::Write;
             use std::os::unix::fs::OpenOptionsExt;
             let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-            // create_new + mode: born with restrictive perms, fails if a
-            // stale temp exists rather than reusing a foreign file.
+            // create_new + mode: born with restrictive perms, fails if a stale
+            // temp exists rather than reusing a foreign file.
             let mut f = match std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -129,9 +96,9 @@ impl RpcAuth {
             };
             f.write_all(content.as_bytes())?;
             f.sync_all()?;
-            // open() honours mode only when creating; an inherited umask
-            // can still mask bits off. Force the exact perms before the
-            // rename publishes the file.
+            // open() honours mode only when creating; an inherited umask can
+            // still mask bits off. Force the exact perms before the rename
+            // publishes the file.
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(perms))?;
             std::fs::rename(&tmp, &path)?;
@@ -153,17 +120,15 @@ impl RpcAuth {
         })))
     }
 
-    /// Convenience for the legacy default path (`$DATADIR/.cookie`,
-    /// 0600). Equivalent to `generate_cookie_with(datadir.join(".cookie"), 0o600)`.
+    /// Convenience for the legacy default path (`$DATADIR/.cookie`, 0600).
     pub fn generate_cookie(datadir: &Path) -> std::io::Result<Self> {
         Self::generate_cookie_with(datadir.join(".cookie"), 0o600)
     }
 
-    /// Validate an HTTP Authorization header value. Returns true if
-    /// `Disabled` (the mTLS-only path), or if ANY held credential
-    /// matches. Constant-time comparison is used for the HMAC tag in
-    /// the rpcauth path; cookie / userpass comparisons are plain
-    /// `==` (the secret length is fixed and known to the operator).
+    /// Validate an HTTP `Authorization` header value. Returns true if `Disabled`
+    /// (the mTLS-only path), or if ANY held credential matches. The actual
+    /// matching — including the constant-time secret comparisons — is delegated
+    /// to [`satd_auth::OperatorCreds::matches`].
     pub fn validate(&self, auth_header: &str) -> bool {
         let guard = match self {
             RpcAuth::Disabled => return true,
@@ -186,41 +151,10 @@ impl RpcAuth {
             Some(parts) => parts,
             None => return false,
         };
-
-        // Cookie credential — only the `__cookie__` username is valid.
-        if let Some(c) = &creds.cookie
-            && user == "__cookie__"
-            && pass == c.token
-        {
-            return true;
-        }
-        // Plain user/password credentials.
-        for up in &creds.userpass {
-            if user == up.username && pass == up.password {
-                return true;
-            }
-        }
-        // rpcauth (HMAC-SHA256). Constant-time tag compare via
-        // `Mac::verify_slice` so a timing attack can't peel off the
-        // hash one byte at a time.
-        for ra in &creds.rpcauth {
-            if user != ra.username {
-                continue;
-            }
-            let Ok(mut mac) = HmacSha256::new_from_slice(ra.salt.as_bytes()) else {
-                continue;
-            };
-            mac.update(pass.as_bytes());
-            if mac.verify_slice(&ra.hash).is_ok() {
-                return true;
-            }
-        }
-        false
+        creds.matches(user, pass)
     }
 
-    /// Is auth disabled? Used by call sites that want a header-free
-    /// fast path (the request middleware can skip reading the header
-    /// entirely, including for the `Disabled`-on-mTLS-only path).
+    /// Is auth disabled? Used by call sites that want a header-free fast path.
     pub fn is_disabled(&self) -> bool {
         matches!(self, RpcAuth::Disabled)
     }
@@ -236,20 +170,13 @@ impl RpcAuth {
         }
     }
 
-    /// Rotate the `-rpcuser`/`-rpcpassword` (userpass) and `-rpcauth`
-    /// credentials live, preserving the auto-generated cookie credential.
-    /// Driven by SIGHUP config reload. No-op on `Disabled`.
+    /// Rotate the `-rpcuser`/`-rpcpassword` (userpass) and `-rpcauth` credentials
+    /// live, preserving the auto-generated cookie credential. Driven by SIGHUP
+    /// config reload. No-op on `Disabled`.
     ///
-    /// The cookie is intentionally NOT touched: it is generated (and its
-    /// file written with restrictive perms) once at startup, and `sat-cli`'s
-    /// no-flag default depends on it. The cookie *file path/perms* remain
-    /// restart-only.
-    ///
-    /// If the rotation leaves zero credentials of any kind (e.g. the operator
-    /// removed `rpcuser`/`rpcpassword` from a node that was started without a
-    /// cookie), a warning is logged: the RPC surface is now unauthenticatable
-    /// until a credential is restored or the daemon is restarted (a restart
-    /// would regenerate the cookie).
+    /// The cookie is intentionally NOT touched: it is generated once at startup
+    /// and `sat-cli`'s no-flag default depends on it. If the rotation leaves zero
+    /// credentials of any kind, a warning is logged.
     pub fn reload_credentials(
         &self,
         userpass: Vec<UserPassCredential>,
@@ -259,7 +186,7 @@ impl RpcAuth {
             let mut creds = lock.write();
             creds.userpass = userpass;
             creds.rpcauth = rpcauth;
-            if creds.cookie.is_none() && creds.userpass.is_empty() && creds.rpcauth.is_empty() {
+            if creds.is_empty() {
                 tracing::warn!(
                     "RPC credential reload left no credentials configured — the RPC \
                      interface is now inaccessible until a credential is restored or \
@@ -339,15 +266,12 @@ where
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
-            // Auth-disabled short-circuit: skip the header read
-            // entirely. Used by the mTLS-only TLS surface when
-            // `--rpcdisableauth=1` — the rustls handshake is the
-            // actual gate, and clients are not expected to send a
-            // Basic header.
+            // Auth-disabled short-circuit: skip the header read entirely. Used by
+            // the mTLS-only TLS surface when `--rpcdisableauth=1` — the rustls
+            // handshake is the actual gate.
             if auth.is_disabled() {
                 return inner.call(req).await;
             }
-            // Check Authorization header
             let authorized = req
                 .headers()
                 .get("authorization")
@@ -410,78 +334,15 @@ mod tests {
     }
 
     #[test]
-    fn test_rpcauth_validate() {
-        // FIXED VECTOR from Bitcoin Core's share/rpcauth/rpcauth.py
-        // semantics: HMAC-SHA256 with key = salt.encode('utf-8') (the
-        // ASCII bytes of the printable salt string, NOT hex-decoded) and
-        // message = password. Generated independently with CPython:
-        //   hmac.new(salt.encode(), password.encode(), 'sha256').hexdigest()
-        // for salt="deadbeefcafef00d1122334455667788",
-        //     password="hunter2longpassword".
-        // This MUST NOT be re-derived by our own implementation, or it
-        // can't catch a salt-handling regression.
-        let salt = "deadbeefcafef00d1122334455667788".to_string();
-        let hash =
-            hex::decode("9383f6d244049af54e59a84188e2f2b1e58ff20de019156bc0c430ff8ae4c7a3")
-                .unwrap();
-        let auth = RpcAuth::Verify(RwLock::new(Credentials {
-            rpcauth: vec![RpcAuthCredential {
-                username: "alice".to_string(),
-                salt,
-                hash,
-            }],
-            ..Default::default()
-        }));
-        let ok = BASE64.encode("alice:hunter2longpassword");
-        assert!(auth.validate(&format!("Basic {}", ok)));
-        let bad_pass = BASE64.encode("alice:wrong");
-        assert!(!auth.validate(&format!("Basic {}", bad_pass)));
-        let bad_user = BASE64.encode("bob:hunter2longpassword");
-        assert!(!auth.validate(&format!("Basic {}", bad_user)));
-    }
-
-    #[test]
-    fn test_multi_credential_any_passes() {
-        let salt = "aabbccddeeff00112233445566778899".to_string();
-        let mut mac = HmacSha256::new_from_slice(salt.as_bytes()).unwrap();
-        mac.update(b"p4ss");
-        let hash = mac.finalize().into_bytes().to_vec();
-        let auth = RpcAuth::Verify(RwLock::new(Credentials {
-            cookie: Some(CookieCredential {
-                path: PathBuf::from("/tmp/x.cookie"),
-                token: "tok".to_string(),
-            }),
-            userpass: vec![UserPassCredential {
-                username: "alice".to_string(),
-                password: "secret".to_string(),
-            }],
-            rpcauth: vec![RpcAuthCredential {
-                username: "bob".to_string(),
-                salt,
-                hash,
-            }],
-        }));
-        let cookie_ok = BASE64.encode("__cookie__:tok");
-        let userpass_ok = BASE64.encode("alice:secret");
-        let rpcauth_ok = BASE64.encode("bob:p4ss");
-        assert!(auth.validate(&format!("Basic {}", cookie_ok)));
-        assert!(auth.validate(&format!("Basic {}", userpass_ok)));
-        assert!(auth.validate(&format!("Basic {}", rpcauth_ok)));
-        let none = BASE64.encode("eve:noway");
-        assert!(!auth.validate(&format!("Basic {}", none)));
-    }
-
-    #[test]
     fn test_reload_credentials_rotates_userpass_keeps_cookie() {
-        // Start with cookie + alice:secret.
         let auth = RpcAuth::Verify(RwLock::new(Credentials {
             cookie: Some(CookieCredential {
                 path: PathBuf::from("/tmp/reload.cookie"),
-                token: "tok".to_string(),
+                token: "tok".into(),
             }),
             userpass: vec![UserPassCredential {
-                username: "alice".to_string(),
-                password: "secret".to_string(),
+                username: "alice".into(),
+                password: "secret".into(),
             }],
             ..Default::default()
         }));
@@ -490,11 +351,10 @@ mod tests {
         assert!(auth.validate(&format!("Basic {}", alice)));
         assert!(auth.validate(&format!("Basic {}", cookie)));
 
-        // Reload: rotate to bob:newpass, drop alice. Cookie must survive.
         auth.reload_credentials(
             vec![UserPassCredential {
-                username: "bob".to_string(),
-                password: "newpass".to_string(),
+                username: "bob".into(),
+                password: "newpass".into(),
             }],
             vec![],
         );
