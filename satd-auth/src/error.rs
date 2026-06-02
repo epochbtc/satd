@@ -35,10 +35,12 @@ pub enum StoreError {
         #[source]
         source: std::io::Error,
     },
-    /// The file permissions are broader than `0600` (group/world accessible).
+    /// The file is group/world-accessible or has an execute bit — i.e. not a
+    /// strictly owner-readable secret (`0600` / `0400`).
     #[error(
-        "auth file {path} is group/world-accessible (mode {mode:#o}); \
-         refusing to load (set permissions to 0600)"
+        "auth file {path} has unsafe permissions (mode {mode:#o}): it must be \
+         readable only by its owner with no execute bit; set it to 0600 \
+         (or 0400 for a read-only secret)"
     )]
     Permissions { path: String, mode: u32 },
     /// The TOML failed to parse, or a `[[token]]` entry was malformed.

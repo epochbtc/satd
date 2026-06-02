@@ -191,8 +191,12 @@ working when the layer is enabled.
 - **`-authfile=<path>` — opt-in bearer-token table.** A separate TOML file (kept
   out of `bitcoin.conf` so it stays Core-shaped) listing tokens as
   `sha256:<hash>` (never plaintext), each with a capability set, optional
-  watch-set quota / rate limit, and optional expiry. The file must be `0600` or
-  satd refuses to start (like the cookie). It is re-read on `SIGHUP`
+  watch-set quota / rate limit, and optional expiry. Token `id`s must be unique
+  (they key per-tenant accounting and the revocation audit log) and unknown
+  capability strings are rejected — both fail the parse loudly rather than
+  silently. The file must be a regular file readable only by its owner with no
+  execute bit (`0600`, or `0400` for a read-only secret) or satd refuses to start
+  (like the cookie). It is re-read on `SIGHUP`
   independently of the rest of the config, so **removing a token and reloading
   revokes it live**; a malformed reload keeps the last-good table. An
   `authfile`-only misconfiguration can never lock out the operator: satd refuses
@@ -213,7 +217,12 @@ working when the layer is enabled.
   `authorization: Bearer <token>` metadata entry for a token holding the
   `stream:subscribe` capability; otherwise the stream is rejected with gRPC
   `UNAUTHENTICATED` / `PERMISSION_DENIED`. The loopback / `-events-grpc-allow-remote`
-  gate stays as a transport pre-check beneath this app-layer auth.
+  gate stays as a transport pre-check beneath this app-layer auth. **A remote
+  bind now requires auth:** `-events-grpc-allow-remote` is refused at startup
+  unless `-events-grpc-auth` is also set (the sink has no transport TLS, so a
+  routable bind without bearer auth would be an unauthenticated firehose). A
+  proxy/mTLS-terminated deployment keeps the loopback bind and omits
+  `-events-grpc-allow-remote`. This mirrors the `-mcpallowremote` → `-mcpauth` rule.
 - **`-mcpauth` / `-mcpallowremote` — bearer tokens + safe remote exposure for
   the MCP HTTP server.** With `-mcpauth` (requires `-authfile`), every MCP
   request must present an `Authorization: Bearer <token>` for a token holding
@@ -229,6 +238,20 @@ working when the layer is enabled.
   or mempool acceptance. The operator credential is unlimited. Per-principal
   state is keyed by token id, so a tenant's budget is shared across its
   connections (per-replica; a future Redis backend can make it global).
+
+- **Per-token watch-set quota on live subscriptions.** A `[[token]]`'s optional
+  `watch_quota = <N>` now caps how many concurrent Esplora SSE
+  address/scripthash watches the token may hold (one subscription = one unit),
+  gated by the `stream:watch` capability. A request lacking the capability is
+  refused **403**; one over its quota is **429**. The quota composes *above* the
+  node-wide `addrindexsubscriptions` cap and is reconciled automatically on
+  disconnect (an RAII lease released when the stream drops), so abandoned
+  sockets cannot permanently consume a tenant's budget. The operator credential
+  and loopback (auth-disabled) requests are unlimited. Like the rate limiter,
+  the per-tenant counter is keyed by token id and shared across the tenant's
+  connections (per-replica). The gRPC event firehose is gated by
+  `stream:subscribe` and its own concurrent-subscription cap instead, as it
+  carries no per-scripthash watch set.
 
 ### API surface scaling
 

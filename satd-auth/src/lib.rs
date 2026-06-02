@@ -41,7 +41,7 @@ pub use capability::{Capability, CapabilitySet};
 pub use credential::Credential;
 pub use error::{AuthError, DenyReason, StoreError};
 pub use operator::{CookieCredential, OperatorCreds, RpcAuthCredential, UserPassCredential};
-pub use principal::{Principal, PrincipalKind};
+pub use principal::{Principal, PrincipalKind, WatchReject};
 pub use quota::{
     Accounting, LocalAccounting, LocalQuotaStore, LocalRateLimiter, QuotaExceeded, QuotaStore,
     RateDecision, RateLimiter, RatePolicy, UnlimitedAccounting, WatchLease,

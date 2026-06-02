@@ -63,6 +63,15 @@ impl Capability {
     }
 }
 
+// `CapabilitySet` is a `u16`, so the vocabulary must stay ≤ 16 entries — a 17th
+// would make `1u16 << 16` over-shift (debug panic / release wrap → two
+// capabilities aliasing one bit → silent privilege grant). This fails the build
+// the moment that ceiling is crossed; widen `CapabilitySet` to `u32` then.
+const _: () = assert!(
+    ALL_CAPS.len() <= 16,
+    "CapabilitySet is u16: widen it before adding a 17th capability"
+);
+
 /// A compact, `Copy`, cheap-to-clone set of capabilities (bitflags over the
 /// fixed vocabulary). The operator principal is [`Self::ALL`].
 #[derive(Clone, Copy, PartialEq, Eq, Default)]

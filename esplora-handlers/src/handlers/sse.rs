@@ -26,6 +26,15 @@
 //! `SubscriptionRegistry` capped by `--addrindexsubscriptions=N`; an
 //! over-cap subscribe attempt returns 503 (`SubscribeError::CapReached`).
 //!
+//! When bearer auth is enabled (`-esploraauthbearer`), each
+//! address/scripthash watch also charges the authenticated principal's
+//! per-tenant `watch_quota` (auth PR 10), composed *above* the node-wide
+//! cap: the principal must hold `stream:watch` (else 403) and stay within
+//! its quota (else 429). The quota unit is held by an RAII
+//! [`satd_auth::WatchLease`] embedded in the response stream, so it is
+//! released automatically on client disconnect. The block stream is a
+//! single global feed and consumes no watch unit.
+//!
 //! Open-stream count is capped by `--esplorasseconns` (defaults to
 //! `--esploramaxconns`). Each handler acquires an
 //! `OwnedSemaphorePermit` and embeds it in the response stream so the
@@ -37,13 +46,14 @@
 use std::convert::Infallible;
 use std::time::Duration;
 
-use axum::extract::{Path, State};
+use axum::extract::{Extension, Path, State};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use bitcoin::address::NetworkUnchecked;
 use bitcoin::{Address, Network};
 use futures_util::stream::{Stream, StreamExt};
 use node::chain::events::ChainEvent;
 use node_index::{Scripthash, SubscribeError, scripthash_of};
+use satd_auth::{Principal, WatchLease, WatchReject};
 use serde::Serialize;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio_stream::wrappers::{BroadcastStream, errors::BroadcastStreamRecvError};
@@ -106,7 +116,9 @@ pub async fn blocks_sse(
             Err(BroadcastStreamRecvError::Lagged(_)) => None,
         }
     });
-    let stream = with_permit(stream, permit);
+    // Block SSE is a single global chain-tip stream, not a per-scripthash
+    // watch — it consumes no watch-set quota (no lease).
+    let stream = with_permit(stream, permit, None);
     Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(HEARTBEAT)))
 }
 
@@ -114,22 +126,60 @@ pub async fn blocks_sse(
 
 pub async fn address_sse(
     State(state): State<EsploraState>,
+    principal: Option<Extension<Principal>>,
     Path(addr): Path<String>,
 ) -> EsploraResult<Sse<impl Stream<Item = Result<Event, Infallible>>>> {
     let sh = parse_address(&addr, state.network)?;
     let permit = acquire_sse_permit(&state)?;
+    // Per-tenant watch-set quota (above the node-wide subscription cap). The
+    // lease must outlive the stream so a disconnect releases the unit.
+    let lease = acquire_watch_lease(&state, principal.as_deref())?;
     let rx = state.address_index.subscribe(sh).map_err(map_subscribe_err)?;
-    Ok(build_status_sse(rx, addr, permit))
+    Ok(build_status_sse(rx, addr, permit, lease))
 }
 
 pub async fn scripthash_sse(
     State(state): State<EsploraState>,
+    principal: Option<Extension<Principal>>,
     Path(hash): Path<String>,
 ) -> EsploraResult<Sse<impl Stream<Item = Result<Event, Infallible>>>> {
     let sh = parse_scripthash(&hash)?;
     let permit = acquire_sse_permit(&state)?;
+    let lease = acquire_watch_lease(&state, principal.as_deref())?;
     let rx = state.address_index.subscribe(sh).map_err(map_subscribe_err)?;
-    Ok(build_status_sse(rx, hash, permit))
+    Ok(build_status_sse(rx, hash, permit, lease))
+}
+
+/// Charge one watch unit against the principal's per-tenant watch-set quota.
+///
+/// When a principal is present (auth enabled, request authorized), it must hold
+/// `stream:watch` (→ 403) and stay within its `watch_quota` (→ 429). Operator /
+/// loopback principals carry no quota and acquire freely.
+///
+/// When no principal is present we **fail closed if auth is enabled**: a request
+/// that reached this handler without a principal while the `require_auth` layer
+/// is installed means the auth middleware was bypassed (a routing bug), so we
+/// refuse rather than silently grant an unmetered watch — mirroring the
+/// fail-closed JSON-RPC capability filter. With auth disabled there is no
+/// identity to account against and watches are unmetered as before.
+fn acquire_watch_lease(
+    state: &EsploraState,
+    principal: Option<&Principal>,
+) -> EsploraResult<Option<WatchLease>> {
+    let Some(p) = principal else {
+        if crate::auth::esplora_auth_enabled(&state.config.auth, &state.config.auth_bearer) {
+            return Err(EsploraError::Forbidden("authentication required".into()));
+        }
+        return Ok(None);
+    };
+    match p.acquire_watch(1) {
+        Ok(lease) => Ok(Some(lease)),
+        Err(WatchReject::MissingCapability(d)) => Err(EsploraError::Forbidden(format!(
+            "token lacks the {} capability",
+            d.0
+        ))),
+        Err(WatchReject::QuotaExceeded(_)) => Err(EsploraError::WatchQuotaExceeded),
+    }
 }
 
 /// Wrap a per-scripthash `StatusUpdate` receiver into an SSE stream.
@@ -142,6 +192,7 @@ fn build_status_sse(
     rx: tokio::sync::broadcast::Receiver<node_index::StatusUpdate>,
     label: String,
     permit: OwnedSemaphorePermit,
+    lease: Option<WatchLease>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let stream = BroadcastStream::new(rx).filter_map(move |item| {
         let label = label.clone();
@@ -160,14 +211,16 @@ fn build_status_sse(
             }
         }
     });
-    let stream = with_permit(stream, permit);
+    let stream = with_permit(stream, permit, lease);
     Sse::new(stream).keep_alive(KeepAlive::new().interval(HEARTBEAT))
 }
 
-/// Try to grab one SSE permit. `cap = 0` disables the cap (returns a
-/// permit from a sized-1 semaphore that's then immediately released —
-/// equivalent to "no cap", since we never actually hold permits in
-/// the cap=0 case). Returns 503 when the cap is saturated.
+/// Try to grab one SSE permit. When the cap is disabled (`--esplorasseconns=0`)
+/// the semaphore is constructed with a very large permit pool
+/// (`Semaphore::new(0)` then `add_permits(usize::MAX >> 8)`, see
+/// `satd/src/main.rs`), so `try_acquire_owned` effectively never fails and the
+/// permit is held harmlessly for the stream's life. Returns 503 when a real cap
+/// is saturated.
 fn acquire_sse_permit(state: &EsploraState) -> EsploraResult<OwnedSemaphorePermit> {
     state
         .sse_semaphore
@@ -176,20 +229,27 @@ fn acquire_sse_permit(state: &EsploraState) -> EsploraResult<OwnedSemaphorePermi
         .map_err(|_| EsploraError::ServiceUnavailable)
 }
 
-/// Glue an `OwnedSemaphorePermit` to the lifetime of a stream.
+/// Glue an `OwnedSemaphorePermit` (and, for watch streams, a
+/// `WatchLease`) to the lifetime of a stream.
 /// `futures_util::StreamExt::map` consumes the permit by moving it
 /// into the per-item closure, but each item's closure runs and drops
 /// before the next event arrives — so a `move` capture wouldn't keep
 /// the permit alive across events. We instead wrap the stream in a
-/// dedicated `PermitStream` whose `Drop` releases the permit when the
-/// outer `Sse` body is dropped (i.e., on client disconnect).
-fn with_permit<S>(stream: S, permit: OwnedSemaphorePermit) -> impl Stream<Item = S::Item>
+/// dedicated `PermitStream` whose `Drop` releases the permit (and the
+/// watch-set quota unit) when the outer `Sse` body is dropped (i.e., on
+/// client disconnect).
+fn with_permit<S>(
+    stream: S,
+    permit: OwnedSemaphorePermit,
+    lease: Option<WatchLease>,
+) -> impl Stream<Item = S::Item>
 where
     S: Stream + Send + 'static,
 {
     PermitStream {
         inner: Box::pin(stream),
         _permit: permit,
+        _lease: lease,
     }
 }
 
@@ -198,6 +258,9 @@ struct PermitStream<S> {
     #[pin]
     inner: std::pin::Pin<Box<S>>,
     _permit: OwnedSemaphorePermit,
+    /// Watch-set quota unit, released on drop (disconnect reconciliation).
+    /// `None` for streams that consume no quota (block SSE, or auth disabled).
+    _lease: Option<WatchLease>,
 }
 
 impl<S: Stream> Stream for PermitStream<S> {

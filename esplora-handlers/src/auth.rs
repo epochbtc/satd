@@ -24,6 +24,17 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
+/// Whether the Esplora server authenticates requests — true when a legacy
+/// operator credential (cookie / userpass) is configured OR bearer tokens are
+/// enabled. This is the single source of truth for "is the `require_auth` layer
+/// installed": [`AuthExpectation::build`] uses it to decide `None` vs `Required`,
+/// and the SSE watch handlers use it to fail *closed* if a request somehow
+/// reaches them with no principal while auth is enabled (a routing-bug guard,
+/// mirroring the JSON-RPC capability filter).
+pub fn esplora_auth_enabled(auth: &EsploraAuth, bearer: &Option<Arc<TokenStore>>) -> bool {
+    !matches!(auth, EsploraAuth::None) || bearer.is_some()
+}
+
 /// Resolved expected credentials. Built once at server start and shared across
 /// requests.
 ///
@@ -63,7 +74,7 @@ impl AuthExpectation {
                 Some(OperatorCreds::from_user_pass(user.to_string(), pass.to_string()))
             }
         };
-        if operator.is_none() && bearer.is_none() {
+        if !esplora_auth_enabled(cfg, &bearer) {
             Ok(Self::None)
         } else {
             Ok(Self::Required { operator, bearer })
@@ -100,7 +111,9 @@ impl AuthExpectation {
     }
 
     /// Evaluate a request: resolve the principal, require `esplora:read`, and
-    /// charge the per-principal rate limit.
+    /// charge the per-principal rate limit. On success the resolved [`Principal`]
+    /// is returned so the middleware can stash it in request extensions — the
+    /// SSE watch handlers read it to enforce the per-tenant watch-set quota.
     fn evaluate(&self, header: Option<&str>) -> AuthOutcome {
         let Some(principal) = self.principal(header) else {
             return AuthOutcome::Unauthorized;
@@ -109,7 +122,7 @@ impl AuthExpectation {
             return AuthOutcome::Unauthorized;
         }
         match principal.check_rate() {
-            satd_auth::RateDecision::Allow => AuthOutcome::Authorized,
+            satd_auth::RateDecision::Allow => AuthOutcome::Authorized(principal),
             satd_auth::RateDecision::Throttle { retry_after_secs } => {
                 AuthOutcome::RateLimited { retry_after_secs }
             }
@@ -118,13 +131,13 @@ impl AuthExpectation {
 
     #[cfg(test)]
     fn check(&self, header: Option<&str>) -> bool {
-        matches!(self.evaluate(header), AuthOutcome::Authorized)
+        matches!(self.evaluate(header), AuthOutcome::Authorized(_))
     }
 }
 
 /// Outcome of evaluating a request's credential against the expectation.
 enum AuthOutcome {
-    Authorized,
+    Authorized(Principal),
     Unauthorized,
     RateLimited { retry_after_secs: u32 },
 }
@@ -132,7 +145,7 @@ enum AuthOutcome {
 /// Axum middleware function. Wired only when auth is enabled.
 pub async fn require_auth(
     axum::extract::State(expected): axum::extract::State<Arc<AuthExpectation>>,
-    req: Request<Body>,
+    mut req: Request<Body>,
     next: Next,
 ) -> Response<Body> {
     let header = req
@@ -141,7 +154,12 @@ pub async fn require_auth(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
     match expected.evaluate(header.as_deref()) {
-        AuthOutcome::Authorized => next.run(req).await,
+        AuthOutcome::Authorized(principal) => {
+            // Stash the resolved principal so downstream handlers (SSE watch
+            // quota) can read it. Cheap clone (a few fields + two Arcs).
+            req.extensions_mut().insert(principal);
+            next.run(req).await
+        }
         AuthOutcome::Unauthorized => Response::builder()
             .status(StatusCode::UNAUTHORIZED)
             .header(
