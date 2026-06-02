@@ -955,6 +955,32 @@ async fn main() {
     // unconfirmed-but-still-valid user txs.
     chain_state.set_mempool(mempool.clone());
 
+    // Live outpoint/script watch registry + matcher. The matcher is fully
+    // decoupled from consensus: it consumes the existing chain/mempool
+    // event broadcasts and re-reads the (already durable) block / accepted
+    // tx the node already holds — it adds no code to the connect or
+    // mempool-accept hot paths, and is gated by a lock-free watcher count
+    // so it does zero extra work when nothing is watched. Spawned on the
+    // API runtime, like the event sinks. Clients register watch-sets via
+    // the streaming gRPC surface (a later PR); the registry handle is
+    // retained for that wiring.
+    let watch_registry = std::sync::Arc::new(node::events::WatchRegistry::new());
+    if let (Some(chain_rx), Some(mempool_rx)) = (
+        chain_state.subscribe_chain_events(),
+        mempool.subscribe_events(),
+    ) {
+        let _api_guard = api_handle.enter();
+        tokio::spawn(node::events::run_watch_matcher(
+            watch_registry.clone(),
+            chain_state.clone(),
+            mempool.clone(),
+            chain_rx,
+            mempool_rx,
+            shutdown_rx.clone(),
+        ));
+        tracing::info!(target: "events", "watch matcher started");
+    }
+
     // Shared MempoolAddrIndex handle. Both the read-side
     // RocksAddressIndex (for RPC queries) and the background
     // event-loop task hold the same Arc<RwLock<...>>.
