@@ -40,6 +40,7 @@ tls-config = { path = "../tls-config" }
 consensus = { path = "../consensus" }
 node-index = { path = "../node-index" }
 node-filter-index = { path = "../node-filter-index" }
+satd-auth = { path = "../satd-auth" }
 
 [features]
 default = ["block-filter-index"]

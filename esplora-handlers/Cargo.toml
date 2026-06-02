@@ -29,6 +29,7 @@ tokio-rustls = { workspace = true }
 tls-config = { path = "../tls-config" }
 node-index = { path = "../node-index" }
 node = { path = "../node" }
+satd-auth = { path = "../satd-auth" }
 
 [dev-dependencies]
 axum-test = "17"
