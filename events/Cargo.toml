@@ -8,7 +8,7 @@ repository.workspace = true
 
 [features]
 default = []
-grpc = ["dep:tonic", "dep:prost", "dep:tokio-stream"]
+grpc = ["dep:tonic", "dep:prost", "dep:tokio-stream", "dep:satd-auth"]
 zmq = ["dep:zeromq"]
 
 [dependencies]
@@ -26,6 +26,7 @@ thiserror = { workspace = true }
 tonic = { workspace = true, optional = true }
 prost = { workspace = true, optional = true }
 tokio-stream = { workspace = true, optional = true }
+satd-auth = { path = "../satd-auth", optional = true }
 
 # zmq feature
 zeromq = { workspace = true, optional = true }
