@@ -179,6 +179,32 @@ layout) per `STABILITY_POLICY.md`.
   can silently fall through. See `OPERATOR_ERGONOMICS.md` for the per-key
   reference and `CORE_DIFFERENCES.md` for the behavior contract.
 
+### Authentication & authorization
+
+An opt-in unified auth layer that adds capability-scoped bearer tokens on top of
+the Core-compatible operator credentials, without changing any default behavior.
+With no `authfile` configured, satd authenticates exactly as before (cookie /
+`-rpcuser`/`-rpcpassword` / `-rpcauth`), and those credentials map to a
+full-capability "operator" principal so `bitcoin-cli`, BTCPay, and NBXplorer keep
+working when the layer is enabled.
+
+- **`-authfile=<path>` — opt-in bearer-token table.** A separate TOML file (kept
+  out of `bitcoin.conf` so it stays Core-shaped) listing tokens as
+  `sha256:<hash>` (never plaintext), each with a capability set, optional
+  watch-set quota / rate limit, and optional expiry. The file must be `0600` or
+  satd refuses to start (like the cookie). It is re-read on `SIGHUP`
+  independently of the rest of the config, so **removing a token and reloading
+  revokes it live**; a malformed reload keeps the last-good table. An
+  `authfile`-only misconfiguration can never lock out the operator: satd refuses
+  to start if no operator credential remains.
+- **`-rpcauthbearer` — bearer tokens on the JSON-RPC listeners.** When set
+  (requires `-authfile`), the read/write JSON-RPC listeners additionally accept
+  `Authorization: Bearer <token>` and enforce **per-method capabilities**:
+  `rpc:read` tokens may call read methods, `rpc:write` is required for
+  mempool-submit / control / block-connecting / unknown methods (fail-closed). A
+  forbidden call returns JSON-RPC error `-32004`. The operator credential keeps
+  full access, so the capability filter is a no-op for legacy clients.
+
 ### API surface scaling
 
 The unifying goal of these three changes is to bound the blast radius of the

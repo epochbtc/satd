@@ -321,6 +321,97 @@ fn test_userpass_auth() {
     node.stop();
 }
 
+/// The unified-auth bearer carrier + capability enforcement on the JSON-RPC
+/// listener: a read-only token may call read methods but is forbidden on write
+/// methods; the operator cookie keeps full access; a bad token is rejected.
+#[test]
+fn test_rpc_bearer_token_capability_scoping() {
+    use std::io::Write;
+
+    // A read-only token: its sha256 goes in the auth file, the plaintext is
+    // presented as the bearer credential.
+    const TOKEN: &str = "satd-test-readonly-token-v1";
+    const TOKEN_SHA256: &str =
+        "710379ec62ddf04432c6c803b1679020abf2caf79a8c64c9dfb522c686a0cf3d";
+
+    // Write a 0600 auth.toml in a dedicated temp dir (absolute path required).
+    let dir = std::env::temp_dir().join(format!("satd-authfile-it-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let authfile = dir.join("auth.toml");
+    let toml = format!(
+        "version = 1\n[[token]]\nid = \"ro\"\nhash = \"sha256:{TOKEN_SHA256}\"\n\
+         capabilities = [\"rpc:read\"]\n"
+    );
+    {
+        let mut f = std::fs::File::create(&authfile).unwrap();
+        f.write_all(toml.as_bytes()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&authfile, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
+    let mut node = TestNode::start(&[
+        &format!("--authfile={}", authfile.display()),
+        "--rpcauthbearer=1",
+    ]);
+
+    let url = format!("http://127.0.0.1:{}/", node.rpcport);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let call = |bearer: Option<&str>, method: &str| -> (u16, serde_json::Value) {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0", "id": "t", "method": method, "params": [],
+        });
+        let mut req = client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .json(&body);
+        if let Some(t) = bearer {
+            req = req.bearer_auth(t);
+        }
+        let resp = req.send().unwrap();
+        let status = resp.status().as_u16();
+        let json = resp.json().unwrap_or(serde_json::Value::Null);
+        (status, json)
+    };
+
+    // (a) The operator cookie keeps full access.
+    let info = node.rpc_call("getblockcount").unwrap();
+    assert!(
+        info.get("result").is_some(),
+        "operator cookie getblockcount should work: {info}"
+    );
+
+    // (b) The read-only token may call a read method.
+    let (status, json) = call(Some(TOKEN), "getblockcount");
+    assert_eq!(status, 200, "bearer read HTTP status");
+    assert!(
+        json.get("result").is_some(),
+        "bearer read should return a result: {json}"
+    );
+
+    // (c) The read-only token is FORBIDDEN on a write method. The capability
+    // filter rejects before dispatch with a JSON-RPC error (HTTP 200), so this
+    // proves the HTTP-layer principal reached the RPC-layer capability filter.
+    let (status, json) = call(Some(TOKEN), "sendrawtransaction");
+    assert_eq!(status, 200, "capability denial is a JSON-RPC error, not HTTP");
+    assert_eq!(
+        json["error"]["code"], -32004,
+        "expected capability-denied code: {json}"
+    );
+
+    // (d) A bad bearer token is rejected at the HTTP layer.
+    let (status, _json) = call(Some("not-a-real-token"), "getblockcount");
+    assert_eq!(status, 401, "bad bearer token should be 401");
+
+    node.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn test_getbestblockhash() {
     let mut node = TestNode::start(&[]);

@@ -12,11 +12,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use toml_edit::{DocumentMut, Item};
 
 use crate::capability::CapabilitySet;
 use crate::error::StoreError;
-use crate::quota::RatePolicy;
+use crate::principal::Principal;
+use crate::quota::{RatePolicy, unlimited};
 
 /// The expected on-disk schema version. Unknown versions are rejected
 /// (recognize-reject) so a future format can't be silently mis-read.
@@ -123,6 +126,35 @@ impl TokenStore {
     /// A cheap `Arc` snapshot of the current table for the lookup hot path.
     pub fn snapshot(&self) -> Arc<TokenTable> {
         self.inner.read().clone()
+    }
+
+    /// Resolve a presented bearer token to a token [`Principal`], or `None` if
+    /// it is unknown, expired, or revoked. `now` is unix seconds.
+    ///
+    /// The token is SHA-256'd and looked up by digest; the stored hash is then
+    /// re-compared in constant time (`subtle`) so the accept decision never
+    /// short-circuits on a near-collision. Token principals carry the no-op
+    /// unlimited accounting handle for now; per-principal rate/quota accounting
+    /// is wired in a later PR.
+    pub fn resolve(&self, token: &str, now: i64) -> Option<Principal> {
+        let digest: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+        let table = self.snapshot();
+        let entry = table.get(&digest)?;
+        if !bool::from(entry.hash.ct_eq(&digest)) {
+            return None;
+        }
+        if let Some(exp) = entry.expires
+            && now >= exp
+        {
+            return None;
+        }
+        Some(Principal::token(
+            entry.id.clone(),
+            entry.caps,
+            entry.watch_quota,
+            entry.rate_limit,
+            unlimited(),
+        ))
     }
 
     /// The file path this store loads from.

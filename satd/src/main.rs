@@ -1496,6 +1496,15 @@ async fn main() {
         rpc_tls,
         auth.clone(),
         tls_auth,
+        // Bearer-token store for the full read/write JSON-RPC listeners, present
+        // only when `-rpcauthbearer` is set (which requires `authfile`). The
+        // operator credential keeps full access; bearer tokens are capability-
+        // scoped per method.
+        if config.rpc_auth_bearer {
+            token_store.clone()
+        } else {
+            None
+        },
         config.rpc_threads,
         config.rpc_workqueue,
         chain_state.clone(),
@@ -2621,8 +2630,9 @@ async fn start_startup_rpc(
             None,
             node::rpc::server::RPC_MAX_CONNECTIONS as usize,
             admission.clone(),
-            // The IBD-phase startup RPC is a full read/write listener (no
-            // read-only method filter).
+            // The IBD-phase startup RPC is operator-only (no bearer tokens) and
+            // a full read/write listener (no read-only method filter).
+            None,
             None,
         )
         .await

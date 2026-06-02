@@ -422,6 +422,10 @@ fn field_specs() -> Vec<FieldSpec> {
         // edits / revocations) is picked up live by the independent
         // `token_store.reload()` at the end of `reload_from_sighup`.
         restart!("authfile", authfile),
+        // Whether a listener installs the bearer carrier + capability filter is
+        // decided when the listener is built at startup, so toggling it requires
+        // a restart. (Token edits/revocations are live — see authfile.)
+        restart!("rpcauthbearer", rpc_auth_bearer),
         // The API runtime's worker count is fixed when the runtime is built
         // at startup; changing it requires a restart.
         restart!("apithreads", api_threads),
