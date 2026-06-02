@@ -221,6 +221,14 @@ working when the layer is enabled.
   `-mcpbind` is now refused at startup** unless `-mcpallowremote` (which requires
   `-mcpauth`) is set — closing the prior gap where `mcpbind=0.0.0.0` would serve
   the block-connecting MCP tools unauthenticated. Loopback MCP is unchanged.
+- **Per-token rate limiting.** A `[[token]]`'s optional `rate_limit = "<n>/s"` is
+  now enforced across every bearer-enabled surface with an in-process token
+  bucket: an over-budget request is **shed** — HTTP **429 + `Retry-After`**
+  (JSON-RPC / Esplora / MCP) or gRPC **`RESOURCE_EXHAUSTED`** — and never
+  blocks, so a throttled consumption client can't backpressure block connection
+  or mempool acceptance. The operator credential is unlimited. Per-principal
+  state is keyed by token id, so a tenant's budget is shared across its
+  connections (per-replica; a future Redis backend can make it global).
 
 ### API surface scaling
 

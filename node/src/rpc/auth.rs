@@ -321,6 +321,16 @@ where
 
             match principal {
                 Some(p) => {
+                    // Per-principal rate limit (operator/loopback bypass). Shed
+                    // an over-budget request with 429 + Retry-After; never block.
+                    if let satd_auth::RateDecision::Throttle { retry_after_secs } = p.check_rate() {
+                        let response = hyper::Response::builder()
+                            .status(429)
+                            .header("Retry-After", retry_after_secs.to_string())
+                            .body(jsonrpsee::server::HttpBody::from("Too Many Requests"))
+                            .unwrap();
+                        return Ok(response);
+                    }
                     req.extensions_mut().insert(p);
                     inner.call(req).await
                 }
