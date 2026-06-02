@@ -666,6 +666,8 @@ fn field_specs() -> Vec<FieldSpec> {
         restart!("mcpstdio", mcp_stdio),
         restart!("mcpport", mcp_port),
         restart!("mcpbind", mcp_bind),
+        restart!("mcpauth", mcp_auth),
+        restart!("mcpallowremote", mcp_allow_remote),
         // ---- Metrics / health ----
         restart!("metricsport", metricsport),
         restart!("metricsbind", metricsbind),
