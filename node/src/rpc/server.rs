@@ -10,6 +10,7 @@ use crate::rpc::amounts::{
 use crate::rpc::admission::{AdmissionLayer, AdmissionState};
 use crate::rpc::auth::{AuthLayer, RpcAuth};
 use crate::rpc::compat::JsonRpcCompatLayer;
+use crate::rpc::capability::CapabilityLayer;
 use crate::rpc::readonly::ReadOnlyLayer;
 use crate::rpc::{access, address, blockchain, indexes, mining, network, psbt, rawtx, util};
 use crate::storage::Store;
@@ -407,6 +408,12 @@ pub async fn start(
     // config-load validation enforces "Disabled requires mTLS"; this
     // layer accepts whatever the caller passes.
     tls_auth: Option<Arc<RpcAuth>>,
+    // Unified-auth bearer-token store, `Some` only when `-rpcauthbearer` is set
+    // (which requires `authfile`). When present, the full read/write listeners
+    // (plain + TLS) additionally accept `Authorization: Bearer <token>` and
+    // enforce per-method capabilities; the operator credential keeps full
+    // access. `None` is today's behavior (operator-only, no capability filter).
+    bearer: Option<Arc<satd_auth::TokenStore>>,
     // RPC admission control (Bitcoin Core `-rpcthreads` / `-rpcworkqueue`).
     // Bounds concurrent in-flight method calls and the backlog allowed to
     // wait before shedding with HTTP 429. Shared across the plain-HTTP and
@@ -1943,6 +1950,7 @@ pub async fn start(
             Some(shutdown_tx_outer.subscribe()),
             RPC_MAX_CONNECTIONS as usize,
             admission.clone(),
+            bearer.clone(),
             None,
         )
         .await?;
@@ -1965,6 +1973,7 @@ pub async fn start(
                 listener_status_outer,
                 &mut shutdown_rx_for_tls,
                 admission.clone(),
+                bearer.clone(),
                 None,
             )
             .await?,
@@ -2054,6 +2063,9 @@ async fn spawn_readonly_listeners(
                 Some(shutdown_rx),
                 RPC_MAX_CONNECTIONS as usize,
                 admission,
+                // The read-only listener does not honor bearer tokens (it is a
+                // read-scoped surface already); operator auth only.
+                None,
                 Some(ReadOnlyLayer::new()),
             )
             .await;
@@ -2094,6 +2106,7 @@ async fn spawn_readonly_listeners(
                 status,
                 &mut shutdown_rx,
                 admission,
+                None,
                 Some(ReadOnlyLayer::new()),
             )
             .await;
@@ -2127,8 +2140,11 @@ async fn spawn_tls_surface(
     listener_status: Arc<ServerListenerStatus>,
     shutdown_rx: &mut watch::Receiver<bool>,
     admission: Arc<AdmissionState>,
-    // `Some` only for a read-only TLS listener (none today; the read-only
-    // listener is plain-HTTP for now). `None` keeps this a zero-cost
+    // `Some` only on a bearer-enabled surface: the AuthLayer also accepts
+    // `Authorization: Bearer` and a capability filter is installed at the RPC
+    // layer. `None` is operator-only (no capability filter, zero cost).
+    bearer: Option<Arc<satd_auth::TokenStore>>,
+    // `Some` only for a read-only TLS listener. `None` keeps this a zero-cost
     // identity, matching `spawn_plain_surface`.
     rpc_filter: Option<ReadOnlyLayer>,
 ) -> Result<ServerHandle, Box<dyn std::error::Error + Send + Sync>> {
@@ -2172,14 +2188,22 @@ async fn spawn_tls_surface(
     // request is rejected before the compat layer buffers its body;
     // JsonRpcCompatLayer then normalizes Core-style (`jsonrpc` 1.0/1.1/
     // absent) requests to 2.0 so jsonrpsee accepts them (see `compat.rs`).
+    // When the surface honors bearer tokens, install the capability filter at
+    // the RPC layer so scoped tokens are gated per method; the operator
+    // principal has all capabilities, so this is a no-op for legacy clients.
+    let capability_filter = bearer.as_ref().map(|_| CapabilityLayer::new());
     let tls_middleware = tower::ServiceBuilder::new()
         .layer(AdmissionLayer::new(admission))
-        .layer(AuthLayer::new(auth))
+        .layer(AuthLayer::new(auth, bearer))
         .layer(JsonRpcCompatLayer::new());
     let rpc_svc = ServerBuilder::new()
         .set_config(server_cfg)
         .set_http_middleware(tls_middleware)
-        .set_rpc_middleware(RpcServiceBuilder::new().option_layer(rpc_filter))
+        .set_rpc_middleware(
+            RpcServiceBuilder::new()
+                .option_layer(rpc_filter)
+                .option_layer(capability_filter),
+        )
         .to_service_builder()
         .build(methods, stop_handle.clone());
 
@@ -2374,6 +2398,10 @@ pub async fn spawn_plain_surface(
     shutdown_rx: Option<watch::Receiver<bool>>,
     max_connections: usize,
     admission: Arc<AdmissionState>,
+    // `Some` only on a bearer-enabled surface: the AuthLayer also accepts
+    // `Authorization: Bearer` and a capability filter is installed at the RPC
+    // layer. `None` is operator-only (no capability filter, zero cost).
+    bearer: Option<Arc<satd_auth::TokenStore>>,
     // `Some` only for read-only listeners: an RPC-layer method filter that
     // rejects non-read methods before dispatch. `None` (the default
     // read/write listener) is a zero-cost identity in the middleware chain.
@@ -2389,17 +2417,23 @@ pub async fn spawn_plain_surface(
 
     let (stop_handle, server_handle) = stop_channel();
 
+    let capability_filter = bearer.as_ref().map(|_| CapabilityLayer::new());
     let plain_middleware = tower::ServiceBuilder::new()
         .layer(AdmissionLayer::new(admission))
-        .layer(AuthLayer::new(auth))
+        .layer(AuthLayer::new(auth, bearer))
         .layer(JsonRpcCompatLayer::new());
     let rpc_svc = ServerBuilder::new()
         .set_config(server_cfg)
         .set_http_middleware(plain_middleware)
         // `option_layer(None)` is `Identity` — the read/write listener pays
-        // nothing; the read-only listener gets the method filter at the RPC
-        // layer (after jsonrpsee has parsed the method + split batches).
-        .set_rpc_middleware(RpcServiceBuilder::new().option_layer(rpc_filter))
+        // nothing; the read-only listener gets the method filter, and a
+        // bearer-enabled listener gets the capability filter, at the RPC layer
+        // (after jsonrpsee has parsed the method + split batches).
+        .set_rpc_middleware(
+            RpcServiceBuilder::new()
+                .option_layer(rpc_filter)
+                .option_layer(capability_filter),
+        )
         .to_service_builder()
         .build(methods, stop_handle.clone());
 

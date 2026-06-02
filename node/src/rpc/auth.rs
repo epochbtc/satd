@@ -208,15 +208,32 @@ pub fn read_cookie_file(path: &Path) -> Result<(String, String), String> {
     Ok((user.to_string(), pass.to_string()))
 }
 
-/// Tower middleware layer for HTTP Basic Auth.
+fn now_unix() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Tower middleware layer for HTTP auth. Authenticates a request and stashes the
+/// resolved [`satd_auth::Principal`] in the request extensions (for the RPC-layer
+/// capability filter and method handlers).
+///
+/// `bearer` is `Some` only on a surface that opted into bearer tokens
+/// (`-rpcauthbearer`): such a surface accepts both the Core-compatible
+/// Basic/cookie/rpcauth operator credential (→ full-capability operator
+/// principal) and an `Authorization: Bearer <token>` resolving to a scoped token
+/// principal. When `None`, only the operator path is live (today's behavior).
 #[derive(Clone)]
 pub struct AuthLayer {
     auth: Arc<RpcAuth>,
+    bearer: Option<Arc<satd_auth::TokenStore>>,
 }
 
 impl AuthLayer {
-    pub fn new(auth: Arc<RpcAuth>) -> Self {
-        Self { auth }
+    pub fn new(auth: Arc<RpcAuth>, bearer: Option<Arc<satd_auth::TokenStore>>) -> Self {
+        Self { auth, bearer }
     }
 }
 
@@ -227,15 +244,18 @@ impl<S> tower::Layer<S> for AuthLayer {
         AuthMiddleware {
             inner,
             auth: self.auth.clone(),
+            bearer: self.bearer.clone(),
         }
     }
 }
 
-/// Tower service that checks HTTP Basic Auth before forwarding requests.
+/// Tower service that authenticates a request, stashes the resolved principal in
+/// its extensions, and forwards it; an unauthenticated request gets a 401.
 #[derive(Clone)]
 pub struct AuthMiddleware<S> {
     inner: S,
     auth: Arc<RpcAuth>,
+    bearer: Option<Arc<satd_auth::TokenStore>>,
 }
 
 impl<S, B> tower::Service<hyper::Request<B>> for AuthMiddleware<S>
@@ -261,34 +281,58 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, req: hyper::Request<B>) -> Self::Future {
+    fn call(&mut self, mut req: hyper::Request<B>) -> Self::Future {
         let auth = self.auth.clone();
+        let bearer = self.bearer.clone();
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
-            // Auth-disabled short-circuit: skip the header read entirely. Used by
-            // the mTLS-only TLS surface when `--rpcdisableauth=1` — the rustls
-            // handshake is the actual gate.
+            // Auth-disabled (mTLS escape hatch, `--rpcdisableauth=1`): the rustls
+            // handshake is the gate. Treat the caller as the full-capability
+            // operator so the downstream capability filter (if any) is a no-op.
             if auth.is_disabled() {
+                req.extensions_mut().insert(satd_auth::Principal::operator());
                 return inner.call(req).await;
             }
-            let authorized = req
+
+            let header = req
                 .headers()
                 .get("authorization")
                 .and_then(|v| v.to_str().ok())
-                .map(|header| auth.validate(header))
-                .unwrap_or(false);
+                .map(|s| s.to_string());
 
-            if !authorized {
-                let response = hyper::Response::builder()
-                    .status(401)
-                    .header("WWW-Authenticate", "Basic realm=\"jsonrpc\"")
-                    .body(jsonrpsee::server::HttpBody::from("Unauthorized"))
-                    .unwrap();
-                return Ok(response);
+            // Resolve to a principal: the Core-compatible operator path
+            // (cookie / userpass / rpcauth, always tried first so legacy clients
+            // are unaffected), else — on a bearer-enabled surface — an opaque
+            // bearer token resolving to a scoped token principal.
+            let principal: Option<satd_auth::Principal> = match &header {
+                Some(h) if auth.validate(h) => Some(satd_auth::Principal::operator()),
+                Some(h) => bearer.as_ref().and_then(|store| {
+                    let mut scratch = String::new();
+                    match satd_auth::Credential::from_authorization(h, &mut scratch) {
+                        Some(satd_auth::Credential::Bearer { token }) => {
+                            store.resolve(token, now_unix())
+                        }
+                        _ => None,
+                    }
+                }),
+                None => None,
+            };
+
+            match principal {
+                Some(p) => {
+                    req.extensions_mut().insert(p);
+                    inner.call(req).await
+                }
+                None => {
+                    let response = hyper::Response::builder()
+                        .status(401)
+                        .header("WWW-Authenticate", "Basic realm=\"jsonrpc\"")
+                        .body(jsonrpsee::server::HttpBody::from("Unauthorized"))
+                        .unwrap();
+                    Ok(response)
+                }
             }
-
-            inner.call(req).await
         })
     }
 }

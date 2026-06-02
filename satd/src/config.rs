@@ -476,6 +476,12 @@ pub struct Config {
     /// would be ambiguous against the network-suffixed datadir. The file itself
     /// is loaded/validated at startup (see `satd_auth::TokenStore::load`).
     pub authfile: Option<PathBuf>,
+    /// Per-surface participation flag: when true, the full read/write JSON-RPC
+    /// listeners additionally honor `Authorization: Bearer <token>` (resolving
+    /// to a capability-scoped token principal) on top of the Core-compatible
+    /// cookie/userpass/rpcauth operator credential. Requires `authfile`. Default
+    /// false (operator-only, today's behavior).
+    pub rpc_auth_bearer: bool,
     /// Operator-overridable path for the auto-generated cookie file
     /// (Core's `-rpccookiefile`). `None` (default) keeps Core's
     /// `$DATADIR/.cookie` behaviour. Absolute paths only — relative
@@ -1277,6 +1283,20 @@ impl Config {
                 ambiguous against satd's network-suffixed datadir (regtest/, signet/, \
                 testnet3/)."
             ));
+        }
+
+        // Per-surface participation flag for the JSON-RPC listeners. Honoring
+        // bearer tokens requires a token table to honor them against.
+        let rpc_auth_bearer = cli
+            .rpcauthbearer
+            .or_else(|| file_get("rpcauthbearer").and_then(|v| parse_bool(&v)))
+            .unwrap_or(false);
+        if rpc_auth_bearer && authfile.is_none() {
+            return Err(
+                "--rpcauthbearer requires --authfile (there is no token table to honor \
+                 bearer tokens against)"
+                    .to_string(),
+            );
         }
 
         let rpcuser = cli.rpcuser.or_else(|| file_get("rpcuser"));
@@ -2229,6 +2249,7 @@ impl Config {
             rpc_readonly_mtls_client_allow,
             rpcauth,
             authfile,
+            rpc_auth_bearer,
             rpc_cookie_file,
             rpc_cookie_perms,
             rpc_tls_bind,
@@ -3098,6 +3119,17 @@ pub struct CliArgs {
         help = "Path to the unified-auth bearer-token file (TOML). Enables the opt-in auth layer; per-surface flags decide where tokens are honored."
     )]
     pub authfile: Option<PathBuf>,
+
+    /// Honor bearer tokens on the JSON-RPC read/write listeners.
+    #[arg(
+        long,
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
+        help = "Honor Authorization: Bearer tokens on the JSON-RPC listeners (default: false). Requires --authfile. The operator credential keeps full access."
+    )]
+    pub rpcauthbearer: Option<bool>,
 
     /// Override the cookie file path. Default `$DATADIR/.cookie`.
     #[arg(
@@ -4299,6 +4331,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "rpcreadonlymtlsclientallow",
         "rpcauth",
         "authfile",
+        "rpcauthbearer",
         "rpccookiefile",
         "rpccookieperms",
         "listen",
@@ -4444,6 +4477,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "electrummtls",
         "rpcmtls",
         "rpcdisableauth",
+        "rpcauthbearer",
         "rpcextendederrors",
         "reindex",
         "reindex-chainstate",
@@ -4730,6 +4764,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "rpcreadonlymtlsclientallow",
     "rpcauth",
     "authfile",
+    "rpcauthbearer",
     "rpccookiefile",
     "rpccookieperms",
     "rpcdefaultunits",
@@ -5633,6 +5668,7 @@ rpcport=8332
             rpcreadonlymtlsclientallow: Vec::new(),
             rpcauth: Vec::new(),
             authfile: None,
+            rpcauthbearer: None,
             rpccookiefile: None,
             rpccookieperms: None,
             rpctlsbind: None,
@@ -5864,6 +5900,7 @@ rpcport=8332
             rpcreadonlymtlsclientallow: Vec::new(),
             rpcauth: Vec::new(),
             authfile: None,
+            rpcauthbearer: None,
             rpccookiefile: None,
             rpccookieperms: None,
             rpctlsbind: None,
@@ -6785,6 +6822,47 @@ rpcport=8332
     #[test]
     fn authfile_is_a_known_config_key() {
         assert!(is_known_config_key("authfile"));
+        assert!(is_known_config_key("rpcauthbearer"));
+    }
+
+    #[test]
+    fn rpcauthbearer_defaults_off() {
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-bearer-test1",
+        ])
+        .unwrap();
+        let cfg = Config::from_cli(cli).unwrap();
+        assert!(!cfg.rpc_auth_bearer);
+    }
+
+    #[test]
+    fn rpcauthbearer_requires_authfile() {
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-bearer-test2",
+            "--rpcauthbearer=1",
+        ])
+        .unwrap();
+        let err = Config::from_cli(cli).unwrap_err();
+        assert!(err.contains("authfile"), "expected authfile requirement, got: {err}");
+    }
+
+    #[test]
+    fn rpcauthbearer_with_authfile_is_accepted() {
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-bearer-test3",
+            "--authfile=/etc/satd/auth.toml",
+            "--rpcauthbearer=1",
+        ])
+        .unwrap();
+        let cfg = Config::from_cli(cli).unwrap();
+        assert!(cfg.rpc_auth_bearer);
+        assert!(cfg.authfile.is_some());
     }
 
     // ---- PR-2: --chain / [signet] / --blocksdir / --signetseednode ----

@@ -8,14 +8,11 @@
 use std::sync::Arc;
 
 use parking_lot::RwLock;
-use sha2::{Digest, Sha256};
-use subtle::ConstantTimeEq;
 
 use crate::credential::Credential;
 use crate::error::AuthError;
 use crate::operator::OperatorCreds;
 use crate::principal::Principal;
-use crate::quota::unlimited;
 use crate::store::TokenStore;
 
 /// Resolves credentials to principals against the operator credentials (cookie /
@@ -96,36 +93,9 @@ impl Verifier {
 
     fn resolve_bearer(&self, token: &str) -> Result<Principal, AuthError> {
         let store = self.store.as_ref().ok_or(AuthError::Unauthenticated)?;
-        let digest: [u8; 32] = Sha256::digest(token.as_bytes()).into();
-
-        let table = store.snapshot();
-        let entry = table.get(&digest).ok_or(AuthError::Unauthenticated)?;
-
-        // Belt-and-suspenders: the map lookup already matched the key, but run a
-        // constant-time compare against the stored hash so the accept decision
-        // never short-circuits on a near-collision. (We protect the secret
-        // compare; map-key-existence timing is acceptable for ≥256-bit tokens.)
-        if !bool::from(entry.hash.ct_eq(&digest)) {
-            return Err(AuthError::Unauthenticated);
-        }
-
-        // Expiry (a removed/rotated token is revoked by the store reload; this
-        // catches time-based expiry of a still-present entry).
-        if let Some(exp) = entry.expires
-            && (self.clock)() >= exp
-        {
-            return Err(AuthError::Unauthenticated);
-        }
-
-        // Token principals get unlimited (no-op) accounting in this PR; the real
-        // per-principal token-bucket / occupancy accounting is wired in later.
-        Ok(Principal::token(
-            entry.id.clone(),
-            entry.caps,
-            entry.watch_quota,
-            entry.rate_limit,
-            unlimited(),
-        ))
+        store
+            .resolve(token, (self.clock)())
+            .ok_or(AuthError::Unauthenticated)
     }
 }
 
@@ -136,7 +106,7 @@ mod tests {
     use crate::principal::PrincipalKind;
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD as BASE64;
-    use sha2::Sha256;
+    use sha2::{Digest, Sha256};
     use std::io::Write;
     use std::path::Path;
 
