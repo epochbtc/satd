@@ -871,6 +871,12 @@ async fn main() {
         shutdown_rx.clone(),
     );
 
+    // Live outpoint/script watch registry, shared between the gRPC `Watch`
+    // RPC (client-facing control + match delivery) and the decoupled matcher
+    // task (consumes block/mempool events, scans against the registry). The
+    // matcher is spawned below once the mempool handle is wired.
+    let watch_registry = std::sync::Arc::new(node::events::WatchRegistry::new());
+
     // Build configured external sinks. Each sink is feature-gated in
     // the `satd-events` crate; this match enables what the operator
     // asked for via CLI / `bitcoin.conf`.
@@ -896,6 +902,8 @@ async fn main() {
             // client can resume from a `from_cursor` (snapshot→live handoff).
             // Read-only; never on the consensus hot path.
             Some(chain_state.clone() as std::sync::Arc<dyn node::events::BlockCursorSource>),
+            // Live watch registry backing the bidirectional `Watch` RPC.
+            Some(watch_registry.clone()),
         )
         .await
         {
@@ -955,16 +963,13 @@ async fn main() {
     // unconfirmed-but-still-valid user txs.
     chain_state.set_mempool(mempool.clone());
 
-    // Live outpoint/script watch registry + matcher. The matcher is fully
-    // decoupled from consensus: it consumes the existing chain/mempool
-    // event broadcasts and re-reads the (already durable) block / accepted
-    // tx the node already holds — it adds no code to the connect or
-    // mempool-accept hot paths, and is gated by a lock-free watcher count
-    // so it does zero extra work when nothing is watched. Spawned on the
-    // API runtime, like the event sinks. Clients register watch-sets via
-    // the streaming gRPC surface (a later PR); the registry handle is
-    // retained for that wiring.
-    let watch_registry = std::sync::Arc::new(node::events::WatchRegistry::new());
+    // Watch matcher task (registry created above, shared with the gRPC
+    // `Watch` RPC). Fully decoupled from consensus: it consumes the existing
+    // chain/mempool event broadcasts and re-reads the (already durable)
+    // block / accepted tx the node already holds — it adds no code to the
+    // connect or mempool-accept hot paths, and is gated by a lock-free
+    // watcher count so it does zero extra work when nothing is watched.
+    // Spawned on the API runtime, like the event sinks.
     if let (Some(chain_rx), Some(mempool_rx)) = (
         chain_state.subscribe_chain_events(),
         mempool.subscribe_events(),
