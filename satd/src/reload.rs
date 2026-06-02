@@ -177,6 +177,12 @@ pub struct ReloadHandles {
     /// are rotatable live (the cookie is preserved). Shared with every RPC
     /// listener surface, so a reload covers all of them at once.
     pub rpc_auth: Arc<RpcAuth>,
+    /// Unified-auth bearer-token store, present only when `authfile=` is set.
+    /// Re-read on every SIGHUP independently of the rest of the config so that
+    /// removing a `[[token]]` revokes it live; a re-read error keeps the
+    /// last-good table (never strands the node without auth). The `authfile`
+    /// *path* itself is restart-only (the store binds to a path at startup).
+    pub token_store: Option<Arc<satd_auth::TokenStore>>,
 }
 
 /// Apply a reorg-webhook config change to the running dispatcher. Shared by the
@@ -410,6 +416,12 @@ fn field_specs() -> Vec<FieldSpec> {
         // it requires a restart.
         restart!("rpcthreads", rpc_threads),
         restart!("rpcworkqueue", rpc_workqueue),
+        // The token store binds to a fixed path when it is loaded at startup
+        // and is shared (as an `Arc`) with the surfaces. Changing WHERE the
+        // file lives therefore requires a restart; changing its CONTENTS (token
+        // edits / revocations) is picked up live by the independent
+        // `token_store.reload()` at the end of `reload_from_sighup`.
+        restart!("authfile", authfile),
         // The API runtime's worker count is fixed when the runtime is built
         // at startup; changing it requires a restart.
         restart!("apithreads", api_threads),
@@ -707,6 +719,34 @@ pub fn reload_from_sighup(handles: &ReloadHandles, running: &Config) -> Config {
                     );
                 }
             }
+        }
+    }
+
+    // Independently re-read the unified-auth token file (if configured). This
+    // is intentionally decoupled from the network/consensus config diff above:
+    // a SIGHUP must pick up token edits — above all, revocations — even when no
+    // `bitcoin.conf` key changed. A re-read error keeps the last-good table.
+    if let Some(store) = &handles.token_store {
+        match store.reload() {
+            Ok(delta) => {
+                if !delta.removed.is_empty() {
+                    tracing::warn!(
+                        revoked = ?delta.removed,
+                        "auth token(s) revoked on reload"
+                    );
+                }
+                if !delta.added.is_empty() {
+                    tracing::info!(added = ?delta.added, "auth token(s) added on reload");
+                }
+                if delta.added.is_empty() && delta.removed.is_empty() {
+                    tracing::debug!("auth token file reloaded: no token changes");
+                }
+            }
+            Err(e) => tracing::error!(
+                error = %e,
+                path = %store.path().display(),
+                "auth token file reload failed — keeping the last-good token table"
+            ),
         }
     }
 
