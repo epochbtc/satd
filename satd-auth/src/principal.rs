@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use crate::capability::{Capability, CapabilitySet};
 use crate::error::DenyReason;
-use crate::quota::{Accounting, RatePolicy, unlimited};
+use crate::quota::{Accounting, RateDecision, RatePolicy, unlimited};
 
 /// What kind of identity authenticated.
 #[derive(Clone, Debug)]
@@ -116,6 +116,18 @@ impl Principal {
     /// This principal's accounting handle (rate limiter + quota store).
     pub fn accounting(&self) -> &Arc<dyn Accounting> {
         &self.acct
+    }
+
+    /// Charge one request against this principal's rate limit. Principals with no
+    /// `rate_limit` (operator, loopback) always [`Allow`](RateDecision::Allow).
+    /// Carriers call this after authentication and shed on
+    /// [`Throttle`](RateDecision::Throttle) — never blocking, so a throttled
+    /// consumption client can't backpressure the node.
+    pub fn check_rate(&self) -> RateDecision {
+        match &self.rate_limit {
+            Some(policy) => self.acct.rate().check(self.id(), policy),
+            None => RateDecision::Allow,
+        }
     }
 }
 

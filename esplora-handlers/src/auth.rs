@@ -99,10 +99,34 @@ impl AuthExpectation {
         }
     }
 
-    fn check(&self, header: Option<&str>) -> bool {
-        self.principal(header)
-            .is_some_and(|p| p.has(Capability::EsploraRead))
+    /// Evaluate a request: resolve the principal, require `esplora:read`, and
+    /// charge the per-principal rate limit.
+    fn evaluate(&self, header: Option<&str>) -> AuthOutcome {
+        let Some(principal) = self.principal(header) else {
+            return AuthOutcome::Unauthorized;
+        };
+        if !principal.has(Capability::EsploraRead) {
+            return AuthOutcome::Unauthorized;
+        }
+        match principal.check_rate() {
+            satd_auth::RateDecision::Allow => AuthOutcome::Authorized,
+            satd_auth::RateDecision::Throttle { retry_after_secs } => {
+                AuthOutcome::RateLimited { retry_after_secs }
+            }
+        }
     }
+
+    #[cfg(test)]
+    fn check(&self, header: Option<&str>) -> bool {
+        matches!(self.evaluate(header), AuthOutcome::Authorized)
+    }
+}
+
+/// Outcome of evaluating a request's credential against the expectation.
+enum AuthOutcome {
+    Authorized,
+    Unauthorized,
+    RateLimited { retry_after_secs: u32 },
 }
 
 /// Axum middleware function. Wired only when auth is enabled.
@@ -116,17 +140,23 @@ pub async fn require_auth(
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
-    if !expected.check(header.as_deref()) {
-        return Response::builder()
+    match expected.evaluate(header.as_deref()) {
+        AuthOutcome::Authorized => next.run(req).await,
+        AuthOutcome::Unauthorized => Response::builder()
             .status(StatusCode::UNAUTHORIZED)
             .header(
                 axum::http::header::WWW_AUTHENTICATE,
                 "Basic realm=\"esplora\"",
             )
             .body(Body::from("Unauthorized"))
-            .unwrap();
+            .unwrap(),
+        // Per-principal rate limit: shed with 429 + Retry-After, never block.
+        AuthOutcome::RateLimited { retry_after_secs } => Response::builder()
+            .status(StatusCode::TOO_MANY_REQUESTS)
+            .header(axum::http::header::RETRY_AFTER, retry_after_secs.to_string())
+            .body(Body::from("Too Many Requests"))
+            .unwrap(),
     }
-    next.run(req).await
 }
 
 #[cfg(test)]

@@ -478,30 +478,45 @@ fn mcp_now_unix() -> i64 {
         .unwrap_or(0)
 }
 
-/// Is the request authorized for MCP? Requires an `Authorization: Bearer <token>`
-/// resolving to a principal that holds the `mcp:*` capability.
-fn mcp_authorized(headers: &hyper::HeaderMap, store: &satd_auth::TokenStore) -> bool {
+enum McpOutcome {
+    Authorized,
+    Unauthorized,
+    RateLimited { retry_after_secs: u32 },
+}
+
+/// Evaluate an MCP request: require an `Authorization: Bearer <token>` resolving
+/// to a principal that holds `mcp:*`, then charge its rate limit.
+fn mcp_evaluate(headers: &hyper::HeaderMap, store: &satd_auth::TokenStore) -> McpOutcome {
     let Some(hdr) = headers.get("authorization").and_then(|v| v.to_str().ok()) else {
-        return false;
+        return McpOutcome::Unauthorized;
     };
     let mut scratch = String::new();
-    match satd_auth::Credential::from_authorization(hdr, &mut scratch) {
-        Some(satd_auth::Credential::Bearer { token }) => store
-            .resolve(token, mcp_now_unix())
-            .is_some_and(|p| p.has(satd_auth::Capability::McpAll)),
-        _ => false,
+    let principal = match satd_auth::Credential::from_authorization(hdr, &mut scratch) {
+        Some(satd_auth::Credential::Bearer { token }) => store.resolve(token, mcp_now_unix()),
+        _ => None,
+    };
+    match principal {
+        Some(p) if p.has(satd_auth::Capability::McpAll) => match p.check_rate() {
+            satd_auth::RateDecision::Allow => McpOutcome::Authorized,
+            satd_auth::RateDecision::Throttle { retry_after_secs } => {
+                McpOutcome::RateLimited { retry_after_secs }
+            }
+        },
+        _ => McpOutcome::Unauthorized,
     }
 }
 
-fn mcp_unauthorized()
--> hyper::Response<http_body_util::combinators::BoxBody<bytes::Bytes, std::convert::Infallible>> {
+type McpBody = http_body_util::combinators::BoxBody<bytes::Bytes, std::convert::Infallible>;
+
+fn mcp_status_response(status: u16, header: Option<(&str, String)>, msg: &'static [u8])
+-> hyper::Response<McpBody> {
     use http_body_util::{BodyExt, Full};
-    let body = Full::new(bytes::Bytes::from_static(b"Unauthorized")).boxed();
-    hyper::Response::builder()
-        .status(401)
-        .header("WWW-Authenticate", "Bearer")
-        .body(body)
-        .expect("static 401 response is valid")
+    let body = Full::new(bytes::Bytes::from_static(msg)).boxed();
+    let mut builder = hyper::Response::builder().status(status);
+    if let Some((k, v)) = header {
+        builder = builder.header(k, v);
+    }
+    builder.body(body).expect("static response is valid")
 }
 
 /// Serve MCP over streamable HTTP.
@@ -554,10 +569,28 @@ pub async fn serve_http(
                                 let svc = svc.clone();
                                 let conn_auth = conn_auth.clone();
                                 async move {
-                                    if let Some(store) = &conn_auth
-                                        && !mcp_authorized(req.headers(), store)
-                                    {
-                                        return Ok::<_, std::convert::Infallible>(mcp_unauthorized());
+                                    if let Some(store) = &conn_auth {
+                                        match mcp_evaluate(req.headers(), store) {
+                                            McpOutcome::Authorized => {}
+                                            McpOutcome::Unauthorized => {
+                                                return Ok::<_, std::convert::Infallible>(
+                                                    mcp_status_response(
+                                                        401,
+                                                        Some(("WWW-Authenticate", "Bearer".into())),
+                                                        b"Unauthorized",
+                                                    ),
+                                                );
+                                            }
+                                            McpOutcome::RateLimited { retry_after_secs } => {
+                                                return Ok::<_, std::convert::Infallible>(
+                                                    mcp_status_response(
+                                                        429,
+                                                        Some(("Retry-After", retry_after_secs.to_string())),
+                                                        b"Too Many Requests",
+                                                    ),
+                                                );
+                                            }
+                                        }
                                     }
                                     Ok::<_, std::convert::Infallible>(svc.handle(req).await)
                                 }

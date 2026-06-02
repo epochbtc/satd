@@ -260,6 +260,11 @@ impl EventSink for GrpcEventSink {
         let result = if let Some(store) = self.auth.clone() {
             let interceptor = move |mut req: Request<()>| -> Result<Request<()>, Status> {
                 let principal = authenticate(&req, &store)?;
+                // Per-principal rate limit (operator/loopback bypass): shed an
+                // over-budget Subscribe with RESOURCE_EXHAUSTED, never block.
+                if let satd_auth::RateDecision::Throttle { .. } = principal.check_rate() {
+                    return Err(Status::resource_exhausted("rate limit exceeded"));
+                }
                 req.extensions_mut().insert(principal);
                 Ok(req)
             };

@@ -333,14 +333,19 @@ fn test_rpc_bearer_token_capability_scoping() {
     const TOKEN: &str = "satd-test-readonly-token-v1";
     const TOKEN_SHA256: &str =
         "710379ec62ddf04432c6c803b1679020abf2caf79a8c64c9dfb522c686a0cf3d";
+    // A rate-limited read token: 1/s, so a rapid second request is shed (429).
+    const TOKEN_RL: &str = "satd-test-ratelimited-token-v1";
+    const TOKEN_RL_SHA256: &str =
+        "42c59631c8af2dcca2366d951bb29cf66b43e6637967315e2eaab48a39c9f474";
 
     // Write a 0600 auth.toml in a dedicated temp dir (absolute path required).
     let dir = std::env::temp_dir().join(format!("satd-authfile-it-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let authfile = dir.join("auth.toml");
     let toml = format!(
-        "version = 1\n[[token]]\nid = \"ro\"\nhash = \"sha256:{TOKEN_SHA256}\"\n\
-         capabilities = [\"rpc:read\"]\n"
+        "version = 1\n\
+         [[token]]\nid = \"ro\"\nhash = \"sha256:{TOKEN_SHA256}\"\ncapabilities = [\"rpc:read\"]\n\
+         [[token]]\nid = \"rl\"\nhash = \"sha256:{TOKEN_RL_SHA256}\"\ncapabilities = [\"rpc:read\"]\nrate_limit = \"1/s\"\n"
     );
     {
         let mut f = std::fs::File::create(&authfile).unwrap();
@@ -407,6 +412,28 @@ fn test_rpc_bearer_token_capability_scoping() {
     // (d) A bad bearer token is rejected at the HTTP layer.
     let (status, _json) = call(Some("not-a-real-token"), "getblockcount");
     assert_eq!(status, 401, "bad bearer token should be 401");
+
+    // (e) Per-token rate limit (1/s, burst 1): the first request is served, a
+    // rapid burst is shed with 429. Fire several back-to-back and require both a
+    // 200 and at least one 429.
+    let mut saw_ok = false;
+    let mut saw_429 = false;
+    for _ in 0..6 {
+        let (status, _json) = call(Some(TOKEN_RL), "getblockcount");
+        match status {
+            200 => saw_ok = true,
+            429 => saw_429 = true,
+            other => panic!("unexpected status {other} for rate-limited token"),
+        }
+    }
+    assert!(saw_ok, "rate-limited token should serve at least one request");
+    assert!(saw_429, "rate-limited token should be 429'd on a rapid burst");
+
+    // The operator cookie is unlimited — never 429'd by the same burst.
+    for _ in 0..6 {
+        let info = node.rpc_call("getblockcount").unwrap();
+        assert!(info.get("result").is_some(), "operator must not be rate-limited");
+    }
 
     node.stop();
     let _ = std::fs::remove_dir_all(&dir);

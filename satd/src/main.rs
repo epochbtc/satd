@@ -329,6 +329,10 @@ async fn main() {
                     tokens = store.snapshot().len(),
                     "Loaded unified-auth token file"
                 );
+                // Attach the in-process accounting backend so per-token
+                // rate-limit / watch-quota state is tracked and enforced.
+                let store = store
+                    .with_accounting(std::sync::Arc::new(satd_auth::LocalAccounting::new()));
                 Some(Arc::new(store))
             }
             Err(e) => {
