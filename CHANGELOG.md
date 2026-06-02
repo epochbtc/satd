@@ -194,7 +194,8 @@ working when the layer is enabled.
   watch-set quota / rate limit, and optional expiry. Token `id`s must be unique
   (they key per-tenant accounting and the revocation audit log) and unknown
   capability strings are rejected — both fail the parse loudly rather than
-  silently. The file must be a regular file and `0600` or satd refuses to start
+  silently. The file must be a regular file readable only by its owner with no
+  execute bit (`0600`, or `0400` for a read-only secret) or satd refuses to start
   (like the cookie). It is re-read on `SIGHUP`
   independently of the rest of the config, so **removing a token and reloading
   revokes it live**; a malformed reload keeps the last-good table. An

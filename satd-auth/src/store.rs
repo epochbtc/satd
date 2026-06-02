@@ -3,8 +3,10 @@
 //!
 //! The file stores `SHA-256(token)`, never the plaintext (SATD_AUTH_PLAN.md §5).
 //! A client presents the plaintext token; the verifier hashes it and looks the
-//! digest up here. The file must be `0600` or the load is refused (mirroring the
-//! cookie / SSH-key convention). Removing a `[[token]]` and reloading revokes it.
+//! digest up here. The file must be a regular file readable only by its owner
+//! with no execute bit — `0600`, or `0400` for a read-only secret — or the load
+//! is refused (mirroring the cookie / SSH-key convention). Removing a
+//! `[[token]]` and reloading revokes it.
 
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
@@ -104,7 +106,8 @@ impl std::fmt::Debug for TokenStore {
 }
 
 impl TokenStore {
-    /// Load and validate the token file. Refuses group/world-accessible perms.
+    /// Load and validate the token file. Refuses a non-regular file or any
+    /// group/world/execute permission bit (owner-only `0600`/`0400` required).
     /// Token principals get the no-op unlimited accounting until
     /// [`with_accounting`](Self::with_accounting) attaches a real backend.
     pub fn load(path: impl AsRef<Path>) -> Result<TokenStore, StoreError> {
@@ -228,7 +231,14 @@ fn read_and_parse(path: &Path) -> Result<TokenTable, StoreError> {
 fn check_perms(path: &Path, meta: &std::fs::Metadata) -> Result<(), StoreError> {
     use std::os::unix::fs::PermissionsExt;
     let mode = meta.permissions().mode();
-    if mode & 0o077 != 0 {
+    // The auth file holds bearer-token hashes, so it must be readable only by
+    // its owner. Refuse any group/world bit (0o077) AND any execute bit (0o111):
+    // a secret data file should be `0600` (read-write) or `0400` (read-only —
+    // an operator may deliberately make the secret immutable). Group/world
+    // access or an execute bit signals misconfiguration. `0400` is intentionally
+    // allowed because it is strictly more restrictive than `0600` (this mirrors
+    // how OpenSSH accepts a `0400` private key).
+    if mode & 0o177 != 0 {
         return Err(StoreError::Permissions {
             path: path.display().to_string(),
             mode: mode & 0o7777,
@@ -474,12 +484,39 @@ capabilities = ["stream:subscribe", "stream:watch"]
 
     #[cfg(unix)]
     #[test]
-    fn refuses_group_or_world_readable() {
+    fn refuses_group_world_or_executable_perms() {
         let dir = tempfile::tempdir().unwrap();
         let toml = format!("version = 1\n[[token]]\nid=\"x\"\nhash=\"{}\"\n", sha256_hex("t"));
-        let p = write_file(dir.path(), "auth.toml", &toml, 0o644);
-        let err = TokenStore::load(&p).unwrap_err();
-        assert!(matches!(err, StoreError::Permissions { .. }), "{err}");
+        // Group/world bits and execute bits are all unsafe for a secret file.
+        for (name, mode) in [
+            ("g_world.toml", 0o644),
+            ("group.toml", 0o640),
+            ("owner_x.toml", 0o700),
+            ("owner_rx.toml", 0o500),
+        ] {
+            let p = write_file(dir.path(), name, &toml, mode);
+            let err = TokenStore::load(&p).unwrap_err();
+            assert!(
+                matches!(err, StoreError::Permissions { .. }),
+                "mode {mode:#o} should be rejected, got {err}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn accepts_owner_only_read_modes() {
+        // 0600 (rw) and 0400 (read-only — a deliberately immutable secret, like
+        // an OpenSSH private key) are both owner-only and non-executable.
+        let dir = tempfile::tempdir().unwrap();
+        let toml = format!("version = 1\n[[token]]\nid=\"x\"\nhash=\"{}\"\n", sha256_hex("t"));
+        for (name, mode) in [("rw.toml", 0o600), ("ro.toml", 0o400)] {
+            let p = write_file(dir.path(), name, &toml, mode);
+            assert!(
+                TokenStore::load(&p).is_ok(),
+                "mode {mode:#o} should be accepted"
+            );
+        }
     }
 
     #[test]
