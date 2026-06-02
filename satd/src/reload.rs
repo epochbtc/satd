@@ -646,6 +646,7 @@ fn field_specs() -> Vec<FieldSpec> {
         restart!("eventsregion", events_region),
         restart!("eventsgrpcbind", events_grpc_bind),
         restart!("eventsgrpcallowremote", events_grpc_allow_remote),
+        restart!("eventsgrpcauth", events_grpc_auth),
         // gRPC admission caps are applied when the sink is built at
         // startup; changing them requires a restart.
         restart!("eventsgrpcmaxconns", events_grpc_max_conns),

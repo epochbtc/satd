@@ -208,6 +208,12 @@ working when the layer is enabled.
   (requires `-authfile`), the Esplora HTTP/SSE surface additionally accepts
   `Authorization: Bearer <token>` for tokens holding the `esplora:read`
   capability, alongside the existing `-esploraauth` cookie/userpass credential.
+- **`-events-grpc-auth` — bearer tokens on the events gRPC stream.** When set
+  (requires `-authfile`), every `Subscribe` must present an
+  `authorization: Bearer <token>` metadata entry for a token holding the
+  `stream:subscribe` capability; otherwise the stream is rejected with gRPC
+  `UNAUTHENTICATED` / `PERMISSION_DENIED`. The loopback / `-events-grpc-allow-remote`
+  gate stays as a transport pre-check beneath this app-layer auth.
 
 ### API surface scaling
 

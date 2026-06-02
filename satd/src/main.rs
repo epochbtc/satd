@@ -880,6 +880,13 @@ async fn main() {
                 max_conns: config.events_grpc_max_conns,
                 max_subscriptions: config.events_grpc_max_subscriptions,
             },
+            // Bearer auth (stream:subscribe) when `-events-grpc-auth` is set
+            // (which requires `authfile`).
+            if config.events_grpc_auth {
+                token_store.clone()
+            } else {
+                None
+            },
         )
         .await
         {

@@ -917,6 +917,11 @@ pub struct Config {
     /// place the server behind a firewall, mTLS terminator, or auth
     /// proxy — the gRPC sink itself has no auth or rate limits.
     pub events_grpc_allow_remote: bool,
+    /// Per-surface participation flag: when true, every events gRPC `Subscribe`
+    /// must present `authorization: Bearer <token>` for a token holding the
+    /// `stream:subscribe` capability. Requires `authfile`. Default false
+    /// (unauthenticated, loopback-trust — today's behavior).
+    pub events_grpc_auth: bool,
     /// Hard cap on simultaneously-open events gRPC connections. A new TCP
     /// connection beyond the cap is dropped at accept. Default: 64. `0`
     /// disables the cap.
@@ -1882,6 +1887,17 @@ impl Config {
                     .to_string(),
             );
         }
+        let events_grpc_auth = cli
+            .events_grpc_auth
+            .or_else(|| file_get("eventsgrpcauth").and_then(|v| parse_bool(&v)))
+            .unwrap_or(false);
+        if events_grpc_auth && authfile.is_none() {
+            return Err(
+                "--events-grpc-auth requires --authfile (there is no token table to honor \
+                 bearer tokens against)"
+                    .to_string(),
+            );
+        }
         let esplora_tls_bind = cli.esploratlsbind.or_else(|| file_get("esploratlsbind"));
         let esplora_tls_cert = cli
             .esploratlscert
@@ -2633,6 +2649,7 @@ impl Config {
                 .events_grpc_max_conns
                 .or_else(|| file_get("eventsgrpcmaxconns").and_then(|v| v.parse().ok()))
                 .unwrap_or(64),
+            events_grpc_auth,
             events_grpc_max_subscriptions: cli
                 .events_grpc_max_subscriptions
                 .or_else(|| file_get("eventsgrpcmaxsubscriptions").and_then(|v| v.parse().ok()))
@@ -4205,6 +4222,17 @@ pub struct CliArgs {
     )]
     pub events_grpc_allow_remote: Option<bool>,
 
+    /// Require bearer tokens (stream:subscribe) on the events gRPC server.
+    #[arg(
+        long = "events-grpc-auth",
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
+        help = "Require Authorization: Bearer tokens (stream:subscribe) on the events gRPC server (default: false). Requires --authfile."
+    )]
+    pub events_grpc_auth: Option<bool>,
+
     #[arg(
         long = "events-grpc-max-conns",
         value_name = "N",
@@ -4926,6 +4954,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "eventsregion",
     "eventsgrpcbind",
     "eventsgrpcallowremote",
+    "eventsgrpcauth",
     "eventsgrpcmaxconns",
     "eventsgrpcmaxsubscriptions",
     "eventszmqbind",
@@ -5836,6 +5865,7 @@ rpcport=8332
             events_region: None,
             events_grpc_bind: None,
             events_grpc_allow_remote: Some(false),
+            events_grpc_auth: None,
             events_grpc_max_conns: None,
             events_grpc_max_subscriptions: None,
             events_zmq_bind: None,
@@ -6069,6 +6099,7 @@ rpcport=8332
             events_region: None,
             events_grpc_bind: None,
             events_grpc_allow_remote: Some(false),
+            events_grpc_auth: None,
             events_grpc_max_conns: None,
             events_grpc_max_subscriptions: None,
             events_zmq_bind: None,

@@ -82,6 +82,50 @@ pub struct GrpcEventSink {
     listener: TcpListener,
     publisher: std::sync::Arc<node::events::EventPublisher>,
     limits: GrpcLimits,
+    /// Unified-auth bearer-token store, `Some` only when `-eventsgrpcauth` is
+    /// set (which requires `authfile`). When present, every `Subscribe` must
+    /// carry an `authorization: Bearer <token>` resolving to a principal with
+    /// the `stream:subscribe` capability; otherwise the stream is unauthenticated
+    /// (loopback-trust), today's behavior.
+    auth: Option<std::sync::Arc<satd_auth::TokenStore>>,
+}
+
+fn now_unix() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Authenticate a gRPC request against the token store: require an
+/// `authorization: Bearer <token>` metadata entry resolving to a principal that
+/// holds `stream:subscribe`. Returns the principal (for the handler / future
+/// per-principal quota) or a gRPC `Status`.
+// `Status` is tonic's required error type for an interceptor; it is large but
+// not ours to box (the interceptor closure must return `Result<_, Status>`).
+#[allow(clippy::result_large_err)]
+fn authenticate(
+    req: &Request<()>,
+    store: &satd_auth::TokenStore,
+) -> Result<satd_auth::Principal, Status> {
+    let hdr = req
+        .metadata()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| Status::unauthenticated("missing authorization metadata"))?;
+    let mut scratch = String::new();
+    let principal = match satd_auth::Credential::from_authorization(hdr, &mut scratch) {
+        Some(satd_auth::Credential::Bearer { token }) => store.resolve(token, now_unix()),
+        _ => None,
+    }
+    .ok_or_else(|| Status::unauthenticated("invalid or unknown bearer token"))?;
+    if !principal.has(satd_auth::Capability::StreamSubscribe) {
+        return Err(Status::permission_denied(
+            "token lacks the stream:subscribe capability",
+        ));
+    }
+    Ok(principal)
 }
 
 impl GrpcEventSink {
@@ -103,6 +147,7 @@ impl GrpcEventSink {
         allow_remote: bool,
         publisher: std::sync::Arc<node::events::EventPublisher>,
         limits: GrpcLimits,
+        auth: Option<std::sync::Arc<satd_auth::TokenStore>>,
     ) -> Result<Self, GrpcEventSinkError> {
         let addr: SocketAddr = bind
             .parse()
@@ -127,6 +172,7 @@ impl GrpcEventSink {
             listener,
             publisher,
             limits,
+            auth,
         })
     }
 
@@ -160,11 +206,11 @@ impl EventSink for GrpcEventSink {
         _events: broadcast::Receiver<NodeEvent>,
         mut shutdown: watch::Receiver<bool>,
     ) {
-        let svc = NodeEventStreamServer::new(NodeEventStreamSvc {
+        let svc_impl = NodeEventStreamSvc {
             publisher: self.publisher.clone(),
             active_subs: Arc::new(AtomicUsize::new(0)),
             max_subscriptions: self.limits.max_subscriptions,
-        });
+        };
         info!(target: "events::grpc", addr = %self.addr, "events gRPC server starting");
         let shutdown_signal = async move {
             let _ = shutdown.changed().await;
@@ -205,11 +251,29 @@ impl EventSink for GrpcEventSink {
             },
             Err(e) => Some(Err(e)),
         });
-        if let Err(e) = Server::builder()
-            .add_service(svc)
-            .serve_with_incoming_shutdown(incoming, shutdown_signal)
-            .await
-        {
+        // When auth is configured, wrap the service in a tonic interceptor that
+        // rejects any Subscribe without a valid bearer token holding
+        // stream:subscribe (and stashes the principal in the request extensions
+        // for the handler / future per-principal quota). The loopback +
+        // allow_remote gate in `bind()` stays as a transport pre-check beneath
+        // this app-layer auth.
+        let result = if let Some(store) = self.auth.clone() {
+            let interceptor = move |mut req: Request<()>| -> Result<Request<()>, Status> {
+                let principal = authenticate(&req, &store)?;
+                req.extensions_mut().insert(principal);
+                Ok(req)
+            };
+            Server::builder()
+                .add_service(NodeEventStreamServer::with_interceptor(svc_impl, interceptor))
+                .serve_with_incoming_shutdown(incoming, shutdown_signal)
+                .await
+        } else {
+            Server::builder()
+                .add_service(NodeEventStreamServer::new(svc_impl))
+                .serve_with_incoming_shutdown(incoming, shutdown_signal)
+                .await
+        };
+        if let Err(e) = result {
             warn!(target: "events::grpc", error = %e, "events gRPC server exited with error");
         }
     }
@@ -522,6 +586,79 @@ mod tests {
         EdgeIdentity::new([0x42; 16], Some("us-east1")).unwrap()
     }
 
+    // sha256("grpc-sub-token") and sha256("grpc-nosub-token"), fixed vectors.
+    const SUB_TOKEN: &str = "grpc-sub-token";
+    const SUB_TOKEN_SHA256: &str =
+        "ae5e3c117a11a76ffdbd1ea48b3ab0090d7a236f44aee421cbeb00d9b10bb368";
+    const NOSUB_TOKEN: &str = "grpc-nosub-token";
+    const NOSUB_TOKEN_SHA256: &str =
+        "11185ce0a4d924beea79c1198a388f6f9d75c1e95ff0fc71549ec8d2d28483b3";
+
+    fn auth_store() -> Arc<satd_auth::TokenStore> {
+        use std::io::Write;
+        let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+        let toml = format!(
+            "version = 1\n\
+             [[token]]\nid=\"sub\"\nhash=\"sha256:{SUB_TOKEN_SHA256}\"\ncapabilities=[\"stream:subscribe\"]\n\
+             [[token]]\nid=\"nosub\"\nhash=\"sha256:{NOSUB_TOKEN_SHA256}\"\ncapabilities=[\"rpc:read\"]\n"
+        );
+        let p = dir.path().join("auth.toml");
+        let mut f = std::fs::File::create(&p).unwrap();
+        f.write_all(toml.as_bytes()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        Arc::new(satd_auth::TokenStore::load(&p).unwrap())
+    }
+
+    fn req_with_auth(value: Option<&str>) -> Request<()> {
+        let mut req = Request::new(());
+        if let Some(v) = value {
+            req.metadata_mut().insert("authorization", v.parse().unwrap());
+        }
+        req
+    }
+
+    #[test]
+    fn grpc_auth_accepts_stream_subscribe_token() {
+        let store = auth_store();
+        let req = req_with_auth(Some(&format!("Bearer {SUB_TOKEN}")));
+        let p = authenticate(&req, &store).expect("valid subscribe token");
+        assert_eq!(p.id(), "sub");
+    }
+
+    #[test]
+    fn grpc_auth_rejects_token_without_subscribe_capability() {
+        let store = auth_store();
+        let req = req_with_auth(Some(&format!("Bearer {NOSUB_TOKEN}")));
+        let err = authenticate(&req, &store).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[test]
+    fn grpc_auth_rejects_missing_and_unknown() {
+        let store = auth_store();
+        assert_eq!(
+            authenticate(&req_with_auth(None), &store).unwrap_err().code(),
+            tonic::Code::Unauthenticated
+        );
+        assert_eq!(
+            authenticate(&req_with_auth(Some("Bearer nope")), &store)
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unauthenticated
+        );
+        // Basic (non-bearer) is not a valid gRPC credential here.
+        assert_eq!(
+            authenticate(&req_with_auth(Some("Basic abc")), &store)
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unauthenticated
+        );
+    }
+
     fn enter(byte: u8) -> MempoolEvent {
         MempoolEvent::Enter {
             txid: Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
@@ -594,7 +731,7 @@ mod tests {
     #[tokio::test]
     async fn bind_rejects_remote_address_by_default() {
         let publisher = EventPublisher::new(edge(), 16);
-        match GrpcEventSink::bind("0.0.0.0:0", false, publisher, GrpcLimits::default()).await {
+        match GrpcEventSink::bind("0.0.0.0:0", false, publisher, GrpcLimits::default(), None).await {
             Err(GrpcEventSinkError::RemoteBindRejected(_)) => {}
             Ok(_) => panic!("non-loopback bind without allow_remote should fail"),
             Err(e) => panic!("expected RemoteBindRejected, got {e}"),
@@ -604,7 +741,7 @@ mod tests {
     #[tokio::test]
     async fn bind_allows_loopback_without_override() {
         let publisher = EventPublisher::new(edge(), 16);
-        let sink = GrpcEventSink::bind("127.0.0.1:0", false, publisher, GrpcLimits::default())
+        let sink = GrpcEventSink::bind("127.0.0.1:0", false, publisher, GrpcLimits::default(), None)
             .await
             .expect("loopback bind should succeed");
         let addr = sink.local_addr().expect("local_addr");
@@ -617,7 +754,7 @@ mod tests {
         // 0.0.0.0:0 with allow_remote = true: must succeed (the actual
         // port the OS picks is irrelevant; the test asserts only that
         // the loopback gate is bypassed when the caller opts in).
-        let sink = GrpcEventSink::bind("0.0.0.0:0", true, publisher, GrpcLimits::default())
+        let sink = GrpcEventSink::bind("0.0.0.0:0", true, publisher, GrpcLimits::default(), None)
             .await
             .expect("explicit remote bind should be allowed");
         let addr = sink.local_addr().unwrap();
@@ -651,7 +788,7 @@ mod tests {
 
         // 2. Bind directly (the new API picks the actual ephemeral port
         // from the OS, no TOCTOU window).
-        let sink = GrpcEventSink::bind("127.0.0.1:0", false, publisher.clone(), GrpcLimits::default())
+        let sink = GrpcEventSink::bind("127.0.0.1:0", false, publisher.clone(), GrpcLimits::default(), None)
             .await
             .expect("bind");
         let actual = sink.local_addr().unwrap();
