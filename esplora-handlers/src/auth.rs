@@ -8,34 +8,51 @@
 //! `EsploraAuth::Cookie` variant defaults to that same path).
 
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
 use axum::http::{Request, Response, StatusCode};
 use axum::middleware::Next;
-use satd_auth::{Credential, OperatorCreds};
+use satd_auth::{Capability, CapabilitySet, Credential, OperatorCreds, Principal, TokenStore};
 
 use crate::config::EsploraAuth;
 
-/// Resolved expected credentials. Built once at server start and
-/// shared across requests.
+fn now_unix() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Resolved expected credentials. Built once at server start and shared across
+/// requests.
 ///
-/// The credential matching (including the constant-time secret compare and the
-/// `Authorization`-header parse) is delegated to the shared
-/// [`satd_auth`] verifier, so this surface no longer carries a bespoke
-/// constant-time routine.
-#[derive(Debug, Clone)]
+/// Credential parsing + the constant-time secret compare are delegated to the
+/// shared [`satd_auth`] verifier. A request is authorized iff it resolves to a
+/// principal holding [`Capability::EsploraRead`]: the legacy operator
+/// (cookie / userpass, full capabilities) and — when `-esploraauthbearer` is on
+/// — a bearer token carrying `esplora:read`.
+#[derive(Clone)]
 pub enum AuthExpectation {
+    /// Wide-open: no operator credential and no bearer store.
     None,
-    UserPass { creds: OperatorCreds },
+    /// At least one credential path is configured; a request must satisfy it.
+    Required {
+        /// Operator credential (cookie / userpass), or `None` when the legacy
+        /// `auth` mode is `None` but bearer tokens are enabled.
+        operator: Option<OperatorCreds>,
+        /// Bearer-token store, `Some` only when `-esploraauthbearer` is set.
+        bearer: Option<Arc<TokenStore>>,
+    },
 }
 
 impl AuthExpectation {
-    pub fn build(cfg: &EsploraAuth) -> Result<Self, String> {
-        match cfg {
-            EsploraAuth::None => Ok(Self::None),
-            EsploraAuth::UserPass { username, password } => Ok(Self::UserPass {
-                creds: OperatorCreds::from_user_pass(username.clone(), password.clone()),
-            }),
+    pub fn build(cfg: &EsploraAuth, bearer: Option<Arc<TokenStore>>) -> Result<Self, String> {
+        let operator = match cfg {
+            EsploraAuth::None => None,
+            EsploraAuth::UserPass { username, password } => {
+                Some(OperatorCreds::from_user_pass(username.clone(), password.clone()))
+            }
             EsploraAuth::Cookie { path } => {
                 let content = std::fs::read_to_string(path).map_err(|e| {
                     format!("esplora auth: cannot read cookie {}: {}", path.display(), e)
@@ -43,30 +60,48 @@ impl AuthExpectation {
                 let (user, pass) = content.trim().split_once(':').ok_or_else(|| {
                     format!("esplora auth: malformed cookie at {}", path.display())
                 })?;
-                Ok(Self::UserPass {
-                    creds: OperatorCreds::from_user_pass(user.to_string(), pass.to_string()),
-                })
+                Some(OperatorCreds::from_user_pass(user.to_string(), pass.to_string()))
             }
+        };
+        if operator.is_none() && bearer.is_none() {
+            Ok(Self::None)
+        } else {
+            Ok(Self::Required { operator, bearer })
+        }
+    }
+
+    /// Whether bearer/operator auth is active (the middleware should be wired).
+    pub fn is_enabled(&self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    /// Resolve the request's credential to a principal, or `None`.
+    fn principal(&self, header: Option<&str>) -> Option<Principal> {
+        let (operator, bearer) = match self {
+            // Wide-open: a loopback principal with full capabilities.
+            Self::None => return Some(Principal::loopback(CapabilitySet::ALL)),
+            Self::Required { operator, bearer } => (operator, bearer),
+        };
+        let hdr = header?;
+        let mut scratch = String::new();
+        match Credential::from_authorization(hdr, &mut scratch) {
+            Some(Credential::Basic { user, pass }) => {
+                if operator.as_ref().is_some_and(|c| c.matches(user, pass)) {
+                    Some(Principal::operator())
+                } else {
+                    None
+                }
+            }
+            Some(Credential::Bearer { token }) => {
+                bearer.as_ref().and_then(|s| s.resolve(token, now_unix()))
+            }
+            _ => None,
         }
     }
 
     fn check(&self, header: Option<&str>) -> bool {
-        let creds = match self {
-            Self::None => return true,
-            Self::UserPass { creds } => creds,
-        };
-        let Some(hdr) = header else {
-            return false;
-        };
-        // Parse via the shared verifier (RFC 7235 case-insensitive scheme,
-        // base64 decode, `user:pass` split), then constant-time match. Only the
-        // Basic carrier is honored on this surface in this PR; the bearer carrier
-        // is added with the `esploraauthbearer` participation flag.
-        let mut scratch = String::new();
-        match Credential::from_authorization(hdr, &mut scratch) {
-            Some(Credential::Basic { user, pass }) => creds.matches(user, pass),
-            _ => false,
-        }
+        self.principal(header)
+            .is_some_and(|p| p.has(Capability::EsploraRead))
     }
 }
 
@@ -143,8 +178,73 @@ mod tests {
     }
 
     fn userpass(username: &str, password: &str) -> AuthExpectation {
-        AuthExpectation::UserPass {
-            creds: OperatorCreds::from_user_pass(username.to_string(), password.to_string()),
+        AuthExpectation::Required {
+            operator: Some(OperatorCreds::from_user_pass(
+                username.to_string(),
+                password.to_string(),
+            )),
+            bearer: None,
         }
+    }
+
+    fn token_store_with(id: &str, plaintext: &str, caps: &str) -> Arc<TokenStore> {
+        use sha2::{Digest, Sha256};
+        use std::io::Write;
+        let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+        let h = format!("sha256:{}", hex::encode(Sha256::digest(plaintext.as_bytes())));
+        let caps_list = caps
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(|c| format!("\"{c}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let toml = format!(
+            "version=1\n[[token]]\nid=\"{id}\"\nhash=\"{h}\"\ncapabilities=[{caps_list}]\n"
+        );
+        let p = dir.path().join("auth.toml");
+        let mut f = std::fs::File::create(&p).unwrap();
+        f.write_all(toml.as_bytes()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        Arc::new(TokenStore::load(&p).unwrap())
+    }
+
+    #[test]
+    fn bearer_token_with_esplora_read_is_accepted() {
+        let exp = AuthExpectation::Required {
+            operator: None,
+            bearer: Some(token_store_with("ro", "esplora-token", "esplora:read")),
+        };
+        assert!(exp.is_enabled());
+        assert!(exp.check(Some("Bearer esplora-token")));
+        // A token lacking esplora:read is rejected even though it authenticates.
+        let exp2 = AuthExpectation::Required {
+            operator: None,
+            bearer: Some(token_store_with("rpc", "rpc-token", "rpc:read")),
+        };
+        assert!(!exp2.check(Some("Bearer rpc-token")));
+        // Unknown token rejected.
+        assert!(!exp.check(Some("Bearer nope")));
+        // Missing header rejected.
+        assert!(!exp.check(None));
+    }
+
+    #[test]
+    fn operator_and_bearer_coexist() {
+        let exp = AuthExpectation::Required {
+            operator: Some(OperatorCreds::from_user_pass("alice".into(), "secret".into())),
+            bearer: Some(token_store_with("ro", "esplora-token", "esplora:read")),
+        };
+        // Operator Basic works.
+        let basic = format!("Basic {}", BASE64.encode("alice:secret"));
+        assert!(exp.check(Some(&basic)));
+        // Bearer works.
+        assert!(exp.check(Some("Bearer esplora-token")));
+        // Wrong operator password rejected.
+        let bad = format!("Basic {}", BASE64.encode("alice:wrong"));
+        assert!(!exp.check(Some(&bad)));
     }
 }

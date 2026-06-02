@@ -204,6 +204,10 @@ working when the layer is enabled.
   mempool-submit / control / block-connecting / unknown methods (fail-closed). A
   forbidden call returns JSON-RPC error `-32004`. The operator credential keeps
   full access, so the capability filter is a no-op for legacy clients.
+- **`-esploraauthbearer` — bearer tokens on the Esplora server.** When set
+  (requires `-authfile`), the Esplora HTTP/SSE surface additionally accepts
+  `Authorization: Bearer <token>` for tokens holding the `esplora:read`
+  capability, alongside the existing `-esploraauth` cookie/userpass credential.
 
 ### API surface scaling
 
