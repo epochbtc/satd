@@ -113,6 +113,16 @@ impl WatchLease {
     }
 }
 
+impl std::fmt::Debug for WatchLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `store` is a trait object (not Debug); omit it.
+        f.debug_struct("WatchLease")
+            .field("principal_id", &self.principal_id)
+            .field("n", &self.n)
+            .finish()
+    }
+}
+
 impl Drop for WatchLease {
     fn drop(&mut self) {
         self.store.release(&self.principal_id, self.n);
@@ -168,6 +178,164 @@ pub(crate) fn unlimited() -> Arc<dyn Accounting> {
     UNLIMITED.get_or_init(|| Arc::new(UnlimitedAccounting)).clone()
 }
 
+// ----------------------------------------------------------------------------
+// In-process default backends. A single `LocalAccounting` is shared by every
+// token principal; per-principal state is keyed by `principal_id` inside the
+// sharded maps (so a tenant's quota/rate survives across its connections). A
+// future Redis-backed backend implements the same traits and drops in
+// fail-open; the call sites only ever see the traits.
+// ----------------------------------------------------------------------------
+
+use dashmap::DashMap;
+
+/// Real (wall-clock) millisecond clock for the token bucket.
+fn system_millis() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+#[derive(Clone, Copy)]
+struct BucketState {
+    tokens: f64,
+    last_ms: u64,
+}
+
+/// In-process token-bucket rate limiter, keyed by principal id.
+pub struct LocalRateLimiter {
+    buckets: DashMap<String, BucketState>,
+    clock: fn() -> u64,
+}
+
+impl LocalRateLimiter {
+    pub fn new() -> Self {
+        Self {
+            buckets: DashMap::new(),
+            clock: system_millis,
+        }
+    }
+    /// Construct with an injected millisecond clock (tests).
+    pub fn with_clock(clock: fn() -> u64) -> Self {
+        Self {
+            buckets: DashMap::new(),
+            clock,
+        }
+    }
+}
+
+impl Default for LocalRateLimiter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RateLimiter for LocalRateLimiter {
+    fn check(&self, principal_id: &str, policy: &RatePolicy) -> RateDecision {
+        let now = (self.clock)();
+        let mut state = self
+            .buckets
+            .entry(principal_id.to_string())
+            .or_insert(BucketState {
+                tokens: policy.burst as f64,
+                last_ms: now,
+            });
+        // Refill proportional to elapsed time, capped at the burst size.
+        let elapsed_ms = now.saturating_sub(state.last_ms);
+        let refill = (elapsed_ms as f64 / 1000.0) * policy.per_sec as f64;
+        state.tokens = (state.tokens + refill).min(policy.burst as f64);
+        state.last_ms = now;
+
+        if state.tokens >= 1.0 {
+            state.tokens -= 1.0;
+            RateDecision::Allow
+        } else {
+            // Time until one whole token refills.
+            let needed = 1.0 - state.tokens;
+            let secs = (needed / policy.per_sec.max(1) as f64).ceil() as u32;
+            RateDecision::Throttle {
+                retry_after_secs: secs.max(1),
+            }
+        }
+    }
+}
+
+/// In-process watch-set occupancy store, keyed by principal id.
+#[derive(Default)]
+pub struct LocalQuotaStore {
+    held: DashMap<String, u64>,
+}
+
+impl LocalQuotaStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl QuotaStore for LocalQuotaStore {
+    fn try_acquire(&self, principal_id: &str, n: u64, max: u64) -> Result<(), QuotaExceeded> {
+        let mut held = self.held.entry(principal_id.to_string()).or_insert(0);
+        let current = *held;
+        if current.saturating_add(n) > max {
+            return Err(QuotaExceeded {
+                current,
+                requested: n,
+                max,
+            });
+        }
+        *held = current + n;
+        Ok(())
+    }
+    fn release(&self, principal_id: &str, n: u64) {
+        if let Some(mut held) = self.held.get_mut(principal_id) {
+            *held = held.saturating_sub(n);
+        }
+    }
+    fn current(&self, principal_id: &str) -> u64 {
+        self.held.get(principal_id).map(|v| *v).unwrap_or(0)
+    }
+}
+
+/// The default in-process accounting backend: a token-bucket rate limiter plus a
+/// watch-set occupancy store, both keyed by principal id. One instance is shared
+/// by every token principal.
+pub struct LocalAccounting {
+    rate: LocalRateLimiter,
+    quota: Arc<LocalQuotaStore>,
+}
+
+impl LocalAccounting {
+    pub fn new() -> Self {
+        Self {
+            rate: LocalRateLimiter::new(),
+            quota: Arc::new(LocalQuotaStore::new()),
+        }
+    }
+    /// Construct with an injected rate-limiter clock (tests).
+    pub fn with_clock(clock: fn() -> u64) -> Self {
+        Self {
+            rate: LocalRateLimiter::with_clock(clock),
+            quota: Arc::new(LocalQuotaStore::new()),
+        }
+    }
+}
+
+impl Default for LocalAccounting {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Accounting for LocalAccounting {
+    fn rate(&self) -> &dyn RateLimiter {
+        &self.rate
+    }
+    fn quota(&self) -> Arc<dyn QuotaStore> {
+        self.quota.clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,5 +360,70 @@ mod tests {
         let lease = WatchLease::acquire(q.clone(), Arc::from("anyone"), 1_000_000, 1).unwrap();
         assert_eq!(lease.units(), 1_000_000);
         assert_eq!(q.current("anyone"), 0); // unlimited tracks nothing
+    }
+
+    // A settable clock for the token-bucket tests.
+    static CLOCK_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    fn test_clock() -> u64 {
+        CLOCK_MS.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn set_clock(ms: u64) {
+        CLOCK_MS.store(ms, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[test]
+    fn token_bucket_bursts_then_throttles_then_refills() {
+        set_clock(0);
+        let rl = LocalRateLimiter::with_clock(test_clock);
+        let policy = RatePolicy { burst: 3, per_sec: 1 };
+        // Burst of 3 allowed at t=0.
+        for _ in 0..3 {
+            assert_eq!(rl.check("p", &policy), RateDecision::Allow);
+        }
+        // 4th is throttled.
+        assert!(matches!(
+            rl.check("p", &policy),
+            RateDecision::Throttle { .. }
+        ));
+        // After 2s, ~2 tokens refilled.
+        set_clock(2000);
+        assert_eq!(rl.check("p", &policy), RateDecision::Allow);
+        assert_eq!(rl.check("p", &policy), RateDecision::Allow);
+        assert!(matches!(
+            rl.check("p", &policy),
+            RateDecision::Throttle { .. }
+        ));
+        // A different principal has its own independent bucket.
+        assert_eq!(rl.check("other", &policy), RateDecision::Allow);
+    }
+
+    #[test]
+    fn quota_store_acquires_releases_and_caps() {
+        let q: Arc<dyn QuotaStore> = Arc::new(LocalQuotaStore::new());
+        // Acquire up to the cap.
+        let l1 = WatchLease::acquire(q.clone(), Arc::from("tenant"), 6, 10).unwrap();
+        assert_eq!(q.current("tenant"), 6);
+        let l2 = WatchLease::acquire(q.clone(), Arc::from("tenant"), 4, 10).unwrap();
+        assert_eq!(q.current("tenant"), 10);
+        // Over the cap → rejected.
+        let err = WatchLease::acquire(q.clone(), Arc::from("tenant"), 1, 10).unwrap_err();
+        assert_eq!(err, QuotaExceeded { current: 10, requested: 1, max: 10 });
+        // Dropping a lease releases its units (disconnect reconciliation).
+        drop(l2);
+        assert_eq!(q.current("tenant"), 6);
+        drop(l1);
+        assert_eq!(q.current("tenant"), 0);
+    }
+
+    #[test]
+    fn local_accounting_bundles_rate_and_quota() {
+        let acct = LocalAccounting::new();
+        assert_eq!(
+            acct.rate().check("p", &RatePolicy { burst: 1, per_sec: 1 }),
+            RateDecision::Allow
+        );
+        let q = acct.quota();
+        let _lease = WatchLease::acquire(q.clone(), Arc::from("p"), 5, 5).unwrap();
+        assert_eq!(q.current("p"), 5);
     }
 }

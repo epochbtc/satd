@@ -19,7 +19,7 @@ use toml_edit::{DocumentMut, Item};
 use crate::capability::CapabilitySet;
 use crate::error::StoreError;
 use crate::principal::Principal;
-use crate::quota::{RatePolicy, unlimited};
+use crate::quota::{Accounting, RatePolicy, unlimited};
 
 /// The expected on-disk schema version. Unknown versions are rejected
 /// (recognize-reject) so a future format can't be silently mis-read.
@@ -83,21 +83,46 @@ pub struct ReloadDelta {
 
 /// A live, reloadable token store. Reads are lock-light (read-lock + `Arc`
 /// clone of the current table); reload takes a brief write-lock to swap.
-#[derive(Debug)]
 pub struct TokenStore {
     inner: RwLock<Arc<TokenTable>>,
     path: PathBuf,
+    /// Accounting handle attached to every resolved token principal. Defaults to
+    /// the no-op unlimited backend; the daemon swaps in a shared
+    /// [`LocalAccounting`](crate::LocalAccounting) (or a future remote backend)
+    /// via [`with_accounting`](Self::with_accounting) when enforcement is on.
+    accounting: Arc<dyn Accounting>,
+}
+
+impl std::fmt::Debug for TokenStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `accounting` is a trait object (not Debug); omit it.
+        f.debug_struct("TokenStore")
+            .field("path", &self.path)
+            .field("tokens", &self.inner.read().len())
+            .finish()
+    }
 }
 
 impl TokenStore {
     /// Load and validate the token file. Refuses group/world-accessible perms.
+    /// Token principals get the no-op unlimited accounting until
+    /// [`with_accounting`](Self::with_accounting) attaches a real backend.
     pub fn load(path: impl AsRef<Path>) -> Result<TokenStore, StoreError> {
         let path = path.as_ref().to_path_buf();
         let table = read_and_parse(&path)?;
         Ok(TokenStore {
             inner: RwLock::new(Arc::new(table)),
             path,
+            accounting: unlimited(),
         })
+    }
+
+    /// Attach a shared accounting backend (rate limiter + watch-set quota store).
+    /// Every token principal this store resolves will carry it, so per-principal
+    /// caps survive across the principal's connections.
+    pub fn with_accounting(mut self, accounting: Arc<dyn Accounting>) -> TokenStore {
+        self.accounting = accounting;
+        self
     }
 
     /// Re-read the file and swap the table atomically. On any error the current
@@ -153,7 +178,7 @@ impl TokenStore {
             entry.caps,
             entry.watch_quota,
             entry.rate_limit,
-            unlimited(),
+            self.accounting.clone(),
         ))
     }
 
