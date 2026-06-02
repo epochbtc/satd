@@ -891,6 +891,11 @@ async fn main() {
             } else {
                 None
             },
+            // Block source for durable cursor replay: ChainState gives the
+            // gRPC `Subscribe` RPC read-only access to the active chain so a
+            // client can resume from a `from_cursor` (snapshot→live handoff).
+            // Read-only; never on the consensus hot path.
+            Some(chain_state.clone() as std::sync::Arc<dyn node::events::BlockCursorSource>),
         )
         .await
         {
