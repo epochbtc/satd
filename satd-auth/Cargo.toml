@@ -23,6 +23,8 @@ hex = { workspace = true }
 parking_lot = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+# Sharded concurrent maps for per-principal rate-bucket / watch-occupancy state.
+dashmap = "5.5"
 
 [dev-dependencies]
 tempfile = "3"

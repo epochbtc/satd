@@ -43,8 +43,8 @@ pub use error::{AuthError, DenyReason, StoreError};
 pub use operator::{CookieCredential, OperatorCreds, RpcAuthCredential, UserPassCredential};
 pub use principal::{Principal, PrincipalKind};
 pub use quota::{
-    Accounting, QuotaExceeded, QuotaStore, RateDecision, RateLimiter, RatePolicy,
-    UnlimitedAccounting, WatchLease,
+    Accounting, LocalAccounting, LocalQuotaStore, LocalRateLimiter, QuotaExceeded, QuotaStore,
+    RateDecision, RateLimiter, RatePolicy, UnlimitedAccounting, WatchLease,
 };
 pub use store::{ReloadDelta, TokenEntry, TokenStore, TokenTable};
 pub use verify::Verifier;

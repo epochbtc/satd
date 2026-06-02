@@ -3522,6 +3522,7 @@ name = "satd-auth"
 version = "0.2.1"
 dependencies = [
  "base64 0.22.1",
+ "dashmap",
  "hex",
  "hmac",
  "parking_lot",
