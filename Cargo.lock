@@ -3514,6 +3514,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "satd-auth"
+version = "0.2.1"
+dependencies = [
+ "base64 0.22.1",
+ "hex",
+ "hmac",
+ "parking_lot",
+ "sha2",
+ "subtle",
+ "tempfile",
+ "thiserror 2.0.18",
+ "toml_edit",
+ "tracing",
+]
+
+[[package]]
 name = "satd-events"
 version = "0.2.1"
 dependencies = [

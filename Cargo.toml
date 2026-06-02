@@ -1,5 +1,5 @@
 [workspace]
-members = ["satd", "sat-cli", "node", "node-index", "node-filter-index", "esplora-handlers", "electrum-proto", "sat-tui", "mcp", "consensus", "events", "tls-config"]
+members = ["satd", "sat-cli", "node", "node-index", "node-filter-index", "esplora-handlers", "electrum-proto", "sat-tui", "mcp", "consensus", "events", "tls-config", "satd-auth"]
 # `fuzz/` is a standalone cargo-fuzz workspace (needs a nightly + sanitizer
 # toolchain); keep it out of the normal `cargo build` / `cargo test --all`.
 exclude = ["fuzz"]
@@ -39,6 +39,12 @@ tower = "0.5"
 tower-http = "0.6"
 hyper = "1"
 thiserror = "2"
+sha2 = "0.10"
+hmac = "0.12"
+# Constant-time byte comparison for the auth verifier (no new heavyweight
+# parser; chosen over the `constant_time_eq` crate to consolidate on one
+# audited primitive already in the tree).
+subtle = "2.6"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rocksdb = { version = "0.24", default-features = false, features = ["zstd", "lz4"] }
 hex = "0.4"
