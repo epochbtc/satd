@@ -643,6 +643,11 @@ pub struct Config {
     pub esplora_cookie_file: Option<std::path::PathBuf>,
     /// `user:pass` for `esplora_auth = userpass`.
     pub esplora_userpass: Option<(String, String)>,
+    /// Per-surface participation flag: when true, the Esplora server also honors
+    /// `Authorization: Bearer <token>` for tokens holding the `esplora:read`
+    /// capability, on top of the legacy `esplora_auth` credential. Requires
+    /// `authfile`. Default false.
+    pub esplora_auth_bearer: bool,
     /// Native Electrum protocol server (per `ECOSYSTEM.md` §4 / §4a).
     /// Off by default; `--electrum=1` enables. Requires
     /// `--addressindex=1` AND a complete `--txindex` for the
@@ -1866,6 +1871,17 @@ impl Config {
         if matches!(esplora_auth, EsploraAuthMode::UserPass) && esplora_userpass.is_none() {
             return Err("--esploraauth=userpass requires --esplorauserpass=user:pass".to_string());
         }
+        let esplora_auth_bearer = cli
+            .esploraauthbearer
+            .or_else(|| file_get("esploraauthbearer").and_then(|v| parse_bool(&v)))
+            .unwrap_or(false);
+        if esplora_auth_bearer && authfile.is_none() {
+            return Err(
+                "--esploraauthbearer requires --authfile (there is no token table to honor \
+                 bearer tokens against)"
+                    .to_string(),
+            );
+        }
         let esplora_tls_bind = cli.esploratlsbind.or_else(|| file_get("esploratlsbind"));
         let esplora_tls_cert = cli
             .esploratlscert
@@ -2306,6 +2322,7 @@ impl Config {
             esplora_auth,
             esplora_cookie_file,
             esplora_userpass,
+            esplora_auth_bearer,
             electrum,
             electrum_bind,
             electrum_tls_bind,
@@ -3526,6 +3543,17 @@ pub struct CliArgs {
     )]
     pub esploraauth: Option<String>,
 
+    /// Honor bearer tokens on the Esplora server.
+    #[arg(
+        long,
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
+        help = "Honor Authorization: Bearer tokens (esplora:read) on the Esplora server (default: false). Requires --authfile."
+    )]
+    pub esploraauthbearer: Option<bool>,
+
     #[arg(
         long,
         value_name = "PATH",
@@ -4368,6 +4396,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "esploramaxconns",
         "esplorasseconns",
         "esploraauth",
+        "esploraauthbearer",
         "esploracookiefile",
         "esplorauserpass",
         "electrum",
@@ -4473,6 +4502,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "persistmempool",
         "esplora",
         "esploramtls",
+        "esploraauthbearer",
         "electrum",
         "electrummtls",
         "rpcmtls",
@@ -4848,6 +4878,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "esploramaxconns",
     "esplorasseconns",
     "esploraauth",
+    "esploraauthbearer",
     "esploracookiefile",
     "esplorauserpass",
     // Electrum
@@ -5721,6 +5752,7 @@ rpcport=8332
             esplorasseconns: None,
             esploraauth: None,
             esploracookiefile: None,
+            esploraauthbearer: None,
             esplorauserpass: None,
             electrum: None,
             electrumbind: None,
@@ -5953,6 +5985,7 @@ rpcport=8332
             esplorasseconns: None,
             esploraauth: None,
             esploracookiefile: None,
+            esploraauthbearer: None,
             esplorauserpass: None,
             electrum: None,
             electrumbind: None,

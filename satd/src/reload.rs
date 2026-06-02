@@ -599,6 +599,7 @@ fn field_specs() -> Vec<FieldSpec> {
         restart!("esploramaxconns", esplora_max_conns),
         restart!("esplorasseconns", esplora_sse_max_conns),
         restart!("esploraauth", esplora_auth),
+        restart!("esploraauthbearer", esplora_auth_bearer),
         restart!("esploracookiefile", esplora_cookie_file),
         restart_secret!("esplorauserpass", esplora_userpass),
         // ---- Electrum ----

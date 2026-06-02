@@ -122,9 +122,11 @@ pub fn build_router(state: EsploraState) -> Result<Router, RouterBuildError> {
         .route("/scripthash/{hash}/sse", get(sse::scripthash_sse))
         .with_state(state);
 
-    let routes = if cfg.auth.is_enabled() {
-        let expected = AuthExpectation::build(&cfg.auth)
-            .map_err(RouterBuildError::Auth)?;
+    // Auth is active when either the legacy operator credential (cookie /
+    // userpass) is configured OR bearer tokens are enabled (`-esploraauthbearer`).
+    let expected = AuthExpectation::build(&cfg.auth, cfg.auth_bearer.clone())
+        .map_err(RouterBuildError::Auth)?;
+    let routes = if expected.is_enabled() {
         let expected = Arc::new(expected);
         routes.layer(axum::middleware::from_fn_with_state(
             expected,

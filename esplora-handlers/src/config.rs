@@ -3,6 +3,7 @@
 //! and frozen for the server's lifetime.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -66,6 +67,12 @@ pub struct EsploraConfig {
     /// Authentication scheme. Default `None` matches public-Esplora
     /// deployments; operators on a flat LAN flip to `Cookie`.
     pub auth: EsploraAuth,
+    /// Unified-auth bearer-token store, `Some` only when `-esploraauthbearer`
+    /// is set (which requires `authfile`). When present, the Esplora surface
+    /// additionally accepts `Authorization: Bearer <token>` for tokens holding
+    /// the `esplora:read` capability, on top of (or instead of) the legacy
+    /// `auth` credential. `None` is today's behavior.
+    pub auth_bearer: Option<Arc<satd_auth::TokenStore>>,
 }
 
 impl Default for EsploraConfig {
@@ -90,6 +97,7 @@ impl Default for EsploraConfig {
             // for. Bump explicitly via --esplorasseconns.
             max_sse_conns: 256,
             auth: EsploraAuth::None,
+            auth_bearer: None,
         }
     }
 }

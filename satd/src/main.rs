@@ -1728,6 +1728,13 @@ async fn main() {
                 max_concurrency: config.esplora_max_conns,
                 max_sse_conns: config.esplora_sse_max_conns,
                 auth: auth_cfg,
+                // Bearer tokens (esplora:read) when `-esploraauthbearer` is set
+                // (which requires `authfile`).
+                auth_bearer: if config.esplora_auth_bearer {
+                    token_store.clone()
+                } else {
+                    None
+                },
             };
             // Semaphore sized for SSE only — distinct from the request
             // concurrency layer which doesn't bound long-lived streams
