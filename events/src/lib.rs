@@ -44,3 +44,7 @@ pub mod ws;
 
 #[cfg(feature = "ws")]
 pub use ws::{WsStreamError, WsStreamServer};
+
+// Descriptor convenience layer — shared by the gRPC and WS watch surfaces.
+#[cfg(any(feature = "grpc", feature = "ws"))]
+pub mod descriptor;

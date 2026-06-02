@@ -396,6 +396,8 @@ enum WsControl {
     AddScripts { scripthashes: Vec<String> },
     /// Remove scripthashes from the watch-set.
     RemoveScripts { scripthashes: Vec<String> },
+    /// Expand a descriptor (rust-miniscript) into a script watch-set.
+    AddDescriptor { descriptor: String, gap_limit: u32 },
 }
 
 #[derive(Deserialize)]
@@ -480,6 +482,22 @@ fn apply_ws_control(
                 .collect();
             handle.remove_scripthashes(&shs);
         }
+        WsControl::AddDescriptor {
+            descriptor,
+            gap_limit,
+        } => match crate::descriptor::expand_descriptor(&descriptor, 0, gap_limit) {
+            Ok(scripts) => {
+                let shs: Vec<[u8; 32]> = scripts.into_iter().map(|(_, sh)| sh).collect();
+                if !shs.is_empty() {
+                    charge_and_add(principal, leases, shs.len(), "descriptor", || {
+                        handle.add_scripthashes(&shs);
+                    });
+                }
+            }
+            Err(e) => {
+                warn!(target: "events::ws", error = %e, "ignoring invalid descriptor");
+            }
+        },
     }
 }
 

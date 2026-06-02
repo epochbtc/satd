@@ -8,9 +8,9 @@ repository.workspace = true
 
 [features]
 default = []
-grpc = ["dep:tonic", "dep:prost", "dep:tokio-stream", "dep:satd-auth"]
+grpc = ["dep:tonic", "dep:prost", "dep:tokio-stream", "dep:satd-auth", "dep:miniscript"]
 zmq = ["dep:zeromq"]
-ws = ["dep:axum", "dep:futures-util", "dep:tokio-stream", "dep:satd-auth"]
+ws = ["dep:axum", "dep:futures-util", "dep:tokio-stream", "dep:satd-auth", "dep:miniscript"]
 
 [dependencies]
 node = { path = "../node" }
@@ -35,6 +35,9 @@ zeromq = { workspace = true, optional = true }
 # ws feature (JSON-over-WebSocket + SSE firehose transport)
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "ws", "query"], optional = true }
 futures-util = { version = "0.3", optional = true }
+
+# descriptor convenience layer (grpc + ws): expand a descriptor into a watch-set
+miniscript = { version = "12", optional = true }
 
 [build-dependencies]
 tonic-build = { workspace = true }

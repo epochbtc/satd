@@ -791,6 +791,23 @@ fn apply_control(
                 .collect();
             handle.remove_scripthashes(&shs);
         }
+        Some(Msg::AddDescriptor(d)) => {
+            // Expand the descriptor into its first `gap_limit` scripts and
+            // watch them (rust-miniscript). Charges one unit per script.
+            match crate::descriptor::expand_descriptor(&d.descriptor, 0, d.gap_limit) {
+                Ok(scripts) => {
+                    let shs: Vec<[u8; 32]> = scripts.into_iter().map(|(_, sh)| sh).collect();
+                    if !shs.is_empty() {
+                        charge_and_add(principal, leases, shs.len(), "descriptor", || {
+                            handle.add_scripthashes(&shs);
+                        });
+                    }
+                }
+                Err(e) => {
+                    warn!(target: "events::grpc", error = %e, "ignoring invalid descriptor");
+                }
+            }
+        }
         Some(Msg::SetCategories(c)) => {
             let mask = if c.categories == 0 {
                 u32::MAX
@@ -1397,6 +1414,7 @@ mod tests {
                 pb::node_event::Body::Heartbeat(_) => "heartbeat",
                 pb::node_event::Body::OutpointSpent(_) => "outpoint_spent",
                 pb::node_event::Body::ScriptMatched(_) => "script_matched",
+                pb::node_event::Body::DescriptorNeedsAddresses(_) => "descriptor_needs_addresses",
             })
             .collect();
         assert!(
@@ -1976,6 +1994,29 @@ mod tests {
             1,
             "a 3x-repeated entry charges a single distinct unit",
         );
+    }
+
+    /// `apply_control(AddDescriptor)` expands the descriptor and registers
+    /// the derived script window (no auth → unlimited).
+    #[test]
+    fn apply_control_add_descriptor_registers_window() {
+        let reg = Arc::new(node::events::WatchRegistry::new());
+        let (handle, _rx) = reg.register(node::events::WATCH_CHANNEL_CAPACITY);
+        let mask = AtomicU32::new(u32::MAX);
+        let mut leases = Vec::new();
+        apply_control(
+            pb::SubscribeControl {
+                msg: Some(pb::subscribe_control::Msg::AddDescriptor(pb::AddDescriptor {
+                    descriptor: "wpkh(xpub6BosfCnifzxcFwrSzQiqu2DBVTshkCXacvNsWGYJVVhhawA7d4R5WSWGFNbi8Aw6ZRc1brxMyWMzG3DSSSSoekkudhUd9yLb6qx39T9nMdj/0/*)".into(),
+                    gap_limit: 4,
+                })),
+            },
+            &handle,
+            None,
+            &mask,
+            &mut leases,
+        );
+        assert!(reg.has_watchers(), "descriptor expansion should register a watch-set");
     }
 
     /// End-to-end bidi `Watch`: a client adds an outpoint to its watch-set

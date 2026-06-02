@@ -38,7 +38,16 @@ message SubscribeControl {
     AddOutpoints    add_outpoints    = 5;
     // Remove outpoints from the watch-set.
     RemoveOutpoints remove_outpoints = 6;
+    // Expand a descriptor into a script watch-set (rust-miniscript). The
+    // server derives `gap_limit` scripts and watches them; charges one unit
+    // per derived script.
+    AddDescriptor   add_descriptor   = 7;
   }
+}
+
+message AddDescriptor {
+  string descriptor = 1; // rust-miniscript output descriptor (public)
+  uint32 gap_limit  = 2; // number of indices to derive/watch (ranged descriptors)
 }
 
 message SetCursor      { Cursor cursor = 1; }
@@ -65,6 +74,15 @@ message ScriptMatched {
   bool   is_output  = 3;    // true = funding; input-side is future work
   uint32 index      = 4;    // vout for a funding match
   bool   confirmed  = 5;
+}
+
+// Server→client side-channel: a watched descriptor's gap-limit window
+// should advance (a derived script near the window edge was used). The
+// client re-sends AddDescriptor (or AddScripts) from `next_index`. (The
+// reactive emission of this event is a follow-up; the message is wire-ready.)
+message DescriptorNeedsAddresses {
+  string descriptor = 1;
+  uint32 next_index = 2;
 }
 
 // Filter knobs for a subscription. All optional; an unset field means
@@ -211,5 +229,6 @@ message NodeEvent {
     Heartbeat heartbeat = 12;
     OutpointSpent outpoint_spent = 13; // watch match (Watch stream)
     ScriptMatched script_matched = 14; // watch match (Watch stream)
+    DescriptorNeedsAddresses descriptor_needs_addresses = 15; // gap-limit side-channel
   }
 }
