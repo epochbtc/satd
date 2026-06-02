@@ -24,6 +24,17 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
+/// Whether the Esplora server authenticates requests — true when a legacy
+/// operator credential (cookie / userpass) is configured OR bearer tokens are
+/// enabled. This is the single source of truth for "is the `require_auth` layer
+/// installed": [`AuthExpectation::build`] uses it to decide `None` vs `Required`,
+/// and the SSE watch handlers use it to fail *closed* if a request somehow
+/// reaches them with no principal while auth is enabled (a routing-bug guard,
+/// mirroring the JSON-RPC capability filter).
+pub fn esplora_auth_enabled(auth: &EsploraAuth, bearer: &Option<Arc<TokenStore>>) -> bool {
+    !matches!(auth, EsploraAuth::None) || bearer.is_some()
+}
+
 /// Resolved expected credentials. Built once at server start and shared across
 /// requests.
 ///
@@ -63,7 +74,7 @@ impl AuthExpectation {
                 Some(OperatorCreds::from_user_pass(user.to_string(), pass.to_string()))
             }
         };
-        if operator.is_none() && bearer.is_none() {
+        if !esplora_auth_enabled(cfg, &bearer) {
             Ok(Self::None)
         } else {
             Ok(Self::Required { operator, bearer })

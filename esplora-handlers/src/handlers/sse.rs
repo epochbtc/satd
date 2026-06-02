@@ -133,7 +133,7 @@ pub async fn address_sse(
     let permit = acquire_sse_permit(&state)?;
     // Per-tenant watch-set quota (above the node-wide subscription cap). The
     // lease must outlive the stream so a disconnect releases the unit.
-    let lease = acquire_watch_lease(principal.as_deref())?;
+    let lease = acquire_watch_lease(&state, principal.as_deref())?;
     let rx = state.address_index.subscribe(sh).map_err(map_subscribe_err)?;
     Ok(build_status_sse(rx, addr, permit, lease))
 }
@@ -145,21 +145,31 @@ pub async fn scripthash_sse(
 ) -> EsploraResult<Sse<impl Stream<Item = Result<Event, Infallible>>>> {
     let sh = parse_scripthash(&hash)?;
     let permit = acquire_sse_permit(&state)?;
-    let lease = acquire_watch_lease(principal.as_deref())?;
+    let lease = acquire_watch_lease(&state, principal.as_deref())?;
     let rx = state.address_index.subscribe(sh).map_err(map_subscribe_err)?;
     Ok(build_status_sse(rx, hash, permit, lease))
 }
 
 /// Charge one watch unit against the principal's per-tenant watch-set quota.
 ///
-/// Returns `Ok(None)` when no principal is present — i.e. Esplora auth is
-/// disabled and the `require_auth` middleware was never wired, so there is no
-/// authenticated identity to account against (today's wide-open behavior).
-/// When a principal *is* present (auth enabled), it must hold `stream:watch`
-/// (→ 403) and stay within its `watch_quota` (→ 429). Operator / loopback
-/// principals carry no quota and acquire freely.
-fn acquire_watch_lease(principal: Option<&Principal>) -> EsploraResult<Option<WatchLease>> {
+/// When a principal is present (auth enabled, request authorized), it must hold
+/// `stream:watch` (→ 403) and stay within its `watch_quota` (→ 429). Operator /
+/// loopback principals carry no quota and acquire freely.
+///
+/// When no principal is present we **fail closed if auth is enabled**: a request
+/// that reached this handler without a principal while the `require_auth` layer
+/// is installed means the auth middleware was bypassed (a routing bug), so we
+/// refuse rather than silently grant an unmetered watch — mirroring the
+/// fail-closed JSON-RPC capability filter. With auth disabled there is no
+/// identity to account against and watches are unmetered as before.
+fn acquire_watch_lease(
+    state: &EsploraState,
+    principal: Option<&Principal>,
+) -> EsploraResult<Option<WatchLease>> {
     let Some(p) = principal else {
+        if crate::auth::esplora_auth_enabled(&state.config.auth, &state.config.auth_bearer) {
+            return Err(EsploraError::Forbidden("authentication required".into()));
+        }
         return Ok(None);
     };
     match p.acquire_watch(1) {
@@ -205,10 +215,12 @@ fn build_status_sse(
     Sse::new(stream).keep_alive(KeepAlive::new().interval(HEARTBEAT))
 }
 
-/// Try to grab one SSE permit. `cap = 0` disables the cap (returns a
-/// permit from a sized-1 semaphore that's then immediately released —
-/// equivalent to "no cap", since we never actually hold permits in
-/// the cap=0 case). Returns 503 when the cap is saturated.
+/// Try to grab one SSE permit. When the cap is disabled (`--esplorasseconns=0`)
+/// the semaphore is constructed with a very large permit pool
+/// (`Semaphore::new(0)` then `add_permits(usize::MAX >> 8)`, see
+/// `satd/src/main.rs`), so `try_acquire_owned` effectively never fails and the
+/// permit is held harmlessly for the stream's life. Returns 503 when a real cap
+/// is saturated.
 fn acquire_sse_permit(state: &EsploraState) -> EsploraResult<OwnedSemaphorePermit> {
     state
         .sse_semaphore

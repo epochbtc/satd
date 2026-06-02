@@ -1906,6 +1906,23 @@ impl Config {
                     .to_string(),
             );
         }
+        let events_grpc_allow_remote = cli.events_grpc_allow_remote.unwrap_or_else(|| {
+            file_get("eventsgrpcallowremote").and_then(|v| parse_bool(&v)).unwrap_or(false)
+        });
+        // A routable events-gRPC bind must be authenticated. The sink has no
+        // transport TLS/mTLS of its own, so without bearer auth a public bind is
+        // an unauthenticated firehose of mempool/chain activity. This mirrors the
+        // MCP rule (`mcpallowremote` requires `mcpauth`). A proxy/mTLS-terminated
+        // deployment keeps the loopback bind and does NOT set allow-remote.
+        if events_grpc_allow_remote && !events_grpc_auth {
+            return Err(
+                "--events-grpc-allow-remote requires --events-grpc-auth (a remote events-gRPC \
+                 bind must be authenticated; --events-grpc-auth in turn requires --authfile). \
+                 For a proxy/mTLS-terminated setup, bind loopback and omit \
+                 --events-grpc-allow-remote."
+                    .to_string(),
+            );
+        }
         let mcp_auth = cli
             .mcpauth
             .or_else(|| file_get("mcpauth").and_then(|v| parse_bool(&v)))
@@ -2674,9 +2691,7 @@ impl Config {
             events_node_id: cli.events_node_id.or_else(|| file_get("eventsnodeid")),
             events_region: cli.events_region.or_else(|| file_get("eventsregion")),
             events_grpc_bind: cli.events_grpc_bind.or_else(|| file_get("eventsgrpcbind")),
-            events_grpc_allow_remote: cli.events_grpc_allow_remote.unwrap_or_else(|| {
-                file_get("eventsgrpcallowremote").and_then(|v| parse_bool(&v)).unwrap_or(false)
-            }),
+            events_grpc_allow_remote,
             events_grpc_max_conns: cli
                 .events_grpc_max_conns
                 .or_else(|| file_get("eventsgrpcmaxconns").and_then(|v| v.parse().ok()))
@@ -4262,7 +4277,7 @@ pub struct CliArgs {
     #[arg(
         long = "events-grpc-bind",
         value_name = "ADDR",
-        help = "host:port to bind the events gRPC streaming server. UNAUTHENTICATED — bind to loopback or use --events-grpc-allow-remote for explicit remote exposure. Default: disabled"
+        help = "host:port to bind the events gRPC streaming server. Loopback bind is unauthenticated by default; a remote bind requires --events-grpc-allow-remote AND --events-grpc-auth. Default: disabled"
     )]
     pub events_grpc_bind: Option<String>,
 
@@ -4272,7 +4287,7 @@ pub struct CliArgs {
         value_parser = parse_bool_arg,
         num_args = 0..=1,
         default_missing_value = "1",
-        help = "Permit --events-grpc-bind to point at a non-loopback address. Operator must firewall or auth-proxy the endpoint — the sink has no auth"
+        help = "Permit --events-grpc-bind to point at a non-loopback address. Requires --events-grpc-auth (a remote bind must be authenticated)"
     )]
     pub events_grpc_allow_remote: Option<bool>,
 
@@ -7003,6 +7018,37 @@ rpcport=8332
         .unwrap();
         let err = Config::from_cli(cli).unwrap_err();
         assert!(err.contains("mcpauth"), "got: {err}");
+    }
+
+    #[test]
+    fn eventsgrpcallowremote_requires_eventsgrpcauth() {
+        // A remote events-gRPC bind without bearer auth would be an
+        // unauthenticated public firehose — must hard-error at startup.
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-grpc-remote-test",
+            "--authfile=/etc/satd/auth.toml",
+            "--events-grpc-allow-remote=1",
+        ])
+        .unwrap();
+        let err = Config::from_cli(cli).unwrap_err();
+        assert!(err.contains("events-grpc-auth"), "got: {err}");
+    }
+
+    #[test]
+    fn eventsgrpc_remote_auth_chain_is_accepted() {
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-grpc-remote-test2",
+            "--authfile=/etc/satd/auth.toml",
+            "--events-grpc-auth=1",
+            "--events-grpc-allow-remote=1",
+        ])
+        .unwrap();
+        let cfg = Config::from_cli(cli).unwrap();
+        assert!(cfg.events_grpc_auth && cfg.events_grpc_allow_remote);
     }
 
     #[test]

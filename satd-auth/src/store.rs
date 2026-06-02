@@ -156,12 +156,19 @@ impl TokenStore {
     /// Resolve a presented bearer token to a token [`Principal`], or `None` if
     /// it is unknown, expired, or revoked. `now` is unix seconds.
     ///
-    /// The token is SHA-256'd and looked up by digest; the stored hash is then
-    /// re-compared in constant time (`subtle`) so the accept decision never
-    /// short-circuits on a near-collision. Token principals carry the no-op
-    /// unlimited accounting handle for now; per-principal rate/quota accounting
-    /// is wired in a later PR.
+    /// An empty or whitespace-only token is rejected up front: this is the
+    /// shared chokepoint every carrier (JSON-RPC, gRPC, MCP) funnels through, so
+    /// a carrier that forwards a blank credential can never authenticate as a
+    /// `sha256("")`-hashed entry. The token is then SHA-256'd and looked up by
+    /// digest. The map key *is* the stored hash, so the subsequent
+    /// `ct_eq(entry.hash, digest)` is a redundant equality (the secret is the
+    /// high-entropy preimage, which is never compared byte-wise); it is kept as
+    /// belt-and-braces and as a guard against a future change to the keying.
+    /// Token principals carry the shared accounting handle for rate/quota.
     pub fn resolve(&self, token: &str, now: i64) -> Option<Principal> {
+        if token.trim().is_empty() {
+            return None;
+        }
         let digest: [u8; 32] = Sha256::digest(token.as_bytes()).into();
         let table = self.snapshot();
         let entry = table.get(&digest)?;
@@ -198,6 +205,15 @@ fn read_and_parse(path: &Path) -> Result<TokenTable, StoreError> {
         path: path.display().to_string(),
         source,
     })?;
+    // Refuse anything that isn't a regular file. A FIFO/socket at the configured
+    // path would otherwise pass the perms check and block `read_to_string`
+    // indefinitely, wedging startup.
+    if !meta.is_file() {
+        return Err(StoreError::Malformed {
+            path: path.display().to_string(),
+            detail: "not a regular file".into(),
+        });
+    }
     check_perms(path, &meta)?;
     let mut content = String::new();
     file.read_to_string(&mut content)
@@ -247,6 +263,11 @@ fn parse_table(path: &Path, content: &str) -> Result<TokenTable, StoreError> {
     }
 
     let mut by_hash: HashMap<[u8; 32], TokenEntry> = HashMap::new();
+    // Ids must be unique: they are the per-principal accounting/audit key (the
+    // rate bucket and watch-set occupancy are keyed by `Principal::id()`), so
+    // two tokens sharing an id would silently alias one tenant's quota onto
+    // another and under-report revocation in the reload delta.
+    let mut seen_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
 
     if let Some(tokens) = doc.get("token") {
         let arr = tokens.as_array_of_tables().ok_or_else(|| {
@@ -259,6 +280,9 @@ fn parse_table(path: &Path, content: &str) -> Result<TokenTable, StoreError> {
                 .get("id")
                 .and_then(Item::as_str)
                 .ok_or_else(|| ctx("missing or non-string `id`".into()))?;
+            if !seen_ids.insert(id) {
+                return Err(ctx(format!("duplicate token id `{id}`")));
+            }
 
             let hash_str = t
                 .get("hash")
@@ -479,6 +503,53 @@ capabilities = ["stream:subscribe", "stream:watch"]
         let p = write_file(dir.path(), "c.toml", bad_version, 0o600);
         let e = TokenStore::load(&p).unwrap_err();
         assert!(matches!(e, StoreError::Malformed { .. }), "{e}");
+    }
+
+    #[test]
+    fn rejects_duplicate_token_id() {
+        // Two distinct secrets sharing an id would alias one tenant's rate/watch
+        // accounting (keyed by id) onto the other and under-report revocation.
+        let dir = tempfile::tempdir().unwrap();
+        let toml = format!(
+            "version=1\n[[token]]\nid=\"dup\"\nhash=\"{}\"\n[[token]]\nid=\"dup\"\nhash=\"{}\"\n",
+            sha256_hex("secret-a"),
+            sha256_hex("secret-b"),
+        );
+        let p = write_file(dir.path(), "dup.toml", &toml, 0o600);
+        let e = TokenStore::load(&p).unwrap_err();
+        assert!(matches!(e, StoreError::Malformed { .. }), "{e}");
+        assert!(format!("{e}").contains("duplicate token id"), "{e}");
+    }
+
+    #[test]
+    fn resolve_rejects_empty_or_whitespace_token() {
+        // Even if a `sha256("")` entry exists, a carrier forwarding a blank
+        // credential must never authenticate — the guard is at the chokepoint.
+        let dir = tempfile::tempdir().unwrap();
+        let toml = format!(
+            "version=1\n[[token]]\nid=\"blank\"\nhash=\"{}\"\ncapabilities=[\"rpc:read\"]\n",
+            sha256_hex(""),
+        );
+        let p = write_file(dir.path(), "blank.toml", &toml, 0o600);
+        let store = TokenStore::load(&p).unwrap();
+        assert!(store.resolve("", 0).is_none(), "empty token must not resolve");
+        assert!(store.resolve("   ", 0).is_none(), "whitespace token must not resolve");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_non_regular_file() {
+        // A non-regular file (here a directory; a FIFO/socket behaves the same)
+        // at the configured path opens and stats fine but is not a regular file
+        // — load must refuse it rather than wedge on the subsequent read.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("not_a_file");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let e = TokenStore::load(&sub).unwrap_err();
+        assert!(matches!(e, StoreError::Malformed { .. }), "{e}");
+        assert!(format!("{e}").contains("regular file"), "{e}");
     }
 
     #[test]

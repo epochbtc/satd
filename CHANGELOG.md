@@ -213,7 +213,12 @@ working when the layer is enabled.
   `authorization: Bearer <token>` metadata entry for a token holding the
   `stream:subscribe` capability; otherwise the stream is rejected with gRPC
   `UNAUTHENTICATED` / `PERMISSION_DENIED`. The loopback / `-events-grpc-allow-remote`
-  gate stays as a transport pre-check beneath this app-layer auth.
+  gate stays as a transport pre-check beneath this app-layer auth. **A remote
+  bind now requires auth:** `-events-grpc-allow-remote` is refused at startup
+  unless `-events-grpc-auth` is also set (the sink has no transport TLS, so a
+  routable bind without bearer auth would be an unauthenticated firehose). A
+  proxy/mTLS-terminated deployment keeps the loopback bind and omits
+  `-events-grpc-allow-remote`. This mirrors the `-mcpallowremote` → `-mcpauth` rule.
 - **`-mcpauth` / `-mcpallowremote` — bearer tokens + safe remote exposure for
   the MCP HTTP server.** With `-mcpauth` (requires `-authfile`), every MCP
   request must present an `Authorization: Bearer <token>` for a token holding
