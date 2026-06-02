@@ -8384,6 +8384,128 @@ fn test_esplora_sse_connection_cap_saturates_with_503() {
     node.stop();
 }
 
+/// Open a raw SSE request carrying an optional `Authorization: Bearer`
+/// header and return `(status_code, live_stream)`. The stream is kept
+/// open by the caller so the server-side subscription (and its
+/// watch-set quota lease) stays held until the caller drops it.
+fn sse_open_raw(port: u16, path: &str, bearer: Option<&str>) -> (u16, std::net::TcpStream) {
+    use std::io::{BufRead as _, BufReader, Write as _};
+    use std::net::TcpStream;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).expect("sse connect");
+    let auth = bearer
+        .map(|t| format!("Authorization: Bearer {}\r\n", t))
+        .unwrap_or_default();
+    let req = format!(
+        "GET {} HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept: text/event-stream\r\n{}Connection: keep-alive\r\n\r\n",
+        path, auth
+    );
+    stream.write_all(req.as_bytes()).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    // Read only the status line; leave the rest of the response (and the
+    // socket) intact so the subscription stays alive.
+    let cloned = stream.try_clone().unwrap();
+    let mut reader = BufReader::new(cloned);
+    let mut status_line = String::new();
+    reader.read_line(&mut status_line).expect("status line");
+    let code = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse::<u16>().ok())
+        .unwrap_or(0);
+    (code, stream)
+}
+
+/// Per-tenant watch-set quota on the Esplora SSE watch path (auth PR 10).
+///
+/// A bearer token with `watch_quota = 1` may hold exactly one live
+/// address/scripthash subscription at a time. A second concurrent watch
+/// is shed with 429 while the first is open; once the first disconnects,
+/// the unit is released (RAII `WatchLease`) and a new watch succeeds. A
+/// token that authenticates but lacks `stream:watch` is refused with 403.
+#[test]
+fn test_esplora_sse_watch_quota_enforced() {
+    use std::io::Write;
+
+    // token "wq": esplora:read + stream:watch, watch_quota = 1.
+    const TOKEN_WQ: &str = "satd-test-watch-token-v1";
+    const TOKEN_WQ_SHA256: &str =
+        "4909d225ceb8baad7eb93eaef0be3cf1275474a56b909cf70792ceb7411354ba";
+    // token "ro": esplora:read only — authenticates but cannot watch.
+    const TOKEN_RO: &str = "satd-test-esploraread-only-v1";
+    const TOKEN_RO_SHA256: &str =
+        "423c2d4c280d24c496e639d3ff2a9e1c49e0bbf0d26736a92b0aa7dfb4e4fd7b";
+
+    let dir = std::env::temp_dir().join(format!("satd-watchquota-it-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let authfile = dir.join("auth.toml");
+    let toml = format!(
+        "version = 1\n\
+         [[token]]\nid = \"wq\"\nhash = \"sha256:{TOKEN_WQ_SHA256}\"\n\
+         capabilities = [\"esplora:read\", \"stream:watch\"]\nwatch_quota = 1\n\
+         [[token]]\nid = \"ro\"\nhash = \"sha256:{TOKEN_RO_SHA256}\"\n\
+         capabilities = [\"esplora:read\"]\n"
+    );
+    {
+        let mut f = std::fs::File::create(&authfile).unwrap();
+        f.write_all(toml.as_bytes()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&authfile, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
+    let esplora_port = find_available_port();
+    let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
+    let mut node = TestNode::start(&[
+        "--esplora=1",
+        &bind,
+        "--esploraauthbearer=1",
+        &format!("--authfile={}", authfile.display()),
+    ]);
+
+    let sh_a = "11".repeat(32);
+    let sh_b = "22".repeat(32);
+    let path_a = format!("/scripthash/{}/sse", sh_a);
+    let path_b = format!("/scripthash/{}/sse", sh_b);
+
+    // (a) First watch within quota → 200. Hold the socket open so the
+    // server-side lease stays held.
+    let (code1, conn1) = sse_open_raw(esplora_port, &path_a, Some(TOKEN_WQ));
+    assert_eq!(code1, 200, "first watch (quota=1) should be accepted");
+
+    // (b) Second concurrent watch by the SAME token exceeds quota → 429.
+    let (code2, _conn2) = sse_open_raw(esplora_port, &path_b, Some(TOKEN_WQ));
+    assert_eq!(code2, 429, "second concurrent watch over quota=1 should be 429");
+
+    // (c) A token without stream:watch is refused at the capability gate → 403.
+    let (code_ro, _conn_ro) = sse_open_raw(esplora_port, &path_a, Some(TOKEN_RO));
+    assert_eq!(code_ro, 403, "esplora:read-only token cannot open a watch");
+
+    // (d) Release the first watch; the unit is returned on disconnect, so a
+    // fresh watch succeeds. Disconnect detection is async — retry briefly.
+    drop(conn1);
+    let mut reclaimed = false;
+    for _ in 0..100 {
+        let (code, conn) = sse_open_raw(esplora_port, &path_b, Some(TOKEN_WQ));
+        if code == 200 {
+            reclaimed = true;
+            drop(conn);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        reclaimed,
+        "watch-set unit should be released on disconnect, allowing a new watch"
+    );
+
+    node.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ── Electrum server (PR-6 of the electrum stack) ──────────────────
 
 /// Helper: connect a raw TCP client to an Electrum server, send one

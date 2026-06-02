@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use crate::capability::{Capability, CapabilitySet};
 use crate::error::DenyReason;
-use crate::quota::{Accounting, RateDecision, RatePolicy, unlimited};
+use crate::quota::{Accounting, QuotaExceeded, RateDecision, RatePolicy, WatchLease, unlimited};
 
 /// What kind of identity authenticated.
 #[derive(Clone, Debug)]
@@ -129,6 +129,35 @@ impl Principal {
             None => RateDecision::Allow,
         }
     }
+
+    /// Acquire `n` watch units for a streaming subscription (one scripthash =
+    /// one unit; SATD_AUTH_PLAN.md §5). Enforces, in order, the `stream:watch`
+    /// capability gate then the principal's `watch_quota` ceiling (`None` =
+    /// unlimited, e.g. operator / loopback). On success the returned
+    /// [`WatchLease`] holds the units until dropped — embed it in the
+    /// subscription's stream so a client disconnect releases the quota
+    /// automatically (disconnect reconciliation, no explicit cleanup path).
+    ///
+    /// This composes *above* the node-wide subscription cap
+    /// (`addrindexsubscriptions`): acquire the lease first, then call the global
+    /// `SubscriptionRegistry::subscribe`. Either ceiling can reject cleanly;
+    /// neither blocks consensus.
+    pub fn acquire_watch(&self, n: u64) -> Result<WatchLease, WatchReject> {
+        self.require(Capability::StreamWatch)
+            .map_err(WatchReject::MissingCapability)?;
+        let max = self.watch_quota.unwrap_or(u64::MAX);
+        WatchLease::acquire(self.acct.quota(), Arc::from(self.id()), n, max)
+            .map_err(WatchReject::QuotaExceeded)
+    }
+}
+
+/// Why [`Principal::acquire_watch`] refused a streaming subscription.
+#[derive(Debug)]
+pub enum WatchReject {
+    /// The principal lacks the `stream:watch` capability.
+    MissingCapability(DenyReason),
+    /// The principal's per-tenant watch-set quota is exhausted.
+    QuotaExceeded(QuotaExceeded),
 }
 
 impl fmt::Debug for Principal {
@@ -178,5 +207,54 @@ mod tests {
             p.require(Capability::RpcWrite).unwrap_err(),
             DenyReason("rpc:write")
         );
+    }
+
+    #[test]
+    fn acquire_watch_requires_capability() {
+        // A token without stream:watch is refused at the capability gate, before
+        // any quota accounting.
+        let p = Principal::token(
+            Arc::from("noscope"),
+            CapabilitySet::EMPTY.with(Capability::EsploraRead),
+            Some(10),
+            None,
+            crate::quota::unlimited(),
+        );
+        assert!(matches!(
+            p.acquire_watch(1),
+            Err(WatchReject::MissingCapability(DenyReason("stream:watch")))
+        ));
+    }
+
+    #[test]
+    fn acquire_watch_charges_quota_and_releases_on_drop() {
+        let acct: Arc<dyn Accounting> = Arc::new(crate::quota::LocalAccounting::new());
+        let p = Principal::token(
+            Arc::from("tenant"),
+            CapabilitySet::EMPTY.with(Capability::StreamWatch),
+            Some(2),
+            None,
+            acct.clone(),
+        );
+        let quota = acct.quota();
+        let l1 = p.acquire_watch(1).expect("first watch within quota");
+        let l2 = p.acquire_watch(1).expect("second watch hits the cap exactly");
+        assert_eq!(quota.current("tenant"), 2);
+        // Third exceeds the watch_quota=2 ceiling.
+        assert!(matches!(p.acquire_watch(1), Err(WatchReject::QuotaExceeded(_))));
+        // Dropping a lease frees a unit (disconnect reconciliation) → room again.
+        drop(l2);
+        assert_eq!(quota.current("tenant"), 1);
+        let _l3 = p.acquire_watch(1).expect("freed unit allows a new watch");
+        drop(l1);
+    }
+
+    #[test]
+    fn operator_watch_is_unlimited() {
+        // Operator has stream:watch (ALL caps) and no quota → always granted,
+        // and the unlimited accounting tracks nothing.
+        let op = Principal::operator();
+        let lease = op.acquire_watch(1_000_000).expect("operator unlimited");
+        assert_eq!(lease.units(), 1_000_000);
     }
 }

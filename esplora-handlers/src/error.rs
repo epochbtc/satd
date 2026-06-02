@@ -14,6 +14,14 @@ pub enum EsploraError {
     IndexDisabled,
     #[error("service unavailable")]
     ServiceUnavailable,
+    /// The authenticated principal lacks the `stream:watch` capability needed to
+    /// open a live address/scripthash subscription. 403.
+    #[error("{0}")]
+    Forbidden(String),
+    /// The principal's per-tenant watch-set quota is exhausted. 429 — distinct
+    /// from the node-wide `addrindexsubscriptions` cap (which is `ServiceUnavailable`/503).
+    #[error("watch-set quota exceeded")]
+    WatchQuotaExceeded,
     #[error("internal: {0}")]
     Internal(String),
 }
@@ -43,6 +51,10 @@ impl IntoResponse for EsploraError {
             EsploraError::BadRequest(_) => (StatusCode::BAD_REQUEST, self.to_string()),
             EsploraError::IndexDisabled => (StatusCode::SERVICE_UNAVAILABLE, self.to_string()),
             EsploraError::ServiceUnavailable => (StatusCode::SERVICE_UNAVAILABLE, self.to_string()),
+            EsploraError::Forbidden(_) => (StatusCode::FORBIDDEN, self.to_string()),
+            EsploraError::WatchQuotaExceeded => {
+                (StatusCode::TOO_MANY_REQUESTS, self.to_string())
+            }
             EsploraError::Internal(_) => {
                 tracing::warn!(error = %self, "esplora internal error");
                 (StatusCode::INTERNAL_SERVER_ERROR, self.to_string())

@@ -230,6 +230,20 @@ working when the layer is enabled.
   state is keyed by token id, so a tenant's budget is shared across its
   connections (per-replica; a future Redis backend can make it global).
 
+- **Per-token watch-set quota on live subscriptions.** A `[[token]]`'s optional
+  `watch_quota = <N>` now caps how many concurrent Esplora SSE
+  address/scripthash watches the token may hold (one subscription = one unit),
+  gated by the `stream:watch` capability. A request lacking the capability is
+  refused **403**; one over its quota is **429**. The quota composes *above* the
+  node-wide `addrindexsubscriptions` cap and is reconciled automatically on
+  disconnect (an RAII lease released when the stream drops), so abandoned
+  sockets cannot permanently consume a tenant's budget. The operator credential
+  and loopback (auth-disabled) requests are unlimited. Like the rate limiter,
+  the per-tenant counter is keyed by token id and shared across the tenant's
+  connections (per-replica). The gRPC event firehose is gated by
+  `stream:subscribe` and its own concurrent-subscription cap instead, as it
+  carries no per-scripthash watch set.
+
 ### API surface scaling
 
 The unifying goal of these three changes is to bound the blast radius of the
