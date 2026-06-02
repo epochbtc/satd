@@ -938,6 +938,22 @@ pub struct Config {
     /// connections. A `Subscribe` beyond the cap is rejected with
     /// `RESOURCE_EXHAUSTED`. Default: 256. `0` disables the cap.
     pub events_grpc_max_subscriptions: usize,
+    /// `host:port` to bind the streaming JSON-over-WebSocket + SSE transport
+    /// (`--streamws`). `None` (default) leaves it disabled. Serves `/ws`
+    /// (bidi JSON: firehose + watch-set control + matches) and `/sse`
+    /// (read-only JSON firehose) on a dedicated port, on the API runtime —
+    /// never the consensus core. Non-loopback bindings are rejected unless
+    /// `streamws_allow_remote` is also set.
+    pub streamws_bind: Option<String>,
+    /// Permit `streamws_bind` to point at a non-loopback address. Default
+    /// `false`. Requires `streamws_auth` (a remote bind must be
+    /// authenticated).
+    pub streamws_allow_remote: bool,
+    /// When true, every streamws connection must present
+    /// `authorization: Bearer <token>` for a token holding `stream:subscribe`
+    /// (watch additions additionally need `stream:watch` + quota). Requires
+    /// `authfile`. Default false (unauthenticated, loopback-trust).
+    pub streamws_auth: bool,
     /// ZMQ endpoint string (e.g. `tcp://0.0.0.0:28332`) for the events
     /// PUB-socket sink. `None` = disabled. Topics emitted: `hashtx`,
     /// `hashblock` (Bitcoin Core wire-format compatible), plus
@@ -1923,6 +1939,31 @@ impl Config {
                     .to_string(),
             );
         }
+        let streamws_auth = cli
+            .streamws_auth
+            .or_else(|| file_get("streamwsauth").and_then(|v| parse_bool(&v)))
+            .unwrap_or(false);
+        if streamws_auth && authfile.is_none() {
+            return Err(
+                "--streamws-auth requires --authfile (there is no token table to honor \
+                 bearer tokens against)"
+                    .to_string(),
+            );
+        }
+        let streamws_allow_remote = cli.streamws_allow_remote.unwrap_or_else(|| {
+            file_get("streamwsallowremote").and_then(|v| parse_bool(&v)).unwrap_or(false)
+        });
+        // A routable streamws bind must be authenticated — same rule as the
+        // events-gRPC sink. The transport has no TLS of its own, so a public
+        // bind without bearer auth would be an unauthenticated firehose.
+        if streamws_allow_remote && !streamws_auth {
+            return Err(
+                "--streamws-allow-remote requires --streamws-auth (a remote streamws bind \
+                 must be authenticated; --streamws-auth in turn requires --authfile). For a \
+                 proxy/mTLS-terminated setup, bind loopback and omit --streamws-allow-remote."
+                    .to_string(),
+            );
+        }
         let mcp_auth = cli
             .mcpauth
             .or_else(|| file_get("mcpauth").and_then(|v| parse_bool(&v)))
@@ -2701,6 +2742,9 @@ impl Config {
                 .events_grpc_max_subscriptions
                 .or_else(|| file_get("eventsgrpcmaxsubscriptions").and_then(|v| v.parse().ok()))
                 .unwrap_or(256),
+            streamws_bind: cli.streamws_bind.or_else(|| file_get("streamws")),
+            streamws_allow_remote,
+            streamws_auth,
             events_zmq_bind: cli.events_zmq_bind.or_else(|| file_get("eventszmqbind")),
             events_zmq_hashtx: cli
                 .events_zmq_hashtx
@@ -4317,6 +4361,33 @@ pub struct CliArgs {
     pub events_grpc_max_subscriptions: Option<usize>,
 
     #[arg(
+        long = "streamws",
+        value_name = "ADDR",
+        help = "host:port to bind the streaming JSON-over-WebSocket + SSE transport (/ws + /sse). Loopback bind is unauthenticated by default; a remote bind requires --streamws-allow-remote AND --streamws-auth. Default: disabled"
+    )]
+    pub streamws_bind: Option<String>,
+
+    #[arg(
+        long = "streamws-allow-remote",
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
+        help = "Permit --streamws to point at a non-loopback address. Requires --streamws-auth (a remote bind must be authenticated)"
+    )]
+    pub streamws_allow_remote: Option<bool>,
+
+    #[arg(
+        long = "streamws-auth",
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
+        help = "Require Authorization: Bearer tokens (stream:subscribe) on the streamws transport (default: false). Requires --authfile."
+    )]
+    pub streamws_auth: Option<bool>,
+
+    #[arg(
         long = "events-zmq-bind",
         value_name = "ENDPOINT",
         help = "ZMQ endpoint for the events PUB sink (e.g. 'tcp://0.0.0.0:28332'). Default: disabled"
@@ -4617,6 +4688,8 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "server",
         "daemon",
         "events-grpc-allow-remote",
+        "streamws-allow-remote",
+        "streamws-auth",
         "events-zmq-hashtx",
         "events-zmq-hashblock",
         "events-zmq-mpevict",
@@ -5030,6 +5103,9 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "eventsgrpcauth",
     "eventsgrpcmaxconns",
     "eventsgrpcmaxsubscriptions",
+    "streamws",
+    "streamwsallowremote",
+    "streamwsauth",
     "eventszmqbind",
     "eventszmqhashtx",
     "eventszmqhashblock",
@@ -5945,6 +6021,9 @@ rpcport=8332
             events_grpc_auth: None,
             events_grpc_max_conns: None,
             events_grpc_max_subscriptions: None,
+            streamws_bind: None,
+            streamws_allow_remote: Some(false),
+            streamws_auth: None,
             events_zmq_bind: None,
             events_zmq_hashtx: None,
             events_zmq_hashblock: None,
@@ -6181,6 +6260,9 @@ rpcport=8332
             events_grpc_auth: None,
             events_grpc_max_conns: None,
             events_grpc_max_subscriptions: None,
+            streamws_bind: None,
+            streamws_allow_remote: Some(false),
+            streamws_auth: None,
             events_zmq_bind: None,
             events_zmq_hashtx: None,
             events_zmq_hashblock: None,
@@ -7049,6 +7131,39 @@ rpcport=8332
         .unwrap();
         let cfg = Config::from_cli(cli).unwrap();
         assert!(cfg.events_grpc_auth && cfg.events_grpc_allow_remote);
+    }
+
+    #[test]
+    fn streamws_allow_remote_requires_streamws_auth() {
+        // A remote streamws bind without bearer auth would be an
+        // unauthenticated public firehose — must hard-error at startup.
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-streamws-remote-test",
+            "--authfile=/etc/satd/auth.toml",
+            "--streamws-allow-remote=1",
+        ])
+        .unwrap();
+        let err = Config::from_cli(cli).unwrap_err();
+        assert!(err.contains("streamws-auth"), "got: {err}");
+    }
+
+    #[test]
+    fn streamws_remote_auth_chain_is_accepted() {
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-streamws-remote-test2",
+            "--authfile=/etc/satd/auth.toml",
+            "--streamws-auth=1",
+            "--streamws-allow-remote=1",
+            "--streamws=0.0.0.0:7799",
+        ])
+        .unwrap();
+        let cfg = Config::from_cli(cli).unwrap();
+        assert!(cfg.streamws_auth && cfg.streamws_allow_remote);
+        assert_eq!(cfg.streamws_bind.as_deref(), Some("0.0.0.0:7799"));
     }
 
     #[test]

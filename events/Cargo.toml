@@ -10,6 +10,7 @@ repository.workspace = true
 default = []
 grpc = ["dep:tonic", "dep:prost", "dep:tokio-stream", "dep:satd-auth"]
 zmq = ["dep:zeromq"]
+ws = ["dep:axum", "dep:futures-util", "dep:tokio-stream", "dep:satd-auth"]
 
 [dependencies]
 node = { path = "../node" }
@@ -30,6 +31,10 @@ satd-auth = { path = "../satd-auth", optional = true }
 
 # zmq feature
 zeromq = { workspace = true, optional = true }
+
+# ws feature (JSON-over-WebSocket + SSE firehose transport)
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "ws", "query"], optional = true }
+futures-util = { version = "0.3", optional = true }
 
 [build-dependencies]
 tonic-build = { workspace = true }

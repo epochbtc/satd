@@ -38,3 +38,9 @@ pub mod zmq;
 
 #[cfg(feature = "zmq")]
 pub use zmq::{ZmqEventSink, ZmqEventSinkError, ZmqTopicConfig};
+
+#[cfg(feature = "ws")]
+pub mod ws;
+
+#[cfg(feature = "ws")]
+pub use ws::{WsStreamError, WsStreamServer};

@@ -53,7 +53,7 @@ esplora-handlers = { path = "../esplora-handlers" }
 satd-auth = { path = "../satd-auth" }
 electrum-proto = { path = "../electrum-proto" }
 tls-config = { path = "../tls-config" }
-satd-events = { path = "../events", features = ["grpc", "zmq"] }
+satd-events = { path = "../events", features = ["grpc", "zmq", "ws"] }
 satd-mcp = { path = "../mcp" }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 bitcoin = { workspace = true }
