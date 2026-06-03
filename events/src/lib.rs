@@ -43,7 +43,7 @@ pub use zmq::{ZmqEventSink, ZmqEventSinkError, ZmqTopicConfig};
 pub mod ws;
 
 #[cfg(feature = "ws")]
-pub use ws::{WsStreamError, WsStreamServer};
+pub use ws::{WsLimits, WsStreamError, WsStreamServer};
 
 // Descriptor convenience layer — shared by the gRPC and WS watch surfaces.
 #[cfg(any(feature = "grpc", feature = "ws"))]

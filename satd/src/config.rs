@@ -954,6 +954,19 @@ pub struct Config {
     /// (watch additions additionally need `stream:watch` + quota). Requires
     /// `authfile`. Default false (unauthenticated, loopback-trust).
     pub streamws_auth: bool,
+    /// Hard cap on simultaneously-open streamws connections (`/ws` + `/sse`
+    /// combined). A new connection beyond the cap is rejected with HTTP 503.
+    /// Mirrors `events_grpc_max_conns`. Default: 256.
+    pub streamws_max_conns: usize,
+    /// Hard cap on watch-set entries per streamws connection. An add that would
+    /// exceed it is shed (the connection stays up). Mirrors
+    /// `events_grpc_max_subscriptions` (which is node-wide; this is per-conn).
+    /// Default: 256.
+    pub streamws_max_subscriptions: usize,
+    /// Cap on a single inbound WebSocket message/frame (bytes). Bounds the
+    /// `serde_json` parse an authenticated peer can force. Default: 262144
+    /// (256 KiB).
+    pub streamws_max_message_bytes: usize,
     /// Upper bound on the number of blocks the decoupled watch matcher will
     /// re-scan in one catch-up after it lags behind the chain event broadcast
     /// (see `events::watch`). On a lag the matcher rescans from its last
@@ -2754,6 +2767,18 @@ impl Config {
             streamws_bind: cli.streamws_bind.or_else(|| file_get("streamws")),
             streamws_allow_remote,
             streamws_auth,
+            streamws_max_conns: cli
+                .streamws_max_conns
+                .or_else(|| file_get("streamwsmaxconns").and_then(|v| v.parse().ok()))
+                .unwrap_or(256),
+            streamws_max_subscriptions: cli
+                .streamws_max_subscriptions
+                .or_else(|| file_get("streamwsmaxsubscriptions").and_then(|v| v.parse().ok()))
+                .unwrap_or(256),
+            streamws_max_message_bytes: cli
+                .streamws_max_message_bytes
+                .or_else(|| file_get("streamwsmaxmessagebytes").and_then(|v| v.parse().ok()))
+                .unwrap_or(262_144),
             stream_max_resync_blocks: cli
                 .stream_max_resync_blocks
                 .or_else(|| file_get("streammaxresyncblocks").and_then(|v| v.parse().ok()))
@@ -4401,6 +4426,27 @@ pub struct CliArgs {
     pub streamws_auth: Option<bool>,
 
     #[arg(
+        long = "streamws-max-conns",
+        value_name = "N",
+        help = "Hard cap on simultaneously-open streamws connections (/ws + /sse). A connection beyond the cap gets HTTP 503 (default: 256)"
+    )]
+    pub streamws_max_conns: Option<usize>,
+
+    #[arg(
+        long = "streamws-max-subscriptions",
+        value_name = "N",
+        help = "Hard cap on watch-set entries per streamws connection; an add beyond it is shed without dropping the connection (default: 256)"
+    )]
+    pub streamws_max_subscriptions: Option<usize>,
+
+    #[arg(
+        long = "streamws-max-message-bytes",
+        value_name = "N",
+        help = "Cap on a single inbound WebSocket message/frame in bytes (default: 262144)"
+    )]
+    pub streamws_max_message_bytes: Option<usize>,
+
+    #[arg(
         long = "stream-max-resync-blocks",
         value_name = "N",
         help = "Max blocks the watch matcher re-scans in one catch-up after lagging the chain event broadcast (default: 10000; 0 disables the cap)"
@@ -5126,6 +5172,9 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "streamws",
     "streamwsallowremote",
     "streamwsauth",
+    "streamwsmaxconns",
+    "streamwsmaxsubscriptions",
+    "streamwsmaxmessagebytes",
     "streammaxresyncblocks",
     "eventszmqbind",
     "eventszmqhashtx",
@@ -5633,6 +5682,10 @@ rpcport=8332
         // satd's events gRPC defaults.
         assert_eq!(cfg.events_grpc_max_conns, 64);
         assert_eq!(cfg.events_grpc_max_subscriptions, 256);
+        // streamws cap defaults.
+        assert_eq!(cfg.streamws_max_conns, 256);
+        assert_eq!(cfg.streamws_max_subscriptions, 256);
+        assert_eq!(cfg.streamws_max_message_bytes, 262_144);
     }
 
     #[test]
@@ -5801,6 +5854,12 @@ rpcport=8332
             "10",
             "--events-grpc-max-subscriptions",
             "20",
+            "--streamws-max-conns",
+            "30",
+            "--streamws-max-subscriptions",
+            "40",
+            "--streamws-max-message-bytes",
+            "50000",
         ])
         .unwrap();
         let cfg = Config::from_cli(cli).unwrap();
@@ -5808,6 +5867,9 @@ rpcport=8332
         assert_eq!(cfg.rpc_workqueue, 128);
         assert_eq!(cfg.events_grpc_max_conns, 10);
         assert_eq!(cfg.events_grpc_max_subscriptions, 20);
+        assert_eq!(cfg.streamws_max_conns, 30);
+        assert_eq!(cfg.streamws_max_subscriptions, 40);
+        assert_eq!(cfg.streamws_max_message_bytes, 50_000);
     }
 
     #[test]
@@ -6045,6 +6107,9 @@ rpcport=8332
             streamws_bind: None,
             streamws_allow_remote: Some(false),
             streamws_auth: None,
+            streamws_max_conns: None,
+            streamws_max_subscriptions: None,
+            streamws_max_message_bytes: None,
             stream_max_resync_blocks: None,
             events_zmq_bind: None,
             events_zmq_hashtx: None,
@@ -6285,6 +6350,9 @@ rpcport=8332
             streamws_bind: None,
             streamws_allow_remote: Some(false),
             streamws_auth: None,
+            streamws_max_conns: None,
+            streamws_max_subscriptions: None,
+            streamws_max_message_bytes: None,
             stream_max_resync_blocks: None,
             events_zmq_bind: None,
             events_zmq_hashtx: None,

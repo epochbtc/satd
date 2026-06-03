@@ -664,6 +664,11 @@ fn field_specs() -> Vec<FieldSpec> {
         restart!("streamws", streamws_bind),
         restart!("streamwsallowremote", streamws_allow_remote),
         restart!("streamwsauth", streamws_auth),
+        // Listener caps are bound at WsStreamServer construction (startup), so a
+        // change takes effect on restart.
+        restart!("streamwsmaxconns", streamws_max_conns),
+        restart!("streamwsmaxsubscriptions", streamws_max_subscriptions),
+        restart!("streamwsmaxmessagebytes", streamws_max_message_bytes),
         // The matcher captures this cap when spawned at startup, so a change
         // takes effect on restart (same disposition as the listener caps).
         restart!("streammaxresyncblocks", stream_max_resync_blocks),
