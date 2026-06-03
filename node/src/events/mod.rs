@@ -23,9 +23,13 @@ pub mod publisher;
 pub mod replay;
 pub mod schema;
 pub mod sink;
+pub mod watch;
 
 pub use envelope::{Cursor, EdgeIdentity, EdgeStamp, NodeEvent, NodeEventBody};
 pub use publisher::{EventPublisher, ENVELOPE_BROADCAST_CAPACITY};
 pub use replay::BlockCursorSource;
 pub use schema::SCHEMA_VERSION;
 pub use sink::EventSink;
+pub use watch::{
+    run_watch_matcher, WatchHandle, WatchMatch, WatchRegistry, WATCH_CHANNEL_CAPACITY,
+};
