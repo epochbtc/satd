@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 
 use async_trait::async_trait;
@@ -26,7 +26,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpListener;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, watch};
 use tokio_stream::Stream;
-use tokio_stream::wrappers::{BroadcastStream, TcpListenerStream};
+use tokio_stream::wrappers::{BroadcastStream, ReceiverStream, TcpListenerStream};
 use tonic::transport::Server;
 use tonic::transport::server::Connected;
 use tonic::{Request, Response, Status, Streaming};
@@ -104,6 +104,9 @@ pub struct GrpcEventSink {
     /// `from_cursor` request then streams live only). Never on the consensus
     /// hot path — replay reads blocks the node already holds.
     block_source: Option<std::sync::Arc<dyn node::events::BlockCursorSource>>,
+    /// Live outpoint/script watch registry backing the bidirectional
+    /// `Watch` RPC. `None` disables `Watch` (returns `UNAVAILABLE`).
+    watch_registry: Option<std::sync::Arc<node::events::WatchRegistry>>,
 }
 
 fn now_unix() -> i64 {
@@ -165,6 +168,7 @@ impl GrpcEventSink {
         limits: GrpcLimits,
         auth: Option<std::sync::Arc<satd_auth::TokenStore>>,
         block_source: Option<std::sync::Arc<dyn node::events::BlockCursorSource>>,
+        watch_registry: Option<std::sync::Arc<node::events::WatchRegistry>>,
     ) -> Result<Self, GrpcEventSinkError> {
         let addr: SocketAddr = bind
             .parse()
@@ -191,6 +195,7 @@ impl GrpcEventSink {
             limits,
             auth,
             block_source,
+            watch_registry,
         })
     }
 
@@ -229,6 +234,7 @@ impl EventSink for GrpcEventSink {
             active_subs: Arc::new(AtomicUsize::new(0)),
             max_subscriptions: self.limits.max_subscriptions,
             block_source: self.block_source.clone(),
+            watch_registry: self.watch_registry.clone(),
         };
         info!(target: "events::grpc", addr = %self.addr, "events gRPC server starting");
         let shutdown_signal = async move {
@@ -313,6 +319,8 @@ struct NodeEventStreamSvc {
     /// Read-only block-index access for durable cursor replay; `None`
     /// disables replay (forward-only).
     block_source: Option<std::sync::Arc<dyn node::events::BlockCursorSource>>,
+    /// Live watch registry backing the `Watch` RPC; `None` disables it.
+    watch_registry: Option<std::sync::Arc<node::events::WatchRegistry>>,
 }
 
 /// RAII guard decrementing the active-subscription counter when a stream is
@@ -392,6 +400,8 @@ impl Connected for PermittedTcp {
 #[async_trait]
 impl NodeEventStream for NodeEventStreamSvc {
     type SubscribeStream =
+        Pin<Box<dyn Stream<Item = Result<pb::NodeEvent, Status>> + Send + 'static>>;
+    type WatchStream =
         Pin<Box<dyn Stream<Item = Result<pb::NodeEvent, Status>> + Send + 'static>>;
 
     async fn subscribe(
@@ -620,6 +630,299 @@ impl NodeEventStream for NodeEventStreamSvc {
 
         Ok(Response::new(stream))
     }
+
+    async fn watch(
+        &self,
+        request: Request<Streaming<pb::SubscribeControl>>,
+    ) -> Result<Response<Self::WatchStream>, Status> {
+        let registry = self.watch_registry.clone().ok_or_else(|| {
+            Status::unavailable("watch registry not configured on this server")
+        })?;
+
+        // Concurrent-subscription cap (shared with Subscribe).
+        let sub_guard = if self.max_subscriptions > 0 {
+            let active = self.active_subs.fetch_add(1, Ordering::AcqRel) + 1;
+            if active > self.max_subscriptions {
+                self.active_subs.fetch_sub(1, Ordering::AcqRel);
+                return Err(Status::resource_exhausted(
+                    "events gRPC concurrent-subscription cap reached",
+                ));
+            }
+            Some(SubscriptionGuard(self.active_subs.clone()))
+        } else {
+            None
+        };
+
+        // Principal for per-add watch quota. Absent when auth is not
+        // configured (loopback trust → unlimited watches, today's behavior).
+        // When present, the interceptor already verified stream:subscribe;
+        // each watch addition additionally requires stream:watch + quota via
+        // `acquire_watch`.
+        let principal = request.extensions().get::<satd_auth::Principal>().cloned();
+        let mut inbound = request.into_inner();
+
+        let (handle, rx_match) = registry.register(node::events::WATCH_CHANNEL_CAPACITY);
+        let handle = Arc::new(handle);
+        let category_mask = Arc::new(AtomicU32::new(u32::MAX));
+        let edge = *self.publisher.edge();
+        let rx_live = self.publisher.subscribe();
+
+        // Watch-quota leases are owned by the SUBSCRIPTION, not the inbound
+        // control reader. gRPC/HTTP-2 lets a client half-close its send side
+        // (END_STREAM on the request) while keeping the response stream open;
+        // if the leases lived in the inbound task they would be released the
+        // moment the control stream closed, dropping the client's quota to
+        // zero while its watches stayed live on the outbound stream — letting
+        // an authed tenant register an unbounded watch-set at no standing
+        // quota cost. Holding the leases behind an `Arc` shared by both the
+        // inbound task and the outbound stream ties their lifetime to the
+        // watch-set itself: quota is released exactly when the `WatchHandle`
+        // is deregistered (full disconnect).
+        let leases: Arc<std::sync::Mutex<Vec<satd_auth::WatchLease>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        // Inbound control reader: applies watch-set mutations + category
+        // changes for the life of the stream, recording any watch-quota leases
+        // into the shared subscription-scoped vec, and holds a handle clone so
+        // the subscription is retained while either side is alive.
+        {
+            let handle = handle.clone();
+            let category_mask = category_mask.clone();
+            let leases = leases.clone();
+            tokio::spawn(async move {
+                while let Ok(Some(ctrl)) = inbound.message().await {
+                    let mut guard = leases.lock().unwrap_or_else(|p| p.into_inner());
+                    apply_control(ctrl, &handle, principal.as_ref(), &category_mask, &mut guard);
+                }
+                // Inbound (control) closed. Leases are NOT released here — they
+                // belong to the subscription and drop with the outbound stream
+                // + WatchHandle when the client fully disconnects.
+            });
+        }
+
+        // Outbound: live category-filtered firehose merged with the
+        // per-subscriber watch matches.
+        let live = BroadcastStream::new(rx_live).filter_map(move |item| match item {
+            Ok(env) => {
+                if (env.category_bit() & category_mask.load(Ordering::Relaxed)) == 0 {
+                    return None;
+                }
+                Some(Ok(envelope_to_proto(&env)))
+            }
+            Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
+                warn!(target: "events::grpc", dropped = n, "Watch subscriber lagged (firehose)");
+                None
+            }
+        });
+        let matches =
+            ReceiverStream::new(rx_match).map(move |m| Ok(watch_match_to_proto(&edge, &m)));
+
+        // Hold `handle` + `sub_guard` alive for the lifetime of the outbound
+        // stream (dropped on client disconnect → deregister + free slot).
+        let merged = live.merge(matches).map(move |x| {
+            let _keep_handle = &handle;
+            let _keep_slot = &sub_guard;
+            // Keep the quota leases alive for the subscription's lifetime; they
+            // (and the WatchHandle) drop together when the client disconnects.
+            let _keep_leases = &leases;
+            x
+        });
+
+        Ok(Response::new(Box::pin(merged)))
+    }
+}
+
+/// Apply one `SubscribeControl` to a subscriber's watch-set. Watch additions
+/// charge the per-token quota (N items = N units) via `acquire_watch`, which
+/// also enforces the `stream:watch` capability; a rejected add is logged and
+/// skipped without tearing down the stream. Quota leases are held by the
+/// caller and released on disconnect (per-remove release is a follow-up).
+fn apply_control(
+    ctrl: pb::SubscribeControl,
+    handle: &node::events::WatchHandle,
+    principal: Option<&satd_auth::Principal>,
+    category_mask: &AtomicU32,
+    leases: &mut Vec<satd_auth::WatchLease>,
+) {
+    use pb::subscribe_control::Msg;
+    match ctrl.msg {
+        Some(Msg::AddOutpoints(a)) => {
+            // Charge for distinct items only — a single message may repeat an
+            // entry, and the registry deduplicates on insert, so charging the
+            // raw count would overcharge the token's quota. (Cross-message
+            // dedup against the live watch-set is a follow-up.)
+            let mut seen = std::collections::HashSet::new();
+            let ops: Vec<bitcoin::OutPoint> = a
+                .outpoints
+                .iter()
+                .filter_map(parse_outpoint)
+                .filter(|o| seen.insert(*o))
+                .collect();
+            if !ops.is_empty() {
+                charge_and_add(principal, leases, ops.len(), "outpoints", || {
+                    handle.add_outpoints(&ops);
+                });
+            }
+        }
+        Some(Msg::AddScripts(a)) => {
+            let mut seen = std::collections::HashSet::new();
+            let shs: Vec<[u8; 32]> = a
+                .scripthashes
+                .iter()
+                .filter_map(|b| parse_scripthash(b))
+                .filter(|sh| seen.insert(*sh))
+                .collect();
+            if !shs.is_empty() {
+                charge_and_add(principal, leases, shs.len(), "scripts", || {
+                    handle.add_scripthashes(&shs);
+                });
+            }
+        }
+        Some(Msg::RemoveOutpoints(r)) => {
+            let ops: Vec<bitcoin::OutPoint> =
+                r.outpoints.iter().filter_map(parse_outpoint).collect();
+            handle.remove_outpoints(&ops);
+        }
+        Some(Msg::RemoveScripts(r)) => {
+            let shs: Vec<[u8; 32]> = r
+                .scripthashes
+                .iter()
+                .filter_map(|b| parse_scripthash(b))
+                .collect();
+            handle.remove_scripthashes(&shs);
+        }
+        Some(Msg::SetCategories(c)) => {
+            let mask = if c.categories == 0 {
+                u32::MAX
+            } else {
+                c.categories
+            };
+            category_mask.store(mask, Ordering::Relaxed);
+        }
+        Some(Msg::SetCursor(_)) => {
+            warn!(
+                target: "events::grpc",
+                "SetCursor on the Watch stream is not served; use Subscribe(from_cursor) for replay",
+            );
+        }
+        None => {}
+    }
+}
+
+/// Charge `n` watch-quota units, then run `add` on success. With no
+/// principal (auth disabled), watches are unlimited (loopback trust).
+fn charge_and_add<F: FnOnce()>(
+    principal: Option<&satd_auth::Principal>,
+    leases: &mut Vec<satd_auth::WatchLease>,
+    n: usize,
+    kind: &'static str,
+    add: F,
+) {
+    match principal {
+        Some(p) => match p.acquire_watch(n as u64) {
+            Ok(lease) => {
+                add();
+                leases.push(lease);
+            }
+            Err(reject) => {
+                warn!(
+                    target: "events::grpc",
+                    kind,
+                    reject = ?reject,
+                    "watch add rejected (capability or quota)",
+                );
+            }
+        },
+        None => add(),
+    }
+}
+
+/// Parse a wire `Outpoint` (raw 32-byte txid + vout). Returns `None` for a
+/// malformed txid length.
+fn parse_outpoint(op: &pb::Outpoint) -> Option<bitcoin::OutPoint> {
+    use bitcoin::hashes::Hash;
+    if op.txid.len() != 32 {
+        return None;
+    }
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(&op.txid);
+    let txid =
+        bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(bytes));
+    Some(bitcoin::OutPoint {
+        txid,
+        vout: op.vout,
+    })
+}
+
+/// Parse a 32-byte scripthash; `None` for a wrong length.
+fn parse_scripthash(b: &[u8]) -> Option<[u8; 32]> {
+    if b.len() != 32 {
+        return None;
+    }
+    let mut sh = [0u8; 32];
+    sh.copy_from_slice(b);
+    Some(sh)
+}
+
+/// Convert a per-subscriber [`WatchMatch`](node::events::WatchMatch) into a
+/// wire `NodeEvent`. Confirmed matches carry a `(height, 0)` cursor; the
+/// stamp seq is 0 (matches are positioned by their identity, not the
+/// volatile per-publisher seq).
+fn watch_match_to_proto(
+    edge: &node::events::EdgeIdentity,
+    m: &node::events::WatchMatch,
+) -> pb::NodeEvent {
+    use bitcoin::hashes::Hash;
+    use node::events::WatchMatch;
+    let (cursor, body) = match m {
+        WatchMatch::OutpointSpent {
+            outpoint,
+            spending_txid,
+            spending_vin,
+            confirmed,
+            height,
+        } => {
+            let body = pb::node_event::Body::OutpointSpent(pb::OutpointSpent {
+                outpoint_txid: outpoint.txid.as_raw_hash().to_byte_array().to_vec(),
+                outpoint_vout: outpoint.vout,
+                spending_txid: spending_txid.as_raw_hash().to_byte_array().to_vec(),
+                spending_vin: *spending_vin,
+                confirmed: *confirmed,
+            });
+            (cursor_from_height(*height), body)
+        }
+        WatchMatch::ScriptMatched {
+            scripthash,
+            txid,
+            is_output,
+            index,
+            confirmed,
+            height,
+        } => {
+            let body = pb::node_event::Body::ScriptMatched(pb::ScriptMatched {
+                scripthash: scripthash.to_vec(),
+                txid: txid.as_raw_hash().to_byte_array().to_vec(),
+                is_output: *is_output,
+                index: *index,
+                confirmed: *confirmed,
+            });
+            (cursor_from_height(*height), body)
+        }
+    };
+    pb::NodeEvent {
+        schema_version: node::events::SCHEMA_VERSION,
+        stamp: Some(replay_stamp(edge)),
+        cursor,
+        body: Some(body),
+    }
+}
+
+fn cursor_from_height(height: Option<u32>) -> Option<pb::Cursor> {
+    height.map(|h| pb::Cursor {
+        height: h,
+        tx_index: 0,
+        mempool_seq: 0,
+    })
 }
 
 /// Discard `Streaming` from the request, leaving only the unary message
@@ -952,7 +1255,7 @@ mod tests {
     #[tokio::test]
     async fn bind_rejects_remote_address_by_default() {
         let publisher = EventPublisher::new(edge(), 16);
-        match GrpcEventSink::bind("0.0.0.0:0", false, publisher, GrpcLimits::default(), None, None).await {
+        match GrpcEventSink::bind("0.0.0.0:0", false, publisher, GrpcLimits::default(), None, None, None).await {
             Err(GrpcEventSinkError::RemoteBindRejected(_)) => {}
             Ok(_) => panic!("non-loopback bind without allow_remote should fail"),
             Err(e) => panic!("expected RemoteBindRejected, got {e}"),
@@ -962,7 +1265,7 @@ mod tests {
     #[tokio::test]
     async fn bind_allows_loopback_without_override() {
         let publisher = EventPublisher::new(edge(), 16);
-        let sink = GrpcEventSink::bind("127.0.0.1:0", false, publisher, GrpcLimits::default(), None, None)
+        let sink = GrpcEventSink::bind("127.0.0.1:0", false, publisher, GrpcLimits::default(), None, None, None)
             .await
             .expect("loopback bind should succeed");
         let addr = sink.local_addr().expect("local_addr");
@@ -975,7 +1278,7 @@ mod tests {
         // 0.0.0.0:0 with allow_remote = true: must succeed (the actual
         // port the OS picks is irrelevant; the test asserts only that
         // the loopback gate is bypassed when the caller opts in).
-        let sink = GrpcEventSink::bind("0.0.0.0:0", true, publisher, GrpcLimits::default(), None, None)
+        let sink = GrpcEventSink::bind("0.0.0.0:0", true, publisher, GrpcLimits::default(), None, None, None)
             .await
             .expect("explicit remote bind should be allowed");
         let addr = sink.local_addr().unwrap();
@@ -1009,7 +1312,7 @@ mod tests {
 
         // 2. Bind directly (the new API picks the actual ephemeral port
         // from the OS, no TOCTOU window).
-        let sink = GrpcEventSink::bind("127.0.0.1:0", false, publisher.clone(), GrpcLimits::default(), None, None)
+        let sink = GrpcEventSink::bind("127.0.0.1:0", false, publisher.clone(), GrpcLimits::default(), None, None, None)
             .await
             .expect("bind");
         let actual = sink.local_addr().unwrap();
@@ -1081,6 +1384,8 @@ mod tests {
                 pb::node_event::Body::Mempool(_) => "mempool",
                 pb::node_event::Body::Chain(_) => "chain",
                 pb::node_event::Body::Heartbeat(_) => "heartbeat",
+                pb::node_event::Body::OutpointSpent(_) => "outpoint_spent",
+                pb::node_event::Body::ScriptMatched(_) => "script_matched",
             })
             .collect();
         assert!(
@@ -1102,6 +1407,7 @@ mod tests {
             active_subs: Arc::new(AtomicUsize::new(0)),
             max_subscriptions: 2,
             block_source: None,
+            watch_registry: None,
         };
         let mk = || {
             Request::new(pb::SubscribeRequest {
@@ -1191,6 +1497,7 @@ mod tests {
             active_subs: Arc::new(AtomicUsize::new(0)),
             max_subscriptions: 0,
             block_source: Some(Arc::new(MockBlocks { tip: 5 })),
+            watch_registry: None,
         };
         // Resume from height 2 → replay 3, 4, 5 (chain category only).
         let resp = svc
@@ -1238,6 +1545,7 @@ mod tests {
             active_subs: Arc::new(AtomicUsize::new(0)),
             max_subscriptions: 0,
             block_source: Some(Arc::new(MockBlocks { tip: 5 })),
+            watch_registry: None,
         };
         let resp = svc
             .subscribe(Request::new(pb::SubscribeRequest {
@@ -1305,6 +1613,7 @@ mod tests {
             active_subs: Arc::new(AtomicUsize::new(0)),
             max_subscriptions: 0,
             block_source: Some(Arc::new(MockBlocks { tip: 5 })),
+            watch_registry: None,
         };
         // Resume from height 3 → replay 4, 5 (snapshot hashes [4;32], [5;32]).
         let resp = svc
@@ -1376,6 +1685,7 @@ mod tests {
             active_subs: Arc::new(AtomicUsize::new(0)),
             max_subscriptions: 0,
             block_source: Some(Arc::new(MockBlocks { tip })),
+            watch_registry: None,
         };
         // Resume from height 0 → would replay the whole chain; must clamp.
         let resp = svc
@@ -1426,6 +1736,7 @@ mod tests {
             max_subscriptions: 0,
             // tip 0 → no confirmed replay; isolate the mempool window.
             block_source: Some(Arc::new(MockBlocks { tip: 0 })),
+            watch_registry: None,
         };
         // Resume from mempool_seq = 1 → replay seqs 2 and 3.
         let resp = svc
@@ -1469,6 +1780,7 @@ mod tests {
             active_subs: Arc::new(AtomicUsize::new(0)),
             max_subscriptions: 0,
             block_source: None,
+            watch_registry: None,
         };
         let resp = svc
             .subscribe(Request::new(pb::SubscribeRequest {
@@ -1488,6 +1800,267 @@ mod tests {
         assert!(pending.is_err(), "forward-only stream should have no replay items");
     }
 
+    fn op_proto(byte: u8, vout: u32) -> pb::Outpoint {
+        use bitcoin::hashes::Hash;
+        pb::Outpoint {
+            txid: bitcoin::hashes::sha256d::Hash::from_byte_array([byte; 32])
+                .to_byte_array()
+                .to_vec(),
+            vout,
+        }
+    }
+
+    /// `apply_control(AddOutpoints)` with no principal (auth disabled) adds
+    /// the watch (loopback trust → unlimited).
+    #[test]
+    fn apply_control_no_auth_adds_outpoint() {
+        let reg = Arc::new(node::events::WatchRegistry::new());
+        let (handle, _rx) = reg.register(node::events::WATCH_CHANNEL_CAPACITY);
+        let mask = AtomicU32::new(u32::MAX);
+        let mut leases = Vec::new();
+        apply_control(
+            pb::SubscribeControl {
+                msg: Some(pb::subscribe_control::Msg::AddOutpoints(pb::AddOutpoints {
+                    outpoints: vec![op_proto(0xcd, 2)],
+                })),
+            },
+            &handle,
+            None,
+            &mask,
+            &mut leases,
+        );
+        assert!(reg.has_watchers());
+    }
+
+    /// A principal that holds `stream:subscribe` but not `stream:watch` is
+    /// rejected by the quota gate: the watch is NOT added and no lease is
+    /// taken — without tearing down the stream.
+    #[test]
+    fn apply_control_quota_rejects_without_stream_watch() {
+        let store = auth_store(); // "sub" token has stream:subscribe only
+        let principal = store
+            .resolve(SUB_TOKEN, now_unix())
+            .expect("resolve sub token");
+        let reg = Arc::new(node::events::WatchRegistry::new());
+        let (handle, _rx) = reg.register(node::events::WATCH_CHANNEL_CAPACITY);
+        let mask = AtomicU32::new(u32::MAX);
+        let mut leases = Vec::new();
+        apply_control(
+            pb::SubscribeControl {
+                msg: Some(pb::subscribe_control::Msg::AddOutpoints(pb::AddOutpoints {
+                    outpoints: vec![op_proto(0xab, 0)],
+                })),
+            },
+            &handle,
+            Some(&principal),
+            &mask,
+            &mut leases,
+        );
+        assert!(
+            !reg.has_watchers(),
+            "add must be rejected without stream:watch"
+        );
+        assert!(leases.is_empty(), "no lease taken on a rejected add");
+    }
+
+    /// Regression (HIGH): watch-quota leases must be owned by the
+    /// SUBSCRIPTION, not the inbound control reader. A client can half-close
+    /// its control stream (END_STREAM) while keeping the response stream open;
+    /// if the leases were dropped when the inbound task ended, the client's
+    /// quota would be released while its watches stayed live — letting it
+    /// register an unbounded watch-set at zero standing quota cost. This
+    /// mirrors the handler's wiring: the lease vec is held behind an `Arc`
+    /// shared by the inbound task and the outbound stream, so the quota is
+    /// released only when the subscription itself is torn down.
+    #[test]
+    fn watch_quota_held_until_subscription_ends_not_on_control_half_close() {
+        use satd_auth::{Accounting, Capability, CapabilitySet, LocalAccounting, Principal};
+        let acct: Arc<dyn Accounting> = Arc::new(LocalAccounting::new());
+        let principal = Principal::token(
+            Arc::from("tenant"),
+            CapabilitySet::EMPTY.with(Capability::StreamWatch),
+            Some(2),
+            None,
+            acct.clone(),
+        );
+        let quota = acct.quota();
+
+        let reg = Arc::new(node::events::WatchRegistry::new());
+        let (handle, _rx) = reg.register(node::events::WATCH_CHANNEL_CAPACITY);
+        let mask = AtomicU32::new(u32::MAX);
+
+        // The subscription-scoped lease vec (held by the outbound stream).
+        let leases: Arc<std::sync::Mutex<Vec<satd_auth::WatchLease>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        // The inbound control reader holds a clone and charges quota into it.
+        let inbound = leases.clone();
+        {
+            let mut guard = inbound.lock().unwrap();
+            apply_control(
+                pb::SubscribeControl {
+                    msg: Some(pb::subscribe_control::Msg::AddOutpoints(pb::AddOutpoints {
+                        outpoints: vec![op_proto(0x01, 0), op_proto(0x02, 0)],
+                    })),
+                },
+                &handle,
+                Some(&principal),
+                &mask,
+                &mut guard,
+            );
+        }
+        assert_eq!(quota.current("tenant"), 2, "two watches charged 2 units");
+
+        // Control stream half-closes → the inbound task ends and drops ITS
+        // clone of the lease vec. Quota must NOT be released: the watches are
+        // still live on the outbound stream.
+        drop(inbound);
+        assert_eq!(
+            quota.current("tenant"),
+            2,
+            "half-closing the control stream must NOT release the watch quota",
+        );
+
+        // Subscription ends (client fully disconnects) → outbound drops the
+        // last lease-vec reference, releasing the quota.
+        drop(leases);
+        assert_eq!(
+            quota.current("tenant"),
+            0,
+            "full disconnect releases the watch quota",
+        );
+    }
+
+    /// A single `AddOutpoints` message that repeats an entry is charged once
+    /// per DISTINCT item, not per raw entry — the registry dedups on insert,
+    /// so charging the raw count would overcharge the token's quota.
+    #[test]
+    fn duplicate_entries_in_one_add_charge_once() {
+        use satd_auth::{Accounting, Capability, CapabilitySet, LocalAccounting, Principal};
+        let acct: Arc<dyn Accounting> = Arc::new(LocalAccounting::new());
+        let principal = Principal::token(
+            Arc::from("tenant"),
+            CapabilitySet::EMPTY.with(Capability::StreamWatch),
+            Some(5),
+            None,
+            acct.clone(),
+        );
+        let reg = Arc::new(node::events::WatchRegistry::new());
+        let (handle, _rx) = reg.register(node::events::WATCH_CHANNEL_CAPACITY);
+        let mask = AtomicU32::new(u32::MAX);
+        let mut leases = Vec::new();
+        apply_control(
+            pb::SubscribeControl {
+                msg: Some(pb::subscribe_control::Msg::AddOutpoints(pb::AddOutpoints {
+                    // Same outpoint three times → one distinct unit.
+                    outpoints: vec![op_proto(0x07, 3), op_proto(0x07, 3), op_proto(0x07, 3)],
+                })),
+            },
+            &handle,
+            Some(&principal),
+            &mask,
+            &mut leases,
+        );
+        assert_eq!(
+            acct.quota().current("tenant"),
+            1,
+            "a 3x-repeated entry charges a single distinct unit",
+        );
+    }
+
+    /// End-to-end bidi `Watch`: a client adds an outpoint to its watch-set
+    /// and receives the `OutpointSpent` event when the matcher reports a
+    /// spend.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watch_delivers_outpoint_match() {
+        use bitcoin::hashes::Hash;
+        let publisher = EventPublisher::new(edge(), 64);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let registry = Arc::new(node::events::WatchRegistry::new());
+        let sink = GrpcEventSink::bind(
+            "127.0.0.1:0",
+            false,
+            publisher.clone(),
+            GrpcLimits::default(),
+            None,
+            None,
+            Some(registry.clone()),
+        )
+        .await
+        .expect("bind");
+        let actual = sink.local_addr().unwrap();
+        publisher.attach_sinks(vec![Box::new(sink)], shutdown_rx.clone());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let mut client =
+            pb::node_event_stream_client::NodeEventStreamClient::connect(format!(
+                "http://{actual}"
+            ))
+            .await
+            .expect("connect");
+
+        let op = bitcoin::OutPoint {
+            txid: Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0xcd; 32])),
+            vout: 1,
+        };
+        let (ctrl_tx, ctrl_rx) = tokio::sync::mpsc::channel::<pb::SubscribeControl>(4);
+        ctrl_tx
+            .send(pb::SubscribeControl {
+                msg: Some(pb::subscribe_control::Msg::AddOutpoints(pb::AddOutpoints {
+                    outpoints: vec![op_proto(0xcd, 1)],
+                })),
+            })
+            .await
+            .unwrap();
+        let mut stream = client
+            .watch(ReceiverStream::new(ctrl_rx))
+            .await
+            .expect("watch")
+            .into_inner();
+
+        // Wait until the server applied the AddOutpoints control.
+        let mut registered = false;
+        for _ in 0..100 {
+            if registry.has_watchers() {
+                registered = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(registered, "server should register the watch");
+
+        // Simulate the matcher reporting a mempool spend of the watched
+        // outpoint (in production `run_watch_matcher` calls this).
+        let spend = bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: op,
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![],
+        };
+        registry.scan_mempool_tx(&spend);
+
+        let ev = tokio::time::timeout(Duration::from_secs(3), stream.message())
+            .await
+            .expect("timeout")
+            .expect("transport")
+            .expect("stream ended");
+        match ev.body.expect("body") {
+            pb::node_event::Body::OutpointSpent(o) => {
+                assert_eq!(o.outpoint_vout, 1);
+                assert!(!o.confirmed, "mempool match is unconfirmed");
+                assert_eq!(o.outpoint_txid.len(), 32);
+            }
+            other => panic!("expected OutpointSpent, got {other:?}"),
+        }
+
+        drop(ctrl_tx);
+        let _ = shutdown_tx.send(true);
+    }
+
     /// `max_subscriptions = 0` disables the cap entirely.
     #[tokio::test]
     async fn subscription_cap_disabled_when_zero() {
@@ -1497,6 +2070,7 @@ mod tests {
             active_subs: Arc::new(AtomicUsize::new(0)),
             max_subscriptions: 0,
             block_source: None,
+            watch_registry: None,
         };
         let mut held = Vec::new();
         for _ in 0..16 {

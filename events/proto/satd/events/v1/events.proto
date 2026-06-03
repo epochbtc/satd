@@ -2,11 +2,69 @@ syntax = "proto3";
 
 package satd.events.v1;
 
-// Server-streaming RPC: client opens one Subscribe call and receives
-// NodeEvent messages until it disconnects or the server shuts down.
-// No client→server messages on the stream.
 service NodeEventStream {
+  // Server-streaming firehose: the client opens one Subscribe call and
+  // receives NodeEvent messages (category-filtered, optional durable
+  // replay via from_cursor) until it disconnects. No client→server
+  // messages on the stream.
   rpc Subscribe(SubscribeRequest) returns (stream NodeEvent);
+
+  // Bidirectional watch stream: the client manages a live watch-set
+  // (outpoints + scripts) via SubscribeControl messages and receives
+  // OutpointSpent / ScriptMatched events the moment a watched outpoint is
+  // spent or a watched script is paid (mempool + confirmed), interleaved
+  // with the live category-filtered firehose. Each watch addition is
+  // gated by the stream:watch capability and the per-token watch quota.
+  rpc Watch(stream SubscribeControl) returns (stream NodeEvent);
+}
+
+// Client→server control on the bidirectional Watch stream. A tagged union
+// so new watch kinds slot in without a protocol break.
+message SubscribeControl {
+  oneof msg {
+    // Replay anchor. Reserved for parity with Subscribe.from_cursor;
+    // durable replay on the Watch stream is not yet served — use
+    // Subscribe(from_cursor) for replay. Accepted and logged for now.
+    SetCursor       set_cursor       = 1;
+    // Adjust the live firehose category bitfield (mempool=1, chain=2,
+    // heartbeat=4; 0 = all). Applies immediately.
+    SetCategories   set_categories   = 2;
+    // Add scripthashes (each 32 bytes, sha256(scriptPubKey)) to the
+    // watch-set. Charges N watch-quota units for N scripthashes.
+    AddScripts      add_scripts      = 3;
+    // Remove scripthashes from the watch-set.
+    RemoveScripts   remove_scripts   = 4;
+    // Add outpoints to the watch-set. Charges N units for N outpoints.
+    AddOutpoints    add_outpoints    = 5;
+    // Remove outpoints from the watch-set.
+    RemoveOutpoints remove_outpoints = 6;
+  }
+}
+
+message SetCursor      { Cursor cursor = 1; }
+message SetCategories  { uint32 categories = 1; }
+message Outpoint       { bytes txid = 1; uint32 vout = 2; }
+message AddScripts     { repeated bytes scripthashes = 1; }
+message RemoveScripts  { repeated bytes scripthashes = 1; }
+message AddOutpoints   { repeated Outpoint outpoints = 1; }
+message RemoveOutpoints{ repeated Outpoint outpoints = 1; }
+
+// A watched outpoint was spent.
+message OutpointSpent {
+  bytes  outpoint_txid = 1;
+  uint32 outpoint_vout = 2;
+  bytes  spending_txid = 3;
+  uint32 spending_vin  = 4;
+  bool   confirmed     = 5; // false = seen in mempool, not yet in a block
+}
+
+// A watched script was paid by a transaction output (funding side).
+message ScriptMatched {
+  bytes  scripthash = 1;
+  bytes  txid       = 2;
+  bool   is_output  = 3;    // true = funding; input-side is future work
+  uint32 index      = 4;    // vout for a funding match
+  bool   confirmed  = 5;
 }
 
 // Filter knobs for a subscription. All optional; an unset field means
@@ -140,5 +198,7 @@ message NodeEvent {
     MempoolEvent mempool = 10;
     ChainEvent chain = 11;
     Heartbeat heartbeat = 12;
+    OutpointSpent outpoint_spent = 13; // watch match (Watch stream)
+    ScriptMatched script_matched = 14; // watch match (Watch stream)
   }
 }
