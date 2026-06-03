@@ -111,8 +111,8 @@ impl WatchSet {
         remove_items(&mut self.txids, incoming, unregister);
     }
 
-    /// Total watched items (diagnostics / tests).
-    #[cfg(test)]
+    /// Total watched items across all kinds. Used to enforce the per-connection
+    /// watch-set cap and in tests.
     pub(crate) fn len(&self) -> usize {
         self.outpoints.len() + self.scripts.len() + self.txids.len()
     }

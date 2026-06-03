@@ -1009,6 +1009,11 @@ async fn main() {
             // ChainState gives read-only active-chain access for the
             // snapshot→live handoff. Read-only; never on the consensus hot path.
             Some(chain_state.clone() as std::sync::Arc<dyn node::events::BlockCursorSource>),
+            satd_events::WsLimits {
+                max_conns: config.streamws_max_conns,
+                max_subscriptions: config.streamws_max_subscriptions,
+                max_message_bytes: config.streamws_max_message_bytes,
+            },
         )
         .await
         {

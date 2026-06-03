@@ -45,25 +45,24 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, watch};
 use tokio_stream::wrappers::BroadcastStream;
 use tracing::{debug, info, warn};
 
-/// Max concurrent `streamws` connections (`/ws` + `/sse` combined). Every
-/// other remote-facing surface (events-gRPC, Esplora, Electrum) is capped;
-/// without this bound a remote-exposed listener could be driven to fd /
-/// memory / task exhaustion by opening connections without limit. Excess
-/// connections are rejected with 503. (Making this operator-configurable,
-/// mirroring `eventsgrpcmaxconns`, is a follow-up.)
-const WS_MAX_CONNS: usize = 256;
-
-/// Cap on a single inbound WebSocket message / frame. Control messages are
-/// tiny; the axum default (64 MiB) is absurd for this protocol and lets an
-/// authenticated peer force large `serde_json` parses.
-const WS_MAX_MESSAGE_BYTES: usize = 256 * 1024;
-
 /// Send a WebSocket Ping at this cadence and reap the connection if no frame
 /// (Pong, control, or otherwise) is seen from the client within
 /// [`WS_IDLE_TIMEOUT`] — so a dead or half-open peer cannot pin a connection
 /// slot, watch-set, and quota indefinitely.
 const WS_PING_INTERVAL: Duration = Duration::from_secs(30);
 const WS_IDLE_TIMEOUT_SECS: i64 = 90;
+
+/// Operator-configurable streamws limits (`streamwsmax*`). For the connection
+/// and subscription caps, `0` ⇒ unlimited.
+#[derive(Clone, Copy)]
+pub struct WsLimits {
+    /// Max concurrent `/ws` + `/sse` connections (`streamwsmaxconns`).
+    pub max_conns: usize,
+    /// Max watch-set entries per connection (`streamwsmaxsubscriptions`).
+    pub max_subscriptions: usize,
+    /// Max bytes for a single inbound WS message/frame (`streamwsmaxmessagebytes`).
+    pub max_message_bytes: usize,
+}
 
 /// Construction-time errors for the WS transport.
 #[derive(Debug, thiserror::Error)]
@@ -89,10 +88,15 @@ struct WsState {
     /// `from_cursor` query is honored as forward-only (no replay), matching the
     /// gRPC no-block-source fallback.
     block_source: Option<Arc<dyn BlockCursorSource>>,
-    /// Admission control: bounds concurrent `/ws` + `/sse` connections. A
-    /// connection holds one permit for its whole lifetime; the permit is
-    /// released on disconnect.
+    /// Admission control: bounds concurrent `/ws` + `/sse` connections
+    /// (operator-set `streamwsmaxconns`; 0 ⇒ unlimited). A connection holds one
+    /// permit for its whole lifetime, released on disconnect.
     conn_sem: Arc<Semaphore>,
+    /// Per-connection watch-set entry cap (`streamwsmaxsubscriptions`; 0 ⇒
+    /// unlimited). An add at/over the cap is shed without dropping the conn.
+    max_subscriptions: usize,
+    /// Cap on a single inbound WS message/frame (`streamwsmaxmessagebytes`).
+    max_message_bytes: usize,
 }
 
 /// The `--streamws` JSON/WS + SSE transport. Bind early (so a bind failure
@@ -129,6 +133,7 @@ impl WsStreamServer {
         watch_registry: Arc<WatchRegistry>,
         auth: Option<Arc<satd_auth::TokenStore>>,
         block_source: Option<Arc<dyn BlockCursorSource>>,
+        limits: WsLimits,
     ) -> Result<Self, WsStreamError> {
         let addr: SocketAddr = bind
             .parse()
@@ -155,7 +160,15 @@ impl WsStreamServer {
                 watch_registry,
                 auth,
                 block_source,
-                conn_sem: Arc::new(Semaphore::new(WS_MAX_CONNS)),
+                // 0 ⇒ unlimited (mirrors the events-gRPC cap convention): a
+                // near-MAX permit pool never blocks admission.
+                conn_sem: Arc::new(Semaphore::new(if limits.max_conns == 0 {
+                    Semaphore::MAX_PERMITS
+                } else {
+                    limits.max_conns
+                })),
+                max_subscriptions: limits.max_subscriptions,
+                max_message_bytes: limits.max_message_bytes,
             },
         })
     }
@@ -432,8 +445,9 @@ async fn ws_upgrade(
     let initial_mask = mask_from(q.categories);
     let cursor = q.cursor();
     // Bound a single inbound frame/message — control frames are tiny.
-    ws.max_message_size(WS_MAX_MESSAGE_BYTES)
-        .max_frame_size(WS_MAX_MESSAGE_BYTES)
+    let max_bytes = state.max_message_bytes;
+    ws.max_message_size(max_bytes)
+        .max_frame_size(max_bytes)
         .on_upgrade(move |socket| ws_conn(socket, state, principal, permit, initial_mask, cursor))
 }
 
@@ -472,6 +486,7 @@ async fn ws_conn(
 
     // Inbound control reader: applies watch-set + category changes against the
     // shared connection-scoped watch-set.
+    let max_subscriptions = state.max_subscriptions;
     let inbound = {
         let handle = handle.clone();
         let category_mask = category_mask.clone();
@@ -489,6 +504,7 @@ async fn ws_conn(
                             principal.as_ref(),
                             &category_mask,
                             &mut guard,
+                            max_subscriptions,
                         );
                     }
                     Message::Close(_) => break,
@@ -647,6 +663,7 @@ fn apply_ws_control(
     principal: Option<&satd_auth::Principal>,
     category_mask: &AtomicU32,
     watch_set: &mut WatchSet,
+    max_subscriptions: usize,
 ) {
     let ctrl: WsControl = match serde_json::from_str(text) {
         Ok(c) => c,
@@ -655,6 +672,26 @@ fn apply_ws_control(
             return;
         }
     };
+    // Per-connection watch-set entry cap (`streamwsmaxsubscriptions`; 0 ⇒
+    // unlimited): once the set is at/over the cap, shed any add (the
+    // connection stays up — no per-message ack). Removes and category changes
+    // are exempt. A single add may overshoot by one control message's worth of
+    // items, itself bounded by the inbound frame cap.
+    let is_add = matches!(
+        ctrl,
+        WsControl::AddOutpoints { .. }
+            | WsControl::AddScripts { .. }
+            | WsControl::AddDescriptor { .. }
+            | WsControl::AddTransactions { .. }
+    );
+    if is_add && max_subscriptions != 0 && watch_set.len() >= max_subscriptions {
+        warn!(
+            target: "events::ws",
+            cap = max_subscriptions,
+            "streamws watch-set at per-connection cap; shedding add",
+        );
+        return;
+    }
     match ctrl {
         WsControl::SetCategories { categories } => {
             let mask = if categories == 0 { u32::MAX } else { categories };
@@ -829,6 +866,38 @@ mod tests {
             WsControl::AddTransactions { txids } => assert_eq!(txids.len(), 2),
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn per_connection_subscription_cap_sheds_adds() {
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, _rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let mask = AtomicU32::new(u32::MAX);
+        let mut ws = WatchSet::default();
+        let txid = "00".repeat(32);
+        let add = |vout: u32| {
+            format!(
+                r#"{{"type":"add_outpoints","outpoints":[{{"txid":"{txid}","vout":{vout}}}]}}"#
+            )
+        };
+        // cap = 2, no principal (loopback/unlimited quota).
+        apply_ws_control(&add(0), &handle, None, &mask, &mut ws, 2);
+        apply_ws_control(&add(1), &handle, None, &mask, &mut ws, 2);
+        assert_eq!(ws.len(), 2, "two distinct outpoints registered");
+        // At the cap → the next add is shed (connection stays up).
+        apply_ws_control(&add(2), &handle, None, &mask, &mut ws, 2);
+        assert_eq!(ws.len(), 2, "add at the per-connection cap is shed");
+        // A remove frees a slot; a subsequent add then succeeds.
+        let rm = format!(
+            r#"{{"type":"remove_outpoints","outpoints":[{{"txid":"{txid}","vout":0}}]}}"#
+        );
+        apply_ws_control(&rm, &handle, None, &mask, &mut ws, 2);
+        assert_eq!(ws.len(), 1);
+        apply_ws_control(&add(2), &handle, None, &mask, &mut ws, 2);
+        assert_eq!(ws.len(), 2, "add succeeds again after a remove frees a slot");
+        // cap = 0 ⇒ unlimited: adds are never shed.
+        apply_ws_control(&add(3), &handle, None, &mask, &mut ws, 0);
+        assert_eq!(ws.len(), 3, "cap 0 disables the per-connection limit");
     }
 
     #[test]
