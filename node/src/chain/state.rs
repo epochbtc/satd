@@ -5605,6 +5605,50 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_active_chain_range_immune_to_polluted_height_hash() {
+        // `BlockCursorSource::active_chain_range` (the streaming cursor-replay
+        // accessor) must read the genuine active chain, not the pollutable
+        // height_hash index. Otherwise durable replay could emit a side-chain
+        // block to a streaming consumer as a "confirmed" BlockConnected — the
+        // exact false-confirmation hazard the resync path also guards against.
+        use crate::events::BlockCursorSource;
+        let (cs, dir) = make_chain_state();
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+
+        // Active chain: genesis -> A1 -> A2 (tip at height 2).
+        let a1 = build_test_block(genesis_hash, 1, 1_300_000_001);
+        let a1_hash = cs.accept_block(&a1).expect("accept A1");
+        let a2 = build_test_block(a1_hash, 2, 1_300_000_002);
+        let a2_hash = cs.accept_block(&a2).expect("accept A2");
+
+        // store_block(B1) pollutes height_hash[1] = B1 even though A1 is the
+        // active block at height 1.
+        let b1 = build_test_block(genesis_hash, 1, 1_300_000_010);
+        let b1_hash = b1.block_hash();
+        let _ = cs.store_block(&b1).expect("store B1");
+        assert_eq!(
+            cs.get_block_hash_by_height(1),
+            Some(b1_hash),
+            "premise: height_hash[1] is polluted with the side block",
+        );
+
+        // active_chain_range must walk back from the tip and return the ACTIVE
+        // hashes (A1, A2), immune to the polluted index.
+        let range = cs.active_chain_range(1, 2);
+        assert_eq!(
+            range,
+            vec![(1, a1_hash), (2, a2_hash)],
+            "active_chain_range must return the active chain, not height_hash[1] = B1",
+        );
+        // A sub-range and a clamp-to-tip both behave.
+        assert_eq!(cs.active_chain_range(2, 2), vec![(2, a2_hash)]);
+        assert_eq!(cs.active_chain_range(1, 99), vec![(1, a1_hash), (2, a2_hash)]);
+        assert!(cs.active_chain_range(3, 3).is_empty(), "above tip → empty");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_reorg_chain_events_emitted_after_full_commit() {
         // Reorg-event ordering: subscribers must see BlockDisconnected
         // events for the old chain followed by BlockConnected events

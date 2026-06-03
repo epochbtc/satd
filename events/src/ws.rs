@@ -31,7 +31,11 @@ use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use futures_util::{SinkExt, StreamExt};
-use node::events::{EventPublisher, WatchMatch, WatchRegistry, WATCH_CHANNEL_CAPACITY};
+use node::chain::events::ChainEvent;
+use node::events::{
+    build_cursor_replay, BlockCursorSource, Cursor, EventPublisher, NodeEventBody, WatchMatch,
+    WatchRegistry, MAX_REPLAY_BLOCKS, WATCH_CHANNEL_CAPACITY,
+};
 use serde::Deserialize;
 
 use crate::watchset::WatchSet;
@@ -81,6 +85,10 @@ struct WsState {
     publisher: Arc<EventPublisher>,
     watch_registry: Arc<WatchRegistry>,
     auth: Option<Arc<satd_auth::TokenStore>>,
+    /// Active-chain access for durable `?from_cursor=` replay. `None` ⇒ a
+    /// `from_cursor` query is honored as forward-only (no replay), matching the
+    /// gRPC no-block-source fallback.
+    block_source: Option<Arc<dyn BlockCursorSource>>,
     /// Admission control: bounds concurrent `/ws` + `/sse` connections. A
     /// connection holds one permit for its whole lifetime; the permit is
     /// released on disconnect.
@@ -120,6 +128,7 @@ impl WsStreamServer {
         publisher: Arc<EventPublisher>,
         watch_registry: Arc<WatchRegistry>,
         auth: Option<Arc<satd_auth::TokenStore>>,
+        block_source: Option<Arc<dyn BlockCursorSource>>,
     ) -> Result<Self, WsStreamError> {
         let addr: SocketAddr = bind
             .parse()
@@ -145,6 +154,7 @@ impl WsStreamServer {
                 publisher,
                 watch_registry,
                 auth,
+                block_source,
                 conn_sem: Arc::new(Semaphore::new(WS_MAX_CONNS)),
             },
         })
@@ -204,9 +214,35 @@ fn authorize(state: &WsState, headers: &HeaderMap) -> Result<Option<satd_auth::P
 }
 
 #[derive(Deserialize)]
-struct CategoryQuery {
+struct FirehoseQuery {
     /// Category bitfield (mempool=1, chain=2, heartbeat=4; 0/absent = all).
     categories: Option<u32>,
+    /// Durable replay anchor — the JSON-cursor fields a client persisted from a
+    /// prior `NodeEvent`, flattened into query params (curl-friendly; no JS
+    /// `Number` precision loss since the URL carries them as text). Replay
+    /// engages when `from_height` is present **and** a block source is
+    /// configured; otherwise the connection is forward-only. Mirrors the gRPC
+    /// `SubscribeRequest.from_cursor`.
+    from_height: Option<u32>,
+    #[serde(default)]
+    from_tx_index: u32,
+    #[serde(default)]
+    from_mempool_seq: u64,
+    #[serde(default)]
+    from_instance_id: u64,
+}
+
+impl FirehoseQuery {
+    /// The durable resume cursor this query requests, if any (`from_height`
+    /// present).
+    fn cursor(&self) -> Option<Cursor> {
+        self.from_height.map(|height| Cursor {
+            height,
+            tx_index: self.from_tx_index,
+            mempool_seq: self.from_mempool_seq,
+            instance_id: self.from_instance_id,
+        })
+    }
 }
 
 fn mask_from(categories: Option<u32>) -> u32 {
@@ -216,11 +252,70 @@ fn mask_from(categories: Option<u32>) -> u32 {
     }
 }
 
-/// `GET /sse` — read-only JSON `NodeEvent` firehose.
+/// Boundary-dedup state for the live filter after a snapshot→live handoff: the
+/// confirmed snapshot (height→hash, identity dedup) and the highest replayed
+/// mempool seq. Cheap to clone per item (the map sits behind an `Arc`).
+#[derive(Clone, Default)]
+struct ReplayDedup {
+    confirmed: Option<Arc<std::collections::HashMap<u32, bitcoin::BlockHash>>>,
+    mempool_through: Option<u64>,
+}
+
+impl ReplayDedup {
+    /// True if `env` is a snapshot→live boundary duplicate that must be
+    /// dropped: a confirmed block byte-identical to the one already replayed at
+    /// its height (a reorg replacement has a different hash and is forwarded),
+    /// or a mempool event at or below the highest replayed seq.
+    fn is_duplicate(&self, env: &node::events::NodeEvent) -> bool {
+        if let Some(cd) = &self.confirmed
+            && let NodeEventBody::Chain(ChainEvent::BlockConnected { height, hash }) = &env.body
+            && cd.get(height) == Some(hash)
+        {
+            return true;
+        }
+        if let Some(s) = self.mempool_through
+            && matches!(env.body, NodeEventBody::Mempool(_))
+            && env.stamp.seq <= s
+        {
+            return true;
+        }
+        false
+    }
+}
+
+/// Build the durable replay (events to emit before live + the live boundary
+/// dedup) for a `from_cursor` query, or `(empty, default)` when replay does not
+/// engage (no cursor, or no block source). `mask` gates which categories are
+/// replayed (mirrors the live category filter).
+fn build_replay(
+    state: &WsState,
+    cursor: Option<Cursor>,
+    mask: u32,
+) -> (Vec<node::events::NodeEvent>, ReplayDedup) {
+    let Some(cursor) = cursor else {
+        return (Vec::new(), ReplayDedup::default());
+    };
+    let Some(src) = state.block_source.as_ref() else {
+        debug!(
+            target: "events::ws",
+            "from_cursor requested but no block source configured; streaming live only",
+        );
+        return (Vec::new(), ReplayDedup::default());
+    };
+    let r = build_cursor_replay(src.as_ref(), &state.publisher, cursor, mask, MAX_REPLAY_BLOCKS);
+    let dedup = ReplayDedup {
+        confirmed: Some(Arc::new(r.confirmed_dedup)),
+        mempool_through: Some(r.mempool_dedup_through),
+    };
+    (r.events, dedup)
+}
+
+/// `GET /sse` — read-only JSON `NodeEvent` firehose, with optional durable
+/// `?from_cursor` replay (snapshot→live handoff) before the live tail.
 async fn sse_firehose(
     State(state): State<WsState>,
     headers: HeaderMap,
-    Query(q): Query<CategoryQuery>,
+    Query(q): Query<FirehoseQuery>,
 ) -> Response {
     if let Err(resp) = authorize(&state, &headers) {
         return resp;
@@ -234,14 +329,26 @@ async fn sse_firehose(
             .into_response();
     };
     let mask = mask_from(q.categories);
+    // Subscribe to the live broadcast FIRST so nothing is missed between the
+    // replay snapshot and the live tail (the snapshot→live handoff ordering).
     let rx = state.publisher.subscribe();
-    let stream = BroadcastStream::new(rx).filter_map(move |item| {
+    let (replay_events, dedup) = build_replay(&state, q.cursor(), mask);
+    // Replayed events first (confirmed history + mempool window — already
+    // category-gated by the replay builder), then the live stream, filtered by
+    // category and boundary-deduped against the snapshot.
+    let replay_stream = tokio_stream::iter(replay_events.into_iter().filter_map(|env| {
+        serde_json::to_string(&env)
+            .ok()
+            .map(|s| Ok::<_, std::convert::Infallible>(Event::default().data(s)))
+    }));
+    let live = BroadcastStream::new(rx).filter_map(move |item| {
         // Keep the permit alive for as long as the SSE stream is held; it is
         // released when the client disconnects and the stream is dropped.
         let _permit = &permit;
+        let dedup = dedup.clone();
         async move {
             match item {
-                Ok(env) if (env.category_bit() & mask) != 0 => {
+                Ok(env) if (env.category_bit() & mask) != 0 && !dedup.is_duplicate(&env) => {
                     Some(Ok::<_, std::convert::Infallible>(
                         Event::default().data(serde_json::to_string(&env).unwrap_or_default()),
                     ))
@@ -250,15 +357,19 @@ async fn sse_firehose(
             }
         }
     });
-    Sse::new(stream)
+    Sse::new(replay_stream.chain(live))
         .keep_alive(axum::response::sse::KeepAlive::default())
         .into_response()
 }
 
-/// `GET /ws` — bidirectional JSON WebSocket.
+/// `GET /ws` — bidirectional JSON WebSocket, with optional durable
+/// `?from_cursor` replay (snapshot→live handoff) before the live tail. The
+/// `?categories=` param sets the initial firehose mask; the client can change
+/// it later with a `set_categories` control message.
 async fn ws_upgrade(
     State(state): State<WsState>,
     headers: HeaderMap,
+    Query(q): Query<FirehoseQuery>,
     ws: WebSocketUpgrade,
 ) -> Response {
     let principal = match authorize(&state, &headers) {
@@ -274,10 +385,12 @@ async fn ws_upgrade(
         )
             .into_response();
     };
+    let initial_mask = mask_from(q.categories);
+    let cursor = q.cursor();
     // Bound a single inbound frame/message — control frames are tiny.
     ws.max_message_size(WS_MAX_MESSAGE_BYTES)
         .max_frame_size(WS_MAX_MESSAGE_BYTES)
-        .on_upgrade(move |socket| ws_conn(socket, state, principal, permit))
+        .on_upgrade(move |socket| ws_conn(socket, state, principal, permit, initial_mask, cursor))
 }
 
 async fn ws_conn(
@@ -285,12 +398,17 @@ async fn ws_conn(
     state: WsState,
     principal: Option<satd_auth::Principal>,
     _permit: OwnedSemaphorePermit,
+    initial_mask: u32,
+    cursor: Option<Cursor>,
 ) {
     let (mut sender, mut receiver) = socket.split();
     let (handle, mut rx_match) = state.watch_registry.register(WATCH_CHANNEL_CAPACITY);
     let handle = Arc::new(handle);
-    let category_mask = Arc::new(AtomicU32::new(u32::MAX));
+    let category_mask = Arc::new(AtomicU32::new(initial_mask));
+    // Subscribe to the live broadcast BEFORE building the replay snapshot so no
+    // event is missed at the snapshot→live boundary.
     let mut rx_live = state.publisher.subscribe();
+    let (replay_events, dedup) = build_replay(&state, cursor, initial_mask);
     // The watch-set (and the per-item quota leases inside it) is owned by the
     // CONNECTION, not the inbound reader (same rule as the gRPC Watch handler):
     // a client that stops sending control frames must not release its quota
@@ -337,11 +455,29 @@ async fn ws_conn(
         })
     };
 
-    // Outbound: live firehose (category-filtered) + watch matches as JSON,
-    // plus a periodic keepalive Ping that also drives idle-connection reaping.
+    // Durable replay first (confirmed history + mempool window from
+    // `?from_cursor`), before the live tail. Already category-gated by the
+    // replay builder; the live stream below boundary-dedups against it.
+    let mut replay_aborted = false;
+    for env in &replay_events {
+        if let Ok(text) = serde_json::to_string(env)
+            && sender.send(Message::Text(text.into())).await.is_err()
+        {
+            replay_aborted = true;
+            break;
+        }
+    }
+
+    // Outbound: live firehose (category-filtered, boundary-deduped) + watch
+    // matches as JSON, plus a periodic keepalive Ping that also drives
+    // idle-connection reaping.
     let mut ping = tokio::time::interval(WS_PING_INTERVAL);
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
+        // The client vanished mid-replay — skip the live loop, fall to cleanup.
+        if replay_aborted {
+            break;
+        }
         tokio::select! {
             _ = ping.tick() => {
                 let idle = now_unix().saturating_sub(last_activity.load(Ordering::Relaxed));
@@ -356,6 +492,7 @@ async fn ws_conn(
             ev = rx_live.recv() => match ev {
                 Ok(env) => {
                     if (env.category_bit() & category_mask.load(Ordering::Relaxed)) != 0
+                        && !dedup.is_duplicate(&env)
                         && let Ok(text) = serde_json::to_string(&env)
                         && sender.send(Message::Text(text.into())).await.is_err()
                     {
@@ -611,5 +748,101 @@ mod tests {
         assert_eq!(v["body"]["outpoint_vout"], 3);
         assert_eq!(v["body"]["confirmed"], true);
         assert_eq!(v["cursor"]["height"], 101);
+    }
+
+    #[test]
+    fn firehose_query_builds_cursor_only_when_height_present() {
+        let q = FirehoseQuery {
+            categories: Some(2),
+            from_height: Some(800_000),
+            from_tx_index: 4,
+            from_mempool_seq: 99,
+            from_instance_id: 0xdead_beef,
+        };
+        assert_eq!(
+            q.cursor(),
+            Some(Cursor {
+                height: 800_000,
+                tx_index: 4,
+                mempool_seq: 99,
+                instance_id: 0xdead_beef,
+            })
+        );
+        let none = FirehoseQuery {
+            categories: None,
+            from_height: None,
+            from_tx_index: 0,
+            from_mempool_seq: 0,
+            from_instance_id: 0,
+        };
+        assert!(none.cursor().is_none(), "no from_height ⇒ no replay cursor");
+    }
+
+    fn stamp(seq: u64) -> node::events::EdgeStamp {
+        node::events::EdgeStamp {
+            node_id: [0; 16],
+            region: None,
+            edge_seen_at_ns: 0,
+            edge_wall_ns: 0,
+            seq,
+        }
+    }
+
+    fn block_hash(byte: u8) -> bitcoin::BlockHash {
+        use bitcoin::hashes::Hash;
+        bitcoin::BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+            [byte; 32],
+        ))
+    }
+
+    fn block_ev(height: u32, hash_byte: u8) -> node::events::NodeEvent {
+        node::events::NodeEvent::new(
+            stamp(0),
+            NodeEventBody::Chain(ChainEvent::BlockConnected {
+                hash: block_hash(hash_byte),
+                height,
+            }),
+        )
+    }
+
+    fn mempool_ev(seq: u64) -> node::events::NodeEvent {
+        use bitcoin::hashes::Hash;
+        use node::mempool::events::MempoolEvent;
+        node::events::NodeEvent::new(
+            stamp(seq),
+            NodeEventBody::Mempool(MempoolEvent::Enter {
+                txid: bitcoin::Txid::from_raw_hash(
+                    bitcoin::hashes::sha256d::Hash::from_byte_array([1; 32]),
+                ),
+                fee: 1,
+                vsize: 1,
+                fee_rate_sat_per_kvb: 1,
+                time: 1,
+            }),
+        )
+    }
+
+    #[test]
+    fn replay_dedup_drops_only_boundary_duplicates() {
+        let mut confirmed = std::collections::HashMap::new();
+        confirmed.insert(5u32, block_hash(0x55));
+        let dedup = ReplayDedup {
+            confirmed: Some(Arc::new(confirmed)),
+            mempool_through: Some(10),
+        };
+        // Confirmed: same (height, hash) = replayed duplicate → drop.
+        assert!(dedup.is_duplicate(&block_ev(5, 0x55)));
+        // Confirmed: same height, DIFFERENT hash (reorg replacement) → keep.
+        assert!(!dedup.is_duplicate(&block_ev(5, 0xEE)));
+        // Confirmed: a height not in the snapshot → keep.
+        assert!(!dedup.is_duplicate(&block_ev(6, 0x66)));
+        // Mempool: seq at/below the high-water → drop; above → keep.
+        assert!(dedup.is_duplicate(&mempool_ev(10)));
+        assert!(dedup.is_duplicate(&mempool_ev(3)));
+        assert!(!dedup.is_duplicate(&mempool_ev(11)));
+        // No replay engaged → never a duplicate.
+        let empty = ReplayDedup::default();
+        assert!(!empty.is_duplicate(&block_ev(5, 0x55)));
+        assert!(!empty.is_duplicate(&mempool_ev(1)));
     }
 }

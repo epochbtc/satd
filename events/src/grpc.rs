@@ -12,7 +12,6 @@
 //! Sinks must never panic. Per-client metrics (active subscribers,
 //! cumulative lag, dropped count) are deferred to a follow-up.
 
-use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -20,7 +19,6 @@ use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 
 use async_trait::async_trait;
-use bitcoin::BlockHash;
 use node::events::{EventSink, NodeEvent, NodeEventBody};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpListener;
@@ -32,14 +30,10 @@ use tonic::transport::server::Connected;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, info, warn};
 
-/// Upper bound on the confirmed-block span replayed for a single
-/// `from_cursor` subscription. A client resuming from a cursor more than this
-/// many blocks behind the tip has its replay window clamped to the most
-/// recent `MAX_REPLAY_BLOCKS` (logged); it should full-resync the older
-/// history out-of-band rather than stream the whole chain over the event
-/// channel. This bounds both the per-subscriber replay work and the
-/// boundary-dedup map built from the captured snapshot.
-const MAX_REPLAY_BLOCKS: u32 = 10_000;
+// The confirmed-block replay span cap is defined once in `node::events`
+// (shared by every streaming carrier); re-export the name into scope so the
+// handler and tests can refer to it unqualified.
+use node::events::MAX_REPLAY_BLOCKS;
 
 /// Admission limits for the events gRPC sink. `0` on either field disables
 /// that cap. Defaults mirror `satd`'s config defaults (64 / 256).
@@ -467,97 +461,33 @@ impl NodeEventStream for NodeEventStreamSvc {
         // height <= the snapshot tip are dropped (they were just replayed).
         // A `from_cursor` request with no block source falls back to
         // forward-only and logs.
-        let replay: Option<(Arc<HashMap<u32, BlockHash>>, Vec<pb::NodeEvent>, u64)> =
+        // Clamp, reorg-safety, instance-epoch handling, and the confirmed +
+        // mempool snapshot all live in the shared `build_cursor_replay` helper
+        // so every carrier (gRPC here, WS/SSE) behaves identically on the wire.
+        let replay: Option<node::events::CursorReplay> =
             match (req.from_cursor, self.block_source.as_ref()) {
-                (Some(cursor), Some(src)) => {
-                    let snapshot_tip = src.current_tip_height();
-                    let mut start = cursor.height.saturating_add(1);
-                    // Bound the confirmed replay span. A cursor far behind the
-                    // tip would otherwise stream the entire chain over the
-                    // event channel (a DoS amplification) and build an
-                    // unbounded boundary-dedup map. Clamp to the most recent
-                    // `MAX_REPLAY_BLOCKS`; replayed events carry their height
-                    // cursor, so a client can detect the resulting gap (first
-                    // replayed height > cursor + 1) and full-resync the rest.
-                    if snapshot_tip >= start && snapshot_tip - start + 1 > MAX_REPLAY_BLOCKS {
-                        let clamped = snapshot_tip - MAX_REPLAY_BLOCKS + 1;
-                        warn!(
-                            target: "events::grpc",
-                            requested_from = start,
-                            clamped_from = clamped,
-                            snapshot_tip,
-                            "from_cursor replay span exceeds MAX_REPLAY_BLOCKS; \
-                             clamping (client should full-resync earlier history)",
-                        );
-                        start = clamped;
-                    }
-                    // Capture a CONSISTENT snapshot of the confirmed range as
-                    // height→hash (gated on the chain category bit). Replay
-                    // emits exactly these hashes (so a reorg during replay
-                    // cannot tear the segment), and the live-side boundary
-                    // dedup compares against them by identity: a live
-                    // BlockConnected whose hash equals the captured hash at
-                    // that height is a true duplicate (it connected during the
-                    // subscribe→snapshot window) and is dropped, while a reorg
-                    // that replaces a block at height <= snapshot_tip yields a
-                    // DIFFERENT hash and is forwarded so the client's confirmed
-                    // view stays correct.
-                    let mut replayed: HashMap<u32, BlockHash> = HashMap::new();
-                    if category_mask & 2 != 0 {
-                        for h in start..=snapshot_tip {
-                            if let Some(hash) = src.block_hash_at(h) {
-                                replayed.insert(h, hash);
-                            }
-                        }
-                    }
-                    // Epoch check: a cursor's `mempool_seq` is only meaningful
-                    // within the publisher instance that issued it. If the
-                    // daemon restarted since the cursor was issued
-                    // (`instance_id` differs), the old watermark indexes a dead
-                    // `seq` space — discard it and replay the full retained
-                    // mempool window from this instance's epoch start. Confirmed
-                    // (height) replay above is durable and instance-independent.
-                    let mempool_since = if cursor.instance_id == self.publisher.instance_id() {
-                        cursor.mempool_seq
-                    } else {
-                        info!(
-                            target: "events::grpc",
-                            cursor_instance = cursor.instance_id,
-                            live_instance = self.publisher.instance_id(),
-                            "from_cursor instance mismatch (daemon restarted since cursor \
-                             issued); discarding stale mempool_seq, replaying full window",
-                        );
-                        0
+                (Some(c), Some(src)) => {
+                    let from = node::events::Cursor {
+                        height: c.height,
+                        tx_index: c.tx_index,
+                        mempool_seq: c.mempool_seq,
+                        instance_id: c.instance_id,
                     };
-                    // Best-effort mempool replay from the bounded publisher ring
-                    // (the mempool is not durable). Oldest-first; the highest
-                    // replayed seq is the live-side dedup boundary. Gated on the
-                    // mempool category bit so a chain-only subscription gets no
-                    // mempool replay.
-                    let mp: Vec<pb::NodeEvent> = if category_mask & 1 != 0 {
-                        self.publisher
-                            .replay_mempool_since(mempool_since)
-                            .iter()
-                            .map(envelope_to_proto)
-                            .collect()
-                    } else {
-                        Vec::new()
-                    };
-                    let mp_dedup_through = mp
-                        .last()
-                        .and_then(|e| e.stamp.as_ref())
-                        .map(|s| s.seq)
-                        .unwrap_or(0);
+                    let r = node::events::build_cursor_replay(
+                        src.as_ref(),
+                        &self.publisher,
+                        from,
+                        category_mask,
+                        MAX_REPLAY_BLOCKS,
+                    );
                     debug!(
                         target: "events::grpc",
-                        from_height = start,
-                        snapshot_tip,
-                        replayed_blocks = replayed.len(),
-                        mempool_replayed = mp.len(),
-                        mempool_since,
+                        replayed_events = r.events.len(),
+                        confirmed_blocks = r.confirmed_dedup.len(),
+                        mempool_dedup_through = r.mempool_dedup_through,
                         "events gRPC durable cursor replay (snapshot→live)",
                     );
-                    Some((Arc::new(replayed), mp, mp_dedup_through))
+                    Some(r)
                 }
                 (Some(_), None) => {
                     warn!(
@@ -576,11 +506,10 @@ impl NodeEventStream for NodeEventStreamSvc {
                     None
                 }
             };
-        let replayed_for_live = replay.as_ref().map(|(r, _, _)| r.clone());
+        let replayed_for_live = replay.as_ref().map(|r| Arc::new(r.confirmed_dedup.clone()));
         // Live mempool events at or below the highest replayed mempool seq
         // were just replayed from the ring — drop the live copy.
-        let drop_mempool_through = replay.as_ref().map(|(_, _, mp_seq)| *mp_seq);
-        let edge = *self.publisher.edge();
+        let drop_mempool_through = replay.as_ref().map(|r| r.mempool_dedup_through);
 
         // `sub_guard` is moved into the live stream closure so the
         // subscription slot is held for exactly as long as the (combined)
@@ -630,20 +559,14 @@ impl NodeEventStream for NodeEventStreamSvc {
         });
 
         let stream: Self::SubscribeStream = match replay {
-            Some((replayed, mp, _)) => {
-                // Confirmed replay first, from the captured consistent snapshot
-                // in height order (empty when the chain category was not
-                // requested). Each carries its `(height, 0)` cursor and a
-                // replay stamp (seq 0 — positioned by the durable cursor, not
-                // the volatile per-publisher seq). Then best-effort mempool
-                // replay (already proto, seq order), then the live stream.
-                let mut pairs: Vec<(u32, BlockHash)> =
-                    replayed.iter().map(|(h, hash)| (*h, *hash)).collect();
-                pairs.sort_unstable_by_key(|(h, _)| *h);
-                let block_replay = tokio_stream::iter(pairs)
-                    .map(move |(h, hash)| Ok(replay_event_from_hash(&edge, h, hash)));
-                let mp_replay = tokio_stream::iter(mp.into_iter().map(Ok));
-                Box::pin(block_replay.chain(mp_replay).chain(live))
+            Some(r) => {
+                // Replay events (confirmed BlockConnected in height order, then
+                // the best-effort mempool window) are built by the shared
+                // helper as `NodeEvent`s; convert each to proto and emit before
+                // joining the live stream.
+                let replay_events =
+                    tokio_stream::iter(r.events.into_iter().map(|e| Ok(envelope_to_proto(&e))));
+                Box::pin(replay_events.chain(live))
             }
             None => Box::pin(live),
         };
@@ -973,32 +896,6 @@ fn replay_stamp(edge: &node::events::EdgeIdentity) -> pb::EdgeStamp {
         edge_seen_at_ns: 0,
         edge_wall_ns: now_wall_ns(),
         seq: 0,
-    }
-}
-
-/// Synthesize a confirmed `BlockConnected` replay event for `height` from a
-/// captured snapshot `hash`, carrying its `(height, 0)` cursor.
-fn replay_event_from_hash(
-    edge: &node::events::EdgeIdentity,
-    height: u32,
-    hash: BlockHash,
-) -> pb::NodeEvent {
-    use bitcoin::hashes::Hash;
-    pb::NodeEvent {
-        schema_version: node::events::SCHEMA_VERSION,
-        stamp: Some(replay_stamp(edge)),
-        cursor: Some(pb::Cursor {
-            height,
-            tx_index: 0,
-            mempool_seq: 0,
-            instance_id: edge.instance_id,
-        }),
-        body: Some(pb::node_event::Body::Chain(pb::ChainEvent {
-            body: Some(pb::chain_event::Body::BlockConnected(pb::BlockConnected {
-                hash: hash.as_raw_hash().to_byte_array().to_vec(),
-                height,
-            })),
-        })),
     }
 }
 
@@ -1471,14 +1368,19 @@ mod tests {
         fn current_tip_height(&self) -> u32 {
             self.tip
         }
-        fn block_hash_at(&self, height: u32) -> Option<BlockHash> {
-            if height >= 1 && height <= self.tip {
-                Some(BlockHash::from_raw_hash(
-                    bitcoin::hashes::sha256d::Hash::from_byte_array([height as u8; 32]),
-                ))
-            } else {
-                None
-            }
+        fn active_chain_range(&self, from: u32, to: u32) -> Vec<(u32, BlockHash)> {
+            let hi = to.min(self.tip);
+            let lo = from.max(1);
+            (lo..=hi)
+                .map(|h| {
+                    (
+                        h,
+                        BlockHash::from_raw_hash(
+                            bitcoin::hashes::sha256d::Hash::from_byte_array([h as u8; 32]),
+                        ),
+                    )
+                })
+                .collect()
         }
     }
 

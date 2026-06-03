@@ -27,7 +27,7 @@ pub mod watch;
 
 pub use envelope::{Cursor, EdgeIdentity, EdgeStamp, NodeEvent, NodeEventBody};
 pub use publisher::{EventPublisher, ENVELOPE_BROADCAST_CAPACITY};
-pub use replay::BlockCursorSource;
+pub use replay::{build_cursor_replay, BlockCursorSource, CursorReplay, MAX_REPLAY_BLOCKS};
 pub use schema::SCHEMA_VERSION;
 pub use sink::EventSink;
 pub use watch::{
