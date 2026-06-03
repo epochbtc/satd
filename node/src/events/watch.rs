@@ -485,11 +485,32 @@ pub async fn run_watch_matcher(
                             );
                         }
                         if registry.has_watchers() {
-                            for h in from..=to {
-                                if let Some(hash) = chain.get_block_hash_by_height(h)
-                                    && let Some(block) = chain.get_block(&hash)
-                                {
-                                    registry.scan_block(&block, h);
+                            for (i, h) in (from..=to).enumerate() {
+                                // Honor shutdown promptly and yield periodically so a
+                                // large catch-up (up to max_resync_blocks, or unbounded
+                                // when the cap is disabled) cannot monopolize the API
+                                // runtime worker or stall graceful shutdown. Each read
+                                // is still non-blocking w.r.t. the consensus publisher.
+                                if *shutdown.borrow() {
+                                    break;
+                                }
+                                if i % 64 == 63 {
+                                    tokio::task::yield_now().await;
+                                }
+                                match chain.get_block_hash_by_height(h) {
+                                    Some(hash) => match chain.get_block(&hash) {
+                                        Some(block) => registry.scan_block(&block, h),
+                                        None => debug!(
+                                            target: "events::watch",
+                                            height = h,
+                                            "resync: block data unavailable (pruned?); skipping"
+                                        ),
+                                    },
+                                    None => debug!(
+                                        target: "events::watch",
+                                        height = h,
+                                        "resync: no block hash at height (pruned/reorg?); skipping"
+                                    ),
                                 }
                             }
                         }
