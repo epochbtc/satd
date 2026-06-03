@@ -1,17 +1,19 @@
-# satd Streaming Consumption API — Protocol Spec (DRAFT / WIP)
+# satd Streaming Consumption API — Protocol Spec
 
-> **Status: DRAFT — v1 implementation merged, pre-consumer-feedback.**
-> The §12 implementation sequence (the 7-PR stack #292–#298) **merged to `master`
-> on 2026-06-03**. This document captures the *design intent* for the Streaming
-> Consumption API described in [`ROADMAP.md` → "Streaming Consumption
-> API"](../../ROADMAP.md); the per-section **Shipped** callouts record where the
-> implementation deviated from the original draft, and §13 is the post-merge
-> follow-up roadmap (A/B/C). It remains a work-in-progress: the wire shapes are
-> still to be iterated against a real anchor consumer (per ROADMAP: *"prove the
-> shape with one anchor consumer before spec-and-evangelize"*). Nothing here is a
-> stability commitment yet — schema stays `v1` and all additions are additive, but
-> field numbers, message names, and error codes MAY still change before any `v1`
-> freeze.
+> **Status: v1 implemented — full substrate + follow-up roadmap merged, pre-consumer-feedback.**
+> The §12 implementation sequence (the 7-PR stack #292–#298) **and the entire §13
+> follow-up roadmap (A/B/C)** are merged to `master` (the A/B/C stack #304–#309
+> landed 2026-06-03). Every item in §13 except the deliberately-parked **A5** is
+> shipped, plus a **transaction-lifecycle + confirmation-depth** layer (§7.4) that
+> extends the original B2 txid watch. This document now describes the **shipped
+> surface**: the per-section **Shipped** callouts and §13's resolved status record
+> where the implementation landed relative to the original draft.
+>
+> It remains pre-consumer-feedback: the wire shapes are stable on `master` but not
+> yet frozen — schema stays `v1` and all additions are additive, but field numbers,
+> message names, and error codes MAY still change before a `v1` freeze, which waits
+> on a real anchor consumer (per ROADMAP: *"prove the shape with one anchor consumer
+> before spec-and-evangelize"*).
 >
 > The eventual goal is an **open, transport-agnostic protocol** that a bitcoind
 > sidecar (or another node) could also serve, with satd as the reference native
@@ -104,21 +106,37 @@ tolerates unknown bits.
 message NodeEvent {
   uint32    schema_version = 1;
   EdgeStamp stamp          = 2;
-  Cursor    cursor         = 3;   // NEW — set on confirmed-side bodies (§6)
+  Cursor    cursor         = 3;   // set on confirmed-side bodies (§6)
   oneof body {
     MempoolEvent  mempool      = 10;  // existing
-    ChainEvent    chain        = 11;  // existing
+    ChainEvent    chain        = 11;  // existing (carries reorg/disconnect — §8)
     Heartbeat     heartbeat    = 12;  // existing
-    OutpointSpent outpoint_spent = 13; // NEW (§7)
-    ScriptMatched script_matched = 14; // NEW (§7)
-    Reorg         reorg          = 15; // NEW (§8) — first-class, not inferred
+    OutpointSpent outpoint_spent             = 13; // watch match (§7)
+    ScriptMatched script_matched             = 14; // watch match (§7)
+    DescriptorNeedsAddresses descriptor_needs_addresses = 15; // reserved/deprecated (§11)
+    Lagged        lagged                     = 16; // in-band lag notice (§6.4)
+    TxidMatched   txid_matched               = 17; // txid lifecycle: seen/confirmed (§7.4)
+    TxidReplaced  txid_replaced              = 18; // txid lifecycle: RBF-replaced (§7.4)
+    TxidEvicted   txid_evicted               = 19; // txid lifecycle: policy eviction (§7.4)
+    TxidUnconfirmed txid_unconfirmed         = 20; // txid lifecycle: reorg rollback (§7.4)
+    TxidDepthReached txid_depth_reached      = 21; // depth alarm, single-shot (§7.4)
+    TxidFinalized txid_finalized             = 22; // lifecycle auto-close, terminal (§7.4)
   }
 }
 ```
 
+> **Shipped:** reorg did **not** become a separate body variant. It is carried on
+> the existing `ChainEvent` (`chain = 11`) as a first-class `Reorg` marker followed
+> by the per-block `BlockDisconnected`/`BlockConnected` sequence (§8), so a sidecar
+> still cannot reproduce it but no new top-level body was needed. Field `15`
+> (`DescriptorNeedsAddresses`) is reserved and **never emitted** (§11). Watch
+> matches (13/14, 17–22) flow on the per-subscriber `Watch` channel, not the
+> firehose, and are never bridged to ZMQ.
+
 `EdgeStamp` is unchanged (node_id, region, edge_seen_at_ns, edge_wall_ns, `seq`).
 `seq` remains **per-publisher and resets on restart** — it is the mempool-side
-replay watermark only, never a durable confirmed-side cursor (§6.2).
+replay watermark only, never a durable confirmed-side cursor (§6.2). The
+**per-process restart epoch** is carried in `Cursor.instance_id` (§6.1, A3).
 
 ## 6. Cursors & replay
 
@@ -132,31 +150,42 @@ Esplora's per-address pagination.
 ```proto
 message Cursor {
   uint32 height      = 1;  // confirmed: block height of the last delivered item
-  uint32 tx_index    = 2;  // confirmed: index within that block of the last delivered tx
+  uint32 tx_index    = 2;  // confirmed: index within that block (reserved, always 0 — A5)
   uint64 mempool_seq = 3;  // best-effort mempool high-water (advisory; resets on restart)
+  uint64 instance_id = 4;  // per-PROCESS restart epoch (A3) — JSON-encoded as a string
 }
 ```
 
-Confirmed-side cursors are durable `(height, tx_index)` — **per-transaction**,
-not per-block. Per-tx granularity lets a client resume *mid-block* after a
-disconnect, which matters for large blocks; it is nearly free because replay
-already indexes into `block.transactions[]`. A client persists the `cursor` from
-the last `NodeEvent` it durably processed and presents it on reconnect.
+Confirmed-side cursors are durable `(height, tx_index)` — designed for
+**per-transaction** granularity so a client can resume *mid-block* after a
+disconnect. A client persists the `cursor` from the last `NodeEvent` it durably
+processed and presents it on reconnect.
 
-> **Shipped (as of #292):** the `Cursor` wire field is present but resume is
-> **block-granular today** — `tx_index` is reserved and always `0`, because the
-> only confirmed-side event is one `BlockConnected` per block. Per-tx resume
-> activates once per-tx confirmed events exist; see §13 item **A5** (parked).
+> **Shipped:** resume is **block-granular** — `tx_index` is reserved and always
+> `0`, because the only confirmed-side event is one `BlockConnected` per block.
+> Per-tx resume activates once per-tx confirmed events exist; see §13 item **A5**
+> (parked).
+>
+> **Shipped (A3):** `instance_id` is a **per-process** random `u64` minted once at
+> startup (NOT the persisted-stable `node_id`, which cannot detect a same-node
+> restart). A resume cursor whose `instance_id` differs from the live publisher's
+> signals a daemon restart — the server resets the mempool watermark to replay the
+> full ring while confirmed/height replay stays durable. In JSON (WS/SSE) it is
+> serialized as a **decimal string** so a 64-bit value survives JS `Number`.
 
 ### 6.2 Replay semantics
 
 A client resumes by sending a cursor (§6.3 `SetCursor`). The server:
 
-1. **Confirmed replay** — walks the block index forward from the cursor:
-   `get_block_hash_by_height(h)` → `get_block(hash)` →
-   `block.transactions[tx_index+1 ..]`, continuing `height → tip`, emitting only
-   transactions that match the subscription watch-set (§7). No extra log or index
-   is needed — the block store *is* the durable event source.
+1. **Confirmed replay** — walks the **active chain back from the tip** to resolve
+   the hash at each height in `(cursor.height, tip]`, then `get_block(hash)`,
+   emitting the confirmed events. **Shipped correction:** replay does NOT use
+   `get_block_hash_by_height` (the pollutable best-known-at-height index, which a
+   header-first / side-chain `store_block` can clobber — a false-confirmation
+   hazard); it uses `active_chain_range`, walking `prev_blockhash` back from the
+   tip once (O(span)). No extra log or index is needed — the block store *is* the
+   durable event source — and the span is capped at `MAX_REPLAY_BLOCKS` (10 000) on
+   every carrier.
 2. **Snapshot → live handoff** — before replay begins, the server captures the
    current live tip + `seq` watermark. It replays confirmed history up to that
    watermark, then seamlessly drains the live broadcast from the captured point.
@@ -174,6 +203,30 @@ emits a `Reorg`, §8), the cursor is **stale**. The server re-anchors: it emits 
 `Reorg` describing the fork point, then replays forward from the new common
 ancestor. Clients MUST be prepared to receive `BlockDisconnected` / `Reorg`
 during replay and roll back their own state accordingly.
+
+> **Shipped:** the replay→live handoff de-duplicates **confirmed events by
+> `(height, hash)` identity** — so a reorg at the seam forwards the replacement
+> block (different hash at the same height) rather than dropping it as a duplicate
+> or emitting it twice — and mempool events by `seq` high-water. Reorg-safe by
+> construction.
+
+### 6.4 In-band lag signal *(shipped — A1)*
+
+A subscriber that falls behind the bounded broadcast buffer would otherwise
+silently lose events. Instead, every carrier (gRPC `Subscribe` + `Watch`, WS, SSE)
+emits an in-band `Lagged { dropped_count, resume_cursor }`:
+
+```proto
+message Lagged { uint64 dropped_count = 1; Cursor resume_cursor = 2; }
+```
+
+The notice **bypasses the category filter** (its `category_bit` is `u32::MAX`), so
+a `SetCategories` mask cannot suppress it. `resume_cursor` is the last-delivered
+position (seeded from the replay tail, or the current chain tip on the replay-less
+Watch firehose), so the client immediately re-issues `Subscribe(from_cursor)` to
+backfill. The server stays drop-on-lag and never backpressures the publisher (§10);
+the client owns the resync. ZMQ keeps Core's behavior (gaps detectable via the
+per-topic sequence) and does not carry `Lagged`.
 
 ## 7. Watch-set subscriptions (the live notifier)
 
@@ -221,15 +274,16 @@ message ScriptMatched {       // address-watching = outpoint-watching + a deriva
 }
 ```
 
-`AddTransactions` (§7.3) emits the existing `MempoolEvent` / `ChainEvent` bodies
-for the watched txids (confirmation tracking) — no new body type needed there.
+`AddTransactions` (§7.3, §7.4) drives a dedicated txid **lifecycle + depth** layer
+with its own match bodies (`TxidMatched` / `TxidReplaced` / `TxidEvicted` /
+`TxidUnconfirmed` / `TxidDepthReached` / `TxidFinalized`), not the firehose bodies.
 
-> **Shipped (as of #294/#295):** `OutpointSpent` (input side) and `ScriptMatched`
-> (output/funding side) are live. `ScriptMatched.is_output` is **always `true`
-> today** — input-side *script* matching is deferred (§13 item **B1**), because
-> the spending tx does not carry the prevout's `scriptPubKey`. Clients get spend
-> coverage for free by watching the funding **outpoint**, which `OutpointSpent`
-> fully detects.
+> **Shipped:** `OutpointSpent` (input side) and `ScriptMatched` (both sides) are
+> live. **B1 shipped:** input-side *script* matching now works —
+> `ScriptMatched.is_output` is `false` for a spend, recovered from the connected
+> block's **undo data** (`Store::get_undo` → `spent_coins[i].script_pubkey`), since
+> the spending tx alone does not carry the prevout's `scriptPubKey`. Unconfirmed
+> spends are still tracked by watching the funding **outpoint**.
 
 ### 7.3 Bidi control channel *(decided: bidi, tagged-union)*
 
@@ -244,14 +298,15 @@ service NodeEventStream {
 
 message SubscribeControl {
   oneof msg {
-    SetCursor       set_cursor       = 1;  // §6 resume; supersedes the since_seq punt
+    SetCursor       set_cursor       = 1;  // §6 resume (Subscribe open-time; Watch mid-stream = no-op)
     SetCategories   set_categories   = 2;  // firehose category filter (mempool/chain/heartbeat)
     AddScripts      add_scripts      = 3;
     RemoveScripts   remove_scripts   = 4;
     AddOutpoints    add_outpoints    = 5;
     RemoveOutpoints remove_outpoints = 6;
-    AddTransactions add_transactions = 7;
-    // AddDescriptor (§11) slots in here later without protocol breakage
+    AddDescriptor   add_descriptor   = 7;  // §11 (client-managed window — B3)
+    AddTransactions    add_transactions    = 8;  // txid lifecycle + depth (§7.4)
+    RemoveTransactions remove_transactions = 9;
   }
 }
 
@@ -259,7 +314,11 @@ message AddScripts       { repeated bytes scripthashes = 1; }
 message RemoveScripts    { repeated bytes scripthashes = 1; }
 message AddOutpoints     { repeated Outpoint outpoints = 1; }
 message RemoveOutpoints  { repeated Outpoint outpoints = 1; }
-message AddTransactions  { repeated bytes txids = 1; }
+// txids: empty min_depths ⇒ lifecycle watch(es) per txid (§7.4); non-empty ⇒ one
+// single-shot depth alarm per (txid × depth). auto_close_depth (0=off) self-evicts
+// the lifecycle watch once buried that deep. min_depths is a repeated list.
+message AddTransactions    { repeated bytes txids = 1; repeated uint32 min_depths = 2; uint32 auto_close_depth = 3; }
+message RemoveTransactions { repeated bytes txids = 1; repeated uint32 min_depths = 2; }
 message Outpoint         { bytes txid = 1; uint32 vout = 2; }
 ```
 
@@ -271,14 +330,56 @@ The legacy server-streaming firehose (categories + `since_seq`) remains availabl
 as a degenerate case: a client that sends only `SetCategories` and never a watch
 add gets exactly today's behavior.
 
-> **Shipped (as of #295):** rather than mutate the existing `Subscribe` server-
-> stream in place, a **new** `rpc Watch(stream SubscribeControl)` was added
-> alongside the unchanged `Subscribe` firehose (a non-breaking refinement).
-> Shipped control arms: `SetCursor` (accepted but **not yet served** on the Watch
-> stream — use `Subscribe(from_cursor)` for replay; §13 item **A4**),
+> **Shipped:** rather than mutate the existing `Subscribe` server-stream in place,
+> a **new** `rpc Watch(stream SubscribeControl)` was added alongside the unchanged
+> `Subscribe` firehose (a non-breaking refinement). All control arms are live:
 > `SetCategories`, `AddScripts`/`RemoveScripts`, `AddOutpoints`/`RemoveOutpoints`,
-> and `AddDescriptor` (§11). **`AddTransactions` did not ship** — it is deferred
-> to §13 item **B2**.
+> `AddDescriptor` (§11), and `AddTransactions`/`RemoveTransactions` (§7.4, B2 +
+> lifecycle/depth). `SetCursor` is served at **`Subscribe` open-time** (durable
+> replay, §6.2) and at WS/SSE connect via `?from_cursor=`; **mid-stream `SetCursor`
+> on the bidi `Watch` is a documented no-op** (replay into an already-live stream is
+> ill-defined — reconnect with `from_cursor` instead; §13 **A4**). Depth-alarm
+> control messages are size-bounded before allocation: the `txids × min_depths`
+> cross-product is rejected if it would exceed a per-message cap, so a malformed or
+> oversized add/remove cannot OOM the daemon.
+
+### 7.4 Transaction lifecycle & confirmation-depth watches *(shipped — B2 + extension)*
+
+`AddTransactions` registers, over the same `by_txid` index, **two decoupled
+primitives** selected by `min_depths`:
+
+```proto
+message TxidMatched     { bytes txid = 1; bool confirmed = 2; uint32 height = 3; }
+message TxidReplaced    { bytes txid = 1; bytes replacing_txid = 2; }        // RBF
+message TxidEvicted     { bytes txid = 1; string reason = 2; }               // full_pool|expiry|block_conflict
+message TxidUnconfirmed { bytes txid = 1; uint32 prev_height = 2; }          // reorg rollback
+message TxidDepthReached{ bytes txid = 1; uint32 depth = 2; uint32 height = 3; } // single-shot alarm
+message TxidFinalized   { bytes txid = 1; uint32 depth = 2; uint32 height = 3; } // lifecycle auto-close
+```
+
+- **Lifecycle watch** (`min_depths` empty) — one persistent watch per txid that
+  narrates the transaction's full lifecycle: **seen** (mempool) → **confirmed**
+  (block) via `TxidMatched`, then `TxidReplaced` (RBF, with the replacing txid),
+  `TxidEvicted` (mempool policy), and `TxidUnconfirmed` (a reorg rolled back its
+  confirming block). An optional `auto_close_depth ≥ 1` makes the watch emit a
+  terminal `TxidFinalized` and **self-evict** once the tx is that many
+  confirmations deep — the only server-side self-clean (no state is truly
+  terminal: a reorg un-confirms, a re-broadcast revives an evicted tx).
+- **Depth alarm** (`min_depths` non-empty) — single-shot triggers keyed
+  `(txid, depth)`: `TxidDepthReached` fires the moment the tx reaches `depth`
+  confirmations, then self-evicts. `min_depths` is a list, so one message arms
+  several thresholds (e.g. `[1, 6]`); each charges one quota unit per pair.
+
+Both are **reorg-safe**: depth tracking anchors on the confirming `(height, hash)`
+and re-checks it against the active chain on every block (via the same tip-walk as
+replay, never the pollutable height index) — a confirming block reorged off the
+active chain reverts the entry, which re-arms if the tx reappears. A tx already
+buried when the watch is registered is resolved best-effort via the txindex. Single-
+shot eviction is **registry-authoritative on fire** (the entry is torn down server-
+side so it cannot re-fire even if its txid reappears, and its counters are freed
+regardless of whether the terminal match reached a lagging client; the carrier then
+releases the quota lease). `LeaveConfirmed` is intentionally not used for the
+confirmed leg — block scanning covers txs that were never in this node's mempool.
 
 ## 8. Reorg events
 
@@ -305,19 +406,25 @@ auth surface**.
 | Action | Required capability | Quota |
 |---|---|---|
 | Open `Subscribe`; receive firehose (categories) | `stream:subscribe` | — |
-| `AddScripts` / `AddOutpoints` / `AddTransactions` | `stream:watch` | per-token watch quota |
-| `Remove*` | — | (today) releases only on disconnect — see §13 **C1** |
+| `AddScripts` / `AddOutpoints` / `AddTransactions` / `AddDescriptor` | `stream:watch` | per-token watch quota + per-add rate limit (C4) |
+| `Remove*` | — | per-item release (C1) — returns units immediately |
 
 Each watch *item* acquires a `WatchLease` (the RAII type from the watch-quota
 work) via `Principal::acquire_watch(n)`, gated on `stream:watch` and the
 per-token quota.
 
-> **Shipped (as of #295):** leases are held in a subscription-scoped
-> `Arc<Mutex<Vec<WatchLease>>>` and released **on disconnect** (RAII drop). Per-
-> `Remove*` release is **not yet wired** (§13 item **C1**) — and quota dedup is
-> **intra-message only**, so re-asserting the same item across two messages is
-> double-charged (§13 item **C2**). Both matter because the §11 descriptor
-> sliding-window UX rotates watches without disconnecting.
+> **Shipped:** leases are tracked **per watch item** in a subscription-scoped
+> `WatchSet` (behind `Arc<Mutex<…>>`), so **`Remove*` releases exactly that item's
+> unit immediately** (C1) — what makes a long-lived client rotating a descriptor
+> window viable. Quota dedup is **cross-message** (C2): re-asserting an item the
+> subscription already holds is charged once. A **per-add rate limit** (C4) bounds
+> the rate of effective (net-new) watch-adds via the per-principal token bucket,
+> shed without tearing down the connection. The `WatchSet` is subscription-scoped
+> (not control-stream-scoped) so an HTTP/2 half-close cannot release quota while
+> watches stay live. A **depth alarm** charges one unit per `(txid, depth)` pair; a
+> lifecycle watch's `auto_close_depth` rides free (no extra unit). Single-shot
+> alarms/auto-close release their unit on fire; a terminal match dropped to a full
+> channel holds it until disconnect (bounded by the connection + quota).
 
 ### 9.1 Quota unit *(decided: N items = N units)*
 
@@ -404,13 +511,31 @@ to support.
 > the post-merge backlog; the per-section **Shipped** callouts above record where
 > the implementation deviated from this draft.
 
-## 13. Post-merge follow-up roadmap (A / B / C)
+## 13. Post-merge follow-up roadmap (A / B / C) — **shipped**
 
-The merged stack is a correct, bounded **live** firehose + watch surface. The
-follow-ups group into three themes: **resumability under loss (A)**, **match
-completeness (B)**, and **fair multi-tenant accounting (C)**. None touch the
-consensus path — the §10 publish-only invariant holds throughout. Items are
-tagged with locked decisions (owner sign-off, 2026-06-02).
+The follow-ups grouped into three themes: **resumability under loss (A)**, **match
+completeness (B)**, and **fair multi-tenant accounting (C)**. **All are now merged**
+(stack #304–#309, 2026-06-03) except **A5** (parked, no consumer). None touched the
+consensus path — the §10 publish-only invariant held throughout. Status:
+
+| Item | What | Shipped via |
+|---|---|---|
+| **A1** | In-band `Lagged` + resume cursor (all carriers) | #306 (§6.4) |
+| **A2** | Matcher lag resync (`streammaxresyncblocks`) | merged in substrate hardening |
+| **A3** | Per-process `instance_id` restart epoch | #304 (§6.1) |
+| **A4** | WS/SSE durable `from_cursor` replay + reorg-safe `active_chain_range` | #305 (§6.2) |
+| **A5** | Per-tx cursor granularity | **parked** (no consumer; `tx_index` reserved) |
+| **B1** | Input-side script matching (via undo data) | substrate (§7.2) |
+| **B2** | `AddTransactions` txid watch | #307, extended by #309 (§7.4) |
+| **B3** | Client-managed descriptor window (`start`) | substrate (§11) |
+| **C1** | Per-remove quota release | substrate (§9) |
+| **C2** | Cross-message dedup | substrate (§9) |
+| **C3** | Operator-configurable WS caps | #308 (§3.1, below) |
+| **C4** | Per-watch-add rate limiting | substrate (§9) |
+| **+** | Txid **lifecycle + depth alarms + auto-close** (beyond B2) | #309 (§7.4) |
+
+The detailed item descriptions below are retained as the design record (the
+decisions, with owner sign-off 2026-06-02, that the implementation followed).
 
 ### A. Replay & cursor completeness
 
@@ -471,10 +596,10 @@ tagged with locked decisions (owner sign-off, 2026-06-02).
   two messages is double-charged. Dedup adds against the live watch-set, charging
   only for net-new items. **Build C1 + C2 together** — they share the per-item
   lease-tracking refactor.
-- **C3 — operator-configurable WS caps.** `WS_MAX_CONNS` (256), message size
-  (256 KiB), ping/idle are hardcoded; gRPC already exposes its caps as config. Add
-  `streamwsmaxconns` (+ `streamwsmaxsubscriptions`, `streamwsmaxmessagebytes`)
-  mirroring `eventsgrpcmaxconns`, `restart!`-classified.
+- **C3 — operator-configurable WS caps.** *(Shipped #308.)* `streamwsmaxconns`
+  (256), `streamwsmaxsubscriptions` (256, per-connection watch-set cap),
+  `streamwsmaxmessagebytes` (262144) — all `restart!`-classified, mirroring
+  `eventsgrpcmaxconns`; `0` = unlimited on each.
 - **C4 — per-watch-add rate limiting.** **Decision: build it.** The per-principal
   token bucket exists but is consulted only at admission (Subscribe / connection
   upgrade), not on the control/add path; a connected client can spam `AddOutpoints`
@@ -482,19 +607,21 @@ tagged with locked decisions (owner sign-off, 2026-06-02).
   over-budget adds (`RESOURCE_EXHAUSTED` / WS control error) without dropping the
   connection.
 
-### Dependencies & recommended first slice
+### Implementation order (as shipped)
+
+The dependency structure that drove the merge order:
 
 ```
 B3 ──needs──▶ C1 ──shares refactor──▶ C2
-A1 ──shares wire shape──▶ A4
-A2 is standalone and highest correctness value
+A1 ──shares wire shape──▶ A4 ──needs──▶ A3 (cursor epoch)
+A2 standalone (highest correctness value)
+B2 ──extended by──▶ txid lifecycle + depth alarms (§7.4)
 ```
 
-**Recommended first slice** (mutually reinforcing): **A2 → (C1+C2) → B3.** That
-trio closes the one real silent-data-loss hole (A2), the one real quota-fairness
-bug (C1/C2), and ships the agreed client-managed-window design (B3). **B1** (input-
-side via undo data) and **C4** (per-add rate limit) form a self-contained second
-slice.
+The substrate-hardening slice (A2, B1, B3, C1, C2, C4) landed first; the A/B/C
+completion stack then merged bottom-up as **A3 (#304) → A4 (#305) → A1 (#306) →
+B2 (#307) → C3 (#308) → lifecycle/depth (#309)**, each independently and
+adversarially reviewed before merge.
 
 ## 14. Open questions (to iterate with consumer feedback)
 
@@ -513,7 +640,9 @@ slice.
 
 ---
 
-*This is a living draft. Update it alongside the implementation PRs (§12) and
-revise the wire shapes as the anchor consumer's feedback lands. Cross-reference:
-[`ROADMAP.md`](../../ROADMAP.md) (strategic framing),
-[`docs/api/esplora.md`](./esplora.md) (the surface this consolidates beyond).*
+*This spec tracks the shipped implementation on `master` (substrate #292–#298 +
+the A/B/C completion stack #304–#309). It stays a living document: revise the wire
+shapes as the anchor consumer's feedback lands, ahead of any `v1` freeze.
+Cross-reference: [`ROADMAP.md`](../../ROADMAP.md) (strategic framing),
+[`docs/api/esplora.md`](./esplora.md) (the surface this consolidates beyond),
+[`CHANGELOG.md`](../../CHANGELOG.md) (the user-facing summary).*
