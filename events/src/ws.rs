@@ -584,6 +584,24 @@ async fn ws_conn(
             },
             m = rx_match.recv() => match m {
                 Some(wm) => {
+                    // Single-shot terminal matches self-evict: release the quota
+                    // lease and deregister the spent watch (the registry already
+                    // de-armed it). Keyed by the threshold the match carries.
+                    match &wm {
+                        WatchMatch::TxidDepthReached { txid, depth, .. } => {
+                            let mut ws = watch_set.lock().unwrap_or_else(|p| p.into_inner());
+                            ws.remove_tx_depths([(*txid, *depth)], |items| {
+                                handle.remove_tx_depths(items);
+                            });
+                        }
+                        WatchMatch::TxidFinalized { txid, .. } => {
+                            let mut ws = watch_set.lock().unwrap_or_else(|p| p.into_inner());
+                            ws.remove_transactions([*txid], |txids| {
+                                handle.remove_txids(txids);
+                            });
+                        }
+                        _ => {}
+                    }
                     let text = watch_match_json(&wm).to_string();
                     if sender.send(Message::Text(text.into())).await.is_err() {
                         break;
@@ -614,10 +632,25 @@ enum WsControl {
     AddScripts { scripthashes: Vec<String> },
     /// Remove scripthashes from the watch-set.
     RemoveScripts { scripthashes: Vec<String> },
-    /// Add transaction ids (display/reversed hex) to the watch-set.
-    AddTransactions { txids: Vec<String> },
-    /// Remove transaction ids from the watch-set.
-    RemoveTransactions { txids: Vec<String> },
+    /// Add transaction ids (display/reversed hex) to the watch-set. With
+    /// `min_depths` empty, registers a lifecycle watch per txid (optionally
+    /// self-closing at `auto_close_depth`); with `min_depths` non-empty,
+    /// registers a single-shot depth alarm per (txid × depth).
+    AddTransactions {
+        txids: Vec<String>,
+        #[serde(default)]
+        min_depths: Vec<u32>,
+        #[serde(default)]
+        auto_close_depth: u32,
+    },
+    /// Remove transaction ids from the watch-set. Mirrors AddTransactions:
+    /// empty `min_depths` removes the lifecycle watch(es); non-empty removes
+    /// those depth alarms.
+    RemoveTransactions {
+        txids: Vec<String>,
+        #[serde(default)]
+        min_depths: Vec<u32>,
+    },
     /// Expand a descriptor (rust-miniscript) into a script watch-set.
     AddDescriptor {
         descriptor: String,
@@ -732,19 +765,43 @@ fn apply_ws_control(
                 },
             );
         }
-        WsControl::AddTransactions { txids } => {
-            watch_set.add_transactions(
-                principal,
-                txids.iter().filter_map(|s| parse_ws_txid(s)),
-                |txids| {
-                    handle.add_txids(txids);
-                },
-            );
+        WsControl::AddTransactions {
+            txids,
+            min_depths,
+            auto_close_depth,
+        } => {
+            let parsed: Vec<bitcoin::Txid> = txids.iter().filter_map(|s| parse_ws_txid(s)).collect();
+            let depths: Vec<u32> = min_depths.iter().copied().filter(|d| *d >= 1).collect();
+            if depths.is_empty() {
+                watch_set.add_transactions(principal, parsed, |txids| {
+                    handle.add_txids(txids, auto_close_depth);
+                });
+            } else {
+                let pairs: Vec<(bitcoin::Txid, u32)> = parsed
+                    .iter()
+                    .flat_map(|t| depths.iter().map(move |d| (*t, *d)))
+                    .collect();
+                watch_set.add_tx_depths(principal, pairs, |items| {
+                    handle.add_tx_depths(items);
+                });
+            }
         }
-        WsControl::RemoveTransactions { txids } => {
-            watch_set.remove_transactions(txids.iter().filter_map(|s| parse_ws_txid(s)), |txids| {
-                handle.remove_txids(txids);
-            });
+        WsControl::RemoveTransactions { txids, min_depths } => {
+            let parsed: Vec<bitcoin::Txid> = txids.iter().filter_map(|s| parse_ws_txid(s)).collect();
+            let depths: Vec<u32> = min_depths.iter().copied().filter(|d| *d >= 1).collect();
+            if depths.is_empty() {
+                watch_set.remove_transactions(parsed, |txids| {
+                    handle.remove_txids(txids);
+                });
+            } else {
+                let pairs: Vec<(bitcoin::Txid, u32)> = parsed
+                    .iter()
+                    .flat_map(|t| depths.iter().map(move |d| (*t, *d)))
+                    .collect();
+                watch_set.remove_tx_depths(pairs, |items| {
+                    handle.remove_tx_depths(items);
+                });
+            }
         }
         WsControl::AddDescriptor {
             descriptor,
@@ -824,6 +881,64 @@ fn watch_match_json(m: &WatchMatch) -> serde_json::Value {
                 "confirmed": confirmed,
             }
         }),
+        WatchMatch::TxidReplaced {
+            txid,
+            replacing_txid,
+        } => json!({
+            "schema_version": node::events::SCHEMA_VERSION,
+            "cursor": serde_json::Value::Null,
+            "body": {
+                "category": "txid_replaced",
+                "txid": hex::encode(txid.as_raw_hash().to_byte_array()),
+                "replacing_txid": hex::encode(replacing_txid.as_raw_hash().to_byte_array()),
+            }
+        }),
+        WatchMatch::TxidEvicted { txid, reason } => json!({
+            "schema_version": node::events::SCHEMA_VERSION,
+            "cursor": serde_json::Value::Null,
+            "body": {
+                "category": "txid_evicted",
+                "txid": hex::encode(txid.as_raw_hash().to_byte_array()),
+                "reason": reason.as_str(),
+            }
+        }),
+        WatchMatch::TxidUnconfirmed { txid, prev_height } => json!({
+            "schema_version": node::events::SCHEMA_VERSION,
+            "cursor": serde_json::Value::Null,
+            "body": {
+                "category": "txid_unconfirmed",
+                "txid": hex::encode(txid.as_raw_hash().to_byte_array()),
+                "prev_height": prev_height,
+            }
+        }),
+        WatchMatch::TxidDepthReached {
+            txid,
+            depth,
+            height,
+        } => json!({
+            "schema_version": node::events::SCHEMA_VERSION,
+            "cursor": json!({ "height": height, "tx_index": 0, "mempool_seq": 0 }),
+            "body": {
+                "category": "txid_depth_reached",
+                "txid": hex::encode(txid.as_raw_hash().to_byte_array()),
+                "depth": depth,
+                "height": height,
+            }
+        }),
+        WatchMatch::TxidFinalized {
+            txid,
+            depth,
+            height,
+        } => json!({
+            "schema_version": node::events::SCHEMA_VERSION,
+            "cursor": json!({ "height": height, "tx_index": 0, "mempool_seq": 0 }),
+            "body": {
+                "category": "txid_finalized",
+                "txid": hex::encode(txid.as_raw_hash().to_byte_array()),
+                "depth": depth,
+                "height": height,
+            }
+        }),
     }
 }
 
@@ -863,7 +978,36 @@ mod tests {
         let c: WsControl =
             serde_json::from_str(r#"{"type":"add_transactions","txids":["aa","bb"]}"#).unwrap();
         match c {
-            WsControl::AddTransactions { txids } => assert_eq!(txids.len(), 2),
+            WsControl::AddTransactions {
+                txids,
+                min_depths,
+                auto_close_depth,
+            } => {
+                assert_eq!(txids.len(), 2);
+                assert!(min_depths.is_empty(), "min_depths defaults empty");
+                assert_eq!(auto_close_depth, 0, "auto_close_depth defaults 0");
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        // Depth-alarm form: min_depths drives the depth alarms; auto_close on the
+        // lifecycle form.
+        let c: WsControl = serde_json::from_str(
+            r#"{"type":"add_transactions","txids":["aa"],"min_depths":[1,3]}"#,
+        )
+        .unwrap();
+        match c {
+            WsControl::AddTransactions { min_depths, .. } => assert_eq!(min_depths, vec![1, 3]),
+            _ => panic!("wrong variant"),
+        }
+        let c: WsControl = serde_json::from_str(
+            r#"{"type":"add_transactions","txids":["aa"],"auto_close_depth":6}"#,
+        )
+        .unwrap();
+        match c {
+            WsControl::AddTransactions {
+                auto_close_depth, ..
+            } => assert_eq!(auto_close_depth, 6),
             _ => panic!("wrong variant"),
         }
     }
@@ -915,6 +1059,74 @@ mod tests {
         assert_eq!(v["body"]["confirmed"], true);
         assert_eq!(v["body"]["txid"], "cd".repeat(32));
         assert_eq!(v["cursor"]["height"], 202);
+    }
+
+    #[test]
+    fn lifecycle_and_depth_json_shapes() {
+        use bitcoin::hashes::Hash;
+        let txid =
+            bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0x11; 32]));
+        let rep =
+            bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0x22; 32]));
+
+        let v = watch_match_json(&WatchMatch::TxidReplaced {
+            txid,
+            replacing_txid: rep,
+        });
+        assert_eq!(v["body"]["category"], "txid_replaced");
+        assert_eq!(v["body"]["replacing_txid"], "22".repeat(32));
+        assert!(v["cursor"].is_null(), "replaced carries no cursor");
+
+        let v = watch_match_json(&WatchMatch::TxidEvicted {
+            txid,
+            reason: node::mempool::events::EvictReason::BlockConflict,
+        });
+        assert_eq!(v["body"]["category"], "txid_evicted");
+        assert_eq!(v["body"]["reason"], "block_conflict");
+
+        let v = watch_match_json(&WatchMatch::TxidUnconfirmed {
+            txid,
+            prev_height: 814_000,
+        });
+        assert_eq!(v["body"]["category"], "txid_unconfirmed");
+        assert_eq!(v["body"]["prev_height"], 814_000);
+
+        let v = watch_match_json(&WatchMatch::TxidDepthReached {
+            txid,
+            depth: 3,
+            height: 100,
+        });
+        assert_eq!(v["body"]["category"], "txid_depth_reached");
+        assert_eq!(v["body"]["depth"], 3);
+        assert_eq!(v["cursor"]["height"], 100);
+
+        let v = watch_match_json(&WatchMatch::TxidFinalized {
+            txid,
+            depth: 6,
+            height: 100,
+        });
+        assert_eq!(v["body"]["category"], "txid_finalized");
+        assert_eq!(v["body"]["depth"], 6);
+        assert_eq!(v["cursor"]["height"], 100);
+    }
+
+    #[test]
+    fn depth_alarm_add_charges_per_pair_via_control() {
+        let reg = std::sync::Arc::new(node::events::WatchRegistry::new());
+        let (handle, _rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let mask = AtomicU32::new(u32::MAX);
+        let mut ws = WatchSet::default();
+        let txid = "11".repeat(32);
+        // min_depths [1,3] on one txid → two distinct alarm items.
+        let ctrl = format!(
+            r#"{{"type":"add_transactions","txids":["{txid}"],"min_depths":[1,3]}}"#
+        );
+        apply_ws_control(&ctrl, &handle, None, &mask, &mut ws, 0);
+        assert_eq!(ws.len(), 2, "(X,1) and (X,3) are two items");
+        // Lifecycle add (no depths) is one item.
+        let ctrl = format!(r#"{{"type":"add_transactions","txids":["{txid}"]}}"#);
+        apply_ws_control(&ctrl, &handle, None, &mask, &mut ws, 0);
+        assert_eq!(ws.len(), 3, "lifecycle watch adds one more item");
     }
 
     #[test]

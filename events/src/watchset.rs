@@ -46,7 +46,12 @@ type Scripthash = [u8; 32];
 pub(crate) struct WatchSet {
     outpoints: HashMap<OutPoint, Option<satd_auth::WatchLease>>,
     scripts: HashMap<Scripthash, Option<satd_auth::WatchLease>>,
+    /// Lifecycle watches (one quota unit per txid). An `auto_close_depth` rides
+    /// on the lifecycle watch server-side and is NOT a separate charged item.
     txids: HashMap<Txid, Option<satd_auth::WatchLease>>,
+    /// Single-shot depth alarms, keyed `(txid, depth)` — one quota unit per
+    /// pair, so an alarm on the same txid at two depths charges two units.
+    tx_depths: HashMap<(Txid, u32), Option<satd_auth::WatchLease>>,
 }
 
 impl WatchSet {
@@ -111,10 +116,30 @@ impl WatchSet {
         remove_items(&mut self.txids, incoming, unregister);
     }
 
+    /// Add depth alarms keyed `(txid, depth)`, charging one unit per net-new
+    /// pair. All-or-nothing per call, like the other add paths.
+    pub(crate) fn add_tx_depths(
+        &mut self,
+        principal: Option<&satd_auth::Principal>,
+        incoming: impl IntoIterator<Item = (Txid, u32)>,
+        register: impl FnOnce(&[(Txid, u32)]),
+    ) {
+        add_items(&mut self.tx_depths, principal, incoming, "tx_depths", register);
+    }
+
+    /// Remove depth alarms, releasing each removed pair's quota unit.
+    pub(crate) fn remove_tx_depths(
+        &mut self,
+        incoming: impl IntoIterator<Item = (Txid, u32)>,
+        unregister: impl FnOnce(&[(Txid, u32)]),
+    ) {
+        remove_items(&mut self.tx_depths, incoming, unregister);
+    }
+
     /// Total watched items across all kinds. Used to enforce the per-connection
     /// watch-set cap and in tests.
     pub(crate) fn len(&self) -> usize {
-        self.outpoints.len() + self.scripts.len() + self.txids.len()
+        self.outpoints.len() + self.scripts.len() + self.txids.len() + self.tx_depths.len()
     }
 }
 
@@ -318,6 +343,32 @@ mod tests {
         ws.remove_transactions([txid(1)], |items| assert_eq!(items.len(), 1));
         assert_eq!(q.current("tenant"), 1, "per-remove release frees one unit");
         assert_eq!(ws.len(), 1);
+    }
+
+    #[test]
+    fn add_tx_depths_charges_per_pair() {
+        let (p, acct) = tenant(10);
+        let q = acct.quota();
+        let mut ws = WatchSet::default();
+        // Two depths on the SAME txid are two distinct items → two units.
+        ws.add_tx_depths(Some(&p), [(txid(1), 1), (txid(1), 3)], |items| {
+            assert_eq!(items.len(), 2)
+        });
+        assert_eq!(q.current("tenant"), 2, "(X,1) and (X,3) charge 2 units");
+        assert_eq!(ws.len(), 2);
+
+        // Re-adding (X,1) dedups; (X,6) is net-new.
+        let mut reg = Vec::new();
+        ws.add_tx_depths(Some(&p), [(txid(1), 1), (txid(1), 6)], |items| {
+            reg = items.to_vec()
+        });
+        assert_eq!(reg, vec![(txid(1), 6)], "only the net-new pair registers");
+        assert_eq!(q.current("tenant"), 3);
+
+        // Removing one pair releases exactly one unit.
+        ws.remove_tx_depths([(txid(1), 3)], |items| assert_eq!(items.len(), 1));
+        assert_eq!(q.current("tenant"), 2, "per-pair release frees one unit");
+        assert_eq!(ws.len(), 2);
     }
 
     #[test]
