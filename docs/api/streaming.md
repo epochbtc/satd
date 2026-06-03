@@ -304,8 +304,10 @@ message SubscribeControl {
     AddOutpoints       add_outpoints       = 5;
     RemoveOutpoints    remove_outpoints    = 6;
     AddDescriptor      add_descriptor      = 7;  // §11
-    AddTransactions    add_transactions    = 8;  // txid lifecycle + depth (§7.4)
-    RemoveTransactions remove_transactions = 9;
+    AddTransactions      add_transactions      = 8;  // txid lifecycle + depth (§7.4)
+    RemoveTransactions   remove_transactions   = 9;
+    AddScriptPrefixes    add_script_prefixes   = 10; // privacy-preserving prefix watch (§7.5)
+    RemoveScriptPrefixes remove_script_prefixes = 11;
   }
 }
 ```
@@ -381,6 +383,95 @@ Because `AddTransactions` carries two repeated lists, the server bounds the
 `txids × min_depths` cross-product before allocating it: a malformed or oversized
 control message is rejected, never amplified into a large allocation.
 
+### 7.5 Privacy-preserving prefix subscriptions
+
+The §7.2–7.4 watches are precise: the server learns the exact scripts, outpoints,
+and txids a client cares about. The firehose (§5) is the privacy ceiling — the
+server learns nothing — but a client that wants only its own activity pays full
+chain+mempool bandwidth for it. `AddScriptPrefixes` is the tunable middle. A client
+registers a **k-bit prefix** of `sha256(scriptPubKey)` instead of a full 32-byte
+scripthash, and the server delivers every transaction whose script falls in that
+2⁻ᵏ **bucket**; the client filters the bucket against its real scripts locally. The
+server's knowledge is bounded at "this client watches bucket *p*" — it never learns
+which script within the bucket is the real target, because it delivers the whole
+bucket and the discrimination happens client-side.
+
+This is the **push dual of BIP 158** (which satd already computes and serves as a
+block-filter index): the same idea — coarse, deterministic membership the client
+tests itself — pushed rather than pulled. The push form is *more* naturally private
+here, for two reasons. First, there is **no fetch step**: a BIP 158 client that
+matches a filter must fetch the full block, and that fetch leaks which block it
+cared about (mitigated only by fetching blocks from a *different* server); a prefix
+subscriber receives the matching transactions inline, so there is no second request
+to correlate. Second, it **covers the mempool**, which block filters structurally
+cannot.
+
+**Membership is BIP 158-parity** — output scripts *and* spent-prevout scripts — so a
+single bucket catches both funding and spending of a script, exactly as §7.2's
+`ScriptMatched` does for exact scripts. It reuses the same resolution machinery: the
+output side is the scripthash `scan_tx` already computes; the **confirmed** input
+side is the prevout script `scan_block_spent_scripts` already recovers from a block's
+undo data. The **mempool** input side is the one piece the exact watches do not
+have — they delegate unconfirmed spend detection to outpoint watches (§7.2), a
+fallback a privacy client *cannot* use without naming the very outpoints it is
+hiding — so a prefix subscription resolves it from the prevout scripthashes retained
+on the mempool entry at admission, where the prevouts are already resolved for
+validation. Each resolved scripthash is truncated to the registered prefix lengths
+and looked up in a parallel `by_prefix` index (keyed `(bits, prefix)`, gated by a
+lock-free `has_prefix_watchers()` like every other watch kind). The per-output cost
+is O(distinct prefix lengths in use) — a `BTreeSet` of active `k` values, typically
+one or two — independent of subscriber count.
+
+```proto
+message ScriptPrefix         { bytes prefix = 1; uint32 bits = 2; }  // k bits, left-aligned in ceil(k/8) bytes
+message AddScriptPrefixes    { repeated ScriptPrefix prefixes = 1; }  // control field 10
+message RemoveScriptPrefixes { repeated ScriptPrefix prefixes = 1; }  // control field 11
+
+message PrefixMatched {                       // body field 23
+  ScriptPrefix prefix           = 1;
+  bytes        raw_tx           = 2;          // the full matching tx, inline — no precise follow-up fetch
+  bool         confirmed        = 3;
+  uint32       height           = 4;
+  repeated SpentPrevout matched_prevouts = 5; // spend side: prevout scripts that matched (empty for pure funding)
+}
+message SpentPrevout { bytes outpoint_txid = 1; uint32 outpoint_vout = 2; bytes script_pubkey = 3; }
+```
+
+**Delivery is self-contained, deliberately.** `PrefixMatched` carries the full
+`raw_tx`, not a txid — a txid would force the client to fetch the transaction
+precisely, re-leaking the exact interest the bucket was hiding. For the spend side
+it also carries the matched prevout scripts, so the client can confirm "this is a
+spend of one of my outputs" without resolving any outpoint itself. Because a bucket
+is a 2⁻ᵏ slice of uniform scripthash space, inline full-tx delivery is cheap: even a
+coarse k=8 bucket (anonymity set ≈ 256×) is a low-single-digit transactions per
+block plus a trickle from the mempool.
+
+**Granularity is operator-bounded** by `streamprefixminbits` / `streamprefixmaxbits`.
+The maximum (most precise) bound matters most: without it a client could register a
+near-full-length prefix and rebuild the leaking exact watch with extra steps, so
+`bits` is capped well short of a single script. The minimum bounds the bandwidth and
+quota a single bucket can pull. A client's choice of `k` is itself metadata, so a
+future refinement is to advertise a small fixed *menu* of allowed lengths rather
+than a free range, making buckets uniform across clients (privacy by uniformity, the
+property that makes BIP 158 filters identical for everyone) — see §13.
+
+**Quota is priced by coarseness.** A coarse prefix is both more private and more
+expensive to serve (a bigger bucket is more delivered traffic), so a prefix item
+costs units scaling inversely with `k` rather than a flat one unit (§9) — the
+bandwidth cost of privacy is surfaced directly in the quota rather than hidden, and
+a client cannot cheaply pin a near-half-chain bucket under a single "watch."
+
+**Privacy properties, stated honestly.** The server learns the *set of buckets* a
+client subscribes to, and nothing finer; within a bucket the real target is
+indistinguishable from its 2ᵏ⁻ᵇⁱᵗ cover, and there is no fetch step to narrow it.
+Two residuals are the client's to manage, not the server's: a wallet that registers
+many *precise* prefixes leaks a coarse silhouette of itself (prefer few coarse
+buckets over many fine ones), and a *stable* prefix per target is
+intersection-resistant — repeated matches only re-assert "watches bucket *p*" —
+whereas a prefix that varies per query can be intersected back down. The firehose
+remains the only zero-disclosure option; this is the knob between it and the exact
+watches, not a replacement for either.
+
 ## 8. Reorg events
 
 Reorgs are **first-class**, emitted in-process as consensus ground truth — a
@@ -410,13 +501,18 @@ token store.
 |---|---|---|
 | Open a stream; receive the firehose (categories) | `stream:subscribe` | — |
 | `AddScripts` / `AddOutpoints` / `AddTransactions` / `AddDescriptor` | `stream:watch` | per-token watch quota + per-add rate limit |
+| `AddScriptPrefixes` (§7.5) | `stream:watch` | same quota, but **priced by coarseness** (see below) |
 | `Remove*` | — | releases each item's unit immediately |
 
 **Quota unit (N items = N units).** A unit is one watched *item*: an `AddOutpoints`
 of N outpoints consumes N units, an `AddScripts` of N scripthashes consumes N, and
 a depth alarm consumes one unit per `(txid, depth)` pair. A lifecycle watch's
-`auto_close_depth` rides free (it is not a separate item). This bounds the *work* a
-tenant pins on the node, not the message count. Over-quota adds are rejected
+`auto_close_depth` rides free (it is not a separate item). The one exception is a
+prefix watch (§7.5), which is priced by coarseness — units scale inversely with
+`bits` (a coarser bucket delivers more traffic) rather than a flat one unit — so the
+quota reflects served bandwidth, not item count, for the one watch kind whose cost
+is not one-item-one-match. This bounds the *work* a tenant pins on the node, not the
+message count. Over-quota adds are rejected
 cleanly (`RESOURCE_EXHAUSTED` on gRPC / `429` on WS) without tearing down the
 subscription.
 
@@ -510,6 +606,13 @@ settle them ahead of any `v1` freeze:
   opaque token that is future-proof against cursor-format changes.
 - **Descriptor expansion bounds.** The right max gap-limit / max derived watch-set
   per token, and how it composes with the §9 per-item quota.
+- **Prefix-watch granularity (§7.5).** Whether to expose `bits` as a free range
+  within `[streamprefixminbits, streamprefixmaxbits]` (current design) or a small
+  fixed *menu* of allowed lengths — the menu makes buckets uniform across clients
+  (so the choice of `k` is not itself a fingerprint) at the cost of client
+  flexibility. Also: whether mempool spend-side matching (which costs one retained
+  scripthash per mempool-entry input) is worth its memory on nodes with no prefix
+  subscribers, or should be gated behind a "prefix subscriptions enabled" flag.
 
 ---
 
