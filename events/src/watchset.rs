@@ -105,6 +105,24 @@ fn add_items<T: Eq + Hash + Copy>(
     kind: &'static str,
     register: impl FnOnce(&[T]),
 ) {
+    // Per-add rate limit (C4): bound the RATE of watch-add control messages,
+    // not just the steady-state quota. One add operation = one token; a client
+    // spamming many small adds is shed here even while under its item quota.
+    // Operator/loopback and no-policy principals always Allow. An over-budget
+    // add is dropped without tearing down the stream — the control protocol has
+    // no per-message ack, same posture as the quota-reject path below.
+    if let Some(p) = principal
+        && let satd_auth::RateDecision::Throttle { retry_after_secs } = p.check_rate()
+    {
+        warn!(
+            target: "events::watchset",
+            kind,
+            retry_after_secs,
+            "watch add rate-limited; skipping",
+        );
+        return;
+    }
+
     // Distinct items not already watched: dedups both within this message
     // (`seen`) and against the live watch-set (`held`).
     let mut seen = HashSet::new();
@@ -290,5 +308,36 @@ mod tests {
         });
         assert_eq!(registered, 2, "intra-message dedup still applies");
         assert_eq!(ws.len(), 2);
+    }
+
+    #[test]
+    fn rate_limited_add_is_shed_without_dropping() {
+        use satd_auth::RatePolicy;
+        // burst = 1 → the first add is within budget, the second (immediate)
+        // add is throttled.
+        let acct: Arc<dyn Accounting> = Arc::new(LocalAccounting::new());
+        let p = Principal::token(
+            Arc::from("tenant"),
+            CapabilitySet::EMPTY.with(Capability::StreamWatch),
+            Some(100),
+            Some(RatePolicy { burst: 1, per_sec: 1 }),
+            acct.clone(),
+        );
+        let q = acct.quota();
+        let mut ws = WatchSet::default();
+
+        let mut reg1 = 0;
+        ws.add_outpoints(Some(&p), [op(1, 0)], |items| reg1 = items.len());
+        assert_eq!(reg1, 1, "first add is within the burst");
+        assert_eq!(q.current("tenant"), 1);
+
+        // Bucket now empty; an immediate second add is throttled → nothing
+        // registered or charged, and the existing watch-set is intact (no
+        // teardown).
+        let mut reg2 = 0;
+        ws.add_outpoints(Some(&p), [op(2, 0)], |items| reg2 = items.len());
+        assert_eq!(reg2, 0, "rate-limited add registers nothing");
+        assert_eq!(q.current("tenant"), 1, "rate-limited add charges no quota");
+        assert_eq!(ws.len(), 1, "earlier watch remains after a shed add");
     }
 }
