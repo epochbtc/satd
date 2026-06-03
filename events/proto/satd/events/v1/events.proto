@@ -58,10 +58,11 @@ message SubscribeControl {
     // removes the lifecycle watch(es); non-empty removes those depth alarms.
     RemoveTransactions remove_transactions = 9;
     // Privacy-preserving prefix watch (§7.5): watch a k-bit prefix of
-    // sha256(scriptPubKey). The server delivers every tx whose output OR spent
-    // prevout script falls in the 2^-k bucket (PrefixMatched, full raw_tx
-    // inline) and the client filters locally, so the server learns only the
-    // bucket, never the exact script. Charged by COARSENESS: a coarser bucket
+    // sha256(scriptPubKey). The server delivers every tx whose output (mempool +
+    // confirmed) OR spent prevout (CONFIRMED only — recovered from block undo
+    // data) script falls in the 2^-k bucket (PrefixMatched, full raw_tx inline)
+    // and the client filters locally, so the server learns only the bucket,
+    // never the exact script. Charged by COARSENESS: a coarser bucket
     // (smaller bits) costs more units. `bits` must be within the operator range
     // [streamprefixminbits, streamprefixmaxbits].
     AddScriptPrefixes    add_script_prefixes    = 10;

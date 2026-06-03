@@ -1084,7 +1084,7 @@ fn watch_match_to_proto(
                     prefix: prefix_wire_bytes(masked, bits),
                     bits: bits as u32,
                 }),
-                raw_tx: pm.raw_tx.clone(),
+                raw_tx: pm.raw_tx.to_vec(),
                 confirmed: pm.confirmed,
                 height: pm.height.unwrap_or(0),
                 matched_prevouts: pm

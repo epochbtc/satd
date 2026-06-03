@@ -122,8 +122,9 @@ pub struct PrefixMatch {
     /// client tell which of its prefixes matched.
     pub prefix: (u32, u8),
     /// The full consensus-serialized matching transaction. Self-contained: the
-    /// client decodes it and filters the bucket locally.
-    pub raw_tx: Vec<u8>,
+    /// client decodes it and filters the bucket locally. `Arc`-wrapped so the
+    /// per-subscriber delivery clone is a refcount bump, not a full-body copy.
+    pub raw_tx: Arc<[u8]>,
     /// `true` in a connected block, `false` in the mempool.
     pub confirmed: bool,
     /// Block height when `confirmed`; `None` in the mempool.
@@ -969,35 +970,38 @@ pub fn prefix_bucket_key(prefix: &[u8], bits: u8) -> u32 {
     u32::from_be_bytes(buf) & prefix_mask(bits)
 }
 
-/// Deliver a [`WatchMatch::PrefixMatched`] for every active prefix length whose
-/// bucket contains `sh`. `raw_tx` is the per-tx serialization cache: serialized
-/// at most once (and only when a prefix actually matches), then reused across a
-/// tx's outputs and prevouts so an unmatched tx pays nothing. `matched_prevouts`
-/// is empty for a funding (output-side) match and carries the spent prevout for
-/// a spend (input-side) match.
-fn deliver_prefix_for_script(
+/// Funding (output-side) prefix delivery for one output's scripthash. A funding
+/// match's payload is identical for every output that lands in the same bucket
+/// (it carries no vout and no prevout — just "this tx funds bucket B"), so
+/// `fired` dedups per `(bits, masked)` bucket across the tx's outputs: one event
+/// per bucket per tx, not one per matching output. `raw_tx` is the per-tx
+/// serialization cache, filled at most once and only on a real match.
+fn deliver_prefix_funding(
     inner: &Inner,
     sh: &Scripthash,
-    raw_tx: &mut Option<Vec<u8>>,
+    raw_tx: &mut Option<Arc<[u8]>>,
     tx: &Transaction,
     confirmed: bool,
     height: Option<u32>,
-    matched_prevouts: &[(OutPoint, ScriptBuf)],
+    fired: &mut HashSet<(u8, u32)>,
 ) {
     if inner.prefix_lens.is_empty() {
         return;
     }
     let top = prefix_top32(sh);
     for &bits in inner.prefix_lens.keys() {
-        let masked = top & prefix_mask(bits);
-        if let Some(subs) = inner.by_prefix.get(&(bits, masked)) {
-            let raw = raw_tx.get_or_insert_with(|| bitcoin::consensus::serialize(tx));
+        let key = (bits, top & prefix_mask(bits));
+        if !fired.contains(&key)
+            && let Some(subs) = inner.by_prefix.get(&key)
+        {
+            fired.insert(key);
+            let raw = raw_tx.get_or_insert_with(|| Arc::from(bitcoin::consensus::serialize(tx)));
             let m = WatchMatch::PrefixMatched(Box::new(PrefixMatch {
-                prefix: (masked, bits),
+                prefix: (key.1, key.0),
                 raw_tx: raw.clone(),
                 confirmed,
                 height,
-                matched_prevouts: matched_prevouts.to_vec(),
+                matched_prevouts: Vec::new(),
             }));
             for sid in subs {
                 deliver(inner, *sid, &m);
@@ -1032,8 +1036,10 @@ fn scan_tx(inner: &Inner, tx: &Transaction, confirmed: bool, height: Option<u32>
     let scan_prefixes = !inner.prefix_lens.is_empty();
     if scan_scripts || scan_prefixes {
         // Per-tx serialization cache for prefix deliveries: filled lazily on the
-        // first prefix match so an unmatched tx never serializes.
-        let mut raw_tx: Option<Vec<u8>> = None;
+        // first prefix match so an unmatched tx never serializes. `fired` dedups
+        // funding-side prefix matches per bucket across this tx's outputs.
+        let mut raw_tx: Option<Arc<[u8]>> = None;
+        let mut fired = HashSet::new();
         for (vout, out) in tx.output.iter().enumerate() {
             let sh = scripthash_of(&out.script_pubkey);
             if scan_scripts
@@ -1052,8 +1058,7 @@ fn scan_tx(inner: &Inner, tx: &Transaction, confirmed: bool, height: Option<u32>
                 }
             }
             if scan_prefixes {
-                // Funding side: no spent prevout.
-                deliver_prefix_for_script(inner, &sh, &mut raw_tx, tx, confirmed, height, &[]);
+                deliver_prefix_funding(inner, &sh, &mut raw_tx, tx, confirmed, height, &mut fired);
             }
         }
     }
@@ -1093,8 +1098,10 @@ fn scan_block_spent_scripts(inner: &Inner, block: &Block, height: u32, undo: &Un
             continue; // coinbase has no spent prevouts in undo
         }
         let txid = tx.compute_txid();
-        // Per-tx prefix serialization cache (filled lazily on first match).
-        let mut raw_tx: Option<Vec<u8>> = None;
+        // Spend-side prefix matches are aggregated per bucket across this tx's
+        // inputs: all matched prevouts for a bucket ride one PrefixMatched (one
+        // full-tx body), not one event per input.
+        let mut prefix_spends: HashMap<(u8, u32), Vec<(OutPoint, ScriptBuf)>> = HashMap::new();
         for (vin, input) in tx.input.iter().enumerate() {
             let Some(spent) = undo.spent_coins.get(undo_idx) else {
                 // Undo shorter than the block's non-coinbase inputs: should
@@ -1130,10 +1137,35 @@ fn scan_block_spent_scripts(inner: &Inner, block: &Block, height: u32, undo: &Un
                 }
             }
             if scan_prefixes {
-                // Spend side: carry the matched prevout so the client can
-                // confirm a coin of its own was spent without resolving it.
-                let prevout = [(input.previous_output, spent.script_pubkey.clone())];
-                deliver_prefix_for_script(inner, &sh, &mut raw_tx, tx, true, Some(height), &prevout);
+                // Group the spent prevout under each bucket it lands in.
+                let top = prefix_top32(&sh);
+                for &bits in inner.prefix_lens.keys() {
+                    let key = (bits, top & prefix_mask(bits));
+                    if inner.by_prefix.contains_key(&key) {
+                        prefix_spends
+                            .entry(key)
+                            .or_default()
+                            .push((input.previous_output, spent.script_pubkey.clone()));
+                    }
+                }
+            }
+        }
+        // One PrefixMatched per matched bucket, carrying all its spent prevouts.
+        if !prefix_spends.is_empty() {
+            let raw: Arc<[u8]> = Arc::from(bitcoin::consensus::serialize(tx));
+            for (key, matched_prevouts) in prefix_spends {
+                if let Some(subs) = inner.by_prefix.get(&key) {
+                    let m = WatchMatch::PrefixMatched(Box::new(PrefixMatch {
+                        prefix: (key.1, key.0),
+                        raw_tx: raw.clone(),
+                        confirmed: true,
+                        height: Some(height),
+                        matched_prevouts,
+                    }));
+                    for sid in subs {
+                        deliver(inner, *sid, &m);
+                    }
+                }
             }
         }
     }
@@ -2437,7 +2469,7 @@ mod tests {
                 assert!(!pm.confirmed);
                 assert_eq!(pm.height, None);
                 assert!(pm.matched_prevouts.is_empty(), "funding side carries no prevout");
-                let decoded: Transaction = bitcoin::consensus::deserialize(&pm.raw_tx).unwrap();
+                let decoded: Transaction = bitcoin::consensus::deserialize(pm.raw_tx.as_ref()).unwrap();
                 assert_eq!(decoded.compute_txid(), tx.compute_txid(), "raw_tx is the full tx");
             }
             other => panic!("wrong match: {other:?}"),
@@ -2581,5 +2613,72 @@ mod tests {
             }
         }
         assert_eq!((funding, spend), (1, 1), "one funding + one spend prefix match");
+    }
+
+    #[test]
+    fn funding_side_dedups_per_bucket_across_outputs() {
+        // A tx with MULTIPLE outputs in the same bucket must fire the funding
+        // match ONCE (the payload is identical — no vout), not once per output.
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let spk = ScriptBuf::from(vec![0x51]);
+        let sh = scripthash_of(&spk);
+        handle.add_prefixes(&[bucket(&sh, 12)]);
+
+        // Three outputs, all the same script → same bucket.
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![],
+            output: vec![
+                TxOut { value: Amount::from_sat(1), script_pubkey: spk.clone() },
+                TxOut { value: Amount::from_sat(2), script_pubkey: spk.clone() },
+                TxOut { value: Amount::from_sat(3), script_pubkey: spk },
+            ],
+        };
+        reg.scan_mempool_tx(&tx);
+        let mut n = 0;
+        while let Ok(WatchMatch::PrefixMatched(_)) = rx.try_recv() {
+            n += 1;
+        }
+        assert_eq!(n, 1, "one funding event per bucket per tx, not one per output");
+    }
+
+    #[test]
+    fn spend_side_aggregates_prevouts_per_bucket() {
+        // A tx spending TWO prevouts in the same bucket fires ONE spend event
+        // carrying both prevouts, not two events.
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let spent_spk = ScriptBuf::from(vec![0x52]);
+        let sh = scripthash_of(&spent_spk);
+        handle.add_prefixes(&[bucket(&sh, 12)]);
+
+        let op0 = outpoint(0xa0, 0);
+        let op1 = outpoint(0xa1, 1);
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![
+                TxIn { previous_output: op0, script_sig: ScriptBuf::new(), sequence: Sequence::MAX, witness: Witness::new() },
+                TxIn { previous_output: op1, script_sig: ScriptBuf::new(), sequence: Sequence::MAX, witness: Witness::new() },
+            ],
+            output: vec![],
+        };
+        let block = block_with(vec![coinbase_tx(), tx]);
+        let undo = UndoData {
+            spent_coins: vec![coin_with_spk(spent_spk.clone()), coin_with_spk(spent_spk)],
+        };
+        reg.scan_block(&block, 4, Some(&undo));
+
+        match rx.try_recv().expect("one aggregated spend match") {
+            WatchMatch::PrefixMatched(pm) => {
+                assert_eq!(pm.matched_prevouts.len(), 2, "both prevouts in one event");
+                let ops: Vec<OutPoint> = pm.matched_prevouts.iter().map(|(o, _)| *o).collect();
+                assert!(ops.contains(&op0) && ops.contains(&op1));
+            }
+            other => panic!("wrong match: {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "no second spend event for the same bucket");
     }
 }

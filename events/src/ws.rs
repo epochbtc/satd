@@ -1014,7 +1014,7 @@ fn watch_match_json(m: &WatchMatch) -> serde_json::Value {
                     "category": "prefix_matched",
                     "prefix": hex::encode(&masked.to_be_bytes()[..nbytes]),
                     "bits": bits,
-                    "raw_tx": hex::encode(&pm.raw_tx),
+                    "raw_tx": hex::encode(pm.raw_tx.as_ref()),
                     "confirmed": pm.confirmed,
                     "height": pm.height,
                     "matched_prevouts": pm.matched_prevouts.iter().map(|(op, spk)| json!({
@@ -1243,7 +1243,7 @@ mod tests {
     fn prefix_matched_json_shape() {
         let m = WatchMatch::PrefixMatched(Box::new(node::events::PrefixMatch {
             prefix: (0xabcd_0000, 16),
-            raw_tx: vec![0x01, 0x02],
+            raw_tx: vec![0x01, 0x02].into(),
             confirmed: true,
             height: Some(5),
             matched_prevouts: vec![],
