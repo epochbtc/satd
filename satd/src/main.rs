@@ -1005,6 +1005,10 @@ async fn main() {
             } else {
                 None
             },
+            // Block source for durable `?from_cursor` replay on /ws and /sse:
+            // ChainState gives read-only active-chain access for the
+            // snapshot→live handoff. Read-only; never on the consensus hot path.
+            Some(chain_state.clone() as std::sync::Arc<dyn node::events::BlockCursorSource>),
         )
         .await
         {
