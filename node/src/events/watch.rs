@@ -2855,4 +2855,48 @@ mod tests {
         }
         assert!(rx.try_recv().is_err(), "no second event for the same bucket");
     }
+
+    #[test]
+    fn mempool_spend_separates_distinct_buckets() {
+        // A tx spending two prevouts in DIFFERENT watched buckets fires one
+        // event per bucket, each carrying only its own prevout — verifies the
+        // per-bucket aggregation map keys correctly, not just collapses inputs.
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let spk_a = ScriptBuf::from(vec![0x52]);
+        let spk_b = ScriptBuf::from(vec![0x53]);
+        let sh_a = scripthash_of(&spk_a);
+        let sh_b = scripthash_of(&spk_b);
+        // At 32 bits the two distinct scripts occupy distinct buckets; guard the
+        // precondition so a (vanishingly unlikely) top-32 collision can't make
+        // the "two events" assertion flaky.
+        let (ba, bb) = (bucket(&sh_a, 32), bucket(&sh_b, 32));
+        assert_ne!(ba, bb, "test setup: scripts must be in different buckets");
+        handle.add_prefixes(&[ba, bb]);
+
+        let op_a = outpoint(0xa0, 0);
+        let op_b = outpoint(0xb0, 1);
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![
+                TxIn { previous_output: op_a, script_sig: ScriptBuf::new(), sequence: Sequence::MAX, witness: Witness::new() },
+                TxIn { previous_output: op_b, script_sig: ScriptBuf::new(), sequence: Sequence::MAX, witness: Witness::new() },
+            ],
+            output: vec![],
+        };
+        reg.scan_mempool_spent_prefixes(&tx, &[sh_a, sh_b]);
+
+        // Collect both events and map each bucket to the single outpoint it carries.
+        let mut by_bucket: std::collections::HashMap<(u8, u32), Vec<OutPoint>> =
+            std::collections::HashMap::new();
+        while let Ok(WatchMatch::PrefixMatched(pm)) = rx.try_recv() {
+            let key = (pm.prefix.1, pm.prefix.0);
+            let ops: Vec<OutPoint> = pm.matched_prevouts.iter().map(|(o, _)| *o).collect();
+            by_bucket.insert(key, ops);
+        }
+        assert_eq!(by_bucket.len(), 2, "one event per distinct bucket");
+        assert_eq!(by_bucket.get(&ba), Some(&vec![op_a]), "bucket A carries only its prevout");
+        assert_eq!(by_bucket.get(&bb), Some(&vec![op_b]), "bucket B carries only its prevout");
+    }
 }
