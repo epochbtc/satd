@@ -877,6 +877,28 @@ async fn main() {
     // matcher is spawned below once the mempool handle is wired.
     let watch_registry = std::sync::Arc::new(node::events::WatchRegistry::new());
 
+    // Validate + clamp the script-prefix watch granularity bounds (§7.5) once,
+    // shared by the gRPC `Watch` and `--streamws` carriers. Invariant:
+    // 1 <= min <= max <= 32 (the bucket key is the top 32 bits of the
+    // scripthash). A misconfiguration is clamped (not fatal) with a warning so a
+    // bad value cannot silently reject every prefix or collapse all buckets.
+    let (prefix_min_bits_cfg, prefix_max_bits_cfg) = {
+        let max = config.stream_prefix_max_bits.clamp(1, 32) as u8;
+        let min = config.stream_prefix_min_bits.clamp(1, 32) as u8;
+        let min = min.min(max);
+        if (min as u32, max as u32) != (config.stream_prefix_min_bits, config.stream_prefix_max_bits)
+        {
+            tracing::warn!(
+                target: "events",
+                requested_min = config.stream_prefix_min_bits,
+                requested_max = config.stream_prefix_max_bits,
+                min, max,
+                "streamprefix bounds out of range; clamped to 1 <= min <= max <= 32",
+            );
+        }
+        (min, max)
+    };
+
     // Build configured external sinks. Each sink is feature-gated in
     // the `satd-events` crate; this match enables what the operator
     // asked for via CLI / `bitcoin.conf`.
@@ -889,6 +911,8 @@ async fn main() {
             satd_events::GrpcLimits {
                 max_conns: config.events_grpc_max_conns,
                 max_subscriptions: config.events_grpc_max_subscriptions,
+                prefix_min_bits: prefix_min_bits_cfg,
+                prefix_max_bits: prefix_max_bits_cfg,
             },
             // Bearer auth (stream:subscribe) when `-events-grpc-auth` is set
             // (which requires `authfile`).
@@ -1013,6 +1037,8 @@ async fn main() {
                 max_conns: config.streamws_max_conns,
                 max_subscriptions: config.streamws_max_subscriptions,
                 max_message_bytes: config.streamws_max_message_bytes,
+                prefix_min_bits: prefix_min_bits_cfg,
+                prefix_max_bits: prefix_max_bits_cfg,
             },
         )
         .await

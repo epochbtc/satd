@@ -62,6 +62,9 @@ pub struct WsLimits {
     pub max_subscriptions: usize,
     /// Max bytes for a single inbound WS message/frame (`streamwsmaxmessagebytes`).
     pub max_message_bytes: usize,
+    /// Script-prefix watch granularity bounds (§7.5).
+    pub prefix_min_bits: u8,
+    pub prefix_max_bits: u8,
 }
 
 /// Construction-time errors for the WS transport.
@@ -97,6 +100,9 @@ struct WsState {
     max_subscriptions: usize,
     /// Cap on a single inbound WS message/frame (`streamwsmaxmessagebytes`).
     max_message_bytes: usize,
+    /// Script-prefix watch granularity bounds (§7.5).
+    prefix_min_bits: u8,
+    prefix_max_bits: u8,
 }
 
 /// The `--streamws` JSON/WS + SSE transport. Bind early (so a bind failure
@@ -178,6 +184,8 @@ impl WsStreamServer {
                 } else {
                     limits.max_message_bytes
                 },
+                prefix_min_bits: limits.prefix_min_bits,
+                prefix_max_bits: limits.prefix_max_bits,
             },
         })
     }
@@ -496,6 +504,7 @@ async fn ws_conn(
     // Inbound control reader: applies watch-set + category changes against the
     // shared connection-scoped watch-set.
     let max_subscriptions = state.max_subscriptions;
+    let prefix_bounds = (state.prefix_min_bits, state.prefix_max_bits);
     let inbound = {
         let handle = handle.clone();
         let category_mask = category_mask.clone();
@@ -514,6 +523,7 @@ async fn ws_conn(
                             &category_mask,
                             &mut guard,
                             max_subscriptions,
+                            prefix_bounds,
                         );
                     }
                     Message::Close(_) => break,
@@ -670,6 +680,25 @@ enum WsControl {
         #[serde(default)]
         start: u32,
     },
+    /// Add privacy-preserving script-prefix buckets (§7.5). Charged by
+    /// coarseness; `bits` must be within `[streamprefixminbits, streamprefixmaxbits]`.
+    AddScriptPrefixes { prefixes: Vec<WsScriptPrefix> },
+    /// Remove script-prefix buckets from the watch-set.
+    RemoveScriptPrefixes { prefixes: Vec<WsScriptPrefix> },
+}
+
+#[derive(Deserialize)]
+struct WsScriptPrefix {
+    /// Top `ceil(bits/8)` bytes of `sha256(scriptPubKey)`, hex-encoded.
+    prefix: String,
+    bits: u32,
+}
+
+/// Parse a WS prefix (hex + bits) into a validated registry bucket key + its
+/// coarseness-priced unit cost; `None` for malformed hex or out-of-range bits.
+fn parse_ws_prefix(p: &WsScriptPrefix, k_min: u8, k_max: u8) -> Option<((u8, u32), u64)> {
+    let bytes = hex::decode(&p.prefix).ok()?;
+    crate::watchset::parse_prefix(&bytes, p.bits, k_min, k_max)
 }
 
 #[derive(Deserialize)]
@@ -700,6 +729,7 @@ fn parse_ws_scripthash(s: &str) -> Option<[u8; 32]> {
     Some(sh)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_ws_control(
     text: &str,
     handle: &node::events::WatchHandle,
@@ -707,7 +737,9 @@ fn apply_ws_control(
     category_mask: &AtomicU32,
     watch_set: &mut WatchSet,
     max_subscriptions: usize,
+    prefix_bounds: (u8, u8),
 ) {
+    let (prefix_min_bits, prefix_max_bits) = prefix_bounds;
     let ctrl: WsControl = match serde_json::from_str(text) {
         Ok(c) => c,
         Err(e) => {
@@ -726,6 +758,7 @@ fn apply_ws_control(
             | WsControl::AddScripts { .. }
             | WsControl::AddDescriptor { .. }
             | WsControl::AddTransactions { .. }
+            | WsControl::AddScriptPrefixes { .. }
     );
     if is_add && max_subscriptions != 0 && watch_set.len() >= max_subscriptions {
         warn!(
@@ -836,6 +869,24 @@ fn apply_ws_control(
                 warn!(target: "events::ws", error = %e, "ignoring invalid descriptor");
             }
         },
+        WsControl::AddScriptPrefixes { prefixes } => {
+            let items: Vec<((u8, u32), u64)> = prefixes
+                .iter()
+                .filter_map(|p| parse_ws_prefix(p, prefix_min_bits, prefix_max_bits))
+                .collect();
+            watch_set.add_prefixes(principal, items, |keys| {
+                handle.add_prefixes(keys);
+            });
+        }
+        WsControl::RemoveScriptPrefixes { prefixes } => {
+            let keys: Vec<(u8, u32)> = prefixes
+                .iter()
+                .filter_map(|p| parse_ws_prefix(p, prefix_min_bits, prefix_max_bits).map(|(k, _)| k))
+                .collect();
+            watch_set.remove_prefixes(keys, |keys| {
+                handle.remove_prefixes(keys);
+            });
+        }
     }
 }
 
@@ -953,6 +1004,27 @@ fn watch_match_json(m: &WatchMatch) -> serde_json::Value {
                 "height": height,
             }
         }),
+        WatchMatch::PrefixMatched(pm) => {
+            let (masked, bits) = pm.prefix;
+            let nbytes = (bits as usize).div_ceil(8).min(4);
+            json!({
+                "schema_version": node::events::SCHEMA_VERSION,
+                "cursor": pm.height.map(|h| json!({ "height": h, "tx_index": 0, "mempool_seq": 0 })),
+                "body": {
+                    "category": "prefix_matched",
+                    "prefix": hex::encode(&masked.to_be_bytes()[..nbytes]),
+                    "bits": bits,
+                    "raw_tx": hex::encode(&pm.raw_tx),
+                    "confirmed": pm.confirmed,
+                    "height": pm.height,
+                    "matched_prevouts": pm.matched_prevouts.iter().map(|(op, spk)| json!({
+                        "outpoint_txid": hex::encode(op.txid.as_raw_hash().to_byte_array()),
+                        "outpoint_vout": op.vout,
+                        "script_pubkey": hex::encode(spk.as_bytes()),
+                    })).collect::<Vec<_>>(),
+                }
+            })
+        }
     }
 }
 
@@ -1039,22 +1111,22 @@ mod tests {
             )
         };
         // cap = 2, no principal (loopback/unlimited quota).
-        apply_ws_control(&add(0), &handle, None, &mask, &mut ws, 2);
-        apply_ws_control(&add(1), &handle, None, &mask, &mut ws, 2);
+        apply_ws_control(&add(0), &handle, None, &mask, &mut ws, 2, (8, 32));
+        apply_ws_control(&add(1), &handle, None, &mask, &mut ws, 2, (8, 32));
         assert_eq!(ws.len(), 2, "two distinct outpoints registered");
         // At the cap → the next add is shed (connection stays up).
-        apply_ws_control(&add(2), &handle, None, &mask, &mut ws, 2);
+        apply_ws_control(&add(2), &handle, None, &mask, &mut ws, 2, (8, 32));
         assert_eq!(ws.len(), 2, "add at the per-connection cap is shed");
         // A remove frees a slot; a subsequent add then succeeds.
         let rm = format!(
             r#"{{"type":"remove_outpoints","outpoints":[{{"txid":"{txid}","vout":0}}]}}"#
         );
-        apply_ws_control(&rm, &handle, None, &mask, &mut ws, 2);
+        apply_ws_control(&rm, &handle, None, &mask, &mut ws, 2, (8, 32));
         assert_eq!(ws.len(), 1);
-        apply_ws_control(&add(2), &handle, None, &mask, &mut ws, 2);
+        apply_ws_control(&add(2), &handle, None, &mask, &mut ws, 2, (8, 32));
         assert_eq!(ws.len(), 2, "add succeeds again after a remove frees a slot");
         // cap = 0 ⇒ unlimited: adds are never shed.
-        apply_ws_control(&add(3), &handle, None, &mask, &mut ws, 0);
+        apply_ws_control(&add(3), &handle, None, &mask, &mut ws, 0, (8, 32));
         assert_eq!(ws.len(), 3, "cap 0 disables the per-connection limit");
     }
 
@@ -1135,12 +1207,54 @@ mod tests {
         let ctrl = format!(
             r#"{{"type":"add_transactions","txids":["{txid}"],"min_depths":[1,3]}}"#
         );
-        apply_ws_control(&ctrl, &handle, None, &mask, &mut ws, 0);
+        apply_ws_control(&ctrl, &handle, None, &mask, &mut ws, 0, (8, 32));
         assert_eq!(ws.len(), 2, "(X,1) and (X,3) are two items");
         // Lifecycle add (no depths) is one item.
         let ctrl = format!(r#"{{"type":"add_transactions","txids":["{txid}"]}}"#);
-        apply_ws_control(&ctrl, &handle, None, &mask, &mut ws, 0);
+        apply_ws_control(&ctrl, &handle, None, &mask, &mut ws, 0, (8, 32));
         assert_eq!(ws.len(), 3, "lifecycle watch adds one more item");
+    }
+
+    #[test]
+    fn add_script_prefixes_via_control() {
+        let reg = std::sync::Arc::new(node::events::WatchRegistry::new());
+        let (handle, _rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let mask = AtomicU32::new(u32::MAX);
+        let mut ws = WatchSet::default();
+        // A 16-bit prefix (2 bytes hex). No principal ⇒ loopback/unlimited.
+        let ctrl = r#"{"type":"add_script_prefixes","prefixes":[{"prefix":"abcd","bits":16}]}"#;
+        apply_ws_control(ctrl, &handle, None, &mask, &mut ws, 0, (8, 32));
+        assert_eq!(ws.len(), 1, "one prefix bucket registered");
+        assert!(reg.has_prefix_watchers());
+
+        // Below-min bits is dropped (filter_map) → nothing registered.
+        let bad = r#"{"type":"add_script_prefixes","prefixes":[{"prefix":"ab","bits":4}]}"#;
+        apply_ws_control(bad, &handle, None, &mask, &mut ws, 0, (8, 32));
+        assert_eq!(ws.len(), 1, "out-of-range bits rejected, set unchanged");
+
+        // Remove releases it.
+        let rm = r#"{"type":"remove_script_prefixes","prefixes":[{"prefix":"abcd","bits":16}]}"#;
+        apply_ws_control(rm, &handle, None, &mask, &mut ws, 0, (8, 32));
+        assert_eq!(ws.len(), 0);
+        assert!(!reg.has_prefix_watchers());
+    }
+
+    #[test]
+    fn prefix_matched_json_shape() {
+        let m = WatchMatch::PrefixMatched(Box::new(node::events::PrefixMatch {
+            prefix: (0xabcd_0000, 16),
+            raw_tx: vec![0x01, 0x02],
+            confirmed: true,
+            height: Some(5),
+            matched_prevouts: vec![],
+        }));
+        let v = watch_match_json(&m);
+        assert_eq!(v["body"]["category"], "prefix_matched");
+        assert_eq!(v["body"]["bits"], 16);
+        assert_eq!(v["body"]["prefix"], "abcd");
+        assert_eq!(v["body"]["raw_tx"], "0102");
+        assert_eq!(v["body"]["confirmed"], true);
+        assert_eq!(v["cursor"]["height"], 5);
     }
 
     #[test]

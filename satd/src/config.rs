@@ -976,6 +976,18 @@ pub struct Config {
     /// silent); a client can still backfill them via `Subscribe(from_cursor)`.
     /// Default: 10_000. `0` disables the cap (rescan all the way back).
     pub stream_max_resync_blocks: u32,
+    /// Minimum allowed bit-length for a privacy-preserving script-prefix watch
+    /// (§7.5). A coarser (smaller-`bits`) prefix is a bigger anonymity bucket
+    /// but more delivered traffic; this floor bounds the bandwidth/quota a
+    /// single prefix can pull. Default: 8.
+    pub stream_prefix_min_bits: u32,
+    /// Maximum allowed bit-length for a script-prefix watch (§7.5). The
+    /// load-bearing privacy bound: capped well short of a full 256-bit
+    /// scripthash so a prefix bucket always spans many scripts and cannot
+    /// degrade into an exact (leaking) script watch. Also the reference point
+    /// for coarseness pricing (a `bits == max` prefix costs one unit). Range
+    /// `[stream_prefix_min_bits, 32]`. Default: 32.
+    pub stream_prefix_max_bits: u32,
     /// ZMQ endpoint string (e.g. `tcp://0.0.0.0:28332`) for the events
     /// PUB-socket sink. `None` = disabled. Topics emitted: `hashtx`,
     /// `hashblock` (Bitcoin Core wire-format compatible), plus
@@ -2783,6 +2795,14 @@ impl Config {
                 .stream_max_resync_blocks
                 .or_else(|| file_get("streammaxresyncblocks").and_then(|v| v.parse().ok()))
                 .unwrap_or(10_000),
+            stream_prefix_min_bits: cli
+                .stream_prefix_min_bits
+                .or_else(|| file_get("streamprefixminbits").and_then(|v| v.parse().ok()))
+                .unwrap_or(8),
+            stream_prefix_max_bits: cli
+                .stream_prefix_max_bits
+                .or_else(|| file_get("streamprefixmaxbits").and_then(|v| v.parse().ok()))
+                .unwrap_or(32),
             events_zmq_bind: cli.events_zmq_bind.or_else(|| file_get("eventszmqbind")),
             events_zmq_hashtx: cli
                 .events_zmq_hashtx
@@ -4454,6 +4474,20 @@ pub struct CliArgs {
     pub stream_max_resync_blocks: Option<u32>,
 
     #[arg(
+        long = "stream-prefix-min-bits",
+        value_name = "K",
+        help = "Minimum bit-length for a privacy-preserving script-prefix watch; floors the bucket coarseness (default: 8)"
+    )]
+    pub stream_prefix_min_bits: Option<u32>,
+
+    #[arg(
+        long = "stream-prefix-max-bits",
+        value_name = "K",
+        help = "Maximum bit-length for a script-prefix watch; caps precision so a bucket always spans many scripts (default: 32, range [min,32])"
+    )]
+    pub stream_prefix_max_bits: Option<u32>,
+
+    #[arg(
         long = "events-zmq-bind",
         value_name = "ENDPOINT",
         help = "ZMQ endpoint for the events PUB sink (e.g. 'tcp://0.0.0.0:28332'). Default: disabled"
@@ -5176,6 +5210,8 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "streamwsmaxsubscriptions",
     "streamwsmaxmessagebytes",
     "streammaxresyncblocks",
+    "streamprefixminbits",
+    "streamprefixmaxbits",
     "eventszmqbind",
     "eventszmqhashtx",
     "eventszmqhashblock",
@@ -5686,6 +5722,9 @@ rpcport=8332
         assert_eq!(cfg.streamws_max_conns, 256);
         assert_eq!(cfg.streamws_max_subscriptions, 256);
         assert_eq!(cfg.streamws_max_message_bytes, 262_144);
+        // Script-prefix watch granularity defaults (§7.5).
+        assert_eq!(cfg.stream_prefix_min_bits, 8);
+        assert_eq!(cfg.stream_prefix_max_bits, 32);
     }
 
     #[test]
@@ -6111,6 +6150,8 @@ rpcport=8332
             streamws_max_subscriptions: None,
             streamws_max_message_bytes: None,
             stream_max_resync_blocks: None,
+            stream_prefix_min_bits: None,
+            stream_prefix_max_bits: None,
             events_zmq_bind: None,
             events_zmq_hashtx: None,
             events_zmq_hashblock: None,
@@ -6354,6 +6395,8 @@ rpcport=8332
             streamws_max_subscriptions: None,
             streamws_max_message_bytes: None,
             stream_max_resync_blocks: None,
+            stream_prefix_min_bits: None,
+            stream_prefix_max_bits: None,
             events_zmq_bind: None,
             events_zmq_hashtx: None,
             events_zmq_hashblock: None,

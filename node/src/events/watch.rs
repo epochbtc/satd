@@ -29,7 +29,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
-use bitcoin::{Block, BlockHash, OutPoint, Transaction, Txid};
+use bitcoin::{Block, BlockHash, OutPoint, ScriptBuf, Transaction, Txid};
 use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{debug, warn};
 
@@ -105,6 +105,34 @@ pub enum WatchMatch {
     /// A lifecycle watch's `auto_close_depth` was reached: terminal notice, the
     /// lifecycle watch has self-evicted (its quota unit is released).
     TxidFinalized { txid: Txid, depth: u32, height: u32 },
+    /// A transaction fell inside a watched **script-prefix bucket** — the
+    /// privacy-preserving watch (§7.5). Carries the full serialized tx so the
+    /// client filters the bucket against its real scripts locally, with no
+    /// precise follow-up fetch that would re-leak the exact interest. Boxed
+    /// because the payload (a whole tx) dwarfs the other variants.
+    PrefixMatched(Box<PrefixMatch>),
+}
+
+/// Payload of a [`WatchMatch::PrefixMatched`]: a transaction that fell inside a
+/// watched k-bit `sha256(scriptPubKey)` prefix bucket, on either side.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrefixMatch {
+    /// The registered prefix that fired, as `(masked_top32, bits)` — the top
+    /// `bits` of the scripthash, with the low `32 - bits` zeroed. Lets the
+    /// client tell which of its prefixes matched.
+    pub prefix: (u32, u8),
+    /// The full consensus-serialized matching transaction. Self-contained: the
+    /// client decodes it and filters the bucket locally.
+    pub raw_tx: Vec<u8>,
+    /// `true` in a connected block, `false` in the mempool.
+    pub confirmed: bool,
+    /// Block height when `confirmed`; `None` in the mempool.
+    pub height: Option<u32>,
+    /// Spend side: the matched spent-prevout(s) — `(outpoint, scriptPubKey)` —
+    /// for inputs whose prevout script fell in the bucket. Empty for a pure
+    /// funding (output-side) match. Lets the client confirm "a coin of mine was
+    /// spent" without resolving any outpoint itself.
+    pub matched_prevouts: Vec<(OutPoint, ScriptBuf)>,
 }
 
 /// Opaque per-subscriber identifier.
@@ -133,6 +161,8 @@ struct Subscriber {
     /// Depth-tracked entries: single-shot alarms and lifecycle auto-close
     /// triggers, distinguished by [`DepthKind`].
     tx_depths: HashSet<(Txid, u32, DepthKind)>,
+    /// Privacy-preserving script-prefix buckets, as `(bits, masked_top32)`.
+    prefixes: HashSet<(u8, u32)>,
 }
 
 #[derive(Default)]
@@ -157,6 +187,15 @@ struct Inner {
     /// Newly-added depth entries awaiting a one-shot txindex probe (for txs
     /// already confirmed before the watch was registered). Drained each tick.
     probe_queue: Vec<DepthKey>,
+    /// Inverted index: watched script-prefix bucket `(bits, masked_top32)` →
+    /// subscribers. The privacy-preserving prefix watch (§7.5).
+    by_prefix: HashMap<(u8, u32), HashSet<SubId>>,
+    /// Distinct prefix bit-lengths currently registered → count of distinct
+    /// `(bits, masked)` buckets at that length. A length is "active" while its
+    /// count is `> 0`; the per-output/per-prevout scan iterates only these
+    /// lengths (typically one or two), so its cost is O(distinct lengths),
+    /// independent of subscriber count.
+    prefix_lens: HashMap<u8, usize>,
 }
 
 /// Registry of per-subscriber outpoint/script watch-sets with O(1)
@@ -180,6 +219,10 @@ pub struct WatchRegistry {
     /// Gates the per-block arm/tick so a watch-set with no depth entries pays
     /// nothing for the confirmation tracking.
     depth_items: AtomicUsize,
+    /// Lock-free count of registered *prefix* buckets (§7.5). Gates the
+    /// per-output/per-prevout prefix scan and the undo-data fetch, so a
+    /// watch-set with no prefixes pays nothing for them.
+    prefix_items: AtomicUsize,
 }
 
 impl Default for WatchRegistry {
@@ -197,6 +240,7 @@ impl WatchRegistry {
             script_items: AtomicUsize::new(0),
             txid_items: AtomicUsize::new(0),
             depth_items: AtomicUsize::new(0),
+            prefix_items: AtomicUsize::new(0),
         }
     }
 
@@ -224,6 +268,13 @@ impl WatchRegistry {
         self.depth_items.load(Ordering::Acquire) > 0
     }
 
+    /// `true` if any subscriber is watching at least one script-prefix bucket.
+    /// Lock-free; gates the prefix scan and (with `has_script_watchers`) the
+    /// input-side undo-data fetch.
+    pub fn has_prefix_watchers(&self) -> bool {
+        self.prefix_items.load(Ordering::Acquire) > 0
+    }
+
     fn lock_inner(&self) -> std::sync::RwLockWriteGuard<'_, Inner> {
         self.inner.write().unwrap_or_else(|p| p.into_inner())
     }
@@ -249,6 +300,7 @@ impl WatchRegistry {
                 scripthashes: HashSet::new(),
                 txids: HashSet::new(),
                 tx_depths: HashSet::new(),
+                prefixes: HashSet::new(),
             },
         );
         (
@@ -450,6 +502,53 @@ impl WatchRegistry {
         removed
     }
 
+    /// Add script-prefix buckets `(bits, masked_top32)` to a subscriber's
+    /// watch-set. Returns the number newly added (already-watched buckets are
+    /// not double-counted). Each prefix bumps `watch_items` (the block-reread
+    /// gate) so a prefix-only watch-set still triggers block scans.
+    fn add_prefixes(&self, id: SubId, prefixes: &[(u8, u32)]) -> usize {
+        let mut inner = self.lock_inner();
+        let mut added = 0;
+        for &(bits, masked) in prefixes {
+            let is_new = match inner.subs.get_mut(&id) {
+                Some(sub) => sub.prefixes.insert((bits, masked)),
+                None => break,
+            };
+            if is_new {
+                added += 1;
+                let set = inner.by_prefix.entry((bits, masked)).or_default();
+                let first_for_bucket = set.is_empty();
+                set.insert(id);
+                if first_for_bucket {
+                    *inner.prefix_lens.entry(bits).or_insert(0) += 1;
+                }
+            }
+        }
+        self.watch_items.fetch_add(added, Ordering::AcqRel);
+        self.prefix_items.fetch_add(added, Ordering::AcqRel);
+        added
+    }
+
+    /// Remove script-prefix buckets from a subscriber's watch-set. Returns the
+    /// number removed.
+    fn remove_prefixes(&self, id: SubId, prefixes: &[(u8, u32)]) -> usize {
+        let mut inner = self.lock_inner();
+        let mut removed = 0;
+        for &(bits, masked) in prefixes {
+            let was = match inner.subs.get_mut(&id) {
+                Some(sub) => sub.prefixes.remove(&(bits, masked)),
+                None => break,
+            };
+            if was {
+                removed += 1;
+                drop_prefix_bucket(&mut inner, id, bits, masked);
+            }
+        }
+        self.watch_items.fetch_sub(removed, Ordering::AcqRel);
+        self.prefix_items.fetch_sub(removed, Ordering::AcqRel);
+        removed
+    }
+
     /// De-register a subscriber and all its watches (called on
     /// [`WatchHandle`] drop).
     fn deregister(&self, id: SubId) {
@@ -459,6 +558,7 @@ impl WatchRegistry {
         };
         let freed_scripts = sub.scripthashes.len();
         let freed_txids = sub.txids.len();
+        let freed_prefixes = sub.prefixes.len();
         // Alarms bump watch_items; Close entries don't (their lifecycle txid does).
         let alarm_count = sub
             .tx_depths
@@ -466,7 +566,11 @@ impl WatchRegistry {
             .filter(|(_, _, k)| *k == DepthKind::Alarm)
             .count();
         let depth_count = sub.tx_depths.len();
-        let freed = sub.outpoints.len() + sub.scripthashes.len() + sub.txids.len() + alarm_count;
+        let freed = sub.outpoints.len()
+            + sub.scripthashes.len()
+            + sub.txids.len()
+            + alarm_count
+            + sub.prefixes.len();
         for op in &sub.outpoints {
             if let Some(set) = inner.by_outpoint.get_mut(op) {
                 set.remove(&id);
@@ -504,10 +608,15 @@ impl WatchRegistry {
             // Stale probe_queue entries (if any) no-op next tick — the tick's
             // probe drain skips keys whose depth_anchor is gone.
         }
+        let prefixes: Vec<(u8, u32)> = sub.prefixes.iter().copied().collect();
+        for (bits, masked) in prefixes {
+            drop_prefix_bucket(&mut inner, id, bits, masked);
+        }
         self.watch_items.fetch_sub(freed, Ordering::AcqRel);
         self.script_items.fetch_sub(freed_scripts, Ordering::AcqRel);
         self.txid_items.fetch_sub(freed_txids, Ordering::AcqRel);
         self.depth_items.fetch_sub(depth_count, Ordering::AcqRel);
+        self.prefix_items.fetch_sub(freed_prefixes, Ordering::AcqRel);
     }
 
     /// Scan every transaction in a connected block, routing matches to
@@ -528,10 +637,11 @@ impl WatchRegistry {
         for tx in &block.txdata {
             scan_tx(&inner, tx, true, Some(height));
         }
-        // Input-side script matching: only meaningful with watched scripts and
-        // the undo data to recover the spent prevout scriptPubKeys.
+        // Input-side script/prefix matching: only meaningful with a watched
+        // script or prefix and the undo data to recover the spent prevout
+        // scriptPubKeys.
         if let Some(undo) = undo
-            && !inner.by_scripthash.is_empty()
+            && (!inner.by_scripthash.is_empty() || !inner.prefix_lens.is_empty())
         {
             scan_block_spent_scripts(&inner, block, height, undo);
         }
@@ -814,6 +924,88 @@ fn remove_depth_entry(
     true
 }
 
+/// Remove subscriber `id` from a prefix bucket, dropping the bucket (and
+/// decrementing its length refcount) when the last subscriber leaves.
+fn drop_prefix_bucket(inner: &mut Inner, id: SubId, bits: u8, masked: u32) {
+    if let Some(set) = inner.by_prefix.get_mut(&(bits, masked)) {
+        set.remove(&id);
+        if set.is_empty() {
+            inner.by_prefix.remove(&(bits, masked));
+            if let Some(c) = inner.prefix_lens.get_mut(&bits) {
+                *c -= 1;
+                if *c == 0 {
+                    inner.prefix_lens.remove(&bits);
+                }
+            }
+        }
+    }
+}
+
+/// Mask keeping the top `bits` of a `u32` (the high bits of a scripthash),
+/// zeroing the low `32 - bits`. `bits == 0` → all-zero; `bits >= 32` → all-one.
+fn prefix_mask(bits: u8) -> u32 {
+    match bits {
+        0 => 0,
+        b if b >= 32 => u32::MAX,
+        b => u32::MAX << (32 - b),
+    }
+}
+
+/// The top 32 bits of a scripthash, as a `u32` — the value prefix buckets key on.
+fn prefix_top32(sh: &Scripthash) -> u32 {
+    u32::from_be_bytes([sh[0], sh[1], sh[2], sh[3]])
+}
+
+/// Bucket key for a client-supplied prefix: the first (up to 4) `prefix` bytes,
+/// left-aligned and zero-padded into a `u32`, masked to `bits`. The single
+/// source of truth for the carrier's `(bits, key)` and the registry's per-script
+/// lookup — a script funds/spends inside the bucket iff
+/// `prefix_top32(sh) & prefix_mask(bits) == prefix_bucket_key(prefix, bits)`.
+/// The caller validates `prefix.len() == bits.div_ceil(8)` and the `bits` range.
+pub fn prefix_bucket_key(prefix: &[u8], bits: u8) -> u32 {
+    let mut buf = [0u8; 4];
+    let n = prefix.len().min(4);
+    buf[..n].copy_from_slice(&prefix[..n]);
+    u32::from_be_bytes(buf) & prefix_mask(bits)
+}
+
+/// Deliver a [`WatchMatch::PrefixMatched`] for every active prefix length whose
+/// bucket contains `sh`. `raw_tx` is the per-tx serialization cache: serialized
+/// at most once (and only when a prefix actually matches), then reused across a
+/// tx's outputs and prevouts so an unmatched tx pays nothing. `matched_prevouts`
+/// is empty for a funding (output-side) match and carries the spent prevout for
+/// a spend (input-side) match.
+fn deliver_prefix_for_script(
+    inner: &Inner,
+    sh: &Scripthash,
+    raw_tx: &mut Option<Vec<u8>>,
+    tx: &Transaction,
+    confirmed: bool,
+    height: Option<u32>,
+    matched_prevouts: &[(OutPoint, ScriptBuf)],
+) {
+    if inner.prefix_lens.is_empty() {
+        return;
+    }
+    let top = prefix_top32(sh);
+    for &bits in inner.prefix_lens.keys() {
+        let masked = top & prefix_mask(bits);
+        if let Some(subs) = inner.by_prefix.get(&(bits, masked)) {
+            let raw = raw_tx.get_or_insert_with(|| bitcoin::consensus::serialize(tx));
+            let m = WatchMatch::PrefixMatched(Box::new(PrefixMatch {
+                prefix: (masked, bits),
+                raw_tx: raw.clone(),
+                confirmed,
+                height,
+                matched_prevouts: matched_prevouts.to_vec(),
+            }));
+            for sid in subs {
+                deliver(inner, *sid, &m);
+            }
+        }
+    }
+}
+
 /// Match a single transaction against the watch-set and deliver to the
 /// matching subscribers. Pure given `inner`; the hot loop the matcher runs.
 fn scan_tx(inner: &Inner, tx: &Transaction, confirmed: bool, height: Option<u32>) {
@@ -835,11 +1027,18 @@ fn scan_tx(inner: &Inner, tx: &Transaction, confirmed: bool, height: Option<u32>
         }
     }
 
-    // Outputs → watched-script funding.
-    if !inner.by_scripthash.is_empty() {
+    // Outputs → watched-script funding (exact scripts and prefix buckets).
+    let scan_scripts = !inner.by_scripthash.is_empty();
+    let scan_prefixes = !inner.prefix_lens.is_empty();
+    if scan_scripts || scan_prefixes {
+        // Per-tx serialization cache for prefix deliveries: filled lazily on the
+        // first prefix match so an unmatched tx never serializes.
+        let mut raw_tx: Option<Vec<u8>> = None;
         for (vout, out) in tx.output.iter().enumerate() {
             let sh = scripthash_of(&out.script_pubkey);
-            if let Some(subs) = inner.by_scripthash.get(&sh) {
+            if scan_scripts
+                && let Some(subs) = inner.by_scripthash.get(&sh)
+            {
                 let m = WatchMatch::ScriptMatched {
                     scripthash: sh,
                     txid,
@@ -851,6 +1050,10 @@ fn scan_tx(inner: &Inner, tx: &Transaction, confirmed: bool, height: Option<u32>
                 for sid in subs {
                     deliver(inner, *sid, &m);
                 }
+            }
+            if scan_prefixes {
+                // Funding side: no spent prevout.
+                deliver_prefix_for_script(inner, &sh, &mut raw_tx, tx, confirmed, height, &[]);
             }
         }
     }
@@ -882,13 +1085,17 @@ fn scan_tx(inner: &Inner, tx: &Transaction, confirmed: bool, height: Option<u32>
 /// give for a script whose funding the matcher never observed (e.g. a UTXO
 /// that predates the watch).
 fn scan_block_spent_scripts(inner: &Inner, block: &Block, height: u32, undo: &UndoData) {
+    let scan_scripts = !inner.by_scripthash.is_empty();
+    let scan_prefixes = !inner.prefix_lens.is_empty();
     let mut undo_idx = 0usize;
     for tx in &block.txdata {
         if tx.is_coinbase() {
             continue; // coinbase has no spent prevouts in undo
         }
         let txid = tx.compute_txid();
-        for (vin, _input) in tx.input.iter().enumerate() {
+        // Per-tx prefix serialization cache (filled lazily on first match).
+        let mut raw_tx: Option<Vec<u8>> = None;
+        for (vin, input) in tx.input.iter().enumerate() {
             let Some(spent) = undo.spent_coins.get(undo_idx) else {
                 // Undo shorter than the block's non-coinbase inputs: should
                 // never happen given the connect-order invariant (the consensus
@@ -907,7 +1114,9 @@ fn scan_block_spent_scripts(inner: &Inner, block: &Block, height: u32, undo: &Un
             };
             undo_idx += 1;
             let sh = scripthash_of(&spent.script_pubkey);
-            if let Some(subs) = inner.by_scripthash.get(&sh) {
+            if scan_scripts
+                && let Some(subs) = inner.by_scripthash.get(&sh)
+            {
                 let m = WatchMatch::ScriptMatched {
                     scripthash: sh,
                     txid,
@@ -919,6 +1128,12 @@ fn scan_block_spent_scripts(inner: &Inner, block: &Block, height: u32, undo: &Un
                 for sid in subs {
                     deliver(inner, *sid, &m);
                 }
+            }
+            if scan_prefixes {
+                // Spend side: carry the matched prevout so the client can
+                // confirm a coin of its own was spent without resolving it.
+                let prevout = [(input.previous_output, spent.script_pubkey.clone())];
+                deliver_prefix_for_script(inner, &sh, &mut raw_tx, tx, true, Some(height), &prevout);
             }
         }
     }
@@ -989,6 +1204,17 @@ impl WatchHandle {
     /// Remove depth alarms keyed `(txid, depth)`; returns the count removed.
     pub fn remove_tx_depths(&self, items: &[(Txid, u32)]) -> usize {
         self.registry.remove_tx_depths(self.id, items)
+    }
+
+    /// Add script-prefix buckets `(bits, masked_top32)` (§7.5); returns the
+    /// count newly added.
+    pub fn add_prefixes(&self, prefixes: &[(u8, u32)]) -> usize {
+        self.registry.add_prefixes(self.id, prefixes)
+    }
+
+    /// Remove script-prefix buckets; returns the count removed.
+    pub fn remove_prefixes(&self, prefixes: &[(u8, u32)]) -> usize {
+        self.registry.remove_prefixes(self.id, prefixes)
     }
 }
 
@@ -1070,7 +1296,7 @@ fn block_undo_for_scan(
     chain: &crate::chain::state::ChainState,
     hash: &bitcoin::BlockHash,
 ) -> Option<UndoData> {
-    if registry.has_script_watchers() {
+    if registry.has_script_watchers() || registry.has_prefix_watchers() {
         chain.get_undo(hash)
     } else {
         None
@@ -2161,5 +2387,199 @@ mod tests {
         assert_eq!(to, 101);
         // Contrast: the forward helper would have started at 101.
         assert_eq!(resync_range(100, 101, 10_000), Some((101, 101, 0)));
+    }
+
+    // ---- §7.5 privacy-preserving script-prefix watch ----
+
+    /// Bucket key a client would register for `sh` at `k` bits.
+    fn bucket(sh: &Scripthash, k: u8) -> (u8, u32) {
+        (k, prefix_top32(sh) & prefix_mask(k))
+    }
+
+    #[test]
+    fn prefix_mask_boundaries() {
+        assert_eq!(prefix_mask(0), 0);
+        assert_eq!(prefix_mask(8), 0xFF00_0000);
+        assert_eq!(prefix_mask(16), 0xFFFF_0000);
+        assert_eq!(prefix_mask(32), 0xFFFF_FFFF);
+        assert_eq!(prefix_mask(40), 0xFFFF_FFFF, ">= 32 saturates");
+    }
+
+    #[test]
+    fn prefix_bucket_key_matches_registry_masking() {
+        // The carrier builds the bucket key from the client's prefix BYTES; the
+        // registry builds it from a script's scripthash. They must agree.
+        let sh = scripthash_of(&ScriptBuf::from(vec![0x51]));
+        for k in [1u8, 8, 13, 16, 32] {
+            let nbytes = (k as usize).div_ceil(8);
+            assert_eq!(
+                prefix_bucket_key(&sh[..nbytes], k),
+                prefix_top32(&sh) & prefix_mask(k),
+                "carrier byte-path and registry masking disagree at k={k}",
+            );
+        }
+    }
+
+    #[test]
+    fn prefix_funding_match_mempool_and_confirmed() {
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let spk = ScriptBuf::from(vec![0x51]);
+        let sh = scripthash_of(&spk);
+        assert_eq!(handle.add_prefixes(&[bucket(&sh, 12)]), 1);
+        assert!(reg.has_watchers() && reg.has_prefix_watchers());
+
+        let tx = funding_tx(spk);
+        reg.scan_mempool_tx(&tx);
+        match rx.try_recv().expect("mempool prefix match") {
+            WatchMatch::PrefixMatched(pm) => {
+                assert_eq!(pm.prefix, (prefix_top32(&sh) & prefix_mask(12), 12));
+                assert!(!pm.confirmed);
+                assert_eq!(pm.height, None);
+                assert!(pm.matched_prevouts.is_empty(), "funding side carries no prevout");
+                let decoded: Transaction = bitcoin::consensus::deserialize(&pm.raw_tx).unwrap();
+                assert_eq!(decoded.compute_txid(), tx.compute_txid(), "raw_tx is the full tx");
+            }
+            other => panic!("wrong match: {other:?}"),
+        }
+
+        reg.scan_block(&block_with(vec![tx]), 7, None);
+        match rx.try_recv().expect("confirmed prefix match") {
+            WatchMatch::PrefixMatched(pm) => {
+                assert!(pm.confirmed);
+                assert_eq!(pm.height, Some(7));
+            }
+            other => panic!("wrong match: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prefix_spend_match_confirmed_via_undo() {
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let spent_spk = ScriptBuf::from(vec![0x52]);
+        let sh = scripthash_of(&spent_spk);
+        handle.add_prefixes(&[bucket(&sh, 12)]);
+        // Prefix watch fetches undo when a prefix is watched, like a script watch.
+        assert!(reg.has_prefix_watchers());
+
+        let op = outpoint(0xaa, 3);
+        let block = block_with(vec![coinbase_tx(), spending_tx(op)]);
+        let undo = UndoData {
+            spent_coins: vec![coin_with_spk(spent_spk.clone())],
+        };
+        reg.scan_block(&block, 9, Some(&undo));
+        match rx.try_recv().expect("input-side prefix match") {
+            WatchMatch::PrefixMatched(pm) => {
+                assert!(pm.confirmed);
+                assert_eq!(pm.height, Some(9));
+                assert_eq!(pm.matched_prevouts.len(), 1, "spend side carries the prevout");
+                let (mop, mspk) = &pm.matched_prevouts[0];
+                assert_eq!(*mop, op);
+                assert_eq!(*mspk, spent_spk);
+            }
+            other => panic!("wrong match: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn two_prefix_lengths_match_independently() {
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let spk = ScriptBuf::from(vec![0x51]);
+        let sh = scripthash_of(&spk);
+        assert_eq!(handle.add_prefixes(&[bucket(&sh, 8), bucket(&sh, 16)]), 2);
+
+        reg.scan_mempool_tx(&funding_tx(spk));
+        let mut bits_seen = Vec::new();
+        while let Ok(WatchMatch::PrefixMatched(pm)) = rx.try_recv() {
+            bits_seen.push(pm.prefix.1);
+        }
+        bits_seen.sort_unstable();
+        assert_eq!(bits_seen, vec![8, 16], "both lengths fire as independent items");
+    }
+
+    #[test]
+    fn prefix_no_match_outside_bucket() {
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let watched = scripthash_of(&ScriptBuf::from(vec![0x51]));
+        handle.add_prefixes(&[bucket(&watched, 16)]);
+        // A different script (overwhelmingly likely in a different 16-bit bucket).
+        reg.scan_mempool_tx(&funding_tx(ScriptBuf::from(vec![0x52, 0x53, 0x54])));
+        assert!(rx.try_recv().is_err(), "script outside the bucket must not match");
+    }
+
+    #[test]
+    fn deregister_clears_prefix_state() {
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, _rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let sh = scripthash_of(&ScriptBuf::from(vec![0x51]));
+        handle.add_prefixes(&[bucket(&sh, 8), bucket(&sh, 16)]);
+        assert!(reg.has_prefix_watchers());
+        drop(handle);
+        assert!(!reg.has_prefix_watchers(), "prefix counter cleared on deregister");
+        assert!(!reg.has_watchers(), "prefixes also clear the reread gate");
+        let inner = reg.read_inner();
+        assert!(inner.by_prefix.is_empty() && inner.prefix_lens.is_empty());
+    }
+
+    #[test]
+    fn remove_prefix_releases_reread_gate() {
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, _rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let sh = scripthash_of(&ScriptBuf::from(vec![0x51]));
+        let key = bucket(&sh, 12);
+        handle.add_prefixes(&[key]);
+        assert!(reg.has_prefix_watchers() && reg.has_watchers());
+        assert_eq!(handle.remove_prefixes(&[key]), 1);
+        assert!(!reg.has_prefix_watchers());
+        assert!(!reg.has_watchers());
+    }
+
+    #[test]
+    fn tx_matching_both_sides_emits_two_prefix_matches() {
+        // A tx that funds one bucket (output) and spends another (input, via
+        // undo) fires twice — once funding (no prevout), once spend (with
+        // prevout) — mirroring ScriptMatched's per-side emission.
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let out_spk = ScriptBuf::from(vec![0x51]);
+        let in_spk = ScriptBuf::from(vec![0x52]);
+        handle.add_prefixes(&[
+            bucket(&scripthash_of(&out_spk), 12),
+            bucket(&scripthash_of(&in_spk), 12),
+        ]);
+
+        let op = outpoint(0xcc, 1);
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: op,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1000),
+                script_pubkey: out_spk,
+            }],
+        };
+        let block = block_with(vec![coinbase_tx(), tx]);
+        let undo = UndoData {
+            spent_coins: vec![coin_with_spk(in_spk)],
+        };
+        reg.scan_block(&block, 3, Some(&undo));
+
+        let (mut funding, mut spend) = (0, 0);
+        while let Ok(WatchMatch::PrefixMatched(pm)) = rx.try_recv() {
+            if pm.matched_prevouts.is_empty() {
+                funding += 1;
+            } else {
+                spend += 1;
+            }
+        }
+        assert_eq!((funding, spend), (1, 1), "one funding + one spend prefix match");
     }
 }

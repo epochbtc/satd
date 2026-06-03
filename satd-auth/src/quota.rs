@@ -123,14 +123,24 @@ impl WatchLease {
     /// return its unit on removal without a second, racy acquire call. Because
     /// no store call is made, the total charged is conserved exactly.
     pub fn split_off_one(&mut self) -> Option<WatchLease> {
-        if self.n == 0 {
+        self.split_off(1)
+    }
+
+    /// Split `n` units off this lease into a new lease over the same principal,
+    /// **without charging or releasing any units** (same conservation property
+    /// as [`split_off_one`](Self::split_off_one), generalized to `n`). Returns
+    /// `None` if this lease holds fewer than `n` units. Used to carve a
+    /// variable-cost per-item lease (e.g. a coarseness-priced prefix watch) out
+    /// of one atomic batch reservation.
+    pub fn split_off(&mut self, n: u64) -> Option<WatchLease> {
+        if n > self.n {
             return None;
         }
-        self.n -= 1;
+        self.n -= n;
         Some(WatchLease {
             store: Arc::clone(&self.store),
             principal_id: Arc::clone(&self.principal_id),
-            n: 1,
+            n,
         })
     }
 }

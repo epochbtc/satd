@@ -69,6 +69,49 @@ pub(crate) fn bounded_txid_depth_pairs(txids: &[Txid], depths: &[u32]) -> Option
 /// depend on `node-index`.
 type Scripthash = [u8; 32];
 
+/// A privacy-preserving script-prefix bucket, as `(bits, masked_top32)` — the
+/// type `WatchHandle::add_prefixes` takes. `bits` is the prefix length; the
+/// `u32` is the top 32 bits of `sha256(spk)` masked to `bits`.
+type PrefixKey = (u8, u32);
+
+/// Cap on the coarseness multiplier's shift. A prefix `bits` below `K_MAX`
+/// charges `1 << (K_MAX - bits)` units — honest bandwidth pricing (a coarser
+/// bucket delivers proportionally more) — but capped here so a very coarse
+/// bucket cannot demand an astronomical quota. With the cap a bucket `≥ 8` bits
+/// coarser than the finest allowed charges a flat 256 units; the `K_MIN` floor
+/// (operator config) is the real coarseness guard.
+pub(crate) const MAX_PREFIX_UNIT_SHIFT: u8 = 8;
+
+/// Quota cost of one prefix watch, priced by coarseness: the finest allowed
+/// (`bits == k_max`) costs 1 unit, each bit coarser doubles, capped at
+/// `1 << MAX_PREFIX_UNIT_SHIFT`.
+pub(crate) fn prefix_units(bits: u8, k_max: u8) -> u64 {
+    let shift = k_max.saturating_sub(bits).min(MAX_PREFIX_UNIT_SHIFT);
+    1u64 << shift
+}
+
+/// Validate and normalize a client-supplied script prefix into a registry
+/// bucket key. Rejects (returns `None`) when `bits` is outside the operator
+/// range `[k_min, k_max]` or the prefix byte length is not exactly
+/// `ceil(bits/8)` (a malformed frame). On success returns `(bits, masked_top32)`
+/// — the same key the registry computes per script — paired with its quota cost.
+pub(crate) fn parse_prefix(
+    prefix: &[u8],
+    bits: u32,
+    k_min: u8,
+    k_max: u8,
+) -> Option<(PrefixKey, u64)> {
+    if bits < k_min as u32 || bits > k_max as u32 {
+        return None;
+    }
+    let bits = bits as u8;
+    if prefix.len() != (bits as usize).div_ceil(8) {
+        return None;
+    }
+    let key = node::events::prefix_bucket_key(prefix, bits);
+    Some(((bits, key), prefix_units(bits, k_max)))
+}
+
 /// A subscription's live watch-set: the outpoints and scripts it watches, each
 /// paired with the [`WatchLease`](satd_auth::WatchLease) backing its quota unit
 /// (`None` when auth is disabled — loopback trust, unlimited).
@@ -82,6 +125,10 @@ pub(crate) struct WatchSet {
     /// Single-shot depth alarms, keyed `(txid, depth)` — one quota unit per
     /// pair, so an alarm on the same txid at two depths charges two units.
     tx_depths: HashMap<(Txid, u32), Option<satd_auth::WatchLease>>,
+    /// Privacy-preserving script-prefix buckets (§7.5), keyed `(bits, masked)`.
+    /// Unlike the others these are **priced by coarseness** — a coarser bucket
+    /// (smaller `bits`) holds a multi-unit lease (see [`prefix_units`]).
+    prefixes: HashMap<PrefixKey, Option<satd_auth::WatchLease>>,
 }
 
 impl WatchSet {
@@ -166,10 +213,47 @@ impl WatchSet {
         remove_items(&mut self.tx_depths, incoming, unregister);
     }
 
+    /// Add prefix watches, charging each net-new bucket its coarseness-priced
+    /// unit cost (see [`prefix_units`]). `incoming` yields `(key, units)` pairs
+    /// from [`parse_prefix`]. All-or-nothing per call like the other add paths.
+    pub(crate) fn add_prefixes(
+        &mut self,
+        principal: Option<&satd_auth::Principal>,
+        incoming: impl IntoIterator<Item = (PrefixKey, u64)>,
+        register: impl FnOnce(&[PrefixKey]),
+    ) {
+        // Collect the (key → cost) of net-new buckets up front so the priced
+        // charge can read each item's cost. `add_items_priced` re-derives the
+        // cost via the closure; a HashMap lookup keeps the two in lockstep.
+        let costs: HashMap<PrefixKey, u64> = incoming.into_iter().collect();
+        add_items_priced(
+            &mut self.prefixes,
+            principal,
+            costs.keys().copied(),
+            |k| costs.get(k).copied().unwrap_or(1),
+            "prefixes",
+            register,
+        );
+    }
+
+    /// Remove prefix watches, releasing each removed bucket's (multi-unit) lease.
+    pub(crate) fn remove_prefixes(
+        &mut self,
+        incoming: impl IntoIterator<Item = PrefixKey>,
+        unregister: impl FnOnce(&[PrefixKey]),
+    ) {
+        remove_items(&mut self.prefixes, incoming, unregister);
+    }
+
     /// Total watched items across all kinds. Used to enforce the per-connection
-    /// watch-set cap and in tests.
+    /// watch-set cap and in tests. A prefix counts as one item regardless of its
+    /// (coarseness-priced) unit cost.
     pub(crate) fn len(&self) -> usize {
-        self.outpoints.len() + self.scripts.len() + self.txids.len() + self.tx_depths.len()
+        self.outpoints.len()
+            + self.scripts.len()
+            + self.txids.len()
+            + self.tx_depths.len()
+            + self.prefixes.len()
     }
 }
 
@@ -177,6 +261,23 @@ fn add_items<T: Eq + Hash + Copy>(
     held: &mut HashMap<T, Option<satd_auth::WatchLease>>,
     principal: Option<&satd_auth::Principal>,
     incoming: impl IntoIterator<Item = T>,
+    kind: &'static str,
+    register: impl FnOnce(&[T]),
+) {
+    // The common case: every item costs exactly one unit.
+    add_items_priced(held, principal, incoming, |_| 1, kind, register);
+}
+
+/// Generalization of [`add_items`] where each item carries its own quota cost
+/// (`cost`). The whole net-new batch is reserved atomically as `sum(cost)` units,
+/// then split into per-item leases via [`WatchLease::split_off`], so a removal
+/// returns exactly that item's units. Used by the coarseness-priced prefix add;
+/// `add_items` is the `cost = 1` specialization.
+fn add_items_priced<T: Eq + Hash + Copy>(
+    held: &mut HashMap<T, Option<satd_auth::WatchLease>>,
+    principal: Option<&satd_auth::Principal>,
+    incoming: impl IntoIterator<Item = T>,
+    cost: impl Fn(&T) -> u64,
     kind: &'static str,
     register: impl FnOnce(&[T]),
 ) {
@@ -215,23 +316,24 @@ fn add_items<T: Eq + Hash + Copy>(
         );
         return;
     }
+    let total: u64 = net_new.iter().map(&cost).sum();
     match principal {
         // Reserve all net-new units atomically (all-or-nothing), then split
         // the batch into per-item leases so each can be released on removal.
-        Some(p) => match p.acquire_watch(net_new.len() as u64) {
+        Some(p) => match p.acquire_watch(total) {
             Ok(mut batch) => {
                 register(&net_new);
                 for it in net_new {
-                    let lease = batch.split_off_one();
+                    let lease = batch.split_off(cost(&it));
                     // Conservation invariant: acquire_watch charged exactly
-                    // net_new.len() units, and we split exactly that many, so
-                    // every split yields Some. A None here would mean an item
+                    // `total` units = sum(cost), and we split exactly that many,
+                    // so every split yields Some. A None here would mean an item
                     // charged in the store with no per-item lease backing it —
                     // a unit leaked until teardown. Pin it so a future refactor
                     // can't silently regress.
                     debug_assert!(
                         lease.is_some(),
-                        "split_off_one drained before all items got a lease",
+                        "split_off drained before all items got a lease",
                     );
                     held.insert(it, lease);
                 }
@@ -482,6 +584,81 @@ mod tests {
         assert_eq!(reg2, 0, "rate-limited add registers nothing");
         assert_eq!(q.current("tenant"), 1, "rate-limited add charges no quota");
         assert_eq!(ws.len(), 1, "earlier watch remains after a shed add");
+    }
+
+    #[test]
+    fn prefix_units_scale_with_coarseness() {
+        // Finest allowed = 1 unit; each bit coarser doubles, capped.
+        assert_eq!(prefix_units(32, 32), 1);
+        assert_eq!(prefix_units(31, 32), 2);
+        assert_eq!(prefix_units(24, 32), 1 << 8);
+        // 24 bits coarser than k_max is capped, not 1<<24.
+        assert_eq!(prefix_units(8, 32), 1 << MAX_PREFIX_UNIT_SHIFT);
+        // Finest is relative to k_max, not an absolute.
+        assert_eq!(prefix_units(16, 16), 1);
+    }
+
+    #[test]
+    fn parse_prefix_validates_range_and_length() {
+        // valid 16-bit prefix (2 bytes)
+        assert!(parse_prefix(&[0xab, 0xcd], 16, 8, 32).is_some());
+        // below the operator minimum
+        assert!(parse_prefix(&[0xab], 4, 8, 32).is_none());
+        // above the operator maximum
+        assert!(parse_prefix(&[0u8; 5], 40, 8, 32).is_none());
+        // byte length must be exactly ceil(bits/8): 16 bits needs 2 bytes
+        assert!(parse_prefix(&[0xab], 16, 8, 32).is_none());
+        // 13 bits → ceil = 2 bytes
+        assert!(parse_prefix(&[0xab, 0xc0], 13, 8, 32).is_some());
+    }
+
+    #[test]
+    fn add_prefixes_charges_by_coarseness_and_releases() {
+        let (p, acct) = tenant(1000);
+        let q = acct.quota();
+        let mut ws = WatchSet::default();
+        let c24 = parse_prefix(&[0xaa, 0xbb, 0xcc], 24, 8, 32).unwrap(); // 1<<8 units
+        let c32 = parse_prefix(&[0x11, 0x22, 0x33, 0x44], 32, 8, 32).unwrap(); // 1 unit
+
+        let mut reg = 0;
+        ws.add_prefixes(Some(&p), [c24, c32], |keys| reg = keys.len());
+        assert_eq!(reg, 2);
+        assert_eq!(q.current("tenant"), (1 << 8) + 1, "coarseness-priced units");
+        assert_eq!(ws.len(), 2, "two buckets = two items regardless of unit cost");
+
+        // Removing the coarse bucket releases all of its units.
+        ws.remove_prefixes([c24.0], |keys| assert_eq!(keys.len(), 1));
+        assert_eq!(q.current("tenant"), 1, "per-bucket release frees its full cost");
+        assert_eq!(ws.len(), 1);
+    }
+
+    #[test]
+    fn add_prefixes_dedups_cross_message() {
+        let (p, acct) = tenant(1000);
+        let q = acct.quota();
+        let mut ws = WatchSet::default();
+        let a = parse_prefix(&[0xaa, 0xbb], 16, 8, 32).unwrap();
+        ws.add_prefixes(Some(&p), [a], |_| {});
+        let charged = q.current("tenant");
+
+        let mut called = false;
+        ws.add_prefixes(Some(&p), [a], |_| called = true);
+        assert!(!called, "re-asserted bucket registers nothing");
+        assert_eq!(q.current("tenant"), charged, "dedup: the bucket is not double-charged");
+    }
+
+    #[test]
+    fn over_quota_prefix_add_is_all_or_nothing() {
+        let (p, acct) = tenant(10);
+        let q = acct.quota();
+        let mut ws = WatchSet::default();
+        // A k=24 prefix costs 1<<8 = 256 units > quota 10 → whole add rejected.
+        let c = parse_prefix(&[0xaa, 0xbb, 0xcc], 24, 8, 32).unwrap();
+        let mut registered = false;
+        ws.add_prefixes(Some(&p), [c], |_| registered = true);
+        assert!(!registered, "a prefix add that overflows quota registers nothing");
+        assert_eq!(q.current("tenant"), 0);
+        assert_eq!(ws.len(), 0);
     }
 
     #[test]

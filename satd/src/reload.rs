@@ -672,6 +672,9 @@ fn field_specs() -> Vec<FieldSpec> {
         // The matcher captures this cap when spawned at startup, so a change
         // takes effect on restart (same disposition as the listener caps).
         restart!("streammaxresyncblocks", stream_max_resync_blocks),
+        // Prefix-watch granularity bounds bind at listener construction (startup).
+        restart!("streamprefixminbits", stream_prefix_min_bits),
+        restart!("streamprefixmaxbits", stream_prefix_max_bits),
         // ---- Webhooks ----
         live!("reorgwebhook", reorg_webhook, apply_webhook),
         live_secret!("reorgwebhooksecret", reorg_webhook_secret, apply_webhook),
