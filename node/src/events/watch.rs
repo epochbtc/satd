@@ -390,11 +390,43 @@ impl Drop for WatchHandle {
     }
 }
 
+/// Compute the height range the matcher must rescan after lagging the chain
+/// event broadcast, capping the span to `max` blocks.
+///
+/// Returns `Some((from, to, skipped))` — an inclusive `from..=to` range to
+/// rescan plus the number of older blocks the cap dropped (always logged,
+/// never silent) — or `None` when there is nothing to rescan (the matcher is
+/// already at or beyond the tip, e.g. after a reorg shrank the chain).
+///
+/// `max == 0` disables the cap (rescan the whole gap).
+fn resync_range(last_scanned: u32, tip: u32, max: u32) -> Option<(u32, u32, u32)> {
+    if tip <= last_scanned {
+        return None;
+    }
+    let from = last_scanned + 1;
+    let span = tip - from + 1;
+    if max != 0 && span > max {
+        // Keep the most recent `max` blocks; the client can backfill the
+        // older tail via Subscribe(from_cursor).
+        Some((tip - max + 1, tip, span - max))
+    } else {
+        Some((from, tip, 0))
+    }
+}
+
 /// Drive the watch matcher off the existing event broadcasts. Decoupled
 /// from consensus: on `BlockConnected` it re-reads the (already durable)
 /// block and scans it; on a mempool `Enter` it fetches the accepted tx and
 /// scans it. Both are gated by [`WatchRegistry::has_watchers`], so a node
 /// with no active watches does zero extra work (no block re-read).
+///
+/// If the chain-event broadcast lags (a slow matcher under a burst of
+/// blocks), the dropped blocks would otherwise be silently un-scanned and
+/// every watcher would miss matches in that window. On a lag the matcher
+/// therefore rescans from its last scanned height forward to the current tip
+/// (capped by `max_resync_blocks`; see [`resync_range`]), reading each block
+/// the node already holds. This keeps the matcher correct under load without
+/// ever backpressuring the publisher.
 ///
 /// Runs until `shutdown` flips or both broadcasts close. Intended to be
 /// spawned on the API runtime, alongside the other event sinks.
@@ -404,9 +436,15 @@ pub async fn run_watch_matcher(
     mempool: Arc<crate::mempool::pool::Mempool>,
     mut chain_rx: broadcast::Receiver<ChainEvent>,
     mut mempool_rx: broadcast::Receiver<MempoolEvent>,
+    max_resync_blocks: u32,
     mut shutdown: watch::Receiver<bool>,
 ) {
     debug!(target: "events::watch", "watch matcher started");
+    // Highest block height the matcher has scanned. Initialized to the current
+    // tip: history before the matcher starts is the client's replay concern
+    // (Subscribe(from_cursor)), not the live matcher's. On a lag we rescan
+    // forward from here so no connected block is silently skipped.
+    let mut last_scanned_height = chain.tip_height();
     loop {
         tokio::select! {
             biased;
@@ -418,6 +456,7 @@ pub async fn run_watch_matcher(
                     {
                         registry.scan_block(&block, height);
                     }
+                    last_scanned_height = height;
                 }
                 // Disconnects and the reorg marker are surfaced to clients
                 // as first-class events; the matcher itself is spend/funding
@@ -425,7 +464,43 @@ pub async fn run_watch_matcher(
                 // Clients roll back their own confirmed state on a Reorg.
                 Ok(ChainEvent::BlockDisconnected { .. }) | Ok(ChainEvent::Reorg { .. }) => {}
                 Err(broadcast::error::RecvError::Lagged(n)) => {
-                    warn!(target: "events::watch", dropped = n, "watch matcher lagged on chain events");
+                    // Rescan the missed window so watchers do not silently miss
+                    // matches. Reading blocks the node already holds; never
+                    // blocks the publisher.
+                    let tip = chain.tip_height();
+                    if let Some((from, to, skipped)) =
+                        resync_range(last_scanned_height, tip, max_resync_blocks)
+                    {
+                        warn!(
+                            target: "events::watch",
+                            dropped = n, from, to, skipped,
+                            "watch matcher lagged on chain events; resyncing to tip"
+                        );
+                        if skipped > 0 {
+                            warn!(
+                                target: "events::watch",
+                                skipped, cap = max_resync_blocks,
+                                "resync span exceeds streammaxresyncblocks; older blocks not \
+                                 rescanned (clients can backfill via Subscribe(from_cursor))"
+                            );
+                        }
+                        if registry.has_watchers() {
+                            for h in from..=to {
+                                if let Some(hash) = chain.get_block_hash_by_height(h)
+                                    && let Some(block) = chain.get_block(&hash)
+                                {
+                                    registry.scan_block(&block, h);
+                                }
+                            }
+                        }
+                        last_scanned_height = tip;
+                    } else {
+                        warn!(
+                            target: "events::watch",
+                            dropped = n,
+                            "watch matcher lagged on chain events; already at tip, nothing to resync"
+                        );
+                    }
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             },
@@ -616,5 +691,49 @@ mod tests {
             Ok(WatchMatch::OutpointSpent { .. })
         ));
         assert!(rx2.try_recv().is_err(), "subscriber 2 watches a different outpoint");
+    }
+
+    // --- resync_range (matcher lag catch-up window) ---
+
+    #[test]
+    fn resync_range_normal_gap_within_cap_rescans_whole_gap() {
+        // Scanned through 100, tip now 105, generous cap → rescan 101..=105.
+        assert_eq!(resync_range(100, 105, 10_000), Some((101, 105, 0)));
+    }
+
+    #[test]
+    fn resync_range_caught_up_is_none() {
+        // tip == last scanned: nothing to do.
+        assert_eq!(resync_range(105, 105, 10_000), None);
+    }
+
+    #[test]
+    fn resync_range_tip_below_last_scanned_is_none() {
+        // A reorg during the lag shrank the active chain below where we were;
+        // the reconnect path drives the new chain, so there is nothing to
+        // forward-rescan here.
+        assert_eq!(resync_range(105, 102, 10_000), None);
+    }
+
+    #[test]
+    fn resync_range_gap_exceeds_cap_keeps_most_recent_and_reports_skipped() {
+        // Scanned through 0, tip 10_000, cap 100 → rescan only the most recent
+        // 100 blocks (9901..=10000) and report 9900 skipped.
+        assert_eq!(resync_range(0, 10_000, 100), Some((9_901, 10_000, 9_900)));
+        // The kept window is exactly `cap` blocks wide.
+        let (from, to, _) = resync_range(0, 10_000, 100).unwrap();
+        assert_eq!(to - from + 1, 100);
+    }
+
+    #[test]
+    fn resync_range_exactly_at_cap_does_not_skip() {
+        // span == cap → no skip, full gap rescanned.
+        assert_eq!(resync_range(0, 100, 100), Some((1, 100, 0)));
+    }
+
+    #[test]
+    fn resync_range_zero_cap_disables_cap() {
+        // max == 0 → rescan the entire gap regardless of size.
+        assert_eq!(resync_range(0, 1_000_000, 0), Some((1, 1_000_000, 0)));
     }
 }

@@ -664,6 +664,9 @@ fn field_specs() -> Vec<FieldSpec> {
         restart!("streamws", streamws_bind),
         restart!("streamwsallowremote", streamws_allow_remote),
         restart!("streamwsauth", streamws_auth),
+        // The matcher captures this cap when spawned at startup, so a change
+        // takes effect on restart (same disposition as the listener caps).
+        restart!("streammaxresyncblocks", stream_max_resync_blocks),
         // ---- Webhooks ----
         live!("reorgwebhook", reorg_webhook, apply_webhook),
         live_secret!("reorgwebhooksecret", reorg_webhook_secret, apply_webhook),

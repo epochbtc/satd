@@ -954,6 +954,15 @@ pub struct Config {
     /// (watch additions additionally need `stream:watch` + quota). Requires
     /// `authfile`. Default false (unauthenticated, loopback-trust).
     pub streamws_auth: bool,
+    /// Upper bound on the number of blocks the decoupled watch matcher will
+    /// re-scan in one catch-up after it lags behind the chain event broadcast
+    /// (see `events::watch`). On a lag the matcher rescans from its last
+    /// scanned height to the current tip so watchers do not silently miss
+    /// matches; this caps that span so a far-behind matcher cannot stall on an
+    /// unbounded rescan. Older blocks beyond the cap are skipped (logged, never
+    /// silent); a client can still backfill them via `Subscribe(from_cursor)`.
+    /// Default: 10_000. `0` disables the cap (rescan all the way back).
+    pub stream_max_resync_blocks: u32,
     /// ZMQ endpoint string (e.g. `tcp://0.0.0.0:28332`) for the events
     /// PUB-socket sink. `None` = disabled. Topics emitted: `hashtx`,
     /// `hashblock` (Bitcoin Core wire-format compatible), plus
@@ -2745,6 +2754,10 @@ impl Config {
             streamws_bind: cli.streamws_bind.or_else(|| file_get("streamws")),
             streamws_allow_remote,
             streamws_auth,
+            stream_max_resync_blocks: cli
+                .stream_max_resync_blocks
+                .or_else(|| file_get("streammaxresyncblocks").and_then(|v| v.parse().ok()))
+                .unwrap_or(10_000),
             events_zmq_bind: cli.events_zmq_bind.or_else(|| file_get("eventszmqbind")),
             events_zmq_hashtx: cli
                 .events_zmq_hashtx
@@ -4388,6 +4401,13 @@ pub struct CliArgs {
     pub streamws_auth: Option<bool>,
 
     #[arg(
+        long = "stream-max-resync-blocks",
+        value_name = "N",
+        help = "Max blocks the watch matcher re-scans in one catch-up after lagging the chain event broadcast (default: 10000; 0 disables the cap)"
+    )]
+    pub stream_max_resync_blocks: Option<u32>,
+
+    #[arg(
         long = "events-zmq-bind",
         value_name = "ENDPOINT",
         help = "ZMQ endpoint for the events PUB sink (e.g. 'tcp://0.0.0.0:28332'). Default: disabled"
@@ -5106,6 +5126,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "streamws",
     "streamwsallowremote",
     "streamwsauth",
+    "streammaxresyncblocks",
     "eventszmqbind",
     "eventszmqhashtx",
     "eventszmqhashblock",
@@ -6024,6 +6045,7 @@ rpcport=8332
             streamws_bind: None,
             streamws_allow_remote: Some(false),
             streamws_auth: None,
+            stream_max_resync_blocks: None,
             events_zmq_bind: None,
             events_zmq_hashtx: None,
             events_zmq_hashblock: None,
@@ -6263,6 +6285,7 @@ rpcport=8332
             streamws_bind: None,
             streamws_allow_remote: Some(false),
             streamws_auth: None,
+            stream_max_resync_blocks: None,
             events_zmq_bind: None,
             events_zmq_hashtx: None,
             events_zmq_hashblock: None,
