@@ -34,6 +34,36 @@ use std::hash::Hash;
 use bitcoin::{OutPoint, Txid};
 use tracing::warn;
 
+/// Per-control-message cap on the `(txid × distinct-depth)` cross-product for
+/// the depth-alarm add/remove paths. A malformed control message carrying huge
+/// `txids` and `min_depths` lists must not allocate billions of tuples (OOM)
+/// *before* the quota check — and the remove path performs no quota check at
+/// all, so an unauthenticated / subscribe-only client could otherwise exhaust
+/// memory with a single frame. 65536 pairs (~2.3 MiB of tuples) is generous for
+/// any legitimate batch; larger sets are split across messages.
+pub(crate) const MAX_TXID_DEPTH_PAIRS: usize = 65_536;
+
+/// Build the `(txid × distinct-depth)` watch pairs for a depth-alarm
+/// add/remove, or `None` if the cross-product would exceed
+/// [`MAX_TXID_DEPTH_PAIRS`]. Depths are de-duplicated first so a client cannot
+/// inflate the product (or the registry) by repeating a threshold.
+pub(crate) fn bounded_txid_depth_pairs(txids: &[Txid], depths: &[u32]) -> Option<Vec<(Txid, u32)>> {
+    let mut distinct: Vec<u32> = depths.to_vec();
+    distinct.sort_unstable();
+    distinct.dedup();
+    let count = txids.len().saturating_mul(distinct.len());
+    if count > MAX_TXID_DEPTH_PAIRS {
+        return None;
+    }
+    let mut pairs = Vec::with_capacity(count);
+    for t in txids {
+        for d in &distinct {
+            pairs.push((*t, *d));
+        }
+    }
+    Some(pairs)
+}
+
 /// A scripthash is `sha256(scriptPubKey)`. Mirrors `node_index::keys::Scripthash`
 /// (the type `WatchHandle::add_scripthashes` takes) without this crate having to
 /// depend on `node-index`.
@@ -343,6 +373,22 @@ mod tests {
         ws.remove_transactions([txid(1)], |items| assert_eq!(items.len(), 1));
         assert_eq!(q.current("tenant"), 1, "per-remove release frees one unit");
         assert_eq!(ws.len(), 1);
+    }
+
+    #[test]
+    fn bounded_pairs_dedups_and_caps() {
+        // Distinct depths only (repeated thresholds can't inflate the product).
+        let pairs = bounded_txid_depth_pairs(&[txid(1), txid(2)], &[3, 3, 1, 3]).unwrap();
+        assert_eq!(pairs.len(), 4, "2 txids × {{1,3}} distinct = 4 pairs");
+
+        // Over the cap → rejected (None) BEFORE allocating the product. 64 txids
+        // × 4096 distinct depths = 262144 > MAX_TXID_DEPTH_PAIRS (65536).
+        let many_depths: Vec<u32> = (1..=4096).collect();
+        let many_txids: Vec<Txid> = (0..64).map(txid).collect();
+        assert!(
+            bounded_txid_depth_pairs(&many_txids, &many_depths).is_none(),
+            "huge cross-product is rejected, not allocated",
+        );
     }
 
     #[test]

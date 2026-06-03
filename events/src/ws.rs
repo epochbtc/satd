@@ -38,7 +38,7 @@ use node::events::{
 };
 use serde::Deserialize;
 
-use crate::watchset::WatchSet;
+use crate::watchset::{bounded_txid_depth_pairs, WatchSet};
 use serde_json::json;
 use tokio::net::TcpListener;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, watch};
@@ -168,7 +168,16 @@ impl WsStreamServer {
                     limits.max_conns
                 })),
                 max_subscriptions: limits.max_subscriptions,
-                max_message_bytes: limits.max_message_bytes,
+                // 0 ⇒ unlimited, mirroring the other two caps. Passing 0 straight
+                // to axum's max_message_size would instead REJECT every non-empty
+                // frame, silently bricking the inbound control channel (adds /
+                // removes / set_categories) while the outbound firehose kept
+                // running — a confusing footgun. Map 0 → usize::MAX.
+                max_message_bytes: if limits.max_message_bytes == 0 {
+                    usize::MAX
+                } else {
+                    limits.max_message_bytes
+                },
             },
         })
     }
@@ -584,9 +593,10 @@ async fn ws_conn(
             },
             m = rx_match.recv() => match m {
                 Some(wm) => {
-                    // Single-shot terminal matches self-evict: release the quota
-                    // lease and deregister the spent watch (the registry already
-                    // de-armed it). Keyed by the threshold the match carries.
+                    // Single-shot terminal matches: the registry already evicted
+                    // the entry server-side on fire, so handle.remove_* is an
+                    // idempotent no-op registry-side — its job here is to drop the
+                    // carrier-held quota LEASE. Keyed by the threshold the match carries.
                     match &wm {
                         WatchMatch::TxidDepthReached { txid, depth, .. } => {
                             let mut ws = watch_set.lock().unwrap_or_else(|p| p.into_inner());
@@ -776,14 +786,16 @@ fn apply_ws_control(
                 watch_set.add_transactions(principal, parsed, |txids| {
                     handle.add_txids(txids, auto_close_depth);
                 });
-            } else {
-                let pairs: Vec<(bitcoin::Txid, u32)> = parsed
-                    .iter()
-                    .flat_map(|t| depths.iter().map(move |d| (*t, *d)))
-                    .collect();
+            } else if let Some(pairs) = bounded_txid_depth_pairs(&parsed, &depths) {
                 watch_set.add_tx_depths(principal, pairs, |items| {
                     handle.add_tx_depths(items);
                 });
+            } else {
+                warn!(
+                    target: "events::ws",
+                    txids = parsed.len(), depths = depths.len(),
+                    "add_transactions txid×depth product exceeds cap; rejecting message",
+                );
             }
         }
         WsControl::RemoveTransactions { txids, min_depths } => {
@@ -793,14 +805,16 @@ fn apply_ws_control(
                 watch_set.remove_transactions(parsed, |txids| {
                     handle.remove_txids(txids);
                 });
-            } else {
-                let pairs: Vec<(bitcoin::Txid, u32)> = parsed
-                    .iter()
-                    .flat_map(|t| depths.iter().map(move |d| (*t, *d)))
-                    .collect();
+            } else if let Some(pairs) = bounded_txid_depth_pairs(&parsed, &depths) {
                 watch_set.remove_tx_depths(pairs, |items| {
                     handle.remove_tx_depths(items);
                 });
+            } else {
+                warn!(
+                    target: "events::ws",
+                    txids = parsed.len(), depths = depths.len(),
+                    "remove_transactions txid×depth product exceeds cap; rejecting message",
+                );
             }
         }
         WsControl::AddDescriptor {

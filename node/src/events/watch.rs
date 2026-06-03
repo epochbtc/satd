@@ -603,9 +603,9 @@ impl WatchRegistry {
 
         // 2. Evaluate armed entries against the tip.
         let armed: Vec<DepthKey> = inner.armed.iter().copied().collect();
-        let mut fires: Vec<(SubId, WatchMatch)> = Vec::new();
+        let mut fires: Vec<(SubId, WatchMatch, DepthKey)> = Vec::new();
         for key in armed {
-            let (id, txid, depth, kind) = key;
+            let (_id, _txid, depth, _kind) = key;
             let Some(Some((h, bh))) = inner.depth_anchor.get(&key).copied() else {
                 inner.armed.remove(&key);
                 continue;
@@ -620,6 +620,7 @@ impl WatchRegistry {
             }
             let cur_depth = tip.saturating_sub(h) + 1;
             if cur_depth >= depth {
+                let (id, txid, depth, kind) = key;
                 // Emit the REQUESTED threshold (`depth`), not the actual reached
                 // depth: it is the alarm's identity (which alarm fired) and the
                 // key the carrier uses to release the quota lease on eviction.
@@ -638,15 +639,57 @@ impl WatchRegistry {
                         height: h,
                     },
                 };
-                fires.push((id, m));
-                // De-arm to prevent a re-fire; full eviction (and quota release)
-                // is carrier-driven on forwarding the terminal match.
-                inner.armed.remove(&key);
+                fires.push((id, m, key));
             }
         }
-        for (id, m) in &fires {
+
+        // Server-authoritative eviction of fired single-shot entries. Doing the
+        // teardown HERE (not waiting for the carrier to forward the terminal
+        // match over the lossy match channel) guarantees: a fired key can never
+        // re-arm if its txid reappears in a later block (no duplicate terminal),
+        // and the registry's counters/gate are freed even if the terminal match
+        // is dropped to a lagging client. The carrier still calls
+        // remove_tx_depths/remove_txids on forwarding — now an idempotent no-op
+        // registry-side, but it is what releases the carrier-held quota lease.
+        // (Residual: a terminal match dropped to a full channel holds that lease
+        // until disconnect — bounded by the connection and the per-token quota.)
+        let mut depth_dec = 0usize;
+        let mut watch_dec = 0usize;
+        let mut txid_dec = 0usize;
+        for (_id, _m, key) in &fires {
+            let (id, txid, depth, kind) = *key;
+            if remove_depth_entry(&mut inner, id, txid, depth, kind) {
+                depth_dec += 1;
+                if kind == DepthKind::Alarm {
+                    watch_dec += 1;
+                }
+            }
+            if kind == DepthKind::Close {
+                // Auto-close is terminal for the lifecycle watch: remove it too
+                // so it stops narrating once finalized.
+                let removed = match inner.subs.get_mut(&id) {
+                    Some(sub) => sub.txids.remove(&txid),
+                    None => false,
+                };
+                if removed {
+                    txid_dec += 1;
+                    watch_dec += 1;
+                    if let Some(set) = inner.by_txid.get_mut(&txid) {
+                        set.remove(&id);
+                        if set.is_empty() {
+                            inner.by_txid.remove(&txid);
+                        }
+                    }
+                }
+            }
+        }
+        for (id, m, _key) in &fires {
             deliver(&inner, *id, m);
         }
+        drop(inner);
+        self.depth_items.fetch_sub(depth_dec, Ordering::AcqRel);
+        self.watch_items.fetch_sub(watch_dec, Ordering::AcqRel);
+        self.txid_items.fetch_sub(txid_dec, Ordering::AcqRel);
     }
 
     /// Deliver a lifecycle transition to every subscriber watching `txid`.
@@ -1751,15 +1794,76 @@ mod tests {
         assert!(!reg.has_txid_watchers(), "lifecycle gone");
         assert!(reg.has_depth_watchers(), "independent alarm survives");
 
-        // The alarm still arms + fires.
+        // The alarm still arms + fires, and self-evicts server-side on fire.
         let block = block_at(1, vec![tx]);
         let mut chain = MockChain::default();
         chain.active.insert(10, block.block_hash());
         reg.arm_depths_for_block(&block, 10);
         reg.tick_depths(12, &chain);
-        // (rx was dropped; just assert the entry de-armed → has_depth false after
-        // the single-shot fire is carrier-driven, so it stays registered here.)
-        assert!(reg.has_depth_watchers(), "alarm entry remains until carrier evict");
+        assert!(
+            !reg.has_depth_watchers(),
+            "single-shot alarm self-evicts server-side on fire"
+        );
+    }
+
+    #[test]
+    fn depth_fire_self_evicts_registry_state() {
+        // A fired alarm is fully removed from the registry on fire (not left
+        // inert awaiting the carrier), so it cannot re-arm if its txid reappears
+        // in a later block, and the counters are freed regardless of delivery.
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let tx = tx_with(0x51);
+        let txid = tx.compute_txid();
+        handle.add_tx_depths(&[(txid, 1)]);
+
+        let block_a = block_at(1, vec![tx.clone()]);
+        let mut chain = MockChain::default();
+        chain.active.insert(10, block_a.block_hash());
+        reg.arm_depths_for_block(&block_a, 10);
+        reg.tick_depths(10, &chain); // depth 1 → fires + self-evicts
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(WatchMatch::TxidDepthReached { depth: 1, .. })
+        ));
+        assert!(!reg.has_depth_watchers(), "self-evicted on fire");
+        {
+            let inner = reg.read_inner();
+            assert!(inner.by_txid_depth.is_empty());
+            assert!(inner.depth_anchor.is_empty());
+            assert!(inner.armed.is_empty());
+        }
+
+        // The same txid re-mined in a later block must NOT resurrect a duplicate
+        // terminal (the entry is gone, so arming finds nothing).
+        let block_b = block_at(2, vec![tx]);
+        chain.active.insert(11, block_b.block_hash());
+        reg.arm_depths_for_block(&block_b, 11);
+        reg.tick_depths(11, &chain);
+        assert!(rx.try_recv().is_err(), "no duplicate terminal on re-mine");
+    }
+
+    #[test]
+    fn auto_close_finalize_evicts_lifecycle_watch() {
+        // TxidFinalized is terminal for the lifecycle watch: after it fires, the
+        // lifecycle watch is gone (stops narrating) without a carrier round-trip.
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let tx = tx_with(0x51);
+        let txid = tx.compute_txid();
+        handle.add_txids(&[txid], 2);
+
+        let block = block_at(1, vec![tx]);
+        let mut chain = MockChain::default();
+        chain.active.insert(10, block.block_hash());
+        reg.scan_block(&block, 10, None);
+        reg.arm_depths_for_block(&block, 10);
+        let _ = rx.try_recv(); // confirmed TxidMatched
+        reg.tick_depths(11, &chain); // depth 2 → TxidFinalized
+        assert!(matches!(rx.try_recv(), Ok(WatchMatch::TxidFinalized { .. })));
+        assert!(!reg.has_txid_watchers(), "lifecycle watch evicted on finalize");
+        assert!(!reg.has_depth_watchers(), "close entry evicted on finalize");
+        assert!(!reg.has_watchers(), "no residual watch items");
     }
 
     #[test]

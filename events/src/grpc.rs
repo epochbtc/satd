@@ -57,7 +57,7 @@ impl Default for GrpcLimits {
 }
 
 use crate::proto::v1 as pb;
-use crate::watchset::WatchSet;
+use crate::watchset::{bounded_txid_depth_pairs, WatchSet};
 use crate::proto::v1::node_event_stream_server::{
     NodeEventStream, NodeEventStreamServer,
 };
@@ -673,10 +673,18 @@ impl NodeEventStream for NodeEventStreamSvc {
 
         // Outbound: live category-filtered firehose merged with the
         // per-subscriber watch matches. Track the last-delivered position to
-        // fill an in-band `Lagged` notice (the Watch firehose has no replay, so
-        // it seeds from zero).
+        // fill an in-band `Lagged` notice. The Watch firehose has no replay, so
+        // seed the resume height from the CURRENT chain tip (not 0): a client
+        // that lags before any block event is delivered — e.g. one that masks the
+        // firehose off and only wants watch matches — would otherwise be handed a
+        // resume_cursor of height 0 and re-replay from genesis on reconnect. The
+        // mempool watermark still seeds from 0 (no live mempool seen yet).
         let lag_publisher = self.publisher.clone();
-        let mut last_h = 0u32;
+        let mut last_h = self
+            .block_source
+            .as_ref()
+            .map(|s| s.current_tip_height())
+            .unwrap_or(0);
         let mut last_s = 0u64;
         let live = BroadcastStream::new(rx_live).filter_map(move |item| match item {
             Ok(env) => {
@@ -696,9 +704,11 @@ impl NodeEventStream for NodeEventStreamSvc {
                 Some(Ok(envelope_to_proto(&ev)))
             }
         });
-        // Single-shot terminal matches (depth alarm / lifecycle auto-close)
-        // self-evict: the registry de-armed the entry; here we release its quota
-        // lease and deregister it. Keyed by the threshold the match carries.
+        // Single-shot terminal matches (depth alarm / lifecycle auto-close): the
+        // registry already evicted the entry server-side on fire, so the
+        // handle.remove_* below is an idempotent no-op registry-side — its job
+        // here is to drop the carrier-held quota LEASE. Keyed by the threshold
+        // the match carries.
         let evict_handle = handle.clone();
         let evict_ws = watch_set.clone();
         let matches = ReceiverStream::new(rx_match).map(move |m| {
@@ -794,15 +804,17 @@ fn apply_control(
                 watch_set.add_transactions(principal, txids, |txids| {
                     handle.add_txids(txids, auto_close);
                 });
-            } else {
-                // Single-shot depth alarms — one item per (txid × depth).
-                let pairs: Vec<(bitcoin::Txid, u32)> = txids
-                    .iter()
-                    .flat_map(|t| depths.iter().map(move |d| (*t, *d)))
-                    .collect();
+            } else if let Some(pairs) = bounded_txid_depth_pairs(&txids, &depths) {
+                // Single-shot depth alarms — one item per (txid × distinct depth).
                 watch_set.add_tx_depths(principal, pairs, |items| {
                     handle.add_tx_depths(items);
                 });
+            } else {
+                warn!(
+                    target: "events::grpc",
+                    txids = txids.len(), depths = depths.len(),
+                    "AddTransactions txid×depth product exceeds cap; rejecting message",
+                );
             }
         }
         Some(Msg::RemoveTransactions(r)) => {
@@ -812,14 +824,16 @@ fn apply_control(
                 watch_set.remove_transactions(txids, |txids| {
                     handle.remove_txids(txids);
                 });
-            } else {
-                let pairs: Vec<(bitcoin::Txid, u32)> = txids
-                    .iter()
-                    .flat_map(|t| depths.iter().map(move |d| (*t, *d)))
-                    .collect();
+            } else if let Some(pairs) = bounded_txid_depth_pairs(&txids, &depths) {
                 watch_set.remove_tx_depths(pairs, |items| {
                     handle.remove_tx_depths(items);
                 });
+            } else {
+                warn!(
+                    target: "events::grpc",
+                    txids = txids.len(), depths = depths.len(),
+                    "RemoveTransactions txid×depth product exceeds cap; rejecting message",
+                );
             }
         }
         Some(Msg::AddDescriptor(d)) => {
