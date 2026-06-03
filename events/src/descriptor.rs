@@ -143,6 +143,28 @@ mod tests {
     }
 
     #[test]
+    fn sliding_window_overlap_shares_scripthashes() {
+        // The client-managed sliding window (B3): advancing `start` while the
+        // windows overlap must re-derive the SAME scripthashes for the shared
+        // indices — that overlap is what makes "advance start, Remove the
+        // trailing scripts" correct, since the kept scripts are byte-identical.
+        let w0 = expand_descriptor(RANGED_WPKH, 0, 5).unwrap(); // indices 0..5
+        let w1 = expand_descriptor(RANGED_WPKH, 3, 5).unwrap(); // indices 3..8
+        // Indices 3 and 4 are in both windows → identical (idx, scripthash).
+        assert_eq!(w0[3], w1[0], "index 3 derives identically in both windows");
+        assert_eq!(w0[4], w1[1], "index 4 derives identically in both windows");
+    }
+
+    #[test]
+    fn huge_start_does_not_panic() {
+        // A start near u32::MAX pushes derivation indices past the non-hardened
+        // range (>= 2^31). `expand_descriptor` must return an error (handled by
+        // the caller as "ignore"), never panic or overflow.
+        let r = expand_descriptor(RANGED_WPKH, u32::MAX - 1, 3);
+        assert!(matches!(r, Err(DescriptorError::Derive(_, _))), "got: {r:?}");
+    }
+
+    #[test]
     fn fixed_descriptor_yields_single_entry() {
         // A non-wildcard key descriptor (fixed final index) resolves to one
         // script regardless of the requested window size.
