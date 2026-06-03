@@ -14,19 +14,29 @@
 //! advance.
 
 use bitcoin::hashes::{Hash, sha256};
-use miniscript::{Descriptor, DescriptorPublicKey};
+use miniscript::descriptor::Wildcard;
+use miniscript::{Descriptor, DescriptorPublicKey, ForEachKey};
 use std::str::FromStr;
 
 /// `sha256(scriptPubKey)` — the same convention as `node_index::keys`.
 pub type Scripthash = [u8; 32];
+
+/// Upper bound on the number of derivation indices a single `AddDescriptor`
+/// may expand. `gap_limit`/`count` is attacker-controlled over the wire; an
+/// unbounded value would drive a huge `Vec` pre-allocation plus that many EC
+/// derivations on the runtime. Bitcoin Core's default gap limit is 20, so a
+/// 1000-entry window is generous for legitimate clients.
+pub const MAX_DESCRIPTOR_WINDOW: u32 = 1000;
 
 /// Errors expanding a descriptor.
 #[derive(Debug, thiserror::Error)]
 pub enum DescriptorError {
     #[error("invalid descriptor: {0}")]
     Parse(String),
-    #[error("descriptor requires a private key or is not address-deriving")]
-    NotDeriving,
+    #[error("descriptor window too large: requested {requested}, max {max}")]
+    WindowTooLarge { requested: u32, max: u32 },
+    #[error("hardened-wildcard descriptors cannot be derived from a public key")]
+    HardenedWildcard,
     #[error("descriptor derivation failed at index {0}: {1}")]
     Derive(u32, String),
 }
@@ -41,7 +51,11 @@ pub enum DescriptorError {
 ///   beyond the first.
 ///
 /// Only public descriptors are accepted (xpub / pubkey based) — the node is
-/// keyless, so a descriptor carrying a private key is rejected.
+/// keyless. Keylessness is enforced by the `Descriptor::<DescriptorPublicKey>`
+/// type parameter below: a descriptor embedding a private key (`xprv`/`tprv`/
+/// WIF) fails to parse here, because the private-key form is the separate
+/// `parse_descriptor`, which we never call. A secret can therefore never reach
+/// derivation.
 pub fn expand_descriptor(
     desc: &str,
     start: u32,
@@ -49,11 +63,23 @@ pub fn expand_descriptor(
 ) -> Result<Vec<(u32, Scripthash)>, DescriptorError> {
     let descriptor = Descriptor::<DescriptorPublicKey>::from_str(desc)
         .map_err(|e| DescriptorError::Parse(e.to_string()))?;
-    // The node never holds secrets; refuse a descriptor that embeds one.
-    if descriptor.to_string().contains("xprv") {
-        return Err(DescriptorError::NotDeriving);
+    // Reject a hardened wildcard up front: such a descriptor parses, but
+    // `at_derivation_index` PANICS on it (a hardened child cannot be derived
+    // from an xpub), so a hardened-wildcard descriptor over the wire would be
+    // a remotely reachable panic unless caught here.
+    if has_hardened_wildcard(&descriptor) {
+        return Err(DescriptorError::HardenedWildcard);
     }
     let ranged = descriptor.has_wildcard();
+    // Bound the derivation window BEFORE allocating or deriving: `count`
+    // (the wire `gap_limit`) is attacker-controlled. A fixed (non-wildcard)
+    // descriptor always yields exactly one script.
+    if ranged && count > MAX_DESCRIPTOR_WINDOW {
+        return Err(DescriptorError::WindowTooLarge {
+            requested: count,
+            max: MAX_DESCRIPTOR_WINDOW,
+        });
+    }
     let n = if ranged { count.max(1) } else { 1 };
     let mut out = Vec::with_capacity(n as usize);
     for i in 0..n {
@@ -61,12 +87,23 @@ pub fn expand_descriptor(
         let definite = descriptor
             .at_derivation_index(idx)
             .map_err(|e| DescriptorError::Derive(idx, e.to_string()))?;
-        let spk = definite
-            .script_pubkey();
+        let spk = definite.script_pubkey();
         let sh = sha256::Hash::hash(spk.as_bytes()).to_byte_array();
         out.push((idx, sh));
     }
     Ok(out)
+}
+
+/// True if any key in the descriptor is an xpub with a HARDENED wildcard
+/// (`/*h` or `/*'`). Such a descriptor parses but cannot be derived from a
+/// public key, and `at_derivation_index` panics on it, so it must be rejected
+/// before derivation.
+fn has_hardened_wildcard(desc: &Descriptor<DescriptorPublicKey>) -> bool {
+    desc.for_any_key(|k| match k {
+        DescriptorPublicKey::XPub(x) => x.wildcard == Wildcard::Hardened,
+        DescriptorPublicKey::MultiXPub(x) => x.wildcard == Wildcard::Hardened,
+        _ => false,
+    })
 }
 
 #[cfg(test)]
@@ -118,6 +155,49 @@ mod tests {
     fn rejects_malformed_descriptor() {
         assert!(matches!(
             expand_descriptor("not a descriptor", 0, 1),
+            Err(DescriptorError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_oversized_window() {
+        // A ranged descriptor with a window beyond the cap is rejected BEFORE
+        // any allocation/derivation (DoS bound), not clamped silently.
+        let err = expand_descriptor(RANGED_WPKH, 0, MAX_DESCRIPTOR_WINDOW + 1);
+        assert!(matches!(
+            err,
+            Err(DescriptorError::WindowTooLarge { requested, max })
+                if requested == MAX_DESCRIPTOR_WINDOW + 1 && max == MAX_DESCRIPTOR_WINDOW
+        ));
+        // Exactly at the cap is allowed (but we only check it does not error).
+        assert!(expand_descriptor(RANGED_WPKH, 0, MAX_DESCRIPTOR_WINDOW).is_ok());
+    }
+
+    #[test]
+    fn rejects_hardened_wildcard_without_panicking() {
+        // `/*h` parses but cannot be derived from an xpub; `at_derivation_index`
+        // would panic. expand_descriptor must return an error, not panic.
+        let hardened = "wpkh(xpub6BosfCnifzxcFwrSzQiqu2DBVTshkCXacvNsWGYJVVhhawA7d4R5WSWGFNbi8Aw6ZRc1brxMyWMzG3DSSSSoekkudhUd9yLb6qx39T9nMdj/0/*h)";
+        assert!(matches!(
+            expand_descriptor(hardened, 0, 4),
+            Err(DescriptorError::HardenedWildcard)
+        ));
+    }
+
+    #[test]
+    fn rejects_secret_bearing_descriptors() {
+        // The keyless invariant: a descriptor carrying a private key must fail
+        // to parse (it never reaches derivation). tprv (testnet xprv) and a
+        // WIF key are both rejected at parse — the `xprv` substring check the
+        // old code used would have missed tprv entirely.
+        let tprv = "wpkh(tprv8ZgxMBicQKsPeDgjzdC36fs6bMjGApWDNLR9erAXMs5skhMv36j9MV5ecvfavji5khqjWaWSFhN3YcCUUdiKH6isR4Pwy3U5y5egddBr16/0/*)";
+        assert!(matches!(
+            expand_descriptor(tprv, 0, 1),
+            Err(DescriptorError::Parse(_))
+        ));
+        let wif = "wpkh(cVt4o7BGAig1UXywgGSmARhxMdzP5qvQsxKkSsc1XEkw3tDTQFpy)";
+        assert!(matches!(
+            expand_descriptor(wif, 0, 1),
             Err(DescriptorError::Parse(_))
         ));
     }
