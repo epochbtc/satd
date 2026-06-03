@@ -667,22 +667,36 @@ impl NodeEventStream for NodeEventStreamSvc {
         let edge = *self.publisher.edge();
         let rx_live = self.publisher.subscribe();
 
+        // Watch-quota leases are owned by the SUBSCRIPTION, not the inbound
+        // control reader. gRPC/HTTP-2 lets a client half-close its send side
+        // (END_STREAM on the request) while keeping the response stream open;
+        // if the leases lived in the inbound task they would be released the
+        // moment the control stream closed, dropping the client's quota to
+        // zero while its watches stayed live on the outbound stream — letting
+        // an authed tenant register an unbounded watch-set at no standing
+        // quota cost. Holding the leases behind an `Arc` shared by both the
+        // inbound task and the outbound stream ties their lifetime to the
+        // watch-set itself: quota is released exactly when the `WatchHandle`
+        // is deregistered (full disconnect).
+        let leases: Arc<std::sync::Mutex<Vec<satd_auth::WatchLease>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+
         // Inbound control reader: applies watch-set mutations + category
-        // changes for the life of the stream, holds the watch-quota leases
-        // (released on disconnect), and holds a handle clone so the
-        // subscription is retained while either side is alive.
+        // changes for the life of the stream, recording any watch-quota leases
+        // into the shared subscription-scoped vec, and holds a handle clone so
+        // the subscription is retained while either side is alive.
         {
             let handle = handle.clone();
             let category_mask = category_mask.clone();
+            let leases = leases.clone();
             tokio::spawn(async move {
-                let mut leases: Vec<satd_auth::WatchLease> = Vec::new();
                 while let Ok(Some(ctrl)) = inbound.message().await {
-                    apply_control(ctrl, &handle, principal.as_ref(), &category_mask, &mut leases);
+                    let mut guard = leases.lock().unwrap_or_else(|p| p.into_inner());
+                    apply_control(ctrl, &handle, principal.as_ref(), &category_mask, &mut guard);
                 }
-                // Client closed the control stream → drop leases (release
-                // quota) and the handle clone (deregister when the outbound
-                // side also drops).
-                drop(leases);
+                // Inbound (control) closed. Leases are NOT released here — they
+                // belong to the subscription and drop with the outbound stream
+                // + WatchHandle when the client fully disconnects.
             });
         }
 
@@ -708,6 +722,9 @@ impl NodeEventStream for NodeEventStreamSvc {
         let merged = live.merge(matches).map(move |x| {
             let _keep_handle = &handle;
             let _keep_slot = &sub_guard;
+            // Keep the quota leases alive for the subscription's lifetime; they
+            // (and the WatchHandle) drop together when the client disconnects.
+            let _keep_leases = &leases;
             x
         });
 
@@ -730,8 +747,17 @@ fn apply_control(
     use pb::subscribe_control::Msg;
     match ctrl.msg {
         Some(Msg::AddOutpoints(a)) => {
-            let ops: Vec<bitcoin::OutPoint> =
-                a.outpoints.iter().filter_map(parse_outpoint).collect();
+            // Charge for distinct items only — a single message may repeat an
+            // entry, and the registry deduplicates on insert, so charging the
+            // raw count would overcharge the token's quota. (Cross-message
+            // dedup against the live watch-set is a follow-up.)
+            let mut seen = std::collections::HashSet::new();
+            let ops: Vec<bitcoin::OutPoint> = a
+                .outpoints
+                .iter()
+                .filter_map(parse_outpoint)
+                .filter(|o| seen.insert(*o))
+                .collect();
             if !ops.is_empty() {
                 charge_and_add(principal, leases, ops.len(), "outpoints", || {
                     handle.add_outpoints(&ops);
@@ -739,10 +765,12 @@ fn apply_control(
             }
         }
         Some(Msg::AddScripts(a)) => {
+            let mut seen = std::collections::HashSet::new();
             let shs: Vec<[u8; 32]> = a
                 .scripthashes
                 .iter()
                 .filter_map(|b| parse_scripthash(b))
+                .filter(|sh| seen.insert(*sh))
                 .collect();
             if !shs.is_empty() {
                 charge_and_add(principal, leases, shs.len(), "scripts", || {
@@ -1585,6 +1613,7 @@ mod tests {
             active_subs: Arc::new(AtomicUsize::new(0)),
             max_subscriptions: 0,
             block_source: Some(Arc::new(MockBlocks { tip: 5 })),
+            watch_registry: None,
         };
         // Resume from height 3 → replay 4, 5 (snapshot hashes [4;32], [5;32]).
         let resp = svc
@@ -1656,6 +1685,7 @@ mod tests {
             active_subs: Arc::new(AtomicUsize::new(0)),
             max_subscriptions: 0,
             block_source: Some(Arc::new(MockBlocks { tip })),
+            watch_registry: None,
         };
         // Resume from height 0 → would replay the whole chain; must clamp.
         let resp = svc
@@ -1831,6 +1861,110 @@ mod tests {
             "add must be rejected without stream:watch"
         );
         assert!(leases.is_empty(), "no lease taken on a rejected add");
+    }
+
+    /// Regression (HIGH): watch-quota leases must be owned by the
+    /// SUBSCRIPTION, not the inbound control reader. A client can half-close
+    /// its control stream (END_STREAM) while keeping the response stream open;
+    /// if the leases were dropped when the inbound task ended, the client's
+    /// quota would be released while its watches stayed live — letting it
+    /// register an unbounded watch-set at zero standing quota cost. This
+    /// mirrors the handler's wiring: the lease vec is held behind an `Arc`
+    /// shared by the inbound task and the outbound stream, so the quota is
+    /// released only when the subscription itself is torn down.
+    #[test]
+    fn watch_quota_held_until_subscription_ends_not_on_control_half_close() {
+        use satd_auth::{Accounting, Capability, CapabilitySet, LocalAccounting, Principal};
+        let acct: Arc<dyn Accounting> = Arc::new(LocalAccounting::new());
+        let principal = Principal::token(
+            Arc::from("tenant"),
+            CapabilitySet::EMPTY.with(Capability::StreamWatch),
+            Some(2),
+            None,
+            acct.clone(),
+        );
+        let quota = acct.quota();
+
+        let reg = Arc::new(node::events::WatchRegistry::new());
+        let (handle, _rx) = reg.register(node::events::WATCH_CHANNEL_CAPACITY);
+        let mask = AtomicU32::new(u32::MAX);
+
+        // The subscription-scoped lease vec (held by the outbound stream).
+        let leases: Arc<std::sync::Mutex<Vec<satd_auth::WatchLease>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        // The inbound control reader holds a clone and charges quota into it.
+        let inbound = leases.clone();
+        {
+            let mut guard = inbound.lock().unwrap();
+            apply_control(
+                pb::SubscribeControl {
+                    msg: Some(pb::subscribe_control::Msg::AddOutpoints(pb::AddOutpoints {
+                        outpoints: vec![op_proto(0x01, 0), op_proto(0x02, 0)],
+                    })),
+                },
+                &handle,
+                Some(&principal),
+                &mask,
+                &mut guard,
+            );
+        }
+        assert_eq!(quota.current("tenant"), 2, "two watches charged 2 units");
+
+        // Control stream half-closes → the inbound task ends and drops ITS
+        // clone of the lease vec. Quota must NOT be released: the watches are
+        // still live on the outbound stream.
+        drop(inbound);
+        assert_eq!(
+            quota.current("tenant"),
+            2,
+            "half-closing the control stream must NOT release the watch quota",
+        );
+
+        // Subscription ends (client fully disconnects) → outbound drops the
+        // last lease-vec reference, releasing the quota.
+        drop(leases);
+        assert_eq!(
+            quota.current("tenant"),
+            0,
+            "full disconnect releases the watch quota",
+        );
+    }
+
+    /// A single `AddOutpoints` message that repeats an entry is charged once
+    /// per DISTINCT item, not per raw entry — the registry dedups on insert,
+    /// so charging the raw count would overcharge the token's quota.
+    #[test]
+    fn duplicate_entries_in_one_add_charge_once() {
+        use satd_auth::{Accounting, Capability, CapabilitySet, LocalAccounting, Principal};
+        let acct: Arc<dyn Accounting> = Arc::new(LocalAccounting::new());
+        let principal = Principal::token(
+            Arc::from("tenant"),
+            CapabilitySet::EMPTY.with(Capability::StreamWatch),
+            Some(5),
+            None,
+            acct.clone(),
+        );
+        let reg = Arc::new(node::events::WatchRegistry::new());
+        let (handle, _rx) = reg.register(node::events::WATCH_CHANNEL_CAPACITY);
+        let mask = AtomicU32::new(u32::MAX);
+        let mut leases = Vec::new();
+        apply_control(
+            pb::SubscribeControl {
+                msg: Some(pb::subscribe_control::Msg::AddOutpoints(pb::AddOutpoints {
+                    // Same outpoint three times → one distinct unit.
+                    outpoints: vec![op_proto(0x07, 3), op_proto(0x07, 3), op_proto(0x07, 3)],
+                })),
+            },
+            &handle,
+            Some(&principal),
+            &mask,
+            &mut leases,
+        );
+        assert_eq!(
+            acct.quota().current("tenant"),
+            1,
+            "a 3x-repeated entry charges a single distinct unit",
+        );
     }
 
     /// End-to-end bidi `Watch`: a client adds an outpoint to its watch-set
