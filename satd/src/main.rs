@@ -981,6 +981,7 @@ async fn main() {
             mempool.clone(),
             chain_rx,
             mempool_rx,
+            config.stream_max_resync_blocks,
             shutdown_rx.clone(),
         ));
         tracing::info!(target: "events", "watch matcher started");
