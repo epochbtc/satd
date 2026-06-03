@@ -111,6 +111,28 @@ impl WatchLease {
     pub fn units(&self) -> u64 {
         self.n
     }
+
+    /// Split a single unit off this lease into a new one-unit lease over the
+    /// same principal, **without charging or releasing any units**. Returns
+    /// `None` once this lease holds nothing left to split.
+    ///
+    /// The two leases together still hold the same total the store charged;
+    /// dropping either releases only its own units. This lets an atomic batch
+    /// reservation (`acquire(n)` — charged all-or-nothing in one round-trip)
+    /// be redistributed into per-item leases, so an individual watch can
+    /// return its unit on removal without a second, racy acquire call. Because
+    /// no store call is made, the total charged is conserved exactly.
+    pub fn split_off_one(&mut self) -> Option<WatchLease> {
+        if self.n == 0 {
+            return None;
+        }
+        self.n -= 1;
+        Some(WatchLease {
+            store: Arc::clone(&self.store),
+            principal_id: Arc::clone(&self.principal_id),
+            n: 1,
+        })
+    }
 }
 
 impl std::fmt::Debug for WatchLease {
@@ -413,6 +435,32 @@ mod tests {
         assert_eq!(q.current("tenant"), 6);
         drop(l1);
         assert_eq!(q.current("tenant"), 0);
+    }
+
+    #[test]
+    fn split_off_one_conserves_units_and_releases_per_split() {
+        let q: Arc<dyn QuotaStore> = Arc::new(LocalQuotaStore::new());
+        // Reserve 3 units atomically, then split into per-item leases.
+        let mut batch = WatchLease::acquire(q.clone(), Arc::from("tenant"), 3, 10).unwrap();
+        assert_eq!(q.current("tenant"), 3, "batch reservation charges 3 up front");
+
+        let a = batch.split_off_one().unwrap();
+        let b = batch.split_off_one().unwrap();
+        let c = batch.split_off_one().unwrap();
+        // Splitting moves units between leases — it never touches the store.
+        assert_eq!(q.current("tenant"), 3, "splitting does not re-charge or release");
+        assert_eq!(batch.units(), 0);
+        assert!(batch.split_off_one().is_none(), "nothing left to split");
+
+        // Dropping the drained batch releases nothing; each per-item lease frees
+        // exactly its one unit.
+        drop(batch);
+        assert_eq!(q.current("tenant"), 3);
+        drop(b);
+        assert_eq!(q.current("tenant"), 2, "one per-item lease released one unit");
+        drop(a);
+        drop(c);
+        assert_eq!(q.current("tenant"), 0, "all per-item leases released");
     }
 
     #[test]
