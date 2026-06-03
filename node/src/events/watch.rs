@@ -81,6 +81,15 @@ pub enum WatchMatch {
         confirmed: bool,
         height: Option<u32>,
     },
+    /// A watched transaction id appeared — in the mempool (`confirmed =
+    /// false`) or a connected block (`confirmed = true`). The plain "did this
+    /// txid land" primitive, complementing the outpoint/script watches.
+    TxidMatched {
+        txid: Txid,
+        confirmed: bool,
+        /// Block height when `confirmed`; `None` in the mempool.
+        height: Option<u32>,
+    },
 }
 
 /// Opaque per-subscriber identifier.
@@ -90,6 +99,7 @@ struct Subscriber {
     sender: mpsc::Sender<WatchMatch>,
     outpoints: HashSet<OutPoint>,
     scripthashes: HashSet<Scripthash>,
+    txids: HashSet<Txid>,
 }
 
 #[derive(Default)]
@@ -100,6 +110,8 @@ struct Inner {
     by_outpoint: HashMap<OutPoint, HashSet<SubId>>,
     /// Inverted index: watched scripthash → subscribers watching it.
     by_scripthash: HashMap<Scripthash, HashSet<SubId>>,
+    /// Inverted index: watched txid → subscribers watching it. O(1) per tx.
+    by_txid: HashMap<Txid, HashSet<SubId>>,
 }
 
 /// Registry of per-subscriber outpoint/script watch-sets with O(1)
@@ -116,6 +128,9 @@ pub struct WatchRegistry {
     /// recover spent prevout scriptPubKeys) only when some script is watched,
     /// so an outpoint-only watch-set pays nothing extra.
     script_items: AtomicUsize,
+    /// Lock-free count of registered *txid* items only. Gates the per-tx txid
+    /// lookup so a watch-set with no txids pays nothing for it.
+    txid_items: AtomicUsize,
 }
 
 impl Default for WatchRegistry {
@@ -131,6 +146,7 @@ impl WatchRegistry {
             next_id: AtomicU64::new(1),
             watch_items: AtomicUsize::new(0),
             script_items: AtomicUsize::new(0),
+            txid_items: AtomicUsize::new(0),
         }
     }
 
@@ -144,6 +160,12 @@ impl WatchRegistry {
     /// gates the input-side undo-data fetch.
     pub fn has_script_watchers(&self) -> bool {
         self.script_items.load(Ordering::Acquire) > 0
+    }
+
+    /// `true` if any subscriber is watching at least one txid. Lock-free;
+    /// gates the per-tx txid lookup.
+    pub fn has_txid_watchers(&self) -> bool {
+        self.txid_items.load(Ordering::Acquire) > 0
     }
 
     fn lock_inner(&self) -> std::sync::RwLockWriteGuard<'_, Inner> {
@@ -169,6 +191,7 @@ impl WatchRegistry {
                 sender: tx,
                 outpoints: HashSet::new(),
                 scripthashes: HashSet::new(),
+                txids: HashSet::new(),
             },
         );
         (
@@ -264,6 +287,47 @@ impl WatchRegistry {
         removed
     }
 
+    /// Add txids to a subscriber's watch-set. Returns the number newly added.
+    fn add_txids(&self, id: SubId, txids: &[Txid]) -> usize {
+        let mut inner = self.lock_inner();
+        let mut added = 0;
+        for t in txids {
+            let Some(sub) = inner.subs.get_mut(&id) else {
+                return added;
+            };
+            if sub.txids.insert(*t) {
+                added += 1;
+                inner.by_txid.entry(*t).or_default().insert(id);
+            }
+        }
+        self.watch_items.fetch_add(added, Ordering::AcqRel);
+        self.txid_items.fetch_add(added, Ordering::AcqRel);
+        added
+    }
+
+    /// Remove txids from a subscriber's watch-set. Returns the number removed.
+    fn remove_txids(&self, id: SubId, txids: &[Txid]) -> usize {
+        let mut inner = self.lock_inner();
+        let mut removed = 0;
+        for t in txids {
+            let Some(sub) = inner.subs.get_mut(&id) else {
+                break;
+            };
+            if sub.txids.remove(t) {
+                removed += 1;
+                if let Some(set) = inner.by_txid.get_mut(t) {
+                    set.remove(&id);
+                    if set.is_empty() {
+                        inner.by_txid.remove(t);
+                    }
+                }
+            }
+        }
+        self.watch_items.fetch_sub(removed, Ordering::AcqRel);
+        self.txid_items.fetch_sub(removed, Ordering::AcqRel);
+        removed
+    }
+
     /// De-register a subscriber and all its watches (called on
     /// [`WatchHandle`] drop).
     fn deregister(&self, id: SubId) {
@@ -271,8 +335,9 @@ impl WatchRegistry {
         let Some(sub) = inner.subs.remove(&id) else {
             return;
         };
-        let freed = sub.outpoints.len() + sub.scripthashes.len();
+        let freed = sub.outpoints.len() + sub.scripthashes.len() + sub.txids.len();
         let freed_scripts = sub.scripthashes.len();
+        let freed_txids = sub.txids.len();
         for op in &sub.outpoints {
             if let Some(set) = inner.by_outpoint.get_mut(op) {
                 set.remove(&id);
@@ -289,8 +354,17 @@ impl WatchRegistry {
                 }
             }
         }
+        for t in &sub.txids {
+            if let Some(set) = inner.by_txid.get_mut(t) {
+                set.remove(&id);
+                if set.is_empty() {
+                    inner.by_txid.remove(t);
+                }
+            }
+        }
         self.watch_items.fetch_sub(freed, Ordering::AcqRel);
         self.script_items.fetch_sub(freed_scripts, Ordering::AcqRel);
+        self.txid_items.fetch_sub(freed_txids, Ordering::AcqRel);
     }
 
     /// Scan every transaction in a connected block, routing matches to
@@ -369,6 +443,20 @@ fn scan_tx(inner: &Inner, tx: &Transaction, confirmed: bool, height: Option<u32>
                     deliver(inner, *sid, &m);
                 }
             }
+        }
+    }
+
+    // Txid → watched-transaction appearance (mempool or block).
+    if !inner.by_txid.is_empty()
+        && let Some(subs) = inner.by_txid.get(&txid)
+    {
+        let m = WatchMatch::TxidMatched {
+            txid,
+            confirmed,
+            height,
+        };
+        for sid in subs {
+            deliver(inner, *sid, &m);
         }
     }
 }
@@ -471,6 +559,16 @@ impl WatchHandle {
     /// Remove scripthashes; returns the count removed.
     pub fn remove_scripthashes(&self, scripthashes: &[Scripthash]) -> usize {
         self.registry.remove_scripthashes(self.id, scripthashes)
+    }
+
+    /// Add txids to this subscriber's watch-set; returns the count newly added.
+    pub fn add_txids(&self, txids: &[Txid]) -> usize {
+        self.registry.add_txids(self.id, txids)
+    }
+
+    /// Remove txids; returns the count removed.
+    pub fn remove_txids(&self, txids: &[Txid]) -> usize {
+        self.registry.remove_txids(self.id, txids)
     }
 }
 
@@ -874,6 +972,61 @@ mod tests {
         handle.add_outpoints(&[outpoint(0x01, 0)]);
         reg.scan_mempool_tx(&spending_tx(outpoint(0x02, 0)));
         assert!(rx.try_recv().is_err(), "unwatched spend must not match");
+    }
+
+    #[test]
+    fn matches_watched_txid_mempool_then_confirmed() {
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let tx = funding_tx(ScriptBuf::from(vec![0x51]));
+        let txid = tx.compute_txid();
+        assert_eq!(handle.add_txids(&[txid]), 1);
+        assert!(reg.has_watchers());
+        assert!(reg.has_txid_watchers());
+
+        // Mempool sighting → unconfirmed match.
+        reg.scan_mempool_tx(&tx);
+        match rx.try_recv().expect("mempool match") {
+            WatchMatch::TxidMatched {
+                txid: t,
+                confirmed,
+                height,
+            } => {
+                assert_eq!(t, txid);
+                assert!(!confirmed);
+                assert_eq!(height, None);
+            }
+            other => panic!("wrong match: {other:?}"),
+        }
+
+        // Then in a block at height 9 → confirmed match.
+        reg.scan_block(&block_with(vec![tx]), 9, None);
+        match rx.try_recv().expect("confirmed match") {
+            WatchMatch::TxidMatched {
+                confirmed, height, ..
+            } => {
+                assert!(confirmed);
+                assert_eq!(height, Some(9));
+            }
+            other => panic!("wrong match: {other:?}"),
+        }
+
+        // Remove → no longer a watcher, no further match.
+        assert_eq!(handle.remove_txids(&[txid]), 1);
+        assert!(!reg.has_txid_watchers());
+        reg.scan_mempool_tx(&funding_tx(ScriptBuf::from(vec![0x51])));
+        assert!(rx.try_recv().is_err(), "removed txid must not match");
+    }
+
+    #[test]
+    fn unwatched_txid_does_not_match() {
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let watched = funding_tx(ScriptBuf::from(vec![0x51])).compute_txid();
+        handle.add_txids(&[watched]);
+        // A different transaction (distinct script → distinct txid).
+        reg.scan_mempool_tx(&funding_tx(ScriptBuf::from(vec![0x52])));
+        assert!(rx.try_recv().is_err(), "unwatched txid must not match");
     }
 
     // --- input-side script matching (B1, confirmed via undo data) ---

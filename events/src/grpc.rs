@@ -762,6 +762,20 @@ fn apply_control(
                 },
             );
         }
+        Some(Msg::AddTransactions(a)) => {
+            watch_set.add_transactions(
+                principal,
+                a.txids.iter().filter_map(|b| parse_txid(b)),
+                |txids| {
+                    handle.add_txids(txids);
+                },
+            );
+        }
+        Some(Msg::RemoveTransactions(r)) => {
+            watch_set.remove_transactions(r.txids.iter().filter_map(|b| parse_txid(b)), |txids| {
+                handle.remove_txids(txids);
+            });
+        }
         Some(Msg::AddDescriptor(d)) => {
             // Expand the descriptor over its [start, start+gap_limit) window and
             // watch it (rust-miniscript). Charges one unit per net-new script.
@@ -828,6 +842,19 @@ fn parse_scripthash(b: &[u8]) -> Option<[u8; 32]> {
     Some(sh)
 }
 
+/// Parse a raw 32-byte txid; `None` for a wrong length.
+fn parse_txid(b: &[u8]) -> Option<bitcoin::Txid> {
+    use bitcoin::hashes::Hash;
+    if b.len() != 32 {
+        return None;
+    }
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(b);
+    Some(bitcoin::Txid::from_raw_hash(
+        bitcoin::hashes::sha256d::Hash::from_byte_array(bytes),
+    ))
+}
+
 /// Convert a per-subscriber [`WatchMatch`](node::events::WatchMatch) into a
 /// wire `NodeEvent`. Confirmed matches carry a `(height, 0)` cursor; the
 /// stamp seq is 0 (matches are positioned by their identity, not the
@@ -869,6 +896,18 @@ fn watch_match_to_proto(
                 is_output: *is_output,
                 index: *index,
                 confirmed: *confirmed,
+            });
+            (cursor_from_height(*height, edge.instance_id), body)
+        }
+        WatchMatch::TxidMatched {
+            txid,
+            confirmed,
+            height,
+        } => {
+            let body = pb::node_event::Body::TxidMatched(pb::TxidMatched {
+                txid: txid.as_raw_hash().to_byte_array().to_vec(),
+                confirmed: *confirmed,
+                height: height.unwrap_or(0),
             });
             (cursor_from_height(*height, edge.instance_id), body)
         }
@@ -1347,6 +1386,7 @@ mod tests {
                 pb::node_event::Body::ScriptMatched(_) => "script_matched",
                 pb::node_event::Body::DescriptorNeedsAddresses(_) => "descriptor_needs_addresses",
                 pb::node_event::Body::Lagged(_) => "lagged",
+                pb::node_event::Body::TxidMatched(_) => "txid_matched",
             })
             .collect();
         assert!(

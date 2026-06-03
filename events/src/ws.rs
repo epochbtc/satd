@@ -598,6 +598,10 @@ enum WsControl {
     AddScripts { scripthashes: Vec<String> },
     /// Remove scripthashes from the watch-set.
     RemoveScripts { scripthashes: Vec<String> },
+    /// Add transaction ids (display/reversed hex) to the watch-set.
+    AddTransactions { txids: Vec<String> },
+    /// Remove transaction ids from the watch-set.
+    RemoveTransactions { txids: Vec<String> },
     /// Expand a descriptor (rust-miniscript) into a script watch-set.
     AddDescriptor {
         descriptor: String,
@@ -620,6 +624,11 @@ fn parse_ws_outpoint(o: &WsOutpoint) -> Option<bitcoin::OutPoint> {
     use std::str::FromStr;
     let txid = bitcoin::Txid::from_str(&o.txid).ok()?;
     Some(bitcoin::OutPoint { txid, vout: o.vout })
+}
+
+fn parse_ws_txid(s: &str) -> Option<bitcoin::Txid> {
+    use std::str::FromStr;
+    bitcoin::Txid::from_str(s).ok()
 }
 
 fn parse_ws_scripthash(s: &str) -> Option<[u8; 32]> {
@@ -686,6 +695,20 @@ fn apply_ws_control(
                 },
             );
         }
+        WsControl::AddTransactions { txids } => {
+            watch_set.add_transactions(
+                principal,
+                txids.iter().filter_map(|s| parse_ws_txid(s)),
+                |txids| {
+                    handle.add_txids(txids);
+                },
+            );
+        }
+        WsControl::RemoveTransactions { txids } => {
+            watch_set.remove_transactions(txids.iter().filter_map(|s| parse_ws_txid(s)), |txids| {
+                handle.remove_txids(txids);
+            });
+        }
         WsControl::AddDescriptor {
             descriptor,
             gap_limit,
@@ -751,6 +774,19 @@ fn watch_match_json(m: &WatchMatch) -> serde_json::Value {
                 "confirmed": confirmed,
             }
         }),
+        WatchMatch::TxidMatched {
+            txid,
+            confirmed,
+            height,
+        } => json!({
+            "schema_version": node::events::SCHEMA_VERSION,
+            "cursor": height.map(|h| json!({ "height": h, "tx_index": 0, "mempool_seq": 0 })),
+            "body": {
+                "category": "txid_matched",
+                "txid": hex::encode(txid.as_raw_hash().to_byte_array()),
+                "confirmed": confirmed,
+            }
+        }),
     }
 }
 
@@ -786,6 +822,30 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(c, WsControl::AddOutpoints { .. }));
+
+        let c: WsControl =
+            serde_json::from_str(r#"{"type":"add_transactions","txids":["aa","bb"]}"#).unwrap();
+        match c {
+            WsControl::AddTransactions { txids } => assert_eq!(txids.len(), 2),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn txid_match_json_shape() {
+        use bitcoin::hashes::Hash;
+        let m = WatchMatch::TxidMatched {
+            txid: bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+                [0xcd; 32],
+            )),
+            confirmed: true,
+            height: Some(202),
+        };
+        let v = watch_match_json(&m);
+        assert_eq!(v["body"]["category"], "txid_matched");
+        assert_eq!(v["body"]["confirmed"], true);
+        assert_eq!(v["body"]["txid"], "cd".repeat(32));
+        assert_eq!(v["cursor"]["height"], 202);
     }
 
     #[test]

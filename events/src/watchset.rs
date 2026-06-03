@@ -31,7 +31,7 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 
-use bitcoin::OutPoint;
+use bitcoin::{OutPoint, Txid};
 use tracing::warn;
 
 /// A scripthash is `sha256(scriptPubKey)`. Mirrors `node_index::keys::Scripthash`
@@ -46,6 +46,7 @@ type Scripthash = [u8; 32];
 pub(crate) struct WatchSet {
     outpoints: HashMap<OutPoint, Option<satd_auth::WatchLease>>,
     scripts: HashMap<Scripthash, Option<satd_auth::WatchLease>>,
+    txids: HashMap<Txid, Option<satd_auth::WatchLease>>,
 }
 
 impl WatchSet {
@@ -91,10 +92,29 @@ impl WatchSet {
         remove_items(&mut self.scripts, incoming, unregister);
     }
 
+    /// Add txids, charging the quota only for items not already watched.
+    pub(crate) fn add_transactions(
+        &mut self,
+        principal: Option<&satd_auth::Principal>,
+        incoming: impl IntoIterator<Item = Txid>,
+        register: impl FnOnce(&[Txid]),
+    ) {
+        add_items(&mut self.txids, principal, incoming, "transactions", register);
+    }
+
+    /// Remove txids, releasing each removed item's quota unit.
+    pub(crate) fn remove_transactions(
+        &mut self,
+        incoming: impl IntoIterator<Item = Txid>,
+        unregister: impl FnOnce(&[Txid]),
+    ) {
+        remove_items(&mut self.txids, incoming, unregister);
+    }
+
     /// Total watched items (diagnostics / tests).
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
-        self.outpoints.len() + self.scripts.len()
+        self.outpoints.len() + self.scripts.len() + self.txids.len()
     }
 }
 
@@ -279,6 +299,25 @@ mod tests {
         assert!(!registered, "an add that overflows quota registers nothing");
         assert_eq!(q.current("tenant"), 0, "no units charged on a rejected add");
         assert_eq!(ws.len(), 0);
+    }
+
+    fn txid(b: u8) -> Txid {
+        use bitcoin::hashes::Hash;
+        bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([b; 32]))
+    }
+
+    #[test]
+    fn add_transactions_charges_and_releases_quota() {
+        let (p, acct) = tenant(10);
+        let q = acct.quota();
+        let mut ws = WatchSet::default();
+        ws.add_transactions(Some(&p), [txid(1), txid(2)], |items| {
+            assert_eq!(items.len(), 2)
+        });
+        assert_eq!(q.current("tenant"), 2, "two txids charge 2 units");
+        ws.remove_transactions([txid(1)], |items| assert_eq!(items.len(), 1));
+        assert_eq!(q.current("tenant"), 1, "per-remove release frees one unit");
+        assert_eq!(ws.len(), 1);
     }
 
     #[test]
