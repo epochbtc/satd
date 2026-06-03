@@ -9,8 +9,9 @@
 //! subscribing to the raw broadcasts directly — this service only
 //! handles the new external-transport pipeline.
 
-use std::sync::Arc;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::{broadcast, watch};
@@ -30,6 +31,16 @@ use super::sink::EventSink;
 /// simultaneously.
 pub const ENVELOPE_BROADCAST_CAPACITY: usize = 4096;
 
+/// Depth of the best-effort mempool replay ring. Holds the most recent
+/// published envelopes so a reconnecting client with a `from_cursor`
+/// mempool watermark can replay mempool transitions it missed within a
+/// bounded window, then join live. The mempool is not durable, so this is
+/// explicitly lossy: a cursor older than the oldest retained entry simply
+/// resumes from the window's start. Confirmed-side replay does NOT use
+/// this ring — it reads the durable block index (see
+/// [`super::BlockCursorSource`]).
+pub const REPLAY_RING_CAPACITY: usize = 1024;
+
 /// Heartbeat cadence. One per second is enough for end-to-end pipeline
 /// latency probes; the bandwidth cost is trivial (a single envelope
 /// per second). Subscribers that don't want heartbeats filter via the
@@ -43,6 +54,11 @@ pub struct EventPublisher {
     edge: EdgeIdentity,
     seq: AtomicU64,
     started_monotonic: Instant,
+    /// Bounded ring of the most recent published envelopes, for
+    /// best-effort mempool cursor replay. Short critical section (one
+    /// push + bounded pop per publish); no `.await` is held across the
+    /// lock, so a `std::sync::Mutex` is appropriate.
+    replay_ring: Mutex<VecDeque<NodeEvent>>,
 }
 
 impl EventPublisher {
@@ -55,6 +71,7 @@ impl EventPublisher {
             edge,
             seq: AtomicU64::new(0),
             started_monotonic: Instant::now(),
+            replay_ring: Mutex::new(VecDeque::with_capacity(REPLAY_RING_CAPACITY)),
         })
     }
 
@@ -113,10 +130,45 @@ impl EventPublisher {
         // as the best-effort mempool high-water mark.
         let cursor = body.derive_cursor(stamp.seq);
         let env = NodeEvent::with_cursor(stamp, cursor, body);
+        // Record into the bounded replay ring before broadcasting, so a
+        // reconnecting client can replay recent mempool transitions it
+        // missed (best-effort, bounded window). Lock poisoning would only
+        // happen if a holder panicked mid-update; recover the guard rather
+        // than propagate a panic into the publish path.
+        {
+            let mut ring = self
+                .replay_ring
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if ring.len() == REPLAY_RING_CAPACITY {
+                ring.pop_front();
+            }
+            ring.push_back(env.clone());
+        }
         // `send` returns `Err(SendError)` only when there are no active
         // receivers. That's the no-sinks-configured case — silent drop
         // is correct.
         let _ = self.out.send(env);
+    }
+
+    /// Best-effort replay of mempool-category envelopes published after
+    /// `after_seq`, oldest-first, from the bounded replay ring. Used by a
+    /// streaming subscriber resuming from a `from_cursor` mempool
+    /// watermark: confirmed history comes from the durable block index,
+    /// mempool history (which is not durable) from this lossy window. A
+    /// watermark older than the ring's oldest retained entry simply
+    /// resumes from the window's start.
+    pub fn replay_mempool_since(&self, after_seq: u64) -> Vec<NodeEvent> {
+        let ring = self
+            .replay_ring
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        ring.iter()
+            .filter(|e| {
+                e.stamp.seq > after_seq && matches!(e.body, NodeEventBody::Mempool(_))
+            })
+            .cloned()
+            .collect()
     }
 
     /// Spawn the bridge tasks: one for the mempool broadcast and one
