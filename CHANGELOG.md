@@ -350,6 +350,16 @@ All additions are opt-in; the wire schema is `v1`. See `docs/api/streaming.md`.
   several depths per tx. Depth tracking is reorg-safe (a confirming block reorged
   off the active chain reverts the entry, which re-arms if the tx reappears) and
   resolves already-buried txs best-effort via the txindex.
+- **Privacy-preserving prefix watches.** A subscription can watch a *k-bit
+  prefix* of `sha256(scriptPubKey)` (`AddScriptPrefixes`) instead of an exact
+  script: the server delivers every transaction whose output *or* spent-prevout
+  script falls in the 2⁻ᵏ bucket — the full transaction inline, so the client
+  filters locally — and learns only the bucket, never the exact script. It is the
+  push dual of BIP 158 (output + spent-prevout membership) but with no fetch step
+  and full mempool coverage. Granularity is operator-bounded
+  (`-streamprefixminbits` / `-streamprefixmaxbits`, defaults 8 / 32; the maximum
+  caps precision so a bucket always spans many scripts), and the quota is priced
+  by coarseness — a coarser bucket costs proportionally more units.
 - **Operator-configurable consumption caps.** Connection, per-connection
   subscription, and inbound-message-size caps for the WS transport
   (`-streamwsmaxconns` / `-streamwsmaxsubscriptions` / `-streamwsmaxmessagebytes`,

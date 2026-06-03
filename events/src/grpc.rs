@@ -45,6 +45,10 @@ pub struct GrpcLimits {
     /// Hard cap on concurrent `Subscribe` streams across all connections. A
     /// `Subscribe` beyond the cap is rejected with `RESOURCE_EXHAUSTED`.
     pub max_subscriptions: usize,
+    /// Minimum allowed bit-length for a script-prefix watch (§7.5).
+    pub prefix_min_bits: u8,
+    /// Maximum allowed bit-length for a script-prefix watch (§7.5).
+    pub prefix_max_bits: u8,
 }
 
 impl Default for GrpcLimits {
@@ -52,6 +56,8 @@ impl Default for GrpcLimits {
         Self {
             max_conns: 64,
             max_subscriptions: 256,
+            prefix_min_bits: 8,
+            prefix_max_bits: 32,
         }
     }
 }
@@ -230,6 +236,8 @@ impl EventSink for GrpcEventSink {
             max_subscriptions: self.limits.max_subscriptions,
             block_source: self.block_source.clone(),
             watch_registry: self.watch_registry.clone(),
+            prefix_min_bits: self.limits.prefix_min_bits,
+            prefix_max_bits: self.limits.prefix_max_bits,
         };
         info!(target: "events::grpc", addr = %self.addr, "events gRPC server starting");
         let shutdown_signal = async move {
@@ -316,6 +324,9 @@ struct NodeEventStreamSvc {
     block_source: Option<std::sync::Arc<dyn node::events::BlockCursorSource>>,
     /// Live watch registry backing the `Watch` RPC; `None` disables it.
     watch_registry: Option<std::sync::Arc<node::events::WatchRegistry>>,
+    /// Operator bounds on script-prefix watch granularity (§7.5).
+    prefix_min_bits: u8,
+    prefix_max_bits: u8,
 }
 
 /// RAII guard decrementing the active-subscription counter when a stream is
@@ -660,10 +671,18 @@ impl NodeEventStream for NodeEventStreamSvc {
             let handle = handle.clone();
             let category_mask = category_mask.clone();
             let watch_set = watch_set.clone();
+            let prefix_bounds = (self.prefix_min_bits, self.prefix_max_bits);
             tokio::spawn(async move {
                 while let Ok(Some(ctrl)) = inbound.message().await {
                     let mut guard = watch_set.lock().unwrap_or_else(|p| p.into_inner());
-                    apply_control(ctrl, &handle, principal.as_ref(), &category_mask, &mut guard);
+                    apply_control(
+                        ctrl,
+                        &handle,
+                        principal.as_ref(),
+                        &category_mask,
+                        &mut guard,
+                        prefix_bounds,
+                    );
                 }
                 // Inbound (control) closed. The watch-set is NOT dropped here —
                 // it belongs to the subscription and drops with the outbound
@@ -759,8 +778,10 @@ fn apply_control(
     principal: Option<&satd_auth::Principal>,
     category_mask: &AtomicU32,
     watch_set: &mut WatchSet,
+    prefix_bounds: (u8, u8),
 ) {
     use pb::subscribe_control::Msg;
+    let (prefix_min_bits, prefix_max_bits) = prefix_bounds;
     match ctrl.msg {
         Some(Msg::AddOutpoints(a)) => {
             watch_set.add_outpoints(
@@ -856,6 +877,43 @@ fn apply_control(
                     warn!(target: "events::grpc", error = %e, "ignoring invalid descriptor");
                 }
             }
+        }
+        Some(Msg::AddScriptPrefixes(a)) => {
+            // Validate + price each prefix; malformed or out-of-range buckets are
+            // dropped (filter_map) before charging. Coarseness-priced quota.
+            let items: Vec<((u8, u32), u64)> = a
+                .prefixes
+                .iter()
+                .filter_map(|p| {
+                    crate::watchset::parse_prefix(
+                        &p.prefix,
+                        p.bits,
+                        prefix_min_bits,
+                        prefix_max_bits,
+                    )
+                })
+                .collect();
+            watch_set.add_prefixes(principal, items, |keys| {
+                handle.add_prefixes(keys);
+            });
+        }
+        Some(Msg::RemoveScriptPrefixes(r)) => {
+            let keys: Vec<(u8, u32)> = r
+                .prefixes
+                .iter()
+                .filter_map(|p| {
+                    crate::watchset::parse_prefix(
+                        &p.prefix,
+                        p.bits,
+                        prefix_min_bits,
+                        prefix_max_bits,
+                    )
+                    .map(|(key, _units)| key)
+                })
+                .collect();
+            watch_set.remove_prefixes(keys, |keys| {
+                handle.remove_prefixes(keys);
+            });
         }
         Some(Msg::SetCategories(c)) => {
             let mask = if c.categories == 0 {
@@ -1019,6 +1077,28 @@ fn watch_match_to_proto(
             });
             (cursor_from_height(Some(*height), edge.instance_id), body)
         }
+        WatchMatch::PrefixMatched(pm) => {
+            let (masked, bits) = pm.prefix;
+            let body = pb::node_event::Body::PrefixMatched(pb::PrefixMatched {
+                prefix: Some(pb::ScriptPrefix {
+                    prefix: prefix_wire_bytes(masked, bits),
+                    bits: bits as u32,
+                }),
+                raw_tx: pm.raw_tx.to_vec(),
+                confirmed: pm.confirmed,
+                height: pm.height.unwrap_or(0),
+                matched_prevouts: pm
+                    .matched_prevouts
+                    .iter()
+                    .map(|(op, spk)| pb::SpentPrevout {
+                        outpoint_txid: op.txid.as_raw_hash().to_byte_array().to_vec(),
+                        outpoint_vout: op.vout,
+                        script_pubkey: spk.to_bytes(),
+                    })
+                    .collect(),
+            });
+            (cursor_from_height(pm.height, edge.instance_id), body)
+        }
     };
     pb::NodeEvent {
         schema_version: node::events::SCHEMA_VERSION,
@@ -1035,6 +1115,14 @@ fn cursor_from_height(height: Option<u32>, instance_id: u64) -> Option<pb::Curso
         mempool_seq: 0,
         instance_id,
     })
+}
+
+/// Render a bucket key back to wire form: the top `ceil(bits/8)` big-endian
+/// bytes of the masked `u32` (low bits beyond `bits` are already zero). Inverse
+/// of [`node::events::prefix_bucket_key`].
+fn prefix_wire_bytes(masked: u32, bits: u8) -> Vec<u8> {
+    let nbytes = (bits as usize).div_ceil(8);
+    masked.to_be_bytes()[..nbytes.min(4)].to_vec()
 }
 
 /// Discard `Streaming` from the request, leaving only the unary message
@@ -1568,6 +1656,7 @@ mod tests {
                 pb::node_event::Body::TxidUnconfirmed(_) => "txid_unconfirmed",
                 pb::node_event::Body::TxidDepthReached(_) => "txid_depth_reached",
                 pb::node_event::Body::TxidFinalized(_) => "txid_finalized",
+                pb::node_event::Body::PrefixMatched(_) => "prefix_matched",
             })
             .collect();
         assert!(
@@ -1590,6 +1679,8 @@ mod tests {
             max_subscriptions: 2,
             block_source: None,
             watch_registry: None,
+            prefix_min_bits: 8,
+            prefix_max_bits: 32,
         };
         let mk = || {
             Request::new(pb::SubscribeRequest {
@@ -1685,6 +1776,8 @@ mod tests {
             max_subscriptions: 0,
             block_source: Some(Arc::new(MockBlocks { tip: 5 })),
             watch_registry: None,
+            prefix_min_bits: 8,
+            prefix_max_bits: 32,
         };
         // Resume from height 2 → replay 3, 4, 5 (chain category only).
         let resp = svc
@@ -1737,6 +1830,8 @@ mod tests {
             max_subscriptions: 0,
             block_source: Some(Arc::new(MockBlocks { tip: 5 })),
             watch_registry: None,
+            prefix_min_bits: 8,
+            prefix_max_bits: 32,
         };
         let resp = svc
             .subscribe(Request::new(pb::SubscribeRequest {
@@ -1809,6 +1904,8 @@ mod tests {
             max_subscriptions: 0,
             block_source: Some(Arc::new(MockBlocks { tip: 5 })),
             watch_registry: None,
+            prefix_min_bits: 8,
+            prefix_max_bits: 32,
         };
         // Resume from height 3 → replay 4, 5 (snapshot hashes [4;32], [5;32]).
         let resp = svc
@@ -1885,6 +1982,8 @@ mod tests {
             max_subscriptions: 0,
             block_source: Some(Arc::new(MockBlocks { tip })),
             watch_registry: None,
+            prefix_min_bits: 8,
+            prefix_max_bits: 32,
         };
         // Resume from height 0 → would replay the whole chain; must clamp.
         let resp = svc
@@ -1940,6 +2039,8 @@ mod tests {
             // tip 0 → no confirmed replay; isolate the mempool window.
             block_source: Some(Arc::new(MockBlocks { tip: 0 })),
             watch_registry: None,
+            prefix_min_bits: 8,
+            prefix_max_bits: 32,
         };
         // Resume from mempool_seq = 1 on the SAME instance → replay seqs 2, 3.
         let resp = svc
@@ -1997,6 +2098,8 @@ mod tests {
             max_subscriptions: 0,
             block_source: Some(Arc::new(MockBlocks { tip: 0 })),
             watch_registry: None,
+            prefix_min_bits: 8,
+            prefix_max_bits: 32,
         };
         // Same mempool_seq=1 as the same-instance test, but a STALE instance
         // → epoch mismatch → discard the watermark → replay seqs 1, 2, 3.
@@ -2044,6 +2147,8 @@ mod tests {
             max_subscriptions: 0,
             block_source: Some(Arc::new(MockBlocks { tip: 5 })),
             watch_registry: None,
+            prefix_min_bits: 8,
+            prefix_max_bits: 32,
         };
         // Stale instance_id, chain category → confirmed replay 3, 4, 5 anyway.
         let resp = svc
@@ -2082,6 +2187,8 @@ mod tests {
             max_subscriptions: 0,
             block_source: None,
             watch_registry: None,
+            prefix_min_bits: 8,
+            prefix_max_bits: 32,
         };
         let resp = svc
             .subscribe(Request::new(pb::SubscribeRequest {
@@ -2123,6 +2230,8 @@ mod tests {
             max_subscriptions: 0,
             block_source: None,
             watch_registry: None,
+            prefix_min_bits: 8,
+            prefix_max_bits: 32,
         };
         // Open the subscription first (its receiver is now live), then flood the
         // publisher far past the broadcast capacity before the stream is polled.
@@ -2194,6 +2303,7 @@ mod tests {
             None,
             &mask,
             &mut leases,
+            (8, 32),
         );
         assert!(reg.has_watchers());
     }
@@ -2221,6 +2331,7 @@ mod tests {
             Some(&principal),
             &mask,
             &mut leases,
+            (8, 32),
         );
         assert!(
             !reg.has_watchers(),
@@ -2272,6 +2383,7 @@ mod tests {
                 Some(&principal),
                 &mask,
                 &mut guard,
+                (8, 32),
             );
         }
         assert_eq!(quota.current("tenant"), 2, "two watches charged 2 units");
@@ -2325,6 +2437,7 @@ mod tests {
             Some(&principal),
             &mask,
             &mut leases,
+            (8, 32),
         );
         assert_eq!(
             acct.quota().current("tenant"),
@@ -2366,6 +2479,7 @@ mod tests {
             Some(&principal),
             &mask,
             &mut leases,
+            (8, 32),
         );
         assert_eq!(q.current("tenant"), 3);
 
@@ -2377,6 +2491,7 @@ mod tests {
             Some(&principal),
             &mask,
             &mut leases,
+            (8, 32),
         );
         assert_eq!(q.current("tenant"), 4, "re-asserted op(1) not double-charged");
 
@@ -2391,6 +2506,7 @@ mod tests {
             Some(&principal),
             &mask,
             &mut leases,
+            (8, 32),
         );
         assert_eq!(q.current("tenant"), 3, "removing one watch frees one unit");
     }
@@ -2415,6 +2531,7 @@ mod tests {
             None,
             &mask,
             &mut leases,
+            (8, 32),
         );
         assert!(reg.has_watchers(), "descriptor expansion should register a watch-set");
     }
@@ -2523,6 +2640,8 @@ mod tests {
             max_subscriptions: 0,
             block_source: None,
             watch_registry: None,
+            prefix_min_bits: 8,
+            prefix_max_bits: 32,
         };
         let mut held = Vec::new();
         for _ in 0..16 {

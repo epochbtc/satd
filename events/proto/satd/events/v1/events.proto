@@ -57,6 +57,17 @@ message SubscribeControl {
     // Remove txids from the watch-set. Mirrors AddTransactions: empty min_depths
     // removes the lifecycle watch(es); non-empty removes those depth alarms.
     RemoveTransactions remove_transactions = 9;
+    // Privacy-preserving prefix watch (§7.5): watch a k-bit prefix of
+    // sha256(scriptPubKey). The server delivers every tx whose output (mempool +
+    // confirmed) OR spent prevout (CONFIRMED only — recovered from block undo
+    // data) script falls in the 2^-k bucket (PrefixMatched, full raw_tx inline)
+    // and the client filters locally, so the server learns only the bucket,
+    // never the exact script. Charged by COARSENESS: a coarser bucket
+    // (smaller bits) costs more units. `bits` must be within the operator range
+    // [streamprefixminbits, streamprefixmaxbits].
+    AddScriptPrefixes    add_script_prefixes    = 10;
+    // Remove prefix buckets from the watch-set; releases each bucket's units.
+    RemoveScriptPrefixes remove_script_prefixes = 11;
   }
 }
 
@@ -83,6 +94,12 @@ message RemoveOutpoints{ repeated Outpoint outpoints = 1; }
 //   when min_depths is non-empty. Free modifier — no extra quota unit.
 message AddTransactions    { repeated bytes txids = 1; repeated uint32 min_depths = 2; uint32 auto_close_depth = 3; }
 message RemoveTransactions { repeated bytes txids = 1; repeated uint32 min_depths = 2; }
+
+// A k-bit prefix of sha256(scriptPubKey): `prefix` is the top ceil(bits/8)
+// bytes (big-endian, low bits beyond `bits` ignored), `bits` the length k.
+message ScriptPrefix         { bytes prefix = 1; uint32 bits = 2; }
+message AddScriptPrefixes    { repeated ScriptPrefix prefixes = 1; }
+message RemoveScriptPrefixes { repeated ScriptPrefix prefixes = 1; }
 
 // A watched outpoint was spent.
 message OutpointSpent {
@@ -143,6 +160,27 @@ message TxidFinalized {
   bytes  txid   = 1;
   uint32 depth  = 2; // confirmations reached (>= auto_close_depth)
   uint32 height = 3; // active-chain height where the tx is confirmed
+}
+
+// A spent prevout that matched a script-prefix bucket (spend side of a
+// PrefixMatched): the outpoint consumed and the scriptPubKey it paid.
+message SpentPrevout {
+  bytes  outpoint_txid = 1;
+  uint32 outpoint_vout = 2;
+  bytes  script_pubkey = 3;
+}
+
+// A transaction fell inside a watched script-prefix bucket (§7.5). Carries the
+// FULL serialized tx so the client filters the bucket against its real scripts
+// locally — no precise follow-up fetch that would re-leak the exact interest.
+message PrefixMatched {
+  ScriptPrefix prefix    = 1; // the registered bucket that fired
+  bytes        raw_tx    = 2; // consensus-serialized matching transaction
+  bool         confirmed = 3; // false = mempool, true = connected block
+  uint32       height    = 4; // block height when confirmed
+  // Spend side: the matched prevout(s) for inputs whose prevout script fell in
+  // the bucket. Empty for a pure funding (output-side) match.
+  repeated SpentPrevout matched_prevouts = 5;
 }
 
 // DEPRECATED / RESERVED — never emitted. The original design had the server
@@ -329,5 +367,6 @@ message NodeEvent {
     TxidUnconfirmed txid_unconfirmed = 20; // lifecycle: reorg rolled back confirmation
     TxidDepthReached txid_depth_reached = 21; // depth alarm (single-shot)
     TxidFinalized txid_finalized = 22; // lifecycle auto-close (terminal)
+    PrefixMatched prefix_matched = 23; // privacy-preserving prefix watch (§7.5)
   }
 }

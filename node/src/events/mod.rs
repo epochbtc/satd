@@ -33,5 +33,6 @@ pub use replay::{
 pub use schema::SCHEMA_VERSION;
 pub use sink::EventSink;
 pub use watch::{
-    run_watch_matcher, WatchHandle, WatchMatch, WatchRegistry, WATCH_CHANNEL_CAPACITY,
+    prefix_bucket_key, run_watch_matcher, PrefixMatch, WatchHandle, WatchMatch, WatchRegistry,
+    WATCH_CHANNEL_CAPACITY,
 };
