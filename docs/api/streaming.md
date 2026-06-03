@@ -1,13 +1,17 @@
 # satd Streaming Consumption API — Protocol Spec (DRAFT / WIP)
 
-> **Status: DRAFT — pre-implementation, pre-consumer-feedback.**
-> This document captures the *current design intent* for the Streaming
+> **Status: DRAFT — v1 implementation merged, pre-consumer-feedback.**
+> The §12 implementation sequence (the 7-PR stack #292–#298) **merged to `master`
+> on 2026-06-03**. This document captures the *design intent* for the Streaming
 > Consumption API described in [`ROADMAP.md` → "Streaming Consumption
-> API"](../../ROADMAP.md). It is deliberately a work-in-progress: the wire
-> shapes below are a starting point to be iterated against a real anchor
-> consumer (per ROADMAP: *"prove the shape with one anchor consumer before
-> spec-and-evangelize"*). Nothing here is a stability commitment yet. Field
-> numbers, message names, and error codes WILL change before any `v1` freeze.
+> API"](../../ROADMAP.md); the per-section **Shipped** callouts record where the
+> implementation deviated from the original draft, and §13 is the post-merge
+> follow-up roadmap (A/B/C). It remains a work-in-progress: the wire shapes are
+> still to be iterated against a real anchor consumer (per ROADMAP: *"prove the
+> shape with one anchor consumer before spec-and-evangelize"*). Nothing here is a
+> stability commitment yet — schema stays `v1` and all additions are additive, but
+> field numbers, message names, and error codes MAY still change before any `v1`
+> freeze.
 >
 > The eventual goal is an **open, transport-agnostic protocol** that a bitcoind
 > sidecar (or another node) could also serve, with satd as the reference native
@@ -139,6 +143,11 @@ disconnect, which matters for large blocks; it is nearly free because replay
 already indexes into `block.transactions[]`. A client persists the `cursor` from
 the last `NodeEvent` it durably processed and presents it on reconnect.
 
+> **Shipped (as of #292):** the `Cursor` wire field is present but resume is
+> **block-granular today** — `tx_index` is reserved and always `0`, because the
+> only confirmed-side event is one `BlockConnected` per block. Per-tx resume
+> activates once per-tx confirmed events exist; see §13 item **A5** (parked).
+
 ### 6.2 Replay semantics
 
 A client resumes by sending a cursor (§6.3 `SetCursor`). The server:
@@ -176,17 +185,21 @@ live connection.
 
 ### 7.1 The matcher (`WatchRegistry`)
 
-A new in-memory registry keyed by `OutPoint` and by `Scripthash`. It is consulted
-**inside `connect_block` / `accept_tx`**, where the full transactions are already
-in hand, and emits match events. Critically it is **publish/read-only**: the
-matcher reads transactions the node already holds and never blocks, locks, or
-backpressures the connect path (§10). A slow client lags → drops; it can never
-stall block connection.
+A new in-memory registry keyed by `OutPoint` and by `Scripthash`, emitting match
+events. Critically it is **publish/read-only**: the matcher reads transactions the
+node already holds and never blocks, locks, or backpressures the connect path
+(§10). A slow client lags → drops; it can never stall block connection.
 
-The current event bus (`ChainEvent::BlockConnected { hash, height }`) is too
-coarse to drive this — it carries no per-tx detail. So the matcher runs at the
-connect site with the block's transactions, rather than re-deriving matches from
-the coarse broadcast event.
+> **Shipped (as of #294): the matcher is fully *decoupled*, not inline.** Rather
+> than running inside `connect_block` / `accept_tx`, `run_watch_matcher`
+> subscribes to the existing chain/mempool broadcasts and *re-reads* each block
+> via `ChainState::get_block(hash)` and each tx via `Mempool::get(txid)` once it
+> already holds them. This was a deliberate strengthening of the §10 invariant:
+> **zero edits to the consensus accept path**, at the cost of one extra block/tx
+> re-read off the hot path. The coarse `BlockConnected { hash, height }` event is
+> sufficient precisely because the matcher re-reads the full block itself. The
+> trade-off it introduces — a lagged matcher silently skipping blocks — is the
+> subject of §13 item **A2**.
 
 ### 7.2 Match events
 
@@ -210,6 +223,13 @@ message ScriptMatched {       // address-watching = outpoint-watching + a deriva
 
 `AddTransactions` (§7.3) emits the existing `MempoolEvent` / `ChainEvent` bodies
 for the watched txids (confirmation tracking) — no new body type needed there.
+
+> **Shipped (as of #294/#295):** `OutpointSpent` (input side) and `ScriptMatched`
+> (output/funding side) are live. `ScriptMatched.is_output` is **always `true`
+> today** — input-side *script* matching is deferred (§13 item **B1**), because
+> the spending tx does not carry the prevout's `scriptPubKey`. Clients get spend
+> coverage for free by watching the funding **outpoint**, which `OutpointSpent`
+> fully detects.
 
 ### 7.3 Bidi control channel *(decided: bidi, tagged-union)*
 
@@ -251,6 +271,15 @@ The legacy server-streaming firehose (categories + `since_seq`) remains availabl
 as a degenerate case: a client that sends only `SetCategories` and never a watch
 add gets exactly today's behavior.
 
+> **Shipped (as of #295):** rather than mutate the existing `Subscribe` server-
+> stream in place, a **new** `rpc Watch(stream SubscribeControl)` was added
+> alongside the unchanged `Subscribe` firehose (a non-breaking refinement).
+> Shipped control arms: `SetCursor` (accepted but **not yet served** on the Watch
+> stream — use `Subscribe(from_cursor)` for replay; §13 item **A4**),
+> `SetCategories`, `AddScripts`/`RemoveScripts`, `AddOutpoints`/`RemoveOutpoints`,
+> and `AddDescriptor` (§11). **`AddTransactions` did not ship** — it is deferred
+> to §13 item **B2**.
+
 ## 8. Reorg events
 
 Reorgs become **first-class**, emitted in-process as consensus ground truth — a
@@ -277,13 +306,18 @@ auth surface**.
 |---|---|---|
 | Open `Subscribe`; receive firehose (categories) | `stream:subscribe` | — |
 | `AddScripts` / `AddOutpoints` / `AddTransactions` | `stream:watch` | per-token watch quota |
-| `Remove*` | — | releases the lease |
+| `Remove*` | — | (today) releases only on disconnect — see §13 **C1** |
 
 Each watch *item* acquires a `WatchLease` (the RAII type from the watch-quota
 work) via `Principal::acquire_watch(n)`, gated on `stream:watch` and the
-per-token quota. The lease is held for the lifetime of the subscription and
-released on `Remove*` or disconnect (RAII drop = reconciliation, same as the
-Esplora SSE path).
+per-token quota.
+
+> **Shipped (as of #295):** leases are held in a subscription-scoped
+> `Arc<Mutex<Vec<WatchLease>>>` and released **on disconnect** (RAII drop). Per-
+> `Remove*` release is **not yet wired** (§13 item **C1**) — and quota dedup is
+> **intra-message only**, so re-asserting the same item across two messages is
+> double-charged (§13 item **C2**). Both matter because the §11 descriptor
+> sliding-window UX rotates watches without disconnecting.
 
 ### 9.1 Quota unit *(decided: N items = N units)*
 
@@ -320,20 +354,32 @@ risk, built last.
 ```proto
 message AddDescriptor {              // new SubscribeControl arm
   string descriptor = 1;             // rust-miniscript parseable
-  uint32 gap_limit  = 2;
-}
-
-message DescriptorNeedsAddresses {   // new NodeEvent body: server→client side-channel
-  string descriptor = 1;
-  uint32 next_index = 2;             // "expand the watch window to at least here"
+  uint32 gap_limit  = 2;             // window size (count); capped at MAX_DESCRIPTOR_WINDOW
+  // uint32 start    = 3;            // PLANNED (§13 B3): window start index, default 0
 }
 ```
 
 The server expands the descriptor via rust-miniscript → derives watch scripts →
-registers them with the §7 `WatchRegistry`. Gap-limit rotation advances the
-derivation window as matches land, emitting `DescriptorNeedsAddresses` when the
-client should extend. This is the address-watching-as-outpoint-watching
-convenience the base primitive was designed to support.
+registers them with the §7 `WatchRegistry`. This is the
+address-watching-as-outpoint-watching convenience the base primitive was designed
+to support.
+
+> **Shipped (as of #298):** `expand_descriptor` derives `[0, gap_limit)`, capped
+> at `MAX_DESCRIPTOR_WINDOW = 1000` (DoS bound), rejecting hardened-wildcard and
+> any secret-bearing descriptor at the type level (`Descriptor<DescriptorPublicKey>`).
+>
+> **Design change — gap-limit rotation is dropped (§13 item B3).** The original
+> draft had the server track derivation progress and emit a
+> `DescriptorNeedsAddresses` side-channel to tell the client to extend its window.
+> We concluded **gap-limit tracking is a client concern**: the client knows its
+> own address-generation policy and is better placed to decide when to advance.
+> So the server stays stateless — it expands a fixed window `[start, start+gap_limit)`
+> and matches it; the **client** watches its own match stream and, as funding
+> approaches the window's high end, issues a fresh `AddDescriptor` with an
+> advanced `start` (and `Remove*`s the trailing scripts, which is why §13 **C1**
+> per-remove release is a prerequisite). The `DescriptorNeedsAddresses` wire
+> message is therefore **never emitted** and is left reserved/deprecated, not
+> built. The only additive change needed is the `start` field above.
 
 ## 12. Proposed implementation sequence
 
@@ -349,7 +395,108 @@ convenience the base primitive was designed to support.
 
 `1→2` gate `3`; `3→4` gate `5–6`; `7` last.
 
-## 13. Open questions (to iterate with consumer feedback)
+> **Status: all seven shipped and merged to `master` on 2026-06-03** as PRs
+> **#292** (1, cursor+replay), **#293** (2, mempool replay), **#294** (3, decoupled
+> `WatchRegistry`), **#295** (4, bidi `Watch` + leases), **#296** (5, first-class
+> `Reorg`), **#297** (6, WS/SSE transport), **#298** (7, descriptors). Independent
+> per-PR review hardened the stack before merge (reorg-handoff dedup, descriptor
+> DoS/panic bounds, quota half-close, WS connection cap). The §13 roadmap below is
+> the post-merge backlog; the per-section **Shipped** callouts above record where
+> the implementation deviated from this draft.
+
+## 13. Post-merge follow-up roadmap (A / B / C)
+
+The merged stack is a correct, bounded **live** firehose + watch surface. The
+follow-ups group into three themes: **resumability under loss (A)**, **match
+completeness (B)**, and **fair multi-tenant accounting (C)**. None touch the
+consensus path — the §10 publish-only invariant holds throughout. Items are
+tagged with locked decisions (owner sign-off, 2026-06-02).
+
+### A. Replay & cursor completeness
+
+- **A2 — matcher lag resync *(highest; silent data loss)*.** The decoupled matcher
+  (§7.1) drops blocks when its chain/mempool broadcast subscription `Lagged`s, and
+  never rescans them — so *every* watcher silently misses matches in that window.
+  Fix: on `Lagged`, rescan `last_scanned_height → tip` via `ChainState` (it already
+  re-reads blocks by hash) and emit the missed matches. **Decision: cap the
+  catch-up span and expose the cap as a config key** (e.g. `streammaxresyncblocks`,
+  default 10 000, `restart!`-classified), mirroring `MAX_REPLAY_BLOCKS`.
+- **A1 — in-band lag signal.** Today `Lagged` is server-logged only; the client is
+  never told it lost events. Add a `Lagged { dropped_n, resume_cursor }` event on
+  all three carriers (gRPC `Subscribe`/`Watch`, WS, SSE) carrying the current tip
+  cursor, so the client re-issues `Subscribe(from_cursor)` to backfill. Server
+  stays drop-on-lag; the client owns the resync.
+- **A4 — WS/SSE durable replay.** `/ws` and `/sse` are live-only; `SetCursor` on
+  the Watch stream is accepted-but-not-served. Serve `from_cursor` on the WS/SSE
+  establish path by reusing the gRPC replay iterator (snapshot capture + identity
+  dedup are transport-agnostic). Shares A1's resume-cursor wire shape.
+- **A3 — mempool-seq restart clarity.** `mempool_seq` resets to 0 on restart, so a
+  client resuming with a pre-restart value silently resumes from the new ring's
+  start. Stamp the envelope `node_id` into the cursor; on mismatch, treat
+  `mempool_seq` as epoch-start and log, rather than comparing across seq spaces.
+- **A5 — per-tx cursor granularity *(parked, no consumer)*.** `tx_index` stays
+  reserved (`0`) until per-tx confirmed events exist. Not built; tracked so the
+  reserved field is an explicit deferral, not an oversight.
+
+### B. Watch-matcher coverage
+
+- **B1 — input-side script matching.** `ScriptMatched.is_output` is always `true`;
+  a watched *script* matches only when funded, never when its prior output is
+  spent. **Decision: build it.** Critical implementation note from ground-truth:
+  because the matcher is **decoupled** (runs *after* `connect_block`), the live
+  UTXO set has **already removed** that block's spent prevouts (`get_coin` →
+  `None`). The correct + fast source is the block's **undo data**:
+  `Store::get_undo(hash) → UndoData { spent_coins: Vec<Coin> }` — one cached
+  RocksDB point-get per block, where `spent_coins[i]` is the i-th non-coinbase
+  input's prevout and carries `script_pubkey`. Mempool txs use the live `get_coin`
+  (confirmed parents) + sibling mempool entries (unconfirmed parents), where the
+  coins are still present.
+- **B2 — `AddTransactions` (txid watch).** Additive; mirrors the `AddOutpoints`
+  pattern with a `by_txid` index and a `TxidSeen`-style match. Quota: N txids = N
+  units, consistent with §9.1.
+- **B3 — client-managed descriptor window *(agreed; see §11)*.** Drop server-side
+  reactive rotation / `DescriptorNeedsAddresses`; add a `start` field to
+  `AddDescriptor` so the client drives a sliding window `[start, start+gap_limit)`.
+  Mostly subtractive (`expand_descriptor` already takes `start`; the handler
+  hardcodes 0). **Depends on C1** — advancing the window must release the trailing
+  watches' quota.
+
+### C. Quota & admission
+
+- **C1 — per-remove quota release *(blocks B3)*.** `Remove*` drops the watch from
+  the registry but not the lease; quota frees only on full disconnect, so a long-
+  lived client that rotates watches monotonically exhausts its quota. Track leases
+  per watch-item so `Remove*` returns units.
+- **C2 — cross-message dedup.** Dedup is intra-message only; the same item added in
+  two messages is double-charged. Dedup adds against the live watch-set, charging
+  only for net-new items. **Build C1 + C2 together** — they share the per-item
+  lease-tracking refactor.
+- **C3 — operator-configurable WS caps.** `WS_MAX_CONNS` (256), message size
+  (256 KiB), ping/idle are hardcoded; gRPC already exposes its caps as config. Add
+  `streamwsmaxconns` (+ `streamwsmaxsubscriptions`, `streamwsmaxmessagebytes`)
+  mirroring `eventsgrpcmaxconns`, `restart!`-classified.
+- **C4 — per-watch-add rate limiting.** **Decision: build it.** The per-principal
+  token bucket exists but is consulted only at admission (Subscribe / connection
+  upgrade), not on the control/add path; a connected client can spam `AddOutpoints`
+  bounded only by quota, not rate. Consult `RateLimiter::check` on each add; shed
+  over-budget adds (`RESOURCE_EXHAUSTED` / WS control error) without dropping the
+  connection.
+
+### Dependencies & recommended first slice
+
+```
+B3 ──needs──▶ C1 ──shares refactor──▶ C2
+A1 ──shares wire shape──▶ A4
+A2 is standalone and highest correctness value
+```
+
+**Recommended first slice** (mutually reinforcing): **A2 → (C1+C2) → B3.** That
+trio closes the one real silent-data-loss hole (A2), the one real quota-fairness
+bug (C1/C2), and ships the agreed client-managed-window design (B3). **B1** (input-
+side via undo data) and **C4** (per-add rate limit) form a self-contained second
+slice.
+
+## 14. Open questions (to iterate with consumer feedback)
 
 - **Anchor consumer.** Which downstream integrator co-designs the surface before
   any `v1` freeze? The wire shapes above are a starting point, not a commitment.
