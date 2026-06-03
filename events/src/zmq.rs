@@ -289,6 +289,11 @@ async fn publish(
             // Heartbeats only flow through `nodeevent`. The Core-compat
             // topics deliberately ignore them.
         }
+        NodeEventBody::Lagged { .. } => {
+            // `Lagged` is a per-subscriber control signal synthesized only by
+            // the streaming carriers (gRPC/WS/SSE); it never reaches the ZMQ
+            // pub/sub fanout via the publish path. No Core-compat topic.
+        }
     }
     Ok(())
 }

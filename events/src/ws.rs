@@ -20,7 +20,7 @@
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use axum::Router;
@@ -281,6 +281,24 @@ impl ReplayDedup {
         }
         false
     }
+
+    /// The `(height, mempool_seq)` a `Lagged` notice should resume from before
+    /// any live event is delivered: the replay tail (so a client that lags
+    /// right after the snapshot resumes after it, not from scratch), else the
+    /// request cursor's coordinates.
+    fn seed(&self, cursor: Option<Cursor>) -> (u32, u64) {
+        let mut h = cursor.map(|c| c.height).unwrap_or(0);
+        let mut s = cursor.map(|c| c.mempool_seq).unwrap_or(0);
+        if let Some(cd) = &self.confirmed
+            && let Some(m) = cd.keys().max()
+        {
+            h = (*m).max(h);
+        }
+        if let Some(m) = self.mempool_through {
+            s = m.max(s);
+        }
+        (h, s)
+    }
 }
 
 /// Build the durable replay (events to emit before live + the live boundary
@@ -332,7 +350,15 @@ async fn sse_firehose(
     // Subscribe to the live broadcast FIRST so nothing is missed between the
     // replay snapshot and the live tail (the snapshot→live handoff ordering).
     let rx = state.publisher.subscribe();
-    let (replay_events, dedup) = build_replay(&state, q.cursor(), mask);
+    let cursor = q.cursor();
+    let (replay_events, dedup) = build_replay(&state, cursor, mask);
+    // Track the last-delivered position (seeded from the replay tail) via
+    // atomics — an async `filter_map` closure cannot hold `&mut` state across
+    // items, so a `Lagged` notice reads the resume cursor from these.
+    let (seed_h, seed_s) = dedup.seed(cursor);
+    let last_h = Arc::new(AtomicU32::new(seed_h));
+    let last_s = Arc::new(AtomicU64::new(seed_s));
+    let publisher = state.publisher.clone();
     // Replayed events first (confirmed history + mempool window — already
     // category-gated by the replay builder), then the live stream, filtered by
     // category and boundary-deduped against the snapshot.
@@ -346,12 +372,30 @@ async fn sse_firehose(
         // released when the client disconnects and the stream is dropped.
         let _permit = &permit;
         let dedup = dedup.clone();
+        let last_h = last_h.clone();
+        let last_s = last_s.clone();
+        let publisher = publisher.clone();
         async move {
             match item {
                 Ok(env) if (env.category_bit() & mask) != 0 && !dedup.is_duplicate(&env) => {
+                    last_s.store(env.stamp.seq, Ordering::Relaxed);
+                    if let Some(c) = &env.cursor {
+                        last_h.store(c.height, Ordering::Relaxed);
+                    }
                     Some(Ok::<_, std::convert::Infallible>(
                         Event::default().data(serde_json::to_string(&env).unwrap_or_default()),
                     ))
+                }
+                // In-band lag notice: tell the client how many events were
+                // dropped and the cursor to reconnect from; the stream continues.
+                Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
+                    warn!(target: "events::ws", dropped = n, "streamws SSE subscriber lagged");
+                    let resume = publisher.resume_cursor(
+                        last_h.load(Ordering::Relaxed),
+                        last_s.load(Ordering::Relaxed),
+                    );
+                    let ev = node::events::lagged_event(&publisher, n, resume);
+                    Some(Ok(Event::default().data(serde_json::to_string(&ev).unwrap_or_default())))
                 }
                 _ => None,
             }
@@ -409,6 +453,9 @@ async fn ws_conn(
     // event is missed at the snapshot→live boundary.
     let mut rx_live = state.publisher.subscribe();
     let (replay_events, dedup) = build_replay(&state, cursor, initial_mask);
+    // Last-delivered position (seeded from the replay tail), for the in-band
+    // `Lagged` notice's resume cursor.
+    let (mut last_h, mut last_s) = dedup.seed(cursor);
     // The watch-set (and the per-item quota leases inside it) is owned by the
     // CONNECTION, not the inbound reader (same rule as the gRPC Watch handler):
     // a client that stops sending control frames must not release its quota
@@ -493,14 +540,29 @@ async fn ws_conn(
                 Ok(env) => {
                     if (env.category_bit() & category_mask.load(Ordering::Relaxed)) != 0
                         && !dedup.is_duplicate(&env)
-                        && let Ok(text) = serde_json::to_string(&env)
+                    {
+                        last_s = env.stamp.seq;
+                        if let Some(c) = &env.cursor {
+                            last_h = c.height;
+                        }
+                        if let Ok(text) = serde_json::to_string(&env)
+                            && sender.send(Message::Text(text.into())).await.is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    // In-band lag notice: how many events were dropped + the
+                    // cursor to reconnect from. The stream then continues live.
+                    warn!(target: "events::ws", dropped = n, "streamws subscriber lagged (firehose)");
+                    let resume = state.publisher.resume_cursor(last_h, last_s);
+                    let ev = node::events::lagged_event(&state.publisher, n, resume);
+                    if let Ok(text) = serde_json::to_string(&ev)
                         && sender.send(Message::Text(text.into())).await.is_err()
                     {
                         break;
                     }
-                }
-                Err(broadcast::error::RecvError::Lagged(n)) => {
-                    warn!(target: "events::ws", dropped = n, "streamws subscriber lagged (firehose)");
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             },

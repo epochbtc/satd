@@ -21,7 +21,7 @@ use tracing::{info, warn};
 use crate::chain::events::ChainEvent;
 use crate::mempool::events::MempoolEvent;
 
-use super::envelope::{EdgeIdentity, EdgeStamp, NodeEvent, NodeEventBody};
+use super::envelope::{Cursor, EdgeIdentity, EdgeStamp, NodeEvent, NodeEventBody};
 use super::sink::EventSink;
 
 /// Capacity of the envelope broadcast channel. Sized 4× the existing
@@ -93,6 +93,18 @@ impl EventPublisher {
     /// `mempool_seq` watermark must be discarded (see [`EdgeIdentity`]).
     pub fn instance_id(&self) -> u64 {
         self.edge.instance_id
+    }
+
+    /// Build a resume [`Cursor`] at `(height, mempool_seq)` stamped with this
+    /// publisher's `instance_id` — used by carriers to fill a `Lagged` notice's
+    /// `resume_cursor` from the last position they delivered.
+    pub fn resume_cursor(&self, height: u32, mempool_seq: u64) -> Cursor {
+        Cursor {
+            height,
+            tx_index: 0,
+            mempool_seq,
+            instance_id: self.edge.instance_id,
+        }
     }
 
     /// Number of envelopes published since startup. Useful for tests.
