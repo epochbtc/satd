@@ -137,6 +137,12 @@ message Cursor {
   uint32 height      = 1; // block height of the last delivered confirmed item
   uint32 tx_index    = 2; // index within that block of the last delivered tx
   uint64 mempool_seq = 3; // best-effort mempool high-water (advisory)
+  // Per-process epoch nonce of the issuing publisher. node_id is stable
+  // across restarts, but mempool_seq resets to 0 each daemon start; on a
+  // from_cursor resume the server discards mempool_seq when this differs
+  // from the live instance (daemon restarted since the cursor was issued).
+  // Confirmed (height) replay is instance-independent and unaffected.
+  uint64 instance_id = 4;
 }
 
 // Per-event identity stamp applied at the publisher's bridge layer.

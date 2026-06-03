@@ -87,6 +87,14 @@ impl EventPublisher {
         &self.edge
     }
 
+    /// This publisher's per-process epoch nonce. A reconnecting client's
+    /// `from_cursor.instance_id` is compared against this; a mismatch
+    /// means the daemon restarted since the cursor was issued, so its
+    /// `mempool_seq` watermark must be discarded (see [`EdgeIdentity`]).
+    pub fn instance_id(&self) -> u64 {
+        self.edge.instance_id
+    }
+
     /// Number of envelopes published since startup. Useful for tests.
     pub fn published(&self) -> u64 {
         self.seq.load(Ordering::Relaxed)
@@ -127,8 +135,10 @@ impl EventPublisher {
         // Stamp a durable resume cursor on confirmed-side bodies (a
         // connected block), so a reconnecting client can persist it and
         // resume via `SubscribeRequest.from_cursor`. `stamp.seq` doubles
-        // as the best-effort mempool high-water mark.
-        let cursor = body.derive_cursor(stamp.seq);
+        // as the best-effort mempool high-water mark; the per-process
+        // `instance_id` lets a reconnecting client detect a restart and
+        // discard a stale mempool watermark.
+        let cursor = body.derive_cursor(self.edge.instance_id, stamp.seq);
         let env = NodeEvent::with_cursor(stamp, cursor, body);
         // Record into the bounded replay ring before broadcasting, so a
         // reconnecting client can replay recent mempool transitions it

@@ -35,6 +35,17 @@ pub const REGION_BYTES: usize = 8;
 pub struct EdgeIdentity {
     pub node_id: [u8; 16],
     pub region: Option<[u8; REGION_BYTES]>,
+    /// Fresh per-process epoch nonce, generated at construction and
+    /// **never persisted**. `node_id` is stable across restarts, but the
+    /// per-publisher `seq` space (and therefore a [`Cursor`]'s
+    /// `mempool_seq` high-water mark) resets to zero on every daemon
+    /// start. A reconnecting client compares the `instance_id` carried in
+    /// its saved cursor against the live stream's: a mismatch means the
+    /// daemon restarted since the cursor was issued, so the stale
+    /// `mempool_seq` must be discarded (treated as epoch start) rather
+    /// than trusted. Durable confirmed `(height, tx_index)` replay is
+    /// instance-independent and unaffected.
+    pub instance_id: u64,
 }
 
 /// Errors loading or persisting the node-id / region.
@@ -75,7 +86,18 @@ impl EdgeIdentity {
             Some(s) => Some(Self::parse_region(s)?),
             None => None,
         };
-        Ok(Self { node_id, region })
+        // A fresh nonce per construction. In production `EdgeIdentity` is
+        // built exactly once per daemon start (via `resolve`) and Copy-
+        // threaded, so every event in a process shares one `instance_id`;
+        // a restart yields a new one. Randomness (not a counter or the
+        // start clock) keeps it collision-resistant across nodes and
+        // robust to wall-clock adjustments.
+        let instance_id = rand::random::<u64>();
+        Ok(Self {
+            node_id,
+            region,
+            instance_id,
+        })
     }
 
     /// Resolve the node-id from operator-provided value, the persisted
@@ -333,6 +355,13 @@ pub enum NodeEventBody {
 /// the `cursor` from the last [`NodeEvent`] it durably processed and
 /// presents it to resume; the confirmed `(height, tx_index)` half is
 /// reconstructable from the durable block store, the mempool half is not.
+///
+/// `instance_id` is the per-process epoch nonce of the publisher that
+/// issued the cursor (see [`EdgeIdentity::instance_id`]). On resume the
+/// server compares it against the live publisher's: a mismatch means the
+/// daemon restarted since the cursor was issued, so the `mempool_seq`
+/// watermark is from a dead `seq` space and is discarded (full mempool
+/// window replay) rather than trusted. The confirmed half is unaffected.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 pub struct Cursor {
     /// Block height of the last delivered confirmed item.
@@ -341,6 +370,18 @@ pub struct Cursor {
     pub tx_index: u32,
     /// Best-effort mempool high-water mark (advisory; resets on restart).
     pub mempool_seq: u64,
+    /// Per-process epoch nonce of the issuing publisher. Rendered as a
+    /// decimal **string** in JSON so JS/JSON consumers (WS/SSE) preserve
+    /// the full 64-bit value without `Number` precision loss.
+    #[serde(serialize_with = "serialize_u64_as_str")]
+    pub instance_id: u64,
+}
+
+/// Serialize a `u64` as a decimal string — used for cursor fields whose
+/// full 64-bit range must survive a round-trip through JSON `Number`
+/// (which only preserves 53 bits of integer precision).
+fn serialize_u64_as_str<S: Serializer>(v: &u64, ser: S) -> Result<S::Ok, S::Error> {
+    ser.serialize_str(&v.to_string())
 }
 
 impl NodeEventBody {
@@ -351,13 +392,15 @@ impl NodeEventBody {
     /// confirmed events exist). Other bodies do not advance the durable
     /// confirmed position, so they carry no cursor. `mempool_seq` is the
     /// current per-publisher sequence, stamped so a reconnecting client
-    /// has a best-effort mempool high-water mark.
-    pub fn derive_cursor(&self, mempool_seq: u64) -> Option<Cursor> {
+    /// has a best-effort mempool high-water mark; `instance_id` is the
+    /// issuing publisher's per-process epoch nonce (see [`Cursor`]).
+    pub fn derive_cursor(&self, instance_id: u64, mempool_seq: u64) -> Option<Cursor> {
         match self {
             NodeEventBody::Chain(ChainEvent::BlockConnected { height, .. }) => Some(Cursor {
                 height: *height,
                 tx_index: 0,
                 mempool_seq,
+                instance_id,
             }),
             _ => None,
         }
@@ -551,5 +594,45 @@ mod tests {
         assert_eq!(env_m.category_bit(), 1);
         assert_eq!(env_c.category_bit(), 2);
         assert_eq!(env_h.category_bit(), 4);
+    }
+
+    #[test]
+    fn block_connected_derives_cursor_with_instance_id() {
+        let body = NodeEventBody::Chain(ChainEvent::BlockConnected {
+            hash: BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+                [9u8; 32],
+            )),
+            height: 808_080,
+        });
+        let cur = body.derive_cursor(0xdead_beef_cafe_f00d, 42).expect("cursor");
+        assert_eq!(cur.height, 808_080);
+        assert_eq!(cur.tx_index, 0);
+        assert_eq!(cur.mempool_seq, 42);
+        assert_eq!(cur.instance_id, 0xdead_beef_cafe_f00d);
+        // Non-confirmed bodies advance no durable cursor.
+        assert!(NodeEventBody::Heartbeat { uptime_ns: 1 }
+            .derive_cursor(1, 2)
+            .is_none());
+    }
+
+    #[test]
+    fn cursor_serializes_instance_id_as_string() {
+        // A full-range u64 must survive JSON as a string — a JS `Number`
+        // would silently lose precision above 2^53, breaking the client's
+        // epoch comparison.
+        let cur = Cursor {
+            height: 5,
+            tx_index: 0,
+            mempool_seq: 7,
+            instance_id: 0xFFFF_FFFF_FFFF_FFFF,
+        };
+        let v = serde_json::to_value(cur).unwrap();
+        assert_eq!(v["height"], 5);
+        assert_eq!(v["mempool_seq"], 7);
+        assert_eq!(
+            v["instance_id"],
+            serde_json::Value::String("18446744073709551615".to_string()),
+            "instance_id must serialize as a decimal string, not a JSON number",
+        );
     }
 }

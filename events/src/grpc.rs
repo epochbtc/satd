@@ -510,6 +510,25 @@ impl NodeEventStream for NodeEventStreamSvc {
                             }
                         }
                     }
+                    // Epoch check: a cursor's `mempool_seq` is only meaningful
+                    // within the publisher instance that issued it. If the
+                    // daemon restarted since the cursor was issued
+                    // (`instance_id` differs), the old watermark indexes a dead
+                    // `seq` space — discard it and replay the full retained
+                    // mempool window from this instance's epoch start. Confirmed
+                    // (height) replay above is durable and instance-independent.
+                    let mempool_since = if cursor.instance_id == self.publisher.instance_id() {
+                        cursor.mempool_seq
+                    } else {
+                        info!(
+                            target: "events::grpc",
+                            cursor_instance = cursor.instance_id,
+                            live_instance = self.publisher.instance_id(),
+                            "from_cursor instance mismatch (daemon restarted since cursor \
+                             issued); discarding stale mempool_seq, replaying full window",
+                        );
+                        0
+                    };
                     // Best-effort mempool replay from the bounded publisher ring
                     // (the mempool is not durable). Oldest-first; the highest
                     // replayed seq is the live-side dedup boundary. Gated on the
@@ -517,7 +536,7 @@ impl NodeEventStream for NodeEventStreamSvc {
                     // mempool replay.
                     let mp: Vec<pb::NodeEvent> = if category_mask & 1 != 0 {
                         self.publisher
-                            .replay_mempool_since(cursor.mempool_seq)
+                            .replay_mempool_since(mempool_since)
                             .iter()
                             .map(envelope_to_proto)
                             .collect()
@@ -535,7 +554,7 @@ impl NodeEventStream for NodeEventStreamSvc {
                         snapshot_tip,
                         replayed_blocks = replayed.len(),
                         mempool_replayed = mp.len(),
-                        mempool_since = cursor.mempool_seq,
+                        mempool_since,
                         "events gRPC durable cursor replay (snapshot→live)",
                     );
                     Some((Arc::new(replayed), mp, mp_dedup_through))
@@ -872,7 +891,7 @@ fn watch_match_to_proto(
                 spending_vin: *spending_vin,
                 confirmed: *confirmed,
             });
-            (cursor_from_height(*height), body)
+            (cursor_from_height(*height, edge.instance_id), body)
         }
         WatchMatch::ScriptMatched {
             scripthash,
@@ -889,7 +908,7 @@ fn watch_match_to_proto(
                 index: *index,
                 confirmed: *confirmed,
             });
-            (cursor_from_height(*height), body)
+            (cursor_from_height(*height, edge.instance_id), body)
         }
     };
     pb::NodeEvent {
@@ -900,11 +919,12 @@ fn watch_match_to_proto(
     }
 }
 
-fn cursor_from_height(height: Option<u32>) -> Option<pb::Cursor> {
+fn cursor_from_height(height: Option<u32>, instance_id: u64) -> Option<pb::Cursor> {
     height.map(|h| pb::Cursor {
         height: h,
         tx_index: 0,
         mempool_seq: 0,
+        instance_id,
     })
 }
 
@@ -930,6 +950,7 @@ fn cursor_to_proto(c: node::events::Cursor) -> pb::Cursor {
         height: c.height,
         tx_index: c.tx_index,
         mempool_seq: c.mempool_seq,
+        instance_id: c.instance_id,
     }
 }
 
@@ -970,6 +991,7 @@ fn replay_event_from_hash(
             height,
             tx_index: 0,
             mempool_seq: 0,
+            instance_id: edge.instance_id,
         }),
         body: Some(pb::node_event::Body::Chain(pb::ChainEvent {
             body: Some(pb::chain_event::Body::BlockConnected(pb::BlockConnected {
@@ -1503,6 +1525,10 @@ mod tests {
                     height: 2,
                     tx_index: 0,
                     mempool_seq: 0,
+                    // Chain-only / no-source replay: the mempool epoch token
+                    // is immaterial here (see the dedicated instance-mismatch
+                    // tests below for the mempool-side behavior).
+                    instance_id: 0,
                 }),
             }))
             .await
@@ -1550,6 +1576,10 @@ mod tests {
                     height: 4,
                     tx_index: 0,
                     mempool_seq: 0,
+                    // Chain-only / no-source replay: the mempool epoch token
+                    // is immaterial here (see the dedicated instance-mismatch
+                    // tests below for the mempool-side behavior).
+                    instance_id: 0,
                 }),
             }))
             .await
@@ -1619,6 +1649,10 @@ mod tests {
                     height: 3,
                     tx_index: 0,
                     mempool_seq: 0,
+                    // Chain-only / no-source replay: the mempool epoch token
+                    // is immaterial here (see the dedicated instance-mismatch
+                    // tests below for the mempool-side behavior).
+                    instance_id: 0,
                 }),
             }))
             .await
@@ -1691,6 +1725,10 @@ mod tests {
                     height: 0,
                     tx_index: 0,
                     mempool_seq: 0,
+                    // Chain-only / no-source replay: the mempool epoch token
+                    // is immaterial here (see the dedicated instance-mismatch
+                    // tests below for the mempool-side behavior).
+                    instance_id: 0,
                 }),
             }))
             .await
@@ -1733,7 +1771,7 @@ mod tests {
             block_source: Some(Arc::new(MockBlocks { tip: 0 })),
             watch_registry: None,
         };
-        // Resume from mempool_seq = 1 → replay seqs 2 and 3.
+        // Resume from mempool_seq = 1 on the SAME instance → replay seqs 2, 3.
         let resp = svc
             .subscribe(Request::new(pb::SubscribeRequest {
                 categories: 1, // mempool only
@@ -1742,6 +1780,7 @@ mod tests {
                     height: 0,
                     tx_index: 0,
                     mempool_seq: 1,
+                    instance_id: publisher.instance_id(),
                 }),
             }))
             .await
@@ -1762,6 +1801,103 @@ mod tests {
         }
         assert_eq!(seqs, vec![2, 3], "replays only the post-watermark window");
         let _ = shutdown_tx.send(true);
+    }
+
+    /// A `from_cursor` whose `instance_id` differs from the live publisher
+    /// (the daemon restarted since the cursor was issued) discards the stale
+    /// `mempool_seq` and replays the FULL retained mempool window — it must
+    /// not trust a watermark indexing a dead `seq` space.
+    #[tokio::test]
+    async fn cursor_instance_mismatch_replays_full_mempool_window() {
+        use tokio_stream::StreamExt as _;
+        let publisher = EventPublisher::new(edge(), 64);
+        let (mp_tx, _) = broadcast::channel::<MempoolEvent>(64);
+        let (ch_tx, _) = broadcast::channel::<ChainEvent>(64);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        publisher.spawn_bridges(mp_tx.subscribe(), ch_tx.subscribe(), shutdown_rx);
+
+        for i in 1..=3u8 {
+            mp_tx.send(enter(i)).unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let svc = NodeEventStreamSvc {
+            publisher: publisher.clone(),
+            active_subs: Arc::new(AtomicUsize::new(0)),
+            max_subscriptions: 0,
+            block_source: Some(Arc::new(MockBlocks { tip: 0 })),
+            watch_registry: None,
+        };
+        // Same mempool_seq=1 as the same-instance test, but a STALE instance
+        // → epoch mismatch → discard the watermark → replay seqs 1, 2, 3.
+        let resp = svc
+            .subscribe(Request::new(pb::SubscribeRequest {
+                categories: 1,
+                since_seq: None,
+                from_cursor: Some(pb::Cursor {
+                    height: 0,
+                    tx_index: 0,
+                    mempool_seq: 1,
+                    instance_id: publisher.instance_id().wrapping_add(1),
+                }),
+            }))
+            .await
+            .expect("subscribe");
+        let mut stream = resp.into_inner();
+        let mut seqs = Vec::new();
+        for _ in 0..3 {
+            let ev = tokio::time::timeout(Duration::from_secs(1), stream.next())
+                .await
+                .expect("mempool replay item ready")
+                .unwrap()
+                .unwrap();
+            seqs.push(ev.stamp.unwrap().seq);
+        }
+        assert_eq!(
+            seqs,
+            vec![1, 2, 3],
+            "instance mismatch must ignore the stale watermark and replay the full window",
+        );
+        let _ = shutdown_tx.send(true);
+    }
+
+    /// An instance mismatch resets only the MEMPOOL side; durable confirmed
+    /// `(height)` replay is instance-independent and proceeds unchanged.
+    #[tokio::test]
+    async fn cursor_instance_mismatch_leaves_confirmed_replay_intact() {
+        use tokio_stream::StreamExt as _;
+        let publisher = EventPublisher::new(edge(), 64);
+        let stale = publisher.instance_id().wrapping_add(1);
+        let svc = NodeEventStreamSvc {
+            publisher,
+            active_subs: Arc::new(AtomicUsize::new(0)),
+            max_subscriptions: 0,
+            block_source: Some(Arc::new(MockBlocks { tip: 5 })),
+            watch_registry: None,
+        };
+        // Stale instance_id, chain category → confirmed replay 3, 4, 5 anyway.
+        let resp = svc
+            .subscribe(Request::new(pb::SubscribeRequest {
+                categories: 2,
+                since_seq: None,
+                from_cursor: Some(pb::Cursor {
+                    height: 2,
+                    tx_index: 0,
+                    mempool_seq: 0,
+                    instance_id: stale,
+                }),
+            }))
+            .await
+            .expect("subscribe");
+        let mut stream = resp.into_inner();
+        for expected in 3..=5u32 {
+            let ev = tokio::time::timeout(Duration::from_secs(1), stream.next())
+                .await
+                .expect("replay item ready")
+                .unwrap()
+                .unwrap();
+            assert_eq!(chain_height(&ev), Some(expected));
+        }
     }
 
     /// A `from_cursor` request with no block source falls back to
@@ -1785,6 +1921,10 @@ mod tests {
                     height: 2,
                     tx_index: 0,
                     mempool_seq: 0,
+                    // Chain-only / no-source replay: the mempool epoch token
+                    // is immaterial here (see the dedicated instance-mismatch
+                    // tests below for the mempool-side behavior).
+                    instance_id: 0,
                 }),
             }))
             .await
