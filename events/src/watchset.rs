@@ -105,12 +105,30 @@ fn add_items<T: Eq + Hash + Copy>(
     kind: &'static str,
     register: impl FnOnce(&[T]),
 ) {
-    // Per-add rate limit (C4): bound the RATE of watch-add control messages,
-    // not just the steady-state quota. One add operation = one token; a client
-    // spamming many small adds is shed here even while under its item quota.
-    // Operator/loopback and no-policy principals always Allow. An over-budget
-    // add is dropped without tearing down the stream — the control protocol has
-    // no per-message ack, same posture as the quota-reject path below.
+    // Distinct items not already watched: dedups both within this message
+    // (`seen`) and against the live watch-set (`held`).
+    let mut seen = HashSet::new();
+    let net_new: Vec<T> = incoming
+        .into_iter()
+        .filter(|it| !held.contains_key(it) && seen.insert(*it))
+        .collect();
+    if net_new.is_empty() {
+        // Empty or fully-duplicate add (e.g. a client re-asserting a watch it
+        // already holds): a no-op — charges neither quota NOR a rate token.
+        return;
+    }
+
+    // Per-add rate limit (C4): bound the RATE of EFFECTIVE watch-adds — those
+    // that register net-new items — not just the steady-state quota. One
+    // effective add = one token. Placed AFTER the net-new/dedup short-circuit
+    // so a no-op (empty or fully-duplicate) add cannot burn the bucket out from
+    // under a subsequent real add. The bucket is per-principal (shared across
+    // the tenant's connections and with the connection-admission check), so an
+    // operator should size the policy with headroom for the expected add
+    // cadence — e.g. a descriptor sliding window spends one token per
+    // AddDescriptor slide. Operator/loopback and no-policy principals always
+    // Allow. An over-budget add is shed without tearing down the stream — no
+    // per-message ack, same posture as the quota-reject path below.
     if let Some(p) = principal
         && let satd_auth::RateDecision::Throttle { retry_after_secs } = p.check_rate()
     {
@@ -120,17 +138,6 @@ fn add_items<T: Eq + Hash + Copy>(
             retry_after_secs,
             "watch add rate-limited; skipping",
         );
-        return;
-    }
-
-    // Distinct items not already watched: dedups both within this message
-    // (`seen`) and against the live watch-set (`held`).
-    let mut seen = HashSet::new();
-    let net_new: Vec<T> = incoming
-        .into_iter()
-        .filter(|it| !held.contains_key(it) && seen.insert(*it))
-        .collect();
-    if net_new.is_empty() {
         return;
     }
     match principal {
@@ -339,5 +346,35 @@ mod tests {
         assert_eq!(reg2, 0, "rate-limited add registers nothing");
         assert_eq!(q.current("tenant"), 1, "rate-limited add charges no quota");
         assert_eq!(ws.len(), 1, "earlier watch remains after a shed add");
+    }
+
+    #[test]
+    fn no_op_add_does_not_consume_rate_budget() {
+        // Regression for the review fix: the rate check sits AFTER the
+        // net-new/dedup short-circuit, so an empty or fully-duplicate add costs
+        // no token and cannot throttle a later real add. With burst = 2:
+        //   add(op1) → registers (token 2→1)
+        //   add(op1) again (duplicate, no-op) → must NOT consume a token
+        //   add(op2) → still has budget → registers (token 1→0)
+        // If the check ran before dedup, the no-op would spend the 2nd token and
+        // op2 would be throttled (ws.len() == 1).
+        use satd_auth::RatePolicy;
+        let acct: Arc<dyn Accounting> = Arc::new(LocalAccounting::new());
+        let p = Principal::token(
+            Arc::from("tenant"),
+            CapabilitySet::EMPTY.with(Capability::StreamWatch),
+            Some(100),
+            Some(RatePolicy { burst: 2, per_sec: 1 }),
+            acct.clone(),
+        );
+        let mut ws = WatchSet::default();
+
+        ws.add_outpoints(Some(&p), [op(1, 0)], |_| {});
+        ws.add_outpoints(Some(&p), [op(1, 0)], |_| {}); // duplicate → no-op, free
+        let mut reg3 = 0;
+        ws.add_outpoints(Some(&p), [op(2, 0)], |items| reg3 = items.len());
+
+        assert_eq!(reg3, 1, "a no-op duplicate must not have spent the rate budget");
+        assert_eq!(ws.len(), 2, "both distinct watches registered");
     }
 }
