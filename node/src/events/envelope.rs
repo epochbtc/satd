@@ -344,6 +344,15 @@ pub enum NodeEventBody {
         /// pipeline latency without an out-of-band clock.
         uptime_ns: u64,
     },
+    /// In-band notice that the carrier dropped events for this subscriber
+    /// (slow-consumer lag); the stream then continues live. Synthesized by
+    /// the transport adapter on a `Lagged` broadcast error — never bridged
+    /// from an internal event. `resume_cursor` is the position of the last
+    /// event delivered before the gap, for a `from_cursor` reconnect.
+    Lagged {
+        dropped_count: u64,
+        resume_cursor: Cursor,
+    },
 }
 
 /// Durable resume position carried alongside confirmed-side events.
@@ -452,6 +461,11 @@ impl NodeEvent {
             NodeEventBody::Mempool(_) => 1,
             NodeEventBody::Chain(_) => 2,
             NodeEventBody::Heartbeat { .. } => 4,
+            // A lag notice is a control signal, not a content category: it
+            // must reach every subscriber regardless of the category mask, so
+            // it sets all bits (and carriers emit it directly, bypassing the
+            // filter, anyway).
+            NodeEventBody::Lagged { .. } => u32::MAX,
         }
     }
 }
@@ -613,6 +627,36 @@ mod tests {
         assert!(NodeEventBody::Heartbeat { uptime_ns: 1 }
             .derive_cursor(1, 2)
             .is_none());
+    }
+
+    #[test]
+    fn lagged_body_serializes_with_category_and_resume_cursor() {
+        let resume = Cursor {
+            height: 700,
+            tx_index: 0,
+            mempool_seq: 1234,
+            instance_id: 0xABCD,
+        };
+        let env = NodeEvent::with_cursor(
+            stamp(),
+            Some(resume),
+            NodeEventBody::Lagged {
+                dropped_count: 42,
+                resume_cursor: resume,
+            },
+        );
+        let v = serde_json::to_value(&env).unwrap();
+        assert_eq!(v["body"]["category"], "lagged");
+        assert_eq!(v["body"]["dropped_count"], 42);
+        assert_eq!(v["body"]["resume_cursor"]["height"], 700);
+        // instance_id is a JS-safe string in every cursor, including the
+        // resume cursor nested in a Lagged body.
+        assert_eq!(
+            v["body"]["resume_cursor"]["instance_id"],
+            serde_json::Value::String("43981".to_string()),
+        );
+        // A lag notice must never be category-filtered out.
+        assert_eq!(env.category_bit(), u32::MAX);
     }
 
     #[test]

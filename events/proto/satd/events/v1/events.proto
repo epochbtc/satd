@@ -230,6 +230,17 @@ message Heartbeat {
   uint64 uptime_ns = 1;
 }
 
+// In-band notice that the server dropped events for this subscriber because
+// it could not keep up with the broadcast (the slow-consumer "lag"). The
+// stream then continues live. `resume_cursor` is the position of the last
+// event the server delivered before the gap; a client that needs the dropped
+// events reconnects with `SubscribeRequest.from_cursor = resume_cursor` to
+// durably replay them, then rejoin live.
+message Lagged {
+  uint64 dropped_count = 1; // events skipped between the last delivered and now
+  Cursor resume_cursor  = 2; // reconnect anchor to recover the gap
+}
+
 // Versioned, edge-stamped envelope. The wire-level type the server
 // streams to clients.
 message NodeEvent {
@@ -247,5 +258,6 @@ message NodeEvent {
     OutpointSpent outpoint_spent = 13; // watch match (Watch stream)
     ScriptMatched script_matched = 14; // watch match (Watch stream)
     DescriptorNeedsAddresses descriptor_needs_addresses = 15; // gap-limit side-channel
+    Lagged lagged = 16; // in-band slow-consumer lag notice + resume cursor
   }
 }

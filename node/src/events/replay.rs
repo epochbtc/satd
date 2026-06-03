@@ -201,25 +201,51 @@ pub fn build_cursor_replay(
 /// — a replayed confirmed event is positioned by its durable `(height,
 /// tx_index)` cursor, not the volatile per-publisher seq.
 fn synth_block_connected(publisher: &EventPublisher, height: u32, hash: BlockHash) -> NodeEvent {
+    let cursor = Cursor {
+        height,
+        tx_index: 0,
+        mempool_seq: 0,
+        instance_id: publisher.instance_id(),
+    };
+    NodeEvent::with_cursor(
+        synth_stamp(publisher),
+        Some(cursor),
+        NodeEventBody::Chain(ChainEvent::BlockConnected { hash, height }),
+    )
+}
+
+/// Build the in-band [`NodeEventBody::Lagged`] notice a carrier emits when it
+/// drops events for a slow subscriber: `dropped_count` skipped, with
+/// `resume_cursor` (the last position delivered before the gap) so the client
+/// can reconnect via `from_cursor` and recover the gap. Carried as a
+/// synthesized event (seq 0) so every transport renders it the same way.
+pub fn lagged_event(
+    publisher: &EventPublisher,
+    dropped_count: u64,
+    resume_cursor: Cursor,
+) -> NodeEvent {
+    NodeEvent::with_cursor(
+        synth_stamp(publisher),
+        Some(resume_cursor),
+        NodeEventBody::Lagged {
+            dropped_count,
+            resume_cursor,
+        },
+    )
+}
+
+/// Edge stamp for a synthesized (replay / lag) event: real `node_id`/`region`,
+/// but `seq` and `edge_seen_at_ns` are 0 — such an event is positioned by its
+/// cursor, not the volatile per-publisher seq.
+fn synth_stamp(publisher: &EventPublisher) -> EdgeStamp {
     let edge = publisher.edge();
-    let stamp = EdgeStamp {
+    EdgeStamp {
         node_id: edge.node_id,
         region: edge.region,
         edge_seen_at_ns: 0,
         edge_wall_ns: now_wall_ns(),
         seq: 0,
-    };
-    let cursor = Cursor {
-        height,
-        tx_index: 0,
-        mempool_seq: 0,
-        instance_id: edge.instance_id,
-    };
-    NodeEvent::with_cursor(
-        stamp,
-        Some(cursor),
-        NodeEventBody::Chain(ChainEvent::BlockConnected { hash, height }),
-    )
+    }
 }
 
 fn now_wall_ns() -> u64 {

@@ -461,6 +461,11 @@ impl NodeEventStream for NodeEventStreamSvc {
         // height <= the snapshot tip are dropped (they were just replayed).
         // A `from_cursor` request with no block source falls back to
         // forward-only and logs.
+        // Capture the requested cursor's coordinates before `from_cursor` is
+        // moved into the replay match; they seed the last-delivered position
+        // used to fill a `Lagged` notice's resume cursor.
+        let from_h = req.from_cursor.as_ref().map(|c| c.height).unwrap_or(0);
+        let from_s = req.from_cursor.as_ref().map(|c| c.mempool_seq).unwrap_or(0);
         // Clamp, reorg-safety, instance-epoch handling, and the confirmed +
         // mempool snapshot all live in the shared `build_cursor_replay` helper
         // so every carrier (gRPC here, WS/SSE) behaves identically on the wire.
@@ -510,6 +515,18 @@ impl NodeEventStream for NodeEventStreamSvc {
         // Live mempool events at or below the highest replayed mempool seq
         // were just replayed from the ring — drop the live copy.
         let drop_mempool_through = replay.as_ref().map(|r| r.mempool_dedup_through);
+        // Last-delivered position, for the `Lagged` notice's resume cursor.
+        // Seed from the replay tail (so a client that lags right after the
+        // snapshot resumes after it, not from scratch), else the request cursor.
+        let lag_publisher = self.publisher.clone();
+        let mut last_h = from_h;
+        let mut last_s = from_s;
+        if let Some(r) = replay.as_ref() {
+            if let Some(h) = r.confirmed_dedup.keys().max() {
+                last_h = (*h).max(last_h);
+            }
+            last_s = r.mempool_dedup_through.max(last_s);
+        }
 
         // `sub_guard` is moved into the live stream closure so the
         // subscription slot is held for exactly as long as the (combined)
@@ -549,11 +566,22 @@ impl NodeEventStream for NodeEventStreamSvc {
                     {
                         return None;
                     }
+                    // Advance the last-delivered position so a subsequent lag
+                    // resumes the client just after this event.
+                    last_s = env.stamp.seq;
+                    if let Some(c) = &env.cursor {
+                        last_h = c.height;
+                    }
                     Some(Ok(envelope_to_proto(&env)))
                 }
                 Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
+                    // Tell the client in-band: how many events were dropped and
+                    // the cursor to reconnect from to recover them. The stream
+                    // then continues live.
                     warn!(target: "events::grpc", dropped = n, "gRPC subscriber lagged");
-                    None
+                    let resume = lag_publisher.resume_cursor(last_h, last_s);
+                    let ev = node::events::lagged_event(&lag_publisher, n, resume);
+                    Some(Ok(envelope_to_proto(&ev)))
                 }
             }
         });
@@ -644,17 +672,28 @@ impl NodeEventStream for NodeEventStreamSvc {
         }
 
         // Outbound: live category-filtered firehose merged with the
-        // per-subscriber watch matches.
+        // per-subscriber watch matches. Track the last-delivered position to
+        // fill an in-band `Lagged` notice (the Watch firehose has no replay, so
+        // it seeds from zero).
+        let lag_publisher = self.publisher.clone();
+        let mut last_h = 0u32;
+        let mut last_s = 0u64;
         let live = BroadcastStream::new(rx_live).filter_map(move |item| match item {
             Ok(env) => {
                 if (env.category_bit() & category_mask.load(Ordering::Relaxed)) == 0 {
                     return None;
                 }
+                last_s = env.stamp.seq;
+                if let Some(c) = &env.cursor {
+                    last_h = c.height;
+                }
                 Some(Ok(envelope_to_proto(&env)))
             }
             Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
                 warn!(target: "events::grpc", dropped = n, "Watch subscriber lagged (firehose)");
-                None
+                let resume = lag_publisher.resume_cursor(last_h, last_s);
+                let ev = node::events::lagged_event(&lag_publisher, n, resume);
+                Some(Ok(envelope_to_proto(&ev)))
             }
         });
         let matches =
@@ -928,6 +967,13 @@ fn body_to_proto(body: &NodeEventBody) -> pb::node_event::Body {
         NodeEventBody::Chain(ch) => Body::Chain(chain_event_to_proto(ch)),
         NodeEventBody::Heartbeat { uptime_ns } => Body::Heartbeat(pb::Heartbeat {
             uptime_ns: *uptime_ns,
+        }),
+        NodeEventBody::Lagged {
+            dropped_count,
+            resume_cursor,
+        } => Body::Lagged(pb::Lagged {
+            dropped_count: *dropped_count,
+            resume_cursor: Some(cursor_to_proto(*resume_cursor)),
         }),
     }
 }
@@ -1300,6 +1346,7 @@ mod tests {
                 pb::node_event::Body::OutpointSpent(_) => "outpoint_spent",
                 pb::node_event::Body::ScriptMatched(_) => "script_matched",
                 pb::node_event::Body::DescriptorNeedsAddresses(_) => "descriptor_needs_addresses",
+                pb::node_event::Body::Lagged(_) => "lagged",
             })
             .collect();
         assert!(
@@ -1835,6 +1882,67 @@ mod tests {
         // No replay, no live events → next() times out (stream is pending).
         let pending = tokio::time::timeout(Duration::from_millis(150), stream.next()).await;
         assert!(pending.is_err(), "forward-only stream should have no replay items");
+    }
+
+    /// When the subscriber falls behind the broadcast, the server emits an
+    /// in-band `Lagged` notice (dropped count + a resume cursor stamped with
+    /// the live instance) instead of silently dropping, and the stream
+    /// continues.
+    #[tokio::test]
+    async fn lagged_emits_in_band_resume_cursor() {
+        use tokio_stream::StreamExt as _;
+        // Tiny broadcast capacity so a burst overflows the subscriber's queue.
+        let publisher = EventPublisher::new(edge(), 4);
+        let (mp_tx, _) = broadcast::channel::<MempoolEvent>(128);
+        let (ch_tx, _) = broadcast::channel::<ChainEvent>(16);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let svc = NodeEventStreamSvc {
+            publisher: publisher.clone(),
+            active_subs: Arc::new(AtomicUsize::new(0)),
+            max_subscriptions: 0,
+            block_source: None,
+            watch_registry: None,
+        };
+        // Open the subscription first (its receiver is now live), then flood the
+        // publisher far past the broadcast capacity before the stream is polled.
+        let resp = svc
+            .subscribe(Request::new(pb::SubscribeRequest {
+                categories: 0,
+                since_seq: None,
+                from_cursor: None,
+            }))
+            .await
+            .expect("subscribe");
+        let mut stream = resp.into_inner();
+        publisher.spawn_bridges(mp_tx.subscribe(), ch_tx.subscribe(), shutdown_rx);
+        tokio::task::yield_now().await;
+        for i in 0..100u8 {
+            mp_tx.send(enter(i)).unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Some events may arrive before the lag; scan for the in-band notice.
+        let mut saw_lagged = false;
+        for _ in 0..20 {
+            let ev = tokio::time::timeout(Duration::from_secs(1), stream.next())
+                .await
+                .expect("item ready")
+                .expect("stream open")
+                .expect("ok");
+            if let Some(pb::node_event::Body::Lagged(l)) = ev.body.as_ref() {
+                assert!(l.dropped_count > 0, "dropped_count must be non-zero");
+                let resume = l.resume_cursor.as_ref().expect("resume cursor present");
+                assert_eq!(
+                    resume.instance_id,
+                    publisher.instance_id(),
+                    "resume cursor carries the live instance",
+                );
+                saw_lagged = true;
+                break;
+            }
+        }
+        assert!(saw_lagged, "expected an in-band Lagged notice after overflow");
+        let _ = shutdown_tx.send(true);
     }
 
     fn op_proto(byte: u8, vout: u32) -> pb::Outpoint {
