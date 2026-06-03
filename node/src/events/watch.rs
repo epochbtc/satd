@@ -394,8 +394,18 @@ fn scan_block_spent_scripts(inner: &Inner, block: &Block, height: u32, undo: &Un
         for (vin, _input) in tx.input.iter().enumerate() {
             let Some(spent) = undo.spent_coins.get(undo_idx) else {
                 // Undo shorter than the block's non-coinbase inputs: should
-                // never happen given the connect-order invariant. Stop rather
-                // than mis-align the remaining indices.
+                // never happen given the connect-order invariant (the consensus
+                // disconnect path validates the exact length). Stop rather than
+                // mis-align the remaining indices — this can only cause MISSED
+                // (never false) input-side matches. Log it: a short undo means
+                // a corrupt undo row or a broken invariant worth investigating.
+                warn!(
+                    target: "events::watch",
+                    height,
+                    have = undo.spent_coins.len(),
+                    "resync/scan: undo shorter than non-coinbase inputs; \
+                     input-side script matches truncated for this block"
+                );
                 return;
             };
             undo_idx += 1;
