@@ -12,6 +12,7 @@
 //! Sinks must never panic. Per-client metrics (active subscribers,
 //! cumulative lag, dropped count) are deferred to a follow-up.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -19,6 +20,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 
 use async_trait::async_trait;
+use bitcoin::BlockHash;
 use node::events::{EventSink, NodeEvent, NodeEventBody};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpListener;
@@ -29,6 +31,15 @@ use tonic::transport::Server;
 use tonic::transport::server::Connected;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, info, warn};
+
+/// Upper bound on the confirmed-block span replayed for a single
+/// `from_cursor` subscription. A client resuming from a cursor more than this
+/// many blocks behind the tip has its replay window clamped to the most
+/// recent `MAX_REPLAY_BLOCKS` (logged); it should full-resync the older
+/// history out-of-band rather than stream the whole chain over the event
+/// channel. This bounds both the per-subscriber replay work and the
+/// boundary-dedup map built from the captured snapshot.
+const MAX_REPLAY_BLOCKS: u32 = 10_000;
 
 /// Admission limits for the events gRPC sink. `0` on either field disables
 /// that cap. Defaults mirror `satd`'s config defaults (64 / 256).
@@ -88,6 +99,11 @@ pub struct GrpcEventSink {
     /// the `stream:subscribe` capability; otherwise the stream is unauthenticated
     /// (loopback-trust), today's behavior.
     auth: Option<std::sync::Arc<satd_auth::TokenStore>>,
+    /// Read-only block-index access for durable cursor replay. `Some` when a
+    /// chain source is wired (production); `None` disables replay (a
+    /// `from_cursor` request then streams live only). Never on the consensus
+    /// hot path — replay reads blocks the node already holds.
+    block_source: Option<std::sync::Arc<dyn node::events::BlockCursorSource>>,
 }
 
 fn now_unix() -> i64 {
@@ -148,6 +164,7 @@ impl GrpcEventSink {
         publisher: std::sync::Arc<node::events::EventPublisher>,
         limits: GrpcLimits,
         auth: Option<std::sync::Arc<satd_auth::TokenStore>>,
+        block_source: Option<std::sync::Arc<dyn node::events::BlockCursorSource>>,
     ) -> Result<Self, GrpcEventSinkError> {
         let addr: SocketAddr = bind
             .parse()
@@ -173,6 +190,7 @@ impl GrpcEventSink {
             publisher,
             limits,
             auth,
+            block_source,
         })
     }
 
@@ -210,6 +228,7 @@ impl EventSink for GrpcEventSink {
             publisher: self.publisher.clone(),
             active_subs: Arc::new(AtomicUsize::new(0)),
             max_subscriptions: self.limits.max_subscriptions,
+            block_source: self.block_source.clone(),
         };
         info!(target: "events::grpc", addr = %self.addr, "events gRPC server starting");
         let shutdown_signal = async move {
@@ -291,6 +310,9 @@ struct NodeEventStreamSvc {
     active_subs: Arc<AtomicUsize>,
     /// Hard cap on concurrent `Subscribe` streams. `0` disables the cap.
     max_subscriptions: usize,
+    /// Read-only block-index access for durable cursor replay; `None`
+    /// disables replay (forward-only).
+    block_source: Option<std::sync::Arc<dyn node::events::BlockCursorSource>>,
 }
 
 /// RAII guard decrementing the active-subscription counter when a stream is
@@ -417,29 +439,98 @@ impl NodeEventStream for NodeEventStreamSvc {
         };
         let since_seq = req.since_seq.unwrap_or(0);
 
-        // `since_seq` is a forward-only filter, NOT a replay hint. We
-        // create a fresh broadcast::Receiver here, which only sees
-        // events emitted strictly after this point — there is no
-        // history rewind. We then drop everything with seq <= since_seq
-        // before sending, so a client that briefly disconnects can
-        // suppress already-seen duplicates if its old `seq` is still
-        // close to the current one. Anything older has already passed
-        // the publisher's broadcast window and cannot be recovered
-        // through this RPC; clients needing durable replay should
-        // consume from a broker upstream of this sink.
+        // Subscribe to the live broadcast FIRST, before reading the tip for
+        // replay. This is the snapshot→live handoff ordering that guarantees
+        // no gap: any block connecting while we replay confirmed history is
+        // buffered in this receiver and delivered live afterwards. A fresh
+        // receiver only sees events emitted after this point, so `since_seq`
+        // (a forward-only dedup filter, not durable replay) and the live
+        // tail both anchor here.
         let rx = self.publisher.subscribe();
-        debug!(
-            target: "events::grpc",
-            categories = req.categories,
-            since_seq,
-            "events gRPC subscriber attached (forward-only; no replay)",
-        );
 
-        // `sub_guard` is moved into the stream closure so the subscription
-        // slot is held for exactly as long as the stream lives; it is never
-        // read, only kept alive (and dropped — decrementing the counter —
-        // when the client disconnects or the server shuts down).
-        let stream = BroadcastStream::new(rx).filter_map(move |item| {
+        // Durable cursor replay (snapshot→live handoff). When the client
+        // sends `from_cursor` and we have a block source, replay confirmed
+        // BlockConnected events from the cursor's next height up to the
+        // current tip (the "snapshot"), then chain the live stream. To
+        // avoid a duplicate at the boundary, live BlockConnected events at
+        // height <= the snapshot tip are dropped (they were just replayed).
+        // A `from_cursor` request with no block source falls back to
+        // forward-only and logs.
+        let replay: Option<Arc<HashMap<u32, BlockHash>>> =
+            match (req.from_cursor, self.block_source.as_ref()) {
+                (Some(cursor), Some(src)) => {
+                    let snapshot_tip = src.current_tip_height();
+                    let mut start = cursor.height.saturating_add(1);
+                    // Bound the confirmed replay span. A cursor far behind the
+                    // tip would otherwise stream the entire chain over the
+                    // event channel (a DoS amplification) and build an
+                    // unbounded boundary-dedup map. Clamp to the most recent
+                    // `MAX_REPLAY_BLOCKS`; replayed events carry their height
+                    // cursor, so a client can detect the resulting gap (first
+                    // replayed height > cursor + 1) and full-resync the rest.
+                    if snapshot_tip >= start && snapshot_tip - start + 1 > MAX_REPLAY_BLOCKS {
+                        let clamped = snapshot_tip - MAX_REPLAY_BLOCKS + 1;
+                        warn!(
+                            target: "events::grpc",
+                            requested_from = start,
+                            clamped_from = clamped,
+                            snapshot_tip,
+                            "from_cursor replay span exceeds MAX_REPLAY_BLOCKS; \
+                             clamping (client should full-resync earlier history)",
+                        );
+                        start = clamped;
+                    }
+                    // Capture a CONSISTENT snapshot of the confirmed range as
+                    // height→hash. Replay emits exactly these hashes (so a
+                    // reorg during replay cannot tear the segment), and the
+                    // live-side boundary dedup compares against them by
+                    // identity: a live BlockConnected whose hash equals the
+                    // captured hash at that height is a true duplicate (it
+                    // connected during the subscribe→snapshot window) and is
+                    // dropped, while a reorg that replaces a block at height
+                    // <= snapshot_tip yields a DIFFERENT hash and is forwarded
+                    // so the client's confirmed view stays correct.
+                    let mut replayed: HashMap<u32, BlockHash> = HashMap::new();
+                    for h in start..=snapshot_tip {
+                        if let Some(hash) = src.block_hash_at(h) {
+                            replayed.insert(h, hash);
+                        }
+                    }
+                    debug!(
+                        target: "events::grpc",
+                        from_height = start,
+                        snapshot_tip,
+                        replayed_blocks = replayed.len(),
+                        "events gRPC durable cursor replay (snapshot→live)",
+                    );
+                    Some(Arc::new(replayed))
+                }
+                (Some(_), None) => {
+                    warn!(
+                        target: "events::grpc",
+                        "from_cursor requested but no block source configured; streaming live only",
+                    );
+                    None
+                }
+                (None, _) => {
+                    debug!(
+                        target: "events::grpc",
+                        categories = req.categories,
+                        since_seq,
+                        "events gRPC subscriber attached (forward-only; no replay)",
+                    );
+                    None
+                }
+            };
+        let replayed_for_live = replay.clone();
+        let edge = *self.publisher.edge();
+
+        // `sub_guard` is moved into the live stream closure so the
+        // subscription slot is held for exactly as long as the (combined)
+        // stream lives; it is never read, only kept alive (and dropped —
+        // decrementing the counter — when the client disconnects or the
+        // server shuts down).
+        let live = BroadcastStream::new(rx).filter_map(move |item| {
             let _keep_slot = &sub_guard;
             match item {
                 Ok(env) => {
@@ -447,6 +538,20 @@ impl NodeEventStream for NodeEventStreamSvc {
                         return None;
                     }
                     if since_seq > 0 && env.stamp.seq <= since_seq {
+                        return None;
+                    }
+                    // Boundary dedup (identity-based): drop a live
+                    // BlockConnected only if it is byte-identical to the block
+                    // already replayed at that height. A reorg replacement at
+                    // height <= snapshot_tip has a different hash and is
+                    // forwarded, so the client's confirmed view stays correct
+                    // across a reorg during the snapshot→live handoff.
+                    if let Some(replayed) = &replayed_for_live
+                        && let NodeEventBody::Chain(
+                            node::chain::events::ChainEvent::BlockConnected { height, hash },
+                        ) = &env.body
+                        && replayed.get(height) == Some(hash)
+                    {
                         return None;
                     }
                     Some(Ok(envelope_to_proto(&env)))
@@ -458,7 +563,24 @@ impl NodeEventStream for NodeEventStreamSvc {
             }
         });
 
-        Ok(Response::new(Box::pin(stream)))
+        let stream: Self::SubscribeStream = match replay {
+            Some(replayed) => {
+                // Replay the captured consistent snapshot in height order. Each
+                // event carries its `(height, 0)` cursor and a replay stamp
+                // (seq 0 — positioned by the durable cursor, not the volatile
+                // per-publisher seq). `tokio_stream::iter` is polled lazily, so
+                // tonic's wire backpressure paces delivery.
+                let mut pairs: Vec<(u32, BlockHash)> =
+                    replayed.iter().map(|(h, hash)| (*h, *hash)).collect();
+                pairs.sort_unstable_by_key(|(h, _)| *h);
+                let replay_stream = tokio_stream::iter(pairs)
+                    .map(move |(h, hash)| Ok(replay_event_from_hash(&edge, h, hash)));
+                Box::pin(replay_stream.chain(live))
+            }
+            None => Box::pin(live),
+        };
+
+        Ok(Response::new(stream))
     }
 }
 
@@ -474,7 +596,63 @@ fn envelope_to_proto(env: &NodeEvent) -> pb::NodeEvent {
     pb::NodeEvent {
         schema_version: env.schema_version,
         stamp: Some(stamp_to_proto(&env.stamp)),
+        cursor: env.cursor.map(cursor_to_proto),
         body: Some(body_to_proto(&env.body)),
+    }
+}
+
+fn cursor_to_proto(c: node::events::Cursor) -> pb::Cursor {
+    pb::Cursor {
+        height: c.height,
+        tx_index: c.tx_index,
+        mempool_seq: c.mempool_seq,
+    }
+}
+
+/// Wall-clock nanoseconds since the Unix epoch (for replay-event stamps).
+fn now_wall_ns() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+/// Build the edge stamp for a synthesized replay event. `seq` is 0 and
+/// `edge_seen_at_ns` is 0 — a replayed confirmed event is positioned by its
+/// durable `(height, tx_index)` cursor, not the volatile per-publisher seq.
+fn replay_stamp(edge: &node::events::EdgeIdentity) -> pb::EdgeStamp {
+    pb::EdgeStamp {
+        node_id: edge.node_id.to_vec(),
+        region: region_to_string(edge.region.as_ref()),
+        edge_seen_at_ns: 0,
+        edge_wall_ns: now_wall_ns(),
+        seq: 0,
+    }
+}
+
+/// Synthesize a confirmed `BlockConnected` replay event for `height` from a
+/// captured snapshot `hash`, carrying its `(height, 0)` cursor.
+fn replay_event_from_hash(
+    edge: &node::events::EdgeIdentity,
+    height: u32,
+    hash: BlockHash,
+) -> pb::NodeEvent {
+    use bitcoin::hashes::Hash;
+    pb::NodeEvent {
+        schema_version: node::events::SCHEMA_VERSION,
+        stamp: Some(replay_stamp(edge)),
+        cursor: Some(pb::Cursor {
+            height,
+            tx_index: 0,
+            mempool_seq: 0,
+        }),
+        body: Some(pb::node_event::Body::Chain(pb::ChainEvent {
+            body: Some(pb::chain_event::Body::BlockConnected(pb::BlockConnected {
+                hash: hash.as_raw_hash().to_byte_array().to_vec(),
+                height,
+            })),
+        })),
     }
 }
 
@@ -736,7 +914,7 @@ mod tests {
     #[tokio::test]
     async fn bind_rejects_remote_address_by_default() {
         let publisher = EventPublisher::new(edge(), 16);
-        match GrpcEventSink::bind("0.0.0.0:0", false, publisher, GrpcLimits::default(), None).await {
+        match GrpcEventSink::bind("0.0.0.0:0", false, publisher, GrpcLimits::default(), None, None).await {
             Err(GrpcEventSinkError::RemoteBindRejected(_)) => {}
             Ok(_) => panic!("non-loopback bind without allow_remote should fail"),
             Err(e) => panic!("expected RemoteBindRejected, got {e}"),
@@ -746,7 +924,7 @@ mod tests {
     #[tokio::test]
     async fn bind_allows_loopback_without_override() {
         let publisher = EventPublisher::new(edge(), 16);
-        let sink = GrpcEventSink::bind("127.0.0.1:0", false, publisher, GrpcLimits::default(), None)
+        let sink = GrpcEventSink::bind("127.0.0.1:0", false, publisher, GrpcLimits::default(), None, None)
             .await
             .expect("loopback bind should succeed");
         let addr = sink.local_addr().expect("local_addr");
@@ -759,7 +937,7 @@ mod tests {
         // 0.0.0.0:0 with allow_remote = true: must succeed (the actual
         // port the OS picks is irrelevant; the test asserts only that
         // the loopback gate is bypassed when the caller opts in).
-        let sink = GrpcEventSink::bind("0.0.0.0:0", true, publisher, GrpcLimits::default(), None)
+        let sink = GrpcEventSink::bind("0.0.0.0:0", true, publisher, GrpcLimits::default(), None, None)
             .await
             .expect("explicit remote bind should be allowed");
         let addr = sink.local_addr().unwrap();
@@ -793,7 +971,7 @@ mod tests {
 
         // 2. Bind directly (the new API picks the actual ephemeral port
         // from the OS, no TOCTOU window).
-        let sink = GrpcEventSink::bind("127.0.0.1:0", false, publisher.clone(), GrpcLimits::default(), None)
+        let sink = GrpcEventSink::bind("127.0.0.1:0", false, publisher.clone(), GrpcLimits::default(), None, None)
             .await
             .expect("bind");
         let actual = sink.local_addr().unwrap();
@@ -815,6 +993,7 @@ mod tests {
             .subscribe(pb::SubscribeRequest {
                 categories: 0,
                 since_seq: None,
+                from_cursor: None,
             })
             .await
             .expect("subscribe")
@@ -884,11 +1063,13 @@ mod tests {
             publisher,
             active_subs: Arc::new(AtomicUsize::new(0)),
             max_subscriptions: 2,
+            block_source: None,
         };
         let mk = || {
             Request::new(pb::SubscribeRequest {
                 categories: 0,
                 since_seq: None,
+                from_cursor: None,
             })
         };
 
@@ -920,6 +1101,300 @@ mod tests {
         drop(s3);
     }
 
+    /// Mock block source: every height up to `tip` resolves to a
+    /// deterministic hash (`[height as u8; 32]`); beyond the tip is `None`.
+    struct MockBlocks {
+        tip: u32,
+    }
+    impl node::events::BlockCursorSource for MockBlocks {
+        fn current_tip_height(&self) -> u32 {
+            self.tip
+        }
+        fn block_hash_at(&self, height: u32) -> Option<BlockHash> {
+            if height >= 1 && height <= self.tip {
+                Some(BlockHash::from_raw_hash(
+                    bitcoin::hashes::sha256d::Hash::from_byte_array([height as u8; 32]),
+                ))
+            } else {
+                None
+            }
+        }
+    }
+
+    fn chain_height(ev: &pb::NodeEvent) -> Option<u32> {
+        match ev.body.as_ref()? {
+            pb::node_event::Body::Chain(c) => match c.body.as_ref()? {
+                pb::chain_event::Body::BlockConnected(b) => Some(b.height),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn chain_hash(ev: &pb::NodeEvent) -> Option<Vec<u8>> {
+        match ev.body.as_ref()? {
+            pb::node_event::Body::Chain(c) => match c.body.as_ref()? {
+                pb::chain_event::Body::BlockConnected(b) => Some(b.hash.clone()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// `from_cursor` replays confirmed `BlockConnected` history from the
+    /// cursor's next height up to the snapshot tip, each stamped with its
+    /// `(height, 0)` cursor and a replay seq of 0.
+    #[tokio::test]
+    async fn cursor_replay_emits_confirmed_history() {
+        use tokio_stream::StreamExt as _;
+        let publisher = EventPublisher::new(edge(), 64);
+        let svc = NodeEventStreamSvc {
+            publisher,
+            active_subs: Arc::new(AtomicUsize::new(0)),
+            max_subscriptions: 0,
+            block_source: Some(Arc::new(MockBlocks { tip: 5 })),
+        };
+        // Resume from height 2 → replay 3, 4, 5 (chain category only).
+        let resp = svc
+            .subscribe(Request::new(pb::SubscribeRequest {
+                categories: 2,
+                since_seq: None,
+                from_cursor: Some(pb::Cursor {
+                    height: 2,
+                    tx_index: 0,
+                    mempool_seq: 0,
+                }),
+            }))
+            .await
+            .expect("subscribe");
+        let mut stream = resp.into_inner();
+        for expected in 3..=5u32 {
+            let ev = tokio::time::timeout(Duration::from_secs(1), stream.next())
+                .await
+                .expect("replay item ready")
+                .expect("stream not ended")
+                .expect("no status error");
+            assert_eq!(chain_height(&ev), Some(expected));
+            let cur = ev.cursor.expect("replay event carries a cursor");
+            assert_eq!(cur.height, expected);
+            assert_eq!(cur.tx_index, 0);
+            // Replay events are positioned by the durable cursor, not seq.
+            assert_eq!(ev.stamp.as_ref().unwrap().seq, 0);
+        }
+    }
+
+    /// After replay, the stream joins live; a live block at height <= the
+    /// snapshot tip is dropped (already replayed) while a higher block is
+    /// delivered — the snapshot→live handoff has no gap and no duplicate.
+    #[tokio::test]
+    async fn cursor_replay_then_joins_live_without_duplicate() {
+        use tokio_stream::StreamExt as _;
+        let publisher = EventPublisher::new(edge(), 64);
+        let (mp_tx, _) = broadcast::channel::<MempoolEvent>(16);
+        let (ch_tx, _) = broadcast::channel::<ChainEvent>(16);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        publisher.spawn_bridges(mp_tx.subscribe(), ch_tx.subscribe(), shutdown_rx);
+
+        let svc = NodeEventStreamSvc {
+            publisher: publisher.clone(),
+            active_subs: Arc::new(AtomicUsize::new(0)),
+            max_subscriptions: 0,
+            block_source: Some(Arc::new(MockBlocks { tip: 5 })),
+        };
+        let resp = svc
+            .subscribe(Request::new(pb::SubscribeRequest {
+                categories: 2,
+                since_seq: None,
+                from_cursor: Some(pb::Cursor {
+                    height: 4,
+                    tx_index: 0,
+                    mempool_seq: 0,
+                }),
+            }))
+            .await
+            .expect("subscribe");
+        let mut stream = resp.into_inner();
+
+        // Replay covers only height 5 (cursor at 4, tip 5).
+        let ev = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("replay ready")
+            .unwrap()
+            .unwrap();
+        assert_eq!(chain_height(&ev), Some(5));
+
+        // Live block at height 5 (<= snapshot tip) must be deduped, and the
+        // block at height 6 (> snapshot tip) must come through.
+        let mk = |h: u32| ChainEvent::BlockConnected {
+            hash: BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+                [h as u8; 32],
+            )),
+            height: h,
+        };
+        ch_tx.send(mk(5)).unwrap(); // duplicate of the replayed tip → dropped
+        ch_tx.send(mk(6)).unwrap(); // new → delivered
+
+        let ev = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("live item ready")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            chain_height(&ev),
+            Some(6),
+            "the height-5 duplicate must be dropped, leaving height 6",
+        );
+        let _ = shutdown_tx.send(true);
+    }
+
+    /// Regression: a reorg during the snapshot→live handoff that replaces a
+    /// block at a height <= the snapshot tip must be DELIVERED (its hash
+    /// differs from the replayed block), not silently dropped by the boundary
+    /// dedup. The earlier height-based dedup tore the client's confirmed view
+    /// by eating the reorg's replacement `BlockConnected` while letting the
+    /// disconnect through; identity-based dedup forwards it.
+    #[tokio::test]
+    async fn reorg_during_handoff_forwards_replacement_block() {
+        use tokio_stream::StreamExt as _;
+        let publisher = EventPublisher::new(edge(), 64);
+        let (mp_tx, _) = broadcast::channel::<MempoolEvent>(16);
+        let (ch_tx, _) = broadcast::channel::<ChainEvent>(16);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        publisher.spawn_bridges(mp_tx.subscribe(), ch_tx.subscribe(), shutdown_rx);
+
+        let svc = NodeEventStreamSvc {
+            publisher: publisher.clone(),
+            active_subs: Arc::new(AtomicUsize::new(0)),
+            max_subscriptions: 0,
+            block_source: Some(Arc::new(MockBlocks { tip: 5 })),
+        };
+        // Resume from height 3 → replay 4, 5 (snapshot hashes [4;32], [5;32]).
+        let resp = svc
+            .subscribe(Request::new(pb::SubscribeRequest {
+                categories: 2,
+                since_seq: None,
+                from_cursor: Some(pb::Cursor {
+                    height: 3,
+                    tx_index: 0,
+                    mempool_seq: 0,
+                }),
+            }))
+            .await
+            .expect("subscribe");
+        let mut stream = resp.into_inner();
+        for expected in 4..=5u32 {
+            let ev = tokio::time::timeout(Duration::from_secs(1), stream.next())
+                .await
+                .expect("replay ready")
+                .unwrap()
+                .unwrap();
+            assert_eq!(chain_height(&ev), Some(expected));
+        }
+
+        // A reorg replaces height 5 with a DIFFERENT block (hash [0xEE;32]).
+        // This is height <= snapshot_tip but is not the replayed block, so it
+        // must be forwarded, not deduped.
+        let reorged5 = ChainEvent::BlockConnected {
+            hash: BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+                [0xEE; 32],
+            )),
+            height: 5,
+        };
+        // A true duplicate of the replayed height-5 (same hash) must still be
+        // dropped.
+        let dup5 = ChainEvent::BlockConnected {
+            hash: BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+                [5u8; 32],
+            )),
+            height: 5,
+        };
+        ch_tx.send(dup5).unwrap(); // identical → dropped
+        ch_tx.send(reorged5).unwrap(); // reorg replacement → delivered
+
+        let ev = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("live item ready")
+            .unwrap()
+            .unwrap();
+        assert_eq!(chain_height(&ev), Some(5));
+        assert_eq!(
+            chain_hash(&ev),
+            Some([0xEE; 32].to_vec()),
+            "the reorg replacement at height 5 must be forwarded, not deduped",
+        );
+        let _ = shutdown_tx.send(true);
+    }
+
+    /// A cursor far behind the tip clamps the replay span to
+    /// `MAX_REPLAY_BLOCKS` (the whole chain is never streamed over the event
+    /// channel). The replayed window starts at `tip - MAX_REPLAY_BLOCKS + 1`.
+    #[tokio::test]
+    async fn far_behind_cursor_clamps_replay_span() {
+        use tokio_stream::StreamExt as _;
+        let tip = MAX_REPLAY_BLOCKS + 100;
+        let publisher = EventPublisher::new(edge(), 64);
+        let svc = NodeEventStreamSvc {
+            publisher,
+            active_subs: Arc::new(AtomicUsize::new(0)),
+            max_subscriptions: 0,
+            block_source: Some(Arc::new(MockBlocks { tip })),
+        };
+        // Resume from height 0 → would replay the whole chain; must clamp.
+        let resp = svc
+            .subscribe(Request::new(pb::SubscribeRequest {
+                categories: 2,
+                since_seq: None,
+                from_cursor: Some(pb::Cursor {
+                    height: 0,
+                    tx_index: 0,
+                    mempool_seq: 0,
+                }),
+            }))
+            .await
+            .expect("subscribe");
+        let mut stream = resp.into_inner();
+        let first = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("replay ready")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            chain_height(&first),
+            Some(tip - MAX_REPLAY_BLOCKS + 1),
+            "replay must start at the clamped window, not height 1",
+        );
+    }
+
+    /// A `from_cursor` request with no block source falls back to
+    /// forward-only (no replay, no error).
+    #[tokio::test]
+    async fn cursor_without_block_source_is_forward_only() {
+        use tokio_stream::StreamExt as _;
+        let publisher = EventPublisher::new(edge(), 16);
+        let svc = NodeEventStreamSvc {
+            publisher,
+            active_subs: Arc::new(AtomicUsize::new(0)),
+            max_subscriptions: 0,
+            block_source: None,
+        };
+        let resp = svc
+            .subscribe(Request::new(pb::SubscribeRequest {
+                categories: 0,
+                since_seq: None,
+                from_cursor: Some(pb::Cursor {
+                    height: 2,
+                    tx_index: 0,
+                    mempool_seq: 0,
+                }),
+            }))
+            .await
+            .expect("subscribe ok even without a block source");
+        let mut stream = resp.into_inner();
+        // No replay, no live events → next() times out (stream is pending).
+        let pending = tokio::time::timeout(Duration::from_millis(150), stream.next()).await;
+        assert!(pending.is_err(), "forward-only stream should have no replay items");
+    }
+
     /// `max_subscriptions = 0` disables the cap entirely.
     #[tokio::test]
     async fn subscription_cap_disabled_when_zero() {
@@ -928,6 +1403,7 @@ mod tests {
             publisher,
             active_subs: Arc::new(AtomicUsize::new(0)),
             max_subscriptions: 0,
+            block_source: None,
         };
         let mut held = Vec::new();
         for _ in 0..16 {
@@ -935,6 +1411,7 @@ mod tests {
                 svc.subscribe(Request::new(pb::SubscribeRequest {
                     categories: 0,
                     since_seq: None,
+                    from_cursor: None,
                 }))
                 .await
                 .expect("uncapped subscribe always ok"),

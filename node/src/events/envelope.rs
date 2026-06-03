@@ -324,22 +324,78 @@ pub enum NodeEventBody {
     },
 }
 
+/// Durable resume position carried alongside confirmed-side events.
+///
+/// Confirmed cursors are `(height, tx_index)` — per-transaction, so a
+/// reconnecting client can resume mid-block. `mempool_seq` is a
+/// best-effort high-water mark for the mempool side (advisory; it tracks
+/// the per-publisher `seq`, which resets on restart). A client persists
+/// the `cursor` from the last [`NodeEvent`] it durably processed and
+/// presents it to resume; the confirmed `(height, tx_index)` half is
+/// reconstructable from the durable block store, the mempool half is not.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub struct Cursor {
+    /// Block height of the last delivered confirmed item.
+    pub height: u32,
+    /// Index within that block of the last delivered transaction.
+    pub tx_index: u32,
+    /// Best-effort mempool high-water mark (advisory; resets on restart).
+    pub mempool_seq: u64,
+}
+
+impl NodeEventBody {
+    /// Derive the durable [`Cursor`] this body advances to, if any.
+    ///
+    /// A connected block advances the confirmed cursor to `(height, 0)`
+    /// (block-level today; per-tx `tx_index` is populated once per-tx
+    /// confirmed events exist). Other bodies do not advance the durable
+    /// confirmed position, so they carry no cursor. `mempool_seq` is the
+    /// current per-publisher sequence, stamped so a reconnecting client
+    /// has a best-effort mempool high-water mark.
+    pub fn derive_cursor(&self, mempool_seq: u64) -> Option<Cursor> {
+        match self {
+            NodeEventBody::Chain(ChainEvent::BlockConnected { height, .. }) => Some(Cursor {
+                height: *height,
+                tx_index: 0,
+                mempool_seq,
+            }),
+            _ => None,
+        }
+    }
+}
+
 /// Versioned, edge-stamped event envelope. External transports emit
 /// these; internal Rust subscribers continue using the raw broadcasts.
 #[derive(Debug, Clone, Serialize)]
 pub struct NodeEvent {
     pub schema_version: u32,
     pub stamp: EdgeStamp,
+    /// Durable resume position as of this event. `Some` on confirmed-side
+    /// bodies (a connected block); `None` on events that do not advance
+    /// the durable cursor (mempool-only transitions, heartbeats).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<Cursor>,
     pub body: NodeEventBody,
 }
 
 impl NodeEvent {
     /// Construct an envelope with [`SCHEMA_VERSION`] and the given stamp
-    /// + body.
+    /// + body, with no durable cursor.
     pub fn new(stamp: EdgeStamp, body: NodeEventBody) -> Self {
         Self {
             schema_version: SCHEMA_VERSION,
             stamp,
+            cursor: None,
+            body,
+        }
+    }
+
+    /// Construct an envelope carrying a durable [`Cursor`].
+    pub fn with_cursor(stamp: EdgeStamp, cursor: Option<Cursor>, body: NodeEventBody) -> Self {
+        Self {
+            schema_version: SCHEMA_VERSION,
+            stamp,
+            cursor,
             body,
         }
     }

@@ -25,9 +25,31 @@ message SubscribeRequest {
   // ">since_seq" filter on events observed thereafter. Use it to
   // suppress duplicates after a brief reconnect within the broadcast
   // window — NOT to replay history. Events whose seq <= since_seq are
-  // dropped before reaching the wire. Clients that need durable
-  // replay should consume from a durable broker upstream of this sink.
+  // dropped before reaching the wire. For durable replay across a
+  // restart or a long disconnect, use `from_cursor` instead.
   optional uint64 since_seq = 2;
+
+  // Durable replay anchor. When set, the server first replays confirmed
+  // history forward from this cursor (reading the block index — see
+  // `Cursor`), then seamlessly joins the live stream with no gap or
+  // duplicate at the boundary (snapshot→live handoff). Unlike
+  // `since_seq`, this survives a restart: confirmed cursors are
+  // `(height, tx_index)` reconstructed from the durable block store, not
+  // an in-memory window. If the server has no block source configured,
+  // replay is skipped and the subscription is forward-only.
+  optional Cursor from_cursor = 3;
+}
+
+// Durable resume position. Confirmed-side cursors are `(height,
+// tx_index)` — per-transaction, so a client can resume mid-block after a
+// disconnect. `mempool_seq` is a best-effort high-water mark for the
+// mempool side (advisory; resets on daemon restart). A client persists
+// the `cursor` from the last `NodeEvent` it durably processed and
+// presents it as `from_cursor` on reconnect.
+message Cursor {
+  uint32 height      = 1; // block height of the last delivered confirmed item
+  uint32 tx_index    = 2; // index within that block of the last delivered tx
+  uint64 mempool_seq = 3; // best-effort mempool high-water (advisory)
 }
 
 // Per-event identity stamp applied at the publisher's bridge layer.
@@ -109,6 +131,11 @@ message Heartbeat {
 message NodeEvent {
   uint32 schema_version = 1;
   EdgeStamp stamp = 2;
+  // Durable resume position as of this event. Set on confirmed-side
+  // bodies (e.g. a connected block); absent on events that do not
+  // advance the durable cursor. A client persists this and presents it
+  // as `SubscribeRequest.from_cursor` to resume.
+  Cursor cursor = 3;
   oneof body {
     MempoolEvent mempool = 10;
     ChainEvent chain = 11;

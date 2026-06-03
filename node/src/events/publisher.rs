@@ -106,7 +106,13 @@ impl EventPublisher {
     /// no external sinks are configured); sink-side `Lagged` errors are
     /// the sink's problem, not ours.
     fn publish(&self, body: NodeEventBody) {
-        let env = NodeEvent::new(self.stamp(), body);
+        let stamp = self.stamp();
+        // Stamp a durable resume cursor on confirmed-side bodies (a
+        // connected block), so a reconnecting client can persist it and
+        // resume via `SubscribeRequest.from_cursor`. `stamp.seq` doubles
+        // as the best-effort mempool high-water mark.
+        let cursor = body.derive_cursor(stamp.seq);
+        let env = NodeEvent::with_cursor(stamp, cursor, body);
         // `send` returns `Err(SendError)` only when there are no active
         // receivers. That's the no-sinks-configured case — silent drop
         // is correct.
