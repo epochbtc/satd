@@ -29,7 +29,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
-use bitcoin::{Block, OutPoint, Transaction, Txid};
+use bitcoin::{Block, BlockHash, OutPoint, Transaction, Txid};
 use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{debug, warn};
 
@@ -487,9 +487,11 @@ pub async fn run_watch_matcher(
     // matcher starts is the client's replay concern (Subscribe(from_cursor)),
     // not the live matcher's. The hash lets a lag handler detect whether a reorg
     // replaced the frontier block (then forward-rescanning from `height` would
-    // miss the replacement blocks at or below it).
-    let mut last_scanned_height = chain.tip_height();
-    let mut last_scanned_hash = chain.get_block_hash_by_height(last_scanned_height);
+    // miss the replacement blocks at or below it). Captured atomically via
+    // `tip_snapshot` so height and hash agree.
+    let (tip_hash, tip_height) = chain.tip_snapshot();
+    let mut last_scanned_height = tip_height;
+    let mut last_scanned_hash: Option<BlockHash> = Some(tip_hash);
     loop {
         tokio::select! {
             biased;
@@ -513,17 +515,27 @@ pub async fn run_watch_matcher(
                     // Rescan the missed window so watchers do not silently miss
                     // matches. Reading blocks the node already holds; never
                     // blocks the publisher.
-                    let tip = chain.tip_height();
-                    // Is the block we last scanned still on the active chain at
-                    // its recorded height? If so, the reorg (if any) happened
-                    // ABOVE the frontier and a forward rescan over active-chain
-                    // heights is exact. If not, the reorg reached at or below the
-                    // frontier and the lag may have dropped the replacements'
-                    // BlockConnected events, so we must rescan the cap window
-                    // ending at the tip rather than only heights above the (now
-                    // stale) frontier.
+                    //
+                    // Snapshot the active-chain tip ONCE and derive everything
+                    // below from it, so the rescan is internally consistent even
+                    // if the tip advances meanwhile.
+                    let (tip_hash, tip) = chain.tip_snapshot();
+                    // Is the block we last scanned still on the ACTIVE chain at
+                    // its recorded height? Use the authoritative active-chain
+                    // lookup: `get_block_hash_by_height` reads the `height_hash`
+                    // index ("best known at height"), which side-chain
+                    // `store_block`/header-first writes can clobber — so it could
+                    // both spuriously report a reorg AND point the rescan at a
+                    // side-chain block (a false `confirmed` match). If the
+                    // frontier is intact the reorg (if any) was ABOVE it and a
+                    // forward rescan is exact; if not, the reorg reached at/below
+                    // the frontier and the lag may have dropped the replacements'
+                    // BlockConnected events, so we rescan the cap window ending at
+                    // the tip rather than only heights above the (stale) frontier.
                     let frontier_intact = match last_scanned_hash {
-                        Some(h) => chain.get_block_hash_by_height(last_scanned_height) == Some(h),
+                        Some(h) => {
+                            chain.active_chain_hash_at_height(last_scanned_height) == Some(h)
+                        }
                         None => false,
                     };
                     let range = if frontier_intact {
@@ -546,7 +558,34 @@ pub async fn run_watch_matcher(
                             );
                         }
                         if registry.has_watchers() {
-                            for (i, h) in (from..=to).enumerate() {
+                            // Resolve the ACTIVE-chain hash for every height in
+                            // `from..=to` (== tip) by walking back from the tip
+                            // ONCE via prev_blockhash: per-height
+                            // `active_chain_hash_at_height` would be O(span^2), and
+                            // `get_block_hash_by_height` could yield side-chain
+                            // blocks. Collect descending, then scan ascending so
+                            // matches are delivered in block order like the live
+                            // path.
+                            let mut active: Vec<(u32, BlockHash)> = Vec::new();
+                            let mut cur = tip_hash;
+                            let mut h = to;
+                            loop {
+                                active.push((h, cur));
+                                if h == from {
+                                    break;
+                                }
+                                match chain.get_block_index(&cur) {
+                                    Some(entry) => {
+                                        cur = entry.header.prev_blockhash;
+                                        h -= 1;
+                                    }
+                                    // An index gap below the tip should not happen
+                                    // for the active chain; stop rather than
+                                    // fabricate heights.
+                                    None => break,
+                                }
+                            }
+                            for (i, (h, hash)) in active.iter().rev().enumerate() {
                                 // Honor shutdown promptly and yield periodically so a
                                 // large catch-up (up to max_resync_blocks, or unbounded
                                 // when the cap is disabled) cannot monopolize the API
@@ -558,25 +597,18 @@ pub async fn run_watch_matcher(
                                 if i % 64 == 63 {
                                     tokio::task::yield_now().await;
                                 }
-                                match chain.get_block_hash_by_height(h) {
-                                    Some(hash) => match chain.get_block(&hash) {
-                                        Some(block) => registry.scan_block(&block, h),
-                                        None => debug!(
-                                            target: "events::watch",
-                                            height = h,
-                                            "resync: block data unavailable (pruned?); skipping"
-                                        ),
-                                    },
+                                match chain.get_block(hash) {
+                                    Some(block) => registry.scan_block(&block, *h),
                                     None => debug!(
                                         target: "events::watch",
-                                        height = h,
-                                        "resync: no block hash at height (pruned/reorg?); skipping"
+                                        height = *h,
+                                        "resync: block data unavailable (pruned?); skipping"
                                     ),
                                 }
                             }
                         }
                         last_scanned_height = tip;
-                        last_scanned_hash = chain.get_block_hash_by_height(tip);
+                        last_scanned_hash = Some(tip_hash);
                     } else {
                         warn!(
                             target: "events::watch",
