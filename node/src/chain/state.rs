@@ -3594,6 +3594,16 @@ impl ChainState {
         // walk the diff top-down and see a fully-consistent chainstate
         // + mempool by the time each event lands.
         if let Some(pending) = pending_reorg.take() {
+            // First-class reorg marker, emitted once before the per-block
+            // disconnect/connect sequence so subscribers have an explicit
+            // fork-point signal (rather than inferring one). The new tip is
+            // the triggering block.
+            self.emit_chain_event(crate::chain::events::ChainEvent::Reorg {
+                from_height: pending.old_height,
+                old_tip: pending.old_tip,
+                to_height: new_height,
+                new_tip: block_hash,
+            });
             for (hash, height) in &pending.original_disconnected {
                 self.emit_chain_event(
                     crate::chain::events::ChainEvent::BlockDisconnected {
@@ -5629,29 +5639,35 @@ pub(crate) mod tests {
         while let Ok(ev) = chain_rx.try_recv() {
             events.push(ev);
         }
-        // Expected: BlockDisconnected(A2), BlockDisconnected(A1),
-        // BlockConnected(B1), BlockConnected(B2), BlockConnected(B3).
-        assert_eq!(events.len(), 5, "events emitted: {:?}", events);
+        // Expected: Reorg marker first, then BlockDisconnected(A2),
+        // BlockDisconnected(A1), BlockConnected(B1), BlockConnected(B2),
+        // BlockConnected(B3).
+        assert_eq!(events.len(), 6, "events emitted: {:?}", events);
         assert!(matches!(
             events[0],
-            ChainEvent::BlockDisconnected { hash, height: 2 } if hash == a2_hash
-        ), "first event: {:?}", events[0]);
+            ChainEvent::Reorg { from_height: 2, old_tip, to_height: 3, new_tip }
+                if old_tip == a2_hash && new_tip == b3_hash
+        ), "first event (reorg marker): {:?}", events[0]);
         assert!(matches!(
             events[1],
-            ChainEvent::BlockDisconnected { hash, height: 1 } if hash == a1_hash
+            ChainEvent::BlockDisconnected { hash, height: 2 } if hash == a2_hash
         ), "second event: {:?}", events[1]);
         assert!(matches!(
             events[2],
-            ChainEvent::BlockConnected { hash, height: 1 } if hash == b1_hash
+            ChainEvent::BlockDisconnected { hash, height: 1 } if hash == a1_hash
         ), "third event: {:?}", events[2]);
         assert!(matches!(
             events[3],
-            ChainEvent::BlockConnected { hash, height: 2 } if hash == b2_hash
+            ChainEvent::BlockConnected { hash, height: 1 } if hash == b1_hash
         ), "fourth event: {:?}", events[3]);
         assert!(matches!(
             events[4],
-            ChainEvent::BlockConnected { hash, height: 3 } if hash == b3_hash
+            ChainEvent::BlockConnected { hash, height: 2 } if hash == b2_hash
         ), "fifth event: {:?}", events[4]);
+        assert!(matches!(
+            events[5],
+            ChainEvent::BlockConnected { hash, height: 3 } if hash == b3_hash
+        ), "sixth event: {:?}", events[5]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

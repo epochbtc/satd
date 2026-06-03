@@ -112,7 +112,9 @@ pub async fn blocks_sse(
                     .event("block")
                     .data(serde_json::to_string(&payload).unwrap_or_default())))
             }
-            Ok(ChainEvent::BlockDisconnected { .. }) => None,
+            // Disconnects and the reorg marker are suppressed on the block
+            // SSE feed; clients see the new tip via the next BlockConnected.
+            Ok(ChainEvent::BlockDisconnected { .. }) | Ok(ChainEvent::Reorg { .. }) => None,
             Err(BroadcastStreamRecvError::Lagged(_)) => None,
         }
     });

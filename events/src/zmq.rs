@@ -276,12 +276,14 @@ async fn publish(
                 send(socket, topics::HASHBLOCK, payload, seq).await?;
             }
         }
-        NodeEventBody::Chain(ChainEvent::BlockDisconnected { .. }) => {
-            // Bitcoin Core does not emit a hashblock for disconnect —
-            // operators detect reorgs via the higher-level reorg
-            // webhook or by observing block-height regressions in
-            // their indexer. The full envelope is still available on
-            // `nodeevent` if the consumer needs it.
+        NodeEventBody::Chain(ChainEvent::BlockDisconnected { .. })
+        | NodeEventBody::Chain(ChainEvent::Reorg { .. }) => {
+            // Bitcoin Core does not emit a hashblock for disconnect or a
+            // dedicated reorg topic — operators detect reorgs via the
+            // higher-level reorg webhook or by observing block-height
+            // regressions in their indexer. The full envelope (including the
+            // first-class Reorg marker) is still available on `nodeevent` if
+            // the consumer needs it.
         }
         NodeEventBody::Heartbeat { .. } => {
             // Heartbeats only flow through `nodeevent`. The Core-compat

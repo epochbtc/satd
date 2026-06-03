@@ -1092,6 +1092,17 @@ fn chain_event_to_proto(ev: &node::chain::events::ChainEvent) -> pb::ChainEvent 
                 height: *height,
             })
         }
+        Ch::Reorg {
+            from_height,
+            old_tip,
+            to_height,
+            new_tip,
+        } => ChBody::Reorg(pb::Reorg {
+            from_height: *from_height,
+            old_tip: old_tip.as_raw_hash().to_byte_array().to_vec(),
+            to_height: *to_height,
+            new_tip: new_tip.as_raw_hash().to_byte_array().to_vec(),
+        }),
     };
     pb::ChainEvent { body: Some(body) }
 }
