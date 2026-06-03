@@ -122,7 +122,18 @@ fn add_items<T: Eq + Hash + Copy>(
             Ok(mut batch) => {
                 register(&net_new);
                 for it in net_new {
-                    held.insert(it, batch.split_off_one());
+                    let lease = batch.split_off_one();
+                    // Conservation invariant: acquire_watch charged exactly
+                    // net_new.len() units, and we split exactly that many, so
+                    // every split yields Some. A None here would mean an item
+                    // charged in the store with no per-item lease backing it —
+                    // a unit leaked until teardown. Pin it so a future refactor
+                    // can't silently regress.
+                    debug_assert!(
+                        lease.is_some(),
+                        "split_off_one drained before all items got a lease",
+                    );
+                    held.insert(it, lease);
                 }
             }
             Err(reject) => {
