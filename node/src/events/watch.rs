@@ -391,12 +391,22 @@ impl Drop for WatchHandle {
 }
 
 /// Compute the height range the matcher must rescan after lagging the chain
-/// event broadcast, capping the span to `max` blocks.
+/// event broadcast **when its frontier block is still on the active chain**,
+/// capping the span to `max` blocks.
+///
+/// This is the forward-only case: the lower bound is anchored just above
+/// `last_scanned`. It is correct even if a reorg occurred *above* the frontier
+/// while we lagged — [`ChainState::get_block_hash_by_height`] returns
+/// active-chain hashes, so rescanning `last_scanned+1..=tip` naturally picks up
+/// the post-reorg blocks. It is NOT correct if the reorg reached down to or
+/// below `last_scanned` (that height's block may have been replaced); the
+/// caller detects that via a frontier-hash check and uses
+/// [`reorg_resync_range`] instead.
 ///
 /// Returns `Some((from, to, skipped))` — an inclusive `from..=to` range to
 /// rescan plus the number of older blocks the cap dropped (always logged,
 /// never silent) — or `None` when there is nothing to rescan (the matcher is
-/// already at or beyond the tip, e.g. after a reorg shrank the chain).
+/// already at or beyond the tip).
 ///
 /// `max == 0` disables the cap (rescan the whole gap).
 fn resync_range(last_scanned: u32, tip: u32, max: u32) -> Option<(u32, u32, u32)> {
@@ -414,6 +424,34 @@ fn resync_range(last_scanned: u32, tip: u32, max: u32) -> Option<(u32, u32, u32)
     }
 }
 
+/// Compute the rescan range after a lag during which the matcher's frontier
+/// block was reorged off the active chain.
+///
+/// Unlike [`resync_range`], the lower bound is **not** anchored to
+/// `last_scanned`: that height's block may have been replaced, and the lag may
+/// have dropped the very `BlockConnected` events for the replacement blocks, so
+/// anchoring above the old frontier would permanently miss matches in the
+/// replacements (heights `<= last_scanned`). Instead we rescan the most recent
+/// `max` blocks ending at `tip`, re-covering reorg-replacement blocks at or
+/// below the old frontier. Unchanged blocks in that window are re-scanned and
+/// may re-emit matches — clients dedup confirmed matches by (item, height), and
+/// a reorg-during-lag is rare — so the bounded duplication is an acceptable
+/// cost of never silently dropping a replacement match.
+///
+/// `max == 0` rescans from genesis. Returns `Some((from, to, skipped))` with
+/// the same shape as [`resync_range`].
+fn reorg_resync_range(tip: u32, max: u32) -> Option<(u32, u32, u32)> {
+    // `from = tip - max + 1`, floored at genesis; `(tip + 1) - max` avoids
+    // underflow. `max == 0` (cap disabled) rescans from genesis.
+    let from = if max == 0 {
+        0
+    } else {
+        (tip + 1).saturating_sub(max)
+    };
+    // Heights `0..from` are below the kept window and not rescanned.
+    Some((from, tip, from))
+}
+
 /// Drive the watch matcher off the existing event broadcasts. Decoupled
 /// from consensus: on `BlockConnected` it re-reads the (already durable)
 /// block and scans it; on a mempool `Enter` it fetches the accepted tx and
@@ -423,10 +461,14 @@ fn resync_range(last_scanned: u32, tip: u32, max: u32) -> Option<(u32, u32, u32)
 /// If the chain-event broadcast lags (a slow matcher under a burst of
 /// blocks), the dropped blocks would otherwise be silently un-scanned and
 /// every watcher would miss matches in that window. On a lag the matcher
-/// therefore rescans from its last scanned height forward to the current tip
-/// (capped by `max_resync_blocks`; see [`resync_range`]), reading each block
-/// the node already holds. This keeps the matcher correct under load without
-/// ever backpressuring the publisher.
+/// rescans the missed blocks the node already holds, capped by
+/// `max_resync_blocks`, without ever backpressuring the publisher. It tracks
+/// its frontier block *hash* (not just height) so it can tell whether a reorg
+/// reached at or below that frontier while it was lagged: if the frontier is
+/// intact, a forward rescan from there is exact (see [`resync_range`]); if the
+/// frontier block was reorged off the active chain, the lag may have dropped
+/// the replacement blocks' `BlockConnected` events too, so it rescans the cap
+/// window ending at the tip (see [`reorg_resync_range`]) to re-cover them.
 ///
 /// Runs until `shutdown` flips or both broadcasts close. Intended to be
 /// spawned on the API runtime, alongside the other event sinks.
@@ -440,11 +482,14 @@ pub async fn run_watch_matcher(
     mut shutdown: watch::Receiver<bool>,
 ) {
     debug!(target: "events::watch", "watch matcher started");
-    // Highest block height the matcher has scanned. Initialized to the current
-    // tip: history before the matcher starts is the client's replay concern
-    // (Subscribe(from_cursor)), not the live matcher's. On a lag we rescan
-    // forward from here so no connected block is silently skipped.
+    // Frontier of what the matcher has scanned: the height AND hash of the last
+    // block it scanned. Initialized to the current tip — history before the
+    // matcher starts is the client's replay concern (Subscribe(from_cursor)),
+    // not the live matcher's. The hash lets a lag handler detect whether a reorg
+    // replaced the frontier block (then forward-rescanning from `height` would
+    // miss the replacement blocks at or below it).
     let mut last_scanned_height = chain.tip_height();
+    let mut last_scanned_hash = chain.get_block_hash_by_height(last_scanned_height);
     loop {
         tokio::select! {
             biased;
@@ -457,6 +502,7 @@ pub async fn run_watch_matcher(
                         registry.scan_block(&block, height);
                     }
                     last_scanned_height = height;
+                    last_scanned_hash = Some(hash);
                 }
                 // Disconnects and the reorg marker are surfaced to clients
                 // as first-class events; the matcher itself is spend/funding
@@ -468,12 +514,27 @@ pub async fn run_watch_matcher(
                     // matches. Reading blocks the node already holds; never
                     // blocks the publisher.
                     let tip = chain.tip_height();
-                    if let Some((from, to, skipped)) =
+                    // Is the block we last scanned still on the active chain at
+                    // its recorded height? If so, the reorg (if any) happened
+                    // ABOVE the frontier and a forward rescan over active-chain
+                    // heights is exact. If not, the reorg reached at or below the
+                    // frontier and the lag may have dropped the replacements'
+                    // BlockConnected events, so we must rescan the cap window
+                    // ending at the tip rather than only heights above the (now
+                    // stale) frontier.
+                    let frontier_intact = match last_scanned_hash {
+                        Some(h) => chain.get_block_hash_by_height(last_scanned_height) == Some(h),
+                        None => false,
+                    };
+                    let range = if frontier_intact {
                         resync_range(last_scanned_height, tip, max_resync_blocks)
-                    {
+                    } else {
+                        reorg_resync_range(tip, max_resync_blocks)
+                    };
+                    if let Some((from, to, skipped)) = range {
                         warn!(
                             target: "events::watch",
-                            dropped = n, from, to, skipped,
+                            dropped = n, from, to, skipped, reorg = !frontier_intact,
                             "watch matcher lagged on chain events; resyncing to tip"
                         );
                         if skipped > 0 {
@@ -515,6 +576,7 @@ pub async fn run_watch_matcher(
                             }
                         }
                         last_scanned_height = tip;
+                        last_scanned_hash = chain.get_block_hash_by_height(tip);
                     } else {
                         warn!(
                             target: "events::watch",
@@ -730,9 +792,12 @@ mod tests {
 
     #[test]
     fn resync_range_tip_below_last_scanned_is_none() {
-        // A reorg during the lag shrank the active chain below where we were;
-        // the reconnect path drives the new chain, so there is nothing to
-        // forward-rescan here.
+        // The forward helper returns None when tip <= last_scanned. This is only
+        // reached when the frontier block is still on the active chain (the
+        // caller's frontier-hash check passed), so tip < last_scanned cannot be
+        // a reorg that replaced our frontier — that case routes to
+        // `reorg_resync_range` instead. Here there is simply nothing above the
+        // frontier to forward-rescan.
         assert_eq!(resync_range(105, 102, 10_000), None);
     }
 
@@ -756,5 +821,43 @@ mod tests {
     fn resync_range_zero_cap_disables_cap() {
         // max == 0 → rescan the entire gap regardless of size.
         assert_eq!(resync_range(0, 1_000_000, 0), Some((1, 1_000_000, 0)));
+    }
+
+    // --- reorg_resync_range (lag during which the frontier was reorged off) ---
+
+    #[test]
+    fn reorg_resync_range_rescans_cap_window_ending_at_tip() {
+        // A reorg reached at/below the frontier during the lag: rescan the most
+        // recent `max` blocks ending at tip (NOT anchored above the old, now
+        // stale, frontier), re-covering replacement blocks at lower heights.
+        // tip 105, cap 100 → 6..=105 (100 blocks), 6 older heights skipped.
+        assert_eq!(reorg_resync_range(105, 100), Some((6, 105, 6)));
+        let (from, to, _) = reorg_resync_range(105, 100).unwrap();
+        assert_eq!(to - from + 1, 100, "window is exactly `cap` blocks wide");
+    }
+
+    #[test]
+    fn reorg_resync_range_window_wider_than_chain_starts_at_genesis() {
+        // cap exceeds the chain height → rescan from genesis, nothing skipped.
+        assert_eq!(reorg_resync_range(50, 100), Some((0, 50, 0)));
+    }
+
+    #[test]
+    fn reorg_resync_range_zero_cap_rescans_from_genesis() {
+        // cap disabled → rescan the whole active chain from genesis.
+        assert_eq!(reorg_resync_range(1_000, 0), Some((0, 1_000, 0)));
+    }
+
+    #[test]
+    fn reorg_resync_range_covers_heights_at_or_below_old_frontier() {
+        // The defect this guards against: a reorg replaces blocks 98,99,100 with
+        // 98',99',100',101' while the matcher (frontier height 100) is lagged.
+        // The forward-only resync_range(100, 101, ..) would scan ONLY 101,
+        // missing replacements 98'..100'. The reorg window must include them.
+        let (from, to, _) = reorg_resync_range(101, 10_000).unwrap();
+        assert!(from <= 98, "must rescan down to the replaced heights, got {from}");
+        assert_eq!(to, 101);
+        // Contrast: the forward helper would have started at 101.
+        assert_eq!(resync_range(100, 101, 10_000), Some((101, 101, 0)));
     }
 }
