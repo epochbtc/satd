@@ -469,6 +469,7 @@ mod tests {
             time: 0,
             fee_delta: 0,
             sigop_cost,
+            prev_scripthashes: Vec::new(),
         }
     }
 

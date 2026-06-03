@@ -359,7 +359,11 @@ All additions are opt-in; the wire schema is `v1`. See `docs/api/streaming.md`.
   and full mempool coverage. Granularity is operator-bounded
   (`-streamprefixminbits` / `-streamprefixmaxbits`, defaults 8 / 32; the maximum
   caps precision so a bucket always spans many scripts), and the quota is priced
-  by coarseness — a coarser bucket costs proportionally more units.
+  by coarseness — a coarser bucket costs proportionally more units. Spent-prevout
+  matching covers both confirmed spends (the matched prevout's full script, from
+  block undo data) and *unconfirmed* mempool spends; for the mempool side the
+  match carries the spent outpoint but not the prevout script (the node retains
+  only its hash), so a client resolves the prevout from its own UTXO set.
 - **Operator-configurable consumption caps.** Connection, per-connection
   subscription, and inbound-message-size caps for the WS transport
   (`-streamwsmaxconns` / `-streamwsmaxsubscriptions` / `-streamwsmaxmessagebytes`,
