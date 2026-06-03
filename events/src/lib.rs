@@ -48,3 +48,8 @@ pub use ws::{WsStreamError, WsStreamServer};
 // Descriptor convenience layer — shared by the gRPC and WS watch surfaces.
 #[cfg(any(feature = "grpc", feature = "ws"))]
 pub mod descriptor;
+
+// Per-subscription watch-set with per-item quota leases (cross-message dedup +
+// per-remove release) — shared by the gRPC and WS watch surfaces.
+#[cfg(any(feature = "grpc", feature = "ws"))]
+pub(crate) mod watchset;

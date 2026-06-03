@@ -63,6 +63,7 @@ impl Default for GrpcLimits {
 }
 
 use crate::proto::v1 as pb;
+use crate::watchset::WatchSet;
 use crate::proto::v1::node_event_stream_server::{
     NodeEventStream, NodeEventStreamServer,
 };
@@ -667,36 +668,36 @@ impl NodeEventStream for NodeEventStreamSvc {
         let edge = *self.publisher.edge();
         let rx_live = self.publisher.subscribe();
 
-        // Watch-quota leases are owned by the SUBSCRIPTION, not the inbound
-        // control reader. gRPC/HTTP-2 lets a client half-close its send side
-        // (END_STREAM on the request) while keeping the response stream open;
-        // if the leases lived in the inbound task they would be released the
-        // moment the control stream closed, dropping the client's quota to
-        // zero while its watches stayed live on the outbound stream — letting
-        // an authed tenant register an unbounded watch-set at no standing
-        // quota cost. Holding the leases behind an `Arc` shared by both the
-        // inbound task and the outbound stream ties their lifetime to the
-        // watch-set itself: quota is released exactly when the `WatchHandle`
-        // is deregistered (full disconnect).
-        let leases: Arc<std::sync::Mutex<Vec<satd_auth::WatchLease>>> =
-            Arc::new(std::sync::Mutex::new(Vec::new()));
+        // The watch-set (and the per-item quota leases inside it) is owned by
+        // the SUBSCRIPTION, not the inbound control reader. gRPC/HTTP-2 lets a
+        // client half-close its send side (END_STREAM on the request) while
+        // keeping the response stream open; if it lived in the inbound task it
+        // would be dropped the moment the control stream closed, releasing the
+        // client's quota to zero while its watches stayed live on the outbound
+        // stream — letting an authed tenant register an unbounded watch-set at
+        // no standing quota cost. Holding it behind an `Arc` shared by both the
+        // inbound task and the outbound stream ties the leases' lifetime to the
+        // watch-set itself: quota is released per-remove, and the remainder when
+        // the subscription is torn down (full disconnect).
+        let watch_set: Arc<std::sync::Mutex<WatchSet>> =
+            Arc::new(std::sync::Mutex::new(WatchSet::default()));
 
         // Inbound control reader: applies watch-set mutations + category
-        // changes for the life of the stream, recording any watch-quota leases
-        // into the shared subscription-scoped vec, and holds a handle clone so
-        // the subscription is retained while either side is alive.
+        // changes for the life of the stream against the shared subscription-
+        // scoped watch-set, and holds a handle clone so the subscription is
+        // retained while either side is alive.
         {
             let handle = handle.clone();
             let category_mask = category_mask.clone();
-            let leases = leases.clone();
+            let watch_set = watch_set.clone();
             tokio::spawn(async move {
                 while let Ok(Some(ctrl)) = inbound.message().await {
-                    let mut guard = leases.lock().unwrap_or_else(|p| p.into_inner());
+                    let mut guard = watch_set.lock().unwrap_or_else(|p| p.into_inner());
                     apply_control(ctrl, &handle, principal.as_ref(), &category_mask, &mut guard);
                 }
-                // Inbound (control) closed. Leases are NOT released here — they
-                // belong to the subscription and drop with the outbound stream
-                // + WatchHandle when the client fully disconnects.
+                // Inbound (control) closed. The watch-set is NOT dropped here —
+                // it belongs to the subscription and drops with the outbound
+                // stream + WatchHandle when the client fully disconnects.
             });
         }
 
@@ -722,9 +723,10 @@ impl NodeEventStream for NodeEventStreamSvc {
         let merged = live.merge(matches).map(move |x| {
             let _keep_handle = &handle;
             let _keep_slot = &sub_guard;
-            // Keep the quota leases alive for the subscription's lifetime; they
-            // (and the WatchHandle) drop together when the client disconnects.
-            let _keep_leases = &leases;
+            // Keep the watch-set (and its quota leases) alive for the
+            // subscription's lifetime; it and the WatchHandle drop together
+            // when the client disconnects.
+            let _keep_watch_set = &watch_set;
             x
         });
 
@@ -733,75 +735,65 @@ impl NodeEventStream for NodeEventStreamSvc {
 }
 
 /// Apply one `SubscribeControl` to a subscriber's watch-set. Watch additions
-/// charge the per-token quota (N items = N units) via `acquire_watch`, which
-/// also enforces the `stream:watch` capability; a rejected add is logged and
-/// skipped without tearing down the stream. Quota leases are held by the
-/// caller and released on disconnect (per-remove release is a follow-up).
+/// charge the per-token quota (N items = N units) via the [`WatchSet`], which
+/// enforces the `stream:watch` capability, dedups against the live watch-set
+/// (cross-message), and mints a per-item lease so a later remove frees exactly
+/// that unit. A rejected add is logged and skipped without tearing down the
+/// stream.
 fn apply_control(
     ctrl: pb::SubscribeControl,
     handle: &node::events::WatchHandle,
     principal: Option<&satd_auth::Principal>,
     category_mask: &AtomicU32,
-    leases: &mut Vec<satd_auth::WatchLease>,
+    watch_set: &mut WatchSet,
 ) {
     use pb::subscribe_control::Msg;
     match ctrl.msg {
         Some(Msg::AddOutpoints(a)) => {
-            // Charge for distinct items only — a single message may repeat an
-            // entry, and the registry deduplicates on insert, so charging the
-            // raw count would overcharge the token's quota. (Cross-message
-            // dedup against the live watch-set is a follow-up.)
-            let mut seen = std::collections::HashSet::new();
-            let ops: Vec<bitcoin::OutPoint> = a
-                .outpoints
-                .iter()
-                .filter_map(parse_outpoint)
-                .filter(|o| seen.insert(*o))
-                .collect();
-            if !ops.is_empty() {
-                charge_and_add(principal, leases, ops.len(), "outpoints", || {
-                    handle.add_outpoints(&ops);
-                });
-            }
+            watch_set.add_outpoints(
+                principal,
+                a.outpoints.iter().filter_map(parse_outpoint),
+                |ops| {
+                    handle.add_outpoints(ops);
+                },
+            );
         }
         Some(Msg::AddScripts(a)) => {
-            let mut seen = std::collections::HashSet::new();
-            let shs: Vec<[u8; 32]> = a
-                .scripthashes
-                .iter()
-                .filter_map(|b| parse_scripthash(b))
-                .filter(|sh| seen.insert(*sh))
-                .collect();
-            if !shs.is_empty() {
-                charge_and_add(principal, leases, shs.len(), "scripts", || {
-                    handle.add_scripthashes(&shs);
-                });
-            }
+            watch_set.add_scripts(
+                principal,
+                a.scripthashes.iter().filter_map(|b| parse_scripthash(b)),
+                "scripts",
+                |shs| {
+                    handle.add_scripthashes(shs);
+                },
+            );
         }
         Some(Msg::RemoveOutpoints(r)) => {
-            let ops: Vec<bitcoin::OutPoint> =
-                r.outpoints.iter().filter_map(parse_outpoint).collect();
-            handle.remove_outpoints(&ops);
+            watch_set.remove_outpoints(r.outpoints.iter().filter_map(parse_outpoint), |ops| {
+                handle.remove_outpoints(ops);
+            });
         }
         Some(Msg::RemoveScripts(r)) => {
-            let shs: Vec<[u8; 32]> = r
-                .scripthashes
-                .iter()
-                .filter_map(|b| parse_scripthash(b))
-                .collect();
-            handle.remove_scripthashes(&shs);
+            watch_set.remove_scripts(
+                r.scripthashes.iter().filter_map(|b| parse_scripthash(b)),
+                |shs| {
+                    handle.remove_scripthashes(shs);
+                },
+            );
         }
         Some(Msg::AddDescriptor(d)) => {
             // Expand the descriptor into its first `gap_limit` scripts and
-            // watch them (rust-miniscript). Charges one unit per script.
+            // watch them (rust-miniscript). Charges one unit per net-new script.
             match crate::descriptor::expand_descriptor(&d.descriptor, 0, d.gap_limit) {
                 Ok(scripts) => {
-                    let shs: Vec<[u8; 32]> = scripts.into_iter().map(|(_, sh)| sh).collect();
-                    if !shs.is_empty() {
-                        charge_and_add(principal, leases, shs.len(), "descriptor", || {
-                            handle.add_scripthashes(&shs);
-                        });
-                    }
+                    watch_set.add_scripts(
+                        principal,
+                        scripts.into_iter().map(|(_, sh)| sh),
+                        "descriptor",
+                        |shs| {
+                            handle.add_scripthashes(shs);
+                        },
+                    );
                 }
                 Err(e) => {
                     warn!(target: "events::grpc", error = %e, "ignoring invalid descriptor");
@@ -823,34 +815,6 @@ fn apply_control(
             );
         }
         None => {}
-    }
-}
-
-/// Charge `n` watch-quota units, then run `add` on success. With no
-/// principal (auth disabled), watches are unlimited (loopback trust).
-fn charge_and_add<F: FnOnce()>(
-    principal: Option<&satd_auth::Principal>,
-    leases: &mut Vec<satd_auth::WatchLease>,
-    n: usize,
-    kind: &'static str,
-    add: F,
-) {
-    match principal {
-        Some(p) => match p.acquire_watch(n as u64) {
-            Ok(lease) => {
-                add();
-                leases.push(lease);
-            }
-            Err(reject) => {
-                warn!(
-                    target: "events::grpc",
-                    kind,
-                    reject = ?reject,
-                    "watch add rejected (capability or quota)",
-                );
-            }
-        },
-        None => add(),
     }
 }
 
@@ -1846,7 +1810,7 @@ mod tests {
         let reg = Arc::new(node::events::WatchRegistry::new());
         let (handle, _rx) = reg.register(node::events::WATCH_CHANNEL_CAPACITY);
         let mask = AtomicU32::new(u32::MAX);
-        let mut leases = Vec::new();
+        let mut leases = WatchSet::default();
         apply_control(
             pb::SubscribeControl {
                 msg: Some(pb::subscribe_control::Msg::AddOutpoints(pb::AddOutpoints {
@@ -1873,7 +1837,7 @@ mod tests {
         let reg = Arc::new(node::events::WatchRegistry::new());
         let (handle, _rx) = reg.register(node::events::WATCH_CHANNEL_CAPACITY);
         let mask = AtomicU32::new(u32::MAX);
-        let mut leases = Vec::new();
+        let mut leases = WatchSet::default();
         apply_control(
             pb::SubscribeControl {
                 msg: Some(pb::subscribe_control::Msg::AddOutpoints(pb::AddOutpoints {
@@ -1889,7 +1853,7 @@ mod tests {
             !reg.has_watchers(),
             "add must be rejected without stream:watch"
         );
-        assert!(leases.is_empty(), "no lease taken on a rejected add");
+        assert_eq!(leases.len(), 0, "no item added on a rejected add");
     }
 
     /// Regression (HIGH): watch-quota leases must be owned by the
@@ -1919,8 +1883,8 @@ mod tests {
         let mask = AtomicU32::new(u32::MAX);
 
         // The subscription-scoped lease vec (held by the outbound stream).
-        let leases: Arc<std::sync::Mutex<Vec<satd_auth::WatchLease>>> =
-            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let leases: Arc<std::sync::Mutex<WatchSet>> =
+            Arc::new(std::sync::Mutex::new(WatchSet::default()));
         // The inbound control reader holds a clone and charges quota into it.
         let inbound = leases.clone();
         {
@@ -1976,7 +1940,7 @@ mod tests {
         let reg = Arc::new(node::events::WatchRegistry::new());
         let (handle, _rx) = reg.register(node::events::WATCH_CHANNEL_CAPACITY);
         let mask = AtomicU32::new(u32::MAX);
-        let mut leases = Vec::new();
+        let mut leases = WatchSet::default();
         apply_control(
             pb::SubscribeControl {
                 msg: Some(pb::subscribe_control::Msg::AddOutpoints(pb::AddOutpoints {
@@ -1996,6 +1960,68 @@ mod tests {
         );
     }
 
+    /// Through the wire path (`apply_control`): a `RemoveOutpoints` releases
+    /// exactly the removed item's quota unit (C1), and re-asserting a still-held
+    /// outpoint in a later message is not double-charged (C2).
+    #[test]
+    fn apply_control_remove_releases_quota_and_cross_message_dedup() {
+        use satd_auth::{Accounting, Capability, CapabilitySet, LocalAccounting, Principal};
+        let acct: Arc<dyn Accounting> = Arc::new(LocalAccounting::new());
+        let principal = Principal::token(
+            Arc::from("tenant"),
+            CapabilitySet::EMPTY.with(Capability::StreamWatch),
+            Some(10),
+            None,
+            acct.clone(),
+        );
+        let q = acct.quota();
+        let reg = Arc::new(node::events::WatchRegistry::new());
+        let (handle, _rx) = reg.register(node::events::WATCH_CHANNEL_CAPACITY);
+        let mask = AtomicU32::new(u32::MAX);
+        let mut leases = WatchSet::default();
+
+        let add = |ops: Vec<pb::Outpoint>| pb::SubscribeControl {
+            msg: Some(pb::subscribe_control::Msg::AddOutpoints(pb::AddOutpoints {
+                outpoints: ops,
+            })),
+        };
+
+        // Add three distinct outpoints → 3 units.
+        apply_control(
+            add(vec![op_proto(1, 0), op_proto(2, 0), op_proto(3, 0)]),
+            &handle,
+            Some(&principal),
+            &mask,
+            &mut leases,
+        );
+        assert_eq!(q.current("tenant"), 3);
+
+        // Re-assert op(1) in a SEPARATE message + add a new op(4): only op(4) is
+        // net-new → charged once more (cross-message dedup).
+        apply_control(
+            add(vec![op_proto(1, 0), op_proto(4, 0)]),
+            &handle,
+            Some(&principal),
+            &mask,
+            &mut leases,
+        );
+        assert_eq!(q.current("tenant"), 4, "re-asserted op(1) not double-charged");
+
+        // Remove op(2) → exactly one unit released (per-remove release).
+        apply_control(
+            pb::SubscribeControl {
+                msg: Some(pb::subscribe_control::Msg::RemoveOutpoints(pb::RemoveOutpoints {
+                    outpoints: vec![op_proto(2, 0)],
+                })),
+            },
+            &handle,
+            Some(&principal),
+            &mask,
+            &mut leases,
+        );
+        assert_eq!(q.current("tenant"), 3, "removing one watch frees one unit");
+    }
+
     /// `apply_control(AddDescriptor)` expands the descriptor and registers
     /// the derived script window (no auth → unlimited).
     #[test]
@@ -2003,7 +2029,7 @@ mod tests {
         let reg = Arc::new(node::events::WatchRegistry::new());
         let (handle, _rx) = reg.register(node::events::WATCH_CHANNEL_CAPACITY);
         let mask = AtomicU32::new(u32::MAX);
-        let mut leases = Vec::new();
+        let mut leases = WatchSet::default();
         apply_control(
             pb::SubscribeControl {
                 msg: Some(pb::subscribe_control::Msg::AddDescriptor(pb::AddDescriptor {

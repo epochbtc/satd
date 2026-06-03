@@ -1,0 +1,283 @@
+//! Per-subscription watch-set with per-item quota leases.
+//!
+//! Both streaming carriers (gRPC `Watch` and the `--streamws` WS/SSE
+//! transport) let a client add and remove outpoint/script watches on a live
+//! subscription, each watch item charging one unit of the per-token watch
+//! quota (N items = N units). This module owns the bookkeeping that ties a
+//! quota lease to an individual watch item, giving two properties the original
+//! "push a per-message batch lease onto a `Vec`" approach lacked:
+//!
+//! * **Cross-message dedup** — re-adding an item the subscription already
+//!   watches (even in a later control message) is charged once and registered
+//!   once. The registry itself dedups on insert, so without this the quota
+//!   would be over-charged for a re-assert.
+//! * **Per-remove release** — removing a watch drops exactly that item's lease
+//!   and returns its unit immediately, instead of holding all quota until the
+//!   whole subscription disconnects. This is what makes a long-lived client
+//!   that rotates its watch-set (e.g. a descriptor sliding window) viable
+//!   without monotonically exhausting its quota.
+//!
+//! Charging stays **atomic and all-or-nothing per add**: the net-new items are
+//! reserved in one [`Principal::acquire_watch`] call, then split into per-item
+//! leases via [`WatchLease::split_off_one`] (which moves units without touching
+//! the store). If the reservation does not fit the quota, none of the add's
+//! items are registered — the protocol has no per-item ack, so a partial add
+//! would be a silent partial failure.
+//!
+//! A `WatchSet` is held behind the subscription-scoped `Arc<Mutex<..>>` shared
+//! by the inbound control reader and the outbound stream, so the quota is tied
+//! to the subscription's lifetime — not to a control-stream half-close.
+
+use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
+
+use bitcoin::OutPoint;
+use tracing::warn;
+
+/// A scripthash is `sha256(scriptPubKey)`. Mirrors `node_index::keys::Scripthash`
+/// (the type `WatchHandle::add_scripthashes` takes) without this crate having to
+/// depend on `node-index`.
+type Scripthash = [u8; 32];
+
+/// A subscription's live watch-set: the outpoints and scripts it watches, each
+/// paired with the [`WatchLease`](satd_auth::WatchLease) backing its quota unit
+/// (`None` when auth is disabled — loopback trust, unlimited).
+#[derive(Default)]
+pub(crate) struct WatchSet {
+    outpoints: HashMap<OutPoint, Option<satd_auth::WatchLease>>,
+    scripts: HashMap<Scripthash, Option<satd_auth::WatchLease>>,
+}
+
+impl WatchSet {
+    /// Add outpoints, charging the quota only for items not already watched and
+    /// registering the net-new ones via `register`. All-or-nothing per call.
+    pub(crate) fn add_outpoints(
+        &mut self,
+        principal: Option<&satd_auth::Principal>,
+        incoming: impl IntoIterator<Item = OutPoint>,
+        register: impl FnOnce(&[OutPoint]),
+    ) {
+        add_items(&mut self.outpoints, principal, incoming, "outpoints", register);
+    }
+
+    /// Add scripthashes (direct or descriptor-derived). `kind` only labels the
+    /// rejection log line.
+    pub(crate) fn add_scripts(
+        &mut self,
+        principal: Option<&satd_auth::Principal>,
+        incoming: impl IntoIterator<Item = Scripthash>,
+        kind: &'static str,
+        register: impl FnOnce(&[Scripthash]),
+    ) {
+        add_items(&mut self.scripts, principal, incoming, kind, register);
+    }
+
+    /// Remove outpoints, releasing each removed item's quota unit (lease drop)
+    /// and de-registering the ones that were actually watched.
+    pub(crate) fn remove_outpoints(
+        &mut self,
+        incoming: impl IntoIterator<Item = OutPoint>,
+        unregister: impl FnOnce(&[OutPoint]),
+    ) {
+        remove_items(&mut self.outpoints, incoming, unregister);
+    }
+
+    /// Remove scripthashes, releasing each removed item's quota unit.
+    pub(crate) fn remove_scripts(
+        &mut self,
+        incoming: impl IntoIterator<Item = Scripthash>,
+        unregister: impl FnOnce(&[Scripthash]),
+    ) {
+        remove_items(&mut self.scripts, incoming, unregister);
+    }
+
+    /// Total watched items (diagnostics / tests).
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.outpoints.len() + self.scripts.len()
+    }
+}
+
+fn add_items<T: Eq + Hash + Copy>(
+    held: &mut HashMap<T, Option<satd_auth::WatchLease>>,
+    principal: Option<&satd_auth::Principal>,
+    incoming: impl IntoIterator<Item = T>,
+    kind: &'static str,
+    register: impl FnOnce(&[T]),
+) {
+    // Distinct items not already watched: dedups both within this message
+    // (`seen`) and against the live watch-set (`held`).
+    let mut seen = HashSet::new();
+    let net_new: Vec<T> = incoming
+        .into_iter()
+        .filter(|it| !held.contains_key(it) && seen.insert(*it))
+        .collect();
+    if net_new.is_empty() {
+        return;
+    }
+    match principal {
+        // Reserve all net-new units atomically (all-or-nothing), then split
+        // the batch into per-item leases so each can be released on removal.
+        Some(p) => match p.acquire_watch(net_new.len() as u64) {
+            Ok(mut batch) => {
+                register(&net_new);
+                for it in net_new {
+                    held.insert(it, batch.split_off_one());
+                }
+            }
+            Err(reject) => {
+                warn!(
+                    target: "events::watchset",
+                    kind,
+                    reject = ?reject,
+                    "watch add rejected (capability or quota)",
+                );
+            }
+        },
+        // Auth disabled (loopback trust): unlimited, no lease.
+        None => {
+            register(&net_new);
+            for it in net_new {
+                held.insert(it, None);
+            }
+        }
+    }
+}
+
+fn remove_items<T: Eq + Hash + Copy>(
+    held: &mut HashMap<T, Option<satd_auth::WatchLease>>,
+    incoming: impl IntoIterator<Item = T>,
+    unregister: impl FnOnce(&[T]),
+) {
+    let mut removed = Vec::new();
+    for it in incoming {
+        // `remove` drops the item's lease here, releasing its unit. A request
+        // to remove something not watched is a no-op (no spurious unregister).
+        if held.remove(&it).is_some() {
+            removed.push(it);
+        }
+    }
+    if !removed.is_empty() {
+        unregister(&removed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use satd_auth::{Accounting, Capability, CapabilitySet, LocalAccounting, Principal};
+    use std::sync::Arc;
+
+    fn op(b: u8, vout: u32) -> OutPoint {
+        use bitcoin::hashes::Hash;
+        OutPoint {
+            txid: bitcoin::Txid::from_raw_hash(
+                bitcoin::hashes::sha256d::Hash::from_byte_array([b; 32]),
+            ),
+            vout,
+        }
+    }
+
+    /// A principal with `stream:watch` and a quota of `max` units.
+    fn tenant(max: u64) -> (Principal, Arc<dyn Accounting>) {
+        let acct: Arc<dyn Accounting> = Arc::new(LocalAccounting::new());
+        let p = Principal::token(
+            Arc::from("tenant"),
+            CapabilitySet::EMPTY.with(Capability::StreamWatch),
+            Some(max),
+            None,
+            acct.clone(),
+        );
+        (p, acct)
+    }
+
+    #[test]
+    fn add_then_remove_releases_quota_per_item() {
+        let (p, acct) = tenant(10);
+        let q = acct.quota();
+        let mut ws = WatchSet::default();
+
+        let mut registered = 0;
+        ws.add_outpoints(Some(&p), [op(1, 0), op(2, 0), op(3, 0)], |items| {
+            registered = items.len();
+        });
+        assert_eq!(registered, 3);
+        assert_eq!(q.current("tenant"), 3, "three items charged 3 units");
+        assert_eq!(ws.len(), 3);
+
+        // Remove one item → exactly one unit released.
+        let mut unregistered = 0;
+        ws.remove_outpoints([op(2, 0)], |items| unregistered = items.len());
+        assert_eq!(unregistered, 1);
+        assert_eq!(q.current("tenant"), 2, "per-remove release frees one unit");
+        assert_eq!(ws.len(), 2);
+    }
+
+    #[test]
+    fn cross_message_re_add_is_charged_once() {
+        let (p, acct) = tenant(10);
+        let q = acct.quota();
+        let mut ws = WatchSet::default();
+
+        ws.add_outpoints(Some(&p), [op(1, 0), op(2, 0)], |_| {});
+        assert_eq!(q.current("tenant"), 2);
+
+        // A SEPARATE message re-asserts op(1) and adds op(3): only op(3) is new.
+        let mut registered = Vec::new();
+        ws.add_outpoints(Some(&p), [op(1, 0), op(3, 0)], |items| {
+            registered = items.to_vec();
+        });
+        assert_eq!(registered, vec![op(3, 0)], "only the net-new item registers");
+        assert_eq!(q.current("tenant"), 3, "the re-asserted item is not double-charged");
+    }
+
+    #[test]
+    fn over_quota_add_is_all_or_nothing() {
+        let (p, acct) = tenant(2);
+        let q = acct.quota();
+        let mut ws = WatchSet::default();
+
+        // Three net-new items but quota is 2 → the whole add is rejected.
+        let mut registered = false;
+        ws.add_outpoints(Some(&p), [op(1, 0), op(2, 0), op(3, 0)], |_| registered = true);
+        assert!(!registered, "an add that overflows quota registers nothing");
+        assert_eq!(q.current("tenant"), 0, "no units charged on a rejected add");
+        assert_eq!(ws.len(), 0);
+    }
+
+    #[test]
+    fn removing_unwatched_item_is_a_noop() {
+        let (p, acct) = tenant(10);
+        let q = acct.quota();
+        let mut ws = WatchSet::default();
+        ws.add_outpoints(Some(&p), [op(1, 0)], |_| {});
+
+        let mut called = false;
+        ws.remove_outpoints([op(9, 9)], |_| called = true);
+        assert!(!called, "removing something not watched does not unregister");
+        assert_eq!(q.current("tenant"), 1, "quota unchanged");
+    }
+
+    #[test]
+    fn dropping_watchset_releases_all_quota() {
+        let (p, acct) = tenant(10);
+        let q = acct.quota();
+        let mut ws = WatchSet::default();
+        ws.add_outpoints(Some(&p), [op(1, 0), op(2, 0)], |_| {});
+        assert_eq!(q.current("tenant"), 2);
+        drop(ws);
+        assert_eq!(q.current("tenant"), 0, "full teardown releases all leases");
+    }
+
+    #[test]
+    fn no_principal_is_unlimited_and_leaseless() {
+        let mut ws = WatchSet::default();
+        let mut registered = 0;
+        // No principal → no quota, items still tracked for dedup/removal.
+        ws.add_outpoints(None, [op(1, 0), op(1, 0), op(2, 0)], |items| {
+            registered = items.len();
+        });
+        assert_eq!(registered, 2, "intra-message dedup still applies");
+        assert_eq!(ws.len(), 2);
+    }
+}

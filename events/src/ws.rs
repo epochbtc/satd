@@ -33,6 +33,8 @@ use axum::routing::get;
 use futures_util::{SinkExt, StreamExt};
 use node::events::{EventPublisher, WatchMatch, WatchRegistry, WATCH_CHANNEL_CAPACITY};
 use serde::Deserialize;
+
+use crate::watchset::WatchSet;
 use serde_json::json;
 use tokio::net::TcpListener;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, watch};
@@ -289,32 +291,33 @@ async fn ws_conn(
     let handle = Arc::new(handle);
     let category_mask = Arc::new(AtomicU32::new(u32::MAX));
     let mut rx_live = state.publisher.subscribe();
-    // Watch-quota leases are owned by the CONNECTION, not the inbound reader
-    // (same rule as the gRPC Watch handler): a client that stops sending
-    // control frames must not release its quota while its watch-set stays
-    // live. Held behind an `Arc` shared with the inbound task; released only
-    // when `ws_conn` returns (alongside the `WatchHandle` deregister).
-    let leases: Arc<std::sync::Mutex<Vec<satd_auth::WatchLease>>> =
-        Arc::new(std::sync::Mutex::new(Vec::new()));
+    // The watch-set (and the per-item quota leases inside it) is owned by the
+    // CONNECTION, not the inbound reader (same rule as the gRPC Watch handler):
+    // a client that stops sending control frames must not release its quota
+    // while its watch-set stays live. Held behind an `Arc` shared with the
+    // inbound task; quota is released per-remove, and the remainder when
+    // `ws_conn` returns (alongside the `WatchHandle` deregister).
+    let watch_set: Arc<std::sync::Mutex<WatchSet>> =
+        Arc::new(std::sync::Mutex::new(WatchSet::default()));
     // Liveness: every frame from the client (including Pong) refreshes this;
     // the outbound loop reaps the connection if it goes silent past the idle
     // timeout, so a dead/half-open peer cannot pin a connection slot.
     let last_activity = Arc::new(AtomicI64::new(now_unix()));
     debug!(target: "events::ws", authenticated = principal.is_some(), "streamws connection opened");
 
-    // Inbound control reader: applies watch-set + category changes, recording
-    // quota leases into the shared connection-scoped vec.
+    // Inbound control reader: applies watch-set + category changes against the
+    // shared connection-scoped watch-set.
     let inbound = {
         let handle = handle.clone();
         let category_mask = category_mask.clone();
-        let leases = leases.clone();
+        let watch_set = watch_set.clone();
         let last_activity = last_activity.clone();
         tokio::spawn(async move {
             while let Some(Ok(msg)) = receiver.next().await {
                 last_activity.store(now_unix(), Ordering::Relaxed);
                 match msg {
                     Message::Text(t) => {
-                        let mut guard = leases.lock().unwrap_or_else(|p| p.into_inner());
+                        let mut guard = watch_set.lock().unwrap_or_else(|p| p.into_inner());
                         apply_ws_control(
                             &t,
                             &handle,
@@ -329,8 +332,8 @@ async fn ws_conn(
                     _ => {}
                 }
             }
-            // Leases are NOT released here — they belong to the connection and
-            // drop with `leases`/`handle` when `ws_conn` returns.
+            // The watch-set is NOT dropped here — it belongs to the connection
+            // and drops with `watch_set`/`handle` when `ws_conn` returns.
         })
     };
 
@@ -376,8 +379,8 @@ async fn ws_conn(
         }
     }
     inbound.abort();
-    // `handle` + `leases` drop here → deregister the watch-set and release the
-    // quota together; `_permit` drops too, freeing the connection slot.
+    // `handle` + `watch_set` drop here → deregister the watch-set and release
+    // the quota together; `_permit` drops too, freeing the connection slot.
     debug!(target: "events::ws", "streamws connection closed");
 }
 
@@ -428,7 +431,7 @@ fn apply_ws_control(
     handle: &node::events::WatchHandle,
     principal: Option<&satd_auth::Principal>,
     category_mask: &AtomicU32,
-    leases: &mut Vec<satd_auth::WatchLease>,
+    watch_set: &mut WatchSet,
 ) {
     let ctrl: WsControl = match serde_json::from_str(text) {
         Ok(c) => c,
@@ -443,84 +446,58 @@ fn apply_ws_control(
             category_mask.store(mask, Ordering::Relaxed);
         }
         WsControl::AddOutpoints { outpoints } => {
-            // Charge for distinct items only (a message may repeat entries;
-            // the registry dedups on insert).
-            let mut seen = std::collections::HashSet::new();
-            let ops: Vec<bitcoin::OutPoint> = outpoints
-                .iter()
-                .filter_map(parse_ws_outpoint)
-                .filter(|o| seen.insert(*o))
-                .collect();
-            if !ops.is_empty() {
-                charge_and_add(principal, leases, ops.len(), "outpoints", || {
-                    handle.add_outpoints(&ops);
-                });
-            }
+            watch_set.add_outpoints(
+                principal,
+                outpoints.iter().filter_map(parse_ws_outpoint),
+                |ops| {
+                    handle.add_outpoints(ops);
+                },
+            );
         }
         WsControl::RemoveOutpoints { outpoints } => {
-            let ops: Vec<bitcoin::OutPoint> =
-                outpoints.iter().filter_map(parse_ws_outpoint).collect();
-            handle.remove_outpoints(&ops);
+            watch_set.remove_outpoints(
+                outpoints.iter().filter_map(parse_ws_outpoint),
+                |ops| {
+                    handle.remove_outpoints(ops);
+                },
+            );
         }
         WsControl::AddScripts { scripthashes } => {
-            let mut seen = std::collections::HashSet::new();
-            let shs: Vec<[u8; 32]> = scripthashes
-                .iter()
-                .filter_map(|s| parse_ws_scripthash(s))
-                .filter(|sh| seen.insert(*sh))
-                .collect();
-            if !shs.is_empty() {
-                charge_and_add(principal, leases, shs.len(), "scripts", || {
-                    handle.add_scripthashes(&shs);
-                });
-            }
+            watch_set.add_scripts(
+                principal,
+                scripthashes.iter().filter_map(|s| parse_ws_scripthash(s)),
+                "scripts",
+                |shs| {
+                    handle.add_scripthashes(shs);
+                },
+            );
         }
         WsControl::RemoveScripts { scripthashes } => {
-            let shs: Vec<[u8; 32]> = scripthashes
-                .iter()
-                .filter_map(|s| parse_ws_scripthash(s))
-                .collect();
-            handle.remove_scripthashes(&shs);
+            watch_set.remove_scripts(
+                scripthashes.iter().filter_map(|s| parse_ws_scripthash(s)),
+                |shs| {
+                    handle.remove_scripthashes(shs);
+                },
+            );
         }
         WsControl::AddDescriptor {
             descriptor,
             gap_limit,
         } => match crate::descriptor::expand_descriptor(&descriptor, 0, gap_limit) {
             Ok(scripts) => {
-                let shs: Vec<[u8; 32]> = scripts.into_iter().map(|(_, sh)| sh).collect();
-                if !shs.is_empty() {
-                    charge_and_add(principal, leases, shs.len(), "descriptor", || {
-                        handle.add_scripthashes(&shs);
-                    });
-                }
+                watch_set.add_scripts(
+                    principal,
+                    scripts.into_iter().map(|(_, sh)| sh),
+                    "descriptor",
+                    |shs| {
+                        handle.add_scripthashes(shs);
+                    },
+                );
             }
             Err(e) => {
                 warn!(target: "events::ws", error = %e, "ignoring invalid descriptor");
             }
         },
-    }
-}
-
-/// Charge `n` watch-quota units, then `add` on success. No principal (auth
-/// disabled) → unlimited (loopback trust).
-fn charge_and_add<F: FnOnce()>(
-    principal: Option<&satd_auth::Principal>,
-    leases: &mut Vec<satd_auth::WatchLease>,
-    n: usize,
-    kind: &'static str,
-    add: F,
-) {
-    match principal {
-        Some(p) => match p.acquire_watch(n as u64) {
-            Ok(lease) => {
-                add();
-                leases.push(lease);
-            }
-            Err(reject) => {
-                warn!(target: "events::ws", kind, reject = ?reject, "watch add rejected (capability or quota)");
-            }
-        },
-        None => add(),
     }
 }
 
