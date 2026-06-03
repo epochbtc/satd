@@ -20,7 +20,8 @@
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
+use std::time::Duration;
 
 use axum::Router;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -34,9 +35,29 @@ use node::events::{EventPublisher, WatchMatch, WatchRegistry, WATCH_CHANNEL_CAPA
 use serde::Deserialize;
 use serde_json::json;
 use tokio::net::TcpListener;
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, watch};
 use tokio_stream::wrappers::BroadcastStream;
 use tracing::{debug, info, warn};
+
+/// Max concurrent `streamws` connections (`/ws` + `/sse` combined). Every
+/// other remote-facing surface (events-gRPC, Esplora, Electrum) is capped;
+/// without this bound a remote-exposed listener could be driven to fd /
+/// memory / task exhaustion by opening connections without limit. Excess
+/// connections are rejected with 503. (Making this operator-configurable,
+/// mirroring `eventsgrpcmaxconns`, is a follow-up.)
+const WS_MAX_CONNS: usize = 256;
+
+/// Cap on a single inbound WebSocket message / frame. Control messages are
+/// tiny; the axum default (64 MiB) is absurd for this protocol and lets an
+/// authenticated peer force large `serde_json` parses.
+const WS_MAX_MESSAGE_BYTES: usize = 256 * 1024;
+
+/// Send a WebSocket Ping at this cadence and reap the connection if no frame
+/// (Pong, control, or otherwise) is seen from the client within
+/// [`WS_IDLE_TIMEOUT`] — so a dead or half-open peer cannot pin a connection
+/// slot, watch-set, and quota indefinitely.
+const WS_PING_INTERVAL: Duration = Duration::from_secs(30);
+const WS_IDLE_TIMEOUT_SECS: i64 = 90;
 
 /// Construction-time errors for the WS transport.
 #[derive(Debug, thiserror::Error)]
@@ -58,6 +79,10 @@ struct WsState {
     publisher: Arc<EventPublisher>,
     watch_registry: Arc<WatchRegistry>,
     auth: Option<Arc<satd_auth::TokenStore>>,
+    /// Admission control: bounds concurrent `/ws` + `/sse` connections. A
+    /// connection holds one permit for its whole lifetime; the permit is
+    /// released on disconnect.
+    conn_sem: Arc<Semaphore>,
 }
 
 /// The `--streamws` JSON/WS + SSE transport. Bind early (so a bind failure
@@ -118,6 +143,7 @@ impl WsStreamServer {
                 publisher,
                 watch_registry,
                 auth,
+                conn_sem: Arc::new(Semaphore::new(WS_MAX_CONNS)),
             },
         })
     }
@@ -197,14 +223,29 @@ async fn sse_firehose(
     if let Err(resp) = authorize(&state, &headers) {
         return resp;
     }
+    // Admission control: hold a connection permit for the stream's lifetime.
+    let Ok(permit) = state.conn_sem.clone().try_acquire_owned() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "streamws connection cap reached",
+        )
+            .into_response();
+    };
     let mask = mask_from(q.categories);
     let rx = state.publisher.subscribe();
-    let stream = BroadcastStream::new(rx).filter_map(move |item| async move {
-        match item {
-            Ok(env) if (env.category_bit() & mask) != 0 => Some(Ok::<_, std::convert::Infallible>(
-                Event::default().data(serde_json::to_string(&env).unwrap_or_default()),
-            )),
-            _ => None,
+    let stream = BroadcastStream::new(rx).filter_map(move |item| {
+        // Keep the permit alive for as long as the SSE stream is held; it is
+        // released when the client disconnects and the stream is dropped.
+        let _permit = &permit;
+        async move {
+            match item {
+                Ok(env) if (env.category_bit() & mask) != 0 => {
+                    Some(Ok::<_, std::convert::Infallible>(
+                        Event::default().data(serde_json::to_string(&env).unwrap_or_default()),
+                    ))
+                }
+                _ => None,
+            }
         }
     });
     Sse::new(stream)
@@ -222,40 +263,93 @@ async fn ws_upgrade(
         Ok(p) => p,
         Err(resp) => return resp,
     };
-    ws.on_upgrade(move |socket| ws_conn(socket, state, principal))
+    // Admission control: hold a connection permit for the connection's
+    // lifetime. At cap → 503 before the upgrade.
+    let Ok(permit) = state.conn_sem.clone().try_acquire_owned() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "streamws connection cap reached",
+        )
+            .into_response();
+    };
+    // Bound a single inbound frame/message — control frames are tiny.
+    ws.max_message_size(WS_MAX_MESSAGE_BYTES)
+        .max_frame_size(WS_MAX_MESSAGE_BYTES)
+        .on_upgrade(move |socket| ws_conn(socket, state, principal, permit))
 }
 
-async fn ws_conn(socket: WebSocket, state: WsState, principal: Option<satd_auth::Principal>) {
+async fn ws_conn(
+    socket: WebSocket,
+    state: WsState,
+    principal: Option<satd_auth::Principal>,
+    _permit: OwnedSemaphorePermit,
+) {
     let (mut sender, mut receiver) = socket.split();
     let (handle, mut rx_match) = state.watch_registry.register(WATCH_CHANNEL_CAPACITY);
     let handle = Arc::new(handle);
     let category_mask = Arc::new(AtomicU32::new(u32::MAX));
     let mut rx_live = state.publisher.subscribe();
+    // Watch-quota leases are owned by the CONNECTION, not the inbound reader
+    // (same rule as the gRPC Watch handler): a client that stops sending
+    // control frames must not release its quota while its watch-set stays
+    // live. Held behind an `Arc` shared with the inbound task; released only
+    // when `ws_conn` returns (alongside the `WatchHandle` deregister).
+    let leases: Arc<std::sync::Mutex<Vec<satd_auth::WatchLease>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    // Liveness: every frame from the client (including Pong) refreshes this;
+    // the outbound loop reaps the connection if it goes silent past the idle
+    // timeout, so a dead/half-open peer cannot pin a connection slot.
+    let last_activity = Arc::new(AtomicI64::new(now_unix()));
     debug!(target: "events::ws", authenticated = principal.is_some(), "streamws connection opened");
 
-    // Inbound control reader: applies watch-set + category changes and holds
-    // the quota leases (released when this task ends = on disconnect).
+    // Inbound control reader: applies watch-set + category changes, recording
+    // quota leases into the shared connection-scoped vec.
     let inbound = {
         let handle = handle.clone();
         let category_mask = category_mask.clone();
+        let leases = leases.clone();
+        let last_activity = last_activity.clone();
         tokio::spawn(async move {
-            let mut leases: Vec<satd_auth::WatchLease> = Vec::new();
             while let Some(Ok(msg)) = receiver.next().await {
+                last_activity.store(now_unix(), Ordering::Relaxed);
                 match msg {
                     Message::Text(t) => {
-                        apply_ws_control(&t, &handle, principal.as_ref(), &category_mask, &mut leases)
+                        let mut guard = leases.lock().unwrap_or_else(|p| p.into_inner());
+                        apply_ws_control(
+                            &t,
+                            &handle,
+                            principal.as_ref(),
+                            &category_mask,
+                            &mut guard,
+                        );
                     }
                     Message::Close(_) => break,
+                    // Ping is auto-answered by axum; Pong (and any other frame)
+                    // already refreshed `last_activity` above.
                     _ => {}
                 }
             }
-            drop(leases);
+            // Leases are NOT released here — they belong to the connection and
+            // drop with `leases`/`handle` when `ws_conn` returns.
         })
     };
 
-    // Outbound: live firehose (category-filtered) + watch matches as JSON.
+    // Outbound: live firehose (category-filtered) + watch matches as JSON,
+    // plus a periodic keepalive Ping that also drives idle-connection reaping.
+    let mut ping = tokio::time::interval(WS_PING_INTERVAL);
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
+            _ = ping.tick() => {
+                let idle = now_unix().saturating_sub(last_activity.load(Ordering::Relaxed));
+                if idle > WS_IDLE_TIMEOUT_SECS {
+                    debug!(target: "events::ws", idle, "streamws connection idle past timeout; closing");
+                    break;
+                }
+                if sender.send(Message::Ping(Vec::new().into())).await.is_err() {
+                    break;
+                }
+            }
             ev = rx_live.recv() => match ev {
                 Ok(env) => {
                     if (env.category_bit() & category_mask.load(Ordering::Relaxed)) != 0
@@ -282,7 +376,8 @@ async fn ws_conn(socket: WebSocket, state: WsState, principal: Option<satd_auth:
         }
     }
     inbound.abort();
-    // `handle` drops here → deregister the watch-set.
+    // `handle` + `leases` drop here → deregister the watch-set and release the
+    // quota together; `_permit` drops too, freeing the connection slot.
     debug!(target: "events::ws", "streamws connection closed");
 }
 
@@ -346,8 +441,14 @@ fn apply_ws_control(
             category_mask.store(mask, Ordering::Relaxed);
         }
         WsControl::AddOutpoints { outpoints } => {
-            let ops: Vec<bitcoin::OutPoint> =
-                outpoints.iter().filter_map(parse_ws_outpoint).collect();
+            // Charge for distinct items only (a message may repeat entries;
+            // the registry dedups on insert).
+            let mut seen = std::collections::HashSet::new();
+            let ops: Vec<bitcoin::OutPoint> = outpoints
+                .iter()
+                .filter_map(parse_ws_outpoint)
+                .filter(|o| seen.insert(*o))
+                .collect();
             if !ops.is_empty() {
                 charge_and_add(principal, leases, ops.len(), "outpoints", || {
                     handle.add_outpoints(&ops);
@@ -360,9 +461,11 @@ fn apply_ws_control(
             handle.remove_outpoints(&ops);
         }
         WsControl::AddScripts { scripthashes } => {
+            let mut seen = std::collections::HashSet::new();
             let shs: Vec<[u8; 32]> = scripthashes
                 .iter()
                 .filter_map(|s| parse_ws_scripthash(s))
+                .filter(|sh| seen.insert(*sh))
                 .collect();
             if !shs.is_empty() {
                 charge_and_add(principal, leases, shs.len(), "scripts", || {
