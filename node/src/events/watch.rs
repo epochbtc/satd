@@ -580,9 +580,20 @@ pub async fn run_watch_matcher(
                                         h -= 1;
                                     }
                                     // An index gap below the tip should not happen
-                                    // for the active chain; stop rather than
+                                    // for the active chain (block-index entries
+                                    // are never pruned, only block data). Log it
+                                    // rather than silently dropping the lower part
+                                    // of the window, and stop rather than
                                     // fabricate heights.
-                                    None => break,
+                                    None => {
+                                        warn!(
+                                            target: "events::watch",
+                                            height = h, hash = %cur, from,
+                                            "resync: active-chain block index gap; \
+                                             lower window not rescanned"
+                                        );
+                                        break;
+                                    }
                                 }
                             }
                             for (i, (h, hash)) in active.iter().rev().enumerate() {
