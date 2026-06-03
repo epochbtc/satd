@@ -8,10 +8,13 @@
 //! [`WatchRegistry`](node::events::WatchRegistry) like any other script
 //! watch-set; matches come back as `ScriptMatched`.
 //!
-//! Pure library, no consensus path. The gap-limit semantics: a client
-//! watches `gap_limit` unused indices ahead; the server emits
-//! `DescriptorNeedsAddresses` (a later enhancement) when the window should
-//! advance.
+//! Pure library, no consensus path. Gap-limit tracking is a **client**
+//! concern: the server expands the fixed window `[start, start + gap_limit)`
+//! it is asked for and stays stateless. The client advances `start` (and
+//! removes the trailing scripts) to slide the window as its addresses are
+//! used; the server never tracks derivation progress and never emits a
+//! side-channel. (`DescriptorNeedsAddresses` is a deprecated, never-emitted
+//! proto message kept only to reserve its field number.)
 
 use bitcoin::hashes::{Hash, sha256};
 use miniscript::descriptor::Wildcard;
@@ -140,6 +143,28 @@ mod tests {
         assert_eq!(shifted[1].0, 11);
         // Index 0 in window-from-0 differs from index 10.
         assert_ne!(a[0].1, shifted[0].1);
+    }
+
+    #[test]
+    fn sliding_window_overlap_shares_scripthashes() {
+        // The client-managed sliding window (B3): advancing `start` while the
+        // windows overlap must re-derive the SAME scripthashes for the shared
+        // indices — that overlap is what makes "advance start, Remove the
+        // trailing scripts" correct, since the kept scripts are byte-identical.
+        let w0 = expand_descriptor(RANGED_WPKH, 0, 5).unwrap(); // indices 0..5
+        let w1 = expand_descriptor(RANGED_WPKH, 3, 5).unwrap(); // indices 3..8
+        // Indices 3 and 4 are in both windows → identical (idx, scripthash).
+        assert_eq!(w0[3], w1[0], "index 3 derives identically in both windows");
+        assert_eq!(w0[4], w1[1], "index 4 derives identically in both windows");
+    }
+
+    #[test]
+    fn huge_start_does_not_panic() {
+        // A start near u32::MAX pushes derivation indices past the non-hardened
+        // range (>= 2^31). `expand_descriptor` must return an error (handled by
+        // the caller as "ignore"), never panic or overflow.
+        let r = expand_descriptor(RANGED_WPKH, u32::MAX - 1, 3);
+        assert!(matches!(r, Err(DescriptorError::Derive(_, _))), "got: {r:?}");
     }
 
     #[test]

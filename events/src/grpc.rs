@@ -782,9 +782,11 @@ fn apply_control(
             );
         }
         Some(Msg::AddDescriptor(d)) => {
-            // Expand the descriptor into its first `gap_limit` scripts and
-            // watch them (rust-miniscript). Charges one unit per net-new script.
-            match crate::descriptor::expand_descriptor(&d.descriptor, 0, d.gap_limit) {
+            // Expand the descriptor over its [start, start+gap_limit) window and
+            // watch it (rust-miniscript). Charges one unit per net-new script.
+            // The client advances `start` to slide the window (gap-limit
+            // tracking is client-side).
+            match crate::descriptor::expand_descriptor(&d.descriptor, d.start, d.gap_limit) {
                 Ok(scripts) => {
                     watch_set.add_scripts(
                         principal,
@@ -2035,6 +2037,7 @@ mod tests {
                 msg: Some(pb::subscribe_control::Msg::AddDescriptor(pb::AddDescriptor {
                     descriptor: "wpkh(xpub6BosfCnifzxcFwrSzQiqu2DBVTshkCXacvNsWGYJVVhhawA7d4R5WSWGFNbi8Aw6ZRc1brxMyWMzG3DSSSSoekkudhUd9yLb6qx39T9nMdj/0/*)".into(),
                     gap_limit: 4,
+                    start: 0,
                 })),
             },
             &handle,

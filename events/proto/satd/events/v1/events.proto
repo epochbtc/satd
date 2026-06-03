@@ -39,15 +39,20 @@ message SubscribeControl {
     // Remove outpoints from the watch-set.
     RemoveOutpoints remove_outpoints = 6;
     // Expand a descriptor into a script watch-set (rust-miniscript). The
-    // server derives `gap_limit` scripts and watches them; charges one unit
-    // per derived script.
+    // server derives the window [start, start+gap_limit) and watches it;
+    // charges one unit per net-new derived script. The CLIENT owns gap-limit
+    // tracking: as funding nears the window's high end, it re-sends
+    // AddDescriptor with an advanced `start` and Remove*s the trailing
+    // scripts (per-remove quota release makes that cheap).
     AddDescriptor   add_descriptor   = 7;
   }
 }
 
 message AddDescriptor {
   string descriptor = 1; // rust-miniscript output descriptor (public)
-  uint32 gap_limit  = 2; // number of indices to derive/watch (ranged descriptors)
+  uint32 gap_limit  = 2; // window size: number of indices to derive/watch
+  uint32 start      = 3; // window start index (default 0); enables a client-
+                         // managed sliding window [start, start+gap_limit)
 }
 
 message SetCursor      { Cursor cursor = 1; }
@@ -76,11 +81,17 @@ message ScriptMatched {
   bool   confirmed  = 5;
 }
 
-// Server→client side-channel: a watched descriptor's gap-limit window
-// should advance (a derived script near the window edge was used). The
-// client re-sends AddDescriptor (or AddScripts) from `next_index`. (The
-// reactive emission of this event is a follow-up; the message is wire-ready.)
+// DEPRECATED / RESERVED — never emitted. The original design had the server
+// track each descriptor's derivation progress and push this side-channel to
+// tell the client to advance its gap-limit window. That was dropped: gap-limit
+// tracking is a CLIENT concern (the client knows its own address-generation
+// policy and is better placed to decide when to extend). The server stays
+// stateless — it watches the fixed window AddDescriptor.start/gap_limit asks
+// for, and the client advances `start` itself. This message is retained only
+// to reserve field 15 in NodeEvent.body; no server emits it and no client
+// should wait for it.
 message DescriptorNeedsAddresses {
+  option deprecated = true;
   string descriptor = 1;
   uint32 next_index = 2;
 }

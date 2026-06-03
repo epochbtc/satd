@@ -400,7 +400,14 @@ enum WsControl {
     /// Remove scripthashes from the watch-set.
     RemoveScripts { scripthashes: Vec<String> },
     /// Expand a descriptor (rust-miniscript) into a script watch-set.
-    AddDescriptor { descriptor: String, gap_limit: u32 },
+    AddDescriptor {
+        descriptor: String,
+        gap_limit: u32,
+        /// Window start index (default 0). The client advances this to slide
+        /// the derivation window `[start, start+gap_limit)`.
+        #[serde(default)]
+        start: u32,
+    },
 }
 
 #[derive(Deserialize)]
@@ -483,7 +490,8 @@ fn apply_ws_control(
         WsControl::AddDescriptor {
             descriptor,
             gap_limit,
-        } => match crate::descriptor::expand_descriptor(&descriptor, 0, gap_limit) {
+            start,
+        } => match crate::descriptor::expand_descriptor(&descriptor, start, gap_limit) {
             Ok(scripts) => {
                 watch_set.add_scripts(
                     principal,
