@@ -302,6 +302,61 @@ new is opt-in or a safe-by-default backstop.
   read RPC traffic horizontally (behind a load balancer) without exposing the
   control plane. See `SATD_API_SCALING.md`.
 
+### Streaming Consumption API
+
+A push-based consumption surface for downstream indexers, wallets, and
+watchtowers: a real-time event firehose plus live subscriptions, delivered over
+three transports. It is strictly **publish/read-only and decoupled from
+consensus** — every sink, the watch matcher, and the WS server run on the
+isolated API runtime and consume the node's existing chain/mempool broadcasts
+with non-blocking, lossy delivery, so no consumer (slow, lagging, or malicious)
+can ever backpressure, stall, or crash block connection or mempool acceptance.
+All additions are opt-in; the wire schema is `v1`. See `docs/api/streaming.md`.
+
+- **Event firehose over three transports.** A schema-versioned `NodeEvent`
+  stream of mempool, chain (connect/disconnect/reorg), and heartbeat events:
+  a **gRPC** server-streaming `Subscribe` and bidirectional `Watch`
+  (`-events-grpc-bind`), a **WebSocket + SSE** transport (`--streamws`,
+  curl-friendly query params), and Bitcoin Core-compatible **ZMQ** PUB sockets.
+  A live category bitfield lets a subscriber select mempool / chain / heartbeat.
+- **Durable, reorg-safe cursor replay.** Every confirmed-side event carries a
+  `Cursor`; a client persists it and resumes with `from_cursor` on gRPC
+  `Subscribe`, WS, and SSE, getting confirmed history replayed from the block
+  index then a seamless join to the live stream with boundary de-duplication.
+  Replay walks the active chain back from the tip (never the pollutable
+  best-known-at-height index), so a reorg at the replay→live seam forwards the
+  replacement rather than dropping or duplicating it, and the span is capped.
+  The cursor carries a per-process `instance_id` epoch token so a client detects
+  a daemon restart (mempool sequence reset) and resets its mempool watermark
+  while confirmed replay stays durable.
+- **In-band lag signal.** When a consumer falls behind the broadcast buffer it
+  receives an in-band `Lagged { dropped_count, resume_cursor }` on every carrier
+  (the notice bypasses category filtering) instead of silently missing events —
+  it can immediately re-subscribe `from_cursor` and recover the gap.
+- **Live watch registry.** A subscription can register, and rotate at runtime,
+  a watch-set of **outpoints** (spend detection, mempool + confirmed),
+  **scripts** (funding and, via block undo data, spending), **descriptors**
+  (server-side rust-miniscript expansion over a bounded window), and
+  **transaction ids** — matched with O(1) inverted indexes that cost a node with
+  no watchers nothing. Each watch item charges one unit of an optional per-token
+  quota with cross-message de-duplication and per-remove release.
+- **Transaction lifecycle watches and confirmation-depth alarms.** A txid watch
+  narrates a transaction's full lifecycle — seen (mempool) → confirmed →
+  replaced (RBF, with the replacing txid) → evicted (policy) → unconfirmed
+  (reorg rollback) — and an optional `auto_close_depth` emits a terminal
+  `TxidFinalized` and self-evicts the watch once the tx is buried that deep.
+  Separately, single-shot **depth alarms** (`min_depths`) fire `TxidDepthReached`
+  the moment a tx reaches N confirmations and then self-evict; a client can arm
+  several depths per tx. Depth tracking is reorg-safe (a confirming block reorged
+  off the active chain reverts the entry, which re-arms if the tx reappears) and
+  resolves already-buried txs best-effort via the txindex.
+- **Operator-configurable consumption caps.** Connection, per-connection
+  subscription, and inbound-message-size caps for the WS transport
+  (`-streamwsmaxconns` / `-streamwsmaxsubscriptions` / `-streamwsmaxmessagebytes`,
+  defaults 256 / 256 / 262144; `0` = unlimited), alongside the existing events-
+  gRPC connection / subscription caps. Control messages are bounded before they
+  allocate, so a malformed or oversized request is rejected, not amplified.
+
 ### Monitoring
 
 - **Startup/reindex progress timing is now computed daemon-side.** The node

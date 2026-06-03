@@ -45,10 +45,17 @@ message SubscribeControl {
     // AddDescriptor with an advanced `start` and Remove*s the trailing
     // scripts (per-remove quota release makes that cheap).
     AddDescriptor   add_descriptor   = 7;
-    // Add transaction ids to the watch-set: fire when the txid appears in the
-    // mempool or a connected block. Charges N units for N txids.
+    // Add transaction ids to the watch-set. Two primitives over one txid index,
+    // selected by `min_depths` (see AddTransactions):
+    //   * empty min_depths  → a persistent LIFECYCLE watch on each txid: narrates
+    //     seen → confirmed → replaced / evicted / unconfirmed. Charges 1 unit/txid.
+    //     Optional `auto_close_depth` self-evicts + emits TxidFinalized once buried.
+    //   * non-empty min_depths → single-shot DEPTH ALARMS keyed (txid, depth):
+    //     TxidDepthReached once the tx is `depth` confirmations deep, then self-evicts.
+    //     Charges 1 unit per (txid, depth).
     AddTransactions    add_transactions    = 8;
-    // Remove txids from the watch-set.
+    // Remove txids from the watch-set. Mirrors AddTransactions: empty min_depths
+    // removes the lifecycle watch(es); non-empty removes those depth alarms.
     RemoveTransactions remove_transactions = 9;
   }
 }
@@ -67,8 +74,15 @@ message AddScripts     { repeated bytes scripthashes = 1; }
 message RemoveScripts  { repeated bytes scripthashes = 1; }
 message AddOutpoints   { repeated Outpoint outpoints = 1; }
 message RemoveOutpoints{ repeated Outpoint outpoints = 1; }
-message AddTransactions    { repeated bytes txids = 1; } // each 32 raw bytes
-message RemoveTransactions { repeated bytes txids = 1; }
+// txids: each 32 raw bytes.
+// min_depths: empty = lifecycle watch(es); non-empty = one depth alarm per
+//   (txid × depth). Each depth >= 1.
+// auto_close_depth: 0 = disabled (lifecycle watch persists until removed). >= 1 =
+//   the lifecycle watch self-evicts and emits TxidFinalized once the tx is that many
+//   confirmations deep. Applies only to lifecycle watches (min_depths empty); ignored
+//   when min_depths is non-empty. Free modifier — no extra quota unit.
+message AddTransactions    { repeated bytes txids = 1; repeated uint32 min_depths = 2; uint32 auto_close_depth = 3; }
+message RemoveTransactions { repeated bytes txids = 1; repeated uint32 min_depths = 2; }
 
 // A watched outpoint was spent.
 message OutpointSpent {
@@ -93,6 +107,42 @@ message TxidMatched {
   bytes  txid      = 1;
   bool   confirmed = 2; // false = seen in mempool, not yet in a block
   uint32 height    = 3; // block height when confirmed; 0 in the mempool
+}
+
+// --- lifecycle transitions for a watched txid (in addition to TxidMatched) ---
+
+// A watched tx was replaced in the mempool by a conflicting RBF candidate.
+message TxidReplaced {
+  bytes txid           = 1;
+  bytes replacing_txid = 2; // the incoming tx that evicted it
+}
+
+// A watched tx left the mempool by policy (not confirmation, not RBF).
+message TxidEvicted {
+  bytes  txid   = 1;
+  string reason = 2; // "full_pool" | "expiry" | "block_conflict"
+}
+
+// A watched tx's confirming block was rolled back by a reorg (it is back in flight).
+message TxidUnconfirmed {
+  bytes  txid        = 1;
+  uint32 prev_height = 2; // height it had been confirmed at, now disconnected
+}
+
+// A depth alarm fired: the watched tx reached the requested confirmation depth.
+// Single-shot — the alarm self-evicts after this.
+message TxidDepthReached {
+  bytes  txid   = 1;
+  uint32 depth  = 2; // confirmations actually reached (>= requested min_depth)
+  uint32 height = 3; // active-chain height where the tx is confirmed
+}
+
+// A lifecycle watch's auto_close_depth was reached: terminal notice, the
+// lifecycle watch has self-evicted (its quota unit is released).
+message TxidFinalized {
+  bytes  txid   = 1;
+  uint32 depth  = 2; // confirmations reached (>= auto_close_depth)
+  uint32 height = 3; // active-chain height where the tx is confirmed
 }
 
 // DEPRECATED / RESERVED — never emitted. The original design had the server
@@ -274,5 +324,10 @@ message NodeEvent {
     DescriptorNeedsAddresses descriptor_needs_addresses = 15; // gap-limit side-channel
     Lagged lagged = 16; // in-band slow-consumer lag notice + resume cursor
     TxidMatched txid_matched = 17; // watch match (Watch stream)
+    TxidReplaced txid_replaced = 18; // lifecycle: RBF-replaced
+    TxidEvicted txid_evicted = 19; // lifecycle: policy eviction
+    TxidUnconfirmed txid_unconfirmed = 20; // lifecycle: reorg rolled back confirmation
+    TxidDepthReached txid_depth_reached = 21; // depth alarm (single-shot)
+    TxidFinalized txid_finalized = 22; // lifecycle auto-close (terminal)
   }
 }

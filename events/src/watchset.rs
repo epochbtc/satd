@@ -34,6 +34,36 @@ use std::hash::Hash;
 use bitcoin::{OutPoint, Txid};
 use tracing::warn;
 
+/// Per-control-message cap on the `(txid × distinct-depth)` cross-product for
+/// the depth-alarm add/remove paths. A malformed control message carrying huge
+/// `txids` and `min_depths` lists must not allocate billions of tuples (OOM)
+/// *before* the quota check — and the remove path performs no quota check at
+/// all, so an unauthenticated / subscribe-only client could otherwise exhaust
+/// memory with a single frame. 65536 pairs (~2.3 MiB of tuples) is generous for
+/// any legitimate batch; larger sets are split across messages.
+pub(crate) const MAX_TXID_DEPTH_PAIRS: usize = 65_536;
+
+/// Build the `(txid × distinct-depth)` watch pairs for a depth-alarm
+/// add/remove, or `None` if the cross-product would exceed
+/// [`MAX_TXID_DEPTH_PAIRS`]. Depths are de-duplicated first so a client cannot
+/// inflate the product (or the registry) by repeating a threshold.
+pub(crate) fn bounded_txid_depth_pairs(txids: &[Txid], depths: &[u32]) -> Option<Vec<(Txid, u32)>> {
+    let mut distinct: Vec<u32> = depths.to_vec();
+    distinct.sort_unstable();
+    distinct.dedup();
+    let count = txids.len().saturating_mul(distinct.len());
+    if count > MAX_TXID_DEPTH_PAIRS {
+        return None;
+    }
+    let mut pairs = Vec::with_capacity(count);
+    for t in txids {
+        for d in &distinct {
+            pairs.push((*t, *d));
+        }
+    }
+    Some(pairs)
+}
+
 /// A scripthash is `sha256(scriptPubKey)`. Mirrors `node_index::keys::Scripthash`
 /// (the type `WatchHandle::add_scripthashes` takes) without this crate having to
 /// depend on `node-index`.
@@ -46,7 +76,12 @@ type Scripthash = [u8; 32];
 pub(crate) struct WatchSet {
     outpoints: HashMap<OutPoint, Option<satd_auth::WatchLease>>,
     scripts: HashMap<Scripthash, Option<satd_auth::WatchLease>>,
+    /// Lifecycle watches (one quota unit per txid). An `auto_close_depth` rides
+    /// on the lifecycle watch server-side and is NOT a separate charged item.
     txids: HashMap<Txid, Option<satd_auth::WatchLease>>,
+    /// Single-shot depth alarms, keyed `(txid, depth)` — one quota unit per
+    /// pair, so an alarm on the same txid at two depths charges two units.
+    tx_depths: HashMap<(Txid, u32), Option<satd_auth::WatchLease>>,
 }
 
 impl WatchSet {
@@ -111,10 +146,30 @@ impl WatchSet {
         remove_items(&mut self.txids, incoming, unregister);
     }
 
+    /// Add depth alarms keyed `(txid, depth)`, charging one unit per net-new
+    /// pair. All-or-nothing per call, like the other add paths.
+    pub(crate) fn add_tx_depths(
+        &mut self,
+        principal: Option<&satd_auth::Principal>,
+        incoming: impl IntoIterator<Item = (Txid, u32)>,
+        register: impl FnOnce(&[(Txid, u32)]),
+    ) {
+        add_items(&mut self.tx_depths, principal, incoming, "tx_depths", register);
+    }
+
+    /// Remove depth alarms, releasing each removed pair's quota unit.
+    pub(crate) fn remove_tx_depths(
+        &mut self,
+        incoming: impl IntoIterator<Item = (Txid, u32)>,
+        unregister: impl FnOnce(&[(Txid, u32)]),
+    ) {
+        remove_items(&mut self.tx_depths, incoming, unregister);
+    }
+
     /// Total watched items across all kinds. Used to enforce the per-connection
     /// watch-set cap and in tests.
     pub(crate) fn len(&self) -> usize {
-        self.outpoints.len() + self.scripts.len() + self.txids.len()
+        self.outpoints.len() + self.scripts.len() + self.txids.len() + self.tx_depths.len()
     }
 }
 
@@ -318,6 +373,48 @@ mod tests {
         ws.remove_transactions([txid(1)], |items| assert_eq!(items.len(), 1));
         assert_eq!(q.current("tenant"), 1, "per-remove release frees one unit");
         assert_eq!(ws.len(), 1);
+    }
+
+    #[test]
+    fn bounded_pairs_dedups_and_caps() {
+        // Distinct depths only (repeated thresholds can't inflate the product).
+        let pairs = bounded_txid_depth_pairs(&[txid(1), txid(2)], &[3, 3, 1, 3]).unwrap();
+        assert_eq!(pairs.len(), 4, "2 txids × {{1,3}} distinct = 4 pairs");
+
+        // Over the cap → rejected (None) BEFORE allocating the product. 64 txids
+        // × 4096 distinct depths = 262144 > MAX_TXID_DEPTH_PAIRS (65536).
+        let many_depths: Vec<u32> = (1..=4096).collect();
+        let many_txids: Vec<Txid> = (0..64).map(txid).collect();
+        assert!(
+            bounded_txid_depth_pairs(&many_txids, &many_depths).is_none(),
+            "huge cross-product is rejected, not allocated",
+        );
+    }
+
+    #[test]
+    fn add_tx_depths_charges_per_pair() {
+        let (p, acct) = tenant(10);
+        let q = acct.quota();
+        let mut ws = WatchSet::default();
+        // Two depths on the SAME txid are two distinct items → two units.
+        ws.add_tx_depths(Some(&p), [(txid(1), 1), (txid(1), 3)], |items| {
+            assert_eq!(items.len(), 2)
+        });
+        assert_eq!(q.current("tenant"), 2, "(X,1) and (X,3) charge 2 units");
+        assert_eq!(ws.len(), 2);
+
+        // Re-adding (X,1) dedups; (X,6) is net-new.
+        let mut reg = Vec::new();
+        ws.add_tx_depths(Some(&p), [(txid(1), 1), (txid(1), 6)], |items| {
+            reg = items.to_vec()
+        });
+        assert_eq!(reg, vec![(txid(1), 6)], "only the net-new pair registers");
+        assert_eq!(q.current("tenant"), 3);
+
+        // Removing one pair releases exactly one unit.
+        ws.remove_tx_depths([(txid(1), 3)], |items| assert_eq!(items.len(), 1));
+        assert_eq!(q.current("tenant"), 2, "per-pair release frees one unit");
+        assert_eq!(ws.len(), 2);
     }
 
     #[test]

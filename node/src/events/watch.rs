@@ -36,7 +36,7 @@ use tracing::{debug, warn};
 use node_index::keys::{scripthash_of, Scripthash};
 
 use crate::chain::events::ChainEvent;
-use crate::mempool::events::MempoolEvent;
+use crate::mempool::events::{EvictReason, MempoolEvent};
 use crate::storage::undo::UndoData;
 
 /// Default per-subscriber match-channel depth. A subscriber that falls
@@ -82,24 +82,57 @@ pub enum WatchMatch {
         height: Option<u32>,
     },
     /// A watched transaction id appeared — in the mempool (`confirmed =
-    /// false`) or a connected block (`confirmed = true`). The plain "did this
-    /// txid land" primitive, complementing the outpoint/script watches.
+    /// false`) or a connected block (`confirmed = true`). The "seen/confirmed"
+    /// legs of the txid lifecycle, complementing the outpoint/script watches.
     TxidMatched {
         txid: Txid,
         confirmed: bool,
         /// Block height when `confirmed`; `None` in the mempool.
         height: Option<u32>,
     },
+    /// Lifecycle: a watched tx was replaced in the mempool by a conflicting
+    /// RBF candidate (`replacing_txid` is the incoming tx that evicted it).
+    TxidReplaced { txid: Txid, replacing_txid: Txid },
+    /// Lifecycle: a watched tx left the mempool by policy (full pool / expiry /
+    /// block conflict) — not a confirmation and not an RBF replacement.
+    TxidEvicted { txid: Txid, reason: EvictReason },
+    /// Lifecycle: a watched tx's confirming block was rolled back by a reorg;
+    /// it is back in flight. `prev_height` is the height it had been confirmed at.
+    TxidUnconfirmed { txid: Txid, prev_height: u32 },
+    /// A depth alarm fired: the watched tx reached the requested confirmation
+    /// depth. Single-shot — the alarm self-evicts after this.
+    TxidDepthReached { txid: Txid, depth: u32, height: u32 },
+    /// A lifecycle watch's `auto_close_depth` was reached: terminal notice, the
+    /// lifecycle watch has self-evicted (its quota unit is released).
+    TxidFinalized { txid: Txid, depth: u32, height: u32 },
 }
 
 /// Opaque per-subscriber identifier.
 type SubId = u64;
 
+/// Distinguishes the two kinds of depth-tracked entry that share the per-block
+/// tick: a single-shot client `Alarm` (`TxidDepthReached`) and a lifecycle
+/// watch's auto-close trigger (`TxidFinalized`). Part of the depth key so an
+/// alarm at depth N and an auto-close at depth N on the same `(sub, txid)`
+/// never collide.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum DepthKind {
+    Alarm,
+    Close,
+}
+
+/// Key identifying one depth-tracked entry: subscriber, txid, threshold, kind.
+type DepthKey = (SubId, Txid, u32, DepthKind);
+
 struct Subscriber {
     sender: mpsc::Sender<WatchMatch>,
     outpoints: HashSet<OutPoint>,
     scripthashes: HashSet<Scripthash>,
+    /// Lifecycle watches (one per txid).
     txids: HashSet<Txid>,
+    /// Depth-tracked entries: single-shot alarms and lifecycle auto-close
+    /// triggers, distinguished by [`DepthKind`].
+    tx_depths: HashSet<(Txid, u32, DepthKind)>,
 }
 
 #[derive(Default)]
@@ -112,6 +145,18 @@ struct Inner {
     by_scripthash: HashMap<Scripthash, HashSet<SubId>>,
     /// Inverted index: watched txid → subscribers watching it. O(1) per tx.
     by_txid: HashMap<Txid, HashSet<SubId>>,
+    /// Inverted index: txid → depth-tracked entries keyed on it. Used to arm an
+    /// entry when its txid first appears in a connected block.
+    by_txid_depth: HashMap<Txid, HashSet<DepthKey>>,
+    /// Confirm anchor per depth entry: `None` until the txid is observed in a
+    /// connected block (or resolved via the txindex probe); `Some((height,
+    /// hash))` once armed. The hash makes the per-block tick reorg-safe.
+    depth_anchor: HashMap<DepthKey, Option<(u32, BlockHash)>>,
+    /// Armed depth entries (anchor is `Some`) — the set the per-block tick walks.
+    armed: HashSet<DepthKey>,
+    /// Newly-added depth entries awaiting a one-shot txindex probe (for txs
+    /// already confirmed before the watch was registered). Drained each tick.
+    probe_queue: Vec<DepthKey>,
 }
 
 /// Registry of per-subscriber outpoint/script watch-sets with O(1)
@@ -131,6 +176,10 @@ pub struct WatchRegistry {
     /// Lock-free count of registered *txid* items only. Gates the per-tx txid
     /// lookup so a watch-set with no txids pays nothing for it.
     txid_items: AtomicUsize,
+    /// Lock-free count of registered *depth* entries (alarms + auto-close).
+    /// Gates the per-block arm/tick so a watch-set with no depth entries pays
+    /// nothing for the confirmation tracking.
+    depth_items: AtomicUsize,
 }
 
 impl Default for WatchRegistry {
@@ -147,6 +196,7 @@ impl WatchRegistry {
             watch_items: AtomicUsize::new(0),
             script_items: AtomicUsize::new(0),
             txid_items: AtomicUsize::new(0),
+            depth_items: AtomicUsize::new(0),
         }
     }
 
@@ -166,6 +216,12 @@ impl WatchRegistry {
     /// gates the per-tx txid lookup.
     pub fn has_txid_watchers(&self) -> bool {
         self.txid_items.load(Ordering::Acquire) > 0
+    }
+
+    /// `true` if any subscriber has a depth-tracked entry (alarm or auto-close).
+    /// Lock-free; gates the per-block depth arm/tick.
+    pub fn has_depth_watchers(&self) -> bool {
+        self.depth_items.load(Ordering::Acquire) > 0
     }
 
     fn lock_inner(&self) -> std::sync::RwLockWriteGuard<'_, Inner> {
@@ -192,6 +248,7 @@ impl WatchRegistry {
                 outpoints: HashSet::new(),
                 scripthashes: HashSet::new(),
                 txids: HashSet::new(),
+                tx_depths: HashSet::new(),
             },
         );
         (
@@ -287,33 +344,49 @@ impl WatchRegistry {
         removed
     }
 
-    /// Add txids to a subscriber's watch-set. Returns the number newly added.
-    fn add_txids(&self, id: SubId, txids: &[Txid]) -> usize {
+    /// Add txids as lifecycle watches. `auto_close_depth >= 1` also arms a
+    /// `Close` depth entry that self-evicts the lifecycle watch (emitting
+    /// `TxidFinalized`) once the tx is that many confirmations deep. Returns the
+    /// number of lifecycle watches newly added.
+    fn add_txids(&self, id: SubId, txids: &[Txid], auto_close_depth: u32) -> usize {
         let mut inner = self.lock_inner();
         let mut added = 0;
+        let mut closes = 0;
         for t in txids {
-            let Some(sub) = inner.subs.get_mut(&id) else {
-                return added;
+            let is_new = match inner.subs.get_mut(&id) {
+                Some(sub) => sub.txids.insert(*t),
+                None => break,
             };
-            if sub.txids.insert(*t) {
+            if is_new {
                 added += 1;
                 inner.by_txid.entry(*t).or_default().insert(id);
+                if auto_close_depth >= 1
+                    && insert_depth_entry(&mut inner, id, *t, auto_close_depth, DepthKind::Close)
+                {
+                    closes += 1;
+                }
             }
         }
         self.watch_items.fetch_add(added, Ordering::AcqRel);
         self.txid_items.fetch_add(added, Ordering::AcqRel);
+        // Close entries gate the tick (depth_items) but are free of quota and do
+        // NOT bump watch_items — the lifecycle txid already keeps the reread gate hot.
+        self.depth_items.fetch_add(closes, Ordering::AcqRel);
         added
     }
 
-    /// Remove txids from a subscriber's watch-set. Returns the number removed.
+    /// Remove lifecycle watches. Also removes any auto-close (`Close`) depth
+    /// entry tied to each removed txid. Returns the number of watches removed.
     fn remove_txids(&self, id: SubId, txids: &[Txid]) -> usize {
         let mut inner = self.lock_inner();
         let mut removed = 0;
+        let mut closes_removed = 0;
         for t in txids {
-            let Some(sub) = inner.subs.get_mut(&id) else {
-                break;
+            let was = match inner.subs.get_mut(&id) {
+                Some(sub) => sub.txids.remove(t),
+                None => break,
             };
-            if sub.txids.remove(t) {
+            if was {
                 removed += 1;
                 if let Some(set) = inner.by_txid.get_mut(t) {
                     set.remove(&id);
@@ -321,10 +394,59 @@ impl WatchRegistry {
                         inner.by_txid.remove(t);
                     }
                 }
+                // Tear down any auto-close entry for this lifecycle watch.
+                let closes: Vec<u32> = inner
+                    .subs
+                    .get(&id)
+                    .map(|s| {
+                        s.tx_depths
+                            .iter()
+                            .filter(|(tx, _, k)| tx == t && *k == DepthKind::Close)
+                            .map(|(_, d, _)| *d)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                for d in closes {
+                    if remove_depth_entry(&mut inner, id, *t, d, DepthKind::Close) {
+                        closes_removed += 1;
+                    }
+                }
             }
         }
         self.watch_items.fetch_sub(removed, Ordering::AcqRel);
         self.txid_items.fetch_sub(removed, Ordering::AcqRel);
+        self.depth_items.fetch_sub(closes_removed, Ordering::AcqRel);
+        removed
+    }
+
+    /// Add single-shot depth alarms keyed `(txid, depth)`. Returns the number
+    /// newly added (already-registered `(txid, depth)` pairs are not re-counted).
+    fn add_tx_depths(&self, id: SubId, items: &[(Txid, u32)]) -> usize {
+        let mut inner = self.lock_inner();
+        let mut added = 0;
+        for (t, d) in items {
+            if insert_depth_entry(&mut inner, id, *t, *d, DepthKind::Alarm) {
+                added += 1;
+            }
+        }
+        // An alarm may have no lifecycle watch behind it, so it bumps watch_items
+        // (reread gate) as well as depth_items (tick gate).
+        self.watch_items.fetch_add(added, Ordering::AcqRel);
+        self.depth_items.fetch_add(added, Ordering::AcqRel);
+        added
+    }
+
+    /// Remove depth alarms keyed `(txid, depth)`. Returns the number removed.
+    fn remove_tx_depths(&self, id: SubId, items: &[(Txid, u32)]) -> usize {
+        let mut inner = self.lock_inner();
+        let mut removed = 0;
+        for (t, d) in items {
+            if remove_depth_entry(&mut inner, id, *t, *d, DepthKind::Alarm) {
+                removed += 1;
+            }
+        }
+        self.watch_items.fetch_sub(removed, Ordering::AcqRel);
+        self.depth_items.fetch_sub(removed, Ordering::AcqRel);
         removed
     }
 
@@ -335,9 +457,16 @@ impl WatchRegistry {
         let Some(sub) = inner.subs.remove(&id) else {
             return;
         };
-        let freed = sub.outpoints.len() + sub.scripthashes.len() + sub.txids.len();
         let freed_scripts = sub.scripthashes.len();
         let freed_txids = sub.txids.len();
+        // Alarms bump watch_items; Close entries don't (their lifecycle txid does).
+        let alarm_count = sub
+            .tx_depths
+            .iter()
+            .filter(|(_, _, k)| *k == DepthKind::Alarm)
+            .count();
+        let depth_count = sub.tx_depths.len();
+        let freed = sub.outpoints.len() + sub.scripthashes.len() + sub.txids.len() + alarm_count;
         for op in &sub.outpoints {
             if let Some(set) = inner.by_outpoint.get_mut(op) {
                 set.remove(&id);
@@ -362,9 +491,23 @@ impl WatchRegistry {
                 }
             }
         }
+        for (txid, depth, kind) in &sub.tx_depths {
+            let key: DepthKey = (id, *txid, *depth, *kind);
+            if let Some(set) = inner.by_txid_depth.get_mut(txid) {
+                set.remove(&key);
+                if set.is_empty() {
+                    inner.by_txid_depth.remove(txid);
+                }
+            }
+            inner.depth_anchor.remove(&key);
+            inner.armed.remove(&key);
+            // Stale probe_queue entries (if any) no-op next tick — the tick's
+            // probe drain skips keys whose depth_anchor is gone.
+        }
         self.watch_items.fetch_sub(freed, Ordering::AcqRel);
         self.script_items.fetch_sub(freed_scripts, Ordering::AcqRel);
         self.txid_items.fetch_sub(freed_txids, Ordering::AcqRel);
+        self.depth_items.fetch_sub(depth_count, Ordering::AcqRel);
     }
 
     /// Scan every transaction in a connected block, routing matches to
@@ -403,6 +546,272 @@ impl WatchRegistry {
         let inner = self.read_inner();
         scan_tx(&inner, tx, false, None);
     }
+
+    /// Arm depth entries whose txid appears in a freshly connected block,
+    /// anchoring each on `(height, block_hash)`. Gated by `has_depth_watchers`.
+    fn arm_depths_for_block(&self, block: &Block, height: u32) {
+        if !self.has_depth_watchers() {
+            return;
+        }
+        let bh = block.block_hash();
+        let mut inner = self.lock_inner();
+        if inner.by_txid_depth.is_empty() {
+            return;
+        }
+        for tx in &block.txdata {
+            let txid = tx.compute_txid();
+            let keys: Vec<DepthKey> = match inner.by_txid_depth.get(&txid) {
+                Some(set) => set.iter().copied().collect(),
+                None => continue,
+            };
+            for key in keys {
+                inner.depth_anchor.insert(key, Some((height, bh)));
+                inner.armed.insert(key);
+            }
+        }
+    }
+
+    /// Per-block tick: drain the one-shot txindex probe queue, then evaluate
+    /// every armed depth entry against `tip`. Fires `TxidDepthReached` (alarm) or
+    /// `TxidFinalized` (auto-close) at the threshold and de-arms; reverts an
+    /// entry whose confirming block was reorged off the active chain. Reorg-safe
+    /// via [`DepthChainView::active_chain_hash_at_height`].
+    fn tick_depths(&self, tip: u32, chain: &dyn DepthChainView) {
+        if !self.has_depth_watchers() {
+            return;
+        }
+        let mut inner = self.lock_inner();
+
+        // 1. Probe: arm entries whose tx confirmed BEFORE the watch was added
+        //    (no live block to arm them). Best-effort — a disabled/incomplete
+        //    txindex returns None and the entry waits for live observation.
+        let probes = std::mem::take(&mut inner.probe_queue);
+        for key in probes {
+            let (_id, txid, _depth, _kind) = key;
+            // Skip entries removed since they were queued, or already armed by a
+            // live block that beat the probe.
+            if !inner.depth_anchor.contains_key(&key) || inner.armed.contains(&key) {
+                continue;
+            }
+            if let Some((h, bh)) = chain.tx_confirmation(&txid)
+                && chain.active_chain_hash_at_height(h) == Some(bh)
+            {
+                inner.depth_anchor.insert(key, Some((h, bh)));
+                inner.armed.insert(key);
+            }
+        }
+
+        // 2. Evaluate armed entries against the tip.
+        let armed: Vec<DepthKey> = inner.armed.iter().copied().collect();
+        let mut fires: Vec<(SubId, WatchMatch, DepthKey)> = Vec::new();
+        for key in armed {
+            let (_id, _txid, depth, _kind) = key;
+            let Some(Some((h, bh))) = inner.depth_anchor.get(&key).copied() else {
+                inner.armed.remove(&key);
+                continue;
+            };
+            // Reorg-safety: the confirming block must still be THE active-chain
+            // block at its height. If not, revert to unarmed — it re-arms if the
+            // tx reappears in a replacement block.
+            if chain.active_chain_hash_at_height(h) != Some(bh) {
+                inner.depth_anchor.insert(key, None);
+                inner.armed.remove(&key);
+                continue;
+            }
+            let cur_depth = tip.saturating_sub(h) + 1;
+            if cur_depth >= depth {
+                let (id, txid, depth, kind) = key;
+                // Emit the REQUESTED threshold (`depth`), not the actual reached
+                // depth: it is the alarm's identity (which alarm fired) and the
+                // key the carrier uses to release the quota lease on eviction.
+                // (cur_depth == depth in steady state; cur_depth > depth only on
+                // a late arm — txindex probe of an already-buried tx, or a resync
+                // window.) The client can recompute actual depth from `height`.
+                let m = match kind {
+                    DepthKind::Alarm => WatchMatch::TxidDepthReached {
+                        txid,
+                        depth,
+                        height: h,
+                    },
+                    DepthKind::Close => WatchMatch::TxidFinalized {
+                        txid,
+                        depth,
+                        height: h,
+                    },
+                };
+                fires.push((id, m, key));
+            }
+        }
+
+        // Server-authoritative eviction of fired single-shot entries. Doing the
+        // teardown HERE (not waiting for the carrier to forward the terminal
+        // match over the lossy match channel) guarantees: a fired key can never
+        // re-arm if its txid reappears in a later block (no duplicate terminal),
+        // and the registry's counters/gate are freed even if the terminal match
+        // is dropped to a lagging client. The carrier still calls
+        // remove_tx_depths/remove_txids on forwarding — now an idempotent no-op
+        // registry-side, but it is what releases the carrier-held quota lease.
+        // (Residual: a terminal match dropped to a full channel holds that lease
+        // until disconnect — bounded by the connection and the per-token quota.)
+        let mut depth_dec = 0usize;
+        let mut watch_dec = 0usize;
+        let mut txid_dec = 0usize;
+        for (_id, _m, key) in &fires {
+            let (id, txid, depth, kind) = *key;
+            if remove_depth_entry(&mut inner, id, txid, depth, kind) {
+                depth_dec += 1;
+                if kind == DepthKind::Alarm {
+                    watch_dec += 1;
+                }
+            }
+            if kind == DepthKind::Close {
+                // Auto-close is terminal for the lifecycle watch: remove it too
+                // so it stops narrating once finalized.
+                let removed = match inner.subs.get_mut(&id) {
+                    Some(sub) => sub.txids.remove(&txid),
+                    None => false,
+                };
+                if removed {
+                    txid_dec += 1;
+                    watch_dec += 1;
+                    if let Some(set) = inner.by_txid.get_mut(&txid) {
+                        set.remove(&id);
+                        if set.is_empty() {
+                            inner.by_txid.remove(&txid);
+                        }
+                    }
+                }
+            }
+        }
+        for (id, m, _key) in &fires {
+            deliver(&inner, *id, m);
+        }
+        drop(inner);
+        self.depth_items.fetch_sub(depth_dec, Ordering::AcqRel);
+        self.watch_items.fetch_sub(watch_dec, Ordering::AcqRel);
+        self.txid_items.fetch_sub(txid_dec, Ordering::AcqRel);
+    }
+
+    /// Deliver a lifecycle transition to every subscriber watching `txid`.
+    fn notify_lifecycle(&self, txid: &Txid, m: WatchMatch) {
+        if !self.has_txid_watchers() {
+            return;
+        }
+        let inner = self.read_inner();
+        if let Some(subs) = inner.by_txid.get(txid) {
+            for sid in subs {
+                deliver(&inner, *sid, &m);
+            }
+        }
+    }
+
+    /// Lifecycle: a watched tx was RBF-replaced in the mempool.
+    fn notify_replaced(&self, txid: Txid, replacing_txid: Txid) {
+        self.notify_lifecycle(&txid, WatchMatch::TxidReplaced { txid, replacing_txid });
+    }
+
+    /// Lifecycle: a watched tx was evicted from the mempool by policy.
+    fn notify_evicted(&self, txid: Txid, reason: EvictReason) {
+        self.notify_lifecycle(&txid, WatchMatch::TxidEvicted { txid, reason });
+    }
+
+    /// Scan a disconnected block: emit `TxidUnconfirmed` for watched txids in it
+    /// (their confirming block was rolled back by a reorg). Best-effort — the
+    /// caller skips this when the block data is unavailable (pruned).
+    fn scan_block_disconnected(&self, block: &Block, height: u32) {
+        if !self.has_txid_watchers() {
+            return;
+        }
+        let inner = self.read_inner();
+        if inner.by_txid.is_empty() {
+            return;
+        }
+        for tx in &block.txdata {
+            let txid = tx.compute_txid();
+            if let Some(subs) = inner.by_txid.get(&txid) {
+                let m = WatchMatch::TxidUnconfirmed {
+                    txid,
+                    prev_height: height,
+                };
+                for sid in subs {
+                    deliver(&inner, *sid, &m);
+                }
+            }
+        }
+    }
+}
+
+/// Minimal chain view the depth tick needs. Decouples the per-block tick from
+/// the full `ChainState` so it is unit-testable with a mock, mirroring the A4
+/// `BlockCursorSource` pattern. Implemented for [`crate::chain::state::ChainState`].
+pub trait DepthChainView {
+    /// Active-chain block hash at `height` (reorg-safe; walks from the tip).
+    fn active_chain_hash_at_height(&self, height: u32) -> Option<BlockHash>;
+    /// Confirming `(height, block_hash)` for a txid via the txindex, or `None`
+    /// when txindex is disabled / the tx is unknown.
+    fn tx_confirmation(&self, txid: &Txid) -> Option<(u32, BlockHash)>;
+}
+
+impl DepthChainView for crate::chain::state::ChainState {
+    fn active_chain_hash_at_height(&self, height: u32) -> Option<BlockHash> {
+        crate::chain::state::ChainState::active_chain_hash_at_height(self, height)
+    }
+    fn tx_confirmation(&self, txid: &Txid) -> Option<(u32, BlockHash)> {
+        let bh = self.get_tx_location(txid)?;
+        let entry = self.get_block_index(&bh)?;
+        Some((entry.height, bh))
+    }
+}
+
+/// Insert a depth-tracked entry (unarmed) into the indexes and queue a one-shot
+/// txindex probe. Returns false if the subscriber already held this exact entry.
+fn insert_depth_entry(
+    inner: &mut Inner,
+    id: SubId,
+    txid: Txid,
+    depth: u32,
+    kind: DepthKind,
+) -> bool {
+    let inserted = match inner.subs.get_mut(&id) {
+        Some(sub) => sub.tx_depths.insert((txid, depth, kind)),
+        None => return false,
+    };
+    if !inserted {
+        return false;
+    }
+    let key: DepthKey = (id, txid, depth, kind);
+    inner.by_txid_depth.entry(txid).or_default().insert(key);
+    inner.depth_anchor.insert(key, None);
+    inner.probe_queue.push(key);
+    true
+}
+
+/// Remove a depth-tracked entry from all indexes. Returns false if it was not
+/// registered.
+fn remove_depth_entry(
+    inner: &mut Inner,
+    id: SubId,
+    txid: Txid,
+    depth: u32,
+    kind: DepthKind,
+) -> bool {
+    let removed = match inner.subs.get_mut(&id) {
+        Some(sub) => sub.tx_depths.remove(&(txid, depth, kind)),
+        None => return false,
+    };
+    if !removed {
+        return false;
+    }
+    let key: DepthKey = (id, txid, depth, kind);
+    if let Some(set) = inner.by_txid_depth.get_mut(&txid) {
+        set.remove(&key);
+        if set.is_empty() {
+            inner.by_txid_depth.remove(&txid);
+        }
+    }
+    inner.depth_anchor.remove(&key);
+    inner.armed.remove(&key);
+    true
 }
 
 /// Match a single transaction against the watch-set and deliver to the
@@ -561,14 +970,25 @@ impl WatchHandle {
         self.registry.remove_scripthashes(self.id, scripthashes)
     }
 
-    /// Add txids to this subscriber's watch-set; returns the count newly added.
-    pub fn add_txids(&self, txids: &[Txid]) -> usize {
-        self.registry.add_txids(self.id, txids)
+    /// Add lifecycle watches for `txids`. `auto_close_depth >= 1` self-evicts each
+    /// (emitting `TxidFinalized`) once that deep. Returns the count newly added.
+    pub fn add_txids(&self, txids: &[Txid], auto_close_depth: u32) -> usize {
+        self.registry.add_txids(self.id, txids, auto_close_depth)
     }
 
-    /// Remove txids; returns the count removed.
+    /// Remove lifecycle watches (and any auto-close entry); returns the count removed.
     pub fn remove_txids(&self, txids: &[Txid]) -> usize {
         self.registry.remove_txids(self.id, txids)
+    }
+
+    /// Add single-shot depth alarms keyed `(txid, depth)`; returns the count newly added.
+    pub fn add_tx_depths(&self, items: &[(Txid, u32)]) -> usize {
+        self.registry.add_tx_depths(self.id, items)
+    }
+
+    /// Remove depth alarms keyed `(txid, depth)`; returns the count removed.
+    pub fn remove_tx_depths(&self, items: &[(Txid, u32)]) -> usize {
+        self.registry.remove_tx_depths(self.id, items)
     }
 }
 
@@ -708,15 +1128,30 @@ pub async fn run_watch_matcher(
                     {
                         let undo = block_undo_for_scan(&registry, &chain, &hash);
                         registry.scan_block(&block, height, undo.as_ref());
+                        // Arm depth entries whose txid is in this block.
+                        registry.arm_depths_for_block(&block, height);
                     }
+                    // Tick depth entries against the new tip (fires alarms /
+                    // auto-close, reverts reorged-out anchors, drains the probe
+                    // queue). Cheap no-op when no depth entries exist.
+                    registry.tick_depths(height, chain.as_ref());
                     last_scanned_height = height;
                     last_scanned_hash = Some(hash);
                 }
-                // Disconnects and the reorg marker are surfaced to clients
-                // as first-class events; the matcher itself is spend/funding
-                // oriented (append-only) and takes no action on either.
-                // Clients roll back their own confirmed state on a Reorg.
-                Ok(ChainEvent::BlockDisconnected { .. }) | Ok(ChainEvent::Reorg { .. }) => {}
+                // A disconnected block rolls back its txs' confirmations: emit
+                // TxidUnconfirmed for watched txids in it (best-effort — skipped
+                // if the block data is pruned). The depth tick reverts any armed
+                // anchor on the next connect via its active-chain check. The
+                // Reorg marker itself is a first-class firehose event; the
+                // matcher takes no action on it directly.
+                Ok(ChainEvent::BlockDisconnected { hash, height }) => {
+                    if registry.has_txid_watchers()
+                        && let Some(block) = chain.get_block(&hash)
+                    {
+                        registry.scan_block_disconnected(&block, height);
+                    }
+                }
+                Ok(ChainEvent::Reorg { .. }) => {}
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     // Rescan the missed window so watchers do not silently miss
                     // matches. Reading blocks the node already holds; never
@@ -818,6 +1253,7 @@ pub async fn run_watch_matcher(
                                     Some(block) => {
                                         let undo = block_undo_for_scan(&registry, &chain, hash);
                                         registry.scan_block(&block, *h, undo.as_ref());
+                                        registry.arm_depths_for_block(&block, *h);
                                     }
                                     None => debug!(
                                         target: "events::watch",
@@ -826,6 +1262,9 @@ pub async fn run_watch_matcher(
                                     ),
                                 }
                             }
+                            // Fire any depth entries that became deep enough across
+                            // the rescanned window.
+                            registry.tick_depths(tip, chain.as_ref());
                         }
                         last_scanned_height = tip;
                         last_scanned_hash = Some(tip_hash);
@@ -846,6 +1285,17 @@ pub async fn run_watch_matcher(
                     {
                         registry.scan_mempool_tx(&entry.tx);
                     }
+                }
+                // Lifecycle: RBF replacement and policy eviction route to any
+                // lifecycle watcher of the affected txid. Confirmation
+                // (LeaveConfirmed) is intentionally NOT handled here — the
+                // confirmed leg is sourced from scan_block, which also catches
+                // txs that were never in this node's mempool.
+                Ok(MempoolEvent::LeaveReplaced { txid, replacing_txid }) => {
+                    registry.notify_replaced(txid, replacing_txid);
+                }
+                Ok(MempoolEvent::LeaveEvicted { txid, reason }) => {
+                    registry.notify_evicted(txid, reason);
                 }
                 Ok(_) => {}
                 Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -980,7 +1430,7 @@ mod tests {
         let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
         let tx = funding_tx(ScriptBuf::from(vec![0x51]));
         let txid = tx.compute_txid();
-        assert_eq!(handle.add_txids(&[txid]), 1);
+        assert_eq!(handle.add_txids(&[txid], 0), 1);
         assert!(reg.has_watchers());
         assert!(reg.has_txid_watchers());
 
@@ -1023,10 +1473,415 @@ mod tests {
         let reg = Arc::new(WatchRegistry::new());
         let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
         let watched = funding_tx(ScriptBuf::from(vec![0x51])).compute_txid();
-        handle.add_txids(&[watched]);
+        handle.add_txids(&[watched], 0);
         // A different transaction (distinct script → distinct txid).
         reg.scan_mempool_tx(&funding_tx(ScriptBuf::from(vec![0x52])));
         assert!(rx.try_recv().is_err(), "unwatched txid must not match");
+    }
+
+    // --- lifecycle transitions + depth alarms / auto-close (PR6) ---
+
+    /// A block with a distinct `nonce` so its `block_hash()` is unique (the
+    /// other test helpers hard-code an all-zeros header → identical hashes).
+    fn block_at(nonce: u32, txs: Vec<Transaction>) -> Block {
+        Block {
+            header: bitcoin::block::Header {
+                version: bitcoin::block::Version::TWO,
+                prev_blockhash: bitcoin::BlockHash::all_zeros(),
+                merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+                time: 0,
+                bits: bitcoin::CompactTarget::from_consensus(0),
+                nonce,
+            },
+            txdata: txs,
+        }
+    }
+
+    /// In-memory [`DepthChainView`]: an active-chain `height → hash` map and a
+    /// txindex `txid → (height, hash)` map, both set by the test.
+    #[derive(Default)]
+    struct MockChain {
+        active: HashMap<u32, BlockHash>,
+        txloc: HashMap<Txid, (u32, BlockHash)>,
+    }
+    impl DepthChainView for MockChain {
+        fn active_chain_hash_at_height(&self, height: u32) -> Option<BlockHash> {
+            self.active.get(&height).copied()
+        }
+        fn tx_confirmation(&self, txid: &Txid) -> Option<(u32, BlockHash)> {
+            self.txloc.get(txid).copied()
+        }
+    }
+
+    fn tx_with(spk: u8) -> Transaction {
+        funding_tx(ScriptBuf::from(vec![spk]))
+    }
+
+    #[test]
+    fn lifecycle_replaced_fires() {
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let txid = tx_with(0x51).compute_txid();
+        let replacing = tx_with(0x52).compute_txid();
+        handle.add_txids(&[txid], 0);
+        reg.notify_replaced(txid, replacing);
+        match rx.try_recv().expect("replaced fires") {
+            WatchMatch::TxidReplaced {
+                txid: t,
+                replacing_txid,
+            } => {
+                assert_eq!(t, txid);
+                assert_eq!(replacing_txid, replacing);
+            }
+            other => panic!("wrong match: {other:?}"),
+        }
+        // Unwatched txid → no fire.
+        reg.notify_replaced(tx_with(0x99).compute_txid(), replacing);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn lifecycle_evicted_fires_with_reason() {
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let txid = tx_with(0x51).compute_txid();
+        handle.add_txids(&[txid], 0);
+        reg.notify_evicted(txid, EvictReason::BlockConflict);
+        match rx.try_recv().expect("evicted fires") {
+            WatchMatch::TxidEvicted { txid: t, reason } => {
+                assert_eq!(t, txid);
+                assert_eq!(reason, EvictReason::BlockConflict);
+            }
+            other => panic!("wrong match: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lifecycle_unconfirmed_on_disconnect() {
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let tx = tx_with(0x51);
+        let txid = tx.compute_txid();
+        handle.add_txids(&[txid], 0);
+        reg.scan_block_disconnected(&block_at(1, vec![tx]), 10);
+        match rx.try_recv().expect("unconfirmed fires") {
+            WatchMatch::TxidUnconfirmed { txid: t, prev_height } => {
+                assert_eq!(t, txid);
+                assert_eq!(prev_height, 10);
+            }
+            other => panic!("wrong match: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn depth_fires_at_threshold_not_before() {
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let tx = tx_with(0x51);
+        let txid = tx.compute_txid();
+        assert_eq!(handle.add_tx_depths(&[(txid, 3)]), 1);
+        assert!(reg.has_depth_watchers());
+
+        let block = block_at(1, vec![tx]);
+        let mut chain = MockChain::default();
+        chain.active.insert(10, block.block_hash());
+
+        reg.arm_depths_for_block(&block, 10);
+        reg.tick_depths(10, &chain); // depth 1
+        assert!(rx.try_recv().is_err(), "depth 1 < 3");
+        reg.tick_depths(11, &chain); // depth 2
+        assert!(rx.try_recv().is_err(), "depth 2 < 3");
+        reg.tick_depths(12, &chain); // depth 3
+        match rx.try_recv().expect("alarm fires at depth 3") {
+            WatchMatch::TxidDepthReached {
+                txid: t,
+                depth,
+                height,
+            } => {
+                assert_eq!(t, txid);
+                assert_eq!(depth, 3, "reports requested threshold");
+                assert_eq!(height, 10);
+            }
+            other => panic!("wrong match: {other:?}"),
+        }
+        // Single-shot: no re-fire as it buries deeper.
+        reg.tick_depths(13, &chain);
+        assert!(rx.try_recv().is_err(), "single-shot, no re-fire");
+    }
+
+    #[test]
+    fn two_depths_one_txid_fire_independently() {
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let tx = tx_with(0x51);
+        let txid = tx.compute_txid();
+        assert_eq!(handle.add_tx_depths(&[(txid, 1), (txid, 3)]), 2);
+
+        let block = block_at(1, vec![tx]);
+        let mut chain = MockChain::default();
+        chain.active.insert(10, block.block_hash());
+        reg.arm_depths_for_block(&block, 10);
+
+        reg.tick_depths(10, &chain); // depth 1 → (X,1) fires, (X,3) waits
+        match rx.try_recv().expect("(X,1) fires") {
+            WatchMatch::TxidDepthReached { depth, .. } => assert_eq!(depth, 1),
+            other => panic!("wrong: {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "(X,3) not yet");
+        reg.tick_depths(12, &chain); // depth 3 → (X,3) fires
+        match rx.try_recv().expect("(X,3) fires") {
+            WatchMatch::TxidDepthReached { depth, .. } => assert_eq!(depth, 3),
+            other => panic!("wrong: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn depth_reverts_on_reorg_then_rearms_at_new_height() {
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let tx = tx_with(0x51);
+        let txid = tx.compute_txid();
+        handle.add_tx_depths(&[(txid, 2)]);
+
+        let block_a = block_at(1, vec![tx.clone()]);
+        let mut chain = MockChain::default();
+        chain.active.insert(10, block_a.block_hash());
+        reg.arm_depths_for_block(&block_a, 10);
+        reg.tick_depths(10, &chain); // depth 1 < 2
+        assert!(rx.try_recv().is_err());
+
+        // Reorg: height 10 is now a DIFFERENT block → anchor stale → revert.
+        chain.active.insert(10, block_at(2, vec![]).block_hash());
+        reg.tick_depths(11, &chain);
+        assert!(rx.try_recv().is_err(), "reverted, no fire on stale anchor");
+
+        // Tx re-mined at height 11 in a replacement block → re-arm and fire.
+        let block_c = block_at(3, vec![tx]);
+        chain.active.insert(11, block_c.block_hash());
+        reg.arm_depths_for_block(&block_c, 11);
+        reg.tick_depths(12, &chain); // depth = 12-11+1 = 2
+        match rx.try_recv().expect("re-armed alarm fires at new height") {
+            WatchMatch::TxidDepthReached { depth, height, .. } => {
+                assert_eq!(depth, 2);
+                assert_eq!(height, 11);
+            }
+            other => panic!("wrong: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn already_confirmed_arms_via_txindex_probe() {
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let tx = tx_with(0x51);
+        let txid = tx.compute_txid();
+        handle.add_tx_depths(&[(txid, 3)]); // queued for probe
+
+        // Tx already confirmed at height 10; tip is 12 → already 3 deep.
+        let bh = block_at(1, vec![tx]).block_hash();
+        let mut chain = MockChain::default();
+        chain.txloc.insert(txid, (10, bh));
+        chain.active.insert(10, bh);
+
+        reg.tick_depths(12, &chain); // probe arms (10,bh), then fires
+        match rx.try_recv().expect("probe arms an already-buried tx and fires") {
+            WatchMatch::TxidDepthReached { depth, height, .. } => {
+                assert_eq!(depth, 3);
+                assert_eq!(height, 10);
+            }
+            other => panic!("wrong: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_txindex_waits_for_live_observation() {
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let tx = tx_with(0x51);
+        let txid = tx.compute_txid();
+        handle.add_tx_depths(&[(txid, 2)]);
+
+        // txindex disabled (empty txloc) → probe finds nothing → no arm/fire.
+        let mut chain = MockChain::default();
+        reg.tick_depths(20, &chain);
+        assert!(rx.try_recv().is_err(), "no txindex → no probe arm");
+
+        // Live observation arms it.
+        let block = block_at(1, vec![tx]);
+        chain.active.insert(19, block.block_hash());
+        reg.arm_depths_for_block(&block, 19);
+        reg.tick_depths(20, &chain); // depth = 20-19+1 = 2
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(WatchMatch::TxidDepthReached { depth: 2, .. })
+        ));
+    }
+
+    #[test]
+    fn auto_close_fires_finalized() {
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let tx = tx_with(0x51);
+        let txid = tx.compute_txid();
+        handle.add_txids(&[txid], 6); // lifecycle + auto-close at depth 6
+
+        let block = block_at(1, vec![tx]);
+        let mut chain = MockChain::default();
+        chain.active.insert(10, block.block_hash());
+        reg.scan_block(&block, 10, None); // delivers the lifecycle "confirmed"
+        reg.arm_depths_for_block(&block, 10);
+        // Drain the confirmed TxidMatched.
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(WatchMatch::TxidMatched {
+                confirmed: true,
+                ..
+            })
+        ));
+
+        reg.tick_depths(14, &chain); // depth 5 < 6
+        assert!(rx.try_recv().is_err());
+        reg.tick_depths(15, &chain); // depth 6 → finalize
+        match rx.try_recv().expect("auto-close fires TxidFinalized") {
+            WatchMatch::TxidFinalized {
+                txid: t,
+                depth,
+                height,
+            } => {
+                assert_eq!(t, txid);
+                assert_eq!(depth, 6);
+                assert_eq!(height, 10);
+            }
+            other => panic!("wrong: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn auto_close_holds_through_reorg_below_depth() {
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let tx = tx_with(0x51);
+        let txid = tx.compute_txid();
+        handle.add_txids(&[txid], 6);
+
+        let block = block_at(1, vec![tx]);
+        let mut chain = MockChain::default();
+        chain.active.insert(10, block.block_hash());
+        reg.scan_block(&block, 10, None);
+        reg.arm_depths_for_block(&block, 10);
+        let _ = rx.try_recv(); // confirmed
+
+        // Reorg below the close depth → revert, NO premature finalize.
+        chain.active.insert(10, block_at(2, vec![]).block_hash());
+        reg.tick_depths(13, &chain);
+        assert!(rx.try_recv().is_err(), "no premature finalize on reorg");
+        // Lifecycle watch survives (not evicted).
+        assert!(reg.has_txid_watchers(), "lifecycle watch held through reorg");
+    }
+
+    #[test]
+    fn auto_close_leaves_independent_alarms_intact() {
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, _rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let tx = tx_with(0x51);
+        let txid = tx.compute_txid();
+        handle.add_txids(&[txid], 6); // lifecycle + Close@6
+        handle.add_tx_depths(&[(txid, 3)]); // independent Alarm@3
+
+        // Removing the lifecycle watch tears down the Close entry but NOT the
+        // independently-registered alarm.
+        handle.remove_txids(&[txid]);
+        assert!(!reg.has_txid_watchers(), "lifecycle gone");
+        assert!(reg.has_depth_watchers(), "independent alarm survives");
+
+        // The alarm still arms + fires, and self-evicts server-side on fire.
+        let block = block_at(1, vec![tx]);
+        let mut chain = MockChain::default();
+        chain.active.insert(10, block.block_hash());
+        reg.arm_depths_for_block(&block, 10);
+        reg.tick_depths(12, &chain);
+        assert!(
+            !reg.has_depth_watchers(),
+            "single-shot alarm self-evicts server-side on fire"
+        );
+    }
+
+    #[test]
+    fn depth_fire_self_evicts_registry_state() {
+        // A fired alarm is fully removed from the registry on fire (not left
+        // inert awaiting the carrier), so it cannot re-arm if its txid reappears
+        // in a later block, and the counters are freed regardless of delivery.
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let tx = tx_with(0x51);
+        let txid = tx.compute_txid();
+        handle.add_tx_depths(&[(txid, 1)]);
+
+        let block_a = block_at(1, vec![tx.clone()]);
+        let mut chain = MockChain::default();
+        chain.active.insert(10, block_a.block_hash());
+        reg.arm_depths_for_block(&block_a, 10);
+        reg.tick_depths(10, &chain); // depth 1 → fires + self-evicts
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(WatchMatch::TxidDepthReached { depth: 1, .. })
+        ));
+        assert!(!reg.has_depth_watchers(), "self-evicted on fire");
+        {
+            let inner = reg.read_inner();
+            assert!(inner.by_txid_depth.is_empty());
+            assert!(inner.depth_anchor.is_empty());
+            assert!(inner.armed.is_empty());
+        }
+
+        // The same txid re-mined in a later block must NOT resurrect a duplicate
+        // terminal (the entry is gone, so arming finds nothing).
+        let block_b = block_at(2, vec![tx]);
+        chain.active.insert(11, block_b.block_hash());
+        reg.arm_depths_for_block(&block_b, 11);
+        reg.tick_depths(11, &chain);
+        assert!(rx.try_recv().is_err(), "no duplicate terminal on re-mine");
+    }
+
+    #[test]
+    fn auto_close_finalize_evicts_lifecycle_watch() {
+        // TxidFinalized is terminal for the lifecycle watch: after it fires, the
+        // lifecycle watch is gone (stops narrating) without a carrier round-trip.
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let tx = tx_with(0x51);
+        let txid = tx.compute_txid();
+        handle.add_txids(&[txid], 2);
+
+        let block = block_at(1, vec![tx]);
+        let mut chain = MockChain::default();
+        chain.active.insert(10, block.block_hash());
+        reg.scan_block(&block, 10, None);
+        reg.arm_depths_for_block(&block, 10);
+        let _ = rx.try_recv(); // confirmed TxidMatched
+        reg.tick_depths(11, &chain); // depth 2 → TxidFinalized
+        assert!(matches!(rx.try_recv(), Ok(WatchMatch::TxidFinalized { .. })));
+        assert!(!reg.has_txid_watchers(), "lifecycle watch evicted on finalize");
+        assert!(!reg.has_depth_watchers(), "close entry evicted on finalize");
+        assert!(!reg.has_watchers(), "no residual watch items");
+    }
+
+    #[test]
+    fn deregister_clears_depth_structures() {
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, _rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let txid = tx_with(0x51).compute_txid();
+        let txid2 = tx_with(0x52).compute_txid();
+        handle.add_txids(&[txid], 6);
+        handle.add_tx_depths(&[(txid2, 2), (txid2, 4)]);
+        assert!(reg.has_depth_watchers());
+        drop(handle);
+        assert!(!reg.has_depth_watchers());
+        assert!(!reg.has_watchers());
+        let inner = reg.read_inner();
+        assert!(inner.by_txid_depth.is_empty());
+        assert!(inner.depth_anchor.is_empty());
+        assert!(inner.armed.is_empty());
     }
 
     // --- input-side script matching (B1, confirmed via undo data) ---

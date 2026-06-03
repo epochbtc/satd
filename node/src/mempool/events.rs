@@ -27,6 +27,17 @@ pub enum EvictReason {
     BlockConflict,
 }
 
+impl EvictReason {
+    /// Stable snake_case wire string (matches the serde representation).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            EvictReason::FullPool => "full_pool",
+            EvictReason::Expiry => "expiry",
+            EvictReason::BlockConflict => "block_conflict",
+        }
+    }
+}
+
 /// Event emitted on a mempool state transition. Serialized to the WS
 /// subscription payload verbatim (the `kind` tag discriminates).
 #[derive(Debug, Clone, Serialize)]

@@ -57,7 +57,7 @@ impl Default for GrpcLimits {
 }
 
 use crate::proto::v1 as pb;
-use crate::watchset::WatchSet;
+use crate::watchset::{bounded_txid_depth_pairs, WatchSet};
 use crate::proto::v1::node_event_stream_server::{
     NodeEventStream, NodeEventStreamServer,
 };
@@ -673,10 +673,18 @@ impl NodeEventStream for NodeEventStreamSvc {
 
         // Outbound: live category-filtered firehose merged with the
         // per-subscriber watch matches. Track the last-delivered position to
-        // fill an in-band `Lagged` notice (the Watch firehose has no replay, so
-        // it seeds from zero).
+        // fill an in-band `Lagged` notice. The Watch firehose has no replay, so
+        // seed the resume height from the CURRENT chain tip (not 0): a client
+        // that lags before any block event is delivered — e.g. one that masks the
+        // firehose off and only wants watch matches — would otherwise be handed a
+        // resume_cursor of height 0 and re-replay from genesis on reconnect. The
+        // mempool watermark still seeds from 0 (no live mempool seen yet).
         let lag_publisher = self.publisher.clone();
-        let mut last_h = 0u32;
+        let mut last_h = self
+            .block_source
+            .as_ref()
+            .map(|s| s.current_tip_height())
+            .unwrap_or(0);
         let mut last_s = 0u64;
         let live = BroadcastStream::new(rx_live).filter_map(move |item| match item {
             Ok(env) => {
@@ -696,8 +704,32 @@ impl NodeEventStream for NodeEventStreamSvc {
                 Some(Ok(envelope_to_proto(&ev)))
             }
         });
-        let matches =
-            ReceiverStream::new(rx_match).map(move |m| Ok(watch_match_to_proto(&edge, &m)));
+        // Single-shot terminal matches (depth alarm / lifecycle auto-close): the
+        // registry already evicted the entry server-side on fire, so the
+        // handle.remove_* below is an idempotent no-op registry-side — its job
+        // here is to drop the carrier-held quota LEASE. Keyed by the threshold
+        // the match carries.
+        let evict_handle = handle.clone();
+        let evict_ws = watch_set.clone();
+        let matches = ReceiverStream::new(rx_match).map(move |m| {
+            use node::events::WatchMatch;
+            match &m {
+                WatchMatch::TxidDepthReached { txid, depth, .. } => {
+                    let mut ws = evict_ws.lock().unwrap_or_else(|p| p.into_inner());
+                    ws.remove_tx_depths([(*txid, *depth)], |items| {
+                        evict_handle.remove_tx_depths(items);
+                    });
+                }
+                WatchMatch::TxidFinalized { txid, .. } => {
+                    let mut ws = evict_ws.lock().unwrap_or_else(|p| p.into_inner());
+                    ws.remove_transactions([*txid], |txids| {
+                        evict_handle.remove_txids(txids);
+                    });
+                }
+                _ => {}
+            }
+            Ok(watch_match_to_proto(&edge, &m))
+        });
 
         // Hold `handle` + `sub_guard` alive for the lifetime of the outbound
         // stream (dropped on client disconnect → deregister + free slot).
@@ -763,18 +795,46 @@ fn apply_control(
             );
         }
         Some(Msg::AddTransactions(a)) => {
-            watch_set.add_transactions(
-                principal,
-                a.txids.iter().filter_map(|b| parse_txid(b)),
-                |txids| {
-                    handle.add_txids(txids);
-                },
-            );
+            let txids: Vec<bitcoin::Txid> = a.txids.iter().filter_map(|b| parse_txid(b)).collect();
+            // Depths >= 1 only; 0 is meaningless as a confirmation threshold.
+            let depths: Vec<u32> = a.min_depths.iter().copied().filter(|d| *d >= 1).collect();
+            if depths.is_empty() {
+                // Lifecycle watch(es); `auto_close_depth` rides on each (0 = off).
+                let auto_close = a.auto_close_depth;
+                watch_set.add_transactions(principal, txids, |txids| {
+                    handle.add_txids(txids, auto_close);
+                });
+            } else if let Some(pairs) = bounded_txid_depth_pairs(&txids, &depths) {
+                // Single-shot depth alarms — one item per (txid × distinct depth).
+                watch_set.add_tx_depths(principal, pairs, |items| {
+                    handle.add_tx_depths(items);
+                });
+            } else {
+                warn!(
+                    target: "events::grpc",
+                    txids = txids.len(), depths = depths.len(),
+                    "AddTransactions txid×depth product exceeds cap; rejecting message",
+                );
+            }
         }
         Some(Msg::RemoveTransactions(r)) => {
-            watch_set.remove_transactions(r.txids.iter().filter_map(|b| parse_txid(b)), |txids| {
-                handle.remove_txids(txids);
-            });
+            let txids: Vec<bitcoin::Txid> = r.txids.iter().filter_map(|b| parse_txid(b)).collect();
+            let depths: Vec<u32> = r.min_depths.iter().copied().filter(|d| *d >= 1).collect();
+            if depths.is_empty() {
+                watch_set.remove_transactions(txids, |txids| {
+                    handle.remove_txids(txids);
+                });
+            } else if let Some(pairs) = bounded_txid_depth_pairs(&txids, &depths) {
+                watch_set.remove_tx_depths(pairs, |items| {
+                    handle.remove_tx_depths(items);
+                });
+            } else {
+                warn!(
+                    target: "events::grpc",
+                    txids = txids.len(), depths = depths.len(),
+                    "RemoveTransactions txid×depth product exceeds cap; rejecting message",
+                );
+            }
         }
         Some(Msg::AddDescriptor(d)) => {
             // Expand the descriptor over its [start, start+gap_limit) window and
@@ -910,6 +970,54 @@ fn watch_match_to_proto(
                 height: height.unwrap_or(0),
             });
             (cursor_from_height(*height, edge.instance_id), body)
+        }
+        WatchMatch::TxidReplaced {
+            txid,
+            replacing_txid,
+        } => {
+            let body = pb::node_event::Body::TxidReplaced(pb::TxidReplaced {
+                txid: txid.as_raw_hash().to_byte_array().to_vec(),
+                replacing_txid: replacing_txid.as_raw_hash().to_byte_array().to_vec(),
+            });
+            (None, body)
+        }
+        WatchMatch::TxidEvicted { txid, reason } => {
+            let body = pb::node_event::Body::TxidEvicted(pb::TxidEvicted {
+                txid: txid.as_raw_hash().to_byte_array().to_vec(),
+                reason: reason.as_str().to_string(),
+            });
+            (None, body)
+        }
+        WatchMatch::TxidUnconfirmed { txid, prev_height } => {
+            let body = pb::node_event::Body::TxidUnconfirmed(pb::TxidUnconfirmed {
+                txid: txid.as_raw_hash().to_byte_array().to_vec(),
+                prev_height: *prev_height,
+            });
+            (None, body)
+        }
+        WatchMatch::TxidDepthReached {
+            txid,
+            depth,
+            height,
+        } => {
+            let body = pb::node_event::Body::TxidDepthReached(pb::TxidDepthReached {
+                txid: txid.as_raw_hash().to_byte_array().to_vec(),
+                depth: *depth,
+                height: *height,
+            });
+            (cursor_from_height(Some(*height), edge.instance_id), body)
+        }
+        WatchMatch::TxidFinalized {
+            txid,
+            depth,
+            height,
+        } => {
+            let body = pb::node_event::Body::TxidFinalized(pb::TxidFinalized {
+                txid: txid.as_raw_hash().to_byte_array().to_vec(),
+                depth: *depth,
+                height: *height,
+            });
+            (cursor_from_height(Some(*height), edge.instance_id), body)
         }
     };
     pb::NodeEvent {
@@ -1106,6 +1214,74 @@ mod tests {
 
     fn edge() -> EdgeIdentity {
         EdgeIdentity::new([0x42; 16], Some("us-east1")).unwrap()
+    }
+
+    #[test]
+    fn lifecycle_and_depth_watch_match_to_proto() {
+        use bitcoin::hashes::Hash;
+        use node::events::WatchMatch;
+        let e = edge();
+        let txid =
+            bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0x11; 32]));
+        let rep =
+            bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0x22; 32]));
+
+        let ev = watch_match_to_proto(
+            &e,
+            &WatchMatch::TxidReplaced {
+                txid,
+                replacing_txid: rep,
+            },
+        );
+        match ev.body.unwrap() {
+            pb::node_event::Body::TxidReplaced(r) => {
+                assert_eq!(r.replacing_txid, [0x22; 32].to_vec());
+            }
+            other => panic!("wrong body: {other:?}"),
+        }
+        assert!(ev.cursor.is_none(), "replaced has no cursor");
+
+        let ev = watch_match_to_proto(
+            &e,
+            &WatchMatch::TxidEvicted {
+                txid,
+                reason: node::mempool::events::EvictReason::Expiry,
+            },
+        );
+        match ev.body.unwrap() {
+            pb::node_event::Body::TxidEvicted(r) => assert_eq!(r.reason, "expiry"),
+            other => panic!("wrong body: {other:?}"),
+        }
+
+        let ev = watch_match_to_proto(
+            &e,
+            &WatchMatch::TxidDepthReached {
+                txid,
+                depth: 3,
+                height: 100,
+            },
+        );
+        match ev.body.unwrap() {
+            pb::node_event::Body::TxidDepthReached(r) => {
+                assert_eq!(r.depth, 3);
+                assert_eq!(r.height, 100);
+            }
+            other => panic!("wrong body: {other:?}"),
+        }
+        assert_eq!(ev.cursor.unwrap().height, 100, "depth match carries a cursor");
+
+        let ev = watch_match_to_proto(
+            &e,
+            &WatchMatch::TxidFinalized {
+                txid,
+                depth: 6,
+                height: 100,
+            },
+        );
+        match ev.body.unwrap() {
+            pb::node_event::Body::TxidFinalized(r) => assert_eq!(r.depth, 6),
+            other => panic!("wrong body: {other:?}"),
+        }
     }
 
     // sha256("grpc-sub-token") and sha256("grpc-nosub-token"), fixed vectors.
@@ -1387,6 +1563,11 @@ mod tests {
                 pb::node_event::Body::DescriptorNeedsAddresses(_) => "descriptor_needs_addresses",
                 pb::node_event::Body::Lagged(_) => "lagged",
                 pb::node_event::Body::TxidMatched(_) => "txid_matched",
+                pb::node_event::Body::TxidReplaced(_) => "txid_replaced",
+                pb::node_event::Body::TxidEvicted(_) => "txid_evicted",
+                pb::node_event::Body::TxidUnconfirmed(_) => "txid_unconfirmed",
+                pb::node_event::Body::TxidDepthReached(_) => "txid_depth_reached",
+                pb::node_event::Body::TxidFinalized(_) => "txid_finalized",
             })
             .collect();
         assert!(
