@@ -37,6 +37,7 @@ use node_index::keys::{scripthash_of, Scripthash};
 
 use crate::chain::events::ChainEvent;
 use crate::mempool::events::MempoolEvent;
+use crate::storage::undo::UndoData;
 
 /// Default per-subscriber match-channel depth. A subscriber that falls
 /// further behind than this loses matches (drop-with-notice) rather than
@@ -58,20 +59,24 @@ pub enum WatchMatch {
         /// Block height when `confirmed`; `None` in the mempool.
         height: Option<u32>,
     },
-    /// A watched script was paid by a transaction output.
+    /// A watched script was matched by a transaction.
     ///
-    /// PR scope: **funding (output) side only**. Detecting that a watched
-    /// script was *spent* (input side) needs the prevout's scriptPubKey,
-    /// which is not present in the spending transaction; clients track
-    /// spends by watching the funding outpoint (the descriptor layer wires
-    /// this automatically). `is_output` is therefore always `true` today,
-    /// but is carried so input-side matching can be added without a wire
-    /// change.
+    /// `is_output` distinguishes the two sides:
+    /// - `true` — **funding**: an output pays the script (`index` = vout).
+    ///   Detected in both the mempool and connected blocks.
+    /// - `false` — **spending**: an input spends an output that paid the
+    ///   script (`index` = vin). Detected for **connected blocks only**,
+    ///   using the block's undo data to recover the spent prevout's
+    ///   `scriptPubKey` (the spending tx does not carry it). Unconfirmed
+    ///   spends are not matched on the script side; a client tracks those by
+    ///   watching the funding outpoint (which `OutpointSpent` detects in the
+    ///   mempool).
     ScriptMatched {
         scripthash: Scripthash,
         txid: Txid,
         is_output: bool,
-        /// `vout` (output index) for a funding match.
+        /// `vout` for a funding match (`is_output = true`); `vin` for a
+        /// spending match (`is_output = false`).
         index: u32,
         confirmed: bool,
         height: Option<u32>,
@@ -106,6 +111,11 @@ pub struct WatchRegistry {
     /// across all subscribers. The matcher checks this before re-reading a
     /// block, so a node with no watchers does zero extra work.
     watch_items: AtomicUsize,
+    /// Lock-free count of registered *script* items only. Gates the
+    /// input-side script match: the matcher fetches a block's undo data (to
+    /// recover spent prevout scriptPubKeys) only when some script is watched,
+    /// so an outpoint-only watch-set pays nothing extra.
+    script_items: AtomicUsize,
 }
 
 impl Default for WatchRegistry {
@@ -120,6 +130,7 @@ impl WatchRegistry {
             inner: RwLock::new(Inner::default()),
             next_id: AtomicU64::new(1),
             watch_items: AtomicUsize::new(0),
+            script_items: AtomicUsize::new(0),
         }
     }
 
@@ -127,6 +138,12 @@ impl WatchRegistry {
     /// script. Lock-free; the matcher gate.
     pub fn has_watchers(&self) -> bool {
         self.watch_items.load(Ordering::Acquire) > 0
+    }
+
+    /// `true` if any subscriber is watching at least one script. Lock-free;
+    /// gates the input-side undo-data fetch.
+    pub fn has_script_watchers(&self) -> bool {
+        self.script_items.load(Ordering::Acquire) > 0
     }
 
     fn lock_inner(&self) -> std::sync::RwLockWriteGuard<'_, Inner> {
@@ -196,6 +213,7 @@ impl WatchRegistry {
             }
         }
         self.watch_items.fetch_add(added, Ordering::AcqRel);
+        self.script_items.fetch_add(added, Ordering::AcqRel);
         added
     }
 
@@ -242,6 +260,7 @@ impl WatchRegistry {
             }
         }
         self.watch_items.fetch_sub(removed, Ordering::AcqRel);
+        self.script_items.fetch_sub(removed, Ordering::AcqRel);
         removed
     }
 
@@ -253,6 +272,7 @@ impl WatchRegistry {
             return;
         };
         let freed = sub.outpoints.len() + sub.scripthashes.len();
+        let freed_scripts = sub.scripthashes.len();
         for op in &sub.outpoints {
             if let Some(set) = inner.by_outpoint.get_mut(op) {
                 set.remove(&id);
@@ -270,17 +290,33 @@ impl WatchRegistry {
             }
         }
         self.watch_items.fetch_sub(freed, Ordering::AcqRel);
+        self.script_items.fetch_sub(freed_scripts, Ordering::AcqRel);
     }
 
     /// Scan every transaction in a connected block, routing matches to
     /// subscribers (confirmed). Cheap early-out when no one is watching.
-    pub fn scan_block(&self, block: &Block, height: u32) {
+    ///
+    /// `undo` is the block's undo data (spent coins, one per non-coinbase
+    /// input in connect order). When present and some script is watched, it
+    /// drives **input-side** script matching: a watched script is matched when
+    /// an output paying it is *spent*, which the spending tx alone cannot
+    /// reveal (it carries no prevout `scriptPubKey`). The caller passes `None`
+    /// when no script is watched (or the undo is unavailable, e.g. pruned), in
+    /// which case only outpoint-spend and output-side script matching run.
+    pub fn scan_block(&self, block: &Block, height: u32, undo: Option<&UndoData>) {
         if !self.has_watchers() {
             return;
         }
         let inner = self.read_inner();
         for tx in &block.txdata {
             scan_tx(&inner, tx, true, Some(height));
+        }
+        // Input-side script matching: only meaningful with watched scripts and
+        // the undo data to recover the spent prevout scriptPubKeys.
+        if let Some(undo) = undo
+            && !inner.by_scripthash.is_empty()
+        {
+            scan_block_spent_scripts(&inner, block, height, undo);
         }
     }
 
@@ -328,6 +364,60 @@ fn scan_tx(inner: &Inner, tx: &Transaction, confirmed: bool, height: Option<u32>
                     index: vout as u32,
                     confirmed,
                     height,
+                };
+                for sid in subs {
+                    deliver(inner, *sid, &m);
+                }
+            }
+        }
+    }
+}
+
+/// Input-side script matching for a connected block: emit a `ScriptMatched`
+/// (`is_output = false`) when a watched script's output is *spent*.
+///
+/// The spending transaction carries no prevout `scriptPubKey`, so the spent
+/// scripts come from the block's undo data. `undo.spent_coins` holds one
+/// `Coin` per non-coinbase input in connect order — exactly the order this
+/// walk produces (`block.txdata`, skipping `is_coinbase()`, then `tx.input`),
+/// so the running `undo_idx` stays aligned with `tx.input[vin]`. This is the
+/// one piece of spend-detection the funding-side/outpoint primitives cannot
+/// give for a script whose funding the matcher never observed (e.g. a UTXO
+/// that predates the watch).
+fn scan_block_spent_scripts(inner: &Inner, block: &Block, height: u32, undo: &UndoData) {
+    let mut undo_idx = 0usize;
+    for tx in &block.txdata {
+        if tx.is_coinbase() {
+            continue; // coinbase has no spent prevouts in undo
+        }
+        let txid = tx.compute_txid();
+        for (vin, _input) in tx.input.iter().enumerate() {
+            let Some(spent) = undo.spent_coins.get(undo_idx) else {
+                // Undo shorter than the block's non-coinbase inputs: should
+                // never happen given the connect-order invariant (the consensus
+                // disconnect path validates the exact length). Stop rather than
+                // mis-align the remaining indices — this can only cause MISSED
+                // (never false) input-side matches. Log it: a short undo means
+                // a corrupt undo row or a broken invariant worth investigating.
+                warn!(
+                    target: "events::watch",
+                    height,
+                    have = undo.spent_coins.len(),
+                    "resync/scan: undo shorter than non-coinbase inputs; \
+                     input-side script matches truncated for this block"
+                );
+                return;
+            };
+            undo_idx += 1;
+            let sh = scripthash_of(&spent.script_pubkey);
+            if let Some(subs) = inner.by_scripthash.get(&sh) {
+                let m = WatchMatch::ScriptMatched {
+                    scripthash: sh,
+                    txid,
+                    is_output: false,
+                    index: vin as u32,
+                    confirmed: true,
+                    height: Some(height),
                 };
                 for sid in subs {
                     deliver(inner, *sid, &m);
@@ -452,6 +542,23 @@ fn reorg_resync_range(tip: u32, max: u32) -> Option<(u32, u32, u32)> {
     Some((from, tip, from))
 }
 
+/// Fetch a block's undo data for input-side script matching — but only when
+/// some script is watched, so an outpoint-only watch-set never pays even the
+/// (cached) undo read. Returns `None` when no script is watched or the undo is
+/// unavailable (e.g. pruned), in which case `scan_block` does funding/outpoint
+/// matching only.
+fn block_undo_for_scan(
+    registry: &WatchRegistry,
+    chain: &crate::chain::state::ChainState,
+    hash: &bitcoin::BlockHash,
+) -> Option<UndoData> {
+    if registry.has_script_watchers() {
+        chain.get_undo(hash)
+    } else {
+        None
+    }
+}
+
 /// Drive the watch matcher off the existing event broadcasts. Decoupled
 /// from consensus: on `BlockConnected` it re-reads the (already durable)
 /// block and scans it; on a mempool `Enter` it fetches the accepted tx and
@@ -501,7 +608,8 @@ pub async fn run_watch_matcher(
                     if registry.has_watchers()
                         && let Some(block) = chain.get_block(&hash)
                     {
-                        registry.scan_block(&block, height);
+                        let undo = block_undo_for_scan(&registry, &chain, &hash);
+                        registry.scan_block(&block, height, undo.as_ref());
                     }
                     last_scanned_height = height;
                     last_scanned_hash = Some(hash);
@@ -609,7 +717,10 @@ pub async fn run_watch_matcher(
                                     tokio::task::yield_now().await;
                                 }
                                 match chain.get_block(hash) {
-                                    Some(block) => registry.scan_block(&block, *h),
+                                    Some(block) => {
+                                        let undo = block_undo_for_scan(&registry, &chain, hash);
+                                        registry.scan_block(&block, *h, undo.as_ref());
+                                    }
                                     None => debug!(
                                         target: "events::watch",
                                         height = *h,
@@ -736,7 +847,7 @@ mod tests {
             },
             txdata: vec![funding_tx(spk)],
         };
-        reg.scan_block(&block, 7);
+        reg.scan_block(&block, 7, None);
         match rx.try_recv().expect("a match was delivered") {
             WatchMatch::ScriptMatched {
                 scripthash,
@@ -763,6 +874,146 @@ mod tests {
         handle.add_outpoints(&[outpoint(0x01, 0)]);
         reg.scan_mempool_tx(&spending_tx(outpoint(0x02, 0)));
         assert!(rx.try_recv().is_err(), "unwatched spend must not match");
+    }
+
+    // --- input-side script matching (B1, confirmed via undo data) ---
+
+    fn coin_with_spk(spk: ScriptBuf) -> crate::storage::coinview::Coin {
+        crate::storage::coinview::Coin {
+            amount: 1000,
+            script_pubkey: spk,
+            height: 1,
+            coinbase: false,
+        }
+    }
+
+    fn coinbase_tx() -> Transaction {
+        Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(5000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        }
+    }
+
+    fn block_with(txs: Vec<Transaction>) -> Block {
+        Block {
+            header: bitcoin::block::Header {
+                version: bitcoin::block::Version::TWO,
+                prev_blockhash: bitcoin::BlockHash::all_zeros(),
+                merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+                time: 0,
+                bits: bitcoin::CompactTarget::from_consensus(0),
+                nonce: 0,
+            },
+            txdata: txs,
+        }
+    }
+
+    #[test]
+    fn input_side_script_match_from_undo() {
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        // Watch the script that the SPENT prevout pays — the spending tx does
+        // not carry it, so the match can only come from the block's undo.
+        let spent_spk = ScriptBuf::from(vec![0x52]);
+        let sh = scripthash_of(&spent_spk);
+        assert_eq!(handle.add_scripthashes(&[sh]), 1);
+        assert!(reg.has_script_watchers());
+
+        let op = outpoint(0xaa, 3);
+        let block = block_with(vec![coinbase_tx(), spending_tx(op)]);
+        // Undo: one spent coin (the non-coinbase input), carrying the watched
+        // scriptPubKey.
+        let undo = UndoData {
+            spent_coins: vec![coin_with_spk(spent_spk)],
+        };
+
+        reg.scan_block(&block, 9, Some(&undo));
+        match rx.try_recv().expect("an input-side match was delivered") {
+            WatchMatch::ScriptMatched {
+                scripthash,
+                is_output,
+                index,
+                confirmed,
+                height,
+                ..
+            } => {
+                assert_eq!(scripthash, sh);
+                assert!(!is_output, "input-side match → is_output = false");
+                assert_eq!(index, 0, "vin of the spending input");
+                assert!(confirmed);
+                assert_eq!(height, Some(9));
+            }
+            other => panic!("wrong match: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn input_side_skips_coinbase_and_aligns_undo_across_txs() {
+        // Two non-coinbase txs after the coinbase; the watched script is the
+        // prevout of the SECOND tx's input. Proves the coinbase is skipped and
+        // the running undo index stays aligned with tx/input order.
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let watched = ScriptBuf::from(vec![0x53]);
+        let sh = scripthash_of(&watched);
+        handle.add_scripthashes(&[sh]);
+
+        let block = block_with(vec![
+            coinbase_tx(),
+            spending_tx(outpoint(0xb1, 0)),
+            spending_tx(outpoint(0xb2, 1)),
+        ]);
+        // Undo order = non-coinbase inputs in connect order: [tx1.in0, tx2.in0].
+        let undo = UndoData {
+            spent_coins: vec![
+                coin_with_spk(ScriptBuf::from(vec![0x99])), // tx1's prevout (unwatched)
+                coin_with_spk(watched),                     // tx2's prevout (watched)
+            ],
+        };
+
+        reg.scan_block(&block, 5, Some(&undo));
+        match rx.try_recv().expect("the second tx's spend matched") {
+            WatchMatch::ScriptMatched {
+                scripthash,
+                is_output,
+                index,
+                ..
+            } => {
+                assert_eq!(scripthash, sh);
+                assert!(!is_output);
+                assert_eq!(index, 0, "vin within the matching (second) tx");
+            }
+            other => panic!("wrong match: {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "only one input-side match expected");
+    }
+
+    #[test]
+    fn input_side_inert_without_undo_or_script_watch() {
+        // No undo → no input-side scan, even with a script watched.
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let spk = ScriptBuf::from(vec![0x54]);
+        handle.add_scripthashes(&[scripthash_of(&spk)]);
+        let block = block_with(vec![coinbase_tx(), spending_tx(outpoint(0xcc, 0))]);
+        reg.scan_block(&block, 3, None);
+        assert!(rx.try_recv().is_err(), "no undo → no input-side match");
+
+        // Outpoint-only watch-set → has_script_watchers() is false.
+        let reg2 = Arc::new(WatchRegistry::new());
+        let (h2, _rx2) = reg2.register(WATCH_CHANNEL_CAPACITY);
+        h2.add_outpoints(&[outpoint(0x01, 0)]);
+        assert!(!reg2.has_script_watchers());
     }
 
     #[test]

@@ -1504,6 +1504,15 @@ impl ChainState {
         self.store.get_coin(outpoint)
     }
 
+    /// Undo data (the coins spent) for a connected block — one `Coin` per
+    /// non-coinbase input in connect order. The decoupled watch matcher uses
+    /// this for input-side script matching: by the time it scans a connected
+    /// block, those prevouts have already been removed from the live UTXO set,
+    /// so the spent `scriptPubKey`s are only recoverable from undo.
+    pub fn get_undo(&self, hash: &BlockHash) -> Option<crate::storage::undo::UndoData> {
+        self.store.get_undo(hash)
+    }
+
     /// Check if we have block data (not just a header) for a block.
     pub fn has_block_data(&self, hash: &BlockHash) -> bool {
         self.store
