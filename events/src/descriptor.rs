@@ -8,10 +8,13 @@
 //! [`WatchRegistry`](node::events::WatchRegistry) like any other script
 //! watch-set; matches come back as `ScriptMatched`.
 //!
-//! Pure library, no consensus path. The gap-limit semantics: a client
-//! watches `gap_limit` unused indices ahead; the server emits
-//! `DescriptorNeedsAddresses` (a later enhancement) when the window should
-//! advance.
+//! Pure library, no consensus path. Gap-limit tracking is a **client**
+//! concern: the server expands the fixed window `[start, start + gap_limit)`
+//! it is asked for and stays stateless. The client advances `start` (and
+//! removes the trailing scripts) to slide the window as its addresses are
+//! used; the server never tracks derivation progress and never emits a
+//! side-channel. (`DescriptorNeedsAddresses` is a deprecated, never-emitted
+//! proto message kept only to reserve its field number.)
 
 use bitcoin::hashes::{Hash, sha256};
 use miniscript::descriptor::Wildcard;
