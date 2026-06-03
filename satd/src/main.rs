@@ -986,6 +986,45 @@ async fn main() {
         tracing::info!(target: "events", "watch matcher started");
     }
 
+    // Streaming JSON-over-WebSocket + SSE transport (`--streamws`). A
+    // dedicated listener on the API runtime (never the consensus core),
+    // serving the same event schema as the gRPC NodeEventStream mapped to
+    // JSON: /ws (bidi firehose + watch-set control + matches) and /sse
+    // (read-only firehose). Shares the publisher + watch registry.
+    if let Some(bind) = config.streamws_bind.as_deref() {
+        match satd_events::WsStreamServer::bind(
+            bind,
+            config.streamws_allow_remote,
+            event_publisher.clone(),
+            watch_registry.clone(),
+            // Bearer auth (stream:subscribe) when --streamws-auth is set
+            // (which requires --authfile).
+            if config.streamws_auth {
+                token_store.clone()
+            } else {
+                None
+            },
+        )
+        .await
+        {
+            Ok(server) => {
+                tracing::info!(
+                    target: "events",
+                    bind,
+                    allow_remote = config.streamws_allow_remote,
+                    "streamws transport configured",
+                );
+                let _api_guard = api_handle.enter();
+                tokio::spawn(server.serve(shutdown_rx.clone()));
+            }
+            Err(e) => {
+                tracing::error!("streamws transport: {e}");
+                auth.cleanup();
+                std::process::exit(1);
+            }
+        }
+    }
+
     // Shared MempoolAddrIndex handle. Both the read-side
     // RocksAddressIndex (for RPC queries) and the background
     // event-loop task hold the same Arc<RwLock<...>>.

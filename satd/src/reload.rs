@@ -658,6 +658,12 @@ fn field_specs() -> Vec<FieldSpec> {
         restart!("eventszmqmpreplace", events_zmq_mpreplace),
         restart!("eventszmqmpconfirm", events_zmq_mpconfirm),
         restart!("eventszmqnodeevent", events_zmq_nodeevent),
+        // Streaming WS/SSE transport: the listener is bound on the API
+        // runtime at startup; changing the bind/auth posture requires a
+        // restart (same disposition as the events-grpc listener).
+        restart!("streamws", streamws_bind),
+        restart!("streamwsallowremote", streamws_allow_remote),
+        restart!("streamwsauth", streamws_auth),
         // ---- Webhooks ----
         live!("reorgwebhook", reorg_webhook, apply_webhook),
         live_secret!("reorgwebhooksecret", reorg_webhook_secret, apply_webhook),
