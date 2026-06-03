@@ -45,6 +45,11 @@ message SubscribeControl {
     // AddDescriptor with an advanced `start` and Remove*s the trailing
     // scripts (per-remove quota release makes that cheap).
     AddDescriptor   add_descriptor   = 7;
+    // Add transaction ids to the watch-set: fire when the txid appears in the
+    // mempool or a connected block. Charges N units for N txids.
+    AddTransactions    add_transactions    = 8;
+    // Remove txids from the watch-set.
+    RemoveTransactions remove_transactions = 9;
   }
 }
 
@@ -62,6 +67,8 @@ message AddScripts     { repeated bytes scripthashes = 1; }
 message RemoveScripts  { repeated bytes scripthashes = 1; }
 message AddOutpoints   { repeated Outpoint outpoints = 1; }
 message RemoveOutpoints{ repeated Outpoint outpoints = 1; }
+message AddTransactions    { repeated bytes txids = 1; } // each 32 raw bytes
+message RemoveTransactions { repeated bytes txids = 1; }
 
 // A watched outpoint was spent.
 message OutpointSpent {
@@ -79,6 +86,13 @@ message ScriptMatched {
   bool   is_output  = 3;    // true = funding; input-side is future work
   uint32 index      = 4;    // vout for a funding match
   bool   confirmed  = 5;
+}
+
+// A watched transaction id appeared in the mempool or a connected block.
+message TxidMatched {
+  bytes  txid      = 1;
+  bool   confirmed = 2; // false = seen in mempool, not yet in a block
+  uint32 height    = 3; // block height when confirmed; 0 in the mempool
 }
 
 // DEPRECATED / RESERVED — never emitted. The original design had the server
@@ -259,5 +273,6 @@ message NodeEvent {
     ScriptMatched script_matched = 14; // watch match (Watch stream)
     DescriptorNeedsAddresses descriptor_needs_addresses = 15; // gap-limit side-channel
     Lagged lagged = 16; // in-band slow-consumer lag notice + resume cursor
+    TxidMatched txid_matched = 17; // watch match (Watch stream)
   }
 }
