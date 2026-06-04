@@ -72,7 +72,7 @@ cargo build -p satd --no-default-features
 ```sh
 nix build .#satd     # produces ./result/bin/{satd, sat-cli}
 ```
-*See `docs/manual/src/packaging.md` §"Reproducible build via Nix" for the full story.*
+*See the [Operator Manual → Packaging](https://epochbtc.github.io/satd/packaging.html#reproducible-build-via-nix) for the full story.*
 
 ### Running
 
@@ -106,7 +106,7 @@ Bundled `--profile=<preset>` selects from `archival`, `pruned-home`, `mining`, `
 
 Authentication uses a cookie file (default) or `--rpcuser` / `--rpcpassword`. The Esplora listener defaults to **unauthenticated loopback**; for non-loopback exposure, set `--esploraauth=cookie` or `--esploraauth=userpass`.
 
-*See the [Operator Manual](docs/manual/src/introduction.md) for the full flag matrix and tuning notes.*
+*See the [Operator Manual](https://epochbtc.github.io/satd/) for the full flag matrix and tuning notes — in particular the [Configuration Flag Reference](https://epochbtc.github.io/satd/config-reference.html).*
 
 ---
 
@@ -133,7 +133,7 @@ docs/                         API + integration docs
 | File | Purpose |
 |---|---|
 | [`MANIFESTO.md`](MANIFESTO.md) | Node Sovereignty, the monoculture risk, and the conservative BIP policy. |
-| [**Operator Manual**](docs/manual/src/introduction.md) | mdbook reference for operators, integrators, and packagers: observability, configuration & live reload, integrator APIs, the `sat-tui`, the Esplora REST and streaming APIs, the native protocol-surface architecture, and packaging. Rendered at <https://epochbtc.github.io/satd/>. |
+| [**Operator Manual**](https://epochbtc.github.io/satd/) | mdbook reference for operators, integrators, and packagers: observability, configuration & live reload, the full config-flag reference, integrator APIs, the `sat-tui`, the Esplora REST and streaming APIs, the native protocol-surface architecture, and packaging. Source under [`docs/manual/`](docs/manual/). |
 | `CORE_DIFFERENCES.md` | Catalog of intentional deviations from Bitcoin Core: native surfaces, exclusions, and behavioral defaults. |
 | `STABILITY_POLICY.md` | Tiered stability contract; deprecation policy; canary CI. |
 | [`ROADMAP.md`](ROADMAP.md) | Upcoming operator features and the ecosystem / mobile-integration strategy (unshipped, tagged by likelihood). |
