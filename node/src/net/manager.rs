@@ -31,6 +31,16 @@ use crate::net::sync;
 const MAX_OUTBOUND: usize = 8;
 const MAX_OUTBOUND_IBD: usize = 64;
 const BAN_THRESHOLD: u32 = 100;
+/// Minimum interval between announcement-triggered `getheaders` to a single
+/// peer. Caps the header-discovery work a peer can make us do by spamming
+/// invs / unconnectable headers (anti-DoS), while still reacting promptly to
+/// an honest competing-chain announcement.
+const GETHEADERS_MIN_INTERVAL: Duration = Duration::from_secs(2);
+/// Ban score charged for a `headers` message whose parent we don't have. Small
+/// enough that an honest peer announcing a better chain (one such message,
+/// resolved by the getheaders we send back) stays far under [`BAN_THRESHOLD`],
+/// but a peer streaming endless unconnectable headers still accrues to a ban.
+const UNCONNECTING_HEADERS_BAN_SCORE: u32 = 1;
 /// Hardcoded fallback when callers (tests, the no-config `new` constructor)
 /// don't supply a value. Operator-facing path goes through
 /// `Config::maxinboundperip` and the `-maxinboundperip` CLI flag.
@@ -105,6 +115,10 @@ pub enum NetEvent {
 struct PeerHandle {
     info: PeerInfo,
     msg_tx: mpsc::Sender<NetworkMessage>,
+    /// Last time we sent this peer a `getheaders`, for rate-limiting
+    /// announcement-triggered header discovery (anti-DoS). `None` until the
+    /// first send.
+    last_getheaders_sent: Option<Instant>,
 }
 
 /// How a peer task receives its transport.
@@ -908,7 +922,7 @@ impl PeerManager {
             let (msg_tx, msg_rx) = mpsc::channel::<NetworkMessage>(256);
             let mut info = PeerInfo::new(id, addr, Direction::Inbound);
             info.permissions = perms;
-            peers.insert(id, PeerHandle { info, msg_tx });
+            peers.insert(id, PeerHandle { info, msg_tx, last_getheaders_sent: None });
             msg_rx
         };
         tracing::info!(%addr, id, noban = perms.noban, "Accepted inbound peer");
@@ -1755,7 +1769,16 @@ impl PeerManager {
         }
 
         if !blocks_to_get.is_empty() {
+            // Direct fetch (fast path when the block extends our tip)…
             self.send_to_peer(id, sync::make_getdata_blocks(&blocks_to_get));
+            // …plus rate-limited headers-first discovery: if the announced
+            // block builds on a competing chain we don't have, the direct block
+            // arrives with an unknown parent and stalls in the buffer; asking
+            // for headers lets us learn the connecting chain so
+            // `request_missing_blocks` can pull its fork blocks and reorg. The
+            // throttle stops a peer spamming block invs from making us emit a
+            // getheaders per message.
+            self.maybe_send_getheaders(id);
         }
         if !txs_to_get.is_empty() {
             self.send_to_peer(id, sync::make_getdata_txs(&txs_to_get));
@@ -1768,10 +1791,31 @@ impl PeerManager {
         }
 
         let (accepted, err) = self.chain_state.accept_headers(&headers);
-        if let Some(e) = err
-            && !matches!(e, crate::chain::state::ChainError::Duplicate)
-        {
-            self.add_ban_score(id, 20, &format!("Header rejected: {}", e));
+        if let Some(e) = err {
+            match e {
+                crate::chain::state::ChainError::Duplicate => {}
+                crate::chain::state::ChainError::BadPrevBlock => {
+                    // The announced header builds on a chain we haven't seen —
+                    // a competing/longer chain forking below our knowledge. Ask
+                    // this peer for the connecting headers (headers-first
+                    // discovery, rate-limited) so we can learn the chain;
+                    // `request_missing_blocks` then pulls its fork blocks. We
+                    // charge only a tiny ban score: an honest peer announcing a
+                    // better chain sends one such message and stays far under
+                    // the threshold, but a peer streaming endless unconnectable
+                    // headers still accrues to a disconnect (and the getheaders
+                    // throttle caps the work in the meantime).
+                    self.maybe_send_getheaders(id);
+                    self.add_ban_score(
+                        id,
+                        UNCONNECTING_HEADERS_BAN_SCORE,
+                        "unconnecting header (unknown parent)",
+                    );
+                }
+                other => {
+                    self.add_ban_score(id, 20, &format!("Header rejected: {}", other));
+                }
+            }
         }
 
         if accepted > 0 {
@@ -3605,26 +3649,41 @@ impl PeerManager {
         }
     }
 
-    fn request_missing_blocks(&self, id: PeerId) {
-        let tip = self.chain_state.tip_height();
-        let mut to_request = Vec::new();
-
-        // Request blocks from tip+1 upward where we have headers but no block data
-        for h in (tip + 1)..=(tip + 512) {
-            if let Some(hash) = self.chain_state.get_block_hash_by_height(h) {
-                if !self.chain_state.has_block_data(&hash) {
-                    to_request.push(hash);
-                    if to_request.len() >= 128 {
-                        break;
-                    }
-                }
-            } else {
-                break;
+    /// Send `getheaders` to a peer for headers-first chain discovery, but no
+    /// more than once per [`GETHEADERS_MIN_INTERVAL`] per peer. Returns whether
+    /// a message was sent. Used on inv/headers announcements so a flood of
+    /// announcements (or unconnectable headers) can't make us emit a getheaders
+    /// — and the locator-building work behind it — on every message.
+    fn maybe_send_getheaders(&self, id: PeerId) -> bool {
+        {
+            let mut peers = self.peers.write();
+            let Some(handle) = peers.get_mut(&id) else {
+                return false;
+            };
+            let now = Instant::now();
+            let due = handle
+                .last_getheaders_sent
+                .is_none_or(|t| now.duration_since(t) >= GETHEADERS_MIN_INTERVAL);
+            if !due {
+                return false;
             }
+            handle.last_getheaders_sent = Some(now);
         }
+        self.send_to_peer(id, sync::make_getheaders(&self.chain_state));
+        true
+    }
+
+    fn request_missing_blocks(&self, id: PeerId) {
+        // Fork-aware: walk back from the best-work header chain tip to the
+        // fork point, requesting blocks we lack data for in connect order.
+        // This requests a competing chain's fork block(s) at heights at or
+        // below our active tip — a plain forward-by-height walk skips them,
+        // and without them a reorg onto a longer competing chain announced by
+        // a peer can never reconnect.
+        let to_request = self.chain_state.missing_blocks_for_best_header_chain(128);
 
         if !to_request.is_empty() {
-            tracing::debug!(tip, count = to_request.len(), "Requesting blocks");
+            tracing::debug!(count = to_request.len(), "Requesting blocks for best header chain");
             self.send_to_peer(id, sync::make_getdata_blocks(&to_request));
         }
     }
@@ -3662,7 +3721,7 @@ impl PeerManager {
         let (msg_tx, msg_rx) = mpsc::channel::<NetworkMessage>(256);
         let mut info = PeerInfo::new(id, addr, direction);
         info.permissions = self.whitelist_permissions(addr.ip());
-        let handle = PeerHandle { info, msg_tx };
+        let handle = PeerHandle { info, msg_tx, last_getheaders_sent: None };
         {
             let mut peers = self.peers.write();
             peers.insert(id, handle);
@@ -4309,7 +4368,7 @@ mod tests {
         info.state = state;
         // 1-slot channel; we never send on the test side.
         let (tx, _rx) = mpsc::channel::<NetworkMessage>(1);
-        PeerHandle { info, msg_tx: tx }
+        PeerHandle { info, msg_tx: tx, last_getheaders_sent: None }
     }
 
     #[test]

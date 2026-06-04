@@ -6,7 +6,8 @@ use std::time::{Duration, Instant};
 
 mod common;
 use common::{
-    TestNode, find_available_port, get_rpc_str, get_rpc_u64, poll_until, test_timeout,
+    DeterministicWallet, TestNode, find_available_port, get_rpc_str, get_rpc_u64, poll_until,
+    test_timeout,
 };
 
 #[test]
@@ -1362,6 +1363,92 @@ fn test_parallel_ibd() {
     assert_eq!(
         a_hash, b_hash,
         "nodes should agree on best block after parallel IBD"
+    );
+
+    node_b.stop();
+    node_a.stop();
+}
+
+/// A synced *listener* must adopt a competing longer chain announced by an
+/// *inbound* peer. This is the inbound-peer pull gap: previously the listener
+/// requested missing blocks by walking forward from its own tip height, so it
+/// never requested the competing chain's fork block (at a height at or below
+/// its tip) and the reorg could never reconnect — the listener stayed put.
+#[test]
+fn test_listener_pulls_competing_chain_from_inbound_peer() {
+    // Node A: the listener, on a SHORT chain (height 1).
+    let p2p_port_a = find_available_port();
+    let mut node_a = TestNode::start(&[&format!("--port={}", p2p_port_a)]);
+    let addr_a = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    node_a
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(1), serde_json::json!(addr_a)],
+        )
+        .unwrap();
+    assert_eq!(get_rpc_u64(&node_a, "getblockcount").unwrap(), 1);
+    let a_block1 = get_rpc_str(&node_a, "getbestblockhash").unwrap();
+
+    // Node B: an INDEPENDENT, longer competing chain (height 3), mined to a
+    // different address so its blocks differ from A's.
+    let addr_b = DeterministicWallet::from_secret([0x4b; 32]).address.to_string();
+    let mut node_b = TestNode::start(&[]);
+    node_b
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(3), serde_json::json!(addr_b)],
+        )
+        .unwrap();
+    assert_eq!(get_rpc_u64(&node_b, "getblockcount").unwrap(), 3);
+    // The chains genuinely diverge at height 1.
+    let b_block1 = node_b
+        .rpc_call_with_params("getblockhash", vec![serde_json::json!(1)])
+        .unwrap()["result"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(a_block1, b_block1, "the two chains must diverge");
+
+    // Connect B → A (B dials A, so B is INBOUND from A's perspective). B keeps
+    // its height-3 chain across the restart; on connect it syncs A's shorter
+    // chain (and ignores it).
+    node_b.restart_preserving_datadir(&[&format!("--connect=127.0.0.1:{}", p2p_port_a)]);
+    poll_until(
+        || get_rpc_u64(&node_b, "getblockcount").unwrap_or(0) >= 3,
+        Duration::from_secs(30),
+        "node B lost its chain across restart",
+    );
+    poll_until(
+        || get_rpc_u64(&node_a, "getconnectioncount").unwrap_or(0) >= 1,
+        Duration::from_secs(30),
+        "nodes did not connect",
+    );
+
+    // NOTE: the height gap here (A at 1, B at 4) is deliberately small so the
+    // listener stays OUT of IBD (`headers_tip <= tip + 24`) and exercises the
+    // non-IBD `request_missing_blocks` fork-walk under test — not the IBD
+    // scheduler. Keep B's height well under that threshold if this is changed.
+    //
+    // Mine one more block on B (height 4) so it announces to A, triggering A's
+    // headers-first discovery of the competing chain.
+    node_b
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(1), serde_json::json!(addr_b)],
+        )
+        .unwrap();
+    let b_tip = get_rpc_str(&node_b, "getbestblockhash").unwrap();
+
+    // The listener A must pull the competing chain and reorg onto it.
+    poll_until(
+        || get_rpc_u64(&node_a, "getblockcount").unwrap_or(0) >= 4,
+        Duration::from_secs(60),
+        "listener A did not pull the competing longer chain from inbound peer B",
+    );
+    assert_eq!(
+        get_rpc_str(&node_a, "getbestblockhash").unwrap(),
+        b_tip,
+        "listener A adopted the inbound peer's competing tip"
     );
 
     node_b.stop();

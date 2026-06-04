@@ -470,6 +470,31 @@ All additions are opt-in; the wire schema is `v1`. See `docs/api/streaming.md`.
 
 ### P2P
 
+- **A synced node now adopts a competing longer chain announced by an inbound
+  peer.** Previously a node that was a passive listener (not in IBD) would not
+  reorg onto a better chain announced by a peer that dialed *it*: it requested
+  missing blocks by walking forward from its own tip height
+  (`tip+1, tip+2, …`), so it never requested the competing chain's **fork
+  block** — which sits at a height at or below the listener's tip — and without
+  that block's data the reorg could never reconnect. The listener stayed on its
+  shorter chain indefinitely. Two fixes: (1) block requests are now **fork-aware**
+  — `request_missing_blocks` walks back from the best-work header chain tip to
+  the fork point, requesting the blocks it lacks in connect order (including
+  fork blocks at heights ≤ the active tip); (2) **headers-first discovery** on
+  announcements — an `inv`/`headers` announcement that builds on an unknown
+  (competing) chain now triggers a `getheaders` to that peer to learn the
+  connecting chain, instead of being dropped (and, for headers, instead of
+  ban-scoring an honest peer announcing a better chain). Verified by a
+  two-node regtest test where a height-1 listener adopts an inbound peer's
+  height-4 competing chain. The best-work header chain is selected from a
+  tracked `pindexBestHeader`-style pointer (updated by chainwork in
+  `accept_header`/`accept_headers`/`accept_block`), not the pollutable
+  best-known-at-height index, so a heavier-but-shorter fork is still pursued;
+  the walk continues to the active-chain fork point (collecting a hole below an
+  already-present side block) and declines a fork too deep to anchor rather
+  than re-requesting an unconnectable run forever. The getheaders discovery is
+  rate-limited per peer (anti-DoS), and an unconnecting-header message still
+  accrues a small ban score so endless unconnectable-header spam disconnects.
 - **`getdata MSG_CMPCT_BLOCK` requests are now served.** satd's getdata
   handler answered `MSG_BLOCK` / `MSG_WITNESS_BLOCK` and tx requests but
   silently ignored `MSG_CMPCT_BLOCK` (BIP 152). A Bitcoin Core peer with a
