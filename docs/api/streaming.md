@@ -439,17 +439,21 @@ message PrefixMatched {                       // body field 23
   bytes        raw_tx           = 2;          // the full matching tx, inline — no precise follow-up fetch
   bool         confirmed        = 3;
   uint32       height           = 4;
-  repeated SpentPrevout matched_prevouts = 5; // spend side: prevout scripts that matched (empty for pure funding)
+  repeated SpentPrevout matched_prevouts = 5; // spend side; script_pubkey set on confirmed spends, empty on mempool spends (hash-only) and pure funding
 }
 message SpentPrevout { bytes outpoint_txid = 1; uint32 outpoint_vout = 2; bytes script_pubkey = 3; }
 ```
 
 **Delivery is self-contained, deliberately.** `PrefixMatched` carries the full
 `raw_tx`, not a txid — a txid would force the client to fetch the transaction
-precisely, re-leaking the exact interest the bucket was hiding. For the spend side
-it also carries the matched prevout scripts, so the client can confirm "this is a
-spend of one of my outputs" without resolving any outpoint itself. Because a bucket
-is a 2⁻ᵏ slice of uniform scripthash space, inline full-tx delivery is cheap: even a
+precisely, re-leaking the exact interest the bucket was hiding. For a **confirmed**
+spend it also carries the matched prevout scripts in `matched_prevouts` (recovered
+from undo data), so the client can confirm "this is a spend of one of my outputs"
+without resolving any outpoint itself. For a **mempool** spend, only the
+prevout *hash* is retained (§7.2), so `matched_prevouts` carries the spent outpoint
+with an *empty* `script_pubkey`; the client confirms the match against its own UTXO
+set rather than from the event alone. Because a bucket is
+a 2⁻ᵏ slice of uniform scripthash space, inline full-tx delivery is cheap: even a
 coarse k=8 bucket (anonymity set ≈ 256×) is a low-single-digit transactions per
 block plus a trickle from the mempool.
 
