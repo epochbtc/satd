@@ -1643,22 +1643,23 @@ impl ChainState {
         let mut max_height = 0u32;
         let mut best_in_batch: Option<(BlockHash, [u8; 32])> = None;
 
-        // The active block tip is fixed for the duration of this header batch
-        // (header acceptance connects no blocks). Header-only writes must stay
-        // above it so they cannot clobber the active-chain height index — see
-        // `accept_header`.
-        let block_tip_height = self.tip_height();
-
         for header in headers {
             let hash = header.block_hash();
 
             // Already known?
             if let Some(existing) = self.store.get_block_index(&hash) {
-                // Crash-resume repair: if the block is stored (DataStored/Valid) but its
-                // height→hash mapping was never written (e.g. accept_headers was never
-                // called for it, or it was lost in a pending_batch that was never flushed),
-                // restore it now so the connect loop can find this block.
-                if matches!(existing.status, BlockStatus::DataStored | BlockStatus::Valid)
+                // Crash-resume repair: if a block was stored (DataStored) but its
+                // height→hash mapping was never written (e.g. accept_headers was
+                // never called for it, or it was lost in a pending_batch that was
+                // never flushed), restore it so the forward connect loop can find
+                // it. Restricted to DataStored (NOT Valid) on purpose: connect
+                // writes a block's Valid entry and its height→hash atomically in
+                // one batch, so a Valid block with a *missing* mapping is never a
+                // crash artifact — it is a block a reorg DISCONNECTED (disconnect
+                // removes the mapping but leaves the status Valid). Restoring that
+                // would re-point height→hash at a no-longer-active block, exactly
+                // the clobber this change exists to prevent.
+                if existing.status == BlockStatus::DataStored
                     && self.store.get_block_hash_by_height(existing.height).is_none()
                 {
                     batch.height_hash_puts.push((existing.height, hash));
@@ -1728,7 +1729,14 @@ impl ChainState {
             };
 
             batch.block_index_puts.push((hash, entry));
-            if new_height > block_tip_height {
+            // Only write the height index strictly above the active tip, so a
+            // sub-tip fork header cannot clobber the active chain — see
+            // `accept_header`. Re-read the tip each iteration: header acceptance
+            // holds no lock against a concurrent RPC `submitblock`/`generate`
+            // (which connect via `accept_block`), so a value captured once before
+            // the loop could go stale and let a header at the just-connected
+            // height slip through.
+            if new_height > self.tip_height() {
                 batch.height_hash_puts.push((new_height, hash));
             }
             accepted += 1;
@@ -2790,9 +2798,17 @@ impl ChainState {
 
         let mut batch = crate::storage::StoreBatch::default();
         batch.block_index_puts.push((block_hash, entry));
-        // Write height_hash so the connect loop can find this block even if
-        // accept_headers was never called (e.g. crash-resume or out-of-order sync).
-        batch.height_hash_puts.push((new_height, block_hash));
+        // Write height_hash so the forward connect loop can find this block even
+        // if accept_headers was never called (e.g. crash-resume or out-of-order
+        // sync). Same active-chain rule as header acceptance: only ABOVE the
+        // active tip. The IBD connect loop only ever reads height_hash forward
+        // (tip+1, tip+2, …), so a stored block below the tip is a competing-fork
+        // block we must not let clobber the active-chain entry there — the same
+        // bad-cb-height pollution, reached through the block-store door. The
+        // block stays reachable by hash for the competing-chain pull.
+        if new_height > self.tip_height() {
+            batch.height_hash_puts.push((new_height, block_hash));
+        }
         self.store.write_batch(batch)?;
 
         Ok((block_hash, new_height))
@@ -5089,6 +5105,16 @@ pub(crate) mod tests {
         (cs, dir)
     }
 
+    /// Force `height_hash[height] = hash`, simulating a polluted index. Used by
+    /// tests that verify consumers stay immune to a `height_hash` that
+    /// disagrees with the active chain. (The writers — accept_header(s) and
+    /// store_block — no longer produce this state, so tests inject it directly.)
+    fn pollute_height_hash(cs: &ChainState, height: u32, hash: BlockHash) {
+        let mut batch = crate::storage::StoreBatch::default();
+        batch.height_hash_puts.push((height, hash));
+        cs.store.write_batch(batch).unwrap();
+    }
+
     /// Mine `n` regtest blocks into `cs` via the proven
     /// accept_header→store_block→connect_stored_block path, returning the
     /// connected blocks in height order.
@@ -5200,7 +5226,7 @@ pub(crate) mod tests {
         let (cs, dir) = make_chain_state();
         let blocks = build_and_connect_chain(&cs, 5);
         assert_eq!(cs.tip_height(), 5);
-        assert_eq!(cs.check_block_index(), Ok(5));
+        assert_eq!(cs.check_block_index(None), Ok(5));
 
         let active3 = blocks[2].block_hash(); // active block at height 3
         let active4 = blocks[3].block_hash(); // active block at height 4
@@ -5230,7 +5256,65 @@ pub(crate) mod tests {
 
         // The structural audit stays clean — a subsequent --reindex-chainstate
         // would replay the true active chain, never the fork.
-        assert_eq!(cs.check_block_index(), Ok(5));
+        assert_eq!(cs.check_block_index(None), Ok(5));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn store_block_does_not_clobber_active_height_index_with_subtip_fork() {
+        // The IBD block-store path (`store_block`) is the second door to the
+        // same bad-cb-height pollution: a peer relays a valid competing block
+        // below the tip, store_block writes its height→hash, and a later
+        // --reindex-chainstate replays it at the wrong height.
+        let (cs, dir) = make_chain_state();
+        let blocks = build_and_connect_chain(&cs, 5);
+        assert_eq!(cs.tip_height(), 5);
+        let active3 = blocks[2].block_hash();
+
+        // A valid block on a fork branching off height 2, so it lands at
+        // height 3 (≤ our tip of 5). store_block validates PoW/difficulty/
+        // checkpoints and persists it, but must not touch the active height map.
+        let f3 = build_test_block(blocks[1].block_hash(), 3, 1_500_000_003);
+        assert_ne!(f3.block_hash(), active3);
+        let (stored_hash, stored_height) = cs.store_block(&f3).unwrap();
+        assert_eq!(stored_height, 3);
+
+        // Stored (reachable by hash) but the active-chain slot is intact.
+        assert!(cs.get_block_index(&stored_hash).is_some());
+        assert_eq!(cs.get_block_hash_by_height(3), Some(active3));
+        assert_eq!(cs.check_block_index(None), Ok(5));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn accept_headers_repair_does_not_restore_a_disconnected_block() {
+        // The crash-resume repair must not re-point height→hash at a block a
+        // reorg disconnected. A Valid block with a missing mapping is exactly
+        // that (connect writes status+mapping atomically; disconnect drops the
+        // mapping but leaves the status Valid), so the repair is restricted to
+        // DataStored. Here we simulate the post-disconnect state by removing the
+        // mapping for a Valid block and re-announcing its header.
+        let (cs, dir) = make_chain_state();
+        let blocks = build_and_connect_chain(&cs, 5);
+        let h5 = blocks[4].block_hash();
+        assert_eq!(cs.get_block_index(&h5).unwrap().status, BlockStatus::Valid);
+
+        let mut batch = crate::storage::StoreBatch::default();
+        batch.height_hash_removes.push(5);
+        cs.store.write_batch(batch).unwrap();
+        assert_eq!(cs.get_block_hash_by_height(5), None);
+
+        // Re-announce the disconnected block's header: the repair branch sees a
+        // Valid (not DataStored) block and must leave the mapping absent.
+        let (_accepted, err) = cs.accept_headers(&[blocks[4].header]);
+        assert!(err.is_none(), "re-announcing a known header should not error: {err:?}");
+        assert_eq!(
+            cs.get_block_hash_by_height(5),
+            None,
+            "repair must not restore the mapping for a disconnected Valid block"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -6844,14 +6928,18 @@ pub(crate) mod tests {
         let a2 = build_test_block(a1_hash, 2, 1_300_000_002);
         cs.accept_block(&a2).expect("accept A2");
 
-        // Store a side block at height 1; this clobbers height_hash[1] = B1.
+        // A side block at height 1. store_block no longer clobbers the active
+        // height index (that pollution is the bug this stack fixes), so inject
+        // the polluted entry directly — this test verifies the CONSUMER is
+        // immune to a height_hash that disagrees with the active chain.
         let b1 = build_test_block(genesis_hash, 1, 1_300_000_010);
         let b1_hash = b1.block_hash();
         cs.store_block(&b1).expect("store B1");
+        pollute_height_hash(&cs, 1, b1_hash);
         assert_eq!(
             cs.get_block_hash_by_height(1),
             Some(b1_hash),
-            "test premise: store_block clobbers the height index"
+            "test premise: height_hash[1] polluted with the side block"
         );
 
         // The side block must be rejected even though height_hash[1] == B1 …
@@ -6897,16 +6985,18 @@ pub(crate) mod tests {
         // After connect_block: height_hash[1] = A1.
         assert_eq!(cs.get_block_hash_by_height(1), Some(a1_hash));
 
-        // Build a side block at height 1 and store it. store_block
-        // writes height_hash[1] = B1 (overwriting A1) even though
-        // A1 is the active block at height 1.
+        // Build a side block at height 1 and store it, then inject the polluted
+        // height_hash[1] = B1 directly. (store_block no longer clobbers the
+        // active index — the fix — so we recreate the disagreement to prove
+        // fork-point discovery is immune to it.)
         let b1 = build_test_block(genesis_hash, 1, 1_300_000_010);
         let b1_hash = b1.block_hash();
         let _ = cs.store_block(&b1).expect("store B1");
+        pollute_height_hash(&cs, 1, b1_hash);
         assert_eq!(
             cs.get_block_hash_by_height(1),
             Some(b1_hash),
-            "store_block must clobber height_hash[1] for the test premise to hold"
+            "premise: height_hash[1] polluted with the side block"
         );
 
         // Extend B with two more blocks via accept_block — heavier
@@ -6946,11 +7036,13 @@ pub(crate) mod tests {
         let a2 = build_test_block(a1_hash, 2, 1_300_000_002);
         let a2_hash = cs.accept_block(&a2).expect("accept A2");
 
-        // store_block(B1) pollutes height_hash[1] = B1 even though A1 is the
-        // active block at height 1.
+        // Inject a polluted height_hash[1] = B1 (store_block no longer clobbers
+        // the active index — the fix), to prove the consumer reads the active
+        // chain regardless.
         let b1 = build_test_block(genesis_hash, 1, 1_300_000_010);
         let b1_hash = b1.block_hash();
         let _ = cs.store_block(&b1).expect("store B1");
+        pollute_height_hash(&cs, 1, b1_hash);
         assert_eq!(
             cs.get_block_hash_by_height(1),
             Some(b1_hash),
