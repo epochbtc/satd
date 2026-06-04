@@ -47,10 +47,12 @@ In-progress; full detail tracked in
 - **Documentation** — operator docs consolidated into an mdbook **Operator
   Manual** (`docs/manual/`, published to GitHub Pages), folding in
   `OPERATOR_ERGONOMICS.md`, `docs/PACKAGING.md`, `docs/TUI.md`, the Esplora REST
-  reference, the native-protocol-surface architecture rationale, a new
-  streaming-API integrator guide, and a complete **Configuration Flag Reference**
-  (every key: default, reload disposition, Core-compatible vs satd extension).
-  Unshipped ecosystem/mobile strategy moved to `ROADMAP.md` (tagged by
+  reference, the native-protocol-surface architecture rationale, a streaming-API
+  integrator guide, a complete **Configuration Flag Reference** (every key:
+  default, reload disposition, Core-compatible vs satd extension), an
+  **Authentication & Authorization** chapter (the unified bearer-token layer and
+  how it contrasts with Core cookie/`rpcuser`/`rpcauth`), and an **MCP Server**
+  chapter. Unshipped ecosystem/mobile strategy moved to `ROADMAP.md` (tagged by
   likelihood).
 
 ## Releases

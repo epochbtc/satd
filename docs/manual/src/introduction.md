@@ -17,9 +17,12 @@ contract.
 
 - **Operating** — the day-to-day surfaces: [observability and
   metrics](observability.md), [configuration, tuning, and live
-  reload](configuration.md), the [integrator APIs](integrator-apis.md), and the
-  [`sat-tui`](tui.md) terminal dashboard.
-- **Protocol Surfaces** — the [Esplora REST API](esplora.md) reference and the
+  reload](configuration.md), [authentication and authorization](authentication.md)
+  (Core-compatible credentials plus the unified bearer-token layer), the
+  [integrator APIs](integrator-apis.md), and the [`sat-tui`](tui.md) terminal
+  dashboard.
+- **Protocol Surfaces** — the [Esplora REST API](esplora.md) reference, the
+  [streaming consumption API](streaming.md), the [MCP server](mcp.md), and the
   [architecture](native-protocol-surfaces.md) behind satd's native, shared-chainstate
   protocol servers (the headline differentiator over the `bitcoind` + `electrs`
   status quo).
