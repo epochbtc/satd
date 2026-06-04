@@ -41,6 +41,22 @@ pub const ENVELOPE_BROADCAST_CAPACITY: usize = 4096;
 /// [`super::BlockCursorSource`]).
 pub const REPLAY_RING_CAPACITY: usize = 1024;
 
+/// Resolve a buffer-capacity knob, applying a test-only environment
+/// override when present. The override exists so the streaming E2E suite
+/// can shrink the broadcast buffer / replay ring to force a deterministic
+/// `Lagged` (and a bounded replay window) without flooding tens of
+/// thousands of events over a real socket. Mirrors the
+/// `SATD_BACKFILL_DEBUG_DELAY_MS` test-knob pattern: parsed, bounds-checked
+/// (1..=65536), and silently ignored on a malformed value, so production —
+/// which never sets these vars — always gets `default`.
+fn capacity_override(var: &str, default: usize) -> usize {
+    std::env::var(var)
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|c| *c > 0 && *c <= 65536)
+        .unwrap_or(default)
+}
+
 /// Heartbeat cadence. One per second is enough for end-to-end pipeline
 /// latency probes; the bandwidth cost is trivial (a single envelope
 /// per second). Subscribers that don't want heartbeats filter via the
@@ -59,19 +75,28 @@ pub struct EventPublisher {
     /// push + bounded pop per publish); no `.await` is held across the
     /// lock, so a `std::sync::Mutex` is appropriate.
     replay_ring: Mutex<VecDeque<NodeEvent>>,
+    /// Effective replay-ring capacity (normally [`REPLAY_RING_CAPACITY`],
+    /// shrinkable via the test-only env knob). Stored per-instance because
+    /// `publish`'s pop bound must match the capacity the ring was built
+    /// with.
+    replay_ring_cap: usize,
 }
 
 impl EventPublisher {
     /// Build a new publisher. `capacity` is the broadcast buffer size;
     /// pass [`ENVELOPE_BROADCAST_CAPACITY`] for the default.
     pub fn new(edge: EdgeIdentity, capacity: usize) -> Arc<Self> {
+        let capacity = capacity_override("SATD_EVENT_BROADCAST_CAPACITY", capacity);
+        let replay_ring_cap =
+            capacity_override("SATD_EVENT_REPLAY_RING_CAPACITY", REPLAY_RING_CAPACITY);
         let (out, _rx) = broadcast::channel(capacity);
         Arc::new(Self {
             out,
             edge,
             seq: AtomicU64::new(0),
             started_monotonic: Instant::now(),
-            replay_ring: Mutex::new(VecDeque::with_capacity(REPLAY_RING_CAPACITY)),
+            replay_ring: Mutex::new(VecDeque::with_capacity(replay_ring_cap)),
+            replay_ring_cap,
         })
     }
 
@@ -162,7 +187,7 @@ impl EventPublisher {
                 .replay_ring
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
-            if ring.len() == REPLAY_RING_CAPACITY {
+            if ring.len() == self.replay_ring_cap {
                 ring.pop_front();
             }
             ring.push_back(env.clone());
