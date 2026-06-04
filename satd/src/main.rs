@@ -698,6 +698,14 @@ async fn main() {
         }
     }
 
+    // A reindex rebuilds the active chain via the replay path, which never
+    // touches the in-memory best-header pointer (seeded at genesis when the
+    // index started empty). Re-seed it from the rebuilt tip before the audit
+    // below, so the pointer is never left behind the active chain.
+    if config.reindex || config.reindex_chainstate {
+        chain_state.refresh_best_header_to_tip();
+    }
+
     // Structural block-index audit (-checkblockindex): on every startup when
     // enabled (default on for regtest/CI), and crucially *after* a reindex —
     // so a reindex that rebuilt a corrupt index is caught here, before the

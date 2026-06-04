@@ -1755,6 +1755,26 @@ impl ChainState {
         self.best_header.read().0
     }
 
+    /// Ensure the in-memory `best_header` pointer is at least the active tip.
+    ///
+    /// A `--reindex` constructs `ChainState` from an empty index (the
+    /// best-header pointer is seeded at genesis), then the replay advances the
+    /// active tip *without* going through `accept_header`/`accept_block`, the
+    /// only writers of `best_header`. The pointer is therefore left behind the
+    /// rebuilt tip, which (a) makes `check_block_index` see the selection
+    /// pointer lagging the active chain and (b) leaves the node unable to
+    /// recognize it is caught up — `missing_blocks_for_best_header_chain`
+    /// returns empty until the first peer `headers` re-seeds the pointer.
+    /// Re-seed it from the rebuilt tip. A no-op when the pointer already
+    /// out-works the tip (e.g. header-only branches loaded from a kept index
+    /// under `--reindex-chainstate`), since [`update_best_header`] keeps the max.
+    pub fn refresh_best_header_to_tip(&self) {
+        let tip_hash = self.tip_hash();
+        if let Some(entry) = self.get_block_index(&tip_hash) {
+            self.update_best_header(tip_hash, entry.chainwork);
+        }
+    }
+
     /// Structural consistency audit of the on-disk block index against the
     /// active chain — satd's analogue of Bitcoin Core's `CheckBlockIndex`.
     ///
@@ -5081,6 +5101,33 @@ pub(crate) mod tests {
             err.contains("stored height 99"),
             "expected a stored-height mismatch, got: {err}"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn refresh_best_header_to_tip_clears_post_reindex_lag() {
+        let (cs, dir) = make_chain_state();
+        build_and_connect_chain(&cs, 5);
+        assert_eq!(cs.check_block_index(), Ok(5));
+
+        // Reproduce the post-`--reindex` state: the replay advances the active
+        // tip but never touches `best_header`, so the pointer is left behind at
+        // genesis. The audit must flag the selection pointer lagging the chain
+        // (this is what made every reindex integration test hang at startup).
+        let genesis = bitcoin::constants::genesis_block(cs.network);
+        *cs.best_header.write() = (genesis.block_hash(), work_for_bits(genesis.header.bits));
+        let err = cs
+            .check_block_index()
+            .expect_err("a best_header behind the active tip must fail the audit");
+        assert!(
+            err.contains("best_header"),
+            "expected a best_header lag error, got: {err}"
+        );
+
+        // The post-reindex re-seed restores the invariant.
+        cs.refresh_best_header_to_tip();
+        assert_eq!(cs.check_block_index(), Ok(5));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
