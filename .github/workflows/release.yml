@@ -675,13 +675,45 @@ jobs:
           cat *.tar.zst.sha256 *.cdx.json.sha256 | sort > SHA256SUMS
           cat SHA256SUMS
 
+      # Drive the Release body from the curated docs/release-notes/<version>.md
+      # (links rewritten to absolute blob URLs at the tag so they resolve from
+      # the release page). The auto-generated PR list is appended below it by
+      # action-gh-release's generate_release_notes. A version with no notes
+      # file (e.g. an -rcN tag) exits 3 and we fall back to auto-notes only;
+      # any other failure (empty/malformed file) aborts the release.
+      - name: Build release notes body
+        id: notes
+        run: |
+          set -euo pipefail
+          body="${RUNNER_TEMP}/RELEASE_BODY.md"
+          if contrib/release/build-release-notes.sh \
+               --repo "${GITHUB_REPOSITORY}" \
+               --tag "${GITHUB_REF_NAME}" \
+               --output "$body"; then
+            echo "Release body built from curated release notes."
+          else
+            rc=$?
+            if [ "$rc" -eq 3 ]; then
+              echo "::warning::No docs/release-notes file for ${GITHUB_REF_NAME}; using auto-generated notes only."
+              printf 'See the [CHANGELOG](https://github.com/%s/blob/%s/CHANGELOG.md) for details.\n' \
+                "${GITHUB_REPOSITORY}" "${GITHUB_REF_NAME}" > "$body"
+            else
+              echo "::error::build-release-notes.sh failed (exit ${rc})"
+              exit "$rc"
+            fi
+          fi
+          echo "body_path=${body}" >> "$GITHUB_OUTPUT"
+
       - name: Create or update GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          # Auto-generate from PR titles; we'll replace this with a
-          # CHANGELOG.md-driven body once the public-release machinery
-          # for that lands.
+          # Curated, versioned notes from docs/release-notes/ (prepended);
+          # GitHub's auto-generated PR list is appended after it.
+          body_path: ${{ steps.notes.outputs.body_path }}
           generate_release_notes: true
+          # A tag carrying a pre-release suffix (e.g. v0.1.0-rc1, v0.3.0-pre)
+          # is marked as a GitHub pre-release so it never shows as "Latest".
+          prerelease: ${{ contains(github.ref_name, '-') }}
           fail_on_unmatched_files: true
           files: |
             dist/*.tar.zst
