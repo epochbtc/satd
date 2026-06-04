@@ -16,8 +16,8 @@ means in practice for contributors.
   (Bitcoin-Core-compatible) surfaces have the strongest contract; please
   read the policy before proposing changes there.
 - **Operator-facing changes** — if a flag, default, or signal changes
-  behaviour the operator has to know about, update
-  [`OPERATOR_ERGONOMICS.md`](OPERATOR_ERGONOMICS.md) in the same PR.
+  behaviour the operator has to know about, update the operator manual
+  ([`docs/manual/`](docs/manual/src/configuration.md)) in the same PR.
 
 ## Workflow
 

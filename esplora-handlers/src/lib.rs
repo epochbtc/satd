@@ -1,9 +1,10 @@
 //! Native Esplora REST handlers, sharing satd's chainstate.
 //!
 //! Compatible with the `blockstream.info` / `mempool.space` HTTP API.
-//! See `ECOSYSTEM.md` §4 / §4a for the architectural rationale (one
-//! RocksDB instance, atomic reorg consistency, sub-millisecond index
-//! lookups). This crate ships the handlers; `satd` mounts them on a
+//! See the "Native Protocol Architecture" chapter of the operator manual
+//! (`docs/manual/src/native-protocol-surfaces.md`) for the architectural
+//! rationale (one RocksDB instance, atomic reorg consistency,
+//! sub-millisecond index lookups). This crate ships the handlers; `satd` mounts them on a
 //! configurable port behind optional cookie / userpass auth.
 //!
 //! Scope by milestone (per the Esplora plan):

@@ -361,10 +361,10 @@ jobs:
           strip "$stage/bin/satd"    || true
           strip "$stage/bin/sat-cli" || true
           strip "$stage/bin/sat-tui" || true
-          cp README.md           "$stage/README.md"
-          cp docs/PACKAGING.md   "$stage/PACKAGING.md"
-          cp CORE_DIFFERENCES.md "$stage/CORE_DIFFERENCES.md"
-          cp STABILITY_POLICY.md "$stage/STABILITY_POLICY.md"
+          cp README.md                       "$stage/README.md"
+          cp docs/manual/src/packaging.md    "$stage/PACKAGING.md"
+          cp CORE_DIFFERENCES.md             "$stage/CORE_DIFFERENCES.md"
+          cp STABILITY_POLICY.md             "$stage/STABILITY_POLICY.md"
           if [[ -f LICENSE ]]; then
             cp LICENSE "$stage/LICENSE"
           fi

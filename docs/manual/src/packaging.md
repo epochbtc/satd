@@ -5,10 +5,12 @@ This document is the authoritative reference for downstream packagers
 Homebrew, Nix). It describes file layout, signals, ports, config
 surface, runtime model, and the contract satd offers a packager.
 
-The user-facing operator guide is [`OPERATOR_ERGONOMICS.md`](../OPERATOR_ERGONOMICS.md).
-The deviation catalog vs. Bitcoin Core is in
-[`CORE_DIFFERENCES.md`](../CORE_DIFFERENCES.md). The strategic
-direction for packaging is in [`ECOSYSTEM.md`](../ECOSYSTEM.md) §2.
+The user-facing operator surfaces are documented elsewhere in this manual —
+see [Observability & Metrics](observability.md) and [Configuration, Tuning &
+Reload](configuration.md). The deviation catalog vs. Bitcoin Core is in
+[`CORE_DIFFERENCES.md`](https://github.com/epochbtc/satd/blob/master/CORE_DIFFERENCES.md).
+The not-yet-shipped ecosystem/packaging direction is tracked in
+[`ROADMAP.md`](https://github.com/epochbtc/satd/blob/master/ROADMAP.md).
 
 ## Document status
 
@@ -37,7 +39,8 @@ There are deliberately **no separate `sat-electrum` / `sat-esplora`
 companion binaries**. Both protocols are subsystems of `satd` itself,
 gated by runtime flags (`--electrum=1`, `--esplora=1`). One process,
 one RocksDB, one log stream, one PID. This is a load-bearing design
-choice — see `ECOSYSTEM.md` §4a.
+choice — see the [Native Protocol Architecture](native-protocol-surfaces.md)
+chapter.
 
 ## File layout
 
@@ -97,7 +100,8 @@ batch. This means:
 |---|---|
 | `SIGTERM` | Clean shutdown. Flush RocksDB, fsync undo files, drain mempool snapshot, close listeners. May take **up to 10 minutes** under heavy IBD load — most shutdowns are sub-second. |
 | `SIGINT` | Identical to SIGTERM. |
-| `SIGHUP` | Currently ignored (no log-reopen on signal yet — see `--logrotate=size` for size-based rotation). |
+| `SIGHUP` | Live config reload. Re-reads `bitcoin.conf` and applies the hot-reloadable subset without dropping the P2P swarm or flushing chainstate. satd logs to stdout (no `debug.log`), so `SIGHUP` is repurposed from Core's log-reopen to config reload — see [Configuration, Tuning & Reload](configuration.md#live-config-reload-sighup). |
+| `SIGUSR1` | Live TLS certificate reload. Re-reads the configured TLS leaf cert/key from disk and swaps it in atomically on every TLS surface, without restarting or dropping connections. |
 | `SIGKILL` | RocksDB recovers via WAL replay on next start. Avoid; one botched shutdown = one corrupted chainstate is the failure mode to design against. |
 
 Container supervisors should set a **stop grace period of at least 10
@@ -147,9 +151,10 @@ Two files are accepted, both with Bitcoin Core's `key=value` /
 Resolution order: `--conf=<path>` if given, else `<datadir>/bitcoin.conf`,
 else `<datadir>/satd.conf`. CLI flags always win over file values.
 
-The full flag matrix is in `OPERATOR_ERGONOMICS.md`. The
-container ships a sensible mainnet-loopback default; everything is
-overridable via `-e SATD_*` … see "Container" below.
+The full flag matrix is in [Configuration, Tuning &
+Reload](configuration.md). The container ships a sensible
+mainnet-loopback default; everything is overridable via `-e SATD_*` …
+see "Container" below.
 
 ## Container
 
@@ -204,8 +209,8 @@ docker pull ghcr.io/epochbtc/satd:0.1.0
 docker pull ghcr.io/epochbtc/satd:latest
 ```
 
-Signing of these images (cosign keyless OIDC, attested to Rekor) ships
-in PR-3 of the packaging stack.
+These images are signed with cosign keyless OIDC, attested to the Rekor
+transparency log (verifier command under "Signed releases" below).
 
 ## systemd
 
@@ -519,7 +524,7 @@ The release workflow is triggered on tag pushes (`v*`) and manual triggers (`wor
 ### Signed releases
 
 Three independent signing surfaces. Verifier commands and key custody
-details live in [`SECURITY.md`](../SECURITY.md).
+details live in [`SECURITY.md`](https://github.com/epochbtc/satd/blob/master/SECURITY.md).
 
 - **Tarballs — minisign Ed25519.** Each `.tar.zst` ships with a
   detached `.minisig`. Pubkeys (primary + cold spare) in `SECURITY.md`.

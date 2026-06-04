@@ -9,8 +9,9 @@
 //! lives outside the index proper (raw tx bytes, block headers by
 //! height, merkle proofs, txid-by-position).
 //!
-//! See `ECOSYSTEM.md` §4 / §4a for the architectural rationale (single
-//! binary, native, shared chainstate). The `node-index` crate's
+//! See the "Native Protocol Architecture" chapter of the operator manual
+//! (`docs/manual/src/native-protocol-surfaces.md`) for the architectural
+//! rationale (single binary, native, shared chainstate). The `node-index` crate's
 //! module-level docs describe the trait surface this protocol crate
 //! consumes.
 //!

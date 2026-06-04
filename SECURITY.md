@@ -179,13 +179,13 @@ Each release ships CycloneDX 1.5 JSON SBOMs for every shipped binary
 (`satd-v<version>.cdx.json`, `sat-cli-v<version>.cdx.json`). The SBOMs
 are signed with the same minisign primary key as the tarballs and
 verify with the same recipe — see
-[`docs/PACKAGING.md`](docs/PACKAGING.md) §"Software Bill of Materials".
+[`docs/manual/src/packaging.md`](docs/manual/src/packaging.md) §"Software Bill of Materials".
 
 Supply-chain enforcement runs as a `cargo-deny` gate against the
 RustSec advisory database. The policy is in `deny.toml` at the repo
 root; it runs on every dep-graph-touching PR and as a hard
 precondition for every release artifact (tag-time enforcement) — see
-`docs/PACKAGING.md` §"Supply-chain policy".
+`docs/manual/src/packaging.md` §"Supply-chain policy".
 
 ## Threat model — what these signatures do and don't prove
 
@@ -200,7 +200,7 @@ precondition for every release artifact (tag-time enforcement) — see
 - That the published tarball binary matches a third-party rebuild
   of the same source. The `Nix` workflow gives independent
   verification on the `nix build` path (two-runner byte-identical
-  check, see `docs/PACKAGING.md` §"Reproducible build via Nix" and
+  check, see `docs/manual/src/packaging.md` §"Reproducible build via Nix" and
   `contrib/repro/diff-build.sh` for offline reproduction). Aligning
   the rustup-stable tarball binary against the Nix output bit-for-bit
   is a v1.x follow-up.
@@ -212,4 +212,4 @@ precondition for every release artifact (tag-time enforcement) — see
 
 For high-assurance deployments, combine the signature checks above
 with the reproducible-build verification described in
-[`docs/PACKAGING.md`](docs/PACKAGING.md) §"Reproducible build via Nix".
+[`docs/manual/src/packaging.md`](docs/manual/src/packaging.md) §"Reproducible build via Nix".

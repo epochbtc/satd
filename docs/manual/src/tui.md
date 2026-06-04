@@ -7,7 +7,7 @@ TUI. Bitcoin Core has no equivalent shipped surface.
 
 This document is the reference for what the TUI shows. It is not a
 walkthrough; for "what should I look at first" guidance, see
-[`OPERATOR_ERGONOMICS.md`](../OPERATOR_ERGONOMICS.md).
+[Observability & Metrics](observability.md).
 
 ## Running
 
@@ -441,11 +441,11 @@ polling.
 
 ## See also
 
-- [`OPERATOR_ERGONOMICS.md`](../OPERATOR_ERGONOMICS.md) — broader
-  operator guide covering CLI, RPC, observability, and tuning.
-- [`CORE_DIFFERENCES.md`](../CORE_DIFFERENCES.md) — what satd does
+- [Observability & Metrics](observability.md) and [Configuration, Tuning &
+  Reload](configuration.md) — the broader operator surfaces (CLI, RPC,
+  observability, tuning).
+- [`CORE_DIFFERENCES.md`](https://github.com/epochbtc/satd/blob/master/CORE_DIFFERENCES.md) — what satd does
   differently from Bitcoin Core.
-- [`docs/api/esplora.md`](api/esplora.md) — Esplora REST endpoint
-  reference.
+- [Esplora REST API](esplora.md) — Esplora REST endpoint reference.
 - `sat-cli help` — every JSON-RPC method exposed by satd, including the
   ones the TUI uses.

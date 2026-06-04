@@ -1,6 +1,8 @@
 //! Address-history index — funding and spending rows keyed by
 //! `sha256(scriptPubKey)`. Backs the operator-facing RPCs and the
-//! native Electrum / Esplora subsystems described in `ECOSYSTEM.md`.
+//! native Electrum / Esplora subsystems described in the operator manual's
+//! "Native Protocol Architecture" chapter
+//! (`docs/manual/src/native-protocol-surfaces.md`).
 //!
 //! Pure types (the `AddressIndex` trait, key/row codec, `BackfillCursor`,
 //! `AddressIndexConfig`, error types, `SubscriptionRegistry`) live in

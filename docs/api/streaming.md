@@ -633,5 +633,5 @@ settle them ahead of any `v1` freeze:
 ---
 
 *Cross-reference: [`ROADMAP.md`](../../ROADMAP.md) (strategic framing),
-[`docs/api/esplora.md`](./esplora.md) (the surface this consolidates beyond),
+[Esplora REST API](../manual/src/esplora.md) (the surface this consolidates beyond),
 [`CHANGELOG.md`](../../CHANGELOG.md) (user-facing summary).*

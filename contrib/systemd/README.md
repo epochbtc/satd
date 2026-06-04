@@ -12,7 +12,7 @@ Two units ship here:
 
 See the comment block at the top of each unit file for install steps.
 The user-facing operator guide lives in
-[`docs/PACKAGING.md`](../../docs/PACKAGING.md).
+[`docs/manual/src/packaging.md`](../../docs/manual/src/packaging.md).
 
 ## Lifecycle behaviour
 

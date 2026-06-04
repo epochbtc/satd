@@ -72,7 +72,7 @@ cargo build -p satd --no-default-features
 ```sh
 nix build .#satd     # produces ./result/bin/{satd, sat-cli}
 ```
-*See `docs/PACKAGING.md` §"Reproducible build via Nix" for the full story.*
+*See `docs/manual/src/packaging.md` §"Reproducible build via Nix" for the full story.*
 
 ### Running
 
@@ -106,7 +106,7 @@ Bundled `--profile=<preset>` selects from `archival`, `pruned-home`, `mining`, `
 
 Authentication uses a cookie file (default) or `--rpcuser` / `--rpcpassword`. The Esplora listener defaults to **unauthenticated loopback**; for non-loopback exposure, set `--esploraauth=cookie` or `--esploraauth=userpass`.
 
-*See `OPERATOR_ERGONOMICS.md` for the full flag matrix and tuning notes.*
+*See the [Operator Manual](docs/manual/src/introduction.md) for the full flag matrix and tuning notes.*
 
 ---
 
@@ -133,13 +133,11 @@ docs/                         API + integration docs
 | File | Purpose |
 |---|---|
 | [`MANIFESTO.md`](MANIFESTO.md) | Node Sovereignty, the monoculture risk, and the conservative BIP policy. |
+| [**Operator Manual**](docs/manual/src/introduction.md) | mdbook reference for operators, integrators, and packagers: observability, configuration & live reload, integrator APIs, the `sat-tui`, the Esplora REST and streaming APIs, the native protocol-surface architecture, and packaging. Rendered at <https://epochbtc.github.io/satd/>. |
 | `CORE_DIFFERENCES.md` | Catalog of intentional deviations from Bitcoin Core: native surfaces, exclusions, and behavioral defaults. |
-| `OPERATOR_ERGONOMICS.md` | Operator-facing flag matrix, tuning, every shipped surface. |
 | `STABILITY_POLICY.md` | Tiered stability contract; deprecation policy; canary CI. |
-| `ECOSYSTEM.md` | Mobile / packaging strategy; why native + shared chainstate. |
-| `docs/PACKAGING.md` | Authoritative reference for downstream packagers. |
-| `docs/TUI.md` | `sat-tui` reference: views, panels, every field, keybindings. |
-| `docs/api/esplora.md` | Esplora REST endpoint reference + wire-shape gotchas. |
+| [`ROADMAP.md`](ROADMAP.md) | Upcoming operator features and the ecosystem / mobile-integration strategy (unshipped, tagged by likelihood). |
+| `docs/api/streaming.md` | Streaming Consumption API — authoritative wire-level protocol spec. |
 | `docs/E2E_TESTING.md` | End-to-end suite: how to run, timeout knobs, flake-gate workflow. |
 
 ## License

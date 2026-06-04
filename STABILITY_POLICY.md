@@ -126,7 +126,7 @@ The canaries above run on `.github/workflows/canary.yml`, triggered on `pull_req
 
 Listed for traceability; each will enter PR-gating on the same terms when its prerequisites are met:
 
-- **Umbrel app**: install the satd Umbrel app on an Umbrel dev image; verify the dashboard reports the node as healthy. Blocked on shipping the satd Umbrel app first (`ECOSYSTEM.md` §6).
+- **Umbrel app**: install the satd Umbrel app on an Umbrel dev image; verify the dashboard reports the node as healthy. Blocked on shipping the satd Umbrel app first (see `ROADMAP.md` → "Ecosystem & Mobile Integration").
 
 ### Failure triage
 
