@@ -10,6 +10,13 @@
 // `docs/E2E_TESTING.md`.
 
 mod common;
+// Streaming Consumption API E2E tests (gRPC / WebSocket / SSE), folded into
+// the `e2e` target so they run in the single "Run E2E suite" CI step under
+// `--features e2e` rather than incidentally via `cargo test --all`. The file
+// lives in `tests/e2e/` (an explicit `#[path]`) so Cargo doesn't also
+// auto-discover it as a separate top-level integration target.
+#[path = "e2e/streaming.rs"]
+mod streaming;
 
 use common::{
     DeterministicWallet, TestNode, build_signed_p2wpkh_spend_from_block1_coinbase,

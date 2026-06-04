@@ -80,7 +80,8 @@ hex = { workspace = true }
 base64 = { workspace = true }
 tempfile = "3"
 rcgen = { workspace = true }
-# Streaming E2E harness (tests/streaming.rs): a real gRPC client (tonic,
+# Streaming E2E harness (tests/e2e/streaming.rs, folded into the `e2e` test
+# target): a real gRPC client (tonic,
 # pinned to the workspace version so it matches the `satd_events::proto`
 # generated service client) and a real WebSocket client. `default-features
 # = false` on tokio-tungstenite drops the TLS connectors — the suite speaks

@@ -17,14 +17,14 @@
 // `tokio::task::spawn_blocking`, because `reqwest::blocking` panics if called
 // directly on a tokio worker thread.
 
-mod common;
-
-use common::grpc_client::{
+// `common` is owned by the `e2e` test crate root (`tests/e2e.rs`); this file
+// is folded in as `mod streaming;` there, so reach it via `crate::common`.
+use crate::common::grpc_client::{
     add_outpoints, add_script_prefixes, add_scripts, add_transactions, next_event_matching,
     next_event_opt, remove_outpoints, Body, Control, Cursor, GrpcStreamClient, SubscribeControl,
 };
-use common::ws_client::{StreamSseClient, WsClient};
-use common::{
+use crate::common::ws_client::{StreamSseClient, WsClient};
+use crate::common::{
     block1_coinbase_txid, build_signed_p2wpkh_spend_from_block1_coinbase,
     build_signed_p2wpkh_spend_seq, display_to_internal_hex, scripthash_hex, script_prefix_hex,
     write_authfile, DeterministicWallet, StreamingNode, TokenSpec,
@@ -839,7 +839,7 @@ async fn ws_from_cursor_replays_then_live() {
     let sn = start_streaming_async(vec![]).await;
     mine_n(&sn, 5).await;
 
-    let mut ws = common::ws_client::WsClient::connect_query(sn.ws_port(), "?from_height=2").await;
+    let mut ws = crate::common::ws_client::WsClient::connect_query(sn.ws_port(), "?from_height=2").await;
     let mut heights = Vec::new();
     for _ in 0..3 {
         let ev = ws
@@ -1075,11 +1075,11 @@ async fn ws_auth_matrix() {
     let port = sn.ws_port();
 
     assert!(
-        common::ws_client::WsClient::try_connect(port, None).await.is_err(),
+        crate::common::ws_client::WsClient::try_connect(port, None).await.is_err(),
         "anon ws upgrade rejected"
     );
     assert!(
-        common::ws_client::WsClient::try_connect(port, Some("tok-ws"))
+        crate::common::ws_client::WsClient::try_connect(port, Some("tok-ws"))
             .await
             .is_ok(),
         "valid token ws upgrade accepted"
@@ -1101,10 +1101,10 @@ async fn ws_max_conns_refuses_second() {
     .await;
     let port = sn.ws_port();
     // Hold the only slot.
-    let _held = common::ws_client::WsClient::connect(port).await;
+    let _held = crate::common::ws_client::WsClient::connect(port).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     // Second connection refused (503 → handshake error).
-    let second = common::ws_client::WsClient::try_connect(port, None).await;
+    let second = crate::common::ws_client::WsClient::try_connect(port, None).await;
     assert!(second.is_err(), "second ws connection over the cap is refused");
 }
 
