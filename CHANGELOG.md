@@ -12,7 +12,7 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
 ## [Unreleased] → 0.3.0
 
 In-progress; full detail tracked in
-[`docs/release-notes/0.3.0.md`](docs/release-notes/0.3.0.md).
+[`docs/release-notes/0.3.0-pre.md`](docs/release-notes/0.3.0-pre.md).
 
 - **Consensus** — six block-level rules brought to Bitcoin Core parity (sigop
   cost, BIP30, future-timestamp, block-version gate, merkle-mutation

@@ -16,7 +16,7 @@ The split is deliberate:
 
 | File | Release | Status |
 |---|---|---|
-| [`0.3.0.md`](0.3.0.md) | 0.3.0 | Pre-release (in progress) |
+| [`0.3.0-pre.md`](0.3.0-pre.md) | 0.3.0 | Pre-release (in progress) |
 | [`0.2.1.md`](0.2.1.md) | 0.2.1 | Released 2026-05-29 |
 | [`0.2.0.md`](0.2.0.md) | 0.2.0 | Released 2026-05-27 |
 | [`0.1.0.md`](0.1.0.md) | 0.1.0 | Released 2026-05-08 (first public release) |
@@ -26,8 +26,10 @@ release** so the structure stays consistent.
 
 ## Conventions
 
-- One file per release, named for the version (`0.3.0.md`), present and edited
-  in-tree as a pre-release file while the version is in development.
+- One file per release, named for the version. While a version is in
+  development its file carries a `-pre` suffix (`0.3.0-pre.md`) to make explicit
+  it is not yet released; the suffix is dropped (`0.3.0.md`) when the release is
+  tagged.
 - Every file opens with a one-paragraph overview and a **Highlights** list,
   then category sections (Consensus, RPC, P2P, Operator, Packaging, …),
   an **Upgrade notes** section for anything breaking or requiring operator
@@ -35,6 +37,7 @@ release** so the structure stays consistent.
   license and the governing policies.
 - Notes are written for a reader who was *not* following development: explain
   the "why", the default/compat posture, and the operator-visible behavior.
-- When a release tags, flip its line in the table above from pre-release to
-  "Released YYYY-MM-DD", update the date in the file header, and add the dated
-  entry + compare link to `CHANGELOG.md`.
+- When a release tags, rename its file to drop the `-pre` suffix
+  (`0.3.0-pre.md` → `0.3.0.md`), flip its line in the table above from
+  pre-release to "Released YYYY-MM-DD", update the date in the file header, and
+  add the dated entry + compare link to `CHANGELOG.md`.

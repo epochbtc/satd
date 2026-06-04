@@ -2,7 +2,9 @@
 
 > Released YYYY-MM-DD · git tag [`v<VERSION>`](https://github.com/epochbtc/satd/releases/tag/v<VERSION>) · [Changelog](../../CHANGELOG.md)
 >
-> _(While in development, replace the date with "Pre-release — in progress".)_
+> _(While in development, name the file `<VERSION>-pre.md` and replace the date
+> with "Pre-release — in progress"; drop the `-pre` suffix and fill in the date
+> + tag link when the release is cut.)_
 
 <One- or two-paragraph overview: what this release is about, who should care,
 and whether it carries any breaking changes or required operator action.>
