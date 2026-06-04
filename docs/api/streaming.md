@@ -118,6 +118,7 @@ message NodeEvent {
     TxidUnconfirmed txid_unconfirmed = 20;  // txid lifecycle: reorg rollback (§7.4)
     TxidDepthReached txid_depth_reached = 21;  // depth alarm, single-shot (§7.4)
     TxidFinalized txid_finalized = 22;  // lifecycle auto-close, terminal (§7.4)
+    PrefixMatched prefix_matched = 23;  // privacy-preserving prefix watch (§7.5)
   }
 }
 ```
@@ -598,9 +599,14 @@ settle them ahead of any `v1` freeze:
 
 - **Anchor consumer.** Which downstream integrator co-designs the surface before a
   `v1` freeze. The wire shapes here are a working contract, not yet a commitment.
-- **Standardization path.** Whether and when to lift this into an open, BIP-style,
-  transport-agnostic spec with a second implementation (e.g. a bitcoind sidecar) —
-  a governance step deferred until the shape is proven.
+- **Stability commitment.** When to freeze the wire surface as a committed `v1` for
+  satd consumers. This API is a deliberate satd differentiator — a native,
+  in-process consensus stream (first-class reorgs, cursor-resumable matches, mempool
+  coverage) that an out-of-process sidecar over Core's ZMQ structurally cannot match
+  (§8). The goal is a stable *satd* contract that pulls integrators onto the node
+  itself, not a lowest-common-denominator cross-node specification that would
+  commoditize the advantage away. Any broader standardization is a downstream
+  governance question, explicitly not a design goal for this surface.
 - **Cursor opacity.** Whether to keep `(height, tx_index, mempool_seq,
   instance_id)` as structured, debuggable fields (current design) or move to an
   opaque token that is future-proof against cursor-format changes.
