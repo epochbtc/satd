@@ -282,8 +282,13 @@ spending transaction does not carry the prevout's `scriptPubKey` — so for a
 connected block it is recovered from the block's **undo data**
 (`Store::get_undo` → `spent_coins[i].script_pubkey`, the i-th non-coinbase input's
 prevout). This is a single cached point-get per block, paid only when a script is
-actually watched. Unconfirmed spends are tracked by watching the funding
-**outpoint**, which `OutpointSpent` detects in the mempool.
+actually watched. The **mempool** input side is its unconfirmed twin: the spending
+tx still carries no prevout `scriptPubKey`, so it is recovered from the prevout
+scripthashes the mempool entry retains at admission (where the prevouts were already
+resolved for validation), yielding `ScriptMatched{is_output = false, confirmed =
+false}` without re-resolving anything off the hot path. Watching the funding
+**outpoint** also surfaces the spend (via `OutpointSpent`); the script path means a
+script watcher need not separately enumerate its outpoints to see unconfirmed spends.
 
 ### 7.3 Bidirectional control channel
 
@@ -412,12 +417,13 @@ single bucket catches both funding and spending of a script, exactly as §7.2's
 `ScriptMatched` does for exact scripts. It reuses the same resolution machinery: the
 output side is the scripthash `scan_tx` already computes; the **confirmed** input
 side is the prevout script `scan_block_spent_scripts` already recovers from a block's
-undo data. The **mempool** input side is the one piece the exact watches do not
-have — they delegate unconfirmed spend detection to outpoint watches (§7.2), a
-fallback a privacy client *cannot* use without naming the very outpoints it is
-hiding — so a prefix subscription resolves it from the prevout scripthashes retained
-on the mempool entry at admission, where the prevouts are already resolved for
-validation. Each resolved scripthash is truncated to the registered prefix lengths
+undo data; the **mempool** input side is resolved from the prevout scripthashes the
+mempool entry retains at admission (the prevouts are already resolved there for
+validation). That retained-hash mempool-spend path is shared with the exact-script
+watch (§7.2) — the prefix watch is what *motivated* it, because the alternative
+unconfirmed-spend signal, an outpoint watch, is a fallback a privacy client *cannot*
+use without naming the very outpoints it is hiding. Each resolved scripthash is
+truncated to the registered prefix lengths
 and looked up in a parallel `by_prefix` index (keyed `(bits, prefix)`, gated by a
 lock-free `has_prefix_watchers()` like every other watch kind). The per-output cost
 is O(distinct prefix lengths in use) — a `BTreeSet` of active `k` values, typically
