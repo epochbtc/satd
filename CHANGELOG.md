@@ -335,8 +335,10 @@ All additions are opt-in; the wire schema is `v1`. See `docs/api/streaming.md`.
   it can immediately re-subscribe `from_cursor` and recover the gap.
 - **Live watch registry.** A subscription can register, and rotate at runtime,
   a watch-set of **outpoints** (spend detection, mempool + confirmed),
-  **scripts** (funding and, via block undo data, spending), **descriptors**
-  (server-side rust-miniscript expansion over a bounded window), and
+  **scripts** (funding, and spending both in confirmed blocks via undo data and
+  in the mempool via prevout scripthashes retained at admission, so a watched
+  script's unconfirmed spend is seen without also watching the outpoint),
+  **descriptors** (server-side rust-miniscript expansion over a bounded window), and
   **transaction ids** — matched with O(1) inverted indexes that cost a node with
   no watchers nothing. Each watch item charges one unit of an optional per-token
   quota with cross-message de-duplication and per-remove release.

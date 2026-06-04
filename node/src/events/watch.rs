@@ -658,48 +658,79 @@ impl WatchRegistry {
         scan_tx(&inner, tx, false, None);
     }
 
-    /// Mempool **spend-side** prefix matching: the unconfirmed analogue of
-    /// [`scan_block_spent_scripts`]'s prefix path. Fires a watched bucket when
-    /// an accepted mempool tx spends a prevout whose `scriptPubKey` hashes into
-    /// it. The spending tx carries no prevout script, so the caller supplies the
-    /// prevout scripthashes (`prev_scripthashes[i]` ↔ `tx.input[i]`), retained on
-    /// the [`MempoolEntry`](crate::mempool::pool::MempoolEntry) at admission.
+    /// Mempool **spend-side** script matching: the unconfirmed analogue of
+    /// [`scan_block_spent_scripts`]. Fires when an accepted mempool tx spends a
+    /// prevout whose `scriptPubKey` is **exactly watched** (`by_scripthash` →
+    /// `ScriptMatched{is_output:false}`) or **hashes into a watched prefix
+    /// bucket** (`by_prefix` → `PrefixMatched`). The spending tx carries no
+    /// prevout script, so the caller supplies the prevout scripthashes
+    /// (`prev_scripthashes[i]` ↔ `tx.input[i]`), retained on the
+    /// [`MempoolEntry`](crate::mempool::pool::MempoolEntry) at admission.
     ///
-    /// **Hash-only delivery:** the emitted `matched_prevouts` carry the spent
-    /// outpoint with an *empty* script — only the hash is retained, so the
-    /// client resolves the prevout from its own UTXO set (a privacy client that
-    /// can't name the outpoint to a server still tracks its own funding). The
-    /// confirmed path keeps full prevout scripts (from undo). Funding-side
-    /// prefix matches and all exact-script/outpoint/txid matches are handled by
+    /// This closes the one spend-detection gap in the script/prefix watches:
+    /// without it an *unconfirmed* spend of a watched script is observable only
+    /// by *also* watching the funding outpoint (which a privacy/prefix client
+    /// cannot name without leaking it). The confirmed side comes from block undo
+    /// data; this is its mempool twin, off the same retained hashes.
+    ///
+    /// Exact `ScriptMatched` carries the watched scripthash (which the client
+    /// already knows), so it is fully self-describing. Prefix delivery stays
+    /// **hash-only**: `matched_prevouts` carry the spent outpoint with an *empty*
+    /// script (the client resolves the prevout from its own UTXO set); the
+    /// confirmed path keeps full prevout scripts. Funding-side matches and all
+    /// outpoint/txid matches are handled by
     /// [`scan_mempool_tx`](Self::scan_mempool_tx); call both per accepted tx.
     ///
-    /// Self-gates on [`has_prefix_watchers`](Self::has_prefix_watchers): a no-op
-    /// (and no serialization) unless some prefix bucket is live, so the per-input
+    /// Self-gates on [`has_script_watchers`](Self::has_script_watchers) /
+    /// [`has_prefix_watchers`](Self::has_prefix_watchers): a no-op (and no
+    /// serialization) unless some spend-side watch is live, so the per-input
     /// scripthash retention on every entry is harmless when unused.
-    pub fn scan_mempool_spent_prefixes(&self, tx: &Transaction, prev_scripthashes: &[Scripthash]) {
-        if !self.has_prefix_watchers() {
+    pub fn scan_mempool_spent_scripts(&self, tx: &Transaction, prev_scripthashes: &[Scripthash]) {
+        if !self.has_script_watchers() && !self.has_prefix_watchers() {
             return;
         }
         let inner = self.read_inner();
-        if inner.prefix_lens.is_empty() {
+        let scan_scripts = !inner.by_scripthash.is_empty();
+        let scan_prefixes = !inner.prefix_lens.is_empty();
+        if !scan_scripts && !scan_prefixes {
             return;
         }
-        // Aggregate per bucket across this tx's inputs: all matched prevouts for
-        // a bucket ride one PrefixMatched (one full-tx body), mirroring the
-        // confirmed undo path. `zip` aligns each input with its prevout hash and
-        // tolerates a short/empty slice (delivers nothing rather than misalign).
+        let txid = tx.compute_txid();
+        // Prefix matches are aggregated per bucket across this tx's inputs (one
+        // PrefixMatched per bucket, mirroring the confirmed undo path); exact
+        // matches fire per input. `zip` aligns each input with its prevout hash
+        // and tolerates a short/empty slice (delivers nothing rather than
+        // misalign); `enumerate` over the zip yields the input index (1:1).
         let mut prefix_spends: HashMap<(u8, u32), Vec<(OutPoint, ScriptBuf)>> = HashMap::new();
-        for (input, sh) in tx.input.iter().zip(prev_scripthashes.iter()) {
-            let top = prefix_top32(sh);
-            for &bits in inner.prefix_lens.keys() {
-                let key = (bits, top & prefix_mask(bits));
-                if inner.by_prefix.contains_key(&key) {
-                    // Hash-only: outpoint is known (from the spending tx), prevout
-                    // script is not retained, so deliver an empty script.
-                    prefix_spends
-                        .entry(key)
-                        .or_default()
-                        .push((input.previous_output, ScriptBuf::new()));
+        for (vin, (input, sh)) in tx.input.iter().zip(prev_scripthashes.iter()).enumerate() {
+            if scan_scripts
+                && let Some(subs) = inner.by_scripthash.get(sh)
+            {
+                let m = WatchMatch::ScriptMatched {
+                    scripthash: *sh,
+                    txid,
+                    is_output: false,
+                    index: vin as u32,
+                    confirmed: false,
+                    height: None,
+                };
+                for sid in subs {
+                    deliver(&inner, *sid, &m);
+                }
+            }
+            if scan_prefixes {
+                let top = prefix_top32(sh);
+                for &bits in inner.prefix_lens.keys() {
+                    let key = (bits, top & prefix_mask(bits));
+                    if inner.by_prefix.contains_key(&key) {
+                        // Hash-only: outpoint is known (from the spending tx),
+                        // prevout script is not retained, so deliver an empty
+                        // script.
+                        prefix_spends
+                            .entry(key)
+                            .or_default()
+                            .push((input.previous_output, ScriptBuf::new()));
+                    }
                 }
             }
         }
@@ -1607,12 +1638,12 @@ pub async fn run_watch_matcher(
                         && let Some(entry) = mempool.get(&txid)
                     {
                         registry.scan_mempool_tx(&entry.tx);
-                        // Mempool spend-side prefix matching (unconfirmed
+                        // Mempool spend-side script + prefix matching (unconfirmed
                         // analogue of the undo-driven confirmed path). Uses the
                         // prevout scripthashes retained on the entry; self-gates
-                        // on has_prefix_watchers() so it's free when no prefix
-                        // bucket is live.
-                        registry.scan_mempool_spent_prefixes(&entry.tx, &entry.prev_scripthashes);
+                        // on has_script_watchers()/has_prefix_watchers() so it's
+                        // free when no spend-side watch is live.
+                        registry.scan_mempool_spent_scripts(&entry.tx, &entry.prev_scripthashes);
                     }
                 }
                 // Lifecycle: RBF replacement and policy eviction route to any
@@ -2767,7 +2798,7 @@ mod tests {
 
         let op = outpoint(0xaa, 3);
         let tx = spending_tx(op);
-        reg.scan_mempool_spent_prefixes(&tx, &[sh]);
+        reg.scan_mempool_spent_scripts(&tx, &[sh]);
 
         match rx.try_recv().expect("mempool spend-side prefix match") {
             WatchMatch::PrefixMatched(pm) => {
@@ -2798,7 +2829,7 @@ mod tests {
 
         // A spend whose prevout hashes into a different 16-bit bucket.
         let other = scripthash_of(&ScriptBuf::from(vec![0x53, 0x54, 0x55]));
-        reg.scan_mempool_spent_prefixes(&spending_tx(outpoint(0xbb, 0)), &[other]);
+        reg.scan_mempool_spent_scripts(&spending_tx(outpoint(0xbb, 0)), &[other]);
         assert!(rx.try_recv().is_err(), "prevout outside the bucket must not match");
     }
 
@@ -2813,7 +2844,7 @@ mod tests {
         assert!(reg.has_watchers() && !reg.has_prefix_watchers());
 
         let spent_spk = ScriptBuf::from(vec![0x52]);
-        reg.scan_mempool_spent_prefixes(
+        reg.scan_mempool_spent_scripts(
             &spending_tx(outpoint(0xaa, 3)),
             &[scripthash_of(&spent_spk)],
         );
@@ -2842,7 +2873,7 @@ mod tests {
             output: vec![],
         };
         // Both inputs spend the same script → same bucket (input-aligned hashes).
-        reg.scan_mempool_spent_prefixes(&tx, &[sh, sh]);
+        reg.scan_mempool_spent_scripts(&tx, &[sh, sh]);
 
         match rx.try_recv().expect("one aggregated mempool spend match") {
             WatchMatch::PrefixMatched(pm) => {
@@ -2885,7 +2916,7 @@ mod tests {
             ],
             output: vec![],
         };
-        reg.scan_mempool_spent_prefixes(&tx, &[sh_a, sh_b]);
+        reg.scan_mempool_spent_scripts(&tx, &[sh_a, sh_b]);
 
         // Collect both events and map each bucket to the single outpoint it carries.
         let mut by_bucket: std::collections::HashMap<(u8, u32), Vec<OutPoint>> =
@@ -2898,5 +2929,132 @@ mod tests {
         assert_eq!(by_bucket.len(), 2, "one event per distinct bucket");
         assert_eq!(by_bucket.get(&ba), Some(&vec![op_a]), "bucket A carries only its prevout");
         assert_eq!(by_bucket.get(&bb), Some(&vec![op_b]), "bucket B carries only its prevout");
+    }
+
+    #[test]
+    fn exact_script_spend_match_mempool() {
+        // The exact-`AddScripts` mempool spend side: a watched script's prior
+        // output spent in the mempool fires ScriptMatched{is_output:false,
+        // confirmed:false} — the unconfirmed twin of the undo-driven confirmed
+        // path, off the same retained prevout scripthashes. Previously a watched
+        // script saw mempool spends only via a separate outpoint watch.
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let spent_spk = ScriptBuf::from(vec![0x52]);
+        let sh = scripthash_of(&spent_spk);
+        assert_eq!(handle.add_scripthashes(&[sh]), 1);
+        assert!(reg.has_script_watchers());
+
+        let op = outpoint(0xaa, 3);
+        reg.scan_mempool_spent_scripts(&spending_tx(op), &[sh]);
+
+        match rx.try_recv().expect("mempool exact-script spend match") {
+            WatchMatch::ScriptMatched {
+                scripthash,
+                is_output,
+                index,
+                confirmed,
+                height,
+                ..
+            } => {
+                assert_eq!(scripthash, sh);
+                assert!(!is_output, "spend side");
+                assert_eq!(index, 0, "input index");
+                assert!(!confirmed, "mempool spend is unconfirmed");
+                assert_eq!(height, None);
+            }
+            other => panic!("wrong match: {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "exactly one spend match");
+    }
+
+    #[test]
+    fn exact_script_spend_multi_input_reports_correct_vin() {
+        // A multi-input tx where a non-zero input spends the watched script must
+        // report that input's index as `vin`, proving the enumerate-over-zip
+        // index is the true input position (not a match counter).
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let watched_spk = ScriptBuf::from(vec![0x52]);
+        let watched = scripthash_of(&watched_spk);
+        let other = scripthash_of(&ScriptBuf::from(vec![0x99, 0x98]));
+        handle.add_scripthashes(&[watched]);
+
+        // Three inputs; only input index 2 spends the watched script.
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![
+                TxIn { previous_output: outpoint(0xa0, 0), script_sig: ScriptBuf::new(), sequence: Sequence::MAX, witness: Witness::new() },
+                TxIn { previous_output: outpoint(0xa1, 1), script_sig: ScriptBuf::new(), sequence: Sequence::MAX, witness: Witness::new() },
+                TxIn { previous_output: outpoint(0xa2, 2), script_sig: ScriptBuf::new(), sequence: Sequence::MAX, witness: Witness::new() },
+            ],
+            output: vec![],
+        };
+        // prev_scripthashes aligned to inputs: only index 2 is the watched hash.
+        reg.scan_mempool_spent_scripts(&tx, &[other, other, watched]);
+
+        match rx.try_recv().expect("the matching input fires") {
+            WatchMatch::ScriptMatched { scripthash, is_output, index, confirmed, .. } => {
+                assert_eq!(scripthash, watched);
+                assert!(!is_output);
+                assert_eq!(index, 2, "vin is the true input index, not a match counter");
+                assert!(!confirmed);
+            }
+            other => panic!("wrong match: {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "only the watched input matches");
+    }
+
+    #[test]
+    fn exact_script_spend_no_match_outside_watch() {
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        handle.add_scripthashes(&[scripthash_of(&ScriptBuf::from(vec![0x52]))]);
+        // A spend of a different (unwatched) prevout script.
+        let other = scripthash_of(&ScriptBuf::from(vec![0x53, 0x54]));
+        reg.scan_mempool_spent_scripts(&spending_tx(outpoint(0xbb, 0)), &[other]);
+        assert!(rx.try_recv().is_err(), "unwatched prevout script must not match");
+    }
+
+    #[test]
+    fn mempool_spend_side_noop_without_any_spend_watcher() {
+        // With neither an exact-script nor a prefix watcher live, the spend-side
+        // scan is a no-op (and never serializes), even with an outpoint watcher
+        // present — the per-entry hash retention stays harmless.
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        handle.add_outpoints(&[outpoint(0xaa, 3)]);
+        assert!(!reg.has_script_watchers() && !reg.has_prefix_watchers());
+        reg.scan_mempool_spent_scripts(
+            &spending_tx(outpoint(0xaa, 3)),
+            &[scripthash_of(&ScriptBuf::from(vec![0x52]))],
+        );
+        assert!(rx.try_recv().is_err(), "no spend-side watcher → no spend-side delivery");
+    }
+
+    #[test]
+    fn exact_and_prefix_spend_both_fire_mempool() {
+        // One prevout that is BOTH exactly watched and inside a watched bucket
+        // fires both an exact ScriptMatched and a PrefixMatched — independent
+        // watch items, per-side emission consistent with the confirmed path.
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let spent_spk = ScriptBuf::from(vec![0x52]);
+        let sh = scripthash_of(&spent_spk);
+        handle.add_scripthashes(&[sh]);
+        handle.add_prefixes(&[bucket(&sh, 12)]);
+
+        reg.scan_mempool_spent_scripts(&spending_tx(outpoint(0xaa, 3)), &[sh]);
+
+        let (mut exact, mut prefix) = (0, 0);
+        while let Ok(m) = rx.try_recv() {
+            match m {
+                WatchMatch::ScriptMatched { is_output: false, confirmed: false, .. } => exact += 1,
+                WatchMatch::PrefixMatched(pm) if !pm.confirmed => prefix += 1,
+                other => panic!("unexpected match: {other:?}"),
+            }
+        }
+        assert_eq!((exact, prefix), (1, 1), "one exact + one prefix spend match");
     }
 }
