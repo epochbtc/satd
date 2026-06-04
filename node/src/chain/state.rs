@@ -103,6 +103,10 @@ pub enum ChainError {
     Disconnect(#[from] disconnect::DisconnectError),
     #[error("snapshot load failed: {0}")]
     Snapshot(String),
+    #[error("block not found")]
+    BlockNotFound,
+    #[error("{0}")]
+    InvalidArgument(String),
 }
 
 /// Outcome of [`ChainState::resume_pending_snapshot`] at startup.
@@ -2374,6 +2378,13 @@ impl ChainState {
             .get_block_index(&prev_hash)
             .ok_or(ChainError::BadPrevBlock)?;
 
+        // Never store a block descending from an explicitly-invalidated one
+        // (Core: "bad-prevblk"). Keeps the invalidated subtree from being
+        // re-populated with data behind the operator's back.
+        if parent.status == BlockStatus::Invalid {
+            return Err(ChainError::BadPrevBlock);
+        }
+
         let new_height = parent.height + 1;
 
         // Context-free block validation
@@ -3122,6 +3133,16 @@ impl ChainState {
             .get_block_index(&prev_hash)
             .ok_or(ChainError::BadPrevBlock)?;
 
+        // Refuse to build on a parent that was explicitly invalidated
+        // (Core: "bad-prevblk"). `invalidate_block` marks the whole subtree
+        // `Invalid`, so this guard preserves the "not-Invalid ⟹ no Invalid
+        // ancestor" invariant that `find_best_valid_tip` relies on: a block
+        // descending from an invalidated one can never re-enter the candidate
+        // set until a matching `reconsider_block` clears the mark.
+        if parent.status == BlockStatus::Invalid {
+            return Err(ChainError::BadPrevBlock);
+        }
+
         let new_height = parent.height + 1;
 
         // Context-free block validation
@@ -3830,6 +3851,478 @@ impl ChainState {
             disconnected_txs,
         })
     }
+    // --- invalidateblock / reconsiderblock (Bitcoin Core parity) ----------
+
+    /// Mark `hash` (and every data-carrying descendant) invalid, then
+    /// re-activate the best remaining valid chain — Bitcoin Core's
+    /// `invalidateblock`.
+    ///
+    /// If `hash` is on the active chain, the active chain is rolled back past
+    /// it and the best connectable valid chain becomes the new tip — that may
+    /// be just the invalid block's parent (a pure truncation) or a competing
+    /// side chain that now carries the most work. The `Invalid` mark is
+    /// persisted in the block index, so the block is never reconnected until a
+    /// matching [`Self::reconsider_block`] clears it. If `hash` was only on a
+    /// side chain the active tip is unaffected.
+    ///
+    /// Returns [`ChainError::BlockNotFound`] for an unknown hash and
+    /// [`ChainError::InvalidArgument`] when asked to invalidate genesis.
+    pub fn invalidate_block(&self, hash: BlockHash) -> Result<(), ChainError> {
+        let _accept_guard = self.accept_lock.lock();
+
+        let entry = self
+            .store
+            .get_block_index(&hash)
+            .ok_or(ChainError::BlockNotFound)?;
+
+        if entry.height == 0 {
+            return Err(ChainError::InvalidArgument(
+                "cannot invalidate the genesis block".to_string(),
+            ));
+        }
+
+        // If the target is on the active chain, roll the active chain back to
+        // its parent FIRST — while the blocks are still readable (`get_block`
+        // excludes `Invalid`, and `perform_reorg` reads each disconnected
+        // block). Marking the subtree invalid before disconnecting would make
+        // the disconnect's own block reads fail.
+        let on_active = self.active_chain_hash_at_height(entry.height) == Some(hash);
+        if on_active {
+            let parent = self
+                .store
+                .get_block_index(&entry.header.prev_blockhash)
+                .ok_or(ChainError::BadPrevBlock)?;
+            if self.tip_hash() != parent.header.block_hash() {
+                self.reorg_to(&parent)?;
+            }
+        }
+
+        // Mark the (now-disconnected) block + every descendant invalid so the
+        // re-activation candidate search excludes the whole subtree.
+        self.mark_subtree_invalid(hash)?;
+
+        // Connect the best valid alternative chain — a competing side chain
+        // that now carries more work than the parent — if one exists;
+        // otherwise the active tip stays at the parent (a pure truncation).
+        self.activate_best_chain()
+    }
+
+    /// Clear the `Invalid` mark on `hash` and its descendants, then
+    /// re-activate the best valid chain — Bitcoin Core's `reconsiderblock`.
+    /// If the reconsidered chain now carries the most work it becomes the
+    /// active tip. Unknown hashes return [`ChainError::BlockNotFound`].
+    /// Reconsidering a block that was never invalidated is a no-op success.
+    pub fn reconsider_block(&self, hash: BlockHash) -> Result<(), ChainError> {
+        let _accept_guard = self.accept_lock.lock();
+
+        if self.store.get_block_index(&hash).is_none() {
+            return Err(ChainError::BlockNotFound);
+        }
+
+        self.clear_subtree_invalid(hash)?;
+        self.activate_best_chain()
+    }
+
+    /// Build a `prev_blockhash -> [children]` adjacency map over the entire
+    /// block index. O(N) — acceptable for the rare, operator-driven
+    /// invalidate/reconsider paths. Used to walk a block's descendant subtree.
+    fn block_index_children(
+        &self,
+    ) -> Result<std::collections::HashMap<BlockHash, Vec<BlockHash>>, ChainError> {
+        let mut children: std::collections::HashMap<BlockHash, Vec<BlockHash>> =
+            std::collections::HashMap::new();
+        self.store.for_each_block_index(&mut |h, entry| {
+            children
+                .entry(entry.header.prev_blockhash)
+                .or_default()
+                .push(h);
+        })?;
+        Ok(children)
+    }
+
+    /// Mark `root` and all of its descendants `Invalid` (Core's
+    /// FAILED_VALID + FAILED_CHILD). `Pruned` descendants are left alone.
+    fn mark_subtree_invalid(&self, root: BlockHash) -> Result<(), ChainError> {
+        let children = self.block_index_children()?;
+        let mut batch = crate::storage::StoreBatch::default();
+        let mut stack = vec![root];
+        while let Some(h) = stack.pop() {
+            if let Some(mut e) = self.store.get_block_index(&h)
+                && e.status != BlockStatus::Invalid
+                && e.status != BlockStatus::Pruned
+            {
+                e.status = BlockStatus::Invalid;
+                batch.block_index_puts.push((h, e));
+            }
+            if let Some(cs) = children.get(&h) {
+                stack.extend(cs.iter().copied());
+            }
+        }
+        // `write_batch` updates the block-index LRU in lock-step (an Invalid
+        // write is never HeaderOnly, so the dominance filter never drops it).
+        if !batch.block_index_puts.is_empty() {
+            self.store.write_batch(batch)?;
+        }
+        Ok(())
+    }
+
+    /// Clear the `Invalid` mark on `root` and its descendants, restoring each
+    /// to `DataStored` (carries block data) or `HeaderOnly` (`num_tx == 0`,
+    /// i.e. a header we never had the block for). `connect_block` re-stamps
+    /// `Valid` if the block is reconnected by the following re-activation.
+    fn clear_subtree_invalid(&self, root: BlockHash) -> Result<(), ChainError> {
+        let children = self.block_index_children()?;
+        let mut batch = crate::storage::StoreBatch::default();
+        let mut stack = vec![root];
+        while let Some(h) = stack.pop() {
+            if let Some(mut e) = self.store.get_block_index(&h)
+                && e.status == BlockStatus::Invalid
+            {
+                // A HeaderOnly entry has num_tx == 0 (no block ever has zero
+                // transactions — the coinbase is mandatory), so this exactly
+                // recovers the pre-invalidation data/no-data distinction.
+                e.status = if e.num_tx == 0 {
+                    BlockStatus::HeaderOnly
+                } else {
+                    BlockStatus::DataStored
+                };
+                batch.block_index_puts.push((h, e));
+            }
+            if let Some(cs) = children.get(&h) {
+                stack.extend(cs.iter().copied());
+            }
+        }
+        if !batch.block_index_puts.is_empty() {
+            self.store.write_batch(batch)?;
+        }
+        Ok(())
+    }
+
+    /// Whether `entry`'s entire ancestry back to the active chain (or genesis)
+    /// is present and non-invalid — i.e. it could be connected right now. Used
+    /// by [`Self::find_best_valid_tip`] to skip candidates whose path has a
+    /// gap (a `HeaderOnly`/`Invalid`/missing ancestor).
+    fn is_connectable(&self, entry: &BlockIndexEntry) -> Result<bool, ChainError> {
+        let mut h = entry.header.block_hash();
+        let mut height = entry.height;
+        loop {
+            // Reached the active chain — everything below is connected.
+            if self.active_chain_hash_at_height(height) == Some(h) {
+                return Ok(true);
+            }
+            let e = match self.store.get_block_index(&h) {
+                Some(e) => e,
+                None => return Ok(false),
+            };
+            if !matches!(e.status, BlockStatus::DataStored | BlockStatus::Valid) {
+                return Ok(false);
+            }
+            if height == 0 {
+                // Genesis is always on the active chain.
+                return Ok(true);
+            }
+            h = e.header.prev_blockhash;
+            height -= 1;
+        }
+    }
+
+    /// The data-carrying, non-invalid, fully-connectable block with the most
+    /// chainwork — the chain we should be on. Returns the current active tip
+    /// when nothing connectable beats it (consensus first-seen tie rule:
+    /// equal-work side chains never displace the active tip). When the active
+    /// tip is itself invalid (just invalidated), the best connectable
+    /// alternative is returned unconditionally.
+    fn find_best_valid_tip(&self) -> Result<BlockIndexEntry, ChainError> {
+        let current_tip = self.tip_hash();
+        let tip_entry = self
+            .store
+            .get_block_index(&current_tip)
+            .ok_or(ChainError::BadPrevBlock)?;
+        let tip_valid = matches!(
+            tip_entry.status,
+            BlockStatus::DataStored | BlockStatus::Valid
+        );
+
+        let mut candidates: Vec<BlockIndexEntry> = Vec::new();
+        self.store.for_each_block_index(&mut |_h, e| {
+            if matches!(e.status, BlockStatus::DataStored | BlockStatus::Valid) {
+                candidates.push(e);
+            }
+        })?;
+        // Most chainwork first; ties broken by hash for determinism (the
+        // iteration order of `for_each_block_index` is unspecified).
+        candidates.sort_by(|a, b| match compare_u256(&a.chainwork, &b.chainwork) {
+            1 => std::cmp::Ordering::Less,
+            -1 => std::cmp::Ordering::Greater,
+            _ => a.header.block_hash().cmp(&b.header.block_hash()),
+        });
+
+        for cand in &candidates {
+            let ch = cand.header.block_hash();
+            if ch == current_tip {
+                // The active tip is the best connectable block (or the
+                // highest-work of a tie we won't switch away from): stay.
+                return Ok(cand.clone());
+            }
+            if tip_valid && compare_u256(&cand.chainwork, &tip_entry.chainwork) <= 0 {
+                // No remaining candidate has strictly more work than the
+                // still-valid tip — keep it.
+                return Ok(tip_entry);
+            }
+            if self.is_connectable(cand)? {
+                return Ok(cand.clone());
+            }
+        }
+        // Unreachable in practice when the tip was invalidated: the fork
+        // parent is always a connectable candidate. Falls back to the tip.
+        Ok(tip_entry)
+    }
+
+    /// Connect the best available valid chain if it differs from the current
+    /// tip (Core's ActivateBestChain, scoped to candidates already present
+    /// locally). Caller must hold `accept_lock`.
+    fn activate_best_chain(&self) -> Result<(), ChainError> {
+        let best = self.find_best_valid_tip()?;
+        if best.header.block_hash() == self.tip_hash() {
+            return Ok(());
+        }
+        self.reorg_to(&best)
+    }
+
+    /// Find the common ancestor (fork point) of the active tip and `target`
+    /// by walking both back via `prev_blockhash`. Immune to height-index
+    /// pollution (consults only immutable `prev_blockhash`/`height`).
+    fn find_fork(
+        &self,
+        tip_entry: &BlockIndexEntry,
+        target: &BlockIndexEntry,
+    ) -> Result<BlockIndexEntry, ChainError> {
+        let mut active_hash = tip_entry.header.block_hash();
+        let mut active_height = tip_entry.height;
+        let mut side_hash = target.header.block_hash();
+        let mut side_height = target.height;
+
+        while active_height > side_height {
+            let e = self
+                .store
+                .get_block_index(&active_hash)
+                .ok_or(ChainError::BadPrevBlock)?;
+            active_hash = e.header.prev_blockhash;
+            active_height -= 1;
+        }
+        while side_height > active_height {
+            let e = self
+                .store
+                .get_block_index(&side_hash)
+                .ok_or(ChainError::BadPrevBlock)?;
+            side_hash = e.header.prev_blockhash;
+            side_height -= 1;
+        }
+        while active_hash != side_hash {
+            let a = self
+                .store
+                .get_block_index(&active_hash)
+                .ok_or(ChainError::BadPrevBlock)?;
+            let s = self
+                .store
+                .get_block_index(&side_hash)
+                .ok_or(ChainError::BadPrevBlock)?;
+            active_hash = a.header.prev_blockhash;
+            side_hash = s.header.prev_blockhash;
+        }
+        self.store
+            .get_block_index(&active_hash)
+            .ok_or(ChainError::BadPrevBlock)
+    }
+
+    /// Reorg the active chain onto `target`: disconnect from the current tip
+    /// down to the fork point, then reconnect the `target` branch. Reuses the
+    /// same #262 atomic-checkpoint discipline as `accept_block`'s reorg path
+    /// (pre-reorg flush + flush-exclusion held across the whole mutation, with
+    /// `abort_reorg` as the infallible in-cache rollback). Caller must hold
+    /// `accept_lock`. `target == fork` is a pure truncation (empty reconnect).
+    fn reorg_to(&self, target: &BlockIndexEntry) -> Result<(), ChainError> {
+        let current_tip = self.tip_hash();
+        let tip_entry = self
+            .store
+            .get_block_index(&current_tip)
+            .ok_or(ChainError::BadPrevBlock)?;
+        let fork_entry = self.find_fork(&tip_entry, target)?;
+        let fork_hash = fork_entry.header.block_hash();
+        let target_hash = target.header.block_hash();
+
+        // Atomic-reorg durable checkpoint (#262): flush the pre-reorg chain so
+        // it is the exact rollback target, then hold the flush-exclusion for
+        // the whole reorg so no external flush can persist a partial state.
+        let excl = self.store.lock_flush_exclusion();
+        excl.flush()?;
+        let mut reorg_excl = Some(excl);
+
+        // Disconnect from current tip down to the fork point.
+        let disconnect_info = match self.perform_reorg(&fork_entry, current_tip) {
+            Ok(info) => info,
+            Err(e) => {
+                self.abort_reorg(current_tip, tip_entry.height);
+                return Err(e);
+            }
+        };
+
+        // Reconnect the target branch fork+1..=target. The collection walk and
+        // the per-block connect both run inside the closure so ANY failure is
+        // routed through `abort_reorg` rather than stranding a partial chain.
+        let mut reconnected_hashes: Vec<BlockHash> = Vec::new();
+        let mut reconnected_blocks: Vec<(bitcoin::Block, u32)> = Vec::new();
+        let reconnect: Result<(), ChainError> = (|| {
+            let mut to_connect = Vec::new();
+            let mut hash = target_hash;
+            while hash != fork_hash {
+                to_connect.push(hash);
+                let e = self
+                    .store
+                    .get_block_index(&hash)
+                    .ok_or(ChainError::BadPrevBlock)?;
+                hash = e.header.prev_blockhash;
+            }
+            to_connect.reverse();
+            for h in &to_connect {
+                let block = self.get_block(h).ok_or(ChainError::FlatFile(
+                    "block data missing for reorg connect".to_string(),
+                ))?;
+                let e = self
+                    .store
+                    .get_block_index(h)
+                    .ok_or(ChainError::BadPrevBlock)?;
+                let parent_entry = self
+                    .store
+                    .get_block_index(&e.header.prev_blockhash)
+                    .ok_or(ChainError::BadPrevBlock)?;
+                let use_noop = self.should_skip_scripts(e.height);
+                let noop = NoopVerifier;
+                let verifier: &dyn ScriptVerifier =
+                    if use_noop { &noop } else { &*self.script_verifier };
+                let mtp = self.get_median_time_past(e.height);
+                let flat_pos = FlatFilePos {
+                    file_number: e.file_number,
+                    data_pos: e.data_pos,
+                };
+                let batch = connect::connect_block(&connect::ConnectParams {
+                    store: &*self.store,
+                    block: &block,
+                    height: e.height,
+                    parent_chainwork: &parent_entry.chainwork,
+                    flat_pos,
+                    script_verifier: verifier,
+                    median_time_past: mtp,
+                    network: self.network,
+                    pre_verified_txs: None,
+                    num_threads: 1,
+                    precomputed_txids: None,
+                    address_index: &self.address_index,
+                    #[cfg(feature = "block-filter-index")]
+                    filter_index: &self.filter_index,
+                    phase_tracker: None,
+                })?;
+                self.store.write_batch(batch)?;
+                {
+                    let mut tip = self.tip.write();
+                    tip.hash = *h;
+                    tip.height = e.height;
+                }
+                reconnected_hashes.push(*h);
+                reconnected_blocks.push((block, e.height));
+            }
+            Ok(())
+        })();
+        if let Err(e) = reconnect {
+            self.abort_reorg(disconnect_info.old_tip, disconnect_info.old_height);
+            return Err(e);
+        }
+
+        // Reorg committed: the cache holds a consistent full-reorg delta.
+        // Release the flush-exclusion so the trailing flush + mempool
+        // reconcile + event emission run unguarded.
+        drop(reorg_excl.take());
+
+        let new_tip = self.tip_hash();
+        let new_height = self.tip_height();
+
+        // Mempool reconcile: clear confirmations from each reconnected block,
+        // then re-offer the disconnected-block txs against the new chain.
+        if let Some(mempool) = self.mempool.get() {
+            for (block, height) in &reconnected_blocks {
+                mempool.remove_for_block(block, *height);
+            }
+            for tx in &disconnect_info.disconnected_txs {
+                if let Err(e) =
+                    mempool.accept_transaction(tx.clone(), self, &*self.script_verifier)
+                {
+                    tracing::debug!(
+                        err = ?e,
+                        "invalidate/reconsider reorg: mempool re-add failed (likely conflict)"
+                    );
+                }
+            }
+        }
+
+        // Chain events, in the canonical order (Reorg marker → disconnect
+        // newest-first → reconnect oldest-first).
+        self.emit_chain_event(crate::chain::events::ChainEvent::Reorg {
+            from_height: disconnect_info.old_height,
+            old_tip: disconnect_info.old_tip,
+            to_height: new_height,
+            new_tip,
+        });
+        for (hash, height) in &disconnect_info.disconnected_with_height {
+            self.emit_chain_event(crate::chain::events::ChainEvent::BlockDisconnected {
+                hash: *hash,
+                height: *height,
+            });
+        }
+        for (block, height) in &reconnected_blocks {
+            self.emit_chain_event(crate::chain::events::ChainEvent::BlockConnected {
+                hash: block.block_hash(),
+                height: *height,
+            });
+        }
+
+        if let Some(log) = self.reorg_log.get() {
+            let record = crate::chain::reorg_log::ReorgRecord::new(
+                fork_entry.height,
+                disconnect_info.old_tip,
+                new_tip,
+                disconnect_info.old_height,
+                disconnect_info.disconnected.clone(),
+                reconnected_hashes.clone(),
+            );
+            log.record(record);
+        }
+
+        for (block, height) in &reconnected_blocks {
+            self.push_mtp_cache(*height, block.header.time);
+        }
+
+        // Durably commit the new chainstate (the operator-driven reorg is rare
+        // and deliberate; flushing keeps the on-disk tip consistent and closes
+        // the multi-block FRESH-elision window of #262). A flush failure does
+        // not un-commit the in-memory reorg, so log loudly and continue.
+        if let Err(e) = self.store.flush() {
+            tracing::error!(
+                error = %e,
+                new_tip = %new_tip,
+                "Coin-cache flush failed after invalidate/reconsider reorg; coins remain dirty in cache"
+            );
+        }
+
+        tracing::info!(
+            old_tip = %disconnect_info.old_tip,
+            old_height = disconnect_info.old_height,
+            %new_tip,
+            new_height,
+            "invalidate/reconsider: activated best valid chain"
+        );
+        Ok(())
+    }
+
     /// Prune old block data files whose blocks are deep enough in the chain.
     /// `keep_blocks` is the number of recent blocks to keep data for.
     /// Returns the number of files deleted.
@@ -4273,6 +4766,129 @@ pub(crate) mod tests {
             );
         }
         assert_eq!(cs.cumulative_tx_count(&cs.tip_hash()), Some(expected));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn invalidate_tip_truncates_then_reconsider_restores() {
+        let (cs, dir) = make_chain_state();
+        let blocks = build_and_connect_chain(&cs, 5);
+        let tip5 = blocks[4].block_hash();
+        let block4 = blocks[3].block_hash();
+        assert_eq!(cs.tip_height(), 5);
+        assert_eq!(cs.tip_hash(), tip5);
+
+        // Invalidating the tip truncates the active chain to its parent.
+        cs.invalidate_block(tip5).unwrap();
+        assert_eq!(cs.tip_height(), 4);
+        assert_eq!(cs.tip_hash(), block4);
+        assert_eq!(
+            cs.get_block_index(&tip5).unwrap().status,
+            BlockStatus::Invalid
+        );
+        // An Invalid block is not retrievable as data.
+        assert!(cs.get_block(&tip5).is_none());
+
+        // Reconsidering restores it and re-activates the chain.
+        cs.reconsider_block(tip5).unwrap();
+        assert_eq!(cs.tip_height(), 5);
+        assert_eq!(cs.tip_hash(), tip5);
+        assert!(cs.get_block(&tip5).is_some());
+        assert_eq!(
+            cs.get_block_index(&tip5).unwrap().status,
+            BlockStatus::Valid
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn invalidate_midchain_block_reorgs_to_competing_fork() {
+        let (cs, dir) = make_chain_state();
+        // Main chain heights 1..=5 (active tip).
+        let main = build_and_connect_chain(&cs, 5);
+        let block2 = main[1].block_hash(); // fork point (height 2)
+        let main3 = main[2].block_hash();
+
+        // Competing fork off block2: heights 3,4,5 with distinct timestamps
+        // (so distinct hashes), stored as a side chain of EQUAL work — not
+        // auto-selected, so only invalidation can switch us onto it.
+        let mut parent = block2;
+        let mut side = Vec::new();
+        for h in 3..=5 {
+            let b = build_test_block(parent, h, 1_400_000_000 + h);
+            cs.accept_header(&b.header).unwrap();
+            cs.store_block(&b).unwrap();
+            parent = b.block_hash();
+            side.push(b);
+        }
+        // Active chain is still the main chain (side has equal work, stored
+        // but not connected).
+        assert_eq!(cs.tip_hash(), main[4].block_hash());
+
+        // Invalidate main height-3: main 3,4,5 become Invalid and the active
+        // chain reorgs onto the side fork.
+        cs.invalidate_block(main3).unwrap();
+        assert_eq!(cs.tip_height(), 5);
+        assert_eq!(cs.tip_hash(), side[2].block_hash());
+        // Main 3/4/5 are invalid; side 3'/4'/5' are now Valid (connected).
+        for b in &main[2..] {
+            assert_eq!(
+                cs.get_block_index(&b.block_hash()).unwrap().status,
+                BlockStatus::Invalid
+            );
+        }
+        for b in &side {
+            assert_eq!(
+                cs.get_block_index(&b.block_hash()).unwrap().status,
+                BlockStatus::Valid
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn invalidate_rejects_genesis_and_unknown() {
+        let (cs, dir) = make_chain_state();
+        build_and_connect_chain(&cs, 2);
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+        assert!(matches!(
+            cs.invalidate_block(genesis),
+            Err(ChainError::InvalidArgument(_))
+        ));
+        let bogus = BlockHash::from_raw_hash(
+            bitcoin::hashes::sha256d::Hash::from_byte_array([7u8; 32]),
+        );
+        assert!(matches!(
+            cs.invalidate_block(bogus),
+            Err(ChainError::BlockNotFound)
+        ));
+        assert!(matches!(
+            cs.reconsider_block(bogus),
+            Err(ChainError::BlockNotFound)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cannot_extend_an_invalidated_block() {
+        let (cs, dir) = make_chain_state();
+        let blocks = build_and_connect_chain(&cs, 3);
+        let block2 = blocks[1].block_hash();
+
+        // Invalidate height-2: 2 and 3 become Invalid, tip truncates to 1.
+        cs.invalidate_block(block2).unwrap();
+        assert_eq!(cs.tip_height(), 1);
+
+        // A new block building on the invalidated block2 is rejected.
+        let child = build_test_block(block2, 3, 1_500_000_999);
+        assert!(matches!(
+            cs.store_block(&child),
+            Err(ChainError::BadPrevBlock)
+        ));
+        assert!(matches!(
+            cs.accept_block(&child),
+            Err(ChainError::BadPrevBlock)
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

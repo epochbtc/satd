@@ -675,6 +675,101 @@ fn test_generatetoaddress() {
 }
 
 #[test]
+fn test_invalidateblock_and_reconsiderblock() {
+    let mut node = TestNode::start(&[]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+
+    // Mine 5 blocks.
+    node.rpc_call_with_params(
+        "generatetoaddress",
+        vec![serde_json::json!(5), serde_json::json!(addr)],
+    )
+    .unwrap();
+    assert_eq!(node.rpc_call("getblockcount").unwrap()["result"], 5);
+
+    let tip5 = node.rpc_call("getbestblockhash").unwrap()["result"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let block4 = node
+        .rpc_call_with_params("getblockhash", vec![serde_json::json!(4)])
+        .unwrap()["result"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // invalidateblock(tip) truncates the active chain to height 4.
+    let resp = node
+        .rpc_call_with_params("invalidateblock", vec![serde_json::json!(tip5)])
+        .unwrap();
+    assert!(resp["error"].is_null(), "invalidateblock errored: {resp:?}");
+    assert_eq!(node.rpc_call("getblockcount").unwrap()["result"], 4);
+    assert_eq!(
+        node.rpc_call("getbestblockhash").unwrap()["result"], block4,
+        "tip should be the parent of the invalidated block"
+    );
+
+    // The invalidated block can no longer be fetched as data.
+    let getblock = node
+        .rpc_call_with_params("getblock", vec![serde_json::json!(tip5)])
+        .unwrap();
+    assert!(
+        !getblock["error"].is_null(),
+        "getblock on an invalidated hash should error: {getblock:?}"
+    );
+
+    // reconsiderblock restores it and re-activates the chain.
+    let resp = node
+        .rpc_call_with_params("reconsiderblock", vec![serde_json::json!(tip5)])
+        .unwrap();
+    assert!(resp["error"].is_null(), "reconsiderblock errored: {resp:?}");
+    assert_eq!(node.rpc_call("getblockcount").unwrap()["result"], 5);
+    assert_eq!(node.rpc_call("getbestblockhash").unwrap()["result"], tip5);
+
+    node.stop();
+}
+
+#[test]
+fn test_invalidateblock_rejects_genesis_and_unknown() {
+    let mut node = TestNode::start(&[]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    node.rpc_call_with_params(
+        "generatetoaddress",
+        vec![serde_json::json!(2), serde_json::json!(addr)],
+    )
+    .unwrap();
+
+    // Unknown block hash → error.
+    let bogus = "00".repeat(32);
+    let resp = node
+        .rpc_call_with_params("invalidateblock", vec![serde_json::json!(bogus)])
+        .unwrap();
+    assert!(
+        !resp["error"].is_null(),
+        "invalidateblock on unknown hash should error: {resp:?}"
+    );
+
+    // Genesis cannot be invalidated.
+    let genesis = node
+        .rpc_call_with_params("getblockhash", vec![serde_json::json!(0)])
+        .unwrap()["result"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let resp = node
+        .rpc_call_with_params("invalidateblock", vec![serde_json::json!(genesis)])
+        .unwrap();
+    assert!(
+        !resp["error"].is_null(),
+        "invalidateblock on genesis should error: {resp:?}"
+    );
+    // The chain is untouched by the failed calls.
+    assert_eq!(node.rpc_call("getblockcount").unwrap()["result"], 2);
+
+    node.stop();
+}
+
+#[test]
 fn test_getblocktemplate() {
     let mut node = TestNode::start(&[]);
     let response = node.rpc_call("getblocktemplate").unwrap();

@@ -69,6 +69,22 @@ layout) per `STABILITY_POLICY.md`.
   transaction remains consensus-valid, matching Core, which performs this check
   outside `CheckBlock`/`ConnectBlock`.
 
+### RPC
+
+- **`invalidateblock` / `reconsiderblock` are now implemented** (previously
+  absent), matching Bitcoin Core. `invalidateblock <hash>` marks a block — and
+  every descendant — invalid, rolls the active chain back past it, and
+  re-activates the best remaining valid chain (a pure truncation to the
+  invalid block's parent, or a reorg onto a competing side chain that now
+  carries the most work). `reconsiderblock <hash>` clears the invalid mark on
+  the block and its descendants and re-activates the best chain (reorging back
+  if that chain regains the most work). The `Invalid` mark is persisted in the
+  block index, and `accept_block`/`store_block` now refuse to build on an
+  invalidated parent (`bad-prevblk`), so the subtree stays excluded until
+  reconsidered. Both are classified `BlockConnecting` (rejected on the
+  read-only RPC listener). This lets a single regtest node be driven into a
+  reorg without a second node — the standard tool for reorg testing.
+
 ### Testing
 
 - **Block-level consensus differential matrix.** A new golden fixture suite
