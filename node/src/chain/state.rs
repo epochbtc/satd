@@ -1690,6 +1690,72 @@ impl ChainState {
         self.headers_tip_height.load(Ordering::Relaxed)
     }
 
+    /// Blocks we must download to connect the best-work header chain we know
+    /// of, in connect order (oldest first), up to `max_request`. Walks back
+    /// from the best header tip via `prev_blockhash`, collecting hashes we lack
+    /// block data for, until reaching a block we already have (the fork point)
+    /// or genesis.
+    ///
+    /// Returns empty when the best header chain does not out-work the active
+    /// tip — we are already on (or ahead of) the best chain.
+    ///
+    /// This is the fork-aware replacement for a forward-by-active-height walk:
+    /// a competing chain forks *below* its tip, so some of its blocks sit at
+    /// heights at or below our active tip. A height-indexed forward walk
+    /// (`tip+1, tip+2, …`) never requests those fork blocks, and without the
+    /// fork block's data a reorg onto the competing chain can never reconnect
+    /// — the exact reason a synced listener failed to adopt a longer chain
+    /// announced by an inbound peer.
+    pub fn missing_blocks_for_best_header_chain(&self, max_request: usize) -> Vec<BlockHash> {
+        if max_request == 0 {
+            return Vec::new();
+        }
+        let tip_hash = self.tip_hash();
+        let Some(tip_entry) = self.store.get_block_index(&tip_hash) else {
+            return Vec::new();
+        };
+        // The best-work header chain tip, approximated by the highest known
+        // header height (for near-equal difficulty this is also the most-work
+        // chain; a same-height higher-work fork is left to `accept_block` once
+        // its blocks arrive by normal extension).
+        let headers_tip = self.headers_tip_height();
+        let Some(best_hash) = self.get_block_hash_by_height(headers_tip) else {
+            return Vec::new();
+        };
+        let Some(best_entry) = self.store.get_block_index(&best_hash) else {
+            return Vec::new();
+        };
+        if compare_u256(&best_entry.chainwork, &tip_entry.chainwork) <= 0 {
+            return Vec::new();
+        }
+
+        // Walk back from the header tip, collecting blocks we lack data for
+        // (newest first), until we reach a block we have (the fork point) or
+        // genesis. Bounded so a pathologically deep fork cannot stall the P2P
+        // loop; realistic post-IBD reorgs are shallow.
+        const MAX_WALK: usize = 16_384;
+        let mut missing: Vec<BlockHash> = Vec::new();
+        let mut h = best_hash;
+        for _ in 0..MAX_WALK {
+            if self.has_block_data(&h) {
+                break; // fork point reached
+            }
+            let Some(e) = self.store.get_block_index(&h) else {
+                break;
+            };
+            missing.push(h);
+            if e.height == 0 {
+                break;
+            }
+            h = e.header.prev_blockhash;
+        }
+        // Oldest first so the peer's (ordered) getdata response connects in
+        // dependency order; cap to the caller's batch size.
+        missing.reverse();
+        missing.truncate(max_request);
+        missing
+    }
+
     /// Whether assumevalid is configured (not Disabled).
     /// Used to decide whether prefetch should run script pre-verification.
     pub fn is_assumevalid_active(&self) -> bool {
@@ -5053,6 +5119,45 @@ pub(crate) mod tests {
         // Idempotent: a valid tip is a no-op.
         cs.reconcile_invalid_tip().unwrap();
         assert_eq!(cs.tip_hash(), block2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_blocks_walks_back_to_fork_including_tip_height() {
+        let (cs, dir) = make_chain_state();
+        // Active chain at height 1 (chain A, has data).
+        build_and_connect_chain(&cs, 1);
+
+        // A competing HEADER chain forking at genesis: B1,B2,B3 (headers only,
+        // no block data), out-working the active tip.
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+        let mut parent = genesis;
+        let mut bhashes = Vec::new();
+        for h in 1..=3 {
+            let b = build_test_block(parent, h, 1_600_000_000 + h);
+            cs.accept_header(&b.header).unwrap();
+            parent = b.block_hash();
+            bhashes.push(b.block_hash());
+        }
+
+        // The fork-aware walk requests B1,B2,B3 in connect order — crucially
+        // including B1 at height 1 (== our tip height), which a forward-by-
+        // height walk from tip+1 would have skipped, stranding the reorg.
+        let missing = cs.missing_blocks_for_best_header_chain(128);
+        assert_eq!(missing, bhashes);
+
+        // Batch cap is honored (oldest first).
+        let capped = cs.missing_blocks_for_best_header_chain(2);
+        assert_eq!(capped, bhashes[..2]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_blocks_empty_when_already_on_best_chain() {
+        let (cs, dir) = make_chain_state();
+        build_and_connect_chain(&cs, 3);
+        // No competing header chain out-works the tip, and we have all data.
+        assert!(cs.missing_blocks_for_best_header_chain(128).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

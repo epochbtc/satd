@@ -1755,7 +1755,14 @@ impl PeerManager {
         }
 
         if !blocks_to_get.is_empty() {
+            // Direct fetch (fast path when the block extends our tip)…
             self.send_to_peer(id, sync::make_getdata_blocks(&blocks_to_get));
+            // …plus headers-first discovery: if the announced block builds on
+            // a competing chain we don't have, the direct block will arrive
+            // with an unknown parent and stall in the buffer. Asking for
+            // headers lets us learn the connecting chain so
+            // `request_missing_blocks` can pull its fork blocks and reorg.
+            self.send_to_peer(id, sync::make_getheaders(&self.chain_state));
         }
         if !txs_to_get.is_empty() {
             self.send_to_peer(id, sync::make_getdata_txs(&txs_to_get));
@@ -1768,10 +1775,23 @@ impl PeerManager {
         }
 
         let (accepted, err) = self.chain_state.accept_headers(&headers);
-        if let Some(e) = err
-            && !matches!(e, crate::chain::state::ChainError::Duplicate)
-        {
-            self.add_ban_score(id, 20, &format!("Header rejected: {}", e));
+        if let Some(e) = err {
+            match e {
+                crate::chain::state::ChainError::Duplicate => {}
+                crate::chain::state::ChainError::BadPrevBlock => {
+                    // The announced header builds on a chain we haven't seen —
+                    // a competing/longer chain forking below our knowledge.
+                    // Ask this peer for the connecting headers (headers-first
+                    // discovery) rather than banning: banning an honest peer
+                    // that announces a better chain would stop us ever
+                    // reorging onto it. Once the connecting headers arrive,
+                    // `request_missing_blocks` pulls the fork blocks.
+                    self.send_to_peer(id, sync::make_getheaders(&self.chain_state));
+                }
+                other => {
+                    self.add_ban_score(id, 20, &format!("Header rejected: {}", other));
+                }
+            }
         }
 
         if accepted > 0 {
@@ -3606,25 +3626,16 @@ impl PeerManager {
     }
 
     fn request_missing_blocks(&self, id: PeerId) {
-        let tip = self.chain_state.tip_height();
-        let mut to_request = Vec::new();
-
-        // Request blocks from tip+1 upward where we have headers but no block data
-        for h in (tip + 1)..=(tip + 512) {
-            if let Some(hash) = self.chain_state.get_block_hash_by_height(h) {
-                if !self.chain_state.has_block_data(&hash) {
-                    to_request.push(hash);
-                    if to_request.len() >= 128 {
-                        break;
-                    }
-                }
-            } else {
-                break;
-            }
-        }
+        // Fork-aware: walk back from the best-work header chain tip to the
+        // fork point, requesting blocks we lack data for in connect order.
+        // This requests a competing chain's fork block(s) at heights at or
+        // below our active tip — a plain forward-by-height walk skips them,
+        // and without them a reorg onto a longer competing chain announced by
+        // a peer can never reconnect.
+        let to_request = self.chain_state.missing_blocks_for_best_header_chain(128);
 
         if !to_request.is_empty() {
-            tracing::debug!(tip, count = to_request.len(), "Requesting blocks");
+            tracing::debug!(count = to_request.len(), "Requesting blocks for best header chain");
             self.send_to_peer(id, sync::make_getdata_blocks(&to_request));
         }
     }
