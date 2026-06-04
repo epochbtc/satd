@@ -8,6 +8,7 @@ use crate::mempool::events::{EvictReason, MempoolEvent};
 use crate::mempool::policy::{self, MAX_STANDARD_TX_WEIGHT};
 use crate::validation::script::ScriptVerifier;
 use crate::validation::tx::check_transaction;
+use node_index::keys::{scripthash_of, Scripthash};
 
 /// Capacity of the broadcast channel for `subscribemempool`. Large
 /// enough to absorb short bursts; a subscriber that lags past this
@@ -69,6 +70,15 @@ pub struct MempoolEntry {
     /// using the resolved `prev_outputs` so P2SH / P2WSH redeem scripts are
     /// accounted for accurately.
     pub sigop_cost: u64,
+    /// `sha256(scriptPubKey)` of each spent prevout, one per input in input
+    /// order (`prev_scripthashes[i]` ↔ `tx.input[i]`). Resolved once at
+    /// admission from `prev_outputs` (which is otherwise discarded) so the
+    /// streaming watch matcher can do **mempool spend-side** prefix matching —
+    /// the unconfirmed analogue of the undo-driven confirmed path — without
+    /// re-resolving prevouts off the hot path. Hashes (32 B/input), not full
+    /// scripts: enough to prefix-match, bounded by mempool size. Empty for
+    /// entries built outside admission (test fixtures, direct inserts).
+    pub prev_scripthashes: Vec<Scripthash>,
 }
 
 /// Statistics about the mempool.
@@ -494,6 +504,15 @@ impl Mempool {
             .collect();
         let sigop_cost = tx.total_sigop_cost(|op| prev_outputs_map.get(op).cloned()) as u64;
 
+        // Retain the spent prevout scripthashes (input order) for mempool
+        // spend-side prefix matching. `prev_outputs` is fully resolved above
+        // and dropped after this; hashing it now is the one chance to keep the
+        // data without re-resolving prevouts in the (decoupled) matcher.
+        let prev_scripthashes: Vec<Scripthash> = prev_outputs
+            .iter()
+            .map(|o| scripthash_of(&o.script_pubkey))
+            .collect();
+
         let entry_weight_u64 = weight as u64;
         let vsize_u64 = entry_weight_u64 / 4;
         inner.entries.insert(
@@ -506,6 +525,7 @@ impl Mempool {
                 time: now,
                 fee_delta: 0,
                 sigop_cost,
+                prev_scripthashes,
             },
         );
         inner.total_bytes += tx_size;
@@ -1117,6 +1137,7 @@ mod tests {
                 time: 0,
                 fee_delta: 0,
                 sigop_cost: 0,
+                prev_scripthashes: Vec::new(),
             },
         );
         inner.total_bytes = low_size;
@@ -1557,6 +1578,7 @@ mod tests {
                     time: 0,
                     fee_delta: 0,
                     sigop_cost: 0,
+                    prev_scripthashes: Vec::new(),
                 },
             );
         }
@@ -1682,6 +1704,7 @@ mod tests {
                     time: 0,
                     fee_delta: 0,
                     sigop_cost: 0,
+                    prev_scripthashes: Vec::new(),
                 },
             );
             for input in &child_tx.input {
@@ -1697,6 +1720,7 @@ mod tests {
                     time: 0,
                     fee_delta: 0,
                     sigop_cost: 0,
+                    prev_scripthashes: Vec::new(),
                 },
             );
         }
@@ -1726,5 +1750,102 @@ mod tests {
         assert!(parent_v["ancestorfees"].is_u64());
         assert!(parent_v["ancestorsize"].is_u64());
         assert!(parent_v["descendantcount"].is_u64());
+    }
+
+    #[test]
+    fn mempool_entry_retains_prev_scripthashes() {
+        // Admission must hash each spent prevout's scriptPubKey (input order)
+        // onto the entry so the streaming matcher can prefix-match mempool
+        // spends without re-resolving prevouts. Exercise the real admission
+        // path via CPFP: a parent already in the pool supplies the child's
+        // prevout script, so accept_transaction resolves it from the mempool.
+        use bitcoin::blockdata::locktime::absolute::LockTime;
+        use bitcoin::hashes::Hash;
+        use bitcoin::{Amount, ScriptBuf, Sequence, TxIn, TxOut, Witness, transaction};
+
+        let (cs, mp, dir) = make_test_env();
+
+        // A distinctive *standard* prevout script (P2WPKH) the child will spend
+        // — admission enforces output standardness, so it can't be arbitrary.
+        let prevout_spk = {
+            let mut b = vec![0x00, 0x14];
+            b.extend_from_slice(&[0xab; 20]);
+            ScriptBuf::from(b)
+        };
+        let child_spk = {
+            let mut b = vec![0x00, 0x14];
+            b.extend_from_slice(&[0xcd; 20]);
+            ScriptBuf::from(b)
+        };
+        let parent_tx = Transaction {
+            version: transaction::Version(2),
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: bitcoin::Txid::from_raw_hash(
+                        bitcoin::hashes::sha256d::Hash::from_byte_array([9u8; 32]),
+                    ),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(10_000),
+                script_pubkey: prevout_spk.clone(),
+            }],
+        };
+        let parent_txid = parent_tx.compute_txid();
+
+        // Seed the parent directly (bypass its own input resolution); the child
+        // then goes through the public accept path, which is what we test.
+        {
+            let mut inner = mp.inner.write();
+            inner.entries.insert(
+                parent_txid,
+                MempoolEntry {
+                    tx: parent_tx,
+                    fee: 0,
+                    weight: 400,
+                    fee_rate: 0,
+                    time: 0,
+                    fee_delta: 0,
+                    sigop_cost: 0,
+                    prev_scripthashes: Vec::new(),
+                },
+            );
+        }
+
+        let child_tx = Transaction {
+            version: transaction::Version(2),
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: parent_txid,
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(9_000),
+                script_pubkey: child_spk,
+            }],
+        };
+        let child_txid = child_tx.compute_txid();
+
+        mp.accept_transaction(child_tx, &cs, &NoopVerifier)
+            .expect("child admits via CPFP");
+
+        let entry = mp.get(&child_txid).expect("child in mempool");
+        assert_eq!(
+            entry.prev_scripthashes,
+            vec![scripthash_of(&prevout_spk)],
+            "entry retains the spent prevout's scripthash in input order"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
