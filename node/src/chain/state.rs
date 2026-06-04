@@ -1610,7 +1610,19 @@ impl ChainState {
 
         let mut batch = crate::storage::StoreBatch::default();
         batch.block_index_puts.push((hash, entry));
-        batch.height_hash_puts.push((new_height, hash));
+        // The height->hash index is the ACTIVE (connected) chain. Header-only
+        // acceptance must never write into its active region (heights <= the
+        // block tip): a competing fork announced *below* our tip would
+        // otherwise clobber the active entry there (last-write-wins), silently
+        // corrupting the index that `--reindex-chainstate` faithfully replays
+        // — the root cause of the 951k `bad-cb-height` reindex loop. Heights
+        // *above* the tip are header-chain territory (the IBD scheduler and the
+        // getheaders locator legitimately need them); the block stays reachable
+        // by hash + `best_header` regardless, so the fork-aware competing-chain
+        // pull (#315) is unaffected.
+        if new_height > self.tip_height() {
+            batch.height_hash_puts.push((new_height, hash));
+        }
         self.store.write_batch(batch)?;
 
         // Track highest header for locator construction
@@ -1630,6 +1642,12 @@ impl ChainState {
         let mut accepted = 0u32;
         let mut max_height = 0u32;
         let mut best_in_batch: Option<(BlockHash, [u8; 32])> = None;
+
+        // The active block tip is fixed for the duration of this header batch
+        // (header acceptance connects no blocks). Header-only writes must stay
+        // above it so they cannot clobber the active-chain height index — see
+        // `accept_header`.
+        let block_tip_height = self.tip_height();
 
         for header in headers {
             let hash = header.block_hash();
@@ -1710,7 +1728,9 @@ impl ChainState {
             };
 
             batch.block_index_puts.push((hash, entry));
-            batch.height_hash_puts.push((new_height, hash));
+            if new_height > block_tip_height {
+                batch.height_hash_puts.push((new_height, hash));
+            }
             accepted += 1;
             max_height = max_height.max(new_height);
             if best_in_batch
@@ -5166,6 +5186,51 @@ pub(crate) mod tests {
         // The post-reindex re-seed restores the invariant.
         cs.refresh_best_header_to_tip();
         assert_eq!(cs.check_block_index(None), Ok(5));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn accept_header_does_not_clobber_active_height_index_with_subtip_fork() {
+        // The 951k bad-cb-height root cause: a competing fork announced *below*
+        // the active tip was accepted as headers, and the unconditional
+        // height->hash write clobbered the active-chain entries at the fork
+        // heights (last-write-wins). --reindex-chainstate then replayed the
+        // fork's blocks at those heights and aborted on bad-cb-height.
+        let (cs, dir) = make_chain_state();
+        let blocks = build_and_connect_chain(&cs, 5);
+        assert_eq!(cs.tip_height(), 5);
+        assert_eq!(cs.check_block_index(), Ok(5));
+
+        let active3 = blocks[2].block_hash(); // active block at height 3
+        let active4 = blocks[3].block_hash(); // active block at height 4
+
+        // A peer announces a competing fork branching off the height-2 block,
+        // supplying alternative headers at heights 3 and 4 — both at or below
+        // our tip of 5. Distinct timestamps yield distinct hashes (the coinbase
+        // commits the timestamp), so these are genuinely new headers.
+        let fork_parent = blocks[1].block_hash(); // height 2
+        let f3 = build_test_block(fork_parent, 3, 1_400_000_003);
+        let f4 = build_test_block(f3.block_hash(), 4, 1_400_000_004);
+        assert_ne!(f3.block_hash(), active3);
+        assert_ne!(f4.block_hash(), active4);
+
+        cs.accept_header(&f3.header).unwrap();
+        cs.accept_header(&f4.header).unwrap();
+
+        // The fork headers are still known by hash, so the fork-aware
+        // competing-chain pull (#315) can reach them via best_header/prev-links.
+        assert!(cs.get_block_index(&f3.block_hash()).is_some());
+        assert!(cs.get_block_index(&f4.block_hash()).is_some());
+
+        // But the active-chain height index was NOT clobbered: heights at or
+        // below the tip belong exclusively to the connected chain.
+        assert_eq!(cs.get_block_hash_by_height(3), Some(active3));
+        assert_eq!(cs.get_block_hash_by_height(4), Some(active4));
+
+        // The structural audit stays clean — a subsequent --reindex-chainstate
+        // would replay the true active chain, never the fork.
+        assert_eq!(cs.check_block_index(), Ok(5));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
