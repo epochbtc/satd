@@ -155,6 +155,93 @@ impl GrpcStreamClient {
     }
 }
 
+// --- SubscribeControl builders (gRPC wire-correct) -------------------------
+//
+// gRPC control parsing reads txid/outpoint as 32 RAW bytes in *internal*
+// order (`Txid::from_raw_hash(from_byte_array(bytes))`), whereas RPC returns
+// display (reversed) hex — so these builders reverse a display-hex txid into
+// internal bytes. Scripthashes and prefixes are natural-order `sha256(spk)`
+// bytes (no reversal). The WS JSON path differs (it parses display-hex txid
+// strings); see `ws_client` / the WS tests.
+
+fn txid_internal_bytes(display_hex: &str) -> Vec<u8> {
+    let mut b = hex::decode(display_hex).expect("txid hex");
+    b.reverse();
+    b
+}
+
+/// `AddOutpoints` for `(display_txid, vout)` pairs.
+pub fn add_outpoints(items: &[(&str, u32)]) -> SubscribeControl {
+    SubscribeControl {
+        msg: Some(Control::AddOutpoints(pb::AddOutpoints {
+            outpoints: items
+                .iter()
+                .map(|(txid, vout)| pb::Outpoint {
+                    txid: txid_internal_bytes(txid),
+                    vout: *vout,
+                })
+                .collect(),
+        })),
+    }
+}
+
+/// `RemoveOutpoints` for `(display_txid, vout)` pairs.
+pub fn remove_outpoints(items: &[(&str, u32)]) -> SubscribeControl {
+    SubscribeControl {
+        msg: Some(Control::RemoveOutpoints(pb::RemoveOutpoints {
+            outpoints: items
+                .iter()
+                .map(|(txid, vout)| pb::Outpoint {
+                    txid: txid_internal_bytes(txid),
+                    vout: *vout,
+                })
+                .collect(),
+        })),
+    }
+}
+
+/// `AddScripts` for natural-order `sha256(spk)` scripthash hex strings.
+pub fn add_scripts(scripthash_hex: &[&str]) -> SubscribeControl {
+    SubscribeControl {
+        msg: Some(Control::AddScripts(pb::AddScripts {
+            scripthashes: scripthash_hex
+                .iter()
+                .map(|h| hex::decode(h).expect("scripthash hex"))
+                .collect(),
+        })),
+    }
+}
+
+/// `AddTransactions` for display-hex txids. `min_depths` empty ⇒ lifecycle
+/// watch (optionally self-closing at `auto_close_depth`); non-empty ⇒ depth
+/// alarms.
+pub fn add_transactions(
+    display_txids: &[&str],
+    min_depths: Vec<u32>,
+    auto_close_depth: u32,
+) -> SubscribeControl {
+    SubscribeControl {
+        msg: Some(Control::AddTransactions(pb::AddTransactions {
+            txids: display_txids.iter().map(|t| txid_internal_bytes(t)).collect(),
+            min_depths,
+            auto_close_depth,
+        })),
+    }
+}
+
+/// `AddScriptPrefixes` for a single byte-aligned prefix (natural-order top
+/// bytes hex + bit length).
+pub fn add_script_prefixes(prefix_hex: &str, bits: u32) -> SubscribeControl {
+    SubscribeControl {
+        msg: Some(Control::AddScriptPrefixes(pb::AddScriptPrefixes {
+            prefixes: vec![pb::ScriptPrefix {
+                prefix: hex::decode(prefix_hex).expect("prefix hex"),
+                bits,
+            }],
+        })),
+    }
+}
+
 /// Await the next event on a stream, panicking on timeout / stream close.
 pub async fn next_event(stream: &mut Streaming<NodeEvent>, secs: u64) -> NodeEvent {
     tokio::time::timeout(Duration::from_secs(secs), stream.message())

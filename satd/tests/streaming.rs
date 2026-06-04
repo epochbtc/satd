@@ -19,9 +19,16 @@
 
 mod common;
 
-use common::grpc_client::{next_event_matching, Body, GrpcStreamClient};
+use common::grpc_client::{
+    add_outpoints, add_script_prefixes, add_scripts, add_transactions, next_event_matching,
+    next_event_opt, remove_outpoints, Body, GrpcStreamClient,
+};
 use common::ws_client::{StreamSseClient, WsClient};
-use common::{DeterministicWallet, StreamingNode};
+use common::{
+    block1_coinbase_txid, build_signed_p2wpkh_spend_from_block1_coinbase,
+    build_signed_p2wpkh_spend_seq, display_to_internal_hex, scripthash_hex, script_prefix_hex,
+    DeterministicWallet, StreamingNode,
+};
 use std::time::Duration;
 
 /// A throwaway regtest address to mine to. The streaming tests don't spend
@@ -169,4 +176,595 @@ async fn sse_firehose_block_connected() {
     .unwrap();
     assert_eq!(ev["body"]["kind"], "block_connected", "event: {ev}");
     assert_eq!(ev["body"]["height"], 1, "event: {ev}");
+}
+
+// ===========================================================================
+// Phase 1 (remainder): category filter, heartbeat
+// ===========================================================================
+
+/// gRPC `Subscribe` with `categories = chain (2)` delivers block events but not
+/// mempool events. We mine (chain) and broadcast a tx (mempool), then assert
+/// the first non-chain-filtered event we see is the BlockConnected and that no
+/// mempool event arrives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grpc_subscribe_category_filter_chain_only() {
+    let (sn, wallet) = matured_node().await;
+    let mut client = GrpcStreamClient::connect(sn.grpc_port()).await;
+    // categories = 2 (chain only).
+    let mut stream = client.subscribe(2, None).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    // Broadcast a tx (mempool category) AND mine a block (chain category).
+    broadcast_spend(&sn, &wallet, 0x55, 10_000).await;
+    mine_n(&sn, 1).await;
+
+    // The first event must be a chain event; a mempool event must never slip
+    // through the filter. Scan a few events to be sure.
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let mut saw_chain = false;
+    while std::time::Instant::now() < deadline {
+        let Some(ev) = next_event_opt(&mut stream, 3).await else {
+            break;
+        };
+        match ev.body {
+            Some(Body::Mempool(_)) => panic!("mempool event leaked past chain-only filter"),
+            Some(Body::Chain(_)) => {
+                saw_chain = true;
+                break;
+            }
+            _ => continue,
+        }
+    }
+    assert!(saw_chain, "expected at least one chain event");
+}
+
+/// gRPC `Subscribe` with `categories = heartbeat (4)` delivers periodic
+/// heartbeats (cadence 1s).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grpc_subscribe_heartbeat() {
+    let sn = start_streaming_async(vec![]).await;
+    let mut client = GrpcStreamClient::connect(sn.grpc_port()).await;
+    let mut stream = client.subscribe(4, None).await;
+    let ev = next_event_matching(&mut stream, 10, |b| matches!(b, Body::Heartbeat(_))).await;
+    match ev.body {
+        Some(Body::Heartbeat(hb)) => assert!(hb.uptime_ns > 0, "uptime advances"),
+        other => panic!("expected Heartbeat, got {other:?}"),
+    }
+}
+
+/// WS firehose honours a runtime `set_categories` control: after switching to
+/// chain-only, a mined block still arrives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ws_set_categories_chain_only() {
+    let (sn, _wallet) = matured_node().await;
+    let mut ws = WsClient::connect(sn.ws_port()).await;
+    ws.send_control(serde_json::json!({"type": "set_categories", "categories": 2}))
+        .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    mine_n(&sn, 1).await;
+    let ev = ws
+        .next_json_matching(15, |v| v["body"]["category"] == "chain")
+        .await;
+    assert_eq!(ev["body"]["kind"], "block_connected", "event: {ev}");
+}
+
+// ===========================================================================
+// Phase 2: watch primitives × match variants (gRPC Watch + WS)
+// ===========================================================================
+//
+// Fixtures: a node with 101 blocks mined to `wallet` (so block-1's coinbase
+// — paying `wallet`'s P2WPKH spk — is mature and spendable at the tip). The
+// canonical "spend" consumes that coinbase (outpoint `block1cb:0`, input
+// script = wallet spk) and pays a fresh `dest` script, so a single tx
+// exercises outpoint-spend, input-side script, output-side (funding) script,
+// and txid watches at once.
+
+/// Default seed for the funding wallet.
+const WALLET_SEED: u8 = 0x11;
+
+async fn matured_node() -> (StreamingNode, DeterministicWallet) {
+    let sn = start_streaming_async(vec![]).await;
+    let wallet = DeterministicWallet::from_secret([WALLET_SEED; 32]);
+    let addr = wallet.address.to_string();
+    let rpc = sn.node.rpc_handle();
+    tokio::task::spawn_blocking(move || rpc.mine(101, &addr))
+        .await
+        .unwrap();
+    (sn, wallet)
+}
+
+async fn coinbase1(sn: &StreamingNode) -> String {
+    let rpc = sn.node.rpc_handle();
+    tokio::task::spawn_blocking(move || block1_coinbase_txid(&rpc))
+        .await
+        .unwrap()
+}
+
+async fn mine_n(sn: &StreamingNode, n: u32) {
+    let rpc = sn.node.rpc_handle();
+    let addr = mine_addr(0x99);
+    tokio::task::spawn_blocking(move || rpc.mine(n, &addr))
+        .await
+        .unwrap();
+}
+
+/// Build + broadcast the canonical block-1-coinbase spend (RBF-signalling off).
+/// Returns `(spend_display_txid, dest_spk)`.
+async fn broadcast_spend(
+    sn: &StreamingNode,
+    wallet: &DeterministicWallet,
+    dest_seed: u8,
+    fee: u64,
+) -> (String, bitcoin::ScriptBuf) {
+    broadcast_spend_seq(sn, wallet, dest_seed, fee, 0xffff_ffff).await
+}
+
+async fn broadcast_spend_seq(
+    sn: &StreamingNode,
+    wallet: &DeterministicWallet,
+    dest_seed: u8,
+    fee: u64,
+    sequence: u32,
+) -> (String, bitcoin::ScriptBuf) {
+    let dest = DeterministicWallet::from_secret([dest_seed; 32])
+        .address
+        .script_pubkey();
+    let rpc = sn.node.rpc_handle();
+    let w = wallet.clone();
+    let dest2 = dest.clone();
+    let (raw, txid) = tokio::task::spawn_blocking(move || {
+        build_signed_p2wpkh_spend_seq(&rpc, &w, dest2, fee, sequence)
+    })
+    .await
+    .unwrap();
+    let rpc2 = sn.node.rpc_handle();
+    let got = tokio::task::spawn_blocking(move || rpc2.send_raw_tx(&raw))
+        .await
+        .unwrap();
+    assert_eq!(got, txid, "sendrawtransaction returns the computed txid");
+    (txid, dest)
+}
+
+// ---- gRPC Watch ----------------------------------------------------------
+
+/// A watched outpoint, spent: `OutpointSpent{confirmed:false}` in the mempool,
+/// then `{confirmed:true}` once mined.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grpc_watch_outpoint_spent_mempool_then_confirmed() {
+    let (sn, wallet) = matured_node().await;
+    let cb = coinbase1(&sn).await;
+    let mut client = GrpcStreamClient::connect(sn.grpc_port()).await;
+    let (_tx, mut stream) = client.watch(vec![add_outpoints(&[(&cb, 0)])]).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let (spend_txid, _dest) = broadcast_spend(&sn, &wallet, 0x55, 10_000).await;
+
+    let ev = next_event_matching(&mut stream, 15, |b| matches!(b, Body::OutpointSpent(_))).await;
+    let Some(Body::OutpointSpent(o)) = ev.body else {
+        unreachable!()
+    };
+    assert!(!o.confirmed, "first match is in the mempool");
+    assert_eq!(hex::encode(&o.outpoint_txid), display_to_internal_hex(&cb));
+    assert_eq!(o.outpoint_vout, 0);
+    assert_eq!(
+        hex::encode(&o.spending_txid),
+        display_to_internal_hex(&spend_txid)
+    );
+
+    mine_n(&sn, 1).await;
+    let ev = next_event_matching(
+        &mut stream,
+        15,
+        |b| matches!(b, Body::OutpointSpent(o) if o.confirmed),
+    )
+    .await;
+    let Some(Body::OutpointSpent(o)) = ev.body else {
+        unreachable!()
+    };
+    assert!(o.confirmed);
+    assert_eq!(hex::encode(&o.outpoint_txid), display_to_internal_hex(&cb));
+}
+
+/// A watched script paid by a tx output (funding side, `is_output=true`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grpc_watch_script_funding_mempool_then_confirmed() {
+    let (sn, wallet) = matured_node().await;
+    let dest = DeterministicWallet::from_secret([0x55; 32])
+        .address
+        .script_pubkey();
+    let sh = scripthash_hex(&dest);
+    let mut client = GrpcStreamClient::connect(sn.grpc_port()).await;
+    let (_tx, mut stream) = client.watch(vec![add_scripts(&[&sh])]).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    broadcast_spend(&sn, &wallet, 0x55, 10_000).await;
+
+    let ev = next_event_matching(
+        &mut stream,
+        15,
+        |b| matches!(b, Body::ScriptMatched(s) if s.is_output && !s.confirmed),
+    )
+    .await;
+    let Some(Body::ScriptMatched(s)) = ev.body else {
+        unreachable!()
+    };
+    assert_eq!(hex::encode(&s.scripthash), sh);
+    assert!(s.is_output);
+
+    mine_n(&sn, 1).await;
+    next_event_matching(
+        &mut stream,
+        15,
+        |b| matches!(b, Body::ScriptMatched(s) if s.is_output && s.confirmed),
+    )
+    .await;
+}
+
+/// A watched script spent by a tx input (`is_output=false`) — mempool (via the
+/// retained prevout scripthashes, #312) then confirmed (via block undo data).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grpc_watch_script_spend_mempool_then_confirmed() {
+    let (sn, wallet) = matured_node().await;
+    // The block-1 coinbase pays the wallet spk; spending it is an input-side
+    // match on that script.
+    let sh = scripthash_hex(&wallet.address.script_pubkey());
+    let mut client = GrpcStreamClient::connect(sn.grpc_port()).await;
+    let (_tx, mut stream) = client.watch(vec![add_scripts(&[&sh])]).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    broadcast_spend(&sn, &wallet, 0x56, 10_000).await;
+
+    let ev = next_event_matching(
+        &mut stream,
+        15,
+        |b| matches!(b, Body::ScriptMatched(s) if !s.is_output && !s.confirmed),
+    )
+    .await;
+    let Some(Body::ScriptMatched(s)) = ev.body else {
+        unreachable!()
+    };
+    assert_eq!(hex::encode(&s.scripthash), sh);
+    assert!(!s.is_output, "input-side match");
+
+    mine_n(&sn, 1).await;
+    next_event_matching(
+        &mut stream,
+        15,
+        |b| matches!(b, Body::ScriptMatched(s) if !s.is_output && s.confirmed),
+    )
+    .await;
+}
+
+/// A watched txid, seen in the mempool then confirmed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grpc_watch_txid_mempool_then_confirmed() {
+    let (sn, wallet) = matured_node().await;
+    // Precompute the spend txid by building (not broadcasting) first.
+    let dest = DeterministicWallet::from_secret([0x57; 32])
+        .address
+        .script_pubkey();
+    let rpc = sn.node.rpc_handle();
+    let w = wallet.clone();
+    let (raw, spend_txid) = tokio::task::spawn_blocking(move || {
+        build_signed_p2wpkh_spend_from_block1_coinbase(&rpc, &w, dest, 10_000)
+    })
+    .await
+    .unwrap();
+
+    let mut client = GrpcStreamClient::connect(sn.grpc_port()).await;
+    let (_tx, mut stream) = client
+        .watch(vec![add_transactions(&[&spend_txid], vec![], 0)])
+        .await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let rpc2 = sn.node.rpc_handle();
+    tokio::task::spawn_blocking(move || rpc2.send_raw_tx(&raw))
+        .await
+        .unwrap();
+
+    let ev = next_event_matching(
+        &mut stream,
+        15,
+        |b| matches!(b, Body::TxidMatched(t) if !t.confirmed),
+    )
+    .await;
+    let Some(Body::TxidMatched(t)) = ev.body else {
+        unreachable!()
+    };
+    assert_eq!(hex::encode(&t.txid), display_to_internal_hex(&spend_txid));
+
+    mine_n(&sn, 1).await;
+    let ev = next_event_matching(
+        &mut stream,
+        15,
+        |b| matches!(b, Body::TxidMatched(t) if t.confirmed),
+    )
+    .await;
+    let Some(Body::TxidMatched(t)) = ev.body else {
+        unreachable!()
+    };
+    assert!(t.height >= 1, "confirmed height set");
+}
+
+/// Removing a watched outpoint stops further matches on it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grpc_watch_remove_outpoint_stops_matches() {
+    let (sn, wallet) = matured_node().await;
+    let cb = coinbase1(&sn).await;
+    let mut client = GrpcStreamClient::connect(sn.grpc_port()).await;
+    let (tx, mut stream) = client.watch(vec![add_outpoints(&[(&cb, 0)])]).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    // Remove the watch before any spend happens.
+    tx.send(remove_outpoints(&[(&cb, 0)])).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    broadcast_spend(&sn, &wallet, 0x58, 10_000).await;
+    mine_n(&sn, 1).await;
+
+    // No OutpointSpent should arrive within the window.
+    let deadline = std::time::Instant::now() + Duration::from_secs(6);
+    while std::time::Instant::now() < deadline {
+        let Some(ev) = next_event_opt(&mut stream, 2).await else {
+            continue;
+        };
+        if matches!(ev.body, Some(Body::OutpointSpent(_))) {
+            panic!("got OutpointSpent after removing the watch");
+        }
+    }
+}
+
+/// A watched script-prefix bucket fires `PrefixMatched` (with the full raw tx)
+/// for a tx whose output pays a script in the bucket.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grpc_watch_prefix_funding_mempool() {
+    let (sn, wallet) = matured_node().await;
+    let dest = DeterministicWallet::from_secret([0x59; 32])
+        .address
+        .script_pubkey();
+    let prefix = script_prefix_hex(&dest, 8);
+    let mut client = GrpcStreamClient::connect(sn.grpc_port()).await;
+    let (_tx, mut stream) = client.watch(vec![add_script_prefixes(&prefix, 8)]).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let (spend_txid, _dest) = broadcast_spend(&sn, &wallet, 0x59, 10_000).await;
+
+    let ev = next_event_matching(
+        &mut stream,
+        15,
+        |b| matches!(b, Body::PrefixMatched(p) if !p.confirmed),
+    )
+    .await;
+    let Some(Body::PrefixMatched(p)) = ev.body else {
+        unreachable!()
+    };
+    assert_eq!(p.prefix.as_ref().map(|sp| sp.bits), Some(8));
+    // The full serialized tx is carried inline; its txid matches the spend.
+    let tx: bitcoin::Transaction =
+        bitcoin::consensus::deserialize(&p.raw_tx).expect("raw_tx decodes");
+    assert_eq!(tx.compute_txid().to_string(), spend_txid);
+}
+
+/// A single-shot depth alarm fires `TxidDepthReached` once the tx is buried to
+/// the requested depth, and not before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grpc_watch_depth_alarm_fires_at_threshold() {
+    let (sn, wallet) = matured_node().await;
+    let dest = DeterministicWallet::from_secret([0x5a; 32])
+        .address
+        .script_pubkey();
+    let rpc = sn.node.rpc_handle();
+    let w = wallet.clone();
+    let (raw, spend_txid) = tokio::task::spawn_blocking(move || {
+        build_signed_p2wpkh_spend_from_block1_coinbase(&rpc, &w, dest, 10_000)
+    })
+    .await
+    .unwrap();
+
+    let mut client = GrpcStreamClient::connect(sn.grpc_port()).await;
+    // Depth alarm at depth 2 (non-empty min_depths).
+    let (_tx, mut stream) = client
+        .watch(vec![add_transactions(&[&spend_txid], vec![2], 0)])
+        .await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let rpc2 = sn.node.rpc_handle();
+    tokio::task::spawn_blocking(move || rpc2.send_raw_tx(&raw))
+        .await
+        .unwrap();
+
+    // Confirm at depth 1 — no alarm yet.
+    mine_n(&sn, 1).await;
+    if let Some(ev) = next_event_opt(&mut stream, 3).await {
+        assert!(
+            !matches!(ev.body, Some(Body::TxidDepthReached(_))),
+            "alarm fired early (depth 1)"
+        );
+    }
+    // Depth 2 — alarm fires.
+    mine_n(&sn, 1).await;
+    let ev = next_event_matching(&mut stream, 15, |b| {
+        matches!(b, Body::TxidDepthReached(_))
+    })
+    .await;
+    let Some(Body::TxidDepthReached(d)) = ev.body else {
+        unreachable!()
+    };
+    assert_eq!(hex::encode(&d.txid), display_to_internal_hex(&spend_txid));
+    assert!(d.depth >= 2, "fired at >= requested depth");
+}
+
+// ---- WS ------------------------------------------------------------------
+
+/// WS watch: a watched outpoint spent → `outpoint_spent` JSON match.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ws_watch_outpoint_spent() {
+    let (sn, wallet) = matured_node().await;
+    let cb = coinbase1(&sn).await;
+    let mut ws = WsClient::connect(sn.ws_port()).await;
+    ws.send_control(serde_json::json!({
+        "type": "add_outpoints",
+        "outpoints": [{"txid": cb, "vout": 0}],
+    }))
+    .await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let (spend_txid, _dest) = broadcast_spend(&sn, &wallet, 0x5b, 10_000).await;
+
+    let ev = ws
+        .next_json_matching(15, |v| v["body"]["category"] == "outpoint_spent")
+        .await;
+    assert_eq!(ev["body"]["confirmed"], false, "event: {ev}");
+    assert_eq!(
+        ev["body"]["outpoint_txid"],
+        display_to_internal_hex(&cb),
+        "event: {ev}"
+    );
+    assert_eq!(
+        ev["body"]["spending_txid"],
+        display_to_internal_hex(&spend_txid)
+    );
+}
+
+/// WS watch: a watched script funded by an output → `script_matched`
+/// (`is_output=true`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ws_watch_script_funding() {
+    let (sn, wallet) = matured_node().await;
+    let dest = DeterministicWallet::from_secret([0x5c; 32])
+        .address
+        .script_pubkey();
+    let sh = scripthash_hex(&dest);
+    let mut ws = WsClient::connect(sn.ws_port()).await;
+    ws.send_control(serde_json::json!({"type": "add_scripts", "scripthashes": [sh]}))
+        .await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    broadcast_spend(&sn, &wallet, 0x5c, 10_000).await;
+
+    let ev = ws
+        .next_json_matching(15, |v| {
+            v["body"]["category"] == "script_matched" && v["body"]["is_output"] == true
+        })
+        .await;
+    assert_eq!(ev["body"]["scripthash"], sh, "event: {ev}");
+}
+
+/// WS watch: a watched txid seen in the mempool → `txid_matched`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ws_watch_txid() {
+    let (sn, wallet) = matured_node().await;
+    let dest = DeterministicWallet::from_secret([0x5d; 32])
+        .address
+        .script_pubkey();
+    let rpc = sn.node.rpc_handle();
+    let w = wallet.clone();
+    let (raw, spend_txid) = tokio::task::spawn_blocking(move || {
+        build_signed_p2wpkh_spend_from_block1_coinbase(&rpc, &w, dest, 10_000)
+    })
+    .await
+    .unwrap();
+
+    let mut ws = WsClient::connect(sn.ws_port()).await;
+    ws.send_control(serde_json::json!({"type": "add_transactions", "txids": [spend_txid]}))
+        .await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let rpc2 = sn.node.rpc_handle();
+    tokio::task::spawn_blocking(move || rpc2.send_raw_tx(&raw))
+        .await
+        .unwrap();
+
+    let ev = ws
+        .next_json_matching(15, |v| v["body"]["category"] == "txid_matched")
+        .await;
+    assert_eq!(
+        ev["body"]["txid"],
+        display_to_internal_hex(&spend_txid),
+        "event: {ev}"
+    );
+}
+
+/// WS watch: a script-prefix bucket fires `prefix_matched` with the raw tx.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ws_watch_prefix_funding() {
+    let (sn, wallet) = matured_node().await;
+    let dest = DeterministicWallet::from_secret([0x5e; 32])
+        .address
+        .script_pubkey();
+    let prefix = script_prefix_hex(&dest, 8);
+    let mut ws = WsClient::connect(sn.ws_port()).await;
+    ws.send_control(serde_json::json!({
+        "type": "add_script_prefixes",
+        "prefixes": [{"prefix": prefix, "bits": 8}],
+    }))
+    .await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let (spend_txid, _dest) = broadcast_spend(&sn, &wallet, 0x5e, 10_000).await;
+
+    let ev = ws
+        .next_json_matching(15, |v| v["body"]["category"] == "prefix_matched")
+        .await;
+    assert_eq!(ev["body"]["bits"], 8, "event: {ev}");
+    let raw = hex::decode(ev["body"]["raw_tx"].as_str().unwrap()).unwrap();
+    let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&raw).unwrap();
+    assert_eq!(tx.compute_txid().to_string(), spend_txid);
+}
+
+/// WS watch: an RBF replacement of a watched tx → `txid_replaced`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ws_watch_txid_replaced_rbf() {
+    let (sn, wallet) = matured_node().await;
+    // Build tx A (RBF-signalling) and a higher-fee replacement B on the same
+    // input, without broadcasting yet.
+    let desta = DeterministicWallet::from_secret([0x5f; 32])
+        .address
+        .script_pubkey();
+    let destb = DeterministicWallet::from_secret([0x60; 32])
+        .address
+        .script_pubkey();
+    let rpc = sn.node.rpc_handle();
+    let w = wallet.clone();
+    let (raw_a, txid_a) = tokio::task::spawn_blocking(move || {
+        build_signed_p2wpkh_spend_seq(&rpc, &w, desta, 10_000, 0xffff_fffd)
+    })
+    .await
+    .unwrap();
+    let rpc = sn.node.rpc_handle();
+    let w = wallet.clone();
+    let (raw_b, txid_b) = tokio::task::spawn_blocking(move || {
+        build_signed_p2wpkh_spend_seq(&rpc, &w, destb, 100_000, 0xffff_fffd)
+    })
+    .await
+    .unwrap();
+
+    let mut ws = WsClient::connect(sn.ws_port()).await;
+    ws.send_control(serde_json::json!({"type": "add_transactions", "txids": [txid_a]}))
+        .await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let rpc = sn.node.rpc_handle();
+    tokio::task::spawn_blocking(move || rpc.send_raw_tx(&raw_a))
+        .await
+        .unwrap();
+    // Wait for the seen notice, then broadcast the replacement.
+    ws.next_json_matching(15, |v| v["body"]["category"] == "txid_matched")
+        .await;
+    let rpc = sn.node.rpc_handle();
+    tokio::task::spawn_blocking(move || rpc.send_raw_tx(&raw_b))
+        .await
+        .unwrap();
+
+    let ev = ws
+        .next_json_matching(15, |v| v["body"]["category"] == "txid_replaced")
+        .await;
+    assert_eq!(
+        ev["body"]["txid"],
+        display_to_internal_hex(&txid_a),
+        "event: {ev}"
+    );
+    assert_eq!(
+        ev["body"]["replacing_txid"],
+        display_to_internal_hex(&txid_b)
+    );
 }

@@ -669,6 +669,38 @@ fn poll_streaming_ports(
     }
 }
 
+/// A blocking JSON-RPC caller. Implemented by both [`TestNode`] (sync tests,
+/// borrows the node) and [`RpcHandle`] (async tests, moves into
+/// `spawn_blocking`), so the funding helpers below work from either context
+/// without changing the existing `e2e.rs` call sites.
+pub trait BlockingRpc {
+    fn rpc(
+        &self,
+        method: &str,
+        params: Vec<serde_json::Value>,
+    ) -> Result<serde_json::Value, String>;
+}
+
+impl BlockingRpc for TestNode {
+    fn rpc(
+        &self,
+        method: &str,
+        params: Vec<serde_json::Value>,
+    ) -> Result<serde_json::Value, String> {
+        self.rpc_call_with_params(method, params)
+    }
+}
+
+impl BlockingRpc for RpcHandle {
+    fn rpc(
+        &self,
+        method: &str,
+        params: Vec<serde_json::Value>,
+    ) -> Result<serde_json::Value, String> {
+        self.call(method, params)
+    }
+}
+
 /// A `Send + 'static` RPC caller cloned from a [`TestNode`]. The streaming
 /// suite drives mining / tx submission from `tokio::task::spawn_blocking`
 /// while holding an async event stream — and `reqwest::blocking` panics if
@@ -774,6 +806,7 @@ impl TestNode {
 /// the matching `SecretKey` / `PublicKey` for signing spends. Lifted from the
 /// E2E suite so both `tests/e2e.rs` and `tests/streaming.rs` share one funding
 /// primitive.
+#[derive(Clone)]
 pub struct DeterministicWallet {
     pub sk: bitcoin::secp256k1::SecretKey,
     pub pk: bitcoin::PublicKey,
@@ -794,14 +827,75 @@ impl DeterministicWallet {
     }
 }
 
+/// The display-hex txid of block 1's coinbase (the input most streaming tests
+/// spend). The caller must have mined ≥1 block.
+pub fn block1_coinbase_txid<R: BlockingRpc>(node: &R) -> String {
+    let block1_hash = node
+        .rpc("getblockhash", vec![serde_json::json!(1)])
+        .expect("getblockhash 1")["result"]
+        .as_str()
+        .expect("hash string")
+        .to_string();
+    node.rpc(
+        "getblock",
+        vec![serde_json::json!(block1_hash), serde_json::json!(1)],
+    )
+    .expect("getblock")["result"]["tx"][0]
+        .as_str()
+        .expect("coinbase txid")
+        .to_string()
+}
+
+/// `sha256(scriptPubKey)` as natural-order hex — the watch-set scripthash form
+/// (`AddScripts` input and `ScriptMatched.scripthash` output both use this).
+pub fn scripthash_hex(spk: &bitcoin::Script) -> String {
+    use bitcoin::hashes::{sha256, Hash as _};
+    hex::encode(sha256::Hash::hash(spk.as_bytes()).to_byte_array())
+}
+
+/// The top `bits/8` bytes of `sha256(scriptPubKey)` as hex — a byte-aligned
+/// script-prefix bucket for `AddScriptPrefixes`. `bits` must be a multiple of 8
+/// in `1..=32` (the tests use byte-aligned prefixes to avoid sub-byte masking).
+pub fn script_prefix_hex(spk: &bitcoin::Script, bits: u32) -> String {
+    assert!(bits.is_multiple_of(8) && (8..=32).contains(&bits), "byte-aligned bits");
+    use bitcoin::hashes::{sha256, Hash as _};
+    let sh = sha256::Hash::hash(spk.as_bytes()).to_byte_array();
+    hex::encode(&sh[..(bits / 8) as usize])
+}
+
+/// Convert a display-order (RPC) txid/blockhash hex into internal (raw)
+/// byte-order hex. Watch matches encode txids as `as_raw_hash().to_byte_array()`
+/// (internal order), whereas RPC returns display (reversed) hex — so an
+/// assertion comparing a match field against an RPC txid must convert one.
+pub fn display_to_internal_hex(display_hex: &str) -> String {
+    let mut b = hex::decode(display_hex).expect("hex");
+    b.reverse();
+    hex::encode(b)
+}
+
 /// Build + sign a P2WPKH spend from block-1's coinbase to `dest_script`.
 /// Returns `(raw_tx_hex, txid_hex)`. The caller must have mined ≥101 blocks to
-/// `wallet.address` so the coinbase is mature. Lifted from `tests/e2e.rs`.
-pub fn build_signed_p2wpkh_spend_from_block1_coinbase(
-    node: &TestNode,
+/// `wallet.address` so the coinbase is mature. `Sequence::MAX` (no RBF
+/// signalling). Lifted from `tests/e2e.rs`.
+pub fn build_signed_p2wpkh_spend_from_block1_coinbase<R: BlockingRpc>(
+    node: &R,
     wallet: &DeterministicWallet,
     dest_script: bitcoin::ScriptBuf,
     fee_sat: u64,
+) -> (String, String) {
+    build_signed_p2wpkh_spend_seq(node, wallet, dest_script, fee_sat, 0xffff_ffff)
+}
+
+/// Like [`build_signed_p2wpkh_spend_from_block1_coinbase`] but with an explicit
+/// input `sequence` — pass a BIP125-signalling value (e.g. `0xffff_fffd`) to
+/// make the tx replaceable for the RBF (`TxidReplaced`) tests, and vary
+/// `fee_sat` to build the higher-fee replacement.
+pub fn build_signed_p2wpkh_spend_seq<R: BlockingRpc>(
+    node: &R,
+    wallet: &DeterministicWallet,
+    dest_script: bitcoin::ScriptBuf,
+    fee_sat: u64,
+    sequence: u32,
 ) -> (String, String) {
     use bitcoin::hashes::Hash as _;
     use bitcoin::secp256k1::{Message, Secp256k1};
@@ -812,21 +906,7 @@ pub fn build_signed_p2wpkh_spend_from_block1_coinbase(
     };
     use std::str::FromStr;
 
-    let block1_hash = node
-        .rpc_call_with_params("getblockhash", vec![serde_json::json!(1)])
-        .expect("getblockhash 1")["result"]
-        .as_str()
-        .expect("hash string")
-        .to_string();
-    let cb_txid_str = node
-        .rpc_call_with_params(
-            "getblock",
-            vec![serde_json::json!(block1_hash), serde_json::json!(1)],
-        )
-        .expect("getblock")["result"]["tx"][0]
-        .as_str()
-        .expect("coinbase txid")
-        .to_string();
+    let cb_txid_str = block1_coinbase_txid(node);
     let cb_txid = bitcoin::Txid::from_str(&cb_txid_str).expect("txid parse");
     // Regtest block-1 coinbase subsidy: 50 BTC (no halvings before 150).
     let cb_value_sat: u64 = 50 * 100_000_000;
@@ -840,7 +920,7 @@ pub fn build_signed_p2wpkh_spend_from_block1_coinbase(
                 vout: 0,
             },
             script_sig: ScriptBuf::new(),
-            sequence: Sequence::MAX,
+            sequence: Sequence(sequence),
             witness: Witness::new(),
         }],
         output: vec![TxOut {
