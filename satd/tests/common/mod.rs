@@ -595,8 +595,21 @@ impl StreamingNode {
     /// `--events-grpc-bind` / `--streamws` in `extra_args` to override (e.g. to
     /// enable only one, or to bind with auth). The caller's flags win.
     pub fn start(extra_args: &[&str]) -> Self {
-        let want_grpc = !extra_args.iter().any(|a| a.starts_with("--events-grpc-bind"));
-        let want_ws = !extra_args.iter().any(|a| a.starts_with("--streamws"));
+        Self::start_with_env(extra_args, &[])
+    }
+
+    /// Like [`Self::start`] but also sets environment variables on the spawned
+    /// `satd` — used by the Lagged / replay-ring tests to shrink the broadcast
+    /// buffer via `SATD_EVENT_BROADCAST_CAPACITY`.
+    pub fn start_with_env(extra_args: &[&str], env: &[(&str, &str)]) -> Self {
+        // Detect ONLY the explicit bind flags (`--events-grpc-bind` /
+        // `--streamws`), not their siblings like `--streamws-auth` or
+        // `--streamws-max-conns` — otherwise a caller that tunes a streamws
+        // knob would suppress the auto-added bind and the listener would never
+        // come up.
+        let is_bind = |a: &&str, flag: &str| **a == *flag || a.starts_with(&format!("{flag}="));
+        let want_grpc = !extra_args.iter().any(|a| is_bind(a, "--events-grpc-bind"));
+        let want_ws = !extra_args.iter().any(|a| is_bind(a, "--streamws"));
         let mut args: Vec<String> = Vec::new();
         if want_grpc {
             args.push("--events-grpc-bind=127.0.0.1:0".to_string());
@@ -608,14 +621,18 @@ impl StreamingNode {
             args.push((*a).to_string());
         }
         let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        let node = TestNode::start(&arg_refs);
+        let node = TestNode::start_with_env(&arg_refs, env);
 
         // The caller may have supplied explicit binds; in that case still poll
         // for them (they're requested) — only a fully-absent listener flag with
         // a `=0`/disabled value is skipped, which we approximate by requesting
         // whatever the merged args ask for.
-        let req_grpc = args.iter().any(|a| a.starts_with("--events-grpc-bind"));
-        let req_ws = args.iter().any(|a| a.starts_with("--streamws"));
+        let req_grpc = args
+            .iter()
+            .any(|a| a == "--events-grpc-bind" || a.starts_with("--events-grpc-bind="));
+        let req_ws = args
+            .iter()
+            .any(|a| a == "--streamws" || a.starts_with("--streamws="));
         let (grpc_port, ws_port) = poll_streaming_ports(&node, req_grpc, req_ws);
         StreamingNode {
             node,
@@ -630,6 +647,28 @@ impl StreamingNode {
 
     pub fn ws_port(&self) -> u16 {
         self.ws_port.expect("streamws listener not bound")
+    }
+
+    /// Stop and re-spawn `satd` on the same datadir + RPC port (preserving the
+    /// durable chain), re-enabling the streaming listeners on fresh
+    /// OS-assigned ports and re-discovering them. Used by the `instance_id`
+    /// epoch test: the per-process publisher nonce changes across a restart
+    /// while the durable confirmed chain (and its cursor replay) survives.
+    /// Blocking — call via `spawn_blocking` from an async test.
+    pub fn restart(&mut self) {
+        self.node.stop();
+        let args = ["--events-grpc-bind=127.0.0.1:0", "--streamws=127.0.0.1:0"];
+        let mut fresh =
+            TestNode::start_with_datadir(&self.node.datadir, self.node.rpcport, &args);
+        std::mem::swap(&mut self.node.process, &mut fresh.process);
+        self.node.cookie = std::mem::take(&mut fresh.cookie);
+        self.node.p2p_port = fresh.p2p_port;
+        self.node.stderr_log = std::mem::take(&mut fresh.stderr_log);
+        // Blank the husk's datadir so its Drop can't delete the shared dir.
+        fresh.datadir = PathBuf::new();
+        let (g, w) = poll_streaming_ports(&self.node, true, true);
+        self.grpc_port = g;
+        self.ws_port = w;
     }
 }
 
@@ -757,6 +796,14 @@ impl RpcHandle {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Current best-block height.
+    pub fn block_count(&self) -> u64 {
+        self.call("getblockcount", vec![])
+            .expect("getblockcount")["result"]
+            .as_u64()
+            .expect("height")
     }
 
     /// Broadcast a raw transaction hex, returning the txid.

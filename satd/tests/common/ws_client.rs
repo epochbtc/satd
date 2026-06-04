@@ -39,6 +39,37 @@ impl WsClient {
         Self::connect_path(port, "/ws", token).await
     }
 
+    /// Connect with a tiny TCP receive buffer (`SO_RCVBUF`), so a non-reading
+    /// client makes the server's send block — and its broadcast receiver lag —
+    /// after only a few buffered events. Makes the in-band `Lagged` test
+    /// deterministic on loopback (whose default socket buffers are megabytes).
+    pub async fn connect_lagprone(port: u16) -> Self {
+        use tokio::net::TcpSocket;
+        let sock = TcpSocket::new_v4().expect("socket");
+        // Best-effort: the kernel may round this up, but it stays far below the
+        // multi-MB loopback default.
+        let _ = sock.set_recv_buffer_size(4096);
+        let addr = format!("127.0.0.1:{port}").parse().expect("addr");
+        let stream = sock.connect(addr).await.expect("tcp connect");
+        let req = format!("ws://127.0.0.1:{port}/ws")
+            .into_client_request()
+            .expect("request");
+        let (ws, _resp) =
+            tokio_tungstenite::client_async(req, MaybeTlsStream::Plain(stream))
+                .await
+                .expect("ws handshake");
+        Self { ws }
+    }
+
+    /// Connect to `/ws` with a raw query string for durable replay, e.g.
+    /// `"?from_height=2"` (the WS upgrade accepts the same `from_*` params as
+    /// `/sse`).
+    pub async fn connect_query(port: u16, query: &str) -> Self {
+        Self::connect_path(port, &format!("/ws{query}"), None)
+            .await
+            .expect("ws connect (query)")
+    }
+
     async fn connect_path(
         port: u16,
         path: &str,

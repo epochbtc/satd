@@ -21,13 +21,13 @@ mod common;
 
 use common::grpc_client::{
     add_outpoints, add_script_prefixes, add_scripts, add_transactions, next_event_matching,
-    next_event_opt, remove_outpoints, Body, GrpcStreamClient,
+    next_event_opt, remove_outpoints, Body, Control, Cursor, GrpcStreamClient, SubscribeControl,
 };
 use common::ws_client::{StreamSseClient, WsClient};
 use common::{
     block1_coinbase_txid, build_signed_p2wpkh_spend_from_block1_coinbase,
     build_signed_p2wpkh_spend_seq, display_to_internal_hex, scripthash_hex, script_prefix_hex,
-    DeterministicWallet, StreamingNode,
+    write_authfile, DeterministicWallet, StreamingNode, TokenSpec,
 };
 use std::time::Duration;
 
@@ -767,4 +767,374 @@ async fn ws_watch_txid_replaced_rbf() {
         ev["body"]["replacing_txid"],
         display_to_internal_hex(&txid_b)
     );
+}
+
+// ===========================================================================
+// Phase 3: cursor replay / instance_id
+// ===========================================================================
+
+/// Spawn a streaming node from an async test with owned args + env (auth /
+/// caps / capacity tests need dynamic strings; the blocking start runs on a
+/// blocking task).
+async fn start_streaming_args(args: Vec<String>, env: Vec<(String, String)>) -> StreamingNode {
+    tokio::task::spawn_blocking(move || {
+        let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        let envrefs: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        StreamingNode::start_with_env(&refs, &envrefs)
+    })
+    .await
+    .unwrap()
+}
+
+/// Extract a `BlockConnected` height from an event body, if it is one.
+fn block_height(body: &Body) -> Option<u32> {
+    if let Body::Chain(ce) = body
+        && let Some(satd_events::proto::v1::chain_event::Body::BlockConnected(bc)) = &ce.body
+    {
+        return Some(bc.height);
+    }
+    None
+}
+
+fn is_block_connected(body: &Body) -> bool {
+    block_height(body).is_some()
+}
+
+fn cursor(height: u32) -> Cursor {
+    Cursor {
+        height,
+        tx_index: 0,
+        mempool_seq: 0,
+        instance_id: 0,
+    }
+}
+
+/// gRPC `Subscribe(from_cursor)` replays confirmed history forward from the
+/// cursor, then joins live with no gap or duplicate at the boundary.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grpc_subscribe_from_cursor_replays_then_live() {
+    let sn = start_streaming_async(vec![]).await;
+    mine_n(&sn, 5).await; // tip = 5
+
+    let mut client = GrpcStreamClient::connect(sn.grpc_port()).await;
+    // chain-only, replay from height 2 → expect 3, 4, 5 replayed.
+    let mut stream = client.subscribe(2, Some(cursor(2))).await;
+
+    let mut heights = Vec::new();
+    for _ in 0..3 {
+        let ev = next_event_matching(&mut stream, 15, is_block_connected).await;
+        heights.push(block_height(&ev.body.unwrap()).unwrap());
+    }
+    assert_eq!(heights, vec![3, 4, 5], "replayed confirmed history");
+
+    // Live handoff: mine one more → height 6, exactly once, no gap/dup.
+    mine_n(&sn, 1).await;
+    let ev = next_event_matching(&mut stream, 15, is_block_connected).await;
+    assert_eq!(block_height(&ev.body.unwrap()), Some(6), "live block after replay");
+}
+
+/// WS `/ws?from_height=` replays then joins live.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ws_from_cursor_replays_then_live() {
+    let sn = start_streaming_async(vec![]).await;
+    mine_n(&sn, 5).await;
+
+    let mut ws = common::ws_client::WsClient::connect_query(sn.ws_port(), "?from_height=2").await;
+    let mut heights = Vec::new();
+    for _ in 0..3 {
+        let ev = ws
+            .next_json_matching(15, |v| v["body"]["kind"] == "block_connected")
+            .await;
+        heights.push(ev["body"]["height"].as_u64().unwrap());
+    }
+    assert_eq!(heights, vec![3, 4, 5]);
+
+    mine_n(&sn, 1).await;
+    let ev = ws
+        .next_json_matching(15, |v| v["body"]["kind"] == "block_connected")
+        .await;
+    assert_eq!(ev["body"]["height"], 6);
+}
+
+/// SSE `/sse?from_height=` replays then joins live.
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn sse_from_cursor_replays_then_live() {
+    let sn = start_streaming_async(vec![]).await;
+    mine_n(&sn, 5).await;
+    let port = sn.ws_port();
+
+    let heights = tokio::task::spawn_blocking(move || {
+        let mut sse = StreamSseClient::connect(port, "/sse?from_height=2");
+        let mut hs = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while hs.len() < 3 && std::time::Instant::now() < deadline {
+            let (_t, data) = sse.next_event();
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data)
+                && v["body"]["kind"] == "block_connected"
+            {
+                hs.push(v["body"]["height"].as_u64().unwrap());
+            }
+        }
+        hs
+    })
+    .await
+    .unwrap();
+    assert_eq!(heights, vec![3, 4, 5]);
+}
+
+/// The per-process `instance_id` changes across a restart (so a client can
+/// detect a daemon restart and discard a stale mempool watermark), while the
+/// durable confirmed chain — and its `from_cursor` replay — survives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn instance_id_resets_across_restart_confirmed_replay_survives() {
+    let sn = start_streaming_async(vec![]).await;
+    mine_n(&sn, 3).await; // tip = 3
+
+    let instance_a = first_live_block_instance(&sn).await; // mines 1 → tip 4
+
+    // Restart on the same datadir.
+    let sn = tokio::task::spawn_blocking(move || {
+        let mut sn = sn;
+        sn.restart();
+        sn
+    })
+    .await
+    .unwrap();
+
+    let instance_b = first_live_block_instance(&sn).await; // mines 1 → tip 5
+    assert_ne!(
+        instance_a, instance_b,
+        "instance_id is a fresh per-process nonce after restart"
+    );
+
+    // Durable confirmed replay survives the restart: replay from height 1.
+    let mut client = GrpcStreamClient::connect(sn.grpc_port()).await;
+    let mut stream = client.subscribe(2, Some(cursor(1))).await;
+    let ev = next_event_matching(&mut stream, 15, is_block_connected).await;
+    assert_eq!(
+        block_height(&ev.body.unwrap()),
+        Some(2),
+        "confirmed replay resumes from height+1 after restart"
+    );
+}
+
+/// Subscribe live, mine one block, and read the issuing publisher's
+/// `instance_id` off the block event's cursor.
+async fn first_live_block_instance(sn: &StreamingNode) -> u64 {
+    let mut client = GrpcStreamClient::connect(sn.grpc_port()).await;
+    let mut stream = client.subscribe(2, None).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    mine_n(sn, 1).await;
+    let ev = next_event_matching(&mut stream, 15, is_block_connected).await;
+    ev.cursor.expect("block event carries a cursor").instance_id
+}
+
+/// A mid-stream `SetCursor` control on `Watch` is a deliberate no-op: the
+/// stream stays open and subsequent watches still fire.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grpc_watch_set_cursor_is_noop() {
+    let (sn, wallet) = matured_node().await;
+    let cb = coinbase1(&sn).await;
+    let mut client = GrpcStreamClient::connect(sn.grpc_port()).await;
+    // Open with a SetCursor (no-op), then add a real watch.
+    let set_cursor = SubscribeControl {
+        msg: Some(Control::SetCursor(satd_events::proto::v1::SetCursor {
+            cursor: Some(cursor(1)),
+        })),
+    };
+    let (tx, mut stream) = client.watch(vec![set_cursor]).await;
+    tx.send(add_outpoints(&[(&cb, 0)])).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    broadcast_spend(&sn, &wallet, 0x61, 10_000).await;
+    // The stream survived the no-op SetCursor and still delivers the match.
+    next_event_matching(&mut stream, 15, |b| matches!(b, Body::OutpointSpent(_))).await;
+}
+
+// ===========================================================================
+// Phase 4: in-band Lagged signal (A1) — deterministic via the capacity knob
+// ===========================================================================
+
+/// A slow/non-reading subscriber that overflows the (shrunk) broadcast buffer
+/// receives an in-band `Lagged{dropped_count, resume_cursor}` instead of a
+/// silent gap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grpc_lagged_emits_resume_cursor() {
+    // Shrink the broadcast buffer so a handful of unread events forces a lag.
+    let sn = start_streaming_args(
+        vec![],
+        vec![("SATD_EVENT_BROADCAST_CAPACITY".into(), "2".into())],
+    )
+    .await;
+    // Tiny h2 window so the unread client blocks the server after a few events.
+    let mut client = GrpcStreamClient::connect_lagprone(sn.grpc_port()).await;
+    let mut stream = client.subscribe(2, None).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    // Do NOT read; mine past the 2-slot broadcast buffer + the tiny window so
+    // the carrier task blocks on the unread client and its broadcast receiver
+    // falls behind.
+    mine_n(&sn, 300).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Now drain: somewhere in the stream a Lagged notice must appear.
+    let ev = next_event_matching(&mut stream, 30, |b| matches!(b, Body::Lagged(_))).await;
+    let Some(Body::Lagged(l)) = ev.body else {
+        unreachable!()
+    };
+    assert!(l.dropped_count > 0, "Lagged reports a positive drop count");
+    assert!(
+        l.resume_cursor.is_some(),
+        "Lagged carries a resume cursor for from_cursor reconnect"
+    );
+}
+
+// NOTE: a WS/SSE in-band-lag E2E is intentionally omitted. The lag is triggered
+// by carrier backpressure, which for gRPC we force deterministically with a tiny
+// HTTP/2 flow-control window (see `grpc_lagged_emits_resume_cursor`). The WS
+// equivalent — a tiny TCP `SO_RCVBUF` — does not reliably backpressure on
+// loopback (the kernel's receive-window behaviour differs from h2's explicit
+// window), so a WS lag E2E would be flaky. The WS rendering of the `lagged`
+// body is covered by unit tests in `events/src/ws.rs`, and the in-band Lagged
+// path itself is proven end-to-end by the gRPC test above.
+
+// ===========================================================================
+// Phase 5: admission — auth + caps
+// ===========================================================================
+
+/// gRPC events auth: no token rejected, wrong-capability rejected, valid
+/// `stream:subscribe` token accepted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grpc_auth_matrix() {
+    let fixture = write_authfile(&[
+        TokenSpec {
+            id: "sub",
+            token: "tok-subscribe",
+            capabilities: &["stream:subscribe"],
+            rate_limit: None,
+            watch_quota: None,
+        },
+        TokenSpec {
+            id: "ro",
+            token: "tok-readonly",
+            capabilities: &["rpc:read"],
+            rate_limit: None,
+            watch_quota: None,
+        },
+    ]);
+    let autharg = format!("--authfile={}", fixture.authfile.display());
+    let sn = start_streaming_args(
+        vec![
+            autharg,
+            "--events-grpc-auth=1".into(),
+            // streamws not needed here; disable to avoid an extra listener.
+            "--streamws=127.0.0.1:0".into(),
+        ],
+        vec![],
+    )
+    .await;
+    let port = sn.grpc_port();
+
+    // No token → rejected.
+    let mut anon = GrpcStreamClient::try_connect_with_token(port, None)
+        .await
+        .expect("tcp connect");
+    assert!(anon.try_subscribe(0).await.is_err(), "anon subscribe rejected");
+
+    // Wrong capability → rejected.
+    let mut ro = GrpcStreamClient::connect_with_token(port, "tok-readonly").await;
+    assert!(
+        ro.try_subscribe(0).await.is_err(),
+        "rpc:read token rejected on stream:subscribe"
+    );
+
+    // Valid token → accepted.
+    let mut ok = GrpcStreamClient::connect_with_token(port, "tok-subscribe").await;
+    assert!(
+        ok.try_subscribe(0).await.is_ok(),
+        "stream:subscribe token accepted"
+    );
+}
+
+/// WS events auth: missing token rejected at the upgrade, valid token accepted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ws_auth_matrix() {
+    let fixture = write_authfile(&[TokenSpec {
+        id: "sub",
+        token: "tok-ws",
+        capabilities: &["stream:subscribe"],
+        rate_limit: None,
+        watch_quota: None,
+    }]);
+    let autharg = format!("--authfile={}", fixture.authfile.display());
+    let sn = start_streaming_args(
+        vec![autharg, "--streamws-auth=1".into()],
+        vec![],
+    )
+    .await;
+    let port = sn.ws_port();
+
+    assert!(
+        common::ws_client::WsClient::try_connect(port, None).await.is_err(),
+        "anon ws upgrade rejected"
+    );
+    assert!(
+        common::ws_client::WsClient::try_connect(port, Some("tok-ws"))
+            .await
+            .is_ok(),
+        "valid token ws upgrade accepted"
+    );
+}
+
+/// WS connection cap: with `--streamws-max-conns=1`, a second concurrent
+/// connection is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ws_max_conns_refuses_second() {
+    let sn = start_streaming_args(
+        vec![
+            "--events-grpc-bind=127.0.0.1:0".into(),
+            "--streamws=127.0.0.1:0".into(),
+            "--streamws-max-conns=1".into(),
+        ],
+        vec![],
+    )
+    .await;
+    let port = sn.ws_port();
+    // Hold the only slot.
+    let _held = common::ws_client::WsClient::connect(port).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Second connection refused (503 → handshake error).
+    let second = common::ws_client::WsClient::try_connect(port, None).await;
+    assert!(second.is_err(), "second ws connection over the cap is refused");
+}
+
+// ===========================================================================
+// Phase 6: consensus invariant — the event bus never backpressures consensus
+// ===========================================================================
+
+/// A flooded, non-reading subscriber (with a tiny broadcast buffer that forces
+/// server-side lag) must NOT stall block production. Mining 40 blocks while the
+/// subscriber lags must still complete and advance the tip — proving the
+/// publish path is decoupled from `connect_block`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn flood_stream_does_not_stall_mining() {
+    let sn = start_streaming_args(
+        vec![],
+        vec![("SATD_EVENT_BROADCAST_CAPACITY".into(), "2".into())],
+    )
+    .await;
+    // Attach a subscriber and never read it (forces broadcast lag once the
+    // 2-slot buffer fills).
+    let mut client = GrpcStreamClient::connect(sn.grpc_port()).await;
+    let _stream = client.subscribe(0, None).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Mining must complete despite the lagging subscriber.
+    mine_n(&sn, 40).await;
+
+    let rpc = sn.node.rpc_handle();
+    let height = tokio::task::spawn_blocking(move || rpc.block_count())
+        .await
+        .unwrap();
+    assert_eq!(height, 40, "block production advanced despite a lagging stream");
 }

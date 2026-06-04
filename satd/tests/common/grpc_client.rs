@@ -86,6 +86,25 @@ impl GrpcStreamClient {
         })
     }
 
+    /// Connect with a deliberately tiny HTTP/2 flow-control window, so a
+    /// non-reading client makes the server block (and its broadcast receiver
+    /// lag) after only a few buffered events. Loopback socket buffers are
+    /// megabytes, so without this a flood drains without ever lagging — this
+    /// is what makes the in-band `Lagged` test deterministic.
+    pub async fn connect_lagprone(port: u16) -> Self {
+        let endpoint = Channel::from_shared(format!("http://127.0.0.1:{port}"))
+            .expect("uri")
+            .initial_stream_window_size(Some(2048))
+            .initial_connection_window_size(Some(2048));
+        let channel = endpoint.connect().await.expect("lagprone connect");
+        Self {
+            inner: pb::node_event_stream_client::NodeEventStreamClient::with_interceptor(
+                channel,
+                AuthInterceptor { token: None },
+            ),
+        }
+    }
+
     async fn connect_inner(port: u16, token: Option<String>) -> Self {
         let endpoint = format!("http://127.0.0.1:{port}");
         // The listener is already bound by the time the harness reads its port
@@ -131,6 +150,24 @@ impl GrpcStreamClient {
             .await
             .expect("subscribe")
             .into_inner()
+    }
+
+    /// Like [`Self::subscribe`] but returns the auth/transport error instead
+    /// of panicking — used by the auth-rejection tests, where the server
+    /// rejects the stream with `Unauthenticated`/`PermissionDenied`.
+    pub async fn try_subscribe(
+        &mut self,
+        categories: u32,
+    ) -> Result<Streaming<NodeEvent>, Status> {
+        let resp = self
+            .inner
+            .subscribe(SubscribeRequest {
+                categories,
+                since_seq: None,
+                from_cursor: None,
+            })
+            .await?;
+        Ok(resp.into_inner())
     }
 
     /// Open the bidirectional `Watch` stream. Returns a control sender (send
