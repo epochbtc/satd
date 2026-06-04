@@ -385,13 +385,19 @@ impl ChainState {
                 }
                 htip = lo;
 
-                // Seed the best-header pointer from the highest known header
-                // (refined by chainwork as new headers arrive). Falls back to
-                // the active tip if the header at `htip` can't be read.
-                let best_header = store
-                    .get_block_hash_by_height(htip)
-                    .and_then(|h| store.get_block_index(&h).map(|e| (h, e.chainwork)))
-                    .unwrap_or((tip_hash, entry.chainwork));
+                // Seed the best-header pointer from the highest-CHAINWORK
+                // header in the index — NOT the highest-height header, which
+                // the pollutable best-known-at-height index would give and
+                // which can name a competing branch after a crash. One-time
+                // O(n) scan at load; thereafter maintained incrementally by
+                // chainwork in accept_header/accept_headers/accept_block. Seeded
+                // with the active tip so a scan miss still yields a sane value.
+                let mut best_header = (tip_hash, entry.chainwork);
+                let _ = store.for_each_block_index(&mut |h, e| {
+                    if compare_u256(&e.chainwork, &best_header.1) > 0 {
+                        best_header = (h, e.chainwork);
+                    }
+                });
 
                 tracing::info!(
                     height = entry.height,
