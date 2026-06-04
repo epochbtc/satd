@@ -393,11 +393,26 @@ impl ChainState {
                 // chainwork in accept_header/accept_headers/accept_block. Seeded
                 // with the active tip so a scan miss still yields a sane value.
                 let mut best_header = (tip_hash, entry.chainwork);
-                let _ = store.for_each_block_index(&mut |h, e| {
+                // Propagate a scan failure rather than swallowing it: a
+                // block_index that cannot be iterated is corruption that
+                // must fail startup loudly, not silently degrade the
+                // competing-chain pull path to the active tip.
+                let scan_stats = store.for_each_block_index(&mut |h, e| {
                     if compare_u256(&e.chainwork, &best_header.1) > 0 {
                         best_header = (h, e.chainwork);
                     }
-                });
+                })?;
+                // Rows dropped mid-scan (bad key / bad value) don't return
+                // Err but DO mean the best-header seed may have missed a
+                // heavier branch — surface them instead of masking.
+                if scan_stats.skipped_bad_key > 0 || scan_stats.skipped_bad_value > 0 {
+                    tracing::warn!(
+                        skipped_bad_key = scan_stats.skipped_bad_key,
+                        skipped_bad_value = scan_stats.skipped_bad_value,
+                        "block_index scan skipped undecodable rows while seeding \
+                         best-header; index may be partially corrupt"
+                    );
+                }
 
                 tracing::info!(
                     height = entry.height,
