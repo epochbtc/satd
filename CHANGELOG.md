@@ -69,6 +69,35 @@ layout) per `STABILITY_POLICY.md`.
   transaction remains consensus-valid, matching Core, which performs this check
   outside `CheckBlock`/`ConnectBlock`.
 
+### RPC
+
+- **`invalidateblock` / `reconsiderblock` are now implemented** (previously
+  absent), matching Bitcoin Core. `invalidateblock <hash>` marks a block — and
+  every descendant — invalid, rolls the active chain back past it, and
+  re-activates the best remaining valid chain (a pure truncation to the
+  invalid block's parent, or a reorg onto a competing side chain that now
+  carries the most work). `reconsiderblock <hash>` clears the invalid mark on
+  the block and its descendants and re-activates the best chain (reorging back
+  if that chain regains the most work). The `Invalid` mark is persisted in the
+  block index **before** the active chain is rolled back, so a crash mid-call
+  can never durably truncate the tip while leaving the disconnected block
+  `Valid` (which would silently un-do the invalidation); and startup
+  reconciliation re-activates the best valid chain if a node is ever loaded
+  with its tip on a durably-`Invalid` block (the inverse crash window), so it
+  can never boot stuck rejecting extensions as `bad-prevblk`. `accept_block`/
+  `store_block` refuse to build on an invalidated parent (`bad-prevblk`), so the
+  subtree stays excluded until reconsidered. On an AssumeUTXO node, invalidating
+  a block at or below the loaded snapshot height is refused (no undo data
+  exists there), matching the reorg-depth guard `accept_block` already enforces. Both are classified `BlockConnecting` (rejected on the
+  read-only RPC listener). This lets a single regtest node be driven into a
+  reorg without a second node — the standard tool for reorg testing, and it now
+  drives the single-node reorg E2E coverage for the Streaming Consumption API
+  (`Reorg` / `BlockDisconnected` / `TxidUnconfirmed` over a real socket).
+- **`getblock` now serves an invalidated block** (Core parity): an
+  `invalidateblock`'d block keeps its data on disk and remains retrievable, and
+  the reorg/watch machinery re-reads a just-disconnected block to emit
+  `TxidUnconfirmed`. (Header-only and pruned blocks remain unreadable.)
+
 ### Testing
 
 - **Block-level consensus differential matrix.** A new golden fixture suite

@@ -182,6 +182,8 @@ pub fn classify(method: &str) -> Option<RpcAccess> {
         | "submitblock"
         | "submitheader"
         | "preciousblock"
+        | "invalidateblock"
+        | "reconsiderblock"
         | "loadtxoutset" => BlockConnecting,
 
         _ => return None,
@@ -215,6 +217,8 @@ mod tests {
             "submitblock",
             "submitheader",
             "preciousblock",
+            "invalidateblock",
+            "reconsiderblock",
             "loadtxoutset",
         ] {
             assert_eq!(classify(m), Some(RpcAccess::BlockConnecting), "{m}");
@@ -309,6 +313,8 @@ mod tests {
             "submitblock",
             "submitheader",
             "preciousblock",
+            "invalidateblock",
+            "reconsiderblock",
             "loadtxoutset",
         ] {
             assert!(dangerous(m), "test prefix list missed {m}");

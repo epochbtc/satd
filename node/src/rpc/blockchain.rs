@@ -844,6 +844,46 @@ pub fn precious_block(_hash_str: &str) -> Result<Value, String> {
     Ok(Value::Null)
 }
 
+/// Map a chain-level invalidate/reconsider error to an `(rpc_code, message)`
+/// pair, mirroring Bitcoin Core's error surface.
+fn map_invalidate_err(e: crate::chain::state::ChainError) -> (i32, String) {
+    use crate::chain::state::ChainError;
+    match e {
+        // RPC_INVALID_ADDRESS_OR_KEY
+        ChainError::BlockNotFound => (-5, "Block not found".to_string()),
+        // RPC_INVALID_PARAMETER
+        ChainError::InvalidArgument(m) => (-8, m),
+        // RPC_DATABASE_ERROR / misc
+        other => (-1, other.to_string()),
+    }
+}
+
+/// `invalidateblock` — mark a block invalid and re-activate the best valid
+/// chain. Returns `null` on success (Core parity).
+pub fn invalidate_block(
+    chain_state: &ChainState,
+    hash_str: &str,
+) -> Result<Value, (i32, String)> {
+    let hash: bitcoin::BlockHash = hash_str
+        .parse()
+        .map_err(|_| (-8, "blockhash must be hexadecimal string".to_string()))?;
+    chain_state.invalidate_block(hash).map_err(map_invalidate_err)?;
+    Ok(Value::Null)
+}
+
+/// `reconsiderblock` — clear a block's invalid mark (and its descendants') and
+/// re-activate the best valid chain. Returns `null` on success (Core parity).
+pub fn reconsider_block(
+    chain_state: &ChainState,
+    hash_str: &str,
+) -> Result<Value, (i32, String)> {
+    let hash: bitcoin::BlockHash = hash_str
+        .parse()
+        .map_err(|_| (-8, "blockhash must be hexadecimal string".to_string()))?;
+    chain_state.reconsider_block(hash).map_err(map_invalidate_err)?;
+    Ok(Value::Null)
+}
+
 /// `verifychain` — verify chain database integrity.
 pub fn verify_chain(chain_state: &ChainState, check_level: u32, nblocks: u32) -> Value {
     let tip = chain_state.tip_height();

@@ -1169,26 +1169,162 @@ async fn grpc_max_subscriptions_caps_streams() {
 }
 
 // ===========================================================================
-// Deferred: two-node reorg E2E (ChainEvent::Reorg / BlockDisconnected /
-// TxidUnconfirmed)
+// Single-node reorg E2E (via the `invalidateblock` RPC)
 // ===========================================================================
 //
-// A two-node reorg cannot be triggered reliably from this harness:
-//   * satd has no `invalidateblock`/`reconsiderblock` RPC, so a single node
-//     can't be forced to reorg.
-//   * With two nodes, the node we subscribe to must be RUNNING and SUBSCRIBED
-//     before the reorg so it can observe the events. The only way to make it
-//     adopt a competing longer chain is to have it DIAL a peer that holds that
-//     chain (the dialer syncs from the listener; a listener does NOT pull a
-//     competing chain from an inbound peer — verified: with both nodes
-//     connected and the peer at height 3, the subscribed listener stayed at
-//     height 1). There is no `addnode` RPC to make the subscribed node dial
-//     after it is already up, and restarting it with `--connect` would perform
-//     the reorg at startup, before a client can attach.
+// `invalidateblock` makes a single node reorg deterministically, so the reorg
+// streaming surfaces — the `Reorg` marker, `BlockDisconnected`, and the
+// `TxidUnconfirmed` lifecycle transition — are now exercised end-to-end over a
+// real socket, no second node required.
+
+/// Invalidating the active tip emits a `Reorg` marker and a `BlockDisconnected`
+/// on the gRPC `Subscribe` firehose (a single-node truncation reorg).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grpc_subscribe_reorg_via_invalidateblock() {
+    let sn = start_streaming_async(vec![]).await;
+
+    // Mine 2 blocks BEFORE subscribing (the firehose is live-only), so the
+    // only chain traffic the subscriber sees is the reorg.
+    let rpc = sn.node.rpc_handle();
+    let addr = mine_addr(0x71);
+    let hashes = tokio::task::spawn_blocking(move || rpc.mine(2, &addr))
+        .await
+        .unwrap();
+    assert_eq!(hashes.len(), 2, "mined two blocks");
+    let tip = hashes[1].clone(); // height 2
+
+    let mut client = GrpcStreamClient::connect(sn.grpc_port()).await;
+    let mut stream = client.subscribe(0, None).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    // Invalidate the tip → the active chain truncates to height 1.
+    let rpc2 = sn.node.rpc_handle();
+    let tip2 = tip.clone();
+    let resp = tokio::task::spawn_blocking(move || {
+        rpc2.call("invalidateblock", vec![serde_json::json!(tip2)])
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(resp["error"].is_null(), "invalidateblock errored: {resp:?}");
+
+    use satd_events::proto::v1::chain_event::Body as Ce;
+
+    // The `Reorg` marker is emitted first.
+    let ev = next_event_matching(&mut stream, 15, |b| {
+        matches!(b, Body::Chain(ce) if matches!(ce.body, Some(Ce::Reorg(_))))
+    })
+    .await;
+    let Some(Body::Chain(ce)) = ev.body else {
+        unreachable!("matched Chain above")
+    };
+    let Some(Ce::Reorg(r)) = ce.body else {
+        unreachable!("matched Reorg above")
+    };
+    assert_eq!(r.from_height, 2, "abandoned tip height");
+    assert_eq!(r.to_height, 1, "new tip height after truncation");
+
+    // Followed by a `BlockDisconnected` for the invalidated tip.
+    let ev = next_event_matching(&mut stream, 15, |b| {
+        matches!(b, Body::Chain(ce) if matches!(ce.body, Some(Ce::BlockDisconnected(_))))
+    })
+    .await;
+    let Some(Body::Chain(ce)) = ev.body else {
+        unreachable!("matched Chain above")
+    };
+    let Some(Ce::BlockDisconnected(bd)) = ce.body else {
+        unreachable!("matched BlockDisconnected above")
+    };
+    assert_eq!(bd.height, 2, "disconnected block height");
+    assert_eq!(bd.hash.len(), 32, "block hash is 32 bytes");
+}
+
+/// A watched txid that was confirmed, then un-confirmed when its block is
+/// invalidated, fires `TxidUnconfirmed` carrying the height it had reached.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grpc_watch_txid_unconfirmed_on_invalidateblock() {
+    let (sn, wallet) = matured_node().await;
+    let dest = DeterministicWallet::from_secret([0x72; 32])
+        .address
+        .script_pubkey();
+    let rpc = sn.node.rpc_handle();
+    let w = wallet.clone();
+    let (raw, spend_txid) = tokio::task::spawn_blocking(move || {
+        build_signed_p2wpkh_spend_from_block1_coinbase(&rpc, &w, dest, 10_000)
+    })
+    .await
+    .unwrap();
+
+    let mut client = GrpcStreamClient::connect(sn.grpc_port()).await;
+    let (_tx, mut stream) = client
+        .watch(vec![add_transactions(&[&spend_txid], vec![], 0)])
+        .await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    // Broadcast + confirm the spend.
+    let rpc2 = sn.node.rpc_handle();
+    let raw2 = raw.clone();
+    tokio::task::spawn_blocking(move || rpc2.send_raw_tx(&raw2))
+        .await
+        .unwrap();
+    mine_n(&sn, 1).await;
+    let ev = next_event_matching(
+        &mut stream,
+        15,
+        |b| matches!(b, Body::TxidMatched(t) if t.confirmed),
+    )
+    .await;
+    let Some(Body::TxidMatched(t)) = ev.body else {
+        unreachable!()
+    };
+    let conf_height = t.height;
+    assert!(conf_height >= 1, "confirmed height set");
+
+    // Invalidate the confirming block (the tip) → the watched tx is rolled
+    // back into the mempool, firing `TxidUnconfirmed`.
+    let rpc3 = sn.node.rpc_handle();
+    let tip = tokio::task::spawn_blocking(move || {
+        rpc3.call("getbestblockhash", vec![]).unwrap()["result"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    })
+    .await
+    .unwrap();
+    let rpc4 = sn.node.rpc_handle();
+    let resp = tokio::task::spawn_blocking(move || {
+        rpc4.call("invalidateblock", vec![serde_json::json!(tip)])
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(resp["error"].is_null(), "invalidateblock errored: {resp:?}");
+
+    let ev = next_event_matching(&mut stream, 15, |b| matches!(b, Body::TxidUnconfirmed(_))).await;
+    let Some(Body::TxidUnconfirmed(u)) = ev.body else {
+        unreachable!()
+    };
+    assert_eq!(
+        hex::encode(&u.txid),
+        display_to_internal_hex(&spend_txid),
+        "unconfirmed txid matches the watched tx"
+    );
+    assert_eq!(
+        u.prev_height, conf_height,
+        "prev_height is the height the tx had reached"
+    );
+}
+
+// ===========================================================================
+// Deferred: two-node reorg E2E (competing chain pulled over P2P)
+// ===========================================================================
 //
-// The reorg event emission (ChainEvent::Reorg, ordered before the
-// disconnect/connect sequence) and the TxidUnconfirmed lifecycle transition are
-// covered by in-process unit tests in `node/src/chain` and
-// `node/src/events/watch.rs`. A future E2E could drive the reorg via a SIGHUP
-// `addnode` config reload (which live-dials and would make the subscribed node
-// a puller) once the harness grows config-file + signal support.
+// The single-node reorg surfaces (Reorg / BlockDisconnected / TxidUnconfirmed)
+// are covered by the two tests above via `invalidateblock`. A *two-node* reorg
+// — where the subscribed node adopts a competing longer chain announced by a
+// peer — is still deferred: a synced listener does NOT pull a competing chain
+// from an inbound peer (verified: with both nodes connected and the peer at
+// height 3, the subscribed listener stayed at height 1), and there is no
+// `addnode` RPC to make an already-running subscribed node dial out. Fixing
+// that inbound-peer pull gap is tracked separately; once it lands, a two-node
+// variant can assert the same events are driven by real P2P block propagation.

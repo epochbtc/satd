@@ -647,6 +647,22 @@ pub async fn start(
         blockchain::precious_block(&hash).map_err(|e| ErrorObjectOwned::owned(-1, e, None::<()>))
     })?;
 
+    module.register_method("invalidateblock", |params, ctx, _extensions| {
+        let hash: String = params
+            .one()
+            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+        blockchain::invalidate_block(&ctx.chain_state, &hash)
+            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
+    })?;
+
+    module.register_method("reconsiderblock", |params, ctx, _extensions| {
+        let hash: String = params
+            .one()
+            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+        blockchain::reconsider_block(&ctx.chain_state, &hash)
+            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
+    })?;
+
     module.register_method("verifychain", |params, ctx, _extensions| {
         let mut seq = params.sequence();
         let check_level: u32 = seq.optional_next().unwrap_or(Some(3)).unwrap_or(3);
@@ -1470,11 +1486,13 @@ pub async fn start(
             "getwarnings",
             "gettxoutsetinfo",
             "help",
+            "invalidateblock",
             "listbanned",
             "logging",
             "ping",
             "preciousblock",
             "prioritisetransaction",
+            "reconsiderblock",
             "savemempool",
             "sendrawtransaction",
             "setban",
