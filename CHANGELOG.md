@@ -47,9 +47,11 @@ In-progress; full detail tracked in
 - **Documentation** — operator docs consolidated into an mdbook **Operator
   Manual** (`docs/manual/`, published to GitHub Pages), folding in
   `OPERATOR_ERGONOMICS.md`, `docs/PACKAGING.md`, `docs/TUI.md`, the Esplora REST
-  reference, the native-protocol-surface architecture rationale, and a new
-  streaming-API integrator guide. Unshipped ecosystem/mobile strategy moved to
-  `ROADMAP.md` (tagged by likelihood).
+  reference, the native-protocol-surface architecture rationale, a new
+  streaming-API integrator guide, and a complete **Configuration Flag Reference**
+  (every key: default, reload disposition, Core-compatible vs satd extension).
+  Unshipped ecosystem/mobile strategy moved to `ROADMAP.md` (tagged by
+  likelihood).
 
 ## Releases
 

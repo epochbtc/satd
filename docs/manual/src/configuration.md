@@ -7,7 +7,9 @@ operator-sovereignty policy knobs, and live reload of both configuration
 
 For the observability surfaces (TUI, Prometheus, structured logs) see
 [Observability & Metrics](observability.md); for the satd-specific developer
-APIs see [Integrator APIs](integrator-apis.md).
+APIs see [Integrator APIs](integrator-apis.md). For the complete per-key index —
+every flag, its default, reload disposition, and whether it is Core-compatible or
+a satd extension — see the [Configuration Flag Reference](config-reference.md).
 
 ## Configuration & Tuning
 

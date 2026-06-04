@@ -26,6 +26,9 @@ contract.
 - **Packaging & Deployment** — the authoritative [packaging
   contract](packaging.md) for downstream distributions: file layout, signals,
   ports, the release/signing pipeline, and reproducible builds.
+- **Reference** — the [Configuration Flag Reference](config-reference.md): every
+  recognized config key, its default, reload disposition, and whether it is
+  Bitcoin Core-compatible or a satd extension.
 
 ## Related documents (in the repository)
 

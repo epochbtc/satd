@@ -18,3 +18,7 @@
 # Packaging & Deployment
 
 - [Packaging satd](packaging.md)
+
+# Reference
+
+- [Configuration Flag Reference](config-reference.md)
