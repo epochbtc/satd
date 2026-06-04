@@ -363,6 +363,10 @@ async fn poller(rpc: Arc<RpcClient>, state: Arc<Mutex<AppState>>) {
                 let status = state::StartupStatus::from_json(&v);
                 let mut st = state.lock();
                 st.update_startup(status);
+                // getstartupinfo succeeding IS "an RPC succeeded": satd is
+                // reachable and starting, so dismiss any stale failure modal
+                // (e.g. a connect blip just before satd bound its RPC).
+                st.clear_failure();
         }
 
         // Slow polls (every ~5s = 3-4 fast ticks).
@@ -399,7 +403,7 @@ async fn poller(rpc: Arc<RpcClient>, state: Arc<Mutex<AppState>>) {
                     rpc.get_uptime(),
                     async {
                         let height = state.lock().blocks;
-                        if height > 0 { rpc.get_block_stats(height).await } else { Err(rpc::RpcError::Rpc("no blocks".into())) }
+                        if height > 0 { rpc.get_block_stats(height).await } else { Err(rpc::RpcError::Rpc { code: 0, message: "no blocks".into() }) }
                     },
                     rpc.get_raw_mempool_verbose(),
                     rpc.get_tx_out_set_info(),
@@ -480,7 +484,12 @@ fn classify_batch_error(errs: &[Option<&RpcError>]) -> Option<(RpcFailure, Strin
             RpcError::AuthFailed => (3, RpcFailure::AuthFailed),
             RpcError::ConnectionFailed => (2, RpcFailure::ConnectionFailed),
             RpcError::Timeout => (1, RpcFailure::Timeout),
-            RpcError::Request(_) | RpcError::Rpc(_) => (0, RpcFailure::Other),
+            // A "method not found" is not a connectivity failure: satd is
+            // reachable and answering, the method just isn't registered yet
+            // (pre-READY during reindex/startup, or a version-skewed daemon).
+            // Skip it so it never raises the modal over the startup panel.
+            RpcError::Rpc { code, .. } if *code == rpc::JSONRPC_METHOD_NOT_FOUND => continue,
+            RpcError::Request(_) | RpcError::Rpc { .. } => (0, RpcFailure::Other),
         };
         if best.as_ref().is_none_or(|(p, _, _)| prio > *p) {
             best = Some((prio, kind, e.to_string()));
@@ -498,7 +507,7 @@ mod tests {
         let conn = RpcError::ConnectionFailed;
         let auth = RpcError::AuthFailed;
         let timeout = RpcError::Timeout;
-        let other = RpcError::Rpc("boom".into());
+        let other = RpcError::Rpc { code: -1, message: "boom".into() };
 
         // AuthFailed always wins.
         let (k, _) = classify_batch_error(&[
@@ -520,6 +529,29 @@ mod tests {
 
         // All-None batch yields None.
         assert!(classify_batch_error(&[None, None]).is_none());
+    }
+
+    #[test]
+    fn method_not_found_never_raises_the_modal() {
+        // Mid-reindex satd answers every steady-state method with -32601. That
+        // is not a connectivity failure (the daemon is reachable), so a batch
+        // of only method-not-found errors must classify as None — no modal.
+        let mnf = RpcError::Rpc {
+            code: rpc::JSONRPC_METHOD_NOT_FOUND,
+            message: "Method not found".into(),
+        };
+        assert!(classify_batch_error(&[Some(&mnf), Some(&mnf)]).is_none());
+
+        // But a real failure mixed in still wins — method-not-found is skipped,
+        // not allowed to mask an actionable connect/auth error.
+        let conn = RpcError::ConnectionFailed;
+        let (k, _) = classify_batch_error(&[Some(&mnf), Some(&conn)]).unwrap();
+        assert_eq!(k, RpcFailure::ConnectionFailed);
+
+        // A non-(-32601) Rpc error is still surfaced as Other.
+        let internal = RpcError::Rpc { code: -32603, message: "internal".into() };
+        let (k, _) = classify_batch_error(&[Some(&internal)]).unwrap();
+        assert_eq!(k, RpcFailure::Other);
     }
 
     #[test]

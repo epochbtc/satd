@@ -134,8 +134,9 @@ impl RpcClient {
             .map_err(|e| RpcError::Request(e.to_string()))?;
 
         if let Some(error) = resp.get("error").filter(|e| !e.is_null()) {
+            let code = error.get("code").and_then(|c| c.as_i64()).unwrap_or(0);
             let msg = error.get("message").and_then(|m| m.as_str()).unwrap_or("Unknown error");
-            return Err(RpcError::Rpc(msg.to_string()));
+            return Err(RpcError::Rpc { code, message: msg.to_string() });
         }
 
         Ok(resp.get("result").cloned().unwrap_or(serde_json::Value::Null))
@@ -235,13 +236,19 @@ impl RpcClient {
     }
 }
 
+/// JSON-RPC 2.0 reserved code for an unregistered method. satd returns this
+/// for steady-state methods while it is still pre-READY (e.g. mid-reindex):
+/// the daemon is reachable and answering, the method just isn't wired up yet,
+/// so it must never be treated as a connectivity failure.
+pub const JSONRPC_METHOD_NOT_FOUND: i64 = -32601;
+
 #[derive(Debug)]
 pub enum RpcError {
     ConnectionFailed,
     AuthFailed,
     Timeout,
     Request(String),
-    Rpc(String),
+    Rpc { code: i64, message: String },
 }
 
 impl std::fmt::Display for RpcError {
@@ -251,7 +258,7 @@ impl std::fmt::Display for RpcError {
             RpcError::AuthFailed => write!(f, "Authentication failed"),
             RpcError::Timeout => write!(f, "Request timed out"),
             RpcError::Request(e) => write!(f, "Request error: {}", e),
-            RpcError::Rpc(e) => write!(f, "RPC error: {}", e),
+            RpcError::Rpc { message, .. } => write!(f, "RPC error: {}", message),
         }
     }
 }
