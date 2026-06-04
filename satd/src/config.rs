@@ -589,7 +589,7 @@ pub struct Config {
     /// memory growth from the per-scripthash broadcast registry.
     /// Default 10000 — generous for typical xpub-derivation patterns.
     pub addrindexsubscriptions: usize,
-    /// Native Esplora REST server (per `ECOSYSTEM.md` §4). On by
+    /// Native Esplora REST server (see `docs/manual/src/native-protocol-surfaces.md`). On by
     /// default; `--esplora=0` disables. Requires `--addressindex=1`.
     pub esplora: bool,
     /// `host:port` for the Esplora HTTP listener.
@@ -648,7 +648,7 @@ pub struct Config {
     /// capability, on top of the legacy `esplora_auth` credential. Requires
     /// `authfile`. Default false.
     pub esplora_auth_bearer: bool,
-    /// Native Electrum protocol server (per `ECOSYSTEM.md` §4 / §4a).
+    /// Native Electrum protocol server (see `docs/manual/src/native-protocol-surfaces.md`).
     /// Off by default; `--electrum=1` enables. Requires
     /// `--addressindex=1` AND a complete `--txindex` for the
     /// confirmed-tx and merkle-proof endpoints. Both invariants
@@ -657,7 +657,7 @@ pub struct Config {
     /// `host:port` for the plain-TCP Electrum listener. Defaults to
     /// loopback on port 50001 (Electrum's standard plain-TCP port);
     /// expose via Tor / .onion rather than directly on the LAN per
-    /// the operator advice in `OPERATOR_ERGONOMICS.md`.
+    /// the operator advice in `docs/manual/src/configuration.md`.
     pub electrum_bind: String,
     /// Optional TLS bind. When set, `electrum_tls_cert` and
     /// `electrum_tls_key` MUST also be set. Standard Electrum TLS
@@ -707,8 +707,8 @@ pub struct Config {
     /// composed at request time (`format!("powered by satd {}",
     /// version)`).
     pub electrum_banner: Option<String>,
-    /// BIP 158 compact-block-filter index (per `ECOSYSTEM.md` §3,
-    /// `bip157-158-compact-filters.md`). Off by default; enable via
+    /// BIP 158 compact-block-filter index (see
+    /// `docs/manual/src/native-protocol-surfaces.md`). Off by default; enable via
     /// `--blockfilterindex=basic` (Bitcoin-Core-compatible spelling)
     /// or `--blockfilterindex=1`. Required for the BIP 157 P2P
     /// service and the `getblockfilter` RPC. Implies an additional

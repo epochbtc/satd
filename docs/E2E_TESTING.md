@@ -7,7 +7,8 @@ Esplora REST, and the third-party `electrum-client` crate for the
 Electrum protocol — and asserts the wire-level guarantees that
 handler-level unit tests can't reach.
 
-The strategic motivation is in `ECOSYSTEM.md` §4 / §4a: satd's
+The strategic motivation is in the operator manual's "Native Protocol
+Architecture" chapter (`docs/manual/src/native-protocol-surfaces.md`): satd's
 "one process, one RocksDB" architecture means a write on any
 protocol surface must propagate to every read surface. The E2E
 suite, and especially the cross-surface test

@@ -1,0 +1,19 @@
+[book]
+title = "satd Operator Manual"
+authors = ["satd contributors"]
+description = "Operator, integrator, and packager reference for satd — a Bitcoin Core-compatible full node in Rust."
+src = "src"
+language = "en"
+
+[output.html]
+site-url = "/satd/"
+git-repository-url = "https://github.com/epochbtc/satd"
+edit-url-template = "https://github.com/epochbtc/satd/edit/master/docs/manual/{path}"
+no-section-label = true
+
+[output.html.fold]
+enable = true
+level = 1
+
+[output.html.search]
+enable = true

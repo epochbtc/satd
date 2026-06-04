@@ -1,29 +1,17 @@
-# satd: Operator Ergonomics & Tuning
+# Configuration, Tuning & Reload
 
-`satd` is built from the ground up to make running a full node easier, safer, and more transparent for infrastructure maintainers.
+`satd` fully supports Bitcoin Core's `bitcoin.conf` syntax and standard CLI
+flags. On top of that compatibility it adds hardware-profile presets, a set of
+operator-sovereignty policy knobs, and live reload of both configuration
+(`SIGHUP`) and TLS certificates (`SIGUSR1`).
 
-This document catalogs the operator-facing surfaces, configuration flags, tuning profiles, and observability tools available in `satd`.
+For the observability surfaces (TUI, Prometheus, structured logs) see
+[Observability & Metrics](observability.md); for the satd-specific developer
+APIs see [Integrator APIs](integrator-apis.md). For the complete per-key index —
+every flag, its default, reload disposition, and whether it is Core-compatible or
+a satd extension — see the [Configuration Flag Reference](config-reference.md).
 
----
-
-## 1. Observability & Metrics
-
-### Native TUI (`sat-tui`)
-`satd` ships with a native Ratatui-based terminal interface. Rather than running blind or relying on chatty log files, operators can visualize node progress in real-time.
-*   **IBD Bitmap:** Visualizes block download and verification progress.
-*   **Peer Stats:** Shows connected peers, their latency, and block delivery rates.
-*   **Mempool Status:** Live view of mempool depth and fee percentiles.
-
-### Prometheus Metrics Endpoint
-*   **Flag:** `--metricsbind=<addr:port>`
-*   Exposes a native Prometheus HTTP server at `GET /metrics` providing deep insights into P2P traffic, block validation times, mempool depth, and RocksDB performance.
-*   Includes `GET /healthz` and `GET /readyz` endpoints for load balancer and orchestrator integration.
-
-### Structured JSON Logging
-*   **Flag:** `--log-format=json|text`
-*   Replaces the traditional `debug.log` text firehose with structured, machine-parseable JSON logs. Perfect for Datadog, ELK, or custom log-alerting pipelines. Trace IDs allow operators to follow a single block through prefetch, connect, and flush.
-
-## 2. Configuration & Tuning
+## Configuration & Tuning
 
 `satd` fully supports Bitcoin Core's `bitcoin.conf` syntax and standard CLI flags. However, to simplify deployment on different hardware profiles, `satd` introduces configuration presets.
 
@@ -60,10 +48,10 @@ Instead of manually tuning `-dbcache`, `-maxmempool`, and connection limits, ope
 | `--permitbaremultisig=<0\|1>` | `1` | If `0`, rejects complex, non-standard bare multisig setups often used for data-storage hacks. |
 | `--limitancestorcount=<N>` | `25` | Maximum unconfirmed ancestor count. |
 
-### Live Config Reload (`SIGHUP`)
+## Live Config Reload (`SIGHUP`)
 Edit `bitcoin.conf` and send `SIGHUP` — `kill -HUP <pid>`, or `systemctl reload satd` — to re-read the file and apply the hot-reloadable settings **without restarting**. The P2P swarm and chainstate are untouched. CLI flags remain authoritative across reloads: only the config *file* is re-read, so a flag passed on the command line always wins over the same key in the file.
 
-> **Difference from Bitcoin Core.** Core uses `SIGHUP` to reopen `debug.log` for logrotate. satd has no `debug.log` — it logs to **stdout**, delegating rotation/retention to systemd-journald or the container runtime — so `SIGHUP` is repurposed for config reload. See `CORE_DIFFERENCES.md`.
+> **Difference from Bitcoin Core.** Core uses `SIGHUP` to reopen `debug.log` for logrotate. satd has no `debug.log` — it logs to **stdout**, delegating rotation/retention to systemd-journald or the container runtime — so `SIGHUP` is repurposed for config reload. See [`CORE_DIFFERENCES.md`](https://github.com/epochbtc/satd/blob/master/CORE_DIFFERENCES.md).
 
 **Safety:** a reload that fails to parse (a typo'd, unknown, or invalid key — these hard-error at load) is logged and the **running config is kept**; the daemon never crashes on a bad reload. Every change is either applied live or logged as `restart required` — nothing is silently ignored. Secret-bearing keys (`rpcuser`, `rpcpassword`, `rpcauth`, `torpassword`, `esplorauserpass`, `reorgwebhooksecret`) report only that they changed — their values are **redacted** in the log, never printed.
 
@@ -94,7 +82,7 @@ Edit `bitcoin.conf` and send `SIGHUP` — `kill -HUP <pid>`, or `systemctl reloa
 
 **Restart required (reported, not applied):** network selection, `datadir`/`blocksdir`, all RPC/P2P/Esplora/Electrum **ports and binds**, the RPC cookie file (`rpccookiefile`/`rpccookieperms`) and `rpcdisableauth`, TLS/mTLS **paths** and the mTLS **CA** (the cert/key *contents* reload via `SIGUSR1` — see below), `dbcache`/`prune`/`storageprofile`/reindex, index enable/disable (`txindex`/`addressindex`/`blockfilterindex`), DNS-seed bootstrap (`dns`/`dnsseed`/`forcednsseed`/`fixedseeds`/`asmap`), Tor (`proxy`/`onion`/`torcontrol`/`listenonion`), `consensus`, and `assumevalid`/`stopatheight`. These are wired into long-lived state at startup (a bound socket, an opened database, the chain identity) and cannot be swapped without restarting the relevant socket/engine/process.
 
-### Live TLS Certificate Reload (`SIGUSR1`)
+## Live TLS Certificate Reload (`SIGUSR1`)
 Send `SIGUSR1` — `kill -USR1 <pid>` — to reload the TLS server certificates from their **already-configured** paths (`rpctlscert`/`rpctlskey`, `esploratlscert`/`esploratlskey`, `electrumtlscert`/`electrumtlskey`) without restarting. Every TLS surface re-reads its leaf cert/key from disk and swaps it in atomically. This is purpose-built for infrastructure that auto-rotates certificates on short TTLs (cert-manager, Vault, ACME sidecars): point a renewal hook (or a systemd `path` unit watching the cert file) at `kill -USR1`.
 
 - **New handshakes** use the new cert; **in-flight connections** keep theirs — no dropped connections, no socket rebind.
@@ -102,24 +90,4 @@ Send `SIGUSR1` — `kill -USR1 <pid>` — to reload the TLS server certificates 
 - **Safe:** a reload that fails (unreadable, malformed, or a cert/key that don't match) is logged per-surface and the **previous, still-valid certificate is kept** — the listener is never left without a usable cert. Each surface reloads independently; one failure doesn't affect the others.
 - Distinct from `SIGHUP` (config reload) on purpose: cert rotation is frequent and automation-driven, so it gets a dedicated signal that doesn't re-read `bitcoin.conf` or run the config diff/apply machinery.
 
-> **Difference from Bitcoin Core.** Core has no `SIGUSR1` handler and no native TLS (its RPC is HTTP-only behind a sidecar). satd's native TLS makes in-place cert reload meaningful. See `CORE_DIFFERENCES.md`.
-
-## 3. Developer & Integrator APIs
-
-### Mempool-Based Fee Estimation
-*   `estimatesmartfee` supports an optional `mode` param (`historical`, `mempool`, `blend`).
-*   `satd` never hard-errors on fee estimation; it falls back to the min-relay floor with `confidence: low` rather than breaking downstream applications.
-
-### Mempool Subscription Stream
-*   `subscribemempool` JSON-RPC WS stream emitting structured events: `enter`, `leave_confirmed`, `leave_evicted`, and `leave_replaced`.
-*   Includes explicit eviction reasons and RBF replacement linkage.
-
-### Satoshis-as-Integers
-*   To prevent IEEE 754 float precision errors, operators can pass `amounts=sats` to any RPC request to receive exact integer satoshi values instead of BTC decimals.
-
-### Persistent Reorg Log & Webhook
-*   A persistent, append-only JSONL log at `$datadir/reorg.log` survives restarts.
-*   Optional HTTP POST on reorgs via `--reorg-webhook=<url>`.
-
-### Client-Side PSBT Signing
-*   `sat-cli signpsbtwithkey` is a client-side command that reads a WIF or xpriv from **stdin** and signs Taproot key-path, SegWit, or Legacy inputs locally. Because the private key is never passed over JSON-RPC, the `satd` daemon stays strictly keyless while allowing operators to securely sign PSBTs via their CLI terminal.
+> **Difference from Bitcoin Core.** Core has no `SIGUSR1` handler and no native TLS (its RPC is HTTP-only behind a sidecar). satd's native TLS makes in-place cert reload meaningful. See [`CORE_DIFFERENCES.md`](https://github.com/epochbtc/satd/blob/master/CORE_DIFFERENCES.md).

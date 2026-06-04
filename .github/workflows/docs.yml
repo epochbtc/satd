@@ -1,0 +1,74 @@
+name: Docs
+
+# Builds the operator manual (mdbook) and publishes it to GitHub Pages.
+# On PRs that touch the manual it runs build-only as a validation gate; on
+# push to master it builds and deploys. Hosted runners (the manual is pure
+# markdown — no workspace toolchain needed).
+#
+# One-time setup: enable Pages with "GitHub Actions" as the source under
+# Settings → Pages. The site renders at https://epochbtc.github.io/satd/.
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - 'docs/manual/**'
+      - '.github/workflows/docs.yml'
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'docs/manual/**'
+      - '.github/workflows/docs.yml'
+
+# Avoid burning runner minutes on superseded commits.
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  MDBOOK_VERSION: '0.4.52'
+
+jobs:
+  build:
+    name: Build manual
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Install mdbook
+        run: |
+          set -euo pipefail
+          url="https://github.com/rust-lang/mdBook/releases/download/v${MDBOOK_VERSION}/mdbook-v${MDBOOK_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          curl -fsSL "$url" | tar -xz
+          echo "$PWD" >> "$GITHUB_PATH"
+
+      - name: Build
+        run: mdbook build docs/manual
+
+      - name: Upload Pages artifact
+        if: github.event_name == 'push'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/manual/book
+
+  deploy:
+    name: Deploy to GitHub Pages
+    # Only on push to master — never on PRs (which can come from forks).
+    if: github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4

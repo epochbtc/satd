@@ -52,7 +52,7 @@ On shared hardware (e.g., a Pi running Umbrel) the node can starve its neighbors
 **Guiding principle:** satd owns a resource control only when enforcement needs *internal knowledge* (which bytes are prunable vs. load-bearing, which cache to shrink) or must *survive restarts* (a persistent counter). Otherwise the kernel, cgroups, systemd, or the container does the job better, and satd's job is to document the knob — not reinvent it. Our deployment targets (Umbrel, Start9, Pi-in-a-container) already run everything under cgroups, so a daemon-side reimplementation would duplicate infrastructure that's already present and more capable. The subsections below apply this principle to CPU, memory, disk, and bandwidth.
 
 #### CPU — delegate to cgroups / systemd
-No daemon-side flag. The kernel CFS scheduler — `CPUQuota=` under systemd, `--cpus` under Docker, `cpu.max` under a raw cgroup — throttles more precisely than satd could from userspace, where the only lever is inserting sleeps into its own verification loops (strictly worse). `docs/PACKAGING.md` should document the recommended `CPUQuota=` for a Pi profile rather than satd growing a `--max-cpu` flag.
+No daemon-side flag. The kernel CFS scheduler — `CPUQuota=` under systemd, `--cpus` under Docker, `cpu.max` under a raw cgroup — throttles more precisely than satd could from userspace, where the only lever is inserting sleeps into its own verification loops (strictly worse). `docs/manual/src/packaging.md` should document the recommended `CPUQuota=` for a Pi profile rather than satd growing a `--max-cpu` flag.
 
 #### Memory — daemon governs, cgroup backstops
 An external memory limit (cgroup `memory.max`, Docker `-m`) enforces via the **OOM killer**: when satd crosses the limit it is SIGKILL'd mid-write — exactly the unclean-shutdown / corrupted-chainstate scenario the Pi-ergonomics work guards against. The daemon's value-add is *staying below* the cap, not capping: it knows its footprint is split across the CoinCache clean-LRU, the RocksDB block cache, and the mempool, and can shrink them proactively under pressure.
@@ -75,7 +75,7 @@ The cumulative upload cap is application state with block-serving semantics — 
 **Status:** ✅ Shipped. Exposes `--dbcache=auto` which spawns a background controller task monitoring `/proc/meminfo` on Linux hosts. It resizes both the RocksDB block cache and CoinCache clean-LRU on a 30s tick in response to system memory pressure, automatically backing off during IBD vs. steady tip operation and contracting on sharp memory drops.
 
 ### Config hot reload on SIGHUP
-**Status:** ✅ Shipped. `SIGHUP` (or `systemctl reload satd`) re-reads `bitcoin.conf` and applies the hot-reloadable subset live without dropping the P2P swarm or flushing the chainstate — CLI flags stay authoritative (only the file is re-read). Bitcoin Core uses `SIGHUP` to reopen `debug.log`; satd logs to stdout (no `debug.log`) and repurposes the signal for config reload. Applied live: log verbosity (`-debug`/`-debugexclude`), connection knobs (`-timeout`/`-blocksonly`/`-maxuploadtarget`/`-v2transport`/`-v2only`/`-externalip`/`-whitelist`), RPC-behavior switches (`-rpcextendederrors`/`-rpcdefaultunits`), mempool/relay policy (`-minrelaytxfee`/`-maxmempool`/`-dustrelayfee`/`-datacarrier(size)`/`-mempoolfullrbf`/`-limitancestorcount`/`-limitdescendantcount`/`-mempoolexpiry`/`-permitbaremultisig`), and the peer-limit knobs (`-maxconnections`/`-maxinboundperip`/`-bantime`). Settings wired into long-lived state at startup (network, datadir, ports/binds, `-dbcache`, indexes, TLS, seeds, Tor) are reported as "restart required" and never silently ignored; a reload that fails to parse keeps the running config and never crashes the daemon. Per-key reference in `OPERATOR_ERGONOMICS.md`; behavior contract in `CORE_DIFFERENCES.md`.
+**Status:** ✅ Shipped. `SIGHUP` (or `systemctl reload satd`) re-reads `bitcoin.conf` and applies the hot-reloadable subset live without dropping the P2P swarm or flushing the chainstate — CLI flags stay authoritative (only the file is re-read). Bitcoin Core uses `SIGHUP` to reopen `debug.log`; satd logs to stdout (no `debug.log`) and repurposes the signal for config reload. Applied live: log verbosity (`-debug`/`-debugexclude`), connection knobs (`-timeout`/`-blocksonly`/`-maxuploadtarget`/`-v2transport`/`-v2only`/`-externalip`/`-whitelist`), RPC-behavior switches (`-rpcextendederrors`/`-rpcdefaultunits`), mempool/relay policy (`-minrelaytxfee`/`-maxmempool`/`-dustrelayfee`/`-datacarrier(size)`/`-mempoolfullrbf`/`-limitancestorcount`/`-limitdescendantcount`/`-mempoolexpiry`/`-permitbaremultisig`), and the peer-limit knobs (`-maxconnections`/`-maxinboundperip`/`-bantime`). Settings wired into long-lived state at startup (network, datadir, ports/binds, `-dbcache`, indexes, TLS, seeds, Tor) are reported as "restart required" and never silently ignored; a reload that fails to parse keeps the running config and never crashes the daemon. Per-key reference in the operator manual (`docs/manual/src/configuration.md`); behavior contract in `CORE_DIFFERENCES.md`.
 
 ### Built-in alerting hooks
 **Proposal:** Webhook dispatches for node health events (e.g., IBD complete, new connection, low disk space, mempool congestion).
@@ -100,46 +100,80 @@ The cumulative upload cap is application state with block-serving semantics — 
 
 ## Streaming Consumption API
 
-The dominant ways to consume a Bitcoin node all date from a different era and leave the same gaps. Core JSON-RPC + ZMQ is request/response plus a fire-and-forget pub-sub with no subscriptions, cursors, descriptors, or reorg events. The Electrum protocol is pre-descriptor, scripthash-only, one-subscription-per-scripthash, no reorg events. Esplora is fundamentally an indexer REST API with bolt-on WebSocket extensions and no spec stability. Every serious consumer — wallets, Lightning nodes, exchanges, watchtowers, explorers, L2 projects — ends up reinventing the same three things on top: **descriptor lifecycle**, **outpoint-level subscriptions**, and **cursor-based event replay**. None of the incumbents serve these natively.
+**Status: ✅ Shipped.** A push-based, streaming-first node-consumption API: a
+real-time event firehose plus live, cursor-resumable watch subscriptions keyed
+on outpoints, scripts, descriptors, and transaction ids — served over gRPC,
+JSON/WebSocket, SSE, and a Core-compatible ZMQ sink. The generalizing primitive
+is **outpoint subscription**: channel-close detection, watchtower triggers,
+deposit confirmation, and theft monitoring all reduce to it, and address-watching
+is outpoint-watching with a derivation rule on top. Durable confirmed-side
+cursors `(height, tx_index)` replay straight from the block index. The matcher
+runs off the consensus hot path on the isolated API runtime (`--api-threads`), so
+a slow or flooding consumer can never backpressure block connection or mempool
+acceptance; auth and per-token watch quotas reuse the unified `satd-auth` layer.
 
-The strategic opening: a clean, streaming-first node-consumption API, specced as an open protocol, with satd as the reference native implementation. The key generalization is that **outpoint subscription is the right base primitive** — Lightning channel-close detection, watchtower triggers, exchange deposit confirmation, and theft monitoring all reduce to it, and address-watching is just outpoint-watching with a derivation rule on top. Build down to outpoints; layer descriptors on as a convenience.
+Integrator guide: the **Streaming Consumption API** chapter of the operator
+manual ([`docs/manual/src/streaming.md`](docs/manual/src/streaming.md)).
+Authoritative wire spec: [`docs/api/streaming.md`](docs/api/streaming.md).
 
-### Where satd already is
+**Possible follow-up (uncertain):** standardizing the wire protocol as an open,
+transport-agnostic spec with a second (bitcoind-sidecar) implementation — a
+governance lift deferred until a real downstream consumer's feedback justifies
+it. Mining ops (`getblocktemplate` / `submitblock` — Stratum is the venue),
+wallet key management, and any consensus / block-production knobs remain
+explicitly out of scope.
 
-This is mostly a **consolidation effort, not a greenfield build** — satd has organically grown ~60–70% of the substrate:
+## Ecosystem & Mobile Integration
 
-- ✅ **Internal event bus** (`node::events`): `NodeEvent` envelope (schema version + edge stamp + monotonic `seq`) carrying `ChainEvent::{BlockConnected, BlockDisconnected}` and `MempoolEvent::{Enter, LeaveConfirmed, LeaveEvicted, LeaveReplaced}` with eviction reasons — published read-only out of the connect/disconnect and mempool-accept paths. This is **consensus ground truth**, not reconstructed.
-- ✅ **gRPC server-streaming adapter** (`satd-events`, `tonic`, proto `satd.events.v1`): `NodeEventStream.Subscribe` on its own port, loopback-guarded, with a category bitfield filter and forward-only `since_seq` dedup.
-- ✅ **Core-compatible ZMQ PUB** sink (`satd-events`).
-- ✅ **Electrum protocol** (`electrum-proto`): per-scripthash subscriptions, SPV merkle proofs, status-hash broadcast over `tokio::broadcast`.
-- ✅ **Esplora REST + SSE** (`esplora-handlers`).
-- ✅ **BIP158 compact-filter index** (`node-filter-index`) and an **outpoint spend index** (`node-index::SpendIndex`, outpoint → confirmed spending input), both with persistent backfill cursors.
+satd's mobile and self-custody strategy is to be **the server half**, not to
+ship a mobile wallet: the phone holds keys and scans filters, while satd runs on
+the user's home server or Pi and serves filters, mempool, blocks, history, and
+broadcast — one trusted party (the user) and no custodial intermediary. The
+wallet-facing surfaces that realize this — Electrum, Esplora REST, BIP 157/158
+compact filters, and Core-compatible JSON-RPC — are **shipped** (see the operator
+manual's [Native Protocol Architecture](docs/manual/src/native-protocol-surfaces.md)
+chapter). What remains below is unshipped; likelihood is tagged.
 
-### Why this is the right place to build it — and the trap to avoid
+**Likelihood legend:** **(likely)** — intend to ship · **(plausible)** — wanted,
+not committed · **(uncertain)** — only if a clear need emerges · **(non-code)** —
+an outreach / ops effort, not a feature.
 
-The cautionary precedent is btcd: it shipped a streaming-style WebSocket API and gained almost no traction outside LND. The failure was **adoption strategy**, not the idea — the API was hostage to running a non-Core consensus node, with no spec, no cursor replay, and no second implementation. That is *not* an argument against a node implementing the protocol; it is an argument for three disciplines:
+### Silent Payments (BIP 352) index — (plausible)
+Server-side scanning of every output's ECDH tweak, pushing only the relevant
+outputs to the client; without server-side indexing, SP is impractical on mobile.
+Rides on the same scan-every-output infrastructure as the shipped address-history
+index — likely that index extended rather than a parallel one.
 
-1. **Spec the wire protocol as an open, transport-agnostic thing**, separate from satd, so a bitcoind sidecar (or Knots, libbitcoin, a future Rust node) can serve the same protocol. satd is the *reference* native implementation, not a proprietary lure to pull operators off Core. The sidecar path stays on the roadmap as the adoption hedge.
-2. **Keep it a distinct service on a distinct port** (already true). The live danger is the **compatibility trap** — satd already ships Core-compatible JSON-RPC *and* Electrum *and* Esplora, so integrators reach for those and never touch the differentiated stream, exactly how btcd's notifications stayed invisible. The streaming API has to be pitched as a first-class reason to point at satd.
-3. **satd-native is genuinely the better implementation**, and a bitcoind sidecar structurally cannot match it: a sidecar diffs headers off ZMQ to *infer* reorgs (ZMQ has no reorg semantics), infers mempool transitions from `rawtx` with no replaced/evicted *reason*, and needs its own index for outpoint spends. satd emits all of this in-process as ground truth.
+### Mobile push notifications (APNs / FCM) — (plausible)
+Push to a mobile wallet on relevant block / tx events so the app needn't stay
+awake polling. Pairs naturally with the shipped streaming watch-matcher as the
+event source.
 
-### The delta — two additions turn the firehose into the differentiator
+### LND-compatible gRPC / REST — (uncertain)
+Would let Zeus and other LND-aware wallets treat satd as "my remote LND." Large
+surface; only worth it if satd makes a deliberate Lightning-first move. Deferred.
 
-The existing gRPC `Subscribe` is a coarse category-filtered firehose with no replay. Two pieces of work close the gap to the proposal, in priority order:
+### Grafana dashboard JSON — (likely)
+A bundled `contrib/grafana/` dashboard over the shipped Prometheus `/metrics`
+endpoint. Small, self-contained, high operator value.
 
-1. **Durable replay cursors (the single highest-value item).** Cursor durability is the main reason an operator would choose this over Core RPC + ZMQ. satd's current proto explicitly punts replay ("consume from a durable broker upstream"). The clean satd-specific design: **confirmed-side cursors are `(height, tx_index)` and replay exactly from the block index** — no extra log, subsuming Electrum's subscribe-then-get-history dance and Esplora's per-address pagination. Mempool-side replay is best-effort within a bounded in-memory window (the mempool isn't durable anyway); persist only the high-water `seq`. Reconnect-with-cursor becomes the single replay primitive for every subscription type.
-2. **Live outpoint/script notifier (not just the query index).** satd has `SpendIndex` (query) and the Electrum scripthash registry (push), but no live outpoint *subscription*. Add an outpoint-keyed matcher in the connect/mempool path that pushes `OutpointSpent`/`TxSeen`, and lift the gRPC `Subscribe` from a one-way stream + bitfield into a **bidi tagged-union** (`AddScripts` / `AddOutpoints` / `AddTransactions` / `SetCursor`), mirroring the `oneof` style already in `NodeEvent`. Tagged-union composition is also what avoids btcd's BIP37 dead-end: new subscription kinds slot in without protocol breakage. This is the LDK/watchtower primitive and satd can serve it in-process with zero ZMQ reconstruction.
+### Raspberry Pi validation pass — (likely)
+Benchmark and tune `dbcache` / `maxmempool` / parallel-verify defaults on 4 GB /
+8 GB Pi 5 hardware, and validate the pruning + AssumeUTXO recommended profile
+end-to-end on-device. The code paths are shipped; this is the empirical tuning +
+sign-off the packager-ready gate calls for.
 
-A **descriptor convenience layer** (rust-miniscript expansion → watch-set, gap-limit rotation, a `DescriptorNeedsAddresses` side-channel) layers on top of the outpoint/script primitive. Lowest consensus risk, pure library work — sequence it last.
+### Ecosystem outreach — (non-code)
+Open the first Umbrel and Start9 app PRs ourselves rather than waiting for
+volunteers; recruit one maintainer from each into early packaging review; stand
+up a publicly-reachable reference deployment (satd on a real Pi 5 with the Umbrel
+app) linked from the README; maintain presence in the relevant packaging channels
+(`#umbrel-dev`, the Start9 community, BTCPay ops).
 
-### Transport
-
-satd is already over-equipped (gRPC, jsonrpsee/WS, Electrum, Esplora/SSE) — which is itself the trap: four transports, no shared schema or cursor. Consolidate to **one schema (the proto is the natural source of truth) over two transports: gRPC native + JSON-over-WebSocket via the existing jsonrpsee server**, reusing the Esplora SSE pattern for firehose consumers. Deliberately **skip grpc-gateway/REST transcoding early** — it drags a Go toolchain into a build that already fights bindgen/libclang/musl-static; hand-roll the JSON/WS mapping instead.
-
-### Constraints and risks
-
-- **Never let the stream touch consensus.** satd's first value is being a correct Core-compatible node. The event bus is publish-only out of `connect_block` today — preserve that invariant absolutely. A slow client must **never** backpressure mempool acceptance or block connection; degrade by drop-with-notice (the current `Lagged` → log → continue handling is correct — protect it as load grows). This is a *safety* property, not just UX.
-- **Auth/multi-tenancy is genuinely missing and must be day-one for remote exposure.** The events gRPC is unauthenticated, loopback-only, with `--events-grpc-allow-remote` as the only knob — that flag is not a multi-tenancy answer. A **unified, opt-in auth layer (TBD) will land first**, gating this and the existing surfaces with scoped tokens + watch-set quotas, before the streaming API is exposed remotely. Bolting auth on later is what condemned Electrum to "trust the operator."
-- **Prove the shape with one anchor consumer before spec-and-evangelize.** The open-protocol / two-implementations / BIP-style-spec ambition is real but a governance lift. The pragmatic near-term path is internal consolidation plus a single downstream integrator co-designing the surface, then deciding whether to standardize.
-
-**Explicitly out of scope:** mining ops (`getblocktemplate`/`submitblock` — Stratum is the right venue), wallet key management and signing (the node stays keyless by design), and any consensus/block-production knobs.
+### Open questions
+- Sponsor / upstream satd-specific presets into an existing mobile wallet
+  (Nunchuk, BlueWallet), or stay a pure server?
+- Support a non-Tor cloud-accessible deployment path (HTTPS reverse proxy,
+  Tailscale, mutual-TLS), or intentionally de-emphasize it in favor of Tor-first?
+- Build the Silent Payments index on top of the address-history index, or as a
+  parallel index? (Likely the former, given the shared scan-every-output shape.)

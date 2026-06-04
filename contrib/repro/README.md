@@ -8,7 +8,7 @@ Tools for verifying the satd flake produces deterministic binaries.
 
 The full reproducibility story — flake design, determinism hazards
 addressed, gating policy — lives in
-[`docs/PACKAGING.md`](../../docs/PACKAGING.md) §"Reproducible build via Nix".
+[`docs/manual/src/packaging.md`](../../docs/manual/src/packaging.md) §"Reproducible build via Nix".
 
 CI runs an equivalent two-runner check on every PR that touches
 `flake.nix`, `flake.lock`, `rust-toolchain.toml`, or `Cargo.lock`;

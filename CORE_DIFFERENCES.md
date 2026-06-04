@@ -123,7 +123,7 @@ APIs. On by default on `127.0.0.1:3000`. Optional TLS via `--esploratlsbind`.
   non-loopback exposure must explicitly set auth).
 - CORS, request-timeout, concurrency caps, hard-wired 1 MiB body cap on
   `POST /tx`.
-- See `docs/api/esplora.md` for the endpoint reference.
+- See `docs/manual/src/esplora.md` for the endpoint reference.
 
 ### Electrum protocol server (`electrum-proto`)
 
@@ -316,7 +316,7 @@ preserved; the satd extension is opt-in per request or per flag.
   "restart required" and never silently ignored. A reload that fails to parse
   (e.g. a typo'd or unknown key, which hard-errors at load) is logged and the
   running config is kept — the daemon never crashes on a bad reload. The
-  authoritative per-key list is in `OPERATOR_ERGONOMICS.md`.
+  authoritative per-key list is in the operator manual (`docs/manual/src/configuration.md`).
 
 - **`SIGUSR1` reloads TLS certificates in place.** Bitcoin Core has no
   `SIGUSR1` handler and no native TLS (its JSON-RPC is HTTP-only, fronted by a
@@ -328,8 +328,8 @@ preserved; the satd extension is opt-in per request or per flag.
   (cert-manager / ACME / Vault). The cert/key **paths** and the mTLS **CA**
   remain restart-only. A failed reload keeps the previous, still-valid cert.
   Kept separate from `SIGHUP` so frequent automated cert rotation doesn't
-  re-read `bitcoin.conf` or run the config diff/apply machinery. See
-  `OPERATOR_ERGONOMICS.md`.
+  re-read `bitcoin.conf` or run the config diff/apply machinery. See the
+  operator manual (`docs/manual/src/configuration.md`).
 
 - **`getibdprogress`** — IBD bitmap + per-peer tracking; richer than
   Core's `verificationprogress` scalar.
@@ -425,6 +425,7 @@ this section will be updated when measurements are available.
 ## References
 
 - `STABILITY_POLICY.md` — Tier 1 / 2 / 3 stability contract.
-- `OPERATOR_ERGONOMICS.md` — operator flag matrix and tuning.
-- `ECOSYSTEM.md` — strategic direction for mobile + packaging.
-- `docs/api/esplora.md` — Esplora REST endpoint reference.
+- Operator manual (`docs/manual/`) — operator flag matrix, tuning, the native
+  protocol-surface architecture, and packaging.
+- `ROADMAP.md` — unshipped operator features and the ecosystem / mobile strategy.
+- `docs/manual/src/esplora.md` — Esplora REST endpoint reference.

@@ -14,4 +14,4 @@ in development) lives in [`docs/release-notes/README.md`](../../docs/release-not
 Verification commands for tarballs (minisign), images (cosign), and
 the full key-rotation procedure live in the repo-root
 [`SECURITY.md`](../../SECURITY.md). The packaging contract for
-release artifacts lives in [`docs/PACKAGING.md`](../../docs/PACKAGING.md).
+release artifacts lives in [`docs/manual/src/packaging.md`](../../docs/manual/src/packaging.md).

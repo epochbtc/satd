@@ -64,7 +64,7 @@ single-dash Core spellings are aliased by `normalize_args`. Grouped:
   `limitdescendantcount`, `mempoolexpiry`, `persistmempool`,
   `permitbaremultisig`
 - **Native protocol surfaces:** the `esplora*` and `electrum*` families
-  (see `OPERATOR_ERGONOMICS.md`)
+  (see `docs/manual/src/configuration.md`)
 - **Peer-table / eclipse resistance:** `asmap` (ASN-based addrman
   bucketing).
 - **Storage / pruning / reindex / mining / events / webhooks / MCP /
