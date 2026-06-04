@@ -79,9 +79,13 @@ layout) per `STABILITY_POLICY.md`.
   carries the most work). `reconsiderblock <hash>` clears the invalid mark on
   the block and its descendants and re-activates the best chain (reorging back
   if that chain regains the most work). The `Invalid` mark is persisted in the
-  block index, and `accept_block`/`store_block` now refuse to build on an
-  invalidated parent (`bad-prevblk`), so the subtree stays excluded until
-  reconsidered. Both are classified `BlockConnecting` (rejected on the
+  block index **before** the active chain is rolled back, so a crash mid-call
+  can never durably truncate the tip while leaving the disconnected block
+  `Valid` (which would silently un-do the invalidation). `accept_block`/
+  `store_block` refuse to build on an invalidated parent (`bad-prevblk`), so the
+  subtree stays excluded until reconsidered. On an AssumeUTXO node, invalidating
+  a block at or below the loaded snapshot height is refused (no undo data
+  exists there), matching the reorg-depth guard `accept_block` already enforces. Both are classified `BlockConnecting` (rejected on the
   read-only RPC listener). This lets a single regtest node be driven into a
   reorg without a second node — the standard tool for reorg testing, and it now
   drives the single-node reorg E2E coverage for the Streaming Consumption API

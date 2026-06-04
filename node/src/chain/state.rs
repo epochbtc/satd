@@ -3894,29 +3894,44 @@ impl ChainState {
             ));
         }
 
-        // If the target is on the active chain, roll the active chain back to
-        // its parent FIRST — while the blocks are still readable (`get_block`
-        // excludes `Invalid`, and `perform_reorg` reads each disconnected
-        // block). Marking the subtree invalid before disconnecting would make
-        // the disconnect's own block reads fail.
-        let on_active = self.active_chain_hash_at_height(entry.height) == Some(hash);
-        if on_active {
-            let parent = self
-                .store
-                .get_block_index(&entry.header.prev_blockhash)
-                .ok_or(ChainError::BadPrevBlock)?;
-            if self.tip_hash() != parent.header.block_hash() {
-                self.reorg_to(&parent)?;
-            }
+        // AssumeUTXO: while a snapshot is loaded this chainstate connected no
+        // blocks at/below `snapshot_height` (its UTXO base IS the snapshot), so
+        // it holds no undo data to roll them back. Refuse to invalidate a block
+        // whose rollback would reach at/below the snapshot height — the same
+        // guard `accept_block`'s reorg path enforces — rather than failing
+        // mid-disconnect on missing undo. The background chainstate validates
+        // that buried history.
+        if let Some(bg) = self.background()
+            && entry.height <= bg.snapshot_height()
+        {
+            return Err(ChainError::InvalidArgument(format!(
+                "cannot invalidate a block at or below the AssumeUTXO snapshot height ({})",
+                bg.snapshot_height()
+            )));
         }
 
-        // Mark the (now-disconnected) block + every descendant invalid so the
-        // re-activation candidate search excludes the whole subtree.
+        // Flush block-index writes still buffered in the coin cache to the
+        // inner store: the full-index scans below (`for_each_block_index` does
+        // not overlay the cache's `pending_batch`) must see a consistent view,
+        // or a descendant that exists only in the pending batch would be
+        // missed by `mark_subtree_invalid`.
+        self.store.flush()?;
+
+        // Mark the block + every descendant invalid and PERSIST it BEFORE
+        // touching the active chain. This is now safe because `get_block`
+        // serves an invalidated block's data, so the subsequent disconnect can
+        // still read the blocks it rolls back. Marking first means a crash
+        // mid-operation can never leave a durably-truncated tip whose
+        // disconnected block is still `Valid` — a state that would silently
+        // re-activate and reverse the invalidation on the next block.
         self.mark_subtree_invalid(hash)?;
 
-        // Connect the best valid alternative chain — a competing side chain
-        // that now carries more work than the parent — if one exists;
-        // otherwise the active tip stays at the parent (a pure truncation).
+        // Re-activate the best valid chain. If `hash` was on the active chain
+        // the current tip is now invalid (a descendant of `hash`), so the best
+        // valid candidate differs and a reorg follows — a pure truncation to
+        // the parent, or onto a competing side chain that now carries more
+        // work. If `hash` was only on a side chain the active tip stays best
+        // and this is a no-op.
         self.activate_best_chain()
     }
 
@@ -3931,6 +3946,10 @@ impl ChainState {
         if self.store.get_block_index(&hash).is_none() {
             return Err(ChainError::BlockNotFound);
         }
+
+        // See `invalidate_block`: flush so the full-index subtree scan sees a
+        // view consistent with `get_block_index`.
+        self.store.flush()?;
 
         self.clear_subtree_invalid(hash)?;
         self.activate_best_chain()
@@ -4163,6 +4182,19 @@ impl ChainState {
         let fork_entry = self.find_fork(&tip_entry, target)?;
         let fork_hash = fork_entry.header.block_hash();
         let target_hash = target.header.block_hash();
+
+        // AssumeUTXO reorg-depth guard (mirrors `accept_block`): never roll
+        // back at/below the snapshot height — this chainstate has no undo data
+        // there. Defense-in-depth: `invalidate_block` rejects up front, but
+        // `reconsider_block`/`activate_best_chain` reach `reorg_to` directly.
+        if let Some(bg) = self.background()
+            && fork_entry.height < bg.snapshot_height()
+        {
+            return Err(ChainError::InvalidArgument(format!(
+                "refusing reorg below the AssumeUTXO snapshot height ({})",
+                bg.snapshot_height()
+            )));
+        }
 
         // Atomic-reorg durable checkpoint (#262): flush the pre-reorg chain so
         // it is the exact rollback target, then hold the flush-exclusion for
@@ -4646,13 +4678,19 @@ pub(crate) mod tests {
     use crate::storage::flatfile::FlatFileManager;
 
     pub(crate) fn make_chain_state() -> (ChainState, std::path::PathBuf) {
+        // A process-wide counter guarantees a unique datadir per call: two
+        // tests running on parallel threads can otherwise hit the same
+        // `subsec_nanos()` and share a `blocks/` dir, corrupting each other's
+        // flat files ("failed to read stored block").
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "satd-chain-test-{}-{}",
+            "satd-chain-test-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .subsec_nanos()
+                .subsec_nanos(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         ));
         let blocks_dir = dir.join("blocks");
         let store = Box::new(InMemoryStore::new());
@@ -4904,6 +4942,58 @@ pub(crate) mod tests {
             cs.accept_block(&child),
             Err(ChainError::BadPrevBlock)
         ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn invalidate_side_chain_block_leaves_active_tip() {
+        let (cs, dir) = make_chain_state();
+        let main = build_and_connect_chain(&cs, 3);
+        let main_tip = main[2].block_hash();
+        let block1 = main[0].block_hash();
+
+        // A shorter side fork off block1 (height 2), stored but never activated.
+        let side = build_test_block(block1, 2, 1_700_000_222);
+        cs.accept_header(&side.header).unwrap();
+        cs.store_block(&side).unwrap();
+        assert_eq!(cs.tip_hash(), main_tip, "side store does not change the tip");
+
+        // Invalidating a side-chain block must not touch the active chain.
+        cs.invalidate_block(side.block_hash()).unwrap();
+        assert_eq!(cs.tip_hash(), main_tip);
+        assert_eq!(cs.tip_height(), 3);
+        assert_eq!(
+            cs.get_block_index(&side.block_hash()).unwrap().status,
+            BlockStatus::Invalid
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reconsider_reorgs_back_onto_restored_chain() {
+        let (cs, dir) = make_chain_state();
+        let main = build_and_connect_chain(&cs, 5);
+        let block2 = main[1].block_hash();
+        let main3 = main[2].block_hash();
+        let main5 = main[4].block_hash();
+
+        // Invalidate a mid-chain block → truncates to its parent (height 2).
+        cs.invalidate_block(main3).unwrap();
+        assert_eq!(cs.tip_hash(), block2);
+        assert_eq!(cs.tip_height(), 2);
+
+        // Reconsidering it restores the subtree; the restored chain out-works
+        // the truncated tip, so the active chain reorgs back onto it via a
+        // multi-block reconnect (3 → 4 → 5).
+        cs.reconsider_block(main3).unwrap();
+        assert_eq!(cs.tip_hash(), main5);
+        assert_eq!(cs.tip_height(), 5);
+        for b in &main[2..] {
+            assert_eq!(
+                cs.get_block_index(&b.block_hash()).unwrap().status,
+                BlockStatus::Valid
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
