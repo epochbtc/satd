@@ -2294,11 +2294,17 @@ impl ChainState {
 
     pub fn get_block(&self, hash: &BlockHash) -> Option<Block> {
         let entry = self.store.get_block_index(hash)?;
-        if matches!(
-            entry.status,
-            BlockStatus::HeaderOnly | BlockStatus::Invalid | BlockStatus::Pruned
-        ) {
-            return None;
+        // HeaderOnly/Pruned entries never carry local block data. An `Invalid`
+        // block (set only by `invalidate_block`) KEEPS its data on disk, and
+        // both Core's `getblock` and the reorg/watch machinery — which
+        // re-reads a just-disconnected block to emit `TxidUnconfirmed` — must
+        // still read it; serve it as long as it actually held a block
+        // (num_tx > 0; every block has at least a coinbase). A header-only
+        // entry that was invalidated (num_tx == 0) has no data to read.
+        match entry.status {
+            BlockStatus::HeaderOnly | BlockStatus::Pruned => return None,
+            BlockStatus::Invalid if entry.num_tx == 0 => return None,
+            _ => {}
         }
         let pos = FlatFilePos {
             file_number: entry.file_number,
@@ -2313,6 +2319,13 @@ impl ChainState {
     /// blocks. Used by the address-index backfill runner.
     pub fn read_block_at_height(&self, height: u32) -> Option<Block> {
         let hash = self.store.get_block_hash_by_height(height)?;
+        // Preserve the documented "skip invalid" contract: unlike `get_block`
+        // (which serves invalidated blocks for getblock/reorg re-reads), the
+        // backfill runner must never process a block that has been
+        // invalidated out of the active chain.
+        if self.store.get_block_index(&hash)?.status == BlockStatus::Invalid {
+            return None;
+        }
         self.get_block(&hash)
     }
 
@@ -4786,8 +4799,10 @@ pub(crate) mod tests {
             cs.get_block_index(&tip5).unwrap().status,
             BlockStatus::Invalid
         );
-        // An Invalid block is not retrievable as data.
-        assert!(cs.get_block(&tip5).is_none());
+        // The block's data is still readable (Core parity + the reorg/watch
+        // machinery re-reads a just-disconnected block); only its index status
+        // changed.
+        assert!(cs.get_block(&tip5).is_some());
 
         // Reconsidering restores it and re-activates the chain.
         cs.reconsider_block(tip5).unwrap();

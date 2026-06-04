@@ -83,7 +83,13 @@ layout) per `STABILITY_POLICY.md`.
   invalidated parent (`bad-prevblk`), so the subtree stays excluded until
   reconsidered. Both are classified `BlockConnecting` (rejected on the
   read-only RPC listener). This lets a single regtest node be driven into a
-  reorg without a second node — the standard tool for reorg testing.
+  reorg without a second node — the standard tool for reorg testing, and it now
+  drives the single-node reorg E2E coverage for the Streaming Consumption API
+  (`Reorg` / `BlockDisconnected` / `TxidUnconfirmed` over a real socket).
+- **`getblock` now serves an invalidated block** (Core parity): an
+  `invalidateblock`'d block keeps its data on disk and remains retrievable, and
+  the reorg/watch machinery re-reads a just-disconnected block to emit
+  `TxidUnconfirmed`. (Header-only and pruned blocks remain unreadable.)
 
 ### Testing
 

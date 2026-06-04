@@ -709,13 +709,14 @@ fn test_invalidateblock_and_reconsiderblock() {
         "tip should be the parent of the invalidated block"
     );
 
-    // The invalidated block can no longer be fetched as data.
+    // The invalidated block's data is still served (Core parity — the block
+    // stays in the index with its data, only its status changes).
     let getblock = node
         .rpc_call_with_params("getblock", vec![serde_json::json!(tip5)])
         .unwrap();
     assert!(
-        !getblock["error"].is_null(),
-        "getblock on an invalidated hash should error: {getblock:?}"
+        getblock["error"].is_null(),
+        "getblock should still serve an invalidated block: {getblock:?}"
     );
 
     // reconsiderblock restores it and re-activates the chain.
