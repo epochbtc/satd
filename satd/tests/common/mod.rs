@@ -12,6 +12,13 @@
 /// binaries that don't use it just carry the (allow-dead-code) module.
 pub mod core_node;
 
+/// Real gRPC + WS/SSE clients for the streaming Consumption-API E2E suite
+/// (`tests/streaming.rs`). Compiled into every integration binary that
+/// `mod common`-imports this; the `regtest`/`e2e` binaries don't use them,
+/// hence the module-level `#![allow(dead_code)]` inside each.
+pub mod grpc_client;
+pub mod ws_client;
+
 use base64::Engine;
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -561,6 +568,498 @@ fn apply_listener_arg_defaults(cmd: &mut Command, extra_args: &[&str]) {
         .any(|a| *a == "--electrum=1" || *a == "--electrum=true");
     if (esplora_explicitly_on || electrum_explicitly_on) && !caller_sets_txindex {
         cmd.arg("--txindex");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Streaming Consumption-API E2E harness
+// ---------------------------------------------------------------------------
+
+/// A `TestNode` plus the runtime-bound ports of its streaming listeners,
+/// discovered from `getserverstatus` after startup. `None` means the listener
+/// was not requested (or didn't bind). Reach through `.node` for RPC / mining.
+pub struct StreamingNode {
+    pub node: TestNode,
+    pub grpc_port: Option<u16>,
+    pub ws_port: Option<u16>,
+}
+
+impl StreamingNode {
+    /// Boot a regtest `satd` with the gRPC + streamws listeners enabled on
+    /// OS-assigned ports, then poll `getserverstatus` until each requested
+    /// listener reports a concrete bound address. Binding `:0` and reading the
+    /// port back avoids the fixed-port TOCTOU that a `find_available_port` +
+    /// explicit-bind would carry.
+    ///
+    /// Both listeners are enabled by default; pass an explicit
+    /// `--events-grpc-bind` / `--streamws` in `extra_args` to override (e.g. to
+    /// enable only one, or to bind with auth). The caller's flags win.
+    pub fn start(extra_args: &[&str]) -> Self {
+        Self::start_with_env(extra_args, &[])
+    }
+
+    /// Like [`Self::start`] but also sets environment variables on the spawned
+    /// `satd` — used by the Lagged / replay-ring tests to shrink the broadcast
+    /// buffer via `SATD_EVENT_BROADCAST_CAPACITY`.
+    pub fn start_with_env(extra_args: &[&str], env: &[(&str, &str)]) -> Self {
+        // Detect ONLY the explicit bind flags (`--events-grpc-bind` /
+        // `--streamws`), not their siblings like `--streamws-auth` or
+        // `--streamws-max-conns` — otherwise a caller that tunes a streamws
+        // knob would suppress the auto-added bind and the listener would never
+        // come up.
+        let is_bind = |a: &&str, flag: &str| **a == *flag || a.starts_with(&format!("{flag}="));
+        let want_grpc = !extra_args.iter().any(|a| is_bind(a, "--events-grpc-bind"));
+        let want_ws = !extra_args.iter().any(|a| is_bind(a, "--streamws"));
+        let mut args: Vec<String> = Vec::new();
+        if want_grpc {
+            args.push("--events-grpc-bind=127.0.0.1:0".to_string());
+        }
+        if want_ws {
+            args.push("--streamws=127.0.0.1:0".to_string());
+        }
+        for a in extra_args {
+            args.push((*a).to_string());
+        }
+        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        let node = TestNode::start_with_env(&arg_refs, env);
+
+        // The caller may have supplied explicit binds; in that case still poll
+        // for them (they're requested) — only a fully-absent listener flag with
+        // a `=0`/disabled value is skipped, which we approximate by requesting
+        // whatever the merged args ask for.
+        let req_grpc = args
+            .iter()
+            .any(|a| a == "--events-grpc-bind" || a.starts_with("--events-grpc-bind="));
+        let req_ws = args
+            .iter()
+            .any(|a| a == "--streamws" || a.starts_with("--streamws="));
+        let (grpc_port, ws_port) = poll_streaming_ports(&node, req_grpc, req_ws);
+        StreamingNode {
+            node,
+            grpc_port,
+            ws_port,
+        }
+    }
+
+    pub fn grpc_port(&self) -> u16 {
+        self.grpc_port.expect("gRPC listener not bound")
+    }
+
+    pub fn ws_port(&self) -> u16 {
+        self.ws_port.expect("streamws listener not bound")
+    }
+
+    /// Stop and re-spawn `satd` on the same datadir + RPC port (preserving the
+    /// durable chain), re-enabling the streaming listeners on fresh
+    /// OS-assigned ports and re-discovering them. Used by the `instance_id`
+    /// epoch test: the per-process publisher nonce changes across a restart
+    /// while the durable confirmed chain (and its cursor replay) survives.
+    /// Blocking — call via `spawn_blocking` from an async test.
+    pub fn restart(&mut self) {
+        self.node.stop();
+        let args = ["--events-grpc-bind=127.0.0.1:0", "--streamws=127.0.0.1:0"];
+        let mut fresh =
+            TestNode::start_with_datadir(&self.node.datadir, self.node.rpcport, &args);
+        std::mem::swap(&mut self.node.process, &mut fresh.process);
+        self.node.cookie = std::mem::take(&mut fresh.cookie);
+        self.node.p2p_port = fresh.p2p_port;
+        self.node.stderr_log = std::mem::take(&mut fresh.stderr_log);
+        // Blank the husk's datadir so its Drop can't delete the shared dir.
+        fresh.datadir = PathBuf::new();
+        let (g, w) = poll_streaming_ports(&self.node, true, true);
+        self.grpc_port = g;
+        self.ws_port = w;
+    }
+}
+
+/// Poll `getserverstatus` until the requested streaming listeners report a
+/// concrete `{"bind": "host:port"}`, returning the parsed ports. satd starts
+/// the JSON-RPC server before the optional listeners bind, so a fresh
+/// `getblockchaininfo`-readiness does not imply the streaming ports are up.
+fn poll_streaming_ports(
+    node: &TestNode,
+    want_grpc: bool,
+    want_ws: bool,
+) -> (Option<u16>, Option<u16>) {
+    let parse_port = |v: &serde_json::Value| -> Option<u16> {
+        v.get("bind")
+            .and_then(|b| b.as_str())
+            .and_then(|s| s.rsplit_once(':'))
+            .and_then(|(_, p)| p.parse::<u16>().ok())
+    };
+    let deadline = Instant::now() + test_timeout(60);
+    loop {
+        if let Ok(status) = node.rpc_call("getserverstatus") {
+            let res = &status["result"];
+            let grpc = parse_port(&res["events_grpc"]);
+            let ws = parse_port(&res["streamws"]);
+            let grpc_ready = !want_grpc || grpc.is_some();
+            let ws_ready = !want_ws || ws.is_some();
+            if grpc_ready && ws_ready {
+                return (grpc, ws);
+            }
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "streaming listeners not up within deadline (want_grpc={want_grpc}, want_ws={want_ws})"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// A blocking JSON-RPC caller. Implemented by both [`TestNode`] (sync tests,
+/// borrows the node) and [`RpcHandle`] (async tests, moves into
+/// `spawn_blocking`), so the funding helpers below work from either context
+/// without changing the existing `e2e.rs` call sites.
+pub trait BlockingRpc {
+    fn rpc(
+        &self,
+        method: &str,
+        params: Vec<serde_json::Value>,
+    ) -> Result<serde_json::Value, String>;
+}
+
+impl BlockingRpc for TestNode {
+    fn rpc(
+        &self,
+        method: &str,
+        params: Vec<serde_json::Value>,
+    ) -> Result<serde_json::Value, String> {
+        self.rpc_call_with_params(method, params)
+    }
+}
+
+impl BlockingRpc for RpcHandle {
+    fn rpc(
+        &self,
+        method: &str,
+        params: Vec<serde_json::Value>,
+    ) -> Result<serde_json::Value, String> {
+        self.call(method, params)
+    }
+}
+
+/// A `Send + 'static` RPC caller cloned from a [`TestNode`]. The streaming
+/// suite drives mining / tx submission from `tokio::task::spawn_blocking`
+/// while holding an async event stream — and `reqwest::blocking` panics if
+/// called directly on a tokio worker thread ("Cannot start a runtime from
+/// within a runtime"). `RpcHandle` carries only the port + cookie, so it
+/// moves cleanly into a blocking task.
+#[derive(Clone)]
+pub struct RpcHandle {
+    rpcport: u16,
+    cookie: String,
+}
+
+impl RpcHandle {
+    pub fn call(
+        &self,
+        method: &str,
+        params: Vec<serde_json::Value>,
+    ) -> Result<serde_json::Value, String> {
+        let url = format!("http://127.0.0.1:{}/", self.rpcport);
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "test",
+            "method": method,
+            "params": params,
+        });
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+        let (user, pass) = self.cookie.split_once(':').unwrap_or(("__cookie__", "none"));
+        let response = client
+            .post(&url)
+            .basic_auth(user, Some(pass))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .map_err(|e| e.to_string())?;
+        response.json().map_err(|e| e.to_string())
+    }
+
+    /// Mine `n` blocks to `addr`, returning the list of block hashes.
+    pub fn mine(&self, n: u32, addr: &str) -> Vec<String> {
+        let res = self
+            .call(
+                "generatetoaddress",
+                vec![serde_json::json!(n), serde_json::json!(addr)],
+            )
+            .expect("generatetoaddress");
+        res["result"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Current best-block height.
+    pub fn block_count(&self) -> u64 {
+        self.call("getblockcount", vec![])
+            .expect("getblockcount")["result"]
+            .as_u64()
+            .expect("height")
+    }
+
+    /// Broadcast a raw transaction hex, returning the txid.
+    pub fn send_raw_tx(&self, raw_hex: &str) -> String {
+        let res = self
+            .call("sendrawtransaction", vec![serde_json::json!(raw_hex)])
+            .expect("sendrawtransaction");
+        res["result"]
+            .as_str()
+            .unwrap_or_else(|| panic!("sendrawtransaction error: {res}"))
+            .to_string()
+    }
+}
+
+impl TestNode {
+    /// A `Send + 'static` RPC handle for use from `spawn_blocking` /
+    /// `std::thread` (see [`RpcHandle`]).
+    pub fn rpc_handle(&self) -> RpcHandle {
+        RpcHandle {
+            rpcport: self.rpcport,
+            cookie: self.cookie.clone(),
+        }
+    }
+
+    /// Stop this node and re-spawn `satd` on the *same* datadir and RPC port,
+    /// preserving the durable chain state. Used by the cursor `instance_id`
+    /// epoch test, which needs a same-datadir restart to prove the per-process
+    /// nonce changes (mempool replay resets) while confirmed replay survives.
+    ///
+    /// Implemented in place because `Drop for TestNode` deletes the datadir —
+    /// the freshly-spawned husk's datadir field is neutralised so its own Drop
+    /// doesn't nuke the still-live shared directory.
+    pub fn restart_preserving_datadir(&mut self, extra_args: &[&str]) {
+        self.stop();
+        let mut fresh = TestNode::start_with_datadir(&self.datadir, self.rpcport, extra_args);
+        std::mem::swap(&mut self.process, &mut fresh.process);
+        self.cookie = std::mem::take(&mut fresh.cookie);
+        self.p2p_port = fresh.p2p_port;
+        self.stderr_log = std::mem::take(&mut fresh.stderr_log);
+        // `fresh` now owns the already-exited old process and a shared datadir;
+        // blank the datadir so its Drop's `remove_dir_all` is a harmless no-op.
+        fresh.datadir = PathBuf::new();
+    }
+}
+
+/// Derived from a deterministic 32-byte secret: a P2WPKH source address plus
+/// the matching `SecretKey` / `PublicKey` for signing spends. Lifted from the
+/// E2E suite so both `tests/e2e.rs` and `tests/streaming.rs` share one funding
+/// primitive.
+#[derive(Clone)]
+pub struct DeterministicWallet {
+    pub sk: bitcoin::secp256k1::SecretKey,
+    pub pk: bitcoin::PublicKey,
+    pub address: bitcoin::Address,
+}
+
+impl DeterministicWallet {
+    pub fn from_secret(secret: [u8; 32]) -> Self {
+        use bitcoin::key::CompressedPublicKey;
+        use bitcoin::secp256k1::{Secp256k1, SecretKey};
+        use bitcoin::{Network, PublicKey};
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_slice(&secret).expect("valid secret");
+        let pk = PublicKey::new(sk.public_key(&secp));
+        let cpk = CompressedPublicKey::from_slice(&pk.to_bytes()).expect("compressed");
+        let address = bitcoin::Address::p2wpkh(&cpk, Network::Regtest);
+        DeterministicWallet { sk, pk, address }
+    }
+}
+
+/// The display-hex txid of block 1's coinbase (the input most streaming tests
+/// spend). The caller must have mined ≥1 block.
+pub fn block1_coinbase_txid<R: BlockingRpc>(node: &R) -> String {
+    let block1_hash = node
+        .rpc("getblockhash", vec![serde_json::json!(1)])
+        .expect("getblockhash 1")["result"]
+        .as_str()
+        .expect("hash string")
+        .to_string();
+    node.rpc(
+        "getblock",
+        vec![serde_json::json!(block1_hash), serde_json::json!(1)],
+    )
+    .expect("getblock")["result"]["tx"][0]
+        .as_str()
+        .expect("coinbase txid")
+        .to_string()
+}
+
+/// `sha256(scriptPubKey)` as natural-order hex — the watch-set scripthash form
+/// (`AddScripts` input and `ScriptMatched.scripthash` output both use this).
+pub fn scripthash_hex(spk: &bitcoin::Script) -> String {
+    use bitcoin::hashes::{sha256, Hash as _};
+    hex::encode(sha256::Hash::hash(spk.as_bytes()).to_byte_array())
+}
+
+/// The top `bits/8` bytes of `sha256(scriptPubKey)` as hex — a byte-aligned
+/// script-prefix bucket for `AddScriptPrefixes`. `bits` must be a multiple of 8
+/// in `1..=32` (the tests use byte-aligned prefixes to avoid sub-byte masking).
+pub fn script_prefix_hex(spk: &bitcoin::Script, bits: u32) -> String {
+    assert!(bits.is_multiple_of(8) && (8..=32).contains(&bits), "byte-aligned bits");
+    use bitcoin::hashes::{sha256, Hash as _};
+    let sh = sha256::Hash::hash(spk.as_bytes()).to_byte_array();
+    hex::encode(&sh[..(bits / 8) as usize])
+}
+
+/// Convert a display-order (RPC) txid/blockhash hex into internal (raw)
+/// byte-order hex. Watch matches encode txids as `as_raw_hash().to_byte_array()`
+/// (internal order), whereas RPC returns display (reversed) hex — so an
+/// assertion comparing a match field against an RPC txid must convert one.
+pub fn display_to_internal_hex(display_hex: &str) -> String {
+    let mut b = hex::decode(display_hex).expect("hex");
+    b.reverse();
+    hex::encode(b)
+}
+
+/// Build + sign a P2WPKH spend from block-1's coinbase to `dest_script`.
+/// Returns `(raw_tx_hex, txid_hex)`. The caller must have mined ≥101 blocks to
+/// `wallet.address` so the coinbase is mature. `Sequence::MAX` (no RBF
+/// signalling). Lifted from `tests/e2e.rs`.
+pub fn build_signed_p2wpkh_spend_from_block1_coinbase<R: BlockingRpc>(
+    node: &R,
+    wallet: &DeterministicWallet,
+    dest_script: bitcoin::ScriptBuf,
+    fee_sat: u64,
+) -> (String, String) {
+    build_signed_p2wpkh_spend_seq(node, wallet, dest_script, fee_sat, 0xffff_ffff)
+}
+
+/// Like [`build_signed_p2wpkh_spend_from_block1_coinbase`] but with an explicit
+/// input `sequence` — pass a BIP125-signalling value (e.g. `0xffff_fffd`) to
+/// make the tx replaceable for the RBF (`TxidReplaced`) tests, and vary
+/// `fee_sat` to build the higher-fee replacement.
+pub fn build_signed_p2wpkh_spend_seq<R: BlockingRpc>(
+    node: &R,
+    wallet: &DeterministicWallet,
+    dest_script: bitcoin::ScriptBuf,
+    fee_sat: u64,
+    sequence: u32,
+) -> (String, String) {
+    use bitcoin::hashes::Hash as _;
+    use bitcoin::secp256k1::{Message, Secp256k1};
+    use bitcoin::sighash::{EcdsaSighashType, SighashCache};
+    use bitcoin::{
+        absolute::LockTime, Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut,
+        Witness,
+    };
+    use std::str::FromStr;
+
+    let cb_txid_str = block1_coinbase_txid(node);
+    let cb_txid = bitcoin::Txid::from_str(&cb_txid_str).expect("txid parse");
+    // Regtest block-1 coinbase subsidy: 50 BTC (no halvings before 150).
+    let cb_value_sat: u64 = 50 * 100_000_000;
+
+    let mut spend = Transaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: cb_txid,
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence(sequence),
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(cb_value_sat - fee_sat),
+            script_pubkey: dest_script,
+        }],
+    };
+
+    let secp = Secp256k1::new();
+    let src_script = wallet.address.script_pubkey();
+    let mut cache = SighashCache::new(&spend);
+    let sighash = cache
+        .p2wpkh_signature_hash(
+            0,
+            &src_script,
+            Amount::from_sat(cb_value_sat),
+            EcdsaSighashType::All,
+        )
+        .expect("sighash");
+    let msg = Message::from_digest(sighash.to_byte_array());
+    let sig = secp.sign_ecdsa(&msg, &wallet.sk);
+    let mut sig_bytes = sig.serialize_der().to_vec();
+    sig_bytes.push(EcdsaSighashType::All as u8);
+    let mut witness = Witness::new();
+    witness.push(sig_bytes);
+    witness.push(wallet.pk.to_bytes());
+    spend.input[0].witness = witness;
+
+    let raw_hex = hex::encode(bitcoin::consensus::serialize(&spend));
+    let txid_hex = spend.compute_txid().to_string();
+    (raw_hex, txid_hex)
+}
+
+/// One `[[token]]` entry for [`write_authfile`].
+pub struct TokenSpec {
+    pub id: &'static str,
+    /// Plaintext bearer token presented by the client; its sha256 is stored.
+    pub token: &'static str,
+    pub capabilities: &'static [&'static str],
+    /// e.g. `Some("1/s")`.
+    pub rate_limit: Option<&'static str>,
+    /// Per-principal watch-unit ceiling (`stream:watch` quota).
+    pub watch_quota: Option<u64>,
+}
+
+/// A written authfile fixture; kept alive to retain the temp dir. The
+/// `authfile` path is passed to `satd --authfile=...`.
+pub struct AuthFixture {
+    _dir: tempfile::TempDir,
+    pub authfile: PathBuf,
+}
+
+/// Write a 0600 `auth.toml` with the given tokens (sha256-hashed) and return
+/// the fixture. Mirrors the bearer-auth test setup in `regtest.rs`.
+pub fn write_authfile(tokens: &[TokenSpec]) -> AuthFixture {
+    use bitcoin::hashes::{sha256, Hash as _};
+    use std::io::Write as _;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let authfile = dir.path().join("auth.toml");
+    let mut toml = String::from("version = 1\n");
+    for t in tokens {
+        let hash = sha256::Hash::hash(t.token.as_bytes());
+        let caps = t
+            .capabilities
+            .iter()
+            .map(|c| format!("\"{c}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        toml.push_str(&format!(
+            "[[token]]\nid = \"{}\"\nhash = \"sha256:{}\"\ncapabilities = [{}]\n",
+            t.id, hash, caps
+        ));
+        if let Some(rl) = t.rate_limit {
+            toml.push_str(&format!("rate_limit = \"{rl}\"\n"));
+        }
+        if let Some(wq) = t.watch_quota {
+            toml.push_str(&format!("watch_quota = {wq}\n"));
+        }
+    }
+    {
+        let mut f = std::fs::File::create(&authfile).expect("create authfile");
+        f.write_all(toml.as_bytes()).expect("write authfile");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&authfile, std::fs::Permissions::from_mode(0o600))
+                .expect("chmod authfile");
+        }
+    }
+    AuthFixture {
+        _dir: dir,
+        authfile,
     }
 }
 

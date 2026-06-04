@@ -80,6 +80,17 @@ hex = { workspace = true }
 base64 = { workspace = true }
 tempfile = "3"
 rcgen = { workspace = true }
+# Streaming E2E harness (tests/streaming.rs): a real gRPC client (tonic,
+# pinned to the workspace version so it matches the `satd_events::proto`
+# generated service client) and a real WebSocket client. `default-features
+# = false` on tokio-tungstenite drops the TLS connectors — the suite speaks
+# plaintext ws:// to a loopback satd, so it needs only the connect +
+# handshake paths, and pulling rustls here would re-trip the dual
+# crypto-provider conflict documented on the `electrum-client` dep above.
+tonic = { workspace = true }
+tokio-stream = { workspace = true }
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "handshake"] }
+futures-util = "0.3"
 # Third-party Electrum client for the E2E suite. Independent
 # implementation of the wire protocol (predates `electrum-proto`;
 # ships its own message types). Drives the Electrum test group so

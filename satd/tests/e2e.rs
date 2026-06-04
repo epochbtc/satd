@@ -11,7 +11,10 @@
 
 mod common;
 
-use common::{TestNode, e2e_test_timeout};
+use common::{
+    DeterministicWallet, TestNode, build_signed_p2wpkh_spend_from_block1_coinbase,
+    e2e_test_timeout,
+};
 use std::path::PathBuf;
 use std::process::Command;
 use std::str::FromStr;
@@ -203,29 +206,6 @@ fn test_e2e_jsonrpc_chain_info_via_sat_cli() {
     e2e.node.stop();
 }
 
-/// Derived from a deterministic 32-byte secret: P2WPKH source address +
-/// the matching `SecretKey` / `PublicKey` for signing spends. Reused
-/// across PR-2 / PR-3 / PR-4 tests so funding flows share a seed.
-struct DeterministicWallet {
-    sk: bitcoin::secp256k1::SecretKey,
-    pk: bitcoin::PublicKey,
-    address: bitcoin::Address,
-}
-
-impl DeterministicWallet {
-    fn from_secret(secret: [u8; 32]) -> Self {
-        use bitcoin::key::CompressedPublicKey;
-        use bitcoin::secp256k1::{Secp256k1, SecretKey};
-        use bitcoin::{Network, PublicKey};
-        let secp = Secp256k1::new();
-        let sk = SecretKey::from_slice(&secret).expect("valid secret");
-        let pk = PublicKey::new(sk.public_key(&secp));
-        let cpk = CompressedPublicKey::from_slice(&pk.to_bytes()).expect("compressed");
-        let address = bitcoin::Address::p2wpkh(&cpk, Network::Regtest);
-        DeterministicWallet { sk, pk, address }
-    }
-}
-
 #[test]
 fn test_e2e_jsonrpc_fund_and_mine_lifecycle() {
     let mut e2e = E2eNode::boot_with(&[]);
@@ -270,87 +250,6 @@ fn test_e2e_jsonrpc_fund_and_mine_lifecycle() {
         "best block must not still be regtest genesis"
     );
     e2e.node.stop();
-}
-
-/// Build + sign a P2WPKH spend from block-1's coinbase to a destination
-/// script. Returns (raw_tx_hex, txid_hex). Mirrors the existing pattern
-/// at `regtest.rs:test_address_index_backfill_spending_row_with_real_spend`.
-/// Caller must have already mined ≥101 blocks to `wallet.address`.
-fn build_signed_p2wpkh_spend_from_block1_coinbase(
-    node: &TestNode,
-    wallet: &DeterministicWallet,
-    dest_script: bitcoin::ScriptBuf,
-    fee_sat: u64,
-) -> (String, String) {
-    use bitcoin::hashes::Hash as _;
-    use bitcoin::secp256k1::{Message, Secp256k1};
-    use bitcoin::sighash::{EcdsaSighashType, SighashCache};
-    use bitcoin::{
-        Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
-        absolute::LockTime,
-    };
-    use std::str::FromStr;
-
-    let block1_hash = node
-        .rpc_call_with_params("getblockhash", vec![serde_json::json!(1)])
-        .expect("getblockhash 1")["result"]
-        .as_str()
-        .expect("hash string")
-        .to_string();
-    let cb_txid_str = node
-        .rpc_call_with_params(
-            "getblock",
-            vec![serde_json::json!(block1_hash), serde_json::json!(1)],
-        )
-        .expect("getblock")["result"]["tx"][0]
-        .as_str()
-        .expect("coinbase txid")
-        .to_string();
-    let cb_txid = bitcoin::Txid::from_str(&cb_txid_str).expect("txid parse");
-    // Regtest block-1 coinbase subsidy: 50 BTC (no halvings before 150).
-    let cb_value_sat: u64 = 50 * 100_000_000;
-
-    let mut spend = Transaction {
-        version: bitcoin::transaction::Version::TWO,
-        lock_time: LockTime::ZERO,
-        input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: cb_txid,
-                vout: 0,
-            },
-            script_sig: ScriptBuf::new(),
-            sequence: Sequence::MAX,
-            witness: Witness::new(),
-        }],
-        output: vec![TxOut {
-            value: Amount::from_sat(cb_value_sat - fee_sat),
-            script_pubkey: dest_script,
-        }],
-    };
-
-    let secp = Secp256k1::new();
-    let src_script = wallet.address.script_pubkey();
-    let mut cache = SighashCache::new(&spend);
-    let sighash = cache
-        .p2wpkh_signature_hash(
-            0,
-            &src_script,
-            Amount::from_sat(cb_value_sat),
-            EcdsaSighashType::All,
-        )
-        .expect("sighash");
-    let msg = Message::from_digest(sighash.to_byte_array());
-    let sig = secp.sign_ecdsa(&msg, &wallet.sk);
-    let mut sig_bytes = sig.serialize_der().to_vec();
-    sig_bytes.push(EcdsaSighashType::All as u8);
-    let mut witness = Witness::new();
-    witness.push(sig_bytes);
-    witness.push(wallet.pk.to_bytes());
-    spend.input[0].witness = witness;
-
-    let raw_hex = hex::encode(bitcoin::consensus::serialize(&spend));
-    let txid_hex = spend.compute_txid().to_string();
-    (raw_hex, txid_hex)
 }
 
 #[test]

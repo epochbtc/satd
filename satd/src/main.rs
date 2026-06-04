@@ -903,6 +903,12 @@ async fn main() {
     // the `satd-events` crate; this match enables what the operator
     // asked for via CLI / `bitcoin.conf`.
     let mut event_sinks: Vec<Box<dyn node::events::EventSink>> = Vec::new();
+    // Runtime-bound addresses of the streaming listeners, captured here and
+    // reported via `getserverstatus` once `listener_status` exists (it is
+    // constructed later, for the RPC server). Capturing the post-bind
+    // address means an OS-assigned `:0` port surfaces concretely.
+    let mut events_grpc_bound: Option<String> = None;
+    let mut streamws_bound: Option<String> = None;
     if let Some(bind) = config.events_grpc_bind.as_deref() {
         match satd_events::GrpcEventSink::bind(
             bind,
@@ -932,6 +938,7 @@ async fn main() {
         .await
         {
             Ok(sink) => {
+                events_grpc_bound = sink.local_addr().ok().map(|a| a.to_string());
                 tracing::info!(
                     target: "events",
                     bind,
@@ -1044,6 +1051,7 @@ async fn main() {
         .await
         {
             Ok(server) => {
+                streamws_bound = server.local_addr().ok().map(|a| a.to_string());
                 tracing::info!(
                     target: "events",
                     bind,
@@ -1508,6 +1516,14 @@ async fn main() {
     // `getserverstatus` RPC. Created before rpc::start so the RPC
     // handler holds the same Arc the bind sites mutate.
     let listener_status = node::rpc::server::ServerListenerStatus::new();
+    // Publish the streaming listeners' runtime-bound addresses (captured at
+    // bind time, above) now that the status record exists.
+    if let Some(addr) = events_grpc_bound {
+        listener_status.set_events_grpc(addr);
+    }
+    if let Some(addr) = streamws_bound {
+        listener_status.set_streamws(addr);
+    }
 
     // Optional JSON-RPC TLS surface. Bitcoin Core's RPC is HTTP-only;
     // this is a satd-specific addition for operators who want native

@@ -56,6 +56,8 @@ struct ServerListenerStatusInner {
     electrum: Option<String>,
     electrum_tls: Option<String>,
     rpc_tls: Option<String>,
+    events_grpc: Option<String>,
+    streamws: Option<String>,
 }
 
 impl ServerListenerStatus {
@@ -73,6 +75,12 @@ impl ServerListenerStatus {
     }
     pub fn set_rpc_tls(&self, bind: String) {
         self.inner.write().rpc_tls = Some(bind);
+    }
+    pub fn set_events_grpc(&self, bind: String) {
+        self.inner.write().events_grpc = Some(bind);
+    }
+    pub fn set_streamws(&self, bind: String) {
+        self.inner.write().streamws = Some(bind);
     }
     fn snapshot(&self) -> ServerListenerStatusInner {
         self.inner.read().clone()
@@ -1534,6 +1542,13 @@ pub async fn start(
         resp.insert("electrum".into(), listener(snap.electrum));
         resp.insert("electrum_tls".into(), listener(snap.electrum_tls));
         resp.insert("rpc_tls".into(), listener(snap.rpc_tls));
+        // Streaming Consumption API listeners — same `null | {"bind": ...}`
+        // shape as the wallet servers above. Reports the runtime-bound
+        // address (so an OS-assigned `:0` port surfaces concretely), which
+        // also lets the streaming E2E harness discover the port without a
+        // fixed-port TOCTOU.
+        resp.insert("events_grpc".into(), listener(snap.events_grpc));
+        resp.insert("streamws".into(), listener(snap.streamws));
         #[cfg(feature = "block-filter-index")]
         {
             let state_label = ctx
