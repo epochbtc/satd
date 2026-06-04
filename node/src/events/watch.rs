@@ -2969,6 +2969,44 @@ mod tests {
     }
 
     #[test]
+    fn exact_script_spend_multi_input_reports_correct_vin() {
+        // A multi-input tx where a non-zero input spends the watched script must
+        // report that input's index as `vin`, proving the enumerate-over-zip
+        // index is the true input position (not a match counter).
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let watched_spk = ScriptBuf::from(vec![0x52]);
+        let watched = scripthash_of(&watched_spk);
+        let other = scripthash_of(&ScriptBuf::from(vec![0x99, 0x98]));
+        handle.add_scripthashes(&[watched]);
+
+        // Three inputs; only input index 2 spends the watched script.
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![
+                TxIn { previous_output: outpoint(0xa0, 0), script_sig: ScriptBuf::new(), sequence: Sequence::MAX, witness: Witness::new() },
+                TxIn { previous_output: outpoint(0xa1, 1), script_sig: ScriptBuf::new(), sequence: Sequence::MAX, witness: Witness::new() },
+                TxIn { previous_output: outpoint(0xa2, 2), script_sig: ScriptBuf::new(), sequence: Sequence::MAX, witness: Witness::new() },
+            ],
+            output: vec![],
+        };
+        // prev_scripthashes aligned to inputs: only index 2 is the watched hash.
+        reg.scan_mempool_spent_scripts(&tx, &[other, other, watched]);
+
+        match rx.try_recv().expect("the matching input fires") {
+            WatchMatch::ScriptMatched { scripthash, is_output, index, confirmed, .. } => {
+                assert_eq!(scripthash, watched);
+                assert!(!is_output);
+                assert_eq!(index, 2, "vin is the true input index, not a match counter");
+                assert!(!confirmed);
+            }
+            other => panic!("wrong match: {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "only the watched input matches");
+    }
+
+    #[test]
     fn exact_script_spend_no_match_outside_watch() {
         let reg = Arc::new(WatchRegistry::new());
         let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);

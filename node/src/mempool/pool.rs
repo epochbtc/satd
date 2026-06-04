@@ -73,11 +73,11 @@ pub struct MempoolEntry {
     /// `sha256(scriptPubKey)` of each spent prevout, one per input in input
     /// order (`prev_scripthashes[i]` ↔ `tx.input[i]`). Resolved once at
     /// admission from `prev_outputs` (which is otherwise discarded) so the
-    /// streaming watch matcher can do **mempool spend-side** prefix matching —
-    /// the unconfirmed analogue of the undo-driven confirmed path — without
-    /// re-resolving prevouts off the hot path. Hashes (32 B/input), not full
-    /// scripts: enough to prefix-match, bounded by mempool size. Empty for
-    /// entries built outside admission (test fixtures, direct inserts).
+    /// streaming watch matcher can do **mempool spend-side** matching (exact
+    /// script and prefix bucket) — the unconfirmed analogue of the undo-driven
+    /// confirmed path — without re-resolving prevouts off the hot path. Hashes
+    /// (32 B/input), not full scripts: enough to match, bounded by mempool size.
+    /// Empty for entries built outside admission (test fixtures, direct inserts).
     pub prev_scripthashes: Vec<Scripthash>,
 }
 
@@ -505,9 +505,10 @@ impl Mempool {
         let sigop_cost = tx.total_sigop_cost(|op| prev_outputs_map.get(op).cloned()) as u64;
 
         // Retain the spent prevout scripthashes (input order) for mempool
-        // spend-side prefix matching. `prev_outputs` is fully resolved above
-        // and dropped after this; hashing it now is the one chance to keep the
-        // data without re-resolving prevouts in the (decoupled) matcher.
+        // spend-side matching (exact script + prefix bucket). `prev_outputs` is
+        // fully resolved above and dropped after this; hashing it now is the one
+        // chance to keep the data without re-resolving prevouts in the
+        // (decoupled) matcher.
         let prev_scripthashes: Vec<Scripthash> = prev_outputs
             .iter()
             .map(|o| scripthash_of(&o.script_pubkey))
