@@ -81,7 +81,10 @@ layout) per `STABILITY_POLICY.md`.
   if that chain regains the most work). The `Invalid` mark is persisted in the
   block index **before** the active chain is rolled back, so a crash mid-call
   can never durably truncate the tip while leaving the disconnected block
-  `Valid` (which would silently un-do the invalidation). `accept_block`/
+  `Valid` (which would silently un-do the invalidation); and startup
+  reconciliation re-activates the best valid chain if a node is ever loaded
+  with its tip on a durably-`Invalid` block (the inverse crash window), so it
+  can never boot stuck rejecting extensions as `bad-prevblk`. `accept_block`/
   `store_block` refuse to build on an invalidated parent (`bad-prevblk`), so the
   subtree stays excluded until reconsidered. On an AssumeUTXO node, invalidating
   a block at or below the loaded snapshot height is refused (no undo data

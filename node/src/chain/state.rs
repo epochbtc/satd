@@ -383,7 +383,7 @@ impl ChainState {
                     hash = %tip_hash,
                     "Loaded chain tip from storage"
                 );
-                return Ok(Self {
+                let cs = Self {
                     store,
                     flat_files: Arc::new(Mutex::new(flat_files)),
                     blocks_dir,
@@ -413,7 +413,11 @@ impl ChainState {
                     background: RwLock::new(None),
                     signet_challenge: None,
                     accept_lock: Mutex::new(()),
-                });
+                };
+                // Self-heal a tip left durably `Invalid` by a crash mid-
+                // invalidateblock (no-op in the normal case).
+                cs.reconcile_invalid_tip()?;
+                return Ok(cs);
             }
 
         // Fresh node: store genesis block.
@@ -3955,6 +3959,32 @@ impl ChainState {
         self.activate_best_chain()
     }
 
+    /// Self-heal an active tip that is durably marked `Invalid` — the state a
+    /// crash leaves behind if it strikes `invalidate_block` after the subtree
+    /// was marked but before the re-activation committed. Re-activates the best
+    /// valid chain, which disconnects the invalid blocks and moves the tip to a
+    /// valid ancestor (or a competing chain). A cheap no-op when the tip is
+    /// valid (the normal case), so it is safe to call unconditionally at
+    /// startup. Without this, a node could boot with its tip on an invalidated
+    /// block and reject every extension as `bad-prevblk`.
+    pub fn reconcile_invalid_tip(&self) -> Result<(), ChainError> {
+        let tip = self.tip_hash();
+        let invalid = self
+            .store
+            .get_block_index(&tip)
+            .map(|e| e.status == BlockStatus::Invalid)
+            .unwrap_or(false);
+        if !invalid {
+            return Ok(());
+        }
+        tracing::warn!(
+            %tip,
+            "Active tip is marked Invalid (crash during invalidateblock?); re-activating the best valid chain"
+        );
+        let _accept_guard = self.accept_lock.lock();
+        self.activate_best_chain()
+    }
+
     /// Build a `prev_blockhash -> [children]` adjacency map over the entire
     /// block index. O(N) — acceptable for the rare, operator-driven
     /// invalidate/reconsider paths. Used to walk a block's descendant subtree.
@@ -4994,6 +5024,35 @@ pub(crate) mod tests {
                 BlockStatus::Valid
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reconcile_invalid_tip_self_heals_a_crashed_invalidate() {
+        let (cs, dir) = make_chain_state();
+        let main = build_and_connect_chain(&cs, 3);
+        let tip3 = main[2].block_hash();
+        let block2 = main[1].block_hash();
+
+        // Simulate a crash mid-`invalidate_block`: the subtree was marked
+        // Invalid but the re-activation never ran, so the durable tip still
+        // points at the (now Invalid) block.
+        cs.mark_subtree_invalid(tip3).unwrap();
+        assert_eq!(cs.tip_hash(), tip3, "tip unchanged by marking alone");
+        assert_eq!(
+            cs.get_block_index(&tip3).unwrap().status,
+            BlockStatus::Invalid
+        );
+
+        // Startup reconciliation moves the tip off the invalid block onto the
+        // best valid ancestor.
+        cs.reconcile_invalid_tip().unwrap();
+        assert_eq!(cs.tip_hash(), block2);
+        assert_eq!(cs.tip_height(), 2);
+
+        // Idempotent: a valid tip is a no-op.
+        cs.reconcile_invalid_tip().unwrap();
+        assert_eq!(cs.tip_hash(), block2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
