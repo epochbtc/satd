@@ -1138,3 +1138,57 @@ async fn flood_stream_does_not_stall_mining() {
         .unwrap();
     assert_eq!(height, 40, "block production advanced despite a lagging stream");
 }
+
+
+/// gRPC subscription cap: with `--events-grpc-max-subscriptions=1`, a second
+/// concurrent `Subscribe` (even on a fresh connection) is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grpc_max_subscriptions_caps_streams() {
+    let sn = start_streaming_args(
+        vec![
+            "--events-grpc-bind=127.0.0.1:0".into(),
+            "--streamws=127.0.0.1:0".into(),
+            "--events-grpc-max-subscriptions=1".into(),
+        ],
+        vec![],
+    )
+    .await;
+    let port = sn.grpc_port();
+
+    // First subscription holds the only slot.
+    let mut c1 = GrpcStreamClient::connect(port).await;
+    let _s1 = c1.subscribe(0, None).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Second subscription is refused.
+    let mut c2 = GrpcStreamClient::connect(port).await;
+    assert!(
+        c2.try_subscribe(0).await.is_err(),
+        "second Subscribe over the cap is refused"
+    );
+}
+
+// ===========================================================================
+// Deferred: two-node reorg E2E (ChainEvent::Reorg / BlockDisconnected /
+// TxidUnconfirmed)
+// ===========================================================================
+//
+// A two-node reorg cannot be triggered reliably from this harness:
+//   * satd has no `invalidateblock`/`reconsiderblock` RPC, so a single node
+//     can't be forced to reorg.
+//   * With two nodes, the node we subscribe to must be RUNNING and SUBSCRIBED
+//     before the reorg so it can observe the events. The only way to make it
+//     adopt a competing longer chain is to have it DIAL a peer that holds that
+//     chain (the dialer syncs from the listener; a listener does NOT pull a
+//     competing chain from an inbound peer — verified: with both nodes
+//     connected and the peer at height 3, the subscribed listener stayed at
+//     height 1). There is no `addnode` RPC to make the subscribed node dial
+//     after it is already up, and restarting it with `--connect` would perform
+//     the reorg at startup, before a client can attach.
+//
+// The reorg event emission (ChainEvent::Reorg, ordered before the
+// disconnect/connect sequence) and the TxidUnconfirmed lifecycle transition are
+// covered by in-process unit tests in `node/src/chain` and
+// `node/src/events/watch.rs`. A future E2E could drive the reorg via a SIGHUP
+// `addnode` config reload (which live-dials and would make the subscribed node
+// a puller) once the harness grows config-file + signal support.
