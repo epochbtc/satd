@@ -698,6 +698,22 @@ async fn main() {
         }
     }
 
+    // Structural block-index audit (-checkblockindex): on every startup when
+    // enabled (default on for regtest/CI), and crucially *after* a reindex —
+    // so a reindex that rebuilt a corrupt index is caught here, before the
+    // node serves, instead of days later when something trips over it. Fail
+    // closed: refuse to serve an index we can't prove self-consistent.
+    if config.check_block_index {
+        match chain_state.check_block_index() {
+            Ok(height) => tracing::info!(height, "Block-index consistency check passed"),
+            Err(e) => {
+                eprintln!("FATAL: block-index consistency check failed: {e}");
+                auth.cleanup();
+                std::process::exit(1);
+            }
+        }
+    }
+
     // AssumeUTXO --fast-start: download the snapshot now, as a pre-RPC
     // startup phase, so its progress renders in the same TUI gauge a
     // reindex uses (the snapshot is the big, slow part). The load itself
