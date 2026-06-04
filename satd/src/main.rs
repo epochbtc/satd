@@ -712,10 +712,17 @@ async fn main() {
     // node serves, instead of days later when something trips over it. Fail
     // closed: refuse to serve an index we can't prove self-consistent.
     if config.check_block_index {
-        match chain_state.check_block_index() {
+        match chain_state.check_block_index(Some(startup_progress.clone())) {
             Ok(height) => tracing::info!(height, "Block-index consistency check passed"),
             Err(e) => {
-                eprintln!("FATAL: block-index consistency check failed: {e}");
+                eprintln!(
+                    "FATAL: block-index consistency check failed: {e}\n\
+                     The on-disk block index is structurally inconsistent with the active \
+                     chain. Recover by rebuilding it from the block files: restart with \
+                     --reindex. (--reindex-chainstate will NOT fix this — it trusts the \
+                     same block index.) If this appeared immediately after a clean reindex, \
+                     please report it with the message above."
+                );
                 auth.cleanup();
                 std::process::exit(1);
             }

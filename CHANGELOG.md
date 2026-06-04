@@ -18,6 +18,12 @@ In-progress; full detail tracked in
   cost, BIP30, future-timestamp, block-version gate, merkle-mutation
   /CVE-2012-2459, per-tx weight cap); reject-reason strings aligned; on-receipt
   mutated-block gate. Differential matrix now 32/32 exact vs Core.
+- **Reliability** — fixed a block-index corruption where a competing fork
+  announced below the active tip could clobber the active-chain `height→hash`
+  map, making `--reindex-chainstate` abort at `bad-cb-height` and loop. Header
+  acceptance and block storage now only touch the index above the active tip.
+  New `-checkblockindex` flag (default on for regtest/CI) runs a structural
+  block-index audit at startup and after a reindex; fail-closed.
 - **RPC** — `invalidateblock` / `reconsiderblock` implemented (crash-safe,
   AssumeUTXO-aware); `getblock` serves invalidated blocks.
 - **Auth** — opt-in capability-scoped bearer-token layer (`-authfile`) across
