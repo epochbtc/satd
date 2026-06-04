@@ -486,7 +486,16 @@ All additions are opt-in; the wire schema is `v1`. See `docs/api/streaming.md`.
   connecting chain, instead of being dropped (and, for headers, instead of
   ban-scoring an honest peer announcing a better chain). Verified by a
   two-node regtest test where a height-1 listener adopts an inbound peer's
-  height-4 competing chain.
+  height-4 competing chain. The best-work header chain is selected from a
+  tracked `pindexBestHeader`-style pointer (updated by chainwork in
+  `accept_header`/`accept_headers`/`accept_block`), not the pollutable
+  best-known-at-height index, so a heavier-but-shorter fork is still pursued;
+  the walk continues to the active-chain fork point (collecting a hole below an
+  already-present side block) and declines a fork too deep to anchor rather
+  than re-requesting an unconnectable run forever. The getheaders discovery is
+  rate-limited per peer (anti-DoS), and an unconnecting-header message still
+  accrues a small ban score so endless unconnectable-header spam disconnects.
+- **`getdata MSG_CMPCT_BLOCK` requests are now served.** satd's getdata
   handler answered `MSG_BLOCK` / `MSG_WITNESS_BLOCK` and tx requests but
   silently ignored `MSG_CMPCT_BLOCK` (BIP 152). A Bitcoin Core peer with a
   high-bandwidth compact-block relationship requests the block right after

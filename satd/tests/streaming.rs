@@ -1316,15 +1316,15 @@ async fn grpc_watch_txid_unconfirmed_on_invalidateblock() {
 }
 
 // ===========================================================================
-// Deferred: two-node reorg E2E (competing chain pulled over P2P)
+// Reorg E2E coverage
 // ===========================================================================
 //
 // The single-node reorg surfaces (Reorg / BlockDisconnected / TxidUnconfirmed)
-// are covered by the two tests above via `invalidateblock`. A *two-node* reorg
-// — where the subscribed node adopts a competing longer chain announced by a
-// peer — is still deferred: a synced listener does NOT pull a competing chain
-// from an inbound peer (verified: with both nodes connected and the peer at
-// height 3, the subscribed listener stayed at height 1), and there is no
-// `addnode` RPC to make an already-running subscribed node dial out. Fixing
-// that inbound-peer pull gap is tracked separately; once it lands, a two-node
-// variant can assert the same events are driven by real P2P block propagation.
+// are covered by the two streaming tests above via `invalidateblock`. The
+// inbound-peer competing-chain pull gap (a synced listener adopting a longer
+// chain announced by an inbound peer) is now fixed and covered at the P2P layer
+// by `test_listener_pulls_competing_chain_from_inbound_peer` in `regtest.rs`. A
+// streaming two-node variant (asserting the same firehose/watch events are
+// driven by real P2P block propagation rather than `invalidateblock`) would be
+// additive — the event paths themselves are identical and already exercised
+// here — so it is intentionally left as future coverage, not a gap.

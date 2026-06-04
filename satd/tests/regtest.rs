@@ -1424,6 +1424,11 @@ fn test_listener_pulls_competing_chain_from_inbound_peer() {
         "nodes did not connect",
     );
 
+    // NOTE: the height gap here (A at 1, B at 4) is deliberately small so the
+    // listener stays OUT of IBD (`headers_tip <= tip + 24`) and exercises the
+    // non-IBD `request_missing_blocks` fork-walk under test — not the IBD
+    // scheduler. Keep B's height well under that threshold if this is changed.
+    //
     // Mine one more block on B (height 4) so it announces to A, triggering A's
     // headers-first discovery of the competing chain.
     node_b

@@ -228,6 +228,14 @@ pub struct ChainState {
     checkpoints: Vec<Checkpoint>,
     /// Highest header height stored (may be ahead of connected block tip during IBD).
     headers_tip_height: AtomicU32,
+    /// Most-work header chain tip seen so far — `(hash, chainwork)` — analogous
+    /// to Bitcoin Core's `pindexBestHeader`. Updated by `accept_header` /
+    /// `accept_headers` whenever a header carries strictly more work. Used to
+    /// drive fork-aware block requests: unlike `headers_tip_height` (a height,
+    /// monotonic via `fetch_max`) and `get_block_hash_by_height` (the pollutable
+    /// "best-known-at-height" index), this names the actual most-work chain, so
+    /// a competing chain that is heavier-but-shorter is still pursued.
+    best_header: RwLock<(BlockHash, [u8; 32])>,
     /// Cached block timestamps for MTP computation (avoids 22 DB reads per block).
     /// Stores (height, timestamp) pairs for the last ~12 blocks.
     mtp_cache: Mutex<Vec<(u32, u32)>>,
@@ -377,6 +385,14 @@ impl ChainState {
                 }
                 htip = lo;
 
+                // Seed the best-header pointer from the highest known header
+                // (refined by chainwork as new headers arrive). Falls back to
+                // the active tip if the header at `htip` can't be read.
+                let best_header = store
+                    .get_block_hash_by_height(htip)
+                    .and_then(|h| store.get_block_index(&h).map(|e| (h, e.chainwork)))
+                    .unwrap_or((tip_hash, entry.chainwork));
+
                 tracing::info!(
                     height = entry.height,
                     headers_tip = htip,
@@ -396,6 +412,7 @@ impl ChainState {
                     assumevalid,
                     checkpoints,
                     headers_tip_height: AtomicU32::new(htip),
+                    best_header: RwLock::new(best_header),
                     mtp_cache: Mutex::new(Vec::with_capacity(12)),
                     num_threads,
                     address_index,
@@ -488,6 +505,7 @@ impl ChainState {
             assumevalid,
             checkpoints,
             headers_tip_height: AtomicU32::new(0),
+            best_header: RwLock::new((genesis_hash, work_for_bits(genesis.header.bits))),
             mtp_cache: Mutex::new(Vec::with_capacity(12)),
             num_threads,
             address_index,
@@ -1576,6 +1594,7 @@ impl ChainState {
 
         // Track highest header for locator construction
         self.headers_tip_height.fetch_max(new_height, Ordering::Relaxed);
+        self.update_best_header(hash, chainwork);
 
         Ok(hash)
     }
@@ -1589,6 +1608,7 @@ impl ChainState {
         let mut batch = crate::storage::StoreBatch::default();
         let mut accepted = 0u32;
         let mut max_height = 0u32;
+        let mut best_in_batch: Option<(BlockHash, [u8; 32])> = None;
 
         for header in headers {
             let hash = header.block_hash();
@@ -1672,6 +1692,12 @@ impl ChainState {
             batch.height_hash_puts.push((new_height, hash));
             accepted += 1;
             max_height = max_height.max(new_height);
+            if best_in_batch
+                .as_ref()
+                .is_none_or(|(_, w)| compare_u256(&chainwork, w) > 0)
+            {
+                best_in_batch = Some((hash, chainwork));
+            }
         }
 
         if accepted > 0 || !batch.height_hash_puts.is_empty() {
@@ -1680,6 +1706,9 @@ impl ChainState {
             }
             self.headers_tip_height
                 .fetch_max(max_height, Ordering::Relaxed);
+            if let Some((h, w)) = best_in_batch {
+                self.update_best_header(h, w);
+            }
         }
 
         (accepted, None)
@@ -1690,14 +1719,33 @@ impl ChainState {
         self.headers_tip_height.load(Ordering::Relaxed)
     }
 
+    /// Advance the best-header pointer if `chainwork` is strictly more than the
+    /// current best (first-seen wins ties, matching consensus).
+    fn update_best_header(&self, hash: BlockHash, chainwork: [u8; 32]) {
+        let mut best = self.best_header.write();
+        if compare_u256(&chainwork, &best.1) > 0 {
+            *best = (hash, chainwork);
+        }
+    }
+
+    /// The most-work header chain tip seen so far (analogous to Core's
+    /// `pindexBestHeader`).
+    pub fn best_header_hash(&self) -> BlockHash {
+        self.best_header.read().0
+    }
+
     /// Blocks we must download to connect the best-work header chain we know
     /// of, in connect order (oldest first), up to `max_request`. Walks back
-    /// from the best header tip via `prev_blockhash`, collecting hashes we lack
-    /// block data for, until reaching a block we already have (the fork point)
-    /// or genesis.
+    /// from the best-work header tip (`best_header`, the most-work chain — NOT
+    /// the pollutable height index) via `prev_blockhash` to the point it joins
+    /// the active chain, collecting every block along the way that we lack data
+    /// for (skipping but walking PAST any side block we already have).
     ///
     /// Returns empty when the best header chain does not out-work the active
-    /// tip — we are already on (or ahead of) the best chain.
+    /// tip (we are already on — or ahead of — the best chain), or when the fork
+    /// point is not reached within the bounded walk (a pathologically deep
+    /// fork: requesting an unanchored deep run makes no progress, so we decline
+    /// rather than spin).
     ///
     /// This is the fork-aware replacement for a forward-by-active-height walk:
     /// a competing chain forks *below* its tip, so some of its blocks sit at
@@ -1705,7 +1753,10 @@ impl ChainState {
     /// (`tip+1, tip+2, …`) never requests those fork blocks, and without the
     /// fork block's data a reorg onto the competing chain can never reconnect
     /// — the exact reason a synced listener failed to adopt a longer chain
-    /// announced by an inbound peer.
+    /// announced by an inbound peer. Walking to the active-chain fork (rather
+    /// than stopping at the first block we happen to have) also requests a hole
+    /// that sits *below* an already-present side block, which a "stop at first
+    /// data" walk would strand.
     pub fn missing_blocks_for_best_header_chain(&self, max_request: usize) -> Vec<BlockHash> {
         if max_request == 0 {
             return Vec::new();
@@ -1714,14 +1765,9 @@ impl ChainState {
         let Some(tip_entry) = self.store.get_block_index(&tip_hash) else {
             return Vec::new();
         };
-        // The best-work header chain tip, approximated by the highest known
-        // header height (for near-equal difficulty this is also the most-work
-        // chain; a same-height higher-work fork is left to `accept_block` once
-        // its blocks arrive by normal extension).
-        let headers_tip = self.headers_tip_height();
-        let Some(best_hash) = self.get_block_hash_by_height(headers_tip) else {
-            return Vec::new();
-        };
+        // The most-work header chain tip (tracked by chainwork in
+        // accept_header/accept_headers/accept_block), not the height index.
+        let best_hash = self.best_header_hash();
         let Some(best_entry) = self.store.get_block_index(&best_hash) else {
             return Vec::new();
         };
@@ -1729,25 +1775,40 @@ impl ChainState {
             return Vec::new();
         }
 
-        // Walk back from the header tip, collecting blocks we lack data for
-        // (newest first), until we reach a block we have (the fork point) or
-        // genesis. Bounded so a pathologically deep fork cannot stall the P2P
-        // loop; realistic post-IBD reorgs are shallow.
+        // Walk back from the best-work header tip, collecting blocks we lack
+        // data for (newest first), until the chain joins the ACTIVE chain (the
+        // fork point) — not merely until the first block we happen to have, so
+        // a missing block below an already-present side block is still
+        // collected. Bounded: if the fork point isn't reached within
+        // `MAX_WALK`, return empty rather than request an unanchored deep run
+        // that can never connect (which would re-request every cycle forever).
         const MAX_WALK: usize = 16_384;
         let mut missing: Vec<BlockHash> = Vec::new();
         let mut h = best_hash;
+        let mut height = best_entry.height;
+        let mut reached_fork = false;
         for _ in 0..MAX_WALK {
-            if self.has_block_data(&h) {
-                break; // fork point reached
+            // On the active chain? Then `h` is the fork point — stop.
+            if self.active_chain_hash_at_height(height) == Some(h) {
+                reached_fork = true;
+                break;
             }
             let Some(e) = self.store.get_block_index(&h) else {
                 break;
             };
-            missing.push(h);
-            if e.height == 0 {
+            if !self.has_block_data(&h) {
+                missing.push(h);
+            }
+            if height == 0 {
+                // Genesis is always on the active chain; treat as fork reached.
+                reached_fork = true;
                 break;
             }
             h = e.header.prev_blockhash;
+            height -= 1;
+        }
+        if !reached_fork {
+            return Vec::new();
         }
         // Oldest first so the peer's (ordered) getdata response connects in
         // dependency order; cap to the caller's batch size.
@@ -3793,6 +3854,13 @@ impl ChainState {
             );
         }
 
+        // Keep the best-header pointer at least as high as the active tip.
+        // Locally-mined / directly-connected blocks never pass through
+        // `accept_header`, so without this the pointer would lag the tip after
+        // mining and `missing_blocks_for_best_header_chain` would compare
+        // against a stale work value.
+        self.update_best_header(block_hash, new_chainwork);
+
         Ok(block_hash)
     }
 
@@ -5158,6 +5226,35 @@ pub(crate) mod tests {
         build_and_connect_chain(&cs, 3);
         // No competing header chain out-works the tip, and we have all data.
         assert!(cs.missing_blocks_for_best_header_chain(128).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_blocks_collects_a_hole_below_a_present_side_block() {
+        let (cs, dir) = make_chain_state();
+        build_and_connect_chain(&cs, 1); // active height 1 (A1)
+
+        // Competing header chain B1..B4 (more work), with data for ONLY B3 —
+        // a present side block with missing neighbours above and below it.
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+        let mut parent = genesis;
+        let mut b = Vec::new();
+        for h in 1..=4 {
+            let blk = build_test_block(parent, h, 1_650_000_000 + h);
+            cs.accept_header(&blk.header).unwrap();
+            parent = blk.block_hash();
+            b.push(blk);
+        }
+        cs.store_block(&b[2]).unwrap(); // B3 has data; B1,B2,B4 do not
+
+        // The walk must continue PAST the present B3 and still collect the
+        // hole below it (B1, B2) as well as B4 — a "stop at first data" walk
+        // would strand B1/B2 and the reorg could never reconnect.
+        let missing = cs.missing_blocks_for_best_header_chain(128);
+        assert_eq!(
+            missing,
+            vec![b[0].block_hash(), b[1].block_hash(), b[3].block_hash()]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
