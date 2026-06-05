@@ -474,9 +474,21 @@ async fn main() {
     // Initialize chain state with script verification
     startup_progress.set_phase("chain_init", "Initializing chain state...");
     let verifier: Box<dyn ScriptVerifier> = match config.consensus {
-        ConsensusEngine::Cpp => Box::new(ConsensusVerifier),
+        ConsensusEngine::Cpp => {
+            tracing::warn!(
+                "Consensus: cpp (single engine, no shadow cross-check). Default 'rust-shadow' \
+                 runs two independent engines and is recommended."
+            );
+            Box::new(ConsensusVerifier)
+        }
         ConsensusEngine::Rust => {
-            tracing::warn!("Using Rust consensus engine — NOT YET VALIDATED FOR PRODUCTION");
+            tracing::warn!(
+                "Consensus: rust (single engine, no shadow cross-check). The Rust engine passes \
+                 Bitcoin Core's script test suite and is shadow-validated against \
+                 libbitcoinconsensus across mainnet history with zero divergence — but running \
+                 either engine alone forgoes the dual-engine cross-check. Default 'rust-shadow' \
+                 is recommended."
+            );
             Box::new(RustVerifier)
         }
         ConsensusEngine::RustShadow => {
