@@ -227,3 +227,54 @@ impl PeerInfo {
         })
     }
 }
+
+/// Derive the Tor v3 `.onion` hostname from the 32-byte ed25519 public key
+/// carried in a BIP 155 `AddrV2::TorV3` gossip entry.
+///
+/// Per rend-spec-v3 §6: the address is `base32(PUBKEY ‖ CHECKSUM ‖ VERSION)`
+/// lowercased, where `VERSION = 0x03` and
+/// `CHECKSUM = SHA3_256(".onion checksum" ‖ PUBKEY ‖ VERSION)[..2]`.
+/// Needed because `AddrV2::socket_addr()` only yields IPv4/IPv6 — without this,
+/// onion peers learned from gossip can't be turned back into a dialable host,
+/// so a node running over a proxy never discovers onion peers beyond its
+/// hardcoded seeds.
+pub fn torv3_to_onion_host(pubkey: &[u8; 32]) -> String {
+    use sha3::{Digest, Sha3_256};
+    const VERSION: u8 = 0x03;
+
+    let mut hasher = Sha3_256::new();
+    hasher.update(b".onion checksum");
+    hasher.update(pubkey);
+    hasher.update([VERSION]);
+    let checksum = hasher.finalize();
+
+    let mut data = Vec::with_capacity(35);
+    data.extend_from_slice(pubkey);
+    data.extend_from_slice(&checksum[..2]);
+    data.push(VERSION);
+
+    let encoded = data_encoding::BASE32_NOPAD.encode(&data).to_lowercase();
+    format!("{encoded}.onion")
+}
+
+#[cfg(test)]
+mod onion_addr_tests {
+    use super::torv3_to_onion_host;
+
+    /// Round-trip against a real Tor-generated v3 address (one of satd's own
+    /// hardcoded mainnet onion seeds): decode it to recover the pubkey, then
+    /// re-derive the full address. This validates the SHA3-256 checksum, the
+    /// version byte, and the base32 encoding all at once against ground truth.
+    #[test]
+    fn torv3_derivation_matches_real_onion() {
+        let onion = "5g72ppm3krkorsfopcm2bi7wlv4ohhs4u4mlseymasn7g7zhdcyjpfid.onion";
+        let b32 = onion.strip_suffix(".onion").unwrap().to_uppercase();
+        let decoded = data_encoding::BASE32_NOPAD.decode(b32.as_bytes()).unwrap();
+        assert_eq!(decoded.len(), 35, "pubkey(32) + checksum(2) + version(1)");
+        assert_eq!(decoded[34], 0x03, "v3 version byte");
+
+        let mut pubkey = [0u8; 32];
+        pubkey.copy_from_slice(&decoded[..32]);
+        assert_eq!(torv3_to_onion_host(&pubkey), onion);
+    }
+}

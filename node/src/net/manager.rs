@@ -36,6 +36,13 @@ const BAN_THRESHOLD: u32 = 100;
 /// invs / unconnectable headers (anti-DoS), while still reacting promptly to
 /// an honest competing-chain announcement.
 const GETHEADERS_MIN_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Cap on onion peer addresses discovered via `addrv2` gossip and kept in
+/// `connect_peer_addrs` for the reconnect loop to dial. Unlike clearnet
+/// addresses (persisted in the addrman / peers.dat), onion peers live only in
+/// this in-memory list, so bound it to avoid unbounded growth from a gossipy
+/// peer. The reconnect loop never opens more than the outbound target anyway.
+const MAX_ONION_CONNECT_ADDRS: usize = 512;
 /// Ban score charged for a `headers` message whose parent we don't have. Small
 /// enough that an honest peer announcing a better chain (one such message,
 /// resolved by the getheaders we send back) stays far under [`BAN_THRESHOLD`],
@@ -650,6 +657,27 @@ impl PeerManager {
         if !addrs.contains(&addr) {
             addrs.push(addr);
         }
+    }
+
+    /// Record a `.onion` peer learned from `addrv2` gossip so the reconnect
+    /// loop can dial it. The addrman is `SocketAddr`-keyed and can't hold
+    /// onion peers, so they live in `connect_peer_addrs` (in-memory, bounded
+    /// by `MAX_ONION_CONNECT_ADDRS`). Deduped against both the current
+    /// connection and the existing candidate list. This is what lets a
+    /// proxy-only node grow its peer set past the hardcoded onion seeds.
+    fn add_onion_connect_addr(&self, host: String, port: u16) {
+        if self.is_onion_connected(&host) {
+            return;
+        }
+        let mut addrs = self.connect_peer_addrs.write();
+        let already = addrs
+            .iter()
+            .any(|a| matches!(a, PeerAddr::Onion { host: h, .. } if *h == host));
+        if already || addrs.len() >= MAX_ONION_CONNECT_ADDRS {
+            return;
+        }
+        tracing::debug!(onion = %host, port, "Discovered onion peer via addrv2");
+        addrs.push(PeerAddr::Onion { host, port });
     }
 
     /// Load the persistent address book from `path` (peers.dat), then
@@ -1708,12 +1736,29 @@ impl PeerManager {
             }
             NetworkMessage::AddrV2(addrs) => {
                 tracing::debug!(id, count = addrs.len(), "Received addrv2");
+                // Onion peers are only reachable when an onion-routing proxy is
+                // configured; without one there's no point recording them.
+                let onion_routing = self.proxy.is_some() || self.onion_proxy.is_some();
                 for addr_msg in &addrs {
-                    if let Ok(sock_addr) = addr_msg.socket_addr()
-                        && !self.is_addr_connected(&sock_addr)
-                        && !self.is_addr_banned(&sock_addr)
-                    {
-                        self.add_connect_addr(sock_addr);
+                    match &addr_msg.addr {
+                        // BIP 155 TorV3: `socket_addr()` can't represent these,
+                        // so derive the .onion host and queue it for dialing.
+                        bitcoin::p2p::address::AddrV2::TorV3(pubkey)
+                            if onion_routing && addr_msg.port != 0 =>
+                        {
+                            let host = crate::net::peer::torv3_to_onion_host(pubkey);
+                            self.add_onion_connect_addr(host, addr_msg.port);
+                        }
+                        // IPv4 / IPv6 (and, under a proxy, anything else with a
+                        // socket form) flow through the clearnet address book.
+                        _ => {
+                            if let Ok(sock_addr) = addr_msg.socket_addr()
+                                && !self.is_addr_connected(&sock_addr)
+                                && !self.is_addr_banned(&sock_addr)
+                            {
+                                self.add_connect_addr(sock_addr);
+                            }
+                        }
                     }
                 }
             }
@@ -4029,6 +4074,21 @@ impl PeerManager {
         writer.send(NetworkMessage::FeeFilter(self.mempool.min_fee_rate() as i64))
             .await
             .map_err(|e| format!("send feefilter: {}", e))?;
+
+        // Proactively request addresses from outbound peers when running over a
+        // proxy. Onion peers are discovered only through gossip (the hardcoded
+        // seeds aside), and a one-time getaddr pulls the peer's address set
+        // promptly instead of waiting for unsolicited trickle — which a short-
+        // lived connection may never deliver. Matches Bitcoin Core, which sends
+        // getaddr to outbound peers. Scoped to proxy mode to leave clearnet
+        // address handling unchanged in this fix.
+        if direction == Direction::Outbound
+            && (self.proxy.is_some() || self.onion_proxy.is_some())
+        {
+            writer.send(NetworkMessage::GetAddr)
+                .await
+                .map_err(|e| format!("send getaddr: {}", e))?;
+        }
 
         // Spawn a dedicated read task that forwards messages via a channel.
         // This task is never cancelled, so read_exact always completes.
