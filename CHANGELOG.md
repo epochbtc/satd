@@ -53,9 +53,13 @@ In-progress; full detail tracked in
   default, reload disposition, Core-compatible vs satd extension), an
   **Authentication & Authorization** chapter (the unified bearer-token layer and
   how it contrasts with Core cookie/`rpcuser`/`rpcauth`), an **MCP Server**
-  chapter, and an **API Scaling & Runtimes** chapter (the core/API two-runtime
-  split, admission-control tuning knobs, and horizontal-scaling guidance).
-  Unshipped ecosystem/mobile strategy moved to `ROADMAP.md` (tagged by
+  chapter, an **API Scaling & Runtimes** chapter (the core/API two-runtime
+  split, admission-control tuning knobs, and horizontal-scaling guidance), and an
+  **Initial Block Download & Fast Sync** chapter (AssumeUTXO / `loadtxoutset` /
+  `--fast-start`, `assumevalid=all`, dual-engine shadow verification, the
+  swarm-download / prefetch / speculative-verify pipeline, and IBD/storage tuning
+  knobs — with Core differences called out). Unshipped ecosystem/mobile strategy
+  moved to `ROADMAP.md` (tagged by
   likelihood).
 
 ## Releases
