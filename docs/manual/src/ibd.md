@@ -100,14 +100,23 @@ satd ships **two independent script-verification engines** — the C++
 `libbitcoinconsensus` FFI and a from-scratch Rust verifier — and can run them
 together, cross-checking every script. This has **no equivalent in Bitcoin Core**.
 
+**Read the name as "which engine is the shadow."** In `<engine>-shadow`, the
+named engine is the **shadow** (the non-authoritative cross-checker); the *other*
+engine is **primary/authoritative** — its verdict is what the node actually acts
+on, and the shadow only re-checks in the background and logs any disagreement. So,
+counter-intuitively at first:
+
+- **`rust-shadow`** → the **Rust** engine is the shadow → **C++ is primary.**
+- **`cpp-shadow`** → the **C++** engine is the shadow → **Rust is primary.**
+
 `-consensus=<mode>`:
 
-| Mode | Behavior |
-|---|---|
-| `rust-shadow` | **Default.** Both engines run; **C++ is authoritative**, the Rust engine shadows and any mismatch is logged. |
-| `cpp-shadow` | Both engines run; **Rust is authoritative**, C++ shadows. |
-| `cpp` | C++ `libbitcoinconsensus` only. |
-| `rust` | Pure Rust engine only (not yet production-validated). |
+| Mode | Primary (authoritative) | Shadow (cross-check) |
+|---|---|---|
+| `rust-shadow` *(default)* | **C++** `libbitcoinconsensus` | Rust (logs mismatches) |
+| `cpp-shadow` | **Rust** | C++ (logs mismatches) |
+| `cpp` | C++ `libbitcoinconsensus` | — (single engine) |
+| `rust` | Rust *(not yet production-validated)* | — (single engine) |
 
 The Rust engine is **typically faster than the C++ FFI** — it avoids the
 per-call FFI marshaling overhead and uses a process-global, verification-only
