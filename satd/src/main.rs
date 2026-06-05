@@ -92,6 +92,18 @@ async fn main() {
         use tracing_subscriber::layer::SubscriberExt;
         use tracing_subscriber::util::SubscriberInitExt;
         let registry = tracing_subscriber::registry().with(filter_layer);
+        // The stdio MCP transport speaks the protocol over stdout, so logs must
+        // not share it — route them to stderr whenever stdio MCP is active, the
+        // standard convention for stdio MCP servers. Otherwise keep the default
+        // stdout sink.
+        use tracing_subscriber::fmt::writer::BoxMakeWriter;
+        let log_writer = || {
+            if config.mcp && config.mcp_stdio {
+                BoxMakeWriter::new(std::io::stderr)
+            } else {
+                BoxMakeWriter::new(std::io::stdout)
+            }
+        };
         match config.log_format {
             config::LogFormat::Json => {
                 // Stable JSON shape: `timestamp`, `level`, `target`,
@@ -101,12 +113,15 @@ async fn main() {
                         tracing_subscriber::fmt::layer()
                             .json()
                             .with_current_span(true)
-                            .with_span_list(false),
+                            .with_span_list(false)
+                            .with_writer(log_writer()),
                     )
                     .init();
             }
             config::LogFormat::Text => {
-                registry.with(tracing_subscriber::fmt::layer()).init();
+                registry
+                    .with(tracing_subscriber::fmt::layer().with_writer(log_writer()))
+                    .init();
             }
         }
     }
