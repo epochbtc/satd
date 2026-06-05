@@ -8,9 +8,10 @@ allows compiling out the BIP 158 codec entirely for a consensus-only build.
 
 This chapter documents the architecture and the design rationale behind that
 choice. For operator flags and tuning see [Configuration, Tuning &
-Reload](configuration.md); for the Esplora wire shape see the [Esplora REST
-API](esplora.md) chapter; for how these surfaces authenticate (and the unified
-bearer-token layer) see [Authentication & Authorization](authentication.md); for
+Reload](configuration.md); for the wire surfaces see the [Esplora REST
+API](esplora.md) and [Electrum Protocol Server](electrum.md) chapters; for how
+these surfaces authenticate (and the unified bearer-token layer) see
+[Authentication & Authorization](authentication.md); for
 the catalog of shipped surfaces see
 [`CORE_DIFFERENCES.md`](https://github.com/epochbtc/satd/blob/master/CORE_DIFFERENCES.md)
 §"Native protocol surfaces".

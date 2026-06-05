@@ -13,6 +13,18 @@ configuration and tuning, live reload, integrator APIs, the terminal UI, the
 native protocol surfaces (Esplora / Electrum / BIP 157-158), and the packaging
 contract.
 
+**One process, one store.** The defining architectural choice is that every API
+service — JSON-RPC, Esplora, Electrum, BIP 157/158 filters, the streaming APIs,
+MCP — is a query layer over the **same RocksDB and chainstate the node itself
+uses**, updated atomically inside block connection. There is no second process
+and no duplicate index: running satd is *not* `bitcoind` + `electrs` + an Esplora
+indexer + exporters glued together, but a single daemon where all surfaces share
+the node's storage. This eliminates the duplicate-index disk cost (an external
+address index alone is 30–180 GB at mainnet tip), the parallel block re-scan, and
+the reorg-window race where an external indexer's view lags the node. The
+trade-off — that you scale out by running more nodes rather than more index
+processes — is covered in [API Scaling & Runtimes](api-scaling.md).
+
 ## How this manual is organized
 
 - **Operating** — the day-to-day surfaces: [observability and
@@ -22,8 +34,9 @@ contract.
   (Core-compatible credentials plus the unified bearer-token layer), the
   [integrator APIs](integrator-apis.md), and the [`sat-tui`](tui.md) terminal
   dashboard.
-- **Protocol Surfaces** — the [Esplora REST API](esplora.md) reference, the
-  [streaming consumption API](streaming.md), the [MCP server](mcp.md), and the
+- **Protocol Surfaces** — the [Esplora REST API](esplora.md) and [Electrum
+  protocol](electrum.md) references, the [streaming consumption API](streaming.md),
+  the [MCP server](mcp.md), and the
   [architecture](native-protocol-surfaces.md) behind satd's native, shared-chainstate
   protocol servers (the headline differentiator over the `bitcoind` + `electrs`
   status quo).

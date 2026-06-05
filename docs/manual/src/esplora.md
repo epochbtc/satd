@@ -6,6 +6,14 @@ listening on `127.0.0.1:3000`. Wire shapes match upstream
 [mempool.space](https://github.com/mempool/mempool) byte-for-byte
 within the endpoint set listed below.
 
+Like the Electrum server, it is a **query layer over satd's own chainstate and
+shared address-history index** — not a separate indexer process (electrs /
+esplora-electrs / Fulcrum) maintaining a parallel 30–180 GB index. One RocksDB,
+updated atomically inside the node's `connect_block` / `disconnect_block` path,
+backs the node and every API surface, so a read can never observe an index out of
+sync with the tip. See [Native Protocol Architecture](native-protocol-surfaces.md)
+for the rationale.
+
 This document covers what's implemented today. The implementation lives
 in the `esplora-handlers/` workspace crate; routes are registered in
 `esplora-handlers/src/router.rs` and shape parity is locked behind the
