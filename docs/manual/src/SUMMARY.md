@@ -14,6 +14,7 @@
 # Protocol Surfaces
 
 - [Esplora REST API](esplora.md)
+- [Electrum Protocol Server](electrum.md)
 - [Streaming Consumption API](streaming.md)
 - [MCP Server](mcp.md)
 - [Native Protocol Architecture](native-protocol-surfaces.md)

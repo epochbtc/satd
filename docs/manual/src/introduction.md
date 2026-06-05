@@ -22,8 +22,9 @@ contract.
   (Core-compatible credentials plus the unified bearer-token layer), the
   [integrator APIs](integrator-apis.md), and the [`sat-tui`](tui.md) terminal
   dashboard.
-- **Protocol Surfaces** — the [Esplora REST API](esplora.md) reference, the
-  [streaming consumption API](streaming.md), the [MCP server](mcp.md), and the
+- **Protocol Surfaces** — the [Esplora REST API](esplora.md) and [Electrum
+  protocol](electrum.md) references, the [streaming consumption API](streaming.md),
+  the [MCP server](mcp.md), and the
   [architecture](native-protocol-surfaces.md) behind satd's native, shared-chainstate
   protocol servers (the headline differentiator over the `bitcoind` + `electrs`
   status quo).
