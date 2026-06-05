@@ -1755,6 +1755,180 @@ impl ChainState {
         self.best_header.read().0
     }
 
+    /// Ensure the in-memory `best_header` pointer is at least the active tip.
+    ///
+    /// A `--reindex` constructs `ChainState` from an empty index (the
+    /// best-header pointer is seeded at genesis), then the replay advances the
+    /// active tip *without* going through `accept_header`/`accept_block`, the
+    /// only writers of `best_header`. The pointer is therefore left behind the
+    /// rebuilt tip, which (a) makes `check_block_index` see the selection
+    /// pointer lagging the active chain and (b) leaves the node unable to
+    /// recognize it is caught up — `missing_blocks_for_best_header_chain`
+    /// returns empty until the first peer `headers` re-seeds the pointer.
+    /// Re-seed it from the rebuilt tip. A no-op when the pointer already
+    /// out-works the tip (e.g. header-only branches loaded from a kept index
+    /// under `--reindex-chainstate`), since [`update_best_header`] keeps the max.
+    pub fn refresh_best_header_to_tip(&self) {
+        let tip_hash = self.tip_hash();
+        if let Some(entry) = self.get_block_index(&tip_hash) {
+            self.update_best_header(tip_hash, entry.chainwork);
+        }
+    }
+
+    /// Structural consistency audit of the on-disk block index against the
+    /// active chain — a startup analogue of Bitcoin Core's `CheckBlockIndex`
+    /// (Core runs its check continuously after every connect/disconnect; this
+    /// runs once at startup and after a reindex).
+    ///
+    /// Metadata-only: it reads block-index entries (header, height, status,
+    /// chainwork), never block data, so it is cheap enough to gate behind
+    /// `-checkblockindex` (default on for regtest/CI, off for mainnet). It
+    /// walks the active chain by `prev_blockhash` from the tip down to the
+    /// bottom of the range this chainstate owns — genesis normally, or the
+    /// AssumeUTXO snapshot base when a background chainstate is still filling
+    /// the pre-snapshot range — and, at every height, cross-checks: the
+    /// entry's stored `height` equals
+    /// its position in the chain; the `height -> hash` map agrees with the
+    /// prev-link walk; chainwork strictly increases and satisfies the exact
+    /// recurrence `child.chainwork == parent.chainwork + work(child.bits)`;
+    /// and no active block is marked `Invalid`. It also verifies the chain
+    /// bottoms out at the network genesis and that `best_header` is never
+    /// behind the active tip in work.
+    ///
+    /// Walking the prev-links (rather than the `height -> hash` map) is the
+    /// whole point: it does not trust the structure that reorg bugs corrupt,
+    /// so a side block clobbering a height entry surfaces as a disagreement
+    /// between the map and the prev-walk. That is exactly the failure that
+    /// polluted heights 951540–951945 and made `--reindex-chainstate` abort
+    /// at `bad-cb-height`.
+    ///
+    /// Returns the tip height verified, or a description of the first
+    /// inconsistency found.
+    pub fn check_block_index(
+        &self,
+        progress: Option<Arc<crate::startup_progress::StartupProgress>>,
+    ) -> Result<u32, String> {
+        let tip_hash = self.tip_hash();
+        let tip_height = self.tip_height();
+        let genesis = bitcoin::constants::genesis_block(self.network).block_hash();
+
+        // Under AssumeUTXO the active (snapshot) chainstate is authoritative
+        // only for [snapshot_height, tip]: `adopt_snapshot_tip` seeds a single
+        // height->hash entry at the base and the background chainstate fills
+        // the genesis->base range lazily over hours/days, so heights below the
+        // base may legitimately be absent from the map. Scope the walk to the
+        // range this chainstate owns (the background validates the rest as it
+        // connects), so the audit does not false-fail mid-background-sync.
+        let floor = self.background().map(|bg| bg.snapshot_height()).unwrap_or(0);
+
+        if let Some(p) = &progress {
+            p.set_phase("checkblockindex", "Verifying block-index consistency…");
+        }
+        tracing::info!(tip_height, floor, "Starting block-index consistency audit");
+
+        let mut hash = tip_hash;
+        let mut height = tip_height;
+        // The block we descended from (one height up): (height, chainwork,
+        // its own work) — used to verify the chainwork recurrence.
+        let mut child: Option<(u32, [u8; 32], [u8; 32])> = None;
+
+        loop {
+            let entry = self.get_block_index(&hash).ok_or_else(|| {
+                format!("active block {hash} at height {height} is missing from the block index")
+            })?;
+
+            // (1) stored height matches the active-chain position
+            if entry.height != height {
+                return Err(format!(
+                    "block {hash} has stored height {} but sits at active-chain position {height}",
+                    entry.height
+                ));
+            }
+
+            // (4) an active-chain block must never be marked Invalid
+            if entry.status == BlockStatus::Invalid {
+                return Err(format!(
+                    "active block {hash} at height {height} is marked Invalid"
+                ));
+            }
+
+            // (2) the height->hash map must agree with the prev-link walk.
+            //     This is the side-block-clobber / 951k-pollution detector.
+            match self.get_block_hash_by_height(height) {
+                Some(h) if h == hash => {}
+                other => {
+                    return Err(format!(
+                        "height->hash[{height}] = {other:?}, but the active chain (by prev-links) \
+                         has {hash}"
+                    ));
+                }
+            }
+
+            // (3) chainwork recurrence against the child we descended from
+            if let Some((child_height, child_chainwork, child_work)) = child {
+                if compare_u256(&child_chainwork, &entry.chainwork) <= 0 {
+                    return Err(format!(
+                        "chainwork is not strictly increasing between heights {height} and \
+                         {child_height}"
+                    ));
+                }
+                if add_u256(&entry.chainwork, &child_work) != child_chainwork {
+                    return Err(format!(
+                        "chainwork recurrence is broken at height {child_height}: stored work != \
+                         parent work + work(bits)"
+                    ));
+                }
+            }
+
+            // Bottom of the audited range. Without AssumeUTXO this is genesis
+            // (verify it); with a snapshot it is the snapshot base, validated
+            // by the per-iteration checks above — stop there, the background
+            // owns everything below.
+            if height == floor {
+                if floor == 0 && hash != genesis {
+                    return Err(format!(
+                        "active chain bottoms out at {hash}, not the {:?} genesis {genesis}",
+                        self.network
+                    ));
+                }
+                break;
+            }
+
+            // Liveness + progress for the mainnet case (~950k point lookups):
+            // refresh the stall-watchdog heartbeat and the startup status so a
+            // long audit is neither mistaken for a hang nor reported under a
+            // stale phase.
+            if height.is_multiple_of(50_000) {
+                self.bump_connect_heartbeat();
+                if let Some(p) = &progress {
+                    p.set_current(u64::from(tip_height - height));
+                }
+                tracing::info!(height, "Block-index audit in progress");
+            }
+
+            child = Some((height, entry.chainwork, work_for_bits(entry.header.bits)));
+            hash = entry.header.prev_blockhash;
+            height -= 1;
+        }
+
+        // best_header (the most-work header tip) must never be behind the
+        // active tip in work — if it is, the chainwork pointer and the active
+        // chain disagree about which chain is best.
+        let best_cw = self
+            .get_block_index(&self.best_header_hash())
+            .map(|e| e.chainwork);
+        let tip_cw = self.get_block_index(&tip_hash).map(|e| e.chainwork);
+        if let (Some(best), Some(tip)) = (best_cw, tip_cw)
+            && compare_u256(&best, &tip) < 0
+        {
+            return Err(format!(
+                "best_header chainwork is behind the active tip at height {tip_height}"
+            ));
+        }
+
+        Ok(tip_height)
+    }
+
     /// Blocks we must download to connect the best-work header chain we know
     /// of, in connect order (oldest first), up to `max_request`. Walks back
     /// from the best-work header tip (`best_header`, the most-work chain — NOT
@@ -4911,6 +5085,89 @@ pub(crate) mod tests {
             blocks.push(b);
         }
         blocks
+    }
+
+    #[test]
+    fn check_block_index_passes_then_catches_height_map_pollution() {
+        let (cs, dir) = make_chain_state();
+        let blocks = build_and_connect_chain(&cs, 5);
+        assert_eq!(cs.tip_height(), 5);
+
+        // A healthy chain audits clean and reports the tip height.
+        assert_eq!(cs.check_block_index(None), Ok(5));
+
+        // Reproduce the 951k reorg corruption: point the height->hash map at
+        // the WRONG block for an interior height (height 3 -> the height-5
+        // block). The prev-link walk still yields the true chain, so the
+        // disagreement must be caught — exactly the divergence that
+        // --reindex-chainstate could not detect before it tripped over it as
+        // bad-cb-height.
+        let wrong = blocks[4].block_hash(); // the block at height 5
+        let mut batch = crate::storage::StoreBatch::default();
+        batch.height_hash_puts.push((3, wrong));
+        cs.store.write_batch(batch).unwrap();
+
+        let err = cs
+            .check_block_index(None)
+            .expect_err("a polluted height->hash map must fail the audit");
+        assert!(
+            err.contains("height->hash[3]"),
+            "expected a height->hash[3] mismatch, got: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn check_block_index_catches_stored_height_mismatch() {
+        let (cs, dir) = make_chain_state();
+        let blocks = build_and_connect_chain(&cs, 4);
+        assert_eq!(cs.check_block_index(None), Ok(4));
+
+        // Corrupt the stored height of the height-2 block's index entry.
+        let h2 = blocks[1].block_hash();
+        let mut entry = cs.get_block_index(&h2).unwrap();
+        entry.height = 99;
+        let mut batch = crate::storage::StoreBatch::default();
+        batch.block_index_puts.push((h2, entry));
+        cs.store.write_batch(batch).unwrap();
+
+        let err = cs
+            .check_block_index(None)
+            .expect_err("a stored-height mismatch must fail the audit");
+        assert!(
+            err.contains("stored height 99"),
+            "expected a stored-height mismatch, got: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn refresh_best_header_to_tip_clears_post_reindex_lag() {
+        let (cs, dir) = make_chain_state();
+        build_and_connect_chain(&cs, 5);
+        assert_eq!(cs.check_block_index(None), Ok(5));
+
+        // Reproduce the post-`--reindex` state: the replay advances the active
+        // tip but never touches `best_header`, so the pointer is left behind at
+        // genesis. The audit must flag the selection pointer lagging the chain
+        // (this is what made every reindex integration test hang at startup).
+        let genesis = bitcoin::constants::genesis_block(cs.network);
+        *cs.best_header.write() = (genesis.block_hash(), work_for_bits(genesis.header.bits));
+        let err = cs
+            .check_block_index(None)
+            .expect_err("a best_header behind the active tip must fail the audit");
+        assert!(
+            err.contains("best_header"),
+            "expected a best_header lag error, got: {err}"
+        );
+
+        // The post-reindex re-seed restores the invariant.
+        cs.refresh_best_header_to_tip();
+        assert_eq!(cs.check_block_index(None), Ok(5));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Build a `ChainState` over an `InMemoryStore` pre-seeded with a fake

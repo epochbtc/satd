@@ -728,6 +728,7 @@ pub struct Config {
     pub prune: u64,
     pub reindex: bool,
     pub reindex_chainstate: bool,
+    pub check_block_index: bool,
     // P2P
     pub maxconnections: usize,
     /// Maximum simultaneous inbound peers from the same source IP
@@ -2486,6 +2487,11 @@ impl Config {
             prune,
             reindex: cli.reindex.unwrap_or(false),
             reindex_chainstate: cli.reindex_chainstate.unwrap_or(false),
+            // Default on for regtest (matches Core's -checkblockindex), off
+            // elsewhere — on a mainnet index the walk is ~1M point lookups.
+            check_block_index: cli
+                .checkblockindex
+                .unwrap_or(network == Network::Regtest),
             maxconnections: cli
                 .maxconnections
                 .or_else(|| file_get("maxconnections").and_then(|v| v.parse().ok()))
@@ -3897,6 +3903,16 @@ pub struct CliArgs {
     )]
     pub reindex_chainstate: Option<bool>,
 
+    #[arg(
+        long = "checkblockindex",
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
+        help = "Audit block-index/active-chain consistency at startup (default: on for regtest)"
+    )]
+    pub checkblockindex: Option<bool>,
+
     // P2P flags
     #[arg(
         long,
@@ -4693,6 +4709,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "prune",
         "reindex",
         "reindex-chainstate",
+        "checkblockindex",
         "maxconnections",
         "maxinboundperip",
         "maxuploadtarget",
@@ -4789,6 +4806,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "rpcextendederrors",
         "reindex",
         "reindex-chainstate",
+        "checkblockindex",
         "mcp",
         "mcpstdio",
         "mcpauth",
@@ -5183,6 +5201,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "prune",
     "reindex",
     "reindexchainstate",
+    "checkblockindex",
     "dbcache",
     "storageprofile",
     "prefetchworkers",
@@ -6084,6 +6103,7 @@ rpcport=8332
             prune: None,
             reindex: Some(false),
             reindex_chainstate: Some(false),
+            checkblockindex: None,
             maxconnections: None,
             maxinboundperip: None,
             maxuploadtarget: None,
@@ -6329,6 +6349,7 @@ rpcport=8332
             prune: None,
             reindex: Some(false),
             reindex_chainstate: Some(false),
+            checkblockindex: None,
             maxconnections: None,
             maxinboundperip: None,
             maxuploadtarget: None,

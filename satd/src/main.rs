@@ -710,6 +710,37 @@ async fn main() {
         }
     }
 
+    // A reindex rebuilds the active chain via the replay path, which never
+    // touches the in-memory best-header pointer (seeded at genesis when the
+    // index started empty). Re-seed it from the rebuilt tip before the audit
+    // below, so the pointer is never left behind the active chain.
+    if config.reindex || config.reindex_chainstate {
+        chain_state.refresh_best_header_to_tip();
+    }
+
+    // Structural block-index audit (-checkblockindex): on every startup when
+    // enabled (default on for regtest/CI), and crucially *after* a reindex —
+    // so a reindex that rebuilt a corrupt index is caught here, before the
+    // node serves, instead of days later when something trips over it. Fail
+    // closed: refuse to serve an index we can't prove self-consistent.
+    if config.check_block_index {
+        match chain_state.check_block_index(Some(startup_progress.clone())) {
+            Ok(height) => tracing::info!(height, "Block-index consistency check passed"),
+            Err(e) => {
+                eprintln!(
+                    "FATAL: block-index consistency check failed: {e}\n\
+                     The on-disk block index is structurally inconsistent with the active \
+                     chain. Recover by rebuilding it from the block files: restart with \
+                     --reindex. (--reindex-chainstate will NOT fix this — it trusts the \
+                     same block index.) If this appeared immediately after a clean reindex, \
+                     please report it with the message above."
+                );
+                auth.cleanup();
+                std::process::exit(1);
+            }
+        }
+    }
+
     // AssumeUTXO --fast-start: download the snapshot now, as a pre-RPC
     // startup phase, so its progress renders in the same TUI gauge a
     // reindex uses (the snapshot is the big, slow part). The load itself
