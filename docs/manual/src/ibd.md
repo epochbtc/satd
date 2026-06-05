@@ -116,15 +116,24 @@ counter-intuitively at first:
 | `rust-shadow` *(default)* | **C++** `libbitcoinconsensus` | Rust (logs mismatches) |
 | `cpp-shadow` | **Rust** | C++ (logs mismatches) |
 | `cpp` | C++ `libbitcoinconsensus` | — (single engine) |
-| `rust` | Rust *(not yet production-validated)* | — (single engine) |
+| `rust` | Rust — single engine, **no cross-check** | — (single engine) |
 
-The Rust engine is **typically faster than the C++ FFI** — it avoids the
-per-call FFI marshaling overhead and uses a process-global, verification-only
-cached `secp256k1` context. That's why `cpp-shadow` (Rust authoritative, C++
-shadow) is the high-performance pairing, and why the long-term direction is to
-make Rust the primary engine once it has accumulated enough mainnet shadow
-mileage; today the conservative `rust-shadow` default keeps C++ authoritative
-while the Rust engine proves itself in the background.
+The Rust engine is no toy: it **passes Bitcoin Core's script test suite** and has
+been **shadow-validated against `libbitcoinconsensus` across the entire mainnet
+chain (genesis → ~945k) with zero divergence**. It is also **typically faster
+than the C++ FFI** — it avoids the per-call FFI marshaling overhead and uses a
+process-global, verification-only cached `secp256k1` context, which is why
+`cpp-shadow` (Rust authoritative, C++ shadow) is the high-performance pairing.
+
+Given all that, why is `rust-shadow` (C++ authoritative) still the default? Pure
+conservatism: keeping a second, independently-written engine as the authoritative
+check is satd's core safety property, and C++ `libbitcoinconsensus` is the most
+battle-tested implementation in existence. The plan is to promote Rust to primary
+as it accrues more authoritative-in-production mileage — `cpp-shadow` is exactly
+that step. The single-engine `rust` mode is the one to be cautious with: not
+because the engine is unproven, but because running *either* engine alone forgoes
+the dual-engine cross-check that is satd's core safety property. satd prints a
+caution at startup when you select the single-engine `rust` mode.
 
 The shadow engine runs on a **bounded background worker pool**, so it consumes
 spare CPU without slowing block connection — shadow verification is essentially
