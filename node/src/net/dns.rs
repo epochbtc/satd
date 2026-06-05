@@ -42,15 +42,19 @@ const TESTNET4_SEEDS: &[&str] = &[
     "seed.testnet4.wiz.biz",
 ];
 
-/// DNS seeds for Bitcoin signet (the default/global signet).
+/// Seeds for Bitcoin signet (the default/global signet).
 ///
-/// Mirrors Bitcoin Core's `SigNetParams` `vSeeds` (v28.0). Core also seeds the
-/// default signet with the clearnet literal `178.128.221.177`; satd does not
-/// embed clearnet fixed-IP seeds (they go stale), so that node is reachable
-/// only once the two DNS seeds below populate the address book.
+/// Mirrors Bitcoin Core's `SigNetParams` `vSeeds` (v28.0): two DNS seeds plus
+/// the clearnet literal `178.128.221.177` Core seeds the default signet with.
+/// The literal needs no DNS query — `lookup_host` parses `IP:port` directly —
+/// so it rides the normal clearnet seeding path. Under a proxy, signet falls
+/// back to the `.onion` seeds instead, so this clearnet node is never dialed
+/// in Tor mode. (Distinct from the `-fixedseeds` last-resort list, which stays
+/// `.onion`-only — see `fixed_seeds_for_network`.)
 const SIGNET_SEEDS: &[&str] = &[
     "seed.signet.bitcoin.sprovoost.nl",
     "seed.signet.achownodes.xyz",
+    "178.128.221.177",
 ];
 
 /// DNS seeds for regtest (none - local network only).
@@ -323,7 +327,8 @@ mod tests {
         assert_eq!(seeds_for_network(Network::Bitcoin).len(), 10);
         assert_eq!(seeds_for_network(Network::Testnet).len(), 5);
         assert_eq!(seeds_for_network(Network::Testnet4).len(), 2);
-        assert_eq!(seeds_for_network(Network::Signet).len(), 2);
+        // Two DNS seeds + Core's default-signet clearnet literal.
+        assert_eq!(seeds_for_network(Network::Signet).len(), 3);
         assert!(seeds_for_network(Network::Regtest).is_empty());
     }
 
@@ -342,6 +347,8 @@ mod tests {
 
         let signet = seeds_for_network(Network::Signet);
         assert!(signet.contains(&"seed.signet.achownodes.xyz"));
+        // Core's default-signet clearnet seed (a literal IP in vSeeds).
+        assert!(signet.contains(&"178.128.221.177"));
 
         // Core seeds the default signet with this Tor v3 node.
         assert!(
@@ -351,6 +358,23 @@ mod tests {
                     == "v7ajjeirttkbnt32wpy3c6w3emwnfr3fkla7hpxcfokr3ysd3kqtzmqd.onion"
                     && *p == 38333)
         );
+    }
+
+    #[tokio::test]
+    async fn signet_clearnet_literal_resolves_without_dns() {
+        // The default-signet clearnet seed is a numeric literal, so the same
+        // `lookup_host("{seed}:{port}")` path the seeder uses returns it
+        // directly with no DNS query — proving it's a usable bootstrap target.
+        let port = default_port(Network::Signet);
+        let literal = seeds_for_network(Network::Signet)
+            .iter()
+            .find(|s| s.parse::<std::net::IpAddr>().is_ok())
+            .expect("signet should carry a clearnet literal seed");
+        let resolved: Vec<_> = tokio::net::lookup_host(format!("{literal}:{port}"))
+            .await
+            .expect("numeric literal resolves offline")
+            .collect();
+        assert_eq!(resolved, vec!["178.128.221.177:38333".parse().unwrap()]);
     }
 
     #[test]
