@@ -51,8 +51,10 @@ In-progress; full detail tracked in
   integrator guide, a complete **Configuration Flag Reference** (every key:
   default, reload disposition, Core-compatible vs satd extension), an
   **Authentication & Authorization** chapter (the unified bearer-token layer and
-  how it contrasts with Core cookie/`rpcuser`/`rpcauth`), and an **MCP Server**
-  chapter. Unshipped ecosystem/mobile strategy moved to `ROADMAP.md` (tagged by
+  how it contrasts with Core cookie/`rpcuser`/`rpcauth`), an **MCP Server**
+  chapter, and an **API Scaling & Runtimes** chapter (the core/API two-runtime
+  split, admission-control tuning knobs, and horizontal-scaling guidance).
+  Unshipped ecosystem/mobile strategy moved to `ROADMAP.md` (tagged by
   likelihood).
 
 ## Releases

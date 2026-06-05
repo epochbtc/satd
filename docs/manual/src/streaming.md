@@ -52,7 +52,9 @@ the Core-compat JSON-RPC port — keeping the differentiated stream a distinct
 service on a distinct port. Every streaming listener (`--streamws` and the gRPC
 `NodeEventStream`) **runs on the isolated API tokio runtime** (`--api-threads`),
 never the core block-connecting runtime: a flood of streaming clients can never
-contend with the threads that connect blocks and accept mempool transactions.
+contend with the threads that connect blocks and accept mempool transactions. See
+[API Scaling & Runtimes](api-scaling.md) for the runtime split, the admission
+caps, and how to scale beyond one node.
 
 ## Subscriptions and watch-sets
 
