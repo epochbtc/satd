@@ -1758,8 +1758,8 @@ async fn main() {
         });
 
         // `--mcp` only enables the feature; `--mcpport` provides the transport.
-        // Without a port there is nothing to serve (the stdio transport was
-        // removed), so warn rather than silently doing nothing.
+        // Without a port there is nothing to serve, so warn rather than silently
+        // doing nothing.
         if config.mcp_port.is_none() {
             tracing::warn!(
                 "--mcp is set but --mcpport is not; the MCP server has no transport and will not \

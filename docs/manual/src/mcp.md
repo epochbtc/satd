@@ -12,9 +12,8 @@ It is **off by default** — enable it with `--mcp` plus `--mcpport`.
 ## Transport
 
 MCP is served over a single **Streamable HTTP** listener (which also serves
-legacy SSE clients). There is no stdio transport: the MCP server is part of the
-running `satd` process, so clients attach to an already-running daemon over the
-network rather than launching their own node.
+legacy SSE clients). The MCP server is part of the running `satd` process, so
+clients attach to an already-running daemon over the network.
 
 | Setting | Default | Notes |
 |---|---|---|
