@@ -61,18 +61,23 @@ fn default_auto_max_mb() -> usize {
 
 /// Consensus engine selection.
 ///
-/// Controls which script verification engine is used:
-/// - `cpp`: C++ libbitcoinconsensus FFI only (current default)
-/// - `rust`: Pure Rust consensus engine only (not yet production-ready)
-/// - `rust-shadow`: Both engines, cpp authoritative, log mismatches
-/// - `cpp-shadow`: Both engines, rust authoritative, log mismatches
+/// Controls which script verification engine is used. The default,
+/// `rust-shadow`, runs two independent engines and cross-checks every script;
+/// the single-engine modes forgo that cross-check.
+/// - `rust-shadow` *(default)*: both engines, cpp authoritative, rust shadow
+/// - `cpp-shadow`: both engines, rust authoritative, cpp shadow
+/// - `cpp`: C++ libbitcoinconsensus FFI only (single engine)
+/// - `rust`: pure Rust consensus engine only (single engine)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConsensusEngine {
-    /// C++ libbitcoinconsensus FFI (default, eventually deprecated).
+    /// C++ libbitcoinconsensus FFI, single engine (no shadow cross-check).
     Cpp,
-    /// Pure Rust consensus engine (not yet validated for production).
+    /// Pure Rust consensus engine, single engine (no shadow cross-check).
+    /// The Rust engine passes Core's script test suite and is shadow-validated
+    /// against libbitcoinconsensus across mainnet history; the caution here is
+    /// only that single-engine mode forgoes the dual-engine cross-check.
     Rust,
-    /// Both engines: cpp is authoritative, rust runs in shadow, mismatches logged.
+    /// Both engines: cpp is authoritative, rust runs in shadow, mismatches logged (default).
     RustShadow,
     /// Both engines: rust is authoritative, cpp runs in shadow, mismatches logged.
     CppShadow,
@@ -2689,8 +2694,11 @@ impl Config {
                     .or_else(|| file_get("consensus"))
                     .unwrap_or_else(|| "rust-shadow".to_string());
                 ConsensusEngine::from_str(&raw).unwrap_or_else(|| {
-                    eprintln!("Warning: unknown consensus engine '{}', using 'cpp'", raw);
-                    ConsensusEngine::Cpp
+                    eprintln!(
+                        "Warning: unknown consensus engine '{}', using default 'rust-shadow'",
+                        raw
+                    );
+                    ConsensusEngine::RustShadow
                 })
             },
             shadow_queue_size: cli
