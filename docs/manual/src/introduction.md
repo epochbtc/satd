@@ -17,7 +17,8 @@ contract.
 
 - **Operating** — the day-to-day surfaces: [observability and
   metrics](observability.md), [configuration, tuning, and live
-  reload](configuration.md), [authentication and authorization](authentication.md)
+  reload](configuration.md), [API scaling and the two-runtime model](api-scaling.md),
+  [authentication and authorization](authentication.md)
   (Core-compatible credentials plus the unified bearer-token layer), the
   [integrator APIs](integrator-apis.md), and the [`sat-tui`](tui.md) terminal
   dashboard.
