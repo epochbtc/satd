@@ -1757,6 +1757,16 @@ async fn main() {
             mempool_history: mempool_history.clone(),
         });
 
+        // `--mcp` only enables the feature; `--mcpport` provides the transport.
+        // Without a port there is nothing to serve (the stdio transport was
+        // removed), so warn rather than silently doing nothing.
+        if config.mcp_port.is_none() {
+            tracing::warn!(
+                "--mcp is set but --mcpport is not; the MCP server has no transport and will not \
+                 start. Set --mcpport=<port> to enable the HTTP(S) listener."
+            );
+        }
+
         if let Some(mcp_port) = config.mcp_port {
             let mcp_bind: SocketAddr = format!("{}:{}", config.mcp_bind, mcp_port)
                 .parse()

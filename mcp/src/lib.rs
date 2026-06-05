@@ -505,6 +505,56 @@ fn mcp_status_response(status: u16, header: Option<(&str, String)>, msg: &'stati
     builder.body(body).expect("static response is valid")
 }
 
+/// Max concurrent MCP connections. Mirrors the RPC TLS surface's connection cap
+/// (`node/src/rpc/server.rs`) so a connection / TLS-handshake flood can't spawn
+/// unbounded tasks on the consensus runtime MCP shares.
+const MCP_MAX_CONNECTIONS: usize = 128;
+
+/// Serve one MCP connection to completion, draining gracefully if the process
+/// shuts down mid-request. `header_read_timeout` bounds how long the client may
+/// take to send request headers (post-handshake slowloris guard).
+async fn serve_mcp_conn<I, S, B>(
+    io: I,
+    svc: S,
+    header_read_timeout: std::time::Duration,
+    shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
+    label: &'static str,
+) where
+    I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
+    S: hyper::service::Service<
+            hyper::Request<hyper::body::Incoming>,
+            Response = hyper::Response<B>,
+            Error = std::convert::Infallible,
+        > + Send + 'static,
+    S::Future: Send + 'static,
+    B: hyper::body::Body + Send + 'static,
+    B::Data: Send,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    let mut builder = hyper::server::conn::http1::Builder::new();
+    builder.header_read_timeout(header_read_timeout);
+    let conn = builder.serve_connection(io, svc).with_upgrades();
+    tokio::pin!(conn);
+    tokio::select! {
+        res = conn.as_mut() => {
+            if let Err(e) = res {
+                tracing::debug!("MCP {label} connection error: {e}");
+            }
+        }
+        // The `wait_for` guard (a non-Send `watch::Ref`) is dropped at the end
+        // of this async block, before the `graceful_shutdown` await below — so
+        // the connection task future stays `Send`.
+        _ = async { let _ = shutdown_rx.wait_for(|v| *v).await; } => {
+            // Stop accepting new requests on this connection and let in-flight
+            // ones finish (e.g. a send_transaction broadcast) before teardown.
+            conn.as_mut().graceful_shutdown();
+            if let Err(e) = conn.as_mut().await {
+                tracing::debug!("MCP {label} connection error after drain: {e}");
+            }
+        }
+    }
+}
+
 /// Native-TLS parameters for the MCP HTTP listener.
 ///
 /// Built by the caller from `--mcpcert`/`--mcpkey` (server-auth TLS) plus the
@@ -563,15 +613,55 @@ pub async fn serve_http(
     let scheme = if tls.is_some() { "https" } else { "http" };
     tracing::info!(%bind_addr, scheme, "MCP HTTP server listening");
 
+    // Connection cap, mirroring the RPC TLS surface
+    // (`node/src/rpc/server.rs`). The per-connection task holds an owned permit
+    // for the lifetime of the connection (handshake + serving), so a connection
+    // or TLS-handshake flood can't spawn unbounded tasks and starve the
+    // consensus runtime MCP shares. At capacity the socket is dropped (TCP
+    // reset) before any work — there is no HTTP body to answer with yet.
+    let conn_cap = std::sync::Arc::new(tokio::sync::Semaphore::new(MCP_MAX_CONNECTIONS));
+    // Bound how long a client may take to send its request headers — the TLS
+    // handshake timeout only covers the handshake; without this a post-handshake
+    // slowloris (dribbling header bytes) would pin a connection task indefinitely.
+    let header_read_timeout = std::time::Duration::from_secs(30);
+    // A separate receiver handle for per-connection graceful-shutdown signalling.
+    // Cloned per connection below; kept distinct from the `shutdown_rx` the outer
+    // accept `select!` borrows mutably, so the two don't conflict.
+    let conn_shutdown_template = shutdown_rx.clone();
+
     loop {
         tokio::select! {
             accept = listener.accept() => {
-                match accept {
-                    Ok((stream, addr)) => {
-                        let svc = mcp_service.clone();
-                        let conn_auth = auth.clone();
-                        let conn_tls = tls.clone();
-                        tokio::spawn(async move {
+                let (stream, addr) = match accept {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // Brief backoff so a persistent accept error (e.g.
+                        // EMFILE / fd exhaustion) doesn't busy-loop a core
+                        // runtime worker and flood the log. Matches RPC.
+                        tracing::warn!(error = %e, "MCP accept error");
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        continue;
+                    }
+                };
+                // try_acquire_owned: at capacity, drop the socket here
+                // (pre-handshake) rather than queueing unbounded work.
+                let permit = match conn_cap.clone().try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        tracing::warn!(
+                            peer = %addr,
+                            "MCP at-capacity rejection ({MCP_MAX_CONNECTIONS} max)",
+                        );
+                        drop(stream);
+                        continue;
+                    }
+                };
+                let svc = mcp_service.clone();
+                let conn_auth = auth.clone();
+                let conn_tls = tls.clone();
+                let conn_shutdown = conn_shutdown_template.clone();
+                tokio::spawn(async move {
+                            let _permit = permit;
                             let svc = hyper::service::service_fn(move |req| {
                                 let svc = svc.clone();
                                 let conn_auth = conn_auth.clone();
@@ -602,6 +692,7 @@ pub async fn serve_http(
                                     Ok::<_, std::convert::Infallible>(svc.handle(req).await)
                                 }
                             });
+                            let mut conn_shutdown = conn_shutdown;
                             match conn_tls {
                                 Some(tls) => {
                                     // TLS handshake with a bound timeout so a
@@ -649,33 +740,19 @@ pub async fn serve_http(
                                         }
                                     }
                                     let io = hyper_util::rt::TokioIo::new(tls_stream);
-                                    if let Err(e) = hyper::server::conn::http1::Builder::new()
-                                        .serve_connection(io, svc)
-                                        .with_upgrades()
-                                        .await
-                                    {
-                                        tracing::debug!("MCP HTTPS connection error: {}", e);
-                                    }
+                                    serve_mcp_conn(io, svc, header_read_timeout, &mut conn_shutdown, "HTTPS").await;
                                 }
                                 None => {
                                     let io = hyper_util::rt::TokioIo::new(stream);
-                                    if let Err(e) = hyper::server::conn::http1::Builder::new()
-                                        .serve_connection(io, svc)
-                                        .with_upgrades()
-                                        .await
-                                    {
-                                        tracing::debug!("MCP HTTP connection error: {}", e);
-                                    }
+                                    serve_mcp_conn(io, svc, header_read_timeout, &mut conn_shutdown, "HTTP").await;
                                 }
                             }
                         });
-                    }
-                    Err(e) => {
-                        tracing::error!("MCP HTTP accept error: {}", e);
-                    }
-                }
             }
-            _ = shutdown_rx.wait_for(|v| *v) => {
+            // Wrapped so the non-Send `watch::Ref` is dropped before the arm
+            // body, keeping the whole `serve_http` future `Send` (it is spawned
+            // by the caller).
+            _ = async { let _ = shutdown_rx.wait_for(|v| *v).await; } => {
                 tracing::info!("MCP HTTP server shutting down");
                 cancel.cancel();
                 break;
