@@ -7,7 +7,7 @@ use context::McpContext as Ctx;
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
-use rmcp::{ServerHandler, ServiceExt, tool, tool_handler, tool_router};
+use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 use rmcp::schemars;
 use serde::Deserialize;
 use serde_json::Value;
@@ -456,20 +456,6 @@ impl SatdMcpServer {
 
 // --- Public API ---
 
-/// Start the MCP server over stdio (stdin/stdout).
-pub async fn serve_stdio(
-    ctx: Arc<McpContext>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let server = SatdMcpServer::new(ctx);
-
-    tracing::info!("MCP stdio server starting");
-    let service = server.serve(rmcp::transport::io::stdio()).await?;
-    service.waiting().await?;
-    tracing::info!("MCP stdio server stopped");
-    Ok(())
-}
-
-/// Start the MCP server over Streamable HTTP (also serves legacy SSE clients).
 fn mcp_now_unix() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -519,17 +505,37 @@ fn mcp_status_response(status: u16, header: Option<(&str, String)>, msg: &'stati
     builder.body(body).expect("static response is valid")
 }
 
-/// Serve MCP over streamable HTTP.
+/// Native-TLS parameters for the MCP HTTP listener.
+///
+/// Built by the caller from `--mcpcert`/`--mcpkey` (server-auth TLS) plus the
+/// optional `--mcpmtls` knobs. When present, every accepted connection is
+/// wrapped in a rustls server session before any HTTP — so bearer tokens never
+/// cross the wire in cleartext. `mtls_enabled` turns on client-cert
+/// verification and the subject allowlist (`allow`).
+pub struct McpTls {
+    pub acceptor: tls_config::TlsAcceptor,
+    pub allow: tls_config::ClientAllowList,
+    pub mtls_enabled: bool,
+    pub handshake_timeout: std::time::Duration,
+}
+
+/// Serve MCP over streamable HTTP (optionally TLS).
 ///
 /// When `auth` is `Some` (operator set `-mcpauth`, which requires `authfile`),
 /// every request must present an `Authorization: Bearer <token>` resolving to a
 /// principal with the `mcp:*` capability; otherwise it is answered with 401.
 /// `auth = None` is the loopback-trust default. The caller is responsible for
 /// refusing a non-loopback bind unless auth is enabled.
+///
+/// When `tls` is `Some`, each connection is wrapped in a rustls server session
+/// (server-auth, plus mTLS when `mtls_enabled`) before HTTP is served. The
+/// caller refuses a non-loopback bind without TLS, so a remote MCP listener
+/// always encrypts the bearer token in transit.
 pub async fn serve_http(
     ctx: Arc<McpContext>,
     bind_addr: std::net::SocketAddr,
     auth: Option<Arc<satd_auth::TokenStore>>,
+    tls: Option<Arc<McpTls>>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use rmcp::transport::streamable_http_server::{
@@ -554,17 +560,18 @@ pub async fn serve_http(
     );
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
-    tracing::info!(%bind_addr, "MCP HTTP server listening");
+    let scheme = if tls.is_some() { "https" } else { "http" };
+    tracing::info!(%bind_addr, scheme, "MCP HTTP server listening");
 
     loop {
         tokio::select! {
             accept = listener.accept() => {
                 match accept {
-                    Ok((stream, _addr)) => {
+                    Ok((stream, addr)) => {
                         let svc = mcp_service.clone();
                         let conn_auth = auth.clone();
+                        let conn_tls = tls.clone();
                         tokio::spawn(async move {
-                            let io = hyper_util::rt::TokioIo::new(stream);
                             let svc = hyper::service::service_fn(move |req| {
                                 let svc = svc.clone();
                                 let conn_auth = conn_auth.clone();
@@ -595,12 +602,71 @@ pub async fn serve_http(
                                     Ok::<_, std::convert::Infallible>(svc.handle(req).await)
                                 }
                             });
-                            if let Err(e) = hyper::server::conn::http1::Builder::new()
-                                .serve_connection(io, svc)
-                                .with_upgrades()
-                                .await
-                            {
-                                tracing::debug!("MCP HTTP connection error: {}", e);
+                            match conn_tls {
+                                Some(tls) => {
+                                    // TLS handshake with a bound timeout so a
+                                    // slowloris client can't pin a connection
+                                    // half-open. On any failure we drop the
+                                    // connection (no HTTP has started yet).
+                                    let tls_stream = match tokio::time::timeout(
+                                        tls.handshake_timeout,
+                                        tls.acceptor.accept(stream),
+                                    )
+                                    .await
+                                    {
+                                        Ok(Ok(s)) => s,
+                                        Ok(Err(e)) => {
+                                            tracing::debug!(peer = %addr, error = %e, "MCP TLS handshake failed");
+                                            return;
+                                        }
+                                        Err(_) => {
+                                            tracing::warn!(
+                                                peer = %addr,
+                                                timeout_secs = tls.handshake_timeout.as_secs(),
+                                                "MCP TLS handshake timed out — closing connection",
+                                            );
+                                            return;
+                                        }
+                                    };
+                                    // mTLS post-handshake: audit the accepted
+                                    // client subject and enforce the allowlist.
+                                    // Only runs when mTLS is enabled — without a
+                                    // client cert there is no subject, and a
+                                    // non-empty allowlist would reject everyone
+                                    // (config-load validation refuses that combo).
+                                    if tls.mtls_enabled {
+                                        let (_, server_conn) = tls_stream.get_ref();
+                                        if let Some(subject) = tls_config::peer_subject_label(server_conn) {
+                                            tracing::info!(peer = %addr, %subject, "MCP mTLS client accepted");
+                                        }
+                                        if let Err(rej) = tls_config::check_peer_allowed(server_conn, &tls.allow) {
+                                            tracing::warn!(
+                                                peer = %addr,
+                                                subject = %rej.subject_label,
+                                                "MCP mTLS client rejected by allowlist",
+                                            );
+                                            return;
+                                        }
+                                    }
+                                    let io = hyper_util::rt::TokioIo::new(tls_stream);
+                                    if let Err(e) = hyper::server::conn::http1::Builder::new()
+                                        .serve_connection(io, svc)
+                                        .with_upgrades()
+                                        .await
+                                    {
+                                        tracing::debug!("MCP HTTPS connection error: {}", e);
+                                    }
+                                }
+                                None => {
+                                    let io = hyper_util::rt::TokioIo::new(stream);
+                                    if let Err(e) = hyper::server::conn::http1::Builder::new()
+                                        .serve_connection(io, svc)
+                                        .with_upgrades()
+                                        .await
+                                    {
+                                        tracing::debug!("MCP HTTP connection error: {}", e);
+                                    }
+                                }
                             }
                         });
                     }

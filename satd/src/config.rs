@@ -854,9 +854,25 @@ pub struct Config {
     pub shadow_workers: usize,
     // MCP server
     pub mcp: bool,
-    pub mcp_stdio: bool,
     pub mcp_port: Option<u16>,
     pub mcp_bind: String,
+    /// Path to PEM-encoded TLS certificate for the MCP HTTP server. When set
+    /// (with `mcp_tls_key`), the MCP listener serves HTTPS. Required for any
+    /// non-loopback bind so bearer tokens never cross the wire in cleartext.
+    pub mcp_tls_cert: Option<std::path::PathBuf>,
+    /// Path to PEM-encoded TLS private key for the MCP HTTP server.
+    pub mcp_tls_key: Option<std::path::PathBuf>,
+    /// Require mutual TLS on the MCP listener. When `true`, `mcp_tls_cert` /
+    /// `mcp_tls_key` and `mcp_mtls_client_ca` MUST be set; clients without a
+    /// cert validly signed by the CA are refused. Strictly additive — the
+    /// `mcp_auth` bearer layer still runs on top.
+    pub mcp_mtls: bool,
+    /// PEM CA bundle used to verify client certificates when `mcp_mtls = true`.
+    pub mcp_mtls_client_ca: Option<std::path::PathBuf>,
+    /// Optional allowlist of accepted client-cert subject identities (CN /
+    /// DNS-SAN, case-insensitive). Empty means "any CA-signed cert"; non-empty
+    /// narrows further.
+    pub mcp_mtls_client_allow: Vec<String>,
     /// Require bearer tokens (`mcp:*`) on the MCP HTTP server. Requires
     /// `authfile`. Default false (loopback-trust). Also the precondition for a
     /// non-loopback MCP bind.
@@ -2026,6 +2042,62 @@ impl Config {
                     .to_string(),
             );
         }
+        // MCP native TLS. The MCP listener serves HTTPS when both cert and key
+        // are set; mTLS layers client-cert verification on top. Same partial-
+        // config / allowlist validation shape as the Esplora / Electrum / RPC
+        // surfaces.
+        let mcp_tls_cert = cli
+            .mcpcert
+            .or_else(|| file_get("mcpcert").map(std::path::PathBuf::from));
+        let mcp_tls_key = cli
+            .mcpkey
+            .or_else(|| file_get("mcpkey").map(std::path::PathBuf::from));
+        let mcp_mtls = cli
+            .mcpmtls
+            .or_else(|| file_get("mcpmtls").and_then(|v| parse_bool(&v)))
+            .unwrap_or(false);
+        let mcp_mtls_client_ca = cli
+            .mcpmtlsclientca
+            .or_else(|| file_get("mcpmtlsclientca").map(std::path::PathBuf::from));
+        let mcp_mtls_client_allow: Vec<String> = {
+            let mut values: Vec<String> = cli.mcpmtlsclientallow.clone();
+            if values.is_empty() {
+                values = file_get_all("mcpmtlsclientallow");
+            }
+            values
+                .into_iter()
+                .flat_map(|v| {
+                    v.split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        };
+        if mcp_tls_cert.is_some() != mcp_tls_key.is_some() {
+            return Err("--mcpcert and --mcpkey must be set together".to_string());
+        }
+        if mcp_mtls && mcp_tls_cert.is_none() {
+            return Err("--mcpmtls=1 requires --mcpcert and --mcpkey".to_string());
+        }
+        if mcp_mtls && mcp_mtls_client_ca.is_none() {
+            return Err("--mcpmtls=1 requires --mcpmtlsclientca".to_string());
+        }
+        if !mcp_mtls && !mcp_mtls_client_allow.is_empty() {
+            return Err("--mcpmtlsclientallow requires --mcpmtls=1".to_string());
+        }
+        // A remote MCP bind must be encrypted: bearer tokens cross the wire, so
+        // TLS is mandatory whenever the listener is reachable off-host. This is
+        // enforced here (`mcpallowremote`) and again in main.rs against the
+        // resolved bind IP, so a non-loopback `mcpbind` without TLS is refused
+        // even if `mcpallowremote` is unset.
+        if mcp_allow_remote && mcp_tls_cert.is_none() {
+            return Err(
+                "--mcpallowremote requires --mcpcert and --mcpkey (a remote MCP listener must \
+                 use TLS so the bearer token is never sent in cleartext)"
+                    .to_string(),
+            );
+        }
         let esplora_tls_bind = cli.esploratlsbind.or_else(|| file_get("esploratlsbind"));
         let esplora_tls_cert = cli
             .esploratlscert
@@ -2587,10 +2659,6 @@ impl Config {
             mcp: cli.mcp.unwrap_or_else(|| {
                 file_get("mcp").and_then(|v| parse_bool(&v)).unwrap_or(false)
             }),
-            mcp_stdio: cli
-                .mcpstdio
-                .or_else(|| file_get("mcpstdio").and_then(|v| parse_bool(&v)))
-                .unwrap_or(true), // default: enabled when --mcp is set
             mcp_port: cli
                 .mcpport
                 .or_else(|| file_get("mcpport").and_then(|v| v.parse().ok())),
@@ -2600,6 +2668,11 @@ impl Config {
                 .unwrap_or_else(|| "127.0.0.1".to_string()),
             mcp_auth,
             mcp_allow_remote,
+            mcp_tls_cert,
+            mcp_tls_key,
+            mcp_mtls,
+            mcp_mtls_client_ca,
+            mcp_mtls_client_allow,
             dbcache: {
                 // Pre-compute static-partition size: the initial budget that
                 // the coin/rocksdb partition is built from. For Auto we use
@@ -4217,16 +4290,6 @@ pub struct CliArgs {
 
     #[arg(
         long,
-        value_name = "BOOL",
-        value_parser = parse_bool_arg,
-        num_args = 0..=1,
-        default_missing_value = "1",
-        help = "Enable MCP stdio transport (default: true when --mcp)"
-    )]
-    pub mcpstdio: Option<bool>,
-
-    #[arg(
-        long,
         value_name = "PORT",
         help = "Enable MCP HTTP transport on this port"
     )]
@@ -4238,6 +4301,44 @@ pub struct CliArgs {
         help = "MCP HTTP bind address (default: 127.0.0.1)"
     )]
     pub mcpbind: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Path to PEM-encoded TLS certificate for the MCP HTTP server (enables HTTPS; requires --mcpkey)"
+    )]
+    pub mcpcert: Option<std::path::PathBuf>,
+
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Path to PEM-encoded TLS private key for the MCP HTTP server (requires --mcpcert)"
+    )]
+    pub mcpkey: Option<std::path::PathBuf>,
+
+    #[arg(
+        long,
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
+        help = "Require mutual TLS on the MCP listener (default: false). Requires --mcpcert/--mcpkey and --mcpmtlsclientca."
+    )]
+    pub mcpmtls: Option<bool>,
+
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Path to PEM CA bundle used to verify client certificates when --mcpmtls=1"
+    )]
+    pub mcpmtlsclientca: Option<std::path::PathBuf>,
+
+    #[arg(
+        long,
+        value_name = "NAME",
+        help = "Allowlist of accepted client-cert CN / DNS-SAN values (repeatable, comma-separated). Empty = any cert validly signed by the CA."
+    )]
+    pub mcpmtlsclientallow: Vec<String>,
 
     /// Require bearer tokens (mcp:*) on the MCP HTTP server.
     #[arg(
@@ -4739,9 +4840,13 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "blockmintxfee",
         "pid",
         "mcp",
-        "mcpstdio",
         "mcpport",
         "mcpbind",
+        "mcpcert",
+        "mcpkey",
+        "mcpmtls",
+        "mcpmtlsclientca",
+        "mcpmtlsclientallow",
         "mcpauth",
         "mcpallowremote",
         "metricsport",
@@ -4808,7 +4913,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "reindex-chainstate",
         "checkblockindex",
         "mcp",
-        "mcpstdio",
+        "mcpmtls",
         "mcpauth",
         "mcpallowremote",
         "server",
@@ -5251,9 +5356,13 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "reorgwebhooksecret",
     // MCP
     "mcp",
-    "mcpstdio",
     "mcpport",
     "mcpbind",
+    "mcpcert",
+    "mcpkey",
+    "mcpmtls",
+    "mcpmtlsclientca",
+    "mcpmtlsclientallow",
     "mcpauth",
     "mcpallowremote",
     // Metrics / health
@@ -6131,9 +6240,13 @@ rpcport=8332
             listenonion: None,
             onlynet: vec![],
             mcp: Some(false),
-            mcpstdio: None,
             mcpport: None,
             mcpbind: None,
+            mcpcert: None,
+            mcpkey: None,
+            mcpmtls: None,
+            mcpmtlsclientca: None,
+            mcpmtlsclientallow: Vec::new(),
             mcpauth: None,
             mcpallowremote: None,
             metricsport: None,
@@ -6377,9 +6490,13 @@ rpcport=8332
             listenonion: None,
             onlynet: vec![],
             mcp: Some(false),
-            mcpstdio: None,
             mcpport: None,
             mcpbind: None,
+            mcpcert: None,
+            mcpkey: None,
+            mcpmtls: None,
+            mcpmtlsclientca: None,
+            mcpmtlsclientallow: Vec::new(),
             mcpauth: None,
             mcpallowremote: None,
             metricsport: None,
@@ -7331,6 +7448,8 @@ rpcport=8332
 
     #[test]
     fn mcp_remote_auth_chain_is_accepted() {
+        // A remote MCP bind needs auth AND TLS: bearer tokens must never cross
+        // the wire in cleartext.
         let cli = CliArgs::try_parse_from([
             "satd",
             "--regtest",
@@ -7338,10 +7457,61 @@ rpcport=8332
             "--authfile=/etc/satd/auth.toml",
             "--mcpauth=1",
             "--mcpallowremote=1",
+            "--mcpcert=/etc/satd/mcp.crt",
+            "--mcpkey=/etc/satd/mcp.key",
         ])
         .unwrap();
         let cfg = Config::from_cli(cli).unwrap();
         assert!(cfg.mcp_auth && cfg.mcp_allow_remote);
+        assert!(cfg.mcp_tls_cert.is_some() && cfg.mcp_tls_key.is_some());
+    }
+
+    #[test]
+    fn mcp_allow_remote_requires_tls() {
+        // Without --mcpcert/--mcpkey the remote bind is refused even with auth.
+        let err = Config::from_cli(
+            CliArgs::try_parse_from([
+                "satd",
+                "--regtest",
+                "--datadir=/tmp/satd-mcp-notls",
+                "--authfile=/etc/satd/auth.toml",
+                "--mcpauth=1",
+                "--mcpallowremote=1",
+            ])
+            .unwrap(),
+        )
+        .unwrap_err();
+        assert!(err.contains("--mcpcert"), "got: {err}");
+    }
+
+    #[test]
+    fn mcp_cert_and_key_must_pair() {
+        let err = Config::from_cli(
+            CliArgs::try_parse_from([
+                "satd",
+                "--regtest",
+                "--datadir=/tmp/satd-mcp-halftls",
+                "--mcpcert=/etc/satd/mcp.crt",
+            ])
+            .unwrap(),
+        )
+        .unwrap_err();
+        assert!(err.contains("must be set together"), "got: {err}");
+    }
+
+    #[test]
+    fn mcp_mtls_requires_cert_and_ca() {
+        let err = Config::from_cli(
+            CliArgs::try_parse_from([
+                "satd",
+                "--regtest",
+                "--datadir=/tmp/satd-mcp-mtls",
+                "--mcpmtls=1",
+            ])
+            .unwrap(),
+        )
+        .unwrap_err();
+        assert!(err.contains("--mcpmtls=1 requires --mcpcert"), "got: {err}");
     }
 
     #[test]

@@ -92,18 +92,6 @@ async fn main() {
         use tracing_subscriber::layer::SubscriberExt;
         use tracing_subscriber::util::SubscriberInitExt;
         let registry = tracing_subscriber::registry().with(filter_layer);
-        // The stdio MCP transport speaks the protocol over stdout, so logs must
-        // not share it — route them to stderr whenever stdio MCP is active, the
-        // standard convention for stdio MCP servers. Otherwise keep the default
-        // stdout sink.
-        use tracing_subscriber::fmt::writer::BoxMakeWriter;
-        let log_writer = || {
-            if config.mcp && config.mcp_stdio {
-                BoxMakeWriter::new(std::io::stderr)
-            } else {
-                BoxMakeWriter::new(std::io::stdout)
-            }
-        };
         match config.log_format {
             config::LogFormat::Json => {
                 // Stable JSON shape: `timestamp`, `level`, `target`,
@@ -113,14 +101,13 @@ async fn main() {
                         tracing_subscriber::fmt::layer()
                             .json()
                             .with_current_span(true)
-                            .with_span_list(false)
-                            .with_writer(log_writer()),
+                            .with_span_list(false),
                     )
                     .init();
             }
             config::LogFormat::Text => {
                 registry
-                    .with(tracing_subscriber::fmt::layer().with_writer(log_writer()))
+                    .with(tracing_subscriber::fmt::layer())
                     .init();
             }
         }
@@ -1770,26 +1757,11 @@ async fn main() {
             mempool_history: mempool_history.clone(),
         });
 
-        if config.mcp_stdio {
-            let ctx = mcp_ctx.clone();
-            // MCP stays on the consensus (core) runtime: it exposes a
-            // block-connecting `generate_blocks` tool, so — like JSON-RPC —
-            // it must not originate block connection from the API runtime.
-            // (It is also loopback-only today, so it carries no public load
-            // that would need isolating.) Revisit when the read-only split
-            // lands.
-            tokio::spawn(async move {
-                if let Err(e) = satd_mcp::serve_stdio(ctx).await {
-                    tracing::error!("MCP stdio server error: {}", e);
-                }
-            });
-            tracing::info!("MCP stdio server started");
-        }
-
         if let Some(mcp_port) = config.mcp_port {
             let mcp_bind: SocketAddr = format!("{}:{}", config.mcp_bind, mcp_port)
                 .parse()
                 .expect("Invalid MCP bind address");
+            let tls_configured = config.mcp_tls_cert.is_some() && config.mcp_tls_key.is_some();
             // Safety guard: MCP exposes block-connecting tools. A non-loopback
             // bind is refused unless the operator opted into authenticated
             // remote exposure (`-mcpallowremote`, which requires `-mcpauth` +
@@ -1803,6 +1775,52 @@ async fn main() {
                 );
                 std::process::exit(1);
             }
+            // A remote MCP listener must use TLS so the bearer token is never
+            // sent in cleartext. Config-load validation already enforces this
+            // when `mcpallowremote` is set, but re-check against the resolved
+            // bind IP so a non-loopback `mcpbind` is covered even if the
+            // operator reached it some other way.
+            if !mcp_bind.ip().is_loopback() && !tls_configured {
+                eprintln!(
+                    "Error: MCP HTTP bind {mcp_bind} is non-loopback but no TLS is configured. \
+                     A remote MCP listener must use TLS so the bearer token is not sent in \
+                     cleartext; set --mcpcert and --mcpkey, or bind to loopback."
+                );
+                std::process::exit(1);
+            }
+            // Build the rustls acceptor when cert+key are present. mTLS adds
+            // client-cert verification + the subject allowlist on top.
+            let mcp_tls = if tls_configured {
+                let cert = config.mcp_tls_cert.clone().expect("cert present");
+                let key = config.mcp_tls_key.clone().expect("key present");
+                let policy = match (config.mcp_mtls, config.mcp_mtls_client_ca.as_ref()) {
+                    (true, Some(ca)) => tls_config::ClientAuthPolicy::Required {
+                        ca_path: ca.clone(),
+                    },
+                    (true, None) => {
+                        eprintln!("Error: --mcpmtls=1 requires --mcpmtlsclientca");
+                        std::process::exit(1);
+                    }
+                    (false, _) => tls_config::ClientAuthPolicy::Disabled,
+                };
+                let acceptor = match tls_config::build_acceptor(&cert, &key, &policy) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        eprintln!("Error: failed to build MCP TLS acceptor: {e}");
+                        std::process::exit(1);
+                    }
+                };
+                let allow =
+                    tls_config::ClientAllowList::new(config.mcp_mtls_client_allow.iter().cloned());
+                Some(std::sync::Arc::new(satd_mcp::McpTls {
+                    acceptor,
+                    allow,
+                    mtls_enabled: config.mcp_mtls,
+                    handshake_timeout: std::time::Duration::from_secs(10),
+                }))
+            } else {
+                None
+            };
             let mcp_auth = if config.mcp_auth {
                 token_store.clone()
             } else {
@@ -1810,10 +1828,11 @@ async fn main() {
             };
             let ctx = mcp_ctx.clone();
             let rx = shutdown_rx.clone();
-            // MCP HTTP stays on the consensus runtime for the same reason
-            // as the stdio transport above (block-connecting tool).
+            // MCP HTTP stays on the consensus runtime: it exposes a
+            // block-connecting `generate_blocks` tool, so — like JSON-RPC — it
+            // must not originate block connection from the API runtime.
             tokio::spawn(async move {
-                if let Err(e) = satd_mcp::serve_http(ctx, mcp_bind, mcp_auth, rx).await {
+                if let Err(e) = satd_mcp::serve_http(ctx, mcp_bind, mcp_auth, mcp_tls, rx).await {
                     tracing::error!("MCP HTTP server error: {}", e);
                 }
             });

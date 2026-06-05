@@ -7,33 +7,57 @@ inspect chain/mempool/peer state, estimate fees, decode and build transactions,
 and run operator actions through a structured, typed tool interface instead of
 raw JSON-RPC.
 
-It is **off by default** — enable it with `--mcp`.
+It is **off by default** — enable it with `--mcp` plus `--mcpport`.
 
-## Transports
+## Transport
 
-| Transport | Enable | Bind / default | Notes |
-|---|---|---|---|
-| **stdio** | `--mcpstdio` (on by default when `--mcp` is set) | stdin/stdout | Local process only; no network auth. |
-| **Streamable HTTP** (+ legacy SSE) | set `--mcpport` | `--mcpbind`, default `127.0.0.1` | Network transport; gated by auth for remote use. |
+MCP is served over a single **Streamable HTTP** listener (which also serves
+legacy SSE clients). There is no stdio transport: the MCP server is part of the
+running `satd` process, so clients attach to an already-running daemon over the
+network rather than launching their own node.
 
-Both transports run on satd's **core (consensus) tokio runtime**, not the
-isolated API runtime — deliberately, because MCP exposes block-connecting and
-broadcast tools (see *Posture* below).
+| Setting | Default | Notes |
+|---|---|---|
+| `--mcpport` | *(off)* | Port to serve MCP on; enables the listener. |
+| `--mcpbind` | `127.0.0.1` | Bind address. Non-loopback requires auth **and** TLS. |
+| `--mcpcert` / `--mcpkey` | *(none)* | PEM cert/key — enables **HTTPS**. Required for any non-loopback bind. |
+| `--mcpmtls` | `false` | Require client certs (mTLS). Needs `--mcpcert`/`--mcpkey` + `--mcpmtlsclientca`. |
+| `--mcpmtlsclientca` | *(none)* | PEM CA bundle that client certs must chain to. |
+| `--mcpmtlsclientallow` | *(any)* | Optional allowlist of client-cert CN / DNS-SAN values. |
+
+The listener runs on satd's **core (consensus) tokio runtime**, not the isolated
+API runtime — deliberately, because MCP exposes block-connecting and broadcast
+tools (see *Posture* below).
+
+## Transport security (TLS)
+
+The MCP listener is plaintext HTTP only when bound to loopback. Set `--mcpcert`
+and `--mcpkey` to serve **HTTPS** instead — this is **mandatory for any
+non-loopback bind**, so a bearer token is never sent in cleartext over the
+network. satd refuses to start a routable MCP listener without TLS.
+
+TLS uses the same `tls_config` layer as the RPC / Esplora / Electrum surfaces
+(hot-reloadable on `SIGUSR1`). For mutual TLS, add `--mcpmtls --mcpmtlsclientca
+<ca.pem>`; clients without a cert that chains to the CA are rejected at the
+handshake. Narrow further with `--mcpmtlsclientallow <CN>` (repeatable /
+comma-separated). mTLS is **additive** — the `--mcpauth` bearer layer still runs
+on top.
 
 ## Authentication
 
 MCP uses the [unified auth system](authentication.md):
 
-- **Loopback default** — with `--mcpauth` off, the HTTP server performs no
-  per-request auth check (loopback-trust). stdio is always local/unauthenticated.
+- **Loopback default** — with `--mcpauth` off, the server performs no per-request
+  auth check (loopback-trust). Only valid for a loopback bind.
 - **Bearer** — `--mcpauth` (which requires `--authfile`) requires
   `Authorization: Bearer <token>` resolving to a principal that holds the
   **`mcp:*`** capability; otherwise the server returns `401` with
   `WWW-Authenticate: Bearer`, and applies the token's rate limit (`429` +
   `Retry-After` on throttle).
 - **Remote exposure is gated** — a non-loopback `--mcpbind` requires
-  `--mcpallowremote`, which requires `--mcpauth`, which requires `--authfile`.
-  satd refuses to start a routable MCP listener that isn't authenticated.
+  `--mcpallowremote` (→ `--mcpauth` → `--authfile`) **and** TLS
+  (`--mcpcert`/`--mcpkey`). satd refuses to start a routable MCP listener that
+  isn't both authenticated and encrypted.
 
 MCP is gated by the **single** `mcp:*` capability — there is no read-only-vs-
 mutating split inside MCP, so any token with `mcp:*` can call **every** tool.
@@ -43,19 +67,15 @@ mutating split inside MCP, so any token with `mcp:*` can call **every** tool.
 Unlike a pure query API, MCP exposes **state-changing** tools — `send_transaction`
 (broadcasts to the network), `generate_blocks` (mines/connects blocks; regtest),
 and `manage_peer` (disconnect/ban/unban/add), plus transaction
-construction/signing. Treat an `mcp:*` token as a privileged credential, keep the
-HTTP transport loopback-bound unless you've deliberately authenticated it, and
-prefer stdio for a co-located agent.
+construction/signing. Treat an `mcp:*` token as a privileged credential, and keep
+the listener loopback-bound unless you've deliberately put auth **and** TLS in
+front of it.
 
 ## Connecting a client
 
-Most tools attach to an **already-running daemon** — that's what the
-**Streamable HTTP** transport is for: enable it on the node, then point the
-client at the URL. The **stdio** transport instead launches its own dedicated
-node (which holds the datadir lock), so it suits a co-located agent that owns
-its node rather than attaching to a shared one.
+Enable the listener on the node, then point the client at the URL.
 
-### Enable the HTTP transport
+### Enable the listener
 
 In `bitcoin.conf`:
 
@@ -71,11 +91,19 @@ or on the command line:
 satd --datadir=/path/to/node --mcp --mcpport=18888
 ```
 
-The server is then reachable at `http://127.0.0.1:18888/`. For remote or
-authenticated use add `--mcpauth` (requires `--authfile`; issue a token that
-holds the `mcp:*` capability) and, for a non-loopback bind,
-`--mcpallowremote --mcpbind=0.0.0.0`. Clients authenticate with an
-`Authorization: Bearer <token>` header. See [Authentication](#authentication).
+The server is then reachable at `http://127.0.0.1:18888/`. For remote use, add
+TLS and auth — issue a token that holds the `mcp:*` capability:
+
+```sh
+satd --datadir=/path/to/node --mcp --mcpport=18888 \
+  --mcpbind=0.0.0.0 --mcpallowremote \
+  --mcpauth --authfile=/etc/satd/auth.toml \
+  --mcpcert=/etc/satd/mcp.crt --mcpkey=/etc/satd/mcp.key
+```
+
+The server is then reachable at `https://NODE_HOST:18888/`. Clients
+authenticate with an `Authorization: Bearer <token>` header. See
+[Authentication](#authentication) and [Transport security](#transport-security-tls).
 
 ### Claude Code
 
@@ -83,8 +111,8 @@ holds the `mcp:*` capability) and, for a non-loopback bind,
 # Loopback daemon, no auth:
 claude mcp add --transport http satd http://127.0.0.1:18888/
 
-# Authenticated (or remote) daemon — pass the bearer token as a header:
-claude mcp add --transport http satd http://NODE_HOST:18888/ \
+# Authenticated, TLS daemon — pass the bearer token as a header:
+claude mcp add --transport http satd https://NODE_HOST:18888/ \
   --header "Authorization: Bearer YOUR_TOKEN"
 ```
 
@@ -97,7 +125,7 @@ The equivalent `.mcp.json` entry:
   "mcpServers": {
     "satd": {
       "type": "http",
-      "url": "http://127.0.0.1:18888/",
+      "url": "https://NODE_HOST:18888/",
       "headers": { "Authorization": "Bearer YOUR_TOKEN" }
     }
   }
@@ -110,34 +138,14 @@ Add to `~/.codex/config.toml` (or `.codex/config.toml` in a trusted project):
 
 ```toml
 [mcp_servers.satd]
-url = "http://127.0.0.1:18888/"
+url = "https://NODE_HOST:18888/"
 # Authenticated daemon — supply the bearer token:
 http_headers = { Authorization = "Bearer YOUR_TOKEN" }
 ```
 
-### stdio transport
-
-For a dedicated, co-located node driven by a single agent, use stdio: the
-client launches `satd` itself. In stdio mode satd routes its logs to **stderr**
-so they don't corrupt the protocol stream on stdout.
-
-Claude Code:
-
-```sh
-claude mcp add --transport stdio satd -- \
-  satd --mcp --mcpstdio --datadir=/path/to/node
-```
-
-Codex (`~/.codex/config.toml`):
-
-```toml
-[mcp_servers.satd]
-command = "satd"
-args = ["--mcp", "--mcpstdio", "--datadir=/path/to/node"]
-```
-
-Because this `satd` process is a full node, its datadir must not be in use by
-another instance.
+> If you terminate TLS with a self-signed cert, configure the client to trust it
+> (or front satd with a reverse proxy holding a CA-issued cert). mTLS clients
+> additionally present their own cert/key per their MCP-client documentation.
 
 ## Tools
 
