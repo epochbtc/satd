@@ -47,6 +47,98 @@ construction/signing. Treat an `mcp:*` token as a privileged credential, keep th
 HTTP transport loopback-bound unless you've deliberately authenticated it, and
 prefer stdio for a co-located agent.
 
+## Connecting a client
+
+Most tools attach to an **already-running daemon** — that's what the
+**Streamable HTTP** transport is for: enable it on the node, then point the
+client at the URL. The **stdio** transport instead launches its own dedicated
+node (which holds the datadir lock), so it suits a co-located agent that owns
+its node rather than attaching to a shared one.
+
+### Enable the HTTP transport
+
+In `bitcoin.conf`:
+
+```ini
+mcp=1
+mcpport=18888
+# mcpbind=127.0.0.1   # default: loopback only
+```
+
+or on the command line:
+
+```sh
+satd --datadir=/path/to/node --mcp --mcpport=18888
+```
+
+The server is then reachable at `http://127.0.0.1:18888/`. For remote or
+authenticated use add `--mcpauth` (requires `--authfile`; issue a token that
+holds the `mcp:*` capability) and, for a non-loopback bind,
+`--mcpallowremote --mcpbind=0.0.0.0`. Clients authenticate with an
+`Authorization: Bearer <token>` header. See [Authentication](#authentication).
+
+### Claude Code
+
+```sh
+# Loopback daemon, no auth:
+claude mcp add --transport http satd http://127.0.0.1:18888/
+
+# Authenticated (or remote) daemon — pass the bearer token as a header:
+claude mcp add --transport http satd http://NODE_HOST:18888/ \
+  --header "Authorization: Bearer YOUR_TOKEN"
+```
+
+Append `--scope project` to write a shared, committable `.mcp.json` instead of
+your personal config; inspect with `claude mcp list` and the in-session `/mcp`.
+The equivalent `.mcp.json` entry:
+
+```json
+{
+  "mcpServers": {
+    "satd": {
+      "type": "http",
+      "url": "http://127.0.0.1:18888/",
+      "headers": { "Authorization": "Bearer YOUR_TOKEN" }
+    }
+  }
+}
+```
+
+### Codex CLI
+
+Add to `~/.codex/config.toml` (or `.codex/config.toml` in a trusted project):
+
+```toml
+[mcp_servers.satd]
+url = "http://127.0.0.1:18888/"
+# Authenticated daemon — supply the bearer token:
+http_headers = { Authorization = "Bearer YOUR_TOKEN" }
+```
+
+### stdio transport
+
+For a dedicated, co-located node driven by a single agent, use stdio: the
+client launches `satd` itself. In stdio mode satd routes its logs to **stderr**
+so they don't corrupt the protocol stream on stdout.
+
+Claude Code:
+
+```sh
+claude mcp add --transport stdio satd -- \
+  satd --mcp --mcpstdio --datadir=/path/to/node
+```
+
+Codex (`~/.codex/config.toml`):
+
+```toml
+[mcp_servers.satd]
+command = "satd"
+args = ["--mcp", "--mcpstdio", "--datadir=/path/to/node"]
+```
+
+Because this `satd` process is a full node, its datadir must not be in use by
+another instance.
+
 ## Tools
 
 The server registers the following tools (each returns a text result).
