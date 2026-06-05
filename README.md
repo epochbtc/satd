@@ -1,10 +1,35 @@
-# satd
+<div align="center">
 
-**A Bitcoin Core-compatible full node in Rust.**
+<img src="docs/assets/logo.png" alt="satd" width="160" />
 
-`satd` provides the core node, plus the wallet-server protocols operators usually wire up alongside it (Esplora REST, Electrum, BIP 157/158). 
+<h1>satd</h1>
 
-*One process. One RocksDB. One systemd unit.*
+<p><strong>A Bitcoin Core-compatible full node in Rust.</strong></p>
+
+<p><em>One process. One RocksDB. One systemd unit.</em></p>
+
+<p>
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue.svg" /></a>
+  <a href="https://github.com/epochbtc/satd/releases"><img alt="Latest release" src="https://img.shields.io/github/v/release/epochbtc/satd?sort=semver&color=brightgreen" /></a>
+  <a href="https://github.com/epochbtc/satd/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/epochbtc/satd/actions/workflows/ci.yml/badge.svg?branch=master" /></a>
+  <a href="https://www.rust-lang.org"><img alt="Rust edition 2024" src="https://img.shields.io/badge/rust-edition%202024-orange?logo=rust&logoColor=white" /></a>
+  <a href="https://epochbtc.github.io/satd/"><img alt="Operator Manual" src="https://img.shields.io/badge/docs-Operator%20Manual-8A2BE2" /></a>
+</p>
+
+<p>
+  <a href="https://epochbtc.github.io/satd/"><b>Operator Manual</b></a> &nbsp;·&nbsp;
+  <a href="MANIFESTO.md">Manifesto</a> &nbsp;·&nbsp;
+  <a href="CORE_DIFFERENCES.md">Core Differences</a> &nbsp;·&nbsp;
+  <a href="ROADMAP.md">Roadmap</a> &nbsp;·&nbsp;
+  <a href="CHANGELOG.md">Changelog</a> &nbsp;·&nbsp;
+  <a href="#getting-started">Getting Started</a>
+</p>
+
+</div>
+
+<p align="center">
+<code>satd</code> provides the core node, plus the wallet-server protocols operators usually wire up alongside it (Esplora REST, Electrum, BIP&nbsp;157/158).
+</p>
 
 ---
 
@@ -48,7 +73,7 @@
 *   **Events Bus:** gRPC + ZMQ publishers for chain and mempool events (`satd-events`).
 *   **Reorg Logging:** Persistent reorg log with an optional webhook.
 
-*(See [CORE_DIFFERENCES.md](CORE_DIFFERENCES.md) for a full catalog of intentional deviations and features explicitly out of scope, such as the legacy wallet).*
+*(See [`CORE_DIFFERENCES.md`](CORE_DIFFERENCES.md) for a full catalog of intentional deviations and features explicitly out of scope, such as the legacy wallet).*
 
 ---
 
@@ -100,7 +125,7 @@ cargo run --bin sat-cli -- --regtest stop
 
 ## Configuration
 
-Bitcoin Core-compatible flags (`-regtest`, `-datadir`, `-rpcport`, `-prune`, `-txindex`, `-assumevalid`, `-includeconf`, …) and the `bitcoin.conf` file format are accepted as the default surface. Core's CLI/config compatibility surface is now complete — every recognized `bitcoin.conf` key is either honored or recognize-rejected with a clear message (no silent accept-and-ignore). 
+Bitcoin Core-compatible flags (`-regtest`, `-datadir`, `-rpcport`, `-prune`, `-txindex`, `-assumevalid`, `-includeconf`, …) and the `bitcoin.conf` file format are accepted as the default surface. Core's CLI/config compatibility surface is now complete — every recognized `bitcoin.conf` key is either honored or recognize-rejected with a clear message (no silent accept-and-ignore).
 
 Bundled `--profile=<preset>` selects from `archival`, `pruned-home`, `mining`, `regtest-dev`, and `signet-watchtower`. CLI flags override profile values; `getconfig` / `sat-cli node config` shows the effective post-merge configuration.
 
@@ -130,15 +155,17 @@ docs/                         API + integration docs
 
 ## Documentation
 
-| File | Purpose |
+| Resource | Purpose |
 |---|---|
-| [`MANIFESTO.md`](MANIFESTO.md) | Node Sovereignty, the monoculture risk, and the conservative BIP policy. |
 | [**Operator Manual**](https://epochbtc.github.io/satd/) | mdbook reference for operators, integrators, and packagers: observability, configuration & live reload, the full config-flag reference, integrator APIs, the `sat-tui`, the Esplora REST and streaming APIs, the native protocol-surface architecture, and packaging. Source under [`docs/manual/`](docs/manual/). |
-| `CORE_DIFFERENCES.md` | Catalog of intentional deviations from Bitcoin Core: native surfaces, exclusions, and behavioral defaults. |
-| `STABILITY_POLICY.md` | Tiered stability contract; deprecation policy; canary CI. |
+| [`MANIFESTO.md`](MANIFESTO.md) | Node Sovereignty, the monoculture risk, and the conservative BIP policy. |
+| [`CORE_DIFFERENCES.md`](CORE_DIFFERENCES.md) | Catalog of intentional deviations from Bitcoin Core: native surfaces, exclusions, and behavioral defaults. |
+| [`STABILITY_POLICY.md`](STABILITY_POLICY.md) | Tiered stability contract; deprecation policy; canary CI. |
 | [`ROADMAP.md`](ROADMAP.md) | Upcoming operator features and the ecosystem / mobile-integration strategy (unshipped, tagged by likelihood). |
-| `docs/api/streaming.md` | Streaming Consumption API — authoritative wire-level protocol spec. |
-| `docs/E2E_TESTING.md` | End-to-end suite: how to run, timeout knobs, flake-gate workflow. |
+| [`docs/api/streaming.md`](docs/api/streaming.md) | Streaming Consumption API — authoritative wire-level protocol spec. |
+| [`docs/E2E_TESTING.md`](docs/E2E_TESTING.md) | End-to-end suite: how to run, timeout knobs, flake-gate workflow. |
+| [`SECURITY.md`](SECURITY.md) | Supported versions and how to report a vulnerability. |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | Branch/PR workflow, CI gates, and review expectations. |
 
 ## License
 
