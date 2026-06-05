@@ -54,7 +54,7 @@
 *   **Electrum Protocol:** Native TCP server (v1.4.5) for wallets like BlueWallet, Sparrow, and Nunchuk.
 *   **Esplora REST:** Wire-shape parity with blockstream.info / mempool.space for the implemented endpoint set.
 *   **Verified Compatibility:** API surfaces rigorously tested with real client canaries in CI to ensure compatibility.
-*   **Streaming Consumption API:** A new [`streaming consumption API`](docs/api/streaming.md) for real-time access to chain and mempool events, with privacy-preserving options.
+*   **Streaming Consumption API:** A novel [`streaming consumption API`](docs/api/streaming.md) for real-time access to chain and mempool events, with privacy-preserving options.
 *   **AI-Native MCP Server:** An optional Model Context Protocol (`mcp`) listener that exposes node data and operational surfaces directly to AI agents.
 *   **Compact Block Filters:** Native BIP 157/158 index and P2P service for embedded-Neutrino mobile wallets (Zeus, Blixt, Mutiny).
 *   **Shared Indexing:** Address-history index atomic with `connect_block`. One database powers everything.
