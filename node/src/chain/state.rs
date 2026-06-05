@@ -1620,10 +1620,19 @@ impl ChainState {
         // getheaders locator legitimately need them); the block stays reachable
         // by hash + `best_header` regardless, so the fork-aware competing-chain
         // pull (#315) is unaffected.
-        if new_height > self.tip_height() {
-            batch.height_hash_puts.push((new_height, hash));
+        //
+        // The above-tip test and the write must be ATOMIC w.r.t. block
+        // connection: `accept_block` (submitblock / internal mine, on an RPC
+        // thread) advances the tip under `accept_lock`, so without holding it
+        // here a height that was above-tip at the test could be at-tip by the
+        // write and still clobber. Take the lock across the test+commit.
+        {
+            let _accept_guard = self.accept_lock.lock();
+            if new_height > self.tip_height() {
+                batch.height_hash_puts.push((new_height, hash));
+            }
+            self.store.write_batch(batch)?;
         }
-        self.store.write_batch(batch)?;
 
         // Track highest header for locator construction
         self.headers_tip_height.fetch_max(new_height, Ordering::Relaxed);
@@ -1729,16 +1738,13 @@ impl ChainState {
             };
 
             batch.block_index_puts.push((hash, entry));
-            // Only write the height index strictly above the active tip, so a
-            // sub-tip fork header cannot clobber the active chain — see
-            // `accept_header`. Re-read the tip each iteration: header acceptance
-            // holds no lock against a concurrent RPC `submitblock`/`generate`
-            // (which connect via `accept_block`), so a value captured once before
-            // the loop could go stale and let a header at the just-connected
-            // height slip through.
-            if new_height > self.tip_height() {
-                batch.height_hash_puts.push((new_height, hash));
-            }
+            // Stage the height->hash write for every accepted header; the
+            // authoritative "strictly above the active tip" filter is applied
+            // once, atomically under `accept_lock`, just before the commit below
+            // (see there for the rationale). Staging all of them keeps the
+            // in-batch difficulty-ancestor lookup above able to resolve
+            // consecutive headers by height within this batch.
+            batch.height_hash_puts.push((new_height, hash));
             accepted += 1;
             max_height = max_height.max(new_height);
             if best_in_batch
@@ -1750,8 +1756,22 @@ impl ChainState {
         }
 
         if accepted > 0 || !batch.height_hash_puts.is_empty() {
-            if let Err(e) = self.store.write_batch(batch) {
-                return (0, Some(e.into()));
+            // Commit the height->hash writes atomically w.r.t. block connection.
+            // `accept_block` (submitblock / internal mine, on an RPC thread)
+            // advances the active tip under `accept_lock`; without holding it
+            // here, an entry staged as above-tip during the loop could be at-tip
+            // by the time we write and clobber the active-chain entry there. Take
+            // the lock, drop any staged height->hash entry that is no longer
+            // strictly above the (possibly just-advanced) tip, then write — so
+            // only genuine header-chain entries reach the index. `block_index_puts`
+            // are hash-keyed and need no such filter.
+            {
+                let _accept_guard = self.accept_lock.lock();
+                let tip_height = self.tip_height();
+                batch.height_hash_puts.retain(|(h, _)| *h > tip_height);
+                if let Err(e) = self.store.write_batch(batch) {
+                    return (0, Some(e.into()));
+                }
             }
             self.headers_tip_height
                 .fetch_max(max_height, Ordering::Relaxed);
@@ -2806,10 +2826,20 @@ impl ChainState {
         // block we must not let clobber the active-chain entry there — the same
         // bad-cb-height pollution, reached through the block-store door. The
         // block stays reachable by hash for the competing-chain pull.
-        if new_height > self.tip_height() {
-            batch.height_hash_puts.push((new_height, block_hash));
+        //
+        // The above-tip test and the write are atomic w.r.t. block connection:
+        // hold `accept_lock` so a concurrent `accept_block` (submitblock /
+        // internal mine) can't advance the tip onto this height between the test
+        // and the commit. (This path runs on the single P2P block thread, which
+        // does not otherwise hold the lock, so the acquisition is uncontended on
+        // the normal IBD path and contends only with a racing RPC submit.)
+        {
+            let _accept_guard = self.accept_lock.lock();
+            if new_height > self.tip_height() {
+                batch.height_hash_puts.push((new_height, block_hash));
+            }
+            self.store.write_batch(batch)?;
         }
-        self.store.write_batch(batch)?;
 
         Ok((block_hash, new_height))
     }
@@ -5314,6 +5344,50 @@ pub(crate) mod tests {
             cs.get_block_hash_by_height(5),
             None,
             "repair must not restore the mapping for a disconnected Valid block"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn accept_header_height_commit_serializes_under_accept_lock() {
+        // The above-tip guard must be atomic with block connection: a concurrent
+        // accept_block (submitblock/mine) advances the tip under accept_lock, so
+        // accept_header must hold the same lock across its test+commit or a
+        // header that was above-tip at the test could clobber an entry the tip
+        // has since advanced onto. Prove accept_header's commit is gated on
+        // accept_lock: while we hold the lock (standing in for an in-progress
+        // accept_block), accept_header cannot complete — `done` cannot become
+        // true regardless of how far the worker has progressed, because the
+        // commit requires the lock. This is deterministic, not timing-dependent.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        let (cs, dir) = make_chain_state();
+        let blocks = build_and_connect_chain(&cs, 3);
+        let h4 = build_test_block(blocks[2].block_hash(), 4, 1_600_000_004);
+        let h4_hash = h4.block_hash();
+        let done = AtomicBool::new(false);
+
+        std::thread::scope(|s| {
+            let guard = cs.accept_lock.lock();
+            s.spawn(|| {
+                cs.accept_header(&h4.header).expect("accept H4");
+                done.store(true, Ordering::SeqCst);
+            });
+            std::thread::sleep(Duration::from_millis(200));
+            assert!(
+                !done.load(Ordering::SeqCst),
+                "accept_header committed its height write while accept_lock was held"
+            );
+            drop(guard);
+        });
+
+        assert!(done.load(Ordering::SeqCst), "accept_header completes once the lock is free");
+        assert_eq!(
+            cs.get_block_hash_by_height(4),
+            Some(h4_hash),
+            "the above-tip header is committed after the lock releases"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
