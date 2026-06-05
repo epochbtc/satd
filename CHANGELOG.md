@@ -31,7 +31,8 @@ In-progress; full detail tracked in
   watch-set quotas. Default credential behavior unchanged.
 - **MCP** — native TLS/mTLS for the HTTP server via
   `-mcpcert`/`-mcpkey`/`-mcpmtls`; a remote bind requires TLS so the bearer token
-  is never sent in cleartext.
+  is never sent in cleartext. The stdio transport (`-mcpstdio`) is removed; MCP
+  is HTTP(S)-only.
 - **API scaling** — per-surface admission control (honors `-rpcthreads` /
   `-rpcworkqueue`); isolated bounded runtime for read/streaming surfaces
   (`--api-threads`); opt-in read-only JSON-RPC listener (`-rpcreadonlybind`).
