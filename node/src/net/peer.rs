@@ -132,6 +132,13 @@ pub struct PeerInfo {
     /// Net permissions granted via -whitelist / -whitebind (noban,
     /// relay, ...). Default empty.
     pub permissions: crate::net::permissions::NetPermissions,
+    /// For outbound `.onion` peers: the Tor v3 hostname we dialed. `addr`
+    /// is a shared `0.0.0.0:port` placeholder for all onion peers (routing
+    /// is via the proxy, so there is no clearnet socket), which makes it
+    /// useless for identity. This carries the real per-peer identity so
+    /// dedup, getpeerinfo, and addrman can distinguish onion peers. `None`
+    /// for clearnet and inbound peers.
+    pub onion_host: Option<String>,
 }
 
 impl PeerInfo {
@@ -155,6 +162,7 @@ impl PeerInfo {
             bytes_recv: 0,
             conn_time: SystemTime::now(),
             permissions: crate::net::permissions::NetPermissions::NONE,
+            onion_host: None,
         }
     }
 
@@ -174,9 +182,16 @@ impl PeerInfo {
             .unwrap_or_default()
             .as_secs();
 
+        // Onion peers share the 0.0.0.0 placeholder socket; report the real
+        // .onion hostname so getpeerinfo identifies them (matches Core, which
+        // shows `<base32>.onion:port`).
+        let addr_str = match &self.onion_host {
+            Some(host) => format!("{host}:{}", self.addr.port()),
+            None => self.addr.to_string(),
+        };
         serde_json::json!({
             "id": self.id,
-            "addr": self.addr.to_string(),
+            "addr": addr_str,
             "services": format!("{:016x}", self.services.to_u64()),
             "servicesnames": [],
             "lastsend": 0,

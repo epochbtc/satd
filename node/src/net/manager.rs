@@ -194,6 +194,12 @@ pub struct PeerManager {
     /// attempts against the same addr (e.g. an addr arriving from
     /// multiple peers' gossip).
     pending_connections: RwLock<HashSet<SocketAddr>>,
+    /// In-flight `.onion` dials, keyed by Tor hostname. The clearnet
+    /// `pending_connections` set can't dedupe onion dials because every
+    /// onion peer shares the `0.0.0.0` placeholder socket; this is the
+    /// onion equivalent, stopping the reconnect loop from opening a second
+    /// connection to an onion peer it's already dialing/connected to.
+    pending_onion_dials: RwLock<HashSet<String>>,
     /// Ban duration in seconds (default: 86400). Atomic for live SIGHUP
     /// reload (applies to bans created after the change).
     ban_duration_secs: AtomicU64,
@@ -375,6 +381,7 @@ impl PeerManager {
             max_connections: AtomicUsize::new(max_connections),
             max_inbound_per_ip: AtomicUsize::new(max_inbound_per_ip),
             pending_connections: RwLock::new(HashSet::new()),
+            pending_onion_dials: RwLock::new(HashSet::new()),
             ban_duration_secs: AtomicU64::new(ban_duration_secs),
             connect_timeout_ms: AtomicU64::new(DEFAULT_CONNECT_TIMEOUT_MS),
             ibd: ibd.clone(),
@@ -815,6 +822,7 @@ impl PeerManager {
             addr,
             IncomingTransport::Established(Box::new(conn)),
             Direction::Outbound,
+            None,
         );
         Ok(())
     }
@@ -826,6 +834,40 @@ impl PeerManager {
         port: u16,
     ) -> Result<(), String> {
         self.check_outbound_limit()?;
+
+        // Dedupe by onion host BEFORE any network I/O. Onion peers all share
+        // the `0.0.0.0` placeholder socket, so `is_addr_connected` /
+        // `pending_connections` (both keyed on `SocketAddr`) can't tell them
+        // apart. Without this guard the 10s reconnect loop re-dials onion
+        // peers it's already connected to; the remote then drops the older
+        // duplicate, which churned onion peers every ~2s and stalled IBD over
+        // Tor (the live seed delivered one headers batch, got re-dialed, and
+        // EOF'd before any blocks transferred).
+        {
+            let mut pending = self.pending_onion_dials.write();
+            if pending.contains(host) {
+                return Err(format!("onion dial already in flight to {host}"));
+            }
+            if self.is_onion_connected(host) {
+                return Err(format!("already connected to {host}"));
+            }
+            pending.insert(host.to_string());
+        }
+        // RAII guard releases the in-flight slot on every exit path (including
+        // a dial timeout or panic at the awaits below).
+        struct OnionPendingGuard<'a> {
+            set: &'a RwLock<HashSet<String>>,
+            host: String,
+        }
+        impl Drop for OnionPendingGuard<'_> {
+            fn drop(&mut self) {
+                self.set.write().remove(&self.host);
+            }
+        }
+        let _guard = OnionPendingGuard {
+            set: &self.pending_onion_dials,
+            host: host.to_string(),
+        };
 
         let stream = self.dial_onion(host, port).await?;
 
@@ -844,6 +886,7 @@ impl PeerManager {
             placeholder_addr,
             IncomingTransport::Established(Box::new(conn)),
             Direction::Outbound,
+            Some(host),
         );
         Ok(())
     }
@@ -1144,6 +1187,21 @@ impl PeerManager {
         peers
             .values()
             .any(|h| h.info.addr == *addr && h.info.state != PeerState::Disconnected)
+    }
+
+    /// Whether we already hold (or are mid-handshake on) a connection to the
+    /// given `.onion` host. The onion analogue of `is_addr_connected`, needed
+    /// because all onion peers share the `0.0.0.0` placeholder socket.
+    fn is_onion_connected(&self, host: &str) -> bool {
+        Self::onion_connected_in(&self.peers.read(), host)
+    }
+
+    /// Pure predicate behind `is_onion_connected`, factored out for testing.
+    fn onion_connected_in(peers: &HashMap<PeerId, PeerHandle>, host: &str) -> bool {
+        peers.values().any(|h| {
+            h.info.onion_host.as_deref() == Some(host)
+                && h.info.state != PeerState::Disconnected
+        })
     }
 
     /// Check if an address is currently banned.
@@ -1489,7 +1547,10 @@ impl PeerManager {
                 // and can dial again. An inbound peer's address is its
                 // ephemeral source port, which is not re-dialable and would
                 // only pollute (and, unbounded, bloat) the table.
-                if handle.info.direction == Direction::Outbound {
+                // Onion peers carry the 0.0.0.0 placeholder socket, not a
+                // re-dialable clearnet addr — marking it good would pollute the
+                // addrman (and conflate every onion peer). Skip them.
+                if handle.info.direction == Direction::Outbound && handle.info.onion_host.is_none() {
                     self.addrman.write().mark_good(handle.info.addr, now_unix_secs());
                 }
                 tracing::info!(
@@ -3717,10 +3778,12 @@ impl PeerManager {
         addr: SocketAddr,
         transport: IncomingTransport,
         direction: Direction,
+        onion_host: Option<&str>,
     ) {
         let (msg_tx, msg_rx) = mpsc::channel::<NetworkMessage>(256);
         let mut info = PeerInfo::new(id, addr, direction);
         info.permissions = self.whitelist_permissions(addr.ip());
+        info.onion_host = onion_host.map(str::to_string);
         let handle = PeerHandle { info, msg_tx, last_getheaders_sent: None };
         {
             let mut peers = self.peers.write();
@@ -4452,6 +4515,38 @@ mod tests {
         let (total_b, same_b) = PeerManager::count_inbound(&peers, ip_b);
         assert_eq!(total_b, 4);
         assert_eq!(same_b, 1);
+    }
+
+    #[test]
+    fn onion_connected_in_matches_by_host_not_placeholder_addr() {
+        // Onion peers all share the 0.0.0.0 placeholder socket, so dedup must
+        // key on the onion host. Two distinct onion peers (same placeholder
+        // addr, different hosts) must be told apart; a disconnected peer must
+        // not count as connected.
+        let placeholder: SocketAddr = "0.0.0.0:8333".parse().unwrap();
+        let mut peers = HashMap::new();
+        let mk = |id: PeerId, host: &str, state: PeerState| {
+            let mut h = mk_handle(id, placeholder, Direction::Outbound, state);
+            h.info.onion_host = Some(host.to_string());
+            h
+        };
+        peers.insert(1, mk(1, "aaaa.onion", PeerState::Connected));
+        peers.insert(2, mk(2, "bbbb.onion", PeerState::Connecting));
+        peers.insert(3, mk(3, "cccc.onion", PeerState::Disconnected));
+
+        assert!(PeerManager::onion_connected_in(&peers, "aaaa.onion"));
+        // Mid-handshake (Connecting) still counts — we don't want a second dial.
+        assert!(PeerManager::onion_connected_in(&peers, "bbbb.onion"));
+        // Disconnected does not count — reconnect must be allowed.
+        assert!(!PeerManager::onion_connected_in(&peers, "cccc.onion"));
+        // Unknown host: not connected.
+        assert!(!PeerManager::onion_connected_in(&peers, "zzzz.onion"));
+        // A clearnet peer on the same placeholder addr must not match an onion host.
+        peers.insert(
+            4,
+            mk_handle(4, placeholder, Direction::Outbound, PeerState::Connected),
+        );
+        assert!(!PeerManager::onion_connected_in(&peers, ""));
     }
 
     #[test]
