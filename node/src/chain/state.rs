@@ -1610,8 +1610,29 @@ impl ChainState {
 
         let mut batch = crate::storage::StoreBatch::default();
         batch.block_index_puts.push((hash, entry));
-        batch.height_hash_puts.push((new_height, hash));
-        self.store.write_batch(batch)?;
+        // The height->hash index is the ACTIVE (connected) chain. Header-only
+        // acceptance must never write into its active region (heights <= the
+        // block tip): a competing fork announced *below* our tip would
+        // otherwise clobber the active entry there (last-write-wins), silently
+        // corrupting the index that `--reindex-chainstate` faithfully replays
+        // — the root cause of the 951k `bad-cb-height` reindex loop. Heights
+        // *above* the tip are header-chain territory (the IBD scheduler and the
+        // getheaders locator legitimately need them); the block stays reachable
+        // by hash + `best_header` regardless, so the fork-aware competing-chain
+        // pull (#315) is unaffected.
+        //
+        // The above-tip test and the write must be ATOMIC w.r.t. block
+        // connection: `accept_block` (submitblock / internal mine, on an RPC
+        // thread) advances the tip under `accept_lock`, so without holding it
+        // here a height that was above-tip at the test could be at-tip by the
+        // write and still clobber. Take the lock across the test+commit.
+        {
+            let _accept_guard = self.accept_lock.lock();
+            if new_height > self.tip_height() {
+                batch.height_hash_puts.push((new_height, hash));
+            }
+            self.store.write_batch(batch)?;
+        }
 
         // Track highest header for locator construction
         self.headers_tip_height.fetch_max(new_height, Ordering::Relaxed);
@@ -1636,11 +1657,18 @@ impl ChainState {
 
             // Already known?
             if let Some(existing) = self.store.get_block_index(&hash) {
-                // Crash-resume repair: if the block is stored (DataStored/Valid) but its
-                // height→hash mapping was never written (e.g. accept_headers was never
-                // called for it, or it was lost in a pending_batch that was never flushed),
-                // restore it now so the connect loop can find this block.
-                if matches!(existing.status, BlockStatus::DataStored | BlockStatus::Valid)
+                // Crash-resume repair: if a block was stored (DataStored) but its
+                // height→hash mapping was never written (e.g. accept_headers was
+                // never called for it, or it was lost in a pending_batch that was
+                // never flushed), restore it so the forward connect loop can find
+                // it. Restricted to DataStored (NOT Valid) on purpose: connect
+                // writes a block's Valid entry and its height→hash atomically in
+                // one batch, so a Valid block with a *missing* mapping is never a
+                // crash artifact — it is a block a reorg DISCONNECTED (disconnect
+                // removes the mapping but leaves the status Valid). Restoring that
+                // would re-point height→hash at a no-longer-active block, exactly
+                // the clobber this change exists to prevent.
+                if existing.status == BlockStatus::DataStored
                     && self.store.get_block_hash_by_height(existing.height).is_none()
                 {
                     batch.height_hash_puts.push((existing.height, hash));
@@ -1710,6 +1738,12 @@ impl ChainState {
             };
 
             batch.block_index_puts.push((hash, entry));
+            // Stage the height->hash write for every accepted header; the
+            // authoritative "strictly above the active tip" filter is applied
+            // once, atomically under `accept_lock`, just before the commit below
+            // (see there for the rationale). Staging all of them keeps the
+            // in-batch difficulty-ancestor lookup above able to resolve
+            // consecutive headers by height within this batch.
             batch.height_hash_puts.push((new_height, hash));
             accepted += 1;
             max_height = max_height.max(new_height);
@@ -1722,8 +1756,22 @@ impl ChainState {
         }
 
         if accepted > 0 || !batch.height_hash_puts.is_empty() {
-            if let Err(e) = self.store.write_batch(batch) {
-                return (0, Some(e.into()));
+            // Commit the height->hash writes atomically w.r.t. block connection.
+            // `accept_block` (submitblock / internal mine, on an RPC thread)
+            // advances the active tip under `accept_lock`; without holding it
+            // here, an entry staged as above-tip during the loop could be at-tip
+            // by the time we write and clobber the active-chain entry there. Take
+            // the lock, drop any staged height->hash entry that is no longer
+            // strictly above the (possibly just-advanced) tip, then write — so
+            // only genuine header-chain entries reach the index. `block_index_puts`
+            // are hash-keyed and need no such filter.
+            {
+                let _accept_guard = self.accept_lock.lock();
+                let tip_height = self.tip_height();
+                batch.height_hash_puts.retain(|(h, _)| *h > tip_height);
+                if let Err(e) = self.store.write_batch(batch) {
+                    return (0, Some(e.into()));
+                }
             }
             self.headers_tip_height
                 .fetch_max(max_height, Ordering::Relaxed);
@@ -2770,10 +2818,28 @@ impl ChainState {
 
         let mut batch = crate::storage::StoreBatch::default();
         batch.block_index_puts.push((block_hash, entry));
-        // Write height_hash so the connect loop can find this block even if
-        // accept_headers was never called (e.g. crash-resume or out-of-order sync).
-        batch.height_hash_puts.push((new_height, block_hash));
-        self.store.write_batch(batch)?;
+        // Write height_hash so the forward connect loop can find this block even
+        // if accept_headers was never called (e.g. crash-resume or out-of-order
+        // sync). Same active-chain rule as header acceptance: only ABOVE the
+        // active tip. The IBD connect loop only ever reads height_hash forward
+        // (tip+1, tip+2, …), so a stored block below the tip is a competing-fork
+        // block we must not let clobber the active-chain entry there — the same
+        // bad-cb-height pollution, reached through the block-store door. The
+        // block stays reachable by hash for the competing-chain pull.
+        //
+        // The above-tip test and the write are atomic w.r.t. block connection:
+        // hold `accept_lock` so a concurrent `accept_block` (submitblock /
+        // internal mine) can't advance the tip onto this height between the test
+        // and the commit. (This path runs on the single P2P block thread, which
+        // does not otherwise hold the lock, so the acquisition is uncontended on
+        // the normal IBD path and contends only with a racing RPC submit.)
+        {
+            let _accept_guard = self.accept_lock.lock();
+            if new_height > self.tip_height() {
+                batch.height_hash_puts.push((new_height, block_hash));
+            }
+            self.store.write_batch(batch)?;
+        }
 
         Ok((block_hash, new_height))
     }
@@ -5069,6 +5135,16 @@ pub(crate) mod tests {
         (cs, dir)
     }
 
+    /// Force `height_hash[height] = hash`, simulating a polluted index. Used by
+    /// tests that verify consumers stay immune to a `height_hash` that
+    /// disagrees with the active chain. (The writers — accept_header(s) and
+    /// store_block — no longer produce this state, so tests inject it directly.)
+    fn pollute_height_hash(cs: &ChainState, height: u32, hash: BlockHash) {
+        let mut batch = crate::storage::StoreBatch::default();
+        batch.height_hash_puts.push((height, hash));
+        cs.store.write_batch(batch).unwrap();
+    }
+
     /// Mine `n` regtest blocks into `cs` via the proven
     /// accept_header→store_block→connect_stored_block path, returning the
     /// connected blocks in height order.
@@ -5166,6 +5242,153 @@ pub(crate) mod tests {
         // The post-reindex re-seed restores the invariant.
         cs.refresh_best_header_to_tip();
         assert_eq!(cs.check_block_index(None), Ok(5));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn accept_header_does_not_clobber_active_height_index_with_subtip_fork() {
+        // The 951k bad-cb-height root cause: a competing fork announced *below*
+        // the active tip was accepted as headers, and the unconditional
+        // height->hash write clobbered the active-chain entries at the fork
+        // heights (last-write-wins). --reindex-chainstate then replayed the
+        // fork's blocks at those heights and aborted on bad-cb-height.
+        let (cs, dir) = make_chain_state();
+        let blocks = build_and_connect_chain(&cs, 5);
+        assert_eq!(cs.tip_height(), 5);
+        assert_eq!(cs.check_block_index(None), Ok(5));
+
+        let active3 = blocks[2].block_hash(); // active block at height 3
+        let active4 = blocks[3].block_hash(); // active block at height 4
+
+        // A peer announces a competing fork branching off the height-2 block,
+        // supplying alternative headers at heights 3 and 4 — both at or below
+        // our tip of 5. Distinct timestamps yield distinct hashes (the coinbase
+        // commits the timestamp), so these are genuinely new headers.
+        let fork_parent = blocks[1].block_hash(); // height 2
+        let f3 = build_test_block(fork_parent, 3, 1_400_000_003);
+        let f4 = build_test_block(f3.block_hash(), 4, 1_400_000_004);
+        assert_ne!(f3.block_hash(), active3);
+        assert_ne!(f4.block_hash(), active4);
+
+        cs.accept_header(&f3.header).unwrap();
+        cs.accept_header(&f4.header).unwrap();
+
+        // The fork headers are still known by hash, so the fork-aware
+        // competing-chain pull (#315) can reach them via best_header/prev-links.
+        assert!(cs.get_block_index(&f3.block_hash()).is_some());
+        assert!(cs.get_block_index(&f4.block_hash()).is_some());
+
+        // But the active-chain height index was NOT clobbered: heights at or
+        // below the tip belong exclusively to the connected chain.
+        assert_eq!(cs.get_block_hash_by_height(3), Some(active3));
+        assert_eq!(cs.get_block_hash_by_height(4), Some(active4));
+
+        // The structural audit stays clean — a subsequent --reindex-chainstate
+        // would replay the true active chain, never the fork.
+        assert_eq!(cs.check_block_index(None), Ok(5));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn store_block_does_not_clobber_active_height_index_with_subtip_fork() {
+        // The IBD block-store path (`store_block`) is the second door to the
+        // same bad-cb-height pollution: a peer relays a valid competing block
+        // below the tip, store_block writes its height→hash, and a later
+        // --reindex-chainstate replays it at the wrong height.
+        let (cs, dir) = make_chain_state();
+        let blocks = build_and_connect_chain(&cs, 5);
+        assert_eq!(cs.tip_height(), 5);
+        let active3 = blocks[2].block_hash();
+
+        // A valid block on a fork branching off height 2, so it lands at
+        // height 3 (≤ our tip of 5). store_block validates PoW/difficulty/
+        // checkpoints and persists it, but must not touch the active height map.
+        let f3 = build_test_block(blocks[1].block_hash(), 3, 1_500_000_003);
+        assert_ne!(f3.block_hash(), active3);
+        let (stored_hash, stored_height) = cs.store_block(&f3).unwrap();
+        assert_eq!(stored_height, 3);
+
+        // Stored (reachable by hash) but the active-chain slot is intact.
+        assert!(cs.get_block_index(&stored_hash).is_some());
+        assert_eq!(cs.get_block_hash_by_height(3), Some(active3));
+        assert_eq!(cs.check_block_index(None), Ok(5));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn accept_headers_repair_does_not_restore_a_disconnected_block() {
+        // The crash-resume repair must not re-point height→hash at a block a
+        // reorg disconnected. A Valid block with a missing mapping is exactly
+        // that (connect writes status+mapping atomically; disconnect drops the
+        // mapping but leaves the status Valid), so the repair is restricted to
+        // DataStored. Here we simulate the post-disconnect state by removing the
+        // mapping for a Valid block and re-announcing its header.
+        let (cs, dir) = make_chain_state();
+        let blocks = build_and_connect_chain(&cs, 5);
+        let h5 = blocks[4].block_hash();
+        assert_eq!(cs.get_block_index(&h5).unwrap().status, BlockStatus::Valid);
+
+        let mut batch = crate::storage::StoreBatch::default();
+        batch.height_hash_removes.push(5);
+        cs.store.write_batch(batch).unwrap();
+        assert_eq!(cs.get_block_hash_by_height(5), None);
+
+        // Re-announce the disconnected block's header: the repair branch sees a
+        // Valid (not DataStored) block and must leave the mapping absent.
+        let (_accepted, err) = cs.accept_headers(&[blocks[4].header]);
+        assert!(err.is_none(), "re-announcing a known header should not error: {err:?}");
+        assert_eq!(
+            cs.get_block_hash_by_height(5),
+            None,
+            "repair must not restore the mapping for a disconnected Valid block"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn accept_header_height_commit_serializes_under_accept_lock() {
+        // The above-tip guard must be atomic with block connection: a concurrent
+        // accept_block (submitblock/mine) advances the tip under accept_lock, so
+        // accept_header must hold the same lock across its test+commit or a
+        // header that was above-tip at the test could clobber an entry the tip
+        // has since advanced onto. Prove accept_header's commit is gated on
+        // accept_lock: while we hold the lock (standing in for an in-progress
+        // accept_block), accept_header cannot complete — `done` cannot become
+        // true regardless of how far the worker has progressed, because the
+        // commit requires the lock. This is deterministic, not timing-dependent.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        let (cs, dir) = make_chain_state();
+        let blocks = build_and_connect_chain(&cs, 3);
+        let h4 = build_test_block(blocks[2].block_hash(), 4, 1_600_000_004);
+        let h4_hash = h4.block_hash();
+        let done = AtomicBool::new(false);
+
+        std::thread::scope(|s| {
+            let guard = cs.accept_lock.lock();
+            s.spawn(|| {
+                cs.accept_header(&h4.header).expect("accept H4");
+                done.store(true, Ordering::SeqCst);
+            });
+            std::thread::sleep(Duration::from_millis(200));
+            assert!(
+                !done.load(Ordering::SeqCst),
+                "accept_header committed its height write while accept_lock was held"
+            );
+            drop(guard);
+        });
+
+        assert!(done.load(Ordering::SeqCst), "accept_header completes once the lock is free");
+        assert_eq!(
+            cs.get_block_hash_by_height(4),
+            Some(h4_hash),
+            "the above-tip header is committed after the lock releases"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -6779,14 +7002,18 @@ pub(crate) mod tests {
         let a2 = build_test_block(a1_hash, 2, 1_300_000_002);
         cs.accept_block(&a2).expect("accept A2");
 
-        // Store a side block at height 1; this clobbers height_hash[1] = B1.
+        // A side block at height 1. store_block no longer clobbers the active
+        // height index (that pollution is the bug this stack fixes), so inject
+        // the polluted entry directly — this test verifies the CONSUMER is
+        // immune to a height_hash that disagrees with the active chain.
         let b1 = build_test_block(genesis_hash, 1, 1_300_000_010);
         let b1_hash = b1.block_hash();
         cs.store_block(&b1).expect("store B1");
+        pollute_height_hash(&cs, 1, b1_hash);
         assert_eq!(
             cs.get_block_hash_by_height(1),
             Some(b1_hash),
-            "test premise: store_block clobbers the height index"
+            "test premise: height_hash[1] polluted with the side block"
         );
 
         // The side block must be rejected even though height_hash[1] == B1 …
@@ -6832,16 +7059,18 @@ pub(crate) mod tests {
         // After connect_block: height_hash[1] = A1.
         assert_eq!(cs.get_block_hash_by_height(1), Some(a1_hash));
 
-        // Build a side block at height 1 and store it. store_block
-        // writes height_hash[1] = B1 (overwriting A1) even though
-        // A1 is the active block at height 1.
+        // Build a side block at height 1 and store it, then inject the polluted
+        // height_hash[1] = B1 directly. (store_block no longer clobbers the
+        // active index — the fix — so we recreate the disagreement to prove
+        // fork-point discovery is immune to it.)
         let b1 = build_test_block(genesis_hash, 1, 1_300_000_010);
         let b1_hash = b1.block_hash();
         let _ = cs.store_block(&b1).expect("store B1");
+        pollute_height_hash(&cs, 1, b1_hash);
         assert_eq!(
             cs.get_block_hash_by_height(1),
             Some(b1_hash),
-            "store_block must clobber height_hash[1] for the test premise to hold"
+            "premise: height_hash[1] polluted with the side block"
         );
 
         // Extend B with two more blocks via accept_block — heavier
@@ -6881,11 +7110,13 @@ pub(crate) mod tests {
         let a2 = build_test_block(a1_hash, 2, 1_300_000_002);
         let a2_hash = cs.accept_block(&a2).expect("accept A2");
 
-        // store_block(B1) pollutes height_hash[1] = B1 even though A1 is the
-        // active block at height 1.
+        // Inject a polluted height_hash[1] = B1 (store_block no longer clobbers
+        // the active index — the fix), to prove the consumer reads the active
+        // chain regardless.
         let b1 = build_test_block(genesis_hash, 1, 1_300_000_010);
         let b1_hash = b1.block_hash();
         let _ = cs.store_block(&b1).expect("store B1");
+        pollute_height_hash(&cs, 1, b1_hash);
         assert_eq!(
             cs.get_block_hash_by_height(1),
             Some(b1_hash),
