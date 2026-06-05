@@ -29,7 +29,8 @@ processes — is covered in [API Scaling & Runtimes](api-scaling.md).
 
 - **Operating** — the day-to-day surfaces: [observability and
   metrics](observability.md), [configuration, tuning, and live
-  reload](configuration.md), [API scaling and the two-runtime model](api-scaling.md),
+  reload](configuration.md), [initial block download and AssumeUTXO fast
+  sync](ibd.md), [API scaling and the two-runtime model](api-scaling.md),
   [authentication and authorization](authentication.md)
   (Core-compatible credentials plus the unified bearer-token layer), the
   [integrator APIs](integrator-apis.md), and the [`sat-tui`](tui.md) terminal

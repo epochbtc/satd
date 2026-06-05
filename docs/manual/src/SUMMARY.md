@@ -6,6 +6,7 @@
 
 - [Observability & Metrics](observability.md)
 - [Configuration, Tuning & Reload](configuration.md)
+- [Initial Block Download & Fast Sync](ibd.md)
 - [API Scaling & Runtimes](api-scaling.md)
 - [Authentication & Authorization](authentication.md)
 - [Integrator APIs](integrator-apis.md)
