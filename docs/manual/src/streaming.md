@@ -109,9 +109,10 @@ first-class `Reorg` marker followed by the per-block disconnect/connect sequence
 ## Authentication & quotas
 
 The streaming API adds **no new auth surface** — it reuses the unified auth layer
-(`satd-auth`) wholesale. With no token store configured the transports are open
-(loopback-trust, matching the existing events-gRPC behavior); a **remote bind
-requires a token store**.
+wholesale (full details in [Authentication & Authorization](authentication.md)).
+With no token store configured the transports are open (loopback-trust, matching
+the existing events-gRPC behavior); a **remote bind requires a token store**
+(`-streamwsauth`/`-eventsgrpcauth` → `-authfile`).
 
 | Action | Capability | Quota |
 |---|---|---|

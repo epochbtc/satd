@@ -6,6 +6,7 @@
 
 - [Observability & Metrics](observability.md)
 - [Configuration, Tuning & Reload](configuration.md)
+- [Authentication & Authorization](authentication.md)
 - [Integrator APIs](integrator-apis.md)
 - [Terminal UI (`sat-tui`)](tui.md)
 
@@ -13,6 +14,7 @@
 
 - [Esplora REST API](esplora.md)
 - [Streaming Consumption API](streaming.md)
+- [MCP Server](mcp.md)
 - [Native Protocol Architecture](native-protocol-surfaces.md)
 
 # Packaging & Deployment

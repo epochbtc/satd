@@ -6,7 +6,9 @@ whether it is **Bitcoin Core-compatible** or a **satd extension**.
 
 For *how* configuration is sourced and the live-reload mechanics, see
 [Configuration, Tuning & Reload](configuration.md). This chapter is the flat
-per-key index.
+per-key index. The auth-related keys (`authfile`, `*authbearer`/`*auth`,
+`*allowremote`, cookie/`rpcuser`/`rpcauth`) are explained in context in
+[Authentication & Authorization](authentication.md).
 
 ## How satd reads configuration
 

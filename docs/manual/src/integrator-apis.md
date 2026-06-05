@@ -10,6 +10,11 @@ API](https://github.com/epochbtc/satd/blob/master/docs/api/streaming.md)
 (gRPC / WebSocket / ZMQ, cursor-resumable watch subscriptions) is specified
 separately as a forward-looking protocol spec.
 
+> **Authentication.** JSON-RPC keeps Bitcoin Core's cookie / `rpcuser` / `rpcauth`
+> credentials by default; capability-scoped bearer tokens (`-rpcauthbearer`,
+> `rpc:read` / `rpc:write`) are an opt-in addition. See
+> [Authentication & Authorization](authentication.md).
+
 ## Mempool-Based Fee Estimation
 
 *   `estimatesmartfee` supports an optional `mode` param (`historical`, `mempool`, `blend`).

@@ -13,6 +13,11 @@ canary CI requirement in `STABILITY_POLICY.md`.
 
 Last verified against routes: 2026-05-05.
 
+> **Authentication.** The Esplora surface defaults to unauthenticated loopback.
+> For Basic auth (`--esploraauth`) or capability-scoped bearer tokens
+> (`--esploraauthbearer`, `esplora:read`), see
+> [Authentication & Authorization](authentication.md).
+
 ## Configuration
 
 | CLI flag | Default | Notes |
