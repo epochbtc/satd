@@ -43,6 +43,13 @@ const GETHEADERS_MIN_INTERVAL: Duration = Duration::from_secs(2);
 /// this in-memory list, so bound it to avoid unbounded growth from a gossipy
 /// peer. The reconnect loop never opens more than the outbound target anyway.
 const MAX_ONION_CONNECT_ADDRS: usize = 512;
+
+/// Upper bound on onion dials the reconnect loop starts in a single 10s tick.
+/// Onion dials each hold a Tor circuit through the one configured SOCKS proxy,
+/// so a burst must be bounded even when many slots are open — otherwise a peer
+/// that floods `connect_peer_addrs` via addrv2 gossip could make a single tick
+/// spawn hundreds of concurrent circuits and saturate the proxy.
+const MAX_ONION_DIALS_PER_TICK: usize = 16;
 /// Ban score charged for a `headers` message whose parent we don't have. Small
 /// enough that an honest peer announcing a better chain (one such message,
 /// resolved by the getheaders we send back) stays far under [`BAN_THRESHOLD`],
@@ -179,6 +186,11 @@ pub struct PeerManager {
     pending_compact: RwLock<HashMap<bitcoin::BlockHash, compact::PendingCompact>>,
     /// Per-address reconnect backoff state.
     reconnect_backoff: RwLock<HashMap<SocketAddr, ReconnectState>>,
+    /// Exponential backoff for `.onion` reconnect candidates, keyed by host
+    /// string. `reconnect_backoff` is `SocketAddr`-keyed and can't hold onion
+    /// peers, so without this a dead onion seed (or a failed gossip-discovered
+    /// host) would be hot-dialed every 10s with no backoff.
+    onion_reconnect_backoff: RwLock<HashMap<String, ReconnectState>>,
     /// Banned addresses with ban expiry time.
     banned_addrs: RwLock<HashMap<SocketAddr, Instant>>,
     /// Fee estimator fed from confirmed blocks (kept alive via Arc, used in block_processor).
@@ -382,6 +394,7 @@ impl PeerManager {
             pending_compact: RwLock::new(HashMap::new()),
             fee_estimator: fee_estimator.clone(),
             reconnect_backoff: RwLock::new(HashMap::new()),
+            onion_reconnect_backoff: RwLock::new(HashMap::new()),
             banned_addrs: RwLock::new(HashMap::new()),
             shutdown,
             prune_target_mb,
@@ -1224,6 +1237,17 @@ impl PeerManager {
         Self::onion_connected_in(&self.peers.read(), host)
     }
 
+    /// How many new onion dials the reconnect loop may start this tick: the
+    /// open outbound slots (counting in-flight dials, which `outbound_count`
+    /// excludes because they aren't `Connected` yet) capped by the per-tick
+    /// burst limit. Without counting `in_flight`, a single tick could spawn a
+    /// dial for every gossip-discovered onion at once.
+    fn onion_dial_budget(target: usize, outbound: usize, in_flight: usize) -> usize {
+        target
+            .saturating_sub(outbound + in_flight)
+            .min(MAX_ONION_DIALS_PER_TICK)
+    }
+
     /// Pure predicate behind `is_onion_connected`, factored out for testing.
     fn onion_connected_in(peers: &HashMap<PeerId, PeerHandle>, host: &str) -> bool {
         peers.values().any(|h| {
@@ -1546,13 +1570,66 @@ impl PeerManager {
                         });
                     }
 
-                    // Also reconnect .onion peers
+                    // Also reconnect .onion peers — with the same discipline the
+                    // clearnet loop above has. `connect_peer_addrs` is fillable
+                    // from untrusted addrv2 gossip (up to MAX_ONION_CONNECT_ADDRS),
+                    // so spawning a dial per entry with no cap would let one peer
+                    // drive hundreds of concurrent SOCKS dials through the single
+                    // proxy every tick. Bound new dials this tick by the open
+                    // slot budget (counting in-flight dials, which
+                    // `outbound_count()` excludes) and a per-tick burst cap; skip
+                    // already-connected / in-flight hosts; and back off failures
+                    // (onion-host-keyed, since `reconnect_backoff` is SocketAddr-
+                    // keyed).
                     let onion_addrs = self.connect_peer_addrs.read().clone();
+                    let mut budget = Self::onion_dial_budget(
+                        target,
+                        self.outbound_count(),
+                        self.pending_onion_dials.read().len(),
+                    );
                     for peer_addr in onion_addrs {
+                        if budget == 0 {
+                            break;
+                        }
+                        let already = match &peer_addr {
+                            PeerAddr::Onion { host, .. } => {
+                                self.is_onion_connected(host)
+                                    || self.pending_onion_dials.read().contains(host)
+                            }
+                            PeerAddr::Socket(sa) => self.is_addr_connected(sa),
+                        };
+                        if already {
+                            continue;
+                        }
+                        let key = peer_addr.to_string();
+                        {
+                            let backoff = self.onion_reconnect_backoff.read();
+                            if let Some(state) = backoff.get(&key)
+                                && now < state.next_attempt
+                            {
+                                continue;
+                            }
+                        }
+                        budget -= 1;
                         let pm = Arc::clone(self);
                         tokio::spawn(async move {
-                            if let Err(e) = pm.connect_peer_addr(&peer_addr).await {
-                                tracing::debug!(%peer_addr, "Onion reconnect failed: {}", e);
+                            let key = peer_addr.to_string();
+                            match pm.connect_peer_addr(&peer_addr).await {
+                                Ok(_) => {
+                                    pm.onion_reconnect_backoff
+                                        .write()
+                                        .entry(key)
+                                        .or_insert_with(ReconnectState::new)
+                                        .reset();
+                                }
+                                Err(e) => {
+                                    tracing::debug!(%peer_addr, "Onion reconnect failed: {}", e);
+                                    pm.onion_reconnect_backoff
+                                        .write()
+                                        .entry(key)
+                                        .or_insert_with(ReconnectState::new)
+                                        .record_failure();
+                                }
                             }
                         });
                     }
@@ -4575,6 +4652,21 @@ mod tests {
         let (total_b, same_b) = PeerManager::count_inbound(&peers, ip_b);
         assert_eq!(total_b, 4);
         assert_eq!(same_b, 1);
+    }
+
+    #[test]
+    fn onion_dial_budget_caps_burst_and_counts_in_flight() {
+        // Cold start: every slot open, but the per-tick burst is the ceiling.
+        assert_eq!(PeerManager::onion_dial_budget(64, 0, 0), MAX_ONION_DIALS_PER_TICK);
+        // In-flight dials count against the budget (outbound_count excludes
+        // them) — this is what stops a gossip flood from spawning hundreds of
+        // concurrent dials in one tick.
+        assert_eq!(PeerManager::onion_dial_budget(8, 2, 6), 0);
+        // Open slots below the burst cap return exactly the slot count.
+        assert_eq!(PeerManager::onion_dial_budget(8, 5, 0), 3);
+        // At or over target → no new dials (saturating).
+        assert_eq!(PeerManager::onion_dial_budget(8, 8, 0), 0);
+        assert_eq!(PeerManager::onion_dial_budget(8, 10, 0), 0);
     }
 
     #[test]

@@ -15,6 +15,11 @@ DEFAULT_PORT = 8333
 SOCKS = ("127.0.0.1", 9050)
 NODE_NETWORK = 1 << 0
 PROTOCOL_VERSION = 70016
+# Reject oversized message-length headers from untrusted peers before we try to
+# read the payload — otherwise a hostile node could announce a huge length and
+# make recvn() block reading megabytes (slowloris). We only need small
+# version/addr/addrv2 messages here. Matches Bitcoin Core's 32 MiB ceiling.
+MAX_MSG_LEN = 32 * 1024 * 1024
 HARVEST_SEEDS = [
     "seed.bitcoin.sipa.be", "dnsseed.bluematt.me", "seed.bitcoin.sprovoost.nl",
     "seed.btc.petertodd.net", "dnsseed.emzy.de", "seed.bitcoin.wiz.biz",
@@ -52,6 +57,7 @@ def recv_msg(s):
     if hdr[:4] != MAINNET_MAGIC: raise ValueError("bad magic")
     command = hdr[4:16].rstrip(b"\x00").decode(errors="replace")
     length = struct.unpack_from("<I", hdr, 16)[0]
+    if length > MAX_MSG_LEN: raise ValueError(f"oversize message: {length}")
     payload = recvn(s, length) if length else b""
     return command, payload
 
