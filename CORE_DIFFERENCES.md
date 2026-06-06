@@ -7,11 +7,15 @@ Bitcoin Core so that existing operators, integrators, and downstream
 infrastructure (BTCPayServer, NBXplorer, Sparrow, Umbrel, Start9,
 mempool.space SDK, BDK) work without code changes.
 
-**Compatibility target: Bitcoin Core v30.** Compatibility is pinned to a
-named Core release rather than tracking Core indefinitely. satd matches
-v30's CLI/`bitcoin.conf` surface and makes no compatibility commitment for
-configuration options introduced in later Core releases (e.g. the v31
-cluster-mempool knobs).
+**Compatibility target: Bitcoin Core v30 — drop in your `bitcoin.conf`.**
+The aim is that an existing Core `bitcoin.conf` starts satd unedited.
+Commonly-used options are honored (names/semantics pinned to v30);
+recognized-but-unsupported v30 options are **skipped with a startup warning**
+rather than aborting, so the long tail doesn't block a drop-in; only a small
+set whose silent omission would mislead about security/exposure/privacy stays
+fatal; and unknown keys are rejected as typos. Nothing a config asks for is
+ever *silently* ignored. satd makes no compatibility commitment for options
+introduced in later Core releases (e.g. the v31 cluster-mempool knobs).
 
 Within that compatibility envelope, satd intentionally goes further on
 **features, ergonomics, and operator flexibility**. This document
@@ -320,8 +324,8 @@ preserved; the satd extension is opt-in per request or per flag.
   Settings wired into long-lived state at startup (network, datadir, ports,
   binds, `-dbcache`, indexes, TLS, seeds, Tor) are reported in the log as
   "restart required" and never silently ignored. A reload that fails to parse
-  (e.g. a typo'd or unknown key, which hard-errors at load) is logged and the
-  running config is kept — the daemon never crashes on a bad reload. The
+  (e.g. a typo, which is rejected at load) is logged and the running config is
+  kept — the daemon never crashes on a bad reload. The
   authoritative per-key list is in the operator manual (`docs/manual/src/configuration.md`).
 
 - **`SIGUSR1` reloads TLS certificates in place.** Bitcoin Core has no
@@ -409,8 +413,13 @@ default behavior set the corresponding flag.
 ## Migration for Core operators
 
 A Core datadir is **not** byte-compatible with satd (different storage
-backend) but the `bitcoin.conf` and CLI flags transfer directly. The
-intended migration is:
+backend), but your `bitcoin.conf` and CLI flags drop in: satd reads Core's
+config surface, honors the commonly-used options, and **skips any option it
+doesn't implement with a startup warning** rather than refusing to start (a
+few security/exposure/privacy-sensitive keys are the exception and fail with
+guidance — see the [Configuration Flag Reference](docs/manual/src/config-reference.md)).
+So the same `bitcoin.conf` starts satd; review the skip warnings on first boot
+to see which lines had no effect. The intended migration is:
 
 1. Stop `bitcoind`. Keep the flat-file `blocks/` directory if you want
    to skip re-downloading the chain (satd reuses the same flat-file

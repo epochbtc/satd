@@ -122,7 +122,7 @@ cargo run --bin sat-cli -- --regtest stop
 
 ## Configuration
 
-Bitcoin Core-compatible flags (`-regtest`, `-datadir`, `-rpcport`, `-prune`, `-txindex`, `-assumevalid`, `-includeconf`, …) and the `bitcoin.conf` file format are accepted as the default surface. Core's CLI/config compatibility surface is intended to be complete — every recognized `bitcoin.conf` key is either honored or recognize-rejected with a clear message (no silent accept-and-ignore).
+**Drop in your existing Bitcoin Core `bitcoin.conf`.** satd reads Core's config surface directly (`-regtest`, `-datadir`, `-rpcport`, `-prune`, `-txindex`, `-assumevalid`, `-includeconf`, …); names and semantics are pinned to **Core v30**. Commonly-used options are honored; a recognized v30 option satd doesn't implement is **skipped with a startup warning** (the node still starts) rather than aborting; a small set whose silent omission would mislead about security/exposure/privacy stays fatal with guidance; and unknown keys are rejected as typos. Nothing a config asks for is *silently* ignored. See the [Configuration Flag Reference](https://epochbtc.github.io/satd/config-reference.html) for the per-key disposition.
 
 Bundled `--profile=<preset>` selects from `archival`, `pruned-home`, `mining`, `regtest-dev`, and `signet-watchtower`. CLI flags override profile values; `getconfig` / `sat-cli node config` shows the effective post-merge configuration.
 

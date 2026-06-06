@@ -15,21 +15,30 @@ family, reindex) in [Initial Block Download & Fast Sync](ibd.md).
 
 ## How satd reads configuration
 
-The compatibility target is **Bitcoin Core v30**: key names and semantics are
-matched against v30's option set, and satd makes no compatibility commitment for
-configuration options introduced in later Core releases.
+**Goal: drop in your existing Bitcoin Core `bitcoin.conf` and have it just
+work.** satd reads Core's configuration surface directly — same
+`bitcoin.conf` / `satd.conf` `key=value` + `[network]` section syntax and the
+same CLI flag names (`-datadir`, `-rpcport`, …). Supported-flag names and
+semantics track **Bitcoin Core v30**.
 
-satd accepts Bitcoin Core's configuration surface as its default:
-
-- **`bitcoin.conf` (or `satd.conf`)** with Core's `key=value` and `[network]`
-  section syntax, plus the same CLI flag names (`-datadir`, `-rpcport`, …).
 - **Resolution order:** `-conf=<path>` if given, else `<datadir>/bitcoin.conf`,
   else `<datadir>/satd.conf`. **CLI flags always win** over file values.
-- **No silent accept-and-ignore.** Every recognized key is either honored or
-  *recognize-rejected* with a clear error (see
-  [Recognize-rejected keys](#recognize-rejected-keys)). An unknown key is a hard
-  error at load — matching Core, and deliberately safer than accepting a key
-  whose effect is then dropped.
+- **What happens to each config-file key** (the four-way disposition that makes
+  drop-in safe):
+  1. **Honored** — satd implements it. The common operator surface.
+  2. **Skipped with a warning** — a recognized Core v30 option satd doesn't
+     implement but is *safe to skip*. The node **still starts**; a `WARN` line
+     names the ignored key (and the satd equivalent, if any). This is what lets
+     a real `bitcoin.conf` boot unedited.
+  3. **Rejected at load** — a small set where silently skipping would mislead
+     you about the node's **security / exposure / privacy** posture (see
+     [Unsupported Core keys](#unsupported-core-keys-skipped-vs-rejected)).
+     Fail-closed with guidance.
+  4. **Rejected as a typo** — a key that is neither a satd option nor a known
+     Core v30 option. Rejected so a fat-fingered security option (e.g.
+     `rpcusser=`) can't silently disable auth.
+- **Never *silently* ignored.** Skipped keys always warn; nothing a config asks
+  for is dropped without the operator being told.
 - **`-profile=<preset>`** seeds a hardware/role profile (`archival`,
   `pruned-home`, `mining`, `regtest-dev`, `signet-watchtower`); explicit flags
   override the profile's values.
@@ -346,19 +355,46 @@ Core ZMQ wire-format compatible.)
 
 ---
 
-## Recognize-rejected keys
+## Unsupported Core keys: skipped vs rejected
 
-These Bitcoin Core keys are **recognized but hard-error at load** with an
-actionable reason, rather than being silently accepted-and-ignored:
+A Core v30 option satd doesn't [honor](#how-satd-reads-configuration) is handled
+one of two ways so that an existing `bitcoin.conf` still drops in.
 
-| Key | Reason |
+### Skipped with a warning (the node still starts)
+
+Recognized Core v30 options satd doesn't implement but that are **safe to skip**
+are ignored with a startup `WARN` line — the node boots without them. The warning
+names the satd equivalent where one exists. This covers the low-value long tail,
+e.g.:
+
+| Key(s) | Warning guidance |
 |---|---|
-| `upnp` | UPnP port mapping — deprecated in Core. |
-| `natpmp` | NAT-PMP port mapping — deprecated in Core. |
-| `i2psam` | I2P SAM proxy — Tor is satd's supported anonymity network. |
-| `i2pacceptincoming` | I2P inbound — out of scope (see `i2psam`). |
+| `rest` | satd ships native Esplora REST instead of Core's `/rest/`; enable with `-esplora` (on by default). |
+| `zmqpub*` (`hashtx`/`hashblock`/`rawtx`/`rawblock`/`sequence` + `*hwm`) | Core's per-topic ZMQ is replaced by the events bus (`-eventszmqbind` + `-eventszmqhashtx`/`-eventszmqhashblock`, Core wire-format). |
+| `peerbloomfilters` | BIP37 unsupported (privacy/DoS); use BIP157/158 (`-blockfilterindex`/`-peerblockfilters`). |
+| `upnp`, `natpmp` | Deprecated in Core; configure port forwarding externally. |
+| `debuglogfile`, `shrinkdebugfile`, `printtoconsole`, `logratelimit` | satd logs to stdout/journald; no `debug.log`. |
+| `maxorphantx` | Removed in Core v30 too. |
+| `wallet`, `walletdir`, … | satd is keyless (no wallet); use external wallets + PSBT. |
+| `coinstatsindex`, `loadblock`, `checkblocks`/`checklevel`, `bytespersigop`, `maxsigcachesize`, `blockversion`, `printpriority`, `txreconciliation`, `discover`, `persistmempoolv1`, `acceptstalefeeestimates`, `blocksxor`, `settings`, `daemonwait`, `deprecatedrpc`, `rpcdoccheck`, … | Recognized Core v30 options satd does not implement; skipped (generic warning). |
 
-Any **unrecognized** key (not a known satd key and not in the list above) is also
-a hard error at load — the error message suggests it may be a Core key satd does
-not yet support. There are currently **no** "recognized but not-yet-implemented"
-Core keys: every Core key satd previously deferred has been implemented.
+### Rejected at load (fail-closed)
+
+A small set stays **fatal**, because silently skipping them would mislead you
+about the node's **security / exposure / privacy** posture. Each rejects with an
+actionable message:
+
+| Key(s) | Reason |
+|---|---|
+| `i2psam`, `i2pacceptincoming` | I2P out of scope — skipping would route traffic over clearnet instead of the privacy network you configured. Tor is satd's anonymity network (`-proxy`/`-onion`/`-torcontrol`). |
+| `rpcwhitelist`, `rpcwhitelistdefault` | satd uses capability-scoped bearer tokens (`-authfile`); skipping would leave RPC less restricted than your Core config intends. See [Authentication & Authorization](authentication.md). |
+
+### Typos
+
+A key that is **neither a satd option nor a known Core v30 option** is rejected
+at load as a likely typo — this is what stops a fat-fingered `rpcusser=` from
+silently disabling authentication.
+
+> **Compatibility scope.** "Supported" is the commonly-used Core operator
+> surface, with semantics pinned to Core v30. The long tail is skipped-with-warning
+> rather than honored.
