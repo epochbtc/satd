@@ -42,7 +42,15 @@ In-progress; full detail tracked in
   previously addable only via the `-addnode` config. Onion dials are also given
   a 20s timeout floor (Core's `SOCKS5_RECV_TIMEOUT`) independent of `-timeout`,
   so the Tor rendezvous can complete on first connection instead of being cut
-  off by the 5s clearnet socket-connect budget.
+  off by the 5s clearnet socket-connect budget. A `-listenonion` node now
+  **advertises its own hidden service** to addrv2-capable peers (BIP 155 TorV3,
+  both proactively after the handshake and in `getaddr` responses) and surfaces
+  it in `getnetworkinfo.localaddresses` — so the network can discover and dial
+  it inbound, where before the service was reachable only by peers handed the
+  address out of band. As a prerequisite, satd now records a peer's
+  `sendaddrv2` during the handshake (it was previously dropped, so satd never
+  sent addrv2 to anyone); the onion network's `getnetworkinfo` `reachable` flag
+  now reflects whether an onion-routing proxy is configured.
 - **API scaling** — per-surface admission control (honors `-rpcthreads` /
   `-rpcworkqueue`); isolated bounded runtime for read/streaming surfaces
   (`--api-threads`); opt-in read-only JSON-RPC listener (`-rpcreadonlybind`).

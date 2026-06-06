@@ -4,6 +4,14 @@ use serde_json::{json, Value};
 /// Build the `getnetworkinfo` response with live connection data.
 pub fn get_network_info(peer_manager: &PeerManager) -> Value {
     let connections = peer_manager.connection_count();
+    let onion_reachable = peer_manager.onion_routing_available();
+    let local_addresses: Vec<Value> = peer_manager
+        .local_addresses()
+        .into_iter()
+        .map(|(address, port, score)| {
+            json!({ "address": address, "port": port, "score": score })
+        })
+        .collect();
 
     json!({
         // Advertises Bitcoin Core wire-protocol vintage (Core v28).
@@ -41,15 +49,15 @@ pub fn get_network_info(peer_manager: &PeerManager) -> Value {
             },
             {
                 "name": "onion",
-                "limited": true,
-                "reachable": false,
+                "limited": !onion_reachable,
+                "reachable": onion_reachable,
                 "proxy": "",
                 "proxy_randomize_credentials": false
             }
         ],
         "relayfee": 0.00001000,
         "incrementalfee": 0.00001000,
-        "localaddresses": [],
+        "localaddresses": local_addresses,
         "warnings": ""
     })
 }
