@@ -764,6 +764,10 @@ pub struct Config {
     pub bantime: u64,
     // Proxy / Tor
     pub proxy: Option<String>,
+    /// Bitcoin Core's `-proxyrandomize`: use fresh random SOCKS5 credentials
+    /// per outbound connection so Tor isolates each peer on its own circuit.
+    /// Default true; only has effect when `-proxy`/`-onion` is set.
+    pub proxyrandomize: bool,
     pub onion: Option<String>,
     pub torcontrol: Option<String>,
     pub torpassword: Option<String>,
@@ -2636,6 +2640,10 @@ impl Config {
                 .or_else(|| file_get("bantime").and_then(|v| v.parse().ok()))
                 .unwrap_or(86400),
             proxy: cli.proxy.or_else(|| file_get("proxy")),
+            proxyrandomize: cli
+                .proxyrandomize
+                .or_else(|| file_get("proxyrandomize").and_then(|v| parse_bool(&v)))
+                .unwrap_or(true),
             onion: cli.onion.or_else(|| file_get("onion")),
             torcontrol,
             torpassword: cli.torpassword.or_else(|| file_get("torpassword")),
@@ -3008,6 +3016,7 @@ impl Config {
             "max_shutdown_secs": self.max_shutdown_secs,
             "tor": {
                 "proxy": self.proxy,
+                "proxyrandomize": self.proxyrandomize,
                 "onion": self.onion,
                 "control": self.torcontrol,
                 "password": if self.torpassword.is_some() { "(set)" } else { "(none)" },
@@ -4101,6 +4110,16 @@ pub struct CliArgs {
 
     #[arg(
         long,
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
+        help = "Randomize SOCKS5 credentials per connection so Tor isolates each peer on its own circuit (default: true)"
+    )]
+    pub proxyrandomize: Option<bool>,
+
+    #[arg(
+        long,
         value_name = "ADDR:PORT",
         help = "SOCKS5 proxy for .onion connections (defaults to -proxy)"
     )]
@@ -4835,6 +4854,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "asmap",
         "bantime",
         "proxy",
+        "proxyrandomize",
         "onion",
         "torcontrol",
         "torpassword",
@@ -4897,6 +4917,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "forcednsseed",
         "fixedseeds",
         "listenonion",
+        "proxyrandomize",
         "txindex",
         "addressindex",
         "peerblockfilters",
@@ -5245,6 +5266,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "signetchallenge",
     // Proxy / Tor
     "proxy",
+    "proxyrandomize",
     "onion",
     "torcontrol",
     "torpassword",
@@ -6238,6 +6260,7 @@ rpcport=8332
             prefetchworkers: None,
             par: None,
             proxy: None,
+            proxyrandomize: None,
             onion: None,
             torcontrol: None,
             torpassword: None,
@@ -6488,6 +6511,7 @@ rpcport=8332
             prefetchworkers: None,
             par: None,
             proxy: None,
+            proxyrandomize: None,
             onion: None,
             torcontrol: None,
             torpassword: None,

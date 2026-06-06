@@ -259,6 +259,10 @@ pub struct PeerManager {
     proxy: Option<String>,
     /// Separate SOCKS5 proxy for .onion connections (defaults to proxy).
     onion_proxy: Option<String>,
+    /// Randomize SOCKS5 credentials per outbound dial so Tor isolates each
+    /// peer onto its own circuit (Bitcoin Core's `-proxyrandomize`, default
+    /// on). Set once at startup; only meaningful when a proxy is configured.
+    proxy_randomize: std::sync::atomic::AtomicBool,
     /// Configured outbound .onion and hostname-based peer addresses for auto-reconnect.
     connect_peer_addrs: RwLock<Vec<PeerAddr>>,
     /// Max blocks downloaded ahead of connect cursor during IBD.
@@ -430,6 +434,7 @@ impl PeerManager {
             bg_connect_signal: bg_connect_signal.clone(),
             proxy,
             onion_proxy,
+            proxy_randomize: std::sync::atomic::AtomicBool::new(true),
             connect_peer_addrs: RwLock::new(Vec::new()),
             max_ahead,
             ibd_eta_secs: Arc::new(AtomicU64::new(0)),
@@ -602,6 +607,42 @@ impl PeerManager {
     /// `reachable` flag.
     pub fn onion_routing_available(&self) -> bool {
         self.proxy.is_some() || self.onion_proxy.is_some()
+    }
+
+    /// Enable/disable per-dial SOCKS credential randomization (`-proxyrandomize`).
+    /// Set once at startup from config.
+    pub fn set_proxy_randomize(&self, on: bool) {
+        self.proxy_randomize.store(on, Ordering::Relaxed);
+    }
+
+    /// Whether per-dial SOCKS credential randomization is on. Drives
+    /// `getnetworkinfo`'s `proxy_randomize_credentials`.
+    pub fn proxy_randomize(&self) -> bool {
+        self.proxy_randomize.load(Ordering::Relaxed)
+    }
+
+    /// The SOCKS proxy used for clearnet (ipv4/ipv6) outbound, if any.
+    pub fn proxy_addr(&self) -> Option<String> {
+        self.proxy.clone()
+    }
+
+    /// The SOCKS proxy used for `.onion` outbound (the dedicated onion proxy,
+    /// else the general proxy), if any.
+    pub fn onion_proxy_addr(&self) -> Option<String> {
+        self.onion_proxy.clone().or_else(|| self.proxy.clone())
+    }
+
+    /// A fresh random SOCKS5 credential pair for one outbound dial, or `None`
+    /// when randomization is off. Tor uses the username/password as its
+    /// stream-isolation key (`IsolateSOCKSAuth`), so a unique pair per dial
+    /// forces a separate circuit per peer. Username and password are set to the
+    /// same random token, matching Bitcoin Core.
+    fn socks_cred(&self) -> Option<(String, String)> {
+        if !self.proxy_randomize.load(Ordering::Relaxed) {
+            return None;
+        }
+        let token = format!("{:016x}", rand::random::<u64>());
+        Some((token.clone(), token))
     }
 
     /// Build the `AddrV2` self-advertisement (our hidden service as a BIP 155
@@ -4129,7 +4170,11 @@ impl PeerManager {
     async fn dial_direct(&self, addr: SocketAddr) -> Result<TcpStream, String> {
         let connect_timeout = Duration::from_millis(self.connect_timeout_ms.load(Ordering::Relaxed));
         if let Some(ref proxy_addr) = self.proxy {
-            tokio::time::timeout(connect_timeout, proxy::connect_socks5(proxy_addr, addr))
+            // Per-dial random SOCKS credentials isolate this peer on its own Tor
+            // circuit (see `socks_cred`).
+            let cred = self.socks_cred();
+            let cred_ref = cred.as_ref().map(|(u, p)| (u.as_str(), p.as_str()));
+            tokio::time::timeout(connect_timeout, proxy::connect_socks5(proxy_addr, addr, cred_ref))
                 .await
                 .map_err(|_| {
                     format!(
@@ -4165,9 +4210,13 @@ impl PeerManager {
         let configured = self.connect_timeout_ms.load(Ordering::Relaxed);
         let connect_timeout =
             Duration::from_millis(configured.max(ONION_DIAL_TIMEOUT_FLOOR_MS));
+        // Per-dial random SOCKS credentials isolate this onion peer on its own
+        // Tor circuit (see `socks_cred`).
+        let cred = self.socks_cred();
+        let cred_ref = cred.as_ref().map(|(u, p)| (u.as_str(), p.as_str()));
         tokio::time::timeout(
             connect_timeout,
-            proxy::connect_socks5_onion(proxy_addr, host, port),
+            proxy::connect_socks5_onion(proxy_addr, host, port, cred_ref),
         )
         .await
         .map_err(|_| {

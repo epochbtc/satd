@@ -1241,6 +1241,8 @@ async fn main() {
     // Bitcoin Core's `-timeout` bounds the version/verack handshake.
     // `config.timeout` is already normalised to milliseconds.
     peer_manager.set_connect_timeout_ms(config.timeout);
+    // Per-connection SOCKS credential randomization (Tor stream isolation).
+    peer_manager.set_proxy_randomize(config.proxyrandomize);
 
     // -blocksonly: suppress P2P transaction relay.
     peer_manager.set_blocksonly(config.blocksonly);

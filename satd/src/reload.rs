@@ -527,6 +527,7 @@ fn field_specs() -> Vec<FieldSpec> {
         restart!("signetchallenge", signet_challenge),
         // ---- Proxy / Tor ----
         restart!("proxy", proxy),
+        restart!("proxyrandomize", proxyrandomize),
         restart!("onion", onion),
         restart!("torcontrol", torcontrol),
         restart_secret!("torpassword", torpassword),

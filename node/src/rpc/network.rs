@@ -5,6 +5,13 @@ use serde_json::{json, Value};
 pub fn get_network_info(peer_manager: &PeerManager) -> Value {
     let connections = peer_manager.connection_count();
     let onion_reachable = peer_manager.onion_routing_available();
+    let randomize = peer_manager.proxy_randomize();
+    let clearnet_proxy = peer_manager.proxy_addr().unwrap_or_default();
+    let onion_proxy = peer_manager.onion_proxy_addr().unwrap_or_default();
+    // proxy_randomize_credentials is only meaningful for a network that
+    // actually routes through a proxy.
+    let clearnet_randomize = randomize && !clearnet_proxy.is_empty();
+    let onion_randomize = randomize && !onion_proxy.is_empty();
     let local_addresses: Vec<Value> = peer_manager
         .local_addresses()
         .into_iter()
@@ -37,22 +44,22 @@ pub fn get_network_info(peer_manager: &PeerManager) -> Value {
                 "name": "ipv4",
                 "limited": false,
                 "reachable": true,
-                "proxy": "",
-                "proxy_randomize_credentials": false
+                "proxy": clearnet_proxy.clone(),
+                "proxy_randomize_credentials": clearnet_randomize
             },
             {
                 "name": "ipv6",
                 "limited": false,
                 "reachable": true,
-                "proxy": "",
-                "proxy_randomize_credentials": false
+                "proxy": clearnet_proxy,
+                "proxy_randomize_credentials": clearnet_randomize
             },
             {
                 "name": "onion",
                 "limited": !onion_reachable,
                 "reachable": onion_reachable,
-                "proxy": "",
-                "proxy_randomize_credentials": false
+                "proxy": onion_proxy,
+                "proxy_randomize_credentials": onion_randomize
             }
         ],
         "relayfee": 0.00001000,

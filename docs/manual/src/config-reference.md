@@ -157,6 +157,7 @@ satd accepts Bitcoin Core's configuration surface as its default:
 | Key | Default | Reload | Compat | Description |
 |---|---|---|---|---|
 | `proxy` | none | restart | core | SOCKS5 proxy for all outbound connections. |
+| `proxyrandomize` | on | restart | core | Use fresh random SOCKS5 credentials per connection so Tor isolates each peer on its own circuit (`IsolateSOCKSAuth`). Relies on Tor's default SocksPort isolation; a no-op on a non-Tor SOCKS proxy (or one with `IsolateSOCKSAuth` disabled), where credentials are simply not negotiated. Set `=0` to opt out. |
 | `onion` | = `-proxy` | restart | core | SOCKS5 proxy for `.onion` connections. |
 | `torcontrol` | `127.0.0.1:9051` | restart | core | Tor control port for the hidden service. Auth is negotiated via `PROTOCOLINFO`: SAFECOOKIE (stock-Tor default) when no password is set, else password, else null. |
 | `torpassword` | none | restart | core | Tor control port password (for a `HashedControlPassword` setup). Leave unset to use SAFECOOKIE cookie auth. |
