@@ -4113,7 +4113,11 @@ pub struct CliArgs {
     )]
     pub torcontrol: Option<String>,
 
-    #[arg(long, value_name = "PASS", help = "Tor control port password")]
+    #[arg(
+        long,
+        value_name = "PASS",
+        help = "Tor control port password (HashedControlPassword). Omit to use SAFECOOKIE cookie auth."
+    )]
     pub torpassword: Option<String>,
 
     #[arg(

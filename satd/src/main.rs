@@ -1337,18 +1337,30 @@ async fn main() {
     // off by default, implicitly on when -torcontrol is set (the legacy
     // satd trigger), and forced off by an explicit -listenonion=0.
     let mut _onion_addr: Option<String> = None;
+    // The ADD_ONION service lives only as long as its originating control
+    // connection (no `Detach` flag), so the controller must be held for the
+    // process lifetime — kept in this function-scope binding and dropped at
+    // process exit, which cleanly removes the service. Dropping it earlier would
+    // tear the hidden service down immediately.
+    let mut _tor_controller: Option<node::net::tor::TorController> = None;
     if config.listenonion {
         let torcontrol = config.torcontrol.as_deref().unwrap_or("127.0.0.1:9051");
         match node::net::tor::TorController::connect(torcontrol).await {
             Ok(mut controller) => {
-                let password = config.torpassword.as_deref().unwrap_or("");
-                match controller.authenticate(password).await {
+                // Pass the optional -torpassword through; the controller negotiates
+                // via PROTOCOLINFO and prefers SAFECOOKIE (stock-Tor default) when
+                // no password is set, so -listenonion works without a torrc
+                // HashedControlPassword.
+                match controller.authenticate(config.torpassword.as_deref()).await {
                     Ok(()) => {
                         let target = format!("127.0.0.1:{}", config.port);
                         match controller.create_hidden_service(config.port, &target).await {
                             Ok(onion) => {
                                 tracing::info!(onion_addr = %onion, "Tor hidden service created");
                                 _onion_addr = Some(onion);
+                                // Retain the control connection so Tor keeps the
+                                // service up for the node's lifetime.
+                                _tor_controller = Some(controller);
                             }
                             Err(e) => {
                                 tracing::error!("Failed to create Tor hidden service: {}", e);

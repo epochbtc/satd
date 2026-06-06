@@ -334,7 +334,8 @@ preserved; the satd extension is opt-in per request or per flag.
 - **`getibdprogress`** — IBD bitmap + per-peer tracking; richer than
   Core's `verificationprogress` scalar.
 
-- **Native Tor v3** — `ADD_ONION` / `DEL_ONION` via control port,
+- **Native Tor v3** — `ADD_ONION` / `DEL_ONION` via control port, with
+  `PROTOCOLINFO`-negotiated auth (SAFECOOKIE by default, password, or null) and
   hardcoded `.onion` seeds. No external torification daemon.
 
 - **Parallel IBD with prefetch + speculative verification** —
