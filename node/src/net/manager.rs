@@ -62,6 +62,16 @@ const DEFAULT_MAX_INBOUND_PER_IP: usize = 3;
 /// Default handshake timeout in milliseconds, matching Bitcoin Core's
 /// `-timeout` default (5000ms).
 const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 5000;
+/// Minimum timeout for a SOCKS5 `.onion` dial, in milliseconds. A `.onion`
+/// connect tunnels the proxy socket connect, the SOCKS5 handshake, and the
+/// Tor rendezvous (HS descriptor fetch + intro/rendezvous circuit build) — the
+/// last of which routinely takes well over the 5s clearnet socket-connect
+/// budget, especially on the first connection to a freshly-published service.
+/// Bitcoin Core gives the SOCKS5 exchange its own 20s `SOCKS5_RECV_TIMEOUT`
+/// (netbase.cpp) for exactly this reason; we mirror that as a floor so a small
+/// `-timeout` doesn't make onion peers effectively undialable. A larger
+/// `-timeout` still wins (operators can extend, not shorten, the onion budget).
+const ONION_DIAL_TIMEOUT_FLOOR_MS: u64 = 20_000;
 /// How far above the background connect cursor the AssumeUTXO catch-up
 /// downloader keeps historical blocks requested/on-disk. Bounds disk
 /// read-ahead and outstanding `getdata` for the background range.
@@ -753,6 +763,21 @@ impl PeerManager {
         }
     }
 
+    /// Drop a PeerAddr from the auto-reconnect set (the inverse of
+    /// [`add_peer_addr`]). Used by `addnode <node> remove`. Like Bitcoin Core,
+    /// this only stops future reconnect attempts; it does not force-disconnect
+    /// an already-established peer.
+    pub fn remove_peer_addr(&self, addr: &PeerAddr) {
+        match addr {
+            PeerAddr::Socket(sa) => {
+                self.connect_addrs.write().retain(|a| a != sa);
+            }
+            PeerAddr::Onion { .. } => {
+                self.connect_peer_addrs.write().retain(|a| a != addr);
+            }
+        }
+    }
+
     /// Count inbound peers, returning `(total_inbound, same_ip_inbound)`.
     /// Pulled out for unit-testing the per-IP cap without a real `TcpStream`.
     ///
@@ -1191,26 +1216,46 @@ impl PeerManager {
         }
     }
 
-    /// Get the list of configured connect addresses.
+    /// Get the list of configured connect addresses (clearnet sockets and
+    /// `.onion` peers added via `-addnode` / the addnode RPC).
     pub fn get_added_node_info(&self) -> Vec<serde_json::Value> {
-        let addrs = self.connect_addrs.read();
         let peers = self.peers.read();
-        addrs
-            .iter()
-            .map(|addr| {
-                let connected = peers
-                    .values()
-                    .any(|h| h.info.addr == *addr && h.info.state == PeerState::Connected);
-                serde_json::json!({
+        let mut out: Vec<serde_json::Value> = Vec::new();
+
+        for addr in self.connect_addrs.read().iter() {
+            let connected = peers
+                .values()
+                .any(|h| h.info.addr == *addr && h.info.state == PeerState::Connected);
+            out.push(serde_json::json!({
+                "addednode": addr.to_string(),
+                "connected": connected,
+                "addresses": [{
+                    "address": addr.to_string(),
+                    "connected": if connected { "outbound" } else { "false" },
+                }],
+            }));
+        }
+
+        // Onion added-nodes live in a separate list (the addrman is
+        // SocketAddr-keyed). Match them on the connected peer's onion_host.
+        for addr in self.connect_peer_addrs.read().iter() {
+            if let PeerAddr::Onion { host, .. } = addr {
+                let connected = peers.values().any(|h| {
+                    h.info.onion_host.as_deref() == Some(host.as_str())
+                        && h.info.state == PeerState::Connected
+                });
+                out.push(serde_json::json!({
                     "addednode": addr.to_string(),
                     "connected": connected,
                     "addresses": [{
                         "address": addr.to_string(),
                         "connected": if connected { "outbound" } else { "false" },
                     }],
-                })
-            })
-            .collect()
+                }));
+            }
+        }
+
+        out
     }
 
     /// Check if we are in Initial Block Download.
@@ -4009,7 +4054,12 @@ impl PeerManager {
             .as_deref()
             .or(self.proxy.as_deref())
             .ok_or("no proxy configured for .onion connections")?;
-        let connect_timeout = Duration::from_millis(self.connect_timeout_ms.load(Ordering::Relaxed));
+        // Floor the onion dial timeout at ONION_DIAL_TIMEOUT_FLOOR_MS so the Tor
+        // rendezvous has time to complete even when `-timeout` is at its 5s
+        // default; a larger `-timeout` still extends it.
+        let configured = self.connect_timeout_ms.load(Ordering::Relaxed);
+        let connect_timeout =
+            Duration::from_millis(configured.max(ONION_DIAL_TIMEOUT_FLOOR_MS));
         tokio::time::timeout(
             connect_timeout,
             proxy::connect_socks5_onion(proxy_addr, host, port),

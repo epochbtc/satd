@@ -37,6 +37,12 @@ In-progress; full detail tracked in
   **SAFECOOKIE**, so `-listenonion` works against a stock Tor
   (`CookieAuthentication 1`) with no `HashedControlPassword`. Falls back to
   password (`-torpassword`) or null; the server's cookie proof is verified.
+  The `addnode` RPC now accepts `.onion` peers (e.g.
+  `addnode "<base32>.onion:8333" add`), matching Bitcoin Core — onion peers were
+  previously addable only via the `-addnode` config. Onion dials are also given
+  a 20s timeout floor (Core's `SOCKS5_RECV_TIMEOUT`) independent of `-timeout`,
+  so the Tor rendezvous can complete on first connection instead of being cut
+  off by the 5s clearnet socket-connect budget.
 - **API scaling** — per-surface admission control (honors `-rpcthreads` /
   `-rpcworkqueue`); isolated bounded runtime for read/streaming surfaces
   (`--api-threads`); opt-in read-only JSON-RPC listener (`-rpcreadonlybind`).
