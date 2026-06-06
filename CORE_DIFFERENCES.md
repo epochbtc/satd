@@ -229,11 +229,11 @@ with consistent shape and provenance. Core's per-topic ZMQ model is
 
 ### MCP server (`satd-mcp`)
 
-Model Context Protocol tools over the ops-surface RPCs. stdio transport
-(`--mcp-stdio`) and streamable-HTTP transport (`--mcp-port`). Lets
-agentic / LLM consumers call `get_health`, `get_reorg_history`,
-`subscribe_mempool_snapshot`, etc. without re-implementing JSON-RPC
-auth.
+Model Context Protocol tools over the ops-surface RPCs, served over a
+streamable-HTTP(S) transport (`--mcpport`, with native TLS/mTLS via
+`--mcpcert`/`--mcpkey`/`--mcpmtls`). Lets agentic / LLM consumers call
+`get_health`, `get_reorg_history`, `subscribe_mempool_snapshot`, etc.
+without re-implementing JSON-RPC auth.
 
 No Bitcoin Core equivalent.
 

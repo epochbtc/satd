@@ -321,11 +321,15 @@ Core ZMQ wire-format compatible.)
 | Key | Default | Reload | Compat | Description |
 |---|---|---|---|---|
 | `mcp` | off | restart | satd | Enable the MCP server. |
-| `mcpstdio` | on when `mcp` | restart | satd | Enable the MCP stdio transport. |
 | `mcpport` | none | restart | satd | Enable the MCP HTTP transport on this port. |
-| `mcpbind` | `127.0.0.1` | restart | satd | MCP HTTP bind address. |
+| `mcpbind` | `127.0.0.1` | restart | satd | MCP HTTP bind address (non-loopback requires auth + TLS). |
+| `mcpcert` | none | restart | satd | PEM TLS certificate for the MCP server (enables HTTPS; requires `mcpkey`). Required for any non-loopback bind. |
+| `mcpkey` | none | restart | satd | PEM TLS private key for the MCP server (requires `mcpcert`). |
+| `mcpmtls` | false | restart | satd | Require mutual TLS on the MCP listener (requires `mcpcert`/`mcpkey` + `mcpmtlsclientca`). |
+| `mcpmtlsclientca` | none | restart | satd | PEM CA bundle that client certs must chain to when `mcpmtls`. |
+| `mcpmtlsclientallow` | any | restart | satd | Allowlist of accepted client-cert CN / DNS-SAN values. |
 | `mcpauth` | false | restart | satd | Require bearer tokens (`mcp:*`) on the MCP HTTP server (requires `authfile`). |
-| `mcpallowremote` | false | restart | satd | Permit a non-loopback MCP HTTP bind (requires `mcpauth`). |
+| `mcpallowremote` | false | restart | satd | Permit a non-loopback MCP HTTP bind (requires `mcpauth` + TLS). |
 
 ## Metrics / health
 

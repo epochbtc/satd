@@ -29,6 +29,10 @@ In-progress; full detail tracked in
 - **Auth** — opt-in capability-scoped bearer-token layer (`-authfile`) across
   JSON-RPC, Esplora, events gRPC, and MCP, with per-token rate limits and
   watch-set quotas. Default credential behavior unchanged.
+- **MCP** — native TLS/mTLS for the HTTP server via
+  `-mcpcert`/`-mcpkey`/`-mcpmtls`; a remote bind requires TLS so the bearer token
+  is never sent in cleartext. The stdio transport (`-mcpstdio`) is removed; MCP
+  is HTTP(S)-only.
 - **API scaling** — per-surface admission control (honors `-rpcthreads` /
   `-rpcworkqueue`); isolated bounded runtime for read/streaming surfaces
   (`--api-threads`); opt-in read-only JSON-RPC listener (`-rpcreadonlybind`).

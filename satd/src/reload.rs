@@ -681,9 +681,13 @@ fn field_specs() -> Vec<FieldSpec> {
         live_secret!("reorgwebhooksecret", reorg_webhook_secret, apply_webhook),
         // ---- MCP ----
         restart!("mcp", mcp),
-        restart!("mcpstdio", mcp_stdio),
         restart!("mcpport", mcp_port),
         restart!("mcpbind", mcp_bind),
+        restart!("mcpcert", mcp_tls_cert),
+        restart!("mcpkey", mcp_tls_key),
+        restart!("mcpmtls", mcp_mtls),
+        restart!("mcpmtlsclientca", mcp_mtls_client_ca),
+        restart!("mcpmtlsclientallow", mcp_mtls_client_allow),
         restart!("mcpauth", mcp_auth),
         restart!("mcpallowremote", mcp_allow_remote),
         // ---- Metrics / health ----
