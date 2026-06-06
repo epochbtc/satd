@@ -11,6 +11,15 @@ const SERVER_HASH_KEY: &[u8] = b"Tor safe cookie authentication server-to-contro
 const CLIENT_HASH_KEY: &[u8] = b"Tor safe cookie authentication controller-to-server hash";
 /// The control-port authentication cookie is exactly 32 bytes.
 const COOKIE_LEN: usize = 32;
+/// Bound for a single control-port connect/read. Hidden-service bring-up runs on
+/// the startup path, so a hung or half-open control port (a wedged Tor, or a
+/// non-Tor process squatting the port that accepts then never replies) must not
+/// stall satd forever. Generous for a busy local Tor, short enough to fail.
+const CONTROL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// Cap on lines in a single control reply (anti-flood): a real
+/// PROTOCOLINFO/AUTHCHALLENGE reply is a handful of lines, so a port streaming
+/// continuation lines without a terminator is refused rather than read forever.
+const MAX_REPLY_LINES: usize = 256;
 
 /// Auth methods a Tor control port may advertise via `PROTOCOLINFO`.
 #[derive(Debug, Default, Clone)]
@@ -28,6 +37,11 @@ struct AuthMethods {
 /// - AUTHENTICATE — SAFECOOKIE (default), password (`-torpassword`), or null
 /// - ADD_ONION (create ephemeral hidden service)
 /// - DEL_ONION (remove hidden service on shutdown)
+///
+/// An `ADD_ONION` ephemeral service is removed by Tor when the **originating
+/// control connection closes** (no `Detach` flag), so the caller must keep this
+/// controller alive for as long as the hidden service should exist. Dropping it
+/// (e.g. at process exit) is itself a clean teardown.
 pub struct TorController {
     reader: BufReader<tokio::io::ReadHalf<TcpStream>>,
     writer: tokio::io::WriteHalf<TcpStream>,
@@ -36,8 +50,9 @@ pub struct TorController {
 impl TorController {
     /// Connect to the Tor control port.
     pub async fn connect(addr: &str) -> Result<Self, String> {
-        let stream = TcpStream::connect(addr)
+        let stream = tokio::time::timeout(CONTROL_TIMEOUT, TcpStream::connect(addr))
             .await
+            .map_err(|_| format!("Tor control connect to {} timed out", addr))?
             .map_err(|e| format!("Tor control connect to {} failed: {}", addr, e))?;
 
         let (read_half, write_half) = tokio::io::split(stream);
@@ -127,6 +142,13 @@ impl TorController {
 
     /// SAFECOOKIE challenge/response (control-spec §3.24).
     async fn authenticate_safecookie(&mut self, cookie_path: &str) -> Result<(), String> {
+        // `cookie_path` comes from the control port's own PROTOCOLINFO response,
+        // so a hostile/compromised control port could point it at any 32-byte
+        // file satd can read. That is acceptable under the standard "the local
+        // control port is trusted" model (same as Bitcoin Core): the bytes are
+        // only fed into the HMAC, never sent or logged, and the SERVERHASH check
+        // below fails unless the port already knows the file — i.e. it is the
+        // real Tor. No confidentiality leak results.
         let cookie = std::fs::read(cookie_path).map_err(|e| {
             format!(
                 "Tor SAFECOOKIE: cannot read cookie file {}: {} (run satd as a user that can read \
@@ -191,6 +213,13 @@ impl TorController {
     }
 
     async fn authenticate_password(&mut self, password: &str) -> Result<(), String> {
+        // The control protocol is line-oriented; a CR/LF in the password would
+        // terminate the AUTHENTICATE line early and inject a second command.
+        // Reject rather than escape — a newline in a control password is always
+        // a misconfiguration.
+        if password.contains(['\r', '\n']) {
+            return Err("Tor control password must not contain CR or LF".to_string());
+        }
         // Control-spec quoting: backslash-escape `\` and `"`.
         let escaped = password.replace('\\', "\\\\").replace('"', "\\\"");
         self.writer
@@ -268,13 +297,14 @@ impl TorController {
         Ok(())
     }
 
-    /// Read a single line response from the control port.
+    /// Read a single line response from the control port, bounded by
+    /// [`CONTROL_TIMEOUT`] so a silent/half-open port can't block forever (the
+    /// timeout also caps an unterminated slowloris dribble of bytes).
     async fn read_response(&mut self) -> Result<String, String> {
         let mut line = String::new();
-        let n = self
-            .reader
-            .read_line(&mut line)
+        let n = tokio::time::timeout(CONTROL_TIMEOUT, self.reader.read_line(&mut line))
             .await
+            .map_err(|_| "Tor control read timed out".to_string())?
             .map_err(|e| format!("Tor control read failed: {}", e))?;
         if n == 0 {
             return Err("Tor control port closed the connection".to_string());
@@ -287,8 +317,21 @@ impl TorController {
     /// An error status (`4xx`/`5xx`) returns the lines as an `Err`.
     async fn read_reply(&mut self) -> Result<Vec<String>, String> {
         let mut lines = Vec::new();
+        // Count every read, including skipped async-event lines, so a port that
+        // streams `6xx` events forever still hits the cap rather than looping.
+        let mut reads = 0usize;
         loop {
+            if reads >= MAX_REPLY_LINES {
+                return Err("Tor control reply exceeded line cap".to_string());
+            }
+            reads += 1;
             let line = self.read_response().await?;
+            // Async event lines (`6xx`) can arrive unsolicited on the control
+            // connection; they are not part of a command reply, so skip them
+            // rather than mistaking one for this reply's terminal line.
+            if line.starts_with('6') {
+                continue;
+            }
             let terminal = line.len() >= 4 && line.as_bytes()[3] == b' ';
             let is_ok = line.starts_with('2');
             lines.push(line);
@@ -337,8 +380,16 @@ fn ct_ne(a: &[u8], b: &[u8]) -> bool {
 /// Extract the value following `key` in a space-separated control line, up to
 /// the next space (e.g. `token_value("METHODS=A,B COOKIEFILE=\"x\"", "METHODS=")`
 /// → `Some("A,B")`). Quoted values keep their quotes; use [`unquote`].
+///
+/// `key` is matched only at a **token boundary** (start of line or right after a
+/// space), so a value can't smuggle a decoy `KEY=` as a substring of another
+/// token. `match_indices` yields matches at char boundaries, so the slicing
+/// below can't panic on a non-ASCII line.
 fn token_value<'a>(line: &'a str, key: &str) -> Option<&'a str> {
-    let start = line.find(key)? + key.len();
+    let start = line
+        .match_indices(key)
+        .find(|(idx, _)| *idx == 0 || line.as_bytes()[idx - 1] == b' ')
+        .map(|(idx, _)| idx + key.len())?;
     let rest = &line[start..];
     // A quoted value may contain spaces; take through the closing quote.
     if let Some(after_quote) = rest.strip_prefix('"') {
@@ -388,6 +439,15 @@ mod tests {
             unquote(token_value(line, "COOKIEFILE=").unwrap()),
             "/var/lib/tor data/control.authcookie"
         );
+    }
+
+    #[test]
+    fn token_value_is_token_anchored_not_substring() {
+        // `SERVERHASH=` must match the real token, not the `SERVERHASH=` substring
+        // inside a decoy token like `NOTSERVERHASH=`.
+        let line = "250 AUTHCHALLENGE NOTSERVERHASH=dead SERVERHASH=beef SERVERNONCE=cafe";
+        assert_eq!(token_value(line, "SERVERHASH="), Some("beef"));
+        assert_eq!(token_value(line, "SERVERNONCE="), Some("cafe"));
     }
 
     /// A minimal Tor control port that drives the real SAFECOOKIE handshake
@@ -488,7 +548,11 @@ mod tests {
             .await
             .expect("SAFECOOKIE auth should succeed");
 
-        let client_hash = server.await.unwrap().unwrap();
+        let client_hash = tokio::time::timeout(std::time::Duration::from_secs(30), server)
+            .await
+            .expect("fake-tor server task timed out")
+            .unwrap()
+            .unwrap();
         assert_eq!(client_hash.len(), 32, "server received a 32-byte client proof");
     }
 
@@ -510,7 +574,11 @@ mod tests {
         // on an auth failure, and it lets the fake server's pending read see EOF
         // instead of blocking forever on an AUTHENTICATE that never comes.
         drop(ctrl);
-        let sent = server.await.unwrap().unwrap();
+        let sent = tokio::time::timeout(std::time::Duration::from_secs(30), server)
+            .await
+            .expect("fake-tor server task timed out")
+            .unwrap()
+            .unwrap();
         assert!(
             sent.is_empty(),
             "client leaked a proof to an unverified server"
