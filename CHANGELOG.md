@@ -50,7 +50,12 @@ In-progress; full detail tracked in
   address out of band. As a prerequisite, satd now records a peer's
   `sendaddrv2` during the handshake (it was previously dropped, so satd never
   sent addrv2 to anyone); the onion network's `getnetworkinfo` `reachable` flag
-  now reflects whether an onion-routing proxy is configured.
+  now reflects whether an onion-routing proxy is configured. New
+  **`-proxyrandomize`** (default on, matching Core) gives each outbound
+  connection fresh random SOCKS5 credentials so Tor isolates every peer on its
+  own circuit — previously all connections shared circuits, letting a single
+  guard/exit correlate the whole peer set. `getnetworkinfo` now reports the
+  configured `proxy` and an honest `proxy_randomize_credentials` per network.
 - **API scaling** — per-surface admission control (honors `-rpcthreads` /
   `-rpcworkqueue`); isolated bounded runtime for read/streaming surfaces
   (`--api-threads`); opt-in read-only JSON-RPC listener (`-rpcreadonlybind`).
