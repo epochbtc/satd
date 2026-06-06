@@ -89,28 +89,44 @@ async fn main() {
     let env_filter = config::build_env_filter(&config);
     let (filter_layer, filter_reload_handle) = tracing_subscriber::reload::Layer::new(env_filter);
     {
+        use tracing_subscriber::Layer as _;
         use tracing_subscriber::layer::SubscriberExt;
         use tracing_subscriber::util::SubscriberInitExt;
         let registry = tracing_subscriber::registry().with(filter_layer);
-        match config.log_format {
+        // Shared fmt knobs (`-logthreadnames` / `-logsourcelocations`) are
+        // plain runtime bools on the same layer type; `-logtimestamps=0`
+        // toggles `.without_time()`, which changes the layer's type, so each
+        // branch is `.boxed()` to a single `Box<dyn Layer>`.
+        let fmt_layer = match config.log_format {
             config::LogFormat::Json => {
                 // Stable JSON shape: `timestamp`, `level`, `target`,
                 // `fields.message`, plus any per-event structured fields.
-                registry
-                    .with(
-                        tracing_subscriber::fmt::layer()
-                            .json()
-                            .with_current_span(true)
-                            .with_span_list(false),
-                    )
-                    .init();
+                let l = tracing_subscriber::fmt::layer()
+                    .json()
+                    .with_current_span(true)
+                    .with_span_list(false)
+                    .with_thread_names(config.log_thread_names)
+                    .with_file(config.log_source_locations)
+                    .with_line_number(config.log_source_locations);
+                if config.log_timestamps {
+                    l.boxed()
+                } else {
+                    l.without_time().boxed()
+                }
             }
             config::LogFormat::Text => {
-                registry
-                    .with(tracing_subscriber::fmt::layer())
-                    .init();
+                let l = tracing_subscriber::fmt::layer()
+                    .with_thread_names(config.log_thread_names)
+                    .with_file(config.log_source_locations)
+                    .with_line_number(config.log_source_locations);
+                if config.log_timestamps {
+                    l.boxed()
+                } else {
+                    l.without_time().boxed()
+                }
             }
-        }
+        };
+        registry.with(fmt_layer).init();
     }
     let log_reload_handle = reload::LogReloadHandle::new(filter_reload_handle);
 

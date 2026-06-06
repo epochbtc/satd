@@ -85,6 +85,9 @@ semantics track **Bitcoin Core v30**.
 | `daemon` | off | restart | core | Run in background; accepted for compatibility (no-op — use systemd). |
 | `server` | on | restart | core | Accept RPC commands; accepted for compatibility (always on). |
 | `logformat` | text | restart | satd | Log output format: `text` or `json`. Only verbosity hot-reloads, not the format. |
+| `logtimestamps` | on | restart | core | Prepend a timestamp to each log line. Disable (`-nologtimestamps`) when journald / the container runtime already stamps lines. |
+| `logthreadnames` | off | restart | core | Prepend the originating thread name to each log line. |
+| `logsourcelocations` | off | restart | core | Prepend source `file:line` to each log line. |
 | `debug` | none | hot | core | Enable debug logging for a category (repeatable; bare/`all`/`1` = everything). |
 | `debugexclude` | none | hot | core | Disable debug logging for a category `debug` would otherwise enable. |
 | `maxshutdownsecs` | 30 | hot | satd | Max graceful-shutdown flush duration (seconds) before force exit. |
