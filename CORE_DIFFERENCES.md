@@ -7,6 +7,12 @@ Bitcoin Core so that existing operators, integrators, and downstream
 infrastructure (BTCPayServer, NBXplorer, Sparrow, Umbrel, Start9,
 mempool.space SDK, BDK) work without code changes.
 
+**Compatibility target: Bitcoin Core v30.** Compatibility is pinned to a
+named Core release rather than tracking Core indefinitely. satd matches
+v30's CLI/`bitcoin.conf` surface and makes no compatibility commitment for
+configuration options introduced in later Core releases (e.g. the v31
+cluster-mempool knobs).
+
 Within that compatibility envelope, satd intentionally goes further on
 **features, ergonomics, and operator flexibility**. This document
 catalogs those deviations: what we ship that Core doesn't, what we

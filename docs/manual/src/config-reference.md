@@ -15,6 +15,10 @@ family, reindex) in [Initial Block Download & Fast Sync](ibd.md).
 
 ## How satd reads configuration
 
+The compatibility target is **Bitcoin Core v30**: key names and semantics are
+matched against v30's option set, and satd makes no compatibility commitment for
+configuration options introduced in later Core releases.
+
 satd accepts Bitcoin Core's configuration surface as its default:
 
 - **`bitcoin.conf` (or `satd.conf`)** with Core's `key=value` and `[network]`
