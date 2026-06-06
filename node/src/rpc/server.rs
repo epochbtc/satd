@@ -1337,15 +1337,49 @@ pub async fn start(
             .unwrap_or(Some("onetry".to_string()))
             .unwrap_or("onetry".to_string());
 
-        if command == "onetry" || command == "add" {
-            let addr: std::net::SocketAddr =
-                addr_str.parse().map_err(|e: std::net::AddrParseError| {
-                    ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
-                })?;
-            ctx.peer_manager
-                .connect_outbound(addr)
-                .await
-                .map_err(|e| ErrorObjectOwned::owned(-1, e, None::<()>))?;
+        // Parse via PeerAddr so `.onion:port` targets are accepted, not just
+        // `SocketAddr`s — Bitcoin Core's addnode takes onion addresses, and a
+        // SocketAddr can't represent a hostname. Onion peers are dialed through
+        // the configured SOCKS proxy by `connect_peer_addr`.
+        match command.as_str() {
+            "add" => {
+                // Register for auto-reconnect and return immediately, matching
+                // Core (and the `-addnode` config path): `add` records the peer;
+                // the reconnect loop dials it. Blocking here would stall the RPC
+                // for the whole connect timeout — up to the 20s onion floor — and
+                // wrongly report a transient dial failure as an addnode error.
+                let addr = crate::net::peer::PeerAddr::parse(&addr_str)
+                    .map_err(|e| ErrorObjectOwned::owned(-1, e, None::<()>))?;
+                ctx.peer_manager.add_peer_addr(addr.clone());
+                let pm = ctx.peer_manager.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = pm.connect_peer_addr(&addr).await {
+                        tracing::debug!(%addr, "addnode add: initial dial failed: {e}");
+                    }
+                });
+            }
+            "onetry" => {
+                // A single, un-remembered attempt — block on it and surface the
+                // result, matching the prior satd behavior (now onion-capable).
+                let addr = crate::net::peer::PeerAddr::parse(&addr_str)
+                    .map_err(|e| ErrorObjectOwned::owned(-1, e, None::<()>))?;
+                ctx.peer_manager
+                    .connect_peer_addr(&addr)
+                    .await
+                    .map_err(|e| ErrorObjectOwned::owned(-1, e, None::<()>))?;
+            }
+            "remove" => {
+                let addr = crate::net::peer::PeerAddr::parse(&addr_str)
+                    .map_err(|e| ErrorObjectOwned::owned(-1, e, None::<()>))?;
+                ctx.peer_manager.remove_peer_addr(&addr);
+            }
+            other => {
+                return Err(ErrorObjectOwned::owned(
+                    -1,
+                    format!("addnode: unknown command '{other}' (expected add/onetry/remove)"),
+                    None::<()>,
+                ));
+            }
         }
         Ok::<_, ErrorObjectOwned>(serde_json::Value::Null)
     })?;
