@@ -34,6 +34,9 @@ parking_lot = { workspace = true }
 ipnet = "2.12"
 hmac = "0.12"
 sha2 = "0.10"
+# Tor v3 .onion address derivation (checksum is SHA3-256; address is base32).
+sha3 = "0.10"
+data-encoding = "2"
 bip324 = "0.10"
 tls-config = { path = "../tls-config" }
 

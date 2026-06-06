@@ -60,17 +60,36 @@ const SIGNET_SEEDS: &[&str] = &[
 /// DNS seeds for regtest (none - local network only).
 const REGTEST_SEEDS: &[&str] = &[];
 
-/// Hardcoded .onion seed nodes for mainnet (Bitcoin Core chainparamsseeds.h).
-/// These are well-known, reliable Tor v3 nodes.
+/// Hardcoded Tor v3 `.onion` seed nodes for mainnet.
+///
+/// Refreshed 2026-06-05: harvested from live `addrv2` gossip and each verified
+/// over Tor with a real handshake (mainnet magic, `NODE_NETWORK`, chain height
+/// at the tip). The previous list had gone stale — 7 of its 8 entries were
+/// unreachable. These bootstrap a proxy-only node; once any one connects,
+/// `addrv2` TorV3 gossip discovery grows the peer set from there (see the
+/// AddrV2 handler in `manager.rs`). Seeds inevitably churn, so this is a
+/// best-effort point-in-time snapshot, not a guarantee of liveness.
 const MAINNET_ONION_SEEDS: &[(&str, u16)] = &[
-    ("2bqghnldu6mcug4pikzprwhtjjnsyederctvci6klcwzepnjd46ikdqd.onion", 8333),
-    ("4lr3w2iyyl5u5l6tosizclykz5ecg7sabjuon5gtiml4pkjurdbhmhid.onion", 8333),
-    ("5g72ppm3krkorsfopcm2bi7wlv4ohhs4u4mlseymasn7g7zhdcyjpfid.onion", 8333),
-    ("c6oy6as64abru7jv626x6bnrxaqxhmpv2c2bljjgdhmhj5wx7swbraid.onion", 8333),
-    ("dz4ioibi5g5h6vghaniashybwjhtk4ts3a7vk5cqda6kxv3damhingid.onion", 8333),
-    ("i2r5tbaizb36s3gfuahrexgvhsrhjhu2paqj5je3lzog6hpkoanfmeid.onion", 8333),
-    ("lsoyeunwlbfpbarczl5q5grzljd7mkrqpgo5j3zxmauelaoanat7iaid.onion", 8333),
-    ("oy4jjez4onqfm7edrbyopfkakdw3mrwvclnn4yta6dvx3pynjgicrrad.onion", 8333),
+    ("26c74c5xnpvadacn2uubs7v2iuf6qm4vn3wccyk36lwkxwklsulkyead.onion", 8333),
+    ("26jfbxrdnsbxlai7qonraijp3sa2sybizmx75ry6dyr3s3dampmwufyd.onion", 8333),
+    ("2ca656itamfkipcwcdh3bpdbd5mn5xo5ii7vw3oawve44meshol6sxid.onion", 8333),
+    ("2de3byew2d3cjqmux357khiqyp3c67qcxeloi3vpko4mojjdnxa37rqd.onion", 8333),
+    ("2fwcqag4zp5mzwvo3segz6r55ogib4ueinuzfi7tn5cndgdduk2qrmyd.onion", 8333),
+    ("2g4d23kmoegzn3xqgso5fkrozhcclhamefy4xsbnzfyp4vtqa6rtjdqd.onion", 8333),
+    ("2glboh4yrv43tuxdox4emdqdtvmvs74ngtbge3hozwdtjlcbf76rrgqd.onion", 8333),
+    ("2iqjfak6fykasmimpst2qujiaphxjweg6jgsfuvqfmqynlxdz7fnliad.onion", 8333),
+    ("2l465kxadtqllf2wxledetrz4d3ya46zkyw6zy3vyjkqqnwls2mvtyqd.onion", 8333),
+    ("2nemrcmvpoaqjl3jq4de5dion5p55sw4txuwwcyyrp67f34tmt5x7qyd.onion", 8333),
+    ("2ptbjwtj7bi4u4jcifnawrkrli6yqbsnncpftla4nkuzhyvelvuwg7ad.onion", 8333),
+    ("2rpqi26jltpqxghloljkfvpywqyiztklvqe2j6g535ct4qc5cfi6wcid.onion", 8333),
+    ("2rtsgzkzj6ffft56ja75oxk246lxujpudo5mzgdmku67y32dqtw6vfad.onion", 8333),
+    ("2ukffrxtqhzgx4g7dvhzvh2dohperls7ukmqfcycz7yjszewggtwe7ad.onion", 8333),
+    ("2v7zzpxnkdwoyagjbzvqzdpyc3t5l7ppwwxffwxzgm7pmwsxk6mkxyid.onion", 8333),
+    ("2va7vyqugpvwyz3i3urgtplnyz6wsvnt5avg26hcmgla3gbazkk65dqd.onion", 8333),
+    ("2w2x2ohgqxjsjzt7nwc6nz55rxxjzwagphio33niud7fc2zil6hb5hqd.onion", 8333),
+    ("35kcii6eyanzvlbitmgxd6gmpanuyojib2z6rcwptbbtrnl5izgxrxid.onion", 8333),
+    ("35lmqbnvj5cxmiewccr3ui77pjd7bftlcfxrpw5os4ukxgsv63hkoayd.onion", 8333),
+    ("35okkasj3syxb2zwnlp6k2bsjatfhovyyvzgld7acoryjd3blz4dxbad.onion", 8333),
 ];
 
 /// Hardcoded .onion seed nodes for signet.
