@@ -31,7 +31,7 @@ separately as a forward-looking protocol spec.
 
 ## Persistent Reorg Log & Webhook
 
-*   A persistent, append-only JSONL log at `$datadir/reorg.log` survives restarts.
+*   A persistent, append-only JSONL log at `$datadir/<network>/reorg.log` (the network-specific datadir subdirectory; directly under `$datadir` only on mainnet) survives restarts.
 *   Optional HTTP POST on reorgs via `--reorg-webhook=<url>`.
 
 ## Client-Side PSBT Signing

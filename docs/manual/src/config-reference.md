@@ -149,7 +149,7 @@ satd accepts Bitcoin Core's configuration surface as its default:
 | `bantime` | 86400 | hot | core | Ban duration in seconds. |
 | `timeout` | 5000 ms | hot | core | P2P connection timeout in milliseconds (accepts `5s`/`5000ms`). |
 | `onlynet` | all | restart | core | Restrict to network types: `ipv4`, `ipv6`, `onion`. |
-| `signetseednode` | built-in seeds | restart | satd | Additional signet seed node (repeatable; signet only). |
+| `signetseednode` | built-in seeds | restart | core | Additional signet seed node (repeatable; signet only). |
 | `signetchallenge` | default signet | restart | core | Custom signet challenge script, hex (BIP 325; signet only). |
 
 ## Proxy / Tor
@@ -186,7 +186,7 @@ satd accepts Bitcoin Core's configuration surface as its default:
 
 | Key | Default | Reload | Compat | Description |
 |---|---|---|---|---|
-| `mempoolfullrbf` | on | hot | core | Enable full replace-by-fee. |
+| `mempoolfullrbf` | on | hot | satd | Enable full replace-by-fee. Core removed this flag in v28 (full-RBF is now unconditional there); satd retains it as a toggle. |
 | `maxmempool` | 300 MB | hot | core | Maximum mempool size in MB. |
 | `minrelaytxfee` | 1000 sat/kvB | hot | core | Minimum relay fee rate. |
 | `dustrelayfee` | 3000 sat/kvB | hot | core | Dust relay fee rate. |
@@ -251,6 +251,7 @@ satd accepts Bitcoin Core's configuration surface as its default:
 | `prune` | 0 (no pruning) | restart | core | Prune block data to target size in MB. |
 | `reindex` | off | restart | core | Rebuild block index and chain state from block files on disk. |
 | `reindexchainstate` | off | restart | core | Rebuild the UTXO set from existing block files (Core `-reindex-chainstate`). |
+| `checkblockindex` | off (on for regtest) | restart | core | Audit block-index / active-chain consistency at startup (Core `-checkblockindex`). |
 | `dbcache` | 450 MB (or `auto`) | restart | core | Total write-cache size in MB, or `auto` for adaptive sizing. |
 | `storageprofile` | ssd | restart | satd | Storage class for chainstate tuning: `ssd` or `hdd`. |
 | `prefetchworkers` | CPU cores | restart | satd | Number of IBD prefetch worker threads. |

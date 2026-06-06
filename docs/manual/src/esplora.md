@@ -233,8 +233,9 @@ upstream blockstream.info / mempool.space within these constraints:
 - **Mempool ordering** in `/address/:addr/txs/mempool` is HashSet
   iteration order, not strictly time-ordered. Upstream's contract is
   "up to 50", not a specific order.
-- **Fee histogram bucketing** uses electrs's published boundaries
-  (1, 2, 3, 4, 5, 6, 8, 10, 12, 15, 20, …, 4000 sat/vB).
+- **Fee histogram bucketing** uses fixed boundaries spanning realistic
+  mainnet fee regimes: 1, 2, 3, 5, 8, 10, 15, 20, 30, 50, 75, 100, 150,
+  200, 300, 500, 1000 sat/vB.
 - **WebSocket** subscriptions are not implemented; SSE is the
   supported live-updates transport. Most consumers (BDK, mempool.space
   SDK) accept SSE as a drop-in replacement.

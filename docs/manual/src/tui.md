@@ -369,9 +369,10 @@ Last 7 days of reorg events from `getreorghistory`. Up to 40 entries.
 | **−N +M blocks** | Disconnected vs. reconnected counts. |
 | **age** | Time since the reorg. |
 
-A persistent file copy lives at `$datadir/reorg.log` and is written by
-satd regardless of TUI state — the modal is a viewer, not the source of
-truth.
+A persistent file copy lives at `$datadir/<network>/reorg.log` (the
+network-specific datadir subdirectory; directly under `$datadir` only on
+mainnet) and is written by satd regardless of TUI state — the modal is a
+viewer, not the source of truth.
 
 ### Warnings
 Centred 80% × 70% overlay that appears automatically when there are

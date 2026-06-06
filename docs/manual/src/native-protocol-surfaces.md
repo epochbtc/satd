@@ -52,7 +52,7 @@ Concretely:
 - **One systemd unit, one Docker image, one log stream, one PID.**
 - **One dbcache budget**, one memory allocator, no double-counting RAM.
 - **No RocksDB-secondary-mode coordination problem** — RocksDB doesn't allow concurrent writers; secondary-mode read-only access works but adds lag and schema-coordination headaches.
-- **Feature flags address the "don't pay for what you don't use" concern.** `cargo build --no-default-features` produces a lean consensus-only binary; default build includes both protocols.
+- **Runtime flags address the "don't pay for what you don't use" concern.** Esplora and Electrum are always compiled into the `satd` binary and are gated at runtime by `--esplora` / `--electrum` (Esplora on by default, Electrum off). The only build-time switch is `--no-default-features`, which compiles out the BIP 158 block-filter-index codec — it does not remove the protocol servers.
 
 The case for separation gets stronger if Electrum subscriptions turn out to be
 the dominant memory pressure point in production (mobile wallets subscribing to
@@ -107,7 +107,7 @@ an architectural one:
 - `node-index` — address-history index over RocksDB. The load-bearing crate; both protocols depend on it.
 - `electrum-proto` — vendored Electrum protocol layer, depends on the `Index` trait from `node-index`.
 - `esplora-handlers` — Esplora REST handlers, depends on the same `Index` trait.
-- `satd` (binary) — pulls in all three behind feature flags (`electrum`, `esplora`).
+- `satd` (binary) — links all three library crates; the Esplora and Electrum servers are started/stopped by the runtime flags `--esplora` / `--electrum`.
 
 Future companion binaries (`sat-electrum`, `sat-esplora` per "Future split"
 above) reuse the same library crates with thin `main.rs` shells.
