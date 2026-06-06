@@ -7,8 +7,9 @@ use crate::mempool::pool::Mempool;
 
 /// Maximum block weight (4 million weight units).
 const MAX_BLOCK_WEIGHT: usize = 4_000_000;
-/// Reserve weight for coinbase transaction.
-const COINBASE_WEIGHT_RESERVE: usize = 4_000;
+/// Reserve weight for coinbase transaction. Matches Bitcoin Core v30's
+/// `DEFAULT_BLOCK_RESERVED_WEIGHT` (8000 WU).
+const COINBASE_WEIGHT_RESERVE: usize = 8_000;
 
 /// A selected transaction for the block template.
 pub struct TemplateTx {
