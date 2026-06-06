@@ -33,6 +33,10 @@ In-progress; full detail tracked in
   `-mcpcert`/`-mcpkey`/`-mcpmtls`; a remote bind requires TLS so the bearer token
   is never sent in cleartext. The stdio transport (`-mcpstdio`) is removed; MCP
   is HTTP(S)-only.
+- **Tor** — control-port auth is negotiated via `PROTOCOLINFO` and now supports
+  **SAFECOOKIE**, so `-listenonion` works against a stock Tor
+  (`CookieAuthentication 1`) with no `HashedControlPassword`. Falls back to
+  password (`-torpassword`) or null; the server's cookie proof is verified.
 - **API scaling** — per-surface admission control (honors `-rpcthreads` /
   `-rpcworkqueue`); isolated bounded runtime for read/streaming surfaces
   (`--api-threads`); opt-in read-only JSON-RPC listener (`-rpcreadonlybind`).

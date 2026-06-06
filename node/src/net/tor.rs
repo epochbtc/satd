@@ -1,10 +1,31 @@
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
+
+type HmacSha256 = Hmac<Sha256>;
+
+/// HMAC key Tor uses for the SAFECOOKIE server proof (control-spec §3.24).
+const SERVER_HASH_KEY: &[u8] = b"Tor safe cookie authentication server-to-controller hash";
+/// HMAC key Tor uses for the SAFECOOKIE client proof.
+const CLIENT_HASH_KEY: &[u8] = b"Tor safe cookie authentication controller-to-server hash";
+/// The control-port authentication cookie is exactly 32 bytes.
+const COOKIE_LEN: usize = 32;
+
+/// Auth methods a Tor control port may advertise via `PROTOCOLINFO`.
+#[derive(Debug, Default, Clone)]
+struct AuthMethods {
+    null: bool,
+    hashedpassword: bool,
+    safecookie: bool,
+    cookie_file: Option<String>,
+}
 
 /// Client for the Tor control port protocol.
 ///
 /// Implements the subset needed for hidden service management:
-/// - AUTHENTICATE (password or empty)
+/// - PROTOCOLINFO (discover auth methods + cookie file)
+/// - AUTHENTICATE — SAFECOOKIE (default), password (`-torpassword`), or null
 /// - ADD_ONION (create ephemeral hidden service)
 /// - DEL_ONION (remove hidden service on shutdown)
 pub struct TorController {
@@ -27,24 +48,164 @@ impl TorController {
     }
 
     /// Authenticate with the Tor control port.
-    /// An empty password uses cookie authentication (Tor default).
-    pub async fn authenticate(&mut self, password: &str) -> Result<(), String> {
-        let cmd = if password.is_empty() {
-            "AUTHENTICATE\r\n".to_string()
-        } else {
-            format!("AUTHENTICATE \"{}\"\r\n", password)
-        };
+    ///
+    /// Negotiates the method from `PROTOCOLINFO`, preferring (in order):
+    /// 1. password, when one is supplied and the port offers `HASHEDPASSWORD`;
+    /// 2. **SAFECOOKIE**, when offered and the cookie file is readable — this is
+    ///    the stock-Tor default (`CookieAuthentication 1`), so it works without
+    ///    an operator-configured `HashedControlPassword`;
+    /// 3. null auth, when the port requires no credentials;
+    /// 4. password as a last resort, if supplied.
+    ///
+    /// SAFECOOKIE (control-spec §3.24) proves cookie knowledge without sending
+    /// the cookie, and verifies the server's proof too, so a rogue process
+    /// squatting the control port can't trick us into authenticating.
+    pub async fn authenticate(&mut self, password: Option<&str>) -> Result<(), String> {
+        let methods = self.protocol_info().await?;
 
+        if let Some(pw) = password.filter(|p| !p.is_empty())
+            && methods.hashedpassword
+        {
+            return self.authenticate_password(pw).await;
+        }
+        if methods.safecookie {
+            match &methods.cookie_file {
+                Some(path) => return self.authenticate_safecookie(path).await,
+                None => {
+                    return Err(
+                        "Tor offers SAFECOOKIE but PROTOCOLINFO gave no COOKIEFILE".to_string(),
+                    );
+                }
+            }
+        }
+        if methods.null {
+            return self.authenticate_null().await;
+        }
+        if let Some(pw) = password.filter(|p| !p.is_empty()) {
+            return self.authenticate_password(pw).await;
+        }
+        Err(
+            "Tor control port requires authentication satd can't satisfy: SAFECOOKIE not offered \
+             (or its cookie is unreadable) and no -torpassword set. Set -torpassword to match the \
+             control port's HashedControlPassword, or make the cookie file group-readable \
+             (CookieAuthFileGroupReadable 1)."
+                .to_string(),
+        )
+    }
+
+    /// Query `PROTOCOLINFO` for the supported auth methods and cookie path.
+    async fn protocol_info(&mut self) -> Result<AuthMethods, String> {
         self.writer
-            .write_all(cmd.as_bytes())
+            .write_all(b"PROTOCOLINFO 1\r\n")
+            .await
+            .map_err(|e| format!("Tor PROTOCOLINFO write failed: {}", e))?;
+
+        let mut methods = AuthMethods::default();
+        for line in self.read_reply().await? {
+            // 250-AUTH METHODS=NULL,SAFECOOKIE COOKIEFILE="/run/tor/control.authcookie"
+            if let Some(rest) = line
+                .strip_prefix("250-AUTH ")
+                .or_else(|| line.strip_prefix("250 AUTH "))
+            {
+                if let Some(list) = token_value(rest, "METHODS=") {
+                    for m in list.split(',') {
+                        match m.trim() {
+                            "NULL" => methods.null = true,
+                            "HASHEDPASSWORD" => methods.hashedpassword = true,
+                            "SAFECOOKIE" => methods.safecookie = true,
+                            _ => {}
+                        }
+                    }
+                }
+                if let Some(file) = token_value(rest, "COOKIEFILE=") {
+                    methods.cookie_file = Some(unquote(file));
+                }
+            }
+        }
+        Ok(methods)
+    }
+
+    /// SAFECOOKIE challenge/response (control-spec §3.24).
+    async fn authenticate_safecookie(&mut self, cookie_path: &str) -> Result<(), String> {
+        let cookie = std::fs::read(cookie_path).map_err(|e| {
+            format!(
+                "Tor SAFECOOKIE: cannot read cookie file {}: {} (run satd as a user that can read \
+                 it, or set CookieAuthFileGroupReadable 1 in torrc)",
+                cookie_path, e
+            )
+        })?;
+        if cookie.len() != COOKIE_LEN {
+            return Err(format!(
+                "Tor SAFECOOKIE: cookie file {} is {} bytes, expected {}",
+                cookie_path,
+                cookie.len(),
+                COOKIE_LEN
+            ));
+        }
+
+        let client_nonce: [u8; 32] = rand::random();
+        self.writer
+            .write_all(
+                format!("AUTHCHALLENGE SAFECOOKIE {}\r\n", hex::encode(client_nonce)).as_bytes(),
+            )
+            .await
+            .map_err(|e| format!("Tor AUTHCHALLENGE write failed: {}", e))?;
+
+        // 250 AUTHCHALLENGE SERVERHASH=<hex> SERVERNONCE=<hex>
+        let reply = self.read_reply().await?;
+        let line = reply
+            .iter()
+            .find(|l| l.contains("AUTHCHALLENGE"))
+            .ok_or_else(|| format!("Tor AUTHCHALLENGE failed: {}", reply.join(" / ")))?;
+        let server_hash = token_value(line, "SERVERHASH=")
+            .and_then(|h| hex::decode(h).ok())
+            .ok_or("Tor AUTHCHALLENGE: missing/!hex SERVERHASH")?;
+        let server_nonce_hex =
+            token_value(line, "SERVERNONCE=").ok_or("Tor AUTHCHALLENGE: missing SERVERNONCE")?;
+        let server_nonce =
+            hex::decode(server_nonce_hex).map_err(|_| "Tor AUTHCHALLENGE: !hex SERVERNONCE")?;
+
+        // msg = cookie || client_nonce || server_nonce
+        let mut msg = Vec::with_capacity(cookie.len() + 32 + server_nonce.len());
+        msg.extend_from_slice(&cookie);
+        msg.extend_from_slice(&client_nonce);
+        msg.extend_from_slice(&server_nonce);
+
+        // Verify the server actually knows the cookie before we send our proof —
+        // otherwise a process squatting the control port could elicit a hash.
+        let expected_server = hmac(SERVER_HASH_KEY, &msg);
+        if ct_ne(&expected_server, &server_hash) {
+            return Err(
+                "Tor SAFECOOKIE: SERVERHASH mismatch — the control port did not prove cookie \
+                 knowledge (possible wrong cookie file or a rogue listener)"
+                    .to_string(),
+            );
+        }
+
+        let client_hash = hmac(CLIENT_HASH_KEY, &msg);
+        self.writer
+            .write_all(format!("AUTHENTICATE {}\r\n", hex::encode(client_hash)).as_bytes())
+            .await
+            .map_err(|e| format!("Tor AUTHENTICATE write failed: {}", e))?;
+        self.expect_250("AUTHENTICATE (SAFECOOKIE)").await
+    }
+
+    async fn authenticate_password(&mut self, password: &str) -> Result<(), String> {
+        // Control-spec quoting: backslash-escape `\` and `"`.
+        let escaped = password.replace('\\', "\\\\").replace('"', "\\\"");
+        self.writer
+            .write_all(format!("AUTHENTICATE \"{}\"\r\n", escaped).as_bytes())
             .await
             .map_err(|e| format!("Tor auth write failed: {}", e))?;
+        self.expect_250("AUTHENTICATE (password)").await
+    }
 
-        let response = self.read_response().await?;
-        if !response.starts_with("250") {
-            return Err(format!("Tor AUTHENTICATE failed: {}", response));
-        }
-        Ok(())
+    async fn authenticate_null(&mut self) -> Result<(), String> {
+        self.writer
+            .write_all(b"AUTHENTICATE\r\n")
+            .await
+            .map_err(|e| format!("Tor auth write failed: {}", e))?;
+        self.expect_250("AUTHENTICATE (null)").await
     }
 
     /// Create an ephemeral hidden service.
@@ -110,20 +271,249 @@ impl TorController {
     /// Read a single line response from the control port.
     async fn read_response(&mut self) -> Result<String, String> {
         let mut line = String::new();
-        self.reader
+        let n = self
+            .reader
             .read_line(&mut line)
             .await
             .map_err(|e| format!("Tor control read failed: {}", e))?;
+        if n == 0 {
+            return Err("Tor control port closed the connection".to_string());
+        }
         Ok(line.trim_end().to_string())
     }
+
+    /// Read a full control reply: continuation lines (`250-`/`250+`) until the
+    /// terminating `250 ` (space) line. Returns every line, terminator included.
+    /// An error status (`4xx`/`5xx`) returns the lines as an `Err`.
+    async fn read_reply(&mut self) -> Result<Vec<String>, String> {
+        let mut lines = Vec::new();
+        loop {
+            let line = self.read_response().await?;
+            let terminal = line.len() >= 4 && line.as_bytes()[3] == b' ';
+            let is_ok = line.starts_with('2');
+            lines.push(line);
+            if terminal {
+                if !is_ok {
+                    return Err(lines.join(" / "));
+                }
+                break;
+            }
+        }
+        Ok(lines)
+    }
+
+    /// Read one reply and require a 250 status.
+    async fn expect_250(&mut self, what: &str) -> Result<(), String> {
+        let reply = self.read_reply().await?;
+        let ok = reply.last().map(|l| l.starts_with("250")).unwrap_or(false);
+        if ok {
+            Ok(())
+        } else {
+            Err(format!("Tor {} failed: {}", what, reply.join(" / ")))
+        }
+    }
+}
+
+/// HMAC-SHA256(key, msg).
+fn hmac(key: &[u8], msg: &[u8]) -> Vec<u8> {
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(msg);
+    mac.finalize().into_bytes().to_vec()
+}
+
+/// Length-independent byte comparison: returns true when the slices differ,
+/// without short-circuiting on the first differing byte of the server hash.
+fn ct_ne(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return true;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff != 0
+}
+
+/// Extract the value following `key` in a space-separated control line, up to
+/// the next space (e.g. `token_value("METHODS=A,B COOKIEFILE=\"x\"", "METHODS=")`
+/// → `Some("A,B")`). Quoted values keep their quotes; use [`unquote`].
+fn token_value<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    let start = line.find(key)? + key.len();
+    let rest = &line[start..];
+    // A quoted value may contain spaces; take through the closing quote.
+    if let Some(after_quote) = rest.strip_prefix('"') {
+        let end = after_quote.find('"').map(|i| i + 2).unwrap_or(rest.len());
+        Some(&rest[..end])
+    } else {
+        let end = rest.find(' ').unwrap_or(rest.len());
+        Some(&rest[..end])
+    }
+}
+
+/// Strip surrounding quotes and unescape `\\`/`\"` from a control-protocol string.
+fn unquote(s: &str) -> String {
+    let inner = s
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .unwrap_or(s);
+    inner.replace("\\\"", "\"").replace("\\\\", "\\")
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
     #[test]
     fn test_strip_onion_suffix() {
         let host = "abc123def456.onion";
         let id = host.strip_suffix(".onion").unwrap();
         assert_eq!(id, "abc123def456");
+    }
+
+    #[test]
+    fn token_value_parses_methods_and_cookiefile() {
+        let line = r#"250-AUTH METHODS=COOKIE,SAFECOOKIE COOKIEFILE="/run/tor/control.authcookie""#;
+        assert_eq!(token_value(line, "METHODS="), Some("COOKIE,SAFECOOKIE"));
+        assert_eq!(
+            unquote(token_value(line, "COOKIEFILE=").unwrap()),
+            "/run/tor/control.authcookie"
+        );
+    }
+
+    #[test]
+    fn token_value_handles_quoted_path_with_space() {
+        let line = r#"250-AUTH METHODS=SAFECOOKIE COOKIEFILE="/var/lib/tor data/control.authcookie""#;
+        assert_eq!(
+            unquote(token_value(line, "COOKIEFILE=").unwrap()),
+            "/var/lib/tor data/control.authcookie"
+        );
+    }
+
+    /// A minimal Tor control port that drives the real SAFECOOKIE handshake
+    /// against `TorController`, computing the server proof the way Tor does.
+    /// Returns the client proof it received (empty if the client hung up).
+    async fn fake_tor_safecookie(
+        listener: TcpListener,
+        cookie: [u8; 32],
+        cookie_path: std::path::PathBuf,
+        corrupt_server_hash: bool,
+    ) -> Result<Vec<u8>, String> {
+        std::fs::write(&cookie_path, cookie).map_err(|e| e.to_string())?;
+        let (stream, _) = listener.accept().await.map_err(|e| e.to_string())?;
+        let (rh, mut wh) = tokio::io::split(stream);
+        let mut reader = BufReader::new(rh);
+
+        // PROTOCOLINFO
+        let mut l = String::new();
+        reader.read_line(&mut l).await.map_err(|e| e.to_string())?;
+        assert!(l.starts_with("PROTOCOLINFO"), "got: {l}");
+        wh.write_all(
+            format!(
+                "250-PROTOCOLINFO 1\r\n250-AUTH METHODS=SAFECOOKIE COOKIEFILE=\"{}\"\r\n250 OK\r\n",
+                cookie_path.display()
+            )
+            .as_bytes(),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
+        // AUTHCHALLENGE SAFECOOKIE <client_nonce>
+        let mut chal = String::new();
+        reader.read_line(&mut chal).await.map_err(|e| e.to_string())?;
+        let chal = chal.trim_end();
+        let client_nonce_hex = chal
+            .strip_prefix("AUTHCHALLENGE SAFECOOKIE ")
+            .ok_or_else(|| format!("bad AUTHCHALLENGE: {chal}"))?;
+        let client_nonce = hex::decode(client_nonce_hex).map_err(|e| e.to_string())?;
+        let server_nonce: [u8; 32] = rand::random();
+
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&cookie);
+        msg.extend_from_slice(&client_nonce);
+        msg.extend_from_slice(&server_nonce);
+        let mut server_hash = hmac(SERVER_HASH_KEY, &msg);
+        if corrupt_server_hash {
+            server_hash[0] ^= 0xff;
+        }
+        wh.write_all(
+            format!(
+                "250 AUTHCHALLENGE SERVERHASH={} SERVERNONCE={}\r\n",
+                hex::encode(&server_hash),
+                hex::encode(server_nonce)
+            )
+            .as_bytes(),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
+        // AUTHENTICATE <client_hash>  (only sent if the client accepted us)
+        let mut auth = String::new();
+        let n = reader.read_line(&mut auth).await.map_err(|e| e.to_string())?;
+        let _ = std::fs::remove_file(&cookie_path);
+        if n == 0 {
+            return Ok(Vec::new()); // client hung up (rejected our SERVERHASH)
+        }
+        let auth = auth.trim_end();
+        let client_hash_hex = auth
+            .strip_prefix("AUTHENTICATE ")
+            .ok_or_else(|| format!("bad AUTHENTICATE: {auth}"))?;
+        let got = hex::decode(client_hash_hex).map_err(|e| e.to_string())?;
+        let expected = hmac(CLIENT_HASH_KEY, &msg);
+        if got == expected {
+            wh.write_all(b"250 OK\r\n").await.map_err(|e| e.to_string())?;
+        } else {
+            wh.write_all(b"515 Bad authentication\r\n")
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(got)
+    }
+
+    fn unique_cookie_path(tag: &str) -> std::path::PathBuf {
+        let nonce: u64 = rand::random();
+        std::env::temp_dir().join(format!("satd-test-cookie-{}-{:016x}", tag, nonce))
+    }
+
+    #[tokio::test]
+    async fn safecookie_handshake_succeeds_against_fake_tor() {
+        let cookie: [u8; 32] = rand::random();
+        let path = unique_cookie_path("ok");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(fake_tor_safecookie(listener, cookie, path, false));
+
+        let mut ctrl = TorController::connect(&addr).await.unwrap();
+        ctrl.authenticate(None)
+            .await
+            .expect("SAFECOOKIE auth should succeed");
+
+        let client_hash = server.await.unwrap().unwrap();
+        assert_eq!(client_hash.len(), 32, "server received a 32-byte client proof");
+    }
+
+    #[tokio::test]
+    async fn safecookie_rejects_bad_server_hash() {
+        // A control port that can't prove cookie knowledge must be refused before
+        // we disclose our own proof (MITM / rogue-listener protection).
+        let cookie: [u8; 32] = rand::random();
+        let path = unique_cookie_path("bad");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(fake_tor_safecookie(listener, cookie, path, true));
+
+        let mut ctrl = TorController::connect(&addr).await.unwrap();
+        let err = ctrl.authenticate(None).await.unwrap_err();
+        assert!(err.contains("SERVERHASH mismatch"), "got: {err}");
+
+        // Drop the controller so the connection closes — this is what satd does
+        // on an auth failure, and it lets the fake server's pending read see EOF
+        // instead of blocking forever on an AUTHENTICATE that never comes.
+        drop(ctrl);
+        let sent = server.await.unwrap().unwrap();
+        assert!(
+            sent.is_empty(),
+            "client leaked a proof to an unverified server"
+        );
     }
 }

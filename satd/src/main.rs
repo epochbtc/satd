@@ -1341,8 +1341,11 @@ async fn main() {
         let torcontrol = config.torcontrol.as_deref().unwrap_or("127.0.0.1:9051");
         match node::net::tor::TorController::connect(torcontrol).await {
             Ok(mut controller) => {
-                let password = config.torpassword.as_deref().unwrap_or("");
-                match controller.authenticate(password).await {
+                // Pass the optional -torpassword through; the controller negotiates
+                // via PROTOCOLINFO and prefers SAFECOOKIE (stock-Tor default) when
+                // no password is set, so -listenonion works without a torrc
+                // HashedControlPassword.
+                match controller.authenticate(config.torpassword.as_deref()).await {
                     Ok(()) => {
                         let target = format!("127.0.0.1:{}", config.port);
                         match controller.create_hidden_service(config.port, &target).await {
