@@ -257,9 +257,46 @@ pub fn torv3_to_onion_host(pubkey: &[u8; 32]) -> String {
     format!("{encoded}.onion")
 }
 
+/// Inverse of [`torv3_to_onion_host`]: recover the 32-byte ed25519 public key
+/// from a v3 `.onion` hostname, validating the version byte and the embedded
+/// SHA3-256 checksum. Returns `None` for anything that isn't a well-formed v3
+/// onion address. Needed to advertise our own hidden service over BIP 155 —
+/// `AddrV2::TorV3` carries the pubkey, but Tor only hands back the base32
+/// ServiceID string.
+pub fn onion_host_to_torv3_pubkey(host: &str) -> Option<[u8; 32]> {
+    use sha3::{Digest, Sha3_256};
+    const VERSION: u8 = 0x03;
+
+    let label = host.strip_suffix(".onion")?;
+    // A v3 ServiceID is base32(32-byte pubkey ‖ 2-byte checksum ‖ 1-byte
+    // version) = 35 bytes → exactly 56 base32 chars.
+    if label.len() != 56 {
+        return None;
+    }
+    let data = data_encoding::BASE32_NOPAD
+        .decode(label.to_uppercase().as_bytes())
+        .ok()?;
+    if data.len() != 35 || data[34] != VERSION {
+        return None;
+    }
+    let pubkey: [u8; 32] = data[..32].try_into().ok()?;
+
+    let mut hasher = Sha3_256::new();
+    hasher.update(b".onion checksum");
+    hasher.update(pubkey);
+    hasher.update([VERSION]);
+    let checksum = hasher.finalize();
+    // Constant comparison isn't security-critical here (public address data),
+    // but reject a mismatched checksum so we never advertise a garbage key.
+    if data[32..34] != checksum[..2] {
+        return None;
+    }
+    Some(pubkey)
+}
+
 #[cfg(test)]
 mod onion_addr_tests {
-    use super::torv3_to_onion_host;
+    use super::{onion_host_to_torv3_pubkey, torv3_to_onion_host};
 
     /// Round-trip against a real Tor-generated v3 address (one of satd's own
     /// hardcoded mainnet onion seeds): decode it to recover the pubkey, then
@@ -276,5 +313,29 @@ mod onion_addr_tests {
         let mut pubkey = [0u8; 32];
         pubkey.copy_from_slice(&decoded[..32]);
         assert_eq!(torv3_to_onion_host(&pubkey), onion);
+    }
+
+    /// `onion_host_to_torv3_pubkey` is the exact inverse of
+    /// `torv3_to_onion_host`: host → pubkey → host returns the original.
+    #[test]
+    fn onion_host_pubkey_roundtrip() {
+        let onion = "5g72ppm3krkorsfopcm2bi7wlv4ohhs4u4mlseymasn7g7zhdcyjpfid.onion";
+        let pubkey = onion_host_to_torv3_pubkey(onion).expect("valid v3 onion");
+        assert_eq!(torv3_to_onion_host(&pubkey), onion);
+    }
+
+    /// Malformed inputs are rejected rather than yielding a bogus key we'd
+    /// then advertise to the network.
+    #[test]
+    fn onion_host_pubkey_rejects_malformed() {
+        // Not an onion host.
+        assert!(onion_host_to_torv3_pubkey("example.com:8333").is_none());
+        // v2-length (16-char) onion.
+        assert!(onion_host_to_torv3_pubkey("expyuzz4wqqyqhjn.onion").is_none());
+        // Right shape, corrupted checksum (flip one base32 char).
+        let bad = "5g72ppm3krkorsfopcm2bi7wlv4ohhs4u4mlseymasn7g7zhdcyjpgid.onion";
+        assert!(onion_host_to_torv3_pubkey(bad).is_none());
+        // Empty / suffix only.
+        assert!(onion_host_to_torv3_pubkey(".onion").is_none());
     }
 }

@@ -1357,6 +1357,11 @@ async fn main() {
                         match controller.create_hidden_service(config.port, &target).await {
                             Ok(onion) => {
                                 tracing::info!(onion_addr = %onion, "Tor hidden service created");
+                                // Advertise the service to peers (addrv2 TorV3 +
+                                // getnetworkinfo) so the network can discover and
+                                // dial us inbound, not just peers handed the
+                                // address out of band.
+                                peer_manager.set_advertised_onion(onion.clone(), config.port);
                                 _onion_addr = Some(onion);
                                 // Retain the control connection so Tor keeps the
                                 // service up for the node's lifetime.
