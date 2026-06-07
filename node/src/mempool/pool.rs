@@ -353,8 +353,16 @@ impl Mempool {
         for input in &tx.input {
             // First try chain state (confirmed UTXOs)
             if let Some(coin) = chain_state.get_coin(&input.previous_output) {
-                // Check coinbase maturity
-                if coin.coinbase && tip_height - coin.height < COINBASE_MATURITY {
+                // Check coinbase maturity. A mempool tx is spent at the next
+                // block (tip + 1) at the earliest, so the spend height — to
+                // match Bitcoin Core's `CheckTxInputs` (nSpendHeight = tip + 1)
+                // and satd's own connect-time check (which uses the connecting
+                // block's height) — is `tip_height + 1`. Using `tip_height`
+                // here made the mempool reject a coinbase at exactly
+                // COINBASE_MATURITY confirmations that consensus would accept
+                // in the next block (off-by-one, surfaced by the BDK canary).
+                let spend_height = tip_height + 1;
+                if coin.coinbase && spend_height - coin.height < COINBASE_MATURITY {
                     return Err(MempoolError::PrematureCoinbaseSpend);
                 }
                 sum_inputs += coin.amount;
