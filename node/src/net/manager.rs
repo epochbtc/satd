@@ -3380,6 +3380,45 @@ impl PeerManager {
                     Err(e) => {
                         retry_count += 1;
                         if retry_count >= 30 {
+                            // The block at tip+1 can't connect because its
+                            // parent isn't the active tip. If a competing
+                            // higher-work header chain exists, this is a reorg
+                            // the linear IBD connector cannot perform: it keeps
+                            // requesting `tip+1` (a block on the other branch)
+                            // while the height-indexed scheduler reports itself
+                            // complete and never fetches the missing fork
+                            // block. Tear down the stalled scheduler and hand
+                            // off to the reorg-capable steady-state path, which
+                            // pulls the fork (missing_blocks_for_best_header_
+                            // chain) and runs ActivateBestChain — exactly what
+                            // a restart would do, without the restart.
+                            if chain_state.best_header_beats_active_tip() {
+                                tracing::warn!(
+                                    height = next_height, %hash,
+                                    "IBD connector stalled on a competing higher-work chain \
+                                     ({e}); exiting IBD so the steady-state reorg path can pull \
+                                     the fork and reorg"
+                                );
+                                chain_state.warnings().record(
+                                    "connect.fork_handoff",
+                                    crate::warnings::Severity::Warn,
+                                    format!(
+                                        "block {next_height} ({hash}) at the connect frontier \
+                                         builds on a competing higher-work chain; handing off to \
+                                         the steady-state reorg path: {e}"
+                                    ),
+                                    serde_json::json!({
+                                        "height": next_height,
+                                        "hash": hash.to_string(),
+                                        "error": e.to_string(),
+                                    }),
+                                );
+                                // Resolve the retry warning — we are now
+                                // handling this via the reorg path, not looping.
+                                chain_state.warnings().clear("connect.retry");
+                                *ibd.write() = None;
+                                break;
+                            }
                             tracing::error!(
                                 height = next_height, %hash, retries = retry_count,
                                 "Persistent connect failure, giving up: {}", e

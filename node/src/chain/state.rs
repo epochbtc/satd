@@ -2074,6 +2074,34 @@ impl ChainState {
         missing
     }
 
+    /// True if the best-work *header* chain has strictly more work than the
+    /// active tip — i.e. a reorg onto a competing chain is warranted but the
+    /// active chain is not yet on it.
+    ///
+    /// The IBD connector connects strictly linearly by height (`tip+1`) and
+    /// cannot perform a reorg. When a competing same-height fork appears at the
+    /// connect frontier, the connector loops forever on `bad-prevblk` (the
+    /// block at `tip+1` builds on a parent that is not the active tip) while
+    /// the height-indexed scheduler reports itself complete and never requests
+    /// the missing fork block. The connector uses this predicate to detect
+    /// that situation and hand off to the steady-state path, which *is*
+    /// reorg-capable (fork-aware block pull via
+    /// [`Self::missing_blocks_for_best_header_chain`] + `ActivateBestChain`).
+    pub fn best_header_beats_active_tip(&self) -> bool {
+        let tip = self.tip_hash();
+        let best = self.best_header_hash();
+        if tip == best {
+            return false;
+        }
+        let (Some(tip_entry), Some(best_entry)) = (
+            self.store.get_block_index(&tip),
+            self.store.get_block_index(&best),
+        ) else {
+            return false;
+        };
+        compare_u256(&best_entry.chainwork, &tip_entry.chainwork) > 0
+    }
+
     /// Whether assumevalid is configured (not Disabled).
     /// Used to decide whether prefetch should run script pre-verification.
     pub fn is_assumevalid_active(&self) -> bool {
@@ -5736,6 +5764,28 @@ pub(crate) mod tests {
         // Batch cap is honored (oldest first).
         let capped = cs.missing_blocks_for_best_header_chain(2);
         assert_eq!(capped, bhashes[..2]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn best_header_beats_active_tip_detects_competing_chain() {
+        let (cs, dir) = make_chain_state();
+        // Active chain at height 2 (has data).
+        build_and_connect_chain(&cs, 2);
+        // No competing chain yet → tip is best.
+        assert!(!cs.best_header_beats_active_tip());
+
+        // A competing HEADER chain forking at genesis, longer (more work),
+        // headers only — the exact shape that wedges the linear IBD connector.
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+        let mut parent = genesis;
+        for h in 1..=3 {
+            let b = build_test_block(parent, h, 1_700_000_000 + h);
+            cs.accept_header(&b.header).unwrap();
+            parent = b.block_hash();
+        }
+        // The best header chain now out-works the active tip.
+        assert!(cs.best_header_beats_active_tip());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
