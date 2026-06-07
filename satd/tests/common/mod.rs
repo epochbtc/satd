@@ -167,6 +167,17 @@ impl TestNode {
             cmd.arg(format!("--port={}", p2p_port));
         }
         apply_listener_arg_defaults(&mut cmd, extra_args);
+        // Quiet the spawned node so the always-on stderr capture below stays
+        // cheap (the fatal "Error: ..." lines that explain an exit-1 are
+        // `eprintln!`s, emitted regardless of log level, so diagnosability is
+        // unaffected). Skipped when the caller tunes logging itself. Net this
+        // is *less* stderr volume than the prior info-level default.
+        let caller_sets_logging = extra_args
+            .iter()
+            .any(|a| a.starts_with("--loglevel") || a.starts_with("--debug"));
+        if !caller_sets_logging {
+            cmd.arg("--loglevel=error");
+        }
         for arg in extra_args {
             cmd.arg(arg);
         }
@@ -174,17 +185,18 @@ impl TestNode {
             cmd.env(k, v);
         }
 
-        // Stderr capture is opt-in via the `capture_stderr` flag from
-        // `start_capturing_stderr`. Default null matches the prior behavior
-        // — always-on capture adds enough I/O on loaded CI runners to slow
-        // other tests into their poll-until budgets.
+        // Always capture stderr to a file in the datadir so a startup failure
+        // is *diagnosable*: the retry log and the final panic carry satd's own
+        // error (e.g. a listener bind conflict) instead of an opaque "exited
+        // with status 1". With the `--loglevel=error` default above this is
+        // cheaper than the previous info-level-to-/dev/null path, so the
+        // earlier I/O concern that kept capture opt-in no longer applies. The
+        // `capture_stderr` flag is retained for API compatibility.
+        let _ = capture_stderr;
         let stderr_log = datadir.join("satd.stderr");
-        let stderr_target = if capture_stderr {
-            let f = std::fs::File::create(&stderr_log)
-                .expect("create satd stderr capture file");
-            std::process::Stdio::from(f)
-        } else {
-            std::process::Stdio::null()
+        let stderr_target = match std::fs::File::create(&stderr_log) {
+            Ok(f) => std::process::Stdio::from(f),
+            Err(_) => std::process::Stdio::null(),
         };
         let mut process = cmd
             .stdout(std::process::Stdio::null())
@@ -222,7 +234,8 @@ impl TestNode {
             // the deadline. `try_wait` reaps the child when it reports `Some`.
             if let Ok(Some(status)) = process.try_wait() {
                 return Err(format!(
-                    "satd (port {rpcport}) exited with {status} before its RPC came up"
+                    "satd (port {rpcport}) exited with {status} before its RPC came up{}",
+                    read_stderr_tail(&stderr_log)
                 ));
             }
             let rpc_ready = if uses_userpass {
@@ -271,7 +284,8 @@ impl TestNode {
                 let _ = process.kill();
                 let _ = process.wait();
                 return Err(format!(
-                    "satd (port {rpcport}) did not answer RPC within the startup deadline"
+                    "satd (port {rpcport}) did not answer RPC within the startup deadline{}",
+                    read_stderr_tail(&stderr_log)
                 ));
             }
             std::thread::sleep(Duration::from_millis(100));
@@ -1063,24 +1077,54 @@ pub fn write_authfile(tokens: &[TokenSpec]) -> AuthFixture {
     }
 }
 
-pub fn find_available_port() -> u16 {
-    use std::sync::atomic::{AtomicU16, Ordering};
-    // Process-unique atomic counter from a high port range. Avoids the
-    // TOCTOU race where bind(0) finds a port, releases it, and another
-    // test grabs the same port before satd can bind.
-    static PORT_COUNTER: AtomicU16 = AtomicU16::new(0);
-    let offset = PORT_COUNTER.fetch_add(1, Ordering::Relaxed);
-    // Base port derived from PID to avoid collisions across concurrent
-    // test processes.
-    let base = 30000 + (std::process::id() as u16 % 10000);
-    let port = base + offset * 2; // *2 because each node may use rpc + p2p
-    if TcpListener::bind(format!("127.0.0.1:{}", port)).is_ok() {
-        port
-    } else {
-        // Fallback: let OS pick. Rare.
-        let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind to port 0");
-        listener.local_addr().unwrap().port()
+/// Read the last few lines of a captured-stderr file for inclusion in a
+/// startup-failure message. Returns an empty string if the file is missing or
+/// empty, so callers can append it unconditionally.
+fn read_stderr_tail(path: &std::path::Path) -> String {
+    match std::fs::read_to_string(path) {
+        Ok(s) if !s.trim().is_empty() => {
+            let lines: Vec<&str> = s.lines().collect();
+            let tail = lines[lines.len().saturating_sub(20)..].join("\n");
+            format!(" — satd stderr tail:\n{tail}")
+        }
+        _ => String::new(),
     }
+}
+
+pub fn find_available_port() -> u16 {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    // Ports already handed out by THIS process, so two parallel tests in the
+    // same test binary never receive the same port even if the kernel happens
+    // to reuse a just-freed ephemeral port across our probe binds.
+    static CLAIMED: OnceLock<Mutex<HashSet<u16>>> = OnceLock::new();
+    let claimed = CLAIMED.get_or_init(|| Mutex::new(HashSet::new()));
+
+    // OS-assigned (`:0`) ephemeral ports. The kernel hands out a currently-free
+    // port and rotates allocations, so concurrent test *processes* don't get
+    // the same port. The previous PID-derived counter (`30000 + pid % 10000 +
+    // offset*2`) collided *deterministically* whenever two parallel test
+    // binaries shared `pid % 10000` — both walked the identical port sequence
+    // and raced satd's bind, which is the main source of the "satd exited
+    // before its RPC came up" flake. The probe socket is dropped immediately so
+    // satd can bind; the small probe→bind window is covered by the start-retry
+    // for RPC/P2P and by the intra-process dedup set here.
+    for _ in 0..100 {
+        let Ok(listener) = TcpListener::bind("127.0.0.1:0") else {
+            continue;
+        };
+        let Ok(addr) = listener.local_addr() else {
+            continue;
+        };
+        let port = addr.port();
+        drop(listener);
+        // insert() returns false if the port was already handed out — keep
+        // probing so we never return a duplicate within this process.
+        if claimed.lock().unwrap().insert(port) {
+            return port;
+        }
+    }
+    panic!("find_available_port: could not obtain a free port after 100 attempts");
 }
 
 /// Poll a condition until it returns true, or panic after timeout.
