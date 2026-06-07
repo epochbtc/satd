@@ -90,7 +90,7 @@ semantics track **Bitcoin Core v30**.
 | `logsourcelocations` | off | restart | core | Prepend source `file:line` to each log line. |
 | `debug` | none | hot | core | Enable debug logging for a category (repeatable; bare/`all`/`1` = everything). |
 | `debugexclude` | none | hot | core | Disable debug logging for a category `debug` would otherwise enable. |
-| `loglevel` | info | hot | core | Global verbosity (`trace`/`debug`/`info`/`warn`/`error`) or a per-category override (`net:debug`). satd maps this onto its `tracing` filter, so a bare level affects all targets (Core scopes it to `-debug` categories). |
+| `loglevel` | info | hot | core | Global verbosity (`trace`/`debug`/`info`/`warn`/`error`) or a per-category override (`net:debug`). Maps onto satd's `tracing` filter: a bare level sets the default for targets not already overridden — it does **not** lower a more specific `-debug`/`RUST_LOG` directive (so `-debug=net -loglevel=error` still logs `net` at debug). A `category:level` pair overrides that subsystem. |
 | `allowignoredconf` | off | restart | core | Suppress startup warnings about `includeconf` files satd had to ignore. |
 | `maxshutdownsecs` | 30 | hot | satd | Max graceful-shutdown flush duration (seconds) before force exit. |
 

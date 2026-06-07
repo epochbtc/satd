@@ -634,6 +634,7 @@ impl ChainState {
             self.flat_files.clone(),
             self.script_verifier.clone(),
             self.checkpoints.clone(),
+            self.enforce_checkpoints,
             self.network,
             self.num_threads,
             bg_dir,

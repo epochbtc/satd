@@ -114,6 +114,10 @@ pub struct BackgroundChainState {
     /// Shared script verifier (Arc-cloned from the primary).
     script_verifier: Arc<dyn ScriptVerifier>,
     checkpoints: Vec<Checkpoint>,
+    /// Whether checkpoint validation is enforced (Core `-checkpoints`),
+    /// forwarded from the primary chainstate so `-checkpoints=0` disables
+    /// it on the background re-validation path too.
+    enforce_checkpoints: bool,
     network: Network,
     num_threads: usize,
     /// On-disk directory of the private coins DB, removed at handoff.
@@ -136,6 +140,7 @@ impl BackgroundChainState {
         flat_files: Arc<parking_lot::Mutex<crate::storage::flatfile::FlatFileManager>>,
         script_verifier: Arc<dyn ScriptVerifier>,
         checkpoints: Vec<Checkpoint>,
+        enforce_checkpoints: bool,
         network: Network,
         num_threads: usize,
         bg_dir: PathBuf,
@@ -180,6 +185,7 @@ impl BackgroundChainState {
             flat_files,
             script_verifier,
             checkpoints,
+            enforce_checkpoints,
             network,
             num_threads,
             bg_dir,
@@ -291,7 +297,9 @@ impl BackgroundChainState {
         // Mandatory block-version gate (Core: bad-version) — BIP34/66/65.
         // Deterministic, height-based; mirrors the live accept path.
         connect::check_block_version(&block.header, new_height, self.network)?;
-        if !checkpoints::check_against_checkpoints(new_height, &block_hash, &self.checkpoints) {
+        if self.enforce_checkpoints
+            && !checkpoints::check_against_checkpoints(new_height, &block_hash, &self.checkpoints)
+        {
             return Err(ChainError::CheckpointMismatch(new_height));
         }
 

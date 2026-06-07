@@ -5830,11 +5830,14 @@ pub fn build_env_filter(config: &Config) -> tracing_subscriber::EnvFilter {
             Err(e) => eprintln!("Warning: ignoring invalid debug directive {d:?}: {e}"),
         }
     }
-    // -loglevel: a bare level overrides the global verbosity; a
-    // `category:level` pair overrides a single satd subsystem. Applied
-    // after -debug so an explicit loglevel wins. Note: satd maps this onto
-    // its tracing EnvFilter, so a global level affects all targets (Core
-    // scopes it to -debug-enabled categories) — documented in the manual.
+    // -loglevel: a bare level sets the global/default verbosity for targets
+    // not already overridden by `-debug`/`RUST_LOG`; a `category:level` pair
+    // overrides a single satd subsystem. Applied after `-debug` so a
+    // per-category loglevel wins over a `-debug` directive for the same
+    // target. Note: because this maps onto the tracing EnvFilter, a bare
+    // level does NOT lower a more specific `-debug`/`RUST_LOG` target
+    // directive (EnvFilter is most-specific-wins) — e.g. `-debug=net
+    // -loglevel=error` still logs net at debug. Documented in the manual.
     if let Some(ll) = &config.log_level {
         for tok in ll.split(',') {
             let tok = tok.trim();
