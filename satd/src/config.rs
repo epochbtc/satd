@@ -927,11 +927,13 @@ pub struct Config {
     /// Bitcoin Core `-debugexclude=<category>` (repeatable). Suppresses
     /// debug logging for a category that `debug` would otherwise enable.
     pub debugexclude: Vec<String>,
-    /// Bitcoin Core `-loglevel=<level>` or `-loglevel=<category>:<level>`.
-    /// A bare level sets the global tracing verbosity; a `category:level`
-    /// pair raises/lowers a single satd subsystem. `None` keeps the
-    /// default (`info`, or `-debug`-derived). See [`build_env_filter`].
-    pub log_level: Option<String>,
+    /// Bitcoin Core `-loglevel=<level>` / `-loglevel=<category>:<level>`
+    /// (**repeatable**, matching Core's `GetArgs("-loglevel")`). A bare
+    /// level sets the global tracing verbosity; each `category:level` pair
+    /// raises/lowers a single satd subsystem; multiple per-category entries
+    /// accumulate. Empty keeps the default (`info`, or `-debug`-derived).
+    /// See [`build_env_filter`].
+    pub log_level: Vec<String>,
     /// Enforce the hardcoded block-checkpoint set (Core `-checkpoints`,
     /// default true). `-checkpoints=0` disables checkpoint validation —
     /// useful when replaying a known-good chain or testing reorg logic.
@@ -2938,7 +2940,13 @@ impl Config {
                 }
                 v
             },
-            log_level: cli.loglevel.clone().or_else(|| file_get("loglevel")),
+            log_level: {
+                let mut v = cli.loglevel.clone();
+                if v.is_empty() {
+                    v = file_get_all("loglevel");
+                }
+                v
+            },
             enforce_checkpoints: cli
                 .checkpoints
                 .or_else(|| file_get("checkpoints").and_then(|v| parse_bool(&v)))
@@ -4609,9 +4617,9 @@ pub struct CliArgs {
     #[arg(
         long = "loglevel",
         value_name = "LEVEL|CATEGORY:LEVEL",
-        help = "Global log verbosity (trace|debug|info|warn|error) or a per-category override (e.g. net:debug)"
+        help = "Global log verbosity (trace|debug|info|warn|error) or a per-category override (e.g. net:debug). Repeatable for multiple category levels."
     )]
-    pub loglevel: Option<String>,
+    pub loglevel: Vec<String>,
 
     #[arg(
         long = "checkpoints",
@@ -5838,8 +5846,11 @@ pub fn build_env_filter(config: &Config) -> tracing_subscriber::EnvFilter {
     // level does NOT lower a more specific `-debug`/`RUST_LOG` target
     // directive (EnvFilter is most-specific-wins) — e.g. `-debug=net
     // -loglevel=error` still logs net at debug. Documented in the manual.
-    if let Some(ll) = &config.log_level {
-        for tok in ll.split(',') {
+    // `-loglevel` is repeatable (Core's `GetArgs`); each entry may itself be a
+    // comma-separated list. Applied in order: a later bare level overrides the
+    // global (add_directive replaces it), per-category entries accumulate.
+    for entry in &config.log_level {
+        for tok in entry.split(',') {
             let tok = tok.trim();
             if tok.is_empty() {
                 continue;
@@ -6633,7 +6644,7 @@ rpcport=8332
             logtimestamps: None,
             logthreadnames: None,
             logsourcelocations: None,
-            loglevel: None,
+            loglevel: vec![],
             checkpoints: None,
             allowignoredconf: None,
             whitelistrelay: None,
@@ -6892,7 +6903,7 @@ rpcport=8332
             logtimestamps: None,
             logthreadnames: None,
             logsourcelocations: None,
-            loglevel: None,
+            loglevel: vec![],
             checkpoints: None,
             allowignoredconf: None,
             whitelistrelay: None,
@@ -8635,7 +8646,7 @@ rpcport=39999
     fn loglevel_honored_via_cli_and_file() {
         // Default: no explicit level.
         let cfg = Config::from_cli(CliArgs::try_parse_from(["satd", "--regtest"]).unwrap()).unwrap();
-        assert_eq!(cfg.log_level, None);
+        assert!(cfg.log_level.is_empty());
         assert!(is_known_config_key("loglevel"));
 
         // CLI bare level.
@@ -8643,13 +8654,45 @@ rpcport=39999
             CliArgs::try_parse_from(["satd", "--regtest", "--loglevel=debug"]).unwrap(),
         )
         .unwrap();
-        assert_eq!(cfg.log_level.as_deref(), Some("debug"));
+        assert_eq!(cfg.log_level, vec!["debug".to_string()]);
 
         // Config-file per-category form is recognized + stored.
         let cf = ConfigFile::parse("loglevel=net:trace\n").unwrap();
         assert_eq!(
             cf.global.get("loglevel").map(|v| v.as_slice()),
             Some(&["net:trace".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn loglevel_is_repeatable_like_core() {
+        // Core reads -loglevel with GetArgs (plural): multiple per-category
+        // entries must all be retained, not collapsed to one.
+        let cfg = Config::from_cli(
+            CliArgs::try_parse_from([
+                "satd",
+                "--regtest",
+                "--loglevel=net:debug",
+                "--loglevel=mempool:trace",
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.log_level,
+            vec!["net:debug".to_string(), "mempool:trace".to_string()]
+        );
+        let rendered = format!("{}", build_env_filter(&cfg));
+        assert!(
+            rendered.contains("node::net") && rendered.contains("node::mempool"),
+            "both per-category levels should reach the filter, got: {rendered}"
+        );
+
+        // Repeated config-file lines are likewise all retained.
+        let cf = ConfigFile::parse("loglevel=net:debug\nloglevel=rpc:trace\n").unwrap();
+        assert_eq!(
+            cf.global.get("loglevel").map(|v| v.as_slice()),
+            Some(&["net:debug".to_string(), "rpc:trace".to_string()][..])
         );
     }
 
