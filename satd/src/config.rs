@@ -5680,6 +5680,13 @@ const SKIP_GUIDANCE: &[(&str, &str)] = &[
     ("zmqpubrawtx", "satd's events bus (-eventszmqbind) replaces Core's per-topic -zmqpub* model; raw-tx publication is not currently provided. See CORE_DIFFERENCES.md."),
     ("zmqpubrawblock", "satd's events bus (-eventszmqbind) replaces Core's per-topic -zmqpub* model; raw-block publication is not currently provided. See CORE_DIFFERENCES.md."),
     ("zmqpubsequence", "satd's events bus (-eventszmqbind) replaces Core's per-topic -zmqpub* model. See CORE_DIFFERENCES.md."),
+    // The *notify shell-hook family. satd implements -blocknotify for Core
+    // convenience, but the supported way to build on satd is the Streaming
+    // Consumption API (reorg-safe, replayable, decoupled from consensus).
+    ("alertnotify", "satd does not run alert shell hooks; consume node warnings via the Streaming Consumption API (nodeevent) — the supported integration path."),
+    ("walletnotify", "satd is keyless (no wallet), so -walletnotify has nothing to fire on; watch addresses/scripts via the Streaming Consumption API or the Esplora API."),
+    ("startupnotify", "satd integrates with systemd readiness (sd_notify); run startup hooks via your service manager (e.g. an ExecStartPost= unit directive)."),
+    ("shutdownnotify", "run shutdown hooks via your service manager (e.g. an ExecStopPost= unit directive); satd signals readiness/stop to systemd."),
 ];
 
 /// The frozen set of Bitcoin Core **v30** config keys (bitcoind node + wallet +
@@ -8843,6 +8850,30 @@ rpcport=39999
             cf.global.get("blocknotify").map(|v| v.as_slice()),
             Some(&["echo %s >> /tmp/blocks".to_string()][..])
         );
+    }
+
+    #[test]
+    fn other_notify_hooks_steer_to_streaming_api() {
+        // The unimplemented *notify shell hooks warn-and-skip with a pointer to
+        // the supported integration path (the Streaming Consumption API, or
+        // systemd for lifecycle hooks) — never a hard error on drop-in.
+        let cf = ConfigFile::parse(
+            "alertnotify=mail %s\nwalletnotify=x\nstartupnotify=y\nshutdownnotify=z\nserver=1\n",
+        )
+        .unwrap();
+        assert!(cf.global.contains_key("server"));
+        for k in ["alertnotify", "walletnotify", "startupnotify", "shutdownnotify"] {
+            assert!(!cf.global.contains_key(k), "{k} should be skipped, not honored");
+            assert!(
+                cf.ignored.iter().any(|m| m.contains(k)),
+                "{k} should warn-and-skip"
+            );
+        }
+        // The chain/node-event hooks point at the streaming API; the lifecycle
+        // hooks point at the service manager.
+        assert!(skip_guidance("alertnotify").unwrap().contains("Streaming Consumption API"));
+        assert!(skip_guidance("walletnotify").unwrap().contains("Streaming Consumption API"));
+        assert!(skip_guidance("startupnotify").unwrap().contains("systemd"));
     }
 
     #[test]

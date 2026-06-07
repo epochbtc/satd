@@ -916,7 +916,13 @@ async fn main() {
         .filter(|c| !c.trim().is_empty())
     {
         let mut rx = chain_event_tx.subscribe();
-        tracing::info!("-blocknotify configured; running a command on each new best block");
+        tracing::warn!(
+            "-blocknotify configured; running a command on each new best block. This shell-hook \
+             notifier is provided for Bitcoin Core convenience/compatibility only — for building \
+             on satd, consume node events via the Streaming Consumption API (gRPC / WebSocket / \
+             ZMQ), which is reorg-safe, replayable, and decoupled from consensus. See the \
+             Streaming Consumption API chapter of the manual."
+        );
         tokio::spawn(async move {
             loop {
                 match rx.recv().await {
