@@ -2352,6 +2352,17 @@ impl Config {
         // --log-format selects the formatter), so direct
         // `tracing::warn!` calls would silently drop on the floor.
         let mut pending_notes: Vec<ConfigNote> = std::mem::take(&mut include_notes);
+        // Surface warnings for recognized-but-unsupported Core keys that were
+        // skipped (drop-in bitcoin.conf compatibility) so the operator knows
+        // each ignored line, even though the node started.
+        if let Some(cf) = config_file.as_ref() {
+            for msg in &cf.ignored {
+                pending_notes.push(ConfigNote {
+                    level: NoteLevel::Warn,
+                    message: msg.clone(),
+                });
+            }
+        }
         let mut esplora_resolved = esplora;
         if esplora_resolved && prune > 0 {
             pending_notes.push(ConfigNote {
@@ -4987,6 +4998,9 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
 pub struct ConfigFile {
     pub global: HashMap<String, Vec<String>>,
     pub sections: HashMap<String, HashMap<String, Vec<String>>>,
+    /// Warnings for recognized-but-unsupported Core keys that were skipped
+    /// (drop-in compatibility). Surfaced to the operator via config notes.
+    pub ignored: Vec<String>,
 }
 
 impl ConfigFile {
@@ -5037,40 +5051,43 @@ impl ConfigFile {
             // reason so the operator knows whether to wait for support
             // (not-yet-implemented) or remove the line for good
             // (intentionally-excluded).
-            match classify_unsupported_key(&key) {
-                Some(UnsupportedKey::NotYetImplemented) => {
-                    return Err(format!(
-                        "Error reading configuration file: parse error on line {line_no}: \
-                        '{key}' is a Bitcoin Core option that satd recognises but does NOT \
-                        yet implement, so honouring this line would silently drop its \
-                        effect. Remove it for now — its support is tracked in \
-                        SATD_CLI_COMPAT_AUDIT.md — before starting satd."
-                    ));
-                }
-                Some(UnsupportedKey::IntentionallyExcluded) => {
-                    return Err(format!(
-                        "Error reading configuration file: parse error on line {line_no}: \
-                        '{key}' is a Bitcoin Core option that satd intentionally does NOT \
-                        support (deprecated upstream or out of scope — see \
-                        CORE_DIFFERENCES.md and SATD_CLI_COMPAT_AUDIT.md). Remove this \
-                        line before starting satd."
-                    ));
-                }
-                None => {}
-            }
-
-            // Reject unrecognised keys with a Core-style line-numbered
-            // error. Wallet keys (`wallet=`, `walletdir=`, ...) are
-            // not on the allowlist — satd intentionally has no wallet,
-            // and silently accepting them would leave operators
-            // unaware their wallet config has zero effect.
+            // Disposition for a key satd does not honor. The goal is drop-in
+            // bitcoin.conf compatibility, so an unsupported-but-recognized Core
+            // key is skipped with a warning (the node still starts) rather than
+            // being fatal — except where skipping would mislead the operator
+            // about the node's security / exposure / privacy posture. A key that
+            // is neither a satd option nor a known Core v30 option is a typo.
             if !is_known_config_key(&key) {
-                return Err(format!(
-                    "Error reading configuration file: parse error on line {line_no}: \
-                    unrecognized key '{key}'. If this is a Bitcoin Core key satd does \
-                    not yet support, see SATD_CLI_COMPAT_AUDIT.md for the parity \
-                    roadmap; otherwise check for typos."
-                ));
+                if let Some(reason) = classify_unsupported_key(&key) {
+                    // Fatal to skip (auth / exposure / privacy).
+                    return Err(format!(
+                        "Error reading configuration file: parse error on line {line_no}: \
+                        '{key}' is a Bitcoin Core option that satd does not support. \
+                        {reason} Remove this line before starting satd."
+                    ));
+                } else if is_core_v30_key(&key) {
+                    // Recognized Core v30 option satd does not implement and is
+                    // safe to skip: warn and continue so the config still loads.
+                    let msg = match skip_guidance(&key) {
+                        Some(g) => format!(
+                            "ignoring unsupported Bitcoin Core option '{key}' (bitcoin.conf line {line_no}); the node will run without it. {g}"
+                        ),
+                        None => format!(
+                            "ignoring unsupported Bitcoin Core v30 option '{key}' (bitcoin.conf line {line_no}); satd does not implement it, so the node will run without it."
+                        ),
+                    };
+                    file.ignored.push(msg);
+                    continue;
+                } else {
+                    // Neither a satd key nor a known Core v30 key — almost
+                    // certainly a typo. Reject so a fat-fingered security option
+                    // (e.g. `rpcusser=`) can't silently disable auth.
+                    return Err(format!(
+                        "Error reading configuration file: parse error on line {line_no}: \
+                        unrecognized key '{key}'. This is neither a satd option nor a \
+                        known Bitcoin Core v30 option — check for a typo."
+                    ));
+                }
             }
 
             let map = match &current_section {
@@ -5109,7 +5126,7 @@ impl ConfigFile {
     /// keep main-then-included order. The common case is an included file
     /// holding keys (e.g. `rpcpassword`) the main file never sets, which
     /// take effect unopposed.
-    fn merge_from(&mut self, other: ConfigFile) {
+    fn merge_from(&mut self, mut other: ConfigFile) {
         for (k, mut v) in other.global {
             self.global.entry(k).or_default().append(&mut v);
         }
@@ -5119,6 +5136,9 @@ impl ConfigFile {
                 dst.entry(k).or_default().append(&mut v);
             }
         }
+        // Carry skipped-key warnings from included files up to the parent so
+        // they surface even when an exotic key lives in an `includeconf` file.
+        self.ignored.append(&mut other.ignored);
     }
 
     /// Resolve `includeconf` directives (global + active `section`)
@@ -5396,45 +5416,98 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "metricsbind",
 ];
 
-/// Why a recognised Bitcoin Core key is rejected rather than honoured.
-/// Drives the parse-time error message so the operator gets an
-/// actionable reason instead of a generic "unknown key".
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UnsupportedKey {
-    /// A real Core feature satd intends to support but hasn't built
-    /// yet. The operator should remove the line for now; support is
-    /// tracked in `SATD_CLI_COMPAT_AUDIT.md`.
-    NotYetImplemented,
-    /// A Core feature satd will not implement — deprecated upstream or
-    /// deliberately out of scope. The operator should remove the line
-    /// permanently. See `CORE_DIFFERENCES.md`.
-    IntentionallyExcluded,
-}
+// Disposition of a Bitcoin Core config key that satd does not honor.
+//
+// The goal is drop-in `bitcoin.conf` compatibility: an existing Core config
+// should start satd with little or no editing. So an unsupported-but-recognized
+// Core key is **skipped with a warning** (the node still starts) rather than
+// being a fatal error — *except* a small set where silently skipping would
+// mislead the operator about the node's security / exposure / privacy posture,
+// which stay fatal. A key that is neither a satd option nor a known Core v30
+// option is treated as a typo and rejected (this is what protects a fat-
+// fingered `rpcusser=` from silently disabling auth).
+//
+// See `SATD_CORE_CONFIG_SUPERSET_GAP.md` (monorepo) for the policy.
 
-/// Bitcoin Core config keys satd RECOGNISES but has not yet implemented.
-/// These hard-error at parse time instead of being silently accepted:
-/// an accepted-but-ignored option lets a config look valid while its
-/// effect is dropped. `includeconf` is the marquee hazard — operators
-/// routinely move security-sensitive options into an included file, so
-/// silently ignoring it could run a node wide open. When a key here
-/// gains real support, move it into [`KNOWN_CONFIG_KEYS`].
-// Currently empty: every Core key satd previously deferred has been
-// implemented and moved into KNOWN_CONFIG_KEYS. The NotYetImplemented
-// classification path is retained for any future deferral — add the key
-// here and it hard-errors at parse time (see ConfigFile::parse).
-const NOT_YET_IMPLEMENTED_KEYS: &[&str] = &[];
+/// Core keys that are **fatal** to skip: skipping them would leave the operator
+/// believing the node is more locked-down / private than it is. Each carries an
+/// actionable reason naming the satd equivalent. (Default is warn-and-continue;
+/// only auth / exposure / privacy keys belong here.)
+const FATAL_UNSUPPORTED_KEYS: &[(&str, &str)] = &[
+    ("i2psam", "I2P is out of scope; Tor is satd's supported anonymity network (-proxy / -onion / -torcontrol). Leaving this in place would route traffic over clearnet instead of the privacy network you configured."),
+    ("i2pacceptincoming", "I2P is out of scope (see i2psam); Tor is satd's supported anonymity network."),
+    ("rpcwhitelist", "satd uses capability-scoped bearer tokens (-authfile) instead of per-user RPC method allowlists; silently skipping this would leave RPC less restricted than your Core config intends. See the Authentication chapter of the manual."),
+    ("rpcwhitelistdefault", "satd uses capability-scoped bearer tokens (-authfile) instead of Core's RPC whitelists; silently skipping this would leave RPC less restricted than your Core config intends. See the Authentication chapter of the manual."),
+];
 
-/// Bitcoin Core config keys satd RECOGNISES but will NOT implement —
-/// either deprecated upstream or deliberately out of scope (see
-/// `CORE_DIFFERENCES.md` "Intentional exclusions"). Hard-error so a
-/// migrated config fails loudly with a clear reason rather than a
-/// confusing "unknown key", but unlike [`NOT_YET_IMPLEMENTED_KEYS`]
-/// these will never move into [`KNOWN_CONFIG_KEYS`].
-const INTENTIONALLY_EXCLUDED_KEYS: &[&str] = &[
-    "upnp",              // UPnP port mapping — deprecated in Core
-    "natpmp",            // NAT-PMP port mapping — deprecated in Core
-    "i2psam",            // I2P SAM proxy — Tor is satd's supported anonymity net
-    "i2pacceptincoming", // I2P inbound — out of scope (see i2psam)
+/// Optional, richer guidance appended to the warning when a *skipped* Core key
+/// has a satd-specific replacement the operator should switch to. Keys not
+/// listed here get a generic "recognized but not implemented" warning.
+const SKIP_GUIDANCE: &[(&str, &str)] = &[
+    ("rest", "satd ships a native Esplora REST API instead of Core's /rest/ surface; enable it with -esplora (on by default)."),
+    ("peerbloomfilters", "BIP37 bloom filters are intentionally unsupported (privacy / DoS); use BIP157/158 compact filters via -blockfilterindex / -peerblockfilters."),
+    ("discover", "external-IP auto-discovery is not supported; advertise your address explicitly with -externalip."),
+    ("maxorphantx", "this option was removed in Bitcoin Core v30 as well."),
+    ("natpmp", "satd does not implement PCP/NAT-PMP port mapping; configure port forwarding externally."),
+    ("debuglogfile", "satd logs to stdout/journald and has no debug.log; manage retention via journald or your container runtime."),
+    ("shrinkdebugfile", "satd logs to stdout/journald and has no debug.log to shrink; manage retention via journald or your container runtime."),
+    ("printtoconsole", "satd always logs to stdout; there is no debug.log alternative to toggle."),
+    ("zmqpubhashtx", "use -eventszmqbind + -eventszmqhashtx (Core wire-format) instead of per-topic -zmqpub* flags."),
+    ("zmqpubhashblock", "use -eventszmqbind + -eventszmqhashblock (Core wire-format) instead of per-topic -zmqpub* flags."),
+    ("zmqpubrawtx", "satd's events bus (-eventszmqbind) replaces Core's per-topic -zmqpub* model; raw-tx publication is not currently provided. See CORE_DIFFERENCES.md."),
+    ("zmqpubrawblock", "satd's events bus (-eventszmqbind) replaces Core's per-topic -zmqpub* model; raw-block publication is not currently provided. See CORE_DIFFERENCES.md."),
+    ("zmqpubsequence", "satd's events bus (-eventszmqbind) replaces Core's per-topic -zmqpub* model. See CORE_DIFFERENCES.md."),
+];
+
+/// The frozen set of Bitcoin Core **v30** config keys (bitcoind node + wallet +
+/// chainparams + logging args). Used purely to tell a real-but-unsupported Core
+/// option (→ warn and skip) apart from a typo (→ reject). Extracted from the
+/// `v30.0` tag:
+/// ```text
+/// for f in src/init.cpp src/init/common.cpp src/common/args.cpp \
+///          src/chainparamsbase.cpp src/wallet/init.cpp; do git show v30.0:$f; done \
+///   | perl -0777 -ne 'while(/AddArg\(\s*"-([a-zA-Z0-9-]+)/g){print "$1\n"}' | sort -u
+/// ```
+/// Note: the logging / `-debug` family (`debug`, `debuglogfile`, `printtoconsole`,
+/// `shrinkdebugfile`, `log*`, …) lives in `src/init/common.cpp`, and many AddArg
+/// calls wrap the option name onto a second line — hence the slurp-mode perl
+/// rather than a line-oriented `grep`.
+/// Compatibility is pinned to v30: keys Core adds in later releases are not
+/// listed here and would be treated as typos until this list is bumped.
+const CORE_V30_KEYS: &[&str] = &[
+    "acceptnonstdtxn", "acceptstalefeeestimates", "addnode", "addresstype", "alertnotify", "allowignoredconf",
+    "asmap", "assumevalid", "avoidpartialspends", "bantime", "bind", "blockfilterindex",
+    "blockmaxweight", "blockmintxfee", "blocknotify", "blockreconstructionextratxn", "blockreservedweight", "blocksdir",
+    "blocksonly", "blocksxor", "blockversion", "bytespersigop", "capturemessages", "chain",
+    "changetype", "checkaddrman", "checkblockindex", "checkblocks", "checklevel", "checkmempool",
+    "checkpoints", "cjdnsreachable", "coinstatsindex", "conf", "connect", "consolidatefeerate",
+    "daemon", "daemonwait", "datacarrier", "datacarriersize", "datadir", "dbbatchsize",
+    "dbcache", "debug", "debugexclude", "debuglogfile", "deprecatedrpc", "disablewallet",
+    "discardfee", "discover", "dns",
+    "dnsseed", "dustrelayfee", "externalip", "fallbackfee", "fastprune", "fixedseeds",
+    "forcednsseed", "help", "help-debug", "i2pacceptincoming", "i2psam", "includeconf",
+    "incrementalrelayfee", "ipcbind", "keypool", "limitancestorcount", "limitancestorsize", "limitdescendantcount",
+    "limitdescendantsize", "listen", "listenonion", "loadblock", "logips", "loglevel",
+    "loglevelalways", "logratelimit", "logsourcelocations", "logthreadnames", "logtimemicros", "logtimestamps",
+    "maxapsfee", "maxconnections", "maxmempool", "maxorphantx", "maxreceivebuffer", "maxsendbuffer",
+    "maxsigcachesize", "maxtipage", "maxtxfee", "maxuploadtarget", "mempoolexpiry", "minimumchainwork",
+    "minrelaytxfee", "mintxfee", "mocktime", "natpmp", "networkactive", "onion",
+    "onlynet", "par", "paytxfee", "peerblockfilters", "peerbloomfilters", "peertimeout",
+    "permitbaremultisig", "persistmempool", "persistmempoolv1", "pid", "port", "printpriority",
+    "printtoconsole", "proxy", "proxyrandomize", "prune", "regtest", "reindex",
+    "reindex-chainstate",
+    "rest", "rpcallowip", "rpcauth", "rpcbind", "rpccookiefile", "rpccookieperms",
+    "rpcdoccheck", "rpcpassword", "rpcport", "rpcservertimeout", "rpcthreads", "rpcuser",
+    "rpcwhitelist", "rpcwhitelistdefault", "rpcworkqueue", "seednode", "server", "settings",
+    "shrinkdebugfile", "shutdownnotify", "signer", "signet", "signetchallenge", "signetseednode",
+    "spendzeroconfchange",
+    "startupnotify", "stopafterblockimport", "stopatheight", "test", "testactivationheight", "testnet",
+    "testnet4", "timeout", "torcontrol", "torpassword", "txconfirmtarget", "txindex",
+    "txreconciliation", "uacomment", "unsafesqlitesync", "v2transport", "vbparams", "version",
+    "wallet", "walletbroadcast", "walletcrosschain", "walletdir", "walletnotify", "walletrbf",
+    "walletrejectlongchains", "whitebind", "whitelist", "whitelistforcerelay", "whitelistrelay", "zmqpubhashblock",
+    "zmqpubhashblockhwm", "zmqpubhashtx", "zmqpubhashtxhwm", "zmqpubrawblock", "zmqpubrawblockhwm", "zmqpubrawtx",
+    "zmqpubrawtxhwm", "zmqpubsequence", "zmqpubsequencehwm",
 ];
 
 /// Is the given config-file key recognised? Returns true for any
@@ -5444,17 +5517,28 @@ pub fn is_known_config_key(key: &str) -> bool {
     KNOWN_CONFIG_KEYS.contains(&key)
 }
 
-/// Classify a Core key that satd recognises but does not accept.
-/// Returns `None` for keys that are not in either unsupported list
-/// (i.e. genuinely unknown, or actually supported).
-pub fn classify_unsupported_key(key: &str) -> Option<UnsupportedKey> {
-    if NOT_YET_IMPLEMENTED_KEYS.contains(&key) {
-        Some(UnsupportedKey::NotYetImplemented)
-    } else if INTENTIONALLY_EXCLUDED_KEYS.contains(&key) {
-        Some(UnsupportedKey::IntentionallyExcluded)
-    } else {
-        None
-    }
+/// If `key` is a Core option that is **fatal to skip** (auth / exposure /
+/// privacy), return the actionable reason; otherwise `None`. Kept as the
+/// public classifier name for callers/tests.
+pub fn classify_unsupported_key(key: &str) -> Option<&'static str> {
+    FATAL_UNSUPPORTED_KEYS
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map(|(_, reason)| *reason)
+}
+
+/// Is `key` a recognized Bitcoin Core v30 option (whether or not satd honors
+/// it)? Distinguishes a real-but-unsupported Core key from a typo.
+pub fn is_core_v30_key(key: &str) -> bool {
+    CORE_V30_KEYS.contains(&key)
+}
+
+/// Optional richer guidance for a *skipped* (warned) Core key.
+fn skip_guidance(key: &str) -> Option<&'static str> {
+    SKIP_GUIDANCE
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map(|(_, g)| *g)
 }
 
 /// Map a Bitcoin Core `-debug` category to the satd `tracing` target
@@ -8339,15 +8423,18 @@ notarealkey=1
     }
 
     #[test]
-    fn wallet_keys_intentionally_rejected() {
-        // Wallet support is intentionally excluded. A Core operator
-        // pasting `wallet=mywallet.dat` should get a clear error,
-        // not silent ignore.
-        let content = "wallet=mywallet.dat\n";
-        let err = ConfigFile::parse(content).unwrap_err();
+    fn wallet_keys_skipped_with_warning_not_fatal() {
+        // satd is keyless (no wallet), but a Core operator's bitcoin.conf
+        // commonly carries `wallet=` lines. For drop-in compatibility these
+        // are recognized Core keys → skipped with a warning, NOT fatal, so the
+        // node still starts. (They are not auth/exposure/privacy keys.)
+        let cf = ConfigFile::parse("wallet=mywallet.dat\nserver=1\n").unwrap();
+        assert!(!cf.global.contains_key("wallet"), "wallet should be skipped");
+        assert!(cf.global.contains_key("server"));
         assert!(
-            err.contains("wallet"),
-            "expected the rejected wallet key cited, got: {err}"
+            cf.ignored.iter().any(|m| m.contains("wallet")),
+            "expected a skip warning naming the wallet key, got: {:?}",
+            cf.ignored
         );
     }
 
@@ -8394,38 +8481,121 @@ notarealkey=1
     }
 
     #[test]
-    fn not_yet_implemented_list_is_empty_after_migration() {
-        // Every formerly-deferred Core key has now been implemented, so
-        // the not-yet-implemented list is empty. The NotYetImplemented
-        // classification path itself remains wired (ConfigFile::parse
-        // still hard-errors on any future entry added here).
-        assert!(
-            NOT_YET_IMPLEMENTED_KEYS.is_empty(),
-            "an entry was re-added; ensure it hard-errors and update this test"
-        );
+    fn fatal_unsupported_keys_hard_error_with_guidance() {
+        // The small set where silently skipping would mislead the operator
+        // about security / exposure / privacy. These stay fatal with an
+        // actionable, per-key message.
+        for (k, _) in FATAL_UNSUPPORTED_KEYS {
+            assert!(classify_unsupported_key(k).is_some(), "{k:?} should be fatal");
+            assert!(!is_known_config_key(k), "{k:?} must not be honored");
+            let err = ConfigFile::parse(&format!("{k}=1")).unwrap_err();
+            assert!(
+                err.contains("does not support")
+                    && err.contains("Remove this line")
+                    && err.contains(k),
+                "expected a fatal error for {k:?}, got: {err}"
+            );
+        }
     }
 
     #[test]
-    fn intentionally_excluded_keys_hard_error() {
-        // Core keys satd will never implement (deprecated upstream or
-        // out of scope). They hard-error with a distinct message that
-        // tells the operator to remove the line permanently.
-        for k in ["upnp", "natpmp", "i2psam", "i2pacceptincoming"] {
-            assert_eq!(
-                classify_unsupported_key(k),
-                Some(UnsupportedKey::IntentionallyExcluded),
-                "{k:?} should classify as IntentionallyExcluded"
+    fn skip_guidance_entries_are_reachable() {
+        // Invariant: every key with prepared SKIP_GUIDANCE must actually reach
+        // the warn-and-skip path. If a key is not a recognized Core v30 key it
+        // is typo-rejected before guidance is consulted; if it is honored the
+        // guidance is dead; if it is fatal the guidance is also unreachable.
+        // This guards against guidance silently rotting (e.g. a key that Core
+        // later removes, or one that satd starts honoring).
+        for (k, _) in SKIP_GUIDANCE {
+            assert!(
+                is_core_v30_key(k),
+                "{k:?} has skip guidance but isn't a Core v30 key — it would be \
+                 rejected as a typo before the guidance is ever shown"
             );
             assert!(
                 !is_known_config_key(k),
-                "{k:?} must not be in the implemented allowlist"
+                "{k:?} has skip guidance but is honored — the guidance is dead code"
             );
-            let err = ConfigFile::parse(&format!("{k}=1")).unwrap_err();
             assert!(
-                err.contains("intentionally does NOT support")
-                    && err.contains("CORE_DIFFERENCES.md")
-                    && err.contains(k),
-                "expected an intentionally-excluded error for {k:?}, got: {err}"
+                classify_unsupported_key(k).is_none(),
+                "{k:?} has skip guidance but is also fatal — guidance unreachable"
+            );
+            // And it must genuinely be reachable end-to-end.
+            let cf = ConfigFile::parse(&format!("{k}=1\n"))
+                .unwrap_or_else(|e| panic!("{k:?} should warn-and-skip, not error: {e}"));
+            assert!(
+                cf.ignored.iter().any(|m| m.contains(*k)),
+                "{k:?} produced no warn-and-skip notice"
+            );
+        }
+    }
+
+    #[test]
+    fn logging_file_keys_are_dropin_skipped_not_typos() {
+        // Core's debug.log knobs are real v30 options satd has no analogue for
+        // (it logs to stdout/journald). A dropped-in Core config carrying them
+        // — `printtoconsole` is near-ubiquitous in containerized setups — must
+        // boot, not hard-error as a typo.
+        for k in ["printtoconsole", "debuglogfile", "shrinkdebugfile"] {
+            let cf = ConfigFile::parse(&format!("{k}=1\nserver=1\n"))
+                .unwrap_or_else(|e| panic!("{k:?} should be skipped, not rejected: {e}"));
+            assert!(!cf.global.contains_key(k), "{k:?} should not be honored");
+            assert!(
+                cf.ignored.iter().any(|m| m.contains(k) && m.contains("debug.log")),
+                "{k:?} warning should explain the no-debug.log behavior, got: {:?}",
+                cf.ignored
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_core_keys_warn_and_skip_for_dropin() {
+        // Drop-in goal: a recognized-but-unsupported Core v30 key does NOT
+        // stop the node — it is skipped with a warning and the rest of the
+        // config still loads.
+        let cf = ConfigFile::parse(
+            "maxorphantx=100\ncoinstatsindex=1\nprintpriority=1\nserver=1\n",
+        )
+        .unwrap();
+        // The supported key is stored; the skipped ones are not.
+        assert!(cf.global.contains_key("server"));
+        assert!(!cf.global.contains_key("maxorphantx"));
+        assert!(!cf.global.contains_key("coinstatsindex"));
+        // Each skipped key produced a warning naming it.
+        assert_eq!(cf.ignored.len(), 3, "got: {:?}", cf.ignored);
+        assert!(cf.ignored.iter().any(|m| m.contains("maxorphantx")));
+        assert!(cf.ignored.iter().any(|m| m.contains("coinstatsindex")));
+    }
+
+    #[test]
+    fn skipped_key_warnings_name_the_satd_equivalent() {
+        // Where a skipped key has a satd replacement, the warning points to it.
+        let cases = [
+            ("rest", "-esplora"),
+            ("zmqpubrawtx", "-eventszmqbind"),
+            ("peerbloomfilters", "-blockfilterindex"),
+            ("maxorphantx", "removed in Bitcoin Core v30"),
+        ];
+        for (k, needle) in cases {
+            let cf = ConfigFile::parse(&format!("{k}=1\n")).unwrap();
+            assert!(
+                cf.ignored.iter().any(|m| m.contains(needle) && m.contains(k)),
+                "expected {k:?} warning to mention {needle:?}, got: {:?}",
+                cf.ignored
+            );
+        }
+    }
+
+    #[test]
+    fn typo_keys_still_hard_error() {
+        // A key that is neither a satd option nor a known Core v30 option is
+        // treated as a typo and rejected — this protects a fat-fingered
+        // security option (e.g. `rpcusser=`) from silently disabling auth.
+        for typo in ["rpcusser", "rpcpasword", "totallymadeup"] {
+            let err = ConfigFile::parse(&format!("{typo}=x")).unwrap_err();
+            assert!(
+                err.contains("unrecognized key") && err.contains("typo"),
+                "expected a typo error for {typo:?}, got: {err}"
             );
         }
     }
@@ -8488,14 +8658,13 @@ notarealkey=1
     }
 
     #[test]
-    fn unknown_key_error_points_to_audit_doc() {
-        // The error message should hint at the audit doc so an
-        // operator confused by "why is `rpccookieperms` unknown?"
-        // can find the parity roadmap.
+    fn unknown_key_error_flags_a_typo() {
+        // A key that is neither a satd option nor a known Core v30 option is
+        // rejected as a likely typo (it is not a real Core key we could skip).
         let err = ConfigFile::parse("garbagekey=1\n").unwrap_err();
         assert!(
-            err.contains("SATD_CLI_COMPAT_AUDIT.md"),
-            "expected audit doc reference, got: {err}"
+            err.contains("unrecognized key") && err.contains("typo"),
+            "expected a typo rejection, got: {err}"
         );
     }
 
