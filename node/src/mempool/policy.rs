@@ -25,8 +25,9 @@ pub const MAX_DESCENDANT_COUNT: usize = 25;
 pub const MEMPOOL_EXPIRY_SECS: u64 = 336 * 3600;
 
 /// Incremental relay fee (sat/kvB). RBF replacements must pay at least this
-/// much more per kvB than the transaction(s) they replace.
-pub const INCREMENTAL_RELAY_FEE: u64 = 1_000;
+/// much more per kvB than the transaction(s) they replace. Matches Bitcoin
+/// Core v30's `DEFAULT_INCREMENTAL_RELAY_FEE` (100 sat/kvB).
+pub const INCREMENTAL_RELAY_FEE: u64 = 100;
 
 /// Compute the dust threshold for a given output script.
 ///

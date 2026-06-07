@@ -18,6 +18,9 @@ In-progress; full detail tracked in
   cost, BIP30, future-timestamp, block-version gate, merkle-mutation
   /CVE-2012-2459, per-tx weight cap); reject-reason strings aligned; on-receipt
   mutated-block gate. Differential matrix now 32/32 exact vs Core.
+- **Policy/mining** — two internal defaults aligned to Bitcoin Core v30: the RBF
+  incremental relay fee (1000 → 100 sat/kvB) and the coinbase weight reserve
+  used for block templates and fee estimation (4000 → 8000 WU).
 - **Reliability** — fixed a block-index corruption where a competing fork
   announced below the active tip could clobber the active-chain `height→hash`
   map, making `--reindex-chainstate` abort at `bad-cb-height` and loop. Header

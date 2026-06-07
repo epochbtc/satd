@@ -27,7 +27,8 @@ use crate::mempool::pool::MempoolEntry;
 /// Maximum block weight (4,000,000 WU per BIP 141).
 pub const BLOCK_WEIGHT_LIMIT: u64 = 4_000_000;
 /// Weight reserved for the coinbase — mirrors `mining/template.rs`.
-pub const COINBASE_WEIGHT_RESERVE: u64 = 4_000;
+/// Matches Bitcoin Core v30's `DEFAULT_BLOCK_RESERVED_WEIGHT` (8000 WU).
+pub const COINBASE_WEIGHT_RESERVE: u64 = 8_000;
 /// Usable weight per simulated block (block limit − coinbase reserve).
 pub const USABLE_WEIGHT_PER_BLOCK: u64 = BLOCK_WEIGHT_LIMIT - COINBASE_WEIGHT_RESERVE;
 /// BIP 141 sigop-cost cap per block.
