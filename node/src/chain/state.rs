@@ -226,6 +226,9 @@ pub struct ChainState {
     script_verifier: Arc<dyn ScriptVerifier>,
     assumevalid: AssumeValid,
     checkpoints: Vec<Checkpoint>,
+    /// Whether the checkpoint set is enforced (Core `-checkpoints`, default
+    /// true). Set to false by `-checkpoints=0` to skip checkpoint validation.
+    enforce_checkpoints: bool,
     /// Highest header height stored (may be ahead of connected block tip during IBD).
     headers_tip_height: AtomicU32,
     /// Most-work header chain tip seen so far — `(hash, chainwork)` — analogous
@@ -432,6 +435,7 @@ impl ChainState {
                     script_verifier,
                     assumevalid,
                     checkpoints,
+                    enforce_checkpoints: true,
                     headers_tip_height: AtomicU32::new(htip),
                     best_header: RwLock::new(best_header),
                     mtp_cache: Mutex::new(Vec::with_capacity(12)),
@@ -525,6 +529,7 @@ impl ChainState {
             script_verifier,
             assumevalid,
             checkpoints,
+            enforce_checkpoints: true,
             headers_tip_height: AtomicU32::new(0),
             best_header: RwLock::new((genesis_hash, work_for_bits(genesis.header.bits))),
             mtp_cache: Mutex::new(Vec::with_capacity(12)),
@@ -552,6 +557,14 @@ impl ChainState {
     /// enables block-solution validation and custom P2P magic.
     pub fn set_signet_challenge(&mut self, challenge: Option<Vec<u8>>) {
         self.signet_challenge = challenge;
+    }
+
+    /// Enable or disable enforcement of the built-in block checkpoints
+    /// (Core `-checkpoints`, default enabled). Call once, before the
+    /// `ChainState` is shared (wrapped in an `Arc`). `-checkpoints=0`
+    /// disables checkpoint validation in `connect_block`.
+    pub fn set_enforce_checkpoints(&mut self, enforce: bool) {
+        self.enforce_checkpoints = enforce;
     }
 
     /// Effective P2P network magic. Custom-signet challenges derive their
@@ -2791,7 +2804,9 @@ impl ChainState {
         self.check_signet_solution(block)?;
 
         // Checkpoint validation
-        if !checkpoints::check_against_checkpoints(new_height, &block_hash, &self.checkpoints) {
+        if self.enforce_checkpoints
+            && !checkpoints::check_against_checkpoints(new_height, &block_hash, &self.checkpoints)
+        {
             return Err(ChainError::CheckpointMismatch(new_height));
         }
 
@@ -3581,7 +3596,9 @@ impl ChainState {
         self.check_signet_solution(block)?;
 
         // Checkpoint validation
-        if !checkpoints::check_against_checkpoints(new_height, &block_hash, &self.checkpoints) {
+        if self.enforce_checkpoints
+            && !checkpoints::check_against_checkpoints(new_height, &block_hash, &self.checkpoints)
+        {
             tracing::warn!(
                 height = new_height,
                 hash = %block_hash,

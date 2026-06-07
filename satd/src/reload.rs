@@ -302,6 +302,7 @@ struct FieldSpec {
 const LOAD_ONLY_KEYS: &[&str] = &[
     "conf",
     "includeconf",
+    "allowignoredconf",
     "profile",
     "regtest",
     "testnet",
@@ -409,9 +410,12 @@ fn field_specs() -> Vec<FieldSpec> {
         restart!("logtimestamps", log_timestamps),
         restart!("logthreadnames", log_thread_names),
         restart!("logsourcelocations", log_source_locations),
+        // -checkpoints is consumed once at ChainState construction.
+        restart!("checkpoints", enforce_checkpoints),
         live!("maxshutdownsecs", max_shutdown_secs, consumed_from_reloaded_config),
         live!("debug", debug, |c, h| h.log_filter.reload(c)),
         live!("debugexclude", debugexclude, |c, h| h.log_filter.reload(c)),
+        live!("loglevel", log_level, |c, h| h.log_filter.reload(c)),
         // ---- RPC server ----
         restart!("rpcport", rpcport),
         restart!("rpcbind", rpcbind),
@@ -489,6 +493,14 @@ fn field_specs() -> Vec<FieldSpec> {
             h.peer_manager.set_external_addrs(c.externalip.clone())
         }),
         live!("whitelist", whitelist, |c, h| {
+            h.peer_manager.set_whitelist(c.whitelist.clone())
+        }),
+        // The global relay-permission defaults are baked into the rebuilt
+        // whitelist entries, so re-pushing the whitelist applies a change.
+        live!("whitelistrelay", whitelist_relay, |c, h| {
+            h.peer_manager.set_whitelist(c.whitelist.clone())
+        }),
+        live!("whitelistforcerelay", whitelist_force_relay, |c, h| {
             h.peer_manager.set_whitelist(c.whitelist.clone())
         }),
         restart!("whitebind", whitebind),

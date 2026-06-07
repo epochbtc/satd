@@ -554,6 +554,14 @@ pub struct Config {
     pub externalip: Vec<SocketAddr>,
     /// `-whitelist` permission entries by source subnet (NetPermissions).
     pub whitelist: Vec<node::net::permissions::WhitelistEntry>,
+    /// Bitcoin Core `-whitelistrelay` (default true): grant the `relay`
+    /// permission to whitelisted peers that took the implicit permission
+    /// set, so their transactions are relayed even under `-blocksonly`.
+    pub whitelist_relay: bool,
+    /// Bitcoin Core `-whitelistforcerelay` (default false): grant the
+    /// `forcerelay` permission (relay even non-standard / fee-failing
+    /// txes) to whitelisted peers with the implicit permission set.
+    pub whitelist_force_relay: bool,
     /// `-whitebind` listeners: an extra bind address plus the permissions
     /// granted to peers that connect to it.
     pub whitebind: Vec<(SocketAddr, node::net::permissions::NetPermissions)>,
@@ -919,6 +927,20 @@ pub struct Config {
     /// Bitcoin Core `-debugexclude=<category>` (repeatable). Suppresses
     /// debug logging for a category that `debug` would otherwise enable.
     pub debugexclude: Vec<String>,
+    /// Bitcoin Core `-loglevel=<level>` or `-loglevel=<category>:<level>`.
+    /// A bare level sets the global tracing verbosity; a `category:level`
+    /// pair raises/lowers a single satd subsystem. `None` keeps the
+    /// default (`info`, or `-debug`-derived). See [`build_env_filter`].
+    pub log_level: Option<String>,
+    /// Enforce the hardcoded block-checkpoint set (Core `-checkpoints`,
+    /// default true). `-checkpoints=0` disables checkpoint validation —
+    /// useful when replaying a known-good chain or testing reorg logic.
+    pub enforce_checkpoints: bool,
+    /// Bitcoin Core `-allowignoredconf` (default false). When false, an
+    /// `includeconf` that resolves to a file satd cannot use produces a
+    /// startup warning; when true, that warning is suppressed (the
+    /// operator has acknowledged the ignored include).
+    pub allow_ignored_conf: bool,
     /// Named profile the operator selected (if any). Informational —
     /// the profile's effects are already baked into the other fields.
     pub profile: Option<Profile>,
@@ -1220,9 +1242,24 @@ impl Config {
         // chain= inside an included file does NOT change the network —
         // network is resolved from the main file + CLI above, matching
         // Core's need to know the chain before section selection.
+        // -allowignoredconf (Core, default false): when set, suppress the
+        // startup warnings about `includeconf` files satd had to ignore.
+        // Resolved here, before include processing, so it can gate those
+        // notes. Read from the CLI first, else the config file's default
+        // scope (this meta-key is not section-specific).
+        let allow_ignored_conf = cli.allowignoredconf.unwrap_or_else(|| {
+            config_file
+                .as_ref()
+                .and_then(|cf| cf.global.get("allowignoredconf").and_then(|v| v.first()))
+                .and_then(|v| parse_bool(v))
+                .unwrap_or(false)
+        });
         let mut include_notes: Vec<ConfigNote> = Vec::new();
         if let Some(cf) = config_file.as_mut() {
             include_notes = cf.resolve_includes(&base_datadir, section)?;
+        }
+        if allow_ignored_conf {
+            include_notes.clear();
         }
         // Command-line -includeconf is rejected, the same as Bitcoin Core:
         // includes are a config-file-only feature (a command-line include
@@ -1748,6 +1785,21 @@ impl Config {
                 node::net::permissions::WhitelistEntry::parse(raw)
                     .map_err(|e| format!("whitelist: {e}"))?,
             );
+        }
+        // -whitelistrelay (default on) / -whitelistforcerelay (default off):
+        // global default relay-permission modifiers applied to whitelist
+        // entries that took the implicit permission set (no explicit
+        // `perms@` prefix), matching Bitcoin Core.
+        let whitelist_relay = cli
+            .whitelistrelay
+            .or_else(|| file_get("whitelistrelay").and_then(|v| parse_bool(&v)))
+            .unwrap_or(true);
+        let whitelist_force_relay = cli
+            .whitelistforcerelay
+            .or_else(|| file_get("whitelistforcerelay").and_then(|v| parse_bool(&v)))
+            .unwrap_or(false);
+        for entry in &mut whitelist {
+            entry.apply_global_relay_defaults(whitelist_relay, whitelist_force_relay);
         }
 
         // -whitebind: extra permissioned listeners. `[perms@]addr`, addr
@@ -2523,6 +2575,8 @@ impl Config {
             v2only,
             externalip,
             whitelist,
+            whitelist_relay,
+            whitelist_force_relay,
             whitebind,
             asmap,
             port,
@@ -2884,6 +2938,12 @@ impl Config {
                 }
                 v
             },
+            log_level: cli.loglevel.clone().or_else(|| file_get("loglevel")),
+            enforce_checkpoints: cli
+                .checkpoints
+                .or_else(|| file_get("checkpoints").and_then(|v| parse_bool(&v)))
+                .unwrap_or(true),
+            allow_ignored_conf,
             profile,
             reorg_webhook: cli.reorg_webhook.or_else(|| file_get("reorgwebhook")),
             reorg_webhook_secret: cli
@@ -3047,8 +3107,13 @@ impl Config {
             "log_timestamps": self.log_timestamps,
             "log_thread_names": self.log_thread_names,
             "log_source_locations": self.log_source_locations,
+            "log_level": self.log_level,
             "debug": self.debug,
             "debugexclude": self.debugexclude,
+            "enforce_checkpoints": self.enforce_checkpoints,
+            "allow_ignored_conf": self.allow_ignored_conf,
+            "whitelist_relay": self.whitelist_relay,
+            "whitelist_force_relay": self.whitelist_force_relay,
             "max_shutdown_secs": self.max_shutdown_secs,
             "tor": {
                 "proxy": self.proxy,
@@ -4542,6 +4607,53 @@ pub struct CliArgs {
     pub logsourcelocations: Option<bool>,
 
     #[arg(
+        long = "loglevel",
+        value_name = "LEVEL|CATEGORY:LEVEL",
+        help = "Global log verbosity (trace|debug|info|warn|error) or a per-category override (e.g. net:debug)"
+    )]
+    pub loglevel: Option<String>,
+
+    #[arg(
+        long = "checkpoints",
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
+        help = "Enforce the built-in block checkpoints (default: true; -checkpoints=0 disables checkpoint validation)"
+    )]
+    pub checkpoints: Option<bool>,
+
+    #[arg(
+        long = "allowignoredconf",
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
+        help = "Suppress startup warnings about includeconf files that had to be ignored (default: false)"
+    )]
+    pub allowignoredconf: Option<bool>,
+
+    #[arg(
+        long = "whitelistrelay",
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
+        help = "Grant 'relay' permission to whitelisted peers with default permissions (default: true)"
+    )]
+    pub whitelistrelay: Option<bool>,
+
+    #[arg(
+        long = "whitelistforcerelay",
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
+        help = "Grant 'forcerelay' permission to whitelisted peers with default permissions (default: false)"
+    )]
+    pub whitelistforcerelay: Option<bool>,
+
+    #[arg(
         long,
         value_name = "NAME",
         help = "Named preset: archival | pruned-home | mining | regtest-dev | signet-watchtower. CLI flags override profile values."
@@ -4954,6 +5066,11 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "logtimestamps",
         "logthreadnames",
         "logsourcelocations",
+        "loglevel",
+        "checkpoints",
+        "allowignoredconf",
+        "whitelistrelay",
+        "whitelistforcerelay",
         "debug",
         "debugexclude",
         "profile",
@@ -5006,6 +5123,10 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "logtimestamps",
         "logthreadnames",
         "logsourcelocations",
+        "checkpoints",
+        "allowignoredconf",
+        "whitelistrelay",
+        "whitelistforcerelay",
         "reindex",
         "reindex-chainstate",
         "checkblockindex",
@@ -5294,6 +5415,11 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "logtimestamps",
     "logthreadnames",
     "logsourcelocations",
+    "loglevel",
+    "checkpoints",
+    "allowignoredconf",
+    "whitelistrelay",
+    "whitelistforcerelay",
     "debug",
     "debugexclude",
     "maxshutdownsecs",
@@ -5704,7 +5830,52 @@ pub fn build_env_filter(config: &Config) -> tracing_subscriber::EnvFilter {
             Err(e) => eprintln!("Warning: ignoring invalid debug directive {d:?}: {e}"),
         }
     }
+    // -loglevel: a bare level overrides the global verbosity; a
+    // `category:level` pair overrides a single satd subsystem. Applied
+    // after -debug so an explicit loglevel wins. Note: satd maps this onto
+    // its tracing EnvFilter, so a global level affects all targets (Core
+    // scopes it to -debug-enabled categories) — documented in the manual.
+    if let Some(ll) = &config.log_level {
+        for tok in ll.split(',') {
+            let tok = tok.trim();
+            if tok.is_empty() {
+                continue;
+            }
+            let directive = if let Some((cat, lvl)) = tok.split_once(':') {
+                match (
+                    debug_category_target(&cat.trim().to_ascii_lowercase()),
+                    normalize_log_level(lvl),
+                ) {
+                    (Some(target), Some(lvl)) => Some(format!("{target}={lvl}")),
+                    _ => None,
+                }
+            } else {
+                normalize_log_level(tok).map(str::to_string)
+            };
+            match directive {
+                Some(d) => match d.parse() {
+                    Ok(parsed) => env_filter = env_filter.add_directive(parsed),
+                    Err(e) => eprintln!("Warning: ignoring invalid -loglevel {tok:?}: {e}"),
+                },
+                None => eprintln!("Warning: ignoring unrecognized -loglevel {tok:?}"),
+            }
+        }
+    }
     env_filter
+}
+
+/// Normalize a Bitcoin Core `-loglevel` severity to a `tracing` level.
+/// Core accepts `trace|debug|info|warning|error`; `tracing` spells the
+/// warning level `warn`. Returns `None` for an unrecognized level.
+fn normalize_log_level(s: &str) -> Option<&'static str> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "trace" => Some("trace"),
+        "debug" => Some("debug"),
+        "info" => Some("info"),
+        "warn" | "warning" => Some("warn"),
+        "error" => Some("error"),
+        _ => None,
+    }
 }
 
 fn default_datadir() -> PathBuf {
@@ -6459,6 +6630,11 @@ rpcport=8332
             logtimestamps: None,
             logthreadnames: None,
             logsourcelocations: None,
+            loglevel: None,
+            checkpoints: None,
+            allowignoredconf: None,
+            whitelistrelay: None,
+            whitelistforcerelay: None,
             debug: vec![],
             debugexclude: vec![],
             profile: None,
@@ -6713,6 +6889,11 @@ rpcport=8332
             logtimestamps: None,
             logthreadnames: None,
             logsourcelocations: None,
+            loglevel: None,
+            checkpoints: None,
+            allowignoredconf: None,
+            whitelistrelay: None,
+            whitelistforcerelay: None,
             debug: vec![],
             debugexclude: vec![],
             profile: None,
@@ -8445,6 +8626,139 @@ rpcport=39999
         assert!(is_known_config_key("logtimestamps"));
         assert!(is_known_config_key("logthreadnames"));
         assert!(is_known_config_key("logsourcelocations"));
+    }
+
+    #[test]
+    fn loglevel_honored_via_cli_and_file() {
+        // Default: no explicit level.
+        let cfg = Config::from_cli(CliArgs::try_parse_from(["satd", "--regtest"]).unwrap()).unwrap();
+        assert_eq!(cfg.log_level, None);
+        assert!(is_known_config_key("loglevel"));
+
+        // CLI bare level.
+        let cfg = Config::from_cli(
+            CliArgs::try_parse_from(["satd", "--regtest", "--loglevel=debug"]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cfg.log_level.as_deref(), Some("debug"));
+
+        // Config-file per-category form is recognized + stored.
+        let cf = ConfigFile::parse("loglevel=net:trace\n").unwrap();
+        assert_eq!(
+            cf.global.get("loglevel").map(|v| v.as_slice()),
+            Some(&["net:trace".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn loglevel_builds_env_filter_directives() {
+        // A bare global level and a per-category override both reach the
+        // EnvFilter (build succeeds — invalid tokens would warn, not panic).
+        let cfg = Config::from_cli(
+            CliArgs::try_parse_from(["satd", "--regtest", "--loglevel=net:debug"]).unwrap(),
+        )
+        .unwrap();
+        let rendered = format!("{}", build_env_filter(&cfg));
+        assert!(
+            rendered.contains("node::net"),
+            "per-category loglevel should add a node::net directive, got: {rendered}"
+        );
+        // "warning" is accepted as an alias for tracing's "warn".
+        assert_eq!(normalize_log_level("warning"), Some("warn"));
+        assert_eq!(normalize_log_level("bogus"), None);
+    }
+
+    #[test]
+    fn checkpoints_default_on_and_disablable() {
+        let cfg = Config::from_cli(CliArgs::try_parse_from(["satd", "--regtest"]).unwrap()).unwrap();
+        assert!(cfg.enforce_checkpoints, "checkpoints enforced by default");
+        assert!(is_known_config_key("checkpoints"));
+
+        let cfg = Config::from_cli(
+            CliArgs::try_parse_from(["satd", "--regtest", "--checkpoints=0"]).unwrap(),
+        )
+        .unwrap();
+        assert!(!cfg.enforce_checkpoints);
+
+        // Core-style `-nocheckpoints` negation.
+        let argv = normalize_args(
+            ["satd", "--regtest", "-nocheckpoints"].iter().map(|s| s.to_string()).collect(),
+        );
+        let cfg = Config::from_cli(CliArgs::try_parse_from(argv).unwrap()).unwrap();
+        assert!(!cfg.enforce_checkpoints);
+    }
+
+    #[test]
+    fn allowignoredconf_default_off_and_honored() {
+        let cfg = Config::from_cli(CliArgs::try_parse_from(["satd", "--regtest"]).unwrap()).unwrap();
+        assert!(!cfg.allow_ignored_conf);
+        assert!(is_known_config_key("allowignoredconf"));
+
+        let cfg = Config::from_cli(
+            CliArgs::try_parse_from(["satd", "--regtest", "--allowignoredconf"]).unwrap(),
+        )
+        .unwrap();
+        assert!(cfg.allow_ignored_conf);
+    }
+
+    #[test]
+    fn whitelistrelay_modifies_implicit_entry_perms() {
+        // Default: implicit whitelist entry keeps relay, no forcerelay.
+        let cfg = Config::from_cli(
+            CliArgs::try_parse_from(["satd", "--regtest", "--whitelist=127.0.0.1"]).unwrap(),
+        )
+        .unwrap();
+        assert!(cfg.whitelist_relay && !cfg.whitelist_force_relay);
+        assert!(cfg.whitelist[0].perms.relay);
+        assert!(!cfg.whitelist[0].perms.force_relay);
+
+        // -whitelistrelay=0 strips relay from the implicit entry.
+        let cfg = Config::from_cli(
+            CliArgs::try_parse_from([
+                "satd",
+                "--regtest",
+                "--whitelist=127.0.0.1",
+                "--whitelistrelay=0",
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(!cfg.whitelist[0].perms.relay);
+
+        // -whitelistforcerelay=1 grants forcerelay (and relay).
+        let cfg = Config::from_cli(
+            CliArgs::try_parse_from([
+                "satd",
+                "--regtest",
+                "--whitelist=10.0.0.0/8",
+                "--whitelistforcerelay=1",
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(cfg.whitelist[0].perms.force_relay);
+        assert!(cfg.whitelist[0].perms.relay);
+    }
+
+    #[test]
+    fn whitelist_explicit_perms_ignore_global_relay_defaults() {
+        // An entry with an explicit perms@ prefix is NOT touched by the
+        // global -whitelistrelay default (Core only modifies implicit ones).
+        let cfg = Config::from_cli(
+            CliArgs::try_parse_from([
+                "satd",
+                "--regtest",
+                "--whitelist=noban@127.0.0.1",
+                "--whitelistrelay=0",
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+        // Explicit "noban" only: relay was never granted, and the global
+        // default doesn't force it off any differently — it's left as parsed.
+        assert!(cfg.whitelist[0].perms.noban);
+        assert!(!cfg.whitelist[0].perms.relay);
+        assert!(!cfg.whitelist[0].implicit);
     }
 
     #[test]
