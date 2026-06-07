@@ -82,7 +82,9 @@ In-progress; full detail tracked in
   mislead about security/exposure/privacy (`i2psam`, `rpcwhitelist`, …) stays
   fatal with guidance; and keys that are neither satd nor known-Core-v30 options
   are rejected as typos (so a fat-fingered `rpcusser=` can't disable auth).
-  Nothing a config asks for is ever *silently* ignored.
+  Nothing a config asks for is ever *silently* ignored. Newly honored Core
+  logging knobs `-logtimestamps` / `-logthreadnames` / `-logsourcelocations`,
+  and the hyphenated `reindex-chainstate` config-file spelling is accepted.
 - **Monitoring** — daemon-side startup/reindex timing on `getstartupinfo`;
   `sat-tui` distinguishes an unreadable RPC cookie from rejected credentials.
 - **Testing / CI** — block-consensus differential matrix (Phase B); live

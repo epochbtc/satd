@@ -404,6 +404,11 @@ fn field_specs() -> Vec<FieldSpec> {
         restart!("daemon", daemon),
         restart!("server", server),
         restart!("logformat", log_format), // only verbosity hot-reloads, not format
+        // The fmt layer (timestamps / thread-names / source-locations) is
+        // built once at startup alongside the format, so these are restart-only.
+        restart!("logtimestamps", log_timestamps),
+        restart!("logthreadnames", log_thread_names),
+        restart!("logsourcelocations", log_source_locations),
         live!("maxshutdownsecs", max_shutdown_secs, consumed_from_reloaded_config),
         live!("debug", debug, |c, h| h.log_filter.reload(c)),
         live!("debugexclude", debugexclude, |c, h| h.log_filter.reload(c)),

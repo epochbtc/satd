@@ -901,6 +901,16 @@ pub struct Config {
     /// Log output format. `Text` is human-readable (default); `Json`
     /// emits one JSON object per event for log-shipping pipelines.
     pub log_format: LogFormat,
+    /// Prepend a timestamp to each log line (Core `-logtimestamps`,
+    /// default true). Disable when journald / the container runtime
+    /// already stamps lines, to avoid a redundant timestamp column.
+    pub log_timestamps: bool,
+    /// Prepend the originating thread name (Core `-logthreadnames`,
+    /// default false).
+    pub log_thread_names: bool,
+    /// Prepend source `file:line` to each log line (Core
+    /// `-logsourcelocations`, default false).
+    pub log_source_locations: bool,
     /// Bitcoin Core `-debug=<category>` (repeatable). Enables
     /// debug-level tracing for the matching satd subsystem(s). The
     /// special values `1` / `all` enable debug everywhere. See
@@ -2848,6 +2858,18 @@ impl Config {
                     .unwrap_or_else(|| "text".to_string());
                 LogFormat::parse(&raw).unwrap_or_default()
             },
+            log_timestamps: cli
+                .logtimestamps
+                .or_else(|| file_get("logtimestamps").and_then(|v| parse_bool(&v)))
+                .unwrap_or(true),
+            log_thread_names: cli
+                .logthreadnames
+                .or_else(|| file_get("logthreadnames").and_then(|v| parse_bool(&v)))
+                .unwrap_or(false),
+            log_source_locations: cli
+                .logsourcelocations
+                .or_else(|| file_get("logsourcelocations").and_then(|v| parse_bool(&v)))
+                .unwrap_or(false),
             debug: {
                 let mut v = cli.debug;
                 if v.is_empty() {
@@ -3022,6 +3044,9 @@ impl Config {
                 LogFormat::Text => "text",
                 LogFormat::Json => "json",
             },
+            "log_timestamps": self.log_timestamps,
+            "log_thread_names": self.log_thread_names,
+            "log_source_locations": self.log_source_locations,
             "debug": self.debug,
             "debugexclude": self.debugexclude,
             "max_shutdown_secs": self.max_shutdown_secs,
@@ -4487,6 +4512,36 @@ pub struct CliArgs {
     pub log_format: Option<String>,
 
     #[arg(
+        long = "logtimestamps",
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
+        help = "Prepend a timestamp to each log line (default: true; -nologtimestamps for journald/container runtimes that stamp their own)"
+    )]
+    pub logtimestamps: Option<bool>,
+
+    #[arg(
+        long = "logthreadnames",
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
+        help = "Prepend the originating thread name to each log line (default: false)"
+    )]
+    pub logthreadnames: Option<bool>,
+
+    #[arg(
+        long = "logsourcelocations",
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
+        help = "Prepend source file:line to each log line (default: false)"
+    )]
+    pub logsourcelocations: Option<bool>,
+
+    #[arg(
         long,
         value_name = "NAME",
         help = "Named preset: archival | pruned-home | mining | regtest-dev | signet-watchtower. CLI flags override profile values."
@@ -4896,6 +4951,9 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "rpcdefaultunits",
         "log-format",
         "logformat",
+        "logtimestamps",
+        "logthreadnames",
+        "logsourcelocations",
         "debug",
         "debugexclude",
         "profile",
@@ -4945,6 +5003,9 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "rpcdisableauth",
         "rpcauthbearer",
         "rpcextendederrors",
+        "logtimestamps",
+        "logthreadnames",
+        "logsourcelocations",
         "reindex",
         "reindex-chainstate",
         "checkblockindex",
@@ -5041,6 +5102,17 @@ impl ConfigFile {
                 (k, v)
             } else {
                 (trimmed.to_string(), "1".to_string())
+            };
+
+            // Accept Bitcoin Core's hyphenated `reindex-chainstate` config
+            // spelling — Core's own conf-file key is hyphenated, so a
+            // migrated bitcoin.conf carries this form. satd's canonical key
+            // is `reindexchainstate`; normalise to it before validation so
+            // the value resolves through the usual `reindexchainstate` path.
+            let key = if key == "reindex-chainstate" {
+                "reindexchainstate".to_string()
+            } else {
+                key
             };
 
             // Hard-error on Bitcoin Core keys we RECOGNISE but do not
@@ -5219,6 +5291,9 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "daemon",
     "server",
     "logformat",
+    "logtimestamps",
+    "logthreadnames",
+    "logsourcelocations",
     "debug",
     "debugexclude",
     "maxshutdownsecs",
@@ -6381,6 +6456,9 @@ rpcport=8332
             maxshutdownsecs: None,
             rpcdefaultunits: None,
             log_format: None,
+            logtimestamps: None,
+            logthreadnames: None,
+            logsourcelocations: None,
             debug: vec![],
             debugexclude: vec![],
             profile: None,
@@ -6632,6 +6710,9 @@ rpcport=8332
             maxshutdownsecs: None,
             rpcdefaultunits: None,
             log_format: None,
+            logtimestamps: None,
+            logthreadnames: None,
+            logsourcelocations: None,
             debug: vec![],
             debugexclude: vec![],
             profile: None,
@@ -8321,6 +8402,62 @@ rpcport=39999
         );
         let cli = CliArgs::try_parse_from(argv).unwrap();
         assert!(!Config::from_cli(cli).unwrap().blocksonly);
+    }
+
+    // ---- logging format knobs ----
+
+    #[test]
+    fn log_format_knob_defaults() {
+        let cfg = Config::from_cli(CliArgs::try_parse_from(["satd", "--regtest"]).unwrap()).unwrap();
+        assert!(cfg.log_timestamps, "timestamps default on (Core parity)");
+        assert!(!cfg.log_thread_names);
+        assert!(!cfg.log_source_locations);
+    }
+
+    #[test]
+    fn log_format_knobs_via_cli_and_negation() {
+        let cfg = Config::from_cli(
+            CliArgs::try_parse_from([
+                "satd",
+                "--regtest",
+                "--logthreadnames",
+                "--logsourcelocations",
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(cfg.log_thread_names);
+        assert!(cfg.log_source_locations);
+        assert!(cfg.log_timestamps);
+
+        // Core-style `-nologtimestamps` disables the timestamp column.
+        let argv = normalize_args(
+            ["satd", "--regtest", "-nologtimestamps"].iter().map(|s| s.to_string()).collect(),
+        );
+        let cfg = Config::from_cli(CliArgs::try_parse_from(argv).unwrap()).unwrap();
+        assert!(!cfg.log_timestamps);
+    }
+
+    #[test]
+    fn log_format_knobs_via_config_file() {
+        let cf = ConfigFile::parse("logthreadnames=1\nlogtimestamps=0\n").unwrap();
+        assert_eq!(cf.global.get("logthreadnames").map(|v| v.as_slice()), Some(&["1".to_string()][..]));
+        assert!(is_known_config_key("logtimestamps"));
+        assert!(is_known_config_key("logthreadnames"));
+        assert!(is_known_config_key("logsourcelocations"));
+    }
+
+    #[test]
+    fn reindex_chainstate_hyphenated_conf_key_is_accepted() {
+        // Bitcoin Core's conf-file key is hyphenated; satd normalises it to
+        // its canonical `reindexchainstate` so a migrated bitcoin.conf works.
+        let cf = ConfigFile::parse("reindex-chainstate=1\n").unwrap();
+        assert_eq!(
+            cf.global.get("reindexchainstate").map(|v| v.as_slice()),
+            Some(&["1".to_string()][..]),
+            "hyphenated key should normalise to reindexchainstate"
+        );
+        assert!(!cf.global.contains_key("reindex-chainstate"));
     }
 
     // ---- v2transport / v2only ----
