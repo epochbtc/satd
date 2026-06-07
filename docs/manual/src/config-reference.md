@@ -43,6 +43,25 @@ semantics track **Bitcoin Core v30**.
   `pruned-home`, `mining`, `regtest-dev`, `signet-watchtower`); explicit flags
   override the profile's values.
 
+> **Compatibility is pinned to Bitcoin Core v30 — and only v30.** The
+> drop-in target is a frozen, verifiable surface, not "whatever Core ships
+> next." Keys Core *adds* in v31 or later (e.g. `limitclustercount`,
+> `limitclustersize`, `privatebroadcast`, `txospenderindex`) are **not**
+> recognized and are rejected as typos until this pin is deliberately bumped.
+> Keys Core *removed* at or before v30 (e.g. `upnp`, `maxorphantx`) are
+> likewise not honored. If you migrate a `bitcoin.conf` from a newer Core, a
+> v31+ key will fail to start satd with an "unknown key" error — that is
+> intentional, not a bug.
+
+> **Building on satd? Don't poll or shell-hook — stream.** This reference is
+> for *operating* the node. If you are writing software that consumes node
+> state (blocks, mempool, address activity, reorgs), the supported integration
+> path is the **[Streaming Consumption API](streaming.md)** (gRPC / WebSocket /
+> ZMQ): reorg-safe, durable cursor replay, decoupled from consensus. The Core
+> `*notify` shell hooks and ad-hoc RPC polling are provided for compatibility
+> and quick scripts only — they have no delivery guarantee, no replay, and no
+> reorg awareness.
+
 ## Legend
 
 - **Reload** — `hot`: applied live on `SIGHUP` (`systemctl reload satd`).
@@ -54,6 +73,14 @@ semantics track **Bitcoin Core v30**.
   Bitcoin Core. `satd`: a satd-specific extension (no Core equivalent, or
   satd-only semantics). Best-effort classification; a key "modeled on" Core
   behavior but without a Core flag of the same name is `satd`.
+
+> **Every key listed in the per-category tables below is _honored_**
+> (disposition #1 — satd implements it). Recognized Core v30 keys satd does
+> **not** honor are not in these tables; they are enumerated, with their
+> warn-and-skip or fail-closed disposition, under
+> [Unsupported Core keys: skipped vs rejected](#unsupported-core-keys-skipped-vs-rejected).
+> So: in a table here ⇒ supported; in the unsupported-keys section ⇒
+> warn-and-continue (or rejected); in neither ⇒ rejected as a typo.
 
 ---
 
@@ -337,21 +364,23 @@ Core ZMQ wire-format compatible.)
 | Key | Default | Reload | Compat | Description |
 |---|---|---|---|---|
 | `blocknotify` | none | restart | core | Shell command run on each new best block; `%s` is replaced by the block hash. Commands run serially on a dedicated subscriber task (a slow hook never stalls block connection — notifications coalesce instead). The command body is not logged (it may embed credentials). |
+| `alertnotify` | none | restart | core | Shell command run on each *new* node warning; `%s` is replaced by the warning text. Deduped by warning id (a repeated condition fires once, not per repeat). Runs serially like `blocknotify`. |
+| `startupnotify` | none | restart | core | Shell command run once after the node finishes starting up (no `%s`). Detached — a slow hook doesn't delay the daemon. Prefer a systemd `ExecStartPost=`. |
+| `shutdownnotify` | none | restart | core | Shell command run once at the start of a graceful shutdown, before the final flush (no `%s`). Bounded by `maxshutdownsecs` so a hung hook can't wedge teardown. Prefer a systemd `ExecStopPost=`. |
 | `reorgwebhook` | none | hot | satd | HTTP(S) endpoint receiving a POST on reorg detection. |
 | `reorgwebhooksecret` | none | hot | satd | HMAC-SHA256 secret signing webhook bodies via `X-Satd-Signature`. |
 
-> **Notifications are convenience, not the integration path.** `blocknotify`
-> (and Core's other `*notify` shell hooks — `walletnotify`, `alertnotify`,
-> `startupnotify`, `shutdownnotify`) exist for drop-in Bitcoin Core
-> compatibility and quick scripts. They are best-effort, fire-and-forget shell
-> execs with no delivery guarantee, no replay, and no reorg awareness. **To
-> build on satd, use the [Streaming Consumption API](streaming.md)** (gRPC /
-> WebSocket / ZMQ) — it is reorg-safe, offers durable cursor replay, and is
-> decoupled from consensus. satd implements only `blocknotify` from the shell-
-> hook family; the others are recognized-and-skipped with a pointer to the
-> supported alternative (`walletnotify` → keyless, watch scripts via the
-> streaming/Esplora API; `startup`/`shutdownnotify` → systemd unit hooks). A
-> node started with `blocknotify` logs this guidance at startup.
+> **Notifications are convenience, not the integration path.** The `*notify`
+> shell hooks (`blocknotify`, `alertnotify`, `startupnotify`, `shutdownnotify`)
+> exist for drop-in Bitcoin Core compatibility and quick scripts. They are
+> best-effort, fire-and-forget shell execs with no delivery guarantee, no
+> replay, and no reorg awareness. **To build on satd, use the [Streaming
+> Consumption API](streaming.md)** (gRPC / WebSocket / ZMQ) — it is reorg-safe,
+> offers durable cursor replay, and is decoupled from consensus. For lifecycle
+> actions, prefer your service manager (systemd `ExecStartPost=` /
+> `ExecStopPost=`). satd honors these four hooks; only `walletnotify` is
+> unsupported (satd is keyless — watch scripts via the streaming/Esplora API).
+> A node started with any of these hooks logs this guidance at startup.
 
 ## MCP
 
@@ -398,8 +427,9 @@ e.g.:
 | `peerbloomfilters` | BIP37 unsupported (privacy/DoS); use BIP157/158 (`-blockfilterindex`/`-peerblockfilters`). |
 | `natpmp` | satd doesn't implement PCP/NAT-PMP port mapping; configure port forwarding externally. (`upnp` was removed in Core v29 and is rejected as unknown — same as Core v30.) |
 | `debuglogfile`, `shrinkdebugfile`, `printtoconsole`, `logratelimit` | satd logs to stdout/journald; no `debug.log`. |
+| `logtimemicros` | satd's logger always emits sub-second timestamps; there is no seconds-only mode, so the toggle has no effect. Use `-logtimestamps=0` to drop timestamps entirely. |
 | `maxorphantx` | Removed in Core v30 too. |
-| `wallet`, `walletdir`, … | satd is keyless (no wallet); use external wallets + PSBT. |
+| `wallet`, `walletdir`, `walletnotify`, … | satd is keyless (no wallet); use external wallets + PSBT, and watch scripts via the streaming/Esplora API. |
 | `coinstatsindex`, `loadblock`, `checkblocks`/`checklevel`, `bytespersigop`, `maxsigcachesize`, `blockversion`, `printpriority`, `txreconciliation`, `discover`, `persistmempoolv1`, `acceptstalefeeestimates`, `blocksxor`, `settings`, `daemonwait`, `deprecatedrpc`, `rpcdoccheck`, … | Recognized Core v30 options satd does not implement; skipped (generic warning). |
 
 ### Rejected at load (fail-closed)
@@ -417,8 +447,13 @@ actionable message:
 
 A key that is **neither a satd option nor a known Core v30 option** is rejected
 at load as a likely typo — this is what stops a fat-fingered `rpcusser=` from
-silently disabling authentication.
+silently disabling authentication. Note this also catches **Core v31+ keys**:
+the compatibility surface is frozen at v30, so a key Core only added later is
+treated as unknown until the pin is deliberately bumped.
 
-> **Compatibility scope.** "Supported" is the commonly-used Core operator
-> surface, with semantics pinned to Core v30. The long tail is skipped-with-warning
-> rather than honored.
+> **Compatibility scope.** "Supported" is the commonly-used Core v30 operator
+> surface, with semantics pinned to **Core v30 only** (not later releases). The
+> long tail is skipped-with-warning rather than honored. To consume node
+> events from your own software, use the
+> [Streaming Consumption API](streaming.md), not the `*notify` hooks or RPC
+> polling.

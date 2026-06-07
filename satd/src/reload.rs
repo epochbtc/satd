@@ -704,9 +704,13 @@ fn field_specs() -> Vec<FieldSpec> {
         restart!("streamprefixminbits", stream_prefix_min_bits),
         restart!("streamprefixmaxbits", stream_prefix_max_bits),
         // ---- Webhooks / notifications ----
-        // The blocknotify dispatcher is spawned once at startup (only when a
-        // command is configured), mirroring Core — changing it needs a restart.
+        // The notify shell-hooks are wired once at startup (only when a
+        // command is configured), mirroring Core — changing one needs a
+        // restart. startup/shutdown fire once per process lifetime.
         restart!("blocknotify", block_notify),
+        restart!("alertnotify", alert_notify),
+        restart!("startupnotify", startup_notify),
+        restart!("shutdownnotify", shutdown_notify),
         live!("reorgwebhook", reorg_webhook, apply_webhook),
         live_secret!("reorgwebhooksecret", reorg_webhook_secret, apply_webhook),
         // ---- MCP ----

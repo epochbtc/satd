@@ -106,8 +106,13 @@ In-progress; full detail tracked in
   (global or `category:level` verbosity), `-checkpoints=0` (disable built-in
   checkpoint validation), `-whitelistrelay` / `-whitelistforcerelay` (default
   relay permissions for whitelisted peers), `-allowignoredconf` (suppress
-  ignored-`includeconf` warnings), and `-blocknotify` (run a shell command,
-  `%s`→block hash, on each new best block).
+  ignored-`includeconf` warnings), and the `*notify` shell-hook family —
+  `-blocknotify` (`%s`→block hash, per new best block), `-alertnotify`
+  (`%s`→warning text, per new node warning), `-startupnotify` (once after
+  startup) and `-shutdownnotify` (once at graceful shutdown). These hooks are
+  provided for Core compatibility only; each logs a startup warning steering
+  integrators to the Streaming Consumption API (the supported, reorg-safe,
+  replayable integration path).
 - **Monitoring** — daemon-side startup/reindex timing on `getstartupinfo`;
   `sat-tui` distinguishes an unreadable RPC cookie from rejected credentials.
 - **Testing / CI** — block-consensus differential matrix (Phase B); live

@@ -964,6 +964,19 @@ pub struct Config {
     /// best block, with `%s` replaced by the block hash. `None` = no
     /// dispatcher. Read once at startup (restart to change), like Core.
     pub block_notify: Option<String>,
+    /// Bitcoin Core `-alertnotify=<cmd>`: a shell command run on each new
+    /// node warning, with `%s` replaced by the warning text. `None` = no
+    /// dispatcher. Read once at startup (restart to change), like Core.
+    pub alert_notify: Option<String>,
+    /// Bitcoin Core `-startupnotify=<cmd>`: a shell command run once after
+    /// the node finishes starting up (no `%s` substitution). `None` = no
+    /// hook. The supported alternative is a systemd `ExecStartPost=`.
+    pub startup_notify: Option<String>,
+    /// Bitcoin Core `-shutdownnotify=<cmd>`: a shell command run once when
+    /// the node begins a graceful shutdown, before the final flush (no `%s`
+    /// substitution). `None` = no hook. The supported alternative is a
+    /// systemd `ExecStopPost=`.
+    pub shutdown_notify: Option<String>,
     /// AssumeUTXO `--fast-start`: a snapshot source to download and load
     /// at startup. Either an `https://` URL or a local filesystem path
     /// (optionally `file://`). `None` = disabled. Validated at config
@@ -2982,6 +2995,12 @@ impl Config {
                 .reorg_webhook_secret
                 .or_else(|| file_get("reorgwebhooksecret")),
             block_notify: cli.blocknotify.clone().or_else(|| file_get("blocknotify")),
+            alert_notify: cli.alertnotify.clone().or_else(|| file_get("alertnotify")),
+            startup_notify: cli.startupnotify.clone().or_else(|| file_get("startupnotify")),
+            shutdown_notify: cli
+                .shutdownnotify
+                .clone()
+                .or_else(|| file_get("shutdownnotify")),
             fast_start,
             fast_start_sha256,
             events_node_id: cli.events_node_id.or_else(|| file_get("eventsnodeid")),
@@ -4721,6 +4740,27 @@ pub struct CliArgs {
     pub blocknotify: Option<String>,
 
     #[arg(
+        long = "alertnotify",
+        value_name = "CMD",
+        help = "Shell command to run on each new node warning (%s is replaced by the warning text)"
+    )]
+    pub alertnotify: Option<String>,
+
+    #[arg(
+        long = "startupnotify",
+        value_name = "CMD",
+        help = "Shell command to run once after the node finishes starting up"
+    )]
+    pub startupnotify: Option<String>,
+
+    #[arg(
+        long = "shutdownnotify",
+        value_name = "CMD",
+        help = "Shell command to run once when the node begins a graceful shutdown"
+    )]
+    pub shutdownnotify: Option<String>,
+
+    #[arg(
         long = "reorg-webhook",
         value_name = "URL",
         help = "HTTP(S) endpoint receiving POST bodies on reorg detection"
@@ -5137,6 +5177,9 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "debugexclude",
         "profile",
         "blocknotify",
+        "alertnotify",
+        "startupnotify",
+        "shutdownnotify",
         "reorg-webhook",
         "reorgwebhook",
         "reorg-webhook-secret",
@@ -5667,6 +5710,9 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "eventszmqnodeevent",
     // Webhooks / notifications
     "blocknotify",
+    "alertnotify",
+    "startupnotify",
+    "shutdownnotify",
     "reorgwebhook",
     "reorgwebhooksecret",
     // MCP
@@ -5726,13 +5772,16 @@ const SKIP_GUIDANCE: &[(&str, &str)] = &[
     ("zmqpubrawtx", "satd's events bus (-eventszmqbind) replaces Core's per-topic -zmqpub* model; raw-tx publication is not currently provided. See CORE_DIFFERENCES.md."),
     ("zmqpubrawblock", "satd's events bus (-eventszmqbind) replaces Core's per-topic -zmqpub* model; raw-block publication is not currently provided. See CORE_DIFFERENCES.md."),
     ("zmqpubsequence", "satd's events bus (-eventszmqbind) replaces Core's per-topic -zmqpub* model. See CORE_DIFFERENCES.md."),
-    // The *notify shell-hook family. satd implements -blocknotify for Core
-    // convenience, but the supported way to build on satd is the Streaming
-    // Consumption API (reorg-safe, replayable, decoupled from consensus).
-    ("alertnotify", "satd does not run alert shell hooks; consume node warnings via the Streaming Consumption API (nodeevent) — the supported integration path."),
+    // The *notify shell-hook family. satd honors -blocknotify, -alertnotify,
+    // -startupnotify and -shutdownnotify for Core convenience (see
+    // KNOWN_CONFIG_KEYS), but the supported way to build on satd is the
+    // Streaming Consumption API (reorg-safe, replayable, decoupled from
+    // consensus). Only -walletnotify is unsupported — satd is keyless.
     ("walletnotify", "satd is keyless (no wallet), so -walletnotify has nothing to fire on; watch addresses/scripts via the Streaming Consumption API or the Esplora API."),
-    ("startupnotify", "satd integrates with systemd readiness (sd_notify); run startup hooks via your service manager (e.g. an ExecStartPost= unit directive)."),
-    ("shutdownnotify", "run shutdown hooks via your service manager (e.g. an ExecStopPost= unit directive); satd signals readiness/stop to systemd."),
+    // satd's structured logger always emits high-precision (sub-second)
+    // timestamps; there is no seconds-only mode to toggle, so this Core knob
+    // is a no-op rather than a behavior change. Skipped, not honored.
+    ("logtimemicros", "satd's logger always emits sub-second timestamps; there is no seconds-only mode, so this toggle has no effect. Use -logtimestamps=0 to drop timestamps entirely."),
 ];
 
 /// The frozen set of Bitcoin Core **v30** config keys (bitcoind node + wallet +
@@ -6722,6 +6771,9 @@ rpcport=8332
             debugexclude: vec![],
             profile: None,
             blocknotify: None,
+            alertnotify: None,
+            startupnotify: None,
+            shutdownnotify: None,
             reorg_webhook: None,
             reorg_webhook_secret: None,
             fast_start: None,
@@ -6984,6 +7036,9 @@ rpcport=8332
             debugexclude: vec![],
             profile: None,
             blocknotify: None,
+            alertnotify: None,
+            startupnotify: None,
+            shutdownnotify: None,
             reorg_webhook: None,
             reorg_webhook_secret: None,
             fast_start: None,
@@ -8939,27 +8994,45 @@ rpcport=39999
     }
 
     #[test]
-    fn other_notify_hooks_steer_to_streaming_api() {
-        // The unimplemented *notify shell hooks warn-and-skip with a pointer to
-        // the supported integration path (the Streaming Consumption API, or
-        // systemd for lifecycle hooks) — never a hard error on drop-in.
+    fn notify_hooks_honored_via_cli_and_file() {
+        // -alertnotify / -startupnotify / -shutdownnotify are honored for Core
+        // drop-in convenience (alongside -blocknotify) and parse into Config.
         let cf = ConfigFile::parse(
-            "alertnotify=mail %s\nwalletnotify=x\nstartupnotify=y\nshutdownnotify=z\nserver=1\n",
+            "alertnotify=mail %s\nstartupnotify=up.sh\nshutdownnotify=down.sh\nserver=1\n",
         )
         .unwrap();
-        assert!(cf.global.contains_key("server"));
-        for k in ["alertnotify", "walletnotify", "startupnotify", "shutdownnotify"] {
-            assert!(!cf.global.contains_key(k), "{k} should be skipped, not honored");
+        for k in ["alertnotify", "startupnotify", "shutdownnotify"] {
+            assert!(is_known_config_key(k), "{k} should be a known config key");
+            assert!(cf.global.contains_key(k), "{k} should be honored, not skipped");
             assert!(
-                cf.ignored.iter().any(|m| m.contains(k)),
-                "{k} should warn-and-skip"
+                !cf.ignored.iter().any(|m| m.contains(k)),
+                "{k} should not warn-and-skip"
             );
         }
-        // The chain/node-event hooks point at the streaming API; the lifecycle
-        // hooks point at the service manager.
-        assert!(skip_guidance("alertnotify").unwrap().contains("Streaming Consumption API"));
+
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--alertnotify=mail %s",
+            "--startupnotify=/usr/bin/up",
+            "--shutdownnotify=/usr/bin/down",
+        ])
+        .unwrap();
+        let cfg = Config::from_cli(cli).unwrap();
+        assert_eq!(cfg.alert_notify.as_deref(), Some("mail %s"));
+        assert_eq!(cfg.startup_notify.as_deref(), Some("/usr/bin/up"));
+        assert_eq!(cfg.shutdown_notify.as_deref(), Some("/usr/bin/down"));
+    }
+
+    #[test]
+    fn walletnotify_steers_to_streaming_api() {
+        // satd is keyless, so -walletnotify warns-and-skips with a pointer to
+        // the supported integration path — never a hard error on drop-in.
+        let cf = ConfigFile::parse("walletnotify=x\nserver=1\n").unwrap();
+        assert!(cf.global.contains_key("server"));
+        assert!(!cf.global.contains_key("walletnotify"));
+        assert!(cf.ignored.iter().any(|m| m.contains("walletnotify")));
         assert!(skip_guidance("walletnotify").unwrap().contains("Streaming Consumption API"));
-        assert!(skip_guidance("startupnotify").unwrap().contains("systemd"));
     }
 
     #[test]
