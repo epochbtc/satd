@@ -5448,11 +5448,10 @@ const SKIP_GUIDANCE: &[(&str, &str)] = &[
     ("peerbloomfilters", "BIP37 bloom filters are intentionally unsupported (privacy / DoS); use BIP157/158 compact filters via -blockfilterindex / -peerblockfilters."),
     ("discover", "external-IP auto-discovery is not supported; advertise your address explicitly with -externalip."),
     ("maxorphantx", "this option was removed in Bitcoin Core v30 as well."),
-    ("upnp", "configure port forwarding externally (UPnP is deprecated in Core)."),
-    ("natpmp", "configure port forwarding externally (NAT-PMP is deprecated in Core)."),
+    ("natpmp", "satd does not implement PCP/NAT-PMP port mapping; configure port forwarding externally."),
     ("debuglogfile", "satd logs to stdout/journald and has no debug.log; manage retention via journald or your container runtime."),
+    ("shrinkdebugfile", "satd logs to stdout/journald and has no debug.log to shrink; manage retention via journald or your container runtime."),
     ("printtoconsole", "satd always logs to stdout; there is no debug.log alternative to toggle."),
-    ("persistmempool", "use -persistmempool to toggle mempool persistence (satd's mempool.dat format is its own)."),
     ("zmqpubhashtx", "use -eventszmqbind + -eventszmqhashtx (Core wire-format) instead of per-topic -zmqpub* flags."),
     ("zmqpubhashblock", "use -eventszmqbind + -eventszmqhashblock (Core wire-format) instead of per-topic -zmqpub* flags."),
     ("zmqpubrawtx", "satd's events bus (-eventszmqbind) replaces Core's per-topic -zmqpub* model; raw-tx publication is not currently provided. See CORE_DIFFERENCES.md."),
@@ -5465,10 +5464,14 @@ const SKIP_GUIDANCE: &[(&str, &str)] = &[
 /// option (→ warn and skip) apart from a typo (→ reject). Extracted from the
 /// `v30.0` tag:
 /// ```text
-/// for f in src/init.cpp src/common/args.cpp src/chainparamsbase.cpp src/wallet/init.cpp; do
-///   git show v30.0:$f; done | grep -oP 'AddArg\(\s*"\K-[a-zA-Z0-9-]+' | sed 's/^-//' | sort -u
-/// git grep -h -oP 'AddArg\(\s*"\K-log[a-zA-Z]+' v30.0 -- src/ | sed 's/^-//'
+/// for f in src/init.cpp src/init/common.cpp src/common/args.cpp \
+///          src/chainparamsbase.cpp src/wallet/init.cpp; do git show v30.0:$f; done \
+///   | perl -0777 -ne 'while(/AddArg\(\s*"-([a-zA-Z0-9-]+)/g){print "$1\n"}' | sort -u
 /// ```
+/// Note: the logging / `-debug` family (`debug`, `debuglogfile`, `printtoconsole`,
+/// `shrinkdebugfile`, `log*`, …) lives in `src/init/common.cpp`, and many AddArg
+/// calls wrap the option name onto a second line — hence the slurp-mode perl
+/// rather than a line-oriented `grep`.
 /// Compatibility is pinned to v30: keys Core adds in later releases are not
 /// listed here and would be treated as typos until this list is bumped.
 const CORE_V30_KEYS: &[&str] = &[
@@ -5479,7 +5482,8 @@ const CORE_V30_KEYS: &[&str] = &[
     "changetype", "checkaddrman", "checkblockindex", "checkblocks", "checklevel", "checkmempool",
     "checkpoints", "cjdnsreachable", "coinstatsindex", "conf", "connect", "consolidatefeerate",
     "daemon", "daemonwait", "datacarrier", "datacarriersize", "datadir", "dbbatchsize",
-    "dbcache", "deprecatedrpc", "disablewallet", "discardfee", "discover", "dns",
+    "dbcache", "debug", "debugexclude", "debuglogfile", "deprecatedrpc", "disablewallet",
+    "discardfee", "discover", "dns",
     "dnsseed", "dustrelayfee", "externalip", "fallbackfee", "fastprune", "fixedseeds",
     "forcednsseed", "help", "help-debug", "i2pacceptincoming", "i2psam", "includeconf",
     "incrementalrelayfee", "ipcbind", "keypool", "limitancestorcount", "limitancestorsize", "limitdescendantcount",
@@ -5490,11 +5494,13 @@ const CORE_V30_KEYS: &[&str] = &[
     "minrelaytxfee", "mintxfee", "mocktime", "natpmp", "networkactive", "onion",
     "onlynet", "par", "paytxfee", "peerblockfilters", "peerbloomfilters", "peertimeout",
     "permitbaremultisig", "persistmempool", "persistmempoolv1", "pid", "port", "printpriority",
-    "proxy", "proxyrandomize", "prune", "regtest", "reindex", "reindex-chainstate",
+    "printtoconsole", "proxy", "proxyrandomize", "prune", "regtest", "reindex",
+    "reindex-chainstate",
     "rest", "rpcallowip", "rpcauth", "rpcbind", "rpccookiefile", "rpccookieperms",
     "rpcdoccheck", "rpcpassword", "rpcport", "rpcservertimeout", "rpcthreads", "rpcuser",
     "rpcwhitelist", "rpcwhitelistdefault", "rpcworkqueue", "seednode", "server", "settings",
-    "shutdownnotify", "signer", "signet", "signetchallenge", "signetseednode", "spendzeroconfchange",
+    "shrinkdebugfile", "shutdownnotify", "signer", "signet", "signetchallenge", "signetseednode",
+    "spendzeroconfchange",
     "startupnotify", "stopafterblockimport", "stopatheight", "test", "testactivationheight", "testnet",
     "testnet4", "timeout", "torcontrol", "torpassword", "txconfirmtarget", "txindex",
     "txreconciliation", "uacomment", "unsafesqlitesync", "v2transport", "vbparams", "version",
@@ -8488,6 +8494,56 @@ notarealkey=1
                     && err.contains("Remove this line")
                     && err.contains(k),
                 "expected a fatal error for {k:?}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn skip_guidance_entries_are_reachable() {
+        // Invariant: every key with prepared SKIP_GUIDANCE must actually reach
+        // the warn-and-skip path. If a key is not a recognized Core v30 key it
+        // is typo-rejected before guidance is consulted; if it is honored the
+        // guidance is dead; if it is fatal the guidance is also unreachable.
+        // This guards against guidance silently rotting (e.g. a key that Core
+        // later removes, or one that satd starts honoring).
+        for (k, _) in SKIP_GUIDANCE {
+            assert!(
+                is_core_v30_key(k),
+                "{k:?} has skip guidance but isn't a Core v30 key — it would be \
+                 rejected as a typo before the guidance is ever shown"
+            );
+            assert!(
+                !is_known_config_key(k),
+                "{k:?} has skip guidance but is honored — the guidance is dead code"
+            );
+            assert!(
+                classify_unsupported_key(k).is_none(),
+                "{k:?} has skip guidance but is also fatal — guidance unreachable"
+            );
+            // And it must genuinely be reachable end-to-end.
+            let cf = ConfigFile::parse(&format!("{k}=1\n"))
+                .unwrap_or_else(|e| panic!("{k:?} should warn-and-skip, not error: {e}"));
+            assert!(
+                cf.ignored.iter().any(|m| m.contains(*k)),
+                "{k:?} produced no warn-and-skip notice"
+            );
+        }
+    }
+
+    #[test]
+    fn logging_file_keys_are_dropin_skipped_not_typos() {
+        // Core's debug.log knobs are real v30 options satd has no analogue for
+        // (it logs to stdout/journald). A dropped-in Core config carrying them
+        // — `printtoconsole` is near-ubiquitous in containerized setups — must
+        // boot, not hard-error as a typo.
+        for k in ["printtoconsole", "debuglogfile", "shrinkdebugfile"] {
+            let cf = ConfigFile::parse(&format!("{k}=1\nserver=1\n"))
+                .unwrap_or_else(|e| panic!("{k:?} should be skipped, not rejected: {e}"));
+            assert!(!cf.global.contains_key(k), "{k:?} should not be honored");
+            assert!(
+                cf.ignored.iter().any(|m| m.contains(k) && m.contains("debug.log")),
+                "{k:?} warning should explain the no-debug.log behavior, got: {:?}",
+                cf.ignored
             );
         }
     }
