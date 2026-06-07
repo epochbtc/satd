@@ -334,7 +334,7 @@ Core ZMQ wire-format compatible.)
 
 | Key | Default | Reload | Compat | Description |
 |---|---|---|---|---|
-| `blocknotify` | none | restart | core | Shell command run on each new best block; `%s` is replaced by the block hash. Runs detached per block (a slow hook never stalls block connection). |
+| `blocknotify` | none | restart | core | Shell command run on each new best block; `%s` is replaced by the block hash. Commands run serially on a dedicated subscriber task (a slow hook never stalls block connection — notifications coalesce instead). The command body is not logged (it may embed credentials). |
 | `reorgwebhook` | none | hot | satd | HTTP(S) endpoint receiving a POST on reorg detection. |
 | `reorgwebhooksecret` | none | hot | satd | HMAC-SHA256 secret signing webhook bodies via `X-Satd-Signature`. |
 

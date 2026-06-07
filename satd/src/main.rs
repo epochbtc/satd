@@ -899,10 +899,22 @@ async fn main() {
     }
 
     // -blocknotify: run a shell command on each new connected block, with
-    // `%s` replaced by the block hash (Bitcoin Core parity). Each invocation
-    // is detached so a slow hook never stalls the event loop or block
-    // connection; non-zero exits and spawn failures are logged, not fatal.
-    if let Some(cmd_template) = config.block_notify.clone() {
+    // `%s` replaced by the block hash (Bitcoin Core parity). Commands run
+    // SERIALLY on this dedicated subscriber task — never spawned per block —
+    // mirroring Core, which serializes blocknotify on its scheduler thread.
+    // This matters because `BlockConnected` also fires for every block
+    // replayed during IBD and `-reindex` (thousands/sec from disk); a
+    // detached spawn-per-block would fork-bomb the host. Because this task is
+    // an independent broadcast subscriber, a slow hook only delays subsequent
+    // notifications and, once its ring overflows, coalesces them (the
+    // `Lagged` arm) — it never stalls block connection. An empty/blank
+    // command is treated as unset. Non-zero exits and spawn failures are
+    // logged (without the command body, which may embed credentials).
+    if let Some(cmd_template) = config
+        .block_notify
+        .clone()
+        .filter(|c| !c.trim().is_empty())
+    {
         let mut rx = chain_event_tx.subscribe();
         tracing::info!("-blocknotify configured; running a command on each new best block");
         tokio::spawn(async move {
@@ -910,26 +922,24 @@ async fn main() {
                 match rx.recv().await {
                     Ok(node::chain::events::ChainEvent::BlockConnected { hash, .. }) => {
                         let cmd = cmd_template.replace("%s", &hash.to_string());
-                        tokio::spawn(async move {
-                            match tokio::process::Command::new("sh")
-                                .arg("-c")
-                                .arg(&cmd)
-                                .status()
-                                .await
-                            {
-                                Ok(status) if status.success() => {}
-                                Ok(status) => tracing::warn!(
-                                    %status,
-                                    command = %cmd,
-                                    "blocknotify command exited non-zero"
-                                ),
-                                Err(e) => tracing::warn!(
-                                    error = %e,
-                                    command = %cmd,
-                                    "failed to run blocknotify command"
-                                ),
-                            }
-                        });
+                        match tokio::process::Command::new("sh")
+                            .arg("-c")
+                            .arg(&cmd)
+                            .status()
+                            .await
+                        {
+                            Ok(status) if status.success() => {}
+                            Ok(status) => tracing::warn!(
+                                %status,
+                                block = %hash,
+                                "blocknotify command exited non-zero"
+                            ),
+                            Err(e) => tracing::warn!(
+                                error = %e,
+                                block = %hash,
+                                "failed to run blocknotify command"
+                            ),
+                        }
                     }
                     Ok(_) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
