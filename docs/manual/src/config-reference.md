@@ -372,7 +372,7 @@ e.g.:
 | `rest` | satd ships native Esplora REST instead of Core's `/rest/`; enable with `-esplora` (on by default). |
 | `zmqpub*` (`hashtx`/`hashblock`/`rawtx`/`rawblock`/`sequence` + `*hwm`) | Core's per-topic ZMQ is replaced by the events bus (`-eventszmqbind` + `-eventszmqhashtx`/`-eventszmqhashblock`, Core wire-format). |
 | `peerbloomfilters` | BIP37 unsupported (privacy/DoS); use BIP157/158 (`-blockfilterindex`/`-peerblockfilters`). |
-| `upnp`, `natpmp` | Deprecated in Core; configure port forwarding externally. |
+| `natpmp` | satd doesn't implement PCP/NAT-PMP port mapping; configure port forwarding externally. (`upnp` was removed in Core v29 and is rejected as unknown — same as Core v30.) |
 | `debuglogfile`, `shrinkdebugfile`, `printtoconsole`, `logratelimit` | satd logs to stdout/journald; no `debug.log`. |
 | `maxorphantx` | Removed in Core v30 too. |
 | `wallet`, `walletdir`, … | satd is keyless (no wallet); use external wallets + PSBT. |
