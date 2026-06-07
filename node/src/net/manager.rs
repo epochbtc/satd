@@ -1739,8 +1739,11 @@ impl PeerManager {
                 }
             }
 
-            // Every 20 ticks (10 seconds), reconnect if below outbound target
-            if ticks.is_multiple_of(20) {
+            // Every 20 ticks (10 seconds), reconnect if below outbound target.
+            // Skipped entirely while networking is paused (`networkactive=0` /
+            // `setnetworkactive false`): otherwise each tick would spawn dials
+            // that immediately fail the gate, churning backoff state and logs.
+            if ticks.is_multiple_of(20) && self.is_network_active() {
                 let outbound = self.outbound_count();
                 let target = if self.is_ibd() { MAX_OUTBOUND_IBD } else { MAX_OUTBOUND };
                 let need_peers = outbound < target;
