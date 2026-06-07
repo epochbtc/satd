@@ -2784,24 +2784,32 @@ async fn main() {
     // runs.
     notify::notify_stopping();
 
+    // Single graceful-shutdown budget, shared by the -shutdownnotify hook and
+    // the RocksDB flush below — so a slow hook eats *into* the deadline rather
+    // than adding a second full one (worst-case teardown stays ~max_shutdown_secs,
+    // not 2×). The flush is the operation that must not be starved (it writes
+    // the clean-shutdown marker), so the hook is capped at half the budget and
+    // the flush gets whatever remains (always ≥ half).
+    let shutdown_deadline = std::time::Duration::from_secs(config.max_shutdown_secs.max(1));
+    let shutdown_started = std::time::Instant::now();
+
     // -shutdownnotify: run the operator's shutdown hook before the blocking
-    // flush (Bitcoin Core runs it at the start of Shutdown()). Bounded by the
-    // shutdown budget so a hanging hook can't wedge teardown — on a systemd
-    // host TimeoutStopSec is a further backstop, but the bound matters for
-    // bare-process operators.
+    // flush (Bitcoin Core runs it at the start of Shutdown()). Capped so a
+    // hanging hook can't wedge teardown or starve the flush; on a systemd host
+    // TimeoutStopSec is a further backstop.
     if let Some(cmd) = config
         .shutdown_notify
         .clone()
         .filter(|c| !c.trim().is_empty())
     {
-        let bound = std::time::Duration::from_secs(config.max_shutdown_secs.max(1));
-        if tokio::time::timeout(bound, notifyhooks::run_once("shutdownnotify", &cmd, None))
+        let hook_bound = (shutdown_deadline / 2).max(std::time::Duration::from_secs(1));
+        if tokio::time::timeout(hook_bound, notifyhooks::run_once("shutdownnotify", &cmd, None))
             .await
             .is_err()
         {
             tracing::warn!(
-                "shutdownnotify command did not finish within the shutdown budget; \
-                 continuing teardown"
+                "shutdownnotify command did not finish within its share of the shutdown \
+                 budget; continuing teardown"
             );
         }
     }
@@ -2822,7 +2830,11 @@ async fn main() {
     // Safety on timeout-forced exit: no data is lost. The next startup will
     // replay any DataStored-but-not-Valid blocks from flat files. We just
     // lose the clean-shutdown marker (which advertises "we flushed cleanly").
-    let shutdown_deadline = std::time::Duration::from_secs(config.max_shutdown_secs);
+    // Budget = whatever the shutdownnotify hook left of the shared deadline
+    // (≥ half, since the hook is capped at half), floored at 1s.
+    let flush_deadline = shutdown_deadline
+        .saturating_sub(shutdown_started.elapsed())
+        .max(std::time::Duration::from_secs(1));
     let tip_hash = chain_state.tip_hash().to_string();
     let tip_height = chain_state.tip_height();
     let flush_cs = chain_state.clone();
@@ -2843,7 +2855,7 @@ async fn main() {
             .and_then(|()| flush_cs.flush_durable());
         let _ = flush_tx.send(result);
     });
-    let flushed_ok = match node::shutdown::await_bounded_flush(flush_rx, shutdown_deadline).await {
+    let flushed_ok = match node::shutdown::await_bounded_flush(flush_rx, flush_deadline).await {
         node::shutdown::BoundedFlushOutcome::Clean => {
             tracing::info!(
                 "UTXO cache flushed cleanly within {}s deadline",
