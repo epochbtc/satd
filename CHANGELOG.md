@@ -29,6 +29,18 @@ In-progress; full detail tracked in
   block-index audit at startup and after a reindex; fail-closed.
 - **RPC** — `invalidateblock` / `reconsiderblock` implemented (crash-safe,
   AssumeUTXO-aware); `getblock` serves invalidated blocks.
+- **P2P observability & control** — un-stubbed the peer activity counters:
+  `getpeerinfo` now reports real `bytessent`/`bytesrecv`/`lastsend`/`lastrecv`
+  and `getnettotals` real `totalbytessent`/`totalbytesrecv` (with matching
+  `satd_net_bytes_sent_total`/`satd_net_bytes_recv_total` Prometheus counters),
+  counted on the wire for both v1 and v2 transports. `setnetworkactive` is now
+  a real toggle (pauses inbound accepts + outbound dials and disconnects
+  peers), reflected in `getnetworkinfo.networkactive`, with a matching
+  `-networkactive` startup flag. The native Prometheus listener
+  (`-metricsport`) remains the recommended path for monitoring.
+- **Policy** — `-acceptnonstdtxn` honored: relay/accept non-standard
+  transactions (bypasses the standardness relay checks; consensus rules still
+  apply). Default off, matching Core.
 - **Auth** — opt-in capability-scoped bearer-token layer (`-authfile`) across
   JSON-RPC, Esplora, events gRPC, and MCP, with per-token rate limits and
   watch-set quotas. Default credential behavior unchanged.

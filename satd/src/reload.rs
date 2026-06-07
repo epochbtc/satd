@@ -252,6 +252,7 @@ pub fn mempool_config_from(c: &Config) -> MempoolConfig {
         max_descendant_count: c.limitdescendantcount,
         expiry_secs: c.mempoolexpiry.saturating_mul(3600),
         permit_bare_multisig: c.permitbaremultisig,
+        accept_non_std_txn: c.acceptnonstdtxn,
     }
 }
 
@@ -601,6 +602,14 @@ fn field_specs() -> Vec<FieldSpec> {
         live!("persistmempool", persistmempool, consumed_from_reloaded_config),
         live!("permitbaremultisig", permitbaremultisig, |c, h| {
             h.mempool.reload_policy(mempool_config_from(c))
+        }),
+        live!("acceptnonstdtxn", acceptnonstdtxn, |c, h| {
+            h.mempool.reload_policy(mempool_config_from(c))
+        }),
+        // `-networkactive`: toggle P2P networking live (same effect as the
+        // `setnetworkactive` RPC). Disabling disconnects all peers.
+        live!("networkactive", networkactive, |c, h| {
+            h.peer_manager.set_network_active(c.networkactive)
         }),
         // ---- Esplora ----
         restart!("esplora", esplora),

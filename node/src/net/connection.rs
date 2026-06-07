@@ -4,10 +4,12 @@ use bitcoin::p2p::Magic;
 use bitcoin::Network;
 use std::io;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 
+use crate::net::stats::PeerStats;
 use crate::net::v2transport::{V2Connection, V2Reader, V2Writer};
 
 /// Wire-level P2P connection.
@@ -129,6 +131,16 @@ impl ConnectionWriter {
             ConnectionWriter::V2(w) => w.send(msg).await,
         }
     }
+
+    /// Attach the per-peer byte/activity counters, recorded on every send.
+    /// Called once after [`Connection::split`], when the peer's `PeerStats`
+    /// is known.
+    pub fn set_counters(&mut self, counters: Arc<PeerStats>) {
+        match self {
+            ConnectionWriter::V1(w) => w.counters = Some(counters),
+            ConnectionWriter::V2(w) => w.set_counters(counters),
+        }
+    }
 }
 
 impl ConnectionReader {
@@ -140,6 +152,16 @@ impl ConnectionReader {
         match self {
             ConnectionReader::V1(r) => r.recv().await,
             ConnectionReader::V2(r) => r.recv().await,
+        }
+    }
+
+    /// Attach the per-peer byte/activity counters, recorded on every recv.
+    /// Called once after [`Connection::split`], when the peer's `PeerStats`
+    /// is known.
+    pub fn set_counters(&mut self, counters: Arc<PeerStats>) {
+        match self {
+            ConnectionReader::V1(r) => r.counters = Some(counters),
+            ConnectionReader::V2(r) => r.set_counters(counters),
         }
     }
 }
@@ -160,12 +182,14 @@ pub struct V1Reader {
     stream: ReadHalf<TcpStream>,
     magic: Magic,
     buf: Vec<u8>,
+    counters: Option<Arc<PeerStats>>,
 }
 
 /// Write half of a split [`V1Connection`].
 pub struct V1Writer {
     stream: WriteHalf<TcpStream>,
     magic: Magic,
+    counters: Option<Arc<PeerStats>>,
 }
 
 /// Size of a P2P message header: 4 (magic) + 12 (command) + 4 (length) + 4 (checksum).
@@ -184,28 +208,31 @@ impl V1Connection {
                 stream: read_half,
                 magic: self.magic,
                 buf: self.buf,
+                counters: None,
             },
             V1Writer {
                 stream: write_half,
                 magic: self.magic,
+                counters: None,
             },
         )
     }
 
-    /// Send a network message.
+    /// Send a network message. Pre-split (handshake) path — uncounted.
     pub async fn send(&mut self, msg: NetworkMessage) -> io::Result<()> {
         let raw = RawNetworkMessage::new(self.magic, msg);
         let bytes = serialize(&raw);
         self.stream.write_all(&bytes).await
     }
 
-    /// Receive the next network message. Skips messages that fail to deserialize.
+    /// Receive the next network message. Skips messages that fail to
+    /// deserialize. Pre-split (handshake) path — uncounted.
     pub async fn recv(&mut self) -> io::Result<NetworkMessage> {
         if let Some(lead) = self.leading.take() {
             let mut reader = LeadingReader::new(lead, &mut self.stream);
-            return recv_message(&mut reader, self.magic, &mut self.buf).await;
+            return recv_message(&mut reader, self.magic, &mut self.buf, None).await;
         }
-        recv_message(&mut self.stream, self.magic, &mut self.buf).await
+        recv_message(&mut self.stream, self.magic, &mut self.buf, None).await
     }
 
     /// Get the peer's remote address.
@@ -251,11 +278,15 @@ impl<R: AsyncRead + Unpin> AsyncRead for LeadingReader<'_, R> {
 }
 
 impl V1Writer {
-    /// Send a network message.
+    /// Send a network message, recording on-wire bytes if counters are set.
     pub async fn send(&mut self, msg: NetworkMessage) -> io::Result<()> {
         let raw = RawNetworkMessage::new(self.magic, msg);
         let bytes = serialize(&raw);
-        self.stream.write_all(&bytes).await
+        self.stream.write_all(&bytes).await?;
+        if let Some(c) = &self.counters {
+            c.record_sent(bytes.len());
+        }
+        Ok(())
     }
 }
 
@@ -265,15 +296,18 @@ impl V1Reader {
     /// This method must NOT be used inside `tokio::select!` — it is not
     /// cancel-safe. Instead, run it in a dedicated task that is never cancelled.
     pub async fn recv(&mut self) -> io::Result<NetworkMessage> {
-        recv_message(&mut self.stream, self.magic, &mut self.buf).await
+        recv_message(&mut self.stream, self.magic, &mut self.buf, self.counters.as_ref()).await
     }
 }
 
-/// Shared recv implementation for both V1Connection and V1Reader.
+/// Shared recv implementation for both V1Connection and V1Reader. When
+/// `counters` is set, the on-wire size (header + payload) of every framed
+/// message — including ones skipped as unparseable — is recorded.
 async fn recv_message<R: AsyncReadExt + Unpin>(
     stream: &mut R,
     magic: Magic,
     buf: &mut Vec<u8>,
+    counters: Option<&Arc<PeerStats>>,
 ) -> io::Result<NetworkMessage> {
     let expected = magic.to_bytes();
 
@@ -308,6 +342,12 @@ async fn recv_message<R: AsyncReadExt + Unpin>(
         let mut payload = vec![0u8; payload_len];
         if payload_len > 0 {
             stream.read_exact(&mut payload).await?;
+        }
+
+        // Record on-wire bytes for this framed message (counted even if it
+        // fails to deserialize below — the bytes were still received).
+        if let Some(c) = counters {
+            c.record_recv(HEADER_SIZE + payload_len);
         }
 
         // Combine header + payload and deserialize

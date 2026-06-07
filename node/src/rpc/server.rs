@@ -1388,10 +1388,11 @@ pub async fn start(
         Ok::<_, ErrorObjectOwned>(serde_json::json!(ctx.peer_manager.get_added_node_info()))
     })?;
 
-    module.register_method("getnettotals", |_params, _ctx, _extensions| {
+    module.register_method("getnettotals", |_params, ctx, _extensions| {
+        let totals = ctx.peer_manager.net_totals();
         Ok::<_, ErrorObjectOwned>(serde_json::json!({
-            "totalbytesrecv": 0,
-            "totalbytessent": 0,
+            "totalbytesrecv": totals.bytes_recv(),
+            "totalbytessent": totals.bytes_sent(),
             "timemillis": std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -1433,12 +1434,13 @@ pub async fn start(
         Ok::<_, ErrorObjectOwned>(serde_json::Value::Null)
     })?;
 
-    module.register_method("setnetworkactive", |params, _ctx, _extensions| {
-        let _active: bool = params
+    module.register_method("setnetworkactive", |params, ctx, _extensions| {
+        let active: bool = params
             .one()
             .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
-        // Stub: network is always active
-        Ok::<_, ErrorObjectOwned>(serde_json::json!(true))
+        ctx.peer_manager.set_network_active(active);
+        // Core returns the resulting state.
+        Ok::<_, ErrorObjectOwned>(serde_json::json!(ctx.peer_manager.is_network_active()))
     })?;
 
     module.register_method("prioritisetransaction", |params, ctx, _extensions| {

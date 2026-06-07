@@ -593,6 +593,14 @@ pub struct Config {
     /// it (re-validated) on startup. Default true, matching Core.
     pub persistmempool: bool,
     pub permitbaremultisig: bool,
+    /// Bitcoin Core's `-acceptnonstdtxn`: relay/accept non-standard
+    /// transactions (skip the standardness relay checks; consensus rules are
+    /// never relaxed). Default false, matching Core.
+    pub acceptnonstdtxn: bool,
+    /// Bitcoin Core's `-networkactive`: start with P2P networking enabled.
+    /// Default true; `-networkactive=0` boots with networking paused (no
+    /// inbound accepts, no outbound dials) until `setnetworkactive true`.
+    pub networkactive: bool,
     pub txindex: bool,
     /// Address-history index. On by default; disable via
     /// `--addressindex=0` or `-noindex=address`. Backs the native
@@ -1933,6 +1941,16 @@ impl Config {
             .or_else(|| file_get("permitbaremultisig").and_then(|v| parse_bool(&v)))
             .unwrap_or(true);
 
+        let acceptnonstdtxn = cli
+            .acceptnonstdtxn
+            .or_else(|| file_get("acceptnonstdtxn").and_then(|v| parse_bool(&v)))
+            .unwrap_or(false);
+
+        let networkactive = cli
+            .networkactive
+            .or_else(|| file_get("networkactive").and_then(|v| parse_bool(&v)))
+            .unwrap_or(true);
+
         // Track whether txindex was explicitly disabled via the
         // config file (CLI can't express that; it's a `bool` flag).
         // The Esplora auto-implication below honors an explicit
@@ -2604,6 +2622,8 @@ impl Config {
                 .or_else(|| file_get("persistmempool").and_then(|v| parse_bool(&v)))
                 .unwrap_or(true),
             permitbaremultisig,
+            acceptnonstdtxn,
+            networkactive,
             txindex,
             addressindex,
             addrindexsubscriptions,
@@ -3787,6 +3807,26 @@ pub struct CliArgs {
         help = "Allow bare multisig outputs (default: true)"
     )]
     pub permitbaremultisig: Option<bool>,
+
+    #[arg(
+        long = "acceptnonstdtxn",
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
+        help = "Relay and accept non-standard transactions (default: false; consensus rules still apply)"
+    )]
+    pub acceptnonstdtxn: Option<bool>,
+
+    #[arg(
+        long = "networkactive",
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
+        help = "Start with P2P networking enabled (default: true); =0 pauses networking at startup"
+    )]
+    pub networkactive: Option<bool>,
 
     #[arg(
         long,
@@ -4993,6 +5033,8 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "mempoolexpiry",
         "persistmempool",
         "permitbaremultisig",
+        "acceptnonstdtxn",
+        "networkactive",
         "txindex",
         "addressindex",
         "addrindexsubscriptions",
@@ -5132,6 +5174,8 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "datacarrier",
         "permitbaremultisig",
         "persistmempool",
+        "acceptnonstdtxn",
+        "networkactive",
         "esplora",
         "esploramtls",
         "esploraauthbearer",
@@ -5536,6 +5580,8 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "mempoolexpiry",
     "persistmempool",
     "permitbaremultisig",
+    "acceptnonstdtxn",
+    "networkactive",
     // Esplora
     "esplora",
     "esplorabind",
@@ -6563,6 +6609,8 @@ rpcport=8332
             mempoolexpiry: None,
             persistmempool: None,
             permitbaremultisig: None,
+            acceptnonstdtxn: None,
+            networkactive: None,
             txindex: None,
             addressindex: None,
             addrindexsubscriptions: None,
@@ -6823,6 +6871,8 @@ rpcport=8332
             mempoolexpiry: None,
             persistmempool: None,
             permitbaremultisig: None,
+            acceptnonstdtxn: None,
+            networkactive: None,
             txindex: None,
             addressindex: None,
             addrindexsubscriptions: None,
@@ -8755,6 +8805,42 @@ rpcport=39999
         );
         let cfg = Config::from_cli(CliArgs::try_parse_from(argv).unwrap()).unwrap();
         assert!(!cfg.enforce_checkpoints);
+    }
+
+    #[test]
+    fn acceptnonstdtxn_defaults_off_and_is_honored() {
+        let cfg = Config::from_cli(CliArgs::try_parse_from(["satd", "--regtest"]).unwrap()).unwrap();
+        assert!(!cfg.acceptnonstdtxn, "standard relay by default (Core parity)");
+        assert!(is_known_config_key("acceptnonstdtxn"));
+
+        let cfg = Config::from_cli(
+            CliArgs::try_parse_from(["satd", "--regtest", "--acceptnonstdtxn=1"]).unwrap(),
+        )
+        .unwrap();
+        assert!(cfg.acceptnonstdtxn);
+
+        let cf = ConfigFile::parse("acceptnonstdtxn=1\n").unwrap();
+        assert!(cf.global.contains_key("acceptnonstdtxn"));
+    }
+
+    #[test]
+    fn networkactive_defaults_on_and_disablable() {
+        let cfg = Config::from_cli(CliArgs::try_parse_from(["satd", "--regtest"]).unwrap()).unwrap();
+        assert!(cfg.networkactive, "networking enabled by default");
+        assert!(is_known_config_key("networkactive"));
+
+        let cfg = Config::from_cli(
+            CliArgs::try_parse_from(["satd", "--regtest", "--networkactive=0"]).unwrap(),
+        )
+        .unwrap();
+        assert!(!cfg.networkactive);
+
+        // Core-style `-nonetworkactive` negation.
+        let argv = normalize_args(
+            ["satd", "--regtest", "-nonetworkactive"].iter().map(|s| s.to_string()).collect(),
+        );
+        let cfg = Config::from_cli(CliArgs::try_parse_from(argv).unwrap()).unwrap();
+        assert!(!cfg.networkactive);
     }
 
     #[test]
