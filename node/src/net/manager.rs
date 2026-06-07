@@ -565,22 +565,34 @@ impl PeerManager {
     /// disconnect-by-manager signal and tears the socket down. Re-enabling
     /// lets the reconnect loop redial. A no-op if already in the target state.
     pub fn set_network_active(&self, active: bool) {
-        let was = self
-            .network_active
-            .swap(active, std::sync::atomic::Ordering::Relaxed);
-        if was == active {
-            return;
-        }
         if active {
-            tracing::info!("networkactive=true: P2P networking resumed");
+            let was = self
+                .network_active
+                .swap(true, std::sync::atomic::Ordering::Relaxed);
+            if !was {
+                tracing::info!("networkactive=true: P2P networking resumed");
+            }
         } else {
+            // Flip the flag AND clear peers under the same `peers` write lock
+            // that peer registration ([`register_peer`]) checks the flag under.
+            // This makes "pause" atomic with respect to "register a new peer":
+            // a dial that wins the lock first registers and is then cleared
+            // here; one that loses sees the flag false and refuses to register.
+            // Without this coupling, a dial finishing its handshake could insert
+            // a live peer in the window after `clear()`, leaving a connection up
+            // while networking is meant to be off.
             let mut peers = self.peers.write();
-            let n = peers.len();
-            peers.clear();
-            tracing::info!(
-                disconnected = n,
-                "networkactive=false: disconnected all peers and paused P2P networking"
-            );
+            let was = self
+                .network_active
+                .swap(false, std::sync::atomic::Ordering::Relaxed);
+            if was {
+                let n = peers.len();
+                peers.clear();
+                tracing::info!(
+                    disconnected = n,
+                    "networkactive=false: disconnected all peers and paused P2P networking"
+                );
+            }
         }
     }
 
@@ -1045,6 +1057,15 @@ impl PeerManager {
         // connected straight as v1 to avoid a wasted round trip.
         let conn = self.establish_outbound(stream, OutboundDial::Direct(addr)).await?;
 
+        // Re-check after the dial + handshake awaits: `setnetworkactive false`
+        // (RPC or SIGHUP) may have run while we were connecting, clearing all
+        // peers. Without this we'd register a live peer *after* the pause,
+        // leaving an outbound connection up while networking is meant to be
+        // off. Dropping `conn` here closes the socket.
+        if !self.is_network_active() {
+            return Err("networking disabled during connect (networkactive=false)".to_string());
+        }
+
         self.spawn_peer(
             id,
             addr,
@@ -1112,6 +1133,13 @@ impl PeerManager {
             .establish_outbound(stream, OutboundDial::Onion(host.to_string(), port))
             .await?;
 
+        // Re-check after the dial + handshake awaits (see connect_outbound):
+        // networkactive may have been toggled off mid-connect. Dropping `conn`
+        // closes the socket so no peer is registered while paused.
+        if !self.is_network_active() {
+            return Err("networking disabled during connect (networkactive=false)".to_string());
+        }
+
         self.spawn_peer(
             id,
             placeholder_addr,
@@ -1167,6 +1195,14 @@ impl PeerManager {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let msg_rx = {
             let mut peers = self.peers.write();
+            // Authoritative pause check under the peers lock (mirrors
+            // spawn_peer / set_network_active). Closes the race where
+            // `setnetworkactive false` runs between the top-of-function check
+            // and here; returning drops `stream`, closing the socket.
+            if !self.is_network_active() {
+                tracing::debug!(%addr, "networkactive=false: refusing inbound connection (race)");
+                return;
+            }
             // NoBan peers are exempt from the inbound connection caps
             // (matches Bitcoin Core's manual-conn / whitelist handling).
             if !perms.noban {
@@ -4181,6 +4217,15 @@ impl PeerManager {
         };
         {
             let mut peers = self.peers.write();
+            // Authoritative pause check: under the same lock `set_network_active`
+            // flips the flag + clears peers under, so a dial that raced a pause
+            // is resolved deterministically — it either registers (and the pause
+            // then clears it) or is refused here. Returning drops `transport`,
+            // closing the freshly-dialed socket; the peer task is never spawned.
+            if !self.is_network_active() {
+                tracing::debug!(id, %addr, "networkactive=false: dropping freshly-connected peer");
+                return;
+            }
             peers.insert(id, handle);
         }
         self.spawn_peer_task(id, addr, transport, direction, msg_rx);
