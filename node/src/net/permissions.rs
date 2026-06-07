@@ -125,6 +125,11 @@ pub struct WhitelistEntry {
     pub net: IpNet,
     pub perms: NetPermissions,
     pub raw: String,
+    /// True when the entry was written without an explicit `perms@` prefix
+    /// and therefore took the implicit permission set. The global
+    /// `-whitelistrelay` / `-whitelistforcerelay` defaults apply only to
+    /// these entries (Core applies them to peers "with default permissions").
+    pub implicit: bool,
 }
 
 impl WhitelistEntry {
@@ -136,9 +141,9 @@ impl WhitelistEntry {
         if raw.is_empty() {
             return Err("empty -whitelist entry".to_string());
         }
-        let (perms, subnet) = match raw.split_once('@') {
-            Some((p, net)) => (NetPermissions::parse_list(p)?, net.trim()),
-            None => (NetPermissions::implicit(), raw.as_str()),
+        let (perms, subnet, implicit) = match raw.split_once('@') {
+            Some((p, net)) => (NetPermissions::parse_list(p)?, net.trim(), false),
+            None => (NetPermissions::implicit(), raw.as_str(), true),
         };
         let net: IpNet = if let Ok(n) = subnet.parse::<IpNet>() {
             n
@@ -153,11 +158,37 @@ impl WhitelistEntry {
                  127.0.0.1, 10.0.0.0/8, noban@192.168.0.0/16)"
             ));
         };
-        Ok(Self { net, perms, raw })
+        Ok(Self {
+            net,
+            perms,
+            raw,
+            implicit,
+        })
     }
 
     pub fn contains(&self, ip: IpAddr) -> bool {
         self.net.contains(&ip)
+    }
+
+    /// Apply the global `-whitelistrelay` (default on) and
+    /// `-whitelistforcerelay` (default off) modifiers. They affect only
+    /// entries that took the implicit permission set (no explicit `perms@`
+    /// prefix), matching Bitcoin Core, which applies them to whitelisted
+    /// peers "with default permissions". An explicit `relay`/`forcerelay`
+    /// in a `perms@` prefix is left untouched.
+    pub fn apply_global_relay_defaults(
+        &mut self,
+        whitelist_relay: bool,
+        whitelist_force_relay: bool,
+    ) {
+        if !self.implicit {
+            return;
+        }
+        self.perms.relay = whitelist_relay;
+        if whitelist_force_relay {
+            self.perms.force_relay = true;
+            self.perms.relay = true;
+        }
     }
 }
 
@@ -199,6 +230,27 @@ mod tests {
     fn unknown_permission_errors() {
         assert!(NetPermissions::parse_list("nonsense").is_err());
         assert!(WhitelistEntry::parse("relay@not-an-ip").is_err());
+    }
+
+    #[test]
+    fn global_relay_defaults_only_touch_implicit_entries() {
+        // Implicit entry: -whitelistrelay=0 strips relay.
+        let mut e = WhitelistEntry::parse("127.0.0.1").unwrap();
+        assert!(e.implicit && e.perms.relay);
+        e.apply_global_relay_defaults(false, false);
+        assert!(!e.perms.relay);
+
+        // Implicit entry: -whitelistforcerelay=1 grants forcerelay + relay.
+        let mut e = WhitelistEntry::parse("10.0.0.0/8").unwrap();
+        e.apply_global_relay_defaults(true, true);
+        assert!(e.perms.force_relay && e.perms.relay);
+
+        // Explicit perms@ entry: untouched by the global defaults.
+        let mut e = WhitelistEntry::parse("noban@192.168.0.0/16").unwrap();
+        assert!(!e.implicit && !e.perms.relay);
+        e.apply_global_relay_defaults(true, true);
+        assert!(!e.perms.relay && !e.perms.force_relay, "explicit entry must be untouched");
+        assert!(e.perms.noban);
     }
 
     #[test]

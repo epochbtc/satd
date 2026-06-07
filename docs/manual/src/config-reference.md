@@ -90,6 +90,8 @@ semantics track **Bitcoin Core v30**.
 | `logsourcelocations` | off | restart | core | Prepend source `file:line` to each log line. |
 | `debug` | none | hot | core | Enable debug logging for a category (repeatable; bare/`all`/`1` = everything). |
 | `debugexclude` | none | hot | core | Disable debug logging for a category `debug` would otherwise enable. |
+| `loglevel` | info | hot | core | Global verbosity (`trace`/`debug`/`info`/`warn`/`error`) or a per-category override (`net:debug`). Maps onto satd's `tracing` filter: a bare level sets the default for targets not already overridden — it does **not** lower a more specific `-debug`/`RUST_LOG` directive (so `-debug=net -loglevel=error` still logs `net` at debug). A `category:level` pair overrides that subsystem. |
+| `allowignoredconf` | off | restart | core | Suppress startup warnings about `includeconf` files satd had to ignore. |
 | `maxshutdownsecs` | 30 | hot | satd | Max graceful-shutdown flush duration (seconds) before force exit. |
 
 ## RPC server
@@ -148,6 +150,8 @@ semantics track **Bitcoin Core v30**.
 | `v2only` | false | hot | satd | Refuse peers that do not speak BIP 324 v2 (privacy / anti-surveillance lever). |
 | `externalip` | none | hot | core | External address to advertise to peers (repeatable). |
 | `whitelist` | none | hot | core | Grant net permissions to peers by source subnet (repeatable). |
+| `whitelistrelay` | on | hot | core | Grant `relay` to whitelisted peers with default permissions (relay their txes even under `-blocksonly`). Entries with an explicit `perms@` prefix are unaffected. |
+| `whitelistforcerelay` | off | hot | core | Grant `forcerelay` to whitelisted peers with default permissions. Entries with an explicit `perms@` prefix are unaffected. |
 | `whitebind` | none | restart | core | Bind an extra permissioned P2P listener (repeatable). |
 | `asmap` | none | restart | core | asmap file for ASN-based addrman bucketing (eclipse resistance). |
 | `port` | network default | restart | core | P2P listen port. |
@@ -185,6 +189,7 @@ semantics track **Bitcoin Core v30**.
 |---|---|---|---|---|
 | `assumevalid` | per-network hash | restart | core | Skip script verification up to HASH (`0`=verify all, `all`=skip old blocks). |
 | `assumevalidage` | 86400 | restart | satd | With `assumevalid=all`, still verify scripts for blocks newer than SECS. |
+| `checkpoints` | on | restart | core | Enforce the built-in block checkpoints. `-checkpoints=0` disables checkpoint validation. |
 | `stopatheight` | none | restart | core | Stop once the active-chain tip reaches HEIGHT. |
 | `consensus` | rust-shadow | restart | satd | Consensus engine: `cpp`\|`rust`\|`rust-shadow`\|`cpp-shadow`. |
 

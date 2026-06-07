@@ -560,6 +560,14 @@ async fn main() {
             // Custom signet (BIP 325): enables block-solution validation
             // and custom P2P magic. Set before sharing the ChainState.
             cs.set_signet_challenge(config.signet_challenge.clone());
+            // -checkpoints=0 disables built-in checkpoint validation.
+            cs.set_enforce_checkpoints(config.enforce_checkpoints);
+            if !config.enforce_checkpoints {
+                tracing::warn!(
+                    "checkpoint validation disabled (-checkpoints=0); blocks are accepted \
+                     without checking the built-in checkpoint set"
+                );
+            }
             Arc::new(cs)
         }
         Err(e) => {
