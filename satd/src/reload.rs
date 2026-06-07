@@ -694,7 +694,10 @@ fn field_specs() -> Vec<FieldSpec> {
         // Prefix-watch granularity bounds bind at listener construction (startup).
         restart!("streamprefixminbits", stream_prefix_min_bits),
         restart!("streamprefixmaxbits", stream_prefix_max_bits),
-        // ---- Webhooks ----
+        // ---- Webhooks / notifications ----
+        // The blocknotify dispatcher is spawned once at startup (only when a
+        // command is configured), mirroring Core — changing it needs a restart.
+        restart!("blocknotify", block_notify),
         live!("reorgwebhook", reorg_webhook, apply_webhook),
         live_secret!("reorgwebhooksecret", reorg_webhook_secret, apply_webhook),
         // ---- MCP ----

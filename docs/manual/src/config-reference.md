@@ -330,12 +330,26 @@ Core ZMQ wire-format compatible.)
 | `eventszmqmpconfirm` | on when bound | restart | satd | Enable `mpconfirm` topic (mempool tx confirmed; JSON). |
 | `eventszmqnodeevent` | on when bound | restart | satd | Enable `nodeevent` topic (full envelope JSON). |
 
-## Webhooks
+## Webhooks / notifications
 
 | Key | Default | Reload | Compat | Description |
 |---|---|---|---|---|
+| `blocknotify` | none | restart | core | Shell command run on each new best block; `%s` is replaced by the block hash. Commands run serially on a dedicated subscriber task (a slow hook never stalls block connection — notifications coalesce instead). The command body is not logged (it may embed credentials). |
 | `reorgwebhook` | none | hot | satd | HTTP(S) endpoint receiving a POST on reorg detection. |
 | `reorgwebhooksecret` | none | hot | satd | HMAC-SHA256 secret signing webhook bodies via `X-Satd-Signature`. |
+
+> **Notifications are convenience, not the integration path.** `blocknotify`
+> (and Core's other `*notify` shell hooks — `walletnotify`, `alertnotify`,
+> `startupnotify`, `shutdownnotify`) exist for drop-in Bitcoin Core
+> compatibility and quick scripts. They are best-effort, fire-and-forget shell
+> execs with no delivery guarantee, no replay, and no reorg awareness. **To
+> build on satd, use the [Streaming Consumption API](streaming.md)** (gRPC /
+> WebSocket / ZMQ) — it is reorg-safe, offers durable cursor replay, and is
+> decoupled from consensus. satd implements only `blocknotify` from the shell-
+> hook family; the others are recognized-and-skipped with a pointer to the
+> supported alternative (`walletnotify` → keyless, watch scripts via the
+> streaming/Esplora API; `startup`/`shutdownnotify` → systemd unit hooks). A
+> node started with `blocknotify` logs this guidance at startup.
 
 ## MCP
 
