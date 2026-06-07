@@ -88,8 +88,9 @@ In-progress; full detail tracked in
   More previously-skipped Core v30 keys are now honored: `-loglevel`
   (global or `category:level` verbosity), `-checkpoints=0` (disable built-in
   checkpoint validation), `-whitelistrelay` / `-whitelistforcerelay` (default
-  relay permissions for whitelisted peers), and `-allowignoredconf` (suppress
-  ignored-`includeconf` warnings).
+  relay permissions for whitelisted peers), `-allowignoredconf` (suppress
+  ignored-`includeconf` warnings), and `-blocknotify` (run a shell command,
+  `%s`→block hash, on each new best block).
 - **Monitoring** — daemon-side startup/reindex timing on `getstartupinfo`;
   `sat-tui` distinguishes an unreadable RPC cookie from rejected credentials.
 - **Testing / CI** — block-consensus differential matrix (Phase B); live

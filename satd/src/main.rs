@@ -898,6 +898,52 @@ async fn main() {
         });
     }
 
+    // -blocknotify: run a shell command on each new connected block, with
+    // `%s` replaced by the block hash (Bitcoin Core parity). Each invocation
+    // is detached so a slow hook never stalls the event loop or block
+    // connection; non-zero exits and spawn failures are logged, not fatal.
+    if let Some(cmd_template) = config.block_notify.clone() {
+        let mut rx = chain_event_tx.subscribe();
+        tracing::info!("-blocknotify configured; running a command on each new best block");
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(node::chain::events::ChainEvent::BlockConnected { hash, .. }) => {
+                        let cmd = cmd_template.replace("%s", &hash.to_string());
+                        tokio::spawn(async move {
+                            match tokio::process::Command::new("sh")
+                                .arg("-c")
+                                .arg(&cmd)
+                                .status()
+                                .await
+                            {
+                                Ok(status) if status.success() => {}
+                                Ok(status) => tracing::warn!(
+                                    %status,
+                                    command = %cmd,
+                                    "blocknotify command exited non-zero"
+                                ),
+                                Err(e) => tracing::warn!(
+                                    error = %e,
+                                    command = %cmd,
+                                    "failed to run blocknotify command"
+                                ),
+                            }
+                        });
+                    }
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(
+                            skipped = n,
+                            "blocknotify lagged; some block notifications were dropped"
+                        );
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                }
+            }
+        });
+    }
+
     chain_state.set_chain_event_sender(chain_event_tx);
 
     // Stand up the pluggable transport bus.

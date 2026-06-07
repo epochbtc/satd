@@ -330,10 +330,11 @@ Core ZMQ wire-format compatible.)
 | `eventszmqmpconfirm` | on when bound | restart | satd | Enable `mpconfirm` topic (mempool tx confirmed; JSON). |
 | `eventszmqnodeevent` | on when bound | restart | satd | Enable `nodeevent` topic (full envelope JSON). |
 
-## Webhooks
+## Webhooks / notifications
 
 | Key | Default | Reload | Compat | Description |
 |---|---|---|---|---|
+| `blocknotify` | none | restart | core | Shell command run on each new best block; `%s` is replaced by the block hash. Runs detached per block (a slow hook never stalls block connection). |
 | `reorgwebhook` | none | hot | satd | HTTP(S) endpoint receiving a POST on reorg detection. |
 | `reorgwebhooksecret` | none | hot | satd | HMAC-SHA256 secret signing webhook bodies via `X-Satd-Signature`. |
 

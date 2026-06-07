@@ -952,6 +952,10 @@ pub struct Config {
     /// Optional HMAC-SHA256 secret for `X-Satd-Signature`. If set, the
     /// dispatcher signs each webhook body. Absent = unsigned POSTs.
     pub reorg_webhook_secret: Option<String>,
+    /// Bitcoin Core `-blocknotify=<cmd>`: a shell command run on each new
+    /// best block, with `%s` replaced by the block hash. `None` = no
+    /// dispatcher. Read once at startup (restart to change), like Core.
+    pub block_notify: Option<String>,
     /// AssumeUTXO `--fast-start`: a snapshot source to download and load
     /// at startup. Either an `https://` URL or a local filesystem path
     /// (optionally `file://`). `None` = disabled. Validated at config
@@ -2957,6 +2961,7 @@ impl Config {
             reorg_webhook_secret: cli
                 .reorg_webhook_secret
                 .or_else(|| file_get("reorgwebhooksecret")),
+            block_notify: cli.blocknotify.clone().or_else(|| file_get("blocknotify")),
             fast_start,
             fast_start_sha256,
             events_node_id: cli.events_node_id.or_else(|| file_get("eventsnodeid")),
@@ -4669,6 +4674,13 @@ pub struct CliArgs {
     pub profile: Option<String>,
 
     #[arg(
+        long = "blocknotify",
+        value_name = "CMD",
+        help = "Shell command to run on each new best block (%s is replaced by the block hash)"
+    )]
+    pub blocknotify: Option<String>,
+
+    #[arg(
         long = "reorg-webhook",
         value_name = "URL",
         help = "HTTP(S) endpoint receiving POST bodies on reorg detection"
@@ -5082,6 +5094,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "debug",
         "debugexclude",
         "profile",
+        "blocknotify",
         "reorg-webhook",
         "reorgwebhook",
         "reorg-webhook-secret",
@@ -5606,7 +5619,8 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "eventszmqmpreplace",
     "eventszmqmpconfirm",
     "eventszmqnodeevent",
-    // Webhooks
+    // Webhooks / notifications
+    "blocknotify",
     "reorgwebhook",
     "reorgwebhooksecret",
     // MCP
@@ -6652,6 +6666,7 @@ rpcport=8332
             debug: vec![],
             debugexclude: vec![],
             profile: None,
+            blocknotify: None,
             reorg_webhook: None,
             reorg_webhook_secret: None,
             fast_start: None,
@@ -6911,6 +6926,7 @@ rpcport=8332
             debug: vec![],
             debugexclude: vec![],
             profile: None,
+            blocknotify: None,
             reorg_webhook: None,
             reorg_webhook_secret: None,
             fast_start: None,
@@ -8805,6 +8821,28 @@ rpcport=39999
         assert!(cfg.whitelist[0].perms.noban);
         assert!(!cfg.whitelist[0].perms.relay);
         assert!(!cfg.whitelist[0].implicit);
+    }
+
+    #[test]
+    fn blocknotify_honored_via_cli_and_file() {
+        let cfg = Config::from_cli(CliArgs::try_parse_from(["satd", "--regtest"]).unwrap()).unwrap();
+        assert_eq!(cfg.block_notify, None);
+        assert!(is_known_config_key("blocknotify"));
+
+        // CLI: the %s placeholder is preserved verbatim for runtime substitution.
+        let cfg = Config::from_cli(
+            CliArgs::try_parse_from(["satd", "--regtest", "--blocknotify=/usr/bin/notify %s"])
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cfg.block_notify.as_deref(), Some("/usr/bin/notify %s"));
+
+        // Config-file form.
+        let cf = ConfigFile::parse("blocknotify=echo %s >> /tmp/blocks\n").unwrap();
+        assert_eq!(
+            cf.global.get("blocknotify").map(|v| v.as_slice()),
+            Some(&["echo %s >> /tmp/blocks".to_string()][..])
+        );
     }
 
     #[test]
