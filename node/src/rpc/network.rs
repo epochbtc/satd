@@ -35,7 +35,7 @@ pub fn get_network_info(peer_manager: &PeerManager) -> Value {
         "localservicesnames": ["NETWORK", "WITNESS", "NETWORK_LIMITED"],
         "localrelay": true,
         "timeoffset": 0,
-        "networkactive": true,
+        "networkactive": peer_manager.is_network_active(),
         "connections": connections,
         "connections_in": 0,
         "connections_out": connections,

@@ -23,12 +23,23 @@ the [Terminal UI](tui.md) chapter.
     only when a port is set. `--metricsbind=<addr>` sets the bind address alone
     (default `127.0.0.1`); it does **not** enable the server on its own. The
     listener binds `<metricsbind>:<metricsport>`.
-*   Exposes a native Prometheus HTTP server at `GET /metrics` providing deep insights into P2P traffic, block validation times, mempool depth, and RocksDB performance.
+*   Exposes a native Prometheus HTTP server at `GET /metrics` providing deep insights into P2P traffic, block validation times, mempool depth, and RocksDB performance. P2P wire volume is exported as the `satd_net_bytes_sent_total` / `satd_net_bytes_recv_total` counters (peer count via `satd_peer_connections`).
 *   Includes `GET /healthz` and `GET /readyz` endpoints for load balancer and orchestrator integration.
 
 See the [Packaging](packaging.md#health-and-readiness) chapter for how to wire
 `/healthz` and `/readyz` to Docker `HEALTHCHECK`, Kubernetes probes, or a
 systemd `ExecStartPost=` poll.
+
+> **Prefer `/metrics` over RPC polling for monitoring.** The Bitcoin Core
+> RPCs `getnettotals` (byte totals) and `getpeerinfo`
+> (`bytessent`/`bytesrecv`/`lastsend`/`lastrecv`) are populated and accurate
+> for steady-state traffic, but they exist for Core compatibility. For
+> dashboards and alerting, scrape the native Prometheus endpoint instead: it
+> is a counter model purpose-built for time-series tooling (rates, retention,
+> labels) and does not consume an RPC worker on every scrape. The RPC byte
+> counters cover post-handshake traffic only (the one-time handshake bytes are
+> not included), so absolute socket totals will read marginally lower than the
+> kernel's.
 
 ## Structured JSON Logging
 

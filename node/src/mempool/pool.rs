@@ -111,6 +111,11 @@ pub struct MempoolConfig {
     pub max_descendant_count: usize,
     pub expiry_secs: u64,
     pub permit_bare_multisig: bool,
+    /// Bitcoin Core's `-acceptnonstdtxn`: when true, skip the *standardness*
+    /// relay checks (oversize, dust, OP_RETURN/datacarrier, non-standard
+    /// output scripts) and admit any consensus-valid transaction. Consensus
+    /// rules are never relaxed. Default false (standard relay), matching Core.
+    pub accept_non_std_txn: bool,
 }
 
 impl Default for MempoolConfig {
@@ -126,6 +131,7 @@ impl Default for MempoolConfig {
             max_descendant_count: policy::MAX_DESCENDANT_COUNT,
             expiry_secs: policy::MEMPOOL_EXPIRY_SECS,
             permit_bare_multisig: true,
+            accept_non_std_txn: false,
         }
     }
 }
@@ -257,56 +263,66 @@ impl Mempool {
             ));
         }
 
-        // Policy: check weight
+        // Standardness relay checks (oversize, dust, OP_RETURN/datacarrier,
+        // non-standard output scripts). Bitcoin Core's `-acceptnonstdtxn`
+        // bypasses these so any consensus-valid tx is admitted; consensus
+        // rules below (check_transaction above, script verification later)
+        // are never relaxed. Default keeps standard relay (cfg default false).
+        // Transaction weight is needed downstream (ancestor/descendant size,
+        // entry accounting) regardless of standardness.
         let weight = tx.weight().to_wu() as usize;
-        if weight > MAX_STANDARD_TX_WEIGHT {
-            return Err(MempoolError::Validation("tx-size".to_string()));
-        }
 
-        // Policy: dust output check (configurable via -dustrelayfee, 0 = disable)
-        if cfg.dust_relay_fee > 0 {
-            for output in &tx.output {
-                if output.script_pubkey.is_op_return() {
-                    continue;
-                }
-                let threshold =
-                    policy::dust_threshold_with_rate(&output.script_pubkey, cfg.dust_relay_fee);
-                if output.value.to_sat() < threshold {
-                    return Err(MempoolError::Dust);
-                }
+        if !cfg.accept_non_std_txn {
+            // Policy: standard tx weight ceiling (oversize relay check)
+            if weight > MAX_STANDARD_TX_WEIGHT {
+                return Err(MempoolError::Validation("tx-size".to_string()));
             }
-        }
 
-        // Policy: OP_RETURN limits (configurable via -datacarrier and -datacarriersize)
-        if !cfg.data_carrier {
-            // Reject all OP_RETURN outputs
-            for output in &tx.output {
-                if output.script_pubkey.is_op_return() {
-                    return Err(MempoolError::NonStandardOpReturn);
-                }
-            }
-        } else {
-            let mut op_return_count = 0;
-            for output in &tx.output {
-                if output.script_pubkey.is_op_return() {
-                    op_return_count += 1;
-                    if op_return_count > 1 {
-                        return Err(MempoolError::NonStandardOpReturn);
+            // Policy: dust output check (configurable via -dustrelayfee, 0 = disable)
+            if cfg.dust_relay_fee > 0 {
+                for output in &tx.output {
+                    if output.script_pubkey.is_op_return() {
+                        continue;
                     }
-                    if output.script_pubkey.len() > cfg.data_carrier_size {
-                        return Err(MempoolError::NonStandardOpReturn);
+                    let threshold =
+                        policy::dust_threshold_with_rate(&output.script_pubkey, cfg.dust_relay_fee);
+                    if output.value.to_sat() < threshold {
+                        return Err(MempoolError::Dust);
                     }
                 }
             }
-        }
 
-        // Policy: reject non-standard output scripts
-        for output in &tx.output {
-            if !policy::is_standard_output_script(
-                &output.script_pubkey,
-                cfg.permit_bare_multisig,
-            ) {
-                return Err(MempoolError::Validation("scriptpubkey".to_string()));
+            // Policy: OP_RETURN limits (configurable via -datacarrier and -datacarriersize)
+            if !cfg.data_carrier {
+                // Reject all OP_RETURN outputs
+                for output in &tx.output {
+                    if output.script_pubkey.is_op_return() {
+                        return Err(MempoolError::NonStandardOpReturn);
+                    }
+                }
+            } else {
+                let mut op_return_count = 0;
+                for output in &tx.output {
+                    if output.script_pubkey.is_op_return() {
+                        op_return_count += 1;
+                        if op_return_count > 1 {
+                            return Err(MempoolError::NonStandardOpReturn);
+                        }
+                        if output.script_pubkey.len() > cfg.data_carrier_size {
+                            return Err(MempoolError::NonStandardOpReturn);
+                        }
+                    }
+                }
+            }
+
+            // Policy: reject non-standard output scripts
+            for output in &tx.output {
+                if !policy::is_standard_output_script(
+                    &output.script_pubkey,
+                    cfg.permit_bare_multisig,
+                ) {
+                    return Err(MempoolError::Validation("scriptpubkey".to_string()));
+                }
             }
         }
 
@@ -337,8 +353,16 @@ impl Mempool {
         for input in &tx.input {
             // First try chain state (confirmed UTXOs)
             if let Some(coin) = chain_state.get_coin(&input.previous_output) {
-                // Check coinbase maturity
-                if coin.coinbase && tip_height - coin.height < COINBASE_MATURITY {
+                // Check coinbase maturity. A mempool tx is spent at the next
+                // block (tip + 1) at the earliest, so the spend height — to
+                // match Bitcoin Core's `CheckTxInputs` (nSpendHeight = tip + 1)
+                // and satd's own connect-time check (which uses the connecting
+                // block's height) — is `tip_height + 1`. Using `tip_height`
+                // here made the mempool reject a coinbase at exactly
+                // COINBASE_MATURITY confirmations that consensus would accept
+                // in the next block (off-by-one, surfaced by the BDK canary).
+                let spend_height = tip_height + 1;
+                if coin.coinbase && spend_height - coin.height < COINBASE_MATURITY {
                     return Err(MempoolError::PrematureCoinbaseSpend);
                 }
                 sum_inputs += coin.amount;
@@ -1383,6 +1407,62 @@ mod tests {
 
         let result = mp.accept_transaction(tx, &cs, &NoopVerifier);
         assert!(matches!(result, Err(MempoolError::Dust)));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn accept_non_std_txn_bypasses_standardness_checks() {
+        use bitcoin::blockdata::locktime::absolute::LockTime;
+        use bitcoin::hashes::Hash;
+        use bitcoin::transaction;
+        use bitcoin::{Amount, ScriptBuf, Sequence, TxIn, TxOut, Witness};
+
+        let (cs, _mp, dir) = make_test_env();
+        // Same dust-relay policy as the rejection test, but with
+        // -acceptnonstdtxn on: the standardness checks (including dust) are
+        // skipped, so admission proceeds past them to input validation.
+        let mp = Mempool::with_config(MempoolConfig {
+            max_size_bytes: 1_000_000,
+            min_fee_rate: 0,
+            dust_relay_fee: 3_000,
+            accept_non_std_txn: true,
+            ..Default::default()
+        });
+
+        let tx = Transaction {
+            version: transaction::Version(2),
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: bitcoin::Txid::from_raw_hash(
+                        bitcoin::hashes::sha256d::Hash::from_byte_array([0xbb; 32]),
+                    ),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1), // dust under standard relay
+                script_pubkey: ScriptBuf::from_bytes(vec![
+                    0x76, 0xa9, 0x14,
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    0x88, 0xac,
+                ]),
+            }],
+        };
+
+        // The dust gate must NOT fire (it's bypassed). The tx still fails
+        // later on the missing/unspendable input — that's a non-standardness
+        // path, which is exactly the point: consensus/input rules still apply.
+        let result = mp.accept_transaction(tx, &cs, &NoopVerifier);
+        assert!(
+            !matches!(result, Err(MempoolError::Dust)),
+            "acceptnonstdtxn must bypass the dust standardness check, got {result:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

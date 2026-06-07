@@ -26,6 +26,7 @@ use crate::net::connection::{Connection, ConnectionWriter};
 use crate::net::ibd::IbdScheduler;
 use crate::net::peer::{Direction, PeerAddr, PeerId, PeerInfo, PeerState};
 use crate::net::proxy;
+use crate::net::stats::{NetTotals, PeerStats};
 use crate::net::sync;
 
 const MAX_OUTBOUND: usize = 8;
@@ -143,6 +144,10 @@ struct PeerHandle {
     /// announcement-triggered header discovery (anti-DoS). `None` until the
     /// first send.
     last_getheaders_sent: Option<Instant>,
+    /// Per-peer wire counters (bytes + last activity), shared with the peer's
+    /// I/O tasks. Read by `getpeerinfo`; rolls up into the global
+    /// [`NetTotals`].
+    stats: Arc<PeerStats>,
 }
 
 /// How a peer task receives its transport.
@@ -319,6 +324,15 @@ pub struct PeerManager {
     upload_bytes: AtomicU64,
     /// Unix-seconds start of the current 24h upload cycle.
     upload_cycle_start: AtomicU64,
+    /// Process-global P2P byte totals (across all peers, past and present),
+    /// feeding `getnettotals` and the Prometheus `satd_net_bytes_*` counters.
+    /// Each peer's [`PeerStats`] holds a clone and rolls its activity up here.
+    net_totals: Arc<NetTotals>,
+    /// Bitcoin Core's `-networkactive` / `setnetworkactive`: when false, the
+    /// node stops accepting inbound peers and stops initiating outbound dials
+    /// (existing peers are disconnected when it is toggled off). Defaults to
+    /// true. Read by the accept loop and the reconnect/dial paths.
+    network_active: std::sync::atomic::AtomicBool,
 }
 
 impl PeerManager {
@@ -450,6 +464,8 @@ impl PeerManager {
             upload_target_bytes: AtomicU64::new(0),
             upload_bytes: AtomicU64::new(0),
             upload_cycle_start: AtomicU64::new(now_unix_secs()),
+            net_totals: NetTotals::new(),
+            network_active: std::sync::atomic::AtomicBool::new(true),
         });
 
         // Spawn block processing thread
@@ -540,6 +556,50 @@ impl PeerManager {
     /// Whether transaction relay is suppressed (`-blocksonly`).
     fn blocksonly(&self) -> bool {
         self.blocksonly.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Enable/disable all P2P networking (`-networkactive` /
+    /// `setnetworkactive`). Disabling stops new inbound accepts and outbound
+    /// dials *and* disconnects every current peer — dropping a peer's handle
+    /// closes its `msg_rx`, which the peer write loop treats as a
+    /// disconnect-by-manager signal and tears the socket down. Re-enabling
+    /// lets the reconnect loop redial. A no-op if already in the target state.
+    pub fn set_network_active(&self, active: bool) {
+        if active {
+            let was = self
+                .network_active
+                .swap(true, std::sync::atomic::Ordering::Relaxed);
+            if !was {
+                tracing::info!("networkactive=true: P2P networking resumed");
+            }
+        } else {
+            // Flip the flag AND clear peers under the same `peers` write lock
+            // that peer registration ([`register_peer`]) checks the flag under.
+            // This makes "pause" atomic with respect to "register a new peer":
+            // a dial that wins the lock first registers and is then cleared
+            // here; one that loses sees the flag false and refuses to register.
+            // Without this coupling, a dial finishing its handshake could insert
+            // a live peer in the window after `clear()`, leaving a connection up
+            // while networking is meant to be off.
+            let mut peers = self.peers.write();
+            let was = self
+                .network_active
+                .swap(false, std::sync::atomic::Ordering::Relaxed);
+            if was {
+                let n = peers.len();
+                peers.clear();
+                tracing::info!(
+                    disconnected = n,
+                    "networkactive=false: disconnected all peers and paused P2P networking"
+                );
+            }
+        }
+    }
+
+    /// Whether P2P networking is active (`-networkactive`, default true).
+    pub fn is_network_active(&self) -> bool {
+        self.network_active
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Enable/disable BIP 324 v2 transport (`-v2transport`). Set from the
@@ -945,6 +1005,9 @@ impl PeerManager {
 
     /// Connect to an outbound peer.
     pub async fn connect_outbound(self: &Arc<Self>, addr: SocketAddr) -> Result<(), String> {
+        if !self.is_network_active() {
+            return Err("networking disabled (networkactive=false)".to_string());
+        }
         self.check_outbound_limit()?;
 
         // Claim the dial slot before doing any network I/O. Without this,
@@ -994,6 +1057,15 @@ impl PeerManager {
         // connected straight as v1 to avoid a wasted round trip.
         let conn = self.establish_outbound(stream, OutboundDial::Direct(addr)).await?;
 
+        // Re-check after the dial + handshake awaits: `setnetworkactive false`
+        // (RPC or SIGHUP) may have run while we were connecting, clearing all
+        // peers. Without this we'd register a live peer *after* the pause,
+        // leaving an outbound connection up while networking is meant to be
+        // off. Dropping `conn` here closes the socket.
+        if !self.is_network_active() {
+            return Err("networking disabled during connect (networkactive=false)".to_string());
+        }
+
         self.spawn_peer(
             id,
             addr,
@@ -1010,6 +1082,9 @@ impl PeerManager {
         host: &str,
         port: u16,
     ) -> Result<(), String> {
+        if !self.is_network_active() {
+            return Err("networking disabled (networkactive=false)".to_string());
+        }
         self.check_outbound_limit()?;
 
         // Dedupe by onion host BEFORE any network I/O. Onion peers all share
@@ -1058,6 +1133,13 @@ impl PeerManager {
             .establish_outbound(stream, OutboundDial::Onion(host.to_string(), port))
             .await?;
 
+        // Re-check after the dial + handshake awaits (see connect_outbound):
+        // networkactive may have been toggled off mid-connect. Dropping `conn`
+        // closes the socket so no peer is registered while paused.
+        if !self.is_network_active() {
+            return Err("networking disabled during connect (networkactive=false)".to_string());
+        }
+
         self.spawn_peer(
             id,
             placeholder_addr,
@@ -1102,11 +1184,25 @@ impl PeerManager {
         addr: SocketAddr,
         bind_perms: crate::net::permissions::NetPermissions,
     ) {
+        // `-networkactive=0` / `setnetworkactive false`: refuse inbound. The
+        // moved `stream` is dropped here, closing the socket.
+        if !self.is_network_active() {
+            tracing::debug!(%addr, "networkactive=false: refusing inbound connection");
+            return;
+        }
         let ip = addr.ip();
         let perms = self.whitelist_permissions(ip).union(bind_perms);
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let msg_rx = {
             let mut peers = self.peers.write();
+            // Authoritative pause check under the peers lock (mirrors
+            // spawn_peer / set_network_active). Closes the race where
+            // `setnetworkactive false` runs between the top-of-function check
+            // and here; returning drops `stream`, closing the socket.
+            if !self.is_network_active() {
+                tracing::debug!(%addr, "networkactive=false: refusing inbound connection (race)");
+                return;
+            }
             // NoBan peers are exempt from the inbound connection caps
             // (matches Bitcoin Core's manual-conn / whitelist handling).
             if !perms.noban {
@@ -1142,7 +1238,15 @@ impl PeerManager {
             let (msg_tx, msg_rx) = mpsc::channel::<NetworkMessage>(256);
             let mut info = PeerInfo::new(id, addr, Direction::Inbound);
             info.permissions = perms;
-            peers.insert(id, PeerHandle { info, msg_tx, last_getheaders_sent: None });
+            peers.insert(
+                id,
+                PeerHandle {
+                    info,
+                    msg_tx,
+                    last_getheaders_sent: None,
+                    stats: PeerStats::new(self.net_totals.clone()),
+                },
+            );
             msg_rx
         };
         tracing::info!(%addr, id, noban = perms.noban, "Accepted inbound peer");
@@ -1203,8 +1307,13 @@ impl PeerManager {
         peers
             .values()
             .filter(|h| h.info.state == PeerState::Connected)
-            .map(|h| h.info.to_rpc_json())
+            .map(|h| h.info.to_rpc_json(&h.stats))
             .collect()
+    }
+
+    /// Process-global P2P byte totals (for `getnettotals` and metrics).
+    pub fn net_totals(&self) -> &Arc<NetTotals> {
+        &self.net_totals
     }
 
     /// Get connection count.
@@ -1666,8 +1775,11 @@ impl PeerManager {
                 }
             }
 
-            // Every 20 ticks (10 seconds), reconnect if below outbound target
-            if ticks.is_multiple_of(20) {
+            // Every 20 ticks (10 seconds), reconnect if below outbound target.
+            // Skipped entirely while networking is paused (`networkactive=0` /
+            // `setnetworkactive false`): otherwise each tick would spawn dials
+            // that immediately fail the gate, churning backoff state and logs.
+            if ticks.is_multiple_of(20) && self.is_network_active() {
                 let outbound = self.outbound_count();
                 let target = if self.is_ibd() { MAX_OUTBOUND_IBD } else { MAX_OUTBOUND };
                 let need_peers = outbound < target;
@@ -4097,9 +4209,23 @@ impl PeerManager {
         let mut info = PeerInfo::new(id, addr, direction);
         info.permissions = self.whitelist_permissions(addr.ip());
         info.onion_host = onion_host.map(str::to_string);
-        let handle = PeerHandle { info, msg_tx, last_getheaders_sent: None };
+        let handle = PeerHandle {
+            info,
+            msg_tx,
+            last_getheaders_sent: None,
+            stats: PeerStats::new(self.net_totals.clone()),
+        };
         {
             let mut peers = self.peers.write();
+            // Authoritative pause check: under the same lock `set_network_active`
+            // flips the flag + clears peers under, so a dial that raced a pause
+            // is resolved deterministically — it either registers (and the pause
+            // then clears it) or is refused here. Returning drops `transport`,
+            // closing the freshly-dialed socket; the peer task is never spawned.
+            if !self.is_network_active() {
+                tracing::debug!(id, %addr, "networkactive=false: dropping freshly-connected peer");
+                return;
+            }
             peers.insert(id, handle);
         }
         self.spawn_peer_task(id, addr, transport, direction, msg_rx);
@@ -4334,6 +4460,16 @@ impl PeerManager {
         // mid-read, consumed bytes are lost and the stream becomes misaligned.
         // By running the reader in a dedicated task, it is never cancelled.
         let (mut reader, mut writer) = conn.split();
+
+        // Attach the per-peer wire counters (bytes + last-activity) so the
+        // read/write halves record steady-state traffic for getpeerinfo /
+        // getnettotals / metrics. Looked up from the already-registered
+        // PeerHandle; if the peer was dropped between registration and here,
+        // the connection is torn down anyway.
+        if let Some(stats) = self.peers.read().get(&id).map(|h| h.stats.clone()) {
+            reader.set_counters(stats.clone());
+            writer.set_counters(stats);
+        }
 
         // Request headers to start sync
         let getheaders = sync::make_getheaders(&self.chain_state);
@@ -4816,7 +4952,12 @@ mod tests {
         info.state = state;
         // 1-slot channel; we never send on the test side.
         let (tx, _rx) = mpsc::channel::<NetworkMessage>(1);
-        PeerHandle { info, msg_tx: tx, last_getheaders_sent: None }
+        PeerHandle {
+            info,
+            msg_tx: tx,
+            last_getheaders_sent: None,
+            stats: PeerStats::new(NetTotals::new()),
+        }
     }
 
     #[test]

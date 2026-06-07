@@ -63,6 +63,9 @@ impl MetricsContext {
         let mempool_info = self.mempool.info();
         let peer_count = self.peer_manager.connection_count() as u64;
         let peer_count_v2 = self.peer_manager.connection_count_v2() as u64;
+        let net_totals = self.peer_manager.net_totals();
+        let net_bytes_sent = net_totals.bytes_sent();
+        let net_bytes_recv = net_totals.bytes_recv();
         let uptime_secs = self.start_time.elapsed().as_secs();
         let network_str = network_label(self.network);
         let (rss_bytes, vm_bytes) = process_memory().unwrap_or((0, 0));
@@ -180,6 +183,22 @@ impl MetricsContext {
             "gauge",
             &[],
             peer_count_v2,
+        );
+        metric(
+            &mut out,
+            "satd_net_bytes_sent_total",
+            "Total P2P bytes sent on the wire across all peers (post-handshake).",
+            "counter",
+            &[],
+            net_bytes_sent,
+        );
+        metric(
+            &mut out,
+            "satd_net_bytes_recv_total",
+            "Total P2P bytes received on the wire across all peers (post-handshake).",
+            "counter",
+            &[],
+            net_bytes_recv,
         );
         metric(
             &mut out,

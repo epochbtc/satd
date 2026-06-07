@@ -1342,6 +1342,17 @@ async fn main() {
     // -maxuploadtarget: cap historical block upload per 24h (0 = off).
     peer_manager.set_max_upload_target(config.max_upload_target);
 
+    // -networkactive=0: boot with P2P networking paused (no inbound accepts,
+    // no outbound dials) until `setnetworkactive true`. Default true is the
+    // PeerManager's own default, so only the disabled case needs applying.
+    if !config.networkactive {
+        peer_manager.set_network_active(false);
+        tracing::warn!(
+            "-networkactive=0: P2P networking is paused at startup; enable it with the \
+             setnetworkactive RPC"
+        );
+    }
+
     // -asmap: install ASN-based addrman bucketing before loading the
     // address book so it buckets by AS. A bad asmap file is fatal (the
     // config layer already verified the path exists).

@@ -24,8 +24,11 @@ use bitcoin::p2p::message::NetworkMessage;
 use bitcoin::Network;
 use std::io;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
+
+use crate::net::stats::PeerStats;
 
 use bip324::{
     CipherSession, GarbageResult, Handshake, InboundCipher, Initialized, OutboundCipher, PacketType,
@@ -117,6 +120,7 @@ async fn recv_v2<S: AsyncRead + Unpin>(
     stream: &mut S,
     cipher: &mut InboundCipher,
     leftover: &mut Vec<u8>,
+    counters: Option<&Arc<PeerStats>>,
 ) -> io::Result<NetworkMessage> {
     loop {
         let len_bytes = read_exact_buffered(stream, leftover, LENGTH_FIELD_LEN).await?;
@@ -134,6 +138,11 @@ async fn recv_v2<S: AsyncRead + Unpin>(
             ));
         }
         let ciphertext = read_exact_buffered(stream, leftover, packet_len).await?;
+        // On-wire bytes for this packet: the 3-byte length prefix + the
+        // encrypted body. Counted per packet, including decoys (which loop).
+        if let Some(c) = counters {
+            c.record_recv(LENGTH_FIELD_LEN + packet_len);
+        }
         let (packet_type, plaintext) = cipher
             .decrypt_to_vec(&ciphertext, None)
             .map_err(handshake_io_err)?;
@@ -152,15 +161,16 @@ async fn recv_v2<S: AsyncRead + Unpin>(
 }
 
 /// Encode, encrypt, and write a single `NetworkMessage` as a genuine v2
-/// packet.
+/// packet. Returns the number of on-wire (ciphertext-framed) bytes written.
 async fn send_v2<S: AsyncWrite + Unpin>(
     stream: &mut S,
     cipher: &mut OutboundCipher,
     msg: NetworkMessage,
-) -> io::Result<()> {
+) -> io::Result<usize> {
     let contents = encode_message(msg);
     let packet = cipher.encrypt_to_vec(&contents, PacketType::Genuine, None);
-    stream.write_all(&packet).await
+    stream.write_all(&packet).await?;
+    Ok(packet.len())
 }
 
 /// Drive a full BIP 324 v2 handshake to completion on `stream`, returning
@@ -289,12 +299,14 @@ pub struct V2Reader {
     stream: ReadHalf<TcpStream>,
     cipher: InboundCipher,
     leftover: Vec<u8>,
+    counters: Option<Arc<PeerStats>>,
 }
 
 /// Write half of a split [`V2Connection`].
 pub struct V2Writer {
     stream: WriteHalf<TcpStream>,
     cipher: OutboundCipher,
+    counters: Option<Arc<PeerStats>>,
 }
 
 impl V2Connection {
@@ -317,22 +329,27 @@ impl V2Connection {
                 stream: read_half,
                 cipher: inbound,
                 leftover: self.leftover,
+                counters: None,
             },
             V2Writer {
                 stream: write_half,
                 cipher: outbound,
+                counters: None,
             },
         )
     }
 
-    /// Send a network message over the encrypted channel.
+    /// Send a network message over the encrypted channel. Pre-split
+    /// (handshake) path — uncounted.
     pub async fn send(&mut self, msg: NetworkMessage) -> io::Result<()> {
-        send_v2(&mut self.stream, self.cipher.outbound(), msg).await
+        send_v2(&mut self.stream, self.cipher.outbound(), msg).await?;
+        Ok(())
     }
 
-    /// Receive the next network message from the encrypted channel.
+    /// Receive the next network message from the encrypted channel. Pre-split
+    /// (handshake) path — uncounted.
     pub async fn recv(&mut self) -> io::Result<NetworkMessage> {
-        recv_v2(&mut self.stream, self.cipher.inbound(), &mut self.leftover).await
+        recv_v2(&mut self.stream, self.cipher.inbound(), &mut self.leftover, None).await
     }
 
     /// Get the peer's remote address.
@@ -342,9 +359,19 @@ impl V2Connection {
 }
 
 impl V2Writer {
-    /// Send a network message over the encrypted channel.
+    /// Send a network message over the encrypted channel, recording on-wire
+    /// (ciphertext-framed) bytes if counters are set.
     pub async fn send(&mut self, msg: NetworkMessage) -> io::Result<()> {
-        send_v2(&mut self.stream, &mut self.cipher, msg).await
+        let n = send_v2(&mut self.stream, &mut self.cipher, msg).await?;
+        if let Some(c) = &self.counters {
+            c.record_sent(n);
+        }
+        Ok(())
+    }
+
+    /// Attach the per-peer byte/activity counters.
+    pub fn set_counters(&mut self, counters: Arc<PeerStats>) {
+        self.counters = Some(counters);
     }
 }
 
@@ -354,7 +381,18 @@ impl V2Reader {
     /// As with [`V1Reader`](crate::net::connection), this must NOT be used
     /// inside `tokio::select!` — it is not cancel-safe.
     pub async fn recv(&mut self) -> io::Result<NetworkMessage> {
-        recv_v2(&mut self.stream, &mut self.cipher, &mut self.leftover).await
+        recv_v2(
+            &mut self.stream,
+            &mut self.cipher,
+            &mut self.leftover,
+            self.counters.as_ref(),
+        )
+        .await
+    }
+
+    /// Attach the per-peer byte/activity counters.
+    pub fn set_counters(&mut self, counters: Arc<PeerStats>) {
+        self.counters = Some(counters);
     }
 }
 

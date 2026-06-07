@@ -126,8 +126,6 @@ pub struct PeerInfo {
     pub wants_addrv2: bool,
     /// Peer's minimum fee rate for tx relay (BIP 133 feefilter), in sat/kvB.
     pub fee_filter: u64,
-    pub bytes_sent: u64,
-    pub bytes_recv: u64,
     pub conn_time: SystemTime,
     /// Net permissions granted via -whitelist / -whitebind (noban,
     /// relay, ...). Default empty.
@@ -158,8 +156,6 @@ impl PeerInfo {
             prefers_headers: false,
             wants_addrv2: false,
             fee_filter: 0,
-            bytes_sent: 0,
-            bytes_recv: 0,
             conn_time: SystemTime::now(),
             permissions: crate::net::permissions::NetPermissions::NONE,
             onion_host: None,
@@ -174,8 +170,10 @@ impl PeerInfo {
         self.version = Some(version);
     }
 
-    /// Convert to JSON-compatible format for getpeerinfo RPC.
-    pub fn to_rpc_json(&self) -> serde_json::Value {
+    /// Convert to JSON-compatible format for getpeerinfo RPC. `stats` carries
+    /// the live wire counters (bytes + last-activity timestamps) recorded by
+    /// the connection read/write halves.
+    pub fn to_rpc_json(&self, stats: &crate::net::stats::PeerStats) -> serde_json::Value {
         let conntime = self
             .conn_time
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -194,10 +192,10 @@ impl PeerInfo {
             "addr": addr_str,
             "services": format!("{:016x}", self.services.to_u64()),
             "servicesnames": [],
-            "lastsend": 0,
-            "lastrecv": 0,
-            "bytessent": self.bytes_sent,
-            "bytesrecv": self.bytes_recv,
+            "lastsend": stats.last_send(),
+            "lastrecv": stats.last_recv(),
+            "bytessent": stats.bytes_sent(),
+            "bytesrecv": stats.bytes_recv(),
             "conntime": conntime,
             "version": self.version.as_ref().map(|v| v.version).unwrap_or(0),
             "subver": &self.user_agent,

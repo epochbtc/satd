@@ -172,6 +172,7 @@ semantics track **Bitcoin Core v30**.
 | Key | Default | Reload | Compat | Description |
 |---|---|---|---|---|
 | `listen` | on | restart | core | Accept P2P connections. |
+| `networkactive` | on | hot | core | Start with P2P networking enabled. `=0` boots with networking paused (no inbound accepts, no outbound dials); toggle at runtime with the `setnetworkactive` RPC. |
 | `blocksonly` | false | hot | core | Suppress P2P transaction relay; locally-submitted txs still relayed. |
 | `v2transport` | true | hot | core | Offer/accept BIP 324 v2 encrypted transport (Core default since v26). |
 | `v2only` | false | hot | satd | Refuse peers that do not speak BIP 324 v2 (privacy / anti-surveillance lever). |
@@ -245,6 +246,7 @@ semantics track **Bitcoin Core v30**.
 | `mempoolexpiry` | 336 h | hot | core | Mempool entry expiry in hours. |
 | `persistmempool` | on | hot | core | Persist the mempool to `mempool.dat` across restarts. |
 | `permitbaremultisig` | on | hot | core | Allow bare multisig outputs. |
+| `acceptnonstdtxn` | off | hot | core | Relay and accept non-standard transactions (bypass the standardness relay checks — oversize, dust, OP_RETURN/datacarrier, non-standard scripts). Consensus rules are never relaxed. Intended for test/dev networks. |
 
 ## Esplora
 
