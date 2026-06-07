@@ -43,6 +43,25 @@ semantics track **Bitcoin Core v30**.
   `pruned-home`, `mining`, `regtest-dev`, `signet-watchtower`); explicit flags
   override the profile's values.
 
+> **Compatibility is pinned to Bitcoin Core v30 — and only v30.** The
+> drop-in target is a frozen, verifiable surface, not "whatever Core ships
+> next." Keys Core *adds* in v31 or later (e.g. `limitclustercount`,
+> `limitclustersize`, `privatebroadcast`, `txospenderindex`) are **not**
+> recognized and are rejected as typos until this pin is deliberately bumped.
+> Keys Core *removed* at or before v30 (e.g. `upnp`, `maxorphantx`) are
+> likewise not honored. If you migrate a `bitcoin.conf` from a newer Core, a
+> v31+ key will fail to start satd with an "unknown key" error — that is
+> intentional, not a bug.
+
+> **Building on satd? Don't poll or shell-hook — stream.** This reference is
+> for *operating* the node. If you are writing software that consumes node
+> state (blocks, mempool, address activity, reorgs), the supported integration
+> path is the **[Streaming Consumption API](streaming.md)** (gRPC / WebSocket /
+> ZMQ): reorg-safe, durable cursor replay, decoupled from consensus. The Core
+> `*notify` shell hooks and ad-hoc RPC polling are provided for compatibility
+> and quick scripts only — they have no delivery guarantee, no replay, and no
+> reorg awareness.
+
 ## Legend
 
 - **Reload** — `hot`: applied live on `SIGHUP` (`systemctl reload satd`).
@@ -54,6 +73,14 @@ semantics track **Bitcoin Core v30**.
   Bitcoin Core. `satd`: a satd-specific extension (no Core equivalent, or
   satd-only semantics). Best-effort classification; a key "modeled on" Core
   behavior but without a Core flag of the same name is `satd`.
+
+> **Every key listed in the per-category tables below is _honored_**
+> (disposition #1 — satd implements it). Recognized Core v30 keys satd does
+> **not** honor are not in these tables; they are enumerated, with their
+> warn-and-skip or fail-closed disposition, under
+> [Unsupported Core keys: skipped vs rejected](#unsupported-core-keys-skipped-vs-rejected).
+> So: in a table here ⇒ supported; in the unsupported-keys section ⇒
+> warn-and-continue (or rejected); in neither ⇒ rejected as a typo.
 
 ---
 
@@ -418,8 +445,13 @@ actionable message:
 
 A key that is **neither a satd option nor a known Core v30 option** is rejected
 at load as a likely typo — this is what stops a fat-fingered `rpcusser=` from
-silently disabling authentication.
+silently disabling authentication. Note this also catches **Core v31+ keys**:
+the compatibility surface is frozen at v30, so a key Core only added later is
+treated as unknown until the pin is deliberately bumped.
 
-> **Compatibility scope.** "Supported" is the commonly-used Core operator
-> surface, with semantics pinned to Core v30. The long tail is skipped-with-warning
-> rather than honored.
+> **Compatibility scope.** "Supported" is the commonly-used Core v30 operator
+> surface, with semantics pinned to **Core v30 only** (not later releases). The
+> long tail is skipped-with-warning rather than honored. To consume node
+> events from your own software, use the
+> [Streaming Consumption API](streaming.md), not the `*notify` hooks or RPC
+> polling.
