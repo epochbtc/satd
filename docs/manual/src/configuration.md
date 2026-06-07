@@ -1,9 +1,13 @@
 # Configuration, Tuning & Reload
 
-`satd` fully supports Bitcoin Core's `bitcoin.conf` syntax and standard CLI
-flags. On top of that compatibility it adds hardware-profile presets, a set of
-operator-sovereignty policy knobs, and live reload of both configuration
-(`SIGHUP`) and TLS certificates (`SIGUSR1`).
+`satd` reads Bitcoin Core's `bitcoin.conf` syntax and CLI-flag names directly, so
+an existing Core config drops in and starts the node — commonly-used options are
+honored (semantics pinned to Core v30), and a recognized option satd doesn't
+implement is skipped with a startup warning rather than aborting (see the
+[Configuration Flag Reference](config-reference.md#how-satd-reads-configuration)
+for the exact disposition). On top of that compatibility it adds hardware-profile
+presets, a set of operator-sovereignty policy knobs, and live reload of both
+configuration (`SIGHUP`) and TLS certificates (`SIGUSR1`).
 
 For the observability surfaces (TUI, Prometheus, structured logs) see
 [Observability & Metrics](observability.md); for the satd-specific developer
@@ -15,7 +19,7 @@ a satd extension — see the [Configuration Flag Reference](config-reference.md)
 
 ## Configuration & Tuning
 
-`satd` fully supports Bitcoin Core's `bitcoin.conf` syntax and standard CLI flags. However, to simplify deployment on different hardware profiles, `satd` introduces configuration presets.
+`satd` reads Bitcoin Core's `bitcoin.conf` syntax and CLI-flag names (a Core config drops in directly — see the [Configuration Flag Reference](config-reference.md#how-satd-reads-configuration)). To simplify deployment on different hardware profiles, `satd` also introduces configuration presets.
 
 ### `--profile` Presets
 Instead of manually tuning `-dbcache`, `-maxmempool`, and connection limits, operators can use `--profile=<preset>`:
@@ -55,7 +59,7 @@ Edit `bitcoin.conf` and send `SIGHUP` — `kill -HUP <pid>`, or `systemctl reloa
 
 > **Difference from Bitcoin Core.** Core uses `SIGHUP` to reopen `debug.log` for logrotate. satd has no `debug.log` — it logs to **stdout**, delegating rotation/retention to systemd-journald or the container runtime — so `SIGHUP` is repurposed for config reload. See [`CORE_DIFFERENCES.md`](https://github.com/epochbtc/satd/blob/master/CORE_DIFFERENCES.md).
 
-**Safety:** a reload that fails to parse (a typo'd, unknown, or invalid key — these hard-error at load) is logged and the **running config is kept**; the daemon never crashes on a bad reload. Every change is either applied live or logged as `restart required` — nothing is silently ignored. Secret-bearing keys (`rpcuser`, `rpcpassword`, `rpcauth`, `torpassword`, `esplorauserpass`, `reorgwebhooksecret`) report only that they changed — their values are **redacted** in the log, never printed.
+**Safety:** a reload that fails to parse (a typo or invalid value — rejected at load; a recognized-but-unsupported Core option is skipped with a warning, not an error) is logged and the **running config is kept**; the daemon never crashes on a bad reload. Every change is either applied live or logged as `restart required` — nothing is silently ignored. Secret-bearing keys (`rpcuser`, `rpcpassword`, `rpcauth`, `torpassword`, `esplorauserpass`, `reorgwebhooksecret`) report only that they changed — their values are **redacted** in the log, never printed.
 
 **Hot-reloadable (applied live):**
 

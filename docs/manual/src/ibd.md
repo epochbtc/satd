@@ -157,7 +157,7 @@ These bound or accelerate IBD. The full defaults/semantics are in the
 | Flag | Default | Notes |
 |---|---|---|
 | `-dbcache=<MB\|auto>` | 450 | Write-cache size. **`auto`** (satd) spawns a controller that resizes RocksDB block cache + CoinCache against `/proc/meminfo` pressure — Core's `-dbcache` is a static number only. |
-| `-par=<n>` | — | Script-verification threads. **Accepted for Core compatibility but a no-op** in satd (the shadow pool / connect path manage their own parallelism). |
+| `-par=<n>` | — | Script-verification threads (Core name). satd's connect path manages its own parallelism, so `-par` does not size it directly — but when `-shadowworkers` is unset, a positive `-par` value is used as the **fallback shadow-verification worker count** (otherwise the default of 4 applies). |
 | `-prefetchworkers=<n>` | CPU cores | *(satd)* IBD block-prefetch worker threads. |
 | `-maxahead=<n\|N%\|all>` | 50000 | *(satd)* how many blocks IBD may stage ahead of the connect tip. |
 | `-storageprofile=<ssd\|hdd>` | ssd | *(satd)* RocksDB tuning class for the storage medium. |
@@ -190,4 +190,4 @@ handles this without tripping the start timeout (see [Packaging](packaging.md) �
 - **`--fast-start` / `--fast-start-sha256`** — one-flag AssumeUTXO download-verify-load (Core: manual `loadtxoutset`).
 - **`-dbcache=auto`** — adaptive cache sizing (Core: static).
 - **satd-only IBD/storage knobs** — `-prefetchworkers`, `-maxahead`, `-storageprofile`, `-maxopenfiles`, the `-rocksdb*` and `-compaction*` family, `-ibdl0pauseat`, and the stall watchdog.
-- **`-par` is a no-op** (accepted for config compatibility).
+- **`-par`** is accepted for config compatibility; it does not size the connect path, but a positive value feeds `-shadowworkers` when that flag is unset.

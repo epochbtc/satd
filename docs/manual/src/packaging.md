@@ -250,8 +250,12 @@ the right moment instead of racing the bind sequence.
 `--reindex-chainstate` on a fully-synced mainnet node runs for hours.
 satd handles this without help from the operator:
 
-- `TimeoutStartSec=infinity` in the unit removes the static budget
-  that would otherwise SIGKILL the unit at 90s.
+- The unit sets a **finite `TimeoutStartSec=3min`** — deliberately not
+  `infinity`. It is large enough for the first heartbeat (at 30s) to land
+  and push the deadline out, and small enough that a pre-heartbeat startup
+  wedge is killed in bounded time. `EXTEND_TIMEOUT_USEC` only works against
+  a finite `TimeoutStartSec`; an infinite startup timeout would let a wedged
+  process hang indefinitely before `READY=1`.
 - Every 30s during the pre-bind phase, satd emits
   `sd_notify(EXTEND_TIMEOUT_USEC=120000000, STATUS=...)`. The
   `EXTEND_TIMEOUT_USEC` resets systemd's internal kill-deadline; the

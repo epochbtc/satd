@@ -19,7 +19,10 @@ the [Terminal UI](tui.md) chapter.
 
 ## Prometheus Metrics Endpoint
 
-*   **Flag:** `--metricsbind=<addr:port>`
+*   **Enable flag:** `--metricsport=<port>` — the metrics/health server starts
+    only when a port is set. `--metricsbind=<addr>` sets the bind address alone
+    (default `127.0.0.1`); it does **not** enable the server on its own. The
+    listener binds `<metricsbind>:<metricsport>`.
 *   Exposes a native Prometheus HTTP server at `GET /metrics` providing deep insights into P2P traffic, block validation times, mempool depth, and RocksDB performance.
 *   Includes `GET /healthz` and `GET /readyz` endpoints for load balancer and orchestrator integration.
 
