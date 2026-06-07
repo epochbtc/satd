@@ -71,6 +71,15 @@ In-progress; full detail tracked in
   amounts emitted with fixed 8 decimals; Esplora coinbase `vin` carries
   `txid`/`vout`/`prevout`; synced node adopts a competing chain from an inbound
   peer.
+- **Config compatibility (drop-in `bitcoin.conf`)** — an existing Bitcoin Core
+  `bitcoin.conf` now drops in and starts satd unedited. Supported flags are
+  honored (semantics pinned to Core v30); recognized-but-unsupported Core v30
+  options are **skipped with a startup warning** (naming the satd equivalent
+  where one exists) instead of aborting; a small set whose silent omission would
+  mislead about security/exposure/privacy (`i2psam`, `rpcwhitelist`, …) stays
+  fatal with guidance; and keys that are neither satd nor known-Core-v30 options
+  are rejected as typos (so a fat-fingered `rpcusser=` can't disable auth).
+  Nothing a config asks for is ever *silently* ignored.
 - **Monitoring** — daemon-side startup/reindex timing on `getstartupinfo`;
   `sat-tui` distinguishes an unreadable RPC cookie from rejected credentials.
 - **Testing / CI** — block-consensus differential matrix (Phase B); live
