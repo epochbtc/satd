@@ -68,13 +68,28 @@ pub struct Warning {
 #[derive(Debug)]
 pub struct NodeWarnings {
     active: Mutex<HashMap<String, Warning>>,
+    /// Optional sink for the Bitcoin Core `-alertnotify` shell hook. When
+    /// set (by the daemon at startup, only if `-alertnotify` is configured),
+    /// a formatted message is sent on the *first* occurrence of each warning
+    /// id — not on repeats, which only bump the count. `None` when no hook
+    /// is configured, so the common path stays a cheap lock + drop.
+    alert_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>,
 }
 
 impl NodeWarnings {
     pub fn new() -> Self {
         Self {
             active: Mutex::new(HashMap::new()),
+            alert_tx: Mutex::new(None),
         }
+    }
+
+    /// Install the `-alertnotify` sink. The daemon calls this once at
+    /// startup when the operator configured `-alertnotify`; the receiving
+    /// task runs the shell command per message. Idempotent (last writer
+    /// wins).
+    pub fn set_alert_notifier(&self, tx: tokio::sync::mpsc::UnboundedSender<String>) {
+        *self.alert_tx.lock() = Some(tx);
     }
 
     /// Record a warning. If `id` is already active, increment count
@@ -88,25 +103,39 @@ impl NodeWarnings {
     ) {
         let now = unix_secs();
         let message: String = message.into();
-        let mut active = self.active.lock();
-        active
-            .entry(id.to_string())
-            .and_modify(|w| {
-                w.severity = severity;
-                w.message = message.clone();
-                w.context = context.clone();
-                w.last_seen_unix_secs = now;
-                w.count += 1;
-            })
-            .or_insert_with(|| Warning {
-                id: id.to_string(),
-                severity,
-                message,
-                first_seen_unix_secs: now,
-                last_seen_unix_secs: now,
-                count: 1,
-                context,
-            });
+        let is_new;
+        {
+            let mut active = self.active.lock();
+            is_new = !active.contains_key(id);
+            active
+                .entry(id.to_string())
+                .and_modify(|w| {
+                    w.severity = severity;
+                    w.message = message.clone();
+                    w.context = context.clone();
+                    w.last_seen_unix_secs = now;
+                    w.count += 1;
+                })
+                .or_insert_with(|| Warning {
+                    id: id.to_string(),
+                    severity,
+                    message: message.clone(),
+                    first_seen_unix_secs: now,
+                    last_seen_unix_secs: now,
+                    count: 1,
+                    context,
+                });
+        }
+        // Fire the `-alertnotify` hook once per new warning id (Core fires on
+        // each `DoWarning`; deduping by id avoids flooding the hook with
+        // identical repeats). The send is non-blocking and best-effort: a
+        // dropped receiver (hook task gone) just no-ops.
+        if is_new {
+            let guard = self.alert_tx.lock();
+            if let Some(tx) = guard.as_ref() {
+                let _ = tx.send(format!("[{}] {}: {}", severity.as_str(), id, message));
+            }
+        }
     }
 
     /// Clear a warning by id. No-op if not present.
@@ -240,5 +269,37 @@ mod tests {
     fn clear_missing_is_noop() {
         let w = NodeWarnings::new();
         w.clear("never.recorded"); // no panic
+    }
+
+    #[test]
+    fn alert_notifier_fires_once_per_new_id() {
+        let w = NodeWarnings::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        w.set_alert_notifier(tx);
+
+        // First occurrence fires; the message carries severity + id + text.
+        w.record("disk.full", Severity::Error, "out of space", json!(null));
+        let msg = rx.try_recv().expect("first record should fire alertnotify");
+        assert!(msg.contains("error"));
+        assert!(msg.contains("disk.full"));
+        assert!(msg.contains("out of space"));
+
+        // Repeats of the same id only bump the count — they do NOT re-fire,
+        // so the hook isn't flooded by an N-times-recorded condition.
+        w.record("disk.full", Severity::Error, "still out of space", json!(null));
+        assert!(rx.try_recv().is_err(), "repeat of same id must not re-fire");
+
+        // A new id fires again.
+        w.record("peer.stall", Severity::Warn, "no progress", json!(null));
+        let msg2 = rx.try_recv().expect("new id should fire");
+        assert!(msg2.contains("peer.stall"));
+    }
+
+    #[test]
+    fn record_without_alert_notifier_is_fine() {
+        // The common path: no -alertnotify configured, no sink installed.
+        let w = NodeWarnings::new();
+        w.record("x.y", Severity::Warn, "z", json!(null));
+        assert_eq!(w.count(), 1);
     }
 }

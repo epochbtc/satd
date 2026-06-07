@@ -335,21 +335,23 @@ Core ZMQ wire-format compatible.)
 | Key | Default | Reload | Compat | Description |
 |---|---|---|---|---|
 | `blocknotify` | none | restart | core | Shell command run on each new best block; `%s` is replaced by the block hash. Commands run serially on a dedicated subscriber task (a slow hook never stalls block connection — notifications coalesce instead). The command body is not logged (it may embed credentials). |
+| `alertnotify` | none | restart | core | Shell command run on each *new* node warning; `%s` is replaced by the warning text. Deduped by warning id (a repeated condition fires once, not per repeat). Runs serially like `blocknotify`. |
+| `startupnotify` | none | restart | core | Shell command run once after the node finishes starting up (no `%s`). Detached — a slow hook doesn't delay the daemon. Prefer a systemd `ExecStartPost=`. |
+| `shutdownnotify` | none | restart | core | Shell command run once at the start of a graceful shutdown, before the final flush (no `%s`). Bounded by `maxshutdownsecs` so a hung hook can't wedge teardown. Prefer a systemd `ExecStopPost=`. |
 | `reorgwebhook` | none | hot | satd | HTTP(S) endpoint receiving a POST on reorg detection. |
 | `reorgwebhooksecret` | none | hot | satd | HMAC-SHA256 secret signing webhook bodies via `X-Satd-Signature`. |
 
-> **Notifications are convenience, not the integration path.** `blocknotify`
-> (and Core's other `*notify` shell hooks — `walletnotify`, `alertnotify`,
-> `startupnotify`, `shutdownnotify`) exist for drop-in Bitcoin Core
-> compatibility and quick scripts. They are best-effort, fire-and-forget shell
-> execs with no delivery guarantee, no replay, and no reorg awareness. **To
-> build on satd, use the [Streaming Consumption API](streaming.md)** (gRPC /
-> WebSocket / ZMQ) — it is reorg-safe, offers durable cursor replay, and is
-> decoupled from consensus. satd implements only `blocknotify` from the shell-
-> hook family; the others are recognized-and-skipped with a pointer to the
-> supported alternative (`walletnotify` → keyless, watch scripts via the
-> streaming/Esplora API; `startup`/`shutdownnotify` → systemd unit hooks). A
-> node started with `blocknotify` logs this guidance at startup.
+> **Notifications are convenience, not the integration path.** The `*notify`
+> shell hooks (`blocknotify`, `alertnotify`, `startupnotify`, `shutdownnotify`)
+> exist for drop-in Bitcoin Core compatibility and quick scripts. They are
+> best-effort, fire-and-forget shell execs with no delivery guarantee, no
+> replay, and no reorg awareness. **To build on satd, use the [Streaming
+> Consumption API](streaming.md)** (gRPC / WebSocket / ZMQ) — it is reorg-safe,
+> offers durable cursor replay, and is decoupled from consensus. For lifecycle
+> actions, prefer your service manager (systemd `ExecStartPost=` /
+> `ExecStopPost=`). satd honors these four hooks; only `walletnotify` is
+> unsupported (satd is keyless — watch scripts via the streaming/Esplora API).
+> A node started with any of these hooks logs this guidance at startup.
 
 ## MCP
 
@@ -396,8 +398,9 @@ e.g.:
 | `peerbloomfilters` | BIP37 unsupported (privacy/DoS); use BIP157/158 (`-blockfilterindex`/`-peerblockfilters`). |
 | `natpmp` | satd doesn't implement PCP/NAT-PMP port mapping; configure port forwarding externally. (`upnp` was removed in Core v29 and is rejected as unknown — same as Core v30.) |
 | `debuglogfile`, `shrinkdebugfile`, `printtoconsole`, `logratelimit` | satd logs to stdout/journald; no `debug.log`. |
+| `logtimemicros` | satd's logger always emits sub-second timestamps; there is no seconds-only mode, so the toggle has no effect. Use `-logtimestamps=0` to drop timestamps entirely. |
 | `maxorphantx` | Removed in Core v30 too. |
-| `wallet`, `walletdir`, … | satd is keyless (no wallet); use external wallets + PSBT. |
+| `wallet`, `walletdir`, `walletnotify`, … | satd is keyless (no wallet); use external wallets + PSBT, and watch scripts via the streaming/Esplora API. |
 | `coinstatsindex`, `loadblock`, `checkblocks`/`checklevel`, `bytespersigop`, `maxsigcachesize`, `blockversion`, `printpriority`, `txreconciliation`, `discover`, `persistmempoolv1`, `acceptstalefeeestimates`, `blocksxor`, `settings`, `daemonwait`, `deprecatedrpc`, `rpcdoccheck`, … | Recognized Core v30 options satd does not implement; skipped (generic warning). |
 
 ### Rejected at load (fail-closed)

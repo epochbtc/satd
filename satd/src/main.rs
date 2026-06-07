@@ -1,6 +1,7 @@
 mod config;
 mod fast_start;
 mod notify;
+mod notifyhooks;
 mod reload;
 
 #[global_allocator]
@@ -899,65 +900,65 @@ async fn main() {
     }
 
     // -blocknotify: run a shell command on each new connected block, with
-    // `%s` replaced by the block hash (Bitcoin Core parity). Commands run
-    // SERIALLY on this dedicated subscriber task — never spawned per block —
-    // mirroring Core, which serializes blocknotify on its scheduler thread.
-    // This matters because `BlockConnected` also fires for every block
-    // replayed during IBD and `-reindex` (thousands/sec from disk); a
-    // detached spawn-per-block would fork-bomb the host. Because this task is
-    // an independent broadcast subscriber, a slow hook only delays subsequent
-    // notifications and, once its ring overflows, coalesces them (the
-    // `Lagged` arm) — it never stalls block connection. An empty/blank
-    // command is treated as unset. Non-zero exits and spawn failures are
-    // logged (without the command body, which may embed credentials).
+    // `%s` replaced by the block hash (Bitcoin Core parity). The dispatcher
+    // runs commands SERIALLY on a dedicated broadcast subscriber — never a
+    // detached spawn-per-block — so an IBD/`-reindex` replay (thousands of
+    // blocks/sec from disk) can't fork-bomb the host. See `notifyhooks` for
+    // the full rationale. An empty/blank command is treated as unset.
     if let Some(cmd_template) = config
         .block_notify
         .clone()
         .filter(|c| !c.trim().is_empty())
     {
-        let mut rx = chain_event_tx.subscribe();
         tracing::warn!(
-            "-blocknotify configured; running a command on each new best block. This shell-hook \
-             notifier is provided for Bitcoin Core convenience/compatibility only — for building \
-             on satd, consume node events via the Streaming Consumption API (gRPC / WebSocket / \
-             ZMQ), which is reorg-safe, replayable, and decoupled from consensus. See the \
-             Streaming Consumption API chapter of the manual."
+            "-blocknotify configured; running a command on each new best block. {}",
+            notifyhooks::STREAMING_API_NOTICE
         );
-        tokio::spawn(async move {
-            loop {
-                match rx.recv().await {
-                    Ok(node::chain::events::ChainEvent::BlockConnected { hash, .. }) => {
-                        let cmd = cmd_template.replace("%s", &hash.to_string());
-                        match tokio::process::Command::new("sh")
-                            .arg("-c")
-                            .arg(&cmd)
-                            .status()
-                            .await
-                        {
-                            Ok(status) if status.success() => {}
-                            Ok(status) => tracing::warn!(
-                                %status,
-                                block = %hash,
-                                "blocknotify command exited non-zero"
-                            ),
-                            Err(e) => tracing::warn!(
-                                error = %e,
-                                block = %hash,
-                                "failed to run blocknotify command"
-                            ),
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!(
-                            skipped = n,
-                            "blocknotify lagged; some block notifications were dropped"
-                        );
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
-                }
-            }
-        });
+        notifyhooks::spawn_block_notifier(chain_event_tx.subscribe(), cmd_template);
+    }
+
+    // -alertnotify: run a shell command whenever the node raises a new
+    // operational warning, with `%s` replaced by the warning text (Bitcoin
+    // Core parity — Core fires this on `DoWarning`). Warnings are deduped by
+    // id in `NodeWarnings`, so the hook fires once per *new* warning, not on
+    // every repeat. Serial dispatch via the same primitive as blocknotify.
+    if let Some(cmd_template) = config
+        .alert_notify
+        .clone()
+        .filter(|c| !c.trim().is_empty())
+    {
+        tracing::warn!(
+            "-alertnotify configured; running a command on each new node warning. {}",
+            notifyhooks::STREAMING_API_NOTICE
+        );
+        let (alert_tx, alert_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        chain_state.warnings().set_alert_notifier(alert_tx);
+        notifyhooks::spawn_alert_notifier(alert_rx, cmd_template);
+    }
+
+    // -startupnotify / -shutdownnotify fire once per process (at ready / at
+    // graceful shutdown — see the call sites below). Warn here at startup so
+    // the operator sees the steer toward the service manager / Streaming API
+    // regardless of when the hook itself runs.
+    if config
+        .startup_notify
+        .as_deref()
+        .is_some_and(|c| !c.trim().is_empty())
+    {
+        tracing::warn!(
+            "-startupnotify configured; running a command once after startup. {}",
+            notifyhooks::LIFECYCLE_NOTICE
+        );
+    }
+    if config
+        .shutdown_notify
+        .as_deref()
+        .is_some_and(|c| !c.trim().is_empty())
+    {
+        tracing::warn!(
+            "-shutdownnotify configured; running a command once at graceful shutdown. {}",
+            notifyhooks::LIFECYCLE_NOTICE
+        );
     }
 
     chain_state.set_chain_event_sender(chain_event_tx);
@@ -2673,6 +2674,20 @@ async fn main() {
     let _ = heartbeat_handle.await;
     notify::notify_ready();
 
+    // -startupnotify: run the operator's startup hook now that all listeners
+    // are bound and the node is up (Bitcoin Core parity — Core fires this at
+    // the end of init). Detached: a slow or hanging hook must not delay the
+    // daemon entering its signal-handling loop.
+    if let Some(cmd) = config
+        .startup_notify
+        .clone()
+        .filter(|c| !c.trim().is_empty())
+    {
+        tokio::spawn(async move {
+            notifyhooks::run_once("startupnotify", &cmd, None).await;
+        });
+    }
+
     // Post-ready watchdog. Reads WATCHDOG_USEC (set by systemd when
     // WatchdogSec= is configured in the unit) and pings WATCHDOG=1 on
     // half the interval. If WATCHDOG_USEC is unset (non-systemd host,
@@ -2768,6 +2783,28 @@ async fn main() {
     // staring at "active" for the full TimeoutStopSec while the flush
     // runs.
     notify::notify_stopping();
+
+    // -shutdownnotify: run the operator's shutdown hook before the blocking
+    // flush (Bitcoin Core runs it at the start of Shutdown()). Bounded by the
+    // shutdown budget so a hanging hook can't wedge teardown — on a systemd
+    // host TimeoutStopSec is a further backstop, but the bound matters for
+    // bare-process operators.
+    if let Some(cmd) = config
+        .shutdown_notify
+        .clone()
+        .filter(|c| !c.trim().is_empty())
+    {
+        let bound = std::time::Duration::from_secs(config.max_shutdown_secs.max(1));
+        if tokio::time::timeout(bound, notifyhooks::run_once("shutdownnotify", &cmd, None))
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                "shutdownnotify command did not finish within the shutdown budget; \
+                 continuing teardown"
+            );
+        }
+    }
 
     // Graceful shutdown — flush UTXO cache before stopping, bounded by
     // --max-shutdown-secs so we actually exit within the deadline no matter
