@@ -112,7 +112,12 @@ In-progress; full detail tracked in
   startup) and `-shutdownnotify` (once at graceful shutdown). These hooks are
   provided for Core compatibility only; each logs a startup warning steering
   integrators to the Streaming Consumption API (the supported, reorg-safe,
-  replayable integration path).
+  replayable integration path). The bare network selectors `testnet=1` /
+  `testnet4=1` / `signet=1` / `regtest=1` in `bitcoin.conf` are now honored as
+  chain selectors (matching Core); previously satd consulted only `chain=` and
+  the CLI flags, silently treating such a config as **mainnet**. Conflicting
+  selectors in a file (e.g. `signet=1` + `testnet4=1`, or `chain=` disagreeing
+  with a bare selector) are now a startup error rather than a silent pick.
 - **Monitoring** — daemon-side startup/reindex timing on `getstartupinfo`;
   `sat-tui` distinguishes an unreadable RPC cookie from rejected credentials.
 - **Testing / CI** — block-consensus differential matrix (Phase B); live

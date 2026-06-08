@@ -92,7 +92,13 @@ semantics track **Bitcoin Core v30**.
 | `testnet` | off | restart | core | Use the testnet network. |
 | `testnet4` | off | restart | core | Use the testnet4 network. |
 | `signet` | off | restart | core | Use the signet network. |
-| `chain` | main | restart | core | Unified network selector: `main`\|`test`\|`signet`\|`regtest`. Alternative to the per-net flags. |
+| `chain` | main | restart | core | Unified network selector: `main`\|`test`\|`signet`\|`regtest`\|`testnet4`. Alternative to the per-net flags. |
+
+The bare selectors (`signet=1`, `testnet4=1`, …) and `chain=` are honored both on
+the command line and in `bitcoin.conf` (Bitcoin Core parity). CLI selectors take
+precedence over the config file. Selecting more than one network — two bare
+selectors, or a `chain=` that disagrees with a bare selector — is a startup
+error rather than a silent pick.
 
 ## Filesystem
 

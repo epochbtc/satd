@@ -1201,13 +1201,18 @@ impl Config {
             None
         };
 
-        // Network resolution. Precedence:
-        //   1. --chain=<name>   (Bitcoin Core's unified selector)
-        //   2. --regtest / --testnet / --signet   (older form, still
-        //      accepted)
-        //   3. config-file `chain=<name>` line
-        //   4. profile defaults
-        //   5. mainnet
+        // Network resolution. Precedence (highest first):
+        //   1. CLI:  --chain=<name>, or --regtest/--testnet/--testnet4/--signet
+        //   2. config file (global scope): chain=<name>, or the bare
+        //      selectors regtest=1 / testnet=1 / testnet4=1 / signet=1
+        //   3. profile defaults
+        //   4. mainnet
+        //
+        // All CLI selectors outrank all config-file selectors. Bitcoin
+        // Core honours the bare `signet=1` / `testnet=1` / `regtest=1` /
+        // `testnet4=1` keys in bitcoin.conf as chain selectors, not just
+        // `chain=`; satd reads them here so a Core drop-in config selects
+        // the right chain instead of silently falling through to mainnet.
         //
         // Refuse to start if --chain conflicts with the older single-
         // network flags: the operator's intent is ambiguous and
@@ -1224,23 +1229,77 @@ impl Config {
             );
         }
         let chain_from_cli = cli.chain.as_deref();
-        // `chain_from_cli` first, then look for `chain=` in the config
-        // file global. The section-keyed lookup is intentionally
-        // skipped here because sections are themselves chain-keyed
-        // — a `chain=` line inside `[main]` would be circular.
-        let chain_from_file: Option<String> = config_file
+        // `chain=` in the config-file global scope. The section-keyed
+        // lookup is intentionally skipped because sections are themselves
+        // chain-keyed — a `chain=` line inside `[main]` would be circular.
+        let chain_from_file_net: Option<Network> = config_file
             .as_ref()
             .and_then(|cf| cf.global.get("chain"))
-            .and_then(|v: &Vec<String>| v.last().cloned());
-        let network = if let Some(name) = chain_from_cli.or(chain_from_file.as_deref()) {
+            .and_then(|v: &Vec<String>| v.last())
+            .map(|name| parse_chain_name(name))
+            .transpose()?;
+        // Bare network selectors in the config-file global scope, matching
+        // Bitcoin Core. Only a true value (`1`/`true`/`yes`) selects; a
+        // false value (e.g. `regtest=0`) is treated as "not selected".
+        let file_select = |key: &str| -> bool {
+            config_file
+                .as_ref()
+                .and_then(|cf| cf.global.get(key))
+                .and_then(|v| v.last())
+                .and_then(|v| parse_bool(v))
+                .unwrap_or(false)
+        };
+        let mut file_bool_net: Option<Network> = None;
+        for (selected, net) in [
+            (file_select("regtest"), Network::Regtest),
+            (file_select("testnet"), Network::Testnet),
+            (file_select("testnet4"), Network::Testnet4),
+            (file_select("signet"), Network::Signet),
+        ] {
+            if selected {
+                match file_bool_net {
+                    Some(prev) if prev != net => {
+                        return Err(
+                            "config file selects more than one network — set only one of \
+                             regtest/testnet/testnet4/signet (or use chain=)"
+                                .to_string(),
+                        );
+                    }
+                    _ => file_bool_net = Some(net),
+                }
+            }
+        }
+        // A file that sets both `chain=` and a conflicting bare selector is
+        // ambiguous — reject rather than silently honour one.
+        if let (Some(cn), Some(bn)) = (chain_from_file_net, file_bool_net)
+            && cn != bn
+        {
+            return Err(
+                "config file sets both chain= and a conflicting network selector — set only one"
+                    .to_string(),
+            );
+        }
+        // Precedence: CLI --chain > CLI per-net flags > config-file selectors
+        // (chain= or bare) > profile defaults > mainnet. The config-file
+        // selectors must sit ABOVE the profile defaults so an explicit
+        // `chain=`/`signet=1` in the file overrides a network-setting profile
+        // (matching "explicit settings override the profile"); they sit BELOW
+        // the CLI flags so the command line still wins over the file.
+        let network = if let Some(name) = chain_from_cli {
             parse_chain_name(name)?
-        } else if cli.regtest == Some(true) || profile_defaults.network_regtest {
+        } else if cli.regtest == Some(true) {
             Network::Regtest
         } else if cli.testnet == Some(true) {
             Network::Testnet
         } else if cli.testnet4 == Some(true) {
             Network::Testnet4
-        } else if cli.signet == Some(true) || profile_defaults.network_signet {
+        } else if cli.signet == Some(true) {
+            Network::Signet
+        } else if let Some(net) = chain_from_file_net.or(file_bool_net) {
+            net
+        } else if profile_defaults.network_regtest {
+            Network::Regtest
+        } else if profile_defaults.network_signet {
             Network::Signet
         } else {
             Network::Bitcoin
@@ -8536,6 +8595,130 @@ rpcport=39999
     #[test]
     fn parse_chain_name_accepts_testnet4() {
         assert_eq!(parse_chain_name("testnet4").unwrap(), Network::Testnet4);
+    }
+
+    // ---- bare network selectors in bitcoin.conf (Core drop-in compat) ----
+
+    /// Resolve the active network from a config-file body with NO CLI
+    /// network selector (datadir + --conf only). Returns the resolved
+    /// network or the load error.
+    fn network_from_conf(body: &str) -> Result<Network, String> {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let conf_path = tmpdir.path().join("bitcoin.conf");
+        std::fs::write(&conf_path, body).unwrap();
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--datadir",
+            tmpdir.path().to_str().unwrap(),
+            "--conf",
+            conf_path.to_str().unwrap(),
+        ])
+        .unwrap();
+        Config::from_cli(cli).map(|c| c.network)
+    }
+
+    #[test]
+    fn config_file_signet_selector_selects_signet() {
+        // Core honours `signet=1` in bitcoin.conf; before this fix satd
+        // silently treated it as mainnet.
+        assert_eq!(network_from_conf("signet=1\n").unwrap(), Network::Signet);
+    }
+
+    #[test]
+    fn config_file_testnet4_selector_selects_testnet4() {
+        assert_eq!(network_from_conf("testnet4=1\n").unwrap(), Network::Testnet4);
+    }
+
+    #[test]
+    fn config_file_testnet_selector_selects_testnet() {
+        assert_eq!(network_from_conf("testnet=1\n").unwrap(), Network::Testnet);
+    }
+
+    #[test]
+    fn config_file_regtest_selector_selects_regtest() {
+        assert_eq!(network_from_conf("regtest=1\n").unwrap(), Network::Regtest);
+    }
+
+    #[test]
+    fn config_file_false_selector_resolves_to_mainnet() {
+        // An explicit `signet=0` selects nothing → mainnet.
+        assert_eq!(network_from_conf("signet=0\n").unwrap(), Network::Bitcoin);
+    }
+
+    #[test]
+    fn config_file_conflicting_bare_selectors_error() {
+        let err = network_from_conf("signet=1\ntestnet4=1\n").unwrap_err();
+        assert!(err.contains("more than one network"), "got: {err}");
+    }
+
+    #[test]
+    fn config_file_chain_and_conflicting_selector_error() {
+        let err = network_from_conf("chain=signet\ntestnet4=1\n").unwrap_err();
+        assert!(
+            err.contains("conflicting network selector"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn config_file_chain_and_matching_selector_ok() {
+        // chain= and a bare selector that agree are not a conflict.
+        assert_eq!(
+            network_from_conf("chain=signet\nsignet=1\n").unwrap(),
+            Network::Signet
+        );
+    }
+
+    #[test]
+    fn cli_selector_overrides_config_file_bare_selector() {
+        // File selects signet, CLI passes --regtest → CLI wins.
+        let tmpdir = tempfile::tempdir().unwrap();
+        let conf_path = tmpdir.path().join("bitcoin.conf");
+        std::fs::write(&conf_path, "signet=1\n").unwrap();
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir",
+            tmpdir.path().to_str().unwrap(),
+            "--conf",
+            conf_path.to_str().unwrap(),
+        ])
+        .unwrap();
+        assert_eq!(Config::from_cli(cli).unwrap().network, Network::Regtest);
+    }
+
+    #[test]
+    fn config_file_selector_overrides_network_setting_profile() {
+        // Regression guard: an explicit file selector must beat a profile that
+        // sets a default network (explicit settings override the profile).
+        // `regtest-dev` sets network_regtest=true; the file says signet → signet.
+        let tmpdir = tempfile::tempdir().unwrap();
+        let conf_path = tmpdir.path().join("bitcoin.conf");
+        std::fs::write(&conf_path, "chain=signet\n").unwrap();
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--profile=regtest-dev",
+            "--datadir",
+            tmpdir.path().to_str().unwrap(),
+            "--conf",
+            conf_path.to_str().unwrap(),
+        ])
+        .unwrap();
+        assert_eq!(Config::from_cli(cli).unwrap().network, Network::Signet);
+    }
+
+    #[test]
+    fn network_setting_profile_still_applies_with_no_selector() {
+        // Without any CLI/file selector, the profile's default network applies.
+        let tmpdir = tempfile::tempdir().unwrap();
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--profile=regtest-dev",
+            "--datadir",
+            tmpdir.path().to_str().unwrap(),
+        ])
+        .unwrap();
+        assert_eq!(Config::from_cli(cli).unwrap().network, Network::Regtest);
     }
 
     // ---- forcednsseed / fixedseeds ----
