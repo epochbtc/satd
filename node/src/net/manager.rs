@@ -3393,25 +3393,16 @@ impl PeerManager {
                             // chain) and runs ActivateBestChain — exactly what
                             // a restart would do, without the restart.
                             if chain_state.best_header_beats_active_tip() {
+                                // Log (for diagnostics) but do NOT record a
+                                // persistent node-warning: this is a self-healing
+                                // transition, not an unresolved operator issue,
+                                // so it must not linger in the active-warnings
+                                // panel after the reorg succeeds.
                                 tracing::warn!(
                                     height = next_height, %hash,
                                     "IBD connector stalled on a competing higher-work chain \
                                      ({e}); exiting IBD so the steady-state reorg path can pull \
                                      the fork and reorg"
-                                );
-                                chain_state.warnings().record(
-                                    "connect.fork_handoff",
-                                    crate::warnings::Severity::Warn,
-                                    format!(
-                                        "block {next_height} ({hash}) at the connect frontier \
-                                         builds on a competing higher-work chain; handing off to \
-                                         the steady-state reorg path: {e}"
-                                    ),
-                                    serde_json::json!({
-                                        "height": next_height,
-                                        "hash": hash.to_string(),
-                                        "error": e.to_string(),
-                                    }),
                                 );
                                 // Resolve the retry warning — we are now
                                 // handling this via the reorg path, not looping.
