@@ -27,6 +27,17 @@ In-progress; full detail tracked in
   acceptance and block storage now only touch the index above the active tip.
   New `-checkblockindex` flag (default on for regtest/CI) runs a structural
   block-index audit at startup and after a reindex; fail-closed.
+- **Reliability (sync)** — fixed a wedge where a competing same-height fork at
+  the IBD connect frontier looped forever on `bad-prevblk`. The height-indexed
+  download scheduler counted that height as "stored" (so never fetched the
+  competing parent block) yet stayed active, which suppressed the steady-state
+  fork-aware block pull. Now the linear scheduler is not (re)created while the
+  connect frontier is fork-blocked (`frontier_connects_to_tip`) — the
+  reorg-capable steady-state path moves the tip onto the better chain first,
+  then bulk IBD resumes (self-correcting at any fork depth). An already-running
+  wedge is broken too: a persistent `bad-prevblk` (specifically) with a
+  higher-work competing chain tears down the stalled scheduler and hands off to
+  the steady-state reorg path. Non-`bad-prevblk` failures stay fail-closed.
 - **TUI / logging** — the daemon startup log now reports the real build version
   (from the crate version) instead of a hardcoded `v0.1.0`. The `sat-tui` header
   shows **both** the connected daemon's version (from `getnetworkinfo`) and the

@@ -2346,7 +2346,17 @@ impl PeerManager {
             let headers_tip = htip as u32;
             {
                 let mut ibd = self.ibd.write();
-                if ibd.is_none() && headers_tip > tip + 24 {
+                // Don't (re)create the linear IBD scheduler while the connect
+                // frontier is fork-blocked — it can't reorg and would re-wedge
+                // on `bad-prevblk` (and, for a deep competing reorg arriving
+                // mid-IBD, oscillate teardown↔re-create forever). Leave the
+                // reorg-capable steady-state path to move the tip onto the
+                // better chain first; once it does, the frontier links to the
+                // new tip and bulk IBD resumes on the next headers batch.
+                if ibd.is_none()
+                    && headers_tip > tip + 24
+                    && self.chain_state.frontier_connects_to_tip()
+                {
                     let effective_max_ahead = Self::resolve_max_ahead(self.max_ahead, headers_tip, tip);
                     let sched = IbdScheduler::new(headers_tip, tip, &self.chain_state, effective_max_ahead);
                     let (_, _, pending, target) = sched.progress();
@@ -3380,6 +3390,44 @@ impl PeerManager {
                     Err(e) => {
                         retry_count += 1;
                         if retry_count >= 30 {
+                            // The block at tip+1 can't connect because its
+                            // parent isn't the active tip. If a competing
+                            // higher-work header chain exists, this is a reorg
+                            // the linear IBD connector cannot perform: it keeps
+                            // requesting `tip+1` (a block on the other branch)
+                            // while the height-indexed scheduler reports itself
+                            // complete and never fetches the missing fork
+                            // block. Tear down the stalled scheduler and hand
+                            // off to the reorg-capable steady-state path, which
+                            // pulls the fork (missing_blocks_for_best_header_
+                            // chain) and runs ActivateBestChain — exactly what
+                            // a restart would do, without the restart.
+                            if matches!(e, crate::chain::state::ChainError::BadPrevBlock)
+                                && chain_state.best_header_beats_active_tip()
+                            {
+                                // Gate on BadPrevBlock specifically: best_header_
+                                // beats_active_tip() is true for ~all of IBD, so
+                                // without the variant check ANY persistent connect
+                                // error (invalid block, I/O fault) would be masked
+                                // as a fork-handoff instead of failing closed.
+                                //
+                                // Log (for diagnostics) but do NOT record a
+                                // persistent node-warning: this is a self-healing
+                                // transition, not an unresolved operator issue,
+                                // so it must not linger in the active-warnings
+                                // panel after the reorg succeeds.
+                                tracing::warn!(
+                                    height = next_height, %hash,
+                                    "IBD connector stalled on a competing higher-work chain \
+                                     ({e}); exiting IBD so the steady-state reorg path can pull \
+                                     the fork and reorg"
+                                );
+                                // Resolve the retry warning — we are now
+                                // handling this via the reorg path, not looping.
+                                chain_state.warnings().clear("connect.retry");
+                                *ibd.write() = None;
+                                break;
+                            }
                             tracing::error!(
                                 height = next_height, %hash, retries = retry_count,
                                 "Persistent connect failure, giving up: {}", e
