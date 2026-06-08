@@ -27,9 +27,11 @@ In-progress; full detail tracked in
   acceptance and block storage now only touch the index above the active tip.
   New `-checkblockindex` flag (default on for regtest/CI) runs a structural
   block-index audit at startup and after a reindex; fail-closed.
-- **TUI / logging** — the `sat-tui` header and the daemon startup log now report
-  the real build version (from the crate version) instead of a hardcoded
-  `v0.1.0`, so they stay in lockstep with `satd --version`.
+- **TUI / logging** — the daemon startup log now reports the real build version
+  (from the crate version) instead of a hardcoded `v0.1.0`. The `sat-tui` header
+  shows **both** the connected daemon's version (from `getnetworkinfo`) and the
+  TUI binary's own version (`srv vX · tui vY`), so a version mismatch between
+  client and node is visible at a glance.
 - **RPC** — `invalidateblock` / `reconsiderblock` implemented (crash-safe,
   AssumeUTXO-aware); `getblock` serves invalidated blocks.
 - **P2P observability & control** — un-stubbed the peer activity counters:

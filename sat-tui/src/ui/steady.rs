@@ -47,7 +47,7 @@ pub fn draw(f: &mut Frame, state: &AppState) {
         ),
         Span::styled(dot_glyph, Style::default().fg(dot_color).add_modifier(Modifier::BOLD)),
         Span::styled(format!("{} ", health_label), Style::default().fg(dot_color)),
-        Span::styled(crate::ui::VERSION_TAG, Style::default().fg(Color::DarkGray)),
+        Span::styled(state.version_line(), Style::default().fg(Color::DarkGray)),
         Span::styled(uptime_str, Style::default().fg(Color::DarkGray)),
     ]);
     f.render_widget(Paragraph::new(title), chunks[0]);

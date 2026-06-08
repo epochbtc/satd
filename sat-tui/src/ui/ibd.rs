@@ -30,7 +30,7 @@ pub fn draw(f: &mut Frame, state: &AppState) {
             format!(" {} ", state.chain_name),
             Style::default().fg(Color::White),
         ),
-        Span::styled(crate::ui::VERSION_TAG, Style::default().fg(Color::DarkGray)),
+        Span::styled(state.version_line(), Style::default().fg(Color::DarkGray)),
     ]);
     f.render_widget(Paragraph::new(title), chunks[0]);
 

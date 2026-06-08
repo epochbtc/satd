@@ -13,12 +13,6 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Row, Table, Cell};
 use ratatui::layout::Constraint;
 
-/// Version tag shown in the TUI header. Sourced from the crate version at
-/// compile time so it stays in lockstep with the satd daemon — both `sat-tui`
-/// and `satd` inherit the workspace `version`, so this never drifts from
-/// `satd --version` again (it was previously hardcoded to `v0.1.0`).
-pub const VERSION_TAG: &str = concat!(" v", env!("CARGO_PKG_VERSION"), " ");
-
 /// Format bytes as human-readable (e.g., "1.23 MB").
 pub fn format_bytes(n: u64) -> String {
     if n < 1_024 {
