@@ -3343,6 +3343,36 @@ impl ChainState {
     /// durable. Headers past the target are still scanned in phase 1
     /// (the BFS needs the full parent→children map to build chain
     /// order correctly), but no further blocks are connected.
+    /// Deepest block height reachable from `genesis` through the `children`
+    /// adjacency map (`prev_hash → child hashes`) built by the phase-1 flat-file
+    /// scan. This is the true connect target for a from-genesis reindex: the
+    /// phase-1 record count includes duplicate copies (collapsed by hash before
+    /// this map is built) and orphan blocks whose parents are absent — neither
+    /// is reachable from genesis, so neither inflates the result. The walk is an
+    /// iterative DFS because a mainnet chain is ~1M blocks deep and recursion
+    /// would overflow the stack.
+    fn reachable_tip_height(
+        children: &std::collections::HashMap<BlockHash, Vec<BlockHash>>,
+        genesis: BlockHash,
+    ) -> u32 {
+        let mut max_height: u32 = 0;
+        let mut stack: Vec<(BlockHash, u32)> = Vec::new();
+        if let Some(child_hashes) = children.get(&genesis) {
+            for h in child_hashes {
+                stack.push((*h, 1));
+            }
+        }
+        while let Some((hash, height)) = stack.pop() {
+            max_height = max_height.max(height);
+            if let Some(child_hashes) = children.get(&hash) {
+                for h in child_hashes {
+                    stack.push((*h, height + 1));
+                }
+            }
+        }
+        max_height
+    }
+
     pub fn reindex_from_flat_files(
         &self,
         stop_at: Option<u32>,
@@ -3403,9 +3433,25 @@ impl ChainState {
         tracing::info!(scanned, "Phase 1: indexed block headers from flat files");
 
         // Phase 2: BFS from genesis, fetch each block from disk and connect.
+        let genesis_hash = bitcoin::constants::genesis_block(self.network).block_hash();
+
+        // The Phase-1 scan counts every physical block record on disk. On a node
+        // whose flat files accumulated duplicate or orphaned (non-genesis-
+        // reachable) records, that count can substantially exceed the real chain
+        // height — and using it as the connect target makes the progress bar top
+        // out early (it can never reach 100%) and the ETA project to a height
+        // that will never be connected. Derive the true target from the block
+        // tree instead: the deepest block reachable from genesis is the tip
+        // Phase 2 will actually connect to.
+        let connect_target_height = Self::reachable_tip_height(&children, genesis_hash);
+        // `-stopatheight` caps the connect target when it lands below the tip.
+        let target_height = stop_at
+            .map(|h| h.min(connect_target_height))
+            .unwrap_or(connect_target_height);
+
         if let Some(p) = &progress {
             p.set_phase("reindex_connect", "Replaying blocks (phase 2/2)");
-            p.set_total(total);
+            p.set_total(target_height as u64);
             p.set_stop_height(stop_at.map(|h| h as u64));
             // Switch the ETA into driver-controlled mode up front so the
             // generic linear estimate never briefly shows a bogus tiny ETA
@@ -3414,15 +3460,12 @@ impl ChainState {
             p.set_eta(None);
         }
         // Weight-aware ETA over the heavy connect phase (reused from IBD). The
-        // block count scanned in phase 1 is a close proxy for the final tip
-        // height of a from-genesis reindex; precision at 1000-block weight
-        // granularity isn't critical.
-        let target_height = stop_at.unwrap_or(total as u32);
+        // connect target is the true genesis-reachable tip height (not the raw
+        // phase-1 record count), so the estimate converges on the real finish.
         let mut eta_est =
             crate::ibd_eta::IbdEtaEstimator::new(0, target_height, self.network == Network::Bitcoin);
         let mut interval_start = std::time::Instant::now();
         let mut last_interval: u32 = 0;
-        let genesis_hash = bitcoin::constants::genesis_block(self.network).block_hash();
         let mut queue: VecDeque<BlockHash> = VecDeque::new();
         if let Some(child_hashes) = children.get(&genesis_hash) {
             for h in child_hashes {
@@ -8903,6 +8946,62 @@ pub(crate) mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression for the reindex ETA/progress miscalibration: the connect
+    /// target must be the real genesis-reachable tip height, not the phase-1
+    /// record count. On a node whose flat files accumulated duplicate/orphan
+    /// block records (e.g. competing forks downloaded during a sync wedge),
+    /// the record count overshoots the chain tip — which made the progress bar
+    /// top out below 100% and the ETA project past the real finish.
+    /// `reachable_tip_height` excludes anything not descending from genesis.
+    #[test]
+    fn reachable_tip_height_ignores_orphans_and_short_forks() {
+        use std::collections::HashMap;
+        let h = |n: u8| {
+            BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([n; 32]))
+        };
+        let genesis = h(0);
+        let (a, b, c, d, e) = (h(1), h(2), h(3), h(4), h(5));
+        // Orphan strand not reachable from genesis (its root is nobody's child).
+        let (orphan_root, x, y) = (h(100), h(101), h(102));
+
+        let mut children: HashMap<BlockHash, Vec<BlockHash>> = HashMap::new();
+        // Main chain: genesis -> a -> b -> c -> d  (tip height 4)
+        children.insert(genesis, vec![a]);
+        children.insert(a, vec![b]);
+        // Fork at b: c continues the main chain, e is a shorter side branch.
+        children.insert(b, vec![c, e]);
+        children.insert(c, vec![d]);
+        // d and e are leaves. Orphan strand: orphan_root -> x -> y.
+        children.insert(orphan_root, vec![x]);
+        children.insert(x, vec![y]);
+
+        // The real tip is d at height 4; the side fork (e, height 3) and the
+        // orphan strand (x, y) must not raise the target.
+        assert_eq!(
+            ChainState::reachable_tip_height(&children, genesis),
+            4,
+            "connect target must be the deepest genesis-reachable block"
+        );
+
+        // The raw record count (a,b,c,d,e,x,y = 7 distinct blocks) is strictly
+        // larger than the real tip — exactly the over-count the fix removes.
+        assert!(
+            7 > ChainState::reachable_tip_height(&children, genesis),
+            "test must exercise the case where record count exceeds the tip"
+        );
+    }
+
+    /// Degenerate input: a children map with no genesis entry (genesis-only
+    /// datadir, or genesis missing from the scan) yields height 0, no panic.
+    #[test]
+    fn reachable_tip_height_handles_genesis_only() {
+        use std::collections::HashMap;
+        let genesis =
+            BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0u8; 32]));
+        let children: HashMap<BlockHash, Vec<BlockHash>> = HashMap::new();
+        assert_eq!(ChainState::reachable_tip_height(&children, genesis), 0);
     }
 
     /// `max_indexed_height` is the helper that powers reindex progress
