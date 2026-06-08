@@ -27,6 +27,11 @@ In-progress; full detail tracked in
   acceptance and block storage now only touch the index above the active tip.
   New `-checkblockindex` flag (default on for regtest/CI) runs a structural
   block-index audit at startup and after a reindex; fail-closed.
+- **Reliability (reindex UX)** — fixed `--reindex` progress and ETA on nodes
+  whose block files hold duplicate/orphan records (e.g. competing forks stored
+  during a sync wedge): the connect target is now the real genesis-reachable
+  tip height rather than the raw on-disk record count, so the progress bar
+  reaches 100% and the ETA no longer projects past the true finish.
 - **Reliability (sync)** — fixed a wedge where a competing same-height fork at
   the IBD connect frontier looped forever on `bad-prevblk`. The height-indexed
   download scheduler counted that height as "stored" (so never fetched the
