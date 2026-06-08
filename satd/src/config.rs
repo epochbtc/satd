@@ -1279,18 +1279,28 @@ impl Config {
                     .to_string(),
             );
         }
+        // Precedence: CLI --chain > CLI per-net flags > config-file selectors
+        // (chain= or bare) > profile defaults > mainnet. The config-file
+        // selectors must sit ABOVE the profile defaults so an explicit
+        // `chain=`/`signet=1` in the file overrides a network-setting profile
+        // (matching "explicit settings override the profile"); they sit BELOW
+        // the CLI flags so the command line still wins over the file.
         let network = if let Some(name) = chain_from_cli {
             parse_chain_name(name)?
-        } else if cli.regtest == Some(true) || profile_defaults.network_regtest {
+        } else if cli.regtest == Some(true) {
             Network::Regtest
         } else if cli.testnet == Some(true) {
             Network::Testnet
         } else if cli.testnet4 == Some(true) {
             Network::Testnet4
-        } else if cli.signet == Some(true) || profile_defaults.network_signet {
+        } else if cli.signet == Some(true) {
             Network::Signet
         } else if let Some(net) = chain_from_file_net.or(file_bool_net) {
             net
+        } else if profile_defaults.network_regtest {
+            Network::Regtest
+        } else if profile_defaults.network_signet {
+            Network::Signet
         } else {
             Network::Bitcoin
         };
@@ -8672,6 +8682,40 @@ rpcport=39999
             tmpdir.path().to_str().unwrap(),
             "--conf",
             conf_path.to_str().unwrap(),
+        ])
+        .unwrap();
+        assert_eq!(Config::from_cli(cli).unwrap().network, Network::Regtest);
+    }
+
+    #[test]
+    fn config_file_selector_overrides_network_setting_profile() {
+        // Regression guard: an explicit file selector must beat a profile that
+        // sets a default network (explicit settings override the profile).
+        // `regtest-dev` sets network_regtest=true; the file says signet → signet.
+        let tmpdir = tempfile::tempdir().unwrap();
+        let conf_path = tmpdir.path().join("bitcoin.conf");
+        std::fs::write(&conf_path, "chain=signet\n").unwrap();
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--profile=regtest-dev",
+            "--datadir",
+            tmpdir.path().to_str().unwrap(),
+            "--conf",
+            conf_path.to_str().unwrap(),
+        ])
+        .unwrap();
+        assert_eq!(Config::from_cli(cli).unwrap().network, Network::Signet);
+    }
+
+    #[test]
+    fn network_setting_profile_still_applies_with_no_selector() {
+        // Without any CLI/file selector, the profile's default network applies.
+        let tmpdir = tempfile::tempdir().unwrap();
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--profile=regtest-dev",
+            "--datadir",
+            tmpdir.path().to_str().unwrap(),
         ])
         .unwrap();
         assert_eq!(Config::from_cli(cli).unwrap().network, Network::Regtest);
