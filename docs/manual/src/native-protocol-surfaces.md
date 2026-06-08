@@ -23,21 +23,28 @@ satd's chainstate, not a separate process maintaining a parallel index**.
 ## Why native + shared chainstate, not bundled electrs
 
 A bundled-electrs companion solves install-friction but inherits the
-architectural costs of the two-process world: a duplicate RocksDB
-address-history index (~30-80 GB on a Pi at mainnet tip), parallel block
-re-scanning, and a reorg-window race where the Electrum view lags the
-chainstate. None of those go away by vendoring `electrs` alongside `satd`.
+architectural costs of the two-process world: a *second copy* of the
+address-history data living in its own database, parallel block re-scanning to
+build it, and a reorg-window race where the Electrum view lags the chainstate.
+None of those go away by vendoring `electrs` alongside `satd`.
 
 Native + shared chainstate gives:
 
 - **One RocksDB instance.** Same WAL, same crash recovery, same backup target.
-- **No duplicate scriptPubKey scanning.** The address-history index is updated inside the existing `connect_block` / `disconnect_block` loop.
+- **No duplicate scriptPubKey scanning.** The address-history index is updated inside the existing `connect_block` / `disconnect_block` loop — no second pass over the blocks to build a parallel database.
 - **Atomic reorg consistency.** The index update lives in the same `WriteBatch` as the chainstate update, so protocol handlers can never observe an index out of sync with the tip.
-- **Sub-millisecond index lookups.** Function calls, not RPC.
+- **Sub-millisecond, O(1) index lookups.** Address history, outpoint-spend, and txid lookups are direct keyed reads on fixed-width keys — function calls, not RPC, and not range scans over a derived view.
 - **Native TLS.** No need to configure or bundle reverse proxy sidecars like nginx just to terminate TLS for these protocol servers.
 
 That's the architectural claim worth making in the announcement. A
 bundled-electrs approach can't earn it.
+
+Because one node serves Electrum *and* Esplora *and* `getrawtransaction` *and*
+BIP 158 from a single store, satd's *aggregate* index is **larger** on disk than
+any one external indexer — and larger than `bitcoind + txindex + electrs` summed.
+That disk buys a tip-consistent, single-process, single-backup deployment. The
+full byte-level accounting — what each column family stores, why, and what query
+it powers — is in [Disk Footprint & Indices](disk-footprint.md).
 
 ## Why a single binary, not separate companion binaries (for v1)
 

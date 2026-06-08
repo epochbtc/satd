@@ -81,7 +81,7 @@ artifacts, signing stack) but no protocol consequences.
 |---|---|---|
 | **Implementation language** | C++ | Rust (edition 2024) |
 | **Script verification** | `libbitcoinconsensus` (C++) | `bitcoinconsensus` FFI primary + native Rust verifier as parity-validated shadow |
-| **Storage backend** | LevelDB (chainstate, indexes) + flat block files | RocksDB (chainstate + all indexes, single instance, zstd + lz4) + flat block files; jemalloc allocator |
+| **Storage backend** | LevelDB (chainstate, indices) + flat block files | RocksDB (chainstate + all indices, single instance, zstd + lz4) + flat block files; jemalloc allocator |
 | **Async runtime** | `boost::asio` + `std::thread` mix | `tokio` for all I/O |
 | **JSON-RPC server** | bespoke HTTP / SSL stack | `jsonrpsee` over `tower` middleware (with native TLS support) |
 | **Reproducible builds** | Guix | Nix flake (Guix may follow if a downstream packager needs it) |
@@ -97,7 +97,7 @@ rebuilds its address set from DNS seeds / `-seednode`. Operators
 migrating a datadir should let satd regenerate `peers.dat` rather than
 expect Core's peer set to carry over.
 
-**Why one RocksDB instance.** Core uses LevelDB and bundles indexes
+**Why one RocksDB instance.** Core uses LevelDB and bundles indices
 (`-txindex`, `-blockfilterindex`, `-coinstatsindex`) as separate
 LevelDB databases. satd uses one RocksDB with multiple column families
 (`block_index`, `coins`, `tx_index`, `addr_funding_v2`,
@@ -106,8 +106,15 @@ LevelDB databases. satd uses one RocksDB with multiple column families
 `WriteBatch` as the connect-block / disconnect-block path, so
 protocol handlers cannot observe an index out of sync with the tip.
 This is the architectural foundation for native Esplora and Electrum
-without the duplicate-index, parallel-rescan, reorg-race costs of the
-`bitcoind + electrs` two-process world.
+without the second-copy, parallel-rescan, reorg-race costs of the
+`bitcoind + electrs` two-process world. A fully-indexed satd
+(`-txindex -addressindex -blockfilterindex`) uses more disk in aggregate
+than `bitcoind + electrs + esplora` summed, because one store serves all
+those surfaces and materializes the spend graph in both directions; the
+trade is disk for tip-consistent, single-process operation. The byte-level
+accounting and the trade-offs are documented in the Operator Manual's
+[Disk Footprint & Indices](https://epochbtc.github.io/satd/disk-footprint.html)
+chapter.
 
 ---
 
@@ -322,7 +329,7 @@ preserved; the satd extension is opt-in per request or per flag.
   and relay policy (`-minrelaytxfee`/`-maxmempool`/`-dustrelayfee`/`-datacarrier(size)`/`-mempoolfullrbf`/`-limit{ancestor,descendant}count`/`-mempoolexpiry`/`-permitbaremultisig`),
   and the peer-limit knobs (`-maxconnections`/`-maxinboundperip`/`-bantime`).
   Settings wired into long-lived state at startup (network, datadir, ports,
-  binds, `-dbcache`, indexes, TLS, seeds, Tor) are reported in the log as
+  binds, `-dbcache`, indices, TLS, seeds, Tor) are reported in the log as
   "restart required" and never silently ignored. A reload that fails to parse
   (e.g. a typo, which is rejected at load) is logged and the running config is
   kept — the daemon never crashes on a bad reload. The
@@ -429,7 +436,7 @@ to see which lines had no effect. The intended migration is:
 3. Start satd with the same `bitcoin.conf`. `-reindex-chainstate`
    replays the flat files into the RocksDB chainstate.
 4. Optional: `backfillindex address` and `backfillindex blockfilter` to
-   populate the satd-specific indexes from disk.
+   populate the satd-specific indices from disk.
 
 Backfills run concurrently with live block validation, so the node
 serves correctly with partial history while they progress. End-to-end

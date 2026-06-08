@@ -17,13 +17,16 @@ contract.
 service — JSON-RPC, Esplora, Electrum, BIP 157/158 filters, the streaming APIs,
 MCP — is a query layer over the **same RocksDB and chainstate the node itself
 uses**, updated atomically inside block connection. There is no second process
-and no duplicate index: running satd is *not* `bitcoind` + `electrs` + an Esplora
-indexer + exporters glued together, but a single daemon where all surfaces share
-the node's storage. This eliminates the duplicate-index disk cost (an external
-address index alone is 30–180 GB at mainnet tip), the parallel block re-scan, and
-the reorg-window race where an external indexer's view lags the node. The
-trade-off — that you scale out by running more nodes rather than more index
-processes — is covered in [API Scaling & Runtimes](api-scaling.md).
+and no second copy of the data: running satd is *not* `bitcoind` + `electrs` + an
+Esplora indexer + exporters glued together, but a single daemon where all surfaces
+share the node's storage. This eliminates the parallel block re-scan and the
+reorg-window race where an external indexer's view lags the node, so every surface
+reads a single, tip-consistent store. Serving Electrum, Esplora,
+`getrawtransaction`, and BIP 158 from one node means satd's *aggregate* on-disk
+index is **larger** than a standalone external index — you trade disk for
+consistency and single-process operation. See [Disk Footprint &
+Indices](disk-footprint.md) for the byte-level accounting, and [API Scaling &
+Runtimes](api-scaling.md) for the scale-out trade-off.
 
 ## How this manual is organized
 
