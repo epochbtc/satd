@@ -8,11 +8,13 @@ within the endpoint set listed below.
 
 Like the Electrum server, it is a **query layer over satd's own chainstate and
 shared address-history index** — not a separate indexer process (electrs /
-esplora-electrs / Fulcrum) maintaining a parallel 30–180 GB index. One RocksDB,
-updated atomically inside the node's `connect_block` / `disconnect_block` path,
-backs the node and every API surface, so a read can never observe an index out of
-sync with the tip. See [Native Protocol Architecture](native-protocol-surfaces.md)
-for the rationale.
+esplora-electrs / Fulcrum) running beside the node with its own copy of the data.
+One RocksDB, updated atomically inside the node's `connect_block` /
+`disconnect_block` path, backs the node and every API surface, so a read can never
+observe an index out of sync with the tip. satd's combined index is larger on disk
+than a standalone electrs/Fulcrum index — the trade is disk for consistency and
+single-process operation; see [Disk Footprint & Indices](disk-footprint.md). See
+[Native Protocol Architecture](native-protocol-surfaces.md) for the rationale.
 
 This document covers what's implemented today. The implementation lives
 in the `esplora-handlers/` workspace crate; routes are registered in
