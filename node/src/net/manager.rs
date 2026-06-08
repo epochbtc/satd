@@ -56,6 +56,14 @@ const MAX_ONION_DIALS_PER_TICK: usize = 16;
 /// resolved by the getheaders we send back) stays far under [`BAN_THRESHOLD`],
 /// but a peer streaming endless unconnectable headers still accrues to a ban.
 const UNCONNECTING_HEADERS_BAN_SCORE: u32 = 1;
+/// Ban score charged when a peer relays a *consensus-invalid* transaction (bad
+/// script/signature, or outputs exceeding inputs). Mirrors the `block rejected`
+/// score: relaying an invalid tx is real misbehavior, but we deliberately avoid
+/// an instant ban (the verifier could have an edge case), so a peer accrues to a
+/// ban over several. Policy/standardness/resource rejections (fee floor, dust,
+/// mempool-full, RBF, conflicts) are NOT misbehavior and carry no score — see
+/// [`tx_rejection_ban_score`].
+const INVALID_TX_BAN_SCORE: u32 = 10;
 /// Hardcoded fallback when callers (tests, the no-config `new` constructor)
 /// don't supply a value. Operator-facing path goes through
 /// `Config::maxinboundperip` and the `-maxinboundperip` CLI flag.
@@ -3600,6 +3608,35 @@ impl PeerManager {
         fee_rates
     }
 
+    /// Ban score for a mempool rejection of a peer-relayed transaction. Only
+    /// *consensus-invalid* transactions are peer misbehavior; policy,
+    /// standardness, resource and RBF rejections are not — the peer cannot know
+    /// our local relay policy, and banning for them severs honest peers on
+    /// low-fee networks (testnet4 is a sub-min-relay-fee tx soup, which used to
+    /// ban our entire peer set one `+1` at a time). This mirrors Bitcoin Core,
+    /// which DoS-scores only `TX_CONSENSUS` failures. `MissingInputs` never
+    /// reaches here — it is handled as an orphan upstream.
+    fn tx_rejection_ban_score(e: &MempoolError) -> u32 {
+        match e {
+            // Consensus-invalid: bad script/signature, or outputs > inputs.
+            MempoolError::Script(_) | MempoolError::BadAmounts => INVALID_TX_BAN_SCORE,
+            // Everything else is local policy / standardness / resource limits /
+            // RBF / duplicates — not misbehavior.
+            MempoolError::AlreadyExists
+            | MempoolError::ConflictingSpend
+            | MempoolError::MissingInputs
+            | MempoolError::InsufficientFee(..)
+            | MempoolError::MempoolFull
+            | MempoolError::Validation(_)
+            | MempoolError::PrematureCoinbaseSpend
+            | MempoolError::DecodeFailed
+            | MempoolError::Dust
+            | MempoolError::NonStandardOpReturn
+            | MempoolError::InsufficientReplacementFee(..)
+            | MempoolError::TooLongMempoolChain => 0,
+        }
+    }
+
     fn handle_tx(&self, id: PeerId, tx: bitcoin::Transaction) {
         // During IBD, ignore relayed transactions — our UTXO set is incomplete
         // so validation would produce false MissingInputs rejections.
@@ -3663,7 +3700,13 @@ impl PeerManager {
             }
             Err(e) => {
                 tracing::debug!(%txid, "Tx rejected: {}", e);
-                self.add_ban_score(id, 1, &format!("Tx rejected: {}", e));
+                // Only consensus-invalid transactions are misbehavior; policy
+                // rejections (fee floor, dust, mempool limits, RBF, …) carry no
+                // ban score so we don't sever honest peers on low-fee networks.
+                let score = Self::tx_rejection_ban_score(&e);
+                if score > 0 {
+                    self.add_ban_score(id, score, &format!("Tx rejected: {}", e));
+                }
             }
         }
     }
@@ -4950,6 +4993,45 @@ impl Drop for BulkLoadGuard<'_> {
 mod tests {
     use super::*;
     use crate::net::peer::{Direction, PeerInfo, PeerState};
+
+    /// A peer relaying a *policy*-rejected tx (fee floor, dust, mempool limits,
+    /// RBF, conflicts, non-standard) must NOT accrue ban score — banning for
+    /// these severs honest peers on low-fee networks (the testnet4 wedge). Only
+    /// consensus-invalid txs (bad script / outputs-exceed-inputs) are scored.
+    #[test]
+    fn tx_rejection_ban_score_only_scores_consensus_invalid() {
+        // Consensus-invalid → scored.
+        assert_eq!(
+            PeerManager::tx_rejection_ban_score(&MempoolError::Script("x".into())),
+            INVALID_TX_BAN_SCORE
+        );
+        assert_eq!(
+            PeerManager::tx_rejection_ban_score(&MempoolError::BadAmounts),
+            INVALID_TX_BAN_SCORE
+        );
+
+        // Policy / standardness / resource / RBF / duplicate → no score.
+        for e in [
+            MempoolError::InsufficientFee(254, 1000),
+            MempoolError::Dust,
+            MempoolError::MempoolFull,
+            MempoolError::AlreadyExists,
+            MempoolError::ConflictingSpend,
+            MempoolError::NonStandardOpReturn,
+            MempoolError::InsufficientReplacementFee(1, 2),
+            MempoolError::TooLongMempoolChain,
+            MempoolError::PrematureCoinbaseSpend,
+            MempoolError::Validation("nonstandard".into()),
+            MempoolError::DecodeFailed,
+            MempoolError::MissingInputs,
+        ] {
+            assert_eq!(
+                PeerManager::tx_rejection_ban_score(&e),
+                0,
+                "policy rejection {e:?} must not be ban-scored"
+            );
+        }
+    }
 
     fn bh(byte: u8) -> bitcoin::BlockHash {
         use bitcoin::hashes::Hash;
