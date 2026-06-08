@@ -49,7 +49,7 @@ fn draw_title(f: &mut Frame, area: Rect, state: &AppState) {
         Span::styled(format!(" {} ", state.chain_name), Style::default().fg(Color::White)),
         Span::styled(dot_glyph, Style::default().fg(dot_color).add_modifier(Modifier::BOLD)),
         Span::styled(format!("{} ", health_label), Style::default().fg(dot_color)),
-        Span::styled(" v0.1.0 ", Style::default().fg(Color::DarkGray)),
+        Span::styled(state.version_line(), Style::default().fg(Color::DarkGray)),
         Span::styled(uptime_str, Style::default().fg(Color::DarkGray)),
         Span::styled(
             " chain & issuance ",

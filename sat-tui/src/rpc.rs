@@ -234,6 +234,10 @@ impl RpcClient {
     pub async fn get_server_status(&self) -> Result<serde_json::Value, RpcError> {
         self.call("getserverstatus", &[]).await
     }
+
+    pub async fn get_network_info(&self) -> Result<serde_json::Value, RpcError> {
+        self.call("getnetworkinfo", &[]).await
+    }
 }
 
 /// JSON-RPC 2.0 reserved code for an unregistered method. satd returns this

@@ -143,10 +143,12 @@ async fn main() {
     }
 
     tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
         network = %config.network,
         datadir = %config.datadir.display(),
         rpcport = config.rpcport,
-        "satd v0.1.0 starting"
+        "satd v{} starting",
+        env!("CARGO_PKG_VERSION")
     );
 
     // Separate, bounded tokio runtime for the remotely-consumed *read*

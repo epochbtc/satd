@@ -404,6 +404,12 @@ pub struct AppState {
     /// `None` once the full RPC server is up and `getblockchaininfo` succeeds.
     pub startup_status: Option<StartupStatus>,
 
+    /// Connected daemon's version, parsed from `getnetworkinfo` subversion
+    /// (e.g. `/satd:0.2.1/` → `0.2.1`). `None` until first fetched; never
+    /// cleared on disconnect (a binary's version is static), so the last
+    /// known value stays shown. Distinct from this TUI binary's own version.
+    pub server_version: Option<String>,
+
     /// Last RPC failure observed by the poller. `Some` from the first
     /// failed batch until any RPC in a subsequent batch succeeds. The
     /// failure modal reads this to surface hard errors (auth, connect)
@@ -590,6 +596,7 @@ impl AppState {
             ibd_bitmap: None,
             backfill: None,
             server_status: ServerStatus::default(),
+            server_version: None,
 
             mode: ViewMode::Steady,
             force_mode: None,
@@ -912,6 +919,27 @@ impl AppState {
     /// Update from `getserverstatus` response.
     pub fn update_server_status(&mut self, v: &serde_json::Value) {
         self.server_status = ServerStatus::from_json(v);
+    }
+
+    /// Update the connected daemon's version from a `getnetworkinfo` response.
+    /// `subversion` is `/satd:0.2.1/`; we keep the bit after the first colon.
+    /// Only set on a successful parse — never cleared — so the last known
+    /// version stays shown across transient RPC failures.
+    pub fn update_server_version(&mut self, v: &serde_json::Value) {
+        if let Some(sub) = v.get("subversion").and_then(|s| s.as_str())
+            && let Some((_, ver)) = sub.trim_matches('/').split_once(':')
+            && !ver.is_empty()
+        {
+            self.server_version = Some(ver.to_string());
+        }
+    }
+
+    /// Header version tag: the connected daemon's version alongside this TUI
+    /// binary's own version. Shows `srv v?` until the daemon version is known.
+    /// The two can legitimately differ (a TUI talking to an older/newer node).
+    pub fn version_line(&self) -> String {
+        let srv = self.server_version.as_deref().unwrap_or("?");
+        format!(" srv v{} · tui v{} ", srv, env!("CARGO_PKG_VERSION"))
     }
 
     /// Update mempool size distribution + top-N from getrawmempool verbose response.

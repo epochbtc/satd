@@ -381,8 +381,11 @@ async fn poller(rpc: Arc<RpcClient>, state: Arc<Mutex<AppState>>) {
             // Index + server-status polls always run, regardless of IBD
             // state — they drive the always-visible services row, which
             // operators may force-display via key 2 even during IBD.
-            let (index_res, srv_res) =
-                tokio::join!(rpc.get_index_info(), rpc.get_server_status());
+            let (index_res, srv_res, netinfo_res) = tokio::join!(
+                rpc.get_index_info(),
+                rpc.get_server_status(),
+                rpc.get_network_info()
+            );
             {
                 let mut st = state.lock();
                 if let Ok(v) = index_res {
@@ -390,6 +393,9 @@ async fn poller(rpc: Arc<RpcClient>, state: Arc<Mutex<AppState>>) {
                 }
                 if let Ok(v) = srv_res {
                     st.update_server_status(&v);
+                }
+                if let Ok(v) = netinfo_res {
+                    st.update_server_version(&v);
                 }
             }
 
