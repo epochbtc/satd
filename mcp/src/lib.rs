@@ -532,6 +532,12 @@ async fn serve_mcp_conn<I, S, B>(
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     let mut builder = hyper::server::conn::http1::Builder::new();
+    // hyper 1.x panics ("timeout `header_read_timeout` set, but no timer set")
+    // the moment it arms the header-read timer unless a timer is configured on
+    // the builder. Without this every accepted connection panics before any
+    // response and the client sees a TCP reset. Use the Tokio timer (we are
+    // always inside the Tokio runtime here).
+    builder.timer(hyper_util::rt::TokioTimer::new());
     builder.header_read_timeout(header_read_timeout);
     let conn = builder.serve_connection(io, svc).with_upgrades();
     tokio::pin!(conn);
@@ -761,4 +767,66 @@ pub async fn serve_http(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod conn_tests {
+    use http_body_util::Full;
+    use hyper::body::Bytes;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Regression: `serve_mcp_conn` configures `header_read_timeout` on the
+    /// hyper builder. hyper 1.x panics ("timeout `header_read_timeout` set, but
+    /// no timer set") the instant it arms that timer unless a timer is also
+    /// configured — which made every MCP connection panic before responding and
+    /// surfaced to clients as a TCP reset. This drives a real request through
+    /// `serve_mcp_conn` over an in-memory duplex stream and asserts a clean
+    /// response comes back; without the `builder.timer(..)` call the spawned
+    /// connection task panics and no response is ever written.
+    #[tokio::test]
+    async fn serve_mcp_conn_serves_a_request_without_panicking() {
+        let svc = hyper::service::service_fn(
+            |_req: hyper::Request<hyper::body::Incoming>| async {
+                Ok::<_, std::convert::Infallible>(
+                    hyper::Response::builder()
+                        .status(204)
+                        .body(Full::new(Bytes::new()))
+                        .unwrap(),
+                )
+            },
+        );
+
+        let (client, server) = tokio::io::duplex(4096);
+        let server_io = hyper_util::rt::TokioIo::new(server);
+        let (_tx, mut rx) = tokio::sync::watch::channel(false);
+
+        let server_task = tokio::spawn(async move {
+            super::serve_mcp_conn(
+                server_io,
+                svc,
+                std::time::Duration::from_secs(5),
+                &mut rx,
+                "TEST",
+            )
+            .await;
+        });
+
+        let mut client = client;
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).await.unwrap();
+        let resp = String::from_utf8_lossy(&buf);
+        assert!(
+            resp.starts_with("HTTP/1.1 204"),
+            "expected a 204 response from the MCP connection; got: {resp:?}"
+        );
+
+        // The connection task must finish cleanly (a panic would make this
+        // join return an Err and fail the test).
+        server_task.await.unwrap();
+    }
 }
