@@ -2102,6 +2102,31 @@ impl ChainState {
         compare_u256(&best_entry.chainwork, &tip_entry.chainwork) > 0
     }
 
+    /// True unless the height-indexed block at `tip+1` builds on a *different*
+    /// parent than the active tip — i.e. the connect frontier is fork-blocked.
+    ///
+    /// The linear-by-height IBD scheduler cannot reorg, so it must NOT be
+    /// (re)created while the frontier is fork-blocked: the block it would try
+    /// to connect at `tip+1` is on a competing branch whose parent isn't the
+    /// active tip, and it would loop on `bad-prevblk` forever. When this
+    /// returns false, the reorg-capable steady-state path is left to move the
+    /// active tip onto the better chain; once it does, the new `tip+1` links to
+    /// the new tip, this returns true again, and bulk IBD can resume. This is
+    /// self-correcting at any fork depth or position (not just a 1-block tip
+    /// fork). Returns true when there is no block at `tip+1` yet (nothing to
+    /// suppress) or its index entry is missing.
+    pub fn frontier_connects_to_tip(&self) -> bool {
+        let tip = self.tip_hash();
+        let next_height = self.tip_height() + 1;
+        match self.get_block_hash_by_height(next_height) {
+            None => true,
+            Some(h) => match self.store.get_block_index(&h) {
+                Some(e) => e.header.prev_blockhash == tip,
+                None => true,
+            },
+        }
+    }
+
     /// Whether assumevalid is configured (not Disabled).
     /// Used to decide whether prefetch should run script pre-verification.
     pub fn is_assumevalid_active(&self) -> bool {
@@ -5786,6 +5811,32 @@ pub(crate) mod tests {
         }
         // The best header chain now out-works the active tip.
         assert!(cs.best_header_beats_active_tip());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn frontier_connects_to_tip_detects_fork_blocked_frontier() {
+        let (cs, dir) = make_chain_state();
+        build_and_connect_chain(&cs, 2); // active tip A2 at height 2
+        // Nothing at tip+1 yet → frontier is not fork-blocked; IBD may run.
+        assert!(cs.frontier_connects_to_tip());
+
+        // Competing higher-work header chain B1..B3 forking at genesis. The
+        // above-tip height index now maps height 3 → B3 (whose parent is B2,
+        // not the active tip A2) — exactly the fork-blocked frontier that
+        // wedges the linear connector.
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+        let mut parent = genesis;
+        for h in 1..=3 {
+            let b = build_test_block(parent, h, 1_700_000_000 + h);
+            cs.accept_header(&b.header).unwrap();
+            parent = b.block_hash();
+        }
+        // get_block_hash_by_height(3) is now the competing B3, prev != tip.
+        assert!(
+            !cs.frontier_connects_to_tip(),
+            "a fork-blocked connect frontier must suppress IBD (re)creation"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
