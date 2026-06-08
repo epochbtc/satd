@@ -97,6 +97,9 @@ In-progress; full detail tracked in
   own circuit — previously all connections shared circuits, letting a single
   guard/exit correlate the whole peer set. `getnetworkinfo` now reports the
   configured `proxy` and an honest `proxy_randomize_credentials` per network.
+- **Networking** — DNS seed lists resynced to Bitcoin Core v28.0 per network
+  (purely additive; new `test_core_parity_seeds_present` golden membership check
+  guards Core parity).
 - **API scaling** — per-surface admission control (honors `-rpcthreads` /
   `-rpcworkqueue`); isolated bounded runtime for read/streaming surfaces
   (`--api-threads`); opt-in read-only JSON-RPC listener (`-rpcreadonlybind`).
