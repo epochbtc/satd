@@ -484,7 +484,7 @@ fn case_bad_diffbits() -> Satd {
     let prev = block_index_entry(0, BASE_TIME, REGTEST_POWLIMIT_BITS);
     let mut header = bitcoin::constants::genesis_block(Network::Regtest).header;
     header.bits = CompactTarget::from_consensus(0x1d00_ffff); // wrong for regtest
-    check_difficulty(&header, &prev, Network::Regtest, |_| None).map_err(|e| e.to_string())
+    check_difficulty(&header, &prev, Network::Regtest, |_| None, |_| None).map_err(|e| e.to_string())
 }
 
 fn case_time_too_old_mtp() -> Satd {
