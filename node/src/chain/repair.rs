@@ -67,9 +67,13 @@ pub struct RepairReport {
     pub height: u32,
     pub tip_hash: BlockHash,
     pub tip_height: u32,
-    /// Coins the lost delta creates (block outputs minus unspendables).
+    /// Coins the lost delta creates — net: block outputs minus
+    /// unspendables and minus outputs spent within the block itself,
+    /// i.e. exactly what reaches the store (matching CoinCache's
+    /// elision on the live path).
     pub coins_created: usize,
-    /// Phantom coins the lost delta removes (the block's spent inputs).
+    /// Phantom coins the lost delta removes — net: the block's spent
+    /// inputs minus intra-block spends.
     pub coins_spent: usize,
     pub tx_index_rows: usize,
     pub addr_funding_rows: usize,
@@ -271,6 +275,26 @@ pub fn repair_lost_connect_delta(
     debug_assert_eq!(batch.tip, Some(block_hash));
     batch.tip = None;
 
+    // Net out intra-block spends. connect_block emits gross coin
+    // traffic — an output created and spent within the same block
+    // appears in BOTH coin_puts and coin_removes. On the live write
+    // path CoinCache cancels those pairs before they reach the store
+    // (FRESH elision); this tool writes to the store directly, and
+    // `RocksDbStore::write_batch` applies removes before puts in one
+    // WriteBatch (last write per key wins), so an un-netted pair would
+    // RESURRECT the spent coin as a phantom UTXO and corrupt the coin
+    // counters. Drop the pairs from the coins CF only — undo, txindex,
+    // address-index, and outpoint-spend rows legitimately record
+    // intra-block events and pass through untouched, exactly as they
+    // do via CoinCache in production.
+    let intra_block_pairs: HashSet<OutPoint> = {
+        let removed: HashSet<OutPoint> =
+            batch.coin_removes.iter().map(|(op, _, _)| *op).collect();
+        batch.coin_puts.iter().map(|(op, _)| *op).filter(|op| removed.contains(op)).collect()
+    };
+    batch.coin_puts.retain(|(op, _)| !intra_block_pairs.contains(op));
+    batch.coin_removes.retain(|(op, _, _)| !intra_block_pairs.contains(op));
+
     // Descendants connected over the hole computed their cumulative tx
     // counts from a missing parent (`unwrap_or(0)`); rewrite every row
     // that disagrees with the repaired series.
@@ -423,14 +447,13 @@ mod tests {
         }
     }
 
-    /// Build the canonical damaged store: genesis connected, a seeded
-    /// coin, block 1 (spends the coin) whose connect delta was LOST —
-    /// only its DataStored index entry survives — and block 2 connected
-    /// on top of the hole. Returns (store, block1, block2_hash,
-    /// seeded_outpoint).
-    fn make_holed_store() -> (InMemoryStore, Block, BlockHash, OutPoint) {
-        let store = InMemoryStore::new();
-
+    /// Damage any store the canonical way: genesis connected, a seeded
+    /// coin, block 1 — coinbase + a spend of the seeded coin + a
+    /// **chained intra-block spend** of that spend's output — whose
+    /// connect delta was LOST (only its DataStored index entry
+    /// survives), and block 2 connected on top of the hole. Returns
+    /// (block1, block2_hash, seeded_outpoint).
+    fn populate_holed_store(store: &dyn Store) -> (Block, BlockHash, OutPoint) {
         // Genesis, fully connected and counted.
         let genesis = seal(BlockHash::all_zeros(), vec![make_coinbase(0, 0)]);
         let genesis_hash = genesis.block_hash();
@@ -475,7 +498,25 @@ mod tests {
                 script_pubkey: bitcoin::ScriptBuf::new(),
             }],
         };
-        let block1 = seal(genesis_hash, vec![make_coinbase(1, 0), spend]);
+        // Chained intra-block spend: consumes `spend`'s output within
+        // the same block, so the rebuilt batch carries that outpoint as
+        // a put+remove PAIR — the case the netting logic must cancel
+        // before writing to a raw store.
+        let chained = Transaction {
+            version: Version(2),
+            lock_time: bitcoin::blockdata::locktime::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint { txid: spend.compute_txid(), vout: 0 },
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_000_000),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+        let block1 = seal(genesis_hash, vec![make_coinbase(1, 0), spend, chained]);
         let block1_hash = block1.block_hash();
         let mut batch = StoreBatch::default();
         batch
@@ -488,7 +529,7 @@ mod tests {
         let block2 = seal(block1_hash, vec![make_coinbase(2, 0)]);
         let block2_hash = block2.block_hash();
         let batch2 = connect::connect_block(&ConnectParams {
-            store: &store,
+            store,
             block: &block2,
             height: 2,
             parent_chainwork: &[0u8; 32],
@@ -511,6 +552,12 @@ mod tests {
         // restarted from zero over the hole.
         assert_eq!(store.get_cumulative_tx_count(&block2_hash), Some(1));
 
+        (block1, block2_hash, seeded)
+    }
+
+    fn make_holed_store() -> (InMemoryStore, Block, BlockHash, OutPoint) {
+        let store = InMemoryStore::new();
+        let (block1, block2_hash, seeded) = populate_holed_store(&store);
         (store, block1, block2_hash, seeded)
     }
 
@@ -532,8 +579,12 @@ mod tests {
         .unwrap();
         assert!(!report.applied);
         assert_eq!(report.height, 1);
+        // Net of the intra-block pair: only the seeded coin is spent
+        // cross-block, and only the coinbase + chained outputs survive.
         assert_eq!(report.coins_spent, 1);
-        assert_eq!(report.tx_index_rows, 2);
+        assert_eq!(report.coins_created, 2);
+        assert_eq!(report.tx_index_rows, 3);
+        // The address index keeps the gross intra-block events.
         assert_eq!(report.chain_tx_rewrites, 1, "block 2's zero-anchored count must be rewritten");
         assert!(store.get_coin(&seeded).is_some(), "dry run must not touch the store");
         assert!(store.get_undo(&block1_hash).is_none(), "dry run must not touch the store");
@@ -551,18 +602,69 @@ mod tests {
         .unwrap();
         assert!(report.applied);
 
-        // The phantom is gone, the block's outputs exist, every index
-        // row is back, and the tip never moved.
+        // The phantom is gone, the block's surviving outputs exist, the
+        // intra-block-spent output does NOT, every index row is back,
+        // and the tip never moved.
         assert!(store.get_coin(&seeded).is_none());
+        let intra = OutPoint { txid: block1.txdata[1].compute_txid(), vout: 0 };
+        assert!(
+            store.get_coin(&intra).is_none(),
+            "intra-block-spent output must not be resurrected"
+        );
+        assert!(
+            store.get_coin(&OutPoint { txid: block1.txdata[2].compute_txid(), vout: 0 }).is_some()
+        );
         for tx in &block1.txdata {
             assert_eq!(store.get_tx_location(&tx.compute_txid()), Some(block1_hash));
         }
         assert!(store.get_undo(&block1_hash).is_some());
         assert_eq!(store.get_block_hash_by_height(1), Some(block1_hash));
         assert_eq!(store.get_tip(), Some(block2_hash));
-        // chain_tx series rebuilt: genesis 1, block1 1+2=3, block2 3+1=4.
-        assert_eq!(store.get_cumulative_tx_count(&block1_hash), Some(3));
-        assert_eq!(store.get_cumulative_tx_count(&block2_hash), Some(4));
+        // chain_tx series rebuilt: genesis 1, block1 1+3=4, block2 4+1=5.
+        assert_eq!(store.get_cumulative_tx_count(&block1_hash), Some(4));
+        assert_eq!(store.get_cumulative_tx_count(&block2_hash), Some(5));
+    }
+
+    /// The same end-to-end repair against a REAL RocksDB store. This is
+    /// the test that catches the resurrection bug the InMemoryStore
+    /// can't: `RocksDbStore::write_batch` applies coin_removes before
+    /// coin_puts inside one WriteBatch (last write per key wins), so an
+    /// un-netted intra-block put+remove pair leaves the spent coin
+    /// alive in the UTXO set.
+    #[test]
+    fn repair_on_rocksdb_does_not_resurrect_intra_block_spends() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            crate::storage::rocksdb_store::RocksDbStore::open(dir.path(), true, 16, false, -1)
+                .unwrap();
+        let (block1, block2_hash, seeded) = populate_holed_store(&store);
+        let block1_hash = block1.block_hash();
+
+        let report = repair_lost_connect_delta(
+            &store,
+            &block1,
+            &NoopVerifier,
+            Network::Regtest,
+            1,
+            &AddressIndexConfig::default(),
+            true,
+        )
+        .unwrap();
+        assert!(report.applied);
+        assert_eq!(report.coins_created, 2);
+        assert_eq!(report.coins_spent, 1);
+
+        let intra = OutPoint { txid: block1.txdata[1].compute_txid(), vout: 0 };
+        assert!(
+            store.get_coin(&intra).is_none(),
+            "intra-block-spent output must not be resurrected in RocksDB"
+        );
+        assert!(
+            store.get_coin(&OutPoint { txid: block1.txdata[2].compute_txid(), vout: 0 }).is_some()
+        );
+        assert!(store.get_coin(&seeded).is_none());
+        assert!(store.get_undo(&block1_hash).is_some());
+        assert_eq!(store.get_tip(), Some(block2_hash));
     }
 
     #[test]
