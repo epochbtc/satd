@@ -170,7 +170,27 @@ impl CoinCache {
     /// Switch the underlying-store write mode for subsequent writes and
     /// flushes. Use `BulkLoad` during IBD (when crash-recovery replay is
     /// cheap relative to WAL overhead); `Normal` otherwise.
+    ///
+    /// Leaving `BulkLoad` performs a durable flush *before* the switch,
+    /// by construction: WAL-less writes are volatile until their memtables
+    /// reach SST files, so restoring `Normal` without flushing strands
+    /// acknowledged writes in memory where the next process exit silently
+    /// drops them (the mainnet-952978 bug shape). Fail-closed callers
+    /// (reindex, IBD completion) should still call `flush_durable`
+    /// explicitly so errors propagate; this transition flush is the
+    /// backstop and only logs on failure.
     pub fn set_write_mode(&self, mode: WriteMode) {
+        if self.current_write_mode() == WriteMode::BulkLoad
+            && mode == WriteMode::Normal
+            && let Err(e) = Store::flush_durable(self)
+        {
+            tracing::error!(
+                error = %e,
+                "durable flush on BulkLoad->Normal transition failed; \
+                 WAL-less writes may be lost if the process exits before \
+                 the next successful flush"
+            );
+        }
         let v = match mode {
             WriteMode::Normal => 0,
             WriteMode::BulkLoad => 1,
@@ -2481,5 +2501,44 @@ mod tests {
         cache.flush().unwrap();
         cache.flush_durable().unwrap();
         assert_eq!(cache.get_coin(&op).unwrap().amount, 4_242);
+    }
+
+    /// Restoring `Normal` from `BulkLoad` must durably flush, by
+    /// construction: WAL-less writes still in memtables are silently lost
+    /// on process exit, so the transition itself has to checkpoint them —
+    /// no caller can be trusted to remember (mainnet-952978 regression).
+    #[test]
+    fn bulkload_to_normal_transition_flushes_durably() {
+        let inner = InMemoryStore::new();
+        let durable_flushes = inner.flush_durable_counter();
+        let cache = CoinCache::new(Box::new(inner), 64);
+
+        cache.set_write_mode(WriteMode::BulkLoad);
+        let mut batch = StoreBatch::default();
+        batch
+            .coin_puts
+            .push((make_outpoint(0xEE, 0), make_coin(9_999, 7)));
+        cache.write_batch(batch).unwrap();
+        assert_eq!(
+            durable_flushes.load(Ordering::Relaxed),
+            0,
+            "entering/holding BulkLoad must not flush on its own"
+        );
+
+        cache.set_write_mode(WriteMode::Normal);
+        assert_eq!(
+            durable_flushes.load(Ordering::Relaxed),
+            1,
+            "leaving BulkLoad must durably flush the backing store"
+        );
+        // The transition drained the cache's dirty map too (flush_durable
+        // flushes the cache before the inner store), so the write survived.
+        assert_eq!(cache.get_coin(&make_outpoint(0xEE, 0)).unwrap().amount, 9_999);
+
+        // Normal -> Normal and Normal -> BulkLoad are not transitions out
+        // of BulkLoad and must not flush.
+        cache.set_write_mode(WriteMode::Normal);
+        cache.set_write_mode(WriteMode::BulkLoad);
+        assert_eq!(durable_flushes.load(Ordering::Relaxed), 1);
     }
 }

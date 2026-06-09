@@ -13,6 +13,10 @@ use node_index::SpendingRef;
 
 /// In-memory storage backend for testing.
 pub struct InMemoryStore {
+    /// Counts `flush_durable` calls. Shared (`Arc`) so tests can keep a
+    /// handle after boxing the store behind `dyn Store` and assert that
+    /// durability checkpoints actually reached the backing store.
+    flush_durable_calls: std::sync::Arc<std::sync::atomic::AtomicU64>,
     block_index: parking_lot::RwLock<std::collections::HashMap<BlockHash, BlockIndexEntry>>,
     coins: parking_lot::RwLock<std::collections::HashMap<OutPoint, Coin>>,
     tip: parking_lot::RwLock<Option<BlockHash>>,
@@ -45,6 +49,7 @@ impl Default for InMemoryStore {
 impl InMemoryStore {
     pub fn new() -> Self {
         Self {
+            flush_durable_calls: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             block_index: parking_lot::RwLock::new(std::collections::HashMap::new()),
             coins: parking_lot::RwLock::new(std::collections::HashMap::new()),
             tip: parking_lot::RwLock::new(None),
@@ -77,9 +82,21 @@ impl InMemoryStore {
             filter_backfill_last_error: parking_lot::RwLock::new(None),
         }
     }
+
+    /// Handle to the `flush_durable` call counter; survives boxing the
+    /// store behind `dyn Store`.
+    pub fn flush_durable_counter(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+        self.flush_durable_calls.clone()
+    }
 }
 
 impl Store for InMemoryStore {
+    fn flush_durable(&self) -> Result<(), StoreError> {
+        self.flush_durable_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
     fn get_block_index(&self, hash: &BlockHash) -> Option<BlockIndexEntry> {
         self.block_index.read().get(hash).cloned()
     }

@@ -54,6 +54,28 @@ const CF_FILTER_HEADER: &str = "block_filter_header";
 /// on Completed or Cancelled.
 const CF_ADDR_BACKFILL_TEMP: &str = "addr_backfill_outpoint_to_scripthash";
 
+/// Every column family this store can create, plus RocksDB's default CF.
+/// `flush_durable` flushes exactly this list (filtered to the CFs that
+/// exist on the open DB), so a CF missing here would silently lose its
+/// WAL-less (BulkLoad) writes on process exit. `open()` asserts every
+/// descriptor it creates is listed — add new CFs HERE first.
+const ALL_CFS: &[&str] = &[
+    "default",
+    CF_COINS,
+    CF_BLOCK_INDEX,
+    CF_HEIGHT_INDEX,
+    CF_UNDO,
+    CF_TX_INDEX,
+    CF_METADATA,
+    CF_CHAIN_TX,
+    CF_ADDR_FUNDING_V2,
+    CF_ADDR_SPENDING_V2,
+    CF_OUTPOINT_SPEND,
+    CF_FILTER,
+    CF_FILTER_HEADER,
+    CF_ADDR_BACKFILL_TEMP,
+];
+
 const TIP_KEY: &[u8] = b"tip";
 const UTXO_COUNT_KEY: &[u8] = b"utxo_count";
 const TOTAL_AMOUNT_KEY: &[u8] = b"total_amount";
@@ -443,6 +465,19 @@ impl RocksDbStore {
             if existing_cfs.iter().any(|n| n == legacy) {
                 cf_descriptors.push(ColumnFamilyDescriptor::new(*legacy, Options::default()));
             }
+        }
+
+        // Every CF we create must be in ALL_CFS so `flush_durable` covers
+        // it — a CF missing from that list loses its WAL-less (BulkLoad)
+        // writes on process exit. Legacy CFs are exempt: they're dropped
+        // right after open and never written.
+        for d in &cf_descriptors {
+            let name = d.name();
+            debug_assert!(
+                ALL_CFS.contains(&name) || LEGACY_ADDR_CF_NAMES.contains(&name),
+                "column family `{name}` is not listed in ALL_CFS; \
+                 flush_durable would not persist its BulkLoad writes"
+            );
         }
 
         let db = DB::open_cf_descriptors(&db_opts, &db_path, cf_descriptors).map_err(|e| {
@@ -1572,14 +1607,28 @@ impl Store for RocksDbStore {
 
     fn flush_durable(&self) -> Result<(), StoreError> {
         // Synchronous flush of every column family's memtable to SST files.
-        // With `atomic_flush(true)` set at DB open time, all CFs are flushed
-        // atomically — either the post-flush state is fully persisted or
-        // nothing is. `wait(true)` ensures the call returns only once the
-        // flush is durable on disk.
+        //
+        // This MUST enumerate the column families explicitly. `DB::flush_opt`
+        // flushes only the *default* CF — which holds none of our data — and
+        // `atomic_flush(true)` does NOT promote a single-CF manual flush to
+        // an all-CF flush. Relying on `flush_opt` here silently dropped every
+        // WAL-less (BulkLoad) write still in a data-CF memtable on any exit
+        // that skips the DB destructor (std::process::exit, SIGKILL, abort):
+        // that lost mainnet block 952978's connect delta and rolled a
+        // finished reindex back 21 blocks. The regression test
+        // `flush_durable_persists_walless_writes_in_data_cfs` pins this.
+        //
+        // With `atomic_flush(true)` the listed CFs flush as one atomic unit;
+        // `wait(true)` returns only once the flush is durable on disk.
         let mut fopts = FlushOptions::default();
         fopts.set_wait(true);
+        let handles: Vec<_> = ALL_CFS
+            .iter()
+            .filter_map(|name| self.db.cf_handle(name))
+            .collect();
+        let refs: Vec<&_> = handles.iter().collect();
         self.db
-            .flush_opt(&fopts)
+            .flush_cfs_opt(&refs, &fopts)
             .map_err(|e| StoreError::Database(e.to_string()))
     }
 
@@ -3788,5 +3837,56 @@ mod tests {
             .expect("reindex open should succeed regardless of schema or legacy CFs");
         assert!(store.db.cf_handle("addr_funding").is_none());
         assert!(store.db.cf_handle("addr_spending").is_none());
+    }
+
+    /// `flush_durable` must persist WAL-less (BulkLoad) writes in EVERY
+    /// column family, not just the default CF. A WAL-less write that is
+    /// still in a memtable after `flush_durable` returns will be silently
+    /// lost on any exit that skips the DB destructor (std::process::exit,
+    /// SIGKILL, panic-abort) — exactly the mainnet 952978 data-loss bug.
+    ///
+    /// The assertion uses the per-CF active-memtable entry count so it
+    /// does not depend on close/reopen semantics (RocksDB flushes WAL-less
+    /// memtables on a *clean* close, which would mask the bug).
+    #[test]
+    fn flush_durable_persists_walless_writes_in_data_cfs() {
+        let (store, _dir) = temp_store(true);
+
+        // A realistic connect batch: coins, block index, undo, height
+        // index, tip, txindex — written WAL-less as during IBD/reindex.
+        let (hash, entry) = regtest_genesis_entry();
+        let mut batch = StoreBatch::default();
+        batch.coin_puts.push((make_outpoint(0xAA, 0), make_coin(50_000, 1)));
+        batch.block_index_puts.push((hash, entry));
+        batch.tip = Some(hash);
+        batch.height_hash_puts.push((1, hash));
+        batch
+            .tx_index_puts
+            .push((Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0xAA; 32])), hash));
+        store
+            .write_batch_mode(batch, WriteMode::BulkLoad)
+            .unwrap();
+
+        store.flush_durable().unwrap();
+
+        // After a durable flush, no data CF may still hold the write in
+        // its (volatile, WAL-less) active memtable.
+        for cf_name in [CF_COINS, CF_BLOCK_INDEX, CF_HEIGHT_INDEX, CF_TX_INDEX, CF_METADATA] {
+            let cf = store.cf(cf_name);
+            let entries = store
+                .db
+                .property_int_value_cf(&cf, "rocksdb.num-entries-active-mem-table")
+                .unwrap()
+                .unwrap_or(0);
+            assert_eq!(
+                entries, 0,
+                "CF `{cf_name}` still has {entries} entries in its active memtable \
+                 after flush_durable(); WAL-less writes there will be lost on \
+                 process exit without a clean DB close"
+            );
+        }
+
+        // And the data must actually be readable back.
+        assert!(store.get_coin(&make_outpoint(0xAA, 0)).is_some());
     }
 }
