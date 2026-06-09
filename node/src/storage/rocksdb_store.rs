@@ -242,6 +242,18 @@ impl RocksDbStore {
         )
     }
 
+    /// Snapshot the live database into `path` using RocksDB's
+    /// checkpoint mechanism: SST files are hardlinked (instant and
+    /// near-free on the same filesystem), the WAL and manifest are
+    /// copied. `path` must not exist yet. Used by the offline
+    /// chainstate-repair tool to take a cheap rollback point before
+    /// writing; restoring is `mv` the checkpoint over `chainstate/`.
+    pub fn create_checkpoint(&self, path: &Path) -> Result<(), StoreError> {
+        let cp = rocksdb::checkpoint::Checkpoint::new(&self.db)
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        cp.create_checkpoint(path).map_err(|e| StoreError::Database(e.to_string()))
+    }
+
     /// Open the chainstate with explicit storage tuning. `path` is the
     /// node datadir; the RocksDB instance lives in its `chainstate/`
     /// subdirectory. See [`StorageTuning`] for the per-field semantics;

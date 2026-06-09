@@ -26,6 +26,12 @@ In-progress; full detail tracked in
   fsync'd before any durable checkpoint that references it (Core's
   `FlushBlockFile` ordering), closing a power-loss window where the block
   index could point at truncated files.
+- **Tooling** — new offline `satd-chainstate-repair` binary: surgically
+  re-applies a single block's lost connect delta (the damage left by the
+  BulkLoad durability bug above) on a stopped node, instead of a multi-day
+  reindex. Dry-run by default, verifies the damage matches the lost-delta
+  signature before writing, takes a RocksDB checkpoint backup, and never
+  moves the tip.
 - **Consensus** — six block-level rules brought to Bitcoin Core parity (sigop
   cost, BIP30, future-timestamp, block-version gate, merkle-mutation
   /CVE-2012-2459, per-tx weight cap); reject-reason strings aligned; on-receipt
