@@ -27,6 +27,12 @@ In-progress; full detail tracked in
   acceptance and block storage now only touch the index above the active tip.
   New `-checkblockindex` flag (default on for regtest/CI) runs a structural
   block-index audit at startup and after a reindex; fail-closed.
+- **Reliability (P2P)** — stopped charging ban score for *policy* transaction
+  rejections (min-relay-fee, dust, mempool-full, RBF, conflicts, non-standard).
+  Only consensus-invalid txs (bad script / outputs-exceed-inputs) are now scored,
+  matching Bitcoin Core. On low-fee networks (e.g. testnet4's sub-min-relay-fee
+  tx soup) the old behavior banned honest peers one `+1` at a time until the
+  whole reachable peer set was gone and the node could no longer sync.
 - **Reliability (reindex UX)** — fixed `--reindex` progress and ETA on nodes
   whose block files hold duplicate/orphan records (e.g. competing forks stored
   during a sync wedge): the connect target is now the real genesis-reachable
