@@ -3107,6 +3107,7 @@ impl ChainState {
             128, // lookahead blocks, matching the IBD connect loop
             self.is_assumevalid_active(),
             self.primary_engine(),
+            self.network,
         );
 
         // Weight-aware ETA over the replay, reused from the IBD connect loop.

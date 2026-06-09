@@ -81,6 +81,7 @@ pub fn prefetch_block(
     height: u32,
     _assumevalid: bool,
     primary_engine: PrimaryEngine,
+    network: bitcoin::Network,
 ) -> Option<PreprocessedBlock> {
     // 1. Get block hash and entry
     let hash = store.get_block_hash_by_height(height)?;
@@ -183,10 +184,10 @@ pub fn prefetch_block(
                         s.spawn(move || {
                             chunk.iter()
                                 .filter(|(_, tx, prev_outputs)| match primary_engine {
-                                    PrimaryEngine::Cpp => ConsensusVerifier
+                                    PrimaryEngine::Cpp => ConsensusVerifier::new(network)
                                         .verify_transaction(tx, prev_outputs, height)
                                         .is_ok(),
-                                    PrimaryEngine::Rust => RustVerifier
+                                    PrimaryEngine::Rust => RustVerifier::new(network)
                                         .verify_transaction(tx, prev_outputs, height)
                                         .is_ok(),
                                 })
@@ -260,6 +261,7 @@ pub type PrefetchBuffer = Arc<parking_lot::Mutex<HashMap<u32, PreprocessedBlock>
 ///
 /// Call `prefetch_handle.advance_cursor(height)` after each successful
 /// connection so the dispatcher assigns new work ahead of the cursor.
+#[allow(clippy::too_many_arguments)]
 pub fn start_prefetcher(
     store: Arc<dyn Store + Send + Sync>,
     blocks_dir: PathBuf,
@@ -268,6 +270,7 @@ pub fn start_prefetcher(
     lookahead: usize,
     assumevalid: bool,
     primary_engine: PrimaryEngine,
+    network: bitcoin::Network,
 ) -> PrefetchHandle {
     let shutdown = Arc::new(AtomicBool::new(false));
     let cursor = Arc::new(AtomicU32::new(start_height));
@@ -301,6 +304,7 @@ pub fn start_prefetcher(
                                     height,
                                     assumevalid,
                                     primary_engine,
+                                    network,
                                 ) {
                                     w_buffer.lock().insert(height, pre);
                                 }
