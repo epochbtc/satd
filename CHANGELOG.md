@@ -74,6 +74,10 @@ In-progress; full detail tracked in
   `-mcpcert`/`-mcpkey`/`-mcpmtls`; a remote bind requires TLS so the bearer token
   is never sent in cleartext. The stdio transport (`-mcpstdio`) is removed; MCP
   is HTTP(S)-only.
+- **MCP (fix)** — fixed a panic that reset *every* MCP HTTP connection before a
+  response (`header_read_timeout` was set on the hyper server without a timer,
+  so hyper panicked as soon as it armed the timer). The MCP server now serves
+  requests instead of dropping the connection.
 - **Tor** — control-port auth is negotiated via `PROTOCOLINFO` and now supports
   **SAFECOOKIE**, so `-listenonion` works against a stock Tor
   (`CookieAuthentication 1`) with no `HashedControlPassword`. Falls back to
