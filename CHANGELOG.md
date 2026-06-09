@@ -21,8 +21,11 @@ In-progress; full detail tracked in
   wedging the node with `bad-txns-inputs-missingorspent`. Durable flushes now
   cover every column family; `SplitStore` flushes both halves; leaving
   BulkLoad mode flushes durably by construction; a reindex whose exit flush
-  fails now reports failure instead of success; and small catch-ups
-  (<10,000 blocks behind) keep the WAL on.
+  fails now reports failure instead of success; small catch-ups
+  (<10,000 blocks behind) keep the WAL on; and flat-file block data is now
+  fsync'd before any durable checkpoint that references it (Core's
+  `FlushBlockFile` ordering), closing a power-loss window where the block
+  index could point at truncated files.
 - **Consensus** — six block-level rules brought to Bitcoin Core parity (sigop
   cost, BIP30, future-timestamp, block-version gate, merkle-mutation
   /CVE-2012-2459, per-tx weight cap); reject-reason strings aligned; on-receipt

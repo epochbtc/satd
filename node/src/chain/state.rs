@@ -2312,8 +2312,17 @@ impl ChainState {
     /// Force all cached writes to durable storage. Intended to be called
     /// periodically during `BulkLoad` IBD, and unconditionally before
     /// switching back to `Normal` mode or shutting down.
+    ///
+    /// Ordering matters: flat-file block data is fsync'd FIRST, then the
+    /// RocksDB memtables (which hold `block_index` entries pointing into
+    /// those files). The reverse order could persist an index entry whose
+    /// referenced block data is still page-cache-only — a power loss then
+    /// leaves a truncated file behind a valid-looking index ("block data
+    /// missing"). This mirrors Bitcoin Core's `FlushBlockFile`-before-
+    /// chainstate-flush sequence in `FlushStateToDisk`.
     pub fn flush_durable(&self) -> Result<(), crate::storage::StoreError> {
         use crate::storage::Store;
+        self.flat_files.lock().sync_all()?;
         self.store.flush_durable()
     }
 

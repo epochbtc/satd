@@ -18,6 +18,11 @@ pub struct FlatFileManager {
     current_pos: u64,
     /// Cached write handle for the current append file.
     write_handle: Option<File>,
+    /// True when the current append file has writes not yet fsync'd.
+    /// Invariant: only the *current* file can ever be dirty — a file
+    /// being rotated out is fsync'd before its handle is dropped, so
+    /// `sync_all` never has to chase closed files.
+    dirty: bool,
     /// Cached read handles keyed by file number (small LRU).
     read_cache: std::collections::HashMap<u32, File>,
 }
@@ -51,6 +56,7 @@ impl FlatFileManager {
             current_file: file_num,
             current_pos,
             write_handle: None,
+            dirty: false,
             read_cache: std::collections::HashMap::new(),
         })
     }
@@ -74,8 +80,17 @@ impl FlatFileManager {
         // Total size: 4 (magic) + 4 (size) + block_data.len()
         let record_size = 8 + block_data.len() as u64;
 
-        // Roll over to next file if current would exceed max
+        // Roll over to next file if current would exceed max. Fsync the
+        // outgoing file first: it will never be written again, and syncing
+        // it here keeps the "only the current file can be dirty" invariant
+        // that lets `sync_all` ignore closed files.
         if self.current_pos > 0 && self.current_pos + record_size > MAX_FILE_SIZE {
+            if self.dirty
+                && let Some(f) = &self.write_handle
+            {
+                f.sync_data()?;
+                self.dirty = false;
+            }
             self.current_file += 1;
             self.current_pos = 0;
             self.write_handle = None; // Close old handle, open new file below
@@ -105,8 +120,36 @@ impl FlatFileManager {
         file.write_all(block_data)?;
 
         self.current_pos += record_size;
+        self.dirty = true;
 
         Ok(pos)
+    }
+
+    /// Fsync any unsynced block-file writes (Core's `FlushBlockFile`).
+    ///
+    /// Block data is appended without fsync for throughput, so until this
+    /// runs it can sit in the OS page cache — safe across a process crash,
+    /// gone on kernel panic/power loss. Callers MUST invoke this before
+    /// making any RocksDB state durable that *references* the data
+    /// (`block_index` entries with a `FlatFilePos`), or a power loss can
+    /// leave the index pointing at truncated files ("block data missing").
+    /// `ChainState::flush_durable` does this ordering; rotation in
+    /// `write_block` syncs each file as it fills, so at most one file
+    /// (the current one) is ever unsynced.
+    pub fn sync_all(&mut self) -> std::io::Result<()> {
+        if self.dirty
+            && let Some(f) = &self.write_handle
+        {
+            f.sync_data()?;
+            self.dirty = false;
+        }
+        Ok(())
+    }
+
+    /// Whether the current append file has unsynced writes (test hook).
+    #[cfg(test)]
+    pub fn has_unsynced_writes(&self) -> bool {
+        self.dirty
     }
 
     /// Check whether a given flat file exists on disk.
@@ -464,6 +507,44 @@ mod tests {
             assert_eq!(mgr.read_block(&pos_a).unwrap(), data_a);
             assert_eq!(mgr.read_block(&pos_b).unwrap(), data_b);
         }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `sync_all` must fsync pending block-file writes, and rotation must
+    /// sync the outgoing file so only the current file is ever unsynced —
+    /// the invariant `ChainState::flush_durable` relies on to order
+    /// "block data durable" before "block_index durable".
+    #[test]
+    fn sync_all_clears_unsynced_writes_and_rotation_syncs_old_file() {
+        let dir = std::env::temp_dir().join(format!("satd-flatfile-sync-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut mgr = FlatFileManager::new(&dir).unwrap();
+        let magic = [0xfa, 0xbf, 0xb5, 0xda];
+
+        // Fresh manager: nothing to sync; sync_all is a no-op Ok.
+        assert!(!mgr.has_unsynced_writes());
+        mgr.sync_all().unwrap();
+
+        // A write dirties the current file; sync_all clears it.
+        let pos_a = mgr.write_block(&vec![0xAA; 1024], magic).unwrap();
+        assert!(mgr.has_unsynced_writes());
+        mgr.sync_all().unwrap();
+        assert!(!mgr.has_unsynced_writes());
+
+        // Force a rotation: a write that would exceed MAX_FILE_SIZE rolls
+        // to the next file, fsyncing the outgoing one. Afterward only the
+        // new (current) file is dirty, and both blocks read back fine.
+        mgr.write_block(&vec![0xBB; 512], magic).unwrap(); // dirty file 0 again
+        mgr.current_pos = MAX_FILE_SIZE - 4; // next record won't fit
+        let pos_c = mgr.write_block(&vec![0xCC; 1024], magic).unwrap();
+        assert_eq!(pos_c.file_number, 1, "write must have rotated to a new file");
+        assert!(mgr.has_unsynced_writes(), "new current file is dirty");
+        mgr.sync_all().unwrap();
+        assert!(!mgr.has_unsynced_writes());
+        assert_eq!(mgr.read_block(&pos_a).unwrap(), vec![0xAA; 1024]);
+        assert_eq!(mgr.read_block(&pos_c).unwrap(), vec![0xCC; 1024]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
