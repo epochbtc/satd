@@ -1,0 +1,29 @@
+# Keep the things CI doesn't pin-and-test for us from silently aging out.
+#
+# Scope is intentionally narrow: the Docker base image and the GitHub
+# Actions we depend on. Cargo dependencies are managed deliberately
+# (Cargo.lock is committed and `deny.toml` gates the supply chain), so
+# they are NOT delegated to Dependabot — that would fight the curated
+# dependency policy.
+#
+#   - docker: watches `FROM debian:${DEBIAN_VERSION}-slim` in the
+#     Dockerfile. Surfaces a PR when a newer Debian point release lands,
+#     which the docker.yml build+smoke job then validates before merge.
+#   - github-actions: watches the `uses:` pins across all workflows
+#     (checkout, buildx, build-push-action, cosign, etc.) so action
+#     versions don't rot past upstream security/bugfix releases.
+version: 2
+updates:
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "ci(docker)"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "ci(actions)"
