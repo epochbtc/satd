@@ -286,10 +286,16 @@ impl BackgroundChainState {
         // which cannot occur on this linear in-order replay).
         validation::block::check_block(block)?;
         validation::pow::check_proof_of_work(&block.header)?;
-        validation::pow::check_difficulty(&block.header, &parent, self.network, |h| {
-            let hash = store_ref.get_block_hash_by_height(h)?;
-            store_ref.get_block_index(&hash)
-        })?;
+        validation::pow::check_difficulty(
+            &block.header,
+            &parent,
+            self.network,
+            |h| {
+                let hash = store_ref.get_block_hash_by_height(h)?;
+                store_ref.get_block_index(&hash)
+            },
+            |h| store_ref.get_block_index(h),
+        )?;
         validation::pow::check_timestamp(&block.header, new_height, |h| {
             let hash = store_ref.get_block_hash_by_height(h)?;
             store_ref.get_block_index(&hash)

@@ -1603,11 +1603,19 @@ impl ChainState {
         // PoW validation
         validation::pow::check_proof_of_work(header)?;
 
-        // Difficulty check
-        validation::pow::check_difficulty(header, &parent, self.network, |h| {
-            let hash = self.store.get_block_hash_by_height(h)?;
-            self.store.get_block_index(&hash)
-        })?;
+        // Difficulty check. `get_ancestor` (by height) seeds retarget boundaries;
+        // the testnet min-difficulty walk-back uses `get_by_hash` (parent
+        // pointers) so it is immune to height→hash index gaps.
+        validation::pow::check_difficulty(
+            header,
+            &parent,
+            self.network,
+            |h| {
+                let hash = self.store.get_block_hash_by_height(h)?;
+                self.store.get_block_index(&hash)
+            },
+            |h| self.store.get_block_index(h),
+        )?;
 
         // Store as header-only
         let chainwork =
@@ -1716,24 +1724,42 @@ impl ChainState {
             }
 
             // Difficulty check
-            if let Err(e) = validation::pow::check_difficulty(header, &parent, self.network, |h| {
-                // Check batch first for recently accepted headers, then store
-                batch
-                    .height_hash_puts
-                    .iter()
-                    .find(|(bh, _)| *bh == h)
-                    .and_then(|(_, hash)| {
-                        batch
-                            .block_index_puts
-                            .iter()
-                            .find(|(bih, _)| bih == hash)
-                            .map(|(_, e)| e.clone())
-                    })
-                    .or_else(|| {
-                        let hash = self.store.get_block_hash_by_height(h)?;
-                        self.store.get_block_index(&hash)
-                    })
-            }) {
+            if let Err(e) = validation::pow::check_difficulty(
+                header,
+                &parent,
+                self.network,
+                |h| {
+                    // Retarget seed by height: check batch first for recently
+                    // accepted headers, then store.
+                    batch
+                        .height_hash_puts
+                        .iter()
+                        .find(|(bh, _)| *bh == h)
+                        .and_then(|(_, hash)| {
+                            batch
+                                .block_index_puts
+                                .iter()
+                                .find(|(bih, _)| bih == hash)
+                                .map(|(_, e)| e.clone())
+                        })
+                        .or_else(|| {
+                            let hash = self.store.get_block_hash_by_height(h)?;
+                            self.store.get_block_index(&hash)
+                        })
+                },
+                |h| {
+                    // Min-difficulty walk-back by parent hash: in-batch headers
+                    // (this batch's predecessors) first, then the store. Using
+                    // parent pointers — not the height index — makes the walk
+                    // immune to height→hash gaps.
+                    batch
+                        .block_index_puts
+                        .iter()
+                        .find(|(bih, _)| bih == h)
+                        .map(|(_, e)| e.clone())
+                        .or_else(|| self.store.get_block_index(h))
+                },
+            ) {
                 return (accepted, Some(e.into()));
             }
 
@@ -2849,10 +2875,16 @@ impl ChainState {
 
         // Difficulty check
         let store_ref = &*self.store;
-        validation::pow::check_difficulty(&block.header, &parent, self.network, |h| {
-            let hash = store_ref.get_block_hash_by_height(h)?;
-            store_ref.get_block_index(&hash)
-        })?;
+        validation::pow::check_difficulty(
+            &block.header,
+            &parent,
+            self.network,
+            |h| {
+                let hash = store_ref.get_block_hash_by_height(h)?;
+                store_ref.get_block_index(&hash)
+            },
+            |h| store_ref.get_block_index(h),
+        )?;
 
         // Signet block-solution check (BIP 325), custom signet only.
         self.check_signet_solution(block)?;
@@ -3670,10 +3702,16 @@ impl ChainState {
 
         // Difficulty check
         let store_ref = &*self.store;
-        validation::pow::check_difficulty(&block.header, &parent, self.network, |h| {
-            let hash = store_ref.get_block_hash_by_height(h)?;
-            store_ref.get_block_index(&hash)
-        })?;
+        validation::pow::check_difficulty(
+            &block.header,
+            &parent,
+            self.network,
+            |h| {
+                let hash = store_ref.get_block_hash_by_height(h)?;
+                store_ref.get_block_index(&hash)
+            },
+            |h| store_ref.get_block_index(h),
+        )?;
 
         // Timestamp check (median time past)
         validation::pow::check_timestamp(&block.header, new_height, |h| {

@@ -27,6 +27,15 @@ In-progress; full detail tracked in
   acceptance and block storage now only touch the index above the active tip.
   New `-checkblockindex` flag (default on for regtest/CI) runs a structural
   block-index audit at startup and after a reindex; fail-closed.
+- **Consensus (testnet difficulty)** — the testnet/testnet4 20-minute
+  min-difficulty walk-back now follows **parent pointers** (`prev_blockhash`),
+  matching Bitcoin Core's `pprev` walk, instead of the active-chain `height→hash`
+  index. The height index can have gaps (reorg artifacts / the corruption class
+  above); a single gap made the walk-back stop early and return powlimit,
+  rejecting a valid real-difficulty block as `bad-diffbits` and wedging header
+  sync. Parent pointers are always present for any ancestor held, so difficulty
+  is now immune to height-index gaps. (Observed live: a testnet4 node stuck at a
+  height whose next real-difficulty block sat just past a one-block index gap.)
 - **Reliability (P2P)** — stopped charging ban score for *policy* transaction
   rejections (min-relay-fee, dust, mempool-full, RBF, conflicts, non-standard).
   Only consensus-invalid txs (bad script / outputs-exceed-inputs) are now scored,
