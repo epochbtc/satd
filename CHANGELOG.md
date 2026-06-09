@@ -21,6 +21,15 @@ In-progress; full detail tracked in
 - **Policy/mining** — two internal defaults aligned to Bitcoin Core v30: the RBF
   incremental relay fee (1000 → 100 sat/kvB) and the coinbase weight reserve
   used for block templates and fee estimation (4000 → 8000 WU).
+- **Policy (fee rate)** — fee rates are now computed per **virtual byte**
+  (sat/kvB), not per weight unit. Several hot paths — the min-relay-fee check,
+  the RBF incremental fee, fee estimation/histogram, `getblockstats`, and the
+  peer `feefilter` — divided the fee by weight (~4× vsize), so satd's effective
+  relay floor was ~4 sat/vB instead of Bitcoin Core's 1 sat/vB and it **rejected
+  standard 1–4 sat/vB transactions** the rest of the network relays (and under-
+  reported fee rates ~4× in RPC). All sites now divide by virtual size, matching
+  Core's `CFeeRate`. (Found dogfooding signet: a 412-sat / 277-vbyte tx paying
+  1487 sat/kvB was wrongly rejected as "min relay fee not met. 371 < 1000".)
 - **Reliability** — fixed a block-index corruption where a competing fork
   announced below the active tip could clobber the active-chain `height→hash`
   map, making `--reindex-chainstate` abort at `bad-cb-height` and loop. Header

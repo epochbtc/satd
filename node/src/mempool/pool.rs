@@ -437,9 +437,9 @@ impl Mempool {
             }
             let new_fee = sum_inputs - sum_outputs;
 
-            // New fee must exceed old fees + incremental relay fee
-            let min_replacement_fee =
-                conflict_fee_total + policy::INCREMENTAL_RELAY_FEE * weight as u64 / 1000;
+            // New fee must exceed old fees + incremental relay fee (per vbyte).
+            let min_replacement_fee = conflict_fee_total
+                + policy::INCREMENTAL_RELAY_FEE * policy::weight_to_vsize(weight as u64) / 1000;
             if new_fee < min_replacement_fee {
                 return Err(MempoolError::InsufficientReplacementFee(
                     new_fee,
@@ -456,12 +456,8 @@ impl Mempool {
 
         let fee = sum_inputs - sum_outputs;
 
-        // Check fee rate (sat per 1000 weight units)
-        let fee_rate = if weight > 0 {
-            fee * 1000 / weight as u64
-        } else {
-            0
-        };
+        // Check fee rate (sat/kvB, i.e. per virtual byte — matches Core).
+        let fee_rate = policy::fee_rate_sat_per_kvb(fee, weight as u64);
         if fee_rate < cfg.min_fee_rate {
             return Err(MempoolError::InsufficientFee(fee_rate, cfg.min_fee_rate));
         }
@@ -539,7 +535,7 @@ impl Mempool {
             .collect();
 
         let entry_weight_u64 = weight as u64;
-        let vsize_u64 = entry_weight_u64 / 4;
+        let vsize_u64 = policy::weight_to_vsize(entry_weight_u64);
         inner.entries.insert(
             txid,
             MempoolEntry {
@@ -971,7 +967,7 @@ impl Mempool {
             .verify_transaction(tx, &prev_outputs, tip_height + 1)
             .map_err(|e| MempoolError::Script(e.to_string()))?;
 
-        let vsize = weight / 4;
+        let vsize = policy::weight_to_vsize(weight as u64) as usize;
         Ok((txid, vsize, fee))
     }
 

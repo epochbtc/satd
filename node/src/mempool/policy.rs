@@ -1,8 +1,10 @@
 /// Default maximum mempool size in bytes (300 MB).
 pub const DEFAULT_MAX_MEMPOOL_SIZE: usize = 300 * 1_000_000;
 
-/// Default minimum relay fee rate in sat per 1000 weight units.
-/// 1000 sat/kvB = 1 sat/vB.
+/// Default minimum relay fee rate in sat/kvB (sat per 1000 *virtual* bytes),
+/// matching Bitcoin Core's `DEFAULT_MIN_RELAY_TX_FEE`. 1000 sat/kvB = 1 sat/vB.
+/// Fee rates are always per vbyte, never per weight unit — derive them with
+/// [`fee_rate_sat_per_kvb`].
 pub const DEFAULT_MIN_RELAY_FEE_RATE: u64 = 1_000;
 
 /// Maximum standard transaction weight (400,000 weight units).
@@ -28,6 +30,29 @@ pub const MEMPOOL_EXPIRY_SECS: u64 = 336 * 3600;
 /// much more per kvB than the transaction(s) they replace. Matches Bitcoin
 /// Core v30's `DEFAULT_INCREMENTAL_RELAY_FEE` (100 sat/kvB).
 pub const INCREMENTAL_RELAY_FEE: u64 = 100;
+
+/// Virtual size (vbytes) for a given transaction weight, matching Bitcoin
+/// Core's `GetVirtualTransactionSize`: ceil division by the witness scale
+/// factor (4). Use this — never raw weight — wherever a vbyte quantity is
+/// needed, so fee rates and size-based fees match Core.
+pub fn weight_to_vsize(weight: u64) -> u64 {
+    weight.div_ceil(4)
+}
+
+/// Fee rate in sat/kvB (sat per 1000 *virtual* bytes), matching Bitcoin Core's
+/// `CFeeRate`. Fee rates throughout satd are sat/kvB and MUST be derived from
+/// virtual size, not raw weight: weight ≈ 4× vsize, so dividing a fee by weight
+/// understates the rate ~4× and applies a ~4× too-high effective relay floor
+/// (rejecting standard 1–4 sat/vB transactions that the rest of the network
+/// relays). Returns 0 for a zero-weight transaction.
+pub fn fee_rate_sat_per_kvb(fee: u64, weight: u64) -> u64 {
+    let vsize = weight_to_vsize(weight);
+    if vsize == 0 {
+        0
+    } else {
+        fee.saturating_mul(1000) / vsize
+    }
+}
 
 /// Compute the dust threshold for a given output script.
 ///
@@ -92,6 +117,26 @@ pub fn is_standard_output_script(script: &bitcoin::Script, permit_bare_multisig:
 mod tests {
     use super::*;
     use bitcoin::ScriptBuf;
+
+    /// Regression for the live signet rejection: a 5-in/2-out P2WPKH spend with
+    /// fee 412 sat and weight 1108 (vsize 277) pays 1487 sat/kvB (1.49 sat/vB),
+    /// comfortably above the 1000 sat/kvB floor — Bitcoin Core accepts it. The
+    /// old `fee*1000/weight` formula computed 371 and wrongly rejected it as
+    /// "min relay fee not met". Fee rates must divide by vsize, not weight.
+    #[test]
+    fn fee_rate_uses_vsize_not_weight() {
+        assert_eq!(weight_to_vsize(1108), 277);
+        assert_eq!(fee_rate_sat_per_kvb(412, 1108), 1487);
+        assert!(fee_rate_sat_per_kvb(412, 1108) >= DEFAULT_MIN_RELAY_FEE_RATE);
+        // The buggy weight-based value, for contrast, was below the floor.
+        assert!(412 * 1000 / 1108 < DEFAULT_MIN_RELAY_FEE_RATE);
+        // Exactly 1 sat/vB sits right on the floor.
+        assert_eq!(fee_rate_sat_per_kvb(277, 1108), 1000);
+        // vsize rounds up (ceil), matching Core's GetVirtualTransactionSize.
+        assert_eq!(weight_to_vsize(1109), 278);
+        // Zero weight is handled without dividing by zero.
+        assert_eq!(fee_rate_sat_per_kvb(1000, 0), 0);
+    }
 
     /// Helper to build a P2PKH script (25 bytes: OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG)
     fn p2pkh_script() -> ScriptBuf {

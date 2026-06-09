@@ -188,7 +188,7 @@ fn simulate_one_block(remaining: &HashMap<Txid, MempoolEntry>) -> (SimBlock, Has
         if weight == 0 {
             continue;
         }
-        let rate = fee.saturating_mul(1000) / weight;
+        let rate = crate::mempool::policy::fee_rate_sat_per_kvb(fee, weight);
         sorted.push((*txid, rate));
     }
     // Highest ancestor-feerate first.
@@ -269,11 +269,8 @@ pub fn build_histogram(entries: &HashMap<Txid, MempoolEntry>) -> Vec<HistogramBu
         .collect();
     let mut weights: Vec<u64> = vec![0; bounds_kvb.len()];
     for entry in entries.values() {
-        let rate = if entry.weight == 0 {
-            0
-        } else {
-            effective_fee(entry).saturating_mul(1000) / entry.weight as u64
-        };
+        let rate =
+            crate::mempool::policy::fee_rate_sat_per_kvb(effective_fee(entry), entry.weight as u64);
         // Drop into the highest bucket whose boundary is ≤ rate.
         let mut idx: Option<usize> = None;
         for (i, b) in bounds_kvb.iter().enumerate() {
@@ -457,11 +454,7 @@ mod tests {
         weight: usize,
         sigop_cost: u64,
     ) -> MempoolEntry {
-        let fee_rate = if weight > 0 {
-            fee * 1000 / weight as u64
-        } else {
-            0
-        };
+        let fee_rate = crate::mempool::policy::fee_rate_sat_per_kvb(fee, weight as u64);
         MempoolEntry {
             tx,
             fee,
@@ -523,9 +516,10 @@ mod tests {
         let tx_b = mk_tx(&[], 2);
         let ta = tx_a.compute_txid();
         let tb = tx_b.compute_txid();
-        // 2 sat/vB (2000 sat/kvB) and 20 sat/vB (20000 sat/kvB)
-        let ea = mk_entry(tx_a, 200, 100); // 2000 sat/kvB
-        let eb = mk_entry(tx_b, 2000, 100); // 20000 sat/kvB
+        // 2 sat/vB (2000 sat/kvB) and 20 sat/vB (20000 sat/kvB). Weight 400 =
+        // 100 vbytes, so fee/vsize gives the intended per-vbyte rate.
+        let ea = mk_entry(tx_a, 200, 400); // 200 / 100 vB = 2000 sat/kvB
+        let eb = mk_entry(tx_b, 2000, 400); // 2000 / 100 vB = 20000 sat/kvB
         let est = estimate_from_mempool(vec![(ta, ea), (tb, eb)], 1);
         let rates: Vec<u64> = est
             .histogram
