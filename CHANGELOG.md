@@ -30,6 +30,17 @@ In-progress; full detail tracked in
   reported fee rates ~4× in RPC). All sites now divide by virtual size, matching
   Core's `CFeeRate`. (Found dogfooding signet: a 412-sat / 277-vbyte tx paying
   1487 sat/kvB was wrongly rejected as "min relay fee not met. 371 < 1000".)
+- **Consensus (CRITICAL, non-mainnet)** — softfork activation heights for
+  script verification are now **per-network**. Both script engines previously
+  applied Bitcoin **mainnet** buried heights on every chain, so on signet /
+  testnet4 / regtest (tips far below mainnet's segwit height 481,824) the
+  WITNESS/TAPROOT/DERSIG/CLTV/CSV flags were never enforced — making P2WPKH,
+  P2WSH, and P2TR outputs **anyone-can-spend** on those networks (an unsigned
+  segwit spend was accepted into the signet mempool; Core rejects it). Signet,
+  testnet4, and regtest now enforce all softforks from genesis and testnet3
+  uses its own buried heights, matching Bitcoin Core's `chainparams.cpp`.
+  Block sigop-cost accounting's P2SH gate is per-network for the same reason.
+  Mainnet behavior is unchanged (already cross-validated genesis→tip).
 - **Reliability** — fixed a block-index corruption where a competing fork
   announced below the active tip could clobber the active-chain `height→hash`
   map, making `--reindex-chainstate` abort at `bad-cb-height` and loop. Header

@@ -500,7 +500,7 @@ async fn main() {
                 "Consensus: cpp (single engine, no shadow cross-check). Default 'rust-shadow' \
                  runs two independent engines and is recommended."
             );
-            Box::new(ConsensusVerifier)
+            Box::new(ConsensusVerifier::new(config.network))
         }
         ConsensusEngine::Rust => {
             tracing::warn!(
@@ -510,13 +510,13 @@ async fn main() {
                  either engine alone forgoes the dual-engine cross-check. Default 'rust-shadow' \
                  is recommended."
             );
-            Box::new(RustVerifier)
+            Box::new(RustVerifier::new(config.network))
         }
         ConsensusEngine::RustShadow => {
             tracing::info!("Consensus: rust-shadow (cpp authoritative, rust shadow)");
             Box::new(ShadowVerifier::new(
-                Box::new(ConsensusVerifier),
-                Box::new(RustVerifier),
+                Box::new(ConsensusVerifier::new(config.network)),
+                Box::new(RustVerifier::new(config.network)),
                 "cpp",
                 "rust",
                 config.shadow_queue_size,
@@ -526,8 +526,8 @@ async fn main() {
         ConsensusEngine::CppShadow => {
             tracing::info!("Consensus: cpp-shadow (rust authoritative, cpp shadow)");
             Box::new(ShadowVerifier::new(
-                Box::new(RustVerifier),
-                Box::new(ConsensusVerifier),
+                Box::new(RustVerifier::new(config.network)),
+                Box::new(ConsensusVerifier::new(config.network)),
                 "rust",
                 "cpp",
                 config.shadow_queue_size,

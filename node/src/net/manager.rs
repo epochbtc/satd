@@ -3068,6 +3068,7 @@ impl PeerManager {
             128, // lookahead blocks
             assumevalid_active,
             primary_engine,
+            network,
         );
 
         // Enter BulkLoad mode via an RAII guard: subsequent RocksDB writes

@@ -174,7 +174,7 @@ fn satd_accepts(b: &Block, base: &Base) -> bool {
         height: base.height + 1,
         parent_chainwork: &[0u8; 32],
         flat_pos: FlatFilePos { file_number: 0, data_pos: 0 },
-        script_verifier: &ConsensusVerifier,
+        script_verifier: &ConsensusVerifier::new(Network::Regtest),
         median_time_past: base.mtp,
         network: Network::Regtest,
         pre_verified_txs: None,

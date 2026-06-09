@@ -18,11 +18,11 @@ const COINBASE_MATURITY: u32 = 100;
 /// `WITNESS_SCALE_FACTOR` (4).
 const MAX_BLOCK_SIGOPS_COST: u64 = 80_000;
 
-/// BIP 16 (P2SH) activation height on mainnet. Below it, only legacy
-/// sigops count toward [`MAX_BLOCK_SIGOPS_COST`]; at/after it, P2SH
-/// redeem-script (and, post-segwit, witness) sigops are included. Mirrors
-/// the height gate used by the script verifier (`validation::script`).
-const P2SH_ACTIVATION_HEIGHT: u32 = 173_805;
+// BIP 16 (P2SH) activation is per-network — see
+// `crate::validation::script::activation_heights`. Below it, only legacy
+// sigops count toward [`MAX_BLOCK_SIGOPS_COST`]; at/after it, P2SH
+// redeem-script (and, post-segwit, witness) sigops are included, mirroring
+// the height gate used by the script verifier.
 
 /// Bitcoin Core's `MAX_SCRIPT_SIZE` (`script.h`). Scripts larger than
 /// this are provably unspendable.
@@ -244,10 +244,11 @@ fn bip30_exempt(network: Network, height: u32, hash: &BlockHash) -> bool {
 /// output it spends (empty for coinbase, which Core counts as legacy-only).
 fn transaction_sigop_cost(
     tx: &Transaction,
+    network: Network,
     height: u32,
     spent: &HashMap<OutPoint, TxOut>,
 ) -> u64 {
-    if height >= P2SH_ACTIVATION_HEIGHT {
+    if height >= crate::validation::script::activation_heights(network).p2sh {
         tx.total_sigop_cost(|op| spent.get(op).cloned()) as u64
     } else {
         let mut legacy: usize = 0;
@@ -591,8 +592,8 @@ pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError>
             for (input, prevout) in tx.input.iter().zip(prev_outputs.iter()) {
                 sigop_spent.insert(input.previous_output, prevout.clone());
             }
-            block_sigops =
-                block_sigops.saturating_add(transaction_sigop_cost(tx, height, &sigop_spent));
+            block_sigops = block_sigops
+                .saturating_add(transaction_sigop_cost(tx, network, height, &sigop_spent));
             if block_sigops > MAX_BLOCK_SIGOPS_COST {
                 return Err(ConnectError::BadBlockSigops);
             }
@@ -613,8 +614,8 @@ pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError>
             // legacy-only (scriptSig + output scriptPubkeys) and still counts
             // toward the block-wide limit, matching Core.
             sigop_spent.clear();
-            block_sigops =
-                block_sigops.saturating_add(transaction_sigop_cost(tx, height, &sigop_spent));
+            block_sigops = block_sigops
+                .saturating_add(transaction_sigop_cost(tx, network, height, &sigop_spent));
             if block_sigops > MAX_BLOCK_SIGOPS_COST {
                 return Err(ConnectError::BadBlockSigops);
             }
@@ -1085,8 +1086,13 @@ mod tests {
         };
         let empty: HashMap<OutPoint, TxOut> = HashMap::new();
         // 10 OP_CHECKMULTISIG * 20 legacy sigops * 4 (witness scale) = 800.
-        assert_eq!(transaction_sigop_cost(&cb, 0, &empty), 800);
-        assert_eq!(transaction_sigop_cost(&cb, P2SH_ACTIVATION_HEIGHT, &empty), 800);
+        let mainnet_p2sh =
+            crate::validation::script::activation_heights(Network::Bitcoin).p2sh;
+        assert_eq!(transaction_sigop_cost(&cb, Network::Bitcoin, 0, &empty), 800);
+        assert_eq!(transaction_sigop_cost(&cb, Network::Bitcoin, mainnet_p2sh, &empty), 800);
+        // Regtest/signet: P2SH active from genesis, so the witness-aware
+        // path is taken even at height 0 (same cost here — no P2SH data).
+        assert_eq!(transaction_sigop_cost(&cb, Network::Regtest, 0, &empty), 800);
     }
 
     // ── decode_coinbase_height tests ──────────────────────────────────

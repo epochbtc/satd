@@ -1,4 +1,4 @@
-use bitcoin::{Transaction, TxOut};
+use bitcoin::{Network, Transaction, TxOut};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ScriptError {
@@ -54,17 +54,128 @@ pub trait ScriptVerifier: Send + Sync {
     }
 }
 
-/// Softfork activation heights (mainnet). Verification flags are cumulative.
-const BIP16_HEIGHT: u32 = 173_805;  // P2SH
-const BIP66_HEIGHT: u32 = 363_725;  // Strict DER signatures
-const BIP65_HEIGHT: u32 = 388_381;  // CHECKLOCKTIMEVERIFY
-const BIP112_HEIGHT: u32 = 419_328; // CHECKSEQUENCEVERIFY
-const SEGWIT_HEIGHT: u32 = 481_824; // Segregated Witness + NULLDUMMY
-const TAPROOT_HEIGHT: u32 = 709_632; // Taproot
+/// Per-network softfork activation heights for script-verification flags.
+/// Verification flags are cumulative: once a fork's height is reached its
+/// flag stays on for all later blocks.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ActivationHeights {
+    /// BIP 16 (P2SH).
+    pub p2sh: u32,
+    /// BIP 66 (strict DER signatures).
+    pub dersig: u32,
+    /// BIP 65 (CHECKLOCKTIMEVERIFY).
+    pub cltv: u32,
+    /// BIP 112 (CHECKSEQUENCEVERIFY).
+    pub csv: u32,
+    /// BIP 141/143 (segregated witness) + BIP 147 (NULLDUMMY).
+    pub segwit: u32,
+    /// BIP 341/342 (taproot).
+    pub taproot: u32,
+}
+
+/// Softfork activation heights for `network`, mirroring Bitcoin Core's
+/// buried-deployment heights (`chainparams.cpp`).
+///
+/// Core's modern `GetBlockScriptFlags` applies P2SH/WITNESS/TAPROOT to every
+/// block on every network and carves out the three historical violators by
+/// hash (`script_flag_exceptions`). The height-gating used here reproduces
+/// that without per-hash carve-outs: each P2SH/taproot gate sits just above
+/// its network's exception block (mainnet BIP16 exception at 170_060 <
+/// 173_805, mainnet taproot exception at 692_261 < 709_632, testnet3 BIP16
+/// exception at 394 < 395), and the canonical chains contain no other
+/// violations below the gates — Core itself validates them flags-on.
+///
+/// Signet, testnet4, and regtest activate everything from genesis (all of
+/// Core's buried heights there are <= 1, and the genesis block is never
+/// script-verified), so a P2WPKH or P2TR output is NEVER anyone-can-spend
+/// on those networks.
+pub fn activation_heights(network: Network) -> ActivationHeights {
+    match network {
+        Network::Bitcoin => ActivationHeights {
+            p2sh: 173_805,
+            dersig: 363_725,
+            cltv: 388_381,
+            csv: 419_328,
+            segwit: 481_824,
+            taproot: 709_632,
+        },
+        // Testnet3. Taproot is gated with segwit rather than at 0: a taproot
+        // spend is a witness spend, so the flag is inert below the witness
+        // gate, and libconsensus rejects TAPROOT-without-WITNESS flag sets.
+        Network::Testnet => ActivationHeights {
+            p2sh: 395,
+            dersig: 330_776,
+            cltv: 581_885,
+            csv: 770_112,
+            segwit: 834_624,
+            taproot: 834_624,
+        },
+        // Signet, Testnet4, Regtest: always active.
+        _ => ActivationHeights {
+            p2sh: 0,
+            dersig: 0,
+            cltv: 0,
+            csv: 0,
+            segwit: 0,
+            taproot: 0,
+        },
+    }
+}
+
+// The two engines must agree on flag bit values for `script_verify_flags`
+// to feed either one. Both mirror Core's script-flag bits; pin it at
+// compile time.
+const _: () = {
+    assert!(consensus::VERIFY_P2SH == bitcoinconsensus::VERIFY_P2SH);
+    assert!(consensus::VERIFY_DERSIG == bitcoinconsensus::VERIFY_DERSIG);
+    assert!(consensus::VERIFY_NULLDUMMY == bitcoinconsensus::VERIFY_NULLDUMMY);
+    assert!(
+        consensus::VERIFY_CHECKLOCKTIMEVERIFY == bitcoinconsensus::VERIFY_CHECKLOCKTIMEVERIFY
+    );
+    assert!(
+        consensus::VERIFY_CHECKSEQUENCEVERIFY == bitcoinconsensus::VERIFY_CHECKSEQUENCEVERIFY
+    );
+    assert!(consensus::VERIFY_WITNESS == bitcoinconsensus::VERIFY_WITNESS);
+    assert!(consensus::VERIFY_TAPROOT == bitcoinconsensus::VERIFY_TAPROOT);
+};
+
+/// Script-verification flags for a block at `height` on `network`.
+/// Shared by both engines (flag bit values are identical — pinned above).
+pub fn script_verify_flags(network: Network, height: u32) -> u32 {
+    let h = activation_heights(network);
+    let mut flags = 0u32;
+    if height >= h.p2sh {
+        flags |= consensus::VERIFY_P2SH;
+    }
+    if height >= h.dersig {
+        flags |= consensus::VERIFY_DERSIG;
+    }
+    if height >= h.cltv {
+        flags |= consensus::VERIFY_CHECKLOCKTIMEVERIFY;
+    }
+    if height >= h.csv {
+        flags |= consensus::VERIFY_CHECKSEQUENCEVERIFY;
+    }
+    if height >= h.segwit {
+        flags |= consensus::VERIFY_WITNESS | consensus::VERIFY_NULLDUMMY;
+    }
+    if height >= h.taproot {
+        flags |= consensus::VERIFY_TAPROOT;
+    }
+    flags
+}
 
 /// Script verifier backed by Bitcoin Core's libconsensus via FFI.
 /// Supports all consensus rules including taproot.
-pub struct ConsensusVerifier;
+pub struct ConsensusVerifier {
+    network: Network,
+}
+
+impl ConsensusVerifier {
+    pub fn new(network: Network) -> Self {
+        Self { network }
+    }
+}
 
 impl ScriptVerifier for ConsensusVerifier {
     fn verify_transaction(
@@ -75,27 +186,7 @@ impl ScriptVerifier for ConsensusVerifier {
     ) -> Result<(), ScriptError> {
         let tx_bytes = bitcoin::consensus::serialize(tx);
 
-        // Compute verification flags based on softfork activation heights
-        let mut flags = 0u32;
-        if height >= BIP16_HEIGHT {
-            flags |= bitcoinconsensus::VERIFY_P2SH;
-        }
-        if height >= BIP66_HEIGHT {
-            flags |= bitcoinconsensus::VERIFY_DERSIG;
-        }
-        if height >= BIP65_HEIGHT {
-            flags |= bitcoinconsensus::VERIFY_CHECKLOCKTIMEVERIFY;
-        }
-        if height >= BIP112_HEIGHT {
-            flags |= bitcoinconsensus::VERIFY_CHECKSEQUENCEVERIFY;
-        }
-        if height >= SEGWIT_HEIGHT {
-            flags |= bitcoinconsensus::VERIFY_WITNESS
-                | bitcoinconsensus::VERIFY_NULLDUMMY;
-        }
-        if height >= TAPROOT_HEIGHT {
-            flags |= bitcoinconsensus::VERIFY_TAPROOT;
-        }
+        let flags = script_verify_flags(self.network, height);
 
         // Build spent outputs array for taproot (needed for signature hash)
         let script_bytes: Vec<Vec<u8>> = prev_outputs
@@ -151,7 +242,15 @@ impl ScriptVerifier for NoopVerifier {
 // ---------------------------------------------------------------------------
 
 /// Script verifier backed by the pure Rust `consensus` crate.
-pub struct RustVerifier;
+pub struct RustVerifier {
+    network: Network,
+}
+
+impl RustVerifier {
+    pub fn new(network: Network) -> Self {
+        Self { network }
+    }
+}
 
 impl ScriptVerifier for RustVerifier {
     fn verify_transaction(
@@ -160,25 +259,7 @@ impl ScriptVerifier for RustVerifier {
         prev_outputs: &[TxOut],
         height: u32,
     ) -> Result<(), ScriptError> {
-        let mut flags = 0u32;
-        if height >= BIP16_HEIGHT {
-            flags |= consensus::VERIFY_P2SH;
-        }
-        if height >= BIP66_HEIGHT {
-            flags |= consensus::VERIFY_DERSIG;
-        }
-        if height >= BIP65_HEIGHT {
-            flags |= consensus::VERIFY_CHECKLOCKTIMEVERIFY;
-        }
-        if height >= BIP112_HEIGHT {
-            flags |= consensus::VERIFY_CHECKSEQUENCEVERIFY;
-        }
-        if height >= SEGWIT_HEIGHT {
-            flags |= consensus::VERIFY_WITNESS | consensus::VERIFY_NULLDUMMY;
-        }
-        if height >= TAPROOT_HEIGHT {
-            flags |= consensus::VERIFY_TAPROOT;
-        }
+        let flags = script_verify_flags(self.network, height);
 
         // Batch API: passes &Transaction so we don't re-deserialize per
         // input, and shares a single SighashCache across inputs (BIP143
@@ -426,14 +507,16 @@ mod tests {
     // not the default (Cpp) that would come from the trait's base impl.
     #[test]
     fn test_primary_engine_reports_correct_authority() {
-        assert_eq!(ConsensusVerifier.primary_engine(), PrimaryEngine::Cpp);
-        assert_eq!(RustVerifier.primary_engine(), PrimaryEngine::Rust);
+        let cpp = ConsensusVerifier::new(Network::Bitcoin);
+        let rust = RustVerifier::new(Network::Bitcoin);
+        assert_eq!(cpp.primary_engine(), PrimaryEngine::Cpp);
+        assert_eq!(rust.primary_engine(), PrimaryEngine::Rust);
         assert_eq!(NoopVerifier.primary_engine(), PrimaryEngine::Cpp);
 
         // rust-shadow layout: cpp authoritative, rust shadow -> Cpp
         let rust_shadow = ShadowVerifier::new(
-            Box::new(ConsensusVerifier),
-            Box::new(RustVerifier),
+            Box::new(ConsensusVerifier::new(Network::Bitcoin)),
+            Box::new(RustVerifier::new(Network::Bitcoin)),
             "cpp",
             "rust",
             16,
@@ -443,14 +526,163 @@ mod tests {
 
         // cpp-shadow layout: rust authoritative, cpp shadow -> Rust
         let cpp_shadow = ShadowVerifier::new(
-            Box::new(RustVerifier),
-            Box::new(ConsensusVerifier),
+            Box::new(RustVerifier::new(Network::Bitcoin)),
+            Box::new(ConsensusVerifier::new(Network::Bitcoin)),
             "rust",
             "cpp",
             16,
             1,
         );
         assert_eq!(cpp_shadow.primary_engine(), PrimaryEngine::Rust);
+    }
+
+    // Pin the per-network activation heights against Bitcoin Core's
+    // chainparams.cpp buried-deployment heights. Round-tripping our own
+    // table proves nothing; these literals were checked against Core.
+    #[test]
+    fn activation_heights_match_core_chainparams() {
+        let main = activation_heights(Network::Bitcoin);
+        assert_eq!(main.p2sh, 173_805);
+        assert_eq!(main.dersig, 363_725);
+        assert_eq!(main.cltv, 388_381);
+        assert_eq!(main.csv, 419_328);
+        assert_eq!(main.segwit, 481_824);
+        assert_eq!(main.taproot, 709_632);
+
+        let t3 = activation_heights(Network::Testnet);
+        assert_eq!(t3.dersig, 330_776); // Core BIP66Height
+        assert_eq!(t3.cltv, 581_885); // Core BIP65Height
+        assert_eq!(t3.csv, 770_112); // Core CSVHeight
+        assert_eq!(t3.segwit, 834_624); // Core SegwitHeight
+        // P2SH gate sits just above testnet3's BIP16 exception block
+        // 00000000dd30457c001f4095d208cc1296b0eed002427aa599874af7a432b105
+        // at height 394.
+        assert_eq!(t3.p2sh, 395);
+
+        for net in [Network::Signet, Network::Testnet4, Network::Regtest] {
+            assert_eq!(
+                activation_heights(net),
+                ActivationHeights { p2sh: 0, dersig: 0, cltv: 0, csv: 0, segwit: 0, taproot: 0 },
+                "{net}: every softfork must be active from genesis"
+            );
+        }
+    }
+
+    #[test]
+    fn script_verify_flags_height_gates() {
+        // Mainnet pre-P2SH: nothing on.
+        assert_eq!(script_verify_flags(Network::Bitcoin, 0), 0);
+        // Mainnet at segwit activation: witness + nulldummy join the set.
+        let at_segwit = script_verify_flags(Network::Bitcoin, 481_824);
+        assert_ne!(at_segwit & consensus::VERIFY_WITNESS, 0);
+        assert_ne!(at_segwit & consensus::VERIFY_NULLDUMMY, 0);
+        assert_eq!(at_segwit & consensus::VERIFY_TAPROOT, 0);
+        // Mainnet at taproot activation: everything on.
+        let all = consensus::VERIFY_P2SH
+            | consensus::VERIFY_DERSIG
+            | consensus::VERIFY_CHECKLOCKTIMEVERIFY
+            | consensus::VERIFY_CHECKSEQUENCEVERIFY
+            | consensus::VERIFY_WITNESS
+            | consensus::VERIFY_NULLDUMMY
+            | consensus::VERIFY_TAPROOT;
+        assert_eq!(script_verify_flags(Network::Bitcoin, 709_632), all);
+        // Always-active networks: everything on from the first block.
+        for net in [Network::Signet, Network::Testnet4, Network::Regtest] {
+            assert_eq!(script_verify_flags(net, 0), all, "{net}");
+            assert_eq!(script_verify_flags(net, 1), all, "{net}");
+        }
+        // WITNESS implies P2SH and TAPROOT implies WITNESS at every height
+        // on every network — libconsensus rejects flag sets violating this.
+        for net in [
+            Network::Bitcoin,
+            Network::Testnet,
+            Network::Testnet4,
+            Network::Signet,
+            Network::Regtest,
+        ] {
+            for height in [0, 394, 395, 400_000, 834_623, 834_624, 1_000_000] {
+                let f = script_verify_flags(net, height);
+                if f & consensus::VERIFY_WITNESS != 0 {
+                    assert_ne!(f & consensus::VERIFY_P2SH, 0, "{net} h={height}");
+                }
+                if f & consensus::VERIFY_TAPROOT != 0 {
+                    assert_ne!(f & consensus::VERIFY_WITNESS, 0, "{net} h={height}");
+                }
+            }
+        }
+    }
+
+    /// Build a tx spending a P2WPKH prevout with an empty scriptSig and an
+    /// empty witness — i.e. completely unsigned. Returns (tx, prevouts).
+    fn unsigned_p2wpkh_spend() -> (Transaction, Vec<TxOut>) {
+        use bitcoin::hashes::Hash as _;
+        use bitcoin::{
+            Amount, OutPoint, ScriptBuf, Sequence, TxIn, Witness, absolute::LockTime,
+            transaction::Version,
+        };
+        let wpkh = bitcoin::WPubkeyHash::from_slice(&[0x42; 20]).unwrap();
+        let prev = TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: ScriptBuf::new_p2wpkh(&wpkh),
+        };
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: "6cf504882427ef10e78990b15c8f16bee6f4235fb5d653a791e5518ad69f0e59"
+                        .parse()
+                        .unwrap(),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(99_000),
+                script_pubkey: ScriptBuf::new_p2wpkh(&wpkh),
+            }],
+        };
+        (tx, vec![prev])
+    }
+
+    // Regression for the signet dogfood incident (2026-06-09): an unsigned
+    // P2WPKH spend was accepted because the verifier applied MAINNET
+    // activation heights on signet — at signet height 308_124 < 481_824 the
+    // WITNESS flag was off, making witness programs anyone-can-spend. With
+    // per-network heights, witness rules are active from genesis on signet,
+    // testnet4, and regtest, and BOTH engines must reject this tx at any
+    // height there.
+    #[test]
+    fn unsigned_p2wpkh_spend_rejected_on_always_active_networks() {
+        let (tx, prevs) = unsigned_p2wpkh_spend();
+        for net in [Network::Signet, Network::Testnet4, Network::Regtest] {
+            for height in [1, 308_124, 481_824] {
+                assert!(
+                    ConsensusVerifier::new(net).verify_transaction(&tx, &prevs, height).is_err(),
+                    "cpp engine accepted unsigned P2WPKH spend on {net} at {height}"
+                );
+                assert!(
+                    RustVerifier::new(net).verify_transaction(&tx, &prevs, height).is_err(),
+                    "rust engine accepted unsigned P2WPKH spend on {net} at {height}"
+                );
+            }
+        }
+        // Pin the mainnet height-gate, which reproduces Core's historical
+        // acceptance: below the segwit gate witness programs are
+        // anyone-can-spend (this is why mainnet stays height-gated and the
+        // other networks must not be).
+        assert!(
+            ConsensusVerifier::new(Network::Bitcoin)
+                .verify_transaction(&tx, &prevs, 308_124)
+                .is_ok()
+        );
+        assert!(
+            ConsensusVerifier::new(Network::Bitcoin)
+                .verify_transaction(&tx, &prevs, 481_824)
+                .is_err()
+        );
     }
 }
 
