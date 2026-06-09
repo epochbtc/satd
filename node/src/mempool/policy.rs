@@ -128,8 +128,11 @@ mod tests {
         assert_eq!(weight_to_vsize(1108), 277);
         assert_eq!(fee_rate_sat_per_kvb(412, 1108), 1487);
         assert!(fee_rate_sat_per_kvb(412, 1108) >= DEFAULT_MIN_RELAY_FEE_RATE);
-        // The buggy weight-based value, for contrast, was below the floor.
-        assert!(412 * 1000 / 1108 < DEFAULT_MIN_RELAY_FEE_RATE);
+        // For contrast, the old formula divided by weight (1108) not vsize (277),
+        // giving 371 — below the floor. `black_box` keeps it a runtime check.
+        let buggy_weight_based = std::hint::black_box(412u64) * 1000 / 1108;
+        assert_eq!(buggy_weight_based, 371);
+        assert!(buggy_weight_based < DEFAULT_MIN_RELAY_FEE_RATE);
         // Exactly 1 sat/vB sits right on the floor.
         assert_eq!(fee_rate_sat_per_kvb(277, 1108), 1000);
         // vsize rounds up (ceil), matching Core's GetVirtualTransactionSize.
