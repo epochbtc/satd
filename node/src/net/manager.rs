@@ -3601,7 +3601,7 @@ impl PeerManager {
             let sum_outputs: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
             if sum_inputs >= sum_outputs {
                 let fee = sum_inputs - sum_outputs;
-                let fee_rate = fee * 1000 / weight; // sat/kvB
+                let fee_rate = crate::mempool::policy::fee_rate_sat_per_kvb(fee, weight); // sat/kvB
                 fee_rates.push(fee_rate);
             }
         }

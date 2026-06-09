@@ -188,7 +188,7 @@ fn simulate_one_block(remaining: &HashMap<Txid, MempoolEntry>) -> (SimBlock, Has
         if weight == 0 {
             continue;
         }
-        let rate = fee.saturating_mul(1000) / weight;
+        let rate = crate::mempool::policy::fee_rate_sat_per_kvb(fee, weight);
         sorted.push((*txid, rate));
     }
     // Highest ancestor-feerate first.
@@ -236,7 +236,7 @@ fn simulate_one_block(remaining: &HashMap<Txid, MempoolEntry>) -> (SimBlock, Has
             // the next candidate (may be smaller in sigops).
             continue;
         }
-        let marginal_rate = group_fee.saturating_mul(1000) / group_weight;
+        let marginal_rate = crate::mempool::policy::fee_rate_sat_per_kvb(group_fee, group_weight);
         used_weight += group_weight;
         used_sigops += group_sigops;
         min_admitted_rate = marginal_rate;
@@ -269,11 +269,8 @@ pub fn build_histogram(entries: &HashMap<Txid, MempoolEntry>) -> Vec<HistogramBu
         .collect();
     let mut weights: Vec<u64> = vec![0; bounds_kvb.len()];
     for entry in entries.values() {
-        let rate = if entry.weight == 0 {
-            0
-        } else {
-            effective_fee(entry).saturating_mul(1000) / entry.weight as u64
-        };
+        let rate =
+            crate::mempool::policy::fee_rate_sat_per_kvb(effective_fee(entry), entry.weight as u64);
         // Drop into the highest bucket whose boundary is ≤ rate.
         let mut idx: Option<usize> = None;
         for (i, b) in bounds_kvb.iter().enumerate() {
@@ -457,11 +454,7 @@ mod tests {
         weight: usize,
         sigop_cost: u64,
     ) -> MempoolEntry {
-        let fee_rate = if weight > 0 {
-            fee * 1000 / weight as u64
-        } else {
-            0
-        };
+        let fee_rate = crate::mempool::policy::fee_rate_sat_per_kvb(fee, weight as u64);
         MempoolEntry {
             tx,
             fee,
@@ -505,7 +498,8 @@ mod tests {
         let tx = mk_tx(&[], 1);
         let txid = tx.compute_txid();
         let weight = (THIN_BLOCK_WEIGHT_THRESHOLD as usize) + 1;
-        let fee = (weight as u64) * 10_000 / 1_000; // 10_000 sat/kvB
+        // Fee for 10_000 sat/kvB measured per vbyte (fee = rate * vsize / 1000).
+        let fee = crate::mempool::policy::weight_to_vsize(weight as u64) * 10_000 / 1_000;
         let entry = mk_entry(tx, fee, weight);
         let snap = vec![(txid, entry)];
         let est = estimate_from_mempool(snap, 3);
@@ -523,9 +517,10 @@ mod tests {
         let tx_b = mk_tx(&[], 2);
         let ta = tx_a.compute_txid();
         let tb = tx_b.compute_txid();
-        // 2 sat/vB (2000 sat/kvB) and 20 sat/vB (20000 sat/kvB)
-        let ea = mk_entry(tx_a, 200, 100); // 2000 sat/kvB
-        let eb = mk_entry(tx_b, 2000, 100); // 20000 sat/kvB
+        // 2 sat/vB (2000 sat/kvB) and 20 sat/vB (20000 sat/kvB). Weight 400 =
+        // 100 vbytes, so fee/vsize gives the intended per-vbyte rate.
+        let ea = mk_entry(tx_a, 200, 400); // 200 / 100 vB = 2000 sat/kvB
+        let eb = mk_entry(tx_b, 2000, 400); // 2000 / 100 vB = 20000 sat/kvB
         let est = estimate_from_mempool(vec![(ta, ea), (tb, eb)], 1);
         let rates: Vec<u64> = est
             .histogram
@@ -549,12 +544,12 @@ mod tests {
         let child_txid = child.compute_txid();
 
         let parent_entry = mk_entry(parent, 0, 400); // 0 sat/kvB on its own
-        let child_entry = mk_entry(child, 2_000, 400); // 5000 sat/kvB on its own
+        let child_entry = mk_entry(child, 2_000, 400); // 2000 / 100 vB = 20000 sat/kvB on its own
         let snap = vec![(parent_txid, parent_entry), (child_txid, child_entry)];
         let est = estimate_from_mempool(snap, 1);
         assert_eq!(est.sim_blocks[0].tx_count, 2, "CPFP must pull parent in");
-        // Combined package: 2000 sat / 800 wu = 2500 sat/kvB.
-        assert_eq!(est.sim_blocks[0].min_feerate_sat_per_kvb, 2500);
+        // Combined package: 2000 sat / 200 vB (800 wu) = 10000 sat/kvB.
+        assert_eq!(est.sim_blocks[0].min_feerate_sat_per_kvb, 10_000);
     }
 
     #[test]
@@ -589,7 +584,8 @@ mod tests {
         let tx = mk_tx(&[], 1);
         let txid = tx.compute_txid();
         let weight = (THIN_BLOCK_WEIGHT_THRESHOLD as usize) + 1;
-        let fee = (weight as u64) * 100 / 1_000; // 100 sat/kvB
+        // 100 sat/kvB measured per vbyte — still below the 1000 floor.
+        let fee = crate::mempool::policy::weight_to_vsize(weight as u64) * 100 / 1_000;
         let entry = mk_entry(tx, fee, weight);
         let est = estimate_from_mempool(vec![(txid, entry)], 3);
         let (rate, conf) = target_estimate(&est, 1, 1000);
@@ -613,14 +609,15 @@ mod tests {
         let child_y = mk_tx(&[(parent_id, 1)], 1);
         let y_id = child_y.compute_txid();
 
-        // P: 0 fee, 400 wu → 0 sat/kvB on its own.
-        // X: 100_000 fee, 400 wu → 250_000 sat/kvB on its own.
-        //    X's ancestor (P+X): 100k/800 = 125_000 sat/kvB.
-        // Y: 1_000 fee, 400 wu → 2_500 sat/kvB on its own.
-        //    Y's ancestor (P+Y): 1k/800 = 1_250 sat/kvB (drags low).
-        // Sort: X first (125k), then Y (1.25k). X admits P+X.
-        // Y's marginal at admission (P already in) = 1000/400 = 2500.
-        // Therefore min_admitted_rate must be 2500, not 1250.
+        // (Rates are sat/kvB = per vbyte; 400 wu = 100 vB, 800 wu = 200 vB.)
+        // P: 0 fee, 100 vB → 0 sat/kvB on its own.
+        // X: 100_000 fee, 100 vB → 1_000_000 sat/kvB on its own.
+        //    X's ancestor (P+X): 100k/200 vB = 500_000 sat/kvB.
+        // Y: 1_000 fee, 100 vB → 10_000 sat/kvB on its own.
+        //    Y's ancestor (P+Y): 1k/200 vB = 5_000 sat/kvB (drags low).
+        // Sort: X first (500k), then Y (5k). X admits P+X.
+        // Y's marginal at admission (P already in) = 1000/100 vB = 10_000.
+        // Therefore min_admitted_rate must be 10_000, not 5_000.
         let p = mk_entry(parent, 0, 400);
         let ex = mk_entry(child_x, 100_000, 400);
         let ey = mk_entry(child_y, 1_000, 400);
@@ -631,7 +628,7 @@ mod tests {
             "all three should be admitted"
         );
         assert_eq!(
-            est.sim_blocks[0].min_feerate_sat_per_kvb, 2_500,
+            est.sim_blocks[0].min_feerate_sat_per_kvb, 10_000,
             "Y's marginal rate at admission — P already paid for"
         );
     }
@@ -654,7 +651,7 @@ mod tests {
         let est = estimate_from_mempool(snap, 1);
         assert_eq!(est.sim_blocks[0].tx_count, 1);
         // The admitted tx must be the ok one, not the sigop-heavy one.
-        let expected_rate = 2_000u64 * 1_000 / 400;
+        let expected_rate = crate::mempool::policy::fee_rate_sat_per_kvb(2_000, 400);
         assert_eq!(
             est.sim_blocks[0].min_feerate_sat_per_kvb, expected_rate,
             "sigop-heavy tx should not have set the floor"
@@ -697,7 +694,7 @@ mod tests {
         let tx = mk_tx(&[], 1);
         let txid = tx.compute_txid();
         let weight = (THIN_BLOCK_WEIGHT_THRESHOLD - 1) as usize;
-        let fee = (weight as u64) * 10_000 / 1_000;
+        let fee = crate::mempool::policy::weight_to_vsize(weight as u64) * 10_000 / 1_000;
         let entry = mk_entry(tx, fee, weight);
         let est = estimate_from_mempool(vec![(txid, entry)], 6);
         assert!(is_thin_block(&est));

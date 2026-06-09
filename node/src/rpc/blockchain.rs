@@ -547,7 +547,7 @@ pub fn get_block_stats(
 
             let w = tx.weight().to_wu();
             if w > 0 {
-                let rate = fee * 1000 / w;
+                let rate = crate::mempool::policy::fee_rate_sat_per_kvb(fee, w);
                 min_fee_rate = min_fee_rate.min(rate);
                 max_fee_rate = max_fee_rate.max(rate);
             }
@@ -571,7 +571,7 @@ pub fn get_block_stats(
         0
     };
     let avg_fee_rate = if total_weight > 0 && num_txs > 1 {
-        total_fee * 1000 / total_weight
+        crate::mempool::policy::fee_rate_sat_per_kvb(total_fee, total_weight)
     } else {
         0
     };
