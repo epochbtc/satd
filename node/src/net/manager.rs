@@ -3078,8 +3078,29 @@ impl PeerManager {
         // into steady-state operation. We still call `flush_durable` every
         // 1000 blocks below so a crash during IBD replays at most ~1000
         // blocks of work.
-        let _bulk_guard = BulkLoadGuard::new(chain_state);
-        tracing::info!("IBD write mode: BulkLoad (WAL disabled, flush every 1000 blocks)");
+        //
+        // Small catch-ups keep the WAL. BulkLoad's WAL-less writes are
+        // volatile until a memtable flush, and its throughput win only
+        // matters on replays measured in tens of thousands of blocks. A
+        // routine restart's catch-up gets no measurable speedup but
+        // inherits the full data-loss exposure — mainnet block 952978's
+        // connect delta was lost from exactly this window after a 64-block
+        // catch-up.
+        let blocks_behind = target.saturating_sub(chain_state.tip_height());
+        let _bulk_guard = if use_bulkload_for_catchup(blocks_behind) {
+            tracing::info!(
+                blocks_behind,
+                "IBD write mode: BulkLoad (WAL disabled, flush every 1000 blocks)"
+            );
+            Some(BulkLoadGuard::new(chain_state))
+        } else {
+            tracing::info!(
+                blocks_behind,
+                threshold = BULKLOAD_MIN_BLOCKS_BEHIND,
+                "IBD write mode: Normal (catch-up below BulkLoad threshold; WAL stays on)"
+            );
+            None
+        };
 
         // RocksDB compaction backpressure state. We log a single warn when
         // we first start pausing in a sustained-pressure window, and a
@@ -4952,6 +4973,23 @@ pub fn reconsider_orphans_on_block(
     }
 }
 
+/// Minimum catch-up size (blocks behind the IBD target) before the
+/// connect loop disables the RocksDB WAL via [`BulkLoadGuard`].
+///
+/// Below this, the WAL's per-write cost is noise but its crash-safety is
+/// not: WAL-less writes survive a process exit only if a memtable flush
+/// happened to run after them, and short catch-ups write too little data
+/// to ever trigger one organically. 10k blocks is roughly two months of
+/// mainnet — anything a routine restart or brief outage produces stays in
+/// Normal mode.
+const BULKLOAD_MIN_BLOCKS_BEHIND: u32 = 10_000;
+
+/// Whether a catch-up of `blocks_behind` blocks is large enough to be
+/// worth running with the WAL disabled.
+fn use_bulkload_for_catchup(blocks_behind: u32) -> bool {
+    blocks_behind >= BULKLOAD_MIN_BLOCKS_BEHIND
+}
+
 /// RAII guard that scopes `WriteMode::BulkLoad` to a lexical region.
 ///
 /// Constructor sets BulkLoad. `Drop` attempts a best-effort
@@ -5039,6 +5077,18 @@ mod tests {
         bitcoin::BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
             [byte; 32],
         ))
+    }
+
+    /// Small catch-ups must keep the WAL: a routine restart's connect run
+    /// gains nothing from BulkLoad but inherits its full WAL-less
+    /// data-loss exposure (mainnet-952978 regression).
+    #[test]
+    fn bulkload_reserved_for_large_catchups() {
+        assert!(!use_bulkload_for_catchup(0));
+        assert!(!use_bulkload_for_catchup(64)); // the 952978 incident size
+        assert!(!use_bulkload_for_catchup(BULKLOAD_MIN_BLOCKS_BEHIND - 1));
+        assert!(use_bulkload_for_catchup(BULKLOAD_MIN_BLOCKS_BEHIND));
+        assert!(use_bulkload_for_catchup(u32::MAX)); // full IBD
     }
 
     #[test]

@@ -3072,14 +3072,20 @@ impl ChainState {
         // inner replay), so BulkLoad semantics never leak into steady state.
         self.set_write_mode(crate::storage::WriteMode::BulkLoad);
         let result = self.reindex_replay(stop_at, progress);
-        if let Err(e) = self.flush_durable() {
+        let flush_result = self.flush_durable();
+        self.set_write_mode(crate::storage::WriteMode::Normal);
+        if let Err(e) = flush_result {
             tracing::error!(
                 error = %e,
-                "reindex: durable flush on exit failed; restoring Normal write mode anyway \
-                 (next startup replays from the flat-file block store)"
+                "reindex: durable flush on exit failed; the replayed chainstate is NOT \
+                 durable (WAL-less writes may still be memtable-only). Failing the \
+                 reindex rather than reporting a completion the disk cannot back."
             );
+            // Fail closed: a reindex that "completed" without a durable
+            // checkpoint reports success while the tail of its writes can
+            // vanish on exit — the exact shape of the 952914-rollback bug.
+            return result.and(Err(ChainError::Storage(e)));
         }
-        self.set_write_mode(crate::storage::WriteMode::Normal);
         result
     }
 

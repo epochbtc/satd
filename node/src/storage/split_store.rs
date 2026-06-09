@@ -177,6 +177,10 @@ impl Store for SplitStore {
     }
 
     fn flush_durable(&self) -> Result<(), StoreError> {
+        // Both halves: the coins store carries the WAL-less (BulkLoad)
+        // writes, but the shared block store must honor the same
+        // "durable after this returns" contract callers rely on.
+        self.block_store.flush_durable()?;
         self.coins_store.flush_durable()
     }
 
@@ -269,5 +273,25 @@ mod tests {
         assert!(split.get_coin(&op).is_some());
         assert_eq!(split.get_tip(), Some(hash));
         assert_eq!(split.coin_count(), coins_store.coin_count());
+    }
+
+    /// `flush_durable` must reach BOTH halves. Flushing only the coins
+    /// store leaves the shared block store's memtable contents volatile,
+    /// breaking the "durable after this returns" contract callers
+    /// (IBD completion, reindex, shutdown) rely on.
+    #[test]
+    fn flush_durable_reaches_both_stores() {
+        use crate::storage::db::InMemoryStore;
+
+        let block_store = InMemoryStore::new();
+        let coins_store = InMemoryStore::new();
+        let block_flushes = block_store.flush_durable_counter();
+        let coins_flushes = coins_store.flush_durable_counter();
+
+        let split = SplitStore::new(Arc::new(block_store), Arc::new(coins_store));
+        split.flush_durable().unwrap();
+
+        assert_eq!(block_flushes.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(coins_flushes.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 }

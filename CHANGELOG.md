@@ -14,6 +14,15 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
 In-progress; full detail tracked in
 [`docs/release-notes/0.3.0-pre.md`](docs/release-notes/0.3.0-pre.md).
 
+- **Storage (CRITICAL)** — fixed silent UTXO/index data loss after IBD or
+  reindex: `flush_durable()` flushed only RocksDB's (empty) default column
+  family, so WAL-disabled (BulkLoad) writes could evaporate on the next
+  restart — losing a connected block's coins/txindex/undo wholesale and
+  wedging the node with `bad-txns-inputs-missingorspent`. Durable flushes now
+  cover every column family; `SplitStore` flushes both halves; leaving
+  BulkLoad mode flushes durably by construction; a reindex whose exit flush
+  fails now reports failure instead of success; and small catch-ups
+  (<10,000 blocks behind) keep the WAL on.
 - **Consensus** — six block-level rules brought to Bitcoin Core parity (sigop
   cost, BIP30, future-timestamp, block-version gate, merkle-mutation
   /CVE-2012-2459, per-tx weight cap); reject-reason strings aligned; on-receipt
