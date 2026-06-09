@@ -36,6 +36,9 @@ In-progress; full detail tracked in
   sync. Parent pointers are always present for any ancestor held, so difficulty
   is now immune to height-index gaps. (Observed live: a testnet4 node stuck at a
   height whose next real-difficulty block sat just past a one-block index gap.)
+  Difficulty computation across all networks now also fails **closed**: a
+  missing retarget-period seed or an unresolvable walk-back ancestor rejects the
+  block as `bad-diffbits` instead of substituting a wrong (too-easy) value.
 - **Reliability (P2P)** — stopped charging ban score for *policy* transaction
   rejections (min-relay-fee, dust, mempool-full, RBF, conflicts, non-standard).
   Only consensus-invalid txs (bad script / outputs-exceed-inputs) are now scored,

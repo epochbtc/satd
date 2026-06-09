@@ -57,7 +57,7 @@ where
         }
         Network::Testnet => {
             let expected =
-                calculate_next_bits_testnet(height, header, prev, &get_ancestor, &get_by_hash, false);
+                calculate_next_bits_testnet(height, header, prev, &get_ancestor, &get_by_hash, false)?;
             if header.bits.to_consensus() != expected {
                 return Err(ValidationError::BadDifficulty);
             }
@@ -82,7 +82,7 @@ where
                 return Err(ValidationError::TimewarpAttack);
             }
             let expected =
-                calculate_next_bits_testnet(height, header, prev, &get_ancestor, &get_by_hash, true);
+                calculate_next_bits_testnet(height, header, prev, &get_ancestor, &get_by_hash, true)?;
             if header.bits.to_consensus() != expected {
                 return Err(ValidationError::BadDifficulty);
             }
@@ -90,7 +90,7 @@ where
         }
         _ => {
             // Mainnet
-            let expected = calculate_next_bits(height, prev, &get_ancestor);
+            let expected = calculate_next_bits(height, prev, &get_ancestor)?;
             if header.bits.to_consensus() != expected {
                 return Err(ValidationError::BadDifficulty);
             }
@@ -100,28 +100,34 @@ where
 }
 
 /// Calculate expected difficulty bits for mainnet.
-fn calculate_next_bits<F>(height: u32, prev: &BlockIndexEntry, get_ancestor: &F) -> u32
+///
+/// Fails closed (`BadDifficulty`) if the retarget-period seed block cannot be
+/// found: a missing seed means we cannot compute the expected difficulty, so we
+/// must reject rather than substitute `prev`'s bits (which would let an
+/// under-difficulty block through at a retarget boundary on a damaged index).
+fn calculate_next_bits<F>(
+    height: u32,
+    prev: &BlockIndexEntry,
+    get_ancestor: &F,
+) -> Result<u32, ValidationError>
 where
     F: Fn(u32) -> Option<BlockIndexEntry>,
 {
     // If not at a retarget boundary, bits must match parent
     if !height.is_multiple_of(RETARGET_INTERVAL) {
-        return prev.header.bits.to_consensus();
+        return Ok(prev.header.bits.to_consensus());
     }
 
     // At retarget boundary: calculate new target
     let retarget_start_height = height - RETARGET_INTERVAL;
-    let first_entry = match get_ancestor(retarget_start_height) {
-        Some(e) => e,
-        None => return prev.header.bits.to_consensus(),
-    };
+    let first_entry = get_ancestor(retarget_start_height).ok_or(ValidationError::BadDifficulty)?;
 
     let actual_timespan = prev.header.time.saturating_sub(first_entry.header.time);
 
     // Clamp to [TARGET_TIMESPAN/4, TARGET_TIMESPAN*4]
     let actual_timespan = actual_timespan.clamp(TARGET_TIMESPAN / 4, TARGET_TIMESPAN * 4);
 
-    retarget(prev.header.bits, actual_timespan, MAINNET_POWLIMIT_BITS)
+    Ok(retarget(prev.header.bits, actual_timespan, MAINNET_POWLIMIT_BITS))
 }
 
 /// Retarget calculation under BIP 94 (testnet4). Identical to
@@ -130,22 +136,24 @@ where
 /// Core's `CalculateNextWorkRequired` when `enforce_BIP94`), not the
 /// previous block. This prevents a testnet min-difficulty block at the
 /// end of a period from resetting the period's real difficulty.
-fn calculate_next_bits_bip94<F>(height: u32, prev: &BlockIndexEntry, get_ancestor: &F) -> u32
+fn calculate_next_bits_bip94<F>(
+    height: u32,
+    prev: &BlockIndexEntry,
+    get_ancestor: &F,
+) -> Result<u32, ValidationError>
 where
     F: Fn(u32) -> Option<BlockIndexEntry>,
 {
     if !height.is_multiple_of(RETARGET_INTERVAL) {
-        return prev.header.bits.to_consensus();
+        return Ok(prev.header.bits.to_consensus());
     }
     let retarget_start_height = height - RETARGET_INTERVAL;
-    let first_entry = match get_ancestor(retarget_start_height) {
-        Some(e) => e,
-        None => return prev.header.bits.to_consensus(),
-    };
+    // Fail closed if the period's first block is missing (see `calculate_next_bits`).
+    let first_entry = get_ancestor(retarget_start_height).ok_or(ValidationError::BadDifficulty)?;
     let actual_timespan = prev.header.time.saturating_sub(first_entry.header.time);
     let actual_timespan = actual_timespan.clamp(TARGET_TIMESPAN / 4, TARGET_TIMESPAN * 4);
     // BIP 94: seed from the first block of the period, not `prev`.
-    retarget(first_entry.header.bits, actual_timespan, MAINNET_POWLIMIT_BITS)
+    Ok(retarget(first_entry.header.bits, actual_timespan, MAINNET_POWLIMIT_BITS))
 }
 
 /// Calculate expected difficulty bits for testnet (with special min-difficulty rule).
@@ -166,7 +174,7 @@ fn calculate_next_bits_testnet<F, G>(
     get_ancestor: &F,
     get_by_hash: &G,
     bip94: bool,
-) -> u32
+) -> Result<u32, ValidationError>
 where
     F: Fn(u32) -> Option<BlockIndexEntry>,
     G: Fn(&BlockHash) -> Option<BlockIndexEntry>,
@@ -184,7 +192,7 @@ where
 
     // Testnet special rule: if >20 minutes since last block, allow min difficulty
     if header.time > prev.header.time + TESTNET_ALLOW_MIN_DIFF_AFTER {
-        return TESTNET_POWLIMIT_BITS;
+        return Ok(TESTNET_POWLIMIT_BITS);
     }
 
     // Otherwise, walk back (via parent pointers) to the last block that is
@@ -203,11 +211,16 @@ where
         }
         match get_by_hash(&current.header.prev_blockhash) {
             Some(e) => current = e,
-            None => break,
+            // Fail closed. A non-boundary, non-genesis, min-difficulty block
+            // whose parent we cannot resolve by hash means we are missing an
+            // ancestor we should hold (a store-integrity violation, not a mere
+            // height-index gap). Returning here would otherwise yield powlimit
+            // and accept an under-difficulty block — reject instead.
+            None => return Err(ValidationError::BadDifficulty),
         }
     }
 
-    current.header.bits.to_consensus()
+    Ok(current.header.bits.to_consensus())
 }
 
 /// Compute new target bits after retarget.
@@ -390,6 +403,76 @@ mod tests {
             check_difficulty(&new_header, &prev, Network::Testnet4, get_ancestor, get_by_hash)
                 .is_ok(),
             "walk-back must follow parent pointers and survive the height-index gap"
+        );
+    }
+
+    /// Companion to the walk-back gap test: if the by-hash walk itself cannot
+    /// resolve a mid-walk ancestor (a store-integrity violation, not merely a
+    /// height-index gap), difficulty computation must FAIL CLOSED — reject as
+    /// `BadDifficulty` rather than fall through to powlimit and accept an
+    /// under-difficulty block.
+    #[test]
+    fn testnet_min_difficulty_walkback_missing_ancestor_is_fail_closed() {
+        use std::collections::HashMap;
+        let pow = TESTNET_POWLIMIT_BITS;
+
+        let mut by_height: HashMap<u32, BlockIndexEntry> = HashMap::new();
+        let mut by_hash: HashMap<BlockHash, BlockIndexEntry> = HashMap::new();
+        let mut prev_hash = bitcoin::constants::genesis_block(Network::Testnet4).block_hash();
+        let base_time = 1_700_000_000u32;
+        for h in 100..=110u32 {
+            let mut hdr = bitcoin::constants::genesis_block(Network::Testnet4).header;
+            hdr.prev_blockhash = prev_hash;
+            hdr.time = base_time + (h - 100) * 100; // <20min apart
+            hdr.bits = CompactTarget::from_consensus(if h == 100 { 0x1a00ffff } else { pow });
+            let e = entry(hdr, h);
+            let hash = hdr.block_hash();
+            by_height.insert(h, e.clone());
+            // Height 105 is genuinely absent from the by-hash store: the walk
+            // (110→…→106) must request 105 by parent hash and find nothing.
+            if h != 105 {
+                by_hash.insert(hash, e);
+            }
+            prev_hash = hash;
+        }
+
+        let prev = by_height[&110].clone();
+        let mut new_header = bitcoin::constants::genesis_block(Network::Testnet4).header;
+        new_header.prev_blockhash = prev.header.block_hash();
+        new_header.time = prev.header.time + 100; // <20min → walk-back runs
+        new_header.bits = CompactTarget::from_consensus(0x1a00ffff);
+
+        let get_ancestor = |h: u32| by_height.get(&h).cloned();
+        let get_by_hash = |hsh: &BlockHash| by_hash.get(hsh).cloned();
+
+        assert!(
+            matches!(
+                check_difficulty(&new_header, &prev, Network::Testnet4, get_ancestor, get_by_hash),
+                Err(ValidationError::BadDifficulty)
+            ),
+            "a missing by-hash ancestor mid-walk must fail closed, not return powlimit"
+        );
+    }
+
+    /// Mainnet retarget must fail closed if the period's seed block is missing
+    /// from the index, rather than substituting `prev`'s bits — which would
+    /// accept an under-difficulty block at the boundary on a damaged index.
+    #[test]
+    fn mainnet_retarget_missing_seed_is_fail_closed() {
+        // prev at height 2015 → child height 2016 is a retarget boundary.
+        let genesis = bitcoin::constants::genesis_block(Network::Bitcoin);
+        let mut prev_header = genesis.header;
+        prev_header.bits = CompactTarget::from_consensus(0x1a00ffff);
+        let prev = entry(prev_header, 2015);
+
+        let mut new_header = genesis.header;
+        new_header.bits = prev_header.bits;
+
+        // The seed lookup (height 0) returns None → retarget cannot be computed.
+        let res = check_difficulty(&new_header, &prev, Network::Bitcoin, |_| None, |_| None);
+        assert!(
+            matches!(res, Err(ValidationError::BadDifficulty)),
+            "missing retarget seed must fail closed, got {res:?}"
         );
     }
 
