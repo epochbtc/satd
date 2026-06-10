@@ -252,7 +252,7 @@ error rather than a silent pick.
 | `mempoolexpiry` | 336 h | hot | core | Mempool entry expiry in hours. |
 | `persistmempool` | on | hot | core | Persist the mempool to `mempool.dat` across restarts. |
 | `rebroadcastinterval` | 0 (auto) | restart | satd | Seconds between rebroadcasts of unconfirmed *local* transactions (those submitted here via `sendrawtransaction`, the MCP tool, Esplora `POST /tx`, or Electrum `transaction.broadcast`). `0` = auto: a randomized 10–15 min interval per pass, matching Bitcoin Core. A locally-submitted tx is re-announced until enough peers echo it back (see `broadcastconfirmpeers`) or it leaves the mempool, so it still propagates if no peer was connected at submit time. |
-| `broadcastconfirmpeers` | 1 | restart | satd | Distinct peers that must announce a locally-broadcast tx back to this node before it is considered propagated and rebroadcast stops. Raising it demands wider observed propagation before giving up retries. |
+| `broadcastconfirmpeers` | 1 | restart | satd | Distinct peers that must take a locally-broadcast tx — fetch it from us via `getdata` (primary signal) or announce it back via `inv` — before it is considered propagated and rebroadcast stops. Raising it demands wider observed propagation before giving up retries. |
 | `permitbaremultisig` | on | hot | core | Allow bare multisig outputs. |
 | `acceptnonstdtxn` | off | hot | core | Relay and accept non-standard transactions (bypass the standardness relay checks — oversize, dust, OP_RETURN/datacarrier, non-standard scripts). Consensus rules are never relaxed. Intended for test/dev networks. |
 

@@ -19,8 +19,8 @@ In-progress; full detail tracked in
   Esplora `POST /tx`, Electrum `transaction.broadcast`/`broadcast_package`)
   announces the tx to peers through one shared path, and a new rebroadcast
   loop re-announces unconfirmed local txs — on a timer and on new-peer
-  connect — until enough peers echo them back or they leave the mempool, so
-  a tx submitted with no peers connected is no longer stranded.
+  connect — until enough peers fetch them (via `getdata`) or they leave the
+  mempool, so a tx submitted with no peers connected is no longer stranded.
   `getmempoolinfo.unbroadcastcount` and the per-entry `unbroadcast` flag now
   report real values. New knobs: `rebroadcastinterval` (default `0` = auto,
   randomized 10–15 min) and `broadcastconfirmpeers` (default `1`).

@@ -2281,9 +2281,11 @@ impl PeerManager {
                 Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
                     if self.mempool.get(&txid).is_some() {
                         // We already have it. If it's one of our pending local
-                        // broadcasts, a peer announcing it back is evidence it
-                        // propagated — count the echo toward stopping rebroadcast.
-                        self.note_broadcast_echo(id, txid);
+                        // broadcasts, a peer announcing it back is a secondary
+                        // sign it propagated — count it toward stopping
+                        // rebroadcast (the primary signal is a peer fetching it
+                        // from us via `getdata`; see `handle_getdata`).
+                        self.note_broadcast_witness(id, txid);
                     } else if !self.is_ibd() && !self.blocksonly() {
                         // Don't request transactions during IBD — we can't
                         // validate them — nor under -blocksonly (no tx relay).
@@ -3961,7 +3963,7 @@ impl PeerManager {
     /// fee-permitting peers. Run periodically by the rebroadcast task; the
     /// `unbroadcast_txids` call also prunes txids that have since left the
     /// mempool. A tx stops being rebroadcast once enough peers echo it back
-    /// (see [`note_broadcast_echo`](Self::note_broadcast_echo)) or it is
+    /// (see [`note_broadcast_witness`](Self::note_broadcast_witness)) or it is
     /// mined/evicted.
     pub fn rebroadcast_unbroadcast_txs(&self) {
         let txids = self.mempool.unbroadcast_txids();
@@ -3997,11 +3999,19 @@ impl PeerManager {
         }
     }
 
-    /// Record that peer `id` announced `txid` back to us. If `txid` is a
-    /// pending local broadcast, this is propagation evidence; once enough
-    /// distinct peers have echoed it the tx is dropped from the unbroadcast
-    /// set and rebroadcast stops.
-    fn note_broadcast_echo(&self, id: PeerId, txid: bitcoin::Txid) {
+    /// Record that peer `id` has demonstrated knowledge of `txid` — either by
+    /// fetching it from us via `getdata` (the primary, reliable signal: the
+    /// peer pulled the tx, so we've handed it off) or by announcing it back to
+    /// us via `inv`. If `txid` is a pending local broadcast, this is
+    /// propagation evidence; once enough distinct peers have witnessed it the
+    /// tx is dropped from the unbroadcast set and rebroadcast stops.
+    ///
+    /// `getdata` is the dominant signal for local txs: we announce a local tx
+    /// to every fee-permitting peer, and standard relay dedup means none of
+    /// them will `inv` it *back* to us (they know we have it) — but each that
+    /// didn't already hold it will `getdata` it within seconds. This mirrors
+    /// Bitcoin Core's `RemoveUnbroadcastTx`-on-`getdata`.
+    fn note_broadcast_witness(&self, id: PeerId, txid: bitcoin::Txid) {
         let threshold = self.broadcast_confirm_peers.load(Ordering::Relaxed) as usize;
         if self.mempool.record_broadcast_witness(&txid, id, threshold) {
             tracing::debug!(%txid, "local tx confirmed propagated; rebroadcast stopped");
@@ -4325,6 +4335,10 @@ impl PeerManager {
                 Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
                     if let Some(entry) = self.mempool.get(&txid) {
                         self.send_to_peer(id, NetworkMessage::Tx(entry.tx));
+                        // The peer pulled this tx from us. If it's a pending
+                        // local broadcast, that's the primary proof it has
+                        // propagated — count the peer toward stopping rebroadcast.
+                        self.note_broadcast_witness(id, txid);
                     } else {
                         not_found.push(inv);
                     }
@@ -5753,9 +5767,10 @@ mod tests {
     }
 
     /// The periodic rebroadcast pass re-announces every unbroadcast local tx
-    /// to fee-permitting peers, and an echo from a peer clears it from the set.
+    /// to fee-permitting peers; a peer fetching it via `getdata` is the
+    /// primary signal that clears it from the set.
     #[test]
-    fn rebroadcast_reannounces_then_echo_clears() {
+    fn rebroadcast_reannounces_then_getdata_clears() {
         use bitcoin::hashes::Hash;
         let (pm, _dir) = mk_test_pm();
         pm.set_rebroadcast_config(0, 1); // auto interval, 1-peer confirm
@@ -5777,9 +5792,35 @@ mod tests {
         }
         assert!(pm.mempool.is_unbroadcast(&txid));
 
-        // A peer announcing it back (echo) confirms propagation → stop.
-        pm.note_broadcast_echo(2, txid);
-        assert!(!pm.mempool.is_unbroadcast(&txid), "echo at threshold 1 clears the set");
+        // The peer fetches it via getdata → we serve the tx AND record the
+        // peer as a propagation witness, clearing it at threshold 1.
+        pm.handle_getdata(1, vec![Inventory::WitnessTransaction(txid)]);
+        // (The synthetic test entry's real txid differs from its map key, so
+        // assert we served a Tx rather than recomputing the id.)
+        match rx1.try_recv() {
+            Ok(NetworkMessage::Tx(_)) => {}
+            other => panic!("getdata should be served the tx, got {other:?}"),
+        }
+        assert!(
+            !pm.mempool.is_unbroadcast(&txid),
+            "a peer fetching the tx via getdata clears the unbroadcast set at threshold 1"
+        );
+    }
+
+    /// A peer announcing the tx back via `inv` is also accepted as a
+    /// (secondary) propagation witness.
+    #[test]
+    fn inv_echo_also_confirms_propagation() {
+        use bitcoin::hashes::Hash;
+        let (pm, _dir) = mk_test_pm();
+        pm.set_rebroadcast_config(0, 1);
+        let txid =
+            bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([7u8; 32]));
+        pm.mempool.insert_unbroadcast_for_test(txid, 0);
+
+        // An inbound inv for a tx we already hold, from a peer, counts as a witness.
+        pm.handle_inv(2, vec![Inventory::WitnessTransaction(txid)]);
+        assert!(!pm.mempool.is_unbroadcast(&txid), "inv echo at threshold 1 clears the set");
     }
 
     /// On new-peer-connect we re-announce pending local txs to that peer, so a
