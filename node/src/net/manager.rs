@@ -3839,6 +3839,30 @@ impl PeerManager {
         }
     }
 
+    /// Broadcast a locally-originated transaction: decode it, accept it
+    /// into the mempool, then [`announce_tx`](Self::announce_tx) it to
+    /// peers. Returns the txid (as a JSON string) on success, or the
+    /// mempool error `(code, message)` on failure.
+    ///
+    /// This is the shared core behind every broadcast surface — the
+    /// `sendrawtransaction` JSON-RPC method and the MCP `send_transaction`
+    /// tool both route through it, so the announce step is part of the
+    /// operation itself and cannot be omitted by an individual handler
+    /// (the surfaces stay thin and only format the result/errors). A bare
+    /// mempool accept does not put a local-origin tx on the wire — the
+    /// peer-relay path only fires for txs received from another peer.
+    pub fn broadcast_transaction(
+        &self,
+        hex_tx: &str,
+    ) -> Result<serde_json::Value, (i32, String)> {
+        let result =
+            crate::rpc::rawtx::send_raw_transaction(&self.chain_state, &self.mempool, hex_tx)?;
+        if let Some(txid) = result.as_str().and_then(|s| s.parse().ok()) {
+            self.announce_tx(txid);
+        }
+        Ok(result)
+    }
+
     /// BFS-drain orphans that listed `parent` as a missing parent. Newly
     /// admitted children recursively trigger further drains. Orphans that
     /// still don't validate (other missing parents, or genuinely invalid)
@@ -5315,5 +5339,96 @@ mod tests {
             }
         }
         assert_eq!(addrs, vec![a, b]);
+    }
+
+    /// Like [`mk_handle`] but retains the channel receiver and lets the
+    /// caller set a fee filter, so a test can observe what `announce_tx`
+    /// enqueues to the peer.
+    fn mk_handle_rx(
+        id: PeerId,
+        addr: SocketAddr,
+        state: PeerState,
+        fee_filter: u64,
+    ) -> (PeerHandle, mpsc::Receiver<NetworkMessage>) {
+        let mut info = PeerInfo::new(id, addr, Direction::Outbound);
+        info.state = state;
+        info.fee_filter = fee_filter;
+        let (tx, rx) = mpsc::channel::<NetworkMessage>(8);
+        (
+            PeerHandle {
+                info,
+                msg_tx: tx,
+                last_getheaders_sent: None,
+                stats: PeerStats::new(NetTotals::new()),
+            },
+            rx,
+        )
+    }
+
+    /// `announce_tx` is the local-origin broadcast path shared by the
+    /// `sendrawtransaction` RPC and the MCP `send_transaction` tool. It
+    /// must enqueue a tx INV to every Connected, fee-permitting peer —
+    /// otherwise a locally-submitted tx enters the mempool but never
+    /// reaches the wire (the bug behind a signet broadcast that sat
+    /// unannounced for hours because the MCP tool skipped this call).
+    #[test]
+    fn announce_tx_invs_connected_fee_permitting_peers() {
+        use crate::chain::state::AssumeValid;
+        use crate::storage::db::InMemoryStore;
+        use crate::storage::flatfile::FlatFileManager;
+        use crate::validation::script::NoopVerifier;
+        use bitcoin::hashes::Hash;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Box::new(InMemoryStore::new());
+        let flat_files = FlatFileManager::new(&dir.path().join("blocks")).unwrap();
+        let chain_state = Arc::new(
+            ChainState::new(
+                store,
+                flat_files,
+                Network::Regtest,
+                Box::new(NoopVerifier),
+                AssumeValid::Disabled,
+                450,
+                4,
+                Default::default(),
+                Default::default(),
+            )
+            .unwrap(),
+        );
+        let mempool = Arc::new(Mempool::new(1_000_000, 0));
+        let fee_estimator = Arc::new(FeeEstimator::new());
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let pm =
+            PeerManager::new(chain_state, mempool, fee_estimator, Network::Regtest, shutdown_rx);
+
+        let addr: SocketAddr = "10.0.0.1:8333".parse().unwrap();
+        // The tx is absent from the (empty) mempool, so announce_tx treats
+        // its fee rate as 0 — only a peer whose fee_filter is also 0 clears it.
+        let (h1, mut rx1) = mk_handle_rx(1, addr, PeerState::Connected, 0);
+        let (h2, mut rx2) = mk_handle_rx(2, addr, PeerState::Connected, 1000);
+        let (h3, mut rx3) = mk_handle_rx(3, addr, PeerState::Connecting, 0);
+        {
+            let mut peers = pm.peers.write();
+            peers.insert(1, h1);
+            peers.insert(2, h2);
+            peers.insert(3, h3);
+        }
+
+        let txid =
+            bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([7u8; 32]));
+        pm.announce_tx(txid);
+
+        // Connected + fee-permitting peer gets exactly one tx inv.
+        match rx1.try_recv() {
+            Ok(NetworkMessage::Inv(inv)) => {
+                assert_eq!(inv, vec![Inventory::WitnessTransaction(txid)]);
+            }
+            other => panic!("connected fee-permitting peer should receive a tx inv, got {other:?}"),
+        }
+        // Fee filter above the tx rate → skipped.
+        assert!(rx2.try_recv().is_err(), "high-fee-filter peer must be skipped");
+        // Not yet Connected → skipped.
+        assert!(rx3.try_recv().is_err(), "non-Connected peer must be skipped");
     }
 }
