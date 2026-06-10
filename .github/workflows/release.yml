@@ -478,7 +478,7 @@ jobs:
 
       - name: Build (PR / dispatch — no push)
         if: ${{ ! startsWith(github.ref, 'refs/tags/') }}
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: ./Dockerfile
@@ -501,7 +501,7 @@ jobs:
       - name: Build and push by digest (tag)
         if: startsWith(github.ref, 'refs/tags/')
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: ./Dockerfile
@@ -650,7 +650,7 @@ jobs:
           # Filter out the per-arch digest artifacts (only the
           # merge-docker job needs them) and the auto-uploaded
           # `*.dockerbuild` build-record artifact that
-          # docker/build-push-action@v6 attaches by default. Both
+          # docker/build-push-action@v7 attaches by default. Both
           # were being pulled here previously, which (a) wasted
           # bandwidth and (b) bit us on v0.1.0-rc1 when an Azure
           # blob fetch on the dockerbuild artifact transient-failed
