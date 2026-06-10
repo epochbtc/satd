@@ -133,14 +133,21 @@ fn authenticate(
         .metadata()
         .get("authorization")
         .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| Status::unauthenticated("missing authorization metadata"))?;
+        .ok_or_else(|| {
+            debug!(target: "events::grpc", code = "unauthenticated", "rejecting Subscribe: missing authorization metadata");
+            Status::unauthenticated("missing authorization metadata")
+        })?;
     let mut scratch = String::new();
     let principal = match satd_auth::Credential::from_authorization(hdr, &mut scratch) {
         Some(satd_auth::Credential::Bearer { token }) => store.resolve(token, now_unix()),
         _ => None,
     }
-    .ok_or_else(|| Status::unauthenticated("invalid or unknown bearer token"))?;
+    .ok_or_else(|| {
+        debug!(target: "events::grpc", code = "unauthenticated", "rejecting Subscribe: invalid or unknown bearer token");
+        Status::unauthenticated("invalid or unknown bearer token")
+    })?;
     if !principal.has(satd_auth::Capability::StreamSubscribe) {
+        debug!(target: "events::grpc", code = "permission_denied", "rejecting Subscribe: token lacks stream:subscribe capability");
         return Err(Status::permission_denied(
             "token lacks the stream:subscribe capability",
         ));
@@ -291,6 +298,7 @@ impl EventSink for GrpcEventSink {
                 // Per-principal rate limit (operator/loopback bypass): shed an
                 // over-budget Subscribe with RESOURCE_EXHAUSTED, never block.
                 if let satd_auth::RateDecision::Throttle { .. } = principal.check_rate() {
+                    debug!(target: "events::grpc", code = "resource_exhausted", "rejecting Subscribe: per-principal rate limit exceeded");
                     return Err(Status::resource_exhausted("rate limit exceeded"));
                 }
                 req.extensions_mut().insert(principal);
@@ -618,6 +626,7 @@ impl NodeEventStream for NodeEventStreamSvc {
         request: Request<Streaming<pb::SubscribeControl>>,
     ) -> Result<Response<Self::WatchStream>, Status> {
         let registry = self.watch_registry.clone().ok_or_else(|| {
+            warn!(target: "events::grpc", code = "unavailable", "rejecting Watch: watch registry not configured on this server");
             Status::unavailable("watch registry not configured on this server")
         })?;
 
@@ -626,6 +635,11 @@ impl NodeEventStream for NodeEventStreamSvc {
             let active = self.active_subs.fetch_add(1, Ordering::AcqRel) + 1;
             if active > self.max_subscriptions {
                 self.active_subs.fetch_sub(1, Ordering::AcqRel);
+                warn!(
+                    target: "events::grpc",
+                    max_subscriptions = self.max_subscriptions,
+                    "events gRPC concurrent-subscription cap reached — rejecting Watch",
+                );
                 return Err(Status::resource_exhausted(
                     "events gRPC concurrent-subscription cap reached",
                 ));

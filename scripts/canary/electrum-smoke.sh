@@ -98,4 +98,23 @@ expect_jq "$RESP" '.result | type == "number"' "relayfee is number"
 expect_jq "$RESP" '.result >= 0' "relayfee non-negative"
 echo "ok: blockchain.relayfee"
 
+# --- batched scripthash.subscribe (Sparrow-style wallet scan) ---
+# Sparrow batches its entire gap-limit window of
+# `blockchain.scripthash.subscribe` calls into ONE JSON-RPC array per scan.
+# If the server's batch cap is below that window it rejects the whole batch
+# with a single error and the wallet scan fails to load. Regression guard:
+# the default cap was once 16 — below Sparrow's ~25 — which silently broke
+# scans. Send a 25-request subscribe batch in one frame and assert every
+# sub-response succeeds. (boot_satd uses default limits, so this exercises
+# the shipped DEFAULT_MAX_BATCH_REQUESTS.)
+N=25
+BATCH=$(for i in $(seq 0 $((N - 1))); do
+    printf '{"jsonrpc":"2.0","id":%d,"method":"blockchain.scripthash.subscribe","params":["%064x"]},' "$i" "$i"
+done | sed 's/,$//')
+RESP=$(printf '[%s]\n' "$BATCH" | nc -q 1 -w 5 127.0.0.1 "$ELECTRUM_PORT")
+expect_jq "$RESP" '. | type == "array"' "batch response is a JSON array"
+expect_jq "$RESP" ". | length == $N" "batch returned $N responses"
+expect_jq "$RESP" '[.[] | select(.error)] | length == 0' "no errors in batch (cap >= $N — was the Sparrow scan bug)"
+echo "ok: batched scripthash.subscribe ($N subs in one frame)"
+
 echo "electrum canary: PASS"

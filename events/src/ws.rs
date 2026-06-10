@@ -227,17 +227,25 @@ fn authorize(state: &WsState, headers: &HeaderMap) -> Result<Option<satd_auth::P
     let hdr = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| (StatusCode::UNAUTHORIZED, "missing authorization header").into_response())?;
+        .ok_or_else(|| {
+            debug!(target: "events::ws", status = 401, "rejecting streamws connection: missing authorization header");
+            (StatusCode::UNAUTHORIZED, "missing authorization header").into_response()
+        })?;
     let mut scratch = String::new();
     let principal = match satd_auth::Credential::from_authorization(hdr, &mut scratch) {
         Some(satd_auth::Credential::Bearer { token }) => store.resolve(token, now_unix()),
         _ => None,
     }
-    .ok_or_else(|| (StatusCode::UNAUTHORIZED, "invalid or unknown bearer token").into_response())?;
+    .ok_or_else(|| {
+        debug!(target: "events::ws", status = 401, "rejecting streamws connection: invalid or unknown bearer token");
+        (StatusCode::UNAUTHORIZED, "invalid or unknown bearer token").into_response()
+    })?;
     if !principal.has(satd_auth::Capability::StreamSubscribe) {
+        debug!(target: "events::ws", status = 403, "rejecting streamws connection: token lacks stream:subscribe capability");
         return Err((StatusCode::FORBIDDEN, "token lacks stream:subscribe").into_response());
     }
     if let satd_auth::RateDecision::Throttle { .. } = principal.check_rate() {
+        debug!(target: "events::ws", status = 429, "rejecting streamws connection: per-principal rate limit exceeded");
         return Err((StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded").into_response());
     }
     Ok(Some(principal))

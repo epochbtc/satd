@@ -32,6 +32,16 @@ In-progress; full detail tracked in
   its mempool (honoring the peer's fee filter). Gated on the `mempool` net
   permission (`-whitelist=mempool@<subnet>`), mirroring Bitcoin Core's
   NODE_BLOOM gating since satd does not support BIP37 bloom filters.
+- **Electrum / serving surfaces** — raised the Electrum server's default
+  per-batch (`16` → `100`) and per-connection subscription (`100` → `1000`)
+  caps so multi-wallet clients like Sparrow complete a wallet scan
+  out-of-the-box; the previous batch cap rejected Sparrow's gap-limit
+  subscribe batch and failed the whole scan. Client-facing API errors that
+  were previously silent server-side — Electrum batch/subscription-cap
+  rejections, Esplora 4xx/5xx responses, and streaming auth/rate/cap
+  rejections — are now logged (capacity/config conditions at `warn`, routine
+  client errors at `debug`), so operators can diagnose them. Added a
+  Sparrow-style batched-subscribe scenario to the Electrum canary.
 
 - **Storage (CRITICAL)** — fixed silent UTXO/index data loss after IBD or
   reindex: `flush_durable()` flushed only RocksDB's (empty) default column

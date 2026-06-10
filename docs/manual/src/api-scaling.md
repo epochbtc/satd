@@ -63,7 +63,7 @@ daemon at boot.
 | events gRPC | `-eventsgrpcmaxconns`, `-eventsgrpcmaxsubscriptions` | 64 / 256 | gRPC **`RESOURCE_EXHAUSTED`** |
 | streaming WS/SSE | `-streamwsmaxconns`, `-streamwsmaxsubscriptions`, `-streamwsmaxmessagebytes` | 256 / 256 / 262144 | connection refused / **429** |
 | Esplora | `-esploramaxconns`, `-esplorasseconns` | 256 / = maxconns | HTTP **429** |
-| Electrum | `-electrummaxconns`, `-electrummaxsubsperconn` | 64 / 100 | connection refused |
+| Electrum | `-electrummaxconns`, `-electrummaxsubsperconn` | 64 / 1000 | connection refused |
 
 `-rpcthreads` / `-rpcworkqueue` are recognized from Bitcoin Core (a Core-shaped
 config carrying them loads): in-flight calls are capped at `-rpcthreads`, and the

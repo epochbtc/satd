@@ -307,9 +307,9 @@ error rather than a silent pick.
 | `electrummtlsclientca` | none | restart | satd | PEM CA bundle to verify client certs when `electrummtls=1`. |
 | `electrummtlsclientallow` | any CA-signed | restart | satd | Allowlist of accepted client-cert CN/DNS-SAN values. |
 | `electrummaxconns` | 64 | restart | satd | Hard cap on simultaneously-open Electrum connections. |
-| `electrummaxsubsperconn` | 100 | restart | satd | Per-connection scripthash subscription cap. |
+| `electrummaxsubsperconn` | 1000 | restart | satd | Per-connection scripthash subscription cap. |
 | `electrumrequesttimeout` | 30 | restart | satd | Per-request handler timeout (seconds). |
-| `electrummaxbatchrequests` | 16 | restart | satd | Max requests per JSON-RPC batch line. |
+| `electrummaxbatchrequests` | 100 | restart | satd | Max requests per JSON-RPC batch line. Wallets (Sparrow) batch their whole gap-limit window of subscribes at scan time. |
 | `electrummaxbroadcastpackagetxs` | 25 | restart | satd | Max txs per `blockchain.transaction.broadcast_package`. |
 | `electrumfeehistogramttl` | 10 | restart | satd | TTL (seconds) for the `mempool.get_fee_histogram` cache. |
 | `electrumbanner` | `powered by satd <ver>` | restart | satd | Override for `server.banner`. |

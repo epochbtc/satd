@@ -46,20 +46,28 @@ impl From<node_index::IndexError> for EsploraError {
 
 impl IntoResponse for EsploraError {
     fn into_response(self) -> Response {
-        let (status, msg) = match &self {
-            EsploraError::NotFound => (StatusCode::NOT_FOUND, self.to_string()),
-            EsploraError::BadRequest(_) => (StatusCode::BAD_REQUEST, self.to_string()),
-            EsploraError::IndexDisabled => (StatusCode::SERVICE_UNAVAILABLE, self.to_string()),
-            EsploraError::ServiceUnavailable => (StatusCode::SERVICE_UNAVAILABLE, self.to_string()),
-            EsploraError::Forbidden(_) => (StatusCode::FORBIDDEN, self.to_string()),
-            EsploraError::WatchQuotaExceeded => {
-                (StatusCode::TOO_MANY_REQUESTS, self.to_string())
-            }
-            EsploraError::Internal(_) => {
-                tracing::warn!(error = %self, "esplora internal error");
-                (StatusCode::INTERNAL_SERVER_ERROR, self.to_string())
-            }
+        let status = match &self {
+            EsploraError::NotFound => StatusCode::NOT_FOUND,
+            EsploraError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            EsploraError::IndexDisabled => StatusCode::SERVICE_UNAVAILABLE,
+            EsploraError::ServiceUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            EsploraError::Forbidden(_) => StatusCode::FORBIDDEN,
+            EsploraError::WatchQuotaExceeded => StatusCode::TOO_MANY_REQUESTS,
+            EsploraError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
+        let msg = self.to_string();
+        // Log every error response so client-facing failures are
+        // visible server-side (previously only Internal was logged,
+        // making config/capacity rejections undiagnosable). 5xx and
+        // capacity/config conditions (503 index-disabled, 429 quota)
+        // are operator-actionable → warn; routine 4xx (404/400/403) →
+        // debug to avoid log spam at the default level. The TraceLayer
+        // separately records method/path/status; this adds the reason.
+        if status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS {
+            tracing::warn!(target: "esplora::error", status = status.as_u16(), error = %msg, "esplora error response");
+        } else {
+            tracing::debug!(target: "esplora::error", status = status.as_u16(), error = %msg, "esplora error response");
+        }
         // Plain-text body matches upstream Esplora's error shape so
         // BDK / mempool.space-style clients parse it identically.
         (status, msg).into_response()

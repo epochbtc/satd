@@ -22,10 +22,21 @@ pub const MAX_HISTORY_ENTRIES: usize = 200_000;
 pub const MAX_HEADERS_PER_REQUEST: u32 = 2016;
 pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
 pub const DEFAULT_MAX_CONNS: usize = 64;
-pub const DEFAULT_MAX_SUBS_PER_CONN: usize = 100;
-/// Max requests in a single JSON-RPC batch. electrs uses 16; matches
-/// the wallet client mix where Sparrow batches 2–8 reads at startup.
-pub const DEFAULT_MAX_BATCH_REQUESTS: usize = 16;
+/// Per-connection scripthash subscription cap. A multi-account wallet
+/// (e.g. Sparrow with several loaded wallets) subscribes to every
+/// derived address on a single connection, so this must comfortably
+/// exceed a few wallets' worth of gap-limit windows. 1000 bounds
+/// per-connection memory while clearing realistic wallets; operators
+/// who serve many large wallets can raise it.
+pub const DEFAULT_MAX_SUBS_PER_CONN: usize = 1000;
+/// Max requests in a single JSON-RPC batch. Real wallets batch far more
+/// than a handful at scan time: Sparrow sends its entire gap-limit
+/// window (~25+) of `blockchain.scripthash.subscribe` calls as one
+/// batch, and rejecting it makes the wallet scan fail outright (the
+/// whole batch is dropped with a single error). 100 clears the default
+/// gap-limit window with headroom while still bounding the work a
+/// single line can schedule.
+pub const DEFAULT_MAX_BATCH_REQUESTS: usize = 100;
 /// Max txs in a single `blockchain.transaction.broadcast_package`
 /// call. electrs accepts up to ~25 (matching Bitcoin Core's
 /// `MAX_PACKAGE_COUNT`).
