@@ -3855,12 +3855,13 @@ impl PeerManager {
         &self,
         hex_tx: &str,
     ) -> Result<serde_json::Value, (i32, String)> {
-        let result =
-            crate::rpc::rawtx::send_raw_transaction(&self.chain_state, &self.mempool, hex_tx)?;
-        if let Some(txid) = result.as_str().and_then(|s| s.parse().ok()) {
-            self.announce_tx(txid);
-        }
-        Ok(result)
+        let tx_bytes =
+            hex::decode(hex_tx).map_err(|_| (-22, "TX decode failed".to_string()))?;
+        let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&tx_bytes)
+            .map_err(|_| (-22, "TX decode failed".to_string()))?;
+        let txid =
+            self.submit_and_announce(tx).map_err(|e| (-25, e.to_string()))?;
+        Ok(serde_json::Value::String(txid.to_string()))
     }
 
     /// Accept an already-decoded, locally-originated transaction into the
@@ -3873,15 +3874,27 @@ impl PeerManager {
     /// `broadcast_package`) call this through the [`TxBroadcaster`] trait,
     /// so they cannot accept a tx into the mempool without also putting it
     /// on the wire.
+    ///
+    /// Resubmitting a tx that is already in the mempool is a success, not
+    /// an error, and re-announces it — Core's `BroadcastTransaction`
+    /// semantics. Wallets (Electrum, Sparrow, BDK) rely on resubmission to
+    /// force re-relay of a stuck tx, including txs that entered the
+    /// mempool from a peer or a `mempool.dat` reload rather than through
+    /// a local submit.
     pub fn submit_and_announce(
         &self,
         tx: bitcoin::Transaction,
     ) -> Result<bitcoin::Txid, MempoolError> {
-        let txid = self.mempool.accept_transaction(
+        let resubmit_txid = tx.compute_txid();
+        let txid = match self.mempool.accept_transaction(
             tx,
             &self.chain_state,
             self.chain_state.script_verifier(),
-        )?;
+        ) {
+            Ok(txid) => txid,
+            Err(MempoolError::AlreadyExists) => resubmit_txid,
+            Err(e) => return Err(e),
+        };
         self.announce_tx(txid);
         Ok(txid)
     }
@@ -5539,5 +5552,88 @@ mod tests {
 
         assert!(pm.submit_and_announce(tx).is_err(), "tx with missing inputs must be rejected");
         assert!(rx1.try_recv().is_err(), "a rejected tx must not be announced to peers");
+    }
+
+    /// Resubmitting a tx that is already in the mempool must succeed and
+    /// re-announce it (Core's `BroadcastTransaction` semantics) — wallets
+    /// resubmit to force re-relay of a stuck tx, and the tx may have entered
+    /// the mempool from a peer rather than a local submit.
+    #[test]
+    fn submit_and_announce_resubmit_of_mempool_tx_succeeds_and_announces() {
+        use crate::chain::state::AssumeValid;
+        use crate::storage::db::InMemoryStore;
+        use crate::storage::flatfile::FlatFileManager;
+        use crate::validation::script::NoopVerifier;
+        use bitcoin::absolute::LockTime;
+        use bitcoin::hashes::Hash;
+        use bitcoin::transaction;
+        use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, TxIn, TxOut, Witness};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Box::new(InMemoryStore::new());
+        let flat_files = FlatFileManager::new(&dir.path().join("blocks")).unwrap();
+        let chain_state = Arc::new(
+            ChainState::new(
+                store,
+                flat_files,
+                Network::Regtest,
+                Box::new(NoopVerifier),
+                AssumeValid::Disabled,
+                450,
+                4,
+                Default::default(),
+                Default::default(),
+            )
+            .unwrap(),
+        );
+        let mempool = Arc::new(Mempool::new(1_000_000, 0));
+        let fee_estimator = Arc::new(FeeEstimator::new());
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let pm =
+            PeerManager::new(chain_state, mempool, fee_estimator, Network::Regtest, shutdown_rx);
+
+        let addr: SocketAddr = "10.0.0.1:8333".parse().unwrap();
+        let (h1, mut rx1) = mk_handle_rx(1, addr, PeerState::Connected, 0);
+        pm.peers.write().insert(1, h1);
+
+        // Seed the mempool with the tx (as if it arrived via P2P relay),
+        // keyed by its real computed txid so the resubmit collides. The tx
+        // must clear the context-free + standardness checks (non-empty
+        // in/out, standard non-dust output) so the accept path reaches the
+        // already-in-mempool check; its input doesn't resolve, but
+        // `AlreadyExists` is detected before input lookup — same order as
+        // Core (CheckTransaction → standardness → mempool dedup → inputs).
+        let tx = bitcoin::Transaction {
+            version: transaction::Version(2),
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: bitcoin::Txid::from_raw_hash(
+                        bitcoin::hashes::sha256d::Hash::from_byte_array([3u8; 32]),
+                    ),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(100_000),
+                script_pubkey: ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_byte_array(
+                    [0x42u8; 20],
+                )),
+            }],
+        };
+        let txid = tx.compute_txid();
+        pm.mempool.insert_entry_for_test(txid, tx.clone(), 0);
+
+        let result = pm.submit_and_announce(tx);
+        assert_eq!(result.ok(), Some(txid), "resubmit of a mempool tx must succeed");
+        match rx1.try_recv() {
+            Ok(NetworkMessage::Inv(inv)) => {
+                assert_eq!(inv, vec![Inventory::WitnessTransaction(txid)]);
+            }
+            other => panic!("resubmit must re-announce the tx, got {other:?}"),
+        }
     }
 }

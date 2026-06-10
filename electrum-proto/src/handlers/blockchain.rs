@@ -651,17 +651,39 @@ pub fn transaction_broadcast_package(
         decoded.push(tx);
     }
 
+    // Accept + announce each tx so accepted ones propagate; a bare
+    // mempool accept would leave them sitting on this node. Submit in
+    // passes until a fixpoint so the package may arrive in any order: a
+    // child listed before its parent fails its first pass on missing
+    // inputs, then succeeds once the parent is admitted. (Core's
+    // `submitpackage` rejects unsorted packages with `package-not-sorted`;
+    // accepting any order is strictly more permissive.) Only the final
+    // no-progress pass's failures are reported.
     let mut errors: Vec<Value> = Vec::new();
-    for tx in &decoded {
-        let txid = tx.compute_txid();
-        // Accept + announce each tx so accepted ones propagate; a bare
-        // mempool accept would leave them sitting on this node.
-        if let Err(e) = state.tx_broadcaster.submit_and_announce(tx.clone()) {
-            errors.push(json!({
-                "txid": txid.to_string(),
-                "error": e.to_string(),
-            }));
+    let mut pending: Vec<usize> = (0..decoded.len()).collect();
+    loop {
+        let mut next_pending: Vec<usize> = Vec::new();
+        let mut pass_errors: Vec<(usize, String)> = Vec::new();
+        for &i in &pending {
+            if let Err(e) = state.tx_broadcaster.submit_and_announce(decoded[i].clone()) {
+                next_pending.push(i);
+                pass_errors.push((i, e.to_string()));
+            }
         }
+        if next_pending.len() == pending.len() {
+            // No progress this pass — the remaining failures are final.
+            for (i, err) in pass_errors {
+                errors.push(json!({
+                    "txid": decoded[i].compute_txid().to_string(),
+                    "error": err,
+                }));
+            }
+            break;
+        }
+        if next_pending.is_empty() {
+            break;
+        }
+        pending = next_pending;
     }
 
     let success = errors.is_empty();
