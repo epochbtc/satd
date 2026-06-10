@@ -24,7 +24,7 @@ pub fn get_mempool_info(mempool: &Mempool) -> Value {
         "mempoolminfee": min_fee,
         "minrelaytxfee": min_fee,
         "incrementalrelayfee": incremental,
-        "unbroadcastcount": 0,
+        "unbroadcastcount": info.unbroadcast,
         "fullrbf": info.full_rbf,
     });
     annotate_units(&mut response, unit);

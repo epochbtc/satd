@@ -14,6 +14,21 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
 In-progress; full detail tracked in
 [`docs/release-notes/0.3.0-pre.md`](docs/release-notes/0.3.0-pre.md).
 
+- **Networking** — locally-submitted transactions now reliably propagate.
+  Every broadcast surface (`sendrawtransaction`, MCP `send_transaction`,
+  Esplora `POST /tx`, Electrum `transaction.broadcast`/`broadcast_package`)
+  announces the tx to peers through one shared path (resubmitting an
+  already-in-mempool tx succeeds and re-relays, Core semantics), and a new
+  rebroadcast loop re-announces unconfirmed local txs — on a timer and to
+  newly-connected outbound peers — until enough peer IPs fetch them (via
+  `getdata`) or they leave the mempool, so a tx submitted with no peers
+  connected is no longer stranded. The pending set persists across restarts
+  (`mempool.dat` v2). Tx announcements now honor a peer's BIP 37 `fRelay`
+  (blocksonly peers are never sent tx invs). `getmempoolinfo.unbroadcastcount`
+  and the per-entry `unbroadcast` flag now report real values. New knobs
+  (SIGHUP-reloadable): `rebroadcastinterval` (default `0` = auto, randomized
+  10–15 min) and `broadcastconfirmpeers` (default `1`).
+
 - **Storage (CRITICAL)** — fixed silent UTXO/index data loss after IBD or
   reindex: `flush_durable()` flushed only RocksDB's (empty) default column
   family, so WAL-disabled (BulkLoad) writes could evaporate on the next
