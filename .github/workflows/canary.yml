@@ -186,7 +186,7 @@ jobs:
         run: cargo build --release --locked --bin satd --bin sat-cli
 
       - name: Upload binaries
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: satd-canary-binaries
           path: |
@@ -222,7 +222,7 @@ jobs:
 
       - name: Upload satd log on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: esplora-canary-logs
           path: /tmp/satd-canary-esplora.*/satd.log
@@ -263,7 +263,7 @@ jobs:
 
       - name: Upload satd log on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: electrum-canary-logs
           path: /tmp/satd-canary-electrum.*/satd.log
@@ -307,7 +307,7 @@ jobs:
 
       - name: Upload satd log on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: nbxplorer-canary-logs
           path: /tmp/satd-canary-nbxplorer.*/satd.log
@@ -347,7 +347,7 @@ jobs:
 
       - name: Upload satd log on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: btcpay-canary-logs
           path: /tmp/satd-canary-btcpay.*/satd.log
@@ -412,7 +412,7 @@ jobs:
 
       - name: Upload satd log on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: bdk-canary-logs
           path: /tmp/satd-canary-bdk.*/satd.log
@@ -461,7 +461,7 @@ jobs:
 
       - name: Upload satd log on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: core-interop-canary-logs
           path: /tmp/satd-canary-core.*/satd.log
@@ -582,7 +582,7 @@ jobs:
 
       - name: Upload satd log on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: lnd-neutrino-canary-logs
           path: /tmp/satd-canary-lnd.*/satd.log
@@ -628,7 +628,7 @@ jobs:
 
       - name: Upload satd log on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: electrum-wallet-canary-logs
           path: /tmp/satd-canary-electrum-wallet.*/satd.log
@@ -676,7 +676,7 @@ jobs:
 
       - name: Upload satd log on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cln-canary-logs
           path: /tmp/satd-canary-cln.*/satd.log

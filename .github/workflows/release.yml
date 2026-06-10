@@ -182,7 +182,7 @@ jobs:
           done
 
       - name: Upload SBOM artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: satd-sbom
           path: |
@@ -413,7 +413,7 @@ jobs:
           fi
 
       - name: Upload tarball artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ env.STAGE }}.tar.zst
           path: |
@@ -534,7 +534,7 @@ jobs:
 
       - name: Upload digest
         if: startsWith(github.ref, 'refs/tags/')
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: digests-${{ matrix.slug }}
           path: /tmp/digests/*
