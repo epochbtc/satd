@@ -2113,6 +2113,7 @@ async fn main() {
             let state = esplora_handlers::EsploraState {
                 chain: chain_state.clone(),
                 mempool: mempool.clone(),
+                tx_broadcaster: peer_manager.clone(),
                 address_index: address_index.clone(),
                 spend_index: Arc::new(node::index::outpoint_spend::lookups::RocksSpendIndex::new(
                     chain_state.store_ref().clone(),
@@ -2376,6 +2377,7 @@ async fn main() {
         let electrum_state = std::sync::Arc::new(electrum_proto::ElectrumState {
             chain: chain_state.clone(),
             mempool: mempool.clone(),
+            tx_broadcaster: peer_manager.clone(),
             address_index: address_index.clone(),
             spend_index,
             fee_estimator: fee_estimator.clone(),

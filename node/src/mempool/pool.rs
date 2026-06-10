@@ -1059,6 +1059,26 @@ impl Mempool {
             full_rbf,
         }
     }
+
+    /// Test-only: insert a synthetic entry keyed by `txid` so unit tests can
+    /// exercise already-in-mempool paths without building a fully valid tx.
+    #[cfg(test)]
+    pub(crate) fn insert_entry_for_test(&self, txid: Txid, tx: Transaction, fee_rate: u64) {
+        let mut inner = self.inner.write();
+        inner.entries.insert(
+            txid,
+            MempoolEntry {
+                tx,
+                fee: 0,
+                weight: 4,
+                fee_rate,
+                time: 0,
+                fee_delta: 0,
+                sigop_cost: 0,
+                prev_scripthashes: Vec::new(),
+            },
+        );
+    }
 }
 
 #[cfg(test)]

@@ -8,6 +8,7 @@ use bitcoin::Network;
 use node::chain::state::ChainState;
 use node::mempool::fee::FeeEstimator;
 use node::mempool::pool::Mempool;
+use node::net::manager::TxBroadcaster;
 use node_index::{AddressIndex, SpendIndex};
 use tokio::sync::Semaphore;
 
@@ -17,6 +18,9 @@ use crate::config::EsploraConfig;
 pub struct EsploraState {
     pub chain: Arc<ChainState>,
     pub mempool: Arc<Mempool>,
+    /// Accepts + announces a broadcast tx (`POST /tx`) so it reaches the
+    /// network — a bare mempool accept never leaves this node.
+    pub tx_broadcaster: Arc<dyn TxBroadcaster>,
     pub address_index: Arc<dyn AddressIndex>,
     pub spend_index: Arc<dyn SpendIndex>,
     pub fee_estimator: Arc<FeeEstimator>,

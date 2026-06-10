@@ -4,9 +4,11 @@
 //! `headers.*`, `block.*`, `transaction.get*`) call directly into the
 //! `node-index` traits + the `ElectrumExtras` adapter.
 //!
-//! Write-side method (`transaction.broadcast`) routes through
-//! [`Mempool::accept_transaction`] — same path Esplora's `POST /tx`
-//! endpoint takes.
+//! Write-side methods (`transaction.broadcast`, `broadcast_package`)
+//! route through the [`TxBroadcaster`](node::net::manager::TxBroadcaster)
+//! injected on the state — accept into the mempool *and* announce to
+//! peers, so the tx actually propagates — the same path Esplora's
+//! `POST /tx` endpoint takes.
 //!
 //! [`scripthash_subscribe`] returns the synchronous initial status
 //! response. The push-notification side lives in PR-4
@@ -594,9 +596,11 @@ pub fn transaction_broadcast(state: &ElectrumState, params: Value) -> Result<Val
         .map_err(|e| JsonRpcError::invalid_params(format!("bad hex: {e}")))?;
     let tx: Transaction =
         deserialize(&bytes).map_err(|e| JsonRpcError::invalid_params(format!("decode: {e}")))?;
+    // Accept + announce in one step so the tx actually propagates — a bare
+    // mempool accept leaves it sitting on this node, unannounced.
     let txid = state
-        .mempool
-        .accept_transaction(tx, &state.chain, state.chain.script_verifier())
+        .tx_broadcaster
+        .submit_and_announce(tx)
         .map_err(|e| JsonRpcError::bad_request(format!("mempool reject: {e}")))?;
     Ok(Value::String(txid.to_string()))
 }
@@ -647,19 +651,39 @@ pub fn transaction_broadcast_package(
         decoded.push(tx);
     }
 
+    // Accept + announce each tx so accepted ones propagate; a bare
+    // mempool accept would leave them sitting on this node. Submit in
+    // passes until a fixpoint so the package may arrive in any order: a
+    // child listed before its parent fails its first pass on missing
+    // inputs, then succeeds once the parent is admitted. (Core's
+    // `submitpackage` rejects unsorted packages with `package-not-sorted`;
+    // accepting any order is strictly more permissive.) Only the final
+    // no-progress pass's failures are reported.
     let mut errors: Vec<Value> = Vec::new();
-    for tx in &decoded {
-        let txid = tx.compute_txid();
-        if let Err(e) = state.mempool.accept_transaction(
-            tx.clone(),
-            &state.chain,
-            state.chain.script_verifier(),
-        ) {
-            errors.push(json!({
-                "txid": txid.to_string(),
-                "error": e.to_string(),
-            }));
+    let mut pending: Vec<usize> = (0..decoded.len()).collect();
+    loop {
+        let mut next_pending: Vec<usize> = Vec::new();
+        let mut pass_errors: Vec<(usize, String)> = Vec::new();
+        for &i in &pending {
+            if let Err(e) = state.tx_broadcaster.submit_and_announce(decoded[i].clone()) {
+                next_pending.push(i);
+                pass_errors.push((i, e.to_string()));
+            }
         }
+        if next_pending.len() == pending.len() {
+            // No progress this pass — the remaining failures are final.
+            for (i, err) in pass_errors {
+                errors.push(json!({
+                    "txid": decoded[i].compute_txid().to_string(),
+                    "error": err,
+                }));
+            }
+            break;
+        }
+        if next_pending.is_empty() {
+            break;
+        }
+        pending = next_pending;
     }
 
     let success = errors.is_empty();

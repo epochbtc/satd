@@ -12,6 +12,7 @@ use bitcoin::Network;
 use node::chain::state::ChainState;
 use node::mempool::fee::FeeEstimator;
 use node::mempool::pool::Mempool;
+use node::net::manager::TxBroadcaster;
 use node_index::{AddressIndex, SpendIndex};
 
 use crate::config::ElectrumConfig;
@@ -22,6 +23,10 @@ use crate::handlers::mempool::FeeHistogramCache;
 pub struct ElectrumState {
     pub chain: Arc<ChainState>,
     pub mempool: Arc<Mempool>,
+    /// Accepts + announces a broadcast tx (`transaction.broadcast` /
+    /// `broadcast_package`) so it reaches the network — a bare mempool
+    /// accept never leaves this node.
+    pub tx_broadcaster: Arc<dyn TxBroadcaster>,
     pub address_index: Arc<dyn AddressIndex>,
     pub spend_index: Arc<dyn SpendIndex>,
     pub fee_estimator: Arc<FeeEstimator>,

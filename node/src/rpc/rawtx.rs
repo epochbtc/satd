@@ -8,25 +8,6 @@ use crate::mempool::pool::Mempool;
 use crate::rpc::amounts::{annotate_units, default_unit, format_amount, format_feerate_sat_per_kvb};
 use serde_json::{json, Value};
 
-/// `sendrawtransaction` — submit a raw transaction to the mempool.
-pub fn send_raw_transaction(
-    chain_state: &ChainState,
-    mempool: &Mempool,
-    hex_tx: &str,
-) -> Result<Value, (i32, String)> {
-    let tx_bytes =
-        hex::decode(hex_tx).map_err(|_| (-22, "TX decode failed".to_string()))?;
-
-    let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&tx_bytes)
-        .map_err(|_| (-22, "TX decode failed".to_string()))?;
-
-    let txid = mempool
-        .accept_transaction(tx, chain_state, chain_state.script_verifier())
-        .map_err(|e| (-25, e.to_string()))?;
-
-    Ok(Value::String(txid.to_string()))
-}
-
 /// `getmempoolinfo` — return mempool statistics.
 pub fn get_mempool_info(mempool: &Mempool) -> Value {
     let info = mempool.info();

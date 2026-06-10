@@ -101,9 +101,11 @@ pub async fn tx_broadcast(
         .map_err(|e| EsploraError::BadRequest(format!("bad hex: {e}")))?;
     let tx: Transaction = deserialize(&bytes)
         .map_err(|e| EsploraError::BadRequest(format!("decode: {e}")))?;
+    // Accept + announce in one step so the tx actually propagates — a bare
+    // mempool accept leaves it sitting on this node, unannounced.
     let txid = state
-        .mempool
-        .accept_transaction(tx, &state.chain, state.chain.script_verifier())
+        .tx_broadcaster
+        .submit_and_announce(tx)
         .map_err(|e| EsploraError::BadRequest(format!("mempool reject: {e}")))?;
     Ok(txid.to_string())
 }
