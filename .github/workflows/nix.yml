@@ -148,7 +148,7 @@ jobs:
           sha256sum result/bin/sat-cli > hash-out/sat-cli.sha256
 
       - name: Upload hash artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: nix-repro-hashes-${{ matrix.replica }}
           path: hash-out/
