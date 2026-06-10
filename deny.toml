@@ -28,12 +28,6 @@ db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "deny"
 ignore = [
-    # paste 1.0.15 — RUSTSEC-2024-0436 (unmaintained, archived).
-    # Pulled in transitively by ratatui (sat-tui dep). No safe upgrade and
-    # the crate has no security implications — it's a compile-time macro.
-    # Track ratatui upstream for paste removal.
-    { id = "RUSTSEC-2024-0436", reason = "transitive via ratatui; macro-only; awaiting upstream removal" },
-
     # rustls-pemfile 2.2.0 — RUSTSEC-2025-0134 (unmaintained, archived).
     # Direct dep in electrum-proto for TLS PEM loading. The replacement
     # (rustls-pki-types::PemObject) is a straightforward port but is a
