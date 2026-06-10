@@ -208,11 +208,15 @@ error rather than a silent pick.
 
 > **BIP35 `mempool` requests.** satd answers a peer's `mempool` message
 > (which asks us to announce our entire mempool) only for peers granted the
-> `mempool` net permission — `-whitelist=mempool@<subnet>` (also implied by
-> `noban`/`all`) — and honors the requesting peer's fee filter. satd does not
-> advertise `NODE_BLOOM` (BIP37 bloom filters are unsupported), so, exactly
-> like Bitcoin Core with bloom disabled, `mempool` requests from peers
-> without that permission are ignored.
+> `mempool` net permission — `-whitelist=mempool@<subnet>`, `all@<subnet>`,
+> or a bare `-whitelist=<subnet>` entry (whose implicit permission set
+> includes `mempool`, as in Core). It is **not** implied by `noban@`. The
+> response honors the requesting peer's fee filter, and dumps to one peer
+> are rate-limited (at most one per 30 s). satd does not advertise
+> `NODE_BLOOM` (BIP37 bloom filters are unsupported); `mempool` requests
+> from peers without the permission are ignored — softer than Bitcoin Core
+> with bloom disabled, which disconnects such peers unless they have
+> `noban`.
 
 ## Proxy / Tor
 
