@@ -279,11 +279,14 @@ pub fn repair_lost_connect_delta(
     // traffic — an output created and spent within the same block
     // appears in BOTH coin_puts and coin_removes. On the live write
     // path CoinCache cancels those pairs before they reach the store
-    // (FRESH elision); this tool writes to the store directly, and
-    // `RocksDbStore::write_batch` applies removes before puts in one
-    // WriteBatch (last write per key wins), so an un-netted pair would
-    // RESURRECT the spent coin as a phantom UTXO and corrupt the coin
-    // counters. Drop the pairs from the coins CF only — undo, txindex,
+    // (FRESH elision); this tool writes to the store directly. Stores
+    // now guarantee the StoreBatch remove-wins contract (puts applied
+    // before removes — RocksDbStore historically did the opposite,
+    // which would have RESURRECTED 2,382 spent coins on the first
+    // production repair), but we still net the pairs here: it keeps
+    // the report's counts net (comparable with the connect-time store
+    // log), skips pointless writes, and keeps the coin counters exact.
+    // Drop the pairs from the coins CF only — undo, txindex,
     // address-index, and outpoint-spend rows legitimately record
     // intra-block events and pass through untouched, exactly as they
     // do via CoinCache in production.
@@ -626,11 +629,13 @@ mod tests {
     }
 
     /// The same end-to-end repair against a REAL RocksDB store. This is
-    /// the test that catches the resurrection bug the InMemoryStore
-    /// can't: `RocksDbStore::write_batch` applies coin_removes before
-    /// coin_puts inside one WriteBatch (last write per key wins), so an
-    /// un-netted intra-block put+remove pair leaves the spent coin
-    /// alive in the UTXO set.
+    /// the test that caught the resurrection bug the InMemoryStore
+    /// can't: `RocksDbStore::write_batch` used to apply coin_removes
+    /// before coin_puts inside one WriteBatch (last write per key
+    /// wins), so an un-netted intra-block put+remove pair left the
+    /// spent coin alive in the UTXO set. The store now applies puts
+    /// first (remove wins) AND the repair nets pairs — this test guards
+    /// the composition end-to-end.
     #[test]
     fn repair_on_rocksdb_does_not_resurrect_intra_block_spends() {
         let dir = tempfile::tempdir().unwrap();
