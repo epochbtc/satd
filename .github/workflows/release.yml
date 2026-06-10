@@ -558,7 +558,7 @@ jobs:
 
     steps:
       - name: Download digests
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: /tmp/digests
           pattern: digests-*
@@ -644,7 +644,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Download tarball artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: dist
           # Filter out the per-arch digest artifacts (only the
@@ -660,7 +660,7 @@ jobs:
           merge-multiple: true
 
       - name: Download SBOM artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: satd-sbom
           path: dist
