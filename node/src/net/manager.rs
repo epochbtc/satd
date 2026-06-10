@@ -2064,6 +2064,9 @@ impl PeerManager {
                     tracing::debug!(id, rate, "Peer set fee filter");
                 }
             }
+            NetworkMessage::MemPool => {
+                self.handle_mempool_request(id);
+            }
             NetworkMessage::Addr(addrs) => {
                 tracing::debug!(id, count = addrs.len(), "Received addr");
                 for (_, addr) in &addrs {
@@ -2288,6 +2291,44 @@ impl PeerManager {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// BIP35 `mempool`: a peer asks us to announce our full mempool.
+    ///
+    /// An unfiltered mempool dump is a privacy/DoS surface, which is why
+    /// Bitcoin Core gates it behind `NODE_BLOOM`. satd does **not** support
+    /// BIP37 / advertise `NODE_BLOOM` (intentionally — see `peerbloomfilters`),
+    /// so the Core-equivalent gate here is the explicit `mempool` net
+    /// permission (`-whitelist=mempool@<subnet>`, also implied by `noban`/
+    /// `all`). Requests from peers without it are ignored — no disconnect, to
+    /// stay friendly to clients that probe. We respond, honoring the peer's
+    /// fee filter, with `inv` message(s) of `MSG_WTX` txids, batched to
+    /// [`MAX_MEMPOOL_INV_CHUNK`]; the peer then `getdata`s the ones it wants.
+    fn handle_mempool_request(&self, id: PeerId) {
+        if !self.peer_permissions(id).mempool {
+            tracing::debug!(id, "ignoring mempool request from peer without mempool permission");
+            return;
+        }
+        // Snapshot the peer's fee filter (and confirm it's still connected).
+        let fee_filter = {
+            let peers = self.peers.read();
+            match peers.get(&id) {
+                Some(h) if h.info.state == PeerState::Connected => h.info.fee_filter,
+                _ => return,
+            }
+        };
+        let txids = self.mempool.txids_above_feerate(fee_filter);
+        if txids.is_empty() {
+            return;
+        }
+        tracing::debug!(id, count = txids.len(), "serving BIP35 mempool request");
+        for chunk in txids.chunks(MAX_MEMPOOL_INV_CHUNK) {
+            let inv = chunk
+                .iter()
+                .map(|txid| Inventory::WitnessTransaction(*txid))
+                .collect::<Vec<_>>();
+            self.send_to_peer(id, NetworkMessage::Inv(inv));
         }
     }
 
@@ -6027,5 +6068,57 @@ mod tests {
             rx.try_recv().is_err(),
             "inbound peers must not receive the on-connect unbroadcast dump"
         );
+    }
+
+    /// BIP35 `mempool` is served only to peers with the `mempool` permission
+    /// (satd doesn't advertise NODE_BLOOM), and the response is an inv of
+    /// the mempool txids.
+    #[test]
+    fn bip35_mempool_served_only_with_permission() {
+        use bitcoin::hashes::Hash;
+        let (pm, _dir) = mk_test_pm();
+        let addr: SocketAddr = "10.0.0.1:8333".parse().unwrap();
+        let txid =
+            bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([5u8; 32]));
+        pm.mempool.insert_unbroadcast_for_test(txid, 0);
+
+        // No mempool permission → request ignored.
+        let (h1, mut rx1) = mk_handle_rx(1, addr, PeerState::Connected, 0);
+        pm.peers.write().insert(1, h1);
+        pm.handle_mempool_request(1);
+        assert!(rx1.try_recv().is_err(), "peer without mempool permission gets no dump");
+
+        // With the mempool permission → inv of the mempool txid.
+        let (mut h2, mut rx2) = mk_handle_rx(2, addr, PeerState::Connected, 0);
+        h2.info.permissions.mempool = true;
+        pm.peers.write().insert(2, h2);
+        pm.handle_mempool_request(2);
+        match rx2.try_recv() {
+            Ok(NetworkMessage::Inv(inv)) => {
+                assert!(
+                    inv.contains(&Inventory::WitnessTransaction(txid)),
+                    "mempool inv should list the resident tx"
+                );
+            }
+            other => panic!("permissioned peer should receive a mempool inv, got {other:?}"),
+        }
+    }
+
+    /// A BIP35 mempool response honors the requesting peer's fee filter.
+    #[test]
+    fn bip35_mempool_respects_fee_filter() {
+        use bitcoin::hashes::Hash;
+        let (pm, _dir) = mk_test_pm();
+        let addr: SocketAddr = "10.0.0.2:8333".parse().unwrap();
+        // Entry at fee rate 0; peer's filter is 1000 sat/kvB → excluded.
+        let txid =
+            bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([6u8; 32]));
+        pm.mempool.insert_unbroadcast_for_test(txid, 0);
+
+        let (mut h, mut rx) = mk_handle_rx(1, addr, PeerState::Connected, 1000);
+        h.info.permissions.mempool = true;
+        pm.peers.write().insert(1, h);
+        pm.handle_mempool_request(1);
+        assert!(rx.try_recv().is_err(), "a tx below the peer's fee filter is not advertised");
     }
 }

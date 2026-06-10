@@ -206,6 +206,14 @@ error rather than a silent pick.
 | `signetseednode` | built-in seeds | restart | core | Additional signet seed node (repeatable; signet only). |
 | `signetchallenge` | default signet | restart | core | Custom signet challenge script, hex (BIP 325; signet only). |
 
+> **BIP35 `mempool` requests.** satd answers a peer's `mempool` message
+> (which asks us to announce our entire mempool) only for peers granted the
+> `mempool` net permission — `-whitelist=mempool@<subnet>` (also implied by
+> `noban`/`all`) — and honors the requesting peer's fee filter. satd does not
+> advertise `NODE_BLOOM` (BIP37 bloom filters are unsupported), so, exactly
+> like Bitcoin Core with bloom disabled, `mempool` requests from peers
+> without that permission are ignored.
+
 ## Proxy / Tor
 
 | Key | Default | Reload | Compat | Description |
