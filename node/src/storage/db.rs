@@ -458,6 +458,41 @@ mod tests {
     use bitcoin::hashes::Hash;
     use bitcoin::pow::CompactTarget;
 
+    /// StoreBatch remove-wins contract (see the StoreBatch docs): a key
+    /// in BOTH coin_puts and coin_removes of one batch nets to absent.
+    /// Pins the trait-level semantics for the in-memory reference
+    /// implementation, mirroring the RocksDbStore test.
+    #[test]
+    fn write_batch_remove_wins_for_put_remove_pairs() {
+        let store = InMemoryStore::new();
+        let mk_op = |seed: u8| OutPoint {
+            txid: Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+                [seed; 32],
+            )),
+            vout: 0,
+        };
+        let mk_coin = |amount: u64| Coin {
+            amount,
+            script_pubkey: bitcoin::ScriptBuf::new(),
+            height: 7,
+            coinbase: false,
+        };
+
+        let paired = mk_op(1);
+        let kept = mk_op(2);
+        let mut batch = StoreBatch::default();
+        batch.coin_puts.push((paired, mk_coin(1_000)));
+        batch.coin_puts.push((kept, mk_coin(2_000)));
+        batch.coin_removes.push((paired, 1_000, 7));
+        store.write_batch(batch).unwrap();
+
+        assert!(
+            store.get_coin(&paired).is_none(),
+            "put+remove pair must net to absent — the remove wins"
+        );
+        assert!(store.get_coin(&kept).is_some(), "unpaired put must survive");
+    }
+
     fn make_test_entry() -> BlockIndexEntry {
         let genesis = bitcoin::constants::genesis_block(bitcoin::Network::Regtest);
         BlockIndexEntry {

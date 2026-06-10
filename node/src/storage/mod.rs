@@ -60,6 +60,16 @@ pub enum StoreError {
 }
 
 /// Atomic batch of writes for a single block connection/disconnection.
+///
+/// **Remove-wins contract:** if the same key appears in both a family's
+/// puts and removes within one batch, the key must end ABSENT. Both
+/// emitters rely on this: `connect_block` carries a put+remove pair for
+/// an output created and spent within the same block, and
+/// `disconnect_block` carries the mirror pair (undo-restore put +
+/// created-output remove) — in both shapes the correct final state is
+/// absent. Implementations must apply puts before removes (or net the
+/// pairs); regression tests pin this for `RocksDbStore` and
+/// `InMemoryStore`.
 #[derive(Default)]
 pub struct StoreBatch {
     pub block_index_puts: Vec<(BlockHash, BlockIndexEntry)>,

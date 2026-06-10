@@ -1309,20 +1309,27 @@ impl Store for RocksDbStore {
             seen_in_batch.insert(*hash, entry.status);
         }
 
-        // Coins with counter tracking
+        // Coins with counter tracking.
+        //
+        // Puts BEFORE removes — this order is load-bearing. A RocksDB
+        // WriteBatch is a log (the last operation per key wins), and a
+        // batch may carry the same outpoint in both lists: connect_block
+        // emits a put+remove PAIR for an output created and spent within
+        // one block, and disconnect_block emits the mirror image
+        // (undo-restore put + created-output remove). In both shapes the
+        // correct final state is ABSENT, so the remove must win. The
+        // live path never exercises this (CoinCache nets pairs out
+        // before flushing), but a direct write_batch caller with
+        // removes-first would silently RESURRECT spent coins — caught
+        // live by the chainstate-repair dry run on mainnet block
+        // 952,978 (2,382 pairs). Counter math is order-independent: a
+        // pair contributes ±0 to count/amount/histogram, matching its
+        // net-absent state. Every other CF family below already applies
+        // puts-then-removes; InMemoryStore does too.
         let mut hist_deltas: std::collections::HashMap<usize, i64> =
             std::collections::HashMap::new();
         let mut count_delta: i64 = 0;
         let mut amount_delta: i64 = 0;
-
-        for (outpoint, spent_amount, spent_height) in &batch.coin_removes {
-            let key = outpoint_to_key(outpoint);
-            count_delta -= 1;
-            amount_delta -= *spent_amount as i64;
-            let bucket = (*spent_height / HEIGHT_HIST_BUCKET) as usize;
-            *hist_deltas.entry(bucket).or_default() -= 1;
-            wb.delete_cf(&cf_coins, key);
-        }
 
         for (outpoint, coin) in &batch.coin_puts {
             let key = outpoint_to_key(outpoint);
@@ -1332,6 +1339,15 @@ impl Store for RocksDbStore {
             amount_delta += coin.amount as i64;
             let bucket = (coin.height / HEIGHT_HIST_BUCKET) as usize;
             *hist_deltas.entry(bucket).or_default() += 1;
+        }
+
+        for (outpoint, spent_amount, spent_height) in &batch.coin_removes {
+            let key = outpoint_to_key(outpoint);
+            count_delta -= 1;
+            amount_delta -= *spent_amount as i64;
+            let bucket = (*spent_height / HEIGHT_HIST_BUCKET) as usize;
+            *hist_deltas.entry(bucket).or_default() -= 1;
+            wb.delete_cf(&cf_coins, key);
         }
 
         // Height index
@@ -2488,6 +2504,47 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = RocksDbStore::open(dir.path(), txindex, 16, false, -1).unwrap();
         (store, dir)
+    }
+
+    /// StoreBatch remove-wins contract: a key in BOTH coin_puts and
+    /// coin_removes of one batch must end absent (connect emits such
+    /// pairs for intra-block spends; disconnect emits the mirror
+    /// shape). A RocksDB WriteBatch is last-write-wins per key, so this
+    /// pins the puts-before-removes application order — the pre-fix
+    /// removes-first order resurrected the spent coin. Counters must
+    /// reflect the net state: the pair contributes nothing.
+    #[test]
+    fn write_batch_remove_wins_for_put_remove_pairs() {
+        let (store, _dir) = temp_store(false);
+
+        let mk_op = |seed: u8| OutPoint {
+            txid: Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+                [seed; 32],
+            )),
+            vout: 0,
+        };
+        let mk_coin = |amount: u64| Coin {
+            amount,
+            script_pubkey: bitcoin::ScriptBuf::new(),
+            height: 7,
+            coinbase: false,
+        };
+
+        let paired = mk_op(1);
+        let kept = mk_op(2);
+        let mut batch = StoreBatch::default();
+        batch.coin_puts.push((paired, mk_coin(1_000)));
+        batch.coin_puts.push((kept, mk_coin(2_000)));
+        batch.coin_removes.push((paired, 1_000, 7));
+        store.write_batch(batch).unwrap();
+
+        assert!(
+            store.get_coin(&paired).is_none(),
+            "put+remove pair must net to absent — the remove wins"
+        );
+        assert!(store.get_coin(&kept).is_some(), "unpaired put must survive");
+        assert_eq!(store.coin_count(), 1, "counters must match the net state");
+        assert_eq!(store.coin_total_amount(), 2_000);
     }
 
     fn regtest_genesis_entry() -> (BlockHash, BlockIndexEntry) {
