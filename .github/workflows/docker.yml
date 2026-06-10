@@ -1,0 +1,88 @@
+# Routine Docker image validation — runs on every PR and on pushes to master.
+#
+# This is the "does the production image still BUILD and still RUN" signal,
+# decoupled from release cadence. release.yml owns the full multi-arch
+# build → push-by-digest → cosign-sign flow on `v*` tags (and a path-gated
+# dry-run for packaging-input PRs); that machinery only exercises the
+# Dockerfile when a release is cut or when a PR happens to touch
+# Cargo.lock / Dockerfile / toolchain. The gap that left: ordinary code
+# PRs never built the image, so base-image / apt / runtime-stage drift
+# surfaced at tag time instead of on the PR that introduced it.
+#
+# Both shipped arches (amd64 + arm64) are validated, each on its own native
+# runner — same split release.yml uses, which keeps arm64 off slow QEMU
+# emulation (rocksdb's C++ build is ~2h under emulation, 5-15 min native).
+#
+# Each arch does load + run, not push: we pull the built image into the
+# local daemon and actually execute both binaries (`--version`). A plain
+# `build` proves the *builder* stage compiles but says nothing about the
+# *runtime* stage — a missing libssl3, a broken tini/ENTRYPOINT, or wrong
+# datadir perms all build green and only fail at `docker run`. Running on a
+# native per-arch runner means the smoke test exercises the real arch
+# binary, not an emulated one.
+#
+# Runs in its own jobs, parallel to ci.yml, so it adds no wall-clock time
+# there. Hosted-runner minutes are free for public repos.
+
+name: Docker
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  build-smoke:
+    name: build + smoke (${{ matrix.slug }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            os: ubuntu-24.04
+            slug: amd64
+          - platform: linux/arm64
+            os: ubuntu-24.04-arm
+            slug: arm64
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image (load locally, no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ matrix.platform }}
+          push: false
+          load: true
+          tags: satd:ci
+          # Dedicated cache scope so this never races / pollutes the
+          # per-arch scopes release.yml uses (docker-ci-* vs amd64/arm64).
+          cache-from: type=gha,scope=docker-ci-${{ matrix.slug }}
+          cache-to: type=gha,mode=max,scope=docker-ci-${{ matrix.slug }}
+          # We sign + attest provenance in release.yml's merge-docker via
+          # cosign keyless; a partial buildkit attestation here would be
+          # noise. This image is never pushed, so it needs neither.
+          provenance: false
+
+      - name: Smoke test — both binaries run in the runtime image
+        run: |
+          set -euo pipefail
+          # ENTRYPOINT is `tini -- satd`; overriding CMD with --version runs
+          # `satd --version`, which clap handles and exits 0 before any node
+          # startup (no datadir touched).
+          echo "satd:"
+          docker run --rm satd:ci --version
+          # sat-cli isn't the entrypoint — override it.
+          echo "sat-cli:"
+          docker run --rm --entrypoint /usr/local/bin/sat-cli satd:ci --version
