@@ -3863,6 +3863,29 @@ impl PeerManager {
         Ok(result)
     }
 
+    /// Accept an already-decoded, locally-originated transaction into the
+    /// mempool and [`announce_tx`](Self::announce_tx) it to peers, as one
+    /// operation. Returns the txid.
+    ///
+    /// The pre-decoded twin of [`broadcast_transaction`](Self::broadcast_transaction):
+    /// surfaces that decode the tx themselves with their own error shape
+    /// (Esplora `POST /tx`, Electrum `transaction.broadcast` and
+    /// `broadcast_package`) call this through the [`TxBroadcaster`] trait,
+    /// so they cannot accept a tx into the mempool without also putting it
+    /// on the wire.
+    pub fn submit_and_announce(
+        &self,
+        tx: bitcoin::Transaction,
+    ) -> Result<bitcoin::Txid, MempoolError> {
+        let txid = self.mempool.accept_transaction(
+            tx,
+            &self.chain_state,
+            self.chain_state.script_verifier(),
+        )?;
+        self.announce_tx(txid);
+        Ok(txid)
+    }
+
     /// BFS-drain orphans that listed `parent` as a missing parent. Newly
     /// admitted children recursively trigger further drains. Orphans that
     /// still don't validate (other missing parents, or genuinely invalid)
@@ -5052,6 +5075,27 @@ impl Drop for BulkLoadGuard<'_> {
     }
 }
 
+/// Accept a locally-originated transaction into the mempool and announce
+/// it to peers, as one operation. Implemented by [`PeerManager`] and
+/// injected into the out-of-crate broadcast surfaces (Esplora `POST /tx`,
+/// Electrum `transaction.broadcast`) so a surface cannot accept a tx into
+/// the mempool without also putting it on the wire — the gap that left
+/// MCP-, Esplora-, and Electrum-broadcast txs sitting unannounced.
+///
+/// A trait (rather than a concrete `Arc<PeerManager>`) keeps those crates
+/// decoupled from the P2P manager and lets their tests inject a fake.
+pub trait TxBroadcaster: Send + Sync {
+    /// Accept `tx` into the mempool and announce it to peers. Returns the
+    /// txid, or the mempool rejection reason.
+    fn submit_and_announce(&self, tx: bitcoin::Transaction) -> Result<bitcoin::Txid, MempoolError>;
+}
+
+impl TxBroadcaster for PeerManager {
+    fn submit_and_announce(&self, tx: bitcoin::Transaction) -> Result<bitcoin::Txid, MempoolError> {
+        PeerManager::submit_and_announce(self, tx)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5430,5 +5474,70 @@ mod tests {
         assert!(rx2.try_recv().is_err(), "high-fee-filter peer must be skipped");
         // Not yet Connected → skipped.
         assert!(rx3.try_recv().is_err(), "non-Connected peer must be skipped");
+    }
+
+    /// `submit_and_announce` — the shared core behind the Esplora / Electrum
+    /// broadcast surfaces — must NOT announce a tx the mempool rejects.
+    /// (The accepted-and-announced path is covered by the mechanism test
+    /// above plus the surface integration tests.)
+    #[test]
+    fn submit_and_announce_does_not_announce_rejected_tx() {
+        use crate::chain::state::AssumeValid;
+        use crate::storage::db::InMemoryStore;
+        use crate::storage::flatfile::FlatFileManager;
+        use crate::validation::script::NoopVerifier;
+        use bitcoin::hashes::Hash;
+        use bitcoin::{
+            Amount, OutPoint, ScriptBuf, Sequence, TxIn, TxOut, Witness, absolute::LockTime,
+            transaction,
+        };
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Box::new(InMemoryStore::new());
+        let flat_files = FlatFileManager::new(&dir.path().join("blocks")).unwrap();
+        let chain_state = Arc::new(
+            ChainState::new(
+                store,
+                flat_files,
+                Network::Regtest,
+                Box::new(NoopVerifier),
+                AssumeValid::Disabled,
+                450,
+                4,
+                Default::default(),
+                Default::default(),
+            )
+            .unwrap(),
+        );
+        let mempool = Arc::new(Mempool::new(1_000_000, 0));
+        let fee_estimator = Arc::new(FeeEstimator::new());
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let pm =
+            PeerManager::new(chain_state, mempool, fee_estimator, Network::Regtest, shutdown_rx);
+
+        let addr: SocketAddr = "10.0.0.1:8333".parse().unwrap();
+        let (h1, mut rx1) = mk_handle_rx(1, addr, PeerState::Connected, 0);
+        pm.peers.write().insert(1, h1);
+
+        // A tx spending a non-existent output → rejected (missing inputs).
+        let tx = bitcoin::Transaction {
+            version: transaction::Version(2),
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: bitcoin::Txid::from_raw_hash(
+                        bitcoin::hashes::sha256d::Hash::from_byte_array([9u8; 32]),
+                    ),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut { value: Amount::from_sat(1000), script_pubkey: ScriptBuf::new() }],
+        };
+
+        assert!(pm.submit_and_announce(tx).is_err(), "tx with missing inputs must be rejected");
+        assert!(rx1.try_recv().is_err(), "a rejected tx must not be announced to peers");
     }
 }

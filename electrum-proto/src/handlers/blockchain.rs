@@ -4,9 +4,11 @@
 //! `headers.*`, `block.*`, `transaction.get*`) call directly into the
 //! `node-index` traits + the `ElectrumExtras` adapter.
 //!
-//! Write-side method (`transaction.broadcast`) routes through
-//! [`Mempool::accept_transaction`] — same path Esplora's `POST /tx`
-//! endpoint takes.
+//! Write-side methods (`transaction.broadcast`, `broadcast_package`)
+//! route through the [`TxBroadcaster`](node::net::manager::TxBroadcaster)
+//! injected on the state — accept into the mempool *and* announce to
+//! peers, so the tx actually propagates — the same path Esplora's
+//! `POST /tx` endpoint takes.
 //!
 //! [`scripthash_subscribe`] returns the synchronous initial status
 //! response. The push-notification side lives in PR-4
@@ -594,9 +596,11 @@ pub fn transaction_broadcast(state: &ElectrumState, params: Value) -> Result<Val
         .map_err(|e| JsonRpcError::invalid_params(format!("bad hex: {e}")))?;
     let tx: Transaction =
         deserialize(&bytes).map_err(|e| JsonRpcError::invalid_params(format!("decode: {e}")))?;
+    // Accept + announce in one step so the tx actually propagates — a bare
+    // mempool accept leaves it sitting on this node, unannounced.
     let txid = state
-        .mempool
-        .accept_transaction(tx, &state.chain, state.chain.script_verifier())
+        .tx_broadcaster
+        .submit_and_announce(tx)
         .map_err(|e| JsonRpcError::bad_request(format!("mempool reject: {e}")))?;
     Ok(Value::String(txid.to_string()))
 }
@@ -650,11 +654,9 @@ pub fn transaction_broadcast_package(
     let mut errors: Vec<Value> = Vec::new();
     for tx in &decoded {
         let txid = tx.compute_txid();
-        if let Err(e) = state.mempool.accept_transaction(
-            tx.clone(),
-            &state.chain,
-            state.chain.script_verifier(),
-        ) {
+        // Accept + announce each tx so accepted ones propagate; a bare
+        // mempool accept would leave them sitting on this node.
+        if let Err(e) = state.tx_broadcaster.submit_and_announce(tx.clone()) {
             errors.push(json!({
                 "txid": txid.to_string(),
                 "error": e.to_string(),
