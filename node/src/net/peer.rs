@@ -170,6 +170,17 @@ impl PeerInfo {
         self.version = Some(version);
     }
 
+    /// Whether this peer participates in tx relay — the BIP 37 `fRelay`
+    /// flag from its version message. A peer that set `relay = false`
+    /// (e.g. Bitcoin Core under `-blocksonly`, or a block-relay-only
+    /// connection) must never be sent tx invs: Core treats a tx inv on
+    /// such a connection as a protocol violation and disconnects.
+    /// Defaults to `true` when no version has been received yet (such a
+    /// peer is not `Connected`, so announce paths skip it anyway).
+    pub fn relays_txs(&self) -> bool {
+        self.version.as_ref().map(|v| v.relay).unwrap_or(true)
+    }
+
     /// Convert to JSON-compatible format for getpeerinfo RPC. `stats` carries
     /// the live wire counters (bytes + last-activity timestamps) recorded by
     /// the connection read/write halves.

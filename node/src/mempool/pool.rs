@@ -99,14 +99,19 @@ struct MempoolInner {
     total_bytes: usize,
     /// Locally-originated txs (submitted here via a broadcast surface) that
     /// have not yet been confirmed to have propagated. Maps each txid to the
-    /// set of peer ids that have since announced it *back* to us — evidence
-    /// it reached the network. The peer manager rebroadcasts these on a timer
-    /// and on new-peer-connect; an entry is dropped once enough distinct
-    /// peers have echoed it (see [`Mempool::record_broadcast_witness`]) or
-    /// the tx leaves the mempool (mined/evicted/replaced/expired). Always a
-    /// subset of `entries`. This is satd's analogue of Core's
+    /// set of peer IPs that have since demonstrated knowledge of it
+    /// (fetched it via `getdata` or announced it back) — evidence it reached
+    /// the network. Witnesses are keyed by IP, not per-connection peer id:
+    /// peer ids are monotonic and never reused, so a single host
+    /// reconnecting could otherwise satisfy any `broadcastconfirmpeers`
+    /// threshold with sequential connections. The peer manager rebroadcasts
+    /// these on a timer and on new-peer-connect; an entry is dropped once
+    /// enough distinct witnesses accrue (see
+    /// [`Mempool::record_broadcast_witness`]) or the tx leaves the mempool
+    /// (mined/evicted/replaced/expired — every removal path prunes it).
+    /// Always a subset of `entries`. This is satd's analogue of Core's
     /// `m_unbroadcast_txids`, surfaced as `getmempoolinfo.unbroadcastcount`.
-    unbroadcast: HashMap<Txid, HashSet<u64>>,
+    unbroadcast: HashMap<Txid, HashSet<std::net::IpAddr>>,
 }
 
 /// Configurable mempool policy. All fields map to Bitcoin Core-compatible
@@ -151,6 +156,13 @@ impl Default for MempoolConfig {
 /// In-memory transaction pool.
 pub struct Mempool {
     inner: RwLock<MempoolInner>,
+    /// Mirror of `inner.unbroadcast.len()`, maintained at every mutation
+    /// site (under the `inner` write lock, so it is always coherent with
+    /// the map). Lets the hot P2P paths (`inv`/`getdata` handlers asking
+    /// "could this be a pending local broadcast?") skip the `inner` lock
+    /// entirely in the ~always case where nothing is pending — a relay
+    /// node would otherwise pay a write-lock acquisition per inv item.
+    unbroadcast_len: std::sync::atomic::AtomicUsize,
     /// Mempool/relay policy. Behind a `RwLock` so SIGHUP config reload can swap
     /// it live (`reload_policy`); `accept_transaction` snapshots it once at
     /// entry so a transaction is judged against a single policy version.
@@ -188,6 +200,7 @@ impl Mempool {
                 total_bytes: 0,
                 unbroadcast: HashMap::new(),
             }),
+            unbroadcast_len: std::sync::atomic::AtomicUsize::new(0),
             config: RwLock::new(config),
             event_tx: Mutex::new(None),
             event_ring: Mutex::new(VecDeque::with_capacity(EVENT_RING_CAPACITY)),
@@ -490,6 +503,7 @@ impl Mempool {
             }
             // Evict enough lowest-fee-rate entries to make room
             evicted_full_pool = Self::evict_lowest_fee_entries(&mut inner, tx_size);
+            self.sync_unbroadcast_len(&inner);
             // If still not enough room after eviction, reject
             if inner.total_bytes + tx_size > cfg.max_size_bytes {
                 return Err(MempoolError::MempoolFull);
@@ -514,10 +528,12 @@ impl Mempool {
                 for ci in &conflict_entry.tx.input {
                     inner.spends.remove(&ci.previous_output);
                 }
+                inner.unbroadcast.remove(conflict_txid);
                 replaced.push(*conflict_txid);
                 tracing::info!(%conflict_txid, "RBF: evicted conflicting transaction");
             }
         }
+        self.sync_unbroadcast_len(&inner);
 
         // Insert
         let now = std::time::SystemTime::now()
@@ -615,6 +631,7 @@ impl Mempool {
                     for input in &entry.tx.input {
                         inner.spends.remove(&input.previous_output);
                     }
+                    inner.unbroadcast.remove(&txid);
                     confirmed.push(txid);
                 }
 
@@ -634,11 +651,13 @@ impl Mempool {
                             for ci in &conflict_entry.tx.input {
                                 inner.spends.remove(&ci.previous_output);
                             }
+                            inner.unbroadcast.remove(&conflict_txid);
                             evicted_conflicts.push(conflict_txid);
                         }
                     }
                 }
             }
+            self.sync_unbroadcast_len(&inner);
         }
 
         for txid in &confirmed {
@@ -739,9 +758,11 @@ impl Mempool {
                     for input in &entry.tx.input {
                         inner.spends.remove(&input.previous_output);
                     }
+                    inner.unbroadcast.remove(txid);
                     expired_txids.push(*txid);
                 }
             }
+            self.sync_unbroadcast_len(&inner);
         }
 
         let count = expired_txids.len();
@@ -1046,6 +1067,7 @@ impl Mempool {
                 for input in &entry.tx.input {
                     inner.spends.remove(&input.previous_output);
                 }
+                inner.unbroadcast.remove(txid);
                 tracing::debug!(%txid, fee_rate = entry.fee_rate, "Evicted low-fee tx from mempool");
             }
         }
@@ -1056,47 +1078,85 @@ impl Mempool {
         to_remove
     }
 
-    /// Get mempool statistics.
+    /// Keep the lock-free `unbroadcast_len` mirror coherent with the map.
+    /// Must be called (with the `inner` write lock still held) after any
+    /// mutation of `inner.unbroadcast`.
+    fn sync_unbroadcast_len(&self, inner: &MempoolInner) {
+        self.unbroadcast_len
+            .store(inner.unbroadcast.len(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether any local tx is pending propagation confirmation. Lock-free
+    /// fast path for the hot P2P handlers (`inv`/`getdata`): on a node
+    /// that isn't actively broadcasting this is `false` and the caller can
+    /// skip [`record_broadcast_witness`](Self::record_broadcast_witness)'s
+    /// write-lock acquisition entirely.
+    pub fn has_unbroadcast(&self) -> bool {
+        self.unbroadcast_len.load(std::sync::atomic::Ordering::Relaxed) > 0
+    }
+
     /// Mark a locally-originated tx as unbroadcast (pending propagation
     /// confirmation). No-op if the tx isn't currently in the mempool.
     pub fn mark_unbroadcast(&self, txid: Txid) {
         let mut inner = self.inner.write();
         if inner.entries.contains_key(&txid) {
             inner.unbroadcast.entry(txid).or_default();
+            self.sync_unbroadcast_len(&inner);
         }
     }
 
-    /// Record that `peer_id` announced `txid` back to us — evidence the tx
-    /// propagated into the network. Returns `true` once at least
-    /// `confirm_threshold` distinct peers have echoed it, at which point the
-    /// tx is dropped from the unbroadcast set (we stop rebroadcasting it).
-    /// `confirm_threshold` is clamped to a minimum of 1. Returns `false` for
-    /// a txid that isn't pending broadcast.
+    /// Record that the peer at `witness` (its IP) demonstrated knowledge of
+    /// `txid` — evidence the tx propagated into the network. Returns `true`
+    /// once at least `confirm_threshold` distinct IPs have witnessed it, at
+    /// which point the tx is dropped from the unbroadcast set (we stop
+    /// rebroadcasting it). Witnesses are keyed by IP so a reconnecting host
+    /// (fresh peer id each time) cannot stack the count. `confirm_threshold`
+    /// is clamped to a minimum of 1. Returns `false` for a txid that isn't
+    /// pending broadcast.
     pub fn record_broadcast_witness(
         &self,
         txid: &Txid,
-        peer_id: u64,
+        witness: std::net::IpAddr,
         confirm_threshold: usize,
     ) -> bool {
         let threshold = confirm_threshold.max(1);
         let mut inner = self.inner.write();
         if let Some(witnesses) = inner.unbroadcast.get_mut(txid) {
-            witnesses.insert(peer_id);
+            witnesses.insert(witness);
             if witnesses.len() >= threshold {
                 inner.unbroadcast.remove(txid);
+                self.sync_unbroadcast_len(&inner);
                 return true;
             }
         }
         false
     }
 
-    /// Live unbroadcast txids (those still resident in the mempool). Prunes
-    /// entries whose tx has since left the mempool (mined/evicted/replaced).
+    /// Live unbroadcast txids (those still resident in the mempool), for
+    /// persistence. Every mempool removal path prunes `unbroadcast` inline;
+    /// the retain here is a cheap second line of defense.
     pub fn unbroadcast_txids(&self) -> Vec<Txid> {
         let mut inner = self.inner.write();
         let MempoolInner { entries, unbroadcast, .. } = &mut *inner;
         unbroadcast.retain(|txid, _| entries.contains_key(txid));
-        unbroadcast.keys().copied().collect()
+        let txids = unbroadcast.keys().copied().collect();
+        self.sync_unbroadcast_len(&inner);
+        txids
+    }
+
+    /// Live unbroadcast `(txid, fee_rate)` pairs, for the announce paths —
+    /// the fee rate is captured here so callers never have to re-enter the
+    /// mempool lock (or clone whole entries) while holding the peers lock.
+    pub fn unbroadcast_entries(&self) -> Vec<(Txid, u64)> {
+        let mut inner = self.inner.write();
+        let MempoolInner { entries, unbroadcast, .. } = &mut *inner;
+        unbroadcast.retain(|txid, _| entries.contains_key(txid));
+        let pairs = unbroadcast
+            .keys()
+            .map(|txid| (*txid, entries.get(txid).map(|e| e.fee_rate).unwrap_or(0)))
+            .collect();
+        self.sync_unbroadcast_len(&inner);
+        pairs
     }
 
     /// Count of live unbroadcast txs — Core's `getmempoolinfo.unbroadcastcount`.
@@ -1104,7 +1164,9 @@ impl Mempool {
         let mut inner = self.inner.write();
         let MempoolInner { entries, unbroadcast, .. } = &mut *inner;
         unbroadcast.retain(|txid, _| entries.contains_key(txid));
-        unbroadcast.len()
+        let count = unbroadcast.len();
+        self.sync_unbroadcast_len(&inner);
+        count
     }
 
     /// Whether `txid` is a pending-broadcast local tx still in the mempool.
@@ -1113,6 +1175,7 @@ impl Mempool {
         inner.unbroadcast.contains_key(txid) && inner.entries.contains_key(txid)
     }
 
+    /// Get mempool statistics.
     pub fn info(&self) -> MempoolInfo {
         // Snapshot policy first (lock released) so the policy lock is never held
         // while `inner` is — uniform leaf-lock discipline (see `remove_expired`).
@@ -1121,8 +1184,8 @@ impl Mempool {
             (cfg.max_size_bytes, cfg.min_fee_rate, cfg.full_rbf)
         };
         let inner = self.inner.read();
-        // Count only unbroadcast entries still resident (read-only; the
-        // periodic `unbroadcast_txids` pass does the actual pruning).
+        // Count only unbroadcast entries still resident (read-only belt —
+        // the removal paths prune inline, so this should equal `len()`).
         let unbroadcast = inner
             .unbroadcast
             .keys()
@@ -1186,6 +1249,7 @@ impl Mempool {
             },
         );
         inner.unbroadcast.entry(txid).or_default();
+        self.sync_unbroadcast_len(&inner);
     }
 }
 
@@ -2074,18 +2138,24 @@ mod tests {
         assert_eq!(mp.unbroadcast_count(), 1);
         assert_eq!(mp.unbroadcast_txids(), vec![txid]);
 
-        // Threshold 2: the same peer twice is one distinct witness.
-        assert!(!mp.record_broadcast_witness(&txid, 7, 2));
-        assert!(!mp.record_broadcast_witness(&txid, 7, 2));
+        // Witnesses key on IP: the same host twice is one distinct witness,
+        // no matter how many times it reconnects.
+        let ip7: std::net::IpAddr = "10.0.0.7".parse().unwrap();
+        let ip8: std::net::IpAddr = "10.0.0.8".parse().unwrap();
+        let ip9: std::net::IpAddr = "10.0.0.9".parse().unwrap();
+        assert!(!mp.record_broadcast_witness(&txid, ip7, 2));
+        assert!(!mp.record_broadcast_witness(&txid, ip7, 2));
         assert!(mp.is_unbroadcast(&txid), "one distinct witness < threshold 2");
+        assert!(mp.has_unbroadcast());
 
-        // A second distinct peer crosses the threshold → dropped.
-        assert!(mp.record_broadcast_witness(&txid, 8, 2));
+        // A second distinct host crosses the threshold → dropped.
+        assert!(mp.record_broadcast_witness(&txid, ip8, 2));
         assert!(!mp.is_unbroadcast(&txid));
         assert_eq!(mp.unbroadcast_count(), 0);
+        assert!(!mp.has_unbroadcast(), "lock-free mirror tracks the map");
 
         // Recording against an unknown/cleared txid is false, not a panic.
-        assert!(!mp.record_broadcast_witness(&txid, 9, 1));
+        assert!(!mp.record_broadcast_witness(&txid, ip9, 1));
     }
 
     #[test]

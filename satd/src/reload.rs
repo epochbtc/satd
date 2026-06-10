@@ -540,8 +540,18 @@ fn field_specs() -> Vec<FieldSpec> {
         live!("timeout", timeout, |c, h| {
             h.peer_manager.set_connect_timeout_ms(c.timeout)
         }),
-        restart!("rebroadcastinterval", rebroadcastinterval),
-        restart!("broadcastconfirmpeers", broadcastconfirmpeers),
+        // Both are re-read from PeerManager atomics at each use (the
+        // interval at the top of every rebroadcast pass, the threshold per
+        // witness check), so a live push applies cleanly. An interval
+        // change takes effect once the in-flight sleep completes.
+        live!("rebroadcastinterval", rebroadcastinterval, |c, h| {
+            h.peer_manager
+                .set_rebroadcast_config(c.rebroadcastinterval, c.broadcastconfirmpeers)
+        }),
+        live!("broadcastconfirmpeers", broadcastconfirmpeers, |c, h| {
+            h.peer_manager
+                .set_rebroadcast_config(c.rebroadcastinterval, c.broadcastconfirmpeers)
+        }),
         restart!("onlynet", onlynet),
         restart!("signetseednode", signet_seed_nodes),
         restart!("signetchallenge", signet_challenge),

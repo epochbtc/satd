@@ -71,14 +71,17 @@ const DEFAULT_MAX_INBOUND_PER_IP: usize = 3;
 /// Default handshake timeout in milliseconds, matching Bitcoin Core's
 /// `-timeout` default (5000ms).
 const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 5000;
-/// Default distinct-peer echo count before a local tx is considered
-/// propagated and rebroadcast stops. 1 = "any peer announced it back."
+/// Default distinct-witness count before a local tx is considered
+/// propagated and rebroadcast stops. 1 = "any peer fetched/echoed it."
 const DEFAULT_BROADCAST_CONFIRM_PEERS: u64 = 1;
 /// Bounds for the "auto" (interval = 0) rebroadcast cadence — Bitcoin Core's
 /// 10–15 minute randomized window. Randomizing avoids a fleet re-announcing
 /// in lockstep.
 const REBROADCAST_AUTO_MIN_SECS: u64 = 600;
 const REBROADCAST_AUTO_MAX_SECS: u64 = 900;
+/// P2P protocol cap on inventory items per `inv` message (Core's
+/// `MAX_INV_SZ`); peers disconnect senders that exceed it.
+const MAX_INV_PER_MSG: usize = 50_000;
 /// Minimum timeout for a SOCKS5 `.onion` dial, in milliseconds. A `.onion`
 /// connect tunnels the proxy socket connect, the SOCKS5 handshake, and the
 /// Tor rendezvous (HS descriptor fetch + intro/rendezvous circuit build) — the
@@ -270,10 +273,12 @@ pub struct PeerManager {
     /// "auto" — the spawner randomizes each interval in
     /// `[REBROADCAST_AUTO_MIN_SECS, REBROADCAST_AUTO_MAX_SECS]` (Core's
     /// 10–15 min). Set from config after construction (see
-    /// [`set_rebroadcast_config`]). SIGHUP-reloadable.
+    /// [`set_rebroadcast_config`]). SIGHUP-reloadable; an interval change
+    /// takes effect after the in-flight sleep completes.
     rebroadcast_interval_secs: AtomicU64,
-    /// Distinct peers that must announce a local tx back to us before we
-    /// consider it propagated and stop rebroadcasting. Clamped to ≥1 at use.
+    /// Distinct witnesses (peer IPs that fetched/echoed a local tx) before
+    /// we consider it propagated and stop rebroadcasting. Clamped to ≥1 at
+    /// use. SIGHUP-reloadable.
     broadcast_confirm_peers: AtomicU64,
     /// IBD scheduler for parallel block download (shared with connect thread).
     ibd: Arc<parking_lot::RwLock<Option<IbdScheduler>>>,
@@ -1514,6 +1519,19 @@ impl PeerManager {
         htip == 0 || tip + 24 < htip
     }
 
+    /// Whether the node is actively catching up to a known headers tip.
+    /// Unlike [`is_ibd`](Self::is_ibd), "no headers heard yet" (`htip == 0`)
+    /// does NOT count: that's the state of an isolated node (fresh regtest,
+    /// no peers yet) — exactly the node whose pending local broadcasts must
+    /// still go out when a peer finally appears. Used to suppress the
+    /// unbroadcast announce paths only while genuinely syncing (peers don't
+    /// want tx invs mid-IBD, and the mempool can't validate then anyway).
+    fn is_actively_syncing(&self) -> bool {
+        let tip = self.chain_state.tip_height();
+        let htip = self.headers_tip.load(Ordering::Relaxed) as u32;
+        tip + 24 < htip
+    }
+
     /// Check if we already have a connection to this address.
     fn is_addr_connected(&self, addr: &SocketAddr) -> bool {
         let peers = self.peers.read();
@@ -1970,9 +1988,11 @@ impl PeerManager {
 
         // Re-announce any pending local broadcasts to the freshly-connected
         // peer, so a tx submitted while we had no (fee-permitting) peers
-        // reaches the network as soon as one arrives. Suppressed during IBD,
-        // which doesn't relay txs.
-        if !self.is_ibd() {
+        // reaches the network as soon as one arrives. Suppressed while
+        // actively syncing (peers don't want tx invs mid-IBD) — but NOT for
+        // an isolated node that simply hasn't heard headers yet, which is
+        // precisely the "first peer finally arrived" case this exists for.
+        if !self.is_actively_syncing() {
             self.announce_unbroadcast_to_peer(id);
         }
     }
@@ -2036,7 +2056,11 @@ impl PeerManager {
             NetworkMessage::FeeFilter(rate) => {
                 let mut peers = self.peers.write();
                 if let Some(handle) = peers.get_mut(&id) {
-                    handle.info.fee_filter = rate as u64;
+                    // BIP 133 carries an i64; clamp negatives to 0
+                    // (pass-everything, Core's signed-comparison behavior)
+                    // instead of letting `as u64` wrap to ~u64::MAX, which
+                    // would silently filter ALL tx announcements to the peer.
+                    handle.info.fee_filter = rate.max(0) as u64;
                     tracing::debug!(id, rate, "Peer set fee filter");
                 }
             }
@@ -3842,6 +3866,7 @@ impl PeerManager {
         for (peer_id, handle) in peers.iter() {
             if *peer_id != from
                 && handle.info.state == PeerState::Connected
+                && handle.info.relays_txs()
                 && entry_fee_rate >= handle.info.fee_filter
             {
                 let _ = handle.msg_tx.try_send(inv.clone());
@@ -3866,6 +3891,7 @@ impl PeerManager {
         let peers = self.peers.read();
         for handle in peers.values() {
             if handle.info.state == PeerState::Connected
+                && handle.info.relays_txs()
                 && entry_fee_rate >= handle.info.fee_filter
             {
                 let _ = handle.msg_tx.try_send(inv.clone());
@@ -3938,10 +3964,20 @@ impl PeerManager {
     }
 
     /// Set the rebroadcast cadence (`interval_secs`, `0` = auto/randomized)
-    /// and the distinct-peer echo count required to confirm propagation.
-    /// Called from the satd binary after construction (and on SIGHUP reload)
-    /// to avoid widening `with_config`.
+    /// and the distinct-witness count required to confirm propagation.
+    /// Called from the satd binary after construction and on SIGHUP reload
+    /// (both values are re-read from the atomics at each use, so a live
+    /// change takes effect on the next pass / witness check).
     pub fn set_rebroadcast_config(&self, interval_secs: u64, confirm_peers: u64) {
+        if interval_secs > 0 && interval_secs < 60 {
+            // Allowed (useful on regtest), but on a real network this
+            // re-invs every pending local tx to every peer each pass.
+            tracing::warn!(
+                interval_secs,
+                "rebroadcastinterval under 60s re-announces aggressively; \
+                 intended for test networks only"
+            );
+        }
         self.rebroadcast_interval_secs
             .store(interval_secs, Ordering::Relaxed);
         self.broadcast_confirm_peers
@@ -3960,42 +3996,80 @@ impl PeerManager {
     }
 
     /// Re-announce every still-resident unbroadcast local tx to all
-    /// fee-permitting peers. Run periodically by the rebroadcast task; the
-    /// `unbroadcast_txids` call also prunes txids that have since left the
-    /// mempool. A tx stops being rebroadcast once enough peers echo it back
-    /// (see [`note_broadcast_witness`](Self::note_broadcast_witness)) or it is
+    /// fee-permitting, tx-relaying peers. Run periodically by the
+    /// rebroadcast task; the `unbroadcast_entries` call also prunes txids
+    /// that have since left the mempool. A tx stops being rebroadcast once
+    /// enough distinct witnesses accrue (see
+    /// [`note_broadcast_witness`](Self::note_broadcast_witness)) or it is
     /// mined/evicted.
+    ///
+    /// The per-peer invs are coalesced into one batched `inv` message
+    /// (chunked at the protocol cap): a repeated *isolated* single-txid inv
+    /// is a much stronger "this is the node's own tx" fingerprint to a
+    /// passive observer than a batch, and it's one message instead of N.
+    /// Suppressed during IBD, which doesn't relay txs.
     pub fn rebroadcast_unbroadcast_txs(&self) {
-        let txids = self.mempool.unbroadcast_txids();
-        if txids.is_empty() {
+        if self.is_actively_syncing() {
             return;
         }
-        tracing::debug!(count = txids.len(), "rebroadcasting unbroadcast local txs");
-        for txid in txids {
-            self.announce_tx(txid);
+        // (txid, fee_rate) pairs are snapshotted BEFORE taking the peers
+        // lock: `mempool.get` can block behind a long `accept_transaction`
+        // write hold (script verification), and stalling every P2P router
+        // behind that while holding `peers.read()` would be self-inflicted.
+        let pairs = self.mempool.unbroadcast_entries();
+        if pairs.is_empty() {
+            return;
+        }
+        tracing::debug!(count = pairs.len(), "rebroadcasting unbroadcast local txs");
+        let peers = self.peers.read();
+        for handle in peers.values() {
+            if handle.info.state != PeerState::Connected || !handle.info.relays_txs() {
+                continue;
+            }
+            let invs: Vec<Inventory> = pairs
+                .iter()
+                .filter(|(_, fee_rate)| *fee_rate >= handle.info.fee_filter)
+                .map(|(txid, _)| Inventory::WitnessTransaction(*txid))
+                .collect();
+            for chunk in invs.chunks(MAX_INV_PER_MSG) {
+                let _ = handle.msg_tx.try_send(NetworkMessage::Inv(chunk.to_vec()));
+            }
         }
     }
 
-    /// Announce the current unbroadcast local txs to a single peer (used on
-    /// new-peer-connect so a tx submitted while we had no peers reaches the
-    /// network as soon as one arrives). Honors the peer's fee filter and
-    /// Connected state.
+    /// Announce the current unbroadcast local txs to a single freshly-
+    /// connected peer (so a tx submitted while we had no peers reaches the
+    /// network as soon as one arrives). Honors the peer's fee filter,
+    /// `fRelay`, and Connected state, and batches into one `inv`.
+    ///
+    /// Outbound peers only: an unsolicited just-after-connect inv of
+    /// exactly our pending local txs is a wallet fingerprint, and inbound
+    /// connections are attacker-chosen — a sybil could connect repeatedly
+    /// just to enumerate them. Outbound peers are ones *we* selected,
+    /// which is the same trust distinction Core draws for address-relay
+    /// and tx-relay decisions; the periodic rebroadcast pass still reaches
+    /// inbound peers on the randomized timer alongside everyone else.
     fn announce_unbroadcast_to_peer(&self, id: PeerId) {
-        let txids = self.mempool.unbroadcast_txids();
-        if txids.is_empty() {
+        // Snapshot before taking the peers lock (see rebroadcast pass).
+        let pairs = self.mempool.unbroadcast_entries();
+        if pairs.is_empty() {
             return;
         }
         let peers = self.peers.read();
         let Some(handle) = peers.get(&id) else { return };
-        if handle.info.state != PeerState::Connected {
+        if handle.info.state != PeerState::Connected
+            || handle.info.direction != Direction::Outbound
+            || !handle.info.relays_txs()
+        {
             return;
         }
-        for txid in txids {
-            let fee_rate = self.mempool.get(&txid).map(|e| e.fee_rate).unwrap_or(0);
-            if fee_rate >= handle.info.fee_filter {
-                let inv = NetworkMessage::Inv(vec![Inventory::WitnessTransaction(txid)]);
-                let _ = handle.msg_tx.try_send(inv);
-            }
+        let invs: Vec<Inventory> = pairs
+            .iter()
+            .filter(|(_, fee_rate)| *fee_rate >= handle.info.fee_filter)
+            .map(|(txid, _)| Inventory::WitnessTransaction(*txid))
+            .collect();
+        for chunk in invs.chunks(MAX_INV_PER_MSG) {
+            let _ = handle.msg_tx.try_send(NetworkMessage::Inv(chunk.to_vec()));
         }
     }
 
@@ -4003,17 +4077,29 @@ impl PeerManager {
     /// fetching it from us via `getdata` (the primary, reliable signal: the
     /// peer pulled the tx, so we've handed it off) or by announcing it back to
     /// us via `inv`. If `txid` is a pending local broadcast, this is
-    /// propagation evidence; once enough distinct peers have witnessed it the
-    /// tx is dropped from the unbroadcast set and rebroadcast stops.
+    /// propagation evidence; once enough distinct witnesses (keyed by peer
+    /// IP, so reconnects don't stack) have seen it the tx is dropped from
+    /// the unbroadcast set and rebroadcast stops.
     ///
     /// `getdata` is the dominant signal for local txs: we announce a local tx
     /// to every fee-permitting peer, and standard relay dedup means none of
     /// them will `inv` it *back* to us (they know we have it) — but each that
     /// didn't already hold it will `getdata` it within seconds. This mirrors
     /// Bitcoin Core's `RemoveUnbroadcastTx`-on-`getdata`.
+    ///
+    /// Called from the hottest P2P paths (every tx inv / getdata for a tx we
+    /// hold), so it must stay cheap when nothing is pending: the lock-free
+    /// `has_unbroadcast` check skips the mempool write lock entirely in that
+    /// ~always case, leaving the original read-only fast path untouched.
     fn note_broadcast_witness(&self, id: PeerId, txid: bitcoin::Txid) {
+        if !self.mempool.has_unbroadcast() {
+            return;
+        }
+        let Some(witness_ip) = self.peers.read().get(&id).map(|h| h.info.addr.ip()) else {
+            return;
+        };
         let threshold = self.broadcast_confirm_peers.load(Ordering::Relaxed) as usize;
-        if self.mempool.record_broadcast_witness(&txid, id, threshold) {
+        if self.mempool.record_broadcast_witness(&txid, witness_ip, threshold) {
             tracing::debug!(%txid, "local tx confirmed propagated; rebroadcast stopped");
         }
     }
@@ -4334,11 +4420,17 @@ impl PeerManager {
                 }
                 Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
                     if let Some(entry) = self.mempool.get(&txid) {
-                        self.send_to_peer(id, NetworkMessage::Tx(entry.tx));
                         // The peer pulled this tx from us. If it's a pending
                         // local broadcast, that's the primary proof it has
-                        // propagated — count the peer toward stopping rebroadcast.
-                        self.note_broadcast_witness(id, txid);
+                        // propagated — count the peer toward stopping
+                        // rebroadcast. Only if the Tx was actually enqueued:
+                        // a try_send drop (slow peer, full channel) means the
+                        // peer never received it, and retiring the tx on a
+                        // dropped send would defeat the exact failure mode
+                        // rebroadcast exists to cover.
+                        if self.send_to_peer(id, NetworkMessage::Tx(entry.tx)) {
+                            self.note_broadcast_witness(id, txid);
+                        }
                     } else {
                         not_found.push(inv);
                     }
@@ -4470,10 +4562,17 @@ impl PeerManager {
         }
     }
 
-    fn send_to_peer(&self, id: PeerId, msg: NetworkMessage) {
+    /// Queue a message to a peer. Returns whether the message was actually
+    /// enqueued — `false` if the peer is gone or its (bounded) channel is
+    /// full and the message was dropped. Most callers ignore the result
+    /// (P2P sends are best-effort), but callers that derive *state* from
+    /// having sent something (e.g. the getdata-served propagation witness)
+    /// must check it: a dropped send is not evidence of anything.
+    fn send_to_peer(&self, id: PeerId, msg: NetworkMessage) -> bool {
         let peers = self.peers.read();
-        if let Some(handle) = peers.get(&id) {
-            let _ = handle.msg_tx.try_send(msg);
+        match peers.get(&id) {
+            Some(handle) => handle.msg_tx.try_send(msg).is_ok(),
+            None => false,
         }
     }
 
@@ -5808,7 +5907,8 @@ mod tests {
     }
 
     /// A peer announcing the tx back via `inv` is also accepted as a
-    /// (secondary) propagation witness.
+    /// (secondary) propagation witness. Witnesses are keyed by the peer's
+    /// IP, so the peer must be resolvable in the peers map.
     #[test]
     fn inv_echo_also_confirms_propagation() {
         use bitcoin::hashes::Hash;
@@ -5818,9 +5918,50 @@ mod tests {
             bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([7u8; 32]));
         pm.mempool.insert_unbroadcast_for_test(txid, 0);
 
+        let addr: SocketAddr = "10.0.0.2:8333".parse().unwrap();
+        let (h2, _rx2) = mk_handle_rx(2, addr, PeerState::Connected, 0);
+        pm.peers.write().insert(2, h2);
+
         // An inbound inv for a tx we already hold, from a peer, counts as a witness.
         pm.handle_inv(2, vec![Inventory::WitnessTransaction(txid)]);
         assert!(!pm.mempool.is_unbroadcast(&txid), "inv echo at threshold 1 clears the set");
+    }
+
+    /// Reconnecting from the same host must not stack witnesses: a fresh
+    /// peer id with the same IP is still one witness, so a single host
+    /// cannot satisfy `broadcastconfirmpeers > 1` by cycling connections.
+    #[test]
+    fn same_ip_reconnect_is_one_witness() {
+        use bitcoin::hashes::Hash;
+        let (pm, _dir) = mk_test_pm();
+        pm.set_rebroadcast_config(0, 2); // require two distinct witnesses
+        let txid =
+            bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([8u8; 32]));
+        pm.mempool.insert_unbroadcast_for_test(txid, 0);
+
+        let addr: SocketAddr = "10.0.0.3:8333".parse().unwrap();
+        let (h5, _rx5) = mk_handle_rx(5, addr, PeerState::Connected, 0);
+        let (h6, _rx6) = mk_handle_rx(6, addr, PeerState::Connected, 0); // same IP, new id
+        {
+            let mut peers = pm.peers.write();
+            peers.insert(5, h5);
+            peers.insert(6, h6);
+        }
+        pm.handle_inv(5, vec![Inventory::WitnessTransaction(txid)]);
+        pm.handle_inv(6, vec![Inventory::WitnessTransaction(txid)]);
+        assert!(
+            pm.mempool.is_unbroadcast(&txid),
+            "two connections from one IP are a single witness"
+        );
+
+        let addr2: SocketAddr = "10.0.0.4:8333".parse().unwrap();
+        let (h7, _rx7) = mk_handle_rx(7, addr2, PeerState::Connected, 0);
+        pm.peers.write().insert(7, h7);
+        pm.handle_inv(7, vec![Inventory::WitnessTransaction(txid)]);
+        assert!(
+            !pm.mempool.is_unbroadcast(&txid),
+            "a second distinct IP crosses the threshold"
+        );
     }
 
     /// On new-peer-connect we re-announce pending local txs to that peer, so a
@@ -5853,5 +5994,38 @@ mod tests {
 
         pm.announce_unbroadcast_to_peer(2);
         assert!(rx2.try_recv().is_err(), "a not-yet-Connected peer must be skipped");
+    }
+
+    /// The on-connect re-announce is outbound-only: an unsolicited inv of
+    /// exactly our pending local txs to a peer that connected *to us* would
+    /// let a sybil enumerate our wallet's txs just by connecting. Inbound
+    /// peers still hear about the tx on the periodic rebroadcast timer.
+    #[test]
+    fn announce_unbroadcast_skips_inbound_peers() {
+        use bitcoin::hashes::Hash;
+        let (pm, _dir) = mk_test_pm();
+        let txid =
+            bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([5u8; 32]));
+        pm.mempool.insert_unbroadcast_for_test(txid, 0);
+
+        let addr: SocketAddr = "10.0.0.9:8333".parse().unwrap();
+        let mut info = PeerInfo::new(9, addr, Direction::Inbound);
+        info.state = PeerState::Connected;
+        let (tx, mut rx) = mpsc::channel::<NetworkMessage>(8);
+        pm.peers.write().insert(
+            9,
+            PeerHandle {
+                info,
+                msg_tx: tx,
+                last_getheaders_sent: None,
+                stats: PeerStats::new(NetTotals::new()),
+            },
+        );
+
+        pm.announce_unbroadcast_to_peer(9);
+        assert!(
+            rx.try_recv().is_err(),
+            "inbound peers must not receive the on-connect unbroadcast dump"
+        );
     }
 }

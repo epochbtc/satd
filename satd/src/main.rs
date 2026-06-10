@@ -1395,17 +1395,21 @@ async fn main() {
     // the on-disk completeness marker is true.
     peer_manager.set_filter_index(filter_index.clone(), config.peerblockfilters);
 
-    // Durable local-tx broadcast: rebroadcast cadence + the distinct-peer
-    // echo count that confirms propagation. Read by the rebroadcast task
-    // below and by the inbound-INV echo path in the peer manager.
+    // Durable local-tx broadcast: rebroadcast cadence + the distinct-witness
+    // count that confirms propagation. Read by the rebroadcast task below
+    // and by the getdata/inv witness paths in the peer manager.
     peer_manager.set_rebroadcast_config(config.rebroadcastinterval, config.broadcastconfirmpeers);
 
     // Periodic rebroadcast of unconfirmed local txs. A tx submitted via any
     // broadcast surface is announced once on submit; if we had no
     // fee-permitting peers then (or the peer we reached died before
-    // relaying), this task re-announces it until enough peers echo it back
+    // relaying), this task re-announces it until enough peers fetch/echo it
     // or it leaves the mempool. The interval is randomized per pass (Core's
-    // 10-15 min) unless an operator pins `-rebroadcastinterval`.
+    // 10-15 min) unless an operator pins `-rebroadcastinterval`. Each pass
+    // is panic-contained: this detached task is the only thing driving
+    // rebroadcast for the life of the process, so one bad pass must not
+    // silently disable the feature (the node would otherwise keep running
+    // with `unbroadcastcount` claiming retries that never happen).
     {
         let pm = peer_manager.clone();
         let mut task_shutdown = shutdown_rx.clone();
@@ -1414,7 +1418,14 @@ async fn main() {
                 let delay = std::time::Duration::from_secs(pm.next_rebroadcast_delay_secs());
                 tokio::select! {
                     _ = task_shutdown.changed() => break,
-                    _ = tokio::time::sleep(delay) => pm.rebroadcast_unbroadcast_txs(),
+                    _ = tokio::time::sleep(delay) => {
+                        let pass = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            pm.rebroadcast_unbroadcast_txs()
+                        }));
+                        if pass.is_err() {
+                            tracing::error!("rebroadcast pass panicked; continuing on next interval");
+                        }
+                    }
                 }
             }
         });

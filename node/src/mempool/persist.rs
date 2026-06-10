@@ -13,14 +13,20 @@
 //!
 //! ```text
 //! magic     [4]   b"SMPL"
-//! version   u32   little-endian (currently 1)
+//! version   u32   little-endian (currently 2; v1 files still load)
 //! count     u64   little-endian number of entries
 //! entries:
 //!   time      u64   little-endian admission time (unix secs)
 //!   fee_delta i64   little-endian prioritisetransaction delta
+//!   flags     u8    (v2+) bit 0: tx was in the unbroadcast set
 //!   tx_len    u32   little-endian length of the encoded tx
 //!   tx_bytes  [tx_len]  consensus-encoded transaction
 //! ```
+//!
+//! v2 added the `flags` byte so the unbroadcast set survives a restart —
+//! Bitcoin Core persists `m_unbroadcast_txids` in its mempool.dat for the
+//! same reason: a tx submitted just before shutdown that never reached a
+//! peer must resume rebroadcasting after the restart, not strand.
 
 use std::path::Path;
 
@@ -29,7 +35,9 @@ use crate::mempool::pool::Mempool;
 use crate::validation::script::ScriptVerifier;
 
 const MAGIC: &[u8; 4] = b"SMPL";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
+/// Record flag bit: the tx was pending propagation confirmation.
+const FLAG_UNBROADCAST: u8 = 1 << 0;
 const FILE_NAME: &str = "mempool.dat";
 
 /// Outcome of a [`load_mempool`] call, for logging.
@@ -49,14 +57,18 @@ pub struct LoadStats {
 /// transactions written.
 pub fn dump_mempool(mempool: &Mempool, net_datadir: &Path) -> std::io::Result<usize> {
     let entries = mempool.get_all_entries();
+    let unbroadcast: std::collections::HashSet<bitcoin::Txid> =
+        mempool.unbroadcast_txids().into_iter().collect();
 
     let mut buf = Vec::new();
     buf.extend_from_slice(MAGIC);
     buf.extend_from_slice(&VERSION.to_le_bytes());
     buf.extend_from_slice(&(entries.len() as u64).to_le_bytes());
-    for (_txid, e) in &entries {
+    for (txid, e) in &entries {
         buf.extend_from_slice(&e.time.to_le_bytes());
         buf.extend_from_slice(&e.fee_delta.to_le_bytes());
+        let flags = if unbroadcast.contains(txid) { FLAG_UNBROADCAST } else { 0 };
+        buf.push(flags);
         let tx_bytes = bitcoin::consensus::serialize(&e.tx);
         buf.extend_from_slice(&(tx_bytes.len() as u32).to_le_bytes());
         buf.extend_from_slice(&tx_bytes);
@@ -153,10 +165,16 @@ pub fn load_mempool(
     let mut stats = LoadStats::default();
     for rec in records {
         let fee_delta = rec.fee_delta;
+        let unbroadcast = rec.flags & FLAG_UNBROADCAST != 0;
         match mempool.accept_transaction(rec.tx, chain_state, script_verifier) {
             Ok(txid) => {
                 if fee_delta != 0 && !mempool.prioritise_transaction(&txid, fee_delta) {
                     tracing::debug!(%txid, "persisted fee_delta not applied (tx absent post-accept)");
+                }
+                if unbroadcast {
+                    // Resume durable rebroadcast across the restart — the tx
+                    // had not yet been confirmed propagated when we shut down.
+                    mempool.mark_unbroadcast(txid);
                 }
                 stats.accepted += 1;
             }
@@ -169,6 +187,7 @@ pub fn load_mempool(
 struct Record {
     time: u64,
     fee_delta: i64,
+    flags: u8,
     tx: bitcoin::Transaction,
 }
 
@@ -193,15 +212,18 @@ fn parse(data: &[u8]) -> Result<ParsedDump, String> {
         Some(_) => return Err("bad magic (not a satd mempool.dat)".to_string()),
         None => return Err("truncated header (no magic)".to_string()),
     }
-    match cur.take(4).and_then(|b| b.try_into().ok()) {
+    // v1 records lack the flags byte; anything newer than us is rejected
+    // (we can't know how its records are framed).
+    let version = match cur.take(4).and_then(|b| b.try_into().ok()) {
         Some(b) => {
             let v = u32::from_le_bytes(b);
-            if v != VERSION {
-                return Err(format!("unsupported version {v} (expected {VERSION})"));
+            if v == 0 || v > VERSION {
+                return Err(format!("unsupported version {v} (expected 1..={VERSION})"));
             }
+            v
         }
         None => return Err("truncated header (no version)".to_string()),
-    }
+    };
     let count = match cur.take(8).and_then(|b| b.try_into().ok()) {
         Some(b) => u64::from_le_bytes(b),
         None => return Err("truncated header (no count)".to_string()),
@@ -224,6 +246,17 @@ fn parse(data: &[u8]) -> Result<ParsedDump, String> {
                 break;
             }
         };
+        let flags = if version >= 2 {
+            match cur.take(1) {
+                Some(b) => b[0],
+                None => {
+                    truncation = Some(format!("truncated at record {i} (flags field)"));
+                    break;
+                }
+            }
+        } else {
+            0
+        };
         let tx_len = match cur.take(4).and_then(|b| b.try_into().ok()) {
             Some(b) => u32::from_le_bytes(b) as usize,
             None => {
@@ -242,6 +275,7 @@ fn parse(data: &[u8]) -> Result<ParsedDump, String> {
             Ok(tx) => records.push(Record {
                 time,
                 fee_delta,
+                flags,
                 tx,
             }),
             Err(_) => {
@@ -341,11 +375,30 @@ mod tests {
         }
     }
 
-    /// Frame records exactly as `dump_mempool` does, for load-side tests.
+    /// Frame records exactly as `dump_mempool` does (current version), for
+    /// load-side tests.
     fn frame(records: &[(u64, i64, bitcoin::Transaction)]) -> Vec<u8> {
         let mut buf = Vec::new();
         buf.extend_from_slice(MAGIC);
         buf.extend_from_slice(&VERSION.to_le_bytes());
+        buf.extend_from_slice(&(records.len() as u64).to_le_bytes());
+        for (time, fee_delta, tx) in records {
+            buf.extend_from_slice(&time.to_le_bytes());
+            buf.extend_from_slice(&fee_delta.to_le_bytes());
+            buf.push(0u8); // flags
+            let tx_bytes = bitcoin::consensus::serialize(tx);
+            buf.extend_from_slice(&(tx_bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&tx_bytes);
+        }
+        buf
+    }
+
+    /// Frame records in the legacy v1 layout (no flags byte), to prove a
+    /// pre-upgrade mempool.dat still loads.
+    fn frame_v1(records: &[(u64, i64, bitcoin::Transaction)]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(MAGIC);
+        buf.extend_from_slice(&1u32.to_le_bytes());
         buf.extend_from_slice(&(records.len() as u64).to_le_bytes());
         for (time, fee_delta, tx) in records {
             buf.extend_from_slice(&time.to_le_bytes());
@@ -397,6 +450,37 @@ mod tests {
         assert_eq!(stats.accepted, 0);
         assert_eq!(stats.skipped, 2);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v1_file_still_parses() {
+        // A legacy (pre-flags) dump parses fully — same two records, no
+        // flags byte — and flows through re-validation like any other.
+        let buf = frame_v1(&[(100, 0, dummy_tx(1)), (200, 500, dummy_tx(2))]);
+        let parsed = parse(&buf).unwrap();
+        assert!(parsed.truncation.is_none(), "v1 body must parse cleanly");
+        assert_eq!(parsed.records.len(), 2);
+        assert!(parsed.records.iter().all(|r| r.flags == 0));
+    }
+
+    #[test]
+    fn unbroadcast_flag_round_trips() {
+        // The flags byte survives dump framing → parse.
+        let mut buf = frame(&[(100, 0, dummy_tx(1)), (200, 0, dummy_tx(2))]);
+        // Flip the first record's flags byte to FLAG_UNBROADCAST: the flags
+        // byte sits after magic(4)+version(4)+count(8)+time(8)+fee_delta(8).
+        buf[32] = FLAG_UNBROADCAST;
+        let parsed = parse(&buf).unwrap();
+        assert!(parsed.truncation.is_none());
+        assert_eq!(parsed.records[0].flags, FLAG_UNBROADCAST);
+        assert_eq!(parsed.records[1].flags, 0);
+    }
+
+    #[test]
+    fn future_version_is_rejected() {
+        let mut buf = frame(&[]);
+        buf[4..8].copy_from_slice(&(VERSION + 1).to_le_bytes());
+        assert!(parse(&buf).is_err(), "unknown future format must not be guessed at");
     }
 
     #[test]
