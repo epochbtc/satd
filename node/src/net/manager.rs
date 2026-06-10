@@ -71,6 +71,14 @@ const DEFAULT_MAX_INBOUND_PER_IP: usize = 3;
 /// Default handshake timeout in milliseconds, matching Bitcoin Core's
 /// `-timeout` default (5000ms).
 const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 5000;
+/// Default distinct-peer echo count before a local tx is considered
+/// propagated and rebroadcast stops. 1 = "any peer announced it back."
+const DEFAULT_BROADCAST_CONFIRM_PEERS: u64 = 1;
+/// Bounds for the "auto" (interval = 0) rebroadcast cadence — Bitcoin Core's
+/// 10–15 minute randomized window. Randomizing avoids a fleet re-announcing
+/// in lockstep.
+const REBROADCAST_AUTO_MIN_SECS: u64 = 600;
+const REBROADCAST_AUTO_MAX_SECS: u64 = 900;
 /// Minimum timeout for a SOCKS5 `.onion` dial, in milliseconds. A `.onion`
 /// connect tunnels the proxy socket connect, the SOCKS5 handshake, and the
 /// Tor rendezvous (HS descriptor fetch + intro/rendezvous circuit build) — the
@@ -258,6 +266,15 @@ pub struct PeerManager {
     /// config after construction (see [`set_connect_timeout_ms`]) without
     /// widening the already-large `with_config` argument list.
     connect_timeout_ms: AtomicU64,
+    /// Rebroadcast cadence for unbroadcast local txs, in seconds. `0` means
+    /// "auto" — the spawner randomizes each interval in
+    /// `[REBROADCAST_AUTO_MIN_SECS, REBROADCAST_AUTO_MAX_SECS]` (Core's
+    /// 10–15 min). Set from config after construction (see
+    /// [`set_rebroadcast_config`]). SIGHUP-reloadable.
+    rebroadcast_interval_secs: AtomicU64,
+    /// Distinct peers that must announce a local tx back to us before we
+    /// consider it propagated and stop rebroadcasting. Clamped to ≥1 at use.
+    broadcast_confirm_peers: AtomicU64,
     /// IBD scheduler for parallel block download (shared with connect thread).
     ibd: Arc<parking_lot::RwLock<Option<IbdScheduler>>>,
     /// Signal to wake the connect thread when a block is stored.
@@ -447,6 +464,8 @@ impl PeerManager {
             pending_onion_dials: RwLock::new(HashSet::new()),
             ban_duration_secs: AtomicU64::new(ban_duration_secs),
             connect_timeout_ms: AtomicU64::new(DEFAULT_CONNECT_TIMEOUT_MS),
+            rebroadcast_interval_secs: AtomicU64::new(0),
+            broadcast_confirm_peers: AtomicU64::new(DEFAULT_BROADCAST_CONFIRM_PEERS),
             ibd: ibd.clone(),
             connect_signal: connect_signal.clone(),
             bg_downloader: RwLock::new(BgDownloader::new(
@@ -1948,6 +1967,14 @@ impl PeerManager {
         if has_ibd {
             self.assign_peer_work(id);
         }
+
+        // Re-announce any pending local broadcasts to the freshly-connected
+        // peer, so a tx submitted while we had no (fee-permitting) peers
+        // reaches the network as soon as one arrives. Suppressed during IBD,
+        // which doesn't relay txs.
+        if !self.is_ibd() {
+            self.announce_unbroadcast_to_peer(id);
+        }
     }
 
     fn handle_peer_disconnected(&self, id: PeerId) {
@@ -2252,9 +2279,14 @@ impl PeerManager {
                     }
                 }
                 Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
-                    // Don't request transactions during IBD — we can't
-                    // validate them — nor under -blocksonly (no tx relay).
-                    if !self.is_ibd() && !self.blocksonly() && self.mempool.get(&txid).is_none() {
+                    if self.mempool.get(&txid).is_some() {
+                        // We already have it. If it's one of our pending local
+                        // broadcasts, a peer announcing it back is evidence it
+                        // propagated — count the echo toward stopping rebroadcast.
+                        self.note_broadcast_echo(id, txid);
+                    } else if !self.is_ibd() && !self.blocksonly() {
+                        // Don't request transactions during IBD — we can't
+                        // validate them — nor under -blocksonly (no tx relay).
                         txs_to_get.push(txid);
                     }
                 }
@@ -3895,8 +3927,85 @@ impl PeerManager {
             Err(MempoolError::AlreadyExists) => resubmit_txid,
             Err(e) => return Err(e),
         };
+        // Mark on the resubmit path too — Core's BroadcastTransaction
+        // re-adds an already-resident tx to m_unbroadcast, so an operator
+        // resubmitting a stuck tx re-arms durable rebroadcast for it.
+        self.mempool.mark_unbroadcast(txid);
         self.announce_tx(txid);
         Ok(txid)
+    }
+
+    /// Set the rebroadcast cadence (`interval_secs`, `0` = auto/randomized)
+    /// and the distinct-peer echo count required to confirm propagation.
+    /// Called from the satd binary after construction (and on SIGHUP reload)
+    /// to avoid widening `with_config`.
+    pub fn set_rebroadcast_config(&self, interval_secs: u64, confirm_peers: u64) {
+        self.rebroadcast_interval_secs
+            .store(interval_secs, Ordering::Relaxed);
+        self.broadcast_confirm_peers
+            .store(confirm_peers.max(1), Ordering::Relaxed);
+    }
+
+    /// Seconds to wait before the next rebroadcast pass. When configured to
+    /// `0` (auto), returns a fresh random value in the Core-style 10–15 min
+    /// window each call so a fleet doesn't re-announce in lockstep.
+    pub fn next_rebroadcast_delay_secs(&self) -> u64 {
+        use rand::Rng as _;
+        match self.rebroadcast_interval_secs.load(Ordering::Relaxed) {
+            0 => rand::thread_rng().gen_range(REBROADCAST_AUTO_MIN_SECS..=REBROADCAST_AUTO_MAX_SECS),
+            n => n,
+        }
+    }
+
+    /// Re-announce every still-resident unbroadcast local tx to all
+    /// fee-permitting peers. Run periodically by the rebroadcast task; the
+    /// `unbroadcast_txids` call also prunes txids that have since left the
+    /// mempool. A tx stops being rebroadcast once enough peers echo it back
+    /// (see [`note_broadcast_echo`](Self::note_broadcast_echo)) or it is
+    /// mined/evicted.
+    pub fn rebroadcast_unbroadcast_txs(&self) {
+        let txids = self.mempool.unbroadcast_txids();
+        if txids.is_empty() {
+            return;
+        }
+        tracing::debug!(count = txids.len(), "rebroadcasting unbroadcast local txs");
+        for txid in txids {
+            self.announce_tx(txid);
+        }
+    }
+
+    /// Announce the current unbroadcast local txs to a single peer (used on
+    /// new-peer-connect so a tx submitted while we had no peers reaches the
+    /// network as soon as one arrives). Honors the peer's fee filter and
+    /// Connected state.
+    fn announce_unbroadcast_to_peer(&self, id: PeerId) {
+        let txids = self.mempool.unbroadcast_txids();
+        if txids.is_empty() {
+            return;
+        }
+        let peers = self.peers.read();
+        let Some(handle) = peers.get(&id) else { return };
+        if handle.info.state != PeerState::Connected {
+            return;
+        }
+        for txid in txids {
+            let fee_rate = self.mempool.get(&txid).map(|e| e.fee_rate).unwrap_or(0);
+            if fee_rate >= handle.info.fee_filter {
+                let inv = NetworkMessage::Inv(vec![Inventory::WitnessTransaction(txid)]);
+                let _ = handle.msg_tx.try_send(inv);
+            }
+        }
+    }
+
+    /// Record that peer `id` announced `txid` back to us. If `txid` is a
+    /// pending local broadcast, this is propagation evidence; once enough
+    /// distinct peers have echoed it the tx is dropped from the unbroadcast
+    /// set and rebroadcast stops.
+    fn note_broadcast_echo(&self, id: PeerId, txid: bitcoin::Txid) {
+        let threshold = self.broadcast_confirm_peers.load(Ordering::Relaxed) as usize;
+        if self.mempool.record_broadcast_witness(&txid, id, threshold) {
+            tracing::debug!(%txid, "local tx confirmed propagated; rebroadcast stopped");
+        }
     }
 
     /// BFS-drain orphans that listed `parent` as a missing parent. Newly
@@ -5560,37 +5669,12 @@ mod tests {
     /// the mempool from a peer rather than a local submit.
     #[test]
     fn submit_and_announce_resubmit_of_mempool_tx_succeeds_and_announces() {
-        use crate::chain::state::AssumeValid;
-        use crate::storage::db::InMemoryStore;
-        use crate::storage::flatfile::FlatFileManager;
-        use crate::validation::script::NoopVerifier;
         use bitcoin::absolute::LockTime;
         use bitcoin::hashes::Hash;
         use bitcoin::transaction;
         use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, TxIn, TxOut, Witness};
 
-        let dir = tempfile::TempDir::new().unwrap();
-        let store = Box::new(InMemoryStore::new());
-        let flat_files = FlatFileManager::new(&dir.path().join("blocks")).unwrap();
-        let chain_state = Arc::new(
-            ChainState::new(
-                store,
-                flat_files,
-                Network::Regtest,
-                Box::new(NoopVerifier),
-                AssumeValid::Disabled,
-                450,
-                4,
-                Default::default(),
-                Default::default(),
-            )
-            .unwrap(),
-        );
-        let mempool = Arc::new(Mempool::new(1_000_000, 0));
-        let fee_estimator = Arc::new(FeeEstimator::new());
-        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let pm =
-            PeerManager::new(chain_state, mempool, fee_estimator, Network::Regtest, shutdown_rx);
+        let (pm, _dir) = mk_test_pm();
 
         let addr: SocketAddr = "10.0.0.1:8333".parse().unwrap();
         let (h1, mut rx1) = mk_handle_rx(1, addr, PeerState::Connected, 0);
@@ -5635,5 +5719,98 @@ mod tests {
             }
             other => panic!("resubmit must re-announce the tx, got {other:?}"),
         }
+    }
+
+    /// Minimal regtest `PeerManager` for the rebroadcast / echo tests.
+    fn mk_test_pm() -> (Arc<PeerManager>, tempfile::TempDir) {
+        use crate::chain::state::AssumeValid;
+        use crate::storage::db::InMemoryStore;
+        use crate::storage::flatfile::FlatFileManager;
+        use crate::validation::script::NoopVerifier;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Box::new(InMemoryStore::new());
+        let flat_files = FlatFileManager::new(&dir.path().join("blocks")).unwrap();
+        let chain_state = Arc::new(
+            ChainState::new(
+                store,
+                flat_files,
+                Network::Regtest,
+                Box::new(NoopVerifier),
+                AssumeValid::Disabled,
+                450,
+                4,
+                Default::default(),
+                Default::default(),
+            )
+            .unwrap(),
+        );
+        let mempool = Arc::new(Mempool::new(1_000_000, 0));
+        let fee_estimator = Arc::new(FeeEstimator::new());
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let pm = PeerManager::new(chain_state, mempool, fee_estimator, Network::Regtest, shutdown_rx);
+        (pm, dir)
+    }
+
+    /// The periodic rebroadcast pass re-announces every unbroadcast local tx
+    /// to fee-permitting peers, and an echo from a peer clears it from the set.
+    #[test]
+    fn rebroadcast_reannounces_then_echo_clears() {
+        use bitcoin::hashes::Hash;
+        let (pm, _dir) = mk_test_pm();
+        pm.set_rebroadcast_config(0, 1); // auto interval, 1-peer confirm
+
+        let addr: SocketAddr = "10.0.0.1:8333".parse().unwrap();
+        let (h1, mut rx1) = mk_handle_rx(1, addr, PeerState::Connected, 0);
+        pm.peers.write().insert(1, h1);
+
+        let txid =
+            bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([3u8; 32]));
+        pm.mempool.insert_unbroadcast_for_test(txid, 0);
+
+        pm.rebroadcast_unbroadcast_txs();
+        match rx1.try_recv() {
+            Ok(NetworkMessage::Inv(inv)) => {
+                assert_eq!(inv, vec![Inventory::WitnessTransaction(txid)]);
+            }
+            other => panic!("rebroadcast should re-announce the unbroadcast tx, got {other:?}"),
+        }
+        assert!(pm.mempool.is_unbroadcast(&txid));
+
+        // A peer announcing it back (echo) confirms propagation → stop.
+        pm.note_broadcast_echo(2, txid);
+        assert!(!pm.mempool.is_unbroadcast(&txid), "echo at threshold 1 clears the set");
+    }
+
+    /// On new-peer-connect we re-announce pending local txs to that peer, so a
+    /// tx submitted while we had no peers reaches the network on connect. A
+    /// peer still mid-handshake (not Connected) is skipped.
+    #[test]
+    fn announce_unbroadcast_to_new_peer_respects_state() {
+        use bitcoin::hashes::Hash;
+        let (pm, _dir) = mk_test_pm();
+        let txid =
+            bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([4u8; 32]));
+        pm.mempool.insert_unbroadcast_for_test(txid, 0);
+
+        let addr: SocketAddr = "10.0.0.1:8333".parse().unwrap();
+        let (h1, mut rx1) = mk_handle_rx(1, addr, PeerState::Connected, 0);
+        let (h2, mut rx2) = mk_handle_rx(2, addr, PeerState::Connecting, 0);
+        {
+            let mut peers = pm.peers.write();
+            peers.insert(1, h1);
+            peers.insert(2, h2);
+        }
+
+        pm.announce_unbroadcast_to_peer(1);
+        match rx1.try_recv() {
+            Ok(NetworkMessage::Inv(inv)) => {
+                assert_eq!(inv, vec![Inventory::WitnessTransaction(txid)]);
+            }
+            other => panic!("connected peer should receive the unbroadcast inv, got {other:?}"),
+        }
+
+        pm.announce_unbroadcast_to_peer(2);
+        assert!(rx2.try_recv().is_err(), "a not-yet-Connected peer must be skipped");
     }
 }

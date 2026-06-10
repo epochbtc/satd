@@ -1395,6 +1395,31 @@ async fn main() {
     // the on-disk completeness marker is true.
     peer_manager.set_filter_index(filter_index.clone(), config.peerblockfilters);
 
+    // Durable local-tx broadcast: rebroadcast cadence + the distinct-peer
+    // echo count that confirms propagation. Read by the rebroadcast task
+    // below and by the inbound-INV echo path in the peer manager.
+    peer_manager.set_rebroadcast_config(config.rebroadcastinterval, config.broadcastconfirmpeers);
+
+    // Periodic rebroadcast of unconfirmed local txs. A tx submitted via any
+    // broadcast surface is announced once on submit; if we had no
+    // fee-permitting peers then (or the peer we reached died before
+    // relaying), this task re-announces it until enough peers echo it back
+    // or it leaves the mempool. The interval is randomized per pass (Core's
+    // 10-15 min) unless an operator pins `-rebroadcastinterval`.
+    {
+        let pm = peer_manager.clone();
+        let mut task_shutdown = shutdown_rx.clone();
+        tokio::spawn(async move {
+            loop {
+                let delay = std::time::Duration::from_secs(pm.next_rebroadcast_delay_secs());
+                tokio::select! {
+                    _ = task_shutdown.changed() => break,
+                    _ = tokio::time::sleep(delay) => pm.rebroadcast_unbroadcast_txs(),
+                }
+            }
+        });
+    }
+
     // P2P block announcement task. Each `BlockConnected` event triggers
     // an announcement of the new tip to connected peers; `announce_block`
     // itself suppresses announcements while bulk-syncing. Lagged events

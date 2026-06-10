@@ -540,6 +540,8 @@ fn field_specs() -> Vec<FieldSpec> {
         live!("timeout", timeout, |c, h| {
             h.peer_manager.set_connect_timeout_ms(c.timeout)
         }),
+        restart!("rebroadcastinterval", rebroadcastinterval),
+        restart!("broadcastconfirmpeers", broadcastconfirmpeers),
         restart!("onlynet", onlynet),
         restart!("signetseednode", signet_seed_nodes),
         restart!("signetchallenge", signet_challenge),

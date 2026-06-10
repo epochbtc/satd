@@ -89,12 +89,24 @@ pub struct MempoolInfo {
     pub max_size: usize,
     pub min_fee_rate: u64,
     pub full_rbf: bool,
+    /// Count of locally-originated txs not yet confirmed propagated.
+    pub unbroadcast: usize,
 }
 
 struct MempoolInner {
     entries: HashMap<Txid, MempoolEntry>,
     spends: HashMap<OutPoint, Txid>,
     total_bytes: usize,
+    /// Locally-originated txs (submitted here via a broadcast surface) that
+    /// have not yet been confirmed to have propagated. Maps each txid to the
+    /// set of peer ids that have since announced it *back* to us — evidence
+    /// it reached the network. The peer manager rebroadcasts these on a timer
+    /// and on new-peer-connect; an entry is dropped once enough distinct
+    /// peers have echoed it (see [`Mempool::record_broadcast_witness`]) or
+    /// the tx leaves the mempool (mined/evicted/replaced/expired). Always a
+    /// subset of `entries`. This is satd's analogue of Core's
+    /// `m_unbroadcast_txids`, surfaced as `getmempoolinfo.unbroadcastcount`.
+    unbroadcast: HashMap<Txid, HashSet<u64>>,
 }
 
 /// Configurable mempool policy. All fields map to Bitcoin Core-compatible
@@ -174,6 +186,7 @@ impl Mempool {
                 entries: HashMap::new(),
                 spends: HashMap::new(),
                 total_bytes: 0,
+                unbroadcast: HashMap::new(),
             }),
             config: RwLock::new(config),
             event_tx: Mutex::new(None),
@@ -838,6 +851,7 @@ impl Mempool {
         let entry_weight = entry.weight;
         let entry_time = entry.time;
         let entry_tx_inputs: Vec<_> = entry.tx.input.clone();
+        let is_unbroadcast = inner.unbroadcast.contains_key(txid);
         drop(inner);
 
         let ancestors = self.get_ancestors(txid).unwrap_or_default();
@@ -899,7 +913,7 @@ impl Mempool {
             "depends": ancestors.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
             "spentby": children.iter().map(|c| c.to_string()).collect::<Vec<_>>(),
             "bip125-replaceable": bip125_replaceable,
-            "unbroadcast": false,
+            "unbroadcast": is_unbroadcast,
         }))
     }
 
@@ -1043,6 +1057,62 @@ impl Mempool {
     }
 
     /// Get mempool statistics.
+    /// Mark a locally-originated tx as unbroadcast (pending propagation
+    /// confirmation). No-op if the tx isn't currently in the mempool.
+    pub fn mark_unbroadcast(&self, txid: Txid) {
+        let mut inner = self.inner.write();
+        if inner.entries.contains_key(&txid) {
+            inner.unbroadcast.entry(txid).or_default();
+        }
+    }
+
+    /// Record that `peer_id` announced `txid` back to us — evidence the tx
+    /// propagated into the network. Returns `true` once at least
+    /// `confirm_threshold` distinct peers have echoed it, at which point the
+    /// tx is dropped from the unbroadcast set (we stop rebroadcasting it).
+    /// `confirm_threshold` is clamped to a minimum of 1. Returns `false` for
+    /// a txid that isn't pending broadcast.
+    pub fn record_broadcast_witness(
+        &self,
+        txid: &Txid,
+        peer_id: u64,
+        confirm_threshold: usize,
+    ) -> bool {
+        let threshold = confirm_threshold.max(1);
+        let mut inner = self.inner.write();
+        if let Some(witnesses) = inner.unbroadcast.get_mut(txid) {
+            witnesses.insert(peer_id);
+            if witnesses.len() >= threshold {
+                inner.unbroadcast.remove(txid);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Live unbroadcast txids (those still resident in the mempool). Prunes
+    /// entries whose tx has since left the mempool (mined/evicted/replaced).
+    pub fn unbroadcast_txids(&self) -> Vec<Txid> {
+        let mut inner = self.inner.write();
+        let MempoolInner { entries, unbroadcast, .. } = &mut *inner;
+        unbroadcast.retain(|txid, _| entries.contains_key(txid));
+        unbroadcast.keys().copied().collect()
+    }
+
+    /// Count of live unbroadcast txs — Core's `getmempoolinfo.unbroadcastcount`.
+    pub fn unbroadcast_count(&self) -> usize {
+        let mut inner = self.inner.write();
+        let MempoolInner { entries, unbroadcast, .. } = &mut *inner;
+        unbroadcast.retain(|txid, _| entries.contains_key(txid));
+        unbroadcast.len()
+    }
+
+    /// Whether `txid` is a pending-broadcast local tx still in the mempool.
+    pub fn is_unbroadcast(&self, txid: &Txid) -> bool {
+        let inner = self.inner.read();
+        inner.unbroadcast.contains_key(txid) && inner.entries.contains_key(txid)
+    }
+
     pub fn info(&self) -> MempoolInfo {
         // Snapshot policy first (lock released) so the policy lock is never held
         // while `inner` is — uniform leaf-lock discipline (see `remove_expired`).
@@ -1051,12 +1121,20 @@ impl Mempool {
             (cfg.max_size_bytes, cfg.min_fee_rate, cfg.full_rbf)
         };
         let inner = self.inner.read();
+        // Count only unbroadcast entries still resident (read-only; the
+        // periodic `unbroadcast_txids` pass does the actual pruning).
+        let unbroadcast = inner
+            .unbroadcast
+            .keys()
+            .filter(|txid| inner.entries.contains_key(*txid))
+            .count();
         MempoolInfo {
             size: inner.entries.len(),
             bytes: inner.total_bytes,
             max_size,
             min_fee_rate,
             full_rbf,
+            unbroadcast,
         }
     }
 
@@ -1078,6 +1156,36 @@ impl Mempool {
                 prev_scripthashes: Vec::new(),
             },
         );
+    }
+}
+
+#[cfg(test)]
+impl Mempool {
+    /// Test-only: insert a minimal entry for `txid` (with `fee_rate`) and mark
+    /// it unbroadcast. Lets cross-module tests (the peer manager) exercise the
+    /// rebroadcast path without standing up a funded UTXO set.
+    pub(crate) fn insert_unbroadcast_for_test(&self, txid: Txid, fee_rate: u64) {
+        let tx = Transaction {
+            version: bitcoin::transaction::Version(2),
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: Vec::new(),
+            output: Vec::new(),
+        };
+        let mut inner = self.inner.write();
+        inner.entries.insert(
+            txid,
+            MempoolEntry {
+                tx,
+                fee: 0,
+                weight: 4,
+                fee_rate,
+                time: 0,
+                fee_delta: 0,
+                sigop_cost: 0,
+                prev_scripthashes: Vec::new(),
+            },
+        );
+        inner.unbroadcast.entry(txid).or_default();
     }
 }
 
@@ -1944,5 +2052,56 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn dummy_txid(byte: u8) -> Txid {
+        use bitcoin::hashes::Hash;
+        Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([byte; 32]))
+    }
+
+    #[test]
+    fn unbroadcast_mark_witness_threshold_and_count() {
+        let mp = Mempool::new(1_000_000, 0);
+        let txid = dummy_txid(1);
+
+        // Marking a tx not in the mempool is a no-op.
+        mp.mark_unbroadcast(txid);
+        assert!(!mp.is_unbroadcast(&txid));
+        assert_eq!(mp.unbroadcast_count(), 0);
+
+        mp.insert_unbroadcast_for_test(txid, 0);
+        assert!(mp.is_unbroadcast(&txid));
+        assert_eq!(mp.unbroadcast_count(), 1);
+        assert_eq!(mp.unbroadcast_txids(), vec![txid]);
+
+        // Threshold 2: the same peer twice is one distinct witness.
+        assert!(!mp.record_broadcast_witness(&txid, 7, 2));
+        assert!(!mp.record_broadcast_witness(&txid, 7, 2));
+        assert!(mp.is_unbroadcast(&txid), "one distinct witness < threshold 2");
+
+        // A second distinct peer crosses the threshold → dropped.
+        assert!(mp.record_broadcast_witness(&txid, 8, 2));
+        assert!(!mp.is_unbroadcast(&txid));
+        assert_eq!(mp.unbroadcast_count(), 0);
+
+        // Recording against an unknown/cleared txid is false, not a panic.
+        assert!(!mp.record_broadcast_witness(&txid, 9, 1));
+    }
+
+    #[test]
+    fn unbroadcast_pruned_when_tx_leaves_mempool() {
+        let mp = Mempool::new(1_000_000, 0);
+        let txid = dummy_txid(2);
+        mp.insert_unbroadcast_for_test(txid, 0);
+        assert_eq!(mp.unbroadcast_count(), 1);
+
+        // Simulate the tx being mined/evicted: it leaves `entries`.
+        mp.inner.write().entries.remove(&txid);
+
+        // The unbroadcast view self-prunes against live entries.
+        assert_eq!(mp.unbroadcast_count(), 0);
+        assert!(mp.unbroadcast_txids().is_empty());
+        assert!(!mp.is_unbroadcast(&txid));
+        assert_eq!(mp.info().unbroadcast, 0);
     }
 }

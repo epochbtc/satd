@@ -778,6 +778,14 @@ pub struct Config {
     /// off. Default true.
     pub fixedseeds: bool,
     pub bantime: u64,
+    /// satd extension: seconds between rebroadcasts of unconfirmed local
+    /// transactions to peers (0 = auto: randomized 10-15 min, matching
+    /// Bitcoin Core). Default 0.
+    pub rebroadcastinterval: u64,
+    /// satd extension: number of distinct peers that must announce a
+    /// locally-broadcast transaction back to this node before it is
+    /// considered propagated and rebroadcast stops. Default 1.
+    pub broadcastconfirmpeers: u64,
     // Proxy / Tor
     pub proxy: Option<String>,
     /// Bitcoin Core's `-proxyrandomize`: use fresh random SOCKS5 credentials
@@ -2812,6 +2820,14 @@ impl Config {
                 .bantime
                 .or_else(|| file_get("bantime").and_then(|v| v.parse().ok()))
                 .unwrap_or(86400),
+            rebroadcastinterval: cli
+                .rebroadcastinterval
+                .or_else(|| file_get("rebroadcastinterval").and_then(|v| v.parse().ok()))
+                .unwrap_or(0),
+            broadcastconfirmpeers: cli
+                .broadcastconfirmpeers
+                .or_else(|| file_get("broadcastconfirmpeers").and_then(|v| v.parse().ok()))
+                .unwrap_or(1),
             proxy: cli.proxy.or_else(|| file_get("proxy")),
             proxyrandomize: cli
                 .proxyrandomize
@@ -4332,6 +4348,20 @@ pub struct CliArgs {
     )]
     pub bantime: Option<u64>,
 
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        help = "Seconds between rebroadcasts of unconfirmed local transactions to peers (0 = auto: randomized 10-15 min, matching Bitcoin Core). Default: 0."
+    )]
+    pub rebroadcastinterval: Option<u64>,
+
+    #[arg(
+        long,
+        value_name = "N",
+        help = "Number of distinct peers that must announce a locally-broadcast transaction back to this node before it is considered propagated and rebroadcast stops. Default: 1."
+    )]
+    pub broadcastconfirmpeers: Option<u64>,
+
     // Proxy / Tor flags
     #[arg(
         long,
@@ -5192,6 +5222,8 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "whitebind",
         "asmap",
         "bantime",
+        "rebroadcastinterval",
+        "broadcastconfirmpeers",
         "proxy",
         "proxyrandomize",
         "onion",
@@ -5648,6 +5680,8 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "forcednsseed",
     "fixedseeds",
     "bantime",
+    "rebroadcastinterval",
+    "broadcastconfirmpeers",
     "timeout",
     "onlynet",
     "signetseednode",
@@ -6772,6 +6806,8 @@ rpcport=8332
             forcednsseed: None,
             fixedseeds: None,
             bantime: None,
+            rebroadcastinterval: None,
+            broadcastconfirmpeers: None,
             blockmaxweight: None,
             blockmintxfee: None,
             pid: None,
@@ -7037,6 +7073,8 @@ rpcport=8332
             forcednsseed: None,
             fixedseeds: None,
             bantime: None,
+            rebroadcastinterval: None,
+            broadcastconfirmpeers: None,
             blockmaxweight: None,
             blockmintxfee: None,
             pid: None,
