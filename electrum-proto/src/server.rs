@@ -494,10 +494,7 @@ fn process_request(
         }
         Ok(Requests::Batch(reqs)) => {
             if reqs.len() > max_batch_requests {
-                let err = JsonRpcError::bad_request(format!(
-                    "batch too large: {} requests (cap = {max_batch_requests})",
-                    reqs.len()
-                ));
+                let err = JsonRpcError::batch_too_large(reqs.len(), max_batch_requests);
                 let resp = Response::error(Value::Null, err);
                 return serde_json::to_string(&resp).ok();
             }

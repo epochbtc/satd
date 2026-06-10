@@ -2366,22 +2366,25 @@ impl Config {
                 })
                 .collect()
         };
+        // Defaults are single-sourced from electrum_proto::config so the
+        // daemon-resolved values can never drift from the server's own
+        // ElectrumConfig::default().
         let electrum_max_conns = cli
             .electrummaxconns
             .or_else(|| file_get("electrummaxconns").and_then(|v| v.parse().ok()))
-            .unwrap_or(64);
+            .unwrap_or(electrum_proto::config::DEFAULT_MAX_CONNS);
         let electrum_max_subs_per_conn = cli
             .electrummaxsubsperconn
             .or_else(|| file_get("electrummaxsubsperconn").and_then(|v| v.parse().ok()))
-            .unwrap_or(100);
+            .unwrap_or(electrum_proto::config::DEFAULT_MAX_SUBS_PER_CONN);
         let electrum_request_timeout = cli
             .electrumrequesttimeout
             .or_else(|| file_get("electrumrequesttimeout").and_then(|v| v.parse().ok()))
-            .unwrap_or(30);
+            .unwrap_or(electrum_proto::config::DEFAULT_REQUEST_TIMEOUT_SECS);
         let electrum_max_batch_requests = cli
             .electrummaxbatchrequests
             .or_else(|| file_get("electrummaxbatchrequests").and_then(|v| v.parse().ok()))
-            .unwrap_or(16);
+            .unwrap_or(electrum_proto::config::DEFAULT_MAX_BATCH_REQUESTS);
         let electrum_max_broadcast_package_txs = cli
             .electrummaxbroadcastpackagetxs
             .or_else(|| file_get("electrummaxbroadcastpackagetxs").and_then(|v| v.parse().ok()))

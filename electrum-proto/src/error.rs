@@ -110,20 +110,43 @@ impl JsonRpcError {
     /// Handler-returned validation / not-found error (code `1`).
     /// Mirrors electrs's `RpcError::BadRequest(err)` — the message is
     /// whatever the handler stringified (kept on the wire so wallets
-    /// can surface it to users).
+    /// can surface it to users). Logged at debug so operators can trace
+    /// client-facing failures without the noise of routine not-founds
+    /// at the default log level.
     pub fn bad_request(message: impl Into<String>) -> Self {
+        let message = message.into();
+        tracing::debug!(target = "electrum::rpc", detail = %message, "bad request");
         Self::new(1, message)
+    }
+
+    /// A JSON-RPC batch exceeded the configured request cap (code `1`,
+    /// same wire shape as [`bad_request`]). Logged at warn because it is
+    /// operator-actionable: a wallet whose scan batches more subscribes
+    /// than `electrummaxbatchrequests` will fail to load, and the fix is
+    /// to raise the cap. Previously this rejection was invisible
+    /// server-side, making the failure undiagnosable.
+    pub fn batch_too_large(requests: usize, cap: usize) -> Self {
+        tracing::warn!(
+            target = "electrum::rpc",
+            requests,
+            cap,
+            "batch too large — rejecting (raise electrummaxbatchrequests if a wallet client needs it)"
+        );
+        Self::new(1, format!("batch too large: {requests} requests (cap = {cap})"))
     }
 
     /// History (or listunspent) result would exceed the per-request
     /// cap. Code `2` (DaemonError-style — semantic limit, dynamic
-    /// message).
+    /// message). Logged at warn (operator-actionable cap).
     pub fn history_too_large(limit: usize) -> Self {
+        tracing::warn!(target = "electrum::rpc", limit, "history too large — rejecting");
         Self::new(2, format!("history too large (cap = {limit} entries)"))
     }
 
-    /// Subscription cap reached for the connection or server.
+    /// Subscription cap reached for the connection or server. Logged at
+    /// warn (operator-actionable cap — raise `electrummaxsubsperconn`).
     pub fn subscription_cap(limit: usize) -> Self {
+        tracing::warn!(target = "electrum::rpc", limit, "subscription cap reached — rejecting subscribe");
         Self::new(3, format!("subscription cap reached ({limit})"))
     }
 
@@ -181,6 +204,23 @@ mod tests {
         let e = JsonRpcError::bad_request("tx not found: deadbeef");
         assert_eq!(e.code, 1);
         assert_eq!(e.message, "tx not found: deadbeef");
+    }
+
+    #[test]
+    fn batch_too_large_carries_counts_on_wire_as_bad_request() {
+        // Same wire shape as bad_request (code 1) so existing clients are
+        // unaffected; the message exposes the counts so a wallet/operator
+        // can see the cap that was hit. (Server-side it also logs at warn.)
+        let e = JsonRpcError::batch_too_large(25, 16);
+        assert_eq!(e.code, 1);
+        assert_eq!(e.message, "batch too large: 25 requests (cap = 16)");
+    }
+
+    #[test]
+    fn subscription_cap_reports_limit_on_wire() {
+        let e = JsonRpcError::subscription_cap(1000);
+        assert_eq!(e.code, 3);
+        assert_eq!(e.message, "subscription cap reached (1000)");
     }
 
     #[test]

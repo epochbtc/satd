@@ -38,9 +38,9 @@ confirmed-transaction and merkle-proof methods), both enforced at startup.
 | `--electrummtlsclientca=<path>` | none | PEM CA bundle to verify client certs when `--electrummtls=1`. |
 | `--electrummtlsclientallow=<subj>` | any CA-signed | Allowlist of accepted client-cert CN / DNS-SAN values. |
 | `--electrummaxconns=<n>` | `64` | Hard cap on simultaneously-open connections. |
-| `--electrummaxsubsperconn=<n>` | `100` | Per-connection scripthash subscription cap. |
+| `--electrummaxsubsperconn=<n>` | `1000` | Per-connection scripthash subscription cap. |
 | `--electrumrequesttimeout=<secs>` | `30` | Per-request handler timeout. |
-| `--electrummaxbatchrequests=<n>` | `16` | Max requests per JSON-RPC batch line. |
+| `--electrummaxbatchrequests=<n>` | `100` | Max requests per JSON-RPC batch line. Wallets (e.g. Sparrow) batch their whole gap-limit window of `scripthash.subscribe` calls at scan time, so a low cap fails the scan. |
 | `--electrummaxbroadcastpackagetxs=<n>` | `25` | Max txs per `blockchain.transaction.broadcast_package`. |
 | `--electrumfeehistogramttl=<secs>` | `10` | TTL for the `mempool.get_fee_histogram` cache. |
 | `--electrumbanner=<text>` | `powered by satd <version>` | Override for `server.banner`. |
