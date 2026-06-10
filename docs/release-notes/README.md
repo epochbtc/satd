@@ -16,7 +16,7 @@ The split is deliberate:
 
 | File | Release | Status |
 |---|---|---|
-| [`0.3.0-pre.md`](0.3.0-pre.md) | 0.3.0 | Pre-release (in progress) |
+| [`0.3.0.md`](0.3.0.md) | 0.3.0 | Released 2026-06-10 |
 | [`0.2.1.md`](0.2.1.md) | 0.2.1 | Released 2026-05-29 |
 | [`0.2.0.md`](0.2.0.md) | 0.2.0 | Released 2026-05-27 |
 | [`0.1.0.md`](0.1.0.md) | 0.1.0 | Released 2026-05-08 (first public release) |
