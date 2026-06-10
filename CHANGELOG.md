@@ -28,6 +28,10 @@ In-progress; full detail tracked in
   and the per-entry `unbroadcast` flag now report real values. New knobs
   (SIGHUP-reloadable): `rebroadcastinterval` (default `0` = auto, randomized
   10–15 min) and `broadcastconfirmpeers` (default `1`).
+- **P2P** — BIP35: satd now answers a peer's `mempool` message by announcing
+  its mempool (honoring the peer's fee filter). Gated on the `mempool` net
+  permission (`-whitelist=mempool@<subnet>`), mirroring Bitcoin Core's
+  NODE_BLOOM gating since satd does not support BIP37 bloom filters.
 
 - **Storage (CRITICAL)** — fixed silent UTXO/index data loss after IBD or
   reindex: `flush_durable()` flushed only RocksDB's (empty) default column

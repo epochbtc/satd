@@ -698,10 +698,23 @@ impl Mempool {
     pub fn get_all_entries(&self) -> Vec<(Txid, MempoolEntry)> {
         self.inner
             .read()
-            
+
             .entries
             .iter()
             .map(|(k, v)| (*k, v.clone()))
+            .collect()
+    }
+
+    /// Txids of mempool entries whose fee rate is at least `min_fee_rate`
+    /// (sat/kvB). Used to answer a BIP35 `mempool` request without cloning
+    /// every entry's transaction.
+    pub fn txids_above_feerate(&self, min_fee_rate: u64) -> Vec<Txid> {
+        self.inner
+            .read()
+            .entries
+            .iter()
+            .filter(|(_, e)| e.fee_rate >= min_fee_rate)
+            .map(|(txid, _)| *txid)
             .collect()
     }
 

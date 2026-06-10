@@ -82,6 +82,11 @@ const REBROADCAST_AUTO_MAX_SECS: u64 = 900;
 /// P2P protocol cap on inventory items per `inv` message (Core's
 /// `MAX_INV_SZ`); peers disconnect senders that exceed it.
 const MAX_INV_PER_MSG: usize = 50_000;
+/// Minimum spacing between BIP35 `mempool` dumps served to one peer. Each
+/// dump is a full-mempool scan plus up to multi-MB of queued `inv`s, so a
+/// permissioned-but-misbehaving peer must not be able to request it in a
+/// tight loop ("whitelisted subnet" ≠ "trusted to behave for months").
+const MEMPOOL_REQUEST_COOLDOWN_SECS: u64 = 30;
 /// Minimum timeout for a SOCKS5 `.onion` dial, in milliseconds. A `.onion`
 /// connect tunnels the proxy socket connect, the SOCKS5 handshake, and the
 /// Tor rendezvous (HS descriptor fetch + intro/rendezvous circuit build) — the
@@ -163,6 +168,11 @@ struct PeerHandle {
     /// announcement-triggered header discovery (anti-DoS). `None` until the
     /// first send.
     last_getheaders_sent: Option<Instant>,
+    /// Last time we served this peer a BIP35 `mempool` dump, for
+    /// rate-limiting: each dump is a full mempool scan plus up to multi-MB
+    /// of queued `inv` allocations, so even a *permissioned* peer must not
+    /// be able to spam it in a tight loop. `None` until the first serve.
+    last_mempool_served: Option<Instant>,
     /// Per-peer wire counters (bytes + last activity), shared with the peer's
     /// I/O tasks. Read by `getpeerinfo`; rolls up into the global
     /// [`NetTotals`].
@@ -1276,6 +1286,7 @@ impl PeerManager {
                     info,
                     msg_tx,
                     last_getheaders_sent: None,
+                    last_mempool_served: None,
                     stats: PeerStats::new(self.net_totals.clone()),
                 },
             );
@@ -2064,6 +2075,9 @@ impl PeerManager {
                     tracing::debug!(id, rate, "Peer set fee filter");
                 }
             }
+            NetworkMessage::MemPool => {
+                self.handle_mempool_request(id);
+            }
             NetworkMessage::Addr(addrs) => {
                 tracing::debug!(id, count = addrs.len(), "Received addr");
                 for (_, addr) in &addrs {
@@ -2288,6 +2302,72 @@ impl PeerManager {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// BIP35 `mempool`: a peer asks us to announce our full mempool.
+    ///
+    /// An unfiltered mempool dump is a privacy/DoS surface, which is why
+    /// Bitcoin Core gates it behind `NODE_BLOOM`. satd does **not** support
+    /// BIP37 / advertise `NODE_BLOOM` (intentionally — see `peerbloomfilters`),
+    /// so the Core-equivalent gate here is the explicit `mempool` net
+    /// permission — granted by `-whitelist=mempool@<subnet>`, by `all@`, or
+    /// implicitly by a bare `-whitelist=<subnet>` entry (which carries Core's
+    /// implicit permission set). It is NOT implied by `noban@`. Requests from
+    /// peers without it are ignored without disconnecting; Bitcoin Core
+    /// *disconnects* such peers unless they have `noban` — satd is
+    /// deliberately softer to stay friendly to clients that probe. We
+    /// respond, honoring the peer's fee filter, with `inv` message(s) of
+    /// witness-tx inventory, batched to [`MAX_INV_PER_MSG`]; the peer then
+    /// `getdata`s the ones it wants. Dumps to one peer are spaced at least
+    /// [`MEMPOOL_REQUEST_COOLDOWN_SECS`] apart — each costs a full mempool
+    /// scan and up to multi-MB of queued invs, and the permission grant is
+    /// not a license to request in a loop.
+    fn handle_mempool_request(&self, id: PeerId) {
+        if !self.peer_permissions(id).mempool {
+            tracing::debug!(id, "ignoring mempool request from peer without mempool permission");
+            return;
+        }
+        // Snapshot the peer's fee filter; confirm it's still connected,
+        // participates in tx relay (a blocksonly peer asking for a mempool
+        // dump gets nothing — Core has no tx-relay state for it either),
+        // and is past the per-peer cooldown. The cooldown stamp is taken
+        // under the same write lock that reads it, so concurrent requests
+        // can't double-serve.
+        let fee_filter = {
+            let mut peers = self.peers.write();
+            match peers.get_mut(&id) {
+                Some(h) if h.info.state == PeerState::Connected && h.info.relays_txs() => {
+                    let now = Instant::now();
+                    if let Some(last) = h.last_mempool_served
+                        && now.duration_since(last).as_secs() < MEMPOOL_REQUEST_COOLDOWN_SECS
+                    {
+                        tracing::debug!(id, "mempool request inside cooldown; ignoring");
+                        return;
+                    }
+                    h.last_mempool_served = Some(now);
+                    h.info.fee_filter
+                }
+                _ => return,
+            }
+        };
+        let txids = self.mempool.txids_above_feerate(fee_filter);
+        if txids.is_empty() {
+            return;
+        }
+        tracing::debug!(id, count = txids.len(), "serving BIP35 mempool request");
+        for chunk in txids.chunks(MAX_INV_PER_MSG) {
+            let inv = chunk
+                .iter()
+                .map(|txid| Inventory::WitnessTransaction(*txid))
+                .collect::<Vec<_>>();
+            if !self.send_to_peer(id, NetworkMessage::Inv(inv)) {
+                // Channel full — the peer isn't draining its queue; the rest
+                // of the dump would drop silently anyway (BIP35 makes no
+                // completeness promise, but don't burn the allocations).
+                tracing::debug!(id, "peer queue full mid mempool dump; truncating response");
+                break;
+            }
         }
     }
 
@@ -4608,6 +4688,7 @@ impl PeerManager {
             info,
             msg_tx,
             last_getheaders_sent: None,
+            last_mempool_served: None,
             stats: PeerStats::new(self.net_totals.clone()),
         };
         {
@@ -5440,6 +5521,7 @@ mod tests {
             info,
             msg_tx: tx,
             last_getheaders_sent: None,
+            last_mempool_served: None,
             stats: PeerStats::new(NetTotals::new()),
         }
     }
@@ -5638,6 +5720,7 @@ mod tests {
                 info,
                 msg_tx: tx,
                 last_getheaders_sent: None,
+                last_mempool_served: None,
                 stats: PeerStats::new(NetTotals::new()),
             },
             rx,
@@ -6018,6 +6101,7 @@ mod tests {
                 info,
                 msg_tx: tx,
                 last_getheaders_sent: None,
+                last_mempool_served: None,
                 stats: PeerStats::new(NetTotals::new()),
             },
         );
@@ -6026,6 +6110,86 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "inbound peers must not receive the on-connect unbroadcast dump"
+        );
+    }
+
+    /// BIP35 `mempool` is served only to peers with the `mempool` permission
+    /// (satd doesn't advertise NODE_BLOOM), and the response is an inv of
+    /// the mempool txids.
+    #[test]
+    fn bip35_mempool_served_only_with_permission() {
+        use bitcoin::hashes::Hash;
+        let (pm, _dir) = mk_test_pm();
+        let addr: SocketAddr = "10.0.0.1:8333".parse().unwrap();
+        let txid =
+            bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([5u8; 32]));
+        pm.mempool.insert_unbroadcast_for_test(txid, 0);
+
+        // No mempool permission → request ignored.
+        let (h1, mut rx1) = mk_handle_rx(1, addr, PeerState::Connected, 0);
+        pm.peers.write().insert(1, h1);
+        pm.handle_mempool_request(1);
+        assert!(rx1.try_recv().is_err(), "peer without mempool permission gets no dump");
+
+        // With the mempool permission → inv of the mempool txid.
+        let (mut h2, mut rx2) = mk_handle_rx(2, addr, PeerState::Connected, 0);
+        h2.info.permissions.mempool = true;
+        pm.peers.write().insert(2, h2);
+        pm.handle_mempool_request(2);
+        match rx2.try_recv() {
+            Ok(NetworkMessage::Inv(inv)) => {
+                assert!(
+                    inv.contains(&Inventory::WitnessTransaction(txid)),
+                    "mempool inv should list the resident tx"
+                );
+            }
+            other => panic!("permissioned peer should receive a mempool inv, got {other:?}"),
+        }
+    }
+
+    /// A BIP35 mempool response honors the requesting peer's fee filter.
+    #[test]
+    fn bip35_mempool_respects_fee_filter() {
+        use bitcoin::hashes::Hash;
+        let (pm, _dir) = mk_test_pm();
+        let addr: SocketAddr = "10.0.0.2:8333".parse().unwrap();
+        // Entry at fee rate 0; peer's filter is 1000 sat/kvB → excluded.
+        let txid =
+            bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([6u8; 32]));
+        pm.mempool.insert_unbroadcast_for_test(txid, 0);
+
+        let (mut h, mut rx) = mk_handle_rx(1, addr, PeerState::Connected, 1000);
+        h.info.permissions.mempool = true;
+        pm.peers.write().insert(1, h);
+        pm.handle_mempool_request(1);
+        assert!(rx.try_recv().is_err(), "a tx below the peer's fee filter is not advertised");
+    }
+
+    /// Repeated `mempool` requests from the same peer inside the cooldown
+    /// window are ignored — each dump is a full mempool scan plus large
+    /// queued invs, and the permission grant is not a license to loop.
+    #[test]
+    fn bip35_mempool_requests_are_rate_limited_per_peer() {
+        use bitcoin::hashes::Hash;
+        let (pm, _dir) = mk_test_pm();
+        let addr: SocketAddr = "10.0.0.3:8333".parse().unwrap();
+        let txid =
+            bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([7u8; 32]));
+        pm.mempool.insert_unbroadcast_for_test(txid, 0);
+
+        let (mut h, mut rx) = mk_handle_rx(1, addr, PeerState::Connected, 0);
+        h.info.permissions.mempool = true;
+        pm.peers.write().insert(1, h);
+
+        pm.handle_mempool_request(1);
+        assert!(
+            matches!(rx.try_recv(), Ok(NetworkMessage::Inv(_))),
+            "first request is served"
+        );
+        pm.handle_mempool_request(1);
+        assert!(
+            rx.try_recv().is_err(),
+            "an immediate second request falls inside the cooldown and is ignored"
         );
     }
 }
