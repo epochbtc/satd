@@ -51,7 +51,7 @@
 
 ### Native Integrations (No side-cars required)
 *   **Native TLS Support:** Direct TLS support for JSON-RPC, Electrum, and Esplora servers, eliminating the need for Nginx/reverse-proxy sidecars.
-*   **Electrum Protocol:** Native TCP server (v1.4.5) for wallets like BlueWallet, Sparrow, and Nunchuk.
+*   **Electrum Protocol:** Native TCP server (protocol 1.4) for wallets like BlueWallet, Sparrow, and Nunchuk.
 *   **Esplora REST:** Wire-shape parity with blockstream.info / mempool.space for the implemented endpoint set.
 *   **Verified Compatibility:** API surfaces rigorously tested with real client canaries in CI to ensure compatibility.
 *   **Streaming Consumption API:** A novel [`streaming consumption API`](docs/api/streaming.md) for real-time access to chain and mempool events, with privacy-preserving options.
@@ -80,6 +80,28 @@
 ---
 
 ## Getting Started
+
+### Try it in 2 minutes (signet, Docker)
+
+No build required — stream a live signet sync (peers connecting, blocks flowing)
+straight to your terminal:
+
+```sh
+docker run --rm -it -v satd-signet:/var/lib/satd \
+  ghcr.io/epochbtc/satd:0.3.0 --signet --datadir=/var/lib/satd
+```
+
+Within seconds the node connects to signet peers and begins Initial Block
+Download. Query it from another terminal (signet RPC is on `38332`, cookie auth):
+
+```sh
+docker exec <container> sat-cli \
+  --rpcport=38332 --rpccookiefile=/var/lib/satd/signet/.cookie \
+  chain info
+```
+
+Stop with `Ctrl-C`. The `--rm` flag discards the container on exit; drop it (and
+keep the named volume) to resume the sync later.
 
 ### Building
 
@@ -126,7 +148,7 @@ cargo run --bin sat-cli -- --regtest stop
 
 Bundled `--profile=<preset>` selects from `archival`, `pruned-home`, `mining`, `regtest-dev`, and `signet-watchtower`. CLI flags override profile values; `getconfig` / `sat-cli node config` shows the effective post-merge configuration.
 
-By defauilt, authentication uses a cookie file (default) or `--rpcuser` / `--rpcpassword`. See also the [Authentication](https://epochbtc.github.io/satd/authentication.html) page for more details. The Esplora listener defaults to **unauthenticated loopback**; for non-loopback exposure, set `--esploraauth=cookie` or `--esploraauth=userpass`.
+By default, authentication uses a cookie file (default) or `--rpcuser` / `--rpcpassword`. See also the [Authentication](https://epochbtc.github.io/satd/authentication.html) page for more details. The Esplora listener defaults to **unauthenticated loopback**; for non-loopback exposure, set `--esploraauth=cookie` or `--esploraauth=userpass`.
 
 *See the [Operator Manual](https://epochbtc.github.io/satd/) for the full flag matrix and tuning notes — in particular the [Configuration Flag Reference](https://epochbtc.github.io/satd/config-reference.html).*
 
