@@ -12,7 +12,8 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
 ## [Unreleased]
 
 _Nothing yet — terse bullets land here as user-facing changes merge; full
-detail goes to the in-development `docs/release-notes/<next>-pre.md`._
+detail goes to the in-development
+[`docs/release-notes/0.4.0-pre.md`](docs/release-notes/0.4.0-pre.md)._
 
 ## Releases
 

@@ -858,7 +858,7 @@ dependencies = [
 
 [[package]]
 name = "consensus"
-version = "0.3.0"
+version = "0.4.0-pre"
 dependencies = [
  "bitcoin",
  "bitcoinconsensus",
@@ -1265,7 +1265,7 @@ dependencies = [
 
 [[package]]
 name = "electrum-proto"
-version = "0.3.0"
+version = "0.4.0-pre"
 dependencies = [
  "async-trait",
  "bitcoin",
@@ -1336,7 +1336,7 @@ dependencies = [
 
 [[package]]
 name = "esplora-handlers"
-version = "0.3.0"
+version = "0.4.0-pre"
 dependencies = [
  "axum 0.8.9",
  "axum-test",
@@ -2620,7 +2620,7 @@ dependencies = [
 
 [[package]]
 name = "node"
-version = "0.3.0"
+version = "0.4.0-pre"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2665,7 +2665,7 @@ dependencies = [
 
 [[package]]
 name = "node-filter-index"
-version = "0.3.0"
+version = "0.4.0-pre"
 dependencies = [
  "bitcoin",
  "serde",
@@ -2674,7 +2674,7 @@ dependencies = [
 
 [[package]]
 name = "node-index"
-version = "0.3.0"
+version = "0.4.0-pre"
 dependencies = [
  "bitcoin",
  "parking_lot",
@@ -3940,7 +3940,7 @@ dependencies = [
 
 [[package]]
 name = "sat-cli"
-version = "0.3.0"
+version = "0.4.0-pre"
 dependencies = [
  "base64 0.22.1",
  "bitcoin",
@@ -3957,7 +3957,7 @@ dependencies = [
 
 [[package]]
 name = "sat-tui"
-version = "0.3.0"
+version = "0.4.0-pre"
 dependencies = [
  "base64 0.22.1",
  "clap",
@@ -3972,7 +3972,7 @@ dependencies = [
 
 [[package]]
 name = "satd"
-version = "0.3.0"
+version = "0.4.0-pre"
 dependencies = [
  "axum 0.8.9",
  "base64 0.22.1",
@@ -4013,7 +4013,7 @@ dependencies = [
 
 [[package]]
 name = "satd-auth"
-version = "0.3.0"
+version = "0.4.0-pre"
 dependencies = [
  "base64 0.22.1",
  "dashmap",
@@ -4030,7 +4030,7 @@ dependencies = [
 
 [[package]]
 name = "satd-events"
-version = "0.3.0"
+version = "0.4.0-pre"
 dependencies = [
  "async-trait",
  "axum 0.8.9",
@@ -4056,7 +4056,7 @@ dependencies = [
 
 [[package]]
 name = "satd-mcp"
-version = "0.3.0"
+version = "0.4.0-pre"
 dependencies = [
  "bitcoin",
  "bytes",
@@ -4763,7 +4763,7 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tls-config"
-version = "0.3.0"
+version = "0.4.0-pre"
 dependencies = [
  "rcgen",
  "rustls-pemfile",
