@@ -1205,8 +1205,16 @@ pub async fn start(
         let mempool_est =
             crate::mempool::estimate::estimate_from_mempool(snapshot, max_target as usize);
 
-        let mut targets_obj = serde_json::Map::new();
         let mut any_fallback = false;
+        // Resolve each target, then clamp the assembled ladder to be
+        // monotonically non-increasing in target. blend mode can source
+        // adjacent targets from different estimators (mempool sim vs.
+        // historical percentile vs. floor), which would otherwise let a
+        // shallower, higher-priority target report a *lower* feerate than a
+        // deeper one. Rows stay in request order; the clamp keys off target
+        // value, and confidence labels are preserved.
+        let mut rows: Vec<(u32, u64, crate::mempool::estimate::Confidence)> =
+            Vec::with_capacity(targets.len());
         for t in &targets {
             let (rate_kvb, conf) = match mode {
                 EstimateMode::Historical => {
@@ -1244,6 +1252,20 @@ pub async fn start(
                     }
                 }
             };
+            rows.push((*t, rate_kvb, conf));
+        }
+
+        let mut clamped: Vec<(u32, u64)> = rows.iter().map(|(t, r, _)| (*t, *r)).collect();
+        crate::mempool::estimate::enforce_monotone_by_target(&mut clamped);
+        // `clamped` is in the same order as `rows`; copy the clamped rates back.
+        for (row, (_, rate)) in rows.iter_mut().zip(clamped.iter()) {
+            row.1 = *rate;
+        }
+        // Cheapest displayed tier — economy must not exceed it.
+        let lowest_tier = clamped.iter().map(|(_, r)| *r).min();
+
+        let mut targets_obj = serde_json::Map::new();
+        for (t, rate_kvb, conf) in &rows {
             let conf_str = match conf {
                 crate::mempool::estimate::Confidence::High => "high",
                 crate::mempool::estimate::Confidence::Medium => "medium",
@@ -1252,7 +1274,7 @@ pub async fn start(
             targets_obj.insert(
                 t.to_string(),
                 serde_json::json!({
-                    "feerate": format_feerate_sat_per_kvb(rate_kvb, unit),
+                    "feerate": format_feerate_sat_per_kvb(*rate_kvb, unit),
                     "confidence": conf_str,
                 }),
             );
@@ -1287,8 +1309,12 @@ pub async fn start(
                 r
             }
         };
+        // Economy is the cheapest tier shown, so it must sit at or below the
+        // lowest displayed target — never above it (which would invert the
+        // None/Low ordering when the deepest target falls back to historical).
         let economy_rate =
-            crate::mempool::estimate::economy_feerate_sat_per_kvb(floor_sat_per_kvb, hour_rate);
+            crate::mempool::estimate::economy_feerate_sat_per_kvb(floor_sat_per_kvb, hour_rate)
+                .min(lowest_tier.unwrap_or(u64::MAX));
         let thin_block = crate::mempool::estimate::is_thin_block(&mempool_est);
 
         let mut response = serde_json::json!({
