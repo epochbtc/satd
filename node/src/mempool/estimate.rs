@@ -288,8 +288,13 @@ fn simulate_one_block(remaining: &HashMap<Txid, MempoolEntry>) -> (SimBlock, Has
             continue;
         }
         if used_sigops.saturating_add(group_sigops) > MAX_BLOCK_SIGOPS_COST {
-            // Block-wide sigop cap reached for this package; skip and try
-            // the next candidate (may be smaller in sigops).
+            // Block-wide sigop cap reached for this package; the block is at a
+            // global capacity limit (like the weight-overflow branch above),
+            // so mark it filled. Smaller-sigop candidates may still squeeze in,
+            // so continue rather than break. Without this, a sigop-bound block
+            // (weight-light but sigop-saturated) would report `filled == false`
+            // and wrongly skip the robust floor trim / be labelled `Medium`.
+            filled = true;
             continue;
         }
         let marginal_rate = crate::mempool::policy::fee_rate_sat_per_kvb(group_fee, group_weight);
@@ -623,12 +628,31 @@ pub fn smart_fees(
     let max_target = targets.iter().copied().max().unwrap_or(24).max(1);
     let sim_depth = (max_target as usize).min(MAX_SIM_DEPTH);
     let mempool_est = estimate_from_mempool(snapshot, sim_depth);
+    smart_fees_from_estimate(&mempool_est, fee_estimator, targets, mode, floor_sat_per_kvb)
+}
+
+/// `smart_fees` against a *prebuilt* mempool simulation, so callers on hot
+/// public surfaces can reuse a cached `MempoolEstimate`
+/// ([`FeeEstimator::cached_mempool_estimate`]) instead of cloning the whole
+/// mempool and re-simulating on every request.
+///
+/// A `MempoolEstimate` simulated to any depth ≥ a target answers that target
+/// identically (the per-block drain is the same regardless of total depth),
+/// so a single estimate built to [`MAX_SIM_DEPTH`] serves every surface.
+pub fn smart_fees_from_estimate(
+    mempool_est: &MempoolEstimate,
+    fee_estimator: &FeeEstimator,
+    targets: &[u32],
+    mode: EstimateMode,
+    floor_sat_per_kvb: u64,
+) -> SmartFees {
+    let max_target = targets.iter().copied().max().unwrap_or(24).max(1);
 
     let mut fallback = false;
     let mut rows: Vec<(u32, u64, Confidence)> = Vec::with_capacity(targets.len());
     for &t in targets {
         let (rate, conf, fb) =
-            resolve_target(&mempool_est, fee_estimator, t, mode, floor_sat_per_kvb);
+            resolve_target(mempool_est, fee_estimator, t, mode, floor_sat_per_kvb);
         fallback |= fb;
         rows.push((t, rate, conf));
     }
@@ -649,7 +673,7 @@ pub fn smart_fees(
         EstimateMode::Historical => fee_estimator
             .estimate_fee(max_target)
             .unwrap_or(floor_sat_per_kvb),
-        _ => target_estimate(&mempool_est, max_target, floor_sat_per_kvb).0,
+        _ => target_estimate(mempool_est, max_target, floor_sat_per_kvb).0,
     };
     let economy = economy_feerate_sat_per_kvb(floor_sat_per_kvb, hour_rate)
         .min(lowest_tier.unwrap_or(u64::MAX));
@@ -666,9 +690,9 @@ pub fn smart_fees(
         economy_feerate_sat_per_kvb: economy,
         mode,
         fallback,
-        thin_block: is_thin_block(&mempool_est),
+        thin_block: is_thin_block(mempool_est),
         mempool_weight: mempool_est.mempool_weight,
-        histogram: mempool_est.histogram,
+        histogram: mempool_est.histogram.clone(),
     }
 }
 
@@ -966,6 +990,9 @@ mod tests {
         let est = estimate_from_mempool(snap, 1);
         // Admit t1 (sigops fit) + t3 (0 sigops). t2 skipped on block cap.
         assert_eq!(est.sim_blocks[0].tx_count, 2);
+        // The block hit the global sigop cap, so it is reported as filled
+        // (so it gets the robust floor trim / High confidence, not Medium).
+        assert!(est.sim_blocks[0].filled, "sigop-bound block must be filled");
     }
 
     #[test]

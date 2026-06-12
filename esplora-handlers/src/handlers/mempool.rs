@@ -163,9 +163,14 @@ pub async fn fee_estimates(
     // `smart_fees` returns sat/kvB; Esplora's wire unit is sat/vB (`/1000`).
     // (Pre-#355 this endpoint used `/250` against the old per-weight-unit
     // value, overreporting every estimate 4×.)
+    //
+    // This endpoint is unauthenticated by default, so the expensive mempool
+    // simulation is taken from the shared short-TTL cache rather than cloning
+    // the whole mempool and re-simulating per request.
     let floor_sat_per_kvb = state.mempool.min_fee_rate().max(1_000);
-    let sf = node::mempool::estimate::smart_fees(
-        state.mempool.get_all_entries(),
+    let est = state.fee_estimator.cached_mempool_estimate(&state.mempool);
+    let sf = node::mempool::estimate::smart_fees_from_estimate(
+        &est,
         &state.fee_estimator,
         FEE_TARGETS,
         node::mempool::estimate::EstimateMode::Blend,
