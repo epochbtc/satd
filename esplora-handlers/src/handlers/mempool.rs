@@ -101,12 +101,11 @@ pub async fn mempool_summary(
         let vsize = vsize_of_weight(entry.weight as u64);
         vsize_total = vsize_total.saturating_add(vsize);
         fee_total = fee_total.saturating_add(entry.fee);
-        // Round-3 review M1: `entry.fee_rate` is satoshis per 1000
-        // weight units (`fee * 1000 / weight` per
-        // `node/src/mempool/pool.rs`), NOT sat/kvB. Conversion to
-        // sat/vB is `/250` (since 1000 vbytes = 4000 weight units).
-        // Prior `/1000` underreported every fee rate by 4x.
-        let rate_sat_vb = (entry.fee_rate as f64) / 250.0;
+        // `entry.fee_rate` is sat/kvB (sat per 1000 *virtual* bytes) since
+        // PR #355 routed all rates through `policy::fee_rate_sat_per_kvb`.
+        // sat/vB is therefore `/1000`. (The earlier `/250` divisor was for
+        // the pre-#355 per-weight-unit value and overreported every rate 4×.)
+        let rate_sat_vb = (entry.fee_rate as f64) / 1000.0;
         tx_rates.push((rate_sat_vb, vsize));
     }
     let fee_histogram = build_fee_histogram(&tx_rates);
@@ -158,22 +157,26 @@ pub async fn mempool_recent(
 pub async fn fee_estimates(
     State(state): State<EsploraState>,
 ) -> EsploraResult<Json<Value>> {
-    let mut out = serde_json::Map::with_capacity(FEE_TARGETS.len());
-    for target in FEE_TARGETS {
-        // Round-3 review M1: FeeEstimator stores satoshis per 1000
-        // weight units (samples are computed as `fee * 1000 / weight`
-        // in `node/src/net/manager.rs`), not sat/kvB. Convert to
-        // sat/vB by `/250` (1 vbyte = 4 weight units, 1000 vbytes =
-        // 4000 weight units). Prior `/1000` underreported every fee
-        // estimate by 4x. When data is insufficient (None) we fall
-        // back to 1.0 sat/vB so consumer tooling always has a
-        // complete map.
-        let rate = state
-            .fee_estimator
-            .estimate_fee(*target)
-            .map(|sat_per_1000_wu| (sat_per_1000_wu as f64) / 250.0)
-            .unwrap_or(1.0);
-        out.insert(target.to_string(), Value::from(rate));
+    // Route through the shared `smart_fees` resolver (blend mode) so
+    // `/fee-estimates` agrees with the JSON-RPC `estimatefees`, the TUI and
+    // Electrum, with the same monotonicity guarantee across the target set.
+    // `smart_fees` returns sat/kvB; Esplora's wire unit is sat/vB (`/1000`).
+    // (Pre-#355 this endpoint used `/250` against the old per-weight-unit
+    // value, overreporting every estimate 4×.)
+    let floor_sat_per_kvb = state.mempool.min_fee_rate().max(1_000);
+    let sf = node::mempool::estimate::smart_fees(
+        state.mempool.get_all_entries(),
+        &state.fee_estimator,
+        FEE_TARGETS,
+        node::mempool::estimate::EstimateMode::Blend,
+        floor_sat_per_kvb,
+    );
+    let mut out = serde_json::Map::with_capacity(sf.targets.len());
+    for tf in &sf.targets {
+        out.insert(
+            tf.target.to_string(),
+            Value::from(tf.feerate_sat_per_kvb as f64 / 1000.0),
+        );
     }
     Ok(Json(Value::Object(out)))
 }
@@ -264,26 +267,22 @@ mod tests {
         assert_eq!(h[0].0, 1.0);
     }
 
-    /// Round-3 review M1: pin the conversion from satd's internal
-    /// `sat per 1000 WU` fee-rate unit to the wire `sat/vB` Esplora
-    /// emits.
+    /// Pin the conversion from satd's internal fee-rate unit to the wire
+    /// `sat/vB` Esplora emits.
     ///
-    /// Internal `fee_rate = fee * 1000 / weight`. For 1 sat/vB:
-    ///   weight = 1000 WU per 250 vB → fee_rate = (1 sat/vB) * 1000
-    ///     vB / 250 WU/vB ... actually simpler: a 1 sat/vB tx has
-    ///   `fee * 1000 / weight = 1 * 1000 / 4 = 250` (using the
-    ///   1 vB = 4 WU identity). So `fee_rate = 250` ↔ 1 sat/vB ↔
-    ///   1000 sat/kvB.
-    /// Pre-fix Esplora divided by 1000 → reported 0.25 sat/vB
-    /// for a 1 sat/vB tx. Post-fix divides by 250 → reports 1.0.
+    /// Since PR #355 all internal fee rates are sat/kvB (sat per 1000
+    /// *virtual* bytes) via `policy::fee_rate_sat_per_kvb`: a 1 sat/vB tx
+    /// has `fee_rate = 1000`, a 10 sat/vB tx has `10000`. The wire unit is
+    /// sat/vB, so the conversion is `/1000`. (The earlier `/250` divisor was
+    /// for the pre-#355 per-weight-unit value and overreported every rate 4×.)
     #[test]
     fn fee_rate_conversion_matches_one_sat_per_vb_fixture() {
-        let internal_one_sat_vb: u64 = 250;
-        let sat_per_vb = (internal_one_sat_vb as f64) / 250.0;
+        let internal_one_sat_vb: u64 = 1000;
+        let sat_per_vb = (internal_one_sat_vb as f64) / 1000.0;
         assert!((sat_per_vb - 1.0).abs() < 1e-12, "got {sat_per_vb}");
 
-        let internal_ten_sat_vb: u64 = 2500;
-        let sat_per_vb = (internal_ten_sat_vb as f64) / 250.0;
+        let internal_ten_sat_vb: u64 = 10_000;
+        let sat_per_vb = (internal_ten_sat_vb as f64) / 1000.0;
         assert!((sat_per_vb - 10.0).abs() < 1e-12, "got {sat_per_vb}");
     }
 }

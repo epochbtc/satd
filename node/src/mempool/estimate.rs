@@ -22,6 +22,7 @@ use std::collections::{HashMap, HashSet};
 use bitcoin::Txid;
 use serde::Serialize;
 
+use crate::mempool::fee::FeeEstimator;
 use crate::mempool::pool::MempoolEntry;
 
 /// Maximum block weight (4,000,000 WU per BIP 141).
@@ -52,6 +53,52 @@ pub enum Confidence {
     Medium,
     /// Mempool had no usable data at this target; floor used.
     Low,
+}
+
+impl Confidence {
+    /// Lowercase wire string (`high`/`medium`/`low`).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::High => "high",
+            Self::Medium => "medium",
+            Self::Low => "low",
+        }
+    }
+}
+
+/// Which data source `estimatesmartfee` / `estimatefees` (and every other
+/// fee surface) draws from.
+///
+/// - `Historical` (default for `estimatesmartfee`, for Bitcoin Core
+///   compatibility): percentile of recent confirmed-block feerates.
+/// - `Mempool`: simulate the next N block templates from the live mempool
+///   and use the lowest admitted feerate. Responds faster to congestion.
+/// - `Blend` (default everywhere else): mempool estimate when confidence
+///   ≥ medium; fall back to historical, then the min-relay floor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EstimateMode {
+    Historical,
+    Mempool,
+    Blend,
+}
+
+impl EstimateMode {
+    pub fn parse(s: Option<&str>) -> Option<Self> {
+        match s?.trim().to_ascii_lowercase().as_str() {
+            "historical" | "conservative" | "economical" | "unset" => Some(Self::Historical),
+            "mempool" => Some(Self::Mempool),
+            "blend" => Some(Self::Blend),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Historical => "historical",
+            Self::Mempool => "mempool",
+            Self::Blend => "blend",
+        }
+    }
 }
 
 /// A single simulated block's summary.
@@ -432,6 +479,145 @@ pub fn enforce_monotone_by_target(rows: &mut [(u32, u64)]) {
     for i in order {
         running_min = running_min.min(rows[i].1);
         rows[i].1 = running_min;
+    }
+}
+
+/// Cap on how many blocks the mempool simulator runs, regardless of the
+/// deepest requested target. Beyond a couple dozen blocks the mempool has
+/// almost always drained (the sim early-exits on an empty block), so deeper
+/// targets resolve through the historical fallback anyway. The cap bounds
+/// cost for surfaces like Esplora `/fee-estimates` that ask out to 1008.
+pub const MAX_SIM_DEPTH: usize = 25;
+
+/// A single resolved per-target fee estimate (sat/kvB).
+#[derive(Debug, Clone)]
+pub struct TargetFee {
+    pub target: u32,
+    pub feerate_sat_per_kvb: u64,
+    pub confidence: Confidence,
+}
+
+/// Fully-resolved smart-fee output shared by every surface (RPC, MCP,
+/// Esplora, Electrum, TUI). This is the single source of truth: mode
+/// selection, the monotonicity clamp, and the economy tier all happen here,
+/// so no surface can drift or reintroduce an ordering/unit bug. All rates
+/// are sat/kvB; each surface formats to its own wire unit.
+#[derive(Debug, Clone)]
+pub struct SmartFees {
+    /// Per-target estimates in request order, clamped monotone by target.
+    pub targets: Vec<TargetFee>,
+    /// "Cheap but reasonable" economy rate (sat/kvB): the deepest target
+    /// clamped into `[floor, 2×floor]` and never above the cheapest tier.
+    pub economy_feerate_sat_per_kvb: u64,
+    /// Mode actually used.
+    pub mode: EstimateMode,
+    /// Whether any target fell back off the mempool sim (to historical/floor).
+    pub fallback: bool,
+    /// Whether the simulated next block is thin (weak queue signal).
+    pub thin_block: bool,
+    /// Total mempool weight at snapshot time.
+    pub mempool_weight: u64,
+    /// Feerate histogram from the snapshot.
+    pub histogram: Vec<HistogramBucket>,
+}
+
+/// Resolve one confirmation target against a prebuilt mempool simulation,
+/// applying the mode policy. Returns `(sat/kvB, confidence, used_fallback)`.
+///
+/// This is the single definition of the blend policy: prefer the mempool
+/// simulation when it is confident (High/Medium), else fall back to the
+/// historical percentile estimator, else the min-relay floor.
+pub fn resolve_target(
+    mempool_est: &MempoolEstimate,
+    fee_estimator: &FeeEstimator,
+    target: u32,
+    mode: EstimateMode,
+    floor_sat_per_kvb: u64,
+) -> (u64, Confidence, bool) {
+    match mode {
+        EstimateMode::Historical => match fee_estimator.estimate_fee(target) {
+            Some(h) => (h, Confidence::Medium, false),
+            None => (floor_sat_per_kvb, Confidence::Low, true),
+        },
+        EstimateMode::Mempool => {
+            let (r, c) = target_estimate(mempool_est, target, floor_sat_per_kvb);
+            (r, c, false)
+        }
+        EstimateMode::Blend => {
+            let (mp_rate, mp_conf) = target_estimate(mempool_est, target, floor_sat_per_kvb);
+            if matches!(mp_conf, Confidence::High | Confidence::Medium) {
+                (mp_rate, mp_conf, false)
+            } else if let Some(h) = fee_estimator.estimate_fee(target) {
+                (h, Confidence::Medium, true)
+            } else {
+                (floor_sat_per_kvb, Confidence::Low, true)
+            }
+        }
+    }
+}
+
+/// Compute smart fees for a set of confirmation targets — the unified entry
+/// point behind every fee surface.
+///
+/// `snapshot` is an owned mempool snapshot (callers take it via
+/// `Mempool::get_all_entries()` so no lock is held during simulation).
+/// `floor_sat_per_kvb` is the min-relay floor (`min_fee_rate`, ≥ 1000).
+pub fn smart_fees(
+    snapshot: Vec<(Txid, MempoolEntry)>,
+    fee_estimator: &FeeEstimator,
+    targets: &[u32],
+    mode: EstimateMode,
+    floor_sat_per_kvb: u64,
+) -> SmartFees {
+    let max_target = targets.iter().copied().max().unwrap_or(24).max(1);
+    let sim_depth = (max_target as usize).min(MAX_SIM_DEPTH);
+    let mempool_est = estimate_from_mempool(snapshot, sim_depth);
+
+    let mut fallback = false;
+    let mut rows: Vec<(u32, u64, Confidence)> = Vec::with_capacity(targets.len());
+    for &t in targets {
+        let (rate, conf, fb) =
+            resolve_target(&mempool_est, fee_estimator, t, mode, floor_sat_per_kvb);
+        fallback |= fb;
+        rows.push((t, rate, conf));
+    }
+
+    // Clamp the assembled ladder to be monotone in target — belt-and-suspenders
+    // against blend mixing estimators across adjacent targets. Confidence
+    // labels are left as resolved.
+    let mut clamped: Vec<(u32, u64)> = rows.iter().map(|(t, r, _)| (*t, *r)).collect();
+    enforce_monotone_by_target(&mut clamped);
+    for (row, (_, rate)) in rows.iter_mut().zip(clamped.iter()) {
+        row.1 = *rate;
+    }
+    let lowest_tier = clamped.iter().map(|(_, r)| *r).min();
+
+    // Economy: clamp the deepest target's rate into [floor, 2×floor], then
+    // hold it at or below the cheapest displayed tier.
+    let hour_rate = match mode {
+        EstimateMode::Historical => fee_estimator
+            .estimate_fee(max_target)
+            .unwrap_or(floor_sat_per_kvb),
+        _ => target_estimate(&mempool_est, max_target, floor_sat_per_kvb).0,
+    };
+    let economy = economy_feerate_sat_per_kvb(floor_sat_per_kvb, hour_rate)
+        .min(lowest_tier.unwrap_or(u64::MAX));
+
+    SmartFees {
+        targets: rows
+            .into_iter()
+            .map(|(target, feerate_sat_per_kvb, confidence)| TargetFee {
+                target,
+                feerate_sat_per_kvb,
+                confidence,
+            })
+            .collect(),
+        economy_feerate_sat_per_kvb: economy,
+        mode,
+        fallback,
+        thin_block: is_thin_block(&mempool_est),
+        mempool_weight: mempool_est.mempool_weight,
+        histogram: mempool_est.histogram,
     }
 }
 
@@ -861,5 +1047,68 @@ mod tests {
             rows,
             vec![(1, 50_000), (3, 30_000), (6, 20_000), (24, 5_000)]
         );
+    }
+
+    #[test]
+    fn smart_fees_empty_mempool_no_history_floors_all_targets() {
+        // Cold node: empty mempool + estimator with no samples. Every target
+        // (and economy) collapses to the floor, monotone, with `fallback`.
+        let est = FeeEstimator::new();
+        let floor = 1_000;
+        let sf = smart_fees(Vec::new(), &est, &[1, 3, 6, 12, 24], EstimateMode::Blend, floor);
+        assert_eq!(sf.targets.len(), 5);
+        assert!(sf.thin_block);
+        assert!(sf.fallback);
+        for tf in &sf.targets {
+            assert_eq!(tf.feerate_sat_per_kvb, floor);
+        }
+        assert_eq!(sf.economy_feerate_sat_per_kvb, floor);
+    }
+
+    #[test]
+    fn smart_fees_historical_is_monotone_and_economy_capped() {
+        // Historical mode over a seeded estimator: percentile-by-target is
+        // already monotone; economy stays at/below the cheapest tier.
+        let est = FeeEstimator::new();
+        // 100 samples 1..=100 (sat/kvB) → percentiles are well-defined.
+        let rates: Vec<u64> = (1..=100).collect();
+        est.record_block(&rates);
+        let floor = 1; // keep the floor out of the way of the percentile values
+        let sf = smart_fees(Vec::new(), &est, &[1, 3, 6, 12, 24], EstimateMode::Historical, floor);
+        let vals: Vec<u64> = sf.targets.iter().map(|t| t.feerate_sat_per_kvb).collect();
+        for w in vals.windows(2) {
+            assert!(w[0] >= w[1], "historical ladder must be non-increasing: {vals:?}");
+        }
+        let lowest = *vals.iter().min().unwrap();
+        assert!(sf.economy_feerate_sat_per_kvb <= lowest);
+    }
+
+    #[test]
+    fn smart_fees_blend_clamps_inverted_history_fallback() {
+        // Deep target falls back to a *higher* historical value than a
+        // shallower mempool/floor target would imply; the clamp must keep the
+        // assembled ladder non-increasing in target.
+        let est = FeeEstimator::new();
+        est.record_block(&[5_000; 50]); // historical ≈ 5_000 at every percentile
+        let floor = 1_000;
+        // Empty mempool → every target is thin/Low → blend falls to historical
+        // (5_000) for all. That is flat (monotone) and a useful regression that
+        // sources agree; assert non-increasing + economy cap.
+        let sf = smart_fees(Vec::new(), &est, &[1, 3, 6], EstimateMode::Blend, floor);
+        let vals: Vec<u64> = sf.targets.iter().map(|t| t.feerate_sat_per_kvb).collect();
+        for w in vals.windows(2) {
+            assert!(w[0] >= w[1], "blend ladder must be non-increasing: {vals:?}");
+        }
+        assert!(sf.economy_feerate_sat_per_kvb <= *vals.iter().min().unwrap());
+    }
+
+    #[test]
+    fn smart_fees_caps_simulation_depth() {
+        // A very deep target must not blow up the sim; depth is capped and
+        // deeper targets resolve through the (monotone) fallback path.
+        let est = FeeEstimator::new();
+        let sf = smart_fees(Vec::new(), &est, &[1, 1008], EstimateMode::Blend, 1_000);
+        assert_eq!(sf.targets.len(), 2);
+        assert!(sf.targets[0].feerate_sat_per_kvb >= sf.targets[1].feerate_sat_per_kvb);
     }
 }
