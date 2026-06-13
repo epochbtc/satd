@@ -88,17 +88,16 @@ pub fn get_fee_histogram(state: &ElectrumState) -> Result<Value, JsonRpcError> {
 pub(crate) fn compute_fee_histogram(mempool: &node::mempool::pool::Mempool) -> Value {
     let entries = mempool.get_all_entries();
 
-    // `MempoolEntry::fee_rate` is sat-per-1000-weight-units. vbyte =
-    // ceil(weight / 4) per Bitcoin Core (`MAX_BLOCK_WEIGHT / 4`
-    // rounded up). So sat/vbyte = fee_rate / 250 (integer divide is
-    // fine; clients use the histogram as a fee-rate hint, not for
-    // exact accounting). Round-2 review note: switch from
-    // `weight / 4` to `weight.div_ceil(4)` for vsize parity with
-    // Esplora and Bitcoin Core.
+    // `MempoolEntry::fee_rate` is sat/kvB (sat per 1000 *virtual* bytes)
+    // since PR #355 (`policy::fee_rate_sat_per_kvb`), so sat/vbyte =
+    // fee_rate / 1000 (integer divide is fine; clients use the histogram as
+    // a fee-rate hint, not for exact accounting). vbyte = ceil(weight / 4)
+    // per Bitcoin Core. (The earlier `/250` divisor was for the pre-#355
+    // per-weight-unit value and overreported every rate 4×.)
     let pairs: Vec<(u64, u64)> = entries
         .iter()
         .map(|(_txid, entry)| {
-            let sats_per_vb = entry.fee_rate / 250;
+            let sats_per_vb = entry.fee_rate / 1000;
             let vbytes = (entry.weight as u64).div_ceil(4);
             (sats_per_vb, vbytes)
         })

@@ -304,81 +304,37 @@ fn try_acquire_blockfile_audit(
     .map(|_| AuditInflightGuard { flag: flag.clone() })
 }
 
-/// Which data source `estimatesmartfee` / `estimatefees` draws from.
-///
-/// - `Historical` (default for `estimatesmartfee`): percentile of recent
-///   confirmed-block feerates. Exactly matches pre-mempool-sim behavior
-///   and Bitcoin Core's `estimatesmartfee` semantics.
-/// - `Mempool`: simulate the next N block templates from the live
-///   mempool and use the ancestor-feerate of the lowest admitted tx.
-///   Responds faster to sudden congestion than historical.
-/// - `Blend` (default for `estimatefees`): mempool estimate when
-///   confidence >= medium; fall back to historical otherwise.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EstimateMode {
-    Historical,
-    Mempool,
-    Blend,
-}
-
-impl EstimateMode {
-    pub fn parse(s: Option<&str>) -> Option<Self> {
-        match s?.trim().to_ascii_lowercase().as_str() {
-            "historical" | "conservative" | "economical" | "unset" => Some(Self::Historical),
-            "mempool" => Some(Self::Mempool),
-            "blend" => Some(Self::Blend),
-            _ => None,
-        }
-    }
-
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Historical => "historical",
-            Self::Mempool => "mempool",
-            Self::Blend => "blend",
-        }
-    }
-}
+/// The estimator mode enum lives in the node library now, shared by every
+/// fee surface (RPC, MCP, Esplora, Electrum). Re-exported here so existing
+/// `EstimateMode` references in this module keep resolving.
+pub use crate::mempool::estimate::EstimateMode;
 
 /// Resolve a single `estimatesmartfee` target into a feerate (sat/kvB).
 ///
 /// Isolated so `estimatesmartfee` can stay Core-compatible: the response
-/// shape never changes; only the source of the number does.
+/// shape never changes; only the source of the number does. The mempool sim
+/// is built lazily — `Historical` mode (the Core-compatible default) never
+/// touches the snapshot.
 fn resolve_feerate_sat_per_kvb<F>(
     mode: EstimateMode,
     target: u32,
-    historical: Option<u64>,
+    fee_estimator: &crate::mempool::fee::FeeEstimator,
     floor_sat_per_kvb: u64,
     snapshot_fn: F,
 ) -> u64
 where
     F: FnOnce() -> Vec<(bitcoin::Txid, crate::mempool::pool::MempoolEntry)>,
 {
-    match mode {
-        EstimateMode::Historical => historical.unwrap_or(floor_sat_per_kvb),
-        EstimateMode::Mempool => {
-            let est =
-                crate::mempool::estimate::estimate_from_mempool(snapshot_fn(), target as usize);
-            let (rate, _) =
-                crate::mempool::estimate::target_estimate(&est, target, floor_sat_per_kvb);
-            rate
-        }
-        EstimateMode::Blend => {
-            let est =
-                crate::mempool::estimate::estimate_from_mempool(snapshot_fn(), target as usize);
-            let (mp_rate, mp_conf) =
-                crate::mempool::estimate::target_estimate(&est, target, floor_sat_per_kvb);
-            if matches!(
-                mp_conf,
-                crate::mempool::estimate::Confidence::High
-                    | crate::mempool::estimate::Confidence::Medium
-            ) {
-                mp_rate
-            } else {
-                historical.unwrap_or(floor_sat_per_kvb)
-            }
-        }
+    if mode == EstimateMode::Historical {
+        return fee_estimator.estimate_fee(target).unwrap_or(floor_sat_per_kvb);
     }
+    let est = crate::mempool::estimate::estimate_from_mempool(
+        snapshot_fn(),
+        (target as usize).min(crate::mempool::estimate::MAX_SIM_DEPTH),
+    );
+    let (rate, _conf, _fallback) =
+        crate::mempool::estimate::resolve_target(&est, fee_estimator, target, mode, floor_sat_per_kvb);
+    rate
 }
 
 /// Start the JSON-RPC HTTP server with authentication.
@@ -1171,9 +1127,8 @@ pub async fn start(
 
         let unit = default_unit();
         let floor_sat_per_kvb = ctx.mempool.info().min_fee_rate.max(1_000);
-        let historical = ctx.fee_estimator.estimate_fee(conf_target);
         let sat_per_kvb =
-            resolve_feerate_sat_per_kvb(mode, conf_target, historical, floor_sat_per_kvb, || {
+            resolve_feerate_sat_per_kvb(mode, conf_target, &ctx.fee_estimator, floor_sat_per_kvb, || {
                 ctx.mempool.get_all_entries()
             });
         let mut response = serde_json::json!({
@@ -1200,87 +1155,29 @@ pub async fn start(
 
         let unit = default_unit();
         let floor_sat_per_kvb = ctx.mempool.info().min_fee_rate.max(1_000);
-        let max_target = targets.iter().copied().max().unwrap_or(24).max(1);
-        let snapshot = ctx.mempool.get_all_entries();
-        let mempool_est =
-            crate::mempool::estimate::estimate_from_mempool(snapshot, max_target as usize);
-
-        let mut any_fallback = false;
-        // Resolve each target, then clamp the assembled ladder to be
-        // monotonically non-increasing in target. blend mode can source
-        // adjacent targets from different estimators (mempool sim vs.
-        // historical percentile vs. floor), which would otherwise let a
-        // shallower, higher-priority target report a *lower* feerate than a
-        // deeper one. Rows stay in request order; the clamp keys off target
-        // value, and confidence labels are preserved.
-        let mut rows: Vec<(u32, u64, crate::mempool::estimate::Confidence)> =
-            Vec::with_capacity(targets.len());
-        for t in &targets {
-            let (rate_kvb, conf) = match mode {
-                EstimateMode::Historical => {
-                    let h = ctx.fee_estimator.estimate_fee(*t);
-                    let r = h.unwrap_or(floor_sat_per_kvb);
-                    let c = if h.is_some() {
-                        crate::mempool::estimate::Confidence::Medium
-                    } else {
-                        any_fallback = true;
-                        crate::mempool::estimate::Confidence::Low
-                    };
-                    (r, c)
-                }
-                EstimateMode::Mempool => {
-                    crate::mempool::estimate::target_estimate(&mempool_est, *t, floor_sat_per_kvb)
-                }
-                EstimateMode::Blend => {
-                    let (mp_rate, mp_conf) = crate::mempool::estimate::target_estimate(
-                        &mempool_est,
-                        *t,
-                        floor_sat_per_kvb,
-                    );
-                    if matches!(
-                        mp_conf,
-                        crate::mempool::estimate::Confidence::High
-                            | crate::mempool::estimate::Confidence::Medium
-                    ) {
-                        (mp_rate, mp_conf)
-                    } else if let Some(h) = ctx.fee_estimator.estimate_fee(*t) {
-                        any_fallback = true;
-                        (h, crate::mempool::estimate::Confidence::Medium)
-                    } else {
-                        any_fallback = true;
-                        (floor_sat_per_kvb, crate::mempool::estimate::Confidence::Low)
-                    }
-                }
-            };
-            rows.push((*t, rate_kvb, conf));
-        }
-
-        let mut clamped: Vec<(u32, u64)> = rows.iter().map(|(t, r, _)| (*t, *r)).collect();
-        crate::mempool::estimate::enforce_monotone_by_target(&mut clamped);
-        // `clamped` is in the same order as `rows`; copy the clamped rates back.
-        for (row, (_, rate)) in rows.iter_mut().zip(clamped.iter()) {
-            row.1 = *rate;
-        }
-        // Cheapest displayed tier — economy must not exceed it.
-        let lowest_tier = clamped.iter().map(|(_, r)| *r).min();
+        // Single source of truth: blend/mempool/historical selection,
+        // monotonicity clamp, and economy tier all happen in `smart_fees`,
+        // shared with MCP / Esplora / Electrum.
+        let sf = crate::mempool::estimate::smart_fees(
+            ctx.mempool.get_all_entries(),
+            &ctx.fee_estimator,
+            &targets,
+            mode,
+            floor_sat_per_kvb,
+        );
 
         let mut targets_obj = serde_json::Map::new();
-        for (t, rate_kvb, conf) in &rows {
-            let conf_str = match conf {
-                crate::mempool::estimate::Confidence::High => "high",
-                crate::mempool::estimate::Confidence::Medium => "medium",
-                crate::mempool::estimate::Confidence::Low => "low",
-            };
+        for tf in &sf.targets {
             targets_obj.insert(
-                t.to_string(),
+                tf.target.to_string(),
                 serde_json::json!({
-                    "feerate": format_feerate_sat_per_kvb(*rate_kvb, unit),
-                    "confidence": conf_str,
+                    "feerate": format_feerate_sat_per_kvb(tf.feerate_sat_per_kvb, unit),
+                    "confidence": tf.confidence.as_str(),
                 }),
             );
         }
 
-        let histogram: Vec<serde_json::Value> = mempool_est
+        let histogram: Vec<serde_json::Value> = sf
             .histogram
             .iter()
             .map(|b| {
@@ -1291,40 +1188,14 @@ pub async fn start(
             })
             .collect();
 
-        // economyFee: "cheap but reasonable" — clamp hour rate between
-        // min-relay floor and 2× floor. Hour rate = the deepest target
-        // the caller asked for.
-        let hour_target = targets.iter().copied().max().unwrap_or(24);
-        let hour_rate = match mode {
-            EstimateMode::Historical => ctx
-                .fee_estimator
-                .estimate_fee(hour_target)
-                .unwrap_or(floor_sat_per_kvb),
-            _ => {
-                let (r, _) = crate::mempool::estimate::target_estimate(
-                    &mempool_est,
-                    hour_target,
-                    floor_sat_per_kvb,
-                );
-                r
-            }
-        };
-        // Economy is the cheapest tier shown, so it must sit at or below the
-        // lowest displayed target — never above it (which would invert the
-        // None/Low ordering when the deepest target falls back to historical).
-        let economy_rate =
-            crate::mempool::estimate::economy_feerate_sat_per_kvb(floor_sat_per_kvb, hour_rate)
-                .min(lowest_tier.unwrap_or(u64::MAX));
-        let thin_block = crate::mempool::estimate::is_thin_block(&mempool_est);
-
         let mut response = serde_json::json!({
             "targets": targets_obj,
             "histogram": histogram,
-            "mode": mode.as_str(),
-            "fallback": any_fallback,
-            "mempool_weight": mempool_est.mempool_weight,
-            "economy_feerate": format_feerate_sat_per_kvb(economy_rate, unit),
-            "thin_block": thin_block,
+            "mode": sf.mode.as_str(),
+            "fallback": sf.fallback,
+            "mempool_weight": sf.mempool_weight,
+            "economy_feerate": format_feerate_sat_per_kvb(sf.economy_feerate_sat_per_kvb, unit),
+            "thin_block": sf.thin_block,
         });
         annotate_units(&mut response, unit);
         Ok::<_, ErrorObjectOwned>(response)

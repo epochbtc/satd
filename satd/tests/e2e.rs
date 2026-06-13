@@ -1912,9 +1912,9 @@ fn test_e2e_electrum_merkle_and_id_from_pos_round_trip() {
 fn test_e2e_electrum_estimatefee_and_relayfee() {
     // estimatefee / relayfee are the two fee endpoints every wallet
     // calls before composing a tx. Both return BTC/kB on the wire;
-    // satd's internal unit is sat per 1000 weight units, so a
-    // conversion regression has historically been a 4x error
-    // (see electrum-proto blockchain.rs sat_per_1000_wu_to_btc_per_kb).
+    // satd's internal unit is sat/kvB (per vbyte), so BTC/kB = sat/kvB / 1e8
+    // (see electrum-proto blockchain.rs sat_per_kvb_to_btc_per_kb). A unit
+    // regression here has historically been a 4x error.
     use electrum_client::ElectrumApi;
     let mut e2e = E2eNode::boot_with(&electrum_e2e_args());
     let url = electrum_url_for(&e2e);

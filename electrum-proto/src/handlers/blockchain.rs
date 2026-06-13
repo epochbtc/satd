@@ -735,32 +735,43 @@ pub fn transaction_id_from_pos(
 pub fn estimatefee(state: &ElectrumState, params: Value) -> Result<Value, JsonRpcError> {
     let arr = require_array(&params, 1, "blockchain.estimatefee")?;
     let target = parse_u32(&arr[0], "num_blocks")?;
-    let est = state.fee_estimator.estimate_fee(target);
-    // M1 (review round 1): satd's internal fee_rate unit is
-    // **sat per 1000 weight units** (`fee * 1000 / weight`), NOT
-    // sat/kvB. The Electrum wire returns BTC per kB. Conversion:
-    //   1 vB = 4 WU, so 1000 vB = 4000 WU = 4 × 1000 WU
-    //   sat/(1000 WU) × 4 = sat/(1000 vB) = sat/kvB
-    //   BTC/kB = sat/kvB / 1e8 = (sat/(1000 WU) × 4) / 1e8
-    // Prior code skipped the ×4, underreporting fees by ~4x.
-    Ok(match est {
-        Some(sat_per_1000_wu) => json!(sat_per_1000_wu_to_btc_per_kb(sat_per_1000_wu)),
-        None => json!(-1.0),
-    })
+    // Unified through the shared `smart_fees` resolver (blend mode) so
+    // Electrum agrees with the JSON-RPC `estimatefees`, the TUI and Esplora.
+    let floor_sat_per_kvb = state.mempool.min_fee_rate().max(1_000);
+    let sf = node::mempool::estimate::smart_fees(
+        state.mempool.get_all_entries(),
+        &state.fee_estimator,
+        &[target],
+        node::mempool::estimate::EstimateMode::Blend,
+        floor_sat_per_kvb,
+    );
+    // Electrum convention: `-1` signals "no estimate available". Emit it only
+    // on a cold node — no mempool signal (thin) *and* no historical data.
+    // Otherwise return the blended estimate in BTC/kB.
+    if sf.thin_block && state.fee_estimator.estimate_fee(target).is_none() {
+        return Ok(json!(-1.0));
+    }
+    let sat_per_kvb = sf
+        .targets
+        .first()
+        .map(|t| t.feerate_sat_per_kvb)
+        .unwrap_or(floor_sat_per_kvb);
+    Ok(json!(sat_per_kvb_to_btc_per_kb(sat_per_kvb)))
 }
 
 pub fn relayfee(state: &ElectrumState) -> Result<Value, JsonRpcError> {
-    // Same conversion as `estimatefee` — sat/(1000 WU) → BTC/kB.
-    // `min_fee_rate` is the mempool's admission policy in sat per
-    // 1000 weight units, mirroring `Mempool::accept_transaction`.
-    let sat_per_1000_wu = state.mempool.min_fee_rate();
-    Ok(json!(sat_per_1000_wu_to_btc_per_kb(sat_per_1000_wu)))
+    // `min_fee_rate` is the mempool admission floor in sat/kvB (sat per 1000
+    // *virtual* bytes) since PR #355. Electrum's wire unit is BTC/kB.
+    let sat_per_kvb = state.mempool.min_fee_rate();
+    Ok(json!(sat_per_kvb_to_btc_per_kb(sat_per_kvb)))
 }
 
-/// Convert satd's internal `sat per 1000 weight units` fee rate to
-/// the BTC/kB unit Electrum clients expect on the wire. See M1 above.
-pub(crate) fn sat_per_1000_wu_to_btc_per_kb(sat_per_1000_wu: u64) -> f64 {
-    (sat_per_1000_wu * 4) as f64 / 100_000_000.0
+/// Convert satd's internal sat/kvB (sat per 1000 *virtual* bytes) fee rate to
+/// the BTC/kB unit Electrum clients expect on the wire. For fee-rate purposes
+/// 1 kB ≈ 1 kvB, so `BTC/kB = sat/kvB / 1e8`. (The earlier `×4` was written
+/// for the pre-#355 per-weight-unit value and overreported fees ~4×.)
+pub(crate) fn sat_per_kvb_to_btc_per_kb(sat_per_kvb: u64) -> f64 {
+    sat_per_kvb as f64 / 100_000_000.0
 }
 
 // ── helpers ───────────────────────────────────────────────────────
@@ -878,19 +889,19 @@ mod tests {
 
     #[test]
     fn fee_unit_conversion_matches_known_fixture() {
-        // M1 (review round 1): a 1 sat/vB transaction has internal
-        // `fee * 1000 / weight = 250` (since vB = WU/4). The Electrum
-        // wire expects 0.00001000 BTC/kB = 1 sat/vB × 1000 / 1e8.
-        // Pre-fix, satd returned 0.00000250 — 4x too low.
-        let one_sat_per_vb = 250u64;
-        let btc_per_kb = sat_per_1000_wu_to_btc_per_kb(one_sat_per_vb);
+        // Since PR #355 internal fee rates are sat/kvB (per vbyte): a 1 sat/vB
+        // tx has internal `fee_rate = 1000`, a 10 sat/vB tx `10000`. Electrum
+        // wire is BTC/kB = sat/kvB / 1e8. (The earlier ×4 against the old
+        // per-weight-unit value overreported every rate ~4×.)
+        let one_sat_per_vb = 1000u64;
+        let btc_per_kb = sat_per_kvb_to_btc_per_kb(one_sat_per_vb);
         // Allow tiny float epsilon.
         assert!((btc_per_kb - 0.00001000).abs() < 1e-12, "{btc_per_kb}");
 
-        // 10 sat/vB → internal 2500 → 0.0001 BTC/kB.
-        assert!((sat_per_1000_wu_to_btc_per_kb(2500) - 0.0001).abs() < 1e-12);
+        // 10 sat/vB → internal 10000 → 0.0001 BTC/kB.
+        assert!((sat_per_kvb_to_btc_per_kb(10_000) - 0.0001).abs() < 1e-12);
 
         // 0 / unknown stays 0.
-        assert_eq!(sat_per_1000_wu_to_btc_per_kb(0), 0.0);
+        assert_eq!(sat_per_kvb_to_btc_per_kb(0), 0.0);
     }
 }
