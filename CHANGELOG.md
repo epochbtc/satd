@@ -11,9 +11,16 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
 
 ## [Unreleased]
 
-_Nothing yet — terse bullets land here as user-facing changes merge; full
-detail goes to the in-development
-[`docs/release-notes/0.4.0-pre.md`](docs/release-notes/0.4.0-pre.md)._
+- **Fee estimation reworked.** Fixed inverted smart-fee tiers (now monotone:
+  `High ≥ Medium ≥ Low ≥ economy`); unified `estimatefees`,
+  `estimatesmartfee`, the TUI, the MCP `estimate_fee` tool, Esplora
+  `/fee-estimates`, and Electrum `blockchain.estimatefee` on one shared
+  estimator so they agree; made the per-block floor robust to a single cheap
+  tail transaction; and cache the mempool simulation behind the public fee
+  endpoints. **Corrected a 4× fee over-report** (regression since 0.3.0) on
+  Esplora `/fee-estimates` + `/mempool` fee rates and Electrum
+  `estimatefee`/`relayfee`/`get_fee_histogram` — see the
+  [release notes](docs/release-notes/0.4.0-pre.md) for the upgrade note.
 
 ## Releases
 

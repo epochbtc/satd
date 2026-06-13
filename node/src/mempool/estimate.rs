@@ -104,8 +104,10 @@ impl EstimateMode {
 /// A single simulated block's summary.
 #[derive(Debug, Clone, Serialize)]
 pub struct SimBlock {
-    /// Lowest ancestor-feerate admitted in this block (sat/kvB). Zero if
-    /// the block is empty.
+    /// Representative floor feerate to land in this block (sat/kvB). For a
+    /// full block this is the robust, bottom-trimmed floor (see
+    /// [`weighted_floor_rate`] / [`BLOCK_FLOOR_TRIM_PERCENT`]); for a partial
+    /// block it is the plain cheapest admission. Zero if the block is empty.
     pub min_feerate_sat_per_kvb: u64,
     /// Number of distinct transactions packed (ancestors + roots).
     pub tx_count: usize,
@@ -221,12 +223,17 @@ fn ancestor_aggregate(
 /// - Reject the package if its aggregate sigop cost exceeds
 ///   `MAX_PACKAGE_SIGOPS_COST`; if it would push the block past
 ///   `MAX_BLOCK_SIGOPS_COST`, skip and continue (later packages may fit).
-/// - Record `min_feerate_sat_per_kvb` as the **marginal** feerate at
-///   admission — (fee of not-yet-admitted ancestors + self) /
-///   (weight of not-yet-admitted ancestors + self). This is the
-///   dependencyRate clamp: a descendant whose ancestor was already
-///   pulled in by a sibling only contributes its own weight and fees
-///   to the block's floor, never claiming credit for the sibling's bump.
+/// - Each admission contributes its **marginal** feerate — (fee of
+///   not-yet-admitted ancestors + self) / (weight of those) — paired with
+///   its marginal weight. This is the dependencyRate clamp: a descendant
+///   whose ancestor was already pulled in by a sibling only contributes its
+///   own weight and fees, never claiming credit for the sibling's bump.
+/// - `min_feerate_sat_per_kvb` is then the *robust* floor: the weight-
+///   weighted [`BLOCK_FLOOR_TRIM_PERCENT`]-th percentile of admitted rates
+///   (see [`weighted_floor_rate`]), not the absolute cheapest admission.
+///   Trimming the bottom sliver of weight keeps one cheap tx slipping into
+///   the tail of an otherwise-full block from dragging the next-block
+///   estimate down to ~min-relay.
 fn simulate_one_block(remaining: &HashMap<Txid, MempoolEntry>) -> (SimBlock, HashSet<Txid>) {
     let mut anc_memo: HashMap<Txid, HashSet<Txid>> = HashMap::with_capacity(remaining.len());
     let mut sorted: Vec<(Txid, u64)> = Vec::with_capacity(remaining.len());
@@ -244,7 +251,9 @@ fn simulate_one_block(remaining: &HashMap<Txid, MempoolEntry>) -> (SimBlock, Has
     let mut included: HashSet<Txid> = HashSet::new();
     let mut used_weight: u64 = 0;
     let mut used_sigops: u64 = 0;
-    let mut min_admitted_rate: u64 = 0;
+    // (marginal_rate, marginal_weight) for every admitted package, used to
+    // compute the robust block floor once packing is done.
+    let mut admissions: Vec<(u64, u64)> = Vec::new();
     let mut filled = false;
 
     for (txid, _initial_rate) in sorted {
@@ -279,14 +288,19 @@ fn simulate_one_block(remaining: &HashMap<Txid, MempoolEntry>) -> (SimBlock, Has
             continue;
         }
         if used_sigops.saturating_add(group_sigops) > MAX_BLOCK_SIGOPS_COST {
-            // Block-wide sigop cap reached for this package; skip and try
-            // the next candidate (may be smaller in sigops).
+            // Block-wide sigop cap reached for this package; the block is at a
+            // global capacity limit (like the weight-overflow branch above),
+            // so mark it filled. Smaller-sigop candidates may still squeeze in,
+            // so continue rather than break. Without this, a sigop-bound block
+            // (weight-light but sigop-saturated) would report `filled == false`
+            // and wrongly skip the robust floor trim / be labelled `Medium`.
+            filled = true;
             continue;
         }
         let marginal_rate = crate::mempool::policy::fee_rate_sat_per_kvb(group_fee, group_weight);
         used_weight += group_weight;
         used_sigops += group_sigops;
-        min_admitted_rate = marginal_rate;
+        admissions.push((marginal_rate, group_weight));
         for t in group {
             included.insert(t);
         }
@@ -296,13 +310,55 @@ fn simulate_one_block(remaining: &HashMap<Txid, MempoolEntry>) -> (SimBlock, Has
         }
     }
 
+    // Only a *full* block has a real eviction margin to smooth. A partial
+    // block admitted the entire remaining mempool, so its true floor is the
+    // cheapest admission — anything at min-relay confirms — and trimming
+    // would overcharge. So trim only when filled.
+    let floor_trim = if filled { BLOCK_FLOOR_TRIM_PERCENT } else { 0 };
     let block = SimBlock {
-        min_feerate_sat_per_kvb: min_admitted_rate,
+        min_feerate_sat_per_kvb: weighted_floor_rate(&admissions, floor_trim),
         tx_count: included.len(),
         weight: used_weight,
         filled,
     };
     (block, included)
+}
+
+/// Fraction of admitted block weight (cheapest-first) trimmed before reading
+/// the per-block floor feerate. Trimming the bottom sliver makes the floor
+/// robust to a single cheap tx slipping into the tail of an otherwise-full
+/// block — which would otherwise drag the next-block estimate down to
+/// ~min-relay. 10% filters tail noise with a small conservative bias; on a
+/// partial block (the whole mempool fits) the low rates still dominate, so
+/// the floor correctly lands near the min-relay floor.
+pub const BLOCK_FLOOR_TRIM_PERCENT: u64 = 10;
+
+/// Weight-weighted, bottom-trimmed floor of `(rate, weight)` admissions: the
+/// lowest rate `R` such that the cumulative weight of admissions with rate
+/// `≤ R` reaches `trim_percent`% of the total. Equivalently, the cheapest
+/// rate that survives trimming the bottom `trim_percent`% of weight.
+///
+/// `trim_percent == 0` reduces to the plain minimum admitted rate. A single
+/// admission (or any whose weight alone exceeds the trim threshold) returns
+/// its own rate, so small/chunky blocks are unaffected — only blocks with a
+/// genuine cheap tail get smoothed.
+fn weighted_floor_rate(admissions: &[(u64, u64)], trim_percent: u64) -> u64 {
+    let total: u64 = admissions.iter().map(|(_, w)| *w).sum();
+    if total == 0 {
+        return 0;
+    }
+    let mut sorted: Vec<(u64, u64)> = admissions.to_vec();
+    sorted.sort_by_key(|(rate, _)| *rate);
+    let threshold = total.saturating_mul(trim_percent).div_ceil(100);
+    let mut cum: u64 = 0;
+    for (rate, weight) in &sorted {
+        cum = cum.saturating_add(*weight);
+        if cum >= threshold {
+            return *rate;
+        }
+    }
+    // threshold == total edge: return the heaviest (highest) rate seen.
+    sorted.last().map(|(rate, _)| *rate).unwrap_or(0)
 }
 
 /// Bucket entries by their own (not ancestor) feerate.
@@ -572,12 +628,31 @@ pub fn smart_fees(
     let max_target = targets.iter().copied().max().unwrap_or(24).max(1);
     let sim_depth = (max_target as usize).min(MAX_SIM_DEPTH);
     let mempool_est = estimate_from_mempool(snapshot, sim_depth);
+    smart_fees_from_estimate(&mempool_est, fee_estimator, targets, mode, floor_sat_per_kvb)
+}
+
+/// `smart_fees` against a *prebuilt* mempool simulation, so callers on hot
+/// public surfaces can reuse a cached `MempoolEstimate`
+/// ([`FeeEstimator::cached_mempool_estimate`]) instead of cloning the whole
+/// mempool and re-simulating on every request.
+///
+/// A `MempoolEstimate` simulated to any depth ≥ a target answers that target
+/// identically (the per-block drain is the same regardless of total depth),
+/// so a single estimate built to [`MAX_SIM_DEPTH`] serves every surface.
+pub fn smart_fees_from_estimate(
+    mempool_est: &MempoolEstimate,
+    fee_estimator: &FeeEstimator,
+    targets: &[u32],
+    mode: EstimateMode,
+    floor_sat_per_kvb: u64,
+) -> SmartFees {
+    let max_target = targets.iter().copied().max().unwrap_or(24).max(1);
 
     let mut fallback = false;
     let mut rows: Vec<(u32, u64, Confidence)> = Vec::with_capacity(targets.len());
     for &t in targets {
         let (rate, conf, fb) =
-            resolve_target(&mempool_est, fee_estimator, t, mode, floor_sat_per_kvb);
+            resolve_target(mempool_est, fee_estimator, t, mode, floor_sat_per_kvb);
         fallback |= fb;
         rows.push((t, rate, conf));
     }
@@ -598,7 +673,7 @@ pub fn smart_fees(
         EstimateMode::Historical => fee_estimator
             .estimate_fee(max_target)
             .unwrap_or(floor_sat_per_kvb),
-        _ => target_estimate(&mempool_est, max_target, floor_sat_per_kvb).0,
+        _ => target_estimate(mempool_est, max_target, floor_sat_per_kvb).0,
     };
     let economy = economy_feerate_sat_per_kvb(floor_sat_per_kvb, hour_rate)
         .min(lowest_tier.unwrap_or(u64::MAX));
@@ -615,9 +690,9 @@ pub fn smart_fees(
         economy_feerate_sat_per_kvb: economy,
         mode,
         fallback,
-        thin_block: is_thin_block(&mempool_est),
+        thin_block: is_thin_block(mempool_est),
         mempool_weight: mempool_est.mempool_weight,
-        histogram: mempool_est.histogram,
+        histogram: mempool_est.histogram.clone(),
     }
 }
 
@@ -915,6 +990,9 @@ mod tests {
         let est = estimate_from_mempool(snap, 1);
         // Admit t1 (sigops fit) + t3 (0 sigops). t2 skipped on block cap.
         assert_eq!(est.sim_blocks[0].tx_count, 2);
+        // The block hit the global sigop cap, so it is reported as filled
+        // (so it gets the robust floor trim / High confidence, not Medium).
+        assert!(est.sim_blocks[0].filled, "sigop-bound block must be filled");
     }
 
     #[test]
@@ -1100,6 +1178,83 @@ mod tests {
             assert!(w[0] >= w[1], "blend ladder must be non-increasing: {vals:?}");
         }
         assert!(sf.economy_feerate_sat_per_kvb <= *vals.iter().min().unwrap());
+    }
+
+    #[test]
+    fn weighted_floor_rate_p0_is_plain_min() {
+        let adm = [(50_000u64, 1_000u64), (1_000, 100), (30_000, 1_000)];
+        assert_eq!(weighted_floor_rate(&adm, 0), 1_000);
+        assert_eq!(weighted_floor_rate(&[], 10), 0);
+        assert_eq!(weighted_floor_rate(&[(7_000u64, 500u64)], 10), 7_000);
+    }
+
+    #[test]
+    fn weighted_floor_rate_trims_small_cheap_tail() {
+        // 99% of weight at 50_000, 1% at 1_000: P10 trims the cheap straggler,
+        // P0 surfaces it.
+        let adm = [(50_000u64, 9_900u64), (1_000, 100)];
+        assert_eq!(weighted_floor_rate(&adm, 10), 50_000);
+        assert_eq!(weighted_floor_rate(&adm, 0), 1_000);
+    }
+
+    #[test]
+    fn weighted_floor_rate_keeps_cheap_when_backed_by_weight() {
+        // A cheap rate backed by >10% of weight is real supply, not noise —
+        // it must NOT be trimmed.
+        let adm = [(50_000u64, 1_000u64), (1_000, 1_000)];
+        assert_eq!(weighted_floor_rate(&adm, 10), 1_000);
+    }
+
+    #[test]
+    fn full_block_floor_trims_cheap_tail() {
+        // A full block packed with high-fee weight plus one cheap tx that
+        // slips into the tail. The robust floor reports the competitive rate
+        // (50 sat/vB), not the 1 sat/vB straggler — which a plain min would.
+        let big_w = 1_300_000usize; // 3 of these ≈ 3.9 Mwu, just under the cap
+        let mk_high = |seed: u8| {
+            let tx = mk_tx(&[(random_txid(seed), 0)], 1);
+            let id = tx.compute_txid();
+            let fee = crate::mempool::policy::weight_to_vsize(big_w as u64) * 50; // 50 sat/vB
+            (id, mk_entry(tx, fee, big_w))
+        };
+        let (h1, e1) = mk_high(1);
+        let (h2, e2) = mk_high(2);
+        let (h3, e3) = mk_high(3);
+        let (h4, e4) = mk_high(4); // a 4th that won't fit → forces `filled`
+        // One cheap tx (~1.3% of block weight) at 1 sat/vB.
+        let cheap_w = 50_000usize;
+        let ctx = mk_tx(&[(random_txid(9), 0)], 1);
+        let cid = ctx.compute_txid();
+        let cfee = crate::mempool::policy::weight_to_vsize(cheap_w as u64); // 1 sat/vB
+        let centry = mk_entry(ctx, cfee, cheap_w);
+
+        let est = estimate_from_mempool(
+            vec![(h1, e1), (h2, e2), (h3, e3), (h4, e4), (cid, centry)],
+            1,
+        );
+        let b0 = &est.sim_blocks[0];
+        assert!(b0.filled, "block 0 should be full");
+        assert_eq!(b0.min_feerate_sat_per_kvb, 50_000, "cheap 1% tail trimmed");
+    }
+
+    #[test]
+    fn partial_block_floor_keeps_cheapest() {
+        // When the whole mempool fits in one block (partial), the floor is the
+        // genuine cheapest admission — trimming there would overcharge.
+        let weight = (THIN_BLOCK_WEIGHT_THRESHOLD as usize) + 1; // non-thin, not full
+        let big = mk_tx(&[(random_txid(1), 0)], 1);
+        let bid = big.compute_txid();
+        let bfee = crate::mempool::policy::weight_to_vsize(weight as u64) * 50;
+        let cheap = mk_tx(&[(random_txid(2), 0)], 1);
+        let cid = cheap.compute_txid();
+        let cfee = crate::mempool::policy::weight_to_vsize(400); // tiny, 1 sat/vB
+        let est = estimate_from_mempool(
+            vec![(bid, mk_entry(big, bfee, weight)), (cid, mk_entry(cheap, cfee, 400))],
+            1,
+        );
+        let b0 = &est.sim_blocks[0];
+        assert!(!b0.filled, "block 0 should be partial (whole mempool fits)");
+        assert_eq!(b0.min_feerate_sat_per_kvb, 1_000, "partial block keeps cheapest");
     }
 
     #[test]

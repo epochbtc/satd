@@ -737,9 +737,12 @@ pub fn estimatefee(state: &ElectrumState, params: Value) -> Result<Value, JsonRp
     let target = parse_u32(&arr[0], "num_blocks")?;
     // Unified through the shared `smart_fees` resolver (blend mode) so
     // Electrum agrees with the JSON-RPC `estimatefees`, the TUI and Esplora.
+    // Unauthenticated surface, so the expensive mempool simulation comes from
+    // the shared short-TTL cache instead of being rebuilt per request.
     let floor_sat_per_kvb = state.mempool.min_fee_rate().max(1_000);
-    let sf = node::mempool::estimate::smart_fees(
-        state.mempool.get_all_entries(),
+    let est = state.fee_estimator.cached_mempool_estimate(&state.mempool);
+    let sf = node::mempool::estimate::smart_fees_from_estimate(
+        &est,
         &state.fee_estimator,
         &[target],
         node::mempool::estimate::EstimateMode::Blend,

@@ -1,4 +1,18 @@
-use parking_lot::RwLock;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use parking_lot::{Mutex, RwLock};
+
+use crate::mempool::estimate::{MAX_SIM_DEPTH, MempoolEstimate, estimate_from_mempool};
+use crate::mempool::pool::Mempool;
+
+/// TTL for the cached mempool fee simulation. The simulation (a full mempool
+/// clone + up to `MAX_SIM_DEPTH` block packs) is identical across surfaces and
+/// across closely-spaced requests; caching it bounds how much work an
+/// unauthenticated caller on a public surface (Esplora `/fee-estimates`,
+/// Electrum `blockchain.estimatefee`) can force, while keeping estimates fresh
+/// enough — fees don't move meaningfully within a few seconds.
+pub const FEE_SIM_CACHE_TTL: Duration = Duration::from_secs(3);
 
 /// Simple fee rate estimator.
 /// Tracks recent block fee rates and returns percentile-based estimates
@@ -8,6 +22,10 @@ pub struct FeeEstimator {
     recent_rates: RwLock<Vec<u64>>,
     /// Maximum number of fee rate samples to retain.
     max_samples: usize,
+    /// Short-TTL cache of the mempool block simulation, shared across every
+    /// fee surface (they all hold the same `Arc<FeeEstimator>`). See
+    /// [`FeeEstimator::cached_mempool_estimate`].
+    sim_cache: Mutex<Option<(Instant, Arc<MempoolEstimate>)>>,
 }
 
 impl Default for FeeEstimator {
@@ -21,7 +39,34 @@ impl FeeEstimator {
         Self {
             recent_rates: RwLock::new(Vec::new()),
             max_samples: 100_000,
+            sim_cache: Mutex::new(None),
         }
+    }
+
+    /// The mempool block simulation, memoized with [`FEE_SIM_CACHE_TTL`].
+    ///
+    /// On a cache miss this clones the entire mempool (`get_all_entries`) and
+    /// runs the block packer to `MAX_SIM_DEPTH` — expensive enough that doing
+    /// it per request on an unauthenticated endpoint is a DoS amplifier.
+    /// Within the TTL, callers share one `Arc<MempoolEstimate>`. The mutex is
+    /// held across the rebuild so concurrent callers past expiry queue behind a
+    /// single simulation (no thundering herd), mirroring the Electrum fee
+    /// histogram cache. The estimate is always built to `MAX_SIM_DEPTH`, which
+    /// answers every target identically regardless of how shallow it is.
+    pub fn cached_mempool_estimate(&self, mempool: &Mempool) -> Arc<MempoolEstimate> {
+        let mut guard = self.sim_cache.lock();
+        let now = Instant::now();
+        if let Some((stamped, cached)) = guard.as_ref()
+            && now.duration_since(*stamped) < FEE_SIM_CACHE_TTL
+        {
+            return cached.clone();
+        }
+        let fresh = Arc::new(estimate_from_mempool(
+            mempool.get_all_entries(),
+            MAX_SIM_DEPTH,
+        ));
+        *guard = Some((now, fresh.clone()));
+        fresh
     }
 
     /// Record fee rates from a confirmed block.
@@ -80,6 +125,19 @@ mod tests {
         est.record_block(&[400, 500, 600, 700, 800, 900]);
         // Now 9 samples — still not enough
         assert_eq!(est.estimate_fee(1), None);
+    }
+
+    #[test]
+    fn cached_mempool_estimate_is_shared_within_ttl() {
+        let est = FeeEstimator::new();
+        let mempool = Mempool::new(300_000_000, 1_000);
+        let a = est.cached_mempool_estimate(&mempool);
+        let b = est.cached_mempool_estimate(&mempool);
+        // Second call within the TTL returns the same cached Arc — no
+        // re-simulation, no second mempool clone.
+        assert!(Arc::ptr_eq(&a, &b), "estimate must be cached within the TTL");
+        // And it is a usable (empty-mempool) simulation.
+        assert!(a.sim_blocks.iter().all(|blk| blk.tx_count == 0));
     }
 
     #[test]
