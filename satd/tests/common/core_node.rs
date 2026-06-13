@@ -1,12 +1,13 @@
 // A real Bitcoin Core (`bitcoind`) regtest node, spawned in Docker, for the
-// Phase C live differential harness (`tests/phase_c_differential.rs`).
+// live-Core block-acceptance differential harness
+// (`tests/core_block_differential.rs`).
 //
-// Phase B (`node/tests/feature_block_consensus.rs`) pins satd's block-
-// acceptance verdicts against Core reasons *hand-transcribed* from
-// `feature_block.py`. Phase C runs the same adversarial blocks/txs against a
-// *live* Core and asserts satd reaches the identical verdict — Core is the
-// oracle, observed at runtime rather than baked in. This module is the Core
-// half of that harness.
+// The static matrix (`node/tests/feature_block_consensus.rs`) pins satd's
+// block-acceptance verdicts against Core reasons *hand-transcribed* from
+// `feature_block.py`. The live differential runs the same adversarial
+// blocks/txs against a *live* Core and asserts satd reaches the identical
+// verdict — Core is the oracle, observed at runtime rather than baked in. This
+// module is the Core half of that harness.
 //
 // Provisioning mirrors the existing Bitcoin Core interop canary
 // (`scripts/canary/core-interop-smoke.sh`): the same pinned image
@@ -59,19 +60,19 @@ pub struct CoreNode {
 impl CoreNode {
     /// Spawn a fresh regtest `bitcoind` in Docker and block until its RPC is
     /// answering. Panics (failing the test) if Docker is unavailable or Core
-    /// never comes up — Phase C is gated only where Docker is provisioned, so
+    /// never comes up — the differential is gated only where Docker is provisioned, so
     /// a missing daemon is a setup error, not a skip.
     pub fn start() -> Self {
         let rpc_port = find_available_port();
         // Core still wants a P2P port even with listening disabled; give it a
         // unique one so parallel harnesses never collide on the default 18444.
         let p2p_port = find_available_port();
-        let user = "phasec";
+        let user = "blockdiff";
         // Loopback-only regtest container — the password just has to match
         // between `docker run` and the client; uniqueness avoids confusion in
         // logs when several runs overlap.
         let pass = format!("pw-{}", rpc_port);
-        let container = format!("satd-phasec-core-{}-{}", std::process::id(), rpc_port);
+        let container = format!("satd-blockdiff-core-{}-{}", std::process::id(), rpc_port);
 
         // Best-effort cleanup of any stale container with this exact name
         // (only possible after a hard crash that skipped Drop).

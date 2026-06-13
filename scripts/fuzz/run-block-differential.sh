@@ -1,6 +1,6 @@
 #!/bin/bash
-# Phase C Layer 2 — run the in-process consensus fuzzer with a live Bitcoin
-# Core oracle. Needs a nightly toolchain, cargo-fuzz, and Docker.
+# Block-acceptance differential fuzz — run the in-process consensus fuzzer with
+# a live Bitcoin Core oracle. Needs a nightly toolchain, cargo-fuzz, and Docker.
 #
 #   MAX_TOTAL_TIME=300 scripts/fuzz/run-block-differential.sh
 #

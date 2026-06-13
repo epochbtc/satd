@@ -1,19 +1,19 @@
-//! Phase C — live block-acceptance differential against a real Bitcoin Core.
+//! Live block-acceptance differential against a real Bitcoin Core.
 //!
-//! Phase B (`node/tests/feature_block_consensus.rs`) pins satd's block- and
-//! tx-level verdicts against Core reasons *hand-transcribed* from
-//! `feature_block.py`. Phase C runs the same family of adversarial blocks /
-//! transactions against a **live** `bitcoind` (spawned in Docker, see
-//! `common::core_node`) and asserts satd reaches the *identical* verdict —
-//! Core is the oracle, observed at runtime rather than baked in.
+//! The static feature_block matrix (`node/tests/feature_block_consensus.rs`)
+//! pins satd's block- and tx-level verdicts against Core reasons
+//! *hand-transcribed* from `feature_block.py`. This test runs the same family
+//! of adversarial blocks / transactions against a **live** `bitcoind` (spawned
+//! in Docker, see `common::core_node`) and asserts satd reaches the *identical*
+//! verdict — Core is the oracle, observed at runtime rather than baked in.
 //!
-//! What this adds over Phase B:
+//! What this adds over the static matrix:
 //!   1. It exercises satd's REAL composite acceptance path (`accept_block`,
 //!      reached through the `submitblock` RPC), not the unit functions
 //!      `check_block` / `connect_block` called in isolation.
-//!   2. It re-validates the hand-transcribed Phase-B reject strings against a
-//!      real Core, and reports (without failing) when the live reason differs
-//!      from the baked constant — e.g. wording drift across a Core version.
+//!   2. It re-validates the hand-transcribed reject strings against a real
+//!      Core, and reports (without failing) when the live reason differs from
+//!      the baked constant — e.g. wording drift across a Core version.
 //!
 //! ## How a verdict is obtained
 //!
@@ -37,24 +37,25 @@
 //! ## Classification
 //!
 //!   * both accept                          → match
-//!   * both reject, same reason             → match (+ cross-check vs Phase B)
+//!   * both reject, same reason             → match (+ cross-check vs matrix)
 //!   * both reject, documented label diff   → match (pinned `ReasonDiffers`)
 //!   * both reject, undeclared diff reason  → REASON DIVERGENCE (fail)
 //!   * one accepts, the other rejects       → CONSENSUS DIVERGENCE (fail)
 //!   * either returns a connectivity verdict → HARNESS BUG (fail)
 //!
-//! A handful of Phase-B cases are intentionally NOT reachable through the live
-//! RPC oracle (Core's `submitblock` coinbase pre-check, the zero-input SegWit-
-//! marker collision) and stay Phase-B-only; see the NOTEs by the case bodies.
+//! A handful of static-matrix cases are intentionally NOT reachable through the
+//! live RPC oracle (Core's `submitblock` coinbase pre-check, the zero-input
+//! SegWit-marker collision) and stay matrix-only; see the NOTEs by the case
+//! bodies.
 //!
 //! ## Gating
 //!
-//! Requires Docker (to spawn Core). Behind the `phase-c` feature so
-//! `cargo test --all` skips it; the dedicated canary job enables it. Run
-//! locally with:
-//!   `cargo test --test phase_c_differential --features phase-c -- --nocapture`
+//! Requires Docker (to spawn Core). Behind the `core-block-differential`
+//! feature so `cargo test --all` skips it; the dedicated canary job enables it.
+//! Run locally with:
+//!   `cargo test --test core_block_differential --features core-block-differential -- --nocapture`
 
-#![cfg(feature = "phase-c")]
+#![cfg(feature = "core-block-differential")]
 
 mod common;
 
@@ -387,14 +388,15 @@ enum Submission {
 struct Case {
     name: &'static str,
     category: &'static str,
-    /// The Core reject reason Phase B baked from `feature_block.py` (None =
-    /// accept). Used only to cross-check live Core against the static matrix;
-    /// a mismatch is reported, not failed.
-    phase_b: Option<&'static str>,
+    /// The Core reject reason the static matrix baked from `feature_block.py`
+    /// (None = accept). Used only to cross-check live Core against the static
+    /// matrix; a mismatch is reported, not failed.
+    matrix_reason: Option<&'static str>,
     /// A *documented* reject-label difference: both nodes reject (consensus
     /// agrees the input is invalid) but Core emits a different — usually less
     /// specific — reason string than satd. Set to the exact string Core emits.
-    /// This is the `Expect::ReasonDiffers` disposition from Phase B: it proves
+    /// This is the `Expect::ReasonDiffers` disposition from the static matrix:
+    /// it proves
     /// satd rejects what Core rejects, while pinning the known label gap so a
     /// *new* divergence still fails. `None` demands exact reason parity.
     core_reason_differs: Option<&'static str>,
@@ -429,7 +431,7 @@ fn is_connectivity(o: &Outcome) -> bool {
 // pre-checks "block starts with a coinbase" and returns an RPC error
 // (`-22 "Block does not start with a coinbase"`) BEFORE consensus validation,
 // so these context-free verdicts can't be observed through the submitblock
-// oracle. Phase B covers them against `check_block` directly. (satd's
+// oracle. The static matrix covers them against `check_block` directly. (satd's
 // submitblock runs full validation and returns the consensus reason — a minor
 // RPC-wrapper difference, tracked in the monorepo findings, not a consensus
 // divergence.)
@@ -507,7 +509,7 @@ fn c_merkle_mutation(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
 // (`...00...`), so Core's deserializer rejects the bytes as malformed
 // (`-22 "TX decode failed … at least one input"`) rather than reaching
 // `CheckTransaction`. It is unrepresentable on the wire as a non-witness tx.
-// Phase B covers it against `check_transaction` directly.
+// The static matrix covers it against `check_transaction` directly.
 
 fn c_tx_no_outputs(_ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
     Submission::Tx(Transaction {
@@ -694,10 +696,10 @@ fn cases() -> Vec<Case> {
     fn case(
         name: &'static str,
         category: &'static str,
-        phase_b: Option<&'static str>,
+        matrix_reason: Option<&'static str>,
         build: fn(&Ctx, &mut Vec<usize>) -> Submission,
     ) -> Case {
-        Case { name, category, phase_b, core_reason_differs: None, build }
+        Case { name, category, matrix_reason, core_reason_differs: None, build }
     }
     vec![
         // context-free block structure
@@ -732,7 +734,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "bip68_sequence_not_met",
             category: "contextual",
-            phase_b: Some("bad-txns-nonBIP68-final"),
+            matrix_reason: Some("bad-txns-nonBIP68-final"),
             core_reason_differs: Some("bad-txns-nonfinal"),
             build: c_bip68_sequence_not_met,
         },
@@ -746,7 +748,7 @@ fn cases() -> Vec<Case> {
 // ── the test ───────────────────────────────────────────────────────────
 
 #[test]
-fn phase_c_live_differential() {
+fn core_block_live_differential() {
     pull_core_image();
     let mut satd = TestNode::start(&[]);
     let core = CoreNode::start();
@@ -768,10 +770,10 @@ fn phase_c_live_differential() {
     }
 
     let mut report = String::from(
-        "\nPhase C live differential (satd vs Bitcoin Core, submitblock/testmempoolaccept)\n",
+        "\nLive-Core block-acceptance differential (satd vs Bitcoin Core, submitblock/testmempoolaccept)\n",
     );
     let mut failures: Vec<String> = Vec::new();
-    let mut phase_b_notes: Vec<String> = Vec::new();
+    let mut matrix_reason_notes: Vec<String> = Vec::new();
     // Index 0 (coinbase at height 1) was consumed by the funding block.
     let mut used_coinbases: Vec<usize> = vec![0];
 
@@ -807,13 +809,13 @@ fn phase_c_live_differential() {
             }
             (Outcome::Reject(a), Outcome::Reject(b)) if a == b => {
                 report.push_str(&format!("✓ [{:<16}] {:<32} reject({a}) == Core\n", case.category, case.name));
-                // Cross-check the live Core reason against Phase B's baked
-                // constant. A mismatch is informational (e.g. wording moved
-                // across a Core version), not a failure.
-                if case.phase_b.is_some_and(|pb| pb != a) {
-                    phase_b_notes.push(format!(
-                        "{}: live Core reason `{a}` differs from Phase-B constant `{:?}`",
-                        case.name, case.phase_b
+                // Cross-check the live Core reason against the static matrix's
+                // baked constant. A mismatch is informational (e.g. wording
+                // moved across a Core version), not a failure.
+                if case.matrix_reason.is_some_and(|pb| pb != a) {
+                    matrix_reason_notes.push(format!(
+                        "{}: live Core reason `{a}` differs from static-matrix constant `{:?}`",
+                        case.name, case.matrix_reason
                     ));
                 }
             }
@@ -848,14 +850,14 @@ fn phase_c_live_differential() {
     }
 
     report.push_str(&format!("\n{} cases, {} failures\n", cases().len(), failures.len()));
-    if !phase_b_notes.is_empty() {
-        report.push_str("\nPhase-B constant cross-check notes (informational):\n");
-        for n in &phase_b_notes {
+    if !matrix_reason_notes.is_empty() {
+        report.push_str("\nStatic-matrix constant cross-check notes (informational):\n");
+        for n in &matrix_reason_notes {
             report.push_str(&format!("  • {n}\n"));
         }
     }
     println!("{report}");
 
     satd.stop();
-    assert!(failures.is_empty(), "Phase C differential divergences:\n{}", failures.join("\n"));
+    assert!(failures.is_empty(), "Block-acceptance differential divergences:\n{}", failures.join("\n"));
 }

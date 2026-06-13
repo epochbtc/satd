@@ -7,9 +7,10 @@
 
 #![allow(dead_code)]
 
-/// A real Bitcoin Core node (Docker) for the Phase C live differential
-/// harness. Each integration-test binary compiles its own copy of `common`;
-/// binaries that don't use it just carry the (allow-dead-code) module.
+/// A real Bitcoin Core node (Docker) for the live-Core block-acceptance
+/// differential harness. Each integration-test binary compiles its own copy
+/// of `common`; binaries that don't use it just carry the (allow-dead-code)
+/// module.
 pub mod core_node;
 
 /// Real gRPC + WS/SSE clients for the streaming Consumption-API E2E suite

@@ -1,5 +1,5 @@
-//! Phase C Layer 2 — in-process consensus fuzzer with a live Bitcoin Core
-//! oracle.
+//! Block-acceptance differential fuzz — in-process consensus fuzzer with a
+//! live Bitcoin Core oracle.
 //!
 //! libFuzzer mutates raw bytes; we deserialize them as a `Block`, fix the
 //! header connectivity fields so the block builds on the shared genesis tip
@@ -20,7 +20,7 @@
 //! *different* first-fault reject reasons depending on internal check order —
 //! that is NOT a consensus bug. Verdict (accept/reject) agreement is the
 //! consensus invariant; reason-string parity is asserted only by the curated
-//! single-fault cases in Layer 1 (`phase_c_differential.rs`).
+//! single-fault cases in the curated differential (`core_block_differential.rs`).
 //!
 //! Connectivity / duplicate verdicts from Core (a valid mutant already
 //! accepted as a side block, or a `submitblock` RPC pre-check error) are
@@ -247,9 +247,9 @@ fuzz_target!(|data: &[u8]| {
     };
 
     if satd != core {
-        eprintln!("=== PHASE C FUZZ CONSENSUS DIVERGENCE ===");
+        eprintln!("=== BLOCK-DIFFERENTIAL FUZZ CONSENSUS DIVERGENCE ===");
         eprintln!("satd_accept={satd} core_accept={core}");
         eprintln!("block_hex={hex}");
-        panic!("phase-c fuzz: satd and Core disagree on block acceptance (satd={satd}, core={core})");
+        panic!("block-differential fuzz: satd and Core disagree on block acceptance (satd={satd}, core={core})");
     }
 });
