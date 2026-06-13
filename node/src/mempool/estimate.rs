@@ -349,15 +349,28 @@ pub fn estimate_from_mempool(
     }
 }
 
-/// Extract per-target estimated feerate with confidence.
+/// Extract the estimated feerate (with confidence) to confirm a tx
+/// *within* `target` blocks.
 ///
-/// `target` is a 1-indexed block number: target=1 means "land in next
-/// block". For each target we look at `sim_blocks[target - 1]`.
+/// `target` is a 1-indexed block number: target=1 means "land in the next
+/// block". The estimate is the cheapest feerate that lands a tx in *any*
+/// of the first `target` simulated blocks — i.e. the running minimum of
+/// the per-block admission floors over `sim_blocks[0..target]`:
 ///
-/// - Fully-filled block → `High` confidence, min admitted rate.
-/// - Partially-filled block → `Medium`, either the min admitted or the
-///   caller's min-relay floor (whichever is higher).
-/// - Empty simulated block → `Low`, floor to `floor_sat_per_kvb`.
+/// - Fully-filled block → `High` confidence, its min admitted rate.
+/// - Partially-filled block → `Medium`, min admitted rate or floor.
+/// - Empty simulated block → `Low`, floor (the queue clears by here, so
+///   anything at min-relay confirms within `target`).
+///
+/// Taking the running minimum is what makes the estimate **monotonically
+/// non-increasing** in `target`: confirming within N+k blocks can never
+/// cost more than confirming within N. A single per-block floor is *not*
+/// monotone — greedy packing under the weight/sigop caps can defer a
+/// high-feerate package past block 1, leaving a later block with a higher
+/// admission floor than an earlier one. Reading one block per target then
+/// produces a nonsensical ladder (e.g. next-block < ~30-min). The running
+/// minimum collapses that to the honest answer: if a cheap tx made it into
+/// an early block, every deeper target is at least as cheap.
 ///
 /// If the first simulated block is "thin" (below
 /// `THIN_BLOCK_WEIGHT_THRESHOLD`), short targets (1..=3) collapse to
@@ -372,23 +385,54 @@ pub fn target_estimate(
     if target <= 3 && is_thin_block(estimate) {
         return (floor_sat_per_kvb, Confidence::Low);
     }
-    let idx = target.saturating_sub(1) as usize;
-    let Some(block) = estimate.sim_blocks.get(idx) else {
-        return (floor_sat_per_kvb, Confidence::Low);
-    };
-    if block.tx_count == 0 {
-        return (floor_sat_per_kvb, Confidence::Low);
+    let upto = target as usize;
+    let mut best: Option<(u64, Confidence)> = None;
+    for i in 0..upto {
+        let Some(block) = estimate.sim_blocks.get(i) else {
+            break;
+        };
+        let (rate, conf) = if block.tx_count == 0 {
+            (floor_sat_per_kvb, Confidence::Low)
+        } else if block.filled {
+            (
+                block.min_feerate_sat_per_kvb.max(floor_sat_per_kvb),
+                Confidence::High,
+            )
+        } else {
+            (
+                block.min_feerate_sat_per_kvb.max(floor_sat_per_kvb),
+                Confidence::Medium,
+            )
+        };
+        // Keep the cheapest block in the window; its confidence is the
+        // confidence of the block a tx at this rate would actually land in.
+        if best.is_none_or(|(b, _)| rate < b) {
+            best = Some((rate, conf));
+        }
     }
-    if block.filled {
-        return (
-            block.min_feerate_sat_per_kvb.max(floor_sat_per_kvb),
-            Confidence::High,
-        );
+    best.unwrap_or((floor_sat_per_kvb, Confidence::Low))
+}
+
+/// Clamp a set of `(target_blocks, rate_sat_per_kvb)` rows so the rate is
+/// monotonically non-increasing as the confirmation target deepens.
+///
+/// [`target_estimate`] already guarantees this for a single estimator, but
+/// the `estimatefees` / `estimatesmartfee` *blend* mode can source adjacent
+/// targets from different estimators (mempool simulation vs. historical
+/// percentile vs. the min-relay floor). Mixing sources can reintroduce an
+/// inverted ladder, so this is the single belt-and-suspenders pass that
+/// guarantees callers a sane High ≥ Medium ≥ Low ordering regardless of
+/// where each tier's number came from. Mutates `rows` in place, clamping
+/// each target down to the running minimum in ascending-target order;
+/// confidence labels (held separately by the caller) are left untouched.
+pub fn enforce_monotone_by_target(rows: &mut [(u32, u64)]) {
+    let mut order: Vec<usize> = (0..rows.len()).collect();
+    order.sort_by_key(|&i| rows[i].0);
+    let mut running_min = u64::MAX;
+    for i in order {
+        running_min = running_min.min(rows[i].1);
+        rows[i].1 = running_min;
     }
-    (
-        block.min_feerate_sat_per_kvb.max(floor_sat_per_kvb),
-        Confidence::Medium,
-    )
 }
 
 /// True when the simulated next block is thinly filled — i.e., below
@@ -715,5 +759,107 @@ mod tests {
         assert_eq!(economy_feerate_sat_per_kvb(floor, 3_000), 3_000);
         // Hour rate above 2× floor → clamped at 2× floor.
         assert_eq!(economy_feerate_sat_per_kvb(floor, 100_000), 2 * floor);
+    }
+
+    /// Build a non-thin `MempoolEstimate` from explicit per-block
+    /// (rate, filled, tx_count) triples, for exercising `target_estimate`
+    /// directly without driving the whole simulator.
+    fn estimate_from_blocks(blocks: &[(u64, bool, usize)]) -> MempoolEstimate {
+        MempoolEstimate {
+            sim_blocks: blocks
+                .iter()
+                .map(|&(rate, filled, txs)| SimBlock {
+                    min_feerate_sat_per_kvb: rate,
+                    tx_count: txs,
+                    // Above the thin threshold so the short-target guard is off.
+                    weight: THIN_BLOCK_WEIGHT_THRESHOLD + 1,
+                    filled,
+                })
+                .collect(),
+            histogram: Vec::new(),
+            mempool_weight: THIN_BLOCK_WEIGHT_THRESHOLD + 1,
+        }
+    }
+
+    #[test]
+    fn target_estimate_is_monotone_when_sim_blocks_invert() {
+        // A later block carries a HIGHER admission floor than an earlier
+        // one — exactly the sigop/weight-deferral artifact that produced
+        // the inverted "High 1.0 / Medium 6.0 / Low 4.2" TUI ladder.
+        let est = estimate_from_blocks(&[
+            (1_000, false, 5), // block 0: a cheap tail tx slipped in
+            (5_000, false, 5), // block 1
+            (6_000, false, 5), // block 2: inverted — above block 0
+            (4_200, false, 5), // block 3
+            (4_200, false, 5),
+            (4_200, false, 5),
+        ]);
+        let (r1, _) = target_estimate(&est, 1, 1_000);
+        let (r3, _) = target_estimate(&est, 3, 1_000);
+        let (r6, _) = target_estimate(&est, 6, 1_000);
+        assert!(
+            r1 >= r3 && r3 >= r6,
+            "tiers must be non-increasing: {r1} {r3} {r6}"
+        );
+        // The cheap block-0 tail honestly floors every deeper target: if a
+        // 1.0 sat/vB tx confirms next block, it confirms within 3 and 6 too.
+        assert_eq!((r1, r3, r6), (1_000, 1_000, 1_000));
+    }
+
+    #[test]
+    fn target_estimate_preserves_descending_ladder() {
+        // A clean drain (rates fall block over block) is already monotone;
+        // the running minimum must leave it intact and keep confidence from
+        // the block a tx would land in.
+        let est = estimate_from_blocks(&[
+            (50_000, true, 5),
+            (30_000, true, 5),
+            (20_000, false, 5),
+            (10_000, false, 5),
+            (10_000, false, 5),
+            (8_000, false, 5),
+        ]);
+        let (r1, c1) = target_estimate(&est, 1, 1_000);
+        let (r3, _) = target_estimate(&est, 3, 1_000);
+        let (r6, _) = target_estimate(&est, 6, 1_000);
+        assert_eq!((r1, c1), (50_000, Confidence::High));
+        assert_eq!(r3, 20_000); // min(50k, 30k, 20k)
+        assert_eq!(r6, 8_000);
+        assert!(r1 >= r3 && r3 >= r6);
+    }
+
+    #[test]
+    fn target_estimate_empty_block_in_window_floors_deeper_targets() {
+        // Block 0 is a full, pricey block; block 1 is empty (queue clears).
+        // Confirming within 2 blocks then costs only the floor.
+        let est = estimate_from_blocks(&[(50_000, true, 5), (0, false, 0), (0, false, 0)]);
+        let (r1, c1) = target_estimate(&est, 1, 1_000);
+        let (r2, c2) = target_estimate(&est, 2, 1_000);
+        assert_eq!((r1, c1), (50_000, Confidence::High));
+        assert_eq!((r2, c2), (1_000, Confidence::Low));
+    }
+
+    #[test]
+    fn enforce_monotone_by_target_clamps_inversions() {
+        // Mixed-source ladder (as blend can emit): clamp deeper targets
+        // down to the running minimum. Order of input rows is irrelevant —
+        // clamping is by target value, not position.
+        let mut rows = vec![(6u32, 4_200u64), (1, 1_000), (24, 8_000), (3, 6_000)];
+        enforce_monotone_by_target(&mut rows);
+        // Sort by target to read the resulting ladder.
+        rows.sort_by_key(|r| r.0);
+        let rates: Vec<u64> = rows.iter().map(|r| r.1).collect();
+        // target 1 = 1_000; everything deeper clamped to ≤ that.
+        assert_eq!(rates, vec![1_000, 1_000, 1_000, 1_000]);
+    }
+
+    #[test]
+    fn enforce_monotone_by_target_keeps_healthy_ladder() {
+        let mut rows = vec![(1u32, 50_000u64), (3, 30_000), (6, 20_000), (24, 5_000)];
+        enforce_monotone_by_target(&mut rows);
+        assert_eq!(
+            rows,
+            vec![(1, 50_000), (3, 30_000), (6, 20_000), (24, 5_000)]
+        );
     }
 }

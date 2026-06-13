@@ -949,9 +949,18 @@ fn test_estimatefees_default_shape() {
     assert!(result["economy_feerate"].as_f64().unwrap() > 0.0);
 
     let targets = result["targets"].as_object().unwrap();
+    let mut prev_rate = f64::INFINITY;
     for key in ["1", "3", "6", "12", "24"] {
         let t = &targets[key];
-        assert!(t["feerate"].as_f64().unwrap() > 0.0);
+        let rate = t["feerate"].as_f64().unwrap();
+        assert!(rate > 0.0);
+        // The ladder must be monotonically non-increasing: a deeper
+        // confirmation target can never cost more than a shallower one.
+        assert!(
+            rate <= prev_rate,
+            "fee tiers must not invert: target {key} = {rate} > previous {prev_rate}"
+        );
+        prev_rate = rate;
         let conf = t["confidence"].as_str().unwrap();
         assert!(
             matches!(conf, "high" | "medium" | "low"),
@@ -959,6 +968,11 @@ fn test_estimatefees_default_shape() {
             conf
         );
     }
+    // Economy is the cheapest tier — never above the deepest (24-block) target.
+    assert!(
+        result["economy_feerate"].as_f64().unwrap() <= targets["24"]["feerate"].as_f64().unwrap(),
+        "economy_feerate must not exceed the deepest target"
+    );
 
     // Histogram is a JSON array (may be empty when mempool is empty).
     assert!(result["histogram"].is_array());
