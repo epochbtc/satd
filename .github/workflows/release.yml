@@ -247,7 +247,11 @@ jobs:
             clang \
             cmake \
             libclang-dev \
-            pkg-config
+            pkg-config \
+            llvm
+          # `llvm` provides llvm-objcopy, used by the staging step to split
+          # debug info. It's multi-arch, so it can split the cross-built
+          # aarch64 ELF that a host x86 GNU objcopy would reject.
 
       # macOS: librocksdb-sys's build-script binary is linked against
       # libclang.dylib at @rpath. dyld's search list includes
@@ -383,7 +387,13 @@ jobs:
           # condition is allowed to fail without tripping `set -e`.
           dbgstage="${stage}-debuginfo"
           mkdir -p "$dbgstage"
-          OBJCOPY="$(command -v llvm-objcopy 2>/dev/null || command -v objcopy 2>/dev/null || true)"
+          # Prefer multi-arch llvm-objcopy. Ubuntu ships it only under a
+          # versioned name (e.g. llvm-objcopy-18, no unversioned symlink), so
+          # fall back to the newest versioned binary, then to GNU objcopy.
+          OBJCOPY="$(command -v llvm-objcopy 2>/dev/null \
+            || ls -1 /usr/bin/llvm-objcopy-* 2>/dev/null | sort -V | tail -n1 \
+            || true)"
+          [ -n "$OBJCOPY" ] || OBJCOPY="$(command -v objcopy 2>/dev/null || true)"
           for b in satd sat-cli sat-tui; do
             bin="$stage/bin/$b"
             if [ -n "$OBJCOPY" ] \
