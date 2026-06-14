@@ -316,6 +316,14 @@ jobs:
 
       - name: Build release binaries (cargo)
         if: matrix.use_zigbuild != true
+        env:
+          # Frame pointers: ~1% runtime cost in exchange for always-on,
+          # low-overhead `perf -g` (frame-pointer unwinding) on the shipped
+          # binary — no DWARF needed. --remap-path-prefix keeps embedded panic
+          # locations / debug line tables deterministic and free of runner
+          # paths. (--build-id is intentionally omitted: macOS ld rejects it,
+          # and this step also builds the apple-darwin targets.)
+          RUSTFLAGS: "-Cforce-frame-pointers=yes --remap-path-prefix=${{ github.workspace }}=/satd"
         run: |
           cargo build --release --locked \
             --bin satd --bin sat-cli --bin sat-tui \
@@ -323,6 +331,10 @@ jobs:
 
       - name: Build release binaries (zigbuild)
         if: matrix.use_zigbuild == true
+        env:
+          # Same frame-pointer + path-remap policy as the cargo build above
+          # (musl static targets cross-built via zigbuild).
+          RUSTFLAGS: "-Cforce-frame-pointers=yes --remap-path-prefix=${{ github.workspace }}=/satd"
         run: |
           # Leave LIBCLANG_PATH unset: clang-sys auto-discovers the
           # apt-installed libclang via its built-in /usr/lib/llvm-*
@@ -355,12 +367,41 @@ jobs:
           cp "target/${{ matrix.target }}/release/satd"    "$stage/bin/satd"
           cp "target/${{ matrix.target }}/release/sat-cli" "$stage/bin/sat-cli"
           cp "target/${{ matrix.target }}/release/sat-tui" "$stage/bin/sat-tui"
-          # Strip is best-effort: macOS strip on cross-compiled aarch64
-          # binaries from a macos-13 runner can fail on signature
-          # checks. Don't gate the release on it.
-          strip "$stage/bin/satd"    || true
-          strip "$stage/bin/sat-cli" || true
-          strip "$stage/bin/sat-tui" || true
+          # Split debug info into a separate sidecar, then strip the shipped
+          # binary (same lean download as before) and link it back via
+          # .gnu_debuglink. This yields fully symbolizable production binaries:
+          # drop the matching `<bin>.debug` next to the binary (or under
+          # /usr/lib/debug) and perf / gdb / addr2line resolve names + line
+          # numbers automatically.
+          #
+          # Tool choice is best-effort and can NEVER fail the release: prefer
+          # llvm-objcopy (multi-arch — handles the cross-built aarch64 targets
+          # whose ELF a host x86 GNU objcopy may reject), fall back to GNU
+          # objcopy. If neither can process the binary (macOS, or a host tool
+          # that doesn't know the target arch) we degrade to a plain strip with
+          # no sidecar — exactly the prior behaviour. The objcopy in the `if`
+          # condition is allowed to fail without tripping `set -e`.
+          dbgstage="${stage}-debuginfo"
+          mkdir -p "$dbgstage"
+          OBJCOPY="$(command -v llvm-objcopy 2>/dev/null || command -v objcopy 2>/dev/null || true)"
+          for b in satd sat-cli sat-tui; do
+            bin="$stage/bin/$b"
+            if [ -n "$OBJCOPY" ] \
+               && file "$bin" 2>/dev/null | grep -q ELF \
+               && "$OBJCOPY" --only-keep-debug "$bin" "$dbgstage/$b.debug" 2>/dev/null; then
+              strip "$bin" 2>/dev/null || "$OBJCOPY" --strip-all "$bin" 2>/dev/null || true
+              "$OBJCOPY" --add-gnu-debuglink="$dbgstage/$b.debug" "$bin" 2>/dev/null || true
+            else
+              rm -f "$dbgstage/$b.debug"
+              strip "$bin" || true
+            fi
+          done
+          # Signal the pack/upload steps whether any sidecar was produced.
+          # Empty on macOS (and any target the host tools can't split), where
+          # these steps no-op.
+          if [ -n "$(ls -A "$dbgstage" 2>/dev/null)" ]; then
+            echo "DBGSTAGE=$dbgstage" >> "$GITHUB_ENV"
+          fi
           cp README.md                       "$stage/README.md"
           cp docs/manual/src/packaging.md    "$stage/PACKAGING.md"
           cp CORE_DIFFERENCES.md             "$stage/CORE_DIFFERENCES.md"
@@ -411,6 +452,24 @@ jobs:
           else
             shasum -a 256 "${STAGE}.tar.zst" > "${STAGE}.tar.zst.sha256"
           fi
+          # Debuginfo sidecar (Linux/GNU targets only — $DBGSTAGE is unset on
+          # macOS). Packed separately so the main download stays lean; attached
+          # to the release as its own asset for after-the-fact profiling. The
+          # release job's existing `dist/*.tar.zst` glob and `*.tar.zst.sha256`
+          # aggregation pick it up automatically.
+          if [ -n "${DBGSTAGE:-}" ]; then
+            "$TAR" --owner=0 --group=0 --numeric-owner \
+                   --format=ustar \
+                   --sort=name \
+                   --mtime='2026-01-01 00:00:00 UTC' \
+                   -cf "${DBGSTAGE}.tar" "${DBGSTAGE}"
+            zstd -19 --rm "${DBGSTAGE}.tar"
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "${DBGSTAGE}.tar.zst" > "${DBGSTAGE}.tar.zst.sha256"
+            else
+              shasum -a 256 "${DBGSTAGE}.tar.zst" > "${DBGSTAGE}.tar.zst.sha256"
+            fi
+          fi
 
       - name: Upload tarball artifact
         uses: actions/upload-artifact@v7
@@ -419,6 +478,18 @@ jobs:
           path: |
             ${{ env.STAGE }}.tar.zst
             ${{ env.STAGE }}.tar.zst.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload debuginfo sidecar artifact
+        # Skipped on macOS targets, where no sidecar is produced.
+        if: env.DBGSTAGE != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.STAGE }}-debuginfo.tar.zst
+          path: |
+            ${{ env.STAGE }}-debuginfo.tar.zst
+            ${{ env.STAGE }}-debuginfo.tar.zst.sha256
           if-no-files-found: error
           retention-days: 14
 
