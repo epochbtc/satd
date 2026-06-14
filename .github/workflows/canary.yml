@@ -483,8 +483,8 @@ jobs:
   # Unlike the other canaries this is a Rust integration test: it drives satd
   # through its own RPC and must compile the harness, so it builds with cargo
   # rather than consuming the shared release artifact (hence `needs: [changes]`,
-  # not `[build]`). Gated behind the `phase-c` cargo feature so the general
-  # `cargo test --all` step never runs it.
+  # not `[build]`). Gated behind the `core-block-differential` cargo feature so
+  # the general `cargo test --all` step never runs it.
   core-block-acceptance-differential:
     name: canary / Bitcoin Core block-acceptance differential
     needs: [changes]
@@ -530,8 +530,8 @@ jobs:
         with:
           path: target
           # Separate key from the release `build` job — this is a debug test build.
-          key: ${{ runner.os }}-phasec-target-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-phasec-target-
+          key: ${{ runner.os }}-core-block-diff-target-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-core-block-diff-target-
 
       - name: Pre-pull Bitcoin Core image
         run: |
@@ -542,7 +542,7 @@ jobs:
         env:
           # Absorb hosted-runner load on satd startup, as ci.yml does.
           SATD_TEST_TIMEOUT_MULT: '2'
-        run: cargo test -p satd --test phase_c_differential --features phase-c -- --nocapture
+        run: cargo test -p satd --test core_block_differential --features core-block-differential -- --nocapture
 
   # LND Neutrino canary — runs a real LND node as a BIP 157/158 light
   # client (Neutrino) backed by satd over P2P. The dominant Lightning

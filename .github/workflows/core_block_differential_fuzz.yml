@@ -1,5 +1,5 @@
-# Phase C Layer 2 — in-process consensus fuzzer with a live Bitcoin Core
-# oracle (fuzz/fuzz_targets/block_differential.rs). libFuzzer mutates blocks,
+# Block-acceptance differential fuzz — in-process consensus fuzzer with a live
+# Bitcoin Core oracle (fuzz/fuzz_targets/block_differential.rs). libFuzzer mutates blocks,
 # satd validates them in-process (coverage-guided, catches panics), and a
 # resident bitcoind is the accept/reject oracle.
 #
@@ -31,7 +31,7 @@ permissions:
   issues: write
 
 concurrency:
-  group: phase-c-fuzz-${{ github.ref }}
+  group: core-block-differential-fuzz-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -78,7 +78,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: phase-c-fuzz-artifacts
+          name: core-block-differential-fuzz-artifacts
           path: fuzz/artifacts/**
           if-no-files-found: ignore
           retention-days: 30
@@ -125,7 +125,7 @@ jobs:
 
           - Run: $RUN_URL
           - Commit: \`${{ github.sha }}\`
-          - Reproducer(s) (also in the \`phase-c-fuzz-artifacts\` artifact):
+          - Reproducer(s) (also in the \`core-block-differential-fuzz-artifacts\` artifact):
 
           $repro_list
 

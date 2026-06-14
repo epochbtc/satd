@@ -1,6 +1,6 @@
-//! Shared block-building helpers for the Phase C Layer 2 fuzz target and its
-//! corpus generator. Mirrors the builders in
-//! `satd/tests/phase_c_differential.rs` (the fuzz crate is a standalone
+//! Shared block-building helpers for the block-acceptance differential fuzz
+//! target and its corpus generator. Mirrors the builders in
+//! `satd/tests/core_block_differential.rs` (the fuzz crate is a standalone
 //! workspace and can't share that test-only module).
 
 use bitcoin::block::{Header, Version};

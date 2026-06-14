@@ -1,5 +1,5 @@
-# Phase C Layer 2 — in-process consensus fuzz target with a live Bitcoin Core
-# oracle. See fuzz_targets/block_differential.rs.
+# Block-acceptance differential fuzz — in-process consensus fuzz target with a
+# live Bitcoin Core oracle. See fuzz_targets/block_differential.rs.
 #
 # Deliberately a STANDALONE workspace (note the empty `[workspace]` table
 # below) and excluded from the parent workspace (`exclude = ["fuzz"]` in the
