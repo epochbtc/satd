@@ -1,5 +1,5 @@
 [workspace]
-members = ["satd", "sat-cli", "node", "node-index", "node-filter-index", "esplora-handlers", "electrum-proto", "sat-tui", "mcp", "consensus", "events", "tls-config", "satd-auth"]
+members = ["satd", "sat-cli", "node", "node-index", "node-filter-index", "esplora-handlers", "electrum-proto", "sat-tui", "mcp", "consensus", "events", "tls-config", "satd-auth", "satd-policy"]
 # `fuzz/` is a standalone cargo-fuzz workspace (needs a nightly + sanitizer
 # toolchain); keep it out of the normal `cargo build` / `cargo test --all`.
 exclude = ["fuzz"]
