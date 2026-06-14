@@ -36,11 +36,19 @@ use crate::ast::*;
 pub const POLICY_BUDGET: u64 = 256_000_000;
 
 /// Upper bound on total script/witness bytes scanned across all elements of one
-/// transaction (a ≤4 MWU tx holds at most ~4 MB of data). A scanning method
+/// transaction (a ≤4 MWU tx holds at most ~4 MB of data). A scanning method over
+/// *transaction-resident* data (script_sig, witness/leaf script, output script)
 /// inside a quantifier is costed as one whole-transaction pass — *not*
 /// `element_count × per-element`, because the sum of all per-element script
 /// bytes cannot exceed the transaction.
 const MAX_TX_SCAN: u64 = 4_000_000;
+
+/// Consensus upper bound on a single prevout scriptPubKey (`MAX_SCRIPT_SIZE`).
+/// Unlike script_sig / witness / output scripts, `in.prevout_script` is sourced
+/// from the UTXO set, **not** from the transaction being evaluated — so the sum
+/// across inputs is *not* bounded by the transaction size and must be costed
+/// per element (`element_count × per-element`), via the `scan_elem` axis.
+const MAX_PREVOUT_SCRIPT: u64 = 10_000;
 
 /// A txid/flat-bytes field is fixed-size.
 const TXID_BYTES: u64 = 32;
@@ -54,13 +62,21 @@ const MAX_OUTPUTS: u64 = 111_000;
 /// Base cost of visiting one AST node / doing one fixed comparison.
 const LEAF: u64 = 1;
 
-/// Split cost: `flat` is per-element-fixed work, `scan` is variable byte
-/// scanning over script/witness data. Kept separate so a quantifier can cap its
-/// scan contribution at the transaction size rather than `count × per-element`.
+/// Split cost across three axes:
+/// * `flat` — per-element-fixed work, multiplied by element count in a quantifier.
+/// * `scan` — byte scanning over *transaction-resident* data, capped at the
+///   transaction size (`MAX_TX_SCAN`) and **not** multiplied by element count.
+/// * `scan_elem` — byte scanning over *non-transaction-resident* data
+///   (`in.prevout_script`, from the UTXO set), which **is** multiplied by element
+///   count because the sum across inputs is unbounded by the transaction.
+///
+/// Keeping these separate is what lets a quantifier treat a witness scan as one
+/// tx-pass while still charging prevout-script scans per input.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Cost {
     pub flat: u64,
     pub scan: u64,
+    pub scan_elem: u64,
 }
 
 impl Cost {
@@ -68,32 +84,47 @@ impl Cost {
         Cost {
             flat: LEAF,
             scan: 0,
-        }
-    }
-    fn add(self, other: Cost) -> Cost {
-        Cost {
-            flat: self.flat.saturating_add(other.flat),
-            scan: self.scan.saturating_add(other.scan),
+            scan_elem: 0,
         }
     }
     fn plus_flat(self, n: u64) -> Cost {
         Cost {
             flat: self.flat.saturating_add(n),
-            scan: self.scan,
+            ..self
         }
     }
     fn plus_scan(self, n: u64) -> Cost {
         Cost {
-            flat: self.flat,
             scan: self.scan.saturating_add(n),
+            ..self
+        }
+    }
+    fn plus_scan_elem(self, n: u64) -> Cost {
+        Cost {
+            scan_elem: self.scan_elem.saturating_add(n),
+            ..self
         }
     }
     /// Total budget cost.
     pub fn total(self) -> u64 {
-        self.flat.saturating_add(self.scan)
+        self.flat
+            .saturating_add(self.scan)
+            .saturating_add(self.scan_elem)
     }
     pub fn within_budget(self) -> bool {
         self.total() <= POLICY_BUDGET
+    }
+}
+
+impl std::ops::Add for Cost {
+    type Output = Cost;
+    /// Sum two costs axis-wise (saturating).
+    fn add(self, other: Cost) -> Cost {
+        Cost {
+            flat: self.flat.saturating_add(other.flat),
+            scan: self.scan.saturating_add(other.scan),
+            scan_elem: self.scan_elem.saturating_add(other.scan_elem),
+        }
     }
 }
 
@@ -104,30 +135,34 @@ pub fn cost(expr: &Expr) -> Cost {
             Cost::leaf()
         }
         Expr::Unary { expr, .. } => cost(expr).plus_flat(LEAF),
-        Expr::Binary { lhs, rhs, .. } => cost(lhs).add(cost(rhs)).plus_flat(LEAF),
+        Expr::Binary { lhs, rhs, .. } => (cost(lhs) + cost(rhs)).plus_flat(LEAF),
         Expr::Method { recv, call, .. } => {
             let base = cost(recv).plus_flat(LEAF);
-            // Worst-case bytes this op scans: a flat 32-byte field, or a whole
-            // transaction's worth of script/witness data (`MAX_TX_SCAN`).
-            let bound = scan_bound(recv);
-            match call {
+            // Worst-case bytes this op scans, and whether that scan is over
+            // transaction-resident data (capped at `MAX_TX_SCAN`, one tx-pass) or
+            // per-element non-resident data (`in.prevout_script`, charged per input).
+            let (bound, per_elem) = scan_bound(recv);
+            let scanned = match call {
                 // O(1): just reads a length.
-                MethodCall::Len => base,
+                MethodCall::Len => 0,
                 // Compare only up to the needle length.
-                MethodCall::StartsWith(n) | MethodCall::EndsWith(n) => {
-                    base.plus_scan(n.len() as u64)
-                }
+                MethodCall::StartsWith(n) | MethodCall::EndsWith(n) => n.len() as u64,
                 // One linear pass over the receiver bytes.
                 MethodCall::Contains(_)
                 | MethodCall::CountOp(_)
                 | MethodCall::MaxPush
-                | MethodCall::WellFormed => base.plus_scan(bound),
+                | MethodCall::WellFormed => bound,
                 // Non-backtracking glob: O(tokens × pattern_tokens); tokens ≈
                 // scanned bytes, pattern includes the +2 AnyRun padding.
                 MethodCall::ContainsOps(pat) => {
                     let factor = pat.len() as u64 + 2;
-                    base.plus_scan(bound.saturating_mul(factor))
+                    bound.saturating_mul(factor)
                 }
+            };
+            if per_elem {
+                base.plus_scan_elem(scanned)
+            } else {
+                base.plus_scan(scanned)
             }
         }
         Expr::Quant { domain, body, .. } => {
@@ -139,28 +174,67 @@ pub fn cost(expr: &Expr) -> Cost {
             Cost {
                 // Flat per-element work scales with the element count.
                 flat: n.saturating_mul(b.flat).saturating_add(LEAF),
-                // Scan work is one whole-transaction pass regardless of element
-                // count — the body's scans already represent the full tx, since
-                // all per-element scripts together are bounded by it.
+                // Transaction-resident scan work is one whole-transaction pass
+                // regardless of element count — all per-element scripts together
+                // are bounded by the tx.
                 scan: b.scan,
+                // Non-resident (prevout-script) scan work genuinely recurs per
+                // element, so it scales with the element count.
+                scan_elem: n.saturating_mul(b.scan_elem),
             }
         }
     }
 }
 
-/// The scan bound for a script/bytes-valued receiver expression. Methods are
-/// only applied to attributes in v1, so this inspects the attribute; anything
-/// else falls back to the conservative per-script bound.
-fn scan_bound(expr: &Expr) -> u64 {
+/// The scan bound for a script/bytes-valued receiver expression, plus whether
+/// the scan recurs per element (true only for `in.prevout_script`, which is not
+/// transaction-resident). Methods are only applied to attributes in v1, so this
+/// inspects the attribute; anything else falls back to the conservative
+/// transaction-resident per-script bound.
+fn scan_bound(expr: &Expr) -> (u64, bool) {
     if let Expr::Attr { root, field, .. } = expr {
         match (root, field.as_str()) {
-            (Root::Tx, "txid") | (Root::In, "prevout_txid") => return TXID_BYTES,
-            (Root::Out, "script")
-            | (Root::In, "script_sig")
-            | (Root::In, "leaf_script")
-            | (Root::In, "prevout_script") => return MAX_TX_SCAN,
+            (Root::Tx, "txid") | (Root::In, "prevout_txid") => return (TXID_BYTES, false),
+            // From the UTXO set, not the tx — charged per input.
+            (Root::In, "prevout_script") => return (MAX_PREVOUT_SCRIPT, true),
+            (Root::Out, "script") | (Root::In, "script_sig") | (Root::In, "leaf_script") => {
+                return (MAX_TX_SCAN, false);
+            }
             _ => {}
         }
     }
-    MAX_TX_SCAN
+    (MAX_TX_SCAN, false)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::compile;
+
+    // `in.prevout_script` is sourced from the UTXO set, not the transaction, so
+    // its scan must scale per input — unlike the tx-resident script fields, whose
+    // combined size is bounded by the transaction (one tx-pass).
+    #[test]
+    fn prevout_script_scan_is_per_element_not_one_tx_pass() {
+        // leaf_script (witness, tx-resident): one tx-pass, no per-element scan.
+        let leaf =
+            compile("all inputs (in.leaf_script.contains_ops(script(OP_RETURN)))").unwrap();
+        assert_eq!(leaf.cost().scan_elem, 0);
+        assert!(leaf.cost().within_budget());
+
+        // prevout_script (UTXO set): per-element scan ≈ MAX_INPUTS × MAX_PREVOUT_SCRIPT.
+        let prevout = compile("all inputs (in.prevout_script.well_formed)").unwrap();
+        assert!(prevout.cost().scan_elem >= 200_000_000, "{:?}", prevout.cost());
+        assert!(prevout.cost().within_budget());
+    }
+
+    // A glob over every input's prevout script is now correctly counted as
+    // hundreds of millions of units and rejected at load, rather than passing the
+    // gate and silently fuel-quarantining every matching transaction at runtime.
+    #[test]
+    fn pathological_prevout_glob_rejected_at_load() {
+        let err =
+            compile("all inputs (in.prevout_script.contains_ops(script(OP_RETURN OP_DUP)))")
+                .unwrap_err();
+        assert!(err.message.contains("cost budget"), "{}", err.message);
+    }
 }

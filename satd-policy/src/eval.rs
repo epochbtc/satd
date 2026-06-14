@@ -147,7 +147,13 @@ impl<'a, 'c> Ev<'a, 'c> {
                 Value::Bool(bytes.ends_with(n))
             }
             MethodCall::Contains(n) => {
-                self.burn(bytes.len() as u64);
+                // Naive substring scan is O(haystack × needle); charge for it and
+                // bail before scanning if that exhausts fuel (the value is then
+                // ignored — the rule layer fail-safe-quarantines on exhaustion).
+                self.burn((bytes.len() as u64).saturating_mul(n.len() as u64));
+                if self.exhausted {
+                    return Value::Bool(false);
+                }
                 Value::Bool(contains_subslice(bytes, n))
             }
             MethodCall::CountOp(op) => {
@@ -160,18 +166,34 @@ impl<'a, 'c> Ev<'a, 'c> {
             }
             MethodCall::WellFormed => {
                 self.burn(bytes.len() as u64);
+                if self.exhausted {
+                    return Value::Bool(false);
+                }
                 Value::Bool(script::tokenize(bytes).well_formed)
             }
             MethodCall::ContainsOps(pat) => {
                 let toks = self.tokenize(bytes);
                 self.burn((toks.len() as u64).saturating_mul(pat.len() as u64 + 2));
+                // Don't run the (potentially large) glob once fuel is gone.
+                if self.exhausted {
+                    return Value::Bool(false);
+                }
                 Value::Bool(pat.contains_in(&toks))
             }
         }
     }
 
+    /// Tokenize, charging fuel for the linear pass first. If that exhausts the
+    /// budget we skip the actual scan entirely and return no tokens: the only
+    /// consumer that matters on the exhausted path is the rule layer, which
+    /// fail-safe-quarantines on `fuel_exhausted` regardless of the token stream.
+    /// This bounds the work of any single tokenize call by the fuel available at
+    /// the call (≤ [`DEFAULT_FUEL`]) rather than by the unbounded script length.
     fn tokenize<'b>(&mut self, bytes: &'b [u8]) -> Vec<ScriptToken<'b>> {
         self.burn(bytes.len() as u64);
+        if self.exhausted {
+            return Vec::new();
+        }
         script::tokenize(bytes).tokens
     }
 

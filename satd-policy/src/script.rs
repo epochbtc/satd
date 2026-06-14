@@ -79,7 +79,10 @@ pub fn tokenize(script: &[u8]) -> Tokenized<'_> {
                 continue;
             }
         };
-        if i + take > n {
+        // `take` (from OP_PUSHDATA4) can be up to u32::MAX; compare against the
+        // remaining length without `i + take`, which could overflow `usize` on a
+        // 32-bit target. `i <= n` holds here, so `n - i` cannot underflow.
+        if take > n - i {
             // Declared push runs past the end: truncated, stream ends here.
             well_formed = false;
             break;
@@ -328,5 +331,105 @@ mod tests {
         let r = tokenize(&s);
         assert!(!r.well_formed);
         assert!(r.tokens.is_empty());
+    }
+
+    #[test]
+    fn pushdata4_oversized_declaration_is_truncated_not_oob() {
+        // OP_PUSHDATA4 declaring 4 GiB on a 5-byte script: must not panic /
+        // over-read; just marks malformed and emits nothing.
+        let s = [0x4e, 0xff, 0xff, 0xff, 0xff];
+        let r = tokenize(&s);
+        assert!(!r.well_formed);
+        assert!(r.tokens.is_empty());
+    }
+
+    // --- glob correctness: differential vs a trivially-correct recursive matcher ---
+
+    /// Reference wildcard matcher for the *padded* pattern (`* pat *`), written
+    /// the obvious (exponential) recursive way so it is clearly correct. Used to
+    /// validate the production single-backtrack `glob_search` over many inputs —
+    /// in particular patterns with multiple `*` (`AnyRun`), where a naive
+    /// single-pointer matcher would be wrong.
+    fn ref_match(toks: &[ScriptToken], pat: &[PatToken]) -> bool {
+        match pat.split_first() {
+            None => toks.is_empty(),
+            Some((PatToken::AnyRun, rest)) => {
+                // Zero tokens, or consume one and stay on the same star.
+                ref_match(toks, rest)
+                    || (!toks.is_empty() && ref_match(&toks[1..], pat))
+            }
+            Some((p, rest)) => {
+                !toks.is_empty() && token_matches(&toks[0], p) && ref_match(&toks[1..], rest)
+            }
+        }
+    }
+
+    fn padded(pat: &[PatToken]) -> Vec<PatToken> {
+        let mut v = Vec::with_capacity(pat.len() + 2);
+        v.push(PatToken::AnyRun);
+        v.extend_from_slice(pat);
+        v.push(PatToken::AnyRun);
+        v
+    }
+
+    #[test]
+    fn glob_matches_reference_exhaustively_incl_multistar() {
+        // Token alphabet: two distinct opcodes.
+        let alphabet = [
+            ScriptToken { op: 0xaa, data: None },
+            ScriptToken { op: 0xbb, data: None },
+        ];
+        // Pattern alphabet includes two `AnyRun`s so generated patterns routinely
+        // contain multiple stars (the case under suspicion).
+        let pat_alphabet = [
+            PatToken::Op(0xaa),
+            PatToken::Op(0xbb),
+            PatToken::AnyOne,
+            PatToken::AnyRun,
+        ];
+
+        // All texts of length 0..=6 over the 2-symbol alphabet.
+        let mut texts: Vec<Vec<ScriptToken>> = vec![vec![]];
+        for _ in 0..6 {
+            let mut next = Vec::new();
+            for t in &texts {
+                for s in &alphabet {
+                    let mut e = t.clone();
+                    e.push(*s);
+                    next.push(e);
+                }
+            }
+            texts.extend(next);
+        }
+
+        // All patterns of length 0..=4 over the 4-symbol pattern alphabet.
+        let mut pats: Vec<Vec<PatToken>> = vec![vec![]];
+        for _ in 0..4 {
+            let mut next = Vec::new();
+            for p in &pats {
+                for s in &pat_alphabet {
+                    let mut e = p.clone();
+                    e.push(s.clone());
+                    next.push(e);
+                }
+            }
+            pats.extend(next);
+        }
+
+        let mut checked = 0u64;
+        for pat in &pats {
+            for text in &texts {
+                let got = glob_search(text, pat);
+                let want = ref_match(text, &padded(pat));
+                assert_eq!(
+                    got, want,
+                    "mismatch: pat={pat:?} text_ops={:?}",
+                    text.iter().map(|t| t.op).collect::<Vec<_>>()
+                );
+                checked += 1;
+            }
+        }
+        // Sanity: we actually exercised a large differential space.
+        assert!(checked > 100_000, "only checked {checked}");
     }
 }

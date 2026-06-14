@@ -201,9 +201,13 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
             push(&mut out, Tok::Ident(src[start..i].to_string()), start, i);
             continue;
         }
+        // `c` is only the first byte; decode the whole UTF-8 char so the message
+        // is correct and the span ends on a char boundary (a span that splits a
+        // multibyte char would panic any consumer that slices the source by it).
+        let ch = src[start..].chars().next().unwrap_or(c as char);
         return Err(PolicyError::lex(
-            Span::new(start, i + 1),
-            format!("unexpected character '{}'", c as char),
+            Span::new(start, start + ch.len_utf8()),
+            format!("unexpected character '{ch}'"),
         ));
     }
     out.push(Token {
@@ -226,5 +230,27 @@ fn hexval(b: u8) -> u8 {
         b'a'..=b'f' => b - b'a' + 10,
         b'A'..=b'F' => b - b'A' + 10,
         _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression: an unexpected non-ASCII char must (a) report the whole decoded
+    // char, not its first byte, and (b) carry a span that ends on a char boundary
+    // so any consumer that slices the source by the span cannot panic.
+    #[test]
+    fn multibyte_unexpected_char_is_boundary_safe() {
+        let src = "tx.version == é";
+        let err = lex(src).unwrap_err();
+        assert!(src.is_char_boundary(err.span.start));
+        assert!(src.is_char_boundary(err.span.end));
+        assert!(err.message.contains('é'), "{}", err.message);
+        // render() slices the source around the span — must not panic.
+        let _ = err.render(src);
+        // The byte string `&src[span]` is itself a valid slice (would panic on a
+        // non-boundary span).
+        assert_eq!(&src[err.span.start..err.span.end], "é");
     }
 }

@@ -151,7 +151,14 @@ impl Parser {
     fn not_expr(&mut self) -> Result<Expr> {
         let start = self.peek_span();
         if self.eat(&Tok::Bang) || self.eat_ident("not") {
-            let inner = self.not_expr()?;
+            // `not`/`!` self-recurses without passing back through `expr()`, so it
+            // must account for nesting depth itself; otherwise a long run of
+            // unary operators (`not not not …`) recurses unbounded and overflows
+            // the stack regardless of MAX_DEPTH.
+            self.enter(start)?;
+            let inner = self.not_expr();
+            self.leave();
+            let inner = inner?;
             let span = start.to(inner.span());
             Ok(Expr::Unary {
                 op: UnOp::Not,
@@ -596,5 +603,37 @@ fn describe(t: &Tok) -> String {
         Tok::AndAnd => "'&&'".into(),
         Tok::OrOr => "'||'".into(),
         Tok::Bang => "'!'".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::Stage;
+
+    // Regression: `not`/`!` self-recurse without passing back through `expr()`,
+    // so without their own depth accounting a long unary run overflows the stack
+    // regardless of MAX_DEPTH. These must return a bounded parse error.
+    #[test]
+    fn deep_not_chain_is_bounded() {
+        let src = format!("{}true", "not ".repeat(50_000));
+        let err = parse(&src).unwrap_err();
+        assert_eq!(err.stage, Stage::Parse);
+        assert!(err.message.contains("nested too deeply"), "{}", err.message);
+    }
+
+    #[test]
+    fn deep_bang_chain_is_bounded() {
+        let src = format!("{}true", "!".repeat(50_000));
+        let err = parse(&src).unwrap_err();
+        assert_eq!(err.stage, Stage::Parse);
+        assert!(err.message.contains("nested too deeply"), "{}", err.message);
+    }
+
+    #[test]
+    fn deep_parens_are_bounded() {
+        let src = format!("{}true{}", "(".repeat(50_000), ")".repeat(50_000));
+        let err = parse(&src).unwrap_err();
+        assert_eq!(err.stage, Stage::Parse);
     }
 }
