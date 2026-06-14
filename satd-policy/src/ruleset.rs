@@ -160,10 +160,7 @@ pub fn parse_ruleset(src: &str) -> Result<CompiledRuleset> {
     for k in 1..starts.len() {
         let (b, e) = unit_span(k);
         let rule = parse_rule(src, b, e, &mut names)?;
-        total = Cost {
-            flat: total.flat.saturating_add(rule.cond.cost().flat),
-            scan: total.scan.saturating_add(rule.cond.cost().scan),
-        };
+        total = total + rule.cond.cost();
         if total.total() > POLICY_BUDGET {
             return Err(PolicyError::cost(
                 Span::new(b, e.min(b + 1)),
@@ -206,11 +203,26 @@ struct LineInfo {
 
 fn classify_lines(src: &str) -> Vec<LineInfo> {
     let mut out = Vec::new();
-    let mut pos = 0usize;
-    for line in src.split_inclusive('\n') {
-        let start = pos;
-        pos += line.len();
-        let text = line.strip_suffix('\n').unwrap_or(line);
+    let bytes = src.as_bytes();
+    let n = bytes.len();
+    let mut i = 0usize;
+    // Split on `\n`, `\r\n`, and lone `\r` so classic-Mac/CR-only files yield one
+    // logical line per record rather than collapsing into a single line. Line
+    // terminators are ASCII, so `start`/`content_end` are always char boundaries.
+    while i < n {
+        let start = i;
+        while i < n && bytes[i] != b'\n' && bytes[i] != b'\r' {
+            i += 1;
+        }
+        let content_end = i;
+        if i < n {
+            if bytes[i] == b'\r' && i + 1 < n && bytes[i + 1] == b'\n' {
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+        let text = &src[start..content_end];
         let trimmed = text.trim_start();
         let content = trimmed.trim_end();
         let kind = if content.is_empty() || content.starts_with('#') {

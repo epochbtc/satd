@@ -346,3 +346,12 @@ fn cookbook_runes_and_dust() {
     let tx = b.tx_view(&ins, &outs);
     assert_eq!(rs.evaluate(&tx, &ctx()).rule(), Some("runes"));
 }
+
+// Regression: classic-Mac / CR-only line endings must split into separate
+// logical lines, not collapse the whole file into one (which fails to load).
+#[test]
+fn cr_only_line_endings_parse_as_separate_lines() {
+    let src = "version 1\rquarantine when tx.version == 2\r";
+    let rs = parse_ruleset(src).unwrap_or_else(|e| panic!("CR-only:\n{}", e.render(src)));
+    assert_eq!(rs.rules().len(), 1);
+}
