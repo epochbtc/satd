@@ -5,6 +5,16 @@ members = ["satd", "sat-cli", "node", "node-index", "node-filter-index", "esplor
 exclude = ["fuzz"]
 resolver = "2"
 
+[profile.release]
+# Line tables make release binaries symbolizable (perf / backtraces /
+# addr2line) without the size and ~no runtime cost of full debuginfo. The
+# release workflow splits this into a separate `.debug` sidecar and strips the
+# shipped binary, so the user download stays lean; a local `cargo build
+# --release` keeps the line tables in-binary for dev profiling. Paired with
+# `-Cforce-frame-pointers=yes` (set in release.yml) this makes shipped binaries
+# cheaply profilable with `perf -g` in production.
+debug = "line-tables-only"
+
 [workspace.package]
 authors = ["Benjamen Keroack <ben@keroack.com>", "20 Gauge Software, Inc.", "The satd developers"]
 version = "0.4.0-pre"

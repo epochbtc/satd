@@ -11,6 +11,12 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
 
 ## [Unreleased]
 
+- **Profilable release binaries.** Release builds now ship with frame pointers
+  + line-table debug info; the binary stays stripped (same download size) and
+  the debug info is published as a separate per-target `*-debuginfo.tar.zst`
+  sidecar, so production nodes can be profiled with `perf -g` and symbolized
+  against the exact running binary. See the
+  [release notes](docs/release-notes/0.4.0-pre.md).
 - **Fee estimation reworked.** Fixed inverted smart-fee tiers (now monotone:
   `High ≥ Medium ≥ Low ≥ economy`); unified `estimatefees`,
   `estimatesmartfee`, the TUI, the MCP `estimate_fee` tool, Esplora
