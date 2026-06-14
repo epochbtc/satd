@@ -281,7 +281,7 @@ jobs:
       # upgrade can break overnight.
       - name: Install Python (for cargo-zigbuild + ziglang wheel)
         if: matrix.use_zigbuild == true
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.12'
 
