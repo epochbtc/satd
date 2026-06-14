@@ -23,10 +23,12 @@
 //! (`rc4`/`sha256`/`reverse` + `tx.first_input_txid`/`out.op_return_data`) are a
 //! deliberate `version 2` fast-follow (design §13) and are not implemented here.
 
+pub mod advisory;
 pub mod ast;
 pub mod cost;
 pub mod error;
 pub mod eval;
+pub mod explain;
 pub mod lexer;
 pub mod parser;
 pub mod ruleset;
@@ -37,9 +39,11 @@ pub mod value;
 pub mod verdict;
 pub mod view;
 
+pub use advisory::{Advisory, L2Flow, advise_rule, advise_ruleset};
 pub use cost::{Cost, POLICY_BUDGET};
 pub use error::{PolicyError, Result, Span, Stage};
 pub use eval::{DEFAULT_FUEL, Outcome};
+pub use explain::{explain_expr, explain_rule, explain_ruleset};
 pub use ruleset::{Action, CompiledRuleset, Rule, SUPPORTED_VERSION, parse_ruleset};
 pub use scope::ScopeSet;
 pub use typeck::Type;
