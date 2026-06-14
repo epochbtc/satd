@@ -705,7 +705,7 @@ jobs:
           echo "body_path=${body}" >> "$GITHUB_OUTPUT"
 
       - name: Create or update GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           # Curated, versioned notes from docs/release-notes/ (prepended);
           # GitHub's auto-generated PR list is appended after it.
