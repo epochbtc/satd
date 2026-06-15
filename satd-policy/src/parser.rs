@@ -114,8 +114,18 @@ impl Parser {
 
     fn or_expr(&mut self) -> Result<Expr> {
         let mut lhs = self.and_expr()?;
+        // Each chain link deepens the *left spine* of the AST by one. The parse
+        // loop itself is iterative (no parser-stack growth), but typeck/cost/eval
+        // — and even `Drop` of the boxed tree — recurse structurally, so a long
+        // `a or a or …` run would overflow the native stack. Charge each link
+        // against the shared depth budget and unwind it on success so sibling
+        // chains start fresh. (On error we abort the whole parse, so leftover
+        // depth is irrelevant.)
+        let mut links = 0usize;
         loop {
             if self.eat(&Tok::OrOr) || self.eat_ident("or") {
+                self.enter(self.peek_span())?;
+                links += 1;
                 let rhs = self.and_expr()?;
                 let span = lhs.span().to(rhs.span());
                 lhs = Expr::Binary {
@@ -125,15 +135,24 @@ impl Parser {
                     span,
                 };
             } else {
-                return Ok(lhs);
+                break;
             }
         }
+        for _ in 0..links {
+            self.leave();
+        }
+        Ok(lhs)
     }
 
     fn and_expr(&mut self) -> Result<Expr> {
         let mut lhs = self.not_expr()?;
+        // See `or_expr`: charge each chain link so a long `a and a and …` run
+        // can't build a stack-overflowing left spine.
+        let mut links = 0usize;
         loop {
             if self.eat(&Tok::AndAnd) || self.eat_ident("and") {
+                self.enter(self.peek_span())?;
+                links += 1;
                 let rhs = self.not_expr()?;
                 let span = lhs.span().to(rhs.span());
                 lhs = Expr::Binary {
@@ -143,9 +162,13 @@ impl Parser {
                     span,
                 };
             } else {
-                return Ok(lhs);
+                break;
             }
         }
+        for _ in 0..links {
+            self.leave();
+        }
+        Ok(lhs)
     }
 
     fn not_expr(&mut self) -> Result<Expr> {
@@ -194,12 +217,17 @@ impl Parser {
 
     fn add_expr(&mut self) -> Result<Expr> {
         let mut lhs = self.mul_expr()?;
+        // See `or_expr`: charge each chain link so a long `a + a + …` run can't
+        // build a stack-overflowing left spine.
+        let mut links = 0usize;
         loop {
             let op = match self.peek() {
                 Tok::Plus => BinOp::Add,
                 Tok::Minus => BinOp::Sub,
-                _ => return Ok(lhs),
+                _ => break,
             };
+            self.enter(self.peek_span())?;
+            links += 1;
             self.bump();
             let rhs = self.mul_expr()?;
             let span = lhs.span().to(rhs.span());
@@ -210,17 +238,26 @@ impl Parser {
                 span,
             };
         }
+        for _ in 0..links {
+            self.leave();
+        }
+        Ok(lhs)
     }
 
     fn mul_expr(&mut self) -> Result<Expr> {
         let mut lhs = self.postfix()?;
+        // See `or_expr`: charge each chain link so a long `a * a * …` run can't
+        // build a stack-overflowing left spine.
+        let mut links = 0usize;
         loop {
             let op = match self.peek() {
                 Tok::Star => BinOp::Mul,
                 Tok::Slash => BinOp::Div,
                 Tok::Percent => BinOp::Mod,
-                _ => return Ok(lhs),
+                _ => break,
             };
+            self.enter(self.peek_span())?;
+            links += 1;
             self.bump();
             let rhs = self.postfix()?;
             let span = lhs.span().to(rhs.span());
@@ -231,6 +268,10 @@ impl Parser {
                 span,
             };
         }
+        for _ in 0..links {
+            self.leave();
+        }
+        Ok(lhs)
     }
 
     fn postfix(&mut self) -> Result<Expr> {
@@ -635,5 +676,58 @@ mod tests {
         let src = format!("{}true{}", "(".repeat(50_000), ")".repeat(50_000));
         let err = parse(&src).unwrap_err();
         assert_eq!(err.stage, Stage::Parse);
+    }
+
+    // Regression: the binary-operator productions (`or`/`and`/`+`/`*`) are
+    // parsed iteratively into deep left-leaning trees. Without per-link depth
+    // accounting, a long flat chain builds an AST that overflows the native
+    // stack when typeck/cost/eval (or `Drop`) recurse over it — even though the
+    // parse loop itself never recurses. These must return a bounded parse error.
+    #[test]
+    fn deep_or_chain_is_bounded() {
+        let src = format!("true{}", " or true".repeat(50_000));
+        let err = parse(&src).unwrap_err();
+        assert_eq!(err.stage, Stage::Parse);
+        assert!(err.message.contains("nested too deeply"), "{}", err.message);
+    }
+
+    #[test]
+    fn deep_and_chain_is_bounded() {
+        let src = format!("true{}", " and true".repeat(50_000));
+        let err = parse(&src).unwrap_err();
+        assert_eq!(err.stage, Stage::Parse);
+        assert!(err.message.contains("nested too deeply"), "{}", err.message);
+    }
+
+    #[test]
+    fn deep_add_chain_is_bounded() {
+        let src = format!("1{}", " + 1".repeat(50_000));
+        let err = parse(&src).unwrap_err();
+        assert_eq!(err.stage, Stage::Parse);
+        assert!(err.message.contains("nested too deeply"), "{}", err.message);
+    }
+
+    #[test]
+    fn deep_mul_chain_is_bounded() {
+        let src = format!("1{}", " * 1".repeat(50_000));
+        let err = parse(&src).unwrap_err();
+        assert_eq!(err.stage, Stage::Parse);
+        assert!(err.message.contains("nested too deeply"), "{}", err.message);
+    }
+
+    // Sibling chains must each start from a fresh depth budget — the unwind in
+    // each binary production prevents one chain's links from leaking into the
+    // next. A modest disjunction of modest conjunctions must still parse.
+    #[test]
+    fn sibling_chains_do_not_share_depth() {
+        let clause = (0..20)
+            .map(|i| format!("{} == {}", i, i))
+            .collect::<Vec<_>>()
+            .join(" and ");
+        let src = (0..20)
+            .map(|_| format!("({clause})"))
+            .collect::<Vec<_>>()
+            .join(" or ");
+        assert!(parse(&src).is_ok(), "modest nested chains should parse");
     }
 }
