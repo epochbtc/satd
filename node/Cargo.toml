@@ -32,6 +32,9 @@ async-trait = { workspace = true }
 uuid = { workspace = true }
 parking_lot = { workspace = true }
 ipnet = "2.12"
+# Lock-free hot-path read of the live policy ruleset pointer (mempool admission
+# reads it on every transaction; SIGHUP/startup swaps it rarely). §7/§8.
+arc-swap = "1"
 hmac = "0.12"
 sha2 = "0.10"
 # Tor v3 .onion address derivation (checksum is SHA3-256; address is base32).
@@ -44,6 +47,9 @@ consensus = { path = "../consensus" }
 node-index = { path = "../node-index" }
 node-filter-index = { path = "../node-filter-index" }
 satd-auth = { path = "../satd-auth" }
+# Transaction-filtering policy engine (the DSL). The mempool admission path
+# compiles a ruleset at startup and evaluates it once per transaction (§7).
+satd-policy = { path = "../satd-policy" }
 
 [features]
 default = ["block-filter-index"]
