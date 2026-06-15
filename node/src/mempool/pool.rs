@@ -1232,7 +1232,16 @@ impl Mempool {
                     .collect();
                 for child in children {
                     if let Some(child_entry) = inner.entries.get(&child) {
-                        freed += bitcoin::consensus::serialize(&child_entry.tx).len();
+                        // A cross-class descendant (e.g. a quarantined child of an
+                        // evicted acting parent) must still be removed for graph
+                        // integrity — its input vanishes with the parent — but its
+                        // bytes belong to the *other* class's budget. Counting them
+                        // toward this class's `bytes_needed` would stop eviction
+                        // early and leave the acting class over budget, so only
+                        // same-class bytes count toward the goal.
+                        if child_entry.scope.is_quarantined() == want_quarantined {
+                            freed += bitcoin::consensus::serialize(&child_entry.tx).len();
+                        }
                     }
                     to_remove.push(child);
                     desc_queue.push(child);
@@ -2500,5 +2509,85 @@ mod tests {
             let inner = mp.inner.read();
             bitcoin::consensus::serialize(&inner.entries.get(&acting).unwrap().tx).len()
         });
+    }
+
+    #[test]
+    fn acting_eviction_counts_only_same_class_bytes_toward_goal() {
+        // A quarantined child of an evicted acting parent must be removed for
+        // graph integrity (its input vanishes with the parent) — but its bytes
+        // belong to the quarantine class, so they must NOT count toward the
+        // acting class's eviction goal. Otherwise eviction stops early and leaves
+        // the acting class over budget.
+        use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, TxIn, TxOut, Witness};
+        let mp = Mempool::new(1_000_000, 0);
+
+        let insert = |inputs: Vec<OutPoint>, nonce: u64, fee_rate: u64, scope: QuarantineScope| -> Txid {
+            let tx = Transaction {
+                version: bitcoin::transaction::Version(2),
+                lock_time: bitcoin::absolute::LockTime::ZERO,
+                input: inputs
+                    .into_iter()
+                    .map(|o| TxIn {
+                        previous_output: o,
+                        script_sig: ScriptBuf::new(),
+                        sequence: Sequence::MAX,
+                        witness: Witness::new(),
+                    })
+                    .collect(),
+                output: vec![TxOut {
+                    value: Amount::from_sat(nonce),
+                    script_pubkey: ScriptBuf::new(),
+                }],
+            };
+            let txid = tx.compute_txid();
+            let tx_size = bitcoin::consensus::serialize(&tx).len();
+            let mut inner = mp.inner.write();
+            inner.entries.insert(
+                txid,
+                MempoolEntry {
+                    tx,
+                    fee: 0,
+                    weight: 4,
+                    fee_rate,
+                    time: 0,
+                    fee_delta: 0,
+                    sigop_cost: 0,
+                    prev_scripthashes: Vec::new(),
+                    source: TxSource::Rpc,
+                    scope,
+                },
+            );
+            inner.account_insert(scope, tx_size);
+            txid
+        };
+
+        // Acting parent P (cheapest), a quarantined child C spending P, and a
+        // second acting entry that also has to go to meet the goal.
+        let p = insert(vec![], 1, 1, QuarantineScope::acting());
+        let c = insert(vec![OutPoint { txid: p, vout: 0 }], 2, 1, RELAY_TEMPLATE);
+        let a_other = insert(vec![], 3, 2, QuarantineScope::acting());
+
+        let p_size = {
+            let inner = mp.inner.read();
+            bitcoin::consensus::serialize(&inner.entries.get(&p).unwrap().tx).len()
+        };
+
+        // Just one byte past the parent alone: only by *excluding* C's bytes from
+        // the acting goal does eviction continue on to `a_other`.
+        let evicted = {
+            let mut inner = mp.inner.write();
+            Mempool::evict_lowest_fee_entries(&mut inner, p_size + 1, false)
+        };
+
+        assert!(evicted.contains(&p), "acting parent evicted");
+        assert!(
+            evicted.contains(&c),
+            "quarantined child removed for graph integrity (its parent is gone)"
+        );
+        assert!(
+            evicted.contains(&a_other),
+            "cross-class child bytes must not satisfy the acting goal — the second \
+             acting entry must still be evicted"
+        );
     }
 }
