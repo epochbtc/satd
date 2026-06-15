@@ -864,10 +864,17 @@ impl Mempool {
             buf.clear();
             Self::collect_children(&inner, &current, &mut buf);
             for &child in &buf {
-                // `insert` dedups and prevents re-walking (and guards against
-                // cycles, which a valid mempool can't contain). The root is
-                // never added back to itself.
-                if child != *txid && descendants.insert(child) {
+                // Only yield descendants actually present in the mempool, each
+                // once. The `entries` membership check restores the old
+                // full-scan's invariant (it iterated `entries`, so it could
+                // only ever return live txids) and keeps this robust to any
+                // future `spends`/`entries` inconsistency rather than trusting
+                // it. `insert` dedups and prevents re-walking; a valid mempool
+                // can't contain cycles, and the root is never re-added.
+                if child != *txid
+                    && inner.entries.contains_key(&child)
+                    && descendants.insert(child)
+                {
                     queue.push(child);
                 }
             }
@@ -2376,6 +2383,53 @@ mod tests {
                 brute_descendants(&mp, t),
                 "fast and brute-force descendant sets diverged for {t}"
             );
+        }
+    }
+
+    #[test]
+    fn spends_index_and_descendants_survive_block_confirmation() {
+        // Exercises the real removal path (`remove_for_block`), not just direct
+        // map inserts, to guard the `spends` ⊆ `entries` invariant that the
+        // `spends`-index walk relies on. a has two outputs; a -> b -> c is a
+        // chain and d spends a's second output.
+        let mp = Mempool::new(1_000_000, 0);
+        let a = insert_tx_linked(&mp, &[], 2, 1);
+        let b = insert_tx_linked(&mp, &[(a, 0)], 1, 2);
+        let c = insert_tx_linked(&mp, &[(b, 0)], 1, 3);
+        let d = insert_tx_linked(&mp, &[(a, 1)], 1, 4);
+        assert_eq!(mp.get_descendants(&a).unwrap(), HashSet::from([b, c, d]));
+
+        // Confirm `a` in a block — the standard "tx mined" eviction path.
+        let a_tx = mp
+            .get_all_entries()
+            .into_iter()
+            .find(|(t, _)| *t == a)
+            .map(|(_, e)| e.tx)
+            .expect("a is in the mempool");
+        let mut block = bitcoin::constants::genesis_block(bitcoin::Network::Regtest);
+        block.txdata.push(a_tx);
+        mp.remove_for_block(&block, 1);
+
+        // `a` is gone; its children remain (now spending a confirmed output).
+        assert!(mp.get_descendants(&a).is_none());
+        assert_eq!(mp.get_descendants(&b).unwrap(), HashSet::from([c]));
+        assert!(mp.get_descendants(&d).unwrap().is_empty());
+
+        // Invariant: removal cleaned the spends index — no value dangles outside
+        // `entries`. (Independent of the defensive check inside get_descendants.)
+        {
+            let inner = mp.inner.read();
+            for spender in inner.spends.values() {
+                assert!(
+                    inner.entries.contains_key(spender),
+                    "spends index points at a txid absent from entries after confirmation"
+                );
+            }
+        }
+
+        // And the fast walk still matches the brute-force reference for survivors.
+        for t in mp.get_all_entries().into_iter().map(|(t, _)| t) {
+            assert_eq!(mp.get_descendants(&t), brute_descendants(&mp, &t));
         }
     }
 }
