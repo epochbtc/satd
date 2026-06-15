@@ -105,7 +105,7 @@ pub async fn tx_broadcast(
     // mempool accept leaves it sitting on this node, unannounced.
     let txid = state
         .tx_broadcaster
-        .submit_and_announce(tx)
+        .submit_and_announce(tx, node::mempool::pool::TxSource::Esplora)
         .map_err(|e| EsploraError::BadRequest(format!("mempool reject: {e}")))?;
     Ok(txid.to_string())
 }

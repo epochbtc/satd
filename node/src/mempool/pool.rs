@@ -56,6 +56,31 @@ pub enum MempoolError {
     TooLongMempoolChain,
 }
 
+/// How a transaction reached this node — the value behind the policy engine's
+/// `tx.source` attribute (design §4.3). Recorded on every [`MempoolEntry`] at
+/// admission. As of PR 4a it is *recorded but unused*; PR 4c feeds it to the
+/// transaction-policy evaluator and PR 4d uses it to distinguish local from
+/// peer submissions for the refusal mapping.
+///
+/// Mirrors `satd_policy::Source`; the eval point converts between them so the
+/// node crate need not depend on the policy crate until PR 4c.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxSource {
+    /// Received from a peer over P2P (direct relay or orphan resolution).
+    P2p,
+    /// Local JSON-RPC `sendrawtransaction`.
+    Rpc,
+    /// Electrum `transaction.broadcast` / `broadcast_package`.
+    Electrum,
+    /// Esplora `POST /tx`.
+    Esplora,
+    /// MCP `send_transaction` tool.
+    Mcp,
+    /// Re-evaluation of an already-resident transaction: `mempool.dat` reload at
+    /// startup, or re-offer of a disconnected block's transactions after a reorg.
+    Reload,
+}
+
 /// Metadata for a transaction in the mempool.
 #[derive(Debug, Clone)]
 pub struct MempoolEntry {
@@ -79,6 +104,9 @@ pub struct MempoolEntry {
     /// (32 B/input), not full scripts: enough to match, bounded by mempool size.
     /// Empty for entries built outside admission (test fixtures, direct inserts).
     pub prev_scripthashes: Vec<Scripthash>,
+    /// How this transaction reached the node. Recorded at admission for the
+    /// transaction-policy engine (`tx.source`); unused until PR 4c.
+    pub source: TxSource,
 }
 
 /// Statistics about the mempool.
@@ -271,6 +299,7 @@ impl Mempool {
         tx: Transaction,
         chain_state: &ChainState,
         script_verifier: &dyn ScriptVerifier,
+        source: TxSource,
     ) -> Result<Txid, MempoolError> {
         let txid = tx.compute_txid();
 
@@ -576,6 +605,7 @@ impl Mempool {
                 fee_delta: 0,
                 sigop_cost,
                 prev_scripthashes,
+                source,
             },
         );
         inner.total_bytes += tx_size;
@@ -1230,6 +1260,7 @@ impl Mempool {
                 fee_delta: 0,
                 sigop_cost: 0,
                 prev_scripthashes: Vec::new(),
+                source: TxSource::Rpc,
             },
         );
     }
@@ -1259,6 +1290,7 @@ impl Mempool {
                 fee_delta: 0,
                 sigop_cost: 0,
                 prev_scripthashes: Vec::new(),
+                source: TxSource::Rpc,
             },
         );
         inner.unbroadcast.entry(txid).or_default();
@@ -1364,6 +1396,7 @@ mod tests {
                 fee_delta: 0,
                 sigop_cost: 0,
                 prev_scripthashes: Vec::new(),
+                source: TxSource::Rpc,
             },
         );
         inner.total_bytes = low_size;
@@ -1441,7 +1474,7 @@ mod tests {
             }],
         };
 
-        let result = mp.accept_transaction(tx, &cs, &NoopVerifier);
+        let result = mp.accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc);
         // Should fail (either MempoolFull or MissingInputs, depending on order)
         assert!(result.is_err());
 
@@ -1511,7 +1544,7 @@ mod tests {
             }],
         };
 
-        let result = mp.accept_transaction(coinbase_tx, &cs, &NoopVerifier);
+        let result = mp.accept_transaction(coinbase_tx, &cs, &NoopVerifier, TxSource::Rpc);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -1558,7 +1591,7 @@ mod tests {
             }],
         };
 
-        let result = mp.accept_transaction(tx, &cs, &NoopVerifier);
+        let result = mp.accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc);
         assert!(matches!(result, Err(MempoolError::MissingInputs)));
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1606,7 +1639,7 @@ mod tests {
             }],
         };
 
-        let result = mp.accept_transaction(tx, &cs, &NoopVerifier);
+        let result = mp.accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc);
         assert!(matches!(result, Err(MempoolError::Dust)));
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1659,7 +1692,7 @@ mod tests {
         // The dust gate must NOT fire (it's bypassed). The tx still fails
         // later on the missing/unspendable input — that's a non-standardness
         // path, which is exactly the point: consensus/input rules still apply.
-        let result = mp.accept_transaction(tx, &cs, &NoopVerifier);
+        let result = mp.accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc);
         assert!(
             !matches!(result, Err(MempoolError::Dust)),
             "acceptnonstdtxn must bypass the dust standardness check, got {result:?}"
@@ -1701,7 +1734,7 @@ mod tests {
             }],
         };
 
-        let result = mp.accept_transaction(tx, &cs, &NoopVerifier);
+        let result = mp.accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc);
         assert!(matches!(result, Err(MempoolError::NonStandardOpReturn)));
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1745,7 +1778,7 @@ mod tests {
             ],
         };
 
-        let result = mp.accept_transaction(tx, &cs, &NoopVerifier);
+        let result = mp.accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc);
         assert!(matches!(result, Err(MempoolError::NonStandardOpReturn)));
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1790,7 +1823,7 @@ mod tests {
             }],
         };
 
-        let result = mp.accept_transaction(tx, &cs, &NoopVerifier);
+        let result = mp.accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc);
         assert!(matches!(result, Err(MempoolError::NonStandardOpReturn)));
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1861,6 +1894,7 @@ mod tests {
                     fee_delta: 0,
                     sigop_cost: 0,
                     prev_scripthashes: Vec::new(),
+                    source: TxSource::Rpc,
                 },
             );
         }
@@ -1987,6 +2021,7 @@ mod tests {
                     fee_delta: 0,
                     sigop_cost: 0,
                     prev_scripthashes: Vec::new(),
+                    source: TxSource::Rpc,
                 },
             );
             for input in &child_tx.input {
@@ -2003,6 +2038,7 @@ mod tests {
                     fee_delta: 0,
                     sigop_cost: 0,
                     prev_scripthashes: Vec::new(),
+                    source: TxSource::Rpc,
                 },
             );
         }
@@ -2095,6 +2131,7 @@ mod tests {
                     fee_delta: 0,
                     sigop_cost: 0,
                     prev_scripthashes: Vec::new(),
+                    source: TxSource::Rpc,
                 },
             );
         }
@@ -2118,7 +2155,7 @@ mod tests {
         };
         let child_txid = child_tx.compute_txid();
 
-        mp.accept_transaction(child_tx, &cs, &NoopVerifier)
+        mp.accept_transaction(child_tx, &cs, &NoopVerifier, TxSource::Rpc)
             .expect("child admits via CPFP");
 
         let entry = mp.get(&child_txid).expect("child in mempool");

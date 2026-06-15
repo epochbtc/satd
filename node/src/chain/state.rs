@@ -4173,6 +4173,7 @@ impl ChainState {
                         tx.clone(),
                         self,
                         &*self.script_verifier,
+                        crate::mempool::pool::TxSource::Reload,
                     ) {
                         tracing::debug!(
                             %txid,
@@ -4891,9 +4892,12 @@ impl ChainState {
                 mempool.remove_for_block(block, *height);
             }
             for tx in &disconnect_info.disconnected_txs {
-                if let Err(e) =
-                    mempool.accept_transaction(tx.clone(), self, &*self.script_verifier)
-                {
+                if let Err(e) = mempool.accept_transaction(
+                    tx.clone(),
+                    self,
+                    &*self.script_verifier,
+                    crate::mempool::pool::TxSource::Reload,
+                ) {
                     tracing::debug!(
                         err = ?e,
                         "invalidate/reconsider reorg: mempool re-add failed (likely conflict)"

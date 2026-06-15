@@ -3814,6 +3814,7 @@ impl PeerManager {
             tx.clone(),
             &self.chain_state,
             self.chain_state.script_verifier(),
+            crate::mempool::pool::TxSource::P2p,
         ) {
             Ok(_) => {
                 self.broadcast_inv(id, txid);
@@ -3994,13 +3995,14 @@ impl PeerManager {
     pub fn broadcast_transaction(
         &self,
         hex_tx: &str,
+        source: crate::mempool::pool::TxSource,
     ) -> Result<serde_json::Value, (i32, String)> {
         let tx_bytes =
             hex::decode(hex_tx).map_err(|_| (-22, "TX decode failed".to_string()))?;
         let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&tx_bytes)
             .map_err(|_| (-22, "TX decode failed".to_string()))?;
         let txid =
-            self.submit_and_announce(tx).map_err(|e| (-25, e.to_string()))?;
+            self.submit_and_announce(tx, source).map_err(|e| (-25, e.to_string()))?;
         Ok(serde_json::Value::String(txid.to_string()))
     }
 
@@ -4024,12 +4026,14 @@ impl PeerManager {
     pub fn submit_and_announce(
         &self,
         tx: bitcoin::Transaction,
+        source: crate::mempool::pool::TxSource,
     ) -> Result<bitcoin::Txid, MempoolError> {
         let resubmit_txid = tx.compute_txid();
         let txid = match self.mempool.accept_transaction(
             tx,
             &self.chain_state,
             self.chain_state.script_verifier(),
+            source,
         ) {
             Ok(txid) => txid,
             Err(MempoolError::AlreadyExists) => resubmit_txid,
@@ -4200,6 +4204,7 @@ impl PeerManager {
                 child.tx.clone(),
                 &self.chain_state,
                 self.chain_state.script_verifier(),
+                crate::mempool::pool::TxSource::P2p,
             );
             match result {
                 Ok(_) => {
@@ -5304,6 +5309,7 @@ pub fn reconsider_orphans_on_block(
             child.tx.clone(),
             chain_state,
             chain_state.script_verifier(),
+            crate::mempool::pool::TxSource::P2p,
         );
         match result {
             Ok(_) => {
@@ -5402,13 +5408,22 @@ impl Drop for BulkLoadGuard<'_> {
 /// decoupled from the P2P manager and lets their tests inject a fake.
 pub trait TxBroadcaster: Send + Sync {
     /// Accept `tx` into the mempool and announce it to peers. Returns the
-    /// txid, or the mempool rejection reason.
-    fn submit_and_announce(&self, tx: bitcoin::Transaction) -> Result<bitcoin::Txid, MempoolError>;
+    /// txid, or the mempool rejection reason. `source` records the submission
+    /// surface for the transaction-policy engine (`tx.source`).
+    fn submit_and_announce(
+        &self,
+        tx: bitcoin::Transaction,
+        source: crate::mempool::pool::TxSource,
+    ) -> Result<bitcoin::Txid, MempoolError>;
 }
 
 impl TxBroadcaster for PeerManager {
-    fn submit_and_announce(&self, tx: bitcoin::Transaction) -> Result<bitcoin::Txid, MempoolError> {
-        PeerManager::submit_and_announce(self, tx)
+    fn submit_and_announce(
+        &self,
+        tx: bitcoin::Transaction,
+        source: crate::mempool::pool::TxSource,
+    ) -> Result<bitcoin::Txid, MempoolError> {
+        PeerManager::submit_and_announce(self, tx, source)
     }
 }
 
@@ -5855,7 +5870,10 @@ mod tests {
             output: vec![TxOut { value: Amount::from_sat(1000), script_pubkey: ScriptBuf::new() }],
         };
 
-        assert!(pm.submit_and_announce(tx).is_err(), "tx with missing inputs must be rejected");
+        assert!(
+            pm.submit_and_announce(tx, crate::mempool::pool::TxSource::Rpc).is_err(),
+            "tx with missing inputs must be rejected"
+        );
         assert!(rx1.try_recv().is_err(), "a rejected tx must not be announced to peers");
     }
 
@@ -5907,7 +5925,7 @@ mod tests {
         let txid = tx.compute_txid();
         pm.mempool.insert_entry_for_test(txid, tx.clone(), 0);
 
-        let result = pm.submit_and_announce(tx);
+        let result = pm.submit_and_announce(tx, crate::mempool::pool::TxSource::Rpc);
         assert_eq!(result.ok(), Some(txid), "resubmit of a mempool tx must succeed");
         match rx1.try_recv() {
             Ok(NetworkMessage::Inv(inv)) => {
