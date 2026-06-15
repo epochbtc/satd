@@ -253,6 +253,10 @@ pub fn mempool_config_from(c: &Config) -> MempoolConfig {
         expiry_secs: c.mempoolexpiry.saturating_mul(3600),
         permit_bare_multisig: c.permitbaremultisig,
         accept_non_std_txn: c.acceptnonstdtxn,
+        // The quarantine class is inert until a policy is loaded (PR 4c), so the
+        // budget stays at its default here; PR 4c adds the `quarantinemempool`
+        // config knob alongside `policyfile`.
+        quarantine_max_bytes: node::mempool::policy::DEFAULT_QUARANTINE_MEMPOOL_SIZE,
     }
 }
 

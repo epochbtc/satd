@@ -262,6 +262,9 @@ enum EvictReason {
   EVICT_REASON_FULL_POOL = 1;
   EVICT_REASON_EXPIRY = 2;
   EVICT_REASON_BLOCK_CONFLICT = 3;
+  // Evicted from the quarantine class because its byte budget overflowed
+  // (fee-rate eviction within the held set). Inert until a policy is loaded.
+  EVICT_REASON_POLICY = 4;
 }
 
 // Mempool state transitions, mirroring `node::mempool::events::MempoolEvent`.
