@@ -1,5 +1,6 @@
 use bitcoin::{Block, OutPoint, Transaction, TxOut, Txid};
 use parking_lot::{Mutex, RwLock};
+use rustc_hash::FxHashMap;
 use std::collections::{HashMap, HashSet, VecDeque};
 use tokio::sync::broadcast;
 
@@ -94,8 +95,12 @@ pub struct MempoolInfo {
 }
 
 struct MempoolInner {
-    entries: HashMap<Txid, MempoolEntry>,
-    spends: HashMap<OutPoint, Txid>,
+    // Keyed by already-uniform double-SHA256 hashes (Txid / OutPoint), so these
+    // use a fast hasher (`FxHashMap`) rather than the default SipHash: hashing a
+    // hash again for DoS resistance buys nothing here and showed up as a real
+    // cost in mempool graph traversals. See `get_descendants` / `collect_children`.
+    entries: FxHashMap<Txid, MempoolEntry>,
+    spends: FxHashMap<OutPoint, Txid>,
     total_bytes: usize,
     /// Locally-originated txs (submitted here via a broadcast surface) that
     /// have not yet been confirmed to have propagated. Maps each txid to the
@@ -195,8 +200,8 @@ impl Mempool {
     pub fn with_config(config: MempoolConfig) -> Self {
         Self {
             inner: RwLock::new(MempoolInner {
-                entries: HashMap::new(),
-                spends: HashMap::new(),
+                entries: FxHashMap::default(),
+                spends: FxHashMap::default(),
                 total_bytes: 0,
                 unbroadcast: HashMap::new(),
             }),
@@ -824,6 +829,27 @@ impl Mempool {
     }
 
     /// Get the set of in-mempool descendants for a transaction.
+    /// Append the direct in-mempool children of `txid` — transactions that
+    /// spend any of its outputs — to `buf`, via the `spends` reverse index.
+    /// O(#outputs), no full-mempool scan. May append the same child more than
+    /// once (a child can spend several of `txid`'s outputs); callers dedup.
+    /// Assumes the caller already holds the inner lock.
+    fn collect_children(inner: &MempoolInner, txid: &Txid, buf: &mut Vec<Txid>) {
+        let Some(entry) = inner.entries.get(txid) else {
+            return;
+        };
+        let n_outs = entry.tx.output.len() as u32;
+        for vout in 0..n_outs {
+            if let Some(&child) = inner.spends.get(&OutPoint { txid: *txid, vout }) {
+                buf.push(child);
+            }
+        }
+    }
+
+    /// Get all transitive in-mempool descendants of `txid` (every transaction
+    /// reachable by following spends downward), excluding `txid` itself.
+    /// Walks the `spends` reverse index via [`Self::collect_children`] —
+    /// O(descendants × outputs), not the full-mempool scan per hop it used to do.
     pub fn get_descendants(&self, txid: &Txid) -> Option<HashSet<Txid>> {
         let inner = self.inner.read();
         if !inner.entries.contains_key(txid) {
@@ -832,23 +858,17 @@ impl Mempool {
 
         let mut descendants = HashSet::new();
         let mut queue = vec![*txid];
+        let mut buf: Vec<Txid> = Vec::new();
 
         while let Some(current) = queue.pop() {
-            if let Some(current_entry) = inner.entries.get(&current) {
-                let current_txid = current_entry.tx.compute_txid();
-                // Find children: entries whose inputs reference outputs of current
-                for (child_txid, child_entry) in &inner.entries {
-                    if *child_txid != *txid
-                        && !descendants.contains(child_txid)
-                        && child_entry
-                            .tx
-                            .input
-                            .iter()
-                            .any(|i| i.previous_output.txid == current_txid)
-                    {
-                        descendants.insert(*child_txid);
-                        queue.push(*child_txid);
-                    }
+            buf.clear();
+            Self::collect_children(&inner, &current, &mut buf);
+            for &child in &buf {
+                // `insert` dedups and prevents re-walking (and guards against
+                // cycles, which a valid mempool can't contain). The root is
+                // never added back to itself.
+                if child != *txid && descendants.insert(child) {
+                    queue.push(child);
                 }
             }
         }
@@ -861,16 +881,16 @@ impl Mempool {
     /// index for O(outputs) lookup. Does *not* recurse.
     pub fn get_children(&self, txid: &Txid) -> Option<Vec<Txid>> {
         let inner = self.inner.read();
-        let entry = inner.entries.get(txid)?;
-        let n_outs = entry.tx.output.len() as u32;
-        let mut children: Vec<Txid> = Vec::new();
+        if !inner.entries.contains_key(txid) {
+            return None;
+        }
+        let mut raw: Vec<Txid> = Vec::new();
+        Self::collect_children(&inner, txid, &mut raw);
         let mut seen: HashSet<Txid> = HashSet::new();
-        for vout in 0..n_outs {
-            let op = OutPoint { txid: *txid, vout };
-            if let Some(child) = inner.spends.get(&op)
-                && seen.insert(*child)
-            {
-                children.push(*child);
+        let mut children: Vec<Txid> = Vec::with_capacity(raw.len());
+        for child in raw {
+            if seen.insert(child) {
+                children.push(child);
             }
         }
         Some(children)
@@ -2186,5 +2206,176 @@ mod tests {
         assert!(mp.unbroadcast_txids().is_empty());
         assert!(!mp.is_unbroadcast(&txid));
         assert_eq!(mp.info().unbroadcast, 0);
+    }
+
+    // ---- get_descendants / get_children traversal (spends-index rewrite) ----
+
+    /// Insert a tx spending `parents` (each a `(txid, vout)`), with `n_outputs`
+    /// outputs, into `mp` while maintaining the `spends` reverse index exactly
+    /// as admission does. `tag` makes the txid unique (via `lock_time`).
+    /// Returns the new txid.
+    fn insert_tx_linked(mp: &Mempool, parents: &[(Txid, u32)], n_outputs: u32, tag: u32) -> Txid {
+        use bitcoin::blockdata::locktime::absolute::LockTime;
+        use bitcoin::hashes::Hash;
+        use bitcoin::{Amount, ScriptBuf, Sequence, TxIn, TxOut, Witness, transaction};
+
+        let input: Vec<TxIn> = if parents.is_empty() {
+            // Root: spend a synthetic external prevout (unique per `tag`).
+            vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+                        [0x11; 32],
+                    )),
+                    vout: tag,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }]
+        } else {
+            parents
+                .iter()
+                .map(|&(txid, vout)| TxIn {
+                    previous_output: OutPoint { txid, vout },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                })
+                .collect()
+        };
+
+        let tx = Transaction {
+            version: transaction::Version(2),
+            lock_time: LockTime::from_consensus(tag),
+            input,
+            output: (0..n_outputs)
+                .map(|_| TxOut {
+                    value: Amount::from_sat(1_000),
+                    script_pubkey: ScriptBuf::new(),
+                })
+                .collect(),
+        };
+        let txid = tx.compute_txid();
+
+        let mut inner = mp.inner.write();
+        for i in &tx.input {
+            inner.spends.insert(i.previous_output, txid);
+        }
+        inner.entries.insert(
+            txid,
+            MempoolEntry {
+                tx,
+                fee: 1_000,
+                weight: 400,
+                fee_rate: 2_500,
+                time: 0,
+                fee_delta: 0,
+                sigop_cost: 0,
+                prev_scripthashes: Vec::new(),
+            },
+        );
+        txid
+    }
+
+    /// Reference implementation: the pre-rewrite O(N) full-mempool scan.
+    /// Used only to prove the fast `spends`-index walk returns identical sets.
+    fn brute_descendants(mp: &Mempool, txid: &Txid) -> Option<HashSet<Txid>> {
+        let inner = mp.inner.read();
+        if !inner.entries.contains_key(txid) {
+            return None;
+        }
+        let mut descendants = HashSet::new();
+        let mut queue = vec![*txid];
+        while let Some(current) = queue.pop() {
+            if let Some(current_entry) = inner.entries.get(&current) {
+                let current_txid = current_entry.tx.compute_txid();
+                for (child_txid, child_entry) in &inner.entries {
+                    if *child_txid != *txid
+                        && !descendants.contains(child_txid)
+                        && child_entry
+                            .tx
+                            .input
+                            .iter()
+                            .any(|i| i.previous_output.txid == current_txid)
+                    {
+                        descendants.insert(*child_txid);
+                        queue.push(*child_txid);
+                    }
+                }
+            }
+        }
+        Some(descendants)
+    }
+
+    #[test]
+    fn get_descendants_absent_txid_is_none() {
+        let mp = Mempool::new(1_000_000, 0);
+        assert!(mp.get_descendants(&dummy_txid(7)).is_none());
+        assert!(mp.get_children(&dummy_txid(7)).is_none());
+    }
+
+    #[test]
+    fn get_descendants_walks_a_chain() {
+        // a -> b -> c -> d
+        let mp = Mempool::new(1_000_000, 0);
+        let a = insert_tx_linked(&mp, &[], 1, 1);
+        let b = insert_tx_linked(&mp, &[(a, 0)], 1, 2);
+        let c = insert_tx_linked(&mp, &[(b, 0)], 1, 3);
+        let d = insert_tx_linked(&mp, &[(c, 0)], 1, 4);
+
+        assert_eq!(mp.get_descendants(&a).unwrap(), HashSet::from([b, c, d]));
+        assert_eq!(mp.get_descendants(&b).unwrap(), HashSet::from([c, d]));
+        assert_eq!(mp.get_descendants(&d).unwrap(), HashSet::new());
+        assert_eq!(mp.get_children(&a).unwrap(), vec![b]);
+        assert!(mp.get_children(&d).unwrap().is_empty());
+    }
+
+    #[test]
+    fn get_descendants_handles_fanout_and_diamond() {
+        // a has 2 outputs; b spends a:0, c spends a:1; d spends both b:0 and c:0.
+        // d is reachable from a via two paths and must appear exactly once.
+        let mp = Mempool::new(1_000_000, 0);
+        let a = insert_tx_linked(&mp, &[], 2, 1);
+        let b = insert_tx_linked(&mp, &[(a, 0)], 1, 2);
+        let c = insert_tx_linked(&mp, &[(a, 1)], 1, 3);
+        let d = insert_tx_linked(&mp, &[(b, 0), (c, 0)], 1, 4);
+
+        assert_eq!(mp.get_descendants(&a).unwrap(), HashSet::from([b, c, d]));
+        assert_eq!(mp.get_descendants(&b).unwrap(), HashSet::from([d]));
+        assert_eq!(mp.get_descendants(&c).unwrap(), HashSet::from([d]));
+        // Direct children of a, in vout order.
+        assert_eq!(mp.get_children(&a).unwrap(), vec![b, c]);
+    }
+
+    #[test]
+    fn get_children_dedups_multi_output_spend() {
+        // child spends two different outputs of the same parent.
+        let mp = Mempool::new(1_000_000, 0);
+        let a = insert_tx_linked(&mp, &[], 2, 1);
+        let child = insert_tx_linked(&mp, &[(a, 0), (a, 1)], 1, 2);
+        assert_eq!(mp.get_children(&a).unwrap(), vec![child]);
+        assert_eq!(mp.get_descendants(&a).unwrap(), HashSet::from([child]));
+    }
+
+    #[test]
+    fn get_descendants_matches_brute_force_reference() {
+        // A mixed graph: independent roots, a chain, a fan-out, and a diamond.
+        let mp = Mempool::new(1_000_000, 0);
+        let r1 = insert_tx_linked(&mp, &[], 3, 1);
+        let _r2 = insert_tx_linked(&mp, &[], 1, 2); // unconnected singleton
+        let c1 = insert_tx_linked(&mp, &[(r1, 0)], 2, 3);
+        let c2 = insert_tx_linked(&mp, &[(r1, 1)], 1, 4);
+        let _g1 = insert_tx_linked(&mp, &[(c1, 0)], 1, 5);
+        let _diamond = insert_tx_linked(&mp, &[(c1, 1), (c2, 0)], 1, 6);
+
+        let all: Vec<Txid> = mp.get_all_entries().into_iter().map(|(t, _)| t).collect();
+        assert_eq!(all.len(), 6);
+        for t in &all {
+            assert_eq!(
+                mp.get_descendants(t),
+                brute_descendants(&mp, t),
+                "fast and brute-force descendant sets diverged for {t}"
+            );
+        }
     }
 }

@@ -2648,6 +2648,7 @@ dependencies = [
  "rcgen",
  "reqwest",
  "rocksdb",
+ "rustc-hash",
  "satd-auth",
  "serde",
  "serde_json",
