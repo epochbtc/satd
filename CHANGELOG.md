@@ -22,13 +22,13 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   chain-shaped lookups are linear. (The aggregate `getrawmempool true` dump
   over a very wide cluster is still superlinear until per-transaction
   descendant limits are enforced — tracked as follow-up.) Output is identical.
-  See the [release notes](docs/release-notes/0.4.0-pre.md).
+  See the [release notes](docs/release-notes/0.3.1-pre.md).
 - **Profilable release binaries.** Release builds now ship with frame pointers
   + line-table debug info; the binary stays stripped (same download size) and
   the debug info is published as a separate per-target `*-debuginfo.tar.zst`
   sidecar, so production nodes can be profiled with `perf -g` and symbolized
   against the exact running binary. See the
-  [release notes](docs/release-notes/0.4.0-pre.md).
+  [release notes](docs/release-notes/0.3.1-pre.md).
 - **Fee estimation reworked.** Fixed inverted smart-fee tiers (now monotone:
   `High ≥ Medium ≥ Low ≥ economy`); unified `estimatefees`,
   `estimatesmartfee`, the TUI, the MCP `estimate_fee` tool, Esplora
@@ -38,7 +38,7 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   endpoints. **Corrected a 4× fee over-report** (regression since 0.3.0) on
   Esplora `/fee-estimates` + `/mempool` fee rates and Electrum
   `estimatefee`/`relayfee`/`get_fee_histogram` — see the
-  [release notes](docs/release-notes/0.4.0-pre.md) for the upgrade note.
+  [release notes](docs/release-notes/0.3.1-pre.md) for the upgrade note.
 
 ## Releases
 

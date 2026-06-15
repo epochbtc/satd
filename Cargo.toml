@@ -17,7 +17,7 @@ debug = "line-tables-only"
 
 [workspace.package]
 authors = ["Benjamen Keroack <ben@keroack.com>", "20 Gauge Software, Inc.", "The satd developers"]
-version = "0.4.0-pre"
+version = "0.3.1-pre"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/epochbtc/satd"
