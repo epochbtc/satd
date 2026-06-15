@@ -864,11 +864,18 @@ pub async fn start(
                 .with_suggestion("Pass the raw transaction as a hex string in the first argument.")
                 .into_error_object()
         })?;
+        // `allowquarantined` (satd extension, opt-in): submit into the quarantine
+        // class even when a relay-scoped policy rule matches, instead of the §6.1
+        // refusal. Read from the second positional slot (Core's `maxfeerate`,
+        // which satd does not enforce); a numeric `maxfeerate` there fails the
+        // bool parse and is harmlessly treated as "not set" (default false), so
+        // Core clients are unaffected.
+        let allow_quarantined: bool = seq.optional_next::<bool>().ok().flatten().unwrap_or(false);
         // Submit + announce is the shared core (`broadcast_transaction`);
         // this handler only maps the error to the JSON-RPC taxonomy.
         let result = ctx
             .peer_manager
-            .broadcast_transaction(&hex_tx, crate::mempool::pool::TxSource::Rpc)
+            .broadcast_transaction(&hex_tx, crate::mempool::pool::TxSource::Rpc, allow_quarantined)
             .map_err(|(code, msg)| {
                 // Classify the mempool error by its code (Core taxonomy):
                 // -22 = decode failed, -25 = mempool acceptance failure.

@@ -479,7 +479,7 @@ mod construction {
     #[test]
     fn test_send_transaction_invalid_hex() {
         let (ctx, _dir) = make_test_ctx();
-        let result = cst::send_transaction(&ctx, "notvalidhex");
+        let result = cst::send_transaction(&ctx, "notvalidhex", false);
         let json: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert!(json["error"].is_string());
     }

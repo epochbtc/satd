@@ -84,6 +84,35 @@ impl MempoolEvent {
     }
 }
 
+/// Quarantine-class lifecycle event, carried on a **separate** broadcast channel
+/// from [`MempoolEvent`] (design §10): the default mempool stream reflects the
+/// *acting* class only — a quarantined admission emits no `Enter` — so quarantine
+/// transitions are surfaced here for explicit, opt-in subscribers. PR 4c places
+/// held entries; PR 4d emits this on placement; PR 6 adds `Promoted`/`Demoted`
+/// on reload and PR 7 builds the operator-facing subscription surface.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum QuarantineEvent {
+    /// A transaction was admitted into the quarantine class. `rule` is the
+    /// matching `quarantine` rule (or the marker for an infectious-ancestor
+    /// inheritance); `relay`/`template` are the withheld scopes.
+    Quarantined {
+        txid: Txid,
+        rule: String,
+        relay: bool,
+        template: bool,
+        time: u64,
+    },
+}
+
+impl QuarantineEvent {
+    pub fn txid(&self) -> &Txid {
+        match self {
+            Self::Quarantined { txid, .. } => txid,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,5 +180,21 @@ mod tests {
         let j = serde_json::to_value(&ev).unwrap();
         assert_eq!(j["kind"], "leave_replaced");
         assert!(j["replacing_txid"].is_string());
+    }
+
+    #[test]
+    fn quarantined_serializes_with_rule_and_scope() {
+        let ev = QuarantineEvent::Quarantined {
+            txid: tx(6),
+            rule: "ordinals".to_string(),
+            relay: true,
+            template: true,
+            time: 1_700_000_000,
+        };
+        let j = serde_json::to_value(&ev).unwrap();
+        assert_eq!(j["kind"], "quarantined");
+        assert_eq!(j["rule"], "ordinals");
+        assert_eq!(j["relay"], true);
+        assert_eq!(j["template"], true);
     }
 }

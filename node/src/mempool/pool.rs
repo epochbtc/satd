@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use tokio::sync::broadcast;
 
 use crate::chain::state::ChainState;
-use crate::mempool::events::{EvictReason, MempoolEvent};
+use crate::mempool::events::{EvictReason, MempoolEvent, QuarantineEvent};
 use crate::mempool::policy::{self, MAX_STANDARD_TX_WEIGHT};
 use crate::mempool::policy_engine::{self, PolicyCtx};
 use crate::validation::script::ScriptVerifier;
@@ -24,6 +24,12 @@ pub const EVENT_RING_CAPACITY: usize = 50;
 
 /// Coinbase maturity: outputs cannot be spent until this many confirmations.
 const COINBASE_MATURITY: u32 = 100;
+
+/// Rule name attributed to a quarantine placement whose held scope is *only*
+/// inherited from a quarantined ancestor (§3 infectious descendants) — the tx
+/// itself matched no rule. Surfaced in the §6.1 refusal error and the
+/// `Quarantined` event so the cause is legible.
+const INFECTIOUS_RULE: &str = "(infectious: quarantined ancestor)";
 
 #[derive(Debug, thiserror::Error)]
 pub enum MempoolError {
@@ -55,6 +61,15 @@ pub enum MempoolError {
     InsufficientReplacementFee(u64, u64),
     #[error("too-long-mempool-chain")]
     TooLongMempoolChain,
+    /// A locally-submitted transaction drew a relay-scoped quarantine verdict
+    /// (design §6.1): refused rather than silently held, with the rule named.
+    /// Resubmit with `allowquarantined` to hold it locally anyway. P2P-sourced
+    /// transactions are never refused — they quarantine as designed.
+    #[error(
+        "txn-policy-quarantined: held by policy rule '{0}' (would not be relayed); \
+         resubmit with allowquarantined=true to hold it locally"
+    )]
+    Quarantined(String),
 }
 
 /// How a transaction reached this node — the value behind the policy engine's
@@ -80,6 +95,20 @@ pub enum TxSource {
     /// Re-evaluation of an already-resident transaction: `mempool.dat` reload at
     /// startup, or re-offer of a disconnected block's transactions after a reorg.
     Reload,
+}
+
+impl TxSource {
+    /// True for the four local submission surfaces (`sendrawtransaction`,
+    /// Electrum broadcast, Esplora `POST /tx`, MCP `send_transaction`). These are
+    /// subject to the §6.1 relay-quarantine refusal; `P2p` and `Reload` are not
+    /// (P2P traffic quarantines as designed; reloaded/reorged txs re-enter
+    /// normally).
+    pub fn is_local(self) -> bool {
+        matches!(
+            self,
+            TxSource::Rpc | TxSource::Electrum | TxSource::Esplora | TxSource::Mcp
+        )
+    }
 }
 
 /// The relay/template surfaces a quarantined mempool entry is withheld from
@@ -297,6 +326,12 @@ pub struct Mempool {
     /// Always maintained (cheap) so MCP tools work whether or not
     /// the broadcast sender is wired.
     event_ring: Mutex<VecDeque<MempoolEvent>>,
+    /// Separate broadcast channel for quarantine-class lifecycle events
+    /// (design §10): the default `event_tx` stream stays acting-class only, so a
+    /// quarantined admission emits no `Enter` there — it emits `Quarantined`
+    /// here instead. Wired by the opt-in subscription surface (PR 7); `None`
+    /// until then, so emission is a no-op exactly like `event_tx`.
+    quarantine_event_tx: Mutex<Option<broadcast::Sender<QuarantineEvent>>>,
 }
 
 impl Mempool {
@@ -322,6 +357,7 @@ impl Mempool {
             policy: arc_swap::ArcSwapOption::empty(),
             event_tx: Mutex::new(None),
             event_ring: Mutex::new(VecDeque::with_capacity(EVENT_RING_CAPACITY)),
+            quarantine_event_tx: Mutex::new(None),
         }
     }
 
@@ -336,6 +372,23 @@ impl Mempool {
     /// has been wired (typical in tests that bypass `main.rs`).
     pub fn subscribe_events(&self) -> Option<broadcast::Receiver<MempoolEvent>> {
         self.event_tx.lock().as_ref().map(|tx| tx.subscribe())
+    }
+
+    /// Wire the broadcast sender for the separate quarantine-event channel
+    /// (design §10). Optional; the opt-in subscription surface (PR 7) installs
+    /// it. Until then `Quarantined` emissions are dropped, like default events
+    /// with no sender.
+    pub fn set_quarantine_event_sender(&self, tx: broadcast::Sender<QuarantineEvent>) {
+        *self.quarantine_event_tx.lock() = Some(tx);
+    }
+
+    /// Subscribe to quarantine-class lifecycle events. `None` if no sender is
+    /// wired.
+    pub fn subscribe_quarantine_events(&self) -> Option<broadcast::Receiver<QuarantineEvent>> {
+        self.quarantine_event_tx
+            .lock()
+            .as_ref()
+            .map(|tx| tx.subscribe())
     }
 
     /// Return the most recent `EVENT_RING_CAPACITY` events tapped
@@ -355,6 +408,14 @@ impl Mempool {
             }
         }
         if let Some(tx) = self.event_tx.lock().as_ref() {
+            let _ = tx.send(event);
+        }
+    }
+
+    /// Emit a quarantine-class event on the separate channel (§10). Best-effort,
+    /// no-op when no sender is wired.
+    fn emit_quarantine(&self, event: QuarantineEvent) {
+        if let Some(tx) = self.quarantine_event_tx.lock().as_ref() {
             let _ = tx.send(event);
         }
     }
@@ -507,6 +568,7 @@ impl Mempool {
         chain_state: &ChainState,
         script_verifier: &dyn ScriptVerifier,
         source: TxSource,
+        allow_quarantined: bool,
     ) -> Result<Txid, MempoolError> {
         let txid = tx.compute_txid();
 
@@ -714,7 +776,11 @@ impl Mempool {
         // standardness failure. When no policy is active it is a no-op (acting
         // scope; no deferral is possible) — byte-identical to a build with the
         // engine compiled out (I8).
-        let scope = if policy_active {
+        // `quarantine_rule` names the rule responsible for any held scope — the
+        // tx's own matching `quarantine` rule, or the infectious-ancestor marker
+        // when the scope is purely inherited. Used for the §6.1 refusal error and
+        // the `Quarantined` event below.
+        let (scope, quarantine_rule): (QuarantineScope, Option<String>) = if policy_active {
             let rs = ruleset
                 .as_ref()
                 .expect("policy_active is set only when the ruleset is Some");
@@ -745,13 +811,13 @@ impl Mempool {
             // (§6.2/§7): `Allow` forgives it; `Pass`/`Quarantine` let the
             // baseline rejection stand — the quarantine class is not a dumping
             // ground for nonstandard traffic.
-            let own_scope = match &verdict {
-                satd_policy::Verdict::Allow { .. } => QuarantineScope::acting(),
+            let (own_scope, own_rule) = match &verdict {
+                satd_policy::Verdict::Allow { .. } => (QuarantineScope::acting(), None),
                 satd_policy::Verdict::Pass => {
                     if let Some(e) = deferred_nonstd {
                         return Err(e);
                     }
-                    QuarantineScope::acting()
+                    (QuarantineScope::acting(), None)
                 }
                 satd_policy::Verdict::Quarantine { rule, scope } => {
                     if let Some(e) = deferred_nonstd {
@@ -766,7 +832,7 @@ impl Mempool {
                     } else {
                         tracing::debug!(%txid, rule = %rule, scope = %scope, "policy quarantine");
                     }
-                    policy_engine::map_scope(*scope)
+                    (policy_engine::map_scope(*scope), Some(rule.clone()))
                 }
             };
 
@@ -784,12 +850,37 @@ impl Mempool {
                     final_scope.template |= e.scope.template;
                 }
             }
-            final_scope
+            // Name the responsible rule: the tx's own match, or — when the held
+            // scope is only inherited — the infectious-ancestor marker.
+            let rule = if final_scope.is_quarantined() {
+                own_rule.or_else(|| Some(INFECTIOUS_RULE.to_string()))
+            } else {
+                None
+            };
+            (final_scope, rule)
         } else {
             // No active policy ⇒ `has_allow` is false ⇒ `deferred_nonstd` is None
             // (standardness already rejected early). Acting scope, unconditionally.
-            QuarantineScope::acting()
+            (QuarantineScope::acting(), None)
         };
+
+        // §6.1 local-submission refusal: a transaction submitted through a local
+        // surface that draws a *relay*-scoped quarantine verdict is refused (with
+        // the rule named) rather than silently held — a relay-quarantined local
+        // tx is dead on arrival (never announced, never mined), so returning a
+        // success txid that then never appears in standard mempool queries is a
+        // trap for Core-compatible wallets. Three boundaries (§6.1):
+        //   • template-only quarantine does NOT refuse (it relays/serves fine);
+        //   • `allowquarantined` overrides, submitting into quarantine anyway;
+        //   • P2P-sourced traffic is never refused — it quarantines as designed.
+        // Refusing here (before placement) keeps a refused tx out of every view.
+        if source.is_local() && scope.relay && !allow_quarantined {
+            return Err(MempoolError::Quarantined(
+                quarantine_rule
+                    .clone()
+                    .unwrap_or_else(|| "(policy)".to_string()),
+            ));
+        }
 
         // Per-class capacity check — the new tx is charged to its own class's
         // budget (acting → `max_size_bytes`, quarantine → `quarantine_max_bytes`)
@@ -934,13 +1025,27 @@ impl Mempool {
                 replacing_txid: txid,
             });
         }
-        self.emit(MempoolEvent::Enter {
-            txid,
-            fee,
-            vsize: vsize_u64,
-            fee_rate_sat_per_kvb: fee_rate,
-            time: now,
-        });
+        // §10: the default mempool stream reflects the *acting* class only — a
+        // quarantined admission emits no `Enter` there. Held placements emit
+        // `Quarantined` on the separate channel instead; acting placements emit
+        // `Enter` exactly as before.
+        if scope.is_quarantined() {
+            self.emit_quarantine(QuarantineEvent::Quarantined {
+                txid,
+                rule: quarantine_rule.unwrap_or_else(|| "(policy)".to_string()),
+                relay: scope.relay,
+                template: scope.template,
+                time: now,
+            });
+        } else {
+            self.emit(MempoolEvent::Enter {
+                txid,
+                fee,
+                vsize: vsize_u64,
+                fee_rate_sat_per_kvb: fee_rate,
+                time: now,
+            });
+        }
 
         Ok(txid)
     }
@@ -1841,7 +1946,7 @@ mod tests {
             }],
         };
 
-        let result = mp.accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc);
+        let result = mp.accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc, false);
         // Should fail (either MempoolFull or MissingInputs, depending on order)
         assert!(result.is_err());
 
@@ -1911,7 +2016,7 @@ mod tests {
             }],
         };
 
-        let result = mp.accept_transaction(coinbase_tx, &cs, &NoopVerifier, TxSource::Rpc);
+        let result = mp.accept_transaction(coinbase_tx, &cs, &NoopVerifier, TxSource::Rpc, false);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -1958,7 +2063,7 @@ mod tests {
             }],
         };
 
-        let result = mp.accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc);
+        let result = mp.accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc, false);
         assert!(matches!(result, Err(MempoolError::MissingInputs)));
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -2006,7 +2111,7 @@ mod tests {
             }],
         };
 
-        let result = mp.accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc);
+        let result = mp.accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc, false);
         assert!(matches!(result, Err(MempoolError::Dust)));
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -2059,7 +2164,7 @@ mod tests {
         // The dust gate must NOT fire (it's bypassed). The tx still fails
         // later on the missing/unspendable input — that's a non-standardness
         // path, which is exactly the point: consensus/input rules still apply.
-        let result = mp.accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc);
+        let result = mp.accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc, false);
         assert!(
             !matches!(result, Err(MempoolError::Dust)),
             "acceptnonstdtxn must bypass the dust standardness check, got {result:?}"
@@ -2101,7 +2206,7 @@ mod tests {
             }],
         };
 
-        let result = mp.accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc);
+        let result = mp.accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc, false);
         assert!(matches!(result, Err(MempoolError::NonStandardOpReturn)));
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -2145,7 +2250,7 @@ mod tests {
             ],
         };
 
-        let result = mp.accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc);
+        let result = mp.accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc, false);
         assert!(matches!(result, Err(MempoolError::NonStandardOpReturn)));
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -2190,7 +2295,7 @@ mod tests {
             }],
         };
 
-        let result = mp.accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc);
+        let result = mp.accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc, false);
         assert!(matches!(result, Err(MempoolError::NonStandardOpReturn)));
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -2526,7 +2631,7 @@ mod tests {
         };
         let child_txid = child_tx.compute_txid();
 
-        mp.accept_transaction(child_tx, &cs, &NoopVerifier, TxSource::Rpc)
+        mp.accept_transaction(child_tx, &cs, &NoopVerifier, TxSource::Rpc, false)
             .expect("child admits via CPFP");
 
         let entry = mp.get(&child_txid).expect("child in mempool");
@@ -2888,7 +2993,7 @@ mod tests {
 
         let tx = spend(op, 99_000, 0x22);
         let txid = mp
-            .accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc)
+            .accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc, false)
             .expect("admitted");
         let inner = mp.inner.read();
         assert!(inner.entries.get(&txid).unwrap().scope.is_acting());
@@ -2907,7 +3012,7 @@ mod tests {
 
         let tx = spend(op, 99_000, 0x22);
         let txid = mp
-            .accept_transaction(tx, &cs, &NoopVerifier, TxSource::P2p)
+            .accept_transaction(tx, &cs, &NoopVerifier, TxSource::P2p, false)
             .expect("admitted into quarantine");
         let inner = mp.inner.read();
         let entry = inner.entries.get(&txid).unwrap();
@@ -2930,7 +3035,7 @@ mod tests {
 
         let tx = spend(op, 1, 0x22); // 1-sat output ⇒ dust
         let txid = mp
-            .accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc)
+            .accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc, false)
             .expect("allow forgives the dust nonstandardness");
         let inner = mp.inner.read();
         assert!(inner.entries.get(&txid).unwrap().scope.is_acting());
@@ -2950,7 +3055,7 @@ mod tests {
 
         let tx = spend(op, 1, 0x22); // dust
         let err = mp
-            .accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc)
+            .accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc, false)
             .unwrap_err();
         assert!(matches!(err, MempoolError::Dust), "got {err:?}");
         assert_eq!(mp.quarantine_bytes(), 0);
@@ -2971,7 +3076,7 @@ mod tests {
 
         let tx = spend(op, 1, 0x22); // dust, version 2 (would match the quarantine rule)
         let err = mp
-            .accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc)
+            .accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc, false)
             .unwrap_err();
         assert!(matches!(err, MempoolError::Dust), "got {err:?}");
         assert_eq!(
@@ -2993,7 +3098,7 @@ mod tests {
 
         let tx = spend(outpoint(0xde), 1, 0x22); // dust, unfunded input
         let err = mp
-            .accept_transaction(tx, &cs, &NoopVerifier, TxSource::P2p)
+            .accept_transaction(tx, &cs, &NoopVerifier, TxSource::P2p, false)
             .unwrap_err();
         assert!(
             matches!(err, MempoolError::Dust),
@@ -3018,7 +3123,7 @@ mod tests {
 
         let parent = spend(op, 90_000, 0x22);
         let parent_txid = parent.compute_txid();
-        mp.accept_transaction(parent, &cs, &NoopVerifier, TxSource::P2p)
+        mp.accept_transaction(parent, &cs, &NoopVerifier, TxSource::P2p, false)
             .expect("parent admitted (quarantined)");
         assert!(
             mp.inner
@@ -3034,7 +3139,7 @@ mod tests {
         // Child spends the parent's output; it matches no rule on its own.
         let child = spend(OutPoint { txid: parent_txid, vout: 0 }, 50_000, 0x33);
         let child_txid = child.compute_txid();
-        mp.accept_transaction(child, &cs, &NoopVerifier, TxSource::P2p)
+        mp.accept_transaction(child, &cs, &NoopVerifier, TxSource::P2p, false)
             .expect("child admitted");
         let inner = mp.inner.read();
         let child_entry = inner.entries.get(&child_txid).unwrap();
@@ -3047,6 +3152,121 @@ mod tests {
             "inherited the parent's full scope"
         );
         drop(inner);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ───────────────────── PR 4d: local-submission refusal + events ──────────
+
+    #[test]
+    fn local_relay_quarantine_is_refused_with_rule_named() {
+        // A local (RPC) submission drawing a relay-scoped quarantine verdict is
+        // refused (§6.1), naming the rule, and is NOT placed.
+        let op = outpoint(0xb1);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin(100_000))]);
+        set_ruleset(&mp, "version 1\nquarantine catch when tx.version == 2");
+
+        let tx = spend(op, 99_000, 0x22);
+        let err = mp
+            .accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc, false)
+            .unwrap_err();
+        match &err {
+            MempoolError::Quarantined(rule) => assert_eq!(rule, "catch"),
+            other => panic!("expected Quarantined, got {other:?}"),
+        }
+        // Refused ⇒ never placed.
+        assert_eq!(mp.quarantine_bytes(), 0);
+        assert_eq!(mp.info().size, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn allowquarantined_override_admits_local_into_quarantine() {
+        let op = outpoint(0xb2);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin(100_000))]);
+        set_ruleset(&mp, "version 1\nquarantine catch when tx.version == 2");
+
+        let tx = spend(op, 99_000, 0x22);
+        let txid = mp
+            .accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc, true)
+            .expect("override admits into quarantine");
+        let inner = mp.inner.read();
+        assert!(inner.entries.get(&txid).unwrap().scope.is_quarantined());
+        assert!(inner.quarantine_bytes > 0);
+        drop(inner);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn template_only_quarantine_is_not_refused() {
+        // `on template` withholds only from block building — the tx still relays,
+        // so a local submission succeeds (§6.1) and carries only the template bit.
+        let op = outpoint(0xb3);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin(100_000))]);
+        set_ruleset(
+            &mp,
+            "version 1\nquarantine no-mine on template when tx.version == 2",
+        );
+
+        let tx = spend(op, 99_000, 0x22);
+        let txid = mp
+            .accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc, false)
+            .expect("template-only quarantine submits normally");
+        let inner = mp.inner.read();
+        let scope = inner.entries.get(&txid).unwrap().scope;
+        assert!(scope.template && !scope.relay, "template-only scope");
+        drop(inner);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn p2p_relay_quarantine_is_never_refused() {
+        // The refusal is local-only: a P2P-sourced tx quarantines as designed.
+        let op = outpoint(0xb4);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin(100_000))]);
+        set_ruleset(&mp, "version 1\nquarantine catch when tx.version == 2");
+
+        let tx = spend(op, 99_000, 0x22);
+        let txid = mp
+            .accept_transaction(tx, &cs, &NoopVerifier, TxSource::P2p, false)
+            .expect("p2p quarantine is admitted, not refused");
+        assert!(
+            mp.inner.read().entries.get(&txid).unwrap().scope.is_quarantined()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn quarantined_admission_emits_quarantined_not_enter() {
+        // §10: a quarantined admission emits no `Enter` on the default stream; it
+        // emits `Quarantined` on the separate channel instead.
+        let op = outpoint(0xb5);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin(100_000))]);
+        set_ruleset(&mp, "version 1\nquarantine catch when tx.version == 2");
+
+        let (etx, mut erx) = broadcast::channel::<MempoolEvent>(16);
+        let (qtx, mut qrx) = broadcast::channel::<QuarantineEvent>(16);
+        mp.set_event_sender(etx);
+        mp.set_quarantine_event_sender(qtx);
+
+        let tx = spend(op, 99_000, 0x22);
+        let txid = mp
+            .accept_transaction(tx, &cs, &NoopVerifier, TxSource::P2p, false)
+            .expect("admitted to quarantine");
+
+        // No default-stream Enter for a held tx.
+        assert!(
+            matches!(erx.try_recv(), Err(broadcast::error::TryRecvError::Empty)),
+            "quarantined admission must emit no Enter on the default stream"
+        );
+        // Exactly one Quarantined event on the separate channel, naming the rule.
+        match qrx.try_recv() {
+            Ok(QuarantineEvent::Quarantined { txid: t, rule, relay, template, .. }) => {
+                assert_eq!(t, txid);
+                assert_eq!(rule, "catch");
+                assert!(relay && template, "full default scope");
+            }
+            other => panic!("expected one Quarantined event, got {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -600,7 +600,11 @@ pub fn transaction_broadcast(state: &ElectrumState, params: Value) -> Result<Val
     // mempool accept leaves it sitting on this node, unannounced.
     let txid = state
         .tx_broadcaster
-        .submit_and_announce(tx, node::mempool::pool::TxSource::Electrum)
+        // The Electrum wire protocol has no per-request flag, so it cannot carry
+        // an `allowquarantined` override (§6.1): a relay-quarantined submission is
+        // refused with the rule named. Use the RPC/Esplora/MCP surfaces to hold
+        // one locally.
+        .submit_and_announce(tx, node::mempool::pool::TxSource::Electrum, false)
         .map_err(|e| JsonRpcError::bad_request(format!("mempool reject: {e}")))?;
     Ok(Value::String(txid.to_string()))
 }
@@ -667,7 +671,7 @@ pub fn transaction_broadcast_package(
         for &i in &pending {
             if let Err(e) = state
                 .tx_broadcaster
-                .submit_and_announce(decoded[i].clone(), node::mempool::pool::TxSource::Electrum)
+                .submit_and_announce(decoded[i].clone(), node::mempool::pool::TxSource::Electrum, false)
             {
                 next_pending.push(i);
                 pass_errors.push((i, e.to_string()));

@@ -43,11 +43,12 @@ pub fn sign_transaction(
 /// which submits to the mempool *and* announces to peers — the same path
 /// the JSON-RPC `sendrawtransaction` method uses, so a local-origin tx
 /// reliably reaches the wire.
-pub fn send_transaction(ctx: &McpContext, hex_tx: &str) -> String {
-    match ctx
-        .peer_manager
-        .broadcast_transaction(hex_tx, node::mempool::pool::TxSource::Mcp)
-    {
+pub fn send_transaction(ctx: &McpContext, hex_tx: &str, allow_quarantined: bool) -> String {
+    match ctx.peer_manager.broadcast_transaction(
+        hex_tx,
+        node::mempool::pool::TxSource::Mcp,
+        allow_quarantined,
+    ) {
         Ok(result) => serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string()),
         Err((code, msg)) => json!({"error": msg, "code": code}).to_string(),
     }
