@@ -103,12 +103,31 @@ pub enum QuarantineEvent {
         template: bool,
         time: u64,
     },
+    /// A ruleset reload (§8) moved a previously-acting transaction *into* the
+    /// quarantine class. Distinct from [`Self::Quarantined`] (admission-time
+    /// placement) so dashboards can tell a fresh hold from a policy change that
+    /// retroactively withheld already-admitted traffic. `rule`/`relay`/`template`
+    /// carry the new held scope, as for `Quarantined`.
+    Demoted {
+        txid: Txid,
+        rule: String,
+        relay: bool,
+        template: bool,
+        time: u64,
+    },
+    /// A ruleset reload (§8) moved a transaction *out of* the quarantine class
+    /// (scope fully cleared — it is acting again, I9). Subscribers re-surface it
+    /// on the acting stream; the relay paths re-announce it via the bounded
+    /// promotion queue (PR 6b).
+    Promoted { txid: Txid, time: u64 },
 }
 
 impl QuarantineEvent {
     pub fn txid(&self) -> &Txid {
         match self {
-            Self::Quarantined { txid, .. } => txid,
+            Self::Quarantined { txid, .. }
+            | Self::Demoted { txid, .. }
+            | Self::Promoted { txid, .. } => txid,
         }
     }
 }
@@ -196,5 +215,25 @@ mod tests {
         assert_eq!(j["rule"], "ordinals");
         assert_eq!(j["relay"], true);
         assert_eq!(j["template"], true);
+    }
+
+    #[test]
+    fn demoted_and_promoted_serialize() {
+        let d = QuarantineEvent::Demoted {
+            txid: tx(7),
+            rule: "no-inscriptions".to_string(),
+            relay: true,
+            template: true,
+            time: 1_700_000_000,
+        };
+        let j = serde_json::to_value(&d).unwrap();
+        assert_eq!(j["kind"], "demoted");
+        assert_eq!(j["rule"], "no-inscriptions");
+        assert_eq!(j["relay"], true);
+
+        let p = QuarantineEvent::Promoted { txid: tx(8), time: 1_700_000_001 };
+        let j = serde_json::to_value(&p).unwrap();
+        assert_eq!(j["kind"], "promoted");
+        assert!(j["txid"].is_string());
     }
 }
