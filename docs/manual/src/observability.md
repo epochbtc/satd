@@ -45,3 +45,18 @@ systemd `ExecStartPost=` poll.
 
 *   **Flag:** `--log-format=json|text`
 *   Replaces the traditional `debug.log` text firehose with structured, machine-parseable JSON logs. Perfect for Datadog, ELK, or custom log-alerting pipelines. Trace IDs allow operators to follow a single block through prefetch, connect, and flush.
+
+## Reorg Notifications
+
+Where Bitcoin Core's `getchaintips` reflects only the *currently* known tips —
+yesterday's reorgs are gone — satd records every reorg natively, so exchanges
+and custodians don't have to reconstruct them externally.
+
+*   **Persistent log.** An append-only JSONL log at `$datadir/<network>/reorg.log`
+    (the network-specific datadir subdirectory; directly under `$datadir` only on
+    mainnet) survives restarts, backed by an in-memory 256-record ring.
+*   **Query RPC.** `getreorghistory [since_secs]` returns recent reorgs.
+*   **Webhook.** Optional HTTP POST on each reorg via `--reorg-webhook=<url>`.
+    Set `--reorg-webhook-secret=<secret>` to have satd sign the body with
+    HMAC-SHA256 in an `X-Satd-Signature: sha256=...` header so the receiver can
+    verify integrity.

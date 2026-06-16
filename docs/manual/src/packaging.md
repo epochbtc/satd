@@ -39,8 +39,8 @@ There are deliberately **no separate `sat-electrum` / `sat-esplora`
 companion binaries**. Both protocols are subsystems of `satd` itself,
 gated by runtime flags (`--electrum=1`, `--esplora=1`). One process,
 one RocksDB, one log stream, one PID. This is a load-bearing design
-choice — see the [Native Protocol Architecture](native-protocol-surfaces.md)
-chapter.
+choice — see [Disk Footprint & Indices](disk-footprint.md) for what the
+single shared store buys you.
 
 ## File layout
 

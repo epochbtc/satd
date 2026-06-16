@@ -5,15 +5,6 @@ uses **more** disk for its indices than a `bitcoind + electrs/Fulcrum + esplora`
 stack uses *summed together*. This is by design, and this chapter explains where
 the bytes go and what you get for them.
 
-This is the one place the manual's "shared index / no duplicate index" language
-can be misread. To be unambiguous:
-
-> **"Shared" means a single source of truth: one RocksDB, updated atomically with
-> the chain, that every API surface reads.** satd indexes more relationships, in
-> more directions, to serve more protocols from one consistent store, so the
-> aggregate on-disk index is larger. You trade disk for consistency and
-> single-process operation.
-
 If you only need a validating node, none of this applies: a consensus-only satd
 (`-txindex=0 -addressindex=0`, filters off) has a chainstate comparable to Core's
 and carries none of the index column families below.
@@ -61,9 +52,8 @@ Every spend writes **two** rows:
 
 electrs/Fulcrum keep essentially one spend representation and *derive* the other
 direction on demand. satd pays the disk to keep both materialized so both queries
-are O(1). This is the single biggest source of the overage — and, ironically, the
-thing the "no duplicate index" tagline understates: the duplication is internal and
-intentional.
+are O(1). This is the single biggest source of the overage: the duplication is
+internal and intentional.
 
 ### 2. satd indexes a *superset* of what any one external tool does
 
