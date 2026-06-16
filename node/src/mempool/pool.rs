@@ -799,10 +799,15 @@ impl Mempool {
     /// foregone-fees estimate against `template_floor` (sat/kvB — the current
     /// template's minimum fee rate; pass the same floor the fee estimator uses).
     pub fn quarantine_report(&self, template_floor: u64) -> QuarantineReport {
+        // Snapshot the config (leaf lock) BEFORE taking `inner`, never the
+        // reverse — uniform leaf-lock discipline (see `info()`); holding `inner`
+        // while acquiring `config` would invert the order every other path uses.
+        let budget_bytes = self.config.read().quarantine_max_bytes as u64;
+        let confirmed_anyway = self.quarantine_confirmed_count();
         let inner = self.inner.read();
         let mut report = QuarantineReport {
-            budget_bytes: self.config.read().quarantine_max_bytes as u64,
-            confirmed_anyway: self.quarantine_confirmed_count(),
+            budget_bytes,
+            confirmed_anyway,
             ..Default::default()
         };
         for e in inner.entries.values() {
@@ -847,15 +852,17 @@ impl Mempool {
         let inner = self.inner.read();
         let mut out: Vec<QuarantineListEntry> = inner
             .entries
-            .values()
-            .filter(|e| !e.scope.is_acting())
-            .filter(|e| {
+            .iter()
+            .filter(|(_, e)| !e.scope.is_acting())
+            .filter(|(_, e)| {
                 rule.is_none_or(|want| {
                     e.quarantine_rule.as_deref() == Some(want)
                 })
             })
-            .map(|e| QuarantineListEntry {
-                txid: e.tx.compute_txid(),
+            .map(|(txid, e)| QuarantineListEntry {
+                // Use the map key — recomputing the txid per entry re-hashes the
+                // whole transaction for no reason.
+                txid: *txid,
                 rule: e
                     .quarantine_rule
                     .clone()
@@ -1090,19 +1097,28 @@ impl Mempool {
                     }
                 }
 
-                if new_scope == old_scope {
-                    continue;
-                }
-
-                // The rule responsible for the new placement: the tx's own match,
-                // or the infectious-ancestor marker when the scope is inherited.
-                // Cleared when the entry becomes acting. Stamped on the entry so
+                // The rule responsible for the placement: the tx's own match, or
+                // the infectious-ancestor marker when the scope is inherited.
+                // Cleared when the entry is acting. Stamped on the entry so
                 // `listquarantine`/`getquarantineinfo` (PR 7b) can attribute it.
                 let stamped_rule = if new_scope.is_quarantined() {
                     Some(own_rule.unwrap_or_else(|| INFECTIOUS_RULE.to_string()))
                 } else {
                     None
                 };
+
+                if new_scope == old_scope {
+                    // Placement unchanged — but a reload may have RENAMED the
+                    // matching rule while keeping its scope; keep the attributed
+                    // rule current for the observability surfaces. No accounting
+                    // move, and not a promotion/demotion.
+                    if let Some(e) = inner.entries.get_mut(&txid)
+                        && e.quarantine_rule != stamped_rule
+                    {
+                        e.quarantine_rule = stamped_rule;
+                    }
+                    continue;
+                }
 
                 // Apply: per-class byte accounting, then stamp the new scope+rule.
                 let size = bitcoin::consensus::serialize(&tx).len();
@@ -4585,6 +4601,20 @@ mod tests {
         assert_eq!(list[0].txid, txid);
         // A filter on a different rule yields nothing.
         assert!(mp.list_quarantine(Some("other"), 0, 0).is_empty());
+
+        // Deep-review regression: a reload that RENAMES the matching rule but
+        // keeps its scope must re-stamp the attributed rule (placement is
+        // unchanged, so the byte-accounting move is correctly skipped).
+        set_ruleset(&mp, "version 1\nquarantine renamed when tx.version == 2");
+        let t = mp.reapply_policy(&cs);
+        assert!(t.promoted.is_empty() && t.demoted.is_empty(), "scope unchanged ⇒ no move");
+        assert_eq!(
+            mp.get_quarantine_entry(&txid).expect("still quarantined").rule,
+            "renamed",
+            "rename with same scope must update the attributed rule"
+        );
+        assert!(mp.list_quarantine(Some("catch"), 0, 0).is_empty());
+        assert_eq!(mp.list_quarantine(Some("renamed"), 0, 0).len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
