@@ -1,0 +1,45 @@
+# satd transaction-filtering policy — annotated example / dogfood-soak ruleset
+# ---------------------------------------------------------------------------
+# Load with `policyfile=/path/to/example.policy` (or `-policyfile=...`), reload
+# live with SIGHUP. Validate offline first: `sat-cli policylint --explain this`.
+#
+# QUARANTINE, NOT REJECT. Every rule below WITHHOLDS a transaction (from relay
+# and/or block templates); none change what the node accepts as valid. A held
+# transaction is visible via `getquarantineinfo` / `listquarantine` and a verdict
+# is reversible on one SIGHUP. Filtering cannot prevent confirmation — it can
+# only decline to assist it.
+#
+# This file is deliberately POSTURE-BALANCED (a demonstration of the language,
+# not a recommended deployment): a permissive allow, two resource-protection
+# rules, a mine-neutral template-only rule, and one self-identifying content
+# rule. Tune against your own `listquarantine` data before trusting any of it.
+
+version 1
+
+# ── Permissive: never filter my own submissions, whatever they carry ──────
+allow own-submissions when tx.source == rpc or tx.source == mcp
+
+# ── Resource protection: cheap, oversized generic OP_RETURN ───────────────
+# Bulk data that doesn't pay its way — NOT "OP_RETURN is bad". Small markers
+# (OpenTimestamps ~40B) and anything paying >=3x min-relay pass freely.
+quarantine cheap-bulk-opreturn when
+    any output (out.script_type == op_return and out.op_return_size > 83)
+    and tx.fee_rate < node.min_relay_fee * 3
+
+# ── Resource protection: dust storms, with L2 P2A anchors carved out ──────
+# The `!= p2a` carve-out lives INSIDE the expression (not in an `allow`), so a
+# real transaction that merely has a P2A fee-bump anchor is not exempted whole.
+quarantine dust-storm when
+    count outputs (out.is_dust and out.script_type != p2a) >= 5
+
+# ── Mine-neutral: huge witnesses relay normally, just aren't in MY blocks ──
+# `on template` only: zero relay impact, so a false positive can't degrade
+# anyone's propagation (the L2-safety discipline).
+quarantine no-mine-big-witness on template when
+    tx.total_witness_size > 100kb
+
+# ── Restrictive content: a self-identifying protocol marker ───────────────
+# Keys on the protocol's own tapleaf marker, NOT on script-path spends in
+# general — Lightning / vault / MuSig tapscript spends are untouched.
+quarantine ordinals when
+    any input (in.leaf_script.contains_ops(script(OP_FALSE OP_IF push(0x6f7264))))
