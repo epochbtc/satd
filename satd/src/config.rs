@@ -597,6 +597,17 @@ pub struct Config {
     /// transactions (skip the standardness relay checks; consensus rules are
     /// never relaxed). Default false, matching Core.
     pub acceptnonstdtxn: bool,
+    /// Path to the transaction-filtering policy file (the DSL ruleset, §8). When
+    /// set, the ruleset is compiled and loaded at startup — **fail-loud**: a
+    /// parse/typecheck/cost error aborts startup with a file-anchored diagnostic.
+    /// Absolute paths only (network-suffixed-datadir ambiguity, like `authfile`).
+    /// `None` (default) keeps the engine compiled-out: behavior byte-identical to
+    /// today (I8). satd-only; no Bitcoin Core equivalent.
+    pub policyfile: Option<PathBuf>,
+    /// Byte budget (in MB) for the **quarantine class** (`quarantinemempool`):
+    /// held transactions are fee-rate-evicted against this, separately from
+    /// `maxmempool`. Inert until a policy quarantines something. satd-only.
+    pub quarantinemempool: usize,
     /// Bitcoin Core's `-networkactive`: start with P2P networking enabled.
     /// Default true; `-networkactive=0` boots with networking paused (no
     /// inbound accepts, no outbound dials) until `setnetworkactive true`.
@@ -1980,6 +1991,29 @@ impl Config {
             .or_else(|| file_get("maxmempool").and_then(|v| v.parse().ok()))
             .unwrap_or(300); // MB
 
+        let quarantinemempool = cli
+            .quarantinemempool
+            .or_else(|| file_get("quarantinemempool").and_then(|v| v.parse().ok()))
+            .unwrap_or(50); // MB (matches DEFAULT_QUARANTINE_MEMPOOL_SIZE)
+
+        // Transaction-filtering policy file. CLI > file > unset. Absolute paths
+        // only (same network-suffixed-datadir rationale as `authfile`). The file
+        // is compiled at startup (fail-loud) in main.rs, not here — config parsing
+        // stays IO-light.
+        let policyfile = cli
+            .policyfile
+            .clone()
+            .or_else(|| file_get("policyfile").map(PathBuf::from));
+        if let Some(p) = &policyfile
+            && p.is_relative()
+        {
+            return Err(format!(
+                "--policyfile must be an absolute path, got {p:?}. Relative paths would be \
+                ambiguous against satd's network-suffixed datadir (regtest/, signet/, \
+                testnet3/)."
+            ));
+        }
+
         let minrelaytxfee = cli
             .minrelaytxfee
             .or_else(|| file_get("minrelaytxfee").and_then(|v| v.parse().ok()))
@@ -2693,6 +2727,8 @@ impl Config {
             stopatheight,
             mempoolfullrbf,
             maxmempool,
+            quarantinemempool,
+            policyfile,
             minrelaytxfee,
             dustrelayfee,
             datacarriersize,
@@ -3218,6 +3254,8 @@ impl Config {
                 "full_rbf": self.mempoolfullrbf,
                 "expiry_hours": self.mempoolexpiry,
                 "persist": self.persistmempool,
+                "quarantine_max_bytes_mb": self.quarantinemempool,
+                "policyfile": self.policyfile.as_ref().map(|p| p.display().to_string()),
             },
             "storage": {
                 "txindex": self.txindex,
@@ -3832,6 +3870,20 @@ pub struct CliArgs {
         help = "Maximum mempool size in MB (default: 300)"
     )]
     pub maxmempool: Option<usize>,
+
+    #[arg(
+        long,
+        value_name = "MB",
+        help = "Byte budget (MB) for the transaction-filtering quarantine class (default: 50). Inert until a -policyfile quarantines something."
+    )]
+    pub quarantinemempool: Option<usize>,
+
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Path to a transaction-filtering policy file (DSL ruleset). Compiled at startup; a parse/typecheck/cost error aborts startup. Absolute path only. Unset = engine disabled (behavior unchanged)."
+    )]
+    pub policyfile: Option<PathBuf>,
 
     #[arg(
         long,
@@ -5156,6 +5208,8 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "stopatheight",
         "mempoolfullrbf",
         "maxmempool",
+        "quarantinemempool",
+        "policyfile",
         "minrelaytxfee",
         "dustrelayfee",
         "datacarriersize",
@@ -5720,6 +5774,8 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "persistmempool",
     "permitbaremultisig",
     "acceptnonstdtxn",
+    "quarantinemempool",
+    "policyfile",
     "networkactive",
     // Esplora
     "esplora",
@@ -6446,6 +6502,58 @@ rpcport=8332
     }
 
     #[test]
+    fn policy_engine_config_defaults_and_parsing() {
+        use clap::Parser;
+        let dir = std::env::temp_dir().join(format!("satd-policy-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Defaults: no policy file, 50 MB quarantine budget.
+        let cli =
+            CliArgs::try_parse_from(["satd", "--regtest", "--datadir", dir.to_str().unwrap()])
+                .unwrap();
+        let cfg = Config::from_cli(cli).unwrap();
+        assert!(cfg.policyfile.is_none());
+        assert_eq!(cfg.quarantinemempool, 50);
+
+        // Explicit values parse through.
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir",
+            dir.to_str().unwrap(),
+            "--policyfile",
+            "/etc/satd/policy.conf",
+            "--quarantinemempool",
+            "200",
+        ])
+        .unwrap();
+        let cfg = Config::from_cli(cli).unwrap();
+        assert_eq!(cfg.policyfile.as_deref(), Some(std::path::Path::new("/etc/satd/policy.conf")));
+        assert_eq!(cfg.quarantinemempool, 200);
+    }
+
+    #[test]
+    fn policyfile_must_be_absolute() {
+        use clap::Parser;
+        let dir = std::env::temp_dir().join(format!("satd-policy-rel-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir",
+            dir.to_str().unwrap(),
+            "--policyfile",
+            "relative/policy.conf",
+        ])
+        .unwrap();
+        let err = Config::from_cli(cli).unwrap_err();
+        assert!(
+            err.contains("policyfile") && err.contains("absolute"),
+            "expected an absolute-path error, got: {err}"
+        );
+    }
+
+    #[test]
     fn rpc_readonly_listener_disabled_by_default() {
         use clap::Parser;
         let dir = std::env::temp_dir().join(format!("satd-ro-default-{}", std::process::id()));
@@ -6745,6 +6853,8 @@ rpcport=8332
             stopatheight: None,
             mempoolfullrbf: None,
             maxmempool: None,
+            quarantinemempool: None,
+            policyfile: None,
             minrelaytxfee: None,
             dustrelayfee: None,
             datacarriersize: None,
@@ -7012,6 +7122,8 @@ rpcport=8332
             stopatheight: None,
             mempoolfullrbf: None,
             maxmempool: None,
+            quarantinemempool: None,
+            policyfile: None,
             minrelaytxfee: None,
             dustrelayfee: None,
             datacarriersize: None,

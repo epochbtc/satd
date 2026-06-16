@@ -253,10 +253,10 @@ pub fn mempool_config_from(c: &Config) -> MempoolConfig {
         expiry_secs: c.mempoolexpiry.saturating_mul(3600),
         permit_bare_multisig: c.permitbaremultisig,
         accept_non_std_txn: c.acceptnonstdtxn,
-        // The quarantine class is inert until a policy is loaded (PR 4c), so the
-        // budget stays at its default here; PR 4c adds the `quarantinemempool`
-        // config knob alongside `policyfile`.
-        quarantine_max_bytes: node::mempool::policy::DEFAULT_QUARANTINE_MEMPOOL_SIZE,
+        // Byte budget for the quarantine class (`quarantinemempool`, MB).
+        // Saturating, same rationale as `maxmempool` above. Inert until a
+        // `policyfile` quarantines something.
+        quarantine_max_bytes: c.quarantinemempool.saturating_mul(1_000_000),
     }
 }
 
@@ -622,6 +622,17 @@ fn field_specs() -> Vec<FieldSpec> {
         live!("acceptnonstdtxn", acceptnonstdtxn, |c, h| {
             h.mempool.reload_policy(mempool_config_from(c))
         }),
+        // Quarantine-class byte budget — folded into the same MempoolConfig
+        // reload as the other mempool knobs.
+        live!("quarantinemempool", quarantinemempool, |c, h| {
+            h.mempool.reload_policy(mempool_config_from(c))
+        }),
+        // The transaction-filtering policy *file path*. Changing which file is
+        // loaded requires a restart for now; live re-read of the file's
+        // *contents* (the TokenStore-style recompile-and-ArcSwap handler, §8) is
+        // PR 6. Classified restart! so a path change is reported, not silently
+        // ignored.
+        restart!("policyfile", policyfile),
         // `-networkactive`: toggle P2P networking live (same effect as the
         // `setnetworkactive` RPC). Disabling disconnects all peers.
         live!("networkactive", networkactive, |c, h| {

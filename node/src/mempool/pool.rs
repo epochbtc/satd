@@ -6,6 +6,7 @@ use tokio::sync::broadcast;
 use crate::chain::state::ChainState;
 use crate::mempool::events::{EvictReason, MempoolEvent};
 use crate::mempool::policy::{self, MAX_STANDARD_TX_WEIGHT};
+use crate::mempool::policy_engine::{self, PolicyCtx};
 use crate::validation::script::ScriptVerifier;
 use crate::validation::tx::check_transaction;
 use node_index::keys::{scripthash_of, Scripthash};
@@ -280,6 +281,14 @@ pub struct Mempool {
     /// lock order uniform so a concurrent `reload_policy` write can never form a
     /// cycle with `inner`.
     config: RwLock<MempoolConfig>,
+    /// Live transaction-filtering policy ruleset (the DSL engine, §7). `None`
+    /// until a `policyfile` is loaded; an empty ruleset is also possible but the
+    /// hot path treats both as "no policy" (I8 — byte-identical to a build with
+    /// the engine compiled out). Behind an `ArcSwap` so the admission hot path
+    /// reads the pointer lock-free while startup load / SIGHUP reload (PR 6) swap
+    /// it atomically. Snapshotted once at the top of `accept_transaction` so a
+    /// transaction is judged against a single ruleset version.
+    policy: arc_swap::ArcSwapOption<satd_policy::CompiledRuleset>,
     /// Broadcast channel fanout for `subscribemempool`. Populated via
     /// `set_event_sender`; remains `None` in tests that don't need
     /// event emission.
@@ -310,6 +319,7 @@ impl Mempool {
             }),
             unbroadcast_len: std::sync::atomic::AtomicUsize::new(0),
             config: RwLock::new(config),
+            policy: arc_swap::ArcSwapOption::empty(),
             event_tx: Mutex::new(None),
             event_ring: Mutex::new(VecDeque::with_capacity(EVENT_RING_CAPACITY)),
         }
@@ -385,6 +395,111 @@ impl Mempool {
         *self.config.write() = new;
     }
 
+    /// Load (or replace) the transaction-filtering ruleset from a file. Returns
+    /// the load summary on success; on failure the previous ruleset is left
+    /// untouched (last-good-wins, §8) and a rendered diagnostic is returned.
+    /// Startup wiring treats the error as fatal (fail-loud); SIGHUP reload (PR 6)
+    /// will keep last-good.
+    pub fn load_policy_file(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<policy_engine::PolicyLoad, String> {
+        let (ruleset, load) = policy_engine::load_policy_file(path)?;
+        self.policy.store(Some(std::sync::Arc::new(ruleset)));
+        Ok(load)
+    }
+
+    /// Drop any loaded ruleset — reverts the node to baseline behavior (the
+    /// engine compiled out, I8). Used when `policyfile` is removed (PR 6) and in
+    /// tests.
+    pub fn clear_policy(&self) {
+        self.policy.store(None);
+    }
+
+    /// Install an already-compiled ruleset directly. Test/embedding hook; the
+    /// file path is the production entry point.
+    pub fn set_policy(&self, ruleset: std::sync::Arc<satd_policy::CompiledRuleset>) {
+        self.policy.store(Some(ruleset));
+    }
+
+    /// Whether a non-empty ruleset is currently loaded. When false the admission
+    /// path skips policy evaluation entirely (I8).
+    pub fn has_policy(&self) -> bool {
+        self.policy
+            .load()
+            .as_ref()
+            .map(|r| !r.is_empty())
+            .unwrap_or(false)
+    }
+
+    /// Snapshot the live ruleset pointer (for `getpolicyinfo`, PR 7).
+    pub fn policy_snapshot(&self) -> Option<std::sync::Arc<satd_policy::CompiledRuleset>> {
+        self.policy.load_full()
+    }
+
+    /// The exemptable standardness set (§6.2 / Core's `-acceptnonstdtxn` family):
+    /// oversize, dust, OP_RETURN/datacarrier limits, and non-standard output
+    /// scripts. Returns the first failure as the error that *would* be returned
+    /// at admission. Pulled out of `accept_transaction` so the deferred-
+    /// standardness path (an `allow` rule may forgive these) and the eager path
+    /// share one definition and can never drift. Consensus rules are **not** here
+    /// — those are never exemptable (§6.2 floor).
+    fn check_standardness(
+        tx: &Transaction,
+        cfg: &MempoolConfig,
+        weight: usize,
+    ) -> Result<(), MempoolError> {
+        // Standard tx weight ceiling (oversize relay check).
+        if weight > MAX_STANDARD_TX_WEIGHT {
+            return Err(MempoolError::Validation("tx-size".to_string()));
+        }
+
+        // Dust output check (configurable via -dustrelayfee, 0 = disable).
+        if cfg.dust_relay_fee > 0 {
+            for output in &tx.output {
+                if output.script_pubkey.is_op_return() {
+                    continue;
+                }
+                let threshold =
+                    policy::dust_threshold_with_rate(&output.script_pubkey, cfg.dust_relay_fee);
+                if output.value.to_sat() < threshold {
+                    return Err(MempoolError::Dust);
+                }
+            }
+        }
+
+        // OP_RETURN limits (configurable via -datacarrier and -datacarriersize).
+        if !cfg.data_carrier {
+            for output in &tx.output {
+                if output.script_pubkey.is_op_return() {
+                    return Err(MempoolError::NonStandardOpReturn);
+                }
+            }
+        } else {
+            let mut op_return_count = 0;
+            for output in &tx.output {
+                if output.script_pubkey.is_op_return() {
+                    op_return_count += 1;
+                    if op_return_count > 1 {
+                        return Err(MempoolError::NonStandardOpReturn);
+                    }
+                    if output.script_pubkey.len() > cfg.data_carrier_size {
+                        return Err(MempoolError::NonStandardOpReturn);
+                    }
+                }
+            }
+        }
+
+        // Non-standard output scripts.
+        for output in &tx.output {
+            if !policy::is_standard_output_script(&output.script_pubkey, cfg.permit_bare_multisig) {
+                return Err(MempoolError::Validation("scriptpubkey".to_string()));
+            }
+        }
+
+        Ok(())
+    }
+
     /// Accept a transaction into the mempool after full validation.
     pub fn accept_transaction(
         &self,
@@ -400,11 +515,16 @@ impl Mempool {
         // `self.config` between calls but never mid-transaction.
         let cfg = self.config.read().clone();
 
-        // Quarantine scope for this transaction. PR 4c replaces this with the
-        // policy-engine verdict; until then every transaction is "acting" (empty
-        // scope), so the quarantine class stays empty, `quarantine_bytes` stays
-        // 0, and the per-class accounting/eviction below is exercised but inert.
-        let scope = QuarantineScope::acting();
+        // Snapshot the policy ruleset pointer once (§7 step 1). `policy_active`
+        // gates every engine-touching branch below; when there is no ruleset
+        // (the common case, I8) the path is byte-identical to a build with the
+        // engine compiled out — `has_allow` stays false (so standardness keeps
+        // its early-return) and `scope` stays acting.
+        let ruleset = self.policy.load_full();
+        let policy_active = ruleset.as_ref().map(|r| !r.is_empty()).unwrap_or(false);
+        // Only thread deferred-standardness when an `allow` rule could forgive a
+        // failure; otherwise the common case pays nothing (§6.2/§7).
+        let has_allow = policy_active && ruleset.as_ref().map(|r| r.has_allow()).unwrap_or(false);
 
         // Context-free checks
         check_transaction(&tx).map_err(|e| MempoolError::Validation(e.to_string()))?;
@@ -425,57 +545,22 @@ impl Mempool {
         // entry accounting) regardless of standardness.
         let weight = tx.weight().to_wu() as usize;
 
-        if !cfg.accept_non_std_txn {
-            // Policy: standard tx weight ceiling (oversize relay check)
-            if weight > MAX_STANDARD_TX_WEIGHT {
-                return Err(MempoolError::Validation("tx-size".to_string()));
-            }
-
-            // Policy: dust output check (configurable via -dustrelayfee, 0 = disable)
-            if cfg.dust_relay_fee > 0 {
-                for output in &tx.output {
-                    if output.script_pubkey.is_op_return() {
-                        continue;
-                    }
-                    let threshold =
-                        policy::dust_threshold_with_rate(&output.script_pubkey, cfg.dust_relay_fee);
-                    if output.value.to_sat() < threshold {
-                        return Err(MempoolError::Dust);
-                    }
-                }
-            }
-
-            // Policy: OP_RETURN limits (configurable via -datacarrier and -datacarriersize)
-            if !cfg.data_carrier {
-                // Reject all OP_RETURN outputs
-                for output in &tx.output {
-                    if output.script_pubkey.is_op_return() {
-                        return Err(MempoolError::NonStandardOpReturn);
-                    }
-                }
+        // §6.2/§7 deferred standardness: when the loaded ruleset contains at
+        // least one `allow` rule, a failure in the exemptable standardness set is
+        // *recorded* and resolved at the eval point below (an `Allow` match
+        // forgives it; `Pass`/`Quarantine` let it stand) — an `allow` rule may
+        // key on prevout-derived attributes not known until after input
+        // resolution. With no `allow` rules (the common case, `has_allow ==
+        // false`, which includes "no policy loaded"), failures reject early
+        // exactly as today and nothing is threaded.
+        let mut deferred_nonstd: Option<MempoolError> = None;
+        if !cfg.accept_non_std_txn
+            && let Err(e) = Self::check_standardness(&tx, &cfg, weight)
+        {
+            if has_allow {
+                deferred_nonstd = Some(e);
             } else {
-                let mut op_return_count = 0;
-                for output in &tx.output {
-                    if output.script_pubkey.is_op_return() {
-                        op_return_count += 1;
-                        if op_return_count > 1 {
-                            return Err(MempoolError::NonStandardOpReturn);
-                        }
-                        if output.script_pubkey.len() > cfg.data_carrier_size {
-                            return Err(MempoolError::NonStandardOpReturn);
-                        }
-                    }
-                }
-            }
-
-            // Policy: reject non-standard output scripts
-            for output in &tx.output {
-                if !policy::is_standard_output_script(
-                    &output.script_pubkey,
-                    cfg.permit_bare_multisig,
-                ) {
-                    return Err(MempoolError::Validation("scriptpubkey".to_string()));
-                }
+                return Err(e);
             }
         }
 
@@ -501,6 +586,9 @@ impl Mempool {
         let tip_height = chain_state.tip_height();
         let mut sum_inputs: u64 = 0;
         let mut prev_outputs: Vec<TxOut> = Vec::new();
+        // Per-input coinbase flag (input order), for the policy engine's
+        // `in.spends_coinbase`. Only populated/consumed when a policy is active.
+        let mut prev_is_coinbase: Vec<bool> = Vec::new();
         let mut ancestors: HashSet<Txid> = HashSet::new();
 
         for input in &tx.input {
@@ -523,6 +611,7 @@ impl Mempool {
                     value: bitcoin::Amount::from_sat(coin.amount),
                     script_pubkey: coin.script_pubkey.clone(),
                 });
+                prev_is_coinbase.push(coin.coinbase);
                 continue;
             }
 
@@ -535,6 +624,9 @@ impl Mempool {
                 ancestors.insert(parent_txid);
                 sum_inputs += output.value.to_sat();
                 prev_outputs.push(output.clone());
+                // A mempool parent is never a coinbase (coinbase is rejected
+                // above), so a spend of one never spends a coinbase output.
+                prev_is_coinbase.push(false);
                 continue;
             }
 
@@ -614,6 +706,90 @@ impl Mempool {
         if fee_rate < cfg.min_fee_rate {
             return Err(MempoolError::InsufficientFee(fee_rate, cfg.min_fee_rate));
         }
+
+        // ── DSL evaluation (§7 step 6) ──────────────────────────────────────
+        // The single policy eval point: after the DoS floor (fee / RBF / ancestor
+        // limits), before per-class capacity and script verification. It computes
+        // this transaction's quarantine `scope` and resolves any deferred
+        // standardness failure. When no policy is active it is a no-op (acting
+        // scope; no deferral is possible) — byte-identical to a build with the
+        // engine compiled out (I8).
+        let scope = if policy_active {
+            let rs = ruleset
+                .as_ref()
+                .expect("policy_active is set only when the ruleset is Some");
+            let ctx = PolicyCtx {
+                network: chain_state.network,
+                height: tip_height,
+                mempool_bytes: inner.total_bytes,
+            };
+            let verdict = policy_engine::evaluate(
+                rs,
+                &tx,
+                &txid,
+                &prev_outputs,
+                &prev_is_coinbase,
+                fee,
+                fee_rate,
+                weight,
+                &cfg,
+                ctx,
+                source,
+                // `tx.from_whitelisted_peer`: peer-whitelist threading into the
+                // admission path is deferred (no peer handle here yet); baseline
+                // `forcerelay` is unaffected. Conservatively false (§6.3).
+                false,
+            );
+
+            // Resolve the verdict against any deferred standardness failure
+            // (§6.2/§7): `Allow` forgives it; `Pass`/`Quarantine` let the
+            // baseline rejection stand — the quarantine class is not a dumping
+            // ground for nonstandard traffic.
+            let own_scope = match &verdict {
+                satd_policy::Verdict::Allow { .. } => QuarantineScope::acting(),
+                satd_policy::Verdict::Pass => {
+                    if let Some(e) = deferred_nonstd {
+                        return Err(e);
+                    }
+                    QuarantineScope::acting()
+                }
+                satd_policy::Verdict::Quarantine { rule, scope } => {
+                    if let Some(e) = deferred_nonstd {
+                        return Err(e);
+                    }
+                    if rule.as_str() == satd_policy::verdict::FUEL_RULE {
+                        tracing::warn!(
+                            %txid,
+                            "policy fuel exhausted — fail-safe full-scope quarantine \
+                             (a sound static cost model makes this unreachable; firing is a bug signal)"
+                        );
+                    } else {
+                        tracing::debug!(%txid, rule = %rule, scope = %scope, "policy quarantine");
+                    }
+                    policy_engine::map_scope(*scope)
+                }
+            };
+
+            // Infectious-descendant propagation (§3/§7): a transaction inherits
+            // the union of its quarantined in-mempool ancestors' scopes,
+            // regardless of its own verdict — announcing or mining a child whose
+            // parent we withhold would be incoherent. The ancestor set is already
+            // computed above, so this is a flag union, not a traversal.
+            let mut final_scope = own_scope;
+            for anc in &ancestors {
+                if let Some(e) = inner.entries.get(anc)
+                    && e.scope.is_quarantined()
+                {
+                    final_scope.relay |= e.scope.relay;
+                    final_scope.template |= e.scope.template;
+                }
+            }
+            final_scope
+        } else {
+            // No active policy ⇒ `has_allow` is false ⇒ `deferred_nonstd` is None
+            // (standardness already rejected early). Acting scope, unconditionally.
+            QuarantineScope::acting()
+        };
 
         // Per-class capacity check — the new tx is charged to its own class's
         // budget (acting → `max_size_bytes`, quarantine → `quarantine_max_bytes`)
@@ -2589,5 +2765,288 @@ mod tests {
             "cross-class child bytes must not satisfy the acting goal — the second \
              acting entry must still be evicted"
         );
+    }
+
+    // ───────────────────────── PR 4c: the eval point ─────────────────────────
+    //
+    // These exercise the policy engine wired into `accept_transaction`: the I8
+    // no-op, quarantine placement, the deferred-standardness matrix (§6.2/§7),
+    // and infectious-descendant propagation (§3/§7). They fund confirmed UTXOs
+    // directly in the backing store (the `CoinCache` reads through on miss) so a
+    // transaction can pass input resolution and reach the eval point.
+
+    use crate::storage::Store as _;
+    use crate::storage::coinview::Coin;
+
+    /// Build a test env with a set of confirmed (non-coinbase) UTXOs pre-funded
+    /// in the backing store. `dust_relay_fee` is on (3000) so the dust
+    /// standardness check is live for the deferred-standardness tests.
+    fn make_funded_env(coins: &[(OutPoint, Coin)]) -> (ChainState, Mempool, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "satd-evalpoint-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let blocks_dir = dir.join("blocks");
+        let store = Box::new(InMemoryStore::new());
+        if !coins.is_empty() {
+            let mut batch = crate::storage::StoreBatch::default();
+            for (op, c) in coins {
+                batch.coin_puts.push((*op, c.clone()));
+            }
+            store.write_batch(batch).unwrap();
+        }
+        let flat_files = FlatFileManager::new(&blocks_dir).unwrap();
+        let cs = ChainState::new(
+            store,
+            flat_files,
+            bitcoin::Network::Regtest,
+            Box::new(NoopVerifier),
+            AssumeValid::Disabled,
+            450,
+            4,
+            Default::default(),
+            Default::default(),
+        )
+        .unwrap();
+        let mp = Mempool::with_config(MempoolConfig {
+            max_size_bytes: 1_000_000,
+            min_fee_rate: 0,
+            dust_relay_fee: 3_000,
+            ..Default::default()
+        });
+        (cs, mp, dir)
+    }
+
+    fn outpoint(tag: u8) -> OutPoint {
+        use bitcoin::hashes::Hash;
+        OutPoint {
+            txid: bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+                [tag; 32],
+            )),
+            vout: 0,
+        }
+    }
+
+    fn coin(amount: u64) -> Coin {
+        // Standard P2WPKH so the prevout classifies cleanly; non-coinbase so
+        // maturity never blocks the spend.
+        Coin {
+            amount,
+            script_pubkey: p2wpkh_spk(0x11),
+            height: 1,
+            coinbase: false,
+        }
+    }
+
+    fn p2wpkh_spk(tag: u8) -> bitcoin::ScriptBuf {
+        let mut v = vec![0x00, 0x14];
+        v.extend_from_slice(&[tag; 20]);
+        bitcoin::ScriptBuf::from_bytes(v)
+    }
+
+    /// 1-in / 1-out spend of `prev`, paying `out_value` to a P2WPKH output.
+    fn spend(prev: OutPoint, out_value: u64, out_tag: u8) -> Transaction {
+        use bitcoin::blockdata::locktime::absolute::LockTime;
+        use bitcoin::{Amount, ScriptBuf, Sequence, TxIn, TxOut, Witness, transaction};
+        Transaction {
+            version: transaction::Version(2),
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: prev,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(out_value),
+                script_pubkey: p2wpkh_spk(out_tag),
+            }],
+        }
+    }
+
+    fn set_ruleset(mp: &Mempool, src: &str) {
+        let rs = satd_policy::parse_ruleset(src).expect("test ruleset must compile");
+        mp.set_policy(std::sync::Arc::new(rs));
+    }
+
+    #[test]
+    fn no_policy_is_byte_identical_to_engine_compiled_out() {
+        // I8: with no ruleset (and with an *empty* ruleset, which the hot path
+        // treats identically), a tx is admitted to the acting class and the
+        // quarantine class stays empty.
+        let op = outpoint(0xa1);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin(100_000))]);
+        assert!(!mp.has_policy());
+
+        // Empty ruleset ⇒ still "no policy" for the hot path.
+        set_ruleset(&mp, "version 1");
+        assert!(!mp.has_policy(), "an empty ruleset is inert (I8)");
+
+        let tx = spend(op, 99_000, 0x22);
+        let txid = mp
+            .accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc)
+            .expect("admitted");
+        let inner = mp.inner.read();
+        assert!(inner.entries.get(&txid).unwrap().scope.is_acting());
+        assert_eq!(inner.quarantine_bytes, 0);
+        drop(inner);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn quarantine_rule_places_entry_in_quarantine_class() {
+        let op = outpoint(0xa2);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin(100_000))]);
+        // Match every version-2 transaction → full-scope quarantine (default).
+        set_ruleset(&mp, "version 1\nquarantine catch when tx.version == 2");
+        assert!(mp.has_policy());
+
+        let tx = spend(op, 99_000, 0x22);
+        let txid = mp
+            .accept_transaction(tx, &cs, &NoopVerifier, TxSource::P2p)
+            .expect("admitted into quarantine");
+        let inner = mp.inner.read();
+        let entry = inner.entries.get(&txid).unwrap();
+        assert!(entry.scope.is_quarantined(), "held in quarantine class");
+        assert!(entry.scope.relay && entry.scope.template, "default full scope");
+        assert!(inner.quarantine_bytes > 0);
+        // The held entry must NOT count against the acting class.
+        assert_eq!(inner.acting_bytes(), 0);
+        drop(inner);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deferred_standardness_allow_match_admits_to_acting() {
+        // A dust output is nonstandard, but an `allow` matching the submission
+        // forgives it (§6.2) → admitted to the acting class.
+        let op = outpoint(0xa3);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin(100_000))]);
+        set_ruleset(&mp, "version 1\nallow mine when tx.source == rpc");
+
+        let tx = spend(op, 1, 0x22); // 1-sat output ⇒ dust
+        let txid = mp
+            .accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc)
+            .expect("allow forgives the dust nonstandardness");
+        let inner = mp.inner.read();
+        assert!(inner.entries.get(&txid).unwrap().scope.is_acting());
+        assert_eq!(inner.quarantine_bytes, 0);
+        drop(inner);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deferred_standardness_pass_lets_rejection_stand() {
+        // Dust + a ruleset that *has* an allow rule (so deferral happens) but the
+        // allow doesn't match this submission and nothing quarantines ⇒ Pass ⇒
+        // the baseline dust rejection stands.
+        let op = outpoint(0xa4);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin(100_000))]);
+        set_ruleset(&mp, "version 1\nallow mine when tx.source == mcp");
+
+        let tx = spend(op, 1, 0x22); // dust
+        let err = mp
+            .accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc)
+            .unwrap_err();
+        assert!(matches!(err, MempoolError::Dust), "got {err:?}");
+        assert_eq!(mp.quarantine_bytes(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deferred_standardness_quarantine_is_not_a_dumping_ground() {
+        // Dust + an allow rule (deferral on) + a quarantine rule that matches:
+        // the deferred baseline rejection still stands — a nonstandard tx is
+        // rejected, NOT quarantined (§6.2).
+        let op = outpoint(0xa5);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin(100_000))]);
+        set_ruleset(
+            &mp,
+            "version 1\nallow mine when tx.source == mcp\nquarantine catch when tx.version == 2",
+        );
+
+        let tx = spend(op, 1, 0x22); // dust, version 2 (would match the quarantine rule)
+        let err = mp
+            .accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc)
+            .unwrap_err();
+        assert!(matches!(err, MempoolError::Dust), "got {err:?}");
+        assert_eq!(
+            mp.quarantine_bytes(),
+            0,
+            "nonstandard tx must not land in quarantine"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_allow_rules_rejects_nonstandard_early() {
+        // With zero `allow` rules the deferral machinery is skipped entirely:
+        // standardness rejects before input resolution, exactly as today. Proven
+        // by rejecting with `Dust` even though the input is unfunded (which would
+        // otherwise surface as `MissingInputs` later).
+        let (cs, mp, dir) = make_funded_env(&[]); // no coins funded
+        set_ruleset(&mp, "version 1\nquarantine catch when tx.version == 2");
+
+        let tx = spend(outpoint(0xde), 1, 0x22); // dust, unfunded input
+        let err = mp
+            .accept_transaction(tx, &cs, &NoopVerifier, TxSource::P2p)
+            .unwrap_err();
+        assert!(
+            matches!(err, MempoolError::Dust),
+            "must reject early on standardness, not reach input resolution: got {err:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn quarantine_is_infectious_to_descendants() {
+        // A child that matches no rule still inherits its quarantined parent's
+        // scope (§3/§7): announcing a child whose parent we withhold would be
+        // incoherent.
+        let op = outpoint(0xa6);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin(100_000))]);
+        // Match only the parent: its 90k output trips the threshold; the child's
+        // 50k output does not.
+        set_ruleset(
+            &mp,
+            "version 1\nquarantine big when any output (out.value > 80000)",
+        );
+
+        let parent = spend(op, 90_000, 0x22);
+        let parent_txid = parent.compute_txid();
+        mp.accept_transaction(parent, &cs, &NoopVerifier, TxSource::P2p)
+            .expect("parent admitted (quarantined)");
+        assert!(
+            mp.inner
+                .read()
+                .entries
+                .get(&parent_txid)
+                .unwrap()
+                .scope
+                .is_quarantined(),
+            "parent is quarantined"
+        );
+
+        // Child spends the parent's output; it matches no rule on its own.
+        let child = spend(OutPoint { txid: parent_txid, vout: 0 }, 50_000, 0x33);
+        let child_txid = child.compute_txid();
+        mp.accept_transaction(child, &cs, &NoopVerifier, TxSource::P2p)
+            .expect("child admitted");
+        let inner = mp.inner.read();
+        let child_entry = inner.entries.get(&child_txid).unwrap();
+        assert!(
+            child_entry.scope.is_quarantined(),
+            "child inherits the parent's quarantine scope"
+        );
+        assert!(
+            child_entry.scope.relay && child_entry.scope.template,
+            "inherited the parent's full scope"
+        );
+        drop(inner);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
