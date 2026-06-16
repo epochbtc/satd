@@ -1487,6 +1487,29 @@ impl Mempool {
             .collect()
     }
 
+    /// Entries in the **acting class** only — every transaction the node is
+    /// fully assisting (`scope.is_acting()`): both relayed and mineable.
+    ///
+    /// This is the view every **standard wallet-serving read surface** presents
+    /// (design §6.1/§10): `getrawmempool`, `getmempoolinfo`, `getmempoolentry`,
+    /// the address index, the mempool history snapshot, Electrum/Esplora, the
+    /// standard MCP mempool tools. To each of these the node behaves exactly
+    /// like a Core node whose relay policy refused the transaction — the
+    /// quarantine class is invisible, not even surfaced as extension fields.
+    /// Consumers that *want* the quarantine view ask for it by name through the
+    /// dedicated extension surfaces (`getquarantineinfo`/`listquarantine`/
+    /// `getquarantineentry`, PR 7b). Until a policy is loaded every scope is
+    /// empty, so this equals the union and behavior is byte-identical.
+    pub fn get_acting_entries(&self) -> Vec<(Txid, MempoolEntry)> {
+        self.inner
+            .read()
+            .entries
+            .iter()
+            .filter(|(_, v)| v.scope.is_acting())
+            .map(|(k, v)| (*k, v.clone()))
+            .collect()
+    }
+
     /// Entries eligible for the **template** assist path — block-template
     /// assembly ([`crate::mining::template::create_template`]) and the mempool
     /// smart-fee simulator ([`crate::mempool::fee::FeeEstimator::cached_mempool_estimate`]).
@@ -1686,6 +1709,12 @@ impl Mempool {
     pub fn get_entry_verbose(&self, txid: &Txid) -> Option<serde_json::Value> {
         let inner = self.inner.read();
         let entry = inner.entries.get(txid)?;
+        // Standard surface (design §6.1): a quarantined entry is invisible here —
+        // `getmempoolentry` reports it as not-found, exactly as a Core node whose
+        // relay policy refused it. The quarantine view is `getquarantineentry`.
+        if !entry.scope.is_acting() {
+            return None;
+        }
         let vsize = entry.weight / 4;
         let entry_fee = entry.fee;
         let entry_weight = entry.weight;
@@ -1699,6 +1728,24 @@ impl Mempool {
         let children = self.get_children(txid).unwrap_or_default();
 
         let inner = self.inner.read();
+
+        // Invisibility (design §6.1): the ancestor/descendant graph reported on
+        // this standard surface must exclude the quarantine class. Infectious
+        // propagation (§3) guarantees an acting entry has no quarantined
+        // ancestor, but it can have a quarantined descendant/child (quarantined
+        // by its own rule); filter all three so counts and rollups never leak.
+        let ancestors: HashSet<Txid> = ancestors
+            .into_iter()
+            .filter(|a| inner.entries.get(a).is_some_and(|e| e.scope.is_acting()))
+            .collect();
+        let descendants: HashSet<Txid> = descendants
+            .into_iter()
+            .filter(|d| inner.entries.get(d).is_some_and(|e| e.scope.is_acting()))
+            .collect();
+        let children: Vec<Txid> = children
+            .into_iter()
+            .filter(|c| inner.entries.get(c).is_some_and(|e| e.scope.is_acting()))
+            .collect();
 
         let ancestor_count = ancestors.len();
         let ancestor_size: usize = ancestors
@@ -2033,16 +2080,31 @@ impl Mempool {
             (cfg.max_size_bytes, cfg.min_fee_rate, cfg.full_rbf)
         };
         let inner = self.inner.read();
-        // Count only unbroadcast entries still resident (read-only belt —
-        // the removal paths prune inline, so this should equal `len()`).
+        // Standard surface (design §6.1/§10): report the **acting class** only,
+        // so `getmempoolinfo` is byte-identical to a node whose relay policy
+        // refused the quarantined transactions. Until a policy is loaded every
+        // entry is acting, so this equals the physical pool and is unchanged.
+        let size = inner
+            .entries
+            .values()
+            .filter(|e| e.scope.is_acting())
+            .count();
+        // Count only acting unbroadcast entries still resident (read-only belt —
+        // the removal paths prune inline). A quarantined-relay entry is never
+        // announced, so it never belongs to the broadcast-confirmation set.
         let unbroadcast = inner
             .unbroadcast
             .keys()
-            .filter(|txid| inner.entries.contains_key(*txid))
+            .filter(|txid| {
+                inner
+                    .entries
+                    .get(*txid)
+                    .is_some_and(|e| e.scope.is_acting())
+            })
             .count();
         MempoolInfo {
-            size: inner.entries.len(),
-            bytes: inner.total_bytes,
+            size,
+            bytes: inner.acting_bytes(),
             max_size,
             min_fee_rate,
             full_rbf,
@@ -4026,5 +4088,102 @@ mod tests {
         ));
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    // --- PR 7a: standard-surface invisibility (design §6.1/§10) ---
+    //
+    // Every standard wallet-serving read surface presents the acting class
+    // only — byte-identical to a node whose relay policy refused the
+    // quarantined transactions. These cover the mempool-level views; the
+    // RPC byte-identity differential lives in `crate::rpc::rawtx`.
+
+    #[test]
+    fn get_acting_entries_excludes_quarantine() {
+        let mp = Mempool::new(300_000_000, 1_000);
+        let a = mp.insert_scoped_for_test(1, 100, QuarantineScope::acting());
+        mp.insert_scoped_for_test(2, 100, RELAY_ONLY);
+        mp.insert_scoped_for_test(3, 100, TEMPLATE_ONLY);
+        mp.insert_scoped_for_test(4, 100, RELAY_TEMPLATE);
+        let acting: Vec<Txid> = mp
+            .get_acting_entries()
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect();
+        assert_eq!(acting, vec![a], "only the fully-acting tx is visible");
+        assert_eq!(mp.get_all_entries().len(), 4, "all four are physically held");
+    }
+
+    #[test]
+    fn info_reports_acting_class_only() {
+        // Reference pool: one acting tx, no policy.
+        let reference = Mempool::new(300_000_000, 1_000);
+        reference.insert_scoped_for_test(1, 100, QuarantineScope::acting());
+
+        // Same acting tx plus a quarantined tx in every scope.
+        let occupied = Mempool::new(300_000_000, 1_000);
+        occupied.insert_scoped_for_test(1, 100, QuarantineScope::acting());
+        occupied.insert_scoped_for_test(2, 100, RELAY_ONLY);
+        occupied.insert_scoped_for_test(3, 100, TEMPLATE_ONLY);
+        occupied.insert_scoped_for_test(4, 100, RELAY_TEMPLATE);
+
+        let r = reference.info();
+        let q = occupied.info();
+        assert_eq!(r.size, q.size, "getmempoolinfo.size counts the acting class only");
+        assert_eq!(r.bytes, q.bytes, "getmempoolinfo.bytes counts the acting class only");
+        assert_eq!(q.size, 1);
+        assert!(
+            occupied.quarantine_bytes() > 0,
+            "the quarantine class is genuinely occupied — the equality is load-bearing"
+        );
+    }
+
+    #[test]
+    fn get_entry_verbose_hides_quarantined_txid() {
+        let mp = Mempool::new(300_000_000, 1_000);
+        let a = mp.insert_scoped_for_test(1, 100, QuarantineScope::acting());
+        let r = mp.insert_scoped_for_test(2, 100, RELAY_ONLY);
+        let t = mp.insert_scoped_for_test(3, 100, TEMPLATE_ONLY);
+        assert!(mp.get_entry_verbose(&a).is_some(), "acting entry is visible");
+        assert!(
+            mp.get_entry_verbose(&r).is_none(),
+            "relay-quarantined entry is not-found on getmempoolentry"
+        );
+        assert!(
+            mp.get_entry_verbose(&t).is_none(),
+            "template-quarantined entry is not-found on getmempoolentry"
+        );
+    }
+
+    #[test]
+    fn get_entry_verbose_descendant_rollup_excludes_quarantined_child() {
+        // parent (acting) → child (quarantined by its own rule). The child must
+        // not appear in the parent's descendant rollup on this standard surface.
+        let mp = Mempool::new(300_000_000, 1_000);
+        let parent = spend(outpoint(1), 50_000, 2);
+        let parent_txid = parent.compute_txid();
+        mp.insert_tx_scoped_for_test(parent, QuarantineScope::acting());
+        let child = spend(
+            OutPoint {
+                txid: parent_txid,
+                vout: 0,
+            },
+            40_000,
+            3,
+        );
+        mp.insert_tx_scoped_for_test(child, RELAY_TEMPLATE);
+
+        let v = mp
+            .get_entry_verbose(&parent_txid)
+            .expect("parent is acting, so visible");
+        assert_eq!(
+            v["descendantcount"],
+            serde_json::json!(1),
+            "self only — the quarantined child is hidden"
+        );
+        assert_eq!(
+            v["spentby"].as_array().unwrap().len(),
+            0,
+            "the quarantined child is not listed in spentby"
+        );
     }
 }
