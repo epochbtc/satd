@@ -110,6 +110,7 @@ pub fn classify(method: &str) -> Option<RpcAccess> {
         | "getquarantineentry"
         | "getquarantineinfo"
         | "listquarantine"
+        | "policytest"
         | "getrawmempool"
         | "getrawtransaction"
         | "getreorghistory"

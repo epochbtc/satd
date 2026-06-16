@@ -228,6 +228,77 @@ pub fn evaluate(
     source: TxSource,
     from_whitelisted_peer: bool,
 ) -> Verdict {
+    with_view(
+        tx,
+        txid,
+        prev_outputs,
+        prev_is_coinbase,
+        fee,
+        fee_rate,
+        weight,
+        cfg,
+        ctx,
+        source,
+        from_whitelisted_peer,
+        |view, ctxv| ruleset.evaluate(view, ctxv),
+    )
+}
+
+/// Like [`evaluate`], but returns the full per-rule trace alongside the verdict
+/// — the `policytest` dry-run surface (design §10, PR 7d). Identical view
+/// construction; the ruleset records each rule's matched/not result, stopping
+/// at the first match (first-match-wins) exactly as the node would.
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_trace(
+    ruleset: &CompiledRuleset,
+    tx: &Transaction,
+    txid: &Txid,
+    prev_outputs: &[TxOut],
+    prev_is_coinbase: &[bool],
+    fee: u64,
+    fee_rate: u64,
+    weight: usize,
+    cfg: &MempoolConfig,
+    ctx: PolicyCtx,
+    source: TxSource,
+    from_whitelisted_peer: bool,
+) -> (Vec<satd_policy::RuleTrace>, Verdict) {
+    with_view(
+        tx,
+        txid,
+        prev_outputs,
+        prev_is_coinbase,
+        fee,
+        fee_rate,
+        weight,
+        cfg,
+        ctx,
+        source,
+        from_whitelisted_peer,
+        |view, ctxv| ruleset.evaluate_trace(view, ctxv),
+    )
+}
+
+/// Build the borrowed [`TxView`]/[`Ctx`] for `tx` and run `f` against them. The
+/// view borrows slices out of `tx`/`prev_outputs` plus a couple of owned txid
+/// buffers, all of which live for the duration of `f` and drop with this frame —
+/// so nothing heap-resident outlives the evaluation. Shared by [`evaluate`] and
+/// [`evaluate_trace`] so the two cannot diverge in how the view is filled.
+#[allow(clippy::too_many_arguments)]
+fn with_view<R>(
+    tx: &Transaction,
+    txid: &Txid,
+    prev_outputs: &[TxOut],
+    prev_is_coinbase: &[bool],
+    fee: u64,
+    fee_rate: u64,
+    weight: usize,
+    cfg: &MempoolConfig,
+    ctx: PolicyCtx,
+    source: TxSource,
+    from_whitelisted_peer: bool,
+    f: impl FnOnce(&TxView, &Ctx) -> R,
+) -> R {
     // Owned 32-byte txid buffers — the only view state not borrowed from `tx`
     // or `prev_outputs`.
     let txid_bytes = txid.to_byte_array();
@@ -319,7 +390,7 @@ pub fn evaluate(
         mempool_min_fee: cfg.min_fee_rate as i128,
     };
 
-    ruleset.evaluate(&view, &ctxv)
+    f(&view, &ctxv)
 }
 
 #[cfg(test)]
@@ -440,5 +511,85 @@ mod tests {
             satd_policy::Verdict::Quarantine { rule, .. } => assert_eq!(rule, "bulk"),
             other => panic!("expected quarantine, got {other:?}"),
         }
+    }
+
+    /// `evaluate_trace` must report every rule's matched/not, mark the first
+    /// match decisive, and leave rules after it not-evaluated (first-match-wins).
+    #[test]
+    fn evaluate_trace_is_first_match_wins() {
+        use bitcoin::blockdata::locktime::absolute::LockTime;
+        use bitcoin::hashes::Hash;
+        use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, TxIn, TxOut, Witness, transaction};
+
+        let mut op_return = vec![0x6a, 0x4c, 90u8];
+        op_return.extend_from_slice(&[0xab; 90]);
+        let tx = Transaction {
+            version: transaction::Version(2),
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: bitcoin::Txid::from_raw_hash(
+                        bitcoin::hashes::sha256d::Hash::from_byte_array([7u8; 32]),
+                    ),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(0),
+                script_pubkey: ScriptBuf::from_bytes(op_return),
+            }],
+        };
+        let txid = tx.compute_txid();
+        let prev = vec![TxOut {
+            value: Amount::from_sat(10_000),
+            script_pubkey: {
+                let mut v = vec![0x00, 0x14];
+                v.extend_from_slice(&[0u8; 20]);
+                ScriptBuf::from_bytes(v)
+            },
+        }];
+
+        // first: won't match (version != 99); bulk: matches (decisive);
+        // later: would match but is never reached.
+        let ruleset = satd_policy::parse_ruleset(
+            "version 1\n\
+             quarantine first when tx.version == 99\n\
+             quarantine bulk when any output (out.script_type == op_return and out.op_return_size > 83)\n\
+             allow later when tx.version == 2",
+        )
+        .unwrap();
+        let cfg = MempoolConfig::default();
+        let ctx = PolicyCtx {
+            network: BNetwork::Regtest,
+            height: 1,
+            mempool_bytes: 0,
+        };
+        let (traces, verdict) = evaluate_trace(
+            &ruleset,
+            &tx,
+            &txid,
+            &prev,
+            &[false],
+            10_000,
+            1_000,
+            tx.weight().to_wu() as usize,
+            &cfg,
+            ctx,
+            TxSource::P2p,
+            false,
+        );
+
+        assert_eq!(traces.len(), 3);
+        assert_eq!(traces[0].name, "first");
+        assert!(traces[0].evaluated && !traces[0].matched && !traces[0].decisive);
+        assert_eq!(traces[1].name, "bulk");
+        assert!(traces[1].evaluated && traces[1].matched && traces[1].decisive);
+        assert_eq!(traces[2].name, "later");
+        assert!(!traces[2].evaluated, "later rule is never reached (first-match-wins)");
+        assert!(matches!(verdict, satd_policy::Verdict::Quarantine { .. }));
+        assert_eq!(verdict.rule(), Some("bulk"));
     }
 }

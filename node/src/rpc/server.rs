@@ -630,6 +630,16 @@ pub async fn start(
             .map_err(|e| ErrorObjectOwned::owned(-5, e, None::<()>))
     })?;
 
+    module.register_method("policytest", |params, ctx, _extensions| {
+        // `policytest <rawtx-hex>` — dry-run against the loaded ruleset.
+        let mut seq = params.sequence();
+        let rawtx: String = seq
+            .next()
+            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+        crate::rpc::policy::policy_test(&ctx.chain_state, &ctx.mempool, &rawtx)
+            .map_err(|e| ErrorObjectOwned::owned(-8, e, None::<()>))
+    })?;
+
     module.register_method("preciousblock", |params, _ctx, _extensions| {
         let hash: String = params
             .one()
