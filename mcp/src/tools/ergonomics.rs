@@ -42,8 +42,10 @@ pub fn get_metrics_snapshot(ctx: &McpContext) -> String {
         network: ctx.network,
         start_time: ctx.start_time,
         version: env!("CARGO_PKG_VERSION"),
-        addr_subs: None,
-        addr_enabled: false,
+        // Mirror the HTTP `/metrics` path: report the node's real
+        // address-index state, not a hardcoded "disabled" / zero.
+        addr_subs: ctx.addr_subs.clone(),
+        addr_enabled: ctx.addr_enabled,
     };
     let body = metrics_ctx.render_prometheus();
     let result = json!({
