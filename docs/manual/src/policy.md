@@ -56,7 +56,8 @@ exceptions first.
 ## Configuration and reload
 
 Point the node at a policy file with `policyfile=/path/to/policy.txt` (config
-file or `-policyfile` flag). On startup a bad file is **fatal** (fail-loud).
+file or `-policyfile` flag); the path must be **absolute**. On startup a bad file
+is **fatal** (fail-loud).
 
 The file is **live-reloadable on `SIGHUP`**: the contents are re-read and
 recompiled on every signal (even if the path is unchanged), the whole mempool is
@@ -67,9 +68,9 @@ re-announced on a bounded drain. A reload that fails to compile keeps the
 back to acting. Re-placement only ever changes *placement*, never validity, so a
 reload is lossless apart from ordinary budget eviction.
 
-The quarantine class has its own byte budget, `quarantinemempool=<bytes>`
-(default 50 MB), accounted and fee-rate-evicted separately from the acting
-mempool so neither class can crowd the other out.
+The quarantine class has its own byte budget, `quarantinemempool=<MB>`
+(in **megabytes**, default 50), accounted and fee-rate-evicted separately from
+the acting mempool so neither class can crowd the other out.
 
 Validate a file offline before deploying it:
 
