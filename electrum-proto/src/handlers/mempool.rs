@@ -86,7 +86,11 @@ pub fn get_fee_histogram(state: &ElectrumState) -> Result<Value, JsonRpcError> {
 /// JSON. Exposed at module level so the cache (and tests) can
 /// invoke the same logic.
 pub(crate) fn compute_fee_histogram(mempool: &node::mempool::pool::Mempool) -> Value {
-    let entries = mempool.get_all_entries();
+    // Fee-estimation surface (design §2.4): the template view — transactions
+    // quarantined `on template` are never mined, so they must not appear in the
+    // fee histogram wallets use to pick a feerate (consistent with every other
+    // fee surface: estimatesmartfee/estimatefees, Esplora /fee-estimates).
+    let entries = mempool.get_template_entries();
 
     // `MempoolEntry::fee_rate` is sat/kvB (sat per 1000 *virtual* bytes)
     // since PR #355 (`policy::fee_rate_sat_per_kvb`), so sat/vbyte =
