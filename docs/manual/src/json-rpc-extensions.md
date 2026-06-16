@@ -3,13 +3,13 @@
 satd preserves Bitcoin Core's JSON-RPC contract by default — the same method
 names, response field names, and types — so existing clients work unchanged.
 On top of that, satd adds a handful of **opt-in** extensions for developers and
-integrators. Every extension below is either requested per-call or enabled by a
-flag; none of them alter the default Core-compatible response shape, and all are
-governed by the
-[stability policy](https://github.com/epochbtc/satd/blob/master/STABILITY_POLICY.md).
-The authoritative, exhaustive catalogue of where satd differs from Core is
-[`CORE_DIFFERENCES.md`](https://github.com/epochbtc/satd/blob/master/CORE_DIFFERENCES.md);
-this chapter is the operator-facing tour.
+integrators. Each is either enabled by a server flag (and is therefore
+live-reloadable over `SIGHUP`) or exposed as an additional method or parameter;
+none of them alters the default Core-compatible wire shape. All are governed by
+the
+[stability policy](https://github.com/epochbtc/satd/blob/master/STABILITY_POLICY.md),
+and the authoritative, exhaustive catalogue of where satd differs from Core is
+[`CORE_DIFFERENCES.md`](https://github.com/epochbtc/satd/blob/master/CORE_DIFFERENCES.md).
 
 For the push-based event firehose and cursor-resumable watch subscriptions
 (gRPC / WebSocket / SSE / ZMQ), see the
@@ -23,44 +23,70 @@ JSON-RPC extensions here.
 
 ## Satoshis-as-integers
 
-The default wire format keeps Core's BTC-as-doubles so existing clients are
-unaffected. To avoid IEEE-754 rounding, a caller can pass `"amounts": "sats"`
-on any request and receive exact integer satoshi values instead of BTC
-decimals; the response echoes `"units": "sats"` so the caller can confirm the
-mode it got. This closes Core's long-standing
-[#3249](https://github.com/bitcoin/bitcoin/issues/3249).
+Bitcoin Core emits every amount as an IEEE-754 double in whole BTC
+(`0.00001000`), which loses precision near dust and at the supply boundary —
+Core's long-standing [#3249](https://github.com/bitcoin/bitcoin/issues/3249),
+open since 2013. satd can instead emit exact integer satoshis.
+
+This is a **server-wide default**, `--rpc-default-units=sats|btc`
+(`rpcdefaultunits` in the config file), not a per-request flag. It defaults to
+`btc`, where output is **byte-identical** to Core (a fixed 8-decimal number,
+formatted from the integer satoshi value so it is exact). Set it to `sats` and
+amounts serialize as JSON integers everywhere; in that mode responses also carry
+a `_units: "sats"` tag so a client can confirm the shape it received (the tag is
+absent in the default `btc` mode to stay byte-for-byte compatible). The setting
+is live-reloadable. A per-request HTTP-header override is a planned follow-up.
 
 ## Structured RPC errors
 
-Opt-in `category` / `suggestion` / `debug` fields on JSON-RPC error payloads,
-for clients that want machine-actionable error handling. The default error
-shape stays Core-compatible; the extra fields appear only when requested. The
-category schema is a Tier-2 stability surface (see `STABILITY_POLICY.md`).
+By default, error responses are byte-identical to Core's `{code, message}`. With
+`--rpc-extended-errors` (`rpcextendederrors`; default off, live-reloadable)
+enabled server-wide, satd additionally populates the JSON-RPC `data` object with
+machine-actionable fields:
 
-## Mempool-aware fee estimation
+- `category` — a stable, dashboard-friendly taxonomy string
+  (e.g. `mempool.policy.feerate`, `validation.consensus`, `storage.not_found`).
+- `suggestion` — a concrete remediation hint, when one applies.
+- `debug` — arbitrary structured detail (field positions, computed values),
+  when present.
 
-Core's `estimatesmartfee` is preserved **unchanged** (same inputs, same
-response shape). Alongside it, satd adds an `estimatefees` RPC that simulates
-the next-N block templates from the *current* mempool with CPFP-aware sorting.
-It **never hard-errors** — it always returns a result with a
-`confidence: low | medium | high` field rather than failing and breaking
-downstream applications. This closes Core's
-[#11500](https://github.com/bitcoin/bitcoin/issues/11500).
+Category names are stable once shipped in a release — only new names are added,
+existing ones never change meaning. As with the units default, this is a
+server-wide switch (the common deployment pattern is satd driven only by
+satd-aware tooling); a per-request `X-Satd-Extended-Errors` header is a planned
+follow-up.
+
+## Fee estimation
+
+Core's `estimatesmartfee conf_target [estimate_mode]` is kept with its exact
+response shape (`{feerate, blocks, errors}`) and is Core-compatible by default.
+Beyond Core's `economical` / `conservative` / `unset` vocabulary (all treated as
+the historical estimator), the optional mode argument additionally accepts
+satd's own `historical` / `mempool` / `blend` values.
+
+Alongside it, satd adds an `estimatefees [targets] [mode]` RPC (default mode
+`blend`, default targets `[1, 3, 6, 12, 24]`). It simulates the next-N block
+templates from the *current* mempool with ancestor-feerate (CPFP-aware) package
+sorting, and **never hard-errors** — it always returns a result. The response
+maps each target to a `{feerate, confidence}` pair (`confidence` is
+`high | medium | low`) and includes a feerate histogram. This is the basis for
+Core's [#11500](https://github.com/bitcoin/bitcoin/issues/11500).
 
 ## Mempool subscription stream
 
-`subscribemempool` is a JSON-RPC WebSocket subscription emitting structured
-lifecycle events:
+`subscribemempool` is a JSON-RPC WebSocket subscription (paired with
+`unsubscribemempool`) emitting structured lifecycle events, each tagged by a
+`kind` field:
 
 *   `enter` — a transaction was admitted to the mempool.
 *   `leave_confirmed` — it was confirmed in a block.
 *   `leave_evicted` — it was dropped, with an explicit `reason`
     (`full_pool` | `expiry`).
-*   `leave_replaced` — it was RBF-replaced, with the `replacing_txid`.
+*   `leave_replaced` — it was RBF-replaced, carrying the `replacing_txid`.
 
 Where Bitcoin Core requires polling `getrawmempool` or rebuilding state from
 per-tx ZMQ frames, this stream carries explicit eviction reasons and RBF
-replacement linkage directly. The richer firehose / cursor-replay surface is
+replacement linkage directly. For the richer firehose with cursor replay, see
 the [Streaming Consumption API](streaming.md); `subscribemempool` is the
 lightweight JSON-RPC option.
 
@@ -68,7 +94,12 @@ lightweight JSON-RPC option.
 
 By design there is **no signing RPC** — the `satd` daemon never handles private
 keys. Signing is instead a client-side `sat-cli` command:
-`sat-cli signpsbtwithkey` reads a WIF or xpriv from **stdin** and signs Taproot
-key-path, SegWit, or Legacy inputs locally. Because the key never crosses the
-JSON-RPC boundary, the daemon stays strictly keyless while operators can still
-sign PSBTs from their terminal.
+`sat-cli signpsbtwithkey` reads a WIF private key or a BIP-32 xpriv from
+**stdin** (prompting without echo when stdin is a terminal) and signs the PSBT
+entirely locally, using only the prevout data already carried in the PSBT. It
+covers the common single-sig script types — Legacy, SegWit v0, nested SegWit,
+and Taproot key-path — and writes `partial_sigs` / `tap_key_sig` for the node's
+`finalizepsbt` to assemble, rather than finalizing itself. An xpriv is expanded
+over the standard BIP 44/49/84/86 paths so it can sign PSBTs that carry no
+derivation metadata (including satd's own `createpsbt` output). Because the key
+never crosses the JSON-RPC boundary, the daemon stays strictly keyless.
