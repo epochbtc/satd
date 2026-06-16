@@ -11,6 +11,12 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
 
 ## [Unreleased]
 
+- **MCP `get_metrics_snapshot` now reports real address-index state.** The
+  tool rendered `satd_addrindex_enabled` and `satd_addrindex_subscriptions_active`
+  from hardcoded zeros, so its snapshot disagreed with the HTTP `/metrics` scrape
+  on a node with `addressindex=1`. It now mirrors the live config and
+  subscription registry. See the [release notes](docs/release-notes/0.3.1-pre.md).
+
 - **`getrawmempool` verbose no longer O(N²).** Verbose mempool views
   (`getrawmempool true`, `getmempooldescendants`, `getmempoolentry`) computed
   each transaction's ancestor/descendant rollups by scanning the whole mempool
