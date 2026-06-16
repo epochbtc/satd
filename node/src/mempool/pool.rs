@@ -719,13 +719,17 @@ impl Mempool {
                     e.scope = new_scope;
                 }
 
-                // Classify the move. A net gain of relay assistance (it was
-                // withheld, now isn't) is a promotion for re-announce purposes;
-                // a net gain of withholding is a demotion. Full clear is the
-                // canonical promotion.
-                let gained_relay = !old_scope.assists_relay() && new_scope.assists_relay();
-                let became_acting = old_scope.is_quarantined() && new_scope.is_acting();
-                if became_acting || gained_relay {
+                // Classify the move for the streaming surface. `Promoted` has a
+                // strict contract: the scope FULLY cleared and the tx is acting
+                // again (I9). A move that recovers *one* path (e.g. relay) while
+                // the other stays withheld is NOT a promotion — the tx is still
+                // quarantined. Report every still-held outcome via `Demoted`,
+                // which carries the resulting held scope (relay/template) so
+                // subscribers converge on the correct state instead of being told
+                // a still-template-held tx is acting. (When `new_scope.is_acting()`
+                // here, `old_scope` was necessarily quarantined: the two differ
+                // and the acting scope is unique.)
+                if new_scope.is_acting() {
                     promoted.push(txid);
                 } else {
                     let rule = own_rule.unwrap_or_else(|| INFECTIOUS_RULE.to_string());
@@ -3780,6 +3784,43 @@ mod tests {
         assert_eq!(mp.inner.read().total_bytes, before_total);
         assert_eq!(mp.acting_bytes(), before_acting);
         assert_eq!(mp.quarantine_bytes(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reapply_partial_relay_recovery_is_demoted_not_promoted() {
+        // Regression: a move that recovers relay assistance but leaves the tx
+        // template-held must NOT be reported as `Promoted` (whose contract is a
+        // FULL scope clear → acting again). It must surface as a `Demoted`-class
+        // move carrying the new held scope, so subscribers don't believe a
+        // still-template-held tx is acting.
+        let op = outpoint(0xc7);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin(100_000))]);
+        let tx = spend(op, 99_000, 0x55);
+        let txid = mp
+            .accept_transaction(tx, &cs, &NoopVerifier, TxSource::P2p, false)
+            .expect("admitted");
+
+        // First ruleset: full quarantine (default scope = relay + template).
+        set_ruleset(&mp, "version 1\nquarantine catch when tx.version == 2");
+        let t = mp.reapply_policy(&cs);
+        assert_eq!(t.demoted, vec![txid]);
+        let s = scope_of(&mp, &txid);
+        assert!(s.relay && s.template, "withheld from both paths");
+
+        // Reload to template-only quarantine: relay is recovered, template stays
+        // held. Net result is still quarantined → this is a Demoted move, never a
+        // Promoted one.
+        set_ruleset(&mp, "version 1\nquarantine catch on template when tx.version == 2");
+        let t = mp.reapply_policy(&cs);
+        assert!(
+            t.promoted.is_empty(),
+            "still template-held ⇒ not a promotion"
+        );
+        assert_eq!(t.demoted, vec![txid], "partial recovery reported as a scope change");
+        let s = scope_of(&mp, &txid);
+        assert!(!s.relay && s.template, "now relay-assisting, template-held");
+        assert!(s.is_quarantined(), "still quarantined overall");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

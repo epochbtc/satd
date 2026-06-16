@@ -103,11 +103,16 @@ pub enum QuarantineEvent {
         template: bool,
         time: u64,
     },
-    /// A ruleset reload (§8) moved a previously-acting transaction *into* the
-    /// quarantine class. Distinct from [`Self::Quarantined`] (admission-time
-    /// placement) so dashboards can tell a fresh hold from a policy change that
-    /// retroactively withheld already-admitted traffic. `rule`/`relay`/`template`
-    /// carry the new held scope, as for `Quarantined`.
+    /// A ruleset reload (§8) left a transaction in the quarantine class with a
+    /// *different* held scope than before: either a previously-acting tx moved
+    /// *into* quarantine, or an already-held tx's scope changed (e.g. relay
+    /// recovered but template still withheld) without fully clearing. Distinct
+    /// from [`Self::Quarantined`] (admission-time placement) so dashboards can
+    /// tell a fresh hold from a policy change that re-scoped already-admitted
+    /// traffic. `rule`/`relay`/`template` carry the new held scope, as for
+    /// `Quarantined`; subscribers should treat this as "the current held scope
+    /// is now X" rather than strictly a downgrade. A move that *fully* clears the
+    /// scope is reported as [`Self::Promoted`] instead.
     Demoted {
         txid: Txid,
         rule: String,
