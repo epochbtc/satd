@@ -750,6 +750,19 @@ impl Mempool {
             self.sync_unbroadcast_len(&inner);
         }
 
+        // A move recorded above can be undone by the post-replacement budget
+        // eviction: a tx promoted into an already-full acting class (or demoted
+        // into a full quarantine class) can itself be the lowest-fee victim and
+        // leave the pool in the same pass. Such a tx is gone — it must surface
+        // only `LeaveEvicted`, never a `Promoted`/`Demoted` event, and must not
+        // be handed back in `promoted` for PR 6b to re-announce. Drop every
+        // evicted txid from the transition lists before emitting/returning.
+        if !evicted.is_empty() {
+            let gone: std::collections::HashSet<Txid> = evicted.iter().copied().collect();
+            promoted.retain(|t| !gone.contains(t));
+            demoted.retain(|(t, _, _)| !gone.contains(t));
+        }
+
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -3821,6 +3834,70 @@ mod tests {
         let s = scope_of(&mp, &txid);
         assert!(!s.relay && s.template, "now relay-assisting, template-held");
         assert!(s.is_quarantined(), "still quarantined overall");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reapply_promotion_evicted_in_same_pass_is_not_reported_promoted() {
+        // Regression: a tx promoted into an already-full acting class can be the
+        // lowest-fee victim of the post-replacement budget eviction in the SAME
+        // pass. It left the pool entirely, so it must surface only as `evicted` —
+        // never in `promoted` (which PR 6b re-announces) and never via a
+        // `Promoted` event for a tx that no longer exists.
+        let op_keep = outpoint(0xd1);
+        let op_q = outpoint(0xd2);
+        let (cs, mp, dir) =
+            make_funded_env(&[(op_keep, coin(100_000)), (op_q, coin(100_000))]);
+
+        // High-fee acting tx to keep; low-fee tx that will be quarantined then
+        // promoted. Both are 1-in/1-out and serialize to the same length.
+        let tx_keep = spend(op_keep, 90_000, 0x33); // fee 10_000 — high rate
+        let tx_q = spend(op_q, 99_900, 0x44); // fee 100 — low rate, evict victim
+        let l = bitcoin::consensus::serialize(&tx_keep).len();
+        assert_eq!(l, bitcoin::consensus::serialize(&tx_q).len());
+
+        // Quarantine only tx_q (match its 99_900 output); admit both.
+        set_ruleset(
+            &mp,
+            "version 1\nquarantine onlyq when any outputs (out.value == 99900)",
+        );
+        let keep_txid = mp
+            .accept_transaction(tx_keep, &cs, &NoopVerifier, TxSource::P2p, false)
+            .expect("keep admitted");
+        let q_txid = mp
+            .accept_transaction(tx_q, &cs, &NoopVerifier, TxSource::P2p, false)
+            .expect("q admitted");
+        assert!(scope_of(&mp, &keep_txid).is_acting());
+        assert!(scope_of(&mp, &q_txid).is_quarantined());
+
+        // Tighten the acting budget so it fits exactly one tx, and remove the
+        // rule: reapply promotes tx_q into acting → acting holds two txs → over
+        // budget → the lowest-fee tx (tx_q) is evicted in the same pass.
+        mp.clear_policy();
+        mp.reload_policy(MempoolConfig {
+            max_size_bytes: l + l / 2,
+            min_fee_rate: 0,
+            dust_relay_fee: 3_000,
+            ..Default::default()
+        });
+        let t = mp.reapply_policy(&cs);
+
+        assert!(
+            t.evicted.contains(&q_txid),
+            "the promoted-then-overflowing tx must be evicted"
+        );
+        assert!(
+            !t.promoted.contains(&q_txid),
+            "an evicted tx must not be reported as promoted (no phantom re-announce)"
+        );
+        assert!(
+            !mp.inner.read().entries.contains_key(&q_txid),
+            "evicted tx is gone from the pool"
+        );
+        assert!(
+            mp.inner.read().entries.contains_key(&keep_txid),
+            "the high-fee acting tx survives"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
