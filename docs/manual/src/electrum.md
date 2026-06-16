@@ -6,9 +6,8 @@ Electrum, and most hardware-wallet coordinators speak. It is a query layer over
 satd's own chainstate and address-history index — **not** a separate `electrs` /
 Fulcrum process with its own copy of the data. satd's combined index is larger on
 disk than a standalone electrs/Fulcrum index — the trade is disk for consistency
-and single-process operation (see [Disk Footprint & Indices](disk-footprint.md)).
-See [Native Protocol Architecture](native-protocol-surfaces.md) for the "why
-native + shared chainstate" rationale.
+and single-process operation; see [Disk Footprint & Indices](disk-footprint.md)
+for the "why native + shared chainstate" rationale.
 
 It is **off by default**. Enable with `--electrum=1`; it requires
 `--addressindex=1` (for scripthash history) **and** `--txindex=1` (for the

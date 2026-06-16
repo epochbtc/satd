@@ -36,14 +36,15 @@ Runtimes](api-scaling.md) for the scale-out trade-off.
   sync](ibd.md), [API scaling and the two-runtime model](api-scaling.md),
   [authentication and authorization](authentication.md)
   (Core-compatible credentials plus the unified bearer-token layer), the
-  [integrator APIs](integrator-apis.md), and the [`sat-tui`](tui.md) terminal
-  dashboard.
+  [JSON-RPC extensions](json-rpc-extensions.md), and the [`sat-tui`](tui.md)
+  terminal dashboard.
 - **Protocol Surfaces** — the [Esplora REST API](esplora.md) and [Electrum
   protocol](electrum.md) references, the [streaming consumption API](streaming.md),
-  the [MCP server](mcp.md), and the
-  [architecture](native-protocol-surfaces.md) behind satd's native, shared-chainstate
-  protocol servers (the headline differentiator over the `bitcoind` + `electrs`
-  status quo).
+  and the [MCP server](mcp.md). These run as native, shared-chainstate
+  subsystems of `satd` itself — the headline differentiator over the
+  `bitcoind` + `electrs` status quo; the [Disk Footprint &
+  Indices](disk-footprint.md) chapter covers what that single shared store buys
+  you.
 - **Packaging & Deployment** — the authoritative [packaging
   contract](packaging.md) for downstream distributions: file layout, signals,
   ports, the release/signing pipeline, and reproducible builds.

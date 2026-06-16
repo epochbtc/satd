@@ -12,14 +12,10 @@ gaps — **descriptor lifecycle**, **outpoint-level subscriptions**, and
 satd serves all three natively, in-process, as consensus ground truth rather
 than reconstructed from a ZMQ side-channel.
 
-> **Status: shipped.** The full surface described here is implemented — the
-> `NodeEvent` bus and gRPC `Subscribe` firehose, the Core-compatible ZMQ PUB
-> sink, the bidirectional `Watch` control channel, the live
-> outpoint/script/txid/prefix matcher, durable replay cursors, the JSON/WebSocket
-> + SSE transports (`--streamws`), and the descriptor convenience layer. This
-> chapter is the integrator guide; the authoritative, wire-level protocol
-> specification is
-> [`docs/api/streaming.md`](https://github.com/epochbtc/satd/blob/master/docs/api/streaming.md).
+This chapter is the integrator guide. The authoritative, wire-level protocol
+specification — the `satd.events.v1` protobuf, frame formats, and cursor
+semantics — is
+[`docs/api/streaming.md`](https://github.com/epochbtc/satd/blob/master/docs/api/streaming.md).
 
 ## The base primitive: outpoint subscription
 
