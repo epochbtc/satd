@@ -26,6 +26,9 @@ pub struct Outcome<'a> {
     /// True iff fuel ran out mid-evaluation. When set, `value` is a sentinel and
     /// the rule layer treats the transaction as fail-safe-restrictive.
     pub fuel_exhausted: bool,
+    /// Fuel left after evaluation (never negative). The rule engine threads this
+    /// across a ruleset so the whole first-match pass shares one budget.
+    pub fuel_remaining: i64,
 }
 
 /// Evaluate `expr` against a transaction/context view with [`DEFAULT_FUEL`].
@@ -47,6 +50,7 @@ pub fn eval_metered<'a>(expr: &'a Expr, tx: &'a TxView<'a>, ctx: &Ctx, fuel: i64
     Outcome {
         value,
         fuel_exhausted: ev.exhausted,
+        fuel_remaining: ev.fuel.max(0),
     }
 }
 

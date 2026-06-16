@@ -45,6 +45,9 @@ pub enum Stage {
     Parse,
     Type,
     Cost,
+    /// Structural policy-file errors (version gate, rule headers, scopes,
+    /// duplicate names) — distinct from expression-level lex/parse/type errors.
+    Ruleset,
 }
 
 impl fmt::Display for Stage {
@@ -54,6 +57,7 @@ impl fmt::Display for Stage {
             Stage::Parse => "parse error",
             Stage::Type => "type error",
             Stage::Cost => "cost error",
+            Stage::Ruleset => "policy error",
         };
         f.write_str(s)
     }
@@ -87,6 +91,18 @@ impl PolicyError {
     }
     pub fn cost(span: Span, message: impl Into<String>) -> Self {
         Self::new(Stage::Cost, span, message)
+    }
+    pub fn ruleset(span: Span, message: impl Into<String>) -> Self {
+        Self::new(Stage::Ruleset, span, message)
+    }
+
+    /// Shift this error's span by `by` bytes. Used when an expression compiled
+    /// from a sub-slice of a policy file reports a span relative to that slice;
+    /// offsetting maps it back to file coordinates for unified rendering.
+    pub fn offset(mut self, by: usize) -> Self {
+        self.span.start += by;
+        self.span.end += by;
+        self
     }
 
     /// Render a multi-line diagnostic against the original `source`, with a

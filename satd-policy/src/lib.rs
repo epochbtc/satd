@@ -29,16 +29,22 @@ pub mod error;
 pub mod eval;
 pub mod lexer;
 pub mod parser;
+pub mod ruleset;
+pub mod scope;
 pub mod script;
 pub mod typeck;
 pub mod value;
+pub mod verdict;
 pub mod view;
 
 pub use cost::{Cost, POLICY_BUDGET};
 pub use error::{PolicyError, Result, Span, Stage};
 pub use eval::{DEFAULT_FUEL, Outcome};
+pub use ruleset::{Action, CompiledRuleset, Rule, SUPPORTED_VERSION, parse_ruleset};
+pub use scope::ScopeSet;
 pub use typeck::Type;
 pub use value::{EnumKind, EnumVal, Network, ScriptType, Source, Value};
+pub use verdict::Verdict;
 pub use view::{Ctx, InputView, OutputView, TxView};
 
 use ast::Expr;
