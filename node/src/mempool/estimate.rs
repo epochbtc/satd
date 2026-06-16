@@ -770,6 +770,7 @@ mod tests {
             sigop_cost,
             prev_scripthashes: Vec::new(),
             source: crate::mempool::pool::TxSource::Rpc,
+            scope: crate::mempool::pool::QuarantineScope::acting(),
         }
     }
 

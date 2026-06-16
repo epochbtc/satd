@@ -25,6 +25,11 @@ pub enum EvictReason {
     /// operators aren't misled into thinking the mempool is under
     /// pressure.
     BlockConflict,
+    /// Evicted from the **quarantine class** because that class's own byte
+    /// budget (`quarantinemempool`) overflowed — fee-rate eviction within the
+    /// held set. Distinct from `FullPool` (the acting class) so per-class
+    /// pressure is legible. Inert until a policy is loaded (PR 4c).
+    Policy,
 }
 
 impl EvictReason {
@@ -34,6 +39,7 @@ impl EvictReason {
             EvictReason::FullPool => "full_pool",
             EvictReason::Expiry => "expiry",
             EvictReason::BlockConflict => "block_conflict",
+            EvictReason::Policy => "policy",
         }
     }
 }

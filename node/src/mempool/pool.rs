@@ -81,6 +81,37 @@ pub enum TxSource {
     Reload,
 }
 
+/// The relay/template surfaces a quarantined mempool entry is withheld from
+/// (design §3, §5). An **empty** scope marks an ordinary "acting" entry — the
+/// only kind that exists until a policy is loaded (PR 4c). A non-empty scope
+/// marks a held ("quarantine class") entry: `relay` withholds it from
+/// announce / serve / rebroadcast, `template` withholds it from blocks this
+/// node builds. Mirrors `satd_policy::ScopeSet`; PR 4c maps the policy
+/// verdict's scope onto this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct QuarantineScope {
+    pub relay: bool,
+    pub template: bool,
+}
+
+impl QuarantineScope {
+    /// Acting entry — withheld from nothing.
+    pub const fn acting() -> Self {
+        QuarantineScope {
+            relay: false,
+            template: false,
+        }
+    }
+    /// True for an acting (non-quarantined) entry.
+    pub fn is_acting(self) -> bool {
+        !self.relay && !self.template
+    }
+    /// True for a held (quarantine-class) entry.
+    pub fn is_quarantined(self) -> bool {
+        !self.is_acting()
+    }
+}
+
 /// Metadata for a transaction in the mempool.
 #[derive(Debug, Clone)]
 pub struct MempoolEntry {
@@ -107,6 +138,10 @@ pub struct MempoolEntry {
     /// How this transaction reached the node. Recorded at admission for the
     /// transaction-policy engine (`tx.source`); unused until PR 4c.
     pub source: TxSource,
+    /// Quarantine scope. Empty ([`QuarantineScope::acting`]) for every entry
+    /// until a policy is loaded (PR 4c); a non-empty scope places the entry in
+    /// the quarantine class for per-class accounting and eviction.
+    pub scope: QuarantineScope,
 }
 
 /// Statistics about the mempool.
@@ -124,7 +159,16 @@ pub struct MempoolInfo {
 struct MempoolInner {
     entries: HashMap<Txid, MempoolEntry>,
     spends: HashMap<OutPoint, Txid>,
+    /// Serialized bytes of **all** entries (acting + quarantine) — the single
+    /// physical pool's occupancy. `acting_bytes()` derives the acting class by
+    /// subtracting `quarantine_bytes`.
     total_bytes: usize,
+    /// Serialized bytes of the **quarantine class** alone (entries whose
+    /// [`MempoolEntry::scope`] is non-empty). Maintained in lockstep with
+    /// `total_bytes` by [`MempoolInner::account_insert`] /
+    /// [`MempoolInner::account_remove`]. Always 0 until a policy is loaded
+    /// (PR 4c), so `acting_bytes() == total_bytes` and behavior is unchanged.
+    quarantine_bytes: usize,
     /// Locally-originated txs (submitted here via a broadcast surface) that
     /// have not yet been confirmed to have propagated. Maps each txid to the
     /// set of peer IPs that have since demonstrated knowledge of it
@@ -140,6 +184,35 @@ struct MempoolInner {
     /// Always a subset of `entries`. This is satd's analogue of Core's
     /// `m_unbroadcast_txids`, surfaced as `getmempoolinfo.unbroadcastcount`.
     unbroadcast: HashMap<Txid, HashSet<std::net::IpAddr>>,
+}
+
+impl MempoolInner {
+    /// Bytes occupied by the **acting class** (everything not quarantined). The
+    /// acting capacity check (`max_size_bytes`) is measured against this, not
+    /// the physical `total_bytes`, so the quarantine class never crowds the
+    /// acting mempool. Equal to `total_bytes` until a policy is loaded (PR 4c).
+    fn acting_bytes(&self) -> usize {
+        self.total_bytes.saturating_sub(self.quarantine_bytes)
+    }
+
+    /// Account a newly-inserted entry of `tx_size` bytes into the per-class
+    /// counters. Call right after `entries.insert`.
+    fn account_insert(&mut self, scope: QuarantineScope, tx_size: usize) {
+        self.total_bytes += tx_size;
+        if scope.is_quarantined() {
+            self.quarantine_bytes += tx_size;
+        }
+    }
+
+    /// Reverse [`account_insert`](Self::account_insert) for a removed entry.
+    /// Call right after `entries.remove`, passing the removed entry's scope and
+    /// serialized size.
+    fn account_remove(&mut self, scope: QuarantineScope, tx_size: usize) {
+        self.total_bytes = self.total_bytes.saturating_sub(tx_size);
+        if scope.is_quarantined() {
+            self.quarantine_bytes = self.quarantine_bytes.saturating_sub(tx_size);
+        }
+    }
 }
 
 /// Configurable mempool policy. All fields map to Bitcoin Core-compatible
@@ -161,6 +234,11 @@ pub struct MempoolConfig {
     /// output scripts) and admit any consensus-valid transaction. Consensus
     /// rules are never relaxed. Default false (standard relay), matching Core.
     pub accept_non_std_txn: bool,
+    /// Byte budget for the **quarantine class** (`quarantinemempool`). Held
+    /// transactions are accounted and fee-rate-evicted against this, separately
+    /// from the acting mempool's `max_size_bytes`. Has no effect until a policy
+    /// quarantines something (PR 4c). Default [`policy::DEFAULT_QUARANTINE_MEMPOOL_SIZE`].
+    pub quarantine_max_bytes: usize,
 }
 
 impl Default for MempoolConfig {
@@ -177,6 +255,7 @@ impl Default for MempoolConfig {
             expiry_secs: policy::MEMPOOL_EXPIRY_SECS,
             permit_bare_multisig: true,
             accept_non_std_txn: false,
+            quarantine_max_bytes: policy::DEFAULT_QUARANTINE_MEMPOOL_SIZE,
         }
     }
 }
@@ -226,6 +305,7 @@ impl Mempool {
                 entries: HashMap::new(),
                 spends: HashMap::new(),
                 total_bytes: 0,
+                quarantine_bytes: 0,
                 unbroadcast: HashMap::new(),
             }),
             unbroadcast_len: std::sync::atomic::AtomicUsize::new(0),
@@ -286,6 +366,18 @@ impl Mempool {
         self.config.read().max_size_bytes
     }
 
+    /// Bytes held by the **quarantine class**. Always 0 until a policy is
+    /// loaded (PR 4c). Surfaced for per-class observability (PR 7) and tests.
+    pub fn quarantine_bytes(&self) -> usize {
+        self.inner.read().quarantine_bytes
+    }
+
+    /// Bytes occupied by the **acting class** (total minus quarantine). Equal to
+    /// the physical pool size until a policy is loaded.
+    pub fn acting_bytes(&self) -> usize {
+        self.inner.read().acting_bytes()
+    }
+
     /// Swap in a new mempool/relay policy live (SIGHUP config reload). Takes
     /// effect on the next `accept_transaction` call; already-admitted entries
     /// are not re-evaluated.
@@ -307,6 +399,12 @@ impl Mempool {
         // against a single config version. A concurrent SIGHUP reload can swap
         // `self.config` between calls but never mid-transaction.
         let cfg = self.config.read().clone();
+
+        // Quarantine scope for this transaction. PR 4c replaces this with the
+        // policy-engine verdict; until then every transaction is "acting" (empty
+        // scope), so the quarantine class stays empty, `quarantine_bytes` stays
+        // 0, and the per-class accounting/eviction below is exercised but inert.
+        let scope = QuarantineScope::acting();
 
         // Context-free checks
         check_transaction(&tx).map_err(|e| MempoolError::Validation(e.to_string()))?;
@@ -517,24 +615,51 @@ impl Mempool {
             return Err(MempoolError::InsufficientFee(fee_rate, cfg.min_fee_rate));
         }
 
-        // Check mempool size — evict lowest-fee entries if needed
+        // Per-class capacity check — the new tx is charged to its own class's
+        // budget (acting → `max_size_bytes`, quarantine → `quarantine_max_bytes`)
+        // and fee-rate eviction only considers entries in that same class, so
+        // neither class can crowd the other out. Until a policy is loaded every
+        // tx is acting, `acting_bytes() == total_bytes`, and this reduces to the
+        // historical single-pool check (the quarantine branch stays dead-data).
+        let quarantined = scope.is_quarantined();
+        let class_bytes = if quarantined {
+            inner.quarantine_bytes
+        } else {
+            inner.acting_bytes()
+        };
+        let class_budget = if quarantined {
+            cfg.quarantine_max_bytes
+        } else {
+            cfg.max_size_bytes
+        };
+        let evict_reason = if quarantined {
+            EvictReason::Policy
+        } else {
+            EvictReason::FullPool
+        };
         let mut evicted_full_pool: Vec<Txid> = Vec::new();
-        if inner.total_bytes + tx_size > cfg.max_size_bytes {
-            // Only evict if the new tx has a higher fee rate than the minimum in the pool
-            let min_pool_fee_rate = inner
+        if class_bytes + tx_size > class_budget {
+            // Only evict if the new tx outbids the cheapest entry *in its own class*.
+            let min_class_fee_rate = inner
                 .entries
                 .values()
+                .filter(|e| e.scope.is_quarantined() == quarantined)
                 .map(|e| e.fee_rate)
                 .min()
                 .unwrap_or(0);
-            if fee_rate <= min_pool_fee_rate {
+            if fee_rate <= min_class_fee_rate {
                 return Err(MempoolError::MempoolFull);
             }
-            // Evict enough lowest-fee-rate entries to make room
-            evicted_full_pool = Self::evict_lowest_fee_entries(&mut inner, tx_size);
+            // Evict enough lowest-fee-rate entries *of this class* to make room.
+            evicted_full_pool = Self::evict_lowest_fee_entries(&mut inner, tx_size, quarantined);
             self.sync_unbroadcast_len(&inner);
-            // If still not enough room after eviction, reject
-            if inner.total_bytes + tx_size > cfg.max_size_bytes {
+            // If still not enough room after eviction, reject.
+            let class_bytes_after = if quarantined {
+                inner.quarantine_bytes
+            } else {
+                inner.acting_bytes()
+            };
+            if class_bytes_after + tx_size > class_budget {
                 return Err(MempoolError::MempoolFull);
             }
         }
@@ -553,7 +678,7 @@ impl Mempool {
         for conflict_txid in &conflicts {
             if let Some(conflict_entry) = inner.entries.remove(conflict_txid) {
                 let sz = bitcoin::consensus::serialize(&conflict_entry.tx).len();
-                inner.total_bytes = inner.total_bytes.saturating_sub(sz);
+                inner.account_remove(conflict_entry.scope, sz);
                 for ci in &conflict_entry.tx.input {
                     inner.spends.remove(&ci.previous_output);
                 }
@@ -606,9 +731,10 @@ impl Mempool {
                 sigop_cost,
                 prev_scripthashes,
                 source,
+                scope,
             },
         );
-        inner.total_bytes += tx_size;
+        inner.account_insert(scope, tx_size);
 
         if !conflicts.is_empty() {
             tracing::info!(%txid, fee, fee_rate, replaced = conflicts.len(), "RBF replacement accepted to mempool");
@@ -623,7 +749,7 @@ impl Mempool {
         for evicted_txid in &evicted_full_pool {
             self.emit(MempoolEvent::LeaveEvicted {
                 txid: *evicted_txid,
-                reason: EvictReason::FullPool,
+                reason: evict_reason,
             });
         }
         for conflict_txid in &replaced {
@@ -657,7 +783,7 @@ impl Mempool {
                 let txid = tx.compute_txid();
                 if let Some(entry) = inner.entries.remove(&txid) {
                     let tx_size = bitcoin::consensus::serialize(&entry.tx).len();
-                    inner.total_bytes = inner.total_bytes.saturating_sub(tx_size);
+                    inner.account_remove(entry.scope, tx_size);
                     for input in &entry.tx.input {
                         inner.spends.remove(&input.previous_output);
                     }
@@ -677,7 +803,7 @@ impl Mempool {
                             && let Some(conflict_entry) = inner.entries.remove(&conflict_txid)
                         {
                             let sz = bitcoin::consensus::serialize(&conflict_entry.tx).len();
-                            inner.total_bytes = inner.total_bytes.saturating_sub(sz);
+                            inner.account_remove(conflict_entry.scope, sz);
                             for ci in &conflict_entry.tx.input {
                                 inner.spends.remove(&ci.previous_output);
                             }
@@ -797,7 +923,7 @@ impl Mempool {
             for txid in &expired {
                 if let Some(entry) = inner.entries.remove(txid) {
                     let tx_size = bitcoin::consensus::serialize(&entry.tx).len();
-                    inner.total_bytes = inner.total_bytes.saturating_sub(tx_size);
+                    inner.account_remove(entry.scope, tx_size);
                     for input in &entry.tx.input {
                         inner.spends.remove(&input.previous_output);
                     }
@@ -1049,15 +1175,26 @@ impl Mempool {
         Ok((txid, vsize, fee))
     }
 
-    /// Evict lowest-fee-rate entries to free at least `bytes_needed` bytes.
-    /// Also removes descendants of evicted entries. Returns the list of
-    /// evicted txids so the caller can emit `LeaveEvicted { FullPool }`
-    /// events after dropping the write lock.
-    fn evict_lowest_fee_entries(inner: &mut MempoolInner, bytes_needed: usize) -> Vec<Txid> {
-        // Sort entries by fee_rate ascending
+    /// Evict lowest-fee-rate entries **of one class** (acting if
+    /// `want_quarantined` is false, the quarantine class if true) to free at
+    /// least `bytes_needed` bytes. Descendants of an evicted entry are removed
+    /// regardless of class (graph integrity) — but under the infectious-
+    /// descendant rule (PR 4c) a held entry's descendants are themselves held,
+    /// so within a class the freed bytes track that class. Returns the evicted
+    /// txids so the caller can emit `LeaveEvicted` with the appropriate reason
+    /// after dropping the write lock. Until a policy is loaded `want_quarantined`
+    /// is always false and this is the historical pool-wide eviction.
+    fn evict_lowest_fee_entries(
+        inner: &mut MempoolInner,
+        bytes_needed: usize,
+        want_quarantined: bool,
+    ) -> Vec<Txid> {
+        // Sort *this class's* entries by fee_rate ascending; the other class is
+        // never an eviction candidate (its own budget governs it).
         let mut by_fee_rate: Vec<(Txid, u64)> = inner
             .entries
             .iter()
+            .filter(|(_, entry)| entry.scope.is_quarantined() == want_quarantined)
             .map(|(txid, entry)| (*txid, entry.fee_rate))
             .collect();
         by_fee_rate.sort_by_key(|(_, rate)| *rate);
@@ -1095,7 +1232,16 @@ impl Mempool {
                     .collect();
                 for child in children {
                     if let Some(child_entry) = inner.entries.get(&child) {
-                        freed += bitcoin::consensus::serialize(&child_entry.tx).len();
+                        // A cross-class descendant (e.g. a quarantined child of an
+                        // evicted acting parent) must still be removed for graph
+                        // integrity — its input vanishes with the parent — but its
+                        // bytes belong to the *other* class's budget. Counting them
+                        // toward this class's `bytes_needed` would stop eviction
+                        // early and leave the acting class over budget, so only
+                        // same-class bytes count toward the goal.
+                        if child_entry.scope.is_quarantined() == want_quarantined {
+                            freed += bitcoin::consensus::serialize(&child_entry.tx).len();
+                        }
                     }
                     to_remove.push(child);
                     desc_queue.push(child);
@@ -1106,7 +1252,7 @@ impl Mempool {
         for txid in &to_remove {
             if let Some(entry) = inner.entries.remove(txid) {
                 let tx_size = bitcoin::consensus::serialize(&entry.tx).len();
-                inner.total_bytes = inner.total_bytes.saturating_sub(tx_size);
+                inner.account_remove(entry.scope, tx_size);
                 for input in &entry.tx.input {
                     inner.spends.remove(&input.previous_output);
                 }
@@ -1261,6 +1407,7 @@ impl Mempool {
                 sigop_cost: 0,
                 prev_scripthashes: Vec::new(),
                 source: TxSource::Rpc,
+                scope: QuarantineScope::acting(),
             },
         );
     }
@@ -1291,10 +1438,53 @@ impl Mempool {
                 sigop_cost: 0,
                 prev_scripthashes: Vec::new(),
                 source: TxSource::Rpc,
+                scope: QuarantineScope::acting(),
             },
         );
         inner.unbroadcast.entry(txid).or_default();
         self.sync_unbroadcast_len(&inner);
+    }
+
+    /// Test-only: insert a minimal entry with an explicit quarantine `scope`,
+    /// routed through the real per-class accounting (`account_insert`), so the
+    /// quarantine-class mechanics can be exercised without the (not-yet-wired)
+    /// policy engine. `nonce` varies the txid/serialized size slightly.
+    pub(crate) fn insert_scoped_for_test(
+        &self,
+        nonce: u64,
+        fee_rate: u64,
+        scope: QuarantineScope,
+    ) -> Txid {
+        use bitcoin::{Amount, ScriptBuf, TxOut};
+        let tx = Transaction {
+            version: bitcoin::transaction::Version(2),
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: Vec::new(),
+            output: vec![TxOut {
+                value: Amount::from_sat(nonce),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let txid = tx.compute_txid();
+        let tx_size = bitcoin::consensus::serialize(&tx).len();
+        let mut inner = self.inner.write();
+        inner.entries.insert(
+            txid,
+            MempoolEntry {
+                tx,
+                fee: 0,
+                weight: 4,
+                fee_rate,
+                time: 0,
+                fee_delta: 0,
+                sigop_cost: 0,
+                prev_scripthashes: Vec::new(),
+                source: TxSource::Rpc,
+                scope,
+            },
+        );
+        inner.account_insert(scope, tx_size);
+        txid
     }
 }
 
@@ -1397,6 +1587,7 @@ mod tests {
                 sigop_cost: 0,
                 prev_scripthashes: Vec::new(),
                 source: TxSource::Rpc,
+                scope: QuarantineScope::acting(),
             },
         );
         inner.total_bytes = low_size;
@@ -1406,7 +1597,7 @@ mod tests {
         let original_bytes = inner.total_bytes;
 
         // Evict to free space
-        Mempool::evict_lowest_fee_entries(&mut inner, original_bytes);
+        Mempool::evict_lowest_fee_entries(&mut inner, original_bytes, false);
 
         // The low-fee tx should be gone
         assert_eq!(inner.entries.len(), 0);
@@ -1895,6 +2086,7 @@ mod tests {
                     sigop_cost: 0,
                     prev_scripthashes: Vec::new(),
                     source: TxSource::Rpc,
+                    scope: QuarantineScope::acting(),
                 },
             );
         }
@@ -2022,6 +2214,7 @@ mod tests {
                     sigop_cost: 0,
                     prev_scripthashes: Vec::new(),
                     source: TxSource::Rpc,
+                    scope: QuarantineScope::acting(),
                 },
             );
             for input in &child_tx.input {
@@ -2039,6 +2232,7 @@ mod tests {
                     sigop_cost: 0,
                     prev_scripthashes: Vec::new(),
                     source: TxSource::Rpc,
+                    scope: QuarantineScope::acting(),
                 },
             );
         }
@@ -2132,6 +2326,7 @@ mod tests {
                     sigop_cost: 0,
                     prev_scripthashes: Vec::new(),
                     source: TxSource::Rpc,
+                    scope: QuarantineScope::acting(),
                 },
             );
         }
@@ -2223,5 +2418,176 @@ mod tests {
         assert!(mp.unbroadcast_txids().is_empty());
         assert!(!mp.is_unbroadcast(&txid));
         assert_eq!(mp.info().unbroadcast, 0);
+    }
+
+    // --- PR 4b: quarantine-class mechanics (engine not yet wired) ---
+
+    const RELAY_TEMPLATE: QuarantineScope = QuarantineScope {
+        relay: true,
+        template: true,
+    };
+
+    #[test]
+    fn per_class_byte_accounting_tracks_both_classes() {
+        let mp = Mempool::new(1_000_000, 0);
+        let a1 = mp.insert_scoped_for_test(1, 100, QuarantineScope::acting());
+        let _a2 = mp.insert_scoped_for_test(2, 100, QuarantineScope::acting());
+        let q1 = mp.insert_scoped_for_test(3, 100, RELAY_TEMPLATE);
+
+        let total = mp.inner.read().total_bytes;
+        let qbytes = mp.quarantine_bytes();
+        assert!(qbytes > 0, "quarantine bytes should be nonzero");
+        assert_eq!(
+            mp.acting_bytes() + qbytes,
+            total,
+            "acting + quarantine must equal the physical pool size"
+        );
+        // Two acting entries vs one quarantined ⇒ acting bytes ≈ 2× quarantine.
+        assert!(mp.acting_bytes() > qbytes);
+
+        // Removing the quarantine entry zeroes the quarantine class only.
+        {
+            let mut inner = mp.inner.write();
+            let e = inner.entries.remove(&q1).unwrap();
+            let sz = bitcoin::consensus::serialize(&e.tx).len();
+            inner.account_remove(e.scope, sz);
+        }
+        assert_eq!(mp.quarantine_bytes(), 0);
+        assert!(mp.acting_bytes() > 0);
+        assert!(mp.inner.read().entries.contains_key(&a1));
+    }
+
+    #[test]
+    fn acting_eviction_never_touches_quarantine_class() {
+        // The 4b safety invariant: filling/evicting the acting class must leave
+        // held transactions alone, even when they are the cheapest in the pool.
+        let mp = Mempool::new(1_000_000, 0);
+        let cheap_q = mp.insert_scoped_for_test(1, 1, RELAY_TEMPLATE); // lowest fee overall
+        let a_lo = mp.insert_scoped_for_test(2, 10, QuarantineScope::acting());
+        let _a_hi = mp.insert_scoped_for_test(3, 1000, QuarantineScope::acting());
+
+        let evicted = {
+            let mut inner = mp.inner.write();
+            // Free a large amount from the ACTING class.
+            Mempool::evict_lowest_fee_entries(&mut inner, 10_000_000, false)
+        };
+        assert!(
+            evicted.contains(&a_lo),
+            "cheapest acting entry must be evicted"
+        );
+        assert!(
+            !evicted.contains(&cheap_q),
+            "a quarantined entry must NOT be evicted by acting-class pressure"
+        );
+        assert!(mp.inner.read().entries.contains_key(&cheap_q));
+        assert!(mp.quarantine_bytes() > 0);
+    }
+
+    #[test]
+    fn quarantine_eviction_only_evicts_held_lowest_fee_first() {
+        let mp = Mempool::new(1_000_000, 0);
+        let q_lo = mp.insert_scoped_for_test(1, 5, RELAY_TEMPLATE);
+        let q_hi = mp.insert_scoped_for_test(2, 5000, RELAY_TEMPLATE);
+        let acting = mp.insert_scoped_for_test(3, 1, QuarantineScope::acting()); // cheapest overall
+
+        // Free just enough to drop one held entry — the cheapest held one.
+        let one_entry = bitcoin::consensus::serialize(
+            &mp.inner.read().entries.get(&q_lo).unwrap().tx,
+        )
+        .len();
+        let evicted = {
+            let mut inner = mp.inner.write();
+            Mempool::evict_lowest_fee_entries(&mut inner, one_entry, true)
+        };
+        assert!(evicted.contains(&q_lo), "cheapest held entry evicted first");
+        assert!(!evicted.contains(&q_hi), "higher-fee held entry retained");
+        assert!(
+            !evicted.contains(&acting),
+            "acting entry untouched by quarantine-class eviction"
+        );
+        assert_eq!(mp.acting_bytes(), {
+            let inner = mp.inner.read();
+            bitcoin::consensus::serialize(&inner.entries.get(&acting).unwrap().tx).len()
+        });
+    }
+
+    #[test]
+    fn acting_eviction_counts_only_same_class_bytes_toward_goal() {
+        // A quarantined child of an evicted acting parent must be removed for
+        // graph integrity (its input vanishes with the parent) — but its bytes
+        // belong to the quarantine class, so they must NOT count toward the
+        // acting class's eviction goal. Otherwise eviction stops early and leaves
+        // the acting class over budget.
+        use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, TxIn, TxOut, Witness};
+        let mp = Mempool::new(1_000_000, 0);
+
+        let insert = |inputs: Vec<OutPoint>, nonce: u64, fee_rate: u64, scope: QuarantineScope| -> Txid {
+            let tx = Transaction {
+                version: bitcoin::transaction::Version(2),
+                lock_time: bitcoin::absolute::LockTime::ZERO,
+                input: inputs
+                    .into_iter()
+                    .map(|o| TxIn {
+                        previous_output: o,
+                        script_sig: ScriptBuf::new(),
+                        sequence: Sequence::MAX,
+                        witness: Witness::new(),
+                    })
+                    .collect(),
+                output: vec![TxOut {
+                    value: Amount::from_sat(nonce),
+                    script_pubkey: ScriptBuf::new(),
+                }],
+            };
+            let txid = tx.compute_txid();
+            let tx_size = bitcoin::consensus::serialize(&tx).len();
+            let mut inner = mp.inner.write();
+            inner.entries.insert(
+                txid,
+                MempoolEntry {
+                    tx,
+                    fee: 0,
+                    weight: 4,
+                    fee_rate,
+                    time: 0,
+                    fee_delta: 0,
+                    sigop_cost: 0,
+                    prev_scripthashes: Vec::new(),
+                    source: TxSource::Rpc,
+                    scope,
+                },
+            );
+            inner.account_insert(scope, tx_size);
+            txid
+        };
+
+        // Acting parent P (cheapest), a quarantined child C spending P, and a
+        // second acting entry that also has to go to meet the goal.
+        let p = insert(vec![], 1, 1, QuarantineScope::acting());
+        let c = insert(vec![OutPoint { txid: p, vout: 0 }], 2, 1, RELAY_TEMPLATE);
+        let a_other = insert(vec![], 3, 2, QuarantineScope::acting());
+
+        let p_size = {
+            let inner = mp.inner.read();
+            bitcoin::consensus::serialize(&inner.entries.get(&p).unwrap().tx).len()
+        };
+
+        // Just one byte past the parent alone: only by *excluding* C's bytes from
+        // the acting goal does eviction continue on to `a_other`.
+        let evicted = {
+            let mut inner = mp.inner.write();
+            Mempool::evict_lowest_fee_entries(&mut inner, p_size + 1, false)
+        };
+
+        assert!(evicted.contains(&p), "acting parent evicted");
+        assert!(
+            evicted.contains(&c),
+            "quarantined child removed for graph integrity (its parent is gone)"
+        );
+        assert!(
+            evicted.contains(&a_other),
+            "cross-class child bytes must not satisfy the acting goal — the second \
+             acting entry must still be evicted"
+        );
     }
 }
