@@ -4684,6 +4684,35 @@ mod tests {
     }
 
     #[test]
+    fn policy_test_rpc_traces_and_places() {
+        // policytest dry-run against the loaded ruleset: per-rule trace + the
+        // placement the tx would receive. The tx is NOT admitted.
+        let op = outpoint(0xab);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin(100_000))]);
+        set_ruleset(&mp, "version 1\nquarantine catch on relay when tx.version == 2");
+        let tx = spend(op, 99_000, 0x66);
+        let hex_tx = hex::encode(bitcoin::consensus::serialize(&tx));
+
+        let v = crate::rpc::policy::policy_test(&cs, &mp, &hex_tx).expect("dry-run ok");
+        assert_eq!(v["loaded"], serde_json::json!(true));
+        assert_eq!(v["verdict"], serde_json::json!("quarantine"));
+        assert_eq!(v["decisive_rule"], serde_json::json!("catch"));
+        assert_eq!(v["placement"]["class"], serde_json::json!("quarantine"));
+        assert_eq!(v["placement"]["scope"]["relay"], serde_json::json!(true));
+        assert_eq!(v["placement"]["scope"]["template"], serde_json::json!(false));
+        assert_eq!(v["rules"][0]["name"], serde_json::json!("catch"));
+        assert_eq!(v["rules"][0]["decisive"], serde_json::json!(true));
+        // Dry-run only: nothing was admitted.
+        assert!(mp.get(&tx.compute_txid()).is_none());
+
+        // With no ruleset loaded, policytest reports unloaded.
+        mp.clear_policy();
+        let v = crate::rpc::policy::policy_test(&cs, &mp, &hex_tx).expect("ok");
+        assert_eq!(v["loaded"], serde_json::json!(false));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn policy_stats_reset_on_swap() {
         // Counters accumulate at the admission eval point and reset on reload.
         let op = outpoint(0xf7);

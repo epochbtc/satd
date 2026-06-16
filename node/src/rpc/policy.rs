@@ -9,7 +9,10 @@
 
 use serde_json::{json, Value};
 
-use crate::mempool::pool::Mempool;
+use crate::chain::state::ChainState;
+use crate::mempool::policy_engine::{self, PolicyCtx};
+use crate::mempool::pool::{Mempool, QuarantineScope, TxSource};
+use crate::mempool::policy as mpolicy;
 
 /// `getpolicyinfo` — ruleset source/load metadata, the per-rule match counters
 /// and fuel-backstop counter accumulated since load, and quarantine-class
@@ -149,6 +152,159 @@ pub fn get_quarantine_entry(mempool: &Mempool, txid_str: &str) -> Result<Value, 
         "fee": d.fee,
         "fee_rate": d.fee_rate,
         "depends": d.depends.iter().map(|t| t.to_string()).collect::<Vec<_>>(),
+    }))
+}
+
+/// `policytest <rawtx-hex>` — dry-run a transaction against the **currently
+/// loaded** ruleset (design §10): the per-rule trace (matched/not, the decisive
+/// rule), the resulting verdict, and the placement/scope the tx would receive —
+/// including infectious-ancestor propagation from any quarantined in-mempool
+/// parents. The `testmempoolaccept` analogue for policy. Prevouts are resolved
+/// from the confirmed UTXO set, then in-mempool parents; an input that resolves
+/// to neither is an error (the tx cannot be evaluated).
+///
+/// `decisive_rule` may be the implicit `__fuel` rule when evaluation exhausts its
+/// fuel budget (the fail-safe full-scope quarantine); in that case no row in
+/// `rules[]` is marked `decisive` (the `__fuel` rule is not part of the ruleset).
+/// The report is a best-effort snapshot — the mempool/UTXO reads are not taken
+/// under a single lock, so a concurrent mutation can blend states slightly.
+pub fn policy_test(
+    chain_state: &ChainState,
+    mempool: &Mempool,
+    rawtx_hex: &str,
+) -> Result<Value, String> {
+    let raw = hex::decode(rawtx_hex.trim()).map_err(|_| "invalid hex".to_string())?;
+    let tx: bitcoin::Transaction =
+        bitcoin::consensus::deserialize(&raw).map_err(|e| format!("decode: {e}"))?;
+
+    let Some(ruleset) = mempool.policy_snapshot() else {
+        return Ok(json!({ "loaded": false }));
+    };
+    let txid = tx.compute_txid();
+
+    // Resolve prevouts (confirmed UTXO set, then in-mempool parents) and, in the
+    // same pass, capture infectious-ancestor scope from any quarantined
+    // in-mempool parent (§3) — one mempool lookup per input. The two branches are
+    // mutually exclusive: a confirmed-coin prevout's funding tx is mined, never
+    // in the mempool, so infectious scope only ever comes from the parent branch.
+    let mut prev_outputs: Vec<bitcoin::TxOut> = Vec::with_capacity(tx.input.len());
+    let mut prev_is_coinbase: Vec<bool> = Vec::with_capacity(tx.input.len());
+    let mut input_total: u64 = 0;
+    let mut infectious = QuarantineScope::acting();
+    let mut infectious_parents: Vec<String> = Vec::new();
+    for input in &tx.input {
+        if let Some(coin) = chain_state.get_coin(&input.previous_output) {
+            input_total = input_total.saturating_add(coin.amount);
+            prev_outputs.push(bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(coin.amount),
+                script_pubkey: coin.script_pubkey.clone(),
+            });
+            prev_is_coinbase.push(coin.coinbase);
+        } else if let Some(parent) = mempool.get(&input.previous_output.txid) {
+            let o = parent
+                .tx
+                .output
+                .get(input.previous_output.vout as usize)
+                .ok_or_else(|| {
+                    format!("prevout {} not found (vout out of range)", input.previous_output)
+                })?;
+            input_total = input_total.saturating_add(o.value.to_sat());
+            prev_outputs.push(o.clone());
+            prev_is_coinbase.push(false);
+            if parent.scope.is_quarantined() {
+                infectious.relay |= parent.scope.relay;
+                infectious.template |= parent.scope.template;
+                infectious_parents.push(input.previous_output.txid.to_string());
+            }
+        } else {
+            return Err(format!(
+                "prevout {} not found (need a confirmed UTXO or in-mempool parent)",
+                input.previous_output
+            ));
+        }
+    }
+
+    let output_total: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
+    let fee = input_total.saturating_sub(output_total);
+    let weight = tx.weight().to_wu() as usize;
+    let vsize = mpolicy::weight_to_vsize(weight as u64);
+    let fee_rate = mpolicy::fee_rate_sat_per_kvb(fee, weight as u64);
+
+    let cfg = mempool.policy();
+    let ctx = PolicyCtx {
+        network: chain_state.network,
+        height: chain_state.tip_height(),
+        mempool_bytes: mempool.acting_bytes() + mempool.quarantine_bytes(),
+    };
+
+    let (traces, verdict) = policy_engine::evaluate_trace(
+        &ruleset,
+        &tx,
+        &txid,
+        &prev_outputs,
+        &prev_is_coinbase,
+        fee,
+        fee_rate,
+        weight,
+        &cfg,
+        ctx,
+        TxSource::Rpc,
+        false,
+    );
+
+    // The placement the tx would receive on admission: its own scope from the
+    // verdict, unioned with the infectious-ancestor scope collected above
+    // (§3 infectious propagation).
+    let own_scope = match &verdict {
+        satd_policy::Verdict::Quarantine { scope, .. } => policy_engine::map_scope(*scope),
+        _ => QuarantineScope::acting(),
+    };
+    let mut final_scope = own_scope;
+    final_scope.relay |= infectious.relay;
+    final_scope.template |= infectious.template;
+
+    let rules: Vec<Value> = traces
+        .iter()
+        .map(|t| {
+            let action = match t.action {
+                satd_policy::Action::Quarantine => "quarantine",
+                satd_policy::Action::Allow => "allow",
+            };
+            let mut e = json!({
+                "name": t.name,
+                "action": action,
+                "auto_named": t.auto_named,
+                "evaluated": t.evaluated,
+                "matched": t.matched,
+                "decisive": t.decisive,
+            });
+            if t.action == satd_policy::Action::Quarantine {
+                e["scope"] = json!({ "relay": t.scope.relay, "template": t.scope.template });
+            }
+            e
+        })
+        .collect();
+
+    let verdict_str = match &verdict {
+        satd_policy::Verdict::Pass => "pass",
+        satd_policy::Verdict::Allow { .. } => "allow",
+        satd_policy::Verdict::Quarantine { .. } => "quarantine",
+    };
+
+    Ok(json!({
+        "loaded": true,
+        "txid": txid.to_string(),
+        "fee": fee,
+        "fee_rate": fee_rate,
+        "vsize": vsize,
+        "verdict": verdict_str,
+        "decisive_rule": verdict.rule(),
+        "placement": {
+            "class": if final_scope.is_acting() { "acting" } else { "quarantine" },
+            "scope": { "relay": final_scope.relay, "template": final_scope.template },
+            "infectious_parents": infectious_parents,
+        },
+        "rules": rules,
     }))
 }
 

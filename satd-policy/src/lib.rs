@@ -44,7 +44,7 @@ pub use cost::{Cost, POLICY_BUDGET};
 pub use error::{PolicyError, Result, Span, Stage};
 pub use eval::{DEFAULT_FUEL, Outcome};
 pub use explain::{explain_expr, explain_rule, explain_ruleset};
-pub use ruleset::{Action, CompiledRuleset, Rule, SUPPORTED_VERSION, parse_ruleset};
+pub use ruleset::{Action, CompiledRuleset, Rule, RuleTrace, SUPPORTED_VERSION, parse_ruleset};
 pub use scope::ScopeSet;
 pub use typeck::Type;
 pub use value::{EnumKind, EnumVal, Network, ScriptType, Source, Value};

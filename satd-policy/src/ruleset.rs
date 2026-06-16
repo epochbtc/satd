@@ -119,6 +119,98 @@ impl CompiledRuleset {
     }
 }
 
+/// One rule's outcome in a [`CompiledRuleset::evaluate_trace`] dry-run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuleTrace {
+    pub name: String,
+    pub action: Action,
+    pub scope: ScopeSet,
+    pub auto_named: bool,
+    /// `true` if this rule's condition matched the transaction.
+    pub matched: bool,
+    /// `true` for the first matching rule — the one that decided the verdict.
+    pub decisive: bool,
+    /// `false` for rules after the decisive match (never reached under
+    /// first-match-wins) and for rules skipped after fuel exhaustion.
+    pub evaluated: bool,
+}
+
+impl CompiledRuleset {
+    /// Evaluate every rule for a dry-run trace, returning each rule's
+    /// matched/not result plus the final [`Verdict`] — the `policytest` surface
+    /// (design §10). Faithful to production semantics: evaluation stops at the
+    /// first matching rule (first-match-wins), and rules after it are reported
+    /// as not-evaluated. Fuel is shared across the pass exactly as in
+    /// [`Self::evaluate`]; exhaustion yields the fail-safe [`Verdict::fuel`].
+    pub fn evaluate_trace<'a>(
+        &'a self,
+        tx: &'a TxView<'a>,
+        ctx: &Ctx,
+    ) -> (Vec<RuleTrace>, Verdict) {
+        let mut fuel = DEFAULT_FUEL;
+        let mut traces: Vec<RuleTrace> = Vec::with_capacity(self.rules.len());
+        let mut verdict = Verdict::Pass;
+        let mut decided = false;
+
+        for rule in &self.rules {
+            if decided {
+                // First-match-wins: later rules are never reached at runtime.
+                traces.push(RuleTrace {
+                    name: rule.name.clone(),
+                    action: rule.action,
+                    scope: rule.scope,
+                    auto_named: rule.auto_named,
+                    matched: false,
+                    decisive: false,
+                    evaluated: false,
+                });
+                continue;
+            }
+
+            let out = rule.cond.eval_metered(tx, ctx, fuel);
+            if out.fuel_exhausted {
+                verdict = Verdict::fuel();
+                decided = true;
+                traces.push(RuleTrace {
+                    name: rule.name.clone(),
+                    action: rule.action,
+                    scope: rule.scope,
+                    auto_named: rule.auto_named,
+                    matched: false,
+                    decisive: false,
+                    evaluated: true,
+                });
+                continue;
+            }
+            fuel = out.fuel_remaining;
+            let matched = out.value.as_bool();
+            if matched {
+                verdict = match rule.action {
+                    Action::Quarantine => Verdict::Quarantine {
+                        rule: rule.name.clone(),
+                        scope: rule.scope,
+                    },
+                    Action::Allow => Verdict::Allow {
+                        rule: rule.name.clone(),
+                    },
+                };
+                decided = true;
+            }
+            traces.push(RuleTrace {
+                name: rule.name.clone(),
+                action: rule.action,
+                scope: rule.scope,
+                auto_named: rule.auto_named,
+                matched,
+                decisive: matched,
+                evaluated: true,
+            });
+        }
+
+        (traces, verdict)
+    }
+}
+
 /// Parse and compile a policy file.
 pub fn parse_ruleset(src: &str) -> Result<CompiledRuleset> {
     let lines = classify_lines(src);
