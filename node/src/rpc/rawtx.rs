@@ -33,7 +33,11 @@ pub fn get_mempool_info(mempool: &Mempool) -> Value {
 
 /// `getrawmempool` — list mempool transaction ids.
 pub fn get_raw_mempool(mempool: &Mempool, verbose: bool) -> Value {
-    let entries = mempool.get_all_entries();
+    // Standard surface (design §6.1/§10): acting class only — quarantined txids
+    // are simply absent, exactly as on a Core node whose relay policy refused
+    // them. `entry_map` below is therefore acting-only, so the ancestor /
+    // descendant rollups and counts never include a quarantined relative.
+    let entries = mempool.get_acting_entries();
 
     if !verbose {
         let txids: Vec<String> = entries.iter().map(|(txid, _)| txid.to_string()).collect();
@@ -58,8 +62,22 @@ pub fn get_raw_mempool(mempool: &Mempool, verbose: bool) -> Value {
         };
         let fee = format_amount(entry.fee, unit);
 
-        let ancestors = mempool.get_ancestors(txid).unwrap_or_default();
-        let descendants = mempool.get_descendants(txid).unwrap_or_default();
+        // Restrict the graph to the acting class (`entry_map` keys): an acting
+        // tx never has a quarantined ancestor (§3 infectious propagation) but
+        // can have a quarantined descendant, so filter both to keep the counts
+        // invisible to the quarantine class.
+        let ancestors: std::collections::HashSet<bitcoin::Txid> = mempool
+            .get_ancestors(txid)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|a| entry_map.contains_key(a))
+            .collect();
+        let descendants: std::collections::HashSet<bitcoin::Txid> = mempool
+            .get_descendants(txid)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|d| entry_map.contains_key(d))
+            .collect();
 
         let ancestor_count = ancestors.len() + 1;
         let ancestor_size: usize = ancestors
@@ -128,7 +146,7 @@ pub fn get_raw_transaction(
     // response; match that so clients that gate on the field don't
     // have to special-case satd.
     if blockhash.is_none()
-        && let Some(entry) = mempool.get(&txid) {
+        && let Some(entry) = mempool.get(&txid).filter(|e| e.scope.is_acting()) {
             return if verbose {
                 Ok(decode_transaction_verbose(&entry.tx, None, None, Some(0)))
             } else {
@@ -1096,5 +1114,109 @@ mod tests {
             EcdsaSighashType::AllPlusAnyoneCanPay
         );
         assert!(parse_sighash_type(Some("INVALID")).is_err());
+    }
+
+    // --- PR 7a: standard-surface invisibility differential (design §6.1/§10) ---
+
+    use crate::mempool::pool::QuarantineScope;
+
+    const RELAY_ONLY: QuarantineScope = QuarantineScope {
+        relay: true,
+        template: false,
+    };
+    const TEMPLATE_ONLY: QuarantineScope = QuarantineScope {
+        relay: false,
+        template: true,
+    };
+    const RELAY_TEMPLATE: QuarantineScope = QuarantineScope {
+        relay: true,
+        template: true,
+    };
+
+    #[test]
+    fn getrawmempool_and_info_invisible_to_quarantine() {
+        // Reference: two acting txs only — what a Core node whose relay policy
+        // refused the others would hold.
+        let reference = Mempool::new(300_000_000, 1_000);
+        reference.insert_scoped_for_test(1, 100, QuarantineScope::acting());
+        reference.insert_scoped_for_test(2, 100, QuarantineScope::acting());
+
+        // Occupied: the same two acting txs plus a quarantined tx in every scope.
+        let occupied = Mempool::new(300_000_000, 1_000);
+        occupied.insert_scoped_for_test(1, 100, QuarantineScope::acting());
+        occupied.insert_scoped_for_test(2, 100, QuarantineScope::acting());
+        occupied.insert_scoped_for_test(3, 100, RELAY_ONLY);
+        occupied.insert_scoped_for_test(4, 100, TEMPLATE_ONLY);
+        occupied.insert_scoped_for_test(5, 100, RELAY_TEMPLATE);
+
+        // getmempoolinfo is byte-identical.
+        assert_eq!(
+            get_mempool_info(&reference),
+            get_mempool_info(&occupied),
+            "getmempoolinfo must not reveal the quarantine class"
+        );
+
+        // getrawmempool (non-verbose): identical txid set (sorted — HashMap
+        // iteration order is not stable across the two pools).
+        let mut a: Vec<String> =
+            serde_json::from_value(get_raw_mempool(&reference, false)).unwrap();
+        let mut b: Vec<String> =
+            serde_json::from_value(get_raw_mempool(&occupied, false)).unwrap();
+        a.sort();
+        b.sort();
+        assert_eq!(a, b, "getrawmempool must list the acting class only");
+        assert_eq!(a.len(), 2);
+
+        // The quarantine class is genuinely occupied — the equalities are
+        // load-bearing, not vacuous.
+        assert!(occupied.quarantine_bytes() > 0);
+    }
+
+    #[test]
+    fn getrawmempool_verbose_descendant_count_excludes_quarantine() {
+        use bitcoin::blockdata::locktime::absolute::LockTime;
+        let mk = |prev: OutPoint, val: u64| Transaction {
+            version: Version(2),
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: prev,
+                script_sig: Default::default(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(val),
+                script_pubkey: Default::default(),
+            }],
+        };
+        let parent = mk(
+            OutPoint {
+                txid: bitcoin::Txid::from_raw_hash(
+                    bitcoin::hashes::sha256d::Hash::from_byte_array([7; 32]),
+                ),
+                vout: 0,
+            },
+            50_000,
+        );
+        let parent_txid = parent.compute_txid();
+        let child = mk(
+            OutPoint {
+                txid: parent_txid,
+                vout: 0,
+            },
+            40_000,
+        );
+
+        let mp = Mempool::new(300_000_000, 1_000);
+        mp.insert_tx_scoped_for_test(parent, QuarantineScope::acting());
+        mp.insert_tx_scoped_for_test(child, RELAY_TEMPLATE);
+
+        let v = get_raw_mempool(&mp, true);
+        let entry = &v[parent_txid.to_string()];
+        assert_eq!(
+            entry["descendantcount"],
+            json!(1),
+            "the quarantined child is hidden from the parent's descendantcount"
+        );
     }
 }

@@ -303,9 +303,13 @@ pub async fn mempool_index_task(
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         // Subscriber fell behind — drain stale events
-                        // and resync from the canonical mempool.
+                        // and resync from the canonical mempool. Acting class
+                        // only (design §6.1/§10): the incremental path is fed
+                        // by acting-only events (a quarantined admission emits
+                        // no `Enter`), so the resync must match or the address
+                        // index would leak the quarantine class into history.
                         let snapshot: Vec<(Txid, bitcoin::Transaction)> = mempool
-                            .get_all_entries()
+                            .get_acting_entries()
                             .into_iter()
                             .map(|(txid, e)| (txid, e.tx))
                             .collect();

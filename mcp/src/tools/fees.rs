@@ -11,7 +11,10 @@ use serde_json::json;
 pub fn estimate_fee(ctx: &McpContext, targets: &[u32]) -> String {
     let floor_sat_per_kvb = ctx.mempool.min_fee_rate().max(1_000);
     let sf = smart_fees(
-        ctx.mempool.get_all_entries(),
+        // Fee-estimation surface (design §2.4): the template view, so a tx
+        // quarantined `on template` can't inflate the quote — matching the
+        // JSON-RPC estimatefees / Electrum / Esplora fee paths.
+        ctx.mempool.get_template_entries(),
         &ctx.fee_estimator,
         targets,
         EstimateMode::Blend,

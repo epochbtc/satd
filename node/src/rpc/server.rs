@@ -1138,7 +1138,11 @@ pub async fn start(
         let floor_sat_per_kvb = ctx.mempool.info().min_fee_rate.max(1_000);
         let sat_per_kvb =
             resolve_feerate_sat_per_kvb(mode, conf_target, &ctx.fee_estimator, floor_sat_per_kvb, || {
-                ctx.mempool.get_all_entries()
+                // Fee estimation is a **template** consumer (design §2.4): a tx
+                // quarantined `on template` is one we will never mine, so it must
+                // not inflate the quote. Same scope-filtered view the block
+                // template selects from.
+                ctx.mempool.get_template_entries()
             });
         let mut response = serde_json::json!({
             "feerate": format_feerate_sat_per_kvb(sat_per_kvb, unit),
@@ -1168,7 +1172,9 @@ pub async fn start(
         // monotonicity clamp, and economy tier all happen in `smart_fees`,
         // shared with MCP / Esplora / Electrum.
         let sf = crate::mempool::estimate::smart_fees(
-            ctx.mempool.get_all_entries(),
+            // Template consumer (design §2.4): `on template` quarantine must not
+            // inflate the fee quote — same view the block template selects from.
+            ctx.mempool.get_template_entries(),
             &ctx.fee_estimator,
             &targets,
             mode,

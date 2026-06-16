@@ -141,7 +141,11 @@ fn parse_txid(s: &str) -> EsploraResult<Txid> {
 /// size; for typical Esplora deployments this is well under a millisecond.
 fn build_mempool_spent_index(state: &EsploraState) -> HashMap<OutPoint, (Txid, u32)> {
     let mut map: HashMap<OutPoint, (Txid, u32)> = HashMap::new();
-    for (txid, entry) in state.mempool.get_all_entries() {
+    // Standard surface (design §6.1): acting class only — a quarantined spender
+    // must not surface as the spending tx on /outspend, just as it is absent
+    // from getrawmempool. (Infectious propagation means an acting tx can't have
+    // a quarantined ancestor, so this never hides a legitimately-relayed spend.)
+    for (txid, entry) in state.mempool.get_acting_entries() {
         for (vin, input) in entry.tx.input.iter().enumerate() {
             if input.previous_output.is_null() {
                 continue;

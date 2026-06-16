@@ -169,8 +169,12 @@ pub fn snapshot_from_mempool(mempool: &Mempool) -> MempoolSnapshot {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    // Standard surface (design §6.1/§10): the mempool snapshot — feeding the
+    // MCP overview and history consumers — reflects the acting class only, in
+    // lockstep with `info()` (also acting-only). The quarantine class never
+    // appears in the size/bytes totals or the fee-rate histogram.
     let info = mempool.info();
-    let entries_vec = mempool.get_all_entries();
+    let entries_vec = mempool.get_acting_entries();
     let (min_rate, max_rate) = extremes(&entries_vec);
     let entries_map: std::collections::HashMap<Txid, MempoolEntry> =
         entries_vec.into_iter().collect();
