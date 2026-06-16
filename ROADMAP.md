@@ -8,17 +8,45 @@ These items are organized into tiers based on their impact and feasibility for o
 
 While `satd` currently matches Core's mempool policy defaults and exposes basic flags (`-datacarrier`, `-dustrelayfee`), our ultimate goal is to give operators programmatic, frictionless control over what their hardware validates.
 
-### Transaction Validation DSL (Domain Specific Language)
-**Proposal:** A lightweight, highly constrained rule engine that evaluates every transaction before it enters the mempool. By folding all filtering strategies into a single DSL, we eliminate the need to hardcode new CLI flags every time a controversial transaction format emerges.
+### Transaction-Filtering Policy DSL
+**Status:** ✅ Shipped (0.4.0, opt-in via `policyfile=`). A lightweight, highly
+constrained rule engine that evaluates every transaction at mempool admission.
+By folding all filtering strategies into a single DSL, we eliminate the need to
+hardcode new CLI flags every time a controversial transaction format emerges.
 
-Operators could define local rulesets using simple boolean logic on transaction metadata. For example:
-- **Granular Script Filtering:** `tx.outputs.any(out => out.script_type == 'p2tr') -> reject`
-- **Economic Discrimination:** `tx.has_op_return && tx.fee_rate < (network.min_relay * 2) -> reject`
-- **Witness Size Caps:** `tx.witness.size > 400000 -> reject`
+**Quarantine, not reject.** The crucial design choice: a rule never makes the
+node *reject* a consensus-valid transaction (which would risk forking the node's
+mempool off the network and, worse, give a false sense that filtering removes a
+transaction — it does not). Instead it **quarantines**: the transaction is held
+but withheld from relay and/or block templates. Consensus is untouched, the
+node stays in sync, and — because a held transaction is visible and a verdict is
+reversible on one `SIGHUP` — a too-broad rule is survivable rather than silent
+and permanent. The guiding honesty: *filtering cannot prevent confirmation; it
+can only decline to assist it.*
 
-**Why it matters:** It completely removes `satd` developers from the policy debate. Operators do not have to wait for a software update or run a patched C++ fork (like Bitcoin Knots) to enforce their preferences. They simply update their local policy.
+Operators define local rulesets with simple boolean logic on transaction
+metadata. For example:
+- **Self-identifying markers:** `any input (in.leaf_script.contains_ops(script(OP_FALSE OP_IF push(0x6f7264))))`
+- **Economic discrimination:** `any output (out.script_type == op_return and out.op_return_size > 83) and tx.fee_rate < node.min_relay_fee * 3`
+- **Mine-neutral witness caps:** `quarantine ... on template when tx.total_witness_size > 100kb`
 
-**Crucial Security Constraint (DoS Protection):** Because this runs on every incoming transaction, the DSL **must not be Turing complete**. It must be strictly bounded in execution time and memory. The engine will support *no loops*, *no recursion*, and *no external network calls*—only flat, O(1) or O(N) boolean evaluations of static transaction metadata. This ensures the DSL cannot be used as an attack vector to exhaust node CPU or memory.
+**Why it matters:** It removes `satd` developers from the policy debate.
+Operators do not have to wait for a software update or run a patched C++ fork
+(like Bitcoin Knots) to enforce their preferences — they update a local file and
+`SIGHUP`. The quarantine view (`getquarantineinfo`, `listquarantine`,
+`policytest`, Prometheus) lets them measure a rule's effect, including watching
+filtered transactions confirm anyway.
+
+**DoS protection:** the DSL is **not Turing complete** — no loops, no recursion,
+no external calls — and is statically cost-bounded with a runtime fuel backstop,
+so it cannot exhaust node CPU or memory. See the
+[Transaction-Filtering Policy](https://epochbtc.github.io/satd/policy.html)
+Operator Manual chapter.
+
+**Fast-follow (Tier 2):** general byte transforms (`rc4`/`sha256`/`reverse` +
+`tx.first_input_txid`/`out.op_return_data`, a `version 2` file) for protocols
+that obfuscate a self-carried marker — sequenced after the version-1 cost model
+is proven on the dogfood fleet.
 
 ### Dynamic Dust Thresholds
 **Proposal:** `--dynamic-dust=1` — Automatically scales the dust threshold as a percentage of the trailing 24-hour median block fee.

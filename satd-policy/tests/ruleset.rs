@@ -355,3 +355,20 @@ fn cr_only_line_endings_parse_as_separate_lines() {
     let rs = parse_ruleset(src).unwrap_or_else(|e| panic!("CR-only:\n{}", e.render(src)));
     assert_eq!(rs.rules().len(), 1);
 }
+
+/// The shipped example/dogfood ruleset (`contrib/policy/example.policy`) must
+/// always compile and stay within budget — it is loaded by the dogfood fleet and
+/// referenced from the Operator Manual, so a grammar change that breaks it must
+/// fail CI here, not in production.
+#[test]
+fn shipped_example_policy_compiles() {
+    let src = include_str!("../../contrib/policy/example.policy");
+    let rs = parse_ruleset(src).unwrap_or_else(|e| panic!("example.policy:\n{}", e.render(src)));
+    assert_eq!(rs.version(), 1);
+    assert_eq!(rs.rules().len(), 5);
+    assert!(rs.has_allow(), "the example leads with an `allow own-submissions` rule");
+    assert!(
+        rs.total_cost().total() <= satd_policy::POLICY_BUDGET,
+        "example.policy must stay within the static cost budget"
+    );
+}
