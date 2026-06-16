@@ -162,6 +162,12 @@ pub fn get_quarantine_entry(mempool: &Mempool, txid_str: &str) -> Result<Value, 
 /// parents. The `testmempoolaccept` analogue for policy. Prevouts are resolved
 /// from the confirmed UTXO set, then in-mempool parents; an input that resolves
 /// to neither is an error (the tx cannot be evaluated).
+///
+/// `decisive_rule` may be the implicit `__fuel` rule when evaluation exhausts its
+/// fuel budget (the fail-safe full-scope quarantine); in that case no row in
+/// `rules[]` is marked `decisive` (the `__fuel` rule is not part of the ruleset).
+/// The report is a best-effort snapshot — the mempool/UTXO reads are not taken
+/// under a single lock, so a concurrent mutation can blend states slightly.
 pub fn policy_test(
     chain_state: &ChainState,
     mempool: &Mempool,
@@ -176,10 +182,16 @@ pub fn policy_test(
     };
     let txid = tx.compute_txid();
 
-    // Resolve prevouts: confirmed UTXO set first, then in-mempool parents.
+    // Resolve prevouts (confirmed UTXO set, then in-mempool parents) and, in the
+    // same pass, capture infectious-ancestor scope from any quarantined
+    // in-mempool parent (§3) — one mempool lookup per input. The two branches are
+    // mutually exclusive: a confirmed-coin prevout's funding tx is mined, never
+    // in the mempool, so infectious scope only ever comes from the parent branch.
     let mut prev_outputs: Vec<bitcoin::TxOut> = Vec::with_capacity(tx.input.len());
     let mut prev_is_coinbase: Vec<bool> = Vec::with_capacity(tx.input.len());
     let mut input_total: u64 = 0;
+    let mut infectious = QuarantineScope::acting();
+    let mut infectious_parents: Vec<String> = Vec::new();
     for input in &tx.input {
         if let Some(coin) = chain_state.get_coin(&input.previous_output) {
             input_total = input_total.saturating_add(coin.amount);
@@ -188,12 +200,22 @@ pub fn policy_test(
                 script_pubkey: coin.script_pubkey.clone(),
             });
             prev_is_coinbase.push(coin.coinbase);
-        } else if let Some(parent) = mempool.get(&input.previous_output.txid)
-            && let Some(o) = parent.tx.output.get(input.previous_output.vout as usize)
-        {
+        } else if let Some(parent) = mempool.get(&input.previous_output.txid) {
+            let o = parent
+                .tx
+                .output
+                .get(input.previous_output.vout as usize)
+                .ok_or_else(|| {
+                    format!("prevout {} not found (vout out of range)", input.previous_output)
+                })?;
             input_total = input_total.saturating_add(o.value.to_sat());
             prev_outputs.push(o.clone());
             prev_is_coinbase.push(false);
+            if parent.scope.is_quarantined() {
+                infectious.relay |= parent.scope.relay;
+                infectious.template |= parent.scope.template;
+                infectious_parents.push(input.previous_output.txid.to_string());
+            }
         } else {
             return Err(format!(
                 "prevout {} not found (need a confirmed UTXO or in-mempool parent)",
@@ -206,7 +228,7 @@ pub fn policy_test(
     let fee = input_total.saturating_sub(output_total);
     let weight = tx.weight().to_wu() as usize;
     let vsize = mpolicy::weight_to_vsize(weight as u64);
-    let fee_rate = if vsize > 0 { fee.saturating_mul(1_000) / vsize } else { 0 };
+    let fee_rate = mpolicy::fee_rate_sat_per_kvb(fee, weight as u64);
 
     let cfg = mempool.policy();
     let ctx = PolicyCtx {
@@ -230,24 +252,16 @@ pub fn policy_test(
         false,
     );
 
-    // Own scope from the verdict, then union any quarantined in-mempool parents'
-    // scopes (§3 infectious propagation) — the placement the tx would actually
-    // receive on admission.
+    // The placement the tx would receive on admission: its own scope from the
+    // verdict, unioned with the infectious-ancestor scope collected above
+    // (§3 infectious propagation).
     let own_scope = match &verdict {
         satd_policy::Verdict::Quarantine { scope, .. } => policy_engine::map_scope(*scope),
         _ => QuarantineScope::acting(),
     };
     let mut final_scope = own_scope;
-    let mut infectious_parents: Vec<String> = Vec::new();
-    for input in &tx.input {
-        if let Some(p) = mempool.get(&input.previous_output.txid)
-            && p.scope.is_quarantined()
-        {
-            final_scope.relay |= p.scope.relay;
-            final_scope.template |= p.scope.template;
-            infectious_parents.push(input.previous_output.txid.to_string());
-        }
-    }
+    final_scope.relay |= infectious.relay;
+    final_scope.template |= infectious.template;
 
     let rules: Vec<Value> = traces
         .iter()
