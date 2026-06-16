@@ -171,6 +171,8 @@ pub fn load_mempool(
             chain_state,
             script_verifier,
             crate::mempool::pool::TxSource::Reload,
+            // mempool.dat reload re-enters and quarantines normally; never refused.
+            false,
         ) {
             Ok(txid) => {
                 if fee_delta != 0 && !mempool.prioritise_transaction(&txid, fee_delta) {

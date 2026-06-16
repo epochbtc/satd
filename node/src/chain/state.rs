@@ -4174,6 +4174,8 @@ impl ChainState {
                         self,
                         &*self.script_verifier,
                         crate::mempool::pool::TxSource::Reload,
+                        // Reorged-out txs re-enter and quarantine normally; never refused.
+                        false,
                     ) {
                         tracing::debug!(
                             %txid,
@@ -4897,6 +4899,7 @@ impl ChainState {
                     self,
                     &*self.script_verifier,
                     crate::mempool::pool::TxSource::Reload,
+                    false,
                 ) {
                     tracing::debug!(
                         err = ?e,

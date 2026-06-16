@@ -141,6 +141,12 @@ struct SignTransactionParams {
 struct SendTransactionParams {
     #[schemars(description = "Hex-encoded signed raw transaction")]
     hex_tx: String,
+    #[schemars(
+        description = "Hold the tx in the local quarantine class even if a relay-scoped \
+                       policy rule matches, instead of refusing it (satd extension; default false)"
+    )]
+    #[serde(default)]
+    allow_quarantined: bool,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -324,7 +330,7 @@ impl SatdMcpServer {
 
     #[tool(description = "Broadcast a signed raw transaction to the network. Returns the transaction ID on success.")]
     fn send_transaction(&self, Parameters(p): Parameters<SendTransactionParams>) -> String {
-        tools::construction::send_transaction(&self.ctx, &p.hex_tx)
+        tools::construction::send_transaction(&self.ctx, &p.hex_tx, p.allow_quarantined)
     }
 
     #[tool(description = "Perform PSBT (Partially Signed Bitcoin Transaction) operations. Actions: 'create' (new PSBT from inputs/outputs), 'decode' (show PSBT contents), 'analyze' (check what signatures are needed), 'combine' (merge partial signatures), 'finalize' (complete for broadcast), 'update' (add UTXO info), 'convert' (raw tx to PSBT), 'join' (merge independent PSBTs).")]

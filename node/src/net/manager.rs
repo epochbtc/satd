@@ -3793,7 +3793,10 @@ impl PeerManager {
             | MempoolError::Dust
             | MempoolError::NonStandardOpReturn
             | MempoolError::InsufficientReplacementFee(..)
-            | MempoolError::TooLongMempoolChain => 0,
+            | MempoolError::TooLongMempoolChain
+            // Local-submission-only refusal (§6.1); P2P traffic never produces it
+            // and it is never peer misbehavior.
+            | MempoolError::Quarantined(_) => 0,
         }
     }
 
@@ -3815,6 +3818,8 @@ impl PeerManager {
             &self.chain_state,
             self.chain_state.script_verifier(),
             crate::mempool::pool::TxSource::P2p,
+            // Peer traffic quarantines as designed; the §6.1 refusal is local-only.
+            false,
         ) {
             Ok(_) => {
                 self.broadcast_inv(id, txid);
@@ -3996,13 +4001,15 @@ impl PeerManager {
         &self,
         hex_tx: &str,
         source: crate::mempool::pool::TxSource,
+        allow_quarantined: bool,
     ) -> Result<serde_json::Value, (i32, String)> {
         let tx_bytes =
             hex::decode(hex_tx).map_err(|_| (-22, "TX decode failed".to_string()))?;
         let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&tx_bytes)
             .map_err(|_| (-22, "TX decode failed".to_string()))?;
-        let txid =
-            self.submit_and_announce(tx, source).map_err(|e| (-25, e.to_string()))?;
+        let txid = self
+            .submit_and_announce(tx, source, allow_quarantined)
+            .map_err(|e| (-25, e.to_string()))?;
         Ok(serde_json::Value::String(txid.to_string()))
     }
 
@@ -4027,6 +4034,7 @@ impl PeerManager {
         &self,
         tx: bitcoin::Transaction,
         source: crate::mempool::pool::TxSource,
+        allow_quarantined: bool,
     ) -> Result<bitcoin::Txid, MempoolError> {
         let resubmit_txid = tx.compute_txid();
         let txid = match self.mempool.accept_transaction(
@@ -4034,6 +4042,7 @@ impl PeerManager {
             &self.chain_state,
             self.chain_state.script_verifier(),
             source,
+            allow_quarantined,
         ) {
             Ok(txid) => txid,
             Err(MempoolError::AlreadyExists) => resubmit_txid,
@@ -4205,6 +4214,7 @@ impl PeerManager {
                 &self.chain_state,
                 self.chain_state.script_verifier(),
                 crate::mempool::pool::TxSource::P2p,
+                false,
             );
             match result {
                 Ok(_) => {
@@ -5310,6 +5320,7 @@ pub fn reconsider_orphans_on_block(
             chain_state,
             chain_state.script_verifier(),
             crate::mempool::pool::TxSource::P2p,
+            false,
         );
         match result {
             Ok(_) => {
@@ -5410,10 +5421,15 @@ pub trait TxBroadcaster: Send + Sync {
     /// Accept `tx` into the mempool and announce it to peers. Returns the
     /// txid, or the mempool rejection reason. `source` records the submission
     /// surface for the transaction-policy engine (`tx.source`).
+    ///
+    /// `allow_quarantined` is the §6.1 override: when false (the default) a
+    /// local submission drawing a relay-scoped quarantine verdict is refused
+    /// (`MempoolError::Quarantined`); when true it is held in quarantine anyway.
     fn submit_and_announce(
         &self,
         tx: bitcoin::Transaction,
         source: crate::mempool::pool::TxSource,
+        allow_quarantined: bool,
     ) -> Result<bitcoin::Txid, MempoolError>;
 }
 
@@ -5422,8 +5438,9 @@ impl TxBroadcaster for PeerManager {
         &self,
         tx: bitcoin::Transaction,
         source: crate::mempool::pool::TxSource,
+        allow_quarantined: bool,
     ) -> Result<bitcoin::Txid, MempoolError> {
-        PeerManager::submit_and_announce(self, tx, source)
+        PeerManager::submit_and_announce(self, tx, source, allow_quarantined)
     }
 }
 
@@ -5871,7 +5888,7 @@ mod tests {
         };
 
         assert!(
-            pm.submit_and_announce(tx, crate::mempool::pool::TxSource::Rpc).is_err(),
+            pm.submit_and_announce(tx, crate::mempool::pool::TxSource::Rpc, false).is_err(),
             "tx with missing inputs must be rejected"
         );
         assert!(rx1.try_recv().is_err(), "a rejected tx must not be announced to peers");
@@ -5925,7 +5942,7 @@ mod tests {
         let txid = tx.compute_txid();
         pm.mempool.insert_entry_for_test(txid, tx.clone(), 0);
 
-        let result = pm.submit_and_announce(tx, crate::mempool::pool::TxSource::Rpc);
+        let result = pm.submit_and_announce(tx, crate::mempool::pool::TxSource::Rpc, false);
         assert_eq!(result.ok(), Some(txid), "resubmit of a mempool tx must succeed");
         match rx1.try_recv() {
             Ok(NetworkMessage::Inv(inv)) => {
