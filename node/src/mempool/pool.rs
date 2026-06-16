@@ -200,6 +200,23 @@ pub struct MempoolInfo {
     pub unbroadcast: usize,
 }
 
+/// Outcome of a ruleset re-placement pass ([`Mempool::reapply_policy`], §8).
+/// The caller drives the side effects it owns from these lists: re-announcing
+/// `promoted` transactions on the bounded promotion queue and re-arming local
+/// rebroadcast (PR 6b). `evicted` are entries dropped only because a class
+/// overflowed its budget *after* the moves (the sole lossy outcome permitted by
+/// I9). `demoted` is informational (the events already fired).
+#[derive(Debug, Default, Clone)]
+pub struct PolicyTransition {
+    /// Quarantine → acting (scope cleared, or it newly assists relay): must be
+    /// re-announced to the network.
+    pub promoted: Vec<Txid>,
+    /// Acting → quarantine (newly withheld by the reloaded ruleset).
+    pub demoted: Vec<Txid>,
+    /// Removed by per-class budget eviction after the moves.
+    pub evicted: Vec<Txid>,
+}
+
 struct MempoolInner {
     entries: HashMap<Txid, MempoolEntry>,
     spends: HashMap<OutPoint, Txid>,
@@ -510,6 +527,267 @@ impl Mempool {
     /// Snapshot the live ruleset pointer (for `getpolicyinfo`, PR 7).
     pub fn policy_snapshot(&self) -> Option<std::sync::Arc<satd_policy::CompiledRuleset>> {
         self.policy.load_full()
+    }
+
+    /// In-mempool dependency order, parents before children (Kahn's algorithm
+    /// over the spend edges that stay inside the pool). A transaction DAG has no
+    /// cycles, so a single sweep totally orders it; any entry left after the
+    /// sweep (impossible without a cycle) is appended so nothing is dropped.
+    /// Used by [`Self::reapply_policy`] so a parent's recomputed scope is visible
+    /// when its child is re-evaluated (§7 infectious propagation).
+    fn topological_order(entries: &HashMap<Txid, MempoolEntry>) -> Vec<Txid> {
+        // Direct in-mempool parents (deduped) and the reverse child edges.
+        let mut parents: HashMap<Txid, HashSet<Txid>> = HashMap::with_capacity(entries.len());
+        let mut children: HashMap<Txid, Vec<Txid>> = HashMap::new();
+        for (txid, entry) in entries {
+            let mut ps: HashSet<Txid> = HashSet::new();
+            for input in &entry.tx.input {
+                let p = input.previous_output.txid;
+                if p != *txid && entries.contains_key(&p) {
+                    ps.insert(p);
+                }
+            }
+            for p in &ps {
+                children.entry(*p).or_default().push(*txid);
+            }
+            parents.insert(*txid, ps);
+        }
+
+        let mut order: Vec<Txid> = Vec::with_capacity(entries.len());
+        let mut indegree: HashMap<Txid, usize> =
+            parents.iter().map(|(t, ps)| (*t, ps.len())).collect();
+        let mut queue: Vec<Txid> = indegree
+            .iter()
+            .filter(|(_, d)| **d == 0)
+            .map(|(t, _)| *t)
+            .collect();
+        while let Some(t) = queue.pop() {
+            order.push(t);
+            if let Some(cs) = children.get(&t) {
+                for c in cs {
+                    if let Some(d) = indegree.get_mut(c) {
+                        *d -= 1;
+                        if *d == 0 {
+                            queue.push(*c);
+                        }
+                    }
+                }
+            }
+        }
+        // Belt-and-suspenders: append anything a (non-existent) cycle stranded.
+        if order.len() != entries.len() {
+            for t in entries.keys() {
+                if !order.contains(t) {
+                    order.push(*t);
+                }
+            }
+        }
+        order
+    }
+
+    /// Re-evaluate every resident transaction against the current ruleset and
+    /// move it between the acting and quarantine classes accordingly — the
+    /// synchronous re-placement pass run after a policy reload (§8). Lossless
+    /// (I9): nothing is dropped except by the destination class's ordinary
+    /// budget eviction; removing a rule promotes everything it was holding back
+    /// without re-hearing anything from the network.
+    ///
+    /// The pool is walked parents-before-children ([`Self::topological_order`])
+    /// so each transaction's infectious-ancestor scope (§3/§7) is derived from
+    /// its parents' already-recomputed scopes in one sweep. Standardness is
+    /// never re-litigated here — an already-admitted entry stays admitted; the
+    /// reload only changes *placement*, never validity. Bounded by pool size and
+    /// run off the hot path (the reload path), per §8.
+    ///
+    /// Returns the [`PolicyTransition`] so the caller (PR 6b) can re-announce
+    /// promoted txs; emits `Promoted`/`Demoted` quarantine events for streaming
+    /// subscribers.
+    pub fn reapply_policy(&self, chain_state: &ChainState) -> PolicyTransition {
+        let cfg = self.config.read().clone();
+        let ruleset = self.policy.load_full();
+        let policy_active = ruleset.as_ref().map(|r| !r.is_empty()).unwrap_or(false);
+        let tip_height = chain_state.tip_height();
+        let network = chain_state.network;
+
+        let mut promoted: Vec<Txid> = Vec::new();
+        // (txid, new scope, responsible rule) — for the Demoted event.
+        let mut demoted: Vec<(Txid, QuarantineScope, String)> = Vec::new();
+        let mut evicted: Vec<Txid> = Vec::new();
+
+        {
+            let mut inner = self.inner.write();
+            let order = Self::topological_order(&inner.entries);
+
+            for txid in order {
+                let (tx, fee, fee_rate, weight, source, old_scope) =
+                    match inner.entries.get(&txid) {
+                        Some(e) => (e.tx.clone(), e.fee, e.fee_rate, e.weight, e.source, e.scope),
+                        None => continue,
+                    };
+
+                // Re-resolve prevouts (confirmed coins or in-mempool parents),
+                // exactly as admission does, and note the direct in-mempool
+                // parents for infectious propagation. An admitted tx always
+                // resolves: every input resolved at admission, a mined parent's
+                // outputs become confirmed coins, and removing a parent
+                // cascade-removes its children — so a *resident* entry never has
+                // a dangling prevout. If one somehow does, it is an invariant
+                // violation (the entry is effectively invalid), surfaced below.
+                let mut prev_outputs: Vec<TxOut> = Vec::with_capacity(tx.input.len());
+                let mut prev_is_coinbase: Vec<bool> = Vec::with_capacity(tx.input.len());
+                let mut parents: Vec<Txid> = Vec::new();
+                let mut resolved = true;
+                for input in &tx.input {
+                    if let Some(coin) = chain_state.get_coin(&input.previous_output) {
+                        prev_outputs.push(TxOut {
+                            value: bitcoin::Amount::from_sat(coin.amount),
+                            script_pubkey: coin.script_pubkey.clone(),
+                        });
+                        prev_is_coinbase.push(coin.coinbase);
+                    } else if let Some(parent) = inner.entries.get(&input.previous_output.txid)
+                        && let Some(o) = parent.tx.output.get(input.previous_output.vout as usize)
+                    {
+                        parents.push(input.previous_output.txid);
+                        prev_outputs.push(o.clone());
+                        prev_is_coinbase.push(false);
+                    } else {
+                        resolved = false;
+                        break;
+                    }
+                }
+                if !resolved {
+                    // Cannot re-judge a transaction whose prevouts we can't
+                    // resolve (the evaluator needs every prevout to build the
+                    // view). Do NOT guess a placement, and do NOT drop the entry
+                    // here — re-placement is lossless (I9); reaping a genuinely
+                    // dangling entry is owned by the mempool's own maintenance
+                    // (block-connect removal, expiry, conflict eviction). But it
+                    // is an invariant violation, so warn loudly rather than skip
+                    // silently — a recurring line points at a removal-ordering or
+                    // chainstate-consistency bug, not a policy issue.
+                    tracing::warn!(
+                        %txid,
+                        "reapply_policy: prevouts unresolvable; leaving placement \
+                         unchanged (entry has a dangling parent / missing coin — \
+                         it should be reaped by mempool maintenance)"
+                    );
+                    continue;
+                }
+
+                // Own scope from the verdict.
+                let (own_scope, own_rule): (QuarantineScope, Option<String>) = if policy_active {
+                    let rs = ruleset.as_ref().expect("policy_active ⇒ Some");
+                    let ctx = PolicyCtx {
+                        network,
+                        height: tip_height,
+                        mempool_bytes: inner.total_bytes,
+                    };
+                    match policy_engine::evaluate(
+                        rs, &tx, &txid, &prev_outputs, &prev_is_coinbase, fee, fee_rate, weight,
+                        &cfg, ctx, source, false,
+                    ) {
+                        satd_policy::Verdict::Allow { .. } | satd_policy::Verdict::Pass => {
+                            (QuarantineScope::acting(), None)
+                        }
+                        satd_policy::Verdict::Quarantine { rule, scope } => {
+                            (policy_engine::map_scope(scope), Some(rule))
+                        }
+                    }
+                } else {
+                    (QuarantineScope::acting(), None)
+                };
+
+                // Infectious propagation: union the direct parents' already-
+                // recomputed scopes (transitive via the topological order).
+                let mut new_scope = own_scope;
+                for p in &parents {
+                    if let Some(pe) = inner.entries.get(p) {
+                        new_scope.relay |= pe.scope.relay;
+                        new_scope.template |= pe.scope.template;
+                    }
+                }
+
+                if new_scope == old_scope {
+                    continue;
+                }
+
+                // Apply: per-class byte accounting, then stamp the new scope.
+                let size = bitcoin::consensus::serialize(&tx).len();
+                inner.account_remove(old_scope, size);
+                inner.account_insert(new_scope, size);
+                if let Some(e) = inner.entries.get_mut(&txid) {
+                    e.scope = new_scope;
+                }
+
+                // Classify the move for the streaming surface. `Promoted` has a
+                // strict contract: the scope FULLY cleared and the tx is acting
+                // again (I9). A move that recovers *one* path (e.g. relay) while
+                // the other stays withheld is NOT a promotion — the tx is still
+                // quarantined. Report every still-held outcome via `Demoted`,
+                // which carries the resulting held scope (relay/template) so
+                // subscribers converge on the correct state instead of being told
+                // a still-template-held tx is acting. (When `new_scope.is_acting()`
+                // here, `old_scope` was necessarily quarantined: the two differ
+                // and the acting scope is unique.)
+                if new_scope.is_acting() {
+                    promoted.push(txid);
+                } else {
+                    let rule = own_rule.unwrap_or_else(|| INFECTIOUS_RULE.to_string());
+                    demoted.push((txid, new_scope, rule));
+                }
+            }
+
+            // Per-class budget eviction after the moves (§8): only the class
+            // that overflowed, only the overflow amount.
+            if inner.acting_bytes() > cfg.max_size_bytes {
+                let over = inner.acting_bytes() - cfg.max_size_bytes;
+                evicted.extend(Self::evict_lowest_fee_entries(&mut inner, over, false));
+            }
+            if inner.quarantine_bytes > cfg.quarantine_max_bytes {
+                let over = inner.quarantine_bytes - cfg.quarantine_max_bytes;
+                evicted.extend(Self::evict_lowest_fee_entries(&mut inner, over, true));
+            }
+            self.sync_unbroadcast_len(&inner);
+        }
+
+        // A move recorded above can be undone by the post-replacement budget
+        // eviction: a tx promoted into an already-full acting class (or demoted
+        // into a full quarantine class) can itself be the lowest-fee victim and
+        // leave the pool in the same pass. Such a tx is gone — it must surface
+        // only `LeaveEvicted`, never a `Promoted`/`Demoted` event, and must not
+        // be handed back in `promoted` for PR 6b to re-announce. Drop every
+        // evicted txid from the transition lists before emitting/returning.
+        if !evicted.is_empty() {
+            let gone: std::collections::HashSet<Txid> = evicted.iter().copied().collect();
+            promoted.retain(|t| !gone.contains(t));
+            demoted.retain(|(t, _, _)| !gone.contains(t));
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        for txid in &promoted {
+            self.emit_quarantine(QuarantineEvent::Promoted { txid: *txid, time: now });
+        }
+        for (txid, scope, rule) in &demoted {
+            self.emit_quarantine(QuarantineEvent::Demoted {
+                txid: *txid,
+                rule: rule.clone(),
+                relay: scope.relay,
+                template: scope.template,
+                time: now,
+            });
+        }
+        for txid in &evicted {
+            self.emit(MempoolEvent::LeaveEvicted { txid: *txid, reason: EvictReason::Policy });
+        }
+
+        PolicyTransition {
+            promoted,
+            demoted: demoted.into_iter().map(|(t, _, _)| t).collect(),
+            evicted,
+        }
     }
 
     /// The exemptable standardness set (§6.2 / Core's `-acceptnonstdtxn` family):
@@ -3436,5 +3714,229 @@ mod tests {
         );
         // It is still tracked for promotion-on-reload, just not rebroadcast.
         assert!(mp.is_unbroadcast(&relay_only));
+    }
+
+    // --- PR 6a: ruleset reload re-placement (§8, I9) ---
+
+    fn scope_of(mp: &Mempool, txid: &Txid) -> QuarantineScope {
+        mp.inner.read().entries.get(txid).unwrap().scope
+    }
+
+    #[test]
+    fn reapply_demotes_acting_into_quarantine() {
+        // A tx admitted with no policy is acting; loading a ruleset that matches
+        // it and reapplying demotes it into the quarantine class.
+        let op = outpoint(0xc1);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin(100_000))]);
+        let tx = spend(op, 99_000, 0x22);
+        let txid = mp
+            .accept_transaction(tx, &cs, &NoopVerifier, TxSource::P2p, false)
+            .expect("admitted to acting");
+        assert!(scope_of(&mp, &txid).is_acting());
+
+        set_ruleset(&mp, "version 1\nquarantine catch when tx.version == 2");
+        let t = mp.reapply_policy(&cs);
+
+        assert_eq!(t.demoted, vec![txid]);
+        assert!(t.promoted.is_empty());
+        assert!(scope_of(&mp, &txid).is_quarantined());
+        assert!(mp.quarantine_bytes() > 0);
+        assert_eq!(mp.acting_bytes(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reapply_promotes_quarantine_back_to_acting_on_rule_removal() {
+        // I9: removing the rule (clear_policy) recovers everything it held —
+        // losslessly, with nothing re-heard from the network.
+        let op = outpoint(0xc2);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin(100_000))]);
+        set_ruleset(&mp, "version 1\nquarantine catch when tx.version == 2");
+        let tx = spend(op, 99_000, 0x22);
+        let txid = mp
+            .accept_transaction(tx, &cs, &NoopVerifier, TxSource::P2p, false)
+            .expect("admitted to quarantine");
+        assert!(scope_of(&mp, &txid).is_quarantined());
+
+        mp.clear_policy();
+        let t = mp.reapply_policy(&cs);
+
+        assert_eq!(t.promoted, vec![txid]);
+        assert!(t.demoted.is_empty());
+        assert!(scope_of(&mp, &txid).is_acting());
+        assert_eq!(mp.quarantine_bytes(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reapply_round_trip_is_lossless_i9() {
+        // The headline I9 test: add a rule → remove the rule → the pool is
+        // byte-for-byte where it started (same entries, same acting scope, same
+        // class accounting). Nothing was dropped or re-downloaded.
+        let op = outpoint(0xc3);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin(100_000))]);
+        let tx = spend(op, 99_000, 0x22);
+        let txid = mp
+            .accept_transaction(tx, &cs, &NoopVerifier, TxSource::P2p, false)
+            .expect("admitted");
+
+        let before_total = mp.inner.read().total_bytes;
+        let before_acting = mp.acting_bytes();
+        assert!(scope_of(&mp, &txid).is_acting());
+
+        // Add a quarantine rule and reapply → demoted.
+        set_ruleset(&mp, "version 1\nquarantine catch when tx.version == 2");
+        mp.reapply_policy(&cs);
+        assert!(scope_of(&mp, &txid).is_quarantined());
+
+        // Remove it and reapply → promoted back, identical to the start.
+        mp.clear_policy();
+        mp.reapply_policy(&cs);
+        assert!(scope_of(&mp, &txid).is_acting());
+        assert!(mp.inner.read().entries.contains_key(&txid), "nothing dropped");
+        assert_eq!(mp.inner.read().total_bytes, before_total);
+        assert_eq!(mp.acting_bytes(), before_acting);
+        assert_eq!(mp.quarantine_bytes(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reapply_partial_relay_recovery_is_demoted_not_promoted() {
+        // Regression: a move that recovers relay assistance but leaves the tx
+        // template-held must NOT be reported as `Promoted` (whose contract is a
+        // FULL scope clear → acting again). It must surface as a `Demoted`-class
+        // move carrying the new held scope, so subscribers don't believe a
+        // still-template-held tx is acting.
+        let op = outpoint(0xc7);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin(100_000))]);
+        let tx = spend(op, 99_000, 0x55);
+        let txid = mp
+            .accept_transaction(tx, &cs, &NoopVerifier, TxSource::P2p, false)
+            .expect("admitted");
+
+        // First ruleset: full quarantine (default scope = relay + template).
+        set_ruleset(&mp, "version 1\nquarantine catch when tx.version == 2");
+        let t = mp.reapply_policy(&cs);
+        assert_eq!(t.demoted, vec![txid]);
+        let s = scope_of(&mp, &txid);
+        assert!(s.relay && s.template, "withheld from both paths");
+
+        // Reload to template-only quarantine: relay is recovered, template stays
+        // held. Net result is still quarantined → this is a Demoted move, never a
+        // Promoted one.
+        set_ruleset(&mp, "version 1\nquarantine catch on template when tx.version == 2");
+        let t = mp.reapply_policy(&cs);
+        assert!(
+            t.promoted.is_empty(),
+            "still template-held ⇒ not a promotion"
+        );
+        assert_eq!(t.demoted, vec![txid], "partial recovery reported as a scope change");
+        let s = scope_of(&mp, &txid);
+        assert!(!s.relay && s.template, "now relay-assisting, template-held");
+        assert!(s.is_quarantined(), "still quarantined overall");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reapply_promotion_evicted_in_same_pass_is_not_reported_promoted() {
+        // Regression: a tx promoted into an already-full acting class can be the
+        // lowest-fee victim of the post-replacement budget eviction in the SAME
+        // pass. It left the pool entirely, so it must surface only as `evicted` —
+        // never in `promoted` (which PR 6b re-announces) and never via a
+        // `Promoted` event for a tx that no longer exists.
+        let op_keep = outpoint(0xd1);
+        let op_q = outpoint(0xd2);
+        let (cs, mp, dir) =
+            make_funded_env(&[(op_keep, coin(100_000)), (op_q, coin(100_000))]);
+
+        // High-fee acting tx to keep; low-fee tx that will be quarantined then
+        // promoted. Both are 1-in/1-out and serialize to the same length.
+        let tx_keep = spend(op_keep, 90_000, 0x33); // fee 10_000 — high rate
+        let tx_q = spend(op_q, 99_900, 0x44); // fee 100 — low rate, evict victim
+        let l = bitcoin::consensus::serialize(&tx_keep).len();
+        assert_eq!(l, bitcoin::consensus::serialize(&tx_q).len());
+
+        // Quarantine only tx_q (match its 99_900 output); admit both.
+        set_ruleset(
+            &mp,
+            "version 1\nquarantine onlyq when any outputs (out.value == 99900)",
+        );
+        let keep_txid = mp
+            .accept_transaction(tx_keep, &cs, &NoopVerifier, TxSource::P2p, false)
+            .expect("keep admitted");
+        let q_txid = mp
+            .accept_transaction(tx_q, &cs, &NoopVerifier, TxSource::P2p, false)
+            .expect("q admitted");
+        assert!(scope_of(&mp, &keep_txid).is_acting());
+        assert!(scope_of(&mp, &q_txid).is_quarantined());
+
+        // Tighten the acting budget so it fits exactly one tx, and remove the
+        // rule: reapply promotes tx_q into acting → acting holds two txs → over
+        // budget → the lowest-fee tx (tx_q) is evicted in the same pass.
+        mp.clear_policy();
+        mp.reload_policy(MempoolConfig {
+            max_size_bytes: l + l / 2,
+            min_fee_rate: 0,
+            dust_relay_fee: 3_000,
+            ..Default::default()
+        });
+        let t = mp.reapply_policy(&cs);
+
+        assert!(
+            t.evicted.contains(&q_txid),
+            "the promoted-then-overflowing tx must be evicted"
+        );
+        assert!(
+            !t.promoted.contains(&q_txid),
+            "an evicted tx must not be reported as promoted (no phantom re-announce)"
+        );
+        assert!(
+            !mp.inner.read().entries.contains_key(&q_txid),
+            "evicted tx is gone from the pool"
+        );
+        assert!(
+            mp.inner.read().entries.contains_key(&keep_txid),
+            "the high-fee acting tx survives"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reapply_propagates_infectiously_in_topological_order() {
+        // A parent matched by the rule and its (rule-unmatched) child: on reload
+        // the child inherits the parent's held scope, derived from the parent's
+        // already-recomputed scope in the same sweep.
+        let op = outpoint(0xc4);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin(200_000))]);
+        // Parent: version 2, will match the rule. Child spends the parent.
+        let parent = spend(op, 150_000, 0x33);
+        let parent_txid = parent.compute_txid();
+        let parent_out = OutPoint { txid: parent_txid, vout: 0 };
+        let child = spend(parent_out, 100_000, 0x44);
+        let child_txid = child.compute_txid();
+
+        mp.accept_transaction(parent, &cs, &NoopVerifier, TxSource::P2p, false)
+            .expect("parent admitted");
+        mp.accept_transaction(child, &cs, &NoopVerifier, TxSource::P2p, false)
+            .expect("child admitted");
+        assert!(scope_of(&mp, &parent_txid).is_acting());
+        assert!(scope_of(&mp, &child_txid).is_acting());
+
+        // Quarantine only the parent (match its 150_000 output value); the child
+        // pays 100_000 and is not matched directly.
+        set_ruleset(
+            &mp,
+            "version 1\nquarantine big on template when any outputs (out.value == 150000)",
+        );
+        mp.reapply_policy(&cs);
+
+        let pscope = scope_of(&mp, &parent_txid);
+        let cscope = scope_of(&mp, &child_txid);
+        assert!(pscope.template && !pscope.relay, "parent held on template");
+        assert!(
+            cscope.template,
+            "child inherits the parent's template hold (infectious, §3/§7)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
