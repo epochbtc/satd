@@ -159,6 +159,35 @@ impl ScriptPattern {
     pub fn contains_in(&self, tokens: &[ScriptToken]) -> bool {
         glob_search(tokens, &self.tokens)
     }
+
+    /// Render the pattern back to its `script(…)` inner text — the inverse of the
+    /// pattern compiler, for tooling (`policylint --explain`, the advisory). Not
+    /// guaranteed byte-identical to the operator's source (opcode spelling is
+    /// canonicalized), but semantically equivalent.
+    pub fn render(&self) -> String {
+        self.tokens
+            .iter()
+            .map(|t| match t {
+                PatToken::Op(b) => opcode_name(*b),
+                PatToken::Push => "push".to_string(),
+                PatToken::PushLen(n) => format!("push({n})"),
+                PatToken::PushRange(a, b) => format!("push({a}..{b})"),
+                PatToken::PushExact(x) => format!("push(0x{})", hex(x)),
+                PatToken::PushPrefix(x) => format!("push(0x{}*)", hex(x)),
+                PatToken::AnyOne => "_".to_string(),
+                PatToken::AnyRun => "*".to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
 }
 
 fn token_matches(tok: &ScriptToken, p: &PatToken) -> bool {
@@ -237,6 +266,20 @@ pub fn opcode_byte(name: &str) -> Option<u8> {
     table.get(&name.to_ascii_uppercase()).copied()
 }
 
+/// The canonical name of an opcode byte (rust-bitcoin's `Display`), e.g.
+/// `0x6a → "OP_RETURN"`. The inverse of [`opcode_byte`] for the common opcodes;
+/// data-push bytes render as their `OP_PUSHBYTES_n` form. For tooling only.
+pub fn opcode_name(byte: u8) -> String {
+    format!("{}", bitcoin::opcodes::Opcode::from(byte))
+}
+
+/// `OP_CHECKLOCKTIMEVERIFY` (BIP-65) — distinctive of Lightning HTLC / timelock
+/// scripts; surfaced by the L2-shape advisory.
+pub const OP_CHECKLOCKTIMEVERIFY: u8 = 0xb1;
+/// `OP_CHECKSEQUENCEVERIFY` (BIP-112) — distinctive of Lightning commitment /
+/// justice / HTLC scripts; surfaced by the L2-shape advisory.
+pub const OP_CHECKSEQUENCEVERIFY: u8 = 0xb2;
+
 fn build_opcode_table() -> HashMap<String, u8> {
     let mut m = HashMap::new();
     for b in 0u16..=255 {
@@ -252,6 +295,12 @@ fn build_opcode_table() -> HashMap<String, u8> {
     m.insert("OP_0".into(), 0x00);
     m.insert("OP_TRUE".into(), 0x51);
     m.insert("OP_1NEGATE".into(), 0x4f);
+    // Full BIP-65/BIP-112 spellings. rust-bitcoin's Display renders these as the
+    // abbreviated OP_CLTV / OP_CSV (the NOP2 / NOP3 byte slots), but operators
+    // authoring L2-aware rules — and the L2-shape advisory's cookbook — use the
+    // long names, so accept both.
+    m.insert("OP_CHECKLOCKTIMEVERIFY".into(), OP_CHECKLOCKTIMEVERIFY);
+    m.insert("OP_CHECKSEQUENCEVERIFY".into(), OP_CHECKSEQUENCEVERIFY);
     for n in 1u8..=16 {
         // OP_1 .. OP_16  ==  0x50 + n  ==  OP_PUSHNUM_n
         m.insert(format!("OP_{n}"), 0x50 + n);
@@ -286,6 +335,9 @@ mod tests {
         assert_eq!(opcode_byte("OP_1NEGATE"), Some(0x4f));
         // Runes marker, both spellings.
         assert_eq!(opcode_byte("OP_PUSHNUM_13"), Some(0x5d));
+        // BIP-65/BIP-112 long spellings (L2 advisory cookbook uses these).
+        assert_eq!(opcode_byte("OP_CHECKLOCKTIMEVERIFY"), Some(0xb1));
+        assert_eq!(opcode_byte("OP_CHECKSEQUENCEVERIFY"), Some(0xb2));
         // Pushdata opcodes.
         assert_eq!(opcode_byte("OP_PUSHDATA1"), Some(0x4c));
         assert_eq!(opcode_byte("OP_PUSHBYTES_3"), Some(0x03));

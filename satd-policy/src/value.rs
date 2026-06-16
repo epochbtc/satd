@@ -75,6 +75,44 @@ pub struct EnumVal {
     pub code: u8,
 }
 
+impl EnumVal {
+    /// The canonical literal name of this enum value — the inverse of
+    /// [`enum_literal`]. Used by tooling that renders the AST back to text
+    /// (`policylint --explain`, the L2-shape advisory, `getpolicyinfo`).
+    pub fn name(self) -> &'static str {
+        match self.kind {
+            EnumKind::ScriptType => match self.code {
+                c if c == ScriptType::P2pk as u8 => "p2pk",
+                c if c == ScriptType::P2pkh as u8 => "p2pkh",
+                c if c == ScriptType::P2sh as u8 => "p2sh",
+                c if c == ScriptType::P2wpkh as u8 => "p2wpkh",
+                c if c == ScriptType::P2wsh as u8 => "p2wsh",
+                c if c == ScriptType::P2tr as u8 => "p2tr",
+                c if c == ScriptType::P2a as u8 => "p2a",
+                c if c == ScriptType::OpReturn as u8 => "op_return",
+                c if c == ScriptType::BareMultisig as u8 => "bare_multisig",
+                c if c == ScriptType::WitnessUnknown as u8 => "witness_unknown",
+                _ => "nonstandard",
+            },
+            EnumKind::Network => match self.code {
+                c if c == Network::Mainnet as u8 => "mainnet",
+                c if c == Network::Testnet as u8 => "testnet",
+                c if c == Network::Testnet4 as u8 => "testnet4",
+                c if c == Network::Signet as u8 => "signet",
+                _ => "regtest",
+            },
+            EnumKind::Source => match self.code {
+                c if c == Source::P2p as u8 => "p2p",
+                c if c == Source::Rpc as u8 => "rpc",
+                c if c == Source::Electrum as u8 => "electrum",
+                c if c == Source::Esplora as u8 => "esplora",
+                c if c == Source::Mcp as u8 => "mcp",
+                _ => "reload",
+            },
+        }
+    }
+}
+
 impl ScriptType {
     fn code(self) -> u8 {
         self as u8

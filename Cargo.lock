@@ -4009,6 +4009,7 @@ dependencies = [
  "hex",
  "reqwest",
  "rpassword",
+ "satd-policy",
  "serde",
  "serde_json",
  "shlex",
