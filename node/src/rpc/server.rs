@@ -866,8 +866,10 @@ pub async fn start(
         })?;
         // Submit + announce is the shared core (`broadcast_transaction`);
         // this handler only maps the error to the JSON-RPC taxonomy.
-        let result = ctx.peer_manager.broadcast_transaction(&hex_tx).map_err(
-            |(code, msg)| {
+        let result = ctx
+            .peer_manager
+            .broadcast_transaction(&hex_tx, crate::mempool::pool::TxSource::Rpc)
+            .map_err(|(code, msg)| {
                 // Classify the mempool error by its code (Core taxonomy):
                 // -22 = decode failed, -25 = mempool acceptance failure.
                 let (category, suggestion) = match code {
