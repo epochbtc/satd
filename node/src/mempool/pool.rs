@@ -628,8 +628,11 @@ impl Mempool {
                 // Re-resolve prevouts (confirmed coins or in-mempool parents),
                 // exactly as admission does, and note the direct in-mempool
                 // parents for infectious propagation. An admitted tx always
-                // resolves; on the off chance a prevout is gone, leave the
-                // entry's placement untouched rather than guess.
+                // resolves: every input resolved at admission, a mined parent's
+                // outputs become confirmed coins, and removing a parent
+                // cascade-removes its children — so a *resident* entry never has
+                // a dangling prevout. If one somehow does, it is an invariant
+                // violation (the entry is effectively invalid), surfaced below.
                 let mut prev_outputs: Vec<TxOut> = Vec::with_capacity(tx.input.len());
                 let mut prev_is_coinbase: Vec<bool> = Vec::with_capacity(tx.input.len());
                 let mut parents: Vec<Txid> = Vec::new();
@@ -653,6 +656,21 @@ impl Mempool {
                     }
                 }
                 if !resolved {
+                    // Cannot re-judge a transaction whose prevouts we can't
+                    // resolve (the evaluator needs every prevout to build the
+                    // view). Do NOT guess a placement, and do NOT drop the entry
+                    // here — re-placement is lossless (I9); reaping a genuinely
+                    // dangling entry is owned by the mempool's own maintenance
+                    // (block-connect removal, expiry, conflict eviction). But it
+                    // is an invariant violation, so warn loudly rather than skip
+                    // silently — a recurring line points at a removal-ordering or
+                    // chainstate-consistency bug, not a policy issue.
+                    tracing::warn!(
+                        %txid,
+                        "reapply_policy: prevouts unresolvable; leaving placement \
+                         unchanged (entry has a dangling parent / missing coin — \
+                         it should be reaped by mempool maintenance)"
+                    );
                     continue;
                 }
 
