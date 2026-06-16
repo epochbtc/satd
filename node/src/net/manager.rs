@@ -3946,7 +3946,13 @@ impl PeerManager {
 
     /// Relay a newly-admitted tx to other peers whose fee filter allows it.
     fn broadcast_inv(&self, from: PeerId, txid: bitcoin::Txid) {
-        let entry_fee_rate = self.mempool.get(&txid).map(|e| e.fee_rate).unwrap_or(0);
+        let entry = self.mempool.get(&txid);
+        // Relay-quarantined: the node declines to gossip this tx (design
+        // §2.4/§6.1), so it is never INV'd to peers.
+        if entry.as_ref().is_some_and(|e| !e.scope.assists_relay()) {
+            return;
+        }
+        let entry_fee_rate = entry.map(|e| e.fee_rate).unwrap_or(0);
         let inv = NetworkMessage::Inv(vec![Inventory::WitnessTransaction(txid)]);
         let peers = self.peers.read();
         for (peer_id, handle) in peers.iter() {
@@ -3972,7 +3978,15 @@ impl PeerManager {
     /// handler (not via the lossy mempool event broadcast) so a
     /// successful `sendrawtransaction` reliably reaches the wire.
     pub fn announce_tx(&self, txid: bitcoin::Txid) {
-        let entry_fee_rate = self.mempool.get(&txid).map(|e| e.fee_rate).unwrap_or(0);
+        let entry = self.mempool.get(&txid);
+        // Relay-quarantined: withheld from the wire even on the local-origin
+        // path. A relay-scoped local submission is normally refused outright
+        // (design §6.1), but with an `allowquarantined` override the tx is
+        // admitted to the quarantine class and must still not be announced.
+        if entry.as_ref().is_some_and(|e| !e.scope.assists_relay()) {
+            return;
+        }
+        let entry_fee_rate = entry.map(|e| e.fee_rate).unwrap_or(0);
         let inv = NetworkMessage::Inv(vec![Inventory::WitnessTransaction(txid)]);
         let peers = self.peers.read();
         for handle in peers.values() {
@@ -4514,7 +4528,16 @@ impl PeerManager {
                     }
                 }
                 Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
-                    if let Some(entry) = self.mempool.get(&txid) {
+                    // Relay-quarantined txs are not served via `getdata`:
+                    // announce-suppression without serve-suppression would be
+                    // incoherent — a peer that learned the txid elsewhere must
+                    // not be able to pull it from us (design §6.1). Report it
+                    // as not-found, exactly as if we did not hold it.
+                    if let Some(entry) = self
+                        .mempool
+                        .get(&txid)
+                        .filter(|e| e.scope.assists_relay())
+                    {
                         // The peer pulled this tx from us. If it's a pending
                         // local broadcast, that's the primary proof it has
                         // propagated — count the peer toward stopping
@@ -5824,6 +5847,88 @@ mod tests {
         assert!(rx2.try_recv().is_err(), "high-fee-filter peer must be skipped");
         // Not yet Connected → skipped.
         assert!(rx3.try_recv().is_err(), "non-Connected peer must be skipped");
+    }
+
+    /// PR 5: the relay assist paths honor the quarantine scope bits. A
+    /// relay-quarantined tx is never INV'd (`announce_tx`/`broadcast_inv`) and
+    /// never served via `getdata` (the peer gets `NotFound`), while a tx
+    /// quarantined only `on template` still relays normally (design §2.4/§6.1).
+    #[test]
+    fn assist_paths_skip_relay_quarantined() {
+        use crate::chain::state::AssumeValid;
+        use crate::mempool::pool::QuarantineScope;
+        use crate::storage::db::InMemoryStore;
+        use crate::storage::flatfile::FlatFileManager;
+        use crate::validation::script::NoopVerifier;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Box::new(InMemoryStore::new());
+        let flat_files = FlatFileManager::new(&dir.path().join("blocks")).unwrap();
+        let chain_state = Arc::new(
+            ChainState::new(
+                store,
+                flat_files,
+                Network::Regtest,
+                Box::new(NoopVerifier),
+                AssumeValid::Disabled,
+                450,
+                4,
+                Default::default(),
+                Default::default(),
+            )
+            .unwrap(),
+        );
+        let mempool = Arc::new(Mempool::new(1_000_000, 0));
+        let fee_estimator = Arc::new(FeeEstimator::new());
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let pm = PeerManager::new(
+            chain_state,
+            mempool.clone(),
+            fee_estimator,
+            Network::Regtest,
+            shutdown_rx,
+        );
+
+        // fee_rate 0 entries; the peer's fee_filter is 0 so the only thing that
+        // can suppress an INV is the relay scope.
+        let relay_q = mempool.insert_scoped_for_test(1, 0, QuarantineScope { relay: true, template: false });
+        let template_q = mempool.insert_scoped_for_test(2, 0, QuarantineScope { relay: false, template: true });
+
+        let addr: SocketAddr = "10.0.0.1:8333".parse().unwrap();
+        let (h1, mut rx1) = mk_handle_rx(1, addr, PeerState::Connected, 0);
+        pm.peers.write().insert(1, h1);
+
+        // announce_tx: relay-quarantined → nothing on the wire.
+        pm.announce_tx(relay_q);
+        assert!(rx1.try_recv().is_err(), "relay-quarantined tx must not be announced");
+
+        // broadcast_inv (peer-relay fan-out): same.
+        pm.broadcast_inv(99, relay_q);
+        assert!(rx1.try_recv().is_err(), "relay-quarantined tx must not be relayed");
+
+        // getdata: peer asking for it gets NotFound, never the Tx.
+        pm.handle_getdata(1, vec![Inventory::WitnessTransaction(relay_q)]);
+        match rx1.try_recv() {
+            Ok(NetworkMessage::NotFound(inv)) => {
+                assert_eq!(inv, vec![Inventory::WitnessTransaction(relay_q)]);
+            }
+            other => panic!("relay-quarantined getdata must return NotFound, got {other:?}"),
+        }
+
+        // Contrast: a tx quarantined only `on template` still relays.
+        pm.announce_tx(template_q);
+        match rx1.try_recv() {
+            Ok(NetworkMessage::Inv(inv)) => {
+                assert_eq!(inv, vec![Inventory::WitnessTransaction(template_q)]);
+            }
+            other => panic!("on-template tx must still be announced, got {other:?}"),
+        }
+        // And it is served on getdata.
+        pm.handle_getdata(1, vec![Inventory::WitnessTransaction(template_q)]);
+        match rx1.try_recv() {
+            Ok(NetworkMessage::Tx(tx)) => assert_eq!(tx.compute_txid(), template_q),
+            other => panic!("on-template tx must be served via getdata, got {other:?}"),
+        }
     }
 
     /// `submit_and_announce` — the shared core behind the Esplora / Electrum
