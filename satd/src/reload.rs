@@ -28,8 +28,9 @@
 //! daemon: it is logged and the running config is kept.
 
 use crate::config::{self, Config};
+use node::chain::state::ChainState;
 use node::index::address::SubscriptionRegistry;
-use node::mempool::pool::{Mempool, MempoolConfig};
+use node::mempool::pool::{Mempool, MempoolConfig, PolicyReloadKind};
 use node::net::manager::PeerManager;
 use node::rpc::auth::{RpcAuth, RpcAuthCredential, UserPassCredential};
 use parking_lot::RwLock;
@@ -165,6 +166,9 @@ pub struct ReloadHandles {
     pub cli: config::CliArgs,
     pub mempool: Arc<Mempool>,
     pub peer_manager: Arc<PeerManager>,
+    /// Chain state — the policy re-placement pass ([`Mempool::reapply_policy`])
+    /// re-resolves each entry's prevouts against it on a `policyfile` reload (§8).
+    pub chain_state: Arc<ChainState>,
     pub log_filter: LogReloadHandle,
     /// Address-index subscription registry — its cap is reloadable.
     pub addr_sub_registry: Arc<SubscriptionRegistry>,
@@ -260,6 +264,63 @@ pub fn mempool_config_from(c: &Config) -> MempoolConfig {
     }
 }
 
+/// Re-read and re-apply the transaction-filtering `policyfile` on SIGHUP (§8).
+/// Runs unconditionally (the `TokenStore` precedent — see [`HANDLER_RELOAD_KEYS`]):
+///
+/// - **`policyfile=` set:** re-read + recompile + swap. A no-op (identical
+///   contents) skips the re-placement walk; a changed ruleset triggers a lossless
+///   re-placement pass (I9) and enqueues the promoted txs for bounded
+///   re-announcement. A compile error keeps the last-good ruleset (I7).
+/// - **`policyfile=` removed:** drop the engine and promote everything held —
+///   behavior reverts to baseline (G4/I9).
+fn apply_policyfile_reload(new: &Config, h: &ReloadHandles) {
+    match &new.policyfile {
+        Some(path) => match h.mempool.reload_policy_file(path) {
+            Ok(PolicyReloadKind::Unchanged) => {
+                tracing::debug!(path = %path.display(), "policy file reloaded: no change");
+            }
+            Ok(PolicyReloadKind::Changed(load)) => {
+                tracing::info!(
+                    path = %path.display(),
+                    rules = load.rules,
+                    total_cost = load.total_cost,
+                    sha256 = %load.sha256,
+                    "policy file reloaded — re-placing mempool"
+                );
+                let t = h.mempool.reapply_policy(&h.chain_state);
+                let promoted = t.promoted.len();
+                h.peer_manager.enqueue_promotions(t.promoted);
+                tracing::info!(
+                    promoted,
+                    demoted = t.demoted.len(),
+                    evicted = t.evicted.len(),
+                    "policy re-placement complete"
+                );
+            }
+            Err(e) => tracing::error!(
+                error = %e,
+                path = %path.display(),
+                "policy file reload failed — keeping the last-good ruleset"
+            ),
+        },
+        // No `policyfile=`: if a ruleset is loaded, drop it and promote
+        // everything (engine reverts to baseline, I9). `policy_snapshot` is
+        // `Some` for any loaded ruleset, including an (inert) empty one.
+        None => {
+            if h.mempool.policy_snapshot().is_some() {
+                h.mempool.clear_policy();
+                let t = h.mempool.reapply_policy(&h.chain_state);
+                let promoted = t.promoted.len();
+                h.peer_manager.enqueue_promotions(t.promoted);
+                tracing::info!(
+                    promoted,
+                    "policyfile removed — engine dropped, quarantine promoted to acting"
+                );
+            }
+        }
+    }
+}
+
 /// How a live field is pushed into the running node.
 enum Apply {
     /// Apply from the new config alone: `f(new, handles)`. The common case —
@@ -315,6 +376,17 @@ const LOAD_ONLY_KEYS: &[&str] = &[
     "signet",
     "par",
 ];
+
+/// Keys whose external file is re-read by a **dedicated handler** at the end of
+/// `reload_from_sighup`, not via a `FieldSpec` — the `TokenStore` precedent (§8):
+/// the file's *contents* are picked up on every SIGHUP even when the config value
+/// (the path) is unchanged, which a path-diff `FieldSpec` would miss. Classified
+/// here so the anti-drift coverage test still accounts for them.
+///
+/// `policyfile`: the transaction-filtering ruleset — re-read, recompiled, swapped,
+/// and re-placed live (path change, in-place content edit, and removal all live).
+#[allow(dead_code)]
+const HANDLER_RELOAD_KEYS: &[&str] = &["policyfile"];
 
 /// Build the field-disposition table. Constructed at call time (once per
 /// reload) so the non-capturing `diff`/`apply` closures coerce to `fn`
@@ -627,12 +699,12 @@ fn field_specs() -> Vec<FieldSpec> {
         live!("quarantinemempool", quarantinemempool, |c, h| {
             h.mempool.reload_policy(mempool_config_from(c))
         }),
-        // The transaction-filtering policy *file path*. Changing which file is
-        // loaded requires a restart for now; live re-read of the file's
-        // *contents* (the TokenStore-style recompile-and-ArcSwap handler, §8) is
-        // PR 6. Classified restart! so a path change is reported, not silently
-        // ignored.
-        restart!("policyfile", policyfile),
+        // NOTE: `policyfile` is intentionally NOT a FieldSpec. Like the
+        // `authfile` token store, its external file's *contents* are re-read on
+        // every SIGHUP — even when the path is unchanged — by a dedicated handler
+        // at the end of `reload_from_sighup` (the `TokenStore` precedent, §8). A
+        // path-diff spec would miss in-place edits to the same file, so the whole
+        // policy reload (path change, content change, and removal) lives there.
         // `-networkactive`: toggle P2P networking live (same effect as the
         // `setnetworkactive` RPC). Disabling disconnects all peers.
         live!("networkactive", networkactive, |c, h| {
@@ -841,6 +913,15 @@ pub fn reload_from_sighup(handles: &ReloadHandles, running: &Config) -> Config {
         }
     }
 
+    // Transaction-filtering policy file (§8), the `TokenStore` precedent:
+    // re-read the external file's *contents* on every SIGHUP — even when the
+    // path is unchanged — recompile, swap, and run the lossless re-placement
+    // pass (I9). A compile error keeps the last-good ruleset; removing
+    // `policyfile=` drops the engine and promotes everything held. Promotions
+    // are announced through the bounded drain queue so a mass promotion never
+    // bursts peers.
+    apply_policyfile_reload(&new, handles);
+
     // Surface any reconciliation notes produced by re-reading the file
     // (e.g. Esplora ↔ txindex, prune auto-disable).
     for note in new.take_pending_notes() {
@@ -893,18 +974,20 @@ mod tests {
             "duplicate key in field_specs()"
         );
         let load_only: HashSet<&str> = LOAD_ONLY_KEYS.iter().copied().collect();
+        let handler_reload: HashSet<&str> = HANDLER_RELOAD_KEYS.iter().copied().collect();
 
         for key in config::KNOWN_CONFIG_KEYS {
-            let covered = spec_keys.contains(key) || load_only.contains(key);
+            let covered =
+                spec_keys.contains(key) || load_only.contains(key) || handler_reload.contains(key);
             assert!(
                 covered,
                 "config key {key:?} has no reload disposition — add it to \
-                 field_specs() (restart!/live!) or LOAD_ONLY_KEYS"
+                 field_specs() (restart!/live!), LOAD_ONLY_KEYS, or HANDLER_RELOAD_KEYS"
             );
         }
-        // No stray keys: every spec/load-only key must be a real config key.
+        // No stray keys: every classified key must be a real config key.
         let known: HashSet<&str> = config::KNOWN_CONFIG_KEYS.iter().copied().collect();
-        for k in spec_keys.iter().chain(load_only.iter()) {
+        for k in spec_keys.iter().chain(load_only.iter()).chain(handler_reload.iter()) {
             assert!(
                 known.contains(k),
                 "{k:?} is classified but is not in KNOWN_CONFIG_KEYS"

@@ -206,6 +206,17 @@ pub struct MempoolInfo {
 /// rebroadcast (PR 6b). `evicted` are entries dropped only because a class
 /// overflowed its budget *after* the moves (the sole lossy outcome permitted by
 /// I9). `demoted` is informational (the events already fired).
+/// Outcome of a live policy-file reload ([`Mempool::reload_policy_file`], §8).
+pub enum PolicyReloadKind {
+    /// The file's contents were unchanged (same `sha256`); nothing was swapped
+    /// and no re-placement is needed.
+    Unchanged,
+    /// A new ruleset was compiled and swapped in. The caller should run
+    /// [`Mempool::reapply_policy`] and announce the resulting promotions. Carries
+    /// the load summary for logging.
+    Changed(policy_engine::PolicyLoad),
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct PolicyTransition {
     /// Quarantine → acting (scope cleared, or it newly assists relay): must be
@@ -349,6 +360,13 @@ pub struct Mempool {
     /// it atomically. Snapshotted once at the top of `accept_transaction` so a
     /// transaction is judged against a single ruleset version.
     policy: arc_swap::ArcSwapOption<satd_policy::CompiledRuleset>,
+    /// `sha256` of the source text of the currently-loaded `policyfile` (the
+    /// digest [`policy_engine::load_policy_file`] returns). Lets the SIGHUP
+    /// handler ([`Self::reload_policy_file`]) detect a no-op reload — same file
+    /// contents — and skip the (bounded but non-trivial) re-placement walk. The
+    /// `CompiledRuleset` itself carries no digest, so it is tracked here. `None`
+    /// when no ruleset is loaded.
+    policy_sha: Mutex<Option<String>>,
     /// Broadcast channel fanout for `subscribemempool`. Populated via
     /// `set_event_sender`; remains `None` in tests that don't need
     /// event emission.
@@ -386,6 +404,7 @@ impl Mempool {
             unbroadcast_len: std::sync::atomic::AtomicUsize::new(0),
             config: RwLock::new(config),
             policy: arc_swap::ArcSwapOption::empty(),
+            policy_sha: Mutex::new(None),
             event_tx: Mutex::new(None),
             event_ring: Mutex::new(VecDeque::with_capacity(EVENT_RING_CAPACITY)),
             quarantine_event_tx: Mutex::new(None),
@@ -498,7 +517,29 @@ impl Mempool {
     ) -> Result<policy_engine::PolicyLoad, String> {
         let (ruleset, load) = policy_engine::load_policy_file(path)?;
         self.policy.store(Some(std::sync::Arc::new(ruleset)));
+        *self.policy_sha.lock() = Some(load.sha256.clone());
         Ok(load)
+    }
+
+    /// Live SIGHUP reload of the policy file (§8 — the `TokenStore` precedent:
+    /// re-read the external file's *contents* on every signal, recompile, swap).
+    /// Detects a no-op reload by comparing the source `sha256` to the loaded
+    /// ruleset's, so an unchanged file skips the re-placement walk. On a compile
+    /// error the previous ruleset is kept untouched (last-good-wins) and the
+    /// error is returned for the caller to log — never a partial apply (I7).
+    /// The caller drives re-placement ([`Self::reapply_policy`]) and promotion
+    /// announcements when this returns [`PolicyReloadKind::Changed`].
+    pub fn reload_policy_file(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<PolicyReloadKind, String> {
+        let (ruleset, load) = policy_engine::load_policy_file(path)?;
+        if self.policy_sha.lock().as_deref() == Some(load.sha256.as_str()) {
+            return Ok(PolicyReloadKind::Unchanged);
+        }
+        self.policy.store(Some(std::sync::Arc::new(ruleset)));
+        *self.policy_sha.lock() = Some(load.sha256.clone());
+        Ok(PolicyReloadKind::Changed(load))
     }
 
     /// Drop any loaded ruleset — reverts the node to baseline behavior (the
@@ -506,6 +547,7 @@ impl Mempool {
     /// tests.
     pub fn clear_policy(&self) {
         self.policy.store(None);
+        *self.policy_sha.lock() = None;
     }
 
     /// Install an already-compiled ruleset directly. Test/embedding hook; the
@@ -3938,5 +3980,51 @@ mod tests {
             "child inherits the parent's template hold (infectious, §3/§7)"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reload_policy_file_detects_noop_vs_change() {
+        let mp = Mempool::new(1_000_000, 0);
+        let path = std::env::temp_dir().join(format!(
+            "satd-policy-reload-{}-{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        std::fs::write(&path, "version 1\nquarantine a when tx.version == 2\n").unwrap();
+        // First load is a change (was none).
+        assert!(matches!(
+            mp.reload_policy_file(&path).unwrap(),
+            PolicyReloadKind::Changed(_)
+        ));
+        assert!(mp.has_policy());
+        // Same contents ⇒ no-op (skips the re-placement walk).
+        assert!(matches!(
+            mp.reload_policy_file(&path).unwrap(),
+            PolicyReloadKind::Unchanged
+        ));
+        // Edited contents ⇒ change.
+        std::fs::write(&path, "version 1\nquarantine a when tx.version == 1\n").unwrap();
+        assert!(matches!(
+            mp.reload_policy_file(&path).unwrap(),
+            PolicyReloadKind::Changed(_)
+        ));
+        // A compile error keeps last-good and returns Err (I7).
+        std::fs::write(&path, "version 1\nthis is not valid\n").unwrap();
+        assert!(mp.reload_policy_file(&path).is_err());
+        assert!(mp.has_policy(), "last-good ruleset survives a bad reload");
+        // clear_policy resets the tracked sha so a later identical file reloads.
+        mp.clear_policy();
+        assert!(!mp.has_policy());
+        std::fs::write(&path, "version 1\nquarantine a when tx.version == 1\n").unwrap();
+        assert!(matches!(
+            mp.reload_policy_file(&path).unwrap(),
+            PolicyReloadKind::Changed(_)
+        ));
+
+        let _ = std::fs::remove_file(&path);
     }
 }
