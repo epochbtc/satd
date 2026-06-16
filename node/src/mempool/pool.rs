@@ -524,6 +524,13 @@ pub struct Mempool {
     /// so the evidence accumulates across ruleset edits. Surfaced by
     /// `getquarantineinfo`.
     quarantine_confirmed: std::sync::atomic::AtomicU64,
+    /// Process-lifetime policy-transition and reload counters for the Prometheus
+    /// surface (PR 7c). `promoted`/`demoted` accumulate the re-placement moves
+    /// across reloads; `reload_failures` counts SIGHUP reloads that kept
+    /// last-good on a compile error.
+    policy_promoted_total: std::sync::atomic::AtomicU64,
+    policy_demoted_total: std::sync::atomic::AtomicU64,
+    policy_reload_failures: std::sync::atomic::AtomicU64,
     /// Broadcast channel fanout for `subscribemempool`. Populated via
     /// `set_event_sender`; remains `None` in tests that don't need
     /// event emission.
@@ -565,6 +572,9 @@ impl Mempool {
             policy_meta: Mutex::new(None),
             policy_stats: PolicyStats::default(),
             quarantine_confirmed: std::sync::atomic::AtomicU64::new(0),
+            policy_promoted_total: std::sync::atomic::AtomicU64::new(0),
+            policy_demoted_total: std::sync::atomic::AtomicU64::new(0),
+            policy_reload_failures: std::sync::atomic::AtomicU64::new(0),
             event_tx: Mutex::new(None),
             event_ring: Mutex::new(VecDeque::with_capacity(EVENT_RING_CAPACITY)),
             quarantine_event_tx: Mutex::new(None),
@@ -712,7 +722,15 @@ impl Mempool {
         &self,
         path: &std::path::Path,
     ) -> Result<PolicyReloadKind, String> {
-        let (ruleset, load) = policy_engine::load_policy_file(path)?;
+        let (ruleset, load) = match policy_engine::load_policy_file(path) {
+            Ok(v) => v,
+            Err(e) => {
+                // Last-good kept (I7); count the failed reload for the metric.
+                self.policy_reload_failures
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Err(e);
+            }
+        };
         if self.policy_sha.lock().as_deref() == Some(load.sha256.as_str()) {
             return Ok(PolicyReloadKind::Unchanged);
         }
@@ -792,6 +810,18 @@ impl Mempool {
     pub fn quarantine_confirmed_count(&self) -> u64 {
         self.quarantine_confirmed
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Process-lifetime count of acting→quarantine and quarantine→acting moves
+    /// made by the reload re-placement pass, and SIGHUP reloads that failed to
+    /// compile (last-good kept). For the Prometheus policy counters (PR 7c).
+    pub fn policy_transition_totals(&self) -> (u64, u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            self.policy_promoted_total.load(Relaxed),
+            self.policy_demoted_total.load(Relaxed),
+            self.policy_reload_failures.load(Relaxed),
+        )
     }
 
     /// Live `getquarantineinfo` rollup (design §10): per-rule count/bytes/fee-rate
@@ -1192,6 +1222,13 @@ impl Mempool {
         for txid in &evicted {
             self.emit(MempoolEvent::LeaveEvicted { txid: *txid, reason: EvictReason::Policy });
         }
+
+        // Accumulate the transition into the process-lifetime Prometheus counters.
+        use std::sync::atomic::Ordering::Relaxed;
+        self.policy_promoted_total
+            .fetch_add(promoted.len() as u64, Relaxed);
+        self.policy_demoted_total
+            .fetch_add(demoted.len() as u64, Relaxed);
 
         PolicyTransition {
             promoted,

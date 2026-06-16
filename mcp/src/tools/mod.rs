@@ -2,6 +2,7 @@ pub mod node_status;
 pub mod blockchain;
 pub mod transactions;
 pub mod mempool;
+pub mod policy;
 pub mod fees;
 pub mod network;
 pub mod construction;

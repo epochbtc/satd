@@ -292,6 +292,134 @@ impl MetricsContext {
             );
         }
 
+        // --- Transaction-filtering policy (design §10, PR 7c) ---
+        // Emitted only when a ruleset is loaded, so a node with no policy renders
+        // a byte-identical /metrics page (I8 invisibility).
+        if let Some(snapshot) = self.mempool.policy_snapshot() {
+            let stats = self.mempool.policy_stats_snapshot();
+            let (promoted, demoted, reload_failures) = self.mempool.policy_transition_totals();
+            let template_floor = self.mempool.min_fee_rate();
+            let report = self.mempool.quarantine_report(template_floor);
+
+            metric(
+                &mut out,
+                "satd_policy_evaluations_total",
+                "Transactions evaluated against the policy ruleset since it loaded.",
+                "counter",
+                &[],
+                stats.evaluations,
+            );
+            metric(
+                &mut out,
+                "satd_policy_fuel_exhausted_total",
+                "Policy evaluations that hit the fuel backstop (fail-safe full-scope quarantine).",
+                "counter",
+                &[],
+                stats.fuel_exhausted,
+            );
+            metric(
+                &mut out,
+                "satd_policy_reload_failures_total",
+                "SIGHUP policy reloads that failed to compile (last-good kept).",
+                "counter",
+                &[],
+                reload_failures,
+            );
+            metric(
+                &mut out,
+                "satd_policy_promoted_total",
+                "Cumulative quarantine->acting moves by the reload re-placement pass.",
+                "counter",
+                &[],
+                promoted,
+            );
+            metric(
+                &mut out,
+                "satd_policy_demoted_total",
+                "Cumulative acting->quarantine moves by the reload re-placement pass.",
+                "counter",
+                &[],
+                demoted,
+            );
+            metric(
+                &mut out,
+                "satd_policy_quarantine_confirmed_total",
+                "Quarantined transactions later seen confirmed in a block (confirmed-anyway).",
+                "counter",
+                &[],
+                report.confirmed_anyway,
+            );
+
+            // Per-rule match counters. Emit each metric family's HELP/TYPE once,
+            // then one labelled sample per rule (multiple HELP/TYPE lines for the
+            // same family is invalid Prometheus).
+            let _ = writeln!(
+                out,
+                "# HELP satd_policy_quarantined_total Per-rule count of quarantine matches since load."
+            );
+            let _ = writeln!(out, "# TYPE satd_policy_quarantined_total counter");
+            let _ = writeln!(
+                out,
+                "# HELP satd_policy_allows_total Per-rule count of allow matches since load."
+            );
+            let _ = writeln!(out, "# TYPE satd_policy_allows_total counter");
+            for r in snapshot.rules() {
+                let matched = stats.per_rule.get(&r.name).copied().unwrap_or(0);
+                match r.action {
+                    satd_policy::Action::Quarantine => {
+                        let _ = writeln!(
+                            out,
+                            "satd_policy_quarantined_total{{rule=\"{}\",scope=\"{}\"}} {}",
+                            escape_label(&r.name),
+                            scope_label(r.scope.relay, r.scope.template),
+                            matched,
+                        );
+                    }
+                    satd_policy::Action::Allow => {
+                        let _ = writeln!(
+                            out,
+                            "satd_policy_allows_total{{rule=\"{}\"}} {}",
+                            escape_label(&r.name),
+                            matched,
+                        );
+                    }
+                }
+            }
+
+            metric(
+                &mut out,
+                "satd_policy_quarantine_transactions",
+                "Transactions currently held in the quarantine class.",
+                "gauge",
+                &[],
+                report.total_count,
+            );
+            metric(
+                &mut out,
+                "satd_policy_quarantine_bytes",
+                "Serialized bytes currently held in the quarantine class.",
+                "gauge",
+                &[],
+                report.total_bytes,
+            );
+            metric(
+                &mut out,
+                "satd_policy_quarantine_budget_bytes",
+                "Configured quarantine-class capacity in bytes.",
+                "gauge",
+                &[],
+                report.budget_bytes,
+            );
+            metric(
+                &mut out,
+                "satd_policy_foregone_fees_sat",
+                "Sum of fees (sat) of template-withheld quarantined txs above the template floor.",
+                "gauge",
+                &[],
+                report.foregone_fees_sat,
+            );
+        }
+
         out
     }
 
@@ -355,6 +483,17 @@ fn network_label(n: Network) -> &'static str {
         Network::Testnet4 => "testnet4",
         Network::Signet => "signet",
         Network::Regtest => "regtest",
+    }
+}
+
+/// Stable label for a quarantine rule's scope (`satd_policy_quarantined_total`).
+/// A scope bit set means "withheld from" that path.
+fn scope_label(relay: bool, template: bool) -> &'static str {
+    match (relay, template) {
+        (true, true) => "relay+template",
+        (true, false) => "relay",
+        (false, true) => "template",
+        (false, false) => "none",
     }
 }
 
@@ -513,5 +652,13 @@ mod tests {
     fn parse_kib_line_handles_typical_proc_status() {
         assert_eq!(parse_kib_line("  123456 kB\n"), Some(123_456 * 1024));
         assert_eq!(parse_kib_line("0 kB"), Some(0));
+    }
+
+    #[test]
+    fn scope_label_covers_every_combination() {
+        assert_eq!(scope_label(true, true), "relay+template");
+        assert_eq!(scope_label(true, false), "relay");
+        assert_eq!(scope_label(false, true), "template");
+        assert_eq!(scope_label(false, false), "none");
     }
 }

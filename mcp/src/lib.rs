@@ -96,6 +96,22 @@ struct GetMempoolEntryParams {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+struct ListQuarantineParams {
+    #[schemars(description = "Filter to a single policy rule name (optional)")]
+    rule: Option<String>,
+    #[schemars(description = "Maximum entries to return (0 or omitted = no limit)")]
+    count: Option<usize>,
+    #[schemars(description = "Number of entries to skip for paging (default: 0)")]
+    skip: Option<usize>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct GetQuarantineEntryParams {
+    #[schemars(description = "Transaction ID (hex)")]
+    txid: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
 struct EstimateFeeParams {
     #[schemars(description = "Confirmation targets in blocks (default: [1, 3, 6, 12, 25])")]
     targets: Option<Vec<u32>>,
@@ -283,6 +299,33 @@ impl SatdMcpServer {
     #[tool(description = "Get detailed info about a mempool transaction, optionally including its ancestor and descendant dependency chains.")]
     fn get_mempool_entry(&self, Parameters(p): Parameters<GetMempoolEntryParams>) -> String {
         tools::mempool::get_mempool_entry(&self.ctx, &p.txid, p.include_relatives.unwrap_or(false))
+    }
+
+    // === Transaction-filtering policy (design §10) ===
+
+    #[tool(description = "Get transaction-filtering policy info: ruleset path/sha256/version, per-rule match counters since load, fuel-backstop count, and quarantine-class totals. Returns {\"loaded\": false} when no ruleset is active.")]
+    fn get_policy_info(&self) -> String {
+        tools::policy::get_policy_info(&self.ctx)
+    }
+
+    #[tool(description = "Get quarantine-class statistics: per-rule rollup (count, bytes, fee-rate span), confirmed-anyway count (quarantined txs later mined), and the foregone-fees estimate (sat). The comparison surface for tuning policy posture.")]
+    fn get_quarantine_info(&self) -> String {
+        tools::policy::get_quarantine_info(&self.ctx)
+    }
+
+    #[tool(description = "List quarantined transactions (the policy hold class), newest-first, optionally filtered to one rule. Each entry: txid, rule, scope (relay/template), entry time, vsize, fee, fee rate.")]
+    fn list_quarantine(&self, Parameters(p): Parameters<ListQuarantineParams>) -> String {
+        tools::policy::list_quarantine(
+            &self.ctx,
+            p.rule.as_deref(),
+            p.count.unwrap_or(0),
+            p.skip.unwrap_or(0),
+        )
+    }
+
+    #[tool(description = "Get detail for a single quarantined transaction (the getmempoolentry analogue for the quarantine class): rule, scope, time, vsize/weight, fee, fee rate, and in-mempool parents.")]
+    fn get_quarantine_entry(&self, Parameters(p): Parameters<GetQuarantineEntryParams>) -> String {
+        tools::policy::get_quarantine_entry(&self.ctx, &p.txid)
     }
 
     // === Fee Estimation ===
