@@ -1910,6 +1910,8 @@ async fn main() {
             network: config.network,
             effective_config: config.effective_view(),
             mempool_history: mempool_history.clone(),
+            addr_enabled: config.addressindex,
+            addr_subs: Some(address_index_concrete.subscription_registry()),
         });
 
         // `--mcp` only enables the feature; `--mcpport` provides the transport.
