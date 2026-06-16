@@ -42,8 +42,11 @@ pub fn create_template(chain_state: &ChainState, mempool: &Mempool) -> BlockTemp
         _ => tip_entry.header.bits, // Simplified; full retarget in pow.rs
     };
 
-    // Select transactions from mempool by effective fee rate (includes fee_delta)
-    let mut entries = mempool.get_all_entries();
+    // Select transactions from mempool by effective fee rate (includes
+    // fee_delta). Template assembly is scope-filtered: transactions
+    // quarantined `on template` are held but never mined by this node
+    // (design §2.4/§3), so they are excluded here.
+    let mut entries = mempool.get_template_entries();
     entries.sort_by(|a, b| {
         // Saturating add: a corrupt persisted mempool could carry an
         // extreme fee_delta; it must not overflow the effective-fee sum
@@ -243,6 +246,34 @@ mod tests {
         // At genesis, that should be the regtest genesis hash
         let genesis = bitcoin::constants::genesis_block(Network::Regtest);
         assert_eq!(template.prev_hash, genesis.block_hash());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // PR 5: a transaction quarantined `on template` is held but never selected
+    // into a block this node builds (design §2.4/§3).
+    #[test]
+    fn test_template_excludes_template_quarantined() {
+        use crate::mempool::pool::QuarantineScope;
+        let (cs, mp, dir) = make_template_env();
+
+        let acting = mp.insert_scoped_for_test(1, 100, QuarantineScope::acting());
+        let relay_only =
+            mp.insert_scoped_for_test(2, 100, QuarantineScope { relay: true, template: false });
+        // High fee rate — if scope were ignored it would sort to the top.
+        let template_only =
+            mp.insert_scoped_for_test(3, 100_000, QuarantineScope { relay: false, template: true });
+
+        let template = create_template(&cs, &mp);
+        let mined: std::collections::HashSet<_> =
+            template.transactions.iter().map(|t| t.tx.compute_txid()).collect();
+
+        assert!(mined.contains(&acting), "acting tx is mined");
+        assert!(mined.contains(&relay_only), "on-relay tx is still mineable by us");
+        assert!(
+            !mined.contains(&template_only),
+            "on-template tx is excluded even at a far higher fee rate"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

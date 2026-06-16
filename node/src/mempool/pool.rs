@@ -140,6 +140,20 @@ impl QuarantineScope {
     pub fn is_quarantined(self) -> bool {
         !self.is_acting()
     }
+    /// True if the entry may be assisted on the **relay** path — announced via
+    /// `inv`, BIP35-listed, served via `getdata`, and rebroadcast. False once
+    /// the `relay` scope withholds it. (A `quarantine … on template` entry is
+    /// still relayed; only the `relay` bit gates this path — design §3.)
+    pub fn assists_relay(self) -> bool {
+        !self.relay
+    }
+    /// True if the entry may be assisted on the **template** path — selected
+    /// into block templates this node builds *and* counted by the mempool
+    /// smart-fee simulator (which simulates what we would mine — design §2.4).
+    /// False once the `template` scope withholds it.
+    pub fn assists_template(self) -> bool {
+        !self.template
+    }
 }
 
 /// Metadata for a transaction in the mempool.
@@ -1131,13 +1145,44 @@ impl Mempool {
         }
     }
 
-    /// Get all txids in the mempool.
+    /// Get all txids in the mempool — the **union** of the acting and
+    /// quarantine classes.
+    ///
+    /// This is the unfiltered view. Only consumers that must see every held
+    /// transaction may use it: compact-block reconstruction
+    /// ([`crate::net::compact::try_reconstruct`], which reconstructs blocks
+    /// from *any* tx we hold), mempool persistence, and the quarantine-aware
+    /// observability surfaces. The **assist** paths (relay, BIP35, `getdata`,
+    /// rebroadcast, templates, the smart-fee simulator) must NOT use this —
+    /// they take a scope-filtered view ([`Self::get_template_entries`] for the
+    /// template/fee paths; per-entry [`QuarantineScope::assists_relay`] checks
+    /// for the relay paths). Mixing these up is a silent correctness bug
+    /// (design §2.4), so the divergence is documented at the source.
     pub fn get_all_entries(&self) -> Vec<(Txid, MempoolEntry)> {
         self.inner
             .read()
-
             .entries
             .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect()
+    }
+
+    /// Entries eligible for the **template** assist path — block-template
+    /// assembly ([`crate::mining::template::create_template`]) and the mempool
+    /// smart-fee simulator ([`crate::mempool::fee::FeeEstimator::cached_mempool_estimate`]).
+    ///
+    /// Filters [`Self::get_all_entries`] down to entries whose scope
+    /// [`assists_template`](QuarantineScope::assists_template) — i.e. excludes
+    /// transactions quarantined `on template` (those we hold but will never
+    /// mine). The fee simulator shares this exact view so it never quotes fees
+    /// for transactions the node would not include in a block (design §2.4).
+    /// Until a policy is loaded every scope is empty, so this equals the union.
+    pub fn get_template_entries(&self) -> Vec<(Txid, MempoolEntry)> {
+        self.inner
+            .read()
+            .entries
+            .iter()
+            .filter(|(_, v)| v.scope.assists_template())
             .map(|(k, v)| (*k, v.clone()))
             .collect()
     }
@@ -1145,12 +1190,16 @@ impl Mempool {
     /// Txids of mempool entries whose fee rate is at least `min_fee_rate`
     /// (sat/kvB). Used to answer a BIP35 `mempool` request without cloning
     /// every entry's transaction.
+    ///
+    /// BIP35 is a **relay** assist path (we are announcing our mempool to a
+    /// peer), so quarantine-relay entries are excluded — the node never
+    /// advertises a transaction it has declined to gossip (design §2.4/§6.1).
     pub fn txids_above_feerate(&self, min_fee_rate: u64) -> Vec<Txid> {
         self.inner
             .read()
             .entries
             .iter()
-            .filter(|(_, e)| e.fee_rate >= min_fee_rate)
+            .filter(|(_, e)| e.scope.assists_relay() && e.fee_rate >= min_fee_rate)
             .map(|(txid, _)| *txid)
             .collect()
     }
@@ -1617,13 +1666,23 @@ impl Mempool {
     /// Live unbroadcast `(txid, fee_rate)` pairs, for the announce paths —
     /// the fee rate is captured here so callers never have to re-enter the
     /// mempool lock (or clone whole entries) while holding the peers lock.
+    ///
+    /// Rebroadcast and announce-to-new-peer are **relay** assist paths, so
+    /// quarantine-relay entries are excluded: a local tx that became
+    /// relay-quarantined (via `allowquarantined` opt-in or a later ruleset
+    /// demotion — design §6.1/§8) stays in the unbroadcast set for promotion
+    /// on reload but is never put on the wire while withheld. The `retain`
+    /// still prunes departed txids regardless of scope.
     pub fn unbroadcast_entries(&self) -> Vec<(Txid, u64)> {
         let mut inner = self.inner.write();
         let MempoolInner { entries, unbroadcast, .. } = &mut *inner;
         unbroadcast.retain(|txid, _| entries.contains_key(txid));
         let pairs = unbroadcast
             .keys()
-            .map(|txid| (*txid, entries.get(txid).map(|e| e.fee_rate).unwrap_or(0)))
+            .filter_map(|txid| {
+                let e = entries.get(txid)?;
+                e.scope.assists_relay().then_some((*txid, e.fee_rate))
+            })
             .collect();
         self.sync_unbroadcast_len(&inner);
         pairs
@@ -1756,6 +1815,37 @@ impl Mempool {
                 fee: 0,
                 weight: 4,
                 fee_rate,
+                time: 0,
+                fee_delta: 0,
+                sigop_cost: 0,
+                prev_scripthashes: Vec::new(),
+                source: TxSource::Rpc,
+                scope,
+            },
+        );
+        inner.account_insert(scope, tx_size);
+        txid
+    }
+
+    /// Test-only: insert a caller-provided `tx` with an explicit quarantine
+    /// `scope`, through the real per-class accounting. Lets the compact-block
+    /// reconstruction test place a *specific* (quarantined) transaction in the
+    /// pool so it can be looked up by its wtxid.
+    pub(crate) fn insert_tx_scoped_for_test(
+        &self,
+        tx: Transaction,
+        scope: QuarantineScope,
+    ) -> Txid {
+        let txid = tx.compute_txid();
+        let tx_size = bitcoin::consensus::serialize(&tx).len();
+        let mut inner = self.inner.write();
+        inner.entries.insert(
+            txid,
+            MempoolEntry {
+                tx,
+                fee: 0,
+                weight: 4,
+                fee_rate: 0,
                 time: 0,
                 fee_delta: 0,
                 sigop_cost: 0,
@@ -3268,5 +3358,83 @@ mod tests {
             other => panic!("expected one Quarantined event, got {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- PR 5: assist-path scope filtering (the three-consumer split, §2.4) ---
+
+    const RELAY_ONLY: QuarantineScope = QuarantineScope { relay: true, template: false };
+    const TEMPLATE_ONLY: QuarantineScope = QuarantineScope { relay: false, template: true };
+
+    #[test]
+    fn scope_assist_predicates() {
+        // The two gates the assist paths read.
+        assert!(QuarantineScope::acting().assists_relay());
+        assert!(QuarantineScope::acting().assists_template());
+        // `on template`: still relayed, never mined.
+        assert!(TEMPLATE_ONLY.assists_relay());
+        assert!(!TEMPLATE_ONLY.assists_template());
+        // `on relay`: never gossiped, still mineable by us.
+        assert!(!RELAY_ONLY.assists_relay());
+        assert!(RELAY_ONLY.assists_template());
+        // Full quarantine: assisted on neither path.
+        assert!(!RELAY_TEMPLATE.assists_relay());
+        assert!(!RELAY_TEMPLATE.assists_template());
+    }
+
+    #[test]
+    fn template_entries_exclude_template_quarantined() {
+        let mp = Mempool::new(1_000_000, 0);
+        let acting = mp.insert_scoped_for_test(1, 100, QuarantineScope::acting());
+        let relay_only = mp.insert_scoped_for_test(2, 100, RELAY_ONLY);
+        let template_only = mp.insert_scoped_for_test(3, 100, TEMPLATE_ONLY);
+        let full = mp.insert_scoped_for_test(4, 100, RELAY_TEMPLATE);
+
+        let ids: std::collections::HashSet<Txid> =
+            mp.get_template_entries().into_iter().map(|(t, _)| t).collect();
+        // The template (and the smart-fee simulator that shares this view)
+        // mine what we would build: acting + relay-only-quarantined.
+        assert!(ids.contains(&acting));
+        assert!(ids.contains(&relay_only), "on-relay txs are still mineable by us");
+        assert!(!ids.contains(&template_only), "on-template txs are withheld from blocks");
+        assert!(!ids.contains(&full));
+        // The union still has everything (reconstruction / observability rely on it).
+        assert_eq!(mp.get_all_entries().len(), 4);
+    }
+
+    #[test]
+    fn bip35_txids_exclude_relay_quarantined() {
+        let mp = Mempool::new(1_000_000, 0);
+        let acting = mp.insert_scoped_for_test(1, 100, QuarantineScope::acting());
+        let relay_only = mp.insert_scoped_for_test(2, 100, RELAY_ONLY);
+        let template_only = mp.insert_scoped_for_test(3, 100, TEMPLATE_ONLY);
+        let full = mp.insert_scoped_for_test(4, 100, RELAY_TEMPLATE);
+
+        let ids: std::collections::HashSet<Txid> =
+            mp.txids_above_feerate(0).into_iter().collect();
+        // BIP35 is a relay path: announce only what we gossip.
+        assert!(ids.contains(&acting));
+        assert!(ids.contains(&template_only), "on-template txs are still relayed");
+        assert!(!ids.contains(&relay_only), "on-relay txs are withheld from announcement");
+        assert!(!ids.contains(&full));
+    }
+
+    #[test]
+    fn unbroadcast_entries_exclude_relay_quarantined() {
+        let mp = Mempool::new(1_000_000, 0);
+        // Insert scoped entries, then mark each unbroadcast.
+        let acting = mp.insert_scoped_for_test(1, 100, QuarantineScope::acting());
+        let relay_only = mp.insert_scoped_for_test(2, 100, RELAY_ONLY);
+        mp.mark_unbroadcast(acting);
+        mp.mark_unbroadcast(relay_only);
+
+        let ids: std::collections::HashSet<Txid> =
+            mp.unbroadcast_entries().into_iter().map(|(t, _)| t).collect();
+        assert!(ids.contains(&acting));
+        assert!(
+            !ids.contains(&relay_only),
+            "relay-quarantined local tx stays in the set but is never put on the wire"
+        );
+        // It is still tracked for promotion-on-reload, just not rebroadcast.
+        assert!(mp.is_unbroadcast(&relay_only));
     }
 }

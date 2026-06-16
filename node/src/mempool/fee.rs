@@ -45,9 +45,15 @@ impl FeeEstimator {
 
     /// The mempool block simulation, memoized with [`FEE_SIM_CACHE_TTL`].
     ///
-    /// On a cache miss this clones the entire mempool (`get_all_entries`) and
-    /// runs the block packer to `MAX_SIM_DEPTH` — expensive enough that doing
-    /// it per request on an unauthenticated endpoint is a DoS amplifier.
+    /// On a cache miss this clones the **template-scoped** mempool
+    /// (`get_template_entries`, the same view `create_template` selects from)
+    /// and runs the block packer to `MAX_SIM_DEPTH` — expensive enough that
+    /// doing it per request on an unauthenticated endpoint is a DoS amplifier.
+    /// The scope filter is load-bearing: simulating against the full pool
+    /// would pack blocks with transactions quarantined `on template` (ones
+    /// this node will never mine) and quote inflated fees to wallets via the
+    /// public smart-fee surfaces (Esplora `/fee-estimates`, Electrum
+    /// `blockchain.estimatefee`) — design §2.4.
     /// Within the TTL, callers share one `Arc<MempoolEstimate>`. The mutex is
     /// held across the rebuild so concurrent callers past expiry queue behind a
     /// single simulation (no thundering herd), mirroring the Electrum fee
@@ -62,7 +68,7 @@ impl FeeEstimator {
             return cached.clone();
         }
         let fresh = Arc::new(estimate_from_mempool(
-            mempool.get_all_entries(),
+            mempool.get_template_entries(),
             MAX_SIM_DEPTH,
         ));
         *guard = Some((now, fresh.clone()));
@@ -125,6 +131,46 @@ mod tests {
         est.record_block(&[400, 500, 600, 700, 800, 900]);
         // Now 9 samples — still not enough
         assert_eq!(est.estimate_fee(1), None);
+    }
+
+    // PR 5: the smart-fee mempool simulator must consume the template-scoped
+    // view, so a transaction quarantined `on template` cannot inflate the fees
+    // we quote to wallets (design §2.4). The estimate must be byte-identical to
+    // the quarantine-empty case.
+    #[test]
+    fn smart_fee_estimate_ignores_template_quarantined() {
+        use crate::mempool::pool::QuarantineScope;
+        let template_only = QuarantineScope { relay: false, template: true };
+
+        // Clean pool: two ordinary acting transactions.
+        let clean = Mempool::new(300_000_000, 1_000);
+        clean.insert_scoped_for_test(1, 100, QuarantineScope::acting());
+        clean.insert_scoped_for_test(2, 200, QuarantineScope::acting());
+
+        // Same pool plus a high-fee-rate tx quarantined `on template`.
+        let quar = Mempool::new(300_000_000, 1_000);
+        quar.insert_scoped_for_test(1, 100, QuarantineScope::acting());
+        quar.insert_scoped_for_test(2, 200, QuarantineScope::acting());
+        quar.insert_scoped_for_test(3, 1_000_000, template_only);
+
+        // Fresh estimators so neither serves a cached Arc.
+        let clean_est = FeeEstimator::new().cached_mempool_estimate(&clean);
+        let quar_est = FeeEstimator::new().cached_mempool_estimate(&quar);
+        assert_eq!(
+            serde_json::to_string(&*clean_est).unwrap(),
+            serde_json::to_string(&*quar_est).unwrap(),
+            "template-quarantined tx must not change the smart-fee output"
+        );
+
+        // Guard: had we (wrongly) simulated the full union, the high-fee tx
+        // would have changed the result — proving the filter is load-bearing.
+        let union_est =
+            estimate_from_mempool(quar.get_all_entries(), MAX_SIM_DEPTH);
+        assert_ne!(
+            serde_json::to_string(&*quar_est).unwrap(),
+            serde_json::to_string(&union_est).unwrap(),
+            "the union view differs — confirms the scope filter actually fires"
+        );
     }
 
     #[test]
