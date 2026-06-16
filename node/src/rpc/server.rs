@@ -596,6 +596,40 @@ pub async fn start(
         }
     })?;
 
+    // --- Transaction-filtering policy observability (design §10, PR 7b) ---
+    // The only RPCs that expose the quarantine class; all read-only.
+
+    module.register_method("getpolicyinfo", |_params, ctx, _extensions| {
+        Ok::<_, ErrorObjectOwned>(crate::rpc::policy::get_policy_info(&ctx.mempool))
+    })?;
+
+    module.register_method("getquarantineinfo", |_params, ctx, _extensions| {
+        Ok::<_, ErrorObjectOwned>(crate::rpc::policy::get_quarantine_info(&ctx.mempool))
+    })?;
+
+    module.register_method("listquarantine", |params, ctx, _extensions| {
+        // `listquarantine [rule] [count] [skip]` — all optional.
+        let mut seq = params.sequence();
+        let rule: Option<String> = seq.optional_next().unwrap_or(None);
+        let count: usize = seq.optional_next().unwrap_or(None).unwrap_or(0);
+        let skip: usize = seq.optional_next().unwrap_or(None).unwrap_or(0);
+        Ok::<_, ErrorObjectOwned>(crate::rpc::policy::list_quarantine(
+            &ctx.mempool,
+            rule.as_deref(),
+            count,
+            skip,
+        ))
+    })?;
+
+    module.register_method("getquarantineentry", |params, ctx, _extensions| {
+        let mut seq = params.sequence();
+        let txid: String = seq
+            .next()
+            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+        crate::rpc::policy::get_quarantine_entry(&ctx.mempool, &txid)
+            .map_err(|e| ErrorObjectOwned::owned(-5, e, None::<()>))
+    })?;
+
     module.register_method("preciousblock", |params, _ctx, _extensions| {
         let hash: String = params
             .one()

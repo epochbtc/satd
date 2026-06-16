@@ -31,6 +31,15 @@ const COINBASE_MATURITY: u32 = 100;
 /// `Quarantined` event so the cause is legible.
 const INFECTIOUS_RULE: &str = "(infectious: quarantined ancestor)";
 
+/// Current Unix time in seconds (saturating to 0 before the epoch). Used for
+/// policy-load timestamps; the hot paths inline their own `now`.
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum MempoolError {
     #[error("txn-already-in-mempool")]
@@ -186,6 +195,13 @@ pub struct MempoolEntry {
     /// until a policy is loaded (PR 4c); a non-empty scope places the entry in
     /// the quarantine class for per-class accounting and eviction.
     pub scope: QuarantineScope,
+    /// Name of the policy rule responsible for the current `scope` (the tx's own
+    /// first-match rule, or the infectious-ancestor marker when the scope is
+    /// only inherited). `None` for acting entries. Stamped at admission and
+    /// re-stamped by the reload re-placement pass; surfaced by the quarantine
+    /// observability extension (`listquarantine`/`getquarantineentry`/
+    /// `getquarantineinfo`, PR 7b). Never leaks onto a standard surface.
+    pub quarantine_rule: Option<String>,
 }
 
 /// Statistics about the mempool.
@@ -226,6 +242,135 @@ pub struct PolicyTransition {
     pub demoted: Vec<Txid>,
     /// Removed by per-class budget eviction after the moves.
     pub evicted: Vec<Txid>,
+}
+
+/// Load metadata for the currently-installed ruleset — the source of
+/// `getpolicyinfo`'s static fields (design §10). `None` when no ruleset is
+/// loaded. Distinct from the live [`CompiledRuleset`] snapshot (which carries
+/// the rules themselves) because the path and load time are node-side facts the
+/// compiled form does not retain.
+#[derive(Debug, Clone)]
+pub struct PolicyMeta {
+    /// Source file path, when loaded from disk (`None` for a direct
+    /// [`Mempool::set_policy`] install — test/embedding only).
+    pub path: Option<std::path::PathBuf>,
+    pub sha256: String,
+    /// Unix seconds at which this ruleset was installed.
+    pub loaded_at: u64,
+    pub version: u32,
+    pub rules: usize,
+    pub total_cost: u64,
+    pub has_allow: bool,
+}
+
+/// Per-rule and aggregate evaluation counters accumulated **since the current
+/// ruleset loaded** (reset on every swap). Feeds `getpolicyinfo` and the
+/// Prometheus policy counters (PR 7c). The per-rule map is keyed by rule name;
+/// a rule's [`satd_policy::ruleset::Action`] tells whether its count is
+/// quarantines or allows, so a single count per rule suffices.
+#[derive(Debug, Default)]
+struct PolicyStats {
+    evaluations: std::sync::atomic::AtomicU64,
+    fuel_exhausted: std::sync::atomic::AtomicU64,
+    per_rule: Mutex<HashMap<String, u64>>,
+}
+
+impl PolicyStats {
+    fn reset(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.evaluations.store(0, Relaxed);
+        self.fuel_exhausted.store(0, Relaxed);
+        self.per_rule.lock().clear();
+    }
+
+    /// Record one evaluation outcome. Cheap (one atomic + a small map bump on a
+    /// match); the `per_rule` mutex is a strict leaf — only ever acquired here
+    /// and in [`Mempool::policy_stats_snapshot`], never while it is itself held.
+    fn record(&self, verdict: &satd_policy::Verdict) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.evaluations.fetch_add(1, Relaxed);
+        if let Some(rule) = verdict.rule() {
+            *self.per_rule.lock().entry(rule.to_string()).or_insert(0) += 1;
+            if rule == satd_policy::verdict::FUEL_RULE {
+                self.fuel_exhausted.fetch_add(1, Relaxed);
+            }
+        }
+    }
+
+    fn snapshot(&self) -> PolicyStatsSnapshot {
+        use std::sync::atomic::Ordering::Relaxed;
+        PolicyStatsSnapshot {
+            evaluations: self.evaluations.load(Relaxed),
+            fuel_exhausted: self.fuel_exhausted.load(Relaxed),
+            per_rule: self.per_rule.lock().clone(),
+        }
+    }
+}
+
+/// A consistent read of [`PolicyStats`] for `getpolicyinfo`.
+#[derive(Debug, Clone, Default)]
+pub struct PolicyStatsSnapshot {
+    pub evaluations: u64,
+    pub fuel_exhausted: u64,
+    pub per_rule: HashMap<String, u64>,
+}
+
+/// One quarantined entry as surfaced by `listquarantine` (design §10).
+#[derive(Debug, Clone)]
+pub struct QuarantineListEntry {
+    pub txid: Txid,
+    pub rule: String,
+    pub relay: bool,
+    pub template: bool,
+    pub time: u64,
+    pub vsize: u64,
+    pub fee: u64,
+    pub fee_rate: u64,
+}
+
+/// Detailed view of a single quarantined entry — the `getmempoolentry` analogue
+/// for the quarantine class (`getquarantineentry`, design §10).
+#[derive(Debug, Clone)]
+pub struct QuarantineEntryDetail {
+    pub txid: Txid,
+    pub rule: String,
+    pub relay: bool,
+    pub template: bool,
+    pub time: u64,
+    pub vsize: u64,
+    pub weight: u64,
+    pub fee: u64,
+    pub fee_rate: u64,
+    /// In-mempool parents (`depends`), regardless of class.
+    pub depends: Vec<Txid>,
+}
+
+/// Per-rule rollup within the quarantine class.
+#[derive(Debug, Clone, Default)]
+pub struct QuarantineRuleStat {
+    pub count: u64,
+    pub bytes: u64,
+    pub min_fee_rate: u64,
+    pub max_fee_rate: u64,
+}
+
+/// The comparison surface for `getquarantineinfo` (design §10): live per-rule
+/// rollup of the quarantine class plus the two economic signals — foregone fees
+/// and the confirmed-anyway count.
+#[derive(Debug, Clone, Default)]
+pub struct QuarantineReport {
+    pub total_count: u64,
+    pub total_bytes: u64,
+    pub budget_bytes: u64,
+    pub per_rule: HashMap<String, QuarantineRuleStat>,
+    /// Sum of fees (sat) of **template-withheld** quarantined txs whose fee rate
+    /// exceeds the supplied template floor — what declining to mine them is
+    /// costing a miner. Relay-only quarantine is still mined, so it is excluded.
+    pub foregone_fees_sat: u64,
+    /// Quarantined txs later seen confirmed in a block (process-lifetime; D4's
+    /// evidence that filtering cannot prevent confirmation, only decline to
+    /// assist it).
+    pub confirmed_anyway: u64,
 }
 
 struct MempoolInner {
@@ -367,6 +512,18 @@ pub struct Mempool {
     /// `CompiledRuleset` itself carries no digest, so it is tracked here. `None`
     /// when no ruleset is loaded.
     policy_sha: Mutex<Option<String>>,
+    /// Load metadata for the installed ruleset (`getpolicyinfo` static fields).
+    /// Set alongside `policy`/`policy_sha`; `None` when no ruleset is loaded.
+    policy_meta: Mutex<Option<PolicyMeta>>,
+    /// Per-rule and aggregate evaluation counters since the current ruleset
+    /// loaded (reset on every swap). Drives `getpolicyinfo` and the Prometheus
+    /// policy counters.
+    policy_stats: PolicyStats,
+    /// Quarantined transactions later observed confirmed in a block — the
+    /// confirmed-anyway signal (D4). Process-lifetime, never reset on reload,
+    /// so the evidence accumulates across ruleset edits. Surfaced by
+    /// `getquarantineinfo`.
+    quarantine_confirmed: std::sync::atomic::AtomicU64,
     /// Broadcast channel fanout for `subscribemempool`. Populated via
     /// `set_event_sender`; remains `None` in tests that don't need
     /// event emission.
@@ -405,6 +562,9 @@ impl Mempool {
             config: RwLock::new(config),
             policy: arc_swap::ArcSwapOption::empty(),
             policy_sha: Mutex::new(None),
+            policy_meta: Mutex::new(None),
+            policy_stats: PolicyStats::default(),
+            quarantine_confirmed: std::sync::atomic::AtomicU64::new(0),
             event_tx: Mutex::new(None),
             event_ring: Mutex::new(VecDeque::with_capacity(EVENT_RING_CAPACITY)),
             quarantine_event_tx: Mutex::new(None),
@@ -518,7 +678,26 @@ impl Mempool {
         let (ruleset, load) = policy_engine::load_policy_file(path)?;
         self.policy.store(Some(std::sync::Arc::new(ruleset)));
         *self.policy_sha.lock() = Some(load.sha256.clone());
+        *self.policy_meta.lock() = Some(Self::build_policy_meta(Some(path), &load));
+        self.policy_stats.reset();
         Ok(load)
+    }
+
+    /// Build the [`PolicyMeta`] for a freshly-loaded ruleset (load-time fields +
+    /// the node-side path/timestamp).
+    fn build_policy_meta(
+        path: Option<&std::path::Path>,
+        load: &policy_engine::PolicyLoad,
+    ) -> PolicyMeta {
+        PolicyMeta {
+            path: path.map(|p| p.to_path_buf()),
+            sha256: load.sha256.clone(),
+            loaded_at: now_unix_secs(),
+            version: load.version,
+            rules: load.rules,
+            total_cost: load.total_cost,
+            has_allow: load.has_allow,
+        }
     }
 
     /// Live SIGHUP reload of the policy file (§8 — the `TokenStore` precedent:
@@ -539,6 +718,8 @@ impl Mempool {
         }
         self.policy.store(Some(std::sync::Arc::new(ruleset)));
         *self.policy_sha.lock() = Some(load.sha256.clone());
+        *self.policy_meta.lock() = Some(Self::build_policy_meta(Some(path), &load));
+        self.policy_stats.reset();
         Ok(PolicyReloadKind::Changed(load))
     }
 
@@ -548,11 +729,23 @@ impl Mempool {
     pub fn clear_policy(&self) {
         self.policy.store(None);
         *self.policy_sha.lock() = None;
+        *self.policy_meta.lock() = None;
+        self.policy_stats.reset();
     }
 
     /// Install an already-compiled ruleset directly. Test/embedding hook; the
     /// file path is the production entry point.
     pub fn set_policy(&self, ruleset: std::sync::Arc<satd_policy::CompiledRuleset>) {
+        *self.policy_meta.lock() = Some(PolicyMeta {
+            path: None,
+            sha256: String::new(),
+            loaded_at: now_unix_secs(),
+            version: ruleset.version(),
+            rules: ruleset.rules().len(),
+            total_cost: ruleset.total_cost().total(),
+            has_allow: ruleset.has_allow(),
+        });
+        self.policy_stats.reset();
         self.policy.store(Some(ruleset));
     }
 
@@ -569,6 +762,161 @@ impl Mempool {
     /// Snapshot the live ruleset pointer (for `getpolicyinfo`, PR 7).
     pub fn policy_snapshot(&self) -> Option<std::sync::Arc<satd_policy::CompiledRuleset>> {
         self.policy.load_full()
+    }
+
+    /// Load metadata for the installed ruleset (`getpolicyinfo` static fields).
+    pub fn policy_meta(&self) -> Option<PolicyMeta> {
+        self.policy_meta.lock().clone()
+    }
+
+    /// Per-rule and aggregate evaluation counters since the current ruleset
+    /// loaded (`getpolicyinfo`).
+    pub fn policy_stats_snapshot(&self) -> PolicyStatsSnapshot {
+        self.policy_stats.snapshot()
+    }
+
+    /// Number of transactions currently in the **quarantine class**. Always 0
+    /// until a policy quarantines something. Cheap relative to the full
+    /// [`Self::quarantine_report`]; used where only the count is needed.
+    pub fn quarantine_count(&self) -> usize {
+        self.inner
+            .read()
+            .entries
+            .values()
+            .filter(|e| !e.scope.is_acting())
+            .count()
+    }
+
+    /// Count of quarantined transactions later seen confirmed in a block — the
+    /// confirmed-anyway signal (process-lifetime).
+    pub fn quarantine_confirmed_count(&self) -> u64 {
+        self.quarantine_confirmed
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Live `getquarantineinfo` rollup (design §10): per-rule count/bytes/fee-rate
+    /// span over the quarantine class, the confirmed-anyway count, and the
+    /// foregone-fees estimate against `template_floor` (sat/kvB — the current
+    /// template's minimum fee rate; pass the same floor the fee estimator uses).
+    pub fn quarantine_report(&self, template_floor: u64) -> QuarantineReport {
+        // Snapshot the config (leaf lock) BEFORE taking `inner`, never the
+        // reverse — uniform leaf-lock discipline (see `info()`); holding `inner`
+        // while acquiring `config` would invert the order every other path uses.
+        let budget_bytes = self.config.read().quarantine_max_bytes as u64;
+        let confirmed_anyway = self.quarantine_confirmed_count();
+        let inner = self.inner.read();
+        let mut report = QuarantineReport {
+            budget_bytes,
+            confirmed_anyway,
+            ..Default::default()
+        };
+        for e in inner.entries.values() {
+            if e.scope.is_acting() {
+                continue;
+            }
+            let size = bitcoin::consensus::serialize(&e.tx).len() as u64;
+            report.total_count += 1;
+            report.total_bytes += size;
+            let rule = e
+                .quarantine_rule
+                .clone()
+                .unwrap_or_else(|| "(policy)".to_string());
+            let stat = report.per_rule.entry(rule).or_default();
+            if stat.count == 0 {
+                stat.min_fee_rate = e.fee_rate;
+                stat.max_fee_rate = e.fee_rate;
+            } else {
+                stat.min_fee_rate = stat.min_fee_rate.min(e.fee_rate);
+                stat.max_fee_rate = stat.max_fee_rate.max(e.fee_rate);
+            }
+            stat.count += 1;
+            stat.bytes += size;
+            // Foregone fees: only entries withheld from the template are a cost
+            // to a miner; a relay-only quarantine is still mined.
+            if !e.scope.assists_template() && e.fee_rate > template_floor {
+                report.foregone_fees_sat = report.foregone_fees_sat.saturating_add(e.fee);
+            }
+        }
+        report
+    }
+
+    /// `listquarantine` (design §10): the quarantine class as a paged list,
+    /// optionally filtered to one `rule`. Sorted by entry time (newest first) so
+    /// paging is stable. `limit == 0` means "no limit".
+    pub fn list_quarantine(
+        &self,
+        rule: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Vec<QuarantineListEntry> {
+        let inner = self.inner.read();
+        let mut out: Vec<QuarantineListEntry> = inner
+            .entries
+            .iter()
+            .filter(|(_, e)| !e.scope.is_acting())
+            .filter(|(_, e)| {
+                rule.is_none_or(|want| {
+                    e.quarantine_rule.as_deref() == Some(want)
+                })
+            })
+            .map(|(txid, e)| QuarantineListEntry {
+                // Use the map key — recomputing the txid per entry re-hashes the
+                // whole transaction for no reason.
+                txid: *txid,
+                rule: e
+                    .quarantine_rule
+                    .clone()
+                    .unwrap_or_else(|| "(policy)".to_string()),
+                relay: e.scope.relay,
+                template: e.scope.template,
+                time: e.time,
+                vsize: policy::weight_to_vsize(e.weight as u64),
+                fee: e.fee,
+                fee_rate: e.fee_rate,
+            })
+            .collect();
+        // Newest first, then txid for a total order (stable paging).
+        out.sort_by(|a, b| b.time.cmp(&a.time).then(a.txid.cmp(&b.txid)));
+        let out: Vec<_> = out.into_iter().skip(offset).collect();
+        if limit == 0 {
+            out
+        } else {
+            out.into_iter().take(limit).collect()
+        }
+    }
+
+    /// `getquarantineentry` (design §10): the `getmempoolentry` analogue for a
+    /// single quarantined transaction. `None` if the txid is absent or acting
+    /// (an acting entry is served by `getmempoolentry`).
+    pub fn get_quarantine_entry(&self, txid: &Txid) -> Option<QuarantineEntryDetail> {
+        let inner = self.inner.read();
+        let e = inner.entries.get(txid)?;
+        if e.scope.is_acting() {
+            return None;
+        }
+        let mut seen: HashSet<Txid> = HashSet::new();
+        let depends: Vec<Txid> = e
+            .tx
+            .input
+            .iter()
+            .map(|i| i.previous_output.txid)
+            .filter(|p| inner.entries.contains_key(p) && seen.insert(*p))
+            .collect();
+        Some(QuarantineEntryDetail {
+            txid: *txid,
+            rule: e
+                .quarantine_rule
+                .clone()
+                .unwrap_or_else(|| "(policy)".to_string()),
+            relay: e.scope.relay,
+            template: e.scope.template,
+            time: e.time,
+            vsize: policy::weight_to_vsize(e.weight as u64),
+            weight: e.weight as u64,
+            fee: e.fee,
+            fee_rate: e.fee_rate,
+            depends,
+        })
     }
 
     /// In-mempool dependency order, parents before children (Kahn's algorithm
@@ -749,16 +1097,36 @@ impl Mempool {
                     }
                 }
 
+                // The rule responsible for the placement: the tx's own match, or
+                // the infectious-ancestor marker when the scope is inherited.
+                // Cleared when the entry is acting. Stamped on the entry so
+                // `listquarantine`/`getquarantineinfo` (PR 7b) can attribute it.
+                let stamped_rule = if new_scope.is_quarantined() {
+                    Some(own_rule.unwrap_or_else(|| INFECTIOUS_RULE.to_string()))
+                } else {
+                    None
+                };
+
                 if new_scope == old_scope {
+                    // Placement unchanged — but a reload may have RENAMED the
+                    // matching rule while keeping its scope; keep the attributed
+                    // rule current for the observability surfaces. No accounting
+                    // move, and not a promotion/demotion.
+                    if let Some(e) = inner.entries.get_mut(&txid)
+                        && e.quarantine_rule != stamped_rule
+                    {
+                        e.quarantine_rule = stamped_rule;
+                    }
                     continue;
                 }
 
-                // Apply: per-class byte accounting, then stamp the new scope.
+                // Apply: per-class byte accounting, then stamp the new scope+rule.
                 let size = bitcoin::consensus::serialize(&tx).len();
                 inner.account_remove(old_scope, size);
                 inner.account_insert(new_scope, size);
                 if let Some(e) = inner.entries.get_mut(&txid) {
                     e.scope = new_scope;
+                    e.quarantine_rule = stamped_rule.clone();
                 }
 
                 // Classify the move for the streaming surface. `Promoted` has a
@@ -774,7 +1142,7 @@ impl Mempool {
                 if new_scope.is_acting() {
                     promoted.push(txid);
                 } else {
-                    let rule = own_rule.unwrap_or_else(|| INFECTIOUS_RULE.to_string());
+                    let rule = stamped_rule.unwrap_or_else(|| INFECTIOUS_RULE.to_string());
                     demoted.push((txid, new_scope, rule));
                 }
             }
@@ -1141,6 +1509,11 @@ impl Mempool {
                 false,
             );
 
+            // Per-rule / aggregate counters since load (getpolicyinfo, PR 7b).
+            // Records every evaluation including `Pass`; a match bumps the rule's
+            // count and the fuel-backstop counter when the fail-safe fired.
+            self.policy_stats.record(&verdict);
+
             // Resolve the verdict against any deferred standardness failure
             // (§6.2/§7): `Allow` forgives it; `Pass`/`Quarantine` let the
             // baseline rejection stand — the quarantine class is not a dumping
@@ -1333,6 +1706,7 @@ impl Mempool {
                 prev_scripthashes,
                 source,
                 scope,
+                quarantine_rule: quarantine_rule.clone(),
             },
         );
         inner.account_insert(scope, tx_size);
@@ -1403,6 +1777,13 @@ impl Mempool {
                         inner.spends.remove(&input.previous_output);
                     }
                     inner.unbroadcast.remove(&txid);
+                    // Confirmed-anyway (D4): a transaction we declined to assist
+                    // got mined regardless. Process-lifetime evidence for
+                    // getquarantineinfo — filtering cannot prevent confirmation.
+                    if entry.scope.is_quarantined() {
+                        self.quarantine_confirmed
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                     confirmed.push(txid);
                 }
 
@@ -2130,6 +2511,7 @@ impl Mempool {
                 prev_scripthashes: Vec::new(),
                 source: TxSource::Rpc,
                 scope: QuarantineScope::acting(),
+                quarantine_rule: None,
             },
         );
     }
@@ -2161,6 +2543,7 @@ impl Mempool {
                 prev_scripthashes: Vec::new(),
                 source: TxSource::Rpc,
                 scope: QuarantineScope::acting(),
+                quarantine_rule: None,
             },
         );
         inner.unbroadcast.entry(txid).or_default();
@@ -2203,6 +2586,7 @@ impl Mempool {
                 prev_scripthashes: Vec::new(),
                 source: TxSource::Rpc,
                 scope,
+                quarantine_rule: None,
             },
         );
         inner.account_insert(scope, tx_size);
@@ -2234,6 +2618,7 @@ impl Mempool {
                 prev_scripthashes: Vec::new(),
                 source: TxSource::Rpc,
                 scope,
+                quarantine_rule: None,
             },
         );
         inner.account_insert(scope, tx_size);
@@ -2341,6 +2726,7 @@ mod tests {
                 prev_scripthashes: Vec::new(),
                 source: TxSource::Rpc,
                 scope: QuarantineScope::acting(),
+                quarantine_rule: None,
             },
         );
         inner.total_bytes = low_size;
@@ -2840,6 +3226,7 @@ mod tests {
                     prev_scripthashes: Vec::new(),
                     source: TxSource::Rpc,
                     scope: QuarantineScope::acting(),
+                    quarantine_rule: None,
                 },
             );
         }
@@ -2968,6 +3355,7 @@ mod tests {
                     prev_scripthashes: Vec::new(),
                     source: TxSource::Rpc,
                     scope: QuarantineScope::acting(),
+                    quarantine_rule: None,
                 },
             );
             for input in &child_tx.input {
@@ -2986,6 +3374,7 @@ mod tests {
                     prev_scripthashes: Vec::new(),
                     source: TxSource::Rpc,
                     scope: QuarantineScope::acting(),
+                    quarantine_rule: None,
                 },
             );
         }
@@ -3080,6 +3469,7 @@ mod tests {
                     prev_scripthashes: Vec::new(),
                     source: TxSource::Rpc,
                     scope: QuarantineScope::acting(),
+                    quarantine_rule: None,
                 },
             );
         }
@@ -3308,6 +3698,7 @@ mod tests {
                     prev_scripthashes: Vec::new(),
                     source: TxSource::Rpc,
                     scope,
+                    quarantine_rule: None,
                 },
             );
             inner.account_insert(scope, tx_size);
@@ -4185,5 +4576,95 @@ mod tests {
             0,
             "the quarantined child is not listed in spentby"
         );
+    }
+
+    // --- PR 7b: observability data model (rule attribution, confirmed-anyway) ---
+
+    #[test]
+    fn reapply_stamps_quarantine_rule_name() {
+        // A re-placement pass must stamp the responsible rule name onto the
+        // entry so listquarantine / getquarantineentry can attribute it.
+        let op = outpoint(0xd4);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin(100_000))]);
+        let tx = spend(op, 99_000, 0x33);
+        let txid = mp
+            .accept_transaction(tx, &cs, &NoopVerifier, TxSource::P2p, false)
+            .expect("admitted to acting");
+
+        set_ruleset(&mp, "version 1\nquarantine catch when tx.version == 2");
+        mp.reapply_policy(&cs);
+
+        let entry = mp.get_quarantine_entry(&txid).expect("now quarantined");
+        assert_eq!(entry.rule, "catch");
+        let list = mp.list_quarantine(Some("catch"), 0, 0);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].txid, txid);
+        // A filter on a different rule yields nothing.
+        assert!(mp.list_quarantine(Some("other"), 0, 0).is_empty());
+
+        // Deep-review regression: a reload that RENAMES the matching rule but
+        // keeps its scope must re-stamp the attributed rule (placement is
+        // unchanged, so the byte-accounting move is correctly skipped).
+        set_ruleset(&mp, "version 1\nquarantine renamed when tx.version == 2");
+        let t = mp.reapply_policy(&cs);
+        assert!(t.promoted.is_empty() && t.demoted.is_empty(), "scope unchanged ⇒ no move");
+        assert_eq!(
+            mp.get_quarantine_entry(&txid).expect("still quarantined").rule,
+            "renamed",
+            "rename with same scope must update the attributed rule"
+        );
+        assert!(mp.list_quarantine(Some("catch"), 0, 0).is_empty());
+        assert_eq!(mp.list_quarantine(Some("renamed"), 0, 0).len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirmed_anyway_counts_quarantined_tx_when_mined() {
+        let mp = Mempool::new(300_000_000, 1_000);
+        // A held (quarantined) tx, then the same tx appears in a block.
+        let tx = spend(outpoint(0xe5), 40_000, 0x44);
+        let txid = mp.insert_tx_scoped_for_test(tx.clone(), RELAY_TEMPLATE);
+        assert_eq!(mp.quarantine_confirmed_count(), 0);
+
+        let mut block = bitcoin::constants::genesis_block(bitcoin::Network::Regtest);
+        block.txdata.push(tx);
+        mp.remove_for_block(&block, 101);
+
+        assert!(mp.get(&txid).is_none(), "mined tx left the pool");
+        assert_eq!(
+            mp.quarantine_confirmed_count(),
+            1,
+            "a quarantined tx that got mined is counted as confirmed-anyway"
+        );
+
+        // An acting tx mined does NOT bump the confirmed-anyway counter.
+        let tx2 = spend(outpoint(0xe6), 40_000, 0x45);
+        mp.insert_tx_scoped_for_test(tx2.clone(), QuarantineScope::acting());
+        let mut block2 = bitcoin::constants::genesis_block(bitcoin::Network::Regtest);
+        block2.txdata.push(tx2);
+        mp.remove_for_block(&block2, 102);
+        assert_eq!(mp.quarantine_confirmed_count(), 1, "acting confirmation is not counted");
+    }
+
+    #[test]
+    fn policy_stats_reset_on_swap() {
+        // Counters accumulate at the admission eval point and reset on reload.
+        let op = outpoint(0xf7);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin(100_000))]);
+        set_ruleset(&mp, "version 1\nquarantine catch when tx.version == 2");
+        let tx = spend(op, 99_000, 0x55);
+        mp.accept_transaction(tx, &cs, &NoopVerifier, TxSource::P2p, false)
+            .expect("admitted (into quarantine)");
+
+        let s = mp.policy_stats_snapshot();
+        assert_eq!(s.evaluations, 1);
+        assert_eq!(s.per_rule.get("catch").copied(), Some(1));
+
+        // Swapping the ruleset resets the counters.
+        set_ruleset(&mp, "version 1\nquarantine other when tx.version == 2");
+        let s = mp.policy_stats_snapshot();
+        assert_eq!(s.evaluations, 0);
+        assert!(s.per_rule.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
