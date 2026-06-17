@@ -11,6 +11,12 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
 
 ## [Unreleased]
 
+- **Streaming API: `streamprevoutmeta` mempool prevout retention (default
+  `amount`).** New mempool-policy key tuning how much spent-prevout metadata the
+  streaming watch matcher retains per mempool input (`hash` | `amount` | `full`)
+  — the foundation for mempool-input `min_value` filtering and chainstate-less
+  prefix-spend confirmation. SIGHUP-reloadable.
+  See the [release notes](docs/release-notes/0.4.0-pre.md).
 - **`getrawmempool` verbose no longer O(N²).** Verbose mempool views
   (`getrawmempool true`, `getmempooldescendants`, `getmempoolentry`) computed
   each transaction's ancestor/descendant rollups by scanning the whole mempool
