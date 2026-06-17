@@ -150,7 +150,9 @@ enum Cmd {
     /// Validate a transaction-policy file offline: parse, typecheck, and report
     /// per-rule cost against the static budget. Never contacts a node, so a
     /// ruleset can be checked before any node loads it. Exit code: 0 loads, 1
-    /// load error (with a caret diagnostic), 2 file unreadable.
+    /// load error (with a caret diagnostic), 2 file unreadable, 3 a rule
+    /// withholds relay for Lightning enforcement traffic (see
+    /// --allow-dangerous-filters).
     Policylint {
         /// Path to the policy file.
         file: PathBuf,
@@ -162,6 +164,11 @@ enum Cmd {
         /// exit code regardless).
         #[arg(long)]
         no_advisories: bool,
+        /// Accept rules that would withhold relay for Lightning enforcement
+        /// transactions. Without this, such a rule makes `policylint` exit 3 (the
+        /// same strict-by-default gate the node applies at load).
+        #[arg(long)]
+        allow_dangerous_filters: bool,
     },
     /// Bitcoin-Core-compatible raw RPC passthrough. Captures unknown
     /// subcommands so `sat-cli getblockchaininfo` still works.
@@ -590,9 +597,15 @@ async fn main() {
         file,
         explain,
         no_advisories,
+        allow_dangerous_filters,
     } = &cli.command
     {
-        std::process::exit(policylint::run(file, *explain, *no_advisories));
+        std::process::exit(policylint::run(
+            file,
+            *explain,
+            *no_advisories,
+            *allow_dangerous_filters,
+        ));
     }
 
     // `signpsbtwithkey` signs locally and makes no RPC call — handle it before

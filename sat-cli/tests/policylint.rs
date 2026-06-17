@@ -70,7 +70,10 @@ fn unreadable_file_exits_two() {
 
 #[test]
 fn advisory_fires_by_default_and_is_silenced_by_flag() {
-    // A p2a-referencing quarantine rule trips the L2-shape advisory.
+    // A p2a-referencing quarantine rule trips the L2-shape advisory. It also
+    // trips the semantic danger gate (p2a is an anchor-output enforcement shape),
+    // so pass --allow-dangerous-filters to keep this test focused on the advisory
+    // section rather than the exit code (the gate has its own tests below).
     let path = temp_policy(
         "adv",
         "version 1\nquarantine anchors when any outputs (out.script_type == p2a)\n",
@@ -79,6 +82,7 @@ fn advisory_fires_by_default_and_is_silenced_by_flag() {
     let default = Command::new(bin())
         .arg("policylint")
         .arg(&path)
+        .arg("--allow-dangerous-filters")
         .output()
         .unwrap();
     assert!(default.status.success());
@@ -89,6 +93,7 @@ fn advisory_fires_by_default_and_is_silenced_by_flag() {
     let quiet = Command::new(bin())
         .arg("policylint")
         .arg(&path)
+        .arg("--allow-dangerous-filters")
         .arg("--no-advisories")
         .output()
         .unwrap();
@@ -97,6 +102,84 @@ fn advisory_fires_by_default_and_is_silenced_by_flag() {
     let q = String::from_utf8_lossy(&quiet.stdout);
     assert!(!q.contains("ADVISORIES"), "advisory should be silenced: {q}");
 
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn relay_dangerous_rule_exits_three_unless_allowed() {
+    // A bare (relay+template) quarantine matching an LN enforcement shape is
+    // refused by default with exit 3.
+    let path = temp_policy(
+        "danger",
+        "version 1\nquarantine csv when any inputs (in.leaf_script.count_op(OP_CHECKSEQUENCEVERIFY) > 0)\n",
+    );
+
+    let strict = Command::new(bin())
+        .arg("policylint")
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert_eq!(
+        strict.status.code(),
+        Some(3),
+        "stderr: {}",
+        String::from_utf8_lossy(&strict.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&strict.stderr).contains("WITHHOLD RELAY"),
+        "{}",
+        String::from_utf8_lossy(&strict.stderr)
+    );
+
+    let allowed = Command::new(bin())
+        .arg("policylint")
+        .arg(&path)
+        .arg("--allow-dangerous-filters")
+        .output()
+        .unwrap();
+    assert!(allowed.status.success(), "override must exit 0");
+
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn template_only_dangerous_rule_warns_but_exits_zero() {
+    // The same enforcement-matching rule scoped `on template` still relays, so it
+    // warns but does not fail (E1 is about relay homogeneity).
+    let path = temp_policy(
+        "tmpl",
+        "version 1\nquarantine csv on template when any inputs (in.leaf_script.count_op(OP_CHECKSEQUENCEVERIFY) > 0)\n",
+    );
+    let out = Command::new(bin())
+        .arg("policylint")
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("LIGHTNING-ENFORCEMENT DANGER"),
+        "expected the danger section to still report the template-only match"
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn safe_ruleset_reports_no_danger() {
+    let path = temp_policy(
+        "safe",
+        "version 1\nquarantine cheap when tx.fee_rate < 1000\n",
+    );
+    let out = Command::new(bin())
+        .arg("policylint")
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("No Lightning-enforcement danger findings."),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
     std::fs::remove_file(&path).ok();
 }
 
