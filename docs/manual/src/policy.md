@@ -8,6 +8,11 @@ node will *accept* as valid.
 > **The one sentence to internalize first:**
 > *Filtering cannot prevent confirmation; it can only decline to assist it.*
 
+> This chapter is intended for operators. For the internal **design and rationale** —
+> the architecture, the quarantine data model, the invariants, the cost/fuel
+> system, and the reasoning behind the quarantine-only stance — see
+> [`satd-policy/DESIGN.md`](https://github.com/epochbtc/satd/blob/master/satd-policy/DESIGN.md).
+
 A transaction shape with real economic demand will confirm via other relay paths
 or direct miner submission regardless of your policy. What policy gives you is a
 local, reversible, fully-observable way to decline to *help* — and the
@@ -167,7 +172,7 @@ The standard surfaces and the metrics page are **byte-identical** whether or not
 the quarantine class is occupied (verified by differential tests): a node with no
 policy is indistinguishable from the same node before this feature existed.
 
-## Node-local consequences (stated plainly, not hidden)
+## Node-local consequences
 
 Quarantine-only filtering repairs most of the collateral damage filtering does to
 your own node, but not all of it:
@@ -189,7 +194,7 @@ your own node, but not all of it:
   `allowquarantined=true` on the submit call to override and hold it anyway;
   `getquarantineentry` is then authoritative for it.
 
-## Network-scale effects (published verbatim, not hidden)
+## Network-scale effects
 
 At the consensus layer, this changes nothing: a filtering supermajority of nodes
 and miners still cannot orphan a block containing a filtered transaction — any
@@ -217,7 +222,7 @@ case against wide filtering alongside the tool:
   miner endpoints — weaker censorship resistance where it actually binds, worse
   submission privacy, a moat for large miners.
 
-**Honest caveat on the quarantine model:** from *peers'* perspective, a
+**Caveat on the quarantine model:** from *peers'* perspective, a
 quarantining node and a hard-rejecting node are indistinguishable — neither
 propagates the transaction — so E1–E3 are **not** softened by the quarantine-only
 design. What quarantine changes is the *local* picture: collateral damage to your
