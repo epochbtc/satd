@@ -1,4 +1,4 @@
-use bitcoin::{Block, OutPoint, Transaction, TxOut, Txid};
+use bitcoin::{Block, OutPoint, ScriptBuf, Transaction, TxOut, Txid};
 use parking_lot::{Mutex, RwLock};
 use rustc_hash::FxHashMap;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -80,6 +80,18 @@ pub struct MempoolEntry {
     /// (32 B/input), not full scripts: enough to match, bounded by mempool size.
     /// Empty for entries built outside admission (test fixtures, direct inserts).
     pub prev_scripthashes: Vec<Scripthash>,
+    /// Spent prevout values (satoshis), one per input in input order, parallel
+    /// to `prev_scripthashes`. Populated only when `streamprevoutmeta` is
+    /// `amount` or `full` (see [`PrevoutMetaLevel`]); empty otherwise. Enables a
+    /// mempool-input `min_value` floor on spend-side script matches. +8 B/input
+    /// when retained.
+    pub prev_amounts: Vec<u64>,
+    /// Spent prevout `scriptPubKey`s, one per input in input order, parallel to
+    /// `prev_scripthashes`. Populated only when `streamprevoutmeta` is `full`;
+    /// empty otherwise. Lets a chainstate-less client confirm a mempool prefix
+    /// spend without resolving the outpoint. Variable size + one heap
+    /// allocation/input when retained.
+    pub prev_scripts: Vec<ScriptBuf>,
 }
 
 /// Statistics about the mempool.
@@ -119,6 +131,68 @@ struct MempoolInner {
     unbroadcast: HashMap<Txid, HashSet<std::net::IpAddr>>,
 }
 
+/// How much per-input prevout metadata the mempool retains at admission for the
+/// streaming watch matcher's **mempool spend-side** path. The prevout
+/// `scriptPubKey` is never carried by the spending input itself, so whatever the
+/// matcher needs must be captured here — `prev_outputs` is resolved for
+/// validation and then dropped, so admission is the one chance to keep it.
+///
+/// The scripthash is always retained (it is what exact-script and prefix-bucket
+/// matching key on); this level governs only the *additional* per-input data:
+///
+/// - [`Hash`](PrevoutMetaLevel::Hash): scripthash only (32 B/input). Sufficient
+///   for any consumer that resolves outpoints against its own UTXO set.
+/// - [`Amount`](PrevoutMetaLevel::Amount): adds the prevout value (+8 B/input),
+///   enabling a mempool-input `min_value` floor on exact-script watches.
+/// - [`Full`](PrevoutMetaLevel::Full): adds the full prevout `scriptPubKey`
+///   (variable, one heap allocation/input), letting a chainstate-less client
+///   confirm a mempool prefix-bucket spend without resolving any outpoint.
+///
+/// Retention is paid at admission for every entry regardless of subscribers, so
+/// the default is the cheapest tier that makes the headline `min_value` filter
+/// work out of the box.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PrevoutMetaLevel {
+    /// Scripthash only — byte-identical to the pre-feature behavior.
+    Hash,
+    /// Scripthash + prevout value (default).
+    #[default]
+    Amount,
+    /// Scripthash + prevout value + full prevout `scriptPubKey`.
+    Full,
+}
+
+impl PrevoutMetaLevel {
+    /// Parse the `streamprevoutmeta` config value. Case-insensitive.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "hash" => Some(Self::Hash),
+            "amount" => Some(Self::Amount),
+            "full" => Some(Self::Full),
+            _ => None,
+        }
+    }
+
+    /// Config-string form (round-trips with [`parse`](PrevoutMetaLevel::parse)).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Hash => "hash",
+            Self::Amount => "amount",
+            Self::Full => "full",
+        }
+    }
+
+    /// Whether this level retains prevout values.
+    fn retains_amount(self) -> bool {
+        matches!(self, Self::Amount | Self::Full)
+    }
+
+    /// Whether this level retains full prevout scripts.
+    fn retains_script(self) -> bool {
+        matches!(self, Self::Full)
+    }
+}
+
 /// Configurable mempool policy. All fields map to Bitcoin Core-compatible
 /// config flags, with the same defaults (or more permissive where noted).
 #[derive(Debug, Clone)]
@@ -138,6 +212,10 @@ pub struct MempoolConfig {
     /// output scripts) and admit any consensus-valid transaction. Consensus
     /// rules are never relaxed. Default false (standard relay), matching Core.
     pub accept_non_std_txn: bool,
+    /// How much per-input prevout metadata to retain at admission for the
+    /// streaming watch matcher (`streamprevoutmeta`). See [`PrevoutMetaLevel`].
+    /// Not a Core flag — a satd streaming knob. Default [`PrevoutMetaLevel::Amount`].
+    pub prevout_meta: PrevoutMetaLevel,
 }
 
 impl Default for MempoolConfig {
@@ -154,6 +232,7 @@ impl Default for MempoolConfig {
             expiry_secs: policy::MEMPOOL_EXPIRY_SECS,
             permit_bare_multisig: true,
             accept_non_std_txn: false,
+            prevout_meta: PrevoutMetaLevel::default(),
         }
     }
 }
@@ -558,15 +637,30 @@ impl Mempool {
             .collect();
         let sigop_cost = tx.total_sigop_cost(|op| prev_outputs_map.get(op).cloned()) as u64;
 
-        // Retain the spent prevout scripthashes (input order) for mempool
+        // Retain the spent prevout metadata (input order) for mempool
         // spend-side matching (exact script + prefix bucket). `prev_outputs` is
-        // fully resolved above and dropped after this; hashing it now is the one
-        // chance to keep the data without re-resolving prevouts in the
-        // (decoupled) matcher.
+        // fully resolved above and dropped after this; capturing it now is the
+        // one chance to keep the data without re-resolving prevouts in the
+        // (decoupled) matcher. The scripthash is always kept; value and full
+        // script are gated by `streamprevoutmeta` (see `PrevoutMetaLevel`) so
+        // operators pay only for the matcher capabilities they want.
         let prev_scripthashes: Vec<Scripthash> = prev_outputs
             .iter()
             .map(|o| scripthash_of(&o.script_pubkey))
             .collect();
+        let prev_amounts: Vec<u64> = if cfg.prevout_meta.retains_amount() {
+            prev_outputs.iter().map(|o| o.value.to_sat()).collect()
+        } else {
+            Vec::new()
+        };
+        let prev_scripts: Vec<ScriptBuf> = if cfg.prevout_meta.retains_script() {
+            prev_outputs
+                .iter()
+                .map(|o| o.script_pubkey.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         let entry_weight_u64 = weight as u64;
         let vsize_u64 = policy::weight_to_vsize(entry_weight_u64);
@@ -581,6 +675,8 @@ impl Mempool {
                 fee_delta: 0,
                 sigop_cost,
                 prev_scripthashes,
+                prev_amounts,
+                prev_scripts,
             },
         );
         inner.total_bytes += tx_size;
@@ -1257,6 +1353,8 @@ impl Mempool {
                 fee_delta: 0,
                 sigop_cost: 0,
                 prev_scripthashes: Vec::new(),
+                prev_amounts: Vec::new(),
+                prev_scripts: Vec::new(),
             },
         );
     }
@@ -1286,6 +1384,8 @@ impl Mempool {
                 fee_delta: 0,
                 sigop_cost: 0,
                 prev_scripthashes: Vec::new(),
+                prev_amounts: Vec::new(),
+                prev_scripts: Vec::new(),
             },
         );
         inner.unbroadcast.entry(txid).or_default();
@@ -1391,6 +1491,8 @@ mod tests {
                 fee_delta: 0,
                 sigop_cost: 0,
                 prev_scripthashes: Vec::new(),
+                prev_amounts: Vec::new(),
+                prev_scripts: Vec::new(),
             },
         );
         inner.total_bytes = low_size;
@@ -1512,6 +1614,51 @@ mod tests {
         assert_eq!(info.min_fee_rate, 5_000, "info() must read the reloaded policy");
         assert_eq!(info.max_size, 2_000_000);
         assert!(!info.full_rbf, "info() must reflect the reloaded full_rbf");
+    }
+
+    #[test]
+    fn prevout_meta_level_parse_roundtrip() {
+        for (s, lvl) in [
+            ("hash", PrevoutMetaLevel::Hash),
+            ("amount", PrevoutMetaLevel::Amount),
+            ("full", PrevoutMetaLevel::Full),
+        ] {
+            assert_eq!(PrevoutMetaLevel::parse(s), Some(lvl));
+            assert_eq!(lvl.as_str(), s);
+            assert_eq!(PrevoutMetaLevel::parse(lvl.as_str()), Some(lvl));
+        }
+        // Case-insensitive + whitespace-tolerant.
+        assert_eq!(
+            PrevoutMetaLevel::parse("  FULL "),
+            Some(PrevoutMetaLevel::Full)
+        );
+        // Unknown values are rejected (caller decides the fallback).
+        assert_eq!(PrevoutMetaLevel::parse("script"), None);
+        assert_eq!(PrevoutMetaLevel::parse(""), None);
+    }
+
+    #[test]
+    fn prevout_meta_level_retention_gating() {
+        // Hash: neither amounts nor scripts.
+        assert!(!PrevoutMetaLevel::Hash.retains_amount());
+        assert!(!PrevoutMetaLevel::Hash.retains_script());
+        // Amount: amounts only.
+        assert!(PrevoutMetaLevel::Amount.retains_amount());
+        assert!(!PrevoutMetaLevel::Amount.retains_script());
+        // Full: both.
+        assert!(PrevoutMetaLevel::Full.retains_amount());
+        assert!(PrevoutMetaLevel::Full.retains_script());
+    }
+
+    #[test]
+    fn prevout_meta_default_is_amount() {
+        // The locked default: `amount` makes mempool-input min_value work out of
+        // the box at ~8 B/input. Changing this default is a deliberate decision.
+        assert_eq!(PrevoutMetaLevel::default(), PrevoutMetaLevel::Amount);
+        assert_eq!(
+            MempoolConfig::default().prevout_meta,
+            PrevoutMetaLevel::Amount
+        );
     }
 
     #[test]
@@ -1888,6 +2035,8 @@ mod tests {
                     fee_delta: 0,
                     sigop_cost: 0,
                     prev_scripthashes: Vec::new(),
+                    prev_amounts: Vec::new(),
+                    prev_scripts: Vec::new(),
                 },
             );
         }
@@ -2014,6 +2163,8 @@ mod tests {
                     fee_delta: 0,
                     sigop_cost: 0,
                     prev_scripthashes: Vec::new(),
+                    prev_amounts: Vec::new(),
+                    prev_scripts: Vec::new(),
                 },
             );
             for input in &child_tx.input {
@@ -2030,6 +2181,8 @@ mod tests {
                     fee_delta: 0,
                     sigop_cost: 0,
                     prev_scripthashes: Vec::new(),
+                    prev_amounts: Vec::new(),
+                    prev_scripts: Vec::new(),
                 },
             );
         }
@@ -2122,6 +2275,8 @@ mod tests {
                     fee_delta: 0,
                     sigop_cost: 0,
                     prev_scripthashes: Vec::new(),
+                    prev_amounts: Vec::new(),
+                    prev_scripts: Vec::new(),
                 },
             );
         }
@@ -2156,6 +2311,128 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mempool_entry_retains_prevout_meta_by_level() {
+        // The amount/script vectors are gated by `streamprevoutmeta`: hash keeps
+        // only the scripthash, amount adds the value, full adds the script.
+        // scripthashes are retained at every level. Exercises the real admission
+        // path via the same CPFP harness as the scripthash test.
+        use bitcoin::blockdata::locktime::absolute::LockTime;
+        use bitcoin::hashes::Hash;
+        use bitcoin::{Amount, ScriptBuf, Sequence, TxIn, TxOut, Witness, transaction};
+
+        let prevout_spk = {
+            let mut b = vec![0x00, 0x14];
+            b.extend_from_slice(&[0xab; 20]);
+            ScriptBuf::from(b)
+        };
+        const PREVOUT_VALUE: u64 = 10_000;
+
+        for level in [
+            PrevoutMetaLevel::Hash,
+            PrevoutMetaLevel::Amount,
+            PrevoutMetaLevel::Full,
+        ] {
+            let (cs, _mp, dir) = make_test_env();
+            let mp = Mempool::with_config(MempoolConfig {
+                max_size_bytes: 1_000_000,
+                min_fee_rate: 0,
+                prevout_meta: level,
+                ..Default::default()
+            });
+
+            let parent_tx = Transaction {
+                version: transaction::Version(2),
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint {
+                        txid: bitcoin::Txid::from_raw_hash(
+                            bitcoin::hashes::sha256d::Hash::from_byte_array([9u8; 32]),
+                        ),
+                        vout: 0,
+                    },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(PREVOUT_VALUE),
+                    script_pubkey: prevout_spk.clone(),
+                }],
+            };
+            let parent_txid = parent_tx.compute_txid();
+            {
+                let mut inner = mp.inner.write();
+                inner.entries.insert(
+                    parent_txid,
+                    MempoolEntry {
+                        tx: parent_tx,
+                        fee: 0,
+                        weight: 400,
+                        fee_rate: 0,
+                        time: 0,
+                        fee_delta: 0,
+                        sigop_cost: 0,
+                        prev_scripthashes: Vec::new(),
+                        prev_amounts: Vec::new(),
+                        prev_scripts: Vec::new(),
+                    },
+                );
+            }
+
+            let child_tx = Transaction {
+                version: transaction::Version(2),
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint {
+                        txid: parent_txid,
+                        vout: 0,
+                    },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(9_000),
+                    script_pubkey: prevout_spk.clone(),
+                }],
+            };
+            let child_txid = child_tx.compute_txid();
+            mp.accept_transaction(child_tx, &cs, &NoopVerifier)
+                .expect("child admits via CPFP");
+            let entry = mp.get(&child_txid).expect("child in mempool");
+
+            // Scripthash is always retained.
+            assert_eq!(
+                entry.prev_scripthashes,
+                vec![scripthash_of(&prevout_spk)],
+                "{level:?}: scripthash always retained"
+            );
+            // Amounts: present iff amount/full.
+            if level.retains_amount() {
+                assert_eq!(
+                    entry.prev_amounts,
+                    vec![PREVOUT_VALUE],
+                    "{level:?}: prevout value retained"
+                );
+            } else {
+                assert!(entry.prev_amounts.is_empty(), "{level:?}: no amounts");
+            }
+            // Scripts: present iff full.
+            if level.retains_script() {
+                assert_eq!(
+                    entry.prev_scripts,
+                    vec![prevout_spk.clone()],
+                    "{level:?}: full prevout script retained"
+                );
+            } else {
+                assert!(entry.prev_scripts.is_empty(), "{level:?}: no scripts");
+            }
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     fn dummy_txid(byte: u8) -> Txid {
@@ -2279,6 +2556,8 @@ mod tests {
                 fee_delta: 0,
                 sigop_cost: 0,
                 prev_scripthashes: Vec::new(),
+                prev_amounts: Vec::new(),
+                prev_scripts: Vec::new(),
             },
         );
         txid

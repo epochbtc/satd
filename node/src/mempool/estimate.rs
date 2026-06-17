@@ -769,6 +769,8 @@ mod tests {
             fee_delta: 0,
             sigop_cost,
             prev_scripthashes: Vec::new(),
+            prev_amounts: Vec::new(),
+            prev_scripts: Vec::new(),
         }
     }
 

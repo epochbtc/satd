@@ -602,6 +602,29 @@ exhaustion, mirroring the rest of the node's admission controls. All are
 Admission shedding runs ahead of authentication and request-body buffering, so a
 connection flood — authenticated or not — is bounded before it does work.
 
+### 12.1 Mempool spend-side prevout retention
+
+The matcher's **mempool** spend-side path (§7.2, §7.5) needs prevout data the
+spending input does not carry. Whatever it needs must be captured at admission —
+`prev_outputs` is resolved for validation and then dropped, so there is no
+off-hot-path way to recover it later. `streamprevoutmeta` tunes how much is kept
+per mempool input, trading memory for matcher capability:
+
+| Value | Per-input cost | Enables |
+|---|---|---|
+| `hash` | scripthash only (32 B) | exact-script + prefix **bucket** matching; client resolves outpoints itself |
+| `amount` *(default)* | + prevout value (8 B) | a mempool-input `min_value` floor on spend-side script matches |
+| `full` | + full prevout `scriptPubKey` (variable, one heap allocation) | a chainstate-less client confirming a mempool prefix spend without resolving any outpoint |
+
+Retention is paid for **every** mempool entry regardless of subscribers (it
+happens at admission), so the default is the cheapest tier that makes `min_value`
+work out of the box; `full` is opt-in because it both costs the most and widens
+the data the node holds in memory. Unlike the §12 caps this is a live-reloadable
+mempool-policy key (SIGHUP): a change governs subsequent admissions, while entries
+already pooled keep whatever they were admitted with (mempool matching is
+best-effort by contract, §6.2). The confirmed-block spend side is unaffected — it
+always recovers full script and value from undo data (§7.2).
+
 ## 13. Open questions
 
 These are genuine open design points, deferred until a real consumer's feedback can
