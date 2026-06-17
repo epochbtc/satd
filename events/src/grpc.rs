@@ -828,17 +828,25 @@ fn apply_control(
                         parse_scripthash(b).map(|sh| (sh, a.min_values.get(i).copied().unwrap_or(0)))
                     })
                     .collect();
+                // Apply the parsed floors to a set of scripthashes. Used for
+                // both net-new scripts and re-asserted ones: `add_scripthashes_with_floors`
+                // bumps the registry refcount only for genuinely new entries and
+                // otherwise just updates the floor in place, so re-asserting a
+                // held script to change its `min_value` is honored without
+                // double-counting the watch.
+                let apply_floors = |shs: &[[u8; 32]]| {
+                    let items: Vec<([u8; 32], u64)> = shs
+                        .iter()
+                        .map(|sh| (*sh, floors.get(sh).copied().unwrap_or(0)))
+                        .collect();
+                    handle.add_scripthashes_with_floors(&items);
+                };
                 watch_set.add_scripts(
                     principal,
                     a.scripthashes.iter().filter_map(|b| parse_scripthash(b)),
                     "scripts",
-                    |shs| {
-                        let items: Vec<([u8; 32], u64)> = shs
-                            .iter()
-                            .map(|sh| (*sh, floors.get(sh).copied().unwrap_or(0)))
-                            .collect();
-                        handle.add_scripthashes_with_floors(&items);
-                    },
+                    apply_floors,
+                    apply_floors,
                 );
             }
         }
@@ -911,6 +919,10 @@ fn apply_control(
                         |shs| {
                             handle.add_scripthashes(shs);
                         },
+                        // Descriptor-derived scripts carry no `min_value` floor,
+                        // so a re-asserted (window-overlap) script needs no
+                        // metadata refresh.
+                        |_| {},
                     );
                 }
                 Err(e) => {

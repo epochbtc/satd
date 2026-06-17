@@ -828,17 +828,23 @@ fn apply_ws_control(
                             .map(|sh| (sh, min_values.get(i).copied().unwrap_or(0)))
                     })
                     .collect();
+                // Apply the parsed floors to a set of scripthashes — used for
+                // both net-new and re-asserted scripts (see the gRPC handler for
+                // the rationale: re-asserting a held script updates its floor in
+                // place without re-charging the watch).
+                let apply_floors = |shs: &[[u8; 32]]| {
+                    let items: Vec<([u8; 32], u64)> = shs
+                        .iter()
+                        .map(|sh| (*sh, floors.get(sh).copied().unwrap_or(0)))
+                        .collect();
+                    handle.add_scripthashes_with_floors(&items);
+                };
                 watch_set.add_scripts(
                     principal,
                     scripthashes.iter().filter_map(|s| parse_ws_scripthash(s)),
                     "scripts",
-                    |shs| {
-                        let items: Vec<([u8; 32], u64)> = shs
-                            .iter()
-                            .map(|sh| (*sh, floors.get(sh).copied().unwrap_or(0)))
-                            .collect();
-                        handle.add_scripthashes_with_floors(&items);
-                    },
+                    apply_floors,
+                    apply_floors,
                 );
             }
         }
@@ -905,6 +911,8 @@ fn apply_ws_control(
                     |shs| {
                         handle.add_scripthashes(shs);
                     },
+                    // Descriptor scripts have no floor — no metadata to refresh.
+                    |_| {},
                 );
             }
             Err(e) => {
