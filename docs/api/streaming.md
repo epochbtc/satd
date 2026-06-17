@@ -310,11 +310,16 @@ value of the coin the script controls in that match:
 - **Spending** (`is_output = false`): the **spent prevout's** value — the input
   carries no value, so it is recovered the same way the prevout `scriptPubKey` is.
   For a **confirmed** block that is the undo data (`spent_coins[i].value`, free
-  alongside the script); for the **mempool** it requires the prevout value to be
-  retained at admission (`streamprevoutmeta ≥ amount`, §12.1) — the default. On a
-  node configured `streamprevoutmeta = hash` the mempool spend side has no value
-  to test, so an `AddScripts` carrying `min_values` is rejected rather than
-  delivering unfiltered unconfirmed spends.
+  alongside the script); for the **mempool** it is the prevout value retained at
+  admission (`streamprevoutmeta ≥ amount`, §12.1) — the default.
+
+On a node configured `streamprevoutmeta = hash` the mempool spend side has no
+value to test, so a floored script's **unconfirmed-spend** matches **fail closed**
+(suppressed) rather than being delivered unfiltered — a `min_value` watcher is
+never handed a possibly-dust unconfirmed spend it asked to be spared. The floor is
+still enforced normally on that script's funding and confirmed-block-input sides;
+only the mempool spend preview is withheld until the operator retains amounts.
+(Non-floored watches on the same node are unaffected.)
 
 The value itself never enters the wire event — the floor is purely a delivery
 filter. The floor on the **output** and **confirmed-input** sides costs nothing

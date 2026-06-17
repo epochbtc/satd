@@ -699,7 +699,19 @@ impl WatchRegistry {
     /// [`has_prefix_watchers`](Self::has_prefix_watchers): a no-op (and no
     /// serialization) unless some spend-side watch is live, so the per-input
     /// scripthash retention on every entry is harmless when unused.
-    pub fn scan_mempool_spent_scripts(&self, tx: &Transaction, prev_scripthashes: &[Scripthash]) {
+    /// `prev_amounts` is the spent prevout values (input order), retained on the
+    /// entry only when `streamprevoutmeta >= amount`; it may be empty (the
+    /// `hash` tier). It is consulted only for the exact-script `min_value` floor:
+    /// when a watched script carries a non-zero floor but the spent value is not
+    /// available here, the match is suppressed (fail-closed) rather than
+    /// delivered unfiltered — so a `min_value` watcher never receives a dust
+    /// unconfirmed spend it asked to be spared, regardless of the retention tier.
+    pub fn scan_mempool_spent_scripts(
+        &self,
+        tx: &Transaction,
+        prev_scripthashes: &[Scripthash],
+        prev_amounts: &[u64],
+    ) {
         if !self.has_script_watchers() && !self.has_prefix_watchers() {
             return;
         }
@@ -728,8 +740,14 @@ impl WatchRegistry {
                     confirmed: false,
                     height: None,
                 };
+                // Mempool-input `min_value`: gate on the spent prevout's value
+                // when retained (`streamprevoutmeta >= amount`). `None` (hash
+                // tier) fails closed for a floored script (see `floor_allows`).
+                let value = prev_amounts.get(vin).copied();
                 for sid in subs {
-                    deliver(&inner, *sid, &m);
+                    if floor_allows(&inner, *sid, sh, value) {
+                        deliver(&inner, *sid, &m);
+                    }
                 }
             }
             if scan_prefixes {
@@ -1291,16 +1309,25 @@ fn scan_block_spent_scripts(inner: &Inner, block: &Block, height: u32, undo: &Un
 }
 
 /// Whether a script match for subscriber `id` on scripthash `sh` clears that
-/// subscriber's `min_value` floor. A floored match below the threshold is
-/// dropped server-side, so the value never enters the wire event. Returns
-/// `true` when there is no floor (`0`), when the subscriber/script is absent
-/// (defensive — the caller only iterates subscribers indexed for `sh`), or when
-/// `value >= floor`.
-fn passes_floor(inner: &Inner, id: SubId, sh: &Scripthash, value: u64) -> bool {
+/// subscriber's `min_value` floor, given the matched value (the controlled
+/// coin's value: output value for funding, spent-prevout value for spending).
+///
+/// `value` is `None` when the value is unavailable — only on the **mempool**
+/// spend side under `streamprevoutmeta = hash`. In that case a *floored* script
+/// **fails closed** (no delivery): we cannot prove the spend clears the floor,
+/// so a `min_value` watcher is never handed a possibly-dust unconfirmed spend.
+/// A floor of `0` (or no floor / absent subscriber) always delivers.
+fn floor_allows(inner: &Inner, id: SubId, sh: &Scripthash, value: Option<u64>) -> bool {
     match inner.subs.get(&id).and_then(|s| s.scripthashes.get(sh)) {
-        Some(&floor) => value >= floor,
-        None => true,
+        None | Some(0) => true,
+        Some(&floor) => value.is_some_and(|v| v >= floor),
     }
+}
+
+/// Convenience for sites where the matched value is always known (output and
+/// confirmed-block-input sides). See [`floor_allows`].
+fn passes_floor(inner: &Inner, id: SubId, sh: &Scripthash, value: u64) -> bool {
+    floor_allows(inner, id, sh, Some(value))
 }
 
 /// Non-blocking delivery to one subscriber. A full channel means the client
@@ -1687,7 +1714,11 @@ pub async fn run_watch_matcher(
                         // prevout scripthashes retained on the entry; self-gates
                         // on has_script_watchers()/has_prefix_watchers() so it's
                         // free when no spend-side watch is live.
-                        registry.scan_mempool_spent_scripts(&entry.tx, &entry.prev_scripthashes);
+                        registry.scan_mempool_spent_scripts(
+                            &entry.tx,
+                            &entry.prev_scripthashes,
+                            &entry.prev_amounts,
+                        );
                     }
                 }
                 // Lifecycle: RBF replacement and policy eviction route to any
@@ -2969,7 +3000,7 @@ mod tests {
 
         let op = outpoint(0xaa, 3);
         let tx = spending_tx(op);
-        reg.scan_mempool_spent_scripts(&tx, &[sh]);
+        reg.scan_mempool_spent_scripts(&tx, &[sh], &[]);
 
         match rx.try_recv().expect("mempool spend-side prefix match") {
             WatchMatch::PrefixMatched(pm) => {
@@ -3000,7 +3031,7 @@ mod tests {
 
         // A spend whose prevout hashes into a different 16-bit bucket.
         let other = scripthash_of(&ScriptBuf::from(vec![0x53, 0x54, 0x55]));
-        reg.scan_mempool_spent_scripts(&spending_tx(outpoint(0xbb, 0)), &[other]);
+        reg.scan_mempool_spent_scripts(&spending_tx(outpoint(0xbb, 0)), &[other], &[]);
         assert!(rx.try_recv().is_err(), "prevout outside the bucket must not match");
     }
 
@@ -3018,6 +3049,7 @@ mod tests {
         reg.scan_mempool_spent_scripts(
             &spending_tx(outpoint(0xaa, 3)),
             &[scripthash_of(&spent_spk)],
+            &[],
         );
         assert!(rx.try_recv().is_err(), "no prefix watchers → no spend-side delivery");
     }
@@ -3044,7 +3076,7 @@ mod tests {
             output: vec![],
         };
         // Both inputs spend the same script → same bucket (input-aligned hashes).
-        reg.scan_mempool_spent_scripts(&tx, &[sh, sh]);
+        reg.scan_mempool_spent_scripts(&tx, &[sh, sh], &[]);
 
         match rx.try_recv().expect("one aggregated mempool spend match") {
             WatchMatch::PrefixMatched(pm) => {
@@ -3087,7 +3119,7 @@ mod tests {
             ],
             output: vec![],
         };
-        reg.scan_mempool_spent_scripts(&tx, &[sh_a, sh_b]);
+        reg.scan_mempool_spent_scripts(&tx, &[sh_a, sh_b], &[]);
 
         // Collect both events and map each bucket to the single outpoint it carries.
         let mut by_bucket: std::collections::HashMap<(u8, u32), Vec<OutPoint>> =
@@ -3117,7 +3149,7 @@ mod tests {
         assert!(reg.has_script_watchers());
 
         let op = outpoint(0xaa, 3);
-        reg.scan_mempool_spent_scripts(&spending_tx(op), &[sh]);
+        reg.scan_mempool_spent_scripts(&spending_tx(op), &[sh], &[]);
 
         match rx.try_recv().expect("mempool exact-script spend match") {
             WatchMatch::ScriptMatched {
@@ -3137,6 +3169,69 @@ mod tests {
             other => panic!("wrong match: {other:?}"),
         }
         assert!(rx.try_recv().is_err(), "exactly one spend match");
+    }
+
+    #[test]
+    fn min_value_floor_filters_mempool_input_spend() {
+        // Mempool spend-side min_value: gate on the spent prevout value passed
+        // alongside the scripthash (retained at admission under
+        // streamprevoutmeta >= amount). Below floor → suppressed; at/above →
+        // delivered.
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let spent_spk = ScriptBuf::from(vec![0x52]);
+        let sh = scripthash_of(&spent_spk);
+        assert_eq!(handle.add_scripthashes_with_floors(&[(sh, 1_000)]), 1);
+
+        let op = outpoint(0xaa, 3);
+        // Spent value 999 < floor → suppressed.
+        reg.scan_mempool_spent_scripts(&spending_tx(op), &[sh], &[999]);
+        assert!(rx.try_recv().is_err(), "999 < floor → suppressed");
+
+        // Spent value 1000 == floor → delivered.
+        reg.scan_mempool_spent_scripts(&spending_tx(op), &[sh], &[1_000]);
+        match rx.try_recv().expect("1000 >= floor → delivered") {
+            WatchMatch::ScriptMatched {
+                is_output,
+                confirmed,
+                ..
+            } => {
+                assert!(!is_output, "spend side");
+                assert!(!confirmed, "mempool");
+            }
+            other => panic!("wrong match: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn min_value_floor_fails_closed_when_amount_unavailable() {
+        // Under streamprevoutmeta=hash the entry retains no amounts, so the
+        // mempool spend side has no value to test. A *floored* script must fail
+        // closed (no delivery) — a min_value watcher is never handed a possibly
+        // dust unconfirmed spend. A *non-floored* watch still delivers.
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let spent_spk = ScriptBuf::from(vec![0x52]);
+        let sh = scripthash_of(&spent_spk);
+        assert_eq!(handle.add_scripthashes_with_floors(&[(sh, 1_000)]), 1);
+
+        // Empty amounts (hash tier) + a non-zero floor → fail closed.
+        reg.scan_mempool_spent_scripts(&spending_tx(outpoint(0xaa, 3)), &[sh], &[]);
+        assert!(
+            rx.try_recv().is_err(),
+            "floored script + no amount available → suppressed (fail-closed)"
+        );
+
+        // A second subscriber with no floor still gets the match.
+        let (handle2, mut rx2) = reg.register(WATCH_CHANNEL_CAPACITY);
+        assert_eq!(handle2.add_scripthashes(&[sh]), 1);
+        reg.scan_mempool_spent_scripts(&spending_tx(outpoint(0xaa, 3)), &[sh], &[]);
+        assert!(
+            matches!(rx2.try_recv(), Ok(WatchMatch::ScriptMatched { .. })),
+            "no-floor watcher delivers regardless of amount availability"
+        );
+        // ...and the floored one still doesn't.
+        assert!(rx.try_recv().is_err(), "floored watcher still suppressed");
     }
 
     #[test]
@@ -3163,7 +3258,7 @@ mod tests {
             output: vec![],
         };
         // prev_scripthashes aligned to inputs: only index 2 is the watched hash.
-        reg.scan_mempool_spent_scripts(&tx, &[other, other, watched]);
+        reg.scan_mempool_spent_scripts(&tx, &[other, other, watched], &[]);
 
         match rx.try_recv().expect("the matching input fires") {
             WatchMatch::ScriptMatched { scripthash, is_output, index, confirmed, .. } => {
@@ -3184,7 +3279,7 @@ mod tests {
         handle.add_scripthashes(&[scripthash_of(&ScriptBuf::from(vec![0x52]))]);
         // A spend of a different (unwatched) prevout script.
         let other = scripthash_of(&ScriptBuf::from(vec![0x53, 0x54]));
-        reg.scan_mempool_spent_scripts(&spending_tx(outpoint(0xbb, 0)), &[other]);
+        reg.scan_mempool_spent_scripts(&spending_tx(outpoint(0xbb, 0)), &[other], &[]);
         assert!(rx.try_recv().is_err(), "unwatched prevout script must not match");
     }
 
@@ -3200,6 +3295,7 @@ mod tests {
         reg.scan_mempool_spent_scripts(
             &spending_tx(outpoint(0xaa, 3)),
             &[scripthash_of(&ScriptBuf::from(vec![0x52]))],
+            &[],
         );
         assert!(rx.try_recv().is_err(), "no spend-side watcher → no spend-side delivery");
     }
@@ -3216,7 +3312,7 @@ mod tests {
         handle.add_scripthashes(&[sh]);
         handle.add_prefixes(&[bucket(&sh, 12)]);
 
-        reg.scan_mempool_spent_scripts(&spending_tx(outpoint(0xaa, 3)), &[sh]);
+        reg.scan_mempool_spent_scripts(&spending_tx(outpoint(0xaa, 3)), &[sh], &[]);
 
         let (mut exact, mut prefix) = (0, 0);
         while let Ok(m) = rx.try_recv() {
