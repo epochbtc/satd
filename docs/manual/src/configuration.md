@@ -11,7 +11,7 @@ configuration (`SIGHUP`) and TLS certificates (`SIGUSR1`).
 
 For the observability surfaces (TUI, Prometheus, structured logs) see
 [Observability & Metrics](observability.md); for the satd-specific developer
-APIs see [Integrator APIs](integrator-apis.md); for the two-runtime model and the
+APIs see [JSON-RPC Extensions](json-rpc-extensions.md); for the two-runtime model and the
 `--api-threads` / admission-control knobs that tune API throughput see
 [API Scaling & Runtimes](api-scaling.md). For the complete per-key index —
 every flag, its default, reload disposition, and whether it is Core-compatible or

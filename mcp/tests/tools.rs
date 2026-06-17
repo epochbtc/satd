@@ -55,6 +55,8 @@ fn make_test_ctx() -> (McpContext, tempfile::TempDir) {
         network: Network::Regtest,
         effective_config: serde_json::json!({"network": "regtest"}),
         mempool_history: None,
+        addr_enabled: false,
+        addr_subs: None,
     };
     (ctx, dir)
 }
@@ -608,6 +610,8 @@ mod mining {
             network: Network::Bitcoin,
             effective_config: serde_json::json!({"network": "bitcoin"}),
             mempool_history: None,
+            addr_enabled: false,
+            addr_subs: None,
         };
 
         let result = mine::generate_blocks(&ctx, 1, REGTEST_ADDR);
@@ -842,6 +846,38 @@ mod ergonomics {
         assert!(
             body.contains("satd_mempool_transactions"),
             "metrics body should include satd_mempool_transactions; got: {}",
+            body
+        );
+    }
+
+    #[test]
+    fn test_get_metrics_snapshot_reflects_addr_enabled() {
+        // Regression: the snapshot used to hardcode addr_enabled=false, so it
+        // always reported `satd_addrindex_enabled 0` regardless of the node's
+        // real config — diverging from the HTTP /metrics scrape. It must now
+        // mirror the context's live value.
+        let (mut ctx, _dir) = make_test_ctx();
+        ctx.addr_enabled = true;
+        let out = ergonomics::get_metrics_snapshot(&ctx);
+        let body = serde_json::from_str::<serde_json::Value>(&out).unwrap()["body"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            body.contains("satd_addrindex_enabled 1"),
+            "addr_enabled=true must render `satd_addrindex_enabled 1`; got: {}",
+            body
+        );
+
+        ctx.addr_enabled = false;
+        let out = ergonomics::get_metrics_snapshot(&ctx);
+        let body = serde_json::from_str::<serde_json::Value>(&out).unwrap()["body"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            body.contains("satd_addrindex_enabled 0"),
+            "addr_enabled=false must render `satd_addrindex_enabled 0`; got: {}",
             body
         );
     }

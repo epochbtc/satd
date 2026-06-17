@@ -27,6 +27,10 @@ bincode = { workspace = true }
 bitcoinconsensus = { workspace = true }
 tokio-socks = { workspace = true }
 lru = { workspace = true }
+# Fast, non-DoS-resistant hasher for the mempool's Txid/OutPoint-keyed maps.
+# Keys are already uniformly-distributed double-SHA256 hashes, so SipHash's
+# hash-flooding resistance buys nothing here while costing measurable CPU.
+rustc-hash = "2"
 crossbeam-channel = { workspace = true }
 async-trait = { workspace = true }
 uuid = { workspace = true }

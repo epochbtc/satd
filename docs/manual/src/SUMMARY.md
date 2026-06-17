@@ -11,7 +11,7 @@
 - [Disk Footprint & Indices](disk-footprint.md)
 - [API Scaling & Runtimes](api-scaling.md)
 - [Authentication & Authorization](authentication.md)
-- [Integrator APIs](integrator-apis.md)
+- [JSON-RPC Extensions](json-rpc-extensions.md)
 - [Terminal UI (`sat-tui`)](tui.md)
 
 # Protocol Surfaces
@@ -20,7 +20,6 @@
 - [Electrum Protocol Server](electrum.md)
 - [Streaming Consumption API](streaming.md)
 - [MCP Server](mcp.md)
-- [Native Protocol Architecture](native-protocol-surfaces.md)
 
 # Packaging & Deployment
 
