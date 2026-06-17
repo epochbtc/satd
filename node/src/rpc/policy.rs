@@ -26,10 +26,14 @@ pub fn get_policy_info(mempool: &Mempool) -> Value {
         });
     };
 
+    // Snapshot the live ruleset once so the per-rule list and the danger
+    // findings below are derived from the same ruleset version.
+    let snapshot = mempool.policy_snapshot();
+
     // Per-rule list from the live ruleset (name / action / scope / auto-named)
     // joined with the match counters since load.
     let mut rules: Vec<Value> = Vec::new();
-    if let Some(rs) = mempool.policy_snapshot() {
+    if let Some(rs) = &snapshot {
         for r in rs.rules() {
             let matched = stats.per_rule.get(&r.name).copied().unwrap_or(0);
             let action = match r.action {
@@ -53,13 +57,17 @@ pub fn get_policy_info(mempool: &Mempool) -> Value {
     }
 
     // Lightning-enforcement danger findings for the live ruleset (§2.5). A
-    // loaded ruleset only reaches here if it passed the load gate, so any
-    // relay-withholding findings present imply `allowdangerousfilters` is set.
+    // loaded ruleset only reaches here if it passed the load gate, so under
+    // steady state any relay-withholding findings imply `allowdangerousfilters`
+    // is set. The flag and the ruleset are read under separate locks, so a
+    // reload racing this call can momentarily report `allow_dangerous_filters:
+    // false` alongside relay-withholding findings (or vice versa); this is a
+    // display-only skew that self-heals on the next call.
     let allow_dangerous = mempool.policy().allow_dangerous_filters;
     let mut findings: Vec<Value> = Vec::new();
     let (mut relay_withholding, mut template_only) = (0u64, 0u64);
-    if let Some(rs) = mempool.policy_snapshot() {
-        for f in satd_policy::analyze_danger(&rs) {
+    if let Some(rs) = &snapshot {
+        for f in satd_policy::analyze_danger(rs) {
             if f.withholds_relay() {
                 relay_withholding += 1;
             } else {

@@ -4094,6 +4094,70 @@ mod tests {
     }
 
     #[test]
+    fn tightened_flag_ejects_live_dangerous_policy_and_promotes() {
+        // Deep-review (PR 410): exercise the FULL fail-safe eject sequence the
+        // SIGHUP handler runs in `apply_policyfile_reload` — recheck → clear →
+        // reapply → promote — not just `recheck_loaded_danger_gate` in isolation.
+        // A `tx.version == 2` rule is relay-withholding (every danger probe is
+        // version 2) AND matches a plain test spend, so it both trips the gate
+        // and actually quarantines a transaction we can watch get promoted.
+        let op = outpoint(0xb7);
+        let (cs, _discard, dir) = make_funded_env(&[(op, coin(100_000))]);
+        let cfg = MempoolConfig {
+            max_size_bytes: 1_000_000,
+            min_fee_rate: 0,
+            dust_relay_fee: 3_000,
+            allow_dangerous_filters: true,
+            ..Default::default()
+        };
+        let mp = Mempool::with_config(cfg.clone());
+
+        let (pdir, path) = write_policy("eject", "version 1\nquarantine catch when tx.version == 2\n");
+        mp.load_policy_file(&path)
+            .expect("dangerous policy loads with the flag on");
+        assert!(mp.has_policy());
+
+        // A matching tx is admitted into the quarantine (relay-withheld) class.
+        let tx = spend(op, 99_000, 0x22);
+        let txid = mp
+            .accept_transaction(tx, &cs, &NoopVerifier, TxSource::P2p, false)
+            .expect("admitted into quarantine");
+        assert!(
+            mp.inner.read().entries.get(&txid).unwrap().scope.is_quarantined(),
+            "tx is held under the dangerous policy"
+        );
+
+        // Tighten the flag (as the live! reload does) with the file unchanged.
+        mp.reload_policy(MempoolConfig {
+            allow_dangerous_filters: false,
+            ..cfg
+        });
+
+        // The unified post-reload recheck flags the now-disallowed live policy …
+        let err = mp
+            .recheck_loaded_danger_gate()
+            .expect_err("tightened flag ⇒ live dangerous policy is disallowed");
+        assert!(err.contains("withhold relay"), "{err}");
+
+        // … and the eject sequence drops the engine and promotes the held tx.
+        mp.clear_policy();
+        let t = mp.reapply_policy(&cs);
+        assert!(!mp.has_policy(), "dangerous policy ejected");
+        assert!(
+            t.promoted.contains(&txid),
+            "held tx promoted to acting on eject: {:?}",
+            t.promoted
+        );
+        assert!(
+            mp.inner.read().entries.get(&txid).unwrap().scope.is_acting(),
+            "tx is acting after the eject"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&pdir);
+    }
+
+    #[test]
     fn no_policy_is_byte_identical_to_engine_compiled_out() {
         // I8: with no ruleset (and with an *empty* ruleset, which the hot path
         // treats identically), a tx is admitted to the acting class and the
