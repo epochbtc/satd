@@ -755,6 +755,39 @@ impl Mempool {
         }
     }
 
+    /// Re-evaluate the danger gate against the *currently loaded* ruleset under
+    /// the current config — without the per-rule warning side effects of
+    /// [`Self::danger_gate`]. Used on SIGHUP to reconcile an already-loaded
+    /// policy with a tightened `allowdangerousfilters` even when the policy file
+    /// is unchanged: `reload_policy_file` short-circuits on an unchanged sha and
+    /// would otherwise skip the gate, leaving a relay-withholding policy live
+    /// while strict mode is reported as on. `Ok` when no policy is loaded, the
+    /// flag still permits it, or it has no relay-withholding enforcement match;
+    /// `Err` (naming the rules) when it is now disallowed and must be ejected.
+    pub fn recheck_loaded_danger_gate(&self) -> Result<(), String> {
+        let Some(rs) = self.policy.load_full() else {
+            return Ok(());
+        };
+        if rs.is_empty() || self.config.read().allow_dangerous_filters {
+            return Ok(());
+        }
+        let mut relay_rules: Vec<String> = Vec::new();
+        for f in satd_policy::analyze_danger(&rs) {
+            if f.withholds_relay() && !relay_rules.contains(&f.rule) {
+                relay_rules.push(f.rule);
+            }
+        }
+        if relay_rules.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "loaded policy has rule(s) [{}] that withhold relay for Lightning \
+                 enforcement transactions (E1) while allowdangerousfilters is off",
+                relay_rules.join(", ")
+            ))
+        }
+    }
+
     /// Build the [`PolicyMeta`] for a freshly-loaded ruleset (load-time fields +
     /// the node-side path/timestamp).
     fn build_policy_meta(
@@ -4021,6 +4054,43 @@ mod tests {
         assert_eq!(before.as_deref(), Some("cheap"));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recheck_flags_loaded_policy_when_flag_tightened() {
+        // Review round 1 (PR 410): tightening allowdangerousfilters true→false
+        // with an unchanged dangerous policy loaded must be detected so the SIGHUP
+        // handler can eject it — the sha-dedup would otherwise skip the gate.
+        let (dir, path) = write_policy("recheck", CSV_RULE);
+
+        // Loaded with the flag on: passes recheck.
+        let mp = Mempool::with_config(MempoolConfig {
+            allow_dangerous_filters: true,
+            ..Default::default()
+        });
+        mp.load_policy_file(&path).expect("loads with flag on");
+        assert!(mp.has_policy());
+        assert!(
+            mp.recheck_loaded_danger_gate().is_ok(),
+            "allowed ⇒ recheck passes"
+        );
+
+        // Tighten the flag (as the live! reload does) WITHOUT touching the file:
+        // recheck must now flag the still-loaded relay-withholding rule.
+        mp.reload_policy(MempoolConfig::default());
+        let err = mp
+            .recheck_loaded_danger_gate()
+            .expect_err("tightened flag ⇒ loaded dangerous policy is now disallowed");
+        assert!(err.contains("withhold relay"), "{err}");
+
+        // A safe policy never trips the recheck regardless of the flag.
+        let (sdir, safe) = write_policy("recheck-safe", "version 1\nquarantine cheap when tx.fee_rate < 1000\n");
+        let mp2 = Mempool::with_config(MempoolConfig::default());
+        mp2.load_policy_file(&safe).expect("safe loads");
+        assert!(mp2.recheck_loaded_danger_gate().is_ok());
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&sdir);
     }
 
     #[test]

@@ -278,7 +278,31 @@ fn apply_policyfile_reload(new: &Config, h: &ReloadHandles) {
     match &new.policyfile {
         Some(path) => match h.mempool.reload_policy_file(path) {
             Ok(PolicyReloadKind::Unchanged) => {
-                tracing::debug!(path = %path.display(), "policy file reloaded: no change");
+                // The file is unchanged, but `allowdangerousfilters` may have been
+                // tightened to strict in this same SIGHUP (its `live!` field is
+                // applied before this handler). The sha-dedup skipped the load
+                // gate, so reconcile the loaded policy with the current flag here:
+                // if a now-disallowed relay-withholding rule is live, eject the
+                // whole policy fail-safe (drop + promote), like a policyfile
+                // removal — strict mode must actually stop the withholding.
+                if let Err(e) = h.mempool.recheck_loaded_danger_gate() {
+                    tracing::error!(
+                        error = %e,
+                        path = %path.display(),
+                        "loaded policy now violates the danger gate \
+                         (allowdangerousfilters tightened) — dropping it"
+                    );
+                    h.mempool.clear_policy();
+                    let t = h.mempool.reapply_policy(&h.chain_state);
+                    let promoted = t.promoted.len();
+                    h.peer_manager.enqueue_promotions(t.promoted);
+                    tracing::info!(
+                        promoted,
+                        "dangerous policy dropped — quarantine promoted to acting"
+                    );
+                } else {
+                    tracing::debug!(path = %path.display(), "policy file reloaded: no change");
+                }
             }
             Ok(PolicyReloadKind::Changed(load)) => {
                 tracing::info!(
@@ -700,12 +724,12 @@ fn field_specs() -> Vec<FieldSpec> {
         live!("quarantinemempool", quarantinemempool, |c, h| {
             h.mempool.reload_policy(mempool_config_from(c))
         }),
-        // The danger-gate opt-out. Updating MempoolConfig governs the *next*
-        // policy (re)load: `apply_policyfile_reload` runs after this in the same
-        // SIGHUP, so flipping it on and re-touching `policyfile` loads a
-        // previously-refused ruleset. Tightening it (true→false) only re-gates
-        // when the policyfile content also changes (the sha-dedup skips an
-        // unchanged file) — to force a re-evaluation, re-touch the file.
+        // The danger-gate opt-out. Updating MempoolConfig governs the gate, which
+        // `apply_policyfile_reload` (running after this in the same SIGHUP) then
+        // applies: flipping it *on* loads a previously-refused ruleset, and
+        // flipping it *off* ejects a now-disallowed loaded policy even when the
+        // file is unchanged (the handler re-checks the loaded ruleset, so the
+        // sha-dedup can't strand a relay-withholding policy in strict mode).
         live!("allowdangerousfilters", allowdangerousfilters, |c, h| {
             h.mempool.reload_policy(mempool_config_from(c))
         }),
