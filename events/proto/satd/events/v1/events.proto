@@ -81,7 +81,13 @@ message AddDescriptor {
 message SetCursor      { Cursor cursor = 1; }
 message SetCategories  { uint32 categories = 1; }
 message Outpoint       { bytes txid = 1; uint32 vout = 2; }
-message AddScripts     { repeated bytes scripthashes = 1; }
+// min_values: optional per-scripthash `min_value` floor (satoshis), parallel to
+//   `scripthashes`. Empty = no floors (every match delivered). If non-empty it
+//   MUST have the same length as `scripthashes`; index i is the floor for
+//   scripthash i. A match is suppressed unless the matched value (output value
+//   for funding, spent-prevout value for spending) is >= the floor. Re-asserting
+//   a watched scripthash updates its floor.
+message AddScripts     { repeated bytes scripthashes = 1; repeated uint64 min_values = 2; }
 message RemoveScripts  { repeated bytes scripthashes = 1; }
 message AddOutpoints   { repeated Outpoint outpoints = 1; }
 message RemoveOutpoints{ repeated Outpoint outpoints = 1; }
@@ -110,12 +116,16 @@ message OutpointSpent {
   bool   confirmed     = 5; // false = seen in mempool, not yet in a block
 }
 
-// A watched script was paid by a transaction output (funding side).
+// A watched script was matched by a transaction, on either side:
+// funding (an output pays the script) or spending (an input spends an output
+// that paid the script). Both sides are emitted for blocks (the spend side
+// recovered from undo data) and the mempool (the spend side recovered from the
+// prevout scripthashes the entry retains at admission).
 message ScriptMatched {
   bytes  scripthash = 1;
   bytes  txid       = 2;
-  bool   is_output  = 3;    // true = funding; input-side is future work
-  uint32 index      = 4;    // vout for a funding match
+  bool   is_output  = 3;    // true = funding (output); false = spending (input)
+  uint32 index      = 4;    // vout if is_output, else vin
   bool   confirmed  = 5;
 }
 

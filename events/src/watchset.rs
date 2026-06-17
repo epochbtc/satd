@@ -140,19 +140,23 @@ impl WatchSet {
         incoming: impl IntoIterator<Item = OutPoint>,
         register: impl FnOnce(&[OutPoint]),
     ) {
-        add_items(&mut self.outpoints, principal, incoming, "outpoints", register);
+        add_items(&mut self.outpoints, principal, incoming, "outpoints", register, |_| {});
     }
 
     /// Add scripthashes (direct or descriptor-derived). `kind` only labels the
-    /// rejection log line.
+    /// rejection log line. `register` receives the net-new scripthashes (those
+    /// charged against the quota); `reassert` receives scripthashes already
+    /// watched, so the caller can refresh their per-item metadata (the
+    /// `min_value` floor) without re-charging quota.
     pub(crate) fn add_scripts(
         &mut self,
         principal: Option<&satd_auth::Principal>,
         incoming: impl IntoIterator<Item = Scripthash>,
         kind: &'static str,
         register: impl FnOnce(&[Scripthash]),
+        reassert: impl FnOnce(&[Scripthash]),
     ) {
-        add_items(&mut self.scripts, principal, incoming, kind, register);
+        add_items(&mut self.scripts, principal, incoming, kind, register, reassert);
     }
 
     /// Remove outpoints, releasing each removed item's quota unit (lease drop)
@@ -181,7 +185,7 @@ impl WatchSet {
         incoming: impl IntoIterator<Item = Txid>,
         register: impl FnOnce(&[Txid]),
     ) {
-        add_items(&mut self.txids, principal, incoming, "transactions", register);
+        add_items(&mut self.txids, principal, incoming, "transactions", register, |_| {});
     }
 
     /// Remove txids, releasing each removed item's quota unit.
@@ -201,7 +205,7 @@ impl WatchSet {
         incoming: impl IntoIterator<Item = (Txid, u32)>,
         register: impl FnOnce(&[(Txid, u32)]),
     ) {
-        add_items(&mut self.tx_depths, principal, incoming, "tx_depths", register);
+        add_items(&mut self.tx_depths, principal, incoming, "tx_depths", register, |_| {});
     }
 
     /// Remove depth alarms, releasing each removed pair's quota unit.
@@ -233,6 +237,7 @@ impl WatchSet {
             |k| costs.get(k).copied().unwrap_or(1),
             "prefixes",
             register,
+            |_| {},
         );
     }
 
@@ -263,9 +268,10 @@ fn add_items<T: Eq + Hash + Copy>(
     incoming: impl IntoIterator<Item = T>,
     kind: &'static str,
     register: impl FnOnce(&[T]),
+    reassert: impl FnOnce(&[T]),
 ) {
     // The common case: every item costs exactly one unit.
-    add_items_priced(held, principal, incoming, |_| 1, kind, register);
+    add_items_priced(held, principal, incoming, |_| 1, kind, register, reassert);
 }
 
 /// Generalization of [`add_items`] where each item carries its own quota cost
@@ -280,17 +286,37 @@ fn add_items_priced<T: Eq + Hash + Copy>(
     cost: impl Fn(&T) -> u64,
     kind: &'static str,
     register: impl FnOnce(&[T]),
+    reassert: impl FnOnce(&[T]),
 ) {
-    // Distinct items not already watched: dedups both within this message
-    // (`seen`) and against the live watch-set (`held`).
+    // Partition `incoming` into net-new items (not yet watched) and re-asserted
+    // items (already watched). Both are deduped within this message via `seen`.
     let mut seen = HashSet::new();
-    let net_new: Vec<T> = incoming
-        .into_iter()
-        .filter(|it| !held.contains_key(it) && seen.insert(*it))
-        .collect();
+    let mut net_new: Vec<T> = Vec::new();
+    let mut reasserted: Vec<T> = Vec::new();
+    for it in incoming {
+        if !seen.insert(it) {
+            continue; // intra-message duplicate
+        }
+        if held.contains_key(&it) {
+            reasserted.push(it);
+        } else {
+            net_new.push(it);
+        }
+    }
+
+    // Re-asserted items are already inside the quota, so refreshing their
+    // per-item metadata (e.g. a script's `min_value` floor) is free: it charges
+    // neither quota nor a rate token. This MUST happen even when there is no
+    // net-new item — a client re-asserting a held watch to change its floor is
+    // the whole point. (For item kinds with no mutable metadata the closure is
+    // a no-op.)
+    if !reasserted.is_empty() {
+        reassert(&reasserted);
+    }
+
     if net_new.is_empty() {
-        // Empty or fully-duplicate add (e.g. a client re-asserting a watch it
-        // already holds): a no-op — charges neither quota NOR a rate token.
+        // No new watches to charge — re-assert-only or empty add. The metadata
+        // refresh above (if any) has already run.
         return;
     }
 
@@ -442,6 +468,80 @@ mod tests {
         });
         assert_eq!(registered, vec![op(3, 0)], "only the net-new item registers");
         assert_eq!(q.current("tenant"), 3, "the re-asserted item is not double-charged");
+    }
+
+    fn sh(b: u8) -> Scripthash {
+        [b; 32]
+    }
+
+    #[test]
+    fn add_scripts_reasserts_held_scripts_for_metadata_refresh() {
+        // Regression: re-asserting an already-watched scripthash (e.g. to change
+        // its `min_value` floor) must surface that script to the caller via the
+        // `reassert` callback — WITHOUT charging quota or a rate token — even
+        // when the add contains no net-new item. Previously the net-new
+        // short-circuit dropped the whole add and the floor was never refreshed.
+        let (p, acct) = tenant(10);
+        let q = acct.quota();
+        let mut ws = WatchSet::default();
+
+        let mut net_new = Vec::new();
+        ws.add_scripts(Some(&p), [sh(1), sh(2)], "scripts", |s| net_new = s.to_vec(), |_| {});
+        assert_eq!(net_new, vec![sh(1), sh(2)], "first add registers both as net-new");
+        assert_eq!(q.current("tenant"), 2);
+
+        // Re-assert sh(1) (held) and add sh(3) (new) in one message: sh(1) must
+        // reach `reassert`, sh(3) must reach `register`, and only sh(3) is charged.
+        let mut net_new2 = Vec::new();
+        let mut reasserted = Vec::new();
+        ws.add_scripts(
+            Some(&p),
+            [sh(1), sh(3)],
+            "scripts",
+            |s| net_new2 = s.to_vec(),
+            |s| reasserted = s.to_vec(),
+        );
+        assert_eq!(net_new2, vec![sh(3)], "only the new script registers");
+        assert_eq!(reasserted, vec![sh(1)], "the held script is surfaced for refresh");
+        assert_eq!(q.current("tenant"), 3, "re-assert charges no extra quota");
+
+        // A re-assert-ONLY message (no net-new) must still fire `reassert`.
+        let mut net_new3 = false;
+        let mut reasserted3 = Vec::new();
+        ws.add_scripts(
+            Some(&p),
+            [sh(1), sh(2)],
+            "scripts",
+            |_| net_new3 = true,
+            |s| reasserted3 = s.to_vec(),
+        );
+        assert!(!net_new3, "no net-new registration on a re-assert-only add");
+        assert_eq!(reasserted3, vec![sh(1), sh(2)], "both held scripts are surfaced");
+        assert_eq!(q.current("tenant"), 3, "re-assert-only add charges nothing");
+    }
+
+    #[test]
+    fn add_scripts_reassert_does_not_burn_rate_token() {
+        use satd_auth::RatePolicy;
+        // burst = 1: the first (net-new) add spends the only token; a subsequent
+        // re-assert-only add must NOT be throttled (it spends no token) and must
+        // still fire `reassert`.
+        let acct: Arc<dyn Accounting> = Arc::new(LocalAccounting::new());
+        let p = Principal::token(
+            Arc::from("tenant"),
+            CapabilitySet::EMPTY.with(Capability::StreamWatch),
+            Some(100),
+            Some(RatePolicy { burst: 1, per_sec: 1 }),
+            acct.clone(),
+        );
+        let mut ws = WatchSet::default();
+
+        ws.add_scripts(Some(&p), [sh(1)], "scripts", |_| {}, |_| {});
+        // Bucket now empty. Re-assert sh(1): a net-new add here would be
+        // throttled, but a re-assert must bypass the rate limiter entirely.
+        let mut reasserted = Vec::new();
+        ws.add_scripts(Some(&p), [sh(1)], "scripts", |_| {}, |s| reasserted = s.to_vec());
+        assert_eq!(reasserted, vec![sh(1)], "re-assert fires even with an empty rate bucket");
     }
 
     #[test]

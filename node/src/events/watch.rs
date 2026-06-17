@@ -156,7 +156,13 @@ type DepthKey = (SubId, Txid, u32, DepthKind);
 struct Subscriber {
     sender: mpsc::Sender<WatchMatch>,
     outpoints: HashSet<OutPoint>,
-    scripthashes: HashSet<Scripthash>,
+    /// Watched scripthashes → per-script `min_value` floor (satoshis). A floor
+    /// of `0` means "deliver every match" (the common case). The floor is a
+    /// server-side delivery filter: an output/funding match is suppressed unless
+    /// the output value is `>= floor`; a spend match unless the spent prevout's
+    /// value is `>= floor` (symmetric). The value itself never enters the wire
+    /// event — the floor only gates delivery.
+    scripthashes: HashMap<Scripthash, u64>,
     /// Lifecycle watches (one per txid).
     txids: HashSet<Txid>,
     /// Depth-tracked entries: single-shot alarms and lifecycle auto-close
@@ -298,7 +304,7 @@ impl WatchRegistry {
             Subscriber {
                 sender: tx,
                 outpoints: HashSet::new(),
-                scripthashes: HashSet::new(),
+                scripthashes: HashMap::new(),
                 txids: HashSet::new(),
                 tx_depths: HashSet::new(),
                 prefixes: HashSet::new(),
@@ -331,16 +337,24 @@ impl WatchRegistry {
         added
     }
 
-    /// Add scripthashes to a subscriber's watch-set. Returns the number
-    /// newly added.
-    fn add_scripthashes(&self, id: SubId, scripthashes: &[Scripthash]) -> usize {
+    /// Add scripthashes to a subscriber's watch-set, each with a `min_value`
+    /// floor (satoshis; `0` = no floor). Returns the number *newly* added.
+    /// Re-asserting an already-watched scripthash updates its floor in place and
+    /// is not counted as new (dedup, matching the quota layer).
+    fn add_scripthashes(&self, id: SubId, items: &[(Scripthash, u64)]) -> usize {
         let mut inner = self.lock_inner();
         let mut added = 0;
-        for sh in scripthashes {
-            let Some(sub) = inner.subs.get_mut(&id) else {
-                return added;
+        for (sh, floor) in items {
+            let is_new = match inner.subs.get_mut(&id) {
+                Some(sub) => {
+                    let is_new = !sub.scripthashes.contains_key(sh);
+                    // Insert or update the floor either way.
+                    sub.scripthashes.insert(*sh, *floor);
+                    is_new
+                }
+                None => return added,
             };
-            if sub.scripthashes.insert(*sh) {
+            if is_new {
                 added += 1;
                 inner.by_scripthash.entry(*sh).or_default().insert(id);
             }
@@ -382,7 +396,7 @@ impl WatchRegistry {
             let Some(sub) = inner.subs.get_mut(&id) else {
                 break;
             };
-            if sub.scripthashes.remove(sh) {
+            if sub.scripthashes.remove(sh).is_some() {
                 removed += 1;
                 if let Some(set) = inner.by_scripthash.get_mut(sh) {
                     set.remove(&id);
@@ -580,7 +594,7 @@ impl WatchRegistry {
                 }
             }
         }
-        for sh in &sub.scripthashes {
+        for sh in sub.scripthashes.keys() {
             if let Some(set) = inner.by_scripthash.get_mut(sh) {
                 set.remove(&id);
                 if set.is_empty() {
@@ -1149,8 +1163,12 @@ fn scan_tx(inner: &Inner, tx: &Transaction, confirmed: bool, height: Option<u32>
                     confirmed,
                     height,
                 };
+                // Output-side `min_value`: gate on the funded output's value.
+                let value = out.value.to_sat();
                 for sid in subs {
-                    deliver(inner, *sid, &m);
+                    if passes_floor(inner, *sid, &sh, value) {
+                        deliver(inner, *sid, &m);
+                    }
                 }
             }
             if scan_prefixes {
@@ -1228,8 +1246,13 @@ fn scan_block_spent_scripts(inner: &Inner, block: &Block, height: u32, undo: &Un
                     confirmed: true,
                     height: Some(height),
                 };
+                // Input-side `min_value`: gate on the spent prevout's value,
+                // recovered from undo data (symmetric with the output side).
+                let value = spent.amount;
                 for sid in subs {
-                    deliver(inner, *sid, &m);
+                    if passes_floor(inner, *sid, &sh, value) {
+                        deliver(inner, *sid, &m);
+                    }
                 }
             }
             if scan_prefixes {
@@ -1267,6 +1290,19 @@ fn scan_block_spent_scripts(inner: &Inner, block: &Block, height: u32, undo: &Un
     }
 }
 
+/// Whether a script match for subscriber `id` on scripthash `sh` clears that
+/// subscriber's `min_value` floor. A floored match below the threshold is
+/// dropped server-side, so the value never enters the wire event. Returns
+/// `true` when there is no floor (`0`), when the subscriber/script is absent
+/// (defensive — the caller only iterates subscribers indexed for `sh`), or when
+/// `value >= floor`.
+fn passes_floor(inner: &Inner, id: SubId, sh: &Scripthash, value: u64) -> bool {
+    match inner.subs.get(&id).and_then(|s| s.scripthashes.get(sh)) {
+        Some(&floor) => value >= floor,
+        None => true,
+    }
+}
+
 /// Non-blocking delivery to one subscriber. A full channel means the client
 /// is too slow: drop-with-notice (warn), never block the matcher.
 fn deliver(inner: &Inner, id: SubId, m: &WatchMatch) {
@@ -1297,10 +1333,18 @@ impl WatchHandle {
         self.registry.add_outpoints(self.id, outpoints)
     }
 
-    /// Add scripthashes to this subscriber's watch-set; returns the count
-    /// newly added.
+    /// Add scripthashes to this subscriber's watch-set with no `min_value`
+    /// floor (deliver every match); returns the count newly added.
     pub fn add_scripthashes(&self, scripthashes: &[Scripthash]) -> usize {
-        self.registry.add_scripthashes(self.id, scripthashes)
+        let items: Vec<(Scripthash, u64)> = scripthashes.iter().map(|sh| (*sh, 0)).collect();
+        self.registry.add_scripthashes(self.id, &items)
+    }
+
+    /// Add scripthashes each with a `min_value` floor (satoshis; `0` = none);
+    /// returns the count newly added. Re-asserting a watched scripthash updates
+    /// its floor without re-counting.
+    pub fn add_scripthashes_with_floors(&self, items: &[(Scripthash, u64)]) -> usize {
+        self.registry.add_scripthashes(self.id, items)
     }
 
     /// Remove outpoints; returns the count removed.
@@ -2253,6 +2297,133 @@ mod tests {
             height: 1,
             coinbase: false,
         }
+    }
+
+    fn coin_with_value(spk: ScriptBuf, amount: u64) -> crate::storage::coinview::Coin {
+        crate::storage::coinview::Coin {
+            amount,
+            script_pubkey: spk,
+            height: 1,
+            coinbase: false,
+        }
+    }
+
+    fn funding_tx_value(spk: ScriptBuf, value: u64) -> Transaction {
+        Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![],
+            output: vec![TxOut {
+                value: Amount::from_sat(value),
+                script_pubkey: spk,
+            }],
+        }
+    }
+
+    #[test]
+    fn min_value_floor_filters_output_funding() {
+        // A per-script min_value floor suppresses funding matches whose output
+        // value is below the floor, and lets matches at/above it through.
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let spk = ScriptBuf::from(vec![0x51]);
+        let sh = scripthash_of(&spk);
+        assert_eq!(handle.add_scripthashes_with_floors(&[(sh, 1_000)]), 1);
+
+        // Below the floor: dropped.
+        reg.scan_block(&block_with(vec![funding_tx_value(spk.clone(), 999)]), 7, None);
+        assert!(rx.try_recv().is_err(), "999 < 1000 floor → suppressed");
+
+        // At the floor: delivered.
+        reg.scan_block(&block_with(vec![funding_tx_value(spk.clone(), 1_000)]), 8, None);
+        match rx.try_recv().expect("1000 >= floor → delivered") {
+            WatchMatch::ScriptMatched {
+                scripthash,
+                is_output,
+                ..
+            } => {
+                assert_eq!(scripthash, sh);
+                assert!(is_output);
+            }
+            other => panic!("wrong match: {other:?}"),
+        }
+
+        // Above the floor: delivered.
+        reg.scan_block(&block_with(vec![funding_tx_value(spk, 5_000)]), 9, None);
+        assert!(
+            matches!(rx.try_recv(), Ok(WatchMatch::ScriptMatched { .. })),
+            "5000 > floor → delivered"
+        );
+    }
+
+    #[test]
+    fn min_value_floor_filters_confirmed_input_spend() {
+        // The floor is symmetric: a spend match is gated on the SPENT prevout's
+        // value (recovered from undo), not the output value.
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let spent_spk = ScriptBuf::from(vec![0x52]);
+        let sh = scripthash_of(&spent_spk);
+        assert_eq!(handle.add_scripthashes_with_floors(&[(sh, 1_000)]), 1);
+
+        let op = outpoint(0xaa, 3);
+        let block = block_with(vec![coinbase_tx(), spending_tx(op)]);
+
+        // Spent prevout worth 999 < floor → suppressed.
+        let undo_low = UndoData {
+            spent_coins: vec![coin_with_value(spent_spk.clone(), 999)],
+        };
+        reg.scan_block(&block, 9, Some(&undo_low));
+        assert!(rx.try_recv().is_err(), "spent value below floor → suppressed");
+
+        // Spent prevout worth 1000 == floor → delivered.
+        let undo_ok = UndoData {
+            spent_coins: vec![coin_with_value(spent_spk, 1_000)],
+        };
+        reg.scan_block(&block, 10, Some(&undo_ok));
+        match rx.try_recv().expect("spent value at floor → delivered") {
+            WatchMatch::ScriptMatched {
+                scripthash,
+                is_output,
+                confirmed,
+                ..
+            } => {
+                assert_eq!(scripthash, sh);
+                assert!(!is_output, "spend side");
+                assert!(confirmed);
+            }
+            other => panic!("wrong match: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn min_value_reassert_updates_floor_without_recount() {
+        // Re-asserting a watched scripthash updates its floor in place and is not
+        // counted as newly added (dedup), and the *new* floor governs delivery.
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let spk = ScriptBuf::from(vec![0x51]);
+        let sh = scripthash_of(&spk);
+
+        // Initial floor 500.
+        assert_eq!(handle.add_scripthashes_with_floors(&[(sh, 500)]), 1);
+        // Re-assert with a higher floor: no new item, floor updated to 2000.
+        assert_eq!(
+            handle.add_scripthashes_with_floors(&[(sh, 2_000)]),
+            0,
+            "re-assert is not a new item"
+        );
+
+        // A 1000-value funding now falls below the updated 2000 floor → dropped.
+        reg.scan_block(&block_with(vec![funding_tx_value(spk.clone(), 1_000)]), 7, None);
+        assert!(rx.try_recv().is_err(), "updated floor (2000) governs");
+
+        // 2000 clears it.
+        reg.scan_block(&block_with(vec![funding_tx_value(spk, 2_000)]), 8, None);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(WatchMatch::ScriptMatched { .. })
+        ));
     }
 
     fn coinbase_tx() -> Transaction {

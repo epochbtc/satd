@@ -273,6 +273,9 @@ message ScriptMatched {
   uint32 index      = 4;      // vout if is_output else vin
   bool   confirmed  = 5;
 }
+
+// AddScripts carries an optional per-scripthash min_value floor (§7.2.1).
+message AddScripts { repeated bytes scripthashes = 1; repeated uint64 min_values = 2; }
 ```
 
 `OutpointSpent` covers spend detection in both the mempool and connected blocks.
@@ -289,6 +292,34 @@ resolved for validation), yielding `ScriptMatched{is_output = false, confirmed =
 false}` without re-resolving anything off the hot path. Watching the funding
 **outpoint** also surfaces the spend (via `OutpointSpent`); the script path means a
 script watcher need not separately enumerate its outpoints to see unconfirmed spends.
+
+#### 7.2.1 Per-script `min_value` floor
+
+`AddScripts` accepts an optional `min_values` list, parallel to `scripthashes`: a
+per-script floor in satoshis below which matches are suppressed **server-side**, so
+a watcher that only cares about economically significant activity is not woken by
+dust. An empty `min_values` means no floors; a non-empty list MUST have the same
+length as `scripthashes` (a mismatch rejects the whole add — never silently
+unfiltered). Re-asserting a watched scripthash updates its floor in place (it is
+not a new quota item).
+
+The floor is **symmetric** with the two sides of `ScriptMatched`, gating on the
+value of the coin the script controls in that match:
+
+- **Funding** (`is_output = true`): the matched output's value.
+- **Spending** (`is_output = false`): the **spent prevout's** value — the input
+  carries no value, so it is recovered the same way the prevout `scriptPubKey` is.
+  For a **confirmed** block that is the undo data (`spent_coins[i].value`, free
+  alongside the script); for the **mempool** it requires the prevout value to be
+  retained at admission (`streamprevoutmeta ≥ amount`, §12.1) — the default. On a
+  node configured `streamprevoutmeta = hash` the mempool spend side has no value
+  to test, so an `AddScripts` carrying `min_values` is rejected rather than
+  delivering unfiltered unconfirmed spends.
+
+The value itself never enters the wire event — the floor is purely a delivery
+filter. The floor on the **output** and **confirmed-input** sides costs nothing
+(both values are already in hand); only the mempool-input side depends on the
+retention tier.
 
 ### 7.3 Bidirectional control channel
 
