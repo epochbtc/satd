@@ -1071,7 +1071,13 @@ fn watch_match_json(m: &WatchMatch) -> serde_json::Value {
                         "outpoint_txid": hex::encode(m.outpoint.txid.as_raw_hash().to_byte_array()),
                         "outpoint_vout": m.outpoint.vout,
                         "script_pubkey": hex::encode(m.script_pubkey.as_bytes()),
+                        // `amount` is null when the value was not retained
+                        // (streamprevoutmeta below `amount`); `has_amount`
+                        // mirrors the gRPC SpentPrevout bool so a JSON client can
+                        // distinguish "not retained" from a genuine 0-sat prevout
+                        // without relying on the null-vs-0 encoding.
                         "amount": m.amount,
+                        "has_amount": m.amount.is_some(),
                     })).collect::<Vec<_>>(),
                 }
             })
@@ -1292,12 +1298,32 @@ mod tests {
 
     #[test]
     fn prefix_matched_json_shape() {
+        use bitcoin::hashes::Hash;
+        let op = |b: u8, vout: u32| bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_raw_hash(
+                bitcoin::hashes::sha256d::Hash::from_byte_array([b; 32]),
+            ),
+            vout,
+        };
         let m = WatchMatch::PrefixMatched(Box::new(node::events::PrefixMatch {
             prefix: (0xabcd_0000, 16),
             raw_tx: vec![0x01, 0x02].into(),
             confirmed: true,
             height: Some(5),
-            matched_prevouts: vec![],
+            matched_prevouts: vec![
+                // value retained (>= amount tier): amount present, has_amount true
+                node::events::SpentPrevoutMeta {
+                    outpoint: op(0x11, 0),
+                    script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x51]),
+                    amount: Some(0),
+                },
+                // value NOT retained (hash tier): amount null, has_amount false
+                node::events::SpentPrevoutMeta {
+                    outpoint: op(0x22, 1),
+                    script_pubkey: bitcoin::ScriptBuf::new(),
+                    amount: None,
+                },
+            ],
         }));
         let v = watch_match_json(&m);
         assert_eq!(v["body"]["category"], "prefix_matched");
@@ -1306,6 +1332,16 @@ mod tests {
         assert_eq!(v["body"]["raw_tx"], "0102");
         assert_eq!(v["body"]["confirmed"], true);
         assert_eq!(v["cursor"]["height"], 5);
+        let mp = &v["body"]["matched_prevouts"];
+        // Retained 0-sat prevout: amount is the number 0 and has_amount is true —
+        // distinguishable from "not retained".
+        assert_eq!(mp[0]["amount"], 0);
+        assert_eq!(mp[0]["has_amount"], true);
+        assert_eq!(mp[0]["script_pubkey"], "51");
+        // Unretained prevout: amount is JSON null and has_amount is false.
+        assert!(mp[1]["amount"].is_null());
+        assert_eq!(mp[1]["has_amount"], false);
+        assert_eq!(mp[1]["script_pubkey"], "");
     }
 
     #[test]

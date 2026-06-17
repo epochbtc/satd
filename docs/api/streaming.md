@@ -488,6 +488,11 @@ message SpentPrevout {
 }
 ```
 
+On the WS/SSE JSON surface each `matched_prevouts` entry mirrors this exactly:
+`script_pubkey` is a (possibly empty) hex string, `amount` is a number or `null`
+when the value was not retained, and `has_amount` is the explicit boolean — so a
+JSON client need not infer retention from the `null`-vs-`0` encoding.
+
 **Delivery is self-contained, deliberately.** `PrefixMatched` carries the full
 `raw_tx`, not a txid — a txid would force the client to fetch the transaction
 precisely, re-leaking the exact interest the bucket was hiding. For a **confirmed**
