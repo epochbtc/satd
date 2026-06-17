@@ -5,9 +5,10 @@
 //! imprecise to *block* on — it fires on rules that merely reference witness size
 //! or a small value, even when the predicate could never match a real
 //! enforcement transaction. This module is the *semantic* counterpart: it
-//! evaluates each `quarantine` rule against a curated set of synthetic
-//! transactions shaped like real Lightning enforcement traffic, and reports only
-//! the rules that *actually quarantine* one of them. The finding is "this rule
+//! evaluates the *whole* ruleset (with the engine's own first-match-wins
+//! semantics) against a curated set of synthetic transactions shaped like real
+//! Lightning enforcement traffic, and reports only the rules that *actually
+//! quarantine* one of them. The finding is "this rule
 //! would withhold *this* enforcement shape", not "this rule is in the
 //! neighborhood", so false positives are near-zero — which is what makes it
 //! safe to gate a load on (`--allow-dangerous-filters`).
@@ -40,15 +41,24 @@ use crate::view::{Ctx, InputView, OutputView, TxView};
 /// The Lightning enforcement shape a probe vector represents.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LnShape {
-    /// A force-close commitment transaction (anchor channel): anchor outputs
-    /// plus a `to_local` delayed output.
+    /// A force-close commitment transaction (legacy anchor channel): a `to_local`
+    /// delayed output plus two 330-sat P2A anchor outputs.
     Bolt3Commitment,
+    /// A force-close commitment of a TRUC / zero-fee-commitment channel: a single
+    /// 0-value (ephemeral) P2A anchor. Covers the dust/zero-value anchor shape
+    /// that the legacy 330-sat anchors do not.
+    Bolt3CommitmentEphemeralAnchor,
     /// A breach-remedy (justice / penalty) transaction spending a revoked
-    /// `to_local` via the revocation branch. The time-critical E1 case.
+    /// `to_local` via the revocation branch (carries `OP_CSV`). The time-critical
+    /// E1 case.
     Bolt3Justice,
-    /// A second-stage HTLC-timeout transaction (carries `OP_CLTV`).
+    /// An offered-HTLC spend (the HTLC-timeout path): a faithful BOLT-3
+    /// offered-HTLC witness script (`OP_CHECKMULTISIG` + hash-lock structure); the
+    /// spending transaction is `OP_CLTV`-locktimed.
     Bolt3HtlcTimeout,
-    /// A second-stage HTLC-success transaction (carries `OP_CSV` + preimage).
+    /// A received-HTLC spend (the preimage / success path): a faithful BOLT-3
+    /// received-HTLC witness script, whose remote-timeout branch carries
+    /// `OP_CLTV` in-script.
     Bolt3HtlcSuccess,
     /// A simple-taproot-channel force-close: a P2TR key-path spend,
     /// byte-shaped like any other. Stands in for the indistinguishable case.
@@ -63,6 +73,9 @@ impl LnShape {
     pub fn label(self) -> &'static str {
         match self {
             LnShape::Bolt3Commitment => "BOLT-3 force-close commitment (anchor channel)",
+            LnShape::Bolt3CommitmentEphemeralAnchor => {
+                "BOLT-3 force-close commitment (TRUC / ephemeral-anchor channel)"
+            }
             LnShape::Bolt3Justice => "BOLT-3 breach-remedy (justice) transaction",
             LnShape::Bolt3HtlcTimeout => "BOLT-3 HTLC-timeout transaction",
             LnShape::Bolt3HtlcSuccess => "BOLT-3 HTLC-success transaction",
@@ -152,6 +165,7 @@ impl LnShape {
     fn class(self) -> DangerClass {
         match self {
             LnShape::Bolt3Commitment
+            | LnShape::Bolt3CommitmentEphemeralAnchor
             | LnShape::Bolt3Justice
             | LnShape::Bolt3HtlcTimeout
             | LnShape::Bolt3HtlcSuccess => DangerClass::Bolt3Enforcement,
@@ -175,7 +189,6 @@ const OP_IF: u8 = 0x63;
 const OP_ELSE: u8 = 0x67;
 const OP_ENDIF: u8 = 0x68;
 const OP_DROP: u8 = 0x75;
-const OP_2DROP: u8 = 0x6d;
 const OP_CHECKSIG: u8 = 0xac;
 const OP_CHECKMULTISIG: u8 = 0xae;
 const OP_2: u8 = 0x52;
@@ -222,27 +235,69 @@ fn funding_2of2_script() -> Vec<u8> {
     s
 }
 
-/// An offered-HTLC witness script (timeout path carries OP_CLTV; both carry
-/// OP_CSV). A faithful-enough shape for opcode-pattern predicates.
-fn htlc_script(timeout: bool) -> Vec<u8> {
+/// A faithful BOLT-3 first-stage HTLC witness script (§ "Offered/Received HTLC
+/// Outputs"). `offered = true` builds the offered-HTLC script (redeemed remotely
+/// by preimage, or locally via the locktimed HTLC-timeout transaction);
+/// `offered = false` builds the received-HTLC script, whose remote-timeout branch
+/// carries `OP_CLTV` in-script. Both share the distinctive revocation-hash +
+/// `OP_SIZE 32 OP_EQUAL` + `OP_CHECKMULTISIG` structure that an anti-HTLC filter
+/// would key on. (First-stage HTLC scripts do not carry `OP_CSV`; the CSV delay
+/// lives on the *second-stage* `to_local` output, covered by [`to_local_script`].
+/// We deliberately do not synthesize an unrealistic CSV∧CLTV-in-one-script
+/// vector, because no real BOLT-3 script combines them.)
+fn htlc_script(offered: bool) -> Vec<u8> {
+    // OP_DUP OP_HASH160 <RIPEMD160(revocationpubkey)> OP_EQUAL
     let mut s = vec![OP_DUP, OP_HASH160];
     s.extend(push(20)); // revocation pubkey hash
     s.push(OP_EQUAL);
-    s.push(OP_NOTIF);
+    // OP_IF OP_CHECKSIG  (revocation branch)
+    s.push(OP_IF);
+    s.push(OP_CHECKSIG);
+    s.push(OP_ELSE);
+    // <remote_htlcpubkey> OP_SWAP OP_SIZE 32 OP_EQUAL
     s.extend(push(33)); // remote htlc pubkey
     s.push(OP_SWAP);
     s.push(OP_SIZE);
     s.extend([0x01, 0x20]); // push 32 (preimage length check)
-    s.push(OP_EQUALVERIFY);
-    if timeout {
-        s.extend([0x03, 0x40, 0x42, 0x0f]); // cltv expiry (scriptnum push)
-        s.push(OP_CHECKLOCKTIMEVERIFY);
+    s.push(OP_EQUAL);
+    if offered {
+        // OP_NOTIF  (not a preimage → local sweeps via HTLC-timeout tx)
+        s.push(OP_NOTIF);
+        s.push(OP_DROP);
+        // 2 OP_SWAP <local_htlcpubkey> 2 OP_CHECKMULTISIG
+        s.push(OP_2);
+        s.push(OP_SWAP);
+        s.extend(push(33)); // local htlc pubkey
+        s.push(OP_2);
+        s.push(OP_CHECKMULTISIG);
+        s.push(OP_ELSE);
+        // OP_HASH160 <RIPEMD160(payment_hash)> OP_EQUALVERIFY OP_CHECKSIG
+        s.push(OP_HASH160);
+        s.extend(push(20));
+        s.push(OP_EQUALVERIFY);
+        s.push(OP_CHECKSIG);
+        s.push(OP_ENDIF);
     } else {
-        s.push(OP_CHECKSEQUENCEVERIFY);
+        // OP_IF  (preimage → local success via 2-of-2)
+        s.push(OP_IF);
+        s.push(OP_HASH160);
+        s.extend(push(20)); // payment hash
+        s.push(OP_EQUALVERIFY);
+        s.push(OP_2);
+        s.push(OP_SWAP);
+        s.extend(push(33)); // local htlc pubkey
+        s.push(OP_2);
+        s.push(OP_CHECKMULTISIG);
+        s.push(OP_ELSE);
+        // OP_DROP <cltv_expiry> OP_CLTV OP_DROP OP_CHECKSIG  (remote timeout)
+        s.push(OP_DROP);
+        s.extend([0x03, 0xc0, 0x27, 0x09]); // cltv_expiry (600000) as scriptnum push
+        s.push(OP_CHECKLOCKTIMEVERIFY);
+        s.push(OP_DROP);
+        s.push(OP_CHECKSIG);
+        s.push(OP_ENDIF);
     }
-    s.push(OP_2DROP);
     s.push(OP_ENDIF);
-    s.push(OP_CHECKSIG);
     s
 }
 
@@ -367,6 +422,13 @@ impl Vector {
             inputs: &ins,
             outputs: &outs,
         };
+        // Probes are evaluated under a single mainnet / P2p-relay snapshot: E1 is
+        // about relay homogeneity, and enforcement traffic reaches the mempool
+        // over P2p, so this is the surface that matters. A rule scoped on a
+        // narrower submission context (e.g. `tx.source == rpc`, or a non-mainnet
+        // `node.network`) only affects locally-submitted or off-mainnet traffic,
+        // does not degrade network-wide relay homogeneity, and is intentionally
+        // out of scope for the gate.
         let ctx = Ctx {
             network: Network::Mainnet,
             height: 800_000,
@@ -389,7 +451,11 @@ fn enforcement_in(pst: ScriptType, leaf: Vec<u8>, witness_size: i128) -> OwnedIn
         script_sig: Vec::new(),
         witness_items: 3,
         witness_size,
-        max_witness_item: leaf.len() as i128,
+        // The largest witness element a real enforcement spend reveals is the
+        // bigger of a ~72-byte signature and the witness script itself (an HTLC
+        // script is ~140 B, a to_local script ~77 B), so anti-spam witness-item
+        // caps that would catch real enforcement are caught here too.
+        max_witness_item: (leaf.len() as i128).max(72),
         has_annex: false,
         prevout_value: 200_000,
         prevout_script_type: pst,
@@ -416,59 +482,91 @@ fn out(value: i128, st: ScriptType, script: Vec<u8>, is_dust: bool) -> OwnedOut 
 /// The probe set. Healthy/realistic field values throughout, so only structural
 /// matches register (a distribution-dependent threshold won't trip these).
 fn vectors() -> Vec<Vector> {
-    let base = |shape: LnShape, ins: Vec<OwnedIn>, outs: Vec<OwnedOut>| Vector {
-        shape,
-        version: 2,
-        locktime: 0,
-        vsize: 200,
-        weight: 800,
-        total_witness_size: 220,
-        signals_rbf: false,
-        fee: 2_000,
-        fee_rate: 10_000, // healthy
-        sigops_cost: 0,
-        txid: vec![0x22; 32],
-        ins,
-        outs,
+    let base = |shape: LnShape, locktime: i128, ins: Vec<OwnedIn>, outs: Vec<OwnedOut>| {
+        // Derive the tx-level witness total from the inputs so witness-size
+        // predicates see a realistic enforcement footprint (not a flat 220).
+        let total_witness_size: i128 = ins.iter().map(|i| i.witness_size).sum();
+        Vector {
+            shape,
+            version: 2,
+            locktime,
+            vsize: 200,
+            weight: 800,
+            total_witness_size,
+            signals_rbf: false,
+            fee: 2_000,
+            fee_rate: 10_000, // healthy
+            sigops_cost: 0,
+            txid: vec![0x22; 32],
+            ins,
+            outs,
+        }
     };
 
     vec![
-        // Force-close commitment: funding 2-of-2 spent; to_local + to_remote +
-        // a 240-sat P2A anchor.
+        // Force-close commitment (legacy anchor channel): funding 2-of-2 spent;
+        // to_local + to_remote + two 330-sat P2A anchors (the canonical anchor
+        // value; below Core's ~330-sat P2WSH dust floor, so value/dust sweeps
+        // catch it).
         base(
             LnShape::Bolt3Commitment,
-            vec![enforcement_in(ScriptType::P2wsh, funding_2of2_script(), 220)],
+            0,
+            vec![enforcement_in(ScriptType::P2wsh, funding_2of2_script(), 240)],
             vec![
                 out(150_000, ScriptType::P2wsh, p2wsh_spk(), false), // to_local
                 out(40_000, ScriptType::P2wpkh, p2wpkh_spk(), false), // to_remote
-                out(240, ScriptType::P2a, p2a_spk(), true),          // anchor
+                out(330, ScriptType::P2a, p2a_spk(), true),          // local anchor
+                out(330, ScriptType::P2a, p2a_spk(), true),          // remote anchor
             ],
         ),
-        // Justice: spend a revoked to_local via the revocation branch.
+        // Force-close commitment (TRUC / zero-fee-commitment channel): a single
+        // 0-value ephemeral P2A anchor, so `out.value == 0` / `out.value < N`
+        // sweeps are caught regardless of the 330-sat convention.
+        base(
+            LnShape::Bolt3CommitmentEphemeralAnchor,
+            0,
+            vec![enforcement_in(ScriptType::P2wsh, funding_2of2_script(), 240)],
+            vec![
+                out(150_000, ScriptType::P2wsh, p2wsh_spk(), false), // to_local
+                out(40_000, ScriptType::P2wpkh, p2wpkh_spk(), false), // to_remote
+                out(0, ScriptType::P2a, p2a_spk(), true),            // ephemeral anchor
+            ],
+        ),
+        // Justice: spend a revoked to_local via the revocation branch. Realistic
+        // witness (revocation sig + ~77-byte witness script).
         base(
             LnShape::Bolt3Justice,
-            vec![enforcement_in(ScriptType::P2wsh, to_local_script(), 180)],
+            0,
+            vec![enforcement_in(ScriptType::P2wsh, to_local_script(), 200)],
             vec![out(190_000, ScriptType::P2wpkh, p2wpkh_spk(), false)],
         ),
+        // Offered-HTLC spend via the locktimed HTLC-timeout transaction. The
+        // ~140-byte witness script and non-zero CLTV locktime are both faithful.
         base(
             LnShape::Bolt3HtlcTimeout,
-            vec![enforcement_in(ScriptType::P2wsh, htlc_script(true), 200)],
+            600_000,
+            vec![enforcement_in(ScriptType::P2wsh, htlc_script(true), 280)],
             vec![out(95_000, ScriptType::P2wsh, p2wsh_spk(), false)],
         ),
+        // Received-HTLC spend (preimage path); its remote-timeout branch carries
+        // OP_CLTV in-script.
         base(
             LnShape::Bolt3HtlcSuccess,
-            vec![enforcement_in(ScriptType::P2wsh, htlc_script(false), 200)],
+            0,
+            vec![enforcement_in(ScriptType::P2wsh, htlc_script(false), 280)],
             vec![out(95_000, ScriptType::P2wsh, p2wsh_spk(), false)],
         ),
         // Taproot script-path justice: tapleaf revealed, carries OP_CSV.
         base(
             LnShape::TaprootScriptPathJustice,
-            vec![enforcement_in(ScriptType::P2tr, taproot_justice_leaf(), 160)],
+            0,
+            vec![enforcement_in(ScriptType::P2tr, taproot_justice_leaf(), 180)],
             vec![out(190_000, ScriptType::P2tr, p2tr_spk(), false)],
         ),
         // Taproot key-path force-close: indistinguishable from a plain keyspend.
         base(
             LnShape::TaprootKeyspendForceClose,
+            0,
             vec![keyspend_in()],
             vec![
                 out(150_000, ScriptType::P2tr, p2tr_spk(), false),
@@ -478,6 +576,7 @@ fn vectors() -> Vec<Vector> {
         // Generic healthy P2TR keyspend — the breadth probe.
         base(
             LnShape::GenericP2trKeyspend,
+            0,
             vec![keyspend_in()],
             vec![out(99_800, ScriptType::P2tr, p2tr_spk(), false)],
         ),
@@ -526,10 +625,63 @@ mod tests {
 
     #[test]
     fn htlc_cltv_rule_is_caught() {
+        // Only the received-HTLC (success) witness script carries OP_CLTV
+        // in-script; the offered-HTLC timeout path enforces its timeout via the
+        // spending tx locktime, not the witness script.
         let s = shapes(
             "version 1\nquarantine h when any inputs (in.leaf_script.count_op(OP_CHECKLOCKTIMEVERIFY) > 0)",
         );
+        assert!(s.contains(&LnShape::Bolt3HtlcSuccess), "{s:?}");
+    }
+
+    #[test]
+    fn htlc_structure_rule_is_caught() {
+        // A filter keyed on the distinctive BOLT-3 HTLC 2-of-2 structure
+        // (OP_CHECKMULTISIG inside the hash-locked branch) catches both HTLC
+        // shapes — proving the witness scripts are faithful, not opcode soup.
+        let s = shapes(
+            "version 1\nquarantine m when any inputs (in.leaf_script.count_op(OP_CHECKMULTISIG) > 0)",
+        );
         assert!(s.contains(&LnShape::Bolt3HtlcTimeout), "{s:?}");
+        assert!(s.contains(&LnShape::Bolt3HtlcSuccess), "{s:?}");
+    }
+
+    #[test]
+    fn oversize_witness_item_cap_catches_htlc() {
+        // An anti-spam per-item witness cap that would catch a real ~140-byte
+        // HTLC witness script must trip the gate.
+        let s = shapes("version 1\nquarantine bigitem when any inputs (in.max_witness_item > 100)");
+        assert!(
+            s.contains(&LnShape::Bolt3HtlcTimeout) || s.contains(&LnShape::Bolt3HtlcSuccess),
+            "witness-item cap must catch an HTLC enforcement spend: {s:?}"
+        );
+    }
+
+    #[test]
+    fn witness_size_cap_catches_enforcement() {
+        // A too-aggressive total-witness-size cap that would catch real
+        // enforcement traffic must trip the gate.
+        let s = shapes("version 1\nquarantine bigwit when tx.total_witness_size > 250");
+        assert!(
+            s.contains(&LnShape::Bolt3HtlcTimeout) || s.contains(&LnShape::Bolt3HtlcSuccess),
+            "witness-size cap must catch an HTLC enforcement spend: {s:?}"
+        );
+    }
+
+    #[test]
+    fn dust_value_sweep_catches_anchor() {
+        // A sub-330-sat value sweep catches the 0-value ephemeral anchor; a dust
+        // predicate catches the legacy 330-sat anchors too.
+        let low = shapes("version 1\nquarantine lowval when any outputs (out.value < 330)");
+        assert!(
+            low.contains(&LnShape::Bolt3CommitmentEphemeralAnchor),
+            "sub-330 value sweep must catch the ephemeral anchor: {low:?}"
+        );
+        let dust = shapes("version 1\nquarantine dust when any outputs (out.is_dust)");
+        assert!(
+            dust.contains(&LnShape::Bolt3Commitment),
+            "dust sweep must catch the legacy 330-sat anchors: {dust:?}"
+        );
     }
 
     #[test]
