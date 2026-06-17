@@ -30,10 +30,11 @@
 //!
 //! `allow` rules are never dangerous: they only widen relay, never withhold.
 
-use crate::ruleset::{Action, CompiledRuleset};
+use crate::ruleset::CompiledRuleset;
 use crate::scope::ScopeSet;
 use crate::script::{OP_CHECKLOCKTIMEVERIFY, OP_CHECKSEQUENCEVERIFY};
 use crate::value::{Network, ScriptType, Source};
+use crate::verdict::Verdict;
 use crate::view::{Ctx, InputView, OutputView, TxView};
 
 /// The Lightning enforcement shape a probe vector represents.
@@ -127,22 +128,21 @@ impl DangerFinding {
 /// enforcement traffic. Returns one finding per (rule, matched shape), in rule
 /// order. Empty when the ruleset is safe.
 pub fn analyze_danger(rs: &CompiledRuleset) -> Vec<DangerFinding> {
-    let vectors = vectors();
     let mut out = Vec::new();
-    for rule in rs.rules() {
-        // `allow` only widens relay; it can never withhold an enforcement tx.
-        if rule.action != Action::Quarantine {
-            continue;
-        }
-        for v in &vectors {
-            if v.matches(rule.condition()) {
-                out.push(DangerFinding {
-                    rule: rule.name.clone(),
-                    shape: v.shape,
-                    class: v.shape.class(),
-                    scope: rule.scope,
-                });
-            }
+    for v in vectors() {
+        // Evaluate the *whole* ruleset against the vector with the engine's own
+        // first-match-wins semantics: an earlier `allow` (or an earlier
+        // quarantine) that matches the enforcement probe decides the verdict, so
+        // a later quarantine rule it shadows is never reached — exactly as at
+        // runtime. Only a quarantine verdict means the tx would actually be
+        // withheld. (`Pass`/`Allow` ⇒ the probe is relayed; no finding.)
+        if let Verdict::Quarantine { rule, scope } = v.verdict(rs) {
+            out.push(DangerFinding {
+                rule,
+                shape: v.shape,
+                class: v.shape.class(),
+                scope,
+            });
         }
     }
     out
@@ -318,7 +318,9 @@ struct Vector {
 }
 
 impl Vector {
-    fn matches(&self, cond: &crate::CompiledExpr) -> bool {
+    /// Evaluate the whole ruleset against this vector with first-match-wins
+    /// semantics (so `allow` shielding and rule order are honored exactly).
+    fn verdict(&self, rs: &CompiledRuleset) -> Verdict {
         let ins: Vec<InputView> = self
             .ins
             .iter()
@@ -373,8 +375,7 @@ impl Vector {
             mempool_bytes: 0,
             mempool_min_fee: 1_000,
         };
-        let out = cond.eval(&tx, &ctx);
-        !out.fuel_exhausted && out.value.as_bool()
+        rs.evaluate(&tx, &ctx)
     }
 }
 
@@ -592,6 +593,38 @@ mod tests {
             "version 1\nallow a when any inputs (in.leaf_script.count_op(OP_CHECKSEQUENCEVERIFY) > 0)",
         );
         assert!(f.is_empty(), "{f:?}");
+    }
+
+    #[test]
+    fn earlier_allow_shadows_a_later_quarantine() {
+        // Review round 2 (PR 408): the analyzer honors first-match-wins. An
+        // `allow` that matches the enforcement probe first shields it, so the
+        // later quarantine on the SAME condition never fires at runtime — and
+        // must not be reported as dangerous.
+        let f = findings(
+            "version 1\n\
+             allow ln when any inputs (in.leaf_script.count_op(OP_CHECKSEQUENCEVERIFY) > 0)\n\
+             quarantine csv when any inputs (in.leaf_script.count_op(OP_CHECKSEQUENCEVERIFY) > 0)\n",
+        );
+        assert!(f.is_empty(), "first-match allow must shadow the quarantine: {f:?}");
+
+        // Sanity: without the shielding allow, the same quarantine IS flagged.
+        let g = findings(
+            "version 1\nquarantine csv when any inputs (in.leaf_script.count_op(OP_CHECKSEQUENCEVERIFY) > 0)\n",
+        );
+        assert!(!g.is_empty(), "control: bare quarantine should be flagged");
+    }
+
+    #[test]
+    fn earlier_quarantine_attributes_the_finding() {
+        // First-match also means the FIRST matching quarantine owns the finding,
+        // not a later one that also matches.
+        let f = findings(
+            "version 1\n\
+             quarantine first when any inputs (in.leaf_script.count_op(OP_CHECKSEQUENCEVERIFY) > 0)\n\
+             quarantine second when any inputs (in.leaf_script.count_op(OP_CHECKSEQUENCEVERIFY) > 0)\n",
+        );
+        assert!(f.iter().all(|x| x.rule == "first"), "{f:?}");
     }
 
     #[test]
