@@ -608,6 +608,12 @@ pub struct Config {
     /// held transactions are fee-rate-evicted against this, separately from
     /// `maxmempool`. Inert until a policy quarantines something. satd-only.
     pub quarantinemempool: usize,
+    /// Opt out of the strict-by-default Lightning-enforcement danger gate
+    /// (§2.5). When false (default), a `policyfile` containing a rule that would
+    /// **withhold relay** for an L2 enforcement shape is refused at load
+    /// (fatal at startup; last-good kept on SIGHUP). When true, such rules load
+    /// with a loud warning. `on template` matches always warn-only. satd-only.
+    pub allowdangerousfilters: bool,
     /// Bitcoin Core's `-networkactive`: start with P2P networking enabled.
     /// Default true; `-networkactive=0` boots with networking paused (no
     /// inbound accepts, no outbound dials) until `setnetworkactive true`.
@@ -2060,6 +2066,11 @@ impl Config {
             .or_else(|| file_get("acceptnonstdtxn").and_then(|v| parse_bool(&v)))
             .unwrap_or(false);
 
+        let allowdangerousfilters = cli
+            .allowdangerousfilters
+            .or_else(|| file_get("allowdangerousfilters").and_then(|v| parse_bool(&v)))
+            .unwrap_or(false);
+
         let networkactive = cli
             .networkactive
             .or_else(|| file_get("networkactive").and_then(|v| parse_bool(&v)))
@@ -2742,6 +2753,7 @@ impl Config {
                 .unwrap_or(true),
             permitbaremultisig,
             acceptnonstdtxn,
+            allowdangerousfilters,
             networkactive,
             txindex,
             addressindex,
@@ -3256,6 +3268,7 @@ impl Config {
                 "persist": self.persistmempool,
                 "quarantine_max_bytes_mb": self.quarantinemempool,
                 "policyfile": self.policyfile.as_ref().map(|p| p.display().to_string()),
+                "allow_dangerous_filters": self.allowdangerousfilters,
             },
             "storage": {
                 "txindex": self.txindex,
@@ -3966,6 +3979,16 @@ pub struct CliArgs {
         help = "Relay and accept non-standard transactions (default: false; consensus rules still apply)"
     )]
     pub acceptnonstdtxn: Option<bool>,
+
+    #[arg(
+        long = "allowdangerousfilters",
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
+        help = "Allow policy rules that withhold relay for Lightning enforcement txns (default: false; refused at load otherwise)"
+    )]
+    pub allowdangerousfilters: Option<bool>,
 
     #[arg(
         long = "networkactive",
@@ -5210,6 +5233,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "maxmempool",
         "quarantinemempool",
         "policyfile",
+        "allowdangerousfilters",
         "minrelaytxfee",
         "dustrelayfee",
         "datacarriersize",
@@ -5366,6 +5390,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "permitbaremultisig",
         "persistmempool",
         "acceptnonstdtxn",
+        "allowdangerousfilters",
         "networkactive",
         "esplora",
         "esploramtls",
@@ -5776,6 +5801,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "acceptnonstdtxn",
     "quarantinemempool",
     "policyfile",
+    "allowdangerousfilters",
     "networkactive",
     // Esplora
     "esplora",
@@ -6865,6 +6891,7 @@ rpcport=8332
             persistmempool: None,
             permitbaremultisig: None,
             acceptnonstdtxn: None,
+            allowdangerousfilters: None,
             networkactive: None,
             txindex: None,
             addressindex: None,
@@ -7134,6 +7161,7 @@ rpcport=8332
             persistmempool: None,
             permitbaremultisig: None,
             acceptnonstdtxn: None,
+            allowdangerousfilters: None,
             networkactive: None,
             txindex: None,
             addressindex: None,

@@ -261,6 +261,7 @@ pub fn mempool_config_from(c: &Config) -> MempoolConfig {
         // Saturating, same rationale as `maxmempool` above. Inert until a
         // `policyfile` quarantines something.
         quarantine_max_bytes: c.quarantinemempool.saturating_mul(1_000_000),
+        allow_dangerous_filters: c.allowdangerousfilters,
     }
 }
 
@@ -697,6 +698,15 @@ fn field_specs() -> Vec<FieldSpec> {
         // Quarantine-class byte budget — folded into the same MempoolConfig
         // reload as the other mempool knobs.
         live!("quarantinemempool", quarantinemempool, |c, h| {
+            h.mempool.reload_policy(mempool_config_from(c))
+        }),
+        // The danger-gate opt-out. Updating MempoolConfig governs the *next*
+        // policy (re)load: `apply_policyfile_reload` runs after this in the same
+        // SIGHUP, so flipping it on and re-touching `policyfile` loads a
+        // previously-refused ruleset. Tightening it (true→false) only re-gates
+        // when the policyfile content also changes (the sha-dedup skips an
+        // unchanged file) — to force a re-evaluation, re-touch the file.
+        live!("allowdangerousfilters", allowdangerousfilters, |c, h| {
             h.mempool.reload_policy(mempool_config_from(c))
         }),
         // NOTE: `policyfile` is intentionally NOT a FieldSpec. Like the

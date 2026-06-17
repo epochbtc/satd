@@ -456,6 +456,12 @@ pub struct MempoolConfig {
     /// from the acting mempool's `max_size_bytes`. Has no effect until a policy
     /// quarantines something (PR 4c). Default [`policy::DEFAULT_QUARANTINE_MEMPOOL_SIZE`].
     pub quarantine_max_bytes: usize,
+    /// `allowdangerousfilters`: opt out of the strict-by-default Lightning-
+    /// enforcement danger gate. When false (default), a policy file with a rule
+    /// that would **withhold relay** for an L2 enforcement shape is refused at
+    /// load (fatal at startup; last-good kept on SIGHUP). When true, such rules
+    /// load with a loud warning instead. Template-only matches always warn-only.
+    pub allow_dangerous_filters: bool,
 }
 
 impl Default for MempoolConfig {
@@ -473,6 +479,7 @@ impl Default for MempoolConfig {
             permit_bare_multisig: true,
             accept_non_std_txn: false,
             quarantine_max_bytes: policy::DEFAULT_QUARANTINE_MEMPOOL_SIZE,
+            allow_dangerous_filters: false,
         }
     }
 }
@@ -686,11 +693,66 @@ impl Mempool {
         path: &std::path::Path,
     ) -> Result<policy_engine::PolicyLoad, String> {
         let (ruleset, load) = policy_engine::load_policy_file(path)?;
+        self.danger_gate(&ruleset)?;
         self.policy.store(Some(std::sync::Arc::new(ruleset)));
         *self.policy_sha.lock() = Some(load.sha256.clone());
         *self.policy_meta.lock() = Some(Self::build_policy_meta(Some(path), &load));
         self.policy_stats.reset();
         Ok(load)
+    }
+
+    /// The strict-by-default Lightning-enforcement danger gate (§2.5).
+    ///
+    /// Runs the semantic [`satd_policy::analyze_danger`] over the compiled
+    /// ruleset. Template-only matches are logged as warnings (E1 turns on relay
+    /// homogeneity, and an `on template` rule still relays). A rule that would
+    /// **withhold relay** for an enforcement shape is refused (`Err`) unless
+    /// `allowdangerousfilters` is set, in which case it loads with a loud
+    /// warning. Returning `Err` makes startup fatal and a SIGHUP reload keep
+    /// last-good — exactly the existing fail-loud / last-good behavior.
+    fn danger_gate(&self, ruleset: &satd_policy::CompiledRuleset) -> Result<(), String> {
+        let findings = satd_policy::analyze_danger(ruleset);
+        if findings.is_empty() {
+            return Ok(());
+        }
+        let allow = self.config.read().allow_dangerous_filters;
+        let mut relay_rules: Vec<&str> = Vec::new();
+        for f in &findings {
+            if f.withholds_relay() {
+                if !relay_rules.contains(&f.rule.as_str()) {
+                    relay_rules.push(f.rule.as_str());
+                }
+                tracing::warn!(
+                    rule = %f.rule, shape = %f.shape.label(), scope = %f.scope,
+                    "policy rule withholds relay for a Lightning enforcement shape (E1)"
+                );
+            } else {
+                tracing::warn!(
+                    rule = %f.rule, shape = %f.shape.label(),
+                    "policy rule declines to mine a Lightning enforcement shape \
+                     (on template — still relayed)"
+                );
+            }
+        }
+        if relay_rules.is_empty() {
+            return Ok(());
+        }
+        if allow {
+            tracing::warn!(
+                rules = ?relay_rules,
+                "loading policy with relay-withholding Lightning-enforcement rule(s); \
+                 allowed by allowdangerousfilters"
+            );
+            Ok(())
+        } else {
+            Err(format!(
+                "refusing policy: rule(s) [{}] would withhold relay for Lightning \
+                 enforcement transactions, degrading L2 enforcement network-wide (E1). \
+                 Narrow them, scope them `on template`, or set allowdangerousfilters=1 \
+                 to override.",
+                relay_rules.join(", ")
+            ))
+        }
     }
 
     /// Build the [`PolicyMeta`] for a freshly-loaded ruleset (load-time fields +
@@ -733,6 +795,13 @@ impl Mempool {
         };
         if self.policy_sha.lock().as_deref() == Some(load.sha256.as_str()) {
             return Ok(PolicyReloadKind::Unchanged);
+        }
+        // Gate the reload exactly as startup: a relay-withholding enforcement
+        // rule keeps last-good (I7) unless allowdangerousfilters is set.
+        if let Err(e) = self.danger_gate(&ruleset) {
+            self.policy_reload_failures
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Err(e);
         }
         self.policy.store(Some(std::sync::Arc::new(ruleset)));
         *self.policy_sha.lock() = Some(load.sha256.clone());
@@ -3878,6 +3947,82 @@ mod tests {
         mp.set_policy(std::sync::Arc::new(rs));
     }
 
+    fn write_policy(tag: &str, src: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "satd-danger-{tag}-{}-{}",
+            std::process::id(),
+            now_unix_secs()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("p.policy");
+        std::fs::write(&path, src).unwrap();
+        (dir, path)
+    }
+
+    const CSV_RULE: &str =
+        "version 1\nquarantine csv when any inputs (in.leaf_script.count_op(OP_CHECKSEQUENCEVERIFY) > 0)\n";
+
+    #[test]
+    fn danger_gate_refuses_relay_withholding_rule_unless_allowed() {
+        let (dir, path) = write_policy("refuse", CSV_RULE);
+
+        // Strict (default): the relay-withholding enforcement rule is refused.
+        let mp = Mempool::with_config(MempoolConfig::default());
+        let err = mp.load_policy_file(&path).unwrap_err();
+        assert!(err.contains("refusing"), "{err}");
+        assert!(!mp.has_policy(), "nothing loaded on refusal");
+
+        // allowdangerousfilters: loads with a warning.
+        let mp2 = Mempool::with_config(MempoolConfig {
+            allow_dangerous_filters: true,
+            ..Default::default()
+        });
+        mp2.load_policy_file(&path)
+            .expect("loads with allowdangerousfilters");
+        assert!(mp2.has_policy());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn danger_gate_allows_template_only_match() {
+        // The same enforcement matcher scoped `on template` still relays, so it
+        // is not gated even in strict mode.
+        let (dir, path) = write_policy(
+            "tmpl",
+            "version 1\nquarantine csv on template when any inputs (in.leaf_script.count_op(OP_CHECKSEQUENCEVERIFY) > 0)\n",
+        );
+        let mp = Mempool::with_config(MempoolConfig::default());
+        mp.load_policy_file(&path)
+            .expect("template-only enforcement match must not be gated");
+        assert!(mp.has_policy());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn danger_gate_reload_keeps_last_good() {
+        // A safe ruleset loads; a dangerous reload is refused and the safe one
+        // stays installed (I7 last-good).
+        let (dir, safe) = write_policy("safe", "version 1\nquarantine cheap when tx.fee_rate < 1000\n");
+        let danger = dir.join("danger.policy");
+        std::fs::write(&danger, CSV_RULE).unwrap();
+
+        let mp = Mempool::with_config(MempoolConfig::default());
+        mp.load_policy_file(&safe).expect("safe loads");
+        let before = mp.policy_snapshot().map(|rs| rs.rules()[0].name.clone());
+
+        let err = match mp.reload_policy_file(&danger) {
+            Err(e) => e,
+            Ok(_) => panic!("dangerous reload must be refused"),
+        };
+        assert!(err.contains("refusing"), "{err}");
+        let after = mp.policy_snapshot().map(|rs| rs.rules()[0].name.clone());
+        assert_eq!(before, after, "dangerous reload must keep last-good");
+        assert_eq!(before.as_deref(), Some("cheap"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn no_policy_is_byte_identical_to_engine_compiled_out() {
         // I8: with no ruleset (and with an *empty* ruleset, which the hot path
@@ -4484,7 +4629,9 @@ mod tests {
                 .as_nanos()
         ));
 
-        std::fs::write(&path, "version 1\nquarantine a when tx.version == 2\n").unwrap();
+        // `tx.version == 3` is gate-safe (the danger vectors are version 2, like
+        // real commitments) while staying distinct from the edited rule below.
+        std::fs::write(&path, "version 1\nquarantine a when tx.version == 3\n").unwrap();
         // First load is a change (was none).
         assert!(matches!(
             mp.reload_policy_file(&path).unwrap(),

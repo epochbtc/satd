@@ -52,6 +52,29 @@ pub fn get_policy_info(mempool: &Mempool) -> Value {
         }
     }
 
+    // Lightning-enforcement danger findings for the live ruleset (§2.5). A
+    // loaded ruleset only reaches here if it passed the load gate, so any
+    // relay-withholding findings present imply `allowdangerousfilters` is set.
+    let allow_dangerous = mempool.policy().allow_dangerous_filters;
+    let mut findings: Vec<Value> = Vec::new();
+    let (mut relay_withholding, mut template_only) = (0u64, 0u64);
+    if let Some(rs) = mempool.policy_snapshot() {
+        for f in satd_policy::analyze_danger(&rs) {
+            if f.withholds_relay() {
+                relay_withholding += 1;
+            } else {
+                template_only += 1;
+            }
+            findings.push(json!({
+                "rule": f.rule,
+                "shape": f.shape.label(),
+                "class": f.class.headline(),
+                "withholds_relay": f.withholds_relay(),
+                "scope": { "relay": f.scope.relay, "template": f.scope.template },
+            }));
+        }
+    }
+
     json!({
         "loaded": true,
         "path": meta.path.as_ref().map(|p| p.display().to_string()),
@@ -68,6 +91,12 @@ pub fn get_policy_info(mempool: &Mempool) -> Value {
             "count": mempool.quarantine_count(),
             "bytes": mempool.quarantine_bytes(),
             "budget_bytes": mempool.policy().quarantine_max_bytes,
+        },
+        "danger": {
+            "allow_dangerous_filters": allow_dangerous,
+            "relay_withholding": relay_withholding,
+            "template_only": template_only,
+            "findings": findings,
         },
     })
 }
