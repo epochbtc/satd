@@ -45,24 +45,40 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   sidecar, so production nodes can be profiled with `perf -g` and symbolized
   against the exact running binary. See the
   [release notes](docs/release-notes/0.4.0-pre.md).
-- **Fee estimation reworked.** Fixed inverted smart-fee tiers (now monotone:
-  `High ≥ Medium ≥ Low ≥ economy`); unified `estimatefees`,
-  `estimatesmartfee`, the TUI, the MCP `estimate_fee` tool, Esplora
-  `/fee-estimates`, and Electrum `blockchain.estimatefee` on one shared
-  estimator so they agree; made the per-block floor robust to a single cheap
-  tail transaction; and cache the mempool simulation behind the public fee
-  endpoints. **Corrected a 4× fee over-report** (regression since 0.3.0) on
-  Esplora `/fee-estimates` + `/mempool` fee rates and Electrum
-  `estimatefee`/`relayfee`/`get_fee_histogram` — see the
-  [release notes](docs/release-notes/0.4.0-pre.md) for the upgrade note.
+- **Streaming API: mid-stream `SetCursor` re-anchor on gRPC `Watch`.** A
+  `SetCursor` on a live bidi `Watch` now replays confirmed history
+  `(cursor.height, tip]` in order ahead of the live tail (drain-replay-resume),
+  preserving the watch-set + quota leases — previously a documented no-op. Lets a
+  long-lived `Watch` re-anchor its replay position without rebuilding a large
+  watch-set. See the [release notes](docs/release-notes/0.4.0-pre.md).
+- **Streaming API: prefix mempool spend-side prevout carriage (`full` tier).**
+  Under `streamprevoutmeta = full`, a mempool `PrefixMatched` now carries the real
+  spent-prevout `scriptPubKey` (and, from `amount`, its value) so a chainstate-less
+  privacy client can confirm a bucket spend locally without resolving the outpoint.
+  `SpentPrevout` gains `amount`/`has_amount`. See the
+  [release notes](docs/release-notes/0.4.0-pre.md).
+- **Streaming API: per-script `min_value` filter on `AddScripts`.** A watch can
+  attach a per-scripthash satoshi floor (`min_values`, parallel to
+  `scripthashes`); matches below it are suppressed server-side. Symmetric across
+  funding (output value) and spending (spent-prevout value). Also corrects the
+  stale `ScriptMatched.is_output` proto comment (input-side matching has shipped
+  since the prefix/exact spend-side work). See the
+  [release notes](docs/release-notes/0.4.0-pre.md).
+- **Streaming API: `streamprevoutmeta` mempool prevout retention (default
+  `amount`).** New mempool-policy key tuning how much spent-prevout metadata the
+  streaming watch matcher retains per mempool input (`hash` | `amount` | `full`)
+  — the foundation for mempool-input `min_value` filtering and chainstate-less
+  prefix-spend confirmation. SIGHUP-reloadable.
+  See the [release notes](docs/release-notes/0.4.0-pre.md).
 
 ## Releases
 
 | Version | Date | Notes |
 |---|---|---|
+| [0.3.1](docs/release-notes/0.3.1.md) | 2026-06-15 | Maintenance release on the 0.3.x line — all bug fixes and tooling, no breaking changes. Fee estimation reworked and unified across every surface (monotone tiers; **corrected a 4× over-report on Esplora/Electrum fee rates**, a regression since 0.3.0); `getrawmempool` verbose no longer O(N²); profilable release binaries (frame pointers + a signed per-target debuginfo sidecar); and the MCP `get_metrics_snapshot` tool now reports real address-index state. Defaults stay Bitcoin Core-compatible. |
 | [0.3.0](docs/release-notes/0.3.0.md) | 2026-06-10 | Consensus hardening — per-network softfork-activation heights (critical, non-mainnet), six block-level rules brought to Core parity, a live Core block-acceptance differential + fuzzer — and **critical storage-durability fixes** (silent UTXO/index loss after IBD/reindex, plus an offline `satd-chainstate-repair` tool). Adds `invalidateblock`/`reconsiderblock`, reliable local-tx broadcast + durable rebroadcast, opt-in bearer auth, API-surface scaling, a push-based Streaming Consumption API, drop-in `bitcoin.conf` compatibility, and canary-fleet client-compat fixes. New surfaces are opt-in — defaults stay Bitcoin Core-compatible. |
 | [0.2.1](docs/release-notes/0.2.1.md) | 2026-05-29 | Packaging only — ship `sat-tui` in tarballs (no code change from 0.2.0). |
 | [0.2.0](docs/release-notes/0.2.0.md) | 2026-05-27 | BIP 324 v2 transport, native TLS, client-side PSBT signing, Core CLI/config-compat gap closed, AssumeUTXO fast-start. **Breaking storage cleanup** — see notes. |
 | [0.1.0](docs/release-notes/0.1.0.md) | 2026-05-08 | First public release: mainnet-validated node, native Esplora/Electrum/cfilters, Core-compatible RPC/CLI, signed reproducible builds. |
 
-[Unreleased]: https://github.com/epochbtc/satd/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/epochbtc/satd/compare/v0.3.1...HEAD

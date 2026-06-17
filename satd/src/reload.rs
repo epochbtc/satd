@@ -262,6 +262,7 @@ pub fn mempool_config_from(c: &Config) -> MempoolConfig {
         // `policyfile` quarantines something.
         quarantine_max_bytes: c.quarantinemempool.saturating_mul(1_000_000),
         allow_dangerous_filters: c.allowdangerousfilters,
+        prevout_meta: c.stream_prevout_meta,
     }
 }
 
@@ -740,6 +741,13 @@ fn field_specs() -> Vec<FieldSpec> {
         // at the end of `reload_from_sighup` (the `TokenStore` precedent, §8). A
         // path-diff spec would miss in-place edits to the same file, so the whole
         // policy reload (path change, content change, and removal) lives there.
+        // Streaming watch matcher prevout-metadata retention. Lives in the
+        // mempool policy (captured at admission), so a SIGHUP change governs
+        // subsequent admissions; entries already in the pool keep whatever they
+        // were admitted with (mempool spend-side matching is best-effort).
+        live!("streamprevoutmeta", stream_prevout_meta, |c, h| {
+            h.mempool.reload_policy(mempool_config_from(c))
+        }),
         // `-networkactive`: toggle P2P networking live (same effect as the
         // `setnetworkactive` RPC). Disabling disconnects all peers.
         live!("networkactive", networkactive, |c, h| {

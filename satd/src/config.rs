@@ -1,5 +1,6 @@
 use bitcoin::Network;
 use clap::Parser;
+use node::mempool::pool::PrevoutMetaLevel;
 use node::rpc::allowip::IpAllowEntry;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -1098,6 +1099,14 @@ pub struct Config {
     /// for coarseness pricing (a `bits == max` prefix costs one unit). Range
     /// `[stream_prefix_min_bits, 32]`. Default: 32.
     pub stream_prefix_max_bits: u32,
+    /// How much per-input prevout metadata the mempool retains at admission for
+    /// the streaming watch matcher's spend-side path (`streamprevoutmeta`): see
+    /// [`PrevoutMetaLevel`]. `hash` = scripthash only (cheapest, current
+    /// behavior); `amount` = + prevout value (enables mempool-input `min_value`);
+    /// `full` = + full prevout script (enables chainstate-less prefix-spend
+    /// confirmation). Default: `amount`. Lives in the mempool policy, so it is
+    /// SIGHUP-reloadable and governs subsequent admissions.
+    pub stream_prevout_meta: PrevoutMetaLevel,
     /// ZMQ endpoint string (e.g. `tcp://0.0.0.0:28332`) for the events
     /// PUB-socket sink. `None` = disabled. Topics emitted: `hashtx`,
     /// `hashblock` (Bitcoin Core wire-format compatible), plus
@@ -3169,6 +3178,22 @@ impl Config {
                 .stream_prefix_max_bits
                 .or_else(|| file_get("streamprefixmaxbits").and_then(|v| v.parse().ok()))
                 .unwrap_or(32),
+            stream_prevout_meta: {
+                let raw = cli
+                    .stream_prevout_meta
+                    .clone()
+                    .or_else(|| file_get("streamprevoutmeta"));
+                match raw {
+                    Some(s) => PrevoutMetaLevel::parse(&s).unwrap_or_else(|| {
+                        eprintln!(
+                            "warning: invalid streamprevoutmeta '{}' (expected hash|amount|full), falling back to 'amount'",
+                            s
+                        );
+                        PrevoutMetaLevel::default()
+                    }),
+                    None => PrevoutMetaLevel::default(),
+                }
+            },
             events_zmq_bind: cli.events_zmq_bind.or_else(|| file_get("eventszmqbind")),
             events_zmq_hashtx: cli
                 .events_zmq_hashtx
@@ -5081,6 +5106,13 @@ pub struct CliArgs {
     pub stream_prefix_max_bits: Option<u32>,
 
     #[arg(
+        long = "stream-prevout-meta",
+        value_name = "LEVEL",
+        help = "Per-input prevout metadata the mempool retains for the streaming watch matcher: hash | amount | full (default: amount)"
+    )]
+    pub stream_prevout_meta: Option<String>,
+
+    #[arg(
         long = "events-zmq-bind",
         value_name = "ENDPOINT",
         help = "ZMQ endpoint for the events PUB sink (e.g. 'tcp://0.0.0.0:28332'). Default: disabled"
@@ -5879,6 +5911,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "streammaxresyncblocks",
     "streamprefixminbits",
     "streamprefixmaxbits",
+    "streamprevoutmeta",
     "eventszmqbind",
     "eventszmqhashtx",
     "eventszmqhashblock",
@@ -7029,6 +7062,7 @@ rpcport=8332
             stream_max_resync_blocks: None,
             stream_prefix_min_bits: None,
             stream_prefix_max_bits: None,
+            stream_prevout_meta: None,
             events_zmq_bind: None,
             events_zmq_hashtx: None,
             events_zmq_hashblock: None,
@@ -7299,6 +7333,7 @@ rpcport=8332
             stream_max_resync_blocks: None,
             stream_prefix_min_bits: None,
             stream_prefix_max_bits: None,
+            stream_prevout_meta: None,
             events_zmq_bind: None,
             events_zmq_hashtx: None,
             events_zmq_hashblock: None,

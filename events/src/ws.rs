@@ -657,7 +657,14 @@ enum WsControl {
     /// Remove outpoints from the watch-set.
     RemoveOutpoints { outpoints: Vec<WsOutpoint> },
     /// Add scripthashes (32-byte hex, natural order) to the watch-set.
-    AddScripts { scripthashes: Vec<String> },
+    /// `min_values` is an optional per-scripthash `min_value` floor (satoshis),
+    /// parallel to `scripthashes`; empty = no floors, otherwise its length must
+    /// equal `scripthashes`.
+    AddScripts {
+        scripthashes: Vec<String>,
+        #[serde(default)]
+        min_values: Vec<u64>,
+    },
     /// Remove scripthashes from the watch-set.
     RemoveScripts { scripthashes: Vec<String> },
     /// Add transaction ids (display/reversed hex) to the watch-set. With
@@ -798,15 +805,48 @@ fn apply_ws_control(
                 },
             );
         }
-        WsControl::AddScripts { scripthashes } => {
-            watch_set.add_scripts(
-                principal,
-                scripthashes.iter().filter_map(|s| parse_ws_scripthash(s)),
-                "scripts",
-                |shs| {
-                    handle.add_scripthashes(shs);
-                },
-            );
+        WsControl::AddScripts {
+            scripthashes,
+            min_values,
+        } => {
+            // Optional per-script `min_value` floors, parallel to `scripthashes`
+            // (mirrors the gRPC AddScripts). A length mismatch is a protocol
+            // error — reject the whole add rather than apply the wrong floors.
+            if !min_values.is_empty() && min_values.len() != scripthashes.len() {
+                warn!(
+                    target: "events::ws",
+                    min_values = min_values.len(),
+                    scripthashes = scripthashes.len(),
+                    "streamws AddScripts min_values length mismatch; ignoring add",
+                );
+            } else {
+                let floors: std::collections::HashMap<[u8; 32], u64> = scripthashes
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, s)| {
+                        parse_ws_scripthash(s)
+                            .map(|sh| (sh, min_values.get(i).copied().unwrap_or(0)))
+                    })
+                    .collect();
+                // Apply the parsed floors to a set of scripthashes — used for
+                // both net-new and re-asserted scripts (see the gRPC handler for
+                // the rationale: re-asserting a held script updates its floor in
+                // place without re-charging the watch).
+                let apply_floors = |shs: &[[u8; 32]]| {
+                    let items: Vec<([u8; 32], u64)> = shs
+                        .iter()
+                        .map(|sh| (*sh, floors.get(sh).copied().unwrap_or(0)))
+                        .collect();
+                    handle.add_scripthashes_with_floors(&items);
+                };
+                watch_set.add_scripts(
+                    principal,
+                    scripthashes.iter().filter_map(|s| parse_ws_scripthash(s)),
+                    "scripts",
+                    apply_floors,
+                    apply_floors,
+                );
+            }
         }
         WsControl::RemoveScripts { scripthashes } => {
             watch_set.remove_scripts(
@@ -871,6 +911,8 @@ fn apply_ws_control(
                     |shs| {
                         handle.add_scripthashes(shs);
                     },
+                    // Descriptor scripts have no floor — no metadata to refresh.
+                    |_| {},
                 );
             }
             Err(e) => {
@@ -1025,10 +1067,17 @@ fn watch_match_json(m: &WatchMatch) -> serde_json::Value {
                     "raw_tx": hex::encode(pm.raw_tx.as_ref()),
                     "confirmed": pm.confirmed,
                     "height": pm.height,
-                    "matched_prevouts": pm.matched_prevouts.iter().map(|(op, spk)| json!({
-                        "outpoint_txid": hex::encode(op.txid.as_raw_hash().to_byte_array()),
-                        "outpoint_vout": op.vout,
-                        "script_pubkey": hex::encode(spk.as_bytes()),
+                    "matched_prevouts": pm.matched_prevouts.iter().map(|m| json!({
+                        "outpoint_txid": hex::encode(m.outpoint.txid.as_raw_hash().to_byte_array()),
+                        "outpoint_vout": m.outpoint.vout,
+                        "script_pubkey": hex::encode(m.script_pubkey.as_bytes()),
+                        // `amount` is null when the value was not retained
+                        // (streamprevoutmeta below `amount`); `has_amount`
+                        // mirrors the gRPC SpentPrevout bool so a JSON client can
+                        // distinguish "not retained" from a genuine 0-sat prevout
+                        // without relying on the null-vs-0 encoding.
+                        "amount": m.amount,
+                        "has_amount": m.amount.is_some(),
                     })).collect::<Vec<_>>(),
                 }
             })
@@ -1249,12 +1298,32 @@ mod tests {
 
     #[test]
     fn prefix_matched_json_shape() {
+        use bitcoin::hashes::Hash;
+        let op = |b: u8, vout: u32| bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_raw_hash(
+                bitcoin::hashes::sha256d::Hash::from_byte_array([b; 32]),
+            ),
+            vout,
+        };
         let m = WatchMatch::PrefixMatched(Box::new(node::events::PrefixMatch {
             prefix: (0xabcd_0000, 16),
             raw_tx: vec![0x01, 0x02].into(),
             confirmed: true,
             height: Some(5),
-            matched_prevouts: vec![],
+            matched_prevouts: vec![
+                // value retained (>= amount tier): amount present, has_amount true
+                node::events::SpentPrevoutMeta {
+                    outpoint: op(0x11, 0),
+                    script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x51]),
+                    amount: Some(0),
+                },
+                // value NOT retained (hash tier): amount null, has_amount false
+                node::events::SpentPrevoutMeta {
+                    outpoint: op(0x22, 1),
+                    script_pubkey: bitcoin::ScriptBuf::new(),
+                    amount: None,
+                },
+            ],
         }));
         let v = watch_match_json(&m);
         assert_eq!(v["body"]["category"], "prefix_matched");
@@ -1263,6 +1332,16 @@ mod tests {
         assert_eq!(v["body"]["raw_tx"], "0102");
         assert_eq!(v["body"]["confirmed"], true);
         assert_eq!(v["cursor"]["height"], 5);
+        let mp = &v["body"]["matched_prevouts"];
+        // Retained 0-sat prevout: amount is the number 0 and has_amount is true —
+        // distinguishable from "not retained".
+        assert_eq!(mp[0]["amount"], 0);
+        assert_eq!(mp[0]["has_amount"], true);
+        assert_eq!(mp[0]["script_pubkey"], "51");
+        // Unretained prevout: amount is JSON null and has_amount is false.
+        assert!(mp[1]["amount"].is_null());
+        assert_eq!(mp[1]["has_amount"], false);
+        assert_eq!(mp[1]["script_pubkey"], "");
     }
 
     #[test]

@@ -273,6 +273,9 @@ message ScriptMatched {
   uint32 index      = 4;      // vout if is_output else vin
   bool   confirmed  = 5;
 }
+
+// AddScripts carries an optional per-scripthash min_value floor (§7.2.1).
+message AddScripts { repeated bytes scripthashes = 1; repeated uint64 min_values = 2; }
 ```
 
 `OutpointSpent` covers spend detection in both the mempool and connected blocks.
@@ -289,6 +292,39 @@ resolved for validation), yielding `ScriptMatched{is_output = false, confirmed =
 false}` without re-resolving anything off the hot path. Watching the funding
 **outpoint** also surfaces the spend (via `OutpointSpent`); the script path means a
 script watcher need not separately enumerate its outpoints to see unconfirmed spends.
+
+#### 7.2.1 Per-script `min_value` floor
+
+`AddScripts` accepts an optional `min_values` list, parallel to `scripthashes`: a
+per-script floor in satoshis below which matches are suppressed **server-side**, so
+a watcher that only cares about economically significant activity is not woken by
+dust. An empty `min_values` means no floors; a non-empty list MUST have the same
+length as `scripthashes` (a mismatch rejects the whole add — never silently
+unfiltered). Re-asserting a watched scripthash updates its floor in place (it is
+not a new quota item).
+
+The floor is **symmetric** with the two sides of `ScriptMatched`, gating on the
+value of the coin the script controls in that match:
+
+- **Funding** (`is_output = true`): the matched output's value.
+- **Spending** (`is_output = false`): the **spent prevout's** value — the input
+  carries no value, so it is recovered the same way the prevout `scriptPubKey` is.
+  For a **confirmed** block that is the undo data (`spent_coins[i].value`, free
+  alongside the script); for the **mempool** it is the prevout value retained at
+  admission (`streamprevoutmeta ≥ amount`, §12.1) — the default.
+
+On a node configured `streamprevoutmeta = hash` the mempool spend side has no
+value to test, so a floored script's **unconfirmed-spend** matches **fail closed**
+(suppressed) rather than being delivered unfiltered — a `min_value` watcher is
+never handed a possibly-dust unconfirmed spend it asked to be spared. The floor is
+still enforced normally on that script's funding and confirmed-block-input sides;
+only the mempool spend preview is withheld until the operator retains amounts.
+(Non-floored watches on the same node are unaffected.)
+
+The value itself never enters the wire event — the floor is purely a delivery
+filter. The floor on the **output** and **confirmed-input** sides costs nothing
+(both values are already in hand); only the mempool-input side depends on the
+retention tier.
 
 ### 7.3 Bidirectional control channel
 
@@ -323,12 +359,46 @@ in without protocol breakage, the design choice that avoids btcd's BIP37 dead-en
 The WS control channel is the JSON mirror of this union.
 
 **Resume semantics.** Durable replay (§6.2) is offered at stream **establishment**:
-`Subscribe(from_cursor)` on gRPC, and `?from_cursor=` at WS/SSE connect. Mid-stream
-`SetCursor` on the bidi `Watch` is a **documented no-op** — splicing a historical
-replay into a stream that is already live is ill-defined (it would interleave past
-and present); a client that needs to re-anchor reconnects with `from_cursor`
-instead. A client that sends only `SetCategories` and no watch-add gets exactly the
-legacy firehose behavior.
+`Subscribe(from_cursor)` on gRPC, and `?from_cursor=` at WS/SSE connect. A client
+that sends only `SetCategories` and no watch-add gets exactly the legacy firehose
+behavior.
+
+Mid-stream `SetCursor` on the bidirectional gRPC `Watch` **re-anchors** the
+firehose (§7.3.1); WS/SSE clients, which have no mid-stream control channel,
+re-anchor by reconnecting with `?from_cursor=`.
+
+#### 7.3.1 Mid-stream re-anchor
+
+`SetCursor(cursor)` on a live `Watch` replays the confirmed history the client
+asks to revisit, then resumes the live tail — without tearing down the watch-set.
+It is an **ordered drain-replay-resume**, not an interleave:
+
+1. The server runs the same `build_cursor_replay` snapshot→live handoff used at
+   establishment (§6.2) for `(cursor.height, current_tip]`.
+2. The replayed confirmed events are emitted **in height order, ahead of any
+   further live events** — the re-anchor batch is drained to completion before the
+   live tail resumes. Live events that accumulate during the drain follow and may
+   duplicate the tail of the replay; the client de-duplicates by `(height, hash)`
+   exactly as at the establishment seam (§6.3), so the stream is at-least-once with
+   idempotent confirmed application.
+3. The **watch-set and its quota leases are preserved** across the re-anchor —
+   the reason to re-anchor in place rather than reconnect with `from_cursor`, which
+   would force a full re-add (+ re-auth + quota rebuild) of a possibly-large
+   watch-set. A long-lived `Watch` with thousands of registered scripts/outpoints
+   re-anchors its replay position without rebuilding its watch-set.
+
+**Not replayed:** historical watch *matches*. Watch matches are per-subscriber and
+not durable (they are never part of cursor replay, nor bridged to ZMQ). A
+re-anchor replays the firehose/confirmed history only; the client reconstructs any
+historical matches it needs from the replayed blocks against its own watch-set, and
+receives live matches going forward. A re-anchor on a server with no `block_source`
+configured is a no-op (the same fallback as `Subscribe(from_cursor)` without a
+source). Replay work is bounded two ways: concurrent re-anchors are capped at one
+in flight per stream (a `SetCursor` arriving while a drain is running is dropped),
+and each actionable re-anchor is charged against the connection's per-principal
+rate limit — the same token bucket as watch-set adds — so back-to-back `SetCursor`s
+in a tight loop are throttled rather than allowed to re-walk the block index
+unboundedly. (Operator/loopback principals bypass the rate limit, as elsewhere.)
 
 ### 7.4 Transaction lifecycle & confirmation-depth watches
 
@@ -439,20 +509,36 @@ message PrefixMatched {                       // body field 23
   bytes        raw_tx           = 2;          // the full matching tx, inline — no precise follow-up fetch
   bool         confirmed        = 3;
   uint32       height           = 4;
-  repeated SpentPrevout matched_prevouts = 5; // spend side; script_pubkey set on confirmed spends, empty on mempool spends (hash-only) and pure funding
+  repeated SpentPrevout matched_prevouts = 5; // spend side (see SpentPrevout); empty on a pure funding match
 }
-message SpentPrevout { bytes outpoint_txid = 1; uint32 outpoint_vout = 2; bytes script_pubkey = 3; }
+// script_pubkey/amount carriage depends on the retention tier (§12.1): confirmed
+// spends always carry both (from undo); mempool spends carry the script only
+// under `full` and the value only under `>= amount`. `has_amount` disambiguates a
+// genuine 0-sat prevout from "value not retained".
+message SpentPrevout {
+  bytes  outpoint_txid = 1; uint32 outpoint_vout = 2;
+  bytes  script_pubkey = 3;  // empty when not retained
+  uint64 amount = 4; bool has_amount = 5;
+}
 ```
+
+On the WS/SSE JSON surface each `matched_prevouts` entry mirrors this exactly:
+`script_pubkey` is a (possibly empty) hex string, `amount` is a number or `null`
+when the value was not retained, and `has_amount` is the explicit boolean — so a
+JSON client need not infer retention from the `null`-vs-`0` encoding.
 
 **Delivery is self-contained, deliberately.** `PrefixMatched` carries the full
 `raw_tx`, not a txid — a txid would force the client to fetch the transaction
 precisely, re-leaking the exact interest the bucket was hiding. For a **confirmed**
-spend it also carries the matched prevout scripts in `matched_prevouts` (recovered
-from undo data), so the client can confirm "this is a spend of one of my outputs"
-without resolving any outpoint itself. For a **mempool** spend, only the
-prevout *hash* is retained (§7.2), so `matched_prevouts` carries the spent outpoint
-with an *empty* `script_pubkey`; the client confirms the match against its own UTXO
-set rather than from the event alone. Because a bucket is
+spend it also carries the matched prevout scripts (and values) in
+`matched_prevouts` (recovered from undo data), so the client can confirm "this is a
+spend of one of my outputs" without resolving any outpoint itself. For a
+**mempool** spend, how much it can confirm from the event alone depends on the
+operator's `streamprevoutmeta` (§12.1): under `full` the real prevout `scriptPubKey`
+is carried (the chainstate-less / privacy client's case — confirm locally, no
+outpoint resolution, no re-leak); under the default `amount` the value is carried
+but the script is empty; under `hash` neither is, and the client confirms the match
+against its own UTXO set. Because a bucket is
 a 2⁻ᵏ slice of uniform scripthash space, inline full-tx delivery is cheap: even a
 coarse k=8 bucket (anonymity set ≈ 256×) is a low-single-digit transactions per
 block plus a trickle from the mempool.
@@ -601,6 +687,41 @@ exhaustion, mirroring the rest of the node's admission controls. All are
 
 Admission shedding runs ahead of authentication and request-body buffering, so a
 connection flood — authenticated or not — is bounded before it does work.
+
+### 12.1 Mempool spend-side prevout retention
+
+The matcher's **mempool** spend-side path (§7.2, §7.5) needs prevout data the
+spending input does not carry. Whatever it needs must be captured at admission —
+`prev_outputs` is resolved for validation and then dropped, so there is no
+off-hot-path way to recover it later. `streamprevoutmeta` tunes how much is kept
+per mempool input, trading memory for matcher capability:
+
+| Value | Per-input cost | Enables |
+|---|---|---|
+| `hash` | scripthash only (32 B) | exact-script + prefix **bucket** matching; client resolves outpoints itself |
+| `amount` *(default)* | + prevout value (8 B) | a mempool-input `min_value` floor on spend-side script matches |
+| `full` | + full prevout `scriptPubKey` (variable, one heap allocation) | a chainstate-less client confirming a mempool prefix spend without resolving any outpoint |
+
+Retention is paid for **every** mempool entry regardless of subscribers (it
+happens at admission), so the default is the cheapest tier that makes `min_value`
+work out of the box; `full` is opt-in because it both costs the most and widens
+the data the node holds in memory. Unlike the §12 caps this is a live-reloadable
+mempool-policy key (SIGHUP): a change governs subsequent admissions, while entries
+already pooled keep whatever they were admitted with (mempool matching is
+best-effort by contract, §6.2). The confirmed-block spend side is unaffected — it
+always recovers full script and value from undo data (§7.2).
+
+**Memory accounting.** Retained prevout metadata is held *alongside* each mempool
+entry and is **not** counted against `maxmempool` (which bounds only serialized
+transaction weight). Budget for it separately. The worst case is bounded by the
+mempool's input count: roughly `entries × inputs_per_entry × per_input_cost`,
+where `per_input_cost` is 32 B (`hash`), 40 B (`amount`), or 32 B + the prevout
+script length (`full`, typically ~34 B for witness outputs, but attacker-
+influenceable up to the standardness script-size limit). For a full default-size
+mempool this is sub-1% of the mempool's own footprint under `hash`/`amount`; under
+`full` size it as `maxmempool` plus that per-input script overhead, and prefer a
+lower tier on memory-constrained nodes that do not need chainstate-less spend
+confirmation.
 
 ## 13. Open questions
 
