@@ -20,8 +20,11 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   through dedicated surfaces — `getpolicyinfo`, `getquarantineinfo` (with
   foregone-fees + confirmed-anyway), `listquarantine`, `getquarantineentry`,
   `policytest`, matching MCP tools, and `satd_policy_*` Prometheus metrics. Live
-  `SIGHUP` reload (last-good-wins, lossless re-placement). Offline `sat-cli
-  policylint`. New Operator Manual chapter plus a contributor
+  `SIGHUP` reload (last-good-wins, lossless re-placement). A **strict-by-default
+  Lightning-enforcement danger gate** refuses a policy whose rule would withhold
+  relay for L2 enforcement traffic (BOLT-3 commitment/justice/HTLC, taproot
+  spends); opt out with `allowdangerousfilters=1`. Offline `sat-cli policylint`
+  (exit 3 on a dangerous rule). New Operator Manual chapter plus a contributor
   [design doc](satd-policy/DESIGN.md). See the
   [release notes](docs/release-notes/0.4.0-pre.md).
 - **Profilable release binaries.** Release builds now ship with frame pointers
