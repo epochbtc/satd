@@ -1140,9 +1140,25 @@ impl Mempool {
         // (txid, new scope, responsible rule) — for the Demoted event.
         let mut demoted: Vec<(Txid, QuarantineScope, String)> = Vec::new();
         let mut evicted: Vec<Txid> = Vec::new();
+        // Standard (acting-only) mempool-surface events for txs that cross the
+        // acting boundary on this reload. `std_enter` carries the `Enter` fields
+        // (txid, fee, vsize, fee_rate, time); `std_leave` is txids that leave.
+        let mut std_enter: Vec<(Txid, u64, u64, u64, u64)> = Vec::new();
+        let mut std_leave: Vec<Txid> = Vec::new();
 
         {
             let mut inner = self.inner.write();
+            // The default event stream and the address / Electrum / Esplora
+            // indexes reflect the ACTING class only — a held tx emits no `Enter`
+            // and is absent from them. Snapshot which txs are visible now so we
+            // can emit the matching `Enter`/`Leave` for any that cross the acting
+            // boundary as the reloaded ruleset is applied below.
+            let prior_visible: std::collections::HashSet<Txid> = inner
+                .entries
+                .iter()
+                .filter(|(_, e)| e.scope.is_acting())
+                .map(|(t, _)| *t)
+                .collect();
             let order = Self::topological_order(&inner.entries);
 
             for txid in order {
@@ -1294,6 +1310,39 @@ impl Mempool {
                 let over = inner.quarantine_bytes - cfg.quarantine_max_bytes;
                 evicted.extend(Self::evict_lowest_fee_entries(&mut inner, over, true));
             }
+
+            // Net visibility diff for the standard (acting-only) surfaces,
+            // computed from before-vs-after so it is correct regardless of how
+            // the per-tx moves and the budget eviction interact. A tx now acting
+            // that wasn't visible before must `Enter`; a tx that was visible but
+            // is now held (and still resident) must `Leave`. Evicted txs are
+            // excluded here — the eviction loop below emits their `LeaveEvicted`.
+            let gone: std::collections::HashSet<Txid> = evicted.iter().copied().collect();
+            for txid in &prior_visible {
+                if gone.contains(txid) {
+                    continue;
+                }
+                let still_acting = inner
+                    .entries
+                    .get(txid)
+                    .map(|e| e.scope.is_acting())
+                    .unwrap_or(false);
+                if !still_acting {
+                    std_leave.push(*txid);
+                }
+            }
+            for (txid, e) in inner.entries.iter() {
+                if e.scope.is_acting() && !prior_visible.contains(txid) {
+                    std_enter.push((
+                        *txid,
+                        e.fee,
+                        policy::weight_to_vsize(e.weight as u64),
+                        e.fee_rate,
+                        e.time,
+                    ));
+                }
+            }
+
             self.sync_unbroadcast_len(&inner);
         }
 
@@ -1328,6 +1377,27 @@ impl Mempool {
         }
         for txid in &evicted {
             self.emit(MempoolEvent::LeaveEvicted { txid: *txid, reason: EvictReason::Policy });
+        }
+        // Standard mempool surfaces (address/Electrum/Esplora indexes, the
+        // default event stream) track the acting class only, so a reload that
+        // moves a tx across the acting boundary must drive them: a promotion
+        // (held → acting) enters, a demotion (acting → held) leaves. Without
+        // these the indexes would keep showing a now-withheld tx or never learn
+        // about a now-relayable one.
+        for (txid, fee, vsize, fee_rate, time) in &std_enter {
+            self.emit(MempoolEvent::Enter {
+                txid: *txid,
+                fee: *fee,
+                vsize: *vsize,
+                fee_rate_sat_per_kvb: *fee_rate,
+                time: *time,
+            });
+        }
+        for txid in &std_leave {
+            self.emit(MempoolEvent::LeaveEvicted {
+                txid: *txid,
+                reason: EvictReason::Policy,
+            });
         }
 
         // Accumulate the transition into the process-lifetime Prometheus counters.
@@ -2382,6 +2452,8 @@ impl Mempool {
         // Look up inputs
         let mut sum_inputs: u64 = 0;
         let mut prev_outputs: Vec<TxOut> = Vec::new();
+        let mut prev_is_coinbase: Vec<bool> = Vec::new();
+        let mut ancestors: HashSet<Txid> = HashSet::new();
 
         for input in &tx.input {
             if let Some(coin) = chain_state.get_coin(&input.previous_output) {
@@ -2390,6 +2462,7 @@ impl Mempool {
                     value: bitcoin::Amount::from_sat(coin.amount),
                     script_pubkey: coin.script_pubkey.clone(),
                 });
+                prev_is_coinbase.push(coin.coinbase);
             } else {
                 // Check mempool parents
                 let inner = self.inner.read();
@@ -2397,6 +2470,8 @@ impl Mempool {
                     && let Some(output) = parent.tx.output.get(input.previous_output.vout as usize) {
                         sum_inputs += output.value.to_sat();
                         prev_outputs.push(output.clone());
+                        prev_is_coinbase.push(false);
+                        ancestors.insert(input.previous_output.txid);
                         continue;
                     }
                 return Err(MempoolError::MissingInputs);
@@ -2415,7 +2490,72 @@ impl Mempool {
             .verify_transaction(tx, &prev_outputs, tip_height + 1)
             .map_err(|e| MempoolError::Script(e.to_string()))?;
 
-        let vsize = policy::weight_to_vsize(weight as u64) as usize;
+        let weight_u64 = weight as u64;
+        let fee_rate = policy::fee_rate_sat_per_kvb(fee, weight_u64);
+        let vsize = policy::weight_to_vsize(weight_u64) as usize;
+
+        // Policy dry-run (§6.1): `testmempoolaccept` answers "would a local
+        // `sendrawtransaction` accept this?", so it must apply the same policy
+        // verdict the admission path does — otherwise it reports `allowed: true`
+        // for a tx the node would actually refuse. A local submission drawing a
+        // *relay*-scoped quarantine verdict (its own, or inherited from a
+        // quarantined in-mempool ancestor) is refused, exactly as
+        // `accept_transaction` does, with `allowquarantined` defaulting off as
+        // for `sendrawtransaction`. A template-only quarantine still relays, so it
+        // stays `allowed: true`. Standardness is not re-litigated here (this dry
+        // run never ran the standardness pass), so deferred-standardness
+        // forgiveness is moot — this only ever surfaces the relay refusal, never
+        // adds a false one. Counters are left untouched: this is not a real eval.
+        if let Some(rs) = self.policy.load_full().as_ref().filter(|r| !r.is_empty()) {
+            let cfg = self.config.read().clone();
+            let inner = self.inner.read();
+            // Transitive in-mempool ancestor set (for infectious propagation).
+            if !ancestors.is_empty() {
+                let mut queue: Vec<Txid> = ancestors.iter().copied().collect();
+                while let Some(a) = queue.pop() {
+                    if let Some(ae) = inner.entries.get(&a) {
+                        for ai in &ae.tx.input {
+                            let gp = ai.previous_output.txid;
+                            if inner.entries.contains_key(&gp) && ancestors.insert(gp) {
+                                queue.push(gp);
+                            }
+                        }
+                    }
+                }
+            }
+            let ctx = PolicyCtx {
+                network: chain_state.network,
+                height: tip_height,
+                mempool_bytes: inner.total_bytes,
+            };
+            let verdict = policy_engine::evaluate(
+                rs, tx, &txid, &prev_outputs, &prev_is_coinbase, fee, fee_rate, weight, &cfg, ctx,
+                TxSource::Rpc, false,
+            );
+            let (mut scope, own_rule) = match &verdict {
+                satd_policy::Verdict::Allow { .. } | satd_policy::Verdict::Pass => {
+                    (QuarantineScope::acting(), None)
+                }
+                satd_policy::Verdict::Quarantine { rule, scope } => {
+                    (policy_engine::map_scope(*scope), Some(rule.clone()))
+                }
+            };
+            // Infectious union from quarantined ancestors (§3/§7).
+            for anc in &ancestors {
+                if let Some(ae) = inner.entries.get(anc)
+                    && ae.scope.is_quarantined()
+                {
+                    scope.relay |= ae.scope.relay;
+                    scope.template |= ae.scope.template;
+                }
+            }
+            if scope.relay {
+                return Err(MempoolError::Quarantined(
+                    own_rule.unwrap_or_else(|| INFECTIOUS_RULE.to_string()),
+                ));
+            }
+        }
+
         Ok((txid, vsize, fee))
     }
 
@@ -4603,6 +4743,85 @@ mod tests {
         assert!(t.demoted.is_empty());
         assert!(scope_of(&mp, &txid).is_acting());
         assert_eq!(mp.quarantine_bytes(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reapply_emits_standard_enter_on_promote_and_leave_on_demote() {
+        // Deep-review (PR 417): the standard acting-only surfaces — address /
+        // Electrum / Esplora indexes and the default event stream — must be
+        // driven by reload moves across the acting boundary: a promotion emits
+        // `Enter`, a demotion emits `Leave`. Without these the indexes go stale
+        // (a demoted tx stays visible; a promoted tx never appears).
+        let op = outpoint(0xd9);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin(100_000))]);
+        let (etx, mut erx) = broadcast::channel::<MempoolEvent>(16);
+        mp.set_event_sender(etx);
+
+        // Admit under a relay-quarantine rule via P2P (held, not refused): no
+        // `Enter` on the default stream.
+        set_ruleset(&mp, "version 1\nquarantine catch when tx.version == 2");
+        let tx = spend(op, 99_000, 0x22);
+        let txid = mp
+            .accept_transaction(tx, &cs, &NoopVerifier, TxSource::P2p, false)
+            .expect("admitted to quarantine");
+        assert!(scope_of(&mp, &txid).is_quarantined());
+        assert!(matches!(
+            erx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+
+        // Remove the rule and reapply → promoted → the standard stream Enters.
+        mp.clear_policy();
+        let t = mp.reapply_policy(&cs);
+        assert_eq!(t.promoted, vec![txid]);
+        match erx.try_recv() {
+            Ok(MempoolEvent::Enter { txid: e, .. }) => assert_eq!(e, txid),
+            other => panic!("promotion must emit a standard Enter, got {other:?}"),
+        }
+
+        // Re-add the rule and reapply → demoted → the standard stream Leaves.
+        set_ruleset(&mp, "version 1\nquarantine catch when tx.version == 2");
+        let t = mp.reapply_policy(&cs);
+        assert_eq!(t.demoted, vec![txid]);
+        match erx.try_recv() {
+            Ok(MempoolEvent::LeaveEvicted { txid: e, reason }) => {
+                assert_eq!(e, txid);
+                assert_eq!(reason, EvictReason::Policy);
+            }
+            other => panic!("demotion must emit a standard Leave, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_accept_applies_policy_relay_refusal() {
+        // Deep-review (PR 417): testmempoolaccept must reflect the verdict a local
+        // sendrawtransaction would apply — a relay-scoped quarantine refuses, a
+        // template-only quarantine still passes.
+        let op = outpoint(0xda);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin(100_000))]);
+        let tx = spend(op, 99_000, 0x22);
+
+        // No policy → accepted.
+        assert!(mp.test_accept(&tx, &cs, &NoopVerifier).is_ok());
+
+        // Relay-scoped quarantine → refused, naming the rule.
+        set_ruleset(&mp, "version 1\nquarantine catch when tx.version == 2");
+        match mp.test_accept(&tx, &cs, &NoopVerifier) {
+            Err(MempoolError::Quarantined(rule)) => assert_eq!(rule, "catch"),
+            other => panic!("relay quarantine must refuse in test_accept, got {other:?}"),
+        }
+
+        // Template-only quarantine still relays → accepted.
+        set_ruleset(
+            &mp,
+            "version 1\nquarantine catch on template when tx.version == 2",
+        );
+        assert!(
+            mp.test_accept(&tx, &cs, &NoopVerifier).is_ok(),
+            "template-only quarantine is still accepted by test_accept"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
