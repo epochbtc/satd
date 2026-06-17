@@ -147,11 +147,15 @@ pub fn cost(expr: &Expr) -> Cost {
                 MethodCall::Len => 0,
                 // Compare only up to the needle length.
                 MethodCall::StartsWith(n) | MethodCall::EndsWith(n) => n.len() as u64,
+                // Naive substring scan is O(haystack × needle); eval charges
+                // `bytes.len() × needle.len()` (eval.rs `Contains`), so the
+                // static model must carry the needle factor too — otherwise a
+                // long-needle `contains` over a large script passes the budget
+                // but exhausts fuel at runtime and fail-safe-quarantines a
+                // legitimate transaction.
+                MethodCall::Contains(n) => bound.saturating_mul(n.len() as u64),
                 // One linear pass over the receiver bytes.
-                MethodCall::Contains(_)
-                | MethodCall::CountOp(_)
-                | MethodCall::MaxPush
-                | MethodCall::WellFormed => bound,
+                MethodCall::CountOp(_) | MethodCall::MaxPush | MethodCall::WellFormed => bound,
                 // Non-backtracking glob: O(tokens × pattern_tokens); tokens ≈
                 // scanned bytes, pattern includes the +2 AnyRun padding.
                 MethodCall::ContainsOps(pat) => {
@@ -225,6 +229,24 @@ mod tests {
         let prevout = compile("all inputs (in.prevout_script.well_formed)").unwrap();
         assert!(prevout.cost().scan_elem >= 200_000_000, "{:?}", prevout.cost());
         assert!(prevout.cost().within_budget());
+    }
+
+    // The naive substring scan eval performs for `contains` is O(haystack ×
+    // needle), so the static model must carry the needle length. A 1-byte needle
+    // is cheap; a 64-byte needle over every output's script (≈ MAX_TX_SCAN × 64)
+    // exceeds the load-time budget and is rejected — before the needle factor was
+    // counted it passed the gate and silently fuel-quarantined matching txs.
+    #[test]
+    fn contains_cost_counts_needle_length() {
+        let short = compile("any output (out.script.contains(0xaa))").unwrap();
+        assert!(short.cost().within_budget());
+
+        let err = compile(&format!(
+            "any output (out.script.contains(0x{}))",
+            "aa".repeat(64)
+        ))
+        .unwrap_err();
+        assert!(err.message.contains("cost budget"), "{}", err.message);
     }
 
     // A glob over every input's prevout script is now correctly counted as

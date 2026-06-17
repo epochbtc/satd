@@ -66,7 +66,12 @@ struct Ev<'a, 'c> {
 impl<'a, 'c> Ev<'a, 'c> {
     /// Charge `n` fuel; flips `exhausted` once the budget is gone.
     fn burn(&mut self, n: u64) {
-        self.fuel = self.fuel.saturating_sub(n as i64);
+        // Clamp before the i64 cast: a charge > i64::MAX would wrap negative and
+        // *add* fuel. No current call site can produce one (charges are byte/
+        // token/needle-length products far below i64::MAX), but clamping keeps
+        // `burn` safe against any future caller feeding a larger view field.
+        let n = n.min(i64::MAX as u64) as i64;
+        self.fuel = self.fuel.saturating_sub(n);
         if self.fuel <= 0 {
             self.exhausted = true;
         }

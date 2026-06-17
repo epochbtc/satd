@@ -250,7 +250,14 @@ fn lookup_confirmed(
 }
 
 fn lookup_mempool(state: &EsploraState, txid: &Txid) -> Option<Transaction> {
-    state.mempool.get(txid).map(|entry| entry.tx)
+    // Acting-only (design §6.1): a relay-quarantined tx must not be served by
+    // txid on any standard read surface, just as it is absent from the Esplora
+    // mempool list endpoints and `/outspend`. Mirrors satd's `getrawtransaction`.
+    state
+        .mempool
+        .get(txid)
+        .filter(|entry| entry.scope.is_acting())
+        .map(|entry| entry.tx)
 }
 
 fn lookup_any(state: &EsploraState, txid: &Txid) -> EsploraResult<Transaction> {
@@ -289,7 +296,14 @@ fn resolve_prev_output(
     {
         return Some(out.clone());
     }
-    if let Some(entry) = state.mempool.get(&prev.txid)
+    // Acting-only for the mempool fallback: a child whose parent is a
+    // quarantined mempool tx is itself infectious-quarantined (and so hidden),
+    // so this never withholds a prevout from a legitimately-visible tx; the
+    // filter keeps quarantined parents off the standard surface for consistency.
+    if let Some(entry) = state
+        .mempool
+        .get(&prev.txid)
+        .filter(|e| e.scope.is_acting())
         && let Some(out) = entry.tx.output.get(prev.vout as usize)
     {
         return Some(out.clone());

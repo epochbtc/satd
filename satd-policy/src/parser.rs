@@ -276,7 +276,19 @@ impl Parser {
 
     fn postfix(&mut self) -> Result<Expr> {
         let mut recv = self.primary()?;
+        // Each `.method`/`.prop` link wraps another `Expr::Method` around the
+        // receiver, deepening the AST by one. The parse loop is iterative, but
+        // typeck/cost/eval — and even `Drop` of the boxed tree — recurse
+        // structurally, so a paren-free property chain (e.g.
+        // `out.script.max_push.max_push…`) would build a stack-overflowing
+        // spine. Charge each link against the shared depth budget exactly as
+        // the binary productions do (see `or_expr`) and unwind on success so
+        // sibling chains start fresh. (On error the whole parse aborts, so
+        // leftover depth is irrelevant.)
+        let mut links = 0usize;
         while self.eat(&Tok::Dot) {
+            self.enter(self.peek_span())?;
+            links += 1;
             let (name, name_span) =
                 self.expect_ident("expected a method or property name after '.'")?;
             let call = self.method(&name, name_span)?;
@@ -286,6 +298,9 @@ impl Parser {
                 call,
                 span,
             };
+        }
+        for _ in 0..links {
+            self.leave();
         }
         Ok(recv)
     }
@@ -710,6 +725,20 @@ mod tests {
     #[test]
     fn deep_mul_chain_is_bounded() {
         let src = format!("1{}", " * 1".repeat(50_000));
+        let err = parse(&src).unwrap_err();
+        assert_eq!(err.stage, Stage::Parse);
+        assert!(err.message.contains("nested too deeply"), "{}", err.message);
+    }
+
+    // Regression: paren-free method/property chains (`a.max_push.max_push…`)
+    // are parsed iteratively in `postfix`, but each link nests another
+    // `Expr::Method`, so without per-link depth accounting a long chain builds
+    // an AST that overflows the native stack when typeck/cost/eval (or `Drop`)
+    // recurse over it — the parse itself survives, then the deep tree aborts
+    // the process. This must return a bounded parse error.
+    #[test]
+    fn deep_method_chain_is_bounded() {
+        let src = format!("out.script{}", ".max_push".repeat(50_000));
         let err = parse(&src).unwrap_err();
         assert_eq!(err.stage, Stage::Parse);
         assert!(err.message.contains("nested too deeply"), "{}", err.message);

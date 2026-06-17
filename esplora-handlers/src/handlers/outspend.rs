@@ -189,7 +189,11 @@ fn build_outspend_one(
     if let Some(sref) = state.spend_index.spend_of(outpoint)? {
         return Ok(confirmed_outspend(state, &sref));
     }
-    if let Some((spend_txid, vin)) = state.mempool.spending_tx(outpoint) {
+    // Acting-only (design §6.1): a quarantined spender must not surface here,
+    // matching the batched `/outspends` path (`build_mempool_spent_index`) and
+    // `getrawmempool`. The single-output path previously used the unfiltered
+    // `spending_tx`, so the two endpoints disagreed for the same outpoint.
+    if let Some((spend_txid, vin)) = state.mempool.spending_tx_acting(outpoint) {
         return Ok(mempool_outspend(spend_txid, vin));
     }
     Ok(unspent_outspend())

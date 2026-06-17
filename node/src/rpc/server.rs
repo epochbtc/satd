@@ -627,7 +627,7 @@ pub async fn start(
             .next()
             .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
         crate::rpc::policy::get_quarantine_entry(&ctx.mempool, &txid)
-            .map_err(|e| ErrorObjectOwned::owned(-5, e, None::<()>))
+            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
     module.register_method("policytest", |params, ctx, _extensions| {

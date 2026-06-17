@@ -299,6 +299,23 @@ fn with_view<R>(
     from_whitelisted_peer: bool,
     f: impl FnOnce(&TxView, &Ctx) -> R,
 ) -> R {
+    // Contract: `prev_outputs` and `prev_is_coinbase` are 1:1 with `tx.input`
+    // (every in-tree caller resolves them in input order). Enforce it here so a
+    // future caller that passes a short slice fails with a clear, deterministic
+    // message at the entry point rather than an obscure index panic deep in the
+    // per-input loop below (line that builds `InputView`), or — worse — a
+    // silently truncated, mis-evaluated view.
+    assert_eq!(
+        prev_outputs.len(),
+        tx.input.len(),
+        "with_view: prev_outputs must be 1:1 with tx.input",
+    );
+    assert_eq!(
+        prev_is_coinbase.len(),
+        tx.input.len(),
+        "with_view: prev_is_coinbase must be 1:1 with tx.input",
+    );
+
     // Owned 32-byte txid buffers — the only view state not borrowed from `tx`
     // or `prev_outputs`.
     let txid_bytes = txid.to_byte_array();

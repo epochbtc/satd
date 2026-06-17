@@ -1785,6 +1785,25 @@ impl Mempool {
             (QuarantineScope::acting(), None)
         };
 
+        // Two-class isolation: a held (quarantined) submission must never
+        // displace an acting-class transaction. If this tx draws a quarantine
+        // scope but conflicts with any acting-class mempool tx, reject it rather
+        // than RBF-evict a relayed tx — letting a withheld submission knock out
+        // a tx we are actively relaying would break the acting class's
+        // independence from policy (and would emit a phantom `LeaveReplaced` for
+        // the displaced acting tx). Acting submissions may still replace either
+        // class; acting takes priority over a conflicting held tx.
+        if scope.is_quarantined()
+            && conflicts.iter().any(|c| {
+                inner
+                    .entries
+                    .get(c)
+                    .is_some_and(|e| e.scope.is_acting())
+            })
+        {
+            return Err(MempoolError::ConflictingSpend);
+        }
+
         // §6.1 local-submission refusal: a transaction submitted through a local
         // surface that draws a *relay*-scoped quarantine verdict is refused (with
         // the rule named) rather than silently held — a relay-quarantined local
@@ -1859,19 +1878,26 @@ impl Mempool {
             .map_err(|e| MempoolError::Script(e.to_string()))?;
 
         // RBF: remove conflicted transactions before inserting replacement.
-        // Collect replaced txids so we can emit LeaveReplaced events
-        // after the write lock is dropped (broadcast is best-effort but
-        // still prefer not to hold a lock while sending).
+        // Collect replaced txids so we can emit LeaveReplaced events after the
+        // write lock is dropped. Only *acting* conflicts go on the standard
+        // stream: a quarantined conflict never emitted an `Enter`, so a
+        // `LeaveReplaced` for it would be a phantom Leave that leaks a withheld
+        // txid (§10). (After the isolation guard above, a quarantined submission
+        // can't reach here with an acting conflict, so this only filters out
+        // quarantined conflicts displaced by an acting replacement.)
         let mut replaced: Vec<Txid> = Vec::new();
         for conflict_txid in &conflicts {
             if let Some(conflict_entry) = inner.entries.remove(conflict_txid) {
+                let was_acting = conflict_entry.scope.is_acting();
                 let sz = bitcoin::consensus::serialize(&conflict_entry.tx).len();
                 inner.account_remove(conflict_entry.scope, sz);
                 for ci in &conflict_entry.tx.input {
                     inner.spends.remove(&ci.previous_output);
                 }
                 inner.unbroadcast.remove(conflict_txid);
-                replaced.push(*conflict_txid);
+                if was_acting {
+                    replaced.push(*conflict_txid);
+                }
                 tracing::info!(%conflict_txid, "RBF: evicted conflicting transaction");
             }
         }
@@ -1935,11 +1961,18 @@ impl Mempool {
         // are best-effort but keeping the lock duration tight is the rule.
         drop(inner);
 
-        for evicted_txid in &evicted_full_pool {
-            self.emit(MempoolEvent::LeaveEvicted {
-                txid: *evicted_txid,
-                reason: evict_reason,
-            });
+        // `evicted_full_pool` is always drawn from the incoming tx's own class
+        // (`evict_lowest_fee_entries` filters to `quarantined`). Acting-class
+        // evictions go on the standard stream as before; quarantine-class
+        // evictions never emitted an `Enter`, so a `LeaveEvicted` for them would
+        // be a phantom Leave leaking a withheld txid (§10) — suppress it.
+        if !quarantined {
+            for evicted_txid in &evicted_full_pool {
+                self.emit(MempoolEvent::LeaveEvicted {
+                    txid: *evicted_txid,
+                    reason: evict_reason,
+                });
+            }
         }
         for conflict_txid in &replaced {
             self.emit(MempoolEvent::LeaveReplaced {
@@ -1997,8 +2030,14 @@ impl Mempool {
                     if entry.scope.is_quarantined() {
                         self.quarantine_confirmed
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    } else {
+                        // Acting-class only on the standard stream: a quarantined
+                        // tx never emitted an `Enter`, so a `LeaveConfirmed` for
+                        // it would be a phantom Leave leaking a withheld txid
+                        // (§10). Its confirmation is still recorded above via
+                        // `quarantine_confirmed` (the D4 confirmed-anyway signal).
+                        confirmed.push(txid);
                     }
-                    confirmed.push(txid);
                 }
 
                 // Also remove any mempool txs whose inputs are now
@@ -2018,7 +2057,13 @@ impl Mempool {
                                 inner.spends.remove(&ci.previous_output);
                             }
                             inner.unbroadcast.remove(&conflict_txid);
-                            evicted_conflicts.push(conflict_txid);
+                            // Acting-class only on the standard stream (§10): a
+                            // quarantined conflict never emitted an `Enter`, so a
+                            // block-conflict `LeaveEvicted` for it would be a
+                            // phantom Leave leaking a withheld txid.
+                            if conflict_entry.scope.is_acting() {
+                                evicted_conflicts.push(conflict_txid);
+                            }
                         }
                     }
                 }
@@ -2155,6 +2200,30 @@ impl Mempool {
         let inner = self.inner.read();
         let spending_txid = *inner.spends.get(outpoint)?;
         let entry = inner.entries.get(&spending_txid)?;
+        let vin = entry
+            .tx
+            .input
+            .iter()
+            .position(|i| i.previous_output == *outpoint)?
+            as u32;
+        Some((spending_txid, vin))
+    }
+
+    /// Like [`spending_tx`](Self::spending_tx) but only reports a spender in the
+    /// *acting* class (design §6.1): a relay-quarantined spender must stay
+    /// invisible on standard read surfaces, exactly as it is absent from
+    /// `getrawmempool` and the batched `/outspends` index
+    /// (`build_mempool_spent_index`). Used by Esplora's single-output
+    /// `/tx/:txid/outspend/:vout` so the single and batched outspend paths agree.
+    /// (Infectious propagation means an acting tx can never have a quarantined
+    /// ancestor, so this never hides a legitimately-relayed spend.)
+    pub fn spending_tx_acting(&self, outpoint: &OutPoint) -> Option<(Txid, u32)> {
+        let inner = self.inner.read();
+        let spending_txid = *inner.spends.get(outpoint)?;
+        let entry = inner.entries.get(&spending_txid)?;
+        if !entry.scope.is_acting() {
+            return None;
+        }
         let vin = entry
             .tx
             .input
@@ -4613,6 +4682,114 @@ mod tests {
             }
             other => panic!("expected one Quarantined event, got {other:?}"),
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn spending_tx_acting_hides_quarantined_spender() {
+        // §6.1: a quarantined spender must not surface on the single-output
+        // Esplora `/outspend` path (`spending_tx_acting`), matching the batched
+        // `/outspends` index and `getrawmempool`. The unfiltered `spending_tx`
+        // (Electrum's conservative "is this UTXO consumed" guard) still sees it.
+        let op = outpoint(0xc1);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin(100_000))]);
+        set_ruleset(&mp, "version 1\nquarantine catch when tx.version == 2");
+
+        let tx = spend(op, 99_000, 0x22); // version 2 ⇒ quarantined
+        mp.accept_transaction(tx, &cs, &NoopVerifier, TxSource::P2p, false)
+            .expect("admitted into quarantine");
+
+        assert!(
+            mp.spending_tx(&op).is_some(),
+            "unfiltered accessor still reports the spender (conservative path)"
+        );
+        assert!(
+            mp.spending_tx_acting(&op).is_none(),
+            "quarantined spender must be hidden from the acting-only /outspend path"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn quarantined_confirmation_emits_no_phantom_leave() {
+        // §10: a quarantined tx never emitted `Enter` on the standard stream, so
+        // its confirmation must not emit a phantom `LeaveConfirmed` either — the
+        // confirmed-anyway counter still ticks (D4).
+        let op = outpoint(0xc8);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin(100_000))]);
+        set_ruleset(&mp, "version 1\nquarantine catch when tx.version == 2");
+
+        let (etx, mut erx) = broadcast::channel::<MempoolEvent>(16);
+        mp.set_event_sender(etx);
+
+        let tx = spend(op, 99_000, 0x22);
+        mp.accept_transaction(tx.clone(), &cs, &NoopVerifier, TxSource::P2p, false)
+            .expect("admitted to quarantine");
+        // No Enter for the held admission.
+        assert!(matches!(
+            erx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+
+        let mut block = bitcoin::constants::genesis_block(bitcoin::Network::Regtest);
+        block.txdata.push(tx);
+        mp.remove_for_block(&block, 7);
+
+        assert!(
+            matches!(erx.try_recv(), Err(broadcast::error::TryRecvError::Empty)),
+            "quarantined confirmation must not emit a phantom LeaveConfirmed"
+        );
+        assert_eq!(mp.quarantine_confirmed_count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn quarantined_submission_cannot_rbf_evict_acting() {
+        // Two-class isolation: a held (quarantined) submission must never RBF-evict
+        // an acting-class tx, even with a higher fee — it is rejected so a withheld
+        // tx can't displace one we are actively relaying.
+        use bitcoin::blockdata::locktime::absolute::LockTime;
+        use bitcoin::{Amount, ScriptBuf, Sequence, TxIn, TxOut, Witness, transaction};
+
+        let op = outpoint(0xc7);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin(1_000_000))]);
+        // Quarantine txs with a small output; a large output stays acting.
+        set_ruleset(&mp, "version 1\nquarantine small when any output (out.value < 200000)");
+
+        let rbf_spend = |value: u64, tag: u8| Transaction {
+            version: transaction::Version(2),
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: op,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence(0xffff_fffd), // signals replaceability
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(value),
+                script_pubkey: p2wpkh_spk(tag),
+            }],
+        };
+
+        // Acting tx: large output (fee 100k), admitted to the acting class.
+        let acting_id = mp
+            .accept_transaction(rbf_spend(900_000, 0x01), &cs, &NoopVerifier, TxSource::P2p, false)
+            .expect("acting tx admitted");
+        assert!(mp.get(&acting_id).unwrap().scope.is_acting());
+
+        // Conflicting quarantined replacement: small output ⇒ higher fee (900k),
+        // which clears the RBF fee bar, but the two-class guard rejects it.
+        let err = mp
+            .accept_transaction(rbf_spend(100_000, 0x02), &cs, &NoopVerifier, TxSource::P2p, false)
+            .unwrap_err();
+        assert!(
+            matches!(err, MempoolError::ConflictingSpend),
+            "held replacement must not evict an acting tx: got {err:?}"
+        );
+        assert!(
+            mp.get(&acting_id).is_some(),
+            "acting tx must survive the rejected held replacement"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

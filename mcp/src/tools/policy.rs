@@ -25,7 +25,7 @@ pub fn list_quarantine(ctx: &McpContext, rule: Option<&str>, count: usize, skip:
 pub fn get_quarantine_entry(ctx: &McpContext, txid: &str) -> String {
     match policy::get_quarantine_entry(&ctx.mempool, txid) {
         Ok(v) => pretty(v),
-        Err(e) => serde_json::json!({ "error": e }).to_string(),
+        Err((_code, msg)) => serde_json::json!({ "error": msg }).to_string(),
     }
 }
 

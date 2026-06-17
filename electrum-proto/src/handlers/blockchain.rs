@@ -382,7 +382,12 @@ pub fn transaction_get(state: &ElectrumState, params: Value) -> Result<Value, Js
     // Resolve the tx — mempool first, then txindex fallback. Same
     // priority order satd's own `getrawtransaction` uses.
     let (tx, location): (Transaction, Option<TxLocation>) =
-        if let Some(entry) = state.mempool.get(&txid) {
+        // Acting-only (design §6.1): a relay-quarantined tx is invisible to a
+        // client that learned the txid elsewhere — matching satd's own
+        // `getrawtransaction` (`rawtx.rs`), which filters to the acting class.
+        // Without this filter any Electrum client could pull a withheld tx by
+        // txid. Fall through to the txindex/not-found path when quarantined.
+        if let Some(entry) = state.mempool.get(&txid).filter(|e| e.scope.is_acting()) {
             (entry.tx, None)
         } else if let Some(raw) = state.electrum_extras.raw_tx(&txid) {
             let parsed: Transaction = deserialize(&raw)

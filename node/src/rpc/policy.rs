@@ -172,13 +172,15 @@ pub fn list_quarantine(
 /// `getquarantineentry <txid>` — the `getmempoolentry` analogue for a single
 /// quarantined transaction. Errors if the txid is absent or acting (an acting
 /// entry is served by `getmempoolentry`).
-pub fn get_quarantine_entry(mempool: &Mempool, txid_str: &str) -> Result<Value, String> {
+pub fn get_quarantine_entry(mempool: &Mempool, txid_str: &str) -> Result<Value, (i32, String)> {
+    // Match `getrawtransaction`'s error taxonomy: a malformed txid is an invalid
+    // parameter (-8), a valid-but-absent txid is invalid-address-or-key (-5).
     let txid: bitcoin::Txid = txid_str
         .parse()
-        .map_err(|_| "Invalid txid".to_string())?;
+        .map_err(|_| (-8, "Invalid txid".to_string()))?;
     let d = mempool
         .get_quarantine_entry(&txid)
-        .ok_or_else(|| "Transaction not in quarantine".to_string())?;
+        .ok_or_else(|| (-5, "Transaction not in quarantine".to_string()))?;
     Ok(json!({
         "txid": d.txid.to_string(),
         "rule": d.rule,
