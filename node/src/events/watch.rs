@@ -113,6 +113,22 @@ pub enum WatchMatch {
     PrefixMatched(Box<PrefixMatch>),
 }
 
+/// One matched spent prevout on the spend side of a [`PrefixMatch`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpentPrevoutMeta {
+    /// The outpoint consumed by the spending input.
+    pub outpoint: OutPoint,
+    /// The spent prevout's `scriptPubKey`. Present for **confirmed** spends
+    /// (recovered from undo data) and for **mempool** spends when
+    /// `streamprevoutmeta = full`; **empty** otherwise (hash/amount tier), in
+    /// which case the client resolves the prevout from its own UTXO set.
+    pub script_pubkey: ScriptBuf,
+    /// The spent prevout's value (satoshis). `Some` for confirmed spends and for
+    /// mempool spends when `streamprevoutmeta >= amount` (the default); `None`
+    /// under the `hash` tier.
+    pub amount: Option<u64>,
+}
+
 /// Payload of a [`WatchMatch::PrefixMatched`]: a transaction that fell inside a
 /// watched k-bit `sha256(scriptPubKey)` prefix bucket, on either side.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,11 +145,12 @@ pub struct PrefixMatch {
     pub confirmed: bool,
     /// Block height when `confirmed`; `None` in the mempool.
     pub height: Option<u32>,
-    /// Spend side: the matched spent-prevout(s) — `(outpoint, scriptPubKey)` —
-    /// for inputs whose prevout script fell in the bucket. Empty for a pure
-    /// funding (output-side) match. Lets the client confirm "a coin of mine was
-    /// spent" without resolving any outpoint itself.
-    pub matched_prevouts: Vec<(OutPoint, ScriptBuf)>,
+    /// Spend side: the matched spent-prevout(s) for inputs whose prevout script
+    /// fell in the bucket. Empty for a pure funding (output-side) match. Lets a
+    /// client confirm "a coin of mine was spent" — from the carried script
+    /// directly (confirmed, or mempool under `full`) or against its own UTXO set
+    /// (mempool under hash/amount, where the script is empty).
+    pub matched_prevouts: Vec<SpentPrevoutMeta>,
 }
 
 /// Opaque per-subscriber identifier.
@@ -711,6 +728,7 @@ impl WatchRegistry {
         tx: &Transaction,
         prev_scripthashes: &[Scripthash],
         prev_amounts: &[u64],
+        prev_scripts: &[ScriptBuf],
     ) {
         if !self.has_script_watchers() && !self.has_prefix_watchers() {
             return;
@@ -727,7 +745,7 @@ impl WatchRegistry {
         // matches fire per input. `zip` aligns each input with its prevout hash
         // and tolerates a short/empty slice (delivers nothing rather than
         // misalign); `enumerate` over the zip yields the input index (1:1).
-        let mut prefix_spends: HashMap<(u8, u32), Vec<(OutPoint, ScriptBuf)>> = HashMap::new();
+        let mut prefix_spends: HashMap<(u8, u32), Vec<SpentPrevoutMeta>> = HashMap::new();
         for (vin, (input, sh)) in tx.input.iter().zip(prev_scripthashes.iter()).enumerate() {
             if scan_scripts
                 && let Some(subs) = inner.by_scripthash.get(sh)
@@ -751,17 +769,21 @@ impl WatchRegistry {
                 }
             }
             if scan_prefixes {
+                // Carry whatever the retention tier kept: the full prevout script
+                // under `full` (else empty → client resolves it itself), and the
+                // value under `>= amount` (the default). The outpoint is always
+                // known (from the spending tx).
+                let script_pubkey = prev_scripts.get(vin).cloned().unwrap_or_default();
+                let amount = prev_amounts.get(vin).copied();
                 let top = prefix_top32(sh);
                 for &bits in inner.prefix_lens.keys() {
                     let key = (bits, top & prefix_mask(bits));
                     if inner.by_prefix.contains_key(&key) {
-                        // Hash-only: outpoint is known (from the spending tx),
-                        // prevout script is not retained, so deliver an empty
-                        // script.
-                        prefix_spends
-                            .entry(key)
-                            .or_default()
-                            .push((input.previous_output, ScriptBuf::new()));
+                        prefix_spends.entry(key).or_default().push(SpentPrevoutMeta {
+                            outpoint: input.previous_output,
+                            script_pubkey: script_pubkey.clone(),
+                            amount,
+                        });
                     }
                 }
             }
@@ -1233,7 +1255,7 @@ fn scan_block_spent_scripts(inner: &Inner, block: &Block, height: u32, undo: &Un
         // Spend-side prefix matches are aggregated per bucket across this tx's
         // inputs: all matched prevouts for a bucket ride one PrefixMatched (one
         // full-tx body), not one event per input.
-        let mut prefix_spends: HashMap<(u8, u32), Vec<(OutPoint, ScriptBuf)>> = HashMap::new();
+        let mut prefix_spends: HashMap<(u8, u32), Vec<SpentPrevoutMeta>> = HashMap::new();
         for (vin, input) in tx.input.iter().enumerate() {
             let Some(spent) = undo.spent_coins.get(undo_idx) else {
                 // Undo shorter than the block's non-coinbase inputs: should
@@ -1274,15 +1296,18 @@ fn scan_block_spent_scripts(inner: &Inner, block: &Block, height: u32, undo: &Un
                 }
             }
             if scan_prefixes {
-                // Group the spent prevout under each bucket it lands in.
+                // Group the spent prevout under each bucket it lands in. Confirmed
+                // spends always carry the full prevout script and value (both come
+                // from the undo `Coin`).
                 let top = prefix_top32(&sh);
                 for &bits in inner.prefix_lens.keys() {
                     let key = (bits, top & prefix_mask(bits));
                     if inner.by_prefix.contains_key(&key) {
-                        prefix_spends
-                            .entry(key)
-                            .or_default()
-                            .push((input.previous_output, spent.script_pubkey.clone()));
+                        prefix_spends.entry(key).or_default().push(SpentPrevoutMeta {
+                            outpoint: input.previous_output,
+                            script_pubkey: spent.script_pubkey.clone(),
+                            amount: Some(spent.amount),
+                        });
                     }
                 }
             }
@@ -1718,6 +1743,7 @@ pub async fn run_watch_matcher(
                             &entry.tx,
                             &entry.prev_scripthashes,
                             &entry.prev_amounts,
+                            &entry.prev_scripts,
                         );
                     }
                 }
@@ -2810,7 +2836,8 @@ mod tests {
                 assert!(pm.confirmed);
                 assert_eq!(pm.height, Some(9));
                 assert_eq!(pm.matched_prevouts.len(), 1, "spend side carries the prevout");
-                let (mop, mspk) = &pm.matched_prevouts[0];
+                let mp0 = &pm.matched_prevouts[0];
+                let (mop, mspk) = (&mp0.outpoint, &mp0.script_pubkey);
                 assert_eq!(*mop, op);
                 assert_eq!(*mspk, spent_spk);
             }
@@ -2978,7 +3005,7 @@ mod tests {
         match rx.try_recv().expect("one aggregated spend match") {
             WatchMatch::PrefixMatched(pm) => {
                 assert_eq!(pm.matched_prevouts.len(), 2, "both prevouts in one event");
-                let ops: Vec<OutPoint> = pm.matched_prevouts.iter().map(|(o, _)| *o).collect();
+                let ops: Vec<OutPoint> = pm.matched_prevouts.iter().map(|m| m.outpoint).collect();
                 assert!(ops.contains(&op0) && ops.contains(&op1));
             }
             other => panic!("wrong match: {other:?}"),
@@ -3000,7 +3027,7 @@ mod tests {
 
         let op = outpoint(0xaa, 3);
         let tx = spending_tx(op);
-        reg.scan_mempool_spent_scripts(&tx, &[sh], &[]);
+        reg.scan_mempool_spent_scripts(&tx, &[sh], &[], &[]);
 
         match rx.try_recv().expect("mempool spend-side prefix match") {
             WatchMatch::PrefixMatched(pm) => {
@@ -3008,7 +3035,8 @@ mod tests {
                 assert!(!pm.confirmed, "mempool spend is unconfirmed");
                 assert_eq!(pm.height, None);
                 assert_eq!(pm.matched_prevouts.len(), 1);
-                let (mop, mspk) = &pm.matched_prevouts[0];
+                let mp0 = &pm.matched_prevouts[0];
+                let (mop, mspk) = (&mp0.outpoint, &mp0.script_pubkey);
                 assert_eq!(*mop, op, "outpoint comes from the spending tx");
                 assert!(
                     mspk.is_empty(),
@@ -3031,7 +3059,7 @@ mod tests {
 
         // A spend whose prevout hashes into a different 16-bit bucket.
         let other = scripthash_of(&ScriptBuf::from(vec![0x53, 0x54, 0x55]));
-        reg.scan_mempool_spent_scripts(&spending_tx(outpoint(0xbb, 0)), &[other], &[]);
+        reg.scan_mempool_spent_scripts(&spending_tx(outpoint(0xbb, 0)), &[other], &[], &[]);
         assert!(rx.try_recv().is_err(), "prevout outside the bucket must not match");
     }
 
@@ -3049,6 +3077,7 @@ mod tests {
         reg.scan_mempool_spent_scripts(
             &spending_tx(outpoint(0xaa, 3)),
             &[scripthash_of(&spent_spk)],
+            &[],
             &[],
         );
         assert!(rx.try_recv().is_err(), "no prefix watchers → no spend-side delivery");
@@ -3076,13 +3105,13 @@ mod tests {
             output: vec![],
         };
         // Both inputs spend the same script → same bucket (input-aligned hashes).
-        reg.scan_mempool_spent_scripts(&tx, &[sh, sh], &[]);
+        reg.scan_mempool_spent_scripts(&tx, &[sh, sh], &[], &[]);
 
         match rx.try_recv().expect("one aggregated mempool spend match") {
             WatchMatch::PrefixMatched(pm) => {
                 assert!(!pm.confirmed);
                 assert_eq!(pm.matched_prevouts.len(), 2, "both prevouts in one event");
-                let ops: Vec<OutPoint> = pm.matched_prevouts.iter().map(|(o, _)| *o).collect();
+                let ops: Vec<OutPoint> = pm.matched_prevouts.iter().map(|m| m.outpoint).collect();
                 assert!(ops.contains(&op0) && ops.contains(&op1));
             }
             other => panic!("wrong match: {other:?}"),
@@ -3119,19 +3148,92 @@ mod tests {
             ],
             output: vec![],
         };
-        reg.scan_mempool_spent_scripts(&tx, &[sh_a, sh_b], &[]);
+        reg.scan_mempool_spent_scripts(&tx, &[sh_a, sh_b], &[], &[]);
 
         // Collect both events and map each bucket to the single outpoint it carries.
         let mut by_bucket: std::collections::HashMap<(u8, u32), Vec<OutPoint>> =
             std::collections::HashMap::new();
         while let Ok(WatchMatch::PrefixMatched(pm)) = rx.try_recv() {
             let key = (pm.prefix.1, pm.prefix.0);
-            let ops: Vec<OutPoint> = pm.matched_prevouts.iter().map(|(o, _)| *o).collect();
+            let ops: Vec<OutPoint> = pm.matched_prevouts.iter().map(|m| m.outpoint).collect();
             by_bucket.insert(key, ops);
         }
         assert_eq!(by_bucket.len(), 2, "one event per distinct bucket");
         assert_eq!(by_bucket.get(&ba), Some(&vec![op_a]), "bucket A carries only its prevout");
         assert_eq!(by_bucket.get(&bb), Some(&vec![op_b]), "bucket B carries only its prevout");
+    }
+
+    #[test]
+    fn prefix_mempool_spend_carries_script_and_amount_when_retained() {
+        // Under `full` retention the mempool prefix spend side carries the real
+        // prevout script (so a chainstate-less client confirms the match without
+        // resolving the outpoint); under `amount` it carries the value but an
+        // empty script; under `hash` neither (empty script, no amount).
+        let spk = ScriptBuf::from(vec![0x52]);
+        let sh = scripthash_of(&spk);
+        let b = bucket(&sh, 32);
+        let op = outpoint(0xa0, 0);
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: op,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![],
+        };
+
+        // `full`: script + amount both carried.
+        {
+            let reg = Arc::new(WatchRegistry::new());
+            let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+            handle.add_prefixes(&[b]);
+            reg.scan_mempool_spent_scripts(&tx, &[sh], &[5_000], std::slice::from_ref(&spk));
+            match rx.try_recv().expect("prefix spend match") {
+                WatchMatch::PrefixMatched(pm) => {
+                    assert_eq!(pm.matched_prevouts.len(), 1);
+                    let m = &pm.matched_prevouts[0];
+                    assert_eq!(m.outpoint, op);
+                    assert_eq!(m.script_pubkey, spk, "full tier carries the real script");
+                    assert_eq!(m.amount, Some(5_000), "full tier carries the value");
+                }
+                other => panic!("wrong match: {other:?}"),
+            }
+        }
+
+        // `amount`: value carried, script empty (client resolves it).
+        {
+            let reg = Arc::new(WatchRegistry::new());
+            let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+            handle.add_prefixes(&[b]);
+            reg.scan_mempool_spent_scripts(&tx, &[sh], &[5_000], &[]);
+            match rx.try_recv().expect("prefix spend match") {
+                WatchMatch::PrefixMatched(pm) => {
+                    let m = &pm.matched_prevouts[0];
+                    assert!(m.script_pubkey.is_empty(), "amount tier: no script");
+                    assert_eq!(m.amount, Some(5_000), "amount tier carries the value");
+                }
+                other => panic!("wrong match: {other:?}"),
+            }
+        }
+
+        // `hash`: neither script nor amount.
+        {
+            let reg = Arc::new(WatchRegistry::new());
+            let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+            handle.add_prefixes(&[b]);
+            reg.scan_mempool_spent_scripts(&tx, &[sh], &[], &[]);
+            match rx.try_recv().expect("prefix spend match") {
+                WatchMatch::PrefixMatched(pm) => {
+                    let m = &pm.matched_prevouts[0];
+                    assert!(m.script_pubkey.is_empty(), "hash tier: no script");
+                    assert_eq!(m.amount, None, "hash tier: no amount");
+                }
+                other => panic!("wrong match: {other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -3149,7 +3251,7 @@ mod tests {
         assert!(reg.has_script_watchers());
 
         let op = outpoint(0xaa, 3);
-        reg.scan_mempool_spent_scripts(&spending_tx(op), &[sh], &[]);
+        reg.scan_mempool_spent_scripts(&spending_tx(op), &[sh], &[], &[]);
 
         match rx.try_recv().expect("mempool exact-script spend match") {
             WatchMatch::ScriptMatched {
@@ -3185,11 +3287,11 @@ mod tests {
 
         let op = outpoint(0xaa, 3);
         // Spent value 999 < floor → suppressed.
-        reg.scan_mempool_spent_scripts(&spending_tx(op), &[sh], &[999]);
+        reg.scan_mempool_spent_scripts(&spending_tx(op), &[sh], &[999], &[]);
         assert!(rx.try_recv().is_err(), "999 < floor → suppressed");
 
         // Spent value 1000 == floor → delivered.
-        reg.scan_mempool_spent_scripts(&spending_tx(op), &[sh], &[1_000]);
+        reg.scan_mempool_spent_scripts(&spending_tx(op), &[sh], &[1_000], &[]);
         match rx.try_recv().expect("1000 >= floor → delivered") {
             WatchMatch::ScriptMatched {
                 is_output,
@@ -3216,7 +3318,7 @@ mod tests {
         assert_eq!(handle.add_scripthashes_with_floors(&[(sh, 1_000)]), 1);
 
         // Empty amounts (hash tier) + a non-zero floor → fail closed.
-        reg.scan_mempool_spent_scripts(&spending_tx(outpoint(0xaa, 3)), &[sh], &[]);
+        reg.scan_mempool_spent_scripts(&spending_tx(outpoint(0xaa, 3)), &[sh], &[], &[]);
         assert!(
             rx.try_recv().is_err(),
             "floored script + no amount available → suppressed (fail-closed)"
@@ -3225,7 +3327,7 @@ mod tests {
         // A second subscriber with no floor still gets the match.
         let (handle2, mut rx2) = reg.register(WATCH_CHANNEL_CAPACITY);
         assert_eq!(handle2.add_scripthashes(&[sh]), 1);
-        reg.scan_mempool_spent_scripts(&spending_tx(outpoint(0xaa, 3)), &[sh], &[]);
+        reg.scan_mempool_spent_scripts(&spending_tx(outpoint(0xaa, 3)), &[sh], &[], &[]);
         assert!(
             matches!(rx2.try_recv(), Ok(WatchMatch::ScriptMatched { .. })),
             "no-floor watcher delivers regardless of amount availability"
@@ -3258,7 +3360,7 @@ mod tests {
             output: vec![],
         };
         // prev_scripthashes aligned to inputs: only index 2 is the watched hash.
-        reg.scan_mempool_spent_scripts(&tx, &[other, other, watched], &[]);
+        reg.scan_mempool_spent_scripts(&tx, &[other, other, watched], &[], &[]);
 
         match rx.try_recv().expect("the matching input fires") {
             WatchMatch::ScriptMatched { scripthash, is_output, index, confirmed, .. } => {
@@ -3279,7 +3381,7 @@ mod tests {
         handle.add_scripthashes(&[scripthash_of(&ScriptBuf::from(vec![0x52]))]);
         // A spend of a different (unwatched) prevout script.
         let other = scripthash_of(&ScriptBuf::from(vec![0x53, 0x54]));
-        reg.scan_mempool_spent_scripts(&spending_tx(outpoint(0xbb, 0)), &[other], &[]);
+        reg.scan_mempool_spent_scripts(&spending_tx(outpoint(0xbb, 0)), &[other], &[], &[]);
         assert!(rx.try_recv().is_err(), "unwatched prevout script must not match");
     }
 
@@ -3295,6 +3397,7 @@ mod tests {
         reg.scan_mempool_spent_scripts(
             &spending_tx(outpoint(0xaa, 3)),
             &[scripthash_of(&ScriptBuf::from(vec![0x52]))],
+            &[],
             &[],
         );
         assert!(rx.try_recv().is_err(), "no spend-side watcher → no spend-side delivery");
@@ -3312,7 +3415,7 @@ mod tests {
         handle.add_scripthashes(&[sh]);
         handle.add_prefixes(&[bucket(&sh, 12)]);
 
-        reg.scan_mempool_spent_scripts(&spending_tx(outpoint(0xaa, 3)), &[sh], &[]);
+        reg.scan_mempool_spent_scripts(&spending_tx(outpoint(0xaa, 3)), &[sh], &[], &[]);
 
         let (mut exact, mut prefix) = (0, 0);
         while let Ok(m) = rx.try_recv() {

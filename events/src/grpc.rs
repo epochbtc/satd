@@ -1142,10 +1142,12 @@ fn watch_match_to_proto(
                 matched_prevouts: pm
                     .matched_prevouts
                     .iter()
-                    .map(|(op, spk)| pb::SpentPrevout {
-                        outpoint_txid: op.txid.as_raw_hash().to_byte_array().to_vec(),
-                        outpoint_vout: op.vout,
-                        script_pubkey: spk.to_bytes(),
+                    .map(|m| pb::SpentPrevout {
+                        outpoint_txid: m.outpoint.txid.as_raw_hash().to_byte_array().to_vec(),
+                        outpoint_vout: m.outpoint.vout,
+                        script_pubkey: m.script_pubkey.to_bytes(),
+                        amount: m.amount.unwrap_or(0),
+                        has_amount: m.amount.is_some(),
                     })
                     .collect(),
             });

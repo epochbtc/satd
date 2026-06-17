@@ -11,6 +11,12 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
 
 ## [Unreleased]
 
+- **Streaming API: prefix mempool spend-side prevout carriage (`full` tier).**
+  Under `streamprevoutmeta = full`, a mempool `PrefixMatched` now carries the real
+  spent-prevout `scriptPubKey` (and, from `amount`, its value) so a chainstate-less
+  privacy client can confirm a bucket spend locally without resolving the outpoint.
+  `SpentPrevout` gains `amount`/`has_amount`. See the
+  [release notes](docs/release-notes/0.4.0-pre.md).
 - **Streaming API: per-script `min_value` filter on `AddScripts`.** A watch can
   attach a per-scripthash satoshi floor (`min_values`, parallel to
   `scripthashes`); matches below it are suppressed server-side. Symmetric across
