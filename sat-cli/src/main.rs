@@ -150,7 +150,9 @@ enum Cmd {
     /// Validate a transaction-policy file offline: parse, typecheck, and report
     /// per-rule cost against the static budget. Never contacts a node, so a
     /// ruleset can be checked before any node loads it. Exit code: 0 loads, 1
-    /// load error (with a caret diagnostic), 2 file unreadable.
+    /// load error (with a caret diagnostic), 2 file unreadable, 3 a rule
+    /// withholds relay for Lightning enforcement traffic (see
+    /// --allow-dangerous-filters).
     Policylint {
         /// Path to the policy file.
         file: PathBuf,

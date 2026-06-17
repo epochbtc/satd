@@ -174,7 +174,7 @@ fn safe_ruleset_reports_no_danger() {
         .arg(&path)
         .output()
         .unwrap();
-    assert!(out.status.success());
+    assert_eq!(out.status.code(), Some(0));
     assert!(
         String::from_utf8_lossy(&out.stdout).contains("No Lightning-enforcement danger findings."),
         "{}",
