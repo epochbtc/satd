@@ -26,6 +26,7 @@
 pub mod advisory;
 pub mod ast;
 pub mod cost;
+pub mod danger;
 pub mod error;
 pub mod eval;
 pub mod explain;
@@ -41,6 +42,7 @@ pub mod view;
 
 pub use advisory::{Advisory, L2Flow, advise_rule, advise_ruleset};
 pub use cost::{Cost, POLICY_BUDGET};
+pub use danger::{DangerClass, DangerFinding, LnShape, analyze_danger};
 pub use error::{PolicyError, Result, Span, Stage};
 pub use eval::{DEFAULT_FUEL, Outcome};
 pub use explain::{explain_expr, explain_rule, explain_ruleset};
