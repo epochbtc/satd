@@ -176,15 +176,49 @@ this one output class," the right tool is a condition *inside* the matching
 expression (e.g. `… and out.script_type != p2a`), not a blanket `allow` —
 because `allow` shields the *entire* transaction from every later rule.
 
-### 4.3 Advisory lint (`§2.5`)
+### 4.3 L2-safety analysis: advisory + danger gate (`§2.5`)
 
-`policylint` (in the crate's `advisory` module) emits an **advisory — never
-blocking** warning when a `quarantine` rule plausibly matches time-sensitive
-Lightning/L2 shapes (anchor outputs, justice-transaction patterns, witness-size
-caps low enough to catch unilateral closes). It never inspects `allow` rules and
-carries zero admission weight. Its purpose is to make the most dangerous class
-of mistake — silently degrading L2 enforcement — visible before deployment.
-`explain` renders each rule in plain English for the same auditing reason.
+There are **two tiers**, by precision:
+
+- **Advisory (syntactic, warn-only)** — the `advisory` module walks a rule's
+  AST and warns when it *mentions* L2-ish features (anchor outputs, small-value
+  thresholds, witness-size caps, `OP_CSV`/`OP_CLTV`). Broad and cheap; right for
+  a hint, too imprecise to block. It never inspects `allow` rules.
+- **Danger gate (semantic, blocking)** — the `danger` module evaluates the whole
+  ruleset (honoring first-match-wins, so an earlier `allow` shields and an earlier
+  `quarantine` is attributed) against synthetic transactions shaped like real
+  Lightning enforcement traffic (BOLT-3 anchor and TRUC/ephemeral-anchor
+  commitments, justice, faithful offered/received HTLC scripts, taproot
+  script-path, and a generic healthy P2TR keyspend), each carrying realistic
+  enforcement witness sizes and anchor values, and reports only the rules that
+  *actually quarantine* one. Near-zero false positives, so it is safe to gate a
+  load on.
+
+The gate is **strict by default** — a reversal of the original "advisory, never
+blocking" stance (see the history note below). A rule that would **withhold
+relay** for an enforcement shape refuses the policy at load (fatal at startup;
+last-good kept on SIGHUP) unless `allowdangerousfilters` is set, in which case it
+loads with a loud warning. A match scoped `on template` warns but never blocks:
+E1 is about relay homogeneity, and an `on template` rule still relays the
+transaction. Detectability tracks the protocols: BOLT-3 scripts are
+spec-mandated (exact probes); taproot key-path force-closes are indistinguishable
+from any P2TR keyspend, so the probe is a generic keyspend and a rule that
+matches it is structurally over-broad; taproot script-path enforcement reveals a
+recognizable tapleaf. Distribution-dependent breadth (a low-fee or oversize
+threshold over P2TR) is deliberately *not* gated — the healthy probe doesn't trip
+it; that stays advisory, with a runtime hit-rate as a planned follow-up.
+
+> **History — why this changed.** The design originally specified the L2 check
+> as "advisory, never blocking" on operator-sovereignty grounds. It was changed
+> to strict-by-default once the semantic gate showed that the high-confidence
+> cases (spec-mandated BOLT-3 scripts; structural P2TR over-breadth) can be
+> recognized with near-zero false positives — at which point failing safe by
+> default, with an explicit `allowdangerousfilters` opt-out, better serves the
+> network than a warning an operator may never read. The gate does not eliminate
+> E1: it cannot catch a rule that snags enforcement via an angle the probes
+> don't model, so E1 remains a documented risk, not a solved one.
+
+`explain` renders each rule in plain English for auditing.
 
 ---
 
@@ -373,7 +407,7 @@ comments resolve here.
 | § | Topic |
 |---|---|
 | §2.4 | The three-consumer split — relay (`assists_relay`) vs template+fee (`assists_template`) vs union; mixing views is a bug |
-| §2.5 | L2-shape advisory lint — never blocking; warns when a rule may match Lightning/L2 shapes |
+| §2.5 | L2-safety analysis: the syntactic advisory (warn-only) and the semantic danger gate (strict-by-default refusal of relay-withholding enforcement matches; `allowdangerousfilters` opt-out) |
 | §2.6 | Verdict model — `Pass` / `Allow` / `Quarantine`, deliberately **no** `Reject` |
 | §3 | Quarantine scopes (`relay`/`template`, set = withheld) and infectious descendant propagation |
 | §4 | The expression pipeline overview (parse → typecheck → cost → eval) |
@@ -415,7 +449,8 @@ For a contributor finding their way in:
 - `verdict.rs` — `Verdict { Pass, Allow, Quarantine }`, `ScopeSet`
 - `view.rs` — `TxView`, `InputView`, `OutputView`, `Ctx` (what the node fills in)
 - `eval.rs` / `cost.rs` / `typeck.rs` / `parser.rs` / `lexer.rs` — the pipeline
-- `advisory.rs` / `explain.rs` — `policylint` support
+- `advisory.rs` (syntactic warn-only lint) / `danger.rs` (`analyze_danger` —
+  semantic, gate-grade) / `explain.rs` — `policylint` and the load-time gate
 - `scope.rs` — the in-language scope set
 
 **Node integration (`node/`)**

@@ -62,7 +62,8 @@ exceptions first.
 
 Point the node at a policy file with `policyfile=/path/to/policy.txt` (config
 file or `-policyfile` flag); the path must be **absolute**. On startup a bad file
-is **fatal** (fail-loud).
+is **fatal** (fail-loud) — and so is a file that trips the Lightning-enforcement
+danger gate (below), unless `allowdangerousfilters=1`.
 
 The file is **live-reloadable on `SIGHUP`**: the contents are re-read and
 recompiled on every signal (even if the path is unchanged), the whole mempool is
@@ -84,11 +85,33 @@ sat-cli policylint /path/to/policy.txt          # parse, typecheck, cost report
 sat-cli policylint --explain /path/to/policy.txt # plain-English per rule
 ```
 
-`policylint` also emits an **advisory** (never blocking) when a rule plausibly
-matches time-sensitive Lightning/L2 shapes — anchor outputs, justice-transaction
-patterns, witness-size caps low enough to catch unilateral closes. Heed it: an
-overly broad shape filter can silently degrade L2 enforcement (see *Network-scale
-effects*).
+`policylint` reports L2 safety in two tiers. The **advisory** (never blocking,
+`--no-advisories` to silence) flags rules that *mention* time-sensitive
+Lightning/L2 shapes — anchor outputs, witness-size caps, `OP_CSV`/`OP_CLTV`. The
+**danger gate** is stricter: it evaluates each rule against synthetic Lightning
+enforcement transactions and reports the ones that *actually* quarantine one. A
+rule that would **withhold relay** for an enforcement shape makes `policylint`
+exit non-zero (code 3) and makes the **node refuse to load the policy** — strict
+by default. An `on template` match warns but does not block (it still relays).
+
+### The danger gate and `allowdangerousfilters`
+
+The gate exists because a too-broad relay filter can degrade Lightning
+enforcement network-wide (E1, below), and that failure is silent for the user
+whose justice transaction never confirms. Detection mirrors the protocols:
+BOLT-3 (legacy/anchor) enforcement scripts are spec-mandated, so they are matched
+exactly; taproot-channel key-path force-closes are indistinguishable from any
+P2TR key-path spend, so a rule broad enough to catch generic P2TR keyspends is
+flagged as sweeping them; taproot script-path enforcement reveals a recognizable
+tapleaf.
+
+If you have a deliberate reason to run such a rule, opt out with
+`allowdangerousfilters=1` (config or `--allowdangerousfilters`): the rule then
+loads with a loud warning instead of being refused. The gate does **not** make
+E1 go away — it cannot catch a rule that snags enforcement through an angle the
+probes don't model, so the network-scale critique below still stands; the gate
+just removes the most common footgun. `getpolicyinfo` reports a `danger` section
+(the findings and whether they are allowed) for a loaded policy.
 
 ## Cookbook
 
@@ -210,7 +233,13 @@ case against wide filtering alongside the tool:
   copy-paste ruleset whose witness-size cap or anchor rule happens to match
   force-close or penalty transactions can silently degrade L2 enforcement
   network-wide — and the user whose justice transaction never confirms does not
-  learn why. This is the critique to take most seriously.
+  learn why. This is the critique to take most seriously. The strict-by-default
+  danger gate (above) is the partial mitigation: it refuses, by default, the
+  rules whose match against Lightning enforcement traffic it can prove. It does
+  not close E1 — it cannot detect a rule that catches enforcement through an
+  angle its probes don't model, and taproot key-path force-closes are
+  indistinguishable from ordinary P2TR spends — so the critique stands; the gate
+  raises the floor, it is not a guarantee.
 - **E2 — Policy-change friction was an unintentional stabilizer.** Today, mass
   policy shift needs a Core release or an implementation switch. A DSL plus a
   viral gist converts policy into a fast, memetic equilibrium with less review
