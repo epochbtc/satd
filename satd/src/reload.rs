@@ -261,6 +261,7 @@ pub fn mempool_config_from(c: &Config) -> MempoolConfig {
         // Saturating, same rationale as `maxmempool` above. Inert until a
         // `policyfile` quarantines something.
         quarantine_max_bytes: c.quarantinemempool.saturating_mul(1_000_000),
+        allow_dangerous_filters: c.allowdangerousfilters,
     }
 }
 
@@ -318,6 +319,31 @@ fn apply_policyfile_reload(new: &Config, h: &ReloadHandles) {
                 );
             }
         }
+    }
+
+    // Final safety reconciliation — runs after *every* path above. The loaded
+    // policy must satisfy the danger gate under the current `allowdangerousfilters`.
+    // This catches two cases the reload itself misses:
+    //   1. the flag tightened against an unchanged file (the sha-dedup returns
+    //      `Unchanged` before the load gate runs), and
+    //   2. a refused or uncompilable reload that kept a last-good policy which was
+    //      originally loaded under the opt-out (the `Err` arm keeps last-good).
+    // In both, a relay-withholding policy could otherwise stay live while strict
+    // mode is reported on. Eject it fail-safe (drop + promote), like a removal.
+    if let Err(e) = h.mempool.recheck_loaded_danger_gate() {
+        tracing::error!(
+            error = %e,
+            "loaded policy violates the danger gate under the current \
+             allowdangerousfilters — dropping it"
+        );
+        h.mempool.clear_policy();
+        let t = h.mempool.reapply_policy(&h.chain_state);
+        let promoted = t.promoted.len();
+        h.peer_manager.enqueue_promotions(t.promoted);
+        tracing::info!(
+            promoted,
+            "dangerous policy dropped — quarantine promoted to acting"
+        );
     }
 }
 
@@ -697,6 +723,15 @@ fn field_specs() -> Vec<FieldSpec> {
         // Quarantine-class byte budget — folded into the same MempoolConfig
         // reload as the other mempool knobs.
         live!("quarantinemempool", quarantinemempool, |c, h| {
+            h.mempool.reload_policy(mempool_config_from(c))
+        }),
+        // The danger-gate opt-out. Updating MempoolConfig governs the gate, which
+        // `apply_policyfile_reload` (running after this in the same SIGHUP) then
+        // applies: flipping it *on* loads a previously-refused ruleset, and
+        // flipping it *off* ejects a now-disallowed loaded policy even when the
+        // file is unchanged (the handler re-checks the loaded ruleset, so the
+        // sha-dedup can't strand a relay-withholding policy in strict mode).
+        live!("allowdangerousfilters", allowdangerousfilters, |c, h| {
             h.mempool.reload_policy(mempool_config_from(c))
         }),
         // NOTE: `policyfile` is intentionally NOT a FieldSpec. Like the

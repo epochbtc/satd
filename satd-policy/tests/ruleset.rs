@@ -371,4 +371,13 @@ fn shipped_example_policy_compiles() {
         rs.total_cost().total() <= satd_policy::POLICY_BUDGET,
         "example.policy must stay within the static cost budget"
     );
+    // The shipped example must not trip the strict danger gate (§2.5): a node
+    // would refuse to start with it otherwise. No rule may withhold relay for a
+    // Lightning enforcement shape.
+    let findings = satd_policy::analyze_danger(&rs);
+    let relay: Vec<_> = findings.iter().filter(|f| f.withholds_relay()).collect();
+    assert!(
+        relay.is_empty(),
+        "example.policy would be refused by the danger gate: {relay:?}"
+    );
 }
