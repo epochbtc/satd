@@ -21,7 +21,8 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   foregone-fees + confirmed-anyway), `listquarantine`, `getquarantineentry`,
   `policytest`, matching MCP tools, and `satd_policy_*` Prometheus metrics. Live
   `SIGHUP` reload (last-good-wins, lossless re-placement). Offline `sat-cli
-  policylint`. New Operator Manual chapter. See the
+  policylint`. New Operator Manual chapter plus a contributor
+  [design doc](satd-policy/DESIGN.md). See the
   [release notes](docs/release-notes/0.4.0-pre.md).
 - **Profilable release binaries.** Release builds now ship with frame pointers
   + line-table debug info; the binary stays stripped (same download size) and
