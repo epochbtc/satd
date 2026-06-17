@@ -184,11 +184,15 @@ There are **two tiers**, by precision:
   AST and warns when it *mentions* L2-ish features (anchor outputs, small-value
   thresholds, witness-size caps, `OP_CSV`/`OP_CLTV`). Broad and cheap; right for
   a hint, too imprecise to block. It never inspects `allow` rules.
-- **Danger gate (semantic, blocking)** — the `danger` module evaluates each
-  `quarantine` rule against synthetic transactions shaped like real Lightning
-  enforcement traffic (BOLT-3 commitment/justice/HTLC, taproot script-path, and
-  a generic healthy P2TR keyspend) and reports only the rules that *actually
-  quarantine* one. Near-zero false positives, so it is safe to gate a load on.
+- **Danger gate (semantic, blocking)** — the `danger` module evaluates the whole
+  ruleset (honoring first-match-wins, so an earlier `allow` shields and an earlier
+  `quarantine` is attributed) against synthetic transactions shaped like real
+  Lightning enforcement traffic (BOLT-3 anchor and TRUC/ephemeral-anchor
+  commitments, justice, faithful offered/received HTLC scripts, taproot
+  script-path, and a generic healthy P2TR keyspend), each carrying realistic
+  enforcement witness sizes and anchor values, and reports only the rules that
+  *actually quarantine* one. Near-zero false positives, so it is safe to gate a
+  load on.
 
 The gate is **strict by default** — a reversal of the original "advisory, never
 blocking" stance (see the history note below). A rule that would **withhold
