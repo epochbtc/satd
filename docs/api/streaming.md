@@ -359,12 +359,46 @@ in without protocol breakage, the design choice that avoids btcd's BIP37 dead-en
 The WS control channel is the JSON mirror of this union.
 
 **Resume semantics.** Durable replay (§6.2) is offered at stream **establishment**:
-`Subscribe(from_cursor)` on gRPC, and `?from_cursor=` at WS/SSE connect. Mid-stream
-`SetCursor` on the bidi `Watch` is a **documented no-op** — splicing a historical
-replay into a stream that is already live is ill-defined (it would interleave past
-and present); a client that needs to re-anchor reconnects with `from_cursor`
-instead. A client that sends only `SetCategories` and no watch-add gets exactly the
-legacy firehose behavior.
+`Subscribe(from_cursor)` on gRPC, and `?from_cursor=` at WS/SSE connect. A client
+that sends only `SetCategories` and no watch-add gets exactly the legacy firehose
+behavior.
+
+Mid-stream `SetCursor` on the bidirectional gRPC `Watch` **re-anchors** the
+firehose (§7.3.1); WS/SSE clients, which have no mid-stream control channel,
+re-anchor by reconnecting with `?from_cursor=`.
+
+#### 7.3.1 Mid-stream re-anchor
+
+`SetCursor(cursor)` on a live `Watch` replays the confirmed history the client
+asks to revisit, then resumes the live tail — without tearing down the watch-set.
+It is an **ordered drain-replay-resume**, not an interleave:
+
+1. The server runs the same `build_cursor_replay` snapshot→live handoff used at
+   establishment (§6.2) for `(cursor.height, current_tip]`.
+2. The replayed confirmed events are emitted **in height order, ahead of any
+   further live events** — the re-anchor batch is drained to completion before the
+   live tail resumes. Live events that accumulate during the drain follow and may
+   duplicate the tail of the replay; the client de-duplicates by `(height, hash)`
+   exactly as at the establishment seam (§6.3), so the stream is at-least-once with
+   idempotent confirmed application.
+3. The **watch-set and its quota leases are preserved** across the re-anchor —
+   the reason to re-anchor in place rather than reconnect with `from_cursor`, which
+   would force a full re-add (+ re-auth + quota rebuild) of a possibly-large
+   watch-set. A long-lived `Watch` with thousands of registered scripts/outpoints
+   re-anchors its replay position without rebuilding its watch-set.
+
+**Not replayed:** historical watch *matches*. Watch matches are per-subscriber and
+not durable (they are never part of cursor replay, nor bridged to ZMQ). A
+re-anchor replays the firehose/confirmed history only; the client reconstructs any
+historical matches it needs from the replayed blocks against its own watch-set, and
+receives live matches going forward. A re-anchor on a server with no `block_source`
+configured is a no-op (the same fallback as `Subscribe(from_cursor)` without a
+source). Replay work is bounded two ways: concurrent re-anchors are capped at one
+in flight per stream (a `SetCursor` arriving while a drain is running is dropped),
+and each actionable re-anchor is charged against the connection's per-principal
+rate limit — the same token bucket as watch-set adds — so back-to-back `SetCursor`s
+in a tight loop are throttled rather than allowed to re-walk the block index
+unboundedly. (Operator/loopback principals bypass the rate limit, as elsewhere.)
 
 ### 7.4 Transaction lifecycle & confirmation-depth watches
 
