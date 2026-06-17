@@ -1067,10 +1067,11 @@ fn watch_match_json(m: &WatchMatch) -> serde_json::Value {
                     "raw_tx": hex::encode(pm.raw_tx.as_ref()),
                     "confirmed": pm.confirmed,
                     "height": pm.height,
-                    "matched_prevouts": pm.matched_prevouts.iter().map(|(op, spk)| json!({
-                        "outpoint_txid": hex::encode(op.txid.as_raw_hash().to_byte_array()),
-                        "outpoint_vout": op.vout,
-                        "script_pubkey": hex::encode(spk.as_bytes()),
+                    "matched_prevouts": pm.matched_prevouts.iter().map(|m| json!({
+                        "outpoint_txid": hex::encode(m.outpoint.txid.as_raw_hash().to_byte_array()),
+                        "outpoint_vout": m.outpoint.vout,
+                        "script_pubkey": hex::encode(m.script_pubkey.as_bytes()),
+                        "amount": m.amount,
                     })).collect::<Vec<_>>(),
                 }
             })

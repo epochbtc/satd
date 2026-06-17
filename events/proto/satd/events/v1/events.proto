@@ -173,11 +173,18 @@ message TxidFinalized {
 }
 
 // A spent prevout that matched a script-prefix bucket (spend side of a
-// PrefixMatched): the outpoint consumed and the scriptPubKey it paid.
+// PrefixMatched): the outpoint consumed, the scriptPubKey it paid, and its value.
+// `script_pubkey` is set for confirmed spends (from undo) and for mempool spends
+// when `streamprevoutmeta = full`; empty otherwise (the client resolves the
+// prevout itself). `amount` is set for confirmed spends and for mempool spends
+// when `streamprevoutmeta >= amount` (the default); `has_amount` distinguishes a
+// genuine 0-value prevout from "value not retained".
 message SpentPrevout {
   bytes  outpoint_txid = 1;
   uint32 outpoint_vout = 2;
   bytes  script_pubkey = 3;
+  uint64 amount        = 4;
+  bool   has_amount    = 5;
 }
 
 // A transaction fell inside a watched script-prefix bucket (§7.5). Carries the
