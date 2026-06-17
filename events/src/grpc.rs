@@ -813,6 +813,15 @@ impl NodeEventStream for NodeEventStreamSvc {
             loop {
                 tokio::select! {
                     biased;
+                    // Client gone: the response `ReceiverStream` (rx_out) was
+                    // dropped. The send-error checks below only fire when an event
+                    // arrives to send, so on an IDLE node a disconnect would
+                    // otherwise leave this task parked on the channels — pinning
+                    // the concurrency slot, WatchHandle, and quota leases (and the
+                    // inbound task) until the next event. Detecting the closed
+                    // sender here releases them promptly. Checked first so a
+                    // disconnect wins over draining work for a client that is gone.
+                    _ = tx_out.closed() => break,
                     // Mid-stream re-anchor: drain the replay batch to completion,
                     // in height order, BEFORE servicing live/match again.
                     Some(cur) = reanchor_rx.recv() => {
@@ -3112,6 +3121,84 @@ mod tests {
         );
 
         drop(ctrl_tx);
+        let _ = shutdown_tx.send(true);
+    }
+
+    /// When the client disconnects while the node is IDLE (no live events, no
+    /// matches, no re-anchor), the outbound task must still tear down promptly and
+    /// release the subscription — it cannot park on the event channels until the
+    /// next event. Proven by watching the registration drop after the client drops
+    /// the stream with nothing ever published. Without the `tx_out.closed()` branch
+    /// the outbound task would stay parked holding its `WatchHandle`, so the watch
+    /// would remain registered.
+    #[tokio::test]
+    async fn watch_outbound_exits_on_client_disconnect_while_idle() {
+        let publisher = EventPublisher::new(edge(), 64);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let registry = Arc::new(node::events::WatchRegistry::new());
+        let sink = GrpcEventSink::bind(
+            "127.0.0.1:0",
+            false,
+            publisher.clone(),
+            GrpcLimits::default(),
+            None,
+            None, // no block source: a re-anchor can't wake the loop either
+            Some(registry.clone()),
+        )
+        .await
+        .expect("bind");
+        let actual = sink.local_addr().unwrap();
+        publisher.attach_sinks(vec![Box::new(sink)], shutdown_rx.clone());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let mut client =
+            pb::node_event_stream_client::NodeEventStreamClient::connect(format!(
+                "http://{actual}"
+            ))
+            .await
+            .expect("connect");
+        let (ctrl_tx, ctrl_rx) = tokio::sync::mpsc::channel::<pb::SubscribeControl>(4);
+        ctrl_tx
+            .send(pb::SubscribeControl {
+                msg: Some(pb::subscribe_control::Msg::AddOutpoints(pb::AddOutpoints {
+                    outpoints: vec![op_proto(0xab, 0)],
+                })),
+            })
+            .await
+            .unwrap();
+        let stream = client
+            .watch(ReceiverStream::new(ctrl_rx))
+            .await
+            .expect("watch")
+            .into_inner();
+
+        for _ in 0..100 {
+            if registry.has_watchers() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(registry.has_watchers(), "watch registered");
+
+        // Client disconnects — drop the response stream (and the rest) with NO
+        // event ever published, so only the closed-sender signal can wake the
+        // outbound task.
+        drop(stream);
+        drop(ctrl_tx);
+        drop(client);
+
+        let mut released = false;
+        for _ in 0..150 {
+            if !registry.has_watchers() {
+                released = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            released,
+            "outbound task released the subscription after an idle disconnect",
+        );
         let _ = shutdown_tx.send(true);
     }
 
