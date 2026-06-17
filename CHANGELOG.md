@@ -11,6 +11,12 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
 
 ## [Unreleased]
 
+- **Streaming API: mid-stream `SetCursor` re-anchor on gRPC `Watch`.** A
+  `SetCursor` on a live bidi `Watch` now replays confirmed history
+  `(cursor.height, tip]` in order ahead of the live tail (drain-replay-resume),
+  preserving the watch-set + quota leases — previously a documented no-op. Lets a
+  long-lived `Watch` re-anchor its replay position without rebuilding a large
+  watch-set. See the [release notes](docs/release-notes/0.4.0-pre.md).
 - **Streaming API: prefix mempool spend-side prevout carriage (`full` tier).**
   Under `streamprevoutmeta = full`, a mempool `PrefixMatched` now carries the real
   spent-prevout `scriptPubKey` (and, from `amount`, its value) so a chainstate-less

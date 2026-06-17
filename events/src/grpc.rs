@@ -677,6 +677,14 @@ impl NodeEventStream for NodeEventStreamSvc {
         let watch_set: Arc<std::sync::Mutex<WatchSet>> =
             Arc::new(std::sync::Mutex::new(WatchSet::default()));
 
+        // Mid-stream re-anchor channel (§7.3.1): a `SetCursor` on the inbound
+        // control stream hands its cursor to the outbound task, which drains a
+        // confirmed-history replay ahead of the live tail. Capacity 1 bounds
+        // concurrent re-anchors to one in flight — a `SetCursor` that arrives
+        // while a drain is pending is dropped (`try_send`), so a client cannot
+        // pile up unbounded replay work.
+        let (reanchor_tx, reanchor_rx) = tokio::sync::mpsc::channel::<node::events::Cursor>(1);
+
         // Inbound control reader: applies watch-set mutations + category
         // changes for the life of the stream against the shared subscription-
         // scoped watch-set, and holds a handle clone so the subscription is
@@ -688,6 +696,21 @@ impl NodeEventStream for NodeEventStreamSvc {
             let prefix_bounds = (self.prefix_min_bits, self.prefix_max_bits);
             tokio::spawn(async move {
                 while let Ok(Some(ctrl)) = inbound.message().await {
+                    // `SetCursor` is a mid-stream re-anchor, not a watch-set
+                    // mutation: forward its cursor to the outbound task (drop if
+                    // a re-anchor is already in flight) instead of applying it.
+                    if let Some(pb::subscribe_control::Msg::SetCursor(sc)) = &ctrl.msg {
+                        if let Some(c) = &sc.cursor {
+                            let cur = node::events::Cursor {
+                                height: c.height,
+                                tx_index: c.tx_index,
+                                mempool_seq: c.mempool_seq,
+                                instance_id: c.instance_id,
+                            };
+                            let _ = reanchor_tx.try_send(cur);
+                        }
+                        continue;
+                    }
                     let mut guard = watch_set.lock().unwrap_or_else(|p| p.into_inner());
                     apply_control(
                         ctrl,
@@ -704,79 +727,128 @@ impl NodeEventStream for NodeEventStreamSvc {
             });
         }
 
-        // Outbound: live category-filtered firehose merged with the
-        // per-subscriber watch matches. Track the last-delivered position to
-        // fill an in-band `Lagged` notice. The Watch firehose has no replay, so
-        // seed the resume height from the CURRENT chain tip (not 0): a client
-        // that lags before any block event is delivered — e.g. one that masks the
-        // firehose off and only wants watch matches — would otherwise be handed a
-        // resume_cursor of height 0 and re-replay from genesis on reconnect. The
-        // mempool watermark still seeds from 0 (no live mempool seen yet).
-        let lag_publisher = self.publisher.clone();
-        let mut last_h = self
-            .block_source
+        // Outbound: a single task selects over the live firehose, the
+        // per-subscriber match channel, and mid-stream re-anchor requests,
+        // forwarding into a bounded `mpsc` that backs the response stream. A
+        // dedicated task (rather than `merge`d streams) is what lets a re-anchor
+        // drain its replay batch *fully and in order* before the live tail
+        // resumes (§7.3.1) — a plain `merge` would interleave past and present.
+        let (tx_out, rx_out) = tokio::sync::mpsc::channel::<Result<pb::NodeEvent, Status>>(
+            node::events::WATCH_CHANNEL_CAPACITY,
+        );
+        let publisher = self.publisher.clone();
+        let block_source = self.block_source.clone();
+        // Resume-cursor seed: the Watch firehose has no establishment replay, so
+        // seed the resume height from the CURRENT chain tip (not 0) — a client
+        // that lags before any block event (e.g. one watching only matches with
+        // the firehose masked off) would otherwise be handed height 0 and
+        // re-replay from genesis. The mempool watermark seeds from 0.
+        let mut last_h = block_source
             .as_ref()
             .map(|s| s.current_tip_height())
             .unwrap_or(0);
         let mut last_s = 0u64;
-        let live = BroadcastStream::new(rx_live).filter_map(move |item| match item {
-            Ok(env) => {
-                if (env.category_bit() & category_mask.load(Ordering::Relaxed)) == 0 {
-                    return None;
-                }
-                last_s = env.stamp.seq;
-                if let Some(c) = &env.cursor {
-                    last_h = c.height;
-                }
-                Some(Ok(envelope_to_proto(&env)))
-            }
-            Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
-                warn!(target: "events::grpc", dropped = n, "Watch subscriber lagged (firehose)");
-                let resume = lag_publisher.resume_cursor(last_h, last_s);
-                let ev = node::events::lagged_event(&lag_publisher, n, resume);
-                Some(Ok(envelope_to_proto(&ev)))
-            }
-        });
-        // Single-shot terminal matches (depth alarm / lifecycle auto-close): the
-        // registry already evicted the entry server-side on fire, so the
-        // handle.remove_* below is an idempotent no-op registry-side — its job
-        // here is to drop the carrier-held quota LEASE. Keyed by the threshold
-        // the match carries.
-        let evict_handle = handle.clone();
-        let evict_ws = watch_set.clone();
-        let matches = ReceiverStream::new(rx_match).map(move |m| {
+        let mut rx_live = rx_live;
+        let mut rx_match = rx_match;
+        let mut reanchor_rx = reanchor_rx;
+        tokio::spawn(async move {
             use node::events::WatchMatch;
-            match &m {
-                WatchMatch::TxidDepthReached { txid, depth, .. } => {
-                    let mut ws = evict_ws.lock().unwrap_or_else(|p| p.into_inner());
-                    ws.remove_tx_depths([(*txid, *depth)], |items| {
-                        evict_handle.remove_tx_depths(items);
-                    });
+            // Keep the subscription alive for the task's lifetime: the
+            // `WatchHandle` (deregisters on drop), the concurrency slot, and the
+            // watch-set with its quota leases all drop together when the client
+            // disconnects (the task ends when `tx_out` send fails).
+            let _keep_slot = sub_guard;
+            loop {
+                tokio::select! {
+                    biased;
+                    // Mid-stream re-anchor: drain the replay batch to completion,
+                    // in height order, BEFORE servicing live/match again.
+                    Some(cur) = reanchor_rx.recv() => {
+                        let Some(src) = block_source.as_ref() else {
+                            // No block source → re-anchor is a no-op (same fallback
+                            // as Subscribe(from_cursor) without a source).
+                            continue;
+                        };
+                        let mask = category_mask.load(Ordering::Relaxed);
+                        let replay = node::events::build_cursor_replay(
+                            src.as_ref(),
+                            &publisher,
+                            cur,
+                            mask,
+                            MAX_REPLAY_BLOCKS,
+                        );
+                        debug!(
+                            target: "events::grpc",
+                            replayed_events = replay.events.len(),
+                            "events gRPC Watch mid-stream re-anchor (drain→resume)",
+                        );
+                        for ev in &replay.events {
+                            if let Some(c) = &ev.cursor {
+                                last_h = c.height;
+                            }
+                            last_s = last_s.max(ev.stamp.seq);
+                            if tx_out.send(Ok(envelope_to_proto(ev))).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    live = rx_live.recv() => match live {
+                        Ok(env) => {
+                            if (env.category_bit() & category_mask.load(Ordering::Relaxed)) == 0 {
+                                continue;
+                            }
+                            last_s = env.stamp.seq;
+                            if let Some(c) = &env.cursor {
+                                last_h = c.height;
+                            }
+                            if tx_out.send(Ok(envelope_to_proto(&env))).await.is_err() {
+                                return;
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            warn!(target: "events::grpc", dropped = n, "Watch subscriber lagged (firehose)");
+                            let resume = publisher.resume_cursor(last_h, last_s);
+                            let ev = node::events::lagged_event(&publisher, n, resume);
+                            if tx_out.send(Ok(envelope_to_proto(&ev))).await.is_err() {
+                                return;
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    },
+                    m = rx_match.recv() => match m {
+                        Some(m) => {
+                            // Single-shot terminal matches (depth alarm / lifecycle
+                            // auto-close): the registry already evicted the entry
+                            // server-side on fire, so handle.remove_* is an
+                            // idempotent no-op there — its job here is to drop the
+                            // carrier-held quota LEASE.
+                            match &m {
+                                WatchMatch::TxidDepthReached { txid, depth, .. } => {
+                                    let mut ws = watch_set.lock().unwrap_or_else(|p| p.into_inner());
+                                    ws.remove_tx_depths([(*txid, *depth)], |items| {
+                                        handle.remove_tx_depths(items);
+                                    });
+                                }
+                                WatchMatch::TxidFinalized { txid, .. } => {
+                                    let mut ws = watch_set.lock().unwrap_or_else(|p| p.into_inner());
+                                    ws.remove_transactions([*txid], |txids| {
+                                        handle.remove_txids(txids);
+                                    });
+                                }
+                                _ => {}
+                            }
+                            if tx_out.send(Ok(watch_match_to_proto(&edge, &m))).await.is_err() {
+                                return;
+                            }
+                        }
+                        None => break,
+                    },
+                    else => break,
                 }
-                WatchMatch::TxidFinalized { txid, .. } => {
-                    let mut ws = evict_ws.lock().unwrap_or_else(|p| p.into_inner());
-                    ws.remove_transactions([*txid], |txids| {
-                        evict_handle.remove_txids(txids);
-                    });
-                }
-                _ => {}
             }
-            Ok(watch_match_to_proto(&edge, &m))
         });
 
-        // Hold `handle` + `sub_guard` alive for the lifetime of the outbound
-        // stream (dropped on client disconnect → deregister + free slot).
-        let merged = live.merge(matches).map(move |x| {
-            let _keep_handle = &handle;
-            let _keep_slot = &sub_guard;
-            // Keep the watch-set (and its quota leases) alive for the
-            // subscription's lifetime; it and the WatchHandle drop together
-            // when the client disconnects.
-            let _keep_watch_set = &watch_set;
-            x
-        });
-
-        Ok(Response::new(Box::pin(merged)))
+        Ok(Response::new(Box::pin(ReceiverStream::new(rx_out))))
     }
 }
 
@@ -2679,6 +2751,121 @@ mod tests {
             }
             other => panic!("expected OutpointSpent, got {other:?}"),
         }
+
+        drop(ctrl_tx);
+        let _ = shutdown_tx.send(true);
+    }
+
+    /// Mid-stream `SetCursor` re-anchors the firehose: it drains the confirmed
+    /// replay `(cursor.height, tip]` in height order, and the watch-set survives
+    /// the re-anchor (a subsequent match still fires).
+    #[tokio::test]
+    async fn watch_set_cursor_re_anchors_confirmed_history() {
+        use bitcoin::hashes::Hash;
+        let publisher = EventPublisher::new(edge(), 64);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let registry = Arc::new(node::events::WatchRegistry::new());
+        let sink = GrpcEventSink::bind(
+            "127.0.0.1:0",
+            false,
+            publisher.clone(),
+            GrpcLimits::default(),
+            None,
+            Some(Arc::new(MockBlocks { tip: 5 })),
+            Some(registry.clone()),
+        )
+        .await
+        .expect("bind");
+        let actual = sink.local_addr().unwrap();
+        publisher.attach_sinks(vec![Box::new(sink)], shutdown_rx.clone());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let mut client =
+            pb::node_event_stream_client::NodeEventStreamClient::connect(format!(
+                "http://{actual}"
+            ))
+            .await
+            .expect("connect");
+
+        let op = bitcoin::OutPoint {
+            txid: Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0xcd; 32])),
+            vout: 1,
+        };
+        let (ctrl_tx, ctrl_rx) = tokio::sync::mpsc::channel::<pb::SubscribeControl>(4);
+        // Register a watch up front so we can prove it survives the re-anchor.
+        ctrl_tx
+            .send(pb::SubscribeControl {
+                msg: Some(pb::subscribe_control::Msg::AddOutpoints(pb::AddOutpoints {
+                    outpoints: vec![op_proto(0xcd, 1)],
+                })),
+            })
+            .await
+            .unwrap();
+        let mut stream = client
+            .watch(ReceiverStream::new(ctrl_rx))
+            .await
+            .expect("watch")
+            .into_inner();
+
+        // Wait until the AddOutpoints control is applied.
+        for _ in 0..100 {
+            if registry.has_watchers() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(registry.has_watchers(), "watch registered");
+
+        // Re-anchor from height 2 → drain confirmed history 3, 4, 5 in order.
+        ctrl_tx
+            .send(pb::SubscribeControl {
+                msg: Some(pb::subscribe_control::Msg::SetCursor(pb::SetCursor {
+                    cursor: Some(pb::Cursor {
+                        height: 2,
+                        tx_index: 0,
+                        mempool_seq: 0,
+                        instance_id: 0,
+                    }),
+                })),
+            })
+            .await
+            .unwrap();
+
+        for expected_h in [3u32, 4, 5] {
+            let ev = tokio::time::timeout(Duration::from_secs(3), stream.message())
+                .await
+                .expect("timeout")
+                .expect("transport")
+                .expect("stream ended");
+            assert_eq!(
+                chain_height(&ev),
+                Some(expected_h),
+                "re-anchor replays confirmed blocks in height order"
+            );
+        }
+
+        // The watch-set survived the re-anchor: a match still fires.
+        let spend = bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: op,
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![],
+        };
+        registry.scan_mempool_tx(&spend);
+        let ev = tokio::time::timeout(Duration::from_secs(3), stream.message())
+            .await
+            .expect("timeout")
+            .expect("transport")
+            .expect("stream ended");
+        assert!(
+            matches!(ev.body, Some(pb::node_event::Body::OutpointSpent(_))),
+            "watch-set preserved across re-anchor → match still delivered"
+        );
 
         drop(ctrl_tx);
         let _ = shutdown_tx.send(true);
