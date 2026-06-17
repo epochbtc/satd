@@ -807,14 +807,40 @@ fn apply_control(
             );
         }
         Some(Msg::AddScripts(a)) => {
-            watch_set.add_scripts(
-                principal,
-                a.scripthashes.iter().filter_map(|b| parse_scripthash(b)),
-                "scripts",
-                |shs| {
-                    handle.add_scripthashes(shs);
-                },
-            );
+            // Optional per-script `min_value` floors, parallel to `scripthashes`.
+            // A non-empty list must match the scripthash count exactly; a
+            // mismatch is a client protocol error — reject the whole add rather
+            // than silently apply the wrong (or no) floors.
+            if !a.min_values.is_empty() && a.min_values.len() != a.scripthashes.len() {
+                warn!(
+                    target: "events::grpc",
+                    min_values = a.min_values.len(),
+                    scripthashes = a.scripthashes.len(),
+                    "AddScripts min_values length mismatch; ignoring add",
+                );
+            } else {
+                // scripthash → floor (0 when no min_values given).
+                let floors: std::collections::HashMap<[u8; 32], u64> = a
+                    .scripthashes
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, b)| {
+                        parse_scripthash(b).map(|sh| (sh, a.min_values.get(i).copied().unwrap_or(0)))
+                    })
+                    .collect();
+                watch_set.add_scripts(
+                    principal,
+                    a.scripthashes.iter().filter_map(|b| parse_scripthash(b)),
+                    "scripts",
+                    |shs| {
+                        let items: Vec<([u8; 32], u64)> = shs
+                            .iter()
+                            .map(|sh| (*sh, floors.get(sh).copied().unwrap_or(0)))
+                            .collect();
+                        handle.add_scripthashes_with_floors(&items);
+                    },
+                );
+            }
         }
         Some(Msg::RemoveOutpoints(r)) => {
             watch_set.remove_outpoints(r.outpoints.iter().filter_map(parse_outpoint), |ops| {

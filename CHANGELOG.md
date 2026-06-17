@@ -11,6 +11,13 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
 
 ## [Unreleased]
 
+- **Streaming API: per-script `min_value` filter on `AddScripts`.** A watch can
+  attach a per-scripthash satoshi floor (`min_values`, parallel to
+  `scripthashes`); matches below it are suppressed server-side. Symmetric across
+  funding (output value) and spending (spent-prevout value). Also corrects the
+  stale `ScriptMatched.is_output` proto comment (input-side matching has shipped
+  since the prefix/exact spend-side work). See the
+  [release notes](docs/release-notes/0.4.0-pre.md).
 - **Streaming API: `streamprevoutmeta` mempool prevout retention (default
   `amount`).** New mempool-policy key tuning how much spent-prevout metadata the
   streaming watch matcher retains per mempool input (`hash` | `amount` | `full`)

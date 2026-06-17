@@ -245,6 +245,7 @@ pub fn add_scripts(scripthash_hex: &[&str]) -> SubscribeControl {
                 .iter()
                 .map(|h| hex::decode(h).expect("scripthash hex"))
                 .collect(),
+            min_values: Vec::new(),
         })),
     }
 }
