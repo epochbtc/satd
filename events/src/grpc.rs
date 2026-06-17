@@ -15,6 +15,7 @@
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 
@@ -29,6 +30,25 @@ use tonic::transport::Server;
 use tonic::transport::server::Connected;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, info, warn};
+
+/// HTTP/2 server keepalive: PING idle connections at this interval and reap any
+/// that fail to respond within [`GRPC_KEEPALIVE_TIMEOUT`]. Without this, a dead
+/// or half-open client (request stream still open, response abandoned) can pin a
+/// `Watch` subscription's `WatchHandle` + quota leases indefinitely. Mirrors the
+/// WS transport's ping/idle-timeout (`ws.rs`).
+const GRPC_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+const GRPC_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Aborts the wrapped task on drop. Ties the inbound control reader's lifetime to
+/// the outbound subscription task: when the subscription tears down, the inbound
+/// task is aborted rather than left parked on `message().await` holding a
+/// `WatchHandle` clone (and, through it, the subscription's quota leases).
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 
 // The confirmed-block replay span cap is defined once in `node::events`
 // (shared by every streaming carrier); re-export the name into scope so the
@@ -305,11 +325,15 @@ impl EventSink for GrpcEventSink {
                 Ok(req)
             };
             Server::builder()
+                .http2_keepalive_interval(Some(GRPC_KEEPALIVE_INTERVAL))
+                .http2_keepalive_timeout(Some(GRPC_KEEPALIVE_TIMEOUT))
                 .add_service(NodeEventStreamServer::with_interceptor(svc_impl, interceptor))
                 .serve_with_incoming_shutdown(incoming, shutdown_signal)
                 .await
         } else {
             Server::builder()
+                .http2_keepalive_interval(Some(GRPC_KEEPALIVE_INTERVAL))
+                .http2_keepalive_timeout(Some(GRPC_KEEPALIVE_TIMEOUT))
                 .add_service(NodeEventStreamServer::new(svc_impl))
                 .serve_with_incoming_shutdown(incoming, shutdown_signal)
                 .await
@@ -689,7 +713,7 @@ impl NodeEventStream for NodeEventStreamSvc {
         // changes for the life of the stream against the shared subscription-
         // scoped watch-set, and holds a handle clone so the subscription is
         // retained while either side is alive.
-        {
+        let inbound_task = {
             let handle = handle.clone();
             let category_mask = category_mask.clone();
             let watch_set = watch_set.clone();
@@ -701,6 +725,27 @@ impl NodeEventStream for NodeEventStreamSvc {
                     // a re-anchor is already in flight) instead of applying it.
                     if let Some(pb::subscribe_control::Msg::SetCursor(sc)) = &ctrl.msg {
                         if let Some(c) = &sc.cursor {
+                            // A re-anchor drives a confirmed-history replay (up to
+                            // MAX_REPLAY_BLOCKS block-index reads + event synthesis).
+                            // The capacity-1 channel bounds only *concurrent*
+                            // re-anchors; rate-limit per-principal here so a client
+                            // cannot fire back-to-back SetCursors in a tight loop and
+                            // pin a worker re-walking the block index. Operator/
+                            // loopback/no-policy principals bypass (check_rate →
+                            // Allow), same posture as Subscribe establishment and
+                            // watch-set adds. Charged only when there is an actionable
+                            // cursor, so a malformed empty SetCursor spends no token.
+                            if let Some(p) = principal.as_ref()
+                                && let satd_auth::RateDecision::Throttle { retry_after_secs } =
+                                    p.check_rate()
+                            {
+                                debug!(
+                                    target: "events::grpc",
+                                    retry_after_secs,
+                                    "dropping mid-stream SetCursor re-anchor: per-principal rate limit exceeded",
+                                );
+                                continue;
+                            }
                             let cur = node::events::Cursor {
                                 height: c.height,
                                 tx_index: c.tx_index,
@@ -724,8 +769,8 @@ impl NodeEventStream for NodeEventStreamSvc {
                 // Inbound (control) closed. The watch-set is NOT dropped here —
                 // it belongs to the subscription and drops with the outbound
                 // stream + WatchHandle when the client fully disconnects.
-            });
-        }
+            })
+        };
 
         // Outbound: a single task selects over the live firehose, the
         // per-subscriber match channel, and mid-stream re-anchor requests,
@@ -758,6 +803,13 @@ impl NodeEventStream for NodeEventStreamSvc {
             // watch-set with its quota leases all drop together when the client
             // disconnects (the task ends when `tx_out` send fails).
             let _keep_slot = sub_guard;
+            // Tie the inbound control reader to this task: when the subscription
+            // ends (any exit path below), abort the inbound task so it cannot
+            // linger on `message().await` holding its `WatchHandle` clone and the
+            // shared watch-set after the outbound side is gone. (A clean
+            // half-close already ends inbound via `message()` → `Ok(None)`; this
+            // covers the case where the outbound side terminates first.)
+            let _abort_inbound = AbortOnDrop(inbound_task);
             loop {
                 tokio::select! {
                     biased;
@@ -1048,9 +1100,12 @@ fn apply_control(
             category_mask.store(mask, Ordering::Relaxed);
         }
         Some(Msg::SetCursor(_)) => {
-            warn!(
+            // Unreachable in practice: the Watch inbound loop intercepts
+            // SetCursor (a mid-stream re-anchor, §7.3.1) before calling
+            // apply_control. Kept as a defensive arm for any other caller.
+            debug!(
                 target: "events::grpc",
-                "SetCursor on the Watch stream is not served; use Subscribe(from_cursor) for replay",
+                "SetCursor reached apply_control unexpectedly; ignoring (handled as re-anchor upstream)",
             );
         }
         None => {}

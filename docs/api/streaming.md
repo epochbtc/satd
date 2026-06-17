@@ -393,9 +393,12 @@ re-anchor replays the firehose/confirmed history only; the client reconstructs a
 historical matches it needs from the replayed blocks against its own watch-set, and
 receives live matches going forward. A re-anchor on a server with no `block_source`
 configured is a no-op (the same fallback as `Subscribe(from_cursor)` without a
-source), and the server bounds concurrent re-anchors to one in flight per stream
-(a further `SetCursor` while a drain is running is dropped) so a client cannot pile
-up unbounded replay work.
+source). Replay work is bounded two ways: concurrent re-anchors are capped at one
+in flight per stream (a `SetCursor` arriving while a drain is running is dropped),
+and each actionable re-anchor is charged against the connection's per-principal
+rate limit — the same token bucket as watch-set adds — so back-to-back `SetCursor`s
+in a tight loop are throttled rather than allowed to re-walk the block index
+unboundedly. (Operator/loopback principals bypass the rate limit, as elsewhere.)
 
 ### 7.4 Transaction lifecycle & confirmation-depth watches
 
