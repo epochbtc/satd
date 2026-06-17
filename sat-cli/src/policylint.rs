@@ -6,18 +6,25 @@
 //! Output:
 //! * a per-rule cost table and the ruleset total against the static budget,
 //! * the **L2-shape advisory** (`--no-advisories` to silence for CI),
+//! * the **Lightning-enforcement danger** report (§2.5) — semantic, gate-grade,
 //! * `--explain` plain-English rendering of each rule.
 //!
 //! Exit codes (for CI): `0` the file loads, `1` a load error (with a caret
-//! diagnostic), `2` the file could not be read. The advisory never changes the
-//! exit code — it is advisory, never blocking.
+//! diagnostic), `2` the file could not be read, `3` the file loads but contains
+//! a rule that would **withhold relay** for Lightning enforcement traffic and
+//! `--allow-dangerous-filters` was not given (strict by default — the same gate
+//! the node applies at load). The syntactic L2-shape advisory never changes the
+//! exit code; the danger report does, unless overridden.
 
 use std::path::Path;
 
-use satd_policy::{CompiledRuleset, POLICY_BUDGET, advise_ruleset, explain_rule, parse_ruleset};
+use satd_policy::{
+    CompiledRuleset, DangerFinding, POLICY_BUDGET, advise_ruleset, analyze_danger, explain_rule,
+    parse_ruleset,
+};
 
 /// Run the linter against `path`. Returns the process exit code.
-pub fn run(path: &Path, explain: bool, no_advisories: bool) -> i32 {
+pub fn run(path: &Path, explain: bool, no_advisories: bool, allow_dangerous: bool) -> i32 {
     let src = match std::fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) => {
@@ -48,7 +55,7 @@ pub fn run(path: &Path, explain: bool, no_advisories: bool) -> i32 {
         print_advisories(&ruleset);
     }
 
-    0
+    print_danger(&ruleset, allow_dangerous)
 }
 
 fn print_summary(path: &Path, rs: &CompiledRuleset) {
@@ -104,6 +111,76 @@ fn print_explanations(rs: &CompiledRuleset) {
         println!("  • {}", explain_rule(r));
     }
     println!();
+}
+
+/// The Lightning-enforcement danger report (semantic, gate-grade §2.5). Returns
+/// the process exit code: `3` if a relay-withholding rule matched an enforcement
+/// shape and `allow_dangerous` is false, else `0`. `on template` matches warn
+/// but never fail — E1 is about relay homogeneity, and a template-only rule
+/// still relays the transaction.
+fn print_danger(rs: &CompiledRuleset, allow_dangerous: bool) -> i32 {
+    let findings = analyze_danger(rs);
+    if findings.is_empty() {
+        println!("No Lightning-enforcement danger findings.");
+        return 0;
+    }
+
+    // Group by rule (scope is constant within a rule), preserving rule order.
+    let mut groups: Vec<(&str, String, bool, Vec<&DangerFinding>)> = Vec::new();
+    for f in &findings {
+        if let Some(g) = groups.iter_mut().find(|(n, ..)| *n == f.rule) {
+            g.3.push(f);
+        } else {
+            groups.push((&f.rule, f.scope.to_string(), f.scope.relay, vec![f]));
+        }
+    }
+    let relay_rules = groups.iter().filter(|(.., relay, _)| *relay).count();
+
+    println!(
+        "LIGHTNING-ENFORCEMENT DANGER ({} rule{}):",
+        groups.len(),
+        if groups.len() == 1 { "" } else { "s" },
+    );
+    for (name, scope, relay, fs) in &groups {
+        let sev = if *relay {
+            "REFUSE (withholds relay)"
+        } else {
+            "warn (template-only — still relayed)"
+        };
+        println!("  [{name}] {sev} — scope: {scope}");
+        for f in fs {
+            println!("      • matches {} — {}", f.shape.label(), f.class.headline());
+        }
+    }
+    println!();
+
+    if relay_rules == 0 {
+        // Only template-only matches: warn, never block.
+        eprintln!(
+            "warning: {} rule(s) decline to MINE Lightning enforcement transactions \
+             (on template); they still relay, so propagation is unaffected.",
+            groups.len()
+        );
+        return 0;
+    }
+
+    if allow_dangerous {
+        eprintln!(
+            "warning: {relay_rules} rule(s) would WITHHOLD RELAY for Lightning enforcement \
+             transactions (E1); accepted via --allow-dangerous-filters."
+        );
+        0
+    } else {
+        eprintln!(
+            "error: refusing — {relay_rules} rule(s) would WITHHOLD RELAY for Lightning \
+             enforcement transactions, degrading L2 enforcement network-wide (E1)."
+        );
+        eprintln!(
+            "       Narrow the rule(s), scope them `on template`, or re-run with \
+             --allow-dangerous-filters to accept the risk."
+        );
+        3
+    }
 }
 
 fn print_advisories(rs: &CompiledRuleset) {
