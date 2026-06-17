@@ -278,31 +278,7 @@ fn apply_policyfile_reload(new: &Config, h: &ReloadHandles) {
     match &new.policyfile {
         Some(path) => match h.mempool.reload_policy_file(path) {
             Ok(PolicyReloadKind::Unchanged) => {
-                // The file is unchanged, but `allowdangerousfilters` may have been
-                // tightened to strict in this same SIGHUP (its `live!` field is
-                // applied before this handler). The sha-dedup skipped the load
-                // gate, so reconcile the loaded policy with the current flag here:
-                // if a now-disallowed relay-withholding rule is live, eject the
-                // whole policy fail-safe (drop + promote), like a policyfile
-                // removal — strict mode must actually stop the withholding.
-                if let Err(e) = h.mempool.recheck_loaded_danger_gate() {
-                    tracing::error!(
-                        error = %e,
-                        path = %path.display(),
-                        "loaded policy now violates the danger gate \
-                         (allowdangerousfilters tightened) — dropping it"
-                    );
-                    h.mempool.clear_policy();
-                    let t = h.mempool.reapply_policy(&h.chain_state);
-                    let promoted = t.promoted.len();
-                    h.peer_manager.enqueue_promotions(t.promoted);
-                    tracing::info!(
-                        promoted,
-                        "dangerous policy dropped — quarantine promoted to acting"
-                    );
-                } else {
-                    tracing::debug!(path = %path.display(), "policy file reloaded: no change");
-                }
+                tracing::debug!(path = %path.display(), "policy file reloaded: no change");
             }
             Ok(PolicyReloadKind::Changed(load)) => {
                 tracing::info!(
@@ -343,6 +319,31 @@ fn apply_policyfile_reload(new: &Config, h: &ReloadHandles) {
                 );
             }
         }
+    }
+
+    // Final safety reconciliation — runs after *every* path above. The loaded
+    // policy must satisfy the danger gate under the current `allowdangerousfilters`.
+    // This catches two cases the reload itself misses:
+    //   1. the flag tightened against an unchanged file (the sha-dedup returns
+    //      `Unchanged` before the load gate runs), and
+    //   2. a refused or uncompilable reload that kept a last-good policy which was
+    //      originally loaded under the opt-out (the `Err` arm keeps last-good).
+    // In both, a relay-withholding policy could otherwise stay live while strict
+    // mode is reported on. Eject it fail-safe (drop + promote), like a removal.
+    if let Err(e) = h.mempool.recheck_loaded_danger_gate() {
+        tracing::error!(
+            error = %e,
+            "loaded policy violates the danger gate under the current \
+             allowdangerousfilters — dropping it"
+        );
+        h.mempool.clear_policy();
+        let t = h.mempool.reapply_policy(&h.chain_state);
+        let promoted = t.promoted.len();
+        h.peer_manager.enqueue_promotions(t.promoted);
+        tracing::info!(
+            promoted,
+            "dangerous policy dropped — quarantine promoted to acting"
+        );
     }
 }
 
