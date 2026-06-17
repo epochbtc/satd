@@ -625,6 +625,18 @@ already pooled keep whatever they were admitted with (mempool matching is
 best-effort by contract, §6.2). The confirmed-block spend side is unaffected — it
 always recovers full script and value from undo data (§7.2).
 
+**Memory accounting.** Retained prevout metadata is held *alongside* each mempool
+entry and is **not** counted against `maxmempool` (which bounds only serialized
+transaction weight). Budget for it separately. The worst case is bounded by the
+mempool's input count: roughly `entries × inputs_per_entry × per_input_cost`,
+where `per_input_cost` is 32 B (`hash`), 40 B (`amount`), or 32 B + the prevout
+script length (`full`, typically ~34 B for witness outputs, but attacker-
+influenceable up to the standardness script-size limit). For a full default-size
+mempool this is sub-1% of the mempool's own footprint under `hash`/`amount`; under
+`full` size it as `maxmempool` plus that per-input script overhead, and prefer a
+lower tier on memory-constrained nodes that do not need chainstate-less spend
+confirmation.
+
 ## 13. Open questions
 
 These are genuine open design points, deferred until a real consumer's feedback can
