@@ -2926,6 +2926,195 @@ mod tests {
         let _ = shutdown_tx.send(true);
     }
 
+    /// A deterministic rate limiter for the SetCursor re-anchor test: Allow the
+    /// first `allow_first` checks, Throttle every check after that. Counting (not
+    /// wall-clock) so the assertion cannot flake on token-bucket refill timing.
+    struct CountingRate {
+        allow_first: usize,
+        calls: Arc<std::sync::Mutex<usize>>,
+    }
+    impl satd_auth::RateLimiter for CountingRate {
+        fn check(&self, _id: &str, _policy: &satd_auth::RatePolicy) -> satd_auth::RateDecision {
+            let mut c = self.calls.lock().unwrap();
+            *c += 1;
+            if *c <= self.allow_first {
+                satd_auth::RateDecision::Allow
+            } else {
+                satd_auth::RateDecision::Throttle { retry_after_secs: 1 }
+            }
+        }
+    }
+    /// Custom rate limiter over a real local quota store (so watch-set adds still
+    /// charge/acquire normally).
+    struct CountingAcct {
+        rate: CountingRate,
+        quota: Arc<dyn satd_auth::QuotaStore>,
+    }
+    impl satd_auth::Accounting for CountingAcct {
+        fn rate(&self) -> &dyn satd_auth::RateLimiter {
+            &self.rate
+        }
+        fn quota(&self) -> Arc<dyn satd_auth::QuotaStore> {
+            self.quota.clone()
+        }
+    }
+
+    /// A mid-stream `SetCursor` re-anchor is charged against the connection's
+    /// per-principal rate limit: once the bucket is spent, the re-anchor is
+    /// dropped rather than driving another confirmed-history replay. Proven over
+    /// the real authenticated gRPC wire path: establishment + the watch-add spend
+    /// the budget, so the subsequent `SetCursor` is throttled and produces no
+    /// replay — a watch match still arrives, which would be preceded by replayed
+    /// blocks if the re-anchor had fired.
+    #[tokio::test]
+    async fn watch_set_cursor_re_anchor_is_rate_limited() {
+        use bitcoin::hashes::Hash;
+        use std::io::Write;
+        // plaintext "grpc-ratelimit-token" → this sha256.
+        const TOKEN: &str = "grpc-ratelimit-token";
+        const TOKEN_SHA256: &str =
+            "d8d38e15dcb3f77263eaa46a3436d532fae469482c6d6ea6764405289d45b2a2";
+
+        // Allow establishment (#1) + the AddOutpoints watch-add (#2); throttle the
+        // SetCursor (#3) and anything after.
+        let calls = Arc::new(std::sync::Mutex::new(0usize));
+        let local: Arc<dyn satd_auth::Accounting> = Arc::new(satd_auth::LocalAccounting::new());
+        let acct: Arc<dyn satd_auth::Accounting> = Arc::new(CountingAcct {
+            rate: CountingRate {
+                allow_first: 2,
+                calls: calls.clone(),
+            },
+            quota: local.quota(),
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let toml = format!(
+            "version = 1\n\
+             [[token]]\nid=\"rl\"\nhash=\"sha256:{TOKEN_SHA256}\"\n\
+             capabilities=[\"stream:subscribe\",\"stream:watch\"]\n\
+             watch_quota=100\nrate_limit=\"100/s\"\n"
+        );
+        let path = dir.path().join("auth.toml");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(toml.as_bytes()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let store =
+            Arc::new(satd_auth::TokenStore::load(&path).unwrap().with_accounting(acct));
+
+        let publisher = EventPublisher::new(edge(), 64);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let registry = Arc::new(node::events::WatchRegistry::new());
+        let sink = GrpcEventSink::bind(
+            "127.0.0.1:0",
+            false,
+            publisher.clone(),
+            GrpcLimits::default(),
+            Some(store),
+            Some(Arc::new(MockBlocks { tip: 5 })),
+            Some(registry.clone()),
+        )
+        .await
+        .expect("bind");
+        let actual = sink.local_addr().unwrap();
+        publisher.attach_sinks(vec![Box::new(sink)], shutdown_rx.clone());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let mut client =
+            pb::node_event_stream_client::NodeEventStreamClient::connect(format!(
+                "http://{actual}"
+            ))
+            .await
+            .expect("connect");
+
+        let op = bitcoin::OutPoint {
+            txid: Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0xcd; 32])),
+            vout: 1,
+        };
+        let (ctrl_tx, ctrl_rx) = tokio::sync::mpsc::channel::<pb::SubscribeControl>(8);
+        // Register a watch up front (charges rate check #2 + one quota unit).
+        ctrl_tx
+            .send(pb::SubscribeControl {
+                msg: Some(pb::subscribe_control::Msg::AddOutpoints(pb::AddOutpoints {
+                    outpoints: vec![op_proto(0xcd, 1)],
+                })),
+            })
+            .await
+            .unwrap();
+        // Authenticated Watch request (establishment charges rate check #1).
+        let mut req = tonic::Request::new(ReceiverStream::new(ctrl_rx));
+        req.metadata_mut()
+            .insert("authorization", format!("Bearer {TOKEN}").parse().unwrap());
+        let mut stream = client.watch(req).await.expect("watch").into_inner();
+
+        for _ in 0..100 {
+            if registry.has_watchers() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(registry.has_watchers(), "watch registered (establishment + add allowed)");
+
+        // SetCursor: rate check #3 → throttled → dropped. Were it served it would
+        // replay confirmed blocks 3, 4, 5.
+        ctrl_tx
+            .send(pb::SubscribeControl {
+                msg: Some(pb::subscribe_control::Msg::SetCursor(pb::SetCursor {
+                    cursor: Some(pb::Cursor {
+                        height: 2,
+                        tx_index: 0,
+                        mempool_seq: 0,
+                        instance_id: 0,
+                    }),
+                })),
+            })
+            .await
+            .unwrap();
+
+        // Give the inbound task time to process (and, in a regression, re-anchor)
+        // the SetCursor before we trigger the sentinel match. With the rate-limit
+        // in place the SetCursor is dropped, so this wait sees no replay.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        // Sentinel: a mempool spend of the watched outpoint → OutpointSpent. The
+        // outbound select is biased toward re-anchors, so if the throttled
+        // SetCursor had instead been served, replayed blocks would arrive BEFORE
+        // this match.
+        let spend = bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: op,
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![],
+        };
+        registry.scan_mempool_tx(&spend);
+
+        let ev = tokio::time::timeout(Duration::from_secs(3), stream.message())
+            .await
+            .expect("timeout")
+            .expect("transport")
+            .expect("stream ended");
+        assert!(
+            matches!(ev.body, Some(pb::node_event::Body::OutpointSpent(_))),
+            "rate-limited SetCursor produced no replay: the first event is the live \
+             match, not a replayed block (got {:?})",
+            ev.body,
+        );
+        assert!(
+            *calls.lock().unwrap() >= 3,
+            "establishment + watch-add + the throttled SetCursor each hit the limiter",
+        );
+
+        drop(ctrl_tx);
+        let _ = shutdown_tx.send(true);
+    }
+
     /// `max_subscriptions = 0` disables the cap entirely.
     #[tokio::test]
     async fn subscription_cap_disabled_when_zero() {
