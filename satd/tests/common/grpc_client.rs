@@ -250,6 +250,27 @@ pub fn add_scripts(scripthash_hex: &[&str]) -> SubscribeControl {
     }
 }
 
+/// `AddScripts` carrying a per-scripthash `min_value` floor (satoshis). `floors`
+/// is parallel to `scripthash_hex` (index `i` is the floor for scripthash `i`);
+/// a floor of `0` means "deliver every match". Re-sending an already-watched
+/// scripthash updates its floor in place (the `reassert` metadata-refresh path).
+pub fn add_scripts_with_floors(scripthash_hex: &[&str], floors: &[u64]) -> SubscribeControl {
+    assert_eq!(
+        scripthash_hex.len(),
+        floors.len(),
+        "min_values must be parallel to scripthashes"
+    );
+    SubscribeControl {
+        msg: Some(Control::AddScripts(pb::AddScripts {
+            scripthashes: scripthash_hex
+                .iter()
+                .map(|h| hex::decode(h).expect("scripthash hex"))
+                .collect(),
+            min_values: floors.to_vec(),
+        })),
+    }
+}
+
 /// `AddTransactions` for display-hex txids. `min_depths` empty ⇒ lifecycle
 /// watch (optionally self-closing at `auto_close_depth`); non-empty ⇒ depth
 /// alarms.

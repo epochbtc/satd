@@ -705,10 +705,12 @@ impl WatchRegistry {
     /// data; this is its mempool twin, off the same retained hashes.
     ///
     /// Exact `ScriptMatched` carries the watched scripthash (which the client
-    /// already knows), so it is fully self-describing. Prefix delivery stays
-    /// **hash-only**: `matched_prevouts` carry the spent outpoint with an *empty*
-    /// script (the client resolves the prevout from its own UTXO set); the
-    /// confirmed path keeps full prevout scripts. Funding-side matches and all
+    /// already knows), so it is fully self-describing. Prefix delivery's
+    /// `matched_prevouts` carry the spent outpoint plus whatever the retention
+    /// tier kept: the prevout value under `streamprevoutmeta >= amount` (the
+    /// default) and the full prevout `scriptPubKey` under `full` (empty
+    /// otherwise → the client resolves the prevout from its own UTXO set). The
+    /// confirmed (undo) path always carries both. Funding-side matches and all
     /// outpoint/txid matches are handled by
     /// [`scan_mempool_tx`](Self::scan_mempool_tx); call both per accepted tx.
     ///
