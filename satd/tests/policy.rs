@@ -28,7 +28,7 @@
 
 mod common;
 
-use common::{find_available_port, get_rpc_u64, poll_until, test_timeout, DeterministicWallet, TestNode};
+use common::{get_rpc_u64, poll_until, test_timeout, DeterministicWallet, TestNode};
 
 use bitcoin::absolute::LockTime;
 use bitcoin::opcodes::all as op;
@@ -91,6 +91,12 @@ const RUNES_RELAY_ONLY: &str = "version 1\nquarantine runes on relay when any ou
 /// not refuse local submission) but is withheld from block templates.
 const RUNES_TEMPLATE_ONLY: &str = "version 1\nquarantine runes on template when any outputs (out.script.contains_ops(script(OP_RETURN OP_PUSHNUM_13 *)))\n";
 
+/// An `allow` rule that matches a dust-storm shape. Because the ruleset contains
+/// an `allow`, a standardness failure is *deferred* (§6.2/§7) and forgiven when
+/// the allow matches — so an otherwise-non-standard dust tx is admitted to the
+/// acting mempool even without `--acceptnonstdtxn`.
+const ALLOW_FORGIVES_DUST: &str = "version 1\nallow forgive-dust when count outputs (out.is_dust and out.script_type != p2a) >= 5\n";
+
 /// Regtest coinbase subsidy for blocks 1..=150 (no halving before 150): 50 BTC.
 const CB_VALUE_SAT: u64 = 50 * 100_000_000;
 
@@ -140,8 +146,27 @@ fn start_funded(policy_src: Option<&str>, extra_args: &[&str]) -> (TestNode, Det
     }
     let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     let node = TestNode::start(&arg_refs);
+    if policy.is_some() {
+        assert_policy_loaded(&node);
+    }
     mine_to(&node, 110, &wallet);
     (node, wallet, policy)
+}
+
+/// Assert a policy node actually loaded its ruleset with no relay-withholding
+/// danger findings. The danger gate is fatal at startup, so a cookbook rule that
+/// began matching a Lightning-enforcement shape would otherwise surface only as
+/// an opaque "node failed to start"; this localizes such a regression and pins
+/// the invariant that the documented cookbook is gate-clean by default.
+fn assert_policy_loaded(node: &TestNode) {
+    let info = node.rpc_call("getpolicyinfo").expect("getpolicyinfo");
+    let res = &info["result"];
+    assert_eq!(res["loaded"], json!(true), "policy not loaded: {info}");
+    assert_eq!(
+        res["danger"]["relay_withholding"],
+        json!(0),
+        "cookbook unexpectedly has relay-withholding danger findings: {info}"
+    );
 }
 
 /// Mine `n` blocks to the wallet's address.
@@ -288,6 +313,35 @@ fn payment_output(wallet: &DeterministicWallet, value_sat: u64) -> TxOut {
     }
 }
 
+/// A tx spending the coinbase at `cb_height` carrying a >100kB witness blob (one
+/// 110 kB stack element). The witness is not a valid spend — but `policytest`
+/// only deserializes and evaluates the structure, so this exercises the
+/// `tx.total_witness_size` view field for the `no-mine-big-witness` rule without
+/// the cost of a real 100kB-witness taproot spend. Returns `(raw_hex, txid)`.
+fn build_big_witness_tx(node: &TestNode, wallet: &DeterministicWallet, cb_height: u64) -> (String, String) {
+    let cb_txid = coinbase_txid_at(node, cb_height);
+    let mut witness = Witness::new();
+    witness.push(vec![0u8; 110_000]);
+    let tx = Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: cb_txid,
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness,
+        }],
+        output: vec![payment_output(wallet, CB_VALUE_SAT - 10_000)],
+    };
+    (
+        hex::encode(bitcoin::consensus::serialize(&tx)),
+        tx.compute_txid().to_string(),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // RPC helpers
 // ---------------------------------------------------------------------------
@@ -383,6 +437,21 @@ fn layer_a_dust_storm_quarantined() {
     let res = policytest(&node, &raw4);
     assert_eq!(res["verdict"], json!("pass"), "4-dust control: {res}");
 
+    node.stop();
+}
+
+#[test]
+fn layer_a_big_witness_quarantined_template_only() {
+    let (mut node, wallet, _pf) = start_funded(Some(COOKBOOK_NO_ALLOW), &[]);
+    let (raw, _txid) = build_big_witness_tx(&node, &wallet, 1);
+    let res = policytest(&node, &raw);
+    // `on template` ⇒ withheld from templates only, still relayed.
+    assert_quarantined(&res, "no-mine-big-witness", false, true);
+
+    // Control: a small-witness payment from the same shape passes.
+    let (raw_small, _) = build_spend(&node, &wallet, 2, vec![payment_output(&wallet, 1_000_000)], 1_000);
+    let res = policytest(&node, &raw_small);
+    assert_eq!(res["verdict"], json!("pass"), "small-witness control: {res}");
     node.stop();
 }
 
@@ -649,30 +718,114 @@ fn layer_b_template_only_local_submission_not_refused() {
     node.stop();
 }
 
+#[test]
+fn layer_b_allow_rule_forgives_nonstandard() {
+    let wallet = test_wallet();
+
+    // Control: a node with no policy rejects the 5-dust tx as non-standard,
+    // proving the tx really is non-standard (so forgiveness below is meaningful).
+    {
+        let (mut plain, _w, _p) = start_funded(None, &[]);
+        let outputs: Vec<TxOut> = (0..5).map(|_| dust_output(&wallet)).collect();
+        let (raw, _txid) = build_spend(&plain, &wallet, 1, outputs, 1_000);
+        let resp = plain
+            .rpc_call_with_params("sendrawtransaction", vec![json!(raw)])
+            .expect("sendrawtransaction rpc");
+        assert!(
+            !resp["error"].is_null(),
+            "no-policy node should reject non-standard dust: {resp}"
+        );
+        plain.stop();
+    }
+
+    // With an `allow` rule matching the dust shape — and NO --acceptnonstdtxn —
+    // the §6.2/§7 deferred-standardness path forgives the dust failure, so the
+    // tx is admitted to the *acting* mempool.
+    let (mut node, _w, _pf) = start_funded(Some(ALLOW_FORGIVES_DUST), &[]);
+    let outputs: Vec<TxOut> = (0..5).map(|_| dust_output(&wallet)).collect();
+    let (raw, txid) = build_spend(&node, &wallet, 1, outputs, 1_000);
+    let resp = node
+        .rpc_call_with_params("sendrawtransaction", vec![json!(raw)])
+        .expect("sendrawtransaction rpc");
+    assert!(
+        resp["error"].is_null(),
+        "allow rule should forgive the non-standard dust failure: {resp}"
+    );
+    assert!(
+        mempool_has(&node, &txid),
+        "allow-forgiven tx should be in the acting mempool"
+    );
+    node.stop();
+}
+
+#[test]
+fn layer_b_template_only_excluded_from_block_template() {
+    let (mut node, wallet, _pf) = start_funded(Some(RUNES_TEMPLATE_ONLY), &[]);
+
+    // An ordinary acting payment — the positive control: it must appear in the
+    // block template.
+    let (raw_ok, txid_ok) = build_spend(&node, &wallet, 1, vec![payment_output(&wallet, 1_000_000)], 1_000);
+    send_ok(&node, &raw_ok);
+    poll_until(|| mempool_has(&node, &txid_ok), test_timeout(10), "acting tx not in mempool");
+
+    // A template-withheld runestone (template-only quarantine still relays, so
+    // §6.1 does not refuse local submission) — must be excluded from the template.
+    let (raw_q, txid_q) = build_spend(&node, &wallet, 2, vec![runestone_output()], 1_000);
+    send_ok(&node, &raw_q);
+    poll_until(|| quarantine_has(&node, &txid_q), test_timeout(10), "runestone not quarantined");
+
+    let gbt = node.rpc_call("getblocktemplate").expect("getblocktemplate");
+    let txids: Vec<String> = gbt["result"]["transactions"]
+        .as_array()
+        .expect("template transactions")
+        .iter()
+        .filter_map(|t| t["txid"].as_str().map(String::from))
+        .collect();
+    assert!(
+        txids.contains(&txid_ok),
+        "acting tx missing from block template: {txids:?}"
+    );
+    assert!(
+        !txids.contains(&txid_q),
+        "template-withheld tx leaked into the block template: {txids:?}"
+    );
+    node.stop();
+}
+
 // ===========================================================================
 // Layer C — multi-node gossip + scope re-relay
 // ===========================================================================
 
-/// Wait for a node to reach at least `height`.
+/// Wait for a node to reach at least `height`. Generous deadline: a 110-block
+/// download over a freshly-handshaked (v2-encrypted) link on a 4-way-parallel CI
+/// runner is the tightest realistic spot in the suite.
 fn wait_height(node: &TestNode, height: u64, what: &str) {
     poll_until(
         || get_rpc_u64(node, "getblockcount").unwrap_or(0) >= height,
-        test_timeout(60),
+        test_timeout(90),
         what,
     );
+}
+
+/// P2P listen port of a harness-started node. Letting the harness allocate the
+/// port (rather than `find_available_port()` + an explicit `--port`) shrinks the
+/// probe→bind TOCTOU window: a silently-failed P2P listener bind would otherwise
+/// surface only as a downstream connection-poll timeout.
+fn p2p_port(node: &TestNode) -> u16 {
+    node.p2p_port.expect("harness-allocated p2p port")
 }
 
 #[test]
 fn layer_c_gossiped_spam_is_quarantined_on_policy_node() {
     let wallet = test_wallet();
-    let p2p_a = find_available_port();
-    let mut node_a = TestNode::start(&[&format!("--port={}", p2p_a)]);
+    let mut node_a = TestNode::start(&[]);
     let pf = write_policy(COOKBOOK_NO_ALLOW);
     let mut node_b = TestNode::start(&[
-        &format!("--connect=127.0.0.1:{}", p2p_a),
+        &format!("--connect=127.0.0.1:{}", p2p_port(&node_a)),
         &format!("--policyfile={}", pf.path.display()),
         "--acceptnonstdtxn",
     ]);
+    assert_policy_loaded(&node_b);
 
     poll_until(
         || get_rpc_u64(&node_a, "getconnectioncount").unwrap_or(0) >= 1,
@@ -704,14 +857,14 @@ fn layer_c_gossiped_spam_is_quarantined_on_policy_node() {
 #[test]
 fn layer_c_allow_own_submission_but_quarantine_when_gossiped() {
     let wallet = test_wallet();
-    let p2p_a = find_available_port();
-    let mut node_a = TestNode::start(&[&format!("--port={}", p2p_a)]);
+    let mut node_a = TestNode::start(&[]);
     let pf = write_policy(COOKBOOK_FULL);
     let mut node_b = TestNode::start(&[
-        &format!("--connect=127.0.0.1:{}", p2p_a),
+        &format!("--connect=127.0.0.1:{}", p2p_port(&node_a)),
         &format!("--policyfile={}", pf.path.display()),
         "--acceptnonstdtxn",
     ]);
+    assert_policy_loaded(&node_b);
     poll_until(
         || get_rpc_u64(&node_a, "getconnectioncount").unwrap_or(0) >= 1,
         test_timeout(30),
@@ -748,25 +901,24 @@ fn layer_c_allow_own_submission_but_quarantine_when_gossiped() {
 /// policy `policy_src` loaded on B. A and C run no policy.
 fn three_node_line(policy_src: &str, height: u64) -> (TestNode, TestNode, TestNode, DeterministicWallet, PolicyFile) {
     let wallet = test_wallet();
-    let p2p_a = find_available_port();
-    let p2p_c = find_available_port();
-    let node_a = TestNode::start(&[&format!("--port={}", p2p_a)]);
-    let node_c = TestNode::start(&[&format!("--port={}", p2p_c)]);
+    let node_a = TestNode::start(&[]);
+    let node_c = TestNode::start(&[]);
     let pf = write_policy(policy_src);
     let node_b = TestNode::start(&[
         &format!("--policyfile={}", pf.path.display()),
         "--acceptnonstdtxn",
     ]);
+    assert_policy_loaded(&node_b);
     // B dials out to both A and C; B keeps listening (no -connect).
     node_b
-        .rpc_call_with_params("addnode", vec![json!(format!("127.0.0.1:{}", p2p_a)), json!("add")])
+        .rpc_call_with_params("addnode", vec![json!(format!("127.0.0.1:{}", p2p_port(&node_a))), json!("add")])
         .expect("addnode A");
     node_b
-        .rpc_call_with_params("addnode", vec![json!(format!("127.0.0.1:{}", p2p_c)), json!("add")])
+        .rpc_call_with_params("addnode", vec![json!(format!("127.0.0.1:{}", p2p_port(&node_c))), json!("add")])
         .expect("addnode C");
     poll_until(
         || get_rpc_u64(&node_b, "getconnectioncount").unwrap_or(0) >= 2,
-        test_timeout(40),
+        test_timeout(60),
         "B did not connect to both A and C",
     );
 
@@ -781,6 +933,20 @@ fn layer_c_relay_scope_is_not_re_gossiped() {
     let (mut node_a, mut node_b, mut node_c, wallet, _pf) =
         three_node_line(RUNES_RELAY_ONLY, 110);
 
+    // Positive control: a plain payment matches no rule, stays acting on B, and
+    // must reach C — proving the A→B→C *tx-relay* path is live for these exact
+    // node instances (three_node_line only proves block relay reaches C). Without
+    // this, the negative assertion below could pass simply because tx relay was
+    // silently broken.
+    let (raw_ctl, txid_ctl) = build_spend(&node_a, &wallet, 2, vec![payment_output(&wallet, 1_000_000)], 1_000);
+    send_ok(&node_a, &raw_ctl);
+    poll_until(
+        || mempool_has(&node_c, &txid_ctl),
+        test_timeout(40),
+        "tx-relay path A→B→C is not live (control payment never reached C)",
+    );
+
+    // Now the relay-withheld runestone.
     let (raw, txid) = build_spend(&node_a, &wallet, 1, vec![runestone_output()], 1_000);
     send_ok(&node_a, &raw);
 
@@ -795,6 +961,7 @@ fn layer_c_relay_scope_is_not_re_gossiped() {
     // A relay-withheld tx is never announced onward: C must not see it. B's relay
     // decision is made at admission, so by the time it is quarantined the (non-)
     // announcement has already happened; a short grace covers in-flight delivery.
+    // The control above already proved C *would* otherwise receive a relayed tx.
     std::thread::sleep(test_timeout(5));
     assert!(
         !mempool_has(&node_c, &txid),
