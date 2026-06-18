@@ -593,6 +593,9 @@ async fn grpc_watch_script_min_value_suppresses_output_below_floor() {
     assert_eq!(hex::encode(&s.scripthash), wallet_sh, "input-side control");
 
     // The dest output-side match stays suppressed by its floor: none arrives.
+    // Fixed (unscaled by SATD_E2E_TIMEOUT_MULT) window — the input-side control
+    // above gates first, so this only needs to outlast same-scan delivery; a
+    // wider window adds CI time without making the negative assertion safer.
     let deadline = std::time::Instant::now() + Duration::from_secs(6);
     while std::time::Instant::now() < deadline {
         let Some(ev) = next_event_opt(&mut stream, 2).await else {
@@ -649,16 +652,37 @@ async fn grpc_watch_script_min_value_reassert_lowers_floor_delivers() {
         .address
         .script_pubkey();
     let dest_sh = scripthash_hex(&dest);
+    // Unfloored input-side control on the wallet spk (spent by the broadcast):
+    // proves the tx was scanned during the suppression window below.
+    let wallet_sh = scripthash_hex(&wallet.address.script_pubkey());
     let mut client = GrpcStreamClient::connect(sn.grpc_port()).await;
-    // Start floored ABOVE the paid value ⇒ the mempool funding match is dropped.
+    // dest floored ABOVE the paid value ⇒ its mempool funding match is dropped.
     let (tx, mut stream) = client
-        .watch(vec![add_scripts_with_floors(&[&dest_sh], &[5_000_000_000])])
+        .watch(vec![add_scripts_with_floors(
+            &[&dest_sh, &wallet_sh],
+            &[5_000_000_000, 0],
+        )])
         .await;
     tokio::time::sleep(Duration::from_millis(600)).await;
 
     broadcast_spend(&sn, &wallet, 0x5d, 10_000).await;
 
-    // No mempool output match under the high floor.
+    // The unfloored input-side wallet match fires (the tx is being scanned).
+    let ev = next_event_matching(
+        &mut stream,
+        15,
+        |b| matches!(b, Body::ScriptMatched(s) if !s.is_output && !s.confirmed),
+    )
+    .await;
+    let Some(Body::ScriptMatched(s)) = ev.body else {
+        unreachable!()
+    };
+    assert_eq!(hex::encode(&s.scripthash), wallet_sh, "input-side control");
+
+    // No dest output match under the high floor. Fixed (unscaled by
+    // SATD_E2E_TIMEOUT_MULT) window: the control above already proves the scan
+    // ran, so this only needs to outlast same-scan delivery — widening it would
+    // add CI time without strengthening the negative assertion.
     let deadline = std::time::Instant::now() + Duration::from_secs(4);
     while std::time::Instant::now() < deadline {
         let Some(ev) = next_event_opt(&mut stream, 2).await else {
@@ -703,6 +727,7 @@ async fn grpc_watch_prefix_spend_carries_amount_default_tier() {
     // coinbase puts the spent prevout's script in the bucket (spend side).
     let wspk = wallet.address.script_pubkey();
     let prefix = script_prefix_hex(&wspk, 8);
+    let cb = coinbase1(&sn).await;
     let mut client = GrpcStreamClient::connect(sn.grpc_port()).await;
     let (_tx, mut stream) = client.watch(vec![add_script_prefixes(&prefix, 8)]).await;
     tokio::time::sleep(Duration::from_millis(600)).await;
@@ -720,8 +745,18 @@ async fn grpc_watch_prefix_spend_carries_amount_default_tier() {
     let Some(Body::PrefixMatched(p)) = ev.body else {
         unreachable!()
     };
+    // The canonical spend has a single input (the block-1 coinbase), so exactly
+    // one bucketed prevout is carried.
     assert_eq!(p.matched_prevouts.len(), 1, "single spent input in the bucket");
     let mp = &p.matched_prevouts[0];
+    // The outpoint is the load-bearing identifier a hash-tier client resolves
+    // against its own UTXO set — assert it points at the spent coinbase.
+    assert_eq!(
+        hex::encode(&mp.outpoint_txid),
+        display_to_internal_hex(&cb),
+        "matched prevout is the block-1 coinbase outpoint"
+    );
+    assert_eq!(mp.outpoint_vout, 0);
     assert!(mp.has_amount, "default 'amount' tier carries the prevout value");
     assert_eq!(
         mp.amount, 5_000_000_000,
