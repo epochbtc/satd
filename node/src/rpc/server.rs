@@ -596,6 +596,50 @@ pub async fn start(
         }
     })?;
 
+    // --- Transaction-filtering policy observability (design §10, PR 7b) ---
+    // The only RPCs that expose the quarantine class; all read-only.
+
+    module.register_method("getpolicyinfo", |_params, ctx, _extensions| {
+        Ok::<_, ErrorObjectOwned>(crate::rpc::policy::get_policy_info(&ctx.mempool))
+    })?;
+
+    module.register_method("getquarantineinfo", |_params, ctx, _extensions| {
+        Ok::<_, ErrorObjectOwned>(crate::rpc::policy::get_quarantine_info(&ctx.mempool))
+    })?;
+
+    module.register_method("listquarantine", |params, ctx, _extensions| {
+        // `listquarantine [rule] [count] [skip]` — all optional.
+        let mut seq = params.sequence();
+        let rule: Option<String> = seq.optional_next().unwrap_or(None);
+        let count: usize = seq.optional_next().unwrap_or(None).unwrap_or(0);
+        let skip: usize = seq.optional_next().unwrap_or(None).unwrap_or(0);
+        Ok::<_, ErrorObjectOwned>(crate::rpc::policy::list_quarantine(
+            &ctx.mempool,
+            rule.as_deref(),
+            count,
+            skip,
+        ))
+    })?;
+
+    module.register_method("getquarantineentry", |params, ctx, _extensions| {
+        let mut seq = params.sequence();
+        let txid: String = seq
+            .next()
+            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+        crate::rpc::policy::get_quarantine_entry(&ctx.mempool, &txid)
+            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
+    })?;
+
+    module.register_method("policytest", |params, ctx, _extensions| {
+        // `policytest <rawtx-hex>` — dry-run against the loaded ruleset.
+        let mut seq = params.sequence();
+        let rawtx: String = seq
+            .next()
+            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+        crate::rpc::policy::policy_test(&ctx.chain_state, &ctx.mempool, &rawtx)
+            .map_err(|e| ErrorObjectOwned::owned(-8, e, None::<()>))
+    })?;
+
     module.register_method("preciousblock", |params, _ctx, _extensions| {
         let hash: String = params
             .one()
@@ -864,10 +908,19 @@ pub async fn start(
                 .with_suggestion("Pass the raw transaction as a hex string in the first argument.")
                 .into_error_object()
         })?;
+        // `allowquarantined` (satd extension, opt-in): submit into the quarantine
+        // class even when a relay-scoped policy rule matches, instead of the §6.1
+        // refusal. Read from the second positional slot (Core's `maxfeerate`,
+        // which satd does not enforce); a numeric `maxfeerate` there fails the
+        // bool parse and is harmlessly treated as "not set" (default false), so
+        // Core clients are unaffected.
+        let allow_quarantined: bool = seq.optional_next::<bool>().ok().flatten().unwrap_or(false);
         // Submit + announce is the shared core (`broadcast_transaction`);
         // this handler only maps the error to the JSON-RPC taxonomy.
-        let result = ctx.peer_manager.broadcast_transaction(&hex_tx).map_err(
-            |(code, msg)| {
+        let result = ctx
+            .peer_manager
+            .broadcast_transaction(&hex_tx, crate::mempool::pool::TxSource::Rpc, allow_quarantined)
+            .map_err(|(code, msg)| {
                 // Classify the mempool error by its code (Core taxonomy):
                 // -22 = decode failed, -25 = mempool acceptance failure.
                 let (category, suggestion) = match code {
@@ -1129,7 +1182,11 @@ pub async fn start(
         let floor_sat_per_kvb = ctx.mempool.info().min_fee_rate.max(1_000);
         let sat_per_kvb =
             resolve_feerate_sat_per_kvb(mode, conf_target, &ctx.fee_estimator, floor_sat_per_kvb, || {
-                ctx.mempool.get_all_entries()
+                // Fee estimation is a **template** consumer (design §2.4): a tx
+                // quarantined `on template` is one we will never mine, so it must
+                // not inflate the quote. Same scope-filtered view the block
+                // template selects from.
+                ctx.mempool.get_template_entries()
             });
         let mut response = serde_json::json!({
             "feerate": format_feerate_sat_per_kvb(sat_per_kvb, unit),
@@ -1159,7 +1216,9 @@ pub async fn start(
         // monotonicity clamp, and economy tier all happen in `smart_fees`,
         // shared with MCP / Esplora / Electrum.
         let sf = crate::mempool::estimate::smart_fees(
-            ctx.mempool.get_all_entries(),
+            // Template consumer (design §2.4): `on template` quarantine must not
+            // inflate the fee quote — same view the block template selects from.
+            ctx.mempool.get_template_entries(),
             &ctx.fee_estimator,
             &targets,
             mode,

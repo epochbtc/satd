@@ -166,7 +166,14 @@ pub fn load_mempool(
     for rec in records {
         let fee_delta = rec.fee_delta;
         let unbroadcast = rec.flags & FLAG_UNBROADCAST != 0;
-        match mempool.accept_transaction(rec.tx, chain_state, script_verifier) {
+        match mempool.accept_transaction(
+            rec.tx,
+            chain_state,
+            script_verifier,
+            crate::mempool::pool::TxSource::Reload,
+            // mempool.dat reload re-enters and quarantines normally; never refused.
+            false,
+        ) {
             Ok(txid) => {
                 if fee_delta != 0 && !mempool.prioritise_transaction(&txid, fee_delta) {
                     tracing::debug!(%txid, "persisted fee_delta not applied (tx absent post-accept)");

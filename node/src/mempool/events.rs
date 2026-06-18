@@ -25,6 +25,11 @@ pub enum EvictReason {
     /// operators aren't misled into thinking the mempool is under
     /// pressure.
     BlockConflict,
+    /// Evicted from the **quarantine class** because that class's own byte
+    /// budget (`quarantinemempool`) overflowed — fee-rate eviction within the
+    /// held set. Distinct from `FullPool` (the acting class) so per-class
+    /// pressure is legible. Inert until a policy is loaded (PR 4c).
+    Policy,
 }
 
 impl EvictReason {
@@ -34,6 +39,7 @@ impl EvictReason {
             EvictReason::FullPool => "full_pool",
             EvictReason::Expiry => "expiry",
             EvictReason::BlockConflict => "block_conflict",
+            EvictReason::Policy => "policy",
         }
     }
 }
@@ -74,6 +80,59 @@ impl MempoolEvent {
             | Self::LeaveConfirmed { txid, .. }
             | Self::LeaveEvicted { txid, .. }
             | Self::LeaveReplaced { txid, .. } => txid,
+        }
+    }
+}
+
+/// Quarantine-class lifecycle event, carried on a **separate** broadcast channel
+/// from [`MempoolEvent`] (design §10): the default mempool stream reflects the
+/// *acting* class only — a quarantined admission emits no `Enter` — so quarantine
+/// transitions are surfaced here for explicit, opt-in subscribers. PR 4c places
+/// held entries; PR 4d emits this on placement; PR 6 adds `Promoted`/`Demoted`
+/// on reload and PR 7 builds the operator-facing subscription surface.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum QuarantineEvent {
+    /// A transaction was admitted into the quarantine class. `rule` is the
+    /// matching `quarantine` rule (or the marker for an infectious-ancestor
+    /// inheritance); `relay`/`template` are the withheld scopes.
+    Quarantined {
+        txid: Txid,
+        rule: String,
+        relay: bool,
+        template: bool,
+        time: u64,
+    },
+    /// A ruleset reload (§8) left a transaction in the quarantine class with a
+    /// *different* held scope than before: either a previously-acting tx moved
+    /// *into* quarantine, or an already-held tx's scope changed (e.g. relay
+    /// recovered but template still withheld) without fully clearing. Distinct
+    /// from [`Self::Quarantined`] (admission-time placement) so dashboards can
+    /// tell a fresh hold from a policy change that re-scoped already-admitted
+    /// traffic. `rule`/`relay`/`template` carry the new held scope, as for
+    /// `Quarantined`; subscribers should treat this as "the current held scope
+    /// is now X" rather than strictly a downgrade. A move that *fully* clears the
+    /// scope is reported as [`Self::Promoted`] instead.
+    Demoted {
+        txid: Txid,
+        rule: String,
+        relay: bool,
+        template: bool,
+        time: u64,
+    },
+    /// A ruleset reload (§8) moved a transaction *out of* the quarantine class
+    /// (scope fully cleared — it is acting again, I9). Subscribers re-surface it
+    /// on the acting stream; the relay paths re-announce it via the bounded
+    /// promotion queue (PR 6b).
+    Promoted { txid: Txid, time: u64 },
+}
+
+impl QuarantineEvent {
+    pub fn txid(&self) -> &Txid {
+        match self {
+            Self::Quarantined { txid, .. }
+            | Self::Demoted { txid, .. }
+            | Self::Promoted { txid, .. } => txid,
         }
     }
 }
@@ -145,5 +204,41 @@ mod tests {
         let j = serde_json::to_value(&ev).unwrap();
         assert_eq!(j["kind"], "leave_replaced");
         assert!(j["replacing_txid"].is_string());
+    }
+
+    #[test]
+    fn quarantined_serializes_with_rule_and_scope() {
+        let ev = QuarantineEvent::Quarantined {
+            txid: tx(6),
+            rule: "ordinals".to_string(),
+            relay: true,
+            template: true,
+            time: 1_700_000_000,
+        };
+        let j = serde_json::to_value(&ev).unwrap();
+        assert_eq!(j["kind"], "quarantined");
+        assert_eq!(j["rule"], "ordinals");
+        assert_eq!(j["relay"], true);
+        assert_eq!(j["template"], true);
+    }
+
+    #[test]
+    fn demoted_and_promoted_serialize() {
+        let d = QuarantineEvent::Demoted {
+            txid: tx(7),
+            rule: "no-inscriptions".to_string(),
+            relay: true,
+            template: true,
+            time: 1_700_000_000,
+        };
+        let j = serde_json::to_value(&d).unwrap();
+        assert_eq!(j["kind"], "demoted");
+        assert_eq!(j["rule"], "no-inscriptions");
+        assert_eq!(j["relay"], true);
+
+        let p = QuarantineEvent::Promoted { txid: tx(8), time: 1_700_000_001 };
+        let j = serde_json::to_value(&p).unwrap();
+        assert_eq!(j["kind"], "promoted");
+        assert!(j["txid"].is_string());
     }
 }

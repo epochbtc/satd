@@ -76,9 +76,13 @@ pub struct ChainTipJson {
 }
 
 // ── Handlers ───────────────────────────────────────────────────────
+//
+// These are standard wallet-serving read surfaces, so they present the
+// **acting class only** (design §6.1/§10): the quarantine class is invisible
+// here, exactly as on a Core node whose relay policy refused the transaction.
 
 pub async fn root(State(state): State<EsploraState>) -> Json<RootJson> {
-    let count = state.mempool.get_all_entries().len() as u64;
+    let count = state.mempool.get_acting_entries().len() as u64;
     Json(RootJson {
         chain_tip: ChainTipJson {
             hash: state.chain.tip_hash().to_string(),
@@ -91,7 +95,7 @@ pub async fn root(State(state): State<EsploraState>) -> Json<RootJson> {
 pub async fn mempool_summary(
     State(state): State<EsploraState>,
 ) -> Json<MempoolJson> {
-    let entries = state.mempool.get_all_entries();
+    let entries = state.mempool.get_acting_entries();
     let count = entries.len() as u64;
     let mut vsize_total: u64 = 0;
     let mut fee_total: u64 = 0;
@@ -120,7 +124,7 @@ pub async fn mempool_summary(
 pub async fn mempool_txids(
     State(state): State<EsploraState>,
 ) -> Json<Vec<String>> {
-    let entries = state.mempool.get_all_entries();
+    let entries = state.mempool.get_acting_entries();
     Json(
         entries
             .into_iter()
@@ -132,7 +136,7 @@ pub async fn mempool_txids(
 pub async fn mempool_recent(
     State(state): State<EsploraState>,
 ) -> Json<Vec<RecentTxJson>> {
-    let mut entries = state.mempool.get_all_entries();
+    let mut entries = state.mempool.get_acting_entries();
     // Sort by `time` descending (newest first); take up to RECENT_LIMIT.
     entries.sort_by(|a, b| b.1.time.cmp(&a.1.time));
     entries.truncate(RECENT_LIMIT);

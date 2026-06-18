@@ -1437,6 +1437,7 @@ fn mempool_event_to_proto(ev: &node::mempool::events::MempoolEvent) -> pb::Mempo
                 RustReason::FullPool => pb::EvictReason::FullPool as i32,
                 RustReason::Expiry => pb::EvictReason::Expiry as i32,
                 RustReason::BlockConflict => pb::EvictReason::BlockConflict as i32,
+                RustReason::Policy => pb::EvictReason::Policy as i32,
             },
         }),
         Mp::LeaveReplaced {
@@ -1668,6 +1669,7 @@ mod tests {
             (EvictReason::FullPool, pb::EvictReason::FullPool),
             (EvictReason::Expiry, pb::EvictReason::Expiry),
             (EvictReason::BlockConflict, pb::EvictReason::BlockConflict),
+            (EvictReason::Policy, pb::EvictReason::Policy),
         ] {
             let ev = MempoolEvent::LeaveEvicted {
                 txid: Txid::from_raw_hash(

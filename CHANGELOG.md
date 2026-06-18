@@ -11,6 +11,40 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
 
 ## [Unreleased]
 
+- **Transaction-filtering policy (opt-in).** A total, statically-cost-bounded
+  policy language (`policyfile=`) that *quarantines* transaction shapes —
+  withholding them from relay and/or block templates — without ever changing
+  what the node accepts as valid (consensus is untouched). Quarantine-only: no
+  `reject`. Standard mempool surfaces stay acting-class-only and byte-identical
+  whether or not anything is quarantined; the quarantine view is exposed solely
+  through dedicated surfaces — `getpolicyinfo`, `getquarantineinfo` (with
+  foregone-fees + confirmed-anyway), `listquarantine`, `getquarantineentry`,
+  `policytest`, matching MCP tools, and `satd_policy_*` Prometheus metrics. Live
+  `SIGHUP` reload (last-good-wins, lossless re-placement). A **strict-by-default
+  Lightning-enforcement danger gate** refuses a policy whose rule would withhold
+  relay for L2 enforcement traffic (BOLT-3 commitment/justice/HTLC, taproot
+  spends); opt out with `allowdangerousfilters=1`. Offline `sat-cli policylint`
+  (exit 3 on a dangerous rule). New Operator Manual chapter plus a contributor
+  [design doc](satd-policy/DESIGN.md). See the
+  [release notes](docs/release-notes/0.4.0-pre.md).
+- **`getrawmempool` verbose no longer O(N²).** Verbose mempool views
+  (`getrawmempool true`, `getmempooldescendants`, `getmempoolentry`) computed
+  each transaction's ancestor/descendant rollups by scanning the whole mempool
+  per traversal hop and re-hashing each tx's txid every hop — so a client
+  polling verbose mempool on a timer (e.g. the `sat-tui` mempool pane) could
+  peg a CPU core, worsening as the mempool grew. Descendant traversal now
+  follows the existing spend index (O(descendants) per hop, not a full-mempool
+  scan) and the Txid/OutPoint maps use a fast hasher, so per-call and
+  chain-shaped lookups are linear. (The aggregate `getrawmempool true` dump
+  over a very wide cluster is still superlinear until per-transaction
+  descendant limits are enforced — tracked as follow-up.) Output is identical.
+  See the [release notes](docs/release-notes/0.4.0-pre.md).
+- **Profilable release binaries.** Release builds now ship with frame pointers
+  + line-table debug info; the binary stays stripped (same download size) and
+  the debug info is published as a separate per-target `*-debuginfo.tar.zst`
+  sidecar, so production nodes can be profiled with `perf -g` and symbolized
+  against the exact running binary. See the
+  [release notes](docs/release-notes/0.4.0-pre.md).
 - **Streaming API: mid-stream `SetCursor` re-anchor on gRPC `Watch`.** A
   `SetCursor` on a live bidi `Watch` now replays confirmed history
   `(cursor.height, tip]` in order ahead of the live tail (drain-replay-resume),

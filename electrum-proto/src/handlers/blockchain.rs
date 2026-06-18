@@ -382,7 +382,12 @@ pub fn transaction_get(state: &ElectrumState, params: Value) -> Result<Value, Js
     // Resolve the tx — mempool first, then txindex fallback. Same
     // priority order satd's own `getrawtransaction` uses.
     let (tx, location): (Transaction, Option<TxLocation>) =
-        if let Some(entry) = state.mempool.get(&txid) {
+        // Acting-only (design §6.1): a relay-quarantined tx is invisible to a
+        // client that learned the txid elsewhere — matching satd's own
+        // `getrawtransaction` (`rawtx.rs`), which filters to the acting class.
+        // Without this filter any Electrum client could pull a withheld tx by
+        // txid. Fall through to the txindex/not-found path when quarantined.
+        if let Some(entry) = state.mempool.get(&txid).filter(|e| e.scope.is_acting()) {
             (entry.tx, None)
         } else if let Some(raw) = state.electrum_extras.raw_tx(&txid) {
             let parsed: Transaction = deserialize(&raw)
@@ -600,7 +605,11 @@ pub fn transaction_broadcast(state: &ElectrumState, params: Value) -> Result<Val
     // mempool accept leaves it sitting on this node, unannounced.
     let txid = state
         .tx_broadcaster
-        .submit_and_announce(tx)
+        // The Electrum wire protocol has no per-request flag, so it cannot carry
+        // an `allowquarantined` override (§6.1): a relay-quarantined submission is
+        // refused with the rule named. Use the RPC/Esplora/MCP surfaces to hold
+        // one locally.
+        .submit_and_announce(tx, node::mempool::pool::TxSource::Electrum, false)
         .map_err(|e| JsonRpcError::bad_request(format!("mempool reject: {e}")))?;
     Ok(Value::String(txid.to_string()))
 }
@@ -665,7 +674,10 @@ pub fn transaction_broadcast_package(
         let mut next_pending: Vec<usize> = Vec::new();
         let mut pass_errors: Vec<(usize, String)> = Vec::new();
         for &i in &pending {
-            if let Err(e) = state.tx_broadcaster.submit_and_announce(decoded[i].clone()) {
+            if let Err(e) = state
+                .tx_broadcaster
+                .submit_and_announce(decoded[i].clone(), node::mempool::pool::TxSource::Electrum, false)
+            {
                 next_pending.push(i);
                 pass_errors.push((i, e.to_string()));
             }

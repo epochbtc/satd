@@ -29,7 +29,16 @@ pub fn try_reconstruct(
 ) -> Result<Block, PendingCompact> {
     let siphash_keys = ShortId::calculate_siphash_keys(&compact.header, compact.nonce);
 
-    // Build a lookup table: short_id -> Transaction from mempool
+    // Build a lookup table: short_id -> Transaction from mempool.
+    //
+    // This is the one assist-adjacent consumer that deliberately reads the
+    // FULL union (`get_all_entries`), NOT a scope-filtered view: a peer's
+    // compact block may contain transactions our policy quarantines, and a
+    // quarantined tx we already hold lets us reconstruct the block locally
+    // instead of paying a `getblocktxn` round trip (design §2.4). Filtering by
+    // scope here would silently reintroduce those round trips. Validating /
+    // reconstructing someone else's block is consensus-only and never
+    // consults policy (I1 corollary, design §3) — so do NOT filter here.
     let all_entries = mempool.get_all_entries();
     let mut mempool_by_short_id: HashMap<ShortId, Transaction> = HashMap::new();
     for (_txid, entry) in &all_entries {
@@ -297,6 +306,34 @@ mod tests {
                 // At least one index should be missing
                 assert!(!pending.missing_indices.is_empty());
             }
+        }
+    }
+
+    // PR 5: compact-block reconstruction is the one assist-adjacent consumer
+    // that reads the FULL union — a tx our policy fully quarantines must still
+    // reconstruct the peer's block locally, sparing a `getblocktxn` round trip
+    // (design §2.4). Reconstructing someone else's block is consensus-only.
+    #[test]
+    fn reconstruct_uses_quarantined_txs() {
+        use crate::mempool::pool::QuarantineScope;
+        let full_quarantine = QuarantineScope { relay: true, template: true };
+
+        let mut block = regtest_genesis();
+        let extra_tx = make_test_tx(4321);
+        block.txdata.push(extra_tx.clone());
+        let compact = make_compact_block(&block).unwrap();
+
+        let mempool = Mempool::new(300_000_000, 1_000);
+        // The extra tx is present but fully quarantined (assisted on neither
+        // relay nor template).
+        mempool.insert_tx_scoped_for_test(extra_tx, full_quarantine);
+
+        match try_reconstruct(&compact, &mempool) {
+            Ok(reconstructed) => {
+                assert_eq!(reconstructed.header, block.header);
+                assert_eq!(reconstructed.txdata.len(), block.txdata.len());
+            }
+            Err(_) => panic!("quarantined tx must still be available for reconstruction"),
         }
     }
 }

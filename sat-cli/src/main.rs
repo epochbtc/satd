@@ -25,6 +25,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+mod policylint;
 mod sign;
 mod signer;
 
@@ -145,6 +146,29 @@ enum Cmd {
         /// the sole device is used; ambiguous if more than one is present.
         #[arg(long)]
         fingerprint: Option<String>,
+    },
+    /// Validate a transaction-policy file offline: parse, typecheck, and report
+    /// per-rule cost against the static budget. Never contacts a node, so a
+    /// ruleset can be checked before any node loads it. Exit code: 0 loads, 1
+    /// load error (with a caret diagnostic), 2 file unreadable, 3 a rule
+    /// withholds relay for Lightning enforcement traffic (see
+    /// --allow-dangerous-filters).
+    Policylint {
+        /// Path to the policy file.
+        file: PathBuf,
+        /// Render each rule as a plain-English sentence (self-review for
+        /// authors; an audit aid for third-party rulesets).
+        #[arg(long)]
+        explain: bool,
+        /// Silence the L2-shape advisory (for CI; the advisory never affects the
+        /// exit code regardless).
+        #[arg(long)]
+        no_advisories: bool,
+        /// Accept rules that would withhold relay for Lightning enforcement
+        /// transactions. Without this, such a rule makes `policylint` exit 3 (the
+        /// same strict-by-default gate the node applies at load).
+        #[arg(long)]
+        allow_dangerous_filters: bool,
     },
     /// Bitcoin-Core-compatible raw RPC passthrough. Captures unknown
     /// subcommands so `sat-cli getblockchaininfo` still works.
@@ -298,6 +322,9 @@ fn resolve_cmd(cmd: &Cmd) -> (String, Vec<serde_json::Value>) {
         }
         Cmd::SignPsbtWithSigner { .. } => {
             unreachable!("signpsbtwithsigner is handled locally before RPC dispatch")
+        }
+        Cmd::Policylint { .. } => {
+            unreachable!("policylint is handled locally before RPC dispatch")
         }
         Cmd::Raw(args) => {
             let mut it = args.iter();
@@ -563,6 +590,23 @@ async fn main() {
             std::process::exit(1);
         }
     };
+
+    // `policylint` is a pure offline consumer of the policy engine — no RPC, no
+    // credentials. Dispatch before any connection setup so it works with no node.
+    if let Cmd::Policylint {
+        file,
+        explain,
+        no_advisories,
+        allow_dangerous_filters,
+    } = &cli.command
+    {
+        std::process::exit(policylint::run(
+            file,
+            *explain,
+            *no_advisories,
+            *allow_dangerous_filters,
+        ));
+    }
 
     // `signpsbtwithkey` signs locally and makes no RPC call — handle it before
     // any RPC credential/connection setup so a missing cookie can't block it.

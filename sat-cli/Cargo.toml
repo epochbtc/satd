@@ -18,3 +18,4 @@ hex = { workspace = true }
 zeroize = { workspace = true }
 rpassword = { workspace = true }
 shlex = { workspace = true }
+satd-policy = { path = "../satd-policy" }

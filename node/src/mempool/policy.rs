@@ -1,6 +1,13 @@
 /// Default maximum mempool size in bytes (300 MB).
 pub const DEFAULT_MAX_MEMPOOL_SIZE: usize = 300 * 1_000_000;
 
+/// Default byte budget for the **quarantine class** (`quarantinemempool=<MB>`),
+/// 50 MB — ≈1/6 of the default acting mempool (design §13). Held transactions
+/// get their own capacity with independent fee-rate eviction, so a broad policy
+/// can never crowd out the acting mempool. Zero in effect until a policy is
+/// loaded (PR 4c): with no ruleset every transaction is "acting".
+pub const DEFAULT_QUARANTINE_MEMPOOL_SIZE: usize = 50 * 1_000_000;
+
 /// Default minimum relay fee rate in sat/kvB (sat per 1000 *virtual* bytes),
 /// matching Bitcoin Core's `DEFAULT_MIN_RELAY_TX_FEE`. 1000 sat/kvB = 1 sat/vB.
 /// Fee rates are always per vbyte, never per weight unit — derive them with

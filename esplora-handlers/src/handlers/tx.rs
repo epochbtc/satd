@@ -10,12 +10,12 @@
 
 use axum::Json;
 use axum::body::Body;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderValue, Response};
 use bitcoin::consensus::encode::{deserialize, serialize};
 use bitcoin::{Address, Block, BlockHash, Network, Script, Transaction, Txid};
 use node::storage::Store;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::{EsploraError, EsploraResult};
 use crate::state::EsploraState;
@@ -91,10 +91,20 @@ pub async fn tx_raw(
     Ok(resp)
 }
 
+/// Query string for `POST /tx`. `allowquarantined` (satd extension, opt-in) is
+/// the §6.1 override: hold a relay-quarantined submission locally instead of
+/// refusing it. Absent ⇒ false (Core-compatible default).
+#[derive(Debug, Default, Deserialize)]
+pub struct BroadcastQuery {
+    #[serde(default)]
+    pub allowquarantined: bool,
+}
+
 /// `POST /tx` → broadcast. Body: hex-encoded tx bytes. Returns the
 /// txid as plain text, matching upstream Esplora.
 pub async fn tx_broadcast(
     State(state): State<EsploraState>,
+    Query(q): Query<BroadcastQuery>,
     body: String,
 ) -> EsploraResult<String> {
     let bytes = hex::decode(body.trim())
@@ -105,7 +115,7 @@ pub async fn tx_broadcast(
     // mempool accept leaves it sitting on this node, unannounced.
     let txid = state
         .tx_broadcaster
-        .submit_and_announce(tx)
+        .submit_and_announce(tx, node::mempool::pool::TxSource::Esplora, q.allowquarantined)
         .map_err(|e| EsploraError::BadRequest(format!("mempool reject: {e}")))?;
     Ok(txid.to_string())
 }
@@ -240,7 +250,14 @@ fn lookup_confirmed(
 }
 
 fn lookup_mempool(state: &EsploraState, txid: &Txid) -> Option<Transaction> {
-    state.mempool.get(txid).map(|entry| entry.tx)
+    // Acting-only (design §6.1): a relay-quarantined tx must not be served by
+    // txid on any standard read surface, just as it is absent from the Esplora
+    // mempool list endpoints and `/outspend`. Mirrors satd's `getrawtransaction`.
+    state
+        .mempool
+        .get(txid)
+        .filter(|entry| entry.scope.is_acting())
+        .map(|entry| entry.tx)
 }
 
 fn lookup_any(state: &EsploraState, txid: &Txid) -> EsploraResult<Transaction> {
@@ -279,7 +296,14 @@ fn resolve_prev_output(
     {
         return Some(out.clone());
     }
-    if let Some(entry) = state.mempool.get(&prev.txid)
+    // Acting-only for the mempool fallback: a child whose parent is a
+    // quarantined mempool tx is itself infectious-quarantined (and so hidden),
+    // so this never withholds a prevout from a legitimately-visible tx; the
+    // filter keeps quarantined parents off the standard surface for consistency.
+    if let Some(entry) = state
+        .mempool
+        .get(&prev.txid)
+        .filter(|e| e.scope.is_acting())
         && let Some(out) = entry.tx.output.get(prev.vout as usize)
     {
         return Some(out.clone());

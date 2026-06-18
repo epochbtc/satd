@@ -1,0 +1,24 @@
+[package]
+name = "satd-policy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+description = "satd transaction-filtering policy language: lexer, parser, typechecker, static cost model, and fuel-metered total evaluator (expression core)."
+
+[dependencies]
+# Reused only for the authoritative opcode name<->byte table (see
+# script::opcode_byte). Hand-maintaining a 256-entry opcode table in a
+# consensus-adjacent codepath is a correctness risk; rust-bitcoin already
+# maintains it, and it is the project's blessed, unmodified dependency. The
+# evaluator hot path itself pulls in no third-party interpreter (the point of
+# the "no dependencies" stance in the design doc, §4.1).
+bitcoin = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# Totality / determinism fuzzing of the evaluator (I4): the design's headline
+# invariant is that eval is total and deterministic, which is exactly what
+# property testing is for.
+proptest = "1"

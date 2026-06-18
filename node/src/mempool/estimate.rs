@@ -771,6 +771,9 @@ mod tests {
             prev_scripthashes: Vec::new(),
             prev_amounts: Vec::new(),
             prev_scripts: Vec::new(),
+            source: crate::mempool::pool::TxSource::Rpc,
+            scope: crate::mempool::pool::QuarantineScope::acting(),
+            quarantine_rule: None,
         }
     }
 

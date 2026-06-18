@@ -28,8 +28,9 @@
 //! daemon: it is logged and the running config is kept.
 
 use crate::config::{self, Config};
+use node::chain::state::ChainState;
 use node::index::address::SubscriptionRegistry;
-use node::mempool::pool::{Mempool, MempoolConfig};
+use node::mempool::pool::{Mempool, MempoolConfig, PolicyReloadKind};
 use node::net::manager::PeerManager;
 use node::rpc::auth::{RpcAuth, RpcAuthCredential, UserPassCredential};
 use parking_lot::RwLock;
@@ -165,6 +166,9 @@ pub struct ReloadHandles {
     pub cli: config::CliArgs,
     pub mempool: Arc<Mempool>,
     pub peer_manager: Arc<PeerManager>,
+    /// Chain state — the policy re-placement pass ([`Mempool::reapply_policy`])
+    /// re-resolves each entry's prevouts against it on a `policyfile` reload (§8).
+    pub chain_state: Arc<ChainState>,
     pub log_filter: LogReloadHandle,
     /// Address-index subscription registry — its cap is reloadable.
     pub addr_sub_registry: Arc<SubscriptionRegistry>,
@@ -253,7 +257,94 @@ pub fn mempool_config_from(c: &Config) -> MempoolConfig {
         expiry_secs: c.mempoolexpiry.saturating_mul(3600),
         permit_bare_multisig: c.permitbaremultisig,
         accept_non_std_txn: c.acceptnonstdtxn,
+        // Byte budget for the quarantine class (`quarantinemempool`, MB).
+        // Saturating, same rationale as `maxmempool` above. Inert until a
+        // `policyfile` quarantines something.
+        quarantine_max_bytes: c.quarantinemempool.saturating_mul(1_000_000),
+        allow_dangerous_filters: c.allowdangerousfilters,
         prevout_meta: c.stream_prevout_meta,
+    }
+}
+
+/// Re-read and re-apply the transaction-filtering `policyfile` on SIGHUP (§8).
+/// Runs unconditionally (the `TokenStore` precedent — see [`HANDLER_RELOAD_KEYS`]):
+///
+/// - **`policyfile=` set:** re-read + recompile + swap. A no-op (identical
+///   contents) skips the re-placement walk; a changed ruleset triggers a lossless
+///   re-placement pass (I9) and enqueues the promoted txs for bounded
+///   re-announcement. A compile error keeps the last-good ruleset (I7).
+/// - **`policyfile=` removed:** drop the engine and promote everything held —
+///   behavior reverts to baseline (G4/I9).
+fn apply_policyfile_reload(new: &Config, h: &ReloadHandles) {
+    match &new.policyfile {
+        Some(path) => match h.mempool.reload_policy_file(path) {
+            Ok(PolicyReloadKind::Unchanged) => {
+                tracing::debug!(path = %path.display(), "policy file reloaded: no change");
+            }
+            Ok(PolicyReloadKind::Changed(load)) => {
+                tracing::info!(
+                    path = %path.display(),
+                    rules = load.rules,
+                    total_cost = load.total_cost,
+                    sha256 = %load.sha256,
+                    "policy file reloaded — re-placing mempool"
+                );
+                let t = h.mempool.reapply_policy(&h.chain_state);
+                let promoted = t.promoted.len();
+                h.peer_manager.enqueue_promotions(t.promoted);
+                tracing::info!(
+                    promoted,
+                    demoted = t.demoted.len(),
+                    evicted = t.evicted.len(),
+                    "policy re-placement complete"
+                );
+            }
+            Err(e) => tracing::error!(
+                error = %e,
+                path = %path.display(),
+                "policy file reload failed — keeping the last-good ruleset"
+            ),
+        },
+        // No `policyfile=`: if a ruleset is loaded, drop it and promote
+        // everything (engine reverts to baseline, I9). `policy_snapshot` is
+        // `Some` for any loaded ruleset, including an (inert) empty one.
+        None => {
+            if h.mempool.policy_snapshot().is_some() {
+                h.mempool.clear_policy();
+                let t = h.mempool.reapply_policy(&h.chain_state);
+                let promoted = t.promoted.len();
+                h.peer_manager.enqueue_promotions(t.promoted);
+                tracing::info!(
+                    promoted,
+                    "policyfile removed — engine dropped, quarantine promoted to acting"
+                );
+            }
+        }
+    }
+
+    // Final safety reconciliation — runs after *every* path above. The loaded
+    // policy must satisfy the danger gate under the current `allowdangerousfilters`.
+    // This catches two cases the reload itself misses:
+    //   1. the flag tightened against an unchanged file (the sha-dedup returns
+    //      `Unchanged` before the load gate runs), and
+    //   2. a refused or uncompilable reload that kept a last-good policy which was
+    //      originally loaded under the opt-out (the `Err` arm keeps last-good).
+    // In both, a relay-withholding policy could otherwise stay live while strict
+    // mode is reported on. Eject it fail-safe (drop + promote), like a removal.
+    if let Err(e) = h.mempool.recheck_loaded_danger_gate() {
+        tracing::error!(
+            error = %e,
+            "loaded policy violates the danger gate under the current \
+             allowdangerousfilters — dropping it"
+        );
+        h.mempool.clear_policy();
+        let t = h.mempool.reapply_policy(&h.chain_state);
+        let promoted = t.promoted.len();
+        h.peer_manager.enqueue_promotions(t.promoted);
+        tracing::info!(
+            promoted,
+            "dangerous policy dropped — quarantine promoted to acting"
+        );
     }
 }
 
@@ -312,6 +403,17 @@ const LOAD_ONLY_KEYS: &[&str] = &[
     "signet",
     "par",
 ];
+
+/// Keys whose external file is re-read by a **dedicated handler** at the end of
+/// `reload_from_sighup`, not via a `FieldSpec` — the `TokenStore` precedent (§8):
+/// the file's *contents* are picked up on every SIGHUP even when the config value
+/// (the path) is unchanged, which a path-diff `FieldSpec` would miss. Classified
+/// here so the anti-drift coverage test still accounts for them.
+///
+/// `policyfile`: the transaction-filtering ruleset — re-read, recompiled, swapped,
+/// and re-placed live (path change, in-place content edit, and removal all live).
+#[allow(dead_code)]
+const HANDLER_RELOAD_KEYS: &[&str] = &["policyfile"];
 
 /// Build the field-disposition table. Constructed at call time (once per
 /// reload) so the non-capturing `diff`/`apply` closures coerce to `fn`
@@ -619,6 +721,26 @@ fn field_specs() -> Vec<FieldSpec> {
         live!("acceptnonstdtxn", acceptnonstdtxn, |c, h| {
             h.mempool.reload_policy(mempool_config_from(c))
         }),
+        // Quarantine-class byte budget — folded into the same MempoolConfig
+        // reload as the other mempool knobs.
+        live!("quarantinemempool", quarantinemempool, |c, h| {
+            h.mempool.reload_policy(mempool_config_from(c))
+        }),
+        // The danger-gate opt-out. Updating MempoolConfig governs the gate, which
+        // `apply_policyfile_reload` (running after this in the same SIGHUP) then
+        // applies: flipping it *on* loads a previously-refused ruleset, and
+        // flipping it *off* ejects a now-disallowed loaded policy even when the
+        // file is unchanged (the handler re-checks the loaded ruleset, so the
+        // sha-dedup can't strand a relay-withholding policy in strict mode).
+        live!("allowdangerousfilters", allowdangerousfilters, |c, h| {
+            h.mempool.reload_policy(mempool_config_from(c))
+        }),
+        // NOTE: `policyfile` is intentionally NOT a FieldSpec. Like the
+        // `authfile` token store, its external file's *contents* are re-read on
+        // every SIGHUP — even when the path is unchanged — by a dedicated handler
+        // at the end of `reload_from_sighup` (the `TokenStore` precedent, §8). A
+        // path-diff spec would miss in-place edits to the same file, so the whole
+        // policy reload (path change, content change, and removal) lives there.
         // Streaming watch matcher prevout-metadata retention. Lives in the
         // mempool policy (captured at admission), so a SIGHUP change governs
         // subsequent admissions; entries already in the pool keep whatever they
@@ -834,6 +956,15 @@ pub fn reload_from_sighup(handles: &ReloadHandles, running: &Config) -> Config {
         }
     }
 
+    // Transaction-filtering policy file (§8), the `TokenStore` precedent:
+    // re-read the external file's *contents* on every SIGHUP — even when the
+    // path is unchanged — recompile, swap, and run the lossless re-placement
+    // pass (I9). A compile error keeps the last-good ruleset; removing
+    // `policyfile=` drops the engine and promotes everything held. Promotions
+    // are announced through the bounded drain queue so a mass promotion never
+    // bursts peers.
+    apply_policyfile_reload(&new, handles);
+
     // Surface any reconciliation notes produced by re-reading the file
     // (e.g. Esplora ↔ txindex, prune auto-disable).
     for note in new.take_pending_notes() {
@@ -886,18 +1017,20 @@ mod tests {
             "duplicate key in field_specs()"
         );
         let load_only: HashSet<&str> = LOAD_ONLY_KEYS.iter().copied().collect();
+        let handler_reload: HashSet<&str> = HANDLER_RELOAD_KEYS.iter().copied().collect();
 
         for key in config::KNOWN_CONFIG_KEYS {
-            let covered = spec_keys.contains(key) || load_only.contains(key);
+            let covered =
+                spec_keys.contains(key) || load_only.contains(key) || handler_reload.contains(key);
             assert!(
                 covered,
                 "config key {key:?} has no reload disposition — add it to \
-                 field_specs() (restart!/live!) or LOAD_ONLY_KEYS"
+                 field_specs() (restart!/live!), LOAD_ONLY_KEYS, or HANDLER_RELOAD_KEYS"
             );
         }
-        // No stray keys: every spec/load-only key must be a real config key.
+        // No stray keys: every classified key must be a real config key.
         let known: HashSet<&str> = config::KNOWN_CONFIG_KEYS.iter().copied().collect();
-        for k in spec_keys.iter().chain(load_only.iter()) {
+        for k in spec_keys.iter().chain(load_only.iter()).chain(handler_reload.iter()) {
             assert!(
                 known.contains(k),
                 "{k:?} is classified but is not in KNOWN_CONFIG_KEYS"

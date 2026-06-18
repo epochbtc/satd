@@ -309,6 +309,31 @@ mod mempool {
     }
 
     #[test]
+    fn test_policy_tools_on_node_without_policy() {
+        use satd_mcp::tools::policy as pol;
+        let (ctx, _dir) = make_test_ctx();
+
+        // getpolicyinfo reports unloaded.
+        let info: serde_json::Value =
+            serde_json::from_str(&pol::get_policy_info(&ctx)).unwrap();
+        assert_eq!(info["loaded"], serde_json::json!(false));
+
+        // getquarantineinfo + listquarantine return empty, never error.
+        let q: serde_json::Value =
+            serde_json::from_str(&pol::get_quarantine_info(&ctx)).unwrap();
+        assert_eq!(q["count"], serde_json::json!(0));
+        let list: serde_json::Value =
+            serde_json::from_str(&pol::list_quarantine(&ctx, None, 0, 0)).unwrap();
+        assert_eq!(list.as_array().unwrap().len(), 0);
+
+        // getquarantineentry on an unknown txid surfaces a structured error.
+        let zero = "0".repeat(64);
+        let entry: serde_json::Value =
+            serde_json::from_str(&pol::get_quarantine_entry(&ctx, &zero)).unwrap();
+        assert!(entry["error"].is_string());
+    }
+
+    #[test]
     fn test_list_mempool_transactions_empty() {
         let (ctx, _dir) = make_test_ctx();
         let result = mp::list_mempool_transactions(&ctx, "fee_rate", 25, None);
@@ -481,7 +506,7 @@ mod construction {
     #[test]
     fn test_send_transaction_invalid_hex() {
         let (ctx, _dir) = make_test_ctx();
-        let result = cst::send_transaction(&ctx, "notvalidhex");
+        let result = cst::send_transaction(&ctx, "notvalidhex", false);
         let json: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert!(json["error"].is_string());
     }
@@ -702,13 +727,15 @@ mod tool_router {
 
     #[test]
     fn test_tool_router_lists_expected_tools() {
-        // 27 original + 8 ergonomics-backfill (#68) = 35
+        // 27 original + 8 ergonomics-backfill (#68) + 4 policy observability
+        // (PR 7c: get_policy_info / get_quarantine_info / list_quarantine /
+        // get_quarantine_entry) = 39
         let server = make_server();
         let tools = server.list_tools_from_router();
         assert_eq!(
             tools.len(),
-            35,
-            "Expected 35 tools, got {}. Tools: {:?}",
+            39,
+            "Expected 39 tools, got {}. Tools: {:?}",
             tools.len(),
             tools.iter().map(|t| &*t.name).collect::<Vec<_>>()
         );
@@ -748,6 +775,10 @@ mod tool_router {
             "get_utxo",
             "get_utxo_set_stats",
             "validate_address",
+            "get_policy_info",
+            "get_quarantine_info",
+            "list_quarantine",
+            "get_quarantine_entry",
         ];
 
         for name in &expected {

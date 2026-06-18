@@ -141,7 +141,11 @@ fn parse_txid(s: &str) -> EsploraResult<Txid> {
 /// size; for typical Esplora deployments this is well under a millisecond.
 fn build_mempool_spent_index(state: &EsploraState) -> HashMap<OutPoint, (Txid, u32)> {
     let mut map: HashMap<OutPoint, (Txid, u32)> = HashMap::new();
-    for (txid, entry) in state.mempool.get_all_entries() {
+    // Standard surface (design §6.1): acting class only — a quarantined spender
+    // must not surface as the spending tx on /outspend, just as it is absent
+    // from getrawmempool. (Infectious propagation means an acting tx can't have
+    // a quarantined ancestor, so this never hides a legitimately-relayed spend.)
+    for (txid, entry) in state.mempool.get_acting_entries() {
         for (vin, input) in entry.tx.input.iter().enumerate() {
             if input.previous_output.is_null() {
                 continue;
@@ -185,7 +189,11 @@ fn build_outspend_one(
     if let Some(sref) = state.spend_index.spend_of(outpoint)? {
         return Ok(confirmed_outspend(state, &sref));
     }
-    if let Some((spend_txid, vin)) = state.mempool.spending_tx(outpoint) {
+    // Acting-only (design §6.1): a quarantined spender must not surface here,
+    // matching the batched `/outspends` path (`build_mempool_spent_index`) and
+    // `getrawmempool`. The single-output path previously used the unfiltered
+    // `spending_tx`, so the two endpoints disagreed for the same outpoint.
+    if let Some((spend_txid, vin)) = state.mempool.spending_tx_acting(outpoint) {
         return Ok(mempool_outspend(spend_txid, vin));
     }
     Ok(unspent_outspend())

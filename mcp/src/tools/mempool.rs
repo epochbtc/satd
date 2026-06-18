@@ -55,8 +55,10 @@ pub fn subscribe_mempool_snapshot(ctx: &McpContext, limit: usize) -> String {
 pub fn get_mempool_overview(ctx: &McpContext) -> String {
     let info = rawtx::get_mempool_info(&ctx.mempool);
 
-    // Build fee histogram from verbose mempool entries
-    let entries = ctx.mempool.get_all_entries();
+    // Build fee histogram from verbose mempool entries. Standard MCP mempool
+    // tool (design §6.1/§10): acting class only — the quarantine class is
+    // invisible here, in lockstep with the histogram fed by `info()`.
+    let entries = ctx.mempool.get_acting_entries();
     let mut buckets = [0u64; 7]; // 0-1, 1-2, 2-5, 5-10, 10-20, 20-50, 50+ sat/vB
     for (_txid, entry) in &entries {
         let fee_rate_sat_vb = if entry.weight > 0 {
@@ -102,7 +104,8 @@ pub fn list_mempool_transactions(
     limit: u32,
     min_fee_rate: Option<u64>,
 ) -> String {
-    let mut entries: Vec<_> = ctx.mempool.get_all_entries();
+    // Standard MCP mempool tool (design §6.1/§10): acting class only.
+    let mut entries: Vec<_> = ctx.mempool.get_acting_entries();
 
     // Filter by min fee rate (sat/vB)
     if let Some(min_rate) = min_fee_rate {

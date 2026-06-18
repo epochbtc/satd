@@ -815,6 +815,32 @@ async fn main() {
     // Built via the shared `reload::mempool_config_from` so startup and SIGHUP
     // reload use one mapping and cannot drift.
     let mempool = Arc::new(Mempool::with_config(reload::mempool_config_from(&config)));
+
+    // Transaction-filtering policy ruleset (opt-in via `policyfile`). Compiled
+    // here so a bad ruleset — parse error, type error, or over-budget — aborts
+    // startup loudly with a file-anchored diagnostic, rather than silently
+    // leaving the engine disabled (fail-loud, §8/I7). Unset ⇒ engine compiled
+    // out, behavior byte-identical to today (I8). SIGHUP reload (PR 6) will
+    // keep-last-good on a bad reload; startup is strict.
+    if let Some(path) = &config.policyfile {
+        match mempool.load_policy_file(path) {
+            Ok(load) => {
+                tracing::info!(
+                    path = %path.display(),
+                    rules = load.rules,
+                    total_cost = load.total_cost,
+                    version = load.version,
+                    sha256 = %load.sha256,
+                    "Loaded transaction-filtering policy ruleset"
+                );
+            }
+            Err(e) => {
+                eprintln!("Error loading policyfile {}:\n{}", path.display(), e);
+                std::process::exit(1);
+            }
+        }
+    }
+
     let fee_estimator = Arc::new(FeeEstimator::new());
 
     // Wire the mempool event broadcaster used by `subscribemempool`
@@ -1424,6 +1450,37 @@ async fn main() {
                         }));
                         if pass.is_err() {
                             tracing::error!("rebroadcast pass panicked; continuing on next interval");
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // Promotion-INV drain (§8). A `policyfile` reload that promotes transactions
+    // out of the quarantine class enqueues them for re-announcement; this task
+    // drains the backlog at a bounded rate (token-bucket-capped per tick) so a
+    // worst-case mass promotion spreads over minutes instead of bursting every
+    // peer. Idle (one cheap lock check) when the queue is empty.
+    {
+        let pm = peer_manager.clone();
+        let mut task_shutdown = shutdown_rx.clone();
+        tokio::spawn(async move {
+            let interval =
+                std::time::Duration::from_secs(node::net::manager::PROMOTION_DRAIN_INTERVAL_SECS);
+            loop {
+                tokio::select! {
+                    _ = task_shutdown.changed() => break,
+                    _ = tokio::time::sleep(interval) => {
+                        let drained = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            pm.drain_promotion_queue()
+                        }));
+                        match drained {
+                            Ok(n) if n > 0 => tracing::debug!(count = n, "promotion-INV drain tick"),
+                            Ok(_) => {}
+                            Err(_) => tracing::error!(
+                                "promotion drain tick panicked; continuing on next interval"
+                            ),
                         }
                     }
                 }
@@ -2789,6 +2846,7 @@ async fn main() {
         cli: cli_snapshot,
         mempool: mempool.clone(),
         peer_manager: peer_manager.clone(),
+        chain_state: chain_state.clone(),
         log_filter: log_reload_handle,
         addr_sub_registry: address_index_concrete.subscription_registry(),
         webhook: reorg_webhook_handle,

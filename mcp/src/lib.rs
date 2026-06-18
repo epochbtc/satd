@@ -96,6 +96,22 @@ struct GetMempoolEntryParams {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+struct ListQuarantineParams {
+    #[schemars(description = "Filter to a single policy rule name (optional)")]
+    rule: Option<String>,
+    #[schemars(description = "Maximum entries to return (0 or omitted = no limit)")]
+    count: Option<usize>,
+    #[schemars(description = "Number of entries to skip for paging (default: 0)")]
+    skip: Option<usize>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct GetQuarantineEntryParams {
+    #[schemars(description = "Transaction ID (hex)")]
+    txid: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
 struct EstimateFeeParams {
     #[schemars(description = "Confirmation targets in blocks (default: [1, 3, 6, 12, 25])")]
     targets: Option<Vec<u32>>,
@@ -141,6 +157,12 @@ struct SignTransactionParams {
 struct SendTransactionParams {
     #[schemars(description = "Hex-encoded signed raw transaction")]
     hex_tx: String,
+    #[schemars(
+        description = "Hold the tx in the local quarantine class even if a relay-scoped \
+                       policy rule matches, instead of refusing it (satd extension; default false)"
+    )]
+    #[serde(default)]
+    allow_quarantined: bool,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -279,6 +301,33 @@ impl SatdMcpServer {
         tools::mempool::get_mempool_entry(&self.ctx, &p.txid, p.include_relatives.unwrap_or(false))
     }
 
+    // === Transaction-filtering policy (design §10) ===
+
+    #[tool(description = "Get transaction-filtering policy info: ruleset path/sha256/version, per-rule match counters since load, fuel-backstop count, and quarantine-class totals. Returns {\"loaded\": false} when no ruleset is active.")]
+    fn get_policy_info(&self) -> String {
+        tools::policy::get_policy_info(&self.ctx)
+    }
+
+    #[tool(description = "Get quarantine-class statistics: per-rule rollup (count, bytes, fee-rate span), confirmed-anyway count (quarantined txs later mined), and the foregone-fees estimate (sat). The comparison surface for tuning policy posture.")]
+    fn get_quarantine_info(&self) -> String {
+        tools::policy::get_quarantine_info(&self.ctx)
+    }
+
+    #[tool(description = "List quarantined transactions (the policy hold class), newest-first, optionally filtered to one rule. Each entry: txid, rule, scope (relay/template), entry time, vsize, fee, fee rate.")]
+    fn list_quarantine(&self, Parameters(p): Parameters<ListQuarantineParams>) -> String {
+        tools::policy::list_quarantine(
+            &self.ctx,
+            p.rule.as_deref(),
+            p.count.unwrap_or(0),
+            p.skip.unwrap_or(0),
+        )
+    }
+
+    #[tool(description = "Get detail for a single quarantined transaction (the getmempoolentry analogue for the quarantine class): rule, scope, time, vsize/weight, fee, fee rate, and in-mempool parents.")]
+    fn get_quarantine_entry(&self, Parameters(p): Parameters<GetQuarantineEntryParams>) -> String {
+        tools::policy::get_quarantine_entry(&self.ctx, &p.txid)
+    }
+
     // === Fee Estimation ===
 
     #[tool(description = "Estimate fee rates for multiple confirmation targets at once. Returns rates in both BTC/kvB and sat/vB. Default targets: 1, 3, 6, 12, 25 blocks.")]
@@ -324,7 +373,7 @@ impl SatdMcpServer {
 
     #[tool(description = "Broadcast a signed raw transaction to the network. Returns the transaction ID on success.")]
     fn send_transaction(&self, Parameters(p): Parameters<SendTransactionParams>) -> String {
-        tools::construction::send_transaction(&self.ctx, &p.hex_tx)
+        tools::construction::send_transaction(&self.ctx, &p.hex_tx, p.allow_quarantined)
     }
 
     #[tool(description = "Perform PSBT (Partially Signed Bitcoin Transaction) operations. Actions: 'create' (new PSBT from inputs/outputs), 'decode' (show PSBT contents), 'analyze' (check what signatures are needed), 'combine' (merge partial signatures), 'finalize' (complete for broadcast), 'update' (add UTXO info), 'convert' (raw tx to PSBT), 'join' (merge independent PSBTs).")]

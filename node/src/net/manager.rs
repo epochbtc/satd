@@ -82,6 +82,15 @@ const REBROADCAST_AUTO_MAX_SECS: u64 = 900;
 /// P2P protocol cap on inventory items per `inv` message (Core's
 /// `MAX_INV_SZ`); peers disconnect senders that exceed it.
 const MAX_INV_PER_MSG: usize = 50_000;
+/// Token-bucket cap for the promotion-INV drain (§8): at most this many
+/// reloaded-and-promoted transactions are announced per drain tick, so a
+/// worst-case mass promotion spreads over minutes instead of bursting peers.
+const PROMOTION_DRAIN_PER_TICK: usize = 200;
+/// Interval between promotion-drain ticks. With [`PROMOTION_DRAIN_PER_TICK`],
+/// a full-quarantine promotion of tens of thousands of txs drains over a few
+/// minutes (e.g. 20k txs ≈ 100 ticks ≈ 3.3 min). Public so the satd binary's
+/// drain task can pace itself by the same constant.
+pub const PROMOTION_DRAIN_INTERVAL_SECS: u64 = 2;
 /// Minimum spacing between BIP35 `mempool` dumps served to one peer. Each
 /// dump is a full-mempool scan plus up to multi-MB of queued `inv`s, so a
 /// permissioned-but-misbehaving peer must not be able to request it in a
@@ -290,6 +299,15 @@ pub struct PeerManager {
     /// we consider it propagated and stop rebroadcasting. Clamped to ≥1 at
     /// use. SIGHUP-reloadable.
     broadcast_confirm_peers: AtomicU64,
+    /// Bounded-drain queue of transactions promoted out of the quarantine class
+    /// by a policy reload (§8). A mass promotion (worst case: a full-quarantine
+    /// ruleset removed) can free tens of thousands of txs at once; announcing
+    /// them all immediately would burst every peer. Instead they are enqueued
+    /// here and the promotion-drain task ([`Self::drain_promotion_queue`]) INVs
+    /// at most [`PROMOTION_DRAIN_PER_TICK`] per tick, so the burst spreads over
+    /// minutes. In-memory only — anything lost to a restart is recovered by the
+    /// startup re-placement pass (§9).
+    promotion_queue: parking_lot::Mutex<std::collections::VecDeque<bitcoin::Txid>>,
     /// IBD scheduler for parallel block download (shared with connect thread).
     ibd: Arc<parking_lot::RwLock<Option<IbdScheduler>>>,
     /// Signal to wake the connect thread when a block is stored.
@@ -480,6 +498,7 @@ impl PeerManager {
             ban_duration_secs: AtomicU64::new(ban_duration_secs),
             connect_timeout_ms: AtomicU64::new(DEFAULT_CONNECT_TIMEOUT_MS),
             rebroadcast_interval_secs: AtomicU64::new(0),
+            promotion_queue: parking_lot::Mutex::new(std::collections::VecDeque::new()),
             broadcast_confirm_peers: AtomicU64::new(DEFAULT_BROADCAST_CONFIRM_PEERS),
             ibd: ibd.clone(),
             connect_signal: connect_signal.clone(),
@@ -3793,7 +3812,10 @@ impl PeerManager {
             | MempoolError::Dust
             | MempoolError::NonStandardOpReturn
             | MempoolError::InsufficientReplacementFee(..)
-            | MempoolError::TooLongMempoolChain => 0,
+            | MempoolError::TooLongMempoolChain
+            // Local-submission-only refusal (§6.1); P2P traffic never produces it
+            // and it is never peer misbehavior.
+            | MempoolError::Quarantined(_) => 0,
         }
     }
 
@@ -3814,6 +3836,9 @@ impl PeerManager {
             tx.clone(),
             &self.chain_state,
             self.chain_state.script_verifier(),
+            crate::mempool::pool::TxSource::P2p,
+            // Peer traffic quarantines as designed; the §6.1 refusal is local-only.
+            false,
         ) {
             Ok(_) => {
                 self.broadcast_inv(id, txid);
@@ -3940,7 +3965,13 @@ impl PeerManager {
 
     /// Relay a newly-admitted tx to other peers whose fee filter allows it.
     fn broadcast_inv(&self, from: PeerId, txid: bitcoin::Txid) {
-        let entry_fee_rate = self.mempool.get(&txid).map(|e| e.fee_rate).unwrap_or(0);
+        let entry = self.mempool.get(&txid);
+        // Relay-quarantined: the node declines to gossip this tx (design
+        // §2.4/§6.1), so it is never INV'd to peers.
+        if entry.as_ref().is_some_and(|e| !e.scope.assists_relay()) {
+            return;
+        }
+        let entry_fee_rate = entry.map(|e| e.fee_rate).unwrap_or(0);
         let inv = NetworkMessage::Inv(vec![Inventory::WitnessTransaction(txid)]);
         let peers = self.peers.read();
         for (peer_id, handle) in peers.iter() {
@@ -3966,7 +3997,15 @@ impl PeerManager {
     /// handler (not via the lossy mempool event broadcast) so a
     /// successful `sendrawtransaction` reliably reaches the wire.
     pub fn announce_tx(&self, txid: bitcoin::Txid) {
-        let entry_fee_rate = self.mempool.get(&txid).map(|e| e.fee_rate).unwrap_or(0);
+        let entry = self.mempool.get(&txid);
+        // Relay-quarantined: withheld from the wire even on the local-origin
+        // path. A relay-scoped local submission is normally refused outright
+        // (design §6.1), but with an `allowquarantined` override the tx is
+        // admitted to the quarantine class and must still not be announced.
+        if entry.as_ref().is_some_and(|e| !e.scope.assists_relay()) {
+            return;
+        }
+        let entry_fee_rate = entry.map(|e| e.fee_rate).unwrap_or(0);
         let inv = NetworkMessage::Inv(vec![Inventory::WitnessTransaction(txid)]);
         let peers = self.peers.read();
         for handle in peers.values() {
@@ -3994,13 +4033,16 @@ impl PeerManager {
     pub fn broadcast_transaction(
         &self,
         hex_tx: &str,
+        source: crate::mempool::pool::TxSource,
+        allow_quarantined: bool,
     ) -> Result<serde_json::Value, (i32, String)> {
         let tx_bytes =
             hex::decode(hex_tx).map_err(|_| (-22, "TX decode failed".to_string()))?;
         let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&tx_bytes)
             .map_err(|_| (-22, "TX decode failed".to_string()))?;
-        let txid =
-            self.submit_and_announce(tx).map_err(|e| (-25, e.to_string()))?;
+        let txid = self
+            .submit_and_announce(tx, source, allow_quarantined)
+            .map_err(|e| (-25, e.to_string()))?;
         Ok(serde_json::Value::String(txid.to_string()))
     }
 
@@ -4024,12 +4066,16 @@ impl PeerManager {
     pub fn submit_and_announce(
         &self,
         tx: bitcoin::Transaction,
+        source: crate::mempool::pool::TxSource,
+        allow_quarantined: bool,
     ) -> Result<bitcoin::Txid, MempoolError> {
         let resubmit_txid = tx.compute_txid();
         let txid = match self.mempool.accept_transaction(
             tx,
             &self.chain_state,
             self.chain_state.script_verifier(),
+            source,
+            allow_quarantined,
         ) {
             Ok(txid) => txid,
             Err(MempoolError::AlreadyExists) => resubmit_txid,
@@ -4117,6 +4163,47 @@ impl PeerManager {
         }
     }
 
+    /// Enqueue transactions promoted out of the quarantine class by a policy
+    /// reload (§8) for bounded re-announcement. Called by the reload handler with
+    /// the [`PolicyTransition::promoted`](crate::mempool::pool::PolicyTransition)
+    /// set; the actual INVs go out on the drain task at a capped rate so a mass
+    /// promotion never bursts peers. Cheap and non-blocking; deduped against the
+    /// existing backlog so repeated reloads don't stack duplicate announcements.
+    pub fn enqueue_promotions(&self, txids: impl IntoIterator<Item = bitcoin::Txid>) {
+        let mut q = self.promotion_queue.lock();
+        let existing: HashSet<bitcoin::Txid> = q.iter().copied().collect();
+        for txid in txids {
+            if !existing.contains(&txid) {
+                q.push_back(txid);
+            }
+        }
+    }
+
+    /// Drain up to [`PROMOTION_DRAIN_PER_TICK`] promoted txs and announce each to
+    /// fee-permitting peers (one drain tick). Returns the number announced.
+    /// [`announce_tx`](Self::announce_tx) re-checks scope, so a tx demoted again
+    /// before its turn (or already gone) is silently skipped. Suppressed during
+    /// IBD, which doesn't relay txs.
+    pub fn drain_promotion_queue(&self) -> usize {
+        if self.is_actively_syncing() {
+            return 0;
+        }
+        let batch: Vec<bitcoin::Txid> = {
+            let mut q = self.promotion_queue.lock();
+            let n = q.len().min(PROMOTION_DRAIN_PER_TICK);
+            q.drain(..n).collect()
+        };
+        for txid in &batch {
+            self.announce_tx(*txid);
+        }
+        batch.len()
+    }
+
+    /// Current depth of the promotion-INV backlog (metrics / tests).
+    pub fn promotion_queue_len(&self) -> usize {
+        self.promotion_queue.lock().len()
+    }
+
     /// Announce the current unbroadcast local txs to a single freshly-
     /// connected peer (so a tx submitted while we had no peers reaches the
     /// network as soon as one arrives). Honors the peer's fee filter,
@@ -4200,6 +4287,8 @@ impl PeerManager {
                 child.tx.clone(),
                 &self.chain_state,
                 self.chain_state.script_verifier(),
+                crate::mempool::pool::TxSource::P2p,
+                false,
             );
             match result {
                 Ok(_) => {
@@ -4499,7 +4588,16 @@ impl PeerManager {
                     }
                 }
                 Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
-                    if let Some(entry) = self.mempool.get(&txid) {
+                    // Relay-quarantined txs are not served via `getdata`:
+                    // announce-suppression without serve-suppression would be
+                    // incoherent — a peer that learned the txid elsewhere must
+                    // not be able to pull it from us (design §6.1). Report it
+                    // as not-found, exactly as if we did not hold it.
+                    if let Some(entry) = self
+                        .mempool
+                        .get(&txid)
+                        .filter(|e| e.scope.assists_relay())
+                    {
                         // The peer pulled this tx from us. If it's a pending
                         // local broadcast, that's the primary proof it has
                         // propagated — count the peer toward stopping
@@ -5304,6 +5402,8 @@ pub fn reconsider_orphans_on_block(
             child.tx.clone(),
             chain_state,
             chain_state.script_verifier(),
+            crate::mempool::pool::TxSource::P2p,
+            false,
         );
         match result {
             Ok(_) => {
@@ -5402,13 +5502,28 @@ impl Drop for BulkLoadGuard<'_> {
 /// decoupled from the P2P manager and lets their tests inject a fake.
 pub trait TxBroadcaster: Send + Sync {
     /// Accept `tx` into the mempool and announce it to peers. Returns the
-    /// txid, or the mempool rejection reason.
-    fn submit_and_announce(&self, tx: bitcoin::Transaction) -> Result<bitcoin::Txid, MempoolError>;
+    /// txid, or the mempool rejection reason. `source` records the submission
+    /// surface for the transaction-policy engine (`tx.source`).
+    ///
+    /// `allow_quarantined` is the §6.1 override: when false (the default) a
+    /// local submission drawing a relay-scoped quarantine verdict is refused
+    /// (`MempoolError::Quarantined`); when true it is held in quarantine anyway.
+    fn submit_and_announce(
+        &self,
+        tx: bitcoin::Transaction,
+        source: crate::mempool::pool::TxSource,
+        allow_quarantined: bool,
+    ) -> Result<bitcoin::Txid, MempoolError>;
 }
 
 impl TxBroadcaster for PeerManager {
-    fn submit_and_announce(&self, tx: bitcoin::Transaction) -> Result<bitcoin::Txid, MempoolError> {
-        PeerManager::submit_and_announce(self, tx)
+    fn submit_and_announce(
+        &self,
+        tx: bitcoin::Transaction,
+        source: crate::mempool::pool::TxSource,
+        allow_quarantined: bool,
+    ) -> Result<bitcoin::Txid, MempoolError> {
+        PeerManager::submit_and_announce(self, tx, source, allow_quarantined)
     }
 }
 
@@ -5794,6 +5909,176 @@ mod tests {
         assert!(rx3.try_recv().is_err(), "non-Connected peer must be skipped");
     }
 
+    /// PR 5: the relay assist paths honor the quarantine scope bits. A
+    /// relay-quarantined tx is never INV'd (`announce_tx`/`broadcast_inv`) and
+    /// never served via `getdata` (the peer gets `NotFound`), while a tx
+    /// quarantined only `on template` still relays normally (design §2.4/§6.1).
+    #[test]
+    fn assist_paths_skip_relay_quarantined() {
+        use crate::chain::state::AssumeValid;
+        use crate::mempool::pool::QuarantineScope;
+        use crate::storage::db::InMemoryStore;
+        use crate::storage::flatfile::FlatFileManager;
+        use crate::validation::script::NoopVerifier;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Box::new(InMemoryStore::new());
+        let flat_files = FlatFileManager::new(&dir.path().join("blocks")).unwrap();
+        let chain_state = Arc::new(
+            ChainState::new(
+                store,
+                flat_files,
+                Network::Regtest,
+                Box::new(NoopVerifier),
+                AssumeValid::Disabled,
+                450,
+                4,
+                Default::default(),
+                Default::default(),
+            )
+            .unwrap(),
+        );
+        let mempool = Arc::new(Mempool::new(1_000_000, 0));
+        let fee_estimator = Arc::new(FeeEstimator::new());
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let pm = PeerManager::new(
+            chain_state,
+            mempool.clone(),
+            fee_estimator,
+            Network::Regtest,
+            shutdown_rx,
+        );
+
+        // fee_rate 0 entries; the peer's fee_filter is 0 so the only thing that
+        // can suppress an INV is the relay scope.
+        let relay_q = mempool.insert_scoped_for_test(1, 0, QuarantineScope { relay: true, template: false });
+        let template_q = mempool.insert_scoped_for_test(2, 0, QuarantineScope { relay: false, template: true });
+
+        let addr: SocketAddr = "10.0.0.1:8333".parse().unwrap();
+        let (h1, mut rx1) = mk_handle_rx(1, addr, PeerState::Connected, 0);
+        pm.peers.write().insert(1, h1);
+
+        // announce_tx: relay-quarantined → nothing on the wire.
+        pm.announce_tx(relay_q);
+        assert!(rx1.try_recv().is_err(), "relay-quarantined tx must not be announced");
+
+        // broadcast_inv (peer-relay fan-out): same.
+        pm.broadcast_inv(99, relay_q);
+        assert!(rx1.try_recv().is_err(), "relay-quarantined tx must not be relayed");
+
+        // getdata: peer asking for it gets NotFound, never the Tx.
+        pm.handle_getdata(1, vec![Inventory::WitnessTransaction(relay_q)]);
+        match rx1.try_recv() {
+            Ok(NetworkMessage::NotFound(inv)) => {
+                assert_eq!(inv, vec![Inventory::WitnessTransaction(relay_q)]);
+            }
+            other => panic!("relay-quarantined getdata must return NotFound, got {other:?}"),
+        }
+
+        // Contrast: a tx quarantined only `on template` still relays.
+        pm.announce_tx(template_q);
+        match rx1.try_recv() {
+            Ok(NetworkMessage::Inv(inv)) => {
+                assert_eq!(inv, vec![Inventory::WitnessTransaction(template_q)]);
+            }
+            other => panic!("on-template tx must still be announced, got {other:?}"),
+        }
+        // And it is served on getdata.
+        pm.handle_getdata(1, vec![Inventory::WitnessTransaction(template_q)]);
+        match rx1.try_recv() {
+            Ok(NetworkMessage::Tx(tx)) => assert_eq!(tx.compute_txid(), template_q),
+            other => panic!("on-template tx must be served via getdata, got {other:?}"),
+        }
+    }
+
+    fn empty_peer_manager() -> Arc<PeerManager> {
+        use crate::chain::state::AssumeValid;
+        use crate::storage::db::InMemoryStore;
+        use crate::storage::flatfile::FlatFileManager;
+        use crate::validation::script::NoopVerifier;
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Box::new(InMemoryStore::new());
+        let flat_files = FlatFileManager::new(&dir.path().join("blocks")).unwrap();
+        let chain_state = Arc::new(
+            ChainState::new(
+                store,
+                flat_files,
+                Network::Regtest,
+                Box::new(NoopVerifier),
+                AssumeValid::Disabled,
+                450,
+                4,
+                Default::default(),
+                Default::default(),
+            )
+            .unwrap(),
+        );
+        let mempool = Arc::new(Mempool::new(1_000_000, 0));
+        let fee_estimator = Arc::new(FeeEstimator::new());
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        // Leak the TempDir so the blocks dir outlives the manager for the test.
+        std::mem::forget(dir);
+        PeerManager::new(chain_state, mempool, fee_estimator, Network::Regtest, shutdown_rx)
+    }
+
+    fn nth_txid(n: u32) -> bitcoin::Txid {
+        use bitcoin::hashes::Hash;
+        let mut b = [0u8; 32];
+        b[..4].copy_from_slice(&n.to_le_bytes());
+        bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(b))
+    }
+
+    /// PR 6b: the promotion queue dedups on enqueue and drains at most
+    /// `PROMOTION_DRAIN_PER_TICK` per tick (token-bucket cap, §8).
+    #[test]
+    fn promotion_queue_dedups_and_drains_bounded() {
+        let pm = empty_peer_manager();
+
+        // Dedup: b appears in both batches but is queued once.
+        pm.enqueue_promotions([nth_txid(1), nth_txid(2)]);
+        pm.enqueue_promotions([nth_txid(2), nth_txid(3)]);
+        assert_eq!(pm.promotion_queue_len(), 3, "duplicate enqueue is deduped");
+
+        // Bounded drain: fill past one tick's cap and confirm only the cap drains.
+        let pm = empty_peer_manager();
+        let total = PROMOTION_DRAIN_PER_TICK + 5;
+        pm.enqueue_promotions((0..total as u32).map(nth_txid));
+        assert_eq!(pm.promotion_queue_len(), total);
+
+        let drained = pm.drain_promotion_queue();
+        assert_eq!(drained, PROMOTION_DRAIN_PER_TICK, "one tick drains the cap");
+        assert_eq!(pm.promotion_queue_len(), 5, "the overflow waits for the next tick");
+
+        let drained = pm.drain_promotion_queue();
+        assert_eq!(drained, 5);
+        assert_eq!(pm.promotion_queue_len(), 0);
+        assert_eq!(pm.drain_promotion_queue(), 0, "empty queue drains nothing");
+    }
+
+    /// PR 6b: draining the queue re-announces each promoted tx to fee-permitting
+    /// peers (the bounded counterpart of `announce_tx`).
+    #[test]
+    fn promotion_drain_announces_to_peers() {
+        let pm = empty_peer_manager();
+        // An acting tx in the mempool (fee_rate 0).
+        let txid = pm
+            .mempool
+            .insert_scoped_for_test(1, 0, crate::mempool::pool::QuarantineScope::acting());
+
+        let addr: SocketAddr = "10.0.0.1:8333".parse().unwrap();
+        let (h1, mut rx1) = mk_handle_rx(1, addr, PeerState::Connected, 0);
+        pm.peers.write().insert(1, h1);
+
+        pm.enqueue_promotions([txid]);
+        assert_eq!(pm.drain_promotion_queue(), 1);
+        match rx1.try_recv() {
+            Ok(NetworkMessage::Inv(inv)) => {
+                assert_eq!(inv, vec![Inventory::WitnessTransaction(txid)]);
+            }
+            other => panic!("promoted tx must be announced on drain, got {other:?}"),
+        }
+    }
+
     /// `submit_and_announce` — the shared core behind the Esplora / Electrum
     /// broadcast surfaces — must NOT announce a tx the mempool rejects.
     /// (The accepted-and-announced path is covered by the mechanism test
@@ -5855,7 +6140,10 @@ mod tests {
             output: vec![TxOut { value: Amount::from_sat(1000), script_pubkey: ScriptBuf::new() }],
         };
 
-        assert!(pm.submit_and_announce(tx).is_err(), "tx with missing inputs must be rejected");
+        assert!(
+            pm.submit_and_announce(tx, crate::mempool::pool::TxSource::Rpc, false).is_err(),
+            "tx with missing inputs must be rejected"
+        );
         assert!(rx1.try_recv().is_err(), "a rejected tx must not be announced to peers");
     }
 
@@ -5907,7 +6195,7 @@ mod tests {
         let txid = tx.compute_txid();
         pm.mempool.insert_entry_for_test(txid, tx.clone(), 0);
 
-        let result = pm.submit_and_announce(tx);
+        let result = pm.submit_and_announce(tx, crate::mempool::pool::TxSource::Rpc, false);
         assert_eq!(result.ok(), Some(txid), "resubmit of a mempool tx must succeed");
         match rx1.try_recv() {
             Ok(NetworkMessage::Inv(inv)) => {
