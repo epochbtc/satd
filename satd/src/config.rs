@@ -1049,6 +1049,31 @@ pub struct Config {
     /// connections. A `Subscribe` beyond the cap is rejected with
     /// `RESOURCE_EXHAUSTED`. Default: 256. `0` disables the cap.
     pub events_grpc_max_subscriptions: usize,
+    /// Server leaf certificate (PEM) for the events gRPC listener. When set
+    /// together with `events_grpc_tls_key`, the `events_grpc_bind` listener
+    /// terminates TLS in-process (no separate plaintext + TLS bind — unlike
+    /// RPC, the single events bind is upgraded). Mirrors the RPC / Electrum /
+    /// Esplora TLS surfaces; a remote bind still requires
+    /// `events_grpc_allow_remote` + `events_grpc_auth`.
+    pub events_grpc_tls_cert: Option<std::path::PathBuf>,
+    /// Server private key (PEM) for the events gRPC listener. Must be set
+    /// whenever `events_grpc_tls_cert` is.
+    pub events_grpc_tls_key: Option<std::path::PathBuf>,
+    /// Require mutual TLS on the events gRPC listener. Off by default. When
+    /// `true`, the listener refuses any client without a cert validly signed by
+    /// `events_grpc_mtls_client_ca`. Requires the TLS cert/key to be set.
+    pub events_grpc_mtls: bool,
+    /// PEM CA bundle used to verify client certificates on the events gRPC TLS
+    /// surface. Required when `events_grpc_mtls = true`.
+    pub events_grpc_mtls_client_ca: Option<std::path::PathBuf>,
+    /// Optional allowlist of accepted client-cert subject identities
+    /// (CN / DNS-SAN, case-insensitive). Empty = any CA-signed cert. Only
+    /// meaningful with `events_grpc_mtls = true`.
+    pub events_grpc_mtls_client_allow: Vec<String>,
+    /// Per-handshake wall-clock timeout on the events gRPC TLS surface.
+    /// Defaults to 30 seconds, matching the Electrum / Esplora streaming
+    /// surfaces (long-lived streaming clients, often non-local).
+    pub events_grpc_tls_handshake_timeout: u64,
     /// `host:port` to bind the streaming JSON-over-WebSocket + SSE transport
     /// (`--streamws`). `None` (default) leaves it disabled. Serves `/ws`
     /// (bidi JSON: firehose + watch-set control + matches) and `/sse`
@@ -2202,20 +2227,81 @@ impl Config {
                     .to_string(),
             );
         }
+        // Events gRPC TLS / mTLS, mirroring the RPC / Electrum / Esplora
+        // surfaces (same `tls-config` plumbing). Unlike RPC there is no separate
+        // TLS bind: setting cert+key upgrades the single `events_grpc_bind`
+        // listener to TLS in-process.
+        let events_grpc_tls_cert = cli
+            .events_grpc_tls_cert
+            .clone()
+            .or_else(|| file_get("eventsgrpctlscert").map(std::path::PathBuf::from));
+        let events_grpc_tls_key = cli
+            .events_grpc_tls_key
+            .clone()
+            .or_else(|| file_get("eventsgrpctlskey").map(std::path::PathBuf::from));
+        if events_grpc_tls_cert.is_some() != events_grpc_tls_key.is_some() {
+            return Err(
+                "--events-grpc-tls-cert and --events-grpc-tls-key must be set together".to_string(),
+            );
+        }
+        let events_grpc_mtls = cli
+            .events_grpc_mtls
+            .or_else(|| file_get("eventsgrpcmtls").and_then(|v| parse_bool(&v)))
+            .unwrap_or(false);
+        let events_grpc_mtls_client_ca = cli
+            .events_grpc_mtls_client_ca
+            .clone()
+            .or_else(|| file_get("eventsgrpcmtlsclientca").map(std::path::PathBuf::from));
+        let events_grpc_mtls_client_allow: Vec<String> = {
+            let mut values: Vec<String> = cli.events_grpc_mtls_client_allow.clone();
+            if values.is_empty() {
+                values = file_get_all("eventsgrpcmtlsclientallow");
+            }
+            values
+                .into_iter()
+                .flat_map(|v| {
+                    v.split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        };
+        let events_grpc_tls_handshake_timeout = cli
+            .events_grpc_tls_handshake_timeout
+            .or_else(|| file_get("eventsgrpctlshandshaketimeout").and_then(|v| v.parse().ok()))
+            .unwrap_or(30);
+        // mTLS requires the TLS cert/key and a client CA bundle; a non-empty
+        // allowlist is meaningless without an mTLS handshake (no peer cert to
+        // match) and would reject every connection — same gates as the other
+        // surfaces.
+        if events_grpc_mtls && events_grpc_tls_cert.is_none() {
+            return Err(
+                "--events-grpc-mtls=1 requires --events-grpc-tls-cert AND --events-grpc-tls-key"
+                    .to_string(),
+            );
+        }
+        if events_grpc_mtls && events_grpc_mtls_client_ca.is_none() {
+            return Err("--events-grpc-mtls=1 requires --events-grpc-mtls-client-ca".to_string());
+        }
+        if !events_grpc_mtls && !events_grpc_mtls_client_allow.is_empty() {
+            return Err("--events-grpc-mtls-client-allow requires --events-grpc-mtls=1".to_string());
+        }
         let events_grpc_allow_remote = cli.events_grpc_allow_remote.unwrap_or_else(|| {
             file_get("eventsgrpcallowremote").and_then(|v| parse_bool(&v)).unwrap_or(false)
         });
-        // A routable events-gRPC bind must be authenticated. The sink has no
-        // transport TLS/mTLS of its own, so without bearer auth a public bind is
-        // an unauthenticated firehose of mempool/chain activity. This mirrors the
-        // MCP rule (`mcpallowremote` requires `mcpauth`). A proxy/mTLS-terminated
-        // deployment keeps the loopback bind and does NOT set allow-remote.
-        if events_grpc_allow_remote && !events_grpc_auth {
+        // A routable events-gRPC bind must be authenticated — without bearer
+        // auth or mTLS a public bind is an unauthenticated firehose of
+        // mempool/chain activity. mTLS satisfies the requirement (the client
+        // must present a CA-signed cert); otherwise --events-grpc-auth is
+        // required (which in turn requires --authfile). This mirrors the MCP
+        // rule. A proxy/TLS-terminated deployment keeps the loopback bind and
+        // does NOT set allow-remote.
+        if events_grpc_allow_remote && !events_grpc_auth && !events_grpc_mtls {
             return Err(
-                "--events-grpc-allow-remote requires --events-grpc-auth (a remote events-gRPC \
-                 bind must be authenticated; --events-grpc-auth in turn requires --authfile). \
-                 For a proxy/mTLS-terminated setup, bind loopback and omit \
-                 --events-grpc-allow-remote."
+                "--events-grpc-allow-remote requires --events-grpc-auth or --events-grpc-mtls=1 \
+                 (a remote events-gRPC bind must be authenticated). For a proxy/TLS-terminated \
+                 setup, bind loopback and omit --events-grpc-allow-remote."
                     .to_string(),
             );
         }
@@ -3151,6 +3237,12 @@ impl Config {
                 .events_grpc_max_subscriptions
                 .or_else(|| file_get("eventsgrpcmaxsubscriptions").and_then(|v| v.parse().ok()))
                 .unwrap_or(256),
+            events_grpc_tls_cert,
+            events_grpc_tls_key,
+            events_grpc_mtls,
+            events_grpc_mtls_client_ca,
+            events_grpc_mtls_client_allow,
+            events_grpc_tls_handshake_timeout,
             streamws_bind: cli.streamws_bind.or_else(|| file_get("streamws")),
             streamws_allow_remote,
             streamws_auth,
@@ -5037,6 +5129,51 @@ pub struct CliArgs {
     pub events_grpc_max_subscriptions: Option<usize>,
 
     #[arg(
+        long = "events-grpc-tls-cert",
+        value_name = "PATH",
+        help = "Path to PEM TLS certificate for the events gRPC server. Setting cert+key upgrades the --events-grpc-bind listener to TLS in-process."
+    )]
+    pub events_grpc_tls_cert: Option<std::path::PathBuf>,
+
+    #[arg(
+        long = "events-grpc-tls-key",
+        value_name = "PATH",
+        help = "Path to PEM TLS private key for the events gRPC server (required with --events-grpc-tls-cert)"
+    )]
+    pub events_grpc_tls_key: Option<std::path::PathBuf>,
+
+    #[arg(
+        long = "events-grpc-mtls",
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
+        help = "Require mutual TLS on the events gRPC server (default: false). Requires --events-grpc-tls-cert/key and --events-grpc-mtls-client-ca."
+    )]
+    pub events_grpc_mtls: Option<bool>,
+
+    #[arg(
+        long = "events-grpc-mtls-client-ca",
+        value_name = "PATH",
+        help = "Path to PEM CA bundle used to verify client certificates when --events-grpc-mtls=1"
+    )]
+    pub events_grpc_mtls_client_ca: Option<std::path::PathBuf>,
+
+    #[arg(
+        long = "events-grpc-mtls-client-allow",
+        value_name = "NAME",
+        help = "Allowlist of accepted client-cert CN / DNS-SAN values (repeatable, comma-separated). Empty = any cert validly signed by the CA."
+    )]
+    pub events_grpc_mtls_client_allow: Vec<String>,
+
+    #[arg(
+        long = "events-grpc-tls-handshake-timeout",
+        value_name = "SECS",
+        help = "Per-handshake timeout for the events gRPC TLS surface (default: 30, matching the Electrum/Esplora streaming surfaces)"
+    )]
+    pub events_grpc_tls_handshake_timeout: Option<u64>,
+
+    #[arg(
         long = "streamws",
         value_name = "ADDR",
         help = "host:port to bind the streaming JSON-over-WebSocket + SSE transport (/ws + /sse). Loopback bind is unauthenticated by default; a remote bind requires --streamws-allow-remote AND --streamws-auth. Default: disabled"
@@ -5450,6 +5587,12 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "server",
         "daemon",
         "events-grpc-allow-remote",
+        "events-grpc-mtls",
+        "events-grpc-tls-cert",
+        "events-grpc-tls-key",
+        "events-grpc-mtls-client-ca",
+        "events-grpc-mtls-client-allow",
+        "events-grpc-tls-handshake-timeout",
         "streamws-allow-remote",
         "streamws-auth",
         "events-zmq-hashtx",
@@ -5902,6 +6045,12 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "eventsgrpcauth",
     "eventsgrpcmaxconns",
     "eventsgrpcmaxsubscriptions",
+    "eventsgrpctlscert",
+    "eventsgrpctlskey",
+    "eventsgrpcmtls",
+    "eventsgrpcmtlsclientca",
+    "eventsgrpcmtlsclientallow",
+    "eventsgrpctlshandshaketimeout",
     "streamws",
     "streamwsallowremote",
     "streamwsauth",
@@ -7053,6 +7202,12 @@ rpcport=8332
             events_grpc_auth: None,
             events_grpc_max_conns: None,
             events_grpc_max_subscriptions: None,
+            events_grpc_tls_cert: None,
+            events_grpc_tls_key: None,
+            events_grpc_mtls: None,
+            events_grpc_mtls_client_ca: None,
+            events_grpc_mtls_client_allow: vec![],
+            events_grpc_tls_handshake_timeout: None,
             streamws_bind: None,
             streamws_allow_remote: Some(false),
             streamws_auth: None,
@@ -7324,6 +7479,12 @@ rpcport=8332
             events_grpc_auth: None,
             events_grpc_max_conns: None,
             events_grpc_max_subscriptions: None,
+            events_grpc_tls_cert: None,
+            events_grpc_tls_key: None,
+            events_grpc_mtls: None,
+            events_grpc_mtls_client_ca: None,
+            events_grpc_mtls_client_allow: vec![],
+            events_grpc_tls_handshake_timeout: None,
             streamws_bind: None,
             streamws_allow_remote: Some(false),
             streamws_auth: None,
@@ -7795,6 +7956,83 @@ rpcport=8332
             err.contains("rpcmtlsclientallow") && err.contains("rpcmtls"),
             "expected allowlist-without-mtls error, got: {err}"
         );
+    }
+
+    #[test]
+    fn test_events_grpc_tls_cert_requires_key() {
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-test",
+            "--events-grpc-bind=127.0.0.1:50051",
+            "--events-grpc-tls-cert=/tmp/cert.pem",
+        ])
+        .unwrap();
+        let err = Config::from_cli(cli).unwrap_err();
+        assert!(
+            err.contains("events-grpc-tls-cert") && err.contains("events-grpc-tls-key"),
+            "expected cert-without-key error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_events_grpc_mtls_requires_ca() {
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-test",
+            "--events-grpc-bind=127.0.0.1:50051",
+            "--events-grpc-tls-cert=/tmp/cert.pem",
+            "--events-grpc-tls-key=/tmp/key.pem",
+            "--events-grpc-mtls=1",
+        ])
+        .unwrap();
+        let err = Config::from_cli(cli).unwrap_err();
+        assert!(
+            err.contains("events-grpc-mtls") && err.contains("events-grpc-mtls-client-ca"),
+            "expected mtls-without-ca error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_events_grpc_mtls_clientallow_requires_mtls() {
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-test",
+            "--events-grpc-bind=127.0.0.1:50051",
+            "--events-grpc-tls-cert=/tmp/cert.pem",
+            "--events-grpc-tls-key=/tmp/key.pem",
+            "--events-grpc-mtls-client-allow=alice",
+        ])
+        .unwrap();
+        let err = Config::from_cli(cli).unwrap_err();
+        assert!(
+            err.contains("events-grpc-mtls-client-allow") && err.contains("events-grpc-mtls"),
+            "expected allowlist-without-mtls error, got: {err}"
+        );
+    }
+
+    /// A remote events-gRPC bind is permitted when authenticated by mTLS, with
+    /// no `--events-grpc-auth` (and thus no `--authfile`) required.
+    #[test]
+    fn test_events_grpc_allow_remote_satisfied_by_mtls() {
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-test",
+            "--events-grpc-bind=0.0.0.0:50051",
+            "--events-grpc-allow-remote=1",
+            "--events-grpc-tls-cert=/tmp/cert.pem",
+            "--events-grpc-tls-key=/tmp/key.pem",
+            "--events-grpc-mtls=1",
+            "--events-grpc-mtls-client-ca=/tmp/ca.pem",
+        ])
+        .unwrap();
+        let cfg = Config::from_cli(cli).expect("mTLS authenticates the remote bind");
+        assert!(cfg.events_grpc_mtls);
+        assert!(cfg.events_grpc_allow_remote);
+        assert_eq!(cfg.events_grpc_tls_handshake_timeout, 30);
     }
 
     /// review H2: `--rpctlshandshaketimeout` is parsed and surfaced

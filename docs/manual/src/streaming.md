@@ -124,6 +124,42 @@ clients that rotate a sliding watch-set viable without exhausting quota.
 Over-quota adds are rejected cleanly (`RESOURCE_EXHAUSTED` on gRPC / `429` on WS)
 without tearing down the subscription.
 
+## Transport encryption (events gRPC TLS / mTLS)
+
+Bearer auth protects *who* may subscribe, but over a plaintext `http://` bind the
+token — and the event stream — travel in the clear. The events gRPC listener can
+terminate **TLS in-process**, sharing the same certificate / mTLS plumbing as the
+RPC, Electrum, and Esplora surfaces. Set a cert + key and the existing
+`eventsgrpcbind` listener is upgraded to TLS (there is no separate plaintext + TLS
+bind):
+
+```ini
+eventsgrpcbind = 0.0.0.0:50051
+eventsgrpctlscert = /etc/satd/events-cert.pem
+eventsgrpctlskey  = /etc/satd/events-key.pem
+```
+
+For **mutual TLS** — clients must present a certificate signed by a CA you control
+— add the CA bundle and, optionally, an allowlist of accepted certificate
+subjects (CN / DNS-SAN; empty means "any cert the CA signed"):
+
+```ini
+eventsgrpcmtls          = 1
+eventsgrpcmtlsclientca  = /etc/satd/clients-ca.pem
+eventsgrpcmtlsclientallow = alice,bob       # optional
+```
+
+A **remote bind must be authenticated**: `eventsgrpcallowremote` requires either
+bearer auth (`eventsgrpcauth`) *or* mTLS (`eventsgrpcmtls`) — mTLS satisfies the
+requirement on its own, since every client must present a CA-signed certificate.
+The cert/key/CA are validated at startup, so a misconfiguration fails the daemon
+immediately rather than per-connection. The handshake timeout
+(`eventsgrpctlshandshaketimeout`, default 30s) bounds slow or probing clients.
+Certificates hot-reload from the same paths on `SIGUSR1`, like the other TLS
+surfaces. TLS uses the workspace `ring` provider exclusively. If you instead
+front the node with a TLS-terminating reverse proxy, keep the loopback bind and
+leave these unset.
+
 ## Operator limits
 
 Every remote-facing streaming surface is bounded so it cannot be driven to

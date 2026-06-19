@@ -11,6 +11,15 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
 
 ## [Unreleased]
 
+- **Events gRPC TLS / mTLS.** The events gRPC streaming listener can now
+  terminate TLS (and mutual TLS) in-process, sharing the cert / mTLS-allowlist
+  plumbing of the RPC / Electrum / Esplora surfaces. Setting `eventsgrpctlscert`
+  + `eventsgrpctlskey` upgrades the existing `eventsgrpcbind` to TLS;
+  `eventsgrpcmtls` (+ `eventsgrpcmtlsclientca`, optional `eventsgrpcmtlsclientallow`)
+  requires client certificates. A remote bind is now satisfied by mTLS as well as
+  bearer auth. New flags: `eventsgrpctlscert`, `eventsgrpctlskey`,
+  `eventsgrpcmtls`, `eventsgrpcmtlsclientca`, `eventsgrpcmtlsclientallow`,
+  `eventsgrpctlshandshaketimeout`.
 - **Transaction-filtering policy (opt-in).** A total, statically-cost-bounded
   policy language (`policyfile=`) that *quarantines* transaction shapes —
   withholding them from relay and/or block templates — without ever changing

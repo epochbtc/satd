@@ -8,7 +8,7 @@ repository.workspace = true
 
 [features]
 default = []
-grpc = ["dep:tonic", "dep:prost", "dep:satd-events-proto", "dep:tokio-stream", "dep:satd-auth", "dep:miniscript"]
+grpc = ["dep:tonic", "dep:prost", "dep:satd-events-proto", "dep:tokio-stream", "dep:satd-auth", "dep:miniscript", "dep:tls-config", "dep:tokio-rustls"]
 zmq = ["dep:zeromq"]
 ws = ["dep:axum", "dep:futures-util", "dep:tokio-stream", "dep:satd-auth", "dep:miniscript"]
 
@@ -29,6 +29,12 @@ prost = { workspace = true, optional = true }
 satd-events-proto = { path = "../satd-events-proto", optional = true }
 tokio-stream = { workspace = true, optional = true }
 satd-auth = { path = "../satd-auth", optional = true }
+# In-process TLS / mTLS termination for the events gRPC listener, sharing the
+# same acceptor + mTLS-allowlist plumbing as the RPC / Electrum / Esplora
+# surfaces. tokio-rustls inherits the workspace pin (ring provider, no
+# aws-lc-rs) so the single process-wide rustls CryptoProvider stays consistent.
+tls-config = { path = "../tls-config", optional = true }
+tokio-rustls = { workspace = true, optional = true }
 
 # zmq feature
 zeromq = { workspace = true, optional = true }
@@ -43,3 +49,7 @@ miniscript = { version = "12", optional = true }
 [dev-dependencies]
 tempfile = "3"
 tokio = { workspace = true, features = ["test-util"] }
+# TLS-termination tests for the events gRPC listener: rcgen mints a throwaway
+# self-signed cert, tokio-rustls drives the client side of the handshake.
+rcgen = { workspace = true }
+tokio-rustls = { workspace = true }
