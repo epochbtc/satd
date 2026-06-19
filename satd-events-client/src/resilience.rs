@@ -22,6 +22,7 @@
 //!   replayed verbatim; the server discards a stale `mempool_seq` on an
 //!   instance mismatch (daemon restart) while confirmed replay is unaffected.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -96,30 +97,49 @@ impl CursorStore for FileCursorStore {
             "{} {} {} {}\n",
             cursor.height, cursor.tx_index, cursor.mempool_seq, cursor.instance_id
         );
-        // Write to a sibling temp file then rename: rename is atomic on the same
-        // filesystem, so a reader never observes a partial line.
-        let tmp = self.path.with_extension("tmp");
-        std::fs::write(&tmp, line.as_bytes())
-            .map_err(|e| StreamError::Decode(format!("cursor store write: {e}")))?;
-        std::fs::rename(&tmp, &self.path)
-            .map_err(|e| StreamError::Decode(format!("cursor store rename: {e}")))?;
-        Ok(())
+        // Write to a *unique* sibling temp file then rename: rename is atomic on
+        // the same filesystem, so a reader never observes a partial line. The
+        // temp name is qualified by pid + a process-local counter so two writers
+        // sharing one cursor path (two subscriptions, or two processes) cannot
+        // clobber each other's in-flight temp and rename a foreign/partial file.
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp = self
+            .path
+            .with_extension(format!("tmp.{}.{n}", std::process::id()));
+        let res = std::fs::write(&tmp, line.as_bytes())
+            .map_err(|e| StreamError::Decode(format!("cursor store write: {e}")))
+            .and_then(|()| {
+                std::fs::rename(&tmp, &self.path)
+                    .map_err(|e| StreamError::Decode(format!("cursor store rename: {e}")))
+            });
+        if res.is_err() {
+            // Best-effort cleanup of the temp on a failed rename.
+            let _ = std::fs::remove_file(&tmp);
+        }
+        res
     }
 }
 
-/// Parse the four-integer cursor line written by [`FileCursorStore`].
+/// Parse the four-integer cursor line written by [`FileCursorStore`]. Each field
+/// is parsed at its real width — `height`/`tx_index` as `u32`, not `u64`-then-
+/// truncate — so a corrupt out-of-range value is a clean `Decode` error rather
+/// than a silently truncated cursor that resumes from the wrong height.
 fn parse_cursor_line(text: &str) -> Result<Cursor, String> {
     let mut it = text.split_whitespace();
-    let mut next_u64 = |field: &str| -> Result<u64, String> {
-        it.next()
-            .ok_or_else(|| format!("cursor store: missing {field}"))?
-            .parse::<u64>()
-            .map_err(|e| format!("cursor store: bad {field}: {e}"))
+    let mut next_field = |field: &str| -> Result<&str, String> {
+        it.next().ok_or_else(|| format!("cursor store: missing {field}"))
     };
-    let height = next_u64("height")? as u32;
-    let tx_index = next_u64("tx_index")? as u32;
-    let mempool_seq = next_u64("mempool_seq")?;
-    let instance_id = next_u64("instance_id")?;
+    let parse = |s: &str, field: &str| -> Result<u64, String> {
+        s.parse::<u64>().map_err(|e| format!("cursor store: bad {field}: {e}"))
+    };
+    let parse32 = |s: &str, field: &str| -> Result<u32, String> {
+        s.parse::<u32>().map_err(|e| format!("cursor store: bad {field}: {e}"))
+    };
+    let height = parse32(next_field("height")?, "height")?;
+    let tx_index = parse32(next_field("tx_index")?, "tx_index")?;
+    let mempool_seq = parse(next_field("mempool_seq")?, "mempool_seq")?;
+    let instance_id = parse(next_field("instance_id")?, "instance_id")?;
     Ok(Cursor { height, tx_index, mempool_seq, instance_id })
 }
 
@@ -148,8 +168,10 @@ pub struct Backoff {
     pub max: Duration,
     /// Per-attempt growth factor.
     pub multiplier: f64,
-    /// Give up after this many consecutive failed reconnects, surfacing the last
-    /// error from [`next`](ResilientSubscription::next). `None` retries forever.
+    /// Give up after this many *consecutive* reconnect attempts produce no event,
+    /// surfacing the last error from [`next`](ResilientSubscription::next). The
+    /// initial connect is not counted; a connection that delivers any event
+    /// resets the count. `None` retries forever.
     pub max_retries: Option<u32>,
 }
 
@@ -264,6 +286,15 @@ pub struct ResilientSubscription {
     /// An event held back so a synthetic [`Event::ReplayGap`] can be delivered
     /// ahead of the block that triggered it.
     pending: Option<Event>,
+    /// Count of consecutive reconnects that have produced **no** event yet. Reset
+    /// to 0 the moment a connection delivers any event ("made progress"), and
+    /// incremented every time a connection fails to establish or ends without
+    /// progress. Drives both the backoff delay and the `max_retries` give-up
+    /// bound, so a server that accepts a subscribe and then immediately closes it
+    /// cannot induce a no-delay reconnect storm.
+    reconnect_attempts: u32,
+    /// The most recent retryable error, surfaced if `max_retries` is exhausted.
+    last_error: Option<StreamError>,
 }
 
 impl ResilientSubscription {
@@ -280,6 +311,8 @@ impl ResilientSubscription {
             resume: None,
             expect_first_height: None,
             pending: None,
+            reconnect_attempts: 0,
+            last_error: None,
         }
     }
 
@@ -294,29 +327,68 @@ impl ResilientSubscription {
     /// Loops internally: a transient failure becomes a backoff + reconnect, an
     /// auto-resumed `Lagged` becomes a re-anchor, and only a real event (or a
     /// surfaced `Lagged`, or a synthetic `ReplayGap`) returns to the caller.
+    ///
+    /// Backoff is applied before **every** reconnect that follows a connection
+    /// which produced no event — whether it failed to establish, closed cleanly,
+    /// or errored — not only the subscribe-error path. A connection that delivers
+    /// an event resets the counter, so a healthy stream that occasionally drops
+    /// reconnects promptly while a flapping server is backed off and eventually
+    /// bounded by `max_retries`.
     pub async fn next(&mut self) -> Result<Event, StreamError> {
         if let Some(ev) = self.pending.take() {
             return Ok(ev);
         }
         loop {
             if self.stream.is_none() {
-                self.connect().await?;
+                // Back off before reconnecting if the previous connection made no
+                // progress (failed to establish, or established and immediately
+                // ended). The first connect (`reconnect_attempts == 0`) is
+                // immediate.
+                if self.reconnect_attempts > 0 {
+                    if let Some(max) = self.config.backoff.max_retries
+                        && self.reconnect_attempts > max
+                    {
+                        return Err(self
+                            .last_error
+                            .take()
+                            .unwrap_or(StreamError::ControlClosed));
+                    }
+                    let delay = self.config.backoff.delay_for(self.reconnect_attempts - 1);
+                    tokio::time::sleep(delay).await;
+                }
+                match self.connect_once().await {
+                    Ok(()) => {}
+                    Err(e) if e.is_retryable() => {
+                        self.reconnect_attempts = self.reconnect_attempts.saturating_add(1);
+                        self.last_error = Some(e);
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
             }
-            // `connect` guarantees `self.stream` is `Some`.
+            // `connect_once` guarantees `self.stream` is `Some`.
             let stream = self.stream.as_mut().expect("connected");
             match stream.message().await {
                 Ok(Some(ev)) => {
+                    // A delivered event is progress: clear the backoff counter so
+                    // the next reconnect (if any) starts fresh.
+                    self.reconnect_attempts = 0;
+                    self.last_error = None;
                     if let Some(out) = self.handle_event(ev).await? {
                         return Ok(out);
                     }
                     // Event consumed internally (auto-resumed lag): loop.
                 }
                 Ok(None) => {
-                    // Server closed the stream cleanly; reconnect from resume.
+                    // Server closed the stream cleanly; reconnect from resume,
+                    // backing off since this connection yielded nothing new.
                     self.stream = None;
+                    self.reconnect_attempts = self.reconnect_attempts.saturating_add(1);
                 }
                 Err(e) if e.is_retryable() => {
                     self.stream = None;
+                    self.reconnect_attempts = self.reconnect_attempts.saturating_add(1);
+                    self.last_error = Some(e);
                 }
                 Err(e) => return Err(e),
             }
@@ -368,39 +440,31 @@ impl ResilientSubscription {
         }
     }
 
-    /// (Re)connect with backoff, replaying from the resume cursor.
-    async fn connect(&mut self) -> Result<(), StreamError> {
+    /// Open a single subscription, replaying from the resume cursor. Backoff and
+    /// retry accounting live in [`next`](Self::next); this performs exactly one
+    /// `subscribe` attempt and returns its result (a retryable `Err` is the
+    /// signal for `next` to back off and try again).
+    async fn connect_once(&mut self) -> Result<(), StreamError> {
         // Effective resume = in-memory anchor, else the persisted one, else the
         // caller's base `from_cursor`.
         if self.resume.is_none() {
             self.resume = self.config.cursor_store.load()?.or(self.base.from_cursor);
         }
-
-        let mut attempt: u32 = 0;
-        loop {
-            let mut opts = self.base.clone();
-            opts.from_cursor = self.resume;
-            match self.client.subscribe(opts).await {
-                Ok(stream) => {
-                    self.stream = Some(stream);
-                    // Arm the truncation check for the first confirmed event of
-                    // this resume (only when we actually asked to replay).
-                    self.expect_first_height =
-                        self.resume.map(|c| c.height.saturating_add(1));
-                    return Ok(());
-                }
-                Err(e) if e.is_retryable() => {
-                    if let Some(max) = self.config.backoff.max_retries
-                        && attempt >= max
-                    {
-                        return Err(e);
-                    }
-                    tokio::time::sleep(self.config.backoff.delay_for(attempt)).await;
-                    attempt = attempt.saturating_add(1);
-                }
-                Err(e) => return Err(e),
-            }
-        }
+        let mut opts = self.base.clone();
+        opts.from_cursor = self.resume;
+        let stream = self.client.subscribe(opts).await?;
+        self.stream = Some(stream);
+        // Arm the truncation check for the first confirmed event of this resume
+        // (only when we actually asked to replay).
+        //
+        // Detection depends on the server replaying confirmed history as
+        // `BlockConnected` events in height order ahead of the live tail — see
+        // `build_cursor_replay` in `node/src/events/replay.rs`, which synthesizes
+        // only `BlockConnected` for the confirmed span. The check below therefore
+        // matches `BlockConnected`; if a future carrier reordered replay this
+        // would need to key on the first confirmed-cursor-bearing event instead.
+        self.expect_first_height = self.resume.map(|c| c.height.saturating_add(1));
+        Ok(())
     }
 }
 
@@ -481,6 +545,18 @@ mod tests {
         let c = parse_cursor_line("951577 4 1234 99\n").unwrap();
         assert_eq!(c, Cursor { height: 951_577, tx_index: 4, mempool_seq: 1234, instance_id: 99 });
         assert!(parse_cursor_line("1 2 3").is_err()); // missing field
+    }
+
+    #[test]
+    fn parse_cursor_line_rejects_out_of_range_height() {
+        // A corrupt height beyond u32::MAX must be a clean error, not a silent
+        // truncation to a wrong (small) height that resumes from the wrong place.
+        let too_big = (u32::MAX as u64) + 1; // 4_294_967_296
+        assert!(parse_cursor_line(&format!("{too_big} 0 0 0")).is_err());
+        // u64-width fields still accept large values.
+        let c = parse_cursor_line(&format!("1 0 {too_big} {too_big}")).unwrap();
+        assert_eq!(c.mempool_seq, too_big);
+        assert_eq!(c.instance_id, too_big);
     }
 
     /// A store we can assert against from tests.
