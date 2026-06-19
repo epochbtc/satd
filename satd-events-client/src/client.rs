@@ -405,23 +405,43 @@ fn validate_prefix(prefix: Vec<u8>, bits: u32) -> Result<pb::ScriptPrefix, Strea
     Ok(pb::ScriptPrefix { prefix, bits })
 }
 
+/// TLS settings assembled by the `StreamClientBuilder::tls*` methods and applied
+/// in [`connect`](StreamClientBuilder::connect). `Some(..)` on the builder means
+/// TLS is enabled; the fields refine trust and identity.
+#[cfg(feature = "tls")]
+#[derive(Clone, Default)]
+struct TlsSettings {
+    /// PEM CA (or self-signed leaf) to verify the server cert. `None` → trust the
+    /// bundled Mozilla webpki roots (public-CA servers).
+    ca_pem: Option<Vec<u8>>,
+    /// mTLS client identity: `(cert_pem, key_pem)`.
+    identity: Option<(Vec<u8>, Vec<u8>)>,
+    /// SNI / certificate domain-name override (e.g. when connecting by IP).
+    domain: Option<String>,
+}
+
 /// Builder for a [`StreamClient`].
 ///
-/// `Debug` is hand-written to redact the bearer token — never derive it here.
+/// `Debug` is hand-written to redact the bearer token (and never leak TLS key
+/// material) — never derive it here.
 #[derive(Clone)]
 pub struct StreamClientBuilder {
     endpoint: String,
     token: Option<String>,
     keepalive: Option<(Duration, Duration)>,
+    #[cfg(feature = "tls")]
+    tls: Option<TlsSettings>,
 }
 
 impl std::fmt::Debug for StreamClientBuilder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("StreamClientBuilder")
-            .field("endpoint", &self.endpoint)
+        let mut d = f.debug_struct("StreamClientBuilder");
+        d.field("endpoint", &self.endpoint)
             .field("token", &self.token.as_ref().map(|_| "<redacted>"))
-            .field("keepalive", &self.keepalive)
-            .finish()
+            .field("keepalive", &self.keepalive);
+        #[cfg(feature = "tls")]
+        d.field("tls", &self.tls.is_some());
+        d.finish()
     }
 }
 
@@ -430,10 +450,11 @@ impl StreamClientBuilder {
     /// on every RPC.
     ///
     /// The token is only honored when the server enforces auth
-    /// (`-eventsgrpcauth`); a no-auth (loopback-trust) server ignores it. **This
-    /// build does not use TLS**, so over a plaintext `http://` endpoint the token
-    /// travels in cleartext — only use it over loopback or through a
-    /// TLS-terminating proxy until TLS support lands.
+    /// (`-eventsgrpcauth`); a no-auth (loopback-trust) server ignores it. Over a
+    /// plaintext `http://` endpoint the token travels in cleartext — enable
+    /// [`tls`](Self::tls) (or [`tls_ca_pem`](Self::tls_ca_pem)) so the connection
+    /// is encrypted, or restrict bearer auth to loopback / a TLS-terminating
+    /// proxy.
     pub fn bearer_token(mut self, token: impl Into<String>) -> Self {
         self.token = Some(token.into());
         self
@@ -451,6 +472,49 @@ impl StreamClientBuilder {
     /// Use the server-matching keepalive defaults (30s interval / 20s timeout).
     pub fn keepalive_default(self) -> Self {
         self.keepalive(30, 20)
+    }
+
+    /// Enable TLS for the connection, trusting the bundled Mozilla root CAs
+    /// (for a server with a publicly-trusted certificate). For a private or
+    /// self-signed CA — the usual case for a satd node — use
+    /// [`tls_ca_pem`](Self::tls_ca_pem) instead. Requires the `tls` feature
+    /// (on by default).
+    #[cfg(feature = "tls")]
+    pub fn tls(mut self) -> Self {
+        self.tls.get_or_insert_with(TlsSettings::default);
+        self
+    }
+
+    /// Enable TLS and verify the server certificate against the PEM CA (or
+    /// self-signed leaf) in `pem` — the usual choice for a satd node serving its
+    /// own certificate. Replaces the bundled roots for this connection.
+    #[cfg(feature = "tls")]
+    pub fn tls_ca_pem(mut self, pem: impl Into<Vec<u8>>) -> Self {
+        self.tls.get_or_insert_with(TlsSettings::default).ca_pem = Some(pem.into());
+        self
+    }
+
+    /// Enable mutual TLS: present this PEM client certificate + private key to a
+    /// server configured for mTLS (`-eventsgrpcmtls`). Combine with
+    /// [`tls_ca_pem`](Self::tls_ca_pem) to also pin the server's CA.
+    #[cfg(feature = "tls")]
+    pub fn tls_client_identity(
+        mut self,
+        cert_pem: impl Into<Vec<u8>>,
+        key_pem: impl Into<Vec<u8>>,
+    ) -> Self {
+        self.tls.get_or_insert_with(TlsSettings::default).identity =
+            Some((cert_pem.into(), key_pem.into()));
+        self
+    }
+
+    /// Override the certificate domain name verified during the TLS handshake
+    /// (SNI). Use when the endpoint host differs from the certificate subject —
+    /// e.g. connecting by IP, or through a proxy. Enables TLS if not already.
+    #[cfg(feature = "tls")]
+    pub fn tls_domain(mut self, domain: impl Into<String>) -> Self {
+        self.tls.get_or_insert_with(TlsSettings::default).domain = Some(domain.into());
+        self
     }
 
     /// Connect the transport and return a ready [`StreamClient`].
@@ -472,10 +536,43 @@ impl StreamClientBuilder {
                 .keep_alive_timeout(timeout)
                 .keep_alive_while_idle(true);
         }
+        #[cfg(feature = "tls")]
+        if let Some(tls) = self.tls {
+            ensure_crypto_provider();
+            let mut cfg = tonic::transport::ClientTlsConfig::new();
+            // A pinned CA verifies exactly that authority (the satd self-signed
+            // case); otherwise fall back to the bundled public roots.
+            cfg = match tls.ca_pem {
+                Some(ca) => cfg.ca_certificate(tonic::transport::Certificate::from_pem(ca)),
+                None => cfg.with_webpki_roots(),
+            };
+            if let Some((cert, key)) = tls.identity {
+                cfg = cfg.identity(tonic::transport::Identity::from_pem(cert, key));
+            }
+            if let Some(domain) = tls.domain {
+                cfg = cfg.domain_name(domain);
+            }
+            endpoint = endpoint.tls_config(cfg)?;
+        }
 
         let channel = endpoint.connect().await?;
         Ok(StreamClient { inner: NodeEventStreamClient::new(channel), auth })
     }
+}
+
+/// Install `ring` as the process-default rustls `CryptoProvider`, once. In this
+/// workspace `tonic/tls` resolves to ring only, so rustls already auto-selects
+/// it; this is belt-and-suspenders for a build that *also* compiled `aws-lc-rs`
+/// (a downstream consumer that doesn't pin the provider), where the default
+/// would otherwise be ambiguous and panic. Best-effort — if the application
+/// already installed a provider, that one stays.
+#[cfg(feature = "tls")]
+fn ensure_crypto_provider() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+    });
 }
 
 /// An async client for the satd `satd.events.v1` streaming API.
@@ -496,9 +593,16 @@ impl std::fmt::Debug for StreamClient {
 }
 
 impl StreamClient {
-    /// Start building a client for `endpoint` (e.g. `http://node:50051`).
+    /// Start building a client for `endpoint` (e.g. `http://node:50051`, or
+    /// `https://node:50051` with [`tls`](StreamClientBuilder::tls)).
     pub fn builder(endpoint: impl Into<String>) -> StreamClientBuilder {
-        StreamClientBuilder { endpoint: endpoint.into(), token: None, keepalive: None }
+        StreamClientBuilder {
+            endpoint: endpoint.into(),
+            token: None,
+            keepalive: None,
+            #[cfg(feature = "tls")]
+            tls: None,
+        }
     }
 
     /// Wrap a message in a request carrying the configured auth metadata.
@@ -677,5 +781,42 @@ mod tests {
             Msg::SetCursor(s) => assert_eq!(s.cursor, Some(cursor)),
             other => panic!("expected SetCursor, got {other:?}"),
         }
+    }
+
+    /// The builder's `Debug` must show only that TLS is enabled — never the CA
+    /// bytes, the client key, or the bearer token.
+    #[cfg(feature = "tls")]
+    #[test]
+    fn tls_builder_debug_redacts_secrets() {
+        let b = StreamClient::builder("https://node:50051")
+            .bearer_token("SUPER_SECRET_TOKEN")
+            .tls_ca_pem(b"-----BEGIN CERTIFICATE-----SECRET_CA_BYTES".to_vec())
+            .tls_client_identity(b"CLIENT_CERT".to_vec(), b"CLIENT_PRIVATE_KEY".to_vec());
+        let dbg = format!("{b:?}");
+        assert!(dbg.contains("tls: true"), "expected tls: true, got {dbg}");
+        assert!(dbg.contains("<redacted>"), "token should be redacted: {dbg}");
+        assert!(!dbg.contains("SUPER_SECRET_TOKEN"));
+        assert!(!dbg.contains("SECRET_CA_BYTES"));
+        assert!(!dbg.contains("CLIENT_PRIVATE_KEY"));
+    }
+
+    /// The TLS connect path assembles a rustls config and installs the `ring`
+    /// provider without panicking; against a dead port it fails cleanly (a
+    /// transport error, not `InvalidEndpoint`/`InvalidToken`). Exercises the
+    /// whole `tls()` → `ClientTlsConfig::with_webpki_roots` → `tls_config`
+    /// assembly end to end, no server required.
+    #[cfg(feature = "tls")]
+    #[tokio::test]
+    async fn tls_connect_assembles_and_fails_cleanly() {
+        let err = StreamClient::builder("https://127.0.0.1:1")
+            .tls()
+            .tls_domain("node.example")
+            .connect()
+            .await
+            .expect_err("connect to a dead port must fail");
+        assert!(
+            !matches!(err, StreamError::InvalidEndpoint(_) | StreamError::InvalidToken),
+            "expected a transport/connect error, got {err:?}",
+        );
     }
 }

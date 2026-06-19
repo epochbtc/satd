@@ -47,10 +47,45 @@ let mut client = StreamClient::builder("http://node:50051")
 ```
 
 The bearer token is honored only when the server enforces auth
-(`-eventsgrpcauth`). **This build does not terminate TLS**, so over a plaintext
-`http://` endpoint the token travels in cleartext — use it over loopback or
-through a TLS-terminating proxy until native TLS lands. The client's `Debug`
-impl redacts the token.
+(`-eventsgrpcauth`). Over a plaintext `http://` endpoint the token travels in
+cleartext — enable TLS (below), restrict bearer auth to loopback, or front the
+node with a TLS-terminating proxy. The client's `Debug` impl redacts the token
+(and never prints TLS key material).
+
+## TLS / mTLS
+
+With the default `tls` feature, encrypt the transport so neither the token nor
+the event stream is sent in the clear. The node terminates TLS natively
+(`eventsgrpctlscert`/`eventsgrpctlskey`; see the [Streaming chapter](streaming.md)).
+
+```rust,ignore
+// Public-CA server: trust the bundled Mozilla roots.
+let client = StreamClient::builder("https://node.example:50051")
+    .tls()
+    .bearer_token(token)
+    .connect()
+    .await?;
+
+// satd node with its own (self-signed) CA: pin it.
+let ca = std::fs::read("node-ca.pem")?;
+let client = StreamClient::builder("https://10.0.0.5:50051")
+    .tls_ca_pem(ca)
+    .tls_domain("node.example")          // when connecting by IP / through a proxy
+    .bearer_token(token)
+    .connect()
+    .await?;
+
+// Mutual TLS (server set with `eventsgrpcmtls=1`): present a client certificate.
+let client = StreamClient::builder("https://node.example:50051")
+    .tls_ca_pem(std::fs::read("node-ca.pem")?)
+    .tls_client_identity(std::fs::read("client-cert.pem")?, std::fs::read("client-key.pem")?)
+    .connect()
+    .await?;
+```
+
+`tls_ca_pem` pins exactly that authority (the bundled public roots are not used);
+plain `tls()` uses the public roots. TLS uses the `ring` rustls provider. For a
+plaintext-only minimal build, depend with `default-features = false`.
 
 ## Firehose — `subscribe`
 
