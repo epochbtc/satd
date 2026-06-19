@@ -20,8 +20,9 @@
 // `common` is owned by the `e2e` test crate root (`tests/e2e.rs`); this file
 // is folded in as `mod streaming;` there, so reach it via `crate::common`.
 use crate::common::grpc_client::{
-    add_outpoints, add_script_prefixes, add_scripts, add_transactions, next_event_matching,
-    next_event_opt, remove_outpoints, Body, Control, Cursor, GrpcStreamClient, SubscribeControl,
+    add_outpoints, add_script_prefixes, add_scripts, add_scripts_with_floors, add_transactions,
+    next_event_matching, next_event_opt, remove_outpoints, Body, Control, Cursor, GrpcStreamClient,
+    SubscribeControl,
 };
 use crate::common::ws_client::{StreamSseClient, WsClient};
 use crate::common::{
@@ -263,7 +264,14 @@ async fn ws_set_categories_chain_only() {
 const WALLET_SEED: u8 = 0x11;
 
 async fn matured_node() -> (StreamingNode, DeterministicWallet) {
-    let sn = start_streaming_async(vec![]).await;
+    matured_node_args(vec![]).await
+}
+
+/// Like [`matured_node`] but forwards extra CLI args to the spawned `satd`
+/// (e.g. `--stream-prevout-meta=full`). Mines 101 blocks to the wallet so the
+/// block-1 coinbase (50 BTC) is mature and spendable.
+async fn matured_node_args(args: Vec<&'static str>) -> (StreamingNode, DeterministicWallet) {
+    let sn = start_streaming_async(args).await;
     let wallet = DeterministicWallet::from_secret([WALLET_SEED; 32]);
     let addr = wallet.address.to_string();
     let rpc = sn.node.rpc_handle();
@@ -544,6 +552,253 @@ async fn grpc_watch_prefix_funding_mempool() {
     assert_eq!(tx.compute_txid().to_string(), spend_txid);
 }
 
+/// `min_value` floor (output side): a watched script funded by an output whose
+/// value is *below* the floor is suppressed. A second, unfloored watch on the
+/// spent (input-side) script in the same tx still fires — proving the pipeline
+/// is live and the floor, not a missed event, dropped the output match.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grpc_watch_script_min_value_suppresses_output_below_floor() {
+    let (sn, wallet) = matured_node().await;
+    let dest = DeterministicWallet::from_secret([0x5b; 32])
+        .address
+        .script_pubkey();
+    let dest_sh = scripthash_hex(&dest);
+    // The block-1 coinbase pays the wallet spk; spending it is an input-side
+    // match on that script (used here as the unfloored positive control).
+    let wallet_sh = scripthash_hex(&wallet.address.script_pubkey());
+    let mut client = GrpcStreamClient::connect(sn.grpc_port()).await;
+    // dest floored ABOVE the paid value (5 BTC > coinbase-minus-fee) ⇒ suppress;
+    // wallet floor 0 ⇒ deliver.
+    let (_tx, mut stream) = client
+        .watch(vec![add_scripts_with_floors(
+            &[&dest_sh, &wallet_sh],
+            &[5_000_000_000, 0],
+        )])
+        .await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    // Pays the entire block-1 coinbase (50 BTC) minus fee to `dest`.
+    broadcast_spend(&sn, &wallet, 0x5b, 10_000).await;
+
+    // The unfloored input-side wallet match fires (pipeline is live).
+    let ev = next_event_matching(
+        &mut stream,
+        15,
+        |b| matches!(b, Body::ScriptMatched(s) if !s.is_output && !s.confirmed),
+    )
+    .await;
+    let Some(Body::ScriptMatched(s)) = ev.body else {
+        unreachable!()
+    };
+    assert_eq!(hex::encode(&s.scripthash), wallet_sh, "input-side control");
+
+    // The dest output-side match stays suppressed by its floor: none arrives.
+    // Fixed (unscaled by SATD_E2E_TIMEOUT_MULT) window — the input-side control
+    // above gates first, so this only needs to outlast same-scan delivery; a
+    // wider window adds CI time without making the negative assertion safer.
+    let deadline = std::time::Instant::now() + Duration::from_secs(6);
+    while std::time::Instant::now() < deadline {
+        let Some(ev) = next_event_opt(&mut stream, 2).await else {
+            continue;
+        };
+        if let Some(Body::ScriptMatched(s)) = ev.body
+            && s.is_output
+            && hex::encode(&s.scripthash) == dest_sh
+        {
+            panic!("output below min_value floor should be suppressed");
+        }
+    }
+}
+
+/// `min_value` floor (output side): a watched script funded *at or above* the
+/// floor is delivered — a nonzero floor must not drop a qualifying match.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grpc_watch_script_min_value_delivers_at_or_above_floor() {
+    let (sn, wallet) = matured_node().await;
+    let dest = DeterministicWallet::from_secret([0x5c; 32])
+        .address
+        .script_pubkey();
+    let dest_sh = scripthash_hex(&dest);
+    let mut client = GrpcStreamClient::connect(sn.grpc_port()).await;
+    // Floor of 0.01 BTC; the funded output is ~50 BTC, well above it.
+    let (_tx, mut stream) = client
+        .watch(vec![add_scripts_with_floors(&[&dest_sh], &[1_000_000])])
+        .await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    broadcast_spend(&sn, &wallet, 0x5c, 10_000).await;
+
+    let ev = next_event_matching(
+        &mut stream,
+        15,
+        |b| matches!(b, Body::ScriptMatched(s) if s.is_output && !s.confirmed),
+    )
+    .await;
+    let Some(Body::ScriptMatched(s)) = ev.body else {
+        unreachable!()
+    };
+    assert_eq!(hex::encode(&s.scripthash), dest_sh);
+    assert!(s.is_output, "funding match above the floor is delivered");
+}
+
+/// Re-asserting an already-watched scripthash with a *lower* `min_value` floor
+/// updates the floor in place (the deep-review `reassert` path): an output that
+/// was suppressed under the original high floor is delivered once the lowered
+/// floor is re-asserted and the tx confirms.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grpc_watch_script_min_value_reassert_lowers_floor_delivers() {
+    let (sn, wallet) = matured_node().await;
+    let dest = DeterministicWallet::from_secret([0x5d; 32])
+        .address
+        .script_pubkey();
+    let dest_sh = scripthash_hex(&dest);
+    // Unfloored input-side control on the wallet spk (spent by the broadcast):
+    // proves the tx was scanned during the suppression window below.
+    let wallet_sh = scripthash_hex(&wallet.address.script_pubkey());
+    let mut client = GrpcStreamClient::connect(sn.grpc_port()).await;
+    // dest floored ABOVE the paid value ⇒ its mempool funding match is dropped.
+    let (tx, mut stream) = client
+        .watch(vec![add_scripts_with_floors(
+            &[&dest_sh, &wallet_sh],
+            &[5_000_000_000, 0],
+        )])
+        .await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    broadcast_spend(&sn, &wallet, 0x5d, 10_000).await;
+
+    // The unfloored input-side wallet match fires (the tx is being scanned).
+    let ev = next_event_matching(
+        &mut stream,
+        15,
+        |b| matches!(b, Body::ScriptMatched(s) if !s.is_output && !s.confirmed),
+    )
+    .await;
+    let Some(Body::ScriptMatched(s)) = ev.body else {
+        unreachable!()
+    };
+    assert_eq!(hex::encode(&s.scripthash), wallet_sh, "input-side control");
+
+    // No dest output match under the high floor. Fixed (unscaled by
+    // SATD_E2E_TIMEOUT_MULT) window: the control above already proves the scan
+    // ran, so this only needs to outlast same-scan delivery — widening it would
+    // add CI time without strengthening the negative assertion.
+    let deadline = std::time::Instant::now() + Duration::from_secs(4);
+    while std::time::Instant::now() < deadline {
+        let Some(ev) = next_event_opt(&mut stream, 2).await else {
+            continue;
+        };
+        if let Some(Body::ScriptMatched(s)) = ev.body
+            && s.is_output
+            && hex::encode(&s.scripthash) == dest_sh
+        {
+            panic!("output below the initial high floor should be suppressed");
+        }
+    }
+
+    // Re-assert the SAME scripthash with floor 0 (the in-place floor update),
+    // then confirm the tx: the now-qualifying output match is delivered.
+    tx.send(add_scripts_with_floors(&[&dest_sh], &[0]))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    mine_n(&sn, 1).await;
+
+    let ev = next_event_matching(
+        &mut stream,
+        15,
+        |b| matches!(b, Body::ScriptMatched(s) if s.is_output && s.confirmed),
+    )
+    .await;
+    let Some(Body::ScriptMatched(s)) = ev.body else {
+        unreachable!()
+    };
+    assert_eq!(hex::encode(&s.scripthash), dest_sh, "delivered after reassert");
+}
+
+/// A mempool spend whose *spent prevout* falls in a watched prefix bucket fires
+/// `PrefixMatched` carrying the spend-side `matched_prevouts`. Under the default
+/// `amount` retention tier the prevout value is carried (`has_amount=true`)
+/// while the scriptPubKey stays withheld (empty).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grpc_watch_prefix_spend_carries_amount_default_tier() {
+    let (sn, wallet) = matured_node().await;
+    // Watch a prefix bucket covering the wallet spk: spending its block-1
+    // coinbase puts the spent prevout's script in the bucket (spend side).
+    let wspk = wallet.address.script_pubkey();
+    let prefix = script_prefix_hex(&wspk, 8);
+    let cb = coinbase1(&sn).await;
+    let mut client = GrpcStreamClient::connect(sn.grpc_port()).await;
+    let (_tx, mut stream) = client.watch(vec![add_script_prefixes(&prefix, 8)]).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    broadcast_spend(&sn, &wallet, 0x5a, 10_000).await;
+
+    // A spend-side match carries non-empty matched_prevouts (funding-side is
+    // empty); filter for it explicitly to avoid a prefix-collision funding hit.
+    let ev = next_event_matching(
+        &mut stream,
+        15,
+        |b| matches!(b, Body::PrefixMatched(p) if !p.confirmed && !p.matched_prevouts.is_empty()),
+    )
+    .await;
+    let Some(Body::PrefixMatched(p)) = ev.body else {
+        unreachable!()
+    };
+    // The canonical spend has a single input (the block-1 coinbase), so exactly
+    // one bucketed prevout is carried.
+    assert_eq!(p.matched_prevouts.len(), 1, "single spent input in the bucket");
+    let mp = &p.matched_prevouts[0];
+    // The outpoint is the load-bearing identifier a hash-tier client resolves
+    // against its own UTXO set — assert it points at the spent coinbase.
+    assert_eq!(
+        hex::encode(&mp.outpoint_txid),
+        display_to_internal_hex(&cb),
+        "matched prevout is the block-1 coinbase outpoint"
+    );
+    assert_eq!(mp.outpoint_vout, 0);
+    assert!(mp.has_amount, "default 'amount' tier carries the prevout value");
+    assert_eq!(
+        mp.amount, 5_000_000_000,
+        "block-1 coinbase value (50 BTC regtest subsidy)"
+    );
+    assert!(
+        mp.script_pubkey.is_empty(),
+        "scriptPubKey withheld below the 'full' tier"
+    );
+}
+
+/// With `--stream-prevout-meta=full`, a mempool prefix spend-side match also
+/// carries the spent prevout's full `scriptPubKey` (not just its value).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grpc_watch_prefix_spend_carries_script_full_tier() {
+    let (sn, wallet) = matured_node_args(vec!["--stream-prevout-meta=full"]).await;
+    let wspk = wallet.address.script_pubkey();
+    let prefix = script_prefix_hex(&wspk, 8);
+    let mut client = GrpcStreamClient::connect(sn.grpc_port()).await;
+    let (_tx, mut stream) = client.watch(vec![add_script_prefixes(&prefix, 8)]).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    broadcast_spend(&sn, &wallet, 0x5a, 10_000).await;
+
+    let ev = next_event_matching(
+        &mut stream,
+        15,
+        |b| matches!(b, Body::PrefixMatched(p) if !p.confirmed && !p.matched_prevouts.is_empty()),
+    )
+    .await;
+    let Some(Body::PrefixMatched(p)) = ev.body else {
+        unreachable!()
+    };
+    let mp = &p.matched_prevouts[0];
+    assert!(mp.has_amount && mp.amount == 5_000_000_000);
+    assert_eq!(
+        mp.script_pubkey,
+        wspk.as_bytes(),
+        "'full' tier carries the spent scriptPubKey"
+    );
+}
+
 /// A single-shot depth alarm fires `TxidDepthReached` once the tx is buried to
 /// the requested depth, and not before.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -709,6 +964,45 @@ async fn ws_watch_prefix_funding() {
     let raw = hex::decode(ev["body"]["raw_tx"].as_str().unwrap()).unwrap();
     let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&raw).unwrap();
     assert_eq!(tx.compute_txid().to_string(), spend_txid);
+}
+
+/// WS watch: a mempool spend whose spent prevout falls in a watched prefix
+/// bucket fires `prefix_matched` carrying `matched_prevouts`. Under the default
+/// `amount` tier each entry reports the prevout value with `has_amount=true`
+/// and an empty `script_pubkey` — the #415 WS-side `has_amount` carriage that
+/// lets a JSON client tell "not retained" from a genuine 0-sat prevout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ws_watch_prefix_spend_carries_has_amount() {
+    let (sn, wallet) = matured_node().await;
+    let wspk = wallet.address.script_pubkey();
+    let prefix = script_prefix_hex(&wspk, 8);
+    let mut ws = WsClient::connect(sn.ws_port()).await;
+    ws.send_control(serde_json::json!({
+        "type": "add_script_prefixes",
+        "prefixes": [{"prefix": prefix, "bits": 8}],
+    }))
+    .await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    broadcast_spend(&sn, &wallet, 0x5a, 10_000).await;
+
+    let ev = ws
+        .next_json_matching(15, |v| {
+            v["body"]["category"] == "prefix_matched"
+                && v["body"]["matched_prevouts"]
+                    .as_array()
+                    .is_some_and(|a| !a.is_empty())
+        })
+        .await;
+    let mps = ev["body"]["matched_prevouts"].as_array().unwrap();
+    assert_eq!(mps.len(), 1, "event: {ev}");
+    let mp = &mps[0];
+    assert_eq!(mp["has_amount"], true, "default 'amount' tier carries the value");
+    assert_eq!(mp["amount"].as_u64(), Some(5_000_000_000));
+    assert_eq!(
+        mp["script_pubkey"], "",
+        "scriptPubKey withheld below the 'full' tier"
+    );
 }
 
 /// WS watch: an RBF replacement of a watched tx → `txid_replaced`.
@@ -929,26 +1223,49 @@ async fn first_live_block_instance(sn: &StreamingNode) -> u64 {
     ev.cursor.expect("block event carries a cursor").instance_id
 }
 
-/// A mid-stream `SetCursor` control on `Watch` is a deliberate no-op: the
-/// stream stays open and subsequent watches still fire.
+/// A mid-stream `SetCursor` control on `Watch` re-anchors the stream (§7.3.1,
+/// changed in #416 from the former deliberate no-op): it replays confirmed
+/// chain history forward from the cursor, draining that batch in height order
+/// before resuming the live tail.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn grpc_watch_set_cursor_is_noop() {
-    let (sn, wallet) = matured_node().await;
-    let cb = coinbase1(&sn).await;
+async fn grpc_watch_set_cursor_re_anchors_replaying_history() {
+    let sn = start_streaming_async(vec![]).await;
+    mine_n(&sn, 5).await; // tip = 5, all mined before the subscription opens
     let mut client = GrpcStreamClient::connect(sn.grpc_port()).await;
-    // Open with a SetCursor (no-op), then add a real watch.
-    let set_cursor = SubscribeControl {
-        msg: Some(Control::SetCursor(satd_events::proto::v1::SetCursor {
-            cursor: Some(cursor(1)),
-        })),
-    };
-    let (tx, mut stream) = client.watch(vec![set_cursor]).await;
-    tx.send(add_outpoints(&[(&cb, 0)])).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(600)).await;
 
-    broadcast_spend(&sn, &wallet, 0x61, 10_000).await;
-    // The stream survived the no-op SetCursor and still delivers the match.
-    next_event_matching(&mut stream, 15, |b| matches!(b, Body::OutpointSpent(_))).await;
+    // Open a live Watch (no initial watch items), let it settle, then re-anchor.
+    let (tx, mut stream) = client.watch(vec![]).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    // Mid-stream SetCursor to height 2 ⇒ confirmed 3, 4, 5 are replayed. These
+    // blocks predate the subscription, so they can only arrive via the replay.
+    tx.send(SubscribeControl {
+        msg: Some(Control::SetCursor(satd_events::proto::v1::SetCursor {
+            cursor: Some(cursor(2)),
+        })),
+    })
+    .await
+    .unwrap();
+
+    let mut heights = Vec::new();
+    for _ in 0..3 {
+        let ev = next_event_matching(&mut stream, 15, is_block_connected).await;
+        heights.push(block_height(&ev.body.unwrap()).unwrap());
+    }
+    assert_eq!(
+        heights,
+        vec![3, 4, 5],
+        "SetCursor re-anchor replays confirmed history in height order"
+    );
+
+    // drain→resume: a live block after the replay still arrives, exactly once.
+    mine_n(&sn, 1).await;
+    let ev = next_event_matching(&mut stream, 15, is_block_connected).await;
+    assert_eq!(
+        block_height(&ev.body.unwrap()),
+        Some(6),
+        "live tail resumes after the replay batch"
+    );
 }
 
 // ===========================================================================
