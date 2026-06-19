@@ -16,7 +16,7 @@ use satd_events_client::{
 };
 
 use crate::common::{
-    block1_coinbase_txid, build_signed_p2wpkh_spend_seq, display_to_internal_hex,
+    block1_coinbase_txid, build_signed_p2wpkh_spend_seq, display_to_internal_hex, e2e_test_timeout,
     DeterministicWallet, StreamingNode,
 };
 
@@ -83,13 +83,13 @@ async fn connect(sn: &StreamingNode) -> StreamClient {
         .expect("SDK connects to the gRPC listener")
 }
 
-/// The next event satisfying `pred`, within an overall deadline.
+/// The next event satisfying `pred`, within an overall deadline (scaled by
+/// `SATD_E2E_TIMEOUT_MULT` under CI load, like the rest of the suite).
 async fn next_matching(
     stream: &mut satd_events_client::EventStream,
     secs: u64,
     mut pred: impl FnMut(&Event) -> bool,
 ) -> Event {
-    let deadline = Duration::from_secs(secs);
     let fut = async {
         loop {
             let ev = stream.message().await.expect("no stream error").expect("not closed");
@@ -98,7 +98,7 @@ async fn next_matching(
             }
         }
     };
-    tokio::time::timeout(deadline, fut).await.expect("matching event within timeout")
+    tokio::time::timeout(e2e_test_timeout(secs), fut).await.expect("matching event within timeout")
 }
 
 fn txid_internal(display_hex: &str) -> [u8; 32] {
@@ -188,8 +188,7 @@ async fn sdk_prefix_watch_local_refilter() {
     // Collect prefix deliveries until one re-filters to a true funding hit on
     // our script (the bucket may also carry decoys / the spend side).
     let dest_sh = satd_events_client::scripthash_of(dest.as_bytes());
-    let deadline = Duration::from_secs(15);
-    let found = tokio::time::timeout(deadline, async {
+    let found = tokio::time::timeout(e2e_test_timeout(15), async {
         loop {
             let ev = stream.message().await.expect("no error").expect("open");
             if let Event::PrefixMatched(m) = ev {
@@ -282,7 +281,7 @@ async fn next_resilient(
             }
         }
     };
-    tokio::time::timeout(Duration::from_secs(secs), fut)
+    tokio::time::timeout(e2e_test_timeout(secs), fut)
         .await
         .expect("event within timeout")
         .expect("no stream error")
