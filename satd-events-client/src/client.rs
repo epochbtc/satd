@@ -247,14 +247,18 @@ impl WatchHandle {
     /// Arm single-shot depth alarms over the **cross product** of `txids` and
     /// `depths`: each txid fires `TxidDepthReached` once it is `depth`
     /// confirmations deep, then self-evicts. Charges one unit per (txid, depth).
-    /// Depths must be >= 1 (the server drops 0).
+    ///
+    /// Depths must be `>= 1`; depths `< 1` are dropped client-side. If that
+    /// leaves no valid depths (or no txids), this is a no-op — importantly, it
+    /// does **not** send an empty `min_depths`, which the server would otherwise
+    /// reinterpret as a *lifecycle* add rather than a depth alarm.
     pub async fn add_depth_alarms(
         &self,
         txids: impl IntoIterator<Item = [u8; 32]>,
         depths: impl IntoIterator<Item = u32>,
     ) -> Result<(), StreamError> {
         let txids: Vec<Vec<u8>> = txids.into_iter().map(|t| t.to_vec()).collect();
-        let min_depths: Vec<u32> = depths.into_iter().collect();
+        let min_depths: Vec<u32> = depths.into_iter().filter(|d| *d >= 1).collect();
         if txids.is_empty() || min_depths.is_empty() {
             return Ok(());
         }
@@ -267,13 +271,16 @@ impl WatchHandle {
     }
 
     /// Remove depth alarms over the cross product of `txids` and `depths`.
+    /// Depths `< 1` are dropped client-side; an all-invalid (or empty) call is a
+    /// no-op and never sends an empty `min_depths` (which would target lifecycle
+    /// watches instead).
     pub async fn remove_depth_alarms(
         &self,
         txids: impl IntoIterator<Item = [u8; 32]>,
         depths: impl IntoIterator<Item = u32>,
     ) -> Result<(), StreamError> {
         let txids: Vec<Vec<u8>> = txids.into_iter().map(|t| t.to_vec()).collect();
-        let min_depths: Vec<u32> = depths.into_iter().collect();
+        let min_depths: Vec<u32> = depths.into_iter().filter(|d| *d >= 1).collect();
         if txids.is_empty() || min_depths.is_empty() {
             return Ok(());
         }
@@ -356,6 +363,11 @@ impl WatchHandle {
     /// Mid-stream re-anchor: replay confirmed history forward from `cursor`, then
     /// resume live, without tearing down the watch-set. Rate-limited per
     /// principal; only one re-anchor drains at a time.
+    ///
+    /// **Best-effort:** `Ok(())` means the request was sent, not that the
+    /// re-anchor ran. The server silently drops an over-rate or concurrent
+    /// re-anchor (no error is returned), so do not rely on this for critical
+    /// resynchronization — for that, reconnect with `from_cursor`.
     pub async fn set_cursor(&self, cursor: Cursor) -> Result<(), StreamError> {
         self.send_msg(pb::subscribe_control::Msg::SetCursor(pb::SetCursor {
             cursor: Some(cursor),
@@ -553,6 +565,9 @@ mod tests {
         h.add_outpoints([]).await.unwrap();
         h.add_depth_alarms([[1u8; 32]], []).await.unwrap(); // empty depths
         h.add_depth_alarms([], [3]).await.unwrap(); // empty txids
+        // depths < 1 are filtered out; an all-invalid call must NOT send an
+        // empty min_depths (the server would treat that as a lifecycle add).
+        h.add_depth_alarms([[1u8; 32]], [0]).await.unwrap();
         assert!(rx.try_recv().is_err(), "no message should have been sent");
     }
 
