@@ -4114,8 +4114,8 @@ dependencies = [
  "miniscript",
  "node",
  "prost",
- "protoc-bin-vendored",
  "satd-auth",
+ "satd-events-proto",
  "serde",
  "serde_json",
  "tempfile",
@@ -4123,9 +4123,18 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic",
- "tonic-build",
  "tracing",
  "zeromq",
+]
+
+[[package]]
+name = "satd-events-proto"
+version = "0.4.0-pre"
+dependencies = [
+ "prost",
+ "protoc-bin-vendored",
+ "tonic",
+ "tonic-build",
 ]
 
 [[package]]
