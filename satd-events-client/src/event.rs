@@ -257,6 +257,20 @@ pub enum Event {
         /// The anchor to resume from to recover the gap.
         resume_cursor: Option<Cursor>,
     },
+    /// **SDK-synthesized — not a wire event.** Emitted by
+    /// [`ResilientSubscription`](crate::ResilientSubscription) when a durable
+    /// replay was clamped by the server to the most recent `MAX_REPLAY_BLOCKS`
+    /// (10,000) blocks, so the confirmed history in `(resume_height,
+    /// first_height)` was skipped. The live stream continues correctly from
+    /// `first_height`; the gap is unrecoverable via this stream, so full-resync
+    /// the skipped range from another source (e.g. RPC `getblock`). Emitted once
+    /// per resume, immediately before the first replayed block.
+    ReplayGap {
+        /// The height the resume cursor expected next (`cursor.height + 1`).
+        resume_height: u32,
+        /// The first height the server actually delivered (`> resume_height`).
+        first_height: u32,
+    },
     /// A body this client build does not recognize (a newer server arm), or an
     /// event with no body set. Ignored by well-behaved consumers.
     Unknown,

@@ -20,11 +20,11 @@ satd-events-proto = { path = "../satd-events-proto" }
 tonic = { workspace = true }
 prost = { workspace = true }
 # Declare the SDK's own minimum tokio surface rather than inheriting the
-# workspace `full` set: the library itself only uses `tokio::sync` (the mpsc
-# control channel). tonic pulls in the runtime/net features it needs. This keeps
-# the published dependency self-sufficient and lean instead of relying on
-# downstream feature unification.
-tokio = { version = "1", default-features = false, features = ["sync"] }
+# workspace `full` set: the library uses `tokio::sync` (the mpsc control
+# channel) and `tokio::time` (reconnect backoff sleeps). tonic pulls in the
+# runtime/net features it needs. This keeps the published dependency
+# self-sufficient and lean instead of relying on downstream feature unification.
+tokio = { version = "1", default-features = false, features = ["sync", "time"] }
 tokio-stream = { workspace = true }
 thiserror = { workspace = true }
 bitcoin = { workspace = true, optional = true }

@@ -509,6 +509,20 @@ impl StreamClient {
         Ok(EventStream { inner, last_cursor: None })
     }
 
+    /// Open a reconnect-and-replay-aware firehose. Unlike [`subscribe`](Self::subscribe),
+    /// the returned [`ResilientSubscription`](crate::ResilientSubscription)
+    /// reconnects with backoff, persists and replays the resume cursor, recovers
+    /// from `Lagged` per the [`LagPolicy`](crate::LagPolicy), and surfaces
+    /// replay-truncation gaps. Connects lazily on the first
+    /// [`next`](crate::ResilientSubscription::next).
+    pub fn resilient_subscribe(
+        &self,
+        opts: SubscribeOptions,
+        config: crate::ResilientConfig,
+    ) -> crate::ResilientSubscription {
+        crate::ResilientSubscription::new(self.clone(), opts, config)
+    }
+
     /// Open a bidirectional watch stream, returning a [`WatchHandle`] to send
     /// control messages and an [`EventStream`] of matches + firehose.
     pub async fn watch(&mut self) -> Result<(WatchHandle, EventStream), StreamError> {
