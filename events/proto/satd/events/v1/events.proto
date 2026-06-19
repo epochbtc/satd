@@ -22,9 +22,16 @@ service NodeEventStream {
 // so new watch kinds slot in without a protocol break.
 message SubscribeControl {
   oneof msg {
-    // Replay anchor. Reserved for parity with Subscribe.from_cursor;
-    // durable replay on the Watch stream is not yet served — use
-    // Subscribe(from_cursor) for replay. Accepted and logged for now.
+    // Mid-stream re-anchor. Replays confirmed history forward from this
+    // cursor (snapshot→live handoff, same as Subscribe.from_cursor) and then
+    // resumes the live firehose, without tearing down the watch-set (its
+    // quota leases are held across the re-anchor). Replayed confirmed events
+    // are emitted in height order ahead of the resumed live tail; the client
+    // de-duplicates the overlap by (height, hash). Historical watch *matches*
+    // are not replayed — the client reconstructs them from the replayed
+    // blocks against its own watch-set. Rate-limited per principal; at most
+    // one re-anchor drains at a time (a SetCursor arriving mid-drain is
+    // dropped).
     SetCursor       set_cursor       = 1;
     // Adjust the live firehose category bitfield (mempool=1, chain=2,
     // heartbeat=4; 0 = all). Applies immediately.
