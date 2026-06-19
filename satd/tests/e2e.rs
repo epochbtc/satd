@@ -17,6 +17,12 @@ mod common;
 // auto-discover it as a separate top-level integration target.
 #[path = "e2e/streaming.rs"]
 mod streaming;
+// Rust SDK (`satd-events-client`) E2E: the same real-node harness, driven
+// through the published client instead of the hand-rolled gRPC test client —
+// proving the SDK's subscribe / watch / cursor-replay / prefix-refilter paths
+// against a live `satd`.
+#[path = "e2e/sdk.rs"]
+mod sdk;
 
 use common::{
     DeterministicWallet, TestNode, build_signed_p2wpkh_spend_from_block1_coinbase,
