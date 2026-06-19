@@ -2186,6 +2186,44 @@ mod tests {
         }
     }
 
+    /// The events TLS acceptor registers its leaf cert/key in the shared
+    /// `tls-config` reload registry, so SIGUSR1 (`reload_all_certs`) hot-reloads
+    /// it alongside the RPC / Electrum / Esplora surfaces — no per-surface
+    /// wiring. Guards against a future refactor to `with_single_cert`, which
+    /// would silently drop the events surface from SIGUSR1 reload.
+    #[tokio::test]
+    async fn bind_with_tls_registers_for_sigusr1_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert_path, key_path, _ck) = self_signed_to_files(dir.path());
+        // The registry is process-global and append-only, so other tests can
+        // only push the count higher — `>= before + 1` is race-safe.
+        let before = tls_config::registered_cert_count();
+        let publisher = EventPublisher::new(edge(), 16);
+        let _sink = GrpcEventSink::bind(
+            "127.0.0.1:0",
+            false,
+            publisher,
+            GrpcLimits::default(),
+            None,
+            None,
+            None,
+            Some(GrpcTlsParams {
+                cert_path,
+                key_path,
+                mtls_enabled: false,
+                mtls_client_ca: None,
+                mtls_client_allow: vec![],
+                handshake_timeout: Duration::from_secs(5),
+            }),
+        )
+        .await
+        .expect("TLS bind should succeed");
+        assert!(
+            tls_config::registered_cert_count() >= before + 1,
+            "events TLS bind must register a reloadable cert/key for SIGUSR1",
+        );
+    }
+
     #[test]
     fn region_serialization_trims_padding() {
         let stamp = node::events::EdgeStamp {
