@@ -109,16 +109,34 @@ impl WatchHandle {
 }
 
 /// Builder for a [`StreamClient`].
-#[derive(Debug, Clone)]
+///
+/// `Debug` is hand-written to redact the bearer token — never derive it here.
+#[derive(Clone)]
 pub struct StreamClientBuilder {
     endpoint: String,
     token: Option<String>,
     keepalive: Option<(Duration, Duration)>,
 }
 
+impl std::fmt::Debug for StreamClientBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamClientBuilder")
+            .field("endpoint", &self.endpoint)
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .field("keepalive", &self.keepalive)
+            .finish()
+    }
+}
+
 impl StreamClientBuilder {
     /// Attach a bearer token, sent as `authorization: Bearer <token>` metadata
     /// on every RPC.
+    ///
+    /// The token is only honored when the server enforces auth
+    /// (`-eventsgrpcauth`); a no-auth (loopback-trust) server ignores it. **This
+    /// build does not use TLS**, so over a plaintext `http://` endpoint the token
+    /// travels in cleartext — only use it over loopback or through a
+    /// TLS-terminating proxy until TLS support lands.
     pub fn bearer_token(mut self, token: impl Into<String>) -> Self {
         self.token = Some(token.into());
         self
@@ -164,10 +182,20 @@ impl StreamClientBuilder {
 }
 
 /// An async client for the satd `satd.events.v1` streaming API.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is hand-written to redact the auth credential — never derive it here.
+#[derive(Clone)]
 pub struct StreamClient {
     inner: NodeEventStreamClient<Channel>,
     auth: Option<MetadataValue<Ascii>>,
+}
+
+impl std::fmt::Debug for StreamClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamClient")
+            .field("auth", &self.auth.as_ref().map(|_| "<redacted>"))
+            .finish_non_exhaustive()
+    }
 }
 
 impl StreamClient {

@@ -19,10 +19,14 @@ bitcoin = ["dep:bitcoin"]
 satd-events-proto = { path = "../satd-events-proto" }
 tonic = { workspace = true }
 prost = { workspace = true }
-tokio = { workspace = true }
+# Declare the SDK's own minimum tokio surface rather than inheriting the
+# workspace `full` set: the library itself only uses `tokio::sync` (the mpsc
+# control channel). tonic pulls in the runtime/net features it needs. This keeps
+# the published dependency self-sufficient and lean instead of relying on
+# downstream feature unification.
+tokio = { version = "1", default-features = false, features = ["sync"] }
 tokio-stream = { workspace = true }
 thiserror = { workspace = true }
-tracing = { workspace = true }
 bitcoin = { workspace = true, optional = true }
 
 [dev-dependencies]

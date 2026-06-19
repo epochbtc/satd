@@ -307,16 +307,19 @@ impl From<pb::NodeEvent> for Event {
                 depth: t.depth,
                 height: t.height,
             },
-            Body::PrefixMatched(p) => Event::PrefixMatched(PrefixMatch {
-                prefix: p
-                    .prefix
-                    .map(|sp| ScriptPrefix { prefix: sp.prefix, bits: sp.bits })
-                    .unwrap_or(ScriptPrefix { prefix: Vec::new(), bits: 0 }),
-                raw_tx: p.raw_tx,
-                confirmed: p.confirmed,
-                height: p.height,
-                matched_prevouts: p.matched_prevouts.into_iter().map(Into::into).collect(),
-            }),
+            // A PrefixMatched without its bucket is a degenerate message the
+            // local re-filter cannot use (bits:0 matches nothing meaningfully);
+            // surface it as Unknown rather than a structurally-valid-looking 0.
+            Body::PrefixMatched(p) => match p.prefix {
+                Some(sp) => Event::PrefixMatched(PrefixMatch {
+                    prefix: ScriptPrefix { prefix: sp.prefix, bits: sp.bits },
+                    raw_tx: p.raw_tx,
+                    confirmed: p.confirmed,
+                    height: p.height,
+                    matched_prevouts: p.matched_prevouts.into_iter().map(Into::into).collect(),
+                }),
+                None => Event::Unknown,
+            },
             Body::Lagged(l) => Event::Lagged {
                 dropped_count: l.dropped_count,
                 resume_cursor: l.resume_cursor,
