@@ -31,12 +31,19 @@ use crate::error::StreamError;
 use crate::event::{Cursor, Event};
 
 /// Persists the durable resume [`Cursor`] across reconnects and process
-/// restarts. The resilience loop loads it on (re)connect and saves it as
-/// confirmed events advance.
+/// restarts. The resilience loop loads it on (re)connect and persists it
+/// **commit-on-poll**: a delivered event's cursor is written only on the *next*
+/// [`next`](ResilientSubscription::next) call, i.e. once the caller has come
+/// back for the following event (an implicit ack). The store therefore never
+/// advances past an event the caller has not yet received, so a crash
+/// mid-processing replays that event on resume — at-least-once, not at-most-once.
+/// (A consumer that needs exactly-once still dedups on its own side keyed by the
+/// `(height, hash)` it processes.)
 ///
-/// Implementations must be cheap to call and may be invoked once per confirmed
-/// event; back them with interior mutability (the methods take `&self`). A
-/// failing `save` is surfaced to the caller of
+/// Implementations must be cheap to call and may be invoked roughly once per
+/// delivered confirmed cursor (redundant writes for unchanged cursors are
+/// elided by the loop); back them with interior mutability (the methods take
+/// `&self`). A failing `save` is surfaced to the caller of
 /// [`next`](ResilientSubscription::next) rather than silently swallowed — a
 /// store that cannot persist would otherwise replay from a stale anchor after a
 /// crash.
@@ -284,8 +291,19 @@ pub struct ResilientSubscription {
     /// checked (live blocks are contiguous; we only test the replay seam).
     expect_first_height: Option<u32>,
     /// An event held back so a synthetic [`Event::ReplayGap`] can be delivered
-    /// ahead of the block that triggered it.
-    pending: Option<Event>,
+    /// ahead of the block that triggered it, paired with that block's cursor
+    /// (applied to the high-water only when the block is actually delivered, so
+    /// the commit never runs ahead of delivery).
+    pending: Option<(Event, Option<Cursor>)>,
+    /// The high-water cursor of the most recently *delivered* event, to be
+    /// persisted on the next [`next`](Self::next) call. Commit-on-poll: the
+    /// caller returning for the next event is its ack of the previous one, so the
+    /// store never advances past an event the caller has not yet had in hand —
+    /// giving at-least-once delivery across a crash rather than at-most-once.
+    commit_next: Option<Cursor>,
+    /// The cursor last written to the store, to skip redundant writes (e.g. a run
+    /// of mempool events that do not move the confirmed high-water).
+    committed: Option<Cursor>,
     /// Count of consecutive reconnects that have produced **no** event yet. Reset
     /// to 0 the moment a connection delivers any event ("made progress"), and
     /// incremented every time a connection fails to establish or ends without
@@ -311,6 +329,8 @@ impl ResilientSubscription {
             resume: None,
             expect_first_height: None,
             pending: None,
+            commit_next: None,
+            committed: None,
             reconnect_attempts: 0,
             last_error: None,
         }
@@ -335,7 +355,25 @@ impl ResilientSubscription {
     /// reconnects promptly while a flapping server is backed off and eventually
     /// bounded by `max_retries`.
     pub async fn next(&mut self) -> Result<Event, StreamError> {
-        if let Some(ev) = self.pending.take() {
+        // Commit-on-poll: persist the previously-delivered event's high-water
+        // cursor now that the caller has come back for the next one (an implicit
+        // ack). This is the only place the store advances, so it can never run
+        // ahead of an event the caller has actually received — at-least-once, not
+        // at-most-once. A crash mid-processing leaves the store at the prior
+        // event, which the server replays on resume.
+        if let Some(c) = self.commit_next.take()
+            && self.committed != Some(c)
+        {
+            self.config.cursor_store.save(c)?;
+            self.committed = Some(c);
+        }
+        if let Some((ev, cur)) = self.pending.take() {
+            // The stashed block is delivered now: advance the high-water and arm
+            // its commit for the next poll (not before).
+            if let Some(c) = cur {
+                self.resume = Some(c);
+            }
+            self.commit_next = self.resume;
             return Ok(ev);
         }
         loop {
@@ -374,7 +412,16 @@ impl ResilientSubscription {
                     // the next reconnect (if any) starts fresh.
                     self.reconnect_attempts = 0;
                     self.last_error = None;
-                    if let Some(out) = self.handle_event(ev).await? {
+                    // Capture the cursor this message carries before handling it,
+                    // so `handle_event` can decide the gap seam without advancing
+                    // the high-water prematurely.
+                    let cur = self.stream.as_ref().and_then(|s| s.cursor().copied());
+                    if let Some(out) = self.handle_event(ev, cur).await? {
+                        // Arm the delivered event's high-water for commit on the
+                        // next poll (the ReplayGap path leaves `resume` unchanged
+                        // and stashes the block, so its cursor commits only when
+                        // the block itself is delivered).
+                        self.commit_next = self.resume;
                         return Ok(out);
                     }
                     // Event consumed internally (auto-resumed lag): loop.
@@ -395,30 +442,32 @@ impl ResilientSubscription {
         }
     }
 
-    /// Process one inbound event. Returns `Ok(Some(ev))` to hand to the caller,
+    /// Process one inbound event, given the cursor (`cur`) the carrying message
+    /// advanced the stream to. Returns `Ok(Some(ev))` to hand to the caller,
     /// `Ok(None)` if it was handled internally (auto-resume), or an error to
     /// propagate (a failed cursor `save`).
-    async fn handle_event(&mut self, ev: Event) -> Result<Option<Event>, StreamError> {
-        // Capture and persist the advancing confirmed cursor.
-        if let Some(stream) = self.stream.as_ref()
-            && let Some(c) = stream.cursor()
-            && self.resume.as_ref() != Some(c)
-        {
-            let c = *c;
-            self.resume = Some(c);
-            self.config.cursor_store.save(c)?;
-        }
-
+    ///
+    /// The confirmed high-water (`self.resume`) is advanced here but **not**
+    /// persisted — persistence is deferred to the next [`next`](Self::next) poll
+    /// (commit-on-poll). The gap check runs *before* the advance so a clamped
+    /// replay stashes the triggering block without moving the high-water past it.
+    async fn handle_event(
+        &mut self,
+        ev: Event,
+        cur: Option<Cursor>,
+    ) -> Result<Option<Event>, StreamError> {
         // Replay-truncation check: only on the first confirmed-height event after
         // a resume. A `BlockConnected` whose height exceeds the expected next
-        // height means the server clamped the replay window.
+        // height means the server clamped the replay window. Stash the block with
+        // its cursor and emit the gap notice first — the high-water is advanced to
+        // this block only when it is actually delivered (next poll), so the commit
+        // never runs ahead of delivery.
         if let Some(expect) = self.expect_first_height
             && let Event::BlockConnected { height, .. } = ev
         {
             self.expect_first_height = None;
             if height > expect {
-                // Hand back the gap notice now; deliver the block next call.
-                self.pending = Some(ev);
+                self.pending = Some((ev, cur));
                 return Ok(Some(Event::ReplayGap {
                     resume_height: expect,
                     first_height: height,
@@ -426,12 +475,24 @@ impl ResilientSubscription {
             }
         }
 
+        // Advance the in-memory high-water (used for live reconnect); not yet
+        // persisted.
+        if let Some(c) = cur {
+            self.resume = Some(c);
+        }
+
         match ev {
             Event::Lagged { resume_cursor, .. } if self.config.lag_policy == LagPolicy::AutoResume => {
-                // Re-anchor from the notice's cursor (if any), then reconnect.
+                // Re-anchor from the notice's cursor (if any), then reconnect. A
+                // lag re-anchor is a recovery point the server handed us, not
+                // caller-delivered data, so persist it immediately (and supersede
+                // any deferred commit) — a crash then resumes from the same place
+                // the live re-anchor would.
                 if let Some(c) = resume_cursor {
                     self.resume = Some(c);
                     self.config.cursor_store.save(c)?;
+                    self.committed = Some(c);
+                    self.commit_next = None;
                 }
                 self.stream = None;
                 Ok(None)
