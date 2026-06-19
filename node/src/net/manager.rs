@@ -1321,23 +1321,30 @@ impl PeerManager {
         );
     }
 
-    /// Listen for inbound connections.
-    pub async fn listen(self: &Arc<Self>, bind_addr: SocketAddr) -> Result<(), String> {
-        self.listen_with_perms(bind_addr, crate::net::permissions::NetPermissions::NONE)
+    /// Bind the inbound P2P listener, returning the bound socket.
+    ///
+    /// Separated from the accept loop ([`Self::accept_loop`]) so the caller
+    /// can treat a bind failure — port already in use (another satd instance),
+    /// permission denied, bad address — as a *fatal* startup error rather than
+    /// discovering it asynchronously after the daemon already reported a clean
+    /// start. The accept loop never returns, so folding bind into it makes the
+    /// only observable failure a log line on a detached task.
+    pub async fn bind_listener(bind_addr: SocketAddr) -> Result<TcpListener, String> {
+        TcpListener::bind(bind_addr)
             .await
+            .map_err(|e| format!("listen failed: {}", e))
     }
 
-    /// Listen on `bind_addr`, granting every peer accepted here
-    /// `bind_perms` (Bitcoin Core's `-whitebind`).
-    pub async fn listen_with_perms(
+    /// Run the inbound accept loop on an already-bound listener, granting every
+    /// peer accepted here `bind_perms` (Bitcoin Core's `-whitebind`). Never
+    /// returns under normal operation.
+    pub async fn accept_loop(
         self: &Arc<Self>,
-        bind_addr: SocketAddr,
+        listener: TcpListener,
         bind_perms: crate::net::permissions::NetPermissions,
-    ) -> Result<(), String> {
-        let listener = TcpListener::bind(bind_addr)
-            .await
-            .map_err(|e| format!("listen failed: {}", e))?;
-        tracing::info!(%bind_addr, whitebind = bind_perms.any(), "P2P listening");
+    ) {
+        let bind_addr = listener.local_addr().ok();
+        tracing::info!(?bind_addr, whitebind = bind_perms.any(), "P2P listening");
 
         loop {
             match listener.accept().await {
@@ -1349,6 +1356,26 @@ impl PeerManager {
                 }
             }
         }
+    }
+
+    /// Bind and serve inbound connections in one call. Convenience wrapper over
+    /// [`Self::bind_listener`] + [`Self::accept_loop`]; a bind failure surfaces
+    /// as `Err` before the loop starts.
+    pub async fn listen(self: &Arc<Self>, bind_addr: SocketAddr) -> Result<(), String> {
+        self.listen_with_perms(bind_addr, crate::net::permissions::NetPermissions::NONE)
+            .await
+    }
+
+    /// Bind and serve inbound connections, granting `bind_perms` to every peer
+    /// accepted (Bitcoin Core's `-whitebind`). See [`Self::listen`].
+    pub async fn listen_with_perms(
+        self: &Arc<Self>,
+        bind_addr: SocketAddr,
+        bind_perms: crate::net::permissions::NetPermissions,
+    ) -> Result<(), String> {
+        let listener = Self::bind_listener(bind_addr).await?;
+        self.accept_loop(listener, bind_perms).await;
+        Ok(())
     }
 
     /// Disconnect a peer by address.
@@ -6478,6 +6505,23 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "an immediate second request falls inside the cooldown and is ignored"
+        );
+    }
+
+    /// `bind_listener` must surface a bind failure as `Err` *before* any accept
+    /// loop starts, so the startup path can treat a port collision (a second
+    /// satd instance) as fatal instead of logging it on a detached task.
+    #[tokio::test]
+    async fn bind_listener_reports_port_collision() {
+        // Bind an ephemeral port, then try to bind the same addr again.
+        let first = PeerManager::bind_listener("127.0.0.1:0".parse().unwrap())
+            .await
+            .expect("first bind on an ephemeral port succeeds");
+        let addr = first.local_addr().unwrap();
+        let second = PeerManager::bind_listener(addr).await;
+        assert!(
+            second.is_err(),
+            "binding an already-bound address must return Err, not panic or succeed"
         );
     }
 }
