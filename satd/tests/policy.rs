@@ -97,6 +97,15 @@ const RUNES_TEMPLATE_ONLY: &str = "version 1\nquarantine runes on template when 
 /// acting mempool even without `--acceptnonstdtxn`.
 const ALLOW_FORGIVES_DUST: &str = "version 1\nallow forgive-dust when count outputs (out.is_dust and out.script_type != p2a) >= 5\n";
 
+/// A single runes rule with the default (both-axes) scope. Used by the gossip
+/// tests that need a relay+template quarantine without other cookbook rules
+/// interfering with the crafted transactions.
+const RUNES_BOTH: &str = "version 1\nquarantine runes when any outputs (out.script.contains_ops(script(OP_RETURN OP_PUSHNUM_13 *)))\n";
+
+/// An empty (rule-less) ruleset — a valid `version 1` policy that matches
+/// nothing. Reloading a node onto this promotes everything it was holding.
+const EMPTY_POLICY: &str = "version 1\n";
+
 /// Regtest coinbase subsidy for blocks 1..=150 (no halving before 150): 50 BTC.
 const CB_VALUE_SAT: u64 = 50 * 100_000_000;
 
@@ -340,6 +349,70 @@ fn build_big_witness_tx(node: &TestNode, wallet: &DeterministicWallet, cb_height
         hex::encode(bitcoin::consensus::serialize(&tx)),
         tx.compute_txid().to_string(),
     )
+}
+
+/// Build + sign a P2WPKH spend of an arbitrary wallet-owned output
+/// `(prev_txid, vout)` worth `prev_value`, paying `fee_sat` and returning the
+/// rest to the wallet. Used to build a child that spends a parent's change
+/// output (for infectious-descendant propagation). Returns `(raw_hex, txid)`.
+fn build_child_spend(
+    wallet: &DeterministicWallet,
+    prev_txid: &str,
+    vout: u32,
+    prev_value: u64,
+    fee_sat: u64,
+) -> (String, String) {
+    use bitcoin::hashes::Hash as _;
+    use bitcoin::secp256k1::{Message, Secp256k1};
+    use bitcoin::sighash::{EcdsaSighashType, SighashCache};
+
+    let prev = bitcoin::Txid::from_str(prev_txid).expect("prev txid");
+    let mut spend = Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint { txid: prev, vout },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![payment_output(wallet, prev_value - fee_sat)],
+    };
+    let secp = Secp256k1::new();
+    let src_script = wallet.address.script_pubkey();
+    let mut cache = SighashCache::new(&spend);
+    let sighash = cache
+        .p2wpkh_signature_hash(0, &src_script, Amount::from_sat(prev_value), EcdsaSighashType::All)
+        .expect("sighash");
+    let msg = Message::from_digest(sighash.to_byte_array());
+    let sig = secp.sign_ecdsa(&msg, &wallet.sk);
+    let mut sig_bytes = sig.serialize_der().to_vec();
+    sig_bytes.push(EcdsaSighashType::All as u8);
+    let mut witness = Witness::new();
+    witness.push(sig_bytes);
+    witness.push(wallet.pk.to_bytes());
+    spend.input[0].witness = witness;
+    (
+        hex::encode(bitcoin::consensus::serialize(&spend)),
+        spend.compute_txid().to_string(),
+    )
+}
+
+/// Overwrite a policy file's contents in place (for SIGHUP reload tests).
+fn rewrite_policy(pf: &PolicyFile, src: &str) {
+    use std::io::Write as _;
+    let mut f = std::fs::File::create(&pf.path).expect("rewrite policy file");
+    f.write_all(src.as_bytes()).expect("write policy file");
+}
+
+/// Send `SIGHUP` to a node to trigger a live config (and policyfile) reload.
+fn sighup(node: &TestNode) {
+    let pid = node.process.id();
+    let status = std::process::Command::new("kill")
+        .args(["-HUP", &pid.to_string()])
+        .status()
+        .expect("send SIGHUP");
+    assert!(status.success(), "kill -HUP failed");
 }
 
 // ---------------------------------------------------------------------------
@@ -890,6 +963,165 @@ fn layer_c_allow_own_submission_but_quarantine_when_gossiped() {
         "gossiped runestone not quarantined on B",
     );
     assert!(!mempool_has(&node_b, &txid2), "gossiped runestone leaked into B mempool");
+
+    node_a.stop();
+    node_b.stop();
+}
+
+#[test]
+fn layer_c_infectious_descendant_inherits_quarantine_when_gossiped() {
+    let wallet = test_wallet();
+    let mut node_a = TestNode::start(&[]);
+    let pf = write_policy(RUNES_BOTH);
+    let mut node_b = TestNode::start(&[
+        &format!("--connect=127.0.0.1:{}", p2p_port(&node_a)),
+        &format!("--policyfile={}", pf.path.display()),
+        "--acceptnonstdtxn",
+    ]);
+    assert_policy_loaded(&node_b);
+    poll_until(
+        || get_rpc_u64(&node_a, "getconnectioncount").unwrap_or(0) >= 1,
+        test_timeout(30),
+        "A and B did not connect",
+    );
+    mine_to(&node_a, 110, &wallet);
+    wait_height(&node_b, 110, "B did not sync to A");
+
+    // Parent: a runestone — quarantined on B (relay+template). Its change output
+    // (vout 1) is a spendable P2WPKH output.
+    let (parent_raw, parent_txid) = build_spend(&node_a, &wallet, 1, vec![runestone_output()], 1_000);
+    send_ok(&node_a, &parent_raw);
+    poll_until(|| quarantine_has(&node_b, &parent_txid), test_timeout(30), "parent not quarantined on B");
+
+    // Child: a plain payment spending the parent's change. It matches no rule on
+    // its own, but its parent is quarantined in B's mempool ⇒ it inherits the
+    // parent's scope (infectious-descendant propagation, §3).
+    let parent_change = CB_VALUE_SAT - 1_000; // outputs[0]=runestone(0); change at vout 1
+    let (child_raw, child_txid) = build_child_spend(&wallet, &parent_txid, 1, parent_change, 1_000);
+    send_ok(&node_a, &child_raw);
+    poll_until(|| quarantine_has(&node_b, &child_txid), test_timeout(30), "child not quarantined on B");
+
+    let qe = node_b
+        .rpc_call_with_params("getquarantineentry", vec![json!(child_txid)])
+        .expect("getquarantineentry");
+    assert_eq!(qe["result"]["scope"]["relay"], json!(true), "child relay scope: {qe}");
+    assert_eq!(qe["result"]["scope"]["template"], json!(true), "child template scope: {qe}");
+    let depends: Vec<String> = qe["result"]["depends"]
+        .as_array()
+        .expect("depends")
+        .iter()
+        .filter_map(|d| d.as_str().map(String::from))
+        .collect();
+    assert!(
+        depends.contains(&parent_txid),
+        "child should report the quarantined parent as an infectious dependency: {qe}"
+    );
+    assert!(!mempool_has(&node_b, &child_txid), "infectious child leaked into acting mempool");
+
+    node_a.stop();
+    node_b.stop();
+}
+
+#[test]
+fn layer_c_quarantined_tx_confirmed_in_block_clears_cleanly() {
+    let wallet = test_wallet();
+    let mut node_a = TestNode::start(&[]);
+    let pf = write_policy(RUNES_BOTH);
+    let mut node_b = TestNode::start(&[
+        &format!("--connect=127.0.0.1:{}", p2p_port(&node_a)),
+        &format!("--policyfile={}", pf.path.display()),
+        "--acceptnonstdtxn",
+    ]);
+    assert_policy_loaded(&node_b);
+    poll_until(
+        || get_rpc_u64(&node_a, "getconnectioncount").unwrap_or(0) >= 1,
+        test_timeout(30),
+        "A and B did not connect",
+    );
+    mine_to(&node_a, 110, &wallet);
+    wait_height(&node_b, 110, "B did not sync to A");
+
+    let (raw, txid) = build_spend(&node_a, &wallet, 1, vec![runestone_output()], 1_000);
+    send_ok(&node_a, &raw);
+    poll_until(|| quarantine_has(&node_b, &txid), test_timeout(30), "tx not quarantined on B");
+
+    // A (no policy) mines the runestone into a block; B receives and connects it.
+    mine_to(&node_a, 1, &wallet);
+    wait_height(&node_b, 111, "B did not receive the confirming block");
+
+    // The tx leaves B's quarantine on confirmation, is not resurrected into the
+    // acting mempool, and the confirmed-anyway counter ticks.
+    poll_until(
+        || !quarantine_has(&node_b, &txid),
+        test_timeout(20),
+        "tx still quarantined after confirmation",
+    );
+    assert!(!mempool_has(&node_b, &txid), "confirmed tx resurrected into acting mempool");
+    let info = node_b.rpc_call("getquarantineinfo").expect("getquarantineinfo");
+    assert!(
+        info["result"]["confirmed_anyway"].as_u64().unwrap_or(0) >= 1,
+        "confirmed_anyway counter not incremented: {info}"
+    );
+
+    node_a.stop();
+    node_b.stop();
+}
+
+#[test]
+fn layer_c_reload_promotes_held_tx() {
+    let wallet = test_wallet();
+    let mut node_a = TestNode::start(&[]);
+    let pf = write_policy(RUNES_BOTH);
+    let mut node_b = TestNode::start(&[
+        &format!("--connect=127.0.0.1:{}", p2p_port(&node_a)),
+        &format!("--policyfile={}", pf.path.display()),
+        "--acceptnonstdtxn",
+    ]);
+    assert_policy_loaded(&node_b);
+    poll_until(
+        || get_rpc_u64(&node_a, "getconnectioncount").unwrap_or(0) >= 1,
+        test_timeout(30),
+        "A and B did not connect",
+    );
+    mine_to(&node_a, 110, &wallet);
+    wait_height(&node_b, 110, "B did not sync to A");
+
+    // Submit the runestone directly to B with allowquarantined ⇒ held on B,
+    // relay-withheld, so A never sees it.
+    let (raw, txid) = build_spend(&node_b, &wallet, 1, vec![runestone_output()], 1_000);
+    let resp = node_b
+        .rpc_call_with_params("sendrawtransaction", vec![json!(raw), json!(true)])
+        .expect("sendrawtransaction rpc");
+    assert!(resp["error"].is_null(), "allowquarantined submit rejected: {resp}");
+    poll_until(|| quarantine_has(&node_b, &txid), test_timeout(20), "tx not held on B");
+    assert!(!mempool_has(&node_b, &txid), "held tx should not be on the acting surface");
+    // Relay-withheld: A never receives it.
+    std::thread::sleep(test_timeout(3));
+    assert!(!mempool_has(&node_a, &txid), "relay-withheld held tx leaked to A before reload");
+
+    // Reload B onto an empty ruleset (SIGHUP) ⇒ reapply_policy re-evaluates the
+    // pool and promotes the now-unmatched held tx out of the quarantine class
+    // into the acting mempool (§8, I9). It becomes visible on the standard
+    // surface and leaves quarantine.
+    rewrite_policy(&pf, EMPTY_POLICY);
+    sighup(&node_b);
+    poll_until(
+        || mempool_has(&node_b, &txid),
+        test_timeout(30),
+        "held tx not promoted to acting on B after reload",
+    );
+    assert!(!quarantine_has(&node_b, &txid), "tx still quarantined after promotion");
+    let info = node_b.rpc_call("getpolicyinfo").expect("getpolicyinfo");
+    assert_eq!(
+        info["result"]["rules_count"],
+        json!(0),
+        "policy was not reloaded to the empty ruleset: {info}"
+    );
+    // NOTE: the bounded promotion queue *re-announces* a promoted tx to peers;
+    // that wire-level re-announcement is covered by the promotion-queue unit
+    // tests and metrics. Observing it cross-node here proved dependent on P2P
+    // tx-request scheduling (inbound-peer trickle) rather than the policy engine,
+    // so this test asserts the engine-side promotion only.
 
     node_a.stop();
     node_b.stop();
