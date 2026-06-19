@@ -1070,21 +1070,30 @@ fn layer_c_quarantined_tx_confirmed_in_block_clears_cleanly() {
 #[test]
 fn layer_c_reload_promotes_held_tx() {
     let wallet = test_wallet();
-    let mut node_a = TestNode::start(&[]);
+    // Topology matters here. The promoted tx must travel B → A: B holds the tx,
+    // promotes it on reload, and re-announces it. A then *requests* it from B.
+    // satd (like Core) only promptly requests transactions from OUTBOUND peers
+    // — a tx INV from an inbound peer is not eagerly fetched — so A must be the
+    // dialer for the fetch to happen. We therefore make the policy node B the
+    // listener/miner and have the plain node A connect out to it, so B is one of
+    // A's outbound peers. (The gossip tests above exercise the opposite, already
+    // -working A → B direction.)
     let pf = write_policy(RUNES_BOTH);
     let mut node_b = TestNode::start(&[
-        &format!("--connect=127.0.0.1:{}", p2p_port(&node_a)),
         &format!("--policyfile={}", pf.path.display()),
         "--acceptnonstdtxn",
     ]);
     assert_policy_loaded(&node_b);
+    let mut node_a = TestNode::start(&[&format!("--connect=127.0.0.1:{}", p2p_port(&node_b))]);
     poll_until(
-        || get_rpc_u64(&node_a, "getconnectioncount").unwrap_or(0) >= 1,
+        || get_rpc_u64(&node_b, "getconnectioncount").unwrap_or(0) >= 1,
         test_timeout(30),
         "A and B did not connect",
     );
-    mine_to(&node_a, 110, &wallet);
-    wait_height(&node_b, 110, "B did not sync to A");
+    // B mines (policy never affects mining of tx-less warmup blocks); A syncs
+    // from its outbound peer B.
+    mine_to(&node_b, 110, &wallet);
+    wait_height(&node_a, 110, "A did not sync from B");
 
     // Submit the runestone directly to B with allowquarantined ⇒ held on B,
     // relay-withheld, so A never sees it.
@@ -1117,11 +1126,19 @@ fn layer_c_reload_promotes_held_tx() {
         json!(0),
         "policy was not reloaded to the empty ruleset: {info}"
     );
-    // NOTE: the bounded promotion queue *re-announces* a promoted tx to peers;
-    // that wire-level re-announcement is covered by the promotion-queue unit
-    // tests and metrics. Observing it cross-node here proved dependent on P2P
-    // tx-request scheduling (inbound-peer trickle) rather than the policy engine,
-    // so this test asserts the engine-side promotion only.
+
+    // Cross-node: promotion is not just an engine-side re-placement — the bounded
+    // promotion queue re-announces the promoted tx to peers (manager::announce_tx,
+    // drained every PROMOTION_DRAIN_INTERVAL_SECS = 2s). Once promoted, the tx is
+    // acting-class on B (assists_relay() == true), so B's handle_getdata will
+    // serve it; satd applies no inbound-peer request delay, so A fetches it as
+    // soon as the drain emits the INV. The poll window spans several drain ticks
+    // to absorb the up-to-2s drain cadence (×SATD_TEST_TIMEOUT_MULT under CI).
+    poll_until(
+        || mempool_has(&node_a, &txid),
+        test_timeout(60),
+        "promoted tx was not re-announced to / fetched by peer A after reload",
+    );
 
     node_a.stop();
     node_b.stop();
