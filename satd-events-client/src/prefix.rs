@@ -33,13 +33,15 @@ pub fn scripthash_of(script_pubkey: &[u8]) -> [u8; 32] {
 }
 
 /// Derive the `(prefix, bits)` registration tuple for a scriptPubKey: the top
-/// `ceil(bits/8)` bytes of its scripthash. `bits` is clamped to `1..=256`
-/// (its valid range); [`WatchHandle::add_script_prefixes`](crate::WatchHandle::add_script_prefixes)
-/// re-validates before the wire.
+/// `ceil(bits/8)` bytes of its scripthash. `bits` is clamped to `1..=32` — the
+/// server buckets on the top 32 bits of the scripthash only, so a wider prefix
+/// is meaningless and would be silently dropped;
+/// [`WatchHandle::add_script_prefixes`](crate::WatchHandle::add_script_prefixes)
+/// re-validates the same bound before the wire.
 pub fn prefix_of(script_pubkey: &[u8], bits: u32) -> (Vec<u8>, u32) {
-    let bits = bits.clamp(1, 256);
+    let bits = bits.clamp(1, crate::client::MAX_PREFIX_BITS);
     let sh = scripthash_of(script_pubkey);
-    let n = (bits as usize).div_ceil(8).min(32);
+    let n = (bits as usize).div_ceil(8);
     (sh[..n].to_vec(), bits)
 }
 
@@ -170,10 +172,12 @@ impl PrefixWatcher {
     /// The deduplicated set of `(prefix, bits)` buckets that cover every watched
     /// script at width `bits` — pass straight to
     /// [`WatchHandle::add_script_prefixes`](crate::WatchHandle::add_script_prefixes).
-    /// Distinct scripts that share a bucket collapse to one registration.
+    /// Distinct scripts that share a bucket collapse to one registration. `bits`
+    /// is clamped to `1..=32` (the server's bucketing ceiling), matching
+    /// [`prefix_of`].
     pub fn prefixes(&self, bits: u32) -> Vec<(Vec<u8>, u32)> {
-        let bits = bits.clamp(1, 256);
-        let n = (bits as usize).div_ceil(8).min(32);
+        let bits = bits.clamp(1, crate::client::MAX_PREFIX_BITS);
+        let n = (bits as usize).div_ceil(8);
         let buckets: HashSet<Vec<u8>> = self.watched.iter().map(|sh| sh[..n].to_vec()).collect();
         buckets.into_iter().map(|p| (p, bits)).collect()
     }
@@ -286,7 +290,10 @@ mod tests {
         assert_eq!(prefix_of(s.as_bytes(), 16), (sh[..2].to_vec(), 16));
         assert_eq!(prefix_of(s.as_bytes(), 12), (sh[..2].to_vec(), 12)); // ceil(12/8)=2
         assert_eq!(prefix_of(s.as_bytes(), 8), (sh[..1].to_vec(), 8));
-        assert_eq!(prefix_of(s.as_bytes(), 256).0.len(), 32);
+        // bits beyond the server's 32-bit ceiling clamp to 32 (4 bytes), never
+        // a wider prefix the server would silently drop.
+        assert_eq!(prefix_of(s.as_bytes(), 32), (sh[..4].to_vec(), 32));
+        assert_eq!(prefix_of(s.as_bytes(), 256), (sh[..4].to_vec(), 32));
     }
 
     #[test]
@@ -385,8 +392,10 @@ mod tests {
         w.watch_script(&spk(1));
         w.watch_script(&spk(2));
         // At 1 bit, both scripts almost certainly collapse to <= 2 buckets; at
-        // 256 bits each script is its own bucket.
-        assert_eq!(w.prefixes(256).len(), 2);
+        // the 32-bit ceiling each script is its own bucket. Over-wide bits clamp
+        // to 32 rather than producing a server-rejected prefix.
+        assert_eq!(w.prefixes(32).len(), 2);
+        assert_eq!(w.prefixes(256).len(), 2); // clamped to 32, still 2 buckets
         assert!(w.prefixes(1).len() <= 2);
         for (p, bits) in w.prefixes(16) {
             assert_eq!(bits, 16);
