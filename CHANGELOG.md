@@ -70,6 +70,14 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   — the foundation for mempool-input `min_value` filtering and chainstate-less
   prefix-spend confirmation. SIGHUP-reloadable.
   See the [release notes](docs/release-notes/0.4.0-pre.md).
+- **P2P listener bind failure is now fatal at startup.** With `-listen=1` (the
+  default) or `-whitebind`, a failure to bind the P2P port — almost always a
+  second satd instance on the same datadir/port, or a port already in use — was
+  logged on a detached task while the daemon otherwise reported a clean start
+  and ran with **no inbound P2P listener** (silently unreachable). The bind now
+  happens synchronously before the accept loop starts and a failure aborts
+  startup with a clear message, matching the existing RPC/Esplora listeners.
+  See the [release notes](docs/release-notes/0.4.0-pre.md).
 
 ## Releases
 

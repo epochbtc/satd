@@ -2531,29 +2531,54 @@ async fn main() {
         eprintln!("Warning: failed to write PID file {}: {}", pid_path, e);
     }
 
-    // Start P2P networking
+    // Start P2P networking. The bind is performed synchronously *before*
+    // spawning the accept loop so a failure (port in use — typically a second
+    // satd instance — or permission denied) is fatal at startup, matching the
+    // RPC/Esplora listeners above. An operator who set -listen=1 must not see
+    // the daemon report a clean start while silently accepting no inbound peers.
     if config.listen {
         let p2p_addr: SocketAddr = format!("{}:{}", config.bind, config.port)
             .parse()
             .expect("Invalid P2P bind address");
+        let listener = match node::net::manager::PeerManager::bind_listener(p2p_addr).await {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!(
+                    "Error: failed to bind P2P listener on {p2p_addr}: {e}\n\
+                     Another instance of satd may already be running, or the port is in use.\n\
+                     Set -port=<n>/-bind=<addr> to change it, or -listen=0 to disable inbound P2P."
+                );
+                auth.cleanup();
+                std::process::exit(1);
+            }
+        };
         let pm = peer_manager.clone();
         tokio::spawn(async move {
-            if let Err(e) = pm.listen(p2p_addr).await {
-                tracing::error!("P2P listener error: {}", e);
-            }
+            pm.accept_loop(listener, node::net::permissions::NetPermissions::NONE)
+                .await;
         });
         tracing::info!(port = config.port, "P2P listening");
     }
 
-    // -whitebind: extra permissioned listeners (independent of -listen).
+    // -whitebind: extra permissioned listeners (independent of -listen). These
+    // are explicitly requested, so a bind failure is fatal here too.
     for (bind_addr, perms) in &config.whitebind {
-        let pm = peer_manager.clone();
         let bind_addr = *bind_addr;
         let perms = *perms;
-        tokio::spawn(async move {
-            if let Err(e) = pm.listen_with_perms(bind_addr, perms).await {
-                tracing::error!(%bind_addr, "whitebind listener error: {}", e);
+        let listener = match node::net::manager::PeerManager::bind_listener(bind_addr).await {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!(
+                    "Error: failed to bind -whitebind P2P listener on {bind_addr}: {e}\n\
+                     Another instance of satd may already be running, or the port is in use."
+                );
+                auth.cleanup();
+                std::process::exit(1);
             }
+        };
+        let pm = peer_manager.clone();
+        tokio::spawn(async move {
+            pm.accept_loop(listener, perms).await;
         });
         tracing::info!(%bind_addr, "whitebind P2P listening");
     }
