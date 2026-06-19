@@ -47,9 +47,16 @@
 //!   the matching `remove_*`. [`send_control`](WatchHandle::send_control) remains
 //!   for raw access.
 //!
-//! The reconnect/replay/lag resilience layer, the prefix-watch local re-filter
-//! (behind the `bitcoin` feature), and TLS are layered on next. The raw wire
-//! types are re-exported under [`proto`] for low-level use.
+//! - [`StreamClient::resilient_subscribe`] — the firehose wrapped in a
+//!   [`ResilientSubscription`] that reconnects with backoff, persists and
+//!   replays the durable cursor (via a [`CursorStore`]), recovers from `Lagged`
+//!   per a [`LagPolicy`], and surfaces replay-truncation gaps.
+//! - [`PrefixWatcher`] (default-on `bitcoin` feature) — the privacy-preserving
+//!   prefix-watch local re-filter: decodes a [`PrefixMatch`]'s `raw_tx` and
+//!   recomputes `sha256(scriptPubKey)` to keep only true matches.
+//!
+//! TLS is layered on next. The raw wire types are re-exported under [`proto`]
+//! for low-level use.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -57,6 +64,8 @@
 mod client;
 mod error;
 mod event;
+#[cfg(feature = "bitcoin")]
+mod prefix;
 mod resilience;
 
 pub use client::{
@@ -70,6 +79,11 @@ pub use event::{
 pub use resilience::{
     Backoff, CursorStore, FileCursorStore, LagPolicy, NoopCursorStore, ResilientConfig,
     ResilientSubscription,
+};
+
+#[cfg(feature = "bitcoin")]
+pub use prefix::{
+    prefix_of, scripthash_of, FundingHit, PrefixHits, PrefixWatcher, SpendingHit,
 };
 
 /// The generated `satd.events.v1` wire types, for low-level control-message

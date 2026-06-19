@@ -10,9 +10,13 @@ publish.workspace = true
 repository.workspace = true
 
 [features]
-default = []
-# Typed bitcoin helpers + prefix-watch local re-filter (pulls the `bitcoin`
-# crate). Wired up in a later PR; declared here so the surface is stable.
+# `bitcoin` is on by default: the prefix-watch local re-filter and scripthash
+# helpers are core to the privacy-preserving watch surface our first consumer
+# uses, so they work out of the box. A minimal-dependency build that filters raw
+# bytes itself can opt out with `default-features = false`.
+default = ["bitcoin"]
+# Typed bitcoin helpers + prefix-watch local re-filter ([`PrefixWatcher`]); pulls
+# the `bitcoin` crate (and transitively secp256k1).
 bitcoin = ["dep:bitcoin"]
 
 [dependencies]
