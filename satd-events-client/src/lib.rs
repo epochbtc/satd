@@ -40,11 +40,16 @@
 //! - [`StreamClient::subscribe`] — the full firehose with `from_cursor` replay
 //!   and cursor capture.
 //! - [`StreamClient::watch`] — opens the bidirectional stream and returns a
-//!   [`WatchHandle`] with a low-level [`send_control`](WatchHandle::send_control).
-//!   Typed watch helpers (scripts, outpoints, txids, descriptors, prefixes),
-//!   the reconnect/replay/lag resilience layer, and TLS are layered on next.
+//!   [`WatchHandle`] with typed helpers for every watch kind: `add_scripts`
+//!   (with per-script `min_value` floors), `add_outpoints`, `add_tx_lifecycle` /
+//!   `add_depth_alarms`, `add_descriptor`, and `add_script_prefixes` (the
+//!   privacy-preserving prefix watch), plus `set_categories` / `set_cursor` and
+//!   the matching `remove_*`. [`send_control`](WatchHandle::send_control) remains
+//!   for raw access.
 //!
-//! The raw wire types are re-exported under [`proto`] for low-level use.
+//! The reconnect/replay/lag resilience layer, the prefix-watch local re-filter
+//! (behind the `bitcoin` feature), and TLS are layered on next. The raw wire
+//! types are re-exported under [`proto`] for low-level use.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -54,7 +59,8 @@ mod error;
 mod event;
 
 pub use client::{
-    Categories, EventStream, StreamClient, StreamClientBuilder, SubscribeOptions, WatchHandle,
+    AutoClose, Categories, EventStream, StreamClient, StreamClientBuilder, SubscribeOptions,
+    WatchHandle,
 };
 pub use error::StreamError;
 pub use event::{
