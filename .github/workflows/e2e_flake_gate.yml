@@ -30,7 +30,7 @@ jobs:
 
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       # Same disk-pressure reclamation as the main PR job. Hosted
       # runners ship ~30 GB of pre-installed SDKs we don't use; without

@@ -30,7 +30,7 @@ jobs:
 
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       # Hosted ubuntu-24.04 ships ~30 GB of pre-installed SDKs we don't
       # use (Android, .NET, Haskell, CodeQL). The workspace target/
@@ -164,7 +164,7 @@ jobs:
 
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Install Linux build deps
         run: |
@@ -226,7 +226,7 @@ jobs:
 
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Free disk space
         run: |
