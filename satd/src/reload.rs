@@ -821,6 +821,14 @@ fn field_specs() -> Vec<FieldSpec> {
         // startup; changing them requires a restart.
         restart!("eventsgrpcmaxconns", events_grpc_max_conns),
         restart!("eventsgrpcmaxsubscriptions", events_grpc_max_subscriptions),
+        // events gRPC TLS: the acceptor is built when the sink binds at startup,
+        // so changing any of these requires a restart (matches the RPC TLS keys).
+        restart!("eventsgrpctlscert", events_grpc_tls_cert),
+        restart!("eventsgrpctlskey", events_grpc_tls_key),
+        restart!("eventsgrpcmtls", events_grpc_mtls),
+        restart!("eventsgrpcmtlsclientca", events_grpc_mtls_client_ca),
+        restart!("eventsgrpcmtlsclientallow", events_grpc_mtls_client_allow),
+        restart!("eventsgrpctlshandshaketimeout", events_grpc_tls_handshake_timeout),
         restart!("eventszmqbind", events_zmq_bind),
         restart!("eventszmqhashtx", events_zmq_hashtx),
         restart!("eventszmqhashblock", events_zmq_hashblock),
