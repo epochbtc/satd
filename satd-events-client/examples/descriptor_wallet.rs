@@ -24,18 +24,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     watch.add_descriptor(descriptor, gap_limit, start).await?;
 
     while let Some(event) = events.message().await? {
-        if let Event::ScriptMatched { txid, is_output, index, confirmed, .. } = event {
-            println!(
-                "descriptor hit tx={} {} idx={} ({})",
-                hex(&txid),
-                if is_output { "funding" } else { "spending" },
-                index,
-                if confirmed { "confirmed" } else { "mempool" },
-            );
-            // A real wallet tracks which child index funded and advances the
-            // window so it never runs past the gap limit.
-            start += gap_limit;
-            watch.add_descriptor(descriptor, gap_limit, start).await?;
+        match event {
+            Event::ScriptMatched { txid, is_output, index, confirmed, .. } => {
+                println!(
+                    "descriptor hit tx={} {} idx={} ({})",
+                    hex(&txid),
+                    if is_output { "funding" } else { "spending" },
+                    index,
+                    if confirmed { "confirmed" } else { "mempool" },
+                );
+                // Gap-limit advancement is the wallet's job, and only *funding*
+                // (output-side) hits consume new addresses. This stand-in is
+                // deliberately simple: it nudges the window forward on each
+                // funding hit. A real wallet maps the matched `scripthash` back
+                // to the derived child index it registered, and only advances
+                // when funding lands near the top of the current
+                // `[start, start+gap_limit)` window — never on a spend
+                // (`is_output == false`), and never past the gap limit. (Note
+                // `index` here is the tx vout/vin, not the descriptor child
+                // index, so it can't drive advancement on its own.)
+                if is_output {
+                    start += 1;
+                    watch.add_descriptor(descriptor, gap_limit, start).await?;
+                }
+            }
+            // If the node can't expand the descriptor it emits
+            // `DescriptorNeedsAddresses`, which this SDK maps to `Event::Unknown`
+            // (a typed accessor is future work) — a real client would surface it
+            // rather than silently ignoring an unexpandable descriptor.
+            Event::Unknown => {}
+            _ => {}
         }
     }
     Ok(())

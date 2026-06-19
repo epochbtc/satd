@@ -200,7 +200,10 @@ which govern what the spend side carries.
 (`Connect`, transient transport codes, `QuotaExhausted`) versus give up
 (`PermissionDenied`, a bad endpoint/token, client-side argument errors).
 `Unauthenticated` is reported non-retryable — re-auth and reconnect
-deliberately rather than blind-retrying the same token.
+deliberately rather than blind-retrying the same token. `QuotaExhausted` is
+treated as retryable because its common causes (subscription cap, per-principal
+rate limit) are transient; a genuinely full *watch quota* is not, so inspect the
+boxed status message before retrying a watch-add forever.
 
 ## Examples
 
