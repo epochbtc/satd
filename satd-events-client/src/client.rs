@@ -534,6 +534,19 @@ impl StreamClient {
 }
 
 #[cfg(test)]
+impl StreamClient {
+    /// Build a client over a lazily-connected channel to a dummy endpoint, for
+    /// unit tests of layers (e.g. [`ResilientSubscription`](crate::ResilientSubscription))
+    /// that need a `StreamClient` value but drive their logic via injected events
+    /// and never actually poll the transport. `connect_lazy` performs no I/O, so
+    /// no server is required; it must be called from within a Tokio runtime.
+    pub(crate) fn for_test() -> Self {
+        let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        StreamClient { inner: NodeEventStreamClient::new(channel), auth: None }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use pb::subscribe_control::Msg;
