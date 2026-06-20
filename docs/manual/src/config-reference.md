@@ -358,10 +358,16 @@ Core ZMQ wire-format compatible.)
 | `eventsnodeid` | auto (persisted to `<datadir>/node_id`) | restart | satd | Stable per-node identifier (32-char hex) stamped on events envelopes. |
 | `eventsregion` | none | restart | satd | Optional region tag (≤8 ASCII bytes) on events envelopes. |
 | `eventsgrpcbind` | off | restart | satd | host:port to bind the events gRPC streaming server. |
-| `eventsgrpcallowremote` | false | restart | satd | Permit `eventsgrpcbind` on a non-loopback address (requires `eventsgrpcauth`). |
+| `eventsgrpcallowremote` | false | restart | satd | Permit `eventsgrpcbind` on a non-loopback address (requires `eventsgrpcauth` **or** `eventsgrpcmtls`). |
 | `eventsgrpcauth` | false | restart | satd | Require bearer tokens (`stream:subscribe`) on events gRPC (requires `authfile`). |
 | `eventsgrpcmaxconns` | 64 (`0` disables) | restart | satd | Hard cap on simultaneously-open events gRPC connections. |
 | `eventsgrpcmaxsubscriptions` | 256 (`0` disables) | restart | satd | Hard cap on concurrent events gRPC `Subscribe` streams. |
+| `eventsgrpctlscert` | off | restart | satd | PEM TLS certificate. Set with `eventsgrpctlskey` to terminate TLS in-process on the `eventsgrpcbind` listener (no separate TLS bind). |
+| `eventsgrpctlskey` | off | restart | satd | PEM TLS private key (required with `eventsgrpctlscert`). |
+| `eventsgrpcmtls` | false | restart | satd | Require mutual TLS (client certificates). Requires `eventsgrpctlscert`/`key` and `eventsgrpcmtlsclientca`. |
+| `eventsgrpcmtlsclientca` | off | restart | satd | PEM CA bundle verifying client certs when `eventsgrpcmtls=1`. |
+| `eventsgrpcmtlsclientallow` | empty (any CA-signed cert) | restart | satd | Allowlist of accepted client-cert CN / DNS-SAN values (repeatable, comma-separated). Requires `eventsgrpcmtls=1`. |
+| `eventsgrpctlshandshaketimeout` | 30 | restart | satd | Per-handshake timeout (seconds) for the events gRPC TLS surface. |
 | `streamws` | off | restart | satd | host:port for the streaming JSON-over-WebSocket + SSE transport (`/ws` + `/sse`). |
 | `streamwsallowremote` | false | restart | satd | Permit `streamws` on a non-loopback address (requires `streamwsauth`). |
 | `streamwsauth` | false | restart | satd | Require bearer tokens (`stream:subscribe`) on `streamws` (requires `authfile`). |

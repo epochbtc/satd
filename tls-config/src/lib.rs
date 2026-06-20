@@ -434,14 +434,31 @@ fn extract_leaf_names(der: &[u8]) -> HashSet<String> {
     names
 }
 
+/// Make a certificate-derived string safe to emit into a single log line.
+/// Cert subject fields (notably the CN, an X.500 DirectoryString) are
+/// attacker-influenced and can contain control characters — including
+/// newlines, which would allow forging log records. Replace any control
+/// character with the Unicode replacement char; printable content is left
+/// readable. Used only on logging-only labels, never on the values compared
+/// against the allowlist (those stay byte-exact).
+fn sanitize_label(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { '\u{fffd}' } else { c })
+        .collect()
+}
+
 /// Best-effort label for the peer's leaf cert. CN if present, else
 /// first DNS SAN, else `None`. Suitable for logging only — not for
 /// trust decisions (which go through [`check_peer_allowed`] or the
-/// rustls verifier).
+/// rustls verifier). The returned label is control-character-sanitized
+/// so it is safe to log directly.
 pub fn peer_subject_label(conn: &ServerConnection) -> Option<String> {
     let chain = conn.peer_certificates()?;
     let leaf = chain.first()?;
-    extract_leaf_names(leaf.as_ref()).into_iter().next()
+    extract_leaf_names(leaf.as_ref())
+        .into_iter()
+        .next()
+        .map(|s| sanitize_label(&s))
 }
 
 /// After a successful mTLS handshake, check the peer's leaf cert
@@ -477,6 +494,7 @@ pub fn check_peer_allowed(
     let subject_label = names
         .into_iter()
         .next()
+        .map(|s| sanitize_label(&s))
         .unwrap_or_else(|| "<unknown>".into());
     Err(AllowlistRejection { subject_label })
 }
@@ -680,6 +698,21 @@ mod tests {
     fn extract_leaf_names_handles_garbage_input() {
         let names = extract_leaf_names(b"not a cert");
         assert!(names.is_empty());
+    }
+
+    #[test]
+    fn sanitize_label_strips_control_chars() {
+        // Newline / CR (the log-forgery vector) and other control chars are
+        // replaced; printable content (including the allowlist-relevant
+        // alphanumerics and dots/dashes) is preserved.
+        let dirty = "alice\r\nFAKE-LOG-LINE\tx\u{0}";
+        let clean = sanitize_label(dirty);
+        assert!(!clean.contains('\n'));
+        assert!(!clean.contains('\r'));
+        assert!(!clean.contains('\t'));
+        assert!(!clean.contains('\u{0}'));
+        assert!(clean.starts_with("alice"));
+        assert_eq!(sanitize_label("node.example-1"), "node.example-1");
     }
 
     // --- TLS cert hot-reload (SIGUSR1) ---

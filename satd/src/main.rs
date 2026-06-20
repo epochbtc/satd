@@ -1094,6 +1094,23 @@ async fn main() {
             Some(chain_state.clone() as std::sync::Arc<dyn node::events::BlockCursorSource>),
             // Live watch registry backing the bidirectional `Watch` RPC.
             Some(watch_registry.clone()),
+            // In-process TLS / mTLS termination when a cert+key are configured.
+            // `Config::load` already validated that the cert and key are set
+            // together and that mTLS implies a client CA, so a present cert is
+            // sufficient to build the params here.
+            config.events_grpc_tls_cert.as_ref().map(|cert| satd_events::GrpcTlsParams {
+                cert_path: cert.clone(),
+                key_path: config
+                    .events_grpc_tls_key
+                    .clone()
+                    .expect("config validated cert+key are set together"),
+                mtls_enabled: config.events_grpc_mtls,
+                mtls_client_ca: config.events_grpc_mtls_client_ca.clone(),
+                mtls_client_allow: config.events_grpc_mtls_client_allow.clone(),
+                handshake_timeout: std::time::Duration::from_secs(
+                    config.events_grpc_tls_handshake_timeout,
+                ),
+            }),
         )
         .await
         {
@@ -1103,6 +1120,8 @@ async fn main() {
                     target: "events",
                     bind,
                     allow_remote = config.events_grpc_allow_remote,
+                    tls = config.events_grpc_tls_cert.is_some(),
+                    mtls = config.events_grpc_mtls,
                     "events gRPC sink configured",
                 );
                 event_sinks.push(Box::new(sink));
