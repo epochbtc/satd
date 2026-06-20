@@ -124,8 +124,9 @@ FROM chef AS builder
 # friends) and it is keyed on recipe.json alone — a source-only change leaves
 # it cache-hit.
 #
-# events/build.rs compiles the gRPC protobufs (satd enables `events/grpc`) and
-# reads events/proto/** at build time. cargo-chef's skeleton reconstructs
+# satd-events-proto/build.rs compiles the gRPC protobufs (satd enables
+# `events/grpc`, which pulls satd-events-proto) and reads
+# satd-events-proto/proto/** at build time. cargo-chef's skeleton reconstructs
 # Cargo.toml + build.rs but NOT arbitrary data files, so the proto tree must be
 # present before cook or the build script fails. It changes rarely, so copying
 # it here doesn't meaningfully erode the cook cache.
@@ -133,7 +134,7 @@ FROM chef AS builder
 # The cook flags MUST match the final `cargo build` exactly (see header note
 # #2).
 COPY --from=planner /src/recipe.json recipe.json
-COPY events/proto events/proto
+COPY satd-events-proto/proto satd-events-proto/proto
 RUN cargo chef cook --release --locked --bin satd --bin sat-cli --recipe-path recipe.json
 
 # Compile first-party crates on top of the cooked dependency artifacts already

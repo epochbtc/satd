@@ -13,21 +13,11 @@ pub mod grpc;
 
 #[cfg(feature = "grpc")]
 pub mod proto {
-    //! Generated protobuf types. Path matches the proto package
-    //! `satd.events.v1`, exposed as `satd_events::proto::satd::events::v1`.
-    #![allow(clippy::all)]
-    #![allow(clippy::pedantic)]
-    #![allow(missing_docs)]
-
-    pub mod satd {
-        pub mod events {
-            pub mod v1 {
-                tonic::include_proto!("satd.events.v1");
-            }
-        }
-    }
-
-    pub use self::satd::events::v1 as v1;
+    //! Generated protobuf types, re-exported from the `satd-events-proto`
+    //! codegen crate so the wire schema has a single source of truth. Paths are
+    //! unchanged for downstream consumers: `satd_events::proto::satd::events::v1`
+    //! and the short alias `satd_events::proto::v1`.
+    pub use satd_events_proto::{satd, v1};
 }
 
 #[cfg(feature = "grpc")]

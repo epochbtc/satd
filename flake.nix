@@ -64,7 +64,7 @@
           craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 
           # crane's `cleanCargoSource` strips non-Rust files. The
-          # workspace has `events/proto/*.proto` files that
+          # workspace has `satd-events-proto/proto/*.proto` files that
           # `tonic_build` reads at compile time; keep those.
           # Also keep license/attribution files referenced by some
           # downstream build scripts and the `vendor/` directories.
