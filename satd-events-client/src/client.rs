@@ -91,12 +91,32 @@ impl EventStream {
     }
 }
 
+/// Auto-close policy for a transaction lifecycle watch: self-evict and emit
+/// `TxidFinalized` once the tx is buried this many confirmations deep.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AutoClose {
+    /// Never auto-close; the lifecycle watch persists until removed.
+    #[default]
+    Never,
+    /// Auto-close once the tx reaches this confirmation depth (>= 1).
+    AtDepth(u32),
+}
+
+impl AutoClose {
+    fn depth(self) -> u32 {
+        match self {
+            AutoClose::Never => 0,
+            AutoClose::AtDepth(d) => d,
+        }
+    }
+}
+
 /// A handle to send control messages on a bidirectional `Watch` stream.
 ///
-/// This revision exposes the low-level [`send_control`](Self::send_control);
-/// typed helpers (`add_scripts`, `add_outpoints`, `set_cursor`, …) are layered
-/// on in a later revision. Dropping the handle closes the control channel,
-/// which the server uses to tear the stream down.
+/// Typed helpers build and send the right [`SubscribeControl`](pb::SubscribeControl)
+/// for each watch kind; [`send_control`](Self::send_control) remains for raw
+/// access. Empty inputs are no-ops (nothing is sent). Dropping the handle closes
+/// the control channel, which the server uses to tear the stream down.
 pub struct WatchHandle {
     tx: mpsc::Sender<pb::SubscribeControl>,
 }
@@ -106,6 +126,271 @@ impl WatchHandle {
     pub async fn send_control(&self, ctrl: pb::SubscribeControl) -> Result<(), StreamError> {
         self.tx.send(ctrl).await.map_err(|_| StreamError::ControlClosed)
     }
+
+    async fn send_msg(&self, msg: pb::subscribe_control::Msg) -> Result<(), StreamError> {
+        self.send_control(pb::SubscribeControl { msg: Some(msg) }).await
+    }
+
+    /// Add scripthashes (each `sha256(scriptPubKey)`), with an optional per-script
+    /// `min_value` floor in satoshis. Matches below a script's floor are
+    /// suppressed (a `None` floor delivers everything). Re-asserting a held
+    /// scripthash updates its floor. Charges one watch-quota unit per scripthash.
+    pub async fn add_scripts(
+        &self,
+        items: impl IntoIterator<Item = ([u8; 32], Option<u64>)>,
+    ) -> Result<(), StreamError> {
+        let items: Vec<_> = items.into_iter().collect();
+        if items.is_empty() {
+            return Ok(());
+        }
+        let scripthashes = items.iter().map(|(h, _)| h.to_vec()).collect();
+        // `min_values` is empty when no floor is set on any script; otherwise it
+        // must be parallel to `scripthashes`, with 0 (deliver-all) for the
+        // unfloored entries.
+        let min_values = if items.iter().any(|(_, f)| f.is_some()) {
+            items.iter().map(|(_, f)| f.unwrap_or(0)).collect()
+        } else {
+            Vec::new()
+        };
+        self.send_msg(pb::subscribe_control::Msg::AddScripts(pb::AddScripts {
+            scripthashes,
+            min_values,
+        }))
+        .await
+    }
+
+    /// Remove scripthashes from the watch-set, releasing their quota.
+    pub async fn remove_scripts(
+        &self,
+        scripthashes: impl IntoIterator<Item = [u8; 32]>,
+    ) -> Result<(), StreamError> {
+        let scripthashes: Vec<Vec<u8>> = scripthashes.into_iter().map(|h| h.to_vec()).collect();
+        if scripthashes.is_empty() {
+            return Ok(());
+        }
+        self.send_msg(pb::subscribe_control::Msg::RemoveScripts(pb::RemoveScripts {
+            scripthashes,
+        }))
+        .await
+    }
+
+    /// Add outpoints (`txid:vout`) to the watch-set. Charges one unit each.
+    pub async fn add_outpoints(
+        &self,
+        outpoints: impl IntoIterator<Item = ([u8; 32], u32)>,
+    ) -> Result<(), StreamError> {
+        let outpoints: Vec<pb::Outpoint> = outpoints
+            .into_iter()
+            .map(|(txid, vout)| pb::Outpoint { txid: txid.to_vec(), vout })
+            .collect();
+        if outpoints.is_empty() {
+            return Ok(());
+        }
+        self.send_msg(pb::subscribe_control::Msg::AddOutpoints(pb::AddOutpoints { outpoints }))
+            .await
+    }
+
+    /// Remove outpoints from the watch-set, releasing their quota.
+    pub async fn remove_outpoints(
+        &self,
+        outpoints: impl IntoIterator<Item = ([u8; 32], u32)>,
+    ) -> Result<(), StreamError> {
+        let outpoints: Vec<pb::Outpoint> = outpoints
+            .into_iter()
+            .map(|(txid, vout)| pb::Outpoint { txid: txid.to_vec(), vout })
+            .collect();
+        if outpoints.is_empty() {
+            return Ok(());
+        }
+        self.send_msg(pb::subscribe_control::Msg::RemoveOutpoints(pb::RemoveOutpoints {
+            outpoints,
+        }))
+        .await
+    }
+
+    /// Add persistent lifecycle watches on txids (seen → confirmed → replaced /
+    /// evicted / unconfirmed). `auto_close` optionally self-evicts the watch once
+    /// the tx is buried. Charges one unit per txid.
+    pub async fn add_tx_lifecycle(
+        &self,
+        txids: impl IntoIterator<Item = [u8; 32]>,
+        auto_close: AutoClose,
+    ) -> Result<(), StreamError> {
+        let txids: Vec<Vec<u8>> = txids.into_iter().map(|t| t.to_vec()).collect();
+        if txids.is_empty() {
+            return Ok(());
+        }
+        self.send_msg(pb::subscribe_control::Msg::AddTransactions(pb::AddTransactions {
+            txids,
+            min_depths: Vec::new(),
+            auto_close_depth: auto_close.depth(),
+        }))
+        .await
+    }
+
+    /// Remove lifecycle watches on txids.
+    pub async fn remove_tx_lifecycle(
+        &self,
+        txids: impl IntoIterator<Item = [u8; 32]>,
+    ) -> Result<(), StreamError> {
+        let txids: Vec<Vec<u8>> = txids.into_iter().map(|t| t.to_vec()).collect();
+        if txids.is_empty() {
+            return Ok(());
+        }
+        self.send_msg(pb::subscribe_control::Msg::RemoveTransactions(pb::RemoveTransactions {
+            txids,
+            min_depths: Vec::new(),
+        }))
+        .await
+    }
+
+    /// Arm single-shot depth alarms over the **cross product** of `txids` and
+    /// `depths`: each txid fires `TxidDepthReached` once it is `depth`
+    /// confirmations deep, then self-evicts. Charges one unit per (txid, depth).
+    ///
+    /// Depths must be `>= 1`; depths `< 1` are dropped client-side. If that
+    /// leaves no valid depths (or no txids), this is a no-op — importantly, it
+    /// does **not** send an empty `min_depths`, which the server would otherwise
+    /// reinterpret as a *lifecycle* add rather than a depth alarm.
+    pub async fn add_depth_alarms(
+        &self,
+        txids: impl IntoIterator<Item = [u8; 32]>,
+        depths: impl IntoIterator<Item = u32>,
+    ) -> Result<(), StreamError> {
+        let txids: Vec<Vec<u8>> = txids.into_iter().map(|t| t.to_vec()).collect();
+        let min_depths: Vec<u32> = depths.into_iter().filter(|d| *d >= 1).collect();
+        if txids.is_empty() || min_depths.is_empty() {
+            return Ok(());
+        }
+        self.send_msg(pb::subscribe_control::Msg::AddTransactions(pb::AddTransactions {
+            txids,
+            min_depths,
+            auto_close_depth: 0,
+        }))
+        .await
+    }
+
+    /// Remove depth alarms over the cross product of `txids` and `depths`.
+    /// Depths `< 1` are dropped client-side; an all-invalid (or empty) call is a
+    /// no-op and never sends an empty `min_depths` (which would target lifecycle
+    /// watches instead).
+    pub async fn remove_depth_alarms(
+        &self,
+        txids: impl IntoIterator<Item = [u8; 32]>,
+        depths: impl IntoIterator<Item = u32>,
+    ) -> Result<(), StreamError> {
+        let txids: Vec<Vec<u8>> = txids.into_iter().map(|t| t.to_vec()).collect();
+        let min_depths: Vec<u32> = depths.into_iter().filter(|d| *d >= 1).collect();
+        if txids.is_empty() || min_depths.is_empty() {
+            return Ok(());
+        }
+        self.send_msg(pb::subscribe_control::Msg::RemoveTransactions(pb::RemoveTransactions {
+            txids,
+            min_depths,
+        }))
+        .await
+    }
+
+    /// Expand a public output descriptor into a watch-set over the window
+    /// `[start, start + gap_limit)`. The client owns gap-limit advancement:
+    /// re-send with an advanced `start` (and remove trailing scripts) as funding
+    /// nears the window's high end.
+    pub async fn add_descriptor(
+        &self,
+        descriptor: impl Into<String>,
+        gap_limit: u32,
+        start: u32,
+    ) -> Result<(), StreamError> {
+        self.send_msg(pb::subscribe_control::Msg::AddDescriptor(pb::AddDescriptor {
+            descriptor: descriptor.into(),
+            gap_limit,
+            start,
+        }))
+        .await
+    }
+
+    /// Add privacy-preserving script-prefix buckets: each is a `bits`-bit prefix
+    /// of `sha256(scriptPubKey)`, carried as the top `ceil(bits/8)` bytes. The
+    /// server delivers every tx in the `2^-bits` bucket and the client filters
+    /// locally, so the server learns only the bucket. Charged by coarseness
+    /// (smaller `bits` costs more). `bits` must be in `1..=256` and `prefix`
+    /// exactly `ceil(bits/8)` bytes; the server additionally enforces its
+    /// configured `[streamprefixminbits, streamprefixmaxbits]` range.
+    pub async fn add_script_prefixes(
+        &self,
+        prefixes: impl IntoIterator<Item = (Vec<u8>, u32)>,
+    ) -> Result<(), StreamError> {
+        let prefixes: Vec<pb::ScriptPrefix> = prefixes
+            .into_iter()
+            .map(|(prefix, bits)| validate_prefix(prefix, bits))
+            .collect::<Result<_, _>>()?;
+        if prefixes.is_empty() {
+            return Ok(());
+        }
+        self.send_msg(pb::subscribe_control::Msg::AddScriptPrefixes(pb::AddScriptPrefixes {
+            prefixes,
+        }))
+        .await
+    }
+
+    /// Remove script-prefix buckets, releasing their quota.
+    pub async fn remove_script_prefixes(
+        &self,
+        prefixes: impl IntoIterator<Item = (Vec<u8>, u32)>,
+    ) -> Result<(), StreamError> {
+        let prefixes: Vec<pb::ScriptPrefix> = prefixes
+            .into_iter()
+            .map(|(prefix, bits)| validate_prefix(prefix, bits))
+            .collect::<Result<_, _>>()?;
+        if prefixes.is_empty() {
+            return Ok(());
+        }
+        self.send_msg(pb::subscribe_control::Msg::RemoveScriptPrefixes(
+            pb::RemoveScriptPrefixes { prefixes },
+        ))
+        .await
+    }
+
+    /// Adjust the live firehose category bitfield (see [`Categories`]). Applies
+    /// immediately; does not affect the watch-set.
+    pub async fn set_categories(&self, categories: u32) -> Result<(), StreamError> {
+        self.send_msg(pb::subscribe_control::Msg::SetCategories(pb::SetCategories {
+            categories,
+        }))
+        .await
+    }
+
+    /// Mid-stream re-anchor: replay confirmed history forward from `cursor`, then
+    /// resume live, without tearing down the watch-set. Rate-limited per
+    /// principal; only one re-anchor drains at a time.
+    ///
+    /// **Best-effort:** `Ok(())` means the request was sent, not that the
+    /// re-anchor ran. The server silently drops an over-rate or concurrent
+    /// re-anchor (no error is returned), so do not rely on this for critical
+    /// resynchronization — for that, reconnect with `from_cursor`.
+    pub async fn set_cursor(&self, cursor: Cursor) -> Result<(), StreamError> {
+        self.send_msg(pb::subscribe_control::Msg::SetCursor(pb::SetCursor {
+            cursor: Some(cursor),
+        }))
+        .await
+    }
+}
+
+/// Validate a prefix/bits pair before it reaches the wire.
+fn validate_prefix(prefix: Vec<u8>, bits: u32) -> Result<pb::ScriptPrefix, StreamError> {
+    if !(1..=256).contains(&bits) {
+        return Err(StreamError::InvalidArgument(format!(
+            "prefix bits {bits} out of range 1..=256"
+        )));
+    }
+    let want = bits.div_ceil(8) as usize;
+    if prefix.len() != want {
+        return Err(StreamError::InvalidArgument(format!(
+            "prefix for {bits} bits must be {want} bytes, got {}",
+            prefix.len()
+        )));
+    }
+    Ok(pb::ScriptPrefix { prefix, bits })
 }
 
 /// Builder for a [`StreamClient`].
@@ -231,5 +516,116 @@ impl StreamClient {
         let req = self.authed(ReceiverStream::new(rx));
         let inner = self.inner.watch(req).await?.into_inner();
         Ok((WatchHandle { tx }, EventStream { inner, last_cursor: None }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pb::subscribe_control::Msg;
+
+    /// A handle wired to a receiver we can inspect — no server needed.
+    fn handle() -> (WatchHandle, mpsc::Receiver<pb::SubscribeControl>) {
+        let (tx, rx) = mpsc::channel(16);
+        (WatchHandle { tx }, rx)
+    }
+
+    fn next(rx: &mut mpsc::Receiver<pb::SubscribeControl>) -> Msg {
+        rx.try_recv().expect("a control message was sent").msg.expect("msg set")
+    }
+
+    #[tokio::test]
+    async fn add_scripts_mixed_floors_emits_parallel_min_values() {
+        let (h, mut rx) = handle();
+        h.add_scripts([([1u8; 32], Some(5_000)), ([2u8; 32], None)]).await.unwrap();
+        match next(&mut rx) {
+            Msg::AddScripts(a) => {
+                assert_eq!(a.scripthashes.len(), 2);
+                // Unfloored entry becomes a 0 floor to keep the vec parallel.
+                assert_eq!(a.min_values, vec![5_000, 0]);
+            }
+            other => panic!("expected AddScripts, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn add_scripts_no_floors_emits_empty_min_values() {
+        let (h, mut rx) = handle();
+        h.add_scripts([([1u8; 32], None), ([2u8; 32], None)]).await.unwrap();
+        match next(&mut rx) {
+            Msg::AddScripts(a) => assert!(a.min_values.is_empty()),
+            other => panic!("expected AddScripts, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_inputs_send_nothing() {
+        let (h, mut rx) = handle();
+        h.add_scripts([]).await.unwrap();
+        h.add_outpoints([]).await.unwrap();
+        h.add_depth_alarms([[1u8; 32]], []).await.unwrap(); // empty depths
+        h.add_depth_alarms([], [3]).await.unwrap(); // empty txids
+        // depths < 1 are filtered out; an all-invalid call must NOT send an
+        // empty min_depths (the server would treat that as a lifecycle add).
+        h.add_depth_alarms([[1u8; 32]], [0]).await.unwrap();
+        assert!(rx.try_recv().is_err(), "no message should have been sent");
+    }
+
+    #[tokio::test]
+    async fn lifecycle_vs_depth_alarms_dispatch_on_min_depths() {
+        let (h, mut rx) = handle();
+        h.add_tx_lifecycle([[7u8; 32]], AutoClose::AtDepth(6)).await.unwrap();
+        match next(&mut rx) {
+            Msg::AddTransactions(a) => {
+                assert!(a.min_depths.is_empty(), "lifecycle => empty min_depths");
+                assert_eq!(a.auto_close_depth, 6);
+            }
+            other => panic!("expected AddTransactions, got {other:?}"),
+        }
+
+        h.add_depth_alarms([[7u8; 32], [8u8; 32]], [3, 6]).await.unwrap();
+        match next(&mut rx) {
+            Msg::AddTransactions(a) => {
+                assert_eq!(a.txids.len(), 2);
+                assert_eq!(a.min_depths, vec![3, 6]); // cross product, server-side
+                assert_eq!(a.auto_close_depth, 0);
+            }
+            other => panic!("expected AddTransactions, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn prefix_validation_rejects_bad_length_and_bits() {
+        let (h, mut rx) = handle();
+        // 16 bits needs 2 bytes; give 1.
+        let err = h.add_script_prefixes([(vec![0xab], 16)]).await.unwrap_err();
+        assert!(matches!(err, StreamError::InvalidArgument(_)));
+        // bits out of range.
+        let err = h.add_script_prefixes([(vec![], 0)]).await.unwrap_err();
+        assert!(matches!(err, StreamError::InvalidArgument(_)));
+        // Nothing reached the wire.
+        assert!(rx.try_recv().is_err());
+
+        // Valid: 16 bits, 2 bytes.
+        h.add_script_prefixes([(vec![0xab, 0xcd], 16)]).await.unwrap();
+        match next(&mut rx) {
+            Msg::AddScriptPrefixes(a) => {
+                assert_eq!(a.prefixes.len(), 1);
+                assert_eq!(a.prefixes[0].bits, 16);
+                assert_eq!(a.prefixes[0].prefix, vec![0xab, 0xcd]);
+            }
+            other => panic!("expected AddScriptPrefixes, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn set_cursor_wraps_cursor() {
+        let (h, mut rx) = handle();
+        let cursor = Cursor { height: 9, tx_index: 0, mempool_seq: 1, instance_id: 2 };
+        h.set_cursor(cursor).await.unwrap();
+        match next(&mut rx) {
+            Msg::SetCursor(s) => assert_eq!(s.cursor, Some(cursor)),
+            other => panic!("expected SetCursor, got {other:?}"),
+        }
     }
 }
