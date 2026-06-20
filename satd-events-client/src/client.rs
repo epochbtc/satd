@@ -509,6 +509,20 @@ impl StreamClient {
         Ok(EventStream { inner, last_cursor: None })
     }
 
+    /// Open a reconnect-and-replay-aware firehose. Unlike [`subscribe`](Self::subscribe),
+    /// the returned [`ResilientSubscription`](crate::ResilientSubscription)
+    /// reconnects with backoff, persists and replays the resume cursor, recovers
+    /// from `Lagged` per the [`LagPolicy`](crate::LagPolicy), and surfaces
+    /// replay-truncation gaps. Connects lazily on the first
+    /// [`next`](crate::ResilientSubscription::next).
+    pub fn resilient_subscribe(
+        &self,
+        opts: SubscribeOptions,
+        config: crate::ResilientConfig,
+    ) -> crate::ResilientSubscription {
+        crate::ResilientSubscription::new(self.clone(), opts, config)
+    }
+
     /// Open a bidirectional watch stream, returning a [`WatchHandle`] to send
     /// control messages and an [`EventStream`] of matches + firehose.
     pub async fn watch(&mut self) -> Result<(WatchHandle, EventStream), StreamError> {
@@ -516,6 +530,19 @@ impl StreamClient {
         let req = self.authed(ReceiverStream::new(rx));
         let inner = self.inner.watch(req).await?.into_inner();
         Ok((WatchHandle { tx }, EventStream { inner, last_cursor: None }))
+    }
+}
+
+#[cfg(test)]
+impl StreamClient {
+    /// Build a client over a lazily-connected channel to a dummy endpoint, for
+    /// unit tests of layers (e.g. [`ResilientSubscription`](crate::ResilientSubscription))
+    /// that need a `StreamClient` value but drive their logic via injected events
+    /// and never actually poll the transport. `connect_lazy` performs no I/O, so
+    /// no server is required; it must be called from within a Tokio runtime.
+    pub(crate) fn for_test() -> Self {
+        let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        StreamClient { inner: NodeEventStreamClient::new(channel), auth: None }
     }
 }
 
