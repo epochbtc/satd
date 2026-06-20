@@ -313,9 +313,11 @@ impl WatchHandle {
     /// of `sha256(scriptPubKey)`, carried as the top `ceil(bits/8)` bytes. The
     /// server delivers every tx in the `2^-bits` bucket and the client filters
     /// locally, so the server learns only the bucket. Charged by coarseness
-    /// (smaller `bits` costs more). `bits` must be in `1..=256` and `prefix`
-    /// exactly `ceil(bits/8)` bytes; the server additionally enforces its
-    /// configured `[streamprefixminbits, streamprefixmaxbits]` range.
+    /// (smaller `bits` costs more). `bits` must be in `1..=32` (the server
+    /// buckets on the top 32 bits of the scripthash; wider is meaningless and
+    /// silently dropped) and `prefix` exactly `ceil(bits/8)` bytes; the server
+    /// additionally enforces its configured
+    /// `[streamprefixminbits, streamprefixmaxbits]` range.
     pub async fn add_script_prefixes(
         &self,
         prefixes: impl IntoIterator<Item = (Vec<u8>, u32)>,
@@ -376,11 +378,21 @@ impl WatchHandle {
     }
 }
 
+/// The maximum meaningful prefix width. The server buckets on the top 32 bits of
+/// `sha256(scriptPubKey)` (its mask saturates at 32) and its default
+/// `streamprefixmaxbits` is 32, so a `bits > 32` registration can never be more
+/// selective and is silently dropped server-side (the control path has no ack).
+/// We reject it client-side rather than let a caller believe a watch was
+/// installed. A server may further *lower* the max via `streamprefixmaxbits`;
+/// that bound is not advertised over the wire, so an over-precise (but ≤ 32)
+/// prefix can still be silently dropped — there is no client-side signal for it.
+pub(crate) const MAX_PREFIX_BITS: u32 = 32;
+
 /// Validate a prefix/bits pair before it reaches the wire.
 fn validate_prefix(prefix: Vec<u8>, bits: u32) -> Result<pb::ScriptPrefix, StreamError> {
-    if !(1..=256).contains(&bits) {
+    if !(1..=MAX_PREFIX_BITS).contains(&bits) {
         return Err(StreamError::InvalidArgument(format!(
-            "prefix bits {bits} out of range 1..=256"
+            "prefix bits {bits} out of range 1..={MAX_PREFIX_BITS}"
         )));
     }
     let want = bits.div_ceil(8) as usize;
@@ -627,11 +639,22 @@ mod tests {
         // 16 bits needs 2 bytes; give 1.
         let err = h.add_script_prefixes([(vec![0xab], 16)]).await.unwrap_err();
         assert!(matches!(err, StreamError::InvalidArgument(_)));
-        // bits out of range.
+        // bits out of range (too small).
         let err = h.add_script_prefixes([(vec![], 0)]).await.unwrap_err();
+        assert!(matches!(err, StreamError::InvalidArgument(_)));
+        // bits above the server's 32-bit ceiling: rejected client-side rather
+        // than sent and silently dropped by the server (5 bytes = ceil(33/8)).
+        let err = h.add_script_prefixes([(vec![0u8; 5], 33)]).await.unwrap_err();
         assert!(matches!(err, StreamError::InvalidArgument(_)));
         // Nothing reached the wire.
         assert!(rx.try_recv().is_err());
+
+        // Valid boundary: exactly 32 bits, 4 bytes.
+        h.add_script_prefixes([(vec![0xde, 0xad, 0xbe, 0xef], 32)]).await.unwrap();
+        match next(&mut rx) {
+            Msg::AddScriptPrefixes(a) => assert_eq!(a.prefixes[0].bits, 32),
+            other => panic!("expected AddScriptPrefixes, got {other:?}"),
+        }
 
         // Valid: 16 bits, 2 bytes.
         h.add_script_prefixes([(vec![0xab, 0xcd], 16)]).await.unwrap();
