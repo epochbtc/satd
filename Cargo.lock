@@ -4128,6 +4128,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "satd-events-client"
+version = "0.4.0-pre"
+dependencies = [
+ "bitcoin",
+ "prost",
+ "satd-events-proto",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+]
+
+[[package]]
 name = "satd-events-proto"
 version = "0.4.0-pre"
 dependencies = [
