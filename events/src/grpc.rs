@@ -2196,7 +2196,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (cert_path, key_path, _ck) = self_signed_to_files(dir.path());
         // The registry is process-global and append-only, so other tests can
-        // only push the count higher — `>= before + 1` is race-safe.
+        // only push the count higher — `> before` is race-safe.
         let before = tls_config::registered_cert_count();
         let publisher = EventPublisher::new(edge(), 16);
         let _sink = GrpcEventSink::bind(
@@ -2219,7 +2219,7 @@ mod tests {
         .await
         .expect("TLS bind should succeed");
         assert!(
-            tls_config::registered_cert_count() >= before + 1,
+            tls_config::registered_cert_count() > before,
             "events TLS bind must register a reloadable cert/key for SIGUSR1",
         );
     }
