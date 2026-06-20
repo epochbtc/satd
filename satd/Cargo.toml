@@ -93,6 +93,10 @@ tonic = { workspace = true }
 tokio-stream = { workspace = true }
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "handshake"] }
 futures-util = "0.3"
+# The published Rust SDK, exercised end-to-end against a real satd node by
+# tests/e2e/sdk.rs (folded into the `e2e` target). Default features include
+# `bitcoin`, so the prefix-watch local re-filter (`PrefixWatcher`) is available.
+satd-events-client = { path = "../satd-events-client" }
 # Third-party Electrum client for the E2E suite. Independent
 # implementation of the wire protocol (predates `electrum-proto`;
 # ships its own message types). Drives the Electrum test group so

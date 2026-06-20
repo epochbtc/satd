@@ -4069,6 +4069,7 @@ dependencies = [
  "reqwest",
  "satd-auth",
  "satd-events",
+ "satd-events-client",
  "satd-mcp",
  "sd-notify",
  "serde",
