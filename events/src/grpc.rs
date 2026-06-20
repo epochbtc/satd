@@ -341,9 +341,6 @@ impl EventSink for GrpcEventSink {
             prefix_max_bits: self.limits.prefix_max_bits,
         };
         info!(target: "events::grpc", addr = %self.addr, "events gRPC server starting");
-        let shutdown_signal = async move {
-            let _ = shutdown.changed().await;
-        };
         // The TCP listener was already bound in `bind()` (so any
         // operator-visible bind failure happens at startup, not here).
         // Hand it to tonic via `serve_with_incoming_shutdown`, gating
@@ -358,6 +355,10 @@ impl EventSink for GrpcEventSink {
         };
         let max_conns = self.limits.max_conns;
         let listener = self.listener;
+        // Tracks the detached TLS accept-loop task so `run` can abort it on
+        // return (see the backstop after `serve`). `None` on the plaintext path,
+        // where tonic owns the listener and stops accepting on shutdown.
+        let mut tls_accept: Option<tokio::task::JoinHandle<()>> = None;
         // Unify the plaintext and TLS paths behind one `EventsConn` incoming
         // stream so the serve block below is transport-agnostic.
         let incoming: Pin<Box<dyn Stream<Item = Result<EventsConn, std::io::Error>> + Send>> =
@@ -369,12 +370,39 @@ impl EventSink for GrpcEventSink {
                 // at accept and rides the connection to release on drop.
                 let (tx, rx) = mpsc::channel::<Result<EventsConn, std::io::Error>>(16);
                 let tls = Arc::new(tls);
-                tokio::spawn(async move {
+                let mut shutdown_accept = shutdown.clone();
+                tls_accept = Some(tokio::spawn(async move {
                     let mut tcp = TcpListenerStream::new(listener);
-                    while let Some(res) = tcp.next().await {
+                    loop {
+                        // Stop accepting promptly on shutdown so this detached
+                        // task can't outlive `run`. (The plaintext path's
+                        // listener is owned by tonic and stops on shutdown; this
+                        // one needs an explicit signal — without it the loop would
+                        // busy-accept forever after graceful shutdown.)
+                        let res = tokio::select! {
+                            biased;
+                            _ = shutdown_accept.changed() => break,
+                            next = tcp.next() => match next {
+                                Some(r) => r,
+                                None => break,
+                            },
+                        };
                         let stream = match res {
                             Ok(s) => s,
-                            Err(_) => continue,
+                            Err(e) => {
+                                // Don't tight-loop on a persistent accept error
+                                // (e.g. EMFILE fd exhaustion): log and briefly
+                                // back off. The plaintext path surfaces accept
+                                // errors to tonic; here we keep the loop alive but
+                                // visible rather than spinning a core silently.
+                                debug!(
+                                    target: "events::grpc",
+                                    error = %e,
+                                    "events gRPC TCP accept error (backing off)",
+                                );
+                                tokio::time::sleep(Duration::from_millis(5)).await;
+                                continue;
+                            }
                         };
                         let permit = match &conn_sem {
                             Some(sem) => match sem.clone().try_acquire_owned() {
@@ -425,14 +453,17 @@ impl EventSink for GrpcEventSink {
                             // client cert there is nothing to check.
                             if tls.mtls_enabled {
                                 let (_, server_conn) = tls_stream.get_ref();
-                                if let Some(subject) = tls_config::peer_subject_label(server_conn) {
-                                    info!(
-                                        target: "events::grpc",
-                                        peer = ?peer,
-                                        subject = %subject,
-                                        "events gRPC mTLS client accepted",
-                                    );
-                                }
+                                // Audit every accepted mTLS client — including a
+                                // CA-signed cert with no usable CN/DNS-SAN, which
+                                // would otherwise be accepted with no log line.
+                                let subject = tls_config::peer_subject_label(server_conn)
+                                    .unwrap_or_else(|| "<unknown>".to_string());
+                                info!(
+                                    target: "events::grpc",
+                                    peer = ?peer,
+                                    subject = %subject,
+                                    "events gRPC mTLS client accepted",
+                                );
                                 if let Err(rej) =
                                     tls_config::check_peer_allowed(server_conn, &tls.allow)
                                 {
@@ -455,7 +486,7 @@ impl EventSink for GrpcEventSink {
                                 .await;
                         });
                     }
-                });
+                }));
                 Box::pin(ReceiverStream::new(rx))
             } else {
                 Box::pin(TcpListenerStream::new(listener).filter_map(move |res| match res {
@@ -488,6 +519,9 @@ impl EventSink for GrpcEventSink {
         // for the handler / future per-principal quota). The loopback +
         // allow_remote gate in `bind()` stays as a transport pre-check beneath
         // this app-layer auth.
+        let shutdown_signal = async move {
+            let _ = shutdown.changed().await;
+        };
         let result = if let Some(store) = self.auth.clone() {
             let interceptor = move |mut req: Request<()>| -> Result<Request<()>, Status> {
                 let principal = authenticate(&req, &store)?;
@@ -516,6 +550,13 @@ impl EventSink for GrpcEventSink {
         };
         if let Err(e) = result {
             warn!(target: "events::grpc", error = %e, "events gRPC server exited with error");
+        }
+        // Backstop: tear down the detached TLS accept loop when `run` returns for
+        // any reason. The `select!` above already breaks it on graceful shutdown;
+        // this also covers a serve error where the shutdown watch never fires.
+        // A no-op on the plaintext path (`tls_accept` is `None`).
+        if let Some(handle) = tls_accept {
+            handle.abort();
         }
     }
 }
@@ -2222,6 +2263,87 @@ mod tests {
             tls_config::registered_cert_count() > before,
             "events TLS bind must register a reloadable cert/key for SIGUSR1",
         );
+    }
+
+    /// A failed TLS handshake must release the connection-cap permit. With
+    /// `max_conns = 1`, a garbage (non-TLS) connection that fails the handshake
+    /// must not permanently hold the single permit — a subsequent well-formed
+    /// TLS client must still be able to connect. Guards the handshake-task error
+    /// paths (bad ClientHello / timeout / allowlist-reject) against a permit leak
+    /// that would wedge the listener at capacity after a single failed probe.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tls_handshake_failure_releases_connection_permit() {
+        use tokio::io::AsyncWriteExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (cert_path, key_path, ck) = self_signed_to_files(dir.path());
+
+        let publisher = EventPublisher::new(edge(), 16);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let limits = GrpcLimits { max_conns: 1, ..GrpcLimits::default() };
+        let sink = GrpcEventSink::bind(
+            "127.0.0.1:0",
+            false,
+            publisher.clone(),
+            limits,
+            None,
+            None,
+            None,
+            Some(GrpcTlsParams {
+                cert_path,
+                key_path,
+                mtls_enabled: false,
+                mtls_client_ca: None,
+                mtls_client_allow: vec![],
+                handshake_timeout: Duration::from_secs(5),
+            }),
+        )
+        .await
+        .expect("TLS bind should succeed");
+        let addr = sink.local_addr().unwrap();
+        publisher.attach_sinks(vec![Box::new(sink)], shutdown_rx.clone());
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Failed handshake: connect and send non-TLS garbage, then close. rustls
+        // rejects the ClientHello, the handshake task returns, and its permit
+        // must release.
+        {
+            let mut bad = tokio::net::TcpStream::connect(addr).await.expect("tcp connect");
+            let _ = bad.write_all(b"this is not a tls clienthello\r\n\r\n").await;
+            let _ = bad.shutdown().await;
+        }
+
+        // The good client must be able to connect. Retry briefly to absorb the
+        // async permit release without a fixed-time flake; if the permit leaked,
+        // every attempt fails (cap = 1 held forever) and the assert trips.
+        let mut roots = tokio_rustls::rustls::RootCertStore::empty();
+        roots.add(ck.cert.der().clone()).unwrap();
+        let client_cfg = tokio_rustls::rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_cfg));
+        let name = tokio_rustls::rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let mut connected = false;
+        for _ in 0..50 {
+            let tcp = match tokio::net::TcpStream::connect(addr).await {
+                Ok(t) => t,
+                Err(_) => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    continue;
+                }
+            };
+            if connector.connect(name.clone(), tcp).await.is_ok() {
+                connected = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            connected,
+            "a good TLS client could not connect after a failed handshake — \
+             the connection-cap permit was likely leaked on the error path",
+        );
+
+        let _ = shutdown_tx.send(true);
     }
 
     #[test]
