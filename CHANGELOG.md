@@ -75,8 +75,11 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   otherwise hand-writes: typed `Event` enum, per-call auth metadata, cursor
   capture/persistence, reconnect-with-backoff, `Lagged` auto-resume,
   replay-truncation detection, and the privacy-preserving prefix-watch local
-  re-filter (`PrefixWatcher`, behind the default-on `bitcoin` feature). Wire
-  types are extracted into a shared `satd-events-proto` crate so the client
+  re-filter (`PrefixWatcher`, behind the default-on `bitcoin` feature).
+  Native **TLS / mTLS** (default-on `tls` feature, `ring` provider):
+  `tls()` / `tls_ca_pem()` / `tls_client_identity()` / `tls_domain()` on the
+  builder encrypt the transport so the bearer token is never sent in cleartext.
+  Wire types are extracted into a shared `satd-events-proto` crate so the client
   pulls no server/`node` dependencies. New Operator Manual chapter + runnable
   examples. See the [release notes](docs/release-notes/0.4.0-pre.md).
 - **P2P listener bind failure is now fatal at startup.** With `-listen=1` (the

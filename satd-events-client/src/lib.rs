@@ -55,8 +55,37 @@
 //!   prefix-watch local re-filter: decodes a [`PrefixMatch`]'s `raw_tx` and
 //!   recomputes `sha256(scriptPubKey)` to keep only true matches.
 //!
-//! TLS is layered on next. The raw wire types are re-exported under [`proto`]
-//! for low-level use.
+//! ## TLS / mTLS (default-on `tls` feature)
+//!
+//! Builder methods encrypt the gRPC transport so a bearer token (and the event
+//! stream) never travels in cleartext:
+//!
+//! - [`tls`](StreamClientBuilder::tls) — TLS with the bundled Mozilla roots
+//!   (public-CA servers).
+//! - [`tls_ca_pem`](StreamClientBuilder::tls_ca_pem) — pin a private / self-signed
+//!   CA, the usual case for a satd node serving its own certificate.
+//! - [`tls_client_identity`](StreamClientBuilder::tls_client_identity) — present a
+//!   client certificate for mutual TLS (`-eventsgrpcmtls`).
+//! - [`tls_domain`](StreamClientBuilder::tls_domain) — override the verified
+//!   certificate name (SNI) when connecting by IP or through a proxy.
+//!
+//! ```no_run
+//! # use satd_events_client::StreamClient;
+//! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+//! let ca = std::fs::read("node-ca.pem")?;
+//! let client = StreamClient::builder("https://node.example:50051")
+//!     .tls_ca_pem(ca)
+//!     .bearer_token("…")
+//!     .connect()
+//!     .await?;
+//! # let _ = client;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! TLS uses the `ring` rustls provider. Opt out with `default-features = false`
+//! for a plaintext-only build. The raw wire types are re-exported under
+//! [`proto`] for low-level use.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
