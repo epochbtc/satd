@@ -496,7 +496,10 @@ impl StreamClientBuilder {
 
     /// Enable mutual TLS: present this PEM client certificate + private key to a
     /// server configured for mTLS (`-eventsgrpcmtls`). Combine with
-    /// [`tls_ca_pem`](Self::tls_ca_pem) to also pin the server's CA.
+    /// [`tls_ca_pem`](Self::tls_ca_pem) to pin the server's CA — without it the
+    /// *server* certificate is verified against the bundled public Mozilla roots,
+    /// so a self-signed satd node (the usual mTLS case) will fail the handshake
+    /// unless you also call `tls_ca_pem`.
     #[cfg(feature = "tls")]
     pub fn tls_client_identity(
         mut self,
@@ -527,6 +530,28 @@ impl StreamClientBuilder {
             ),
             None => None,
         };
+
+        // TLS is selected by tonic purely from the URI scheme, *not* from
+        // whether a `ClientTlsConfig` is attached: an `http://` (or scheme-less)
+        // endpoint silently connects in cleartext even with TLS configured,
+        // leaking the bearer token and the whole event stream while the caller
+        // believes the link is encrypted. Fail closed rather than downgrade.
+        #[cfg(feature = "tls")]
+        if self.tls.is_some() {
+            let scheme_is_https = self
+                .endpoint
+                .split_once("://")
+                .map(|(scheme, _)| scheme.eq_ignore_ascii_case("https"))
+                .unwrap_or(false);
+            if !scheme_is_https {
+                return Err(StreamError::InvalidEndpoint(
+                    "TLS was requested (tls / tls_ca_pem / tls_client_identity / tls_domain) but \
+                     the endpoint scheme is not https:// — refusing to connect in cleartext; use \
+                     an https:// endpoint"
+                        .to_string(),
+                ));
+            }
+        }
 
         let mut endpoint = Endpoint::from_shared(self.endpoint)
             .map_err(|e| StreamError::InvalidEndpoint(e.to_string()))?;
@@ -818,5 +843,30 @@ mod tests {
             !matches!(err, StreamError::InvalidEndpoint(_) | StreamError::InvalidToken),
             "expected a transport/connect error, got {err:?}",
         );
+    }
+
+    /// TLS requested over a plaintext `http://` endpoint must fail closed at
+    /// `connect()` rather than silently connecting in cleartext — tonic selects
+    /// TLS from the URI scheme alone, so without this guard the bearer token and
+    /// event stream would leak on the wire. Covers `http://` and a scheme-less
+    /// endpoint; the `https://` happy path is exercised above.
+    #[cfg(feature = "tls")]
+    #[tokio::test]
+    async fn tls_over_non_https_endpoint_is_refused() {
+        for ep in ["http://127.0.0.1:1", "127.0.0.1:1"] {
+            let err = StreamClient::builder(ep)
+                .tls_ca_pem(b"-----BEGIN CERTIFICATE-----".to_vec())
+                .bearer_token("SECRET")
+                .connect()
+                .await
+                .expect_err("TLS over non-https must be refused");
+            match err {
+                StreamError::InvalidEndpoint(msg) => assert!(
+                    msg.contains("https"),
+                    "expected an https-scheme error for {ep}, got {msg}"
+                ),
+                other => panic!("expected InvalidEndpoint for {ep}, got {other:?}"),
+            }
+        }
     }
 }
