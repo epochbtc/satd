@@ -35,3 +35,10 @@ bitcoin = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+# The prefix-privacy example uses `PrefixWatcher`, so it only builds with the
+# `bitcoin` feature (on by default). Gating it here keeps a
+# `--no-default-features --examples` build clean.
+[[example]]
+name = "prefix_privacy"
+required-features = ["bitcoin"]

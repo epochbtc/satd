@@ -19,6 +19,7 @@
 - [Esplora REST API](esplora.md)
 - [Electrum Protocol Server](electrum.md)
 - [Streaming Consumption API](streaming.md)
+- [Rust SDK (`satd-events-client`)](rust-sdk.md)
 - [MCP Server](mcp.md)
 
 # Packaging & Deployment

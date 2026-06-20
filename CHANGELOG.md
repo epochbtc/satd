@@ -70,6 +70,15 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   — the foundation for mempool-input `min_value` filtering and chainstate-less
   prefix-spend confirmation. SIGHUP-reloadable.
   See the [release notes](docs/release-notes/0.4.0-pre.md).
+- **Rust SDK for the Streaming API (`satd-events-client`).** A new published
+  async client crate that absorbs the tonic boilerplate every consumer
+  otherwise hand-writes: typed `Event` enum, per-call auth metadata, cursor
+  capture/persistence, reconnect-with-backoff, `Lagged` auto-resume,
+  replay-truncation detection, and the privacy-preserving prefix-watch local
+  re-filter (`PrefixWatcher`, behind the default-on `bitcoin` feature). Wire
+  types are extracted into a shared `satd-events-proto` crate so the client
+  pulls no server/`node` dependencies. New Operator Manual chapter + runnable
+  examples. See the [release notes](docs/release-notes/0.4.0-pre.md).
 - **P2P listener bind failure is now fatal at startup.** With `-listen=1` (the
   default) or `-whitebind`, a failure to bind the P2P port — almost always a
   second satd instance on the same datadir/port, or a port already in use — was
