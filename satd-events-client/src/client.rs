@@ -480,6 +480,7 @@ impl StreamClientBuilder {
     /// [`tls_ca_pem`](Self::tls_ca_pem) instead. Requires the `tls` feature
     /// (on by default).
     #[cfg(feature = "tls")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "tls")))]
     pub fn tls(mut self) -> Self {
         self.tls.get_or_insert_with(TlsSettings::default);
         self
@@ -489,6 +490,7 @@ impl StreamClientBuilder {
     /// self-signed leaf) in `pem` — the usual choice for a satd node serving its
     /// own certificate. Replaces the bundled roots for this connection.
     #[cfg(feature = "tls")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "tls")))]
     pub fn tls_ca_pem(mut self, pem: impl Into<Vec<u8>>) -> Self {
         self.tls.get_or_insert_with(TlsSettings::default).ca_pem = Some(pem.into());
         self
@@ -501,6 +503,7 @@ impl StreamClientBuilder {
     /// so a self-signed satd node (the usual mTLS case) will fail the handshake
     /// unless you also call `tls_ca_pem`.
     #[cfg(feature = "tls")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "tls")))]
     pub fn tls_client_identity(
         mut self,
         cert_pem: impl Into<Vec<u8>>,
@@ -515,6 +518,7 @@ impl StreamClientBuilder {
     /// (SNI). Use when the endpoint host differs from the certificate subject —
     /// e.g. connecting by IP, or through a proxy. Enables TLS if not already.
     #[cfg(feature = "tls")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "tls")))]
     pub fn tls_domain(mut self, domain: impl Into<String>) -> Self {
         self.tls.get_or_insert_with(TlsSettings::default).domain = Some(domain.into());
         self

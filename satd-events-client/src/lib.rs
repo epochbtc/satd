@@ -86,7 +86,26 @@
 //! TLS uses the `ring` rustls provider. Opt out with `default-features = false`
 //! for a plaintext-only build. The raw wire types are re-exported under
 //! [`proto`] for low-level use.
+//!
+//! ## Stability & versioning
+//!
+//! The SDK tracks the **additive `satd.events.v1` wire schema**, not the node's
+//! release cadence: new optional fields and event / watch kinds are added
+//! without breaking existing consumers, and the crate follows [semver]
+//! independently of the satd node version — a node and SDK do **not** need
+//! matching versions. The generated wire types are re-exported under [`proto`]
+//! so you can pin to the schema directly when a typed helper does not yet cover
+//! your case. Minimum supported Rust version (**MSRV**) is **1.93**; an MSRV
+//! bump is treated as a minor-version change.
+//!
+//! See the [wire/streaming spec][spec] for the underlying gRPC contract and the
+//! [`satd-events-proto`][proto-crate] crate for the generated types.
+//!
+//! [semver]: https://semver.org/
+//! [spec]: https://github.com/epochbtc/satd/blob/master/docs/api/streaming.md
+//! [proto-crate]: https://docs.rs/satd-events-proto
 
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
@@ -111,6 +130,7 @@ pub use resilience::{
 };
 
 #[cfg(feature = "bitcoin")]
+#[cfg_attr(docsrs, doc(cfg(feature = "bitcoin")))]
 pub use prefix::{
     prefix_of, scripthash_of, FundingHit, PrefixHits, PrefixWatcher, SpendingHit,
 };
