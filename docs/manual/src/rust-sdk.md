@@ -261,7 +261,7 @@ versions. The generated wire types are re-exported under `proto` so you can pin
 to the schema directly when a typed helper does not yet cover your case. The
 minimum supported Rust version (**MSRV**) is **1.93**; an MSRV bump is treated as
 a minor-version change. The underlying gRPC contract is the
-[streaming spec](../api/streaming.md).
+[streaming spec](streaming.md).
 
 ## Examples
 

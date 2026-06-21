@@ -1,7 +1,7 @@
-//! The streaming client: connect, `Subscribe` firehose, and a minimal `Watch`
-//! handle. Typed watch helpers and the reconnect/replay resilience layer are
-//! added in later revisions; this module establishes the connection, auth, and
-//! cursor-capturing event stream they build on.
+//! The streaming client: connect, `Subscribe` firehose, and the `Watch` handle
+//! with its typed watch helpers. This module establishes the connection, auth,
+//! and cursor-capturing event stream that the reconnect/replay resilience layer
+//! (the `resilience` module) builds on.
 
 use std::time::Duration;
 
