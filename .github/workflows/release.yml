@@ -537,7 +537,7 @@ jobs:
 
       - name: Compute image tags + labels
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           # `bake-target=metadata` is irrelevant here; we just want the
@@ -657,7 +657,7 @@ jobs:
 
       - name: Compute manifest tags
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           # Pre-release tags (anything with `-`, e.g. v0.1.0-rc1) get
