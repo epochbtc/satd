@@ -411,7 +411,7 @@ message RemoveTransactions { repeated bytes txids = 1; repeated uint32 min_depth
 
 message TxidMatched     { bytes txid = 1; bool confirmed = 2; uint32 height = 3; }
 message TxidReplaced    { bytes txid = 1; bytes replacing_txid = 2; }        // RBF
-message TxidEvicted     { bytes txid = 1; string reason = 2; }               // full_pool | expiry | block_conflict
+message TxidEvicted     { bytes txid = 1; string reason = 2; }               // full_pool | expiry | block_conflict | policy
 message TxidUnconfirmed { bytes txid = 1; uint32 prev_height = 2; }          // reorg rollback
 message TxidDepthReached{ bytes txid = 1; uint32 depth = 2; uint32 height = 3; }  // single-shot alarm
 message TxidFinalized   { bytes txid = 1; uint32 depth = 2; uint32 height = 3; }  // lifecycle auto-close

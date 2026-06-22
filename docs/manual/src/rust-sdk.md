@@ -26,6 +26,17 @@ layer (`tonic`, `prost`, `tokio`, `tokio-stream`, `thiserror`, and an optional
 satd-events-client = "0.4"
 ```
 
+> **Pre-publish:** the crate is not yet on crates.io. Until the published
+> release lands, depend on it via git and read its API docs locally:
+>
+> ```toml
+> satd-events-client = { git = "https://github.com/epochbtc/satd", branch = "master" }
+> ```
+>
+> ```sh
+> cargo doc -p satd-events-client --no-deps --all-features --open
+> ```
+
 The default build includes the `bitcoin` feature (the prefix-watch re-filter and
 scripthash helpers). For a minimal dependency tree that hands you raw bytes to
 filter yourself:
@@ -240,13 +251,27 @@ treated as retryable because its common causes (subscription cap, per-principal
 rate limit) are transient; a genuinely full *watch quota* is not, so inspect the
 boxed status message before retrying a watch-add forever.
 
+## Stability & versioning
+
+The SDK tracks the **additive `satd.events.v1` wire schema**, not the node's
+release cadence: new optional fields and event/watch kinds are added without
+breaking existing consumers, and the crate follows [semver](https://semver.org/)
+independently of the satd node version — a node and SDK do **not** need matching
+versions. The generated wire types are re-exported under `proto` so you can pin
+to the schema directly when a typed helper does not yet cover your case. The
+minimum supported Rust version (**MSRV**) is **1.93**; an MSRV bump is treated as
+a minor-version change. The underlying gRPC contract is the
+[streaming spec](streaming.md).
+
 ## Examples
 
 Runnable examples live in
 [`satd-events-client/examples/`](https://github.com/epochbtc/satd/tree/master/satd-events-client/examples):
 `firehose_tail`, `resilient_tail`, `watch_outpoints`, `descriptor_wallet`,
-`lifecycle_alarms`, and `prefix_privacy`.
+`lifecycle_alarms`, `prefix_privacy`, and — over an encrypted transport —
+`tls_tail` and `mtls_tail`.
 
 ```sh
 cargo run -p satd-events-client --example resilient_tail -- http://127.0.0.1:50051 /tmp/satd.cursor
+cargo run -p satd-events-client --example tls_tail -- https://node.example:50051 ./node-ca.pem
 ```

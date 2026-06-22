@@ -3,7 +3,8 @@
 //! of unwrapping nested protobuf `Option`s.
 //!
 //! Hashes and txids are carried as raw `Vec<u8>` here; the optional `bitcoin`
-//! feature layers typed conversions on top in a later revision.
+//! feature layers typed conversions on top (the prefix-watch re-filter and
+//! scripthash helpers).
 
 use satd_events_proto::v1 as pb;
 
@@ -219,7 +220,8 @@ pub enum Event {
     TxidEvicted {
         /// Transaction id.
         txid: Vec<u8>,
-        /// Free-text reason (`"full_pool"` | `"expiry"` | `"block_conflict"`).
+        /// Free-text reason (`"full_pool"` | `"expiry"` | `"block_conflict"` |
+        /// `"policy"`).
         reason: String,
     },
     /// A watched tx's confirming block was rolled back by a reorg.

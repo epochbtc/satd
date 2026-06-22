@@ -1,9 +1,15 @@
 [package]
 name = "satd-events-client"
 description = "Async Rust client SDK for the satd.events.v1 streaming consumption API"
+readme = "README.md"
+documentation = "https://docs.rs/satd-events-client"
+# MSRV: built and tested on the workspace toolchain (see rust-toolchain.toml).
+rust-version = "1.93"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+keywords = ["bitcoin", "satd", "streaming", "grpc", "mempool"]
+categories = ["api-bindings", "asynchronous", "cryptography::cryptocurrencies"]
 # Inherits the workspace `publish = false` for now (see satd-events-proto and the
 # workspace note in the root Cargo.toml); the publish flip is a dedicated PR.
 publish.workspace = true
@@ -57,3 +63,21 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 [[example]]
 name = "prefix_privacy"
 required-features = ["bitcoin"]
+
+# TLS / mTLS examples use the `tls`-gated builder methods (`tls_ca_pem`,
+# `tls_client_identity`); gating them keeps a `--no-default-features --examples`
+# build clean.
+[[example]]
+name = "tls_tail"
+required-features = ["tls"]
+
+[[example]]
+name = "mtls_tail"
+required-features = ["tls"]
+
+[package.metadata.docs.rs]
+# Document the full surface (the `tls` + `bitcoin`-gated items) and turn on the
+# `#[doc(cfg(...))]` feature-requirement labels, which are gated on the `docsrs`
+# cfg that docs.rs (and our GitHub Pages build) set via `rustdoc-args`.
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

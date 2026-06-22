@@ -154,7 +154,7 @@ message TxidReplaced {
 // A watched tx left the mempool by policy (not confirmation, not RBF).
 message TxidEvicted {
   bytes  txid   = 1;
-  string reason = 2; // "full_pool" | "expiry" | "block_conflict"
+  string reason = 2; // "full_pool" | "expiry" | "block_conflict" | "policy"
 }
 
 // A watched tx's confirming block was rolled back by a reorg (it is back in flight).
