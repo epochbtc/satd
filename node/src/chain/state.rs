@@ -3729,11 +3729,11 @@ impl ChainState {
             |h| store_ref.get_block_index(h),
         )?;
 
-        // Timestamp check (median time past)
-        validation::pow::check_timestamp(&block.header, new_height, |h| {
-            let hash = store_ref.get_block_hash_by_height(h)?;
-            store_ref.get_block_index(&hash)
-        })?;
+        // Timestamp check (median time past). The MTP ancestor walk follows the
+        // candidate block's own parent pointers (not the active-chain height
+        // index), so a block on a competing branch is judged against its own
+        // ancestors — required for reorgs onto lower-timestamp testnet4 forks.
+        validation::pow::check_timestamp(&block.header, &parent, |h| store_ref.get_block_index(h))?;
 
         // Future-timestamp check (Core: time-too-new, 2h ahead of now).
         // Historical blocks always pass; only live, ahead-of-clock blocks
