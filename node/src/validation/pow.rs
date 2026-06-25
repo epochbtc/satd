@@ -255,28 +255,47 @@ fn compare_targets(a: &[u8; 32], b: &[u8; 32]) -> i32 {
     0
 }
 
-/// Check that the block timestamp is greater than the median of the previous 11 blocks.
-pub fn check_timestamp<F>(header: &Header, height: u32, get_ancestor: F) -> Result<(), ValidationError>
+/// Check that the block timestamp is greater than the median time past of its
+/// own ancestors — Bitcoin Core's `block.GetBlockTime() > pindexPrev->GetMedianTimePast()`.
+///
+/// The median is taken over `prev` and up to its 10 ancestors, reached by
+/// walking **parent pointers** (`prev_blockhash`) via `get_by_hash` — exactly
+/// Core's `pindex->pprev` walk in `GetMedianTimePast`.
+///
+/// This must NOT resolve ancestors through the height→hash index. That index
+/// tracks the *active chain*, so for a block on a competing branch it returns
+/// the active chain's blocks at those heights rather than the candidate block's
+/// real ancestors. On testnet4's min-difficulty timestamp sawtooth a competing
+/// branch routinely carries timestamps lower than the current fork tip, so a
+/// height-indexed MTP would spuriously reject the branch as `time-too-old` and
+/// permanently block the reorg onto it. Parent pointers are always present for
+/// any ancestor we hold, so the walk is immune to active-chain index gaps —
+/// the same hazard already avoided in the difficulty walk-back above.
+pub fn check_timestamp<G>(
+    header: &Header,
+    prev: &BlockIndexEntry,
+    get_by_hash: G,
+) -> Result<(), ValidationError>
 where
-    F: Fn(u32) -> Option<BlockIndexEntry>,
+    G: Fn(&BlockHash) -> Option<BlockIndexEntry>,
 {
-    if height == 0 {
-        return Ok(());
-    }
+    const MEDIAN_TIME_SPAN: usize = 11;
 
-    let start = height.saturating_sub(11);
-    let mut timestamps: Vec<u32> = Vec::new();
-    for h in start..height {
-        if let Some(entry) = get_ancestor(h) {
-            timestamps.push(entry.header.time);
+    let mut timestamps: Vec<u32> = Vec::with_capacity(MEDIAN_TIME_SPAN);
+    let mut current = Some(prev.clone());
+    while let Some(entry) = current {
+        timestamps.push(entry.header.time);
+        if timestamps.len() == MEDIAN_TIME_SPAN || entry.height == 0 {
+            break;
         }
+        current = get_by_hash(&entry.header.prev_blockhash);
     }
 
     if timestamps.is_empty() {
         return Ok(());
     }
 
-    timestamps.sort();
+    timestamps.sort_unstable();
     let median = timestamps[timestamps.len() / 2];
 
     if header.time <= median {
@@ -733,73 +752,127 @@ mod tests {
         assert!(check_difficulty(&header, &prev, Network::Signet, |_| None, |_| None).is_ok());
     }
 
+    /// Build a parent-pointer-chained run of `count` block-index entries whose
+    /// timestamps are produced by `time_at(height)`, returning the entries plus
+    /// a by-hash resolver (mirroring `Store::get_block_index`). Each entry's
+    /// `prev_blockhash` links to the previous entry's real `block_hash()`, so a
+    /// `check_timestamp` walk reaches the intended ancestors.
+    fn build_chain(
+        count: u32,
+        time_at: impl Fn(u32) -> u32,
+    ) -> (Vec<BlockIndexEntry>, std::collections::HashMap<BlockHash, BlockIndexEntry>) {
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+        let mut entries: Vec<BlockIndexEntry> = Vec::with_capacity(count as usize);
+        for i in 0..count {
+            let mut hdr = genesis.header;
+            hdr.time = time_at(i);
+            if i > 0 {
+                hdr.prev_blockhash = entries[(i - 1) as usize].header.block_hash();
+            }
+            entries.push(BlockIndexEntry {
+                header: hdr,
+                height: i,
+                status: BlockStatus::Valid,
+                num_tx: 1,
+                file_number: 0,
+                data_pos: 0,
+                chainwork: [0u8; 32],
+            });
+        }
+        let map = entries
+            .iter()
+            .map(|e| (e.header.block_hash(), e.clone()))
+            .collect();
+        (entries, map)
+    }
+
     #[test]
     fn test_timestamp_above_median_passes() {
         // Build 11 ancestors with increasing timestamps, header time above median -> pass.
-        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
         let base_time = 1_000_000u32;
-
-        let entries: Vec<BlockIndexEntry> = (0..11)
-            .map(|i| {
-                let mut hdr = genesis.header;
-                hdr.time = base_time + i * 100;
-                BlockIndexEntry {
-                    header: hdr,
-                    height: i,
-                    status: BlockStatus::Valid,
-                    num_tx: 1,
-                    file_number: 0,
-                    data_pos: 0,
-                    chainwork: [0u8; 32],
-                }
-            })
-            .collect();
+        let (entries, map) = build_chain(11, |i| base_time + i * 100);
+        let prev = entries.last().unwrap().clone();
 
         // Median of [base, base+100, ..., base+1000] sorted = base+500
-        let mut header = genesis.header;
+        let mut header = prev.header;
         header.time = base_time + 501; // Above median
 
-        let get_ancestor = |h: u32| -> Option<BlockIndexEntry> {
-            entries.get(h as usize).cloned()
-        };
-
-        assert!(check_timestamp(&header, 11, get_ancestor).is_ok());
+        assert!(check_timestamp(&header, &prev, |h| map.get(h).cloned()).is_ok());
     }
 
     #[test]
     fn test_timestamp_at_median_fails() {
         // Header time equal to median of previous 11 blocks -> TimeTooOld.
-        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
         let base_time = 1_000_000u32;
-
-        let entries: Vec<BlockIndexEntry> = (0..11)
-            .map(|i| {
-                let mut hdr = genesis.header;
-                hdr.time = base_time + i * 100;
-                BlockIndexEntry {
-                    header: hdr,
-                    height: i,
-                    status: BlockStatus::Valid,
-                    num_tx: 1,
-                    file_number: 0,
-                    data_pos: 0,
-                    chainwork: [0u8; 32],
-                }
-            })
-            .collect();
+        let (entries, map) = build_chain(11, |i| base_time + i * 100);
+        let prev = entries.last().unwrap().clone();
 
         // Median of [base, base+100, ..., base+1000] sorted = base+500
-        let mut header = genesis.header;
+        let mut header = prev.header;
         header.time = base_time + 500; // Equal to median
 
-        let get_ancestor = |h: u32| -> Option<BlockIndexEntry> {
-            entries.get(h as usize).cloned()
-        };
-
         assert!(matches!(
-            check_timestamp(&header, 11, get_ancestor),
+            check_timestamp(&header, &prev, |h| map.get(h).cloned()),
             Err(ValidationError::TimeTooOld)
         ));
+    }
+
+    #[test]
+    fn test_timestamp_walks_candidate_branch_not_active_chain() {
+        // Regression for the testnet4 reorg wedge (node stuck at height 139,285):
+        // a block on a competing branch must have its median-time-past computed
+        // from *its own* ancestors via the parent-pointer walk, not from whatever
+        // the active-chain height index holds at those heights.
+        //
+        // Two branches share heights 0..=2, then diverge for the entire 11-block
+        // MTP window: the canonical branch carries low timestamps, the active
+        // fork carries high ones. A candidate extending the canonical branch is
+        // judged only against canonical ancestors, so it is accepted even though
+        // its timestamp sits far below the active fork's MTP — letting the reorg
+        // proceed. Resolved by active-chain height index, the same candidate
+        // would have been rejected `time-too-old` and wedged the node.
+        let base = 1_000_000u32;
+
+        // Canonical branch, heights 0..=13, steadily increasing low timestamps.
+        let (canonical, mut map) = build_chain(14, |h| base + h * 100);
+
+        // Competing fork: shares heights 0..=2, then heights 3..=13 with high
+        // timestamps, linked by their own parent pointers (vector index == height).
+        let mut fork: Vec<BlockIndexEntry> = canonical[..3].to_vec();
+        for h in 3..=13u32 {
+            let mut e = canonical[h as usize].clone();
+            e.header.time = base + 50_000 + h * 100;
+            e.header.prev_blockhash = fork[(h - 1) as usize].header.block_hash();
+            fork.push(e);
+        }
+        for e in &fork {
+            map.insert(e.header.block_hash(), e.clone());
+        }
+
+        let canon_tip = canonical[13].clone();
+        let fork_tip = fork[13].clone();
+
+        // Candidate on the canonical branch: above the canonical MTP (base+800),
+        // below the fork MTP (base+50_800).
+        let mut candidate = canon_tip.header;
+        candidate.prev_blockhash = canon_tip.header.block_hash();
+        candidate.time = base + 900;
+
+        // Walking the candidate's own (canonical) ancestors accepts it...
+        assert!(
+            check_timestamp(&candidate, &canon_tip, |h| map.get(h).cloned()).is_ok(),
+            "candidate must pass against its own canonical ancestors"
+        );
+
+        // ...whereas judging it against the active fork's ancestors rejects it —
+        // exactly the by-height behaviour that wedged the testnet4 node.
+        assert!(
+            matches!(
+                check_timestamp(&candidate, &fork_tip, |h| map.get(h).cloned()),
+                Err(ValidationError::TimeTooOld)
+            ),
+            "the active fork's MTP is higher — the old by-height walk wedged here"
+        );
     }
 
     #[test]

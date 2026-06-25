@@ -488,13 +488,24 @@ fn case_bad_diffbits() -> Satd {
 }
 
 fn case_time_too_old_mtp() -> Satd {
-    // 11 ancestors at increasing times; header at/below median → reject.
-    let ancestors: Vec<BlockIndexEntry> =
-        (1..=11).map(|h| block_index_entry(h, BASE_TIME + h * 100, REGTEST_POWLIMIT_BITS)).collect();
+    // 11 parent-chained ancestors at increasing times; candidate at/below the
+    // median time past → reject. MTP walks the candidate's own parent pointers,
+    // so the ancestors must be linked by real block hashes.
+    let mut ancestors: Vec<BlockIndexEntry> = Vec::new();
+    for h in 1..=11u32 {
+        let mut e = block_index_entry(h, BASE_TIME + h * 100, REGTEST_POWLIMIT_BITS);
+        if let Some(parent) = ancestors.last() {
+            e.header.prev_blockhash = parent.header.block_hash();
+        }
+        ancestors.push(e);
+    }
+    let by_hash: std::collections::HashMap<BlockHash, BlockIndexEntry> =
+        ancestors.iter().map(|e| (e.header.block_hash(), e.clone())).collect();
+    let prev = ancestors.last().unwrap().clone();
     let mut header = bitcoin::constants::genesis_block(Network::Regtest).header;
+    header.prev_blockhash = prev.header.block_hash();
     header.time = BASE_TIME; // below the median of [BASE+100..BASE+1100]
-    check_timestamp(&header, 12, |h| ancestors.iter().find(|e| e.height == h).cloned())
-        .map_err(|e| e.to_string())
+    check_timestamp(&header, &prev, |h| by_hash.get(h).cloned()).map_err(|e| e.to_string())
 }
 
 // -- GAPS: Core rejects, satd accepts --
