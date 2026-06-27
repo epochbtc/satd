@@ -296,10 +296,8 @@ impl BackgroundChainState {
             },
             |h| store_ref.get_block_index(h),
         )?;
-        validation::pow::check_timestamp(&block.header, new_height, |h| {
-            let hash = store_ref.get_block_hash_by_height(h)?;
-            store_ref.get_block_index(&hash)
-        })?;
+        // MTP walks the candidate's own parent pointers (see `check_timestamp`).
+        validation::pow::check_timestamp(&block.header, &parent, |h| store_ref.get_block_index(h))?;
         // Mandatory block-version gate (Core: bad-version) — BIP34/66/65.
         // Deterministic, height-based; mirrors the live accept path.
         connect::check_block_version(&block.header, new_height, self.network)?;
