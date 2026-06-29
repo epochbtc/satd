@@ -30,8 +30,9 @@ message SubscribeControl {
     // de-duplicates the overlap by (height, hash). Historical watch *matches*
     // are not replayed — the client reconstructs them from the replayed
     // blocks against its own watch-set. Rate-limited per principal; at most
-    // one re-anchor drains at a time (a SetCursor arriving mid-drain is
-    // dropped).
+    // one re-anchor is in flight at a time — a SetCursor arriving while one is
+    // queued or actively draining is rejected with SetCursorResult{
+    // CursorRejected{CONCURRENT_REANCHOR}}, never silently dropped.
     SetCursor       set_cursor       = 1;
     // Adjust the live firehose category bitfield (mempool=1, chain=2,
     // heartbeat=4; 0 = all). Applies immediately.
