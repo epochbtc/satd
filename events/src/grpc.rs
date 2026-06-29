@@ -2550,6 +2550,7 @@ mod tests {
                 pb::node_event::Body::TxidDepthReached(_) => "txid_depth_reached",
                 pb::node_event::Body::TxidFinalized(_) => "txid_finalized",
                 pb::node_event::Body::PrefixMatched(_) => "prefix_matched",
+                pb::node_event::Body::SetCursorResult(_) => "set_cursor_result",
             })
             .collect();
         assert!(
@@ -3600,6 +3601,21 @@ mod tests {
             .await
             .unwrap();
 
+        // The re-anchor is acked in-band ahead of the replay batch (#439).
+        let ack = tokio::time::timeout(Duration::from_secs(3), stream.message())
+            .await
+            .expect("timeout")
+            .expect("transport")
+            .expect("stream ended");
+        let Some(pb::node_event::Body::SetCursorResult(r)) = ack.body else {
+            panic!("expected SetCursorResult ack first, got {:?}", ack.body);
+        };
+        let Some(pb::set_cursor_result::Outcome::Accepted(a)) = r.outcome else {
+            panic!("expected CursorAccepted, got {:?}", r.outcome);
+        };
+        assert!(!a.clamped, "in-window cursor is not clamped");
+        assert_eq!(a.earliest_replayed, 3, "replay starts at cursor.height + 1");
+
         for expected_h in [3u32, 4, 5] {
             let ev = tokio::time::timeout(Duration::from_secs(3), stream.message())
                 .await
@@ -3772,8 +3788,8 @@ mod tests {
         }
         assert!(registry.has_watchers(), "watch registered (establishment + add allowed)");
 
-        // SetCursor: rate check #3 → throttled → dropped. Were it served it would
-        // replay confirmed blocks 3, 4, 5.
+        // SetCursor: rate check #3 → throttled → rejected (no replay). Were it
+        // served it would replay confirmed blocks 3, 4, 5.
         ctrl_tx
             .send(pb::SubscribeControl {
                 msg: Some(pb::subscribe_control::Msg::SetCursor(pb::SetCursor {
@@ -3790,7 +3806,8 @@ mod tests {
 
         // Give the inbound task time to process (and, in a regression, re-anchor)
         // the SetCursor before we trigger the sentinel match. With the rate-limit
-        // in place the SetCursor is dropped, so this wait sees no replay.
+        // in place the SetCursor is rejected (no replay), but it now emits a
+        // deterministic CursorRejected (#439) ahead of the sentinel match.
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         // Sentinel: a mempool spend of the watched outpoint → OutpointSpent. The
@@ -3810,6 +3827,25 @@ mod tests {
         };
         registry.scan_mempool_tx(&spend);
 
+        // First: the deterministic rejection (rate-limited), not a replayed block.
+        let ev = tokio::time::timeout(Duration::from_secs(3), stream.message())
+            .await
+            .expect("timeout")
+            .expect("transport")
+            .expect("stream ended");
+        let Some(pb::node_event::Body::SetCursorResult(r)) = ev.body else {
+            panic!("expected a CursorRejected, not a replayed block (got {:?})", ev.body);
+        };
+        let Some(pb::set_cursor_result::Outcome::Rejected(rj)) = r.outcome else {
+            panic!("expected CursorRejected, got {:?}", r.outcome);
+        };
+        assert_eq!(
+            rj.reason,
+            pb::cursor_rejected::Reason::RateLimited as i32,
+            "throttled SetCursor is rejected with RATE_LIMITED",
+        );
+
+        // Then the live match: no replayed blocks came between.
         let ev = tokio::time::timeout(Duration::from_secs(3), stream.message())
             .await
             .expect("timeout")
@@ -3817,8 +3853,8 @@ mod tests {
             .expect("stream ended");
         assert!(
             matches!(ev.body, Some(pb::node_event::Body::OutpointSpent(_))),
-            "rate-limited SetCursor produced no replay: the first event is the live \
-             match, not a replayed block (got {:?})",
+            "rate-limited SetCursor produced no replay: after the rejection the next \
+             event is the live match, not a replayed block (got {:?})",
             ev.body,
         );
         assert!(
