@@ -25,10 +25,13 @@ pub mod schema;
 pub mod sink;
 pub mod watch;
 
-pub use envelope::{Cursor, EdgeIdentity, EdgeStamp, NodeEvent, NodeEventBody};
+pub use envelope::{
+    Cursor, CursorRejectReason, EdgeIdentity, EdgeStamp, NodeEvent, NodeEventBody, SetCursorOutcome,
+};
 pub use publisher::{EventPublisher, ENVELOPE_BROADCAST_CAPACITY};
 pub use replay::{
-    build_cursor_replay, lagged_event, BlockCursorSource, CursorReplay, MAX_REPLAY_BLOCKS,
+    build_cursor_replay, cursor_accepted_event, cursor_rejected_event, lagged_event,
+    BlockCursorSource, CursorReplay, MAX_REPLAY_BLOCKS,
 };
 pub use schema::SCHEMA_VERSION;
 pub use sink::EventSink;

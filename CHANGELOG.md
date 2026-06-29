@@ -11,6 +11,14 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
 
 ## [Unreleased]
 
+- **Deterministic mid-stream re-anchor (`set_cursor`).** A `SetCursor` on the
+  bidirectional gRPC `Watch` stream now emits exactly one in-band
+  `SetCursorResult` (`CursorAccepted{from, clamped, earliest_replayed}` ahead of
+  the replay, or `CursorRejected{reason, current_head}`), so a consumer can tell
+  "accepted, replaying" from "ignored" instead of inferring it. Over-rate,
+  concurrent, empty, and no-source re-anchors are now reported rather than
+  silently dropped. New `satd-events-client` `Event::CursorAccepted` /
+  `Event::CursorRejected` variants. (#439)
 - **Events gRPC TLS / mTLS.** The events gRPC streaming listener can now
   terminate TLS (and mutual TLS) in-process, sharing the cert / mTLS-allowlist
   plumbing of the RPC / Electrum / Esplora surfaces. Setting `eventsgrpctlscert`

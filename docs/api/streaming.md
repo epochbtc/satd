@@ -119,6 +119,7 @@ message NodeEvent {
     TxidDepthReached txid_depth_reached = 21;  // depth alarm, single-shot (§7.4)
     TxidFinalized txid_finalized = 22;  // lifecycle auto-close, terminal (§7.4)
     PrefixMatched prefix_matched = 23;  // privacy-preserving prefix watch (§7.5)
+    SetCursorResult set_cursor_result = 24;  // deterministic re-anchor ack/reject (§7.3.1)
   }
 }
 ```
@@ -391,14 +392,50 @@ It is an **ordered drain-replay-resume**, not an interleave:
 not durable (they are never part of cursor replay, nor bridged to ZMQ). A
 re-anchor replays the firehose/confirmed history only; the client reconstructs any
 historical matches it needs from the replayed blocks against its own watch-set, and
-receives live matches going forward. A re-anchor on a server with no `block_source`
-configured is a no-op (the same fallback as `Subscribe(from_cursor)` without a
-source). Replay work is bounded two ways: concurrent re-anchors are capped at one
-in flight per stream (a `SetCursor` arriving while a drain is running is dropped),
-and each actionable re-anchor is charged against the connection's per-principal
-rate limit — the same token bucket as watch-set adds — so back-to-back `SetCursor`s
-in a tight loop are throttled rather than allowed to re-walk the block index
-unboundedly. (Operator/loopback principals bypass the rate limit, as elsewhere.)
+receives live matches going forward. Replay work is bounded two ways: concurrent
+re-anchors are capped at one in flight per stream, and each actionable re-anchor is
+charged against the connection's per-principal rate limit — the same token bucket as
+watch-set adds — so back-to-back `SetCursor`s in a tight loop are throttled rather
+than allowed to re-walk the block index unboundedly. (Operator/loopback principals
+bypass the rate limit, as elsewhere.)
+
+##### Deterministic outcome (`SetCursorResult`)
+
+Every actionable `SetCursor` produces exactly one in-band `SetCursorResult`
+`NodeEvent` on the stream, so a client can distinguish "accepted, replaying from
+X" from "ignored, still live from the old position" without inferring it from the
+event flow:
+
+```proto
+message SetCursorResult {
+  oneof outcome {
+    CursorAccepted accepted = 1;
+    CursorRejected rejected = 2;
+  }
+}
+message CursorAccepted { Cursor from = 1; bool clamped = 2; uint32 earliest_replayed = 3; }
+message CursorRejected {
+  enum Reason { REASON_UNSPECIFIED = 0; RATE_LIMITED = 1; CONCURRENT_REANCHOR = 2; EMPTY_CURSOR = 3; NO_SOURCE = 4; }
+  Reason reason = 1; Cursor current_head = 2;
+}
+```
+
+- **`CursorAccepted`** is emitted **ahead of the replay batch**: replay is now
+  running. When the requested cursor predates the replay window
+  (`MAX_REPLAY_BLOCKS = 10 000` confirmed blocks) the lower end is **clamped** —
+  `clamped = true` and `earliest_replayed` is the first height that will actually
+  be replayed; the client must full-resync the skipped range below it from another
+  source (e.g. RPC `getblock`).
+- **`CursorRejected`** means the re-anchor did **not** run and the live stream is
+  unchanged: `RATE_LIMITED` (per-principal limit), `CONCURRENT_REANCHOR` (a drain
+  already in flight), `EMPTY_CURSOR` (no cursor in the request), or `NO_SOURCE`
+  (server has no `block_source`). `current_head` is the server's present resume
+  position, so the client can retry, back off, or escalate to a full resnapshot.
+
+A consumer with an at-least-once delivery contract should drive its catch-up
+state machine off these results rather than treating the `SetCursor` send as
+success. WS/SSE clients have no mid-stream control channel and so never see a
+`SetCursorResult` — they re-anchor by reconnecting with `?from_cursor=`.
 
 ### 7.4 Transaction lifecycle & confirmation-depth watches
 

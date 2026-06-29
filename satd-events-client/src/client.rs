@@ -366,10 +366,21 @@ impl WatchHandle {
     /// resume live, without tearing down the watch-set. Rate-limited per
     /// principal; only one re-anchor drains at a time.
     ///
-    /// **Best-effort:** `Ok(())` means the request was sent, not that the
-    /// re-anchor ran. The server silently drops an over-rate or concurrent
-    /// re-anchor (no error is returned), so do not rely on this for critical
-    /// resynchronization — for that, reconnect with `from_cursor`.
+    /// `Ok(())` means the request was written to the control stream — **not**
+    /// that the re-anchor ran. The outcome arrives **in-band on the event
+    /// stream** as exactly one of (#439):
+    ///
+    /// - [`Event::CursorAccepted`](crate::Event::CursorAccepted) — admitted;
+    ///   confirmed-history replay follows it (watch for `clamped` to learn the
+    ///   server truncated the lower end and you must full-resync below
+    ///   `earliest_replayed`).
+    /// - [`Event::CursorRejected`](crate::Event::CursorRejected) — declined
+    ///   (rate-limited, concurrent re-anchor, empty cursor, or no block source);
+    ///   the live stream is unchanged. Retry, back off, or escalate to a full
+    ///   resnapshot per the [`reason`](crate::CursorRejectReason).
+    ///
+    /// A consumer that needs at-least-once delivery should drive its catch-up
+    /// state machine off these events rather than treating `Ok(())` as success.
     pub async fn set_cursor(&self, cursor: Cursor) -> Result<(), StreamError> {
         self.send_msg(pb::subscribe_control::Msg::SetCursor(pb::SetCursor {
             cursor: Some(cursor),

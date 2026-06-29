@@ -353,6 +353,48 @@ pub enum NodeEventBody {
         dropped_count: u64,
         resume_cursor: Cursor,
     },
+    /// Deterministic outcome of a mid-stream re-anchor (`SetCursor`). Like
+    /// [`Lagged`](NodeEventBody::Lagged), this is synthesized by the carrier
+    /// and emitted in-band — never bridged from an internal event. Emitted
+    /// exactly once per actionable `SetCursor`, ahead of any confirmed history
+    /// the re-anchor admits, so a client can distinguish "accepted, replaying"
+    /// from "ignored, still live from the old position".
+    SetCursorResult(SetCursorOutcome),
+}
+
+/// Why a mid-stream re-anchor was not admitted (see [`SetCursorOutcome`]).
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub enum CursorRejectReason {
+    /// Per-principal re-anchor rate limit exceeded.
+    RateLimited,
+    /// Another re-anchor is already draining (only one runs at a time).
+    ConcurrentReanchor,
+    /// The `SetCursor` carried no cursor.
+    EmptyCursor,
+    /// The server has no block source to replay from.
+    NoSource,
+}
+
+/// Deterministic result of a `SetCursor` re-anchor, carried in-band by
+/// [`NodeEventBody::SetCursorResult`].
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub enum SetCursorOutcome {
+    /// The re-anchor was admitted; confirmed-history replay follows this event
+    /// in height order before the live tail resumes. `clamped` is true when the
+    /// requested cursor predated the replay window and the lower end was
+    /// dropped — replay still runs, but only from `earliest_replayed`, and the
+    /// client must full-resync history below it.
+    Accepted {
+        from: Cursor,
+        clamped: bool,
+        earliest_replayed: u32,
+    },
+    /// The re-anchor was not admitted; the live stream is unchanged.
+    /// `current_head` is the server's present resume position.
+    Rejected {
+        reason: CursorRejectReason,
+        current_head: Cursor,
+    },
 }
 
 /// Durable resume position carried alongside confirmed-side events.
@@ -466,6 +508,11 @@ impl NodeEvent {
             // it sets all bits (and carriers emit it directly, bypassing the
             // filter, anyway).
             NodeEventBody::Lagged { .. } => u32::MAX,
+            // A re-anchor ack is a control signal addressed to the requesting
+            // subscriber, not a content category: it must reach the client
+            // regardless of the category mask (and carriers emit it directly,
+            // bypassing the filter, anyway).
+            NodeEventBody::SetCursorResult(_) => u32::MAX,
         }
     }
 }

@@ -19,7 +19,10 @@ use bitcoin::BlockHash;
 
 use crate::chain::events::ChainEvent;
 
-use super::{Cursor, EdgeStamp, EventPublisher, NodeEvent, NodeEventBody};
+use super::{
+    Cursor, CursorRejectReason, EdgeStamp, EventPublisher, NodeEvent, NodeEventBody,
+    SetCursorOutcome,
+};
 
 /// Upper bound on the confirmed-block span replayed for a single `from_cursor`
 /// resume. A client resuming from a cursor more than this many blocks behind
@@ -116,6 +119,17 @@ pub struct CursorReplay {
     /// Highest replayed mempool `seq`. Live mempool events at or below it were
     /// already replayed and must be dropped.
     pub mempool_dedup_through: u64,
+    /// First confirmed height the replay will emit (`from.height + 1` normally;
+    /// higher when the requested span exceeded `max_blocks` and the lower end
+    /// was clamped). `clamped` records whether that truncation happened, so a
+    /// carrier can surface a deterministic "accepted but clamped — resync below
+    /// this height" signal (see [`CursorAccepted`](crate::events) on the wire).
+    /// When no confirmed replay runs (chain category masked off, or the cursor
+    /// is at/after the tip), this is `from.height + 1` and `clamped` is false.
+    pub earliest_replayed: u32,
+    /// True when the requested replay span was older than `max_blocks` and the
+    /// lower end was dropped.
+    pub clamped: bool,
 }
 
 /// Build the durable cursor replay (snapshot→live handoff) shared by all
@@ -141,7 +155,8 @@ pub fn build_cursor_replay(
     max_blocks: u32,
 ) -> CursorReplay {
     let snapshot_tip = src.current_tip_height();
-    let mut start = from.height.saturating_add(1);
+    let requested_start = from.height.saturating_add(1);
+    let mut start = requested_start;
     // Bound the confirmed replay span. A cursor far behind the tip would
     // otherwise stream the entire chain (a DoS amplification) and build an
     // unbounded boundary-dedup map. Replayed events carry their height cursor,
@@ -158,6 +173,7 @@ pub fn build_cursor_replay(
         );
         start = clamped;
     }
+    let clamped = start != requested_start;
 
     let mut events: Vec<NodeEvent> = Vec::new();
     let mut confirmed_dedup: HashMap<u32, BlockHash> = HashMap::new();
@@ -193,6 +209,8 @@ pub fn build_cursor_replay(
         events,
         confirmed_dedup,
         mempool_dedup_through,
+        earliest_replayed: start,
+        clamped,
     }
 }
 
@@ -234,6 +252,46 @@ pub fn lagged_event(
     )
 }
 
+/// Build the in-band [`NodeEventBody::SetCursorResult`] ack a carrier emits when
+/// a mid-stream re-anchor is **admitted**: emitted (seq 0) immediately ahead of
+/// the replay batch so the client knows replay is now running. `clamped` /
+/// `earliest_replayed` come straight from the [`CursorReplay`] the carrier is
+/// about to drain.
+pub fn cursor_accepted_event(
+    publisher: &EventPublisher,
+    from: Cursor,
+    clamped: bool,
+    earliest_replayed: u32,
+) -> NodeEvent {
+    NodeEvent::new(
+        synth_stamp(publisher),
+        NodeEventBody::SetCursorResult(SetCursorOutcome::Accepted {
+            from,
+            clamped,
+            earliest_replayed,
+        }),
+    )
+}
+
+/// Build the in-band [`NodeEventBody::SetCursorResult`] notice a carrier emits
+/// when a mid-stream re-anchor is **not** admitted (rate limit, a re-anchor
+/// already draining, an empty cursor, or no block source). The live stream is
+/// unchanged; `current_head` is the subscriber's current resume position so the
+/// client can retry, back off, or escalate to a full resnapshot.
+pub fn cursor_rejected_event(
+    publisher: &EventPublisher,
+    reason: CursorRejectReason,
+    current_head: Cursor,
+) -> NodeEvent {
+    NodeEvent::new(
+        synth_stamp(publisher),
+        NodeEventBody::SetCursorResult(SetCursorOutcome::Rejected {
+            reason,
+            current_head,
+        }),
+    )
+}
+
 /// Edge stamp for a synthesized (replay / lag) event: real `node_id`/`region`,
 /// but `seq` and `edge_seen_at_ns` are 0 — such an event is positioned by its
 /// cursor, not the volatile per-publisher seq.
@@ -253,4 +311,78 @@ fn now_wall_ns() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::events::EdgeIdentity;
+    use bitcoin::hashes::Hash;
+
+    /// A `BlockCursorSource` with a flat synthetic active chain `[1, tip]`.
+    struct FlatChain {
+        tip: u32,
+    }
+
+    impl BlockCursorSource for FlatChain {
+        fn current_tip_height(&self) -> u32 {
+            self.tip
+        }
+        fn active_chain_range(&self, from: u32, to: u32) -> Vec<(u32, BlockHash)> {
+            let hi = to.min(self.tip);
+            if from > hi {
+                return Vec::new();
+            }
+            (from..=hi)
+                .map(|h| (h, BlockHash::from_byte_array([h as u8; 32])))
+                .collect()
+        }
+    }
+
+    fn publisher() -> std::sync::Arc<EventPublisher> {
+        EventPublisher::new(EdgeIdentity::new([0xab; 16], Some("us-east1")).unwrap(), 16)
+    }
+
+    fn cursor(height: u32) -> Cursor {
+        Cursor {
+            height,
+            tx_index: 0,
+            mempool_seq: 0,
+            instance_id: 0,
+        }
+    }
+
+    #[test]
+    fn in_window_replay_is_not_clamped() {
+        let src = FlatChain { tip: 5 };
+        let pubr = publisher();
+        // chain-only mask (2); from height 2 ⇒ replay 3,4,5.
+        let r = build_cursor_replay(&src, &pubr, cursor(2), 2, MAX_REPLAY_BLOCKS);
+        assert!(!r.clamped);
+        assert_eq!(r.earliest_replayed, 3, "earliest = from.height + 1");
+        assert_eq!(r.events.len(), 3);
+    }
+
+    #[test]
+    fn over_window_replay_reports_clamp() {
+        let src = FlatChain { tip: 100 };
+        let pubr = publisher();
+        // max_blocks = 10; from height 2 would need 98 blocks ⇒ clamp the lower
+        // end to tip - max_blocks + 1 = 91.
+        let r = build_cursor_replay(&src, &pubr, cursor(2), 2, 10);
+        assert!(r.clamped, "an over-window span is reported as clamped");
+        assert_eq!(r.earliest_replayed, 91);
+        assert_eq!(r.events.len(), 10, "exactly max_blocks replayed");
+    }
+
+    #[test]
+    fn cursor_at_tip_is_not_clamped() {
+        let src = FlatChain { tip: 5 };
+        let pubr = publisher();
+        // from the tip ⇒ nothing to replay, earliest = from.height + 1, no clamp.
+        let r = build_cursor_replay(&src, &pubr, cursor(5), 2, MAX_REPLAY_BLOCKS);
+        assert!(!r.clamped);
+        assert_eq!(r.earliest_replayed, 6);
+        assert!(r.events.is_empty());
+    }
 }

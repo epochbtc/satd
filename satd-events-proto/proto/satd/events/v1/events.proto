@@ -370,6 +370,49 @@ message Lagged {
   Cursor resume_cursor  = 2; // reconnect anchor to recover the gap
 }
 
+// In-band, deterministic outcome of a mid-stream re-anchor
+// (`SubscribeControl.set_cursor`). Emitted exactly once per actionable
+// SetCursor, ahead of any replayed history it admits, so a client can tell
+// "the server accepted my cursor and is replaying from it" from "the server
+// ignored it and is still emitting from wherever it already was" — without
+// the correlation plumbing a control-stream *response* would need. Mirrors
+// the `Lagged` in-band-notice pattern.
+message SetCursorResult {
+  oneof outcome {
+    CursorAccepted accepted = 1;
+    CursorRejected rejected = 2;
+  }
+}
+
+// The re-anchor was admitted; confirmed-history replay will follow this event
+// (in height order) before the live tail resumes. `clamped` is set when the
+// requested cursor was older than the server's replay window
+// (`MAX_REPLAY_BLOCKS`): replay still runs, but only from `earliest_replayed`
+// — the client must full-resync history below that height itself. When
+// `clamped` is false, `earliest_replayed` is `from.height + 1` and the replay
+// covers the whole gap.
+message CursorAccepted {
+  Cursor from              = 1; // the cursor the server anchored to
+  bool   clamped           = 2; // true → replay window truncated the lower end
+  uint32 earliest_replayed = 3; // first height that will be replayed
+}
+
+// The re-anchor was not admitted; the live stream is unchanged (still emitting
+// from its prior position). `current_head` is the server's present resume
+// position, so a client can decide whether to retry, back off, or escalate to
+// a full resnapshot.
+message CursorRejected {
+  enum Reason {
+    REASON_UNSPECIFIED   = 0;
+    RATE_LIMITED         = 1; // per-principal re-anchor rate limit exceeded
+    CONCURRENT_REANCHOR  = 2; // another re-anchor is already draining
+    EMPTY_CURSOR         = 3; // SetCursor carried no cursor
+    NO_SOURCE            = 4; // server has no block source to replay from
+  }
+  Reason reason       = 1;
+  Cursor current_head = 2; // server's current resume position
+}
+
 // Versioned, edge-stamped envelope. The wire-level type the server
 // streams to clients.
 message NodeEvent {
@@ -395,5 +438,6 @@ message NodeEvent {
     TxidDepthReached txid_depth_reached = 21; // depth alarm (single-shot)
     TxidFinalized txid_finalized = 22; // lifecycle auto-close (terminal)
     PrefixMatched prefix_matched = 23; // privacy-preserving prefix watch (§7.5)
+    SetCursorResult set_cursor_result = 24; // deterministic re-anchor ack/reject
   }
 }
