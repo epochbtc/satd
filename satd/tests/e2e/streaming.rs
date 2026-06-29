@@ -1094,6 +1094,10 @@ fn is_block_connected(body: &Body) -> bool {
     block_height(body).is_some()
 }
 
+fn is_set_cursor_result(body: &Body) -> bool {
+    matches!(body, Body::SetCursorResult(_))
+}
+
 fn cursor(height: u32) -> Cursor {
     Cursor {
         height,
@@ -1247,6 +1251,18 @@ async fn grpc_watch_set_cursor_re_anchors_replaying_history() {
     .await
     .unwrap();
 
+    // The re-anchor is acked in-band BEFORE the replay batch (#439): an
+    // accepted result with `clamped=false` and `earliest_replayed=3`.
+    let ev = next_event_matching(&mut stream, 15, is_set_cursor_result).await;
+    let Some(Body::SetCursorResult(r)) = ev.body else {
+        unreachable!()
+    };
+    let Some(satd_events::proto::v1::set_cursor_result::Outcome::Accepted(a)) = r.outcome else {
+        panic!("expected CursorAccepted, got {:?}", r.outcome);
+    };
+    assert!(!a.clamped, "in-window cursor is not clamped");
+    assert_eq!(a.earliest_replayed, 3, "replay starts at cursor.height + 1");
+
     let mut heights = Vec::new();
     for _ in 0..3 {
         let ev = next_event_matching(&mut stream, 15, is_block_connected).await;
@@ -1265,6 +1281,48 @@ async fn grpc_watch_set_cursor_re_anchors_replaying_history() {
         block_height(&ev.body.unwrap()),
         Some(6),
         "live tail resumes after the replay batch"
+    );
+}
+
+/// A mid-stream `SetCursor` carrying no cursor is declined deterministically
+/// with an in-band `CursorRejected{EmptyCursor}` (#439) rather than silently
+/// dropped, and the live stream is unaffected.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grpc_watch_set_cursor_empty_is_rejected() {
+    let sn = start_streaming_async(vec![]).await;
+    mine_n(&sn, 3).await;
+    let mut client = GrpcStreamClient::connect(sn.grpc_port()).await;
+
+    let (tx, mut stream) = client.watch(vec![]).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    // SetCursor with no cursor → EmptyCursor rejection.
+    tx.send(SubscribeControl {
+        msg: Some(Control::SetCursor(satd_events::proto::v1::SetCursor { cursor: None })),
+    })
+    .await
+    .unwrap();
+
+    let ev = next_event_matching(&mut stream, 15, is_set_cursor_result).await;
+    let Some(Body::SetCursorResult(r)) = ev.body else {
+        unreachable!()
+    };
+    let Some(satd_events::proto::v1::set_cursor_result::Outcome::Rejected(rj)) = r.outcome else {
+        panic!("expected CursorRejected, got {:?}", r.outcome);
+    };
+    assert_eq!(
+        rj.reason,
+        satd_events::proto::v1::cursor_rejected::Reason::EmptyCursor as i32,
+        "empty SetCursor is rejected with EmptyCursor"
+    );
+
+    // The live stream is unchanged: a freshly mined block still arrives.
+    mine_n(&sn, 1).await;
+    let ev = next_event_matching(&mut stream, 15, is_block_connected).await;
+    assert_eq!(
+        block_height(&ev.body.unwrap()),
+        Some(4),
+        "live tail continues after a rejected re-anchor"
     );
 }
 

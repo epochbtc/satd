@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 
 use async_trait::async_trait;
@@ -1057,11 +1057,38 @@ impl NodeEventStream for NodeEventStreamSvc {
 
         // Mid-stream re-anchor channel (§7.3.1): a `SetCursor` on the inbound
         // control stream hands its cursor to the outbound task, which drains a
-        // confirmed-history replay ahead of the live tail. Capacity 1 bounds
-        // concurrent re-anchors to one in flight — a `SetCursor` that arrives
-        // while a drain is pending is dropped (`try_send`), so a client cannot
-        // pile up unbounded replay work.
+        // confirmed-history replay ahead of the live tail.
         let (reanchor_tx, reanchor_rx) = tokio::sync::mpsc::channel::<node::events::Cursor>(1);
+
+        // "A re-anchor is in flight" — set by the inbound reader when it queues a
+        // cursor, cleared by the outbound task only after the replay has fully
+        // drained. The capacity-1 channel alone does NOT bound this: `recv()`
+        // empties it at the *start* of the drain, so a `SetCursor` arriving
+        // during a long replay would be queued and serviced late rather than
+        // rejected. This flag spans the whole in-flight window (queue → drain →
+        // done), so a concurrent `SetCursor` is rejected `ConcurrentReanchor`
+        // for the entire duration, bounding outstanding replay work to one.
+        let reanchor_in_flight = Arc::new(AtomicBool::new(false));
+
+        // Re-anchor rejection channel (#439): a `SetCursor` the inbound reader
+        // declines (rate-limited, an empty cursor, or a re-anchor already in
+        // flight) hands its reason to the outbound task, which renders a
+        // deterministic `SetCursorResult::Rejected` in-band so the client can
+        // tell "ignored" from "accepted, replaying". The outbound task owns the
+        // accurate `current_head` (last position it delivered), so the reason is
+        // routed there rather than emitted from inbound.
+        //
+        // The contract is "exactly one SetCursorResult per actionable SetCursor",
+        // so this MUST NOT silently drop. The outbound task only services this
+        // channel between drains (a long replay holds it off), so under a burst
+        // of declined SetCursors it can fill. Inbound therefore *blocks* on a
+        // full channel (`send().await`, not `try_send`): the surplus backpressures
+        // the client's control stream (h2 flow control) until the outbound task
+        // catches up, rather than being shed. A rejection is lost only if the
+        // outbound task is already gone (client disconnected) — nothing to
+        // deliver to. The buffer (32) absorbs normal bursts before backpressure.
+        let (reject_tx, reject_rx) =
+            tokio::sync::mpsc::channel::<node::events::CursorRejectReason>(32);
 
         // Inbound control reader: applies watch-set mutations + category
         // changes for the life of the stream against the shared subscription-
@@ -1071,42 +1098,78 @@ impl NodeEventStream for NodeEventStreamSvc {
             let handle = handle.clone();
             let category_mask = category_mask.clone();
             let watch_set = watch_set.clone();
+            let reanchor_in_flight = reanchor_in_flight.clone();
             let prefix_bounds = (self.prefix_min_bits, self.prefix_max_bits);
             tokio::spawn(async move {
+                use node::events::CursorRejectReason;
+                // Hand a deterministic rejection to the outbound task. BLOCKS when
+                // the channel is full (backpressuring the client's control stream)
+                // rather than dropping — a silently-lost rejection is the exact bug
+                // this path exists to kill. An `Err` means the outbound task is
+                // gone (stream tearing down); there is nothing to deliver, so it is
+                // ignored. (`async` closures are unstable, so this is a small
+                // async fn over a borrowed sender.)
+                async fn reject(
+                    tx: &tokio::sync::mpsc::Sender<CursorRejectReason>,
+                    reason: CursorRejectReason,
+                ) {
+                    let _ = tx.send(reason).await;
+                }
                 while let Ok(Some(ctrl)) = inbound.message().await {
                     // `SetCursor` is a mid-stream re-anchor, not a watch-set
-                    // mutation: forward its cursor to the outbound task (drop if
-                    // a re-anchor is already in flight) instead of applying it.
+                    // mutation: forward its cursor to the outbound task (or a
+                    // rejection reason if it cannot be admitted) instead of
+                    // applying it.
                     if let Some(pb::subscribe_control::Msg::SetCursor(sc)) = &ctrl.msg {
-                        if let Some(c) = &sc.cursor {
-                            // A re-anchor drives a confirmed-history replay (up to
-                            // MAX_REPLAY_BLOCKS block-index reads + event synthesis).
-                            // The capacity-1 channel bounds only *concurrent*
-                            // re-anchors; rate-limit per-principal here so a client
-                            // cannot fire back-to-back SetCursors in a tight loop and
-                            // pin a worker re-walking the block index. Operator/
-                            // loopback/no-policy principals bypass (check_rate →
-                            // Allow), same posture as Subscribe establishment and
-                            // watch-set adds. Charged only when there is an actionable
-                            // cursor, so a malformed empty SetCursor spends no token.
-                            if let Some(p) = principal.as_ref()
-                                && let satd_auth::RateDecision::Throttle { retry_after_secs } =
-                                    p.check_rate()
-                            {
-                                debug!(
-                                    target: "events::grpc",
-                                    retry_after_secs,
-                                    "dropping mid-stream SetCursor re-anchor: per-principal rate limit exceeded",
-                                );
-                                continue;
-                            }
-                            let cur = node::events::Cursor {
-                                height: c.height,
-                                tx_index: c.tx_index,
-                                mempool_seq: c.mempool_seq,
-                                instance_id: c.instance_id,
-                            };
-                            let _ = reanchor_tx.try_send(cur);
+                        let Some(c) = &sc.cursor else {
+                            // Malformed empty SetCursor: spends no rate token, but
+                            // the client still gets a deterministic rejection.
+                            reject(&reject_tx, CursorRejectReason::EmptyCursor).await;
+                            continue;
+                        };
+                        // A re-anchor drives a confirmed-history replay (up to
+                        // MAX_REPLAY_BLOCKS block-index reads + event synthesis).
+                        // The capacity-1 channel bounds only *concurrent*
+                        // re-anchors; rate-limit per-principal here so a client
+                        // cannot fire back-to-back SetCursors in a tight loop and
+                        // pin a worker re-walking the block index. Operator/
+                        // loopback/no-policy principals bypass (check_rate →
+                        // Allow), same posture as Subscribe establishment and
+                        // watch-set adds. Charged only when there is an actionable
+                        // cursor.
+                        if let Some(p) = principal.as_ref()
+                            && let satd_auth::RateDecision::Throttle { retry_after_secs } =
+                                p.check_rate()
+                        {
+                            debug!(
+                                target: "events::grpc",
+                                retry_after_secs,
+                                "rejecting mid-stream SetCursor re-anchor: per-principal rate limit exceeded",
+                            );
+                            reject(&reject_tx, CursorRejectReason::RateLimited).await;
+                            continue;
+                        }
+                        let cur = node::events::Cursor {
+                            height: c.height,
+                            tx_index: c.tx_index,
+                            mempool_seq: c.mempool_seq,
+                            instance_id: c.instance_id,
+                        };
+                        // Claim the single in-flight slot. `swap` returning `true`
+                        // means a re-anchor is already in flight (queued OR
+                        // actively draining) → reject ConcurrentReanchor. This
+                        // covers the whole drain, which the capacity-1 channel
+                        // alone does not (recv empties it before the drain). The
+                        // outbound task clears the flag once the replay completes.
+                        if reanchor_in_flight.swap(true, Ordering::AcqRel) {
+                            reject(&reject_tx, CursorRejectReason::ConcurrentReanchor).await;
+                            continue;
+                        }
+                        // We own the slot, so the capacity-1 channel is empty: a
+                        // send error here can only be `Closed` (outbound gone,
+                        // stream tearing down). Release the slot in that case.
+                        if reanchor_tx.try_send(cur).is_err() {
+                            reanchor_in_flight.store(false, Ordering::Release);
                         }
                         continue;
                     }
@@ -1150,6 +1213,7 @@ impl NodeEventStream for NodeEventStreamSvc {
         let mut rx_live = rx_live;
         let mut rx_match = rx_match;
         let mut reanchor_rx = reanchor_rx;
+        let mut reject_rx = reject_rx;
         tokio::spawn(async move {
             use node::events::WatchMatch;
             // Keep the subscription alive for the task's lifetime: the
@@ -1179,9 +1243,26 @@ impl NodeEventStream for NodeEventStreamSvc {
                     // Mid-stream re-anchor: drain the replay batch to completion,
                     // in height order, BEFORE servicing live/match again.
                     Some(cur) = reanchor_rx.recv() => {
+                        // `reanchor_in_flight` was set by the inbound reader when
+                        // it queued this cursor; it stays set across the whole
+                        // drain (so concurrent SetCursors are rejected) and is
+                        // cleared on every exit from this arm below. The `return`
+                        // paths end the task (and abort inbound), so the flag is
+                        // moot there.
                         let Some(src) = block_source.as_ref() else {
-                            // No block source → re-anchor is a no-op (same fallback
-                            // as Subscribe(from_cursor) without a source).
+                            // No block source → re-anchor cannot replay. Tell the
+                            // client deterministically (#439) instead of silently
+                            // no-op'ing; the live stream is unchanged.
+                            reanchor_in_flight.store(false, Ordering::Release);
+                            let head = publisher.resume_cursor(last_h, last_s);
+                            let ev = node::events::cursor_rejected_event(
+                                &publisher,
+                                node::events::CursorRejectReason::NoSource,
+                                head,
+                            );
+                            if tx_out.send(Ok(envelope_to_proto(&ev))).await.is_err() {
+                                return;
+                            }
                             continue;
                         };
                         let mask = category_mask.load(Ordering::Relaxed);
@@ -1192,6 +1273,18 @@ impl NodeEventStream for NodeEventStreamSvc {
                             mask,
                             MAX_REPLAY_BLOCKS,
                         );
+                        // Ack the re-anchor in-band, ahead of the replay batch, so
+                        // the client knows replay is now running (and from where —
+                        // `clamped` flags a truncated lower end). (#439)
+                        let ack = node::events::cursor_accepted_event(
+                            &publisher,
+                            cur,
+                            replay.clamped,
+                            replay.earliest_replayed,
+                        );
+                        if tx_out.send(Ok(envelope_to_proto(&ack))).await.is_err() {
+                            return;
+                        }
                         debug!(
                             target: "events::grpc",
                             replayed_events = replay.events.len(),
@@ -1205,6 +1298,18 @@ impl NodeEventStream for NodeEventStreamSvc {
                             if tx_out.send(Ok(envelope_to_proto(ev))).await.is_err() {
                                 return;
                             }
+                        }
+                        // Replay fully drained → admit the next re-anchor.
+                        reanchor_in_flight.store(false, Ordering::Release);
+                    }
+                    // A re-anchor the inbound reader declined (rate-limited, empty
+                    // cursor, or concurrent): emit a deterministic rejection with
+                    // the subscriber's current head. The live stream is unchanged.
+                    Some(reason) = reject_rx.recv() => {
+                        let head = publisher.resume_cursor(last_h, last_s);
+                        let ev = node::events::cursor_rejected_event(&publisher, reason, head);
+                        if tx_out.send(Ok(envelope_to_proto(&ev))).await.is_err() {
+                            return;
                         }
                     }
                     live = rx_live.recv() => match live {
@@ -1754,6 +1859,43 @@ fn body_to_proto(body: &NodeEventBody) -> pb::node_event::Body {
             dropped_count: *dropped_count,
             resume_cursor: Some(cursor_to_proto(*resume_cursor)),
         }),
+        NodeEventBody::SetCursorResult(outcome) => {
+            Body::SetCursorResult(set_cursor_result_to_proto(outcome))
+        }
+    }
+}
+
+fn set_cursor_result_to_proto(outcome: &node::events::SetCursorOutcome) -> pb::SetCursorResult {
+    use node::events::{CursorRejectReason as R, SetCursorOutcome as O};
+    use pb::set_cursor_result::Outcome;
+    let outcome = match outcome {
+        O::Accepted {
+            from,
+            clamped,
+            earliest_replayed,
+        } => Outcome::Accepted(pb::CursorAccepted {
+            from: Some(cursor_to_proto(*from)),
+            clamped: *clamped,
+            earliest_replayed: *earliest_replayed,
+        }),
+        O::Rejected {
+            reason,
+            current_head,
+        } => {
+            let reason = match reason {
+                R::RateLimited => pb::cursor_rejected::Reason::RateLimited,
+                R::ConcurrentReanchor => pb::cursor_rejected::Reason::ConcurrentReanchor,
+                R::EmptyCursor => pb::cursor_rejected::Reason::EmptyCursor,
+                R::NoSource => pb::cursor_rejected::Reason::NoSource,
+            };
+            Outcome::Rejected(pb::CursorRejected {
+                reason: reason as i32,
+                current_head: Some(cursor_to_proto(*current_head)),
+            })
+        }
+    };
+    pb::SetCursorResult {
+        outcome: Some(outcome),
     }
 }
 
@@ -2456,6 +2598,7 @@ mod tests {
                 pb::node_event::Body::TxidDepthReached(_) => "txid_depth_reached",
                 pb::node_event::Body::TxidFinalized(_) => "txid_finalized",
                 pb::node_event::Body::PrefixMatched(_) => "prefix_matched",
+                pb::node_event::Body::SetCursorResult(_) => "set_cursor_result",
             })
             .collect();
         assert!(
@@ -2539,6 +2682,56 @@ mod tests {
                     )
                 })
                 .collect()
+        }
+    }
+
+    /// A block source whose FIRST `active_chain_range` call blocks until the test
+    /// releases it, so a re-anchor drain can be held mid-flight deterministically.
+    /// It signals `entered` (async-awaitable) once that drain reaches replay, then
+    /// parks on `release` (a blocking channel) until the test sends. Subsequent
+    /// calls (later re-anchors) pass through immediately, so a test that fires a
+    /// burst of follow-on re-anchors does not deadlock on a single-use gate.
+    struct GatedBlocks {
+        tip: u32,
+        entered: Arc<tokio::sync::Notify>,
+        released: AtomicBool,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+    impl node::events::BlockCursorSource for GatedBlocks {
+        fn current_tip_height(&self) -> u32 {
+            self.tip
+        }
+        fn active_chain_range(&self, from: u32, to: u32) -> Vec<(u32, BlockHash)> {
+            // Only the first drain is gated; later ones pass straight through.
+            if !self.released.swap(true, Ordering::AcqRel) {
+                self.entered.notify_one();
+                let _ = self.release.lock().unwrap().recv();
+            }
+            let hi = to.min(self.tip);
+            let lo = from.max(1);
+            (lo..=hi)
+                .map(|h| {
+                    (
+                        h,
+                        BlockHash::from_raw_hash(
+                            bitcoin::hashes::sha256d::Hash::from_byte_array([h as u8; 32]),
+                        ),
+                    )
+                })
+                .collect()
+        }
+    }
+
+    fn set_cursor_ctrl(height: u32) -> pb::SubscribeControl {
+        pb::SubscribeControl {
+            msg: Some(pb::subscribe_control::Msg::SetCursor(pb::SetCursor {
+                cursor: Some(pb::Cursor {
+                    height,
+                    tx_index: 0,
+                    mempool_seq: 0,
+                    instance_id: 0,
+                }),
+            })),
         }
     }
 
@@ -3506,6 +3699,21 @@ mod tests {
             .await
             .unwrap();
 
+        // The re-anchor is acked in-band ahead of the replay batch (#439).
+        let ack = tokio::time::timeout(Duration::from_secs(3), stream.message())
+            .await
+            .expect("timeout")
+            .expect("transport")
+            .expect("stream ended");
+        let Some(pb::node_event::Body::SetCursorResult(r)) = ack.body else {
+            panic!("expected SetCursorResult ack first, got {:?}", ack.body);
+        };
+        let Some(pb::set_cursor_result::Outcome::Accepted(a)) = r.outcome else {
+            panic!("expected CursorAccepted, got {:?}", r.outcome);
+        };
+        assert!(!a.clamped, "in-window cursor is not clamped");
+        assert_eq!(a.earliest_replayed, 3, "replay starts at cursor.height + 1");
+
         for expected_h in [3u32, 4, 5] {
             let ev = tokio::time::timeout(Duration::from_secs(3), stream.message())
                 .await
@@ -3678,8 +3886,8 @@ mod tests {
         }
         assert!(registry.has_watchers(), "watch registered (establishment + add allowed)");
 
-        // SetCursor: rate check #3 → throttled → dropped. Were it served it would
-        // replay confirmed blocks 3, 4, 5.
+        // SetCursor: rate check #3 → throttled → rejected (no replay). Were it
+        // served it would replay confirmed blocks 3, 4, 5.
         ctrl_tx
             .send(pb::SubscribeControl {
                 msg: Some(pb::subscribe_control::Msg::SetCursor(pb::SetCursor {
@@ -3696,7 +3904,8 @@ mod tests {
 
         // Give the inbound task time to process (and, in a regression, re-anchor)
         // the SetCursor before we trigger the sentinel match. With the rate-limit
-        // in place the SetCursor is dropped, so this wait sees no replay.
+        // in place the SetCursor is rejected (no replay), but it now emits a
+        // deterministic CursorRejected (#439) ahead of the sentinel match.
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         // Sentinel: a mempool spend of the watched outpoint → OutpointSpent. The
@@ -3716,6 +3925,25 @@ mod tests {
         };
         registry.scan_mempool_tx(&spend);
 
+        // First: the deterministic rejection (rate-limited), not a replayed block.
+        let ev = tokio::time::timeout(Duration::from_secs(3), stream.message())
+            .await
+            .expect("timeout")
+            .expect("transport")
+            .expect("stream ended");
+        let Some(pb::node_event::Body::SetCursorResult(r)) = ev.body else {
+            panic!("expected a CursorRejected, not a replayed block (got {:?})", ev.body);
+        };
+        let Some(pb::set_cursor_result::Outcome::Rejected(rj)) = r.outcome else {
+            panic!("expected CursorRejected, got {:?}", r.outcome);
+        };
+        assert_eq!(
+            rj.reason,
+            pb::cursor_rejected::Reason::RateLimited as i32,
+            "throttled SetCursor is rejected with RATE_LIMITED",
+        );
+
+        // Then the live match: no replayed blocks came between.
         let ev = tokio::time::timeout(Duration::from_secs(3), stream.message())
             .await
             .expect("timeout")
@@ -3723,8 +3951,8 @@ mod tests {
             .expect("stream ended");
         assert!(
             matches!(ev.body, Some(pb::node_event::Body::OutpointSpent(_))),
-            "rate-limited SetCursor produced no replay: the first event is the live \
-             match, not a replayed block (got {:?})",
+            "rate-limited SetCursor produced no replay: after the rejection the next \
+             event is the live match, not a replayed block (got {:?})",
             ev.body,
         );
         assert!(
@@ -3732,6 +3960,218 @@ mod tests {
             "establishment + watch-add + the throttled SetCursor each hit the limiter",
         );
 
+        drop(ctrl_tx);
+        let _ = shutdown_tx.send(true);
+    }
+
+    /// A `SetCursor` that arrives while a previous re-anchor is **actively
+    /// draining** (not merely queued) must be rejected `ConcurrentReanchor`, not
+    /// queued and serviced late. The capacity-1 channel alone does not cover
+    /// this — `recv()` empties it before the drain — so the in-flight flag does.
+    /// We hold the first drain open with a gated block source, fire the second
+    /// SetCursor mid-drain, then release and assert the stream order:
+    /// Accepted(#1) → replayed blocks → Rejected(ConcurrentReanchor)(#2).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn watch_set_cursor_concurrent_during_drain_is_rejected() {
+        let publisher = EventPublisher::new(edge(), 64);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let registry = Arc::new(node::events::WatchRegistry::new());
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let blocks = GatedBlocks {
+            tip: 5,
+            entered: entered.clone(),
+            released: AtomicBool::new(false),
+            release: std::sync::Mutex::new(release_rx),
+        };
+        let sink = GrpcEventSink::bind(
+            "127.0.0.1:0",
+            false,
+            publisher.clone(),
+            GrpcLimits::default(),
+            None,
+            Some(Arc::new(blocks)),
+            Some(registry.clone()),
+            None,
+        )
+        .await
+        .expect("bind");
+        let actual = sink.local_addr().unwrap();
+        publisher.attach_sinks(vec![Box::new(sink)], shutdown_rx.clone());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let mut client =
+            pb::node_event_stream_client::NodeEventStreamClient::connect(format!("http://{actual}"))
+                .await
+                .expect("connect");
+        let (ctrl_tx, ctrl_rx) = tokio::sync::mpsc::channel::<pb::SubscribeControl>(4);
+        let mut stream = client
+            .watch(ReceiverStream::new(ctrl_rx))
+            .await
+            .expect("watch")
+            .into_inner();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // SetCursor #1 (height 2): the outbound task enters the replay and parks
+        // in the gated block source. The in-flight flag is now set.
+        ctrl_tx.send(set_cursor_ctrl(2)).await.unwrap();
+        entered.notified().await;
+
+        // SetCursor #2 (height 4) arrives while #1 is mid-drain → ConcurrentReanchor.
+        ctrl_tx.send(set_cursor_ctrl(4)).await.unwrap();
+        // Let the inbound reader process #2 before we release the drain.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Release #1's drain.
+        release_tx.send(()).unwrap();
+
+        macro_rules! next {
+            () => {
+                tokio::time::timeout(Duration::from_secs(3), stream.message())
+                    .await
+                    .expect("timeout")
+                    .expect("transport")
+                    .expect("stream ended")
+            };
+        }
+
+        // #1 accepted, ahead of its replay.
+        let ack = next!();
+        let Some(pb::node_event::Body::SetCursorResult(r)) = ack.body else {
+            panic!("expected SetCursorResult ack, got {:?}", ack.body);
+        };
+        assert!(
+            matches!(r.outcome, Some(pb::set_cursor_result::Outcome::Accepted(_))),
+            "first result is Accepted for SetCursor #1",
+        );
+        // #1 replays confirmed 3, 4, 5.
+        for expected_h in [3u32, 4, 5] {
+            let ev = next!();
+            assert_eq!(chain_height(&ev), Some(expected_h));
+        }
+        // #2, fired mid-drain, is rejected ConcurrentReanchor (not queued/serviced).
+        let rej = next!();
+        let Some(pb::node_event::Body::SetCursorResult(r)) = rej.body else {
+            panic!("expected SetCursorResult rejection, got {:?}", rej.body);
+        };
+        let Some(pb::set_cursor_result::Outcome::Rejected(rj)) = r.outcome else {
+            panic!("expected CursorRejected, got {:?}", r.outcome);
+        };
+        assert_eq!(
+            rj.reason,
+            pb::cursor_rejected::Reason::ConcurrentReanchor as i32,
+            "a SetCursor during an active drain is rejected ConcurrentReanchor",
+        );
+
+        drop(ctrl_tx);
+        let _ = shutdown_tx.send(true);
+    }
+
+    /// A burst of declined SetCursors during a single (held-open) drain — more
+    /// than the rejection channel can buffer — must ALL be rejected, none
+    /// silently dropped. Inbound backpressures (blocking send) instead of
+    /// shedding once the buffer fills, so every SetCursor still yields exactly
+    /// one CursorRejected. This is the contract the #439 fix exists to keep.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn watch_set_cursor_burst_is_not_silently_dropped() {
+        // Well above the reject channel buffer (32) so the surplus must
+        // backpressure rather than drop.
+        const BURST: usize = 64;
+
+        let publisher = EventPublisher::new(edge(), 64);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let registry = Arc::new(node::events::WatchRegistry::new());
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let blocks = GatedBlocks {
+            tip: 5,
+            entered: entered.clone(),
+            released: AtomicBool::new(false),
+            release: std::sync::Mutex::new(release_rx),
+        };
+        let sink = GrpcEventSink::bind(
+            "127.0.0.1:0",
+            false,
+            publisher.clone(),
+            GrpcLimits::default(),
+            None,
+            Some(Arc::new(blocks)),
+            Some(registry.clone()),
+            None,
+        )
+        .await
+        .expect("bind");
+        let actual = sink.local_addr().unwrap();
+        publisher.attach_sinks(vec![Box::new(sink)], shutdown_rx.clone());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let mut client =
+            pb::node_event_stream_client::NodeEventStreamClient::connect(format!("http://{actual}"))
+                .await
+                .expect("connect");
+        let (ctrl_tx, ctrl_rx) = tokio::sync::mpsc::channel::<pb::SubscribeControl>(4);
+        let mut stream = client
+            .watch(ReceiverStream::new(ctrl_rx))
+            .await
+            .expect("watch")
+            .into_inner();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // #1 enters the gated drain (flag set, drain parked).
+        ctrl_tx.send(set_cursor_ctrl(2)).await.unwrap();
+        entered.notified().await;
+
+        // Fire BURST more SetCursors mid-drain from a task (they backpressure
+        // once the buffer fills; the task blocks, never drops).
+        let sender = ctrl_tx.clone();
+        let pump = tokio::spawn(async move {
+            for _ in 0..BURST {
+                if sender.send(set_cursor_ctrl(4)).await.is_err() {
+                    break;
+                }
+            }
+        });
+        // Give inbound time to fill the buffer and block on the surplus.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        // Release the drain; everything now flows.
+        release_tx.send(()).unwrap();
+
+        // Every SetCursor — the initial #1 plus all BURST burst ones — must yield
+        // exactly one SetCursorResult (Accepted or Rejected). We assert the TOTAL
+        // count, not the mix: once #1's drain finishes the in-flight flag clears,
+        // so some later burst cursors become fresh Accepted re-anchors rather than
+        // ConcurrentReanchor — but NONE may be silently dropped. Replayed blocks
+        // (from the accepted re-anchors) are ignored.
+        macro_rules! next {
+            () => {
+                tokio::time::timeout(Duration::from_secs(5), stream.message())
+                    .await
+                    .expect("timeout (a SetCursor result was dropped)")
+                    .expect("transport")
+                    .expect("stream ended")
+            };
+        }
+        let want = BURST + 1; // #1 + the burst
+        let mut results = 0usize;
+        while results < want {
+            let ev = next!();
+            match ev.body {
+                Some(pb::node_event::Body::SetCursorResult(r)) => {
+                    assert!(r.outcome.is_some(), "every result carries an outcome");
+                    results += 1;
+                }
+                // Replayed blocks from accepted re-anchors — ignore.
+                Some(pb::node_event::Body::Chain(_)) => {}
+                other => panic!("unexpected body during burst drain: {other:?}"),
+            }
+        }
+        assert_eq!(
+            results, want,
+            "every SetCursor (initial + burst) yielded exactly one result; none dropped",
+        );
+
+        pump.await.unwrap();
         drop(ctrl_tx);
         let _ = shutdown_tx.send(true);
     }

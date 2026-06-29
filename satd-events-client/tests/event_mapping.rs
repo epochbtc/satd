@@ -2,7 +2,7 @@
 //! easy to get subtly wrong: `has_amount` → `Option`, the evict-reason enum,
 //! prefix nesting, and the empty-body / unrecognized-arm fallback.
 
-use satd_events_client::{proto as pb, Event, EvictReason};
+use satd_events_client::{proto as pb, CursorRejectReason, Event, EvictReason};
 
 fn node_event(body: pb::node_event::Body) -> pb::NodeEvent {
     pb::NodeEvent { schema_version: 1, stamp: None, cursor: None, body: Some(body) }
@@ -102,5 +102,62 @@ fn lagged_carries_resume_cursor() {
 #[test]
 fn empty_body_is_unknown() {
     let ev = pb::NodeEvent { schema_version: 1, stamp: None, cursor: None, body: None };
+    assert_eq!(Event::from(ev), Event::Unknown);
+}
+
+#[test]
+fn set_cursor_accepted_maps() {
+    let cursor = pb::Cursor { height: 50, tx_index: 0, mempool_seq: 0, instance_id: 7 };
+    let ev = node_event(pb::node_event::Body::SetCursorResult(pb::SetCursorResult {
+        outcome: Some(pb::set_cursor_result::Outcome::Accepted(pb::CursorAccepted {
+            from: Some(cursor),
+            clamped: true,
+            earliest_replayed: 41,
+        })),
+    }));
+    assert_eq!(
+        Event::from(ev),
+        Event::CursorAccepted { from: Some(cursor), clamped: true, earliest_replayed: 41 }
+    );
+}
+
+#[test]
+fn set_cursor_rejected_maps_reason() {
+    let head = pb::Cursor { height: 99, tx_index: 0, mempool_seq: 3, instance_id: 1 };
+    let ev = node_event(pb::node_event::Body::SetCursorResult(pb::SetCursorResult {
+        outcome: Some(pb::set_cursor_result::Outcome::Rejected(pb::CursorRejected {
+            reason: pb::cursor_rejected::Reason::ConcurrentReanchor as i32,
+            current_head: Some(head),
+        })),
+    }));
+    assert_eq!(
+        Event::from(ev),
+        Event::CursorRejected {
+            reason: CursorRejectReason::ConcurrentReanchor,
+            current_head: Some(head),
+        }
+    );
+}
+
+#[test]
+fn set_cursor_rejected_unknown_reason_is_unknown_variant() {
+    // A reason code from a newer server maps to the catch-all, not a panic.
+    let ev = node_event(pb::node_event::Body::SetCursorResult(pb::SetCursorResult {
+        outcome: Some(pb::set_cursor_result::Outcome::Rejected(pb::CursorRejected {
+            reason: 9999,
+            current_head: None,
+        })),
+    }));
+    assert_eq!(
+        Event::from(ev),
+        Event::CursorRejected { reason: CursorRejectReason::Unknown, current_head: None }
+    );
+}
+
+#[test]
+fn set_cursor_result_without_outcome_is_unknown() {
+    let ev = node_event(pb::node_event::Body::SetCursorResult(pb::SetCursorResult {
+        outcome: None,
+    }));
     assert_eq!(Event::from(ev), Event::Unknown);
 }

@@ -273,8 +273,51 @@ pub enum Event {
         /// The first height the server actually delivered (`> resume_height`).
         first_height: u32,
     },
+    /// A mid-stream re-anchor ([`WatchHandle::set_cursor`](crate::WatchHandle::set_cursor))
+    /// was **admitted**. Confirmed-history replay follows this event (in height
+    /// order) before the live tail resumes. When `clamped` is true the requested
+    /// cursor predated the server's replay window: replay still runs, but only
+    /// from `earliest_replayed`, so full-resync history below it from another
+    /// source. This is the deterministic "accepted, replaying from X" signal.
+    CursorAccepted {
+        /// The cursor the server anchored to.
+        from: Option<Cursor>,
+        /// `true` → the replay window truncated the lower end of the gap.
+        clamped: bool,
+        /// First height the server will replay.
+        earliest_replayed: u32,
+    },
+    /// A mid-stream re-anchor ([`WatchHandle::set_cursor`](crate::WatchHandle::set_cursor))
+    /// was **not** admitted. The live stream is unchanged (still emitting from
+    /// its prior position). Decide whether to retry, back off, or escalate to a
+    /// full resnapshot based on `reason`; `current_head` is where the server is
+    /// now.
+    CursorRejected {
+        /// Why the re-anchor was declined.
+        reason: CursorRejectReason,
+        /// The server's current resume position.
+        current_head: Option<Cursor>,
+    },
     /// A body this client build does not recognize (a newer server arm), or an
     /// event with no body set. Ignored by well-behaved consumers.
+    Unknown,
+}
+
+/// Why a mid-stream re-anchor was declined by the server (see
+/// [`Event::CursorRejected`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CursorRejectReason {
+    /// Per-principal re-anchor rate limit exceeded — retry after a backoff.
+    RateLimited,
+    /// Another re-anchor is already draining (only one runs at a time) — retry
+    /// once it completes.
+    ConcurrentReanchor,
+    /// The request carried no cursor (client bug).
+    EmptyCursor,
+    /// The server has no block source to replay from.
+    NoSource,
+    /// A reason code this client build does not recognize (a newer server).
     Unknown,
 }
 
@@ -340,9 +383,36 @@ impl From<pb::NodeEvent> for Event {
                 dropped_count: l.dropped_count,
                 resume_cursor: l.resume_cursor,
             },
+            Body::SetCursorResult(r) => match r.outcome {
+                Some(pb::set_cursor_result::Outcome::Accepted(a)) => Event::CursorAccepted {
+                    from: a.from,
+                    clamped: a.clamped,
+                    earliest_replayed: a.earliest_replayed,
+                },
+                Some(pb::set_cursor_result::Outcome::Rejected(rj)) => Event::CursorRejected {
+                    reason: cursor_reject_reason(rj.reason),
+                    current_head: rj.current_head,
+                },
+                // A result frame with no outcome set is a degenerate message.
+                None => Event::Unknown,
+            },
             // Reserved/never-emitted, or an unrecognized arm.
             Body::DescriptorNeedsAddresses(_) => Event::Unknown,
         }
+    }
+}
+
+/// Map the proto `CursorRejected.Reason` enum (an `i32` on the wire) to the
+/// client enum, treating an unrecognized code as [`CursorRejectReason::Unknown`].
+fn cursor_reject_reason(reason: i32) -> CursorRejectReason {
+    match pb::cursor_rejected::Reason::try_from(reason) {
+        Ok(pb::cursor_rejected::Reason::RateLimited) => CursorRejectReason::RateLimited,
+        Ok(pb::cursor_rejected::Reason::ConcurrentReanchor) => {
+            CursorRejectReason::ConcurrentReanchor
+        }
+        Ok(pb::cursor_rejected::Reason::EmptyCursor) => CursorRejectReason::EmptyCursor,
+        Ok(pb::cursor_rejected::Reason::NoSource) => CursorRejectReason::NoSource,
+        Ok(pb::cursor_rejected::Reason::Unspecified) | Err(_) => CursorRejectReason::Unknown,
     }
 }
 

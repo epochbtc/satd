@@ -294,6 +294,11 @@ async fn publish(
             // the streaming carriers (gRPC/WS/SSE); it never reaches the ZMQ
             // pub/sub fanout via the publish path. No Core-compat topic.
         }
+        NodeEventBody::SetCursorResult(_) => {
+            // A re-anchor ack is a per-subscriber control signal on the bidi
+            // Watch stream (gRPC/WS); like `Lagged` it never reaches the ZMQ
+            // fanout. No Core-compat topic.
+        }
     }
     Ok(())
 }
