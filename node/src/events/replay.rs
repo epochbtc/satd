@@ -155,13 +155,17 @@ pub fn build_cursor_replay(
     max_blocks: u32,
 ) -> CursorReplay {
     let snapshot_tip = src.current_tip_height();
+    let chain_on = category_mask & 2 != 0;
     let requested_start = from.height.saturating_add(1);
     let mut start = requested_start;
     // Bound the confirmed replay span. A cursor far behind the tip would
     // otherwise stream the entire chain (a DoS amplification) and build an
     // unbounded boundary-dedup map. Replayed events carry their height cursor,
     // so a client can detect the resulting gap and full-resync the rest.
-    if snapshot_tip >= start && snapshot_tip - start + 1 > max_blocks {
+    // Only meaningful when chain history is actually being replayed: with the
+    // chain category masked off no confirmed blocks are emitted, so the span is
+    // not clamped and `earliest_replayed`/`clamped` report "nothing skipped".
+    if chain_on && snapshot_tip >= start && snapshot_tip - start + 1 > max_blocks {
         let clamped = snapshot_tip - max_blocks + 1;
         tracing::warn!(
             target: "events::replay",
@@ -177,7 +181,7 @@ pub fn build_cursor_replay(
 
     let mut events: Vec<NodeEvent> = Vec::new();
     let mut confirmed_dedup: HashMap<u32, BlockHash> = HashMap::new();
-    if category_mask & 2 != 0 && start <= snapshot_tip {
+    if chain_on && start <= snapshot_tip {
         for (h, hash) in src.active_chain_range(start, snapshot_tip) {
             confirmed_dedup.insert(h, hash);
             events.push(synth_block_connected(publisher, h, hash));
@@ -384,5 +388,21 @@ mod tests {
         assert!(!r.clamped);
         assert_eq!(r.earliest_replayed, 6);
         assert!(r.events.is_empty());
+    }
+
+    #[test]
+    fn chain_masked_off_does_not_clamp() {
+        let src = FlatChain { tip: 100 };
+        let pubr = publisher();
+        // Ancient cursor that WOULD clamp if chain were on, but the chain
+        // category bit (2) is masked off (mask = 1, mempool only). No confirmed
+        // blocks replay, so the report must be "nothing skipped".
+        let r = build_cursor_replay(&src, &pubr, cursor(2), 1, 10);
+        assert!(!r.clamped, "no clamp reported when chain replay is masked off");
+        assert_eq!(r.earliest_replayed, 3, "earliest = from.height + 1");
+        assert!(
+            r.events.is_empty(),
+            "no confirmed blocks emitted with chain masked off"
+        );
     }
 }

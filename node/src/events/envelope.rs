@@ -363,7 +363,11 @@ pub enum NodeEventBody {
 }
 
 /// Why a mid-stream re-anchor was not admitted (see [`SetCursorOutcome`]).
+///
+/// `rename_all = "snake_case"` keeps the JSON (WS/SSE carriers) consistent with
+/// the rest of the event schema (`EvictReason`, the `kind`-tagged bodies).
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum CursorRejectReason {
     /// Per-principal re-anchor rate limit exceeded.
     RateLimited,
@@ -377,7 +381,15 @@ pub enum CursorRejectReason {
 
 /// Deterministic result of a `SetCursor` re-anchor, carried in-band by
 /// [`NodeEventBody::SetCursorResult`].
+///
+/// Internally tagged on `kind` with snake_case variants, mirroring the
+/// `MempoolEvent` / `ChainEvent` bodies, so the WS/SSE JSON renders as a flat
+/// `{"category":"set_cursor_result","kind":"accepted",...}` consistent with
+/// every other body (the gRPC carrier ignores serde and goes through
+/// `body_to_proto`). Without this the default external tagging would emit a
+/// non-conforming nested PascalCase object.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SetCursorOutcome {
     /// The re-anchor was admitted; confirmed-history replay follows this event
     /// in height order before the live tail resumes. `clamped` is true when the
@@ -704,6 +716,49 @@ mod tests {
         );
         // A lag notice must never be category-filtered out.
         assert_eq!(env.category_bit(), u32::MAX);
+    }
+
+    #[test]
+    fn set_cursor_result_serializes_flat_with_category_and_kind() {
+        // Renders like the other bodies: a flat `category` + `kind`, snake_case,
+        // NOT a nested PascalCase object. (gRPC ignores serde; this guards the
+        // WS/SSE JSON contract should SetCursor ever reach those carriers.)
+        let from = Cursor {
+            height: 500,
+            tx_index: 0,
+            mempool_seq: 0,
+            instance_id: 7,
+        };
+        let accepted = NodeEvent::new(
+            stamp(),
+            NodeEventBody::SetCursorResult(SetCursorOutcome::Accepted {
+                from,
+                clamped: true,
+                earliest_replayed: 491,
+            }),
+        );
+        let v = serde_json::to_value(&accepted).unwrap();
+        assert_eq!(v["body"]["category"], "set_cursor_result");
+        assert_eq!(v["body"]["kind"], "accepted");
+        assert_eq!(v["body"]["clamped"], true);
+        assert_eq!(v["body"]["earliest_replayed"], 491);
+        assert_eq!(v["body"]["from"]["height"], 500);
+        // No externally-tagged PascalCase wrapper.
+        assert!(v["body"]["Accepted"].is_null());
+
+        let rejected = NodeEvent::new(
+            stamp(),
+            NodeEventBody::SetCursorResult(SetCursorOutcome::Rejected {
+                reason: CursorRejectReason::ConcurrentReanchor,
+                current_head: from,
+            }),
+        );
+        let v = serde_json::to_value(&rejected).unwrap();
+        assert_eq!(v["body"]["category"], "set_cursor_result");
+        assert_eq!(v["body"]["kind"], "rejected");
+        assert_eq!(v["body"]["reason"], "concurrent_reanchor");
+        // A re-anchor ack must never be category-filtered out.
+        assert_eq!(rejected.category_bit(), u32::MAX);
     }
 
     #[test]

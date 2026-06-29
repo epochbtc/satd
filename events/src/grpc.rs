@@ -1086,6 +1086,22 @@ impl NodeEventStream for NodeEventStreamSvc {
             let prefix_bounds = (self.prefix_min_bits, self.prefix_max_bits);
             tokio::spawn(async move {
                 use node::events::CursorRejectReason;
+                use tokio::sync::mpsc::error::TrySendError;
+                // Queue a deterministic rejection for the outbound task to render.
+                // `Full` means the bounded reject channel is backed up behind a
+                // client that is not draining its stream (the surplus is shed —
+                // log it, since a silently-lost rejection is the exact bug this
+                // path exists to kill); `Closed` means the outbound task is gone
+                // (stream tearing down) — nothing to do.
+                let reject = |reason: CursorRejectReason| {
+                    if let Err(TrySendError::Full(reason)) = reject_tx.try_send(reason) {
+                        debug!(
+                            target: "events::grpc",
+                            ?reason,
+                            "shedding mid-stream SetCursor rejection: client not draining its stream",
+                        );
+                    }
+                };
                 while let Ok(Some(ctrl)) = inbound.message().await {
                     // `SetCursor` is a mid-stream re-anchor, not a watch-set
                     // mutation: forward its cursor to the outbound task (or a
@@ -1095,7 +1111,7 @@ impl NodeEventStream for NodeEventStreamSvc {
                         let Some(c) = &sc.cursor else {
                             // Malformed empty SetCursor: spends no rate token, but
                             // the client still gets a deterministic rejection.
-                            let _ = reject_tx.try_send(CursorRejectReason::EmptyCursor);
+                            reject(CursorRejectReason::EmptyCursor);
                             continue;
                         };
                         // A re-anchor drives a confirmed-history replay (up to
@@ -1117,7 +1133,7 @@ impl NodeEventStream for NodeEventStreamSvc {
                                 retry_after_secs,
                                 "rejecting mid-stream SetCursor re-anchor: per-principal rate limit exceeded",
                             );
-                            let _ = reject_tx.try_send(CursorRejectReason::RateLimited);
+                            reject(CursorRejectReason::RateLimited);
                             continue;
                         }
                         let cur = node::events::Cursor {
@@ -1126,11 +1142,13 @@ impl NodeEventStream for NodeEventStreamSvc {
                             mempool_seq: c.mempool_seq,
                             instance_id: c.instance_id,
                         };
-                        // Capacity-1: a `try_send` failure means a re-anchor is
-                        // already draining. Tell the client deterministically
-                        // instead of silently dropping it.
-                        if reanchor_tx.try_send(cur).is_err() {
-                            let _ = reject_tx.try_send(CursorRejectReason::ConcurrentReanchor);
+                        // Capacity-1 reanchor channel. `Full` means a re-anchor is
+                        // already draining → tell the client deterministically
+                        // (ConcurrentReanchor) instead of silently dropping it.
+                        // `Closed` means the outbound task has exited (stream
+                        // tearing down) → nothing to report.
+                        if let Err(TrySendError::Full(_)) = reanchor_tx.try_send(cur) {
+                            reject(CursorRejectReason::ConcurrentReanchor);
                         }
                         continue;
                     }
