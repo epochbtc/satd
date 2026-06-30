@@ -2589,7 +2589,6 @@ mod tests {
                 pb::node_event::Body::Heartbeat(_) => "heartbeat",
                 pb::node_event::Body::OutpointSpent(_) => "outpoint_spent",
                 pb::node_event::Body::ScriptMatched(_) => "script_matched",
-                pb::node_event::Body::DescriptorNeedsAddresses(_) => "descriptor_needs_addresses",
                 pb::node_event::Body::Lagged(_) => "lagged",
                 pb::node_event::Body::TxidMatched(_) => "txid_matched",
                 pb::node_event::Body::TxidReplaced(_) => "txid_replaced",
