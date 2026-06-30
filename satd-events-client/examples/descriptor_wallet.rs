@@ -48,10 +48,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     watch.add_descriptor(descriptor, gap_limit, start).await?;
                 }
             }
-            // If the node can't expand the descriptor it emits
-            // `DescriptorNeedsAddresses`, which this SDK maps to `Event::Unknown`
-            // (a typed accessor is future work) — a real client would surface it
-            // rather than silently ignoring an unexpandable descriptor.
+            // Forward-compat: an event arm this SDK build doesn't recognize
+            // (a newer server) decodes to `Event::Unknown`. The server never
+            // pushes a gap-limit nudge — advancing the window is this client's
+            // job, done above on each funding match.
             Event::Unknown => {}
             _ => {}
         }

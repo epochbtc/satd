@@ -11,6 +11,12 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
 
 ## [Unreleased]
 
+- **Retire the never-emitted `DescriptorNeedsAddresses` event.** The deprecated
+  gap-limit side-channel (`NodeEvent.body` field 15) is removed from the wire
+  schema and its tag reserved. No server ever emitted it — gap-limit
+  advancement is a client concern — so this changes no observable behavior; it
+  drops the dead `Event::Unknown` mapping in `satd-events-client` and the stale
+  docs that implied the server pushed a top-up nudge. (#440)
 - **Deterministic mid-stream re-anchor (`set_cursor`).** A `SetCursor` on the
   bidirectional gRPC `Watch` stream now emits exactly one in-band
   `SetCursorResult` (`CursorAccepted{from, clamped, earliest_replayed}` ahead of

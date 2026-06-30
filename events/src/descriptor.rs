@@ -13,8 +13,8 @@
 //! it is asked for and stays stateless. The client advances `start` (and
 //! removes the trailing scripts) to slide the window as its addresses are
 //! used; the server never tracks derivation progress and never emits a
-//! side-channel. (`DescriptorNeedsAddresses` is a deprecated, never-emitted
-//! proto message kept only to reserve its field number.)
+//! side-channel (no gap-limit nudge from the server — that derivation-progress
+//! design was dropped, and its retired wire field is reserved in NodeEvent).
 
 use bitcoin::hashes::{Hash, sha256};
 use miniscript::descriptor::Wildcard;

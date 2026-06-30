@@ -208,21 +208,6 @@ message PrefixMatched {
   repeated SpentPrevout matched_prevouts = 5;
 }
 
-// DEPRECATED / RESERVED — never emitted. The original design had the server
-// track each descriptor's derivation progress and push this side-channel to
-// tell the client to advance its gap-limit window. That was dropped: gap-limit
-// tracking is a CLIENT concern (the client knows its own address-generation
-// policy and is better placed to decide when to extend). The server stays
-// stateless — it watches the fixed window AddDescriptor.start/gap_limit asks
-// for, and the client advances `start` itself. This message is retained only
-// to reserve field 15 in NodeEvent.body; no server emits it and no client
-// should wait for it.
-message DescriptorNeedsAddresses {
-  option deprecated = true;
-  string descriptor = 1;
-  uint32 next_index = 2;
-}
-
 // Filter knobs for a subscription. All optional; an unset field means
 // "no filter" (the server applies its own defaults).
 message SubscribeRequest {
@@ -424,13 +409,18 @@ message NodeEvent {
   // advance the durable cursor. A client persists this and presents it
   // as `SubscribeRequest.from_cursor` to resume.
   Cursor cursor = 3;
+  // Field 15 (descriptor_needs_addresses) was a deprecated gap-limit
+  // side-channel no server ever emitted — gap-limit advancement is a client
+  // concern. Retired; reserved so the tag is never silently reused for new
+  // semantics.
+  reserved 15;
+  reserved "descriptor_needs_addresses";
   oneof body {
     MempoolEvent mempool = 10;
     ChainEvent chain = 11;
     Heartbeat heartbeat = 12;
     OutpointSpent outpoint_spent = 13; // watch match (Watch stream)
     ScriptMatched script_matched = 14; // watch match (Watch stream)
-    DescriptorNeedsAddresses descriptor_needs_addresses = 15; // gap-limit side-channel
     Lagged lagged = 16; // in-band slow-consumer lag notice + resume cursor
     TxidMatched txid_matched = 17; // watch match (Watch stream)
     TxidReplaced txid_replaced = 18; // lifecycle: RBF-replaced

@@ -396,8 +396,6 @@ impl From<pb::NodeEvent> for Event {
                 // A result frame with no outcome set is a degenerate message.
                 None => Event::Unknown,
             },
-            // Reserved/never-emitted, or an unrecognized arm.
-            Body::DescriptorNeedsAddresses(_) => Event::Unknown,
         }
     }
 }
