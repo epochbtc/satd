@@ -433,7 +433,15 @@ impl ResilientWatchConfig {
     ///   [`StreamError::WatchSetLoader`], which the reconnect loop backs off and
     ///   retries on the next connect rather than surfacing — a momentary failure
     ///   of the integrator's truth must not crash a consumer whose contract is
-    ///   at-least-once.
+    ///   at-least-once. A *permanent* loader error (a config typo, a closure that
+    ///   always fails) is indistinguishable from a transient one and so is retried
+    ///   indefinitely: with the default backoff (`max_retries: None`) the stream
+    ///   never resumes and [`next`](ResilientWatch::next) simply never yields.
+    ///   Set [`Backoff::max_retries`](crate::Backoff::max_retries) if you need a
+    ///   permanently-failing loader to surface a terminal error instead of
+    ///   retrying forever. The loader should return `Err` rather than panic — a
+    ///   panic unwinds through the reconnect and aborts the current `next()`; it
+    ///   is not caught.
     ///
     /// The resume cursor is independent of the watch-set: it still comes from the
     /// [`cursor_store`](Self::cursor_store) / [`from_cursor`](Self::from_cursor)
