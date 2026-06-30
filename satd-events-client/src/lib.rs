@@ -139,7 +139,9 @@ pub use resilience::{
     Backoff, CursorStore, FileCursorStore, LagPolicy, NoopCursorStore, ResilientConfig,
     ResilientSubscription,
 };
-pub use resilient_watch::{ResilientWatch, ResilientWatchConfig, WatchSetBuilder};
+pub use resilient_watch::{
+    ReloadError, ReloadSummary, ResilientWatch, ResilientWatchConfig, WatchSetBuilder,
+};
 
 #[cfg(feature = "bitcoin")]
 #[cfg_attr(docsrs, doc(cfg(feature = "bitcoin")))]

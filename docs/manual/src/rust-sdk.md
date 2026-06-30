@@ -318,6 +318,38 @@ Semantics:
 `remove_*` — you are building a complete set into an empty mirror). Omit the
 loader and behavior is exactly the mirror-replay described above.
 
+#### Pushing a truth change mid-stream — `reload()`
+
+The loader fires on every *reconnect*. When the durable truth changes **while the
+stream is up** — a bulk import that wrote rows outside your hot-add path, an admin
+rotation, an operator "make the wire match truth now" reconciliation — `reload()`
+re-runs the loader, **diffs** the freshly-loaded set against the live watch-set,
+and applies only the delta on the wire:
+
+```rust,ignore
+let summary = watch.reload().await?;   // ReloadSummary { added, removed, unchanged, applied }
+tracing::info!(?summary, "watch-set realigned with truth");
+```
+
+- **Diff, not blast** — only added / changed / removed items are sent (`Add*`
+  before `Remove*`/`RemoveDescriptor`, so new coverage is up before the old is
+  dropped); identical items are untouched, so there's no window where the server
+  watches nothing. A descriptor whose window changed is re-asserted (the server
+  reconciles); a vanished descriptor is dropped with `RemoveDescriptor` (so this
+  needs the descriptor-membership server support — satd ≥ this release).
+- **Atomic** — `&mut self` serializes `reload()` against your `add_*` / `next()`
+  on the single task.
+- **Disconnected defers, never errors** — with the stream down there's nothing to
+  apply now; the mirror is still updated and the next reconnect's loader
+  re-registers it. `ReloadSummary::applied` tells you which happened.
+- Returns `ReloadError::NoLoader` if no loader is configured, or
+  `ReloadError::Loader` if the loader itself fails (surfaced, not retried — you
+  decide whether to call again).
+
+This reuses the backoff / cursor re-anchor / loader plumbing — the reason to use
+`ResilientWatch` at all — instead of dropping and rebuilding the wrapper to force
+a full re-push.
+
 ## Prefix watches (privacy-preserving)
 
 A prefix watch registers a coarse `bits`-bit prefix of `sha256(scriptPubKey)`.

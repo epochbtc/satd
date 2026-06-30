@@ -719,6 +719,17 @@ impl StreamClient {
 }
 
 #[cfg(test)]
+impl WatchHandle {
+    /// A handle wired to an inspectable receiver — for unit tests in sibling
+    /// modules (e.g. `ResilientWatch::reload`) that assert the control messages a
+    /// layer sends. No server needed.
+    pub(crate) fn for_test() -> (Self, mpsc::Receiver<pb::SubscribeControl>) {
+        let (tx, rx) = mpsc::channel(64);
+        (WatchHandle { tx }, rx)
+    }
+}
+
+#[cfg(test)]
 impl StreamClient {
     /// Build a client over a lazily-connected channel to a dummy endpoint, for
     /// unit tests of layers (e.g. [`ResilientSubscription`](crate::ResilientSubscription))

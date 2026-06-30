@@ -250,6 +250,203 @@ impl WatchSetMirror {
 
         out
     }
+
+    /// Compute the minimal control messages that transform `self` (the current
+    /// net watch-set) into `target`, plus item counts — the delta a
+    /// [`reload`](ResilientWatch::reload) applies on the live wire. Only the
+    /// differences are emitted: items present-and-equal in both are left alone,
+    /// so the stream is never cleared and rebuilt (no window where the server
+    /// watches nothing). `Add*` messages lead so new coverage is registered
+    /// before any `Remove*`/`RemoveDescriptor` tears the old down. A descriptor
+    /// whose window changed is one `AddDescriptor` (the server reconciles the
+    /// slid window); a descriptor that disappeared is a `RemoveDescriptor`.
+    fn reconcile_to(&self, target: &WatchSetMirror) -> (Vec<Msg>, ReloadCounts) {
+        let mut adds = Vec::new();
+        let mut removes = Vec::new();
+        let mut c = ReloadCounts::default();
+
+        // Category filter (not a watch *item*, so it does not move the counts).
+        if target.categories != self.categories
+            && let Some(cat) = target.categories
+        {
+            adds.push(Msg::SetCategories(pb::SetCategories { categories: cat }));
+        }
+
+        // Scripts: new or changed-floor → AddScripts; vanished → RemoveScripts.
+        {
+            let mut changed: Vec<(Scripthash, Option<u64>)> = Vec::new();
+            for (h, floor) in &target.scripts {
+                match self.scripts.get(h) {
+                    Some(f) if f == floor => c.unchanged += 1,
+                    _ => changed.push((*h, *floor)),
+                }
+            }
+            let gone: Vec<Scripthash> =
+                self.scripts.keys().filter(|h| !target.scripts.contains_key(*h)).copied().collect();
+            if !changed.is_empty() {
+                c.added += changed.len();
+                let scripthashes = changed.iter().map(|(h, _)| h.to_vec()).collect();
+                let min_values = if changed.iter().any(|(_, f)| f.is_some()) {
+                    changed.iter().map(|(_, f)| f.unwrap_or(0)).collect()
+                } else {
+                    Vec::new()
+                };
+                adds.push(Msg::AddScripts(pb::AddScripts { scripthashes, min_values }));
+            }
+            if !gone.is_empty() {
+                c.removed += gone.len();
+                removes.push(Msg::RemoveScripts(pb::RemoveScripts {
+                    scripthashes: gone.iter().map(|h| h.to_vec()).collect(),
+                }));
+            }
+        }
+
+        // Outpoints.
+        {
+            let add: Vec<_> = target.outpoints.difference(&self.outpoints).copied().collect();
+            let gone: Vec<_> = self.outpoints.difference(&target.outpoints).copied().collect();
+            c.unchanged += target.outpoints.intersection(&self.outpoints).count();
+            if !add.is_empty() {
+                c.added += add.len();
+                adds.push(Msg::AddOutpoints(pb::AddOutpoints {
+                    outpoints: add.iter().map(|(t, v)| pb::Outpoint { txid: t.to_vec(), vout: *v }).collect(),
+                }));
+            }
+            if !gone.is_empty() {
+                c.removed += gone.len();
+                removes.push(Msg::RemoveOutpoints(pb::RemoveOutpoints {
+                    outpoints: gone.iter().map(|(t, v)| pb::Outpoint { txid: t.to_vec(), vout: *v }).collect(),
+                }));
+            }
+        }
+
+        // Tx lifecycles: new or changed auto-close → AddTransactions (grouped by
+        // depth, empty min_depths); vanished → RemoveTransactions (lifecycle).
+        {
+            let mut by_depth: BTreeMap<u32, Vec<Vec<u8>>> = BTreeMap::new();
+            for (txid, ac) in &target.tx_lifecycles {
+                match self.tx_lifecycles.get(txid) {
+                    Some(old) if old == ac => c.unchanged += 1,
+                    _ => {
+                        let depth = match ac {
+                            AutoClose::Never => 0,
+                            AutoClose::AtDepth(d) => *d,
+                        };
+                        by_depth.entry(depth).or_default().push(txid.to_vec());
+                        c.added += 1;
+                    }
+                }
+            }
+            for (auto_close_depth, txids) in by_depth {
+                adds.push(Msg::AddTransactions(pb::AddTransactions {
+                    txids,
+                    min_depths: Vec::new(),
+                    auto_close_depth,
+                }));
+            }
+            let gone: Vec<Vec<u8>> = self
+                .tx_lifecycles
+                .keys()
+                .filter(|t| !target.tx_lifecycles.contains_key(*t))
+                .map(|t| t.to_vec())
+                .collect();
+            if !gone.is_empty() {
+                c.removed += gone.len();
+                removes.push(Msg::RemoveTransactions(pb::RemoveTransactions {
+                    txids: gone,
+                    min_depths: Vec::new(),
+                }));
+            }
+        }
+
+        // Depth alarms, grouped per txid (non-empty min_depths marks the kind).
+        {
+            let add: Vec<_> = target.depth_alarms.difference(&self.depth_alarms).copied().collect();
+            let gone: Vec<_> = self.depth_alarms.difference(&target.depth_alarms).copied().collect();
+            c.unchanged += target.depth_alarms.intersection(&self.depth_alarms).count();
+            if !add.is_empty() {
+                c.added += add.len();
+                let mut by_txid: BTreeMap<Txid, Vec<u32>> = BTreeMap::new();
+                for (t, d) in add {
+                    by_txid.entry(t).or_default().push(d);
+                }
+                for (txid, min_depths) in by_txid {
+                    adds.push(Msg::AddTransactions(pb::AddTransactions {
+                        txids: vec![txid.to_vec()],
+                        min_depths,
+                        auto_close_depth: 0,
+                    }));
+                }
+            }
+            if !gone.is_empty() {
+                c.removed += gone.len();
+                let mut by_txid: BTreeMap<Txid, Vec<u32>> = BTreeMap::new();
+                for (t, d) in gone {
+                    by_txid.entry(t).or_default().push(d);
+                }
+                for (txid, min_depths) in by_txid {
+                    removes.push(Msg::RemoveTransactions(pb::RemoveTransactions {
+                        txids: vec![txid.to_vec()],
+                        min_depths,
+                    }));
+                }
+            }
+        }
+
+        // Descriptors: new or changed window → AddDescriptor (server reconciles);
+        // vanished → RemoveDescriptor.
+        {
+            for (d, win) in &target.descriptors {
+                match self.descriptors.get(d) {
+                    Some(old) if old == win => c.unchanged += 1,
+                    _ => {
+                        c.added += 1;
+                        adds.push(Msg::AddDescriptor(pb::AddDescriptor {
+                            descriptor: d.clone(),
+                            gap_limit: win.0,
+                            start: win.1,
+                        }));
+                    }
+                }
+            }
+            for d in self.descriptors.keys() {
+                if !target.descriptors.contains_key(d) {
+                    c.removed += 1;
+                    removes.push(Msg::RemoveDescriptor(pb::RemoveDescriptor { descriptor: d.clone() }));
+                }
+            }
+        }
+
+        // Prefix buckets.
+        {
+            let add: Vec<_> = target.prefixes.difference(&self.prefixes).cloned().collect();
+            let gone: Vec<_> = self.prefixes.difference(&target.prefixes).cloned().collect();
+            c.unchanged += target.prefixes.intersection(&self.prefixes).count();
+            if !add.is_empty() {
+                c.added += add.len();
+                adds.push(Msg::AddScriptPrefixes(pb::AddScriptPrefixes {
+                    prefixes: add.iter().map(|(bits, p)| pb::ScriptPrefix { prefix: p.clone(), bits: *bits }).collect(),
+                }));
+            }
+            if !gone.is_empty() {
+                c.removed += gone.len();
+                removes.push(Msg::RemoveScriptPrefixes(pb::RemoveScriptPrefixes {
+                    prefixes: gone.iter().map(|(bits, p)| pb::ScriptPrefix { prefix: p.clone(), bits: *bits }).collect(),
+                }));
+            }
+        }
+
+        adds.extend(removes);
+        (adds, c)
+    }
+}
+
+/// Item counts from a [`reconcile_to`](WatchSetMirror::reconcile_to) diff.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ReloadCounts {
+    added: usize,
+    removed: usize,
+    unchanged: usize,
 }
 
 /// The canonical watch-set declared by a [`watch_set_loader`] on every
@@ -473,6 +670,37 @@ impl ResilientWatchConfig {
     }
 }
 
+/// The outcome of [`ResilientWatch::reload`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ReloadSummary {
+    /// Watch items added or changed (a changed floor / descriptor window / tx
+    /// auto-close counts as added).
+    pub added: usize,
+    /// Watch items removed.
+    pub removed: usize,
+    /// Watch items present and identical in both the old and reloaded set.
+    pub unchanged: usize,
+    /// Whether the delta was sent on the live stream now (`true`), or deferred to
+    /// the next reconnect's loader because the stream was down — or dropped
+    /// mid-reload (`false`). When `false` the mirror still reflects the reloaded
+    /// set, so the pending reconnect re-registers it from the same loader.
+    pub applied: bool,
+}
+
+/// Why a [`ResilientWatch::reload`] could not run.
+#[derive(Debug, thiserror::Error)]
+pub enum ReloadError {
+    /// `reload` requires a [`watch_set_loader`](ResilientWatchConfig::watch_set_loader);
+    /// none was configured.
+    #[error("reload requires a watch_set_loader, but none is configured")]
+    NoLoader,
+    /// The loader itself returned an error. Unlike a connect-time loader failure
+    /// (which is retried on reconnect), an explicit `reload` surfaces it so the
+    /// caller decides whether to retry.
+    #[error("watch-set loader failed: {0}")]
+    Loader(#[source] BoxError),
+}
+
 /// A `Watch` stream that reconnects, re-registers its watch-set, and re-anchors
 /// off the deterministic [`Event::CursorAccepted`] / [`Event::CursorRejected`]
 /// results on the caller's behalf.
@@ -484,7 +712,9 @@ impl ResilientWatchConfig {
 /// single-task, like [`ResilientSubscription`](crate::ResilientSubscription):
 /// interleave watch-set edits with [`next`](Self::next) calls from one task
 /// (the [`descriptor_wallet`] usage shape — react to a match, then adjust the
-/// watch-set).
+/// watch-set). When the watch-set has a durable source-of-truth, configure a
+/// [`watch_set_loader`](ResilientWatchConfig::watch_set_loader) and call
+/// [`reload`](Self::reload) to realign the live stream with that truth on demand.
 ///
 /// [`descriptor_wallet`]: https://github.com/epochbtc/satd/blob/master/satd-events-client/examples/descriptor_wallet.rs
 pub struct ResilientWatch {
@@ -789,6 +1019,82 @@ impl ResilientWatch {
             None => None,
         };
         self.after_send(res)
+    }
+
+    /// Re-run the configured [`watch_set_loader`](ResilientWatchConfig::watch_set_loader),
+    /// diff the freshly-loaded canonical set against the live watch-set, and apply
+    /// **only the delta** on the wire — realigning the subscription with the
+    /// integrator's source-of-truth without dropping and rebuilding the stream
+    /// (which would throw away the backoff / cursor re-anchor plumbing).
+    ///
+    /// This is the on-demand companion to the connect-time loader (which fires on
+    /// every reconnect, [`watch_set_loader`](ResilientWatchConfig::watch_set_loader)):
+    /// use it when the durable truth changes *while the stream is up* and you want
+    /// it pushed now — a bulk import or migration that wrote truth outside the
+    /// hot-add path, an admin/external rotation, or an operator "make the wire
+    /// match truth" reconciliation.
+    ///
+    /// Semantics:
+    ///
+    /// - **Diff, not blast.** Only added/changed/removed items are sent
+    ///   (`Add*` first so new coverage is up before any `Remove*` /
+    ///   `RemoveDescriptor` tears the old down); identical items are untouched,
+    ///   so there is no window where the server watches nothing. A descriptor
+    ///   whose window changed is re-asserted (the server reconciles); a vanished
+    ///   descriptor is dropped with `RemoveDescriptor`.
+    /// - **Atomic w.r.t. concurrent edits.** `&mut self` serializes `reload`
+    ///   against `add_*` / `remove_*` / [`next`](Self::next), so no hot-add can
+    ///   interleave with the diff.
+    /// - **The reloaded set becomes the mirror.** Subsequent reconnects replay it
+    ///   (and re-run the loader), exactly as for the connect-time path.
+    /// - **Disconnected (or dropped mid-reload) defers, never errors.** With the
+    ///   stream down there is nothing to apply now; the mirror is still updated to
+    ///   the reloaded set and the next reconnect's loader re-registers it from
+    ///   truth. [`ReloadSummary::applied`] reports which happened.
+    ///
+    /// Returns [`ReloadError::NoLoader`] if no loader is configured, or
+    /// [`ReloadError::Loader`] if the loader itself fails (surfaced, not retried —
+    /// an explicit `reload` lets the caller decide).
+    pub async fn reload(&mut self) -> Result<ReloadSummary, ReloadError> {
+        let loader = self.config.watch_set_loader.clone().ok_or(ReloadError::NoLoader)?;
+        // Build the canonical set from the integrator's truth into a fresh mirror.
+        let shared = Arc::new(Mutex::new(WatchSetMirror::default()));
+        loader(WatchSetBuilder { mirror: shared.clone() })
+            .await
+            .map_err(ReloadError::Loader)?;
+        let loaded = std::mem::take(&mut *shared.lock().unwrap_or_else(|p| p.into_inner()));
+
+        // Diff the current live set against it.
+        let (messages, counts) = self.mirror.reconcile_to(&loaded);
+
+        // Apply the delta live if connected; a send failure means the stream is
+        // gone, so defer to the reconnect loader rather than erroring.
+        let mut applied = false;
+        if self.handle.is_some() {
+            applied = true;
+            for msg in messages {
+                let res = match &self.handle {
+                    Some(h) => h.send_control(pb::SubscribeControl { msg: Some(msg) }).await,
+                    None => break,
+                };
+                if res.is_err() {
+                    self.teardown();
+                    applied = false;
+                    break;
+                }
+            }
+        }
+
+        // Adopt the reloaded set as the canonical mirror regardless: a deferred
+        // reload is rebuilt from the same loader on the next reconnect.
+        self.mirror = loaded;
+
+        Ok(ReloadSummary {
+            added: counts.added,
+            removed: counts.removed,
+            unchanged: counts.unchanged,
+            applied,
+        })
     }
 
     // --- driving the stream ---------------------------------------------------
@@ -1508,5 +1814,147 @@ mod tests {
     fn no_loader_leaves_behavior_unchanged() {
         // The default config has no loader: mirror-replay is untouched.
         assert!(ResilientWatchConfig::new().watch_set_loader.is_none());
+    }
+
+    // --- reload(): diff the live set against truth and apply the delta ---------
+
+    #[test]
+    fn reconcile_to_emits_only_the_delta_adds_before_removes() {
+        // Old set vs a target that adds, removes, and changes one of each kind.
+        let mut old = WatchSetMirror::default();
+        old.add_scripts(&[([1u8; 32], None), ([2u8; 32], Some(500))]); // 2 kept-ish
+        old.add_outpoints(&[([9u8; 32], 0)]);
+        old.add_descriptor("desc-keep".into(), 20, 0);
+        old.add_descriptor("desc-drop".into(), 20, 0);
+
+        let mut new = WatchSetMirror::default();
+        new.add_scripts(&[([1u8; 32], None), ([2u8; 32], Some(999))]); // sh2 floor changed
+        new.add_scripts(&[([3u8; 32], None)]); // sh3 new
+        // sh? none removed here besides via descriptors; outpoint 9 removed (absent)
+        new.add_descriptor("desc-keep".into(), 20, 0); // unchanged
+        // desc-drop removed; desc-new added
+        new.add_descriptor("desc-new".into(), 20, 0);
+
+        let (msgs, counts) = old.reconcile_to(&new);
+
+        // sh3 + sh2(changed) added (2), desc-new added (1) → added 3.
+        // outpoint 9 removed (1), desc-drop removed (1) → removed 2.
+        // sh1 + desc-keep unchanged → unchanged 2.
+        assert_eq!(counts.added, 3, "sh2(changed) + sh3 + desc-new");
+        assert_eq!(counts.removed, 2, "outpoint + desc-drop");
+        assert_eq!(counts.unchanged, 2, "sh1 + desc-keep");
+
+        // All Add*/SetCategories come before any Remove*/RemoveDescriptor.
+        let first_remove = msgs.iter().position(|m| {
+            matches!(
+                m,
+                Msg::RemoveScripts(_)
+                    | Msg::RemoveOutpoints(_)
+                    | Msg::RemoveTransactions(_)
+                    | Msg::RemoveScriptPrefixes(_)
+                    | Msg::RemoveDescriptor(_)
+            )
+        });
+        let last_add = msgs.iter().rposition(|m| {
+            matches!(
+                m,
+                Msg::AddScripts(_)
+                    | Msg::AddOutpoints(_)
+                    | Msg::AddTransactions(_)
+                    | Msg::AddDescriptor(_)
+                    | Msg::AddScriptPrefixes(_)
+                    | Msg::SetCategories(_)
+            )
+        });
+        if let (Some(fr), Some(la)) = (first_remove, last_add) {
+            assert!(la < fr, "every Add must precede every Remove");
+        }
+        // A vanished descriptor is dropped with RemoveDescriptor, not by scripthash.
+        assert!(msgs.iter().any(|m| matches!(m, Msg::RemoveDescriptor(d) if d.descriptor == "desc-drop")));
+    }
+
+    #[test]
+    fn reconcile_identical_sets_is_empty() {
+        let mut m = WatchSetMirror::default();
+        m.add_scripts(&[([1u8; 32], Some(5))]);
+        m.add_descriptor("d".into(), 20, 0);
+        let (msgs, counts) = m.reconcile_to(&m.clone());
+        assert!(msgs.is_empty(), "no churn when nothing changed");
+        assert_eq!((counts.added, counts.removed), (0, 0));
+        assert_eq!(counts.unchanged, 2);
+    }
+
+    #[tokio::test]
+    async fn reload_without_loader_errors() {
+        let store = Arc::new(MemStore::default());
+        let mut w = watch_with(&store);
+        assert!(matches!(w.reload().await, Err(ReloadError::NoLoader)));
+    }
+
+    #[tokio::test]
+    async fn reload_surfaces_loader_error() {
+        let mut w = ResilientWatch::new(
+            StreamClient::for_test(),
+            ResilientWatchConfig::new()
+                .watch_set_loader(|_b: WatchSetBuilder| async move { Err("truth down".into()) }),
+        );
+        let err = w.reload().await.expect_err("loader failure surfaces");
+        assert!(matches!(err, ReloadError::Loader(_)));
+        assert!(err.to_string().contains("truth down"));
+    }
+
+    #[tokio::test]
+    async fn reload_while_disconnected_defers_but_updates_the_mirror() {
+        let mut w = ResilientWatch::new(
+            StreamClient::for_test(),
+            ResilientWatchConfig::new().watch_set_loader(|b: WatchSetBuilder| async move {
+                b.add_scripts([([5u8; 32], None)]);
+                Ok(())
+            }),
+        );
+        // Pre-existing live edit the loader will not reproduce.
+        w.add_scripts([([1u8; 32], None)]).await.unwrap();
+
+        let summary = w.reload().await.expect("reload ok");
+        assert!(!summary.applied, "no live stream → deferred to reconnect loader");
+        assert_eq!(summary.added, 1, "sh5 added");
+        assert_eq!(summary.removed, 1, "stale sh1 removed");
+        // The mirror now reflects truth, so a reconnect re-registers the right set.
+        assert!(w.mirror.scripts.contains_key(&[5u8; 32]));
+        assert!(!w.mirror.scripts.contains_key(&[1u8; 32]));
+    }
+
+    #[tokio::test]
+    async fn reload_while_connected_sends_only_the_delta() {
+        let mut w = ResilientWatch::new(
+            StreamClient::for_test(),
+            ResilientWatchConfig::new().watch_set_loader(|b: WatchSetBuilder| async move {
+                // Truth: keep sh1, drop sh2, add sh3.
+                b.add_scripts([([1u8; 32], None), ([3u8; 32], None)]);
+                Ok(())
+            }),
+        );
+        w.add_scripts([([1u8; 32], None), ([2u8; 32], None)]).await.unwrap();
+
+        // Inject a live handle whose receiver we can inspect.
+        let (handle, mut rx) = crate::client::WatchHandle::for_test();
+        w.handle = Some(handle);
+
+        let summary = w.reload().await.expect("reload ok");
+        assert!(summary.applied, "connected → applied live");
+        assert_eq!((summary.added, summary.removed, summary.unchanged), (1, 1, 1));
+
+        // Exactly one AddScripts(sh3) then one RemoveScripts(sh2) reached the wire.
+        let mut adds = Vec::new();
+        let mut rms = Vec::new();
+        while let Ok(ctrl) = rx.try_recv() {
+            match ctrl.msg.unwrap() {
+                Msg::AddScripts(a) => adds.extend(a.scripthashes),
+                Msg::RemoveScripts(r) => rms.extend(r.scripthashes),
+                other => panic!("unexpected control message: {other:?}"),
+            }
+        }
+        assert_eq!(adds, vec![[3u8; 32].to_vec()], "only the net-new script is added");
+        assert_eq!(rms, vec![[2u8; 32].to_vec()], "only the vanished script is removed");
     }
 }
