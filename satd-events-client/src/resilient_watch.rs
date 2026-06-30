@@ -708,7 +708,21 @@ impl ResilientWatch {
             return Ok(None);
         }
 
-        if matches!(&ev, Event::CursorAccepted { .. }) {
+        if let Event::CursorAccepted { from, .. } = &ev {
+            // The server has committed to replaying from this anchor. Adopt it as
+            // the resume / re-anchor point *now* — not only once the first
+            // replayed confirmed event advances the high-water. If the stream
+            // drops after this ack but before that first replayed event, the
+            // reconnect re-anchors from `resume`; leaving it at the stale
+            // high-water would silently skip the requested catch-up window and
+            // break at-least-once coverage. (`cur` is None for this control
+            // frame, so the high-water line above left `resume` untouched; we set
+            // it to the accepted anchor here. A clamped accept re-clamps the same
+            // way on reconnect, so re-anchoring from `from` stays correct.)
+            if let Some(c) = from {
+                self.resume = Some(*c);
+                self.desired_cursor = Some(*c);
+            }
             // The re-anchor landed: reset the transient-retry counter.
             self.reanchor_attempts = 0;
         }
@@ -980,6 +994,25 @@ mod tests {
         let out = w.handle_event(ev, None).await.unwrap();
         assert!(matches!(out, Some(Event::CursorAccepted { .. })), "accept surfaces to caller");
         assert_eq!(w.reanchor_attempts, 0, "a landed re-anchor resets the retry counter");
+    }
+
+    #[tokio::test]
+    async fn cursor_accepted_adopts_anchor_before_any_replayed_event() {
+        let store = Arc::new(MemStore::default());
+        let mut w = watch_with(&store);
+        // High-water sits forward (e.g. from prior live events); the caller
+        // re-anchors backward to replay a window.
+        w.resume = Some(cur(1000));
+        w.desired_cursor = Some(cur(200));
+        // Server admits the re-anchor. No replayed confirmed event has arrived yet
+        // (this control frame carries no cursor).
+        let ev = Event::CursorAccepted { from: Some(cur(200)), clamped: false, earliest_replayed: 200 };
+        let out = w.handle_event(ev, None).await.unwrap();
+        assert!(matches!(out, Some(Event::CursorAccepted { .. })));
+        // The accepted anchor is adopted immediately, so a reconnect *before* the
+        // first replayed event re-anchors from 200, not the stale high-water 1000.
+        assert_eq!(w.resume, Some(cur(200)), "accepted anchor becomes the resume point at once");
+        assert_eq!(w.desired_cursor, Some(cur(200)));
     }
 
     #[tokio::test]
