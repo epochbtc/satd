@@ -678,6 +678,27 @@ impl ResilientWatch {
             self.resume = Some(c);
         }
 
+        // One-shot watches the server auto-evicts when their terminal event
+        // fires: prune the mirror to match, so a reconnect does not re-register
+        // an already-fired watch (which would duplicate the terminal
+        // notification and burn watch quota on a completed txid). The server
+        // emits the *requested* threshold as `depth` (its alarm identity), so it
+        // is the exact `(txid, depth)` key to drop; a finalize evicts the whole
+        // lifecycle watch for the txid.
+        match &ev {
+            Event::TxidDepthReached { txid, depth, .. } => {
+                if let Ok(t) = <[u8; 32]>::try_from(txid.as_slice()) {
+                    self.mirror.remove_depth_alarms(&[(t, *depth)]);
+                }
+            }
+            Event::TxidFinalized { txid, .. } => {
+                if let Ok(t) = <[u8; 32]>::try_from(txid.as_slice()) {
+                    self.mirror.remove_tx_lifecycle(&[t]);
+                }
+            }
+            _ => {}
+        }
+
         let transient_reject = matches!(
             &ev,
             Event::CursorRejected {
@@ -1061,6 +1082,38 @@ mod tests {
             "budget exhausted → surfaced for the caller to escalate"
         );
         assert_eq!(w.reanchor_attempts, 0, "counter resets after surfacing");
+    }
+
+    // --- one-shot watch eviction sync -----------------------------------------
+
+    #[tokio::test]
+    async fn fired_depth_alarm_is_pruned_from_the_mirror() {
+        let store = Arc::new(MemStore::default());
+        let mut w = watch_with(&store);
+        // Arm two alarms on one txid; the server fires and self-evicts the
+        // depth-3 one (reporting the requested threshold 3, not actual confs).
+        w.add_depth_alarms([[7u8; 32]], [3, 6]).await.unwrap();
+        let ev = Event::TxidDepthReached { txid: [7u8; 32].to_vec(), depth: 3, height: 100 };
+        let out = w.handle_event(ev, None).await.unwrap();
+        assert!(matches!(out, Some(Event::TxidDepthReached { .. })), "still surfaced to caller");
+        // Fired (txid,3) pruned so a reconnect won't re-register it; (txid,6)
+        // stays for replay.
+        assert!(!w.mirror.depth_alarms.contains(&([7u8; 32], 3)), "fired alarm pruned");
+        assert!(w.mirror.depth_alarms.contains(&([7u8; 32], 6)), "unfired alarm retained");
+    }
+
+    #[tokio::test]
+    async fn finalized_lifecycle_watch_is_pruned_from_the_mirror() {
+        let store = Arc::new(MemStore::default());
+        let mut w = watch_with(&store);
+        w.add_tx_lifecycle([[8u8; 32]], AutoClose::AtDepth(6)).await.unwrap();
+        let ev = Event::TxidFinalized { txid: [8u8; 32].to_vec(), depth: 6, height: 200 };
+        let out = w.handle_event(ev, None).await.unwrap();
+        assert!(matches!(out, Some(Event::TxidFinalized { .. })), "still surfaced to caller");
+        assert!(
+            !w.mirror.tx_lifecycles.contains_key(&[8u8; 32]),
+            "auto-close finalize prunes the lifecycle watch the server evicted"
+        );
     }
 
     // --- cursor persistence (commit-on-poll) ----------------------------------
