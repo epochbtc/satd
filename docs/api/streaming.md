@@ -717,6 +717,15 @@ A script's quota unit and matcher registration are released only when its **last
 owner goes, so a scripthash shared by two descriptors, or by a descriptor and a
 direct add, is never dropped while any source still wants it.
 
+The number of distinct descriptors a single connection may retain is capped
+(`MAX_DESCRIPTORS_PER_CONNECTION = 256`). The cap exists because a descriptor
+whose window expands entirely to already-watched scripts charges no quota unit
+(nothing is net-new) yet still costs a retained membership entry, so without it a
+client could grow that map without bound, invisibly to the watch quota and the
+per-connection watch-set cap. A connection at the cap must `RemoveDescriptor`
+before adding a new descriptor; re-asserting (sliding) an already-retained
+descriptor never counts against it.
+
 `RemoveDescriptor` drops a descriptor's whole window: every scripthash it
 contributed whose last owner this removes is released (membership is retained
 precisely so the server knows which those are — it does not re-derive). Removing
