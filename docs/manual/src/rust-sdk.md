@@ -255,7 +255,10 @@ loop {
 It is single-task, like `ResilientSubscription`: interleave watch-set edits with
 `next()` calls from one task (react to a match, then adjust the watch-set). A
 descriptor replays from its latest `(gap_limit, start)`, so advance `start` to
-slide the window across reconnects.
+slide the window across reconnects (the server reconciles the slid window), or
+`remove_descriptor(descriptor)` to drop it — which releases every scripthash its
+window contributed whose last owner that drops (a script shared with a direct add
+or another descriptor stays).
 
 ### Watch-set loader — when truth lives outside the wrapper
 

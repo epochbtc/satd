@@ -292,9 +292,11 @@ impl WatchHandle {
     }
 
     /// Expand a public output descriptor into a watch-set over the window
-    /// `[start, start + gap_limit)`. The client owns gap-limit advancement:
-    /// re-send with an advanced `start` (and remove trailing scripts) as funding
-    /// nears the window's high end.
+    /// `[start, start + gap_limit)`. The server retains the descriptor →
+    /// scripthashes membership, so the client owns gap-limit advancement by
+    /// re-sending with an advanced `start` (the server reconciles the slid
+    /// window) and can drop the whole window with
+    /// [`remove_descriptor`](Self::remove_descriptor).
     pub async fn add_descriptor(
         &self,
         descriptor: impl Into<String>,
@@ -305,6 +307,21 @@ impl WatchHandle {
             descriptor: descriptor.into(),
             gap_limit,
             start,
+        }))
+        .await
+    }
+
+    /// Remove a descriptor previously added with [`add_descriptor`](Self::add_descriptor),
+    /// releasing every scripthash its window contributed whose last owner this
+    /// drops. A scripthash the descriptor shares with a direct `add_scripts` or
+    /// another descriptor stays watched. `descriptor` must byte-match the string
+    /// it was added with; removing an unknown descriptor is a no-op.
+    pub async fn remove_descriptor(
+        &self,
+        descriptor: impl Into<String>,
+    ) -> Result<(), StreamError> {
+        self.send_msg(pb::subscribe_control::Msg::RemoveDescriptor(pb::RemoveDescriptor {
+            descriptor: descriptor.into(),
         }))
         .await
     }

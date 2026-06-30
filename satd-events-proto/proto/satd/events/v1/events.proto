@@ -47,12 +47,23 @@ message SubscribeControl {
     // Remove outpoints from the watch-set.
     RemoveOutpoints remove_outpoints = 6;
     // Expand a descriptor into a script watch-set (rust-miniscript). The
-    // server derives the window [start, start+gap_limit) and watches it;
-    // charges one unit per net-new derived script. The CLIENT owns gap-limit
-    // tracking: as funding nears the window's high end, it re-sends
-    // AddDescriptor with an advanced `start` and Remove*s the trailing
-    // scripts (per-remove quota release makes that cheap).
+    // server derives the window [start, start+gap_limit), watches it, and
+    // RETAINS the descriptor → derived-scripthashes membership so the window
+    // can be slid or removed cleanly; charges one unit per net-new derived
+    // script. The CLIENT owns gap-limit tracking: as funding nears the
+    // window's high end, it re-sends AddDescriptor with an advanced `start`.
+    // Re-asserting the same descriptor string with a slid window reconciles
+    // server-side — scripts that left the window are released (if no other
+    // watch still holds them), scripts that entered are added — so the client
+    // no longer has to Remove* the trailing scripts by hand.
     AddDescriptor   add_descriptor   = 7;
+    // Remove a descriptor previously added with AddDescriptor, releasing every
+    // scripthash its window contributed whose last owner this drops. A
+    // scripthash the descriptor shares with a direct AddScripts or another
+    // descriptor stays watched (its quota unit is held until its final owner
+    // goes). `descriptor` must byte-match the string AddDescriptor was sent
+    // with. Removing an unknown descriptor is a no-op.
+    RemoveDescriptor remove_descriptor = 12;
     // Add transaction ids to the watch-set. Two primitives over one txid index,
     // selected by `min_depths` (see AddTransactions):
     //   * empty min_depths  → a persistent LIFECYCLE watch on each txid: narrates
@@ -84,6 +95,10 @@ message AddDescriptor {
   uint32 gap_limit  = 2; // window size: number of indices to derive/watch
   uint32 start      = 3; // window start index (default 0); enables a client-
                          // managed sliding window [start, start+gap_limit)
+}
+
+message RemoveDescriptor {
+  string descriptor = 1; // the descriptor string AddDescriptor was sent with
 }
 
 message SetCursor      { Cursor cursor = 1; }

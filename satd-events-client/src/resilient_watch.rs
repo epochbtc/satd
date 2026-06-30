@@ -140,6 +140,10 @@ impl WatchSetMirror {
         self.descriptors.insert(descriptor, (gap_limit, start));
     }
 
+    fn remove_descriptor(&mut self, descriptor: &str) {
+        self.descriptors.remove(descriptor);
+    }
+
     fn add_prefixes(&mut self, items: &[pb::ScriptPrefix]) {
         for sp in items {
             self.prefixes.insert((sp.bits, sp.prefix.clone()));
@@ -679,8 +683,8 @@ impl ResilientWatch {
 
     /// Register a public output descriptor's watch window. The latest
     /// `(gap_limit, start)` per descriptor is what replays on reconnect — advance
-    /// `start` to slide the window (fine-grained mid-window script trims are not
-    /// separately preserved across a reconnect). See [`WatchHandle::add_descriptor`].
+    /// `start` to slide the window (the server reconciles the slid window). See
+    /// [`WatchHandle::add_descriptor`].
     pub async fn add_descriptor(
         &mut self,
         descriptor: impl Into<String>,
@@ -691,6 +695,23 @@ impl ResilientWatch {
         self.mirror.add_descriptor(descriptor.clone(), gap_limit, start);
         let res = match &self.handle {
             Some(h) => Some(h.add_descriptor(descriptor, gap_limit, start).await),
+            None => None,
+        };
+        self.after_send(res)
+    }
+
+    /// Remove a descriptor previously added with [`add_descriptor`](Self::add_descriptor),
+    /// dropping it from the mirror so it is not replayed on reconnect and (while
+    /// connected) releasing the scripthashes its window contributed whose last
+    /// owner this drops. See [`WatchHandle::remove_descriptor`].
+    pub async fn remove_descriptor(
+        &mut self,
+        descriptor: impl Into<String>,
+    ) -> Result<(), StreamError> {
+        let descriptor = descriptor.into();
+        self.mirror.remove_descriptor(&descriptor);
+        let res = match &self.handle {
+            Some(h) => Some(h.remove_descriptor(descriptor).await),
             None => None,
         };
         self.after_send(res)
@@ -1149,6 +1170,25 @@ mod tests {
             })
             .collect();
         assert_eq!(descs, vec![(20, 5)], "only the latest window replays");
+    }
+
+    #[test]
+    fn mirror_removed_descriptor_is_not_replayed() {
+        let mut m = WatchSetMirror::default();
+        m.add_descriptor("wpkh(a)".into(), 20, 0);
+        m.add_descriptor("wpkh(b)".into(), 20, 0);
+        m.remove_descriptor("wpkh(a)");
+        let descs: Vec<_> = m
+            .control_messages()
+            .into_iter()
+            .filter_map(|msg| match msg {
+                Msg::AddDescriptor(d) => Some(d.descriptor),
+                _ => None,
+            })
+            .collect();
+        // The removed descriptor is gone from the replay; a reconnect re-registers
+        // only the surviving one (the fresh stream has nothing to RemoveDescriptor).
+        assert_eq!(descs, vec!["wpkh(b)".to_string()]);
     }
 
     #[test]

@@ -351,6 +351,7 @@ message SubscribeControl {
     RemoveTransactions   remove_transactions   = 9;
     AddScriptPrefixes    add_script_prefixes   = 10; // privacy-preserving prefix watch (§7.5)
     RemoveScriptPrefixes remove_script_prefixes = 11;
+    RemoveDescriptor     remove_descriptor     = 12; // drop a descriptor window (§11)
   }
 }
 ```
@@ -689,12 +690,17 @@ message AddDescriptor {
   uint32 gap_limit  = 2;   // window size; capped at MAX_DESCRIPTOR_WINDOW (1000)
   uint32 start      = 3;   // window start index (default 0)
 }
+
+message RemoveDescriptor {
+  string descriptor = 1;   // byte-matches the AddDescriptor string
+}
 ```
 
 The server expands the descriptor via rust-miniscript over the window
-`[start, start + gap_limit)`, derives the watch scripts, and registers them with
-the §7 matcher — the address-watching-as-outpoint-watching convenience the base
-primitive was designed for. A BIP-389 multipath descriptor (`.../<0;1>/*`) is
+`[start, start + gap_limit)`, derives the watch scripts, registers them with
+the §7 matcher, and **retains the descriptor → derived-scripthashes membership**
+for the connection — the address-watching-as-outpoint-watching convenience the
+base primitive was designed for. A BIP-389 multipath descriptor (`.../<0;1>/*`) is
 split into its branches and each branch expanded over the same window, so it
 yields up to `branches × gap_limit` scripts and costs that many watch units; the
 branch count is capped at 2 (`MAX_DESCRIPTOR_BRANCHES`) — more is rejected before
@@ -703,17 +709,31 @@ so ≤ 2000 scripts for a 2-branch descriptor) and rejects hardened-wildcard and
 secret-bearing descriptor at the type level (`Descriptor<DescriptorPublicKey>`),
 so no signing material can be submitted.
 
-**Gap-limit tracking is a client concern, by design.** An earlier approach had the
-server track derivation progress and push a `DescriptorNeedsAddresses` side-channel
-to tell the client to extend its window. We rejected it: the client knows its own
-address-generation policy and is better placed to decide when to advance. So the
-server stays **stateless** — it watches the fixed window it was asked for — and the
-client drives a sliding window by issuing a fresh `AddDescriptor` with an advanced
-`start` as funding approaches the window's high end, `Remove*`-ing the trailing
-scripts (cheap thanks to per-remove release, §9) — for a multipath descriptor that
-means removing **every** branch's scripthash for each slid index, since removal is
-by explicit scripthash and there is no `RemoveDescriptor`. The `DescriptorNeedsAddresses`
-body (field 15) is reserved for wire-compat but is never emitted.
+Each derived scripthash carries an **owner count** — the number of sources
+(a direct `AddScripts` and/or one or more descriptors) that currently watch it.
+A script's quota unit and matcher registration are released only when its **last**
+owner goes, so a scripthash shared by two descriptors, or by a descriptor and a
+direct add, is never dropped while any source still wants it.
+
+`RemoveDescriptor` drops a descriptor's whole window: every scripthash it
+contributed whose last owner this removes is released (membership is retained
+precisely so the server knows which those are — it does not re-derive). Removing
+an unknown descriptor is a no-op. Re-sending `AddDescriptor` for the same
+descriptor string with an advanced `start` **reconciles the slid window
+server-side**: scripts that left the window are released (subject to the same
+last-owner rule), scripts that entered are added, all-or-nothing on quota — the
+client no longer has to `Remove*` the trailing scripts by hand.
+
+**Gap-limit tracking is still a client concern, by design.** Retaining membership
+lets the server *manage* a window (slide, remove); it does **not** make the server
+track derivation *progress*. An earlier approach had the server follow how far the
+client had derived and push a `DescriptorNeedsAddresses` side-channel telling it to
+extend the window. We rejected that and it stays rejected: the server never tracks
+how far the client has advanced, never decides when to slide, and emits no
+unsolicited nudge. The client owns address-generation policy and drives the window
+by advancing `start` (or dropping it with `RemoveDescriptor`); the server only
+expands, watches, reconciles, and releases. The `DescriptorNeedsAddresses` body
+(field 15) is reserved for wire-compat but is never emitted.
 
 ## 12. Operator limits
 

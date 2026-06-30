@@ -118,7 +118,26 @@ pub(crate) fn parse_prefix(
 #[derive(Default)]
 pub(crate) struct WatchSet {
     outpoints: HashMap<OutPoint, Option<satd_auth::WatchLease>>,
+    /// Effectively-watched scripthashes, each holding its quota lease. A
+    /// scripthash is present here iff it has at least one owner (see
+    /// `script_owners`): a direct `add_scripts` and/or one or more descriptors.
+    /// The lease — and the script's registry watch — is released only when its
+    /// **last** owner goes, so a script shared by a direct add and a descriptor
+    /// (or by two descriptors) is not dropped while any source still wants it.
     scripts: HashMap<Scripthash, Option<satd_auth::WatchLease>>,
+    /// Per-scripthash owner count = (1 if directly added) + (number of
+    /// descriptors whose window currently contains it). Maintained in lockstep
+    /// with `scripts`: a script is in `scripts` iff its count here is `> 0`.
+    script_owners: HashMap<Scripthash, u32>,
+    /// Scripthashes a direct `add_scripts` owns. Makes the direct add/remove
+    /// path idempotent (a repeated direct add is one owner; one direct remove
+    /// drops it) and distinct from descriptor ownership.
+    script_direct: HashSet<Scripthash>,
+    /// Descriptor string → the scripthashes its current `[start, start+gap)`
+    /// window expands to. Retained so a `RemoveDescriptor` (or a re-asserted,
+    /// slid window) can release exactly the scripts that descriptor contributed,
+    /// decrementing `script_owners` rather than blindly dropping shared scripts.
+    descriptors: HashMap<String, Vec<Scripthash>>,
     /// Lifecycle watches (one quota unit per txid). An `auto_close_depth` rides
     /// on the lifecycle watch server-side and is NOT a separate charged item.
     txids: HashMap<Txid, Option<satd_auth::WatchLease>>,
@@ -143,11 +162,17 @@ impl WatchSet {
         add_items(&mut self.outpoints, principal, incoming, "outpoints", register, |_| {});
     }
 
-    /// Add scripthashes (direct or descriptor-derived). `kind` only labels the
-    /// rejection log line. `register` receives the net-new scripthashes (those
-    /// charged against the quota); `reassert` receives scripthashes already
-    /// watched, so the caller can refresh their per-item metadata (the
-    /// `min_value` floor) without re-charging quota.
+    /// Add **directly-watched** scripthashes (an `AddScripts` control message).
+    /// `kind` only labels the rejection log line. `register` receives the net-new
+    /// scripthashes (those charged against the quota); `reassert` receives
+    /// scripthashes already watched, so the caller can refresh their per-item
+    /// metadata (the `min_value` floor) without re-charging quota.
+    ///
+    /// Idempotent in direct ownership: re-adding a script already held directly
+    /// only refreshes its floor. A script that a descriptor already watches is
+    /// not re-charged (it is in `scripts`), but it gains a *second* owner here,
+    /// so a later `remove_scripts` drops only the direct ownership and the
+    /// descriptor keeps it alive.
     pub(crate) fn add_scripts(
         &mut self,
         principal: Option<&satd_auth::Principal>,
@@ -156,7 +181,130 @@ impl WatchSet {
         register: impl FnOnce(&[Scripthash]),
         reassert: impl FnOnce(&[Scripthash]),
     ) {
-        add_items(&mut self.scripts, principal, incoming, kind, register, reassert);
+        let items: Vec<Scripthash> = incoming.into_iter().collect();
+        // The registry/lease/floor handling is unchanged: `add_items` charges
+        // net-new (scripts not already in `scripts`) and refreshes re-asserts.
+        add_items(&mut self.scripts, principal, items.iter().copied(), kind, register, reassert);
+        // Reconcile direct ownership for whatever is now watched: every script
+        // that ended up in `scripts` (net-new committed, or already held) and is
+        // not yet a direct owner becomes one. A net-new that failed the quota is
+        // absent, so it is correctly skipped.
+        for s in &items {
+            if self.scripts.contains_key(s) && self.script_direct.insert(*s) {
+                *self.script_owners.entry(*s).or_insert(0) += 1;
+            }
+        }
+    }
+
+    /// Remove **direct** ownership of scripthashes (a `RemoveScripts` control
+    /// message). A script's lease is released — and `unregister` called for it —
+    /// only when this drops its **last** owner; a script a descriptor still
+    /// watches stays. Removing a script held *only* by a descriptor is a no-op
+    /// (slide or `RemoveDescriptor` the descriptor instead).
+    pub(crate) fn remove_scripts(
+        &mut self,
+        incoming: impl IntoIterator<Item = Scripthash>,
+        unregister: impl FnOnce(&[Scripthash]),
+    ) {
+        let mut to_release = Vec::new();
+        for s in incoming {
+            if self.script_direct.remove(&s) {
+                self.release_owner(s, &mut to_release);
+            }
+        }
+        remove_items(&mut self.scripts, to_release, unregister);
+    }
+
+    /// Register a descriptor's expanded window. `derived` is the full set of
+    /// scripthashes the descriptor's current `[start, start+gap)` window expands
+    /// to (the carrier expands it). Re-asserting the same descriptor with a
+    /// **slid** window reconciles: scripts that left the window lose this
+    /// descriptor's ownership (released if it was their last owner), scripts that
+    /// entered are added. `register` / `reassert` / `unregister` mirror the
+    /// other paths. All-or-nothing on quota: if the net-new scripts do not fit,
+    /// the whole (re)assert is rejected and the descriptor's membership is left
+    /// unchanged.
+    pub(crate) fn add_descriptor(
+        &mut self,
+        principal: Option<&satd_auth::Principal>,
+        descriptor: String,
+        derived: impl IntoIterator<Item = Scripthash>,
+        register: impl FnOnce(&[Scripthash]),
+        unregister: impl FnOnce(&[Scripthash]),
+    ) {
+        // Dedup the new membership, preserving first-seen order.
+        let mut new: Vec<Scripthash> = Vec::new();
+        let mut new_set = HashSet::new();
+        for s in derived {
+            if new_set.insert(s) {
+                new.push(s);
+            }
+        }
+        let old: Vec<Scripthash> = self.descriptors.get(&descriptor).cloned().unwrap_or_default();
+        let old_set: HashSet<Scripthash> = old.iter().copied().collect();
+
+        // Scripts entering this descriptor's window (gain it as an owner).
+        let to_add: Vec<Scripthash> = new.iter().copied().filter(|s| !old_set.contains(s)).collect();
+        // Among those, the ones not currently watched at all are net-new to the
+        // registry and must fit the quota atomically.
+        let net_new: Vec<Scripthash> =
+            to_add.iter().copied().filter(|s| !self.scripts.contains_key(s)).collect();
+
+        if !net_new.is_empty()
+            && !reserve_scripts(&mut self.scripts, principal, &net_new, "descriptor", register)
+        {
+            // Quota/rate rejected the net-new batch: change nothing (membership,
+            // ownership, and the prior window all stay as they were).
+            return;
+        }
+        // Commit ownership for every script that gained this descriptor.
+        for s in &to_add {
+            *self.script_owners.entry(*s).or_insert(0) += 1;
+        }
+
+        // Scripts leaving the window lose this descriptor's ownership.
+        let mut to_release = Vec::new();
+        for s in &old {
+            if !new_set.contains(s) {
+                self.release_owner(*s, &mut to_release);
+            }
+        }
+        remove_items(&mut self.scripts, to_release, unregister);
+
+        self.descriptors.insert(descriptor, new);
+    }
+
+    /// Remove a descriptor entirely (a `RemoveDescriptor` control message),
+    /// releasing each of its scripts whose last owner this drops. Scripts the
+    /// descriptor shares with a direct add or another descriptor stay. Removing
+    /// an unknown descriptor is a no-op.
+    pub(crate) fn remove_descriptor(
+        &mut self,
+        descriptor: &str,
+        unregister: impl FnOnce(&[Scripthash]),
+    ) {
+        let Some(members) = self.descriptors.remove(descriptor) else {
+            return;
+        };
+        let mut to_release = Vec::new();
+        for s in members {
+            self.release_owner(s, &mut to_release);
+        }
+        remove_items(&mut self.scripts, to_release, unregister);
+    }
+
+    /// Drop one owner from a scripthash. If that was its last owner, queue it in
+    /// `to_release` (the caller then `remove_items` it, dropping the lease and
+    /// unregistering). Clears the `script_owners` entry on reaching zero so the
+    /// map stays in lockstep with `scripts`.
+    fn release_owner(&mut self, s: Scripthash, to_release: &mut Vec<Scripthash>) {
+        if let Some(c) = self.script_owners.get_mut(&s) {
+            *c = c.saturating_sub(1);
+            if *c == 0 {
+                self.script_owners.remove(&s);
+                to_release.push(s);
+            }
+        }
     }
 
     /// Remove outpoints, releasing each removed item's quota unit (lease drop)
@@ -167,15 +315,6 @@ impl WatchSet {
         unregister: impl FnOnce(&[OutPoint]),
     ) {
         remove_items(&mut self.outpoints, incoming, unregister);
-    }
-
-    /// Remove scripthashes, releasing each removed item's quota unit.
-    pub(crate) fn remove_scripts(
-        &mut self,
-        incoming: impl IntoIterator<Item = Scripthash>,
-        unregister: impl FnOnce(&[Scripthash]),
-    ) {
-        remove_items(&mut self.scripts, incoming, unregister);
     }
 
     /// Add txids, charging the quota only for items not already watched.
@@ -379,6 +518,70 @@ fn add_items_priced<T: Eq + Hash + Copy>(
             for it in net_new {
                 held.insert(it, None);
             }
+        }
+    }
+}
+
+/// Reserve quota for a batch of net-new scripthashes (one unit each), all-or-
+/// nothing, inserting each with its split lease and calling `register` on
+/// success. Returns whether the batch was committed (always `true` when auth is
+/// disabled or the batch is empty). Mirrors the net-new arm of
+/// [`add_items_priced`], but *reports* success so a descriptor (re)assert can
+/// stay atomic — rejecting the whole window rather than partially registering.
+fn reserve_scripts(
+    held: &mut HashMap<Scripthash, Option<satd_auth::WatchLease>>,
+    principal: Option<&satd_auth::Principal>,
+    net_new: &[Scripthash],
+    kind: &'static str,
+    register: impl FnOnce(&[Scripthash]),
+) -> bool {
+    if net_new.is_empty() {
+        return true;
+    }
+    // Per-add rate limit (C4): one effective add = one token, checked after the
+    // empty short-circuit so a no-op cannot burn the bucket.
+    if let Some(p) = principal
+        && let satd_auth::RateDecision::Throttle { retry_after_secs } = p.check_rate()
+    {
+        warn!(
+            target: "events::watchset",
+            kind,
+            retry_after_secs,
+            "watch add rate-limited; skipping",
+        );
+        return false;
+    }
+    match principal {
+        Some(p) => match p.acquire_watch(net_new.len() as u64) {
+            Ok(mut batch) => {
+                register(net_new);
+                for s in net_new {
+                    let lease = batch.split_off(1);
+                    debug_assert!(
+                        lease.is_some(),
+                        "split_off drained before all scripts got a lease",
+                    );
+                    held.insert(*s, lease);
+                }
+                true
+            }
+            Err(reject) => {
+                warn!(
+                    target: "events::watchset",
+                    kind,
+                    reject = ?reject,
+                    "watch add rejected (capability or quota)",
+                );
+                false
+            }
+        },
+        // Auth disabled (loopback trust): unlimited, no lease.
+        None => {
+            register(net_new);
+            for s in net_new {
+                held.insert(*s, None);
+            }
+            true
         }
     }
 }
@@ -789,5 +992,190 @@ mod tests {
 
         assert_eq!(reg3, 1, "a no-op duplicate must not have spent the rate budget");
         assert_eq!(ws.len(), 2, "both distinct watches registered");
+    }
+
+    // --- descriptor membership + ownership (RemoveDescriptor) ------------------
+
+    #[test]
+    fn descriptor_add_then_remove_releases_its_scripts() {
+        let (p, acct) = tenant(10);
+        let q = acct.quota();
+        let mut ws = WatchSet::default();
+
+        let mut registered = Vec::new();
+        ws.add_descriptor(
+            Some(&p),
+            "D".into(),
+            [sh(1), sh(2), sh(3)],
+            |s| registered = s.to_vec(),
+            |_| {},
+        );
+        assert_eq!(registered, vec![sh(1), sh(2), sh(3)], "every derived script registers");
+        assert_eq!(q.current("tenant"), 3, "one unit per derived script");
+        assert_eq!(ws.len(), 3);
+
+        let mut unregistered = Vec::new();
+        ws.remove_descriptor("D", |s| unregistered = s.to_vec());
+        assert_eq!(unregistered.len(), 3, "removing the descriptor releases all its scripts");
+        assert_eq!(q.current("tenant"), 0, "all units returned");
+        assert_eq!(ws.len(), 0);
+    }
+
+    #[test]
+    fn script_shared_by_direct_add_and_descriptor_held_until_last_owner() {
+        let (p, acct) = tenant(10);
+        let q = acct.quota();
+        let mut ws = WatchSet::default();
+
+        // Directly watch sh(2), then a descriptor whose window also contains it.
+        ws.add_scripts(Some(&p), [sh(2)], "scripts", |_| {}, |_| {});
+        assert_eq!(q.current("tenant"), 1);
+        let mut registered = Vec::new();
+        ws.add_descriptor(
+            Some(&p),
+            "D".into(),
+            [sh(1), sh(2), sh(3)],
+            |s| registered = s.to_vec(),
+            |_| {},
+        );
+        // sh(2) was already watched → only sh(1), sh(3) are net-new.
+        assert_eq!(registered, vec![sh(1), sh(3)], "the shared script is not re-charged");
+        assert_eq!(q.current("tenant"), 3, "sh1 + sh2(direct) + sh3");
+
+        // Removing the descriptor drops sh(1)/sh(3) but NOT sh(2) — the direct
+        // add still owns it.
+        let mut unregistered = Vec::new();
+        ws.remove_descriptor("D", |s| unregistered = s.to_vec());
+        assert_eq!(unregistered.len(), 2, "only the descriptor-only scripts release");
+        assert!(!unregistered.contains(&sh(2)), "the shared, still-direct script stays");
+        assert_eq!(q.current("tenant"), 1, "sh(2) lease held by its direct owner");
+        assert_eq!(ws.len(), 1);
+
+        // Now the direct remove drops the last owner.
+        ws.remove_scripts([sh(2)], |_| {});
+        assert_eq!(q.current("tenant"), 0);
+        assert_eq!(ws.len(), 0);
+    }
+
+    #[test]
+    fn two_overlapping_descriptors_each_hold_the_shared_script() {
+        let (p, acct) = tenant(10);
+        let q = acct.quota();
+        let mut ws = WatchSet::default();
+
+        ws.add_descriptor(Some(&p), "D1".into(), [sh(1), sh(2)], |_| {}, |_| {});
+        ws.add_descriptor(Some(&p), "D2".into(), [sh(2), sh(3)], |_| {}, |_| {});
+        // sh(2) shared → charged once; total sh1 + sh2 + sh3.
+        assert_eq!(q.current("tenant"), 3);
+        assert_eq!(ws.len(), 3);
+
+        // Drop D1: sh(1) releases, sh(2) stays (still owned by D2).
+        let mut unregistered = Vec::new();
+        ws.remove_descriptor("D1", |s| unregistered = s.to_vec());
+        assert_eq!(unregistered, vec![sh(1)], "only D1's exclusive script releases");
+        assert_eq!(q.current("tenant"), 2);
+
+        // Drop D2: sh(2) and sh(3) release.
+        ws.remove_descriptor("D2", |_| {});
+        assert_eq!(q.current("tenant"), 0);
+        assert_eq!(ws.len(), 0);
+    }
+
+    #[test]
+    fn re_asserting_a_descriptor_with_a_slid_window_reconciles() {
+        let (p, acct) = tenant(10);
+        let q = acct.quota();
+        let mut ws = WatchSet::default();
+
+        ws.add_descriptor(Some(&p), "D".into(), [sh(1), sh(2), sh(3)], |_| {}, |_| {});
+        assert_eq!(q.current("tenant"), 3);
+
+        // Slide the window forward: {1,2,3} → {3,4,5}. 1,2 leave; 4,5 enter; 3 stays.
+        let mut registered = Vec::new();
+        let mut unregistered = Vec::new();
+        ws.add_descriptor(
+            Some(&p),
+            "D".into(),
+            [sh(3), sh(4), sh(5)],
+            |s| registered = s.to_vec(),
+            |s| unregistered = s.to_vec(),
+        );
+        assert_eq!(registered, vec![sh(4), sh(5)], "scripts entering the window register");
+        let mut u = unregistered.clone();
+        u.sort();
+        assert_eq!(u, vec![sh(1), sh(2)], "scripts leaving the window release");
+        assert_eq!(q.current("tenant"), 3, "net quota unchanged: -2 +2");
+        assert_eq!(ws.len(), 3);
+    }
+
+    #[test]
+    fn remove_scripts_on_a_descriptor_only_script_is_a_noop() {
+        let (p, acct) = tenant(10);
+        let q = acct.quota();
+        let mut ws = WatchSet::default();
+
+        ws.add_descriptor(Some(&p), "D".into(), [sh(1)], |_| {}, |_| {});
+        assert_eq!(q.current("tenant"), 1);
+
+        // A direct RemoveScripts does not touch descriptor ownership.
+        let mut unregistered = 0;
+        ws.remove_scripts([sh(1)], |s| unregistered = s.len());
+        assert_eq!(unregistered, 0, "no direct owner to drop");
+        assert_eq!(q.current("tenant"), 1, "the descriptor still holds it");
+        assert_eq!(ws.len(), 1);
+    }
+
+    #[test]
+    fn descriptor_add_is_all_or_nothing_on_quota() {
+        let (p, acct) = tenant(2); // room for 2 units only
+        let q = acct.quota();
+        let mut ws = WatchSet::default();
+
+        // A 3-script descriptor does not fit → the whole add is rejected.
+        let mut registered = false;
+        ws.add_descriptor(
+            Some(&p),
+            "D".into(),
+            [sh(1), sh(2), sh(3)],
+            |_| registered = true,
+            |_| {},
+        );
+        assert!(!registered, "an over-quota descriptor registers nothing");
+        assert_eq!(q.current("tenant"), 0, "no units charged");
+        assert_eq!(ws.len(), 0);
+        // And its membership was not recorded, so a later remove is a clean no-op.
+        ws.remove_descriptor("D", |_| panic!("nothing should release"));
+    }
+
+    #[test]
+    fn re_adding_an_identical_descriptor_window_is_idempotent() {
+        let (p, acct) = tenant(10);
+        let q = acct.quota();
+        let mut ws = WatchSet::default();
+
+        ws.add_descriptor(Some(&p), "D".into(), [sh(1), sh(2)], |_| {}, |_| {});
+        // Same descriptor, same window: nothing net-new, nothing released.
+        let mut registered = false;
+        let mut unregistered = false;
+        ws.add_descriptor(
+            Some(&p),
+            "D".into(),
+            [sh(1), sh(2)],
+            |_| registered = true,
+            |_| unregistered = true,
+        );
+        assert!(!registered && !unregistered, "a no-op re-assert touches nothing");
+        assert_eq!(q.current("tenant"), 2, "no double-charge");
+
+        // One removal clears it (ownership was counted once, not twice).
+        ws.remove_descriptor("D", |_| {});
+        assert_eq!(q.current("tenant"), 0);
+    }
+
+    #[test]
+    fn remove_unknown_descriptor_is_a_noop() {
+        let mut ws = WatchSet::default();
+        ws.remove_descriptor("never-added", |_| panic!("must not unregister anything"));
+        assert_eq!(ws.len(), 0);
     }
 }

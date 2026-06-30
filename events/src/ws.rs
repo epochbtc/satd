@@ -686,7 +686,9 @@ enum WsControl {
         #[serde(default)]
         min_depths: Vec<u32>,
     },
-    /// Expand a descriptor (rust-miniscript) into a script watch-set.
+    /// Expand a descriptor (rust-miniscript) into a script watch-set. The
+    /// descriptor → scripthashes membership is retained so the window can be
+    /// slid (re-assert reconciles) or removed cleanly.
     AddDescriptor {
         descriptor: String,
         gap_limit: u32,
@@ -695,6 +697,9 @@ enum WsControl {
         #[serde(default)]
         start: u32,
     },
+    /// Remove a descriptor previously added with `AddDescriptor`, releasing the
+    /// scripthashes its window contributed whose last owner this drops.
+    RemoveDescriptor { descriptor: String },
     /// Add privacy-preserving script-prefix buckets (§7.5). Charged by
     /// coarseness; `bits` must be within `[streamprefixminbits, streamprefixmaxbits]`.
     AddScriptPrefixes { prefixes: Vec<WsScriptPrefix> },
@@ -904,21 +909,27 @@ fn apply_ws_control(
             start,
         } => match crate::descriptor::expand_descriptor(&descriptor, start, gap_limit) {
             Ok(scripts) => {
-                watch_set.add_scripts(
+                watch_set.add_descriptor(
                     principal,
+                    descriptor.clone(),
                     scripts.into_iter().map(|(_, sh)| sh),
-                    "descriptor",
                     |shs| {
                         handle.add_scripthashes(shs);
                     },
-                    // Descriptor scripts have no floor — no metadata to refresh.
-                    |_| {},
+                    |shs| {
+                        handle.remove_scripthashes(shs);
+                    },
                 );
             }
             Err(e) => {
                 warn!(target: "events::ws", error = %e, "ignoring invalid descriptor");
             }
         },
+        WsControl::RemoveDescriptor { descriptor } => {
+            watch_set.remove_descriptor(&descriptor, |shs| {
+                handle.remove_scripthashes(shs);
+            });
+        }
         WsControl::AddScriptPrefixes { prefixes } => {
             let items: Vec<((u8, u32), u64)> = prefixes
                 .iter()

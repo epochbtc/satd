@@ -1499,28 +1499,35 @@ fn apply_control(
         }
         Some(Msg::AddDescriptor(d)) => {
             // Expand the descriptor over its [start, start+gap_limit) window and
-            // watch it (rust-miniscript). Charges one unit per net-new script.
-            // The client advances `start` to slide the window (gap-limit
-            // tracking is client-side).
+            // watch it (rust-miniscript), retaining the descriptor → scripthashes
+            // membership so it can be slid or removed cleanly. Charges one unit
+            // per net-new script. The client advances `start` to slide the window
+            // (gap-limit tracking is client-side); re-asserting reconciles.
             match crate::descriptor::expand_descriptor(&d.descriptor, d.start, d.gap_limit) {
                 Ok(scripts) => {
-                    watch_set.add_scripts(
+                    watch_set.add_descriptor(
                         principal,
+                        d.descriptor.clone(),
                         scripts.into_iter().map(|(_, sh)| sh),
-                        "descriptor",
                         |shs| {
                             handle.add_scripthashes(shs);
                         },
-                        // Descriptor-derived scripts carry no `min_value` floor,
-                        // so a re-asserted (window-overlap) script needs no
-                        // metadata refresh.
-                        |_| {},
+                        |shs| {
+                            handle.remove_scripthashes(shs);
+                        },
                     );
                 }
                 Err(e) => {
                     warn!(target: "events::grpc", error = %e, "ignoring invalid descriptor");
                 }
             }
+        }
+        Some(Msg::RemoveDescriptor(r)) => {
+            // Drop a previously-added descriptor, releasing the scripthashes its
+            // window contributed whose last owner this removes.
+            watch_set.remove_descriptor(&r.descriptor, |shs| {
+                handle.remove_scripthashes(shs);
+            });
         }
         Some(Msg::AddScriptPrefixes(a)) => {
             // Validate + price each prefix; malformed or out-of-range buckets are
@@ -3525,6 +3532,51 @@ mod tests {
             (8, 32),
         );
         assert!(reg.has_watchers(), "descriptor expansion should register a watch-set");
+    }
+
+    /// `apply_control(RemoveDescriptor)` drops the window a prior AddDescriptor
+    /// registered, leaving no watchers (no auth → unlimited).
+    #[test]
+    fn apply_control_remove_descriptor_drops_the_window() {
+        const DESC: &str = "wpkh(xpub6BosfCnifzxcFwrSzQiqu2DBVTshkCXacvNsWGYJVVhhawA7d4R5WSWGFNbi8Aw6ZRc1brxMyWMzG3DSSSSoekkudhUd9yLb6qx39T9nMdj/0/*)";
+        let reg = Arc::new(node::events::WatchRegistry::new());
+        let (handle, _rx) = reg.register(node::events::WATCH_CHANNEL_CAPACITY);
+        let mask = AtomicU32::new(u32::MAX);
+        let mut leases = WatchSet::default();
+        let add = |leases: &mut WatchSet| {
+            apply_control(
+                pb::SubscribeControl {
+                    msg: Some(pb::subscribe_control::Msg::AddDescriptor(pb::AddDescriptor {
+                        descriptor: DESC.into(),
+                        gap_limit: 4,
+                        start: 0,
+                    })),
+                },
+                &handle,
+                None,
+                &mask,
+                leases,
+                (8, 32),
+            );
+        };
+        add(&mut leases);
+        assert!(reg.has_watchers(), "precondition: the window is registered");
+        assert_eq!(leases.len(), 4);
+
+        apply_control(
+            pb::SubscribeControl {
+                msg: Some(pb::subscribe_control::Msg::RemoveDescriptor(pb::RemoveDescriptor {
+                    descriptor: DESC.into(),
+                })),
+            },
+            &handle,
+            None,
+            &mask,
+            &mut leases,
+            (8, 32),
+        );
+        assert_eq!(leases.len(), 0, "removing the descriptor drops its whole window");
+        assert!(!reg.has_watchers(), "no watchers remain after RemoveDescriptor");
     }
 
     /// End-to-end bidi `Watch`: a client adds an outpoint to its watch-set
