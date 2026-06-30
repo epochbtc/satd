@@ -531,6 +531,14 @@ impl ResilientSubscription {
                 self.stream = None;
                 Ok(None)
             }
+            // Deterministic re-anchor acks (#441) are a `Watch`-only signal — a
+            // `set_cursor` is never sent on the `Subscribe` firehose this layer
+            // wraps, so they cannot arrive here today. Match them explicitly so a
+            // future carrier that did surface them could not have them mistaken
+            // for confirmed data: they carry no durable cursor, so the high-water
+            // (advanced above only from a message's own cursor) is untouched, and
+            // they pass straight through to the caller.
+            e @ (Event::CursorAccepted { .. } | Event::CursorRejected { .. }) => Ok(Some(e)),
             other => Ok(Some(other)),
         }
     }

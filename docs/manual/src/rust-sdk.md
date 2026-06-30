@@ -197,9 +197,65 @@ A few sharp edges the helpers handle for you:
 - **`min_value` floors.** Parallel to the scripthashes; a `None` floor delivers
   everything, a floor of 0 is deliver-all, and a non-zero floor suppresses
   matches below it server-side (symmetric across funding and spend sides).
-- **`set_cursor` is best-effort.** `Ok(())` means the re-anchor was *sent*, not
-  that it ran — the server silently drops an over-rate or concurrent re-anchor.
-  For critical resync, reconnect with `from_cursor`.
+- **`set_cursor` reports its outcome in-band.** `Ok(())` means the re-anchor was
+  *sent*, not that it ran. The server answers on the event stream with exactly
+  one `Event::CursorAccepted { clamped, earliest_replayed, .. }` (admitted,
+  replaying — `clamped` flags an authoritative replay-window gap) or
+  `Event::CursorRejected { reason, .. }` (`RateLimited`, `ConcurrentReanchor`,
+  `EmptyCursor`, `NoSource`). Drive your catch-up off those rather than treating
+  `Ok(())` as success — or use `resilient_watch` (below), which does it for you.
+
+## Durable watch — `resilient_watch`
+
+`watch` gives you the raw bidirectional stream; `resilient_watch` wraps it the
+way `resilient_subscribe` wraps the firehose — but with the extra work the
+`Watch` stream needs, because **the watch-set is per-connection**: when the
+stream drops, the server discards your watch-set and quota leases, so a bare
+reconnect comes back blind.
+
+`ResilientWatch` closes that gap:
+
+- **Watch-set mirror.** It records every `add_*` / `remove_*` / `set_categories`
+  you make and **re-registers the whole set** on each reconnect — you keep
+  calling the same typed helpers, now on `ResilientWatch`.
+- **Re-anchor off the deterministic result.** After re-registering it
+  `set_cursor`s to the persisted high-water and drives catch-up off the in-band
+  ack: a transient `CursorRejected` (`RateLimited` / `ConcurrentReanchor`) is
+  backed off and retried in place; a `CursorAccepted { clamped: true, .. }` or a
+  terminal reject (`NoSource`) is surfaced so you can resnapshot — the
+  exception, not the everyday fallback.
+- **Cursor persistence + backoff.** It reuses the same `CursorStore` and
+  `Backoff` as `resilient_subscribe`, committing confirmed cursors on-poll.
+
+```rust,ignore
+use satd_events_client::{ResilientWatchConfig, FileCursorStore, Event, AutoClose};
+use std::sync::Arc;
+
+let config = ResilientWatchConfig::new()
+    .cursor_store(Arc::new(FileCursorStore::new("/var/lib/app/watch.cursor")));
+let mut watch = client.resilient_watch(config);
+
+// Register interest once; it is replayed automatically across reconnects.
+watch.add_scripts([(scripthash, None)]).await?;
+watch.add_tx_lifecycle([txid], AutoClose::AtDepth(6)).await?;
+
+loop {
+    match watch.next().await? {
+        Event::ScriptMatched { txid, .. } => { /* ... */ }
+        Event::CursorAccepted { clamped: true, earliest_replayed, .. } => {
+            // Authoritative gap: full-resync confirmed history below
+            // `earliest_replayed` from another source.
+        }
+        Event::CursorRejected { reason, .. } => { /* escalate to a resnapshot */ }
+        _ => {}
+    }
+}
+```
+
+It is single-task, like `ResilientSubscription`: interleave watch-set edits with
+`next()` calls from one task (react to a match, then adjust the watch-set). A
+descriptor replays from its latest `(gap_limit, start)`, so advance `start` to
+slide the window across reconnects.
 
 ## Prefix watches (privacy-preserving)
 

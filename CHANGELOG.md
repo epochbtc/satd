@@ -17,6 +17,15 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   advancement is a client concern — so this changes no observable behavior; it
   drops the dead `Event::Unknown` mapping in `satd-events-client` and the stale
   docs that implied the server pushed a top-up nudge. (#440)
+- **Resilient `Watch` wrapper (`resilient_watch`).** New `satd-events-client`
+  `ResilientWatch` — the `Watch`-stream twin of `ResilientSubscription`. Because
+  the server's watch-set is per-connection, it mirrors every add/remove and
+  re-registers the whole set on reconnect, then re-anchors off the deterministic
+  `CursorAccepted` / `CursorRejected` result: transient rejects (`RateLimited`,
+  `ConcurrentReanchor`) are backed off and retried in place, while a `clamped`
+  accept or a terminal reject (`NoSource`) is surfaced so a full resnapshot
+  becomes the exception, not the default fallback. Reuses the existing
+  `CursorStore` / `Backoff`. (#442)
 - **Deterministic mid-stream re-anchor (`set_cursor`).** A `SetCursor` on the
   bidirectional gRPC `Watch` stream now emits exactly one in-band
   `SetCursorResult` (`CursorAccepted{from, clamped, earliest_replayed}` ahead of

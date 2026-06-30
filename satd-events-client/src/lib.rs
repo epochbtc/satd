@@ -51,6 +51,12 @@
 //!   [`ResilientSubscription`] that reconnects with backoff, persists and
 //!   replays the durable cursor (via a [`CursorStore`]), recovers from `Lagged`
 //!   per a [`LagPolicy`], and surfaces replay-truncation gaps.
+//! - [`StreamClient::resilient_watch`] — the bidirectional `Watch` stream
+//!   wrapped in a [`ResilientWatch`] that mirrors the watch-set and
+//!   re-registers it on reconnect (watch-sets are per-connection), then
+//!   re-anchors off the deterministic [`Event::CursorAccepted`] /
+//!   [`Event::CursorRejected`] results, retrying transient rejects in place and
+//!   surfacing the rest for a resnapshot.
 //! - [`PrefixWatcher`] (default-on `bitcoin` feature) — the privacy-preserving
 //!   prefix-watch local re-filter: decodes a [`PrefixMatch`]'s `raw_tx` and
 //!   recomputes `sha256(scriptPubKey)` to keep only true matches.
@@ -115,6 +121,7 @@ mod event;
 #[cfg(feature = "bitcoin")]
 mod prefix;
 mod resilience;
+mod resilient_watch;
 
 pub use client::{
     AutoClose, Categories, EventStream, StreamClient, StreamClientBuilder, SubscribeOptions,
@@ -129,6 +136,7 @@ pub use resilience::{
     Backoff, CursorStore, FileCursorStore, LagPolicy, NoopCursorStore, ResilientConfig,
     ResilientSubscription,
 };
+pub use resilient_watch::{ResilientWatch, ResilientWatchConfig};
 
 #[cfg(feature = "bitcoin")]
 #[cfg_attr(docsrs, doc(cfg(feature = "bitcoin")))]
