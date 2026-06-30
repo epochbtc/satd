@@ -181,7 +181,7 @@ watch.add_scripts([(scripthash, Some(100_000))]).await?;  // per-script min_valu
 watch.add_outpoints([(txid, vout)]).await?;
 watch.add_tx_lifecycle([txid], AutoClose::AtDepth(6)).await?;
 watch.add_depth_alarms([txid], [1, 3]).await?;            // cross product txids × depths
-watch.add_descriptor(descriptor, /*gap*/ 20, /*start*/ 0).await?;
+watch.add_descriptor(descriptor, /*gap*/ 20, /*start*/ 0).await?;  // multipath <0;1> ⇒ 2×gap scripts
 watch.add_script_prefixes([(prefix_bytes, 16)]).await?;   // privacy-preserving prefix
 watch.set_categories(mask).await?;
 watch.set_cursor(cursor).await?;                          // mid-stream re-anchor (best-effort)

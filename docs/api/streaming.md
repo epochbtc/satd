@@ -694,9 +694,14 @@ message AddDescriptor {
 The server expands the descriptor via rust-miniscript over the window
 `[start, start + gap_limit)`, derives the watch scripts, and registers them with
 the §7 matcher — the address-watching-as-outpoint-watching convenience the base
-primitive was designed for. Expansion is bounded (`MAX_DESCRIPTOR_WINDOW`, a DoS
-limit) and rejects hardened-wildcard and any secret-bearing descriptor at the type
-level (`Descriptor<DescriptorPublicKey>`), so no signing material can be submitted.
+primitive was designed for. A BIP-389 multipath descriptor (`.../<0;1>/*`) is
+split into its branches and each branch expanded over the same window, so it
+yields up to `branches × gap_limit` scripts and costs that many watch units; the
+branch count is capped at 2 (`MAX_DESCRIPTOR_BRANCHES`) — more is rejected before
+the split. Expansion is bounded per branch (`MAX_DESCRIPTOR_WINDOW`, a DoS limit,
+so ≤ 2000 scripts for a 2-branch descriptor) and rejects hardened-wildcard and any
+secret-bearing descriptor at the type level (`Descriptor<DescriptorPublicKey>`),
+so no signing material can be submitted.
 
 **Gap-limit tracking is a client concern, by design.** An earlier approach had the
 server track derivation progress and push a `DescriptorNeedsAddresses` side-channel
@@ -705,7 +710,9 @@ address-generation policy and is better placed to decide when to advance. So the
 server stays **stateless** — it watches the fixed window it was asked for — and the
 client drives a sliding window by issuing a fresh `AddDescriptor` with an advanced
 `start` as funding approaches the window's high end, `Remove*`-ing the trailing
-scripts (cheap thanks to per-remove release, §9). The `DescriptorNeedsAddresses`
+scripts (cheap thanks to per-remove release, §9) — for a multipath descriptor that
+means removing **every** branch's scripthash for each slid index, since removal is
+by explicit scripthash and there is no `RemoveDescriptor`. The `DescriptorNeedsAddresses`
 body (field 15) is reserved for wire-compat but is never emitted.
 
 ## 12. Operator limits
