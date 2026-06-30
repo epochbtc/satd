@@ -400,7 +400,10 @@ impl WatchHandle {
 pub(crate) const MAX_PREFIX_BITS: u32 = 32;
 
 /// Validate a prefix/bits pair before it reaches the wire.
-fn validate_prefix(prefix: Vec<u8>, bits: u32) -> Result<pb::ScriptPrefix, StreamError> {
+pub(crate) fn validate_prefix(
+    prefix: Vec<u8>,
+    bits: u32,
+) -> Result<pb::ScriptPrefix, StreamError> {
     if !(1..=MAX_PREFIX_BITS).contains(&bits) {
         return Err(StreamError::InvalidArgument(format!(
             "prefix bits {bits} out of range 1..={MAX_PREFIX_BITS}"
@@ -677,6 +680,15 @@ impl StreamClient {
         config: crate::ResilientConfig,
     ) -> crate::ResilientSubscription {
         crate::ResilientSubscription::new(self.clone(), opts, config)
+    }
+
+    /// Open a reconnect-and-replay-aware bidirectional watch. Unlike
+    /// [`watch`](Self::watch), the returned [`ResilientWatch`](crate::ResilientWatch)
+    /// mirrors the watch-set and re-registers it on reconnect, re-anchors off the
+    /// deterministic `set_cursor` results, and persists the resume cursor.
+    /// Connects lazily on the first [`next`](crate::ResilientWatch::next).
+    pub fn resilient_watch(&self, config: crate::ResilientWatchConfig) -> crate::ResilientWatch {
+        crate::ResilientWatch::new(self.clone(), config)
     }
 
     /// Open a bidirectional watch stream, returning a [`WatchHandle`] to send
