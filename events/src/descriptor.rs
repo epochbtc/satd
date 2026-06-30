@@ -4,6 +4,10 @@
 //! This module expands a (possibly ranged) output descriptor into the
 //! scripthashes a client wants to watch, via `rust-miniscript` — so a
 //! client can send a single descriptor instead of enumerating addresses.
+//! A BIP-389 multipath descriptor (`.../<0;1>/*`) splits into its branches
+//! and expands each over the same window — so one such descriptor yields up
+//! to `branches × window` scripts (and the client must remove all branches
+//! when sliding the window; see below).
 //! The expanded scripthashes are registered with the
 //! [`WatchRegistry`](node::events::WatchRegistry) like any other script
 //! watch-set; matches come back as `ScriptMatched`.
@@ -15,6 +19,11 @@
 //! used; the server never tracks derivation progress and never emits a
 //! side-channel (no gap-limit nudge from the server — that derivation-progress
 //! design was dropped, and its retired wire field is reserved in NodeEvent).
+//! Removal is by explicit scripthash (there is no `RemoveDescriptor`), so for a
+//! multipath descriptor the client must re-derive and remove **every branch's**
+//! scripthash for each slid index — a trailing index sheds `branches` scripts,
+//! not one. A client that removes only one branch per index leaks the others'
+//! quota as the window advances.
 
 use bitcoin::hashes::{Hash, sha256};
 use miniscript::descriptor::Wildcard;
@@ -88,25 +97,52 @@ pub fn expand_descriptor(
     // string. `at_derivation_index` can't derive it directly, so split it
     // first and expand each branch independently. A non-multipath descriptor
     // is its own single branch.
-    let branches = if descriptor.is_multipath() {
-        let single = descriptor
+    //
+    // Bound the branch count BEFORE splitting. The `<a;b;…>` element count is
+    // unbounded at parse time, and `into_single_descriptors` clones the whole
+    // descriptor once per branch — O(branches²) time and space — so capping
+    // after the split would let a single `<0;1;…;N>` message (N limited only by
+    // the ~MB ingress size) drive a multi-GB, quadratic-time blowup on the
+    // events runtime. `multipath_branch_count` reads the element count in O(keys)
+    // without cloning, so the split only ever runs for an already-bounded count.
+    let branches = multipath_branch_count(&descriptor);
+    if branches > MAX_DESCRIPTOR_BRANCHES {
+        return Err(DescriptorError::TooManyBranches {
+            branches,
+            max: MAX_DESCRIPTOR_BRANCHES,
+        });
+    }
+    let single = if descriptor.is_multipath() {
+        descriptor
             .into_single_descriptors()
-            .map_err(|e| DescriptorError::Parse(format!("multipath split: {e}")))?;
-        if single.len() > MAX_DESCRIPTOR_BRANCHES {
-            return Err(DescriptorError::TooManyBranches {
-                branches: single.len(),
-                max: MAX_DESCRIPTOR_BRANCHES,
-            });
-        }
-        single
+            .map_err(|e| DescriptorError::Parse(format!("multipath split: {e}")))?
     } else {
         vec![descriptor]
     };
     let mut out = Vec::new();
-    for branch in &branches {
+    for branch in &single {
         expand_single(branch, start, count, &mut out)?;
     }
     Ok(out)
+}
+
+/// Number of branches a descriptor would split into: the length of its BIP-389
+/// multipath list (`<a;b;…>`), or 1 for a single-path descriptor. Computed by
+/// reading each key's derivation-path count — no cloning, no splitting — so it
+/// can bound the branch count before paying the O(branches²) cost of
+/// [`Descriptor::into_single_descriptors`]. Takes the max over keys: BIP-389
+/// requires every multipath key in a descriptor to share one length, but a
+/// malformed descriptor with mismatched lengths still gets bounded by its
+/// largest, and `into_single_descriptors` rejects the mismatch later.
+fn multipath_branch_count(desc: &Descriptor<DescriptorPublicKey>) -> usize {
+    let mut max = 1usize;
+    desc.for_each_key(|k| {
+        if let DescriptorPublicKey::MultiXPub(x) = k {
+            max = max.max(x.derivation_paths.paths().len());
+        }
+        true
+    });
+    max
 }
 
 /// Expand one single-path (non-multipath) descriptor over `[start, start+count)`,
@@ -240,10 +276,19 @@ mod tests {
         let out = expand_descriptor(MULTIPATH_WPKH, 0, 5).expect("expand multipath");
         assert_eq!(out.len(), 10, "2 branches × window of 5");
 
-        // The first branch (`/0/*`) must match the equivalent single-path
-        // descriptor byte-for-byte; the second branch (`/1/*`) is distinct.
+        // Branch order is load-bearing for the sliding window: branch[0] must
+        // be `/0/*` (external) and branch[1] `/1/*` (change), each byte-identical
+        // to its equivalent single-path descriptor. This pins the order
+        // `into_single_descriptors` yields.
         let single0 = expand_descriptor(RANGED_WPKH, 0, 5).unwrap();
+        let single1 = expand_descriptor(
+            "wpkh(xpub6BosfCnifzxcFwrSzQiqu2DBVTshkCXacvNsWGYJVVhhawA7d4R5WSWGFNbi8Aw6ZRc1brxMyWMzG3DSSSSoekkudhUd9yLb6qx39T9nMdj/1/*)",
+            0,
+            5,
+        )
+        .unwrap();
         assert_eq!(&out[..5], &single0[..], "first branch == /0/* single-path");
+        assert_eq!(&out[5..], &single1[..], "second branch == /1/* single-path");
         assert_ne!(
             &out[..5],
             &out[5..],
@@ -278,6 +323,58 @@ mod tests {
             expand_descriptor(three, 0, 5),
             Err(DescriptorError::TooManyBranches { branches: 3, max: 2 })
         ));
+    }
+
+    #[test]
+    fn over_cap_multipath_rejected_before_split() {
+        // A large multipath list must be counted and rejected via
+        // `multipath_branch_count` WITHOUT calling `into_single_descriptors`
+        // (which is O(branches²) and the unbounded element count is the DoS
+        // vector). We can't time it here, but assert the count is read directly
+        // off the parsed key and surfaced exactly, for any list length.
+        let big = "wpkh(xpub6BosfCnifzxcFwrSzQiqu2DBVTshkCXacvNsWGYJVVhhawA7d4R5WSWGFNbi8Aw6ZRc1brxMyWMzG3DSSSSoekkudhUd9yLb6qx39T9nMdj/<0;1;2;3;4;5;6;7>/*)";
+        assert!(matches!(
+            expand_descriptor(big, 0, 5),
+            Err(DescriptorError::TooManyBranches { branches: 8, max: 2 })
+        ));
+        // And the cheap counter agrees with the parsed descriptor.
+        let parsed = Descriptor::<DescriptorPublicKey>::from_str(big).unwrap();
+        assert_eq!(multipath_branch_count(&parsed), 8);
+        let single = Descriptor::<DescriptorPublicKey>::from_str(RANGED_WPKH).unwrap();
+        assert_eq!(multipath_branch_count(&single), 1, "single-path counts as 1");
+    }
+
+    #[test]
+    fn multipath_fixed_yields_one_entry_per_branch() {
+        // A multipath descriptor with no wildcard resolves to one script per
+        // branch (count ignored beyond the first), i.e. exactly 2 entries.
+        let fixed = "wpkh(xpub6BosfCnifzxcFwrSzQiqu2DBVTshkCXacvNsWGYJVVhhawA7d4R5WSWGFNbi8Aw6ZRc1brxMyWMzG3DSSSSoekkudhUd9yLb6qx39T9nMdj/<0;1>/0)";
+        let out = expand_descriptor(fixed, 0, 20).expect("expand fixed multipath");
+        assert_eq!(out.len(), 2, "one script per branch, count ignored");
+        assert_ne!(out[0].1, out[1].1, "the two branches differ");
+    }
+
+    #[test]
+    fn multipath_taproot_expands_both_branches() {
+        // Splitting must work across descriptor types, not just wpkh: a tr()
+        // multipath exercises a different script_pubkey/derivation path.
+        let tr = "tr(xpub6BosfCnifzxcFwrSzQiqu2DBVTshkCXacvNsWGYJVVhhawA7d4R5WSWGFNbi8Aw6ZRc1brxMyWMzG3DSSSSoekkudhUd9yLb6qx39T9nMdj/<0;1>/*)";
+        let out = expand_descriptor(tr, 0, 4).expect("expand tr multipath");
+        assert_eq!(out.len(), 8, "2 branches × window of 4");
+        let mut hashes: Vec<_> = out.iter().map(|(_, sh)| *sh).collect();
+        hashes.sort();
+        hashes.dedup();
+        assert_eq!(hashes.len(), 8, "all taproot scripthashes distinct");
+    }
+
+    #[test]
+    fn multipath_huge_start_aborts_whole_install() {
+        // The partial-install guard under the per-branch loop: a `start` past
+        // the non-hardened range makes derivation error; `expand_descriptor`
+        // must return Err for the whole descriptor (nothing half-installed),
+        // exactly like the single-path `huge_start_does_not_panic` case.
+        let r = expand_descriptor(MULTIPATH_WPKH, u32::MAX - 1, 3);
+        assert!(matches!(r, Err(DescriptorError::Derive(_, _))), "got: {r:?}");
     }
 
     #[test]

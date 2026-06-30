@@ -81,11 +81,17 @@ never stalling the matcher or blocking consensus.
 `AddDescriptor` takes a rust-miniscript-parseable, **public-key-only** descriptor
 plus a `gap_limit` window; the server expands it over `[start, start +
 gap_limit)`, derives the watch scripts, and registers them with the matcher.
-Expansion is bounded (`MAX_DESCRIPTOR_WINDOW = 1000`) and rejects any
-secret-bearing descriptor at the type level, so no signing material can ever be
-submitted — the node stays keyless. Gap-limit advancement is a client concern by
-design: the client drives a sliding window by issuing a fresh `AddDescriptor`
-with an advanced `start` and `Remove`-ing the trailing scripts.
+A BIP-389 multipath descriptor (`.../<0;1>/*`, the canonical export form of
+Core/Sparrow/BDK wallets) is split into its branches and each branch is expanded
+over the same window, so it yields up to `branches × gap_limit` scripts (and
+costs that many watch units); the branch count is capped at 2 — more is rejected.
+Expansion is bounded per branch (`MAX_DESCRIPTOR_WINDOW = 1000`, so at most 2000
+scripts for a 2-branch descriptor) and rejects any secret-bearing descriptor at
+the type level, so no signing material can ever be submitted — the node stays
+keyless. Gap-limit advancement is a client concern by design: the client drives a
+sliding window by issuing a fresh `AddDescriptor` with an advanced `start` and
+`Remove`-ing the trailing scripts — **all** branches' scripts for each slid index
+on a multipath descriptor, since removal is by explicit scripthash.
 
 ## Cursors & replay
 
