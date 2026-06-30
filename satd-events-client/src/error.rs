@@ -89,6 +89,16 @@ pub enum StreamError {
     /// watch stream has been torn down).
     #[error("control channel closed")]
     ControlClosed,
+
+    /// A user-supplied watch-set loader (see
+    /// [`ResilientWatchConfig::watch_set_loader`](crate::ResilientWatchConfig::watch_set_loader))
+    /// returned an error while rebuilding the watch-set on (re)connect. Treated
+    /// by [`ResilientWatch`](crate::ResilientWatch) as a transient
+    /// reconnect-level condition: the loader is retried after a backoff on the
+    /// next connect rather than surfaced, so a momentary failure of the
+    /// integrator's source-of-truth does not crash the consumer.
+    #[error("watch-set loader failed: {0}")]
+    WatchSetLoader(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
 
 impl StreamError {
