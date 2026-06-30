@@ -31,6 +31,15 @@ pub type Scripthash = [u8; 32];
 /// 1000-entry window is generous for legitimate clients.
 pub const MAX_DESCRIPTOR_WINDOW: u32 = 1000;
 
+/// Upper bound on the number of branches a BIP-389 multipath descriptor may
+/// expand to. A multipath step `<a;b;…>` yields one branch per element, and
+/// each branch derives a full `[start, start + count)` window — so without a
+/// branch bound a `<0;1;…;N>` descriptor would multiply the per-branch
+/// derivation work past [`MAX_DESCRIPTOR_WINDOW`] (DoS amplification). Real
+/// wallets — and Bitcoin Core itself — use exactly two branches (external
+/// `<0>` + change `<1>`), so two is the right cap.
+pub const MAX_DESCRIPTOR_BRANCHES: usize = 2;
+
 /// Errors expanding a descriptor.
 #[derive(Debug, thiserror::Error)]
 pub enum DescriptorError {
@@ -38,6 +47,8 @@ pub enum DescriptorError {
     Parse(String),
     #[error("descriptor window too large: requested {requested}, max {max}")]
     WindowTooLarge { requested: u32, max: u32 },
+    #[error("multipath descriptor has too many branches: {branches}, max {max}")]
+    TooManyBranches { branches: usize, max: usize },
     #[error("hardened-wildcard descriptors cannot be derived from a public key")]
     HardenedWildcard,
     #[error("descriptor derivation failed at index {0}: {1}")]
@@ -59,6 +70,13 @@ pub enum DescriptorError {
 /// WIF) fails to parse here, because the private-key form is the separate
 /// `parse_descriptor`, which we never call. A secret can therefore never reach
 /// derivation.
+///
+/// A **BIP-389 multipath** descriptor (e.g. `wpkh(.../<0;1>/*)`, the canonical
+/// form modern wallets export to cover external + change in one string) is
+/// split into its single-path branches and each branch expanded over the same
+/// `[start, start + count)` window; the results are concatenated. Without this
+/// split miniscript's `at_derivation_index` rejects the descriptor outright
+/// ("multiple existing keys") and the watch silently installs nothing.
 pub fn expand_descriptor(
     desc: &str,
     start: u32,
@@ -66,17 +84,52 @@ pub fn expand_descriptor(
 ) -> Result<Vec<(u32, Scripthash)>, DescriptorError> {
     let descriptor = Descriptor::<DescriptorPublicKey>::from_str(desc)
         .map_err(|e| DescriptorError::Parse(e.to_string()))?;
+    // BIP-389: a multipath descriptor packs N single-path branches into one
+    // string. `at_derivation_index` can't derive it directly, so split it
+    // first and expand each branch independently. A non-multipath descriptor
+    // is its own single branch.
+    let branches = if descriptor.is_multipath() {
+        let single = descriptor
+            .into_single_descriptors()
+            .map_err(|e| DescriptorError::Parse(format!("multipath split: {e}")))?;
+        if single.len() > MAX_DESCRIPTOR_BRANCHES {
+            return Err(DescriptorError::TooManyBranches {
+                branches: single.len(),
+                max: MAX_DESCRIPTOR_BRANCHES,
+            });
+        }
+        single
+    } else {
+        vec![descriptor]
+    };
+    let mut out = Vec::new();
+    for branch in &branches {
+        expand_single(branch, start, count, &mut out)?;
+    }
+    Ok(out)
+}
+
+/// Expand one single-path (non-multipath) descriptor over `[start, start+count)`,
+/// appending `(index, scripthash)` pairs to `out`.
+fn expand_single(
+    descriptor: &Descriptor<DescriptorPublicKey>,
+    start: u32,
+    count: u32,
+    out: &mut Vec<(u32, Scripthash)>,
+) -> Result<(), DescriptorError> {
     // Reject a hardened wildcard up front: such a descriptor parses, but
     // `at_derivation_index` PANICS on it (a hardened child cannot be derived
     // from an xpub), so a hardened-wildcard descriptor over the wire would be
     // a remotely reachable panic unless caught here.
-    if has_hardened_wildcard(&descriptor) {
+    if has_hardened_wildcard(descriptor) {
         return Err(DescriptorError::HardenedWildcard);
     }
     let ranged = descriptor.has_wildcard();
     // Bound the derivation window BEFORE allocating or deriving: `count`
     // (the wire `gap_limit`) is attacker-controlled. A fixed (non-wildcard)
-    // descriptor always yields exactly one script.
+    // descriptor always yields exactly one script. The window is bounded
+    // per branch; the branch count itself is bounded in `expand_descriptor`,
+    // so the total work stays within `MAX_DESCRIPTOR_WINDOW * MAX_DESCRIPTOR_BRANCHES`.
     if ranged && count > MAX_DESCRIPTOR_WINDOW {
         return Err(DescriptorError::WindowTooLarge {
             requested: count,
@@ -84,7 +137,7 @@ pub fn expand_descriptor(
         });
     }
     let n = if ranged { count.max(1) } else { 1 };
-    let mut out = Vec::with_capacity(n as usize);
+    out.reserve(n as usize);
     for i in 0..n {
         let idx = start.saturating_add(i);
         let definite = descriptor
@@ -94,7 +147,7 @@ pub fn expand_descriptor(
         let sh = sha256::Hash::hash(spk.as_bytes()).to_byte_array();
         out.push((idx, sh));
     }
-    Ok(out)
+    Ok(())
 }
 
 /// True if any key in the descriptor is an xpub with a HARDENED wildcard
@@ -174,6 +227,57 @@ mod tests {
         let fixed = "wpkh(xpub6BosfCnifzxcFwrSzQiqu2DBVTshkCXacvNsWGYJVVhhawA7d4R5WSWGFNbi8Aw6ZRc1brxMyWMzG3DSSSSoekkudhUd9yLb6qx39T9nMdj/0/0)";
         let out = expand_descriptor(fixed, 0, 20).expect("expand fixed");
         assert_eq!(out.len(), 1, "fixed descriptor yields a single script");
+    }
+
+    // BIP-389 multipath form of `RANGED_WPKH`: external `<0>` + change `<1>`
+    // packed into one string. This is what Core/Sparrow/BDK wallets export.
+    const MULTIPATH_WPKH: &str = "wpkh(xpub6BosfCnifzxcFwrSzQiqu2DBVTshkCXacvNsWGYJVVhhawA7d4R5WSWGFNbi8Aw6ZRc1brxMyWMzG3DSSSSoekkudhUd9yLb6qx39T9nMdj/<0;1>/*)";
+
+    #[test]
+    fn expands_multipath_to_both_branches() {
+        // A multipath descriptor must expand to one window per branch,
+        // concatenated — not fail outright (#445). Here: 2 branches × 5.
+        let out = expand_descriptor(MULTIPATH_WPKH, 0, 5).expect("expand multipath");
+        assert_eq!(out.len(), 10, "2 branches × window of 5");
+
+        // The first branch (`/0/*`) must match the equivalent single-path
+        // descriptor byte-for-byte; the second branch (`/1/*`) is distinct.
+        let single0 = expand_descriptor(RANGED_WPKH, 0, 5).unwrap();
+        assert_eq!(&out[..5], &single0[..], "first branch == /0/* single-path");
+        assert_ne!(
+            &out[..5],
+            &out[5..],
+            "external and change branches derive distinct scripts"
+        );
+
+        // All ten scripthashes are distinct (no branch/index collision).
+        let mut hashes: Vec<_> = out.iter().map(|(_, sh)| *sh).collect();
+        hashes.sort();
+        hashes.dedup();
+        assert_eq!(hashes.len(), 10, "all derived scripthashes distinct");
+    }
+
+    #[test]
+    fn multipath_window_cap_is_per_branch() {
+        // The window cap applies per branch, so a 2-branch descriptor at the
+        // cap is accepted and yields 2× the cap. One past the cap still errors.
+        assert!(expand_descriptor(MULTIPATH_WPKH, 0, MAX_DESCRIPTOR_WINDOW).is_ok());
+        assert!(matches!(
+            expand_descriptor(MULTIPATH_WPKH, 0, MAX_DESCRIPTOR_WINDOW + 1),
+            Err(DescriptorError::WindowTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_too_many_multipath_branches() {
+        // A multipath descriptor with more branches than the cap is rejected
+        // before any derivation — it would otherwise amplify the per-branch
+        // window past the DoS bound (and is incompatible with Core anyway).
+        let three = "wpkh(xpub6BosfCnifzxcFwrSzQiqu2DBVTshkCXacvNsWGYJVVhhawA7d4R5WSWGFNbi8Aw6ZRc1brxMyWMzG3DSSSSoekkudhUd9yLb6qx39T9nMdj/<0;1;2>/*)";
+        assert!(matches!(
+            expand_descriptor(three, 0, 5),
+            Err(DescriptorError::TooManyBranches { branches: 3, max: 2 })
+        ));
     }
 
     #[test]
