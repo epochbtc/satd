@@ -1188,10 +1188,17 @@ impl NodeEventStream for NodeEventStreamSvc {
                     if let Some(pb::subscribe_control::Msg::SetWatchSet(s)) = &ctrl.msg {
                         let outcome = {
                             let mut guard = watch_set.lock().unwrap_or_else(|p| p.into_inner());
-                            let mask = if s.categories == 0 { u32::MAX } else { s.categories };
-                            category_mask.store(mask, Ordering::Relaxed);
                             let desired = desired_from_proto(s, prefix_bounds);
-                            guard.replace(principal.as_ref(), desired, &*handle)
+                            let outcome = guard.replace(principal.as_ref(), desired, &*handle);
+                            // The category filter is part of the desired set, so
+                            // apply it only when the replace was accepted — a
+                            // quota rejection leaves the whole set (categories
+                            // included) unchanged, as WatchSetRejected promises.
+                            if matches!(outcome, crate::watchset::ReplaceOutcome::Accepted { .. }) {
+                                let mask = if s.categories == 0 { u32::MAX } else { s.categories };
+                                category_mask.store(mask, Ordering::Relaxed);
+                            }
+                            outcome
                         };
                         // Outbound gone (stream tearing down) → nothing to deliver.
                         let _ = ws_result_tx.send(outcome).await;

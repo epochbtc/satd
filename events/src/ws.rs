@@ -847,8 +847,6 @@ fn apply_ws_control(
         depth_alarms,
     } = &ctrl
     {
-        let mask = if *categories == 0 { u32::MAX } else { *categories };
-        category_mask.store(mask, Ordering::Relaxed);
         let scripts: Vec<([u8; 32], u64)> = scripthashes
             .iter()
             .enumerate()
@@ -887,7 +885,15 @@ fn apply_ws_control(
                 .filter_map(|p| parse_ws_prefix(p, prefix_min_bits, prefix_max_bits))
                 .collect(),
         };
-        return Some(watch_set.replace(principal, desired, handle));
+        let outcome = watch_set.replace(principal, desired, handle);
+        // The category filter is part of the desired set: apply it only when the
+        // replace was accepted, so a quota rejection leaves the whole set
+        // (categories included) unchanged as `watch_set_result` reports.
+        if matches!(outcome, crate::watchset::ReplaceOutcome::Accepted { .. }) {
+            let mask = if *categories == 0 { u32::MAX } else { *categories };
+            category_mask.store(mask, Ordering::Relaxed);
+        }
+        return Some(outcome);
     }
     // Per-connection watch-set entry cap (`streamwsmaxsubscriptions`; 0 ⇒
     // unlimited): once the set is at/over the cap, shed any add (the
@@ -1344,6 +1350,48 @@ mod tests {
         // cap = 0 ⇒ unlimited: adds are never shed.
         apply_ws_control(&add(3), &handle, None, &mask, &mut ws, 0, (8, 32));
         assert_eq!(ws.len(), 3, "cap 0 disables the per-connection limit");
+    }
+
+    #[test]
+    fn set_watch_set_applies_categories_only_when_accepted() {
+        use satd_auth::{Accounting, Capability, CapabilitySet, LocalAccounting, Principal};
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, _rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let acct: Arc<dyn Accounting> = Arc::new(LocalAccounting::new());
+        // Quota of 1 unit.
+        let p = Principal::token(
+            Arc::from("tenant"),
+            CapabilitySet::EMPTY.with(Capability::StreamWatch),
+            Some(1),
+            None,
+            acct.clone(),
+        );
+        let mask = AtomicU32::new(0xF); // a distinctive pre-existing filter
+        let mut ws = WatchSet::default();
+
+        // Two scripts need 2 units > quota 1 → the whole replace is rejected, so
+        // the category filter must NOT change.
+        let ctrl = format!(
+            r#"{{"type":"set_watch_set","categories":2,"scripthashes":["{}","{}"]}}"#,
+            "11".repeat(32),
+            "22".repeat(32),
+        );
+        let outcome = apply_ws_control(&ctrl, &handle, Some(&p), &mask, &mut ws, 0, (8, 32));
+        assert!(
+            matches!(outcome, Some(crate::watchset::ReplaceOutcome::Rejected { .. })),
+            "over-quota target must be rejected",
+        );
+        assert_eq!(mask.load(Ordering::Relaxed), 0xF, "rejected replace must not touch categories");
+        assert_eq!(ws.len(), 0, "rejected replace registers nothing");
+
+        // A single script fits quota → accepted, and the category filter applies.
+        let ok = format!(
+            r#"{{"type":"set_watch_set","categories":2,"scripthashes":["{}"]}}"#,
+            "11".repeat(32),
+        );
+        let outcome = apply_ws_control(&ok, &handle, Some(&p), &mask, &mut ws, 0, (8, 32));
+        assert!(matches!(outcome, Some(crate::watchset::ReplaceOutcome::Accepted { .. })));
+        assert_eq!(mask.load(Ordering::Relaxed), 2, "accepted replace applies its category filter");
     }
 
     #[test]
