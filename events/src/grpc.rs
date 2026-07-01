@@ -1186,19 +1186,23 @@ impl NodeEventStream for NodeEventStreamSvc {
                     // the lock, then forward the outcome (mirrors SetCursor). The
                     // guard is scoped so it drops before the `.await` below.
                     if let Some(pb::subscribe_control::Msg::SetWatchSet(s)) = &ctrl.msg {
-                        let outcome = {
-                            let mut guard = watch_set.lock().unwrap_or_else(|p| p.into_inner());
-                            let desired = desired_from_proto(s, prefix_bounds);
-                            let outcome = guard.replace(principal.as_ref(), desired, &*handle);
-                            // The category filter is part of the desired set, so
-                            // apply it only when the replace was accepted — a
-                            // quota rejection leaves the whole set (categories
-                            // included) unchanged, as WatchSetRejected promises.
-                            if matches!(outcome, crate::watchset::ReplaceOutcome::Accepted { .. }) {
-                                let mask = if s.categories == 0 { u32::MAX } else { s.categories };
-                                category_mask.store(mask, Ordering::Relaxed);
+                        let outcome = match desired_from_proto(s, prefix_bounds) {
+                            // A malformed element refuses the whole snapshot before
+                            // the lock is ever taken — the live set is untouched.
+                            Err(_) => crate::watchset::ReplaceOutcome::Malformed,
+                            Ok(desired) => {
+                                let mut guard = watch_set.lock().unwrap_or_else(|p| p.into_inner());
+                                let outcome = guard.replace(principal.as_ref(), desired, &*handle);
+                                // The category filter is part of the desired set, so
+                                // apply it only when the replace was accepted — a
+                                // rejection leaves the whole set (categories
+                                // included) unchanged, as WatchSetRejected promises.
+                                if matches!(outcome, crate::watchset::ReplaceOutcome::Accepted { .. }) {
+                                    let mask = if s.categories == 0 { u32::MAX } else { s.categories };
+                                    category_mask.store(mask, Ordering::Relaxed);
+                                }
+                                outcome
                             }
-                            outcome
                         };
                         // Outbound gone (stream tearing down) → nothing to deliver.
                         let _ = ws_result_tx.send(outcome).await;
@@ -1636,56 +1640,70 @@ fn apply_control(
 }
 
 /// Build a [`DesiredWatchSet`] from a `SetWatchSet` snapshot: expand each
-/// descriptor over its window (skipping any that fail to parse, as AddDescriptor
-/// does) and parse the concrete kinds. `prefix_bounds` prices the prefix buckets.
+/// descriptor over its window and parse the concrete kinds. `prefix_bounds`
+/// prices the prefix buckets.
+///
+/// STRICT: a `SetWatchSet` is a full replacement, so any element that fails to
+/// parse or expand fails the whole build (`Err`). Silently dropping a bad item —
+/// as the incremental `Add*` best-effort paths do — would shrink the desired set
+/// and make [`replace`](crate::watchset::WatchSet::replace) unregister
+/// previously-live watches while still reporting `Accepted`. All-or-nothing: the
+/// caller turns `Err` into a `WatchSetRejected{MALFORMED}` and leaves the live
+/// set untouched.
 fn desired_from_proto(
     s: &pb::SetWatchSet,
     prefix_bounds: (u8, u8),
-) -> crate::watchset::DesiredWatchSet {
+) -> Result<crate::watchset::DesiredWatchSet, &'static str> {
     let (prefix_min_bits, prefix_max_bits) = prefix_bounds;
-    let scripts: Vec<([u8; 32], u64)> = s
-        .scripthashes
-        .iter()
-        .enumerate()
-        .filter_map(|(i, b)| {
-            parse_scripthash(b).map(|sh| (sh, s.min_values.get(i).copied().unwrap_or(0)))
-        })
-        .collect();
-    let descriptors: Vec<(String, Vec<[u8; 32]>)> = s
-        .descriptors
-        .iter()
-        .filter_map(|d| match crate::descriptor::expand_descriptor(&d.descriptor, d.start, d.gap_limit) {
-            Ok(shs) => Some((d.descriptor.clone(), shs.into_iter().map(|(_, sh)| sh).collect())),
+    let mut scripts: Vec<([u8; 32], u64)> = Vec::with_capacity(s.scripthashes.len());
+    for (i, b) in s.scripthashes.iter().enumerate() {
+        let sh = parse_scripthash(b).ok_or("scripthash")?;
+        scripts.push((sh, s.min_values.get(i).copied().unwrap_or(0)));
+    }
+    let mut descriptors: Vec<(String, Vec<[u8; 32]>)> = Vec::with_capacity(s.descriptors.len());
+    for d in &s.descriptors {
+        match crate::descriptor::expand_descriptor(&d.descriptor, d.start, d.gap_limit) {
+            Ok(shs) => descriptors.push((
+                d.descriptor.clone(),
+                shs.into_iter().map(|(_, sh)| sh).collect(),
+            )),
             Err(e) => {
-                warn!(target: "events::grpc", error = %e, "SetWatchSet: ignoring invalid descriptor");
-                None
+                warn!(target: "events::grpc", error = %e, "SetWatchSet: rejecting snapshot for invalid descriptor");
+                return Err("descriptor");
             }
-        })
-        .collect();
-    let outpoints = s.outpoints.iter().filter_map(parse_outpoint).collect();
-    let lifecycles = s
-        .lifecycles
-        .iter()
-        .filter_map(|l| parse_txid(&l.txid).map(|t| (t, l.auto_close_depth)))
-        .collect();
-    let depth_alarms = s
-        .depth_alarms
-        .iter()
-        .filter_map(|a| parse_txid(&a.txid).filter(|_| a.depth >= 1).map(|t| (t, a.depth)))
-        .collect();
-    let prefixes = s
-        .prefixes
-        .iter()
-        .filter_map(|p| crate::watchset::parse_prefix(&p.prefix, p.bits, prefix_min_bits, prefix_max_bits))
-        .collect();
-    crate::watchset::DesiredWatchSet {
+        }
+    }
+    let mut outpoints = Vec::with_capacity(s.outpoints.len());
+    for op in &s.outpoints {
+        outpoints.push(parse_outpoint(op).ok_or("outpoint")?);
+    }
+    let mut lifecycles = Vec::with_capacity(s.lifecycles.len());
+    for l in &s.lifecycles {
+        let t = parse_txid(&l.txid).ok_or("lifecycle txid")?;
+        lifecycles.push((t, l.auto_close_depth));
+    }
+    let mut depth_alarms = Vec::with_capacity(s.depth_alarms.len());
+    for a in &s.depth_alarms {
+        if a.depth < 1 {
+            return Err("depth alarm depth");
+        }
+        let t = parse_txid(&a.txid).ok_or("depth alarm txid")?;
+        depth_alarms.push((t, a.depth));
+    }
+    let mut prefixes = Vec::with_capacity(s.prefixes.len());
+    for p in &s.prefixes {
+        let parsed = crate::watchset::parse_prefix(&p.prefix, p.bits, prefix_min_bits, prefix_max_bits)
+            .ok_or("prefix")?;
+        prefixes.push(parsed);
+    }
+    Ok(crate::watchset::DesiredWatchSet {
         scripts,
         descriptors,
         outpoints,
         lifecycles,
         depth_alarms,
         prefixes,
-    }
+    })
 }
 
 /// Render a [`ReplaceOutcome`] as the in-band `WatchSetResult` node event.
@@ -1707,6 +1725,13 @@ fn watch_set_result_to_proto(
                 reason: pb::watch_set_rejected::Reason::QuotaExceeded as i32,
                 required: *required,
                 quota: *quota,
+            })
+        }
+        ReplaceOutcome::Malformed => {
+            pb::watch_set_result::Outcome::Rejected(pb::WatchSetRejected {
+                reason: pb::watch_set_rejected::Reason::Malformed as i32,
+                required: 0,
+                quota: 0,
             })
         }
     };
@@ -2129,6 +2154,54 @@ mod tests {
 
     fn edge() -> EdgeIdentity {
         EdgeIdentity::new([0x42; 16], Some("us-east1")).unwrap()
+    }
+
+    #[test]
+    fn desired_from_proto_is_strict_all_or_nothing() {
+        // A full replace must reject the whole snapshot if any element is
+        // unparseable — never silently drop it (which would shrink the set and
+        // unregister live watches while replace() still reports Accepted).
+        let ok = pb::SetWatchSet {
+            scripthashes: vec![vec![0x11; 32], vec![0x22; 32]],
+            ..Default::default()
+        };
+        let d = desired_from_proto(&ok, (8, 32)).expect("all-valid snapshot builds");
+        assert_eq!(d.scripts.len(), 2);
+
+        // One malformed scripthash (wrong length) fails the whole build.
+        let bad_sh = pb::SetWatchSet {
+            scripthashes: vec![vec![0x11; 32], vec![0x22; 31]],
+            ..Default::default()
+        };
+        assert!(desired_from_proto(&bad_sh, (8, 32)).is_err(), "bad scripthash rejects snapshot");
+
+        // A malformed outpoint (bad txid length) fails too.
+        let bad_op = pb::SetWatchSet {
+            outpoints: vec![pb::Outpoint { txid: vec![0u8; 31], vout: 0 }],
+            ..Default::default()
+        };
+        assert!(desired_from_proto(&bad_op, (8, 32)).is_err(), "bad outpoint rejects snapshot");
+
+        // A depth alarm with depth 0 is invalid.
+        let bad_depth = pb::SetWatchSet {
+            depth_alarms: vec![pb::WatchDepthAlarm { txid: vec![0x33; 32], depth: 0 }],
+            ..Default::default()
+        };
+        assert!(desired_from_proto(&bad_depth, (8, 32)).is_err(), "depth 0 rejects snapshot");
+    }
+
+    #[test]
+    fn malformed_outcome_maps_to_rejected_malformed() {
+        let ev = watch_set_result_to_proto(&edge(), &crate::watchset::ReplaceOutcome::Malformed);
+        let Some(pb::node_event::Body::SetWatchSetResult(r)) = ev.body else {
+            panic!("expected a WatchSetResult body");
+        };
+        let Some(pb::watch_set_result::Outcome::Rejected(rj)) = r.outcome else {
+            panic!("Malformed maps to a Rejected outcome");
+        };
+        assert_eq!(rj.reason, pb::watch_set_rejected::Reason::Malformed as i32);
+        assert_eq!(rj.required, 0);
+        assert_eq!(rj.quota, 0);
     }
 
     #[test]

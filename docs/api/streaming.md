@@ -761,9 +761,20 @@ coverage** (descriptors expanded): items in both the old and new set keep their
 registration and quota lease untouched — including a scripthash whose *mechanism*
 changes across the replace (a direct add becoming descriptor-covered, or vice
 versa), which a client-side `Add*`/`Remove*` diff cannot see and would briefly
-unwatch. Departed items are released; net-new items are charged. Quota is
-**all-or-nothing on the whole target**: if the target's total unit cost exceeds
-the principal's quota the watch-set is left **unchanged**.
+unwatch. Departed items are released; net-new items are charged. The replace is
+**all-or-nothing on the whole target** for two independent reasons:
+
+- **Quota** — if the target's total unit cost exceeds the principal's quota the
+  watch-set is left **unchanged** (`reason = QUOTA_EXCEEDED`, `required`/`quota`
+  set).
+- **Malformed input** — because a `SetWatchSet` is a *full snapshot*, any element
+  the server cannot parse or expand (a bad scripthash, outpoint, txid, descriptor,
+  or prefix) refuses the **whole** snapshot (`reason = MALFORMED`,
+  `required`/`quota` = 0) and leaves the live set unchanged. It is *not* silently
+  dropped — dropping one item would shrink the snapshot and unwatch still-wanted
+  scripts while reporting success. (This is the one place the incremental `Add*`
+  paths differ: those are best-effort and skip an unparseable item, since they
+  only *grow* the set.)
 
 The outcome is deterministic and in-band (mirrors `SetCursorResult`):
 
@@ -772,7 +783,10 @@ message WatchSetResult {
   oneof outcome { WatchSetAccepted accepted = 1; WatchSetRejected rejected = 2; }
 }
 message WatchSetAccepted { uint32 added = 1; uint32 removed = 2; uint32 unchanged = 3; }
-message WatchSetRejected { Reason reason = 1; uint64 required = 2; uint64 quota = 3; }
+message WatchSetRejected {
+  enum Reason { REASON_UNSPECIFIED = 0; QUOTA_EXCEEDED = 1; MALFORMED = 2; }
+  Reason reason = 1; uint64 required = 2; uint64 quota = 3;
+}
 ```
 
 This is the primitive an SDK reload/realign uses: one round-trip, gap-free,

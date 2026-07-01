@@ -192,6 +192,12 @@ pub(crate) enum ReplaceOutcome {
     /// The target's total unit cost exceeds the principal's quota; the watch-set
     /// is left unchanged.
     Rejected { required: u64, quota: u64 },
+    /// The target snapshot contained an element the carrier could not parse or
+    /// expand. A full replace is all-or-nothing, so the snapshot is refused whole
+    /// and the live watch-set is left unchanged — never silently shrunk by the
+    /// dropped item. Constructed by the carrier before [`replace`](WatchSet::replace)
+    /// is ever called.
+    Malformed,
 }
 
 /// A subscription's live watch-set: the outpoints and scripts it watches, each

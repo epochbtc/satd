@@ -474,16 +474,21 @@ message WatchSetAccepted {
 }
 
 // The replace was rejected whole; the live watch-set is UNCHANGED (still the
-// prior set). `required` is the target's total quota cost, `quota` the
-// principal's ceiling — so a client can shed and retry with a smaller set.
+// prior set). For QUOTA_EXCEEDED, `required` is the target's total quota cost
+// and `quota` the principal's ceiling — so a client can shed and retry with a
+// smaller set. For MALFORMED (an element the server could not parse or expand),
+// `required`/`quota` are 0: a full replace is all-or-nothing, so one bad item
+// refuses the whole snapshot rather than silently dropping it and shrinking the
+// live set.
 message WatchSetRejected {
   enum Reason {
     REASON_UNSPECIFIED = 0;
     QUOTA_EXCEEDED     = 1; // target's total unit cost exceeds the principal quota
+    MALFORMED          = 2; // the target snapshot contained an unparseable element
   }
   Reason reason  = 1;
-  uint64 required = 2; // units the target set needs
-  uint64 quota    = 3; // the principal's quota ceiling
+  uint64 required = 2; // units the target set needs (0 for MALFORMED)
+  uint64 quota    = 3; // the principal's quota ceiling (0 for MALFORMED)
 }
 
 // Versioned, edge-stamped envelope. The wire-level type the server

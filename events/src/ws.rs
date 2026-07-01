@@ -847,52 +847,76 @@ fn apply_ws_control(
         depth_alarms,
     } = &ctrl
     {
-        let scripts: Vec<([u8; 32], u64)> = scripthashes
-            .iter()
-            .enumerate()
-            .filter_map(|(i, s)| {
-                parse_ws_scripthash(s).map(|sh| (sh, min_values.get(i).copied().unwrap_or(0)))
-            })
-            .collect();
-        let descriptors: Vec<(String, Vec<[u8; 32]>)> = descriptors
-            .iter()
-            .filter_map(|d| {
+        // STRICT: a replace is a full snapshot, so any unparseable element refuses
+        // the whole thing (mirrors the gRPC `desired_from_proto`). Silently
+        // dropping a bad item would shrink the desired set and make `replace`
+        // unregister still-wanted watches while reporting `Accepted`. Build into a
+        // `Result` and turn the first failure into a `Malformed` outcome, leaving
+        // the live set untouched (`replace` is never called).
+        let desired: Result<crate::watchset::DesiredWatchSet, &'static str> = (|| {
+            let mut scripts: Vec<([u8; 32], u64)> = Vec::with_capacity(scripthashes.len());
+            for (i, s) in scripthashes.iter().enumerate() {
+                let sh = parse_ws_scripthash(s).ok_or("scripthash")?;
+                scripts.push((sh, min_values.get(i).copied().unwrap_or(0)));
+            }
+            let mut descs: Vec<(String, Vec<[u8; 32]>)> = Vec::with_capacity(descriptors.len());
+            for d in descriptors {
                 match crate::descriptor::expand_descriptor(&d.descriptor, d.start, d.gap_limit) {
-                    Ok(shs) => {
-                        Some((d.descriptor.clone(), shs.into_iter().map(|(_, sh)| sh).collect()))
-                    }
+                    Ok(shs) => descs.push((
+                        d.descriptor.clone(),
+                        shs.into_iter().map(|(_, sh)| sh).collect(),
+                    )),
                     Err(e) => {
-                        warn!(target: "events::ws", error = %e, "SetWatchSet: ignoring invalid descriptor");
-                        None
+                        warn!(target: "events::ws", error = %e, "SetWatchSet: rejecting snapshot for invalid descriptor");
+                        return Err("descriptor");
                     }
                 }
+            }
+            let mut ops = Vec::with_capacity(outpoints.len());
+            for o in outpoints {
+                ops.push(parse_ws_outpoint(o).ok_or("outpoint")?);
+            }
+            let mut lcs = Vec::with_capacity(lifecycles.len());
+            for l in lifecycles {
+                let t = parse_ws_txid(&l.txid).ok_or("lifecycle txid")?;
+                lcs.push((t, l.auto_close_depth));
+            }
+            let mut alarms = Vec::with_capacity(depth_alarms.len());
+            for a in depth_alarms {
+                if a.depth < 1 {
+                    return Err("depth alarm depth");
+                }
+                let t = parse_ws_txid(&a.txid).ok_or("depth alarm txid")?;
+                alarms.push((t, a.depth));
+            }
+            let mut pfx = Vec::with_capacity(prefixes.len());
+            for p in prefixes {
+                pfx.push(parse_ws_prefix(p, prefix_min_bits, prefix_max_bits).ok_or("prefix")?);
+            }
+            Ok(crate::watchset::DesiredWatchSet {
+                scripts,
+                descriptors: descs,
+                outpoints: ops,
+                lifecycles: lcs,
+                depth_alarms: alarms,
+                prefixes: pfx,
             })
-            .collect();
-        let desired = crate::watchset::DesiredWatchSet {
-            scripts,
-            descriptors,
-            outpoints: outpoints.iter().filter_map(parse_ws_outpoint).collect(),
-            lifecycles: lifecycles
-                .iter()
-                .filter_map(|l| parse_ws_txid(&l.txid).map(|t| (t, l.auto_close_depth)))
-                .collect(),
-            depth_alarms: depth_alarms
-                .iter()
-                .filter_map(|a| parse_ws_txid(&a.txid).filter(|_| a.depth >= 1).map(|t| (t, a.depth)))
-                .collect(),
-            prefixes: prefixes
-                .iter()
-                .filter_map(|p| parse_ws_prefix(p, prefix_min_bits, prefix_max_bits))
-                .collect(),
+        })();
+        let outcome = match desired {
+            Err(_) => crate::watchset::ReplaceOutcome::Malformed,
+            Ok(desired) => {
+                let outcome = watch_set.replace(principal, desired, handle);
+                // The category filter is part of the desired set: apply it only
+                // when the replace was accepted, so a rejection leaves the whole
+                // set (categories included) unchanged as `watch_set_result`
+                // reports.
+                if matches!(outcome, crate::watchset::ReplaceOutcome::Accepted { .. }) {
+                    let mask = if *categories == 0 { u32::MAX } else { *categories };
+                    category_mask.store(mask, Ordering::Relaxed);
+                }
+                outcome
+            }
         };
-        let outcome = watch_set.replace(principal, desired, handle);
-        // The category filter is part of the desired set: apply it only when the
-        // replace was accepted, so a quota rejection leaves the whole set
-        // (categories included) unchanged as `watch_set_result` reports.
-        if matches!(outcome, crate::watchset::ReplaceOutcome::Accepted { .. }) {
-            let mask = if *categories == 0 { u32::MAX } else { *categories };
-            category_mask.store(mask, Ordering::Relaxed);
-        }
         return Some(outcome);
     }
     // Per-connection watch-set entry cap (`streamwsmaxsubscriptions`; 0 ⇒
@@ -1100,6 +1124,13 @@ fn watch_set_result_json(outcome: &crate::watchset::ReplaceOutcome) -> serde_jso
             "reason": "quota_exceeded",
             "required": required,
             "quota": quota,
+        }),
+        ReplaceOutcome::Malformed => json!({
+            "category": "watch_set_result",
+            "outcome": "rejected",
+            "reason": "malformed",
+            "required": 0,
+            "quota": 0,
         }),
     };
     json!({ "schema_version": node::events::SCHEMA_VERSION, "cursor": null, "body": body })
@@ -1392,6 +1423,43 @@ mod tests {
         let outcome = apply_ws_control(&ok, &handle, Some(&p), &mask, &mut ws, 0, (8, 32));
         assert!(matches!(outcome, Some(crate::watchset::ReplaceOutcome::Accepted { .. })));
         assert_eq!(mask.load(Ordering::Relaxed), 2, "accepted replace applies its category filter");
+    }
+
+    #[test]
+    fn set_watch_set_rejects_a_malformed_snapshot_and_keeps_the_live_set() {
+        // A full replace is all-or-nothing: one unparseable element must refuse
+        // the whole snapshot (Malformed) and leave the already-registered set
+        // intact — never silently drop the bad item and unregister live watches.
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, _rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let mask = AtomicU32::new(0xF);
+        let mut ws = WatchSet::default();
+
+        // Establish a live set of two scripts.
+        let seed = format!(
+            r#"{{"type":"set_watch_set","categories":2,"scripthashes":["{}","{}"]}}"#,
+            "aa".repeat(32),
+            "bb".repeat(32),
+        );
+        let outcome = apply_ws_control(&seed, &handle, None, &mask, &mut ws, 0, (8, 32));
+        assert!(matches!(outcome, Some(crate::watchset::ReplaceOutcome::Accepted { .. })));
+        assert_eq!(ws.len(), 2);
+        assert_eq!(mask.load(Ordering::Relaxed), 2);
+
+        // A replace whose second scripthash is malformed (odd length) must be
+        // rejected whole — the live two-script set and category filter are kept.
+        let bad = format!(
+            r#"{{"type":"set_watch_set","categories":8,"scripthashes":["{}","zz"]}}"#,
+            "cc".repeat(32),
+        );
+        let outcome = apply_ws_control(&bad, &handle, None, &mask, &mut ws, 0, (8, 32));
+        assert!(
+            matches!(outcome, Some(crate::watchset::ReplaceOutcome::Malformed)),
+            "a malformed element refuses the whole snapshot",
+        );
+        assert_eq!(ws.len(), 2, "the live set is untouched by a rejected replace");
+        assert_eq!(mask.load(Ordering::Relaxed), 2, "categories are not changed by a rejected replace");
+        assert_eq!(watch_set_result_json(&crate::watchset::ReplaceOutcome::Malformed)["body"]["reason"], "malformed");
     }
 
     #[test]

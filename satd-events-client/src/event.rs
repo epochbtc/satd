@@ -311,16 +311,22 @@ pub enum Event {
         /// Items in both the old and new set (kept without re-registration).
         unchanged: u32,
     },
-    /// An atomic watch-set replace was **rejected**: the target's total quota
-    /// cost (`required`) exceeds the principal's `quota`. The live watch-set is
-    /// UNCHANGED — the prior set is still in effect — so shed items and retry.
-    /// The client's mirror still reflects the (unapplied) reloaded set, so a
-    /// consumer that ignores this keeps an over-claiming mirror; react by
-    /// reloading a set that fits.
+    /// An atomic watch-set replace was **rejected**; the live watch-set is
+    /// UNCHANGED (the prior set is still in effect). For
+    /// [`QuotaExceeded`](WatchSetRejectReason::QuotaExceeded), the target's total
+    /// quota cost (`required`) exceeds the principal's `quota` — shed items and
+    /// retry. For [`Malformed`](WatchSetRejectReason::Malformed) the server could
+    /// not parse or expand an element of the snapshot (`required`/`quota` are 0);
+    /// this is a client bug, not a transient condition. Either way the client's
+    /// mirror still reflects the (unapplied) reloaded set, so a consumer that
+    /// ignores this keeps an over-claiming mirror; react by reloading a set that
+    /// the server accepts.
     WatchSetRejected {
-        /// Total watch units the rejected target set needs.
+        /// Why the replace was refused.
+        reason: WatchSetRejectReason,
+        /// Total watch units the rejected target set needs (0 for `Malformed`).
         required: u64,
-        /// The principal's quota ceiling.
+        /// The principal's quota ceiling (0 for `Malformed`).
         quota: u64,
     },
     /// A body this client build does not recognize (a newer server arm), or an
@@ -344,6 +350,33 @@ pub enum CursorRejectReason {
     NoSource,
     /// A reason code this client build does not recognize (a newer server).
     Unknown,
+}
+
+/// Why an atomic watch-set replace was declined by the server (see
+/// [`Event::WatchSetRejected`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum WatchSetRejectReason {
+    /// The target set's total unit cost exceeds the principal's quota — shed
+    /// items and retry. Transient: a smaller set fits.
+    QuotaExceeded,
+    /// The server could not parse or expand an element of the snapshot (a bad
+    /// scripthash, outpoint, txid, descriptor, or prefix). A full replace is
+    /// all-or-nothing, so the whole snapshot was refused. This is a client bug —
+    /// retrying the same set will not help.
+    Malformed,
+    /// A reason code this client build does not recognize (a newer server).
+    Unknown,
+}
+
+/// Map the proto `WatchSetRejected.Reason` enum (an `i32` on the wire) to the
+/// client enum, treating an unrecognized code as [`WatchSetRejectReason::Unknown`].
+fn watch_set_reject_reason(reason: i32) -> WatchSetRejectReason {
+    match pb::watch_set_rejected::Reason::try_from(reason) {
+        Ok(pb::watch_set_rejected::Reason::QuotaExceeded) => WatchSetRejectReason::QuotaExceeded,
+        Ok(pb::watch_set_rejected::Reason::Malformed) => WatchSetRejectReason::Malformed,
+        Ok(pb::watch_set_rejected::Reason::Unspecified) | Err(_) => WatchSetRejectReason::Unknown,
+    }
 }
 
 impl From<pb::NodeEvent> for Event {
@@ -428,6 +461,7 @@ impl From<pb::NodeEvent> for Event {
                     unchanged: a.unchanged,
                 },
                 Some(pb::watch_set_result::Outcome::Rejected(rj)) => Event::WatchSetRejected {
+                    reason: watch_set_reject_reason(rj.reason),
                     required: rj.required,
                     quota: rj.quota,
                 },
