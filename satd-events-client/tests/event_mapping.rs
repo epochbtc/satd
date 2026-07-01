@@ -2,10 +2,56 @@
 //! easy to get subtly wrong: `has_amount` → `Option`, the evict-reason enum,
 //! prefix nesting, and the empty-body / unrecognized-arm fallback.
 
-use satd_events_client::{proto as pb, CursorRejectReason, Event, EvictReason};
+use satd_events_client::{proto as pb, CursorRejectReason, DescriptorMatch, Event, EvictReason};
 
 fn node_event(body: pb::node_event::Body) -> pb::NodeEvent {
     pb::NodeEvent { schema_version: 1, stamp: None, cursor: None, body: Some(body) }
+}
+
+#[test]
+fn script_matched_carries_descriptor_attribution() {
+    let ev = node_event(pb::node_event::Body::ScriptMatched(pb::ScriptMatched {
+        scripthash: vec![0x11; 32],
+        txid: vec![0x22; 32],
+        is_output: true,
+        index: 0,
+        confirmed: true,
+        descriptor_matches: vec![pb::DescriptorMatch {
+            descriptor: "wpkh(xpub...)".into(),
+            branch: 1,
+            derivation_index: 42,
+        }],
+    }));
+    match Event::from(ev) {
+        Event::ScriptMatched { descriptors, is_output, .. } => {
+            assert!(is_output);
+            assert_eq!(
+                descriptors,
+                vec![DescriptorMatch {
+                    descriptor: "wpkh(xpub...)".into(),
+                    branch: 1,
+                    derivation_index: 42,
+                }]
+            );
+        }
+        other => panic!("expected ScriptMatched, got {other:?}"),
+    }
+}
+
+#[test]
+fn script_matched_without_descriptor_is_empty_attribution() {
+    let ev = node_event(pb::node_event::Body::ScriptMatched(pb::ScriptMatched {
+        scripthash: vec![0x11; 32],
+        txid: vec![0x22; 32],
+        is_output: false,
+        index: 1,
+        confirmed: false,
+        descriptor_matches: vec![],
+    }));
+    match Event::from(ev) {
+        Event::ScriptMatched { descriptors, .. } => assert!(descriptors.is_empty()),
+        other => panic!("expected ScriptMatched, got {other:?}"),
+    }
 }
 
 #[test]

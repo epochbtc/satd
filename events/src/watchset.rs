@@ -85,6 +85,11 @@ pub(crate) fn bounded_txid_depth_pairs(txids: &[Txid], depths: &[u32]) -> Option
 /// depend on `node-index`.
 type Scripthash = [u8; 32];
 
+/// A descriptor's expanded window as `(branch, derivation_index, scripthash)`
+/// tuples — the coordinates [`expand_descriptor`](crate::descriptor::expand_descriptor)
+/// produces, carried through to the match-attribution reverse index.
+pub(crate) type DescriptorWindow = Vec<(u32, u32, Scripthash)>;
+
 /// A privacy-preserving script-prefix bucket, as `(bits, masked_top32)` — the
 /// type `WatchHandle::add_prefixes` takes. `bits` is the prefix length; the
 /// `u32` is the top 32 bits of `sha256(spk)` masked to `bits`.
@@ -187,10 +192,12 @@ impl WatchRegistry for node::events::WatchHandle {
 pub(crate) struct DesiredWatchSet {
     /// Directly-watched scripthashes, each with its `min_value` floor (0 = none).
     pub scripts: Vec<(Scripthash, u64)>,
-    /// Descriptor string → the scripthashes its window expands to (deduped by the
-    /// carrier). A scripthash may also appear in `scripts` or another descriptor;
-    /// it is charged once and owned by each source.
-    pub descriptors: Vec<(String, Vec<Scripthash>)>,
+    /// Descriptor string → its expanded window as `(branch, derivation_index,
+    /// scripthash)` tuples (the coordinates `expand_descriptor` produced). A
+    /// scripthash may also appear in `scripts` or another descriptor; it is
+    /// charged once and owned by each source. The coordinates feed the match
+    /// attribution reverse index so a `SetWatchSet` replace keeps it correct.
+    pub descriptors: Vec<(String, DescriptorWindow)>,
     pub outpoints: Vec<OutPoint>,
     /// Lifecycle watches: `(txid, auto_close_depth)` (0 = persist until removed).
     pub lifecycles: Vec<(Txid, u32)>,
@@ -244,10 +251,25 @@ pub(crate) struct WatchSet {
     /// drops it) and distinct from descriptor ownership.
     script_direct: HashSet<Scripthash>,
     /// Descriptor string → the scripthashes its current `[start, start+gap)`
-    /// window expands to. Retained so a `RemoveDescriptor` (or a re-asserted,
-    /// slid window) can release exactly the scripts that descriptor contributed,
-    /// decrementing `script_owners` rather than blindly dropping shared scripts.
+    /// window expands to (in expansion order). Retained so a `RemoveDescriptor`
+    /// (or a re-asserted, slid window) can release exactly the scripts that
+    /// descriptor contributed, decrementing `script_owners` rather than blindly
+    /// dropping shared scripts.
     descriptors: HashMap<String, Vec<Scripthash>>,
+    /// Reverse index: scripthash → the descriptor(s) whose window contains it,
+    /// each paired with the script's **position** in that window (expansion
+    /// order). Drives match attribution (`ScriptMatched.descriptor_matches`): a
+    /// match on a descriptor-derived script reports which descriptor + window
+    /// offset it came from. The offset is purely positional (relative to the
+    /// registered window), never the absolute derivation index — the server
+    /// holds no derivation indices. A script appears once per descriptor that
+    /// contains it (overlap → multiple entries). The descriptor name is shared
+    /// (`Arc<str>`) so a large window does not store the string per script.
+    /// Reverse index: matched scripthash → the descriptors currently covering it,
+    /// each with the exact `(branch, derivation_index)` the server derived it at
+    /// (BIP-389 branch + absolute index — not a positional offset). Powers
+    /// `descriptor_attribution` on the match path.
+    script_descriptors: HashMap<Scripthash, Vec<(std::sync::Arc<str>, u32, u32)>>,
     /// Lifecycle watches (one quota unit per txid). An `auto_close_depth` rides
     /// on the lifecycle watch server-side and is NOT a separate charged item.
     txids: HashMap<Txid, Option<satd_auth::WatchLease>>,
@@ -338,16 +360,20 @@ impl WatchSet {
         &mut self,
         principal: Option<&satd_auth::Principal>,
         descriptor: String,
-        derived: impl IntoIterator<Item = Scripthash>,
+        derived: impl IntoIterator<Item = (u32, u32, Scripthash)>,
         register: impl FnOnce(&[Scripthash]),
         unregister: impl FnOnce(&[Scripthash]),
     ) {
-        // Dedup the new membership, preserving first-seen order.
+        // Dedup the new membership, preserving first-seen order. `new_coords` runs
+        // parallel to `new`, carrying each scripthash's `(branch, index)` from the
+        // expansion (first occurrence wins if a script recurs across branches).
         let mut new: Vec<Scripthash> = Vec::new();
         let mut new_set = HashSet::new();
-        for s in derived {
+        let mut new_coords: Vec<(u32, u32)> = Vec::new();
+        for (branch, index, s) in derived {
             if new_set.insert(s) {
                 new.push(s);
+                new_coords.push((branch, index));
             }
         }
         let is_new_descriptor = !self.descriptors.contains_key(&descriptor);
@@ -416,6 +442,16 @@ impl WatchSet {
         }
         remove_items(&mut self.scripts, to_release, unregister);
 
+        // Rebuild this descriptor's reverse-index entries: a slid window changes
+        // which indices the surviving scripts sit at, so drop the old entries
+        // wholesale and re-record `(descriptor, branch, index)` for the new
+        // membership from the coordinates the expansion produced.
+        self.clear_reverse_index(&descriptor, &old);
+        let key: std::sync::Arc<str> = std::sync::Arc::from(descriptor.as_str());
+        for (s, (branch, index)) in new.iter().zip(new_coords.iter()) {
+            self.script_descriptors.entry(*s).or_default().push((key.clone(), *branch, *index));
+        }
+
         self.descriptors.insert(descriptor, new);
     }
 
@@ -431,6 +467,7 @@ impl WatchSet {
         let Some(members) = self.descriptors.remove(descriptor) else {
             return;
         };
+        self.clear_reverse_index(descriptor, &members);
         let mut to_release = Vec::new();
         for s in members {
             self.release_owner(s, &mut to_release);
@@ -488,15 +525,26 @@ impl WatchSet {
         // insert, inflating `script_owners` above the memberships a later
         // `RemoveDescriptor` can decrement and stranding live scripthash watches.
         let mut target_descriptors: HashMap<String, Vec<Scripthash>> = HashMap::new();
-        for (desc, shs) in &desired.descriptors {
+        // Rebuilt reverse index (scripthash → (descriptor, branch, index)) so match
+        // attribution stays correct across a replace — wholesale, so departed
+        // descriptors' entries simply don't reappear.
+        let mut target_script_descriptors: HashMap<Scripthash, Vec<(std::sync::Arc<str>, u32, u32)>> =
+            HashMap::new();
+        for (desc, coords) in &desired.descriptors {
             if target_descriptors.contains_key(desc) {
                 continue;
             }
+            let key: std::sync::Arc<str> = std::sync::Arc::from(desc.as_str());
             let mut seen = HashSet::new();
             let mut members = Vec::new();
-            for sh in shs {
+            for (branch, index, sh) in coords {
                 if seen.insert(*sh) {
                     members.push(*sh);
+                    target_script_descriptors.entry(*sh).or_default().push((
+                        key.clone(),
+                        *branch,
+                        *index,
+                    ));
                     *target_owners.entry(*sh).or_insert(0) += 1;
                     target_floors.entry(*sh).or_insert(0);
                 }
@@ -620,6 +668,7 @@ impl WatchSet {
         self.script_owners = target_owners;
         self.script_direct = target_direct;
         self.descriptors = target_descriptors;
+        self.script_descriptors = target_script_descriptors;
 
         // ---- Registry reconcile (kept items untouched → no gap) ----------
         if !all_target_scripts.is_empty() {
@@ -692,6 +741,31 @@ impl WatchSet {
                 l.defuse();
             }
         }
+    }
+
+    /// Drop `descriptor`'s entries from the reverse index for each of `members`,
+    /// removing a script's bucket entirely once it has no descriptor left.
+    fn clear_reverse_index(&mut self, descriptor: &str, members: &[Scripthash]) {
+        for s in members {
+            if let Some(v) = self.script_descriptors.get_mut(s) {
+                v.retain(|(d, _, _)| d.as_ref() != descriptor);
+                if v.is_empty() {
+                    self.script_descriptors.remove(s);
+                }
+            }
+        }
+    }
+
+    /// The descriptor attribution for a matched scripthash: `(descriptor, branch,
+    /// derivation_index)` for each descriptor whose window currently contains it —
+    /// the exact BIP-389 branch and absolute index the server derived it at, so a
+    /// client needs no positional arithmetic. Empty for a directly-watched
+    /// (non-descriptor) script. The carrier attaches this to `ScriptMatched`.
+    pub(crate) fn descriptor_attribution(
+        &self,
+        scripthash: &Scripthash,
+    ) -> &[(std::sync::Arc<str>, u32, u32)] {
+        self.script_descriptors.get(scripthash).map(Vec::as_slice).unwrap_or(&[])
     }
 
     /// Drop one owner from a scripthash. If that was its last owner, queue it in
@@ -1078,6 +1152,14 @@ mod tests {
         [b; 32]
     }
 
+    /// A single-branch descriptor window: `(branch 0, index = position, sh)` —
+    /// the shape a real `expand_descriptor` yields for a `/0/*` descriptor, so
+    /// the reverse index records index == position (matching the old positional
+    /// offset for a single branch).
+    fn win(shs: &[Scripthash]) -> Vec<(u32, u32, Scripthash)> {
+        shs.iter().enumerate().map(|(i, s)| (0u32, i as u32, *s)).collect()
+    }
+
     #[test]
     fn add_scripts_reasserts_held_scripts_for_metadata_refresh() {
         // Regression: re-asserting an already-watched scripthash (e.g. to change
@@ -1407,7 +1489,7 @@ mod tests {
         ws.add_descriptor(
             Some(&p),
             "D".into(),
-            [sh(1), sh(2), sh(3)],
+            win(&[sh(1), sh(2), sh(3)]),
             |s| registered = s.to_vec(),
             |_| {},
         );
@@ -1435,7 +1517,7 @@ mod tests {
         ws.add_descriptor(
             Some(&p),
             "D".into(),
-            [sh(1), sh(2), sh(3)],
+            win(&[sh(1), sh(2), sh(3)]),
             |s| registered = s.to_vec(),
             |_| {},
         );
@@ -1464,8 +1546,8 @@ mod tests {
         let q = acct.quota();
         let mut ws = WatchSet::default();
 
-        ws.add_descriptor(Some(&p), "D1".into(), [sh(1), sh(2)], |_| {}, |_| {});
-        ws.add_descriptor(Some(&p), "D2".into(), [sh(2), sh(3)], |_| {}, |_| {});
+        ws.add_descriptor(Some(&p), "D1".into(), win(&[sh(1), sh(2)]), |_| {}, |_| {});
+        ws.add_descriptor(Some(&p), "D2".into(), win(&[sh(2), sh(3)]), |_| {}, |_| {});
         // sh(2) shared → charged once; total sh1 + sh2 + sh3.
         assert_eq!(q.current("tenant"), 3);
         assert_eq!(ws.len(), 3);
@@ -1488,7 +1570,7 @@ mod tests {
         let q = acct.quota();
         let mut ws = WatchSet::default();
 
-        ws.add_descriptor(Some(&p), "D".into(), [sh(1), sh(2), sh(3)], |_| {}, |_| {});
+        ws.add_descriptor(Some(&p), "D".into(), win(&[sh(1), sh(2), sh(3)]), |_| {}, |_| {});
         assert_eq!(q.current("tenant"), 3);
 
         // Slide the window forward: {1,2,3} → {3,4,5}. 1,2 leave; 4,5 enter; 3 stays.
@@ -1497,7 +1579,7 @@ mod tests {
         ws.add_descriptor(
             Some(&p),
             "D".into(),
-            [sh(3), sh(4), sh(5)],
+            win(&[sh(3), sh(4), sh(5)]),
             |s| registered = s.to_vec(),
             |s| unregistered = s.to_vec(),
         );
@@ -1515,7 +1597,7 @@ mod tests {
         let q = acct.quota();
         let mut ws = WatchSet::default();
 
-        ws.add_descriptor(Some(&p), "D".into(), [sh(1)], |_| {}, |_| {});
+        ws.add_descriptor(Some(&p), "D".into(), win(&[sh(1)]), |_| {}, |_| {});
         assert_eq!(q.current("tenant"), 1);
 
         // A direct RemoveScripts does not touch descriptor ownership.
@@ -1537,7 +1619,7 @@ mod tests {
         ws.add_descriptor(
             Some(&p),
             "D".into(),
-            [sh(1), sh(2), sh(3)],
+            win(&[sh(1), sh(2), sh(3)]),
             |_| registered = true,
             |_| {},
         );
@@ -1554,14 +1636,14 @@ mod tests {
         let q = acct.quota();
         let mut ws = WatchSet::default();
 
-        ws.add_descriptor(Some(&p), "D".into(), [sh(1), sh(2)], |_| {}, |_| {});
+        ws.add_descriptor(Some(&p), "D".into(), win(&[sh(1), sh(2)]), |_| {}, |_| {});
         // Same descriptor, same window: nothing net-new, nothing released.
         let mut registered = false;
         let mut unregistered = false;
         ws.add_descriptor(
             Some(&p),
             "D".into(),
-            [sh(1), sh(2)],
+            win(&[sh(1), sh(2)]),
             |_| registered = true,
             |_| unregistered = true,
         );
@@ -1649,7 +1731,7 @@ mod tests {
         // server diffs by effective coverage, so sh1 is `unchanged`.
         let desired = DesiredWatchSet {
             scripts: Vec::new(),
-            descriptors: vec![("d".to_string(), vec![sh(1)])],
+            descriptors: vec![("d".to_string(), vec![(0, 0, sh(1))])],
             outpoints: Vec::new(),
             lifecycles: Vec::new(),
             depth_alarms: Vec::new(),
@@ -1669,6 +1751,44 @@ mod tests {
     }
 
     #[test]
+    fn replace_rebuilds_the_descriptor_attribution_reverse_index() {
+        // A SetWatchSet replace must keep the match-attribution reverse index in
+        // sync with the new descriptor set — new descriptors attribute at their
+        // real (branch, index), and a descriptor dropped by the replace leaves no
+        // stale attribution. Regression: replace() predates the reverse index, so
+        // the #450/#451 merge had to thread coordinates through DesiredWatchSet and
+        // rebuild `script_descriptors`; without it attribution would go stale.
+        let (p, _acct) = tenant(10);
+        let mut ws = WatchSet::default();
+        let d1 = DesiredWatchSet {
+            scripts: Vec::new(),
+            descriptors: vec![("a".to_string(), vec![(0, 5, sh(1))])],
+            outpoints: Vec::new(),
+            lifecycles: Vec::new(),
+            depth_alarms: Vec::new(),
+            prefixes: Vec::new(),
+        };
+        ws.replace(Some(&p), d1, 0, &MockReg::default());
+        assert_eq!(attrib(&ws, sh(1)), vec![("a".to_string(), 0, 5)], "new descriptor attributes at its coordinate");
+
+        // Replace with a different descriptor covering a different script.
+        let d2 = DesiredWatchSet {
+            scripts: Vec::new(),
+            descriptors: vec![("b".to_string(), vec![(1, 9, sh(2))])],
+            outpoints: Vec::new(),
+            lifecycles: Vec::new(),
+            depth_alarms: Vec::new(),
+            prefixes: Vec::new(),
+        };
+        ws.replace(Some(&p), d2, 0, &MockReg::default());
+        assert_eq!(attrib(&ws, sh(2)), vec![("b".to_string(), 1, 9)], "replaced-in descriptor attributes correctly");
+        assert!(
+            ws.descriptor_attribution(&sh(1)).is_empty(),
+            "a descriptor dropped by the replace leaves no stale attribution",
+        );
+    }
+
+    #[test]
     fn replace_dedups_a_duplicate_descriptor_so_removedescriptor_fully_clears() {
         // A snapshot listing the same descriptor string twice is the same watch:
         // it must be counted once. Otherwise `script_owners` is inflated (+1 per
@@ -1681,8 +1801,8 @@ mod tests {
         let desired = DesiredWatchSet {
             scripts: Vec::new(),
             descriptors: vec![
-                ("d".to_string(), vec![sh(1), sh(2)]),
-                ("d".to_string(), vec![sh(1), sh(2)]),
+                ("d".to_string(), vec![(0, 0, sh(1)), (0, 1, sh(2))]),
+                ("d".to_string(), vec![(0, 0, sh(1)), (0, 1, sh(2))]),
             ],
             outpoints: Vec::new(),
             lifecycles: Vec::new(),
@@ -1801,14 +1921,14 @@ mod tests {
         // script, so each past the first has an empty net-new set — exactly the
         // "free descriptor" path (no quota unit, no rate token) the cap bounds.
         for i in 0..MAX_DESCRIPTORS_PER_CONNECTION {
-            ws.add_descriptor(None, format!("D{i}"), [sh(1)], |_| {}, |_| {});
+            ws.add_descriptor(None, format!("D{i}"), win(&[sh(1)]), |_| {}, |_| {});
         }
         assert_eq!(ws.descriptors.len(), MAX_DESCRIPTORS_PER_CONNECTION);
 
         // One more *distinct* descriptor is rejected outright — the map, which is
         // invisible to the quota and to `len()`, does not grow past the cap.
         let mut registered = false;
-        ws.add_descriptor(None, "overflow".into(), [sh(1)], |_| registered = true, |_| {});
+        ws.add_descriptor(None, "overflow".into(), win(&[sh(1)]), |_| registered = true, |_| {});
         assert!(!registered, "a descriptor rejected by the cap registers nothing");
         assert_eq!(
             ws.descriptors.len(),
@@ -1820,7 +1940,7 @@ mod tests {
         // Re-asserting (sliding) an already-retained descriptor at the cap still
         // works — the count cap must never block a window slide.
         let mut slid = Vec::new();
-        ws.add_descriptor(None, "D0".into(), [sh(2)], |s| slid = s.to_vec(), |_| {});
+        ws.add_descriptor(None, "D0".into(), win(&[sh(2)]), |s| slid = s.to_vec(), |_| {});
         assert_eq!(
             ws.descriptors.len(),
             MAX_DESCRIPTORS_PER_CONNECTION,
@@ -1832,5 +1952,82 @@ mod tests {
             "the slid window replaced D0's membership",
         );
         assert_eq!(slid, vec![sh(2)], "the slid-in script registers");
+    }
+
+    // --- descriptor match attribution (reverse index) -------------------------
+
+    /// `(descriptor, branch, index)` attribution as plain owned tuples for
+    /// assertions.
+    fn attrib(ws: &WatchSet, sh: Scripthash) -> Vec<(String, u32, u32)> {
+        ws.descriptor_attribution(&sh)
+            .iter()
+            .map(|(d, branch, index)| (d.to_string(), *branch, *index))
+            .collect()
+    }
+
+    #[test]
+    fn attribution_reports_descriptor_branch_and_index() {
+        let (p, _acct) = tenant(10);
+        let mut ws = WatchSet::default();
+        ws.add_descriptor(Some(&p), "D".into(), win(&[sh(10), sh(11), sh(12)]), |_| {}, |_| {});
+        // `win` models a single-branch /0/* window: branch 0, index = position.
+        assert_eq!(attrib(&ws, sh(10)), vec![("D".to_string(), 0, 0)]);
+        assert_eq!(attrib(&ws, sh(11)), vec![("D".to_string(), 0, 1)]);
+        assert_eq!(attrib(&ws, sh(12)), vec![("D".to_string(), 0, 2)]);
+    }
+
+    #[test]
+    fn attribution_reports_the_multipath_branch() {
+        // A two-branch window (external=0, change=1) attributes each script to its
+        // real branch and index — the case a positional offset could not express.
+        let (p, _acct) = tenant(10);
+        let mut ws = WatchSet::default();
+        let two_branch = vec![(0u32, 7u32, sh(1)), (1u32, 7u32, sh(2))];
+        ws.add_descriptor(Some(&p), "M".into(), two_branch, |_| {}, |_| {});
+        assert_eq!(attrib(&ws, sh(1)), vec![("M".to_string(), 0, 7)], "external branch");
+        assert_eq!(attrib(&ws, sh(2)), vec![("M".to_string(), 1, 7)], "change branch, same index");
+    }
+
+    #[test]
+    fn direct_scripts_have_no_attribution() {
+        let (p, _acct) = tenant(10);
+        let mut ws = WatchSet::default();
+        ws.add_scripts(Some(&p), [sh(1)], "scripts", |_| {}, |_| {});
+        assert!(ws.descriptor_attribution(&sh(1)).is_empty());
+    }
+
+    #[test]
+    fn overlapping_descriptors_attribute_a_shared_script_to_both() {
+        let (p, _acct) = tenant(10);
+        let mut ws = WatchSet::default();
+        ws.add_descriptor(Some(&p), "A".into(), win(&[sh(1), sh(2)]), |_| {}, |_| {});
+        ws.add_descriptor(Some(&p), "B".into(), win(&[sh(9), sh(2)]), |_| {}, |_| {});
+        // sh(2) is offset 1 in A and offset 1 in B.
+        let mut got = attrib(&ws, sh(2));
+        got.sort();
+        assert_eq!(got, vec![("A".to_string(), 0, 1), ("B".to_string(), 0, 1)]);
+    }
+
+    #[test]
+    fn sliding_a_window_updates_offsets_and_drops_departed_scripts() {
+        let (p, _acct) = tenant(10);
+        let mut ws = WatchSet::default();
+        ws.add_descriptor(Some(&p), "D".into(), win(&[sh(1), sh(2), sh(3)]), |_| {}, |_| {});
+        // Slide: {1,2,3} → {3,4,5}. sh(3) moves from offset 2 to offset 0.
+        ws.add_descriptor(Some(&p), "D".into(), win(&[sh(3), sh(4), sh(5)]), |_| {}, |_| {});
+        assert_eq!(attrib(&ws, sh(3)), vec![("D".to_string(), 0, 0)], "surviving script re-offset");
+        assert_eq!(attrib(&ws, sh(4)), vec![("D".to_string(), 0, 1)]);
+        assert!(ws.descriptor_attribution(&sh(1)).is_empty(), "departed script loses attribution");
+    }
+
+    #[test]
+    fn removing_a_descriptor_clears_attribution_but_keeps_shared() {
+        let (p, _acct) = tenant(10);
+        let mut ws = WatchSet::default();
+        ws.add_descriptor(Some(&p), "A".into(), win(&[sh(1), sh(2)]), |_| {}, |_| {});
+        ws.add_descriptor(Some(&p), "B".into(), win(&[sh(2)]), |_| {}, |_| {});
+        ws.remove_descriptor("A", |_| {});
+        assert!(ws.descriptor_attribution(&sh(1)).is_empty(), "A's exclusive script cleared");
+        assert_eq!(attrib(&ws, sh(2)), vec![("B".to_string(), 0, 0)], "B still attributes the shared script");
     }
 }

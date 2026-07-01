@@ -649,7 +649,16 @@ async fn ws_conn(
                         }
                         _ => {}
                     }
-                    let text = watch_match_json(&wm).to_string();
+                    // Attribute a script match to the descriptor(s) whose window
+                    // it belongs to (empty for a direct watch).
+                    let attribution: Vec<(std::sync::Arc<str>, u32, u32)> = match &wm {
+                        WatchMatch::ScriptMatched { scripthash, .. } => {
+                            let ws = watch_set.lock().unwrap_or_else(|p| p.into_inner());
+                            ws.descriptor_attribution(scripthash).to_vec()
+                        }
+                        _ => Vec::new(),
+                    };
+                    let text = watch_match_json(&wm, &attribution).to_string();
                     if sender.send(Message::Text(text.into())).await.is_err() {
                         break;
                     }
@@ -865,13 +874,11 @@ fn apply_ws_control(
                 let sh = parse_ws_scripthash(s).ok_or("scripthash")?;
                 scripts.push((sh, min_values.get(i).copied().unwrap_or(0)));
             }
-            let mut descs: Vec<(String, Vec<[u8; 32]>)> = Vec::with_capacity(descriptors.len());
+            let mut descs: Vec<(String, crate::watchset::DescriptorWindow)> =
+                Vec::with_capacity(descriptors.len());
             for d in descriptors {
                 match crate::descriptor::expand_descriptor(&d.descriptor, d.start, d.gap_limit) {
-                    Ok(shs) => descs.push((
-                        d.descriptor.clone(),
-                        shs.into_iter().map(|(_, sh)| sh).collect(),
-                    )),
+                    Ok(coords) => descs.push((d.descriptor.clone(), coords)),
                     Err(e) => {
                         warn!(target: "events::ws", error = %e, "SetWatchSet: rejecting snapshot for invalid descriptor");
                         return Err("descriptor");
@@ -1074,7 +1081,7 @@ fn apply_ws_control(
                 watch_set.add_descriptor(
                     principal,
                     descriptor.clone(),
-                    scripts.into_iter().map(|(_, sh)| sh),
+                    scripts,
                     |shs| {
                         handle.add_scripthashes(shs);
                     },
@@ -1153,8 +1160,12 @@ fn watch_set_result_json(outcome: &crate::watchset::ReplaceOutcome) -> serde_jso
 
 /// Hand-rolled JSON for a watch match (the proto has no `serde` derive). The
 /// shape mirrors a `NodeEvent`: a `body` tagged by `category`, plus a
-/// `cursor` on confirmed matches.
-fn watch_match_json(m: &WatchMatch) -> serde_json::Value {
+/// `cursor` on confirmed matches. `descriptor_matches` is the descriptor
+/// attribution for a `ScriptMatched` (empty otherwise / for a direct watch).
+fn watch_match_json(
+    m: &WatchMatch,
+    descriptor_matches: &[(std::sync::Arc<str>, u32, u32)],
+) -> serde_json::Value {
     use bitcoin::hashes::Hash;
     match m {
         WatchMatch::OutpointSpent {
@@ -1192,6 +1203,16 @@ fn watch_match_json(m: &WatchMatch) -> serde_json::Value {
                 "is_output": is_output,
                 "index": index,
                 "confirmed": confirmed,
+                // Empty array for a directly-watched script; one entry per
+                // descriptor whose window holds this scripthash.
+                "descriptor_matches": descriptor_matches
+                    .iter()
+                    .map(|(d, branch, index)| json!({
+                        "descriptor": d.as_ref(),
+                        "branch": branch,
+                        "derivation_index": index,
+                    }))
+                    .collect::<Vec<_>>(),
             }
         }),
         WatchMatch::TxidMatched {
@@ -1526,7 +1547,7 @@ mod tests {
             confirmed: true,
             height: Some(202),
         };
-        let v = watch_match_json(&m);
+        let v = watch_match_json(&m, &[]);
         assert_eq!(v["body"]["category"], "txid_matched");
         assert_eq!(v["body"]["confirmed"], true);
         assert_eq!(v["body"]["txid"], "cd".repeat(32));
@@ -1544,7 +1565,7 @@ mod tests {
         let v = watch_match_json(&WatchMatch::TxidReplaced {
             txid,
             replacing_txid: rep,
-        });
+        }, &[]);
         assert_eq!(v["body"]["category"], "txid_replaced");
         assert_eq!(v["body"]["replacing_txid"], "22".repeat(32));
         assert!(v["cursor"].is_null(), "replaced carries no cursor");
@@ -1552,14 +1573,14 @@ mod tests {
         let v = watch_match_json(&WatchMatch::TxidEvicted {
             txid,
             reason: node::mempool::events::EvictReason::BlockConflict,
-        });
+        }, &[]);
         assert_eq!(v["body"]["category"], "txid_evicted");
         assert_eq!(v["body"]["reason"], "block_conflict");
 
         let v = watch_match_json(&WatchMatch::TxidUnconfirmed {
             txid,
             prev_height: 814_000,
-        });
+        }, &[]);
         assert_eq!(v["body"]["category"], "txid_unconfirmed");
         assert_eq!(v["body"]["prev_height"], 814_000);
 
@@ -1567,7 +1588,7 @@ mod tests {
             txid,
             depth: 3,
             height: 100,
-        });
+        }, &[]);
         assert_eq!(v["body"]["category"], "txid_depth_reached");
         assert_eq!(v["body"]["depth"], 3);
         assert_eq!(v["cursor"]["height"], 100);
@@ -1576,7 +1597,7 @@ mod tests {
             txid,
             depth: 6,
             height: 100,
-        });
+        }, &[]);
         assert_eq!(v["body"]["category"], "txid_finalized");
         assert_eq!(v["body"]["depth"], 6);
         assert_eq!(v["cursor"]["height"], 100);
@@ -1654,7 +1675,7 @@ mod tests {
                 },
             ],
         }));
-        let v = watch_match_json(&m);
+        let v = watch_match_json(&m, &[]);
         assert_eq!(v["body"]["category"], "prefix_matched");
         assert_eq!(v["body"]["bits"], 16);
         assert_eq!(v["body"]["prefix"], "abcd");
@@ -1690,7 +1711,7 @@ mod tests {
             confirmed: true,
             height: Some(101),
         };
-        let v = watch_match_json(&m);
+        let v = watch_match_json(&m, &[]);
         assert_eq!(v["body"]["category"], "outpoint_spent");
         assert_eq!(v["body"]["outpoint_vout"], 3);
         assert_eq!(v["body"]["confirmed"], true);

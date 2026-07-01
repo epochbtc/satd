@@ -1402,7 +1402,28 @@ impl NodeEventStream for NodeEventStreamSvc {
                                 }
                                 _ => {}
                             }
-                            if tx_out.send(Ok(watch_match_to_proto(&edge, &m))).await.is_err() {
+                            // Attribute a script match back to the descriptor(s)
+                            // whose window it belongs to (empty for a direct
+                            // watch), looked up from this connection's watch-set.
+                            let descriptor_matches = match &m {
+                                WatchMatch::ScriptMatched { scripthash, .. } => {
+                                    let ws = watch_set.lock().unwrap_or_else(|p| p.into_inner());
+                                    ws.descriptor_attribution(scripthash)
+                                        .iter()
+                                        .map(|(d, branch, index)| pb::DescriptorMatch {
+                                            descriptor: d.to_string(),
+                                            branch: *branch,
+                                            derivation_index: *index,
+                                        })
+                                        .collect()
+                                }
+                                _ => Vec::new(),
+                            };
+                            if tx_out
+                                .send(Ok(watch_match_to_proto(&edge, &m, descriptor_matches)))
+                                .await
+                                .is_err()
+                            {
                                 return;
                             }
                         }
@@ -1553,7 +1574,7 @@ fn apply_control(
                     watch_set.add_descriptor(
                         principal,
                         d.descriptor.clone(),
-                        scripts.into_iter().map(|(_, sh)| sh),
+                        scripts,
                         |shs| {
                             handle.add_scripthashes(shs);
                         },
@@ -1669,13 +1690,11 @@ fn desired_from_proto(
         let sh = parse_scripthash(b).ok_or("scripthash")?;
         scripts.push((sh, s.min_values.get(i).copied().unwrap_or(0)));
     }
-    let mut descriptors: Vec<(String, Vec<[u8; 32]>)> = Vec::with_capacity(s.descriptors.len());
+    let mut descriptors: Vec<(String, crate::watchset::DescriptorWindow)> =
+        Vec::with_capacity(s.descriptors.len());
     for d in &s.descriptors {
         match crate::descriptor::expand_descriptor(&d.descriptor, d.start, d.gap_limit) {
-            Ok(shs) => descriptors.push((
-                d.descriptor.clone(),
-                shs.into_iter().map(|(_, sh)| sh).collect(),
-            )),
+            Ok(coords) => descriptors.push((d.descriptor.clone(), coords)),
             Err(e) => {
                 warn!(target: "events::grpc", error = %e, "SetWatchSet: rejecting snapshot for invalid descriptor");
                 return Err("descriptor");
@@ -1808,6 +1827,7 @@ fn parse_txid(b: &[u8]) -> Option<bitcoin::Txid> {
 fn watch_match_to_proto(
     edge: &node::events::EdgeIdentity,
     m: &node::events::WatchMatch,
+    descriptor_matches: Vec<pb::DescriptorMatch>,
 ) -> pb::NodeEvent {
     use bitcoin::hashes::Hash;
     use node::events::WatchMatch;
@@ -1842,6 +1862,7 @@ fn watch_match_to_proto(
                 is_output: *is_output,
                 index: *index,
                 confirmed: *confirmed,
+                descriptor_matches,
             });
             (cursor_from_height(*height, edge.instance_id), body)
         }
@@ -2259,6 +2280,7 @@ mod tests {
                 txid,
                 replacing_txid: rep,
             },
+            Vec::new(),
         );
         match ev.body.unwrap() {
             pb::node_event::Body::TxidReplaced(r) => {
@@ -2274,6 +2296,7 @@ mod tests {
                 txid,
                 reason: node::mempool::events::EvictReason::Expiry,
             },
+            Vec::new(),
         );
         match ev.body.unwrap() {
             pb::node_event::Body::TxidEvicted(r) => assert_eq!(r.reason, "expiry"),
@@ -2287,6 +2310,7 @@ mod tests {
                 depth: 3,
                 height: 100,
             },
+            Vec::new(),
         );
         match ev.body.unwrap() {
             pb::node_event::Body::TxidDepthReached(r) => {
@@ -2304,9 +2328,44 @@ mod tests {
                 depth: 6,
                 height: 100,
             },
+            Vec::new(),
         );
         match ev.body.unwrap() {
             pb::node_event::Body::TxidFinalized(r) => assert_eq!(r.depth, 6),
+            other => panic!("wrong body: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn script_match_carries_descriptor_attribution() {
+        use bitcoin::hashes::Hash;
+        use node::events::WatchMatch;
+        let e = edge();
+        let txid =
+            bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0x11; 32]));
+        let ev = watch_match_to_proto(
+            &e,
+            &WatchMatch::ScriptMatched {
+                scripthash: [0xaa; 32],
+                txid,
+                is_output: true,
+                index: 0,
+                confirmed: true,
+                height: Some(100),
+            },
+            vec![pb::DescriptorMatch {
+                descriptor: "wpkh(xpub)".into(),
+                branch: 1,
+                derivation_index: 7,
+            }],
+        );
+        match ev.body.unwrap() {
+            pb::node_event::Body::ScriptMatched(s) => {
+                assert_eq!(s.descriptor_matches.len(), 1);
+                assert_eq!(s.descriptor_matches[0].descriptor, "wpkh(xpub)");
+                assert_eq!(s.descriptor_matches[0].branch, 1);
+                assert_eq!(s.descriptor_matches[0].derivation_index, 7);
+            }
             other => panic!("wrong body: {other:?}"),
         }
     }

@@ -22,6 +22,24 @@ pub struct Outpoint {
     pub vout: u32,
 }
 
+/// Descriptor attribution for a [`ScriptMatched`](Event::ScriptMatched): which
+/// descriptor watch a matched scripthash belongs to, and the exact coordinate the
+/// server derived it at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DescriptorMatch {
+    /// The descriptor string the watch was registered with.
+    pub descriptor: String,
+    /// The 0-based BIP-389 multipath branch the matched script came from (`<0;1>`
+    /// → external = 0, change = 1; always 0 for a single-path descriptor).
+    pub branch: u32,
+    /// The absolute derivation index of the matched script — ready to use, no
+    /// `gap_limit` arithmetic. `(branch, derivation_index)` is exactly what the
+    /// server derived (correct for fixed and multipath descriptors alike); the
+    /// server still tracks no derivation progress — advancing your gap limit
+    /// remains your concern.
+    pub derivation_index: u32,
+}
+
 /// Why a transaction left the mempool by policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -199,6 +217,10 @@ pub enum Event {
         index: u32,
         /// `false` = mempool, `true` = confirmed.
         confirmed: bool,
+        /// Descriptor attribution: the descriptor watch(es) this scripthash
+        /// belongs to, if it was registered via `add_descriptor`. Empty for a
+        /// directly-watched script. See [`DescriptorMatch`].
+        descriptors: Vec<DescriptorMatch>,
     },
     /// A watched txid appeared in the mempool or a connected block.
     TxidMatched {
@@ -410,6 +432,15 @@ impl From<pb::NodeEvent> for Event {
                 is_output: s.is_output,
                 index: s.index,
                 confirmed: s.confirmed,
+                descriptors: s
+                    .descriptor_matches
+                    .into_iter()
+                    .map(|d| DescriptorMatch {
+                        descriptor: d.descriptor,
+                        branch: d.branch,
+                        derivation_index: d.derivation_index,
+                    })
+                    .collect(),
             },
             Body::TxidMatched(t) => Event::TxidMatched {
                 txid: t.txid,
