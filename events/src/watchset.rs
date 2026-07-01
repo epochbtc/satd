@@ -408,9 +408,18 @@ impl WatchSet {
             }
             target_floors.insert(*sh, *floor);
         }
-        // Descriptors: dedup each window, add an owner per membership.
+        // Descriptors: dedup each window, add an owner per membership. A descriptor
+        // *string* identifies one watch (the `descriptors` map is keyed by it), so
+        // a duplicate entry in the snapshot is the same descriptor and is counted
+        // ONCE — first occurrence wins. Processing it twice would `+1` each script's
+        // owner count per occurrence while only one membership vec survives the map
+        // insert, inflating `script_owners` above the memberships a later
+        // `RemoveDescriptor` can decrement and stranding live scripthash watches.
         let mut target_descriptors: HashMap<String, Vec<Scripthash>> = HashMap::new();
         for (desc, shs) in &desired.descriptors {
+            if target_descriptors.contains_key(desc) {
+                continue;
+            }
             let mut seen = HashSet::new();
             let mut members = Vec::new();
             for sh in shs {
@@ -1570,6 +1579,45 @@ mod tests {
         assert_eq!(q.current("tenant"), 1, "no re-charge for the kept script");
         assert!(ws.descriptors.contains_key("d") && !ws.script_direct.contains(&sh(1)));
         assert!(ws.scripts.contains_key(&sh(1)), "still effectively watched");
+    }
+
+    #[test]
+    fn replace_dedups_a_duplicate_descriptor_so_removedescriptor_fully_clears() {
+        // A snapshot listing the same descriptor string twice is the same watch:
+        // it must be counted once. Otherwise `script_owners` is inflated (+1 per
+        // occurrence) while only one membership vec survives, and a later
+        // RemoveDescriptor decrements ownership once — leaving the scripthash
+        // stranded as a live watch that can't be cleared.
+        let (p, acct) = tenant(10);
+        let q = acct.quota();
+        let mut ws = WatchSet::default();
+        let desired = DesiredWatchSet {
+            scripts: Vec::new(),
+            descriptors: vec![
+                ("d".to_string(), vec![sh(1), sh(2)]),
+                ("d".to_string(), vec![sh(1), sh(2)]),
+            ],
+            outpoints: Vec::new(),
+            lifecycles: Vec::new(),
+            depth_alarms: Vec::new(),
+            prefixes: Vec::new(),
+        };
+        let outcome = ws.replace(Some(&p), desired, &MockReg::default());
+        assert!(
+            matches!(outcome, ReplaceOutcome::Accepted { added: 2, removed: 0, unchanged: 0 }),
+            "duplicate descriptor counts its scripts once, got {outcome:?}",
+        );
+        assert_eq!(q.current("tenant"), 2, "two scripthashes, two units — not four");
+        assert_eq!(ws.script_owners.get(&sh(1)), Some(&1), "one owner, not two");
+        assert_eq!(ws.script_owners.get(&sh(2)), Some(&1));
+
+        // The single RemoveDescriptor now fully clears both scripthashes.
+        let mut unregistered = Vec::new();
+        ws.remove_descriptor("d", |s| unregistered.extend_from_slice(s));
+        assert!(ws.scripts.is_empty(), "RemoveDescriptor clears the whole descriptor's coverage");
+        assert!(ws.script_owners.is_empty(), "no stranded owners");
+        assert_eq!(unregistered.len(), 2, "both scripthashes unregistered from the matcher");
+        assert_eq!(q.current("tenant"), 0, "all units released");
     }
 
     #[test]
