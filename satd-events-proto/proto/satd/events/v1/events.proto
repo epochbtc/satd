@@ -188,6 +188,23 @@ message ScriptMatched {
   bool   is_output  = 3;    // true = funding (output); false = spending (input)
   uint32 index      = 4;    // vout if is_output, else vin
   bool   confirmed  = 5;
+  // Attribution: the descriptor watch(es) this scripthash belongs to, if it was
+  // registered via AddDescriptor. Empty for a directly-watched script. More than
+  // one entry when the script falls in more than one descriptor's window. Each
+  // entry carries the EXACT coordinate the server derived the script at: `branch`
+  // is the 0-based BIP-389 multipath branch (`<0;1>` → external = 0, change = 1;
+  // 0 for a single-path descriptor) and `derivation_index` is the absolute
+  // derivation index. No positional arithmetic and no `gap_limit` assumption is
+  // required — correct for fixed and multipath descriptors alike. Gap-limit
+  // advancement remains a client concern (§11); the server tracks no derivation
+  // progress, it only reports where a matched script sits.
+  repeated DescriptorMatch descriptor_matches = 6;
+}
+
+message DescriptorMatch {
+  string descriptor       = 1; // the descriptor string the client registered
+  uint32 branch           = 2; // 0-based BIP-389 multipath branch (0 if single-path)
+  uint32 derivation_index = 3; // absolute derivation index of the matched script
 }
 
 // A watched transaction id appeared in the mempool or a connected block.

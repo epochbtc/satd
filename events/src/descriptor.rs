@@ -64,8 +64,12 @@ pub enum DescriptorError {
     Derive(u32, String),
 }
 
-/// Expand a descriptor into `(index, scripthash)` pairs for derivation
-/// indices `[start, start + count)`.
+/// Expand a descriptor into `(branch, index, scripthash)` tuples for derivation
+/// indices `[start, start + count)`. `branch` is the 0-based BIP-389 multipath
+/// branch (`<0;1>` → external = 0, change = 1; always 0 for a single-path
+/// descriptor); `index` is the absolute derivation index. Together they are the
+/// exact coordinate the match path attributes back to the client — no positional
+/// arithmetic, correct for fixed and multipath descriptors alike.
 ///
 /// - A **ranged** descriptor (one with a `/*` wildcard) yields up to
 ///   `count` entries, one per index.
@@ -90,7 +94,7 @@ pub fn expand_descriptor(
     desc: &str,
     start: u32,
     count: u32,
-) -> Result<Vec<(u32, Scripthash)>, DescriptorError> {
+) -> Result<Vec<(u32, u32, Scripthash)>, DescriptorError> {
     let descriptor = Descriptor::<DescriptorPublicKey>::from_str(desc)
         .map_err(|e| DescriptorError::Parse(e.to_string()))?;
     // BIP-389: a multipath descriptor packs N single-path branches into one
@@ -120,8 +124,8 @@ pub fn expand_descriptor(
         vec![descriptor]
     };
     let mut out = Vec::new();
-    for branch in &single {
-        expand_single(branch, start, count, &mut out)?;
+    for (branch, branch_desc) in single.iter().enumerate() {
+        expand_single(branch_desc, branch as u32, start, count, &mut out)?;
     }
     Ok(out)
 }
@@ -146,12 +150,14 @@ fn multipath_branch_count(desc: &Descriptor<DescriptorPublicKey>) -> usize {
 }
 
 /// Expand one single-path (non-multipath) descriptor over `[start, start+count)`,
-/// appending `(index, scripthash)` pairs to `out`.
+/// appending `(branch, index, scripthash)` tuples to `out`. `branch` is the
+/// caller-assigned multipath branch position this single descriptor came from.
 fn expand_single(
     descriptor: &Descriptor<DescriptorPublicKey>,
+    branch: u32,
     start: u32,
     count: u32,
-    out: &mut Vec<(u32, Scripthash)>,
+    out: &mut Vec<(u32, u32, Scripthash)>,
 ) -> Result<(), DescriptorError> {
     // Reject a hardened wildcard up front: such a descriptor parses, but
     // `at_derivation_index` PANICS on it (a hardened child cannot be derived
@@ -181,7 +187,7 @@ fn expand_single(
             .map_err(|e| DescriptorError::Derive(idx, e.to_string()))?;
         let spk = definite.script_pubkey();
         let sh = sha256::Hash::hash(spk.as_bytes()).to_byte_array();
-        out.push((idx, sh));
+        out.push((branch, idx, sh));
     }
     Ok(())
 }
@@ -210,12 +216,13 @@ mod tests {
     fn expands_ranged_descriptor_to_distinct_scripthashes() {
         let out = expand_descriptor(RANGED_WPKH, 0, 5).expect("expand");
         assert_eq!(out.len(), 5);
-        // Indices are sequential from start.
-        for (i, (idx, _)) in out.iter().enumerate() {
+        // A single-path descriptor is all branch 0; indices are sequential.
+        for (i, (branch, idx, _)) in out.iter().enumerate() {
+            assert_eq!(*branch, 0);
             assert_eq!(*idx, i as u32);
         }
         // Each derived script is distinct.
-        let mut hashes: Vec<_> = out.iter().map(|(_, sh)| *sh).collect();
+        let mut hashes: Vec<_> = out.iter().map(|(_, _, sh)| *sh).collect();
         hashes.sort();
         hashes.dedup();
         assert_eq!(hashes.len(), 5, "derived scripthashes must be distinct");
@@ -226,12 +233,12 @@ mod tests {
         let a = expand_descriptor(RANGED_WPKH, 0, 3).unwrap();
         let b = expand_descriptor(RANGED_WPKH, 0, 3).unwrap();
         assert_eq!(a, b, "same descriptor + window → same scripthashes");
-        // A shifted window starts where asked.
+        // A shifted window starts where asked (tuple is (branch, index, sh)).
         let shifted = expand_descriptor(RANGED_WPKH, 10, 2).unwrap();
-        assert_eq!(shifted[0].0, 10);
-        assert_eq!(shifted[1].0, 11);
+        assert_eq!(shifted[0].1, 10);
+        assert_eq!(shifted[1].1, 11);
         // Index 0 in window-from-0 differs from index 10.
-        assert_ne!(a[0].1, shifted[0].1);
+        assert_ne!(a[0].2, shifted[0].2);
     }
 
     #[test]
@@ -287,16 +294,23 @@ mod tests {
             5,
         )
         .unwrap();
-        assert_eq!(&out[..5], &single0[..], "first branch == /0/* single-path");
-        assert_eq!(&out[5..], &single1[..], "second branch == /1/* single-path");
+        // Compare (index, scripthash) — the single-path expansions are branch 0,
+        // while `out`'s branches are 0 and 1 (that branch tag is the whole point).
+        let ix = |v: &[(u32, u32, Scripthash)]| -> Vec<(u32, Scripthash)> {
+            v.iter().map(|(_, i, s)| (*i, *s)).collect()
+        };
+        assert_eq!(ix(&out[..5]), ix(&single0), "first branch == /0/* single-path");
+        assert_eq!(ix(&out[5..]), ix(&single1), "second branch == /1/* single-path");
+        assert!(out[..5].iter().all(|(b, _, _)| *b == 0), "first 5 are branch 0");
+        assert!(out[5..].iter().all(|(b, _, _)| *b == 1), "last 5 are branch 1");
         assert_ne!(
-            &out[..5],
-            &out[5..],
+            ix(&out[..5]),
+            ix(&out[5..]),
             "external and change branches derive distinct scripts"
         );
 
         // All ten scripthashes are distinct (no branch/index collision).
-        let mut hashes: Vec<_> = out.iter().map(|(_, sh)| *sh).collect();
+        let mut hashes: Vec<_> = out.iter().map(|(_, _, sh)| *sh).collect();
         hashes.sort();
         hashes.dedup();
         assert_eq!(hashes.len(), 10, "all derived scripthashes distinct");
@@ -351,7 +365,11 @@ mod tests {
         let fixed = "wpkh(xpub6BosfCnifzxcFwrSzQiqu2DBVTshkCXacvNsWGYJVVhhawA7d4R5WSWGFNbi8Aw6ZRc1brxMyWMzG3DSSSSoekkudhUd9yLb6qx39T9nMdj/<0;1>/0)";
         let out = expand_descriptor(fixed, 0, 20).expect("expand fixed multipath");
         assert_eq!(out.len(), 2, "one script per branch, count ignored");
-        assert_ne!(out[0].1, out[1].1, "the two branches differ");
+        // The branch tag is explicit — the exact case the old positional
+        // window_offset formula (offset/gap_limit) got wrong.
+        assert_eq!((out[0].0, out[0].1), (0, 0), "branch 0 at index 0");
+        assert_eq!((out[1].0, out[1].1), (1, 0), "branch 1 at index 0");
+        assert_ne!(out[0].2, out[1].2, "the two branches derive distinct scripts");
     }
 
     #[test]
@@ -361,7 +379,7 @@ mod tests {
         let tr = "tr(xpub6BosfCnifzxcFwrSzQiqu2DBVTshkCXacvNsWGYJVVhhawA7d4R5WSWGFNbi8Aw6ZRc1brxMyWMzG3DSSSSoekkudhUd9yLb6qx39T9nMdj/<0;1>/*)";
         let out = expand_descriptor(tr, 0, 4).expect("expand tr multipath");
         assert_eq!(out.len(), 8, "2 branches × window of 4");
-        let mut hashes: Vec<_> = out.iter().map(|(_, sh)| *sh).collect();
+        let mut hashes: Vec<_> = out.iter().map(|(_, _, sh)| *sh).collect();
         hashes.sort();
         hashes.dedup();
         assert_eq!(hashes.len(), 8, "all taproot scripthashes distinct");

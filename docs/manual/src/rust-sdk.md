@@ -241,7 +241,9 @@ watch.add_tx_lifecycle([txid], AutoClose::AtDepth(6)).await?;
 
 loop {
     match watch.next().await? {
-        Event::ScriptMatched { txid, .. } => { /* ... */ }
+        // `descriptors` attributes a descriptor-derived hit back to its
+        // descriptor + (branch, derivation_index) (empty for a direct watch).
+        Event::ScriptMatched { txid, descriptors, .. } => { let _ = descriptors; }
         Event::CursorAccepted { clamped: true, earliest_replayed, .. } => {
             // Authoritative gap: full-resync confirmed history below
             // `earliest_replayed` from another source.

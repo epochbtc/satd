@@ -274,6 +274,13 @@ message ScriptMatched {
   bool   is_output  = 3;      // true = funding (an output pays the script); false = spending
   uint32 index      = 4;      // vout if is_output else vin
   bool   confirmed  = 5;
+  repeated DescriptorMatch descriptor_matches = 6;  // descriptor attribution (§11.1); empty for a direct watch
+}
+
+message DescriptorMatch {
+  string descriptor       = 1;   // the descriptor string the client registered
+  uint32 branch           = 2;   // 0-based BIP-389 multipath branch (external=0, change=1; 0 if single-path)
+  uint32 derivation_index = 3;   // absolute derivation index of the matched script
 }
 
 // AddScripts carries an optional per-scripthash min_value floor (§7.2.1).
@@ -745,6 +752,30 @@ unsolicited nudge. The client owns address-generation policy and drives the wind
 by advancing `start` (or dropping it with `RemoveDescriptor`); the server only
 expands, watches, reconciles, and releases. The `DescriptorNeedsAddresses` body
 (field 15) is reserved for wire-compat but is never emitted.
+
+### 11.1 Match attribution
+
+A `ScriptMatched` for a descriptor-derived script carries
+`descriptor_matches` — the descriptor(s) whose window currently contains that
+scripthash, each with the exact `(branch, derivation_index)` the server derived
+it at. This saves a descriptor consumer from maintaining its own reverse
+`scripthash → descriptor` index (the work it offloaded to the server by sending a
+descriptor in the first place): a deposit hit can be routed to the right account
+directly. It is empty for a directly-watched (`AddScripts`) script, and carries
+more than one entry when the script falls in more than one descriptor's window
+(overlap). The server keeps a per-connection reverse index over the retained
+membership (§11) to attach it.
+
+`branch` is the 0-based BIP-389 multipath branch (`<0;1>` → external = 0,
+change = 1; always 0 for a single-path descriptor) and `derivation_index` is the
+absolute index — together the coordinate the server actually derived the script
+at, ready to use with **no `gap_limit` arithmetic**. This is correct for every
+descriptor shape, including fixed (non-wildcard) and multipath descriptors where
+a positional offset could not be reversed. Attribution stays consistent with the
+gap-limit-is-a-client-concern principle (§11): it is **reactive** (emitted only on
+a match, never an unsolicited "derive more" nudge) and the server still tracks no
+derivation *progress* — it reports only where a matched script sits, never
+advancing a gap limit on the client's behalf.
 
 ### 11.2 Atomic whole-set replace (`SetWatchSet`)
 

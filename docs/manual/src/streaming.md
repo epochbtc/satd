@@ -66,7 +66,11 @@ without protocol breakage.
 Match events delivered on the per-subscriber `Watch` channel include:
 
 - `OutpointSpent` — an outpoint was spent (in mempool or a connected block).
-- `ScriptMatched` — a script was funded or spent (both sides).
+- `ScriptMatched` — a script was funded or spent (both sides). For a
+  descriptor-derived script it carries `descriptor_matches`: which descriptor +
+  the exact `(branch, derivation_index)` it was derived at (empty for a
+  directly-watched script), so a multi-descriptor consumer can route a hit
+  without its own reverse index.
 - `TxidMatched` / `TxidReplaced` / `TxidEvicted` / `TxidUnconfirmed` /
   `TxidDepthReached` / `TxidFinalized` — transaction lifecycle and
   confirmation-depth alarms.
