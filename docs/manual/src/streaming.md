@@ -16,6 +16,8 @@ This chapter is the integrator guide. The authoritative, wire-level protocol
 specification — the `satd.events.v1` protobuf, frame formats, and cursor
 semantics — is
 [`docs/api/streaming.md`](https://github.com/epochbtc/satd/blob/master/docs/api/streaming.md).
+For a step-by-step onramp before this reference, start with
+[Getting Started: Consuming Events](streaming-tutorial.md).
 
 ## The base primitive: outpoint subscription
 

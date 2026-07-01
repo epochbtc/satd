@@ -13,6 +13,10 @@ consumers use the gRPC/WebSocket surface directly against the
 [`.proto`](https://github.com/epochbtc/satd/blob/master/satd-events-proto/proto/satd/events/v1/events.proto)
 contract.
 
+> New here? [Getting Started: Consuming Events](streaming-tutorial.md) walks the
+> whole arc — connect, firehose, durable watch, prefix privacy — one runnable
+> step at a time. This chapter is the per-method reference it links back to.
+
 ## Crate layout
 
 The wire types are codegen'd once in `satd-events-proto` (a thin tonic/prost

@@ -18,6 +18,7 @@
 
 - [Esplora REST API](esplora.md)
 - [Electrum Protocol Server](electrum.md)
+- [Getting Started: Consuming Events](streaming-tutorial.md)
 - [Streaming Consumption API](streaming.md)
 - [Rust SDK (`satd-events-client`)](rust-sdk.md)
 - [MCP Server](mcp.md)
