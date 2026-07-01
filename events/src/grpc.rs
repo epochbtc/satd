@@ -1655,6 +1655,13 @@ fn desired_from_proto(
     prefix_bounds: (u8, u8),
 ) -> Result<crate::watchset::DesiredWatchSet, &'static str> {
     let (prefix_min_bits, prefix_max_bits) = prefix_bounds;
+    // `min_values` is either empty (no floors) or exactly parallel to
+    // `scripthashes`. A non-empty length mismatch is malformed: `get(i)` would
+    // otherwise silently clear floors (too few) or ignore them (too many),
+    // changing filters the client did not ask to change.
+    if !s.min_values.is_empty() && s.min_values.len() != s.scripthashes.len() {
+        return Err("min_values length");
+    }
     let mut scripts: Vec<([u8; 32], u64)> = Vec::with_capacity(s.scripthashes.len());
     for (i, b) in s.scripthashes.iter().enumerate() {
         let sh = parse_scripthash(b).ok_or("scripthash")?;
@@ -2188,6 +2195,29 @@ mod tests {
             ..Default::default()
         };
         assert!(desired_from_proto(&bad_depth, (8, 32)).is_err(), "depth 0 rejects snapshot");
+
+        // Non-empty min_values must be exactly parallel to scripthashes: too few
+        // (would silently clear floors) and too many (silently ignored) are both
+        // malformed. Empty is fine (no floors).
+        let too_few = pb::SetWatchSet {
+            scripthashes: vec![vec![0x11; 32], vec![0x22; 32]],
+            min_values: vec![5],
+            ..Default::default()
+        };
+        assert!(desired_from_proto(&too_few, (8, 32)).is_err(), "too few floors rejects snapshot");
+        let too_many = pb::SetWatchSet {
+            scripthashes: vec![vec![0x11; 32]],
+            min_values: vec![5, 6],
+            ..Default::default()
+        };
+        assert!(desired_from_proto(&too_many, (8, 32)).is_err(), "too many floors rejects snapshot");
+        let parallel = pb::SetWatchSet {
+            scripthashes: vec![vec![0x11; 32], vec![0x22; 32]],
+            min_values: vec![5, 6],
+            ..Default::default()
+        };
+        let d = desired_from_proto(&parallel, (8, 32)).expect("parallel floors build");
+        assert_eq!(d.scripts, vec![([0x11; 32], 5), ([0x22; 32], 6)]);
     }
 
     #[test]

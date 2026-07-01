@@ -854,6 +854,12 @@ fn apply_ws_control(
         // `Result` and turn the first failure into a `Malformed` outcome, leaving
         // the live set untouched (`replace` is never called).
         let desired: Result<crate::watchset::DesiredWatchSet, &'static str> = (|| {
+            // `min_values` is empty (no floors) or exactly parallel to
+            // `scripthashes`; a non-empty length mismatch is malformed (see the
+            // gRPC `desired_from_proto`).
+            if !min_values.is_empty() && min_values.len() != scripthashes.len() {
+                return Err("min_values length");
+            }
             let mut scripts: Vec<([u8; 32], u64)> = Vec::with_capacity(scripthashes.len());
             for (i, s) in scripthashes.iter().enumerate() {
                 let sh = parse_ws_scripthash(s).ok_or("scripthash")?;
