@@ -266,10 +266,18 @@ impl WatchSetMirror {
         let mut c = ReloadCounts::default();
 
         // Category filter (not a watch *item*, so it does not move the counts).
-        if target.categories != self.categories
-            && let Some(cat) = target.categories
-        {
-            adds.push(Msg::SetCategories(pb::SetCategories { categories: cat }));
+        // `None` and `Some(0)` both mean "all categories" — the wire spells "all"
+        // as `SetCategories { categories: 0 }` (both carriers map 0 → u32::MAX).
+        // Compare the *effective* masks, not the raw `Option`: a reload that
+        // relaxes the filter (`Some(n)` → truth has no filter) must emit an
+        // explicit `SetCategories { 0 }` reset, or the mirror would adopt "no
+        // filter" while the live server stayed filtered until the next reconnect,
+        // silently dropping the now-in-scope events. A no-op `None` ↔ `Some(0)`
+        // change emits nothing.
+        let target_mask = target.categories.unwrap_or(0);
+        let live_mask = self.categories.unwrap_or(0);
+        if target_mask != live_mask {
+            adds.push(Msg::SetCategories(pb::SetCategories { categories: target_mask }));
         }
 
         // Scripts: new or changed-floor → AddScripts; vanished → RemoveScripts.
@@ -1882,6 +1890,45 @@ mod tests {
         assert!(msgs.is_empty(), "no churn when nothing changed");
         assert_eq!((counts.added, counts.removed), (0, 0));
         assert_eq!(counts.unchanged, 2);
+    }
+
+    #[test]
+    fn reconcile_categories_relaxation_emits_an_explicit_reset() {
+        // Live server is filtered to CHAIN; truth (the reload target) has no
+        // category filter. reconcile must emit SetCategories{0} ("all") so the
+        // relaxation takes effect live — not silently leave the server filtered.
+        let mut live = WatchSetMirror::default();
+        live.set_categories(crate::Categories::CHAIN);
+        let target = WatchSetMirror::default(); // no filter
+
+        let (msgs, _) = live.reconcile_to(&target);
+        assert_eq!(
+            msgs.iter()
+                .filter_map(|m| match m {
+                    Msg::SetCategories(s) => Some(s.categories),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![0],
+            "relaxing a filter to all-categories emits SetCategories{{0}}",
+        );
+
+        // Setting a filter from none, and changing between filters, still emit.
+        let none = WatchSetMirror::default();
+        let mut chain = WatchSetMirror::default();
+        chain.set_categories(crate::Categories::CHAIN);
+        assert!(
+            matches!(none.reconcile_to(&chain).0.first(), Some(Msg::SetCategories(s)) if s.categories == crate::Categories::CHAIN),
+            "setting a filter from unfiltered emits it",
+        );
+
+        // None ↔ Some(0) are both "all categories": no spurious message.
+        let mut all = WatchSetMirror::default();
+        all.set_categories(0);
+        assert!(
+            !none.reconcile_to(&all).0.iter().any(|m| matches!(m, Msg::SetCategories(_))),
+            "None and Some(0) are the same effective filter — no reset emitted",
+        );
     }
 
     #[tokio::test]
