@@ -22,7 +22,11 @@
 //!   triggers an exponential-backoff reconnect (the shared [`Backoff`]).
 //! - **Watch-set replay** — the mirrored watch-set (scripts + floors, outpoints,
 //!   tx lifecycles, depth alarms, descriptors, prefixes, category filter) is
-//!   re-sent on every (re)connect, in place of a manual re-add.
+//!   re-sent on every (re)connect, in place of a manual re-add. Integrators whose
+//!   watch-set has a durable source-of-truth outside the wrapper can instead
+//!   install a [`watch_set_loader`](ResilientWatchConfig::watch_set_loader) that
+//!   rebuilds the canonical set from that truth on every (re)connect — closing
+//!   the restart-loses-mirror and truth-drift-during-disconnect gaps.
 //! - **Re-anchor in place** — after replay it `set_cursor`s to the persisted
 //!   high-water and resumes confirmed replay. Transient rejects
 //!   (`RateLimited`, `ConcurrentReanchor`) are backed off and retried in place;
@@ -32,7 +36,9 @@
 //!   shared [`CursorStore`], so a resume survives reconnects and restarts.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 
 use satd_events_proto::v1 as pb;
 use satd_events_proto::v1::subscribe_control::Msg;
@@ -41,6 +47,18 @@ use crate::client::{validate_prefix, AutoClose, EventStream, StreamClient, Watch
 use crate::error::StreamError;
 use crate::event::{Cursor, CursorRejectReason, Event};
 use crate::resilience::{Backoff, CursorStore, NoopCursorStore};
+
+/// A boxed integrator error returned by a watch-set loader.
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// The stored watch-set loader closure: takes a fresh [`WatchSetBuilder`],
+/// populates it (typically from a durable source-of-truth), and resolves to
+/// `Ok(())` once the canonical set is declared. Boxed so the loader can be any
+/// async closure the integrator supplies.
+type WatchSetLoaderFn =
+    dyn Fn(WatchSetBuilder) -> Pin<Box<dyn Future<Output = Result<(), BoxError>> + Send>>
+        + Send
+        + Sync;
 
 /// A scripthash (`sha256(scriptPubKey)`).
 type Scripthash = [u8; 32];
@@ -230,6 +248,101 @@ impl WatchSetMirror {
     }
 }
 
+/// The canonical watch-set declared by a [`watch_set_loader`] on every
+/// (re)connect. It is a thin recording facade over a fresh [`WatchSetMirror`]:
+/// each `add_*` / [`set_categories`](Self::set_categories) call records interest
+/// the way the matching [`ResilientWatch`] method would, so the populated set
+/// renders to exactly the same control messages a manual replay would. The
+/// wrapper adopts the builder's set as the mirror once the loader returns, then
+/// re-registers it and re-anchors as usual.
+///
+/// Only declarative `add_*` methods are exposed (no `remove_*`): the loader
+/// builds a complete set from the integrator's source-of-truth into an empty
+/// mirror, where a removal has nothing to act on. Methods are synchronous —
+/// they only record — so a loader does its own `await`ing against its truth
+/// (DB, config, upstream service) between calls.
+///
+/// [`watch_set_loader`]: ResilientWatchConfig::watch_set_loader
+pub struct WatchSetBuilder {
+    mirror: Arc<Mutex<WatchSetMirror>>,
+}
+
+impl WatchSetBuilder {
+    fn with(&self, f: impl FnOnce(&mut WatchSetMirror)) {
+        // The mutex is only contended if a loader clones the builder across
+        // tasks; a poisoned lock means a prior loader panicked mid-build — recover
+        // the inner mirror rather than propagating the panic into the reconnect.
+        let mut m = self.mirror.lock().unwrap_or_else(|p| p.into_inner());
+        f(&mut m);
+    }
+
+    /// Declare scripthashes (each `sha256(scriptPubKey)`) with an optional
+    /// per-script `min_value` floor. See [`ResilientWatch::add_scripts`].
+    pub fn add_scripts(&self, items: impl IntoIterator<Item = (Scripthash, Option<u64>)>) {
+        let items: Vec<_> = items.into_iter().collect();
+        self.with(|m| m.add_scripts(&items));
+    }
+
+    /// Declare outpoints (`txid:vout`). See [`ResilientWatch::add_outpoints`].
+    pub fn add_outpoints(&self, outpoints: impl IntoIterator<Item = (Txid, u32)>) {
+        let items: Vec<_> = outpoints.into_iter().collect();
+        self.with(|m| m.add_outpoints(&items));
+    }
+
+    /// Declare lifecycle watches on txids. See [`ResilientWatch::add_tx_lifecycle`].
+    pub fn add_tx_lifecycle(&self, txids: impl IntoIterator<Item = Txid>, auto_close: AutoClose) {
+        let txids: Vec<_> = txids.into_iter().collect();
+        if txids.is_empty() {
+            return;
+        }
+        self.with(|m| m.add_tx_lifecycle(&txids, auto_close));
+    }
+
+    /// Arm single-shot depth alarms over the cross product of `txids` and
+    /// `depths` (depths `< 1` dropped). See [`ResilientWatch::add_depth_alarms`].
+    pub fn add_depth_alarms(
+        &self,
+        txids: impl IntoIterator<Item = Txid>,
+        depths: impl IntoIterator<Item = u32>,
+    ) {
+        let txids: Vec<_> = txids.into_iter().collect();
+        let depths: Vec<u32> = depths.into_iter().filter(|d| *d >= 1).collect();
+        if txids.is_empty() || depths.is_empty() {
+            return;
+        }
+        let pairs = cross_product(&txids, &depths);
+        self.with(|m| m.add_depth_alarms(&pairs));
+    }
+
+    /// Declare a public output descriptor's `(gap_limit, start)` watch window.
+    /// See [`ResilientWatch::add_descriptor`].
+    pub fn add_descriptor(&self, descriptor: impl Into<String>, gap_limit: u32, start: u32) {
+        let descriptor = descriptor.into();
+        self.with(|m| m.add_descriptor(descriptor, gap_limit, start));
+    }
+
+    /// Declare script-prefix buckets (validated client-side, same as the live
+    /// path). An invalid `(prefix, bits)` aborts the load with
+    /// [`StreamError::InvalidArgument`], which the loader propagates as a
+    /// (retryable) loader failure. See [`ResilientWatch::add_script_prefixes`].
+    pub fn add_script_prefixes(
+        &self,
+        prefixes: impl IntoIterator<Item = (Vec<u8>, u32)>,
+    ) -> Result<(), StreamError> {
+        let validated = validate_prefixes(prefixes)?;
+        if validated.is_empty() {
+            return Ok(());
+        }
+        self.with(|m| m.add_prefixes(&validated));
+        Ok(())
+    }
+
+    /// Declare the live category filter. See [`ResilientWatch::set_categories`].
+    pub fn set_categories(&self, categories: u32) {
+        self.with(|m| m.set_categories(categories));
+    }
+}
+
 /// Knobs for [`StreamClient::resilient_watch`]. Reuses the [`Backoff`] and
 /// [`CursorStore`] from the [`ResilientSubscription`](crate::ResilientSubscription)
 /// resilience layer.
@@ -240,6 +353,10 @@ pub struct ResilientWatchConfig {
     pub cursor_store: Arc<dyn CursorStore>,
     /// Initial resume anchor used on the first connect when the store is empty.
     pub from_cursor: Option<Cursor>,
+    /// Optional canonical watch-set loader. When set, it is run on every
+    /// (re)connect to rebuild the watch-set from the integrator's
+    /// source-of-truth (see [`watch_set_loader`](Self::watch_set_loader)).
+    pub(crate) watch_set_loader: Option<Arc<WatchSetLoaderFn>>,
 }
 
 impl Default for ResilientWatchConfig {
@@ -248,6 +365,7 @@ impl Default for ResilientWatchConfig {
             backoff: Backoff::default(),
             cursor_store: Arc::new(NoopCursorStore),
             from_cursor: None,
+            watch_set_loader: None,
         }
     }
 }
@@ -258,6 +376,7 @@ impl std::fmt::Debug for ResilientWatchConfig {
             .field("backoff", &self.backoff)
             .field("cursor_store", &"<dyn CursorStore>")
             .field("from_cursor", &self.from_cursor)
+            .field("watch_set_loader", &self.watch_set_loader.as_ref().map(|_| "<loader>"))
             .finish()
     }
 }
@@ -285,6 +404,67 @@ impl ResilientWatchConfig {
     /// persisted cursor).
     pub fn from_cursor(mut self, cursor: Cursor) -> Self {
         self.from_cursor = Some(cursor);
+        self
+    }
+
+    /// Install a canonical watch-set loader for integrators whose watch-set has
+    /// a durable source-of-truth (a DB, a config file, an upstream service)
+    /// outside the wrapper.
+    ///
+    /// Without a loader, [`ResilientWatch`] re-registers its in-memory mirror of
+    /// the `add_*` / `remove_*` calls made through it — correct when the
+    /// watch-set is built once at startup and never drifts, but the mirror is
+    /// empty after a process restart and goes stale if the truth changes while
+    /// the stream is down. With a loader, the mirror is treated as a *cache* of
+    /// the external truth:
+    ///
+    /// - The loader runs once after **every** successful (re)connect, **before**
+    ///   the consumer's event stream resumes — so the first events pumped after
+    ///   a reconnect already land on a fully-populated subscription. It receives
+    ///   a fresh [`WatchSetBuilder`] and declares the canonical set into it
+    ///   (typically by querying its truth with its own `await`s between calls).
+    /// - On return, the builder's set **replaces** the mirror: it is canonical.
+    ///   In-process `add_*` / `remove_*` calls still mutate the mirror and send
+    ///   live, but the next reconnect re-derives the set from the loader, so the
+    ///   integrator's truth — not the accumulated in-process edits — is the
+    ///   record across reconnects (this is what closes the restart-loses-mirror
+    ///   and truth-drift-during-disconnect gaps).
+    /// - A loader error is **transient**: it maps to
+    ///   [`StreamError::WatchSetLoader`], which the reconnect loop backs off and
+    ///   retries on the next connect rather than surfacing — a momentary failure
+    ///   of the integrator's truth must not crash a consumer whose contract is
+    ///   at-least-once. A *permanent* loader error (a config typo, a closure that
+    ///   always fails) is indistinguishable from a transient one and so is retried
+    ///   indefinitely: with the default backoff (`max_retries: None`) the stream
+    ///   never resumes and [`next`](ResilientWatch::next) simply never yields.
+    ///   Set [`Backoff::max_retries`](crate::Backoff::max_retries) if you need a
+    ///   permanently-failing loader to surface a terminal error instead of
+    ///   retrying forever. The loader should return `Err` rather than panic — a
+    ///   panic unwinds through the reconnect and aborts the current `next()`; it
+    ///   is not caught.
+    ///
+    /// The resume cursor is independent of the watch-set: it still comes from the
+    /// [`cursor_store`](Self::cursor_store) / [`from_cursor`](Self::from_cursor)
+    /// and the re-anchor runs after the loaded set is registered, exactly as
+    /// without a loader.
+    ///
+    /// ```no_run
+    /// # use satd_events_client::{ResilientWatchConfig, WatchSetBuilder};
+    /// # async fn rows() -> Result<Vec<([u8; 32], Option<u64>)>, Box<dyn std::error::Error + Send + Sync>> { Ok(vec![]) }
+    /// let config = ResilientWatchConfig::new().watch_set_loader(|builder: WatchSetBuilder| async move {
+    ///     // Query the durable source-of-truth and declare the canonical set.
+    ///     let scripts = rows().await?;
+    ///     builder.add_scripts(scripts);
+    ///     Ok(())
+    /// });
+    /// # let _ = config;
+    /// ```
+    pub fn watch_set_loader<F, Fut>(mut self, loader: F) -> Self
+    where
+        F: Fn(WatchSetBuilder) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), BoxError>> + Send + 'static,
+    {
+        self.watch_set_loader = Some(Arc::new(move |b| Box::pin(loader(b))));
         self
     }
 }
@@ -757,6 +937,22 @@ impl ResilientWatch {
     async fn connect(&mut self) -> Result<(), StreamError> {
         self.seed_resume()?;
         let (handle, stream) = self.client.watch().await?;
+        // When a loader is configured it is canonical: rebuild the watch-set from
+        // the integrator's source-of-truth into a fresh mirror, then adopt it.
+        // This runs before the watch-set is registered (below) and before any
+        // event is pumped, so the first events after a reconnect land on a fully
+        // populated subscription. A loader error is a transient reconnect-level
+        // condition (see `is_reconnectable`), so a freshly-opened stream we will
+        // not use is dropped here and the next attempt retries the load.
+        if let Some(loader) = self.config.watch_set_loader.clone() {
+            let shared = Arc::new(Mutex::new(WatchSetMirror::default()));
+            loader(WatchSetBuilder { mirror: shared.clone() })
+                .await
+                .map_err(StreamError::WatchSetLoader)?;
+            // Take the loaded set regardless of whether the loader stashed a
+            // builder clone; the builder only records, so nothing races here.
+            self.mirror = std::mem::take(&mut *shared.lock().unwrap_or_else(|p| p.into_inner()));
+        }
         for msg in self.mirror.control_messages() {
             handle.send_control(pb::SubscribeControl { msg: Some(msg) }).await?;
         }
@@ -848,11 +1044,13 @@ fn validate_prefixes(
 }
 
 /// Whether a `connect()` failure should be retried by reconnecting. Adds
-/// `ControlClosed` to the transport-retryable set: a freshly-opened stream that
-/// rejects the watch-set replay is itself a transient failure to reconnect
-/// through, not a caller-facing error.
+/// `ControlClosed` and `WatchSetLoader` to the transport-retryable set: a
+/// freshly-opened stream that rejects the watch-set replay is a transient
+/// failure to reconnect through, and a watch-set loader that fails to reach its
+/// source-of-truth should be retried on the next connect rather than crashing
+/// the consumer — neither is a caller-facing error.
 fn is_reconnectable(e: &StreamError) -> bool {
-    e.is_retryable() || matches!(e, StreamError::ControlClosed)
+    e.is_retryable() || matches!(e, StreamError::ControlClosed | StreamError::WatchSetLoader(_))
 }
 
 #[cfg(test)]
@@ -1151,5 +1349,124 @@ mod tests {
         w.seed_resume().unwrap();
         assert_eq!(w.resume, Some(cur(800)), "persisted cursor wins over from_cursor");
         assert_eq!(w.committed, Some(cur(800)), "loaded cursor seeds committed");
+    }
+
+    // --- watch-set loader (#447) ----------------------------------------------
+
+    /// Drive the loader step exactly as `connect` does — populate a fresh shared
+    /// mirror through the builder, then take it — without needing a live stream.
+    async fn run_loader(config: &ResilientWatchConfig) -> Result<WatchSetMirror, StreamError> {
+        let loader = config.watch_set_loader.clone().expect("loader configured");
+        let shared = Arc::new(Mutex::new(WatchSetMirror::default()));
+        loader(WatchSetBuilder { mirror: shared.clone() })
+            .await
+            .map_err(StreamError::WatchSetLoader)?;
+        Ok(std::mem::take(&mut *shared.lock().unwrap()))
+    }
+
+    #[test]
+    fn builder_facade_records_every_watch_kind() {
+        let m = Arc::new(Mutex::new(WatchSetMirror::default()));
+        let b = WatchSetBuilder { mirror: m.clone() };
+        b.set_categories(crate::Categories::CHAIN);
+        b.add_scripts([([1u8; 32], Some(5_000))]);
+        b.add_outpoints([([2u8; 32], 0)]);
+        b.add_tx_lifecycle([[3u8; 32]], AutoClose::AtDepth(6));
+        b.add_depth_alarms([[4u8; 32]], [3, 6]);
+        b.add_descriptor("wpkh(xpub...)", 20, 0);
+        b.add_script_prefixes([(vec![0xab], 8)]).unwrap();
+
+        let mirror = std::mem::take(&mut *m.lock().unwrap());
+        let kinds: Vec<_> = mirror
+            .control_messages()
+            .into_iter()
+            .map(|msg| std::mem::discriminant(&msg))
+            .collect();
+        // Categories + scripts + outpoints + lifecycle + depth-alarm + descriptor
+        // + prefixes = 7 messages, the same shapes a manual replay emits.
+        assert_eq!(kinds.len(), 7, "every declared kind renders to a control message");
+        assert!(
+            matches!(mirror.control_messages()[0], Msg::SetCategories(_)),
+            "categories still lead the replay"
+        );
+    }
+
+    #[test]
+    fn builder_depth_alarms_filter_and_cross_product() {
+        let m = Arc::new(Mutex::new(WatchSetMirror::default()));
+        let b = WatchSetBuilder { mirror: m.clone() };
+        // Depth 0 is invalid and dropped; the two txids × the one valid depth (5)
+        // cross-multiply into two alarms.
+        b.add_depth_alarms([[1u8; 32], [2u8; 32]], [0, 5]);
+        let mirror = std::mem::take(&mut *m.lock().unwrap());
+        assert!(mirror.depth_alarms.contains(&([1u8; 32], 5)));
+        assert!(mirror.depth_alarms.contains(&([2u8; 32], 5)));
+        assert_eq!(mirror.depth_alarms.len(), 2, "depth 0 dropped, depth 5 kept");
+    }
+
+    #[test]
+    fn builder_prefix_validation_error_aborts_the_load() {
+        let m = Arc::new(Mutex::new(WatchSetMirror::default()));
+        let b = WatchSetBuilder { mirror: m };
+        // bits 0 is out of the 1..=32 range — rejected the same as the live path.
+        assert!(matches!(
+            b.add_script_prefixes([(vec![], 0)]),
+            Err(StreamError::InvalidArgument(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn loader_rebuilds_the_canonical_watch_set() {
+        let config = ResilientWatchConfig::new().watch_set_loader(|b: WatchSetBuilder| async move {
+            // Stand-in for "query the durable truth, then declare the set."
+            b.add_scripts([([7u8; 32], None), ([8u8; 32], Some(1_000))]);
+            b.add_outpoints([([9u8; 32], 1)]);
+            Ok(())
+        });
+        let mirror = run_loader(&config).await.expect("loader succeeds");
+        assert!(mirror.scripts.contains_key(&[7u8; 32]));
+        assert_eq!(mirror.scripts.get(&[8u8; 32]), Some(&Some(1_000)));
+        assert!(mirror.outpoints.contains(&([9u8; 32], 1)));
+    }
+
+    #[tokio::test]
+    async fn loader_canonical_set_replaces_prior_in_process_edits() {
+        // A loaded canonical set must REPLACE whatever the in-process mirror held
+        // (truth-of-record is external), not merge with it.
+        let mut w = ResilientWatch::new(
+            StreamClient::for_test(),
+            ResilientWatchConfig::new().watch_set_loader(|b: WatchSetBuilder| async move {
+                b.add_scripts([([2u8; 32], None)]);
+                Ok(())
+            }),
+        );
+        // Pre-existing in-process edit the loader does not know about.
+        w.add_scripts([([1u8; 32], None)]).await.unwrap();
+        assert!(w.mirror.scripts.contains_key(&[1u8; 32]));
+        // Adopt the loaded set the way `connect` does.
+        w.mirror = run_loader(&w.config).await.unwrap();
+        assert!(!w.mirror.scripts.contains_key(&[1u8; 32]), "stale in-process edit dropped");
+        assert!(w.mirror.scripts.contains_key(&[2u8; 32]), "canonical loaded script present");
+    }
+
+    #[tokio::test]
+    async fn loader_error_maps_to_watch_set_loader_and_is_reconnectable() {
+        let config = ResilientWatchConfig::new().watch_set_loader(|_b: WatchSetBuilder| async move {
+            Err("source-of-truth unreachable".into())
+        });
+        let err = run_loader(&config).await.expect_err("loader failure surfaces");
+        assert!(matches!(err, StreamError::WatchSetLoader(_)));
+        assert!(
+            is_reconnectable(&err),
+            "a loader failure is a transient reconnect-level condition, not caller-facing"
+        );
+        // And the inner integrator message is preserved.
+        assert!(err.to_string().contains("source-of-truth unreachable"));
+    }
+
+    #[test]
+    fn no_loader_leaves_behavior_unchanged() {
+        // The default config has no loader: mirror-replay is untouched.
+        assert!(ResilientWatchConfig::new().watch_set_loader.is_none());
     }
 }

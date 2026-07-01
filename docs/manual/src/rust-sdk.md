@@ -257,6 +257,64 @@ It is single-task, like `ResilientSubscription`: interleave watch-set edits with
 descriptor replays from its latest `(gap_limit, start)`, so advance `start` to
 slide the window across reconnects.
 
+### Watch-set loader — when truth lives outside the wrapper
+
+The mirror above is authoritative only when you build the watch-set once at
+startup and never change it during the process lifetime. The moment the
+watch-set has a durable **source-of-truth** outside the wrapper — a DB table, a
+config file, an upstream service — the mirror is really a *cache* of that truth,
+and two gaps open: a process restart starts with an empty mirror (nothing to
+replay), and a change to the truth while the stream is down (an entity added,
+removed, or rekeyed through your own API) leaves the mirror stale until the next
+in-process edit happens to touch it.
+
+`watch_set_loader` closes both. It runs once after **every** (re)connect,
+**before** the event stream resumes, and rebuilds the canonical set from your
+truth into a fresh `WatchSetBuilder` — so the first events after a reconnect
+already land on a fully-populated subscription, and a restart rehydrates from
+truth instead of from an empty mirror:
+
+```rust,ignore
+use satd_events_client::{ResilientWatchConfig, FileCursorStore, WatchSetBuilder};
+use std::sync::Arc;
+
+let db = Arc::new(my_watch_db());
+let config = ResilientWatchConfig::new()
+    .cursor_store(Arc::new(FileCursorStore::new("/var/lib/app/watch.cursor")))
+    .watch_set_loader({
+        let db = db.clone();
+        move |builder: WatchSetBuilder| {
+            let db = db.clone();
+            async move {
+                // Query the source-of-truth and declare the canonical set.
+                for row in db.load_watched_scripts().await? {
+                    builder.add_scripts([(row.scripthash, row.min_value)]);
+                }
+                Ok(())
+            }
+        }
+    });
+let mut watch = client.resilient_watch(config);
+```
+
+Semantics:
+
+- **Canonical on every connect.** The loaded set *replaces* the mirror. You can
+  still call `add_*` / `remove_*` for live edits within the current connection,
+  but the next reconnect re-derives the set from the loader — so your truth, not
+  the accumulated in-process edits, is the record across reconnects. Persist a
+  hot-add to your truth and the loader picks it up on the next connect.
+- **The cursor is independent.** Resume still comes from the `CursorStore` /
+  `from_cursor`; the re-anchor runs after the loaded set is registered, exactly
+  as without a loader.
+- **Loader errors are transient.** A failure maps to `StreamError::WatchSetLoader`
+  and is backed off and retried on the next connect — a momentary outage of your
+  source-of-truth must not crash an at-least-once consumer.
+
+`WatchSetBuilder` exposes the declarative `add_*` / `set_categories` surface (no
+`remove_*` — you are building a complete set into an empty mirror). Omit the
+loader and behavior is exactly the mirror-replay described above.
+
 ## Prefix watches (privacy-preserving)
 
 A prefix watch registers a coarse `bits`-bit prefix of `sha256(scriptPubKey)`.

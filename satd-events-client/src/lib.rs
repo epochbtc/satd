@@ -56,7 +56,10 @@
 //!   re-registers it on reconnect (watch-sets are per-connection), then
 //!   re-anchors off the deterministic [`Event::CursorAccepted`] /
 //!   [`Event::CursorRejected`] results, retrying transient rejects in place and
-//!   surfacing the rest for a resnapshot.
+//!   surfacing the rest for a resnapshot. Integrators with a durable watch-set
+//!   source-of-truth can install a
+//!   [`watch_set_loader`](ResilientWatchConfig::watch_set_loader) to rebuild the
+//!   canonical set from that truth on every (re)connect.
 //! - [`PrefixWatcher`] (default-on `bitcoin` feature) — the privacy-preserving
 //!   prefix-watch local re-filter: decodes a [`PrefixMatch`]'s `raw_tx` and
 //!   recomputes `sha256(scriptPubKey)` to keep only true matches.
@@ -136,7 +139,7 @@ pub use resilience::{
     Backoff, CursorStore, FileCursorStore, LagPolicy, NoopCursorStore, ResilientConfig,
     ResilientSubscription,
 };
-pub use resilient_watch::{ResilientWatch, ResilientWatchConfig};
+pub use resilient_watch::{ResilientWatch, ResilientWatchConfig, WatchSetBuilder};
 
 #[cfg(feature = "bitcoin")]
 #[cfg_attr(docsrs, doc(cfg(feature = "bitcoin")))]
