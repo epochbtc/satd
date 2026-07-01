@@ -342,11 +342,12 @@ tracing::info!(?summary, "watch-set realigned with truth");
 - **Deterministic result** — the outcome arrives in-band on `next()` as
   `Event::WatchSetReplaced { added, removed, unchanged }` (the server's
   authoritative counts) or `Event::WatchSetRejected { reason, required, quota }`.
-  `reason` is `QuotaExceeded` (the target does not fit quota — shed and retry) or
-  `Malformed` (the server could not parse an element of the snapshot — a client
-  bug; retrying the same set will not help). Either way the live set is left
-  unchanged. The `ReloadSummary` returned by `reload()` carries advisory
-  client-side counts; the `Event` is the source of truth.
+  `reason` is `QuotaExceeded` (the target does not fit quota — shed and retry),
+  `CapExceeded` (more entries than the per-connection cap, which applies even with
+  no quota — shed and retry), or `Malformed` (the server could not parse an element
+  of the snapshot — a client bug; retrying the same set will not help). In every
+  case the live set is left unchanged. The `ReloadSummary` returned by `reload()`
+  carries advisory client-side counts; the `Event` is the source of truth.
 - **Atomic w.r.t. your task** — `&mut self` serializes `reload()` against your
   `add_*` / `next()` on the single task.
 - **Disconnected defers, never errors** — with the stream down there's nothing to

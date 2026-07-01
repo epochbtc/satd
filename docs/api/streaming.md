@@ -762,19 +762,32 @@ registration and quota lease untouched — including a scripthash whose *mechani
 changes across the replace (a direct add becoming descriptor-covered, or vice
 versa), which a client-side `Add*`/`Remove*` diff cannot see and would briefly
 unwatch. Departed items are released; net-new items are charged. The replace is
-**all-or-nothing on the whole target** for two independent reasons:
+**all-or-nothing on the whole target** for three independent reasons:
 
 - **Quota** — if the target's total unit cost exceeds the principal's quota the
-  watch-set is left **unchanged** (`reason = QUOTA_EXCEEDED`, `required`/`quota`
-  set).
+  watch-set is left **unchanged** (`reason = QUOTA_EXCEEDED`, `required` = units
+  needed, `quota` = the unit ceiling).
+- **Entry cap** — the replace is bounded by the same per-connection watch-set
+  **entry** cap as the incremental adds on that carrier (WebSocket
+  `streamwsmaxsubscriptions`; a prefix counts as one entry). A target with more
+  entries than the cap is refused whole (`reason = CAP_EXCEEDED`, `required` =
+  entry count, `quota` = the cap). This bound applies even to a **loopback/no-auth
+  connection**, which has no quota — so one `SetWatchSet` frame can never install
+  more than the cap. (gRPC entry-caps neither its incremental adds nor a replace;
+  quota is its bound.)
 - **Malformed input** — because a `SetWatchSet` is a *full snapshot*, any element
   the server cannot parse or expand (a bad scripthash, outpoint, txid, descriptor,
-  or prefix) refuses the **whole** snapshot (`reason = MALFORMED`,
-  `required`/`quota` = 0) and leaves the live set unchanged. It is *not* silently
-  dropped — dropping one item would shrink the snapshot and unwatch still-wanted
-  scripts while reporting success. (This is the one place the incremental `Add*`
-  paths differ: those are best-effort and skip an unparseable item, since they
-  only *grow* the set.)
+  or prefix — or a `min_values` length that does not match `scripthashes`) refuses
+  the **whole** snapshot (`reason = MALFORMED`, `required`/`quota` = 0) and leaves
+  the live set unchanged. It is *not* silently dropped — dropping one item would
+  shrink the snapshot and unwatch still-wanted scripts while reporting success.
+  (This is the one place the incremental `Add*` paths differ: those are
+  best-effort and skip an unparseable item, since they only *grow* the set.)
+
+Unlike the incremental adds, a replace does **not** charge the per-add rate
+limiter: it is the watch-set re-establishment primitive (reconnect / SDK reload),
+and rate-limiting it would let a reconnect storm block clients from restoring
+their watches. Steady-state size stays bounded by quota and the entry cap above.
 
 The outcome is deterministic and in-band (mirrors `SetCursorResult`):
 
@@ -784,7 +797,7 @@ message WatchSetResult {
 }
 message WatchSetAccepted { uint32 added = 1; uint32 removed = 2; uint32 unchanged = 3; }
 message WatchSetRejected {
-  enum Reason { REASON_UNSPECIFIED = 0; QUOTA_EXCEEDED = 1; MALFORMED = 2; }
+  enum Reason { REASON_UNSPECIFIED = 0; QUOTA_EXCEEDED = 1; MALFORMED = 2; CAP_EXCEEDED = 3; }
   Reason reason = 1; uint64 required = 2; uint64 quota = 3;
 }
 ```

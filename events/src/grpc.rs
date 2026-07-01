@@ -1192,7 +1192,9 @@ impl NodeEventStream for NodeEventStreamSvc {
                             Err(_) => crate::watchset::ReplaceOutcome::Malformed,
                             Ok(desired) => {
                                 let mut guard = watch_set.lock().unwrap_or_else(|p| p.into_inner());
-                                let outcome = guard.replace(principal.as_ref(), desired, &*handle);
+                                // gRPC entry-caps neither incremental adds nor a
+                                // replace (quota is its bound) → max_items = 0.
+                                let outcome = guard.replace(principal.as_ref(), desired, 0, &*handle);
                                 // The category filter is part of the desired set, so
                                 // apply it only when the replace was accepted — a
                                 // rejection leaves the whole set (categories
@@ -1732,6 +1734,13 @@ fn watch_set_result_to_proto(
                 reason: pb::watch_set_rejected::Reason::QuotaExceeded as i32,
                 required: *required,
                 quota: *quota,
+            })
+        }
+        ReplaceOutcome::CapExceeded { limit, requested } => {
+            pb::watch_set_result::Outcome::Rejected(pb::WatchSetRejected {
+                reason: pb::watch_set_rejected::Reason::CapExceeded as i32,
+                required: *requested,
+                quota: *limit,
             })
         }
         ReplaceOutcome::Malformed => {

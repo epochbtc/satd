@@ -911,7 +911,9 @@ fn apply_ws_control(
         let outcome = match desired {
             Err(_) => crate::watchset::ReplaceOutcome::Malformed,
             Ok(desired) => {
-                let outcome = watch_set.replace(principal, desired, handle);
+                // Bound the replace by the same per-connection entry cap the
+                // incremental adds respect (streamwsmaxsubscriptions).
+                let outcome = watch_set.replace(principal, desired, max_subscriptions, handle);
                 // The category filter is part of the desired set: apply it only
                 // when the replace was accepted, so a rejection leaves the whole
                 // set (categories included) unchanged as `watch_set_result`
@@ -1130,6 +1132,13 @@ fn watch_set_result_json(outcome: &crate::watchset::ReplaceOutcome) -> serde_jso
             "reason": "quota_exceeded",
             "required": required,
             "quota": quota,
+        }),
+        ReplaceOutcome::CapExceeded { limit, requested } => json!({
+            "category": "watch_set_result",
+            "outcome": "rejected",
+            "reason": "cap_exceeded",
+            "required": requested,
+            "quota": limit,
         }),
         ReplaceOutcome::Malformed => json!({
             "category": "watch_set_result",
@@ -1466,6 +1475,45 @@ mod tests {
         assert_eq!(ws.len(), 2, "the live set is untouched by a rejected replace");
         assert_eq!(mask.load(Ordering::Relaxed), 2, "categories are not changed by a rejected replace");
         assert_eq!(watch_set_result_json(&crate::watchset::ReplaceOutcome::Malformed)["body"]["reason"], "malformed");
+    }
+
+    #[test]
+    fn set_watch_set_is_bounded_by_the_per_connection_entry_cap() {
+        // The SetWatchSet path must honor streamwsmaxsubscriptions like the
+        // incremental adds — otherwise one frame installs an unbounded set on a
+        // no-auth connection. No principal (loopback) → the cap is the only bound.
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, _rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let mask = AtomicU32::new(0);
+        let mut ws = WatchSet::default();
+
+        // cap = 2. A 3-scripthash replace is rejected whole; nothing registers.
+        let over = format!(
+            r#"{{"type":"set_watch_set","scripthashes":["{}","{}","{}"]}}"#,
+            "11".repeat(32),
+            "22".repeat(32),
+            "33".repeat(32),
+        );
+        let outcome = apply_ws_control(&over, &handle, None, &mask, &mut ws, 2, (8, 32));
+        assert!(
+            matches!(outcome, Some(crate::watchset::ReplaceOutcome::CapExceeded { limit: 2, requested: 3 })),
+            "over-cap SetWatchSet must be rejected, got {outcome:?}",
+        );
+        assert_eq!(ws.len(), 0, "a cap-rejected replace installs nothing");
+        assert_eq!(
+            watch_set_result_json(&crate::watchset::ReplaceOutcome::CapExceeded { limit: 2, requested: 3 })["body"]["reason"],
+            "cap_exceeded",
+        );
+
+        // A 2-scripthash replace fits the cap exactly.
+        let ok = format!(
+            r#"{{"type":"set_watch_set","scripthashes":["{}","{}"]}}"#,
+            "11".repeat(32),
+            "22".repeat(32),
+        );
+        let outcome = apply_ws_control(&ok, &handle, None, &mask, &mut ws, 2, (8, 32));
+        assert!(matches!(outcome, Some(crate::watchset::ReplaceOutcome::Accepted { .. })));
+        assert_eq!(ws.len(), 2);
     }
 
     #[test]

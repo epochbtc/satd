@@ -192,6 +192,12 @@ pub(crate) enum ReplaceOutcome {
     /// The target's total unit cost exceeds the principal's quota; the watch-set
     /// is left unchanged.
     Rejected { required: u64, quota: u64 },
+    /// The target's watch-set **entry** count exceeds the per-connection cap
+    /// (`max_items`, e.g. WS `streamwsmaxsubscriptions`); the watch-set is left
+    /// unchanged. Distinct from [`Rejected`](Self::Rejected): a loopback/no-auth
+    /// connection has no quota but is still entry-capped, and this bound is by
+    /// item count (a prefix is one entry regardless of its unit cost).
+    CapExceeded { limit: u64, requested: u64 },
     /// The target snapshot contained an element the carrier could not parse or
     /// expand. A full replace is all-or-nothing, so the snapshot is refused whole
     /// and the live watch-set is left unchanged — never silently shrunk by the
@@ -391,10 +397,25 @@ impl WatchSet {
     /// and [`ReplaceOutcome::Rejected`] is returned. Runs under the per-connection
     /// watch-set lock the carrier already holds — the reconcile is not observable
     /// mid-flight.
+    /// `max_items` is the per-connection watch-set **entry** cap (0 = unlimited):
+    /// a target whose effective entry count exceeds it is rejected whole
+    /// ([`ReplaceOutcome::CapExceeded`]), leaving the set unchanged. This mirrors
+    /// the incremental `Add*` shed on the same carrier — WS passes
+    /// `streamwsmaxsubscriptions`; gRPC, which entry-caps neither its incremental
+    /// adds nor a replace (quota is its bound), passes 0.
+    ///
+    /// Note `replace` deliberately does NOT charge the per-add rate limiter that
+    /// the incremental `Add*` paths do. `replace` is the watch-set
+    /// re-establishment primitive (reconnect / `ResilientWatch::reload`); rate-
+    /// limiting it would let a reconnect storm block clients from restoring their
+    /// watch-set exactly when they must. The per-add limiter bounds incremental
+    /// churn cadence; steady-state size is still bounded here by quota and
+    /// `max_items`.
     pub(crate) fn replace(
         &mut self,
         principal: Option<&satd_auth::Principal>,
         desired: DesiredWatchSet,
+        max_items: usize,
         reg: &impl WatchRegistry,
     ) -> ReplaceOutcome {
         // ---- Build the target effective sets -----------------------------
@@ -436,6 +457,21 @@ impl WatchSet {
         let target_txids: HashMap<Txid, u32> = desired.lifecycles.iter().copied().collect();
         let target_depths: HashSet<(Txid, u32)> = desired.depth_alarms.iter().copied().collect();
         let target_prefixes: HashMap<PrefixKey, u64> = desired.prefixes.iter().copied().collect();
+
+        // Per-connection entry cap: bound the target the same way the incremental
+        // adds are bounded on this carrier. Count effective ENTRIES (a prefix is
+        // one entry regardless of its unit cost) — this matches `len()`. Checked
+        // BEFORE the quota swap and any mutation, so a rejection leaves the live
+        // set (and its leases) untouched. `max_items == 0` ⇒ unlimited.
+        let target_len =
+            target_scripts.len() + target_outpoints.len() + target_txids.len() + target_depths.len()
+                + target_prefixes.len();
+        if max_items != 0 && target_len > max_items {
+            return ReplaceOutcome::CapExceeded {
+                limit: max_items as u64,
+                requested: target_len as u64,
+            };
+        }
 
         let target_units: u64 = target_scripts.len() as u64
             + target_outpoints.len() as u64
@@ -1533,13 +1569,13 @@ mod tests {
         let (p, acct) = tenant(3); // room for exactly 3 units
         let q = acct.quota();
         let mut ws = WatchSet::default();
-        ws.replace(Some(&p), desired_scripts(&[sh(1), sh(2), sh(3)]), &MockReg::default());
+        ws.replace(Some(&p), desired_scripts(&[sh(1), sh(2), sh(3)]), 0, &MockReg::default());
         assert_eq!(q.current("tenant"), 3);
 
         // Swap all three for three DISJOINT scripts. At quota this only fits
         // because the replace releases the old units before acquiring the new
         // (no transient doubling — the tenant can never hold 6).
-        let outcome = ws.replace(Some(&p), desired_scripts(&[sh(4), sh(5), sh(6)]), &MockReg::default());
+        let outcome = ws.replace(Some(&p), desired_scripts(&[sh(4), sh(5), sh(6)]), 0, &MockReg::default());
         assert!(
             matches!(outcome, ReplaceOutcome::Accepted { added: 3, removed: 3, unchanged: 0 }),
             "disjoint same-size swap must fit at quota, got {outcome:?}",
@@ -1569,7 +1605,7 @@ mod tests {
             prefixes: Vec::new(),
         };
         let reg = MockReg::default();
-        let outcome = ws.replace(Some(&p), desired, &reg);
+        let outcome = ws.replace(Some(&p), desired, 0, &reg);
         assert!(
             matches!(outcome, ReplaceOutcome::Accepted { added: 0, removed: 0, unchanged: 1 }),
             "same effective scripthash → unchanged, got {outcome:?}",
@@ -1602,7 +1638,7 @@ mod tests {
             depth_alarms: Vec::new(),
             prefixes: Vec::new(),
         };
-        let outcome = ws.replace(Some(&p), desired, &MockReg::default());
+        let outcome = ws.replace(Some(&p), desired, 0, &MockReg::default());
         assert!(
             matches!(outcome, ReplaceOutcome::Accepted { added: 2, removed: 0, unchanged: 0 }),
             "duplicate descriptor counts its scripts once, got {outcome:?}",
@@ -1625,12 +1661,12 @@ mod tests {
         let (p, acct) = tenant(2);
         let q = acct.quota();
         let mut ws = WatchSet::default();
-        ws.replace(Some(&p), desired_scripts(&[sh(1), sh(2)]), &MockReg::default());
+        ws.replace(Some(&p), desired_scripts(&[sh(1), sh(2)]), 0, &MockReg::default());
         assert_eq!(q.current("tenant"), 2);
 
         // Target needs 3 units > quota 2 → rejected whole; the old set stays.
         let reg = MockReg::default();
-        let outcome = ws.replace(Some(&p), desired_scripts(&[sh(3), sh(4), sh(5)]), &reg);
+        let outcome = ws.replace(Some(&p), desired_scripts(&[sh(3), sh(4), sh(5)]), 0, &reg);
         assert!(
             matches!(outcome, ReplaceOutcome::Rejected { required: 3, quota: 2 }),
             "over-quota target must be rejected, got {outcome:?}",
@@ -1645,13 +1681,50 @@ mod tests {
     }
 
     #[test]
+    fn replace_over_entry_cap_is_rejected_and_leaves_the_set_unchanged() {
+        // The per-connection entry cap bounds a replace the same way it bounds
+        // incremental adds — and it applies even with NO principal (loopback/
+        // no-auth), where there is no quota to fall back on. That is exactly the
+        // case the cap exists to protect: a single SetWatchSet cannot install more
+        // than `max_items` entries.
+        let mut ws = WatchSet::default();
+        // Seed a 2-entry set within a cap of 2 (no auth → no quota bound).
+        let outcome = ws.replace(None, desired_scripts(&[sh(1), sh(2)]), 2, &MockReg::default());
+        assert!(matches!(outcome, ReplaceOutcome::Accepted { added: 2, .. }));
+        assert_eq!(ws.len(), 2);
+
+        // A target of 3 entries exceeds the cap of 2 → rejected whole, old set kept.
+        let reg = MockReg::default();
+        let outcome = ws.replace(None, desired_scripts(&[sh(3), sh(4), sh(5)]), 2, &reg);
+        assert!(
+            matches!(outcome, ReplaceOutcome::CapExceeded { limit: 2, requested: 3 }),
+            "over-cap target must be rejected, got {outcome:?}",
+        );
+        assert_eq!(ws.len(), 2, "old set intact");
+        assert!(ws.scripts.contains_key(&sh(1)) && ws.scripts.contains_key(&sh(2)));
+        assert!(
+            reg.added_scripts.borrow().is_empty() && reg.removed_scripts.borrow().is_empty(),
+            "a cap-rejected replace touches nothing in the registry",
+        );
+
+        // A target of exactly the cap (2) is allowed — and may swap membership.
+        let outcome = ws.replace(None, desired_scripts(&[sh(6), sh(7)]), 2, &MockReg::default());
+        assert!(matches!(outcome, ReplaceOutcome::Accepted { .. }), "at-cap target fits");
+        assert_eq!(ws.len(), 2);
+        // max_items = 0 disables the cap entirely.
+        let outcome = ws.replace(None, desired_scripts(&[sh(1), sh(2), sh(3), sh(4)]), 0, &MockReg::default());
+        assert!(matches!(outcome, ReplaceOutcome::Accepted { .. }), "cap 0 ⇒ unlimited");
+        assert_eq!(ws.len(), 4);
+    }
+
+    #[test]
     fn replace_empty_target_clears_everything() {
         let (p, acct) = tenant(10);
         let q = acct.quota();
         let mut ws = WatchSet::default();
-        ws.replace(Some(&p), desired_scripts(&[sh(1), sh(2)]), &MockReg::default());
+        ws.replace(Some(&p), desired_scripts(&[sh(1), sh(2)]), 0, &MockReg::default());
         let reg = MockReg::default();
-        let outcome = ws.replace(Some(&p), desired_scripts(&[]), &reg);
+        let outcome = ws.replace(Some(&p), desired_scripts(&[]), 0, &reg);
         assert!(matches!(outcome, ReplaceOutcome::Accepted { added: 0, removed: 2, unchanged: 0 }));
         assert_eq!(ws.scripts.len(), 0);
         assert_eq!(q.current("tenant"), 0, "all units released");
@@ -1663,7 +1736,7 @@ mod tests {
     #[test]
     fn replace_without_auth_holds_no_leases() {
         let mut ws = WatchSet::default();
-        let outcome = ws.replace(None, desired_scripts(&[sh(1), sh(2)]), &MockReg::default());
+        let outcome = ws.replace(None, desired_scripts(&[sh(1), sh(2)]), 0, &MockReg::default());
         assert!(matches!(outcome, ReplaceOutcome::Accepted { added: 2, .. }));
         assert_eq!(ws.scripts.len(), 2);
         assert!(ws.scripts.values().all(Option::is_none), "auth disabled → no leases");
