@@ -255,12 +255,16 @@ impl WatchSetMirror {
     /// net watch-set) into `target`, plus item counts — the delta a
     /// [`reload`](ResilientWatch::reload) applies on the live wire. Only the
     /// differences are emitted: items present-and-equal in both are left alone,
-    /// so the stream is never cleared and rebuilt (no window where the server
-    /// watches nothing). `Add*` messages lead so new coverage is registered
-    /// before any `Remove*`/`RemoveDescriptor` tears the old down. A descriptor
-    /// whose window changed is one `AddDescriptor` (the server reconciles the
-    /// slid window); a descriptor that disappeared is a `RemoveDescriptor`.
+    /// so the stream is never cleared and rebuilt. `Remove*`/`RemoveDescriptor`
+    /// lead (after any category change) so a removal frees its quota unit before
+    /// the replacement `Add*` claims it — a swap at quota would otherwise have its
+    /// net-new adds silently rejected while the removes still applied. See the
+    /// ordering note at the tail of this function for the full rationale. A
+    /// descriptor whose window changed is one `AddDescriptor` (the server
+    /// reconciles the slid window); a descriptor that disappeared is a
+    /// `RemoveDescriptor`.
     fn reconcile_to(&self, target: &WatchSetMirror) -> (Vec<Msg>, ReloadCounts) {
+        let mut lead = Vec::new();
         let mut adds = Vec::new();
         let mut removes = Vec::new();
         let mut c = ReloadCounts::default();
@@ -277,7 +281,7 @@ impl WatchSetMirror {
         let target_mask = target.categories.unwrap_or(0);
         let live_mask = self.categories.unwrap_or(0);
         if target_mask != live_mask {
-            adds.push(Msg::SetCategories(pb::SetCategories { categories: target_mask }));
+            lead.push(Msg::SetCategories(pb::SetCategories { categories: target_mask }));
         }
 
         // Scripts: new or changed-floor → AddScripts; vanished → RemoveScripts.
@@ -444,8 +448,26 @@ impl WatchSetMirror {
             }
         }
 
-        adds.extend(removes);
-        (adds, c)
+        // Order: category filter, then **Remove* before Add***. A removal frees
+        // its quota unit, so a reload that swaps N watches for N disjoint ones
+        // fits even when the tenant is exactly at quota. The opposite order
+        // (Add* first) is a false promise at quota: the server has no per-message
+        // ack and silently drops a quota-over add without closing the stream, so
+        // the net-new adds would be rejected, the removes would then apply, and
+        // the mirror would adopt a target the server never registered — a
+        // permanent silent divergence until the next reconnect. Remove-first
+        // cannot regress coverage of any still-wanted item: `reconcile_to` only
+        // removes items *absent* from the target, and no concrete watch key is
+        // ever both removed and added (removes are self-keys-not-in-target, adds
+        // are target-keys). The lone exception is a single scripthash that
+        // changes *mechanism* across the reload (a direct add becoming
+        // descriptor-covered, or vice versa) — invisible to this key-level diff,
+        // so it briefly unwatches between the RemoveScripts and the AddDescriptor.
+        // That sub-millisecond gap on a rare manual-reload transition is the
+        // deliberate trade for eliminating the permanent-divergence failure.
+        lead.extend(removes);
+        lead.extend(adds);
+        (lead, c)
     }
 }
 
@@ -1044,12 +1066,15 @@ impl ResilientWatch {
     ///
     /// Semantics:
     ///
-    /// - **Diff, not blast.** Only added/changed/removed items are sent
-    ///   (`Add*` first so new coverage is up before any `Remove*` /
-    ///   `RemoveDescriptor` tears the old down); identical items are untouched,
-    ///   so there is no window where the server watches nothing. A descriptor
-    ///   whose window changed is re-asserted (the server reconciles); a vanished
-    ///   descriptor is dropped with `RemoveDescriptor`.
+    /// - **Diff, not blast.** Only added/changed/removed items are sent;
+    ///   identical items are untouched. `Remove*` / `RemoveDescriptor` lead so a
+    ///   removal frees its quota unit before the replacement `Add*` claims it —
+    ///   which is what lets a swap of N watches for N disjoint ones apply cleanly
+    ///   even when the tenant is exactly at quota (the server silently drops a
+    ///   quota-over add, so an add-first order would leave the mirror claiming
+    ///   watches the server never registered). A descriptor whose window changed
+    ///   is re-asserted (the server reconciles); a vanished descriptor is dropped
+    ///   with `RemoveDescriptor`.
     /// - **Atomic w.r.t. concurrent edits.** `&mut self` serializes `reload`
     ///   against `add_*` / `remove_*` / [`next`](Self::next), so no hot-add can
     ///   interleave with the diff.
@@ -1827,7 +1852,7 @@ mod tests {
     // --- reload(): diff the live set against truth and apply the delta ---------
 
     #[test]
-    fn reconcile_to_emits_only_the_delta_adds_before_removes() {
+    fn reconcile_to_emits_only_the_delta_removes_before_adds() {
         // Old set vs a target that adds, removes, and changes one of each kind.
         let mut old = WatchSetMirror::default();
         old.add_scripts(&[([1u8; 32], None), ([2u8; 32], Some(500))]); // 2 kept-ish
@@ -1852,8 +1877,10 @@ mod tests {
         assert_eq!(counts.removed, 2, "outpoint + desc-drop");
         assert_eq!(counts.unchanged, 2, "sh1 + desc-keep");
 
-        // All Add*/SetCategories come before any Remove*/RemoveDescriptor.
-        let first_remove = msgs.iter().position(|m| {
+        // Every Remove*/RemoveDescriptor comes before any watch-adding Add* — a
+        // removal must free its quota unit before the replacement add claims it,
+        // so a swap at quota does not have its adds silently rejected.
+        let last_remove = msgs.iter().rposition(|m| {
             matches!(
                 m,
                 Msg::RemoveScripts(_)
@@ -1863,7 +1890,7 @@ mod tests {
                     | Msg::RemoveDescriptor(_)
             )
         });
-        let last_add = msgs.iter().rposition(|m| {
+        let first_add = msgs.iter().position(|m| {
             matches!(
                 m,
                 Msg::AddScripts(_)
@@ -1871,14 +1898,35 @@ mod tests {
                     | Msg::AddTransactions(_)
                     | Msg::AddDescriptor(_)
                     | Msg::AddScriptPrefixes(_)
-                    | Msg::SetCategories(_)
             )
         });
-        if let (Some(fr), Some(la)) = (first_remove, last_add) {
-            assert!(la < fr, "every Add must precede every Remove");
+        if let (Some(lr), Some(fa)) = (last_remove, first_add) {
+            assert!(lr < fa, "every Remove must precede every quota-consuming Add");
         }
         // A vanished descriptor is dropped with RemoveDescriptor, not by scripthash.
         assert!(msgs.iter().any(|m| matches!(m, Msg::RemoveDescriptor(d) if d.descriptor == "desc-drop")));
+    }
+
+    #[test]
+    fn reconcile_disjoint_swap_removes_before_adds_for_quota_safety() {
+        // A tenant at quota N reloading N old watches → N disjoint new watches.
+        // The removes must precede the adds so the server frees the N old units
+        // before the N new adds are charged; add-first would let the server
+        // silently reject the over-quota adds and then apply the removes.
+        let mut live = WatchSetMirror::default();
+        live.add_scripts(&[([1u8; 32], None), ([2u8; 32], None), ([3u8; 32], None)]);
+        let mut target = WatchSetMirror::default();
+        target.add_scripts(&[([4u8; 32], None), ([5u8; 32], None), ([6u8; 32], None)]);
+
+        let (msgs, counts) = live.reconcile_to(&target);
+        assert_eq!((counts.added, counts.removed, counts.unchanged), (3, 3, 0));
+
+        let remove_pos = msgs.iter().position(|m| matches!(m, Msg::RemoveScripts(_)));
+        let add_pos = msgs.iter().position(|m| matches!(m, Msg::AddScripts(_)));
+        assert!(
+            remove_pos < add_pos,
+            "RemoveScripts must be sent before AddScripts so freed quota covers the replacements",
+        );
     }
 
     #[test]
