@@ -43,6 +43,22 @@ use tracing::warn;
 /// any legitimate batch; larger sets are split across messages.
 pub(crate) const MAX_TXID_DEPTH_PAIRS: usize = 65_536;
 
+/// Per-connection cap on the number of distinct descriptors retained for
+/// `RemoveDescriptor` / slide reconciliation. Each retained descriptor costs a
+/// map entry — the descriptor string plus its membership `Vec<Scripthash>`.
+/// A descriptor whose window expands entirely to already-watched scripts has an
+/// empty `net_new` set, so it charges no quota unit and (without this) consumes
+/// no rate token, yet still grows the `descriptors` map. Neither the per-token
+/// watch quota nor the per-connection watch-set cap (`len()`) counts descriptor
+/// membership, so absent this bound a client could stream unboundedly-many
+/// distinct descriptor strings — each resolving to a single already-held script
+/// — and grow the map until OOM, invisibly to every other limit. 256 distinct
+/// descriptors is generous for any real wallet (roughly one per account /
+/// keychain); a client at the cap must `RemoveDescriptor` before adding a new
+/// one. Re-asserting (sliding) an already-retained descriptor never grows the
+/// map and is always allowed.
+pub(crate) const MAX_DESCRIPTORS_PER_CONNECTION: usize = 256;
+
 /// Build the `(txid × distinct-depth)` watch pairs for a depth-alarm
 /// add/remove, or `None` if the cross-product would exceed
 /// [`MAX_TXID_DEPTH_PAIRS`]. Depths are de-duplicated first so a client cannot
@@ -334,6 +350,22 @@ impl WatchSet {
                 new.push(s);
             }
         }
+        let is_new_descriptor = !self.descriptors.contains_key(&descriptor);
+        // Memory-DoS guard: a brand-new descriptor that expands entirely to
+        // already-watched scripts has an empty `net_new` set, so the quota and
+        // rate checks below are skipped — yet it still costs a retained map
+        // entry. Cap the count of distinct descriptors so such "free"
+        // descriptors cannot be streamed without bound. A re-asserted (slid)
+        // descriptor is already in the map, never grows it, and passes through.
+        if is_new_descriptor && self.descriptors.len() >= MAX_DESCRIPTORS_PER_CONNECTION {
+            warn!(
+                target: "events::watchset",
+                cap = MAX_DESCRIPTORS_PER_CONNECTION,
+                "descriptor count cap reached; rejecting new descriptor",
+            );
+            return;
+        }
+
         let old: Vec<Scripthash> = self.descriptors.get(&descriptor).cloned().unwrap_or_default();
         let old_set: HashSet<Scripthash> = old.iter().copied().collect();
 
@@ -344,12 +376,31 @@ impl WatchSet {
         let net_new: Vec<Scripthash> =
             to_add.iter().copied().filter(|s| !self.scripts.contains_key(s)).collect();
 
-        if !net_new.is_empty()
-            && !reserve_scripts(&mut self.scripts, principal, &net_new, "descriptor", register)
-        {
-            // Quota/rate rejected the net-new batch: change nothing (membership,
-            // ownership, and the prior window all stay as they were).
-            return;
+        if !net_new.is_empty() {
+            if !reserve_scripts(&mut self.scripts, principal, &net_new, "descriptor", register) {
+                // Quota/rate rejected the net-new batch: change nothing
+                // (membership, ownership, and the prior window all stay as they
+                // were).
+                return;
+            }
+        } else if !to_add.is_empty() || old_set.iter().any(|s| !new_set.contains(s)) {
+            // Membership changed (scripts entered the window from another owner,
+            // or scripts left it) but nothing is net-new to the registry, so
+            // `reserve_scripts` — which carries the per-add rate token — was
+            // skipped. Charge the rate token here so descriptor churn / a slid
+            // window is bounded like any other effective add; loopback and
+            // no-policy principals always Allow. Throttled ⇒ leave unchanged.
+            if let Some(p) = principal
+                && let satd_auth::RateDecision::Throttle { retry_after_secs } = p.check_rate()
+            {
+                warn!(
+                    target: "events::watchset",
+                    kind = "descriptor",
+                    retry_after_secs,
+                    "descriptor re-assert rate-limited; skipping",
+                );
+                return;
+            }
         }
         // Commit ownership for every script that gained this descriptor.
         for s in &to_add {
@@ -1740,5 +1791,46 @@ mod tests {
         assert!(matches!(outcome, ReplaceOutcome::Accepted { added: 2, .. }));
         assert_eq!(ws.scripts.len(), 2);
         assert!(ws.scripts.values().all(Option::is_none), "auth disabled → no leases");
+    }
+
+    #[test]
+    fn descriptor_count_is_capped_per_connection() {
+        let mut ws = WatchSet::default();
+        // Loopback (no auth): no quota or rate gate, so only the descriptor-count
+        // cap can bound growth. Every descriptor expands to the *same* already-held
+        // script, so each past the first has an empty net-new set — exactly the
+        // "free descriptor" path (no quota unit, no rate token) the cap bounds.
+        for i in 0..MAX_DESCRIPTORS_PER_CONNECTION {
+            ws.add_descriptor(None, format!("D{i}"), [sh(1)], |_| {}, |_| {});
+        }
+        assert_eq!(ws.descriptors.len(), MAX_DESCRIPTORS_PER_CONNECTION);
+
+        // One more *distinct* descriptor is rejected outright — the map, which is
+        // invisible to the quota and to `len()`, does not grow past the cap.
+        let mut registered = false;
+        ws.add_descriptor(None, "overflow".into(), [sh(1)], |_| registered = true, |_| {});
+        assert!(!registered, "a descriptor rejected by the cap registers nothing");
+        assert_eq!(
+            ws.descriptors.len(),
+            MAX_DESCRIPTORS_PER_CONNECTION,
+            "a new descriptor past the cap is rejected",
+        );
+        assert!(!ws.descriptors.contains_key("overflow"));
+
+        // Re-asserting (sliding) an already-retained descriptor at the cap still
+        // works — the count cap must never block a window slide.
+        let mut slid = Vec::new();
+        ws.add_descriptor(None, "D0".into(), [sh(2)], |s| slid = s.to_vec(), |_| {});
+        assert_eq!(
+            ws.descriptors.len(),
+            MAX_DESCRIPTORS_PER_CONNECTION,
+            "re-asserting an existing descriptor does not grow the map",
+        );
+        assert_eq!(
+            ws.descriptors.get("D0").map(Vec::as_slice),
+            Some([sh(2)].as_slice()),
+            "the slid window replaced D0's membership",
+        );
+        assert_eq!(slid, vec![sh(2)], "the slid-in script registers");
     }
 }

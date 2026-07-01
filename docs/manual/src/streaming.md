@@ -96,7 +96,10 @@ connection, so a window can be slid or dropped cleanly: re-sending `AddDescripto
 with an advanced `start` reconciles the slid window server-side (scripts leaving
 the window are released, scripts entering are added), and `RemoveDescriptor` drops
 the whole window. A scripthash shared with a direct add or another descriptor is
-held until its **last** owner goes. Gap-limit advancement stays a client concern
+held until its **last** owner goes. A connection may retain up to 256 distinct
+descriptors (`MAX_DESCRIPTORS_PER_CONNECTION`); at the cap, drop one with
+`RemoveDescriptor` before adding a new one (re-asserting an existing descriptor
+to slide its window is always allowed). Gap-limit advancement stays a client concern
 by design: the server manages the window it is told to, but never tracks
 derivation progress or nudges the client to extend — the client decides when to
 advance `start` (or `RemoveDescriptor`).
