@@ -513,6 +513,11 @@ async fn ws_conn(
     // shared connection-scoped watch-set.
     let max_subscriptions = state.max_subscriptions;
     let prefix_bounds = (state.prefix_min_bits, state.prefix_max_bits);
+    // Bridge the deterministic result of an atomic SetWatchSet replace (applied
+    // by the inbound reader under the watch-set lock) to the outbound loop, which
+    // emits the in-band `watch_set_result`.
+    let (ws_result_tx, mut ws_result_rx) =
+        tokio::sync::mpsc::channel::<crate::watchset::ReplaceOutcome>(32);
     let inbound = {
         let handle = handle.clone();
         let category_mask = category_mask.clone();
@@ -523,16 +528,23 @@ async fn ws_conn(
                 last_activity.store(now_unix(), Ordering::Relaxed);
                 match msg {
                     Message::Text(t) => {
-                        let mut guard = watch_set.lock().unwrap_or_else(|p| p.into_inner());
-                        apply_ws_control(
-                            &t,
-                            &handle,
-                            principal.as_ref(),
-                            &category_mask,
-                            &mut guard,
-                            max_subscriptions,
-                            prefix_bounds,
-                        );
+                        // Scope the guard so it drops before the async send below.
+                        let outcome = {
+                            let mut guard = watch_set.lock().unwrap_or_else(|p| p.into_inner());
+                            apply_ws_control(
+                                &t,
+                                &handle,
+                                principal.as_ref(),
+                                &category_mask,
+                                &mut guard,
+                                max_subscriptions,
+                                prefix_bounds,
+                            )
+                        };
+                        if let Some(outcome) = outcome {
+                            // Outbound gone (tearing down) → nothing to deliver.
+                            let _ = ws_result_tx.send(outcome).await;
+                        }
                     }
                     Message::Close(_) => break,
                     // Ping is auto-answered by axum; Pong (and any other frame)
@@ -609,6 +621,13 @@ async fn ws_conn(
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             },
+            // Deterministic result of an atomic SetWatchSet replace.
+            Some(outcome) = ws_result_rx.recv() => {
+                let text = watch_set_result_json(&outcome).to_string();
+                if sender.send(Message::Text(text.into())).await.is_err() {
+                    break;
+                }
+            }
             m = rx_match.recv() => match m {
                 Some(wm) => {
                     // Single-shot terminal matches: the registry already evicted
@@ -705,6 +724,51 @@ enum WsControl {
     AddScriptPrefixes { prefixes: Vec<WsScriptPrefix> },
     /// Remove script-prefix buckets from the watch-set.
     RemoveScriptPrefixes { prefixes: Vec<WsScriptPrefix> },
+    /// Atomically REPLACE the whole watch-set with the snapshot carried here
+    /// (the JSON mirror of the gRPC `SetWatchSet`). Every field is the full
+    /// desired membership of its kind, not a delta. The server reconciles by
+    /// effective scripthash coverage and replies with a `watch_set_result`
+    /// event (`accepted` with counts, or `rejected` when the target exceeds the
+    /// quota — the set is then left unchanged).
+    SetWatchSet {
+        #[serde(default)]
+        categories: u32,
+        #[serde(default)]
+        scripthashes: Vec<String>,
+        #[serde(default)]
+        min_values: Vec<u64>,
+        #[serde(default)]
+        outpoints: Vec<WsOutpoint>,
+        #[serde(default)]
+        descriptors: Vec<WsDescriptor>,
+        #[serde(default)]
+        prefixes: Vec<WsScriptPrefix>,
+        #[serde(default)]
+        lifecycles: Vec<WsLifecycle>,
+        #[serde(default)]
+        depth_alarms: Vec<WsDepthAlarm>,
+    },
+}
+
+#[derive(Deserialize)]
+struct WsDescriptor {
+    descriptor: String,
+    gap_limit: u32,
+    #[serde(default)]
+    start: u32,
+}
+
+#[derive(Deserialize)]
+struct WsLifecycle {
+    txid: String,
+    #[serde(default)]
+    auto_close_depth: u32,
+}
+
+#[derive(Deserialize)]
+struct WsDepthAlarm {
+    txid: String,
+    depth: u32,
 }
 
 #[derive(Deserialize)]
@@ -758,15 +822,73 @@ fn apply_ws_control(
     watch_set: &mut WatchSet,
     max_subscriptions: usize,
     prefix_bounds: (u8, u8),
-) {
+) -> Option<crate::watchset::ReplaceOutcome> {
     let (prefix_min_bits, prefix_max_bits) = prefix_bounds;
     let ctrl: WsControl = match serde_json::from_str(text) {
         Ok(c) => c,
         Err(e) => {
             warn!(target: "events::ws", error = %e, "ignoring malformed streamws control message");
-            return;
+            return None;
         }
     };
+
+    // SetWatchSet is an atomic replace: build the desired set, reconcile under
+    // the lock, and return the outcome so the caller can emit the deterministic
+    // `watch_set_result`. Handled before the per-add cap (a replace may shrink)
+    // and separate from the incremental match arms.
+    if let WsControl::SetWatchSet {
+        categories,
+        scripthashes,
+        min_values,
+        outpoints,
+        descriptors,
+        prefixes,
+        lifecycles,
+        depth_alarms,
+    } = &ctrl
+    {
+        let mask = if *categories == 0 { u32::MAX } else { *categories };
+        category_mask.store(mask, Ordering::Relaxed);
+        let scripts: Vec<([u8; 32], u64)> = scripthashes
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| {
+                parse_ws_scripthash(s).map(|sh| (sh, min_values.get(i).copied().unwrap_or(0)))
+            })
+            .collect();
+        let descriptors: Vec<(String, Vec<[u8; 32]>)> = descriptors
+            .iter()
+            .filter_map(|d| {
+                match crate::descriptor::expand_descriptor(&d.descriptor, d.start, d.gap_limit) {
+                    Ok(shs) => {
+                        Some((d.descriptor.clone(), shs.into_iter().map(|(_, sh)| sh).collect()))
+                    }
+                    Err(e) => {
+                        warn!(target: "events::ws", error = %e, "SetWatchSet: ignoring invalid descriptor");
+                        None
+                    }
+                }
+            })
+            .collect();
+        let desired = crate::watchset::DesiredWatchSet {
+            scripts,
+            descriptors,
+            outpoints: outpoints.iter().filter_map(parse_ws_outpoint).collect(),
+            lifecycles: lifecycles
+                .iter()
+                .filter_map(|l| parse_ws_txid(&l.txid).map(|t| (t, l.auto_close_depth)))
+                .collect(),
+            depth_alarms: depth_alarms
+                .iter()
+                .filter_map(|a| parse_ws_txid(&a.txid).filter(|_| a.depth >= 1).map(|t| (t, a.depth)))
+                .collect(),
+            prefixes: prefixes
+                .iter()
+                .filter_map(|p| parse_ws_prefix(p, prefix_min_bits, prefix_max_bits))
+                .collect(),
+        };
+        return Some(watch_set.replace(principal, desired, handle));
+    }
     // Per-connection watch-set entry cap (`streamwsmaxsubscriptions`; 0 ⇒
     // unlimited): once the set is at/over the cap, shed any add (the
     // connection stays up — no per-message ack). Removes and category changes
@@ -786,9 +908,11 @@ fn apply_ws_control(
             cap = max_subscriptions,
             "streamws watch-set at per-connection cap; shedding add",
         );
-        return;
+        return None;
     }
     match ctrl {
+        // Handled and returned above; kept for match exhaustiveness.
+        WsControl::SetWatchSet { .. } => {}
         WsControl::SetCategories { categories } => {
             let mask = if categories == 0 { u32::MAX } else { categories };
             category_mask.store(mask, Ordering::Relaxed);
@@ -949,6 +1073,30 @@ fn apply_ws_control(
             });
         }
     }
+    None
+}
+
+/// Hand-rolled JSON for the deterministic result of an atomic `SetWatchSet`
+/// replace — the JSON mirror of the `WatchSetResult` node event.
+fn watch_set_result_json(outcome: &crate::watchset::ReplaceOutcome) -> serde_json::Value {
+    use crate::watchset::ReplaceOutcome;
+    let body = match outcome {
+        ReplaceOutcome::Accepted { added, removed, unchanged } => json!({
+            "category": "watch_set_result",
+            "outcome": "accepted",
+            "added": added,
+            "removed": removed,
+            "unchanged": unchanged,
+        }),
+        ReplaceOutcome::Rejected { required, quota } => json!({
+            "category": "watch_set_result",
+            "outcome": "rejected",
+            "reason": "quota_exceeded",
+            "required": required,
+            "quota": quota,
+        }),
+    };
+    json!({ "schema_version": node::events::SCHEMA_VERSION, "cursor": null, "body": body })
 }
 
 /// Hand-rolled JSON for a watch match (the proto has no `serde` derive). The

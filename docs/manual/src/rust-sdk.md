@@ -323,22 +323,30 @@ loader and behavior is exactly the mirror-replay described above.
 The loader fires on every *reconnect*. When the durable truth changes **while the
 stream is up** — a bulk import that wrote rows outside your hot-add path, an admin
 rotation, an operator "make the wire match truth now" reconciliation — `reload()`
-re-runs the loader, **diffs** the freshly-loaded set against the live watch-set,
-and applies only the delta on the wire:
+re-runs the loader and pushes the freshly-loaded set as a **single atomic
+`SetWatchSet`**:
 
 ```rust,ignore
 let summary = watch.reload().await?;   // ReloadSummary { added, removed, unchanged, applied }
 tracing::info!(?summary, "watch-set realigned with truth");
 ```
 
-- **Diff, not blast** — only added / changed / removed items are sent (`Add*`
-  before `Remove*`/`RemoveDescriptor`, so new coverage is up before the old is
-  dropped); identical items are untouched, so there's no window where the server
-  watches nothing. A descriptor whose window changed is re-asserted (the server
-  reconciles); a vanished descriptor is dropped with `RemoveDescriptor` (so this
-  needs the descriptor-membership server support — satd ≥ this release).
-- **Atomic** — `&mut self` serializes `reload()` against your `add_*` / `next()`
-  on the single task.
+- **One atomic replace, server-reconciled** — `reload()` sends the *whole* desired
+  set in one `SetWatchSet` message; the server reconciles it under its watch-set
+  lock, by **effective scripthash coverage** (descriptors expanded). It never
+  sends a client-computed `Add*`/`Remove*` delta, so there is no message ordering
+  that can strand coverage or over-charge at quota. An item watched in both the
+  old and new set — even if its *mechanism* changes (a direct script becoming
+  descriptor-covered, or vice versa) — is kept without a re-registration, so the
+  matcher sees no gap. Quota is all-or-nothing on the whole target.
+- **Deterministic result** — the outcome arrives in-band on `next()` as
+  `Event::WatchSetReplaced { added, removed, unchanged }` (the server's
+  authoritative counts) or `Event::WatchSetRejected { required, quota }` when the
+  target does not fit quota (the live set is then left unchanged; shed and retry).
+  The `ReloadSummary` returned by `reload()` carries advisory client-side counts;
+  the `Event` is the source of truth.
+- **Atomic w.r.t. your task** — `&mut self` serializes `reload()` against your
+  `add_*` / `next()` on the single task.
 - **Disconnected defers, never errors** — with the stream down there's nothing to
   apply now; the mirror is still updated and the next reconnect's loader
   re-registers it. `ReloadSummary::applied` tells you which happened.

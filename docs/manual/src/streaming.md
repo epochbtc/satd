@@ -56,9 +56,12 @@ caps, and how to scale beyond one node.
 
 The gRPC service offers the server-streaming `Subscribe` (the firehose, with
 cursor replay) plus a **bidirectional** `Watch` whose client→server messages are
-a tagged union — `SetCursor`, `SetCategories`, and `Add`/`Remove` for scripts,
-outpoints, transactions, script-prefixes, and descriptors. New subscription
-kinds slot in additively without protocol breakage.
+a tagged union — `SetCursor`, `SetCategories`, `Add`/`Remove` for scripts,
+outpoints, transactions, script-prefixes, and descriptors, and `SetWatchSet` (an
+atomic whole-set replace: send the complete desired watch-set in one message and
+the server reconciles it under its lock by effective coverage, replying with a
+deterministic `WatchSetResult`). New subscription kinds slot in additively
+without protocol breakage.
 
 Match events delivered on the per-subscriber `Watch` channel include:
 

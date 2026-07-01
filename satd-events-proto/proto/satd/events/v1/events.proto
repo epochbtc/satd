@@ -87,8 +87,46 @@ message SubscribeControl {
     AddScriptPrefixes    add_script_prefixes    = 10;
     // Remove prefix buckets from the watch-set; releases each bucket's units.
     RemoveScriptPrefixes remove_script_prefixes = 11;
+    // Atomically REPLACE the entire watch-set with the one carried here — the
+    // whole desired set (scripts, outpoints, txids, depth alarms, descriptors,
+    // prefixes, category filter) in a single message. The server reconciles it
+    // under the watch-set lock, by EFFECTIVE scripthash coverage (descriptors
+    // expanded): items in both the old and new set keep their registration and
+    // quota lease untouched (no unwatch/rewatch gap, even for a scripthash whose
+    // mechanism changes — a direct add becoming descriptor-covered or vice
+    // versa), departed items are released, net-new items are charged. Quota is
+    // all-or-nothing on the WHOLE target: if the target's total unit cost
+    // exceeds the principal's quota the watch-set is left UNCHANGED and the
+    // server replies WatchSetResult{WatchSetRejected}. On success it replies
+    // WatchSetResult{WatchSetAccepted{added,removed,unchanged}}. This is the
+    // primitive an SDK reload/realign uses: one round-trip, gap-free, with a
+    // deterministic result — never a client-computed Add*/Remove* delta whose
+    // ordering can strand coverage or over-charge at quota.
+    SetWatchSet set_watch_set = 13;
   }
 }
+
+// A complete watch-set snapshot for SetWatchSet. Each repeated field is the FULL
+// desired membership of that kind (not a delta). `min_values` is parallel to
+// `scripthashes` (same rule as AddScripts: empty = no floors, else equal length).
+// Descriptors are expanded server-side over each window, exactly as AddDescriptor.
+message SetWatchSet {
+  uint32 categories                   = 1; // firehose filter (0 = all)
+  repeated bytes scripthashes         = 2; // direct script watches (32 bytes each)
+  repeated uint64 min_values          = 3; // optional per-script floor, parallel to scripthashes
+  repeated Outpoint outpoints         = 4;
+  repeated AddDescriptor descriptors  = 5; // each expanded over [start, start+gap_limit)
+  repeated ScriptPrefix prefixes      = 6;
+  repeated WatchLifecycle lifecycles  = 7; // txid lifecycle watches
+  repeated WatchDepthAlarm depth_alarms = 8; // single-shot (txid, depth) alarms
+}
+
+// One txid lifecycle watch in a SetWatchSet snapshot. `auto_close_depth` matches
+// AddTransactions: 0 = persist until removed, >= 1 = self-evict + TxidFinalized
+// once that many confirmations deep.
+message WatchLifecycle { bytes txid = 1; uint32 auto_close_depth = 2; }
+// One single-shot depth alarm in a SetWatchSet snapshot. `depth` >= 1.
+message WatchDepthAlarm { bytes txid = 1; uint32 depth = 2; }
 
 message AddDescriptor {
   string descriptor = 1; // rust-miniscript output descriptor (public)
@@ -414,6 +452,40 @@ message CursorRejected {
   Cursor current_head = 2; // server's current resume position
 }
 
+// Deterministic outcome of a SetWatchSet, delivered in-band on the event stream
+// (same pattern as SetCursorResult): the atomic replace either applied or was
+// rejected whole. The client acts on it — adopt the new set on accept, keep the
+// old set on reject.
+message WatchSetResult {
+  oneof outcome {
+    WatchSetAccepted accepted = 1;
+    WatchSetRejected rejected = 2;
+  }
+}
+
+// The replace applied atomically. Counts are by EFFECTIVE coverage: `added` =
+// items newly watched, `removed` = items released, `unchanged` = items in both
+// the old and new set (kept without a re-registration). The live watch-set now
+// equals the SetWatchSet snapshot.
+message WatchSetAccepted {
+  uint32 added     = 1;
+  uint32 removed   = 2;
+  uint32 unchanged = 3;
+}
+
+// The replace was rejected whole; the live watch-set is UNCHANGED (still the
+// prior set). `required` is the target's total quota cost, `quota` the
+// principal's ceiling — so a client can shed and retry with a smaller set.
+message WatchSetRejected {
+  enum Reason {
+    REASON_UNSPECIFIED = 0;
+    QUOTA_EXCEEDED     = 1; // target's total unit cost exceeds the principal quota
+  }
+  Reason reason  = 1;
+  uint64 required = 2; // units the target set needs
+  uint64 quota    = 3; // the principal's quota ceiling
+}
+
 // Versioned, edge-stamped envelope. The wire-level type the server
 // streams to clients.
 message NodeEvent {
@@ -445,5 +517,6 @@ message NodeEvent {
     TxidFinalized txid_finalized = 22; // lifecycle auto-close (terminal)
     PrefixMatched prefix_matched = 23; // privacy-preserving prefix watch (§7.5)
     SetCursorResult set_cursor_result = 24; // deterministic re-anchor ack/reject
+    WatchSetResult set_watch_set_result = 25; // deterministic atomic-replace ack/reject
   }
 }

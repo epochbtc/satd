@@ -251,6 +251,62 @@ impl WatchSetMirror {
         out
     }
 
+    /// Render the whole net watch-set as a single `SetWatchSet` snapshot — the
+    /// atomic-replace payload [`reload`](ResilientWatch::reload) sends. Unlike
+    /// [`control_messages`](Self::control_messages) (a fresh-stream replay) or a
+    /// `reconcile_to` delta, this is the COMPLETE desired membership in one
+    /// message: the server reconciles it under its lock by effective coverage, so
+    /// there is no client-computed Add*/Remove* ordering to strand coverage or
+    /// over-charge at quota.
+    fn to_set_watch_set(&self) -> pb::SetWatchSet {
+        let scripthashes: Vec<Vec<u8>> = self.scripts.keys().map(|h| h.to_vec()).collect();
+        let min_values = if self.scripts.values().any(Option::is_some) {
+            self.scripts.values().map(|f| f.unwrap_or(0)).collect()
+        } else {
+            Vec::new()
+        };
+        pb::SetWatchSet {
+            categories: self.categories.unwrap_or(0),
+            scripthashes,
+            min_values,
+            outpoints: self
+                .outpoints
+                .iter()
+                .map(|(t, v)| pb::Outpoint { txid: t.to_vec(), vout: *v })
+                .collect(),
+            descriptors: self
+                .descriptors
+                .iter()
+                .map(|(d, (gap_limit, start))| pb::AddDescriptor {
+                    descriptor: d.clone(),
+                    gap_limit: *gap_limit,
+                    start: *start,
+                })
+                .collect(),
+            prefixes: self
+                .prefixes
+                .iter()
+                .map(|(bits, prefix)| pb::ScriptPrefix { prefix: prefix.clone(), bits: *bits })
+                .collect(),
+            lifecycles: self
+                .tx_lifecycles
+                .iter()
+                .map(|(t, ac)| pb::WatchLifecycle {
+                    txid: t.to_vec(),
+                    auto_close_depth: match ac {
+                        AutoClose::Never => 0,
+                        AutoClose::AtDepth(d) => *d,
+                    },
+                })
+                .collect(),
+            depth_alarms: self
+                .depth_alarms
+                .iter()
+                .map(|(t, d)| pb::WatchDepthAlarm { txid: t.to_vec(), depth: *d })
+                .collect(),
+        }
+    }
+
     /// Compute the minimal control messages that transform `self` (the current
     /// net watch-set) into `target`, plus item counts — the delta a
     /// [`reload`](ResilientWatch::reload) applies on the live wire. Only the
@@ -1097,24 +1153,24 @@ impl ResilientWatch {
             .map_err(ReloadError::Loader)?;
         let loaded = std::mem::take(&mut *shared.lock().unwrap_or_else(|p| p.into_inner()));
 
-        // Diff the current live set against it.
-        let (messages, counts) = self.mirror.reconcile_to(&loaded);
+        // Counts (added/removed/unchanged) for the summary — advisory; the
+        // server's WatchSetResult carries the authoritative counts by effective
+        // coverage. The delta messages are discarded: reload no longer applies a
+        // client-computed Add*/Remove* delta (whose ordering could strand
+        // coverage or over-charge at quota — the Rounds 2/3 failures). It sends
+        // ONE SetWatchSet and lets the server reconcile atomically under its lock.
+        let (_delta, counts) = self.mirror.reconcile_to(&loaded);
 
-        // Apply the delta live if connected; a send failure means the stream is
-        // gone, so defer to the reconnect loader rather than erroring.
+        // Push the whole desired set as a single atomic replace if connected; a
+        // send failure means the stream is gone, so defer to the reconnect loader
+        // rather than erroring. The deterministic WatchSetResult
+        // (accepted/rejected) arrives in-band on [`next`](Self::next).
         let mut applied = false;
-        if self.handle.is_some() {
-            applied = true;
-            for msg in messages {
-                let res = match &self.handle {
-                    Some(h) => h.send_control(pb::SubscribeControl { msg: Some(msg) }).await,
-                    None => break,
-                };
-                if res.is_err() {
-                    self.teardown();
-                    applied = false;
-                    break;
-                }
+        if let Some(h) = &self.handle {
+            let msg = Msg::SetWatchSet(loaded.to_set_watch_set());
+            match h.send_control(pb::SubscribeControl { msg: Some(msg) }).await {
+                Ok(()) => applied = true,
+                Err(_) => self.teardown(),
             }
         }
 
@@ -2037,19 +2093,25 @@ mod tests {
 
         let summary = w.reload().await.expect("reload ok");
         assert!(summary.applied, "connected → applied live");
+        // Advisory client counts (server's WatchSetResult is authoritative).
         assert_eq!((summary.added, summary.removed, summary.unchanged), (1, 1, 1));
 
-        // Exactly one AddScripts(sh3) then one RemoveScripts(sh2) reached the wire.
-        let mut adds = Vec::new();
-        let mut rms = Vec::new();
+        // Exactly ONE SetWatchSet carrying the whole desired set (sh1 + sh3)
+        // reached the wire — no client-computed Add*/Remove* delta.
+        let mut msgs = Vec::new();
         while let Ok(ctrl) = rx.try_recv() {
-            match ctrl.msg.unwrap() {
-                Msg::AddScripts(a) => adds.extend(a.scripthashes),
-                Msg::RemoveScripts(r) => rms.extend(r.scripthashes),
-                other => panic!("unexpected control message: {other:?}"),
-            }
+            msgs.push(ctrl.msg.unwrap());
         }
-        assert_eq!(adds, vec![[3u8; 32].to_vec()], "only the net-new script is added");
-        assert_eq!(rms, vec![[2u8; 32].to_vec()], "only the vanished script is removed");
+        assert_eq!(msgs.len(), 1, "reload sends exactly one control message");
+        let Msg::SetWatchSet(sws) = &msgs[0] else {
+            panic!("expected a SetWatchSet, got {:?}", msgs[0]);
+        };
+        let mut got: Vec<Vec<u8>> = sws.scripthashes.clone();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![[1u8; 32].to_vec(), [3u8; 32].to_vec()],
+            "the snapshot is the full desired set, not a delta",
+        );
     }
 }

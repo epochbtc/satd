@@ -120,6 +120,7 @@ message NodeEvent {
     TxidFinalized txid_finalized = 22;  // lifecycle auto-close, terminal (§7.4)
     PrefixMatched prefix_matched = 23;  // privacy-preserving prefix watch (§7.5)
     SetCursorResult set_cursor_result = 24;  // deterministic re-anchor ack/reject (§7.3.1)
+    WatchSetResult set_watch_set_result = 25;  // deterministic atomic-replace ack/reject (§11.2)
   }
 }
 ```
@@ -352,6 +353,7 @@ message SubscribeControl {
     AddScriptPrefixes    add_script_prefixes   = 10; // privacy-preserving prefix watch (§7.5)
     RemoveScriptPrefixes remove_script_prefixes = 11;
     RemoveDescriptor     remove_descriptor     = 12; // drop a descriptor window (§11)
+    SetWatchSet          set_watch_set         = 13; // atomic whole-set replace (see below)
   }
 }
 ```
@@ -734,6 +736,52 @@ unsolicited nudge. The client owns address-generation policy and drives the wind
 by advancing `start` (or dropping it with `RemoveDescriptor`); the server only
 expands, watches, reconciles, and releases. The `DescriptorNeedsAddresses` body
 (field 15) is reserved for wire-compat but is never emitted.
+
+### 11.2 Atomic whole-set replace (`SetWatchSet`)
+
+`SetWatchSet` carries the **complete desired watch-set** — scripts (+floors),
+outpoints, txid lifecycles, depth alarms, descriptors (+windows), prefixes, and
+the category filter — in one message, and asks the server to *become* it:
+
+```protobuf
+message SetWatchSet {
+  uint32 categories                   = 1;  // 0 = all
+  repeated bytes scripthashes         = 2;
+  repeated uint64 min_values          = 3;  // parallel to scripthashes (empty = no floors)
+  repeated Outpoint outpoints         = 4;
+  repeated AddDescriptor descriptors  = 5;  // expanded over each window, as AddDescriptor
+  repeated ScriptPrefix prefixes      = 6;
+  repeated WatchLifecycle lifecycles  = 7;  // { txid, auto_close_depth }
+  repeated WatchDepthAlarm depth_alarms = 8; // { txid, depth }
+}
+```
+
+The server reconciles it **under the watch-set lock, by effective scripthash
+coverage** (descriptors expanded): items in both the old and new set keep their
+registration and quota lease untouched — including a scripthash whose *mechanism*
+changes across the replace (a direct add becoming descriptor-covered, or vice
+versa), which a client-side `Add*`/`Remove*` diff cannot see and would briefly
+unwatch. Departed items are released; net-new items are charged. Quota is
+**all-or-nothing on the whole target**: if the target's total unit cost exceeds
+the principal's quota the watch-set is left **unchanged**.
+
+The outcome is deterministic and in-band (mirrors `SetCursorResult`):
+
+```protobuf
+message WatchSetResult {
+  oneof outcome { WatchSetAccepted accepted = 1; WatchSetRejected rejected = 2; }
+}
+message WatchSetAccepted { uint32 added = 1; uint32 removed = 2; uint32 unchanged = 3; }
+message WatchSetRejected { Reason reason = 1; uint64 required = 2; uint64 quota = 3; }
+```
+
+This is the primitive an SDK reload/realign uses: one round-trip, gap-free,
+quota-correct even for a same-size swap at exactly the quota ceiling — never a
+client-computed delta whose ordering can strand coverage (send `Remove*` first
+and an at-quota client is briefly unwatched; send `Add*` first and the over-quota
+adds are silently dropped). On WebSocket the same operation is
+`{"type":"set_watch_set", ...}` and the result a `{"category":"watch_set_result",
+"outcome":"accepted"|"rejected", ...}` event.
 
 ## 12. Operator limits
 

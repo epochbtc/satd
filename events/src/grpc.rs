@@ -1090,6 +1090,13 @@ impl NodeEventStream for NodeEventStreamSvc {
         let (reject_tx, reject_rx) =
             tokio::sync::mpsc::channel::<node::events::CursorRejectReason>(32);
 
+        // Deterministic result of an atomic SetWatchSet replace, handed from the
+        // inbound reader (which applies it under the watch-set lock) to the
+        // outbound task (which emits the in-band WatchSetResult). Same bridge
+        // shape as the SetCursor rejection channel.
+        let (ws_result_tx, mut ws_result_rx) =
+            tokio::sync::mpsc::channel::<crate::watchset::ReplaceOutcome>(32);
+
         // Inbound control reader: applies watch-set mutations + category
         // changes for the life of the stream against the shared subscription-
         // scoped watch-set, and holds a handle clone so the subscription is
@@ -1100,6 +1107,7 @@ impl NodeEventStream for NodeEventStreamSvc {
             let watch_set = watch_set.clone();
             let reanchor_in_flight = reanchor_in_flight.clone();
             let prefix_bounds = (self.prefix_min_bits, self.prefix_max_bits);
+            let ws_result_tx = ws_result_tx;
             tokio::spawn(async move {
                 use node::events::CursorRejectReason;
                 // Hand a deterministic rejection to the outbound task. BLOCKS when
@@ -1171,6 +1179,22 @@ impl NodeEventStream for NodeEventStreamSvc {
                         if reanchor_tx.try_send(cur).is_err() {
                             reanchor_in_flight.store(false, Ordering::Release);
                         }
+                        continue;
+                    }
+                    // SetWatchSet is an atomic replace whose deterministic
+                    // WatchSetResult must reach the outbound task; apply it under
+                    // the lock, then forward the outcome (mirrors SetCursor). The
+                    // guard is scoped so it drops before the `.await` below.
+                    if let Some(pb::subscribe_control::Msg::SetWatchSet(s)) = &ctrl.msg {
+                        let outcome = {
+                            let mut guard = watch_set.lock().unwrap_or_else(|p| p.into_inner());
+                            let mask = if s.categories == 0 { u32::MAX } else { s.categories };
+                            category_mask.store(mask, Ordering::Relaxed);
+                            let desired = desired_from_proto(s, prefix_bounds);
+                            guard.replace(principal.as_ref(), desired, &*handle)
+                        };
+                        // Outbound gone (stream tearing down) → nothing to deliver.
+                        let _ = ws_result_tx.send(outcome).await;
                         continue;
                     }
                     let mut guard = watch_set.lock().unwrap_or_else(|p| p.into_inner());
@@ -1309,6 +1333,14 @@ impl NodeEventStream for NodeEventStreamSvc {
                         let head = publisher.resume_cursor(last_h, last_s);
                         let ev = node::events::cursor_rejected_event(&publisher, reason, head);
                         if tx_out.send(Ok(envelope_to_proto(&ev))).await.is_err() {
+                            return;
+                        }
+                    }
+                    // Deterministic result of an atomic SetWatchSet replace applied
+                    // by the inbound reader: emit the in-band WatchSetResult.
+                    Some(outcome) = ws_result_rx.recv() => {
+                        let ev = watch_set_result_to_proto(&edge, &outcome);
+                        if tx_out.send(Ok(ev)).await.is_err() {
                             return;
                         }
                     }
@@ -1583,7 +1615,101 @@ fn apply_control(
                 "SetCursor reached apply_control unexpectedly; ignoring (handled as re-anchor upstream)",
             );
         }
+        Some(Msg::SetWatchSet(_)) => {
+            // Like SetCursor: the inbound loop intercepts SetWatchSet (an atomic
+            // replace whose deterministic WatchSetResult must reach the outbound
+            // task) before calling apply_control. Defensive arm for other callers.
+            debug!(
+                target: "events::grpc",
+                "SetWatchSet reached apply_control unexpectedly; ignoring (handled as atomic replace upstream)",
+            );
+        }
         None => {}
+    }
+}
+
+/// Build a [`DesiredWatchSet`] from a `SetWatchSet` snapshot: expand each
+/// descriptor over its window (skipping any that fail to parse, as AddDescriptor
+/// does) and parse the concrete kinds. `prefix_bounds` prices the prefix buckets.
+fn desired_from_proto(
+    s: &pb::SetWatchSet,
+    prefix_bounds: (u8, u8),
+) -> crate::watchset::DesiredWatchSet {
+    let (prefix_min_bits, prefix_max_bits) = prefix_bounds;
+    let scripts: Vec<([u8; 32], u64)> = s
+        .scripthashes
+        .iter()
+        .enumerate()
+        .filter_map(|(i, b)| {
+            parse_scripthash(b).map(|sh| (sh, s.min_values.get(i).copied().unwrap_or(0)))
+        })
+        .collect();
+    let descriptors: Vec<(String, Vec<[u8; 32]>)> = s
+        .descriptors
+        .iter()
+        .filter_map(|d| match crate::descriptor::expand_descriptor(&d.descriptor, d.start, d.gap_limit) {
+            Ok(shs) => Some((d.descriptor.clone(), shs.into_iter().map(|(_, sh)| sh).collect())),
+            Err(e) => {
+                warn!(target: "events::grpc", error = %e, "SetWatchSet: ignoring invalid descriptor");
+                None
+            }
+        })
+        .collect();
+    let outpoints = s.outpoints.iter().filter_map(parse_outpoint).collect();
+    let lifecycles = s
+        .lifecycles
+        .iter()
+        .filter_map(|l| parse_txid(&l.txid).map(|t| (t, l.auto_close_depth)))
+        .collect();
+    let depth_alarms = s
+        .depth_alarms
+        .iter()
+        .filter_map(|a| parse_txid(&a.txid).filter(|_| a.depth >= 1).map(|t| (t, a.depth)))
+        .collect();
+    let prefixes = s
+        .prefixes
+        .iter()
+        .filter_map(|p| crate::watchset::parse_prefix(&p.prefix, p.bits, prefix_min_bits, prefix_max_bits))
+        .collect();
+    crate::watchset::DesiredWatchSet {
+        scripts,
+        descriptors,
+        outpoints,
+        lifecycles,
+        depth_alarms,
+        prefixes,
+    }
+}
+
+/// Render a [`ReplaceOutcome`] as the in-band `WatchSetResult` node event.
+fn watch_set_result_to_proto(
+    edge: &node::events::EdgeIdentity,
+    outcome: &crate::watchset::ReplaceOutcome,
+) -> pb::NodeEvent {
+    use crate::watchset::ReplaceOutcome;
+    let outcome = match outcome {
+        ReplaceOutcome::Accepted { added, removed, unchanged } => {
+            pb::watch_set_result::Outcome::Accepted(pb::WatchSetAccepted {
+                added: *added,
+                removed: *removed,
+                unchanged: *unchanged,
+            })
+        }
+        ReplaceOutcome::Rejected { required, quota } => {
+            pb::watch_set_result::Outcome::Rejected(pb::WatchSetRejected {
+                reason: pb::watch_set_rejected::Reason::QuotaExceeded as i32,
+                required: *required,
+                quota: *quota,
+            })
+        }
+    };
+    pb::NodeEvent {
+        schema_version: node::events::SCHEMA_VERSION,
+        stamp: Some(replay_stamp(edge)),
+        cursor: None,
+        body: Some(pb::node_event::Body::SetWatchSetResult(pb::WatchSetResult {
+            outcome: Some(outcome),
+        })),
     }
 }
 
@@ -2605,6 +2731,7 @@ mod tests {
                 pb::node_event::Body::TxidFinalized(_) => "txid_finalized",
                 pb::node_event::Body::PrefixMatched(_) => "prefix_matched",
                 pb::node_event::Body::SetCursorResult(_) => "set_cursor_result",
+                pb::node_event::Body::SetWatchSetResult(_) => "set_watch_set_result",
             })
             .collect();
         assert!(

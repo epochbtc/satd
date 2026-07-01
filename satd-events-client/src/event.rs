@@ -298,6 +298,31 @@ pub enum Event {
         /// The server's current resume position.
         current_head: Option<Cursor>,
     },
+    /// An atomic watch-set replace ([`ResilientWatch::reload`](crate::ResilientWatch::reload),
+    /// carried as `SetWatchSet`) was applied. The live watch-set now equals the
+    /// reloaded truth; the counts are the server's authoritative diff by
+    /// **effective coverage** (a scripthash covered by both the old and new set —
+    /// even via a different mechanism — counts as `unchanged`, never gapped).
+    WatchSetReplaced {
+        /// Items newly watched.
+        added: u32,
+        /// Items released.
+        removed: u32,
+        /// Items in both the old and new set (kept without re-registration).
+        unchanged: u32,
+    },
+    /// An atomic watch-set replace was **rejected**: the target's total quota
+    /// cost (`required`) exceeds the principal's `quota`. The live watch-set is
+    /// UNCHANGED — the prior set is still in effect — so shed items and retry.
+    /// The client's mirror still reflects the (unapplied) reloaded set, so a
+    /// consumer that ignores this keeps an over-claiming mirror; react by
+    /// reloading a set that fits.
+    WatchSetRejected {
+        /// Total watch units the rejected target set needs.
+        required: u64,
+        /// The principal's quota ceiling.
+        quota: u64,
+    },
     /// A body this client build does not recognize (a newer server arm), or an
     /// event with no body set. Ignored by well-behaved consumers.
     Unknown,
@@ -394,6 +419,18 @@ impl From<pb::NodeEvent> for Event {
                     current_head: rj.current_head,
                 },
                 // A result frame with no outcome set is a degenerate message.
+                None => Event::Unknown,
+            },
+            Body::SetWatchSetResult(r) => match r.outcome {
+                Some(pb::watch_set_result::Outcome::Accepted(a)) => Event::WatchSetReplaced {
+                    added: a.added,
+                    removed: a.removed,
+                    unchanged: a.unchanged,
+                },
+                Some(pb::watch_set_result::Outcome::Rejected(rj)) => Event::WatchSetRejected {
+                    required: rj.required,
+                    quota: rj.quota,
+                },
                 None => Event::Unknown,
             },
         }
